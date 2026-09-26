@@ -747,6 +747,39 @@ fn hidden_series_do_not_expand_autoscale() {
 }
 
 #[test]
+fn histogram_autoscale_includes_the_column_base() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart.set_series_visible(0, false);
+    chart
+        .set_series_data(
+            volume,
+            &[1.0, 2.0, 3.0],
+            &[120.0, 150.0, 180.0],
+            &[120.0, 150.0, 180.0],
+            &[120.0, 150.0, 180.0],
+            &[120.0, 150.0, 180.0],
+        )
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart.autoscale_visible();
+    let range = chart.panes[0].price_scale.price_range().unwrap();
+    assert_eq!((range.min_value(), range.max_value()), (0.0, 180.0));
+
+    // A base above the data extends the range upward instead.
+    chart
+        .series
+        .iter_mut()
+        .find(|series| series.id == volume)
+        .unwrap()
+        .base = 200.0;
+    chart.autoscale_visible();
+    let range = chart.panes[0].price_scale.price_range().unwrap();
+    assert_eq!((range.min_value(), range.max_value()), (120.0, 200.0));
+}
+
+#[test]
 fn marker_autoscale_margins_are_headless_and_can_be_disabled() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart
