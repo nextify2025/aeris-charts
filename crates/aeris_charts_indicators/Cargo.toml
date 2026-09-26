@@ -11,5 +11,9 @@ description = "Pure Rust technical-indicator producers for Aeris Charts"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 
+[dev-dependencies]
+# `float_roundtrip` parses the KLineChart parity fixture exactly, so values can be compared bitwise.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
 [lints]
 workspace = true
