@@ -260,6 +260,8 @@ for crosshair lines, and muted for crosshair-label surfaces.
 - `crates/aeris_charts_native` — deterministic native rendering and performance verification.
 - `packages/charts` — TypeScript browser package.
 - `examples/web_demo` — browser integration and parity test host; it is not a published package.
+- `apps/stock-detail` — a GPUI Kit stock detail page with a full K-line chart (KLineChart indicators
+  and drawing tools, simulated or Longbridge OpenAPI data); a separate Cargo workspace.
 - `docs` — architecture, public API, domain-model, crate, and contribution documentation.
 - `plan` — active product and expansion plans.
 
@@ -308,6 +310,11 @@ Aeris Charts is independently designed and implemented. Public documentation, pu
 and observed behavior from established charting products are used to learn common user expectations
 and to build development-only compatibility comparisons. Those references do not share Aeris's
 engine, rendering, or state-management implementation.
+
+The KLineChart port is the exception: its indicator formulas and overlay geometry are translated
+from [KLineChart](https://github.com/klinecharts/KLineChart) v10.0.3 (Apache-2.0) and credited in
+[NOTICE](NOTICE) and the module documentation. [KLineChart_zh.md](docs/KLineChart_zh.md) describes
+the port in Chinese.
 
 Development tests use Lightweight Charts as a pinned Apache-2.0 dependency through its public API.
 That dependency is not included in the published `@aeristerminal/aeris-charts` package. TradingView and
