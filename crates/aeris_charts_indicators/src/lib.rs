@@ -4,6 +4,7 @@
 //! rendering. It consumes a close/value slice and returns a derived value column that the
 //! headless engine can install as an ordinary series. `None` represents the warm-up window.
 
+pub mod klinechart;
 pub mod volume_profile;
 
 use std::{num::NonZeroUsize, sync::Arc};
