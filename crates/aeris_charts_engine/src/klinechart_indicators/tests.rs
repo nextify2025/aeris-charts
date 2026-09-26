@@ -155,6 +155,7 @@ fn assert_colors_match_full(chart: &ChartEngine, binding_index: usize) {
                     bars[2][source_row],
                     bars[3][source_row],
                 ],
+                chart.klinechart_palette(binding.source),
             );
             let actual = chart
                 .data
@@ -509,4 +510,38 @@ fn fixture_without_indicators() -> Fixture {
     let fixture = fixture();
     assert!(fixture.chart.indicators.is_empty());
     fixture
+}
+
+#[test]
+fn bar_colors_follow_the_chart_market_colors() {
+    let mut fixture = fixture();
+    let (_, outputs) = bind(&mut fixture, &Indicator::from_name("VOL").unwrap());
+    let binding = fixture.chart.indicators.len() - 1;
+    let body = |chart: &ChartEngine, row| {
+        chart
+            .data
+            .point_color(outputs[0], PointColorChannel::Body, row)
+            .unwrap()
+    };
+    // Row 0 of the fixture closes above its open or below it; find one of each.
+    let (_, bars) = fixture.chart.data.series_data(0).unwrap();
+    let rising = (0..ROWS).find(|&row| bars[3][row] > bars[0][row]).unwrap();
+    let default_up = body(&fixture.chart, rising);
+
+    // A red-up convention: swap the chart's bullish and bearish colors, then refresh.
+    fixture
+        .chart
+        .options
+        .apply_str(r##"{"layout":{"bullishColor":"#F92855","bearishColor":"#2DC08E"}}"##)
+        .unwrap();
+    fixture.chart.refresh_klinechart_colors();
+    let red_up = body(&fixture.chart, rising);
+    assert_ne!(red_up, default_up);
+    assert_eq!(red_up >> 8, 0x00F9_2855);
+    check(&fixture, binding);
+
+    // An explicit series color wins over the layout default.
+    fixture.chart.series[0].up_color = Some("#0000ff".into());
+    fixture.chart.refresh_klinechart_colors();
+    assert_eq!(body(&fixture.chart, rising) >> 8, 0x0000_00ff);
 }

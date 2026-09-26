@@ -26,14 +26,32 @@ const HOLLOW_ALPHA: u8 = 0x4d;
 /// KLineChart's `noChangeColor`, `#76808F`.
 const NO_CHANGE: u32 = 0x7680_8fff;
 
-const fn rgba(rgb: (u8, u8, u8), alpha: u8) -> u32 {
-    (rgb.0 as u32) << 24 | (rgb.1 as u32) << 16 | (rgb.2 as u32) << 8 | alpha as u32
+/// A color packed as `0xRRGGBBAA` at `alpha`.
+fn packed(color: Color, alpha: u8) -> u32 {
+    (color.r() as u32) << 24 | (color.g() as u32) << 16 | (color.b() as u32) << 8 | alpha as u32
 }
 
-const UP_FILL: u32 = rgba(aeris_charts_core::style::MARKET_UP_RGB, FILL_ALPHA);
-const UP_HOLLOW: u32 = rgba(aeris_charts_core::style::MARKET_UP_RGB, HOLLOW_ALPHA);
-const DOWN_FILL: u32 = rgba(aeris_charts_core::style::MARKET_DOWN_RGB, FILL_ALPHA);
-const DOWN_HOLLOW: u32 = rgba(aeris_charts_core::style::MARKET_DOWN_RGB, HOLLOW_ALPHA);
+/// The up/down colors per-row KLineChart figures use, packed for point-color channels. They
+/// follow the source candles: the series' own up/down colors when set, else the chart's
+/// `layout.bullishColor`/`bearishColor`, so a red-up market convention recolors the bars too.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KLineChartPalette {
+    up_fill: u32,
+    up_hollow: u32,
+    down_fill: u32,
+    down_hollow: u32,
+}
+
+impl KLineChartPalette {
+    fn new(up: Color, down: Color) -> Self {
+        Self {
+            up_fill: packed(up, FILL_ALPHA),
+            up_hollow: packed(up, HOLLOW_ALPHA),
+            down_fill: packed(down, FILL_ALPHA),
+            down_hollow: packed(down, HOLLOW_ALPHA),
+        }
+    }
+}
 
 /// The `IndicatorInfo::kind` / schema name of a KLineChart binding: `klinechart_` followed by the
 /// template name in lower case.
@@ -168,7 +186,13 @@ const MIN_SAFE_INTEGER: f64 = -9_007_199_254_740_991.0;
 
 impl KLineChartColorRule {
     /// The color of one row. `candle` is the source bar as `[open, high, low, close]`.
-    fn color(self, value: f64, previous: Option<f64>, candle: [f64; 4]) -> u32 {
+    fn color(
+        self,
+        value: f64,
+        previous: Option<f64>,
+        candle: [f64; 4],
+        palette: KLineChartPalette,
+    ) -> u32 {
         if !value.is_finite() {
             return POINT_COLOR_ABSENT;
         }
@@ -179,9 +203,9 @@ impl KLineChartColorRule {
         match self {
             Self::CandleDirection => {
                 if close > open {
-                    UP_FILL
+                    palette.up_fill
                 } else if close < open {
-                    DOWN_FILL
+                    palette.down_fill
                 } else {
                     NO_CHANGE
                 }
@@ -190,15 +214,15 @@ impl KLineChartColorRule {
                 let rising = previous < value;
                 if value > 0.0 {
                     if rising {
-                        UP_HOLLOW
+                        palette.up_hollow
                     } else {
-                        UP_FILL
+                        palette.up_fill
                     }
                 } else if value < 0.0 {
                     if rising {
-                        DOWN_HOLLOW
+                        palette.down_hollow
                     } else {
-                        DOWN_FILL
+                        palette.down_fill
                     }
                 } else {
                     NO_CHANGE
@@ -206,16 +230,16 @@ impl KLineChartColorRule {
             }
             Self::AoColumn => {
                 if value > previous {
-                    UP_HOLLOW
+                    palette.up_hollow
                 } else {
-                    DOWN_FILL
+                    palette.down_fill
                 }
             }
             Self::SarDot => {
                 if value < (high + low) / 2.0 {
-                    UP_FILL
+                    palette.up_fill
                 } else {
-                    DOWN_FILL
+                    palette.down_fill
                 }
             }
         }
@@ -248,6 +272,49 @@ impl ChartEngine {
         }
     }
 
+    /// Recolor every KLineChart bar and dot output from scratch. Call after changing the candle
+    /// series' up/down colors or the chart's bullish/bearish layout colors: per-row colors are
+    /// resolved when values change, so they would otherwise keep the previous palette.
+    pub fn refresh_klinechart_colors(&mut self) {
+        let targets = self
+            .indicators
+            .iter()
+            .filter_map(|binding| match &binding.kind {
+                IndicatorKind::KLineChart(indicator) => Some((indicator, binding)),
+                _ => None,
+            })
+            .flat_map(|(indicator, binding)| {
+                binding
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, &output)| {
+                        klinechart_color_rule(indicator, index)
+                            .map(|rule| (rule, binding.source, output))
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (rule, source, output) in targets {
+            self.color_klinechart_output(rule, source, output, 0, true);
+            self.invalidate_frame_series(output);
+        }
+    }
+
+    /// The palette for per-row colors of outputs bound to `source`.
+    fn klinechart_palette(&self, source: SeriesId) -> KLineChartPalette {
+        let (theme_up, theme_down) = self.themed_candle_colors();
+        let series = self.series_entry(source);
+        let pick = |color: Option<&String>, fallback: Color| {
+            color
+                .and_then(|css| Color::parse_css(css))
+                .unwrap_or(fallback)
+        };
+        KLineChartPalette::new(
+            pick(series.and_then(|s| s.up_color.as_ref()), theme_up),
+            pick(series.and_then(|s| s.down_color.as_ref()), theme_down),
+        )
+    }
+
     /// Recolors the rows of a bar or dot output from `from_row` (all rows when `full`), after the
     /// output's values changed.
     pub(crate) fn color_klinechart_output(
@@ -258,6 +325,7 @@ impl ChartEngine {
         from_row: usize,
         full: bool,
     ) {
+        let palette = self.klinechart_palette(source);
         let (from, colors) = {
             let Some((_, output_values)) = self.data.series_data(output) else {
                 return;
@@ -281,7 +349,7 @@ impl ChartEngine {
                         bars[3][source_row],
                     ];
                     let previous = row.checked_sub(1).map(|previous| values[previous]);
-                    rule.color(values[row], previous, candle)
+                    rule.color(values[row], previous, candle, palette)
                 })
                 .collect::<Vec<_>>();
             (from, colors)
