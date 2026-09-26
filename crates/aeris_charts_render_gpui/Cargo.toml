@@ -24,9 +24,9 @@ aeris_charts_core = { path = "../aeris_charts_core", version = "0.3.0" }
 aeris_charts_engine = { path = "../aeris_charts_engine", version = "0.3.0" }
 aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
 
-# GPUI is sourced from Zed because Aeris and Aeris Terminal intentionally track the current pre-1.0
-# API. Both dependencies pin the same reviewed immutable commit; upgrades are explicit manifest and
-# lockfile changes and must pass the complete GPUI parity suite.
+# GPUI comes from `gpui-pre` 0.3.6, the published GPUI snapshot that gpui-kit (gpui-component)
+# 0.6.6 pins, so the chart renders inside gpui-kit applications with the same `gpui` types.
+# Upgrades are explicit manifest and lockfile changes and must pass the complete GPUI parity suite.
 #
 # `default-features = false` keeps unrelated platform feature paths out of the graph, so Windows
 # resolves cleanly to GPUI's native backend.
@@ -35,7 +35,7 @@ aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
 # only resolves under a comctl32 v6 activation context. That context comes from the application
 # manifest this feature embeds. Without it the executable fails to load at all
 # (STATUS_ENTRYPOINT_NOT_FOUND, 0xC0000139) before `main` runs.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "1057c2cf3d5b4aefd04755e1387c7826a4d7fba6", version = "=0.2.2", optional = true, default-features = false, features = [
+gpui = { package = "gpui-pre", version = "=0.3.6", optional = true, default-features = false, features = [
     "windows-manifest",
 ] }
 image = { version = "0.25", optional = true, default-features = false }
@@ -43,9 +43,15 @@ smallvec = { version = "1", optional = true }
 
 # The pixel-parity harness diffs GPUI's real output against Aeris's existing native rasterizer.
 [dev-dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1057c2cf3d5b4aefd04755e1387c7826a4d7fba6", default-features = false, features = [
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", default-features = false, features = [
     "wayland",
     "x11",
+] }
+# `gpui-pre-linux`'s `x11` feature does not turn on `gpui/x11`, which `guess_compositor` needs to
+# pick X11 from `DISPLAY`; without it an X11 session silently opens headless windows.
+gpui = { package = "gpui-pre", version = "=0.3.6", default-features = false, features = [
+    "x11",
+    "wayland",
 ] }
 aeris_charts_native = { path = "../aeris_charts_native", version = "0.3.0" }
 sha2 = "0.11"

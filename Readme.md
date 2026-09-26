@@ -26,9 +26,10 @@ is preparing the AGPL-licensed `0.3.0` release:
 | [`aeris_charts_native`](https://crates.io/crates/aeris_charts_native) | Native tiny-skia rasterizer and server-side PNG rendering |
 | [`aeris_charts_wasm`](https://crates.io/crates/aeris_charts_wasm) | WebAssembly browser host |
 
-The GPUI executor remains available from this repository because it relies on a reviewed Zed commit
-whose API differs from the crates.io `gpui` release. It is deliberately not published as a broken
-registry fallback. All published Aeris crates in a release use the same version. Existing
+The GPUI executor remains available from this repository. It builds on `gpui-pre` 0.3.6, the GPUI
+snapshot gpui-kit 0.6.6 pins, so it drops into gpui-kit applications. It is deliberately not
+published as a broken registry fallback. All published Aeris crates in a release use the same
+version. Existing
 registry artifacts remain under the license bundled with their release; repository source and
 future releases use the [AGPL and commercial dual-license model](#license).
 

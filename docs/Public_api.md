@@ -339,9 +339,9 @@ API within their minor line except where a correctness or security repair cannot
 releases may add, change, or remove pre-1.0 Rust APIs. All published Aeris crates in one release use
 the same version, and consumers should keep direct Aeris dependencies aligned.
 
-`aeris_charts_render_gpui` remains repository-only and experimental because it tracks a reviewed
-Zed Git revision whose API differs from the crates.io `gpui` release. Exact Git revisions are
-required for that backend; floating Git dependencies are unsupported.
+`aeris_charts_render_gpui` remains repository-only and experimental. It pins `gpui-pre` 0.3.6,
+the GPUI snapshot gpui-kit 0.6.6 depends on, with an exact version requirement; GPUI upgrades are
+explicit manifest and lockfile changes.
 
 ## Release policy
 

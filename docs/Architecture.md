@@ -19,7 +19,7 @@ Host API and market data
     -> pixels and frame metrics
 ```
 
-Browser hosts enter through `packages/charts`, which translates the supported public TypeScript API into typed arrays and WebAssembly calls. Rust hosts use the versioned `aeris_charts_engine` crate directly and select a renderer from the coordinated crates.io release, first published as version `0.1.0`. Repository development still resolves those crates through local paths, with the same explicit version used for registry consumers. The GPUI executor remains repository-only because it tracks a reviewed Zed commit whose API differs from the crates.io `gpui` release. Rendering backends consume prepared frame data; they do not own chart semantics.
+Browser hosts enter through `packages/charts`, which translates the supported public TypeScript API into typed arrays and WebAssembly calls. Rust hosts use the versioned `aeris_charts_engine` crate directly and select a renderer from the coordinated crates.io release, first published as version `0.1.0`. Repository development still resolves those crates through local paths, with the same explicit version used for registry consumers. The GPUI executor remains repository-only; in this fork it builds on `gpui-pre` 0.3.6, the GPUI snapshot that gpui-kit 0.6.6 pins, so it renders inside gpui-kit applications with the same `gpui` types. Rendering backends consume prepared frame data; they do not own chart semantics.
 
 The web demo exposes all built-in calculation APIs in a searchable Indicators catalog. Entries create their engine bindings on demand and remove all owned outputs and synthetic volume dependencies when cleared. RSI uses the same engine calculation and oscillator pane as package consumers; no separate demo formula is maintained.
 

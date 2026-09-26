@@ -124,7 +124,7 @@ Run Playwright once per batch when the batch changes browser-facing behavior, an
 
 Keep every publishable Aeris crate on one coordinated version and keep each internal dependency's
 `path` plus `version` fields aligned. `aeris_charts_render_gpui` is repository-only and must retain
-`publish = false` while it depends on the reviewed Zed Git revision.
+`publish = false`; it pins `gpui-pre` 0.3.6 to share GPUI with gpui-kit 0.6.6.
 
 After the complete gates pass, publish with `--locked` in dependency order and wait for each crate to
 be indexed before publishing its consumers:

@@ -37,7 +37,8 @@ bundled with their release.
 | [`aeris_charts_wasm`](https://crates.io/crates/aeris_charts_wasm) | WebAssembly browser host |
 
 The optional GPUI executor is available from the repository but is not published to crates.io. It
-tracks a reviewed Zed commit whose API differs from the registry `gpui` release.
+builds on `gpui-pre` 0.3.6, the GPUI snapshot that gpui-kit 0.6.6 pins, rather than the registry
+`gpui` release.
 
 ## Publish order and deprecation
 
