@@ -830,7 +830,7 @@ pub(crate) fn verbatim_color(value: &Option<String>, fallback: Color) -> Color {
 }
 
 impl ChartEngine {
-    fn themed_candle_colors(&self) -> (Color, Color) {
+    pub(crate) fn themed_candle_colors(&self) -> (Color, Color) {
         let layout = &self.options.get().layout;
         (
             Color::parse_css(&layout.bullish_color).unwrap_or(UP),
