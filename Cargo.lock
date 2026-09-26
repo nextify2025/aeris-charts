@@ -137,6 +137,7 @@ name = "aeris_charts_indicators"
 version = "0.3.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

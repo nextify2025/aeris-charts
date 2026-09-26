@@ -16,6 +16,10 @@
 //! figure unset. KLineChart does not validate periods; here a zero period yields an all-`None`
 //! output instead of dividing by zero.
 //!
+//! [`Indicator`] bundles a template with its parameters. It is the form a chart binds
+//! ([`crate::IncrementalState::klinechart`]) and persists, and it carries the presentation
+//! metadata a host needs to draw the outputs the way KLineChart does.
+//!
 //! KLineChart is Copyright (c) 2019 lihu and licensed under the Apache License, Version 2.0. Each
 //! module names the KLineChart source file it was translated from. Changes: translated from
 //! TypeScript to Rust, and outputs are returned as columns instead of per-row objects.
@@ -32,6 +36,7 @@ mod different_of_moving_average;
 mod directional_movement_index;
 mod ease_of_movement_value;
 mod exponential_moving_average;
+mod indicator;
 mod momentum;
 mod moving_average;
 mod moving_average_convergence_divergence;
@@ -60,6 +65,7 @@ pub use different_of_moving_average::{dma, Dma};
 pub use directional_movement_index::{dmi, Dmi};
 pub use ease_of_movement_value::{emv, Emv};
 pub use exponential_moving_average::ema;
+pub use indicator::{Bars, Figure, Indicator, Param, Placement, ValueFormat, MAX_PERIOD, NAMES};
 pub use momentum::{mtm, Mtm};
 pub use moving_average::ma;
 pub use moving_average_convergence_divergence::{macd, Macd};

@@ -22,6 +22,7 @@ mod hit_test;
 mod host_layout;
 mod indicators;
 mod interaction;
+mod klinechart_indicators;
 mod native_primitives;
 mod volume_profile;
 pub use volume_profile::{
@@ -43,7 +44,7 @@ use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 
-pub use aeris_charts_indicators::{PivotKind, VwapReset};
+pub use aeris_charts_indicators::{klinechart, PivotKind, VwapReset};
 pub use alerts::{
     AlertCondition, AlertCreateRequest, AlertFrequency, AlertId, AlertLine, AlertLineStatus,
     AlertPriceScale, AlertSnapshot, MAX_ALERT_LINES,
@@ -127,6 +128,11 @@ pub use interaction::{
     WheelSample, KINETIC_DUMPING, KINETIC_MAX_SPEED, KINETIC_MIN_MOVE, KINETIC_MIN_SPEED,
     MAX_ACTIVE_POINTERS, PINCH_ZOOM_INTENSITY, WHEEL_SCROLL_PX_PER_DELTA,
 };
+pub(crate) use klinechart_indicators::{
+    apply_klinechart_output_style, apply_klinechart_value_format, klinechart_color_rule,
+    klinechart_kind_name, klinechart_output_color, klinechart_primary_period, KLineChartColorRule,
+};
+pub use klinechart_indicators::{klinechart_indicator_for_kind_name, KLINECHART_LINE_COLORS};
 pub use native_primitives::{
     AccessibilityFocusOptions, AnchoredTextHorizontalAlign, AnchoredTextOptions,
     AnchoredTextVerticalAlign, BandsIndicatorOptions, DeltaTooltipActiveRange, DeltaTooltipOptions,

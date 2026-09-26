@@ -383,6 +383,7 @@ fn incremental_output_count(kind: &IndicatorKind) -> usize {
         IndicatorKind::Macd { .. } => 3,
         IndicatorKind::Stochastic { .. } => 2,
         IndicatorKind::VwapBands { .. } => 5,
+        IndicatorKind::KLineChart(indicator) => indicator.output_count(),
     }
 }
 
@@ -460,6 +461,7 @@ fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
             percent,
             ..
         } => standard_deviation.is_finite() && percent.is_finite(),
+        IndicatorKind::KLineChart(indicator) => indicator.is_valid(),
     }
 }
 

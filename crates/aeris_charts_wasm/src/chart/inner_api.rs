@@ -193,7 +193,11 @@ impl ChartInner {
                 percent: 10.0,
             },
             "wma" => IndicatorKind::Wma { period },
-            _ => return "null".into(),
+            // KLineChart templates (`klinechart_macd`, ...) describe their default parameters.
+            other => match aeris_charts_engine::klinechart_indicator_for_kind_name(other) {
+                Some(indicator) => IndicatorKind::KLineChart(indicator),
+                None => return "null".into(),
+            },
         };
         serde_json::to_string(&ChartEngine::indicator_schema(&definition))
             .unwrap_or_else(|_| "null".into())
