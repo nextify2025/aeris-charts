@@ -1022,9 +1022,10 @@ impl ChartView {
                 let series = self.engine.hit_test_series(pane_x, y);
                 self.engine.set_hovered_series(series);
             }
-            let logical = (self.engine.time_scale.coordinate_to_float_index(pane_x) + 0.5).floor();
-            self.hover = (logical >= 0.0 && !self.candles.is_empty())
-                .then(|| (logical as usize).min(self.candles.len() - 1));
+            // The same bar the crosshair's time label names.
+            let index = self.engine.time_scale.coordinate_to_index(pane_x);
+            self.hover = (index >= 0 && !self.candles.is_empty())
+                .then(|| (index as usize).min(self.candles.len() - 1));
         } else {
             self.engine.crosshair = None;
             self.clear_hover();
