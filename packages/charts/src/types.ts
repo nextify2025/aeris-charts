@@ -1808,6 +1808,10 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * stop), horizontal line/ray, vertical line, and text (1 each), a multi-click arrow-ended
  * straight-segment path (variable length, every vertex editable), and the freehand brush (a
  * variable-length curve, anchor handles at the two ends).
+ *
+ * The tools ported from KLineChart's overlays: straight line, ray line, horizontal segment,
+ * vertical ray/segment, and Fibonacci line (2 anchors each), parallel line and price channel
+ * (3), and price line, simple annotation, and simple tag (1 each).
  */
 export type drawing_kind =
   | "trend_line"
@@ -1819,7 +1823,18 @@ export type drawing_kind =
   | "brush"
   | "path"
   | "long_position"
-  | "short_position";
+  | "short_position"
+  | "straight_line"
+  | "ray_line"
+  | "horizontal_segment"
+  | "vertical_ray"
+  | "vertical_segment"
+  | "price_line"
+  | "parallel_line"
+  | "price_channel"
+  | "fibonacci_line"
+  | "simple_annotation"
+  | "simple_tag";
 
 export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   trend_line: 0,
@@ -1832,6 +1847,17 @@ export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   path: 7,
   long_position: 8,
   short_position: 9,
+  straight_line: 10,
+  ray_line: 11,
+  horizontal_segment: 12,
+  vertical_ray: 13,
+  vertical_segment: 14,
+  price_line: 15,
+  parallel_line: 16,
+  price_channel: 17,
+  fibonacci_line: 18,
+  simple_annotation: 19,
+  simple_tag: 20,
 };
 
 /**

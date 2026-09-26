@@ -1745,7 +1745,10 @@ impl ChartEngine {
                 if drawing.pane_index != pi
                     || !matches!(
                         drawing.kind,
-                        DrawingKind::HorizontalLine | DrawingKind::HorizontalRay
+                        DrawingKind::HorizontalLine
+                            | DrawingKind::HorizontalRay
+                            | DrawingKind::PriceLine
+                            | DrawingKind::SimpleTag
                     )
                 {
                     continue;
@@ -1759,6 +1762,10 @@ impl ChartEngine {
                 }
                 let logical = scale.price_to_logical_value(point.price, base);
                 let text = match series {
+                    // A KLineChart tag shows its own text in place of the price.
+                    _ if drawing.kind == DrawingKind::SimpleTag && !drawing.text.is_empty() => {
+                        drawing.text.clone()
+                    }
                     Some(s) => self.format_series_value(s, scale, logical),
                     None => self.format_scale_value(scale, logical),
                 };

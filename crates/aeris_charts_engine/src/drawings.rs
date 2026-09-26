@@ -27,8 +27,8 @@ mod geometry;
 mod tools;
 
 pub(crate) use geometry::{
-    resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, PositionGeometry,
-    PositionZone,
+    resolve_drawing_geometry, AnnotationGeometry, DrawingBodyGeometry, DrawingGeometryOptions,
+    PositionGeometry, PositionZone, FIBONACCI_LEVELS,
 };
 pub(crate) use tools::{
     DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
@@ -367,6 +367,36 @@ pub enum DrawingKind {
     LongPosition,
     /// Three-anchor Short Position annotation: entry, target, stop.
     ShortPosition,
+    /// Two-anchor line extended across the whole pane (KLineChart `straightLine`).
+    StraightLine,
+    /// Two-anchor ray from the first anchor through the second to the pane edge (KLineChart
+    /// `rayLine`).
+    RayLine,
+    /// Two-anchor horizontal segment; both anchors share one price (KLineChart
+    /// `horizontalSegment`).
+    HorizontalSegment,
+    /// Two-anchor vertical ray from the first anchor toward the second anchor's side; both
+    /// anchors share one bar (KLineChart `verticalRayLine`).
+    VerticalRay,
+    /// Two-anchor vertical segment; both anchors share one bar (KLineChart `verticalSegment`).
+    VerticalSegment,
+    /// One-anchor ray to the right labeled with the anchor's price (KLineChart `priceLine`).
+    PriceLine,
+    /// Three-anchor pair of parallel lines: through the first two anchors and through the third
+    /// (KLineChart `parallelStraightLine`).
+    ParallelLine,
+    /// Three-anchor price channel: the parallel pair plus the first line mirrored beyond the
+    /// second (KLineChart `priceChannelLine`).
+    PriceChannel,
+    /// Two-anchor Fibonacci retracement: levels at 100%, 78.6%, 61.8%, 50%, 38.2%, 23.6%, and 0%
+    /// from the first anchor's price to the second's (KLineChart `fibonacciLine`).
+    FibonacciLine,
+    /// One-anchor callout: a dashed stem and arrow above the anchor, with the drawing's text
+    /// (KLineChart `simpleAnnotation`).
+    SimpleAnnotation,
+    /// One-anchor dashed full-width line tagged on the price axis with the drawing's text, or its
+    /// price (KLineChart `simpleTag`).
+    SimpleTag,
 }
 
 impl DrawingKind {
@@ -611,11 +641,12 @@ impl Drawing {
         pane_index: usize,
         mut points: Vec<DrawingPoint>,
     ) -> Self {
-        Self::normalize_position_points(kind, &mut points);
-        let (text_h_align, text_v_align) = if kind == DrawingKind::TrendLine {
-            (DrawingTextHAlign::Right, DrawingTextVAlign::Top)
-        } else {
-            (DrawingTextHAlign::Center, DrawingTextVAlign::Middle)
+        Self::normalize_points(kind, &mut points);
+        let (text_h_align, text_v_align) = match kind {
+            DrawingKind::TrendLine => (DrawingTextHAlign::Right, DrawingTextVAlign::Top),
+            // KLineChart centers the annotation text on top of its arrow.
+            DrawingKind::SimpleAnnotation => (DrawingTextHAlign::Center, DrawingTextVAlign::Top),
+            _ => (DrawingTextHAlign::Center, DrawingTextVAlign::Middle),
         };
         Self {
             id,
@@ -635,12 +666,27 @@ impl Drawing {
             extend_right: false,
             fill_enabled: kind == DrawingKind::Rectangle,
             magnet: Default::default(),
-            labels: Vec::new(),
+            // KLineChart's price line prints the anchor's price on its line.
+            labels: if kind == DrawingKind::PriceLine {
+                vec![crate::DrawingLabelOptions {
+                    metric: crate::DrawingLabelMetric::Price,
+                    visible: true,
+                    position: crate::DrawingLabelPosition::Above,
+                    text: None,
+                }]
+            } else {
+                Vec::new()
+            },
             levels: Vec::new(),
             price_scale: DrawingPriceScale::Right,
             color: DRAWING_DEFAULT_COLOR.to_string(),
             width: kind.spec().default_width,
-            style: LineStyle::Solid,
+            // KLineChart draws its annotation and tag overlays dashed.
+            style: if matches!(kind, DrawingKind::SimpleAnnotation | DrawingKind::SimpleTag) {
+                LineStyle::Dashed
+            } else {
+                LineStyle::Solid
+            },
             fill_color: None,
             preview_fill_color: None,
             border_visible: true,
@@ -660,6 +706,16 @@ impl Drawing {
             box_border_color: None,
             box_border_width: 1.0,
         }
+    }
+
+    /// Repair a supplied point list to the kind's invariants: linked anchors share their linked
+    /// coordinate (taken from the last anchor, the one placed last), and positions keep their
+    /// semantic levels.
+    pub(crate) fn normalize_points(kind: DrawingKind, points: &mut [DrawingPoint]) {
+        kind.spec()
+            .anchor_link
+            .apply(points, points.len().saturating_sub(1));
+        Self::normalize_position_points(kind, points);
     }
 
     /// Long/Short Position has semantic levels, not three unrelated corners. Keep the stop on the
@@ -2402,7 +2458,7 @@ impl ChartEngine {
         {
             return false;
         }
-        Drawing::normalize_position_points(drawing.kind, &mut points);
+        Drawing::normalize_points(drawing.kind, &mut points);
         let before = drawing.clone();
         self.drawings[index].points = points;
         let after = self.drawings[index].clone();
@@ -3361,6 +3417,24 @@ impl ChartEngine {
                 )
                 .is_some()
             }
+            DrawingBodyGeometry::Lines { lines, count } => lines[..count]
+                .iter()
+                .any(|&(a, b)| distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance),
+            DrawingBodyGeometry::Fibonacci { x0, x1, y100, y0 } => {
+                x >= x0.min(x1) - hit_tolerance
+                    && x <= x0.max(x1) + hit_tolerance
+                    && FIBONACCI_LEVELS.iter().any(|&level| {
+                        (y - DrawingBodyGeometry::fibonacci_y(y100, y0, level)).abs() <= tolerance
+                    })
+            }
+            DrawingBodyGeometry::Annotation(annotation) => {
+                // The stem and arrowhead; the label above is hit through the text box below.
+                let near_stem = (x - annotation.x).abs()
+                    <= tolerance.max(annotation.head_half_width)
+                    && y >= annotation.head_top - hit_tolerance
+                    && y <= annotation.stem_bottom + hit_tolerance;
+                near_stem || self.drawing_label_hit(drawing, &geometry.text_box, x, y)
+            }
             DrawingBodyGeometry::Empty => {
                 // The click/hover target is the interaction-chrome box (the label run while
                 // non-empty, else a one-em caret box — empty text paints nothing on the chart)
@@ -3383,6 +3457,23 @@ impl ChartEngine {
                     && y <= ty + height / 2.0 + TEXT_CHROME_PAD
             }
         }
+    }
+
+    /// Whether `(x, y)` falls on a drawing's non-empty label placed against `reference`.
+    fn drawing_label_hit(&self, drawing: &Drawing, reference: &TextBox, x: f64, y: f64) -> bool {
+        if drawing.text.is_empty() {
+            return false;
+        }
+        let size = drawing.resolved_text_size(self.options.get().layout.font_size);
+        let (tx, ty, align, _) = Self::text_placement(drawing, reference, size, TEXT_PAD);
+        let width = self.measure_drawing_text(drawing, size);
+        let height = size * 1.2;
+        let left = match align {
+            DrawingTextHAlign::Left => tx,
+            DrawingTextHAlign::Center => tx - width / 2.0,
+            DrawingTextHAlign::Right => tx - width,
+        };
+        x >= left && x <= left + width && y >= ty - height / 2.0 && y <= ty + height / 2.0
     }
 
     // --- drag session (anchor re-anchoring / whole-body move) ---
@@ -3648,6 +3739,8 @@ impl ChartEngine {
                     }
                 }
                 points[index] = point;
+                // A horizontal or vertical segment drags its linked coordinate on every anchor.
+                kind.spec().anchor_link.apply(&mut points, index);
             }
             DrawingDragPart::Body => {
                 // Reference-informed shift-move: constrain the translation to the dominant axis.
@@ -4323,6 +4416,7 @@ impl ChartEngine {
         };
         let mut drawing = pending.drawing;
         drawing.id = id;
+        Drawing::normalize_points(drawing.kind, &mut drawing.points);
         self.drawings.push(drawing);
         self.insert_drawing_runtime(id);
         self.selected_drawing = Some(id);
@@ -4603,5 +4697,7 @@ impl ChartEngine {
     }
 }
 
+#[cfg(test)]
+mod klinechart_tests;
 #[cfg(test)]
 mod tests;

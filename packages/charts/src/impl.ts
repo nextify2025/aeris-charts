@@ -70,6 +70,17 @@ const DRAWING_KIND_FROM_U8: readonly drawing_kind[] = [
   "path",
   "long_position",
   "short_position",
+  "straight_line",
+  "ray_line",
+  "horizontal_segment",
+  "vertical_ray",
+  "vertical_segment",
+  "price_line",
+  "parallel_line",
+  "price_channel",
+  "fibonacci_line",
+  "simple_annotation",
+  "simple_tag",
 ];
 
 type persistence_error_result = {

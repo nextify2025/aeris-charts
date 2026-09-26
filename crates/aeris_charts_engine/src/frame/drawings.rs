@@ -14,9 +14,10 @@ use aeris_charts_render::draw_list::{IRect, LineStyle, LineType, Prim, TextAlign
 
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::{
-    resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
-    DrawingHandleMode, DrawingId, DrawingKind, DrawingTextHAlign, PositionGeometry, PositionZone,
-    TEXT_CHROME_PAD, TEXT_PAD, TREND_TEXT_PLACEHOLDER,
+    resolve_drawing_geometry, AnnotationGeometry, Drawing, DrawingBodyGeometry,
+    DrawingGeometryOptions, DrawingHandleMode, DrawingId, DrawingKind, DrawingTextHAlign,
+    PositionGeometry, PositionZone, FIBONACCI_LEVELS, TEXT_CHROME_PAD, TEXT_PAD,
+    TREND_TEXT_PLACEHOLDER,
 };
 use crate::ChartEngine;
 use aeris_charts_core::model::plot_list::PlotValueIndex;
@@ -63,6 +64,32 @@ fn push_segment(
         width: (drawing.width * vpr) as f32,
         style: drawing.style,
         line_type: LineType::Simple,
+        color,
+    });
+}
+
+/// KLineChart `simpleAnnotation`: the dashed stem and the arrowhead pointing down at it.
+fn push_annotation(
+    annotation: AnnotationGeometry,
+    style: LineStyle,
+    color: Color,
+    width: i32,
+    out: &mut Vec<Prim>,
+) {
+    out.push(Prim::VLine {
+        x: annotation.x.round() as i32,
+        y0: annotation.stem_top.round() as i32,
+        y1: annotation.stem_bottom.round() as i32,
+        width,
+        style,
+        color,
+    });
+    let x = annotation.x as f32;
+    let half = annotation.head_half_width as f32;
+    out.push(Prim::Triangle {
+        a: [x, annotation.stem_top as f32],
+        b: [x - half, annotation.head_top as f32],
+        c: [x + half, annotation.head_top as f32],
         color,
     });
 }
@@ -385,7 +412,7 @@ impl ChartEngine {
                 let ready = if is_sequence {
                     anchors.len() >= pending.drawing.kind.anchor_count()
                 } else {
-                    anchors.len() == pending.drawing.kind.anchor_count()
+                    anchors.len() >= usize::from(pending.drawing.kind.spec().preview_points)
                 };
                 if ready {
                     let px: Option<Vec<(f64, f64)>> = anchors
@@ -398,6 +425,8 @@ impl ChartEngine {
                         let px: Vec<(f64, f64)> =
                             px.into_iter().map(|(x, y)| (x * hpr, y * vpr)).collect();
                         let mut preview_drawing = pending.drawing.clone();
+                        // Price-derived labels (Fibonacci levels) read the live anchors.
+                        preview_drawing.points = anchors.clone();
                         if preview_drawing.kind.spec().handles == DrawingHandleMode::RectangleBounds
                         {
                             if let Some(fill) = preview_drawing.preview_fill_color.clone() {
@@ -647,6 +676,8 @@ impl ChartEngine {
                 }
             }
             DrawingBodyGeometry::Vertical { x, y0, y1 } => {
+                // Rays and segments may run upward from their first anchor.
+                let (y0, y1) = (y0.min(y1), y0.max(y1));
                 out.push(Prim::VLine {
                     x: x.round() as i32,
                     y0: y0.round().max(0.0) as i32,
@@ -754,6 +785,24 @@ impl ChartEngine {
                     );
                 }
             }
+            DrawingBodyGeometry::Lines { lines, count } => {
+                for &(a, b) in &lines[..count] {
+                    push_segment(a, b, drawing, color, vpr, out, points);
+                }
+            }
+            DrawingBodyGeometry::Fibonacci { x0, x1, y100, y0 } => {
+                self.push_fibonacci_levels(
+                    drawing,
+                    (x0, x1, y100, y0),
+                    pane_w_px,
+                    (color, crisp_width),
+                    vpr,
+                    out,
+                );
+            }
+            DrawingBodyGeometry::Annotation(annotation) => {
+                push_annotation(annotation, drawing.style, color, crisp_width, out);
+            }
             // The text tool's geometry is its label (emitted by `build_drawing_text`).
             DrawingBodyGeometry::Empty => {}
             DrawingBodyGeometry::Polyline {
@@ -808,6 +857,67 @@ impl ChartEngine {
                     });
                 }
             }
+        }
+    }
+
+    /// KLineChart `fibonacciLine`: one full-width line per level, each labeled on its left end
+    /// with the level's price and percentage, e.g. `123.45 (61.8%)`. Prices interpolate between
+    /// the two anchors' prices; positions interpolate between their pixels, as in KLineChart.
+    fn push_fibonacci_levels(
+        &self,
+        drawing: &Drawing,
+        (x0, x1, y100, y0): (f64, f64, f64, f64),
+        pane_w_px: i32,
+        (color, width): (Color, i32),
+        vpr: f64,
+        out: &mut Vec<Prim>,
+    ) {
+        let left = (x0.min(x1).round() as i32).clamp(0, pane_w_px);
+        let right = (x0.max(x1).round() as i32).clamp(0, pane_w_px);
+        let prices = drawing
+            .points
+            .first()
+            .zip(drawing.points.get(1))
+            .map(|(first, second)| (first.price, second.price));
+        let layout = &self.options.get().layout;
+        let size = drawing.resolved_text_size(layout.font_size) * vpr;
+        let text_color = drawing
+            .text_color
+            .as_deref()
+            .and_then(Color::parse_css)
+            .unwrap_or(color);
+        for level in FIBONACCI_LEVELS {
+            let y = DrawingBodyGeometry::fibonacci_y(y100, y0, level);
+            if left != right {
+                out.push(Prim::HLine {
+                    y: y.round() as i32,
+                    x0: left,
+                    x1: right,
+                    width,
+                    style: drawing.style,
+                    color,
+                });
+            }
+            let Some((price_100, price_0)) = prices else {
+                continue;
+            };
+            let price = price_0 + (price_100 - price_0) * level;
+            out.push(Prim::Text {
+                x: (f64::from(left) + TEXT_PAD * vpr) as f32,
+                // Sits on the line, like KLineChart's bottom-baseline labels.
+                y: (y - size / 2.0 - 2.0 * vpr) as f32,
+                text: format!(
+                    "{} ({:.1}%)",
+                    self.price_formatter.format(price),
+                    level * 100.0
+                ),
+                color: text_color,
+                size: size as f32,
+                family: layout.font_family.clone(),
+                align: TextAlign::Left,
+                weight: drawing.text_weight.unwrap_or(400),
+                italic: drawing.text_italic,
+            });
         }
     }
 
@@ -893,10 +1003,16 @@ impl ChartEngine {
         // the focus border still paint — the editor wrap is borderless with transparent glyphs,
         // so entering edit cannot lift the text or shift the outline (the public reference's
         // overlay-caret model).
+        // A tag's text is its price-axis label (`append_drawing_line_labels`).
+        if drawing.kind == DrawingKind::SimpleTag {
+            return;
+        }
         let Some((text, placeholder)) = self.drawing_frame_text(drawing) else {
             return;
         };
         let is_text_tool = drawing.kind == DrawingKind::Text;
+        // KLineChart boxes annotation text in the overlay color, with white text.
+        let is_annotation = drawing.kind == DrawingKind::SimpleAnnotation;
         let (size, x, y, align, angle) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
         let layout = &self.options.get().layout;
         let mut color = drawing
@@ -908,6 +1024,7 @@ impl ChartEngine {
                     .then(|| Color::parse_css(&drawing.color))
                     .flatten()
             })
+            .or_else(|| is_annotation.then(|| Color::rgb(255, 255, 255)))
             .or_else(|| Color::parse_css(&layout.text_color))
             .unwrap_or_else(|| {
                 let fallback = aeris_charts_core::style::DEFAULT_FOREGROUND_RGB;
@@ -927,12 +1044,20 @@ impl ChartEngine {
         // border) — strong-color thin geometry at fractional positions AA-phases differently
         // between the backends, so the box snaps to whole device px (the public reference's boxes are
         // crisp the same way).
-        let box_fill = drawing.box_color.as_deref().and_then(Color::parse_css);
+        let box_fill = drawing
+            .box_color
+            .as_deref()
+            .and_then(Color::parse_css)
+            .or_else(|| {
+                is_annotation
+                    .then(|| Color::parse_css(&drawing.color))
+                    .flatten()
+            });
         let box_border = drawing
             .box_border_color
             .as_deref()
             .and_then(Color::parse_css);
-        if is_text_tool && (box_fill.is_some() || box_border.is_some()) {
+        if (is_text_tool || is_annotation) && (box_fill.is_some() || box_border.is_some()) {
             let width = self.measure_drawing_text(drawing, size);
             let height = size * 1.2;
             let pad = 4.0 * vpr;
