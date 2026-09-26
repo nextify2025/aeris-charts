@@ -29,7 +29,7 @@ pub fn cr(high: &[f64], low: &[f64], period: usize, ma_periods: [usize; 4]) -> C
         let prev = i.saturating_sub(1);
         (high[prev] + low[prev]) / 2.0
     };
-    let forward = ma_periods.map(|m| (m as f64 / 2.5 + 1.0).ceil() as usize);
+    let forward = ma_periods.map(forward_shift);
     let mut ma_sums = [0.0; 4];
     let mut ma_lists: [Vec<f64>; 4] = Default::default();
     let mut high_sub_sum = 0.0;
@@ -68,4 +68,9 @@ pub fn cr(high: &[f64], low: &[f64], period: usize, ma_periods: [usize; 4]) -> C
         }
     }
     out
+}
+
+/// How many rows a CR moving average is shifted by: `CEIL(M / 2.5 + 1)`.
+pub(super) fn forward_shift(ma_period: usize) -> usize {
+    (ma_period as f64 / 2.5 + 1.0).ceil() as usize
 }

@@ -1852,7 +1852,7 @@ fn add_test_indicator(
     )
 }
 
-fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding_index: usize) {
+pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding_index: usize) {
     let binding = &chart.indicators[binding_index];
     let (times, source) = chart.data.series_data(binding.source).unwrap();
     let expected = match binding.kind {
@@ -2189,10 +2189,56 @@ fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding_index: usi
                 points.iter().map(|point| point.j).collect(),
             ]
         }
+        IndicatorKind::KLineChart(ref indicator) => {
+            let missing = indicator.missing_volume();
+            let volume = binding
+                .volume_source
+                .and_then(|id| chart.data.series_data(id))
+                .map(|(volume_times, values)| {
+                    let mut aligned = vec![missing; times.len()];
+                    let mut volume_row = 0;
+                    for (source_row, &time) in times.iter().enumerate() {
+                        while volume_row < volume_times.len() && volume_times[volume_row] < time {
+                            volume_row += 1;
+                        }
+                        if volume_times.get(volume_row) == Some(&time) {
+                            aligned[source_row] = values[3][volume_row];
+                        }
+                    }
+                    aligned
+                })
+                .unwrap_or_else(|| vec![missing; times.len()]);
+            indicator.compute(&aeris_charts_indicators::klinechart::Bars {
+                open: source[0],
+                high: source[1],
+                low: source[2],
+                close: source[3],
+                volume: &volume,
+                turnover: source[3],
+            })
+        }
     };
 
-    for (&output, expected) in binding.outputs.iter().zip(expected) {
-        let expected = if matches!(
+    // KLineChart outputs are dense from their declared warm-up row, with NaN where unset.
+    let klinechart_starts = match &binding.kind {
+        IndicatorKind::KLineChart(indicator) => Some(indicator.output_starts()),
+        _ => None,
+    };
+    for (output_index, (&output, expected)) in binding.outputs.iter().zip(expected).enumerate() {
+        let expected = if let Some(starts) = klinechart_starts {
+            times
+                .iter()
+                .copied()
+                .zip(expected)
+                .skip(starts[output_index])
+                .map(|(time, value)| {
+                    (
+                        time,
+                        value.filter(|value| value.is_finite()).unwrap_or(f64::NAN),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else if matches!(
             binding.kind,
             IndicatorKind::PivotPoints { .. } | IndicatorKind::ZigZag { .. }
         ) {
