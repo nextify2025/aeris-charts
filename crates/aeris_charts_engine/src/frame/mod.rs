@@ -2372,6 +2372,12 @@ impl ChartEngine {
             if !minimum.is_finite() || !maximum.is_finite() {
                 continue;
             }
+            // reference series.ts `_autoscaleInfoImpl`: a histogram's range always includes the
+            // `base` its columns grow from, so columns are never clipped at the pane edge.
+            if s.kind == SeriesKind::Histogram && s.base.is_finite() {
+                minimum = minimum.min(s.base);
+                maximum = maximum.max(s.base);
+            }
             if s.kind == SeriesKind::Footprint {
                 let Some(state) = s.footprint.as_ref() else {
                     continue;
