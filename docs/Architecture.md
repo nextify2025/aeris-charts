@@ -475,6 +475,16 @@ native scroll and keyboard-focus facilities; the browser uses semantic headings,
 and a dismissible compact inspector. These shells retain the existing engine/API action paths;
 the finite GPUI probe and browser runtime fixtures keep their dedicated measurement layouts.
 
+`apps/stock-detail` is an application host outside the Cargo workspace (it has its own workspace
+and lockfile, so ordinary workspace builds never compile gpui-kit). It embeds one `ChartEngine` in
+a gpui-kit page through the same host contract as `gpui_probe`: data and KLineChart indicator
+bindings go through public engine calls, the frame is rebuilt in GPUI prepaint with GPUI's own
+text measurement and painted by `GpuiChartRenderer`, and pointer input feeds the shared gesture
+and drawing-tool APIs. Page chrome (quote header, period and indicator controls, drawing toolbar,
+per-pane legends) is gpui-kit UI laid over or around the canvas and reads engine state only. Market
+data enters through the app's own `MarketData` trait: a deterministic simulated feed by default,
+or Longbridge OpenAPI behind the app's `longbridge` feature.
+
 ### `aeris_charts_render_wgpu`
 
 The WebGPU executor. It owns quad, triangle, textured-label, atlas, blend, multisample, scissor, and GPU timing resources. GPU objects are reused across frames and rebuilt only when their actual invalidation inputs change.

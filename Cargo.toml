@@ -10,6 +10,9 @@ members = [
     "crates/aeris_charts_wasm",
     "crates/aeris_charts_native",
 ]
+# The gpui-kit stock-detail demo is its own workspace so ordinary workspace builds never compile
+# gpui-kit.
+exclude = ["apps/stock-detail"]
 
 [workspace.package]
 version = "0.3.0"
