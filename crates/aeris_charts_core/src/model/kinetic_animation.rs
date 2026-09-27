@@ -131,6 +131,24 @@ impl KineticAnimation {
         );
     }
 
+    /// Move every retained sample and the engaged coast anchor by `delta`. A data
+    /// synchronization that rebases the scroll position (history insert, retention trim) calls
+    /// this so an in-flight coast continues over the same content; speeds are unchanged.
+    pub fn shift_positions(&mut self, delta: f64) {
+        for sample in [
+            &mut self.position1,
+            &mut self.position2,
+            &mut self.position3,
+            &mut self.position4,
+            &mut self.animation_start_position,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            sample.position += delta;
+        }
+    }
+
     /// reference `getPosition`. Only meaningful while `!finished(time)`.
     pub fn position(&self, time: f64) -> f64 {
         let Some(start) = self.animation_start_position else {

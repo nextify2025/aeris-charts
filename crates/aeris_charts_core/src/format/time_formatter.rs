@@ -11,6 +11,7 @@
 
 use std::sync::LazyLock;
 
+use crate::scale::exchange_time::ExchangeTime;
 use crate::scale::time_tick_marks::{civil_from_timestamp, TickMarkWeight};
 
 const MONTHS_SHORT: [&str; 12] = [
@@ -126,17 +127,33 @@ pub fn format_tick_label(ts: i64, mark_type: TickMarkType) -> String {
 /// [`format_tick_label`] with per-locale month names for the `Month` mark (reference
 /// `localization.locale` applied to the time axis).
 pub fn format_tick_label_with(ts: i64, mark_type: TickMarkType, months: &MonthNames) -> String {
-    let (year, month, day) = civil_from_timestamp(ts);
+    format_tick_label_in(ts, mark_type, months, &ExchangeTime::UTC)
+}
+
+/// [`format_tick_label_with`] in exchange time: Year/Month/DayOfMonth marks name the exchange
+/// trading date (the local date shifted by the session start), and time marks show exchange
+/// wall-clock time.
+pub fn format_tick_label_in(
+    ts: i64,
+    mark_type: TickMarkType,
+    months: &MonthNames,
+    time: &ExchangeTime,
+) -> String {
     match mark_type {
-        TickMarkType::Year => format!("{year}"),
-        TickMarkType::Month => months.short[(month - 1) as usize].clone(),
-        TickMarkType::DayOfMonth => format!("{day}"),
+        TickMarkType::Year | TickMarkType::Month | TickMarkType::DayOfMonth => {
+            let (year, month, day) = time.trading_date(ts);
+            match mark_type {
+                TickMarkType::Year => format!("{year}"),
+                TickMarkType::Month => months.short[(month - 1) as usize].clone(),
+                _ => format!("{day}"),
+            }
+        }
         TickMarkType::Time => {
-            let (h, m, _) = hms(ts);
+            let (h, m, _) = hms(time.local_seconds(ts));
             format!("{h:02}:{m:02}")
         }
         TickMarkType::TimeWithSeconds => {
-            let (h, m, s) = hms(ts);
+            let (h, m, s) = hms(time.local_seconds(ts));
             format!("{h:02}:{m:02}:{s:02}")
         }
     }
@@ -257,6 +274,27 @@ pub fn format_crosshair_time_with(
     date_format: &str,
     months: &MonthNames,
 ) -> String {
+    format_crosshair_time_in(
+        ts,
+        time_visible,
+        seconds_visible,
+        date_format,
+        months,
+        &ExchangeTime::UTC,
+    )
+}
+
+/// [`format_crosshair_time_with`] in exchange time: the instant's exchange wall-clock date and
+/// time. Calendar-date rows keep their own date.
+pub fn format_crosshair_time_in(
+    ts: i64,
+    time_visible: bool,
+    seconds_visible: bool,
+    date_format: &str,
+    months: &MonthNames,
+    time: &ExchangeTime,
+) -> String {
+    let ts = time.local_seconds(ts);
     let date = format_date_pattern(ts, date_format, months);
     if !time_visible {
         return date;
@@ -352,6 +390,65 @@ mod tests {
         // Degenerate runs: single y is literal, long M runs cap at the long name.
         assert_eq!(format_date_pattern(TS, "y", &months), "y");
         assert_eq!(format_date_pattern(TS, "MMMMM", &months), "JuneM");
+    }
+
+    #[test]
+    fn exchange_time_labels_use_local_wall_clock_and_trading_dates() {
+        use crate::scale::exchange_time::UtcOffsetSchedule;
+        let months = MonthNames::english();
+        let shanghai = ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), 0).unwrap();
+        // 2024-01-02 01:30 UTC = 09:30 CST.
+        let open = 1_704_159_000;
+        assert_eq!(
+            format_tick_label_in(open, TickMarkType::Time, &months, &shanghai),
+            "09:30"
+        );
+        assert_eq!(
+            format_tick_label_in(open, TickMarkType::DayOfMonth, &months, &shanghai),
+            "2"
+        );
+        assert_eq!(
+            format_crosshair_time_in(open, true, false, DEFAULT_DATE_FORMAT, &months, &shanghai),
+            "02 Jan '24   09:30"
+        );
+        // 2024-01-01 16:30 UTC is already Jan 2 in Shanghai.
+        assert_eq!(
+            format_crosshair_time_in(
+                open - 9 * 3_600,
+                true,
+                false,
+                DEFAULT_DATE_FORMAT,
+                &months,
+                &shanghai
+            ),
+            "02 Jan '24   00:30"
+        );
+        // A 21:00 night session names the next trading day on its Day mark while the crosshair
+        // keeps the wall-clock date.
+        let futures =
+            ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), -3 * 3_600).unwrap();
+        let night = 1_704_200_400; // 2024-01-02 13:00 UTC = 21:00 CST
+        assert_eq!(
+            format_tick_label_in(night, TickMarkType::DayOfMonth, &months, &futures),
+            "3"
+        );
+        assert_eq!(
+            format_crosshair_time_in(night, true, false, "yyyy-MM-dd", &months, &futures),
+            "2024-01-02   21:00"
+        );
+        // Calendar dates never shift.
+        let mut dates =
+            ExchangeTime::new(UtcOffsetSchedule::fixed(-5 * 3_600).unwrap(), 0).unwrap();
+        dates.set_calendar_dates(true);
+        let midnight = 1_704_153_600; // 2024-01-02 00:00 UTC
+        assert_eq!(
+            format_crosshair_time_in(midnight, false, false, "yyyy-MM-dd", &months, &dates),
+            "2024-01-02"
+        );
+        assert_eq!(
+            format_tick_label_in(midnight, TickMarkType::DayOfMonth, &months, &dates),
+            "2"
+        );
     }
 
     #[test]

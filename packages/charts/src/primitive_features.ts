@@ -1,6 +1,6 @@
 /** Primitive and compatibility helpers built on Aeris's existing engine and extension boundaries. */
 
-import { chart_impl, time_to_utc_seconds } from "./impl.js";
+import { chart_impl, chart_time_text, time_to_utc_seconds } from "./impl.js";
 import { AerisChartsError } from "./errors.js";
 import {
   attach_native_bands_indicator,
@@ -454,7 +454,16 @@ export function create_partial_price_line(
 }
 
 export interface session_highlighting_options {
+  /**
+   * Optional session gate `[start_hour, end_hour)` in fractional exchange-local hours (`9.5` is
+   * 09:30; `start > end` wraps midnight). Hours and the weekend test use the chart's
+   * `time_scale.time_zone` (UTC by default). Both or neither must be set.
+   */
+  start_hour?: number;
+  end_hour?: number;
+  /** @deprecated Alias of `start_hour` (identical on the default UTC chart). */
   start_hour_utc?: number;
+  /** @deprecated Alias of `end_hour` (identical on the default UTC chart). */
   end_hour_utc?: number;
   weekday_color?: string;
   weekend_color?: string;
@@ -475,7 +484,9 @@ export function create_session_highlighting(
 /**
  * Engine-owned source-bar shading. The callback overload is informed by a public example's API shape:
  * the host evaluates the user callback when source data changes, then Rust retains the aligned
- * `{time,color}` records and owns coordinate conversion, clipping, merging, and rendering.
+ * `{time,color}` records and owns coordinate conversion, clipping, merging, and rendering. The
+ * callback depends only on the bar time, so a live `update` evaluates just the appended rows; a
+ * full replacement (or any tail that no longer aligns) re-evaluates the series once.
  */
 export function create_session_highlighting(
   series: series_api,
@@ -488,7 +499,9 @@ export function create_session_highlighting(
   const highlighter = highlighter_or_options;
   const native = attach_native_session_highlighting(series, JSON.stringify(options));
   let attached = true;
-  const sync = (): void => {
+  // The newest evaluated source time; tail updates evaluate only rows after it.
+  let last_time: number | null = null;
+  const full_sync = (): void => {
     const highlights = series.data().map((point) => ({
       time: time_to_utc_seconds(point.time),
       color: highlighter(point.time) || "rgba(0, 0, 0, 0)",
@@ -496,10 +509,38 @@ export function create_session_highlighting(
     if (!native.set_data_json(JSON.stringify(highlights))) {
       throw new Error("Aeris rejected session-highlighting data that was not aligned to its source series");
     }
+    last_time = highlights.length === 0 ? null : highlights[highlights.length - 1]!.time;
+  };
+  const tail_sync = (): void => {
+    if (last_time === null) {
+      full_sync();
+      return;
+    }
+    const times = native.times_since(last_time);
+    // The previously newest row must still exist, otherwise history changed underneath.
+    if (times.length === 0 || times[0] !== last_time) {
+      full_sync();
+      return;
+    }
+    // Even with nothing appended the engine verifies the row count and endpoints, so a
+    // historical insertion or trim falls back to one full evaluation.
+    const appended = Array.from(times.subarray(1), (time) => ({
+      time,
+      color: highlighter(time) || "rgba(0, 0, 0, 0)",
+    }));
+    if (native.upsert_data_json(JSON.stringify(appended))) {
+      last_time = times[times.length - 1]!;
+    } else {
+      full_sync();
+    }
+  };
+  const sync = (scope: "full" | "update"): void => {
+    if (scope === "update") tail_sync();
+    else full_sync();
   };
   series.subscribe_data_changed(sync);
   try {
-    sync();
+    full_sync();
   } catch (error) {
     series.unsubscribe_data_changed(sync);
     native.detach();
@@ -668,18 +709,6 @@ function tooltip_row_text(row: HTMLDivElement, value: HTMLSpanElement, text: str
   row.hidden = text.length === 0;
 }
 
-const tooltip_time_formatter = new Intl.DateTimeFormat(undefined, {
-  month: "short",
-  day: "numeric",
-  hour: "numeric",
-  minute: "2-digit",
-  timeZoneName: "short",
-});
-
-function tooltip_timestamp(timestamp: number): string {
-  if (timestamp === 0) return "";
-  return tooltip_time_formatter.format(new Date(timestamp * 1_000));
-}
 
 /** Structured OHLC market-data tooltip; source lookup and its vertical guide are engine-owned. */
 export function create_tooltip(chart: chart_api, options: tooltip_options = {}): tooltip_handle {
@@ -780,7 +809,8 @@ export function create_tooltip(chart: chart_api, options: tooltip_options = {}):
       return;
     }
     tooltip_text(title, current.title);
-    tooltip_text(timestamp, tooltip_timestamp(snapshot.time));
+    // Chart time zone, localization.locale, and the host time_formatter — never the browser zone.
+    tooltip_text(timestamp, Number.isFinite(snapshot.time) ? chart_time_text(chart, snapshot.time) : "");
     tooltip_row_text(close.row, close.value, Number.isFinite(snapshot.close) ? format_price(event, snapshot.close) : "");
     tooltip_row_text(open.row, open.value, Number.isFinite(snapshot.open) ? format_price(event, snapshot.open) : "");
     tooltip_row_text(high.row, high.value, Number.isFinite(snapshot.high) ? format_price(event, snapshot.high) : "");

@@ -31,9 +31,11 @@ export * from "./shortcuts.js";
 export * from "./grid.js";
 import { chart_impl } from "./impl.js";
 import { ensure_init } from "./impl.js";
+export { session_slot_times } from "./impl.js";
 import { enable_accessibility } from "./accessibility.js";
 import type { accessibility_options } from "./accessibility.js";
 import { default_theme_name, theme_options, theme_palette, type theme_name } from "./theme.js";
+import { split_exchange_time_options } from "./time_zone.js";
 import type { chart_api, chart_options, deep_partial, localization_options, tracking_mode_options } from "./types.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -146,7 +148,9 @@ export async function create_chart(
       (options ?? {}) as deep_partial<chart_options> & {
         tracking_mode?: tracking_mode_options;
       };
-    let engine_options: Record<string, unknown> = rest;
+    // IANA time-zone names resolve in the package; the engine receives explicit schedules.
+    const exchange = split_exchange_time_options(rest as Record<string, unknown>);
+    let engine_options: Record<string, unknown> = { ...exchange.engine };
     delete engine_options.backend;
     delete engine_options.__simulate_webgpu_adapter_failure;
     delete engine_options.__force_webgpu_fallback_adapter;
@@ -154,7 +158,7 @@ export async function create_chart(
     const panes = (rest.layout as { panes?: { enableResize?: boolean } } | undefined)?.panes;
     if (panes?.enableResize !== undefined) {
       const { enableResize, ...panes_rest } = panes;
-      engine_options = { ...rest, layout: { ...(rest.layout as object), panes: panes_rest } };
+      engine_options = { ...engine_options, layout: { ...(rest.layout as object), panes: panes_rest } };
       panes_resize = enableResize;
     }
     const selected_theme = (theme ?? default_theme_name) as theme_name;
@@ -181,6 +185,9 @@ export async function create_chart(
       tracking_mode !== undefined
     ) {
       chart.apply_gesture_options(handle_scroll, handle_scale, kinetic_scroll, tracking_mode);
+    }
+    if (exchange.zone !== undefined || exchange.session_start !== undefined || exchange.tick_marks !== undefined) {
+      chart.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks);
     }
     if (wheel_behavior !== undefined) chart.apply_options({ wheel_behavior });
     if (panes_resize !== undefined) {

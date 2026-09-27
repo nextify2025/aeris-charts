@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-async function create_worker_chart(page, backend) {
+async function create_worker_chart(page, backend, init_extra = {}, device_dpr = false) {
   await page.goto("/");
   const supported = await page.evaluate(() =>
     typeof OffscreenCanvas !== "undefined"
@@ -8,7 +8,7 @@ async function create_worker_chart(page, backend) {
   );
   test.skip(!supported, "OffscreenCanvas transfer is unavailable in this browser");
 
-  await page.evaluate((requested_backend) => {
+  await page.evaluate(({ requested_backend, init_extra, device_dpr }) => {
     const host = document.createElement("div");
     host.id = "offscreen-worker-host";
     host.style.cssText = "position:fixed;left:0;top:0;width:640px;height:360px;z-index:1000;background:white";
@@ -37,13 +37,14 @@ async function create_worker_chart(page, backend) {
       fallback_canvas,
       width: 640,
       height: 360,
-      dpr: 1,
+      dpr: device_dpr ? window.devicePixelRatio : 1,
       backend: requested_backend,
       bars: 5_000,
       force_fallback_adapter: true,
+      ...init_extra,
     }, [gpu_canvas, fallback_canvas]);
     window.__offscreen_worker = { worker, messages };
-  }, backend);
+  }, { requested_backend: backend, init_extra, device_dpr });
 
   await page.waitForFunction(() => window.__offscreen_worker.messages.some((message) =>
     message.type === "ready" || message.type === "error",
@@ -125,6 +126,84 @@ test("OffscreenCanvas worker renders, resizes, and accepts relayed pointer/wheel
   expect(resized.stats.presented_frames).toBeGreaterThan(keyed.stats.presented_frames);
 });
 
+test("worker wheel routing matches the main-thread gesture router", async ({ page }) => {
+  test.setTimeout(120_000);
+  const ready = await create_worker_chart(page, undefined, {}, true);
+  // A main-thread twin with the worker fixture's exact data, size, and device pixel ratio.
+  const twin_range = await page.evaluate(async () => {
+    const { create_chart } = await import("/dist/aeris_charts_financial.js");
+    const host = document.createElement("div");
+    host.style.cssText =
+      "position:fixed;left:0;top:380px;width:640px;height:360px;z-index:1000;background:white";
+    document.body.append(host);
+    const chart = await create_chart(host, { autoSize: false, backend: "canvas2d" });
+    chart.resize(640, 360);
+    const count = 5_000;
+    const columns = {
+      times: new Float64Array(count),
+      open: new Float64Array(count),
+      high: new Float64Array(count),
+      low: new Float64Array(count),
+      close: new Float64Array(count),
+    };
+    let price = 100;
+    for (let i = 0; i < count; i += 1) {
+      const next = price + Math.sin(i * 0.037) * 0.45;
+      columns.times[i] = 1_577_836_800 + i * 60;
+      columns.open[i] = price;
+      columns.high[i] = Math.max(price, next) + 0.2;
+      columns.low[i] = Math.min(price, next) - 0.2;
+      columns.close[i] = next;
+      price = next;
+    }
+    chart.add_series("candlestick").set_data_typed(columns);
+    chart.time_scale().fit_content();
+    window.__wheel_twin = { chart, host };
+    return chart.time_scale().get_visible_logical_range();
+  });
+  expect(twin_range.from).toBeCloseTo(ready.range.from, 9);
+  expect(twin_range.to).toBeCloseTo(ready.range.to, 9);
+
+  const samples = [
+    // Auto mode: vertical wheel over the price axis zooms time, not price.
+    { x: 628, y: 150, delta_x: 0, delta_y: -120, delta_mode: 0 },
+    // Auto mode ignores Ctrl and Shift.
+    { x: 200, y: 150, delta_x: 0, delta_y: -120, delta_mode: 0, ctrl_key: true },
+    { x: 300, y: 150, delta_x: 0, delta_y: 120, delta_mode: 0, shift_key: true },
+    { x: 320, y: 150, delta_x: 80, delta_y: 0, delta_mode: 0 },
+    { x: 420, y: 150, delta_x: 0, delta_y: -3, delta_mode: 1 },
+  ];
+  let previous = ready.range;
+  for (const sample of samples) {
+    const worker_state = await send(page, { type: "wheel", event: sample });
+    const main_range = await page.evaluate((sample) => {
+      const { chart } = window.__wheel_twin;
+      const overlay = chart.chart_element().querySelector("canvas:last-of-type");
+      const rect = overlay.getBoundingClientRect();
+      overlay.dispatchEvent(new WheelEvent("wheel", {
+        deltaX: sample.delta_x,
+        deltaY: sample.delta_y,
+        deltaMode: sample.delta_mode,
+        ctrlKey: sample.ctrl_key === true,
+        shiftKey: sample.shift_key === true,
+        clientX: rect.left + sample.x,
+        clientY: rect.top + sample.y,
+        bubbles: true,
+        cancelable: true,
+      }));
+      return chart.time_scale().get_visible_logical_range();
+    }, sample);
+    expect(worker_state.range, JSON.stringify(sample)).not.toEqual(previous);
+    expect(worker_state.range.from, JSON.stringify(sample)).toBeCloseTo(main_range.from, 9);
+    expect(worker_state.range.to, JSON.stringify(sample)).toBeCloseTo(main_range.to, 9);
+    previous = worker_state.range;
+  }
+  await page.evaluate(() => {
+    window.__wheel_twin.chart.remove();
+    window.__wheel_twin.host.remove();
+  });
+});
+
 test("worker frames continue while the main thread is blocked for 500 ms", async ({ page }) => {
   test.setTimeout(120_000);
   const ready = await create_worker_chart(page, undefined);
@@ -182,4 +261,71 @@ test("OffscreenCanvas exposes atomic timestamp rejection diagnostics", async ({ 
   expect(result.type).toBe("timestamp_diagnostics");
   expect(result.diagnostics).toMatchObject({ status: "rejected", accepted: 0 });
   expect(result.diagnostics.reason).toContain("milliseconds");
+});
+
+test("worker charts resolve a declarative IANA time zone and session start", async ({ page }) => {
+  test.setTimeout(120_000);
+  // Construction-time declarative option (IANA name resolved with the worker's own Intl).
+  await create_worker_chart(page, "canvas2d", { time_scale: { timeZone: "Asia/Shanghai" } });
+  const probe = 1_704_159_000; // 2024-01-02 01:30 UTC = 09:30 CST
+  const initial = await send(page, { type: "time_zone", probe });
+  expect(initial.type).toBe("time_zone");
+  expect(Array.isArray(initial.time_zone)).toBe(true);
+  expect(initial.time_zone.at(-1).offset_seconds).toBe(28_800);
+  expect(initial.local - probe).toBe(8 * 3_600);
+
+  // Runtime apply_options with a DST zone and a session start.
+  const eastern = await send(page, {
+    type: "time_zone",
+    probe: 1_720_000_000, // July 2024: EDT
+    options: { timeScale: { timeZone: "America/New_York", sessionStart: -6 * 3_600 } },
+  });
+  expect(eastern.local - 1_720_000_000).toBe(-4 * 3_600);
+  expect(eastern.session_start).toBe(-21_600);
+  expect(Array.isArray(eastern.time_zone)).toBe(true);
+  expect(eastern.time_zone.length).toBeGreaterThan(100);
+
+  // An unknown zone is rejected without changing the installed zone.
+  const rejected = await send(page, {
+    type: "time_zone",
+    options: { timeScale: { timeZone: "Nowhere/Invalid" } },
+  });
+  expect(rejected).toMatchObject({ type: "time_zone_error", code: "invalid_options" });
+  const unchanged = await send(page, { type: "time_zone", probe: 1_720_000_000 });
+  expect(unchanged.local - 1_720_000_000).toBe(-4 * 3_600);
+});
+
+test("worker charts accept declarative explicit time-axis marks", async ({ page }) => {
+  await create_worker_chart(page, "canvas2d");
+  const marks = await send(page, {
+    type: "time_zone",
+    probe: 1_704_159_000,
+    options: { timeScale: { tickMarks: [{ time: "2024-01-02", label: "Jan 2" }, { time: 1_704_240_000 }] } },
+  });
+  expect(marks.tick_marks).toEqual([{ time: 1_704_153_600, label: "Jan 2" }, { time: 1_704_240_000 }]);
+  // An unordered list is rejected without changing the installed marks.
+  const rejected = await send(page, {
+    type: "time_zone",
+    options: { timeScale: { tickMarks: [{ time: 2 }, { time: 1 }] } },
+  });
+  expect(rejected).toMatchObject({ type: "time_zone_error", code: "invalid_options" });
+  const unchanged = await send(page, { type: "time_zone", probe: 1_704_159_000 });
+  expect(unchanged.tick_marks).toEqual(marks.tick_marks);
+  const cleared = await send(page, {
+    type: "time_zone",
+    probe: 1_704_159_000,
+    options: { timeScale: { tickMarks: null } },
+  });
+  expect(cleared.tick_marks).toBeNull();
+});
+
+test("OffscreenCanvas typed streaming honors the sequence guard and merges partial columns", async ({ page }) => {
+  await create_worker_chart(page, "canvas2d");
+  const result = await send(page, { type: "sequenced_stream", bars: 5_000 });
+  expect(result.type).toBe("sequenced_stream");
+  expect(result.results.applied).toBeNull();
+  expect(result.results.stale).toMatchObject({ status: "rejected", code: "stale_sequence", last_sequence: 3 });
+  expect(result.results.merged).toBeNull();
+  expect(result.results.merge_stale).toMatchObject({ status: "rejected", code: "stale_sequence", last_sequence: 4 });
+  expect(result.results.empty).toMatchObject({ status: "rejected", code: "empty_merge" });
 });

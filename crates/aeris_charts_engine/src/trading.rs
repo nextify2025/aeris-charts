@@ -1201,6 +1201,66 @@ impl ChartEngine {
         (price / tick).round() * tick
     }
 
+    /// The price-band ladder that governs trading prices on `(pane, scale)`: the tick ladder of
+    /// that scale's formatter-source series. When configured it is the single tick source for
+    /// both the axis labels and order snapping; the scalar instrument `tick_size` applies only
+    /// where no ladder is configured.
+    fn trading_tick_ladder(
+        &self,
+        pane_index: usize,
+        price_scale: TradingPriceScale,
+    ) -> Option<&aeris_charts_core::format::price_tick_ladder::PriceTickLadder> {
+        self.scale_formatter_source(pane_index, price_scale.into())?
+            .price_format
+            .active_tick_ladder()
+    }
+
+    /// Snap to the ladder band tick on `(pane, scale)`, else the instrument tick.
+    fn snap_trading_price_on(
+        &self,
+        pane_index: usize,
+        price_scale: TradingPriceScale,
+        price: f64,
+    ) -> f64 {
+        match self.trading_tick_ladder(pane_index, price_scale) {
+            Some(ladder) => ladder.snap(price),
+            None => self.snap_trading_price(price),
+        }
+    }
+
+    /// Exact tick index on `(pane, scale)`: cumulative band ticks with a ladder, else
+    /// `price / tick_size`.
+    fn trading_price_tick_index_on(
+        &self,
+        pane_index: usize,
+        price_scale: TradingPriceScale,
+        price: f64,
+    ) -> Option<i64> {
+        match self.trading_tick_ladder(pane_index, price_scale) {
+            Some(ladder) => ladder.tick_index(price),
+            None => self.trading_price_tick_index(price),
+        }
+    }
+
+    /// Half the tick at `price` on `(pane, scale)`: the tolerance for "the price did not move".
+    fn trading_half_tick_on(
+        &self,
+        pane_index: usize,
+        price_scale: TradingPriceScale,
+        price: f64,
+    ) -> f64 {
+        match self.trading_tick_ladder(pane_index, price_scale) {
+            Some(ladder) => ladder.min_move_at(price) * 0.5,
+            None => {
+                self.trading_state
+                    .instrument
+                    .tick_size
+                    .unwrap_or(f64::EPSILON)
+                    * 0.5
+            }
+        }
+    }
+
     fn trading_price_tick_index(&self, price: f64) -> Option<i64> {
         let tick = self.trading_state.instrument.tick_size?;
         if !tick.is_finite() || tick <= 0.0 || !price.is_finite() {
@@ -1502,7 +1562,11 @@ impl ChartEngine {
             kind,
             role: Some(preview.role),
             price: Some(preview.price),
-            price_tick_index: self.trading_price_tick_index(preview.price),
+            price_tick_index: self.trading_price_tick_index_on(
+                preview.pane_index,
+                preview.price_scale,
+                preview.price,
+            ),
             stop_price,
             take_profit_price: None,
             stop_loss_price: None,
@@ -1560,10 +1624,20 @@ impl ChartEngine {
             return false;
         }
         let tick = self.trading_state.instrument.tick_size.unwrap_or(1.0);
+        let Some(current) = self.trading_state.interaction.preview().cloned() else {
+            return false;
+        };
+        // A ladder steps by exact band ticks across band boundaries.
+        let price = match self.trading_tick_ladder(current.pane_index, current.price_scale) {
+            Some(ladder) => match ladder.step(current.price, i64::from(ticks)) {
+                Some(price) => price,
+                None => return false,
+            },
+            None => current.price + f64::from(ticks) * tick,
+        };
         let Some(preview) = self.trading_state.interaction.dragging_preview_mut() else {
             return false;
         };
-        let price = preview.price + f64::from(ticks) * tick;
         if !price.is_finite() || price <= 0.0 {
             return false;
         }
@@ -1633,7 +1707,7 @@ impl ChartEngine {
         else {
             return false;
         };
-        let price = self.snap_trading_price(price);
+        let price = self.snap_trading_price_on(preview.pane_index, preview.price_scale, price);
         if !price.is_finite() || price <= 0.0 || preview.price == price {
             return false;
         }
@@ -1656,12 +1730,8 @@ impl ChartEngine {
             } => *authoritative_price,
             _ => return None,
         };
-        let tolerance = self
-            .trading_state
-            .instrument
-            .tick_size
-            .unwrap_or(f64::EPSILON)
-            * 0.5;
+        let tolerance =
+            self.trading_half_tick_on(preview.pane_index, preview.price_scale, start_price);
         if (start_price - preview.price).abs() <= tolerance {
             self.trading_state.interaction = TradingInteractionState::Idle;
             self.invalidate_frame_trading();
@@ -1757,9 +1827,14 @@ impl ChartEngine {
             )
         };
 
-        let entry_price = self.snap_trading_price(points[0]);
-        let take_profit_price = self.snap_trading_price(points[1]);
-        let stop_loss_price = self.snap_trading_price(points[2]);
+        let snap_scale = match price_scale {
+            DrawingPriceScale::Right => TradingPriceScale::Right,
+            DrawingPriceScale::Left => TradingPriceScale::Left,
+            DrawingPriceScale::Overlay => TradingPriceScale::Overlay,
+        };
+        let entry_price = self.snap_trading_price_on(pane_index, snap_scale, points[0]);
+        let take_profit_price = self.snap_trading_price_on(pane_index, snap_scale, points[1]);
+        let stop_loss_price = self.snap_trading_price_on(pane_index, snap_scale, points[2]);
         let side = match kind {
             DrawingKind::LongPosition
                 if take_profit_price > entry_price && stop_loss_price < entry_price =>
@@ -1799,7 +1874,7 @@ impl ChartEngine {
             kind: Some(OrderKind::Limit),
             role: Some(OrderRole::Working),
             price: Some(entry_price),
-            price_tick_index: self.trading_price_tick_index(entry_price),
+            price_tick_index: self.trading_price_tick_index_on(pane_index, snap_scale, entry_price),
             stop_price: None,
             take_profit_price: Some(take_profit_price),
             stop_loss_price: Some(stop_loss_price),
@@ -1862,7 +1937,11 @@ impl ChartEngine {
                     kind: Some(order.kind),
                     role: Some(order.role),
                     price: Some(order.price),
-                    price_tick_index: self.trading_price_tick_index(order.price),
+                    price_tick_index: self.trading_price_tick_index_on(
+                        order.pane_index,
+                        order.price_scale,
+                        order.price,
+                    ),
                     stop_price: order.stop_price,
                     take_profit_price: None,
                     stop_loss_price: None,
@@ -2442,12 +2521,8 @@ impl ChartEngine {
     }
 
     fn trading_group_key_for_preview(&self, preview: &TradingPreview) -> Option<TradingGroupKey> {
-        let tolerance = self
-            .trading_state
-            .instrument
-            .tick_size
-            .unwrap_or(f64::EPSILON)
-            * 0.5;
+        let tolerance =
+            self.trading_half_tick_on(preview.pane_index, preview.price_scale, preview.price);
         match &preview.source {
             TradingPreviewSource::Order { order_id } => self
                 .trading_state

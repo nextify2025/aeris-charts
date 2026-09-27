@@ -25,6 +25,7 @@ import type {
   series_api,
   series_data,
   series_kind,
+  time,
 } from "./types.js";
 
 const chart_context = createContext<chart_api | null>(null);
@@ -99,6 +100,75 @@ export function AerisChart({ options, className, style, children, onChartReady }
 
 export type react_financial_series_kind = Exclude<series_kind, "custom">;
 
+/** Longest changed tail streamed through `update()`; a larger change is one full `setData`. */
+const STREAM_TAIL_LIMIT = 1_024;
+
+/** Order two input times of the same form, or `null` when the forms differ. */
+function time_order(a: time, b: time): number | null {
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "string" && typeof b === "string") return a < b ? -1 : a > b ? 1 : 0;
+  if (typeof a === "object" && typeof b === "object" && a !== null && b !== null) {
+    return a.year - b.year || a.month - b.month || a.day - b.day;
+  }
+  return null;
+}
+
+/** Shallow point equality: the same object, or the same own keys with identical values. */
+function same_point(a: series_data, b: series_data): boolean {
+  if (a === b) return true;
+  const a_record = a as unknown as Record<string, unknown>;
+  const b_record = b as unknown as Record<string, unknown>;
+  const keys = Object.keys(a_record);
+  if (keys.length !== Object.keys(b_record).length) return false;
+  return keys.every((key) => a_record[key] === b_record[key]
+    || (key === "time" && time_order(a.time, b.time) === 0));
+}
+
+/**
+ * What a `FinancialSeries` last applied. React state is immutable by contract, but streaming hosts
+ * often mutate the forming bar (or push onto their array) in place before passing a new array; the
+ * applied length and a shallow copy of the applied last point keep that common case diffed against
+ * what the chart actually holds rather than against the mutated objects.
+ */
+interface applied_series_data {
+  series: series_api;
+  data: readonly series_data[];
+  length: number;
+  last: series_data;
+}
+
+function applied_state(series: series_api, data: readonly series_data[]): applied_series_data | null {
+  const last = data[data.length - 1];
+  return last === undefined ? null : { series, data, length: data.length, last: { ...last } };
+}
+
+/**
+ * The points to stream when `next` differs from the `applied` data only by a replaced last point
+ * and/or an ascending appended tail, in the order `update()` must apply them. `null` means the
+ * change is anything else and needs a full replace.
+ */
+function streaming_tail(
+  applied: applied_series_data,
+  next: readonly series_data[],
+): readonly series_data[] | null {
+  const last = applied.length - 1;
+  if (next.length < applied.length || next.length - last > STREAM_TAIL_LIMIT) return null;
+  for (let index = 0; index < last; index += 1) {
+    if (!same_point(applied.data[index]!, next[index]!)) return null;
+  }
+  const tail: series_data[] = [];
+  if (!same_point(applied.last, next[last]!)) {
+    if (time_order(applied.last.time, next[last]!.time) !== 0) return null;
+    tail.push(next[last]!);
+  }
+  for (let index = applied.length; index < next.length; index += 1) {
+    const order = time_order(next[index - 1]!.time, next[index]!.time);
+    if (order === null || order >= 0) return null;
+    tail.push(next[index]!);
+  }
+  return tail;
+}
+
 export interface FinancialSeriesProps {
   kind: react_financial_series_kind;
   data: readonly series_data[];
@@ -106,11 +176,24 @@ export interface FinancialSeriesProps {
   onSeriesReady?: (series: series_api) => void;
 }
 
-/** A financial series whose engine identity is retained across ordinary React rerenders. */
+/**
+ * A financial series whose engine identity is retained across ordinary React rerenders.
+ *
+ * Declarative streaming: when a new `data` array differs from the previously applied one only by
+ * a replaced last point and/or appended later points (the usual immutable
+ * `[...prev.slice(0, -1), bar]` / `[...prev, bar]` updates), the changed points go through
+ * `series.update()` in O(1) each instead of a full `setData`. Unchanged points are recognized by
+ * identity or shallow equality (one linear identity scan per change); the last point is compared
+ * with a copy taken when it was applied, so mutating the forming bar in place still streams. Any
+ * other change (history edits, removals, reordering, a new series, or a previously rejected
+ * install) falls back to one `setData`. Edits made by mutating older points in place are not
+ * detected, as React props are immutable by contract.
+ */
 export function FinancialSeries({ kind, data, options, onSeriesReady }: FinancialSeriesProps) {
   const chart = useAerisChart();
   const options_ref = useRef(options);
   const ready_ref = useRef(onSeriesReady);
+  const applied_ref = useRef<applied_series_data | null>(null);
   const [series, set_series] = useState<series_api | null>(null);
   options_ref.current = options;
   ready_ref.current = onSeriesReady;
@@ -123,7 +206,21 @@ export function FinancialSeries({ kind, data, options, onSeriesReady }: Financia
   }, [chart, kind]);
 
   useEffect(() => {
-    if (series !== null) series.setData(data);
+    if (series === null) return;
+    const applied = applied_ref.current;
+    const tail = applied !== null && applied.series === series ? streaming_tail(applied, data) : null;
+    let streamed = tail !== null;
+    for (const point of tail ?? []) {
+      series.update(point);
+      if (series.last_ingestion_diagnostics()?.status === "rejected") {
+        streamed = false;
+        break;
+      }
+    }
+    if (!streamed) series.setData(data);
+    applied_ref.current = series.last_ingestion_diagnostics()?.status === "rejected"
+      ? null
+      : applied_state(series, data);
   }, [series, data]);
 
   useEffect(() => {

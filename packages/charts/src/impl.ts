@@ -4,7 +4,7 @@
  */
 
 // @ts-ignore -- pkg is a build artifact, present after build:wasm
-import init, { AerisChart } from "../pkg/aeris_charts_wasm.js";
+import init, { AerisChart, session_slot_times as wasm_session_slot_times } from "../pkg/aeris_charts_wasm.js";
 
 import { install_gestures } from "./gestures.js";
 import type { pane_primitive, pane_primitive_handle, series_primitive, series_primitive_handle } from "./primitives.js";
@@ -20,11 +20,13 @@ import { AerisChartsError } from "./errors.js";
 import type { AerisChartsErrorCode } from "./errors.js";
 import type {
   alert_api, alert_condition, alert_frequency, alert_line, alert_price_scale, alert_snapshot,
+  autoscale_info,
   crosshair_action_request, crosshair_action_request_handler,
   any_series_options, backend_status, bars_info, chart_api, chart_context_handler, chart_context_params, chart_options, chart_state, chart_value_snapshot, comparison_legend_entry, data_changed_handler, dbl_click_handler,
   deep_partial, drawing_api, drawing_created_handler, drawing_info, drawing_kind, drawing_options,
   depth_event_columns, depth_event_layer_options, depth_heatmap_options, depth_ladder_row, depth_options, depth_snapshot_columns, depth_study_snapshot, depth_update_columns,
-  drawing_point, drawing_tool_change_handler, drawing_interval, drawing_property_schema, drawing_kind_options, drawing_template,
+  drawing_point, drawing_point_input, drawing_points_update, drawing_price_segment, drawing_magnet_mode,
+  drawing_tool_change_handler, drawing_interval, drawing_property_schema, drawing_kind_options, drawing_template,
   ema_ribbon_options, ema_ribbon_periods,
   feature_series_kind, frame_stats,
   footprint_bar, footprint_series_api, footprint_series_options, footprint_trade, footprint_trade_columns,
@@ -34,11 +36,12 @@ import type {
   error_bar_row, heatmap_grid_row, range_area_row, temporal_error_columns, temporal_heatmap_columns, temporal_range_columns, temporal_xy_columns,
   ingestion_diagnostics,
   handle_scale_options, handle_scroll_options, indicator_info, indicator_input_source, indicator_kind, indicator_output_style, indicator_schema, kinetic_scroll_options, pivot_kind, vwap_reset,
+  bollinger_parameters, indicator_convention, indicator_seed_parameters, macd_parameters, vwap_parameters,
   last_value_data, localization_options, logical_range,
   mismatch_direction, mouse_event_handler, mouse_event_params, ohlc_columns, ohlc_data, options_change_handler, pane_api, pane_geometry, price_line_api, price_line_options,
   persistence_restore_result, price_range, price_scale_api, price_scale_create_options,
   price_scale_info, price_scale_options, ring_source_layout,
-  series_api, series_change_handler, series_data, series_kind,
+  series_api, series_change_handler, series_data, series_kind, series_merge_columns, series_merge_data, series_update_options,
   series_marker, series_marker_options, series_options, single_value_data, size_change_handler, time, time_range,
   replay_clock_stats, replay_seek_stats, synthetic_bar_options, trade_stream_stats,
   time_and_sales_options, time_and_sales_row, time_scale_api, time_scale_options, tracking_mode_options, trading_api, trading_execution, trading_hit,
@@ -47,12 +50,18 @@ import type {
   trading_style_options, instrument_metadata, working_order, host_overlay_snapshot, host_event_hit,
   visible_logical_range_handler, visible_time_range_handler,
   volume_profile_indicator_api, volume_profile_indicator_options, volume_profile_indicator_snapshot,
+  time_label_context, time_zone,
+  histogram_updown_rule, kdj_parameters, session_slot_options, time_tick_mark,
 } from "./types.js";
 import {
   DRAWING_KIND_TO_U8, FEATURE_KIND_TO_U8, KIND_TO_U8, LINE_STYLE_TO_U8, LINE_TYPE_TO_U8,
   is_feature_series_kind, is_footprint_series_kind,
 } from "./types.js";
 import { default_theme_name, theme_options, theme_palette, type theme_name } from "./theme.js";
+import {
+  exchange_time_json, format_exchange_seconds, resolve_time_zone, split_exchange_time_options,
+  time_label_context_for, type engine_time_tick_marks,
+} from "./time_zone.js";
 
 // ---------------------------------------------------------------------------------------------
 // Implementation
@@ -81,6 +90,16 @@ type persistence_error_result = {
 function throw_persistence_error(result: persistence_error_result): never {
   throw new AerisChartsError(result.error.code, result.error.message);
 }
+
+/** Parse an engine `{ok, ...}` / `{ok:false, error}` drawing result envelope, throwing on error. */
+function drawing_result<T extends object>(json: string): T {
+  const result = JSON.parse(json) as ({ ok: true } & T) | persistence_error_result;
+  if (!result.ok) throw_persistence_error(result);
+  return result;
+}
+
+const DRAWING_MAGNET_TO_U8: Record<drawing_magnet_mode, number> = { off: 0, weak: 1, strong: 2 };
+const DRAWING_MAGNET_FROM_U8: readonly drawing_magnet_mode[] = ["off", "weak", "strong"];
 /**
  * Instantiate the wasm module once per page. `wasm_url` overrides the default asset resolution
  * (`new URL("aeris_charts_wasm_bg.wasm", import.meta.url)` beside the bundle) — the escape hatch for
@@ -89,12 +108,75 @@ function throw_persistence_error(result: persistence_error_result): never {
  */
 export function ensure_init(wasm_url?: string | URL): Promise<unknown> {
   if (init_promise === null) {
-    const initializing = wasm_url !== undefined ? init(wasm_url) : init();
+    const initializing = (wasm_url !== undefined ? init(wasm_url) : init()).then((module: unknown) => {
+      wasm_ready = true;
+      return module;
+    });
     init_promise = initializing;
     return initializing;
   }
   return init_promise;
 }
+
+/** Set once the engine module is instantiated, for synchronous engine helpers. */
+let wasm_ready = false;
+
+/**
+ * UTC seconds of every bar slot of one trading date's session windows, for reserving whitespace
+ * slots before an intraday (分时) session trades. The engine owns the calculation (validation,
+ * exchange offsets across DST, windows crossing midnight, at most 100 000 slots); the time zone
+ * is an IANA name resolved here or an explicit schedule. Needs the engine module, so call it after
+ * `init_wasm()` or `create_chart()` resolved. Invalid input throws `invalid_options`.
+ */
+export function session_slot_times(options: session_slot_options): number[] {
+  if (!wasm_ready) {
+    throw new AerisChartsError(
+      "unsupported_operation",
+      "session_slot_times needs the engine: await init_wasm() or create_chart() first",
+    );
+  }
+  const date = options.date;
+  const text = typeof date === "string"
+    ? date
+    : date !== null && typeof date === "object"
+      ? `${String(date.year).padStart(4, "0")}-${String(date.month).padStart(2, "0")}-${String(date.day).padStart(2, "0")}`
+      : "";
+  const request = JSON.stringify({
+    date: text,
+    windows: options.windows,
+    interval_seconds: options.interval_seconds,
+    time_zone: resolve_time_zone(options.time_zone ?? "UTC"),
+    session_start: options.session_start ?? 0,
+    convention: options.convention ?? "bar_open",
+  });
+  try {
+    return Array.from(wasm_session_slot_times(request));
+  } catch (error) {
+    throw new AerisChartsError("invalid_options", `invalid session: ${String(error)}`);
+  }
+}
+
+/**
+ * Convert public explicit time-axis marks to the engine form (UTC seconds). The engine validates
+ * order, count, and label length. `null` restores automatic ticks.
+ */
+export function normalize_time_tick_marks(marks: unknown): engine_time_tick_marks {
+  if (marks === null) return null;
+  if (!Array.isArray(marks)) {
+    throw new AerisChartsError("invalid_options", "tick_marks must be an array of { time, label? } or null");
+  }
+  return (marks as (time_tick_mark | null)[]).map((mark, index) => {
+    const time = mark === null || typeof mark !== "object" ? NaN : time_to_utc_seconds(mark.time);
+    const label = mark?.label;
+    if (!Number.isFinite(time) || (label !== undefined && typeof label !== "string")) {
+      throw new AerisChartsError("invalid_options", `tick mark ${index} needs a valid time and an optional string label`);
+    }
+    return label === undefined ? { time } : { time, label };
+  });
+}
+
+/** Accepted `histogram_updown_rule` values. */
+const HISTOGRAM_UPDOWN_RULES: readonly histogram_updown_rule[] = ["open_close", "previous_close"];
 
 function undef_to_null<T>(v: T | undefined): T | null {
   return v === undefined ? null : v;
@@ -111,6 +193,10 @@ function same_time_range(a: time_range | null, b: time_range | null): boolean {
 /** Duration of the animated `scroll_to_position` ease (matches the reference smooth-scroll feel). */
 const SCROLL_ANIM_MS = 300;
 const EMPTY_UINT32 = new Uint32Array();
+/** reference `scrollToRealTime` duration (`DefaultAnimationDuration`, time-scale.ts:31). */
+const REAL_TIME_SCROLL_ANIM_MS = 400;
+/** Synchronous re-reads after handlers mutate the view; later changes wait for the next frame. */
+const MAX_VISIBLE_RANGE_EMIT_PASSES = 8;
 
 /**
  * Whether the candle-close countdown timer should run: any series with `countdown_visible`
@@ -166,7 +252,28 @@ const SERIES_JSON_OPTION_KEYS = [
   "close_visible",
   "thin_bars",
   "heikin_ashi",
+  "histogram_updown_rule",
 ] as const;
+
+/** Reject malformed Aeris price-scale extension values before any option is applied. */
+function validate_price_scale_options(options: deep_partial<price_scale_options>): void {
+  const { tick_mark_density, base_value, autoscale_center } = options;
+  if (tick_mark_density !== undefined && !(Number.isFinite(tick_mark_density) && tick_mark_density > 0)) {
+    throw new AerisChartsError("invalid_options", "tick_mark_density must be a finite positive number");
+  }
+  if (base_value !== undefined && base_value !== null && !(Number.isFinite(base_value) && base_value !== 0)) {
+    throw new AerisChartsError("invalid_options", "base_value must be a finite non-zero price or null");
+  }
+  if (autoscale_center !== undefined && autoscale_center !== null && !Number.isFinite(autoscale_center)) {
+    throw new AerisChartsError("invalid_options", "autoscale_center must be a finite price or null");
+  }
+  for (const key of ["ensure_edge_tick_marks_visible", "stable_auto_scale"] as const) {
+    const value = options[key];
+    if (value !== undefined && typeof value !== "boolean") {
+      throw new AerisChartsError("invalid_options", `${key} must be a boolean`);
+    }
+  }
+}
 
 /**
  * Price-scale style keys without a dedicated wasm setter, forwarded to
@@ -179,6 +286,11 @@ const PRICE_SCALE_JSON_OPTION_KEYS = [
   "minimum_width",
   "text_color",
   "bold_round_labels",
+  "tick_mark_density",
+  "ensure_edge_tick_marks_visible",
+  "base_value",
+  "autoscale_center",
+  "stable_auto_scale",
   "visible",
 ] as const;
 
@@ -224,6 +336,7 @@ const FRAME_STATS_SLOT = {
   axis_rebuilds: 17,
   text_resolutions: 18,
   trading_rebuilds: 19,
+  ring_dropped_rows: 20,
 } as const;
 
 /**
@@ -256,6 +369,16 @@ export function time_to_utc_seconds(t: time): number {
   date.setUTCFullYear(year, month - 1, day);
   if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return NaN;
   return date.getTime() / 1_000;
+}
+
+/**
+ * Input form of a replacement batch: `true` when every row carries a calendar date
+ * (`business_day` or `"YYYY-MM-DD"`), `false` when any row is a numeric instant, `null` for an
+ * empty batch (the series no longer constrains the chart's calendar-date axis).
+ */
+function calendar_input(data: readonly { time: time }[]): boolean | null {
+  if (data.length === 0) return null;
+  return data.every((item) => typeof item.time !== "number");
 }
 
 const MIN_TIMESTAMP_SECONDS = -62_167_219_200;
@@ -1554,6 +1677,44 @@ class general_series_impl implements general_series_api {
   }
 }
 
+/** Point keys that never carry a price: a payload with only these (plus `time`) is whitespace. */
+const NON_PRICE_POINT_KEYS = new Set(["time", "color", "wick_color", "border_color", "custom_values", "customValues"]);
+const OHLC_POINT_KEYS = ["open", "high", "low", "close"] as const;
+
+/** A rejected streaming record in the shared `ingestion_diagnostics` shape. */
+function rejected_ingestion(
+  reason: string,
+  code?: ingestion_diagnostics["code"],
+  non_finite = 0,
+  out_of_range = 0,
+): ingestion_diagnostics {
+  return {
+    status: "rejected",
+    accepted: 0,
+    dropped_invalid: non_finite + out_of_range > 0 ? 1 : 0,
+    dropped_non_finite: non_finite,
+    dropped_out_of_range: out_of_range,
+    deduplicated: 0,
+    reordered: false,
+    semantic_anomalies: 0,
+    reason,
+    ...(code === undefined ? {} : { code }),
+  };
+}
+
+const INVALID_SEQUENCE = "sequence must be a non-negative safe integer";
+
+/** Custom and advanced series own their payloads outside the OHLC streaming path, so a sequence
+ *  passed to them would silently guard nothing. */
+function reject_sequence_option(options: series_update_options | undefined, series: string): void {
+  if (options?.sequence !== undefined) {
+    throw new AerisChartsError(
+      "unsupported_operation",
+      `the sequence guard applies to built-in OHLC and value series, not to ${series}`,
+    );
+  }
+}
+
 class series_impl implements series_api {
   setData(...args: Parameters<series_api["set_data"]>): void { this.set_data(...args); }
   setDataTyped(...args: Parameters<series_api["set_data_typed"]>): void { this.set_data_typed(...args); }
@@ -1564,6 +1725,8 @@ class series_impl implements series_api {
   protected readonly data_changed_subs = new Set<data_changed_handler>();
   private removed = false;
   private last_ingestion: ingestion_diagnostics | null = null;
+  /** Accepted-with-hint streaming codes already warned for this handle (bounded by the code set). */
+  private readonly warned_codes = new Set<string>();
 
   constructor(
     readonly id: number,
@@ -1584,6 +1747,7 @@ class series_impl implements series_api {
    */
   emit_ring_data_changed(): void {
     if (this.removed) return;
+    this.chart.note_series_update(this.id, false);
     for (const handler of this.data_changed_subs) handler("update");
   }
   protected assert_live(): void {
@@ -1591,17 +1755,33 @@ class series_impl implements series_api {
     if (this.removed) throw new AerisChartsError("stale_handle", "this series has been removed from the chart");
   }
 
-  set_data(data: readonly series_data[]): void {
+  /** The wasm sequence argument (`NaN` = none), or `null` after recording and warning about an
+   *  invalid one; the call is then dropped like any other rejected ingestion. */
+  private streaming_sequence(options: series_update_options | undefined, call: string): number | null {
+    const sequence = options?.sequence;
+    if (sequence === undefined) return NaN;
+    if (Number.isSafeInteger(sequence) && sequence >= 0) return sequence;
+    this.last_ingestion = rejected_ingestion(INVALID_SEQUENCE);
+    console.warn(`aeris_charts: ${call} rejected — ${INVALID_SEQUENCE}`);
+    return null;
+  }
+
+  set_data(data: readonly series_data[], options?: series_update_options): void {
     this.assert_live();
+    const sequence = this.streaming_sequence(options, "set_data");
+    if (sequence === null) return;
     const p = pack(data);
     const accepted = this.record_ingestion(
       this.chart.wasm.set_series_data_typed(this.id, p.times, p.open, p.high, p.low, p.close),
     );
     if (!accepted) return;
+    // A full replace cleared the guard; a snapshot sequence becomes the new baseline.
+    if (!Number.isNaN(sequence)) this.chart.wasm.set_series_update_sequence(this.id, sequence);
     // set_series_data resets point colors, so per-point channels must be applied after it.
     if (p.body_colors !== undefined || p.wick_colors !== undefined || p.border_colors !== undefined) {
       this.chart.wasm.set_series_point_colors(this.id, p.body_colors, p.wick_colors, p.border_colors);
     }
+    this.chart.note_series_times(this.id, calendar_input(data));
     this.chart.sync_countdown_timer();
     this.chart.repaint();
     for (const handler of this.data_changed_subs) handler("full");
@@ -1616,12 +1796,16 @@ class series_impl implements series_api {
    * apply them after with the usual options/colors path. The engine's sort/dedupe/
    * sanitize rules apply exactly as with `set_data`.
    */
-  set_data_typed(columns: ohlc_columns): void {
+  set_data_typed(columns: ohlc_columns, options?: series_update_options): void {
     this.assert_live();
+    const sequence = this.streaming_sequence(options, "set_data_typed");
+    if (sequence === null) return;
     const accepted = this.record_ingestion(this.chart.wasm.set_series_data_typed(
       this.id, columns.times, columns.open, columns.high, columns.low, columns.close,
     ));
     if (!accepted) return;
+    this.chart.note_series_times(this.id, columns.times.length === 0 ? null : false);
+    if (!Number.isNaN(sequence)) this.chart.wasm.set_series_update_sequence(this.id, sequence);
     this.chart.sync_countdown_timer();
     this.chart.repaint();
     for (const handler of this.data_changed_subs) handler("full");
@@ -1633,12 +1817,19 @@ class series_impl implements series_api {
    * at the boundary. One `data_changed("update")` per call regardless of batch size — the
    * notification describes the call, not the rows, exactly as it does for `update`.
    */
-  update_typed(columns: ohlc_columns): void {
+  update_typed(columns: ohlc_columns, options?: series_update_options): void {
     this.assert_live();
-    const accepted = this.record_ingestion(this.chart.wasm.update_series_bars_typed(
-      this.id, columns.times, columns.open, columns.high, columns.low, columns.close,
-    ));
+    const sequence = this.streaming_sequence(options, "update_typed");
+    if (sequence === null) return;
+    const accepted = this.record_ingestion(Number.isNaN(sequence)
+      ? this.chart.wasm.update_series_bars_typed(
+        this.id, columns.times, columns.open, columns.high, columns.low, columns.close,
+      )
+      : this.chart.wasm.update_series_bars_typed_sequenced(
+        this.id, columns.times, columns.open, columns.high, columns.low, columns.close, sequence,
+      ));
     if (!accepted) return;
+    if (columns.times.length > 0) this.chart.note_series_update(this.id, false);
     // Same post-update bookkeeping as `update`: data arriving on a countdown-enabled series can
     // start the timer, and repaints coalesce onto the next frame rather than painting per batch.
     if (this.chart.countdown_series_present) this.chart.sync_countdown_timer();
@@ -1677,8 +1868,10 @@ class series_impl implements series_api {
     this.chart.sync_ring_drain_loop();
   }
 
-  update(point: series_data): void {
+  update(point: series_data, options?: series_update_options): void {
     this.assert_live();
+    const sequence = this.streaming_sequence(options, "update");
+    if (sequence === null) return;
     // A whitespace point (`{time}` only) streams as an all-NaN bar; the engine keeps the slot.
     const o = "value" in point ? point.value : "open" in point ? point.open : NaN;
     const h = "value" in point ? point.value : "high" in point ? point.high : NaN;
@@ -1691,14 +1884,159 @@ class series_impl implements series_api {
     const border = "border_color" in point ? point_color_to_u32(point.border_color) : undefined;
     // Series-scoped streaming: append a new time point or replace the last on this series.
     const time = time_to_utc_seconds(point.time);
-    if (!this.record_single_ingestion(time, [o, h, l, c])) return;
-    this.chart.wasm.update_series_bar_styled(
-      this.id, time, o, h, l, c, body, wick, border,
-    );
+    if (!this.record_single_ingestion(time, [o, h, l, c])) {
+      const present = OHLC_POINT_KEYS.filter((key) => key in point).length;
+      if (!("value" in point) && present > 0 && present < OHLC_POINT_KEYS.length && this.last_ingestion !== null) {
+        this.last_ingestion = {
+          ...this.last_ingestion,
+          code: "partial_ohlc",
+          reason: "partial OHLC point (missing open/high/low/close); use merge() for partial ticks",
+        };
+      }
+      // Same signal as update_typed: a dropped streaming point is never silent.
+      console.warn(`aeris_charts: update rejected — ${this.last_ingestion?.reason ?? "invalid or out-of-range values"}`);
+      return;
+    }
+    if (Number.isNaN(sequence)) {
+      this.chart.wasm.update_series_bar_styled(
+        this.id, time, o, h, l, c, body, wick, border,
+      );
+    } else {
+      const json = this.chart.wasm.update_series_bar_sequenced(
+        this.id, time, o, h, l, c, body, wick, border, sequence,
+      );
+      // `undefined` = applied; keep any semantic-anomaly record from the boundary check.
+      if (json !== undefined && !this.record_ingestion(json)) {
+        this.warn_rejected("update");
+        return;
+      }
+    }
+    this.chart.note_series_update(this.id, typeof point.time !== "number");
+    this.note_reference_hint(point);
     // Data arriving on a countdown-enabled series can start the timer (cheap flag check).
     if (this.chart.countdown_series_present) this.chart.sync_countdown_timer();
     this.chart.schedule_repaint();
     for (const handler of this.data_changed_subs) handler("update");
+  }
+
+  merge(point: series_merge_data, options?: series_update_options): void {
+    this.assert_live();
+    const sequence = this.streaming_sequence(options, "merge");
+    if (sequence === null) return;
+    const time = time_to_utc_seconds(point.time);
+    const timestamp_reason = timestamp_rejection_reason(time);
+    if (timestamp_reason !== null) {
+      this.last_ingestion = rejected_ingestion(
+        timestamp_reason,
+        undefined,
+        Number.isFinite(time) ? 0 : 1,
+        Number.isFinite(time) && Number.isInteger(time) ? 1 : 0,
+      );
+      console.warn(`aeris_charts: merge rejected — ${timestamp_reason}`);
+      return;
+    }
+    // NaN is the wasm encoding of an absent channel, so a present field must be a finite number.
+    const channels = [point.open, point.high, point.low, point.close ?? point.value];
+    const limit = Number.MAX_SAFE_INTEGER / 100;
+    for (const value of channels) {
+      if (value === undefined) continue;
+      if (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > limit) {
+        const non_finite = typeof value !== "number" || !Number.isFinite(value);
+        this.last_ingestion = rejected_ingestion(
+          "merge fields must be finite numbers within the supported range",
+          undefined,
+          non_finite ? 1 : 0,
+          non_finite ? 0 : 1,
+        );
+        console.warn(`aeris_charts: merge rejected — ${this.last_ingestion.reason}`);
+        return;
+      }
+    }
+    const [open, high, low, close] = channels.map((value) => value ?? NaN) as [number, number, number, number];
+    const body = point.color === undefined ? undefined : point_color_to_u32(point.color);
+    const wick = point.wick_color === undefined ? undefined : point_color_to_u32(point.wick_color);
+    const border = point.border_color === undefined ? undefined : point_color_to_u32(point.border_color);
+    const json = this.chart.wasm.merge_series_bar(
+      this.id, time, open, high, low, close, body, wick, border, sequence,
+    );
+    if (!this.record_ingestion(json)) {
+      this.warn_rejected("merge");
+      return;
+    }
+    this.chart.note_series_update(this.id, typeof point.time !== "number");
+    if (this.chart.countdown_series_present) this.chart.sync_countdown_timer();
+    this.chart.schedule_repaint();
+    for (const handler of this.data_changed_subs) handler("update");
+  }
+
+  /**
+   * Columnar partial merge: row `i` merges exactly like `merge({ time: times[i], ... })`, with
+   * `NaN` entries and omitted columns absent. Rows apply in input order (a later row for the same
+   * time merges into the earlier result) with one engine synchronization and one
+   * `data_changed("update")`; any invalid row rejects the whole batch.
+   */
+  merge_typed(columns: series_merge_columns, options?: series_update_options): void {
+    this.assert_live();
+    const sequence = this.streaming_sequence(options, "merge_typed");
+    if (sequence === null) return;
+    const json = this.chart.wasm.merge_series_bars_typed(
+      this.id, columns.times, columns.open, columns.high, columns.low, columns.close, sequence,
+    );
+    if (!this.record_ingestion(json)) {
+      this.warn_rejected("merge_typed");
+      return;
+    }
+    if (columns.times.length > 0) this.chart.note_series_update(this.id, false);
+    if (this.chart.countdown_series_present) this.chart.sync_countdown_timer();
+    this.chart.schedule_repaint();
+    for (const handler of this.data_changed_subs) handler("update");
+  }
+
+  /** A dropped streaming call is never silent; stale deliveries are expected and stay quiet. */
+  private warn_rejected(call: string): void {
+    if (this.last_ingestion?.code === "stale_sequence") return;
+    console.warn(`aeris_charts: ${call} rejected — ${this.last_ingestion?.reason ?? "invalid data"}`);
+  }
+
+  /**
+   * Reference `update` semantics that silently rewrite a bar get an accepted diagnostic pointing
+   * at `merge()`: a value-only point flattens a candlestick/bar, and a price-less payload such as
+   * `{ time, volume }` becomes whitespace. Each code warns once per handle.
+   */
+  private note_reference_hint(point: series_data): void {
+    let code: ingestion_diagnostics["code"];
+    let reason: string;
+    if ("value" in point) {
+      const kind = KIND_NAMES[this.chart.wasm.series_kind(this.id) ?? KIND_TO_U8[this.kind]];
+      if (kind !== "candlestick" && kind !== "bar") return;
+      code = "value_on_ohlc_series";
+      reason = "{ time, value } replaced the OHLC bar with a flat O=H=L=C bar; use merge({ time, close }) to update only the close";
+    } else if (!OHLC_POINT_KEYS.some((key) => key in point)) {
+      const extra = Object.keys(point).filter((key) => !NON_PRICE_POINT_KEYS.has(key));
+      if (extra.length === 0) return;
+      code = "price_less_payload";
+      reason = `a point without price fields (${extra.join(", ")}) replaced the bar with whitespace; use merge() for partial ticks and update volume on its own series`;
+    } else {
+      return;
+    }
+    this.last_ingestion = {
+      ...(this.last_ingestion ?? {
+        status: "accepted_with_diagnostics",
+        accepted: 1,
+        dropped_invalid: 0,
+        dropped_non_finite: 0,
+        dropped_out_of_range: 0,
+        deduplicated: 0,
+        reordered: false,
+        semantic_anomalies: 0,
+      }),
+      code,
+      reason,
+    };
+    if (!this.warned_codes.has(code)) {
+      this.warned_codes.add(code);
+      console.warn(`aeris_charts: update() ${reason}`);
+    }
   }
 
   last_ingestion_diagnostics(): ingestion_diagnostics | null {
@@ -1765,6 +2103,10 @@ class series_impl implements series_api {
 
   apply_options(options: Partial<any_series_options>): void {
     this.assert_live();
+    const rule = (options as Partial<series_options>).histogram_updown_rule;
+    if (rule !== undefined && !HISTOGRAM_UPDOWN_RULES.includes(rule)) {
+      throw new AerisChartsError("invalid_options", `histogram_updown_rule must be "open_close" or "previous_close"`);
+    }
     if (options.max_points !== undefined) {
       // 0 (and anything below 1) clears the cap back to unbounded, matching the option's docs.
       this.chart.wasm.set_series_max_points(this.id, options.max_points);
@@ -1866,10 +2208,43 @@ class series_impl implements series_api {
           );
         }
       } else {
-        this.chart.wasm.series_apply_price_format_json(
-          this.id, JSON.stringify({ type: pf.type, precision: pf.precision, min_move: pf.min_move }),
+        // An omitted precision stays omitted so the engine derives it from `min_move`; a
+        // `null` ladder survives serialization and clears the bands. The engine validates the
+        // whole patch before changing anything, so a rejected ladder leaves the format intact.
+        const applied = this.chart.wasm.series_apply_price_format_json(
+          this.id,
+          JSON.stringify({
+            type: pf.type,
+            precision: pf.precision,
+            min_move: pf.min_move,
+            tick_ladder: pf.tick_ladder,
+          }),
         );
+        if (!applied) {
+          throw new AerisChartsError(
+            "invalid_options",
+            "price_format was rejected: tick_ladder needs 1 to 64 bands with finite non-negative, "
+              + "strictly ascending `from` bounds, positive `min_move` ticks, precision 0-15, and "
+              + "each bound on both adjacent bands' tick grids",
+          );
+        }
       }
+    }
+    if ("autoscale_info_provider" in options) {
+      const provider = options.autoscale_info_provider;
+      if (provider !== undefined && provider !== null && typeof provider !== "function") {
+        throw new AerisChartsError("invalid_options", "autoscale_info_provider must be a function");
+      }
+      // The engine hands the adapter the series' own info; the user provider sees it through the
+      // reference-style `base_implementation()` callback.
+      const chart = this.chart;
+      this.chart.wasm.set_series_autoscale_info_provider(
+        this.id,
+        typeof provider === "function"
+          ? (base: autoscale_info | null) =>
+            chart.run_render_callback("autoscale_info_provider", () => provider(() => base))
+          : undefined,
+      );
     }
     // Style keys without a dedicated setter go to the engine as a single JSON patch.
     const json_patch: Record<string, unknown> = {};
@@ -2050,7 +2425,7 @@ class series_impl implements series_api {
   }
   indicator_info(): indicator_info | null {
     const raw = JSON.parse(this.chart.wasm.series_indicator_info_json(this.id)) as
-      | Omit<indicator_info, "source" | "volume_source"> & { source: number; volume_source: number | null }
+      | Omit<indicator_info, "source" | "volume_source" | "amount_source"> & { source: number; volume_source: number | null; amount_source: number | null }
       | null;
     if (raw === null) return null;
     return {
@@ -2062,10 +2437,13 @@ class series_impl implements series_api {
       source: this.chart.series_handle(raw.source),
       source_input: raw.source_input,
       volume_source: raw.volume_source === null ? null : this.chart.series_handle(raw.volume_source),
+      amount_source: raw.amount_source === null ? null : this.chart.series_handle(raw.amount_source),
       style: raw.style,
       output_name: raw.output_name,
       output_index: raw.output_index,
       output_count: raw.output_count,
+      warmup_bars: raw.warmup_bars,
+      convergence_bars: raw.convergence_bars,
     };
   }
   indicator_output_style(): indicator_output_style | null {
@@ -2190,6 +2568,17 @@ class series_impl implements series_api {
     if (changed) this.chart.repaint();
     return changed;
   }
+  native_upsert_session_highlighting_data(primitive_id: number, highlights_json: string): boolean {
+    this.assert_live();
+    const changed = this.chart.wasm.upsert_native_session_highlighting_data(primitive_id, highlights_json);
+    if (changed) this.chart.schedule_repaint();
+    return changed;
+  }
+  /** Source times at or after `since` (UTC seconds), for incremental per-row host callbacks. */
+  native_times_since(since: number): Float64Array {
+    this.assert_live();
+    return Float64Array.from(this.chart.wasm.series_times_since(this.id, since));
+  }
   native_add_crosshair_highlight(color?: string): number {
     this.assert_live();
     return this.chart.wasm.add_native_crosshair_highlight(this.id, color);
@@ -2304,6 +2693,10 @@ export interface native_accessibility_focus_handle extends native_primitive_hand
 
 export interface native_session_highlighting_handle extends native_primitive_handle {
   set_data_json(data_json: string): boolean;
+  /** Merge records for rows appended or replaced at the tail; false when unaligned. */
+  upsert_data_json(data_json: string): boolean;
+  /** Source times at or after `since`. */
+  times_since(since: number): Float64Array;
 }
 
 export interface native_anchored_text_handle extends native_primitive_handle {
@@ -2397,6 +2790,12 @@ export function attach_native_accessibility_focus(
   };
 }
 
+/** Exchange-time text for a chart timestamp (package-owned DOM surfaces). */
+export function chart_time_text(chart: chart_api, seconds: number): string {
+  if (chart instanceof chart_impl) return chart.format_time_text(seconds);
+  return format_exchange_seconds(seconds, undefined, seconds % 86_400 !== 0, false);
+}
+
 export function attach_native_session_highlighting(
   series: series_api,
   options_json: string,
@@ -2408,6 +2807,12 @@ export function attach_native_session_highlighting(
     detach: base.detach,
     set_data_json(data_json) {
       return owner.native_set_session_highlighting_data(id, data_json);
+    },
+    upsert_data_json(data_json) {
+      return owner.native_upsert_session_highlighting_data(id, data_json);
+    },
+    times_since(since) {
+      return owner.native_times_since(since);
     },
   };
 }
@@ -2589,26 +2994,40 @@ class custom_series_impl extends series_impl {
   /** Replace the series' items (reference `setData`). Times convert to UTC seconds here (the same
    *  boundary conversion as the built-ins); sort/dedupe happens engine-side with the items
    *  carried along, so `data()` returns the aligned raw items. */
-  set_data(data: readonly custom_series_item[]): void {
+  set_data(data: readonly custom_series_item[], options?: series_update_options): void {
     this.assert_live();
+    reject_sequence_option(options, "custom series");
     const converted = data.map((item) => ({ ...item, time: time_to_utc_seconds(item.time) }));
     if (!this.record_ingestion(this.chart.wasm.set_custom_series_data(this.id, converted))) return;
+    this.chart.note_series_times(this.id, calendar_input(data));
     this.chart.repaint();
     for (const handler of this.data_changed_subs) handler("full");
   }
 
   /** Append a new item or replace the one at an existing time (reference `update`). */
-  update(item: custom_series_item): void {
+  update(item: custom_series_item, options?: series_update_options): void {
     this.assert_live();
+    reject_sequence_option(options, "custom series");
     if (!this.record_ingestion(this.chart.wasm.update_custom_series_item(
       this.id,
       { ...item, time: time_to_utc_seconds(item.time) },
     ))) return;
+    this.chart.note_series_update(this.id, typeof item.time !== "number");
     // Custom series compute their price values through the JS pane view during render,
     // so this path must stay synchronous: last_value_data and friends read that
     // render-computed state immediately after an update.
     this.chart.repaint();
     for (const handler of this.data_changed_subs) handler("update");
+  }
+
+  merge(): void {
+    // Custom items are opaque plugin payloads; there are no engine-owned fields to merge.
+    this.assert_live();
+    throw new AerisChartsError("unsupported_operation", "merge() does not apply to a custom series");
+  }
+
+  merge_typed(): void {
+    this.merge();
   }
 
   set_data_typed(): void {
@@ -2670,27 +3089,43 @@ class feature_series_impl extends series_impl {
     } as series_data;
   }
 
-  set_data(data: readonly series_data[]): void {
+  set_data(data: readonly series_data[], options?: series_update_options): void {
     this.assert_live();
+    reject_sequence_option(options, "advanced series");
     const converted = data.map((item) => this.engine_item({
       ...item,
       time: time_to_utc_seconds(item.time),
     } as series_data));
     if (!this.record_ingestion(this.chart.wasm.set_feature_series_data(this.id, converted))) return;
+    this.chart.note_series_times(this.id, calendar_input(data));
     this.chart.sync_countdown_timer();
     this.chart.repaint();
     for (const handler of this.data_changed_subs) handler("full");
   }
 
-  update(item: series_data): void {
+  update(item: series_data, options?: series_update_options): void {
     this.assert_live();
+    reject_sequence_option(options, "advanced series");
     if (!this.record_ingestion(this.chart.wasm.update_feature_series_item(
       this.id,
       this.engine_item({ ...item, time: time_to_utc_seconds(item.time) } as series_data),
     ))) return;
+    this.chart.note_series_update(this.id, typeof item.time !== "number");
     if (this.chart.countdown_series_present) this.chart.sync_countdown_timer();
     this.chart.schedule_repaint();
     for (const handler of this.data_changed_subs) handler("update");
+  }
+
+  merge(): void {
+    this.assert_live();
+    throw new AerisChartsError(
+      "unsupported_operation",
+      "merge() does not apply to structured advanced-series payloads",
+    );
+  }
+
+  merge_typed(): void {
+    this.merge();
   }
 
   set_data_typed(): void {
@@ -2935,6 +3370,14 @@ class footprint_series_impl extends series_impl implements footprint_series_api 
     this.update();
   }
 
+  merge(): void {
+    this.update();
+  }
+
+  merge_typed(): void {
+    this.update();
+  }
+
   set_ring_source(): void {
     this.assert_live();
     throw new AerisChartsError(
@@ -3015,7 +3458,14 @@ class time_scale_impl implements time_scale_api {
     }
     this.chart.wasm.cancel_keyboard_scroll();
     this.chart.wasm.start_scroll_animation(position, SCROLL_ANIM_MS, performance.now());
+    this.drive_scroll_animation();
+  }
+  /** Host frame scheduling for the engine-owned scroll animation (a newer scroll or a user
+   *  gesture supersedes it engine-side, which ends this loop). */
+  private drive_scroll_animation(): void {
     const step = () => {
+      // A chart removed mid-animation has freed its engine; the loop simply ends.
+      if (this.chart.is_removed()) return;
       const done = Number.isNaN(this.chart.wasm.scroll_animation_tick(performance.now()));
       this.chart.repaint();
       if (!done) requestAnimationFrame(step);
@@ -3023,9 +3473,16 @@ class time_scale_impl implements time_scale_api {
     requestAnimationFrame(step);
   }
   scroll_to_real_time(): void {
-    this.cancel_scroll_animation();
-    this.chart.wasm.scroll_to_real_time();
-    this.chart.repaint();
+    // reference `scrollToRealTime` animates to `options.rightOffset` (time-scale.ts:824-826).
+    if (this.chart.prefers_reduced_motion()) {
+      this.cancel_scroll_animation();
+      this.chart.wasm.scroll_to_real_time();
+      this.chart.repaint();
+      return;
+    }
+    this.chart.wasm.cancel_keyboard_scroll();
+    this.chart.wasm.start_real_time_scroll_animation(REAL_TIME_SCROLL_ANIM_MS, performance.now());
+    this.drive_scroll_animation();
   }
   reset_time_scale(): void {
     this.cancel_scroll_animation();
@@ -3038,6 +3495,11 @@ class time_scale_impl implements time_scale_api {
     this.chart.repaint();
   }
   apply_options(options: Partial<time_scale_options>): void {
+    // Exchange time and explicit marks validate first, together, so a rejected zone or mark list
+    // leaves every other option untouched.
+    if (options.time_zone !== undefined || options.session_start !== undefined || options.tick_marks !== undefined) {
+      this.chart.apply_exchange_time(options.time_zone, options.session_start, options.tick_marks);
+    }
   if (options.bar_spacing !== undefined) this.chart.wasm.apply_bar_spacing_option(options.bar_spacing);
   if (options.right_offset !== undefined) this.chart.wasm.apply_right_offset_option(options.right_offset);
     if (options.min_bar_spacing !== undefined) this.chart.wasm.set_min_bar_spacing(options.min_bar_spacing);
@@ -3051,6 +3513,8 @@ class time_scale_impl implements time_scale_api {
       this.chart.wasm.set_lock_visible_time_range_on_resize(options.lock_visible_time_range_on_resize);
     if (options.right_bar_stays_on_scroll !== undefined)
       this.chart.wasm.set_right_bar_stays_on_scroll(options.right_bar_stays_on_scroll);
+    if (options.lock_visible_logical_range !== undefined)
+      this.chart.wasm.set_lock_visible_logical_range(options.lock_visible_logical_range);
     if (options.shift_visible_range_on_new_bar !== undefined)
       this.chart.wasm.set_shift_visible_range_on_new_bar(options.shift_visible_range_on_new_bar);
     if (options.allow_shift_visible_range_on_whitespace_replacement !== undefined)
@@ -3065,11 +3529,14 @@ class time_scale_impl implements time_scale_api {
       this.chart.wasm.set_tick_mark_max_character_length(options.tick_mark_max_character_length);
     if (options.visible !== undefined) this.chart.wasm.set_time_axis_visible(options.visible);
     if (options.tick_mark_formatter !== undefined)
-      this.chart.wasm.set_tick_mark_formatter(options.tick_mark_formatter);
+      this.chart.set_tick_mark_formatter(options.tick_mark_formatter);
     this.chart.repaint();
   }
   options(): time_scale_options {
-    return JSON.parse(this.chart.wasm.time_scale_options_json()) as time_scale_options;
+    const options = JSON.parse(this.chart.wasm.time_scale_options_json()) as time_scale_options;
+    const name = this.chart.time_zone_name(options.time_zone);
+    if (name !== null) options.time_zone = name;
+    return options;
   }
   get_visible_logical_range(): logical_range | null {
     const r = this.chart.wasm.visible_logical_range();
@@ -3165,6 +3632,7 @@ class price_scale_impl implements price_scale_api {
   }
 
   apply_options(options: deep_partial<price_scale_options>): void {
+    validate_price_scale_options(options);
     if (options.mode !== undefined) {
       this.chart.wasm.set_price_scale_mode(this.pane(), this.target(), options.mode);
     }
@@ -3398,11 +3866,9 @@ class drawing_impl implements drawing_api {
     this.assert_live();
     return JSON.parse(this.chart.wasm.drawing_points_json(this.id)) as drawing_point[];
   }
-  set_points(points: drawing_point[]): void {
+  set_points(points: drawing_point_input[]): void {
     this.assert_live();
-    if (!this.chart.wasm.drawing_set_points(this.id, JSON.stringify(points))) {
-      throw new AerisChartsError("invalid_data", "drawing anchors are malformed or invalid for this kind");
-    }
+    drawing_result(this.chart.wasm.drawing_set_points_result_json(this.id, JSON.stringify(points)));
     this.chart.repaint();
   }
   options(): drawing_options {
@@ -3731,6 +4197,8 @@ export class chart_impl implements chart_api {
   private readonly delta_tooltip_range_listeners = new Set<() => void>();
   private last_visible_logical_range: logical_range | null;
   private last_visible_time_range: time_range | null;
+  private visible_range_emitting = false;
+  private visible_range_emit_pending = false;
   private last_ts_width: number;
   private last_ts_height: number;
   private auto_size: boolean;
@@ -4022,6 +4490,21 @@ export class chart_impl implements chart_api {
    * so streaming `update` calls can cheaply decide whether data-arrival may start the timer.
    */
   countdown_series_present = false;
+  /** Host clock (UTC seconds) for the countdown; `null` uses `Date.now()`. */
+  private clock: (() => number) | null = null;
+  /**
+   * IANA name of the last applied exchange time zone and the engine schedule it resolved to, so
+   * `time_scale().options()` reports the name only while the engine still uses that schedule (a
+   * V2 import or an explicit schedule replaces it).
+   */
+  private applied_zone: { name: string; schedule: string } | null = null;
+  /** Whether every financial series with data was given calendar-date (`business_day`) times. */
+  private calendar_date_axis = false;
+  /** Per-series input form of the latest data (`true` = calendar dates) for the axis flag. */
+  private readonly calendar_series = new Map<number, boolean>();
+  /** The unwrapped host `localization.time_formatter` for package-owned time text. */
+  private host_time_formatter: localization_options["time_formatter"] | undefined = undefined;
+  private locale_setting: string | undefined = undefined;
   /** The Phase C-e plugin overlay canvas and its 2D context (package-owned host DOM). */
   private readonly plugin_ctx: CanvasRenderingContext2D;
   private readonly canvas_primitives: canvas_primitive_entry[] = [];
@@ -4083,7 +4566,32 @@ export class chart_impl implements chart_api {
     if (this.wasm_instance === null) {
       throw new AerisChartsError("disposed", "this chart has been disposed");
     }
+    if (this.render_callback !== null) {
+      // The engine is mid-frame: re-entering it would alias its state (and abort the instance).
+      throw new AerisChartsError(
+        "unsupported_operation",
+        `chart APIs cannot be called from ${this.render_callback}, which runs while the chart renders`,
+      );
+    }
     return this.wasm_instance;
+  }
+
+  /** The render-time host callback currently on the stack, if any. */
+  private render_callback: string | null = null;
+
+  /**
+   * Run a host callback that the engine invokes during frame construction. Chart APIs called from
+   * it throw `unsupported_operation` instead of re-entering the engine; the engine then keeps its
+   * own result for that pass.
+   */
+  run_render_callback<T>(name: string, callback: () => T): T {
+    const outer = this.render_callback;
+    this.render_callback = name;
+    try {
+      return callback();
+    } finally {
+      this.render_callback = outer;
+    }
   }
 
   /** Deterministic browser-test hook; intentionally absent from `chart_api`. */
@@ -4293,7 +4801,33 @@ export class chart_impl implements chart_api {
     return r.length === 2 ? { from: r[0]!, to: r[1]! } : null;
   }
 
+  /**
+   * Diff-and-notify for the visible range and size subscriptions. A handler may mutate the chart
+   * synchronously (the load-more-history recipe calls `set_data` from its range handler), which
+   * repaints and re-enters here. Nested calls only mark the diff dirty; the outer dispatch
+   * finishes delivering its value to every handler and then re-reads, so handlers that ran
+   * after the mutating one always receive a corrective event with the final range. The re-read
+   * is bounded; a handler that keeps changing the range defers the rest to the next frame.
+   */
   private emit_visible_range_changes(): void {
+    if (this.visible_range_emitting) {
+      this.visible_range_emit_pending = true;
+      return;
+    }
+    this.visible_range_emitting = true;
+    try {
+      for (let pass = 0; pass < MAX_VISIBLE_RANGE_EMIT_PASSES; pass += 1) {
+        this.visible_range_emit_pending = false;
+        this.emit_visible_range_diff();
+        if (!this.visible_range_emit_pending || this.removed) return;
+      }
+      this.schedule_repaint();
+    } finally {
+      this.visible_range_emitting = false;
+    }
+  }
+
+  private emit_visible_range_diff(): void {
     const logical = this.read_visible_logical_range();
     const time = this.read_visible_time_range();
     const logical_changed = !same_logical_range(this.last_visible_logical_range, logical);
@@ -4311,6 +4845,8 @@ export class chart_impl implements chart_api {
         handler(time ? { ...time } : null);
       }
     }
+    // A handler may remove the chart; its engine is gone, so there is no size left to diff.
+    if (this.removed) return;
 
     // Size-change diff (reference `subscribeSizeChange`), fired on change only.
     const width = this.wasm.time_scale_width();
@@ -4355,13 +4891,16 @@ export class chart_impl implements chart_api {
       }
     }
     if (countdown_timer_needed(candidates)) {
+      // Re-pin the clock on every data arrival too: the countdown hides while the clock is
+      // before the forming bar's open, so a clock pinned by the last 1 s tick would hide a bar
+      // that just opened until the next tick.
+      this.wasm.set_now_seconds(this.now_seconds());
       if (this.countdown_timer === null) {
-        this.wasm.set_now_seconds(Date.now() / 1000);
         this.countdown_timer = setInterval(() => {
           // Skip while hidden or while the user is mid-gesture — a mid-drag repaint is the
           // visible lag/flicker when moving the chart.
           if (document.hidden || this.interacting) return;
-          this.wasm.set_now_seconds(Date.now() / 1000);
+          this.wasm.set_now_seconds(this.now_seconds());
           this.repaint();
         }, 1000);
       }
@@ -4370,6 +4909,120 @@ export class chart_impl implements chart_api {
       this.countdown_timer = null;
     }
   }
+  /**
+   * Install (or with `null` remove) the host clock used by the candle-close countdown. The clock
+   * returns UTC seconds and replaces `Date.now()` for every countdown tick and repaint.
+   */
+  set_clock(clock: (() => number) | null): void {
+    if (clock !== null && typeof clock !== "function") {
+      throw new AerisChartsError("invalid_options", "set_clock expects a function returning UTC seconds, or null");
+    }
+    this.clock = clock;
+    // NaN unpins the engine clock so the render path falls back to the system time.
+    this.wasm.set_now_seconds(clock === null ? Number.NaN : this.now_seconds());
+    this.repaint();
+  }
+
+  /** Current UTC seconds from the host clock, or the system clock when none is installed. */
+  now_seconds(): number {
+    if (this.clock !== null) {
+      try {
+        const now = this.clock();
+        if (Number.isFinite(now)) return now;
+      } catch (error) {
+        console.error("aeris_charts: host clock threw", error);
+      }
+    }
+    return Date.now() / 1000;
+  }
+
+  /** Resolve and apply `time_zone` / `session_start` / explicit `tick_marks` as one validated step;
+   *  throws without changing anything on error. */
+  apply_exchange_time(zone: time_zone | undefined, session_start: number | undefined, tick_marks?: unknown): void {
+    const marks = tick_marks === undefined ? undefined : normalize_time_tick_marks(tick_marks);
+    const reason = this.wasm.set_exchange_time_json(exchange_time_json(zone, session_start, marks));
+    if (reason !== "") throw new AerisChartsError("invalid_options", reason);
+    if (typeof zone === "string") {
+      const engine = JSON.parse(this.wasm.time_scale_options_json()) as { time_zone: unknown };
+      this.applied_zone = { name: zone, schedule: JSON.stringify(engine.time_zone) };
+    }
+    this.repaint();
+  }
+
+  /** The IANA name for the engine's current schedule, when it was applied by name. */
+  time_zone_name(schedule: unknown): string | null {
+    const applied = this.applied_zone;
+    return applied !== null && JSON.stringify(schedule) === applied.schedule ? applied.name : null;
+  }
+
+  /** Record a replacement batch's input form (`null` when the series has no rows). */
+  note_series_times(id: number, calendar: boolean | null): void {
+    if (calendar === null) this.calendar_series.delete(id);
+    else this.calendar_series.set(id, calendar);
+    this.sync_calendar_date_axis();
+  }
+
+  /** Record a streamed row's input form: one numeric instant makes the series instant-based. */
+  note_series_update(id: number, calendar: boolean): void {
+    const current = this.calendar_series.get(id);
+    if (current === calendar || current === false) return;
+    this.calendar_series.set(id, current === undefined ? calendar : false);
+    this.sync_calendar_date_axis();
+  }
+
+  private sync_calendar_date_axis(): void {
+    let calendar = this.calendar_series.size > 0;
+    for (const value of this.calendar_series.values()) {
+      if (!value) {
+        calendar = false;
+        break;
+      }
+    }
+    if (calendar === this.calendar_date_axis) return;
+    this.calendar_date_axis = calendar;
+    this.wasm.set_calendar_date_axis(calendar);
+  }
+
+  /** Formatter context; reads package state only, so engine-driven callbacks may use it. */
+  time_label_context(seconds: number): time_label_context {
+    return time_label_context_for(seconds, this.calendar_date_axis);
+  }
+
+  private formatter_locale(): string {
+    return this.locale_setting ?? (typeof navigator !== "undefined" ? navigator.language : "en-US");
+  }
+
+  /** Install the host tick formatter with the reference `(time, type, locale)` arguments plus context. */
+  set_tick_mark_formatter(formatter: time_scale_options["tick_mark_formatter"] | null): void {
+    this.wasm.set_tick_mark_formatter(formatter === null || formatter === undefined
+      ? null
+      : (time: number, tick_mark_type: number) =>
+        formatter(time, tick_mark_type, this.formatter_locale(), this.time_label_context(time)));
+  }
+
+  /**
+   * Time text for package-owned surfaces (tooltip, accessibility): the host `time_formatter`
+   * when installed, else a locale date — plus time of day for intraday rows — in the chart's
+   * exchange time. Calendar-date rows always show their own date.
+   */
+  format_time_text(seconds: number): string {
+    const formatter = this.host_time_formatter;
+    if (formatter !== undefined) {
+      try {
+        const text = formatter(seconds, this.time_label_context(seconds));
+        if (typeof text === "string") return text;
+      } catch (error) {
+        console.error("aeris_charts: localization.time_formatter threw", error);
+      }
+    }
+    const flags = this.wasm.time_label_flags();
+    const local = this.wasm.exchange_local_seconds(seconds);
+    const calendar = (flags & 4) !== 0;
+    const with_time = !calendar && ((flags & 1) !== 0 || local % 86_400 !== 0);
+    const with_seconds = with_time && ((flags & 2) !== 0 || local % 60 !== 0);
+    return format_exchange_seconds(local, this.locale_setting, with_time, with_seconds);
+  }
+
   private stop_countdown_timer(): void {
     if (this.countdown_timer !== null) {
       clearInterval(this.countdown_timer);
@@ -4944,6 +5597,7 @@ export class chart_impl implements chart_api {
       if (!handle) continue;
       handle.mark_removed();
       this.series_by_id.delete(id);
+      this.note_series_times(id, null);
       this.emit_series_change(this.series_removed_subs, handle, pane_of.get(id) ?? 0);
     }
     this.sync_countdown_timer();
@@ -5035,16 +5689,46 @@ export class chart_impl implements chart_api {
     return this.indicator_series(this.wasm.add_sma_with_source(source.id, input, Math.max(1, Math.floor(period))), options);
   }
 
-  add_ema(source: series_api, period: number, options?: Partial<series_options>): series_api {
-    return this.indicator_series(this.wasm.add_ema(source.id, Math.max(1, Math.floor(period))), options);
+  /**
+   * Create a built-in indicator from its typed engine definition. Undefined fields are omitted, so
+   * the engine applies its defaults, then `convention`, then the explicit fields.
+   */
+  private add_indicator_definition(
+    source: series_api,
+    input: indicator_input_source,
+    definition: Record<string, unknown>,
+    convention: indicator_convention | undefined,
+    volume_source?: series_api | null,
+    amount_source?: series_api | null,
+  ): number[] {
+    if (convention !== undefined && convention !== "tradingview" && convention !== "china") {
+      throw new AerisChartsError("invalid_options", `unknown indicator convention: ${String(convention)}`);
+    }
+    return Array.from(this.wasm.add_indicator(
+      source.id,
+      input,
+      JSON.stringify(definition),
+      convention ?? "",
+      volume_source?.id ?? -1,
+      amount_source?.id ?? -1,
+    ));
   }
 
-  add_dema(source: series_api, period: number, options?: Partial<series_options>): series_api {
-    return this.indicator_series(this.wasm.add_dema(source.id, Math.max(1, Math.floor(period))), options);
+  private add_seeded_average(kind: "ema" | "dema" | "tema" | "rsi", source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api {
+    const ids = this.add_indicator_definition(source, input, { kind, period: Math.max(1, Math.floor(period)), seed: parameters?.seed }, parameters?.convention);
+    return this.indicator_series(ids[0] ?? 0xffffffff, options);
   }
 
-  add_tema(source: series_api, period: number, options?: Partial<series_options>): series_api {
-    return this.indicator_series(this.wasm.add_tema(source.id, Math.max(1, Math.floor(period))), options);
+  add_ema(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api {
+    return this.add_seeded_average("ema", source, "close", period, options, parameters);
+  }
+
+  add_dema(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api {
+    return this.add_seeded_average("dema", source, "close", period, options, parameters);
+  }
+
+  add_tema(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api {
+    return this.add_seeded_average("tema", source, "close", period, options, parameters);
   }
 
   add_smma(source: series_api, period: number, options?: Partial<series_options>): series_api {
@@ -5083,24 +5767,27 @@ export class chart_impl implements chart_api {
     return updated;
   }
 
-  add_bollinger(source: series_api, period: number, deviation = 2, options?: Partial<series_options>): [series_api, series_api, series_api] {
-    const ids = this.wasm.add_bollinger(source.id, Math.max(1, Math.floor(period)), deviation);
+  add_bollinger(source: series_api, period: number, deviation = 2, options?: Partial<series_options>, parameters?: bollinger_parameters): [series_api, series_api, series_api] {
+    return this.add_bollinger_with_source(source, "close", period, deviation, options, parameters);
+  }
+
+  add_bollinger_with_source(source: series_api, input: indicator_input_source, period: number, deviation = 2, options?: Partial<series_options>, parameters?: bollinger_parameters): [series_api, series_api, series_api] {
+    const ids = this.add_indicator_definition(source, input, {
+      kind: "bollinger",
+      period: Math.max(1, Math.floor(period)),
+      deviation,
+      estimator: parameters?.estimator,
+    }, parameters?.convention);
     if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Bollinger configuration");
     return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
   }
 
-  add_bollinger_with_source(source: series_api, input: indicator_input_source, period: number, deviation = 2, options?: Partial<series_options>): [series_api, series_api, series_api] {
-    const ids = this.wasm.add_bollinger_with_source(source.id, input, Math.max(1, Math.floor(period)), deviation);
-    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Bollinger configuration");
-    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
+  add_rsi(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api {
+    return this.add_seeded_average("rsi", source, "close", period, options, parameters);
   }
 
-  add_rsi(source: series_api, period: number, options?: Partial<series_options>): series_api {
-    return this.indicator_series(this.wasm.add_rsi(source.id, Math.max(1, Math.floor(period))), options);
-  }
-
-  add_rsi_with_source(source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>): series_api {
-    return this.indicator_series(this.wasm.add_rsi_with_source(source.id, input, Math.max(1, Math.floor(period))), options);
+  add_rsi_with_source(source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api {
+    return this.add_seeded_average("rsi", source, input, period, options, parameters);
   }
 
   set_indicator_input_source(indicator: series_api, input: indicator_input_source): boolean {
@@ -5116,9 +5803,29 @@ export class chart_impl implements chart_api {
     return schema;
   }
 
-  add_macd(source: series_api, fast: number, slow: number, signal: number, options?: Partial<series_options>): [series_api, series_api, series_api] {
-    const ids = this.wasm.add_macd(source.id, Math.max(1, Math.floor(fast)), Math.max(1, Math.floor(slow)), Math.max(1, Math.floor(signal)));
+  add_macd(source: series_api, fast: number, slow: number, signal: number, options?: Partial<series_options>, parameters?: macd_parameters): [series_api, series_api, series_api] {
+    const ids = this.add_indicator_definition(source, "close", {
+      kind: "macd",
+      fast: Math.max(1, Math.floor(fast)),
+      slow: Math.max(1, Math.floor(slow)),
+      signal: Math.max(1, Math.floor(signal)),
+      seed: parameters?.seed,
+      histogram_multiplier: parameters?.histogram_multiplier,
+    }, parameters?.convention);
     if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid MACD configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
+  }
+
+  add_kdj(source: series_api, period = 9, k_smoothing = 3, d_smoothing = 3, options?: Partial<series_options>, parameters?: kdj_parameters): [series_api, series_api, series_api] {
+    const whole = (value: number) => Math.max(1, Math.floor(value));
+    const ids = this.add_indicator_definition(source, "close", {
+      kind: "kdj",
+      period: whole(period),
+      k_smoothing: whole(k_smoothing),
+      d_smoothing: whole(d_smoothing),
+      seed: parameters?.seed,
+    }, parameters?.convention);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid KDJ configuration");
     return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
   }
 
@@ -5132,8 +5839,9 @@ export class chart_impl implements chart_api {
     return this.indicator_series(this.wasm.add_atr(source.id, Math.max(1, Math.floor(period))), options);
   }
 
-  add_vwap(source: series_api, volume_source?: series_api | null, options?: Partial<series_options>): series_api {
-    return this.indicator_series(this.wasm.add_vwap(source.id, volume_source?.id ?? -1), options);
+  add_vwap(source: series_api, volume_source?: series_api | null, options?: Partial<series_options>, parameters?: vwap_parameters): series_api {
+    const ids = this.add_indicator_definition(source, "close", { kind: "vwap" }, undefined, volume_source, parameters?.amount_source);
+    return this.indicator_series(ids[0] ?? 0xffffffff, options);
   }
 
   add_obv(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api {
@@ -5638,24 +6346,67 @@ export class chart_impl implements chart_api {
 
   add_drawing(
     kind: drawing_kind,
-    points: drawing_point[],
+    points: drawing_point_input[],
     options?: Partial<drawing_options>,
     pane_index = 0,
   ): drawing_api {
-    const id = this.wasm.add_drawing(
-      DRAWING_KIND_TO_U8[kind],
+    const wire_kind = DRAWING_KIND_TO_U8[kind];
+    if (wire_kind === undefined) throw new AerisChartsError("invalid_data", `unknown drawing kind ${String(kind)}`);
+    const { id } = drawing_result<{ id: number }>(this.wasm.add_drawing_result_json(
+      wire_kind,
       pane_index,
       JSON.stringify(points),
       JSON.stringify(options ?? {}),
-    );
-    if (id === 0) {
-      throw new AerisChartsError(
-        "invalid_data",
-        "add_drawing rejected (stale pane, wrong anchor count, or non-finite anchors)",
-      );
-    }
+    ));
     this.repaint();
     return new drawing_impl(this, id, kind, pane_index);
+  }
+
+  set_drawings_points(updates: readonly drawing_points_update[]): number {
+    const wire = updates.map((update) => ({
+      id: typeof update.drawing === "number" ? update.drawing : update.drawing.id,
+      points: update.points,
+    }));
+    const { changed } = drawing_result<{ changed: number }>(
+      this.wasm.set_drawings_points_result_json(JSON.stringify(wire)),
+    );
+    if (changed > 0) this.repaint();
+    return changed;
+  }
+
+  rescale_drawing_prices(segments: readonly drawing_price_segment[], price_basis?: string): number {
+    const { changed } = drawing_result<{ changed: number }>(
+      this.wasm.rescale_drawing_prices_result_json(JSON.stringify(segments), price_basis),
+    );
+    this.repaint();
+    return changed;
+  }
+
+  set_drawing_price_basis(basis: string | null): void {
+    if (!this.wasm.set_drawing_price_basis(basis ?? undefined)) {
+      throw new AerisChartsError("invalid_options", "drawing price basis must be at most 128 bytes");
+    }
+  }
+
+  drawing_price_basis(): string | null {
+    return this.wasm.drawing_price_basis() ?? null;
+  }
+
+  set_drawing_magnet_mode(mode: drawing_magnet_mode): void {
+    const wire = DRAWING_MAGNET_TO_U8[mode];
+    if (wire === undefined || !this.wasm.set_drawing_magnet_mode(wire)) {
+      throw new AerisChartsError("invalid_options", `unknown drawing magnet mode ${String(mode)}`);
+    }
+    this.repaint();
+  }
+
+  drawing_magnet_mode(): drawing_magnet_mode {
+    return DRAWING_MAGNET_FROM_U8[this.wasm.drawing_magnet_mode()] ?? "off";
+  }
+
+  /** Whether the armed tool's next placement snaps strongly (crosshair magnet mirror). */
+  armed_drawing_magnet_strong(toggle: boolean): boolean {
+    return this.wasm.armed_drawing_magnet(toggle) === 2;
   }
 
   drawings(): drawing_api[] {
@@ -6302,13 +7053,19 @@ export class chart_impl implements chart_api {
         localization?: localization_options;
         accessibility?: boolean | accessibility_options;
       };
-    let engine_options: Record<string, unknown> = rest;
+    // IANA time-zone names resolve here (the engine accepts only explicit schedules). Validate
+    // and apply them before any other key so a rejected zone changes nothing.
+    const exchange = split_exchange_time_options(rest as Record<string, unknown>);
+    if (exchange.zone !== undefined || exchange.session_start !== undefined || exchange.tick_marks !== undefined) {
+      this.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks);
+    }
+    let engine_options: Record<string, unknown> = exchange.engine;
     // layout.panes.enableResize (reference) drives the separator drag here, not the engine; strip it
     // alongside the other gesture keys before forwarding.
-    const panes = (rest.layout as { panes?: { enableResize?: boolean } } | undefined)?.panes;
+    const panes = (engine_options.layout as { panes?: { enableResize?: boolean } } | undefined)?.panes;
     if (panes?.enableResize !== undefined) {
       const { enableResize, ...panes_rest } = panes;
-      engine_options = { ...rest, layout: { ...(rest.layout as object), panes: panes_rest } };
+      engine_options = { ...engine_options, layout: { ...(engine_options.layout as object), panes: panes_rest } };
       this.gestures_cfg.panes_resize = enableResize;
     }
     // Theme selection is package-owned state. Apply its canonical projection first so explicit
@@ -6365,10 +7122,15 @@ export class chart_impl implements chart_api {
     }
   }
 
-  nudge_selected_drawing(dx: number, dy: number, anchor: number | null): boolean {
-    const changed = this.wasm.nudge_selected_drawing(dx, dy, anchor ?? -1);
+  nudge_selected_drawing(dx: number, dy: number, handle: number | null): boolean {
+    const changed = this.wasm.nudge_selected_drawing(dx, dy, handle ?? -1);
     if (changed) this.repaint();
     return changed;
+  }
+
+  /** Keyboard-reachable handle count of a drawing (0 when unknown or not placeable). */
+  drawing_handle_count(id: number): number {
+    return Math.max(0, this.wasm.drawing_handle_count(id));
   }
 
   select_drawing_for_accessibility(id: number): void {
@@ -6403,8 +7165,19 @@ export class chart_impl implements chart_api {
   /** Install the host price/time formatters (reference `localization`). Callbacks cross into wasm. */
   apply_localization(loc: localization_options): void {
     if (loc.price_formatter !== undefined) this.wasm.set_price_formatter(loc.price_formatter);
-    if (loc.time_formatter !== undefined) this.wasm.set_time_formatter(loc.time_formatter);
-    if (loc.locale !== undefined) this.wasm.set_locale(loc.locale);
+    if (loc.time_formatter !== undefined) {
+      const formatter = loc.time_formatter as localization_options["time_formatter"] | null;
+      this.host_time_formatter = formatter ?? undefined;
+      // The engine calls this during frame construction, so the wrapper reads only package
+      // state (never the wasm object) to build the calendar-date context.
+      this.wasm.set_time_formatter(formatter === null || formatter === undefined
+        ? null
+        : (time: number) => formatter(time, this.time_label_context(time)));
+    }
+    if (loc.locale !== undefined) {
+      this.locale_setting = loc.locale;
+      this.wasm.set_locale(loc.locale);
+    }
     if (loc.date_format !== undefined) this.wasm.set_date_format(loc.date_format);
     this.repaint();
   }
@@ -6466,6 +7239,28 @@ export class chart_impl implements chart_api {
     return this.gestures_cfg;
   }
 
+  /**
+   * Keyboard time-scale motion honors the same host switches as pointer gestures, so a fixed
+   * view (`handle_scroll: false`, `handle_scale: false`) cannot be moved from the keyboard:
+   * arrow panning needs a horizontal scroll gesture, +/- zoom follows wheel zoom, and Home
+   * (fit/reset) follows the time-axis reset gesture.
+   */
+  keyboard_time_scroll_enabled(): boolean {
+    const c = this.gestures_cfg;
+    return c.pan || c.pan_horz_touch || c.wheel_scroll;
+  }
+  keyboard_time_zoom_enabled(): boolean {
+    return this.gestures_cfg.wheel_zoom;
+  }
+  keyboard_time_reset_enabled(): boolean {
+    return this.gestures_cfg.axis_dblclick_reset_time;
+  }
+
+  /** Whether `remove()` ran; host frame loops stop instead of touching the freed engine. */
+  is_removed(): boolean {
+    return this.removed;
+  }
+
   options(): unknown {
     return JSON.parse(this.wasm.options_json());
   }
@@ -6511,6 +7306,7 @@ export class chart_impl implements chart_api {
       axis_rebuilds: out[FRAME_STATS_SLOT.axis_rebuilds] as number,
       text_resolutions: out[FRAME_STATS_SLOT.text_resolutions] as number,
       trading_rebuilds: out[FRAME_STATS_SLOT.trading_rebuilds] as number,
+      ring_dropped_rows: out[FRAME_STATS_SLOT.ring_dropped_rows] as number,
     };
   }
 
@@ -6523,6 +7319,9 @@ export class chart_impl implements chart_api {
   }
 
   add_price_scale(options: price_scale_create_options, pane_index = 0): price_scale_api {
+    // Same contract as `price_scale().apply_options`: a malformed extension value throws before
+    // any scale is created.
+    validate_price_scale_options(options);
     parse_engine_result<{ target: number }>(
       this.wasm.add_price_scale_result_json(pane_index, JSON.stringify(options)),
     );

@@ -142,6 +142,12 @@ impl ChartEngine {
     }
 
     pub(crate) fn runtime_scale_base(&self, pane_index: usize, target: PriceScaleTarget) -> f64 {
+        if let Some(base) = self
+            .price_scale_for(pane_index, target)
+            .and_then(|scale| scale.options().base_value)
+        {
+            return base;
+        }
         self.visible_range()
             .and_then(|(from, _)| {
                 let series = self.series.iter().find(|series| {

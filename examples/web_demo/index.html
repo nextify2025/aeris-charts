@@ -30,8 +30,8 @@
   .brand { font-size: 13px; font-weight: 650; }
   .lab-title { margin-top: 2px; color: var(--text-secondary); font-size: 11px; }
   #demo_mode_switch { display: flex; gap: 2px; padding: 3px; background: var(--surface-secondary); border: var(--border-width) solid var(--border); border-radius: 9px; }
-  #demo_mode_switch button { height: 32px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
-  #demo_mode_switch button:hover { background: var(--hover-bg); color: var(--text-primary); }
+  #demo_mode_switch button, #demo_mode_switch a { display: inline-grid; place-items: center; height: 32px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text-secondary); font-size: 11px; font-weight: 600; text-decoration: none; }
+  #demo_mode_switch button:hover, #demo_mode_switch a:hover { background: var(--hover-bg); color: var(--text-primary); }
   #demo_mode_switch button[aria-pressed="true"] { background: var(--surface); color: var(--primary); box-shadow: 0 0 0 var(--border-width) var(--border-secondary); }
   .market-summary { display: flex; align-items: center; gap: 10px; min-width: 0; padding-left: 16px; border-left: var(--border-width) solid var(--border); }
   .market-symbol { font-size: 13px; font-weight: 600; white-space: nowrap; }
@@ -179,6 +179,7 @@
       <nav id="demo_mode_switch" aria-label="Demo workspace">
         <button id="demo_mode_financial" type="button" aria-pressed="true">Financial</button>
         <button id="demo_mode_general" type="button" aria-pressed="false">General</button>
+        <a id="demo_mode_intraday" href="./intraday.html" title="A-share time-sharing (分时) chart">Intraday</a>
       </nav>
       <div class="market-summary" aria-label="Demo instrument">
         <span class="market-symbol">NCL · 1H</span>
@@ -1556,6 +1557,7 @@ const indicator_definitions = [
   ["rsi", "RSI · Relative strength index (14)", () => chart.add_rsi(main, 14, { color: "#ab47bc", line_width: 2 })],
   ["macd", "MACD · 12 / 26 / 9", () => chart.add_macd(main, 12, 26, 9)],
   ["stochastic", "Stochastic · 14 / 3", () => chart.add_stochastic(main, 14, 3)],
+  ["kdj", "KDJ · 9 / 3 / 3", () => chart.add_kdj(main, 9, 3, 3)],
   ["atr", "ATR · Average true range (14)", () => chart.add_atr(main, 14)],
   ["vwap", "VWAP · Session volume-weighted price", (volume) => chart.add_vwap(main, volume)],
   ["volume_profile", "Volume Profile · Visible range / POC / 70%", (volume) => chart.add_volume_profile(main, volume)],

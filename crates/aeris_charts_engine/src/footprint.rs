@@ -2074,7 +2074,9 @@ impl ChartEngine {
                     for (index, point) in points.iter_mut().enumerate() {
                         point.logical_index = index as u64;
                     }
-                    self.sync_sequence_axis_times();
+                    // Every retention caller runs `sync_time_points` next, which reads this
+                    // sidecar and applies the exact viewport compensation for the trim. Syncing
+                    // the scale here as well would move the base index first and compensate twice.
                 }
             }
             let _ = self.refresh_trade_bubbles(stream_id);
@@ -2572,6 +2574,7 @@ fn footprint_price_format(tick_size: f64) -> SeriesPriceFormat {
         precision,
         min_move: tick_size,
         formatter: None,
+        tick_ladder: None,
     }
 }
 

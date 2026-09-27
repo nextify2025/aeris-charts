@@ -788,8 +788,10 @@ test("workspace state composes chart persistence V1 and restores stable ownershi
   expect(result.identities).toEqual(["BTC-USD", "ETH-USD", "SOL-USD"]);
   expect(result.drawings.map((drawings) => drawings.map((drawing) => drawing.kind)))
     .toEqual([["horizontal_line"], ["trend_line"], ["rectangle"]]);
+  // points() also reports each anchor's time identity (the seeded bars use times 1..30, so
+  // logical 4 is time 5); the restore resolves that time against the re-seeded data.
   expect(result.drawings[1][0].points).toEqual([
-    { logical: 4, price: 104 }, { logical: 12, price: 112 },
+    { logical: 4, price: 104, time: 5 }, { logical: 12, price: 112, time: 13 },
   ]);
   expect(result.drawings[1][0].options).toMatchObject({ style: "dashed", width: 4 });
   expect(result.histories_empty).toBe(true);

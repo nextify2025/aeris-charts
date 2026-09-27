@@ -5,32 +5,32 @@ use crate::native_primitives::{
     NativeSeriesPrimitiveKind, OverlayPriceScaleSide,
 };
 use aeris_charts_core::format::time_formatter::{
-    format_date_pattern, format_tick_label_with, TickMarkType,
+    format_date_pattern, format_tick_label_in, TickMarkType,
 };
+use aeris_charts_core::scale::exchange_time::ExchangeTime;
 use aeris_charts_render::draw_list::TextAlign;
 
-fn utc_hour(time: i64) -> u8 {
-    (time.rem_euclid(86_400) / 3_600) as u8
-}
-
-fn is_weekend(time: i64) -> bool {
-    let weekday_from_sunday = (time.div_euclid(86_400) + 4).rem_euclid(7);
-    weekday_from_sunday == 0 || weekday_from_sunday == 6
-}
-
-fn session_color(time: i64, options: crate::SessionHighlightingOptions) -> Option<Color> {
-    if let (Some(start), Some(end)) = (options.start_hour_utc, options.end_hour_utc) {
-        let hour = utc_hour(time);
+/// Session color of one source bar: the optional `[start_hour, end_hour)` gate and the weekend
+/// test both use exchange wall-clock time (fractional hours, minute precision and finer).
+fn session_color(
+    time: i64,
+    options: crate::SessionHighlightingOptions,
+    exchange: &ExchangeTime,
+) -> Option<Color> {
+    if let (Some(start), Some(end)) = (options.start_hour, options.end_hour) {
+        let seconds = exchange.local_seconds_of_day(time);
+        let start = (start * 3_600.0).round() as i64;
+        let end = (end * 3_600.0).round() as i64;
         let inside = if start <= end {
-            hour >= start && hour < end
+            seconds >= start && seconds < end
         } else {
-            hour >= start || hour < end
+            seconds >= start || seconds < end
         };
         if !inside {
             return None;
         }
     }
-    Some(if is_weekend(time) {
+    Some(if exchange.local_weekday(time) >= 5 {
         options.weekend_color
     } else {
         options.weekday_color
@@ -251,15 +251,24 @@ impl ChartEngine {
 
                 items.sort_by_key(|item| item.1);
                 let tooltip_lines = |item: &(f64, i64, f64, i64)| {
-                    let mut lines = vec![
-                        format!("{:.2}", item.2),
-                        format_date_pattern(item.3, "dd MMM yyyy", &self.month_names),
-                    ];
+                    let mut lines = vec![self.format_series_plain_value(series, item.2)];
+                    // A host `timeFormatter` owns the whole time text; otherwise the built-in
+                    // date and time lines use exchange wall-clock time.
+                    if let Some(text) = self.host_time_label(item.3) {
+                        lines.push(text);
+                        return lines;
+                    }
+                    lines.push(format_date_pattern(
+                        self.exchange_time.local_seconds(item.3),
+                        "dd MMM yyyy",
+                        &self.month_names,
+                    ));
                     if state.options.show_time {
-                        lines.push(format_tick_label_with(
+                        lines.push(format_tick_label_in(
                             item.3,
                             TickMarkType::Time,
                             &self.month_names,
+                            &self.exchange_time,
                         ));
                     }
                     lines
@@ -305,7 +314,12 @@ impl ChartEngine {
                     let change = items[1].2 - items[0].2;
                     let percent = 100.0 * change / items[0].2;
                     let positive = change >= 0.0;
-                    delta_top = format!("{}{change:.2}", if positive { "+" } else { "" });
+                    let change_text = self.format_series_plain_value(series, change);
+                    delta_top = if positive {
+                        format!("+{change_text}")
+                    } else {
+                        change_text
+                    };
                     delta_bottom = format!("{}{percent:.2}%", if positive { "+" } else { "" });
                     delta_bg = if positive {
                         Color::rgba(MARKET_UP_RGB.0, MARKET_UP_RGB.1, MARKET_UP_RGB.2, 51)
@@ -684,7 +698,9 @@ impl ChartEngine {
                         }
                     } else {
                         for &time in times {
-                            if let Some(color) = session_color(time, state.options) {
+                            if let Some(color) =
+                                session_color(time, state.options, &self.exchange_time)
+                            {
                                 append(time, color);
                             }
                         }

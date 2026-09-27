@@ -540,8 +540,16 @@ impl ChartEngine {
             return;
         }
         self.invalidate_frame_all();
-        if let Some(series) = self.series_entry_mut(id) {
-            series.price_scale_target = target;
+        let Some(previous) = self
+            .series_entry_mut(id)
+            .map(|series| std::mem::replace(&mut series.price_scale_target, target))
+        else {
+            return;
+        };
+        if previous != target {
+            // Both the scale the series left and the one it joined refit exactly.
+            self.reset_scale_stabilization_at(pane_index, previous);
+            self.reset_scale_stabilization_at(pane_index, target);
         }
     }
 
@@ -550,8 +558,10 @@ impl ChartEngine {
     /// Keys: `mode` (0 normal, 1 log, 2 percentage, 3 indexed-to-100), `auto_scale`,
     /// `invert_scale`, `scale_margins` (`{top, bottom}`, each optional), `align_labels`,
     /// `ticks_visible`, `entire_text_only`, `minimum_width`, `text_color` (string, `""` or
-    /// `null` clears back to `layout.textColor`). Returns false for a malformed patch or an
-    /// unknown pane/target.
+    /// `null` clears back to `layout.textColor`), `bold_round_labels`, `tick_mark_density`,
+    /// `ensure_edge_tick_marks_visible`, `base_value` and `autoscale_center` (numbers, `null`
+    /// clears), and `stable_auto_scale`. Returns false for a malformed patch or an unknown
+    /// pane/target.
     pub fn price_scale_apply_options_json(
         &mut self,
         pane: usize,
@@ -639,13 +649,156 @@ impl ChartEngine {
         if let Some(value) = flag("bold_round_labels") {
             scale.set_bold_round_labels(value);
         }
+        if let Some(density) = finite("tick_mark_density") {
+            scale.set_tick_mark_density(density);
+        }
+        if let Some(visible) = flag("ensure_edge_tick_marks_visible") {
+            scale.set_ensure_edge_tick_marks_visible(visible);
+        }
+        // `null` clears; a non-finite (or zero base) value leaves the option untouched.
+        let optional_price = |key: &str| match patch.get(key) {
+            Some(serde_json::Value::Null) => Some(None),
+            Some(value) => value.as_f64().map(Some),
+            None => None,
+        };
+        if let Some(base) = optional_price("base_value") {
+            scale.set_base_value(base);
+        }
+        if let Some(center) = optional_price("autoscale_center") {
+            scale.set_autoscale_center(center);
+        }
+        if let Some(stable) = flag("stable_auto_scale") {
+            scale.set_stable_auto_scale(stable);
+        }
+        // These keys change autoscale inputs, not just axis presentation.
+        if [
+            "tick_mark_density",
+            "ensure_edge_tick_marks_visible",
+            "base_value",
+            "autoscale_center",
+            "stable_auto_scale",
+        ]
+        .iter()
+        .any(|key| patch.contains_key(*key))
+        {
+            self.invalidate_frame_scene();
+        }
         true
+    }
+
+    /// reference `tickMarkDensity`: tick label spacing in font heights (finite, positive).
+    /// Returns false for an unknown pane/target or an invalid density.
+    pub fn set_price_scale_tick_mark_density_for(
+        &mut self,
+        pane: usize,
+        target: PriceScaleTarget,
+        density: f64,
+    ) -> bool {
+        self.invalidate_frame_scene();
+        self.price_scale_for_mut(pane, target)
+            .is_some_and(|scale| scale.set_tick_mark_density(density))
+    }
+
+    /// reference `ensureEdgeTickMarksVisible`: rounded boundary ticks and half-font edge padding
+    /// while the scale autoscales. Returns false for an unknown pane/target.
+    pub fn set_price_scale_ensure_edge_tick_marks_visible_for(
+        &mut self,
+        pane: usize,
+        target: PriceScaleTarget,
+        visible: bool,
+    ) -> bool {
+        self.invalidate_frame_scene();
+        self.price_scale_for_mut(pane, target)
+            .map(|scale| scale.set_ensure_edge_tick_marks_visible(visible))
+            .is_some()
+    }
+
+    /// Explicit percentage/indexed-to-100 base price for one scale (e.g. the previous close), or
+    /// `None` for the first-visible/comparison-anchor base. Drawings on the scale share it.
+    /// Returns false for an unknown pane/target or a non-finite/zero base.
+    pub fn set_price_scale_base_value_for(
+        &mut self,
+        pane: usize,
+        target: PriceScaleTarget,
+        base: Option<f64>,
+    ) -> bool {
+        self.invalidate_frame_scene();
+        self.price_scale_for_mut(pane, target)
+            .is_some_and(|scale| scale.set_base_value(base))
+    }
+
+    /// Center the scale's autoscaled range on a raw price (`center ± max|price − center|`), or
+    /// `None` for the plain data range. Returns false for an unknown pane/target or a non-finite
+    /// center.
+    pub fn set_price_scale_autoscale_center_for(
+        &mut self,
+        pane: usize,
+        target: PriceScaleTarget,
+        center: Option<f64>,
+    ) -> bool {
+        self.invalidate_frame_scene();
+        self.price_scale_for_mut(pane, target)
+            .is_some_and(|scale| scale.set_autoscale_center(center))
+    }
+
+    /// Opt one scale into stable autoscale (grow at once, shrink with hysteresis). Returns false
+    /// for an unknown pane/target.
+    pub fn set_price_scale_stable_auto_scale_for(
+        &mut self,
+        pane: usize,
+        target: PriceScaleTarget,
+        stable: bool,
+    ) -> bool {
+        self.invalidate_frame_scene();
+        self.price_scale_for_mut(pane, target)
+            .map(|scale| scale.set_stable_auto_scale(stable))
+            .is_some()
+    }
+
+    /// Restart stable autoscale on one scale (unknown pane/target: no-op).
+    pub(crate) fn reset_scale_stabilization_at(&mut self, pane: usize, target: PriceScaleTarget) {
+        if let Some(scale) = self.price_scale_for_mut(pane, target) {
+            scale.reset_autoscale_stabilization();
+        }
+    }
+
+    /// Restart stable autoscale on the scale that owns `id`: its contribution changed
+    /// structurally (visibility, removal, or pane/scale rebinding), not by a pan.
+    pub(crate) fn reset_series_scale_stabilization(&mut self, id: SeriesId) {
+        if let Some((pane, target)) = self.series_price_scale(id) {
+            self.reset_scale_stabilization_at(pane, target);
+        }
+    }
+
+    /// A full data replacement restarts stable autoscale on the replaced series' scale and on the
+    /// scale of every indicator output rebuilt from it through its price, volume, or turnover
+    /// (amount) input (bindings are topological, so one forward pass reaches every downstream
+    /// chain).
+    pub(crate) fn reset_replaced_series_stabilization(&mut self, id: SeriesId) {
+        let mut affected = vec![id];
+        for binding in &self.indicators {
+            if affected.contains(&binding.source)
+                || binding
+                    .volume_source
+                    .is_some_and(|volume| affected.contains(&volume))
+                || binding
+                    .amount_source
+                    .is_some_and(|amount| affected.contains(&amount))
+            {
+                affected.extend(binding.outputs.iter().copied());
+            }
+        }
+        for id in affected {
+            self.reset_series_scale_stabilization(id);
+        }
     }
 
     /// One pane scale's full options as a snake_case JSON object (reference `priceScale.options()`
     /// shape): `mode`, `auto_scale`, `invert_scale`, `scale_margins`, and the label
     /// cosmetics (`align_labels`, `ticks_visible`, `entire_text_only`, `minimum_width`,
-    /// `text_color`). `None` for an unknown pane/target.
+    /// `text_color`, `bold_round_labels`, `tick_mark_density`, `ensure_edge_tick_marks_visible`),
+    /// plus `base_value`, `autoscale_center`, `stable_auto_scale`, and `visible`. `None` for an
+    /// unknown pane/target.
     pub fn price_scale_options_json(
         &self,
         pane: usize,
@@ -673,6 +826,11 @@ impl ChartEngine {
                 "minimum_width": options.minimum_width,
                 "text_color": options.text_color,
                 "bold_round_labels": options.bold_round_labels,
+                "tick_mark_density": options.tick_mark_density,
+                "ensure_edge_tick_marks_visible": options.ensure_edge_tick_marks_visible,
+                "base_value": options.base_value,
+                "autoscale_center": options.autoscale_center,
+                "stable_auto_scale": options.stable_auto_scale,
                 "visible": self.price_scale_visible_for(pane, target),
             })
             .to_string(),
@@ -692,6 +850,19 @@ impl ChartEngine {
     /// reference `firstValue` reads the custom plot row's Close slot).
     pub(crate) fn series_base_value(&self, id: SeriesId, visible_from: i64) -> Option<f64> {
         let series = self.series_entry(id)?;
+        let first = self.series_first_value(series, visible_from)?;
+        // An explicit scale base (e.g. the previous close) replaces the first-visible/anchor base
+        // for every source and drawing on that scale. The first visible value still gates whether
+        // the source participates at all, exactly as before.
+        Some(
+            self.price_scale_for(series.pane_index, crate::frame::series_scale_target(series))
+                .and_then(|scale| scale.options().base_value)
+                .unwrap_or(first),
+        )
+    }
+
+    fn series_first_value(&self, series: &crate::SeriesEntry, visible_from: i64) -> Option<f64> {
+        let id = series.id;
         if series.kind == SeriesKind::Custom {
             return series
                 .custom_frame

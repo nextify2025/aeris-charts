@@ -151,7 +151,8 @@ function use_footprint_spacing(chart) {
   const scale = chart.time_scale();
   const previous = scale.options();
   scale.apply_options({ min_bar_spacing: 4, bar_spacing: 72, right_offset: 0 });
-  scale.scroll_to_real_time();
+  // Snap immediately; `scroll_to_real_time()` animates like the reference.
+  scale.scroll_to_position(0, false);
   return () => scale.apply_options({
     min_bar_spacing: previous.min_bar_spacing,
     bar_spacing: previous.bar_spacing,

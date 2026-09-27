@@ -90,6 +90,8 @@ pub(super) struct DrainOutcome {
     pub(super) had_work: bool,
     /// Rows the producer overwrote before this drain reached them.
     pub(super) lost_rows: u32,
+    /// Rows read from the ring but dropped as invalid (bad timestamp or non-finite values).
+    pub(super) dropped_rows: u32,
 }
 
 impl BoundRing {
@@ -167,6 +169,7 @@ impl BoundRing {
                     rows: 0,
                     had_work: false,
                     lost_rows: 0,
+                    dropped_rows: 0,
                 };
             };
             let plan = self.layout.plan_drain(self.consumed, cursor);
@@ -177,6 +180,7 @@ impl BoundRing {
                     rows: 0,
                     had_work: false,
                     lost_rows: 0,
+                    dropped_rows: 0,
                 };
             }
             let start_count = cursor.wrapping_sub(take as i32);
@@ -239,6 +243,7 @@ impl BoundRing {
                 rows,
                 had_work: true,
                 lost_rows: plan.lost_rows as u32,
+                dropped_rows: (take as u32).saturating_sub(rows),
             };
         }
 
@@ -246,6 +251,7 @@ impl BoundRing {
             rows: 0,
             had_work: true,
             lost_rows: 0,
+            dropped_rows: 0,
         }
     }
 

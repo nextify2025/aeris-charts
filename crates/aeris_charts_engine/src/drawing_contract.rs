@@ -5,7 +5,7 @@
 //! templates, persistence adapters, and cross-cell synchronization.  Values are deliberately
 //! bounded and deterministic so a host cannot turn a drawing patch into unbounded work.
 
-use crate::{DrawingKind, DrawingPoint, DrawingPriceScale};
+use crate::{ChartError, DrawingAnchor, DrawingKind, DrawingPriceScale, ErrorCode};
 
 pub const DRAWING_CONTRACT_REVISION: u32 = 1;
 pub const MAX_DRAWING_NAME_BYTES: usize = 256;
@@ -15,6 +15,8 @@ pub const MAX_DRAWING_LEVELS: usize = 64;
 pub const MAX_DRAWING_TEMPLATE_BYTES: usize = 64 * 1024;
 pub const MAX_DRAWING_TEMPLATES: usize = 128;
 pub const MAX_DRAWING_OBJECTS: usize = 10_000;
+/// Upper bound on the segments one price-basis rescale may carry.
+pub const MAX_DRAWING_PRICE_SEGMENTS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -183,13 +185,15 @@ impl DrawingLevel {
     }
 }
 
+/// One drawing in a clipboard or sync payload. Each point carries its anchor time identity, so a
+/// receiving chart with a different interval or history window resolves it by time.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DrawingClipboardItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u32>,
     pub kind: DrawingKind,
     pub pane_index: usize,
-    pub points: Vec<DrawingPoint>,
+    pub points: Vec<DrawingAnchor>,
     pub options: serde_json::Value,
 }
 
@@ -198,6 +202,10 @@ pub struct DrawingClipboardPayload {
     pub schema: String,
     pub revision: u64,
     pub drawings: Vec<DrawingClipboardItem>,
+    /// Host-defined price basis the copied prices use (see
+    /// [`ChartEngine::set_drawing_price_basis`](crate::ChartEngine::set_drawing_price_basis)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_basis: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -206,6 +214,79 @@ pub struct DrawingSyncPayload {
     pub source: String,
     pub revision: u64,
     pub drawings: Vec<DrawingClipboardItem>,
+    /// Host-defined price basis of the synchronized drawings; the receiver adopts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_basis: Option<String>,
+}
+
+/// One multiplicative price-basis segment for
+/// [`ChartEngine::rescale_drawing_prices`](crate::ChartEngine::rescale_drawing_prices): anchors
+/// whose time lies in `[from_time, to_time)` (UTC seconds; `None` is unbounded) are multiplied by
+/// `factor`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DrawingPriceSegment {
+    #[serde(default)]
+    pub from_time: Option<f64>,
+    #[serde(default)]
+    pub to_time: Option<f64>,
+    pub factor: f64,
+}
+
+impl DrawingPriceSegment {
+    /// Smallest and largest accepted factors; adjustment ratios are far inside this range and the
+    /// bound keeps every rescaled finite price finite.
+    pub const MIN_FACTOR: f64 = 1e-6;
+    pub const MAX_FACTOR: f64 = 1e6;
+
+    pub fn contains(&self, time: f64) -> bool {
+        self.from_time.is_none_or(|from| time >= from) && self.to_time.is_none_or(|to| time < to)
+    }
+
+    /// Validate a segment list: bounded length, finite bounds with `from < to`, factors in
+    /// `[MIN_FACTOR, MAX_FACTOR]`, and no two segments overlapping.
+    pub fn validate_all(segments: &[Self]) -> Result<(), ChartError> {
+        let invalid = |message: String| ChartError::new(ErrorCode::InvalidData, message);
+        if segments.len() > MAX_DRAWING_PRICE_SEGMENTS {
+            return Err(ChartError::new(
+                ErrorCode::ResourceLimit,
+                format!("at most {MAX_DRAWING_PRICE_SEGMENTS} price segments are supported"),
+            ));
+        }
+        for (index, segment) in segments.iter().enumerate() {
+            let finite_bound = |bound: Option<f64>| bound.is_none_or(f64::is_finite);
+            if !finite_bound(segment.from_time) || !finite_bound(segment.to_time) {
+                return Err(invalid(format!(
+                    "price segment {index} has a non-finite bound"
+                )));
+            }
+            if let (Some(from), Some(to)) = (segment.from_time, segment.to_time) {
+                if from >= to {
+                    return Err(invalid(format!("price segment {index} is empty")));
+                }
+            }
+            if !(Self::MIN_FACTOR..=Self::MAX_FACTOR).contains(&segment.factor) {
+                return Err(invalid(format!(
+                    "price segment {index} factor must be in [{}, {}]",
+                    Self::MIN_FACTOR,
+                    Self::MAX_FACTOR
+                )));
+            }
+        }
+        let mut ordered = segments.to_vec();
+        ordered.sort_by(|a, b| {
+            a.from_time
+                .unwrap_or(f64::NEG_INFINITY)
+                .total_cmp(&b.from_time.unwrap_or(f64::NEG_INFINITY))
+        });
+        for pair in ordered.windows(2) {
+            let previous_end = pair[0].to_time.unwrap_or(f64::INFINITY);
+            let next_start = pair[1].from_time.unwrap_or(f64::NEG_INFINITY);
+            if next_start < previous_end {
+                return Err(invalid("price segments overlap".to_string()));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

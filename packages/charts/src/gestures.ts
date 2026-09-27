@@ -49,6 +49,130 @@ type AxisDrag = { kind: "price"; pane: number; target: number } | { kind: "time"
 /** Where a press landed; drives the touch ownership rules (the reference's per-widget handlers). */
 type press_region = "pane" | "price_axis" | "time_axis" | "separator";
 
+// ---------------------------------------------------------------------------------------------
+// Wheel routing (reference chart-widget.ts `_onMousewheel` + `_determineWheelSpeedAdjustment`),
+// shared by the DOM recognizer and the OffscreenCanvas worker façade. Worker-safe: it reads only
+// `navigator`, which workers expose too.
+// ---------------------------------------------------------------------------------------------
+
+/** The engine surface one routed wheel sample drives. */
+export interface wheel_route_target {
+  classify_wheel(
+    behavior: number,
+    delta_x: number,
+    delta_y: number,
+    delta_mode: number,
+    ctrl_key: boolean,
+    shift_key: boolean,
+  ): number;
+  pane_index_at_y(y: number): number;
+  price_axis_target_at(pane: number, x: number): number | undefined;
+  wheel_zoom_scale(delta_y: number): number;
+  price_axis_wheel_zoom(pane: number, target: number, y: number, zoom: number): unknown;
+  zoom(x: number, scale: number): void;
+  zoom_focused(x: number, scale: number): void;
+  scroll_start(x: number): void;
+  scroll_move(x: number): void;
+  wheel_scroll_delta(delta: number): number;
+  scroll_end(): void;
+}
+
+/** One raw wheel sample. `point()` resolves lazily to pane-relative x and chart-relative y. */
+export interface wheel_route_sample {
+  delta_x: number;
+  delta_y: number;
+  delta_mode: number;
+  ctrl_key: boolean;
+  shift_key: boolean;
+  /** `_determineWheelSpeedAdjustment` for this sample (see {@link wheel_speed_adjustment}). */
+  speed: number;
+  point(): { x: number; y: number };
+}
+
+export interface wheel_route_config {
+  wheel_behavior: "auto" | "pan" | "zoom";
+  wheel_zoom: boolean;
+  wheel_scroll: boolean;
+}
+
+// reference `windowsChrome` = isChromiumBased() && isWindows(), resolved lazily for non-browser runs.
+let windows_chrome: boolean | null = null;
+function is_windows_chromium(): boolean {
+  if (windows_chrome === null) {
+    const nav = (typeof navigator === "undefined" ? undefined : navigator) as
+      | (Navigator & { userAgentData?: { platform?: string; brands?: { brand: string }[] } })
+      | undefined;
+    const chromium = nav?.userAgentData?.brands?.some((b) => b.brand.includes("Chromium")) === true;
+    const windows = nav?.userAgentData?.platform
+      ? nav.userAgentData.platform === "Windows"
+      : (nav?.userAgent ?? "").toLowerCase().indexOf("win") >= 0;
+    windows_chrome = chromium && windows;
+  }
+  return windows_chrome;
+}
+
+/** reference `_determineWheelSpeedAdjustment`: page/line delta modes use fixed factors, and
+ *  Chromium on Windows mis-scales pixel deltas on high-density displays (Chromium issues
+ *  1001735 / 1207308), corrected by 1/devicePixelRatio. */
+export function wheel_speed_adjustment(delta_mode: number, device_pixel_ratio: number): number {
+  switch (delta_mode) {
+    case 2: // DOM_DELTA_PAGE: one screen at a time
+      return 120;
+    case 1: // DOM_DELTA_LINE: one line at a time
+      return 32;
+  }
+  return is_windows_chromium() && device_pixel_ratio > 0 ? 1 / device_pixel_ratio : 1;
+}
+
+/** Apply one wheel sample to the time scale (or, in explicit zoom mode, a price axis). Returns
+ *  false when the sample does nothing so a DOM host can leave the page scroll alone. */
+export function route_wheel(
+  wasm: wheel_route_target,
+  sample: wheel_route_sample,
+  cfg: wheel_route_config,
+): boolean {
+  const delta_x = (sample.speed * sample.delta_x) / 100;
+  const delta_y = -(sample.speed * sample.delta_y) / 100;
+  const behavior = cfg.wheel_behavior === "pan" ? 1 : cfg.wheel_behavior === "zoom" ? 2 : 0;
+  const intent = wasm.classify_wheel(
+    behavior,
+    delta_x,
+    delta_y,
+    sample.delta_mode,
+    sample.ctrl_key,
+    sample.shift_key,
+  );
+  const pan_delta = cfg.wheel_behavior === "auto"
+    ? delta_x
+    : Math.abs(delta_x) >= Math.abs(delta_y) ? delta_x : -delta_y;
+  const do_zoom = (intent & 2) !== 0 && delta_y !== 0 && cfg.wheel_zoom;
+  const do_scroll = (intent & 1) !== 0 && pan_delta !== 0 && cfg.wheel_scroll;
+  if (!do_zoom && !do_scroll) return false;
+  if (do_zoom) {
+    const point = sample.point();
+    const pane = wasm.pane_index_at_y(point.y);
+    const target = wasm.price_axis_target_at(pane, point.x) ?? null;
+    const zoom = wasm.wheel_zoom_scale(delta_y);
+    if (cfg.wheel_behavior === "zoom" && target !== null) {
+      // Explicit Aeris `zoom` mode retains price-axis wheel zoom as an extension.
+      wasm.price_axis_wheel_zoom(pane, target, point.y, zoom);
+    } else {
+      // Auto mode is informed by the public reference's chart-level behavior: every surface zooms
+      // time, modifiers are ignored, and the engine clamps the pane-relative anchor into the plot.
+      if (cfg.wheel_behavior === "zoom" && sample.ctrl_key) wasm.zoom_focused(point.x, zoom);
+      else wasm.zoom(point.x, zoom);
+    }
+  }
+  if (do_scroll) {
+    // reference `scrollChart(deltaX * -80)`: "80 is a made up coefficient, and minus is for the
+    // 'natural' scroll" (engine) — expressed as a scroll session spanning a single jump.
+    wasm.scroll_start(0);
+    wasm.scroll_move(wasm.wheel_scroll_delta(pan_delta));
+    wasm.scroll_end();
+  }
+  return true;
+}
+
 export function install_gestures(chart: chart_impl): () => void {
   const overlay = chart.overlay_el();
   const wasm = chart.wasm;
@@ -234,11 +358,14 @@ export function install_gestures(chart: chart_impl): () => void {
 
   // the public reference's Ctrl-held magnet, scoped to DRAWING work: the Normal-mode crosshair snaps
   // to the hovered bar's rendered prices only while a drawing tool is armed (anchor
-  // placement/preview) —
-  // plain browsing never price-snaps on Ctrl. Forwarded on every pointer move/down and on
-  // modifier key events, so a press/release without mouse movement still refreshes the snap live.
+  // placement/preview) and the engine's effective drawing magnet is strong — the chart/tool
+  // magnet mode with Ctrl/Cmd as its temporary toggle. Plain browsing never price-snaps on Ctrl.
+  // Forwarded on every pointer move/down and on modifier key events, so a press/release without
+  // mouse movement still refreshes the snap live.
   const apply_crosshair_magnet = (e: { ctrlKey: boolean; metaKey: boolean }) => {
-    wasm.set_crosshair_ohlc_magnet((e.ctrlKey || e.metaKey) && chart.creation_armed());
+    wasm.set_crosshair_ohlc_magnet(
+      chart.creation_armed() && chart.armed_drawing_magnet_strong(e.ctrlKey || e.metaKey),
+    );
   };
   const on_modifier_key = (e: KeyboardEvent) => {
     if (e.key !== "Control" && e.key !== "Meta") return;
@@ -428,84 +555,25 @@ export function install_gestures(chart: chart_impl): () => void {
   };
 
   // ---------------------------------------------------------------------------------------------
-  // Wheel (reference chart-widget.ts `_onMousewheel` + `_determineWheelSpeedAdjustment`)
+  // Wheel: the shared `route_wheel` owns the semantics; this host adds event-default policy.
   // ---------------------------------------------------------------------------------------------
 
-  // reference `windowsChrome` = isChromiumBased() && isWindows(), resolved lazily for non-browser runs.
-  let windows_chrome: boolean | null = null;
-  const is_windows_chromium = (): boolean => {
-    if (windows_chrome === null) {
-      const nav = navigator as Navigator & {
-        userAgentData?: { platform?: string; brands?: { brand: string }[] };
-      };
-      const chromium = nav.userAgentData?.brands?.some((b) => b.brand.includes("Chromium")) === true;
-      const windows = nav.userAgentData?.platform
-        ? nav.userAgentData.platform === "Windows"
-        : navigator.userAgent.toLowerCase().indexOf("win") >= 0;
-      windows_chrome = chromium && windows;
-    }
-    return windows_chrome;
-  };
-  const wheel_speed_adjustment = (e: WheelEvent): number => {
-    switch (e.deltaMode) {
-      case WheelEvent.DOM_DELTA_PAGE: // one screen at a time scroll mode
-        return 120;
-      case WheelEvent.DOM_DELTA_LINE: // one line at a time scroll mode
-        return 32;
-    }
-    // Chromium on Windows mis-scales wheel deltas on high-density displays (Chromium issues
-    // 1001735 / 1207308); reference corrects by 1/devicePixelRatio for consistent scroll speed.
-    return is_windows_chromium() ? 1 / window.devicePixelRatio : 1;
-  };
-
   const on_wheel = (e: WheelEvent) => {
-    const cfg = chart.gesture_config();
-    const adj = wheel_speed_adjustment(e);
-    const delta_x = (adj * e.deltaX) / 100;
-    const delta_y = -(adj * e.deltaY) / 100;
-    const behavior = cfg.wheel_behavior === "pan" ? 1 : cfg.wheel_behavior === "zoom" ? 2 : 0;
-    const intent = wasm.classify_wheel(
-      behavior,
-      delta_x,
-      delta_y,
-      e.deltaMode,
-      e.ctrlKey,
-      e.shiftKey,
+    const handled = route_wheel(
+      wasm,
+      {
+        delta_x: e.deltaX,
+        delta_y: e.deltaY,
+        delta_mode: e.deltaMode,
+        ctrl_key: e.ctrlKey,
+        shift_key: e.shiftKey,
+        speed: wheel_speed_adjustment(e.deltaMode, window.devicePixelRatio),
+        point: () => local_xy(e),
+      },
+      chart.gesture_config(),
     );
-    const pan_delta = cfg.wheel_behavior === "auto"
-      ? delta_x
-      : Math.abs(delta_x) >= Math.abs(delta_y) ? delta_x : -delta_y;
-    const do_zoom = (intent & 2) !== 0 && delta_y !== 0 && cfg.wheel_zoom;
-    const do_scroll = (intent & 1) !== 0 && pan_delta !== 0 && cfg.wheel_scroll;
-    if (!do_zoom && !do_scroll) return; // let the page scroll
+    if (!handled) return; // let the page scroll
     if (e.cancelable) e.preventDefault();
-    if (do_zoom) {
-      const point = local_xy(e);
-      const pane = wasm.pane_index_at_y(point.y);
-      const target = wasm.price_axis_target_at(pane, point.x) ?? null;
-      const zoom = wasm.wheel_zoom_scale(delta_y);
-      if (cfg.wheel_behavior === "zoom" && target !== null) {
-        // Explicit Aeris `zoom` mode retains price-axis wheel zoom as an extension.
-        wasm.price_axis_wheel_zoom(
-          pane,
-          target,
-          point.y,
-          zoom,
-        );
-      } else {
-        // Auto mode is informed by the public reference's chart-level behavior: every surface zooms time,
-        // modifiers are ignored, and the engine clamps the pane-relative anchor into the plot.
-        if (cfg.wheel_behavior === "zoom" && e.ctrlKey) wasm.zoom_focused(point.x, zoom);
-        else wasm.zoom(point.x, zoom);
-      }
-    }
-    if (do_scroll) {
-      // reference `scrollChart(deltaX * -80)`: "80 is a made up coefficient, and minus is for the
-      // 'natural' scroll" (engine) — expressed as a scroll session spanning a single jump.
-      wasm.scroll_start(0);
-      wasm.scroll_move(wasm.wheel_scroll_delta(pan_delta));
-      wasm.scroll_end();
-    }
     chart.repaint();
   };
 
@@ -1357,7 +1425,6 @@ export function install_gestures(chart: chart_impl): () => void {
   };
 
   const on_keydown = (e: KeyboardEvent) => {
-    const cfg = chart.gesture_config();
     const step = e.ctrlKey || e.shiftKey ? 10 : 1;
     const center = wasm.time_scale_width() / 2;
     let handled = true;
@@ -1373,22 +1440,28 @@ export function install_gestures(chart: chart_impl): () => void {
     switch (e.key) {
       // the public reference: Left scrolls back in time (older data), Right forward (newer data);
       // Ctrl/Shift steps 10 bars. reference rightOffset grows toward newer data, hence the signs.
+      // A key whose gesture the host disabled does nothing, so its default is left alone.
       case "ArrowLeft":
-        begin_keyboard_scroll("ArrowLeft", -step, e.repeat);
+        handled = chart.keyboard_time_scroll_enabled();
+        if (handled) begin_keyboard_scroll("ArrowLeft", -step, e.repeat);
         break;
       case "ArrowRight":
-        begin_keyboard_scroll("ArrowRight", step, e.repeat);
+        handled = chart.keyboard_time_scroll_enabled();
+        if (handled) begin_keyboard_scroll("ArrowRight", step, e.repeat);
         break;
       case "+":
       case "=":
-        if (cfg.wheel_zoom) wasm.zoom(center, 0.5);
+        handled = chart.keyboard_time_zoom_enabled();
+        if (handled) wasm.zoom(center, 0.5);
         break;
       case "-":
       case "_":
-        if (cfg.wheel_zoom) wasm.zoom(center, -0.5);
+        handled = chart.keyboard_time_zoom_enabled();
+        if (handled) wasm.zoom(center, -0.5);
         break;
       case "Home":
-        wasm.fit_content();
+        handled = chart.keyboard_time_reset_enabled();
+        if (handled) wasm.fit_content();
         break;
       case "Enter":
         handled = chart.creation_finish();

@@ -6148,9 +6148,8 @@ fn grid_uses_the_innermost_populated_scale_and_prefers_right_on_equal_order() {
     chart.fit_content();
     chart.build_frame();
 
-    let expected: Vec<i32> = chart.panes[0]
-        .price_scale
-        .build_tick_marks(chart.scale_tick_base(0, PriceScaleTarget::Right), 0.0)
+    let expected: Vec<i32> = chart
+        .scale_tick_marks(0, PriceScaleTarget::Right, 0.0)
         .into_iter()
         .map(|mark| mark.coord.round() as i32)
         .collect();
@@ -7976,6 +7975,64 @@ fn crosshair_marks_cover_all_line_series_with_per_series_options() {
 }
 
 #[test]
+fn baseline_with_one_traded_row_draws_a_bar_wide_segment_on_its_side() {
+    // A full session of whitespace slots with only the opening minute traded.
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Baseline;
+    chart.series[0].baseline = Some(100.0);
+    let times: Vec<f64> = (0..10).map(|i| 60.0 * i as f64).collect();
+    let mut values = vec![f64::NAN; 10];
+    values[0] = 101.0;
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.set_lock_visible_logical_range(true);
+    chart.set_visible_logical_range(0.0, 9.0);
+
+    for (value, line, fill_top) in [
+        (
+            101.0,
+            BASELINE_TOP_LINE,
+            area_fill_gradient(BASELINE_TOP_LINE).0,
+        ),
+        (
+            99.0,
+            BASELINE_BOTTOM_LINE,
+            area_fill_gradient(BASELINE_BOTTOM_LINE).1,
+        ),
+    ] {
+        assert!(chart.update_series_bar(0, 0.0, [value; 4]));
+        let frame = chart.build_frame();
+        let pane = &frame.panes[0];
+        let (first, count) = pane
+            .main
+            .iter()
+            .find_map(|prim| match prim {
+                Prim::Polyline {
+                    first_point,
+                    point_count,
+                    color,
+                    ..
+                } if *color == line => Some((*first_point as usize, *point_count as usize)),
+                _ => None,
+            })
+            .expect("a single traded row draws its stroke");
+        assert_eq!(count, 2);
+        let [start, end] = [pane.points[first], pane.points[first + 1]];
+        assert_eq!(start[1], end[1], "the segment is horizontal");
+        let spacing = chart.time_scale.bar_spacing() as f32;
+        assert!((end[0] - start[0] - spacing).abs() < 1e-3);
+        let center = chart.time_scale.index_to_coordinate(0) as f32;
+        assert!(((start[0] + end[0]) / 2.0 - center).abs() < 1e-3);
+        assert!(pane.main.iter().any(|prim| matches!(
+            prim,
+            Prim::AreaFill { point_count: 2, gradient, .. } if gradient.top == fill_top
+        )));
+    }
+}
+
+#[test]
 fn baseline_quadrant_options_flow_into_fills_and_strokes() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Baseline;
@@ -8112,6 +8169,54 @@ fn histogram_base_offsets_the_column_level() {
     assert!(
         rects.iter().all(|r| r.y == expected_top),
         "columns below the base start at the base level: {rects:?} vs {expected_top}"
+    );
+}
+
+#[test]
+fn histogram_autoscale_includes_its_base_like_the_reference() {
+    // reference series.ts `_autoscaleInfoImpl` merges `base` into a histogram's range: volume
+    // columns stay proportional, and a session's first (only) volume column spans the pane
+    // instead of collapsing to a degenerate range around its own value.
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Histogram;
+    let times: Vec<f64> = (0..3).map(|i| 60.0 * i as f64).collect();
+    let values = [1_000.0, 2_000.0, 1_500.0];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart.build_frame();
+    assert_eq!(
+        chart.price_scale_visible_range(0, false),
+        Some((0.0, 2_000.0))
+    );
+
+    let single = [86_900.0, f64::NAN, f64::NAN];
+    chart
+        .set_series_data(0, &times, &single, &single, &single, &single)
+        .unwrap();
+    chart.build_frame();
+    assert_eq!(
+        chart.price_scale_visible_range(0, false),
+        Some((0.0, 86_900.0))
+    );
+
+    // A base above the data extends the range upwards; line series keep their own range.
+    chart.series_entry_mut(0).unwrap().base = 100_000.0;
+    chart.build_frame();
+    assert_eq!(
+        chart.price_scale_visible_range(0, false),
+        Some((86_900.0, 100_000.0))
+    );
+    chart.series[0].kind = SeriesKind::Line;
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.build_frame();
+    assert_eq!(
+        chart.price_scale_visible_range(0, false),
+        Some((1_000.0, 2_000.0))
     );
 }
 
@@ -8397,6 +8502,126 @@ fn histogram_per_bar_color_overrides_the_updown_tint() {
         p,
         Prim::Rect { color, .. } if *color == VOLUME_UP
     )));
+}
+
+/// Column colors of a histogram frame, left to right.
+fn histogram_column_colors(chart: &mut ChartEngine, palette: &[Color]) -> Vec<Color> {
+    let frame = chart.build_frame();
+    let mut columns: Vec<(i32, Color)> = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Rect { rect, color } if palette.contains(color) => Some((rect.x, *color)),
+            _ => None,
+        })
+        .collect();
+    columns.sort_by_key(|(x, _)| *x);
+    columns.into_iter().map(|(_, color)| color).collect()
+}
+
+/// A line primary (O=H=L=C, as time-sharing prices arrive) plus a volume histogram.
+fn time_sharing_volume_chart(closes: &[f64]) -> (ChartEngine, SeriesId) {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Line;
+    let times: Vec<f64> = (0..closes.len()).map(|i| 60.0 * i as f64).collect();
+    chart
+        .set_series_data(0, &times, closes, closes, closes, closes)
+        .unwrap();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let volumes = vec![1_000.0; closes.len()];
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .unwrap();
+    chart.series_entry_mut(volume).unwrap().histogram_updown = true;
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    (chart, volume)
+}
+
+#[test]
+fn previous_close_rule_tints_volume_against_the_prior_close_in_host_colors() {
+    let red = Color::parse_css("rgba(239, 83, 80, 0.5)").unwrap();
+    let green = Color::parse_css("rgba(38, 166, 154, 0.5)").unwrap();
+    let (mut chart, volume) = time_sharing_volume_chart(&[99.0, 101.0, 101.0, 100.0, 100.5]);
+
+    // The default open-vs-close rule sees O == C on a line primary: every column is "up".
+    assert_eq!(
+        histogram_column_colors(&mut chart, &[VOLUME_UP, VOLUME_DOWN]),
+        vec![VOLUME_UP; 5]
+    );
+
+    // Red-up/green-down (A-share) with the previous-close rule: an unchanged minute stays up and
+    // the first minute, without a previous close or reference, compares with its own open.
+    assert!(chart.series_apply_options_json(
+        volume,
+        r#"{"histogram_updown_rule":"previous_close","up_color":"rgba(239, 83, 80, 0.5)","down_color":"rgba(38, 166, 154, 0.5)"}"#,
+    ));
+    assert_eq!(
+        histogram_column_colors(&mut chart, &[red, green]),
+        vec![red, red, red, green, red]
+    );
+    let options: serde_json::Value =
+        serde_json::from_str(&chart.series_options_json(volume).unwrap()).unwrap();
+    assert_eq!(options["histogram_updown_rule"], "previous_close");
+
+    // A price-only correction of an earlier minute, inside the unchanged price range, re-tints the
+    // following volume column even though no volume changed.
+    assert!(chart.update_series_bar(0, 180.0, [100.8; 4]));
+    assert_eq!(
+        histogram_column_colors(&mut chart, &[red, green]),
+        vec![red, red, red, green, green]
+    );
+
+    // Unknown rules are ignored and a style reset restores the reference rule and palette.
+    assert!(chart.series_apply_options_json(volume, r#"{"histogram_updown_rule":"median"}"#));
+    assert_eq!(
+        chart.series_entry(volume).unwrap().histogram_updown_rule,
+        crate::HistogramUpDownRule::PreviousClose
+    );
+    chart.reset_style_to_defaults();
+    let volume_entry = chart.series_entry(volume).unwrap();
+    assert_eq!(
+        volume_entry.histogram_updown_rule,
+        crate::HistogramUpDownRule::OpenClose
+    );
+    assert_eq!(volume_entry.up_color, None);
+}
+
+#[test]
+fn previous_close_rule_skips_whitespace_and_opens_against_the_reference_price() {
+    let (mut chart, volume) =
+        time_sharing_volume_chart(&[100.0, f64::NAN, 99.0, f64::NAN, 99.0, 100.5]);
+    chart
+        .series_entry_mut(volume)
+        .unwrap()
+        .histogram_updown_rule = crate::HistogramUpDownRule::PreviousClose;
+    // Whitespace primary rows fall back to the solid column color; the others compare with the
+    // last traded close across the gap.
+    let solid = HISTOGRAM;
+    assert_eq!(
+        histogram_column_colors(&mut chart, &[VOLUME_UP, VOLUME_DOWN, solid]),
+        vec![VOLUME_UP, solid, VOLUME_DOWN, solid, VOLUME_UP, VOLUME_UP]
+    );
+
+    // The first minute compares with the host's previous close: the scale's explicit base...
+    assert!(chart.set_price_scale_base_value_for(0, PriceScaleTarget::Right, Some(100.5)));
+    assert_eq!(
+        histogram_column_colors(&mut chart, &[VOLUME_UP, VOLUME_DOWN, solid])[0],
+        VOLUME_DOWN
+    );
+    // ...or a baseline series' explicit baseline.
+    assert!(chart.set_price_scale_base_value_for(0, PriceScaleTarget::Right, None));
+    chart.series[0].kind = SeriesKind::Baseline;
+    chart.series[0].baseline = Some(99.5);
+    assert_eq!(
+        histogram_column_colors(&mut chart, &[VOLUME_UP, VOLUME_DOWN, solid])[0],
+        VOLUME_UP
+    );
+    chart.series[0].baseline = Some(100.25);
+    assert_eq!(
+        histogram_column_colors(&mut chart, &[VOLUME_UP, VOLUME_DOWN, solid])[0],
+        VOLUME_DOWN
+    );
 }
 
 #[test]
@@ -9090,6 +9315,22 @@ fn countdown_chart() -> ChartEngine {
     chart
 }
 
+/// [`countdown_chart`] on two-hour bars ending at t=28800, so an in-interval clock yields the
+/// eight-character `hh:mm:ss` countdown. The countdown only shows inside the forming bar's
+/// interval, so long countdown text needs a long interval rather than a clock behind the data.
+fn hourly_countdown_chart() -> ChartEngine {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Line;
+    let times = [0.0, 7_200.0, 14_400.0, 21_600.0, 28_800.0];
+    let values = [10.0, 11.0, 12.0, 11.5, 12.5];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart
+}
+
 fn boxed_labels(chart: &mut ChartEngine) -> Vec<AxisLabel> {
     chart
         .build_axis_frame(
@@ -9115,13 +9356,20 @@ fn countdown_text_tracks_the_pinned_host_clock() {
     assert_eq!(chart.series_countdown_text(0).as_deref(), Some("00:50"));
     chart.now_override = Some(299.7);
     assert_eq!(chart.series_countdown_text(0).as_deref(), Some("00:00"));
-    // A quiet market keeps counting subsequent inferred intervals rather than
-    // freezing at zero until the next data point arrives.
+    // The countdown belongs to the forming bar only. It used to keep cycling inferred intervals
+    // after the last bar's interval ended, which counted through lunch breaks, nights,
+    // weekends, and early closes; outside `[last_bar_time, last_bar_time + interval)` it now
+    // hides until the next bar arrives.
     chart.now_override = Some(300.0);
-    assert_eq!(chart.series_countdown_text(0).as_deref(), Some("01:00"));
+    assert_eq!(chart.series_countdown_text(0), None);
     chart.now_override = Some(302.0);
-    assert_eq!(chart.series_countdown_text(0).as_deref(), Some("00:58"));
+    assert_eq!(chart.series_countdown_text(0), None);
     chart.now_override = Some(480.0);
+    assert_eq!(chart.series_countdown_text(0), None);
+    // A clock behind the forming bar's open is outside the interval as well.
+    chart.now_override = Some(239.0);
+    assert_eq!(chart.series_countdown_text(0), None);
+    chart.now_override = Some(240.0);
     assert_eq!(chart.series_countdown_text(0).as_deref(), Some("01:00"));
 }
 
@@ -9494,7 +9742,7 @@ fn boxed_labels_begin_beyond_the_axis_border_at_every_dpr() {
 fn axis_width_negotiation_includes_the_secondary_countdown_row() {
     let measure = |t: &str, _bold: bool| t.len() as f64 * 7.0;
     let countdown_measure = |t: &str, _bold: bool| t.len() as f64 * 6.0;
-    let mut chart = countdown_chart();
+    let mut chart = hourly_countdown_chart();
     let plain =
         chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, countdown_measure);
     // Tick + price texts are 5 chars here; the reference's worst-case crosshair sample
@@ -9504,13 +9752,13 @@ fn axis_width_negotiation_includes_the_secondary_countdown_row() {
 
     // The eight-character countdown is wider than the primary price and must widen the strip.
     chart.series[0].countdown_visible = true;
-    chart.now_override = Some(300.0 - 86399.0);
+    chart.now_override = Some(28_801.0); // "01:59:59"
     let with_countdown =
         chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, countdown_measure);
     assert_eq!(with_countdown, 60.0);
 
     // The title chip lives OUTSIDE the strip (pane side), so it never widens the axis.
-    chart.now_override = Some(250.0); // "00:50" — same 5 chars as the price
+    chart.now_override = Some(28_800.0 + 7_150.0); // "00:50" — same 5 chars as the price
     chart.series[0].title = "NDQ".to_string();
     let with_cluster =
         chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, countdown_measure);
@@ -9521,9 +9769,9 @@ fn axis_width_negotiation_includes_the_secondary_countdown_row() {
 fn exact_axis_width_negotiation_includes_the_countdown_row() {
     let measure = |text: &str, _bold: bool| text.len() as f64 * 7.0;
     let countdown_measure = |text: &str, _bold: bool| text.len() as f64 * 6.0;
-    let mut chart = countdown_chart();
+    let mut chart = hourly_countdown_chart();
     chart.series[0].countdown_visible = true;
-    chart.now_override = Some(300.0 - 86399.0);
+    chart.now_override = Some(28_801.0);
 
     // Eight-char countdown at 6px plus shared 12px chrome: 60 even.
     assert_eq!(
@@ -9539,7 +9787,7 @@ fn exact_axis_width_negotiation_includes_the_countdown_row() {
 
 #[test]
 fn countdown_clock_requests_layout_without_invalidating_coordinates() {
-    let mut chart = countdown_chart();
+    let mut chart = hourly_countdown_chart();
     chart.series[0].countdown_visible = true;
     chart.recompute_layout_with_measure(
         true,
@@ -9550,7 +9798,7 @@ fn countdown_clock_requests_layout_without_invalidating_coordinates() {
     assert!(!chart.frame_requires_layout());
     let coordinate_revision = chart.frame_coordinate_revision();
 
-    chart.set_now_seconds(300.0 - 86399.0);
+    chart.set_now_seconds(28_801.0);
 
     assert!(chart.frame_requires_layout());
     assert_eq!(chart.frame_coordinate_revision(), coordinate_revision);
@@ -9565,7 +9813,7 @@ fn countdown_clock_requests_layout_without_invalidating_coordinates() {
         |text, _bold| text.len() as f64 * 7.0,
         |text, _bold| text.len() as f64 * 6.0,
     );
-    chart.set_now_seconds(300.0 - 86398.0);
+    chart.set_now_seconds(28_802.0);
     assert!(!chart.frame_requires_layout());
     assert!(chart.frame_requires_axis());
 }
@@ -9851,7 +10099,8 @@ fn countdown_only_cluster_centers_on_the_value_coordinate() {
 #[test]
 fn last_value_cluster_overlap_resolution_uses_the_total_height() {
     let mut chart = two_identical_line_series();
-    chart.now_override = Some(12.0);
+    // Inside the forming bar's interval [240, 300) so both countdown rows show.
+    chart.now_override = Some(252.0);
     chart.series[0].countdown_visible = true;
     chart.series[1].countdown_visible = true;
     let labels = chart
@@ -11070,7 +11319,8 @@ fn countdown_tick_renegotiates_layout_without_rebuilding_unchanged_pane_layers()
         |text, _bold| text.len() as f64 * 7.0,
         |text, _bold| text.len() as f64 * 6.0,
     );
-    chart.set_now_seconds(1_700_000_000.0);
+    // Inside the forming bar's interval [3, 4): the countdown row appears.
+    chart.set_now_seconds(3.5);
     assert!(chart.frame_requires_axis());
     assert!(chart.frame_requires_layout());
     chart.recompute_layout_with_measure(
@@ -11601,4 +11851,80 @@ fn render_cutoff_stops_drawing_rows_without_dropping_series_data() {
     assert_eq!(candle_bodies(&mut chart), 0);
     chart.set_series_render_before_time(0, None);
     assert_eq!(candle_bodies(&mut chart), all);
+}
+
+#[test]
+fn position_progress_re_evaluates_after_a_price_basis_rescale() {
+    use crate::drawings::{DrawingKind, DrawingPoint};
+    use crate::frame::drawings::PositionRunSide;
+
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Candlestick;
+    let times = [0.0, 60.0, 120.0, 180.0, 240.0];
+    let open = [10.0, 12.0, 13.0, 14.0, 13.0];
+    let high = [11.0, 13.0, 16.0, 15.0, 14.0];
+    let low = [9.0, 11.0, 12.0, 10.0, 11.0];
+    let close = [10.5, 12.5, 15.0, 10.5, 12.5];
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    let id = chart
+        .add_drawing(
+            DrawingKind::LongPosition,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 1.0,
+                    price: 12.0,
+                },
+                DrawingPoint {
+                    logical: 3.0,
+                    price: 20.0,
+                },
+                DrawingPoint {
+                    logical: 1.0,
+                    price: 5.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    let before = chart
+        .position_run_progress(chart.drawing(id).unwrap())
+        .unwrap();
+
+    // Switch the host data to a half-price basis and rescale the drawings in the same step.
+    let half = |values: &[f64]| values.iter().map(|value| value * 0.5).collect::<Vec<_>>();
+    chart
+        .set_series_data(
+            0,
+            &times,
+            &half(&open),
+            &half(&high),
+            &half(&low),
+            &half(&close),
+        )
+        .unwrap();
+    let segments = [crate::DrawingPriceSegment {
+        from_time: None,
+        to_time: None,
+        factor: 0.5,
+    }];
+    assert_eq!(
+        chart
+            .rescale_drawing_prices(&segments, Some("half"))
+            .unwrap(),
+        1
+    );
+    let after = chart
+        .position_run_progress(chart.drawing(id).unwrap())
+        .unwrap();
+    assert_eq!(after.side, before.side);
+    assert_eq!(after.side, PositionRunSide::Risk);
+    assert_eq!(after.start.logical, before.start.logical);
+    assert_eq!(after.start.price, before.start.price * 0.5);
+    assert_eq!(after.point.logical, before.point.logical);
+    assert_eq!(after.point.price, before.point.price * 0.5);
 }

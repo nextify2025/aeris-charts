@@ -137,7 +137,10 @@ fn fixture() -> ChartEngine {
         .add_indicator_kind_with_input(
             0,
             IndicatorInputSource::Hlc3,
-            IndicatorKind::Rsi { period: 3 },
+            IndicatorKind::Rsi {
+                period: 3,
+                seed: aeris_charts_engine::IndicatorSeed::Sma,
+            },
             None,
         )
         .into_iter()

@@ -12,6 +12,9 @@ const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", i
 const PR = fixture.pixel_ratio;
 const BLUE = [0, 145, 255]; // semantic primary #0091ff — anchor border and drawing default
 const PURPLE = [123, 31, 162]; // #7b1fa2 — text label color (collides with no fixture pixel)
+// Ctrl/Cmd is the drawing magnet toggle. macOS Chromium turns Ctrl+CLICK into a secondary click
+// (no placement), so click-based magnet tests hold Cmd there; press-drag and hover keep Ctrl.
+const MAGNET_CLICK_KEY = process.platform === "darwin" ? "Meta" : "Control";
 
 test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
@@ -774,7 +777,10 @@ test("public drawing history reverses create, delete, anchors, and style with co
   await page.keyboard.press("Control+z");
   expect(await drawings(page)).toHaveLength(0);
   await page.keyboard.press("Control+Shift+z");
-  expect((await drawings(page))[0].points).toEqual(initial);
+  // points() also reports each anchor's `time` identity; the history must restore the exact
+  // logical/price anchors, so match those fields and require the time to be present.
+  expect((await drawings(page))[0].points).toMatchObject(initial);
+  expect((await drawings(page))[0].points.every((point) => Number.isFinite(point.time))).toBe(true);
 
   await page.evaluate(() => window.__chart.drawings()[0].apply_options({ color: "#ff00ff", width: 5 }));
   expect((await page.evaluate(() => window.__chart.drawings()[0].options())).width).toBe(5);
@@ -786,14 +792,14 @@ test("public drawing history reverses create, delete, anchors, and style with co
   const moved = initial.map((point) => ({ logical: point.logical + 2, price: point.price + 1 }));
   await page.evaluate(({ moved }) => window.__chart.drawings()[0].set_points(moved), { moved });
   await page.evaluate(() => window.__chart.undo_drawing());
-  expect((await drawings(page))[0].points).toEqual(initial);
+  expect((await drawings(page))[0].points).toMatchObject(initial);
   await page.evaluate(() => window.__chart.redo_drawing());
-  expect((await drawings(page))[0].points).toEqual(moved);
+  expect((await drawings(page))[0].points).toMatchObject(moved);
 
   await page.evaluate(() => window.__chart.drawings()[0].remove());
   expect(await drawings(page)).toHaveLength(0);
   await page.evaluate(() => window.__chart.undo_drawing());
-  expect((await drawings(page))[0].points).toEqual(moved);
+  expect((await drawings(page))[0].points).toMatchObject(moved);
   await page.evaluate(() => {
     window.__chart.drawings()[0].apply_options({ width: 3 });
   });
@@ -1022,9 +1028,9 @@ test("Ctrl magnet snaps placement to the nearest bar's OHLC", async ({ page }) =
     const y = window.__main.price_to_coordinate(bar.close) + 3;
     return { index, x, y, prices: [bar.open, bar.high, bar.low, bar.close] };
   });
-  await page.keyboard.down("Control");
+  await page.keyboard.down(MAGNET_CLICK_KEY);
   await page.mouse.click(probe.x, probe.y);
-  await page.keyboard.up("Control");
+  await page.keyboard.up(MAGNET_CLICK_KEY);
   // Second click WITHOUT Ctrl: stays raw (fractional logical).
   const free = await page.evaluate(() => {
     const range = window.__chart.time_scale().get_visible_logical_range();
@@ -1075,9 +1081,9 @@ test("Ctrl magnet ignores derived indicator lines", async ({ page }) => {
   });
   expect(probe).not.toBeNull();
 
-  await page.keyboard.down("Control");
+  await page.keyboard.down(MAGNET_CLICK_KEY);
   await page.mouse.click(probe.x, probe.y);
-  await page.keyboard.up("Control");
+  await page.keyboard.up(MAGNET_CLICK_KEY);
 
   const list = await drawings(page);
   expect(list).toHaveLength(1);
@@ -1111,9 +1117,9 @@ test("Ctrl magnet ignores hidden OHLC fields after switching to an area series",
   expect(probe.hidden_high).not.toBe(probe.close);
   await settle_frames(page);
 
-  await page.keyboard.down("Control");
+  await page.keyboard.down(MAGNET_CLICK_KEY);
   await page.mouse.click(probe.x, probe.y);
-  await page.keyboard.up("Control");
+  await page.keyboard.up(MAGNET_CLICK_KEY);
 
   const list = await drawings(page);
   expect(list).toHaveLength(1);

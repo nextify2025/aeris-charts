@@ -318,6 +318,7 @@ test("Series launches a readable tick-driven footprint preview", async ({ page }
       drawing_id: drawing.id,
       logical,
       price,
+      time: drawing.points()[0].time,
       bar_spacing: window.__chart.time_scale().options().bar_spacing,
     };
   });
@@ -368,7 +369,9 @@ test("Series launches a readable tick-driven footprint preview", async ({ page }
   });
   expect(state.scale_ids).not.toContain("footprint-dedicated");
   expect(state.drawing_scale_id).toBe("right");
-  expect(state.drawing_points).toEqual([{ logical: anchor.logical, price: anchor.price }]);
+  // points() also carries the anchor's time identity, which the footprint switch must keep.
+  expect(anchor.time).toEqual(expect.any(Number));
+  expect(state.drawing_points).toEqual([{ logical: anchor.logical, price: anchor.price, time: anchor.time }]);
   expect(state.footprint_y).toBeCloseTo(state.main_y, 10);
   expect(state.footprint_y).toBeCloseTo(state.sma_y, 10);
 
@@ -388,7 +391,7 @@ test("Series launches a readable tick-driven footprint preview", async ({ page }
     active: null,
     main_visible: true,
     footprint_count: 0,
-    drawing_points: [{ logical: anchor.logical, price: anchor.price }],
+    drawing_points: [{ logical: anchor.logical, price: anchor.price, time: anchor.time }],
     sma_scale_id: "right",
     spacing: anchor.bar_spacing,
   });

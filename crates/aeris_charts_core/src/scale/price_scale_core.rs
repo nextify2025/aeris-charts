@@ -3,7 +3,7 @@
 
 use crate::model::price_range::PriceRange;
 use crate::scale::log_formula::{self, LogFormula, DEF_LOG_FORMULA};
-use crate::scale::price_tick_span_calculator::composite_tick_span;
+use crate::scale::price_tick_span_calculator::{align_span_to_min_move, composite_tick_span};
 use crate::Coordinate;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +51,27 @@ pub struct PriceScaleCoreOptions {
     /// bold font — multiples of `step × 10` on uniform ticks, exact powers of ten on
     /// non-uniform (log) ticks.
     pub bold_round_labels: bool,
+    /// reference `ensureEdgeTickMarksVisible` (default false): while autoscaled, reserve half a
+    /// font height at both edges and place a rounded tick mark at the very top and bottom.
+    pub ensure_edge_tick_marks_visible: bool,
+    /// Aeris extension (default `None`): explicit base price for the percentage and
+    /// indexed-to-100 modes, e.g. the previous close. When set, every source on this scale and
+    /// every drawing bound to it converts against this value instead of its first visible bar or
+    /// the chart comparison anchor.
+    pub base_value: Option<f64>,
+    /// Aeris extension (default `None`): center the autoscaled range on this raw price:
+    /// `center ± max|price − center|`, before scale margins apply.
+    pub autoscale_center: Option<f64>,
+    /// Aeris extension (default false): stable autoscale. The range expands at once when visible
+    /// data exceeds it but shrinks only when the data one bar beyond the visible edges leaves
+    /// more than [`STABLE_AUTOSCALE_SHRINK_FRACTION`] of the range unused, so sub-bar pans and
+    /// kinetic coasts cannot flip the range back and forth. `false` keeps the reference's exact
+    /// per-frame range.
+    pub stable_auto_scale: bool,
 }
+
+/// Unused fraction of a stable autoscale range that triggers a shrink to the data.
+pub const STABLE_AUTOSCALE_SHRINK_FRACTION: f64 = 0.2;
 
 impl Default for PriceScaleCoreOptions {
     fn default() -> Self {
@@ -72,6 +92,10 @@ impl Default for PriceScaleCoreOptions {
             minimum_width: 0.0,
             text_color: None,
             bold_round_labels: true,
+            ensure_edge_tick_marks_visible: false,
+            base_value: None,
+            autoscale_center: None,
+            stable_auto_scale: false,
         }
     }
 }
@@ -82,6 +106,8 @@ impl Default for PriceScaleCoreOptions {
 pub struct PriceMark {
     pub coord: Coordinate,
     pub logical: f64,
+    /// A boundary mark added by `ensure_edge_tick_marks_visible`; it sits off the uniform span.
+    pub edge: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +126,9 @@ pub struct PriceScaleCore {
     scale_start_point: Option<f64>,
     scroll_start_point: Option<f64>,
     price_range_snapshot: Option<PriceRange>,
+    /// Whether `price_range` is a stable-autoscale result the next pass may keep or grow.
+    /// Cleared by mode/base/center changes, explicit autoscale resets, and data replacement.
+    stable_range_valid: bool,
     /// Canonical source revision for coordinate and axis-presentation state.
     revision: u64,
 }
@@ -118,6 +147,7 @@ impl PriceScaleCore {
             scale_start_point: None,
             scroll_start_point: None,
             price_range_snapshot: None,
+            stable_range_valid: false,
             revision: 1,
         }
     }
@@ -155,6 +185,7 @@ impl PriceScaleCore {
             _ => None,
         };
         self.options.mode = mode;
+        self.stable_range_valid = false;
         match mode {
             PriceScaleMode::Normal => self.price_range = raw_range,
             PriceScaleMode::Logarithmic => {
@@ -253,6 +284,71 @@ impl PriceScaleCore {
         }
     }
 
+    /// reference `tickMarkDensity` (default 2.5): tick label spacing in font heights. Finite
+    /// positive values only; higher values produce fewer marks.
+    pub fn set_tick_mark_density(&mut self, density: f64) -> bool {
+        if !density.is_finite() || density <= 0.0 {
+            return false;
+        }
+        if self.options.tick_mark_density != density {
+            self.options.tick_mark_density = density;
+            self.changed();
+        }
+        true
+    }
+
+    /// reference `ensureEdgeTickMarksVisible`: boundary tick marks plus half-font edge padding
+    /// while the scale autoscales.
+    pub fn set_ensure_edge_tick_marks_visible(&mut self, visible: bool) {
+        if self.options.ensure_edge_tick_marks_visible != visible {
+            self.options.ensure_edge_tick_marks_visible = visible;
+            self.changed();
+        }
+    }
+
+    /// Explicit percentage/indexed-to-100 base price (`None` restores the first-visible/anchor
+    /// base). Rejects non-finite and zero bases, which cannot produce finite coordinates.
+    pub fn set_base_value(&mut self, base: Option<f64>) -> bool {
+        if base.is_some_and(|value| !value.is_finite() || value == 0.0) {
+            return false;
+        }
+        if self.options.base_value != base {
+            self.options.base_value = base;
+            self.stable_range_valid = false;
+            self.changed();
+        }
+        true
+    }
+
+    /// Raw price the autoscaled range is centered on (`None` restores the plain data range).
+    pub fn set_autoscale_center(&mut self, center: Option<f64>) -> bool {
+        if center.is_some_and(|value| !value.is_finite()) {
+            return false;
+        }
+        if self.options.autoscale_center != center {
+            self.options.autoscale_center = center;
+            self.stable_range_valid = false;
+            self.changed();
+        }
+        true
+    }
+
+    /// Opt into (or out of) the stable autoscale range. Either transition restarts from the exact
+    /// data range on the next autoscale pass.
+    pub fn set_stable_auto_scale(&mut self, stable: bool) {
+        if self.options.stable_auto_scale != stable {
+            self.options.stable_auto_scale = stable;
+            self.stable_range_valid = false;
+            self.changed();
+        }
+    }
+
+    /// Forget the retained stable-autoscale range so the next pass starts from the exact data
+    /// range (series data replacement, explicit resets).
+    pub fn reset_autoscale_stabilization(&mut self) {
+        self.stable_range_valid = false;
+    }
+
     /// Restore only axis presentation fields to their canonical defaults. Scale mode, inversion,
     /// autoscale/manual range, margins, label-layout behavior, and gesture state are preserved.
     pub fn reset_style_to_defaults(&mut self) {
@@ -273,6 +369,8 @@ impl PriceScaleCore {
             self.scale_start_point = None;
             self.scroll_start_point = None;
             self.price_range_snapshot = None;
+            // An explicit autoscale (re)enable is a reset: stable mode restarts from exact data.
+            self.stable_range_valid = false;
         }
         if self.options.auto_scale != v {
             self.options.auto_scale = v;
@@ -379,19 +477,45 @@ impl PriceScaleCore {
             || self.price_range.as_ref().is_some_and(|r| r.is_empty())
     }
 
-    fn top_margin_px(&self) -> f64 {
-        if self.is_inverted() {
-            self.options.scale_margins.bottom * self.height + self.margin_below
+    /// reference `hasVisibleEdgeMarks`: edge tick marks only apply while autoscaled.
+    fn has_visible_edge_marks(&self) -> bool {
+        self.options.ensure_edge_tick_marks_visible && self.options.auto_scale
+    }
+
+    /// reference `getEdgeMarksPadding`: half the tick font height.
+    fn edge_marks_padding(&self) -> f64 {
+        self.options.font_size / 2.0
+    }
+
+    /// Pixel margins from autoscale providers, widened to the edge-mark padding while edge marks
+    /// are visible (reference `_recalculatePriceRangeImpl`).
+    fn internal_margins_px(&self) -> (f64, f64) {
+        if self.has_visible_edge_marks() {
+            let padding = self.edge_marks_padding();
+            (
+                self.margin_above.max(padding),
+                self.margin_below.max(padding),
+            )
         } else {
-            self.options.scale_margins.top * self.height + self.margin_above
+            (self.margin_above, self.margin_below)
+        }
+    }
+
+    fn top_margin_px(&self) -> f64 {
+        let (above, below) = self.internal_margins_px();
+        if self.is_inverted() {
+            self.options.scale_margins.bottom * self.height + below
+        } else {
+            self.options.scale_margins.top * self.height + above
         }
     }
 
     fn bottom_margin_px(&self) -> f64 {
+        let (above, below) = self.internal_margins_px();
         if self.is_inverted() {
-            self.options.scale_margins.top * self.height + self.margin_above
+            self.options.scale_margins.top * self.height + above
         } else {
-            self.options.scale_margins.bottom * self.height + self.margin_below
+            self.options.scale_margins.bottom * self.height + below
         }
     }
 
@@ -711,11 +835,26 @@ impl PriceScaleCore {
     /// Applies a merged source range (already in logical space for the current mode).
     /// `min_move` = 1/base of the formatter source (e.g. 0.01).
     pub fn apply_autoscale_range(&mut self, merged: Option<PriceRange>, min_move: f64) {
+        self.apply_autoscale_ranges(merged, None, None, min_move);
+    }
+
+    /// Full autoscale application. `exact` is the merged source range over the strictly visible
+    /// bars; `extended` is the same union one bar beyond each visible edge (only consulted in
+    /// stable mode); `center` is `autoscale_center` already converted to this scale's logical
+    /// domain. All ranges are in the current mode's logical space.
+    pub fn apply_autoscale_ranges(
+        &mut self,
+        exact: Option<PriceRange>,
+        extended: Option<PriceRange>,
+        center: Option<f64>,
+        min_move: f64,
+    ) {
         let before = (self.min_move, self.price_range, self.log_formula);
         if min_move.is_finite() && min_move > 0.0 {
             self.min_move = min_move;
         }
-        let Some(mut price_range) = merged else {
+        let Some(exact) = exact else {
+            self.stable_range_valid = false;
             // reset empty to default
             if self.price_range.is_none() {
                 self.price_range = Some(PriceRange::new(-0.5, 0.5));
@@ -726,6 +865,47 @@ impl PriceScaleCore {
             }
             return;
         };
+        // A center so far from the data that the mirrored range overflows keeps the plain range.
+        let symmetric = |range: PriceRange| match center.filter(|value| value.is_finite()) {
+            Some(center) => {
+                let half = (range.max_value() - center)
+                    .abs()
+                    .max((range.min_value() - center).abs());
+                let (low, high) = (center - half, center + half);
+                if low.is_finite() && high.is_finite() {
+                    PriceRange::new(low, high)
+                } else {
+                    range
+                }
+            }
+            None => range,
+        };
+        let exact = symmetric(exact);
+        let mut price_range = match (self.options.stable_auto_scale, self.price_range) {
+            (true, Some(current)) if self.stable_range_valid => {
+                // Grow at once so no visible bar is ever clipped.
+                let grown = PriceRange::new(
+                    current.min_value().min(exact.min_value()),
+                    current.max_value().max(exact.max_value()),
+                );
+                // Shrink only toward data that is stable one bar past both visible edges,
+                // clamped into the grown range so off-screen extremes never widen it.
+                let settled = symmetric(extended.map_or(exact, |range| range.merge(Some(&exact))));
+                let target = PriceRange::new(
+                    settled.min_value().max(grown.min_value()),
+                    settled.max_value().min(grown.max_value()),
+                );
+                if grown.length() - target.length()
+                    > STABLE_AUTOSCALE_SHRINK_FRACTION * grown.length()
+                {
+                    target
+                } else {
+                    grown
+                }
+            }
+            _ => exact,
+        };
+        self.stable_range_valid = self.options.stable_auto_scale;
 
         if price_range.min_value() == price_range.max_value() {
             // degenerate range: extend by 5 min-move values on each side (in raw space)
@@ -773,10 +953,26 @@ impl PriceScaleCore {
         (self.options.font_size * self.options.tick_mark_density).ceil()
     }
 
-    /// Generates tick marks for the current range. `base` is the formatter base (e.g. 100).
+    /// Generates tick marks for the current range. `min_move` is the price grid every tick must
+    /// lie on (the formatter source's minimum move, `0.01` for percentage/indexed scales).
     /// `entire_text_only_margin` should be `font_size / 2` when the entireTextOnly option is on,
-    /// else 0. Edge tick marks (ensureEdgeTickMarksVisible) are not implemented yet.
-    pub fn build_tick_marks(&self, base: i64, entire_text_only_margin: f64) -> Vec<PriceMark> {
+    /// else 0. With `ensure_edge_tick_marks_visible` on an autoscaled scale, rounded boundary
+    /// marks are added at the top and bottom edges (reference `_applyEdgeMarks`).
+    pub fn build_tick_marks(&self, min_move: f64, entire_text_only_margin: f64) -> Vec<PriceMark> {
+        self.build_tick_marks_on_grid(|_, _| min_move, entire_text_only_margin)
+    }
+
+    /// [`Self::build_tick_marks`] for a price grid that depends on the price region (a
+    /// tick-size ladder): `grid(low, high)` returns the step every tick in the builder-domain
+    /// interval `[low, high]` must be a multiple of (raw prices on a log scale, logical values
+    /// otherwise). The grid of a sub-interval must divide the grid of any interval containing
+    /// it. A log scale re-derives its span per mark over `[low, mark]`, so each lower price
+    /// region keeps its own finer grid instead of the coarsest grid of the whole view.
+    pub fn build_tick_marks_on_grid(
+        &self,
+        grid: impl Fn(f64, f64) -> f64,
+        entire_text_only_margin: f64,
+    ) -> Vec<PriceMark> {
         let mut marks = Vec::new();
 
         if self.is_empty() {
@@ -796,7 +992,14 @@ impl PriceScaleCore {
             return marks;
         }
 
-        let mut span = composite_tick_span(high, low, base, scale_height, self.tick_mark_height());
+        let mut span = composite_tick_span(
+            high,
+            low,
+            grid(low, high),
+            scale_height,
+            self.tick_mark_height(),
+        );
+        let first_span = span;
         let mut modulo = high % span;
         if modulo < 0.0 {
             modulo += span;
@@ -818,13 +1021,14 @@ impl PriceScaleCore {
                 marks.push(PriceMark {
                     coord: coord + self.pane_offset,
                     logical,
+                    edge: false,
                 });
                 prev_coord = Some(coord);
                 if self.is_log() {
                     span = composite_tick_span(
                         logical * sign,
                         low,
-                        base,
+                        grid(low, logical * sign),
                         scale_height,
                         self.tick_mark_height(),
                     );
@@ -834,7 +1038,82 @@ impl PriceScaleCore {
             logical -= span;
         }
 
+        if self.has_visible_edge_marks() && self.should_apply_edge_marks(first_span, low, high) {
+            self.apply_edge_marks(&mut marks, &grid, first_span, min_coord, max_coord);
+        }
+
         marks
+    }
+
+    /// reference `_shouldApplyEdgeMarks`: only when both scale margins are narrower than a span.
+    fn should_apply_edge_marks(&self, span: f64, low: f64, high: f64) -> bool {
+        let Some(mut range) = self.price_range else {
+            return false;
+        };
+        if self.is_log() {
+            range = log_formula::convert_price_range_from_log(&range, &self.log_formula);
+        }
+        range.min_value() - low < span && high - range.max_value() < span
+    }
+
+    /// reference `_applyEdgeMarks`: replace a regular mark closer than half a span to an edge
+    /// with a rounded boundary mark at that edge.
+    fn apply_edge_marks(
+        &self,
+        marks: &mut Vec<PriceMark>,
+        grid: &impl Fn(f64, f64) -> f64,
+        span: f64,
+        min_coord: f64,
+        max_coord: f64,
+    ) {
+        let padding = self.edge_marks_padding();
+        let top = self.boundary_price_mark(grid, min_coord, padding, padding * 2.0);
+        let bottom = self.boundary_price_mark(grid, max_coord, -padding * 2.0, -padding);
+        let span_px = self.logical_to_coordinate_raw(0.0) - self.logical_to_coordinate_raw(span);
+        if marks
+            .first()
+            .is_some_and(|mark| mark.coord - top.coord < span_px / 2.0)
+        {
+            marks.remove(0);
+        }
+        if marks
+            .last()
+            .is_some_and(|mark| bottom.coord - mark.coord < span_px / 2.0)
+        {
+            marks.pop();
+        }
+        marks.insert(0, top);
+        marks.push(bottom);
+    }
+
+    /// reference `_computeBoundaryPriceMark`: a value near `coord` rounded to a fine grid (at
+    /// least 0.1, aligned to the local price grid so the boundary label is a tradable price).
+    fn boundary_price_mark(
+        &self,
+        grid: &impl Fn(f64, f64) -> f64,
+        coord: f64,
+        min_padding: f64,
+        max_padding: f64,
+    ) -> PriceMark {
+        let average = (min_padding + max_padding) / 2.0;
+        let first = self.coordinate_to_logical_raw(coord + min_padding);
+        let second = self.coordinate_to_logical_raw(coord + max_padding);
+        let min_move = grid(first.min(second), first.max(second));
+        let span = composite_tick_span(
+            first.max(second),
+            first.min(second),
+            min_move,
+            self.height,
+            self.tick_mark_height(),
+        );
+        let value_span = align_span_to_min_move(span.max(0.1), min_move);
+        let value = self.coordinate_to_logical_raw(coord + average);
+        let rounded = value - value % value_span;
+        PriceMark {
+            coord: self.logical_to_coordinate_raw(rounded) + self.pane_offset,
+            logical: rounded,
+            edge: true,
+        }
     }
 
     /// coordinate -> logical *without* undoing the log transform (the tick mark builder works in
@@ -1018,7 +1297,7 @@ mod tests {
     fn tick_marks_are_spaced_and_round() {
         let mut s = scale_with_range(300.0, 0.0, 100.0);
         s.set_height(300.0);
-        let marks = s.build_tick_marks(100, 0.0);
+        let marks = s.build_tick_marks(0.01, 0.0);
         assert!(!marks.is_empty());
         // marks must be at multiples of the span -> logical values divide evenly
         let span = (marks[0].logical - marks[1].logical).abs();
@@ -1033,6 +1312,243 @@ mod tests {
         for m in &marks {
             assert!(m.coord >= 0.0 && m.coord <= 299.0);
         }
+    }
+
+    #[test]
+    fn tick_labels_lie_on_every_min_move_grid_and_are_unique() {
+        use crate::format::price_formatter::{precision_by_min_move, PriceFormatter};
+        use crate::scale::price_tick_span_calculator::is_multiple_of;
+        let min_moves = [0.02, 0.05, 0.005, 0.2, 1.0, 2.0, 5.0, 0.25, 0.03125];
+        let centers = [0.8, 9.9, 15.0, 25.0, 97.5, 250.0, 1_234.0, 7_500.0];
+        let widths = [0.07, 0.3, 1.43, 4.0, 17.0, 80.0, 333.0, 2_500.0];
+        let heights = [120.0, 300.0, 400.0, 611.0, 900.0];
+        let mut checked = 0;
+        for min_move in min_moves {
+            let precision = precision_by_min_move(min_move);
+            let formatter = PriceFormatter::from_precision(precision, min_move);
+            for mode in [PriceScaleMode::Normal, PriceScaleMode::Logarithmic] {
+                for center in centers {
+                    for width in widths {
+                        if width < min_move * 4.0 || center - width <= 0.0 {
+                            continue;
+                        }
+                        for height in heights {
+                            let mut s = PriceScaleCore::new(PriceScaleCoreOptions {
+                                mode,
+                                ..Default::default()
+                            });
+                            s.set_height(height);
+                            s.apply_autoscale_range(
+                                Some(
+                                    s.price_range_to_logical(
+                                        &PriceRange::new(
+                                            center - width / 2.0,
+                                            center + width / 2.0,
+                                        ),
+                                        1.0,
+                                    )
+                                    .unwrap(),
+                                ),
+                                min_move,
+                            );
+                            let marks = s.build_tick_marks(min_move, 0.0);
+                            let mut labels = Vec::with_capacity(marks.len());
+                            for mark in &marks {
+                                assert!(
+                                    is_multiple_of(mark.logical, min_move),
+                                    "{mode:?} min_move {min_move} center {center} width {width} \
+                                     height {height}: tick {}",
+                                    mark.logical
+                                );
+                                let label = formatter.format(mark.logical).replace(',', "");
+                                let value: f64 = label.parse().unwrap();
+                                assert!(
+                                    is_multiple_of(value, min_move),
+                                    "{mode:?} min_move {min_move}: label {label}"
+                                );
+                                labels.push(label);
+                            }
+                            let unique: std::collections::BTreeSet<_> = labels.iter().collect();
+                            assert_eq!(
+                                unique.len(),
+                                labels.len(),
+                                "{mode:?} min_move {min_move} center {center} width {width} \
+                                 height {height}: duplicate labels {labels:?}"
+                            );
+                            checked += marks.len();
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 5_000, "sweep produced too few ticks: {checked}");
+    }
+
+    #[test]
+    fn log_ticks_keep_each_price_regions_own_grid() {
+        use crate::scale::price_tick_span_calculator::is_multiple_of;
+        // A two-band ladder: 0.01 below 10, 1 from 10 up. An interval's grid is its coarsest
+        // band, which every sub-interval's grid divides.
+        let band = |price: f64| -> f64 {
+            if price.abs() < 10.0 {
+                0.01
+            } else {
+                1.0
+            }
+        };
+        let grid = |low: f64, high: f64| band(low).max(band(high));
+        let mut s = PriceScaleCore::new(PriceScaleCoreOptions {
+            mode: PriceScaleMode::Logarithmic,
+            ..Default::default()
+        });
+        s.set_height(600.0);
+        s.apply_autoscale_range(
+            Some(
+                s.price_range_to_logical(&PriceRange::new(0.3, 3_000.0), 1.0)
+                    .unwrap(),
+            ),
+            0.01,
+        );
+        let marks = s.build_tick_marks_on_grid(grid, 0.0);
+        for mark in &marks {
+            assert!(
+                is_multiple_of(mark.logical, band(mark.logical)),
+                "{mark:?} is off its band grid"
+            );
+        }
+        let low_region = marks.iter().filter(|mark| mark.logical < 10.0).count();
+        assert!(
+            low_region >= 3,
+            "the sub-10 decades kept too few ticks: {marks:?}"
+        );
+        // The view-wide grid alone (1.0) cannot label anything below 1.
+        let coarse = s.build_tick_marks(grid(0.3, 3_000.0), 0.0);
+        assert!(coarse.iter().all(|mark| mark.logical >= 1.0));
+        assert!(marks.iter().any(|mark| mark.logical < 1.0));
+        // A constant grid is exactly `build_tick_marks`.
+        assert_eq!(
+            s.build_tick_marks_on_grid(|_, _| 0.01, 0.0),
+            s.build_tick_marks(0.01, 0.0)
+        );
+    }
+
+    #[test]
+    fn edge_tick_marks_follow_the_reference_boundary_rule() {
+        let mut s = PriceScaleCore::new(PriceScaleCoreOptions {
+            scale_margins: PriceScaleMargins {
+                top: 0.0,
+                bottom: 0.0,
+            },
+            ..Default::default()
+        });
+        s.set_height(300.0);
+        s.apply_autoscale_range(Some(PriceRange::new(101.37, 118.91)), 0.01);
+        let plain = s.build_tick_marks(0.01, 0.0);
+        assert!(plain.iter().all(|mark| !mark.edge));
+        s.set_ensure_edge_tick_marks_visible(true);
+        let marks = s.build_tick_marks(0.01, 0.0);
+        let first = marks.first().unwrap();
+        let last = marks.last().unwrap();
+        assert!(first.edge && last.edge);
+        assert!(marks[1..marks.len() - 1].iter().all(|mark| !mark.edge));
+        // Boundary marks sit within the half-font edge padding band and on the 0.1 grid.
+        assert!(
+            first.coord >= 6.0 - 1.0 && first.coord <= 12.0 + 1.0,
+            "{first:?}"
+        );
+        assert!(last.coord <= 299.0 - 6.0 + 1.0 && last.coord >= 299.0 - 12.0 - 1.0);
+        for mark in [first, last] {
+            assert!(
+                crate::scale::price_tick_span_calculator::is_multiple_of(mark.logical, 0.1),
+                "{mark:?}"
+            );
+        }
+        // The padding is applied as an internal margin while autoscaled.
+        assert!((s.price_to_coordinate(118.91, 0.0) - 6.0).abs() < 1e-9);
+        // Manual scales drop edge marks, as in the reference.
+        s.set_auto_scale(false);
+        assert!(s.build_tick_marks(0.01, 0.0).iter().all(|mark| !mark.edge));
+    }
+
+    #[test]
+    fn symmetric_autoscale_centers_the_range_on_the_requested_price() {
+        let mut s = PriceScaleCore::new(PriceScaleCoreOptions::default());
+        s.set_height(300.0);
+        s.apply_autoscale_ranges(Some(PriceRange::new(101.0, 104.0)), None, Some(100.0), 0.01);
+        assert_eq!(s.price_range().unwrap(), &PriceRange::new(96.0, 104.0));
+        s.apply_autoscale_ranges(Some(PriceRange::new(97.5, 100.5)), None, Some(100.0), 0.01);
+        assert_eq!(s.price_range().unwrap(), &PriceRange::new(97.5, 102.5));
+        // Percentage-domain center (0%) works identically.
+        s.apply_autoscale_ranges(Some(PriceRange::new(-1.5, 3.0)), None, Some(0.0), 0.01);
+        assert_eq!(s.price_range().unwrap(), &PriceRange::new(-3.0, 3.0));
+        // A center whose mirrored range would overflow keeps the finite data range.
+        s.apply_autoscale_ranges(Some(PriceRange::new(1.0, 2.0)), None, Some(f64::MAX), 0.01);
+        assert_eq!(s.price_range().unwrap(), &PriceRange::new(1.0, 2.0));
+    }
+
+    #[test]
+    fn stable_autoscale_grows_at_once_shrinks_with_hysteresis_and_resets() {
+        let mut s = PriceScaleCore::new(PriceScaleCoreOptions {
+            stable_auto_scale: true,
+            ..Default::default()
+        });
+        s.set_height(300.0);
+        let apply = |s: &mut PriceScaleCore, exact: (f64, f64), extended: (f64, f64)| {
+            s.apply_autoscale_ranges(
+                Some(PriceRange::new(exact.0, exact.1)),
+                Some(PriceRange::new(extended.0, extended.1)),
+                None,
+                0.01,
+            );
+            *s.price_range().unwrap()
+        };
+        // First pass: exact range.
+        assert_eq!(
+            apply(&mut s, (100.0, 110.0), (99.0, 111.0)),
+            PriceRange::new(100.0, 110.0)
+        );
+        // A new visible extreme grows the range at once.
+        assert_eq!(
+            apply(&mut s, (100.0, 115.0), (100.0, 115.0)),
+            PriceRange::new(100.0, 115.0)
+        );
+        // The extreme bar leaves the strict view but is still within one bar: no shrink.
+        assert_eq!(
+            apply(&mut s, (100.0, 110.0), (100.0, 115.0)),
+            PriceRange::new(100.0, 115.0)
+        );
+        // Small unused headroom (below the threshold) is kept.
+        assert_eq!(
+            apply(&mut s, (100.5, 113.0), (100.5, 113.0)),
+            PriceRange::new(100.0, 115.0)
+        );
+        // More than 20% unused: shrink to the settled data.
+        assert_eq!(
+            apply(&mut s, (104.0, 110.0), (103.0, 111.0)),
+            PriceRange::new(103.0, 111.0)
+        );
+        // Explicit autoscale reset restarts from the exact range.
+        s.set_auto_scale(true);
+        assert_eq!(
+            apply(&mut s, (105.0, 106.0), (104.0, 107.0)),
+            PriceRange::new(105.0, 106.0)
+        );
+        s.reset_autoscale_stabilization();
+        assert_eq!(
+            apply(&mut s, (105.5, 106.0), (104.0, 107.0)),
+            PriceRange::new(105.5, 106.0)
+        );
+        // Default (exact) mode follows every range immediately.
+        let mut exact = PriceScaleCore::new(PriceScaleCoreOptions::default());
+        exact.set_height(300.0);
+        assert_eq!(
+            apply(&mut exact, (100.0, 115.0), (100.0, 115.0)),
+            PriceRange::new(100.0, 115.0)
+        );
+        assert_eq!(
+            apply(&mut exact, (100.0, 110.0), (100.0, 115.0)),
+            PriceRange::new(100.0, 110.0)
+        );
     }
 
     #[test]

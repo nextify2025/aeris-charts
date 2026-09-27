@@ -28,6 +28,9 @@ mod telemetry;
 // target too, because wrap, overrun and cursor-overflow are the cases worth testing off-browser.
 #[cfg(any(target_arch = "wasm32", test))]
 mod ring_source;
+// Session slot generation boundary (JSON request → engine); host-testable.
+#[cfg(any(target_arch = "wasm32", test))]
+mod session_slots;
 
 #[cfg(target_arch = "wasm32")]
 mod canvas2d_target;

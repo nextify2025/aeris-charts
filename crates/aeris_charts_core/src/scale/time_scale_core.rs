@@ -35,6 +35,13 @@ pub struct TimeScaleOptions {
     pub allow_bold_labels: bool,
     /// When set, overrides `right_offset` and is preserved in pixels across zoom.
     pub right_offset_pixels: Option<f64>,
+    /// Aeris fixed-view option (default false; no reference equivalent): hold the visible logical
+    /// range exactly across data synchronization and resizes. Data changes neither follow new
+    /// bars nor compensate, a resize rescales the bar spacing, and a range set through
+    /// [`TimeScaleCore::set_logical_range`] is applied without the reference scroll clamps, so a
+    /// host can show a complete session of `N` slots as `[0, N - 1]` even before two bars have
+    /// traded. Explicit scroll/zoom mutations still apply (clamped) and re-lock the result.
+    pub lock_visible_logical_range: bool,
 }
 
 impl Default for TimeScaleOptions {
@@ -55,6 +62,7 @@ impl Default for TimeScaleOptions {
             allow_shift_visible_range_on_whitespace_replacement: false,
             allow_bold_labels: true,
             right_offset_pixels: None,
+            lock_visible_logical_range: false,
         }
     }
 }
@@ -80,6 +88,8 @@ pub struct TimeScaleCore {
     /// `_isAllScalingAndScrollingDisabled`, time-scale.ts:975-986): label alignment only —
     /// never consulted by the spacing/offset math, which reads the raw fix-edge options.
     interaction_disabled: bool,
+    /// The held range while `lock_visible_logical_range` is on (`None` until a range exists).
+    locked_range: Option<LogicalRange>,
     /// Canonical source revision for every value that can affect time coordinates or time-axis
     /// presentation. Mutators advance this intrinsically so hosts cannot change scale state while
     /// leaving retained geometry on an older transform.
@@ -101,6 +111,7 @@ impl TimeScaleCore {
             scale_start_point: None,
             common_transition_start_state: None,
             interaction_disabled: false,
+            locked_range: None,
             revision: 1,
         }
     }
@@ -145,7 +156,12 @@ impl TimeScaleCore {
     pub fn set_points_len(&mut self, len: usize) {
         let before = (self.points_len, self.bar_spacing, self.right_offset);
         self.points_len = len;
-        self.correct_offset();
+        if self.locked_range.is_some() {
+            self.apply_locked_range();
+        } else {
+            self.correct_offset();
+            self.relock();
+        }
         if before != (self.points_len, self.bar_spacing, self.right_offset) {
             self.changed();
         }
@@ -154,11 +170,72 @@ impl TimeScaleCore {
     pub fn set_base_index(&mut self, base_index: Option<TimePointIndex>) {
         let before = (self.base_index, self.bar_spacing, self.right_offset);
         self.base_index = base_index;
-        self.correct_offset();
-        self.do_fix_left_edge();
+        if self.locked_range.is_some() {
+            self.apply_locked_range();
+        } else {
+            self.correct_offset();
+            self.do_fix_left_edge();
+            self.relock();
+        }
         if before != (self.base_index, self.bar_spacing, self.right_offset) {
             self.changed();
         }
+    }
+
+    /// Land one data synchronization atomically: the new point count and base index together
+    /// with the right offset that keeps the intended view (`None` keeps the offset relative to
+    /// the new base index, i.e. the view follows the latest bar). Offsets are corrected once
+    /// against the final state. A locked logical range ignores `right_offset` and is re-applied
+    /// exactly, which rebases the offset by the base-index move.
+    ///
+    /// Returns that view-preserving rebase of the right offset (0 when the offset stays relative
+    /// to the base). An active drag's start snapshot moves by the same amount so the gesture
+    /// continues on the bars it grabbed; the owner applies it to its own in-flight motion.
+    pub fn sync_points(
+        &mut self,
+        points_len: usize,
+        base_index: Option<TimePointIndex>,
+        right_offset: Option<f64>,
+    ) -> f64 {
+        let before = (
+            self.points_len,
+            self.base_index,
+            self.bar_spacing,
+            self.right_offset,
+        );
+        self.points_len = points_len;
+        self.base_index = base_index;
+        let rebase = if self.locked_range.is_some() {
+            let previous = self.right_offset;
+            self.apply_locked_range();
+            self.right_offset - previous
+        } else {
+            let rebase = right_offset
+                .filter(|offset| offset.is_finite())
+                .map_or(0.0, |offset| {
+                    let shift = offset - self.right_offset;
+                    self.right_offset = offset;
+                    shift
+                });
+            self.correct_offset();
+            self.do_fix_left_edge();
+            self.relock();
+            rebase
+        };
+        if let Some(state) = self.common_transition_start_state.as_mut() {
+            state.right_offset += rebase;
+        }
+        if before
+            != (
+                self.points_len,
+                self.base_index,
+                self.bar_spacing,
+                self.right_offset,
+            )
+        {
+            self.changed();
+        }
+        rebase
     }
 
     fn first_index(&self) -> Option<TimePointIndex> {
@@ -225,6 +302,20 @@ impl TimeScaleCore {
         if self.is_empty() {
             return None;
         }
+        // A locked range reports the exact host range while the spacing honors it; derived
+        // borders would carry floating-point noise from `width / (width / count)`.
+        if let Some(locked) = self.locked_range {
+            if self.bar_spacing == self.width / (locked.right() - locked.left() + 1.0) {
+                return Some(locked);
+            }
+        }
+        self.derived_visible_logical_range()
+    }
+
+    fn derived_visible_logical_range(&self) -> Option<LogicalRange> {
+        if self.is_empty() {
+            return None;
+        }
 
         let base_index = self.base_index();
         let new_bars_length = self.width / self.bar_spacing;
@@ -251,6 +342,12 @@ impl TimeScaleCore {
         let old_width = self.width;
         self.width = new_width;
 
+        if self.locked_range.is_some() {
+            self.apply_locked_range();
+            self.changed();
+            return;
+        }
+
         if self.options.lock_visible_time_range_on_resize && old_width != 0.0 {
             self.bar_spacing = self.bar_spacing * new_width / old_width;
         }
@@ -268,6 +365,7 @@ impl TimeScaleCore {
         // bar spacing first: right offset correction depends on it
         self.correct_bar_spacing();
         self.correct_offset();
+        self.relock();
         self.changed();
     }
 
@@ -282,6 +380,7 @@ impl TimeScaleCore {
             self.right_offset = self.right_offset * old_bar_spacing / self.bar_spacing;
         }
         self.correct_offset();
+        self.relock();
         if before != (self.bar_spacing, self.right_offset) {
             self.changed();
         }
@@ -296,6 +395,7 @@ impl TimeScaleCore {
         let before = self.right_offset;
         self.right_offset = offset;
         self.correct_offset();
+        self.relock();
         if before != self.right_offset {
             self.changed();
         }
@@ -315,6 +415,7 @@ impl TimeScaleCore {
             self.options.min_bar_spacing = min_bar_spacing;
             self.correct_bar_spacing();
             self.correct_offset();
+            self.relock();
             if before
                 != (
                     self.options.min_bar_spacing,
@@ -365,6 +466,7 @@ impl TimeScaleCore {
             self.options.max_bar_spacing = max_bar_spacing;
             self.correct_bar_spacing();
             self.correct_offset();
+            self.relock();
             if before
                 != (
                     self.options.max_bar_spacing,
@@ -405,6 +507,7 @@ impl TimeScaleCore {
         self.do_fix_left_edge();
         self.correct_bar_spacing();
         self.correct_offset();
+        self.relock();
         if before
             != (
                 self.options.fix_left_edge,
@@ -421,6 +524,7 @@ impl TimeScaleCore {
         let before = (self.options.fix_right_edge, self.right_offset);
         self.options.fix_right_edge = fix;
         self.correct_offset();
+        self.relock();
         if before != (self.options.fix_right_edge, self.right_offset) {
             self.changed();
         }
@@ -433,6 +537,37 @@ impl TimeScaleCore {
             self.options.lock_visible_time_range_on_resize = lock;
             self.changed();
         }
+    }
+
+    /// Aeris `lock_visible_logical_range`: enabling captures the current visible logical range
+    /// (or the next one once the scale has a range); disabling returns to the reference behavior
+    /// from the current view.
+    pub fn set_lock_visible_logical_range(&mut self, lock: bool) {
+        if self.options.lock_visible_logical_range != lock {
+            self.options.lock_visible_logical_range = lock;
+            self.locked_range = None;
+            self.relock();
+            self.changed();
+        }
+    }
+
+    /// Capture the current view as the locked range after an explicit mutation.
+    fn relock(&mut self) {
+        if self.options.lock_visible_logical_range {
+            self.locked_range = self.derived_visible_logical_range();
+        }
+    }
+
+    /// Re-derive spacing and offset from the locked range for the current width and base index.
+    /// Offset clamps are deliberately skipped: the locked range is the host's explicit view.
+    fn apply_locked_range(&mut self) {
+        let Some(range) = self.locked_range else {
+            return;
+        };
+        if self.width > 0.0 {
+            self.set_bar_spacing_internal(self.width / (range.right() - range.left() + 1.0));
+        }
+        self.right_offset = range.right() - self.base_index() as f64;
     }
 
     /// reference `rightBarStaysOnScroll`.
@@ -673,6 +808,7 @@ impl TimeScaleCore {
         self.right_offset = start_state.right_offset + shift_in_logical;
 
         self.correct_offset();
+        self.relock();
         if before != self.right_offset {
             self.changed();
         }
@@ -690,15 +826,25 @@ impl TimeScaleCore {
 
     /// Port of `setVisibleRange` (without the invalidation side effects).
     pub fn set_visible_range(&mut self, range: StrictRange, apply_default_offset: bool) {
+        self.set_visible_bounds(
+            range.left() as f64,
+            range.right() as f64,
+            apply_default_offset,
+        );
+    }
+
+    /// `setVisibleRange` over possibly fractional borders: the reference `RangeImpl` count is
+    /// `right - left + 1` for fractional logical bounds as well (range-impl.ts:22-24).
+    fn set_visible_bounds(&mut self, left: f64, right: f64, apply_default_offset: bool) {
         let before = (self.bar_spacing, self.right_offset);
-        let length = range.count() as f64;
+        let length = right - left + 1.0;
         let pixel_offset = if apply_default_offset {
             self.options.right_offset_pixels.unwrap_or(0.0)
         } else {
             0.0
         };
         self.set_bar_spacing_internal((self.width - pixel_offset) / length);
-        self.right_offset = range.right() as f64 - self.base_index() as f64;
+        self.right_offset = right - self.base_index() as f64;
         if apply_default_offset {
             self.right_offset = if pixel_offset != 0.0 {
                 pixel_offset / self.bar_spacing
@@ -707,6 +853,7 @@ impl TimeScaleCore {
             };
         }
         self.correct_offset();
+        self.relock();
         if before != (self.bar_spacing, self.right_offset) {
             self.changed();
         }
@@ -729,11 +876,20 @@ impl TimeScaleCore {
         );
     }
 
+    /// reference `setLogicalRange` (time-scale.ts:907-913): the fractional borders pass straight
+    /// through, so reading the visible logical range and setting it back is the identity. With
+    /// `lock_visible_logical_range` the range becomes the held view and skips the scroll clamps.
     pub fn set_logical_range(&mut self, range: LogicalRange) {
-        self.set_visible_range(
-            StrictRange::new(range.left().round() as i64, range.right().round() as i64),
-            false,
-        );
+        if self.options.lock_visible_logical_range {
+            let before = (self.locked_range, self.bar_spacing, self.right_offset);
+            self.locked_range = Some(range);
+            self.apply_locked_range();
+            if before != (self.locked_range, self.bar_spacing, self.right_offset) {
+                self.changed();
+            }
+            return;
+        }
+        self.set_visible_bounds(range.left(), range.right(), false);
     }
 
     pub fn restore_default(&mut self) {
@@ -856,6 +1012,8 @@ mod tests {
     #[test]
     fn focused_zoom_keeps_point_under_cursor_even_with_right_bar_pin_enabled() {
         let mut s = scale(400.0, 6.0, 0.0, 500, 300);
+        // The pin is what focused zoom must override; the test previously left it disabled.
+        s.set_right_bar_stays_on_scroll(true);
         let cursor = 250.0;
         let before = s.coordinate_to_float_index(cursor);
         s.zoom_focused(cursor, 1.0);
@@ -988,6 +1146,88 @@ mod tests {
         assert!(s.interaction_disabled());
         s.set_interaction_disabled(false);
         assert!(!s.interaction_disabled());
+    }
+
+    #[test]
+    fn logical_range_keeps_fractional_borders_like_the_reference() {
+        // reference setLogicalRange (time-scale.ts:907-913) does not round; RangeImpl.count is
+        // right - left + 1 (range-impl.ts:22-24).
+        let mut s = scale(400.0, 6.0, 0.0, 500, 300);
+        s.set_logical_range(LogicalRange::new(100.25, 179.75));
+        assert_eq!(s.bar_spacing(), 400.0 / 80.5);
+        let r = s.visible_logical_range().unwrap();
+        assert!((r.left() - 100.25).abs() < 1e-9 && (r.right() - 179.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sync_points_rebases_right_offset_and_an_active_drag_snapshot() {
+        let mut s = scale(400.0, 8.0, -20.0, 500, 300);
+        s.start_scroll(200.0);
+        s.scroll_to(160.0);
+        let grabbed = s.coordinate_to_float_index(160.0);
+        // Two bars appended while scrolled back: the view keeps its absolute right border.
+        let rebase = s.sync_points(502, Some(302), Some(s.right_offset() - 2.0));
+        assert_eq!(
+            rebase, -2.0,
+            "the owner rebases its own motion by the same amount"
+        );
+        assert!((s.coordinate_to_float_index(160.0) - grabbed).abs() < 1e-9);
+        s.scroll_to(160.0);
+        assert!(
+            (s.coordinate_to_float_index(160.0) - grabbed).abs() < 1e-9,
+            "the drag continues from the rebased snapshot"
+        );
+        // `None` keeps the offset relative to the base (follow-latest).
+        let offset = s.right_offset();
+        s.end_scroll();
+        assert_eq!(s.sync_points(503, Some(303), None), 0.0);
+        assert_eq!(s.right_offset(), offset);
+
+        // A locked range rebases by the base move and carries the drag snapshot with it.
+        s.set_lock_visible_logical_range(true);
+        s.start_scroll(200.0);
+        s.scroll_to(190.0);
+        let grabbed = s.coordinate_to_float_index(190.0);
+        assert_eq!(s.sync_points(503, Some(305), None), -2.0);
+        s.scroll_to(190.0);
+        assert!(
+            (s.coordinate_to_float_index(190.0) - grabbed).abs() < 1e-9,
+            "a locked drag continues from the rebased snapshot"
+        );
+    }
+
+    #[test]
+    fn locked_logical_range_holds_across_resize_and_base_moves_without_clamps() {
+        let mut s = scale(800.0, 6.0, 0.0, 241, 0);
+        s.set_lock_visible_logical_range(true);
+        s.set_logical_range(LogicalRange::new(0.0, 240.0));
+        // The reference clamp would force index -1 into view while the base is slot 0.
+        assert_eq!(
+            s.visible_logical_range(),
+            Some(LogicalRange::new(0.0, 240.0))
+        );
+        s.sync_points(241, Some(5), None);
+        s.set_width(333.0);
+        assert_eq!(
+            s.visible_logical_range(),
+            Some(LogicalRange::new(0.0, 240.0))
+        );
+        assert_eq!(s.bar_spacing(), 333.0 / 241.0);
+        // An explicit scroll applies the ordinary clamps and becomes the held range.
+        s.set_right_offset(s.right_offset() - 10.0);
+        let moved = s.visible_logical_range().unwrap();
+        assert!((moved.right() - 230.0).abs() < 1e-9);
+        s.sync_points(241, Some(6), None);
+        assert!((s.visible_logical_range().unwrap().right() - 230.0).abs() < 1e-9);
+        // Unlocking returns to the reference clamps from the current view.
+        s.set_lock_visible_logical_range(false);
+        s.sync_points(241, Some(0), None);
+        s.set_logical_range(LogicalRange::new(0.0, 240.0));
+        let clamped = s.visible_logical_range().unwrap();
+        assert!(
+            (clamped.left() + 1.0).abs() < 1e-9,
+            "reference clamp: {clamped:?}"
+        );
     }
 
     #[test]

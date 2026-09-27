@@ -539,6 +539,35 @@ export interface business_day {
 }
 
 /**
+ * One entry of an explicit exchange time-zone schedule: from `from_utc_seconds` (inclusive) until
+ * the next entry, exchange wall-clock time is `utc + offset_seconds`. The first offset also
+ * applies before its entry. Entries must be strictly ascending (at most 1024, offsets within
+ * ±18 h).
+ */
+export interface utc_offset_transition {
+  from_utc_seconds: number;
+  offset_seconds: number;
+}
+
+/**
+ * Exchange time zone of the financial time axis: `"UTC"` (default), an IANA name such as
+ * `"Asia/Shanghai"` or `"America/New_York"` (resolved once per zone with `Intl.DateTimeFormat`
+ * over 1970–2100), or an explicit {@link utc_offset_transition} schedule. The chart never reads
+ * the browser's own time zone.
+ */
+export type time_zone = string | readonly utc_offset_transition[];
+
+/** Extra context passed to host time formatters. */
+export interface time_label_context {
+  /**
+   * The calendar date when the chart's financial time points are calendar dates (every
+   * financial series was given `business_day` or `"YYYY-MM-DD"` times), else `null` for
+   * instants. The first argument remains the UTC-midnight seconds of that date.
+   */
+  business_day: business_day | null;
+}
+
+/**
  * A point in time (reference `Time`). Accepted forms at the input boundary:
  * - `number` — a finite whole UTC timestamp in seconds since the epoch;
  * - `business_day` — `{ year, month, day }`, taken at UTC midnight;
@@ -627,6 +656,60 @@ export type feature_series_data =
   | whisker_box_data;
 
 export type series_data = ohlc_data | single_value_data | feature_series_data | whitespace_data;
+
+/**
+ * A partial bar for {@link series_api.merge}. Present fields overwrite the bar at `time`; absent
+ * (or `undefined`) fields keep that bar's current values. `value` is an alias of `close` (use it for
+ * line/area/baseline/histogram series). Volume and turnover are not bar fields: merge them into
+ * their own series (for example the volume histogram) with `{ time, value }`.
+ */
+export interface series_merge_data {
+  time: time;
+  open?: number;
+  high?: number;
+  low?: number;
+  close?: number;
+  value?: number;
+  /** Per-bar color overrides; absent keeps the bar's current override. */
+  color?: string;
+  wick_color?: string;
+  border_color?: string;
+}
+
+/**
+ * Columns for {@link series_api.merge_typed}: row `i` is the partial bar
+ * `{ time: times[i], open: open?.[i], ... }`. A `NaN` entry, or an omitted column, is an absent
+ * field that keeps the bar's current value. `close` is the value of line/area/baseline/histogram
+ * series. Every present column must have the length of `times`.
+ */
+export interface series_merge_columns {
+  /** UTC seconds, as for {@link ohlc_columns.times}. */
+  times: Float64Array;
+  open?: Float64Array;
+  high?: Float64Array;
+  low?: Float64Array;
+  close?: Float64Array;
+}
+
+/**
+ * Options for streaming ingestion ({@link series_api.update}, {@link series_api.merge},
+ * {@link series_api.update_typed}, {@link series_api.merge_typed}) and full replaces
+ * ({@link series_api.set_data}). Custom and advanced series throw `unsupported_operation` when a
+ * `sequence` is supplied, because their payloads bypass the guarded OHLC path.
+ */
+export interface series_update_options {
+  /**
+   * Optional monotonic per-series sequence (a non-negative safe integer), for example the feed's
+   * message sequence. On `update`/`merge`/`update_typed`/`merge_typed`, a sequence that is not
+   * greater than the last one applied to this series is rejected as stale: nothing changes and
+   * {@link series_api.last_ingestion_diagnostics} reports `code: "stale_sequence"` with
+   * `last_sequence`. Calls without a sequence always apply and leave the guard untouched. On
+   * `set_data`/`set_data_typed` it installs the snapshot's sequence as the new baseline; a full
+   * replace without one clears the guard. The guard is O(1), runtime-only, and never persisted.
+   * An invalid value is rejected (and warned) like invalid data, leaving the series unchanged.
+   */
+  sequence?: number;
+}
 
 export type footprint_aggressor_side = "buy" | "sell" | "unknown";
 
@@ -844,6 +927,20 @@ export interface ingestion_diagnostics {
   reordered: boolean;
   semantic_anomalies: number;
   reason?: string;
+  /**
+   * Machine-readable cause for streaming diagnostics:
+   * - `stale_sequence` — rejected: the `sequence` option was not newer than `last_sequence`;
+   * - `partial_ohlc` — rejected: an `update()` point carried only some OHLC fields (use `merge()`);
+   * - `value_on_ohlc_series` — accepted: `{ time, value }` replaced a candlestick/bar with a flat
+   *   O=H=L=C bar (reference behavior; use `merge()` to move only the close);
+   * - `price_less_payload` — accepted: a point without price fields (for example
+   *   `{ time, volume }`) replaced the bar with whitespace (reference behavior; use `merge()`, and
+   *   update volume on its own series);
+   * - `empty_merge` — rejected: a `merge()` carried no price field.
+   */
+  code?: "stale_sequence" | "partial_ohlc" | "value_on_ohlc_series" | "price_less_payload" | "empty_merge";
+  /** Last sequence applied to the series, reported with `code: "stale_sequence"`. */
+  last_sequence?: number;
 }
 
 /**
@@ -884,6 +981,9 @@ export interface frame_stats {
   /** Producer overruns observed across all ring sources since chart create
    *  (see {@link series_api.set_ring_source}); 0 while no ring is bound. */
   ring_overruns: number;
+  /** Ring rows dropped since chart create because their timestamp or values were invalid
+   *  (non-finite, fractional, or out of range); 0 while no ring is bound. */
+  ring_dropped_rows: number;
   /** WebGPU vertex-buffer allocations made for the most recent frame. A warmed, unchanged chart
    *  reports 0; capacity grows geometrically and is retained until chart removal. */
   gpu_buffer_allocations: number;
@@ -1089,16 +1189,69 @@ export interface comparison_legend_entry {
 
 /** Scalar input accepted by a built-in indicator. The source series may itself be an indicator output. */
 export type indicator_input_source = "open" | "high" | "low" | "close" | "hl2" | "hlc3" | "ohlc4" | "hlcc4";
-export type indicator_kind = "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma";
+export type indicator_kind = "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma" | "kdj";
 export type pivot_kind = "standard" | "fibonacci" | "camarilla" | "woodie" | "demark";
+/** VWAP reset period in exchange trading days: one day, a Monday-start week, or a calendar month. */
 export type vwap_reset = "session" | "weekly" | "monthly";
-export type indicator_parameter_type = "integer" | "number" | "source" | "series";
+/**
+ * Seed of a recursive average. `"sma"` seeds with the mean of the first N samples, so values start
+ * at sample N-1 (TradingView `ta.ema`/`ta.rma`, TA-Lib). `"first_value"` seeds with the first sample,
+ * so values start immediately (通达信/同花顺 `EMA(X,N)` and `SMA(X,N,M)`).
+ */
+export type indicator_seed = "sma" | "first_value";
+/** Bollinger standard deviation: `"population"` divides by N (TradingView), `"sample"` by N-1 (通达信/同花顺 `STD`). */
+export type deviation_estimator = "population" | "sample";
+/**
+ * Convenience preset expanded by the engine into explicit parameters. `"tradingview"` (the default)
+ * selects SMA seeds, a `MACD - signal` histogram, and population deviation; `"china"` selects
+ * first-value seeds, the `(DIF-DEA)*2` histogram, and sample deviation. Explicit fields override
+ * the preset, and only the expanded parameters are reported and persisted.
+ */
+export type indicator_convention = "tradingview" | "china";
+export interface indicator_convention_parameters {
+  convention?: indicator_convention;
+}
+/** Calculation parameters for {@link chart_api.add_ema}, `add_dema`, `add_tema`, and RSI. */
+export interface indicator_seed_parameters extends indicator_convention_parameters {
+  seed?: indicator_seed;
+}
+/** Calculation parameters for {@link chart_api.add_macd}. */
+export interface macd_parameters extends indicator_seed_parameters {
+  /** Histogram scale: 1 is `MACD - signal` (default), 2 is 通达信/同花顺/富途 `(DIF-DEA)*2`. */
+  histogram_multiplier?: number;
+}
+/**
+ * Start of KDJ's `SMA(X,N,1)` smoothing: `"fifty"` (default) is the textbook start, where a missing
+ * previous K or D is 50; `"first_value"` is the 通达信/同花顺 formula `SMA` semantics, where the first
+ * K equals the first RSV and the first D the first K. They converge after `convergence_bars`.
+ */
+export type kdj_seed = "fifty" | "first_value";
+/** Calculation parameters for {@link chart_api.add_kdj}; `convention: "china"` selects `"first_value"`. */
+export interface kdj_parameters extends indicator_convention_parameters {
+  seed?: kdj_seed;
+}
+/** Calculation parameters for {@link chart_api.add_bollinger}. */
+export interface bollinger_parameters extends indicator_convention_parameters {
+  estimator?: deviation_estimator;
+}
+/** Calculation parameters for {@link chart_api.add_vwap}. */
+export interface vwap_parameters {
+  /**
+   * Scalar turnover series. When present the line is the 分时 average price
+   * `sum(amount) / sum(volume)` per reset period; `volume_source` is then required. Both columns align
+   * by timestamp, and rows without positive volume or finite turnover contribute nothing.
+   */
+  amount_source?: series_api | null;
+}
+export type indicator_parameter_type = "integer" | "number" | "source" | "series" | "choice";
 export interface indicator_parameter_descriptor {
   name: string;
   parameter_type: indicator_parameter_type;
   default: unknown;
   min: number | null;
   max: number | null;
+  /** Allowed values of a `"choice"` parameter. */
+  choices?: string[];
 }
 export interface indicator_output_descriptor {
   name: string;
@@ -1149,6 +1302,17 @@ export interface indicator_info {
     reset: vwap_reset | null;
     standard_deviation: number | null;
     percent: number | null;
+    /** EMA/DEMA/TEMA/MACD/RSI seed convention. */
+    seed: indicator_seed | null;
+    /** MACD histogram scale. */
+    histogram_multiplier: number | null;
+    /** Bollinger standard-deviation estimator. */
+    estimator: deviation_estimator | null;
+    /** KDJ K and D smoothing (`SMA(X,N,1)` lengths). */
+    k_smoothing: number | null;
+    d_smoothing: number | null;
+    /** KDJ K/D start (the `seed` of `add_kdj` parameters). */
+    kdj_seed: kdj_seed | null;
   };
   period: number;
   /** Second parameter when the kind has one: Bollinger deviation, MACD signal period,
@@ -1159,15 +1323,25 @@ export interface indicator_info {
   source_input: indicator_input_source;
   /** VWAP's bound volume series, otherwise `null`. */
   volume_source: series_api | null;
+  /** The turnover series of an amount-weighted VWAP, otherwise `null`. */
+  amount_source: series_api | null;
   /** Current engine-owned presentation state for this output. */
   style: indicator_output_style;
   /** Stable display name for this output, preserving binding output order. */
   output_name: string;
   /** Bollinger: 0 = upper, 1 = middle, 2 = lower. EMA ribbon: fastest-to-slowest configured
    *  period. MACD: 0 = line, 1 = signal, 2 = histogram. Stochastic: 0 = %K, 1 = %D.
-   *  Single-output indicators: 0. */
+   *  KDJ: 0 = K, 1 = D, 2 = J. Single-output indicators: 0. */
   output_index: number;
   output_count: number;
+  /** Bars of the root price source before this output's first value, including every chained
+   *  indicator source (assuming no whitespace rows). */
+  warmup_bars: number;
+  /** Recommended bars of history before this output no longer depends on where loaded history
+   *  begins: the warm-up for windowed formulas, plus the bars for every recursive seed's weight
+   *  to fall below 0.1%. `null` when no bar count suffices (session VWAP, pivots, OBV, SAR,
+   *  SuperTrend, ZigZag). Load at least this many bars before the first visible bar. */
+  convergence_bars: number | null;
 }
 
 /** Five EMA periods in fastest-to-slowest output order. */
@@ -1232,6 +1406,16 @@ export interface time_scale_options {
   /** reference `timeScale.allowBoldLabels` (default true): bold the major time tick labels. */
   allow_bold_labels?: boolean;
   /**
+   * Hold the visible logical range exactly across data updates and resizes (Aeris extension,
+   * default `false`). New bars never shift the view, resizes rescale the bar spacing, and a
+   * range passed to `set_visible_logical_range` is applied without the reference scroll clamps.
+   * Use it for fixed full-session intraday (time-sharing) views: install every session slot as
+   * whitespace rows, then call `set_visible_logical_range({ from: 0, to: slots - 1 })`; the
+   * view stays exact from the pre-open state through the close. Explicit scrolls and zooms still
+   * apply and become the held range.
+   */
+  lock_visible_logical_range?: boolean;
+  /**
    * Show the whole time-scale strip (reference `timeScale.visible`, default `true`). Distinct from
    * `time_visible`, which only controls whether the labels show the time of day.
    */
@@ -1249,9 +1433,69 @@ export interface time_scale_options {
    * (reference `tickMarkMaxCharacterLength`, default 8).
    */
   tick_mark_max_character_length?: number;
-  /** Custom time-axis tick formatter (reference `tickMarkFormatter`). Receives `(timeSeconds, tickMarkType)`
-   *  where tickMarkType is 0 Year, 1 Month, 2 DayOfMonth, 3 Time, 4 TimeWithSeconds. */
-  tick_mark_formatter?: (time: number, tick_mark_type: number) => string;
+  /** Custom time-axis tick formatter (reference `tickMarkFormatter`). Receives `(timeSeconds, tickMarkType,
+   *  locale, context)` where tickMarkType is 0 Year, 1 Month, 2 DayOfMonth, 3 Time, 4 TimeWithSeconds
+   *  and `context.business_day` identifies calendar-date rows. */
+  tick_mark_formatter?: (
+    time: number,
+    tick_mark_type: number,
+    locale: string,
+    context: time_label_context,
+  ) => string;
+  /**
+   * Exchange time zone for tick boundaries and built-in time labels (default `"UTC"`). Canonical
+   * data times stay UTC seconds; see {@link time_zone}.
+   */
+  time_zone?: time_zone;
+  /**
+   * Seconds from exchange-local midnight at which a trading day begins (default `0`). Negative
+   * values assign an evening session to the next trading day (e.g. `-3 * 3600` makes a 21:00
+   * night session start the next day; a Friday-night session then belongs to Monday). Drives
+   * Day/Month/Year tick marks, VWAP session/weekly/monthly resets, and pivot sessions.
+   */
+  session_start?: number;
+  /**
+   * Explicit time-axis marks (Aeris extension, default `null`): the listed anchors replace the
+   * automatic tick selection for both the axis labels and the vertical grid; `null` restores it.
+   * Times must be strictly ascending (at most 512 marks, labels at most 64 bytes). A mark draws
+   * only where a time point has exactly its time, including whitespace slots reserved for bars
+   * that have not traded; without a `label` the built-in exchange-time label for that point is
+   * used (set `time_visible` for `HH:MM`), an empty label keeps just the grid line, and labels stay
+   * inside the axis and skip one that would overlap its predecessor.
+   */
+  tick_marks?: readonly time_tick_mark[] | null;
+}
+
+/** One explicit time-axis mark (see {@link time_scale_options.tick_marks}). */
+export interface time_tick_mark {
+  time: time;
+  label?: string;
+}
+
+/** Which instant of each bar names its session slot. */
+export type session_slot_convention = "bar_open" | "bar_close" | "bar_close_with_open";
+
+/** Input of {@link session_slot_times}. */
+export interface session_slot_options {
+  /** Trading date, `"YYYY-MM-DD"` or a business day. */
+  date: string | business_day;
+  /**
+   * Exchange-local `["HH:MM", "HH:MM"]` windows in chronological order (at most 32). An end at or
+   * before its start crosses midnight; `"24:00"` ends at midnight.
+   */
+  windows: readonly (readonly [string, string])[];
+  /** Bar interval in seconds (1..86 400). */
+  interval_seconds: number;
+  /** Exchange time zone: an IANA name or an explicit schedule (default `"UTC"`). */
+  time_zone?: time_zone;
+  /** Trading-day start relative to local midnight, like the chart's `session_start` (default 0). */
+  session_start?: number;
+  /**
+   * `"bar_open"` (default, the canonical bar time): 09:30..11:29 and 13:00..14:59 for an A-share
+   * day. `"bar_close"`: 09:31..11:30 and 13:01..15:00. `"bar_close_with_open"` adds the opening
+   * instant as its own slot: the 241 points 同花顺/富途 show (09:30, 09:31..11:30, 13:01..15:00).
+   */
+  convention?: session_slot_convention;
 }
 
 export interface price_scale_options {
@@ -1283,6 +1527,39 @@ export interface price_scale_options {
    * font — multiples of step×10 on uniform ticks, exact powers of ten on log ticks.
    */
   bold_round_labels?: boolean;
+  /**
+   * Tick mark label density (reference `tickMarkDensity`, default `2.5`): tick spacing in font
+   * heights. Higher values produce fewer tick marks.
+   */
+  tick_mark_density?: number;
+  /**
+   * Keep a rounded tick mark at the very top and bottom of an autoscaled scale (reference
+   * `ensureEdgeTickMarksVisible`, default `false`); adds half a font height of edge padding.
+   */
+  ensure_edge_tick_marks_visible?: boolean;
+  /**
+   * Aeris extension: explicit base price for the percentage (`mode: 2`) and indexed-to-100
+   * (`mode: 3`) modes, e.g. the previous close. Every series and drawing on this scale converts
+   * against it instead of its first visible bar or the comparison anchor, so horizontal panning
+   * never re-bases the axis. `null` (default) restores the first-visible base.
+   */
+  base_value?: number | null;
+  /**
+   * Aeris extension: center the autoscaled range on this price, `center ± max|price − center|`
+   * (e.g. a time-sharing chart centered on the previous close). Works in every mode; in
+   * percentage/indexed modes the center converts through the scale's base. Scale margins still
+   * apply, so equal top/bottom margins put the center at the pane's middle. `null` (default)
+   * autoscales to the plain data range.
+   */
+  autoscale_center?: number | null;
+  /**
+   * Aeris extension (default `false`, reference-exact): stable autoscale. The range grows at once
+   * when visible data exceeds it but shrinks only when the data one bar beyond the visible edges
+   * leaves more than 20% of it unused, so sub-bar pans and kinetic scrolling never flip the range
+   * back and forth. Restarts from the exact range on data replacement, series visibility,
+   * removal, or scale changes, mode/base/center changes, and autoscale resets.
+   */
+  stable_auto_scale?: boolean;
   /** Reserve and render this scale's axis strip while retaining its state when hidden. */
   visible?: boolean;
 }
@@ -1352,8 +1629,12 @@ export interface localization_options {
   date_format?: string;
   /** Format any non-percentage price label (axis ticks, last-value badge, crosshair, price lines). */
   price_formatter?: (price: number) => string;
-  /** Format the crosshair time label. Receives the UTC-second timestamp. */
-  time_formatter?: (time: number) => string;
+  /**
+   * Format a point in time wherever the chart prints one (crosshair, rectangle axis tags, delta
+   * tooltip, tooltip, accessibility). Receives the UTC-second timestamp and a context whose
+   * `business_day` identifies calendar-date rows.
+   */
+  time_formatter?: (time: number, context: time_label_context) => string;
 }
 
 /** Pan/scroll gesture toggles (reference `handleScroll`). `false` disables all scrolling. */
@@ -1422,6 +1703,10 @@ export interface chart_price_scale_options {
   textColor?: string;
   /** Bold round-figure tick labels (Aeris extension, industry-standard, default `true`). */
   boldRoundLabels?: boolean;
+  /** Tick mark label density in font heights (reference `tickMarkDensity`, default `2.5`). */
+  tickMarkDensity?: number;
+  /** Rounded tick marks at both edges while autoscaled (reference `ensureEdgeTickMarksVisible`, default `false`). */
+  ensureEdgeTickMarksVisible?: boolean;
 }
 
 /** Crosshair "tracking mode" behavior on touch (reference `trackingMode`). Package-level. */
@@ -1469,8 +1754,20 @@ export interface chart_options {
   crosshair: { vertLine: crosshair_line_options; horzLine: crosshair_line_options; mode: number };
   leftPriceScale: chart_price_scale_options;
   rightPriceScale: chart_price_scale_options;
-  /** Time-axis strip cosmetics (reference `timeScale.borderVisible`/`borderColor`). */
-  timeScale: { borderVisible: boolean; borderColor: string };
+  /**
+   * Time-axis strip cosmetics (reference `timeScale.borderVisible`/`borderColor`) plus the
+   * declarative exchange time zone and trading-day start (same semantics as
+   * {@link time_scale_options.time_zone} / {@link time_scale_options.session_start}); these two
+   * also work for worker charts.
+   */
+  timeScale: {
+    borderVisible: boolean;
+    borderColor: string;
+    timeZone?: time_zone;
+    sessionStart?: number;
+    /** Declarative {@link time_scale_options.tick_marks} (also for worker charts). */
+    tickMarks?: readonly time_tick_mark[] | null;
+  };
   /**
    * Large text label painted inside the pane (reference v4 `watermark`). `color` is any CSS color
    * (include alpha for a faint mark; the default is fully transparent). Aeris draws it on the shared
@@ -1529,6 +1826,9 @@ export interface chart_options {
   theme: "light" | "dark";
 }
 
+/** Direction rule of a `histogram_updown` volume histogram. */
+export type histogram_updown_rule = "open_close" | "previous_close";
+
 /** Options accepted when adding a series. */
 export interface series_options {
   /**
@@ -1559,9 +1859,13 @@ export interface series_options {
   render_before_time: number | null;
   /** Overrides the kind default color (line/area/histogram). */
   color: string;
-  /** Candlestick/bar up (close ≥ open) body color. Any CSS color the engine parses. */
+  /**
+   * Candlestick/bar up (close ≥ open) body color. Any CSS color the engine parses. On a
+   * `histogram_updown` histogram it is the up-column tint instead of the translucent market up
+   * color (e.g. red for the A-share red-up convention).
+   */
   up_color: string;
-  /** Candlestick/bar down (close < open) body color. */
+  /** Candlestick/bar down (close < open) body color; the down-column tint of a `histogram_updown` histogram. */
   down_color: string;
   /** Render candlesticks from a bounded Heikin Ashi presentation projection while keeping raw OHLC in data(). */
   heikin_ashi: boolean;
@@ -1589,6 +1893,15 @@ export interface series_options {
    * (translucent green/red), matching industry-standard volume. Default false (solid `color`).
    */
   histogram_updown: boolean;
+  /**
+   * How `histogram_updown` decides a column's direction from the primary price series (the first
+   * series added): `"open_close"` (default) compares that bar's close with its open;
+   * `"previous_close"` compares it with the previous traded close (the A-share/HK time-sharing
+   * (分时) volume convention; an unchanged close counts as up). The first traded bar compares
+   * with the primary's previous-close reference: a baseline series' `baseline_value`, else its
+   * price scale's `base_value`, else its own open. Whitespace bars keep the solid `color`.
+   */
+  histogram_updown_rule?: histogram_updown_rule;
   /**
    * Place the series on the bottom-band overlay price scale (volume-style): its magnitude is
    * excluded from the main price axis autoscale. Mirrors the reference's `priceScaleId: ''` + scaleMargins.
@@ -1702,7 +2015,7 @@ export interface series_options {
   bottom_line_width?: number;
   /** Baseline: line style below the baseline, a `LINE_STYLE_TO_U8` value (reference `bottomLineStyle`). */
   bottom_line_style?: number;
-  /** Histogram base value the bars grow from (reference `base`, default 0). */
+  /** Histogram base value the bars grow from (reference `base`, default 0); autoscale always includes it. */
   base?: number;
   /** Area: invert the filled area (fill above the line) (reference `invertFilledArea`, default `false`). */
   invert_filled_area?: boolean;
@@ -1717,11 +2030,56 @@ export interface series_options {
    * `"percent"`, reference `PriceFormatBuiltIn`) take `precision` and `min_move` (reference
    * `precision`/`minMove`, snake_case per the package API convention); `"custom"` (reference
    * `PriceFormatCustom`) installs a JS formatter callback with an optional `min_move`.
+   *
+   * Axis ticks always lie on the `min_move` grid (a 0.02 tick never labels 15.25). When
+   * `min_move` is given without `precision`, the precision derives from it (reference
+   * `precisionByMinMove`): `{ type: "price", min_move: 0.0001 }` prints 4 decimals.
+   *
+   * `tick_ladder` (Aeris extension, `"price"` type) installs an exchange spread table: each label
+   * rounds to its own band tick with that band's precision, axis ticks lie on the common grid of
+   * the visible bands, and trading order snapping on this series' scale uses the same bands.
+   * `null` clears it. A malformed ladder throws `invalid_options` and leaves the format unchanged.
    */
   price_format?:
-    | { type: "price" | "volume" | "percent"; precision?: number; min_move?: number }
+    | {
+        type: "price" | "volume" | "percent";
+        precision?: number;
+        min_move?: number;
+        tick_ladder?: readonly price_tick_band[] | null;
+      }
     | { type: "custom"; formatter: (price: number) => string; min_move?: number };
+  /**
+   * Replace this series' autoscale contribution (reference `autoscaleInfoProvider`). Called
+   * during every autoscale pass with `base_implementation`, which returns the series' own info for
+   * the visible bars; the returned info REPLACES it (`null` removes the series from autoscale).
+   * The provider runs while the chart renders: a chart API called from inside it throws
+   * `unsupported_operation` without touching the chart, and a provider that throws is ignored for
+   * that pass (the series keeps its own info). Read chart state before rendering and close over
+   * it instead. `null` clears it.
+   */
+  autoscale_info_provider?: autoscale_info_provider | null;
 }
+
+/** One band of a price-format tick-size ladder (exchange spread table). */
+export interface price_tick_band {
+  /** Inclusive lower bound of the band's absolute price; the first band also covers lower prices. */
+  from: number;
+  /** Tick size inside the band. Band bounds must lie on the grids of both adjacent bands. */
+  min_move: number;
+  /** Label decimals inside the band; derived from `min_move` when omitted. */
+  precision?: number;
+}
+
+/** reference `AutoscaleInfo`: a series' autoscale range in prices plus optional pixel margins. */
+export interface autoscale_info {
+  price_range: { min_value: number; max_value: number } | null;
+  margins?: { above: number; below: number };
+}
+
+/** reference `AutoscaleInfoProvider`: receives the default implementation, returns the replacement. */
+export type autoscale_info_provider = (
+  base_implementation: () => autoscale_info | null,
+) => autoscale_info | null;
 
 export interface feature_brush_style {
   line_color: string;
@@ -1966,10 +2324,45 @@ export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
  * centers — the engine's `logical_to_coordinate` space) plus a price. The unused coordinate of
  * the full-span kinds is stored but never read (a horizontal line's `logical`, a vertical
  * line's `price`).
+ *
+ * `time` is the anchor's time identity in UTC seconds (fractional between bars, extrapolated
+ * with the prevailing bar interval beyond the data). It is what survives an interval switch, a
+ * data reload, persistence restore into a different history window, and cross-chart sync. It is
+ * absent on non-time (tick/volume/range bar) charts, for `logical` anchors while the chart has too
+ * few time points to derive one, and for positions so far beyond the data that the time would
+ * leave the supported value range. An anchor supplied by `time` keeps reporting it while pending.
  */
 export interface drawing_point {
   logical: number;
   price: number;
+  time?: number;
+}
+
+/**
+ * An anchor supplied to {@link chart_api.add_drawing} or {@link drawing_api.set_points}: a
+ * `logical` index, a `time` (UTC seconds), or both — `time` wins when both are present and
+ * disagree. A `time` supplied before the chart has data stays pending and resolves when data
+ * arrives. `points()` output is accepted unchanged.
+ */
+export type drawing_point_input =
+  | { logical: number; price: number; time?: number }
+  | { time: number; price: number; logical?: number };
+
+/** One anchor rewrite in {@link chart_api.set_drawings_points}. */
+export interface drawing_points_update {
+  drawing: drawing_api | number;
+  points: drawing_point_input[];
+}
+
+/**
+ * A multiplicative price-basis segment for {@link chart_api.rescale_drawing_prices}: anchors whose
+ * time lies in `[from_time, to_time)` (UTC seconds; omitted = unbounded) are multiplied by
+ * `factor` (1e-6..1e6). Segments must not overlap.
+ */
+export interface drawing_price_segment {
+  from_time?: number;
+  to_time?: number;
+  factor: number;
 }
 
 /** Horizontal label alignment shared by every tool's text (canvas `textAlign` keywords). */
@@ -2129,7 +2522,10 @@ export interface persisted_drawing_v1 {
   id: number;
   kind: drawing_kind;
   pane_id: `pane-${number}`;
+  /** `{logical, price, time?}`; a present `time` is authoritative when the restoring chart can place it. */
   anchors: drawing_point[];
+  /** Non-time (tick/volume/range bar) charts: full-resolution bar identity per anchor. */
+  anchor_times_micros?: ({ open_timestamp_micros: number; close_timestamp_micros: number } | null)[];
   style?: persisted_drawing_style_v1;
 }
 
@@ -2139,6 +2535,8 @@ export interface chart_state_v1 {
   schema_version: 1;
   panes: persisted_pane_v1[];
   drawings: persisted_drawing_v1[];
+  /** Host-defined price basis of the drawing prices (see {@link chart_api.set_drawing_price_basis}). */
+  drawing_price_basis?: string;
 }
 
 export interface trade_stream_stats {
@@ -2147,6 +2545,10 @@ export interface trade_stream_stats {
   dependent_count: number;
   dependent_rebuilds: number;
   dependent_incremental_updates: number;
+  /** Lifetime CVD/delta rows computed by study refreshes; a live tip adds only its active bars. */
+  dependent_rows_computed: number;
+  /** Lifetime tape trades folded into bubble markers; a live tip adds only its new trades. */
+  bubble_trades_scanned: number;
 }
 
 export interface replay_seek_stats {
@@ -2202,13 +2604,38 @@ export interface chart_state_v2 {
     stack_mode: "Normal" | "Percent";
   }[];
   chart_options: Record<string, unknown>;
+  drawing_price_basis?: string;
 }
 
-export type chart_state = chart_state_v1 | chart_state_v2;
+/** Indicator source reference persisted by schema V3: a host series or an earlier study output. */
+export type persisted_indicator_source_v3 =
+  | { kind: "series"; id: number }
+  | { kind: "output"; study: number; output: number };
+
+/** V3 adds engine-owned study bindings to the V1 financial document. */
+export interface chart_state_v3 {
+  schema: "aeris_charts-state";
+  schema_version: 3;
+  panes: persisted_pane_v1[];
+  drawings: persisted_drawing_v1[];
+  indicators: {
+    /** Engine indicator definition: `{ kind: indicator_kind, ...parameters }`. */
+    kind: { kind: indicator_kind } & Record<string, unknown>;
+    source: persisted_indicator_source_v3;
+    source_input: indicator_input_source;
+    volume_source?: persisted_indicator_source_v3 | null;
+    /** Turnover series of an amount-weighted VWAP; absent when the study has none. */
+    amount_source?: persisted_indicator_source_v3 | null;
+    styles: indicator_output_style[];
+  }[];
+  drawing_price_basis?: string;
+}
+
+export type chart_state = chart_state_v1 | chart_state_v2 | chart_state_v3;
 
 /** Counts returned after one validated, atomic state restore. */
 export interface persistence_restore_result {
-  schema_version: 1 | 2;
+  schema_version: 1 | 2 | 3;
   panes: number;
   drawings: number;
   points: number;
@@ -2219,10 +2646,10 @@ export interface drawing_api {
   readonly id: number;
   kind(): drawing_kind;
   pane_index(): number;
-  /** The defining anchors. */
+  /** The defining anchors, each with its `time` identity on ordinary time charts. */
   points(): drawing_point[];
-  /** Replace the anchors (validated against the kind's anchor count). */
-  set_points(points: drawing_point[]): void;
+  /** Replace the anchors (validated against the kind's anchor count; `time` anchors accepted). */
+  set_points(points: drawing_point_input[]): void;
   /** The current options (reference `options()`). */
   options(): drawing_options;
   /** Deep-merge a patch onto this drawing's options (reference `applyOptions`). */
@@ -2248,8 +2675,12 @@ export interface series_api {
   applyOptions: series_api["apply_options"];
   moveToPane: series_api["move_to_pane"];
   priceScale: series_api["price_scale"];
-  /** Replace the series' data. Accepts OHLC or single-value points; packed to typed arrays here. */
-  set_data(data: readonly series_data[]): void;
+  /**
+   * Replace the series' data. Accepts OHLC or single-value points; packed to typed arrays here.
+   * A full replace clears the series' sequence guard, or installs `options.sequence` as the new
+   * baseline (see {@link series_update_options.sequence}).
+   */
+  set_data(data: readonly series_data[], options?: series_update_options): void;
   /** Diagnostics from the most recent set/update call; `null` is the allocation-free clean case. */
   last_ingestion_diagnostics(): ingestion_diagnostics | null;
   /**
@@ -2266,10 +2697,52 @@ export interface series_api {
    *   the "repeat their value in all four price channels" contract.
    * - Views over a `SharedArrayBuffer` are safe, and the buffer may be rewritten by the producer
    *   as soon as this call returns.
+   *
+   * Like {@link set_data}, a full replace clears the sequence guard or installs
+   * `options.sequence` as the baseline.
    */
-  set_data_typed(columns: ohlc_columns): void;
-  /** Append a new point or replace the last one (streaming). */
-  update(point: series_data): void;
+  set_data_typed(columns: ohlc_columns, options?: series_update_options): void;
+  /**
+   * Streaming update with reference `series.update` semantics: the point replaces the **whole**
+   * bar at its time. A time equal to the last bar replaces it and a newer time appends, both in
+   * O(1). An older time corrects that historical bar in place (only its level-of-detail path and
+   * autoscale chunk are repaired) or inserts a new bar there, which reindexes the series and, for a
+   * time no series holds, merges the shared time axis.
+   *
+   * Partial payloads are not merged: an OHLC point missing some prices is rejected (and warned),
+   * `{ time, value }` on a candlestick/bar series flattens the bar to O=H=L=C, and a point without
+   * price fields (for example `{ time, volume }`) becomes whitespace. Each case is reported through
+   * {@link last_ingestion_diagnostics} with a `code`; use {@link merge} for partial ticks.
+   *
+   * `options.sequence` enables the per-series stale-delivery guard
+   * (see {@link series_update_options.sequence}).
+   */
+  update(point: series_data, options?: series_update_options): void;
+  /**
+   * Merge a partial tick into the bar at `point.time` (engine-owned, O(log n) lookup plus the
+   * ordinary streaming update). Present fields overwrite, absent fields keep the existing bar. For
+   * candlestick/bar series the result is normalized so `high >= max(open, close)` and
+   * `low <= min(open, close)`, so a close-only tick extends the high/low as needed; a close-only
+   * tick for a new time creates an O=H=L=C bar. Line/area/baseline/histogram series take
+   * `value` (or `close`) as their value. A merge without any price field is rejected with
+   * `code: "empty_merge"`. Volume and turnover merge into their own series.
+   *
+   * Emits one `data_changed("update")`. Throws `unsupported_operation` on custom, advanced, and
+   * footprint series.
+   */
+  merge(point: series_merge_data, options?: series_update_options): void;
+  /**
+   * Columnar counterpart to {@link merge} for high-rate partial ticks: row `i` merges exactly like
+   * `merge({ time: times[i], ... })` with `NaN` entries and omitted columns absent. Rows apply in
+   * input order, so a later row for the same time merges into the earlier result, and the engine
+   * synchronizes time state and indicators once for the batch. Each row costs what the same
+   * {@link merge} would: O(log n) for an existing or tail bar, a reindex for a new historical
+   * time. One invalid row (bad timestamp,
+   * non-finite or out-of-range value, or no price field) rejects the whole batch; `sequence`
+   * guards the batch as one delivery. Emits one `data_changed("update")`. Throws
+   * `unsupported_operation` on custom, advanced, and footprint series.
+   */
+  merge_typed(columns: series_merge_columns, options?: series_update_options): void;
   /**
    * Streaming counterpart to {@link set_data_typed}: append (or replace-last) a **batch** of
    * points from already-packed columns, so a high-rate feed never allocates a JS object per tick.
@@ -2288,16 +2761,19 @@ export interface series_api {
    *
    * Cost for the streaming shape — every row at or past the chart's last timestamp — is linear in
    * the batch and independent of series length, because each row takes the engine's single-append
-   * fast path. A
-   * row that lands *before* the last timestamp is a mid-history insert and costs a reindex of the
-   * shared time axis, exactly as the same row would through {@link update}; a batch of those is
-   * therefore linear in the batch times the series length, not a bulk reindex. Use
+   * fast path. When the rows before the series' last bar only correct bars that already exist,
+   * they are applied in place (logarithmic lookup per row, no reindex) and the batch's tail rows
+   * keep the append path. A batch that inserts new historical times is merged
+   * into the series in one linear pass and reindexes the shared time axis once. Use
    * {@link set_data_typed} to rewrite history.
    *
    * The input arrays are never mutated or retained — see {@link set_data_typed} for the aliasing
    * guarantee this shares.
+   *
+   * `options.sequence` guards the whole batch with one sequence
+   * (see {@link series_update_options.sequence}).
    */
-  update_typed(columns: ohlc_columns): void;
+  update_typed(columns: ohlc_columns, options?: series_update_options): void;
   /**
    * Bind a `SharedArrayBuffer` ring that the engine drains **once per frame**, or pass `null` to
    * unbind and return to explicit {@link update}/{@link update_typed} calls.
@@ -2313,7 +2789,8 @@ export interface series_api {
    * planning and copying allocate nothing per row or frame.
    *
    * Rows apply in ring order, each appending or replacing the series' last point exactly as
-   * {@link update} would; a non-finite row is dropped. Unlike {@link update_typed} there is no
+   * {@link update} would; a row with an invalid timestamp or non-finite value is dropped and counted
+   * in {@link frame_stats.ring_dropped_rows}. Unlike {@link update_typed} there is no
    * per-batch sort or dedupe — a ring is a stream, and its producer is expected to write in
    * ascending time.
    *
@@ -2329,9 +2806,9 @@ export interface series_api {
    * does removing the series.
    *
    * The cost model of {@link update_typed} applies to the drained rows as well: rows at or past the
-   * chart's last timestamp take the engine's single-append fast path, while a row landing before it
-   * costs a reindex of the shared time axis. On a chart with several series, keep the ring-fed one at
-   * the global tip.
+   * chart's last timestamp take the engine's single-append fast path; a row correcting an existing
+   * earlier bar is repaired in place, while a row with a new earlier time costs a reindex of the
+   * shared time axis. On a chart with several series, keep the ring-fed one at the global tip.
    *
    * Composes with {@link series_options.max_points}: a ring-fed series with a cap holds its window
    * and plateaus in memory, which is the shape a long live session wants.
@@ -2447,7 +2924,10 @@ export interface time_scale_api {
    * ease-out (suppressed under prefers-reduced-motion); falsy applies immediately.
    */
   scroll_to_position(position: number, animated: boolean): void;
-  /** Return the latest point to the real-time edge. */
+  /**
+   * Return the latest point to the real-time edge at the configured `right_offset` (reference
+   * `scrollToRealTime`): animated over ~400 ms, immediate under prefers-reduced-motion.
+   */
   scroll_to_real_time(): void;
   /** Restore configured default spacing and right offset. */
   reset_time_scale(): void;
@@ -2455,6 +2935,10 @@ export interface time_scale_api {
   apply_options(options: Partial<time_scale_options>): void;
   options(): time_scale_options;
   get_visible_logical_range(): logical_range | null;
+  /**
+   * Show this logical range. Fractional borders are kept exactly (reference
+   * `setVisibleLogicalRange`), so restoring a saved `get_visible_logical_range()` is jump-free.
+   */
   set_visible_logical_range(range: logical_range): void;
   get_visible_range(): time_range | null;
   set_visible_range(range: time_range): void;
@@ -3057,10 +3541,12 @@ export interface chart_api {
   add_sma(source: series_api, period: number, options?: Partial<series_options>): series_api;
   /** Add an SMA using an explicit OHLC/aggregate input from the source series. */
   add_sma_with_source(source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>): series_api;
-  /** Add a Rust-native exponential moving-average line derived from an existing series. */
-  add_ema(source: series_api, period: number, options?: Partial<series_options>): series_api;
-  add_dema(source: series_api, period: number, options?: Partial<series_options>): series_api;
-  add_tema(source: series_api, period: number, options?: Partial<series_options>): series_api;
+  /** Add a Rust-native exponential moving-average line derived from an existing series.
+   *  `parameters` selects the seed convention (default SMA seed; `{ convention: "china" }` or
+   *  `{ seed: "first_value" }` starts at the first bar). */
+  add_ema(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api;
+  add_dema(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api;
+  add_tema(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api;
   add_smma(source: series_api, period: number, options?: Partial<series_options>): series_api;
   add_rma(source: series_api, period: number, options?: Partial<series_options>): series_api;
   add_hma(source: series_api, period: number, options?: Partial<series_options>): series_api;
@@ -3072,29 +3558,34 @@ export interface chart_api {
   set_ema_ribbon_periods(indicator: series_api, periods: ema_ribbon_periods): boolean;
   /** Add upper, middle, and lower Rust-native Bollinger-band lines (with the industry-standard
    *  background fill between the bands). */
-  add_bollinger(source: series_api, period: number, deviation?: number, options?: Partial<series_options>): [series_api, series_api, series_api];
+  add_bollinger(source: series_api, period: number, deviation?: number, options?: Partial<series_options>, parameters?: bollinger_parameters): [series_api, series_api, series_api];
   /** Add Bollinger bands using an explicit OHLC/aggregate input from the source series. */
-  add_bollinger_with_source(source: series_api, input: indicator_input_source, period: number, deviation?: number, options?: Partial<series_options>): [series_api, series_api, series_api];
+  add_bollinger_with_source(source: series_api, input: indicator_input_source, period: number, deviation?: number, options?: Partial<series_options>, parameters?: bollinger_parameters): [series_api, series_api, series_api];
   /** Add a Rust-native Wilder RSI line in its own oscillator pane (dotted 30/70 band lines and
    *  the translucent channel strip between them). */
-  add_rsi(source: series_api, period: number, options?: Partial<series_options>): series_api;
+  add_rsi(source: series_api, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api;
   /** Add RSI using an explicit OHLC/aggregate input from the source series. */
-  add_rsi_with_source(source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>): series_api;
+  add_rsi_with_source(source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api;
   /** Change an existing indicator binding's scalar input while retaining its output handle. */
   set_indicator_input_source(indicator: series_api, input: indicator_input_source): boolean;
   /** Return the bounded typed editor schema for a built-in indicator kind. */
   indicator_schema(kind: indicator_kind, period?: number, deviation?: number): indicator_schema;
   /** Add MACD line, signal line, and histogram in their own oscillator pane; the histogram's
    *  per-bar color follows four conventional states (strong/weak × above/below zero). */
-  add_macd(source: series_api, fast: number, slow: number, signal: number, options?: Partial<series_options>): [series_api, series_api, series_api];
+  add_macd(source: series_api, fast: number, slow: number, signal: number, options?: Partial<series_options>, parameters?: macd_parameters): [series_api, series_api, series_api];
+  /** Add KDJ K, D, and J lines in their own oscillator pane (dotted 20/80 bands). RSV uses the last
+   *  `period` bars; `K = SMA(RSV, k_smoothing, 1)`, `D = SMA(K, d_smoothing, 1)`, `J = 3K - 2D`,
+   *  with K and D starting from 50 unless `parameters` selects `{ seed: "first_value" }` (or
+   *  `{ convention: "china" }`). Defaults 9/3/3. */
+  add_kdj(source: series_api, period?: number, k_smoothing?: number, d_smoothing?: number, options?: Partial<series_options>, parameters?: kdj_parameters): [series_api, series_api, series_api];
   /** Add Stochastic %K and %D lines in their own oscillator pane (dotted 20/80 band lines and
    *  the translucent channel strip between them). */
   add_stochastic(source: series_api, k_period: number, d_period: number, options?: Partial<series_options>): [series_api, series_api];
   /** Add a Rust-native Wilder ATR line in its own oscillator pane. */
   add_atr(source: series_api, period: number, options?: Partial<series_options>): series_api;
-  /** Add a session-anchored (UTC-day reset) VWAP line on the source's pane. `volume_source`
+  /** Add a session-anchored (exchange trading-day reset; UTC by default) VWAP line on the source's pane. `volume_source`
    *  supplies per-bar volume (e.g. the volume histogram series); `null`/omitted = unit weights. */
-  add_vwap(source: series_api, volume_source?: series_api | null, options?: Partial<series_options>): series_api;
+  add_vwap(source: series_api, volume_source?: series_api | null, options?: Partial<series_options>, parameters?: vwap_parameters): series_api;
   add_obv(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_cmf(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_mfi(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
@@ -3137,6 +3628,12 @@ export interface chart_api {
   add_ichimoku(source: series_api, options?: Partial<series_options>): [series_api, series_api, series_api, series_api, series_api];
   apply_options(options: deep_partial<chart_options>): void;
   options(): unknown;
+  /**
+   * Install the host clock (UTC seconds, fractional allowed) used by the candle-close countdown
+   * instead of `Date.now()`; `null` restores the system clock. The countdown shows only while the
+   * clock is inside the forming bar's interval.
+   */
+  set_clock(clock: (() => number) | null): void;
   time_scale(): time_scale_api;
   price_scale(price_scale_id?: string, pane_index?: number): price_scale_api;
   add_price_scale(options: price_scale_create_options, pane_index?: number): price_scale_api;
@@ -3270,10 +3767,43 @@ export interface chart_api {
   unsubscribe_options_change(handler: options_change_handler): void;
   /**
    * Add a drawing (engine-owned drawing object) to a pane (default 0) from its defining anchor
-   * points and repaint. Returns the live handle. Throws when the engine rejects the placement
-   * (stale pane, wrong anchor count for the kind, non-finite anchors).
+   * points and repaint. Anchors may be `{logical, price}` or `{time, price}` (UTC seconds).
+   * Returns the live handle. Throws `invalid_data` when the engine rejects the placement (stale
+   * pane, wrong anchor count for the kind, non-finite anchors) and `invalid_options` for a
+   * malformed or out-of-range options patch.
    */
-  add_drawing(kind: drawing_kind, points: drawing_point[], options?: Partial<drawing_options>, pane_index?: number): drawing_api;
+  add_drawing(kind: drawing_kind, points: drawing_point_input[], options?: Partial<drawing_options>, pane_index?: number): drawing_api;
+  /**
+   * Rewrite the anchors of many drawings atomically as ONE undo step (every update is validated
+   * first). Returns the number of drawings that changed.
+   */
+  set_drawings_points(updates: readonly drawing_points_update[]): number;
+  /**
+   * Rescale drawing prices for a data price-basis switch (for example 前复权 ↔ 不复权): each
+   * anchor whose time falls in a segment is multiplied by that segment's factor (Long/Short
+   * Position levels use the entry's segment; on tick/volume/range bar charts an anchor's time is
+   * the open time of its bar). This is a data-basis change, not an edit: it also
+   * applies to locked drawings, rewrites the undo/redo history in the new basis, and records no
+   * undo step. `price_basis` (when given) sets the basis label in the same step; `""` clears it.
+   * Atomic: throws `invalid_data` with nothing changed for invalid segments or when a factor would
+   * move any price outside the supported value range. Returns the number of drawings that changed.
+   */
+  rescale_drawing_prices(segments: readonly drawing_price_segment[], price_basis?: string): number;
+  /**
+   * Label the price basis the drawings use (host-defined, e.g. `"qfq"` or `"raw"`; at most 128
+   * bytes; `null` clears it). The label is persisted and carried by sync/clipboard payloads so a
+   * host can detect a mismatch on restore.
+   */
+  set_drawing_price_basis(basis: string | null): void;
+  drawing_price_basis(): string | null;
+  /**
+   * Persistent chart drawing magnet (the toolbar magnet, default `"off"`): `"weak"` snaps anchor
+   * placement and editing to the nearest OHLC value only within a small pixel distance,
+   * `"strong"` always snaps. A drawing's own `magnet` option can raise it for that drawing, and
+   * holding Ctrl/Cmd toggles the effective magnet temporarily. Touch input uses this mode.
+   */
+  set_drawing_magnet_mode(mode: drawing_magnet_mode): void;
+  drawing_magnet_mode(): drawing_magnet_mode;
   /** Every drawing as live handles, in z-order (bottom first). */
   drawings(): drawing_api[];
   /** Return the typed common property schema for a live drawing. */

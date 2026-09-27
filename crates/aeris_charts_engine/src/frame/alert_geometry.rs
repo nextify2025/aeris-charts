@@ -58,12 +58,8 @@ impl ChartEngine {
         let base = self.series_base_value(series.id, from)?;
         let snap_y = self.crosshair_snap(pane_index, x_css, y_css, from, to).1;
         let raw_price = scale.coordinate_to_price(snap_y, base);
-        let min_move = series.price_format.min_move;
-        let price = if min_move.is_finite() && min_move > 0.0 {
-            (raw_price / min_move).round() * min_move
-        } else {
-            raw_price
-        };
+        // The same grid the axis labels use: the band tick of a tick ladder, else `min_move`.
+        let price = series.price_format.snap_price(raw_price);
         let size = self.axis_metrics().crosshair_price_tag_height();
         let full_x = if side == PriceScaleSide::Right {
             strip_x - size

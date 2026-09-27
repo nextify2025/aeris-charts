@@ -12,6 +12,7 @@ mod depth;
 mod domains;
 mod drawing_contract;
 mod drawings;
+mod exchange_time_api;
 mod feature_series;
 mod footprint;
 mod frame;
@@ -31,14 +32,19 @@ pub use volume_profile::{
 };
 mod ordering;
 mod persistence;
+#[cfg(test)]
+mod price_axis_tests;
 mod price_line_api;
 mod price_scale_api;
 mod profiles;
 mod resampling;
 mod series_query_api;
+mod series_update_api;
 #[cfg(test)]
 mod tests;
+mod time_tick_marks_api;
 mod trading;
+mod viewport;
 mod workspace;
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +53,9 @@ use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 
-pub use aeris_charts_indicators::{PivotKind, VwapReset};
+pub use aeris_charts_indicators::{
+    DeviationEstimator, IndicatorConvention, IndicatorSeed, KdjSeed, PivotKind, VwapReset,
+};
 pub use alerts::{
     AlertCondition, AlertCreateRequest, AlertFrequency, AlertId, AlertLine, AlertLineStatus,
     AlertPriceScale, AlertSnapshot, MAX_ALERT_LINES,
@@ -69,18 +77,19 @@ pub use drawing_contract::{
     DrawingClipboardItem, DrawingClipboardPayload, DrawingCommonSnapshot, DrawingInterval,
     DrawingIntervalUnit, DrawingIntervalVisibility, DrawingKindOptions, DrawingLabelMetric,
     DrawingLabelOptions, DrawingLabelPosition, DrawingLevel, DrawingLineCap, DrawingMagnetMode,
-    DrawingPropertyDescriptor, DrawingPropertySchema, DrawingPropertyType, DrawingSyncPayload,
-    DrawingTemplate, DRAWING_CONTRACT_REVISION, MAX_DRAWING_GROUP_BYTES, MAX_DRAWING_LABELS,
-    MAX_DRAWING_LEVELS, MAX_DRAWING_NAME_BYTES, MAX_DRAWING_OBJECTS, MAX_DRAWING_TEMPLATES,
-    MAX_DRAWING_TEMPLATE_BYTES,
+    DrawingPriceSegment, DrawingPropertyDescriptor, DrawingPropertySchema, DrawingPropertyType,
+    DrawingSyncPayload, DrawingTemplate, DRAWING_CONTRACT_REVISION, MAX_DRAWING_GROUP_BYTES,
+    MAX_DRAWING_LABELS, MAX_DRAWING_LEVELS, MAX_DRAWING_NAME_BYTES, MAX_DRAWING_OBJECTS,
+    MAX_DRAWING_PRICE_SEGMENTS, MAX_DRAWING_TEMPLATES, MAX_DRAWING_TEMPLATE_BYTES,
 };
 pub use drawings::{
-    Drawing, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId, DrawingKind,
-    DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingWorkStats, TextMeasureFn,
-    DRAWING_DEFAULT_COLOR,
+    Drawing, DrawingAnchor, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId,
+    DrawingKind, DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingWorkStats,
+    TextMeasureFn, DRAWING_DEFAULT_COLOR, DRAWING_WEAK_MAGNET_DISTANCE,
 };
 pub(crate) use drawings::{
-    DrawingAnchorTime, DrawingController, DrawingDrag, DrawingHistory, DrawingRuntime,
+    DrawingAnchorTime, DrawingChartSettings, DrawingController, DrawingDrag, DrawingHistory,
+    DrawingRuntime,
 };
 pub use feature_series::{
     FeatureDataPoint, FeatureSeriesKind, FeatureSeriesOptionsPatch, FeatureValue, HeatmapCell,
@@ -167,9 +176,13 @@ pub use resampling::{
     ResampleBoundary, ResampleError, ResampleOptions, ResampledBar, MAX_RESAMPLED_SERIES,
     MAX_RESAMPLE_BOUNDARIES,
 };
+pub use series_update_api::{SeriesBarPatch, SeriesUpdateOutcome, SeriesUpdateRejection};
 pub use synthetic_bars::{
     SyntheticBar, SyntheticBarAggregator, SyntheticBarError, SyntheticBarOptions,
     SyntheticSourceBar, MAX_SYNTHETIC_BARS, MAX_SYNTHETIC_SOURCE_BARS,
+};
+pub use time_tick_marks_api::{
+    TimeTickMark, TimeTickMarksError, MAX_TIME_TICK_LABEL_BYTES, MAX_TIME_TICK_MARKS,
 };
 pub use trading::{
     AccountId, ExecutionId, ExecutionKind, ExecutionMarkerShape, HostEventHit, HostEventMarker,
@@ -185,6 +198,9 @@ pub use trading::{
 pub use workspace::{SplitDirection, Workspace, WorkspaceError, WorkspaceLayout};
 
 use aeris_charts_core::format::price_formatter::PriceFormatter;
+pub use aeris_charts_core::format::price_tick_ladder::{
+    PriceTickBand, PriceTickLadder, MAX_PRICE_TICK_BANDS,
+};
 use aeris_charts_core::format::time_formatter::{MonthNames, DEFAULT_DATE_FORMAT};
 use aeris_charts_core::model::data_layer::{
     DataLayer, DataLayerMemoryUsage, MergedTimeMapping, PointColorChannel, SeriesId, SeriesIdError,
@@ -199,8 +215,15 @@ use aeris_charts_core::model::price_range::PriceRange;
 use aeris_charts_core::model::range::{LogicalRange, StrictRange};
 pub use aeris_charts_core::options::ChartTheme;
 use aeris_charts_core::options::{chart_theme_patch, ChartOptionsStore};
+pub use aeris_charts_core::scale::exchange_time::{
+    ExchangeTime, ExchangeTimeError, UtcOffsetSchedule, UtcOffsetTransition,
+};
 use aeris_charts_core::scale::price_scale_core::{
     PriceScaleCore, PriceScaleCoreOptions, PriceScaleMargins, PriceScaleMode,
+};
+pub use aeris_charts_core::scale::session_slots::{
+    parse_iso_date, parse_wall_clock, session_slot_times, SessionSlotConvention, SessionSlotError,
+    SessionWindow, MAX_SESSION_SLOTS, MAX_SESSION_WINDOWS,
 };
 use aeris_charts_core::scale::time_scale_core::{TimeScaleCore, TimeScaleOptions};
 use aeris_charts_core::scale::time_tick_marks::TimeTickMarks;
@@ -293,6 +316,11 @@ pub struct SeriesPriceFormat {
     pub precision: u32,
     pub min_move: f64,
     pub formatter: Option<PriceFormatterFn>,
+    /// Aeris extension: price-band tick sizes (an exchange spread table). For the `price` kind the
+    /// ladder owns label rounding and per-band precision, the axis tick grid (the LCM of the
+    /// visible bands' ticks), and trading price snapping on this series' scale; `min_move` and
+    /// `precision` remain the scalar fallback for autoscale padding.
+    pub tick_ladder: Option<PriceTickLadder>,
 }
 
 impl Default for SeriesPriceFormat {
@@ -302,6 +330,7 @@ impl Default for SeriesPriceFormat {
             precision: 2,
             min_move: 0.01,
             formatter: None,
+            tick_ladder: None,
         }
     }
 }
@@ -311,13 +340,77 @@ impl SeriesPriceFormat {
     /// chart-level `localization.priceFormatter`/built-in formatter, exactly like a series
     /// that never set `priceFormat`.
     pub fn is_reference_default(&self) -> bool {
-        self.kind == PriceFormatKind::Price && self.precision == 2 && self.min_move == 0.01
+        self.kind == PriceFormatKind::Price
+            && self.precision == 2
+            && self.min_move == 0.01
+            && self.tick_ladder.is_none()
     }
 
     /// Reference series `base()`: the price-scale tick base is the reciprocal of `minMove`.
+    #[cfg(test)]
     pub(crate) fn base(&self) -> i64 {
-        const MAX_EXACT_BASE: f64 = 1_000_000_000_000_000.0;
-        self.min_move.recip().round().clamp(1.0, MAX_EXACT_BASE) as i64
+        aeris_charts_core::scale::price_tick_span_calculator::tick_base_for_min_move(self.min_move)
+    }
+
+    /// The price-band ladder when it governs this format (built-in `price` kind only).
+    pub fn active_tick_ladder(&self) -> Option<&PriceTickLadder> {
+        self.tick_ladder
+            .as_ref()
+            .filter(|_| self.kind == PriceFormatKind::Price)
+    }
+
+    /// Nearest price on this format's tick grid (the ladder band tick, else `min_move`).
+    pub fn snap_price(&self, price: f64) -> f64 {
+        match self.active_tick_ladder() {
+            Some(ladder) => ladder.snap(price),
+            None if self.min_move.is_finite() && self.min_move > 0.0 => {
+                (price / self.min_move).round() * self.min_move
+            }
+            None => price,
+        }
+    }
+
+    /// The grid every axis tick over raw prices `[low, high]` must lie on.
+    pub(crate) fn tick_grid(&self, low: f64, high: f64) -> f64 {
+        match self.active_tick_ladder() {
+            Some(ladder) if low.is_finite() && high.is_finite() => ladder.grid_step(low, high),
+            _ => self.min_move,
+        }
+    }
+}
+
+/// reference `AutoscaleInfo` (series-options.ts): a series' autoscale range in raw prices plus
+/// optional pixel margins. `price_range: None` contributes no range.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AutoscaleInfo {
+    /// `(min, max)` raw prices.
+    pub price_range: Option<(f64, f64)>,
+    /// `(above, below)` extra pixel margins.
+    pub margins: Option<(f64, f64)>,
+}
+
+/// reference `autoscaleInfoProvider`: receives the series' own autoscale info for the visible bars
+/// (`None` when the series has no data) and returns the info that REPLACES it (`None` removes the
+/// series from autoscale). Hosts must not call back into the chart from the provider.
+pub type AutoscaleInfoProviderFn = Box<dyn Fn(Option<AutoscaleInfo>) -> Option<AutoscaleInfo>>;
+
+/// Apply the chart-level `leftPriceScale`/`rightPriceScale` tick keys (reference
+/// `tickMarkDensity`/`ensureEdgeTickMarksVisible`) present in `group` to one scale.
+fn apply_chart_tick_mark_options(
+    scale: &mut PriceScaleCore,
+    group: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(density) = group
+        .get("tickMarkDensity")
+        .and_then(serde_json::Value::as_f64)
+    {
+        scale.set_tick_mark_density(density);
+    }
+    if let Some(visible) = group
+        .get("ensureEdgeTickMarksVisible")
+        .and_then(serde_json::Value::as_bool)
+    {
+        scale.set_ensure_edge_tick_marks_visible(visible);
     }
 }
 
@@ -461,6 +554,37 @@ impl PriceLineExtent {
         match value {
             "partial" => Some(Self::Partial),
             "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// How a `histogram_updown` column takes its direction from the chart's primary price series.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistogramUpDownRule {
+    /// Up when the primary's close is at or above the same bar's open (the reference volume
+    /// convention, and the default).
+    #[default]
+    OpenClose,
+    /// Up when the primary's close is at or above its previous non-whitespace close (the
+    /// A-share/HK time-sharing (分时) convention). The primary's first row compares with its
+    /// reference price: its explicit `baseline_value`, else its price scale's explicit
+    /// `base_value` (the host's previous close), else that bar's own open.
+    PreviousClose,
+}
+
+impl HistogramUpDownRule {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenClose => "open_close",
+            Self::PreviousClose => "previous_close",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open_close" => Some(Self::OpenClose),
+            "previous_close" => Some(Self::PreviousClose),
             _ => None,
         }
     }
@@ -827,7 +951,11 @@ pub struct SeriesEntry {
     pub(crate) area_brush: Option<AreaBrushState>,
     /// Optional fixed-value channel painted behind this line/area series.
     pub threshold_region: Option<SeriesThresholdRegion>,
+    /// Tint histogram columns by the primary price series' direction. `up_color`/`down_color`
+    /// override the translucent market palette of the tint.
     pub histogram_updown: bool,
+    /// Which comparison decides a `histogram_updown` column's direction.
+    pub histogram_updown_rule: HistogramUpDownRule,
     pub price_scale_target: PriceScaleTarget,
     pub pane_index: usize,
     pub line_type: LineType,
@@ -978,6 +1106,11 @@ pub struct SeriesEntry {
     /// Rows at or after this UTC-seconds time keep their data but are not drawn. A host uses it
     /// to hand the tail of a series to another presentation (candles before a live footprint).
     pub render_before_time: Option<i64>,
+    /// Last host sequence applied by a sequence-guarded update or merge (runtime-only, O(1)).
+    /// `None` accepts any sequence; a full data install clears it.
+    pub(crate) update_sequence: Option<u64>,
+    /// reference `autoscaleInfoProvider`: replaces this series' autoscale contribution.
+    pub(crate) autoscale_info_provider: Option<AutoscaleInfoProviderFn>,
 }
 
 impl SeriesEntry {
@@ -1000,6 +1133,7 @@ impl SeriesEntry {
             area_brush: None,
             threshold_region: None,
             histogram_updown: false,
+            histogram_updown_rule: HistogramUpDownRule::OpenClose,
             price_scale_target: PriceScaleTarget::Right,
             pane_index: 0,
             line_type: LineType::Simple,
@@ -1067,6 +1201,8 @@ impl SeriesEntry {
             native_primitives: Vec::new(),
             max_points: None,
             render_before_time: None,
+            update_sequence: None,
+            autoscale_info_provider: None,
         }
     }
 
@@ -1092,6 +1228,7 @@ impl SeriesEntry {
         self.area_top_color = defaults.area_top_color;
         self.area_bottom_color = defaults.area_bottom_color;
         self.histogram_updown = defaults.histogram_updown;
+        self.histogram_updown_rule = defaults.histogram_updown_rule;
         self.line_type = defaults.line_type;
         self.point_markers = defaults.point_markers;
         self.last_price_animation = defaults.last_price_animation;
@@ -1598,6 +1735,8 @@ pub struct ChartEngine {
     drawing_anchor_times: HashMap<DrawingId, Vec<Option<DrawingAnchorTime>>>,
     pub series: SeriesStore,
     tick_marks: TimeTickMarks,
+    /// Host-supplied time-axis marks replacing the automatic selection (`None` = automatic).
+    time_tick_marks: Option<Vec<time_tick_marks_api::TimeTickMark>>,
     next_pane_id: u32,
     next_persistent_pane_id: u32,
     general_horizontal_domains: domains::HorizontalDomainRegistry,
@@ -1693,6 +1832,10 @@ pub struct ChartEngine {
     /// `MMM`/`MMMM` tokens and the month tick labels. Hosts inject locale-derived names (the
     /// wasm host builds them from `Intl.DateTimeFormat`); the headless default is English.
     pub month_names: MonthNames,
+    /// Exchange time zone, trading-day session start, and calendar-date axis flag. Drives tick
+    /// weights, built-in time labels, trading-day indicator resets, session highlighting, and
+    /// the countdown window. Defaults to UTC with a midnight session start.
+    pub(crate) exchange_time: ExchangeTime,
     /// Series ids in stable order, bottom to top (topmost LAST — the reference's z-order, pane.ts
     /// `orderedSources`/`setSeriesOrder`). Live series only: removed slots leave the list.
     /// This is the saved ordering: insertion order until an explicit `set_series_order`
@@ -1745,6 +1888,9 @@ pub struct ChartEngine {
     /// loops without making the host coordinator stateful inside the renderer.
     drawing_sync_source: String,
     drawing_sync_revision: u64,
+    /// Chart-level drawing settings (magnet mode, price-basis label) and anchor time-identity
+    /// bookkeeping; drawings.rs owns every field.
+    drawing_settings: DrawingChartSettings,
     /// The drawing whose dedicated host editor currently owns text input (drawings.rs).
     /// Frame construction keeps committed glyphs for the transparent overlay-caret model and
     /// keeps an empty trend label's measured middle gap while its editor is open.
@@ -1834,6 +1980,7 @@ impl ChartEngine {
             drawing_anchor_times: HashMap::new(),
             series,
             tick_marks: TimeTickMarks::new(),
+            time_tick_marks: None,
             next_pane_id: 2,
             next_persistent_pane_id: 2,
             general_horizontal_domains,
@@ -1890,6 +2037,7 @@ impl ChartEngine {
             synced_first_time: None,
             date_format: DEFAULT_DATE_FORMAT.to_string(),
             month_names: MonthNames::default(),
+            exchange_time: ExchangeTime::default(),
             series_order,
             series_order_explicit: false,
             hovered_series: None,
@@ -1906,6 +2054,7 @@ impl ChartEngine {
             drawing_controller: DrawingController::default(),
             drawing_sync_source: String::new(),
             drawing_sync_revision: 0,
+            drawing_settings: DrawingChartSettings::default(),
             editing_drawing: None,
             hovered_text: None,
             hovered_drawing: None,
@@ -1995,8 +2144,8 @@ impl ChartEngine {
             self.indicator_memory_usage();
         EngineMemoryUsage {
             data: self.data.memory_usage(),
-            tick_payload_bytes: self.tick_marks.payload_bytes(),
-            tick_capacity_bytes: self.tick_marks.capacity_bytes(),
+            tick_payload_bytes: self.tick_marks.payload_bytes() + self.time_tick_marks_bytes().0,
+            tick_capacity_bytes: self.tick_marks.capacity_bytes() + self.time_tick_marks_bytes().1,
             indicator_runtime_bytes,
             indicator_transfer_capacity_bytes,
             retained_frame_capacity_bytes: self.retained_frame.capacity_bytes(),
@@ -2373,6 +2522,8 @@ impl ChartEngine {
         for rid in &tombstones {
             let rid = *rid;
             self.synthetic_series.remove(&rid);
+            // The scale losing this source refits exactly under stable autoscale.
+            self.reset_series_scale_stabilization(rid);
             self.drop_volume_profiles_using(rid);
             if let Some(entry) = self.series.iter_mut().find(|s| s.id == rid) {
                 entry.removed = true;
@@ -2382,6 +2533,7 @@ impl ChartEngine {
                 entry.feature = None;
                 entry.footprint = None;
                 entry.native_primitives.clear();
+                entry.autoscale_info_provider = None;
             }
             // Release the data slot; its opaque identity is invalid forever and the storage may
             // be reused by a different identity.
@@ -2801,6 +2953,9 @@ impl ChartEngine {
         }
         series.pane_index = pane_index;
         series.price_scale_target = destination_target;
+        // Both the scale the series left and the one it joined refit exactly.
+        self.reset_scale_stabilization_at(from, current_target);
+        self.reset_scale_stabilization_at(pane_index, destination_target);
         if from != PANELESS {
             self.cleanup_if_pane_is_empty(from);
         }
@@ -2818,7 +2973,10 @@ impl ChartEngine {
         if pane_index < self.panes.len() && !self.pane_uses_financial_time(pane_index) {
             return false;
         }
-        let Some(from) = self.series_entry(id).map(|series| series.pane_index) else {
+        let Some((from, from_target)) = self
+            .series_entry(id)
+            .map(|series| (series.pane_index, series.price_scale_target))
+        else {
             return false;
         };
         let built_in = matches!(price_scale_id, "left" | "right" | "");
@@ -2842,6 +3000,11 @@ impl ChartEngine {
         };
         series.pane_index = pane_index;
         series.price_scale_target = target;
+        if (from, from_target) != (pane_index, target) {
+            // Both the scale the series left and the one it joined refit exactly.
+            self.reset_scale_stabilization_at(from, from_target);
+            self.reset_scale_stabilization_at(pane_index, target);
+        }
         if from != pane_index && from != PANELESS {
             self.cleanup_if_pane_is_empty(from);
         }
@@ -2903,6 +3066,17 @@ impl ChartEngine {
         };
         apply(&mut pane.left_scale, &options.left_price_scale);
         apply(&mut pane.price_scale, &options.right_price_scale);
+        // Tick density and edge marks are scale-core options carried only in the raw chart
+        // options, like `boldRoundLabels`.
+        let raw = self.options.value();
+        for (key, scale) in [
+            ("leftPriceScale", &mut pane.left_scale),
+            ("rightPriceScale", &mut pane.price_scale),
+        ] {
+            if let Some(group) = raw.get(key).and_then(serde_json::Value::as_object) {
+                apply_chart_tick_mark_options(scale, group);
+            }
+        }
     }
 
     /// Whether `id` names a tombstoned (removed) series. Data mutations on such a slot are ignored
@@ -3000,6 +3174,8 @@ impl ChartEngine {
                 return;
             }
             series.visible = visible;
+            // Showing or hiding a source refits a stable scale exactly, like the default mode.
+            self.reset_series_scale_stabilization(id);
             self.invalidate_frame_scene();
             self.invalidate_frame_layout_and_axis();
         }
@@ -3536,8 +3712,18 @@ impl ChartEngine {
         {
             return false;
         }
+        // Keep the row-key base across reinstalls so studies and markers written against the
+        // current sequence axis stay aligned (retention trims drop keys without re-keying).
+        let key_base = if self.sequence_points.is_some() {
+            self.data
+                .series_data(id)
+                .and_then(|(times, _)| times.first().copied())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let times = (0..points.len())
-            .map(|index| index as i64)
+            .map(|index| key_base + index as i64)
             .collect::<Vec<_>>();
         // The data layer synchronizes immediately during installation. Clear any prior
         // sequence first so that synchronization cannot interpret the new logical rows with an
@@ -3547,14 +3733,21 @@ impl ChartEngine {
         // The aggregator keeps absolute bar identities across retention, while the chart data
         // layer and drawing geometry address the retained rows from zero. Preserve the absolute
         // identity through the full-resolution times, but normalize the chart-local sidecar
-        // indices before mapping/rebasing anchors.
+        // indices before mapping/rebasing anchors. Retention trims the installed rows inside the
+        // install, so map the prior sequence onto the rows that remain: the viewport and drawing
+        // rebases in that synchronization then address the final chart-local indices.
+        let retained = self.rows_retained_after_cap(id, points.len());
+        points.drain(..points.len() - retained);
         for (index, point) in points.iter_mut().enumerate() {
             point.logical_index = index as u64;
         }
         self.pending_sequence_mapping = previous_sequence
             .as_deref()
             .map(|old| BarSequenceMapping::between_points(old, &points));
+        // The row keys installed below are not UTC times; drawing time identity must not read them.
+        self.drawing_settings.sequence_install = true;
         let installed = self.install_series_data_inner(id, times, open, high, low, close);
+        self.drawing_settings.sequence_install = false;
         if installed {
             let retained_len = self
                 .data
@@ -3730,33 +3923,37 @@ impl ChartEngine {
         {
             return 0;
         }
-        let Some(sequence) = self.sequence_points.take() else {
+        // Rows are keyed contiguously from the projection's first retained key (retention trims
+        // drop keys from the front without re-keying).
+        let key_base = self
+            .data
+            .series_data(id)
+            .and_then(|(times, _)| times.first().copied())
+            .unwrap_or(0);
+        let Some(sequence) = self.sequence_points.as_mut() else {
             return 0;
         };
         if from > sequence.len() {
-            self.sequence_points = Some(sequence);
             return 0;
         }
-        let times = (from..from + points.len())
-            .map(|index| index as i64)
-            .collect::<Vec<_>>();
-        let previous_pending = self.pending_sequence_mapping.take();
-        let mut next_sequence = sequence[..from].to_vec();
+        // A live tip rewrites only the active suffix. The prefix keeps its identities, so logical
+        // anchors map to themselves and no rebase mapping is needed. The sidecar changes before
+        // the rows so a retention trim inside the update drains the matching prefix, and the
+        // shared time sync then reads the final sidecar in place.
+        let replaced = sequence.split_off(from);
         for (index, point) in points.iter_mut().enumerate() {
             point.logical_index = (from + index) as u64;
         }
-        next_sequence.extend_from_slice(&points);
-        self.pending_sequence_mapping = Some(BarSequenceMapping::between_points(
-            &sequence,
-            &next_sequence,
-        ));
+        sequence.extend_from_slice(&points);
+        let times = (from..from + points.len())
+            .map(|index| key_base + index as i64)
+            .collect::<Vec<_>>();
         let accepted = self.update_series_bars_sanitized_inner(id, times, open, high, low, close);
-        if accepted == points.len() {
-            self.sequence_points = Some(next_sequence);
-            self.sync_sequence_axis_times();
-        } else {
-            self.sequence_points = Some(sequence);
-            self.pending_sequence_mapping = previous_pending;
+        if accepted != points.len() {
+            if let Some(sequence) = self.sequence_points.as_mut() {
+                sequence.truncate(from);
+                sequence.extend(replaced);
+            }
         }
         accepted
     }
@@ -3770,6 +3967,13 @@ impl ChartEngine {
         low: Vec<f64>,
         close: Vec<f64>,
     ) -> bool {
+        // A full replace is a resync: the provider's sequence space may have restarted.
+        if let Some(series) = self.series_entry_mut(id) {
+            series.update_sequence = None;
+        }
+        // A full replacement restarts stable autoscale from the new data's exact range, on this
+        // series' scale and on every derived indicator output's scale.
+        self.reset_replaced_series_stabilization(id);
         let scalar = self
             .series_entry(id)
             .is_some_and(|series| series.kind.stores_scalar_values())
@@ -3841,14 +4045,24 @@ impl ChartEngine {
         if rows <= max_points {
             return false;
         }
-        // Trim past the ceiling by the hysteresis margin so the next `margin` appends are free.
-        // A cap of 0 means "hold nothing"; guard the divisor rather than special-casing it.
-        let margin = (max_points / CAP_TRIM_MARGIN_DIVISOR).min(max_points);
-        let keep = max_points - margin;
+        let keep = self.rows_retained_after_cap(id, rows);
         self.data.trim_front(id, keep);
         self.trim_feature_rows_front(id, keep);
         self.trim_footprint_rows_front(id, keep);
         true
+    }
+
+    /// Rows a series keeps after its retention cap processes `rows` rows.
+    fn rows_retained_after_cap(&self, id: SeriesId, rows: usize) -> usize {
+        match self.series_max_points(id) {
+            // Trim past the ceiling by the hysteresis margin so the next `margin` appends are
+            // free. A cap of 0 means "hold nothing"; guard the divisor rather than
+            // special-casing it.
+            Some(max_points) if rows > max_points => {
+                max_points - (max_points / CAP_TRIM_MARGIN_DIVISOR).min(max_points)
+            }
+            _ => rows,
+        }
     }
 
     /// Fit the horizontal scale to the current union of series timestamps.
@@ -4031,6 +4245,13 @@ impl ChartEngine {
         self.time_scale.set_right_bar_stays_on_scroll(stays);
     }
 
+    /// Aeris `timeScale.lockVisibleLogicalRange` (default false): hold the visible logical range
+    /// exactly across data updates and resizes, e.g. a fixed full-session intraday view.
+    pub fn set_lock_visible_logical_range(&mut self, lock: bool) {
+        self.time_scale.set_lock_visible_logical_range(lock);
+        self.invalidate_frame_scene();
+    }
+
     /// reference `timeScale.shiftVisibleRangeOnNewBar` (default true): when the last bar is
     /// visible, the visible range follows newly appended bars instead of compensating the
     /// right offset (chart-model.ts:968-983).
@@ -4187,11 +4408,26 @@ impl ChartEngine {
         self.set_right_offset(position);
     }
 
-    /// Restore the real-time edge. This intentionally targets zero rather than the configured
-    /// default offset, matching the reference charting library's `scrollToRealTime` contract.
+    /// The real-time edge position: the configured `right_offset` option, exactly the target of
+    /// reference `scrollToRealTime` (time-scale.ts:824-826). Like the reference, a configured
+    /// `right_offset_pixels` is not consulted here.
+    pub fn real_time_scroll_position(&self) -> f64 {
+        self.time_scale.options().right_offset
+    }
+
+    /// Restore the real-time edge at the configured right offset. Headless callers get the
+    /// target state immediately; browser hosts animate through
+    /// [`Self::start_real_time_scroll_animation`] like the reference.
     pub fn scroll_to_real_time(&mut self) {
-        self.time_scale.set_right_offset(0.0);
-        self.invalidate_frame_scene();
+        self.cancel_scroll_animation();
+        self.set_right_offset(self.real_time_scroll_position());
+    }
+
+    /// Animate to the real-time edge (reference `scrollToRealTime` animates over
+    /// `DefaultAnimationDuration`, time-scale.ts:31, 824-848). The host drives
+    /// [`Self::scroll_animation_tick`] from its frame scheduler.
+    pub fn start_real_time_scroll_animation(&mut self, duration_ms: f64, now_ms: f64) {
+        self.start_scroll_animation(self.real_time_scroll_position(), duration_ms, now_ms);
     }
 
     /// Restore the configured default bar spacing and right offset.
@@ -4265,12 +4501,23 @@ impl ChartEngine {
     /// public time-scale API. Returns the parse error for a malformed patch.
     pub fn apply_options(&mut self, patch_json: &str) -> Result<(), serde_json::Error> {
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
+        // Exchange-time keys validate before anything mutates so a rejected schedule never
+        // reaches the options store (and therefore persistence).
+        let exchange_time = Self::parse_exchange_time_patch(&patch)
+            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+        let tick_marks = time_tick_marks_api::parse_time_tick_marks_patch(&patch)
+            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
         self.options.apply(&patch);
         // Re-derive runtime state that isn't read straight from the store each frame.
         self.crosshair_mode = crosshair_mode_from_u8(self.options.get().crosshair.mode);
         self.route_time_scale_patch(&patch);
         self.route_price_scale_patch(&patch);
         self.route_localization_patch(&patch);
+        self.apply_exchange_time_patch(exchange_time);
+        if let Some(marks) = tick_marks {
+            self.set_time_tick_marks(marks)
+                .expect("time tick marks were validated before the options patch applied");
+        }
         self.invalidate_frame_all();
         Ok(())
     }
@@ -4380,6 +4627,9 @@ impl ChartEngine {
         if let Some(stays) = flag("rightBarStaysOnScroll") {
             self.set_right_bar_stays_on_scroll(stays);
         }
+        if let Some(lock) = flag("lockVisibleLogicalRange") {
+            self.set_lock_visible_logical_range(lock);
+        }
         if let Some(shift) = flag("shiftVisibleRangeOnNewBar") {
             self.set_shift_visible_range_on_new_bar(shift);
         }
@@ -4439,6 +4689,7 @@ impl ChartEngine {
                 if let Some(bold) = flag("boldRoundLabels") {
                     scale.set_bold_round_labels(bold);
                 }
+                apply_chart_tick_mark_options(scale, group);
             }
         }
     }
@@ -4483,6 +4734,10 @@ impl ChartEngine {
             "shift_visible_range_on_new_bar": options.shift_visible_range_on_new_bar,
             "allow_shift_visible_range_on_whitespace_replacement": options.allow_shift_visible_range_on_whitespace_replacement,
             "allow_bold_labels": options.allow_bold_labels,
+            "time_zone": self.time_zone_json(),
+            "session_start": self.exchange_time.session_start_seconds(),
+            "lock_visible_logical_range": options.lock_visible_logical_range,
+            "tick_marks": self.time_tick_marks_json(),
         })
         .to_string()
     }
@@ -4656,93 +4911,72 @@ impl ChartEngine {
         if sequence_changed {
             self.invalidate_frame_scene();
         }
+        // Viewport compensation is decided against the scale state before the new points land
+        // (viewport.rs), through the same exact mappings the drawings rebase with below.
+        let viewport_right_offset =
+            self.viewport_right_offset_after_sync(merged_time_mapping.as_ref());
         if let Some(mapping) = self.pending_sequence_mapping.take() {
             self.rebase_drawing_logicals_sequence(&mapping);
         } else if let Some(mapping) = merged_time_mapping.as_ref() {
             self.rebase_drawing_logicals(mapping);
         }
-        // Port of reference `ChartModel.updateTimeScale` (chart-model.ts:953-984): decide the
-        // right-offset compensation BEFORE the new points/base index land on the scale.
-        let old_first_time = self.synced_first_time;
-        let new_first_time = self.data.merged_times().first().copied();
-        let current_base_index = self.time_scale.base_index();
-        let visible_bars = self.time_scale.visible_strict_range();
-        let new_base_index = self.data.base_index();
-        // the reference's `replacedExistingWhitespace` (firstChangedPointIndex === undefined): the time
-        // scale points did not change, so a base-index move comes from a real bar replacing a
-        // whitespace point (or a same-length data swap) rather than from new points.
-        let points_unchanged =
-            self.data.time_points_generation() == self.synced_time_points_generation;
-        let replaced_existing_whitespace = points_unchanged;
-
-        if let (Some(visible_bars), Some(old_first), Some(new_first)) =
-            (visible_bars, old_first_time, new_first_time)
-        {
-            let is_last_series_bar_visible = visible_bars.contains(current_base_index);
-            let is_left_bar_shift_to_left = old_first > new_first;
-            let is_series_points_added =
-                new_base_index.is_some_and(|new_base| new_base > current_base_index);
-            let is_series_points_added_to_right =
-                is_series_points_added && !is_left_bar_shift_to_left;
-
-            let allow_shift_when_replacing_whitespace = self
-                .time_scale
-                .options()
-                .allow_shift_visible_range_on_whitespace_replacement;
-            let need_shift_visible_range_on_new_bar = is_last_series_bar_visible
-                && (!replaced_existing_whitespace || allow_shift_when_replacing_whitespace)
-                && self.time_scale.options().shift_visible_range_on_new_bar;
-            if is_series_points_added_to_right && !need_shift_visible_range_on_new_bar {
-                if let Some(new_base_index) = new_base_index {
-                    let compensation_shift = new_base_index - current_base_index;
-                    self.time_scale.set_right_offset(
-                        self.time_scale.right_offset() - compensation_shift as f64,
-                    );
-                }
-            }
-        }
-
+        self.sync_drawing_time_identity(sequence_changed);
+        // Non-time footprint axes label ticks by full-resolution bar open times. Read them in
+        // place; only a full weight rebuild materializes the column, so a live tip stays O(1).
+        let sequence = self.sequence_points.as_deref();
         let times = self.data.merged_times();
-        let sequence_tick_times = self.sequence_points().map(|points| {
-            points
-                .iter()
-                .map(|point| point.open_timestamp_micros.div_euclid(1_000_000))
-                .collect::<Vec<_>>()
-        });
-        let tick_times = sequence_tick_times.as_deref().unwrap_or(times);
+        let tick_len = sequence.map_or(times.len(), <[BarSequencePoint]>::len);
+        let tick_time = |index: usize| {
+            sequence.map_or_else(
+                || times[index],
+                |points| points[index].open_timestamp_micros.div_euclid(1_000_000),
+            )
+        };
         let time_points_changed =
             self.data.time_points_generation() != self.synced_time_points_generation;
+        // Only a pure tail append may extend the weights incrementally. Any union rebuild in this
+        // transaction (a retention trim, a history insert, a replacement) records a mapping, and
+        // the surviving weights then no longer line up with their indices.
         let appended = time_points_changed
-            && tick_times.len() > self.synced_points_len
+            && merged_time_mapping.is_none()
+            && tick_len > self.synced_points_len
             && self.synced_points_len > 0
             && self.synced_last_time.is_some_and(|last| {
-                tick_times
-                    .get(self.synced_points_len)
-                    .is_some_and(|&time| time > last)
+                let time = tick_time(self.synced_points_len);
+                // Several non-time bars may open within one second.
+                time > last || (sequence.is_some() && time == last)
             });
         if appended {
-            for index in self.synced_points_len..tick_times.len() {
-                let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time(
-                    tick_times[index],
-                    tick_times[index - 1],
+            for index in self.synced_points_len..tick_len {
+                let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time_in(
+                    tick_time(index),
+                    tick_time(index - 1),
+                    &self.exchange_time,
                 ) as u8;
                 self.tick_marks.push_weight(index as i64, weight);
             }
         } else if time_points_changed {
-            let mut weights = vec![0u8; tick_times.len()];
-            aeris_charts_core::scale::time_tick_marks::fill_weights_for_points(
-                tick_times,
+            let tick_times = (0..tick_len).map(tick_time).collect::<Vec<_>>();
+            let mut weights = vec![0u8; tick_len];
+            aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_in(
+                &tick_times,
                 &mut weights,
                 0,
+                &self.exchange_time,
             );
             self.tick_marks.set_weights(&weights);
         }
-        self.synced_points_len = tick_times.len();
+        self.synced_points_len = tick_len;
         self.synced_time_points_generation = self.data.time_points_generation();
-        self.synced_last_time = tick_times.last().copied();
-        self.synced_first_time = tick_times.first().copied();
-        self.time_scale.set_points_len(tick_times.len());
-        self.time_scale.set_base_index(self.data.base_index());
+        self.synced_last_time = tick_len.checked_sub(1).map(tick_time);
+        let points_len = tick_len;
+        // Data-layer units (chart-local row keys on a non-time sequence axis), matching the
+        // unit of the compensation fallback's first-time comparison.
+        self.synced_first_time = self.data.merged_times().first().copied();
+        let rebase =
+            self.time_scale
+                .sync_points(points_len, self.data.base_index(), viewport_right_offset);
+        self.rebase_view_motion(rebase);
         if merged_time_mapping.is_some() {
             self.refresh_drawing_pixel_baselines();
             self.drawing_baselines_need_frame_refresh = true;
@@ -4760,13 +4994,22 @@ impl ChartEngine {
             .map(|point| point.open_timestamp_micros.div_euclid(1_000_000))
             .collect::<Vec<_>>();
         let mut weights = vec![0u8; times.len()];
-        aeris_charts_core::scale::time_tick_marks::fill_weights_for_points(&times, &mut weights, 0);
+        aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_in(
+            &times,
+            &mut weights,
+            0,
+            &self.exchange_time,
+        );
         self.tick_marks.set_weights(&weights);
         self.synced_points_len = times.len();
         self.synced_last_time = times.last().copied();
-        self.synced_first_time = times.first().copied();
-        self.time_scale.set_points_len(times.len());
-        self.time_scale.set_base_index(self.data.base_index());
+        // Keep the data-layer row-key unit; open seconds here made every later sync look like
+        // a history prepend and disabled compensation on the sequence axis.
+        self.synced_first_time = self.data.merged_times().first().copied();
+        let rebase = self
+            .time_scale
+            .sync_points(times.len(), self.data.base_index(), None);
+        self.rebase_view_motion(rebase);
     }
 
     fn clear_sequence_axis_if_unused(&mut self) {

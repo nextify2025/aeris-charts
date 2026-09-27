@@ -213,11 +213,13 @@ impl ChartEngine {
     }
 
     /// Apply a per-series `priceFormat` JSON patch (reference `series.applyOptions({ priceFormat })`):
-    /// `{"type":"price"|"volume"|"percent"|"custom", "precision"?, "min_move"?}` (`minMove`
-    /// accepted as an alias). Absent keys keep their current values (reference merge semantics).
-    /// Switching to a non-custom type clears any installed custom formatter fn;
-    /// `{type:"custom"}` keeps the installed fn. Returns false for a malformed patch, an
-    /// unknown type, or an unknown/removed id.
+    /// `{"type":"price"|"volume"|"percent"|"custom", "precision"?, "min_move"?, "tick_ladder"?}`
+    /// (`minMove` accepted as an alias). Absent keys keep their current values (reference merge
+    /// semantics), except that a built-in type naming `min_move` without `precision` derives the
+    /// precision from it (reference `precisionByMinMove`). `tick_ladder` is an ascending array of
+    /// `{from, min_move, precision?}` price bands (`null` clears it). Switching to a non-custom
+    /// type clears any installed custom formatter fn; `{type:"custom"}` keeps the installed fn.
+    /// Returns false for a malformed patch or ladder, an unknown type, or an unknown/removed id.
     pub fn series_apply_price_format_json(&mut self, id: SeriesId, json: &str) -> bool {
         let Ok(serde_json::Value::Object(patch)) = serde_json::from_str::<serde_json::Value>(json)
         else {
@@ -236,7 +238,18 @@ impl ChartEngine {
             "custom" => PriceFormatKind::Custom,
             _ => return false,
         };
-        if let Some(precision) = patch.get("precision").and_then(serde_json::Value::as_u64) {
+        // `tick_ladder`: `[{from, min_move, precision?}, ...]` price bands, or `null` to clear.
+        // Validated before any field changes so a malformed ladder leaves the format intact.
+        let tick_ladder = match patch.get("tick_ladder") {
+            None => None,
+            Some(serde_json::Value::Null) => Some(None),
+            Some(value) => match parse_tick_ladder(value) {
+                Some(ladder) => Some(Some(ladder)),
+                None => return false,
+            },
+        };
+        let precision = patch.get("precision").and_then(serde_json::Value::as_u64);
+        if let Some(precision) = precision {
             // 10^precision is computed at format time; clamp to the exact f64 integer range.
             s.price_format.precision = precision.min(15) as u32;
         }
@@ -247,7 +260,17 @@ impl ChartEngine {
         {
             if min_move.is_finite() && min_move > 0.0 {
                 s.price_format.min_move = min_move;
+                // reference `precisionByMinMove` (chart-api.ts `patchPriceFormat`): a built-in
+                // format that names `min_move` without `precision` derives its decimals from it,
+                // so `{type:"price", min_move:0.0001}` labels with 4 decimals.
+                if precision.is_none() && kind != PriceFormatKind::Custom {
+                    s.price_format.precision =
+                        aeris_charts_core::format::price_formatter::precision_by_min_move(min_move);
+                }
             }
+        }
+        if let Some(tick_ladder) = tick_ladder {
+            s.price_format.tick_ladder = tick_ladder;
         }
         s.price_format.kind = kind;
         if kind != PriceFormatKind::Custom {
@@ -297,11 +320,27 @@ impl ChartEngine {
         // reference PriceFormat wire form; a custom format's fn is not serializable (reference `options()`
         // returns it, but the JSON boundary carries only the declarative keys).
         let price_format = match s.price_format.kind {
-            PriceFormatKind::Price => serde_json::json!({
-                "type": "price",
-                "precision": s.price_format.precision,
-                "min_move": s.price_format.min_move,
-            }),
+            PriceFormatKind::Price => {
+                let mut format = serde_json::json!({
+                    "type": "price",
+                    "precision": s.price_format.precision,
+                    "min_move": s.price_format.min_move,
+                });
+                if let Some(ladder) = &s.price_format.tick_ladder {
+                    format["tick_ladder"] = ladder
+                        .bands()
+                        .iter()
+                        .map(|band| {
+                            serde_json::json!({
+                                "from": band.from,
+                                "min_move": band.min_move,
+                                "precision": band.precision,
+                            })
+                        })
+                        .collect();
+                }
+                format
+            }
             // the reference's `PriceFormatVolume` is exactly `{type: "volume"}` — precision is an accepted
             // apply-time superset (drives the volume formatter) but is not serialized back.
             PriceFormatKind::Volume => serde_json::json!({
@@ -348,6 +387,10 @@ impl ChartEngine {
         insert("area_bottom_color", verbatim(&s.area_bottom_color).into());
         insert("invert_filled_area", s.invert_filled_area.into());
         insert("histogram_updown", s.histogram_updown.into());
+        insert(
+            "histogram_updown_rule",
+            s.histogram_updown_rule.as_str().into(),
+        );
         insert("base", s.base.into());
         insert(
             "baseline_value",
@@ -672,6 +715,16 @@ impl ChartEngine {
                         s.heikin_ashi = v;
                     }
                 }
+                "histogram_updown" => {
+                    if let Some(v) = value.as_bool() {
+                        s.histogram_updown = v;
+                    }
+                }
+                "histogram_updown_rule" => {
+                    if let Some(rule) = value.as_str().and_then(crate::HistogramUpDownRule::parse) {
+                        s.histogram_updown_rule = rule;
+                    }
+                }
                 // Unknown keys are ignored gracefully (reference applyOptions merge semantics).
                 _ => {}
             }
@@ -849,4 +902,54 @@ impl ChartEngine {
             to: times.map(|times| times.1),
         })
     }
+
+    /// reference series option `autoscaleInfoProvider`: install (or clear with `None`) a callback
+    /// that REPLACES this series' autoscale contribution. It runs during every autoscale pass with
+    /// the series' own info for the visible bars (data plus primitives and marker margins; `None`
+    /// when the series has no data) and returns the range and margins to use instead (`None`
+    /// removes the series from autoscale). Returns false for an unknown/removed id.
+    pub fn set_series_autoscale_info_provider(
+        &mut self,
+        id: SeriesId,
+        provider: Option<AutoscaleInfoProviderFn>,
+    ) -> bool {
+        let Some(series) = self.series.iter_mut().find(|s| s.id == id && !s.removed) else {
+            return false;
+        };
+        series.autoscale_info_provider = provider;
+        self.invalidate_frame_scene();
+        true
+    }
+
+    /// Whether a series currently has an autoscale info provider installed.
+    pub fn series_has_autoscale_info_provider(&self, id: SeriesId) -> bool {
+        self.series_entry(id)
+            .is_some_and(|series| series.autoscale_info_provider.is_some())
+    }
+}
+
+/// Parse a `tick_ladder` JSON array (`[{from, min_move, precision?}, ...]`, `minMove` accepted as
+/// an alias). `None` for any malformed band or a ladder [`PriceTickLadder::new`] rejects.
+fn parse_tick_ladder(value: &serde_json::Value) -> Option<PriceTickLadder> {
+    let bands = value.as_array()?;
+    if bands.len() > MAX_PRICE_TICK_BANDS {
+        return None;
+    }
+    let bands = bands
+        .iter()
+        .map(|band| {
+            let band = band.as_object()?;
+            let from = band.get("from")?.as_f64()?;
+            let min_move = band
+                .get("min_move")
+                .or_else(|| band.get("minMove"))?
+                .as_f64()?;
+            let mut parsed = PriceTickBand::new(from, min_move);
+            if let Some(precision) = band.get("precision").filter(|value| !value.is_null()) {
+                parsed.precision = u32::try_from(precision.as_u64()?).ok()?;
+            }
+            Some(parsed)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    PriceTickLadder::new(bands).ok()
 }

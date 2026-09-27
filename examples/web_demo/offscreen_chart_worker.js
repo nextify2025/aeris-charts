@@ -46,7 +46,10 @@ self.onmessage = async (event) => {
         width: message.width,
         height: message.height,
         dpr: message.dpr,
-        options: { backend: message.backend },
+        options: {
+          backend: message.backend,
+          ...(message.time_scale ? { timeScale: message.time_scale } : {}),
+        },
         force_fallback_adapter: message.force_fallback_adapter,
       });
       chart.set_data_typed(columns(message.bars ?? 5_000));
@@ -87,6 +90,47 @@ self.onmessage = async (event) => {
         type: "timestamp_diagnostics",
         diagnostics: chart.last_ingestion_diagnostics(),
       });
+      return;
+    } else if (message.type === "time_zone") {
+      // Declarative exchange time zone: IANA resolution runs inside the worker.
+      try {
+        if (message.options) chart.apply_options(message.options);
+      } catch (error) {
+        postMessage({ type: "time_zone_error", code: error.code, message: error.message });
+        return;
+      }
+      const options = JSON.parse(chart.wasm.time_scale_options_json());
+      postMessage({
+        type: "time_zone",
+        time_zone: options.time_zone,
+        session_start: options.session_start,
+        tick_marks: options.tick_marks,
+        local: chart.wasm.exchange_local_seconds(message.probe),
+      });
+      // One reply per request: a trailing state message would race the reply in `send`.
+      return;
+    } else if (message.type === "sequenced_stream") {
+      // Worker-side streaming: the sequence guard on typed updates and typed partial merges.
+      const last = 1_577_836_800 + ((message.bars ?? 5_000) - 1) * 60;
+      const row = (time, value) => ({
+        times: new Float64Array([time]),
+        open: new Float64Array([value]),
+        high: new Float64Array([value]),
+        low: new Float64Array([value]),
+        close: new Float64Array([value]),
+      });
+      const results = {};
+      chart.update_typed(row(last, 101), 0, { sequence: 3 });
+      results.applied = chart.last_ingestion_diagnostics();
+      chart.update_typed(row(last, 102), 0, { sequence: 3 });
+      results.stale = chart.last_ingestion_diagnostics();
+      chart.merge_typed({ times: new Float64Array([last + 60]), close: new Float64Array([99]) }, 0, { sequence: 4 });
+      results.merged = chart.last_ingestion_diagnostics();
+      chart.merge_typed({ times: new Float64Array([last + 60]), close: new Float64Array([98]) }, 0, { sequence: 4 });
+      results.merge_stale = chart.last_ingestion_diagnostics();
+      chart.merge_typed({ times: new Float64Array([last + 60]) }, 0);
+      results.empty = chart.last_ingestion_diagnostics();
+      postMessage({ type: "sequenced_stream", results });
       return;
     } else if (message.type === "remove") {
       if (timer !== null) clearInterval(timer);

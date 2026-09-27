@@ -353,6 +353,7 @@ impl ChartEngine {
             .find(|series| series.pane_index == pane_index && series_scale_target(series) == target)
     }
 
+    #[cfg(test)]
     pub(crate) fn scale_tick_base(&self, pane_index: usize, target: PriceScaleTarget) -> i64 {
         let Some(scale) = self.price_scale_for(pane_index, target) else {
             return 100;
@@ -365,6 +366,37 @@ impl ChartEngine {
         }
         self.scale_formatter_source(pane_index, target)
             .map_or(100, |series| series.price_format.base())
+    }
+
+    /// One scale's tick marks on its price grid; the axis labels, the horizontal grid, and axis
+    /// width negotiation all share this set. The grid is the formatter source's minimum move,
+    /// or, with a tick-size ladder, the LCM of the band ticks over each price interval the
+    /// builder spans (per mark on a log scale, so lower bands keep their finer grid).
+    /// Percentage and indexed-to-100 scales use the reference's fixed base-100 grid (`0.01`).
+    pub(crate) fn scale_tick_marks(
+        &self,
+        pane_index: usize,
+        target: PriceScaleTarget,
+        entire_text_only_margin: f64,
+    ) -> Vec<aeris_charts_core::scale::price_scale_core::PriceMark> {
+        const DEFAULT_MIN_MOVE: f64 = 0.01;
+        let Some(scale) = self.price_scale_for(pane_index, target) else {
+            return Vec::new();
+        };
+        let format = (!matches!(
+            scale.mode(),
+            PriceScaleMode::Percentage | PriceScaleMode::IndexedTo100
+        ))
+        .then(|| self.scale_formatter_source(pane_index, target))
+        .flatten()
+        .map(|series| &series.price_format);
+        match format {
+            Some(format) => scale.build_tick_marks_on_grid(
+                |low, high| format.tick_grid(low, high),
+                entire_text_only_margin,
+            ),
+            None => scale.build_tick_marks(DEFAULT_MIN_MOVE, entire_text_only_margin),
+        }
     }
 
     pub(crate) fn scale_autoscale_min_move(
@@ -390,6 +422,9 @@ impl ChartEngine {
             // Percentage mode has its own formatter; the host price formatter does not apply here
             // (matching reference, where percentage display is independent of `priceFormatter`).
             return PercentageFormatter::default().format(value);
+        }
+        if scale.mode() == PriceScaleMode::IndexedTo100 {
+            return Self::format_indexed_value(value);
         }
         if let Some(f) = &self.price_formatter_fn {
             if let Some(s) = f(value) {
@@ -423,7 +458,11 @@ impl ChartEngine {
                 PercentageFormatter::with_price_scale(10i64.pow(format.precision)).format(value),
             ),
             PriceFormatKind::Price => {
-                if format.is_reference_default() {
+                if let Some(ladder) = format.active_tick_ladder() {
+                    // Each price rounds to its own band tick and prints with that band's
+                    // precision.
+                    Some(ladder.format(value))
+                } else if format.is_reference_default() {
                     None
                 } else {
                     Some(
@@ -433,6 +472,13 @@ impl ChartEngine {
                 }
             }
         }
+    }
+
+    /// reference IndexedTo100 labels: a fixed `PriceFormatter(100, 1)` (price-scale.ts
+    /// `updateFormatter`) for ticks, crosshair, last-value, and price-line labels alike —
+    /// independent of the series format and the localization price formatter.
+    fn format_indexed_value(value: f64) -> String {
+        PriceFormatter::new(100, 1.0).format(value)
     }
 
     /// A series' OWN format drives its last-value label, its price-line labels, and the
@@ -448,6 +494,25 @@ impl ChartEngine {
         if scale.mode() == PriceScaleMode::Percentage {
             return PercentageFormatter::default().format(value);
         }
+        if scale.mode() == PriceScaleMode::IndexedTo100 {
+            return Self::format_indexed_value(value);
+        }
+        if let Some(f) = &self.price_formatter_fn {
+            if let Some(s) = f(value) {
+                return s;
+            }
+        }
+        self.format_with_price_format(&series.price_format, value)
+            .unwrap_or_else(|| self.price_formatter.format(value))
+    }
+
+    /// A series value outside any scale context (tooltips): the host `priceFormatter`, then
+    /// the series' own price format, then the chart's built-in price formatter.
+    pub(crate) fn format_series_plain_value(
+        &self,
+        series: &crate::SeriesEntry,
+        value: f64,
+    ) -> String {
         if let Some(f) = &self.price_formatter_fn {
             if let Some(s) = f(value) {
                 return s;
@@ -472,6 +537,9 @@ impl ChartEngine {
         if scale.mode() == PriceScaleMode::Percentage {
             return PercentageFormatter::default().format(value);
         }
+        if scale.mode() == PriceScaleMode::IndexedTo100 {
+            return Self::format_indexed_value(value);
+        }
         let primary = self.scale_formatter_source(pane_index, target);
         if let Some(series) = primary {
             if let Some(s) = self.format_with_price_format(&series.price_format, value) {
@@ -483,20 +551,25 @@ impl ChartEngine {
 
     /// Crosshair time label, honoring a host `timeFormatter` when installed. Otherwise the
     /// engine's `localization.dateFormat` pattern with the locale month-name table (reference
-    /// chart-options-defaults.ts:34-37).
+    /// chart-options-defaults.ts:34-37), in exchange wall-clock time.
     pub(super) fn format_crosshair_ts(&self, ts: i64) -> String {
-        if let Some(f) = &self.time_formatter_fn {
-            if let Some(s) = f(ts) {
-                return s;
-            }
+        if let Some(s) = self.host_time_label(ts) {
+            return s;
         }
-        format_crosshair_time_with(
+        format_crosshair_time_in(
             ts,
             self.time_visible,
             self.seconds_visible,
             &self.date_format,
             &self.month_names,
+            &self.exchange_time,
         )
+    }
+
+    /// The host `timeFormatter` text for a timestamp, when one is installed and answers. Every
+    /// engine surface that prints a point in time consults this first.
+    pub(crate) fn host_time_label(&self, ts: i64) -> Option<String> {
+        self.time_formatter_fn.as_ref().and_then(|f| f(ts))
     }
 
     /// Aeris extension: bold round-figure price tick labels (the public reference decile rule). Uniform
@@ -529,6 +602,25 @@ impl ChartEngine {
                     }
                 }
             })
+            .collect()
+    }
+
+    /// Bold decisions for built tick marks. Boundary marks from `ensure_edge_tick_marks_visible`
+    /// sit off the uniform span: they are never bold and never break the regular marks' uniform
+    /// step detection.
+    fn bold_round_mark_decisions(
+        marks: &[aeris_charts_core::scale::price_scale_core::PriceMark],
+        enabled: bool,
+    ) -> Vec<bool> {
+        let regular: Vec<f64> = marks
+            .iter()
+            .filter(|mark| !mark.edge)
+            .map(|mark| mark.logical)
+            .collect();
+        let mut regular_bold = Self::bold_round_decisions(&regular, enabled).into_iter();
+        marks
+            .iter()
+            .map(|mark| !mark.edge && regular_bold.next().unwrap_or(false))
             .collect()
     }
 
@@ -616,11 +708,9 @@ impl ChartEngine {
                 };
                 let text_color = scale_text_color(scale);
                 let ticks_visible = scale.options().ticks_visible;
-                let marks = scale.build_tick_marks(self.scale_tick_base(pi, target), entire_margin);
-                let bold_round = Self::bold_round_decisions(
-                    &marks.iter().map(|m| m.logical).collect::<Vec<_>>(),
-                    scale.options().bold_round_labels,
-                );
+                let marks = self.scale_tick_marks(pi, target, entire_margin);
+                let bold_round =
+                    Self::bold_round_mark_decisions(&marks, scale.options().bold_round_labels);
                 for (mark, bold) in marks.iter().zip(bold_round) {
                     let y = mark.coord;
                     // A tick coordinate is the glyph center, not its visible bounds. Every pane
@@ -692,7 +782,13 @@ impl ChartEngine {
                 }
             }
         }
-        if let Some((from, to)) = visible {
+        let explicit_marks = self.resolved_time_tick_marks();
+        if let (Some(range), Some(explicit)) = (visible, explicit_marks.as_deref()) {
+            if self.time_axis_visible {
+                self.append_explicit_time_labels(&mut out, explicit, range, &measure);
+            }
+            self.append_native_vertical_line_labels(&mut out.labels, &measure);
+        } else if let Some((from, to)) = visible {
             let time_marks = self.time_marks(max_label_width);
             let maximum_weight = time_marks
                 .iter()
@@ -722,8 +818,9 @@ impl ChartEngine {
                     .as_ref()
                     .and_then(|formatter| formatter(ts, kind as u8));
                 let built_in = custom_text.is_none();
-                let text = custom_text
-                    .unwrap_or_else(|| format_tick_label_with(ts, kind, &self.month_names));
+                let text = custom_text.unwrap_or_else(|| {
+                    format_tick_label_in(ts, kind, &self.month_names, &self.exchange_time)
+                });
                 if kind == TickMarkType::Year
                     && built_in
                     && text.chars().count() > self.tick_mark_max_character_length as usize
@@ -1000,14 +1097,25 @@ impl ChartEngine {
                 if x < 0.0 || x > self.pane_w {
                     continue;
                 }
-                let logical = point.logical.round() as i64;
-                let Some(time) = usize::try_from(logical)
+                let logical = point.logical.round();
+                // Anchors beyond the data show their extrapolated anchor time.
+                let Some(time) = usize::try_from(logical as i64)
                     .ok()
                     .and_then(|index| self.axis_time_key_at(index))
+                    .or_else(|| {
+                        self.anchor_time_at_logical(logical)
+                            .map(|time| time.floor() as i64)
+                    })
                 else {
                     continue;
                 };
-                let text = format_date_pattern(time, "M/d/yyyy", &self.month_names);
+                let text = self.host_time_label(time).unwrap_or_else(|| {
+                    format_date_pattern(
+                        self.exchange_time.local_seconds(time),
+                        "M/d/yyyy",
+                        &self.month_names,
+                    )
+                });
                 let width = AxisMetrics::time_tag_width(measure(&text, false));
                 let height = metrics.time_strip_height();
                 let chart_x = self.pane_left + x;
@@ -1355,11 +1463,8 @@ impl ChartEngine {
         let Some(scale) = pane.scale(target) else {
             return 0.0;
         };
-        let marks = scale.build_tick_marks(self.scale_tick_base(pane_index, target), 0.0);
-        let bold_round = Self::bold_round_decisions(
-            &marks.iter().map(|m| m.logical).collect::<Vec<_>>(),
-            scale.options().bold_round_labels,
-        );
+        let marks = self.scale_tick_marks(pane_index, target, 0.0);
+        let bold_round = Self::bold_round_mark_decisions(&marks, scale.options().bold_round_labels);
         let mut text_width = marks
             .iter()
             .zip(bold_round)
@@ -2358,34 +2463,47 @@ impl ChartEngine {
     }
 
     /// The series' candle-close countdown text (industry-standard `countdown_visible`): the time
-    /// until the inferred next bar close. After a quiet interval with no new point, the deadline
-    /// continues from the last point's interval grid instead of freezing at zero until data
-    /// resumes. The interval is the median of the last up-to-10
-    /// inter-bar deltas of the series' own bar times (fallback: the last delta). `None` (the row
-    /// hides) with fewer than two bars or no installed host clock (`now_override`).
+    /// until the forming bar closes. The interval is the median of the last up-to-10 inter-bar
+    /// deltas of the series' own bar times (fallback: the last delta). The countdown shows only
+    /// while the host clock is inside the last bar's interval `[last_bar_time, last_bar_time +
+    /// interval)`; outside it — a lunch break, overnight, a weekend, or after an early close —
+    /// the row hides instead of cycling through intervals the market never trades. Calendar-date
+    /// bars form during their exchange trading day(s), or through the end of their calendar
+    /// month(s) for monthly and longer bars. `None` (the row hides) with fewer than two bars or no
+    /// installed host clock (`now_override`).
     fn series_countdown_remaining_at(&self, id: SeriesId, now: f64) -> Option<f64> {
         if self.sequence_points().is_some() {
             return None;
         }
         let plot = self.data.plot(id);
-        // Only the tail (up to 11 bars → 10 deltas) feeds the inference.
+        // The forming bar is the last traded row: hosts may pre-fill the rest of a session with
+        // whitespace slots, and an all-whitespace series has no forming bar yet.
+        let anchor = plot.last_non_whitespace_row_before(plot.size())?;
+        // Up to 11 slots around it (→ 10 deltas) feed the interval inference. Whitespace slots
+        // count, so the first traded bar of a pre-filled session still has a neighbour.
         let times = self.data.merged_times();
-        let tail_times: Vec<i64> = (plot.size().saturating_sub(11)..plot.size())
-            .filter_map(|row| plot.index_at(row))
-            .filter_map(|index| times.get(index as usize).copied())
+        let time_at = |row: usize| {
+            plot.index_at(row)
+                .and_then(|index| times.get(index as usize).copied())
+        };
+        let window_end = (anchor + 1).min(plot.size() - 1);
+        let tail_times: Vec<i64> = (window_end.saturating_sub(10)..=window_end)
+            .filter_map(time_at)
             .collect();
         let interval = median_bar_interval(&tail_times)?;
-        let last_time = *tail_times.last()?;
-        let elapsed = now - last_time as f64;
-        if elapsed < interval {
-            return Some((interval - elapsed).max(0.0));
-        }
-        let phase = elapsed.rem_euclid(interval);
-        Some(if phase == 0.0 {
-            interval
+        let last_time = time_at(anchor)?;
+        let (start, end) = if self.exchange_time.calendar_dates() {
+            let (start, end) = self
+                .exchange_time
+                .calendar_bar_window_utc(last_time.div_euclid(86_400), interval);
+            (start as f64, end as f64)
         } else {
-            interval - phase
-        })
+            (last_time as f64, last_time as f64 + interval)
+        };
+        if now < start || now >= end {
+            return None;
+        }
+        Some(end - now)
     }
 
     pub(crate) fn series_countdown_layout_key_at(

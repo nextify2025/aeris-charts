@@ -60,8 +60,10 @@ and visible-range lookup, so several bars in one second are never assigned false
 The chart retires the sidecar when its last non-time footprint and dependent are removed, so a
 later time-only series cannot inherit stale logical labels.
 Non-time tip updates replace only the affected suffix and keep derived delta studies on the same
-logical row keys; capped series use the full path when retention can shift the prefix. Trade bubbles
-also use logical bar indices while their aggregation windows retain microsecond comparison precision.
+logical row keys, including capped series: retention drops row keys from the front without re-keying,
+so later tips, studies, and bubble markers continue from the projection's first retained key. Trade
+bubbles also use logical bar indices while their aggregation windows retain microsecond comparison
+precision.
 Chart value snapshots and series queries expose the corresponding UTC-second label instead of the
 internal row key.
 Incremental replay and release performance evidence remain part of the B5 performance exit.
@@ -148,7 +150,9 @@ One chart-level stream owns one canonical trade tape and one derived bar vector.
 owns only visual options and a stream handle; CVD, delta, and bubble dependents own no provider tape.
 A bar owns sorted price levels;
 there is no renderer-side cluster cache. Tip append mutates only the active bar or appends one bar,
-updates its canonical scale projection, and invalidates that series. Closed bars are immutable on the
+updates its canonical scale projection, and invalidates that series. CVD/delta studies recompute only
+that suffix from a cached running fold, and bubble markers fold only the appended trades (no work
+without bubble dependents); `trade_stream_stats` reports both as work counters. Closed bars are immutable on the
 live path. Historical insertion/correction reconstructs canonical state once after the final tape is
 known and replaces the projection once. The current reconstruction is intentionally full-series;
 work statistics expose that cost so suffix checkpoints can be added when measurements justify them.

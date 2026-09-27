@@ -398,20 +398,31 @@ impl ChartInner {
         let value: serde_json::Value =
             serde_json::from_str(options_json).unwrap_or(serde_json::Value::Null);
         let defaults = SessionHighlightingOptions::default();
-        let start = value
-            .get("start_hour_utc")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|hour| u8::try_from(hour).ok());
-        let end = value
-            .get("end_hour_utc")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|hour| u8::try_from(hour).ok());
+        // Fractional exchange-local hours; `*_hour_utc` remain accepted aliases (they equal the
+        // exchange hours on the default UTC chart). A malformed hour rejects the attachment
+        // rather than silently disabling the gate.
+        let hour = |key: &str, legacy: &str| -> Result<Option<f64>, ()> {
+            match value.get(key).or_else(|| value.get(legacy)) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(hour) => hour
+                    .as_f64()
+                    .filter(|hour| hour.is_finite())
+                    .map(Some)
+                    .ok_or(()),
+            }
+        };
+        let (Ok(start), Ok(end)) = (
+            hour("start_hour", "start_hour_utc"),
+            hour("end_hour", "end_hour_utc"),
+        ) else {
+            return 0;
+        };
         self.engine
             .add_session_highlighting(
                 series_id,
                 SessionHighlightingOptions {
-                    start_hour_utc: start,
-                    end_hour_utc: end,
+                    start_hour: start,
+                    end_hour: end,
                     weekday_color: json_color(&value, "weekday_color", defaults.weekday_color),
                     weekend_color: json_color(&value, "weekend_color", defaults.weekend_color),
                 },
@@ -427,6 +438,17 @@ impl ChartInner {
         parse_session_highlights(highlights_json).is_some_and(|highlights| {
             self.engine
                 .set_session_highlighting_data(primitive_id, highlights)
+        })
+    }
+
+    pub(super) fn upsert_native_session_highlighting_data(
+        &mut self,
+        primitive_id: u32,
+        highlights_json: &str,
+    ) -> bool {
+        parse_session_highlights(highlights_json).is_some_and(|highlights| {
+            self.engine
+                .upsert_session_highlighting_data(primitive_id, highlights)
         })
     }
 

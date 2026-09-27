@@ -296,6 +296,9 @@ pub struct DataLayer {
     /// Inclusive whole-second visibility boundary supplied by the chart replay clock. Canonical
     /// rows remain retained; merged indices and public/derived views expose only this prefix.
     time_cutoff: Option<i64>,
+    /// Lifetime count of whole-layer union merges plus reindex passes. Work telemetry for tests
+    /// that prove a historical value correction stays local.
+    index_rebuilds: u64,
 }
 
 /// Piecewise-linear old-to-new logical-index mapping through timestamps present in both unions.
@@ -304,11 +307,24 @@ pub struct DataLayer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergedTimeMapping {
     common_indices: Vec<(usize, usize)>,
+    /// Old logical indices of the first and last common timestamp, retained even when the
+    /// breakpoints collapse to identity. `None` means the unions share no timestamp.
+    common_old_extent: Option<(usize, usize)>,
+    /// Whether at least two common timestamps exist and every one keeps the same index offset
+    /// (a same-resolution prepend, trim, or window shift rather than an interval change).
+    translation: bool,
+    /// The old merged union, moved out of the data layer so time-identity consumers can derive
+    /// anchor times on the axis the logical indices referred to. Empty for mappings built
+    /// directly from slices.
+    old_times: Vec<i64>,
 }
 
 impl MergedTimeMapping {
     fn between(old: &[i64], new: &[i64]) -> Self {
         let mut common_indices = Vec::new();
+        let mut first_common: Option<(usize, usize)> = None;
+        let mut last_common: Option<(usize, usize)> = None;
+        let mut offsets_equal = true;
         let (mut old_index, mut new_index) = (0, 0);
         while old_index < old.len() && new_index < new.len() {
             match old[old_index].cmp(&new[new_index]) {
@@ -316,6 +332,10 @@ impl MergedTimeMapping {
                 std::cmp::Ordering::Greater => new_index += 1,
                 std::cmp::Ordering::Equal => {
                     let current = (old_index, new_index);
+                    let first = *first_common.get_or_insert(current);
+                    offsets_equal &=
+                        new_index as i128 - old_index as i128 == first.1 as i128 - first.0 as i128;
+                    last_common = Some(current);
                     if common_indices.len() >= 2 {
                         let a: (usize, usize) = common_indices[common_indices.len() - 2];
                         let b: (usize, usize) = common_indices[common_indices.len() - 1];
@@ -343,7 +363,35 @@ impl MergedTimeMapping {
         {
             common_indices.clear();
         }
-        Self { common_indices }
+        let common_old_extent = first_common.zip(last_common).map(|(a, b)| (a.0, b.0));
+        Self {
+            common_indices,
+            common_old_extent,
+            translation: offsets_equal && first_common != last_common,
+            old_times: Vec::new(),
+        }
+    }
+
+    /// Old logical indices of the first and last timestamp present in both unions, or `None`
+    /// when the unions share no timestamp (an interval switch or unrelated reload).
+    pub fn common_old_extent(&self) -> Option<(usize, usize)> {
+        self.common_old_extent
+    }
+
+    /// Whether the mapping is a pure index translation over at least two common timestamps.
+    pub fn is_translation(&self) -> bool {
+        self.translation
+    }
+
+    /// The old merged union the mapped logical indices referred to (empty when unknown).
+    pub fn old_times(&self) -> &[i64] {
+        &self.old_times
+    }
+
+    /// Whether any timestamp survived the transaction, i.e. whether [`Self::map_logical`] is
+    /// anchored on real common points rather than the identity fallback for disjoint unions.
+    pub fn has_common_time(&self) -> bool {
+        self.common_old_extent.is_some()
     }
 
     pub fn map_logical(&self, logical: f64) -> f64 {
@@ -449,7 +497,9 @@ impl DataLayer {
     pub fn take_merged_time_mapping(&mut self) -> Option<MergedTimeMapping> {
         self.capture_merged_time_rebase = false;
         let old = self.merged_time_rebase_source.take()?;
-        Some(MergedTimeMapping::between(&old, &self.merged_times))
+        let mut mapping = MergedTimeMapping::between(&old, &self.merged_times);
+        mapping.old_times = old;
+        Some(mapping)
     }
 
     pub fn add_series(&mut self) -> SeriesId {
@@ -682,6 +732,12 @@ impl DataLayer {
 
     pub fn series_generation(&self, id: SeriesId) -> Option<u64> {
         Some(self.series.get(self.series_slot(id)?)?.generation)
+    }
+
+    /// Lifetime count of timestamp-union merges and plot reindex passes (work telemetry).
+    #[doc(hidden)]
+    pub fn index_rebuilds(&self) -> u64 {
+        self.index_rebuilds
     }
 
     #[doc(hidden)]
@@ -1002,9 +1058,10 @@ impl DataLayer {
 
     /// [`update`] plus the target bar's per-point colors (reference `series.update` with data-item
     /// colors; `None` = no custom color for that channel). The color channels stay aligned
-    /// with the rows in every path: appended rows push, a replaced last bar takes the new
-    /// channels (a plain `update` clears that bar's overrides, matching the reference's whole-bar
-    /// replacement), and a mid-history insert splices.
+    /// with the rows in every path: appended rows push, a replaced bar takes the new channels (a
+    /// plain `update` clears that bar's overrides, matching the reference's whole-bar
+    /// replacement), and a mid-history insert splices. The first explicit color on a series
+    /// without that channel creates it, so the bar is colored exactly as a full install would.
     pub fn update_styled(
         &mut self,
         id: SeriesId,
@@ -1081,11 +1138,7 @@ impl DataLayer {
             let affected = if series_last == Some(time) {
                 let row = s.times.len() - 1;
                 s.values.set_row(row, values);
-                for (channel, color) in s.point_colors.iter_mut().zip(colors) {
-                    if !channel.is_empty() {
-                        channel[row] = color.unwrap_or(POINT_COLOR_ABSENT);
-                    }
-                }
+                set_row_colors(s, row, colors);
                 row
             } else {
                 let row = s.values.len();
@@ -1100,42 +1153,151 @@ impl DataLayer {
             return true;
         }
 
-        // Case 3: insert into the middle of this series (and possibly the merged set) — rebuild.
+        // Case 3a: an in-place correction of an existing historical row (a late N-1/N-2 fix).
+        // No timestamp changes, so the union and every plot mapping stay valid; repair only the
+        // row's LOD path and its autoscale chunk.
         let s = &mut self.series[slot];
         let insert = lower_bound(&s.times, |&t| t < time);
-        let inserted = s.times.get(insert) != Some(&time);
-        if !inserted {
+        if s.times.get(insert) == Some(&time) {
             s.values.set_row(insert, values);
-            for (channel, color) in s.point_colors.iter_mut().zip(colors) {
-                if !channel.is_empty() {
-                    channel[insert] = color.unwrap_or(POINT_COLOR_ABSENT);
-                }
-            }
+            set_row_colors(s, insert, colors);
             if update_lod {
                 s.rebuild_lod_range(insert..insert + 1);
             }
-        } else {
-            s.times.insert(insert, time);
-            s.values.insert(insert, values);
-            for (channel, color) in s.point_colors.iter_mut().zip(colors) {
-                if !channel.is_empty() {
-                    channel.insert(insert, color.unwrap_or(POINT_COLOR_ABSENT));
-                }
-            }
-            if update_lod {
-                s.rebuild_lod();
+            s.plot.invalidate_row(insert);
+            s.generation = s.generation.wrapping_add(1);
+            return true;
+        }
+
+        // Case 3b: a new row inside this series' history. Its rows shift, so it is reindexed; the
+        // union is merged only when the time is genuinely new to the chart.
+        let rows = s.values.len();
+        for (channel, color) in s.point_colors.iter_mut().zip(colors) {
+            if let Some(channel) = color_channel(channel, rows, color) {
+                channel.insert(insert, color.unwrap_or(POINT_COLOR_ABSENT));
             }
         }
+        s.times.insert(insert, time);
+        s.values.insert(insert, values);
+        if update_lod {
+            s.rebuild_lod();
+        }
         s.generation = s.generation.wrapping_add(1);
-        self.rebuild_merged();
-        self.reindex_all();
+        if existing.is_some() {
+            self.reindex_series(slot);
+        } else {
+            self.insert_merged_time(time);
+            self.reindex_all();
+        }
         true
     }
 
-    /// Apply an ascending, unique batch as one logical data-layer mutation. Tail-only input keeps
-    /// the existing O(1)-per-row append/replace path; a historical batch is merged in O(n + k)
-    /// and rebuilds the shared index once instead of once per row. Returns the first affected row
-    /// in the resulting source series.
+    /// Insert one timestamp that no series held before into the union. Equivalent to
+    /// [`Self::rebuild_merged`] for a single new time without re-sorting every series' times.
+    fn insert_merged_time(&mut self, time: i64) {
+        let Err(position) = self.merged_times.binary_search(&time) else {
+            return;
+        };
+        self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
+        if self.capture_merged_time_rebase && self.merged_time_rebase_source.is_none() {
+            self.merged_time_rebase_source = Some(self.merged_times.clone());
+        }
+        self.merged_times.insert(position, time);
+        self.time_points_generation = self.time_points_generation.wrapping_add(1);
+    }
+
+    /// Reindex one owned series (and outputs aliasing its time range) against an unchanged union.
+    fn reindex_series(&mut self, slot: usize) {
+        self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
+        let s = &mut self.series[slot];
+        s.plot.rebuild_from(&self.merged_times, &s.times);
+        let aliases = self
+            .live_slots
+            .values()
+            .filter_map(|&alias| {
+                self.resolved_alias_range(alias)
+                    .filter(|&(source, _, _)| source == slot)
+                    .map(|range| (alias, range))
+            })
+            .collect::<Vec<_>>();
+        for (alias, (source, offset, len)) in aliases {
+            self.copy_plot_range(alias, source, offset, len);
+        }
+    }
+
+    /// Apply an ascending batch whose rows before this series' last bar all correct bars that
+    /// already exist: those rows change in place (no timestamp or plot mapping moves) and the rest
+    /// append or replace the tail through the streaming path. `None` when a row would insert a new
+    /// historical time, which needs the merging path. Batch rows replace whole bars, so their
+    /// colors clear.
+    fn update_rows_without_history_insert(
+        &mut self,
+        id: SeriesId,
+        slot: usize,
+        times: &[i64],
+        values: [&[f64]; 4],
+    ) -> Option<()> {
+        let series = &self.series[slot];
+        let historical = series
+            .times
+            .last()
+            .map_or(0, |&last| times.partition_point(|&time| time < last));
+        let rows = times[..historical]
+            .iter()
+            .map(|time| series.times.binary_search(time).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let s = &mut self.series[slot];
+        for (index, &row) in rows.iter().enumerate() {
+            s.values.set_row(
+                row,
+                [
+                    values[0][index],
+                    values[1][index],
+                    values[2][index],
+                    values[3][index],
+                ],
+            );
+            for channel in &mut s.point_colors {
+                if !channel.is_empty() {
+                    channel[row] = POINT_COLOR_ABSENT;
+                }
+            }
+            s.plot.invalidate_row(row);
+        }
+        if let (Some(&first), Some(&last)) = (rows.first(), rows.last()) {
+            s.rebuild_lod_range(first..last + 1);
+        }
+        s.generation = s.generation.wrapping_add(historical as u64);
+
+        let tail_from = times
+            .get(historical)
+            .map_or(0, |&first| lower_bound(&s.times, |&time| time < first));
+        for row in historical..times.len() {
+            self.update_styled_impl(
+                id,
+                times[row],
+                [
+                    values[0][row],
+                    values[1][row],
+                    values[2][row],
+                    values[3][row],
+                ],
+                [None; POINT_COLOR_CHANNELS],
+                false,
+            );
+        }
+        if historical < times.len() {
+            let series = &mut self.series[slot];
+            series.rebuild_lod_range(tail_from..series.values.len());
+        }
+        Some(())
+    }
+
+    /// Apply an ascending, unique batch as one logical data-layer mutation. Tail rows keep the
+    /// O(1)-per-row append/replace path and rows correcting existing history change in place;
+    /// only a batch inserting new historical times is merged in O(n + k), rebuilding the shared
+    /// index once instead of once per row. Returns the first affected row in the resulting
+    /// source series.
     pub fn update_many(
         &mut self,
         id: SeriesId,
@@ -1159,38 +1321,17 @@ impl DataLayer {
         debug_assert!(values.iter().all(|column| column.len() == times.len()));
 
         let affected = lower_bound(&self.series[slot].times, |&time| time < times[0]);
-        if self.series[slot]
-            .times
-            .last()
-            .is_none_or(|&last| times[0] >= last)
+        if self
+            .update_rows_without_history_insert(id, slot, times, values)
+            .is_some()
         {
-            for row in 0..times.len() {
-                self.update_styled_impl(
-                    id,
-                    times[row],
-                    [
-                        values[0][row],
-                        values[1][row],
-                        values[2][row],
-                        values[3][row],
-                    ],
-                    [None; POINT_COLOR_CHANNELS],
-                    false,
-                );
-            }
-            let series = &mut self.series[slot];
-            series.rebuild_lod_range(affected..series.values.len());
             return Some(affected);
         }
-
         let new_time_points = times
             .iter()
             .filter(|time| self.merged_times.binary_search(time).is_err())
             .count();
         let old = &self.series[slot];
-        let timeline_shift = times
-            .iter()
-            .any(|time| old.times.binary_search(time).is_err());
         let old_values = old.values.columns();
         let capacity = old.times.len() + times.len();
         let mut merged_times = Vec::with_capacity(capacity);
@@ -1238,16 +1379,9 @@ impl DataLayer {
         let series = &mut self.series[slot];
         series.times = merged_times;
         series.values = SeriesValues::Ohlc(merged_values);
-        if timeline_shift {
-            series.rebuild_lod();
-        } else {
-            let end = series
-                .times
-                .binary_search(times.last().expect("non-empty batch"))
-                .expect("replacement time remains installed")
-                + 1;
-            series.rebuild_lod_range(affected..end);
-        }
+        // Batches that only correct existing history (plus any tail) returned through the in-place
+        // path above, so every merge here inserts rows and shifts the hierarchy.
+        series.rebuild_lod();
         series.point_colors = merged_colors;
         series.generation = series.generation.wrapping_add(times.len() as u64);
         self.rebuild_merged();
@@ -1274,27 +1408,17 @@ impl DataLayer {
         debug_assert!(times.windows(2).all(|window| window[0] < window[1]));
 
         let affected = lower_bound(&self.series[slot].times, |&time| time < times[0]);
-        if self.series[slot]
-            .times
-            .last()
-            .is_none_or(|&last| times[0] >= last)
+        if self
+            .update_rows_without_history_insert(id, slot, times, [values, values, values, values])
+            .is_some()
         {
-            for (&time, &value) in times.iter().zip(values) {
-                self.update_styled_impl(id, time, [value; 4], [None; POINT_COLOR_CHANNELS], false);
-            }
-            let series = &mut self.series[slot];
-            series.rebuild_lod_range(affected..series.values.len());
             return Some(affected);
         }
-
         let new_time_points = times
             .iter()
             .filter(|time| self.merged_times.binary_search(time).is_err())
             .count();
         let old = &self.series[slot];
-        let timeline_shift = times
-            .iter()
-            .any(|time| old.times.binary_search(time).is_err());
         let old_values = old.values.columns()[3];
         let capacity = old.times.len() + times.len();
         let mut merged_times = Vec::with_capacity(capacity);
@@ -1337,16 +1461,9 @@ impl DataLayer {
         let series = &mut self.series[slot];
         series.times = merged_times;
         series.values = SeriesValues::Single(merged_values);
-        if timeline_shift {
-            series.rebuild_lod();
-        } else {
-            let end = series
-                .times
-                .binary_search(times.last().expect("non-empty batch"))
-                .expect("replacement time remains installed")
-                + 1;
-            series.rebuild_lod_range(affected..end);
-        }
+        // Batches that only correct existing history (plus any tail) returned through the in-place
+        // path above, so every merge here inserts rows and shifts the hierarchy.
+        series.rebuild_lod();
         series.point_colors = merged_colors;
         series.generation = series.generation.wrapping_add(times.len() as u64);
         self.rebuild_merged();
@@ -1413,6 +1530,7 @@ impl DataLayer {
     }
 
     fn rebuild_merged(&mut self) {
+        self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
         let total: usize = self
             .live_slots
             .values()
@@ -1445,6 +1563,7 @@ impl DataLayer {
     }
 
     fn reindex_all(&mut self) {
+        self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
         // Reindex owned timelines first. Aliased outputs copy a range from their ultimate owned
         // source, so they retain no mapping allocation when that source is dense.
         let merged = &self.merged_times;
@@ -1487,19 +1606,41 @@ impl DataLayer {
     }
 }
 
+/// The row-aligned color channel that stores `color`. An absent channel is created (every existing
+/// row without an override) the first time a streamed row carries an explicit color, so a styled
+/// update colors its bar like the same item in a full data install; `None` keeps it absent.
+fn color_channel(channel: &mut Vec<u32>, rows: usize, color: Option<u32>) -> Option<&mut Vec<u32>> {
+    if channel.is_empty() {
+        color?;
+        channel.resize(rows, POINT_COLOR_ABSENT);
+    }
+    Some(channel)
+}
+
+/// Replace one existing row's color overrides (a whole-bar update clears absent channels' rows).
+fn set_row_colors(s: &mut RawSeries, row: usize, colors: [Option<u32>; POINT_COLOR_CHANNELS]) {
+    let rows = s.values.len();
+    for (channel, color) in s.point_colors.iter_mut().zip(colors) {
+        if let Some(channel) = color_channel(channel, rows, color) {
+            channel[row] = color.unwrap_or(POINT_COLOR_ABSENT);
+        }
+    }
+}
+
 fn push_raw(
     s: &mut RawSeries,
     time: i64,
     values: [f64; 4],
     colors: [Option<u32>; POINT_COLOR_CHANNELS],
 ) {
-    s.times.push(time);
-    s.values.push(values);
+    let rows = s.values.len();
     for (channel, color) in s.point_colors.iter_mut().zip(colors) {
-        if !channel.is_empty() {
+        if let Some(channel) = color_channel(channel, rows, color) {
             channel.push(color.unwrap_or(POINT_COLOR_ABSENT));
         }
     }
+    s.times.push(time);
+    s.values.push(values);
 }
 
 #[cfg(test)]
@@ -1914,6 +2055,44 @@ mod tests {
     }
 
     #[test]
+    fn merged_time_mapping_reports_extent_translation_and_old_union() {
+        let mut dl = DataLayer::new();
+        let id = dl.add_series();
+        set(&mut dl, id, &[30, 40, 50], &[1.0; 3]);
+
+        // Prepend: a pure translation over the shared extent, with the old union retained.
+        dl.begin_merged_time_transaction();
+        set(&mut dl, id, &[10, 20, 30, 40, 50], &[1.0; 5]);
+        let mapping = dl.take_merged_time_mapping().unwrap();
+        assert!(mapping.is_translation());
+        assert_eq!(mapping.common_old_extent(), Some((0, 2)));
+        assert_eq!(mapping.old_times(), &[30, 40, 50]);
+
+        // Identity-collapsed breakpoints still report their shared extent and translation.
+        dl.begin_merged_time_transaction();
+        set(&mut dl, id, &[10, 20, 30, 40, 50, 60], &[1.0; 6]);
+        let mapping = dl.take_merged_time_mapping().unwrap();
+        assert!(mapping.is_translation());
+        assert_eq!(mapping.common_old_extent(), Some((0, 4)));
+        assert_eq!(mapping.map_logical(7.0), 7.0);
+
+        // A coarser interval shares only aligned stamps with a different index density.
+        dl.begin_merged_time_transaction();
+        set(&mut dl, id, &[0, 30, 60], &[1.0; 3]);
+        let mapping = dl.take_merged_time_mapping().unwrap();
+        assert!(!mapping.is_translation());
+        assert_eq!(mapping.common_old_extent(), Some((2, 5)));
+
+        // Unrelated stamps share nothing.
+        dl.begin_merged_time_transaction();
+        set(&mut dl, id, &[1, 2, 3], &[1.0; 3]);
+        let mapping = dl.take_merged_time_mapping().unwrap();
+        assert!(!mapping.is_translation());
+        assert_eq!(mapping.common_old_extent(), None);
+        assert_eq!(mapping.old_times(), &[0, 30, 60]);
+    }
+
+    #[test]
     fn replacements_and_tail_appends_do_not_create_a_mapping() {
         let mut dl = DataLayer::new();
         let id = dl.add_series();
@@ -1975,6 +2154,250 @@ mod tests {
             batch.series_data(batch_id).unwrap().1,
             singles.series_data(singles_id).unwrap().1
         );
+    }
+
+    /// Late corrections of bars N-1/N-2 are the common real-time case. They must repair only the
+    /// corrected row (LOD path and autoscale chunk) instead of merging the timestamp union and
+    /// reindexing every series, which is O(total rows).
+    #[test]
+    fn historical_correction_of_an_existing_time_is_local_work() {
+        let mut dl = DataLayer::new();
+        let a = dl.add_series();
+        let b = dl.add_series();
+        let rows = 20_000i64;
+        let times = (0..rows).map(|row| row * 60).collect::<Vec<_>>();
+        let values = (0..rows).map(|row| row as f64).collect::<Vec<_>>();
+        set(&mut dl, a, &times, &values);
+        let sparse = times.iter().copied().step_by(3).collect::<Vec<_>>();
+        set(&mut dl, b, &sparse, &vec![1.0; sparse.len()]);
+        let last = (rows - 1) as TimePointIndex;
+        // Warm the autoscale chunk that holds N-2 so a stale cache would be observable.
+        let before = dl
+            .min_max_on_range_cached(
+                a,
+                last - 5,
+                last,
+                &[PlotValueIndex::High, PlotValueIndex::Low],
+            )
+            .unwrap();
+        assert_eq!(
+            (before.min, before.max),
+            ((rows - 6) as f64, (rows - 1) as f64)
+        );
+        let generation = dl.time_points_generation();
+        let passes = dl.index_rebuilds();
+        let series_generation = dl.series_generation(a).unwrap();
+
+        dl.begin_merged_time_transaction();
+        assert!(dl.update(a, times[times.len() - 2], [5.0, 1.0e6, -1.0e6, 7.0]));
+        assert!(dl.update(a, times[times.len() - 3], [8.0, 9.0, 4.0, 6.0]));
+
+        assert_eq!(dl.index_rebuilds(), passes, "no union merge or reindex");
+        assert_eq!(dl.time_points_generation(), generation);
+        assert!(dl.take_merged_time_mapping().is_none());
+        assert_eq!(dl.series_generation(a), Some(series_generation + 2));
+        assert!(dl.last_lod_update_nodes(a).unwrap() <= 8);
+        let after = dl
+            .min_max_on_range_cached(
+                a,
+                last - 5,
+                last,
+                &[PlotValueIndex::High, PlotValueIndex::Low],
+            )
+            .unwrap();
+        assert_eq!((after.min, after.max), (-1.0e6, 1.0e6));
+        assert_eq!(value_at_index(&dl, a, last - 1, PlotValueIndex::Close), 7.0);
+        assert_eq!(value_at_index(&dl, a, last - 2, PlotValueIndex::Open), 8.0);
+        assert_eq!(dl.merged_times(), times.as_slice());
+        assert_lod_matches_fresh(&dl, a);
+    }
+
+    /// A time the union already holds (owned by another series) inserts a new row for this series
+    /// without re-sorting the union; only a genuinely new time merges the union.
+    #[test]
+    fn historical_insert_at_an_existing_union_time_skips_the_union_merge() {
+        let mut dl = DataLayer::new();
+        let a = dl.add_series();
+        let b = dl.add_series();
+        set(&mut dl, a, &[1, 2, 3, 4, 5], &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        set(&mut dl, b, &[1, 5], &[10.0, 50.0]);
+        let generation = dl.time_points_generation();
+        let passes = dl.index_rebuilds();
+        dl.begin_merged_time_transaction();
+
+        assert!(dl.update(b, 3, [30.0; 4]));
+        assert_eq!(
+            dl.index_rebuilds(),
+            passes + 1,
+            "one reindex pass, no union merge"
+        );
+        assert_eq!(dl.time_points_generation(), generation);
+        assert!(dl.take_merged_time_mapping().is_none());
+        assert_eq!(indices(&dl, b), [0, 2, 4]);
+        assert_eq!(value_at_index(&dl, b, 2, PlotValueIndex::Close), 30.0);
+        assert_eq!(dl.merged_times(), &[1, 2, 3, 4, 5]);
+
+        // A genuinely new historical time still merges the union and rebases logical indices.
+        dl.begin_merged_time_transaction();
+        assert!(dl.update(b, 0, [0.5; 4]));
+        assert_ne!(dl.time_points_generation(), generation);
+        assert_eq!(dl.merged_times(), &[0, 1, 2, 3, 4, 5]);
+        assert!(dl.take_merged_time_mapping().is_some());
+        assert_eq!(indices(&dl, a), [1, 2, 3, 4, 5]);
+        assert_eq!(indices(&dl, b), [0, 1, 3, 5]);
+    }
+
+    /// A typed batch that only corrects existing historical rows applies in place, like the single
+    /// path, instead of copying every column and reindexing the layer.
+    #[test]
+    fn batch_corrections_of_existing_times_apply_in_place() {
+        let mut dl = DataLayer::new();
+        let id = dl.add_series();
+        let times = (0..5_000i64).collect::<Vec<_>>();
+        let values = (0..5_000).map(|row| row as f64).collect::<Vec<_>>();
+        set(&mut dl, id, &times, &values);
+        assert!(dl.set_point_colors(id, [Some(vec![7; 5_000]), None, None]));
+        let passes = dl.index_rebuilds();
+        let generation = dl.time_points_generation();
+        let before = dl.series_generation(id).unwrap();
+
+        let open = [1.0, 2.0];
+        let high = [10.0, 20.0];
+        let low = [0.5, 1.5];
+        let close = [5.0, 6.0];
+        assert_eq!(
+            dl.update_many(id, &[4_990, 4_995], [&open, &high, &low, &close]),
+            Some(4_990)
+        );
+        assert_eq!(dl.index_rebuilds(), passes);
+        assert_eq!(dl.time_points_generation(), generation);
+        assert_eq!(dl.series_generation(id), Some(before + 2));
+        let (_, columns) = dl.series_data(id).unwrap();
+        assert_eq!(columns[1][4_990], 10.0);
+        assert_eq!(columns[3][4_995], 6.0);
+        assert_eq!(columns[3][4_994], 4_994.0);
+        assert_eq!(dl.point_color(id, PointColorChannel::Body, 4_990), None);
+        assert_eq!(dl.point_color(id, PointColorChannel::Body, 4_991), Some(7));
+        assert_lod_matches_fresh(&dl, id);
+
+        // The scalar batch path keeps one canonical column through the same in-place correction.
+        let scalar = dl.add_series();
+        set(&mut dl, scalar, &[1, 2, 3], &[1.0, 2.0, 3.0]);
+        let passes = dl.index_rebuilds();
+        let replacement = [20.0];
+        assert_eq!(dl.update_many_single(scalar, &[2], &replacement), Some(1));
+        assert_eq!(dl.index_rebuilds(), passes);
+        assert_eq!(dl.series_data(scalar).unwrap().1[3], &[1.0, 20.0, 3.0]);
+    }
+
+    /// The common feed batch corrects a late bar and streams the current bar in one call. The
+    /// correction applies in place and the tail rows append through the streaming path, so the
+    /// batch never merges the union or reindexes the layer, and the result equals the same rows
+    /// applied one by one. A new historical time still takes the merging path.
+    #[test]
+    fn batch_correction_plus_tail_append_stays_in_place() {
+        let rows = 5_000i64;
+        let times = (0..rows).collect::<Vec<_>>();
+        let values = (0..rows).map(|row| row as f64).collect::<Vec<_>>();
+        let mut dl = DataLayer::new();
+        let id = dl.add_series();
+        set(&mut dl, id, &times, &values);
+        let passes = dl.index_rebuilds();
+        let generation = dl.time_points_generation();
+
+        let batch = [rows - 3, rows - 1, rows, rows + 1];
+        let open = [1.0, 2.0, 3.0, 4.0];
+        let high = [10.0, 20.0, 30.0, 40.0];
+        let low = [0.5, 1.5, 2.5, 3.5];
+        let close = [5.0, 6.0, 7.0, 8.0];
+        dl.begin_merged_time_transaction();
+        assert_eq!(
+            dl.update_many(id, &batch, [&open, &high, &low, &close]),
+            Some((rows - 3) as usize)
+        );
+        assert_eq!(dl.index_rebuilds(), passes, "no union merge or reindex");
+        assert_eq!(dl.time_points_generation(), generation + 2);
+        assert!(dl.take_merged_time_mapping().is_none());
+        let (stored_times, columns) = dl.series_data(id).unwrap();
+        assert_eq!(stored_times.len(), (rows + 2) as usize);
+        assert_eq!(columns[1][(rows - 3) as usize], 10.0);
+        assert_eq!(columns[3][(rows - 2) as usize], (rows - 2) as f64);
+        assert_eq!(columns[3][(rows - 1) as usize], 6.0);
+        assert_eq!(columns[0][(rows + 1) as usize], 4.0);
+        assert_lod_matches_fresh(&dl, id);
+        let mut single = DataLayer::new();
+        let one_by_one = single.add_series();
+        set(&mut single, one_by_one, &times, &values);
+        for (index, &time) in batch.iter().enumerate() {
+            assert!(single.update(
+                one_by_one,
+                time,
+                [open[index], high[index], low[index], close[index]]
+            ));
+        }
+        assert_eq!(single.series_data(one_by_one), dl.series_data(id));
+        assert_eq!(indices(&single, one_by_one), indices(&dl, id));
+
+        // A new historical time in the same shape of batch merges once, as before.
+        let passes = dl.index_rebuilds();
+        let inserted = [-1, rows + 1];
+        assert_eq!(
+            dl.update_many(
+                id,
+                &inserted,
+                [&[9.0, 9.0], &[9.0, 9.0], &[9.0, 9.0], &[9.0, 9.0]]
+            ),
+            Some(0)
+        );
+        assert!(dl.index_rebuilds() > passes);
+        assert_eq!(dl.series_data(id).unwrap().0[0], -1);
+        assert_lod_matches_fresh(&dl, id);
+    }
+
+    /// Reference `series.update` colors the updated item even when no earlier item had a color:
+    /// the first explicit color creates the row-aligned channel in every streaming path.
+    #[test]
+    fn first_styled_update_creates_its_color_channel() {
+        let mut dl = DataLayer::new();
+        let id = dl.add_series();
+        assert!(dl.update_styled(id, 10, [1.0; 4], [Some(7), None, None]));
+        assert_eq!(dl.point_color(id, PointColorChannel::Body, 0), Some(7));
+        assert!(dl.point_colors(id).unwrap().channels[1].is_empty());
+
+        let plain = dl.add_series();
+        set(&mut dl, plain, &[10, 20, 30, 40], &[1.0, 2.0, 3.0, 4.0]);
+        assert!(!dl.has_point_colors(plain));
+        // Replace-last, append, historical correction, and historical insert each color only their
+        // own bar and keep the channel aligned with the rows.
+        assert!(dl.update_styled(plain, 40, [5.0; 4], [None, Some(1), None]));
+        assert!(dl.update_styled(plain, 50, [6.0; 4], [Some(2), None, None]));
+        assert!(dl.update_styled(plain, 20, [7.0; 4], [None, None, Some(3)]));
+        assert!(dl.update_styled(plain, 25, [8.0; 4], [Some(4), None, None]));
+        let colors = |channel| {
+            (0..6)
+                .map(|row| dl.point_color(plain, channel, row))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            colors(PointColorChannel::Body),
+            [None, None, Some(4), None, None, Some(2)]
+        );
+        assert_eq!(
+            colors(PointColorChannel::Wick),
+            [None, None, None, None, Some(1), None]
+        );
+        assert_eq!(
+            colors(PointColorChannel::Border),
+            [None, Some(3), None, None, None, None]
+        );
+        for channel in dl.point_colors(plain).unwrap().channels {
+            assert_eq!(channel.len(), 6);
+        }
+        // An unstyled update neither creates a channel nor disturbs existing ones.
+        let untouched = dl.add_series();
+        set(&mut dl, untouched, &[10, 20], &[1.0, 2.0]);
+        assert!(dl.update(untouched, 30, [3.0; 4]));
+        assert!(!dl.has_point_colors(untouched));
     }
 
     #[test]

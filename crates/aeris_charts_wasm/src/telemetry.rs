@@ -21,7 +21,7 @@ use std::cell::Cell;
 /// `f64` slots written by `AerisChart::frame_stats_into`. The TypeScript façade owns one
 /// scratch `Float64Array` of this length and re-reads it every frame, so a `frame_stats()` call
 /// allocates nothing on either side of the boundary.
-pub const FRAME_STATS_LEN: usize = 20;
+pub const FRAME_STATS_LEN: usize = 21;
 
 /// Slot indices in the `frame_stats_into` buffer. Kept in lockstep with `read_frame_stats` in
 /// `packages/charts/src/impl.ts` — append only, never reorder (the package pins `^0.8`).
@@ -47,6 +47,7 @@ pub mod slot {
     pub const AXIS_REBUILDS: usize = 17;
     pub const TEXT_RESOLUTIONS: usize = 18;
     pub const TRADING_REBUILDS: usize = 19;
+    pub const RING_DROPPED_ROWS: usize = 20;
 }
 
 #[derive(Default)]
@@ -69,6 +70,8 @@ pub struct FrameTelemetry {
     /// Ring-source producer overruns since chart create (see `set_ring_source`). Stays 0 while
     /// no series has a ring bound — the slot is part of the wire layout either way.
     ring_overruns: Cell<u32>,
+    /// Ring rows dropped as invalid (bad timestamp or non-finite values) since chart create.
+    ring_dropped_rows: Cell<u32>,
     /// Ring-source drain time waiting to be attributed to the render immediately following it.
     /// Draining is triggered by the package's frame tick just before `render`, so keeping this
     /// separate closes the telemetry boundary without changing the public frame loop.
@@ -155,6 +158,12 @@ impl FrameTelemetry {
             .set(self.ring_overruns.get().saturating_add(n));
     }
 
+    /// Count `n` ring rows the engine dropped as invalid during a drain.
+    pub fn count_ring_dropped_rows(&self, n: u32) {
+        self.ring_dropped_rows
+            .set(self.ring_dropped_rows.get().saturating_add(n));
+    }
+
     /// True once the host has read `frame_stats()` at least once — the gate for arming GPU
     /// timestamp collection.
     pub fn stats_requested(&self) -> bool {
@@ -189,6 +198,7 @@ impl FrameTelemetry {
         out[slot::AXIS_REBUILDS] = self.axis_rebuilds.get() as f64;
         out[slot::TEXT_RESOLUTIONS] = self.text_resolutions.get() as f64;
         out[slot::TRADING_REBUILDS] = self.trading_rebuilds.get() as f64;
+        out[slot::RING_DROPPED_ROWS] = f64::from(self.ring_dropped_rows.get());
     }
 }
 
@@ -270,10 +280,25 @@ mod tests {
         telemetry.set_browser_rebuilds(10, 11);
         let mut out = [0.0; FRAME_STATS_LEN];
         telemetry.write_into(&mut out, None);
+        // Bounded to the slots this test owns: later append-only slots (ring dropped rows)
+        // extend the record without moving these.
         assert_eq!(
-            &out[slot::GPU_BUFFER_ALLOCATIONS..],
+            &out[slot::GPU_BUFFER_ALLOCATIONS..=slot::TRADING_REBUILDS],
             &[1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 6.0, 9.0, 10.0, 11.0, 12.0]
         );
+    }
+
+    #[test]
+    fn ring_dropped_rows_accumulate_in_their_own_slot() {
+        let telemetry = FrameTelemetry::default();
+        telemetry.count_ring_overruns(2);
+        telemetry.count_ring_dropped_rows(3);
+        telemetry.count_ring_dropped_rows(4);
+        let mut out = [0.0; FRAME_STATS_LEN];
+        telemetry.write_into(&mut out, None);
+        assert_eq!(out[slot::RING_OVERRUNS], 2.0);
+        assert_eq!(out[slot::RING_DROPPED_ROWS], 7.0);
+        assert_eq!(slot::RING_DROPPED_ROWS, FRAME_STATS_LEN - 1);
     }
 
     #[test]

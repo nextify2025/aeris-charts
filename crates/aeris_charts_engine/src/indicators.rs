@@ -43,6 +43,8 @@ pub enum IndicatorParameterType {
     Number,
     Source,
     Series,
+    /// One of the string values listed in [`IndicatorParameterDescriptor::choices`].
+    Choice,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -54,6 +56,9 @@ pub struct IndicatorParameterDescriptor {
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// Allowed values of a [`IndicatorParameterType::Choice`] parameter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -89,7 +94,7 @@ pub struct IndicatorSchema {
     pub outputs: Vec<IndicatorOutputDescriptor>,
 }
 
-pub const INDICATOR_SCHEMA_REVISION: u32 = 1;
+pub const INDICATOR_SCHEMA_REVISION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -99,12 +104,19 @@ pub enum IndicatorKind {
     },
     Ema {
         period: usize,
+        /// Seed convention. Documents written before it existed restore the SMA seed.
+        #[serde(default)]
+        seed: aeris_charts_indicators::IndicatorSeed,
     },
     Dema {
         period: usize,
+        #[serde(default)]
+        seed: aeris_charts_indicators::IndicatorSeed,
     },
     Tema {
         period: usize,
+        #[serde(default)]
+        seed: aeris_charts_indicators::IndicatorSeed,
     },
     Smma {
         period: usize,
@@ -162,14 +174,24 @@ pub enum IndicatorKind {
     Bollinger {
         period: usize,
         deviation: f64,
+        /// Standard-deviation estimator; older documents restore the population estimator.
+        #[serde(default)]
+        estimator: aeris_charts_indicators::DeviationEstimator,
     },
     Rsi {
         period: usize,
+        #[serde(default)]
+        seed: aeris_charts_indicators::IndicatorSeed,
     },
     Macd {
         fast: usize,
         slow: usize,
         signal: usize,
+        #[serde(default)]
+        seed: aeris_charts_indicators::IndicatorSeed,
+        /// Histogram scale: 1 is `MACD - signal`, 2 is 通达信 `(DIF-DEA)*2`.
+        #[serde(default = "default_histogram_multiplier")]
+        histogram_multiplier: f64,
     },
     Stochastic {
         k_period: usize,
@@ -197,6 +219,77 @@ pub enum IndicatorKind {
     Wma {
         period: usize,
     },
+    /// KDJ: RSV over `period` rows, `K = SMA(RSV, k_smoothing, 1)`,
+    /// `D = SMA(K, d_smoothing, 1)`, `J = 3K - 2D` (defaults 9/3/3).
+    Kdj {
+        period: usize,
+        k_smoothing: usize,
+        d_smoothing: usize,
+        /// K/D start; documents written before it existed restore the textbook 50.
+        #[serde(default)]
+        seed: aeris_charts_indicators::KdjSeed,
+    },
+}
+
+fn default_histogram_multiplier() -> f64 {
+    1.0
+}
+
+impl IndicatorKind {
+    /// Expand a convention preset into this definition's explicit parameters: seeds for EMA,
+    /// DEMA, TEMA, MACD and RSI, the KDJ K/D start, the MACD histogram scale, and the Bollinger
+    /// estimator. Periods
+    /// and kinds without a convention-dependent parameter are unchanged, and the preset itself
+    /// is not retained.
+    pub fn with_convention(self, convention: aeris_charts_indicators::IndicatorConvention) -> Self {
+        let convention_seed = convention.seed();
+        match self {
+            Self::Ema { period, .. } => Self::Ema {
+                period,
+                seed: convention_seed,
+            },
+            Self::Dema { period, .. } => Self::Dema {
+                period,
+                seed: convention_seed,
+            },
+            Self::Tema { period, .. } => Self::Tema {
+                period,
+                seed: convention_seed,
+            },
+            Self::Rsi { period, .. } => Self::Rsi {
+                period,
+                seed: convention_seed,
+            },
+            Self::Macd {
+                fast, slow, signal, ..
+            } => Self::Macd {
+                fast,
+                slow,
+                signal,
+                seed: convention_seed,
+                histogram_multiplier: convention.macd_histogram_multiplier(),
+            },
+            Self::Bollinger {
+                period, deviation, ..
+            } => Self::Bollinger {
+                period,
+                deviation,
+                estimator: convention.deviation_estimator(),
+            },
+            Self::Kdj {
+                period,
+                k_smoothing,
+                d_smoothing,
+                ..
+            } => Self::Kdj {
+                period,
+                k_smoothing,
+                d_smoothing,
+                seed: convention.kdj_seed(),
+            },
+            other => other,
+        }
+    }
 }
 
 /// One live indicator producer's typed, runtime-independent definition.
@@ -213,6 +306,8 @@ pub struct IndicatorBindingInfo {
     pub source_input: IndicatorInputSource,
     /// Parallel volume column source for VWAP; `None` means unit weights.
     pub volume_source: Option<SeriesId>,
+    /// Turnover column for an amount-weighted VWAP (`sum(amount) / sum(volume)`).
+    pub amount_source: Option<SeriesId>,
     /// Output identities in the indicator's documented order.
     pub outputs: Vec<SeriesId>,
     /// Per-output presentation snapshots in the same order as `outputs`.
@@ -227,9 +322,12 @@ pub(crate) struct IndicatorBinding {
     pub(crate) outputs: Vec<SeriesId>,
     /// Parallel volume column source (VWAP); `None` = unit weights.
     pub(crate) volume_source: Option<SeriesId>,
+    /// Turnover column of an amount-weighted VWAP, aligned by timestamp like volume.
+    pub(crate) amount_source: Option<SeriesId>,
     runtime: aeris_charts_indicators::IncrementalState,
     source_generation: u64,
     volume_generation: Option<u64>,
+    amount_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -281,11 +379,21 @@ pub struct IndicatorInfo {
     pub source: SeriesId,
     pub source_input: IndicatorInputSource,
     pub volume_source: Option<SeriesId>,
+    /// Turnover source of an amount-weighted VWAP.
+    pub amount_source: Option<SeriesId>,
     /// Current engine-owned presentation state for this output.
     pub style: IndicatorOutputStyle,
     pub output_name: &'static str,
     pub output_index: usize,
     pub output_count: usize,
+    /// Rows of the root (non-indicator) source before this output's first value, counting
+    /// every chained indicator source, on a whitespace-free source.
+    pub warmup_bars: usize,
+    /// Recommended rows of root-source history before this output stops depending on where the
+    /// loaded history begins: the warm-up for windowed formulas, plus the rows for every
+    /// recursive seed's weight to fall below 0.1%, summed over chained sources. `None` when no
+    /// row count suffices (time-anchored VWAP/pivots, cumulative or path-dependent formulas).
+    pub convergence_bars: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
@@ -303,6 +411,13 @@ pub struct IndicatorParameters {
     pub reset: Option<aeris_charts_indicators::VwapReset>,
     pub standard_deviation: Option<f64>,
     pub percent: Option<f64>,
+    pub seed: Option<aeris_charts_indicators::IndicatorSeed>,
+    pub histogram_multiplier: Option<f64>,
+    pub estimator: Option<aeris_charts_indicators::DeviationEstimator>,
+    pub k_smoothing: Option<usize>,
+    pub d_smoothing: Option<usize>,
+    /// KDJ K/D start (the `seed` field of a KDJ definition).
+    pub kdj_seed: Option<aeris_charts_indicators::KdjSeed>,
 }
 
 impl ChartEngine {
@@ -372,6 +487,7 @@ impl ChartEngine {
                 source: binding.source,
                 source_input: binding.source_input,
                 volume_source: binding.volume_source,
+                amount_source: binding.amount_source,
                 outputs: binding.outputs.clone(),
                 styles: binding
                     .outputs
@@ -442,30 +558,33 @@ impl ChartEngine {
                                 ..IndicatorParameters::default()
                             },
                         ),
-                        IndicatorKind::Ema { period } => (
+                        IndicatorKind::Ema { period, seed } => (
                             "ema",
                             period,
                             None,
                             IndicatorParameters {
                                 period: Some(period),
+                                seed: Some(seed),
                                 ..IndicatorParameters::default()
                             },
                         ),
-                        IndicatorKind::Dema { period } => (
+                        IndicatorKind::Dema { period, seed } => (
                             "dema",
                             period,
                             None,
                             IndicatorParameters {
                                 period: Some(period),
+                                seed: Some(seed),
                                 ..IndicatorParameters::default()
                             },
                         ),
-                        IndicatorKind::Tema { period } => (
+                        IndicatorKind::Tema { period, seed } => (
                             "tema",
                             period,
                             None,
                             IndicatorParameters {
                                 period: Some(period),
+                                seed: Some(seed),
                                 ..IndicatorParameters::default()
                             },
                         ),
@@ -625,27 +744,39 @@ impl ChartEngine {
                                 ..IndicatorParameters::default()
                             },
                         ),
-                        IndicatorKind::Bollinger { period, deviation } => (
+                        IndicatorKind::Bollinger {
+                            period,
+                            deviation,
+                            estimator,
+                        } => (
                             "bollinger",
                             period,
                             Some(deviation),
                             IndicatorParameters {
                                 period: Some(period),
                                 deviation: Some(deviation),
+                                estimator: Some(estimator),
                                 ..IndicatorParameters::default()
                             },
                         ),
-                        IndicatorKind::Rsi { period } => (
+                        IndicatorKind::Rsi { period, seed } => (
                             "rsi",
                             period,
                             None,
                             IndicatorParameters {
                                 period: Some(period),
+                                seed: Some(seed),
                                 ..IndicatorParameters::default()
                             },
                         ),
                         // MACD/Stochastic pack their second period into `deviation`.
-                        IndicatorKind::Macd { fast, slow, signal } => (
+                        IndicatorKind::Macd {
+                            fast,
+                            slow,
+                            signal,
+                            seed,
+                            histogram_multiplier,
+                        } => (
                             "macd",
                             slow,
                             Some(signal as f64),
@@ -653,6 +784,8 @@ impl ChartEngine {
                                 fast: Some(fast),
                                 slow: Some(slow),
                                 signal: Some(signal),
+                                seed: Some(seed),
+                                histogram_multiplier: Some(histogram_multiplier),
                                 ..IndicatorParameters::default()
                             },
                         ),
@@ -728,7 +861,25 @@ impl ChartEngine {
                                 ..IndicatorParameters::default()
                             },
                         ),
+                        IndicatorKind::Kdj {
+                            period,
+                            k_smoothing,
+                            d_smoothing,
+                            seed,
+                        } => (
+                            "kdj",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                k_smoothing: Some(k_smoothing),
+                                d_smoothing: Some(d_smoothing),
+                                kdj_seed: Some(seed),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
                     };
+                    let (warmup_bars, convergence_bars) = self.indicator_output_warmup(id);
                     IndicatorInfo {
                         binding_id: binding.outputs[0],
                         kind,
@@ -738,6 +889,7 @@ impl ChartEngine {
                         source: binding.source,
                         source_input: binding.source_input,
                         volume_source: binding.volume_source,
+                        amount_source: binding.amount_source,
                         style: self
                             .series_entry(binding.outputs[output_index])
                             .map(indicator_output_style)
@@ -745,9 +897,35 @@ impl ChartEngine {
                         output_name: indicator_output_name(&binding.kind, output_index),
                         output_index,
                         output_count: binding.outputs.len(),
+                        warmup_bars,
+                        convergence_bars,
                     }
                 })
         })
+    }
+
+    /// `(warmup, convergence)` rows of root-source history for an indicator output, following
+    /// chained indicator sources back to their plain series. A plain series needs none.
+    fn indicator_output_warmup(&self, id: SeriesId) -> (usize, Option<usize>) {
+        // Bindings are topological (a source output always precedes its consumer), so this walk
+        // visits each binding at most once.
+        let mut warmup = 0_usize;
+        let mut convergence = Some(0_usize);
+        let mut current = id;
+        while let Some((binding, output_index)) = self.indicators.iter().find_map(|binding| {
+            binding
+                .outputs
+                .iter()
+                .position(|&output| output == current)
+                .map(|index| (binding, index))
+        }) {
+            warmup = warmup.saturating_add(binding.runtime.warmup_rows(output_index));
+            convergence = convergence
+                .zip(binding.runtime.convergence_rows(output_index))
+                .map(|(total, own)| total.saturating_add(own));
+            current = binding.source;
+        }
+        (warmup, convergence)
     }
 
     /// Add a Rust-native simple moving-average producer. The returned line series is owned by the
@@ -760,21 +938,42 @@ impl ChartEngine {
 
     /// Add a Rust-native exponential moving-average producer.
     pub fn add_ema(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
-        self.add_indicator_kind(source, IndicatorKind::Ema { period }, None)
-            .into_iter()
-            .next()
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Ema {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
     }
 
     pub fn add_dema(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
-        self.add_indicator_kind(source, IndicatorKind::Dema { period }, None)
-            .into_iter()
-            .next()
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Dema {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
     }
 
     pub fn add_tema(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
-        self.add_indicator_kind(source, IndicatorKind::Tema { period }, None)
-            .into_iter()
-            .next()
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Tema {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
     }
 
     pub fn add_smma(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
@@ -964,14 +1163,29 @@ impl ChartEngine {
         period: usize,
         deviation: f64,
     ) -> Vec<SeriesId> {
-        self.add_indicator_kind(source, IndicatorKind::Bollinger { period, deviation }, None)
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Bollinger {
+                period,
+                deviation,
+                estimator: DeviationEstimator::Population,
+            },
+            None,
+        )
     }
 
     /// Add a Wilder RSI line in its own oscillator pane (with dotted 30/70 band lines).
     pub fn add_rsi(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
-        self.add_indicator_kind(source, IndicatorKind::Rsi { period }, None)
-            .into_iter()
-            .next()
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Rsi {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
     }
 
     /// Add MACD line, signal line, and histogram series in that order, in their own
@@ -984,7 +1198,17 @@ impl ChartEngine {
         slow: usize,
         signal: usize,
     ) -> Vec<SeriesId> {
-        self.add_indicator_kind(source, IndicatorKind::Macd { fast, slow, signal }, None)
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Macd {
+                fast,
+                slow,
+                signal,
+                seed: IndicatorSeed::Sma,
+                histogram_multiplier: 1.0,
+            },
+            None,
+        )
     }
 
     /// Add Stochastic %K and %D lines in that order, in their own oscillator pane (with
@@ -1009,7 +1233,8 @@ impl ChartEngine {
             .next()
     }
 
-    /// Add a session-anchored (UTC-day reset) VWAP line on the source's pane.
+    /// Add a session-anchored VWAP line on the source's pane, reset at each exchange trading day
+    /// (the UTC day unless the chart sets a time zone or session start).
     /// `volume_source` supplies the per-bar volume column (its close slot); `None` = unit
     /// weights.
     pub fn add_vwap(
@@ -1095,6 +1320,48 @@ impl ChartEngine {
             .next()
     }
 
+    /// Add KDJ K, D and J lines in that order, in their own oscillator pane (dotted 20/80 band
+    /// lines). K and D start from the textbook 50; `IndicatorKind::Kdj { seed, .. }` selects the
+    /// formula-language first value instead.
+    pub fn add_kdj(
+        &mut self,
+        source: SeriesId,
+        period: usize,
+        k_smoothing: usize,
+        d_smoothing: usize,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Kdj {
+                period,
+                k_smoothing,
+                d_smoothing,
+                seed: aeris_charts_indicators::KdjSeed::Fifty,
+            },
+            None,
+        )
+    }
+
+    /// Add the 分时 average-price line: a VWAP of `sum(amount) / sum(volume)` per reset period
+    /// over the source's rows. Both columns align to the source by exact timestamp; rows whose
+    /// amount or volume is missing, whitespace or non-positive volume contribute nothing.
+    pub fn add_vwap_with_amount(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+        amount_source: SeriesId,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind_with_sources(
+            source,
+            IndicatorInputSource::Close,
+            IndicatorKind::Vwap,
+            Some(volume_source),
+            Some(amount_source),
+        )
+        .into_iter()
+        .next()
+    }
+
     /// Add an indicator from its typed definition, applying the same output, pane, and chrome
     /// defaults as the specialized convenience methods. Invalid definitions return no outputs and
     /// leave the chart unchanged.
@@ -1116,7 +1383,26 @@ impl ChartEngine {
         kind: IndicatorKind,
         volume_source: Option<SeriesId>,
     ) -> Vec<SeriesId> {
-        let ids = self.add_indicator(source, source_input, kind.clone(), volume_source);
+        self.add_indicator_kind_with_sources(source, source_input, kind, volume_source, None)
+    }
+
+    /// Add an indicator with every input explicit. `amount_source` is accepted only by VWAP,
+    /// which then also requires `volume_source`, and must be a distinct scalar series.
+    pub fn add_indicator_kind_with_sources(
+        &mut self,
+        source: SeriesId,
+        source_input: IndicatorInputSource,
+        kind: IndicatorKind,
+        volume_source: Option<SeriesId>,
+        amount_source: Option<SeriesId>,
+    ) -> Vec<SeriesId> {
+        let ids = self.add_indicator(
+            source,
+            source_input,
+            kind.clone(),
+            volume_source,
+            amount_source,
+        );
         match kind {
             IndicatorKind::Rsi { .. } => {
                 if !ids.is_empty() {
@@ -1129,7 +1415,7 @@ impl ChartEngine {
                     self.place_outputs_in_oscillator_pane(&ids);
                 }
             }
-            IndicatorKind::Stochastic { .. } => {
+            IndicatorKind::Stochastic { .. } | IndicatorKind::Kdj { .. } => {
                 if !ids.is_empty() {
                     self.place_outputs_in_oscillator_pane(&ids);
                 }
@@ -1244,41 +1530,86 @@ impl ChartEngine {
 
     /// Return the bounded typed editor schema for an indicator definition.
     pub fn indicator_schema(kind: &IndicatorKind) -> IndicatorSchema {
-        let mut parameters = vec![IndicatorParameterDescriptor {
-            name: "source".into(),
-            parameter_type: IndicatorParameterType::Source,
-            default: serde_json::json!(IndicatorInputSource::Close),
-            min: None,
-            max: None,
-        }];
-        let integer = |name: &str, default: usize| IndicatorParameterDescriptor {
-            name: name.into(),
-            parameter_type: IndicatorParameterType::Integer,
-            default: serde_json::json!(default),
-            min: Some(1.0),
-            max: Some(1_000_000.0),
+        let descriptor =
+            |name: &str,
+             parameter_type: IndicatorParameterType,
+             default: serde_json::Value,
+             range: Option<(f64, f64)>| IndicatorParameterDescriptor {
+                name: name.into(),
+                parameter_type,
+                default,
+                min: range.map(|range| range.0),
+                max: range.map(|range| range.1),
+                choices: Vec::new(),
+            };
+        let mut parameters = vec![descriptor(
+            "source",
+            IndicatorParameterType::Source,
+            serde_json::json!(IndicatorInputSource::Close),
+            None,
+        )];
+        let integer = |name: &str, default: usize| {
+            descriptor(
+                name,
+                IndicatorParameterType::Integer,
+                serde_json::json!(default),
+                Some((1.0, 1_000_000.0)),
+            )
         };
-        let number = |name: &str, default: f64| IndicatorParameterDescriptor {
-            name: name.into(),
-            parameter_type: IndicatorParameterType::Number,
-            default: serde_json::json!(default),
-            min: Some(0.0),
-            max: Some(1_000_000.0),
+        let number = |name: &str, default: f64| {
+            descriptor(
+                name,
+                IndicatorParameterType::Number,
+                serde_json::json!(default),
+                Some((0.0, 1_000_000.0)),
+            )
+        };
+        let series = |name: &str| {
+            descriptor(
+                name,
+                IndicatorParameterType::Series,
+                serde_json::Value::Null,
+                None,
+            )
+        };
+        let choice = |name: &str, default: serde_json::Value, choices: &[&str]| {
+            IndicatorParameterDescriptor {
+                choices: choices.iter().map(|choice| (*choice).to_string()).collect(),
+                ..descriptor(name, IndicatorParameterType::Choice, default, None)
+            }
+        };
+        let seed = |value: aeris_charts_indicators::IndicatorSeed| {
+            choice("seed", serde_json::json!(value), &["sma", "first_value"])
         };
         match *kind {
             IndicatorKind::Sma { period }
-            | IndicatorKind::Ema { period }
-            | IndicatorKind::Dema { period }
-            | IndicatorKind::Tema { period }
             | IndicatorKind::Smma { period }
             | IndicatorKind::Hma { period }
             | IndicatorKind::StandardDeviation { period }
             | IndicatorKind::Cci { period }
             | IndicatorKind::WilliamsR { period }
             | IndicatorKind::Donchian { period }
-            | IndicatorKind::Rsi { period }
             | IndicatorKind::Atr { period }
             | IndicatorKind::Wma { period } => parameters.push(integer("period", period)),
+            IndicatorKind::Ema {
+                period,
+                seed: value,
+            }
+            | IndicatorKind::Dema {
+                period,
+                seed: value,
+            }
+            | IndicatorKind::Tema {
+                period,
+                seed: value,
+            }
+            | IndicatorKind::Rsi {
+                period,
+                seed: value,
+            } => {
+                parameters.push(integer("period", period));
+                parameters.push(seed(value));
+            }
             IndicatorKind::PivotPoints { variant } => {
                 parameters.push(integer("kind", pivot_kind_index(variant)))
             }
@@ -1290,9 +1621,18 @@ impl ChartEngine {
                     parameters.push(integer(&format!("period_{}", index + 1), period));
                 }
             }
-            IndicatorKind::Bollinger { period, deviation } => {
+            IndicatorKind::Bollinger {
+                period,
+                deviation,
+                estimator,
+            } => {
                 parameters.push(integer("period", period));
                 parameters.push(number("deviation", deviation));
+                parameters.push(choice(
+                    "estimator",
+                    serde_json::json!(estimator),
+                    &["population", "sample"],
+                ));
             }
             IndicatorKind::Keltner { period, multiplier } => {
                 parameters.push(integer("period", period));
@@ -1315,94 +1655,64 @@ impl ChartEngine {
                 parameters.push(number("multiplier", multiplier));
             }
             IndicatorKind::Ichimoku => {}
-            IndicatorKind::Macd { fast, slow, signal } => {
+            IndicatorKind::Macd {
+                fast,
+                slow,
+                signal,
+                seed: value,
+                histogram_multiplier,
+            } => {
                 parameters.push(integer("fast", fast));
                 parameters.push(integer("slow", slow));
                 parameters.push(integer("signal", signal));
+                parameters.push(seed(value));
+                parameters.push(number("histogram_multiplier", histogram_multiplier));
             }
             IndicatorKind::Stochastic { k_period, d_period } => {
                 parameters.push(integer("k_period", k_period));
                 parameters.push(integer("d_period", d_period));
             }
+            IndicatorKind::Kdj {
+                period,
+                k_smoothing,
+                d_smoothing,
+                seed,
+            } => {
+                parameters.push(integer("period", period));
+                parameters.push(integer("k_smoothing", k_smoothing));
+                parameters.push(integer("d_smoothing", d_smoothing));
+                parameters.push(choice(
+                    "seed",
+                    serde_json::json!(seed),
+                    &["fifty", "first_value"],
+                ));
+            }
             IndicatorKind::Vwap => {
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "volume_source".into(),
-                    parameter_type: IndicatorParameterType::Series,
-                    default: serde_json::Value::Null,
-                    min: None,
-                    max: None,
-                });
+                parameters.push(series("volume_source"));
+                parameters.push(series("amount_source"));
             }
-            IndicatorKind::Obv => {
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "volume_source".into(),
-                    parameter_type: IndicatorParameterType::Series,
-                    default: serde_json::Value::Null,
-                    min: None,
-                    max: None,
-                });
-            }
-            IndicatorKind::Cmf { period } => {
+            IndicatorKind::Obv => parameters.push(series("volume_source")),
+            IndicatorKind::Cmf { period }
+            | IndicatorKind::Mfi { period }
+            | IndicatorKind::Volume { period }
+            | IndicatorKind::Vwma { period } => {
                 parameters.push(integer("period", period));
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "volume_source".into(),
-                    parameter_type: IndicatorParameterType::Series,
-                    default: serde_json::Value::Null,
-                    min: None,
-                    max: None,
-                });
-            }
-            IndicatorKind::Mfi { period } => {
-                parameters.push(integer("period", period));
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "volume_source".into(),
-                    parameter_type: IndicatorParameterType::Series,
-                    default: serde_json::Value::Null,
-                    min: None,
-                    max: None,
-                });
-            }
-            IndicatorKind::Volume { period } => {
-                parameters.push(integer("period", period));
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "volume_source".into(),
-                    parameter_type: IndicatorParameterType::Series,
-                    default: serde_json::Value::Null,
-                    min: None,
-                    max: None,
-                });
-            }
-            IndicatorKind::Vwma { period } => {
-                parameters.push(integer("period", period));
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "volume_source".into(),
-                    parameter_type: IndicatorParameterType::Series,
-                    default: serde_json::Value::Null,
-                    min: None,
-                    max: None,
-                });
+                parameters.push(series("volume_source"));
             }
             IndicatorKind::VwapBands {
                 reset,
                 standard_deviation,
                 percent,
             } => {
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "reset".into(),
-                    parameter_type: IndicatorParameterType::Source,
-                    default: serde_json::json!(reset),
-                    min: None,
-                    max: None,
-                });
+                parameters.push(descriptor(
+                    "reset",
+                    IndicatorParameterType::Source,
+                    serde_json::json!(reset),
+                    None,
+                ));
                 parameters.push(number("standard_deviation", standard_deviation));
                 parameters.push(number("percent", percent));
-                parameters.push(IndicatorParameterDescriptor {
-                    name: "volume_source".into(),
-                    parameter_type: IndicatorParameterType::Series,
-                    default: serde_json::Value::Null,
-                    min: None,
-                    max: None,
-                });
+                parameters.push(series("volume_source"));
             }
         }
         let output_count = incremental_state(kind).output_count();
@@ -1467,10 +1777,14 @@ impl ChartEngine {
         self.indicators.retain(|binding| {
             let touches_removed = binding.source == id
                 || binding.volume_source == Some(id)
+                || binding.amount_source == Some(id)
                 || binding.outputs.contains(&id)
                 || dropped_outputs.contains(&binding.source)
                 || binding
                     .volume_source
+                    .is_some_and(|source| dropped_outputs.contains(&source))
+                || binding
+                    .amount_source
                     .is_some_and(|source| dropped_outputs.contains(&source));
             if touches_removed {
                 dropped_outputs.extend(binding.outputs.iter().copied());
@@ -1488,8 +1802,18 @@ impl ChartEngine {
         source_input: IndicatorInputSource,
         kind: IndicatorKind,
         volume_source: Option<SeriesId>,
+        amount_source: Option<SeriesId>,
     ) -> Vec<SeriesId> {
         if self.series_entry(source).is_none()
+            || amount_source.is_some_and(|id| {
+                // Turnover weighting divides by volume, so it needs a distinct volume column.
+                !matches!(kind, IndicatorKind::Vwap)
+                    || volume_source.is_none_or(|volume| volume == id)
+                    || id == source
+                    || self
+                        .series_entry(id)
+                        .is_none_or(|series| !series.kind.stores_scalar_values())
+            })
             || match &kind {
                 IndicatorKind::Obv
                 | IndicatorKind::Cmf { .. }
@@ -1512,18 +1836,24 @@ impl ChartEngine {
             }
             || match &kind {
                 IndicatorKind::Sma { period }
-                | IndicatorKind::Ema { period }
-                | IndicatorKind::Dema { period }
-                | IndicatorKind::Tema { period }
+                | IndicatorKind::Ema { period, .. }
+                | IndicatorKind::Dema { period, .. }
+                | IndicatorKind::Tema { period, .. }
                 | IndicatorKind::Smma { period }
                 | IndicatorKind::Hma { period }
                 | IndicatorKind::Vwma { period }
                 | IndicatorKind::StandardDeviation { period }
                 | IndicatorKind::Donchian { period }
                 | IndicatorKind::Bollinger { period, .. }
-                | IndicatorKind::Rsi { period }
+                | IndicatorKind::Rsi { period, .. }
                 | IndicatorKind::Atr { period }
                 | IndicatorKind::Wma { period } => *period == 0,
+                IndicatorKind::Kdj {
+                    period,
+                    k_smoothing,
+                    d_smoothing,
+                    ..
+                } => *period == 0 || *k_smoothing == 0 || *d_smoothing == 0,
                 IndicatorKind::EmaRibbon { periods } => periods.contains(&0),
                 IndicatorKind::Keltner { period, multiplier } => {
                     *period == 0 || !multiplier.is_finite() || *multiplier < 0.0
@@ -1546,8 +1876,18 @@ impl ChartEngine {
                     *period == 0 || !multiplier.is_finite() || *multiplier < 0.0
                 }
                 IndicatorKind::Ichimoku => false,
-                IndicatorKind::Macd { fast, slow, signal } => {
-                    *fast == 0 || *slow == 0 || *signal == 0
+                IndicatorKind::Macd {
+                    fast,
+                    slow,
+                    signal,
+                    histogram_multiplier,
+                    ..
+                } => {
+                    *fast == 0
+                        || *slow == 0
+                        || *signal == 0
+                        || !histogram_multiplier.is_finite()
+                        || *histogram_multiplier <= 0.0
                 }
                 IndicatorKind::Stochastic { k_period, d_period } => {
                     *k_period == 0 || *d_period == 0
@@ -1602,10 +1942,12 @@ impl ChartEngine {
                             lower: 30.0,
                             upper: 70.0,
                         }),
-                        IndicatorKind::Stochastic { .. } => Some(SeriesThresholdRegion {
-                            lower: 20.0,
-                            upper: 80.0,
-                        }),
+                        IndicatorKind::Stochastic { .. } | IndicatorKind::Kdj { .. } => {
+                            Some(SeriesThresholdRegion {
+                                lower: 20.0,
+                                upper: 80.0,
+                            })
+                        }
                         IndicatorKind::Cci { .. } => Some(SeriesThresholdRegion {
                             lower: -100.0,
                             upper: 100.0,
@@ -1638,8 +1980,10 @@ impl ChartEngine {
             kind,
             outputs: ids.clone(),
             volume_source,
+            amount_source,
             source_generation: 0,
             volume_generation: None,
+            amount_generation: None,
         });
         self.rebuild_indicator(self.indicators.len() - 1, 0, true);
         ids
@@ -1699,6 +2043,45 @@ impl ChartEngine {
         self.refresh_resampled_dependents(dependency);
     }
 
+    /// First source row affected when a timestamp-aligned weight column (volume or turnover)
+    /// changed from its own row `from`. Weight rows pair with source rows by timestamp, not by
+    /// position, so every source row after the last unchanged weight timestamp is affected.
+    fn weight_change_source_row(&self, source: SeriesId, weight: SeriesId, from: usize) -> usize {
+        let Some(previous) = from.checked_sub(1) else {
+            return 0;
+        };
+        let (Some((source_times, _)), Some((weight_times, _))) =
+            (self.data.series_data(source), self.data.series_data(weight))
+        else {
+            return 0;
+        };
+        match weight_times.get(previous).or(weight_times.last()) {
+            Some(&unchanged) => source_times.partition_point(|&time| time <= unchanged),
+            None => 0,
+        }
+    }
+
+    /// Exchange time zone, session start, or calendar-date changes move trading-day boundaries:
+    /// rebuild every period-keyed binding (VWAP, VWAP bands, pivots) and its dependents once.
+    pub(crate) fn rebuild_trading_day_indicators(&mut self) {
+        self.indicator_changes.clear();
+        for index in 0..self.indicators.len() {
+            if matches!(
+                self.indicators[index].kind,
+                IndicatorKind::Vwap
+                    | IndicatorKind::VwapBands { .. }
+                    | IndicatorKind::PivotPoints { .. }
+            ) {
+                let changes = self.rebuild_indicator(index, 0, true);
+                self.indicator_changes.extend(changes.into_iter().flatten());
+            }
+        }
+        if !self.indicator_changes.is_empty() {
+            self.propagate_indicator_changes();
+            self.sync_time_points();
+        }
+    }
+
     fn propagate_indicator_changes(&mut self) {
         // Bindings are topological by construction: an indicator output must exist before it can
         // be selected as a later indicator's source. One forward pass therefore updates direct
@@ -1709,18 +2092,24 @@ impl ChartEngine {
                 self.indicator_changes
                     .iter()
                     .filter_map(|&(dependency, change)| {
-                        let tracked = if binding.source == dependency {
-                            binding.source_generation
+                        let (tracked, weight_column) = if binding.source == dependency {
+                            (binding.source_generation, false)
                         } else if binding.volume_source == Some(dependency) {
-                            binding.volume_generation.unwrap_or(0)
+                            (binding.volume_generation.unwrap_or(0), true)
+                        } else if binding.amount_source == Some(dependency) {
+                            (binding.amount_generation.unwrap_or(0), true)
                         } else {
                             return None;
                         };
                         let stale = tracked != change.previous_generation;
-                        Some((
-                            if stale { 0 } else { change.from },
-                            change.full_replace || stale,
-                        ))
+                        let from = if stale {
+                            0
+                        } else if weight_column {
+                            self.weight_change_source_row(binding.source, dependency, change.from)
+                        } else {
+                            change.from
+                        };
+                        Some((from, change.full_replace || stale))
                     })
                     .reduce(|left, right| (left.0.min(right.0), left.1 || right.1))
             };
@@ -1747,35 +2136,50 @@ impl ChartEngine {
         let source = self.indicators[index].source;
         let source_input = self.indicators[index].source_input;
         let volume_source = self.indicators[index].volume_source;
+        let amount_source = self.indicators[index].amount_source;
         {
             let Some((times, values)) = self.data.series_data(source) else {
                 return changes;
             };
             let selected_close = selected_input(source_input, values);
-            let volume = volume_source
-                .and_then(|id| self.data.series_data(id))
-                .map_or(Cow::Borrowed(&[][..]), |(volume_times, values)| {
-                    if volume_times == times {
-                        Cow::Borrowed(values[3])
-                    } else {
-                        Cow::Owned(align_volume_to_source_times(
-                            times,
-                            volume_times,
-                            values[3],
-                            matches!(
-                                &self.indicators[index].kind,
-                                IndicatorKind::Obv
-                                    | IndicatorKind::Cmf { .. }
-                                    | IndicatorKind::Mfi { .. }
-                                    | IndicatorKind::Volume { .. }
-                            )
-                            .then_some(0.0)
-                            .unwrap_or(1.0),
-                        ))
-                    }
-                });
+            // Missing volume/amount timestamps use the documented fallback: zero for volume
+            // studies, unit weight for VWAP/VWMA, and "no trade" (NaN, skipped) for the
+            // amount-weighted average price.
+            let fallback = if amount_source.is_some() {
+                f64::NAN
+            } else if matches!(
+                &self.indicators[index].kind,
+                IndicatorKind::Obv
+                    | IndicatorKind::Cmf { .. }
+                    | IndicatorKind::Mfi { .. }
+                    | IndicatorKind::Volume { .. }
+            ) {
+                0.0
+            } else {
+                1.0
+            };
+            let aligned = |column: Option<SeriesId>| {
+                column.and_then(|id| self.data.series_data(id)).map_or(
+                    Cow::Borrowed(&[][..]),
+                    |(column_times, values)| {
+                        if column_times == times {
+                            Cow::Borrowed(values[3])
+                        } else {
+                            Cow::Owned(align_volume_to_source_times(
+                                times,
+                                column_times,
+                                values[3],
+                                fallback,
+                            ))
+                        }
+                    },
+                )
+            };
+            let volume = aligned(volume_source);
+            let amount = aligned(amount_source);
+            let exchange_time = &self.exchange_time;
             let binding = &mut self.indicators[index];
-            binding.runtime.rebuild_from(
+            binding.runtime.rebuild_from_with_trading_days(
                 aeris_charts_indicators::IndicatorInput {
                     times,
                     open: values[0],
@@ -1783,13 +2187,17 @@ impl ChartEngine {
                     low: values[2],
                     close: selected_close.as_ref(),
                     volume: volume.as_ref(),
+                    amount: amount.as_ref(),
                 },
                 if full_replace { 0 } else { from },
+                &|seconds| exchange_time.trading_day_seconds(seconds),
             );
         }
         self.indicators[index].source_generation = self.data.series_generation(source).unwrap_or(0);
         self.indicators[index].volume_generation =
             volume_source.and_then(|id| self.data.series_generation(id));
+        self.indicators[index].amount_generation =
+            amount_source.and_then(|id| self.data.series_generation(id));
 
         let mut full_histogram_colors = None;
         for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
@@ -1824,30 +2232,41 @@ impl ChartEngine {
             }
         }
 
-        if let IndicatorKind::Macd { slow, signal, .. } = self.indicators[index].kind {
+        if matches!(self.indicators[index].kind, IndicatorKind::Macd { .. }) {
             let histogram_id = outputs[2].unwrap();
             if let Some(colors) = full_histogram_colors {
                 self.data
                     .set_point_colors(histogram_id, [Some(colors), None, None]);
             } else {
                 let histogram = self.indicators[index].runtime.output(2);
-                let first_histogram = slow.saturating_add(signal).saturating_sub(2);
+                // The histogram series aliases source rows from its warm-up row, which depends on
+                // the seed convention.
+                let first_histogram = self.indicators[index].runtime.warmup_rows(2);
                 let source_from = self.indicators[index].runtime.output_from(2);
                 let output_start = source_from.saturating_sub(first_histogram);
                 let mut previous = output_start.checked_sub(1).and_then(|row| {
                     self.data
                         .series_data(histogram_id)
                         .and_then(|(_, values)| values[3].get(row).copied())
+                        .filter(|value| value.is_finite())
                 });
                 for (offset, &value) in histogram.iter().enumerate() {
-                    let color = momentum_histogram_color(value, previous);
+                    // Whitespace resets the momentum comparison exactly like a full rebuild.
+                    let (color, next) = if value.is_finite() {
+                        (momentum_histogram_color(value, previous), Some(value))
+                    } else {
+                        (
+                            aeris_charts_core::model::data_layer::POINT_COLOR_ABSENT,
+                            None,
+                        )
+                    };
                     self.data.set_point_color(
                         histogram_id,
                         PointColorChannel::Body,
                         output_start + offset,
                         color,
                     );
-                    previous = Some(value);
+                    previous = next;
                 }
             }
         }
@@ -1971,6 +2390,7 @@ fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {
         IndicatorKind::Volume { .. } => "volume",
         IndicatorKind::VwapBands { .. } => "vwap_bands",
         IndicatorKind::Wma { .. } => "wma",
+        IndicatorKind::Kdj { .. } => "kdj",
     }
 }
 
@@ -1987,9 +2407,15 @@ fn pivot_kind_index(kind: aeris_charts_indicators::PivotKind) -> usize {
 fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::IncrementalState {
     match *kind {
         IndicatorKind::Sma { period } => aeris_charts_indicators::IncrementalState::sma(period),
-        IndicatorKind::Ema { period } => aeris_charts_indicators::IncrementalState::ema(period),
-        IndicatorKind::Dema { period } => aeris_charts_indicators::IncrementalState::dema(period),
-        IndicatorKind::Tema { period } => aeris_charts_indicators::IncrementalState::tema(period),
+        IndicatorKind::Ema { period, seed } => {
+            aeris_charts_indicators::IncrementalState::ema_with_seed(period, seed)
+        }
+        IndicatorKind::Dema { period, seed } => {
+            aeris_charts_indicators::IncrementalState::dema_with_seed(period, seed)
+        }
+        IndicatorKind::Tema { period, seed } => {
+            aeris_charts_indicators::IncrementalState::tema_with_seed(period, seed)
+        }
         IndicatorKind::Smma { period } => aeris_charts_indicators::IncrementalState::smma(period),
         IndicatorKind::Hma { period } => aeris_charts_indicators::IncrementalState::hma(period),
         IndicatorKind::Vwma { period } => aeris_charts_indicators::IncrementalState::vwma(period),
@@ -2029,13 +2455,40 @@ fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::Increment
         IndicatorKind::EmaRibbon { periods } => {
             aeris_charts_indicators::IncrementalState::ema_ribbon(periods)
         }
-        IndicatorKind::Bollinger { period, deviation } => {
-            aeris_charts_indicators::IncrementalState::bollinger(period, deviation)
+        IndicatorKind::Bollinger {
+            period,
+            deviation,
+            estimator,
+        } => {
+            aeris_charts_indicators::IncrementalState::bollinger_with(period, deviation, estimator)
         }
-        IndicatorKind::Rsi { period } => aeris_charts_indicators::IncrementalState::rsi(period),
-        IndicatorKind::Macd { fast, slow, signal } => {
-            aeris_charts_indicators::IncrementalState::macd(fast, slow, signal)
+        IndicatorKind::Rsi { period, seed } => {
+            aeris_charts_indicators::IncrementalState::rsi_with_seed(period, seed)
         }
+        IndicatorKind::Macd {
+            fast,
+            slow,
+            signal,
+            seed,
+            histogram_multiplier,
+        } => aeris_charts_indicators::IncrementalState::macd_with(
+            fast,
+            slow,
+            signal,
+            seed,
+            histogram_multiplier,
+        ),
+        IndicatorKind::Kdj {
+            period,
+            k_smoothing,
+            d_smoothing,
+            seed,
+        } => aeris_charts_indicators::IncrementalState::kdj_with_seed(
+            period,
+            k_smoothing,
+            d_smoothing,
+            seed,
+        ),
         IndicatorKind::Stochastic { k_period, d_period } => {
             aeris_charts_indicators::IncrementalState::stochastic(k_period, d_period)
         }
@@ -2094,9 +2547,9 @@ fn indicator_title(kind: &IndicatorKind) -> String {
     };
     match kind {
         IndicatorKind::Sma { period } => format!("SMA {period}"),
-        IndicatorKind::Ema { period } => format!("EMA {period}"),
-        IndicatorKind::Dema { period } => format!("DEMA {period}"),
-        IndicatorKind::Tema { period } => format!("TEMA {period}"),
+        IndicatorKind::Ema { period, .. } => format!("EMA {period}"),
+        IndicatorKind::Dema { period, .. } => format!("DEMA {period}"),
+        IndicatorKind::Tema { period, .. } => format!("TEMA {period}"),
         IndicatorKind::Smma { period } => format!("SMMA {period}"),
         IndicatorKind::Hma { period } => format!("HMA {period}"),
         IndicatorKind::Vwma { period } => format!("VWMA {period}"),
@@ -2127,11 +2580,15 @@ fn indicator_title(kind: &IndicatorKind) -> String {
             "EMA Ribbon {} {} {} {} {}",
             periods[0], periods[1], periods[2], periods[3], periods[4]
         ),
-        IndicatorKind::Bollinger { period, deviation } => {
+        IndicatorKind::Bollinger {
+            period, deviation, ..
+        } => {
             format!("Bollinger {period} {}", params(*deviation))
         }
-        IndicatorKind::Rsi { period } => format!("RSI {period}"),
-        IndicatorKind::Macd { fast, slow, signal } => format!("MACD {fast} {slow} {signal}"),
+        IndicatorKind::Rsi { period, .. } => format!("RSI {period}"),
+        IndicatorKind::Macd {
+            fast, slow, signal, ..
+        } => format!("MACD {fast} {slow} {signal}"),
         IndicatorKind::Stochastic { k_period, d_period } => {
             format!("Stochastic {k_period} {d_period}")
         }
@@ -2143,6 +2600,12 @@ fn indicator_title(kind: &IndicatorKind) -> String {
         IndicatorKind::Volume { .. } => "Volume".to_string(),
         IndicatorKind::VwapBands { .. } => "VWAP Bands".to_string(),
         IndicatorKind::Wma { period } => format!("WMA {period}"),
+        IndicatorKind::Kdj {
+            period,
+            k_smoothing,
+            d_smoothing,
+            ..
+        } => format!("KDJ {period} {k_smoothing} {d_smoothing}"),
     }
 }
 
@@ -2219,5 +2682,6 @@ fn indicator_output_name(kind: &IndicatorKind, output_index: usize) -> &'static 
             ["Basis", "Std Upper", "Std Lower", "% Upper", "% Lower"][output_index]
         }
         IndicatorKind::Wma { .. } => "WMA",
+        IndicatorKind::Kdj { .. } => ["K", "D", "J"][output_index],
     }
 }

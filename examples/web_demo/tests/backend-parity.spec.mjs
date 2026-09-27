@@ -483,6 +483,12 @@ test("public time and price scale handles are engine-owned and reference-compati
     minimum_height: 0,
     tick_mark_max_character_length: 8,
     visible: true,
+    // Aeris extensions (defaults): exchange time zone and trading-day start, explicit time-axis
+    // marks, and the fixed-session logical-range lock.
+    time_zone: "UTC",
+    session_start: 0,
+    tick_marks: null,
+    lock_visible_logical_range: false,
   });
   expect(result.series_queries.length).toBe(fixture.bar_count);
   expect(result.series_queries.type).toBe("candlestick");

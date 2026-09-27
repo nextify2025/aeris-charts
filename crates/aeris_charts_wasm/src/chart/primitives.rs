@@ -116,7 +116,12 @@ impl ChartInner {
         let plot = self.engine.data_layer().plot(series.id);
         let row = plot.first_non_whitespace_row(from)?;
         let value = plot.value_at(row, PlotValueIndex::Close);
-        value.is_finite().then_some(value)
+        // An explicit scale base (price-scale option `base_value`) replaces the first value.
+        let explicit = self
+            .engine
+            .price_scale_for(pane_index, target)
+            .and_then(|scale| scale.options().base_value);
+        explicit.or_else(|| value.is_finite().then_some(value))
     }
 
     /// A series' own base value for percentage/indexed scale modes — its first visible close
@@ -125,7 +130,13 @@ impl ChartInner {
         let plot = self.engine.data_layer().plot(id);
         let row = plot.first_non_whitespace_row(from)?;
         let value = plot.value_at(row, PlotValueIndex::Close);
-        value.is_finite().then_some(value)
+        // An explicit scale base (price-scale option `base_value`) replaces the first value.
+        let explicit = self
+            .engine
+            .series_price_scale(id)
+            .and_then(|(pane, target)| self.engine.price_scale_for(pane, target))
+            .and_then(|scale| scale.options().base_value);
+        explicit.or_else(|| value.is_finite().then_some(value))
     }
 
     pub(super) fn primitive_scale_snapshot(&self) -> PrimitiveScaleSnapshot {

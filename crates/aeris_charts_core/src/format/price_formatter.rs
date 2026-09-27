@@ -34,6 +34,25 @@ fn format_integer(value: u64) -> String {
     grouped
 }
 
+/// Decimal digits needed to print every multiple of `min_move` (reference
+/// `precisionByMinMove`, series-options.ts): `0.0001 -> 4`, `0.05 -> 2`, `1 -> 0`. The reference
+/// compares against an absolute `1e-8`, which returns 0 digits for moves below `1e-8`; here the
+/// scaled move must reach a whole unit first, so `1e-9 -> 9` (capped at the 15-digit limit).
+pub fn precision_by_min_move(min_move: f64) -> u32 {
+    if !min_move.is_finite() || min_move <= 0.0 || min_move >= 1.0 {
+        return 0;
+    }
+    let mut value = min_move;
+    for digits in 0..15 {
+        let whole = value.round();
+        if whole >= 1.0 && (whole - value).abs() < 1e-8 * whole {
+            return digits;
+        }
+        value *= 10.0;
+    }
+    15
+}
+
 #[derive(Clone, Debug)]
 pub struct PriceFormatter {
     price_scale: i64,
@@ -170,5 +189,28 @@ mod tests {
     fn from_precision_helper() {
         let f = PriceFormatter::from_precision(2, 0.01);
         assert_eq!(f.format(10.5), "10.50");
+    }
+
+    #[test]
+    fn precision_follows_min_move_like_the_reference() {
+        for (min_move, precision) in [
+            (0.0001, 4),
+            (0.01, 2),
+            (0.02, 2),
+            (0.05, 2),
+            (0.005, 3),
+            (0.25, 2),
+            (0.03125, 5),
+            (0.5, 1),
+            (1.0, 0),
+            (5.0, 0),
+            (1e-9, 9),
+        ] {
+            assert_eq!(
+                precision_by_min_move(min_move),
+                precision,
+                "min_move {min_move}"
+            );
+        }
     }
 }

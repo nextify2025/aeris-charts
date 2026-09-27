@@ -12,13 +12,15 @@ use crate::{
 use aeris_charts_core::format::percentage_formatter::PercentageFormatter;
 use aeris_charts_core::format::price_formatter::PriceFormatter;
 use aeris_charts_core::format::time_formatter::{
-    format_crosshair_time_with, format_date_pattern, format_tick_label_with,
-    weight_to_tick_mark_type, TickMarkType,
+    format_crosshair_time_in, format_date_pattern, format_tick_label_in, weight_to_tick_mark_type,
+    TickMarkType,
 };
 use aeris_charts_core::format::volume_formatter::VolumeFormatter;
 use aeris_charts_core::model::data_layer::{PointColorChannel, SeriesId};
 use aeris_charts_core::model::magnet::{magnet_snap_coordinate, CrosshairMode};
-use aeris_charts_core::model::plot_list::{MismatchDirection, PlotListView, PlotValueIndex};
+use aeris_charts_core::model::plot_list::{
+    MinMax, MismatchDirection, PlotListView, PlotValueIndex,
+};
 use aeris_charts_core::model::price_range::PriceRange;
 use aeris_charts_core::scale::price_scale_core::{PriceScaleCore, PriceScaleMode};
 use aeris_charts_core::style::{
@@ -720,6 +722,13 @@ struct ResolvedSeries {
     base_value: f64,
 }
 
+/// A series' own autoscale union in raw prices, and whether its data had a visible range (marker
+/// margins and native primitives only participate alongside visible data).
+struct SeriesAutoscaleRange {
+    range: Option<PriceRange>,
+    has_data: bool,
+}
+
 pub(crate) fn series_scale_target(series: &crate::SeriesEntry) -> PriceScaleTarget {
     series.price_scale_target
 }
@@ -1089,6 +1098,24 @@ impl ChartEngine {
 
     pub(crate) fn invalidate_frame_series(&mut self, id: SeriesId) {
         self.frame_invalidation.series(id);
+    }
+
+    /// The generation a retained series layer is built from. A `histogram_updown` histogram
+    /// takes its column colors from the primary price series, so a price-only update (or a
+    /// correction of an earlier close) rebuilds it too. Generations are ticks of one clock, so
+    /// the newer of the two changes whenever either input changes.
+    fn series_layer_source_generation(&self, rs: &ResolvedSeries) -> u64 {
+        let own = self.frame_invalidation.series_generation(rs.id);
+        if rs.kind != SeriesKind::Histogram
+            || !self
+                .series_entry(rs.id)
+                .is_some_and(|series| series.histogram_updown)
+        {
+            return own;
+        }
+        self.primary_series().map_or(own, |primary| {
+            own.max(self.frame_invalidation.series_generation(primary.id))
+        })
     }
 
     pub(crate) fn invalidate_frame_drawings(&mut self) {
@@ -1466,7 +1493,6 @@ impl ChartEngine {
                         (order, side)
                     });
                     if let Some(grid_target) = grid_targets.first().copied() {
-                        let grid_scale = pane_scale(pane, grid_target);
                         self.build_grid_frame(
                             &mut cache.under.prims,
                             &time_marks,
@@ -1477,8 +1503,7 @@ impl ChartEngine {
                             height_px as i32,
                             hpr,
                             vpr,
-                            grid_scale,
-                            self.scale_tick_base(pi, grid_target),
+                            &self.scale_tick_marks(pi, grid_target, 0.0),
                         );
                     }
                     self.build_native_session_highlighting_frame(
@@ -1503,7 +1528,7 @@ impl ChartEngine {
                     .iter()
                     .filter(|rs| rs.pane == Some(pi) && rs.visible)
                     .any(|rs| {
-                        let source_generation = self.frame_invalidation.series_generation(rs.id);
+                        let source_generation = self.series_layer_source_generation(rs);
                         cache
                             .series_layers
                             .iter()
@@ -1526,7 +1551,7 @@ impl ChartEngine {
                         if rs.pane != Some(pi) || !rs.visible {
                             continue;
                         }
-                        let source_generation = self.frame_invalidation.series_generation(rs.id);
+                        let source_generation = self.series_layer_source_generation(rs);
                         let layer_index = match cache
                             .series_layers
                             .iter()
@@ -2320,339 +2345,364 @@ impl ChartEngine {
     }
 
     fn autoscale_for_frame(&mut self, from: i64, to: i64) {
-        struct NamedAutoscale {
+        /// One pane-local scale's autoscale inputs for this pass, in its logical domain.
+        struct ScaleAutoscale {
+            pane: usize,
             target: PriceScaleTarget,
-            range: Option<PriceRange>,
+            exact: Option<PriceRange>,
+            /// The same union one bar beyond both visible edges (stable scales only).
+            extended: Option<PriceRange>,
             margins: (f64, f64),
             min_move: f64,
+            stable: bool,
+            center: Option<f64>,
+        }
+        fn merge(slot: &mut Option<PriceRange>, range: PriceRange) {
+            *slot = Some(match slot.take() {
+                Some(old) => old.merge(Some(&range)),
+                None => range,
+            });
         }
 
-        let n = self.panes.len().max(1);
-        let scale_min_moves: Vec<[f64; 3]> = (0..n)
-            .map(|pane| {
-                [
-                    self.scale_autoscale_min_move(pane, PriceScaleTarget::Right),
-                    self.scale_autoscale_min_move(pane, PriceScaleTarget::Left),
-                    self.scale_autoscale_min_move(pane, PriceScaleTarget::Overlay),
-                ]
-            })
-            .collect();
-        let mut main: Vec<Option<PriceRange>> = vec![None; n];
-        let mut left: Vec<Option<PriceRange>> = vec![None; n];
-        let mut overlay: Vec<Option<PriceRange>> = vec![None; n];
-        let mut main_marker_margins = vec![(0.0_f64, 0.0_f64); n];
-        let mut left_marker_margins = vec![(0.0_f64, 0.0_f64); n];
-        let mut overlay_marker_margins = vec![(0.0_f64, 0.0_f64); n];
-        let mut named: Vec<Vec<NamedAutoscale>> = self
-            .panes
-            .iter()
-            .enumerate()
-            .map(|(pane_index, pane)| {
-                pane.named_scales
-                    .iter()
-                    .map(|entry| {
-                        let target = PriceScaleTarget::Named(entry.id);
-                        NamedAutoscale {
-                            target,
-                            range: None,
-                            margins: (0.0, 0.0),
-                            min_move: self.scale_autoscale_min_move(pane_index, target),
+        let last_index = self.data.merged_times().len() as i64 - 1;
+        let wide_window = ((from - 1).max(0), (to + 1).min(last_index.max(to)));
+        let bar_spacing = self.time_scale.bar_spacing();
+        let mut scales = Vec::new();
+        for (pane_index, pane) in self.panes.iter().enumerate() {
+            for target in pane.scale_targets() {
+                let Some(scale) = pane.scale(target) else {
+                    continue;
+                };
+                let options = scale.options();
+                let center = options.autoscale_center.and_then(|center| {
+                    let base = match scale.mode() {
+                        PriceScaleMode::Percentage | PriceScaleMode::IndexedTo100 => {
+                            options.base_value.or_else(|| {
+                                self.scale_formatter_source(pane_index, target)
+                                    .and_then(|series| self.series_base_value(series.id, from))
+                            })?
                         }
-                    })
-                    .collect()
+                        _ => 0.0,
+                    };
+                    let logical = scale.price_to_logical_value(center, base);
+                    logical.is_finite().then_some(logical)
+                });
+                scales.push(ScaleAutoscale {
+                    pane: pane_index,
+                    target,
+                    exact: None,
+                    extended: None,
+                    margins: (0.0, 0.0),
+                    min_move: self.scale_autoscale_min_move(pane_index, target),
+                    stable: options.stable_auto_scale && scale.is_auto_scale(),
+                    center,
+                });
+            }
+        }
+        // Data min/max queries go through the plot cache, which needs the data layer mutably:
+        // resolve them first (strict window, plus the one-bar-wider window for stable scales).
+        const LOW_HIGH: [PlotValueIndex; 2] = [PlotValueIndex::Low, PlotValueIndex::High];
+        let data_min_max: Vec<_> = self
+            .series
+            .iter()
+            .map(|s| {
+                if !s.visible {
+                    return (None, None);
+                }
+                let stable = scales.iter().any(|acc| {
+                    acc.stable && acc.pane == s.pane_index && acc.target == series_scale_target(s)
+                });
+                let exact = self.data.min_max_on_range_cached(s.id, from, to, &LOW_HIGH);
+                let wide = if stable {
+                    self.data
+                        .min_max_on_range_cached(s.id, wide_window.0, wide_window.1, &LOW_HIGH)
+                } else {
+                    None
+                };
+                (exact, wide)
             })
             .collect();
-        for s in &self.series {
+        for (s, (exact_min_max, wide_min_max)) in self.series.iter().zip(data_min_max) {
             // Hidden series remain engine-owned so they can be toggled back on, but—matching
             // reference—they must not contribute to the active price-scale autoscale range. A
             // pane-less series (its pane was removed) scales nowhere either.
             if !s.visible {
                 continue;
             }
-            let Some(pane_index) = (s.pane_index < n).then_some(s.pane_index) else {
+            let target = series_scale_target(s);
+            let Some(slot) = scales
+                .iter()
+                .position(|acc| acc.pane == s.pane_index && acc.target == target)
+            else {
                 continue;
             };
-            let raw_mm = self.data.min_max_on_range_cached(
-                s.id,
-                from,
-                to,
-                &[PlotValueIndex::Low, PlotValueIndex::High],
-            );
-            let (mut minimum, mut maximum) = if s.kind == SeriesKind::Candlestick && s.heikin_ashi {
+            let Some(base_value) = self.series_base_value(s.id, from) else {
+                continue;
+            };
+            let marker_margins = if s.markers_auto_scale {
+                marker_auto_scale_margins(&s.markers, bar_spacing)
+            } else {
+                (0.0, 0.0)
+            };
+            let (exact, extended, margins) = match &s.autoscale_info_provider {
+                // reference `autoscaleInfoProvider`: the host sees the series' own info and its
+                // answer replaces it outright (range and margins).
+                Some(provider) => {
+                    let own = self.series_autoscale_range(s, exact_min_max, from, to);
+                    let base = (!self.data.plot(s.id).is_empty()).then(|| crate::AutoscaleInfo {
+                        price_range: own
+                            .range
+                            .map(|range| (range.min_value(), range.max_value())),
+                        margins: (own.has_data && marker_margins != (0.0, 0.0))
+                            .then_some(marker_margins),
+                    });
+                    let info = provider(base);
+                    let range = info
+                        .and_then(|info| info.price_range)
+                        .filter(|(min, max)| min.is_finite() && max.is_finite() && min <= max)
+                        .map(|(min, max)| PriceRange::new(min, max));
+                    let margins = info
+                        .and_then(|info| info.margins)
+                        .filter(|(above, below)| above.is_finite() && below.is_finite())
+                        .map_or((0.0, 0.0), |(above, below)| {
+                            (above.max(0.0), below.max(0.0))
+                        });
+                    (range, range, margins)
+                }
+                None => {
+                    let own = self.series_autoscale_range(s, exact_min_max, from, to);
+                    let wide = if scales[slot].stable {
+                        self.series_autoscale_range(s, wide_min_max, wide_window.0, wide_window.1)
+                            .range
+                    } else {
+                        None
+                    };
+                    let margins = if own.has_data {
+                        marker_margins
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    (own.range, wide, margins)
+                }
+            };
+            let Some(exact) = exact else {
+                continue;
+            };
+            let scale = pane_scale(&self.panes[s.pane_index], target);
+            let Some(exact) = scale.price_range_to_logical(&exact, base_value) else {
+                continue;
+            };
+            let extended =
+                extended.and_then(|range| scale.price_range_to_logical(&range, base_value));
+            let acc = &mut scales[slot];
+            merge(&mut acc.exact, exact);
+            if acc.stable {
+                merge(&mut acc.extended, extended.unwrap_or(exact));
+            }
+            acc.margins.0 = acc.margins.0.max(margins.0);
+            acc.margins.1 = acc.margins.1.max(margins.1);
+        }
+        for acc in &scales {
+            let pane = &mut self.panes[acc.pane];
+            let auto = pane
+                .scale(acc.target)
+                .is_some_and(PriceScaleCore::is_auto_scale);
+            let (above, below) = if auto { acc.margins } else { (0.0, 0.0) };
+            match acc.target {
+                PriceScaleTarget::Right => {
+                    pane.marker_margin_above = above;
+                    pane.marker_margin_below = below;
+                }
+                PriceScaleTarget::Left => {
+                    pane.left_marker_margin_above = above;
+                    pane.left_marker_margin_below = below;
+                }
+                PriceScaleTarget::Overlay => {
+                    pane.overlay_marker_margin_above = above;
+                    pane.overlay_marker_margin_below = below;
+                }
+                PriceScaleTarget::Named(id) => {
+                    if let Some(entry) = pane.named_scale_mut(id) {
+                        entry.marker_margin_above = above;
+                        entry.marker_margin_below = below;
+                    }
+                }
+            }
+        }
+        for pane in &mut self.panes {
+            pane.refresh_internal_margins();
+        }
+        for acc in scales {
+            let Some(scale) = self.panes[acc.pane].scale_mut(acc.target) else {
+                continue;
+            };
+            if !scale.is_auto_scale() {
+                continue;
+            }
+            let Some(mut exact) = acc.exact else {
+                continue;
+            };
+            let mut extended = acc.extended;
+            if acc.target == PriceScaleTarget::Overlay {
+                // The overlay (volume) scale always keeps zero in range.
+                let zero = PriceRange::new(0.0, 0.0);
+                exact = exact.merge(Some(&zero));
+                extended = extended.map(|range| range.merge(Some(&zero)));
+            }
+            scale.apply_autoscale_ranges(Some(exact), extended, acc.center, acc.min_move);
+        }
+    }
+
+    /// One series' own autoscale range in raw prices over merged bars `[from, to]` (reference
+    /// series.ts `_autoscaleInfoImpl`): its data (Heikin-Ashi and footprint-cell aware), the
+    /// engine-owned native primitives that participate while the data is visible, and the host
+    /// series-primitive contributions recorded for this frame.
+    fn series_autoscale_range(
+        &self,
+        s: &crate::SeriesEntry,
+        data_min_max: Option<MinMax>,
+        from: i64,
+        to: i64,
+    ) -> SeriesAutoscaleRange {
+        let mut range = self.series_data_autoscale_range(s, data_min_max, from, to);
+        let has_data = range.is_some();
+        if has_data {
+            // Engine-owned volume profiles participate only while their anchored bar span
+            // overlaps the visible logical range, matching the official primitive's autoscaleInfo
+            // gate.
+            for primitive in &s.native_primitives {
+                if let Some(primitive_range) =
+                    self.native_primitive_autoscale_range(s, primitive, from, to)
+                {
+                    range = Some(match range {
+                        Some(old) => old.merge(Some(&primitive_range)),
+                        None => primitive_range,
+                    });
+                }
+            }
+        }
+        // Series-primitive autoscale contributions (plugin platform Phase C-b): reference merges a
+        // series primitive's `autoscaleInfo` into its owning series' autoscale info. The pane and
+        // scale recorded with the contribution must still match the series.
+        let target = series_scale_target(s);
+        for contribution in &self.primitive_autoscale {
+            if contribution.series != s.id
+                || contribution.pane != s.pane_index
+                || contribution.target != target
+            {
+                continue;
+            }
+            let contribution = PriceRange::new(contribution.min, contribution.max);
+            range = Some(match range {
+                Some(old) => old.merge(Some(&contribution)),
+                None => contribution,
+            });
+        }
+        SeriesAutoscaleRange { range, has_data }
+    }
+
+    /// `data_min_max` is the plot cache's low/high min/max over `[from, to]`.
+    fn series_data_autoscale_range(
+        &self,
+        s: &crate::SeriesEntry,
+        data_min_max: Option<MinMax>,
+        from: i64,
+        to: i64,
+    ) -> Option<PriceRange> {
+        let (minimum, maximum) = if s.kind == SeriesKind::Candlestick && s.heikin_ashi {
+            let plot = self.data.plot(s.id);
+            let mut minimum = f64::INFINITY;
+            let mut maximum = f64::NEG_INFINITY;
+            for row in plot.visible_rows(from, to) {
+                if let Some(values) = self.heikin_ashi_row(s.id, row) {
+                    minimum = minimum.min(values[2]);
+                    maximum = maximum.max(values[1]);
+                }
+            }
+            (minimum, maximum)
+        } else {
+            let mm = data_min_max?;
+            (mm.min, mm.max)
+        };
+        if !minimum.is_finite() || !maximum.is_finite() {
+            return None;
+        }
+        if s.kind == SeriesKind::Footprint {
+            let state = s.footprint.as_ref()?;
+            let stream = self.trade_stream(state.trade_stream_id)?;
+            let (minimum, maximum) =
+                crate::footprint::footprint_row_price_bounds(&stream.options(), minimum, maximum);
+            return Some(PriceRange::new(minimum, maximum));
+        }
+        if s.kind == SeriesKind::Histogram && s.base.is_finite() {
+            // reference series.ts `_autoscaleInfoImpl`: a histogram's range always includes its
+            // `base`, so columns grow from a visible base and keep heights proportional (a
+            // single volume column spans the pane instead of collapsing to a degenerate range).
+            return Some(PriceRange::new(minimum.min(s.base), maximum.max(s.base)));
+        }
+        Some(PriceRange::new(minimum, maximum))
+    }
+
+    fn native_primitive_autoscale_range(
+        &self,
+        s: &crate::SeriesEntry,
+        primitive: &crate::native_primitives::NativeSeriesPrimitive,
+        from: i64,
+        to: i64,
+    ) -> Option<PriceRange> {
+        match &primitive.kind {
+            crate::native_primitives::NativeSeriesPrimitiveKind::BandsIndicator(_) => {
                 let plot = self.data.plot(s.id);
                 let mut minimum = f64::INFINITY;
                 let mut maximum = f64::NEG_INFINITY;
                 for row in plot.visible_rows(from, to) {
-                    if let Some(values) = self.heikin_ashi_row(s.id, row) {
-                        minimum = minimum.min(values[2]);
-                        maximum = maximum.max(values[1]);
+                    if plot.is_whitespace_row(row) {
+                        continue;
                     }
+                    let price = plot.value_at(row, PlotValueIndex::Close);
+                    if !price.is_finite() {
+                        continue;
+                    }
+                    let first = price * 0.9;
+                    let second = price * 1.1;
+                    minimum = minimum.min(first.min(second));
+                    maximum = maximum.max(first.max(second));
                 }
-                (minimum, maximum)
-            } else {
-                let Some(mm) = raw_mm else {
-                    continue;
-                };
-                (mm.min, mm.max)
-            };
-            if !minimum.is_finite() || !maximum.is_finite() {
-                continue;
+                (minimum.is_finite() && maximum.is_finite())
+                    .then(|| PriceRange::new(minimum, maximum))
             }
-            if s.kind == SeriesKind::Footprint {
-                let Some(state) = s.footprint.as_ref() else {
-                    continue;
-                };
-                let Some(stream) = self.trade_stream(state.trade_stream_id) else {
-                    continue;
-                };
-                (minimum, maximum) = crate::footprint::footprint_row_price_bounds(
-                    &stream.options(),
-                    minimum,
-                    maximum,
+            crate::native_primitives::NativeSeriesPrimitiveKind::VolumeProfile { data, .. } => {
+                let logical = self.time_to_index(data.time as f64, false)?;
+                if to < logical || from as f64 > logical as f64 + data.width {
+                    return None;
+                }
+                let (minimum, maximum) = data.profile.iter().fold(
+                    (f64::INFINITY, f64::NEG_INFINITY),
+                    |(minimum, maximum), point| {
+                        (minimum.min(point.price), maximum.max(point.price))
+                    },
                 );
+                (minimum.is_finite() && maximum.is_finite())
+                    .then(|| PriceRange::new(minimum, maximum))
             }
-            let Some(base_value) = self.series_base_value(s.id, from) else {
-                continue;
-            };
-            let scale_target = series_scale_target(s);
-            let scale = pane_scale(&self.panes[pane_index], scale_target);
-            let Some(range) =
-                scale.price_range_to_logical(&PriceRange::new(minimum, maximum), base_value)
-            else {
-                continue;
-            };
-            let slot = match scale_target {
-                PriceScaleTarget::Right => &mut main[pane_index],
-                PriceScaleTarget::Left => &mut left[pane_index],
-                PriceScaleTarget::Overlay => &mut overlay[pane_index],
-                PriceScaleTarget::Named(_) => {
-                    let Some(entry) = named[pane_index]
-                        .iter_mut()
-                        .find(|entry| entry.target == scale_target)
-                    else {
-                        continue;
-                    };
-                    &mut entry.range
+            crate::native_primitives::NativeSeriesPrimitiveKind::TrendLine {
+                first_time,
+                first_price,
+                second_time,
+                second_price,
+                ..
+            } => {
+                let first = self.time_to_index(*first_time as f64, false)?;
+                let second = self.time_to_index(*second_time as f64, false)?;
+                if to < first.min(second) || from > first.max(second) {
+                    return None;
                 }
-            };
-            *slot = Some(match slot.take() {
-                Some(old) => old.merge(Some(&range)),
-                None => range,
-            });
-            // Engine-owned volume profiles participate only while their anchored bar span overlaps
-            // the visible logical range, matching the official primitive's autoscaleInfo gate.
-            for primitive in &s.native_primitives {
-                let range = match &primitive.kind {
-                    crate::native_primitives::NativeSeriesPrimitiveKind::BandsIndicator(_) => {
-                        let plot = self.data.plot(s.id);
-                        let mut minimum = f64::INFINITY;
-                        let mut maximum = f64::NEG_INFINITY;
-                        for row in plot.visible_rows(from, to) {
-                            if plot.is_whitespace_row(row) {
-                                continue;
-                            }
-                            let price = plot.value_at(row, PlotValueIndex::Close);
-                            if !price.is_finite() {
-                                continue;
-                            }
-                            let first = price * 0.9;
-                            let second = price * 1.1;
-                            minimum = minimum.min(first.min(second));
-                            maximum = maximum.max(first.max(second));
-                        }
-                        if !minimum.is_finite() || !maximum.is_finite() {
-                            continue;
-                        }
-                        PriceRange::new(minimum, maximum)
-                    }
-                    crate::native_primitives::NativeSeriesPrimitiveKind::VolumeProfile {
-                        data,
-                        ..
-                    } => {
-                        let Some(logical) = self.time_to_index(data.time as f64, false) else {
-                            continue;
-                        };
-                        if to < logical || from as f64 > logical as f64 + data.width {
-                            continue;
-                        }
-                        let (minimum, maximum) = data.profile.iter().fold(
-                            (f64::INFINITY, f64::NEG_INFINITY),
-                            |(minimum, maximum), point| {
-                                (minimum.min(point.price), maximum.max(point.price))
-                            },
-                        );
-                        PriceRange::new(minimum, maximum)
-                    }
-                    crate::native_primitives::NativeSeriesPrimitiveKind::TrendLine {
-                        first_time,
-                        first_price,
-                        second_time,
-                        second_price,
-                        ..
-                    } => {
-                        let (Some(first), Some(second)) = (
-                            self.time_to_index(*first_time as f64, false),
-                            self.time_to_index(*second_time as f64, false),
-                        ) else {
-                            continue;
-                        };
-                        if to < first.min(second) || from > first.max(second) {
-                            continue;
-                        }
-                        PriceRange::new(
-                            first_price.min(*second_price),
-                            first_price.max(*second_price),
-                        )
-                    }
-                    _ => continue,
-                };
-                let Some(profile_range) = scale.price_range_to_logical(&range, base_value) else {
-                    continue;
-                };
-                *slot = Some(match slot.take() {
-                    Some(old) => old.merge(Some(&profile_range)),
-                    None => profile_range,
-                });
+                Some(PriceRange::new(
+                    first_price.min(*second_price),
+                    first_price.max(*second_price),
+                ))
             }
-            if s.markers_auto_scale {
-                let margins = marker_auto_scale_margins(&s.markers, self.time_scale.bar_spacing());
-                let target = match scale_target {
-                    PriceScaleTarget::Right => &mut main_marker_margins[pane_index],
-                    PriceScaleTarget::Left => &mut left_marker_margins[pane_index],
-                    PriceScaleTarget::Overlay => &mut overlay_marker_margins[pane_index],
-                    PriceScaleTarget::Named(_) => {
-                        let Some(entry) = named[pane_index]
-                            .iter_mut()
-                            .find(|entry| entry.target == scale_target)
-                        else {
-                            continue;
-                        };
-                        &mut entry.margins
-                    }
-                };
-                target.0 = target.0.max(margins.0);
-                target.1 = target.1.max(margins.1);
-            }
-        }
-        // Series-primitive autoscale contributions (plugin platform Phase C-b): reference merges a
-        // series primitive's `autoscaleInfo` into its owning series' autoscale info (series.ts
-        // `_autoscaleInfoImpl`), and price-scale.ts `_recalculatePriceRangeImpl` only consults
-        // sources that are visible with a first value — so a hidden, data-less, or pane-less
-        // owning series silences its primitives' contributions too.
-        for contribution in &self.primitive_autoscale {
-            let Some(series) = self
-                .series
-                .iter()
-                .find(|s| s.id == contribution.series && !s.removed)
-            else {
-                continue;
-            };
-            if !series.visible || contribution.pane != series.pane_index || contribution.pane >= n {
-                continue;
-            }
-            let Some(base_value) = self.series_base_value(series.id, from) else {
-                continue;
-            };
-            let scale = pane_scale(&self.panes[contribution.pane], contribution.target);
-            let Some(range) = scale.price_range_to_logical(
-                &PriceRange::new(contribution.min, contribution.max),
-                base_value,
-            ) else {
-                continue;
-            };
-            let slot = match contribution.target {
-                PriceScaleTarget::Right => &mut main[contribution.pane],
-                PriceScaleTarget::Left => &mut left[contribution.pane],
-                PriceScaleTarget::Overlay => &mut overlay[contribution.pane],
-                PriceScaleTarget::Named(_) => {
-                    let Some(entry) = named[contribution.pane]
-                        .iter_mut()
-                        .find(|entry| entry.target == contribution.target)
-                    else {
-                        continue;
-                    };
-                    &mut entry.range
-                }
-            };
-            *slot = Some(match slot.take() {
-                Some(old) => old.merge(Some(&range)),
-                None => range,
-            });
-        }
-        for (i, pane) in self.panes.iter_mut().enumerate() {
-            let main_auto = pane.price_scale.is_auto_scale();
-            let left_auto = pane.left_scale.is_auto_scale();
-            let overlay_auto = pane.overlay_scale.is_auto_scale();
-            pane.marker_margin_above = if main_auto {
-                main_marker_margins[i].0
-            } else {
-                0.0
-            };
-            pane.marker_margin_below = if main_auto {
-                main_marker_margins[i].1
-            } else {
-                0.0
-            };
-            pane.left_marker_margin_above = if left_auto {
-                left_marker_margins[i].0
-            } else {
-                0.0
-            };
-            pane.left_marker_margin_below = if left_auto {
-                left_marker_margins[i].1
-            } else {
-                0.0
-            };
-            pane.overlay_marker_margin_above = if overlay_auto {
-                overlay_marker_margins[i].0
-            } else {
-                0.0
-            };
-            pane.overlay_marker_margin_below = if overlay_auto {
-                overlay_marker_margins[i].1
-            } else {
-                0.0
-            };
-            pane.refresh_internal_margins();
-            if main_auto {
-                if let Some(range) = main[i].take() {
-                    pane.price_scale
-                        .apply_autoscale_range(Some(range), scale_min_moves[i][0]);
-                }
-            }
-            if left_auto {
-                if let Some(range) = left[i].take() {
-                    pane.left_scale
-                        .apply_autoscale_range(Some(range), scale_min_moves[i][1]);
-                }
-            }
-            if overlay_auto {
-                if let Some(range) = overlay[i].take() {
-                    pane.overlay_scale.apply_autoscale_range(
-                        Some(range.merge(Some(&PriceRange::new(0.0, 0.0)))),
-                        scale_min_moves[i][2],
-                    );
-                }
-            }
-            for autoscale in &mut named[i] {
-                let PriceScaleTarget::Named(id) = autoscale.target else {
-                    continue;
-                };
-                let Some(entry) = pane.named_scale_mut(id) else {
-                    continue;
-                };
-                let auto = entry.scale.is_auto_scale();
-                entry.marker_margin_above = if auto { autoscale.margins.0 } else { 0.0 };
-                entry.marker_margin_below = if auto { autoscale.margins.1 } else { 0.0 };
-                if auto {
-                    if let Some(range) = autoscale.range.take() {
-                        entry
-                            .scale
-                            .apply_autoscale_range(Some(range), autoscale.min_move);
-                    }
-                }
-            }
-            pane.refresh_internal_margins();
+            _ => None,
         }
     }
 
@@ -2663,8 +2713,15 @@ impl ChartEngine {
         self.time_marks(max_width)
     }
 
-    /// Build the time marks used by both the frame grid and host axis labels.
+    /// Build the time marks used by both the frame grid and host axis labels: the explicit
+    /// host marks when set, otherwise the automatic weight-and-spacing selection.
     pub fn time_marks(&mut self, max_label_width: f64) -> Vec<(i64, u8)> {
+        if let Some(marks) = self.resolved_time_tick_marks() {
+            return marks
+                .into_iter()
+                .map(|mark| (mark.index, mark.weight))
+                .collect();
+        }
         self.tick_marks
             .build(self.time_scale.bar_spacing(), max_label_width)
             .iter()

@@ -265,3 +265,107 @@ export async function exerciseReactFailureCleanup(): Promise<Record<string, unkn
     host.remove();
   }
 }
+
+/**
+ * Declarative streaming evidence: a `FinancialSeries` whose `data` prop changes only by a replaced
+ * last bar and/or appended bars must stream through `update()` (one `data_changed("update")` per
+ * changed bar) instead of a full `setData`; any other change falls back to one `setData`.
+ */
+export async function exerciseReactStreaming(): Promise<Record<string, unknown>> {
+  const host = document.createElement("div");
+  host.style.cssText = "width:720px;height:480px";
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  let series: series_api | null = null;
+  let scopes: string[] = [];
+  const t0 = 1735689600;
+  const bar = (index: number, close = 10.5 + index) => ({
+    time: t0 + index * 60,
+    open: 10 + index,
+    high: Math.max(11 + index, close),
+    low: Math.min(9 + index, close),
+    close,
+  });
+  type bar_data = ReturnType<typeof bar>;
+  const render = (data: readonly bar_data[]) => {
+    root.render(
+      <AerisChart options={{ backend: "canvas2d", autoSize: false, accessibility: false }}>
+        <FinancialSeries
+          kind="candlestick"
+          data={data}
+          onSeriesReady={(value) => {
+            series = value;
+            value.subscribe_data_changed((scope) => { scopes.push(scope); });
+          }}
+        />
+      </AerisChart>,
+    );
+  };
+  const step = async (data: readonly bar_data[], ready: (live: series_api) => boolean) => {
+    scopes = [];
+    render(data);
+    await wait_until(() => series !== null && safely(() => ready(series as series_api)));
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return [...scopes];
+  };
+  const close_at = (live: series_api, index: number) =>
+    (live.data()[index] as { close?: number } | undefined)?.close;
+
+  try {
+    const initial = Array.from({ length: 100 }, (_, index) => bar(index));
+    const initial_scopes = await step(initial, (live) => live.data().length === 100);
+
+    const replaced = [...initial.slice(0, -1), bar(99, 250)];
+    const replace_scopes = await step(replaced, (live) => close_at(live, 99) === 250);
+
+    const appended = [...replaced, bar(100)];
+    const append_scopes = await step(appended, (live) => live.data().length === 101);
+
+    const replaced_and_appended = [...appended.slice(0, -1), bar(100, 300), bar(101), bar(102)];
+    const mixed_scopes = await step(replaced_and_appended, (live) => live.data().length === 103
+      && close_at(live, 100) === 300);
+
+    // Re-created objects with identical values still stream (shallow equality), then append.
+    const recreated = [...replaced_and_appended.map((point) => ({ ...point })), bar(103)];
+    const recreated_scopes = await step(recreated, (live) => live.data().length === 104);
+
+    const history_edit = recreated.map((point, index) => index === 10 ? bar(10, 999) : point);
+    const history_scopes = await step(history_edit, (live) => close_at(live, 10) === 999);
+
+    const removed = history_edit.slice(0, -1);
+    const removal_scopes = await step(removed, (live) => live.data().length === 103);
+
+    // Streaming hosts often mutate the forming bar and push onto the array they passed last time,
+    // then pass a copy. The applied snapshot still sees the replaced bar and the appended one.
+    const forming = removed[removed.length - 1]!;
+    forming.high = 777;
+    forming.close = 777;
+    removed.push(bar(103));
+    const final_data = [...removed];
+    const in_place_scopes = await step(final_data, (live) => live.data().length === 104
+      && close_at(live, 102) === 777);
+
+    const live = series as unknown as series_api;
+    const rows = live.data() as unknown as readonly bar_data[];
+    const final_matches = rows.length === final_data.length
+      && final_data.every((point, index) => {
+        const row = rows[index]!;
+        return row.time === point.time && row.open === point.open && row.high === point.high
+          && row.low === point.low && row.close === point.close;
+      });
+    return {
+      initial_scopes,
+      replace_scopes,
+      append_scopes,
+      mixed_scopes,
+      recreated_scopes,
+      history_scopes,
+      removal_scopes,
+      in_place_scopes,
+      final_matches,
+    };
+  } finally {
+    root.unmount();
+    host.remove();
+  }
+}

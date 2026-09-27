@@ -4,9 +4,41 @@
 use super::inner_render::measure_text_ctx;
 use super::*;
 use aeris_charts_engine::{
-    ChartEngine, IndicatorInputSource, IndicatorKind, IndicatorOutputStyle, PivotKind,
-    SyntheticBarOptions, SyntheticSourceBar, VwapReset,
+    ChartEngine, ChartError, DeviationEstimator, DrawingAnchor, DrawingMagnetMode,
+    DrawingPriceSegment, ErrorCode, IndicatorConvention, IndicatorInputSource, IndicatorKind,
+    IndicatorOutputStyle, IndicatorSeed, PivotKind, SyntheticBarOptions, SyntheticSourceBar,
+    VwapReset,
 };
+
+fn drawing_invalid_data(message: impl Into<String>) -> ChartError {
+    ChartError::new(ErrorCode::InvalidData, message)
+}
+
+/// `{ok:false,error:{code,message}}`, the shared drawing result envelope.
+fn drawing_error_json(error: &ChartError) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": { "code": error.code().name(), "message": error.message() }
+    })
+    .to_string()
+}
+
+fn drawing_magnet_from_u8(mode: u8) -> Option<DrawingMagnetMode> {
+    Some(match mode {
+        0 => DrawingMagnetMode::Off,
+        1 => DrawingMagnetMode::Weak,
+        2 => DrawingMagnetMode::Strong,
+        _ => return None,
+    })
+}
+
+fn drawing_magnet_to_u8(mode: DrawingMagnetMode) -> u8 {
+    match mode {
+        DrawingMagnetMode::Off => 0,
+        DrawingMagnetMode::Weak => 1,
+        DrawingMagnetMode::Strong => 2,
+    }
+}
 
 impl ChartInner {
     pub fn configure_synthetic_bar_series(&mut self, id: u32, options_json: &str) -> String {
@@ -219,9 +251,18 @@ impl ChartInner {
         let period = period as usize;
         let definition = match kind {
             "sma" => IndicatorKind::Sma { period },
-            "ema" => IndicatorKind::Ema { period },
-            "dema" => IndicatorKind::Dema { period },
-            "tema" => IndicatorKind::Tema { period },
+            "ema" => IndicatorKind::Ema {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
+            "dema" => IndicatorKind::Dema {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
+            "tema" => IndicatorKind::Tema {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
             "smma" | "rma" => IndicatorKind::Smma { period },
             "hma" => IndicatorKind::Hma { period },
             "vwma" => IndicatorKind::Vwma { period },
@@ -263,12 +304,27 @@ impl ChartInner {
             "ema_ribbon" => IndicatorKind::EmaRibbon {
                 periods: [period; 5],
             },
-            "bollinger" => IndicatorKind::Bollinger { period, deviation },
-            "rsi" => IndicatorKind::Rsi { period },
+            "bollinger" => IndicatorKind::Bollinger {
+                period,
+                deviation,
+                estimator: DeviationEstimator::Population,
+            },
+            "rsi" => IndicatorKind::Rsi {
+                period,
+                seed: IndicatorSeed::Sma,
+            },
             "macd" => IndicatorKind::Macd {
                 fast: period,
                 slow: period.saturating_mul(2),
                 signal: period,
+                seed: IndicatorSeed::Sma,
+                histogram_multiplier: 1.0,
+            },
+            "kdj" => IndicatorKind::Kdj {
+                period,
+                k_smoothing: 3,
+                d_smoothing: 3,
+                seed: aeris_charts_engine::KdjSeed::Fifty,
             },
             "stochastic" => IndicatorKind::Stochastic {
                 k_period: period,
@@ -501,6 +557,7 @@ impl ChartInner {
             IndicatorKind::Bollinger {
                 period: period as usize,
                 deviation,
+                estimator: DeviationEstimator::Population,
             },
             None,
         )
@@ -522,6 +579,7 @@ impl ChartInner {
                 source_input,
                 IndicatorKind::Rsi {
                     period: period as usize,
+                    seed: IndicatorSeed::Sma,
                 },
                 None,
             )
@@ -641,6 +699,71 @@ impl ChartInner {
             .unwrap_or(u32::MAX)
     }
 
+    pub fn add_kdj(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        k_smoothing: u32,
+        d_smoothing: u32,
+    ) -> Vec<u32> {
+        self.engine.add_kdj(
+            source_id as SeriesId,
+            period as usize,
+            k_smoothing as usize,
+            d_smoothing as usize,
+        )
+    }
+
+    /// Add any built-in indicator from its typed JSON definition, e.g.
+    /// `{"kind":"macd","fast":12,"slow":26,"signal":9}`. `convention` (`""`, `"tradingview"` or
+    /// `"china"`) first expands the convention-dependent parameters; fields present in
+    /// `kind_json` override the preset. Series ids of -1 mean "none". Invalid definitions or
+    /// inputs return no outputs and leave the chart unchanged.
+    pub fn add_indicator(
+        &mut self,
+        source_id: u32,
+        source: &str,
+        kind_json: &str,
+        convention: &str,
+        volume_source: i32,
+        amount_source: i32,
+    ) -> Vec<u32> {
+        let Some(source_input) = Self::indicator_input_source(source) else {
+            return Vec::new();
+        };
+        let Some(kind) = Self::indicator_kind_from_json(kind_json, convention) else {
+            return Vec::new();
+        };
+        let optional = |id: i32| (id >= 0).then_some(id as SeriesId);
+        self.engine.add_indicator_kind_with_sources(
+            source_id as SeriesId,
+            source_input,
+            kind,
+            optional(volume_source),
+            optional(amount_source),
+        )
+    }
+
+    fn indicator_kind_from_json(kind_json: &str, convention: &str) -> Option<IndicatorKind> {
+        let convention = match convention {
+            "" | "tradingview" => IndicatorConvention::TradingView,
+            "china" => IndicatorConvention::China,
+            _ => return None,
+        };
+        let explicit = serde_json::from_str::<serde_json::Value>(kind_json).ok()?;
+        // Serde defaults fill omitted parameters, the preset replaces the convention-dependent
+        // ones, and the host's explicit fields finally win over the preset.
+        let preset = serde_json::from_value::<IndicatorKind>(explicit.clone())
+            .ok()?
+            .with_convention(convention);
+        let mut merged = serde_json::to_value(preset).ok()?;
+        let fields = merged.as_object_mut()?;
+        for (key, value) in explicit.as_object()? {
+            fields.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(merged).ok()
+    }
+
     /// Sets the main series' data (series 0). `times` are ascending UTC seconds.
     pub fn set_data(
         &mut self,
@@ -754,28 +877,11 @@ impl ChartInner {
             web_sys::console::warn_1(&"aeris_charts: update_typed for unknown series id".into());
             return Some(rejected_diagnostics_json("unknown or stale series id"));
         }
-        let s = match aeris_charts_core::model::data_validation::sanitize_ohlc_owned(
-            times.to_vec(),
-            open.to_vec(),
-            high.to_vec(),
-            low.to_vec(),
-            close.to_vec(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                web_sys::console::warn_1(
-                    &format!("aeris_charts: update_typed rejected — {e}").into(),
-                );
-                return Some(rejected_validation_diagnostics_json(e));
-            }
-        };
-        if !s.report.is_clean() {
-            web_sys::console::warn_1(&format!("aeris_charts: update_typed sanitized batch — accepted {}, dropped {} invalid, {} duplicate{}", s.report.accepted, s.report.dropped_invalid, s.report.dropped_duplicate, if s.report.reordered { ", reordered" } else { "" }).into());
-        }
-        let diagnostics = validation_diagnostics_json(&s.report);
-        if s.report.accepted == 0 && s.report.dropped_invalid > 0 {
-            return diagnostics;
-        }
+        let (s, diagnostics) =
+            match super::series_update::sanitize_typed_batch(times, open, high, low, close) {
+                Ok(batch) => batch,
+                Err(rejected) => return rejected,
+            };
         self.engine.update_series_bars_sanitized(
             id as SeriesId,
             s.times,
@@ -834,11 +940,13 @@ impl ChartInner {
         let mut had_work = false;
         let mut pairs = 0usize;
         let mut lost = 0u32;
+        let mut dropped = 0u32;
         for ring in rings.iter_mut() {
             let series_id = ring.series_id;
             let outcome = ring.drain(engine);
             had_work |= outcome.had_work;
             lost += outcome.lost_rows;
+            dropped += outcome.dropped_rows;
             if outcome.rows == 0 {
                 continue;
             }
@@ -858,6 +966,11 @@ impl ChartInner {
             // Surfaced on `frame_stats().ring_overruns` rather than as a console warning: an
             // overrun under load would otherwise flood the console at frame rate.
             telemetry.count_ring_overruns(lost);
+        }
+        if dropped > 0 {
+            // Same channel as overruns: a producer writing bad rows gets a counter, not a
+            // frame-rate console flood.
+            telemetry.count_ring_dropped_rows(dropped);
         }
         if had_work {
             if let (Some(clock), Some(start)) = (clock.as_ref(), started) {
@@ -967,17 +1080,12 @@ impl ChartInner {
         }
     }
 
-    /// Apply a per-series `priceFormat` JSON patch (reference PriceFormat). Malformed JSON, an
-    /// unknown type, or an unknown/removed id warns and is ignored.
-    pub fn series_apply_price_format_json(&mut self, id: u32, json: &str) {
-        if !self
-            .engine
+    /// Apply a per-series `priceFormat` JSON patch (reference PriceFormat). Returns false, leaving
+    /// the format unchanged, for malformed JSON, an unknown type, an unknown/removed id, or a
+    /// rejected `tick_ladder`; the package reports it as `invalid_options`.
+    pub fn series_apply_price_format_json(&mut self, id: u32, json: &str) -> bool {
+        self.engine
             .series_apply_price_format_json(id as SeriesId, json)
-        {
-            web_sys::console::warn_1(
-                &"aeris_charts: series_apply_price_format_json ignored (unknown id, type, or malformed JSON)".into(),
-            );
-        }
     }
 
     /// Install a series' custom price formatter fn (reference `priceFormat.formatter`), switching it
@@ -996,6 +1104,43 @@ impl ChartInner {
         if !installed {
             web_sys::console::warn_1(
                 &"aeris_charts: set_series_price_formatter ignored (unknown series id)".into(),
+            );
+        }
+    }
+
+    /// Install (or clear with `None`) a series' reference `autoscaleInfoProvider`. The package
+    /// passes an adapter `(base) => info`: `base` is the series' own
+    /// `{price_range: {min_value, max_value} | null, margins?: {above, below}}` (or `null` without
+    /// data) and the returned info replaces it (`null` removes the series from autoscale). A
+    /// throw keeps the series' own info for that pass.
+    pub fn set_series_autoscale_info_provider(
+        &mut self,
+        id: u32,
+        provider: Option<js_sys::Function>,
+    ) {
+        let provider = provider.map(|provider| {
+            Box::new(move |base: Option<aeris_charts_engine::AutoscaleInfo>| {
+                match provider.call1(&JsValue::NULL, &autoscale_info_to_js(base)) {
+                    Ok(result) => autoscale_info_from_js(&result),
+                    Err(error) => {
+                        web_sys::console::warn_1(
+                            &format!(
+                                "aeris_charts: series `autoscale_info_provider` threw — {error:?}"
+                            )
+                            .into(),
+                        );
+                        base
+                    }
+                }
+            }) as aeris_charts_engine::AutoscaleInfoProviderFn
+        });
+        if !self
+            .engine
+            .set_series_autoscale_info_provider(id as SeriesId, provider)
+        {
+            web_sys::console::warn_1(
+                &"aeris_charts: set_series_autoscale_info_provider ignored (unknown series id)"
+                    .into(),
             );
         }
     }
@@ -1901,6 +2046,11 @@ impl ChartInner {
         self.engine.set_right_bar_stays_on_scroll(stays);
     }
 
+    /// Aeris `lock_visible_logical_range`: hold the visible logical range across data and resizes.
+    pub fn set_lock_visible_logical_range(&mut self, lock: bool) {
+        self.engine.set_lock_visible_logical_range(lock);
+    }
+
     /// reference `timeScale.shiftVisibleRangeOnNewBar` (default true): when the last bar is
     /// visible, the view follows newly appended bars.
     pub fn set_shift_visible_range_on_new_bar(&mut self, shift: bool) {
@@ -2042,6 +2192,49 @@ impl ChartInner {
                     .and_then(|v| v.as_string())
             }) as TimeFormatterFn
         }));
+    }
+
+    /// Apply `timeScale.timeZone` (`"UTC"` or explicit `{from_utc_seconds, offset_seconds}`
+    /// transitions), `timeScale.sessionStart` (seconds from local midnight), and/or
+    /// `timeScale.tickMarks` (explicit `[{time, label?}]` axis marks or `null`). The package
+    /// resolves IANA names to schedules and mark times to UTC seconds before calling. Returns an
+    /// empty string on success or the validation message; a rejected patch changes nothing.
+    pub fn set_exchange_time_json(&mut self, time_scale_json: &str) -> String {
+        let time_scale: serde_json::Value = match serde_json::from_str(time_scale_json) {
+            Ok(value) => value,
+            Err(error) => return error.to_string(),
+        };
+        if !time_scale.is_object() {
+            return "exchange time options must be an object".to_string();
+        }
+        let patch = serde_json::json!({ "timeScale": time_scale }).to_string();
+        if let Err(error) = self.engine.apply_options(&patch) {
+            return error.to_string();
+        }
+        self.recompute_layout(true);
+        String::new()
+    }
+
+    /// Declare whether the chart's financial time points are calendar dates (business-day or
+    /// `YYYY-MM-DD` input). The package derives this from its series' input forms.
+    pub fn set_calendar_date_axis(&mut self, calendar_dates: bool) {
+        self.engine.set_calendar_date_axis(calendar_dates);
+    }
+
+    /// Label flags for package-owned time text: bit 0 `timeVisible`, bit 1 `secondsVisible`,
+    /// bit 2 calendar-date axis.
+    pub fn time_label_flags(&self) -> u32 {
+        u32::from(self.engine.time_visible)
+            | (u32::from(self.engine.seconds_visible) << 1)
+            | (u32::from(self.engine.exchange_time().calendar_dates()) << 2)
+    }
+
+    /// Exchange-local wall-clock seconds for a UTC timestamp (identity for calendar dates).
+    pub fn exchange_local_seconds(&self, time: f64) -> f64 {
+        if !time.is_finite() {
+            return f64::NAN;
+        }
+        self.engine.exchange_local_seconds(time as i64) as f64
     }
 
     /// 0 = normal, 1 = magnet (reference default), 2 = hidden, 3 = magnet OHLC.
@@ -2335,6 +2528,10 @@ impl ChartInner {
     pub fn scroll_to_real_time(&mut self) {
         self.engine.scroll_to_real_time();
     }
+    pub fn start_real_time_scroll_animation(&mut self, duration_ms: f64, now_ms: f64) {
+        self.engine
+            .start_real_time_scroll_animation(duration_ms, now_ms);
+    }
     pub fn reset_time_scale(&mut self) {
         self.engine.reset_time_scale();
     }
@@ -2564,8 +2761,8 @@ impl ChartInner {
     // JSON strings. All state, hit-testing, and drag math is engine-side; the gesture layer only
     // forwards pointer samples and repaints.
 
-    /// Add a drawing from a JSON `[{logical, price}, ...]` anchor array plus an optional options
-    /// patch ("" = defaults). Returns the drawing id, or 0 when the engine rejects it.
+    /// Add a drawing from a JSON `[{logical?, time?, price}, ...]` anchor array plus an optional
+    /// options patch ("" = defaults). Returns the drawing id, or 0 when the engine rejects it.
     pub fn add_drawing(
         &mut self,
         kind: u8,
@@ -2576,19 +2773,122 @@ impl ChartInner {
         let Some(kind) = DrawingKind::from_u8(kind) else {
             return 0;
         };
-        let Ok(points) = serde_json::from_str::<Vec<DrawingPoint>>(points_json) else {
+        let Ok(anchors) = serde_json::from_str::<Vec<DrawingAnchor>>(points_json) else {
             return 0;
         };
         let options = (!options_json.is_empty()).then_some(options_json);
         self.engine
-            .add_drawing(kind, pane, points, options)
+            .add_drawing_anchors(kind, pane, &anchors, options)
             .unwrap_or(0)
+    }
+    /// Result envelope form of [`Self::add_drawing`]: `{ok:true,id}` or `{ok:false,error}` naming
+    /// whether the anchors or the options patch were rejected.
+    pub fn add_drawing_result_json(
+        &mut self,
+        kind: u8,
+        pane: usize,
+        points_json: &str,
+        options_json: &str,
+    ) -> String {
+        let result = DrawingKind::from_u8(kind)
+            .ok_or_else(|| drawing_invalid_data("unknown drawing kind"))
+            .and_then(|kind| {
+                let anchors = serde_json::from_str::<Vec<DrawingAnchor>>(points_json)
+                    .map_err(|error| drawing_invalid_data(format!("malformed anchors: {error}")))?;
+                let options = (!options_json.is_empty()).then_some(options_json);
+                self.engine
+                    .add_drawing_anchors(kind, pane, &anchors, options)
+            });
+        match result {
+            Ok(id) => serde_json::json!({ "ok": true, "id": id }).to_string(),
+            Err(error) => drawing_error_json(&error),
+        }
     }
     pub fn drawing_apply_options(&mut self, id: u32, options_json: &str) -> bool {
         self.engine.drawing_apply_options(id, options_json)
     }
     pub fn drawing_set_points(&mut self, id: u32, points_json: &str) -> bool {
         self.engine.drawing_set_points(id, points_json)
+    }
+    /// Result envelope form of [`Self::drawing_set_points`].
+    pub fn drawing_set_points_result_json(&mut self, id: u32, points_json: &str) -> String {
+        let result = serde_json::from_str::<Vec<DrawingAnchor>>(points_json)
+            .map_err(|error| drawing_invalid_data(format!("malformed anchors: {error}")))
+            .and_then(|anchors| self.engine.set_drawing_anchors(id, &anchors));
+        match result {
+            Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+            Err(error) => drawing_error_json(&error),
+        }
+    }
+    /// Atomic multi-drawing anchor rewrite from `[{id, points: [...]}, ...]` (one undo step):
+    /// `{ok:true,changed}` or `{ok:false,error}`.
+    pub fn set_drawings_points_result_json(&mut self, updates_json: &str) -> String {
+        #[derive(serde::Deserialize)]
+        struct Update {
+            id: u32,
+            points: Vec<DrawingAnchor>,
+        }
+        let result = serde_json::from_str::<Vec<Update>>(updates_json)
+            .map_err(|error| drawing_invalid_data(format!("malformed updates: {error}")))
+            .and_then(|updates| {
+                let updates = updates
+                    .into_iter()
+                    .map(|update| (update.id, update.points))
+                    .collect::<Vec<_>>();
+                self.engine.set_drawings_anchors(&updates)
+            });
+        match result {
+            Ok(changed) => serde_json::json!({ "ok": true, "changed": changed }).to_string(),
+            Err(error) => drawing_error_json(&error),
+        }
+    }
+    /// Price-basis rescale from `[{from_time?, to_time?, factor}, ...]`; `price_basis` `None`
+    /// keeps the current label. `{ok:true,changed}` or `{ok:false,error}`.
+    pub fn rescale_drawing_prices_result_json(
+        &mut self,
+        segments_json: &str,
+        price_basis: Option<String>,
+    ) -> String {
+        let result = serde_json::from_str::<Vec<DrawingPriceSegment>>(segments_json)
+            .map_err(|error| drawing_invalid_data(format!("malformed price segments: {error}")))
+            .and_then(|segments| {
+                self.engine
+                    .rescale_drawing_prices(&segments, price_basis.as_deref())
+            });
+        match result {
+            Ok(changed) => serde_json::json!({ "ok": true, "changed": changed }).to_string(),
+            Err(error) => drawing_error_json(&error),
+        }
+    }
+    pub fn set_drawing_price_basis(&mut self, basis: Option<String>) -> bool {
+        self.engine
+            .set_drawing_price_basis(basis.as_deref())
+            .is_ok()
+    }
+    pub fn drawing_price_basis(&self) -> Option<String> {
+        self.engine.drawing_price_basis().map(str::to_string)
+    }
+    /// Chart drawing magnet: 0 off, 1 weak, 2 strong (unknown values are rejected).
+    pub fn set_drawing_magnet_mode(&mut self, mode: u8) -> bool {
+        let Some(mode) = drawing_magnet_from_u8(mode) else {
+            return false;
+        };
+        self.engine.set_drawing_magnet_mode(mode);
+        true
+    }
+    pub fn drawing_magnet_mode(&self) -> u8 {
+        drawing_magnet_to_u8(self.engine.drawing_magnet_mode())
+    }
+    /// Effective magnet for the armed tool's next placement with the Ctrl/Cmd toggle state.
+    pub fn armed_drawing_magnet(&self, toggle: bool) -> u8 {
+        drawing_magnet_to_u8(self.engine.armed_drawing_magnet(toggle))
+    }
+    /// Keyboard handle count of a drawing, or -1 for an unknown/unplaceable drawing.
+    pub fn drawing_handle_count(&self, id: u32) -> i32 {
+        self.engine
+            .drawing_handle_count(id)
+            .and_then(|count| i32::try_from(count).ok())
+            .unwrap_or(-1)
     }
     /// The drawing's options JSON ("" for an unknown id — the wasm boundary has no Option<String>).
     pub fn drawing_options_json(&self, id: u32) -> String {
@@ -3052,6 +3352,53 @@ impl ChartInner {
     pub fn set_visible_time_range(&mut self, from_time: f64, to_time: f64) {
         self.engine.set_visible_time_range(from_time, to_time);
     }
+}
+
+/// Engine autoscale info -> the package's `autoscale_info` object (`null` for `None`).
+fn autoscale_info_to_js(info: Option<aeris_charts_engine::AutoscaleInfo>) -> JsValue {
+    let Some(info) = info else {
+        return JsValue::NULL;
+    };
+    let object = js_sys::Object::new();
+    let range = match info.price_range {
+        Some((min, max)) => {
+            let range = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&range, &"min_value".into(), &JsValue::from_f64(min));
+            let _ = js_sys::Reflect::set(&range, &"max_value".into(), &JsValue::from_f64(max));
+            range.into()
+        }
+        None => JsValue::NULL,
+    };
+    let _ = js_sys::Reflect::set(&object, &"price_range".into(), &range);
+    if let Some((above, below)) = info.margins {
+        let margins = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&margins, &"above".into(), &JsValue::from_f64(above));
+        let _ = js_sys::Reflect::set(&margins, &"below".into(), &JsValue::from_f64(below));
+        let _ = js_sys::Reflect::set(&object, &"margins".into(), &margins);
+    }
+    object.into()
+}
+
+/// The package's `autoscale_info` object -> engine info. `null`/`undefined` is `None`; a missing,
+/// `null`, or non-numeric range contributes no range (the engine re-validates finiteness/order).
+fn autoscale_info_from_js(value: &JsValue) -> Option<aeris_charts_engine::AutoscaleInfo> {
+    if value.is_null() || value.is_undefined() {
+        return None;
+    }
+    let get = |object: &JsValue, key: &str| {
+        js_sys::Reflect::get(object, &key.into())
+            .ok()
+            .filter(|value| !value.is_null() && !value.is_undefined())
+    };
+    let number = |object: &JsValue, key: &str| get(object, key).and_then(|value| value.as_f64());
+    let price_range = get(value, "price_range")
+        .and_then(|range| Some((number(&range, "min_value")?, number(&range, "max_value")?)));
+    let margins = get(value, "margins")
+        .and_then(|margins| Some((number(&margins, "above")?, number(&margins, "below")?)));
+    Some(aeris_charts_engine::AutoscaleInfo {
+        price_range,
+        margins,
+    })
 }
 
 /// Overlay a host's partial brush style on the engine default. An absent style or field keeps the

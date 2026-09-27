@@ -307,6 +307,17 @@ impl PlotList {
         self.min_max_cache.clear();
     }
 
+    /// Drop the cached autoscale chunk holding `row` after an in-place value correction. The
+    /// row-to-index mapping is unchanged, so no other chunk or mapping state is touched.
+    pub(crate) fn invalidate_row(&mut self, row: usize) {
+        if let Some(index) = self.index_at(row) {
+            let chunk = index.div_euclid(CHUNK_SIZE);
+            for plot in 0..4 {
+                self.min_max_cache.remove(&(plot, chunk));
+            }
+        }
+    }
+
     /// Streaming append/replace of the last row (the `update()` hot path).
     pub fn upsert_last(&mut self, index: TimePointIndex) {
         match self.last_index() {

@@ -2,6 +2,7 @@
 
 import {
   attach_native_accessibility_focus,
+  chart_time_text,
   time_to_utc_seconds,
 } from "./impl.js";
 import type { native_accessibility_focus_handle } from "./impl.js";
@@ -43,6 +44,22 @@ function is_general_series(series: series_api | general_series_api | unknown): s
 
 function is_accessibility_series(series: series_api | general_series_api | unknown): series is accessibility_series {
   return is_financial_series(series) || is_general_series(series);
+}
+
+/** Which keyboard time-scale motions the host's gesture switches allow (the chart's own keyboard
+ *  gate, so `handle_scroll: false` / `handle_scale: false` fixed views stay fixed). Charts without
+ *  the gate (foreign `chart_api` implementations) allow everything. */
+function keyboard_time_gates(chart: chart_api): { scroll: boolean; zoom: boolean; reset: boolean } {
+  const gated = chart as chart_api & {
+    keyboard_time_scroll_enabled?: () => boolean;
+    keyboard_time_zoom_enabled?: () => boolean;
+    keyboard_time_reset_enabled?: () => boolean;
+  };
+  return {
+    scroll: gated.keyboard_time_scroll_enabled?.() ?? true,
+    zoom: gated.keyboard_time_zoom_enabled?.() ?? true,
+    reset: gated.keyboard_time_reset_enabled?.() ?? true,
+  };
 }
 
 export interface accessibility_point {
@@ -446,9 +463,10 @@ class PaneAccessibility {
       } else return false;
     } else if (target === "time-axis") {
       const scale = this.controller.chart.time_scale();
-      if (event.key === "Home") scale.reset_time_scale();
-      else if (event.key === "ArrowLeft") scale.scroll_to_position(scale.scroll_position() - 1, false);
-      else if (event.key === "ArrowRight") scale.scroll_to_position(scale.scroll_position() + 1, false);
+      const gates = keyboard_time_gates(this.controller.chart);
+      if (event.key === "Home" && gates.reset) scale.reset_time_scale();
+      else if (event.key === "ArrowLeft" && gates.scroll) scale.scroll_to_position(scale.scroll_position() - 1, false);
+      else if (event.key === "ArrowRight" && gates.scroll) scale.scroll_to_position(scale.scroll_position() + 1, false);
       else return false;
     } else if (target === "separator") {
       if (event.key === "Home") this.pane.set_stretch_factor(1);
@@ -537,7 +555,8 @@ class PaneAccessibility {
 
   private handle_drawing_key(event: KeyboardEvent, drawing: import("./types.js").drawing_api): boolean {
     const chart = this.controller.chart as chart_api & {
-      nudge_selected_drawing(dx: number, dy: number, anchor: number | null): boolean;
+      nudge_selected_drawing(dx: number, dy: number, handle: number | null): boolean;
+      drawing_handle_count(id: number): number;
     };
     if (event.key === "Enter") {
       this.drawing_editing = !this.drawing_editing;
@@ -559,12 +578,14 @@ class PaneAccessibility {
       drawing.remove();
       this.writer.write(`${kind} removed.`);
     } else if (event.key === "Tab" && this.drawing_editing) {
-      const count = drawing.points().length;
+      // Cycle the engine's editable handles (every anchor, a rectangle's eight bounds handles, or
+      // a position's target/entry/width/stop controls), not the raw anchor list.
+      const count = chart.drawing_handle_count(drawing.id);
       if (count === 0) return false;
       this.drawing_anchor = event.shiftKey
         ? (this.drawing_anchor <= 0 ? count - 1 : this.drawing_anchor - 1)
         : (this.drawing_anchor + 1) % count;
-      this.writer.write(`Anchor ${this.drawing_anchor + 1} of ${count}.`);
+      this.writer.write(`Handle ${this.drawing_anchor + 1} of ${count}.`);
     } else if (this.drawing_editing && event.key.startsWith("Arrow")) {
       const step = event.shiftKey ? 10 : 1;
       const [dx, dy] = event.key === "ArrowLeft" ? [-step, 0]
@@ -752,6 +773,8 @@ class PaneAccessibility {
 
   private scroll_into_view(): void {
     if (is_general_series(this.active_series())) return;
+    // Point navigation still announces and focuses; it only stops moving a view the host fixed.
+    if (!keyboard_time_gates(this.controller.chart).scroll) return;
     const point = this.points[this.point_index];
     const logical = point === undefined ? null : this.logical_index(point);
     const scale = this.controller.chart.time_scale();
@@ -788,6 +811,7 @@ class PaneAccessibility {
       this.update_focus_ring();
       return;
     }
+    if (!keyboard_time_gates(this.controller.chart).zoom) return;
     const scale = this.controller.chart.time_scale();
     const range = scale.get_visible_logical_range();
     if (range === null) return;
@@ -835,12 +859,9 @@ class PaneAccessibility {
 
   private format_time(value: time): string {
     if (this.controller.options.time_formatter !== undefined) return this.controller.options.time_formatter(value);
-    const formatter = this.controller.localization().time_formatter;
-    const seconds = time_to_utc_seconds(value);
-    if (formatter !== undefined) return formatter(seconds);
-    return new Date(seconds * 1000).toLocaleDateString(this.controller.locale(), {
-      year: "numeric", month: "short", day: "numeric", timeZone: "UTC",
-    });
+    // The chart's host `localization.time_formatter`, else a locale date in the chart's exchange
+    // time zone with the time of day for intraday rows (calendar dates keep their own date).
+    return chart_time_text(this.controller.chart, time_to_utc_seconds(value));
   }
 
   private describe_values(point: series_data, series = this.active_series()): string {

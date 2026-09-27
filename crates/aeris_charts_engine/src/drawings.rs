@@ -18,12 +18,14 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use aeris_charts_core::model::data_validation::MAX_SAFE_VALUE;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType};
 
 use super::*;
 
 mod geometry;
+mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{
@@ -421,6 +423,50 @@ pub struct DrawingPoint {
     pub price: f64,
 }
 
+/// Host-facing anchor: the live `{logical, price}` geometry plus the anchor's time identity
+/// (UTC seconds). On an ordinary time axis a fractional logical position interpolates between
+/// the neighbouring bar times and a position beyond the data extrapolates with the prevailing bar
+/// interval. Inputs may supply `logical`, `time`, or both (`time` wins when both are present and
+/// disagree); outputs always carry `logical` and carry `time` whenever the chart has an ordinary
+/// time axis (non-time sequence charts use their persisted bar identity instead).
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DrawingAnchor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical: Option<f64>,
+    pub price: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<f64>,
+}
+
+impl From<DrawingPoint> for DrawingAnchor {
+    fn from(point: DrawingPoint) -> Self {
+        Self {
+            logical: Some(point.logical),
+            price: point.price,
+            time: None,
+        }
+    }
+}
+
+/// Weak magnet capture distance in CSS px, measured vertically between the pointer and the
+/// nearest rendered OHLC candidate of the bar under the pointer.
+pub const DRAWING_WEAK_MAGNET_DISTANCE: f64 = 12.0;
+
+/// Chart-level drawing settings and time-identity bookkeeping (drawings.rs owns every field).
+#[derive(Default)]
+pub(crate) struct DrawingChartSettings {
+    /// Persistent chart magnet mode; Ctrl/Cmd toggles it temporarily.
+    pub(crate) magnet_mode: crate::DrawingMagnetMode,
+    /// Host-defined label of the price basis (for example adjusted or raw) drawing prices use.
+    pub(crate) price_basis: Option<String>,
+    /// Some committed or history snapshot holds an anchor time not yet resolved on the axis.
+    pub(crate) time_pending: bool,
+    /// A non-time bar sequence is being installed; its row keys are not UTC times.
+    pub(crate) sequence_install: bool,
+    /// The last synchronized axis was a non-time bar sequence.
+    pub(crate) sequence_axis: bool,
+}
+
 /// Full-resolution identity persisted alongside a logical drawing anchor on a non-time chart.
 /// The live geometry remains in logical/price space; this sidecar lets a restored drawing find
 /// the same bar after the host installs a different retained sequence.
@@ -598,6 +644,10 @@ pub struct Drawing {
     pub box_border_color: Option<String>,
     /// Text-tool container border width in CSS px (default 1).
     pub box_border_width: f64,
+    /// Per-anchor time identity that is authoritative while the anchor cannot be placed on the
+    /// current axis (no time points yet, or restored/pasted before matching data). Empty when
+    /// every anchor is resolved; resolved anchors derive their time from `logical`.
+    pub(crate) pending_times: Vec<Option<f64>>,
 }
 
 /// Default glyph size for the TEXT TOOL's label in CSS px when `text_size` is unset
@@ -668,7 +718,29 @@ impl Drawing {
             box_color: None,
             box_border_color: None,
             box_border_width: aeris_charts_core::style::BORDER_WIDTH,
+            pending_times: Vec::new(),
         }
+    }
+
+    /// Install per-anchor pending times, keeping the Long/Short stop on the entry's identity (the
+    /// stop shares the origin edge) and storing nothing when every anchor is resolved.
+    pub(crate) fn set_pending_times(&mut self, mut pending: Vec<Option<f64>>) {
+        if pending.len() == 3
+            && matches!(
+                self.kind,
+                DrawingKind::LongPosition | DrawingKind::ShortPosition
+            )
+        {
+            pending[2] = pending[0];
+        }
+        if pending.len() != self.points.len() || pending.iter().all(Option::is_none) {
+            pending.clear();
+        }
+        self.pending_times = pending;
+    }
+
+    pub(crate) fn has_pending_times(&self) -> bool {
+        !self.pending_times.is_empty()
     }
 
     /// Long/Short Position has semantic levels, not three unrelated corners. Keep the stop on the
@@ -808,9 +880,11 @@ pub struct DrawingHit {
 }
 
 /// Modifier keys the host gesture layer forwards with pointer positions (the public reference modifier
-/// semantics): `magnet` snaps anchors to the nearest bar — x to the bar's center, the price to
-/// its closest rendered field (OHLC for candles/bars, value for scalar series; Ctrl/Cmd — the
-/// same key that magnets the crosshair);
+/// semantics): `magnet` is the temporary magnet toggle (Ctrl/Cmd — the same key that magnets the
+/// crosshair). It turns an inactive effective magnet (the stronger of the drawing's own
+/// `magnet` and the chart's [`ChartEngine::drawing_magnet_mode`]) into a strong one and an active
+/// one off. Snapping moves an anchor to the nearest bar — x to the bar's center, the price to its
+/// closest rendered field (OHLC for candles/bars, value for scalar series);
 /// `straighten` constrains the dragged anchor of a two-anchor tool so the segment snaps to
 /// 0°/45°/90° (a rectangle to a square) and body drags to the dominant axis (Shift only —
 /// Ctrl never straightens). Where the two compose, straighten wins for the dragged anchor.
@@ -876,6 +950,21 @@ enum DrawingCommand {
 }
 
 impl DrawingCommand {
+    /// Visit every drawing snapshot the command retains (both sides of updates).
+    fn for_each_drawing_mut(&mut self, mut visit: impl FnMut(&mut Drawing)) {
+        match self {
+            Self::Create { drawing, .. } | Self::Delete { drawing, .. } => visit(drawing),
+            Self::Update { before, after } => {
+                visit(before);
+                visit(after);
+            }
+            Self::Clear { drawings } => drawings.iter_mut().for_each(visit),
+            Self::Reorder { before, after } | Self::BatchUpdate { before, after } => {
+                before.iter_mut().chain(after.iter_mut()).for_each(visit)
+            }
+        }
+    }
+
     fn rebase_logical_with<F>(&mut self, map: F)
     where
         F: Fn(f64) -> f64 + Copy,
@@ -1376,6 +1465,313 @@ impl ChartEngine {
         })
     }
 
+    /// Set the chart's persistent drawing magnet (the toolbar magnet): `Weak` snaps creation and
+    /// editing within [`DRAWING_WEAK_MAGNET_DISTANCE`], `Strong` always snaps to the nearest
+    /// rendered OHLC value. A drawing's own `magnet` option raises it for that drawing, and the
+    /// Ctrl/Cmd modifier toggles the effective mode temporarily. Touch input has no modifier and
+    /// therefore uses the chart mode directly.
+    pub fn set_drawing_magnet_mode(&mut self, mode: crate::DrawingMagnetMode) {
+        if self.drawing_settings.magnet_mode != mode {
+            self.drawing_settings.magnet_mode = mode;
+            self.invalidate_frame_drawings();
+        }
+    }
+
+    pub fn drawing_magnet_mode(&self) -> crate::DrawingMagnetMode {
+        self.drawing_settings.magnet_mode
+    }
+
+    /// The magnet a drawing whose own mode is `own` uses: the stronger of `own` and the chart
+    /// mode, with `toggle` (Ctrl/Cmd held) turning an inactive magnet strong and an active one off.
+    pub fn effective_drawing_magnet(
+        &self,
+        own: crate::DrawingMagnetMode,
+        toggle: bool,
+    ) -> crate::DrawingMagnetMode {
+        use crate::DrawingMagnetMode::{Off, Strong, Weak};
+        let rank = |mode| match mode {
+            Off => 0,
+            Weak => 1,
+            Strong => 2,
+        };
+        let chart = self.drawing_settings.magnet_mode;
+        let active = if rank(own) >= rank(chart) { own } else { chart };
+        match (active, toggle) {
+            (Off, true) => Strong,
+            (_, true) => Off,
+            (active, false) => active,
+        }
+    }
+
+    /// The effective magnet for the armed tool's next placement (`Off` while no tool is armed).
+    /// Hosts use it to mirror strong snapping in the crosshair while drawing.
+    pub fn armed_drawing_magnet(&self, toggle: bool) -> crate::DrawingMagnetMode {
+        let own = match (
+            &self.drawing_controller.pending,
+            &self.drawing_controller.armed,
+        ) {
+            (Some(pending), _) => pending.drawing.magnet,
+            (None, Some(armed)) => armed.template.magnet,
+            (None, None) => return crate::DrawingMagnetMode::Off,
+        };
+        self.effective_drawing_magnet(own, toggle)
+    }
+
+    /// Set the host-defined price-basis label (for example `"qfq"` or `"raw"`) that describes
+    /// which data basis drawing prices use. It is persisted and carried by sync/clipboard
+    /// payloads so a host can detect a mismatch on restore. `None` or an empty label clears it.
+    pub fn set_drawing_price_basis(&mut self, basis: Option<&str>) -> Result<(), ChartError> {
+        let basis = basis.filter(|basis| !basis.is_empty());
+        if basis.is_some_and(|basis| basis.len() > crate::MAX_DRAWING_GROUP_BYTES) {
+            return Err(ChartError::new(
+                ErrorCode::InvalidOptions,
+                format!(
+                    "the drawing price basis exceeds {} bytes",
+                    crate::MAX_DRAWING_GROUP_BYTES
+                ),
+            ));
+        }
+        if self.drawing_settings.price_basis.as_deref() != basis {
+            self.drawing_settings.price_basis = basis.map(str::to_string);
+            self.bump_drawing_sync_revision();
+        }
+        Ok(())
+    }
+
+    pub fn drawing_price_basis(&self) -> Option<&str> {
+        self.drawing_settings.price_basis.as_deref()
+    }
+
+    /// Rescale drawing prices for a data price-basis change (for example switching between
+    /// forward-adjusted and unadjusted history). Each anchor whose time falls inside a segment
+    /// `[from_time, to_time)` has its price multiplied by that segment's factor (on non-time bar
+    /// charts an anchor's time is the open time of the bar it sits on); Long/Short
+    /// Position anchors all use the entry anchor's segment so their levels stay consistent. This is
+    /// a data-basis change, not a user edit: it applies to locked drawings too, rewrites the undo
+    /// and redo stacks and any in-flight creation/drag in the same basis, records no undo step,
+    /// and optionally sets the price-basis label in the same transaction. It is atomic: invalid
+    /// segments, or a factor that would move any committed, historical, or in-flight price outside
+    /// the persisted value range, fail with nothing changed. Returns the number of committed
+    /// drawings that changed.
+    pub fn rescale_drawing_prices(
+        &mut self,
+        segments: &[crate::DrawingPriceSegment],
+        price_basis: Option<&str>,
+    ) -> Result<usize, ChartError> {
+        crate::DrawingPriceSegment::validate_all(segments)?;
+        let basis = price_basis.filter(|basis| !basis.is_empty());
+        if basis.is_some_and(|basis| basis.len() > crate::MAX_DRAWING_GROUP_BYTES) {
+            return Err(ChartError::new(
+                ErrorCode::InvalidOptions,
+                format!(
+                    "the drawing price basis exceeds {} bytes",
+                    crate::MAX_DRAWING_GROUP_BYTES
+                ),
+            ));
+        }
+        let time_axis = self.drawing_time_axis();
+        let times = self.data.merged_times();
+        // Non-time bar charts date an anchor by the open time of the bar it sits on, the same
+        // identity their persisted anchor-time sidecar records.
+        let sequence = self.sequence_points.as_deref();
+        let sequence_time = |logical: f64| {
+            let index = logical.round();
+            if !index.is_finite() || index < 0.0 {
+                return None;
+            }
+            sequence?
+                .get(index as usize)
+                .map(|bar| bar.open_timestamp_micros as f64 / 1_000_000.0)
+        };
+        // Validated segments never overlap, so the only candidate for a time is the last segment
+        // starting at or before it: a binary search keeps the rescale O(anchors * log segments).
+        let mut ordered = segments.to_vec();
+        ordered.sort_by(|a, b| {
+            a.from_time
+                .unwrap_or(f64::NEG_INFINITY)
+                .total_cmp(&b.from_time.unwrap_or(f64::NEG_INFINITY))
+        });
+        let factor_at = |time: Option<f64>| {
+            time.and_then(|time| {
+                let upper = ordered
+                    .partition_point(|segment| segment.from_time.is_none_or(|from| from <= time));
+                ordered[..upper]
+                    .last()
+                    .filter(|segment| segment.contains(time))
+                    .map(|segment| segment.factor)
+            })
+            .unwrap_or(1.0)
+        };
+        // One pass validates (`apply == false`) and a second mutates, so a factor that would push
+        // any committed, historical, or in-flight price past the persisted value range rejects
+        // the whole rescale. `None` reports that overflow; otherwise whether a price changes.
+        let rescale = |kind: DrawingKind,
+                       points: &mut [DrawingPoint],
+                       pending: &[Option<f64>],
+                       apply: bool|
+         -> Option<bool> {
+            let time_of = |index: usize, point: &DrawingPoint| {
+                pending.get(index).copied().flatten().or_else(|| {
+                    if time_axis {
+                        time_anchor::time_at_logical(times, point.logical)
+                    } else {
+                        sequence_time(point.logical)
+                    }
+                })
+            };
+            let position = points.len() == 3
+                && matches!(kind, DrawingKind::LongPosition | DrawingKind::ShortPosition);
+            let entry_factor = position.then(|| factor_at(time_of(0, &points[0])));
+            let mut changed = false;
+            for (index, point) in points.iter_mut().enumerate() {
+                let factor = entry_factor.unwrap_or_else(|| factor_at(time_of(index, point)));
+                if factor == 1.0 {
+                    continue;
+                }
+                let price = point.price * factor;
+                if !price.is_finite() || price.abs() > MAX_SAFE_VALUE {
+                    return None;
+                }
+                if apply {
+                    point.price = price;
+                }
+                changed = true;
+            }
+            Some(changed)
+        };
+        let rescale_drawing = |drawing: &mut Drawing, apply: bool| -> Option<bool> {
+            let changed = rescale(
+                drawing.kind,
+                &mut drawing.points,
+                &drawing.pending_times,
+                apply,
+            )?;
+            if changed && apply {
+                drawing.revision = drawing.revision.saturating_add(1);
+            }
+            Some(changed)
+        };
+        let drag_kind = self.drawing_drag.as_ref().and_then(|drag| {
+            self.drawings
+                .iter()
+                .find(|drawing| drawing.id == drag.id)
+                .map(|drawing| drawing.kind)
+        });
+        let mut changed = 0usize;
+        let mut transient_changed = false;
+        for apply in [false, true] {
+            let mut in_range = true;
+            let mut visit = |changed: Option<bool>| match changed {
+                Some(changed) => changed,
+                None => {
+                    in_range = false;
+                    false
+                }
+            };
+            changed = 0;
+            for drawing in &mut self.drawings {
+                changed += usize::from(visit(rescale_drawing(drawing, apply)));
+            }
+            for command in self
+                .drawing_history
+                .undo
+                .iter_mut()
+                .chain(&mut self.drawing_history.redo)
+            {
+                command.for_each_drawing_mut(|drawing| {
+                    visit(rescale_drawing(drawing, apply));
+                });
+            }
+            if let Some(pending) = self.drawing_controller.pending.as_mut() {
+                let kind = pending.drawing.kind;
+                transient_changed |= visit(rescale_drawing(&mut pending.drawing, apply));
+                if let Some(preview) = pending.preview.as_mut() {
+                    transient_changed |=
+                        visit(rescale(kind, std::slice::from_mut(preview), &[], apply));
+                }
+            }
+            if let Some(capture) = self.drawing_controller.brush.as_mut() {
+                transient_changed |=
+                    visit(rescale(DrawingKind::Brush, &mut capture.points, &[], apply));
+            }
+            if let (Some(drag), Some(kind)) = (self.drawing_drag.as_mut(), drag_kind) {
+                transient_changed |= visit(rescale(kind, &mut drag.start_points, &[], apply));
+                transient_changed |= visit(rescale(kind, &mut drag.history_points, &[], apply));
+            }
+            if !in_range {
+                return Err(ChartError::new(
+                    ErrorCode::InvalidData,
+                    "the rescale would move a drawing price outside the supported value range",
+                ));
+            }
+        }
+        // `None` keeps the current label; an explicit empty label clears it.
+        if price_basis.is_some() && basis != self.drawing_settings.price_basis.as_deref() {
+            self.drawing_settings.price_basis = basis.map(str::to_string);
+            transient_changed = true;
+        }
+        if changed > 0 {
+            self.drawing_runtime
+                .borrow_mut()
+                .rebuild_all(&self.drawings, self.panes.len());
+        }
+        if changed > 0 || transient_changed {
+            self.bump_drawing_sync_revision();
+            self.refresh_drawing_pixel_baselines();
+            self.drawing_baselines_need_frame_refresh = true;
+            self.invalidate_frame_drawings();
+        }
+        Ok(changed)
+    }
+
+    /// Media-px handles of a drawing in keyboard order, each paired with the drag part it drives:
+    /// every anchor, the brush's two ends, the rectangle's eight bounds handles, or the Long/Short
+    /// Position's four controls (target, entry, width, stop). `None` when the drawing cannot be
+    /// placed on the current axis.
+    fn drawing_handles(&self, drawing: &Drawing) -> Option<Vec<((f64, f64), DrawingDragPart)>> {
+        let px = self.drawing_px(drawing)?;
+        Some(match drawing.kind.spec().handles {
+            DrawingHandleMode::None => Vec::new(),
+            DrawingHandleMode::Endpoints if px.len() >= 2 => {
+                let last = px.len() - 1;
+                vec![
+                    (px[0], DrawingDragPart::Anchor(0)),
+                    (px[last], DrawingDragPart::Anchor(last)),
+                ]
+            }
+            DrawingHandleMode::RectangleBounds if px.len() == 2 => Self::rectangle_anchors(&px)
+                .into_iter()
+                .enumerate()
+                .map(|(index, point)| (point, DrawingDragPart::Anchor(index)))
+                .collect(),
+            DrawingHandleMode::Position if px.len() == 3 => {
+                let (entry, target, stop) = (px[0], px[1], px[2]);
+                [
+                    (entry.0, target.1),
+                    (entry.0, entry.1),
+                    (target.0, entry.1),
+                    (entry.0, stop.1),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, point)| (point, DrawingDragPart::Anchor(index)))
+                .collect()
+            }
+            _ => px
+                .iter()
+                .enumerate()
+                .map(|(index, &point)| (point, DrawingDragPart::Anchor(index)))
+                .collect(),
+        })
+    }
+
+    /// Number of keyboard-reachable handles of a drawing (see
+    /// [`ChartEngine::nudge_selected_drawing`]). `None` for an unknown id or an unplaceable
+    /// drawing.
+    pub fn drawing_handle_count(&self, id: DrawingId) -> Option<usize> {
+        Some(self.drawing_handles(self.drawing(id)?)?.len())
+    }
+
     fn rebase_drawing_logicals_with<F>(&mut self, map: F)
     where
         F: Fn(f64) -> f64 + Copy,
@@ -1411,8 +1807,153 @@ impl ChartEngine {
         }
     }
 
+    /// Rebase every drawing-semantic logical snapshot across a merged-union change. Common
+    /// timestamps keep the exact merged mapping; anchors the mapping cannot place (an interval
+    /// switch or reload without shared stamps, or anchors left of prepended history) resolve their
+    /// old-axis time on the new axis; an axis emptied by clear-then-set parks each anchor's time
+    /// until data returns. Non-time sequence axes keep their row/sequence mapping. Trims and
+    /// other non-prepending translations (the per-tick retention path) stay a pure bar-count
+    /// shift with no copy of the axis.
     pub(crate) fn rebase_drawing_logicals(&mut self, mapping: &MergedTimeMapping) {
-        self.rebase_drawing_logicals_with(|logical| mapping.map_logical(logical));
+        let time_axes = self.drawing_time_axis() && !self.drawing_settings.sequence_axis;
+        if !time_axes || (mapping.is_translation() && !time_anchor::translation_prepends(mapping)) {
+            self.rebase_drawing_logicals_with(|logical| mapping.map_logical(logical));
+            return;
+        }
+        if self.data.merged_times().is_empty() {
+            self.park_drawing_anchor_times(mapping.old_times());
+            return;
+        }
+        let new_times = self.data.merged_times().to_vec();
+        self.rebase_drawing_logicals_with(|logical| {
+            time_anchor::rebase_logical(mapping, &new_times, logical)
+        });
+    }
+
+    /// Whether the merged axis currently carries UTC times rather than non-time row keys.
+    fn drawing_time_axis(&self) -> bool {
+        self.sequence_points.is_none() && !self.drawing_settings.sequence_install
+    }
+
+    /// The axis just emptied: record every committed and history anchor's time on the old axis
+    /// so the anchors re-resolve when data returns. Transient creation/drag state cannot outlive
+    /// the axis it was measured on, so it is cancelled (a drag rolls back to its start).
+    fn park_drawing_anchor_times(&mut self, old_times: &[i64]) {
+        if old_times.is_empty() {
+            return;
+        }
+        if self.drawing_drag.is_some() {
+            self.drawing_drag_cancel();
+        }
+        self.drawing_controller.pending = None;
+        self.drawing_controller.brush = None;
+        let park = |drawing: &mut Drawing| {
+            let mut pending = if drawing.pending_times.is_empty() {
+                vec![None; drawing.points.len()]
+            } else {
+                std::mem::take(&mut drawing.pending_times)
+            };
+            for (slot, point) in pending.iter_mut().zip(&drawing.points) {
+                if slot.is_none() {
+                    *slot = time_anchor::time_at_logical(old_times, point.logical);
+                }
+            }
+            drawing.set_pending_times(pending);
+            drawing.has_pending_times()
+        };
+        let mut parked = false;
+        for drawing in &mut self.drawings {
+            parked |= park(drawing);
+        }
+        for command in self
+            .drawing_history
+            .undo
+            .iter_mut()
+            .chain(&mut self.drawing_history.redo)
+        {
+            command.for_each_drawing_mut(|drawing| parked |= park(drawing));
+        }
+        self.drawing_settings.time_pending |= parked;
+        self.invalidate_frame_drawings();
+    }
+
+    /// Resolve parked anchor times on the current axis (after data arrives, on import, or when
+    /// a pasted/synced drawing lands before its data). Anchors that still cannot be placed stay
+    /// pending; the bookkeeping flag is recomputed so steady-state syncs skip the walk.
+    pub(crate) fn resolve_pending_drawing_times(&mut self) {
+        if !self.drawing_settings.time_pending || !self.drawing_time_axis() {
+            return;
+        }
+        let times = self.data.merged_times();
+        if times.is_empty() {
+            return;
+        }
+        let mut still_pending = false;
+        let mut committed_changed = false;
+        let resolve = |drawing: &mut Drawing, still_pending: &mut bool| -> bool {
+            if drawing.pending_times.is_empty() {
+                return false;
+            }
+            let mut changed = false;
+            let mut pending = std::mem::take(&mut drawing.pending_times);
+            for (slot, point) in pending.iter_mut().zip(drawing.points.iter_mut()) {
+                // A placeholder that already sits exactly at the time (a document restored into
+                // the window it was saved from) is kept bit-exact rather than re-derived.
+                let current = point.logical;
+                if let Some(logical) = slot.and_then(|time| {
+                    if time_anchor::time_at_logical(times, current) == Some(time) {
+                        Some(current)
+                    } else {
+                        time_anchor::logical_at_time(times, time)
+                    }
+                }) {
+                    changed |= point.logical != logical;
+                    point.logical = logical;
+                    *slot = None;
+                }
+            }
+            drawing.set_pending_times(pending);
+            *still_pending |= drawing.has_pending_times();
+            changed
+        };
+        for drawing in &mut self.drawings {
+            committed_changed |= resolve(drawing, &mut still_pending);
+        }
+        for command in self
+            .drawing_history
+            .undo
+            .iter_mut()
+            .chain(&mut self.drawing_history.redo)
+        {
+            command.for_each_drawing_mut(|drawing| {
+                resolve(drawing, &mut still_pending);
+            });
+        }
+        self.drawing_settings.time_pending = still_pending;
+        if committed_changed {
+            self.drawing_runtime
+                .borrow_mut()
+                .rebuild_all(&self.drawings, self.panes.len());
+            self.invalidate_frame_drawings();
+        }
+    }
+
+    /// Install a restored document's price-basis label and resolve its anchor times against the
+    /// chart's current data. Without time points the anchors stay pending by time and resolve
+    /// when the host installs data (for example a grid workspace restoring before its feeds).
+    pub(crate) fn restore_drawing_time_identity(&mut self, price_basis: Option<String>) {
+        self.drawing_settings.price_basis = price_basis;
+        self.drawing_settings.time_pending = self.drawings.iter().any(Drawing::has_pending_times);
+        self.resolve_pending_drawing_times();
+    }
+
+    /// Drawing time-identity maintenance after a merged-axis synchronization: remember the axis
+    /// kind for the next rebase and resolve parked anchor times when the time points changed.
+    pub(crate) fn sync_drawing_time_identity(&mut self, points_changed: bool) {
+        self.drawing_settings.sequence_axis = !self.drawing_time_axis();
+        if points_changed {
+            self.resolve_pending_drawing_times();
+        }
     }
 
     pub(crate) fn rebase_drawing_logicals_sequence(&mut self, mapping: &BarSequenceMapping) {
@@ -1558,8 +2099,13 @@ impl ChartEngine {
         }
     }
 
-    /// Undo one committed drawing-semantic operation for this chart only.
+    /// Undo one committed drawing-semantic operation for this chart only. An active pointer or
+    /// keyboard drag is cancelled first (rolled back to its start) so the next drag sample cannot
+    /// overwrite the restored state and the drag's end cannot record over the redo branch.
     pub fn undo_drawing(&mut self) -> bool {
+        if self.drawing_drag.is_some() {
+            self.drawing_drag_cancel();
+        }
         let Some(command) = self.drawing_history.undo.pop() else {
             return false;
         };
@@ -1572,8 +2118,12 @@ impl ChartEngine {
         true
     }
 
-    /// Redo one previously undone drawing-semantic operation for this chart only.
+    /// Redo one previously undone drawing-semantic operation for this chart only. Like undo, an
+    /// active drag is cancelled first.
     pub fn redo_drawing(&mut self) -> bool {
+        if self.drawing_drag.is_some() {
+            self.drawing_drag_cancel();
+        }
         let Some(command) = self.drawing_history.redo.pop() else {
             return false;
         };
@@ -1650,6 +2200,14 @@ impl ChartEngine {
             DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
             DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
         };
+        // An explicit scale base (e.g. the previous close) anchors drawings exactly like the
+        // series on that scale, even before any series has a visible bar.
+        if let Some(base) = self
+            .price_scale_for(pane_index, target)
+            .and_then(|scale| scale.options().base_value)
+        {
+            return base;
+        }
         self.visible_range()
             .and_then(|(from, _)| {
                 let series = self.series.iter().find(|s| {
@@ -1728,20 +2286,31 @@ impl ChartEngine {
         Some(point)
     }
 
-    /// Reference-informed magnet behavior (Ctrl held): resolve the live pointer through the same pixel-space
+    /// Reference-informed magnet behavior: resolve the live pointer through the same pixel-space
     /// rendered-price candidate path as the crosshair, then encode the winning coordinate on the
-    /// drawing's own price scale. A bar with no visible real candidate keeps the unsnapped point.
+    /// drawing's own price scale. Strong always snaps to the nearest candidate of the bar under the
+    /// pointer; weak snaps only within [`DRAWING_WEAK_MAGNET_DISTANCE`] vertical CSS px. A bar with
+    /// no visible real candidate keeps the unsnapped point.
     fn magnet_snap_point_at(
         &self,
+        mode: crate::DrawingMagnetMode,
         pane_index: usize,
         price_scale: DrawingPriceScale,
         x: f64,
         y: f64,
         point: DrawingPoint,
     ) -> DrawingPoint {
+        if mode == crate::DrawingMagnetMode::Off {
+            return point;
+        }
         let Some((logical, snapped_y)) = self.magnet_snap_coordinate(pane_index, x, y, true) else {
             return point;
         };
+        if mode == crate::DrawingMagnetMode::Weak
+            && (snapped_y - y).abs() > DRAWING_WEAK_MAGNET_DISTANCE
+        {
+            return point;
+        }
         let Some(mut snapped) = self.drawing_from_px_for(pane_index, price_scale, x, snapped_y)
         else {
             return point;
@@ -2326,8 +2895,10 @@ impl ChartEngine {
     // --- CRUD ---
 
     /// Add a drawing to a financial-time pane; returns its chart-unique id, or `None` for a stale
-    /// or incompatible pane, a wrong anchor count for the kind, or non-finite anchors.
-    /// `options_json` is a [`DrawingPatch`] — absent keys take the documented defaults.
+    /// or incompatible pane, a wrong anchor count for the kind, non-finite anchors, or a malformed
+    /// or out-of-contract options patch. `options_json` is a [`DrawingPatch`] — absent keys take
+    /// the documented defaults. [`ChartEngine::add_drawing_anchors`] reports the failure reason
+    /// and also accepts time anchors.
     pub fn add_drawing(
         &mut self,
         kind: DrawingKind,
@@ -2335,27 +2906,72 @@ impl ChartEngine {
         points: Vec<DrawingPoint>,
         options_json: Option<&str>,
     ) -> Option<DrawingId> {
+        let anchors = points
+            .into_iter()
+            .map(DrawingAnchor::from)
+            .collect::<Vec<_>>();
+        self.add_drawing_anchors(kind, pane_index, &anchors, options_json)
+            .ok()
+    }
+
+    /// Add a drawing from `{logical, price}`, `{time, price}`, or combined anchors. Time anchors
+    /// resolve on the current time axis; before any time points exist they stay pending by time
+    /// and resolve when data arrives. Every input, including the options patch, is validated
+    /// before the drawing is created, and failures report their reason.
+    pub fn add_drawing_anchors(
+        &mut self,
+        kind: DrawingKind,
+        pane_index: usize,
+        anchors: &[DrawingAnchor],
+        options_json: Option<&str>,
+    ) -> Result<DrawingId, ChartError> {
         self.invalidate_frame_drawings();
-        if pane_index >= self.panes.len()
-            || !self.pane_uses_financial_time(pane_index)
-            || points.len() > MAX_DRAWING_POINTS
-            || !kind.valid_point_count(points.len())
-        {
-            return None;
+        if pane_index >= self.panes.len() || !self.pane_uses_financial_time(pane_index) {
+            return Err(ChartError::new(
+                ErrorCode::InvalidData,
+                format!("pane {pane_index} is stale or not a financial-time pane"),
+            ));
         }
-        if points
-            .iter()
-            .any(|p| !p.logical.is_finite() || !p.price.is_finite())
-        {
-            return None;
+        if anchors.len() > MAX_DRAWING_POINTS || !kind.valid_point_count(anchors.len()) {
+            return Err(ChartError::new(
+                ErrorCode::InvalidData,
+                format!(
+                    "{} anchors are invalid for a {} drawing",
+                    anchors.len(),
+                    kind.name()
+                ),
+            ));
         }
-        let id = self.take_drawing_id()?;
-        let mut drawing = Drawing::new(id, kind, pane_index, points);
+        let (points, pending) = self.resolve_drawing_anchors(anchors)?;
+        let mut drawing = Drawing::new(0, kind, pane_index, points);
+        drawing.set_pending_times(pending);
+        let mut explicit_z_order = false;
         if let Some(json) = options_json {
-            if let Ok(patch) = serde_json::from_str::<DrawingPatch>(json) {
-                let _ = drawing.apply_patch(patch);
+            let patch = serde_json::from_str::<DrawingPatch>(json).map_err(|error| {
+                ChartError::new(
+                    ErrorCode::InvalidOptions,
+                    format!("drawing options are malformed: {error}"),
+                )
+            })?;
+            explicit_z_order = patch.z_order.is_some();
+            if !drawing.apply_patch(patch) {
+                return Err(ChartError::new(
+                    ErrorCode::InvalidOptions,
+                    "drawing options exceed the drawing contract bounds",
+                ));
             }
         }
+        let id = self.take_drawing_id().ok_or_else(|| {
+            ChartError::new(
+                ErrorCode::ResourceLimit,
+                "drawing identity space is exhausted",
+            )
+        })?;
+        drawing.id = id;
+        if !explicit_z_order {
+            drawing.z_order = id as i32;
+        }
+        self.drawing_settings.time_pending |= drawing.has_pending_times();
         self.drawings.push(drawing);
         self.insert_drawing_runtime(id);
         let index = self.drawings.len() - 1;
@@ -2364,7 +2980,7 @@ impl ChartEngine {
             index,
         });
         self.bump_drawing_sync_revision();
-        Some(id)
+        Ok(id)
     }
 
     /// Merge a JSON options patch into the drawing with `id` (reference `applyOptions`): absent
@@ -2419,41 +3035,257 @@ impl ChartEngine {
         true
     }
 
-    /// Replace a drawing's anchors from a JSON `[{logical, price}, ...]` array. Returns false
-    /// for malformed JSON, a wrong count for the kind, non-finite values, or an unknown id.
+    /// Replace a drawing's anchors from a JSON `[{logical?, time?, price}, ...]` array. Returns
+    /// false for malformed JSON, a wrong count for the kind, non-finite values, or an unknown id.
     pub fn drawing_set_points(&mut self, id: DrawingId, json: &str) -> bool {
         self.invalidate_frame_drawings();
-        let Ok(mut points) = serde_json::from_str::<Vec<DrawingPoint>>(json) else {
+        let Ok(anchors) = serde_json::from_str::<Vec<DrawingAnchor>>(json) else {
             return false;
         };
-        let Some(index) = self.drawings.iter().position(|drawing| drawing.id == id) else {
-            return false;
-        };
-        let drawing = &self.drawings[index];
-        if points.len() > MAX_DRAWING_POINTS
-            || !drawing.kind.valid_point_count(points.len())
-            || points
+        self.set_drawing_anchors(id, &anchors).is_ok()
+    }
+
+    /// Replace one drawing's anchors (one undo step). Time anchors resolve on the current axis
+    /// exactly as in [`ChartEngine::add_drawing_anchors`].
+    pub fn set_drawing_anchors(
+        &mut self,
+        id: DrawingId,
+        anchors: &[DrawingAnchor],
+    ) -> Result<(), ChartError> {
+        self.set_drawings_anchors_inner(&[(id, anchors)], false)
+            .map(|_| ())
+    }
+
+    /// Replace the anchors of many drawings atomically as ONE undo step (for example a host-side
+    /// price-basis rewrite). Every update is validated before any drawing changes; returns the
+    /// number of drawings whose anchors changed.
+    pub fn set_drawings_anchors(
+        &mut self,
+        updates: &[(DrawingId, Vec<DrawingAnchor>)],
+    ) -> Result<usize, ChartError> {
+        let updates = updates
+            .iter()
+            .map(|(id, anchors)| (*id, anchors.as_slice()))
+            .collect::<Vec<_>>();
+        self.set_drawings_anchors_inner(&updates, true)
+    }
+
+    fn set_drawings_anchors_inner(
+        &mut self,
+        updates: &[(DrawingId, &[DrawingAnchor])],
+        batch: bool,
+    ) -> Result<usize, ChartError> {
+        self.invalidate_frame_drawings();
+        if updates.len() > crate::MAX_DRAWING_OBJECTS {
+            return Err(ChartError::new(
+                ErrorCode::ResourceLimit,
+                format!(
+                    "at most {} drawings can be updated at once",
+                    crate::MAX_DRAWING_OBJECTS
+                ),
+            ));
+        }
+        let total = updates
+            .iter()
+            .map(|(_, anchors)| anchors.len())
+            .fold(0usize, usize::saturating_add);
+        if total > crate::PERSISTENCE_MAX_TOTAL_POINTS.max(MAX_DRAWING_POINTS) {
+            return Err(ChartError::new(
+                ErrorCode::ResourceLimit,
+                "the anchor update exceeds the total anchor limit",
+            ));
+        }
+        let mut staged = Vec::with_capacity(updates.len());
+        let mut seen = std::collections::HashSet::with_capacity(updates.len());
+        for &(id, anchors) in updates {
+            if !seen.insert(id) {
+                return Err(ChartError::new(
+                    ErrorCode::InvalidData,
+                    format!("drawing {id} is updated more than once"),
+                ));
+            }
+            let index = self
+                .drawings
                 .iter()
-                .any(|p| !p.logical.is_finite() || !p.price.is_finite())
-        {
-            return false;
+                .position(|drawing| drawing.id == id)
+                .ok_or_else(|| {
+                    ChartError::new(ErrorCode::StaleHandle, format!("drawing {id} was removed"))
+                })?;
+            let kind = self.drawings[index].kind;
+            if anchors.len() > MAX_DRAWING_POINTS || !kind.valid_point_count(anchors.len()) {
+                return Err(ChartError::new(
+                    ErrorCode::InvalidData,
+                    format!(
+                        "{} anchors are invalid for a {} drawing",
+                        anchors.len(),
+                        kind.name()
+                    ),
+                ));
+            }
+            let (mut points, pending) = self.resolve_drawing_anchors(anchors)?;
+            Drawing::normalize_position_points(kind, &mut points);
+            staged.push((index, points, pending));
         }
-        Drawing::normalize_position_points(drawing.kind, &mut points);
-        let before = drawing.clone();
-        self.drawings[index].points = points;
-        let after = self.drawings[index].clone();
-        if before.points != after.points {
-            self.drawing_anchor_times.remove(&id);
+        let before_all = batch.then(|| self.drawings.clone());
+        let mut changed = 0usize;
+        let mut single = None;
+        for (index, points, pending) in staged {
+            let before = self.drawings[index].clone();
+            let drawing = &mut self.drawings[index];
+            drawing.points = points;
+            drawing.set_pending_times(pending);
+            let pending_now = drawing.has_pending_times();
+            let id = drawing.id;
+            let logical_changed = before.points.len() != drawing.points.len()
+                || before
+                    .points
+                    .iter()
+                    .zip(&drawing.points)
+                    .any(|(a, b)| a.logical != b.logical);
+            self.drawing_settings.time_pending |= pending_now;
+            if logical_changed {
+                // A price-only edit keeps the non-time bar identity sidecar.
+                self.drawing_anchor_times.remove(&id);
+            }
+            if before != self.drawings[index] {
+                changed += 1;
+                single = Some((before, self.drawings[index].clone()));
+            }
         }
-        self.update_drawing_runtime(id);
-        if before != after {
-            self.record_drawing_command(DrawingCommand::Update {
-                before,
-                after: Box::new(after),
+        if changed == 0 {
+            return Ok(0);
+        }
+        match before_all {
+            Some(before) => {
+                let after = self.drawings.clone();
+                self.record_drawing_command(DrawingCommand::BatchUpdate { before, after });
+                self.drawing_runtime
+                    .borrow_mut()
+                    .rebuild_all(&self.drawings, self.panes.len());
+            }
+            None => {
+                let (before, after) = single.expect("one changed drawing");
+                self.update_drawing_runtime(after.id);
+                self.record_drawing_command(DrawingCommand::Update {
+                    before,
+                    after: Box::new(after),
+                });
+            }
+        }
+        self.bump_drawing_sync_revision();
+        Ok(changed)
+    }
+
+    /// Resolve host anchors into live logical/price points plus pending times. A `time` resolves
+    /// on the current ordinary time axis (it wins over a disagreeing `logical`); without time
+    /// points it stays pending with `logical` (or zero) as the placeholder.
+    fn resolve_drawing_anchors(
+        &self,
+        anchors: &[DrawingAnchor],
+    ) -> Result<(Vec<DrawingPoint>, Vec<Option<f64>>), ChartError> {
+        let time_axis = self.drawing_time_axis();
+        let times = self.data.merged_times();
+        let finite = |value: f64| value.is_finite() && value.abs() <= MAX_SAFE_VALUE;
+        let mut points = Vec::with_capacity(anchors.len());
+        let mut pending = Vec::new();
+        for (index, anchor) in anchors.iter().enumerate() {
+            if !finite(anchor.price)
+                || anchor.logical.is_some_and(|logical| !finite(logical))
+                || anchor.time.is_some_and(|time| !finite(time))
+            {
+                return Err(ChartError::new(
+                    ErrorCode::InvalidData,
+                    format!("drawing anchor {index} has a non-finite or out-of-range value"),
+                ));
+            }
+            let (logical, pending_time) = match (anchor.logical, anchor.time) {
+                (logical, Some(time)) if time_axis => {
+                    let exact = logical.filter(|&logical| {
+                        time_anchor::time_at_logical(times, logical) == Some(time)
+                    });
+                    if let Some(logical) = exact {
+                        (logical, None)
+                    } else if let Some(resolved) = time_anchor::logical_at_time(times, time) {
+                        (resolved, None)
+                    } else {
+                        (logical.unwrap_or(0.0), Some(time))
+                    }
+                }
+                (Some(logical), _) => (logical, None),
+                (None, Some(_)) => {
+                    return Err(ChartError::new(
+                        ErrorCode::UnsupportedOperation,
+                        format!(
+                            "drawing anchor {index} is time-only, but this chart has no ordinary time axis"
+                        ),
+                    ))
+                }
+                (None, None) => {
+                    return Err(ChartError::new(
+                        ErrorCode::InvalidData,
+                        format!("drawing anchor {index} needs a logical index or a time"),
+                    ))
+                }
+            };
+            if pending_time.is_some() && pending.is_empty() {
+                pending = vec![None; anchors.len()];
+            }
+            if let Some(slot) = pending.get_mut(index) {
+                *slot = pending_time;
+            }
+            points.push(DrawingPoint {
+                logical,
+                price: anchor.price,
             });
-            self.bump_drawing_sync_revision();
         }
-        true
+        Ok((points, pending))
+    }
+
+    /// Anchor time (UTC seconds) of a logical position on the current ordinary time axis:
+    /// interpolated between neighbouring bars, extrapolated with the prevailing bar interval beyond
+    /// the data. `None` on non-time sequence axes or without enough time points.
+    pub fn anchor_time_at_logical(&self, logical: f64) -> Option<f64> {
+        if !self.drawing_time_axis() {
+            return None;
+        }
+        time_anchor::time_at_logical(self.data.merged_times(), logical)
+    }
+
+    /// Logical position of an anchor time on the current ordinary time axis (the inverse of
+    /// [`ChartEngine::anchor_time_at_logical`]).
+    pub fn anchor_logical_at_time(&self, time: f64) -> Option<f64> {
+        if !self.drawing_time_axis() {
+            return None;
+        }
+        time_anchor::logical_at_time(self.data.merged_times(), time)
+    }
+
+    /// The time identity of one anchor of `drawing`: its pending time while unresolved, otherwise
+    /// the time derived from its logical position on the current axis.
+    pub(crate) fn drawing_anchor_time_of(&self, drawing: &Drawing, index: usize) -> Option<f64> {
+        if let Some(Some(time)) = drawing.pending_times.get(index) {
+            return Some(*time);
+        }
+        self.anchor_time_at_logical(drawing.points.get(index)?.logical)
+    }
+
+    /// Host-facing anchors of a drawing: live `{logical, price}` plus the anchor time identity.
+    pub(crate) fn drawing_anchors_of(&self, drawing: &Drawing) -> Vec<DrawingAnchor> {
+        drawing
+            .points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| DrawingAnchor {
+                logical: Some(point.logical),
+                price: point.price,
+                time: self.drawing_anchor_time_of(drawing, index),
+            })
+            .collect()
+    }
+
+    /// The drawing's anchors with their time identity. `None` for an unknown id.
+    pub fn drawing_anchors(&self, id: DrawingId) -> Option<Vec<DrawingAnchor>> {
+        Some(self.drawing_anchors_of(self.drawing(id)?))
     }
 
     /// Remove a drawing by id. Returns false for an unknown id. Any selection or drag session
@@ -2539,7 +3371,8 @@ impl ChartEngine {
         &self.selected_drawings
     }
 
-    /// Copy selected or explicitly supplied drawings to a bounded, revisioned payload.
+    /// Copy selected or explicitly supplied drawings to a bounded, revisioned payload. Points
+    /// carry their anchor time identity and the payload carries the chart's price-basis label.
     pub fn copy_drawings_json(&self, ids: &[DrawingId]) -> Option<String> {
         let ids = if ids.is_empty() {
             &self.selected_drawings
@@ -2554,7 +3387,7 @@ impl ChartEngine {
                 id: None,
                 kind: drawing.kind,
                 pane_index: drawing.pane_index,
-                points: drawing.points.clone(),
+                points: self.drawing_anchors_of(drawing),
                 options: drawing.options_json(),
             })
             .collect::<Vec<_>>();
@@ -2562,13 +3395,16 @@ impl ChartEngine {
             schema: "aeris_charts-drawings".to_string(),
             revision: self.drawing_sync_revision,
             drawings,
+            price_basis: self.drawing_settings.price_basis.clone(),
         };
         let bytes = serde_json::to_vec(&payload).ok()?;
         (bytes.len() <= crate::MAX_DRAWING_TEMPLATE_BYTES).then(|| String::from_utf8(bytes).ok())?
     }
 
-    /// Paste a clipboard payload into one pane with a semantic anchor offset. Validation happens
-    /// before mutation, so malformed or oversized payloads cannot partially change the chart.
+    /// Paste a clipboard payload into one pane with a semantic anchor offset. Anchors resolve by
+    /// their time on this chart's axis (so a payload copied from another interval or history
+    /// window lands on the same moments), then the offsets apply. Validation happens before
+    /// mutation, so malformed or oversized payloads cannot partially change the chart.
     pub fn paste_drawings_json(
         &mut self,
         json: &str,
@@ -2593,25 +3429,49 @@ impl ChartEngine {
         }
         let mut staged = Vec::with_capacity(payload.drawings.len());
         for item in payload.drawings {
-            let mut points = item.points;
+            if item.points.len() > MAX_DRAWING_POINTS
+                || !item.kind.valid_point_count(item.points.len())
+            {
+                return None;
+            }
+            let (mut points, mut pending) = self.resolve_drawing_anchors(&item.points).ok()?;
             for point in &mut points {
                 point.logical += logical_offset;
                 point.price += price_offset;
             }
-            if points.len() > MAX_DRAWING_POINTS
-                || !item.kind.valid_point_count(points.len())
-                || points
-                    .iter()
-                    .any(|point| !point.logical.is_finite() || !point.price.is_finite())
+            if points
+                .iter()
+                .any(|point| !point.logical.is_finite() || !point.price.is_finite())
             {
                 return None;
             }
+            if logical_offset != 0.0 {
+                // A logical shift of a placeholder has no time equivalent without time points;
+                // the shifted placeholder becomes the anchor.
+                pending.clear();
+            }
+            let patch = serde_json::from_value::<DrawingPatch>(item.options.clone()).ok()?;
+            if !Drawing::new(0, item.kind, pane_index, Vec::new()).apply_patch(patch) {
+                return None;
+            }
+            let anchors = points
+                .iter()
+                .enumerate()
+                .map(|(index, point)| DrawingAnchor {
+                    logical: Some(point.logical),
+                    price: point.price,
+                    time: pending.get(index).copied().flatten(),
+                })
+                .collect::<Vec<_>>();
             let options = serde_json::to_string(&item.options).ok()?;
-            staged.push((item.kind, points, options));
+            staged.push((item.kind, anchors, options));
         }
         let mut ids = Vec::with_capacity(staged.len());
-        for (kind, points, options) in staged {
-            ids.push(self.add_drawing(kind, pane_index, points, Some(&options))?);
+        for (kind, anchors, options) in staged {
+            ids.push(
+                self.add_drawing_anchors(kind, pane_index, &anchors, Some(&options))
+                    .ok()?,
+            );
         }
         Some(ids)
     }
@@ -2798,7 +3658,7 @@ impl ChartEngine {
                 id: Some(drawing.id),
                 kind: drawing.kind,
                 pane_index: drawing.pane_index,
-                points: drawing.points.clone(),
+                points: self.drawing_anchors_of(drawing),
                 options: drawing.options_json(),
             })
             .collect();
@@ -2807,12 +3667,15 @@ impl ChartEngine {
             source: source.to_string(),
             revision: self.drawing_sync_revision.max(1),
             drawings,
+            price_basis: self.drawing_settings.price_basis.clone(),
         })
         .ok()
     }
 
     /// Apply a complete cross-cell payload. Stale revisions and same-source echoes are ignored;
-    /// all entries are validated and staged before replacing live semantic state.
+    /// all entries are validated and staged before replacing live semantic state. Anchors resolve
+    /// by their time on this chart's axis (pending until data arrives when it has none), and the
+    /// receiver adopts the payload's price-basis label because every drawing now carries it.
     pub fn apply_drawing_sync_payload_json(&mut self, json: &str) -> bool {
         let Ok(payload) = serde_json::from_str::<crate::DrawingSyncPayload>(json) else {
             return false;
@@ -2824,6 +3687,10 @@ impl ChartEngine {
             || (payload.source == self.drawing_sync_source
                 && payload.revision <= self.drawing_sync_revision)
             || payload.drawings.len() > crate::MAX_DRAWING_OBJECTS
+            || payload
+                .price_basis
+                .as_ref()
+                .is_some_and(|basis| basis.len() > crate::MAX_DRAWING_GROUP_BYTES)
         {
             return false;
         }
@@ -2833,11 +3700,8 @@ impl ChartEngine {
             if item.pane_index >= self.panes.len()
                 || !self.pane_uses_financial_time(item.pane_index)
                 || !ids.insert(item.id.unwrap_or(0))
+                || item.points.len() > MAX_DRAWING_POINTS
                 || !item.kind.valid_point_count(item.points.len())
-                || item
-                    .points
-                    .iter()
-                    .any(|point| !point.logical.is_finite() || !point.price.is_finite())
             {
                 return false;
             }
@@ -2845,7 +3709,11 @@ impl ChartEngine {
             if id == 0 {
                 return false;
             }
-            let mut drawing = Drawing::new(id, item.kind, item.pane_index, item.points);
+            let Ok((points, pending)) = self.resolve_drawing_anchors(&item.points) else {
+                return false;
+            };
+            let mut drawing = Drawing::new(id, item.kind, item.pane_index, points);
+            drawing.set_pending_times(pending);
             let Ok(options) = serde_json::to_string(&item.options) else {
                 return false;
             };
@@ -2857,6 +3725,7 @@ impl ChartEngine {
             }
             staged.push(drawing);
         }
+        self.drawing_settings.time_pending |= staged.iter().any(Drawing::has_pending_times);
         self.drawings = staged;
         self.next_drawing_id = self
             .drawings
@@ -2867,6 +3736,7 @@ impl ChartEngine {
             .saturating_add(1);
         self.drawing_sync_source = payload.source;
         self.drawing_sync_revision = payload.revision;
+        self.drawing_settings.price_basis = payload.price_basis.filter(|basis| !basis.is_empty());
         self.selected_drawing = None;
         self.selected_drawings.clear();
         self.drawing_history.clear();
@@ -2877,9 +3747,10 @@ impl ChartEngine {
         true
     }
 
-    /// The drawing's anchors as a JSON `[{logical, price}, ...]` array. `None` for an unknown id.
+    /// The drawing's anchors as a JSON `[{logical, price, time?}, ...]` array (`time` is the
+    /// anchor time identity in UTC seconds). `None` for an unknown id.
     pub fn drawing_points_json(&self, id: DrawingId) -> Option<String> {
-        Some(serde_json::to_string(&self.drawing(id)?.points).unwrap_or_default())
+        Some(serde_json::to_string(&self.drawing_anchors(id)?).unwrap_or_default())
     }
 
     /// One anchor's media-px position (x pane-relative, y chart-top — the host's overlay
@@ -3477,6 +4348,28 @@ impl ChartEngine {
     /// move) — the session recomputes from its start snapshot each call, so toggling a modifier
     /// mid-drag responds live (reference-informed behavior).
     pub fn drawing_drag_to(&mut self, x: f64, y: f64, modifiers: DrawingModifiers) {
+        let own = self
+            .drawing_drag
+            .as_ref()
+            .and_then(|drag| self.drawing(drag.id))
+            .map_or(crate::DrawingMagnetMode::Off, |drawing| drawing.magnet);
+        let magnet = self.effective_drawing_magnet(own, modifiers.magnet);
+        self.drawing_drag_apply(x, y, magnet, modifiers.straighten);
+    }
+
+    /// Apply one drag sample with an already-resolved magnet mode (pointer drags resolve it from
+    /// the drawing, chart, and toggle; keyboard nudges never snap).
+    fn drawing_drag_apply(
+        &mut self,
+        x: f64,
+        y: f64,
+        magnet: crate::DrawingMagnetMode,
+        straighten: bool,
+    ) {
+        let modifiers = DrawingModifiers {
+            magnet: magnet != crate::DrawingMagnetMode::Off,
+            straighten,
+        };
         self.invalidate_frame_drawings();
         let Some(drag) = self.drawing_drag.as_mut() else {
             return;
@@ -3511,7 +4404,8 @@ impl ChartEngine {
                         return;
                     };
                     if modifiers.magnet && index != 2 {
-                        cursor_pt = self.magnet_snap_point_at(pane, price_scale, x, y, cursor_pt);
+                        cursor_pt =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, cursor_pt);
                     }
                     match index {
                         // Target: vertical level only.
@@ -3572,7 +4466,8 @@ impl ChartEngine {
                         cursor_pt = snapped;
                     }
                     if modifiers.magnet {
-                        cursor_pt = self.magnet_snap_point_at(pane, price_scale, x, y, cursor_pt);
+                        cursor_pt =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, cursor_pt);
                     }
                     let Some((mx, my)) = self.drawing_to_px_for(pane, price_scale, cursor_pt)
                     else {
@@ -3661,7 +4556,7 @@ impl ChartEngine {
                     point = snapped;
                 }
                 if modifiers.magnet {
-                    let snapped = self.magnet_snap_point_at(pane, price_scale, x, y, point);
+                    let snapped = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
                     point = match kind.spec().movement_axis {
                         DrawingMovementAxis::VerticalOnly => DrawingPoint {
                             price: snapped.price,
@@ -3712,7 +4607,8 @@ impl ChartEngine {
                     // the anchor drag, so the magnet applies here too (a Ctrl-dragged vertical
                     // line snaps to bar centers, a horizontal one to the nearest rendered price).
                     if modifiers.magnet && single_anchor {
-                        let snapped = self.magnet_snap_point_at(pane, price_scale, x, y, point);
+                        let snapped =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
                         point = match kind.spec().movement_axis {
                             DrawingMovementAxis::VerticalOnly => DrawingPoint {
                                 price: snapped.price,
@@ -3749,7 +4645,15 @@ impl ChartEngine {
                 let mut before = after.clone();
                 before.points = drag.history_points;
                 if before != after {
-                    self.drawing_anchor_times.remove(&id);
+                    // A price-only (vertical) edit keeps the non-time bar identity sidecar.
+                    if before
+                        .points
+                        .iter()
+                        .zip(&after.points)
+                        .any(|(a, b)| a.logical != b.logical)
+                    {
+                        self.drawing_anchor_times.remove(&id);
+                    }
                     self.record_drawing_command(DrawingCommand::Update {
                         before,
                         after: Box::new(after),
@@ -3782,14 +4686,23 @@ impl ChartEngine {
     }
 
     /// Keyboard-equivalent movement through the same drag/history path as pointer input.
-    /// `anchor` selects one defining anchor; `None` moves the whole drawing.
+    /// `handle` selects one keyboard handle in [`ChartEngine::drawing_handle_count`] order (every
+    /// anchor, the brush's two ends, the rectangle's eight bounds handles, or the Long/Short
+    /// Position's target/entry/width/stop controls); `None` moves the whole drawing. The session
+    /// starts at the handle's own media position so handle kinds that follow the pointer move by
+    /// exactly the nudge delta. Keyboard nudges never magnet-snap, locked drawings do not move,
+    /// and an active pointer drag is left untouched.
     pub fn nudge_selected_drawing(
         &mut self,
         dx_css: f64,
         dy_css: f64,
-        anchor: Option<usize>,
+        handle: Option<usize>,
     ) -> bool {
-        if !dx_css.is_finite() || !dy_css.is_finite() || (dx_css == 0.0 && dy_css == 0.0) {
+        if !dx_css.is_finite()
+            || !dy_css.is_finite()
+            || (dx_css == 0.0 && dy_css == 0.0)
+            || self.drawing_drag.is_some()
+        {
             return false;
         }
         let Some(id) = self.selected_drawing else {
@@ -3798,25 +4711,43 @@ impl ChartEngine {
         let Some(drawing) = self.drawing(id) else {
             return false;
         };
-        if anchor.is_some_and(|index| index >= drawing.points.len()) {
+        if drawing.locked {
             return false;
         }
+        let Some(handles) = self.drawing_handles(drawing) else {
+            return false;
+        };
+        let ((start_x, start_y), part) = match handle {
+            Some(index) => match handles.get(index) {
+                Some(&handle) => handle,
+                None => return false,
+            },
+            None => match handles.first() {
+                Some(&(position, _)) => (position, DrawingDragPart::Body),
+                None => ((0.0, 0.0), DrawingDragPart::Body),
+            },
+        };
         let start_points = drawing.points.clone();
         let Some(start_px) = self.drawing_px(drawing) else {
             return false;
         };
         self.drawing_drag = Some(DrawingDrag {
             id,
-            part: anchor.map_or(DrawingDragPart::Body, DrawingDragPart::Anchor),
-            start_x: 0.0,
-            start_y: 0.0,
-            current_x: 0.0,
-            current_y: 0.0,
+            part,
+            start_x,
+            start_y,
+            current_x: start_x,
+            current_y: start_y,
             history_points: start_points.clone(),
             start_points,
             start_px,
         });
-        self.drawing_drag_to(dx_css, dy_css, DrawingModifiers::default());
+        self.drawing_drag_apply(
+            start_x + dx_css,
+            start_y + dy_css,
+            crate::DrawingMagnetMode::Off,
+            false,
+        );
         self.drawing_drag_end();
         true
     }
@@ -4279,7 +5210,7 @@ impl ChartEngine {
         let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {
             return -1;
         };
-        let (anchor_count, kind, fixed, snap_time_to_data) = {
+        let (anchor_count, kind, fixed, snap_time_to_data, own_magnet) = {
             let Some(pending) = &self.drawing_controller.pending else {
                 return 0;
             };
@@ -4288,6 +5219,7 @@ impl ChartEngine {
                 pending.drawing.kind,
                 pending.drawing.points.last().copied(),
                 pending.drawing.snap_time_to_data,
+                pending.drawing.magnet,
             )
         };
         if snap_time_to_data {
@@ -4296,9 +5228,8 @@ impl ChartEngine {
             };
             point = snapped;
         }
-        if modifiers.magnet {
-            point = self.magnet_snap_point_at(pane, price_scale, x, y, point);
-        }
+        let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
+        point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
         if modifiers.straighten {
             if let Some(fixed) = fixed {
                 if let Some(snapped) = self.straighten_point(pane, price_scale, kind, fixed, point)
@@ -4436,15 +5367,15 @@ impl ChartEngine {
         let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {
             return;
         };
+        let own_magnet = pending.drawing.magnet;
         if pending.drawing.snap_time_to_data {
             let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                 return;
             };
             point = snapped;
         }
-        if modifiers.magnet {
-            point = self.magnet_snap_point_at(pane, price_scale, x, y, point);
-        }
+        let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
+        point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
         if modifiers.straighten {
             if let Some(pending) = &self.drawing_controller.pending {
                 if let Some(&fixed) = pending.drawing.points.last() {
@@ -4639,5 +5570,7 @@ impl ChartEngine {
     }
 }
 
+#[cfg(test)]
+mod identity_tests;
 #[cfg(test)]
 mod tests;

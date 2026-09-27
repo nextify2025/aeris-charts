@@ -2,12 +2,14 @@
 //! Ports of `src/model/horz-scale-behavior-time/time-scale-point-weight-generator.ts`
 //! and `src/model/tick-marks.ts`.
 //!
-//! Weights are assigned per point by comparing consecutive UTC timestamps: the largest
-//! calendar/time boundary crossed between neighbors determines the weight. Mark selection
-//! keeps higher weights first and inserts lower-weight marks only where they fit.
+//! Weights are assigned per point by comparing consecutive timestamps in exchange time: the
+//! largest trading-day/calendar/time boundary crossed between neighbors determines the weight.
+//! The default [`ExchangeTime::UTC`] reproduces the reference's UTC boundaries exactly. Mark
+//! selection keeps higher weights first and inserts lower-weight marks only where they fit.
 
 use std::collections::BTreeMap;
 
+use crate::scale::exchange_time::ExchangeTime;
 use crate::TimePointIndex;
 
 /// Exact values from the reference's `TickMarkWeight` (`horz-scale-behavior-time/types.ts`).
@@ -90,21 +92,33 @@ const INTRADAY_DIVISORS: [(i64, TickMarkWeight); 8] = [
     (43_200, TickMarkWeight::Hour12),
 ];
 
-/// Port of `weightByTime`: weight of `current` given the previous point's timestamp.
+/// Port of `weightByTime`: weight of `current` given the previous point's timestamp (UTC).
 pub fn weight_by_time(current_ts: i64, prev_ts: i64) -> TickMarkWeight {
-    let (cy, cm, cd) = civil_from_timestamp(current_ts);
-    let (py, pm, pd) = civil_from_timestamp(prev_ts);
+    weight_by_time_in(current_ts, prev_ts, &ExchangeTime::UTC)
+}
 
-    if cy != py {
-        return TickMarkWeight::Year;
-    } else if cm != pm {
-        return TickMarkWeight::Month;
-    } else if cd != pd {
-        return TickMarkWeight::Day;
+/// [`weight_by_time`] in exchange time. Year/Month/Day boundaries compare exchange trading days
+/// (local date shifted by the session start); intraday boundaries compare local wall-clock time,
+/// so hour and minute marks stay on exchange hours across DST and non-hour offsets.
+pub fn weight_by_time_in(current_ts: i64, prev_ts: i64, time: &ExchangeTime) -> TickMarkWeight {
+    let current_day = time.trading_day(current_ts);
+    let prev_day = time.trading_day(prev_ts);
+    if current_day != prev_day {
+        let (cy, cm, _) = civil_from_days(current_day);
+        let (py, pm, _) = civil_from_days(prev_day);
+        return if cy != py {
+            TickMarkWeight::Year
+        } else if cm != pm {
+            TickMarkWeight::Month
+        } else {
+            TickMarkWeight::Day
+        };
     }
 
+    let current = time.local_seconds(current_ts);
+    let prev = time.local_seconds(prev_ts);
     for &(divisor, weight) in INTRADAY_DIVISORS.iter().rev() {
-        if prev_ts.div_euclid(divisor) != current_ts.div_euclid(divisor) {
+        if prev.div_euclid(divisor) != current.div_euclid(divisor) {
             return weight;
         }
     }
@@ -116,6 +130,16 @@ pub fn weight_by_time(current_ts: i64, prev_ts: i64) -> TickMarkWeight {
 /// `weights[start_index..]`. The first point's weight is guessed by extrapolating the
 /// average time diff backwards.
 pub fn fill_weights_for_points(times: &[i64], weights: &mut [u8], start_index: usize) {
+    fill_weights_for_points_in(times, weights, start_index, &ExchangeTime::UTC);
+}
+
+/// [`fill_weights_for_points`] in exchange time (see [`weight_by_time_in`]).
+pub fn fill_weights_for_points_in(
+    times: &[i64],
+    weights: &mut [u8],
+    start_index: usize,
+    time: &ExchangeTime,
+) {
     debug_assert_eq!(times.len(), weights.len());
     if times.is_empty() {
         return;
@@ -131,7 +155,7 @@ pub fn fill_weights_for_points(times: &[i64], weights: &mut [u8], start_index: u
     for index in start_index..times.len() {
         let current = times[index];
         if let Some(prev) = prev_time {
-            weights[index] = weight_by_time(current, prev) as u8;
+            weights[index] = weight_by_time_in(current, prev, time) as u8;
         }
         total_time_diff += current - prev_time.unwrap_or(current);
         prev_time = Some(current);
@@ -143,7 +167,7 @@ pub fn fill_weights_for_points(times: &[i64], weights: &mut [u8], start_index: u
         let average_time_diff =
             ((total_time_diff as f64) / (times.len() as f64 - 1.0)).ceil() as i64;
         let approx_prev = times[0] - average_time_diff;
-        weights[0] = weight_by_time(times[0], approx_prev) as u8;
+        weights[0] = weight_by_time_in(times[0], approx_prev, time) as u8;
     }
 }
 
@@ -411,6 +435,165 @@ mod tests {
         let wide = tm.build(80.0, 80.0).len(); // 1 index per mark -> all fit
         let narrow = tm.build(2.0, 80.0).len(); // 40 indexes per mark -> few fit
         assert!(wide > narrow);
+    }
+
+    use crate::scale::exchange_time::{UtcOffsetSchedule, UtcOffsetTransition};
+
+    /// UTC instant of an exchange-local wall-clock minute.
+    fn local(time: &ExchangeTime, year: i64, month: u32, day: u32, hour: i64, minute: i64) -> i64 {
+        let wall = days_from_civil(year, month, day).unwrap() * 86_400 + hour * 3_600 + minute * 60;
+        time.offsets().to_utc(wall)
+    }
+
+    fn weights_in(times: &[i64], time: &ExchangeTime) -> Vec<u8> {
+        let mut weights = vec![0u8; times.len()];
+        fill_weights_for_points_in(times, &mut weights, 0, time);
+        weights
+    }
+
+    fn minute_bars(
+        time: &ExchangeTime,
+        date: (i64, u32, u32),
+        from: (i64, i64),
+        to: (i64, i64),
+        step_minutes: i64,
+    ) -> Vec<i64> {
+        let start = from.0 * 60 + from.1;
+        let end = to.0 * 60 + to.1;
+        (start..=end)
+            .step_by(step_minutes as usize)
+            .map(|minute| local(time, date.0, date.1, date.2, minute / 60, minute % 60))
+            .collect()
+    }
+
+    fn new_york() -> ExchangeTime {
+        let at = |y, m, d, h: i64| days_from_civil(y, m, d).unwrap() * 86_400 + h * 3_600;
+        ExchangeTime::new(
+            UtcOffsetSchedule::new(vec![
+                UtcOffsetTransition {
+                    from_utc_seconds: at(2023, 11, 5, 6),
+                    offset_seconds: -5 * 3_600,
+                },
+                UtcOffsetTransition {
+                    from_utc_seconds: at(2024, 3, 10, 7),
+                    offset_seconds: -4 * 3_600,
+                },
+            ])
+            .unwrap(),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn utc_default_matches_the_reference_weights() {
+        let times: Vec<i64> = (0..200).map(|i| 1_579_046_400 + i * 1_700).collect();
+        let mut reference = vec![0u8; times.len()];
+        fill_weights_for_points(&times, &mut reference, 0);
+        assert_eq!(weights_in(&times, &ExchangeTime::UTC), reference);
+    }
+
+    #[test]
+    fn a_share_lunch_break_weights_follow_shanghai_time() {
+        let shanghai = ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), 0).unwrap();
+        let mut times = Vec::new();
+        for day in [2, 3] {
+            times.extend(minute_bars(&shanghai, (2024, 1, day), (9, 30), (11, 30), 1));
+            times.extend(minute_bars(&shanghai, (2024, 1, day), (13, 0), (15, 0), 1));
+        }
+        let weights = weights_in(&times, &shanghai);
+        let per_day = times.len() / 2;
+        // The first bar of the second trading day carries the Day mark; nothing else does.
+        let day_marks: Vec<usize> = weights
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, &w)| w >= TickMarkWeight::Day as u8)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(day_marks, vec![per_day]);
+        // 11:30 -> 13:00 crosses local noon: Hour12 in exchange time (UTC would give Hour1).
+        let afternoon_open = 121;
+        assert_eq!(weights[afternoon_open], TickMarkWeight::Hour12 as u8);
+        assert_eq!(
+            weight_by_time(times[afternoon_open], times[afternoon_open - 1]),
+            TickMarkWeight::Hour1
+        );
+        // 10:00 local is an hour boundary (02:00 UTC).
+        assert_eq!(weights[30], TickMarkWeight::Hour1 as u8);
+    }
+
+    #[test]
+    fn us_dst_week_keeps_day_marks_and_hours_on_eastern_time() {
+        let eastern = new_york();
+        let mut times = minute_bars(&eastern, (2024, 3, 8), (9, 30), (16, 0), 30);
+        let friday = times.len();
+        times.extend(minute_bars(&eastern, (2024, 3, 11), (9, 30), (16, 0), 30));
+        let weights = weights_in(&times, &eastern);
+        assert_eq!(weights[friday], TickMarkWeight::Day as u8);
+        // 12:00 ET crosses local noon on both sides of the DST change.
+        let noon = 5; // 09:30, 10:00, 10:30, 11:00, 11:30, 12:00
+        assert_eq!(weights[noon], TickMarkWeight::Hour12 as u8);
+        assert_eq!(weights[friday + noon], TickMarkWeight::Hour12 as u8);
+        // 10:00 ET is the same Hour1 boundary on both days in exchange time, while UTC shifts it
+        // from a Hour3 boundary (15:00 UTC) to a Hour1 boundary (14:00 UTC).
+        assert_eq!(weights[1], TickMarkWeight::Hour1 as u8);
+        assert_eq!(weights[friday + 1], TickMarkWeight::Hour1 as u8);
+        let utc = weights_in(&times, &ExchangeTime::UTC);
+        assert_ne!(utc[1], utc[friday + 1]);
+    }
+
+    #[test]
+    fn us_extended_hours_in_winter_have_no_mid_session_day_mark() {
+        let eastern = new_york();
+        let mut times = minute_bars(&eastern, (2024, 1, 8), (4, 0), (20, 0), 60);
+        let next = times.len();
+        times.extend(minute_bars(&eastern, (2024, 1, 9), (4, 0), (20, 0), 60));
+        let weights = weights_in(&times, &eastern);
+        let day_marks: Vec<usize> = weights
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, &w)| w >= TickMarkWeight::Day as u8)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(day_marks, vec![next]);
+        // UTC would put the Day mark on the 19:00 ET bar (00:00 UTC).
+        let utc = weights_in(&times, &ExchangeTime::UTC);
+        assert_eq!(utc[15], TickMarkWeight::Day as u8);
+    }
+
+    #[test]
+    fn china_futures_night_session_starts_the_trading_day() {
+        let futures =
+            ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), -3 * 3_600).unwrap();
+        // Tuesday day session, Tuesday night session (Wednesday's trading day), Wednesday day.
+        let mut times = minute_bars(&futures, (2024, 1, 2), (13, 30), (15, 0), 30);
+        let night = times.len();
+        times.extend(minute_bars(&futures, (2024, 1, 2), (21, 0), (23, 0), 30));
+        let day = times.len();
+        times.extend(minute_bars(&futures, (2024, 1, 3), (9, 0), (11, 30), 30));
+        let weights = weights_in(&times, &futures);
+        assert_eq!(weights[night], TickMarkWeight::Day as u8);
+        assert!(weights[day] < TickMarkWeight::Day as u8);
+        // Friday night belongs to Monday: the Monday day session is not a new trading day.
+        let mut weekend = minute_bars(&futures, (2024, 1, 5), (21, 0), (23, 0), 60);
+        let monday = weekend.len();
+        weekend.extend(minute_bars(&futures, (2024, 1, 8), (9, 0), (11, 0), 60));
+        let weights = weights_in(&weekend, &futures);
+        assert!(weights[monday] < TickMarkWeight::Day as u8);
+    }
+
+    #[test]
+    fn calendar_dates_ignore_the_exchange_offset() {
+        let mut eastern = new_york();
+        eastern.set_calendar_dates(true);
+        let days: Vec<i64> = (0..40)
+            .map(|index| (days_from_civil(2024, 1, 15).unwrap() + index) * 86_400)
+            .collect();
+        let mut reference = vec![0u8; days.len()];
+        fill_weights_for_points(&days, &mut reference, 0);
+        assert_eq!(weights_in(&days, &eastern), reference);
     }
 
     #[test]

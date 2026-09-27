@@ -26,6 +26,7 @@ mod inner_render;
 mod native_primitives;
 mod primitives;
 mod ring;
+mod series_update;
 mod text_runs;
 
 use custom_series::CustomSeriesEntry;
@@ -58,9 +59,9 @@ use aeris_charts_engine::{
     crosshair_mode_from_u8, line_style_from_u8, marker_pos, marker_shape, AccountId, AlertId,
     AlertLine, AlertSnapshot, AxisFrame, AxisLabel, AxisLabelCorners, AxisTextAlign,
     AxisTextMidpoint, BrushRange, BrushStyle, ChartEngine, DrawingKind, DrawingModifiers,
-    DrawingPoint, ExecutionId, FeatureSeriesKind, GestureResolver, GestureUpdate, InputDevice,
-    InputModifiers, InputTarget, InstrumentMetadata, Marker, OrderId, PaneId, PointerSample,
-    PositionId, PriceFormatterFn, PriceScaleId, PriceScaleSide, PriceScaleTarget,
+    ExecutionId, FeatureSeriesKind, GestureResolver, GestureUpdate, InputDevice, InputModifiers,
+    InputTarget, InstrumentMetadata, Marker, OrderId, PaneId, PointerSample, PositionId,
+    PriceFormatterFn, PriceScaleId, PriceScaleSide, PriceScaleTarget,
     PrimitiveAutoscaleContribution, SeriesKind, TickMarkFormatterFn, TimeFormatterFn,
     TradingExecution, TradingPosition, TradingSnapshot, TradingStyleOptions, WorkingOrder,
 };
@@ -2196,6 +2197,33 @@ impl AerisChart {
             .set_native_session_highlighting_data(primitive_id, highlights_json)
     }
 
+    /// Merge `{time,color}` records for rows a live update appended or replaced at the tail.
+    /// Returns false (unchanged) when the result would not align with the source.
+    pub fn upsert_native_session_highlighting_data(
+        &mut self,
+        primitive_id: u32,
+        highlights_json: &str,
+    ) -> bool {
+        self.inner
+            .borrow_mut()
+            .upsert_native_session_highlighting_data(primitive_id, highlights_json)
+    }
+
+    /// Canonical source times at or after `since` for incremental per-row host callbacks.
+    pub fn series_times_since(&self, series_id: u32, since: f64) -> Vec<f64> {
+        let inner = self.inner.borrow();
+        let since = if since.is_nan() {
+            i64::MIN
+        } else {
+            since.clamp(i64::MIN as f64, i64::MAX as f64) as i64
+        };
+        inner
+            .series_times_since(series_id, since)
+            .iter()
+            .map(|&time| time as f64)
+            .collect()
+    }
+
     /// Attach a retained-frame bar-slot highlight driven directly by the engine crosshair.
     pub fn add_native_crosshair_highlight(&mut self, series_id: u32, color: Option<String>) -> u32 {
         self.inner
@@ -2610,6 +2638,41 @@ impl AerisChart {
         self.inner.borrow_mut().add_wma(source_id, period)
     }
 
+    /// Add KDJ K, D and J lines in their own oscillator pane (20/80 band lines).
+    pub fn add_kdj(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        k_smoothing: u32,
+        d_smoothing: u32,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_kdj(source_id, period, k_smoothing, d_smoothing)
+    }
+
+    /// Add a built-in indicator from its typed JSON definition. `convention` is `""`,
+    /// `"tradingview"` or `"china"`; explicit definition fields override it. Series ids of -1
+    /// mean "none". Returns an empty array for invalid input.
+    pub fn add_indicator(
+        &mut self,
+        source_id: u32,
+        source: &str,
+        kind_json: &str,
+        convention: &str,
+        volume_source: i32,
+        amount_source: i32,
+    ) -> Vec<u32> {
+        self.inner.borrow_mut().add_indicator(
+            source_id,
+            source,
+            kind_json,
+            convention,
+            volume_source,
+            amount_source,
+        )
+    }
+
     /// Sets the main series' data (series 0). `times` are ascending UTC seconds.
     pub fn set_data(
         &mut self,
@@ -2775,15 +2838,105 @@ impl AerisChart {
             .update_series_bar_styled(id, time, open, high, low, close, body, wick, border);
     }
 
-    /// Apply a per-series `priceFormat` (reference PriceFormat) as JSON:
-    /// `{"type":"price"|"volume"|"percent", "precision"?, "min_move"?}` or
-    /// `{"type":"custom", "min_move"?}` (keeps a formatter installed via
-    /// [`set_series_price_formatter`]; switching to a non-custom type clears it). Malformed
-    /// JSON or an unknown type/id is ignored with a console warning.
-    pub fn series_apply_price_format_json(&mut self, id: u32, json: &str) {
+    /// Partial streaming merge (`series.merge`): `NaN` open/high/low/close are absent and keep the
+    /// existing bar's values; the engine normalizes the merged high/low envelope. `sequence` is
+    /// the optional monotonic guard (`NaN` = none). Returns ingestion diagnostics JSON when the
+    /// merge was rejected or stale, `undefined` when it applied.
+    #[allow(clippy::too_many_arguments)] // OHLC channels, three color slots, and the guard
+    pub fn merge_series_bar(
+        &mut self,
+        id: u32,
+        time: f64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        body: Option<u32>,
+        wick: Option<u32>,
+        border: Option<u32>,
+        sequence: f64,
+    ) -> Option<String> {
+        self.inner.borrow_mut().merge_series_bar(
+            id, time, open, high, low, close, body, wick, border, sequence,
+        )
+    }
+
+    /// [`update_series_bar_styled`] behind the per-series sequence guard: a `sequence` that is
+    /// not newer than the last applied one is rejected as stale (diagnostics JSON).
+    #[allow(clippy::too_many_arguments)] // mirrors update_series_bar_styled plus the guard
+    pub fn update_series_bar_sequenced(
+        &mut self,
+        id: u32,
+        time: f64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        body: Option<u32>,
+        wick: Option<u32>,
+        border: Option<u32>,
+        sequence: f64,
+    ) -> Option<String> {
+        self.inner.borrow_mut().update_series_bar_sequenced(
+            id, time, open, high, low, close, body, wick, border, sequence,
+        )
+    }
+
+    /// [`update_series_bars_typed`] behind the per-series sequence guard (one sequence per batch).
+    #[allow(clippy::too_many_arguments)] // the typed OHLC columns plus the guard
+    pub fn update_series_bars_typed_sequenced(
+        &mut self,
+        id: u32,
+        times: &Float64Array,
+        open: &Float64Array,
+        high: &Float64Array,
+        low: &Float64Array,
+        close: &Float64Array,
+        sequence: f64,
+    ) -> Option<String> {
         self.inner
             .borrow_mut()
-            .series_apply_price_format_json(id, json);
+            .update_series_bars_typed_sequenced(id, times, open, high, low, close, sequence)
+    }
+
+    /// Typed partial merge (`series.merge_typed`): each row merges like `merge_series_bar`, with
+    /// `NaN` entries and omitted columns absent, applied in input order with one synchronization.
+    /// The batch is rejected atomically (diagnostics JSON); `undefined` when it applied.
+    #[allow(clippy::too_many_arguments)] // the optional OHLC columns plus the guard
+    pub fn merge_series_bars_typed(
+        &mut self,
+        id: u32,
+        times: &Float64Array,
+        open: Option<Float64Array>,
+        high: Option<Float64Array>,
+        low: Option<Float64Array>,
+        close: Option<Float64Array>,
+        sequence: f64,
+    ) -> Option<String> {
+        self.inner
+            .borrow_mut()
+            .merge_series_bars_typed(id, times, open, high, low, close, sequence)
+    }
+
+    /// Install a sequence baseline (for example a snapshot's sequence) or clear it with `NaN`.
+    /// A full data install clears it on its own. Returns false for an unknown series or a
+    /// sequence that is not a non-negative safe integer.
+    pub fn set_series_update_sequence(&mut self, id: u32, sequence: f64) -> bool {
+        self.inner
+            .borrow_mut()
+            .set_series_update_sequence(id, sequence)
+    }
+
+    /// Apply a per-series `priceFormat` (reference PriceFormat) as JSON:
+    /// `{"type":"price"|"volume"|"percent", "precision"?, "min_move"?, "tick_ladder"?}` or
+    /// `{"type":"custom", "min_move"?}` (keeps a formatter installed via
+    /// [`set_series_price_formatter`]; switching to a non-custom type clears it). Returns false,
+    /// leaving the format unchanged, for malformed JSON, an unknown type/id, or a rejected
+    /// `tick_ladder`.
+    pub fn series_apply_price_format_json(&mut self, id: u32, json: &str) -> bool {
+        self.inner
+            .borrow_mut()
+            .series_apply_price_format_json(id, json)
     }
 
     /// reference `priceFormat: {type:"custom", formatter}`: install the series' custom formatter fn
@@ -2793,6 +2946,20 @@ impl AerisChart {
         self.inner
             .borrow_mut()
             .set_series_price_formatter(id, formatter);
+    }
+
+    /// reference series option `autoscaleInfoProvider`: install (or clear with `undefined`) an
+    /// adapter `(base) => info` whose result REPLACES the series' autoscale info. `base` is
+    /// `{price_range: {min_value, max_value} | null, margins?: {above, below}}` or `null`; the
+    /// adapter runs during rendering and must not call back into the chart.
+    pub fn set_series_autoscale_info_provider(
+        &mut self,
+        id: u32,
+        provider: Option<js_sys::Function>,
+    ) {
+        self.inner
+            .borrow_mut()
+            .set_series_autoscale_info_provider(id, provider);
     }
 
     /// Sets a series' line/area color (overrides the kind default).
@@ -4288,6 +4455,12 @@ impl AerisChart {
         self.inner.borrow_mut().set_right_bar_stays_on_scroll(stays);
     }
 
+    /// Aeris `timeScale.lock_visible_logical_range` (default false): hold the visible logical
+    /// range exactly across data updates and resizes (fixed full-session views).
+    pub fn set_lock_visible_logical_range(&mut self, lock: bool) {
+        self.inner.borrow_mut().set_lock_visible_logical_range(lock);
+    }
+
     /// reference `timeScale.shiftVisibleRangeOnNewBar` (default true): when the last bar is
     /// visible, the view follows newly appended bars; scrolled back, the same bars stay.
     pub fn set_shift_visible_range_on_new_bar(&mut self, shift: bool) {
@@ -4343,6 +4516,32 @@ impl AerisChart {
         self.inner.borrow_mut().set_time_formatter(f);
     }
 
+    /// Exchange time zone / trading-day start / explicit time-axis marks (`{"timeZone": "UTC" |
+    /// transitions, "sessionStart": seconds, "tickMarks": [{time, label?}] | null}`), validated
+    /// together. Returns "" on success or the validation message; a rejection changes nothing.
+    pub fn set_exchange_time_json(&mut self, time_scale_json: &str) -> String {
+        self.inner
+            .borrow_mut()
+            .set_exchange_time_json(time_scale_json)
+    }
+
+    /// Whether the financial time points are calendar dates (business-day input).
+    pub fn set_calendar_date_axis(&mut self, calendar_dates: bool) {
+        self.inner
+            .borrow_mut()
+            .set_calendar_date_axis(calendar_dates);
+    }
+
+    /// Exchange-local wall-clock seconds for a UTC timestamp.
+    pub fn exchange_local_seconds(&self, time: f64) -> f64 {
+        self.inner.borrow().exchange_local_seconds(time)
+    }
+
+    /// Bit 0 `timeVisible`, bit 1 `secondsVisible`, bit 2 calendar-date axis.
+    pub fn time_label_flags(&self) -> u32 {
+        self.inner.borrow().time_label_flags()
+    }
+
     /// 0 = normal, 1 = magnet (reference default), 2 = hidden, 3 = magnet OHLC.
     pub fn set_crosshair_mode(&mut self, mode: u8) {
         self.inner.borrow_mut().set_crosshair_mode(mode);
@@ -4388,7 +4587,7 @@ impl AerisChart {
     /// `seconds_visible`, `fix_left_edge`, `fix_right_edge`,
     /// `lock_visible_time_range_on_resize`, `right_bar_stays_on_scroll`,
     /// `shift_visible_range_on_new_bar`,
-    /// `allow_shift_visible_range_on_whitespace_replacement`).
+    /// `allow_shift_visible_range_on_whitespace_replacement`, `lock_visible_logical_range`).
     pub fn time_scale_options_json(&self) -> String {
         self.inner.borrow().time_scale_options_json()
     }
@@ -4787,9 +4986,64 @@ impl AerisChart {
             .borrow_mut()
             .drawing_apply_options(id, options_json)
     }
-    /// Replace the drawing's anchors from a JSON `[{logical, price}, ...]` array.
+    /// Replace the drawing's anchors from a JSON `[{logical?, time?, price}, ...]` array.
     pub fn drawing_set_points(&mut self, id: u32, points_json: &str) -> bool {
         self.inner.borrow_mut().drawing_set_points(id, points_json)
+    }
+    /// `add_drawing` with a `{ok, id}` / `{ok:false, error:{code, message}}` result envelope.
+    pub fn add_drawing_result_json(
+        &mut self,
+        kind: u8,
+        pane: usize,
+        points_json: &str,
+        options_json: &str,
+    ) -> String {
+        self.inner
+            .borrow_mut()
+            .add_drawing_result_json(kind, pane, points_json, options_json)
+    }
+    /// `drawing_set_points` with a `{ok}` / `{ok:false, error}` result envelope.
+    pub fn drawing_set_points_result_json(&mut self, id: u32, points_json: &str) -> String {
+        self.inner
+            .borrow_mut()
+            .drawing_set_points_result_json(id, points_json)
+    }
+    /// Atomic multi-drawing anchor rewrite (`[{id, points}]`, one undo step).
+    pub fn set_drawings_points_result_json(&mut self, updates_json: &str) -> String {
+        self.inner
+            .borrow_mut()
+            .set_drawings_points_result_json(updates_json)
+    }
+    /// Price-basis rescale of drawing prices by time segments (no undo step).
+    pub fn rescale_drawing_prices_result_json(
+        &mut self,
+        segments_json: &str,
+        price_basis: Option<String>,
+    ) -> String {
+        self.inner
+            .borrow_mut()
+            .rescale_drawing_prices_result_json(segments_json, price_basis)
+    }
+    pub fn set_drawing_price_basis(&mut self, basis: Option<String>) -> bool {
+        self.inner.borrow_mut().set_drawing_price_basis(basis)
+    }
+    pub fn drawing_price_basis(&self) -> Option<String> {
+        self.inner.borrow().drawing_price_basis()
+    }
+    /// Chart drawing magnet: 0 off, 1 weak, 2 strong.
+    pub fn set_drawing_magnet_mode(&mut self, mode: u8) -> bool {
+        self.inner.borrow_mut().set_drawing_magnet_mode(mode)
+    }
+    pub fn drawing_magnet_mode(&self) -> u8 {
+        self.inner.borrow().drawing_magnet_mode()
+    }
+    /// Effective magnet (0/1/2) of the armed tool's next placement given the Ctrl/Cmd toggle.
+    pub fn armed_drawing_magnet(&self, toggle: bool) -> u8 {
+        self.inner.borrow().armed_drawing_magnet(toggle)
+    }
+    /// Keyboard-reachable handle count of a drawing (-1 when unknown or unplaceable).
+    pub fn drawing_handle_count(&self, id: u32) -> i32 {
+        self.inner.borrow().drawing_handle_count(id)
     }
     /// The drawing's options as snake_case JSON ("" for an unknown id).
     pub fn drawing_options_json(&self, id: u32) -> String {
@@ -5211,8 +5465,15 @@ impl AerisChart {
     pub fn scroll_to_position(&mut self, position: f64) {
         self.inner.borrow_mut().scroll_to_position(position);
     }
+    /// Jump to the real-time edge (the configured `right_offset`, reference `scrollToRealTime`).
     pub fn scroll_to_real_time(&mut self) {
         self.inner.borrow_mut().scroll_to_real_time();
+    }
+    /// Animate to the real-time edge; drive with `scroll_animation_tick` until it returns NaN.
+    pub fn start_real_time_scroll_animation(&mut self, duration_ms: f64, now_ms: f64) {
+        self.inner
+            .borrow_mut()
+            .start_real_time_scroll_animation(duration_ms, now_ms);
     }
     pub fn reset_time_scale(&mut self) {
         self.inner.borrow_mut().reset_time_scale();

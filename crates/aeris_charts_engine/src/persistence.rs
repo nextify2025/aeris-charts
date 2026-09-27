@@ -14,8 +14,8 @@ use aeris_charts_render::draw_list::LineStyle;
 
 use crate::drawings::{DrawingAnchorTime, DrawingPriceScale, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{
-    ChartEngine, ChartError, Drawing, DrawingKind, DrawingPoint, ErrorCode, IndicatorInputSource,
-    IndicatorKind, IndicatorOutputStyle, Pane, PaneId, SeriesId,
+    ChartEngine, ChartError, Drawing, DrawingAnchor, DrawingKind, DrawingPoint, ErrorCode,
+    IndicatorInputSource, IndicatorKind, IndicatorOutputStyle, Pane, PaneId, SeriesId,
 };
 
 pub const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
@@ -68,6 +68,7 @@ pub struct ValidatedStateV1 {
     panes: Vec<ValidatedPane>,
     drawings: Vec<Drawing>,
     drawing_anchor_times: HashMap<u32, Vec<Option<DrawingAnchorTime>>>,
+    drawing_price_basis: Option<String>,
     max_drawing_id: u32,
     max_persistent_pane_id: u32,
     points: usize,
@@ -86,6 +87,9 @@ struct StateV1 {
     schema_version: u32,
     panes: Vec<PaneV1>,
     drawings: Vec<DrawingV1>,
+    /// Host-defined price basis of the drawing prices (optional; no schema bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drawing_price_basis: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -100,6 +104,8 @@ struct StateV2 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     references: Vec<crate::GeneralReferenceOptions>,
     chart_options: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drawing_price_basis: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -110,6 +116,8 @@ struct StateV3 {
     drawings: Vec<DrawingV1>,
     #[serde(default)]
     indicators: Vec<IndicatorV3>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drawing_price_basis: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -126,6 +134,9 @@ struct IndicatorV3 {
     source_input: IndicatorInputSource,
     #[serde(default)]
     volume_source: Option<IndicatorSourceV3>,
+    /// Turnover source of an amount-weighted VWAP; absent in documents without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    amount_source: Option<IndicatorSourceV3>,
     styles: Vec<IndicatorOutputStyle>,
 }
 
@@ -206,7 +217,9 @@ struct DrawingV1 {
     id: u32,
     kind: String,
     pane_id: String,
-    anchors: Vec<DrawingPoint>,
+    /// `{logical, price, time?}`: `time` is the anchor time identity (UTC seconds) on ordinary
+    /// time charts; it is authoritative on restore whenever the chart can place it.
+    anchors: Vec<DrawingAnchor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     anchor_times_micros: Vec<Option<DrawingAnchorTime>>,
     #[serde(default)]
@@ -384,6 +397,7 @@ fn incremental_output_count(kind: &IndicatorKind) -> usize {
         IndicatorKind::Bollinger { .. } => 3,
         IndicatorKind::Macd { .. } => 3,
         IndicatorKind::Stochastic { .. } => 2,
+        IndicatorKind::Kdj { .. } => 3,
         IndicatorKind::VwapBands { .. } => 5,
     }
 }
@@ -417,9 +431,9 @@ fn validate_indicator_style(style: &IndicatorOutputStyle) -> Result<(), &'static
 fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
     match kind {
         IndicatorKind::Sma { period }
-        | IndicatorKind::Ema { period }
-        | IndicatorKind::Dema { period }
-        | IndicatorKind::Tema { period }
+        | IndicatorKind::Ema { period, .. }
+        | IndicatorKind::Dema { period, .. }
+        | IndicatorKind::Tema { period, .. }
         | IndicatorKind::Smma { period }
         | IndicatorKind::Hma { period }
         | IndicatorKind::Vwma { period }
@@ -427,7 +441,7 @@ fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
         | IndicatorKind::Cci { period }
         | IndicatorKind::WilliamsR { period }
         | IndicatorKind::Donchian { period }
-        | IndicatorKind::Rsi { period }
+        | IndicatorKind::Rsi { period, .. }
         | IndicatorKind::Atr { period }
         | IndicatorKind::Wma { period } => *period > 0,
         IndicatorKind::PivotPoints { .. } => true,
@@ -449,8 +463,28 @@ fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
         }
         IndicatorKind::Ichimoku => true,
         IndicatorKind::EmaRibbon { periods } => periods.iter().all(|period| *period > 0),
-        IndicatorKind::Bollinger { period, deviation } => *period > 0 && deviation.is_finite(),
-        IndicatorKind::Macd { fast, slow, signal } => *fast > 0 && *slow > 0 && *signal > 0,
+        IndicatorKind::Bollinger {
+            period, deviation, ..
+        } => *period > 0 && deviation.is_finite(),
+        IndicatorKind::Macd {
+            fast,
+            slow,
+            signal,
+            histogram_multiplier,
+            ..
+        } => {
+            *fast > 0
+                && *slow > 0
+                && *signal > 0
+                && histogram_multiplier.is_finite()
+                && *histogram_multiplier > 0.0
+        }
+        IndicatorKind::Kdj {
+            period,
+            k_smoothing,
+            d_smoothing,
+            ..
+        } => *period > 0 && *k_smoothing > 0 && *d_smoothing > 0,
         IndicatorKind::Stochastic { k_period, d_period } => *k_period > 0 && *d_period > 0,
         IndicatorKind::Vwap => true,
         IndicatorKind::Obv => true,
@@ -582,6 +616,10 @@ impl ChartEngine {
                     .volume_source
                     .map(|id| self.indicator_source_ref(id, study))
                     .transpose()?;
+                let amount_source = binding
+                    .amount_source
+                    .map(|id| self.indicator_source_ref(id, study))
+                    .transpose()?;
                 let styles = binding
                     .outputs
                     .iter()
@@ -601,6 +639,7 @@ impl ChartEngine {
                     source,
                     source_input: binding.source_input,
                     volume_source,
+                    amount_source,
                     styles,
                 })
             })
@@ -611,6 +650,7 @@ impl ChartEngine {
             panes: base.panes,
             drawings: base.drawings,
             indicators,
+            drawing_price_basis: base.drawing_price_basis,
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
         if document.len() > PERSISTENCE_MAX_DOCUMENT_BYTES {
@@ -681,7 +721,7 @@ impl ChartEngine {
                     id: drawing.id,
                     kind: drawing.kind.name().to_string(),
                     pane_id: pane_wire_id(persistent_id),
-                    anchors: drawing.points.clone(),
+                    anchors: self.drawing_anchors_of(drawing),
                     anchor_times_micros: self.drawing_anchor_times_for(drawing),
                     style: DrawingStyleV1 {
                         profile: drawing.profile.clone(),
@@ -740,6 +780,7 @@ impl ChartEngine {
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             panes,
             drawings,
+            drawing_price_basis: self.drawing_price_basis().map(str::to_string),
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))
     }
@@ -1117,6 +1158,7 @@ impl ChartEngine {
             series,
             references,
             chart_options: self.options.value().clone(),
+            drawing_price_basis: base.drawing_price_basis,
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
         if document.len() > PERSISTENCE_MAX_GENERAL_DOCUMENT_BYTES {
@@ -1274,17 +1316,33 @@ impl ChartEngine {
             if !item.anchor_times_micros.is_empty() {
                 drawing_anchor_times.insert(item.id, item.anchor_times_micros.clone());
             }
-            if item.anchors.iter().any(|point| {
-                !point.logical.is_finite()
-                    || !point.price.is_finite()
-                    || point.logical.abs() > MAX_SAFE_VALUE
-                    || point.price.abs() > MAX_SAFE_VALUE
+            let bounded = |value: f64| value.is_finite() && value.abs() <= MAX_SAFE_VALUE;
+            if item.anchors.iter().any(|anchor| {
+                !bounded(anchor.price)
+                    || anchor.logical.is_some_and(|logical| !bounded(logical))
+                    || anchor.time.is_some_and(|time| !bounded(time))
+                    || (anchor.logical.is_none() && anchor.time.is_none())
             }) {
                 return Err(invalid(format!(
                     "drawing {} has an invalid anchor",
                     item.id
                 )));
             }
+            // Anchor times are restored as pending identity and resolved against the host's
+            // data on install (immediately when data is present, otherwise when it arrives).
+            let pending_times = item
+                .anchors
+                .iter()
+                .map(|anchor| anchor.time)
+                .collect::<Vec<_>>();
+            let anchors = item
+                .anchors
+                .iter()
+                .map(|anchor| DrawingPoint {
+                    logical: anchor.logical.unwrap_or(0.0),
+                    price: anchor.price,
+                })
+                .collect::<Vec<_>>();
             let pane_id = parse_pane_wire_id(&item.pane_id).ok_or_else(|| {
                 invalid(format!("drawing {} has an invalid pane reference", item.id))
             })?;
@@ -1294,7 +1352,8 @@ impl ChartEngine {
                     item.id, item.pane_id
                 ))
             })?;
-            let mut drawing = Drawing::new(item.id, kind, pane_index, item.anchors);
+            let mut drawing = Drawing::new(item.id, kind, pane_index, anchors);
+            drawing.set_pending_times(pending_times);
             let style = item.style;
             if let Some(profile) = style.profile {
                 if !profile.valid() {
@@ -1474,10 +1533,18 @@ impl ChartEngine {
             max_drawing_id = max_drawing_id.max(item.id);
             drawings.push(drawing);
         }
+        let drawing_price_basis = state.drawing_price_basis.filter(|basis| !basis.is_empty());
+        if drawing_price_basis
+            .as_ref()
+            .is_some_and(|basis| basis.len() > crate::MAX_DRAWING_GROUP_BYTES)
+        {
+            return Err(resource("drawing price basis is too large"));
+        }
         Ok(ValidatedStateV1 {
             panes,
             drawings,
             drawing_anchor_times,
+            drawing_price_basis,
             max_drawing_id,
             max_persistent_pane_id,
             points: total_points,
@@ -1540,6 +1607,7 @@ impl ChartEngine {
         self.general_series = None;
         self.drawings = state.drawings;
         self.drawing_anchor_times = state.drawing_anchor_times;
+        self.restore_drawing_time_identity(state.drawing_price_basis);
         self.next_pane_id = next_runtime;
         self.next_persistent_pane_id = state.max_persistent_pane_id + 1;
         self.next_drawing_id = state.max_drawing_id + 1;
@@ -1674,6 +1742,7 @@ impl ChartEngine {
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             panes: state.panes,
             drawings: state.drawings,
+            drawing_price_basis: state.drawing_price_basis.clone(),
         })?;
         let mut resolved = Vec::with_capacity(state.indicators.len());
         let mut expected_outputs = Vec::with_capacity(state.indicators.len());
@@ -1709,6 +1778,28 @@ impl ChartEngine {
                     )));
                 }
             }
+            let amount_source = indicator
+                .amount_source
+                .as_ref()
+                .map(|source| resolve_indicator_source(source, study, &expected_outputs, self))
+                .transpose()?;
+            if let (Some(amount_source), Some(amount_ref)) =
+                (amount_source, indicator.amount_source.as_ref())
+            {
+                if !matches!(indicator.kind, IndicatorKind::Vwap)
+                    || source_refs_equal(&indicator.source, amount_ref)
+                    || indicator
+                        .volume_source
+                        .as_ref()
+                        .is_none_or(|volume| source_refs_equal(volume, amount_ref))
+                    || (matches!(amount_ref, IndicatorSourceV3::Series { .. })
+                        && !source_is_scalar(self, amount_source))
+                {
+                    return Err(invalid(format!(
+                        "indicator {study} amount source must be a distinct scalar VWAP input"
+                    )));
+                }
+            }
             let expected = incremental_output_count(&indicator.kind);
             if indicator.styles.len() != expected {
                 return Err(invalid(format!(
@@ -1725,6 +1816,7 @@ impl ChartEngine {
                 indicator.source_input,
                 indicator.kind.clone(),
                 volume_source,
+                amount_source,
                 indicator.styles.clone(),
             ));
             expected_outputs.push(vec![u32::MAX; expected]);
@@ -1732,7 +1824,7 @@ impl ChartEngine {
         let mut result = self.install_validated_state(validated)?;
         let mut remapped_outputs = Vec::with_capacity(resolved.len());
         self.study_restore_pane_cursor = Some(1);
-        for (study, (source, source_input, kind, volume_source, styles)) in
+        for (study, (source, source_input, kind, volume_source, amount_source, styles)) in
             resolved.into_iter().enumerate()
         {
             let source =
@@ -1747,8 +1839,23 @@ impl ChartEngine {
                         volume_source.unwrap_or_default(),
                     )
                 });
-            let outputs =
-                self.add_indicator_kind_with_input(source, source_input, kind, volume_source);
+            let amount_source = state.indicators[study]
+                .amount_source
+                .as_ref()
+                .map(|source| {
+                    remap_indicator_source(
+                        source,
+                        &remapped_outputs,
+                        amount_source.unwrap_or_default(),
+                    )
+                });
+            let outputs = self.add_indicator_kind_with_sources(
+                source,
+                source_input,
+                kind,
+                volume_source,
+                amount_source,
+            );
             if outputs.len() != styles.len() {
                 return Err(invalid(format!("indicator {study} could not be restored")));
             }
@@ -1798,6 +1905,7 @@ impl ChartEngine {
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             panes: state.panes.into_iter().map(|pane| pane.pane).collect(),
             drawings: state.drawings,
+            drawing_price_basis: state.drawing_price_basis,
         })?;
         let mut staged = ChartEngine::new(self.css_width, self.css_height, self.dpr);
         staged.next_pane_id = self.next_pane_id;
@@ -1863,13 +1971,25 @@ impl ChartEngine {
         self.general_axes = staged.general_axes;
         self.general_data = staged.general_data;
         self.general_series = staged.general_series;
+        let price_basis = staged.drawing_settings.price_basis.take();
         self.drawings = staged.drawings;
+        self.restore_drawing_time_identity(price_basis);
         self.next_pane_id = staged.next_pane_id;
         self.next_persistent_pane_id = staged.next_persistent_pane_id;
         self.next_drawing_id = staged.next_drawing_id;
         self.options = staged.options;
         self.apply_options(&options_json)
             .expect("validated V2 chart options must serialize");
+        // A document without exchange-time keys keeps the chart's installed zone and session
+        // start; mirror a non-default one so the replaced options store still describes the live
+        // chart (absent keys already mean UTC, keeping default documents byte-stable).
+        if !self.exchange_time().is_utc_identity() {
+            self.mirror_exchange_time_options();
+        }
+        // Likewise explicit time-axis marks the document does not carry stay installed.
+        if self.time_tick_marks().is_some() {
+            self.mirror_time_tick_marks_option();
+        }
         self.selected_drawing = None;
         self.selected_drawings.clear();
         self.drawing_drag = None;
@@ -2032,7 +2152,10 @@ mod tests {
             .add_indicator_kind_with_input(
                 0,
                 crate::IndicatorInputSource::Hlc3,
-                crate::IndicatorKind::Rsi { period: 3 },
+                crate::IndicatorKind::Rsi {
+                    period: 3,
+                    seed: crate::IndicatorSeed::Sma,
+                },
                 None,
             )
             .into_iter()
@@ -2466,6 +2589,77 @@ mod tests {
     }
 
     #[test]
+    fn time_chart_anchor_times_restore_into_a_shifted_window_before_or_after_data() {
+        const BASE: f64 = 1_704_067_200.0;
+        let hours = |from: f64, count: usize| {
+            (0..count)
+                .map(|index| from + index as f64 * 3_600.0)
+                .collect::<Vec<_>>()
+        };
+        let install = |chart: &mut ChartEngine, times: &[f64]| {
+            let values = vec![10.0; times.len()];
+            chart
+                .set_series_data(0, times, &values, &values, &values, &values)
+                .unwrap();
+        };
+        let mut source = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut source, &hours(BASE, 100));
+        let id = source
+            .add_drawing(
+                DrawingKind::TrendLine,
+                0,
+                vec![
+                    DrawingPoint {
+                        logical: 50.0,
+                        price: 10.0,
+                    },
+                    DrawingPoint {
+                        logical: 60.25,
+                        price: 11.0,
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+        source.set_drawing_price_basis(Some("qfq")).unwrap();
+        let document = source.export_state_json().unwrap();
+        assert!(document.contains(&format!("\"time\":{}", BASE + 50.0 * 3_600.0)));
+        assert!(document.contains("\"drawing_price_basis\":\"qfq\""));
+
+        // Grid-workspace order: restore first, then the host loads the latest bars, which now
+        // start twenty hours later than when the layout was saved.
+        let mut before_data = ChartEngine::new(800.0, 500.0, 1.0);
+        before_data.import_state_json(&document).unwrap();
+        assert_eq!(before_data.drawing_price_basis(), Some("qfq"));
+        assert_eq!(
+            before_data.export_state_json().unwrap(),
+            document,
+            "unresolved anchors round-trip their time identity unchanged"
+        );
+        install(&mut before_data, &hours(BASE + 20.0 * 3_600.0, 100));
+        let points = &before_data.drawing(id).unwrap().points;
+        assert_eq!(points[0].logical, 30.0);
+        assert!((points[1].logical - 40.25).abs() < 1e-9);
+
+        // Restoring after data (more history loaded) resolves immediately.
+        let mut after_data = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut after_data, &hours(BASE - 30.0 * 3_600.0, 200));
+        after_data.import_state_json(&document).unwrap();
+        let points = &after_data.drawing(id).unwrap().points;
+        assert_eq!(points[0].logical, 80.0);
+        assert!((points[1].logical - 90.25).abs() < 1e-9);
+
+        // Legacy documents without anchor times keep their logical anchors.
+        let first_time = serde_json::to_string(&(BASE + 50.0 * 3_600.0)).unwrap();
+        let legacy = document.replace(&format!(",\"time\":{first_time}"), "");
+        assert_ne!(legacy, document);
+        let mut legacy_chart = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut legacy_chart, &hours(BASE - 30.0 * 3_600.0, 200));
+        legacy_chart.import_state_json(&legacy).unwrap();
+        assert_eq!(legacy_chart.drawing(id).unwrap().points[0].logical, 50.0);
+    }
+
+    #[test]
     fn non_time_drawing_anchor_times_restore_against_a_rebased_sequence() {
         let trade = |timestamp_micros, price| FootprintTrade {
             timestamp_micros,
@@ -2516,6 +2710,8 @@ mod tests {
             .unwrap();
         let document = chart.export_state_json().unwrap();
         assert!(document.contains("anchor_times_micros"));
+        // Non-time sequence rows are not UTC times, so no seconds-based anchor time is emitted.
+        assert!(!document.contains("\"time\""));
 
         let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
         restored.import_state_json(&document).unwrap();
@@ -3613,5 +3809,181 @@ mod tests {
         assert_eq!(work.candidates, 10);
         assert_eq!(work.visible, 10);
         assert_eq!(work.geometry_rebuilds, 10);
+    }
+
+    #[test]
+    fn study_persistence_round_trips_convention_parameters_kdj_and_amount_source() {
+        let mut chart = settled_chart();
+        let volume = chart.add_series(crate::SeriesKind::Histogram);
+        let amount = chart.add_series(crate::SeriesKind::Line);
+        let times = (0..10).map(|i| (i * 3600) as f64).collect::<Vec<_>>();
+        let values = [11.0, 12.0, 11.0, 10.0, 11.0, 12.0, 13.0, 12.0, 11.0, 10.0];
+        let amounts = values.map(|value| value * 11.5);
+        chart
+            .set_series_data(volume, &times, &values, &values, &values, &values)
+            .unwrap();
+        chart
+            .set_series_data(amount, &times, &amounts, &amounts, &amounts, &amounts)
+            .unwrap();
+        let china = crate::IndicatorConvention::China;
+        let kinds = [
+            crate::IndicatorKind::Ema {
+                period: 3,
+                seed: crate::IndicatorSeed::Sma,
+            }
+            .with_convention(china),
+            crate::IndicatorKind::Rsi {
+                period: 3,
+                seed: crate::IndicatorSeed::Sma,
+            }
+            .with_convention(china),
+            crate::IndicatorKind::Macd {
+                fast: 2,
+                slow: 4,
+                signal: 3,
+                seed: crate::IndicatorSeed::Sma,
+                histogram_multiplier: 1.0,
+            }
+            .with_convention(china),
+            crate::IndicatorKind::Bollinger {
+                period: 3,
+                deviation: 2.0,
+                estimator: crate::DeviationEstimator::Population,
+            }
+            .with_convention(china),
+            crate::IndicatorKind::Kdj {
+                period: 3,
+                k_smoothing: 3,
+                d_smoothing: 3,
+                seed: aeris_charts_indicators::KdjSeed::Fifty,
+            }
+            .with_convention(china),
+        ];
+        for kind in &kinds {
+            assert!(!chart.add_indicator_kind(0, kind.clone(), None).is_empty());
+        }
+        chart.add_vwap_with_amount(0, volume, amount).unwrap();
+        let document = chart.export_state_json().unwrap();
+        // Explicit parameters are persisted; the preset name never is.
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["indicators"][2]["kind"]["seed"], "first_value");
+        assert_eq!(value["indicators"][2]["kind"]["histogram_multiplier"], 2.0);
+        assert_eq!(value["indicators"][3]["kind"]["estimator"], "sample");
+        assert_eq!(value["indicators"][4]["kind"]["seed"], "first_value");
+        assert!(!document.contains("china"));
+
+        let mut restored = settled_chart();
+        let restored_volume = restored.add_series(crate::SeriesKind::Histogram);
+        let restored_amount = restored.add_series(crate::SeriesKind::Line);
+        restored
+            .set_series_data(restored_volume, &times, &values, &values, &values, &values)
+            .unwrap();
+        restored
+            .set_series_data(
+                restored_amount,
+                &times,
+                &amounts,
+                &amounts,
+                &amounts,
+                &amounts,
+            )
+            .unwrap();
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(restored.export_state_json().unwrap(), document);
+        let bindings = restored.indicator_bindings();
+        for (binding, kind) in bindings.iter().zip(&kinds) {
+            assert_eq!(&binding.kind, kind);
+        }
+        assert_eq!(bindings[5].volume_source, Some(restored_volume));
+        assert_eq!(bindings[5].amount_source, Some(restored_amount));
+        assert_eq!(
+            restored.data.series_data(bindings[5].outputs[0]).unwrap().1[3],
+            chart
+                .data
+                .series_data(chart.indicator_bindings()[5].outputs[0])
+                .unwrap()
+                .1[3]
+        );
+
+        // An amount source on a kind that cannot use it is rejected before mutation.
+        let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+        invalid["indicators"][0]["amount_source"] =
+            invalid["indicators"][5]["amount_source"].clone();
+        let invalid = serde_json::to_string(&invalid).unwrap();
+        let mut untouched = settled_chart();
+        for series in [crate::SeriesKind::Histogram, crate::SeriesKind::Line] {
+            let id = untouched.add_series(series);
+            untouched
+                .set_series_data(id, &times, &values, &values, &values, &values)
+                .unwrap();
+        }
+        let baseline = untouched.export_state_json().unwrap();
+        let error = untouched.import_state_json(&invalid).unwrap_err();
+        assert!(error.message().contains("amount source"), "{error:?}");
+        assert_eq!(untouched.export_state_json().unwrap(), baseline);
+        assert!(untouched.import_state_json(&document).is_ok());
+    }
+
+    #[test]
+    fn study_documents_without_convention_fields_restore_the_tradingview_defaults() {
+        let mut chart = settled_chart();
+        chart.add_macd(0, 2, 4, 3);
+        chart.add_bollinger(0, 3, 2.0);
+        chart.add_rsi(0, 3);
+        chart.add_indicator_kind(
+            0,
+            crate::IndicatorKind::Kdj {
+                period: 3,
+                k_smoothing: 3,
+                d_smoothing: 3,
+                seed: aeris_charts_indicators::KdjSeed::FirstValue,
+            },
+            None,
+        );
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&chart.export_state_json().unwrap()).unwrap();
+        // Documents written before these parameters existed carry none of them.
+        for indicator in legacy["indicators"].as_array_mut().unwrap() {
+            let kind = indicator["kind"].as_object_mut().unwrap();
+            for field in ["seed", "histogram_multiplier", "estimator"] {
+                kind.remove(field);
+            }
+        }
+        let mut restored = settled_chart();
+        restored
+            .import_state_json(&serde_json::to_string(&legacy).unwrap())
+            .unwrap();
+        let kinds = restored
+            .indicator_bindings()
+            .into_iter()
+            .map(|binding| binding.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                crate::IndicatorKind::Macd {
+                    fast: 2,
+                    slow: 4,
+                    signal: 3,
+                    seed: crate::IndicatorSeed::Sma,
+                    histogram_multiplier: 1.0,
+                },
+                crate::IndicatorKind::Bollinger {
+                    period: 3,
+                    deviation: 2.0,
+                    estimator: crate::DeviationEstimator::Population,
+                },
+                crate::IndicatorKind::Rsi {
+                    period: 3,
+                    seed: crate::IndicatorSeed::Sma,
+                },
+                crate::IndicatorKind::Kdj {
+                    period: 3,
+                    k_smoothing: 3,
+                    d_smoothing: 3,
+                    seed: aeris_charts_indicators::KdjSeed::Fifty,
+                },
+            ]
+        );
     }
 }

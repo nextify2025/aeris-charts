@@ -236,10 +236,12 @@ impl Default for ImageWatermarkOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionHighlightingOptions {
-    /// Optional UTC-hour gate. Without it, every source bar receives the weekday/weekend color,
-    /// matching the official example. With it, bars outside the half-open session are clear.
-    pub start_hour_utc: Option<u8>,
-    pub end_hour_utc: Option<u8>,
+    /// Optional exchange-local hour gate in fractional hours (`9.5` is 09:30). Without it, every
+    /// source bar receives the weekday/weekend color, matching the official example. With it,
+    /// bars outside the half-open session `[start_hour, end_hour)` are clear; `start > end` wraps
+    /// midnight. Hours and the weekend test use the chart's exchange time (UTC by default).
+    pub start_hour: Option<f64>,
+    pub end_hour: Option<f64>,
     pub weekday_color: Color,
     pub weekend_color: Color,
 }
@@ -255,8 +257,8 @@ pub struct SessionHighlightingData {
 impl Default for SessionHighlightingOptions {
     fn default() -> Self {
         Self {
-            start_hour_utc: None,
-            end_hour_utc: None,
+            start_hour: None,
+            end_hour: None,
             weekday_color: Color::rgba(41, 98, 255, 20),
             weekend_color: Color::rgba(255, 152, 1, 20),
         }
@@ -661,9 +663,13 @@ impl ChartEngine {
         series_id: SeriesId,
         options: SessionHighlightingOptions,
     ) -> Option<NativePrimitiveId> {
-        if options.start_hour_utc.is_some_and(|hour| hour > 23)
-            || options.end_hour_utc.is_some_and(|hour| hour > 24)
-            || options.start_hour_utc.is_some() != options.end_hour_utc.is_some()
+        if options
+            .start_hour
+            .is_some_and(|hour| !(0.0..24.0).contains(&hour))
+            || options
+                .end_hour
+                .is_some_and(|hour| !(0.0..=24.0).contains(&hour))
+            || options.start_hour.is_some() != options.end_hour.is_some()
         {
             return None;
         }
@@ -719,6 +725,110 @@ impl ChartEngine {
         state.highlights = Some(highlights);
         self.invalidate_frame_series(series_id);
         true
+    }
+
+    /// Merge callback colors for source rows that changed at the tail (appended rows and a
+    /// replaced current bar) without resending the aligned history, so a live update costs work
+    /// proportional to the changed rows. Records must be strictly ascending; each replaces the
+    /// record with the same time or appends after the last one. Records older than the source's
+    /// first row are dropped first, so `max_points` retention trims stay incremental. Nothing
+    /// changes unless the result stays aligned with the source (count and both endpoints); the
+    /// host then falls back to [`Self::set_session_highlighting_data`].
+    pub fn upsert_session_highlighting_data(
+        &mut self,
+        primitive_id: NativePrimitiveId,
+        records: Vec<SessionHighlightingData>,
+    ) -> bool {
+        if records.windows(2).any(|pair| pair[0].time >= pair[1].time) {
+            return false;
+        }
+        let Some(series_id) = self.series.iter().find_map(|series| {
+            series
+                .native_primitives
+                .iter()
+                .any(|primitive| primitive.id == primitive_id)
+                .then_some(series.id)
+        }) else {
+            return false;
+        };
+        let Some((times, _)) = self.data.series_data(series_id) else {
+            return false;
+        };
+        let source_len = times.len();
+        let source_first = times.first().copied();
+        let source_last = times.last().copied();
+        let Some(state) = self.series_entry_mut(series_id).and_then(|series| {
+            series.native_primitives.iter_mut().find_map(|primitive| {
+                (primitive.id == primitive_id)
+                    .then_some(&mut primitive.kind)
+                    .and_then(|kind| match kind {
+                        NativeSeriesPrimitiveKind::SessionHighlighting(state) => Some(state),
+                        _ => None,
+                    })
+            })
+        }) else {
+            return false;
+        };
+        let Some(highlights) = state.highlights.as_mut() else {
+            return false;
+        };
+        if records
+            .first()
+            .is_some_and(|record| source_first.is_none_or(|first| record.time < first))
+        {
+            return false;
+        }
+        // Rows retention evicted from the source's head.
+        let evicted = source_first.map_or(0, |first| {
+            highlights.partition_point(|highlight| highlight.time < first)
+        });
+        let last_time = highlights.last().map(|highlight| highlight.time);
+        let appended = records
+            .iter()
+            .filter(|record| last_time.is_none_or(|last| record.time > last))
+            .count();
+        let replaced_exist = records
+            .iter()
+            .filter(|record| last_time.is_some_and(|last| record.time <= last))
+            .all(|record| {
+                highlights
+                    .binary_search_by_key(&record.time, |highlight| highlight.time)
+                    .is_ok()
+            });
+        let final_first = highlights
+            .get(evicted)
+            .map(|highlight| highlight.time)
+            .or_else(|| records.first().map(|record| record.time));
+        let final_last = records.last().map(|record| record.time).max(last_time);
+        if !replaced_exist
+            || highlights.len() - evicted + appended != source_len
+            || final_first != source_first
+            || final_last != source_last
+        {
+            return false;
+        }
+        if records.is_empty() && evicted == 0 {
+            return true;
+        }
+        highlights.drain(..evicted);
+        for record in records {
+            match highlights.binary_search_by_key(&record.time, |highlight| highlight.time) {
+                Ok(index) => highlights[index] = record,
+                Err(_) => highlights.push(record),
+            }
+        }
+        self.invalidate_frame_series(series_id);
+        true
+    }
+
+    /// Canonical source times at or after `since` (ascending). Lets a host evaluate per-row
+    /// callbacks only for the rows a live update touched.
+    pub fn series_times_since(&self, series_id: SeriesId, since: i64) -> &[i64] {
+        self.data
+            .series_data(series_id)
+            .map_or(&[][..], |(times, _)| {
+                &times[times.partition_point(|&time| time < since)..]
+            })
     }
 
     pub fn add_highlight_bar_crosshair(
@@ -1925,6 +2035,163 @@ mod tests {
     }
 
     #[test]
+    fn session_highlighting_gate_uses_fractional_exchange_hours_and_local_weekends() {
+        // 2024-01-05 (Friday) 30-minute bars from 13:00 to 21:30 UTC.
+        let base = 1_704_459_600;
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times: Vec<f64> = (0..18).map(|i| (base + i * 1_800) as f64).collect();
+        let values = vec![100.0; times.len()];
+        chart
+            .set_series_data(0, &times, &values, &values, &values, &values)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        let weekday = Color::rgba(1, 2, 3, 40);
+        let weekend = Color::rgba(4, 5, 6, 50);
+        // Fractional hours are no longer dropped: 09:30..16:00 is a valid gate.
+        assert!(chart
+            .add_session_highlighting(
+                0,
+                SessionHighlightingOptions {
+                    start_hour: Some(9.5),
+                    end_hour: Some(16.0),
+                    weekday_color: weekday,
+                    weekend_color: weekend,
+                },
+            )
+            .is_some());
+        assert!(chart
+            .add_session_highlighting(
+                0,
+                SessionHighlightingOptions {
+                    start_hour: Some(9.5),
+                    end_hour: None,
+                    ..SessionHighlightingOptions::default()
+                },
+            )
+            .is_none());
+        let shaded = |chart: &mut ChartEngine, color: Color| -> i32 {
+            chart.build_frame().panes[0]
+                .under
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Prim::Rect { rect, color: c } if *c == color => Some(rect.w),
+                    _ => None,
+                })
+                .sum()
+        };
+        // In UTC the 09:30..16:00 gate covers the 13:00..15:30 UTC bars; in New York (-5h) the
+        // same exchange-local gate covers 14:30..20:30 UTC.
+        let utc_width = shaded(&mut chart, weekday);
+        chart.set_time_zone(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
+        let eastern_width = shaded(&mut chart, weekday);
+        assert!(utc_width > 0 && eastern_width > utc_width);
+        assert_eq!(shaded(&mut chart, weekend), 0);
+
+        // In Tokyo (+9h) the Friday 15:00+ UTC bars are already Saturday: weekend color.
+        let mut all_day = ChartEngine::new(800.0, 500.0, 1.0);
+        all_day
+            .set_series_data(0, &times, &values, &values, &values, &values)
+            .unwrap();
+        all_day.time_scale.set_width(800.0);
+        all_day.fit_content();
+        all_day.set_time_zone(crate::UtcOffsetSchedule::fixed(9 * 3_600).unwrap());
+        all_day
+            .add_session_highlighting(
+                0,
+                SessionHighlightingOptions {
+                    weekday_color: weekday,
+                    weekend_color: weekend,
+                    ..SessionHighlightingOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(shaded(&mut all_day, weekend) > 0);
+        assert!(shaded(&mut all_day, weekday) > 0);
+    }
+
+    #[test]
+    fn session_highlighting_tail_upsert_touches_only_changed_rows() {
+        let mut chart = chart();
+        let primitive = chart
+            .add_session_highlighting(0, SessionHighlightingOptions::default())
+            .unwrap();
+        let color = Color::rgba(1, 2, 3, 40);
+        let replaced = Color::rgba(7, 8, 9, 40);
+        let records = |days: std::ops::Range<i64>, color: Color| {
+            days.map(|day| SessionHighlightingData {
+                time: day * 86_400,
+                color,
+            })
+            .collect::<Vec<_>>()
+        };
+        // Tail merge needs a full baseline first.
+        assert!(!chart.upsert_session_highlighting_data(primitive, records(9..10, color)));
+        assert!(chart.set_session_highlighting_data(primitive, records(0..10, color)));
+        assert_eq!(chart.series_times_since(0, 9 * 86_400), &[9 * 86_400]);
+
+        // A live append: the source grows by one row and only that row is sent.
+        assert!(chart.update_series_bar(0, 10.0 * 86_400.0, [1.0, 2.0, 0.5, 1.5]));
+        assert_eq!(
+            chart.series_times_since(0, 9 * 86_400),
+            &[9 * 86_400, 10 * 86_400]
+        );
+        assert!(chart.upsert_session_highlighting_data(primitive, records(10..11, replaced)));
+        // Replacing the current bar keeps the alignment.
+        assert!(chart.upsert_session_highlighting_data(primitive, records(10..11, color)));
+        // Unaligned tails (a row the source does not have) are rejected without mutation.
+        assert!(!chart.upsert_session_highlighting_data(primitive, records(11..12, color)));
+        assert!(!chart.upsert_session_highlighting_data(
+            primitive,
+            vec![
+                SessionHighlightingData {
+                    time: 10 * 86_400,
+                    color,
+                },
+                SessionHighlightingData {
+                    time: 9 * 86_400,
+                    color,
+                },
+            ],
+        ));
+        let frame = chart.build_frame();
+        assert!(frame.panes[0]
+            .under
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Rect { color: c, .. } if *c == color)));
+
+        // `max_points` retention evicts the oldest source row on the next append. The tail merge
+        // drops that row's record instead of forcing a full callback re-evaluation.
+        let retained = |chart: &ChartEngine| -> (usize, Option<i64>) {
+            chart.series[0]
+                .native_primitives
+                .iter()
+                .find_map(|entry| match &entry.kind {
+                    NativeSeriesPrimitiveKind::SessionHighlighting(state)
+                        if entry.id == primitive =>
+                    {
+                        state.highlights.as_ref().map(|highlights| {
+                            (
+                                highlights.len(),
+                                highlights.first().map(|highlight| highlight.time),
+                            )
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(chart.set_series_max_points(0, Some(11)));
+        assert!(chart.update_series_bar(0, 11.0 * 86_400.0, [1.0, 2.0, 0.5, 1.5]));
+        assert_eq!(chart.series_times_since(0, 0)[0], 86_400);
+        // A record older than the retained source is never merged.
+        assert!(!chart.upsert_session_highlighting_data(primitive, records(0..1, color)));
+        assert_eq!(retained(&chart), (11, Some(0)));
+        assert!(chart.upsert_session_highlighting_data(primitive, records(11..12, color)));
+        assert_eq!(retained(&chart), (11, Some(86_400)));
+    }
+
+    #[test]
     fn volume_profile_validation_is_transactional_and_memory_is_attributed() {
         let mut chart = chart();
         let id = chart
@@ -2073,6 +2340,52 @@ mod tests {
         assert!(chart.build_frame().panes[0].main.iter().all(|primitive| {
             !matches!(primitive, Prim::VLine { color, .. } if *color == guide_color)
         }));
+    }
+
+    #[test]
+    fn delta_tooltip_uses_the_series_price_format_exchange_time_and_host_formatter() {
+        let mut chart = delta_chart();
+        chart.series[0].price_format = crate::SeriesPriceFormat {
+            precision: 3,
+            min_move: 0.001,
+            ..crate::SeriesPriceFormat::default()
+        };
+        // America/New_York winter offset: day 2 (1970-01-03 00:00 UTC) is 2 Jan 19:00 locally.
+        chart.set_time_zone(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
+        chart
+            .add_delta_tooltip(
+                0,
+                DeltaTooltipOptions {
+                    show_time: true,
+                    ..DeltaTooltipOptions::default()
+                },
+            )
+            .unwrap();
+        let x2 = chart.time_scale.index_to_coordinate(2);
+        let x7 = chart.time_scale.index_to_coordinate(7);
+        assert!(chart.delta_tooltip_mouse_down(x2));
+        assert!(chart.delta_tooltip_mouse_move(x7));
+        let texts = |chart: &mut ChartEngine| -> Vec<String> {
+            chart.build_frame().panes[0]
+                .main
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Prim::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let built_in = texts(&mut chart);
+        for expected in ["102.000", "107.000", "+5.000", "02 Jan 1970", "19:00"] {
+            assert!(
+                built_in.iter().any(|text| text == expected),
+                "missing {expected:?} in {built_in:?}"
+            );
+        }
+        chart.set_time_formatter(Some(Box::new(|time| Some(format!("T{time}")))));
+        let hosted = texts(&mut chart);
+        assert!(hosted.iter().any(|text| text == "T172800"), "{hosted:?}");
+        assert!(!hosted.iter().any(|text| text == "02 Jan 1970"));
     }
 
     #[test]

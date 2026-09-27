@@ -533,7 +533,9 @@ test("session highlighting follows the official callback contract and refreshes 
     return { source_count, initial_calls, update_calls, detached_calls: calls, last_type };
   });
   expect(result.initial_calls).toBe(result.source_count);
-  expect(result.update_calls).toBe(result.initial_calls + result.source_count + 1);
+  // A live update evaluates only the appended row. The callback used to re-run over the whole
+  // series on every update (initial + source_count + 1), which made each tick O(n).
+  expect(result.update_calls).toBe(result.initial_calls + 1);
   expect(result.detached_calls).toBe(result.update_calls);
   expect(result.last_type).toBe("number");
 });

@@ -223,8 +223,7 @@ impl ChartEngine {
         height: i32,
         hpr: f64,
         vpr: f64,
-        scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
-        tick_base: i64,
+        price_marks: &[aeris_charts_core::scale::price_scale_core::PriceMark],
     ) {
         let grid = &self.options.get().grid;
         let vert = css_color(&grid.vert_lines.color, GRID);
@@ -249,7 +248,7 @@ impl ChartEngine {
             }
         }
         if grid.horz_lines.visible {
-            for mark in scale.build_tick_marks(tick_base, 0.0) {
+            for mark in price_marks {
                 out.push(Prim::HLine {
                     y: (mark.coord * vpr).round() as i32,
                     x0: -lw,
@@ -573,11 +572,38 @@ impl ChartEngine {
         };
         // the public reference volume tint: the primary series' up/down direction per bar. The primary
         // is the first visible, non-removed series (id 0 may be tombstoned).
-        let main = self.primary_series().map(|s| self.data.plot(s.id));
+        let primary = self.primary_series();
+        let main = primary.map(|s| self.data.plot(s.id));
         let point_colors = self.data.point_colors(rs.id);
-        let histogram_updown = self
-            .series_entry(rs.id)
-            .is_some_and(|series| series.histogram_updown);
+        let (histogram_updown, rule, volume_up, volume_down) = self.series_entry(rs.id).map_or(
+            (
+                false,
+                crate::HistogramUpDownRule::OpenClose,
+                VOLUME_UP,
+                VOLUME_DOWN,
+            ),
+            |series| {
+                (
+                    series.histogram_updown,
+                    series.histogram_updown_rule,
+                    verbatim_color(&series.up_color, VOLUME_UP),
+                    verbatim_color(&series.down_color, VOLUME_DOWN),
+                )
+            },
+        );
+        // The previous-close rule compares the primary's first row with the host's previous close:
+        // a baseline series' explicit baseline, else its scale's explicit percentage base.
+        let first_reference = primary.and_then(|s| {
+            s.baseline
+                .filter(|_| s.kind == SeriesKind::Baseline)
+                .or_else(|| {
+                    self.panes
+                        .get(s.pane_index)
+                        .and_then(|pane| pane.scale(series_scale_target(s)))
+                        .and_then(|scale| scale.options().base_value)
+                })
+                .filter(|price| price.is_finite())
+        });
         let mut work = conflation::DensityWork::default();
         let visible = visible_histogram_rows_with_work(
             plot,
@@ -617,12 +643,29 @@ impl ChartEngine {
                                     return None;
                                 }
                                 let close = m.value_at(row, PlotValueIndex::Close);
-                                let open = m.value_at(row, PlotValueIndex::Open);
-                                (close.is_finite() && open.is_finite()).then_some(close >= open)
+                                let reference = match rule {
+                                    crate::HistogramUpDownRule::OpenClose => {
+                                        m.value_at(row, PlotValueIndex::Open)
+                                    }
+                                    // The summary pyramid bounds this predecessor walk even
+                                    // across long whitespace runs.
+                                    crate::HistogramUpDownRule::PreviousClose => {
+                                        match m.last_non_whitespace_row_before(row) {
+                                            Some(previous) => {
+                                                m.value_at(previous, PlotValueIndex::Close)
+                                            }
+                                            None => first_reference.unwrap_or_else(|| {
+                                                m.value_at(row, PlotValueIndex::Open)
+                                            }),
+                                        }
+                                    }
+                                };
+                                (close.is_finite() && reference.is_finite())
+                                    .then_some(close >= reference)
                             });
                             match direction {
-                                Some(true) => VOLUME_UP,
-                                Some(false) => VOLUME_DOWN,
+                                Some(true) => volume_up,
+                                Some(false) => volume_down,
                                 None => solid,
                             }
                         } else {
@@ -1005,7 +1048,7 @@ impl ChartEngine {
             hpr,
             |index| self.time_scale.index_to_coordinate(index) * hpr,
         );
-        if rows.len() < 2 {
+        if rows.is_empty() {
             return;
         }
         let Some(baseline_price) = self.resolved_baseline_price(rs.id, from, to) else {
@@ -1014,6 +1057,24 @@ impl ChartEngine {
         let baseline_y = scale.price_to_coordinate(baseline_price, rs.base_value);
         let mut top_runs: Vec<Vec<[f32; 2]>> = Vec::new();
         let mut bottom_runs: Vec<Vec<[f32; 2]>> = Vec::new();
+        if let [row] = rows[..] {
+            // reference walkLine: a single visible item draws a horizontal segment one bar spacing
+            // wide, so the first traded minute of a session is visible (fill included).
+            let x = self
+                .time_scale
+                .index_to_coordinate(plot.index_at(row).expect("baseline row index"));
+            let y = scale.price_to_coordinate(close[row], rs.base_value);
+            let half = self.time_scale.bar_spacing() / 2.0;
+            let run = vec![
+                [((x - half) * hpr) as f32, (y * vpr) as f32],
+                [((x + half) * hpr) as f32, (y * vpr) as f32],
+            ];
+            if y < baseline_y {
+                top_runs.push(run);
+            } else {
+                bottom_runs.push(run);
+            }
+        }
         for pair in rows.windows(2) {
             let a_row = pair[0];
             let b_row = pair[1];
