@@ -247,7 +247,8 @@ impl ChartEngine {
                     continue;
                 };
                 let range = if to >= from {
-                    self.data.plot(series.id).visible_rows(from, to)
+                    let plot = self.data.plot(series.id);
+                    plot.source_range(plot.visible_rows(from, to))
                 } else {
                     0..0
                 };
@@ -279,8 +280,10 @@ impl ChartEngine {
                 self.data.series_data(volume_source),
             ) {
                 (Some((times, values)), Some((volume_times, volumes))) => {
+                    // Canonical bars in view, each once (as-of points repeat rows).
                     let range = if to >= from {
-                        self.data.plot(source).visible_rows(from, to)
+                        let plot = self.data.plot(source);
+                        plot.source_range(plot.visible_rows(from, to))
                     } else {
                         0..0
                     };

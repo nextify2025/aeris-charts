@@ -38,13 +38,13 @@
     },
     {
       "path": "index.d.ts",
-      "bytes": 2248,
-      "sha256": "16d7cf0439bb04d447214f362f57c9045485a9188d24c4088c9f1deba75c9362"
+      "bytes": 2297,
+      "sha256": "13f97fbdad33f650907e8b619b1bec7f387b6c796d3106d6540e1abefbfbedcb"
     },
     {
       "path": "offscreen.d.ts",
-      "bytes": 8444,
-      "sha256": "1151f77b3b30e7fcd0de93249e6c190489c38e37a0b23efffc75549f07efd97a"
+      "bytes": 8536,
+      "sha256": "0d2ab6271c51fe501da4e96ac2dc382222d2e52ea28dea71ac437e01c4583e11"
     },
     {
       "path": "primitive_features.d.ts",
@@ -73,8 +73,8 @@
     },
     {
       "path": "types.d.ts",
-      "bytes": 185475,
-      "sha256": "a04b0ae211da9b996b0ca39666a884b5a88fe7b797990606f0a451ccc85d63b3"
+      "bytes": 205978,
+      "sha256": "ecdf1e9b689eecaa9191ad6243ae42402a223ae2f916cedb5d4c4a48792db2e8"
     }
   ]
 }

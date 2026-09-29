@@ -4,7 +4,8 @@ import { test, expect } from "@playwright/test";
 // (examples/web_demo/intraday.html): whole-session whitespace slots, a price line that stops at
 // the last trade, 均价 = sum(amount) / sum(volume), a percentage axis centred on the previous close,
 // exchange-time anchor ticks, a view that input cannot move, previous-close volume colors, and
-// the five-day variant's day-open marks. The browser runs in New York so every exchange-time
+// the five-day variant's day-open marks and per-day line runs (no connector across a trading-day
+// boundary for the average or the price). The browser runs in New York so every exchange-time
 // label must come from the chart's Asia/Shanghai zone, not the host's.
 
 test.use({ timezoneId: "America/New_York" });
@@ -388,6 +389,147 @@ test("the five-day variant labels each day's open and resets the average every s
   for (const label of ["09-21", "09-22", "09-23", "09-24", "09-25"]) expect(texts).toContain(label);
   expect(result.tick_marks.map((mark) => mark.label)).toEqual(["09-21", "09-22", "09-23", "09-24", "09-25"]);
   for (const { chart, expected } of result.openings) expect(chart).toBeCloseTo(expected, 9);
+  expect(errors).toEqual([]);
+});
+
+/** Record every path the Canvas2D executor strokes (subpaths in bitmap px) while recording is on. */
+async function record_canvas_strokes(page) {
+  await page.addInitScript(() => {
+    window.__strokes = null;
+    const proto = CanvasRenderingContext2D.prototype;
+    const { beginPath, moveTo, lineTo, stroke } = proto;
+    let path = [];
+    proto.beginPath = function (...args) {
+      path = [];
+      return beginPath.apply(this, args);
+    };
+    proto.moveTo = function (x, y) {
+      path.push([[x, y]]);
+      return moveTo.call(this, x, y);
+    };
+    proto.lineTo = function (x, y) {
+      if (path.length === 0) path.push([]);
+      path.at(-1).push([x, y]);
+      return lineTo.call(this, x, y);
+    };
+    proto.stroke = function (...args) {
+      if (window.__strokes !== null) {
+        window.__strokes.push({ color: this.strokeStyle, subpaths: path.map((subpath) => subpath.slice()) });
+      }
+      return stroke.apply(this, args);
+    };
+  });
+}
+
+/**
+ * Stroked runs of the price pane in `colors`, each mapped to logical slots through the frame's
+ * device-pixel transform and to the trading day it lies in (`inside` is false when a run joins
+ * two days). A lone row's one-bar segment spans half a slot to each side of its row.
+ */
+async function day_runs(page, colors) {
+  await page.evaluate(() => {
+    window.__strokes = [];
+    window.__intraday.chart.apply_options({});
+  });
+  await settle(page);
+  const { strokes, layout } = await page.evaluate(() => {
+    const { chart, days, slots } = window.__intraday;
+    const pane = chart.panes()[0].get_geometry();
+    const scale = chart.time_scale();
+    const recorded = window.__strokes;
+    window.__strokes = null;
+    return {
+      strokes: recorded,
+      layout: {
+        dpr: window.devicePixelRatio,
+        left: pane.left,
+        width: pane.width,
+        slot_zero: scale.logical_to_coordinate(0),
+        spacing: scale.logical_to_coordinate(1) - scale.logical_to_coordinate(0),
+        per_day: slots.length / days.length,
+      },
+    };
+  });
+  // The engine's pane bitmap ratio and pane offset (frame/mod.rs).
+  const hpr = Math.max(1, Math.round(layout.width * layout.dpr)) / Math.max(1, layout.width);
+  const left = Math.round(layout.left * layout.dpr);
+  const logical = (x) => ((x - left) / hpr - layout.slot_zero) / layout.spacing;
+  return strokes
+    .filter((stroke) => colors.includes(stroke.color))
+    .flatMap((stroke) => stroke.subpaths)
+    .filter((path) => path.length >= 2)
+    .map((path) => {
+      const logicals = path.map(([x]) => logical(x));
+      const middle = (logicals[0] + logicals.at(-1)) / 2;
+      const day = Math.floor((middle + 0.5) / layout.per_day);
+      const start = day * layout.per_day - 0.5;
+      const inside = logicals.every((value) => value >= start - 0.05 && value <= start + layout.per_day + 0.05);
+      return { day, inside, logicals };
+    });
+}
+
+test("the five-day lines restart every trading day with no connector, live minutes included", async ({ page }) => {
+  await record_canvas_strokes(page);
+  const errors = await open_intraday(page, "&days=5&traded=0");
+  const AVERAGE = "#f59e0a";
+  const PRICE = ["#f7525f", "#089981"];
+  const days = (runs) => [...new Set(runs.map((run) => run.day))].sort();
+
+  // Four traded days before the fifth opens: the average draws one run per day, and the price
+  // (red above / green below the previous close) never joins two days either.
+  const average = await day_runs(page, [AVERAGE]);
+  expect(average.map((run) => run.day)).toEqual([0, 1, 2, 3]);
+  for (const run of average) {
+    expect(run.inside, `average run of day ${run.day}`).toBe(true);
+    // Every vertex sits on a slot: the transform above is the frame's own.
+    for (const value of run.logicals) expect(Math.abs(value - Math.round(value))).toBeLessThan(0.05);
+  }
+  const price = await day_runs(page, PRICE);
+  expect(days(price)).toEqual([0, 1, 2, 3]);
+  for (const run of price) expect(run.inside, `price run of day ${run.day}`).toBe(true);
+
+  // The fifth day's opening trade draws its own one-bar segments instead of a diagonal from
+  // yesterday's last average and price.
+  const first = await page.evaluate(() => {
+    window.__intraday.step();
+    return window.__intraday.slots.length - window.__intraday.slots.length / 5;
+  });
+  await settle(page);
+  const opened = await day_runs(page, [AVERAGE]);
+  expect(opened.map((run) => run.day)).toEqual([0, 1, 2, 3, 4]);
+  for (const run of opened) expect(run.inside, `average run of day ${run.day}`).toBe(true);
+  expect(opened[4].logicals.map((value) => Number(value.toFixed(2)))).toEqual([first - 0.5, first + 0.5]);
+  const opened_price = await day_runs(page, PRICE);
+  expect(days(opened_price)).toEqual([0, 1, 2, 3, 4]);
+  for (const run of opened_price) expect(run.inside, `price run of day ${run.day}`).toBe(true);
+
+  // Later minutes extend the fifth day's runs without reaching back into the fourth.
+  await page.evaluate(() => window.__intraday.advance(30));
+  await settle(page);
+  const live = await day_runs(page, [AVERAGE]);
+  expect(live.map((run) => run.day)).toEqual([0, 1, 2, 3, 4]);
+  expect(live[4].logicals[0]).toBeCloseTo(first, 1);
+  for (const run of live) expect(run.inside, `average run of day ${run.day}`).toBe(true);
+  for (const run of await day_runs(page, PRICE)) expect(run.inside, `price run of day ${run.day}`).toBe(true);
+
+  // Control: without the option the price line joins the days again, and the check sees it.
+  await page.evaluate(() => {
+    for (const series of [window.__intraday.price, window.__intraday.percent]) {
+      series.apply_options({ break_on_trading_day: false });
+    }
+  });
+  expect(await page.evaluate(() => window.__intraday.price.options().break_on_trading_day)).toBe(false);
+  const joined = await day_runs(page, PRICE);
+  expect(joined.some((run) => !run.inside)).toBe(true);
+  expect(errors).toEqual([]);
+});
+
+test("the one-day variant keeps a single continuous price and average line", async ({ page }) => {
+  await record_canvas_strokes(page);
+  const errors = await open_intraday(page);
+  const average = await day_runs(page, ["#f59e0a"]);
+  expect(average).toHaveLength(1);
+  expect(average[0].logicals.length).toBeGreaterThan(100);
   expect(errors).toEqual([]);
 });
 

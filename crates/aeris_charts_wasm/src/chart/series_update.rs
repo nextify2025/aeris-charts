@@ -51,7 +51,8 @@ fn outcome_json(outcome: SeriesUpdateOutcome, sequence: Option<u64>) -> Option<S
             ("unknown or stale series id", None)
         }
         SeriesUpdateOutcome::Rejected(SeriesUpdateRejection::UnsupportedSeries) => (
-            "custom, advanced, and footprint series do not accept OHLC merges",
+            "custom, advanced, and footprint series, and engine-derived synthetic or resampled \
+             bars, do not accept host OHLC writes",
             None,
         ),
         SeriesUpdateOutcome::Rejected(SeriesUpdateRejection::EmptyPatch) => (

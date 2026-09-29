@@ -962,6 +962,83 @@ test("drawing tools render pixel-identical on WebGPU and Canvas2D (AA coverage s
   expect(ordering_diff, "drawing geometry/paint order must match (only AA coverage steps may differ)").toBe(0);
 });
 
+test("dashed and dotted core drawings paint identical dashes on WebGPU and Canvas2D", async ({ page }, test_info) => {
+  // The frame lowers every dashed or dotted core stroke (trend line, path, curved brush) into
+  // solid dash runs, so the WebGPU stroker, which has no dash concept, paints the same dashes
+  // Canvas2D does instead of a solid line.
+  const run_scenario = async (backend, styles) => {
+    await goto_fixture(page, backend);
+    await page.evaluate(() => window.__chart.apply_options({ crosshair: { mode: 2 } }));
+    const s = await anchor_spots(page);
+    await page.evaluate(({ s, styles }) => {
+      const chart = window.__chart;
+      const mid = Math.floor((s.l0 + s.l1) / 2);
+      const span = s.p_hi - s.p_lo;
+      chart.add_drawing("trend_line", [
+        { logical: s.l0, price: s.p_lo - span * 0.3 },
+        { logical: s.l1, price: s.p_hi + span * 0.3 },
+      ], { color: "#7b1fa2", width: 2, style: styles[0] });
+      chart.add_drawing("path", [
+        { logical: s.l0, price: s.p_hi + span * 0.5 },
+        { logical: mid, price: s.p_lo - span * 0.5 },
+        { logical: s.l1, price: s.p_hi + span * 0.5 },
+      ], { color: "#e91e63", width: 2, style: styles[1] });
+      chart.add_drawing("brush", [
+        { logical: s.l0, price: s.p_mid },
+        { logical: Math.floor((s.l0 + mid) / 2), price: s.p_hi + span * 0.8 },
+        { logical: mid, price: s.p_mid },
+        { logical: Math.floor((mid + s.l1) / 2), price: s.p_lo - span * 0.8 },
+        { logical: s.l1, price: s.p_mid },
+      ], { color: "#00897b", width: 3, style: styles[2] });
+    }, { s, styles });
+    await settle_frames(page);
+    return {
+      backend: await page.evaluate(() => window.__chart.backend()),
+      png: PNG.sync.read(await page.screenshot({ animations: "disabled", fullPage: false })),
+    };
+  };
+  const dashed = ["dashed", "dotted", "dashed"];
+  const canvas = await run_scenario("canvas2d", dashed);
+  expect(canvas.backend).toBe("canvas2d");
+  const gpu = await run_scenario("auto", dashed);
+  expect(gpu.backend).toBe("webgpu");
+  expect([canvas.png.width, canvas.png.height]).toEqual([gpu.png.width, gpu.png.height]);
+
+  // Vacuousness guard: the dashes leave gaps that solid strokes would ink on each backend.
+  const solid_canvas = await run_scenario("canvas2d", ["solid", "solid", "solid"]);
+  const solid_gpu = await run_scenario("auto", ["solid", "solid", "solid"]);
+  expect(pixel_diff(solid_canvas.png, canvas.png), "Canvas2D dashes the strokes").toBeGreaterThan(500);
+  expect(pixel_diff(solid_gpu.png, gpu.png), "WebGPU dashes the strokes").toBeGreaterThan(500);
+
+  // A dash painted where the other backend leaves a gap (a WebGPU stroke that ignores the style)
+  // differs by the stroke's full contrast, far above any raster difference. Every dash run has two
+  // butt ends, where Canvas2D's analytic coverage and WebGPU's faded butt caps may differ by one
+  // coverage step beyond the drawing parity test's 128 diagonal-stroke bound: measured at most
+  // 142, on 3 isolated pixels of this teal on white. Such end pixels stay few and isolated.
+  let paint_diff = 0;
+  let dash_end_diff = 0;
+  let edge_diff = 0;
+  for (let offset = 0; offset < canvas.png.data.length; offset += 4) {
+    let pixel_delta = 0;
+    for (let channel = 0; channel < 4; channel += 1) {
+      pixel_delta = Math.max(pixel_delta, Math.abs(canvas.png.data[offset + channel] - gpu.png.data[offset + channel]));
+    }
+    if (pixel_delta > 200) paint_diff += 1;
+    else if (pixel_delta > 128) dash_end_diff += 1;
+    else if (pixel_delta !== 0) edge_diff += 1;
+  }
+  console.log(`dashed core drawings parity: ${edge_diff} AA-edge pixels, ${dash_end_diff} dash-end coverage pixels, ${paint_diff} paint pixels`);
+  if (paint_diff !== 0 || dash_end_diff > 32) {
+    const visual = new PNG({ width: canvas.png.width, height: canvas.png.height });
+    pixelmatch(canvas.png.data, gpu.png.data, visual.data, canvas.png.width, canvas.png.height, { threshold: 0, includeAA: true });
+    await test_info.attach("canvas2d.png", { body: PNG.sync.write(canvas.png), contentType: "image/png" });
+    await test_info.attach("webgpu.png", { body: PNG.sync.write(gpu.png), contentType: "image/png" });
+    await test_info.attach("diff.png", { body: PNG.sync.write(visual), contentType: "image/png" });
+  }
+  expect(paint_diff, "dashed core strokes paint the same dashes on both executors").toBe(0);
+  expect(dash_end_diff, "dash-end coverage steps stay isolated").toBeLessThanOrEqual(32);
+});
+
 test("the demo toolbar arms tools, creates, and clears all", async ({ page }) => {  // The full demo (toolbar visible, grid-native chart) — the drawing group drives the same API.
   await page.goto("/");
   await wait_for_chart(page);
@@ -1275,7 +1352,9 @@ test("Ctrl magnets the crosshair to the hovered bar's OHLC", async ({ page }) =>
   await page.evaluate(() => window.__chart.set_drawing_tool("trend_line"));
   // The crosshair's horizontal line is the default crosshair gray — find the pane row with
   // the most of it (the dashed line covers the pane width).
-  const CROSS = [194, 194, 194]; // light border-strong crosshair line #c2c2c2
+  // d2c9b95 ("pin crosshair to dark chrome tokens") pins the crosshair line to the dark-theme
+  // border #333333 in both themes, including this light fixture.
+  const CROSS = [51, 51, 51];
   const crosshair_row = async () => {
     const png = await capture(page);
     const pane_bottom = Math.round((fixture.css_height - fixture.time_axis_height) * PR);
@@ -1556,7 +1635,9 @@ test("trend labels rotate, reverse, template alignment, and never inherit text-t
   let first = await page.evaluate(() => window.__chart.drawings()[0].options());
   expect(first.text, "trend templates never consume the standalone text field").toBe("");
   expect([first.text_h_align, first.text_v_align]).toEqual(["right", "bottom"]);
-  expect(first.text_size, "drawing text defaults to 14 CSS px").toBe(14);
+  // The size control was left untouched, so the trend keeps its catalog default: no size of its
+  // own, following the chart font size (the demo toolbar templates only edited settings).
+  expect(first.text_size, "an untouched size control leaves the catalog default").toBeNull();
   expect(first.text_color, "the visible text-color control templates trend labels").toBe("#d32f2f");
 
   const [slot_x, slot_y, slot_angle] = await page.evaluate(() => (
@@ -1578,7 +1659,8 @@ test("trend labels rotate, reverse, template alignment, and never inherit text-t
   const editor = page.locator("#chart_container #aeris_charts-text-input");
   await expect(editor).toBeFocused();
   const wrap = page.locator("#chart_container #aeris_charts-text-editor");
-  expect(await editor.evaluate((el) => getComputedStyle(el).fontSize)).toBe("14px");
+  const chart_font_size = await page.evaluate(() => window.__chart.options().layout.fontSize);
+  expect(await editor.evaluate((el) => getComputedStyle(el).fontSize)).toBe(`${chart_font_size}px`);
   expect(await editor.evaluate((el) => getComputedStyle(el).opacity)).toBe("0");
   expect(await page.locator("#aeris_charts-text-caret")).toBeVisible();
   const editor_angle = () => wrap.evaluate((el) => Number(el.style.transform.match(/rotate\(([-\d.e]+)rad\)/)?.[1]));

@@ -4,7 +4,6 @@
 //! ordinary engine series (`aeris_charts_indicators` holds the pure math). Extracted from `lib.rs`.
 
 use super::*;
-use std::borrow::Cow;
 
 /// Scalar source selected by a study.  The aggregate sources are calculated from the source
 /// bar's OHLC columns without changing the canonical source series or duplicating its storage.
@@ -220,7 +219,8 @@ pub enum IndicatorKind {
         period: usize,
     },
     /// KDJ: RSV over `period` rows, `K = SMA(RSV, k_smoothing, 1)`,
-    /// `D = SMA(K, d_smoothing, 1)`, `J = 3K - 2D` (defaults 9/3/3).
+    /// `D = SMA(K, d_smoothing, 1)`, `J = 3K - 2D` (defaults 9/3/3). `seed` also decides whether
+    /// the first rows use a partial RSV window (see `KdjSeed`).
     Kdj {
         period: usize,
         k_smoothing: usize,
@@ -325,9 +325,147 @@ pub(crate) struct IndicatorBinding {
     /// Turnover column of an amount-weighted VWAP, aligned by timestamp like volume.
     pub(crate) amount_source: Option<SeriesId>,
     runtime: aeris_charts_indicators::IncrementalState,
+    inputs: IndicatorInputs,
     source_generation: u64,
     volume_generation: Option<u64>,
     amount_generation: Option<u64>,
+    /// Source rows the runtime covers: through the source's last real row as of the latest
+    /// rebuild. Output rows at or past it are whitespace (the trailing rows of pre-installed
+    /// session slots), so a tail rebuild never recomputes or rewrites them.
+    data_end: usize,
+}
+
+impl IndicatorBinding {
+    /// Rows of work this binding's most recent rebuild performed: formula rows its runtime
+    /// evaluated plus aggregate-input and weight-alignment rows it derived.
+    pub(crate) fn last_work_rows(&self) -> usize {
+        self.runtime.last_work_rows() + self.inputs.work_rows
+    }
+}
+
+/// Binding-owned input columns derived from canonical series: an aggregate price column (`hl2`,
+/// `hlc3`, `ohlc4`, `hlcc4`) and timestamp-aligned weight columns. They share the runtime's
+/// invariant that source rows before a rebuild's first changed row are unchanged, so a tail
+/// update derives only the changed suffix. They are private runtime state, never canonical
+/// series, and are counted in the indicator runtime memory.
+#[derive(Clone, Debug, Default)]
+struct IndicatorInputs {
+    price: Vec<f64>,
+    volume: AlignedWeights,
+    amount: AlignedWeights,
+    /// Input rows derived or compared by the last rebuild.
+    work_rows: usize,
+}
+
+impl IndicatorInputs {
+    fn bytes(&self) -> usize {
+        (self.price.capacity() + self.volume.aligned.capacity() + self.amount.aligned.capacity())
+            * std::mem::size_of::<f64>()
+    }
+}
+
+/// A weight column (volume or turnover) paired with the source rows by timestamp.
+#[derive(Clone, Debug, Default)]
+struct AlignedWeights {
+    /// Leading rows at which the weight series and the source carry the same timestamps, as of
+    /// the last rebuild.
+    matched: usize,
+    /// Aligned weights while the two timelines diverge; empty while one is a prefix of the other.
+    aligned: Vec<f64>,
+}
+
+impl AlignedWeights {
+    /// Weights for `source_times`, re-deriving only rows `from..`, plus the rows touched.
+    ///
+    /// While one timeline is a prefix of the other (identical timelines, or a candle that
+    /// streamed its new bar before its volume did, or after), the weight column is borrowed as
+    /// is and the runtime applies each formula's missing-weight fallback past its end. Otherwise
+    /// the retained aligned column keeps its unchanged prefix and uses `fallback` for source
+    /// timestamps the weight series lacks.
+    fn column<'a>(
+        &'a mut self,
+        source_times: &[i64],
+        weight: Option<(&'a [i64], &'a [f64])>,
+        from: usize,
+        fallback: f64,
+    ) -> (&'a [f64], usize) {
+        let Some((times, values)) = weight else {
+            *self = Self::default();
+            return (&[], 0);
+        };
+        let rows = source_times.len();
+        let shared = rows.min(times.len());
+        let resume = self.matched.min(from).min(shared);
+        let mut matched = resume;
+        while matched < shared && times[matched] == source_times[matched] {
+            matched += 1;
+        }
+        self.matched = matched;
+        let compared = matched - resume;
+        // An empty weight series keeps the explicit fallback column (an amount-weighted VWAP
+        // treats an empty turnover column as "no turnover source").
+        if matched == shared && (shared > 0 || rows == 0) {
+            self.aligned = Vec::new();
+            return (&values[..shared], compared);
+        }
+        let keep = self.aligned.len().min(from).min(rows);
+        self.aligned.truncate(keep);
+        let mut weight_row = source_times.get(keep).map_or(times.len(), |&first| {
+            times.partition_point(|&time| time < first)
+        });
+        for &time in &source_times[keep..] {
+            while weight_row < times.len() && times[weight_row] < time {
+                weight_row += 1;
+            }
+            self.aligned.push(if times.get(weight_row) == Some(&time) {
+                values[weight_row]
+            } else {
+                fallback
+            });
+        }
+        (&self.aligned, compared + rows - keep)
+    }
+}
+
+/// The scalar input column a study reads as its close: a canonical column, or the aggregate
+/// price retained in `cache` with rows `from..` re-derived. Returns the column and derived rows.
+fn price_input<'a>(
+    cache: &'a mut Vec<f64>,
+    source: IndicatorInputSource,
+    values: [&'a [f64]; 4],
+    from: usize,
+) -> (&'a [f64], usize) {
+    let aggregate: fn(f64, f64, f64, f64) -> f64 = match source {
+        IndicatorInputSource::Open
+        | IndicatorInputSource::High
+        | IndicatorInputSource::Low
+        | IndicatorInputSource::Close => {
+            *cache = Vec::new();
+            let column = match source {
+                IndicatorInputSource::Open => 0,
+                IndicatorInputSource::High => 1,
+                IndicatorInputSource::Low => 2,
+                _ => 3,
+            };
+            return (values[column], 0);
+        }
+        IndicatorInputSource::Hl2 => |_, high, low, _| (high + low) * 0.5,
+        IndicatorInputSource::Hlc3 => |_, high, low, close| (high + low + close) / 3.0,
+        IndicatorInputSource::Ohlc4 => |open, high, low, close| (open + high + low + close) * 0.25,
+        IndicatorInputSource::Hlcc4 => |_, high, low, close| (high + low + 2.0 * close) * 0.25,
+    };
+    let rows = values.iter().map(|column| column.len()).min().unwrap_or(0);
+    let keep = cache.len().min(from).min(rows);
+    cache.truncate(keep);
+    cache.extend((keep..rows).map(|row| {
+        aggregate(
+            values[0][row],
+            values[1][row],
+            values[2][row],
+            values[3][row],
+        )
+    }));
+    (cache, rows - keep)
 }
 
 #[derive(Clone, Copy)]
@@ -464,16 +602,18 @@ impl ChartEngine {
     pub(crate) fn indicator_memory_usage(&self) -> (usize, usize) {
         self.indicators.iter().fold((0, 0), |usage, binding| {
             (
-                usage.0 + binding.runtime.runtime_bytes(),
+                usage.0 + binding.runtime.runtime_bytes() + binding.inputs.bytes(),
                 usage.1 + binding.runtime.transfer_capacity_bytes(),
             )
         })
     }
 
+    /// Rows of work each binding's most recent rebuild performed, summed over bindings: formula
+    /// rows its runtime evaluated plus aggregate-input and weight-alignment rows it derived.
     pub fn last_indicator_work_rows(&self) -> usize {
         self.indicators
             .iter()
-            .map(|binding| binding.runtime.last_work_rows())
+            .map(IndicatorBinding::last_work_rows)
             .sum()
     }
 
@@ -1321,8 +1461,9 @@ impl ChartEngine {
     }
 
     /// Add KDJ K, D and J lines in that order, in their own oscillator pane (dotted 20/80 band
-    /// lines). K and D start from the textbook 50; `IndicatorKind::Kdj { seed, .. }` selects the
-    /// formula-language first value instead.
+    /// lines). K and D start from the textbook 50 after a full RSV window;
+    /// `IndicatorKind::Kdj { seed, .. }` selects the formula-language start instead (RSV over the
+    /// rows available, first value at row 0).
     pub fn add_kdj(
         &mut self,
         source: SeriesId,
@@ -1768,6 +1909,28 @@ impl ChartEngine {
         })
     }
 
+    /// The reset period of the binding that owns output `id`, when its values restart at period
+    /// boundaries: session VWAP (typical-price or amount-weighted) and pivot sessions per
+    /// exchange trading day, VWAP bands per their configured reset. The frame ends a line run
+    /// wherever consecutive drawn rows' [`VwapReset::period_key`]s differ, using the same
+    /// trading-day mapping the runtime resets on, so the break and the reset always coincide.
+    pub(crate) fn indicator_reset_period(
+        &self,
+        id: SeriesId,
+    ) -> Option<aeris_charts_indicators::VwapReset> {
+        let binding = self
+            .indicators
+            .iter()
+            .find(|binding| binding.outputs.contains(&id))?;
+        match binding.kind {
+            IndicatorKind::Vwap | IndicatorKind::PivotPoints { .. } => {
+                Some(aeris_charts_indicators::VwapReset::Session)
+            }
+            IndicatorKind::VwapBands { reset, .. } => Some(reset),
+            _ => None,
+        }
+    }
+
     /// Drop every indicator binding that reads from or writes to `id`, returning the output series
     /// ids those bindings owned so the caller can tombstone them alongside `id`. Used by
     /// `remove_series`: removing a source drops its derived indicators; removing an indicator's own
@@ -1977,6 +2140,7 @@ impl ChartEngine {
             source,
             source_input,
             runtime,
+            inputs: IndicatorInputs::default(),
             kind,
             outputs: ids.clone(),
             volume_source,
@@ -1984,6 +2148,7 @@ impl ChartEngine {
             source_generation: 0,
             volume_generation: None,
             amount_generation: None,
+            data_end: 0,
         });
         self.rebuild_indicator(self.indicators.len() - 1, 0, true);
         ids
@@ -2004,30 +2169,111 @@ impl ChartEngine {
         self.refresh_resampled_dependents(dependency);
     }
 
-    pub(crate) fn recompute_all_indicators(&mut self) {
-        self.indicator_changes.clear();
+    /// One past `source`'s last real row among its `rows` visible rows: the rows after it are
+    /// whitespace (such as pre-installed session slots), which studies and resampled bars leave
+    /// untouched on a tail change. An as-of source's plot rows are not its canonical rows, so
+    /// every row counts there. Logarithmic through the source's LOD pyramid.
+    pub(crate) fn source_data_end(&self, source: SeriesId, rows: usize) -> usize {
+        let plot = self.data.plot(source);
+        if plot.is_as_of() || plot.size() != rows {
+            return rows;
+        }
+        plot.last_non_whitespace_row_before(rows)
+            .map_or(0, |row| row + 1)
+    }
+
+    /// Report a data change of `series` from generation `previous`, touching rows from `from` on,
+    /// to the derived drawing state that follows series data incrementally (regression fits), so
+    /// it can extend over a tail change instead of repeating a full pass. A change reported
+    /// nowhere (a complete replacement) leaves that state behind, which then rebuilds in full.
+    fn note_series_change(&mut self, series: SeriesId, previous: u64, from: usize) {
+        let generation = self.data.series_generation(series).unwrap_or(0);
+        self.drawing_settings
+            .regression_memo
+            .borrow_mut()
+            .note_change(series, previous, generation, from);
+    }
+
+    /// Visible length and generation of every host-owned indicator dependency (a binding's
+    /// price, volume, or turnover source that is not itself an indicator output), captured before
+    /// a replay clock move changes the visible prefixes.
+    pub(crate) fn indicator_dependency_extents(&self) -> Vec<(SeriesId, usize, u64)> {
+        let mut extents: Vec<(SeriesId, usize, u64)> = Vec::new();
         for binding in &self.indicators {
-            for dependency in [Some(binding.source), binding.volume_source]
-                .into_iter()
-                .flatten()
+            for id in [
+                Some(binding.source),
+                binding.volume_source,
+                binding.amount_source,
+            ]
+            .into_iter()
+            .flatten()
             {
-                if !self
-                    .indicator_changes
-                    .iter()
-                    .any(|(existing, _)| *existing == dependency)
+                if extents.iter().any(|&(seen, ..)| seen == id)
+                    || self.indicator_binding_id(id).is_some()
                 {
-                    self.indicator_changes.push((
-                        dependency,
-                        IndicatorChange {
-                            from: 0,
-                            previous_generation: 0,
-                            full_replace: true,
-                        },
-                    ));
+                    continue;
                 }
+                let visible = self
+                    .data
+                    .series_data(id)
+                    .map_or(0, |(times, _)| times.len());
+                let generation = self.data.series_generation(id).unwrap_or(0);
+                extents.push((id, visible, generation));
             }
         }
-        self.propagate_indicator_changes();
+        extents
+    }
+
+    /// Refresh indicators after a replay clock move, from their dependencies' `extents` before
+    /// it. A dependency whose rows were only revealed (a forward move) refreshes from its previous
+    /// visible length, like a tail append; one whose visible prefix shrank (a backward move)
+    /// rebuilds. A dependency its owner rewrote during the move (a trade-derived or resampled
+    /// series) already refreshed its bindings through that owner's update path, unless one of
+    /// them is still behind, which rebuilds.
+    pub(crate) fn refresh_indicators_after_cutoff(&mut self, extents: &[(SeriesId, usize, u64)]) {
+        self.indicator_changes.clear();
+        for &(id, before, generation) in extents {
+            let current = self.data.series_generation(id).unwrap_or(0);
+            let change = if current != generation {
+                let behind = self.indicators.iter().any(|binding| {
+                    let tracked = if binding.source == id {
+                        Some(binding.source_generation)
+                    } else if binding.volume_source == Some(id) {
+                        binding.volume_generation
+                    } else if binding.amount_source == Some(id) {
+                        binding.amount_generation
+                    } else {
+                        return false;
+                    };
+                    tracked != Some(current)
+                });
+                if !behind {
+                    continue;
+                }
+                IndicatorChange {
+                    from: 0,
+                    previous_generation: current,
+                    full_replace: true,
+                }
+            } else {
+                let now = self
+                    .data
+                    .series_data(id)
+                    .map_or(0, |(times, _)| times.len());
+                if now == before {
+                    continue;
+                }
+                IndicatorChange {
+                    from: before.min(now),
+                    previous_generation: generation,
+                    full_replace: now < before,
+                }
+            };
+            self.indicator_changes.push((id, change));
+        }
+        if !self.indicator_changes.is_empty() {
+            self.propagate_indicator_changes();
+        }
         self.sync_time_points();
     }
 
@@ -2036,11 +2282,16 @@ impl ChartEngine {
         dependency: SeriesId,
         change: IndicatorChange,
     ) {
+        self.note_series_change(
+            dependency,
+            change.previous_generation,
+            if change.full_replace { 0 } else { change.from },
+        );
         self.indicator_changes.clear();
         self.indicator_changes.push((dependency, change));
         self.propagate_indicator_changes();
         self.sync_time_points();
-        self.refresh_resampled_dependents(dependency);
+        self.refresh_resampled_after_change(dependency, change);
     }
 
     /// First source row affected when a timestamp-aligned weight column (volume or turnover)
@@ -2137,11 +2388,26 @@ impl ChartEngine {
         let source_input = self.indicators[index].source_input;
         let volume_source = self.indicators[index].volume_source;
         let amount_source = self.indicators[index].amount_source;
+        let rows;
+        let end;
         {
             let Some((times, values)) = self.data.series_data(source) else {
                 return changes;
             };
-            let selected_close = selected_input(source_input, values);
+            // Rows past the source's last real row, before and after this change, are whitespace
+            // (pre-installed session slots), so their outputs are empty and stay so: the runtime
+            // stops at that data end and the outputs keep the rows past it untouched, which keeps
+            // a tick filling a slot as cheap as an append.
+            rows = times.len();
+            let data_end = self.source_data_end(source, rows);
+            end = if full_replace {
+                data_end
+            } else {
+                data_end.max(self.indicators[index].data_end).min(rows)
+            };
+            let times = &times[..end];
+            let values = values.map(|column| &column[..end.min(column.len())]);
+            let from = if full_replace { 0 } else { from.min(end) };
             // Missing volume/amount timestamps use the documented fallback: zero for volume
             // studies, unit weight for VWAP/VWMA, and "no trade" (NaN, skipped) for the
             // amount-weighted average price.
@@ -2158,41 +2424,42 @@ impl ChartEngine {
             } else {
                 1.0
             };
-            let aligned = |column: Option<SeriesId>| {
-                column.and_then(|id| self.data.series_data(id)).map_or(
-                    Cow::Borrowed(&[][..]),
-                    |(column_times, values)| {
-                        if column_times == times {
-                            Cow::Borrowed(values[3])
-                        } else {
-                            Cow::Owned(align_volume_to_source_times(
-                                times,
-                                column_times,
-                                values[3],
-                                fallback,
-                            ))
-                        }
-                    },
-                )
+            let weight = |column: Option<SeriesId>| {
+                column
+                    .and_then(|id| self.data.series_data(id))
+                    .map(|(column_times, values)| (column_times, values[3]))
             };
-            let volume = aligned(volume_source);
-            let amount = aligned(amount_source);
+            let (volume_column, amount_column) = (weight(volume_source), weight(amount_source));
             let exchange_time = &self.exchange_time;
             let binding = &mut self.indicators[index];
+            let (close, price_rows) =
+                price_input(&mut binding.inputs.price, source_input, values, from);
+            let (volume, volume_rows) =
+                binding
+                    .inputs
+                    .volume
+                    .column(times, volume_column, from, fallback);
+            let (amount, amount_rows) =
+                binding
+                    .inputs
+                    .amount
+                    .column(times, amount_column, from, fallback);
             binding.runtime.rebuild_from_with_trading_days(
                 aeris_charts_indicators::IndicatorInput {
                     times,
                     open: values[0],
                     high: values[1],
                     low: values[2],
-                    close: selected_close.as_ref(),
-                    volume: volume.as_ref(),
-                    amount: amount.as_ref(),
+                    close,
+                    volume,
+                    amount,
                 },
-                if full_replace { 0 } else { from },
+                from,
                 &|seconds| exchange_time.trading_day_seconds(seconds),
             );
+            binding.inputs.work_rows = price_rows + volume_rows + amount_rows;
         }
+        self.indicators[index].data_end = end;
         self.indicators[index].source_generation = self.data.series_generation(source).unwrap_or(0);
         self.indicators[index].volume_generation =
             volume_source.and_then(|id| self.data.series_generation(id));
@@ -2202,10 +2469,22 @@ impl ChartEngine {
         let mut full_histogram_colors = None;
         for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
             let previous_generation = self.data.series_generation(output).unwrap_or(0);
-            let source_from = self.indicators[index].runtime.output_from(output_index);
+            // The runtime stops at the data end, so an output whose first row lies past it (its
+            // warm-up, or the rebuild's first row, falls among trailing whitespace rows) starts
+            // where it would over every row, not at the data end.
+            let runtime_from = self.indicators[index].runtime.output_from(output_index);
+            let source_from = if runtime_from < end {
+                runtime_from
+            } else {
+                let requested = if full_replace { 0 } else { from };
+                requested
+                    .max(self.indicators[index].runtime.warmup_rows(output_index))
+                    .clamp(end, rows)
+            };
 
             let output_from = if full_replace {
-                let values = self.indicators[index].runtime.take_output(output_index);
+                let mut values = self.indicators[index].runtime.take_output(output_index);
+                values.resize(rows - source_from, f64::NAN);
                 if output_index == 2
                     && matches!(self.indicators[index].kind, IndicatorKind::Macd { .. })
                 {
@@ -2216,9 +2495,14 @@ impl ChartEngine {
                 0
             } else {
                 let values = self.indicators[index].runtime.output(output_index);
-                self.data
-                    .update_single_aligned(output, source, source_from, values)
-                    .expect("indicator output remains aligned to its source")
+                if end == rows {
+                    self.data
+                        .update_single_aligned(output, source, source_from, values)
+                } else {
+                    self.data
+                        .update_single_aligned_within(output, source, source_from, values)
+                }
+                .expect("indicator output remains aligned to its source")
             };
             if self.data.series_generation(output).unwrap_or(0) != previous_generation {
                 changes[output_index] = Some((
@@ -2288,70 +2572,6 @@ fn momentum_histogram_colors(values: &[f64]) -> Vec<u32> {
         }
     }
     colors
-}
-
-fn selected_input<'a>(source: IndicatorInputSource, values: [&'a [f64]; 4]) -> Cow<'a, [f64]> {
-    match source {
-        IndicatorInputSource::Open => Cow::Borrowed(values[0]),
-        IndicatorInputSource::High => Cow::Borrowed(values[1]),
-        IndicatorInputSource::Low => Cow::Borrowed(values[2]),
-        IndicatorInputSource::Close => Cow::Borrowed(values[3]),
-        IndicatorInputSource::Hl2 => Cow::Owned(
-            values[1]
-                .iter()
-                .zip(values[2])
-                .map(|(&high, &low)| (high + low) * 0.5)
-                .collect(),
-        ),
-        IndicatorInputSource::Hlc3 => Cow::Owned(
-            values[1]
-                .iter()
-                .zip(values[2])
-                .zip(values[3])
-                .map(|((&high, &low), &close)| (high + low + close) / 3.0)
-                .collect(),
-        ),
-        IndicatorInputSource::Ohlc4 => Cow::Owned(
-            values[0]
-                .iter()
-                .zip(values[1])
-                .zip(values[2])
-                .zip(values[3])
-                .map(|(((&open, &high), &low), &close)| (open + high + low + close) * 0.25)
-                .collect(),
-        ),
-        IndicatorInputSource::Hlcc4 => Cow::Owned(
-            values[1]
-                .iter()
-                .zip(values[2])
-                .zip(values[3])
-                .map(|((&high, &low), &close)| (high + low + 2.0 * close) * 0.25)
-                .collect(),
-        ),
-    }
-}
-
-/// Align an optional volume input to the source timeline without retaining a second canonical
-/// timeline. Missing timestamps intentionally use the indicator layer's unit-weight fallback.
-fn align_volume_to_source_times(
-    source_times: &[i64],
-    volume_times: &[i64],
-    values: &[f64],
-    default: f64,
-) -> Vec<f64> {
-    let mut aligned = vec![default; source_times.len()];
-    let mut volume_row = 0;
-    for (source_row, &source_time) in source_times.iter().enumerate() {
-        while volume_row < volume_times.len() && volume_times[volume_row] < source_time {
-            volume_row += 1;
-        }
-        if volume_times.get(volume_row) == Some(&source_time) {
-            if let Some(&volume) = values.get(volume_row) {
-                aligned[source_row] = volume;
-            }
-        }
-    }
-    aligned
 }
 
 fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {

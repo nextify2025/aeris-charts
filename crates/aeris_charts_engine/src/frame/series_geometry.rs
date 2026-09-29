@@ -1,7 +1,9 @@
 //! Per-kind series geometry builders (grid, candles, bars, histogram, line, baseline,
 //! price lines, markers, last-value line and pulse) emitting backend-neutral prims.
 
+use super::conflation::line_runs;
 use super::*;
+use crate::VwapReset;
 use aeris_charts_core::TimePointIndex;
 
 /// Emit a polyline stroke. A solid style emits a single `Polyline` prim (the backends expand
@@ -55,6 +57,94 @@ pub(super) fn push_line_stroke(
             color,
         });
     }
+}
+
+/// Lower one stroke run that may reach far past `pane` (family and placement-guide strokes, and
+/// the dashed strokes of [`push_styled_stroke`]) for every executor. The run is clipped to `pane`
+/// grown by the stroke's reach, so frame work and coordinates stay bounded however far the
+/// geometry reaches (an extreme level or zoom), and a dashed or dotted run is split into solid
+/// dash runs through [`push_line_stroke`]; clipped parts keep the unclipped run's dash phase, so
+/// dashes never shift while panning.
+pub(super) fn push_clipped_stroke(
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+    run: &[(f64, f64)],
+    pane: aeris_charts_render::shape::Rect,
+    (width, style, color): (f32, LineStyle, Color),
+    scratch: &mut Vec<(f64, f64)>,
+) {
+    let clip = pane.inflate(f64::from(width) + 2.0);
+    let period: f64 = style
+        .dash_pattern(width)
+        .iter()
+        .copied()
+        .map(f64::from)
+        .sum();
+    aeris_charts_render::shape::clip_polyline_to_rect(run, clip, period, scratch, |part| {
+        if style == LineStyle::Solid {
+            let first_point = points.len() as u32;
+            points.extend(part.iter().map(|&(x, y)| [x as f32, y as f32]));
+            out.push(Prim::Polyline {
+                first_point,
+                point_count: part.len() as u32,
+                width,
+                style,
+                line_type: LineType::Simple,
+                color,
+            });
+        } else {
+            let path: Vec<[f32; 2]> = part.iter().map(|&(x, y)| [x as f32, y as f32]).collect();
+            push_line_stroke(out, points, &path, width, style, LineType::Simple, color);
+        }
+    });
+}
+
+/// Lower a styled stroke through `run` (bitmap px) whose geometry is not bounded by the viewport
+/// (core drawings, general series). A solid run stays one polyline in `line_type`, which every
+/// executor strokes alike. A dashed or dotted run is expanded with `line_type` first (a curve
+/// clipped before expansion would bend differently inside the pane) and then lowered through
+/// [`push_clipped_stroke`], so executors receive only solid dash runs, whatever their dash
+/// support, and dash work stays bounded by the pane.
+pub(super) fn push_styled_stroke(
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+    run: &[(f64, f64)],
+    line_type: LineType,
+    (width, style, color): (f32, LineStyle, Color),
+    pane: aeris_charts_render::shape::Rect,
+) {
+    if style == LineStyle::Solid {
+        let first_point = points.len() as u32;
+        points.extend(run.iter().map(|&(x, y)| [x as f32, y as f32]));
+        out.push(Prim::Polyline {
+            first_point,
+            point_count: run.len() as u32,
+            width,
+            style,
+            line_type,
+            color,
+        });
+        return;
+    }
+    let expanded;
+    let run = if line_type == LineType::Simple {
+        run
+    } else {
+        let line: Vec<LinePoint> = run.iter().map(|&(x, y)| LinePoint { x, y }).collect();
+        expanded = expand_line(&line, line_type)
+            .into_iter()
+            .map(|point| (point.x, point.y))
+            .collect::<Vec<_>>();
+        &expanded
+    };
+    push_clipped_stroke(
+        out,
+        points,
+        run,
+        pane,
+        (width, style, color),
+        &mut Vec::new(),
+    );
 }
 
 /// Per-point-color stroke runs over a resolved per-point color list, porting reference walkLine's
@@ -210,7 +300,96 @@ fn push_area_brush_fill(
     });
 }
 
+/// A one-bar horizontal segment through a single-point run (the reference walkLine rule for a
+/// lone visible item), `half_bar` device px to each side.
+fn single_point_segment(point: [f32; 2], half_bar: f32) -> [[f32; 2]; 2] {
+    [
+        [point[0] - half_bar, point[1]],
+        [point[0] + half_bar, point[1]],
+    ]
+}
+
 impl ChartEngine {
+    /// Positions in `rows` (ascending drawn rows of `id`) that start a new line run: rows whose
+    /// period key differs from the previous drawn row's. The period is the exchange trading day
+    /// when the host set `break_on_trading_day` (trading-day keys refine every weekly/monthly
+    /// key, so the option subsumes a binding's coarser reset), else the reset period of the
+    /// indicator binding that owns `id`. Keys come from each row's time through the chart's
+    /// exchange trading day, so full rebuilds, incremental updates, and conflated (LOD) row
+    /// selections all break at the same boundaries. An indicator output keys the canonical row
+    /// time its runtime resets on (for an as-of output, the row a plot row shows through
+    /// `source_row`, not the axis point's time); the host option keys the time axis's own bar
+    /// times, which on a non-time sequence axis are the bars' open times rather than the data
+    /// layer's row keys.
+    /// Whitespace rows are never drawn, so a period whose first rows are blank starts at its
+    /// first drawn row. Empty when the series has no break period.
+    pub(crate) fn line_run_breaks(
+        &self,
+        id: SeriesId,
+        plot: PlotListView<'_>,
+        rows: &[usize],
+    ) -> Vec<usize> {
+        let Some(series) = self.series_entry(id) else {
+            return Vec::new();
+        };
+        let host = series.break_on_trading_day;
+        let Some(period) = host
+            .then_some(VwapReset::Session)
+            .or_else(|| self.indicator_reset_period(id))
+        else {
+            return Vec::new();
+        };
+        // An indicator output keys its own canonical rows (it aliases its source's times): an
+        // as-of output's plot rows repeat or skip canonical rows, so the axis point's time can
+        // fall in a later period than the row whose value it shows and resets on.
+        let row_times = (!host).then(|| {
+            self.data
+                .series_data(id)
+                .map_or(&[][..], |(times, _)| times)
+        });
+        let key = |row: usize| {
+            let time = match row_times {
+                None => self.axis_time_key_at(usize::try_from(plot.index_at(row)?).ok()?)?,
+                Some(times) => *times.get(plot.source_row(row))?,
+            };
+            Some(period.period_key(self.exchange_time.trading_day_seconds(time)))
+        };
+        let mut breaks = Vec::new();
+        let mut previous = rows.first().and_then(|&row| key(row));
+        for (position, &row) in rows.iter().enumerate().skip(1) {
+            let current = key(row);
+            if current != previous {
+                breaks.push(position);
+            }
+            previous = current;
+        }
+        breaks
+    }
+
+    /// The line runs of `rows` (the drawn rows of `id` inside `from..=to` plus at most one edge
+    /// neighbour per side): the single run `0..len` without a break, else `rows` split at the
+    /// period breaks. A break that isolates an edge neighbour drops that run, because its real
+    /// segments lie beyond the pane edge; a one-bar segment would reach into view instead.
+    pub(crate) fn line_run_ranges(
+        &self,
+        id: SeriesId,
+        plot: PlotListView<'_>,
+        rows: &[usize],
+        from: i64,
+        to: i64,
+    ) -> Vec<std::ops::Range<usize>> {
+        let breaks = self.line_run_breaks(id, plot, rows);
+        line_runs(rows.len(), &breaks)
+            .filter(|run| {
+                breaks.is_empty()
+                    || run.len() > 1
+                    || plot
+                        .index_at(rows[run.start])
+                        .is_some_and(|index| (from..=to).contains(&index))
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_grid_frame(
         &self,
@@ -561,7 +740,7 @@ impl ChartEngine {
         scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
     ) {
         let plot = self.data.plot(rs.id);
-        let c = plot.column(PlotValueIndex::Close);
+        let c = |row: usize| plot.value_at(row, PlotValueIndex::Close);
         // reference HistogramStyleOptions.base (histogram-renderer.ts): columns grow from this price
         // level (default 0).
         let base = scale.price_to_coordinate(rs.base, rs.base_value);
@@ -675,7 +854,7 @@ impl ChartEngine {
                 };
                 HistogramItem {
                     x: item.x_px / hpr,
-                    y: scale.price_to_coordinate(c[r], rs.base_value),
+                    y: scale.price_to_coordinate(c(r), rs.base_value),
                     time: item.geometry_time,
                     color,
                 }
@@ -708,7 +887,7 @@ impl ChartEngine {
         scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
     ) {
         let plot = self.data.plot(rs.id);
-        let c = plot.column(PlotValueIndex::Close);
+        let c = |row: usize| plot.value_at(row, PlotValueIndex::Close);
         let mut work = conflation::DensityWork::default();
         let rows = visible_line_rows_with_work(
             plot,
@@ -732,12 +911,25 @@ impl ChartEngine {
                     .time_scale
                     .index_to_coordinate(plot.index_at(r).expect("line row index"))
                     * hpr) as f32,
-                (scale.price_to_coordinate(c[r], rs.base_value) * vpr) as f32,
+                (scale.price_to_coordinate(c(r), rs.base_value) * vpr) as f32,
             ]);
         }
         if row_points.is_empty() {
             return;
         }
+        // Period breaks (the host's trading-day option, indicator resets) split the drawn rows
+        // into independent runs: no stroke, fill, or band joins the last row of one period to the
+        // first row of the next. Without a break the single run `0..len` reproduces the unbroken
+        // geometry primitive for primitive.
+        let runs = self.line_run_ranges(rs.id, plot, &rows, from, to);
+        let broken = !matches!(runs.as_slice(), [run] if *run == (0..rows.len()));
+        let half_bar = (self.time_scale.bar_spacing() * hpr / 2.0) as f32;
+        // A run a break leaves with one row draws the one-bar segment, so the first row of a new
+        // period shows at once (the baseline builder applies the same rule).
+        let lone_segment = |run: &std::ops::Range<usize>| {
+            (broken && run.len() == 1)
+                .then(|| single_point_segment(row_points[run.start], half_bar))
+        };
         let first = points.len() as u32;
         points.extend_from_slice(&row_points);
         let count = row_points.len() as u32;
@@ -750,7 +942,7 @@ impl ChartEngine {
         // point-for-point; a count mismatch skips the fill rather than drawing a wrong one.
         if let Some(lower_id) = self.bollinger_fill_companion(rs.id) {
             let lower_plot = self.data.plot(lower_id);
-            let lower_close = lower_plot.column(PlotValueIndex::Close);
+            let lower_close = |row: usize| lower_plot.value_at(row, PlotValueIndex::Close);
             let mut work = conflation::DensityWork::default();
             let lower_rows = visible_line_rows_with_work(
                 lower_plot,
@@ -768,29 +960,31 @@ impl ChartEngine {
                 work.candidates,
             );
             if lower_rows.len() == rows.len() && rows.len() >= 2 {
-                let upper_first = points.len() as u32;
-                points.extend_from_slice(&row_points);
-                let lower_first = points.len() as u32;
-                points.extend(lower_rows.iter().map(|&r| {
-                    [
-                        (self.time_scale.index_to_coordinate(
-                            lower_plot.index_at(r).expect("lower-band row index"),
-                        ) * hpr) as f32,
-                        (scale.price_to_coordinate(lower_close[r], rs.base_value) * vpr) as f32,
-                    ]
-                }));
-                out.push(Prim::BandFill {
-                    line_type: LineType::Simple,
-                    upper_first,
-                    lower_first,
-                    point_count: rows.len() as u32,
-                    fill: Color::rgba(
-                        color.r(),
-                        color.g(),
-                        color.b(),
-                        (color.a() as f64 * 0.2).round() as u8,
-                    ),
-                });
+                for run in runs.iter().filter(|run| run.len() >= 2) {
+                    let upper_first = points.len() as u32;
+                    points.extend_from_slice(&row_points[run.clone()]);
+                    let lower_first = points.len() as u32;
+                    points.extend(lower_rows[run.clone()].iter().map(|&r| {
+                        [
+                            (self.time_scale.index_to_coordinate(
+                                lower_plot.index_at(r).expect("lower-band row index"),
+                            ) * hpr) as f32,
+                            (scale.price_to_coordinate(lower_close(r), rs.base_value) * vpr) as f32,
+                        ]
+                    }));
+                    out.push(Prim::BandFill {
+                        line_type: LineType::Simple,
+                        upper_first,
+                        lower_first,
+                        point_count: run.len() as u32,
+                        fill: Color::rgba(
+                            color.r(),
+                            color.g(),
+                            color.b(),
+                            (color.a() as f64 * 0.2).round() as u8,
+                        ),
+                    });
+                }
             }
         }
         // reference data-item colors (series-bar-colorer.ts Line/Area arms — area reads `lineColor`,
@@ -821,6 +1015,11 @@ impl ChartEngine {
                     .and_then(|series| series.area_brush.as_ref())
             })
             .flatten();
+        let brush_style_at = |brush: &crate::AreaBrushState, row: usize| {
+            plot.index_at(row).map_or(brush.outside, |logical| {
+                area_brush_style_for(brush, logical)
+            })
+        };
         if rs.kind == SeriesKind::Area {
             // reference `invertFilledArea` (area-renderer-base.ts): fill from the pane's top edge
             // down to the line instead of from the line down to the pane's bottom edge.
@@ -829,174 +1028,273 @@ impl ChartEngine {
             } else {
                 band_bottom
             };
+            // Split fills keep their slice of the one gradient an unbroken fill would span.
+            let global_top = row_points
+                .iter()
+                .map(|point| point[1] as f64 / vpr)
+                .fold(base_y, f64::min);
+            let global_bottom = row_points
+                .iter()
+                .map(|point| point[1] as f64 / vpr)
+                .fold(base_y, f64::max);
+            let global_span = (global_bottom - global_top).max(1.0);
             if let Some(brush) = area_brush {
                 // Brush styling is transient presentation state on the ordinary Area series. Split
                 // the fill only at actual style boundaries. Emitting every adjacent pair as a
                 // separate translucent mesh makes their antialiased shared edges blend twice and
                 // produces dark vertical seams at every bar. Canonical rows, LOD selection, scale
                 // math, and the normal Area hit-test remain untouched.
-                let global_top = row_points
-                    .iter()
-                    .map(|point| point[1] as f64 / vpr)
-                    .fold(base_y, f64::min);
-                let global_bottom = row_points
-                    .iter()
-                    .map(|point| point[1] as f64 / vpr)
-                    .fold(base_y, f64::max);
-                let global_span = (global_bottom - global_top).max(1.0);
-                let mut run_style: Option<crate::BrushStyle> = None;
-                let mut run = Vec::<[f32; 2]>::new();
-                for (segment_index, pair) in row_points.windows(2).enumerate() {
-                    let Some(logical) = plot.index_at(rows[segment_index + 1]) else {
-                        continue;
-                    };
-                    let style = area_brush_style_for(brush, logical);
-                    if run_style.is_some_and(|current| current != style) {
+                for run in &runs {
+                    if let Some(segment) = lone_segment(run) {
                         push_area_brush_fill(
                             out,
                             points,
-                            &run,
-                            run_style.expect("brush fill run style"),
+                            &segment,
+                            brush_style_at(brush, rows[run.start]),
                             base_y,
                             global_top,
                             global_span,
                             vpr,
                             rs.line_type,
                         );
-                        run.clear();
+                        continue;
                     }
-                    if run.is_empty() {
-                        run.push(pair[0]);
+                    let mut run_style: Option<crate::BrushStyle> = None;
+                    let mut fill_run = Vec::<[f32; 2]>::new();
+                    for (offset, pair) in row_points[run.clone()].windows(2).enumerate() {
+                        let Some(logical) = plot.index_at(rows[run.start + offset + 1]) else {
+                            continue;
+                        };
+                        let style = area_brush_style_for(brush, logical);
+                        if run_style.is_some_and(|current| current != style) {
+                            push_area_brush_fill(
+                                out,
+                                points,
+                                &fill_run,
+                                run_style.expect("brush fill run style"),
+                                base_y,
+                                global_top,
+                                global_span,
+                                vpr,
+                                rs.line_type,
+                            );
+                            fill_run.clear();
+                        }
+                        if fill_run.is_empty() {
+                            fill_run.push(pair[0]);
+                        }
+                        fill_run.push(pair[1]);
+                        run_style = Some(style);
                     }
-                    run.push(pair[1]);
-                    run_style = Some(style);
-                }
-                if let Some(style) = run_style {
-                    push_area_brush_fill(
-                        out,
-                        points,
-                        &run,
-                        style,
-                        base_y,
-                        global_top,
-                        global_span,
-                        vpr,
-                        rs.line_type,
-                    );
+                    if let Some(style) = run_style {
+                        push_area_brush_fill(
+                            out,
+                            points,
+                            &fill_run,
+                            style,
+                            base_y,
+                            global_top,
+                            global_span,
+                            vpr,
+                            rs.line_type,
+                        );
+                    }
                 }
             } else {
                 // Deviation: the area fill keeps the series-level gradient even with per-point
                 // colors — the reference's `color`/`lineColor` data-item field affects only the stroke
                 // (per-point `topColor`/`bottomColor` fill overrides are not modeled).
-                out.push(Prim::AreaFill {
-                    first_point: first,
-                    point_count: count,
-                    base_y: (base_y * vpr) as f32,
-                    line_type: self
-                        .series_entry(rs.id)
-                        .map_or(LineType::Simple, |series| series.line_type),
-                    gradient: Gradient {
-                        top: rs.area_top,
-                        bottom: rs.area_bottom,
-                    },
-                });
+                let line_type = self
+                    .series_entry(rs.id)
+                    .map_or(LineType::Simple, |series| series.line_type);
+                if !broken {
+                    out.push(Prim::AreaFill {
+                        first_point: first,
+                        point_count: count,
+                        base_y: (base_y * vpr) as f32,
+                        line_type,
+                        gradient: Gradient {
+                            top: rs.area_top,
+                            bottom: rs.area_bottom,
+                        },
+                    });
+                }
+                for run in runs.iter().filter(|_| broken) {
+                    let (run_first, run_count) = match lone_segment(run) {
+                        Some(segment) => {
+                            let segment_first = points.len() as u32;
+                            points.extend_from_slice(&segment);
+                            (segment_first, 2)
+                        }
+                        None => (first + run.start as u32, run.len() as u32),
+                    };
+                    let window = &points[run_first as usize..(run_first + run_count) as usize];
+                    let run_top = window
+                        .iter()
+                        .map(|point| point[1] as f64 / vpr)
+                        .fold(base_y, f64::min);
+                    let run_bottom = window
+                        .iter()
+                        .map(|point| point[1] as f64 / vpr)
+                        .fold(base_y, f64::max);
+                    out.push(Prim::AreaFill {
+                        first_point: run_first,
+                        point_count: run_count,
+                        base_y: (base_y * vpr) as f32,
+                        line_type,
+                        gradient: Gradient {
+                            top: mix_area_brush_color(
+                                rs.area_top,
+                                rs.area_bottom,
+                                (run_top - global_top) / global_span,
+                            ),
+                            bottom: mix_area_brush_color(
+                                rs.area_top,
+                                rs.area_bottom,
+                                (run_bottom - global_top) / global_span,
+                            ),
+                        },
+                    });
+                }
             }
         }
         // reference `lineVisible` (line-renderer-base.ts): the stroke is skipped; an area keeps its
         // fill and a line series keeps only its point markers.
         if rs.line_visible {
             if let Some(brush) = area_brush {
-                let mut run_style: Option<crate::BrushStyle> = None;
-                let mut run = Vec::<[f32; 2]>::new();
-                for (segment_index, pair) in row_points.windows(2).enumerate() {
-                    let Some(logical) = plot.index_at(rows[segment_index + 1]) else {
-                        continue;
-                    };
-                    let style = area_brush_style_for(brush, logical);
-                    if run_style.is_some_and(|current| current != style) {
-                        let current = run_style.expect("brush run style");
+                for run in &runs {
+                    if let Some(segment) = lone_segment(run) {
+                        let style = brush_style_at(brush, rows[run.start]);
                         push_line_stroke(
                             out,
                             points,
-                            &run,
-                            (current.line_width * vpr) as f32,
+                            &segment,
+                            (style.line_width * vpr) as f32,
                             rs.line_style,
                             rs.line_type,
-                            current.line_color,
+                            style.line_color,
                         );
-                        run.clear();
+                        continue;
                     }
-                    if run.is_empty() {
-                        run.push(pair[0]);
+                    let mut run_style: Option<crate::BrushStyle> = None;
+                    let mut stroke_run = Vec::<[f32; 2]>::new();
+                    for (offset, pair) in row_points[run.clone()].windows(2).enumerate() {
+                        let Some(logical) = plot.index_at(rows[run.start + offset + 1]) else {
+                            continue;
+                        };
+                        let style = area_brush_style_for(brush, logical);
+                        if run_style.is_some_and(|current| current != style) {
+                            let current = run_style.expect("brush run style");
+                            push_line_stroke(
+                                out,
+                                points,
+                                &stroke_run,
+                                (current.line_width * vpr) as f32,
+                                rs.line_style,
+                                rs.line_type,
+                                current.line_color,
+                            );
+                            stroke_run.clear();
+                        }
+                        if stroke_run.is_empty() {
+                            stroke_run.push(pair[0]);
+                        }
+                        stroke_run.push(pair[1]);
+                        run_style = Some(style);
                     }
-                    run.push(pair[1]);
-                    run_style = Some(style);
-                }
-                if let Some(style) = run_style {
-                    push_line_stroke(
-                        out,
-                        points,
-                        &run,
-                        (style.line_width * vpr) as f32,
-                        rs.line_style,
-                        rs.line_type,
-                        style.line_color,
-                    );
+                    if let Some(style) = run_style {
+                        push_line_stroke(
+                            out,
+                            points,
+                            &stroke_run,
+                            (style.line_width * vpr) as f32,
+                            rs.line_style,
+                            rs.line_type,
+                            style.line_color,
+                        );
+                    }
                 }
             } else {
                 let width = (rs.line_width * vpr) as f32;
-                match &resolved {
-                    Some(colors) => {
-                        // Per-point colors: one stroke run per maximal equal-color span (the
-                        // walkLine split). With steps/curves each run expands independently, and a
-                        // dashed style restarts its pattern per run — reference keeps dash offset and
-                        // splits the step corner at the color change; those sub-segment details are
-                        // not modeled (documented deviation; Simple lines are exact).
-                        for (start, end, run_color) in color_runs(colors) {
-                            if rs.line_style == LineStyle::Solid {
-                                let run_first = points.len() as u32;
-                                points.extend_from_slice(&row_points[start..end]);
+                for run in &runs {
+                    let segment = lone_segment(run);
+                    match &resolved {
+                        Some(colors) => {
+                            if let Some(segment) = segment {
+                                push_line_stroke(
+                                    out,
+                                    points,
+                                    &segment,
+                                    width,
+                                    rs.line_style,
+                                    rs.line_type,
+                                    colors[run.start],
+                                );
+                                continue;
+                            }
+                            // Per-point colors: one stroke run per maximal equal-color span (the
+                            // walkLine split). With steps/curves each run expands independently,
+                            // and a dashed style restarts its pattern per run — reference keeps
+                            // dash offset and splits the step corner at the color change; those
+                            // sub-segment details are not modeled (documented deviation; Simple
+                            // lines are exact).
+                            for (start, end, run_color) in color_runs(&colors[run.clone()]) {
+                                let (start, end) = (run.start + start, run.start + end);
+                                if rs.line_style == LineStyle::Solid {
+                                    let run_first = points.len() as u32;
+                                    points.extend_from_slice(&row_points[start..end]);
+                                    out.push(Prim::Polyline {
+                                        first_point: run_first,
+                                        point_count: (end - start) as u32,
+                                        width,
+                                        style: LineStyle::Solid,
+                                        line_type: rs.line_type,
+                                        color: run_color,
+                                    });
+                                } else {
+                                    push_line_stroke(
+                                        out,
+                                        points,
+                                        &row_points[start..end],
+                                        width,
+                                        rs.line_style,
+                                        rs.line_type,
+                                        run_color,
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some(segment) = segment {
+                                push_line_stroke(
+                                    out,
+                                    points,
+                                    &segment,
+                                    width,
+                                    rs.line_style,
+                                    rs.line_type,
+                                    color,
+                                );
+                            } else if rs.line_style == LineStyle::Solid {
                                 out.push(Prim::Polyline {
-                                    first_point: run_first,
-                                    point_count: (end - start) as u32,
+                                    first_point: first + run.start as u32,
+                                    point_count: run.len() as u32,
                                     width,
                                     style: LineStyle::Solid,
                                     line_type: rs.line_type,
-                                    color: run_color,
+                                    color,
                                 });
                             } else {
                                 push_line_stroke(
                                     out,
                                     points,
-                                    &row_points[start..end],
+                                    &row_points[run.clone()],
                                     width,
                                     rs.line_style,
                                     rs.line_type,
-                                    run_color,
+                                    color,
                                 );
                             }
-                        }
-                    }
-                    None => {
-                        if rs.line_style == LineStyle::Solid {
-                            out.push(Prim::Polyline {
-                                first_point: first,
-                                point_count: count,
-                                width,
-                                style: LineStyle::Solid,
-                                line_type: rs.line_type,
-                                color,
-                            });
-                        } else {
-                            push_line_stroke(
-                                out,
-                                points,
-                                &row_points,
-                                width,
-                                rs.line_style,
-                                rs.line_type,
-                                color,
-                            );
                         }
                     }
                 }
@@ -1039,7 +1337,7 @@ impl ChartEngine {
         scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
     ) {
         let plot = self.data.plot(rs.id);
-        let close = plot.column(PlotValueIndex::Close);
+        let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
         let rows = visible_line_rows(
             plot,
             from,
@@ -1057,56 +1355,66 @@ impl ChartEngine {
         let baseline_y = scale.price_to_coordinate(baseline_price, rs.base_value);
         let mut top_runs: Vec<Vec<[f32; 2]>> = Vec::new();
         let mut bottom_runs: Vec<Vec<[f32; 2]>> = Vec::new();
-        if let [row] = rows[..] {
-            // reference walkLine: a single visible item draws a horizontal segment one bar spacing
-            // wide, so the first traded minute of a session is visible (fill included).
-            let x = self
-                .time_scale
-                .index_to_coordinate(plot.index_at(row).expect("baseline row index"));
-            let y = scale.price_to_coordinate(close[row], rs.base_value);
-            let half = self.time_scale.bar_spacing() / 2.0;
-            let run = vec![
-                [((x - half) * hpr) as f32, (y * vpr) as f32],
-                [((x + half) * hpr) as f32, (y * vpr) as f32],
-            ];
-            if y < baseline_y {
-                top_runs.push(run);
-            } else {
-                bottom_runs.push(run);
-            }
-        }
-        for pair in rows.windows(2) {
-            let a_row = pair[0];
-            let b_row = pair[1];
-            let a = (
-                self.time_scale
-                    .index_to_coordinate(plot.index_at(a_row).expect("baseline row index")),
-                scale.price_to_coordinate(close[a_row], rs.base_value),
-            );
-            let b = (
-                self.time_scale
-                    .index_to_coordinate(plot.index_at(b_row).expect("baseline row index")),
-                scale.price_to_coordinate(close[b_row], rs.base_value),
-            );
-            let mut segments = vec![(a, b)];
-            if (a.1 < baseline_y) != (b.1 < baseline_y) && (b.1 - a.1).abs() > 1e-9 {
-                let t = (baseline_y - a.1) / (b.1 - a.1);
-                let crossing = (a.0 + (b.0 - a.0) * t, baseline_y);
-                segments = vec![(a, crossing), (crossing, b)];
-            }
-            for (s0, s1) in segments {
-                let above = (s0.1 + s1.1) * 0.5 < baseline_y;
-                let p0 = [(s0.0 * hpr) as f32, (s0.1 * vpr) as f32];
-                let p1 = [(s1.0 * hpr) as f32, (s1.1 * vpr) as f32];
-                let runs = if above {
-                    &mut top_runs
+        // Period breaks split the rows into independent runs (see `build_line_frame`): each run's
+        // first segment opens new quadrant runs, so no stroke or fill joins two runs.
+        for run in self.line_run_ranges(rs.id, plot, &rows, from, to) {
+            let rows = &rows[run];
+            if let [row] = rows[..] {
+                // reference walkLine: a single visible item draws a horizontal segment one bar
+                // spacing wide, so the first traded minute of a session is visible (fill included).
+                let x = self
+                    .time_scale
+                    .index_to_coordinate(plot.index_at(row).expect("baseline row index"));
+                let y = scale.price_to_coordinate(close(row), rs.base_value);
+                let half = self.time_scale.bar_spacing() / 2.0;
+                let run = vec![
+                    [((x - half) * hpr) as f32, (y * vpr) as f32],
+                    [((x + half) * hpr) as f32, (y * vpr) as f32],
+                ];
+                if y < baseline_y {
+                    top_runs.push(run);
                 } else {
-                    &mut bottom_runs
-                };
-                if let Some(run) = runs.last_mut().filter(|run| run.last() == Some(&p0)) {
-                    run.push(p1);
-                } else {
-                    runs.push(vec![p0, p1]);
+                    bottom_runs.push(run);
+                }
+            }
+            let mut fresh = true;
+            for pair in rows.windows(2) {
+                let a_row = pair[0];
+                let b_row = pair[1];
+                let a = (
+                    self.time_scale
+                        .index_to_coordinate(plot.index_at(a_row).expect("baseline row index")),
+                    scale.price_to_coordinate(close(a_row), rs.base_value),
+                );
+                let b = (
+                    self.time_scale
+                        .index_to_coordinate(plot.index_at(b_row).expect("baseline row index")),
+                    scale.price_to_coordinate(close(b_row), rs.base_value),
+                );
+                let mut segments = vec![(a, b)];
+                if (a.1 < baseline_y) != (b.1 < baseline_y) && (b.1 - a.1).abs() > 1e-9 {
+                    let t = (baseline_y - a.1) / (b.1 - a.1);
+                    let crossing = (a.0 + (b.0 - a.0) * t, baseline_y);
+                    segments = vec![(a, crossing), (crossing, b)];
+                }
+                for (s0, s1) in segments {
+                    let above = (s0.1 + s1.1) * 0.5 < baseline_y;
+                    let p0 = [(s0.0 * hpr) as f32, (s0.1 * vpr) as f32];
+                    let p1 = [(s1.0 * hpr) as f32, (s1.1 * vpr) as f32];
+                    let runs = if above {
+                        &mut top_runs
+                    } else {
+                        &mut bottom_runs
+                    };
+                    if let Some(run) = runs
+                        .last_mut()
+                        .filter(|run| !fresh && run.last() == Some(&p0))
+                    {
+                        run.push(p1);
+                    } else {
+                        runs.push(vec![p0, p1]);
+                    }
+                    fresh = false;
                 }
             }
         }
@@ -1244,12 +1552,26 @@ impl ChartEngine {
         let mut above_offset = shape_margin;
         let mut below_offset = shape_margin;
 
+        let as_of = plot.is_as_of();
         for marker in &series.markers {
             let Some(candidate) = self.time_to_index(marker.time as f64, true) else {
                 continue;
             };
             let direction = if candidate < first_data_index {
                 MismatchDirection::NearestRight
+            } else if as_of {
+                // An as-of overlay's marker sits on the first point at or after its time: a row
+                // newer than every point waits for one, and a point left blank by the staleness
+                // bound hides it rather than moving it onto an earlier moment.
+                if self
+                    .data
+                    .merged_times()
+                    .get(candidate as usize)
+                    .is_none_or(|&time| time < marker.time)
+                {
+                    continue;
+                }
+                MismatchDirection::None
             } else {
                 MismatchDirection::NearestLeft
             };
@@ -1719,7 +2041,12 @@ impl ChartEngine {
                 continue;
             };
             for time in &member.times {
-                let Ok(row) = times.binary_search(time) else {
+                // A selected row is anchored where it is plotted (an as-of row may be hidden).
+                let Some(row) = times
+                    .binary_search(time)
+                    .ok()
+                    .and_then(|row| plot.row_for_source(row))
+                else {
                     continue;
                 };
                 if plot.is_whitespace_row(row) {

@@ -4,6 +4,10 @@
 //!
 //! Rows are keyed by *time-point index* (position in the merged time scale), which may be
 //! sparse when a series has whitespace. All searches are binary over the sorted index column.
+//!
+//! A plot row is the canonical row of the same position, except for as-of time-aligned series
+//! (and outputs aliasing them): their plot rows are merged time points, and a non-decreasing
+//! source-row map names the canonical row each one shows.
 
 use std::collections::HashMap;
 
@@ -62,6 +66,9 @@ enum PlotIndices {
 #[derive(Default)]
 pub struct PlotList {
     indices: PlotIndices,
+    /// As-of time alignment: the canonical row each plot row shows (non-decreasing, one entry
+    /// per plot row). `None` is the identity used by every union-timed series.
+    source_rows: Option<Vec<u32>>,
     /// (plot, chunk_index) -> chunk min/max. Cleared on set_data.
     min_max_cache: HashMap<(usize, i64), Option<MinMax>>,
 }
@@ -72,24 +79,77 @@ pub struct PlotList {
 pub enum PlotValues<'a> {
     Single(&'a [f64]),
     Ohlc([&'a [f64]; 4]),
+    /// Canonical columns read through an as-of time-alignment row map: plot row `r` shows
+    /// canonical row `rows[r]`, so one source row may back several consecutive plot rows.
+    AsOf {
+        columns: [&'a [f64]; 4],
+        rows: &'a [u32],
+    },
 }
 
 impl<'a> PlotValues<'a> {
+    /// The canonical column. For [`PlotValues::AsOf`] it is indexed by source row
+    /// ([`Self::source_row`]), not by plot row; [`Self::value_at`] resolves both.
     pub fn column(self, plot: PlotValueIndex) -> &'a [f64] {
+        self.columns()[plot as usize]
+    }
+
+    /// Canonical columns in [`PlotValueIndex`] order.
+    pub fn columns(self) -> [&'a [f64]; 4] {
         match self {
-            Self::Single(values) => values,
-            Self::Ohlc(values) => values[plot as usize],
+            Self::Single(values) => [values, values, values, values],
+            Self::Ohlc(columns) | Self::AsOf { columns, .. } => columns,
         }
     }
 
-    fn value_at(self, row: usize, plot: PlotValueIndex) -> f64 {
-        self.column(plot)[row]
+    /// Number of plot rows these values back.
+    pub fn len(self) -> usize {
+        match self {
+            Self::Single(values) => values.len(),
+            Self::Ohlc(columns) => columns[3].len(),
+            Self::AsOf { rows, .. } => rows.len(),
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Canonical row shown by plot row `row` (the identity unless as-of aligned).
+    pub fn source_row(self, row: usize) -> usize {
+        match self {
+            Self::AsOf { rows, .. } => rows[row] as usize,
+            Self::Single(_) | Self::Ohlc(_) => row,
+        }
+    }
+
+    pub fn value_at(self, row: usize, plot: PlotValueIndex) -> f64 {
+        match self {
+            Self::Single(values) => values[row],
+            Self::Ohlc(columns) => columns[plot as usize][row],
+            Self::AsOf { columns, rows } => columns[plot as usize][rows[row] as usize],
+        }
     }
 
     pub(crate) fn is_whitespace_row(self, row: usize) -> bool {
         match self {
             Self::Single(values) => values[row].is_nan(),
             Self::Ohlc(values) => values.iter().all(|column| column[row].is_nan()),
+            Self::AsOf { columns, rows } => {
+                let row = rows[row] as usize;
+                columns.iter().all(|column| column[row].is_nan())
+            }
+        }
+    }
+
+    /// Canonical values viewed through an optional as-of row map.
+    pub(crate) fn with_rows(self, rows: Option<&'a [u32]>) -> Self {
+        match rows {
+            Some(rows) => Self::AsOf {
+                columns: self.columns(),
+                rows,
+            },
+            None => self,
         }
     }
 }
@@ -104,10 +164,11 @@ pub struct PlotListView<'a> {
 }
 
 impl<'a> PlotListView<'a> {
+    /// Join canonical `values` to `list`; an as-of list reads them through its row map.
     pub fn new(list: &'a PlotList, values: PlotValues<'a>) -> Self {
         Self {
             list,
-            values,
+            values: values.with_rows(list.source_rows()),
             lod: None,
         }
     }
@@ -119,8 +180,41 @@ impl<'a> PlotListView<'a> {
     ) -> Self {
         Self {
             list,
-            values,
+            values: values.with_rows(list.source_rows()),
             lod: Some(lod),
+        }
+    }
+
+    /// Canonical row shown by plot row `row`: the identity except for as-of aligned series,
+    /// whose consecutive plot rows may repeat one source row.
+    pub fn source_row(self, row: usize) -> usize {
+        self.values.source_row(row)
+    }
+
+    /// First plot row showing canonical row `source_row`, if that row is shown at all (an as-of
+    /// row collapsed into a later row's time point, or past the aligned extent, is not).
+    pub fn row_for_source(self, source_row: usize) -> Option<usize> {
+        match self.list.source_rows() {
+            None => (source_row < self.size()).then_some(source_row),
+            Some(rows) => {
+                let row = rows.partition_point(|&row| (row as usize) < source_row);
+                (rows.get(row).is_some_and(|&row| row as usize == source_row)).then_some(row)
+            }
+        }
+    }
+
+    /// Whether plot rows map through an as-of time-alignment row map.
+    pub fn is_as_of(self) -> bool {
+        self.list.source_rows().is_some()
+    }
+
+    /// Canonical rows spanned by the plot rows `rows`, each once: the identity unless as-of,
+    /// where repeated points collapse and rows collapsed between two points are included.
+    pub fn source_range(self, rows: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        match self.list.source_rows() {
+            None => rows,
+            Some(_) if rows.is_empty() => 0..0,
+            Some(map) => map[rows.start] as usize..map[rows.end - 1] as usize + 1,
         }
     }
 
@@ -153,6 +247,8 @@ impl<'a> PlotListView<'a> {
         self.list.indices()
     }
 
+    /// The canonical column, indexed by [`Self::source_row`] (plot rows index it directly unless
+    /// the series is as-of aligned); prefer [`Self::value_at`] for plot rows.
     pub fn column(self, plot: PlotValueIndex) -> &'a [f64] {
         self.values.column(plot)
     }
@@ -246,13 +342,178 @@ impl PlotList {
             "indices must be sorted unique"
         );
         self.indices = dense_or_sparse(indices);
+        self.source_rows = None;
         self.min_max_cache.clear();
+    }
+
+    /// The as-of row map (plot row -> canonical row), or `None` for the identity.
+    pub(crate) fn source_rows(&self) -> Option<&[u32]> {
+        self.source_rows.as_deref()
+    }
+
+    /// Canonical row shown by plot row `row`.
+    pub fn source_row(&self, row: usize) -> usize {
+        self.source_rows
+            .as_ref()
+            .map_or(row, |rows| rows[row] as usize)
+    }
+
+    /// Number of plot rows showing canonical rows before `row`.
+    pub(crate) fn rows_before_source(&self, row: usize) -> usize {
+        match &self.source_rows {
+            None => row.min(self.size()),
+            Some(rows) => rows.partition_point(|&source| (source as usize) < row),
+        }
+    }
+
+    /// Plot rows showing canonical row `row` (empty when it is not shown).
+    pub(crate) fn plot_rows_for_source(&self, row: usize) -> std::ops::Range<usize> {
+        match &self.source_rows {
+            None if row < self.size() => row..row + 1,
+            None => row..row,
+            Some(rows) => {
+                rows.partition_point(|&source| (source as usize) < row)
+                    ..rows.partition_point(|&source| source as usize <= row)
+            }
+        }
+    }
+
+    /// Rebuild an as-of mapping over the merged points `[0, through)`: each point shows the last
+    /// canonical row (`times` ascending) at or before its time, provided that row is at most
+    /// `max_staleness` seconds older than the point. Points before the first row, or past the
+    /// staleness bound, stay empty. `O(through + rows)`.
+    pub(crate) fn rebuild_as_of(
+        &mut self,
+        merged_times: &[i64],
+        through: usize,
+        times: &[i64],
+        max_staleness: Option<i64>,
+    ) {
+        // Start from `Empty` so a contiguous mapping lands in the allocation-free dense form.
+        self.indices = PlotIndices::Empty;
+        self.source_rows.get_or_insert_with(Vec::new).clear();
+        self.extend_as_of(merged_times, 0, through, times, max_staleness);
+        self.min_max_cache.clear();
+    }
+
+    /// Re-derive the as-of rows of the merged points `[from, through)` after a change that
+    /// leaves every earlier point's source row intact (a new tail point, a moved data extent, or
+    /// a new canonical row at or after `merged_times[from]`). Returns the first plot row that
+    /// may differ; the work is proportional to the rewritten tail.
+    pub(crate) fn resync_as_of_tail(
+        &mut self,
+        merged_times: &[i64],
+        from: usize,
+        through: usize,
+        times: &[i64],
+        max_staleness: Option<i64>,
+    ) -> usize {
+        debug_assert!(self.source_rows.is_some(), "not an as-of mapping");
+        let keep = self.lowerbound(from as TimePointIndex);
+        let old = (self.index_at(keep), self.last_index());
+        self.truncate_plot_rows(keep);
+        self.extend_as_of(merged_times, from, through, times, max_staleness);
+        self.invalidate_tail_chunks(keep, old);
+        keep
+    }
+
+    fn extend_as_of(
+        &mut self,
+        merged_times: &[i64],
+        from: usize,
+        through: usize,
+        times: &[i64],
+        max_staleness: Option<i64>,
+    ) {
+        let through = through.min(merged_times.len());
+        if from >= through {
+            return;
+        }
+        let mut row = times.partition_point(|&time| time < merged_times[from]);
+        for (index, &point) in merged_times.iter().enumerate().take(through).skip(from) {
+            while times.get(row).is_some_and(|&time| time <= point) {
+                row += 1;
+            }
+            let Some(source) = row.checked_sub(1) else {
+                continue;
+            };
+            if max_staleness.is_some_and(|max| point.saturating_sub(times[source]) > max) {
+                continue;
+            }
+            self.push_plot_row(index as TimePointIndex, source);
+        }
+    }
+
+    fn push_plot_row(&mut self, index: TimePointIndex, source: usize) {
+        match &mut self.indices {
+            PlotIndices::Empty => {
+                self.indices = PlotIndices::Dense {
+                    start: index,
+                    len: 1,
+                }
+            }
+            PlotIndices::Dense { start, len } if *start + *len as i64 == index => *len += 1,
+            PlotIndices::Dense { start, len } => {
+                let mut indices = (*start..*start + *len as i64).collect::<Vec<_>>();
+                indices.push(index);
+                self.indices = PlotIndices::Sparse(indices);
+            }
+            PlotIndices::Sparse(indices) => indices.push(index),
+        }
+        debug_assert!(u32::try_from(source).is_ok(), "source row exceeds u32");
+        self.source_rows
+            .get_or_insert_with(Vec::new)
+            .push(source as u32);
+    }
+
+    fn truncate_plot_rows(&mut self, len: usize) {
+        match &mut self.indices {
+            PlotIndices::Empty => {}
+            PlotIndices::Dense { len: current, .. } => {
+                if len == 0 {
+                    self.indices = PlotIndices::Empty;
+                } else {
+                    *current = (*current).min(len);
+                }
+            }
+            PlotIndices::Sparse(indices) => indices.truncate(len),
+        }
+        if let Some(rows) = &mut self.source_rows {
+            rows.truncate(len);
+        }
+    }
+
+    /// Drop cached autoscale chunks of a rewritten tail: from the first rewritten row's old or
+    /// new index through the old or new last index.
+    fn invalidate_tail_chunks(
+        &mut self,
+        keep: usize,
+        (old_first, old_last): (Option<TimePointIndex>, Option<TimePointIndex>),
+    ) {
+        if keep == 0 {
+            self.min_max_cache.clear();
+            return;
+        }
+        let first = [old_first, self.index_at(keep)].into_iter().flatten().min();
+        let last = [old_last, self.last_index()].into_iter().flatten().max();
+        if let (Some(first), Some(last)) = (first, last) {
+            self.invalidate_index_chunks(first, last);
+        }
+    }
+
+    fn invalidate_index_chunks(&mut self, first: TimePointIndex, last: TimePointIndex) {
+        for chunk in first.div_euclid(CHUNK_SIZE)..=last.div_euclid(CHUNK_SIZE) {
+            for plot in 0..4 {
+                self.min_max_cache.remove(&(plot, chunk));
+            }
+        }
     }
 
     /// Reindex canonical columns while retaining the plot's high-water allocation. Full data
     /// installs and retention trims call this repeatedly; replacing the vectors would fragment
     /// the WASM allocator even though the retained row count is bounded.
     pub(crate) fn rebuild_from(&mut self, merged_times: &[i64], times: &[i64]) {
+        self.source_rows = None;
         if times.is_empty() {
             self.indices = PlotIndices::Empty;
             self.min_max_cache.clear();
@@ -288,38 +549,108 @@ impl PlotList {
         self.min_max_cache.clear();
     }
 
-    pub(crate) fn copy_range_from(&mut self, source: &Self, offset: usize, len: usize) {
-        debug_assert!(offset + len <= source.size());
-        self.indices = match &source.indices {
-            PlotIndices::Empty => PlotIndices::Empty,
-            PlotIndices::Dense { start, .. } => {
-                if len == 0 {
-                    PlotIndices::Empty
-                } else {
-                    PlotIndices::Dense {
-                        start: *start + offset as i64,
-                        len,
+    /// Alias the plot rows of `source` that show its canonical rows `[offset, offset + len)`.
+    /// For a union source those are the same rows; an as-of source contributes the plot rows
+    /// showing them, with its row map shifted onto this series' own rows.
+    ///
+    /// `unchanged` is how many of the source's leading plot rows the caller knows kept their
+    /// mapping since this list was last copied from it with the same `offset` (0 = unknown). An
+    /// as-of copy rewrites only the rows after them, so a live tail stays proportional to the
+    /// change. Returns the first plot row of this list that may differ.
+    pub(crate) fn copy_range_from(
+        &mut self,
+        source: &Self,
+        offset: usize,
+        len: usize,
+        unchanged: usize,
+    ) -> usize {
+        let Some(rows) = source.source_rows.as_deref() else {
+            debug_assert!(offset + len <= source.size());
+            self.source_rows = None;
+            self.indices = match &source.indices {
+                PlotIndices::Empty => PlotIndices::Empty,
+                PlotIndices::Dense { start, .. } => {
+                    if len == 0 {
+                        PlotIndices::Empty
+                    } else {
+                        PlotIndices::Dense {
+                            start: *start + offset as i64,
+                            len,
+                        }
                     }
                 }
-            }
-            PlotIndices::Sparse(indices) => dense_or_sparse(indices[offset..offset + len].to_vec()),
+                PlotIndices::Sparse(indices) => {
+                    dense_or_sparse(indices[offset..offset + len].to_vec())
+                }
+            };
+            self.min_max_cache.clear();
+            return 0;
         };
-        self.min_max_cache.clear();
+        let first = rows.partition_point(|&row| (row as usize) < offset);
+        let end = rows.partition_point(|&row| (row as usize) < offset.saturating_add(len));
+        let count = end - first;
+        let keep = if self.source_rows.is_some() {
+            unchanged.saturating_sub(first).min(self.size()).min(count)
+        } else {
+            0
+        };
+        debug_assert!(
+            (0..keep).all(|row| self.index_at(row) == source.index_at(first + row)
+                && self.source_row(row) + offset == rows[first + row] as usize),
+            "as-of alias prefix changed without a full copy"
+        );
+        let old = (self.index_at(keep), self.last_index());
+        self.indices = match &source.indices {
+            PlotIndices::Empty => PlotIndices::Empty,
+            _ if count == 0 => PlotIndices::Empty,
+            PlotIndices::Dense { start, .. } => PlotIndices::Dense {
+                start: *start + first as i64,
+                len: count,
+            },
+            PlotIndices::Sparse(indices) => {
+                let mut target = match std::mem::take(&mut self.indices) {
+                    PlotIndices::Sparse(target) => target,
+                    PlotIndices::Dense { start, len } if keep > 0 => {
+                        (start..start + len as i64).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                target.truncate(keep);
+                target.extend_from_slice(&indices[first + keep..end]);
+                PlotIndices::Sparse(target)
+            }
+        };
+        let mut map = self.source_rows.take().unwrap_or_default();
+        map.truncate(keep);
+        map.extend(
+            rows[first + keep..end]
+                .iter()
+                .map(|&row| row - offset as u32),
+        );
+        self.source_rows = Some(map);
+        self.invalidate_tail_chunks(keep, old);
+        keep
     }
 
-    /// Drop the cached autoscale chunk holding `row` after an in-place value correction. The
-    /// row-to-index mapping is unchanged, so no other chunk or mapping state is touched.
-    pub(crate) fn invalidate_row(&mut self, row: usize) {
-        if let Some(index) = self.index_at(row) {
-            let chunk = index.div_euclid(CHUNK_SIZE);
-            for plot in 0..4 {
-                self.min_max_cache.remove(&(plot, chunk));
+    /// Drop the cached autoscale chunks showing canonical `row` after an in-place value
+    /// correction. The row-to-index mapping is unchanged, so no other chunk or mapping state is
+    /// touched. Returns the plot rows showing it.
+    pub(crate) fn invalidate_row(&mut self, row: usize) -> std::ops::Range<usize> {
+        let rows = self.plot_rows_for_source(row);
+        if let (Some(first), Some(last)) = (
+            self.index_at(rows.start),
+            rows.end.checked_sub(1).and_then(|row| self.index_at(row)),
+        ) {
+            if !rows.is_empty() {
+                self.invalidate_index_chunks(first, last);
             }
         }
+        rows
     }
 
     /// Streaming append/replace of the last row (the `update()` hot path).
     pub fn upsert_last(&mut self, index: TimePointIndex) {
+        debug_assert!(self.source_rows.is_none(), "as-of rows resync their tail");
         match self.last_index() {
             Some(last) if index == last => {
                 // invalidate the chunk containing this row
@@ -392,14 +723,22 @@ impl PlotList {
     }
 
     pub(crate) fn index_bytes(&self) -> usize {
-        match &self.indices {
+        let rows = self
+            .source_rows
+            .as_ref()
+            .map_or(0, |rows| rows.len() * std::mem::size_of::<u32>());
+        rows + match &self.indices {
             PlotIndices::Sparse(indices) => indices.len() * std::mem::size_of::<TimePointIndex>(),
             PlotIndices::Empty | PlotIndices::Dense { .. } => 0,
         }
     }
 
     pub(crate) fn index_capacity_bytes(&self) -> usize {
-        match &self.indices {
+        let rows = self
+            .source_rows
+            .as_ref()
+            .map_or(0, |rows| rows.capacity() * std::mem::size_of::<u32>());
+        rows + match &self.indices {
             PlotIndices::Sparse(indices) => {
                 indices.capacity() * std::mem::size_of::<TimePointIndex>()
             }
@@ -452,11 +791,15 @@ impl PlotList {
             return None;
         }
 
+        // Canonical values read through an as-of map; moved out so the cache can be mutated.
+        let rows = self.source_rows.take();
+        let values = values.with_rows(rows.as_deref());
         let mut result: Option<MinMax> = None;
         for &plot in plots {
             let plot_min_max = self.min_max_on_range_cached_impl(values, start, end, plot);
             result = merge_min_max(result, plot_min_max);
         }
+        self.source_rows = rows;
         result
     }
 
@@ -510,26 +853,32 @@ impl PlotList {
         if start_row >= end_row {
             return None;
         }
-        let mut result: Option<MinMax> = None;
         let col = values.column(match plot {
             0 => PlotValueIndex::Open,
             1 => PlotValueIndex::High,
             2 => PlotValueIndex::Low,
             _ => PlotValueIndex::Close,
         });
-        for &v in &col[start_row..end_row] {
+        let fold = |result: Option<MinMax>, v: f64| {
             if v.is_nan() {
-                continue;
+                return result;
             }
-            result = Some(match result {
+            Some(match result {
                 None => MinMax { min: v, max: v },
                 Some(mm) => MinMax {
                     min: mm.min.min(v),
                     max: mm.max.max(v),
                 },
-            });
+            })
+        };
+        match values {
+            PlotValues::AsOf { rows, .. } => rows[start_row..end_row]
+                .iter()
+                .fold(None, |result, &row| fold(result, col[row as usize])),
+            PlotValues::Single(_) | PlotValues::Ohlc(_) => col[start_row..end_row]
+                .iter()
+                .fold(None, |result, &v| fold(result, v)),
         }
-        result
     }
 
     fn min_max_on_range_cached_impl(

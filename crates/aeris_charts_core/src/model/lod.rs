@@ -35,11 +35,9 @@ impl LodSummary {
         let Ok(row) = u32::try_from(row) else {
             return Self::EMPTY;
         };
-        let row_usize = row as usize;
-        let columns = match values {
-            PlotValues::Single(column) => [column, column, column, column],
-            PlotValues::Ohlc(columns) => columns,
-        };
+        // Summaries name plot rows; an as-of plot row reads the canonical row it shows.
+        let row_usize = values.source_row(row as usize);
+        let columns = values.columns();
         if columns.iter().all(|column| column[row_usize].is_nan()) {
             return Self::EMPTY;
         }
@@ -67,12 +65,11 @@ impl LodSummary {
         if other.first == NO_ROW {
             return self;
         }
-        let low = values.column(PlotValueIndex::Low);
-        let high = values.column(PlotValueIndex::High);
+        let value = |plot: PlotValueIndex, row: u32| values.value_at(row as usize, plot);
         let low_row = match (self.low, other.low) {
             (NO_ROW, row) | (row, NO_ROW) => row,
             (left, right) => {
-                if low[right as usize] < low[left as usize] {
+                if value(PlotValueIndex::Low, right) < value(PlotValueIndex::Low, left) {
                     right
                 } else {
                     left
@@ -82,18 +79,17 @@ impl LodSummary {
         let high_row = match (self.high, other.high) {
             (NO_ROW, row) | (row, NO_ROW) => row,
             (left, right) => {
-                if high[right as usize] > high[left as usize] {
+                if value(PlotValueIndex::High, right) > value(PlotValueIndex::High, left) {
                     right
                 } else {
                     left
                 }
             }
         };
-        let close = values.column(PlotValueIndex::Close);
         let close_min = match (self.close_min, other.close_min) {
             (NO_ROW, row) | (row, NO_ROW) => row,
             (left, right) => {
-                if close[right as usize] < close[left as usize] {
+                if value(PlotValueIndex::Close, right) < value(PlotValueIndex::Close, left) {
                     right
                 } else {
                     left
@@ -103,7 +99,7 @@ impl LodSummary {
         let close_max = match (self.close_max, other.close_max) {
             (NO_ROW, row) | (row, NO_ROW) => row,
             (left, right) => {
-                if close[right as usize] > close[left as usize] {
+                if value(PlotValueIndex::Close, right) > value(PlotValueIndex::Close, left) {
                     right
                 } else {
                     left
@@ -191,7 +187,7 @@ impl LodPyramid {
     }
 
     pub(crate) fn rebuild(&mut self, values: PlotValues<'_>) {
-        let len = values.column(PlotValueIndex::Close).len();
+        let len = values.len();
         if len > NO_ROW as usize {
             self.levels.clear();
             return;
@@ -208,7 +204,7 @@ impl LodPyramid {
         values: PlotValues<'_>,
         affected: Range<usize>,
     ) -> LodUpdateStats {
-        let len = values.column(PlotValueIndex::Close).len();
+        let len = values.len();
         if len > NO_ROW as usize {
             self.levels.clear();
             return LodUpdateStats::default();
@@ -291,7 +287,7 @@ impl LodPyramidView<'_> {
     /// most `LOD_FANOUT - 1` raw rows or summary nodes per hierarchy level, so trailing
     /// whitespace cannot turn a latest/predecessor query into a history-length scan.
     pub fn last_row_before(self, end: usize) -> Option<usize> {
-        let len = self.values.column(PlotValueIndex::Close).len();
+        let len = self.values.len();
         let mut position = end.min(len);
         while position > 0 {
             let mut selected = None;
@@ -349,7 +345,7 @@ impl LodPyramidView<'_> {
         range: Range<usize>,
         selected_level: usize,
     ) -> (LodRows, LodQueryStats) {
-        let len = self.values.column(PlotValueIndex::Close).len();
+        let len = self.values.len();
         let mut position = range.start.min(len);
         let end = range.end.min(len);
         let selected_level = selected_level.min(self.pyramid.levels.len());

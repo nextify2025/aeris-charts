@@ -1976,15 +1976,48 @@ fn xy_line_preserves_gaps_hits_rows_and_shared_frame_geometry() {
         "missing rows must split the line rather than bridging the gap"
     );
 
-    let line_primitives = frame.panes[pane]
+    // The dashed curve reaches executors as solid straight dash runs of the expanded curve (the
+    // WebGPU stroker has no dash concept), and no run bridges the missing row.
+    let line_color = Color::rgb(0x33, 0x66, 0x99);
+    let dash_runs = frame.panes[pane]
         .main
         .iter()
-        .filter(|primitive| matches!(primitive, Prim::Polyline { point_count: 2, .. }))
-        .count();
-    assert_eq!(line_primitives, 2);
-    assert!(frame.panes[pane].main.iter().any(|primitive| {
-        matches!(primitive, Prim::Polyline { width, .. } if (*width - 4.0).abs() < f32::EPSILON)
-    }));
+        .filter_map(|primitive| match primitive {
+            Prim::Polyline {
+                first_point,
+                point_count,
+                width,
+                style,
+                line_type,
+                color,
+            } if *color == line_color => {
+                assert_eq!((*style, *line_type), (LineStyle::Solid, LineType::Simple));
+                assert!((*width - 4.0).abs() < f32::EPSILON);
+                Some(
+                    frame.panes[pane].points
+                        [*first_point as usize..(*first_point + *point_count) as usize]
+                        .iter()
+                        .map(|point| f64::from(point[0]))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(dash_runs.len() > 4, "{} dash runs", dash_runs.len());
+    // Frame x is shifted by the left axis strip; the curve starts at the first row.
+    let shift = dash_runs[0][0] - geometry[0].x;
+    let within = |xs: &[f64], from: usize, to: usize| {
+        xs.iter()
+            .all(|&x| x >= geometry[from].x + shift - 1.0 && x <= geometry[to].x + shift + 1.0)
+    };
+    assert!(
+        dash_runs
+            .iter()
+            .all(|xs| within(xs, 0, 1) || within(xs, 2, 3)),
+        "missing rows must split the line rather than bridging the gap"
+    );
+    assert!(dash_runs.iter().any(|xs| within(xs, 2, 3)));
     assert_eq!(
         frame.panes[pane]
             .main
@@ -1994,16 +2027,6 @@ fn xy_line_preserves_gaps_hits_rows_and_shared_frame_geometry() {
         8,
         "each valid path row must emit one two-triangle diamond above the stroke"
     );
-    assert!(frame.panes[pane].main.iter().any(|primitive| {
-        matches!(
-            primitive,
-            Prim::Polyline {
-                style: LineStyle::Dashed,
-                line_type: LineType::Curved,
-                ..
-            }
-        )
-    }));
     assert!(frame.panes[pane]
         .main
         .iter()
@@ -10360,21 +10383,21 @@ fn middle_trend_label_gap_shrinks_to_the_caret_then_expands_with_text() {
     );
     assert!(prompt_color.a() < 0xff);
 
-    chart.set_editing_drawing(Some(id));
+    assert!(chart.begin_drawing_text_edit(id));
     let editing_empty = orange_segments(&mut chart);
     assert_eq!(editing_empty.len(), 2);
     assert!(
         gap_width(&editing_empty) < gap_width(&hovered),
         "clicking the prompt must shrink its opening to the one-character caret slot"
     );
-    assert!(chart.drawing_apply_options(id, r#"{"text":"typing"}"#));
+    assert!(chart.set_drawing_edit_text("typing"));
     let typing = orange_segments(&mut chart);
     assert_eq!(typing.len(), 2);
     assert!(
         gap_width(&typing) > gap_width(&editing_empty),
         "measured typed text must expand the opening"
     );
-    chart.set_editing_drawing(None);
+    assert!(chart.end_drawing_text_edit(true));
     chart.set_hovered_text(None);
     assert_eq!(orange_segments(&mut chart), typing);
 }
@@ -10561,12 +10584,12 @@ fn text_tool_selection_paints_a_focus_border_without_anchor_handles() {
         })
         .expect("hovered trend placeholder");
     assert_eq!(placeholder.a(), 0x99);
-    chart.set_editing_drawing(Some(line));
+    assert!(chart.begin_drawing_text_edit(line));
     assert!(chart.build_frame().panes[0]
         .main
         .iter()
         .all(|prim| !matches!(prim, Prim::RotatedText { text, .. } if text == "+ Add text")));
-    chart.set_editing_drawing(None);
+    assert!(chart.end_drawing_text_edit(true));
     chart.set_hovered_text(None);
     chart.set_hovered_text(Some(text));
     assert_eq!(chart.hovered_text(), Some(text));
@@ -10596,14 +10619,14 @@ fn text_tool_selection_paints_a_focus_border_without_anchor_handles() {
 
     // While the typing-mode editor owns the drawing, the engine still paints the focus
     // border (the host wrap is borderless) — the wrap's border is not a second outline.
-    chart.set_editing_drawing(Some(text));
+    assert!(chart.begin_drawing_text_edit(text));
     let editing = border_frames(&mut chart);
     assert_eq!(editing.len(), 1, "focus border stays while editing");
     assert_eq!(
         editing[0].0, selected[0].0,
         "edit does not move the focus border"
     );
-    chart.set_editing_drawing(None);
+    assert!(chart.end_drawing_text_edit(true));
 
     // The trend line keeps its anchor handles on selection (border discs + fill discs).
     chart.set_selected_drawing(Some(line));

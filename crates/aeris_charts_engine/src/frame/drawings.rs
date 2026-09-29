@@ -12,11 +12,14 @@
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, LineStyle, LineType, Prim, TextAlign};
 
+use super::series_geometry::{push_clipped_stroke, push_styled_stroke};
 use super::{POSITION_ENTRY, PRIMARY};
+use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
 use crate::drawings::{
-    resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
-    DrawingHandleMode, DrawingId, DrawingKind, DrawingTextHAlign, PositionGeometry, PositionZone,
-    TEXT_CHROME_PAD, TEXT_PAD, TREND_TEXT_PLACEHOLDER,
+    cap_radius, resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
+    DrawingHandleMode, DrawingId, DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign,
+    DrawingTextLayout, PartContext, PositionGeometry, PositionZone, TEXT_CHROME_PAD, TEXT_PAD,
+    TREND_TEXT_PLACEHOLDER,
 };
 use crate::ChartEngine;
 use aeris_charts_core::model::plot_list::PlotValueIndex;
@@ -43,28 +46,48 @@ fn point_on_segment(a: (f64, f64), b: (f64, f64), t: f64) -> (f64, f64) {
     (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
 }
 
+/// A crisp line's `[from, to]` span (either order) clamped to `pane` in whole pixels, `None` when
+/// it misses the pane. Executors dash a crisp line from its start, so a start clamped into the
+/// pane moves back to a whole dash period from the unclamped start and keeps the pattern's phase;
+/// the executors' dash loops stay bounded by the pane.
+fn crisp_span(
+    from: f64,
+    to: f64,
+    (low, high): (f64, f64),
+    width: i32,
+    style: LineStyle,
+) -> Option<(i32, i32)> {
+    let (start, end) = (from.min(to).round(), from.max(to).round());
+    if !(start <= high && end >= low) {
+        return None;
+    }
+    let period: f64 = style
+        .dash_pattern(width as f32)
+        .iter()
+        .copied()
+        .map(f64::from)
+        .sum();
+    let clamped = if start < low && period > 0.0 {
+        low - (low - start).rem_euclid(period)
+    } else {
+        start.max(low)
+    };
+    Some((clamped.round() as i32, end.min(high) as i32))
+}
+
+/// A core segment stroke; a dashed or dotted one reaches executors as solid dash runs clipped to
+/// `pane` ([`push_styled_stroke`]).
 fn push_segment(
     a: (f64, f64),
     b: (f64, f64),
-    drawing: &Drawing,
-    color: Color,
-    vpr: f64,
+    (stroke, pane): ((f32, LineStyle, Color), aeris_charts_render::shape::Rect),
     out: &mut Vec<Prim>,
     points: &mut Vec<[f32; 2]>,
 ) {
     if (a.0 - b.0).abs() <= f64::EPSILON && (a.1 - b.1).abs() <= f64::EPSILON {
         return;
     }
-    let first_point = points.len() as u32;
-    points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
-    out.push(Prim::Polyline {
-        first_point,
-        point_count: 2,
-        width: (drawing.width * vpr) as f32,
-        style: drawing.style,
-        line_type: LineType::Simple,
-        color,
-    });
+    push_styled_stroke(out, points, &[a, b], LineType::Simple, stroke, pane);
 }
 
 fn push_drawing_cap(
@@ -86,7 +109,7 @@ fn push_drawing_cap(
     }
     let ux = dx / distance;
     let uy = dy / distance;
-    let radius = (width * 1.75).max(3.0);
+    let radius = cap_radius(width);
     match cap {
         crate::DrawingLineCap::Circle => out.push(Prim::Circle {
             cx: endpoint.0 as f32,
@@ -207,14 +230,14 @@ impl ChartEngine {
         }
         (drawing.kind == DrawingKind::TrendLine
             && self.hovered_text == Some(drawing.id)
-            && self.editing_drawing != Some(drawing.id))
+            && self.editing_drawing() != Some(drawing.id))
         .then_some((TREND_TEXT_PLACEHOLDER, true))
     }
 
     /// Width source for the middle-line cutout. Hover reserves the full prompt; once editing
     /// begins, an empty value uses the editor's one-em caret opening and measured text expands it.
     fn drawing_frame_gap_text<'a>(&self, drawing: &'a Drawing) -> Option<&'a str> {
-        if drawing.kind == DrawingKind::TrendLine && self.editing_drawing == Some(drawing.id) {
+        if drawing.kind == DrawingKind::TrendLine && self.editing_drawing() == Some(drawing.id) {
             return Some(drawing.display_text());
         }
         if !drawing.text.is_empty() {
@@ -382,22 +405,38 @@ impl ChartEngine {
                         anchors.push(preview);
                     }
                 }
+                // Families that resolve partial anchors preview from the second anchor on.
+                let partial = anchors.len() >= 2
+                    && pending
+                        .drawing
+                        .kind
+                        .spec()
+                        .family
+                        .is_some_and(|family| family.partial_preview);
                 let ready = if is_sequence {
                     anchors.len() >= pending.drawing.kind.anchor_count()
                 } else {
-                    anchors.len() == pending.drawing.kind.anchor_count()
+                    anchors.len() == pending.drawing.kind.anchor_count() || partial
                 };
                 if ready {
                     let px: Option<Vec<(f64, f64)>> = anchors
                         .iter()
                         .map(|&point| {
-                            self.drawing_to_px_for(pane_index, pending.drawing.price_scale, point)
+                            self.drawing_anchor_px(
+                                pending.drawing.kind,
+                                pane_index,
+                                pending.drawing.price_scale,
+                                point,
+                            )
                         })
                         .collect();
-                    if let Some(px) = px {
+                    if let Some(media) = px {
                         let px: Vec<(f64, f64)> =
-                            px.into_iter().map(|(x, y)| (x * hpr, y * vpr)).collect();
+                            media.iter().map(|&(x, y)| (x * hpr, y * vpr)).collect();
                         let mut preview_drawing = pending.drawing.clone();
+                        // Family stats and angles measure the previewed geometry, not only the
+                        // anchors placed so far.
+                        preview_drawing.points.clone_from(&anchors);
                         if preview_drawing.kind.spec().handles == DrawingHandleMode::RectangleBounds
                         {
                             if let Some(fill) = preview_drawing.preview_fill_color.clone() {
@@ -417,19 +456,68 @@ impl ChartEngine {
                             // the public reference shows all eight anchors while the rectangle is being
                             // drawn (committed corner + live preview corner), not only after
                             // the commit.
-                            build_rectangle_handles(&px, vpr, self.anchor_fill(), out);
+                            let handles = handle_set(DrawingHandleMode::RectangleBounds, &px);
+                            build_handles(&handles, vpr, self.anchor_fill(), out);
                         } else {
-                            let committed = pending.drawing.points.len();
-                            build_anchor_handles(&px[..committed], vpr, self.anchor_fill(), out);
+                            // The placed anchors' handles, where the family paints them on the
+                            // previewed geometry (a regression's on its fitted line); derived
+                            // handles wait for the committed drawing.
+                            let placed = pending.drawing.points.len();
+                            let handles: Vec<(f64, f64)> = self
+                                .drawing_handle_set(&preview_drawing, &media)
+                                .into_iter()
+                                .filter(|handle| {
+                                    matches!(
+                                        handle.part,
+                                        crate::DrawingDragPart::Anchor(index) if index < placed
+                                    )
+                                })
+                                .map(|handle| (handle.point.0 * hpr, handle.point.1 * vpr))
+                                .collect();
+                            build_anchor_handles(&handles, vpr, self.anchor_fill(), out);
                         }
                     }
-                } else if anchors.len() == 1 {
-                    // A one-anchor kind awaiting its click, or a two-anchor kind before the
-                    // preview resolves: show the placed anchor as a handle alone.
-                    if let Some((x, y)) =
-                        self.drawing_to_px_for(pane_index, pending.drawing.price_scale, anchors[0])
-                    {
-                        build_anchor_handles(&[(x * hpr, y * vpr)], vpr, self.anchor_fill(), out);
+                } else if !anchors.is_empty() {
+                    // Fewer anchors than the tool needs: a two-anchor kind before the preview
+                    // resolves shows its first anchor as a handle alone; a tool of three or more
+                    // anchors between clicks also runs a guide polyline in the drawing's stroke
+                    // through its placed anchors to the pointer, so every click leaves visible
+                    // ink.
+                    let px: Option<Vec<(f64, f64)>> = anchors
+                        .iter()
+                        .map(|&point| {
+                            self.drawing_anchor_px(
+                                pending.drawing.kind,
+                                pane_index,
+                                pending.drawing.price_scale,
+                                point,
+                            )
+                            .map(|(x, y)| (x * hpr, y * vpr))
+                        })
+                        .collect();
+                    if let (Some(px), Some(pane)) = (px, self.panes.get(pane_index)) {
+                        if px.len() >= 2 {
+                            let clip = aeris_charts_render::shape::Rect {
+                                left: 0.0,
+                                top: pane.top * vpr,
+                                right: f64::from(pane_w_px),
+                                bottom: (pane.top + pane.height) * vpr,
+                            };
+                            push_clipped_stroke(
+                                out,
+                                points,
+                                &px,
+                                clip,
+                                (
+                                    (pending.drawing.width * vpr) as f32,
+                                    pending.drawing.style,
+                                    pending.drawing.stroke_color(),
+                                ),
+                                &mut Vec::new(),
+                            );
+                        }
+                        let placed = pending.drawing.points.len().clamp(1, px.len());
+                        build_anchor_handles(&px[..placed], vpr, self.anchor_fill(), out);
                     }
                 }
             }
@@ -489,25 +577,14 @@ impl ChartEngine {
             self.push_text_chrome(drawing, &px, pane_w_px, vpr, ANCHOR_BORDER, out);
             return;
         }
-        let Some(px) = self.overlay_drawing_px(pane_index, id, hpr, vpr) else {
+        let Some(px) = self.overlay_drawing_px(pane_index, id, 1.0, 1.0) else {
             return;
         };
-        match drawing.kind.spec().handles {
-            DrawingHandleMode::None => {}
-            DrawingHandleMode::RectangleBounds if px.len() == 2 => {
-                build_rectangle_handles(&px, vpr, self.anchor_fill(), out);
-            }
-            DrawingHandleMode::Position if px.len() == 3 => {
-                build_position_handles(&px, vpr, self.anchor_fill(), out);
-            }
-            DrawingHandleMode::Endpoints if !px.is_empty() => {
-                build_anchor_handles(&[px[0], px[px.len() - 1]], vpr, self.anchor_fill(), out);
-            }
-            DrawingHandleMode::Anchors | DrawingHandleMode::Endpoints => {
-                build_anchor_handles(&px, vpr, self.anchor_fill(), out);
-            }
-            DrawingHandleMode::RectangleBounds | DrawingHandleMode::Position => {}
+        let mut handles = self.drawing_handle_set(drawing, &px);
+        for handle in &mut handles {
+            handle.point = (handle.point.0 * hpr, handle.point.1 * vpr);
         }
+        build_handles(&handles, vpr, self.anchor_fill(), out);
     }
 
     /// The hovered text drawing's focus border at hover opacity (the public reference's hover ring):
@@ -559,11 +636,25 @@ impl ChartEngine {
             self.build_profile_drawing_prims(drawing, px, pane_w_px, vpr, out, points);
             return;
         }
-        let color = Color::parse_css(&drawing.color).unwrap_or(PRIMARY);
+        if drawing.kind.spec().family.is_some() {
+            self.build_family_prims(drawing, px, pane_w_px, vpr, out, points);
+            return;
+        }
+        let color = drawing.stroke_color();
         let crisp_width = (drawing.width * vpr).round().max(1.0) as i32;
         let Some(pane) = self.panes.get(drawing.pane_index) else {
             return;
         };
+        // Dashed and dotted strokes lower to solid dash runs clipped to the pane.
+        let stroke = (
+            ((drawing.width * vpr) as f32, drawing.style, color),
+            aeris_charts_render::shape::Rect {
+                left: 0.0,
+                top: pane.top * vpr,
+                right: f64::from(pane_w_px),
+                bottom: (pane.top + pane.height) * vpr,
+            },
+        );
         let Some(geometry) = resolve_drawing_geometry(
             drawing.kind,
             px,
@@ -581,63 +672,12 @@ impl ChartEngine {
         };
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
-                let label_gap = self
-                    .drawing_frame_gap_text(drawing)
-                    .filter(|_| {
-                        drawing.kind == DrawingKind::TrendLine
-                            && drawing.text_v_align == crate::drawings::DrawingTextVAlign::Middle
-                    })
-                    .and_then(|text| {
-                        let (size, x, y, align, angle) =
-                            self.text_run_geometry(drawing, px, pane_w_px, vpr);
-                        let mut width = self.measure_drawing_frame_text(drawing, text, size);
-                        if self.editing_drawing == Some(drawing.id) {
-                            // Match the host editor's one-em empty/minimum width. This leaves a
-                            // compact caret slot and then grows from actual shaped advance.
-                            width = width.max(size);
-                        }
-                        let gap = TEXT_PAD * vpr;
-                        let (local_start, local_end) = match align {
-                            DrawingTextHAlign::Left => (-gap, width + gap),
-                            DrawingTextHAlign::Center => (-width / 2.0 - gap, width / 2.0 + gap),
-                            DrawingTextHAlign::Right => (-width - gap, gap),
-                        };
-                        let length_sq = (b.0 - a.0).powi(2) + (b.1 - a.1).powi(2);
-                        if length_sq <= f64::EPSILON {
-                            return None;
-                        }
-                        let project = |distance: f64| {
-                            let px = x + angle.cos() * distance;
-                            let py = y + angle.sin() * distance;
-                            ((px - a.0) * (b.0 - a.0) + (py - a.1) * (b.1 - a.1)) / length_sq
-                        };
-                        let first = project(local_start);
-                        let second = project(local_end);
-                        let start = first.min(second).clamp(0.0, 1.0);
-                        let end = first.max(second).clamp(0.0, 1.0);
-                        (start < end).then_some((start, end))
-                    });
+                let label_gap = self.segment_label_gap(drawing, px, pane_w_px, vpr, a, b);
                 if let Some((gap_start, gap_end)) = label_gap {
-                    push_segment(
-                        a,
-                        point_on_segment(a, b, gap_start),
-                        drawing,
-                        color,
-                        vpr,
-                        out,
-                        points,
-                    );
-                    push_segment(
-                        point_on_segment(a, b, gap_end),
-                        b,
-                        drawing,
-                        color,
-                        vpr,
-                        out,
-                        points,
-                    );
+                    push_segment(a, point_on_segment(a, b, gap_start), stroke, out, points);
+                    push_segment(point_on_segment(a, b, gap_end), b, stroke, out, points);
                 } else {
-                    push_segment(a, b, drawing, color, vpr, out, points);
+                    push_segment(a, b, stroke, out, points);
                 }
                 push_drawing_cap(drawing.stroke_start, a, b, drawing.width * vpr, color, out);
                 push_drawing_cap(drawing.stroke_end, b, a, drawing.width * vpr, color, out);
@@ -682,11 +722,7 @@ impl ChartEngine {
                 let height = (bottom - top).abs() + 1;
                 // reference rectangle-drawing-tool default: the fill is the border color washed
                 // out (its `previewFillColor`/`fillColor` alpha pattern) — 20% here.
-                let fill = drawing
-                    .fill_color
-                    .as_deref()
-                    .and_then(Color::parse_css)
-                    .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51));
+                let fill = drawing.fill_or_wash(51);
                 if drawing.fill_enabled {
                     out.push(Prim::Rect {
                         rect: IRect {
@@ -771,18 +807,7 @@ impl ChartEngine {
                 line_type,
                 terminal,
             } => {
-                let first_point = points.len() as u32;
-                for &(x, y) in line_points {
-                    points.push([x as f32, y as f32]);
-                }
-                out.push(Prim::Polyline {
-                    first_point,
-                    point_count: line_points.len() as u32,
-                    width: (drawing.width * vpr) as f32,
-                    style: drawing.style,
-                    line_type,
-                    color,
-                });
+                push_styled_stroke(out, points, line_points, line_type, stroke.0, stroke.1);
                 if let (Some(first), Some(last)) = (line_points.first(), line_points.last()) {
                     if line_points.len() >= 2 {
                         push_drawing_cap(
@@ -816,6 +841,322 @@ impl ChartEngine {
                         line_type: LineType::Simple,
                         color,
                     });
+                }
+            }
+        }
+    }
+
+    /// The `[start, end]` fraction of segment `a → b` a middle segment-layout label cuts out of
+    /// the stroke: the measured run (the host editor's one-em minimum while editing) plus the
+    /// text pad on each side, projected onto the segment.
+    fn segment_label_gap(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w_px: i32,
+        vpr: f64,
+        a: (f64, f64),
+        b: (f64, f64),
+    ) -> Option<(f64, f64)> {
+        self.drawing_frame_gap_text(drawing)
+            .filter(|_| {
+                drawing.kind.spec().text_layout == DrawingTextLayout::Segment
+                    && drawing.text_v_align == crate::drawings::DrawingTextVAlign::Middle
+            })
+            .and_then(|text| {
+                let (size, x, y, align, angle) =
+                    self.text_run_geometry(drawing, px, pane_w_px, vpr);
+                let mut width = self.measure_drawing_frame_text(drawing, text, size);
+                if self.editing_drawing() == Some(drawing.id) {
+                    // Match the host editor's one-em empty/minimum width. This leaves a
+                    // compact caret slot and then grows from actual shaped advance.
+                    width = width.max(size);
+                }
+                let gap = TEXT_PAD * vpr;
+                let (local_start, local_end) = match align {
+                    DrawingTextHAlign::Left => (-gap, width + gap),
+                    DrawingTextHAlign::Center => (-width / 2.0 - gap, width / 2.0 + gap),
+                    DrawingTextHAlign::Right => (-width - gap, gap),
+                };
+                let length_sq = (b.0 - a.0).powi(2) + (b.1 - a.1).powi(2);
+                if length_sq <= f64::EPSILON {
+                    return None;
+                }
+                let project = |distance: f64| {
+                    let px = x + angle.cos() * distance;
+                    let py = y + angle.sin() * distance;
+                    ((px - a.0) * (b.0 - a.0) + (py - a.1) * (b.1 - a.1)) / length_sq
+                };
+                let first = project(local_start);
+                let second = project(local_end);
+                let start = first.min(second).clamp(0.0, 1.0);
+                let end = first.max(second).clamp(0.0, 1.0);
+                (start < end).then_some((start, end))
+            })
+    }
+
+    /// The color every text run of `drawing` resolves to: the explicit `text_color`, the stroke
+    /// for segment-layout labels, then the chart foreground.
+    pub(crate) fn drawing_label_color(&self, drawing: &Drawing) -> Color {
+        let layout = &self.options.get().layout;
+        drawing
+            .text_color
+            .as_deref()
+            .and_then(Color::parse_css)
+            .or_else(|| {
+                (drawing.kind.spec().text_layout == DrawingTextLayout::Segment)
+                    .then(|| Color::parse_css(&drawing.color))
+                    .flatten()
+            })
+            .or_else(|| Color::parse_css(&layout.text_color))
+            .unwrap_or_else(|| {
+                let fallback = aeris_charts_core::style::DEFAULT_FOREGROUND_RGB;
+                Color::rgb(fallback.0, fallback.1, fallback.2)
+            })
+    }
+
+    /// Lower a B8 family tool's shared parts (`drawings/parts.rs`) into the ordered frame. The
+    /// family resolved them in bitmap px; this is the only place family geometry becomes `Prim`s.
+    fn build_family_prims(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w_px: i32,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
+    ) {
+        let (Some(family), Some(pane)) = (
+            drawing.kind.spec().family,
+            self.panes.get(drawing.pane_index),
+        ) else {
+            return;
+        };
+        // The frame's horizontal ratio: `pane_w_px` is the rounded bitmap width it derives from.
+        let hpr = f64::from(pane_w_px) / self.pane_w.max(1.0);
+        let context = PartContext {
+            engine: self,
+            drawing,
+            px,
+            pane: aeris_charts_render::shape::Rect {
+                left: 0.0,
+                top: pane.top * vpr,
+                right: f64::from(pane_w_px),
+                bottom: (pane.top + pane.height) * vpr,
+            },
+            scale: vpr,
+            x_scale: hpr,
+            text_editing: self.editing_drawing() == Some(drawing.id),
+        };
+        debug_assert!(
+            drawing.points.len() != px.len()
+                || drawing.points.iter().zip(px).all(|(&point, &anchor)| {
+                    context.point_px(point).is_none_or(|mapped| {
+                        (mapped.0 - anchor.0).abs() <= 1e-6 * anchor.0.abs().max(1.0)
+                            && (mapped.1 - anchor.1).abs() <= 1e-6 * anchor.1.abs().max(1.0)
+                    })
+                }),
+            "derived family points share the anchors' caller-px space"
+        );
+        let mut parts = DrawingParts::default();
+        (family.build_parts)(&context, &mut parts);
+        let mut scratch = Vec::new();
+        let color = drawing.stroke_color();
+        let layout = &self.options.get().layout;
+        for part in &parts.items {
+            match *part {
+                DrawingPart::Stroke {
+                    start,
+                    end,
+                    stroke,
+                    label_gap,
+                } => {
+                    let line = &parts.points[start..end];
+                    let width = (stroke.width_css(drawing) * vpr) as f32;
+                    let style = stroke.line_style(drawing);
+                    let stroke_color = stroke.color.unwrap_or(color);
+                    let gap = if label_gap && line.len() == 2 {
+                        self.segment_label_gap(drawing, px, pane_w_px, vpr, line[0], line[1])
+                    } else {
+                        None
+                    };
+                    // Dashed styles split into solid dash runs (the series' dash contract), so
+                    // the WebGPU tessellator, which has no dash concept, paints Canvas2D's dashes.
+                    let mut push = |run: &[(f64, f64)]| {
+                        push_clipped_stroke(
+                            out,
+                            points,
+                            run,
+                            context.pane,
+                            (width, style, stroke_color),
+                            &mut scratch,
+                        );
+                    };
+                    match gap {
+                        Some((gap_start, gap_end)) => {
+                            let (a, b) = (line[0], line[1]);
+                            push(&[a, point_on_segment(a, b, gap_start)]);
+                            push(&[point_on_segment(a, b, gap_end), b]);
+                        }
+                        None => push(line),
+                    }
+                }
+                DrawingPart::HLine { y, x0, x1, stroke } => {
+                    let width = (stroke.width_css(drawing) * vpr).round().max(1.0) as i32;
+                    let style = stroke.line_style(drawing);
+                    let span = crisp_span(x0, x1, (0.0, f64::from(pane_w_px)), width, style);
+                    if let Some((x0, x1)) = span.filter(|(x0, x1)| x0 != x1) {
+                        out.push(Prim::HLine {
+                            y: y.round() as i32,
+                            x0,
+                            x1,
+                            width,
+                            style,
+                            color: stroke.color.unwrap_or(color),
+                        });
+                    }
+                }
+                DrawingPart::VLine { x, y0, y1, stroke } => {
+                    let width = (stroke.width_css(drawing) * vpr).round().max(1.0) as i32;
+                    let style = stroke.line_style(drawing);
+                    let pane_span = (context.pane.top.floor(), context.pane.bottom.ceil());
+                    if let Some((y0, y1)) = crisp_span(y0, y1, pane_span, width, style) {
+                        out.push(Prim::VLine {
+                            x: x.round() as i32,
+                            y0,
+                            y1,
+                            width,
+                            style,
+                            color: stroke.color.unwrap_or(color),
+                        });
+                    }
+                }
+                DrawingPart::Fill {
+                    upper,
+                    lower,
+                    count,
+                    color: fill,
+                    ..
+                } => {
+                    let upper_first = points.len() as u32;
+                    points.extend(
+                        parts.points[upper..upper + count]
+                            .iter()
+                            .map(|&(x, y)| [x as f32, y as f32]),
+                    );
+                    let lower_first = points.len() as u32;
+                    points.extend(
+                        parts.points[lower..lower + count]
+                            .iter()
+                            .map(|&(x, y)| [x as f32, y as f32]),
+                    );
+                    out.push(Prim::BandFill {
+                        upper_first,
+                        lower_first,
+                        point_count: count as u32,
+                        line_type: LineType::Simple,
+                        fill: fill.unwrap_or(color),
+                    });
+                }
+                DrawingPart::Disc {
+                    center,
+                    radius,
+                    color: fill,
+                } => {
+                    let fill = fill.unwrap_or(color);
+                    out.push(Prim::Circle {
+                        cx: center.0 as f32,
+                        cy: center.1 as f32,
+                        radius: radius as f32,
+                        fill,
+                        stroke_width: 0.0,
+                        stroke: fill,
+                    });
+                }
+                DrawingPart::Tube { start, end, stroke } => {
+                    let line = &parts.points[start..end];
+                    let width = stroke.width_css(drawing) * vpr;
+                    let fill = stroke.color.unwrap_or(color);
+                    let mut chains = Vec::new();
+                    let count = DrawingParts::tube_region(line, width, context.pane, &mut chains);
+                    if count > 0 {
+                        let upper_first = points.len() as u32;
+                        points.extend(chains.iter().map(|&(x, y)| [x as f32, y as f32]));
+                        out.push(Prim::BandFill {
+                            upper_first,
+                            lower_first: upper_first + count as u32,
+                            point_count: count as u32,
+                            line_type: LineType::Simple,
+                            fill,
+                        });
+                    } else {
+                        // Beyond the fill bounds even when coarsened: a plain stroke, whose
+                        // self-overlaps may blend twice on the GPU executors.
+                        push_clipped_stroke(
+                            out,
+                            points,
+                            line,
+                            context.pane,
+                            (width as f32, LineStyle::Solid, fill),
+                            &mut scratch,
+                        );
+                    }
+                }
+                DrawingPart::Label { index } => {
+                    let label = &parts.labels[index];
+                    let box_layout = label.layout(|line| {
+                        self.measure_text_run(
+                            line,
+                            label.size,
+                            &layout.font_family,
+                            label.weight,
+                            label.italic,
+                        )
+                    });
+                    // Boxes off the pane (level labels of far tines) emit nothing.
+                    if !box_layout.rect.intersects(&context.pane) {
+                        continue;
+                    }
+                    let rect = IRect {
+                        x: box_layout.rect.left.round() as i32,
+                        y: box_layout.rect.top.round() as i32,
+                        w: (box_layout.rect.right - box_layout.rect.left)
+                            .round()
+                            .max(1.0) as i32,
+                        h: (box_layout.rect.bottom - box_layout.rect.top)
+                            .round()
+                            .max(1.0) as i32,
+                    };
+                    if let Some(background) = label.background {
+                        out.push(Prim::Rect {
+                            rect,
+                            color: background,
+                        });
+                    }
+                    if let Some(border) = label.border {
+                        out.push(Prim::RectFrame {
+                            rect,
+                            border: vpr.round().max(1.0) as i32,
+                            color: border,
+                        });
+                    }
+                    let text_color = label
+                        .color
+                        .unwrap_or_else(|| self.drawing_label_color(drawing));
+                    for (line_index, text) in label.lines.iter().enumerate() {
+                        out.push(Prim::Text {
+                            x: box_layout.text_x as f32,
+                            y: (box_layout.first_y + line_index as f64 * box_layout.line_height)
+                                as f32,
+                            text: text.clone(),
+                            color: text_color,
+                            size: label.size as f32,
+                            family: layout.font_family.clone(),
+                            align: TextAlign::Left,
+                            weight: label.weight,
+                            italic: label.italic,
+                        });
+                    }
                 }
             }
         }
@@ -959,7 +1300,7 @@ impl ChartEngine {
                         }
                     }
                 }
-                let color = Color::parse_css(&drawing.color).unwrap_or(PRIMARY);
+                let color = drawing.stroke_color();
                 super::series_geometry::push_line_stroke(
                     out,
                     points,
@@ -1066,27 +1407,22 @@ impl ChartEngine {
         // Empty text paints nothing. While the host typing-mode editor is open the LABEL and
         // the focus border still paint — the editor wrap is borderless with transparent glyphs,
         // so entering edit cannot lift the text or shift the outline (the public reference's
-        // overlay-caret model).
+        // overlay-caret model). Families that own their text lay it out in their parts.
+        if drawing
+            .kind
+            .spec()
+            .family
+            .is_some_and(|family| family.owns_text)
+        {
+            return;
+        }
         let Some((text, placeholder)) = self.drawing_frame_text(drawing) else {
             return;
         };
         let is_text_tool = drawing.kind == DrawingKind::Text;
         let (size, x, y, align, angle) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
         let layout = &self.options.get().layout;
-        let mut color = drawing
-            .text_color
-            .as_deref()
-            .and_then(Color::parse_css)
-            .or_else(|| {
-                (drawing.kind == DrawingKind::TrendLine)
-                    .then(|| Color::parse_css(&drawing.color))
-                    .flatten()
-            })
-            .or_else(|| Color::parse_css(&layout.text_color))
-            .unwrap_or_else(|| {
-                let fallback = aeris_charts_core::style::DEFAULT_FOREGROUND_RGB;
-                Color::rgb(fallback.0, fallback.1, fallback.2)
-            });
+        let mut color = self.drawing_label_color(drawing);
         if placeholder {
             color = Color::rgba(
                 color.r(),
@@ -1150,7 +1486,7 @@ impl ChartEngine {
             italic: drawing.text_italic,
             angle: angle as f32,
         };
-        if drawing.kind == DrawingKind::TrendLine {
+        if drawing.kind.spec().text_layout == DrawingTextLayout::Segment {
             out.push(text_prim);
         } else if let Prim::RotatedText {
             x,
@@ -1189,7 +1525,13 @@ impl ChartEngine {
         let Some(anchor) = px.first().copied() else {
             return;
         };
-        if drawing.labels.is_empty() {
+        if drawing.labels.is_empty()
+            || drawing
+                .kind
+                .spec()
+                .family
+                .is_some_and(|family| family.owns_labels)
+        {
             return;
         }
         let color = drawing
@@ -1740,7 +2082,7 @@ impl ChartEngine {
             return;
         }
         let layout = &self.options.get().layout;
-        let size = (layout.font_size * 0.92).max(10.0) * vpr;
+        let size = self.drawing_stats_size() * vpr;
         let line_height = size * 1.25;
         let pad_x = 6.0 * vpr;
         let pad_y = 3.0 * vpr;
@@ -1840,118 +2182,63 @@ fn build_anchor_handles(px: &[(f64, f64)], vpr: f64, fill: Color, out: &mut Vec<
     }
 }
 
-/// Long/Short Position selection controls. The controls correspond to target, entry/origin,
-/// horizontal extent, and stop; they are intentionally not generic drawing-point anchors.
-fn build_position_handles(px: &[(f64, f64)], vpr: f64, fill: Color, out: &mut Vec<Prim>) {
-    if px.len() != 3 {
-        return;
-    }
-    let entry = px[0];
-    let target = px[1];
-    let stop = px[2];
-    let controls = [
-        (entry.0, target.1, false),
-        (entry.0, entry.1, true),
-        (target.0, entry.1, false),
-        (entry.0, stop.1, false),
-    ];
-    let outer = ((ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr) as f32;
-    let inner = (ANCHOR_RADIUS * vpr) as f32;
-    for (cx, cy, circular) in controls {
-        if circular {
-            out.push(Prim::Circle {
-                cx: cx as f32,
-                cy: cy as f32,
-                radius: outer,
-                fill: ANCHOR_BORDER,
-                stroke_width: 0.0,
-                stroke: ANCHOR_BORDER,
-            });
-            out.push(Prim::Circle {
-                cx: cx as f32,
-                cy: cy as f32,
-                radius: inner,
-                fill,
-                stroke_width: 0.0,
-                stroke: fill,
-            });
-        } else {
-            let side = (2.0 * (ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr)
-                .round()
-                .max(1.0) as i32;
-            let inner_side = (2.0 * ANCHOR_RADIUS * vpr).round().max(1.0) as i32;
-            out.push(Prim::Rect {
-                rect: IRect {
-                    x: (cx - f64::from(side) / 2.0).round() as i32,
-                    y: (cy - f64::from(side) / 2.0).round() as i32,
-                    w: side,
-                    h: side,
-                },
-                color: ANCHOR_BORDER,
-            });
-            out.push(Prim::Rect {
-                rect: IRect {
-                    x: (cx - f64::from(inner_side) / 2.0).round() as i32,
-                    y: (cy - f64::from(inner_side) / 2.0).round() as i32,
-                    w: inner_side,
-                    h: inner_side,
-                },
-                color: fill,
-            });
-        }
-    }
-}
-
-/// The rectangle's eight reference-informed handles: fully-rounded discs on the four corners and
-/// slightly-rounded square handles on the four edge midpoints (the midpoint drags resize one
-/// edge independently).
-fn build_rectangle_handles(px: &[(f64, f64)], vpr: f64, fill: Color, out: &mut Vec<Prim>) {
-    let anchors = ChartEngine::rectangle_anchors(px);
-    for (index, &(cx, cy)) in anchors.iter().enumerate() {
-        if index % 2 == 0 {
-            // Corners: the standard disc handles.
-            out.push(Prim::Circle {
-                cx: cx as f32,
-                cy: cy as f32,
-                radius: ((ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr) as f32,
-                fill: ANCHOR_BORDER,
-                stroke_width: 0.0,
-                stroke: ANCHOR_BORDER,
-            });
-            out.push(Prim::Circle {
-                cx: cx as f32,
-                cy: cy as f32,
-                radius: (ANCHOR_RADIUS * vpr) as f32,
-                fill,
-                stroke_width: 0.0,
-                stroke: fill,
-            });
-        } else {
-            // Edge midpoints: slightly-rounded squares (2px corner radius), border square
-            // underneath, fill square on top.
-            let outer = ((ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr) as f32;
-            let inner = (ANCHOR_RADIUS * vpr) as f32;
-            let radii = [2.0 * vpr as f32; 4];
-            out.push(Prim::RoundRect {
-                x: cx as f32 - outer,
-                y: cy as f32 - outer,
-                w: outer * 2.0,
-                h: outer * 2.0,
-                radii,
-                fill: ANCHOR_BORDER,
-                border_width: 0.0,
-                border_color: ANCHOR_BORDER,
-            });
-            out.push(Prim::RoundRect {
-                x: cx as f32 - inner,
-                y: cy as f32 - inner,
-                w: inner * 2.0,
-                h: inner * 2.0,
-                radii,
-                fill,
-                border_width: 0.0,
-                border_color: fill,
-            });
+/// Paint a handle set (`drawings/handles.rs`) in its order: discs are the anchor disc pair,
+/// squares the Long/Short Position control pair, and rounded squares the rectangle edge-midpoint
+/// pair (2 px corner radius).
+fn build_handles(handles: &[DrawingHandle], vpr: f64, fill: Color, out: &mut Vec<Prim>) {
+    for handle in handles {
+        let (cx, cy) = handle.point;
+        match handle.shape {
+            HandleShape::Disc => build_anchor_handles(&[handle.point], vpr, fill, out),
+            HandleShape::Square => {
+                let side = (2.0 * (ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr)
+                    .round()
+                    .max(1.0) as i32;
+                let inner_side = (2.0 * ANCHOR_RADIUS * vpr).round().max(1.0) as i32;
+                out.push(Prim::Rect {
+                    rect: IRect {
+                        x: (cx - f64::from(side) / 2.0).round() as i32,
+                        y: (cy - f64::from(side) / 2.0).round() as i32,
+                        w: side,
+                        h: side,
+                    },
+                    color: ANCHOR_BORDER,
+                });
+                out.push(Prim::Rect {
+                    rect: IRect {
+                        x: (cx - f64::from(inner_side) / 2.0).round() as i32,
+                        y: (cy - f64::from(inner_side) / 2.0).round() as i32,
+                        w: inner_side,
+                        h: inner_side,
+                    },
+                    color: fill,
+                });
+            }
+            HandleShape::RoundedSquare => {
+                let outer = ((ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr) as f32;
+                let inner = (ANCHOR_RADIUS * vpr) as f32;
+                let radii = [2.0 * vpr as f32; 4];
+                out.push(Prim::RoundRect {
+                    x: cx as f32 - outer,
+                    y: cy as f32 - outer,
+                    w: outer * 2.0,
+                    h: outer * 2.0,
+                    radii,
+                    fill: ANCHOR_BORDER,
+                    border_width: 0.0,
+                    border_color: ANCHOR_BORDER,
+                });
+                out.push(Prim::RoundRect {
+                    x: cx as f32 - inner,
+                    y: cy as f32 - inner,
+                    w: inner * 2.0,
+                    h: inner * 2.0,
+                    radii,
+                    fill,
+                    border_width: 0.0,
+                    border_color: fill,
+                });
+            }
         }
     }
 }

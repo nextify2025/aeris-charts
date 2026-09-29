@@ -207,6 +207,36 @@ test("accessibility is default, singleton, bounded, silent for streaming, and ke
   expect(result.after).toEqual(result.before);
 });
 
+test("a keyboard nudge that moves nothing is not undone by Escape", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const a11y = chart.accessibility();
+    const recolored = chart.add_drawing("trend_line", [
+      { logical: 20, price: 100 },
+      { logical: 30, price: 105 },
+    ]);
+    recolored.apply_options({ color: "#00ff00" });
+    const line = chart.add_drawing("vertical_line", [{ logical: 25, price: 100 }]);
+    chart.wasm.set_selected_drawing(line.id);
+    a11y.focus_target(`drawing:${line.id}`);
+    const layer = document.activeElement;
+    const key = (name) => layer.dispatchEvent(new KeyboardEvent("keydown", { key: name, bubbles: true, cancelable: true }));
+    key("Enter");
+    // A vertical line only moves in time: ArrowUp is consumed but changes nothing.
+    const consumed = !key("ArrowUp");
+    key("Escape");
+    return {
+      consumed,
+      kinds: chart.drawings().map((drawing) => drawing.kind()),
+      color: recolored.options().color,
+    };
+  });
+  expect(result.consumed).toBe(true);
+  expect(result.kinds).toEqual(["trend_line", "vertical_line"]);
+  expect(result.color).toBe("#00ff00");
+});
+
 test("semantic axis and trading targets route keyboard actions through canonical engine paths", async ({ page }) => {
   await open_chart(page);
   const result = await page.evaluate(() => {

@@ -60,20 +60,13 @@ fn points(kind: DrawingKind, index: usize, mostly_offscreen: bool) -> Vec<Drawin
     } else {
         98.0 + (index % 40) as f64 * 0.1
     };
-    let first = DrawingPoint { logical, price };
-    match kind {
-        DrawingKind::TrendLine
-        | DrawingKind::Rectangle
-        | DrawingKind::Brush
-        | DrawingKind::Path => vec![
-            first,
-            DrawingPoint {
-                logical: logical + 8.0,
-                price: price + 2.0,
-            },
-        ],
-        _ => vec![first],
-    }
+    // One anchor per defining point, spread along a rising diagonal.
+    (0..kind.anchor_count())
+        .map(|step| DrawingPoint {
+            logical: logical + 8.0 * step as f64,
+            price: price + 2.0 * step as f64,
+        })
+        .collect()
 }
 
 fn install_drawings(chart: &mut ChartEngine, count: usize, mix: &str, mostly_offscreen: bool) {
@@ -87,8 +80,14 @@ fn install_drawings(chart: &mut ChartEngine, count: usize, mix: &str, mostly_off
         DrawingKind::HorizontalRay,
         DrawingKind::VerticalLine,
     ];
+    // Every B8 family tool (wire ids 32 and up, reserved per family), read from the engine
+    // catalog so family work never edits this harness.
+    let families = (32..=u8::MAX)
+        .filter_map(DrawingKind::from_u8)
+        .collect::<Vec<_>>();
     for index in 0..count {
         let kind = match mix {
+            "families" => families[index % families.len()],
             "trend" => DrawingKind::TrendLine,
             "rectangle" => DrawingKind::Rectangle,
             "brush" => DrawingKind::Brush,
@@ -267,15 +266,18 @@ fn combined_foundation_row() {
 fn main() {
     if std::env::var_os("AERIS_CHARTS_DRAWING_QUICK").is_some() {
         row(1_000, "mixed", true);
+        row(1_000, "families", false);
+        row(1_000, "families", true);
         combined_foundation_row();
         return;
     }
     for count in [0, 10, 50, 100, 250, 500, 1_000] {
-        for mix in ["trend", "rectangle", "brush", "text", "mixed"] {
+        for mix in ["trend", "rectangle", "brush", "text", "families", "mixed"] {
             row(count, mix, false);
         }
     }
     row(1_000, "mixed", true);
+    row(1_000, "families", true);
     for points in [100, 1_000, 10_000] {
         brush_path_row(points);
     }

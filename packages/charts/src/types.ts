@@ -1221,9 +1221,11 @@ export interface macd_parameters extends indicator_seed_parameters {
   histogram_multiplier?: number;
 }
 /**
- * Start of KDJ's `SMA(X,N,1)` smoothing: `"fifty"` (default) is the textbook start, where a missing
- * previous K or D is 50; `"first_value"` is the 通达信/同花顺 formula `SMA` semantics, where the first
- * K equals the first RSV and the first D the first K. They converge after `convergence_bars`.
+ * How KDJ starts: `"fifty"` (default) is the textbook start (通达信 KDJ传统版), which waits for a full
+ * RSV window and uses 50 for the missing previous K and D; `"first_value"` is the 通达信 formula KDJ
+ * (KDJ普通版), whose RSV uses the bars available while fewer than `period` exist and whose `SMA`
+ * starts at its first input, so K = D = J = RSV on the first bar. They converge after
+ * `convergence_bars`.
  */
 export type kdj_seed = "fifty" | "first_value";
 /** Calculation parameters for {@link chart_api.add_kdj}; `convention: "china"` selects `"first_value"`. */
@@ -1496,6 +1498,87 @@ export interface session_slot_options {
    * instant as its own slot: the 241 points 同花顺/富途 show (09:30, 09:31..11:30, 13:01..15:00).
    */
   convention?: session_slot_convention;
+}
+
+/**
+ * Where a print outside every session window goes: `"fold"` keeps it (a print before the trading
+ * day's first window, such as the opening auction, joins that window's first bar; a later one,
+ * such as the 11:30 or closing print, joins the preceding window's last bar); `"exclude"` leaves it
+ * out of every bar except prints stamped in a window's closing second (the closing auction).
+ */
+export type out_of_session_policy = "fold" | "exclude";
+
+/** Session anchoring of a trade stream's time bars (see {@link chart_api.set_trade_stream_sessions}). */
+export interface trade_session_options {
+  /**
+   * Exchange-local `["HH:MM", "HH:MM"]` windows in chronological order (at most 32), placed in the
+   * chart's `time_zone` and `session_start` like {@link session_slot_options.windows}. Each window
+   * restarts the bar grid at its open; an interval of one day gives one bar per trading day.
+   */
+  windows: readonly (readonly [string, string])[];
+  /** Default `"fold"`. */
+  outside?: out_of_session_policy;
+}
+
+/** One resampling period: bars restart at `start_time` and never cross `end_time` (UTC seconds). */
+export interface resample_boundary {
+  start_time: number;
+  /** Exclusive. */
+  end_time: number;
+  /** Opaque session identity; {@link resample_boundaries} uses the trading date as `YYYYMMDD`. */
+  session_id: number;
+}
+
+/** Input of {@link resample_boundaries}. */
+export interface resample_boundary_options {
+  /** Trading dates (`"YYYY-MM-DD"` or business days), strictly ascending; host calendar data. */
+  dates: readonly (string | business_day)[];
+  /** Exchange-local `["HH:MM", "HH:MM"]` session windows, as in {@link session_slot_options.windows}. */
+  windows: readonly (readonly [string, string])[];
+  /** Exchange time zone: an IANA name or an explicit schedule (default `"UTC"`). */
+  time_zone?: time_zone;
+  /** Trading-day start relative to local midnight, like the chart's `session_start` (default 0). */
+  session_start?: number;
+  /**
+   * `"window"` (default): one boundary per session window, so intraday bars restart at every
+   * window open. `"day"`: one boundary per date from its first open to its last close, for daily
+   * bars (use an interval of at least that span, e.g. 86 400).
+   */
+  span?: "window" | "day";
+}
+
+/** Options of {@link chart_api.configure_resampled_series}. */
+export interface resample_series_options {
+  /** Candlestick or bar series whose bar-open-stamped rows are resampled. */
+  source: series_api | number;
+  /** Histogram of the source's volume, summed per derived bar into `volume_target`. */
+  volume_source?: series_api | number;
+  /** Histogram that receives the derived volume. */
+  volume_target?: series_api | number;
+  /** Width of one derived bar in seconds; buckets restart at each boundary. */
+  interval_seconds: number;
+  /** At most 20 000 ordered, disjoint periods; source rows outside every boundary are omitted. */
+  boundaries: readonly resample_boundary[];
+}
+
+/** One derived bar of a resampled series; whitespace bars carry `null` prices and volume. */
+export interface resampled_bar {
+  time: number;
+  session_id: number;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  volume: number | null;
+  /** Source rows aggregated into the bar, whitespace rows included. */
+  source_rows: number;
+}
+
+/** Lifetime work counters of a resampled series. */
+export interface resample_stats {
+  rebuilds: number;
+  tail_refreshes: number;
+  rows_scanned: number;
 }
 
 export interface price_scale_options {
@@ -1829,6 +1912,9 @@ export interface chart_options {
 /** Direction rule of a `histogram_updown` volume histogram. */
 export type histogram_updown_rule = "open_close" | "previous_close";
 
+/** How a series' timestamps land on the shared time axis (see `series_options.time_alignment`). */
+export type time_alignment = "union" | "as_of";
+
 /** Options accepted when adding a series. */
 export interface series_options {
   /**
@@ -1848,6 +1934,11 @@ export interface series_options {
    * were not also held by another series. Applying a cap trims the series' existing points
    * immediately; a full `set_data`/`set_data_typed` install is trimmed to the ceiling too.
    *
+   * Under a replay clock the ceiling counts and evicts only the points up to the clock (what a
+   * clean load to that clock holds), and a seek that reveals points trims them the same way.
+   * Points ingested past the clock are the replay's pending data: they stay, uncounted, until the
+   * clock reveals them.
+   *
    * Note this is a *point* count, not a time window: the retained span depends on the bar interval.
    */
   max_points: number;
@@ -1857,6 +1948,27 @@ export interface series_options {
    * every row.
    */
   render_before_time: number | null;
+  /**
+   * How this series' timestamps land on the shared time axis. `"union"` (the default,
+   * reference behavior) adds every timestamp to the chart's time points. `"as_of"` is for an
+   * overlay from another market calendar (an index over a stock from another exchange, crypto
+   * over equities, a futures night session over its underlying): the series adds no time point,
+   * so the other series keep a gapless axis, and each point up to the last real bar of the
+   * other series shows this series' last row at or before that point's time. Rows between two
+   * points collapse into the later one; a point with no newer row repeats the previous row (see
+   * `as_of_max_staleness`); rows after the last point wait for it. Studies bound to the series
+   * compute on its own rows and follow the same points, `data()` keeps its own rows, and value
+   * snapshots report the point's time. Line, area, baseline, histogram, bar, and candlestick
+   * series that own their rows, on a time axis, only; others (and any series on a non-time bar
+   * axis) throw `unsupported_operation`.
+   */
+  time_alignment: time_alignment;
+  /**
+   * With `time_alignment: "as_of"`, leave a point empty instead of repeating a row older than
+   * this many seconds (a non-negative whole number). `null` (the default) repeats without limit;
+   * `0` shows only rows exactly at a point's time.
+   */
+  as_of_max_staleness: number | null;
   /** Overrides the kind default color (line/area/histogram). */
   color: string;
   /**
@@ -2019,6 +2131,15 @@ export interface series_options {
   base?: number;
   /** Area: invert the filled area (fill above the line) (reference `invertFilledArea`, default `false`). */
   invert_filled_area?: boolean;
+  /**
+   * Line/area/baseline: end the line at each exchange trading-day boundary (default `false`).
+   * The first drawn row of a trading day starts a new run with no connecting segment, fill, or
+   * hit area from the previous day; trading days follow the time scale's `time_zone` and
+   * `session_start`. A run of one row draws a one-bar horizontal segment. Multi-day intraday
+   * (分时) charts use it to separate days. VWAP, VWAP bands, and pivot outputs always break at
+   * their own reset periods.
+   */
+  break_on_trading_day?: boolean;
   /** Bar: draw the open tick on each bar (reference `openVisible`, default `true`). */
   open_visible?: boolean;
   /** Bar: draw the close tick on each bar (default `true`). Set false with `open_visible` false for high-low bars. */
@@ -2293,6 +2414,10 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * stop), horizontal line/ray, vertical line, and text (1 each), a multi-click arrow-ended
  * straight-segment path (variable length, every vertex editable), and the freehand brush (a
  * variable-length curve, anchor handles at the two ends).
+ *
+ * Lines family (B8): `ray`, `extended_line`, `info_line`, `trend_angle`, and `arrow_line` place
+ * two anchors; `extend_left` extends beyond the first anchor and `extend_right` beyond the second
+ * (a ray defaults to `extend_right`, an extended line to both). `cross_line` places one anchor.
  */
 export type drawing_kind =
   | "trend_line"
@@ -2304,7 +2429,106 @@ export type drawing_kind =
   | "brush"
   | "path"
   | "long_position"
-  | "short_position";
+  | "short_position"
+  // B8: lines — begin
+  | "ray"
+  | "extended_line"
+  | "info_line"
+  | "trend_angle"
+  | "cross_line"
+  | "arrow_line"
+  // B8: lines — end
+  // B8: channels — begin
+  | "parallel_channel"
+  | "regression_trend"
+  | "flat_top_bottom"
+  | "disjoint_channel"
+  // B8: channels — end
+  // B8: fibonacci — begin
+  // Fibonacci family: two anchors (retracement, time zone, speed resistance fan and arcs,
+  // circles, spiral) or three (trend-based extension and time, channel, wedge); levels come
+  // from `levels`, options from `tool_options.fibonacci`.
+  | "fib_retracement"
+  | "trend_based_fib_extension"
+  | "fib_channel"
+  | "fib_time_zone"
+  | "trend_based_fib_time"
+  | "fib_speed_resistance_fan"
+  | "fib_speed_resistance_arcs"
+  | "fib_circles"
+  | "fib_spiral"
+  | "fib_wedge"
+  // B8: fibonacci — end
+  // B8: pitchforks_gann — begin
+  | "andrews_pitchfork"
+  | "schiff_pitchfork"
+  | "modified_schiff_pitchfork"
+  | "inside_pitchfork"
+  | "pitchfan"
+  | "gann_box"
+  | "gann_square"
+  | "gann_square_fixed"
+  | "gann_fan"
+  // B8: pitchforks_gann — end
+  // B8: projection_annotations — begin
+  // Projection & Annotations: `projection` places three anchors; `forecast`, `bars_pattern`,
+  // the three ranges, `price_note`, and `callout` two; the other annotations one.
+  // `anchored_text` anchors are pane fractions (`logical` = x / pane width, `price` = y / pane
+  // height) and carry no `time`.
+  | "forecast"
+  | "bars_pattern"
+  | "price_range"
+  | "date_range"
+  | "date_and_price_range"
+  | "projection"
+  | "anchored_text"
+  | "note"
+  | "price_note"
+  | "callout"
+  | "comment"
+  | "price_label"
+  | "signpost"
+  | "flag_mark"
+  | "arrow_mark_up"
+  | "arrow_mark_down"
+  | "arrow_mark_left"
+  | "arrow_mark_right"
+  | "icon"
+  // B8: projection_annotations — end
+  // B8: patterns_elliott_cycles — begin
+  // Patterns (boxed point labels; XABCD, cypher, ABCD, and three drives add ratio connectors),
+  // Elliott waves (degree-notation labels), and cycles (repeats across the pane).
+  | "xabcd_pattern"
+  | "cypher_pattern"
+  | "abcd_pattern"
+  | "head_and_shoulders"
+  | "triangle_pattern"
+  | "three_drives_pattern"
+  | "elliott_impulse_wave"
+  | "elliott_correction_wave"
+  | "elliott_triangle_wave"
+  | "elliott_double_combo"
+  | "elliott_triple_combo"
+  | "cyclic_lines"
+  | "time_cycles"
+  | "sine_line"
+  // B8: patterns_elliott_cycles — end
+  // B8: shapes — begin
+  // Shapes family: `rotated_rectangle` (axis ends + a point on a long side), `ellipse` (box
+  // corners), `circle` (center + rim), `triangle`, `arc` (start, end, a point on the arc),
+  // `curve` (start, end, the curve's midpoint), `double_curve` (start, end, the points at one and
+  // two thirds), multi-click `polyline`, and the freehand `highlighter`.
+  | "rotated_rectangle"
+  | "ellipse"
+  | "circle"
+  | "triangle"
+  | "arc"
+  | "curve"
+  | "double_curve"
+  | "polyline"
+  | "highlighter"
+  // B8: shapes — end
+  ;
 
 export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   trend_line: 0,
@@ -2317,6 +2541,91 @@ export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   path: 7,
   long_position: 8,
   short_position: 9,
+  // B8: lines — begin (wire ids 32..=47)
+  ray: 32,
+  extended_line: 33,
+  info_line: 34,
+  trend_angle: 35,
+  cross_line: 36,
+  arrow_line: 37,
+  // B8: lines — end
+  // B8: channels — begin (wire ids 48..=63)
+  parallel_channel: 48,
+  regression_trend: 49,
+  flat_top_bottom: 50,
+  disjoint_channel: 51,
+  // B8: channels — end
+  // B8: fibonacci — begin (wire ids 64..=95)
+  fib_retracement: 64,
+  trend_based_fib_extension: 65,
+  fib_channel: 66,
+  fib_time_zone: 67,
+  trend_based_fib_time: 68,
+  fib_speed_resistance_fan: 69,
+  fib_speed_resistance_arcs: 70,
+  fib_circles: 71,
+  fib_spiral: 72,
+  fib_wedge: 73,
+  // B8: fibonacci — end
+  // B8: pitchforks_gann — begin (wire ids 96..=127)
+  andrews_pitchfork: 96,
+  schiff_pitchfork: 97,
+  modified_schiff_pitchfork: 98,
+  inside_pitchfork: 99,
+  pitchfan: 100,
+  gann_box: 101,
+  gann_square: 102,
+  gann_square_fixed: 103,
+  gann_fan: 104,
+  // B8: pitchforks_gann — end
+  // B8: projection_annotations — begin (wire ids 128..=159)
+  forecast: 128,
+  bars_pattern: 129,
+  price_range: 130,
+  date_range: 131,
+  date_and_price_range: 132,
+  projection: 133,
+  anchored_text: 134,
+  note: 135,
+  price_note: 136,
+  callout: 137,
+  comment: 138,
+  price_label: 139,
+  signpost: 140,
+  flag_mark: 141,
+  arrow_mark_up: 142,
+  arrow_mark_down: 143,
+  arrow_mark_left: 144,
+  arrow_mark_right: 145,
+  icon: 146,
+  // B8: projection_annotations — end
+  // B8: patterns_elliott_cycles — begin (wire ids 160..=191)
+  xabcd_pattern: 160,
+  cypher_pattern: 161,
+  abcd_pattern: 162,
+  head_and_shoulders: 163,
+  triangle_pattern: 164,
+  three_drives_pattern: 165,
+  elliott_impulse_wave: 166,
+  elliott_correction_wave: 167,
+  elliott_triangle_wave: 168,
+  elliott_double_combo: 169,
+  elliott_triple_combo: 170,
+  cyclic_lines: 171,
+  time_cycles: 172,
+  sine_line: 173,
+  // B8: patterns_elliott_cycles — end
+  // B8: shapes — begin (wire ids 192..=223)
+  rotated_rectangle: 192,
+  ellipse: 193,
+  circle: 194,
+  triangle: 195,
+  arc: 196,
+  curve: 197,
+  double_curve: 198,
+  polyline: 199,
+  highlighter: 200,
+  // B8: shapes — end
 };
 
 /**
@@ -2386,7 +2695,275 @@ export type drawing_kind_options =
   | { kind: "rectangle"; fill_color?: string; preview_fill_color?: string; border_visible: boolean; show_labels: boolean; axis_bands_visible: boolean; label_color?: string; label_text_color?: string; snap_time_to_data: boolean }
   | { kind: "text"; box_color?: string; box_border_color?: string; box_border_width: number }
   | { kind: "position"; levels: drawing_level[] }
-  | { kind: "generic" };
+  | { kind: "generic" }
+  // B8: lines — begin
+  | { kind: "line"; stats_position: drawing_stats_position }
+  // B8: lines — end
+  // B8: channels — begin
+  | { kind: "channel"; middle_line: boolean; middle_color: string | null }
+  | {
+    kind: "regression_trend";
+    middle_line: boolean;
+    middle_color: string | null;
+    upper_deviation: number;
+    lower_deviation: number;
+    use_upper_deviation: boolean;
+    use_lower_deviation: boolean;
+    source: indicator_input_source;
+    show_pearsons: boolean;
+  }
+  // B8: channels — end
+  // B8: fibonacci — begin
+  | ({ kind: "fibonacci" } & Required<fibonacci_tool_options>)
+  // B8: fibonacci — end
+  // B8: pitchforks_gann — begin
+  | { kind: "pitchfork"; levels: drawing_level[] }
+  | {
+    kind: "gann";
+    levels: drawing_level[];
+    time_levels: drawing_level[];
+    angles: drawing_level[];
+    arcs: drawing_level[];
+    reverse: boolean;
+    show_angles: boolean;
+    show_stats: boolean;
+    scale_ratio: number | null;
+    size_bars: number;
+  }
+  // B8: pitchforks_gann — end
+  // B8: projection_annotations — begin
+  | {
+    kind: "projection_annotation";
+    bars_mode: bars_pattern_mode;
+    mirrored: boolean;
+    flipped: boolean;
+    /** Number of bars a `bars_pattern` copied (0 for other tools). */
+    pattern_bars: number;
+    icon: drawing_icon;
+    icon_size: number;
+    always_show_text: boolean;
+  }
+  // B8: projection_annotations — end
+  // B8: patterns_elliott_cycles — begin
+  | { kind: "pattern"; show_ratios: boolean }
+  | { kind: "elliott_wave"; degree: elliott_wave_degree; show_wave: boolean }
+  // B8: patterns_elliott_cycles — end
+  // B8: shapes — begin
+  | { kind: "shape"; closed: boolean }
+  // B8: shapes — end
+  ;
+
+// B8: lines — begin
+/** Where a Lines-family stats box sits: beyond the first anchor, below the midpoint, or beyond the second anchor. */
+export type drawing_stats_position = "start" | "middle" | "end";
+/** Lines-family options (`tool_options.line`); absent fields keep their defaults. */
+export interface line_tool_options {
+  /** Stats box position along the anchor segment (default `"end"`). */
+  stats_position?: drawing_stats_position;
+}
+// B8: lines — end
+// B8: channels — begin
+/**
+ * Channels-family options (`tool_options.channel`). Absent fields take the tool's own default
+ * and `null` resets one field. The deviation, source, and Pearson fields apply to
+ * `regression_trend` only.
+ */
+export interface channel_tool_options {
+  /** Dashed middle line; the regression line on a regression trend (default on for the parallel channel and the regression trend, off for the others). */
+  middle_line?: boolean | null;
+  /** Middle-line CSS color; `""` follows the stroke color (default). */
+  middle_color?: string | null;
+  /** Upper line offset in residual standard deviations (default 2, range -100..100). */
+  upper_deviation?: number | null;
+  /** Lower line offset in residual standard deviations (default -2, range -100..100). */
+  lower_deviation?: number | null;
+  /** Paint the upper deviation line and its zone (default true). */
+  use_upper_deviation?: boolean | null;
+  /** Paint the lower deviation line and its zone (default true). */
+  use_lower_deviation?: boolean | null;
+  /** Bar value the regression fits (default `"close"`). */
+  source?: indicator_input_source | null;
+  /** Paint Pearson's R below the regression's start (default true). */
+  show_pearsons?: boolean | null;
+}
+// B8: channels — end
+// B8: fibonacci — begin
+/**
+ * Fibonacci-family options (`tool_options.fibonacci`); absent fields keep their defaults. Each
+ * tool's property schema lists the fields it reads.
+ */
+export interface fibonacci_tool_options {
+  /**
+   * Swap the ends levels 0 and 1 sit at (retracement, extension, channel, fan), project time
+   * zones backward, or turn the spiral counterclockwise (default `false`).
+   */
+  reverse?: boolean;
+  /** Show level values in labels (default `true`). */
+  show_levels?: boolean;
+  /** Show level prices in labels: retracement and extension (default `true`). */
+  show_prices?: boolean;
+  /** Show level values as percents, `61.8%` instead of `0.618` (default `false`). */
+  levels_as_percent?: boolean;
+  /** Interpolate price levels in log space: retracement, extension, channel (default `false`). */
+  log_scale?: boolean;
+  /** Show the dashed trend line through the anchors (default `true`). */
+  trend_line?: boolean;
+  /** Show the speed resistance fan's grid (default `true`). */
+  grid?: boolean;
+  /** Draw speed resistance arcs as full circles (default `false`). */
+  full_circles?: boolean;
+  /**
+   * Level label placement: beyond the left end, centered, or beyond the right end of price
+   * levels; left of, on, or right of time levels. Absent: `"left"` for price levels, `"right"`
+   * for time levels.
+   */
+  label_h_align?: drawing_text_h_align;
+  /**
+   * Level label placement: above, on, or below price levels; at the top, middle, or bottom of
+   * time levels. Absent: `"middle"` for price levels, `"bottom"` for time levels.
+   */
+  label_v_align?: drawing_text_v_align;
+}
+// B8: fibonacci — end
+// B8: pitchforks_gann — begin
+/**
+ * Gann-tool options (`tool_options.gann`); absent fields keep their defaults. Each field applies
+ * to the Gann tools named on it. Pitchforks and the pitchfan use only the common options: their
+ * `levels` are median offsets in half-handle widths (level 1 passes through the handle's ends).
+ */
+export interface gann_tool_options {
+  /** Gann box vertical levels as fractions of the box width (its `levels` are the price levels). */
+  time_levels?: drawing_level[];
+  /**
+   * Gann box (with `show_angles`) and Gann squares: angle lines from the pivot corner as positive
+   * multiples of the 1×1 slope (`2` is 1×2, `0.5` is 2×1).
+   */
+  angles?: drawing_level[];
+  /** Gann squares: quarter arcs around the pivot corner, radii as positive fractions of the side. */
+  arcs?: drawing_level[];
+  /** Gann box and squares: measure from the second anchor's price; the fixed square grows down. */
+  reverse?: boolean;
+  /** Gann box: paint `angles` from the pivot corner (default `false`). */
+  show_angles?: boolean;
+  /** Gann squares: the price range, bars, and price-per-bar box (default `true`). */
+  show_stats?: boolean;
+  /**
+   * Gann fan and fixed square: price units per bar of the 1×1 angle. `null` makes the fan's 1×1
+   * pass through its second anchor and the fixed square a square on screen.
+   */
+  scale_ratio?: number | null;
+  /** Fixed square: side length in bars, 1..=100000 (default 20). */
+  size_bars?: number;
+}
+// B8: pitchforks_gann — end
+// B8: projection_annotations — begin
+/** How a `bars_pattern` paints its copied bars: high–low or open–close sticks, or a line through one field. */
+export type bars_pattern_mode = "hl_bars" | "oc_bars" | "line_open" | "line_high" | "line_low" | "line_close";
+/** The bounded built-in icon set of the `icon` tool. */
+export type drawing_icon =
+  | "star"
+  | "heart"
+  | "check"
+  | "cross"
+  | "circle"
+  | "square"
+  | "diamond"
+  | "triangle_up"
+  | "triangle_down";
+/** Projection & Annotations options (`tool_options.projection_annotation`); absent fields keep their defaults. */
+export interface projection_annotation_tool_options {
+  /** `bars_pattern` paint mode (default `"hl_bars"`). */
+  bars_mode?: bars_pattern_mode;
+  /** `bars_pattern`: reverse the copied bars in time (default `false`). */
+  mirrored?: boolean;
+  /** `bars_pattern`: turn the copied bars upside down within the box between its two anchors (default `false`). */
+  flipped?: boolean;
+  /**
+   * `bars_pattern`: the copied `[open, high, low, close]` bars, oldest first (at most 128). The
+   * engine captures them when the pattern is created; paste, sync, and persistence carry them,
+   * while named templates keep only the style.
+   */
+  bars?: [number, number, number, number][];
+  /** `icon` shape (default `"star"`). */
+  icon?: drawing_icon;
+  /** `icon` size in CSS px, 8..128 (default 24). */
+  icon_size?: number;
+  /**
+   * `note`: paint the text box while the note is neither hovered, selected, nor edited (default
+   * `false`: only the pin shows then).
+   */
+  always_show_text?: boolean;
+}
+// B8: projection_annotations — end
+// B8: patterns_elliott_cycles — begin
+/**
+ * Elliott wave degree, largest first. Labels follow the Frost–Prechter notation: supercycle-scale
+ * degrees use upper Roman numerals and lowercase letters, primary to minor Arabic numerals and
+ * uppercase letters, minute to subminuette lower Roman numerals and lowercase letters; within each
+ * triad the degrees are ringed, parenthesized, and bare. The millennium degrees wrap upper Roman
+ * numerals in braces, brackets, and angle brackets.
+ */
+export type elliott_wave_degree =
+  | "supermillennium"
+  | "millennium"
+  | "submillennium"
+  | "grand_supercycle"
+  | "supercycle"
+  | "cycle"
+  | "primary"
+  | "intermediate"
+  | "minor"
+  | "minute"
+  | "minuette"
+  | "subminuette";
+/** Patterns, Elliott waves, and cycles options (`tool_options.pattern`); absent fields keep their defaults. */
+export interface pattern_tool_options {
+  /** XABCD, cypher, ABCD, and three drives: dashed ratio connectors and their ratios (default `true`). */
+  show_ratios?: boolean;
+  /** Elliott waves: the degree whose notation labels the waves (default `"intermediate"`). */
+  degree?: elliott_wave_degree;
+  /** Elliott waves: the wave polyline; `false` leaves only the labels (default `true`). */
+  show_wave?: boolean;
+}
+// B8: patterns_elliott_cycles — end
+// B8: shapes — begin
+/** Shapes-family options (`tool_options.shape`); absent fields keep their defaults. */
+export interface shape_tool_options {
+  /**
+   * Polyline only: join the last vertex back to the first and, while `fill_enabled`, fill the
+   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it.
+   */
+  closed?: boolean;
+}
+// B8: shapes — end
+
+/**
+ * Family-specific option blocks (B8), one optional block per drawing family. Patches deep-merge:
+ * absent keys keep their values and `null` resets a block to its defaults.
+ */
+export interface drawing_tool_options {
+  // B8: lines — begin
+  line?: line_tool_options | null;
+  // B8: lines — end
+  // B8: channels — begin
+  channel?: channel_tool_options | null;
+  // B8: channels — end
+  // B8: fibonacci — begin
+  fibonacci?: fibonacci_tool_options | null;
+  // B8: fibonacci — end
+  // B8: pitchforks_gann — begin
+  gann?: gann_tool_options | null;
+  // B8: pitchforks_gann — end
+  // B8: projection_annotations — begin
+  projection_annotation?: projection_annotation_tool_options | null;
+  // B8: projection_annotations — end
+  // B8: patterns_elliott_cycles — begin
+  pattern?: pattern_tool_options | null;
+  // B8: patterns_elliott_cycles — end
+  // B8: shapes — begin
+  shape?: shape_tool_options | null;
+  // B8: shapes — end
+}
 
 /**
  * A drawing's options (engine `Drawing`). Every tool can carry a text label placed by the
@@ -2419,7 +2996,10 @@ export interface drawing_options {
   width: number;
   /** Stroke style (default `"solid"`). */
   style: line_style;
-  /** Rectangle fill (default `""` = the border color at 20% alpha). Unused by other kinds. */
+  /**
+   * Region fill of the rectangle and of family tools that fill (default `""` = the stroke color
+   * washed out, 20% alpha for the rectangle). Unused by the line kinds and the text tool.
+   */
   fill_color: string;
   /** Interactive rectangle preview fill (`""` = `fill_color`). */
   preview_fill_color: string;
@@ -2459,6 +3039,11 @@ export interface drawing_options {
   box_border_color: string;
   /** Text-tool container border width in CSS px (default 1). */
   box_border_width: number;
+  /**
+   * Family-specific option blocks (B8). The Lines family's stats (`info_line` shows them by
+   * default) are the common `labels` list; `tool_options.line.stats_position` places their box.
+   */
+  tool_options: drawing_tool_options;
 }
 
 /** A drawing as listed by {@link chart_api.drawings}. This inspection shape is not persistence. */
@@ -2515,6 +3100,7 @@ export interface persisted_drawing_style_v1 {
   box_color?: string;
   box_border_color?: string;
   box_border_width?: number;
+  tool_options?: drawing_tool_options;
 }
 
 /** One semantic drawing in the durable V1 persistence contract. */
@@ -2547,8 +3133,15 @@ export interface trade_stream_stats {
   dependent_incremental_updates: number;
   /** Lifetime CVD/delta rows computed by study refreshes; a live tip adds only its active bars. */
   dependent_rows_computed: number;
+  /** Lifetime footprint and bound candle/bar rows projected; a live tip adds only its active bars. */
+  bar_rows_projected: number;
   /** Lifetime tape trades folded into bubble markers; a live tip adds only its new trades. */
   bubble_trades_scanned: number;
+  /**
+   * Lifetime bubble marker sizes computed; a live tip sizes only its new or merged bubbles unless
+   * the peak retained bubble volume changes, which rescales every retained bubble once.
+   */
+  bubble_markers_sized: number;
 }
 
 export interface replay_seek_stats {
@@ -3493,6 +4086,30 @@ export interface chart_api {
   add_cvd_series(stream_id: number, pane?: number, reset?: "session" | "continuous" | "anchored", anchor_timestamp_micros?: number): series_api;
   add_delta_series(stream_id: number, pane?: number): series_api;
   add_trade_bubbles(series: series_api | number, stream_id: number, options?: { minimum_volume?: number; max_markers?: number; aggregation_window_micros?: number }): void;
+  /**
+   * Anchor a time-bar trade stream to exchange-local session windows in the chart's `time_zone`
+   * and `session_start`: each window restarts the bar grid (A-share 60-minute bars open at 09:30,
+   * 10:30, 13:00 and 14:00), and `outside` places auction, lunch, and after-hours prints. `null`
+   * restores the plain `anchor_seconds` grid. The stream rebuilds once and every dependent follows;
+   * changing the chart's time zone or session start re-places the windows.
+   */
+  set_trade_stream_sessions(stream_id: number, sessions: trade_session_options | null): void;
+  /**
+   * Volume histogram derived from the stream's bars (total traded volume per bar), tinted by the
+   * primary price series' direction (`histogram_updown`); restyle it like any histogram.
+   */
+  add_trade_volume_series(stream_id: number, pane?: number): series_api;
+  /**
+   * Derive `target` (a candlestick or bar series) and an optional volume histogram from a source
+   * series by engine resampling; both follow every source change, refreshing only the affected
+   * tail. The targets are engine-owned: host writes to them are rejected (see
+   * {@link series_api.last_ingestion_diagnostics}). Reconfigure to extend the boundaries, e.g. when a
+   * new trading date starts; source rows outside every boundary are omitted.
+   */
+  configure_resampled_series(target: series_api | number, options: resample_series_options): void;
+  /** The derived bars of a resampled series, or `null` when it is not resampled. */
+  resampled_bars(target: series_api | number): readonly resampled_bar[] | null;
+  resample_stats(target: series_api | number): resample_stats | null;
   add_series(kind: "footprint", options?: Partial<any_series_options> & Partial<footprint_series_options>): footprint_series_api;
   add_series(kind: general_series_kind, options: general_series_options): general_series_api;
   add_series(kind: series_kind, options?: Partial<any_series_options>): series_api;
@@ -3576,7 +4193,8 @@ export interface chart_api {
   /** Add KDJ K, D, and J lines in their own oscillator pane (dotted 20/80 bands). RSV uses the last
    *  `period` bars; `K = SMA(RSV, k_smoothing, 1)`, `D = SMA(K, d_smoothing, 1)`, `J = 3K - 2D`,
    *  with K and D starting from 50 unless `parameters` selects `{ seed: "first_value" }` (or
-   *  `{ convention: "china" }`). Defaults 9/3/3. */
+   *  `{ convention: "china" }`), which starts at the first bar over the bars available.
+   *  Defaults 9/3/3. */
   add_kdj(source: series_api, period?: number, k_smoothing?: number, d_smoothing?: number, options?: Partial<series_options>, parameters?: kdj_parameters): [series_api, series_api, series_api];
   /** Add Stochastic %K and %D lines in their own oscillator pane (dotted 20/80 band lines and
    *  the translucent channel strip between them). */
@@ -3813,7 +4431,10 @@ export interface chart_api {
   drawing_object_tree(): unknown[];
   /** Set host-supplied interval metadata used by interval visibility. */
   set_drawing_interval(interval: drawing_interval | null): void;
-  /** Copy selected or explicit drawings into a bounded payload. */
+  /**
+   * Copy selected or explicit drawings into a payload bounded like a persisted drawing document.
+   * Throws `resource_limit` past that bound and `invalid_data` when no listed drawing exists.
+   */
   copy_drawings(ids?: readonly number[]): string;
   /** Paste a payload into a pane and return newly allocated drawing handles. */
   paste_drawings(payload: string, pane_index?: number, logical_offset?: number, price_offset?: number): drawing_api[];
@@ -3824,7 +4445,11 @@ export interface chart_api {
   set_drawing_group_visibility(group_id: string, visible: boolean): number;
   set_drawing_group_locked(group_id: string, locked: boolean): number;
   move_drawing_group(group_id: string, logical_delta: number, price_delta: number): number;
-  /** Apply or export a typed template. */
+  /**
+   * Apply or export a typed style template. A template carries style only: never the name, group,
+   * revision, visibility, lock, z-order, interval visibility, price scale, or text, whether it was
+   * exported or written by the host.
+   */
   drawing_template(drawing: drawing_api | number, name: string): drawing_template;
   apply_drawing_template(drawing: drawing_api | number, template: drawing_template): void;
   /** Export/import revisioned cross-cell drawing payloads. */

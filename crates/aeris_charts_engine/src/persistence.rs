@@ -304,6 +304,9 @@ struct DrawingStyleV1 {
     box_border_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     box_border_width: Option<f64>,
+    /// B8 family option blocks; omitted when they equal the kind's defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_options: Option<crate::DrawingToolOptions>,
 }
 
 fn pane_wire_id(id: u32) -> String {
@@ -717,6 +720,10 @@ impl ChartEngine {
                         "drawing pane has no persistence id",
                     )
                 })?;
+                // Omitted style fields restore the kind's own defaults (a ray's `extend_right`,
+                // an arrow line's end cap), so each optional field is written when it differs
+                // from them.
+                let defaults = Drawing::new(0, drawing.kind, 0, Vec::new());
                 Ok(DrawingV1 {
                     id: drawing.id,
                     kind: drawing.kind.name().to_string(),
@@ -735,19 +742,20 @@ impl ChartEngine {
                             .interval_visibility
                             .enabled
                             .then_some(drawing.interval_visibility.clone()),
-                        stroke_start: (drawing.stroke_start != crate::DrawingLineCap::None)
+                        stroke_start: (drawing.stroke_start != defaults.stroke_start)
                             .then_some(drawing.stroke_start),
-                        stroke_end: (drawing.stroke_end != crate::DrawingLineCap::None)
+                        stroke_end: (drawing.stroke_end != defaults.stroke_end)
                             .then_some(drawing.stroke_end),
-                        extend_left: drawing.extend_left.then_some(true),
-                        extend_right: drawing.extend_right.then_some(true),
-                        fill_enabled: (drawing.fill_enabled
-                            != (drawing.kind == DrawingKind::Rectangle))
+                        extend_left: (drawing.extend_left != defaults.extend_left)
+                            .then_some(drawing.extend_left),
+                        extend_right: (drawing.extend_right != defaults.extend_right)
+                            .then_some(drawing.extend_right),
+                        fill_enabled: (drawing.fill_enabled != defaults.fill_enabled)
                             .then_some(drawing.fill_enabled),
                         magnet: (drawing.magnet != crate::DrawingMagnetMode::Off)
                             .then_some(drawing.magnet),
-                        labels: (!drawing.labels.is_empty()).then_some(drawing.labels.clone()),
-                        levels: (!drawing.levels.is_empty()).then_some(drawing.levels.clone()),
+                        labels: (drawing.labels != defaults.labels).then(|| drawing.labels.clone()),
+                        levels: (drawing.levels != defaults.levels).then(|| drawing.levels.clone()),
                         price_scale_id: (drawing.price_scale != DrawingPriceScale::Right)
                             .then(|| drawing.price_scale.name().to_string()),
                         color: Some(drawing.color.clone()),
@@ -761,7 +769,7 @@ impl ChartEngine {
                         label_color: drawing.label_color.clone(),
                         label_text_color: drawing.label_text_color.clone(),
                         snap_time_to_data: drawing.snap_time_to_data.then_some(true),
-                        text: (!drawing.text.is_empty()).then(|| drawing.text.clone()),
+                        text: (drawing.text != defaults.text).then(|| drawing.text.clone()),
                         text_color: drawing.text_color.clone(),
                         text_size: drawing.text_size,
                         text_weight: drawing.text_weight,
@@ -771,6 +779,8 @@ impl ChartEngine {
                         box_color: drawing.box_color.clone(),
                         box_border_color: drawing.box_border_color.clone(),
                         box_border_width: Some(drawing.box_border_width),
+                        tool_options: (drawing.tool_options != defaults.tool_options)
+                            .then(|| drawing.tool_options.clone()),
                     },
                 })
             })
@@ -1313,15 +1323,20 @@ impl ChartEngine {
                     item.id
                 )));
             }
-            if !item.anchor_times_micros.is_empty() {
+            // Pane-anchored anchors are pane fractions with no time identity.
+            let pane_anchored = kind.pane_anchored();
+            if !item.anchor_times_micros.is_empty() && !pane_anchored {
                 drawing_anchor_times.insert(item.id, item.anchor_times_micros.clone());
             }
             let bounded = |value: f64| value.is_finite() && value.abs() <= MAX_SAFE_VALUE;
+            let fraction = |value: f64| (0.0..=1.0).contains(&value);
             if item.anchors.iter().any(|anchor| {
                 !bounded(anchor.price)
                     || anchor.logical.is_some_and(|logical| !bounded(logical))
                     || anchor.time.is_some_and(|time| !bounded(time))
                     || (anchor.logical.is_none() && anchor.time.is_none())
+                    || (pane_anchored
+                        && !(anchor.logical.is_some_and(fraction) && fraction(anchor.price)))
             }) {
                 return Err(invalid(format!(
                     "drawing {} has an invalid anchor",
@@ -1530,6 +1545,15 @@ impl ChartEngine {
                 validate_positive_number(width, "box_border_width")?;
                 drawing.box_border_width = width;
             }
+            if let Some(tool_options) = style.tool_options {
+                if !tool_options.validate() {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid tool options",
+                        item.id
+                    )));
+                }
+                drawing.tool_options = tool_options;
+            }
             max_drawing_id = max_drawing_id.max(item.id);
             drawings.push(drawing);
         }
@@ -1624,7 +1648,7 @@ impl ChartEngine {
         // state and historically survived import. Abort only the in-flight placement/capture.
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
-        self.editing_drawing = None;
+        self.text_edit = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
         #[cfg(not(target_arch = "wasm32"))]
@@ -1996,7 +2020,7 @@ impl ChartEngine {
         self.drawing_history = crate::DrawingHistory::default();
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
-        self.editing_drawing = None;
+        self.text_edit = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
         for series in &mut self.series {

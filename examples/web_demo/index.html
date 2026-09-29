@@ -346,6 +346,91 @@
       <button type="button" data-tool="brush" title="Freehand brush: drag to draw a smooth stroke; when selected its two end anchors re-anchor, the body moves">brush</button>
       <button type="button" data-tool="long_position" title="Long Position: one click places entry, target, stop, and width">long position</button>
       <button type="button" data-tool="short_position" title="Short Position: one click places entry, target, stop, and width">short position</button>
+      <!-- B8: lines — begin -->
+      <button type="button" data-tool="ray" title="Ray: from the first anchor through the second to the pane edge">ray</button>
+      <button type="button" data-tool="extended_line" title="Extended line: through both anchors to both pane edges">ext line</button>
+      <button type="button" data-tool="info_line" title="Info line: segment with price change, percent, bars, duration, and angle stats">info line</button>
+      <button type="button" data-tool="trend_angle" title="Trend angle: segment with its screen angle against the horizontal">trend angle</button>
+      <button type="button" data-tool="cross_line" title="Cross line: horizontal and vertical lines through one anchor">cross line</button>
+      <button type="button" data-tool="arrow_line" title="Arrow: two-anchor segment ending in an arrowhead">arrow</button>
+      <!-- B8: lines — end -->
+      <!-- B8: channels — begin -->
+      <button type="button" data-tool="parallel_channel" title="Parallel channel: two clicks for the base line, a third for the parallel line">parallel channel</button>
+      <button type="button" data-tool="regression_trend" title="Regression trend: linear regression of closes between two bars with ±2 standard-deviation lines and Pearson's R">regression</button>
+      <button type="button" data-tool="flat_top_bottom" title="Flat top/bottom: a trend line and a horizontal level at the third click">flat top/bottom</button>
+      <button type="button" data-tool="disjoint_channel" title="Disjoint channel: a trend line and its mirrored-slope line through the third click">disjoint channel</button>
+      <!-- B8: channels — end -->
+      <!-- B8: fibonacci — begin -->
+      <button type="button" data-tool="fib_retracement" title="Fib retracement: ratio levels between two anchors (level 0 on the second)">fib retr</button>
+      <button type="button" data-tool="trend_based_fib_extension" title="Trend-based fib extension: the first leg's move projected from a third anchor">fib ext</button>
+      <button type="button" data-tool="fib_channel" title="Fib channel: ratio lines parallel to the first leg, offset toward a third anchor">fib channel</button>
+      <button type="button" data-tool="fib_time_zone" title="Fib time zones: vertical lines at Fibonacci multiples of the anchors' time distance">fib zones</button>
+      <button type="button" data-tool="trend_based_fib_time" title="Trend-based fib time: the first leg's duration projected from a third anchor">fib time</button>
+      <button type="button" data-tool="fib_speed_resistance_fan" title="Fib speed resistance fan: price and time ratio rays from the first anchor">fib fan</button>
+      <button type="button" data-tool="fib_speed_resistance_arcs" title="Fib speed resistance arcs: ratio arcs around the first anchor toward the second">fib arcs</button>
+      <button type="button" data-tool="fib_circles" title="Fib circles: concentric ratio circles around the anchors' midpoint">fib circles</button>
+      <button type="button" data-tool="fib_spiral" title="Fib spiral: golden spiral around the first anchor through the second">fib spiral</button>
+      <button type="button" data-tool="fib_wedge" title="Fib wedge: ratio arcs between two edges from the first anchor">fib wedge</button>
+      <!-- B8: fibonacci — end -->
+      <!-- B8: pitchforks_gann — begin -->
+      <button type="button" data-tool="andrews_pitchfork" title="Andrews pitchfork: pivot, then the two handle ends; median through the handle midpoint with parallel tines">pitchfork</button>
+      <button type="button" data-tool="schiff_pitchfork" title="Schiff pitchfork: the median starts halfway between the first two pivots' prices">schiff</button>
+      <button type="button" data-tool="modified_schiff_pitchfork" title="Modified Schiff pitchfork: the median starts at the midpoint of the first two pivots">mod schiff</button>
+      <button type="button" data-tool="inside_pitchfork" title="Inside pitchfork: median from the midpoint of the first two pivots through the third">inside fork</button>
+      <button type="button" data-tool="pitchfan" title="Pitchfan: rays from the pivot through the pitchfork levels of the handle">pitchfan</button>
+      <button type="button" data-tool="gann_box" title="Gann box: price and time levels between two corners with zone fills">gann box</button>
+      <button type="button" data-tool="gann_square" title="Gann square: grid, angle fan, and arcs between two corners">gann square</button>
+      <button type="button" data-tool="gann_square_fixed" title="Gann square fixed: one click places a fixed-size square (size and price-per-bar ratio in its options)">gann fixed</button>
+      <button type="button" data-tool="gann_fan" title="Gann fan: 1x8 … 8x1 angles from the first anchor, the 1x1 through the second">gann fan</button>
+      <!-- B8: pitchforks_gann — end -->
+      <!-- B8: projection_annotations — begin -->
+      <button type="button" data-tool="forecast" title="Forecast: source and target; the target box turns into success or failure as bars arrive">forecast</button>
+      <button type="button" data-tool="bars_pattern" title="Bars pattern: copies the bars between two clicks as a movable ghost">bars pattern</button>
+      <button type="button" data-tool="price_range" title="Price range: price change, percent, and ticks between two prices">price range</button>
+      <button type="button" data-tool="date_range" title="Date range: bars and duration between two times">date range</button>
+      <button type="button" data-tool="date_and_price_range" title="Date and price range: price and time measurement together">date+price</button>
+      <button type="button" data-tool="projection" title="Projection: sector from an apex through a radius point to a price point">projection</button>
+      <button type="button" data-tool="anchored_text" title="Anchored text: text pinned to a pane position that stays put while the chart scrolls">anchored text</button>
+      <button type="button" data-tool="note" title="Note: pin marker with a note">note</button>
+      <button type="button" data-tool="price_note" title="Price note: leader from a price to its label">price note</button>
+      <button type="button" data-tool="callout" title="Callout: text box with a pointer to a point">callout</button>
+      <button type="button" data-tool="comment" title="Comment: speech bubble pointing at a point">comment</button>
+      <button type="button" data-tool="price_label" title="Price label: bubble with the point's price">price label</button>
+      <button type="button" data-tool="signpost" title="Signpost: pole with a text plate">signpost</button>
+      <button type="button" data-tool="flag_mark" title="Flag mark">flag</button>
+      <button type="button" data-tool="arrow_mark_up" title="Arrow mark up">arrow up</button>
+      <button type="button" data-tool="arrow_mark_down" title="Arrow mark down">arrow down</button>
+      <button type="button" data-tool="arrow_mark_left" title="Arrow mark left">arrow left</button>
+      <button type="button" data-tool="arrow_mark_right" title="Arrow mark right">arrow right</button>
+      <button type="button" data-tool="icon" title="Icon stamp from the built-in icon set">icon</button>
+      <!-- B8: projection_annotations — end -->
+      <!-- B8: patterns_elliott_cycles — begin -->
+      <button type="button" data-tool="xabcd_pattern" title="XABCD pattern: five clicks (X, A, B, C, D); shaded XAB/BCD triangles with Fibonacci ratios">XABCD</button>
+      <button type="button" data-tool="cypher_pattern" title="Cypher pattern: five clicks (X, A, B, C, D); ratios AB/XA, XC/XA, CD/XC">cypher</button>
+      <button type="button" data-tool="abcd_pattern" title="ABCD pattern: four clicks with BC/AB and CD/BC ratios">ABCD</button>
+      <button type="button" data-tool="head_and_shoulders" title="Head and shoulders: seven clicks (base, shoulder, neck, head, neck, shoulder, base) with the neckline">H&amp;S</button>
+      <button type="button" data-tool="triangle_pattern" title="Triangle pattern: four clicks (A, B, C, D) on alternating highs and lows; sides extend to their apex">triangle pattern</button>
+      <button type="button" data-tool="three_drives_pattern" title="Three drives: seven clicks with drive and retracement ratios">three drives</button>
+      <button type="button" data-tool="elliott_impulse_wave" title="Elliott impulse wave: six clicks (0, 1, 2, 3, 4, 5) labeled in the selected degree">impulse</button>
+      <button type="button" data-tool="elliott_correction_wave" title="Elliott correction wave: four clicks (0, A, B, C)">correction</button>
+      <button type="button" data-tool="elliott_triangle_wave" title="Elliott triangle wave: six clicks (0, A, B, C, D, E)">EW triangle</button>
+      <button type="button" data-tool="elliott_double_combo" title="Elliott double combination: four clicks (0, W, X, Y)">WXY</button>
+      <button type="button" data-tool="elliott_triple_combo" title="Elliott triple combination: six clicks (0, W, X, Y, X, Z)">WXYXZ</button>
+      <button type="button" data-tool="cyclic_lines" title="Cyclic lines: two clicks set the interval; vertical lines repeat it to the right">cyclic lines</button>
+      <button type="button" data-tool="time_cycles" title="Time cycles: two clicks set one arch's width and height; arches repeat both ways">time cycles</button>
+      <button type="button" data-tool="sine_line" title="Sine line: click a peak, then the next trough">sine</button>
+      <!-- B8: patterns_elliott_cycles — end -->
+      <!-- B8: shapes — begin -->
+      <button type="button" data-tool="rotated_rectangle" title="Rotated rectangle: click the midpoints of the two short sides, then a point on a long side">rot rect</button>
+      <button type="button" data-tool="ellipse" title="Ellipse inscribed in two corners; Shift makes a circle">ellipse</button>
+      <button type="button" data-tool="circle" title="Circle: click the center, then a point on the rim">circle</button>
+      <button type="button" data-tool="triangle" title="Triangle: click three vertices">triangle</button>
+      <button type="button" data-tool="arc" title="Arc: click the start, the end, then a point the arc passes through">arc</button>
+      <button type="button" data-tool="curve" title="Curve: click the start, the end, then the point the curve passes at its middle">curve</button>
+      <button type="button" data-tool="double_curve" title="Double curve: click the start, the end, then the points the curve passes at one and two thirds">double curve</button>
+      <button type="button" data-tool="polyline" title="Polyline: click vertices; double-click or Enter to finish, Backspace to remove the latest vertex">polyline</button>
+      <button type="button" data-tool="highlighter" title="Highlighter: drag a wide translucent marker stroke">highlighter</button>
+      <!-- B8: shapes — end -->
       <label title="Host-supplied quantity for placing the selected Long/Short Position drawing">order qty <input type="number" id="position_order_quantity" min="0.00000001" step="any" value="1"></label>
       <button id="place_position_order" type="button" disabled title="Place one host-authoritative bracket order from the selected Long/Short Position drawing">place order</button>
       <label title="Stroke/border color — templates new drawings and applies live to the selected one">color <input type="color" id="drawing_color" value="#168ef7"></label>
@@ -356,7 +441,7 @@
           <option value="dashed">dashed</option>
         </select>
       </label>
-      <label title="Stroke width in CSS px — templates new drawings and applies live to the selected one">w <input type="range" id="drawing_width" min="1" max="8" step="1" value="2"><span id="drawing_width_val">2</span></label>
+      <label title="Stroke width in CSS px — templates new drawings and applies live to the selected one">w <input type="range" id="drawing_width" min="1" max="24" step="1" value="2"><span id="drawing_width_val">2</span></label>
       <label title="Standalone Text tool content; trend-line labels are edited in place">text tool <input type="text" id="drawing_text" size="8"></label>
       <label title="Label text color — templates new drawings and applies live to the selected one">text <input type="color" id="drawing_text_color" value="#f0f0f0"></label>
       <label title="Label font size in CSS px — templates new drawings and applies live to the selected one">size <input type="number" id="drawing_text_size" min="8" max="72" step="1" value="14"></label>
@@ -1129,24 +1214,25 @@ function sync_drawing_tool_buttons(tool) {
   }
 }
 // The customization inputs template newly created drawings AND apply live to the selected one
-// (the public reference's floating settings, toolbar form).
-// A false value means trend-label ink follows the line color. The color input still displays the
-// resolved color, but it is serialized only after the user explicitly changes that control.
-let drawing_text_color_explicit = false;
+// (the public reference's floating settings, toolbar form). Only the settings the user explicitly
+// changed template a new drawing: every other option keeps the armed tool's own catalog default
+// (a market-colored arrow, a dashed gray Fibonacci trend line, a highlighter's translucent wide
+// marker, a label following the chart font size); an untouched input is display only.
+const drawing_explicit_options = new Set();
 function drawing_options_from_inputs(kind = null) {
-  const options = {
-    color: document.getElementById("drawing_color").value,
-    style: document.getElementById("drawing_style").value,
-    width: Number(document.getElementById("drawing_width").value),
-    text_size: Number(document.getElementById("drawing_text_size").value),
-    text_weight: Number(document.getElementById("drawing_weight").value),
-    text_italic: document.getElementById("drawing_italic").checked,
-    text_h_align: document.getElementById("drawing_text_h_align").value,
-    text_v_align: document.getElementById("drawing_text_v_align").value,
+  const value_of = {
+    color: () => document.getElementById("drawing_color").value,
+    style: () => document.getElementById("drawing_style").value,
+    width: () => Number(document.getElementById("drawing_width").value),
+    text_color: () => document.getElementById("drawing_text_color").value,
+    text_size: () => Number(document.getElementById("drawing_text_size").value),
+    text_weight: () => Number(document.getElementById("drawing_weight").value),
+    text_italic: () => document.getElementById("drawing_italic").checked,
+    text_h_align: () => document.getElementById("drawing_text_h_align").value,
+    text_v_align: () => document.getElementById("drawing_text_v_align").value,
   };
-  if (drawing_text_color_explicit) {
-    options.text_color = document.getElementById("drawing_text_color").value;
-  }
+  const options = {};
+  for (const key of drawing_explicit_options) options[key] = value_of[key]();
   if (kind === "text") options.text = document.getElementById("drawing_text").value;
   return options;
 }
@@ -1184,8 +1270,11 @@ function sync_drawing_inputs_from_selection() {
   document.getElementById("drawing_width").value = String(o.width);
   document.getElementById("drawing_width_val").textContent = String(o.width);
   if (selected.kind() === "text") set("drawing_text", o.text);
+  // Showing a selection marks nothing explicit, except that a drawing's own text color stands
+  // for an explicit one (a false value means trend-label ink follows the line color).
   const explicit_text_color = css_to_hex(o.text_color);
-  drawing_text_color_explicit = explicit_text_color !== null;
+  if (explicit_text_color !== null) drawing_explicit_options.add("text_color");
+  else drawing_explicit_options.delete("text_color");
   const inherited_text_color = selected.kind() === "trend_line"
     ? css_to_hex(o.color)
     : css_to_hex(active_chart().options().layout.textColor);
@@ -1197,23 +1286,33 @@ function sync_drawing_inputs_from_selection() {
   set("drawing_text_v_align", o.text_v_align);
 }
 document.getElementById("chart_container").addEventListener("pointerup", () => setTimeout(sync_drawing_inputs_from_selection, 0));
-for (const id of ["drawing_color", "drawing_style", "drawing_width", "drawing_text_color", "drawing_text_size", "drawing_weight", "drawing_italic", "drawing_text_h_align", "drawing_text_v_align"]) {
+const drawing_option_of_input = {
+  drawing_color: "color",
+  drawing_style: "style",
+  drawing_width: "width",
+  drawing_text_color: "text_color",
+  drawing_text_size: "text_size",
+  drawing_weight: "text_weight",
+  drawing_italic: "text_italic",
+  drawing_text_h_align: "text_h_align",
+  drawing_text_v_align: "text_v_align",
+};
+for (const id of Object.keys(drawing_option_of_input)) {
   document.getElementById(id).addEventListener("change", () => {
-    if (id === "drawing_text_color") drawing_text_color_explicit = true;
-    if (id === "drawing_color" && !drawing_text_color_explicit) {
+    drawing_explicit_options.add(drawing_option_of_input[id]);
+    if (id === "drawing_color" && !drawing_explicit_options.has("text_color")) {
       document.getElementById("drawing_text_color").value = document.getElementById("drawing_color").value;
     }
     const tool = active_chart_router.active_drawing_tool();
-    const options = drawing_options_from_inputs(tool);
     // Re-template the armed tool (the next drawing picks the new settings up).
-    if (tool !== null) active_chart_router.set_drawing_tool(tool, options);
-    // Apply live to the selected drawing, if any — but NEVER write an empty template label
-    // over a drawing's real text (an empty `text` would wipe it back to the placeholder).
+    if (tool !== null) active_chart_router.set_drawing_tool(tool, drawing_options_from_inputs(tool));
+    // Apply only the edited setting live to the selected drawing, if any: the others keep the
+    // drawing's own values, which the inputs cannot always hold (its text, a translucent `rgba`
+    // color, a highlighter's 20 px width).
     const selected = active_chart().selected_drawing();
-    if (selected !== null) {
-      const { text: _template_text, ...style } = options;
-      selected.apply_options(style);
-    }
+    const key = drawing_option_of_input[id];
+    const value = drawing_options_from_inputs()[key];
+    if (selected !== null && value !== undefined) selected.apply_options({ [key]: value });
   });
 }
 document.getElementById("drawing_width").addEventListener("input", (e) => {
@@ -1825,7 +1924,7 @@ function sync_chart_controls_from_engine() {
   document.getElementById("font_family").value = options.layout.fontFamily;
   document.getElementById("font_size").value = String(options.layout.fontSize);
   document.getElementById("font_size_val").textContent = String(options.layout.fontSize);
-  if (!drawing_text_color_explicit) {
+  if (!drawing_explicit_options.has("text_color")) {
     document.getElementById("drawing_text_color").value = document.getElementById("drawing_color").value;
   }
 }

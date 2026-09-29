@@ -5,7 +5,8 @@
 //!   Target A — 60fps @ 10 series x 50k bars:  `build_frame` under 16.67 ms/frame
 //!   Target B — 1M-bar load under 300 ms:      `set_series_data` of 1,000,000 bars
 //!   Target C — canonical pointer sample:      fixed-capacity resolver under 0.01 ms/sample
-//!   Target D — shared non-time candles/footprint history, live, correction, and frame construction
+//!   Target D — shared non-time candles/footprint history, live, correction, frame construction,
+//!              and bounded single-trade live tips across every stream dependent
 //!   Target E — 100k visible-bar volume profile refresh and cached shared frame
 //!   Target F — 100k-point general XY line frame + nearest-hit interaction
 //!   Target G — mixed 100k-row general dashboard frame, hit interaction, and retained memory
@@ -13,6 +14,9 @@
 //!   Target I — 100k-row numeric error bars frame, hit interaction, and retained memory
 //!   Target K — 100x replay clock advance, shared projections, frame work, and flat retained memory
 //!   Target L — sustained depth updates, bounded heatmap frame work, and live-edge upload size
+//!   Target M — per-tick cost of every built-in indicator bound to a 1M-row source
+//!   Target N — live ticks plus frame construction with regression trends anchored across a
+//!              1M-row source (data-reading drawings follow ticks by the changed rows)
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
@@ -179,6 +183,314 @@ fn dense_footprint_wgpu_scene_ms() -> (usize, usize, f64) {
     )
 }
 
+/// Per-tick indicator cost measured by Target M.
+struct IndicatorTickCost {
+    bindings: usize,
+    /// `(mean, median, max)` milliseconds per current-bar replacement tick.
+    replace_ms: (f64, f64, f64),
+    /// `(mean, median, max)` milliseconds per new-bar append tick.
+    append_ms: (f64, f64, f64),
+    /// The excluded first append after the bulk install.
+    first_append_ms: f64,
+    /// Largest `last_indicator_work_rows` any measured tick reported.
+    max_work_rows: usize,
+}
+
+/// Target M: bind every built-in study kind (plus aggregate-input studies) to one `rows`-row
+/// minute candle source and its volume series, then time live ticks through the public engine
+/// path: current-bar replacements, and appends in the usual candle-then-volume order.
+fn indicator_tick_cost(
+    rows: usize,
+    slots: usize,
+    replaces_per_append: usize,
+    appends: usize,
+) -> IndicatorTickCost {
+    use aeris_charts_engine::{
+        DeviationEstimator, IndicatorInputSource, IndicatorKind, IndicatorSeed, KdjSeed, PivotKind,
+        VwapReset,
+    };
+
+    let bar = |row: usize, revision: usize| {
+        let base = 100.0 + (row as f64 * 0.0007).sin() * 12.0 + (row as f64 * 0.013).sin() * 1.5;
+        let close = base + revision as f64 * 0.01;
+        let open = base - (row as f64 * 0.31).cos() * 0.4;
+        [open, open.max(close) + 0.35, open.min(close) - 0.3, close]
+    };
+    let volume_at = |row: usize, revision: usize| ((row * 37 + revision) % 900 + 100) as f64;
+    // `slots` trailing whitespace rows model a pre-installed session: ticks then fill them in
+    // place instead of appending.
+    let mut times = Vec::with_capacity(rows + slots);
+    let mut columns: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows + slots));
+    let mut volumes = Vec::with_capacity(rows + slots);
+    for row in 0..rows + slots {
+        times.push(row as f64 * 60.0);
+        let (values, volume_value) = if row < rows {
+            (bar(row, 0), volume_at(row, 0))
+        } else {
+            ([f64::NAN; 4], f64::NAN)
+        };
+        for (column, value) in columns.iter_mut().zip(values) {
+            column.push(value);
+        }
+        volumes.push(volume_value);
+    }
+    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &times,
+            &columns[0],
+            &columns[1],
+            &columns[2],
+            &columns[3],
+        )
+        .expect("valid indicator source");
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .expect("valid indicator volume");
+    let kinds = [
+        IndicatorKind::Sma { period: 20 },
+        IndicatorKind::Ema {
+            period: 20,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Dema {
+            period: 20,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Tema {
+            period: 20,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Smma { period: 14 },
+        IndicatorKind::Hma { period: 20 },
+        IndicatorKind::Vwma { period: 20 },
+        IndicatorKind::StandardDeviation { period: 20 },
+        IndicatorKind::Cci { period: 20 },
+        IndicatorKind::WilliamsR { period: 14 },
+        IndicatorKind::StochasticRsi {
+            rsi_period: 14,
+            stochastic_period: 14,
+        },
+        IndicatorKind::Momentum { period: 10 },
+        IndicatorKind::RateOfChange { period: 10 },
+        IndicatorKind::Donchian { period: 20 },
+        IndicatorKind::PivotPoints {
+            variant: PivotKind::Standard,
+        },
+        IndicatorKind::ZigZag {
+            deviation_percent: 5.0,
+        },
+        IndicatorKind::Keltner {
+            period: 20,
+            multiplier: 2.0,
+        },
+        IndicatorKind::AdxDmi { period: 14 },
+        IndicatorKind::ParabolicSar,
+        IndicatorKind::SuperTrend {
+            period: 10,
+            multiplier: 3.0,
+        },
+        IndicatorKind::Ichimoku,
+        IndicatorKind::EmaRibbon {
+            periods: [5, 10, 20, 50, 200],
+        },
+        IndicatorKind::Bollinger {
+            period: 20,
+            deviation: 2.0,
+            estimator: DeviationEstimator::Population,
+        },
+        IndicatorKind::Rsi {
+            period: 14,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Macd {
+            fast: 12,
+            slow: 26,
+            signal: 9,
+            seed: IndicatorSeed::Sma,
+            histogram_multiplier: 1.0,
+        },
+        IndicatorKind::Stochastic {
+            k_period: 14,
+            d_period: 3,
+        },
+        IndicatorKind::Atr { period: 14 },
+        IndicatorKind::Vwap,
+        IndicatorKind::Obv,
+        IndicatorKind::Cmf { period: 20 },
+        IndicatorKind::Mfi { period: 14 },
+        IndicatorKind::Volume { period: 20 },
+        IndicatorKind::VwapBands {
+            reset: VwapReset::Session,
+            standard_deviation: 1.0,
+            percent: 1.0,
+        },
+        IndicatorKind::Wma { period: 20 },
+        IndicatorKind::Kdj {
+            period: 9,
+            k_smoothing: 3,
+            d_smoothing: 3,
+            seed: KdjSeed::Fifty,
+        },
+    ];
+    let mut bindings = 0;
+    for kind in kinds {
+        let weighted = matches!(
+            kind,
+            IndicatorKind::Vwma { .. }
+                | IndicatorKind::Vwap
+                | IndicatorKind::VwapBands { .. }
+                | IndicatorKind::Obv
+                | IndicatorKind::Cmf { .. }
+                | IndicatorKind::Mfi { .. }
+                | IndicatorKind::Volume { .. }
+        );
+        let outputs = chart.add_indicator_kind(0, kind, weighted.then_some(volume));
+        assert!(!outputs.is_empty(), "indicator binds");
+        bindings += 1;
+    }
+    // Aggregate price inputs derive their scalar column from the source OHLC rows.
+    for (input, kind) in [
+        (
+            IndicatorInputSource::Hlc3,
+            IndicatorKind::Rsi {
+                period: 14,
+                seed: IndicatorSeed::Sma,
+            },
+        ),
+        (
+            IndicatorInputSource::Ohlc4,
+            IndicatorKind::Sma { period: 20 },
+        ),
+        (
+            IndicatorInputSource::Hl2,
+            IndicatorKind::StochasticRsi {
+                rsi_period: 14,
+                stochastic_period: 14,
+            },
+        ),
+    ] {
+        assert!(!chart
+            .add_indicator_kind_with_input(0, input, kind, None)
+            .is_empty());
+        bindings += 1;
+    }
+
+    // The first append after a bulk install grows every exact-capacity column the install created
+    // (source, volume, and each study output) once. That amortized capacity growth is not per-tick
+    // work, so it is reported separately and excluded from the tick statistics.
+    let mut last = rows;
+    let started = Instant::now();
+    chart.update_series_bar(0, last as f64 * 60.0, bar(last, 0));
+    chart.update_series_bar(volume, last as f64 * 60.0, [volume_at(last, 0); 4]);
+    let first_append_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut replace_ms = Vec::new();
+    let mut append_ms = Vec::new();
+    let mut max_work_rows = 0;
+    for _ in 0..appends {
+        for revision in 1..=replaces_per_append {
+            let time = last as f64 * 60.0;
+            let started = Instant::now();
+            chart.update_series_bar(0, time, bar(last, revision));
+            let volume_value = volume_at(last, revision);
+            chart.update_series_bar(volume, time, [volume_value; 4]);
+            replace_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
+        }
+        last += 1;
+        let time = last as f64 * 60.0;
+        let started = Instant::now();
+        chart.update_series_bar(0, time, bar(last, 0));
+        chart.update_series_bar(volume, time, [volume_at(last, 0); 4]);
+        append_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
+    }
+    let summary = |mut samples: Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        (mean, samples[samples.len() / 2], samples[samples.len() - 1])
+    };
+    IndicatorTickCost {
+        bindings,
+        replace_ms: summary(replace_ms),
+        append_ms: summary(append_ms),
+        first_append_ms,
+        max_work_rows,
+    }
+}
+
+/// Target N: `rows` minute candles with `regressions` regression trends anchored from the first
+/// bar to the latest (one reaching into the future, so appends enter it), the view on the latest
+/// 100 bars, then live ticks (current-bar replacements and appends) each followed by one frame.
+/// Returns `(mean, median, max)` milliseconds per tick plus frame.
+fn regression_tick_cost(rows: usize, regressions: usize, ticks: usize) -> (f64, f64, f64) {
+    use aeris_charts_engine::{DrawingKind, DrawingPoint};
+
+    let bar = |row: usize, revision: usize| {
+        let close = 100.0 + (row as f64 * 0.0007).sin() * 12.0 + revision as f64 * 0.01;
+        [close - 0.2, close + 0.4, close - 0.5, close]
+    };
+    let times = (0..rows).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
+    let columns: [Vec<f64>; 4] =
+        std::array::from_fn(|column| (0..rows).map(|row| bar(row, 0)[column]).collect());
+    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &times,
+            &columns[0],
+            &columns[1],
+            &columns[2],
+            &columns[3],
+        )
+        .expect("valid regression source");
+    for index in 0..regressions {
+        let second = if index == 0 {
+            rows as f64 + 1_000.0
+        } else {
+            rows as f64 - 1.0
+        };
+        chart
+            .add_drawing(
+                DrawingKind::RegressionTrend,
+                0,
+                vec![
+                    DrawingPoint {
+                        logical: index as f64,
+                        price: 100.0,
+                    },
+                    DrawingPoint {
+                        logical: second,
+                        price: 100.0,
+                    },
+                ],
+                None,
+            )
+            .expect("regression trend");
+    }
+    chart.set_visible_logical_range(rows as f64 - 100.0, rows as f64);
+    let mut frame = ChartFrame::default();
+    chart.build_frame_into(&mut frame);
+    let mut samples = Vec::with_capacity(ticks);
+    let mut last = rows - 1;
+    for tick in 0..ticks {
+        // Four replacements of the forming bar, then the next bar.
+        if tick % 5 == 4 {
+            last += 1;
+        }
+        let started = Instant::now();
+        chart.update_series_bar(0, last as f64 * 60.0, bar(last, tick % 5));
+        chart.build_frame_into(&mut frame);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    (mean, samples[samples.len() / 2], samples[samples.len() - 1])
+}
+
 fn main() {
     const SERIES: usize = 10;
     const FRAME_BARS: usize = 50_000;
@@ -195,6 +507,9 @@ fn main() {
     const FOOTPRINT_LIVE_BUDGET_MS: f64 = 50.0;
     const FOOTPRINT_CORRECTION_BARS: usize = 10;
     const FOOTPRINT_CORRECTION_BUDGET_MS: f64 = 300.0;
+    // Enough single-trade tips to cross the 2,500-bar retention ceiling's 78-bar hysteresis once.
+    const FOOTPRINT_TIP_BARS: usize = 90;
+    const FOOTPRINT_TIP_P99_BUDGET_MS: f64 = 0.25;
     const GENERAL_LINE_POINTS: usize = 100_000;
     const GENERAL_LINE_HIT_SAMPLES: usize = 100;
     const GENERAL_LINE_HIT_BUDGET_MS: f64 = 8.0;
@@ -212,6 +527,9 @@ fn main() {
     const DEPTH_BATCH_UPDATES: usize = 100_000;
     const DEPTH_BATCH_BUDGET_MS: f64 = 150.0;
     const DEPTH_UPLOAD_BUDGET_BYTES: usize = 4_096 * 4;
+    const INDICATOR_TICK_ROWS: usize = 1_000_000;
+    const INDICATOR_TICK_APPENDS: usize = 60;
+    const INDICATOR_TICK_BUDGET_MS: f64 = 1.0;
 
     println!("aeris_charts perf gate (release build recommended)\n");
 
@@ -431,8 +749,96 @@ fn main() {
         "retention ceiling",
         if d_retention_pass { "PASS" } else { "FAIL" }
     );
-    let d_pass =
-        d_load_pass && d_live_pass && d_correction_pass && d_frame_pass && d_retention_pass;
+
+    // Sustained single-trade live tips on the retained chart. Each tip must advance the footprint,
+    // bound candles, CVD, delta, and bubble dependents by the changed bar suffix and the new trade
+    // only. The tip crossing the retention ceiling also evicts the leading bars, their trades, and
+    // their bubbles in place, without reconstructing the retained tape or refolding bubbles.
+    let tip_trades = gen_footprint_trades(
+        FOOTPRINT_HISTORY_BARS + FOOTPRINT_LIVE_BARS,
+        FOOTPRINT_TIP_BARS,
+        FOOTPRINT_TRADES_PER_BAR,
+    );
+    let tip_count = tip_trades.len() as u64;
+    let first_row_key = |chart: &ChartEngine| {
+        chart
+            .data_layer()
+            .series_data(0)
+            .and_then(|(times, _)| times.first().copied())
+    };
+    let tip_work_before = footprint
+        .trade_stream_stats(footprint_stream)
+        .expect("footprint stream stats before tips");
+    let tip_rebuilds_before = footprint
+        .footprint_work_stats(0)
+        .expect("footprint work stats before tips")
+        .historical_rebuilds;
+    let mut tip_samples = Vec::with_capacity(tip_trades.len());
+    let mut tip_trims = 0u64;
+    for trade in tip_trades {
+        let first_key = first_row_key(&footprint);
+        let start = Instant::now();
+        footprint
+            .update_footprint_trades(0, vec![trade])
+            .expect("valid footprint tip");
+        tip_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        tip_trims += u64::from(first_row_key(&footprint) != first_key);
+    }
+    let tip_work = footprint
+        .trade_stream_stats(footprint_stream)
+        .expect("footprint stream stats after tips");
+    let tip_rebuilds = footprint
+        .footprint_work_stats(0)
+        .expect("footprint work stats after tips")
+        .historical_rebuilds
+        - tip_rebuilds_before;
+    tip_samples.sort_by(f64::total_cmp);
+    let tip_percentile =
+        |p: f64| tip_samples[((tip_samples.len() - 1) as f64 * p).round() as usize];
+    let tip_study_rows = tip_work.dependent_rows_computed - tip_work_before.dependent_rows_computed;
+    let tip_bar_rows = tip_work.bar_rows_projected - tip_work_before.bar_rows_projected;
+    let tip_bubble_trades = tip_work.bubble_trades_scanned - tip_work_before.bubble_trades_scanned;
+    let tip_bubble_sizes = tip_work.bubble_markers_sized - tip_work_before.bubble_markers_sized;
+    println!(
+        "  live tips: {tip_count} single-trade tips, {tip_trims} retention trim(s), {tip_rebuilds} tape reconstruction(s); p50 {:.4} ms, max {:.2} ms; per tip {:.2} study rows, {:.2} bar rows, {:.2} bubble trades, {:.2} bubble sizes",
+        tip_percentile(0.5),
+        tip_percentile(1.0),
+        tip_study_rows as f64 / tip_count as f64,
+        tip_bar_rows as f64 / tip_count as f64,
+        tip_bubble_trades as f64 / tip_count as f64,
+        tip_bubble_sizes as f64 / tip_count as f64,
+    );
+    // CVD and delta each recompute the changed suffix (the active bar, plus the bar a tip opens);
+    // the footprint and bound candles project the same suffix; bubbles fold each new trade exactly
+    // once, also across the retention trim, and nothing reconstructs the retained tape.
+    let d_tip_work_pass = tip_study_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
+        && tip_bar_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
+        && tip_bubble_trades == tip_count
+        && tip_rebuilds == 0
+        && tip_trims >= 1;
+    println!(
+        "  [{}] tip work bounded by the changed suffix and the new trade",
+        if d_tip_work_pass { "PASS" } else { "FAIL" }
+    );
+    let d_tip_pass = report(
+        "footprint live tip p99",
+        tip_percentile(0.99),
+        FOOTPRINT_TIP_P99_BUDGET_MS,
+    );
+    // The slowest tip is the one that crosses the retention ceiling; it must still fit a frame.
+    let d_tip_max_pass = report(
+        "footprint live tip max",
+        tip_percentile(1.0),
+        FRAME_BUDGET_MS,
+    );
+    let d_pass = d_load_pass
+        && d_live_pass
+        && d_correction_pass
+        && d_frame_pass
+        && d_retention_pass
+        && d_tip_work_pass
+        && d_tip_pass
+        && d_tip_max_pass;
 
     let (dense_text_prims, dense_text_instances, dense_wgpu_p99_ms) =
         dense_footprint_wgpu_scene_ms();
@@ -1123,6 +1529,70 @@ fn main() {
         depth_memory_second as f64 / (1024.0 * 1024.0),
     );
 
+    // ---- Target M: bounded per-tick indicator work over a 1M-row source ---------------------
+    // Every built-in kind is bound, so one tick advances 38 bindings (~60 outputs) plus the volume
+    // series. Bounded rolling state makes a tick O(period) per binding, independent of history;
+    // the budget keeps a tick (candle + volume update) under 1 ms, so a 60 fps host absorbs a
+    // burst of ticks inside one frame with most of its 16.67 ms left for frame construction.
+    let tick_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 0, 4, INDICATOR_TICK_APPENDS);
+    println!(
+        "Target M — per-tick indicator cost, {} bindings over {INDICATOR_TICK_ROWS} rows (max {} work rows per tick; first append after install {:.2} ms):",
+        tick_cost.bindings, tick_cost.max_work_rows, tick_cost.first_append_ms
+    );
+    let (replace_mean, replace_median, replace_max) = tick_cost.replace_ms;
+    let m_replace = report(
+        &format!(
+            "current-bar replace mean (median {replace_median:.3} ms, max {replace_max:.2} ms)"
+        ),
+        replace_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+    let (append_mean, append_median, append_max) = tick_cost.append_ms;
+    let m_append = report(
+        &format!("new-bar append mean (median {append_median:.3} ms, max {append_max:.2} ms)"),
+        append_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+
+    // The same studies with a pre-installed one-second session (23,400 whitespace slots) after
+    // the source: filling and revising the forming slot must cost the same bounded window.
+    let slot_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 23_400, 4, INDICATOR_TICK_APPENDS);
+    println!(
+        "Target M (slots) — the same ticks filling 23,400 pre-installed session slots (max {} work rows per tick):",
+        slot_cost.max_work_rows
+    );
+    let (slot_replace_mean, slot_replace_median, slot_replace_max) = slot_cost.replace_ms;
+    let m_slot_replace = report(
+        &format!(
+            "forming-slot replace mean (median {slot_replace_median:.3} ms, max {slot_replace_max:.2} ms)"
+        ),
+        slot_replace_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+    let (slot_fill_mean, slot_fill_median, slot_fill_max) = slot_cost.append_ms;
+    let m_slot_fill = report(
+        &format!(
+            "next-slot fill mean (median {slot_fill_median:.3} ms, max {slot_fill_max:.2} ms)"
+        ),
+        slot_fill_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+
+    // ---- Target N: regression trends across a 1M-row source under live ticks ----------------
+    // Each regression spans the whole history; a tick replacing or appending the latest bar must
+    // extend the fits by the changed rows, so a tick plus its frame stays inside the per-tick
+    // budget however long the anchored range is.
+    let (regression_mean, regression_median, regression_max) =
+        regression_tick_cost(INDICATOR_TICK_ROWS, 5, 200);
+    println!("Target N — live ticks with 5 regression trends over {INDICATOR_TICK_ROWS} rows:");
+    let n_tick = report(
+        &format!(
+            "tick + frame mean (median {regression_median:.3} ms, max {regression_max:.2} ms)"
+        ),
+        regression_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+
     let all_pass = a_pass
         && b_pass
         && c_pass
@@ -1146,7 +1616,12 @@ fn main() {
         && l_update
         && l_frame
         && l_upload
-        && l_flat_memory;
+        && l_flat_memory
+        && m_replace
+        && m_append
+        && m_slot_replace
+        && m_slot_fill
+        && n_tick;
     println!(
         "\n{}",
         if all_pass {

@@ -354,7 +354,7 @@ impl ChartEngine {
             }
             SeriesKind::Histogram => {
                 let base_y = scale.price_to_coordinate(series.base, base_value);
-                let close = plot.column(PlotValueIndex::Close);
+                let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
                 let mut work = crate::frame::conflation::DensityWork::default();
                 let visible = crate::frame::conflation::visible_histogram_rows_with_work(
                     plot,
@@ -377,7 +377,7 @@ impl ChartEngine {
                         (
                             item.x_px / hpr,
                             item.geometry_time,
-                            scale.price_to_coordinate(close[item.source_row], base_value),
+                            scale.price_to_coordinate(close(item.source_row), base_value),
                             base_y,
                         )
                     })
@@ -386,7 +386,7 @@ impl ChartEngine {
                     .map(|distance| (distance, SeriesHitKind::Range))
             }
             SeriesKind::Line | SeriesKind::Area | SeriesKind::Baseline => {
-                let close = plot.column(PlotValueIndex::Close);
+                let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
                 let mut work = crate::frame::conflation::DensityWork::default();
                 let visible = crate::frame::conflation::visible_line_rows_with_work(
                     plot,
@@ -404,16 +404,19 @@ impl ChartEngine {
                     work.candidates,
                 );
                 let points = visible
-                    .into_iter()
-                    .map(|row| {
+                    .iter()
+                    .map(|&row| {
                         (
                             self.time_scale.index_to_coordinate(
                                 plot.index_at(row).expect("hit-test row index"),
                             ),
-                            scale.price_to_coordinate(close[row], base_value),
+                            scale.price_to_coordinate(close(row), base_value),
                         )
                     })
                     .collect::<Vec<_>>();
+                // The frame's period breaks: each run is tested alone, so the connector the
+                // frame omits between runs cannot be hit (a lone row keeps its one-bar segment).
+                let runs = self.line_run_ranges(id, plot, &visible, from, to);
                 // reference line-hit-test-pane-view-base.ts: width 1 when the stroke is hidden;
                 // point markers join with their resolved radius (default lineWidth/2 + 2).
                 let line_width = if series.line_visible {
@@ -426,16 +429,36 @@ impl ChartEngine {
                         .point_markers_radius
                         .unwrap_or(line_width / 2.0 + 2.0)
                 });
-                hit_test_line_series(
-                    &points,
-                    x_css,
-                    y_css,
-                    series.line_type,
-                    line_width,
-                    markers_radius,
-                    bar_spacing,
-                    HIT_TEST_TOLERANCE,
-                )
+                runs.into_iter()
+                    .filter_map(|run| {
+                        hit_test_line_series(
+                            &points[run],
+                            x_css,
+                            y_css,
+                            series.line_type,
+                            line_width,
+                            markers_radius,
+                            bar_spacing,
+                            HIT_TEST_TOLERANCE,
+                        )
+                    })
+                    .reduce(|best, hit| {
+                        let better = SeriesHit {
+                            series: id,
+                            distance: hit.0,
+                            kind: hit.1,
+                        }
+                        .is_better_than(&SeriesHit {
+                            series: id,
+                            distance: best.0,
+                            kind: best.1,
+                        });
+                        if better {
+                            hit
+                        } else {
+                            best
+                        }
+                    })
             }
             SeriesKind::Feature => {
                 let feature = series.feature.as_ref()?;
@@ -637,8 +660,13 @@ impl ChartEngine {
         let Some(last_row) = plot.last_non_whitespace_row(last_index) else {
             return Vec::new();
         };
+        // Anchors are canonical row times; an as-of plot row names the row it repeats.
         if first_row == last_row {
-            return times.get(first_row).copied().into_iter().collect();
+            return times
+                .get(plot.source_row(first_row))
+                .copied()
+                .into_iter()
+                .collect();
         }
 
         let first_x = plot
@@ -686,9 +714,12 @@ impl ChartEngine {
         }
         rows.sort_unstable();
         rows.dedup();
-        rows.into_iter()
-            .filter_map(|row| times.get(row).copied())
-            .collect()
+        let mut anchors = rows
+            .into_iter()
+            .filter_map(|row| times.get(plot.source_row(row)).copied())
+            .collect::<Vec<_>>();
+        anchors.dedup();
+        anchors
     }
 
     pub(crate) fn prune_selection_anchor_snapshot(&mut self) {

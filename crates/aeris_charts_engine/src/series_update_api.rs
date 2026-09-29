@@ -40,7 +40,8 @@ impl SeriesBarPatch {
 pub enum SeriesUpdateRejection {
     /// Unknown or removed series identity.
     UnknownSeries,
-    /// Custom, advanced (feature), and footprint series own their payloads elsewhere.
+    /// Custom, advanced (feature), footprint, and engine-derived (synthetic or resampled)
+    /// series own their payloads elsewhere.
     UnsupportedSeries,
     /// The patch carried no price the series stores: none of open/high/low/close, or no close
     /// (value) for a line/area/baseline/histogram series.
@@ -210,10 +211,13 @@ impl ChartEngine {
                 SeriesUpdateRejection::UnknownSeries,
             ));
         };
+        // Engine-derived targets (synthetic and resampled bars) change only through their
+        // source; a merge written straight into their rows would diverge from it.
         if matches!(
             series.kind,
             SeriesKind::Custom | SeriesKind::Feature | SeriesKind::Footprint
-        ) {
+        ) || self.is_source_owned_series(id)
+        {
             return Err(SeriesUpdateOutcome::Rejected(
                 SeriesUpdateRejection::UnsupportedSeries,
             ));

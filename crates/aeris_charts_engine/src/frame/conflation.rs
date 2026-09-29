@@ -150,13 +150,27 @@ fn with_edge_neighbours(
     rows
 }
 
+/// Split `0..len` into consecutive line runs at `breaks` (ascending positions in `1..len`, each
+/// the first element of a new run). No breaks yields the single run `0..len`.
+pub(crate) fn line_runs(
+    len: usize,
+    breaks: &[usize],
+) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let starts = std::iter::once(0).chain(breaks.iter().copied());
+    let ends = breaks.iter().copied().chain(std::iter::once(len));
+    starts
+        .zip(ends)
+        .map(|(start, end)| start..end)
+        .filter(|run| !run.is_empty())
+}
+
 /// Sub-pixel conflation: keep first, low, high, and last per device-pixel column.
 fn conflate_line_rows(
     plot: PlotListView<'_>,
     visible: Vec<usize>,
     x_at: &impl Fn(i64) -> f64,
 ) -> Vec<usize> {
-    let close = plot.column(PlotValueIndex::Close);
+    let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
     let mut out = Vec::new();
     let mut bucket_rows = Vec::new();
     let mut bucket: Option<i64> = None;
@@ -168,10 +182,10 @@ fn conflate_line_rows(
         let mut low = first;
         let mut high = first;
         for &row in bucket_rows.iter().skip(1) {
-            if close[row].is_finite() && (!close[low].is_finite() || close[row] < close[low]) {
+            if close(row).is_finite() && (!close(low).is_finite() || close(row) < close(low)) {
                 low = row;
             }
-            if close[row].is_finite() && (!close[high].is_finite() || close[row] > close[high]) {
+            if close(row).is_finite() && (!close(high).is_finite() || close(row) > close(high)) {
                 high = row;
             }
         }
@@ -458,7 +472,7 @@ fn visible_histogram_rows_policy(
     work: &mut DensityWork,
     use_lod: bool,
 ) -> Vec<VisibleHistogramRow> {
-    let close = plot.column(PlotValueIndex::Close);
+    let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
     // Whitespace rows draw nothing (the reference's plot list omits them).
     let (visible, measured) = density_rows(plot, from, to, bar_spacing, hpr, &x_at, use_lod);
     *work = measured;
@@ -478,7 +492,7 @@ fn visible_histogram_rows_policy(
         let bucket = x_at(plot.index_at(source_row).expect("visible row index")).floor() as i64;
         match out.last_mut() {
             Some(item) if item.geometry_time == bucket => {
-                if close[source_row].abs() > close[item.source_row].abs() {
+                if close(source_row).abs() > close(item.source_row).abs() {
                     item.source_row = source_row;
                 }
             }

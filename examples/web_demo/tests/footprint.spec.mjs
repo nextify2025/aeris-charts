@@ -326,6 +326,150 @@ test("ordinary candles consume one canonical non-time trade stream", async ({ pa
   expect(result.scalar_error).toContain("candlestick or bar");
 });
 
+test("live trade-stream tips do suffix-bounded dependent work and match a clean load", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const second = Math.floor(window.__data[0].time / 60) * 60;
+    const micros = second * 1_000_000;
+    const trade = (index) => ({
+      timestamp_micros: micros + index * 7_000_000 + 1,
+      price: 100 + ((index * 7) % 11),
+      volume: 1 + ((index * 13) % 9) + (index % 29 === 0 ? 30 : 0),
+      aggressor: index % 5 === 2 ? "unknown" : index % 2 ? "sell" : "buy",
+      trade_id: index + 1,
+      session_id: 1,
+    });
+    // Two streams on one time axis: one advances by live tips, the other loads the final tape.
+    const build = (key) => {
+      const stream = chart.add_trade_stream(key, { tick_size: 1, interval_seconds: 60 });
+      const footprint = chart.add_series("footprint", { tick_size: 1, interval_seconds: 60 });
+      chart.bind_footprint_series_to_stream(footprint, stream);
+      const candles = chart.add_series("candlestick");
+      chart.bind_trade_bar_series_to_stream(candles, stream);
+      const cvd = chart.add_cvd_series(stream, 1, "continuous");
+      const delta = chart.add_delta_series(stream, 1);
+      chart.add_trade_bubbles(footprint, stream, { minimum_volume: 3, max_markers: 32 });
+      return { stream, footprint, candles, cvd, delta };
+    };
+    const live = build("TEST:TIP:LIVE");
+    const clean = build("TEST:TIP:CLEAN");
+    chart.set_trade_stream_trades(live.stream, Array.from({ length: 400 }, (_, index) => trade(index)));
+    const tips = [];
+    for (let index = 400; index < 520; index += 1) {
+      const before = chart.trade_stream_stats(live.stream);
+      const bars_before = live.footprint.footprint_bars().length;
+      const kind = chart.update_trade_stream_trades(live.stream, [trade(index)]);
+      const after = chart.trade_stream_stats(live.stream);
+      tips.push({
+        kind,
+        changed_bars: live.footprint.footprint_bars().length + 1 - bars_before,
+        study_rows: after.dependent_rows_computed - before.dependent_rows_computed,
+        bar_rows: after.bar_rows_projected - before.bar_rows_projected,
+        bubble_trades: after.bubble_trades_scanned - before.bubble_trades_scanned,
+        bubble_sizes: after.bubble_markers_sized - before.bubble_markers_sized,
+      });
+    }
+    chart.set_trade_stream_trades(clean.stream, Array.from({ length: 520 }, (_, index) => trade(index)));
+    const read = (handles) => ({
+      bars: handles.footprint.footprint_bars(),
+      candles: handles.candles.data(),
+      cvd: handles.cvd.data(),
+      delta: handles.delta.data(),
+    });
+    return { tips, live: read(live), clean: read(clean) };
+  });
+
+  expect(result.tips).toHaveLength(120);
+  for (const tip of result.tips) {
+    expect(tip.kind).toBe("tip");
+    // CVD and delta recompute, and the footprint and candles project, only the changed bars.
+    expect(tip.study_rows).toBe(2 * tip.changed_bars);
+    expect(tip.bar_rows).toBe(2 * tip.changed_bars);
+    // Bubbles fold only the new trade; a peak change rescales at most the 32 retained bubbles.
+    expect(tip.bubble_trades).toBe(1);
+    expect(tip.bubble_sizes).toBeLessThanOrEqual(32);
+  }
+  expect(result.tips.some((tip) => tip.changed_bars === 2)).toBe(true);
+  expect(result.live.bars.length).toBeGreaterThan(20);
+  expect(result.live).toEqual(result.clean);
+});
+
+test("retained live trade-stream tips evict history in place and keep the unretained tail", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const second = Math.floor(window.__data[0].time / 60) * 60;
+    const micros = second * 1_000_000;
+    const trade = (index) => ({
+      timestamp_micros: micros + index * 7_000_000 + 1,
+      price: 100 + ((index * 7) % 11),
+      volume: 1 + ((index * 13) % 9) + (index % 29 === 0 ? 30 : 0),
+      aggressor: index % 5 === 2 ? "unknown" : index % 2 ? "sell" : "buy",
+      trade_id: index + 1,
+      session_id: 1,
+    });
+    // The same tape streams into a retained and an unretained stream on one time axis.
+    const build = (key, max_points) => {
+      const stream = chart.add_trade_stream(key, { tick_size: 1, interval_seconds: 60 });
+      const footprint = chart.add_series("footprint", { tick_size: 1, interval_seconds: 60 });
+      chart.bind_footprint_series_to_stream(footprint, stream);
+      if (max_points) footprint.apply_options({ max_points });
+      const candles = chart.add_series("candlestick");
+      chart.bind_trade_bar_series_to_stream(candles, stream);
+      const cvd = chart.add_cvd_series(stream, 1, "continuous");
+      const delta = chart.add_delta_series(stream, 1);
+      chart.add_trade_bubbles(footprint, stream, { minimum_volume: 3, max_markers: 32 });
+      return { stream, footprint, candles, cvd, delta };
+    };
+    const retained = build("TEST:TIP:RETAINED", 20);
+    const unretained = build("TEST:TIP:UNRETAINED", null);
+    const history = Array.from({ length: 200 }, (_, index) => trade(index));
+    chart.set_trade_stream_trades(retained.stream, history);
+    chart.set_trade_stream_trades(unretained.stream, history);
+    const first_open = () => retained.footprint.footprint_bars()[0].start_timestamp_micros;
+    const tips = [];
+    for (let index = 200; index < 500; index += 1) {
+      const before = chart.trade_stream_stats(retained.stream);
+      const opened_before = first_open();
+      chart.update_trade_stream_trades(retained.stream, [trade(index)]);
+      chart.update_trade_stream_trades(unretained.stream, [trade(index)]);
+      const after = chart.trade_stream_stats(retained.stream);
+      tips.push({
+        trimmed: first_open() !== opened_before,
+        bubble_trades: after.bubble_trades_scanned - before.bubble_trades_scanned,
+        bar_rows: after.bar_rows_projected - before.bar_rows_projected,
+      });
+    }
+    const read = (handles) => ({
+      bars: handles.footprint.footprint_bars().map(({ logical_index, ...bar }) => bar),
+      candles: handles.candles.data(),
+      cvd: handles.cvd.data(),
+      delta: handles.delta.data(),
+    });
+    return { tips, retained: read(retained), unretained: read(unretained) };
+  });
+
+  expect(result.tips.filter((tip) => tip.trimmed).length).toBeGreaterThan(2);
+  for (const tip of result.tips) {
+    // Every tip folds only its own trade, also the tips that cross the retention ceiling.
+    expect(tip.bubble_trades).toBe(1);
+    // The footprint and candles project only the active bar and a bar the tip opened.
+    expect(tip.bar_rows).toBeLessThanOrEqual(4);
+  }
+  const retained_bars = result.retained.bars.length;
+  expect(retained_bars).toBeLessThanOrEqual(20);
+  expect(result.unretained.bars.length).toBeGreaterThan(retained_bars);
+  const tail = (rows) => rows.slice(rows.length - retained_bars);
+  expect(result.retained.bars).toEqual(tail(result.unretained.bars));
+  expect(result.retained.candles).toEqual(tail(result.unretained.candles));
+  // Evicting history never rewrites the cumulative delta of the bars that remain.
+  expect(result.retained.cvd).toEqual(tail(result.unretained.cvd));
+  expect(result.retained.delta).toEqual(tail(result.unretained.delta));
+});
+
 test("trade replay clock masks retained future events and reports seek work", async ({ page }) => {
   await open_chart(page);
   const result = await page.evaluate(() => {

@@ -6,13 +6,17 @@
 //! no point at a given index is simply absent there (whitespace). This is what lets a price
 //! series and a volume series — or a candlestick and a moving-average overlay — share one time
 //! scale even when their sample sets differ.
+//!
+//! A series opted into [`TimeAlignment::AsOf`] (an overlay from another market calendar) never
+//! joins that union. Each merged point up to the union's last real bar shows its last row at or
+//! before the point's time instead, through a sparse plot-row -> canonical-row map; values are
+//! not copied.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
 use crate::helpers::algorithms::lower_bound;
-use crate::model::data_validation::is_whitespace_values;
 use crate::model::lod::LodPyramid;
 use crate::model::plot_list::{PlotList, PlotListView, PlotValueIndex, PlotValues};
 use crate::TimePointIndex;
@@ -47,10 +51,12 @@ pub const POINT_COLOR_CHANNELS: usize = 3;
 pub const POINT_COLOR_ABSENT: u32 = 0;
 
 /// Read-only per-row color columns resolved once from an opaque series identity. Frame builders
-/// keep this view across their row loop so identity lookup never becomes per-point work.
+/// keep this view across their row loop so identity lookup never becomes per-point work. Rows are
+/// plot rows: an as-of aligned series reads the canonical row each plot row shows.
 #[derive(Clone, Copy)]
 pub struct PointColors<'a> {
     channels: [&'a [u32]; POINT_COLOR_CHANNELS],
+    rows: Option<&'a [u32]>,
 }
 
 impl PointColors<'_> {
@@ -59,10 +65,41 @@ impl PointColors<'_> {
         if channel.is_empty() {
             return None;
         }
+        let row = match self.rows {
+            Some(rows) => *rows.get(row)? as usize,
+            None => row,
+        };
         channel
             .get(row)
             .copied()
             .filter(|&color| color != POINT_COLOR_ABSENT)
+    }
+}
+
+/// How an owned series' rows land on the shared time axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeAlignment {
+    /// The series' timestamps join the merged time points (the default, reference behavior).
+    #[default]
+    Union,
+    /// The series never adds time points. Each merged point, up to the last point where a union
+    /// series holds a real bar, shows the series' last row at or before the point's time (an
+    /// as-of join): rows between two points collapse into the later one, and a point with no
+    /// newer row repeats the previous one. With `max_staleness` (seconds), a point whose as-of row
+    /// is older than that stays empty instead; `None` repeats without limit.
+    AsOf { max_staleness: Option<i64> },
+}
+
+impl TimeAlignment {
+    pub fn is_as_of(self) -> bool {
+        matches!(self, Self::AsOf { .. })
+    }
+
+    fn max_staleness(self) -> Option<i64> {
+        match self {
+            Self::AsOf { max_staleness } => max_staleness,
+            Self::Union => None,
+        }
     }
 }
 
@@ -92,18 +129,6 @@ impl SeriesValues {
         match self {
             Self::Single(values) => [values, values, values, values],
             Self::Ohlc(values) => [&values[0], &values[1], &values[2], &values[3]],
-        }
-    }
-
-    fn row(&self, row: usize) -> [f64; 4] {
-        match self {
-            Self::Single(values) => [values[row]; 4],
-            Self::Ohlc(values) => [
-                values[0][row],
-                values[1][row],
-                values[2][row],
-                values[3][row],
-            ],
         }
     }
 
@@ -236,11 +261,14 @@ struct RawSeries {
     /// Rebuilt against merged indices; keys are positions in `merged_times`.
     plot: PlotList,
     /// Compact endpoint and extrema source-row identities used only for dense viewport queries.
+    /// Rows are plot rows: canonical rows, or merged points for an as-of mapped plot.
     lod: LodPyramid,
     last_lod_update_nodes: usize,
     /// Changes on every accepted mutation of this series' canonical rows. Derived-data
     /// runtimes use it to reject incremental continuation from stale source state.
     generation: u64,
+    /// How an owned series lands on the merged time points. Aliased outputs follow their source.
+    alignment: TimeAlignment,
 }
 
 #[derive(Clone, Copy)]
@@ -262,19 +290,49 @@ impl RawSeries {
             lod: LodPyramid::default(),
             last_lod_update_nodes: 0,
             generation: 0,
+            alignment: TimeAlignment::Union,
         }
     }
 
+    /// Canonical-row LOD maintenance for a mutation. An as-of series summarizes plot rows
+    /// instead, so its row-map maintenance repairs the LOD once the map is current.
     fn rebuild_lod(&mut self) {
-        self.lod.rebuild(self.values.view());
+        if self.alignment.is_as_of() {
+            return;
+        }
+        self.lod
+            .rebuild(self.values.view().with_rows(self.plot.source_rows()));
         self.last_lod_update_nodes = self.lod.node_count();
     }
 
     fn rebuild_lod_range(&mut self, affected: Range<usize>) {
+        if self.alignment.is_as_of() {
+            return;
+        }
         self.last_lod_update_nodes = self
             .lod
-            .rebuild_range(self.values.view(), affected)
+            .rebuild_range(
+                self.values.view().with_rows(self.plot.source_rows()),
+                affected,
+            )
             .nodes_updated;
+    }
+
+    /// Repair the LOD over plot rows `affected` after the row map, or the values those rows
+    /// show, changed. The node holding the last surviving row is always refreshed, so a
+    /// shortened plot cannot keep a summary naming a dropped row.
+    fn repair_plot_lod(&mut self, affected: Range<usize>) {
+        let values = self.values.view().with_rows(self.plot.source_rows());
+        let len = values.len();
+        let start = affected.start.min(len.saturating_sub(1));
+        let end = affected.end.min(len).max(start + 1);
+        self.last_lod_update_nodes = self.lod.rebuild_range(values, start..end).nodes_updated;
+    }
+
+    fn rebuild_plot_lod(&mut self) {
+        self.lod
+            .rebuild(self.values.view().with_rows(self.plot.source_rows()));
+        self.last_lod_update_nodes = self.lod.node_count();
     }
 }
 
@@ -289,6 +347,9 @@ pub struct DataLayer {
     /// Changes only when the merged timestamp sequence changes. Value-only current-bar updates
     /// leave it untouched, so time-derived consumers can distinguish them without rescanning.
     time_points_generation: u64,
+    /// Changes whenever an existing time point can move or leave: anything but appending points
+    /// after the last one. While it holds, every point below the old length keeps its index.
+    time_index_generation: u64,
     /// Old union for the current owner transaction, captured only when a rebuild actually changes
     /// logical indices and consumed when the owner synchronizes the final time scale.
     merged_time_rebase_source: Option<Vec<i64>>,
@@ -299,6 +360,18 @@ pub struct DataLayer {
     /// Lifetime count of whole-layer union merges plus reindex passes. Work telemetry for tests
     /// that prove a historical value correction stays local.
     index_rebuilds: u64,
+    /// Live owned series with [`TimeAlignment::AsOf`]; zero keeps every union path as before.
+    as_of_series: usize,
+    /// Merged points `[0, as_of_through)` carry as-of rows: through the last point where a union
+    /// series holds a real bar, so an overlay never runs into future session slots.
+    as_of_through: usize,
+    /// Series whose as-of plot rows changed outside their own mutation (a new union point, a
+    /// moved data extent, or a union reindex), drained by the owner to invalidate their retained
+    /// frames.
+    realigned: Vec<SeriesId>,
+    /// Lifetime count of plot rows (re)written by as-of maintenance (work telemetry for tests
+    /// that prove live tips stay proportional to the change).
+    as_of_rows_rewritten: u64,
 }
 
 /// Piecewise-linear old-to-new logical-index mapping through timestamps present in both unions.
@@ -502,6 +575,218 @@ impl DataLayer {
         Some(mapping)
     }
 
+    /// Choose how an owned series lands on the merged time points. Aliased indicator outputs
+    /// follow their source and are refused, as are unknown ids and a negative staleness bound.
+    /// A change rebuilds the union and every mapping once. Returns whether the policy changed.
+    pub fn set_time_alignment(&mut self, id: SeriesId, alignment: TimeAlignment) -> bool {
+        let Some(slot) = self.series_slot(id) else {
+            return false;
+        };
+        if alignment.max_staleness().is_some_and(|max| max < 0) {
+            return false;
+        }
+        let series = &mut self.series[slot];
+        if series.time_alias.is_some() || series.alignment == alignment {
+            return false;
+        }
+        let was_as_of = series.alignment.is_as_of();
+        series.alignment = alignment;
+        match (was_as_of, alignment.is_as_of()) {
+            (false, true) => self.as_of_series += 1,
+            (true, false) => self.as_of_series -= 1,
+            _ => {}
+        }
+        self.rebuild_merged();
+        self.reindex_all();
+        if !alignment.is_as_of() {
+            // Back on canonical rows: its summaries name canonical rows again.
+            self.series[slot].rebuild_lod();
+        }
+        true
+    }
+
+    /// The alignment a series follows: its own, or its source's for an aliased output. `None`
+    /// for an unknown or stale id.
+    pub fn time_alignment(&self, id: SeriesId) -> Option<TimeAlignment> {
+        let slot = self.series_slot(id)?;
+        let owner = self
+            .resolved_alias_range(slot)
+            .map_or(slot, |(source, _, _)| source);
+        Some(self.series[owner].alignment)
+    }
+
+    /// Series whose as-of plot rows changed as a side effect of another series' mutation (a new
+    /// union point, a moved data extent, or any union reindex) since the previous call. The owner
+    /// invalidates their retained presentation; each id appears once.
+    pub fn take_realigned(&mut self) -> Vec<SeriesId> {
+        std::mem::take(&mut self.realigned)
+    }
+
+    /// Lifetime count of plot rows (re)written by as-of maintenance (work telemetry).
+    #[doc(hidden)]
+    pub fn as_of_rows_rewritten(&self) -> u64 {
+        self.as_of_rows_rewritten
+    }
+
+    /// Merged index of the last point where a host-owned union series holds a real row
+    /// (whitespace excluded, time-only custom rows included), within the replay cutoff. As-of
+    /// rows never extend past it, so an overlay stops where the chart's own bars stop instead of
+    /// running into host-installed future session slots. `O(series × log rows)`.
+    fn union_data_extent(&self) -> Option<usize> {
+        let mut extent: Option<usize> = None;
+        for &slot in self.live_slots.values() {
+            let series = &self.series[slot];
+            if series.time_alias.is_some()
+                || series.alignment.is_as_of()
+                || series.plot.source_rows().is_some()
+            {
+                continue;
+            }
+            let plot = PlotListView::with_lod(&series.plot, series.values.view(), &series.lod);
+            let row = if series.rows_count_as_data {
+                plot.size().checked_sub(1)
+            } else {
+                plot.last_non_whitespace_row_before(plot.size())
+            };
+            if let Some(index) = row.and_then(|row| plot.index_at(row)) {
+                extent = extent.max(Some(index as usize));
+            }
+        }
+        extent
+    }
+
+    fn as_of_slots(&self) -> Vec<usize> {
+        if self.as_of_series == 0 {
+            return Vec::new();
+        }
+        self.live_slots
+            .values()
+            .copied()
+            .filter(|&slot| {
+                self.series[slot].time_alias.is_none() && self.series[slot].alignment.is_as_of()
+            })
+            .collect()
+    }
+
+    fn note_realigned(&mut self, slot: usize) {
+        let Some(id) = self
+            .live_slots
+            .iter()
+            .find_map(|(&id, &candidate)| (candidate == slot).then_some(id))
+        else {
+            return;
+        };
+        if !self.realigned.contains(&id) {
+            self.realigned.push(id);
+        }
+    }
+
+    /// Rebuild every as-of mapping against the current union (outputs are re-aliased by the
+    /// caller). A union reindex can move an overlay's points without changing the time points (a
+    /// popped or replaced bar inside pre-installed session slots), so each one is reported.
+    fn rebuild_as_of_all(&mut self) {
+        self.as_of_through = if self.as_of_series == 0 {
+            0
+        } else {
+            self.union_data_extent().map_or(0, |index| index + 1)
+        };
+        for slot in self.as_of_slots() {
+            self.rebuild_as_of_rows(slot);
+            self.note_realigned(slot);
+        }
+    }
+
+    /// Rebuild one owned as-of series' mapping and plot LOD (outputs are re-aliased by callers).
+    fn rebuild_as_of_rows(&mut self, slot: usize) {
+        let cutoff = self.time_cutoff;
+        let through = self.as_of_through;
+        let series = &mut self.series[slot];
+        let len = cutoff.map_or(series.times.len(), |cutoff| {
+            series.times.partition_point(|&time| time <= cutoff)
+        });
+        series.plot.rebuild_as_of(
+            &self.merged_times,
+            through,
+            &series.times[..len],
+            series.alignment.max_staleness(),
+        );
+        series.rebuild_plot_lod();
+        self.as_of_rows_rewritten = self
+            .as_of_rows_rewritten
+            .wrapping_add(series.plot.size() as u64);
+    }
+
+    /// Re-derive one owned as-of series' rows for the merged points `[from, as_of_through)`,
+    /// then carry the change to the outputs aliasing it. Returns whether any plot row changed.
+    fn resync_as_of_tail(&mut self, slot: usize, from: usize) -> bool {
+        let cutoff = self.time_cutoff;
+        let through = self.as_of_through;
+        let series = &mut self.series[slot];
+        let len = cutoff.map_or(series.times.len(), |cutoff| {
+            series.times.partition_point(|&time| time <= cutoff)
+        });
+        let old_size = series.plot.size();
+        let keep = series.plot.resync_as_of_tail(
+            &self.merged_times,
+            from,
+            through,
+            &series.times[..len],
+            series.alignment.max_staleness(),
+        );
+        let size = series.plot.size();
+        if keep == old_size && keep == size {
+            return false;
+        }
+        series.repair_plot_lod(keep..size);
+        self.as_of_rows_rewritten = self.as_of_rows_rewritten.wrapping_add((size - keep) as u64);
+        self.realias_outputs(slot, keep);
+        true
+    }
+
+    /// After a union change, carry the as-of rows up to the union's new data extent. Every
+    /// point before the previous extent keeps its time, so only the tail is rewritten.
+    fn sync_as_of_tail(&mut self) {
+        if self.as_of_series == 0 {
+            return;
+        }
+        let through = self.union_data_extent().map_or(0, |index| index + 1);
+        if through == self.as_of_through {
+            return;
+        }
+        let from = self.as_of_through.min(through);
+        self.as_of_through = through;
+        for slot in self.as_of_slots() {
+            if self.resync_as_of_tail(slot, from) {
+                self.note_realigned(slot);
+            }
+        }
+    }
+
+    /// Re-alias the outputs whose ultimate source is `source_slot`. The source's first `keep`
+    /// plot rows are unchanged since those outputs were last aliased (0 = copy everything).
+    fn realias_outputs(&mut self, source_slot: usize, keep: usize) {
+        let aliases = self
+            .live_slots
+            .values()
+            .filter_map(|&alias| {
+                self.resolved_alias_range(alias)
+                    .filter(|&(source, _, _)| source == source_slot)
+                    .map(|range| (alias, range))
+            })
+            .collect::<Vec<_>>();
+        for (alias, (source, offset, len)) in aliases {
+            let first_changed = self.copy_plot_range(alias, source, offset, len, keep);
+            let target = &mut self.series[alias];
+            if keep == 0 {
+                target.rebuild_plot_lod();
+            } else {
+                let size = target.plot.size();
+                target.repair_plot_lod(first_changed..size);
+            }
+            self.note_realigned(alias);
+        }
+    }
+
     pub fn add_series(&mut self) -> SeriesId {
         let id = self.next_series_id;
         self.next_series_id = self
@@ -569,6 +854,12 @@ impl DataLayer {
         usage
     }
 
+    /// Canonical rows a series stores, including rows past the replay time cutoff that its
+    /// queries do not expose yet.
+    pub fn series_rows(&self, id: SeriesId) -> Option<usize> {
+        Some(self.series.get(self.series_slot(id)?)?.values.len())
+    }
+
     pub fn series_memory_usage(&self, id: SeriesId) -> Option<SeriesMemoryUsage> {
         let slot = self.series_slot(id)?;
         let series = &self.series[slot];
@@ -607,8 +898,13 @@ impl DataLayer {
         let slot = self.series_slot(id)?;
         if self.series[slot].time_alias.is_some() {
             let times = self.series_times_by_slot(slot)?.to_vec();
+            // An output of an as-of source keeps following that calendar once it owns its
+            // times; its copied row map already describes those rows.
+            let alignment = self.time_alignment(id).unwrap_or_default();
             self.series[slot].times = times;
             self.series[slot].time_alias = None;
+            self.series[slot].alignment = alignment;
+            self.as_of_series += usize::from(alignment.is_as_of());
         }
         Some(slot)
     }
@@ -632,6 +928,10 @@ impl DataLayer {
         let Some(slot) = self.live_slots.remove(&id) else {
             return false;
         };
+        if self.series[slot].time_alias.is_none() && self.series[slot].alignment.is_as_of() {
+            self.as_of_series -= 1;
+        }
+        self.realigned.retain(|&realigned| realigned != id);
         self.series[slot] = RawSeries::empty();
         self.free_slots.push(slot);
         self.rebuild_merged();
@@ -647,6 +947,12 @@ impl DataLayer {
     /// Monotonic identity for the complete merged timestamp sequence.
     pub fn time_points_generation(&self) -> u64 {
         self.time_points_generation
+    }
+
+    /// Identity of the merged points' positions: unchanged while the union only grows at its end,
+    /// so a consumer keyed on it may keep per-index work for the points it already read.
+    pub fn time_index_generation(&self) -> u64 {
+        self.time_index_generation
     }
 
     /// Plot data for a live series. Unknown/stale ids safely read as an empty plot; callers that
@@ -692,6 +998,7 @@ impl DataLayer {
             .and_then(|slot| self.series.get_mut(slot))
         {
             s.rows_count_as_data = flag;
+            self.sync_as_of_tail();
         }
     }
 
@@ -754,6 +1061,8 @@ impl DataLayer {
     /// like the reference's `_getBaseIndex` (data-layer.ts:495-510), which reads the whitespace-filtered
     /// series rows — the base index is the last point holding a real bar in any series. When
     /// every series' rows are whitespace the index is 0 (the reference's initialized `baseIndex`).
+    /// As-of aligned series (and their outputs) own no points and never reach past the union's
+    /// last real bar, so they are not consulted.
     pub fn base_index(&self) -> Option<TimePointIndex> {
         if self.merged_times.is_empty() {
             return None;
@@ -761,19 +1070,25 @@ impl DataLayer {
         let mut last_data_time: Option<i64> = None;
         for &slot in self.live_slots.values() {
             let s = &self.series[slot];
+            if s.alignment.is_as_of() || s.plot.source_rows().is_some() {
+                continue;
+            }
             let Some(times) = self.series_times_by_slot(slot) else {
                 continue;
             };
-            let row = s.values.len().min(times.len());
-            for row in (0..row).rev() {
-                let values = s.values.row(row);
-                if s.rows_count_as_data || !is_whitespace_values(values) {
-                    last_data_time = Some(match last_data_time {
-                        Some(t) => t.max(times[row]),
-                        None => times[row],
-                    });
-                    break;
-                }
+            let rows = s.values.len().min(times.len());
+            // The LOD pyramid finds the last non-whitespace row in a logarithmic number of
+            // summaries, so trailing whitespace (pre-installed session slots) costs nothing here.
+            let row = if s.rows_count_as_data {
+                rows.checked_sub(1)
+            } else {
+                s.lod.view(s.values.view()).last_row_before(rows)
+            };
+            if let Some(row) = row {
+                last_data_time = Some(match last_data_time {
+                    Some(t) => t.max(times[row]),
+                    None => times[row],
+                });
             }
         }
         match last_data_time {
@@ -866,6 +1181,13 @@ impl DataLayer {
         if source_from + values.len() != source_len {
             return false;
         }
+        if self.series[target_slot].time_alias.is_none()
+            && self.series[target_slot].alignment.is_as_of()
+        {
+            // An alias follows its source's alignment; a materialized as-of output gives up its own.
+            self.as_of_series -= 1;
+            self.series[target_slot].alignment = TimeAlignment::Union;
+        }
         {
             let target = &mut self.series[target_slot];
             target.times = Vec::new();
@@ -875,16 +1197,19 @@ impl DataLayer {
                 len: values.len(),
             });
             target.values = SeriesValues::Single(values);
-            target.rebuild_lod();
             target.point_colors = [vec![], vec![], vec![]];
             target.generation = target.generation.wrapping_add(1);
         }
+        let aliasable = self.aliasable_rows(source_slot);
         self.copy_plot_range(
             target_slot,
             source_slot,
-            source_from,
-            source_len - source_from,
+            source_from.min(aliasable),
+            aliasable.saturating_sub(source_from),
+            0,
         );
+        // Summaries name plot rows, which an as-of source only fixes once the alias is copied.
+        self.series[target_slot].rebuild_plot_lod();
         true
     }
 
@@ -903,9 +1228,12 @@ impl DataLayer {
         if alias.source != source {
             return None;
         }
-        // Before an indicator reaches warm-up it has no output rows. Keep that empty alias at the
-        // current source suffix so successive appends do not manufacture a gap in the output.
-        let alias_offset = if self.series[target_slot].values.len() == 0 && values.is_empty() {
+        // Before an indicator reaches warm-up it has no output rows, so there is nothing to stay
+        // aligned with: the output starts where this update's first value lands. That keeps an
+        // empty alias at the current source suffix, so successive appends do not manufacture a
+        // gap, and a batch that rewrites earlier source rows and completes the warm-up in one step
+        // starts the output at its first value instead of reading as a gap.
+        let alias_offset = if self.series[target_slot].values.len() == 0 {
             source_from
         } else {
             alias.offset
@@ -918,7 +1246,7 @@ impl DataLayer {
             return None;
         }
         let output_row = source_from - alias_offset;
-        let source_plot_len = self.series[source_slot].plot.size();
+        let source_plot_len = self.aliasable_rows(source_slot);
         let plot_offset = alias_offset.min(source_plot_len);
         let output_len = source_len
             .saturating_sub(alias_offset)
@@ -927,6 +1255,7 @@ impl DataLayer {
         if output_row > self.series[target_slot].values.len() {
             return None;
         }
+        let as_of = self.series[source_slot].plot.source_rows().is_some();
         {
             let target = &mut self.series[target_slot];
             let mut column =
@@ -950,30 +1279,143 @@ impl DataLayer {
                 }
             }
             target.generation = target.generation.wrapping_add(1);
-            target.rebuild_lod_range(changed_from..output_len);
+            if !as_of {
+                target.rebuild_lod_range(changed_from..output_len);
+            }
         }
-        self.copy_plot_range(target_slot, source_slot, plot_offset, output_len);
+        if !as_of {
+            self.copy_plot_range(target_slot, source_slot, plot_offset, output_len, 0);
+            return Some(changed_from);
+        }
+        // An as-of source's mapping changes reach its outputs as they happen, so only the rows
+        // showing recomputed values (and a moved end) are rewritten here.
+        let unchanged = if alias_offset == alias.offset {
+            self.series[source_slot]
+                .plot
+                .rows_before_source(alias_offset + changed_from)
+        } else {
+            0
+        };
+        let first_changed =
+            self.copy_plot_range(target_slot, source_slot, plot_offset, output_len, unchanged);
+        let target = &mut self.series[target_slot];
+        let size = target.plot.size();
+        target.repair_plot_lod(first_changed..size);
         Some(changed_from)
     }
 
+    /// Replace rows `[source_from, source_from + values.len())` of an aligned scalar output whose
+    /// later rows the owner knows are unchanged: a study stops at its union source's last real
+    /// row, so the trailing whitespace rows of pre-installed session slots keep their empty
+    /// values instead of being rewritten on every tick. The output then covers the source's rows,
+    /// growing by whitespace rows or shrinking with it, so the work is proportional to the written
+    /// rows plus that growth, not the trailing rows. `None` (nothing changed) for an unknown or
+    /// unaliased output, a write before the output's first row, past its end, or past the source,
+    /// and for an as-of source, whose outputs rewrite through [`Self::update_single_aligned`].
+    pub fn update_single_aligned_within(
+        &mut self,
+        id: SeriesId,
+        source: SeriesId,
+        source_from: usize,
+        values: &[f64],
+    ) -> Option<usize> {
+        let target_slot = self.series_slot(id)?;
+        let source_slot = self.series_slot(source)?;
+        let alias = self.series[target_slot].time_alias?;
+        if alias.source != source || self.series[source_slot].plot.source_rows().is_some() {
+            return None;
+        }
+        let alias_offset = if self.series[target_slot].values.len() == 0 {
+            source_from
+        } else {
+            alias.offset
+        };
+        let source_len = self.visible_len(self.series_times_by_slot(source_slot)?);
+        if source_from < alias_offset || source_from + values.len() > source_len {
+            return None;
+        }
+        let output_row = source_from - alias_offset;
+        let source_plot_len = self.aliasable_rows(source_slot);
+        let plot_offset = alias_offset.min(source_plot_len);
+        let output_len = source_len
+            .saturating_sub(alias_offset)
+            .min(source_plot_len - plot_offset);
+        let old_len = self.series[target_slot].values.len();
+        if output_row > old_len {
+            return None;
+        }
+        let written = (output_row + values.len()).min(output_len);
+        let target = &mut self.series[target_slot];
+        let mut column =
+            match std::mem::replace(&mut target.values, SeriesValues::Single(Vec::new())) {
+                SeriesValues::Single(values) => values,
+                SeriesValues::Ohlc(mut columns) => std::mem::take(&mut columns[3]),
+            };
+        let overlap = column.len().min(written).saturating_sub(output_row);
+        column[output_row..output_row + overlap].copy_from_slice(&values[..overlap]);
+        column.extend_from_slice(&values[overlap..written - output_row]);
+        column.resize(output_len, f64::NAN);
+        target.values = SeriesValues::Single(column);
+        target.time_alias = Some(TimeAlias {
+            source,
+            offset: alias_offset,
+            len: output_len,
+        });
+        for colors in &mut target.point_colors {
+            if !colors.is_empty() {
+                colors.resize(output_len, POINT_COLOR_ABSENT);
+                colors[output_row.min(output_len)..written].fill(POINT_COLOR_ABSENT);
+            }
+        }
+        target.generation = target.generation.wrapping_add(1);
+        let changed_from = output_row.min(output_len);
+        if output_len < old_len {
+            target.rebuild_lod();
+        } else {
+            // The written rows, plus any whitespace rows the output grew by.
+            let end = if output_len > old_len {
+                output_len
+            } else {
+                written
+            };
+            target.rebuild_lod_range(changed_from..end);
+        }
+        self.copy_plot_range(target_slot, source_slot, plot_offset, output_len, 0);
+        Some(changed_from)
+    }
+
+    /// Canonical rows of `slot` its plot can alias: the plotted rows of a union-timed series, or
+    /// every visible canonical row of an as-of mapped one (whose plot rows are merged points).
+    fn aliasable_rows(&self, slot: usize) -> usize {
+        let series = &self.series[slot];
+        if series.plot.source_rows().is_none() {
+            return series.plot.size();
+        }
+        self.series_times_by_slot(slot)
+            .map_or(0, |times| self.visible_len(times))
+            .min(series.values.len())
+    }
+
+    /// Returns the first target plot row that may differ (see [`PlotList::copy_range_from`]).
     fn copy_plot_range(
         &mut self,
         target_slot: usize,
         source_slot: usize,
         offset: usize,
         len: usize,
-    ) {
+        unchanged: usize,
+    ) -> usize {
         debug_assert_ne!(target_slot, source_slot);
         if target_slot < source_slot {
             let (left, right) = self.series.split_at_mut(source_slot);
             left[target_slot]
                 .plot
-                .copy_range_from(&right[0].plot, offset, len);
+                .copy_range_from(&right[0].plot, offset, len, unchanged)
         } else {
             let (left, right) = self.series.split_at_mut(target_slot);
             right[0]
                 .plot
-                .copy_range_from(&left[source_slot].plot, offset, len);
+                .copy_range_from(&left[source_slot].plot, offset, len, unchanged)
         }
     }
 
@@ -1027,18 +1469,25 @@ impl DataLayer {
         true
     }
 
-    /// The per-point color override at `row` for `channel`, or `None` when the channel is
-    /// absent or the row carries [`POINT_COLOR_ABSENT`]. Plot rows mirror raw rows, so a plot
-    /// row offset indexes here directly.
+    /// The per-point color override at canonical `row` for `channel`, or `None` when the channel
+    /// is absent or the row carries [`POINT_COLOR_ABSENT`]. Plot rows mirror canonical rows
+    /// except for as-of aligned series; plot-row readers use [`Self::point_colors`].
     pub fn point_color(&self, id: SeriesId, channel: PointColorChannel, row: usize) -> Option<u32> {
-        self.point_colors(id)?.color(channel, row)
+        let s = self.series.get(self.series_slot(id)?)?;
+        PointColors {
+            channels: [&s.point_colors[0], &s.point_colors[1], &s.point_colors[2]],
+            rows: None,
+        }
+        .color(channel, row)
     }
 
-    /// Resolve every point-color channel once for a row-processing hot path.
+    /// Resolve every point-color channel once for a row-processing hot path, indexed by plot
+    /// row (an as-of aligned series reads the canonical row each plot row shows).
     pub fn point_colors(&self, id: SeriesId) -> Option<PointColors<'_>> {
         let s = self.series.get(self.series_slot(id)?)?;
         Some(PointColors {
             channels: [&s.point_colors[0], &s.point_colors[1], &s.point_colors[2]],
+            rows: s.plot.source_rows(),
         })
     }
 
@@ -1053,7 +1502,9 @@ impl DataLayer {
     /// The fast path (append at a new global max time, or replace an existing point) avoids a
     /// full rebuild.
     pub fn update(&mut self, id: SeriesId, time: i64, values: [f64; 4]) -> bool {
-        self.update_styled_impl(id, time, values, [None; POINT_COLOR_CHANNELS], true)
+        let applied = self.update_styled_impl(id, time, values, [None; POINT_COLOR_CHANNELS], true);
+        self.sync_as_of_tail();
+        applied
     }
 
     /// [`update`] plus the target bar's per-point colors (reference `series.update` with data-item
@@ -1069,7 +1520,9 @@ impl DataLayer {
         values: [f64; 4],
         colors: [Option<u32>; POINT_COLOR_CHANNELS],
     ) -> bool {
-        self.update_styled_impl(id, time, values, colors, true)
+        let applied = self.update_styled_impl(id, time, values, colors, true);
+        self.sync_as_of_tail();
+        applied
     }
 
     fn update_styled_impl(
@@ -1111,10 +1564,17 @@ impl DataLayer {
             s.generation = s.generation.wrapping_add(1);
             return true;
         }
+        if self.series[slot].alignment.is_as_of() {
+            self.update_as_of_row(slot, time, values, colors);
+            return true;
+        }
         let last_merged = self.merged_times.last().copied();
 
-        // Case 1: brand-new global max time — appended at the end, no indices shift.
-        if last_merged.is_none_or(|last| time > last) {
+        // Case 1: brand-new global max time — appended at the end, no indices shift. Rows retained
+        // past a replay clock still follow it, so such a time is a history insert instead.
+        let series_last = self.series[slot].times.last().copied();
+        if last_merged.is_none_or(|last| time > last) && series_last.is_none_or(|last| time > last)
+        {
             let new_index = self.merged_times.len() as TimePointIndex;
             self.merged_times.push(time);
             self.time_points_generation = self.time_points_generation.wrapping_add(1);
@@ -1131,7 +1591,6 @@ impl DataLayer {
 
         // Case 2: an existing merged time, at or after this series' own last point — a
         // replace-last or append-at-series-end that maps to a non-decreasing plot index.
-        let series_last = self.series[slot].times.last().copied();
         let existing = self.merged_times.binary_search(&time).ok();
         if let (Some(pos), true) = (existing, series_last.is_none_or(|lt| time >= lt)) {
             let s = &mut self.series[slot];
@@ -1192,6 +1651,52 @@ impl DataLayer {
         true
     }
 
+    /// Streaming write to an as-of series (visible time). It never touches the union: a value
+    /// change repairs only the plot rows showing that row, a new last row rewrites only the
+    /// points at or after its time, and a new historical row re-derives this series' mapping.
+    fn update_as_of_row(
+        &mut self,
+        slot: usize,
+        time: i64,
+        values: [f64; 4],
+        colors: [Option<u32>; POINT_COLOR_CHANNELS],
+    ) {
+        let s = &mut self.series[slot];
+        let row = lower_bound(&s.times, |&candidate| candidate < time);
+        s.generation = s.generation.wrapping_add(1);
+        if s.times.get(row) == Some(&time) {
+            s.values.set_row(row, values);
+            set_row_colors(s, row, colors);
+            let shown = s.plot.invalidate_row(row);
+            if !shown.is_empty() {
+                self.as_of_rows_rewritten =
+                    self.as_of_rows_rewritten.wrapping_add(shown.len() as u64);
+                s.repair_plot_lod(shown);
+            }
+            return;
+        }
+        if row == s.times.len() {
+            push_raw(s, time, values, colors);
+            let from =
+                self.merged_times[..self.as_of_through].partition_point(|&point| point < time);
+            if from < self.as_of_through {
+                self.resync_as_of_tail(slot, from);
+            }
+            return;
+        }
+        let rows = s.values.len();
+        for (channel, color) in s.point_colors.iter_mut().zip(colors) {
+            if let Some(channel) = color_channel(channel, rows, color) {
+                channel.insert(row, color.unwrap_or(POINT_COLOR_ABSENT));
+            }
+        }
+        s.times.insert(row, time);
+        s.values.insert(row, values);
+        self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
+        self.rebuild_as_of_rows(slot);
+        self.realias_outputs(slot, 0);
+    }
+
     /// Insert one timestamp that no series held before into the union. Equivalent to
     /// [`Self::rebuild_merged`] for a single new time without re-sorting every series' times.
     fn insert_merged_time(&mut self, time: i64) {
@@ -1202,6 +1707,9 @@ impl DataLayer {
         if self.capture_merged_time_rebase && self.merged_time_rebase_source.is_none() {
             self.merged_time_rebase_source = Some(self.merged_times.clone());
         }
+        if position < self.merged_times.len() {
+            self.time_index_generation = self.time_index_generation.wrapping_add(1);
+        }
         self.merged_times.insert(position, time);
         self.time_points_generation = self.time_points_generation.wrapping_add(1);
     }
@@ -1209,8 +1717,10 @@ impl DataLayer {
     /// Reindex one owned series (and outputs aliasing its time range) against an unchanged union.
     fn reindex_series(&mut self, slot: usize) {
         self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
+        // Rows past a replay clock hold no point yet.
+        let len = self.visible_len(&self.series[slot].times);
         let s = &mut self.series[slot];
-        s.plot.rebuild_from(&self.merged_times, &s.times);
+        s.plot.rebuild_from(&self.merged_times, &s.times[..len]);
         let aliases = self
             .live_slots
             .values()
@@ -1221,7 +1731,7 @@ impl DataLayer {
             })
             .collect::<Vec<_>>();
         for (alias, (source, offset, len)) in aliases {
-            self.copy_plot_range(alias, source, offset, len);
+            self.copy_plot_range(alias, source, offset, len, 0);
         }
     }
 
@@ -1265,7 +1775,15 @@ impl DataLayer {
             s.plot.invalidate_row(row);
         }
         if let (Some(&first), Some(&last)) = (rows.first(), rows.last()) {
-            s.rebuild_lod_range(first..last + 1);
+            if s.alignment.is_as_of() {
+                // The corrected rows repair the plot rows showing them (none if collapsed).
+                let shown = s.plot.rows_before_source(first)..s.plot.rows_before_source(last + 1);
+                if !shown.is_empty() {
+                    s.repair_plot_lod(shown);
+                }
+            } else {
+                s.rebuild_lod_range(first..last + 1);
+            }
         }
         s.generation = s.generation.wrapping_add(historical as u64);
 
@@ -1304,6 +1822,17 @@ impl DataLayer {
         times: &[i64],
         values: [&[f64]; 4],
     ) -> Option<usize> {
+        let affected = self.update_many_impl(id, times, values);
+        self.sync_as_of_tail();
+        affected
+    }
+
+    fn update_many_impl(
+        &mut self,
+        id: SeriesId,
+        times: &[i64],
+        values: [&[f64]; 4],
+    ) -> Option<usize> {
         if self
             .series_slot(id)
             .is_some_and(|slot| matches!(self.series[slot].values, SeriesValues::Single(_)))
@@ -1311,7 +1840,7 @@ impl DataLayer {
             && values[0] == values[2]
             && values[0] == values[3]
         {
-            return self.update_many_single(id, times, values[0]);
+            return self.update_many_single_impl(id, times, values[0]);
         }
         let slot = self.materialize_time_alias(id)?;
         if times.is_empty() {
@@ -1327,10 +1856,7 @@ impl DataLayer {
         {
             return Some(affected);
         }
-        let new_time_points = times
-            .iter()
-            .filter(|time| self.merged_times.binary_search(time).is_err())
-            .count();
+        let new_time_points = self.new_time_points(slot, times);
         let old = &self.series[slot];
         let old_values = old.values.columns();
         let capacity = old.times.len() + times.len();
@@ -1392,9 +1918,32 @@ impl DataLayer {
         Some(affected)
     }
 
+    /// Timestamps of a merging batch that are new to the union (none for an as-of series, which
+    /// never adds points).
+    fn new_time_points(&self, slot: usize, times: &[i64]) -> usize {
+        if self.series[slot].alignment.is_as_of() {
+            return 0;
+        }
+        times
+            .iter()
+            .filter(|time| self.merged_times.binary_search(time).is_err())
+            .count()
+    }
+
     /// Scalar-series variant of [`Self::update_many`]. It preserves one canonical value column
     /// through historical merges instead of constructing four identical temporary columns.
     pub fn update_many_single(
+        &mut self,
+        id: SeriesId,
+        times: &[i64],
+        values: &[f64],
+    ) -> Option<usize> {
+        let affected = self.update_many_single_impl(id, times, values);
+        self.sync_as_of_tail();
+        affected
+    }
+
+    fn update_many_single_impl(
         &mut self,
         id: SeriesId,
         times: &[i64],
@@ -1414,10 +1963,7 @@ impl DataLayer {
         {
             return Some(affected);
         }
-        let new_time_points = times
-            .iter()
-            .filter(|time| self.merged_times.binary_search(time).is_err())
-            .count();
+        let new_time_points = self.new_time_points(slot, times);
         let old = &self.series[slot];
         let old_values = old.values.columns()[3];
         let capacity = old.times.len() + times.len();
@@ -1529,12 +2075,18 @@ impl DataLayer {
         Some(keep)
     }
 
+    /// Whether a live slot's own timestamps join the merged union (owned and not as-of).
+    fn joins_union(&self, slot: usize) -> bool {
+        let series = &self.series[slot];
+        series.time_alias.is_none() && !series.alignment.is_as_of()
+    }
+
     fn rebuild_merged(&mut self) {
         self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
         let total: usize = self
             .live_slots
             .values()
-            .filter(|&&slot| self.series[slot].time_alias.is_none())
+            .filter(|&&slot| self.joins_union(slot))
             .map(|&slot| self.series[slot].times.len())
             .sum();
         let all = &mut self.merged_times_scratch;
@@ -1543,7 +2095,8 @@ impl DataLayer {
             all.reserve(total);
         }
         for &slot in self.live_slots.values() {
-            if self.series[slot].time_alias.is_none() {
+            let series = &self.series[slot];
+            if series.time_alias.is_none() && !series.alignment.is_as_of() {
                 let times = &self.series[slot].times;
                 let len = self.time_cutoff.map_or(times.len(), |cutoff| {
                     times.partition_point(|&time| time <= cutoff)
@@ -1557,6 +2110,9 @@ impl DataLayer {
             if self.capture_merged_time_rebase && self.merged_time_rebase_source.is_none() {
                 self.merged_time_rebase_source = Some(self.merged_times.clone());
             }
+            if !all.starts_with(&self.merged_times) {
+                self.time_index_generation = self.time_index_generation.wrapping_add(1);
+            }
             std::mem::swap(&mut self.merged_times, all);
             self.time_points_generation = self.time_points_generation.wrapping_add(1);
         }
@@ -1568,21 +2124,29 @@ impl DataLayer {
         // source, so they retain no mapping allocation when that source is dense.
         let merged = &self.merged_times;
         for &slot in self.live_slots.values() {
-            if self.series[slot].time_alias.is_none() {
-                let s = &mut self.series[slot];
+            let s = &mut self.series[slot];
+            if s.time_alias.is_none() && !s.alignment.is_as_of() {
                 let len = self.time_cutoff.map_or(s.times.len(), |cutoff| {
                     s.times.partition_point(|&time| time <= cutoff)
                 });
                 s.plot.rebuild_from(merged, &s.times[..len]);
             }
         }
+        // As-of series map onto the finished union (their extent reads the union plots).
+        self.rebuild_as_of_all();
         let aliases = self
             .live_slots
             .values()
             .filter_map(|&slot| self.resolved_alias_range(slot).map(|range| (slot, range)))
             .collect::<Vec<_>>();
         for (slot, (source_slot, offset, len)) in aliases {
-            self.copy_plot_range(slot, source_slot, offset, len);
+            let was_as_of = self.series[slot].plot.source_rows().is_some();
+            self.copy_plot_range(slot, source_slot, offset, len, 0);
+            // Summaries of an as-of alias name plot rows, which this copy may have moved.
+            if was_as_of || self.series[slot].plot.source_rows().is_some() {
+                self.series[slot].rebuild_plot_lod();
+                self.note_realigned(slot);
+            }
         }
     }
 
@@ -1592,7 +2156,7 @@ impl DataLayer {
         let mut aliased = false;
         for _ in 0..self.series.len().max(1) {
             let Some(alias) = self.series.get(slot)?.time_alias else {
-                let source_size = self.series[slot].plot.size();
+                let source_size = self.aliasable_rows(slot);
                 let offset = offset.min(source_size);
                 let available = source_size - offset;
                 return aliased.then_some((slot, offset, len.min(available)));
@@ -1708,6 +2272,40 @@ mod tests {
         assert!(!dl.set_time_cutoff(Some(5)));
         assert!(dl.set_time_cutoff(None));
         assert_eq!(dl.merged_times(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn replay_writes_before_rows_retained_past_the_clock_keep_rows_and_points_ordered() {
+        let mut dl = DataLayer::new();
+        let first = dl.add_series();
+        let second = dl.add_series();
+        set(&mut dl, first, &[1, 2, 3, 5], &[10.0, 20.0, 30.0, 50.0]);
+        set(&mut dl, second, &[2, 5], &[2.0, 5.0]);
+        assert!(dl.set_time_cutoff(Some(4)));
+        assert_eq!(dl.merged_times(), &[1, 2, 3]);
+
+        // A row at a time the chart already shows, before a retained future row: only visible
+        // rows are indexed.
+        assert!(dl.update(second, 3, [3.0; 4]));
+        assert_eq!(dl.series_data(second).unwrap().0, &[2, 3]);
+        assert_eq!(indices(&dl, second), vec![1, 2]);
+
+        // A new visible time past every point but before a retained future row inserts into
+        // history instead of appending after that row.
+        assert!(dl.update(first, 4, [40.0; 4]));
+        assert_eq!(dl.merged_times(), &[1, 2, 3, 4]);
+        assert_eq!(
+            dl.series[dl.series_slot(first).unwrap()].times,
+            &[1, 2, 3, 4, 5]
+        );
+        assert_eq!(indices(&dl, first), vec![0, 1, 2, 3]);
+        assert!(dl.set_time_cutoff(None));
+        assert_eq!(dl.merged_times(), &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            dl.series_data(first).unwrap().1[3],
+            &[10.0, 20.0, 30.0, 40.0, 50.0]
+        );
+        assert_eq!(indices(&dl, second), vec![1, 2, 4]);
     }
 
     fn assert_lod_matches_fresh(dl: &DataLayer, id: SeriesId) {
@@ -1855,6 +2453,36 @@ mod tests {
         assert_eq!(dl.series_data(output).unwrap().0, &[2, 3, 4]);
     }
 
+    /// An indicator before warm-up holds an empty alias at the source suffix. A batch that
+    /// rewrites an earlier source row and completes the warm-up in one step starts the output at
+    /// its first value; it is not a gap after the empty alias.
+    #[test]
+    fn empty_aligned_output_starts_at_the_first_value_of_its_update() {
+        let mut dl = DataLayer::new();
+        let source = dl.add_series();
+        let output = dl.add_series();
+        set(&mut dl, source, &[1, 2], &[10.0, 20.0]);
+        assert!(dl.set_single_data_aligned(output, source, 2, Vec::new()));
+        set(
+            &mut dl,
+            source,
+            &[1, 2, 3, 4, 5],
+            &[10.0, 21.0, 30.0, 40.0, 50.0],
+        );
+        assert_eq!(
+            dl.update_single_aligned(output, source, 3, &[25.0, 35.0]),
+            Some(0)
+        );
+        let (times, values) = dl.series_data(output).unwrap();
+        assert_eq!(times, &[4, 5]);
+        assert_eq!(values[3], &[25.0, 35.0]);
+        // Still before warm-up, an empty update keeps the empty alias at the new suffix.
+        let empty = dl.add_series();
+        assert!(dl.set_single_data_aligned(empty, source, 5, Vec::new()));
+        assert_eq!(dl.update_single_aligned(empty, source, 5, &[]), Some(0));
+        assert!(dl.series_data(empty).unwrap().0.is_empty());
+    }
+
     #[test]
     fn independently_timed_series_retain_sparse_mapping() {
         let mut dl = DataLayer::new();
@@ -1987,6 +2615,33 @@ mod tests {
 
         dl.update(id, 259_200, [5.0; 4]);
         assert_eq!(dl.time_points_generation(), appended);
+    }
+
+    #[test]
+    fn time_index_generation_holds_while_the_union_only_grows_at_its_end() {
+        let mut dl = DataLayer::new();
+        let a = dl.add_series();
+        let b = dl.add_series();
+        set(&mut dl, a, &[10, 20, 30], &[1.0; 3]);
+        let base = dl.time_index_generation();
+        // Appends past the last point, by an update or by another series' install, keep indices.
+        dl.update(a, 40, [2.0; 4]);
+        set(&mut dl, b, &[30, 40, 50], &[1.0; 3]);
+        assert_eq!(dl.time_index_generation(), base);
+        // A point inside the union moves every later index.
+        dl.update(b, 25, [1.0; 4]);
+        let inserted = dl.time_index_generation();
+        assert_ne!(inserted, base);
+        // So does a point leaving the front.
+        set(&mut dl, a, &[20, 30, 40], &[1.0; 3]);
+        assert_ne!(dl.time_index_generation(), inserted);
+        let trimmed = dl.time_index_generation();
+        // A replay cutoff that reveals points at the end keeps indices; one that hides them does not.
+        dl.set_time_cutoff(Some(40));
+        let hidden = dl.time_index_generation();
+        assert_ne!(hidden, trimmed);
+        dl.set_time_cutoff(None);
+        assert_eq!(dl.time_index_generation(), hidden);
     }
 
     #[test]
@@ -2634,5 +3289,917 @@ mod tests {
         dl.update(a, 2, [20.0, 21.0, 19.0, 20.0]);
         assert_eq!(dl.point_color(a, PointColorChannel::Body, 1), None);
         assert_eq!(dl.point_color(a, PointColorChannel::Body, 2), Some(33));
+    }
+
+    const DAY: i64 = 86_400;
+
+    fn days(list: &[i64]) -> Vec<i64> {
+        list.iter().map(|day| day * DAY).collect()
+    }
+
+    /// `(logical index, close)` for every plot row of a series.
+    fn plot_points(dl: &DataLayer, id: SeriesId) -> Vec<(TimePointIndex, f64)> {
+        let plot = dl.plot(id);
+        (0..plot.size())
+            .map(|row| {
+                (
+                    plot.index_at(row).unwrap(),
+                    plot.value_at(row, PlotValueIndex::Close),
+                )
+            })
+            .collect()
+    }
+
+    /// Reference as-of join over the whole union prefix `[0, through)`.
+    fn naive_as_of(
+        merged: &[i64],
+        through: usize,
+        times: &[i64],
+        values: &[f64],
+        max_staleness: Option<i64>,
+    ) -> Vec<(TimePointIndex, f64)> {
+        merged[..through]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &point)| {
+                let row = times.iter().rposition(|&time| time <= point)?;
+                if max_staleness.is_some_and(|max| point - times[row] > max) {
+                    return None;
+                }
+                Some((index as TimePointIndex, values[row]))
+            })
+            .collect()
+    }
+
+    fn assert_plot_lod_matches_fresh(dl: &DataLayer, id: SeriesId) {
+        let slot = dl.series_slot(id).unwrap();
+        let series = &dl.series[slot];
+        let values = series.values.view().with_rows(series.plot.source_rows());
+        let mut fresh = LodPyramid::default();
+        fresh.rebuild(values);
+        let len = values.len();
+        for range in [0..len, len / 3..len, len.saturating_sub(40)..len] {
+            let actual = series
+                .lod
+                .view(values)
+                .rows_on_range(range.clone(), usize::MAX)
+                .0
+                .iter()
+                .collect::<Vec<_>>();
+            let expected = fresh
+                .view(values)
+                .rows_on_range(range, usize::MAX)
+                .0
+                .iter()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+        let plot = dl.plot(id);
+        assert_eq!(
+            plot.last_non_whitespace_row_before(len),
+            (0..len).rev().find(|&row| !plot.is_whitespace_row(row))
+        );
+    }
+
+    const AS_OF: TimeAlignment = TimeAlignment::AsOf {
+        max_staleness: None,
+    };
+
+    #[test]
+    fn as_of_overlay_adds_no_time_points_and_shows_the_last_row_at_or_before_each_point() {
+        let mut dl = DataLayer::new();
+        let hk = dl.add_series();
+        let us = dl.add_series();
+        // HK trades d1 d2 d3 d5 d6 (d4 is an HK holiday); US trades d1 d2 d4 d5 d7 (d3 a US
+        // holiday, d7 after the last HK day).
+        set(
+            &mut dl,
+            hk,
+            &days(&[1, 2, 3, 5, 6]),
+            &[1.0, 2.0, 3.0, 5.0, 6.0],
+        );
+        set(
+            &mut dl,
+            us,
+            &days(&[1, 2, 4, 5, 7]),
+            &[10.0, 20.0, 40.0, 50.0, 70.0],
+        );
+        // The union inserts d4 and d7 into HK and leaves gaps in both series.
+        assert_eq!(dl.merged_times().len(), 7);
+
+        assert!(dl.set_time_alignment(us, AS_OF));
+        assert!(!dl.set_time_alignment(us, AS_OF));
+        assert_eq!(dl.time_alignment(us), Some(AS_OF));
+        assert_eq!(dl.merged_times(), days(&[1, 2, 3, 5, 6]).as_slice());
+        assert_eq!(indices(&dl, hk), vec![0, 1, 2, 3, 4]);
+        assert!(dl.plot(hk).search(3, MismatchDirection::None).is_some());
+        // d3 repeats the US d2 close, d4 collapses into d5, d6 repeats d5, and d7 has no point.
+        assert_eq!(
+            plot_points(&dl, us),
+            vec![(0, 10.0), (1, 20.0), (2, 20.0), (3, 50.0), (4, 50.0)]
+        );
+        let plot = dl.plot(us);
+        assert_eq!(plot.source_row(2), 1);
+        assert_eq!(plot.row_for_source(1), Some(1));
+        assert_eq!(plot.row_for_source(2), None, "collapsed US d4 is not shown");
+        assert_eq!(
+            plot.row_for_source(4),
+            None,
+            "US d7 is past the last HK bar"
+        );
+        // The canonical rows, their times and the base index stay the series' own.
+        assert_eq!(
+            dl.series_data(us).unwrap().0,
+            days(&[1, 2, 4, 5, 7]).as_slice()
+        );
+        assert_eq!(dl.base_index(), Some(4));
+        let min_max = dl
+            .min_max_on_range_cached(us, 0, 4, &[PlotValueIndex::Close])
+            .unwrap();
+        assert_eq!((min_max.min, min_max.max), (10.0, 50.0));
+        assert_plot_lod_matches_fresh(&dl, us);
+
+        // Back to the union restores the reference behavior exactly.
+        assert!(dl.set_time_alignment(us, TimeAlignment::Union));
+        assert_eq!(dl.merged_times().len(), 7);
+        assert_eq!(indices(&dl, us), vec![0, 1, 3, 4, 6]);
+        assert!(!dl.plot(us).is_as_of());
+    }
+
+    #[test]
+    fn as_of_tips_on_either_side_rewrite_only_the_affected_points() {
+        let mut dl = DataLayer::new();
+        let main = dl.add_series();
+        let overlay = dl.add_series();
+        let main_times = (0..500).map(|minute| minute * 60).collect::<Vec<_>>();
+        set(&mut dl, main, &main_times, &vec![1.0; 500]);
+        // The overlay prints every 7 minutes, offset by 30 s.
+        let overlay_times = (0..71).map(|k| k * 420 + 30).collect::<Vec<_>>();
+        let overlay_values = (0..71).map(|k| k as f64).collect::<Vec<_>>();
+        set(&mut dl, overlay, &overlay_times, &overlay_values);
+        assert!(dl.set_time_alignment(overlay, AS_OF));
+        assert_eq!(dl.merged_times(), main_times.as_slice());
+
+        let check = |dl: &DataLayer, times: &[i64], values: &[f64]| {
+            let merged = dl.merged_times();
+            assert_eq!(
+                plot_points(dl, overlay),
+                naive_as_of(merged, merged.len(), times, values, None)
+            );
+            assert_plot_lod_matches_fresh(dl, overlay);
+        };
+        check(&dl, &overlay_times, &overlay_values);
+
+        // A value tick on the overlay's last row repaints only the points showing it.
+        let mut times = overlay_times.clone();
+        let mut values = overlay_values.clone();
+        let before = dl.as_of_rows_rewritten();
+        assert!(dl.update(overlay, *times.last().unwrap(), [99.0; 4]));
+        *values.last_mut().unwrap() = 99.0;
+        // Its last row (29 430 s) is shown by the nine minutes 491..=499.
+        assert_eq!(dl.as_of_rows_rewritten() - before, 9);
+        check(&dl, &times, &values);
+
+        // A new overlay row past the last main point shows nothing until the main catches up.
+        let rebuilds = dl.index_rebuilds();
+        let before = dl.as_of_rows_rewritten();
+        assert!(dl.update(overlay, 500 * 60 + 10, [100.0; 4]));
+        times.push(500 * 60 + 10);
+        values.push(100.0);
+        assert_eq!(dl.as_of_rows_rewritten(), before);
+        assert_eq!(dl.merged_times(), main_times.as_slice());
+        check(&dl, &times, &values);
+
+        // A new main bar extends the overlay by exactly that point.
+        let before = dl.as_of_rows_rewritten();
+        assert!(dl.update(main, 500 * 60, [2.0; 4]));
+        assert!(dl.update(main, 501 * 60, [2.0; 4]));
+        assert_eq!(dl.as_of_rows_rewritten() - before, 2);
+        assert_eq!(dl.take_realigned(), vec![overlay]);
+        assert!(dl.take_realigned().is_empty());
+        check(&dl, &times, &values);
+        assert_eq!(
+            dl.index_rebuilds(),
+            rebuilds,
+            "tips never rebuild the index"
+        );
+
+        // A historical overlay row re-derives that series only.
+        assert!(dl.update(overlay, 45, [-1.0; 4]));
+        times.insert(1, 45);
+        values.insert(1, -1.0);
+        check(&dl, &times, &values);
+        assert_eq!(dl.merged_times().len(), 502);
+    }
+
+    #[test]
+    fn as_of_stops_at_the_last_real_bar_and_follows_it_into_session_slots() {
+        let mut dl = DataLayer::new();
+        let main = dl.add_series();
+        let index = dl.add_series();
+        let nan = f64::NAN;
+        // A session of six slots; only the first two have traded.
+        set(
+            &mut dl,
+            main,
+            &[60, 120, 180, 240, 300, 360],
+            &[1.0, 2.0, nan, nan, nan, nan],
+        );
+        set(&mut dl, index, &[0, 150], &[100.0, 101.0]);
+        assert!(dl.set_time_alignment(index, AS_OF));
+        assert_eq!(plot_points(&dl, index), vec![(0, 100.0), (1, 100.0)]);
+
+        // The third minute trades: the index follows it, but not into the empty slots.
+        assert!(dl.update(main, 180, [3.0; 4]));
+        assert_eq!(
+            plot_points(&dl, index),
+            vec![(0, 100.0), (1, 100.0), (2, 101.0)]
+        );
+        assert_eq!(dl.take_realigned(), vec![index]);
+        // Replacing that bar with whitespace pulls the extent back.
+        assert!(dl.update(main, 180, [nan; 4]));
+        assert_eq!(plot_points(&dl, index), vec![(0, 100.0), (1, 100.0)]);
+        assert_plot_lod_matches_fresh(&dl, index);
+    }
+
+    #[test]
+    fn as_of_max_staleness_blanks_points_whose_row_is_too_old() {
+        let mut dl = DataLayer::new();
+        let hk = dl.add_series();
+        let us = dl.add_series();
+        set(&mut dl, hk, &days(&[1, 2, 3, 5, 6]), &[1.0; 5]);
+        set(&mut dl, us, &days(&[1, 2, 4, 5]), &[10.0, 20.0, 40.0, 50.0]);
+        let exact = TimeAlignment::AsOf {
+            max_staleness: Some(0),
+        };
+        assert!(dl.set_time_alignment(us, exact));
+        assert_eq!(plot_points(&dl, us), vec![(0, 10.0), (1, 20.0), (3, 50.0)]);
+        assert!(!dl.plot(us).is_empty());
+        let one_day = TimeAlignment::AsOf {
+            max_staleness: Some(DAY),
+        };
+        assert!(dl.set_time_alignment(us, one_day));
+        assert_eq!(
+            plot_points(&dl, us),
+            vec![(0, 10.0), (1, 20.0), (2, 20.0), (3, 50.0), (4, 50.0)]
+        );
+        assert!(!dl.set_time_alignment(
+            us,
+            TimeAlignment::AsOf {
+                max_staleness: Some(-1)
+            }
+        ));
+        // A live main bar two days later is past the bound.
+        assert!(dl.update(hk, 8 * DAY, [1.0; 4]));
+        assert_eq!(plot_points(&dl, us).len(), 5);
+        assert!(dl.update(us, 7 * DAY, [70.0; 4]));
+        assert_eq!(plot_points(&dl, us).last(), Some(&(5, 70.0)));
+        assert_plot_lod_matches_fresh(&dl, us);
+    }
+
+    #[test]
+    fn outputs_aliasing_an_as_of_source_follow_its_points_incrementally() {
+        let mut dl = DataLayer::new();
+        let main = dl.add_series();
+        let overlay = dl.add_series();
+        let output = dl.add_series();
+        let main_times = (0..300).map(|minute| minute * 60).collect::<Vec<_>>();
+        set(&mut dl, main, &main_times, &vec![1.0; 300]);
+        let overlay_times = (0..100).map(|k| k * 180 + 20).collect::<Vec<_>>();
+        set(&mut dl, overlay, &overlay_times, &vec![5.0; 100]);
+        assert!(dl.set_time_alignment(overlay, AS_OF));
+        // An indicator output from overlay row 10 on.
+        let output_values = (10..100).map(|row| row as f64).collect::<Vec<_>>();
+        assert!(dl.set_single_data_aligned(output, overlay, 10, output_values.clone()));
+        assert_eq!(dl.time_alignment(output), Some(AS_OF));
+
+        let expected = |dl: &DataLayer, values: &[f64]| {
+            let times = &dl.series_data(overlay).unwrap().0[10..];
+            let merged = dl.merged_times();
+            naive_as_of(merged, merged.len(), times, values, None)
+        };
+        assert_eq!(plot_points(&dl, output), expected(&dl, &output_values));
+        assert_plot_lod_matches_fresh(&dl, output);
+
+        // New main points reach the output through its source without a full copy.
+        let mut values = output_values;
+        for minute in 300..310 {
+            assert!(dl.update(main, minute * 60, [1.0; 4]));
+            assert_eq!(plot_points(&dl, output), expected(&dl, &values));
+        }
+        // The source appends a row; the study recomputes its tail incrementally.
+        assert!(dl.update(overlay, 100 * 180 + 20, [5.0; 4]));
+        values.push(100.0);
+        let last = *values.last().unwrap();
+        assert_eq!(
+            dl.update_single_aligned(output, overlay, 99, &[99.0, last]),
+            Some(89)
+        );
+        assert_eq!(plot_points(&dl, output), expected(&dl, &values));
+        assert_plot_lod_matches_fresh(&dl, output);
+        // A value-only recompute of the last row repaints the points showing it.
+        *values.last_mut().unwrap() = 123.0;
+        assert_eq!(
+            dl.update_single_aligned(output, overlay, 100, &[123.0]),
+            Some(90)
+        );
+        assert_eq!(plot_points(&dl, output), expected(&dl, &values));
+        let min_max = dl
+            .min_max_on_range_cached(output, 0, 400, &[PlotValueIndex::Close])
+            .unwrap();
+        assert_eq!(min_max.max, 123.0);
+        assert_plot_lod_matches_fresh(&dl, output);
+
+        // Switching the source back to the union re-aliases the output onto its own times.
+        assert!(dl.set_time_alignment(overlay, TimeAlignment::Union));
+        assert!(!dl.plot(output).is_as_of());
+        assert_eq!(dl.plot(output).size(), values.len());
+        assert_plot_lod_matches_fresh(&dl, output);
+    }
+
+    #[test]
+    fn as_of_point_colors_and_batches_read_the_row_each_point_shows() {
+        let mut dl = DataLayer::new();
+        let main = dl.add_series();
+        let overlay = dl.add_series();
+        set(&mut dl, main, &[10, 20, 30, 40], &[1.0; 4]);
+        set(&mut dl, overlay, &[5, 25], &[50.0, 250.0]);
+        assert!(dl.set_point_colors(overlay, [Some(vec![7, 9]), None, None]));
+        assert!(dl.set_time_alignment(overlay, AS_OF));
+        let colors = dl.point_colors(overlay).unwrap();
+        assert_eq!(
+            (0..4)
+                .map(|row| colors.color(PointColorChannel::Body, row))
+                .collect::<Vec<_>>(),
+            vec![Some(7), Some(7), Some(9), Some(9)]
+        );
+        // Canonical lookups keep canonical rows.
+        assert_eq!(dl.point_color(overlay, PointColorChannel::Body, 1), Some(9));
+
+        // An in-place batch correction plus a tail append.
+        assert_eq!(
+            dl.update_many_single(overlay, &[5, 35], &[55.0, 350.0]),
+            Some(0)
+        );
+        assert_eq!(
+            plot_points(&dl, overlay),
+            vec![(0, 55.0), (1, 55.0), (2, 250.0), (3, 350.0)]
+        );
+        // A merging batch that inserts history.
+        assert_eq!(
+            dl.update_many_single(overlay, &[15, 36], &[150.0, 360.0]),
+            Some(1)
+        );
+        assert_eq!(dl.merged_times(), &[10, 20, 30, 40]);
+        assert_eq!(
+            plot_points(&dl, overlay),
+            vec![(0, 55.0), (1, 150.0), (2, 250.0), (3, 360.0)]
+        );
+        assert_plot_lod_matches_fresh(&dl, overlay);
+    }
+
+    #[test]
+    fn as_of_respects_the_replay_cutoff_and_retention() {
+        let mut dl = DataLayer::new();
+        let main = dl.add_series();
+        let overlay = dl.add_series();
+        set(&mut dl, main, &[10, 20, 30, 40], &[1.0; 4]);
+        set(&mut dl, overlay, &[15, 25, 35], &[1.5, 2.5, 3.5]);
+        assert!(dl.set_time_alignment(overlay, AS_OF));
+        assert!(dl.set_time_cutoff(Some(30)));
+        assert_eq!(plot_points(&dl, overlay), vec![(1, 1.5), (2, 2.5)]);
+        // A tip beyond the clock is retained but not shown.
+        assert!(dl.update(overlay, 45, [4.5; 4]));
+        assert_eq!(plot_points(&dl, overlay), vec![(1, 1.5), (2, 2.5)]);
+        assert!(dl.set_time_cutoff(None));
+        assert_eq!(
+            plot_points(&dl, overlay),
+            vec![(1, 1.5), (2, 2.5), (3, 3.5)]
+        );
+        assert_eq!(dl.trim_front(overlay, 2), Some(2));
+        assert_eq!(plot_points(&dl, overlay), vec![(3, 3.5)]);
+        assert!(dl.remove_series(overlay));
+        assert_eq!(dl.memory_usage().rows, 4);
+    }
+
+    /// Deterministic xorshift for the randomized as-of differential test.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                self.next() % n
+            }
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    fn same_value(left: f64, right: f64) -> bool {
+        left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
+    }
+
+    /// `(logical index, canonical row)` of every plot row.
+    fn plot_rows(dl: &DataLayer, id: SeriesId) -> Vec<(TimePointIndex, usize)> {
+        let plot = dl.plot(id);
+        (0..plot.size())
+            .map(|row| (plot.index_at(row).unwrap(), plot.source_row(row)))
+            .collect()
+    }
+
+    /// The as-of join recomputed from scratch from the visible canonical columns.
+    fn reference_as_of_rows(
+        dl: &DataLayer,
+        union: &[SeriesId],
+        overlay: SeriesId,
+    ) -> Vec<(TimePointIndex, usize)> {
+        let merged = dl.merged_times();
+        let mut expected_union = union
+            .iter()
+            .flat_map(|&id| dl.series_data(id).unwrap().0.to_vec())
+            .collect::<Vec<_>>();
+        expected_union.sort_unstable();
+        expected_union.dedup();
+        assert_eq!(
+            merged,
+            expected_union.as_slice(),
+            "as-of rows joined the union"
+        );
+        let through = union
+            .iter()
+            .filter_map(|&id| {
+                let (times, columns) = dl.series_data(id).unwrap();
+                (0..times.len())
+                    .rev()
+                    .find(|&row| columns.iter().any(|column| !column[row].is_nan()))
+                    .map(|row| merged.binary_search(&times[row]).unwrap() + 1)
+            })
+            .max()
+            .unwrap_or(0);
+        let TimeAlignment::AsOf { max_staleness } = dl.time_alignment(overlay).unwrap() else {
+            panic!("not as-of");
+        };
+        let (times, _) = dl.series_data(overlay).unwrap();
+        merged[..through]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &point)| {
+                let row = times
+                    .partition_point(|&time| time <= point)
+                    .checked_sub(1)?;
+                if max_staleness.is_some_and(|max| point - times[row] > max) {
+                    return None;
+                }
+                Some((index as TimePointIndex, row))
+            })
+            .collect()
+    }
+
+    fn naive_min_max(values: impl Iterator<Item = f64>) -> Option<(f64, f64)> {
+        values
+            .filter(|value| !value.is_nan())
+            .fold(None, |result, value| match result {
+                None => Some((value, value)),
+                Some((min, max)) => Some((value.min(min), value.max(max))),
+            })
+    }
+
+    /// Every reader of an as-of plot (and of an output aliasing it) against the reference.
+    fn check_as_of_readers(
+        dl: &mut DataLayer,
+        union: &[SeriesId],
+        overlay: SeriesId,
+        output: SeriesId,
+        rng: &mut Rng,
+        context: &str,
+    ) {
+        let overlay_as_of = dl.time_alignment(overlay).unwrap().is_as_of();
+        let expected = if overlay_as_of {
+            reference_as_of_rows(dl, union, overlay)
+        } else {
+            let merged = dl.merged_times();
+            let (times, _) = dl.series_data(overlay).unwrap();
+            times
+                .iter()
+                .enumerate()
+                .map(|(row, time)| {
+                    (
+                        merged.binary_search(time).expect("union row has a point") as i64,
+                        row,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(dl.plot(overlay).is_as_of(), overlay_as_of, "{context}");
+        // Only owned series carry an alignment; the owner count backs the union fast path.
+        assert!(dl.live_slots.values().all(|&slot| {
+            dl.series[slot].time_alias.is_none()
+                || dl.series[slot].alignment == TimeAlignment::Union
+        }));
+        assert_eq!(
+            dl.as_of_series,
+            dl.live_slots
+                .values()
+                .filter(|&&slot| dl.series[slot].alignment.is_as_of())
+                .count(),
+            "{context}"
+        );
+        assert_eq!(plot_rows(dl, overlay), expected, "{context}: overlay rows");
+        {
+            let plot = dl.plot(overlay);
+            let (_, columns) = dl.series_data(overlay).unwrap();
+            for (row, &(_, source)) in expected.iter().enumerate() {
+                for value in [
+                    PlotValueIndex::Open,
+                    PlotValueIndex::High,
+                    PlotValueIndex::Low,
+                    PlotValueIndex::Close,
+                ] {
+                    assert!(
+                        same_value(plot.value_at(row, value), columns[value as usize][source]),
+                        "{context}: overlay value"
+                    );
+                }
+            }
+            let len = plot.size();
+            for end in [len, len / 2, len.saturating_sub(1)] {
+                assert_eq!(
+                    plot.last_non_whitespace_row_before(end),
+                    (0..end).rev().find(|&row| !plot.is_whitespace_row(row)),
+                    "{context}: predecessor"
+                );
+            }
+        }
+        if overlay_as_of {
+            assert_plot_lod_matches_fresh(dl, overlay);
+        }
+
+        // The output shows `2 * close` of the overlay rows it aliases, at the same points.
+        let slot = dl.series_slot(output).unwrap();
+        let alias = dl.series[slot].time_alias.expect("output stays aliased");
+        let out_len = dl.series[slot].values.len();
+        let expected_output = expected
+            .iter()
+            .filter(|&&(_, source)| source >= alias.offset && source < alias.offset + out_len)
+            .map(|&(index, source)| (index, source - alias.offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dl.time_alignment(output),
+            dl.time_alignment(overlay),
+            "{context}"
+        );
+        assert_eq!(
+            plot_rows(dl, output),
+            expected_output,
+            "{context}: output rows"
+        );
+        {
+            let plot = dl.plot(output);
+            let (_, columns) = dl.series_data(overlay).unwrap();
+            for (row, &(_, source)) in expected_output.iter().enumerate() {
+                assert!(
+                    same_value(
+                        plot.value_at(row, PlotValueIndex::Close),
+                        columns[3][source + alias.offset] * 2.0
+                    ),
+                    "{context}: output value"
+                );
+            }
+        }
+        if overlay_as_of {
+            assert_plot_lod_matches_fresh(dl, output);
+        }
+
+        // Autoscale chunks (cached across operations) against a fresh fold.
+        let points = dl.merged_times().len() as u64 + 2;
+        for _ in 0..3 {
+            let from = rng.below(points) as i64 - 1;
+            let to = from + rng.below(points) as i64;
+            for (id, rows, offset, scale) in [
+                (overlay, &expected, 0, 1.0),
+                (output, &expected_output, alias.offset, 2.0),
+            ] {
+                let (_, columns) = dl.series_data(overlay).unwrap();
+                let naive = naive_min_max(
+                    rows.iter()
+                        .filter(|(index, _)| (from..=to).contains(index))
+                        .flat_map(|&(_, source)| {
+                            let source = source + offset;
+                            if id == overlay {
+                                [columns[1][source], columns[2][source]]
+                            } else {
+                                [columns[3][source] * scale; 2]
+                            }
+                        }),
+                );
+                let actual = dl
+                    .min_max_on_range_cached(
+                        id,
+                        from,
+                        to,
+                        &[PlotValueIndex::High, PlotValueIndex::Low],
+                    )
+                    .map(|min_max| (min_max.min, min_max.max));
+                assert_eq!(
+                    actual, naive,
+                    "{context}: min/max of {id} over {from}..={to}"
+                );
+            }
+        }
+    }
+
+    fn random_row(rng: &mut Rng, whitespace_percent: u64) -> [f64; 4] {
+        if rng.chance(whitespace_percent) {
+            return [f64::NAN; 4];
+        }
+        let low = rng.below(1_000) as f64 / 8.0;
+        let high = low + rng.below(80) as f64 / 8.0;
+        let open = low + rng.below(8) as f64 / 8.0;
+        [open, high, low, low.max(high - 1.0)]
+    }
+
+    fn random_time(rng: &mut Rng, dl: &DataLayer, id: SeriesId) -> i64 {
+        let times = &dl.series[dl.series_slot(id).unwrap()].times;
+        let last = times.last().copied().unwrap_or(0);
+        match rng.below(6) {
+            0 | 1 => last + 1 + rng.below(9) as i64,
+            2 => last,
+            3 if !times.is_empty() => times[rng.below(times.len() as u64) as usize],
+            _ => rng.below(last.max(1) as u64 + 5) as i64,
+        }
+    }
+
+    fn random_batch(rng: &mut Rng, dl: &DataLayer, id: SeriesId) -> Vec<i64> {
+        let mut times = (0..1 + rng.below(6))
+            .map(|_| random_time(rng, dl, id))
+            .collect::<Vec<_>>();
+        times.sort_unstable();
+        times.dedup();
+        times
+    }
+
+    #[test]
+    fn as_of_incremental_maintenance_matches_a_fresh_join_under_random_mutations() {
+        for seed in 1..=80u64 {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
+            let mut dl = DataLayer::new();
+            let main = dl.add_series();
+            let volume = dl.add_series();
+            let overlay = dl.add_series();
+            let output = dl.add_series();
+            let union = [main, volume];
+            // Every fourth seed is large enough for two summary levels and many autoscale chunks.
+            let scale: u64 = if seed % 4 == 0 { 6 } else { 1 };
+            // Main: a session of 2-second slots, traded for the first part.
+            let slots = (0..60 * scale as i64)
+                .map(|slot| slot * 2)
+                .collect::<Vec<_>>();
+            let traded = rng.below(60 * scale);
+            let rows = (0..60 * scale)
+                .map(|slot| random_row(&mut rng, if slot < traded { 5 } else { 100 }))
+                .collect::<Vec<_>>();
+            let column = |value: usize| rows.iter().map(|row| row[value]).collect::<Vec<_>>();
+            dl.set_data(main, slots, column(0), column(1), column(2), column(3));
+            let volume_times = (0..15 * scale as i64)
+                .map(|row| row * 3 + 1)
+                .collect::<Vec<_>>();
+            let volume_values = (0..15 * scale)
+                .map(|_| random_row(&mut rng, 30)[3])
+                .collect::<Vec<_>>();
+            dl.set_single_data(volume, volume_times, volume_values);
+            let overlay_times = (0..25 * scale as i64)
+                .map(|row| row * 5 + rng.below(5) as i64)
+                .collect::<Vec<_>>();
+            let overlay_rows = (0..25 * scale)
+                .map(|_| random_row(&mut rng, 10))
+                .collect::<Vec<_>>();
+            let column = |value: usize| overlay_rows.iter().map(|row| row[value]).collect();
+            dl.set_data(
+                overlay,
+                overlay_times,
+                column(0),
+                column(1),
+                column(2),
+                column(3),
+            );
+            let alignments = [
+                TimeAlignment::AsOf {
+                    max_staleness: None,
+                },
+                TimeAlignment::AsOf {
+                    max_staleness: Some(4),
+                },
+                TimeAlignment::AsOf {
+                    max_staleness: Some(0),
+                },
+                TimeAlignment::Union,
+            ];
+            dl.set_time_alignment(overlay, alignments[rng.below(3) as usize]);
+
+            // An indicator-like output: `2 * close` from a warm-up row on, recomputed the way the
+            // engine does after every source change (full after trims and replacements).
+            let install_output = |dl: &mut DataLayer| {
+                let (_, columns) = dl.series_data(overlay).unwrap();
+                let from = columns[3].len().min(3);
+                let values = columns[3][from..].iter().map(|close| close * 2.0).collect();
+                assert!(dl.set_single_data_aligned(output, overlay, from, values));
+            };
+            install_output(&mut dl);
+            dl.take_realigned();
+
+            for step in 0..120 {
+                let before_rows = plot_rows(&dl, overlay);
+                let before_generation = dl.time_points_generation();
+                let before_overlay = dl.series_data(overlay).unwrap().0.to_vec();
+                let before_close = dl.series_data(overlay).unwrap().1[3].to_vec();
+                let op = rng.below(14);
+                let target = [main, volume, overlay][rng.below(3) as usize];
+                let mut full = false;
+                let description = match op {
+                    0..=4 => {
+                        let time = random_time(&mut rng, &dl, target);
+                        let row = random_row(&mut rng, if target == main { 20 } else { 10 });
+                        dl.update(target, time, row);
+                        format!("update {target} at {time}")
+                    }
+                    5 | 6 => {
+                        let times = random_batch(&mut rng, &dl, target);
+                        let rows = times
+                            .iter()
+                            .map(|_| random_row(&mut rng, 10))
+                            .collect::<Vec<_>>();
+                        let column =
+                            |value: usize| rows.iter().map(|row| row[value]).collect::<Vec<_>>();
+                        if target == volume {
+                            dl.update_many_single(volume, &times, &column(3));
+                        } else {
+                            dl.update_many(
+                                target,
+                                &times,
+                                [&column(0), &column(1), &column(2), &column(3)],
+                            );
+                        }
+                        format!("batch {target} at {times:?}")
+                    }
+                    7 => {
+                        dl.pop(target, 1 + rng.below(3) as usize);
+                        full = true;
+                        format!("pop {target}")
+                    }
+                    8 => {
+                        let len = dl.series_data(target).unwrap().0.len();
+                        dl.trim_front(target, len.saturating_sub(1 + rng.below(3) as usize));
+                        full = true;
+                        format!("trim {target}")
+                    }
+                    9 => {
+                        let cutoff = (!rng.chance(40)).then(|| rng.below(160) as i64);
+                        dl.set_time_cutoff(cutoff);
+                        full = true;
+                        format!("cutoff {cutoff:?}")
+                    }
+                    10 => {
+                        let alignment = alignments[rng.below(4) as usize];
+                        dl.set_time_alignment(overlay, alignment);
+                        format!("align {alignment:?}")
+                    }
+                    11 => {
+                        let len = 1 + rng.below(30 * scale) as i64;
+                        let start = rng.below(40) as i64;
+                        let times = (0..len).map(|row| start + row * 4).collect::<Vec<_>>();
+                        let rows = times
+                            .iter()
+                            .map(|_| random_row(&mut rng, 15))
+                            .collect::<Vec<_>>();
+                        let column =
+                            |value: usize| rows.iter().map(|row| row[value]).collect::<Vec<_>>();
+                        if target == volume || (target == overlay && rng.chance(50)) {
+                            dl.set_single_data(target, times, column(3));
+                        } else {
+                            dl.set_data(target, times, column(0), column(1), column(2), column(3));
+                        }
+                        full = true;
+                        format!("set {target}")
+                    }
+                    12 => {
+                        // A direct write materializes the output; the recompute re-aliases it.
+                        dl.pop(output, 0);
+                        full = true;
+                        "materialize output".to_string()
+                    }
+                    _ => {
+                        let len = dl.series_data(target).unwrap().0.len();
+                        if len > 0 {
+                            let time = dl.series_data(target).unwrap().0[len - 1];
+                            dl.update(target, time, [f64::NAN; 4]);
+                        }
+                        format!("whitespace tip {target}")
+                    }
+                };
+                let context = format!("seed {seed} step {step}: {description}");
+
+                // Recompute the output like the engine: full after a replacement, a trim, or a
+                // moved clock; otherwise from the first overlay row that changed.
+                let (times, columns) = dl.series_data(overlay).unwrap();
+                let changed = before_overlay
+                    .iter()
+                    .zip(times)
+                    .zip(before_close.iter().zip(columns[3]))
+                    .position(|((old_time, new_time), (old, new))| {
+                        old_time != new_time || !same_value(*old, *new)
+                    })
+                    .unwrap_or(before_overlay.len().min(times.len()));
+                let front_moved = before_overlay.first() != times.first();
+                if full || front_moved || rng.chance(15) {
+                    install_output(&mut dl);
+                } else {
+                    let alias = dl.series[dl.series_slot(output).unwrap()]
+                        .time_alias
+                        .unwrap();
+                    let out_len = dl.series[dl.series_slot(output).unwrap()].values.len();
+                    let from = changed.max(alias.offset).min(alias.offset + out_len);
+                    let from = from.min(times.len());
+                    let values = columns[3][from..]
+                        .iter()
+                        .map(|close| close * 2.0)
+                        .collect::<Vec<_>>();
+                    assert!(
+                        dl.update_single_aligned(output, overlay, from, &values)
+                            .is_some(),
+                        "{context}: incremental output"
+                    );
+                }
+
+                // A mapping moved by another series without a time-point change must be reported,
+                // or the engine would keep presenting the overlay's stale retained layer.
+                let realigned = dl.take_realigned();
+                if target != overlay
+                    && op != 10
+                    && dl.time_points_generation() == before_generation
+                    && plot_rows(&dl, overlay) != before_rows
+                {
+                    assert!(
+                        realigned.contains(&overlay),
+                        "{context}: overlay not realigned"
+                    );
+                }
+                check_as_of_readers(&mut dl, &union, overlay, output, &mut rng, &context);
+            }
+        }
+    }
+
+    #[test]
+    fn a_materialized_as_of_output_realiased_onto_its_source_follows_the_source_again() {
+        let mut dl = DataLayer::new();
+        let main = dl.add_series();
+        let overlay = dl.add_series();
+        let output = dl.add_series();
+        let main_times = (0..200).collect::<Vec<_>>();
+        set(&mut dl, main, &main_times, &vec![1.0; 200]);
+        let overlay_times = (0..100).map(|row| row * 2 + 1).collect::<Vec<_>>();
+        let overlay_values = (0..100).map(f64::from).collect::<Vec<_>>();
+        set(&mut dl, overlay, &overlay_times, &overlay_values);
+        assert!(dl.set_time_alignment(overlay, AS_OF));
+        assert!(dl.set_single_data_aligned(output, overlay, 0, overlay_values.clone()));
+        // A direct write materializes the output as its own as-of series.
+        assert!(dl.update(output, 199, [7.0; 4]));
+        assert_eq!(dl.time_alignment(output), Some(AS_OF));
+        // Re-aliasing hands it back to its source's alignment, including after a switch.
+        assert!(dl.set_single_data_aligned(output, overlay, 0, overlay_values.clone()));
+        assert!(dl.set_time_alignment(overlay, TimeAlignment::Union));
+        assert_eq!(dl.time_alignment(output), Some(TimeAlignment::Union));
+        // A recompute from row 50, inside a complete summary node.
+        let mut values = overlay_values;
+        values[50] = -5.0;
+        assert_eq!(
+            dl.update_single_aligned(output, overlay, 50, &values[50..]),
+            Some(50)
+        );
+        assert_lod_matches_fresh(&dl, output);
+        assert_eq!(
+            dl.plot(output)
+                .lod()
+                .unwrap()
+                .rows_on_range(0..100, 0)
+                .0
+                .iter()
+                .map(|row| dl.plot(output).value_at(row, PlotValueIndex::Low))
+                .fold(f64::INFINITY, f64::min),
+            -5.0
+        );
+        // The count of as-of owners returns to zero once nothing is as-of.
+        assert!(dl.remove_series(output));
+        assert_eq!(dl.as_of_series, 0);
     }
 }

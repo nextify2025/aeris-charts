@@ -421,14 +421,21 @@ test("rectangle tool uses official two-click preview, data-time snapping, and en
   await page.mouse.move(setup.second.x, setup.second.y);
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 
+  // f65f039 ("canonical theme") moved the semantic primary from #168ef7 to #0091ff. The active
+  // axis band is that primary at the engine's 64/255 alpha over the white fixture surface
+  // (191, 227, 255); the active price labels are the opaque primary (0, 145, 255). Selection
+  // handles in the pane share the primary, so both probes count only the left price-axis
+  // columns: the engine axis views, not the handles, must satisfy them.
   const preview = await page.evaluate(() => {
     const chart = window.__chart;
     const canvas = chart.take_screenshot();
     const ctx = canvas.getContext("2d");
+    const axis_right = Math.floor(chart.price_scale("left").width() * canvas.width / chart.chart_element().clientWidth);
     let band_pixels = 0;
     const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
     for (let index = 0; index < pixels.length; index += 4) {
-      if (Math.abs(pixels[index] - 197) <= 3 && Math.abs(pixels[index + 1] - 227) <= 3 && Math.abs(pixels[index + 2] - 253) <= 3 && pixels[index + 3] === 255) {
+      if ((index / 4) % canvas.width >= axis_right) continue;
+      if (Math.abs(pixels[index] - 191) <= 3 && Math.abs(pixels[index + 1] - 227) <= 3 && Math.abs(pixels[index + 2] - 255) <= 3 && pixels[index + 3] === 255) {
         band_pixels += 1;
       }
     }
@@ -453,14 +460,16 @@ test("rectangle tool uses official two-click preview, data-time snapping, and en
     const ctx = canvas.getContext("2d");
     const options = drawing.options();
     const points = drawing.points();
+    const axis_right = Math.floor(chart.price_scale("left").width() * canvas.width / chart.chart_element().clientWidth);
     let label_pixels = 0;
     let band_pixels = 0;
     const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
     for (let index = 0; index < pixels.length; index += 4) {
-      if (Math.abs(pixels[index] - 22) <= 3 && Math.abs(pixels[index + 1] - 142) <= 3 && Math.abs(pixels[index + 2] - 247) <= 3 && pixels[index + 3] === 255) {
+      if ((index / 4) % canvas.width >= axis_right) continue;
+      if (Math.abs(pixels[index] - 0) <= 3 && Math.abs(pixels[index + 1] - 145) <= 3 && Math.abs(pixels[index + 2] - 255) <= 3 && pixels[index + 3] === 255) {
         label_pixels += 1;
       }
-      if (Math.abs(pixels[index] - 197) <= 3 && Math.abs(pixels[index + 1] - 227) <= 3 && Math.abs(pixels[index + 2] - 253) <= 3 && pixels[index + 3] === 255) {
+      if (Math.abs(pixels[index] - 191) <= 3 && Math.abs(pixels[index + 1] - 227) <= 3 && Math.abs(pixels[index + 2] - 255) <= 3 && pixels[index + 3] === 255) {
         band_pixels += 1;
       }
     }
@@ -705,8 +714,10 @@ test("tooltip presents themed OHLC market data with explicit volume", async ({ p
     { label: "Low", value: target.expected.low },
     { label: "Volume", value: target.expected.volume },
   ]);
+  // f65f039 ("canonical theme") set the dark surface to #1f1f1f and the dark foreground to
+  // #f5f5f5; the light foreground below moved from #333333 to #222222 in the same commit.
   expect(content.background).toBe("rgb(31, 31, 31)");
-  expect(content.color).toBe("rgb(240, 240, 240)");
+  expect(content.color).toBe("rgb(245, 245, 245)");
   expect(content.borderRadius).toBe("8px");
   expect(content.shadow).toBe("none");
   expect(content.transform).toContain("20px");
@@ -716,7 +727,7 @@ test("tooltip presents themed OHLC market data with explicit volume", async ({ p
     window.__chart.apply_options(api.theme_options("light"));
   });
   await expect.poll(() => page.locator(".aeris_charts-tooltip").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe("rgb(255, 255, 255)");
-  expect(await page.locator(".aeris_charts-tooltip").evaluate((element) => getComputedStyle(element).color)).toBe("rgb(51, 51, 51)");
+  expect(await page.locator(".aeris_charts-tooltip").evaluate((element) => getComputedStyle(element).color)).toBe("rgb(34, 34, 34)");
 
   const after = await page.screenshot();
   expect(after.equals(before)).toBe(false);

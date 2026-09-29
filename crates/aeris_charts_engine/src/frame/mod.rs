@@ -50,6 +50,8 @@ mod feature_geometry;
 mod footprint_geometry;
 mod general_series_geometry;
 mod native_primitive_geometry;
+#[cfg(test)]
+mod run_break_tests;
 mod series_geometry;
 #[cfg(test)]
 mod tests;
@@ -445,6 +447,9 @@ pub(crate) struct RetainedFrame {
     coordinate_generation: u64,
     last_layout_key: Option<[u64; 9]>,
     last_overlay_key: Option<[u64; 6]>,
+    /// The hovered and the selected drawing when their family paints parts only while focused
+    /// (`DrawingFamily::reveals_on_focus`).
+    last_focus_key: [Option<crate::DrawingId>; 2],
     last_options_generation: u64,
     last_series_revision: u64,
     last_time_scale_revision: u64,
@@ -807,12 +812,12 @@ impl ChartEngine {
             return Some(price);
         }
         let plot = self.data.plot(id);
-        let close = plot.column(PlotValueIndex::Close);
+        let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         let mut any = false;
         for row in plot.visible_rows(from, to) {
-            let value = close[row];
+            let value = close(row);
             if value.is_finite() {
                 min = min.min(value);
                 max = max.max(value);
@@ -845,7 +850,8 @@ impl ChartEngine {
         if !matches!(series.kind, SeriesKind::Baseline) {
             if let Some(c) = self
                 .data
-                .point_color(series.id, PointColorChannel::Body, row)
+                .point_colors(series.id)
+                .and_then(|colors| colors.color(PointColorChannel::Body, row))
             {
                 return Color(c);
             }
@@ -938,7 +944,12 @@ impl ChartEngine {
                 )
             });
         let rising = open <= close;
-        let point = |channel| self.data.point_color(series.id, channel, row).map(Color);
+        let colors = self.data.point_colors(series.id);
+        let point = |channel| {
+            colors
+                .and_then(|colors| colors.color(channel, row))
+                .map(Color)
+        };
         let pick = |up: &Option<String>, down: &Option<String>, fallback: Color| {
             if rising {
                 verbatim_color(up, fallback)
@@ -1098,6 +1109,20 @@ impl ChartEngine {
 
     pub(crate) fn invalidate_frame_series(&mut self, id: SeriesId) {
         self.frame_invalidation.series(id);
+        // Family drawings whose geometry reads series data (regression statistics, a forecast's
+        // outcome) follow their own source series; a change of any other series leaves them.
+        // Structural source changes (series add, removal, pane or scale moves) invalidate the
+        // whole scene instead.
+        if self.drawings.iter().any(|drawing| {
+            drawing
+                .kind
+                .spec()
+                .family
+                .is_some_and(|family| (family.reads_series_data)(drawing))
+                && self.drawing_source_series(drawing) == Some(id)
+        }) {
+            self.frame_invalidation.drawings();
+        }
     }
 
     /// The generation a retained series layer is built from. A `histogram_updown` histogram
@@ -1291,6 +1316,15 @@ impl ChartEngine {
         let time_scale_revision = self.time_scale.revision();
         if self.retained_frame.last_time_scale_revision != time_scale_revision {
             self.frame_invalidation.time_coordinates();
+        }
+        // Hover and selection normally reassemble retained drawing geometry without rebuilding
+        // it; a drawing that paints parts only while focused rebuilds the layer when it gains
+        // or loses focus.
+        let focus_key = [self.hovered_drawing(), self.selected_drawing()]
+            .map(|id| id.filter(|&id| self.drawing_reveals_on_focus(id)));
+        if self.retained_frame.last_focus_key != focus_key {
+            self.frame_invalidation.drawings();
+            self.retained_frame.last_focus_key = focus_key;
         }
         let price_scales_changed = self.retained_frame.last_price_scale_revisions.len()
             != self.panes.len()

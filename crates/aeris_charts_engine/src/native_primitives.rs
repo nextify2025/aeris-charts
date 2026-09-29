@@ -975,7 +975,8 @@ impl ChartEngine {
             high,
             low,
             close,
-            time: *times.get(row)?,
+            // The bar's own time (an as-of point repeats an earlier row of its series).
+            time: *times.get(plot.source_row(row))?,
         })
     }
 

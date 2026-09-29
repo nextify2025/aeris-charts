@@ -1,6 +1,7 @@
 use aeris_charts_core::scale::general_scale::{BandScale, LinearScale, PointScale};
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, Prim, TextAlign};
+use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim, TextAlign};
+use aeris_charts_render::shape::Rect;
 
 use crate::general_axes::NumericAxisScale;
 use crate::{
@@ -21,6 +22,43 @@ const MAX_GENERAL_DATA_LABEL_ATTEMPTS_PER_PANE: usize = 4_096;
 
 fn opacity_alpha(opacity: f64) -> u8 {
     (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// A series stroke over the pooled points `[first, first + count)` (shared with its area or band
+/// fill). A solid style strokes them as they are; a dashed or dotted one reaches executors as
+/// solid dash runs clipped to the pane, like every engine-owned dashed stroke, because the WebGPU
+/// stroker has no dash concept.
+fn push_general_stroke(
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+    (first, count): (u32, u32),
+    line_type: LineType,
+    (width, style, color): (f32, LineStyle, Color),
+    pane: Rect,
+) {
+    if style == LineStyle::Solid {
+        out.push(Prim::Polyline {
+            first_point: first,
+            point_count: count,
+            width,
+            style,
+            line_type,
+            color,
+        });
+        return;
+    }
+    let run: Vec<(f64, f64)> = points[first as usize..(first + count) as usize]
+        .iter()
+        .map(|point| (f64::from(point[0]), f64::from(point[1])))
+        .collect();
+    super::series_geometry::push_styled_stroke(
+        out,
+        points,
+        &run,
+        line_type,
+        (width, style, color),
+        pane,
+    );
 }
 
 fn push_general_point_symbol(
@@ -93,6 +131,16 @@ impl ChartEngine {
         };
         let Some(plot) = self.general_plot_rect(pane_index) else {
             return interaction;
+        };
+        let Some(pane) = self.panes.get(pane_index) else {
+            return interaction;
+        };
+        // Series strokes clip to the pane when they lower dashes (pane-local x).
+        let pane_clip = Rect {
+            left: 0.0,
+            top: pane.top * vpr,
+            right: plot.width * hpr,
+            bottom: (pane.top + pane.height) * vpr,
         };
         let layout = &self.options.get().layout;
         let label_size = layout.font_size.max(1.0);
@@ -248,14 +296,18 @@ impl ChartEngine {
                                         line_type: series.interpolation().render_type(),
                                         fill,
                                     });
-                                    out.push(Prim::Polyline {
-                                        first_point: upper_first,
-                                        point_count,
-                                        width: (series.line_width() * vpr) as f32,
-                                        style: series.line_style().render_style(),
-                                        line_type: series.interpolation().render_type(),
-                                        color,
-                                    });
+                                    push_general_stroke(
+                                        out,
+                                        points,
+                                        (upper_first, point_count),
+                                        series.interpolation().render_type(),
+                                        (
+                                            (series.line_width() * vpr) as f32,
+                                            series.line_style().render_style(),
+                                            color,
+                                        ),
+                                        pane_clip,
+                                    );
                                 } else {
                                     upper.clear();
                                     lower.clear();
@@ -334,14 +386,18 @@ impl ChartEngine {
                                     },
                                 });
                             }
-                            out.push(Prim::Polyline {
-                                first_point,
-                                point_count,
-                                width: (series.line_width() * vpr) as f32,
-                                style: series.line_style().render_style(),
-                                line_type: series.interpolation().render_type(),
-                                color,
-                            });
+                            push_general_stroke(
+                                out,
+                                points,
+                                (first_point, point_count),
+                                series.interpolation().render_type(),
+                                (
+                                    (series.line_width() * vpr) as f32,
+                                    series.line_style().render_style(),
+                                    color,
+                                ),
+                                pane_clip,
+                            );
                         } else {
                             run.clear();
                         }
@@ -453,22 +509,30 @@ impl ChartEngine {
                                 line_type: series.interpolation().render_type(),
                                 fill,
                             });
-                            out.push(Prim::Polyline {
-                                first_point: upper_first,
-                                point_count,
-                                width: (series.line_width() * vpr) as f32,
-                                style: series.line_style().render_style(),
-                                line_type: series.interpolation().render_type(),
-                                color,
-                            });
-                            out.push(Prim::Polyline {
-                                first_point: lower_first,
-                                point_count,
-                                width: (series.line_width() * vpr) as f32,
-                                style: series.line_style().render_style(),
-                                line_type: series.interpolation().render_type(),
-                                color,
-                            });
+                            push_general_stroke(
+                                out,
+                                points,
+                                (upper_first, point_count),
+                                series.interpolation().render_type(),
+                                (
+                                    (series.line_width() * vpr) as f32,
+                                    series.line_style().render_style(),
+                                    color,
+                                ),
+                                pane_clip,
+                            );
+                            push_general_stroke(
+                                out,
+                                points,
+                                (lower_first, point_count),
+                                series.interpolation().render_type(),
+                                (
+                                    (series.line_width() * vpr) as f32,
+                                    series.line_style().render_style(),
+                                    color,
+                                ),
+                                pane_clip,
+                            );
                         } else {
                             upper.clear();
                             lower.clear();

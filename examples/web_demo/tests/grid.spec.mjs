@@ -94,6 +94,8 @@ test("demo chrome and controls follow the chart theme", async ({ page }) => {
     bearish: window.__chart.options().layout.bearishColor,
   }));
 
+  // d2c9b95 ("pin crosshair to dark chrome tokens") pins the crosshair line to the dark border
+  // (#333333) and its label to the dark muted surface (#222222) in both themes.
   expect(await theme_state()).toEqual({
     root: "dark",
     control: "dark",
@@ -104,11 +106,20 @@ test("demo chrome and controls follow the chart theme", async ({ page }) => {
     axis_border: "#333333",
     grid: "#333333",
     border_control: "#333333",
-    crosshair_control: "#404040",
-    crosshair_label_control: "#404040",
+    crosshair_control: "#333333",
+    crosshair_label_control: "#222222",
     bullish: "#089981",
     bearish: "#f7525f",
   });
+
+  // Both themes share the crosshair tokens, so customize them first: the theme switch below must
+  // restore the canonical crosshair and resync its controls rather than keep the custom values.
+  await page.locator("#cross_color").fill("#ff0000");
+  await page.locator("#cross_label_bg").fill("#00ff00");
+  expect(await page.evaluate(() => {
+    const line = window.__chart.options().crosshair.vertLine;
+    return [line.color, line.labelBackgroundColor];
+  })).toEqual(["#ff0000", "#00ff00"]);
 
   await page.selectOption("#theme_select", "light");
   await wait_grid(page);
@@ -122,8 +133,8 @@ test("demo chrome and controls follow the chart theme", async ({ page }) => {
     axis_border: "#e5e5e5",
     grid: "#e5e5e5",
     border_control: "#e5e5e5",
-    crosshair_control: "#c2c2c2",
-    crosshair_label_control: "#c2c2c2",
+    crosshair_control: "#333333",
+    crosshair_label_control: "#222222",
     bullish: "#089981",
     bearish: "#f7525f",
   });

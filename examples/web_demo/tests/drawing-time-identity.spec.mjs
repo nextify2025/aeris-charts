@@ -227,13 +227,31 @@ test("sync payloads, price-basis rescale, batch rewrites and option errors throu
     } catch (error) {
       anchor_error = error.code;
     }
+    // A long freehand stroke copies, pastes, and clones past the 64 KiB template bound; copying
+    // nothing reports invalid data.
+    const stroke = hourly.add_drawing("highlighter", Array.from({ length: 2_000 }, (_, index) => ({
+      logical: 1 + index * 0.0037,
+      price: 100 + Math.sin(index * 0.017),
+    })));
+    const stroke_payload = hourly.copy_drawings([stroke.id]);
+    const stroke_copy = {
+      bytes: stroke_payload.length,
+      pasted: hourly.paste_drawings(stroke_payload, 0, 0.5)[0].points().length,
+      cloned: hourly.clone_drawing(stroke, 1).points().length,
+    };
+    let copy_error = null;
+    try {
+      hourly.copy_drawings([987_654]);
+    } catch (error) {
+      copy_error = error.code;
+    }
     hourly.remove();
     hourly_host.remove();
     daily.remove();
     daily_host.remove();
     return {
       applied, synced, changed, rescaled, basis, undo_after_rescale, batch, after_batch_undo,
-      option_error, anchor_error,
+      option_error, anchor_error, stroke_copy, copy_error,
     };
   }, { BASE, HOUR, DAY });
 
@@ -248,6 +266,9 @@ test("sync payloads, price-basis rescale, batch rewrites and option errors throu
   expect(result.after_batch_undo).toEqual([10, 5]);
   expect(result.option_error).toBe("invalid_options");
   expect(result.anchor_error).toBe("invalid_data");
+  expect(result.stroke_copy.bytes).toBeGreaterThan(64 * 1024);
+  expect(result.stroke_copy).toMatchObject({ pasted: 2_000, cloned: 2_000 });
+  expect(result.copy_error).toBe("invalid_data");
 });
 
 async function goto_fixture(page) {

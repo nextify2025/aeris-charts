@@ -74,6 +74,222 @@ fn trend_labels_default_to_top_right_without_changing_standalone_text_defaults()
 }
 
 #[test]
+fn named_templates_carry_style_but_never_identity_placement_or_text() {
+    let mut chart = settled_chart();
+    let points = |from: f64| {
+        vec![
+            DrawingPoint {
+                logical: from,
+                price: 10.5,
+            },
+            DrawingPoint {
+                logical: from + 3.0,
+                price: 12.5,
+            },
+        ]
+    };
+    let source = chart
+        .add_drawing(
+            DrawingKind::FibRetracement,
+            0,
+            points(1.0),
+            Some(
+                r##"{"name":"Swing A","group_id":"g1","text":"A","locked":true,"z_order":7,
+                "visible":false,"price_scale_id":"left",
+                "interval_visibility":{"enabled":true,"intervals":[]},
+                "color":"#123456","width":3,"style":"dotted","text_size":17}"##,
+            ),
+        )
+        .unwrap();
+    let target = chart
+        .add_drawing(
+            DrawingKind::FibRetracement,
+            0,
+            points(5.0),
+            Some(r#"{"name":"Swing B","text":"B"}"#),
+        )
+        .unwrap();
+    // Several edits put the target's revision ahead of the source's.
+    for color in ["#654321", "#654322", "#654323"] {
+        assert!(chart.drawing_apply_options(target, &format!(r#"{{"color":"{color}"}}"#)));
+    }
+    assert!(chart.drawing(target).unwrap().revision > chart.drawing(source).unwrap().revision);
+    let before = chart.drawing(target).unwrap().clone();
+
+    let template = chart.drawing_template_json(source, "my style").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&template).unwrap();
+    for key in TEMPLATE_NON_STYLE_KEYS {
+        assert!(parsed["options"].get(*key).is_none(), "{key} in {template}");
+    }
+    assert!(chart.apply_drawing_template_json(target, &template));
+    let after = chart.drawing(target).unwrap();
+    // Style transfers.
+    assert_eq!(after.color, "#123456");
+    assert_eq!(after.width, 3.0);
+    assert_eq!(after.style, LineStyle::Dotted);
+    assert_eq!(after.text_size, Some(17.0));
+    // Identity, placement, visibility, and content stay the target's own.
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.group_id, before.group_id);
+    assert_eq!(after.locked, before.locked);
+    assert_eq!(after.visible, before.visible);
+    assert_eq!(after.z_order, before.z_order);
+    assert_eq!(after.interval_visibility, before.interval_visibility);
+    assert_eq!(after.price_scale, before.price_scale);
+    assert_eq!(after.text, "B");
+    assert!(
+        after.revision > before.revision,
+        "the revision only moves forward"
+    );
+
+    // A host-written template carrying identity keys in either spelling applies style only.
+    let written = serde_json::json!({
+        "name": "host",
+        "kind": "fib_retracement",
+        "options": {
+            "name": "Stolen", "groupId": "g9", "zOrder": 99, "intervalVisibility": {"enabled": true},
+            "priceScaleId": "left", "revision": 1, "locked": true, "text": "Stolen",
+            "color": "#abcdef"
+        }
+    });
+    let revision = chart.drawing(target).unwrap().revision;
+    assert!(chart.apply_drawing_template_json(target, &written.to_string()));
+    let after = chart.drawing(target).unwrap();
+    assert_eq!(after.color, "#abcdef");
+    assert_eq!(
+        (
+            after.name.as_str(),
+            after.group_id.as_deref(),
+            after.z_order,
+            after.locked
+        ),
+        ("Swing B", None, before.z_order, false)
+    );
+    assert_eq!(after.text, "B");
+    assert!(after.revision > revision);
+}
+
+#[test]
+fn clipboard_payloads_are_bounded_like_persisted_drawings_not_templates() {
+    let mut chart = settled_chart();
+    let stroke = |count: usize, from: f64| {
+        (0..count)
+            .map(|index| DrawingPoint {
+                logical: from + index as f64 * 0.003_7,
+                price: 10.0 + (index as f64 * 0.017).sin(),
+            })
+            .collect::<Vec<_>>()
+    };
+    // A long freehand stroke with fractional anchors, well past the 64 KiB template bound.
+    let highlighter = chart
+        .add_drawing(DrawingKind::Highlighter, 0, stroke(2_000, 1.0), None)
+        .unwrap();
+    let payload = chart.copy_drawings_json(&[highlighter]).unwrap();
+    assert!(payload.len() > crate::MAX_DRAWING_TEMPLATE_BYTES);
+    let pasted = chart.paste_drawings_json(&payload, 0, 0.5, 0.0).unwrap();
+    assert_eq!(chart.drawing(pasted[0]).unwrap().points.len(), 2_000);
+    let clone = chart.clone_drawing(highlighter, 1.0, 0.0).unwrap();
+    assert_eq!(chart.drawing(clone).unwrap().points.len(), 2_000);
+
+    // Modest multi-selections: 100 trend lines and 40 retracements (level lists included).
+    let mut ids = Vec::new();
+    for index in 0..100 {
+        ids.push(add_trend(&mut chart));
+        assert!(chart.drawing_apply_options(ids[index], &format!(r#"{{"name":"t{index}"}}"#)));
+    }
+    for _ in 0..40 {
+        ids.push(
+            chart
+                .add_drawing(
+                    DrawingKind::FibRetracement,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: 2.0,
+                            price: 10.5,
+                        },
+                        DrawingPoint {
+                            logical: 6.0,
+                            price: 12.5,
+                        },
+                    ],
+                    None,
+                )
+                .unwrap(),
+        );
+    }
+    let before = chart.drawings().len();
+    let payload = chart.copy_drawings_json(&ids).unwrap();
+    assert_eq!(
+        chart
+            .paste_drawings_json(&payload, 0, 0.0, 0.0)
+            .unwrap()
+            .len(),
+        140
+    );
+    assert_eq!(chart.drawings().len(), before + 140);
+
+    // Nothing to copy is invalid data; past the anchor bound is a resource limit.
+    assert_eq!(
+        chart.copy_drawings_json(&[9_999]).unwrap_err().code(),
+        ErrorCode::InvalidData
+    );
+    let giants = (0..3)
+        .map(|index| {
+            chart
+                .add_drawing(
+                    DrawingKind::Highlighter,
+                    0,
+                    stroke(MAX_DRAWING_POINTS, index as f64),
+                    None,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chart.copy_drawings_json(&giants).unwrap_err().code(),
+        ErrorCode::ResourceLimit
+    );
+    // A clone of a drawing at the per-drawing bound still works.
+    assert!(chart.clone_drawing(giants[0], 0.0, 0.0).is_some());
+
+    // Pasted payloads past either bound change nothing.
+    let minimal = |count: usize| {
+        let point = r#"{"logical":1,"price":1}"#;
+        let points = vec![point; count].join(",");
+        format!(r#"{{"kind":"highlighter","pane_index":0,"points":[{points}],"options":{{}}}}"#)
+    };
+    let payload = |items: usize, per_item: usize| {
+        format!(
+            r#"{{"schema":"aeris_charts-drawings","revision":1,"drawings":[{}]}}"#,
+            vec![minimal(per_item); items].join(",")
+        )
+    };
+    assert_eq!(
+        chart
+            .paste_drawings_json(&payload(3, 10), 0, 0.0, 0.0)
+            .unwrap()
+            .len(),
+        3,
+        "the same shape within the bounds pastes"
+    );
+    let count = chart.drawings().len();
+    let too_many_points = payload(3, crate::MAX_DRAWING_CLIPBOARD_POINTS / 3 + 1);
+    assert!(too_many_points.len() <= crate::MAX_DRAWING_CLIPBOARD_BYTES);
+    assert!(chart
+        .paste_drawings_json(&too_many_points, 0, 0.0, 0.0)
+        .is_none());
+    let too_many_bytes = format!(
+        r#"{{"schema":"aeris_charts-drawings","revision":1,"drawings":[],"pad":"{}"}}"#,
+        "x".repeat(crate::MAX_DRAWING_CLIPBOARD_BYTES)
+    );
+    assert!(chart
+        .paste_drawings_json(&too_many_bytes, 0, 0.0, 0.0)
+        .is_none());
+    assert_eq!(chart.drawings().len(), count);
+}
+
+#[test]
 fn drawing_history_reverses_create_delete_points_and_style() {
     let mut chart = settled_chart();
     let id = add_trend(&mut chart);
@@ -289,9 +505,12 @@ fn active_drawing_state_and_pixel_baselines_rebase_with_the_union() {
         start_y: 100.0,
         current_x: 100.0,
         current_y: 100.0,
+        handle_px: (100.0, 100.0),
         history_points: drawing.points.clone(),
+        history_tool_options: drawing.tool_options.clone(),
         start_points: drawing.points.clone(),
         start_px: vec![(f64::NAN, f64::NAN); 2],
+        keyboard_step: None,
     });
     chart.drawing_controller.pending = Some(PendingDrawing {
         drawing: Drawing::new(
@@ -749,6 +968,131 @@ fn set_points_validates_count_and_finiteness() {
     assert!(!chart.drawing_set_points(id, r#"[{"logical":1.0,"price":10.0}]"#));
     assert!(!chart.drawing_set_points(id, "[1,2]"));
     assert!(!chart.drawing_set_points(999, "[]"));
+}
+
+/// A frame polyline's points, style, and line type.
+type FramePolyline = (Vec<(f64, f64)>, LineStyle, LineType);
+
+/// Every polyline of `color` in the first pane's frame.
+fn frame_polylines(chart: &mut ChartEngine, color: Color) -> Vec<FramePolyline> {
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    pane.main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Polyline {
+                first_point,
+                point_count,
+                style,
+                line_type,
+                color: stroke,
+                ..
+            } if *stroke == color => Some((
+                pane.points[*first_point as usize..(*first_point + *point_count) as usize]
+                    .iter()
+                    .map(|point| (f64::from(point[0]), f64::from(point[1])))
+                    .collect(),
+                *style,
+                *line_type,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Core drawings' dashed and dotted strokes (trend line, path, the curved brush) reach every
+/// executor as solid dash runs lowered in the frame, like family strokes and series lines: the
+/// WebGPU stroker ignores `Polyline.style`, so a styled polyline would paint solid there while
+/// Canvas2D dashes it. Solid strokes keep their single polyline, and a dashed line reaching far
+/// past the pane is clipped before it is split, so its frame work stays bounded.
+#[test]
+fn dashed_core_drawing_strokes_reach_executors_as_solid_dash_runs() {
+    let mut chart = settled_chart();
+    let point = |logical: f64, price: f64| DrawingPoint { logical, price };
+    let styled = |chart: &mut ChartEngine, kind, points, options: &str| {
+        chart.add_drawing(kind, 0, points, Some(options)).unwrap()
+    };
+    styled(
+        &mut chart,
+        DrawingKind::TrendLine,
+        vec![point(1.0, 10.2), point(8.0, 12.8)],
+        r##"{"color":"#102030","style":"dashed","width":2}"##,
+    );
+    styled(
+        &mut chart,
+        DrawingKind::Path,
+        vec![point(1.0, 12.0), point(4.0, 10.5), point(8.0, 12.5)],
+        r##"{"color":"#203040","style":"dotted","width":2}"##,
+    );
+    styled(
+        &mut chart,
+        DrawingKind::Brush,
+        vec![
+            point(1.0, 11.0),
+            point(3.0, 12.5),
+            point(6.0, 10.2),
+            point(8.5, 11.8),
+        ],
+        r##"{"color":"#304050","style":"dashed","width":3}"##,
+    );
+    styled(
+        &mut chart,
+        DrawingKind::TrendLine,
+        vec![point(2.0, 10.0), point(7.0, 13.0)],
+        r##"{"color":"#405060","width":2}"##,
+    );
+    let length = |points: &[(f64, f64)]| {
+        points
+            .windows(2)
+            .map(|pair| (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1))
+            .sum::<f64>()
+    };
+    for (css, straight) in [("#102030", true), ("#203040", true), ("#304050", false)] {
+        let color = Color::parse_css(css).unwrap();
+        let runs = frame_polylines(&mut chart, color)
+            .into_iter()
+            // The path's open terminal chevron is its own solid three-point stroke.
+            .filter(|(points, ..)| points.len() != 3 || !straight)
+            .collect::<Vec<_>>();
+        assert!(runs.len() > 5, "{css}: {} dash runs", runs.len());
+        assert!(
+            runs.iter()
+                .all(|(_, style, line_type)| *style == LineStyle::Solid
+                    && *line_type == LineType::Simple),
+            "{css}: executors receive only solid straight runs"
+        );
+        // The gaps between dashes stay unpainted.
+        let inked = runs.iter().map(|(points, ..)| length(points)).sum::<f64>();
+        let first = runs.first().unwrap().0[0];
+        let last = *runs.last().unwrap().0.last().unwrap();
+        assert!(
+            inked < (last.0 - first.0).hypot(last.1 - first.1).max(1.0) * 1.5,
+            "{css}"
+        );
+    }
+    let solid = frame_polylines(&mut chart, Color::parse_css("#405060").unwrap());
+    assert_eq!(solid.len(), 1, "a solid trend line stays one polyline");
+    assert_eq!((solid[0].0.len(), solid[0].1), (2, LineStyle::Solid));
+
+    // A dashed line whose anchors sit a million bars off both pane edges splits only its
+    // visible reach into dash runs.
+    let far = styled(
+        &mut chart,
+        DrawingKind::TrendLine,
+        vec![point(-1.0e6, 10.0), point(1.0e6, 13.0)],
+        r##"{"color":"#506070","style":"dotted","width":1}"##,
+    );
+    let runs = frame_polylines(&mut chart, Color::parse_css("#506070").unwrap());
+    assert!(
+        !runs.is_empty() && runs.len() < 2_000,
+        "{} runs for the far line",
+        runs.len()
+    );
+    assert!(runs
+        .iter()
+        .flat_map(|(points, ..)| points)
+        .all(|&(x, y)| (-20.0..=820.0).contains(&x) && (-20.0..=520.0).contains(&y)));
+    assert!(chart.remove_drawing(far));
 }
 
 #[test]
@@ -3139,13 +3483,47 @@ fn editing_drawing_keeps_the_label_for_overlay_caret() {
     assert!(texts.iter().any(|(t, _)| t == "live"));
     // Typing mode: the host wrap owns the border, but the canvas label stays so the
     // transparent editor cannot lift/recolor the glyphs.
-    chart.set_editing_drawing(Some(id));
+    assert!(chart.begin_drawing_text_edit(id));
     assert_eq!(chart.editing_drawing(), Some(id));
     let (texts, _) = text_prims(&mut chart);
     assert!(texts.iter().any(|(t, _)| t == "live"));
-    chart.set_editing_drawing(None);
+    assert!(chart.end_drawing_text_edit(true));
     let (texts, _) = text_prims(&mut chart);
     assert!(texts.iter().any(|(t, _)| t == "live"));
+}
+
+#[test]
+fn typing_into_a_text_drawing_is_one_undo_step_and_locked_text_never_edits() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::Text,
+            0,
+            vec![DrawingPoint {
+                logical: 5.0,
+                price: 11.0,
+            }],
+            Some(r##"{"text":"a"}"##),
+        )
+        .unwrap();
+    assert!(chart.begin_drawing_text_edit(id));
+    for text in ["ab", "abc", "abcd"] {
+        assert!(chart.set_drawing_edit_text(text));
+    }
+    let (texts, _) = text_prims(&mut chart);
+    assert!(texts.iter().any(|(t, _)| t == "abcd"), "live text paints");
+    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().text, "a", "one step per edit");
+    assert!(chart.undo_drawing());
+    assert!(chart.drawing(id).is_none(), "the next step is the creation");
+    assert!(chart.redo_drawing() && chart.redo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().text, "abcd");
+
+    assert!(chart.drawing_apply_options(id, r#"{"locked":true}"#));
+    assert!(!chart.drawing_text_editable(id));
+    assert!(!chart.begin_drawing_text_edit(id));
+    assert_eq!(chart.editing_drawing(), None);
 }
 
 #[test]
@@ -3728,4 +4106,55 @@ fn drawing_runtime_is_isolated_per_chart_even_when_ids_overlap() {
     assert_eq!(second.drawing_work_stats().drawings_total, 45);
     first.clear_drawings();
     assert_eq!(second.drawings().len(), 45);
+}
+
+#[test]
+fn data_reading_drawings_measure_the_first_ordinary_series_on_their_scale() {
+    let mut chart = ohlc_chart();
+    let sma = chart.add_sma(0, 2).expect("SMA output");
+    let line = chart.add_series(SeriesKind::Line);
+    let custom = chart.add_series(SeriesKind::Custom);
+    let forecast = Drawing::new(1, DrawingKind::Forecast, 0, Vec::new());
+    assert_eq!(chart.drawing_source_series(&forecast), Some(0));
+    // Neither paint order nor visibility moves the source.
+    assert!(chart.set_series_order(vec![line, custom, sma, 0]));
+    chart.set_series_visible(0, false);
+    assert_eq!(chart.drawing_source_series(&forecast), Some(0));
+    // Without it, the next ordinary series takes over; indicator outputs and custom series
+    // never do, and another scale or pane has its own source.
+    assert!(chart.remove_series(0));
+    assert_eq!(chart.drawing_source_series(&forecast), Some(line));
+    assert!(chart.remove_series(line));
+    assert_eq!(chart.drawing_source_series(&forecast), None);
+    let mut left = forecast.clone();
+    left.price_scale = DrawingPriceScale::Left;
+    assert_eq!(chart.drawing_source_series(&left), None);
+}
+
+#[test]
+fn data_reading_drawings_keep_creation_order_when_storage_slots_are_reused() {
+    let forecast = Drawing::new(1, DrawingKind::Forecast, 0, Vec::new());
+    // One removal: a later series reuses the removed primary's slot but stays newer.
+    let mut chart = ohlc_chart();
+    let older = chart.add_series(SeriesKind::Line);
+    assert!(chart.remove_series(0));
+    let newer = chart.add_series(SeriesKind::Line);
+    assert!(newer > older);
+    assert_eq!(chart.drawing_source_series(&forecast), Some(older));
+
+    // A remount of two series: freed slots come back last-in-first-out, so the series added
+    // first lands in the higher slot and must still be the source.
+    let mut chart = ohlc_chart();
+    let candles = chart.add_series(SeriesKind::Candlestick);
+    let line = chart.add_series(SeriesKind::Line);
+    assert!(chart.remove_series(0));
+    assert!(chart.remove_series(candles));
+    assert!(chart.remove_series(line));
+    let remounted_candles = chart.add_series(SeriesKind::Candlestick);
+    let remounted_line = chart.add_series(SeriesKind::Line);
+    assert!(remounted_line > remounted_candles);
+    assert_eq!(
+        chart.drawing_source_series(&forecast),
+        Some(remounted_candles)
+    );
 }

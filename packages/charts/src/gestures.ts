@@ -1239,6 +1239,7 @@ export function install_gestures(chart: chart_impl): () => void {
         // Unlike mouse compatibility events, the second tap has no preceding `click` event.
         // A variable-sequence placement receives this activation before the shared finish action.
         if (chart.creation_sequence_active()) chart.creation_click(p.x, p.y, false, false);
+        else if (region_of(p, true) === "pane") chart.activate_drawing_double_click(p.x, p.y);
         run_dblclick(p.x, p.y);
       }
       reset_tap();
@@ -1464,7 +1465,16 @@ export function install_gestures(chart: chart_impl): () => void {
         if (handled) wasm.fit_content();
         break;
       case "Enter":
-        handled = chart.creation_finish();
+      case "F2":
+        // Enter finishes a variable sequence. Otherwise Enter and F2 edit the selected drawing's
+        // text in place; the opened editor owns focus and its announcements from here.
+        if (e.key === "Enter" && chart.creation_finish()) break;
+        if (chart.edit_selected_drawing_text()) {
+          e.preventDefault();
+          stop_kinetic();
+          return;
+        }
+        handled = false;
         break;
       case "Backspace":
         // During variable-sequence placement Backspace removes only the latest pending vertex.

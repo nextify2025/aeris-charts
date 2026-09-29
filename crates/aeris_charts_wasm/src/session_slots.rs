@@ -1,9 +1,11 @@
-//! Browser boundary for session slot generation. The package resolves the exchange time zone to
-//! an explicit schedule; the engine owns validation and the slot arithmetic.
+//! Browser boundary for exchange-session requests: session slot generation, session-anchored
+//! trade-stream bars, and resampling boundaries/configuration. The package resolves the exchange
+//! time zone to an explicit schedule; the engine owns validation and the session arithmetic.
 
 use aeris_charts_engine::{
-    parse_iso_date, parse_wall_clock, session_slot_times, ExchangeTime, SessionSlotConvention,
-    SessionWindow, UtcOffsetSchedule, UtcOffsetTransition,
+    parse_iso_date, parse_wall_clock, resample_boundaries, session_slot_times, ExchangeTime,
+    OutOfSessionPolicy, ResampleBoundary, ResampleOptions, ResampleSpan, SessionSlotConvention,
+    SessionWindow, TradeSessionOptions, UtcOffsetSchedule, UtcOffsetTransition,
 };
 use serde::Deserialize;
 
@@ -22,14 +24,12 @@ struct SessionSlotRequest {
     convention: SessionSlotConvention,
 }
 
-/// UTC seconds of every bar slot described by a JSON request, or the rejection reason.
-pub(crate) fn session_slot_times_json(request: &str) -> Result<Vec<i64>, String> {
-    let request: SessionSlotRequest =
-        serde_json::from_str(request).map_err(|error| format!("invalid session: {error}"))?;
-    let day = parse_iso_date(&request.date)
-        .ok_or_else(|| format!("date {:?} must be a YYYY-MM-DD calendar date", request.date))?;
-    let windows = request
-        .windows
+fn parse_date(text: &str) -> Result<i64, String> {
+    parse_iso_date(text).ok_or_else(|| format!("date {text:?} must be a YYYY-MM-DD calendar date"))
+}
+
+fn parse_windows(windows: &[(String, String)]) -> Result<Vec<SessionWindow>, String> {
+    windows
         .iter()
         .enumerate()
         .map(|(index, (start, end))| {
@@ -43,9 +43,24 @@ pub(crate) fn session_slot_times_json(request: &str) -> Result<Vec<i64>, String>
                 )),
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let offsets = UtcOffsetSchedule::new(request.time_zone).map_err(|error| error.to_string())?;
-    let time = ExchangeTime::new(offsets, request.session_start).map_err(|e| e.to_string())?;
+        .collect()
+}
+
+fn exchange_time(
+    time_zone: Vec<UtcOffsetTransition>,
+    session_start: i32,
+) -> Result<ExchangeTime, String> {
+    let offsets = UtcOffsetSchedule::new(time_zone).map_err(|error| error.to_string())?;
+    ExchangeTime::new(offsets, session_start).map_err(|error| error.to_string())
+}
+
+/// UTC seconds of every bar slot described by a JSON request, or the rejection reason.
+pub(crate) fn session_slot_times_json(request: &str) -> Result<Vec<i64>, String> {
+    let request: SessionSlotRequest =
+        serde_json::from_str(request).map_err(|error| format!("invalid session: {error}"))?;
+    let day = parse_date(&request.date)?;
+    let windows = parse_windows(&request.windows)?;
+    let time = exchange_time(request.time_zone, request.session_start)?;
     session_slot_times(
         day,
         &windows,
@@ -54,6 +69,102 @@ pub(crate) fn session_slot_times_json(request: &str) -> Result<Vec<i64>, String>
         request.convention,
     )
     .map_err(|error| error.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResampleBoundaryRequest {
+    dates: Vec<String>,
+    windows: Vec<(String, String)>,
+    #[serde(default)]
+    time_zone: Vec<UtcOffsetTransition>,
+    #[serde(default)]
+    session_start: i32,
+    #[serde(default)]
+    span: ResampleSpan,
+}
+
+/// Resampling boundaries for a JSON request of trading dates and session windows.
+pub(crate) fn resample_boundaries_json(request: &str) -> Result<Vec<ResampleBoundary>, String> {
+    let request: ResampleBoundaryRequest = serde_json::from_str(request)
+        .map_err(|error| format!("invalid resample sessions: {error}"))?;
+    let days = request
+        .dates
+        .iter()
+        .map(|date| parse_date(date))
+        .collect::<Result<Vec<_>, _>>()?;
+    let windows = parse_windows(&request.windows)?;
+    let time = exchange_time(request.time_zone, request.session_start)?;
+    resample_boundaries(&days, &windows, &time, request.span).map_err(|error| error.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TradeSessionRequest {
+    windows: Vec<(String, String)>,
+    #[serde(default)]
+    outside: OutOfSessionPolicy,
+}
+
+/// Session anchoring for a trade stream (`null` restores the plain anchor grid). The windows are
+/// placed in the chart's own exchange time by the engine.
+pub(crate) fn trade_sessions_json(request: &str) -> Result<Option<TradeSessionOptions>, String> {
+    let request: Option<TradeSessionRequest> = serde_json::from_str(request)
+        .map_err(|error| format!("invalid trade sessions: {error}"))?;
+    request
+        .map(|request| {
+            Ok(TradeSessionOptions {
+                windows: parse_windows(&request.windows)?,
+                outside: request.outside,
+            })
+        })
+        .transpose()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundaryRow {
+    start_time: i64,
+    end_time: i64,
+    session_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResampleSeriesRequest {
+    source: u32,
+    #[serde(default)]
+    volume_source: Option<u32>,
+    #[serde(default)]
+    volume_target: Option<u32>,
+    interval_seconds: u32,
+    boundaries: Vec<BoundaryRow>,
+}
+
+/// A parsed `configure_resampled_series` request: source, volume source, volume target, and
+/// options (the target is the call's series).
+pub(crate) type ResampleSeriesConfig = (u32, Option<u32>, Option<u32>, ResampleOptions);
+
+pub(crate) fn resample_series_json(request: &str) -> Result<ResampleSeriesConfig, String> {
+    let request: ResampleSeriesRequest = serde_json::from_str(request)
+        .map_err(|error| format!("invalid resample options: {error}"))?;
+    Ok((
+        request.source,
+        request.volume_source,
+        request.volume_target,
+        ResampleOptions {
+            interval_seconds: request.interval_seconds,
+            boundaries: request
+                .boundaries
+                .into_iter()
+                .map(|row| ResampleBoundary {
+                    start_time: row.start_time,
+                    end_time: row.end_time,
+                    session_id: row.session_id,
+                })
+                .collect(),
+        },
+    ))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -68,11 +179,31 @@ mod bindings {
             .map(|slots| slots.into_iter().map(|slot| slot as f64).collect())
             .map_err(|reason| JsValue::from_str(&reason))
     }
+
+    /// Resampling boundaries as flat `[start_time, end_time, session_id]` triples (see the
+    /// engine's `resample_boundaries`). Throws the rejection reason as a string.
+    #[wasm_bindgen]
+    pub fn resample_boundaries(request_json: &str) -> Result<Vec<f64>, JsValue> {
+        super::resample_boundaries_json(request_json)
+            .map(|boundaries| {
+                boundaries
+                    .into_iter()
+                    .flat_map(|boundary| {
+                        [
+                            boundary.start_time as f64,
+                            boundary.end_time as f64,
+                            boundary.session_id as f64,
+                        ]
+                    })
+                    .collect()
+            })
+            .map_err(|reason| JsValue::from_str(&reason))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::session_slot_times_json;
+    use super::*;
 
     #[test]
     fn json_requests_validate_at_the_boundary() {
@@ -110,5 +241,84 @@ mod tests {
             let error = session_slot_times_json(request).unwrap_err();
             assert!(error.contains(reason), "{error}");
         }
+    }
+
+    #[test]
+    fn resample_boundary_requests_place_sessions_per_date() {
+        let boundaries = resample_boundaries_json(
+            r#"{"dates":["2026-09-24","2026-09-25"],"windows":[["09:30","11:30"],["13:00","15:00"]],
+                "time_zone":[{"from_utc_seconds":0,"offset_seconds":28800}]}"#,
+        )
+        .unwrap();
+        assert_eq!(boundaries.len(), 4);
+        assert_eq!(boundaries[0].start_time.rem_euclid(86_400), 3_600 + 1_800);
+        assert_eq!(boundaries[1].end_time.rem_euclid(86_400), 7 * 3_600);
+        assert_eq!(boundaries[3].session_id, 20_260_925);
+        let daily = resample_boundaries_json(
+            r#"{"dates":["2026-09-25"],"windows":[["09:30","11:30"],["13:00","15:00"]],"span":"day"}"#,
+        )
+        .unwrap();
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].end_time - daily[0].start_time, 5 * 3_600 + 1_800);
+        for (request, reason) in [
+            (
+                r#"{"dates":["2026-9-25"],"windows":[["09:30","11:30"]]}"#,
+                "YYYY-MM-DD",
+            ),
+            (
+                r#"{"dates":["2026-09-25","2026-09-24"],"windows":[["09:30","11:30"]]}"#,
+                "boundaries",
+            ),
+            (
+                r#"{"dates":["2026-09-25"],"windows":[["09:30","11:30"]],"span":"week"}"#,
+                "unknown variant",
+            ),
+            (
+                r#"{"dates":["2026-09-25"],"windows":[["13:00","15:00"],["09:30","11:30"]]}"#,
+                "starts before the previous window ends",
+            ),
+        ] {
+            let error = resample_boundaries_json(request).unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn trade_session_and_resample_series_requests_are_strict() {
+        assert_eq!(trade_sessions_json("null").unwrap(), None);
+        let sessions = trade_sessions_json(
+            r#"{"windows":[["09:30","11:30"],["13:00","15:00"]],"outside":"exclude"}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sessions.windows.len(), 2);
+        assert_eq!(sessions.outside, OutOfSessionPolicy::Exclude);
+        assert_eq!(
+            trade_sessions_json(r#"{"windows":[["09:30","11:30"]]}"#)
+                .unwrap()
+                .unwrap()
+                .outside,
+            OutOfSessionPolicy::Fold
+        );
+        assert!(
+            trade_sessions_json(r#"{"windows":[["09:30","11:30"]],"outside":"drop"}"#)
+                .unwrap_err()
+                .contains("unknown variant")
+        );
+        let (source, volume_source, volume_target, options) = resample_series_json(
+            r#"{"source":1,"volume_source":2,"volume_target":4,"interval_seconds":300,
+                "boundaries":[{"start_time":0,"end_time":600,"session_id":20260925}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (source, volume_source, volume_target),
+            (1, Some(2), Some(4))
+        );
+        assert_eq!(options.interval_seconds, 300);
+        assert_eq!(options.boundaries[0].end_time, 600);
+        assert!(resample_series_json(
+            r#"{"source":1,"interval_seconds":300,"boundaries":[{"start_time":0.5,"end_time":600,"session_id":1}]}"#
+        )
+        .is_err());
     }
 }

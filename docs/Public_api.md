@@ -29,8 +29,11 @@ The supported root surface is:
   the reference fixed two-decimal formatter;
 - the intraday (分时) building blocks described under [Intraday (分时) charts](#intraday-分时-charts):
   `session_slot_times()`, explicit time-axis `tick_marks`, the `histogram_updown_rule`
-  previous-close volume tint with host `up_color`/`down_color`, and a baseline series that shows
-  its first traded bar;
+  previous-close volume tint with host `up_color`/`down_color`, a baseline series that shows
+  its first traded bar, the additive `break_on_trading_day` line/area/baseline option (default
+  `false`), and VWAP/pivot lines that restart at every reset;
+- multi-calendar overlays through the series options `time_alignment: "as_of"` and
+  `as_of_max_staleness` (see [Multi-calendar overlays](#time-exchange-time-zone-and-trading-sessions));
 - built-in series, indicators, drawing kinds, options, themes, data ingestion, interactions,
   subscriptions, screenshots, and lifecycle operations declared by those handles;
 - Long Position and Short Position drawings through the canonical `drawing_kind` values
@@ -45,10 +48,18 @@ The supported root surface is:
   stacked imbalances, density LOD, and derived bar/level queries; generic OHLC setters are rejected
   because they cannot supply order-flow truth;
 - one chart-level replay clock plus shared canonical trade streams, typed batch ingestion, ordinary
-  candle/bar bindings, exact seek-work telemetry, and fixed/ATR Renko, Line Break, Kagi, and Point &
+  candle/bar bindings, exact seek-work telemetry, live-tip dependent work counters in
+  `chart.trade_stream_stats()` (`dependent_rows_computed`, `bar_rows_projected`,
+  `bubble_trades_scanned`, `bubble_markers_sized`), and fixed/ATR Renko, Line Break, Kagi, and Point &
   Figure transforms through `configure_synthetic_bar_series`, `set_synthetic_bar_source[_typed]`,
   and `update_synthetic_bar_source`; synthetic source/history remains host-owned and is not part of
   chart-state persistence;
+- ordinary candles built from ticks and OHLCV resampling as described under
+  [Ticks to candles and resampling](#ticks-to-candles-and-resampling): exchange-session anchored
+  trade-stream time bars (`chart.set_trade_stream_sessions()`), the stream volume histogram
+  (`chart.add_trade_volume_series()`), and engine resampling through
+  `chart.configure_resampled_series()`, `chart.resampled_bars()`, `chart.resample_stats()`, and the
+  session-derived `resample_boundaries()` helper; resampling configuration is runtime-only;
 - engine-resolved secondary-click context through `chart.subscribe_chart_context()`, including
   pane, time, logical index, coordinates, hit series, and the exact price on its scale; hosts own
   menus, clipboard operations, and order actions;
@@ -235,12 +246,12 @@ Built-in studies default to the TradingView/TA-Lib definitions. The optional las
 argument of `add_ema`, `add_dema`, `add_tema`, `add_rsi`, `add_rsi_with_source`, `add_macd`,
 `add_bollinger`, and `add_bollinger_with_source` selects the other widespread convention:
 
-| Parameter | Default (`convention: "tradingview"`) | `convention: "china"` (通达信/同花顺/富途) |
+| Parameter | Default (`convention: "tradingview"`) | `convention: "china"` (通达信/同花顺 formula language) |
 | --- | --- | --- |
 | `seed` (EMA, DEMA, TEMA, MACD, RSI) | `"sma"`: mean of the first N samples; EMA N starts at bar N-1, RSI N at bar N, MACD 12/26/9 at bar 25/33 | `"first_value"`: `Y0 = X0`, so values start at bar 0 (RSI at bar 1) |
 | `histogram_multiplier` (MACD) | `1`: `MACD - signal` | `2`: `(DIF - DEA) * 2` |
 | `estimator` (Bollinger) | `"population"` (divide by N) | `"sample"` (`STD`, divide by N-1) |
-| `seed` (KDJ) | `"fifty"`: K and D start from the textbook 50 | `"first_value"`: `SMA(X,N,1)` starts at its first input, so the first K is the first RSV |
+| `seed` (KDJ) | `"fifty"`: a full RSV window, then K and D start from the textbook 50 (first value at bar N-1) | `"first_value"`: RSV over the bars available while fewer than N exist, and `SMA(X,N,1)` starts at its first input, so K = D = J = RSV at bar 0 |
 
 ```ts
 const [dif, dea, bars] = chart.add_macd(candles, 12, 26, 9, undefined, { convention: "china" });
@@ -257,21 +268,47 @@ TradingView defaults. Rust hosts use `IndicatorKind::with_convention(IndicatorCo
 `add_kdj(source, period = 9, k_smoothing = 3, d_smoothing = 3, options?, parameters?)` adds K, D,
 and J in one oscillator pane: `RSV = (C - LLV(L, N)) / (HHV(H, N) - LLV(L, N)) * 100`,
 `K = SMA(RSV, M1, 1)`, `D = SMA(K, M2, 1)`, `J = 3K - 2D`, where `SMA(X, N, 1)` is
-`Y = (X + (N-1) * Y') / N`. The first value lands at bar N-1 either way; a flat window
-(`HHV == LLV`) repeats the previous RSV (50 before the first) instead of producing NaN. `seed`
-chooses the missing previous K and D:
+`Y = (X + (N-1) * Y') / N`. J is not clipped to 0–100. A flat window (`HHV == LLV`) repeats the
+previous RSV (50 before the first) instead of producing NaN. `seed` chooses how the study starts:
 
-- `"fifty"` (default): the textbook definition (百度百科/东方财富百科: "若无前一日K值与D值，则可分别用50来
-  代替").
-- `"first_value"` (`{ convention: "china" }` selects it): the 通达信/同花顺 formula language's
-  `SMA(X,N,M)` semantics, which start at their first input (`Y0 = X0`), as the MyTT-style ports that
-  reproduce those terminals do. The first K equals the first RSV and the first D the first K.
+- `"fifty"` (default): the textbook KDJ, which 通达信's own help calls "KDJ传统版": the first value
+  waits for a full N-bar RSV window (bar N-1) and uses 50 for the missing previous K and D ("若无前一日
+  K值与D值，则可分别用50来代替"; also 百度百科/东方财富百科).
+- `"first_value"` (`{ convention: "china" }` selects it): the formula-language KDJ, which 通达信's help
+  calls "KDJ普通版" (`RSV:=...; K:SMA(RSV,M1,1); D:SMA(K,M2,1); J:3*K-2*D`). While fewer than N bars
+  exist, `HHV`/`LLV` take the bars available, so RSV exists from the first bar, and `SMA(X,N,M)`
+  starts at its first input (`Y0 = X0`). K, D, and J all equal the first bar's RSV, and every bar
+  has a value (`warmup_bars` 0).
 
-The two differ only near the start of the loaded history and agree after `convergence_bars` (26
-bars for K and 44 for D/J at 9/3/3), so load that much history before the first visible bar when the
-exact terminal value matters. Neither choice has been compared against a live terminal build here.
+The two differ only near the start of the loaded history. They agree after `convergence_bars` (26
+bars for K and 44 for D/J at 9/3/3, the same for both seeds), so load that much history before the
+first visible bar when the exact terminal value matters. For a newly listed instrument whose whole
+history is loaded, `"first_value"` follows the formula from the first session, as 东方财富's and
+新浪's web charts compute it (apart from flat windows, see below). Retention trims and prepended
+history restart the partial window at the new first bar, exactly as if that history had been loaded.
 `indicator_info().parameters.kdj_seed` reports the choice, and V3 persistence stores it (documents
-without it restore `"fifty"`).
+without it restore `"fifty"`). A document saved with `"first_value"` before this rule was verified
+restores the same parameter and now also shows values on the first N-1 bars.
+
+**How the conventions were checked (2026-09-28).** No live 通达信, 同花顺, 东方财富, or 富途
+terminal was available, so these results come from published definitions, the platforms' own web
+chart code, and one platform's published values. The published values were compared outside the
+repository and are not committed; `crates/aeris_charts_indicators/tests/platform_values.rs` pins the
+verified rules on a deterministic synthetic series instead:
+
+| Study | Evidence | Result |
+| --- | --- | --- |
+| KDJ `"fifty"` | 通达信 help "通达信指标公式算法释疑" (help.tdx.com.cn/gspt) describes KDJ传统版 with the 50 rule; textbook encyclopedias | Documentation only |
+| KDJ `"first_value"` | 通达信 help: KDJ普通版 formula; function reference: `EMA` returns values before N bars (unlike `EXPMEMA`), and `TMA`/`AMA` start at X. Web chart code: 东方财富 (emcharts 3.18.1, quotekchart 1.0.6) computes RSV over `min(9, i + 1)` bars with K = D = J = RSV at bar 0; 新浪财经's formula runtime computes `HHV`/`LLV` over the bars available and starts `SMA` at `Y0 = X0`. Values: 雪球's server-computed KDJ for two A-shares from their listing day and the full histories of four older listings, compared out of tree | 雪球's RSV equals the available-bar RSV exactly from the third session, and the same rule reproduced all six histories to 5e-5. 雪球 starts K and D from 100 and clips J to 0–100, which no terminal formula does, so its first sessions differ; after `convergence_bars` they agree |
+| MACD `{ convention: "china" }` | Same out-of-tree 雪球 comparison; 东方财富, 同花顺, and 新浪 web chart code | Exact from the first session: `EMA` from the first close, DIF = DEA = 0 on bar 0, `(DIF-DEA)*2` |
+| BOLL `estimator` | Same out-of-tree 雪球 comparison; web chart code; 通达信 help: `BOLL` is `MA(C,M) ± 2*STD(C,M)`, and the function reference defines `STD` as the estimated (sample) σ and `STDP` as the population σ | Conflicting. 雪球, 东方财富 web, and 同花顺 web use the population σ (`"population"`, exact match with 雪球). `{ convention: "china" }` selects the sample σ of 通达信's `STD` definition, as 新浪's web chart does, but 通达信's own BOLL help page illustrates σ with 1/N, and published user comparisons disagree (a 2008 test found population, a 2018 formula with N-1 matched). Pass `estimator: "population"` to match 雪球 or 东方财富; the terminal estimator needs a live 通达信/同花顺 check |
+| RSI `"first_value"` | Same out-of-tree 雪球 comparison; 东方财富 and 新浪 web chart code | Not matched near the start: those sources start `SMA` from 0, and 雪球 also measures the listing day's change from the issue price, while `"first_value"` starts at the first change. The gap shrinks as history grows (RSI6 on one listing: 0.65 at bar 39). Unchanged pending a terminal check |
+
+Not verified: exact 通达信/同花顺/富途 terminal output (so the China preset is not claimed to match
+富途), how terminals treat a flat window (东方财富's and 新浪's web charts use RSV 0 instead of
+repeating the previous RSV; 通达信's formula help does not document division by zero), and 富途's web
+chart, whose page is behind a bot challenge. 同花顺's legacy web charts use other KDJ starts (100 with
+clipping, or a running mean for the first N bars) and are not treated as the terminal definition.
 
 `indicator_schema(kind)` has revision 2: convention parameters appear as `"choice"` parameters with a
 `choices` list, and VWAP lists an optional `amount_source` series.
@@ -311,13 +348,58 @@ whitespace price rows, contribute nothing, and the line is blank until the perio
 `indicator_info().amount_source` identifies the turnover series; removing it removes the study. The
 reset period follows the VWAP session key.
 
+**Lines restart at resets.** Every VWAP line (typical-price or amount-weighted), each VWAP band
+output, and each pivot level ends its line where its period resets: the first drawn row of a new
+session (or week or month for VWAP bands) starts a new run, with no segment, fill, or hit area joining
+it to the previous period. Periods follow the chart's exchange trading day (`time_zone`,
+`session_start`), exactly as the values reset, after full installs and live updates alike. A period
+whose only drawn row is its first draws a one-bar horizontal segment, so a session VWAP on daily
+bars shows one short segment per bar. Ordinary line, area, and baseline series connect across days
+unless `break_on_trading_day: true` asks them to break at each exchange trading day (on a non-time
+bar axis such as Renko or tick bars, the day of each bar's open time); whitespace rows never break
+a line.
+
 ## Time, exchange time zone, and trading sessions
 
 Canonical chart time is whole UTC seconds. `business_day` values and strict `"YYYY-MM-DD"` strings
 are taken at UTC midnight; values returned by the chart are always numeric UTC seconds. The
 financial time axis is ordinal: bars are spaced by index, so weekends, holidays, lunch breaks, and
 half days take no width. Hosts own exchange calendars and send only the bars that exist; holiday
-calendars and multi-calendar overlay alignment are not engine features.
+calendars are not an engine feature. By default every series' timestamps join the axis, so an
+overlay from another market calendar adds its own bars as slots; opt it into `time_alignment:
+"as_of"` instead (see **Multi-calendar overlays**).
+
+**Multi-calendar overlays.** `series_options.time_alignment` is `"union"` (the default, reference
+behavior) or `"as_of"`. An as-of series (an index over a stock from another exchange, crypto over
+equities, a futures night session over its underlying) adds no time point, so the other series keep
+a gapless axis. Each point, up to the last real bar of the other series, shows the overlay's last
+row at or before that point's time: rows between two points collapse into the later one, a point
+with no newer row repeats the previous row, and rows after the last point wait until the other
+series reach them (a pre-installed intraday session never shows the overlay in its future slots).
+`as_of_max_staleness` (whole seconds, `null` by default) leaves a point empty instead of repeating
+a row older than that; `0` shows only rows exactly at a point. The points come from the union
+series, so an as-of series alone on a chart shows nothing. Everything reading the series follows
+the same points: rendering, hit testing, crosshair and legend values, `value_snapshot` (which
+reports the point's time), comparison anchors and percentage bases, autoscale, markers (placed at
+the first point at or after their time; a marker newer than every point waits with its row, and a
+point the staleness bound leaves empty hides it), session highlighting (each point is colored as
+the row it shows), the accessibility focus ring (on the first point showing the focused row), and
+last-value chrome. `data()`, `data_by_index`, and `last_value_data` return the overlay's own rows
+with their own times. Studies bound to an as-of series compute on its own rows and are shown the
+same way; their `time_alignment` reads back as the source's and cannot be set. Live ticks on
+either side stay proportional to the points they change. Only line, area, baseline, histogram, bar,
+and candlestick series that own their rows accept it: custom, advanced, footprint, trade-bound,
+trade-study, and synthetic series, and every series on a non-time (tick, volume, range, or
+synthetic) bar axis, throw `unsupported_operation`. Converting an as-of series to a custom,
+advanced, or footprint series, binding it to a trade stream, or configuring it as a synthetic
+transform returns it to the union. A bad value or a staleness without `"as_of"` throws
+`invalid_options` before the call's other options apply; `add_series` checks both keys before it
+creates (or adopts) the series, and a refusal leaves no series behind on the main thread or in a
+worker. Re-applying the current alignment is a no-op that notifies no `subscribe_data_changed`
+handler; a change notifies each once with `"full"`. Worker charts take both keys in
+`add_series` options. Rust hosts call
+`ChartEngine::set_series_time_alignment(id, TimeAlignment::AsOf { max_staleness })`. Like other
+financial series options, the setting is host-owned and not persisted.
 
 **Exchange time zone.** `chart.time_scale().apply_options({ time_zone, session_start })` or the
 declarative chart option `timeScale: { timeZone, sessionStart }` (also accepted by worker charts)
@@ -474,6 +556,9 @@ const average = chart.add_vwap(price, volume, { price_scale_id: "left", color: "
 ```
 
 Keep units consistent: with turnover in yuan, volume must be in shares (multiply lots by 100).
+The average line restarts at every session reset, so on a multi-day chart no segment joins one
+day's last average to the next day's first. To separate the days' price lines the same way, give
+the price series (and a percentage mirror) `break_on_trading_day: true`; the five-day demo does.
 
 **5. Volume colors.** `histogram_updown_rule: "previous_close"` colors each column by the primary
 price series' close against the previous traded close (an unchanged close counts as up); the first
@@ -526,6 +611,135 @@ Before the first trade the time axis, its anchors, and the vertical grid already
 while the price axes stay empty: as in the reference, a series without data does not autoscale.
 The opening trade then draws at once (a baseline series with one traded row paints a bar-wide
 segment). Open `intraday.html?traded=0` to see that state.
+
+## Ticks to candles and resampling
+
+Both recipes build ordinary candles on the time axis in the chart's exchange time, so set the
+exchange time zone (and `session_start` for night sessions) first. Candles are stamped with their
+open time, the canonical Aeris bar time; platforms that label a minute by its close (同花顺, 富途)
+show the same bars one interval later.
+
+### Ticks to candles
+
+A chart-level trade stream owns the tick tape; an ordinary candlestick (or bar) series bound to it
+presents the stream's time bars, and a volume histogram is derived from the same bars:
+
+```ts
+chart.time_scale().apply_options({ time_zone: "Asia/Shanghai" });
+const candles = chart.add_series("candlestick");       // add first: it tints the volume columns
+const stream = chart.add_trade_stream("SSE:600000", {
+  tick_size: 0.01, bar_type: "time", interval_seconds: 60,   // 300 for 5-minute candles
+});
+chart.bind_trade_bar_series_to_stream(candles, stream);
+chart.set_trade_stream_sessions(stream, { windows: [["09:30", "11:30"], ["13:00", "15:00"]] });
+const volume = chart.add_trade_volume_series(stream, 1);   // total volume per bar, pane 1
+volume.apply_options({ histogram_updown_rule: "previous_close" });
+chart.set_trade_stream_trades(stream, history);           // footprint_trade[]; typed columns also work
+chart.update_trade_stream_trades_typed(stream, live_columns); // "tip" for in-order prints
+```
+
+**Session anchoring.** Without sessions, time bars align to the `anchor_seconds` grid (default 0,
+the UTC grid), which suits 24-hour markets. `set_trade_stream_sessions()` places the exchange-local
+windows on every trading day in the chart's `time_zone` and `session_start` (the offset in force on
+that date, so DST is respected), and each window restarts the bar grid at its open: A-share
+60-minute bars open at 09:30, 10:30, 13:00 and 14:00, US 60-minute bars at 09:30 … 15:30 Eastern on
+both sides of a DST change, and the lunch break takes no width. An `interval_seconds` of 86 400 gives
+one bar per trading day, opening at its first window. Changing the chart's time zone or session start
+re-places the windows; `null` restores the plain grid. Only whole-second time bars accept sessions;
+invalid windows or other bar types throw `invalid_options` and change nothing.
+
+**Prints outside the windows.** `outside: "fold"` (the default) keeps every print: the 09:25
+opening auction opens the 09:30 bar, and the 11:30:00 and 15:00:00 closing prints close the last bar
+of their window, as Chinese platforms show them. `outside: "exclude"` leaves pre-market and
+after-hours prints out of every bar (a US regular-hours chart) but keeps prints stamped in a window's
+closing second, such as the 16:00:00 closing cross. A print that is folded or excluded still takes
+part in aggressor classification. A trade `session_id` change always starts a new bar and resets
+session delta; the windows already split the morning and afternoon, so a per-date id is enough.
+
+**Live, corrections, and replay.** In-order prints update the forming bar in place and the first
+print at or after a bar boundary opens the next bar (`"tip"`); late or corrected prints rebuild the
+stream once (`"historical"`). The volume histogram, CVD/delta studies, and footprints on the same
+stream follow every change. `chart.set_replay_clock_micros(clock)` shows exactly the bars of the tape
+up to the clock; a bar that a folded pre-open print opens ahead of the clock appears when the clock
+reaches its open. The volume columns take the up/down tint of the chart's primary (first) price
+series (`histogram_updown`); restyle them like any histogram.
+
+Rust hosts call `ChartEngine::set_trade_stream_sessions(stream, Some(TradeSessionOptions { windows,
+outside: OutOfSessionPolicy::Fold }))` and `add_trade_volume_series(stream, pane)`;
+`SessionBarGrid` exposes the same placement for other tick consumers.
+
+### Resampling
+
+`configure_resampled_series(target, options)` derives a candlestick or bar `target` (and an optional
+volume histogram) from a source series in the engine. `resample_boundaries()` derives the periods
+from the session windows, the exchange time zone, and the host's trading dates:
+
+```ts
+import { resample_boundaries } from "@aeristerminal/aeris-charts";
+
+const minute = chart.add_series("candlestick");
+const minute_volume = chart.add_series("histogram", { pane: 1 });
+minute.set_data(minute_bars);                 // stamped with each minute's open time
+minute_volume.set_data(minute_volumes);
+const hour = chart.add_series("candlestick");
+const hour_volume = chart.add_series("histogram", { pane: 1 });
+const boundaries = resample_boundaries({
+  dates: ["2026-09-24", "2026-09-25"],        // host calendar; future dates are allowed
+  windows: [["09:30", "11:30"], ["13:00", "15:00"]],
+  time_zone: "Asia/Shanghai",
+});
+chart.configure_resampled_series(hour, {
+  source: minute, volume_source: minute_volume, volume_target: hour_volume,
+  interval_seconds: 3600, boundaries,
+});
+```
+
+**Periods.** `span: "window"` (the default) returns one boundary per session window, so 5-, 15-,
+30- and 60-minute bars restart at every window open (A-share 60-minute bars at 09:30, 10:30, 13:00,
+14:00; a window whose length is not a multiple of the interval ends with a shorter bar).
+`span: "day"` returns one boundary per trading date from its first open to its last close; with
+`interval_seconds: 86400` that is one daily bar per date, stamped at the session open, so US daily
+bars built from extended-hours minutes (04:00–20:00 Eastern) stay one bar per day across DST even
+though winter sessions run past UTC midnight. Every boundary carries the trading date as
+`session_id` (`YYYYMMDD`). Dates are strictly ascending and use `session_slot_times` placement
+(night sessions with a negative `session_start` included); at most 20 000 boundaries and 32
+resampled series per chart. Hosts may also pass their own `{ start_time, end_time, session_id }`
+periods (for weeks or months, for example).
+
+**Source rows.** Source rows must be stamped with bar-open times; rows outside every boundary are
+omitted, so shift close-stamped minutes (09:31 … 15:00) back by one interval first. A feed that also
+carries a separate opening-auction minute (241-bar feeds stamp it 09:30 beside the close-stamped
+09:31) must merge that row into the first minute before resampling: shifted, it falls before the
+first window and is omitted with its volume. Whitespace rows (`session_slot_times` reservations)
+reserve their bucket without prices: an untraded bucket is a whitespace bar, and the forming bucket
+closes at its last traded row. Resampling needs a time axis: it is rejected on a chart whose axis is
+a non-time bar sequence (trade-count, volume, or range streams, synthetic bars), and such a sequence
+cannot join a chart that has resampled series.
+
+**Live updates.** `update`, `merge`, and typed batches on the source or its volume refresh only the
+affected tail: the unchanged prefix of derived bars is kept and the tail is rebuilt from the first
+bucket that can hold a changed row, so a live minute re-reads one bucket, never the history, and
+boundaries past the last source row (dates configured ahead) cost nothing. A `pop`, a
+retention-cap trim of the source's head, a backward replay that loses a derived bar, and a complete
+`set_data` rebuild once.
+`chart.resample_stats(target)` reports `rebuilds`, `tail_refreshes`, and `rows_scanned`. Under the
+replay clock the forming bar aggregates only rows at or before the clock. To reach a date past the
+configured boundaries, call `configure_resampled_series` again (one rebuild); new dates can also be
+included ahead of time because dates without data produce no bars. A reconfigure keeps the
+binding's source (another source throws `invalid_options`). Bindings never chain, in either
+configuration order: a target (or volume target) may not be another binding's source (or volume
+source) or output, and a binding's volume source may not be its own volume target; each throws
+`invalid_options` ("resampling dependencies may not be chained or cyclic") and changes nothing.
+
+The targets are engine-owned: `set_data`, `update`, `update_typed`, `merge`, and `merge_typed` on
+them are rejected (`last_ingestion_diagnostics().status === "rejected"`) and change nothing.
+Removing any series of a binding (source, volume source, or a target) removes the binding together
+with its target series, like indicator outputs. `chart.resampled_bars(target)` returns the derived
+bars with their `session_id` and aggregated source-row count. Rust hosts call
+`ChartEngine::configure_resampled_series(source, volume_source, target, volume_target,
+ResampleOptions { interval_seconds, boundaries })` and
+`aeris_charts_engine::resample_boundaries(&days, &windows, chart.exchange_time(),
+ResampleSpan::Window)`.
 
 ## Experimental surfaces
 
@@ -652,7 +866,15 @@ reload), each anchor resolves from its time on the new axis: 10:37
 lands 37/60 of the way from the 10:00 hourly bar to the next one, and inside that day's bar on
 daily data. Undo/redo history and in-flight creation or drag state follow the same rules. Sync
 payloads (`drawing_sync_payload`) and clipboard payloads (`copy_drawings`) carry anchor times, so the
-receiving chart resolves them on its own interval and history window.
+receiving chart resolves them on its own interval and history window. Every committed drawing change
+(an API call, a placement, a freehand stroke, a pointer drag or keyboard nudge that moved something,
+a text edit) advances the sync revision, so an already synced cell accepts the next payload.
+Clipboard payloads are bounded like a persisted drawing document (at most 10,000 drawings, 250,000
+anchors, and 8 MiB): `copy_drawings` throws `resource_limit` past them and `invalid_data` when no
+listed drawing exists, and `clone_drawing` copies any drawing the chart holds. Named templates
+(`drawing_template`, `apply_drawing_template`) carry style only: never a drawing's name, group,
+revision, visibility, lock, z-order, interval visibility, price scale, or text, so applying one
+restyles the target and keeps its identity and its own text.
 
 `chart.set_drawing_magnet_mode("off" | "weak" | "strong")` is the persistent toolbar magnet
 (default `"off"`, which keeps the historical Ctrl/Cmd-only magnet). `"strong"` always snaps a placed
@@ -664,8 +886,26 @@ off). Touch input has no modifier and uses the chart mode. Keyboard nudges never
 `chart.add_drawing()` throws `invalid_options` for a malformed or out-of-range options patch instead of
 dropping the options. Undo/redo during an active drag cancels the drag first. Keyboard editing
 (`Enter`, `Tab`, arrows) cycles the drawing's editable handles (every anchor, a rectangle's eight
-bounds handles, or a Long/Short Position's target, entry, width, and stop controls) and moves the
-focused handle by the nudge distance.
+bounds handles, a Long/Short Position's target, entry, width, and stop controls, or the handles a
+drawing family places on its geometry, listed with each family below) and moves the focused
+handle by the nudge distance. `drawing_handle_count()` counts them. A nudge that moves nothing (a
+locked drawing, an axis the drawing cannot move along, a clamp at the pane edge) records no undo
+step and is announced as such, so Escape rolls back only the nudges that moved the drawing.
+
+A drawing's own text is edited in place in the chart's inline editor: the text tool, a trend line's
+label, and the text boxes of the Projection & Annotations tools listed below. A double-click on a
+selected drawing, or Enter or F2 while the chart has focus and the drawing is selected (F2 on its
+accessibility drawing target, where Enter keeps geometry editing), opens the editor; locked,
+hidden, and interval-hidden drawings do not open it. Typing repaints live, Enter or leaving the
+editor commits, and Escape restores the text. The whole edit is one undo step and reaches
+`drawing_sync_payload` once, on commit. Family text boxes take several lines (Shift+Enter adds one,
+paste inserts plain text); the text tool and trend labels stay single-line. The editor is a
+labeled text box that announces opening and closing through the accessibility live region and
+returns focus to where it was opened from.
+
+A drawing's dashed or dotted `style` paints the same dashes on WebGPU, Canvas2D, GPUI, and native
+rendering, and so does a general series' `line_style`: the engine splits those strokes into dash
+runs before any backend draws them.
 
 ### Price-basis (复权) switches
 
@@ -677,7 +917,9 @@ switch through three calls:
    `{from_time?, to_time?, factor}` (UTC seconds, `[from, to)`, non-overlapping, factor 1e-6..1e6).
    Each anchor price whose time falls in a segment is multiplied by that factor (on tick, volume,
    or range bar charts an anchor's time is the open time of the bar it sits on); Long/Short
-   Position levels use the entry anchor's segment. This is a data-basis change, not an edit: it
+   Position levels use the entry anchor's segment, and a Gann fan's or fixed square's
+   `scale_ratio` (price per bar) scales with its first anchor's segment. This is a data-basis
+   change, not an edit: it
    also applies to locked drawings, rewrites the undo/redo history in the new basis, and records no
    undo step, so undo never restores old-basis prices. The rescale is atomic: invalid segments, or
    a factor that would move any price outside the supported value range, change nothing. The
@@ -694,6 +936,364 @@ one undo step, for host-computed edits. Price lines, alerts, markers, and tradin
 host-owned; the host rewrites them itself. Trading intents emitted from the chart (bracket orders from
 Long/Short Positions, order drags) carry display-basis prices, so under a non-raw basis the host must
 convert them to raw prices before it submits them to a broker.
+
+## Drawing families
+
+B8 drawing families extend the `drawing_kind` catalog. Their tools use the same placement,
+selection, handles, drags, magnet, keyboard editing, anchor time identity, history, persistence,
+clipboard, sync, and schema APIs as every other drawing. Some tools add handles on their geometry
+beyond their anchors (listed with each family); those drag, magnet-snap, and keyboard-nudge like
+anchor handles, and each drag or nudge is one undo step, including any option it edits. Family-specific options live in one block
+per family under `options.tool_options`; a patch deep-merges it (absent keys keep their values,
+`null` resets a block, an invalid block rejects the whole patch with `invalid_options`). Schema
+descriptors name those options with dotted paths such as `tool_options.line.stats_position`, and
+`drawing_kind_options()` returns the resolved block. Kind defaults (for example a ray's
+`extend_right`) are the schema defaults and are omitted from persistence.
+
+<!-- B8: lines — begin -->
+### Lines
+
+- `ray`, `extended_line`, `info_line`, `trend_angle`, and `arrow_line` place two anchors. On these
+  tools `extend_left` extends beyond the first anchor and `extend_right` beyond the second, each to
+  the pane edge in the line's own direction; a ray defaults to `extend_right`, an extended line to
+  both. End caps (`stroke_start`, `stroke_end`) paint only on ends that are not extended; the arrow
+  line defaults `stroke_end` to `"arrow"`. The `text` label follows the segment like a trend
+  line's; inline hover editing remains a trend-line feature.
+- Visible `labels` render as one stats box: price, price change, percent change, and ticks on one
+  line; bar count, time range, and duration on the next; screen angle and CSS-px distance last.
+  Values use the drawing scale's price formatter and the anchors' time identity. `info_line`
+  enables price change, percent change, bar count, duration, and angle by default.
+  `tool_options.line.stats_position` (`"start"`, `"middle"`, `"end"`; default `"end"`) places the
+  box beyond the first anchor, below the midpoint, or beyond the second anchor. The box is a body
+  target for selection and drags. `volume_in_range` renders nothing because drawings carry no
+  volume source.
+- `trend_angle` adds a dashed horizontal reference toward the second anchor, the arc to the
+  segment, and the screen angle in degrees (rising positive, -90 to 90).
+- `cross_line` places one anchor and paints full-span horizontal and vertical lines through it,
+  with the horizontal line's price tag on the axis. Its body drags on both axes.
+- `drawing_kind_options()` returns `{ kind: "line", stats_position }` for every Lines tool.
+<!-- B8: lines — end -->
+<!-- B8: channels — begin -->
+### Channels
+
+- `parallel_channel`, `flat_top_bottom`, and `disjoint_channel` place three anchors. The first two
+  define the base line. The second line spans the same bars and lies on the line through the third
+  anchor, whichever bar that anchor sits on: the base line moved vertically on screen for the
+  parallel channel (parallel on every scale mode), a horizontal line at the third anchor's price for
+  flat top/bottom, and the base line's slope mirrored for the disjoint channel. `extend_left` and
+  `extend_right` extend both lines and the fill to the pane edge beyond the first and second
+  anchor. Placement previews the base line after the first click and the whole channel after the
+  second.
+- The fill between the lines is on by default (`fill_enabled`); `fill_color` defaults to the stroke
+  color at 20% alpha. Where the lines cross (flat top/bottom, disjoint channel) the fill meets at
+  the crossing. Lines are body targets; the fill is a drag surface only while the drawing is
+  selected, like the rectangle's. The `text` label follows the base line like a trend line's.
+  Channel lines ignore `stroke_start` and `stroke_end`.
+- `tool_options.channel.middle_line` paints a dashed 1 px line halfway between the two lines (default
+  on for the parallel channel, off for the others) in `middle_color` (`""` follows `color`).
+- `regression_trend` places two anchors that choose a bar range (rounded positions, inclusive); its
+  body and handles move along time only. The engine fits a least-squares line to the source series
+  over those bars — the first ordinary series added to the drawing's pane and price scale that is
+  still live (indicator outputs and custom series never qualify, footprint and feature series do
+  through their OHLC projection; reordering or hiding a series does not change the source, and
+  neither does removing and re-adding other series) — and paints it dashed (`middle_line`, `middle_color`) with lines `upper_deviation` (default 2) and
+  `lower_deviation` (default -2) residual standard deviations away (sample deviation, `n − 1`),
+  each toggled by `use_upper_deviation` and `use_lower_deviation`, the zones between them filled,
+  and Pearson's R (the signed correlation of bar position and value, four decimals) below the start
+  unless `show_pearsons` is false. `source` selects the bar value (`indicator_input_source`, default
+  `"close"`). The lines follow streaming updates of the source; replacing the latest bar or appending
+  bars costs the changed rows, not the anchored range. On an as-of (`time_alignment: "as_of"`)
+  source the fit reads each of the source's own bars in the range once, not the repeated axis
+  points. A range without source bars paints
+  the dashed anchor segment. The anchors' prices are stored but do not shape the lines, and the
+  `text` label sits in the anchors' box. Default width 1; the other channels default to 2.
+- Handles sit on the painted lines, one per anchor in anchor order (`drawing_handle_count` 3 or
+  2): the base line's two ends, the second line's midpoint for the third anchor (dragging or
+  nudging it moves the second line), and the regression line's two ends, which follow the fit
+  (while placing too). Shift-dragging a base-line end straightens the base line like a trend
+  line's.
+- A template from `drawing_template()` replaces the drawing's `tool_options.channel` when applied,
+  so options the template leaves at their defaults reset as well.
+- `drawing_kind_options()` returns `{ kind: "channel", middle_line, middle_color }` for the three
+  click-placed channels and `{ kind: "regression_trend", ... }` with every resolved regression
+  option. `tool_options.channel` stores only the fields that were set.
+<!-- B8: channels — end -->
+<!-- B8: fibonacci — begin -->
+### Fibonacci
+
+| Tool | Anchors | Geometry |
+| --- | --- | --- |
+| `fib_retracement` | 2 | Horizontal levels between the anchors' prices: level 0 on the second anchor, 1 on the first, extensions beyond. Levels span the anchors' times. |
+| `trend_based_fib_extension` | 3 | The first leg's move projected from the third anchor (level 0 at the third anchor, 1 one full move away), spanning the first leg's width from the third anchor. |
+| `fib_channel` | 3 | Lines parallel to the first leg; level 1 passes through the third anchor. |
+| `fib_time_zone` | 2 | Full-height lines at 0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89 times the anchors' time distance from the first anchor. |
+| `trend_based_fib_time` | 3 | Full-height lines at ratio multiples of the first leg's duration from the third anchor. |
+| `fib_speed_resistance_fan` | 2 | Rays from the first anchor through the second anchor's time at each price ratio and through its price at each time ratio, to the pane edge, plus the ratio grid inside the anchors' box. |
+| `fib_speed_resistance_arcs` | 2 | Arcs around the first anchor, radius ratio × the anchors' screen distance, on the second anchor's side (full circles optional). |
+| `fib_circles` | 2 | Circles around the anchors' midpoint; level 1 passes through both anchors. |
+| `fib_spiral` | 2 | A golden spiral around the first anchor through the second, growing by φ every quarter turn, clockwise on screen. |
+| `fib_wedge` | 3 | Ratio arcs around the first anchor between the edges toward the second and third anchors; level 1 at the second anchor's distance. |
+
+- The level list is the common `levels` option: `value`, `color`, `visible`, `style`
+  (`"solid"`, `"dotted"`, `"dashed"`), `fill_between`, optional `fill_color`, and
+  `label_visible`, at most 64 levels. Retracement, extension, and channel default to
+  TradingView's visible retracement levels 0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618, 2.618,
+  3.618, 4.236 and its palette (0 and 1 gray, 0.236 red, 0.382 orange, 0.5 green, 0.618 teal,
+  0.786 cyan, 1.618 blue, 2.618 red, 3.618 purple, 4.236 pink). The other tools use the
+  conventional tables: trend-based time 0, 0.382, 0.5, 0.618, 1, 1.382, 1.618, 2, 2.382, 2.618, 3;
+  the fan 0, 0.25, 0.382, 0.5, 0.618, 0.75, 1; arcs and circles 0.236 through 4.236; the wedge
+  0.236 through 1. Values from the retracement table keep its colors; other values take the
+  palette in list order. The spiral has no levels.
+- Visible levels sort by value. `fill_enabled` is the background switch (on by default except
+  for time zones and the spiral); the band between two neighbouring levels takes the upper
+  level's `fill_color`, or its color at 20% opacity, when that level's `fill_between` is on. Bands
+  select and drag the drawing only while it is selected; level lines, the trend line, and labels
+  always do.
+- The drawing's own `color`, `width`, and `style` (default `#787b86`, 1 px, dashed) are the
+  trend line through the anchors, the fan's grid, and the wedge's edges (solid); the spiral is
+  drawn in them. Level lines use each level's color and style at the drawing's width.
+- `extend_left` and `extend_right` extend the retracement's, extension's, and channel's levels to
+  the pane's left and right edges.
+- Level labels show the value and, for the retracement and extension, the price through the
+  drawing scale's formatter, for example `0.618 (102.53)`, in the level's color.
+- `tool_options.fibonacci` (`fibonacci_tool_options`): `reverse` (swap the ends levels 0 and 1
+  sit at; time zones project backward; the spiral turns counterclockwise), `show_levels`,
+  `show_prices`, `levels_as_percent` (`61.8%`), `log_scale` (price levels interpolate in log
+  space), `trend_line`, `grid` (fan), `full_circles` (arcs), `label_h_align` and `label_v_align`
+  (price levels default to `"left"`/`"middle"`: beyond the left end, centered on the line; time
+  levels to `"right"`/`"bottom"`). Each tool's schema lists only the fields it reads, with its
+  resolved defaults. `drawing_kind_options()` returns `{ kind: "fibonacci", ... }` with every field
+  resolved.
+- Culling follows the painted levels: price and time levels beyond the anchors keep a drawing
+  visible and hittable while its anchors are scrolled away. The fan, arcs, circles, spiral, and
+  wedge depend on the screen distance between their anchors, so they are culled by the pane only.
+<!-- B8: fibonacci — end -->
+<!-- B8: pitchforks_gann — begin -->
+### Pitchforks and Gann
+
+- `andrews_pitchfork`, `schiff_pitchfork`, `modified_schiff_pitchfork`, and `inside_pitchfork`
+  place three anchors: the pivot, then the two ends of the handle. The median starts at the pivot
+  (Schiff: at the pivot's time, halfway between the first two anchors' prices; modified Schiff and
+  inside: at the midpoint of the first two anchors). It runs through the handle's midpoint, or for
+  the inside pitchfork through the third anchor, whose tines pass through the second anchor and
+  its reflection about the third. Between clicks a guide joins the placed anchors and the pointer.
+  Besides one handle per anchor, the pitchforks and the pitchfan have a fourth handle on the
+  midpoint between the second and third anchors, which moves both together
+  (`drawing_handle_count` 4).
+- A pitchfork's `levels` are median offsets in half-handle widths: level `v` is a tine on each
+  side of the median, and level 1 passes through the handle's ends. Defaults: 0.25, 0.382, 0.5,
+  0.618, 0.75, 1, 1.5, 1.75, and 2, with 0.5 and 1 visible; `fill_between` zones filled at 20% of
+  the level color (`fill_enabled`); level labels off; median `color` `#f23645`; width 1.
+  Unextended lines reach one median length past the handle; `extend_left` and `extend_right` run
+  every line to the pane edge. The shifted-pivot variants add a dashed guide between the first two
+  anchors. Like a rectangle's interior, the zone fills of every tool in this family (pitchfork and
+  fan zones, Gann box zones, square arcs) are drag targets only while the drawing is selected.
+- `pitchfan` places three anchors and draws the same levels as rays from the first anchor through
+  the level points on the handle between the other two.
+- `gann_box` places two corners. Its `levels` are horizontal price levels and
+  `tool_options.gann.time_levels` vertical time levels, both as fractions of the box from the first
+  corner (defaults 0, 0.25, 0.382, 0.5, 0.618, 0.75, and 1, filled and labeled on all four sides).
+  `show_angles` adds the `angles` fan from the pivot corner. It has eight bounds handles, and
+  Shift squares it on screen.
+- `gann_square` places two corners and draws the `levels` grid (default fifths of each side), the
+  `angles` fan (1×8 through 8×1, the 1×1 on the diagonal), quarter `arcs` around the pivot corner
+  (fifths of the side, filled), and a box with the price range, bar count, and price per bar. Like
+  the box, it has eight bounds handles and Shift squares it on screen.
+  `gann_square_fixed` places one anchor: the square is `size_bars` wide and `size_bars ×
+  scale_ratio` tall in price, or square on screen without a ratio. Its second handle, the far
+  corner, resizes it: the corner's bar sets `size_bars` in whole bars (at least 1), dragging it
+  below the anchor sets `reverse`, and with a `scale_ratio` the corner's price sets the ratio
+  (Shift keeps it); without one the square stays square on screen and follows the corner's larger
+  distance from the anchor. A keyboard nudge of the corner moves the side at least one whole bar
+  the way the arrow points (without a ratio, sized by the arrow's axis), so repeated presses keep
+  resizing however wide a bar is.
+- `gann_fan` places two anchors. Its `levels` are multiples of the 1×1 slope (defaults 1/8, 1/4,
+  1/3, 1/2, 1, 2, 3, 4, and 8, labeled `8x1` through `1x8`, zones filled). The 1×1 passes through
+  the second anchor, or with `scale_ratio` rises that many price units per bar. Lines are rays by
+  default (`extend_right`); unextended, they stop at the anchors' box. Shift straightens the
+  second anchor to 45°.
+- `tool_options.gann` (absent fields keep their defaults):
+
+  | Field | Tools | Default |
+  | --- | --- | --- |
+  | `time_levels` | Gann box | 0 … 1 as above |
+  | `angles` | Gann box (with `show_angles`), squares | 1/8 … 8, positive values |
+  | `arcs` | squares | 0.2, 0.4, 0.6, 0.8, 1, positive values |
+  | `reverse` | Gann box, squares | `false`; `true` measures from the second anchor's price (the box also counts time from it) and grows the fixed square down |
+  | `show_angles` | Gann box | `false` |
+  | `show_stats` | squares | `true` |
+  | `scale_ratio` | Gann fan, fixed square | `null`: price per bar of the 1×1, positive |
+  | `size_bars` | fixed square | 20, from 1 to 100000 |
+
+  Each tool's schema lists only the fields it uses. `drawing_kind_options()` returns
+  `{ kind: "pitchfork", levels }` for the pitchforks and the pitchfan, and `{ kind: "gann", levels,
+  time_levels, angles, arcs, reverse, show_angles, show_stats, scale_ratio, size_bars }` for the
+  Gann tools.
+<!-- B8: pitchforks_gann — end -->
+<!-- B8: projection_annotations — begin -->
+### Projection and annotations
+
+Defaults follow the conventional professional-platform look: the drawing `color` (the canonical
+primary unless noted) paints markers, leaders, and box backgrounds; box text is `text_color` or
+black/white contrast against the box; `box_border_color` frames annotation boxes; text uses the
+chart font size unless `text_size` is set. Every tool owns its `text` (it does not follow the
+3×3 box label of other tools) and renders any visible `labels` as engine-formatted stats.
+
+- `forecast` (source, target): a segment with end caps from `stroke_start`/`stroke_end`, a source
+  dot and a source-price box on the far side, and a target box with the change and percent, the
+  target time, and the outcome. The outcome comes from the drawing's source series (the regression
+  trend's rule: the first live ordinary series added to its pane and price scale) and follows its
+  streaming updates: `Success` (market-up box) once a bar after the source bar reaches the target
+  price (a high for a rising target, a low for a falling one) by the target bar (an as-of source's
+  own bars, including those that collapse between two axis points; a point that repeats the source
+  bar is not a later bar), `Failure`
+  (market-down box) once a traded bar after the target bar exists without that (a target on the
+  latest, possibly still-forming bar stays pending, and whitespace rows such as future session
+  slots are not bars), and no outcome (the drawing color) while pending.
+- `bars_pattern` (two anchors): when placed with the armed tool (which previews the copy in place)
+  or created by `add_drawing` without `bars`, it copies the bars between its anchors' bar indexes
+  (at most 128; a longer range aggregates into 128 OHLC buckets) into
+  `tool_options.projection_annotation.bars` and pins its anchors on the copy's box — the first
+  copied bar at the copy's highest value and the last at its lowest — so the ghost starts exactly
+  over its source. The ghost always fills the box between its anchors: moving it moves the copy,
+  and the anchors stretch it in time and scale it in proportion to the copy's full range (a price
+  basis rescale scales it exactly). `bars_mode` is `"hl_bars"` (default), `"oc_bars"`,
+  `"line_open"`, `"line_high"`, `"line_low"`, or `"line_close"`; `mirrored` reverses the copy in
+  time and `flipped` turns it upside down within the box. Paste, sync, and persistence carry the
+  copied bars; a named template keeps only the style, so applying one never replaces a pattern's
+  copy and the armed tool always copies its own range. On an as-of source it copies the source's
+  own bars, each once. A pattern created before any data has no
+  copy and paints a dashed box.
+- `price_range`, `date_range`, `date_and_price_range` (two anchors): a fill between the anchors
+  (`fill_enabled` defaults on; `fill_color` or the drawing color at 20%), the edge lines of the
+  measured axis, arrowed measures through the middle toward the second anchor (`stroke_end`
+  defaults to `"arrow"`), and a stats box beyond the measured end (below a date range). Default
+  `labels`: price change, percent change, and ticks; bar count and duration; or all five.
+- `projection` (apex, radius point, price point): the circular sector around the apex from
+  the ray through the radius point to the ray through the price point (the shorter turn), filled
+  (`fill_enabled` defaults on) and outlined. Visible `labels` measure from the apex to the price
+  point. While placing, the first click shows the apex as a handle with a provisional line to the
+  pointer; after the second click the sector previews through the pointer, and the third click
+  commits it.
+- `anchored_text` (one anchor): text pinned to a pane position. Its anchor is a pane fraction —
+  `logical` is x / pane width and `price` is y / pane height from the pane top — so it stays put
+  while the chart scrolls, zooms, rescales, or changes interval. Its anchors carry no `time`
+  (`time` inputs are ignored and a time-only anchor is rejected), fractions clamp into `0..=1`
+  (in `add_drawing`, `set_points`, paste, sync, and drags, so it always stays reachable) while an
+  `import_state` document with a fraction outside `0..=1` is `invalid_data`, and magnets and paste
+  offsets and group moves do not apply. Default text `"Text"`, aligned left/top on the
+  anchor; `box_color`/`box_border_color` box it like the text tool.
+- `note` (one anchor): a pin whose tip is the anchor, with the text (default `"Note"`) in a box
+  beside the head. The box shows while the note is hovered, selected, or being edited;
+  `tool_options.projection_annotation.always_show_text` (default `false`) keeps it visible.
+- `price_note` (two anchors): a leader from the priced point to a box with its price (and any
+  text) at the second anchor.
+- `callout` (tip, box): a text box (default `"Callout"`) placed on the second anchor by
+  `text_h_align`/`text_v_align` (default centered), with a pointer to the first anchor.
+- `comment` and `price_label` (one anchor): a speech bubble whose tail tip is the anchor; the
+  comment shows its text (default `"Comment"`), the price label the anchor's price and any text.
+- `signpost` (one anchor): a pole from the anchor up to a text plate (default `"Signpost"`).
+- `flag_mark` (one anchor): a flag standing on the anchor.
+- `arrow_mark_up`, `arrow_mark_down`, `arrow_mark_left`, `arrow_mark_right` (one anchor): a block
+  arrow whose tip is the anchor, with any text past its tail in `text_color` or the arrow color.
+  Up defaults to the market-up color and down to the market-down color.
+- `icon` (one anchor): `tool_options.projection_annotation.icon` — `"star"` (default), `"heart"`,
+  `"check"`, `"cross"`, `"circle"`, `"square"`, `"diamond"`, `"triangle_up"`, or
+  `"triangle_down"` — centered on the anchor, `icon_size` CSS px across (8..128, default 24), in
+  the drawing color.
+- Kind defaults (fills, arrows, stats, default texts, arrow colors) are schema defaults and are
+  omitted from persistence; a cleared default text persists as `""`.
+- The text of `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
+  `signpost`, and the arrow marks edits in place (see inline text editing above); the price note
+  and price label keep their price line above it. An emptied box keeps one caret line while it is
+  edited. Placing one of these tools does not open the editor.
+- `drawing_kind_options()` returns `{ kind: "projection_annotation", bars_mode, mirrored, flipped,
+  pattern_bars, icon, icon_size, always_show_text }` for every tool of the family.
+<!-- B8: projection_annotations — end -->
+<!-- B8: patterns_elliott_cycles — begin -->
+### Patterns, Elliott waves, and cycles
+
+Every tool places a fixed number of anchors by clicking, previews the legs placed so far while it is
+being placed, and exposes one handle per anchor. Defaults follow TradingView's: colors per tool,
+width 2 (1 for cyclic lines), and region fills at 15% of the drawing color when `fill_color` is
+empty. Point and ratio labels use the drawing's text size, weight, and italic (`text_color`
+overrides their contrasting default); they are body targets.
+
+| Tool | Anchors | Default color | Paints |
+| --- | --- | --- | --- |
+| `xabcd_pattern` | X, A, B, C, D | `#2962FF` | Legs, shaded XAB and BCD, ratios AB/XA, BC/AB, CD/BC, AD/XA |
+| `cypher_pattern` | X, A, B, C, D | `#2962FF` | Legs, shaded XAB and BCD, ratios AB/XA, XC/XA, CD/XC |
+| `abcd_pattern` | A, B, C, D | `#089981` | Legs, ratios BC/AB and CD/BC |
+| `head_and_shoulders` | base, left shoulder, neck, head, neck, right shoulder, base | `#089981` | Legs, neckline between the outer legs, shaded shoulders and head, part labels |
+| `triangle_pattern` | A, B, C, D (alternating highs and lows) | `#673AB7` | Legs, A–C and B–D sides extended to their apex when it lies ahead within one pattern width, shaded triangle |
+| `three_drives_pattern` | start, drive 1, retracement, drive 2, retracement, drive 3, end | `#673AB7` | Legs, drives labeled 1–3, each leg's ratio to the leg before it |
+| `elliott_impulse_wave` | 0, 1, 2, 3, 4, 5 | `#3D85C6` | Waves labeled 1–5 |
+| `elliott_correction_wave` | 0, A, B, C | `#3D85C6` | Waves labeled A–C |
+| `elliott_triangle_wave` | 0, A, B, C, D, E | `#FF9800` | Waves labeled A–E |
+| `elliott_double_combo` | 0, W, X, Y | `#6AA84F` | Waves labeled W, X, Y |
+| `elliott_triple_combo` | 0, W, X, Y, X, Z | `#6AA84F` | Waves labeled W, X, Y, X, Z |
+| `cyclic_lines` | cycle start, cycle end | `#80CCDB` | Dashed connector and full-height vertical lines every interval from the earlier anchor to the right edge |
+| `time_cycles` | cycle start (base), cycle end (sets the arch height) | `#159980` | Half-ellipse arches of the anchors' width and height, repeated both ways, shaded |
+| `sine_line` | a peak or trough, the next opposite extreme | `#159980` | A sine through both anchors across the pane |
+
+- Ratios are price ratios printed with three decimals on dashed connectors;
+  `tool_options.pattern.show_ratios: false` hides connectors and ratios.
+- `tool_options.pattern.degree` selects the Elliott wave degree: `"supermillennium"`,
+  `"millennium"`, `"submillennium"`, `"grand_supercycle"`, `"supercycle"`, `"cycle"`,
+  `"primary"`, `"intermediate"` (default), `"minor"`, `"minute"`, `"minuette"`, or
+  `"subminuette"`. Wave 3 and wave C read `{III}`/`{c}`, `[III]`/`[c]`, `<III>`/`<c>`, ringed
+  `III`/`c`, `(III)`/`(c)`, `III`/`c`, ringed `3`/`C`, `(3)`/`(C)`, `3`/`C`, ringed `iii`/`c`,
+  `(iii)`/`(c)`, and `iii`/`c` in that order. `tool_options.pattern.show_wave: false` leaves only
+  the labels.
+- Cycle repeats closer than 3 CSS px collapse to the defining cycle.
+- `fill_enabled` and `fill_color` shade XABCD, cypher, head and shoulders, triangle pattern, and
+  time cycles; region fills are a body target only while the drawing is selected. `extend_left`,
+  `extend_right`, `stroke_start`, and `stroke_end` do not apply to these tools, and fill does not
+  apply to the other tools. The `text` label is placed against the anchors' box.
+- `drawing_kind_options()` returns `{ kind: "pattern", show_ratios }` for XABCD, cypher, ABCD, and
+  three drives, `{ kind: "elliott_wave", degree, show_wave }` for the Elliott tools, and
+  `{ kind: "generic" }` for head and shoulders, the triangle pattern, and the cycle tools.
+<!-- B8: patterns_elliott_cycles — end -->
+<!-- B8: shapes — begin -->
+### Shapes
+
+- `rotated_rectangle` places three anchors: the midpoints of the two short sides, then a point on a
+  long side, whose distance from that axis sets the width. It stays right-angled on screen at any
+  zoom. Its handles are the two axis ends and a width handle at the midpoint of each long side
+  (`drawing_handle_count` 4); the third anchor has no handle of its own. A width handle sets the
+  width to its distance from the axis, and dragging an axis end keeps the width on screen, so
+  turning the rectangle never flattens it. After a width drag the third anchor sits at its long
+  side's midpoint.
+- `ellipse` places two box corners and is inscribed in their box; it edits with the rectangle's
+  eight handles, and Shift keeps the box square (a circle). `circle` places its center and a point
+  on its rim. `triangle` places three vertices.
+- `arc` places its start, its end, and a point it passes through (collinear points give the
+  straight chord). `curve` places its start, its end, and the point it passes at its middle;
+  `double_curve` places its start, its end, and the points it passes at one and two thirds. Every
+  handle sits on the curve, and `extend_left`/`extend_right` continue a curve's end tangents to the
+  pane edge. While a three- or four-anchor shape is placed, the anchors clicked so far and the
+  pointer show as a polyline in the drawing's stroke until every anchor but the last is placed; the
+  shape itself then previews through the pointer until the last click commits it.
+- `polyline` places vertices like `path`: click to add, double-click or Enter to finish, Backspace
+  removes the latest vertex, Escape cancels. Once three vertices are placed, clicking the first
+  vertex again finishes the polyline closed (the preview snaps shut while the pointer is over it).
+  `tool_options.shape.closed` (default `false`) joins the last vertex to the first and fills the
+  enclosed region by the nonzero rule.
+- `highlighter` is a freehand drag like `brush`: a 20 px marker stroke in 40% amber with round
+  ends. It keeps one opacity where it overlaps itself on every backend, and ignores `style`, end
+  caps, and fill.
+- Strokes default to 2 px. The rotated rectangle, ellipse, circle, triangle, arc, and polyline
+  default `fill_enabled` to `true` and fill with `fill_color`, or the stroke color at 20% opacity
+  when unset; the arc fills the segment between the arc and its chord, curves fill the region
+  between the curve and its chord once enabled, and an open polyline never fills. A shape's fill
+  selects and drags it only while it is selected, so an unselected shape's interior keeps panning
+  the chart. End caps (`stroke_start`, `stroke_end`) apply to the open shapes: arc, curves, and the
+  open polyline.
+- Box text (`text`) aligns against the shape's own box, such as a circle's rather than the box of
+  its center and rim anchors.
+- `drawing_kind_options()` returns `{ kind: "shape", closed }` for every Shapes tool; the
+  `tool_options.shape.closed` schema descriptor is listed for `polyline` only.
+<!-- B8: shapes — end -->
 
 ## Persistence V1
 
@@ -728,6 +1328,10 @@ ordinary time chart `time` is authoritative on restore: importing after data res
 by its time on the loaded window, and importing before data (the grid workspace order) keeps the
 anchors pending by time until the host installs data. Documents without anchor times keep their
 logical anchors. Non-time (tick/volume/range) charts keep using `anchor_times_micros`.
+
+Drawing style fields are optional and restore the kind's own defaults when omitted; the export
+writes a field only when it differs from them. B8 family options travel in the optional
+`style.tool_options` object (at most 16 KiB serialized), so older documents need no migration.
 
 Limits for untrusted input are 8 MiB per document, 64 panes, 10,000 drawings, 100,000 anchors per
 drawing, 250,000 total anchors, 64 KiB text per drawing, and 1 MiB total drawing text. Unknown

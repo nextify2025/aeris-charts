@@ -150,6 +150,7 @@ impl ChartEngine {
     fn exchange_time_changed(&mut self) {
         self.rebuild_tick_weights();
         self.rebuild_trading_day_indicators();
+        self.refresh_trade_stream_sessions();
         self.invalidate_frame_all();
     }
 

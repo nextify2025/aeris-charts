@@ -6,7 +6,8 @@
 //   2. A baseline series relative to the previous close (red above, green below) carries price;
 //      the left axis is autoscaled symmetrically around the previous close and a mirror series
 //      puts the same prices on a right percentage axis based on the previous close.
-//   3. The average price (均价) is VWAP with a turnover (amount) source, reset per session.
+//   3. The average price (均价) is VWAP with a turnover (amount) source, reset per session; its
+//      line restarts at each reset. The five-day price lines also break at every trading day.
 //   4. The volume histogram colors each minute against the previous minute's close.
 //   5. Explicit time-axis marks 09:30/10:30/11:30|13:00/14:00/15:00 (day opens for five days).
 //   6. The whole session is held in view: `lock_visible_logical_range` plus disabled scroll/scale.
@@ -116,10 +117,13 @@ const chart = await create_chart(container, {
 });
 
 const margins = { top: 0.08, bottom: 0.08 };
+// Several days: each day's price line starts fresh instead of joining the previous day's close.
+const break_on_trading_day = DAYS > 1;
 // Price: a baseline series against the previous close (red above, green below), on the left.
 const price = chart.add_series("baseline", {
   price_scale_id: "left",
   baseline_value: reference_close,
+  break_on_trading_day,
   line_width: 1.5,
   top_line_color: RED,
   top_fill_color1: "rgba(247, 82, 95, 0.18)",
@@ -137,6 +141,7 @@ const percent = chart.add_series("line", {
   price_scale_id: "right",
   color: "#787b86",
   line_visible: false,
+  break_on_trading_day,
   price_line_visible: false,
   countdown_visible: false,
   crosshair_marker_visible: false,
@@ -170,7 +175,7 @@ percent.set_data(minutes.map((minute, index) => row(minute, index, minute.price)
 volume.set_data(minutes.map((minute, index) => row(minute, index, minute.volume)));
 amount.set_data(minutes.map((minute, index) => row(minute, index, minute.amount)));
 
-// 均价: sum(amount) / sum(volume), reset each trading session.
+// 均价: sum(amount) / sum(volume), reset each trading session; each reset starts a new line.
 const average = chart.add_vwap(price, volume, {
   price_scale_id: "left",
   color: AVERAGE,

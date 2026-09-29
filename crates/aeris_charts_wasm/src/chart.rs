@@ -27,6 +27,7 @@ mod native_primitives;
 mod primitives;
 mod ring;
 mod series_update;
+mod sessions;
 mod text_runs;
 
 use custom_series::CustomSeriesEntry;
@@ -156,6 +157,14 @@ fn rejected_diagnostics_json(reason: impl core::fmt::Display) -> String {
         "reason": reason.to_string(),
     })
     .to_string()
+}
+
+/// Rejected ingestion for a host write to an engine-derived series (footprint, synthetic, or
+/// resampled bars), which changes only through its source.
+fn derived_series_rejection(id: u32) -> String {
+    rejected_diagnostics_json(format_args!(
+        "series {id} is derived by the engine; write to its source instead"
+    ))
 }
 
 fn rejected_validation_diagnostics_json(
@@ -1715,6 +1724,32 @@ impl AerisChart {
             .update_synthetic_bar_source(id, time, open, high, low, close)
     }
 
+    pub fn set_trade_stream_sessions(&mut self, stream_id: u32, sessions_json: &str) -> String {
+        self.inner
+            .borrow_mut()
+            .set_trade_stream_sessions(stream_id, sessions_json)
+    }
+
+    pub fn add_trade_volume_series(&mut self, stream_id: u32, pane_index: usize) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_trade_volume_series(stream_id, pane_index)
+    }
+
+    pub fn configure_resampled_series(&mut self, target: u32, options_json: &str) -> String {
+        self.inner
+            .borrow_mut()
+            .configure_resampled_series(target, options_json)
+    }
+
+    pub fn resampled_bars_json(&self, target: u32) -> String {
+        self.inner.borrow().resampled_bars_json(target)
+    }
+
+    pub fn resample_stats_json(&self, target: u32) -> String {
+        self.inner.borrow().resample_stats_json(target)
+    }
+
     pub fn trade_stream_id(&self, key: &str) -> u32 {
         self.inner.borrow().trade_stream_id(key)
     }
@@ -2819,7 +2854,8 @@ impl AerisChart {
     /// Streaming update like [`update_series_bar`] that also sets the target bar's three
     /// per-point color channels (`undefined` = no custom color for that channel; packed RGBA
     /// `0xRRGGBBAA` as in [`set_series_point_colors`]). Append-new-time vs replace-last
-    /// semantics mirror the plain update.
+    /// semantics mirror the plain update. Returns `false` when the engine rejected the bar (an
+    /// engine-derived series, or values the host boundary did not validate).
     #[allow(clippy::too_many_arguments)] // mirrors update_series_bar plus the three reference color slots
     pub fn update_series_bar_styled(
         &mut self,
@@ -2832,10 +2868,10 @@ impl AerisChart {
         body: Option<u32>,
         wick: Option<u32>,
         border: Option<u32>,
-    ) {
+    ) -> bool {
         self.inner
             .borrow_mut()
-            .update_series_bar_styled(id, time, open, high, low, close, body, wick, border);
+            .update_series_bar_styled(id, time, open, high, low, close, body, wick, border)
     }
 
     /// Partial streaming merge (`series.merge`): `NaN` open/high/low/close are absent and keep the
@@ -3000,6 +3036,46 @@ impl AerisChart {
     /// This series' retention ceiling, or `undefined` when unbounded.
     pub fn series_max_points(&self, id: u32) -> Option<f64> {
         self.inner.borrow().series_max_points(id)
+    }
+
+    /// Multi-calendar overlay alignment (`series_options.time_alignment`): `as_of` false keeps
+    /// the default union; true adds no time points and shows the series' last row at or before
+    /// each point, blank once that row is more than `max_staleness` seconds old (`undefined` =
+    /// no limit). Returns `{"ok":true}` or `{"ok":false,"error":{code,message}}`.
+    pub fn set_series_time_alignment(
+        &mut self,
+        id: u32,
+        as_of: bool,
+        max_staleness: Option<f64>,
+    ) -> String {
+        let alignment = match (as_of, max_staleness) {
+            (false, _) => aeris_charts_engine::TimeAlignment::Union,
+            (true, None) => aeris_charts_engine::TimeAlignment::AsOf {
+                max_staleness: None,
+            },
+            (true, Some(seconds))
+                if seconds.is_finite()
+                    && seconds >= 0.0
+                    && seconds.fract() == 0.0
+                    && seconds <= 9_007_199_254_740_991.0 =>
+            {
+                aeris_charts_engine::TimeAlignment::AsOf {
+                    max_staleness: Some(seconds as i64),
+                }
+            }
+            (true, Some(_)) => {
+                return trading_result_json(Err(aeris_charts_engine::ChartError::new(
+                    aeris_charts_engine::ErrorCode::InvalidOptions,
+                    "as_of_max_staleness must be a non-negative whole number of seconds or null",
+                )))
+            }
+        };
+        trading_result_json(
+            self.inner
+                .borrow_mut()
+                .engine
+                .set_series_time_alignment(id as SeriesId, alignment),
+        )
     }
 
     /// Set candlestick/bar body colors per direction; same keep/clear/pin contract as the wick
@@ -4962,9 +5038,10 @@ impl AerisChart {
     }
 
     // --- drawing tools (engine-owned drawing objects; aeris_charts_engine drawings.rs) ---
-    // Kinds: 0 trend_line, 1 horizontal_line, 2 horizontal_ray, 3 vertical_line, 4 rectangle,
-    // 5 text, 6 brush, 7 path, 8 long_position, 9 short_position. All coordinates are pane-relative CSS px (x from the pane's left, y from the
-    // chart's top — the crosshair's space). Call `render()` after mutations.
+    // Kinds are the engine catalog's wire ids (`DrawingKind::to_u8`, TS `DRAWING_KIND_TO_U8`):
+    // core tools 0..=31, B8 drawing families from 32 in reserved per-family ranges. All
+    // coordinates are pane-relative CSS px (x from the pane's left, y from the chart's top — the
+    // crosshair's space). Call `render()` after mutations.
 
     /// Add a drawing to `pane` from a JSON `[{logical, price}, ...]` anchor array and an
     /// optional options patch ("" = defaults). Returns the drawing id (> 0), or 0 when the
@@ -5182,11 +5259,31 @@ impl AerisChart {
     pub fn set_selected_drawing(&mut self, id: Option<u32>) {
         self.inner.borrow_mut().set_selected_drawing(id);
     }
-    /// Mark the drawing whose dedicated host editor currently owns text input. Frame
-    /// construction retains committed glyphs for the overlay caret and preserves an empty
-    /// trend label's measured middle gap. Clear (`undefined`) when the editor closes.
-    pub fn set_editing_drawing(&mut self, id: Option<u32>) {
-        self.inner.borrow_mut().engine.set_editing_drawing(id);
+    /// Whether the host's inline editor can edit the drawing's text in place (the text tool, a
+    /// trend label, or a family text box), while it is unlocked, visible, and shown.
+    pub fn drawing_text_editable(&self, id: u32) -> bool {
+        self.inner.borrow().engine.drawing_text_editable(id)
+    }
+    /// Open the engine's text-edit session for the host editor. Frame construction keeps the
+    /// committed glyphs under the overlay caret while it is open. False when not editable.
+    pub fn begin_drawing_text_edit(&mut self, id: u32) -> bool {
+        self.inner.borrow_mut().engine.begin_drawing_text_edit(id)
+    }
+    /// Live text of the open session: repaints without an undo step or a sync revision.
+    pub fn set_drawing_edit_text(&mut self, text: &str) -> bool {
+        self.inner.borrow_mut().engine.set_drawing_edit_text(text)
+    }
+    /// Close the open session: commit records one undo step, cancel restores the text.
+    pub fn end_drawing_text_edit(&mut self, commit: bool) -> bool {
+        self.inner.borrow_mut().engine.end_drawing_text_edit(commit)
+    }
+    pub fn editing_drawing(&self) -> Option<u32> {
+        self.inner.borrow().engine.editing_drawing()
+    }
+    /// A family text box's editor layout as JSON (`{x, y, line_height, size, font_family,
+    /// weight, italic, color, rect}` in overlay CSS px), or an empty string.
+    pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
+        self.inner.borrow().drawing_text_edit_layout_json(id)
     }
     pub fn selected_drawing(&self) -> Option<u32> {
         self.inner.borrow().selected_drawing()

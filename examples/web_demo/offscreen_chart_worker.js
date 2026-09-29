@@ -132,6 +132,49 @@ self.onmessage = async (event) => {
       results.empty = chart.last_ingestion_diagnostics();
       postMessage({ type: "sequenced_stream", results });
       return;
+    } else if (message.type === "as_of_overlay") {
+      // A second market calendar: every seventh minute, 30 s off the primary's minutes. As-of it
+      // adds no time point; as a union series it would add one per row.
+      const main = columns(message.bars ?? 5_000);
+      const count = Math.floor(main.times.length / 7);
+      const overlay = columns(count);
+      for (let i = 0; i < count; i += 1) overlay.times[i] = main.times[i * 7] + 30;
+      let first_invalid = null;
+      try {
+        chart.add_series("candlestick", { time_alignment: "asof" });
+      } catch (error) {
+        first_invalid = error.code;
+      }
+      const primary = chart.add_series("candlestick"); // adopts the primary that `init` filled
+      chart.fit_content();
+      const range_before = chart.visible_logical_range();
+      const id = chart.add_series("line", { time_alignment: "as_of" });
+      chart.set_data_typed(overlay, id);
+      chart.fit_content();
+      const range_after = chart.visible_logical_range();
+      const time_alignment = JSON.parse(chart.wasm.series_options_json(id)).time_alignment;
+      const union = chart.add_series("line");
+      chart.set_data_typed(overlay, union);
+      chart.fit_content();
+      const union_points_grew = chart.visible_logical_range().to > range_before.to;
+      const ids_before_invalid = Array.from(chart.wasm.pane_series_ids(0));
+      let invalid = null;
+      try {
+        chart.add_series("line", { as_of_max_staleness: -5 });
+      } catch (error) {
+        invalid = error.code;
+      }
+      try {
+        chart.add_series("line", { time_alignment: "union", as_of_max_staleness: 60 });
+      } catch {
+        // Refused like the call above.
+      }
+      const ids_after_invalid = Array.from(chart.wasm.pane_series_ids(0));
+      postMessage({
+        type: "as_of_overlay", range_before, range_after, time_alignment, union_points_grew, invalid,
+        first_invalid, primary, ids_before_invalid, ids_after_invalid,
+      });
+      return;
     } else if (message.type === "remove") {
       if (timer !== null) clearInterval(timer);
       timer = null;

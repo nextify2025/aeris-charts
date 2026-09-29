@@ -206,6 +206,26 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 y1: pane_top + pane_h,
             }
         }
+        // B8 family tools resolve their bodies through `kinds::` parts; only their anchors'
+        // box (or the family's `text_box`) reaches this resolver, as the reference box of a
+        // box-layout text label.
+        _ => {
+            let family = kind.spec().family;
+            debug_assert!(family.is_some());
+            let text_box = family
+                .and_then(|family| (family.text_box)(kind, px))
+                .map(|rect| TextBox {
+                    left: rect.left,
+                    right: rect.right,
+                    top: rect.top,
+                    bottom: rect.bottom,
+                })
+                .or_else(|| points_box(px))?;
+            return Some(ResolvedDrawingGeometry {
+                body: DrawingBodyGeometry::Empty,
+                text_box,
+            });
+        }
     };
 
     let text_box = match body {

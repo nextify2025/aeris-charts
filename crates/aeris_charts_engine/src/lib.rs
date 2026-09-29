@@ -42,6 +42,9 @@ mod series_query_api;
 mod series_update_api;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tick_bar_tests;
+mod time_alignment_api;
 mod time_tick_marks_api;
 mod trading;
 mod viewport;
@@ -74,22 +77,52 @@ pub use domains::{
 };
 pub use drawing_contract::drawing_property_schema;
 pub use drawing_contract::{
+    drawing_levels_from_ratios, DrawingToolOptions, FIBONACCI_RATIOS, FIBONACCI_TIME_ZONES,
+    MAX_DRAWING_TOOL_OPTIONS_BYTES,
+};
+pub use drawing_contract::{
     DrawingClipboardItem, DrawingClipboardPayload, DrawingCommonSnapshot, DrawingInterval,
     DrawingIntervalUnit, DrawingIntervalVisibility, DrawingKindOptions, DrawingLabelMetric,
     DrawingLabelOptions, DrawingLabelPosition, DrawingLevel, DrawingLineCap, DrawingMagnetMode,
     DrawingPriceSegment, DrawingPropertyDescriptor, DrawingPropertySchema, DrawingPropertyType,
-    DrawingSyncPayload, DrawingTemplate, DRAWING_CONTRACT_REVISION, MAX_DRAWING_GROUP_BYTES,
-    MAX_DRAWING_LABELS, MAX_DRAWING_LEVELS, MAX_DRAWING_NAME_BYTES, MAX_DRAWING_OBJECTS,
-    MAX_DRAWING_PRICE_SEGMENTS, MAX_DRAWING_TEMPLATES, MAX_DRAWING_TEMPLATE_BYTES,
+    DrawingSyncPayload, DrawingTemplate, DRAWING_CONTRACT_REVISION, MAX_DRAWING_CLIPBOARD_BYTES,
+    MAX_DRAWING_CLIPBOARD_POINTS, MAX_DRAWING_GROUP_BYTES, MAX_DRAWING_LABELS, MAX_DRAWING_LEVELS,
+    MAX_DRAWING_NAME_BYTES, MAX_DRAWING_OBJECTS, MAX_DRAWING_PRICE_SEGMENTS, MAX_DRAWING_TEMPLATES,
+    MAX_DRAWING_TEMPLATE_BYTES,
 };
+// B8: lines — begin
+pub use drawings::kinds::lines::{DrawingStatsPosition, LineToolOptions};
+// B8: lines — end
+// B8: channels — begin
+pub use drawings::kinds::channels::ChannelToolOptions;
+// B8: channels — end
+// B8: fibonacci — begin
+pub use drawings::kinds::fibonacci::{
+    FibonacciLabelHAlign, FibonacciLabelVAlign, FibonacciToolOptions,
+};
+// B8: fibonacci — end
+// B8: pitchforks_gann — begin
+pub use drawings::kinds::pitchforks_gann::{GannToolOptions, MAX_GANN_SQUARE_BARS};
+// B8: pitchforks_gann — end
+// B8: projection_annotations — begin
+pub use drawings::kinds::projection_annotations::{
+    BarsPatternMode, DrawingIcon, ProjectionAnnotationToolOptions, MAX_BARS_PATTERN_BARS,
+};
+// B8: projection_annotations — end
+// B8: patterns_elliott_cycles — begin
+pub use drawings::kinds::patterns_elliott_cycles::{ElliottWaveDegree, PatternToolOptions};
+// B8: patterns_elliott_cycles — end
+// B8: shapes — begin
+pub use drawings::kinds::shapes::ShapeToolOptions;
+// B8: shapes — end
 pub use drawings::{
     Drawing, DrawingAnchor, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId,
-    DrawingKind, DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingWorkStats,
-    TextMeasureFn, DRAWING_DEFAULT_COLOR, DRAWING_WEAK_MAGNET_DISTANCE,
+    DrawingKind, DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingTextEditLayout,
+    DrawingWorkStats, TextMeasureFn, DRAWING_DEFAULT_COLOR, DRAWING_WEAK_MAGNET_DISTANCE,
 };
 pub(crate) use drawings::{
     DrawingAnchorTime, DrawingChartSettings, DrawingController, DrawingDrag, DrawingHistory,
-    DrawingRuntime,
+    DrawingRuntime, DrawingTextEdit,
 };
 pub use feature_series::{
     FeatureDataPoint, FeatureSeriesKind, FeatureSeriesOptionsPatch, FeatureValue, HeatmapCell,
@@ -101,7 +134,7 @@ pub use footprint::{
     FootprintCellMode, FootprintError, FootprintImbalanceOptions, FootprintLevel,
     FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind, FootprintVisualOptions,
     FootprintWorkStats, ReplayClockStats, ReplaySeekStats, TimeAndSalesOptions, TimeAndSalesRow,
-    TradeBubbleOptions, TradeStreamStats, TradeStudyKind, TradeStudyOptions,
+    TradeBubbleOptions, TradeSessionOptions, TradeStreamStats, TradeStudyKind, TradeStudyOptions,
     MAX_TIME_AND_SALES_ROWS, MAX_TRADE_STREAMS, MAX_TRADE_STREAM_KEY_BYTES,
 };
 pub use frame::{
@@ -173,8 +206,8 @@ pub use profiles::{
     MAX_PROFILE_DEVELOPING_POINTS, MAX_PROFILE_PERIODS, MAX_PROFILE_ROWS, MAX_TPO_PERIODS,
 };
 pub use resampling::{
-    ResampleBoundary, ResampleError, ResampleOptions, ResampledBar, MAX_RESAMPLED_SERIES,
-    MAX_RESAMPLE_BOUNDARIES,
+    resample_boundaries, ResampleBoundary, ResampleError, ResampleOptions, ResampleSpan,
+    ResampleStats, ResampledBar, MAX_RESAMPLED_SERIES, MAX_RESAMPLE_BOUNDARIES,
 };
 pub use series_update_api::{SeriesBarPatch, SeriesUpdateOutcome, SeriesUpdateRejection};
 pub use synthetic_bars::{
@@ -202,6 +235,7 @@ pub use aeris_charts_core::format::price_tick_ladder::{
     PriceTickBand, PriceTickLadder, MAX_PRICE_TICK_BANDS,
 };
 use aeris_charts_core::format::time_formatter::{MonthNames, DEFAULT_DATE_FORMAT};
+pub use aeris_charts_core::model::data_layer::TimeAlignment;
 use aeris_charts_core::model::data_layer::{
     DataLayer, DataLayerMemoryUsage, MergedTimeMapping, PointColorChannel, SeriesId, SeriesIdError,
 };
@@ -224,6 +258,9 @@ use aeris_charts_core::scale::price_scale_core::{
 pub use aeris_charts_core::scale::session_slots::{
     parse_iso_date, parse_wall_clock, session_slot_times, SessionSlotConvention, SessionSlotError,
     SessionWindow, MAX_SESSION_SLOTS, MAX_SESSION_WINDOWS,
+};
+pub use aeris_charts_core::scale::session_slots::{
+    session_window_bounds, OutOfSessionPolicy, SessionBarGrid,
 };
 use aeris_charts_core::scale::time_scale_core::{TimeScaleCore, TimeScaleOptions};
 use aeris_charts_core::scale::time_tick_marks::TimeTickMarks;
@@ -1106,6 +1143,11 @@ pub struct SeriesEntry {
     /// Rows at or after this UTC-seconds time keep their data but are not drawn. A host uses it
     /// to hand the tail of a series to another presentation (candles before a live footprint).
     pub render_before_time: Option<i64>,
+    /// Line/area/baseline runs end at each exchange trading-day boundary (default false): the
+    /// first drawn row of a trading day starts a new run with no connecting segment, fill, or
+    /// hit area from the previous day. Engine indicator outputs with period resets (VWAP, VWAP
+    /// bands, pivots) break at their reset keys without this option.
+    pub break_on_trading_day: bool,
     /// Last host sequence applied by a sequence-guarded update or merge (runtime-only, O(1)).
     /// `None` accepts any sequence; a full data install clears it.
     pub(crate) update_sequence: Option<u64>,
@@ -1201,6 +1243,7 @@ impl SeriesEntry {
             native_primitives: Vec::new(),
             max_points: None,
             render_before_time: None,
+            break_on_trading_day: false,
             update_sequence: None,
             autoscale_info_provider: None,
         }
@@ -1891,10 +1934,11 @@ pub struct ChartEngine {
     /// Chart-level drawing settings (magnet mode, price-basis label) and anchor time-identity
     /// bookkeeping; drawings.rs owns every field.
     drawing_settings: DrawingChartSettings,
-    /// The drawing whose dedicated host editor currently owns text input (drawings.rs).
-    /// Frame construction keeps committed glyphs for the transparent overlay-caret model and
-    /// keeps an empty trend label's measured middle gap while its editor is open.
-    editing_drawing: Option<DrawingId>,
+    /// The open inline text-edit session (drawings.rs): the drawing whose host editor owns
+    /// text input, with the text it began from. Frame construction keeps committed glyphs for
+    /// the transparent overlay-caret model, keeps an empty trend label's measured middle gap,
+    /// and keeps an empty family text box's caret line while it is open. Runtime only.
+    text_edit: Option<DrawingTextEdit>,
     /// The text drawing under the host's pointer (drawings.rs): the overlay frame paints its
     /// focus border at hover opacity (the public reference's hover ring). Only the text tool has hover
     /// chrome — other kinds show nothing until selected.
@@ -2055,7 +2099,7 @@ impl ChartEngine {
             drawing_sync_source: String::new(),
             drawing_sync_revision: 0,
             drawing_settings: DrawingChartSettings::default(),
-            editing_drawing: None,
+            text_edit: None,
             hovered_text: None,
             hovered_drawing: None,
             text_measure_fn: None,
@@ -2453,6 +2497,10 @@ impl ChartEngine {
             }
             self.data
                 .set_rows_count_as_data(id, kind == SeriesKind::Custom);
+            // Host-valued kinds own no engine rows to join as-of; they rejoin the union.
+            if matches!(kind, SeriesKind::Custom | SeriesKind::Feature) {
+                self.rejoin_time_union(id);
+            }
             self.clear_sequence_axis_if_unused();
             self.invalidate_frame_scene();
         }
@@ -3117,6 +3165,8 @@ impl ChartEngine {
         }
         let generation = self.data.series_generation(id)?;
         let (_, columns) = self.data.series_data(id)?;
+        // `row` is a plot row; the projection is over canonical rows (they differ as-of).
+        let row = self.data.plot(id).source_row(row);
         series
             .heikin_ashi_cache
             .borrow_mut()
@@ -3275,6 +3325,8 @@ impl ChartEngine {
 
     pub fn set_series_markers(&mut self, id: SeriesId, markers: Vec<Marker>) {
         self.invalidate_frame_series(id);
+        // A trade-bubble fold writing this series must refold on its next refresh.
+        self.invalidate_trade_bubble_folds(id, None);
         if let Some(series) = self.series_entry_mut(id) {
             series.markers = markers;
         }
@@ -3683,28 +3735,27 @@ impl ChartEngine {
         self.install_series_data_inner(id, times, open, high, low, close)
     }
 
+    /// `key_base` is the row key of the first bar: the trade stream's retained key base, so a
+    /// footprint installed after retention trims stays aligned with the stream's other rows.
     pub(crate) fn install_footprint_sequence_projection(
         &mut self,
         id: SeriesId,
-        points: Vec<BarSequencePoint>,
-        open: Vec<f64>,
-        high: Vec<f64>,
-        low: Vec<f64>,
-        close: Vec<f64>,
+        key_base: i64,
+        projection: SequenceProjectionColumns,
     ) -> bool {
         debug_assert!(self.is_footprint_series(id));
-        self.install_sequence_projection_inner(id, points, open, high, low, close)
+        self.install_sequence_projection_inner(id, Some(key_base), projection)
     }
 
+    /// Install a complete sequence-axis projection keyed contiguously from `key_base`, or, when
+    /// `None`, from the series' own first key while the sequence axis is live (zero otherwise).
     fn install_sequence_projection_inner(
         &mut self,
         id: SeriesId,
-        mut points: Vec<BarSequencePoint>,
-        open: Vec<f64>,
-        high: Vec<f64>,
-        low: Vec<f64>,
-        close: Vec<f64>,
+        key_base: Option<i64>,
+        projection: SequenceProjectionColumns,
     ) -> bool {
+        let (mut points, open, high, low, close) = projection;
         if points.len() != open.len()
             || points.len() != high.len()
             || points.len() != low.len()
@@ -3714,14 +3765,16 @@ impl ChartEngine {
         }
         // Keep the row-key base across reinstalls so studies and markers written against the
         // current sequence axis stay aligned (retention trims drop keys without re-keying).
-        let key_base = if self.sequence_points.is_some() {
-            self.data
-                .series_data(id)
-                .and_then(|(times, _)| times.first().copied())
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let key_base = key_base.unwrap_or_else(|| {
+            if self.sequence_points.is_some() {
+                self.data
+                    .series_data(id)
+                    .and_then(|(times, _)| times.first().copied())
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        });
         let times = (0..points.len())
             .map(|index| key_base + index as i64)
             .collect::<Vec<_>>();
@@ -3770,19 +3823,18 @@ impl ChartEngine {
         installed
     }
 
+    /// `key_base` is the row key of the first bar, as in
+    /// [`Self::install_footprint_sequence_projection`].
     pub(crate) fn install_trade_bar_sequence_projection(
         &mut self,
         id: SeriesId,
-        points: Vec<BarSequencePoint>,
-        open: Vec<f64>,
-        high: Vec<f64>,
-        low: Vec<f64>,
-        close: Vec<f64>,
+        key_base: i64,
+        projection: SequenceProjectionColumns,
     ) -> bool {
         debug_assert!(self.series_entry(id).is_some_and(|series| {
             matches!(series.kind, SeriesKind::Candlestick | SeriesKind::Bar)
         }));
-        self.install_sequence_projection_inner(id, points, open, high, low, close)
+        self.install_sequence_projection_inner(id, Some(key_base), projection)
     }
 
     pub(crate) fn sequence_points(&self) -> Option<&[BarSequencePoint]> {
@@ -3793,7 +3845,10 @@ impl ChartEngine {
         &self,
         drawing: &Drawing,
     ) -> Vec<Option<DrawingAnchorTime>> {
-        let Some(points) = self.sequence_points() else {
+        let Some(points) = self
+            .sequence_points()
+            .filter(|_| !drawing.kind.pane_anchored())
+        else {
             return Vec::new();
         };
         drawing
@@ -3998,6 +4053,12 @@ impl ChartEngine {
     /// floor right after a trim is `max_points - margin`. Amortized cost per appended point is
     /// constant.
     ///
+    /// **Replay.** Under a replay clock the ceiling counts and evicts only the rows up to the
+    /// clock, so the chart holds what a clean load to that clock with the same cap would hold,
+    /// and a seek that reveals rows trims them the same way. Rows ingested past the clock are the
+    /// replay's pending source truth: they are retained, uncounted, until the clock reveals them
+    /// (hidden rows never push out visible ones).
+    ///
     /// An unknown or removed id is ignored.
     pub fn set_series_max_points(&mut self, id: SeriesId, max_points: Option<usize>) -> bool {
         if self.is_series_removed(id) {
@@ -4028,7 +4089,9 @@ impl ChartEngine {
 
     /// Evict oldest rows if the series is over its ceiling. Returns whether anything was dropped,
     /// so callers can skip the follow-up scale/indicator sync in the overwhelmingly common case
-    /// where nothing needed evicting.
+    /// where nothing needed evicting. The ceiling counts the rows the series exposes (up to the
+    /// replay clock) and, except for a footprint projection, evicts only from their front; rows
+    /// past the clock stay.
     fn enforce_series_cap(&mut self, id: SeriesId) -> bool {
         let Some(max_points) = self
             .series
@@ -4038,16 +4101,28 @@ impl ChartEngine {
         else {
             return false;
         };
-        let rows = self
+        let visible = self
             .data
             .series_data(id)
             .map_or(0, |(times, _)| times.len());
-        if rows <= max_points {
+        if visible <= max_points {
             return false;
         }
-        let keep = self.rows_retained_after_cap(id, rows);
-        self.data.trim_front(id, keep);
-        self.trim_feature_rows_front(id, keep);
+        let keep = self.rows_retained_after_cap(id, visible);
+        // A footprint projection is rebuilt from its stream with the ceiling applied to every bar
+        // it projects, so its trim keeps that many rows in all, as that rebuild does. Any other
+        // series keeps its rows past the clock and evicts only from the front of the rows up to
+        // it; the data layer and the feature sidecar hold every canonical row.
+        let footprint = self
+            .series_entry(id)
+            .is_some_and(|series| series.footprint.is_some());
+        let hidden = if footprint {
+            0
+        } else {
+            self.data.series_rows(id).unwrap_or(visible) - visible
+        };
+        self.data.trim_front(id, keep + hidden);
+        self.trim_feature_rows_front(id, keep + hidden);
         self.trim_footprint_rows_front(id, keep);
         true
     }
@@ -4910,6 +4985,11 @@ impl ChartEngine {
             self.data.time_points_generation() != self.synced_time_points_generation;
         if sequence_changed {
             self.invalidate_frame_scene();
+        }
+        // As-of overlays whose points moved with another series' data (a new bar or a moved data
+        // extent) repaint without a time-point change of their own.
+        for id in self.data.take_realigned() {
+            self.invalidate_frame_series(id);
         }
         // Viewport compensation is decided against the scale state before the new points land
         // (viewport.rs), through the same exact mappings the drawings rebase with below.

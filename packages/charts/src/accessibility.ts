@@ -557,8 +557,13 @@ class PaneAccessibility {
     const chart = this.controller.chart as chart_api & {
       nudge_selected_drawing(dx: number, dy: number, handle: number | null): boolean;
       drawing_handle_count(id: number): number;
+      edit_drawing_text(id: number): boolean;
     };
-    if (event.key === "Enter") {
+    if (event.key === "F2") {
+      // Edit the drawing's own text in the chart's inline editor, which announces itself and
+      // returns focus here when it closes.
+      if (!chart.edit_drawing_text(drawing.id)) return false;
+    } else if (event.key === "Enter") {
       this.drawing_editing = !this.drawing_editing;
       this.drawing_anchor = -1;
       this.drawing_nudge_count = 0;
@@ -578,8 +583,9 @@ class PaneAccessibility {
       drawing.remove();
       this.writer.write(`${kind} removed.`);
     } else if (event.key === "Tab" && this.drawing_editing) {
-      // Cycle the engine's editable handles (every anchor, a rectangle's eight bounds handles, or
-      // a position's target/entry/width/stop controls), not the raw anchor list.
+      // Cycle the engine's editable handles (every anchor, a rectangle's eight bounds handles, a
+      // position's target/entry/width/stop controls, or a family's derived handles), not the raw
+      // anchor list.
       const count = chart.drawing_handle_count(drawing.id);
       if (count === 0) return false;
       this.drawing_anchor = event.shiftKey
@@ -591,9 +597,16 @@ class PaneAccessibility {
       const [dx, dy] = event.key === "ArrowLeft" ? [-step, 0]
         : event.key === "ArrowRight" ? [step, 0]
           : event.key === "ArrowUp" ? [0, -step] : [0, step];
-      if (!chart.nudge_selected_drawing(dx, dy, this.drawing_anchor < 0 ? null : this.drawing_anchor)) return false;
-      this.drawing_nudge_count += 1;
-      this.writer.write(`Drawing moved ${step} CSS pixel${step === 1 ? "" : "s"}.`);
+      // Escape undoes one step per counted nudge, so only a nudge that recorded an undoable
+      // change counts. A refused one (locked, clamped at the pane edge, or along an axis the
+      // drawing cannot move) still consumes the key so it never falls through to series
+      // navigation while editing.
+      if (chart.nudge_selected_drawing(dx, dy, this.drawing_anchor < 0 ? null : this.drawing_anchor)) {
+        this.drawing_nudge_count += 1;
+        this.writer.write(`Drawing moved ${step} CSS pixel${step === 1 ? "" : "s"}.`);
+      } else {
+        this.writer.write("Drawing did not move.");
+      }
     } else {
       return false;
     }
@@ -1405,7 +1418,8 @@ class AccessibilityController implements accessibility_handle {
     }
     const selector = "a[href],button,input,select,textarea,iframe,[tabindex],[contenteditable=true],audio[controls],video[controls]";
     for (const element of this.host.querySelectorAll<HTMLElement>(selector)) {
-      if (element.closest(".aeris_charts-a11y-layer") !== null) continue;
+      // The layer's own targets and the chart's inline text editor are the accessible controls.
+      if (element.closest(".aeris_charts-a11y-layer, .aeris_charts-text-editor") !== null) continue;
       if (this.neutralised.has(element)) continue;
       const previous_hidden = element instanceof HTMLCanvasElement
         ? this.hidden_canvases.get(element) ?? null

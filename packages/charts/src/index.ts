@@ -32,6 +32,7 @@ export * from "./grid.js";
 import { chart_impl } from "./impl.js";
 import { ensure_init } from "./impl.js";
 export { session_slot_times } from "./impl.js";
+export { resample_boundaries } from "./impl.js";
 import { enable_accessibility } from "./accessibility.js";
 import type { accessibility_options } from "./accessibility.js";
 import { default_theme_name, theme_options, theme_palette, type theme_name } from "./theme.js";

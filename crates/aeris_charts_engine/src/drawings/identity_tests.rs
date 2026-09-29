@@ -367,6 +367,109 @@ fn px(chart: &ChartEngine, id: DrawingId, index: usize) -> (f64, f64) {
     chart.drawing_point_to_coordinate(id, index).unwrap()
 }
 
+/// Apply `sender`'s full sync payload to `receiver`; true when the receiver accepted it.
+fn sync(sender: &ChartEngine, receiver: &mut ChartEngine) -> bool {
+    receiver.apply_drawing_sync_payload_json(&sender.drawing_sync_payload_json("cell-a").unwrap())
+}
+
+/// The receiver shows `id` where the sender does (time resolution may differ in the last ulp).
+fn assert_synced(sender: &ChartEngine, receiver: &ChartEngine, id: DrawingId) {
+    for (index, (a, b)) in logicals(sender, id)
+        .into_iter()
+        .zip(logicals(receiver, id))
+        .enumerate()
+    {
+        assert_close(b, a, &format!("synced logical {index}"));
+    }
+    for (index, (a, b)) in prices(sender, id)
+        .into_iter()
+        .zip(prices(receiver, id))
+        .enumerate()
+    {
+        assert_close(b, a, &format!("synced price {index}"));
+    }
+}
+
+#[test]
+fn interactive_placement_and_drag_commits_reach_already_synced_cells() {
+    let mut a = settled();
+    let mut b = settled();
+    let line = trend(&mut a, point(2.0, 101.0), point(7.0, 103.0));
+    assert!(sync(&a, &mut b), "the first payload syncs");
+
+    // Click placement of a family tool.
+    assert!(a.drawing_create_begin(DrawingKind::FibRetracement, None));
+    let (x0, y0) = (x_at(&a, 1.0), y_at(&a, 102.0));
+    let (x1, y1) = (x_at(&a, 5.0), y_at(&a, 105.0));
+    assert_eq!(a.drawing_create_click(x0, y0, NO_KEYS), -1);
+    assert!(a.drawing_create_click(x1, y1, NO_KEYS) > 0);
+    assert_eq!(a.drawings().len(), 2);
+    assert!(
+        sync(&a, &mut b),
+        "a click-placed drawing advances the sync revision"
+    );
+    assert_eq!(b.drawings().len(), 2);
+
+    // A freehand stroke.
+    assert!(a.brush_create_start(None, x0, y0));
+    assert!(a.brush_create_add(x0 + 20.0, y0 + 10.0));
+    assert!(a.brush_create_add(x0 + 40.0, y0 - 10.0));
+    assert!(a.brush_create_end() > 0);
+    assert!(
+        sync(&a, &mut b),
+        "a committed stroke advances the sync revision"
+    );
+    assert_eq!(b.drawings().len(), 3);
+
+    // A pointer drag of the trend line's first anchor.
+    a.set_selected_drawing(Some(line));
+    let revision = a.drawing(line).unwrap().revision;
+    let (x, y) = px(&a, line, 0);
+    assert!(a.drawing_drag_start_at(x, y));
+    a.drawing_drag_to(x + 40.0, y + 30.0, NO_KEYS);
+    a.drawing_drag_end();
+    assert!(
+        a.drawing(line).unwrap().revision > revision,
+        "a committed drag advances the drawing's own revision"
+    );
+    assert!(
+        sync(&a, &mut b),
+        "a committed drag advances the sync revision"
+    );
+    assert_synced(&a, &b, line);
+    // Undo restores the pre-drag revision along with the geometry.
+    assert!(a.undo_drawing());
+    assert_eq!(a.drawing(line).unwrap().revision, revision);
+    assert!(a.redo_drawing());
+    assert!(sync(&a, &mut b));
+
+    // A keyboard nudge.
+    let before = a.drawing(line).unwrap().points.clone();
+    assert!(a.nudge_selected_drawing(0.0, -5.0, None));
+    assert_ne!(a.drawing(line).unwrap().points, before);
+    assert!(
+        sync(&a, &mut b),
+        "a keyboard nudge advances the sync revision"
+    );
+    assert_synced(&a, &b, line);
+
+    // A drag that ends where it started and a cancelled drag commit nothing.
+    let settled_revision = a.drawing_sync_revision;
+    let drawing_revision = a.drawing(line).unwrap().revision;
+    let (x, y) = px(&a, line, 0);
+    assert!(a.drawing_drag_start_at(x, y));
+    a.drawing_drag_end();
+    assert!(a.drawing_drag_start_at(x, y));
+    a.drawing_drag_to(x + 40.0, y + 30.0, NO_KEYS);
+    a.drawing_drag_cancel();
+    assert_eq!(a.drawing_sync_revision, settled_revision);
+    assert_eq!(a.drawing(line).unwrap().revision, drawing_revision);
+    assert!(
+        !sync(&a, &mut b),
+        "an unchanged payload is still a stale echo"
+    );
+}
+
 #[test]
 fn keyboard_nudge_moves_rectangle_and_position_handles_by_the_delta() {
     let mut chart = settled();
@@ -428,6 +531,49 @@ fn keyboard_nudge_moves_rectangle_and_position_handles_by_the_delta() {
     // Locked drawings stay put.
     assert!(chart.set_drawing_locked(position, true));
     assert!(!chart.nudge_selected_drawing(0.0, 1.0, None));
+}
+
+#[test]
+fn keyboard_nudges_that_move_nothing_report_false_and_record_nothing() {
+    let mut chart = settled();
+    let recolored = trend(&mut chart, point(1.0, 101.0), point(4.0, 103.0));
+    assert!(chart.drawing_apply_options(recolored, r##"{"color":"#00ff00"}"##));
+    let recolor = chart.drawing(recolored).unwrap().clone();
+    // A time-only kind nudged vertically, a regression (time-only body) nudged vertically, and a
+    // pane-anchored text clamped at the pane's left edge.
+    let cases = [
+        (
+            DrawingKind::VerticalLine,
+            vec![point(5.0, 101.0)],
+            (0.0, -1.0),
+        ),
+        (
+            DrawingKind::RegressionTrend,
+            vec![point(2.0, 101.0), point(8.0, 104.0)],
+            (0.0, -1.0),
+        ),
+        (
+            DrawingKind::AnchoredText,
+            vec![point(0.0, 0.5)],
+            (-1.0, 0.0),
+        ),
+    ];
+    for (kind, points, (dx, dy)) in cases {
+        let id = chart.add_drawing(kind, 0, points, None).unwrap();
+        chart.set_selected_drawing(Some(id));
+        let before = chart.drawing(id).unwrap().clone();
+        let undo_depth = chart.drawing_history.undo.len();
+        let sync_revision = chart.drawing_sync_revision;
+        assert!(!chart.nudge_selected_drawing(dx, dy, None), "{kind:?}");
+        assert!(!chart.drawing_drag_active());
+        assert_eq!(chart.drawing(id).unwrap(), &before, "{kind:?}");
+        assert_eq!(chart.drawing_history.undo.len(), undo_depth, "{kind:?}");
+        assert_eq!(chart.drawing_sync_revision, sync_revision, "{kind:?}");
+    }
+    // The newest undo step is still the last creation, and the earlier recolor survives it.
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawings().len(), 3);
+    assert_eq!(chart.drawing(recolored).unwrap(), &recolor);
 }
 
 #[test]

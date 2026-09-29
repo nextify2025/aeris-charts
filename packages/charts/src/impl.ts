@@ -4,7 +4,9 @@
  */
 
 // @ts-ignore -- pkg is a build artifact, present after build:wasm
-import init, { AerisChart, session_slot_times as wasm_session_slot_times } from "../pkg/aeris_charts_wasm.js";
+import init, {
+  AerisChart, resample_boundaries as wasm_resample_boundaries, session_slot_times as wasm_session_slot_times,
+} from "../pkg/aeris_charts_wasm.js";
 
 import { install_gestures } from "./gestures.js";
 import type { pane_primitive, pane_primitive_handle, series_primitive, series_primitive_handle } from "./primitives.js";
@@ -51,7 +53,9 @@ import type {
   visible_logical_range_handler, visible_time_range_handler,
   volume_profile_indicator_api, volume_profile_indicator_options, volume_profile_indicator_snapshot,
   time_label_context, time_zone,
-  histogram_updown_rule, kdj_parameters, session_slot_options, time_tick_mark,
+  histogram_updown_rule, kdj_parameters, session_slot_options, time_tick_mark, time_alignment,
+  resample_boundary, resample_boundary_options, resample_series_options, resample_stats, resampled_bar,
+  trade_session_options, business_day,
 } from "./types.js";
 import {
   DRAWING_KIND_TO_U8, FEATURE_KIND_TO_U8, KIND_TO_U8, LINE_STYLE_TO_U8, LINE_TYPE_TO_U8,
@@ -69,18 +73,11 @@ import {
 
 let init_promise: Promise<unknown> | null = null;
 
-const DRAWING_KIND_FROM_U8: readonly drawing_kind[] = [
-  "trend_line",
-  "horizontal_line",
-  "horizontal_ray",
-  "vertical_line",
-  "rectangle",
-  "text",
-  "brush",
-  "path",
-  "long_position",
-  "short_position",
-];
+// Wire ids are sparse (reserved per drawing family), so the reverse map derives from the single
+// DRAWING_KIND_TO_U8 list instead of an index-ordered array.
+const DRAWING_KIND_FROM_U8: ReadonlyMap<number, drawing_kind> = new Map(
+  (Object.entries(DRAWING_KIND_TO_U8) as [drawing_kind, number][]).map(([kind, wire]) => [wire, kind]),
+);
 
 type persistence_error_result = {
   ok: false;
@@ -156,6 +153,53 @@ export function session_slot_times(options: session_slot_options): number[] {
   }
 }
 
+function trading_date_text(date: string | business_day): string {
+  return typeof date === "string"
+    ? date
+    : date !== null && typeof date === "object"
+      ? `${String(date.year).padStart(4, "0")}-${String(date.month).padStart(2, "0")}-${String(date.day).padStart(2, "0")}`
+      : "";
+}
+
+/**
+ * Resampling boundaries for the host's trading dates: each date's exchange-local session windows
+ * placed in the exchange time zone (offset in force on that date, so DST is respected), one
+ * boundary per window (`span: "window"`, intraday bars restart at every window open) or per date
+ * (`span: "day"`, daily bars). Dates without data produce no bars, so a live host may include the
+ * dates it is about to stream. Needs the engine module, like {@link session_slot_times}. Invalid
+ * input throws `invalid_options`.
+ */
+export function resample_boundaries(options: resample_boundary_options): resample_boundary[] {
+  if (!wasm_ready) {
+    throw new AerisChartsError(
+      "unsupported_operation",
+      "resample_boundaries needs the engine: await init_wasm() or create_chart() first",
+    );
+  }
+  const request = JSON.stringify({
+    dates: Array.from(options.dates ?? [], trading_date_text),
+    windows: options.windows,
+    time_zone: resolve_time_zone(options.time_zone ?? "UTC"),
+    session_start: options.session_start ?? 0,
+    span: options.span ?? "window",
+  });
+  let flat: Float64Array;
+  try {
+    flat = wasm_resample_boundaries(request);
+  } catch (error) {
+    throw new AerisChartsError("invalid_options", `invalid resample sessions: ${String(error)}`);
+  }
+  const boundaries: resample_boundary[] = [];
+  for (let offset = 0; offset + 2 < flat.length; offset += 3) {
+    boundaries.push({
+      start_time: flat[offset] ?? 0,
+      end_time: flat[offset + 1] ?? 0,
+      session_id: flat[offset + 2] ?? 0,
+    });
+  }
+  return boundaries;
+}
+
 /**
  * Convert public explicit time-axis marks to the engine form (UTC seconds). The engine validates
  * order, count, and label length. `null` restores automatic ticks.
@@ -177,6 +221,61 @@ export function normalize_time_tick_marks(marks: unknown): engine_time_tick_mark
 
 /** Accepted `histogram_updown_rule` values. */
 const HISTOGRAM_UPDOWN_RULES: readonly histogram_updown_rule[] = ["open_close", "previous_close"];
+
+/** Accepted `time_alignment` values. */
+const TIME_ALIGNMENTS: readonly time_alignment[] = ["union", "as_of"];
+
+/**
+ * The pure value checks of `time_alignment` / `as_of_max_staleness`, run before anything touches
+ * the engine: the enum, a non-negative whole number of seconds (or null), and no staleness bound
+ * on a union series. `current` is the series' alignment when the call omits `time_alignment`
+ * (`"union"` for a series about to be created). Throws `invalid_options`.
+ */
+export function validate_series_time_alignment(
+  options: Partial<Pick<series_options, "time_alignment" | "as_of_max_staleness">>,
+  current: time_alignment = "union",
+): void {
+  const { time_alignment, as_of_max_staleness } = options;
+  if (time_alignment !== undefined && !TIME_ALIGNMENTS.includes(time_alignment)) {
+    throw new AerisChartsError("invalid_options", `time_alignment must be "union" or "as_of"`);
+  }
+  if (as_of_max_staleness !== undefined && as_of_max_staleness !== null
+    && !(Number.isSafeInteger(as_of_max_staleness) && as_of_max_staleness >= 0)) {
+    throw new AerisChartsError(
+      "invalid_options",
+      "as_of_max_staleness must be a non-negative whole number of seconds or null",
+    );
+  }
+  if ((time_alignment ?? current) === "union" && as_of_max_staleness !== undefined && as_of_max_staleness !== null) {
+    throw new AerisChartsError("invalid_options", `as_of_max_staleness requires time_alignment "as_of"`);
+  }
+}
+
+/**
+ * Validate and apply `time_alignment` / `as_of_max_staleness` (shared by main-thread and worker
+ * charts). An omitted key keeps the current value, except that switching to `"union"` clears the
+ * staleness bound. Throws `invalid_options` for a bad value (before touching the series) and the
+ * engine's `unsupported_operation` for a series without an own calendar. Returns whether the
+ * alignment or staleness changed; a request equal to the current values is a no-op.
+ */
+export function apply_series_time_alignment(
+  wasm: AerisChart,
+  id: number,
+  options: Partial<Pick<series_options, "time_alignment" | "as_of_max_staleness">>,
+): boolean {
+  const { time_alignment, as_of_max_staleness } = options;
+  if (time_alignment === undefined && as_of_max_staleness === undefined) return false;
+  const current = JSON.parse(wasm.series_options_json(id)) as Partial<series_options>;
+  const current_alignment = current.time_alignment ?? "union";
+  validate_series_time_alignment(options, current_alignment);
+  const alignment = time_alignment ?? current_alignment;
+  const staleness = as_of_max_staleness !== undefined
+    ? as_of_max_staleness
+    : alignment === "as_of" ? current.as_of_max_staleness ?? null : null;
+  if (alignment === current_alignment && staleness === (current.as_of_max_staleness ?? null)) return false;
+  assert_trading_result(wasm.set_series_time_alignment(id, alignment === "as_of", staleness ?? undefined));
+  return true;
+}
 
 function undef_to_null<T>(v: T | undefined): T | null {
   return v === undefined ? null : v;
@@ -248,6 +347,7 @@ const SERIES_JSON_OPTION_KEYS = [
   "bottom_line_style",
   "base",
   "invert_filled_area",
+  "break_on_trading_day",
   "open_visible",
   "close_visible",
   "thin_bars",
@@ -1898,9 +1998,15 @@ class series_impl implements series_api {
       return;
     }
     if (Number.isNaN(sequence)) {
-      this.chart.wasm.update_series_bar_styled(
-        this.id, time, o, h, l, c, body, wick, border,
-      );
+      // The values passed the boundary check above, so an engine rejection means the series is
+      // engine-derived (footprint, synthetic, or resampled bars) and changes only via its source.
+      if (!this.chart.wasm.update_series_bar_styled(this.id, time, o, h, l, c, body, wick, border)) {
+        this.last_ingestion = rejected_ingestion(
+          `series ${this.id} is derived by the engine; write to its source instead`,
+        );
+        this.warn_rejected("update");
+        return;
+      }
     } else {
       const json = this.chart.wasm.update_series_bar_sequenced(
         this.id, time, o, h, l, c, body, wick, border, sequence,
@@ -2106,6 +2212,12 @@ class series_impl implements series_api {
     const rule = (options as Partial<series_options>).histogram_updown_rule;
     if (rule !== undefined && !HISTOGRAM_UPDOWN_RULES.includes(rule)) {
       throw new AerisChartsError("invalid_options", `histogram_updown_rule must be "open_close" or "previous_close"`);
+    }
+    // First, so a rejected alignment leaves every other option of the call unapplied. A changed
+    // alignment may change the chart's time points, which is a full-range change for handlers;
+    // re-applying the current alignment (a React re-render) notifies nothing.
+    if (apply_series_time_alignment(this.chart.wasm, this.id, options)) {
+      for (const handler of this.data_changed_subs) handler("full");
     }
     if (options.max_points !== undefined) {
       // 0 (and anything below 1) clears the cap back to unbounded, matching the option's docs.
@@ -3826,6 +3938,22 @@ class series_primitive_handle_impl implements series_primitive_handle {
   }
 }
 
+/**
+ * Where the engine paints a family text box's own text (`drawing_text_edit_layout_json`), in
+ * overlay CSS px: lines left-aligned at `x`, line `i` centered at `y + i * line_height`.
+ */
+interface text_edit_layout {
+  x: number;
+  y: number;
+  line_height: number;
+  size: number;
+  font_family: string;
+  weight: number;
+  italic: boolean;
+  color: string;
+  rect: [number, number, number, number];
+}
+
 /** One registered canvas primitive (Phase C-e) in the package-side registry. */
 interface canvas_primitive_entry {
   primitive: canvas_primitive;
@@ -4225,12 +4353,16 @@ export class chart_impl implements chart_api {
   private tool_listener: ((tool: drawing_kind | null) => void) | null = null;
   private readonly tool_change_subs = new Set<drawing_tool_change_handler>();
   private readonly drawing_created_subs = new Set<drawing_created_handler>();
-  /** Borderless caret surface shared by two explicitly separate product edit modes. */
+  /** Borderless caret surface shared by the explicitly separate product edit modes. */
   private text_editor: HTMLElement | null = null;
   private text_editor_id = 0;
   /** Snapshot of the drawing's text when the editor opened — restored on Escape. */
   private text_editor_original = "";
-  private text_editor_mode: "standalone_text" | "trend_label" | null = null;
+  private text_editor_mode: "standalone_text" | "trend_label" | "part_label" | null = null;
+  /** The edited drawing's kind in words, for accessibility announcements. */
+  private text_editor_label = "";
+  /** The element focused when the editor opened (an accessibility target regains focus). */
+  private text_editor_return_focus: Element | null = null;
   /**
    * The drawing selection snapshotted at pointer-DOWN, before the engine's drag grab selects
    * the hit (gestures.ts calls `note_drawing_press`). `emit_click` reads it for the public reference's
@@ -5431,6 +5563,59 @@ export class chart_impl implements chart_api {
     this.repaint();
   }
 
+  set_trade_stream_sessions(stream_id: number, sessions: trade_session_options | null): void {
+    const request = sessions === null
+      ? null
+      : { windows: sessions.windows, outside: sessions.outside ?? "fold" };
+    const result = this.wasm.set_trade_stream_sessions(stream_id, JSON.stringify(request));
+    if (result !== "") throw new AerisChartsError("invalid_options", result);
+    this.sync_countdown_timer();
+    this.repaint();
+  }
+
+  add_trade_volume_series(stream_id: number, pane = 1): series_api {
+    const id = this.wasm.add_trade_volume_series(stream_id, pane);
+    if (id === 0xffffffff) {
+      throw new AerisChartsError("invalid_options", "trade volume series options were rejected by the engine");
+    }
+    const series = new series_impl(id, "histogram", this);
+    this.series_by_id.set(id, series);
+    this.emit_series_change(this.series_added_subs, series, this.pane_of_series(id));
+    this.repaint();
+    return series;
+  }
+
+  configure_resampled_series(target: series_api | number, options: resample_series_options): void {
+    const id_of = (series: series_api | number | undefined) =>
+      series === undefined ? undefined : typeof series === "number" ? series : series.id;
+    const request = JSON.stringify({
+      source: id_of(options.source),
+      volume_source: id_of(options.volume_source),
+      volume_target: id_of(options.volume_target),
+      interval_seconds: options.interval_seconds,
+      boundaries: Array.from(options.boundaries ?? [], (boundary) => ({
+        start_time: boundary.start_time,
+        end_time: boundary.end_time,
+        session_id: boundary.session_id,
+      })),
+    });
+    const target_id = typeof target === "number" ? target : target.id;
+    const result = this.wasm.configure_resampled_series(target_id, request);
+    if (result !== "") throw new AerisChartsError("invalid_options", result);
+    this.sync_countdown_timer();
+    this.repaint();
+  }
+
+  resampled_bars(target: series_api | number): readonly resampled_bar[] | null {
+    const id = typeof target === "number" ? target : target.id;
+    return JSON.parse(this.wasm.resampled_bars_json(id)) as resampled_bar[] | null;
+  }
+
+  resample_stats(target: series_api | number): resample_stats | null {
+    const id = typeof target === "number" ? target : target.id;
+    return JSON.parse(this.wasm.resample_stats_json(id)) as resample_stats | null;
+  }
+
   add_series(
     kind: "footprint",
     options?: Partial<any_series_options> & Partial<footprint_series_options>,
@@ -5521,10 +5706,21 @@ export class chart_impl implements chart_api {
       this.emit_series_change(this.series_added_subs, series, this.pane_of_series(id));
       return series;
     }
+    // Option values that need no engine state are checked before the series exists, so a bad
+    // value creates or adopts nothing.
+    if (options) {
+      const rule = (options as Partial<series_options>).histogram_updown_rule;
+      if (rule !== undefined && !HISTOGRAM_UPDOWN_RULES.includes(rule)) {
+        throw new AerisChartsError("invalid_options", `histogram_updown_rule must be "open_close" or "previous_close"`);
+      }
+      validate_series_time_alignment(options as Partial<series_options>);
+    }
     // Series 0 is created by the engine at construction; the first add_series adopts it so the
     // common "one chart, one series" path matches reference (add_series returns the primary series).
+    const adopted = !this.next_extra_series;
+    const adopted_kind = adopted ? this.wasm.series_kind(0) : undefined;
     let id: number;
-    if (!this.next_extra_series) {
+    if (adopted) {
       this.next_extra_series = true;
       this.wasm.set_series_type(KIND_TO_U8[kind]);
       id = 0;
@@ -5534,7 +5730,21 @@ export class chart_impl implements chart_api {
     const series = new series_impl(id, kind, this);
     this.series_by_id.set(id, series);
     if (options) {
-      series.apply_options(options as Partial<any_series_options>);
+      try {
+        series.apply_options(options as Partial<any_series_options>);
+      } catch (error) {
+        // An engine refusal (an as-of alignment on a non-time axis) leaves no series behind:
+        // the caller never receives this handle.
+        this.series_by_id.delete(id);
+        series.mark_removed();
+        if (adopted) {
+          this.next_extra_series = false;
+          if (adopted_kind !== undefined) this.wasm.set_series_type(adopted_kind);
+        } else {
+          this.wasm.remove_series_tracked(id);
+        }
+        throw error;
+      }
     }
     this.emit_series_change(this.series_added_subs, series, this.pane_of_series(id));
     return series;
@@ -6300,12 +6510,25 @@ export class chart_impl implements chart_api {
     for (const h of this.click_subs) h(params);
   }
 
-  /** Let an explicitly hit Aeris drawing consume the second click without a pane click event. */
+  /**
+   * Let an explicitly hit Aeris drawing consume the second click without a pane click event: the
+   * text tool and trend labels re-run their click activation, and any other drawing whose text
+   * the engine edits in place (a family text box) opens the inline editor.
+   */
   activate_drawing_double_click(x: number, y: number): void {
     const selected = this.selected_drawing();
     if (selected === null || selected.id !== this.text_press_selected) return;
-    if (selected.kind() !== "text" && selected.kind() !== "trend_line") return;
-    this.apply_primary_click(x, y);
+    if (selected.kind() === "text" || selected.kind() === "trend_line") {
+      this.apply_primary_click(x, y);
+    } else {
+      this.edit_drawing_text(selected.id);
+    }
+  }
+
+  /** Enter or F2 on the chart: edit the selected drawing's text in place, when it has one. */
+  edit_selected_drawing_text(): boolean {
+    const id = this.wasm.selected_drawing();
+    return id !== undefined && this.edit_drawing_text(id);
   }
 
   /** Emit engine-resolved context without running primary-click selection or activation paths. */
@@ -6440,9 +6663,7 @@ export class chart_impl implements chart_api {
   }
 
   copy_drawings(ids: readonly number[] = []): string {
-    const payload = this.wasm.copy_drawings_json(JSON.stringify(ids));
-    if (payload === "") throw new AerisChartsError("invalid_data", "no drawings could be copied");
-    return payload;
+    return parse_engine_result<{ payload: string }>(this.wasm.copy_drawings_json(JSON.stringify(ids))).payload;
   }
 
   paste_drawings(payload: string, pane_index = 0, logical_offset = 0, price_offset = 0): drawing_api[] {
@@ -6628,7 +6849,7 @@ export class chart_impl implements chart_api {
 
   active_drawing_tool(): drawing_kind | null {
     const wire = Number(this.wasm.active_drawing_tool());
-    return wire >= 0 ? (DRAWING_KIND_FROM_U8[wire] ?? null) : null;
+    return wire >= 0 ? (DRAWING_KIND_FROM_U8.get(wire) ?? null) : null;
   }
 
   set_drawing_tool_listener(listener: ((tool: drawing_kind | null) => void) | null): void {
@@ -6752,8 +6973,10 @@ export class chart_impl implements chart_api {
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Inline drawing editors. Standalone text and trend labels share only the low-level caret
-  // surface; each enters with an explicit product mode and owns a different empty lifecycle.
+  // Inline drawing editors. Standalone text, trend labels, and family text boxes (a note, callout,
+  // comment, ...) share the borderless caret surface and the engine's text-edit session: live
+  // text repaints without history, commit records one undo step, and cancel restores the
+  // pre-edit text. Each mode enters explicitly and owns its layout source and empty lifecycle.
   // ---------------------------------------------------------------------------------------------
 
   /**
@@ -6771,6 +6994,182 @@ export class chart_impl implements chart_api {
     this.open_inline_editor(drawing, "trend_label");
   }
 
+  /**
+   * Open the inline editor on a drawing's own text (Enter or F2 on a selected drawing, or a
+   * double-click on it): the text tool's typing mode, a trend line's label, or a family text box,
+   * whichever the engine reports editable. Returns whether an editor opened.
+   */
+  edit_drawing_text(id: number): boolean {
+    if (!this.wasm.drawing_text_editable(id)) return false;
+    const info = (JSON.parse(this.wasm.drawings_json()) as drawing_info[]).find((d) => d.id === id);
+    if (info === undefined) return false;
+    const drawing = new drawing_impl(this, info.id, info.kind, info.pane_index);
+    if (info.kind === "text") this.open_inline_editor(drawing, "standalone_text");
+    else if (info.kind === "trend_line") this.open_inline_editor(drawing, "trend_label");
+    else this.open_part_label_editor(drawing);
+    return this.text_editor !== null && this.text_editor_id === id;
+  }
+
+  /**
+   * The caret surface every editor mode shares: a borderless wrap holding a fully transparent
+   * editable run (glyphs, IME composition, and browser selection all invisible, so the engine's
+   * canvas label stays the only ink) and one explicit caret in the label's ink. Single-line text
+   * edits a content-editable run; multi-line text a native `textarea`, which keeps a caret
+   * position after a trailing line break and pastes plain text.
+   */
+  private text_editor_surface(
+    text: string,
+    font: string,
+    font_size: number,
+    line_height: number,
+    ink: string,
+    label: string,
+    multiline: boolean,
+  ): { wrap: HTMLDivElement; editor: HTMLElement; caret: HTMLSpanElement } {
+    const wrap = document.createElement("div");
+    wrap.id = "aeris_charts-text-editor";
+    // The accessibility layer leaves this class reachable (it hides every other chart control).
+    wrap.className = "aeris_charts-text-editor";
+    wrap.style.position = "absolute";
+    wrap.style.zIndex = "10";
+    // Borderless: the engine paints the focus border and any box continuously (selected +
+    // editing), so the outline never swaps owners or shifts when entering typing mode. This wrap
+    // only carries the transparent caret overlay.
+    wrap.style.border = "none";
+    wrap.style.borderRadius = "0";
+    wrap.style.background = "transparent";
+    wrap.style.padding = "0";
+    wrap.style.outline = "none";
+
+    let editor: HTMLElement;
+    if (multiline) {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.wrap = "off";
+      area.spellcheck = false;
+      area.style.resize = "none";
+      area.style.overflow = "hidden";
+      editor = area;
+    } else {
+      editor = document.createElement("div");
+      editor.contentEditable = "true";
+      editor.setAttribute("role", "textbox");
+      editor.textContent = text;
+    }
+    editor.id = "aeris_charts-text-input";
+    editor.setAttribute("aria-label", label);
+    editor.style.font = font;
+    editor.style.lineHeight = `${line_height}px`;
+    // The editing surface is fully transparent, including IME composition glyphs. Chromium can
+    // otherwise repaint composing text in `caret-color` despite transparent text fill, producing
+    // a second unrotated label. A dedicated one-pixel caret below is the only DOM ink.
+    editor.style.color = "transparent";
+    editor.style.caretColor = "transparent";
+    (editor.style as CSSStyleDeclaration & { webkitTextFillColor?: string }).webkitTextFillColor =
+      "transparent";
+    editor.style.opacity = "0";
+    editor.style.background = "transparent";
+    editor.style.border = "none";
+    editor.style.outline = "none";
+    editor.style.padding = "0";
+    editor.style.margin = "0";
+    editor.style.display = "block";
+    editor.style.whiteSpace = multiline ? "pre" : "nowrap";
+    editor.style.minWidth = `${font_size}px`;
+
+    const caret = document.createElement("span");
+    caret.id = "aeris_charts-text-caret";
+    caret.setAttribute("aria-hidden", "true");
+    caret.style.position = "absolute";
+    caret.style.top = "0";
+    caret.style.width = "1px";
+    caret.style.height = `${font_size * 1.2}px`;
+    caret.style.background = ink;
+    caret.style.pointerEvents = "none";
+
+    // Selection is painted by the browser in a separate phase and can remain visible even when
+    // the editable element itself is transparent. Suppress it locally so a selected/composing
+    // label cannot place theme-colored blocks over the canonical canvas glyphs.
+    const selection_style = document.createElement("style");
+    selection_style.textContent =
+      "#aeris_charts-text-input::selection{background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important}";
+
+    wrap.appendChild(editor);
+    wrap.appendChild(caret);
+    wrap.appendChild(selection_style);
+    return { wrap, editor, caret };
+  }
+
+  /** The editor surface's text. */
+  private static text_editor_value(editor: HTMLElement): string {
+    return editor instanceof HTMLTextAreaElement ? editor.value : (editor.textContent ?? "");
+  }
+
+  /** The editor's caret offset in its text (the text length when the selection is elsewhere). */
+  private static text_editor_caret_offset(editor: HTMLElement): number {
+    if (editor instanceof HTMLTextAreaElement) return editor.selectionEnd;
+    const selection = window.getSelection();
+    if (selection?.anchorNode && editor.contains(selection.anchorNode)) {
+      const prefix = document.createRange();
+      prefix.selectNodeContents(editor);
+      prefix.setEnd(selection.anchorNode, selection.anchorOffset);
+      return prefix.toString().length;
+    }
+    return (editor.textContent ?? "").length;
+  }
+
+  /**
+   * Hand the mounted surface the session: Enter (outside IME composition) and blur commit and
+   * Escape cancels; a multi-line editor keeps Shift+Enter for its native line break. The caret
+   * starts at the end of the text and focus returns where it was on close.
+   */
+  private attach_text_editor(
+    drawing: drawing_api,
+    mode: "standalone_text" | "trend_label" | "part_label",
+    editor: HTMLElement,
+    return_focus: Element | null,
+    on_input: () => void,
+  ): void {
+    const multiline = mode === "part_label";
+    editor.addEventListener("input", on_input);
+    editor.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.isComposing) return;
+      if (e.key === "Enter" && !(multiline && e.shiftKey)) {
+        e.preventDefault();
+        this.close_text_editor(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.close_text_editor(false);
+      }
+    });
+    editor.addEventListener("blur", () => this.close_text_editor(true));
+
+    this.text_editor = editor;
+    this.text_editor_id = drawing.id;
+    this.text_editor_original = drawing.options().text ?? "";
+    this.text_editor_mode = mode;
+    this.text_editor_label = drawing.kind().replaceAll("_", " ");
+    this.text_editor_return_focus = return_focus;
+    this.repaint();
+    editor.focus();
+    if (editor instanceof HTMLTextAreaElement) {
+      editor.setSelectionRange(editor.value.length, editor.value.length);
+    } else {
+      const selection = window.getSelection();
+      if (selection !== null) {
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    }
+    this.accessibility_handle?.announce(
+      `${this.text_editor_label} text editing. Enter commits${multiline ? ", Shift+Enter adds a line" : ""}, Escape cancels.`,
+    );
+  }
+
   private open_inline_editor(
     drawing: drawing_api,
     mode: "standalone_text" | "trend_label",
@@ -6778,6 +7177,10 @@ export class chart_impl implements chart_api {
     this.close_text_editor(true);
     let transform = this.wasm.drawing_text_transform(drawing.id);
     if (transform.length !== 3) return;
+    const return_focus = document.activeElement;
+    // The engine session keeps the canvas label under the caret overlay and records the edit as
+    // one undo step; it refuses a locked, hidden, or otherwise uneditable drawing.
+    if (!this.wasm.begin_drawing_text_edit(drawing.id)) return;
     const options = drawing.options();
     const layout = (this.options() as {
       layout?: {
@@ -6803,58 +7206,16 @@ export class chart_impl implements chart_api {
       layout.textColor ??
       theme_palette(default_theme_name).foreground;
 
-    const wrap = document.createElement("div");
-    wrap.id = "aeris_charts-text-editor";
-    wrap.style.position = "absolute";
-    wrap.style.zIndex = "10";
-    // Borderless: the engine paints the focus border continuously (selected + editing), so the
-    // outline never swaps owners or shifts when entering typing mode. This wrap only carries
-    // the transparent caret overlay.
-    wrap.style.border = "none";
-    wrap.style.borderRadius = "0";
+    const { wrap, editor, caret } = this.text_editor_surface(
+      options.text,
+      font,
+      font_size,
+      font_size * 1.2,
+      ink,
+      `${drawing.kind().replaceAll("_", " ")} text`,
+      false,
+    );
     wrap.style.background = options.box_color || "transparent";
-    wrap.style.padding = "0";
-    wrap.style.outline = "none";
-
-    const editor = document.createElement("div");
-    editor.id = "aeris_charts-text-input";
-    editor.contentEditable = "true";
-    editor.textContent = options.text;
-    editor.style.font = font;
-    editor.style.lineHeight = `${font_size * 1.2}px`;
-    // The editing surface is fully transparent, including IME composition glyphs. Chromium can
-    // otherwise repaint composing text in `caret-color` despite transparent text fill, producing
-    // a second unrotated label. A dedicated one-pixel caret below is the only DOM ink.
-    editor.style.color = "transparent";
-    editor.style.caretColor = "transparent";
-    (editor.style as CSSStyleDeclaration & { webkitTextFillColor?: string }).webkitTextFillColor =
-      "transparent";
-    editor.style.opacity = "0";
-    editor.style.background = "transparent";
-    editor.style.border = "none";
-    editor.style.outline = "none";
-    editor.style.padding = "0";
-    editor.style.margin = "0";
-    editor.style.display = "block";
-    editor.style.whiteSpace = "nowrap";
-    editor.style.minWidth = `${font_size}px`;
-
-    const caret = document.createElement("span");
-    caret.id = "aeris_charts-text-caret";
-    caret.setAttribute("aria-hidden", "true");
-    caret.style.position = "absolute";
-    caret.style.top = "0";
-    caret.style.width = "1px";
-    caret.style.height = `${font_size * 1.2}px`;
-    caret.style.background = ink;
-    caret.style.pointerEvents = "none";
-
-    // Selection is painted by the browser in a separate phase and can remain visible even when
-    // the editable element itself is transparent. Suppress it locally so a selected/composing
-    // trend label cannot place theme-colored blocks over the canonical canvas glyphs.
-    const selection_style = document.createElement("style");
-    selection_style.textContent =
-      "#aeris_charts-text-input::selection{background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important}";
 
     const dpr = window.devicePixelRatio || 1;
     const measure_ctx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
@@ -6893,15 +7254,7 @@ export class chart_impl implements chart_api {
     let baseline_in_editor = 0;
     const position_caret = () => {
       const text = editor.textContent ?? "";
-      let offset = text.length;
-      const selection = window.getSelection();
-      if (selection?.anchorNode && editor.contains(selection.anchorNode)) {
-        const prefix = document.createRange();
-        prefix.selectNodeContents(editor);
-        prefix.setEnd(selection.anchorNode, selection.anchorOffset);
-        offset = prefix.toString().length;
-      }
-      const before_caret = text.slice(0, offset);
+      const before_caret = text.slice(0, chart_impl.text_editor_caret_offset(editor));
       const x = measure_ctx === null ? 0 : measure_ctx.measureText(before_caret).width;
       caret.style.left = `${Math.ceil(x)}px`;
     };
@@ -6926,7 +7279,10 @@ export class chart_impl implements chart_api {
     };
     const push_live_text = () => {
       const text = (editor.textContent ?? "").replace(/\s*\n\s*/g, " ");
-      this.wasm.drawing_apply_options(this.text_editor_id, JSON.stringify({ text }));
+      if (!this.wasm.set_drawing_edit_text(text)) {
+        this.close_text_editor(false);
+        return;
+      }
       this.repaint();
     };
     const set_width = () => {
@@ -6939,24 +7295,9 @@ export class chart_impl implements chart_api {
       position_editor();
       push_live_text();
     };
-    editor.addEventListener("input", set_width);
     editor.addEventListener("keyup", position_caret);
     editor.addEventListener("pointerup", position_caret);
-    editor.addEventListener("keydown", (e) => {
-      e.stopPropagation();
-      if (e.key === "Enter") {
-        e.preventDefault();
-        this.close_text_editor(true);
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        this.close_text_editor(false);
-      }
-    });
-    editor.addEventListener("blur", () => this.close_text_editor(true));
 
-    wrap.appendChild(editor);
-    wrap.appendChild(caret);
-    wrap.appendChild(selection_style);
     this.container.appendChild(wrap);
     const probe = document.createElement("span");
     probe.style.display = "inline-block";
@@ -6966,17 +7307,11 @@ export class chart_impl implements chart_api {
     baseline_in_editor = probe.getBoundingClientRect().top - editor.getBoundingClientRect().top;
     probe.remove();
 
-    this.text_editor = editor;
-    this.text_editor_id = drawing.id;
-    this.text_editor_original = options.text ?? "";
-    this.text_editor_mode = mode;
     // Width without a live push yet (avoids a redundant apply of the same text).
     if (measure_ctx !== null) {
       measure_ctx.font = font;
-      const w =
-        this.text_editor_original === ""
-          ? font_size
-          : measure_ctx.measureText(this.text_editor_original).width;
+      const original = options.text ?? "";
+      const w = original === "" ? font_size : measure_ctx.measureText(original).width;
       editor.style.width = `${Math.ceil(w) + 1}px`;
     }
     position_editor();
@@ -6984,58 +7319,142 @@ export class chart_impl implements chart_api {
     this.text_editor_reposition = () => {
       if (this.text_editor === null) return;
       const fresh = this.wasm.drawing_text_transform(drawing.id);
-      if (fresh.length !== 3) {
+      if (fresh.length !== 3 || this.wasm.editing_drawing() !== drawing.id) {
         this.close_text_editor(false);
         return;
       }
       transform = fresh;
       position_editor();
     };
-    // Marks typing mode for hosts; the engine keeps painting the label and the focus border
-    // underneath this borderless caret overlay (no outline handoff).
-    this.wasm.set_editing_drawing(drawing.id);
-    this.repaint();
-    editor.focus();
-    const selection = window.getSelection();
-    if (selection !== null) {
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      range.collapse(false);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
+    this.attach_text_editor(drawing, mode, editor, return_focus, set_width);
     position_caret();
   }
 
   /**
-   * Close the typing-mode editor. Commit keeps the live-pushed text (or removes if empty);
-   * cancel restores the pre-edit snapshot. Empty result removes the drawing.
+   * Open the editor on a family text box: the engine resolves where the box's own text sits (its
+   * left edge, the first text line's center, and the line advance, below any engine line such as
+   * a price label's price) and relays it out after every keystroke, since a box can grow in any
+   * direction (a comment grows upward, a centered callout both ways). The text may span lines.
+   */
+  private open_part_label_editor(drawing: drawing_api): void {
+    this.close_text_editor(true);
+    const return_focus = document.activeElement;
+    if (!this.wasm.begin_drawing_text_edit(drawing.id)) return;
+    let layout = this.text_edit_layout(drawing.id);
+    if (layout === null) {
+      this.wasm.end_drawing_text_edit(false);
+      return;
+    }
+    const font_of = (edit: text_edit_layout) =>
+      `${edit.italic ? "italic " : ""}${edit.weight} ${edit.size}px ${edit.font_family}`;
+    const { wrap, editor, caret } = this.text_editor_surface(
+      drawing.options().text ?? "",
+      font_of(layout),
+      layout.size,
+      layout.line_height,
+      layout.color,
+      `${drawing.kind().replaceAll("_", " ")} text`,
+      true,
+    );
+    const measure_ctx = document.createElement("canvas").getContext("2d");
+    const measure = (text: string) => {
+      if (measure_ctx === null) return 0;
+      measure_ctx.font = font_of(layout!);
+      return measure_ctx.measureText(text).width;
+    };
+    const text_of = () => chart_impl.text_editor_value(editor).replace(/\r\n?/g, "\n");
+    const position = () => {
+      const edit = layout!;
+      const font = font_of(edit);
+      editor.style.font = font;
+      editor.style.lineHeight = `${edit.line_height}px`;
+      editor.style.minWidth = `${edit.size}px`;
+      const text = text_of();
+      const lines = text.split("\n");
+      const widest = lines.reduce((width, line) => Math.max(width, measure(line)), 0);
+      editor.style.width = `${Math.ceil(Math.max(widest, edit.size)) + 1}px`;
+      editor.style.height = `${lines.length * edit.line_height}px`;
+      wrap.style.left = `${edit.x}px`;
+      wrap.style.top = `${edit.y - edit.line_height / 2}px`;
+      const before = text.slice(0, chart_impl.text_editor_caret_offset(editor)).split("\n");
+      const row = before.length - 1;
+      caret.style.left = `${Math.ceil(measure(before[row] ?? ""))}px`;
+      caret.style.top = `${row * edit.line_height + (edit.line_height - edit.size * 1.2) / 2}px`;
+      caret.style.height = `${edit.size * 1.2}px`;
+      caret.style.background = edit.color;
+    };
+    const push_live_text = () => {
+      if (!this.wasm.set_drawing_edit_text(text_of())) {
+        this.close_text_editor(false);
+        return;
+      }
+      // The repaint relays the box out through `text_editor_reposition`.
+      this.repaint();
+    };
+    editor.addEventListener("keyup", position);
+    editor.addEventListener("pointerup", position);
+    this.container.appendChild(wrap);
+    position();
+    this.text_editor_reposition = () => {
+      if (this.text_editor === null) return;
+      const fresh = this.wasm.editing_drawing() === drawing.id ? this.text_edit_layout(drawing.id) : null;
+      if (fresh === null) {
+        this.close_text_editor(false);
+        return;
+      }
+      layout = fresh;
+      position();
+    };
+    this.attach_text_editor(drawing, "part_label", editor, return_focus, push_live_text);
+    position();
+  }
+
+  /** The engine's editor layout of a family text box, or null when it paints none. */
+  private text_edit_layout(id: number): text_edit_layout | null {
+    const json = this.wasm.drawing_text_edit_layout_json(id);
+    return json === "" ? null : (JSON.parse(json) as text_edit_layout);
+  }
+
+  /**
+   * Close the typing-mode editor. Commit keeps the typed text as one undo step; cancel restores
+   * the pre-edit text. A standalone text left empty is removed. Focus returns to where the
+   * editor was opened from inside the chart (an accessibility target), else the overlay.
    */
   close_text_editor(commit: boolean): void {
     const editor = this.text_editor;
     if (editor === null) return;
+    const mode = this.text_editor_mode;
     this.text_editor = null;
     this.text_editor_reposition = null;
     const wrap = this.container.querySelector("#aeris_charts-text-editor");
     wrap?.remove();
-    this.wasm.set_editing_drawing(undefined);
     const id = this.text_editor_id;
-    const text = (editor.textContent ?? "").replace(/\s*\n\s*/g, " ").trim();
-    if (commit) {
-      if (text === "" && this.text_editor_mode === "standalone_text") {
-        this.wasm.remove_drawing(id);
-      } else {
-        this.wasm.drawing_apply_options(id, JSON.stringify({ text }));
-      }
-    } else if (!this.text_editor_original.trim() && this.text_editor_mode === "standalone_text") {
+    const raw = chart_impl.text_editor_value(editor);
+    const text = (mode === "part_label" ? raw.replace(/\r\n?/g, "\n") : raw.replace(/\s*\n\s*/g, " ")).trim();
+    if (commit) this.wasm.set_drawing_edit_text(text);
+    // A session the engine already ended (the drawing was removed, restored, or replaced by a
+    // sync payload) is not this editor's to finish.
+    const ended = this.wasm.end_drawing_text_edit(commit);
+    if (ended && mode === "standalone_text" && !(commit ? text : this.text_editor_original.trim())) {
       this.wasm.remove_drawing(id);
-    } else {
-      this.wasm.drawing_apply_options(id, JSON.stringify({ text: this.text_editor_original }));
     }
+    const label = this.text_editor_label;
+    const return_focus = this.text_editor_return_focus;
     this.text_editor_original = "";
     this.text_editor_mode = null;
+    this.text_editor_label = "";
+    this.text_editor_return_focus = null;
     this.repaint();
-    this.overlay_el().focus();
+    if (ended) this.accessibility_handle?.announce(`${label} text ${commit ? "committed" : "edit cancelled"}.`);
+    // An accessibility target rebuilt while editing is found again by its target key.
+    const target = return_focus instanceof HTMLElement ? return_focus.dataset.a11yTarget : undefined;
+    const back = return_focus instanceof HTMLElement && return_focus.isConnected
+      ? return_focus
+      : target === undefined
+        ? null
+        : this.container.querySelector<HTMLElement>(`[data-a11y-target="${CSS.escape(target)}"]`);
+    if (back !== null && back !== this.overlay_el() && this.container.contains(back)) back.focus();
+    else this.overlay_el().focus();
   }
 
   apply_options(options: deep_partial<chart_options>): void {

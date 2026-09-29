@@ -848,8 +848,12 @@ impl ChartInner {
         if s.report.accepted == 0 && s.report.dropped_invalid > 0 {
             return diagnostics;
         }
-        self.engine
-            .install_series_data(id as SeriesId, s.times, s.open, s.high, s.low, s.close);
+        if !self
+            .engine
+            .install_series_data(id as SeriesId, s.times, s.open, s.high, s.low, s.close)
+        {
+            return Some(derived_series_rejection(id));
+        }
         diagnostics
     }
 
@@ -882,7 +886,8 @@ impl ChartInner {
                 Ok(batch) => batch,
                 Err(rejected) => return rejected,
             };
-        self.engine.update_series_bars_sanitized(
+        let rows = s.times.len();
+        let applied = self.engine.update_series_bars_sanitized(
             id as SeriesId,
             s.times,
             s.open,
@@ -890,6 +895,9 @@ impl ChartInner {
             s.low,
             s.close,
         );
+        if rows > 0 && applied == 0 {
+            return Some(derived_series_rejection(id));
+        }
         diagnostics
     }
 
@@ -1037,7 +1045,9 @@ impl ChartInner {
     }
 
     /// Streaming update like [`update_series_bar`] that also sets the target bar's per-point
-    /// color channels (None = no custom color for that channel).
+    /// color channels (None = no custom color for that channel). Returns whether the engine
+    /// applied the bar; the caller has already validated the values, so a rejection means the
+    /// series is engine-derived (footprint, synthetic, or resampled).
     #[allow(clippy::too_many_arguments)] // mirrors update_series_bar plus the three reference color slots
     pub fn update_series_bar_styled(
         &mut self,
@@ -1050,13 +1060,13 @@ impl ChartInner {
         body: Option<u32>,
         wick: Option<u32>,
         border: Option<u32>,
-    ) {
+    ) -> bool {
         // Ignore updates to an unknown series rather than corrupting the data layer.
         if !self.series.iter().any(|s| s.id == series_id as SeriesId) {
             web_sys::console::warn_1(
                 &"aeris_charts: update_series_bar_styled for unknown series id".into(),
             );
-            return;
+            return false;
         }
         if let Err(error) = aeris_charts_core::model::data_validation::validate_timestamp(time) {
             web_sys::console::warn_1(
@@ -1065,19 +1075,14 @@ impl ChartInner {
                 )
                 .into(),
             );
-            return;
+            return false;
         }
-        if !self.engine.update_series_bar_styled(
+        self.engine.update_series_bar_styled(
             series_id as SeriesId,
             time,
             [open, high, low, close],
             [body, wick, border],
-        ) {
-            web_sys::console::warn_1(
-                &"aeris_charts: update_series_bar_styled rejected invalid or out-of-range values"
-                    .into(),
-            );
-        }
+        )
     }
 
     /// Apply a per-series `priceFormat` JSON patch (reference PriceFormat). Returns false, leaving
@@ -2934,6 +2939,17 @@ impl ChartInner {
     pub fn drawing_text_hit_at(&self, x_css: f64, y_css: f64) -> u32 {
         self.engine.drawing_text_hit_at(x_css, y_css).unwrap_or(0)
     }
+    pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
+        self.engine
+            .drawing_text_edit_layout(id)
+            .map(|mut layout| {
+                layout.x += self.pane_left;
+                layout.rect[0] += self.pane_left;
+                layout.rect[2] += self.pane_left;
+                serde_json::to_string(&layout).unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
     pub fn drawings_json(&self) -> String {
         self.engine.drawings_json()
     }
@@ -2958,9 +2974,18 @@ impl ChartInner {
         };
         self.engine.set_selected_drawings(&ids)
     }
+    /// `{"ok":true,"payload":"..."}`, or the engine's error (`invalid_data` when nothing could be
+    /// copied, `resource_limit` past the clipboard bounds).
     pub fn copy_drawings_json(&self, ids_json: &str) -> String {
         let ids = serde_json::from_str::<Vec<u32>>(ids_json).unwrap_or_default();
-        self.engine.copy_drawings_json(&ids).unwrap_or_default()
+        let result = match self.engine.copy_drawings_json(&ids) {
+            Ok(payload) => serde_json::json!({ "ok": true, "payload": payload }),
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": { "code": error.code().name(), "message": error.message() },
+            }),
+        };
+        result.to_string()
     }
     pub fn paste_drawings_json(
         &mut self,

@@ -12,3 +12,4 @@ pub mod crosshair_icon;
 pub mod draw_list;
 pub mod histogram;
 pub mod line;
+pub mod shape;

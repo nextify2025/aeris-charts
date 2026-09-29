@@ -2284,6 +2284,623 @@ fn every_indicator_engine_path_matches_full_recomputation() {
     }
 }
 
+/// Every built-in indicator kind with short periods, for engine-path equivalence checks.
+fn every_indicator_kind() -> Vec<IndicatorKind> {
+    use aeris_charts_indicators::{PivotKind, VwapReset};
+    vec![
+        IndicatorKind::Sma { period: 5 },
+        IndicatorKind::Ema {
+            period: 5,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Dema {
+            period: 4,
+            seed: IndicatorSeed::FirstValue,
+        },
+        IndicatorKind::Tema {
+            period: 3,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Smma { period: 5 },
+        IndicatorKind::Hma { period: 5 },
+        IndicatorKind::Vwma { period: 5 },
+        IndicatorKind::StandardDeviation { period: 5 },
+        IndicatorKind::Cci { period: 5 },
+        IndicatorKind::WilliamsR { period: 5 },
+        IndicatorKind::StochasticRsi {
+            rsi_period: 5,
+            stochastic_period: 5,
+        },
+        IndicatorKind::Momentum { period: 5 },
+        IndicatorKind::RateOfChange { period: 5 },
+        IndicatorKind::Donchian { period: 5 },
+        IndicatorKind::PivotPoints {
+            variant: PivotKind::Camarilla,
+        },
+        IndicatorKind::ZigZag {
+            deviation_percent: 3.0,
+        },
+        IndicatorKind::Keltner {
+            period: 5,
+            multiplier: 2.0,
+        },
+        IndicatorKind::AdxDmi { period: 5 },
+        IndicatorKind::ParabolicSar,
+        IndicatorKind::SuperTrend {
+            period: 5,
+            multiplier: 3.0,
+        },
+        IndicatorKind::Ichimoku,
+        IndicatorKind::EmaRibbon {
+            periods: [3, 5, 8, 13, 21],
+        },
+        IndicatorKind::Bollinger {
+            period: 5,
+            deviation: 2.0,
+            estimator: DeviationEstimator::Sample,
+        },
+        IndicatorKind::Rsi {
+            period: 5,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Macd {
+            fast: 3,
+            slow: 6,
+            signal: 4,
+            seed: IndicatorSeed::Sma,
+            histogram_multiplier: 2.0,
+        },
+        IndicatorKind::Stochastic {
+            k_period: 5,
+            d_period: 3,
+        },
+        IndicatorKind::Atr { period: 5 },
+        IndicatorKind::Vwap,
+        IndicatorKind::Obv,
+        IndicatorKind::Cmf { period: 5 },
+        IndicatorKind::Mfi { period: 5 },
+        IndicatorKind::Volume { period: 5 },
+        IndicatorKind::VwapBands {
+            reset: VwapReset::Session,
+            standard_deviation: 1.0,
+            percent: 5.0,
+        },
+        IndicatorKind::Wma { period: 5 },
+        IndicatorKind::Kdj {
+            period: 5,
+            k_smoothing: 3,
+            d_smoothing: 3,
+            seed: aeris_charts_indicators::KdjSeed::Fifty,
+        },
+    ]
+}
+
+fn indicator_reads_volume(kind: &IndicatorKind) -> bool {
+    matches!(
+        kind,
+        IndicatorKind::Vwma { .. }
+            | IndicatorKind::Vwap
+            | IndicatorKind::VwapBands { .. }
+            | IndicatorKind::Obv
+            | IndicatorKind::Cmf { .. }
+            | IndicatorKind::Mfi { .. }
+            | IndicatorKind::Volume { .. }
+    )
+}
+
+/// One swinging bar per row, so ZigZag confirms reversals and pivots see several sessions.
+fn swinging_bar(row: usize, revision: usize) -> [f64; 4] {
+    let close = 100.0 + (row as f64 * 0.35).sin() * 8.0 + revision as f64 * 0.013;
+    let open = close - (row as f64 * 0.9).cos() * 0.6;
+    [open, open.max(close) + 0.7, open.min(close) - 0.5, close]
+}
+
+/// Compare every output of `binding` with the same study installed on a fresh chart from the
+/// chart's current source, volume, and turnover data: incremental repairs must equal a full build.
+fn assert_binding_matches_fresh_install(chart: &ChartEngine, binding: usize, label: &str) {
+    let binding = &chart.indicators[binding];
+    let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+    let copy = |fresh: &mut ChartEngine, from: SeriesId, into: SeriesId| {
+        let (times, values) = chart.data.series_data(from).unwrap();
+        let seconds = times.iter().map(|&time| time as f64).collect::<Vec<_>>();
+        fresh
+            .set_series_data(into, &seconds, values[0], values[1], values[2], values[3])
+            .unwrap();
+    };
+    copy(&mut fresh, binding.source, 0);
+    let mut weight = |column: Option<SeriesId>| {
+        column.map(|id| {
+            let fresh_id = fresh.add_series(SeriesKind::Histogram);
+            copy(&mut fresh, id, fresh_id);
+            fresh_id
+        })
+    };
+    let volume = weight(binding.volume_source);
+    let amount = weight(binding.amount_source);
+    let outputs = fresh.add_indicator_kind_with_sources(
+        0,
+        binding.source_input,
+        binding.kind.clone(),
+        volume,
+        amount,
+    );
+    assert_eq!(outputs.len(), binding.outputs.len(), "{label}");
+    for (output, (&actual, &expected)) in binding.outputs.iter().zip(&outputs).enumerate() {
+        let (actual_times, actual) = chart.data.series_data(actual).unwrap();
+        let (expected_times, expected) = fresh.data.series_data(expected).unwrap();
+        assert_eq!(
+            actual_times, expected_times,
+            "{label} output {output} times"
+        );
+        for (row, (&actual, &expected)) in actual[3].iter().zip(expected[3]).enumerate() {
+            assert!(
+                (actual.is_nan() && expected.is_nan()) || (actual - expected).abs() < 1e-10,
+                "{label} output {output} row {row}: incremental {actual} != fresh {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn streamed_aggregate_and_weight_inputs_match_a_fresh_install_for_every_indicator() {
+    // Weight timelines: identical with the candle streaming first ("lagging" volume), identical
+    // with the volume streaming first ("leading"), and genuinely different timestamps ("diverged":
+    // missing every seventh bar plus bars the source lacks).
+    let orders = ["lagging", "leading", "diverged"];
+    let mut cases = Vec::new();
+    for kind in every_indicator_kind() {
+        let weighted = indicator_reads_volume(&kind);
+        for input in [IndicatorInputSource::Close, IndicatorInputSource::Hlc3] {
+            for order in orders.iter().take(if weighted { 3 } else { 1 }) {
+                cases.push((kind.clone(), input, *order, false));
+            }
+        }
+    }
+    for order in orders {
+        cases.push((
+            IndicatorKind::Vwap,
+            IndicatorInputSource::Ohlc4,
+            order,
+            true,
+        ));
+    }
+    for (kind, input, order, with_amount) in cases {
+        let label = format!("{kind:?} {input:?} {order} amount={with_amount}");
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let amount = chart.add_series(SeriesKind::Histogram);
+        let diverged = order == "diverged";
+        let weight_rows = |rows: std::ops::Range<usize>| {
+            rows.filter(|row| !diverged || row % 7 != 3)
+                .map(|row| row as f64 * 3_600.0)
+                .chain(
+                    diverged
+                        .then_some([10.5 * 3_600.0, 20.25 * 3_600.0])
+                        .into_iter()
+                        .flatten(),
+                )
+                .collect::<Vec<_>>()
+        };
+        let times = (0..40).map(|row| row as f64 * 3_600.0).collect::<Vec<_>>();
+        let bars = (0..40).map(|row| swinging_bar(row, 0)).collect::<Vec<_>>();
+        let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+        chart
+            .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+            .unwrap();
+        let mut weight_times = weight_rows(0..40);
+        weight_times.sort_by(f64::total_cmp);
+        let volumes = weight_times
+            .iter()
+            .map(|time| (time / 3_600.0 * 7.0) % 11.0 + 1.0)
+            .collect::<Vec<_>>();
+        let amounts = volumes
+            .iter()
+            .map(|volume| volume * 101.0)
+            .collect::<Vec<_>>();
+        for (id, values) in [(volume, &volumes), (amount, &amounts)] {
+            chart
+                .set_series_data(id, &weight_times, values, values, values, values)
+                .unwrap();
+        }
+        let outputs = chart.add_indicator_kind_with_sources(
+            0,
+            input,
+            kind.clone(),
+            indicator_reads_volume(&kind).then_some(volume),
+            with_amount.then_some(amount),
+        );
+        assert!(!outputs.is_empty(), "{label}");
+        let binding = chart.indicators.len() - 1;
+        assert_binding_matches_fresh_install(&chart, binding, &label);
+
+        let tick = |chart: &mut ChartEngine, row: usize, revision: usize| {
+            let time = row as f64 * 3_600.0;
+            let weight = ((row * 7 + revision) % 11 + 1) as f64;
+            let candle = |chart: &mut ChartEngine| {
+                chart.update_series_bar(0, time, swinging_bar(row, revision));
+            };
+            let weights = |chart: &mut ChartEngine| {
+                if !diverged || row % 7 != 3 {
+                    chart.update_series_bar(volume, time, [weight; 4]);
+                    chart.update_series_bar(amount, time, [weight * 101.0; 4]);
+                }
+            };
+            if order == "leading" {
+                weights(chart);
+                assert_binding_matches_fresh_install(chart, binding, &label);
+                candle(chart);
+            } else {
+                candle(chart);
+                assert_binding_matches_fresh_install(chart, binding, &label);
+                weights(chart);
+            }
+            assert_binding_matches_fresh_install(chart, binding, &label);
+        };
+        for revision in 1..=3 {
+            tick(&mut chart, 39, revision);
+        }
+        for row in 40..46 {
+            tick(&mut chart, row, 0);
+            tick(&mut chart, row, 1);
+        }
+        // Historical corrections of existing bars, then a bar at a time neither series had.
+        tick(&mut chart, 17, 4);
+        tick(&mut chart, 31, 2);
+        chart.update_series_bar(0, 17.5 * 3_600.0, swinging_bar(17, 9));
+        assert_binding_matches_fresh_install(&chart, binding, &label);
+        chart.update_series_bar(volume, 17.5 * 3_600.0, [4.0; 4]);
+        chart.update_series_bar(amount, 17.5 * 3_600.0, [404.0; 4]);
+        assert_binding_matches_fresh_install(&chart, binding, &label);
+        // Truncating the source leaves the weight series longer than the source.
+        chart.series_pop(0, 3).unwrap();
+        assert_binding_matches_fresh_install(&chart, binding, &label);
+        tick(&mut chart, 43, 5);
+        tick(&mut chart, 44, 0);
+    }
+}
+
+#[test]
+fn indicator_ticks_over_100k_rows_do_bounded_engine_work() {
+    // Every kind plus aggregate inputs, a volume stream in both update orders, and a diverged
+    // turnover timeline: one tick must cost O(window) per binding, independent of history.
+    const ROWS: usize = 100_000;
+    const WORK_PER_BINDING: usize = 64;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let gappy_volume = chart.add_series(SeriesKind::Histogram);
+    let times = (0..ROWS).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
+    let bars = (0..ROWS)
+        .map(|row| swinging_bar(row, 0))
+        .collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+    let volumes = (0..ROWS)
+        .map(|row| (row % 13 + 1) as f64)
+        .collect::<Vec<_>>();
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .unwrap();
+    let gappy_times = times
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(row, _)| row % 50 != 7)
+        .map(|(_, time)| time)
+        .collect::<Vec<_>>();
+    let gappy = vec![5.0; gappy_times.len()];
+    chart
+        .set_series_data(gappy_volume, &gappy_times, &gappy, &gappy, &gappy, &gappy)
+        .unwrap();
+    for kind in every_indicator_kind() {
+        let weighted = indicator_reads_volume(&kind);
+        assert!(!chart
+            .add_indicator_kind(0, kind, weighted.then_some(volume))
+            .is_empty());
+    }
+    for input in [
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ] {
+        assert!(!chart
+            .add_indicator_kind_with_input(
+                0,
+                input,
+                IndicatorKind::StochasticRsi {
+                    rsi_period: 5,
+                    stochastic_period: 5,
+                },
+                None,
+            )
+            .is_empty());
+    }
+    assert!(!chart
+        .add_indicator_kind(0, IndicatorKind::Vwap, Some(gappy_volume))
+        .is_empty());
+    // Every binding's latest rebuild (formula rows plus derived input rows) stays within its
+    // window, so a regression in one binding cannot hide behind the others' small ticks.
+    let assert_bounded = |chart: &ChartEngine, mutation: &str| {
+        for binding in &chart.indicators {
+            assert!(
+                binding.last_work_rows() <= WORK_PER_BINDING,
+                "{mutation}: {:?} {:?} did {} work rows (bound {WORK_PER_BINDING})",
+                binding.kind,
+                binding.source_input,
+                binding.last_work_rows()
+            );
+        }
+    };
+
+    let mut last = ROWS - 1;
+    for (step, leading) in [false, true, false, true].into_iter().enumerate() {
+        for revision in 1..=3 {
+            let time = last as f64 * 60.0;
+            chart.update_series_bar(0, time, swinging_bar(last, revision + step));
+            assert_bounded(&chart, "replace candle");
+            chart.update_series_bar(volume, time, [revision as f64; 4]);
+            assert_bounded(&chart, "replace volume");
+        }
+        last += 1;
+        let time = last as f64 * 60.0;
+        let updates: [(SeriesId, [f64; 4]); 3] = [
+            (volume, [3.0; 4]),
+            (gappy_volume, [5.0; 4]),
+            (0, swinging_bar(last, 0)),
+        ];
+        let order: Vec<_> = if leading {
+            updates.to_vec()
+        } else {
+            updates.iter().rev().copied().collect()
+        };
+        for (series, values) in order {
+            chart.update_series_bar(series, time, values);
+            assert_bounded(&chart, &format!("append (volume leading: {leading})"));
+        }
+    }
+    // Closing the current bar and opening the next one in a single batch.
+    let bars = [swinging_bar(last, 9), swinging_bar(last + 1, 0)];
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    assert_eq!(
+        chart.update_series_bars_sanitized(
+            0,
+            vec![last as i64 * 60, (last + 1) as i64 * 60],
+            column(0),
+            column(1),
+            column(2),
+            column(3),
+        ),
+        2
+    );
+    assert_bounded(&chart, "batch close and open");
+    chart.update_series_bar(volume, (last + 1) as f64 * 60.0, [4.0; 4]);
+    assert_bounded(&chart, "volume for the batch-opened bar");
+    // The bounded paths still produce full-rebuild values: the path-dependent ZigZag, an
+    // aggregate-input Stochastic RSI, and the VWAP over the diverged volume timeline.
+    for binding in 0..chart.indicators.len() {
+        let binding_info = &chart.indicators[binding];
+        if matches!(binding_info.kind, IndicatorKind::ZigZag { .. })
+            || binding_info.source_input == IndicatorInputSource::Hlc3
+            || binding_info.volume_source == Some(gappy_volume)
+        {
+            let label = format!("{:?} {:?}", binding_info.kind, binding_info.source_input);
+            assert_binding_matches_fresh_install(&chart, binding, &label);
+        }
+    }
+}
+
+#[test]
+fn indicator_ticks_filling_pre_installed_session_slots_do_bounded_work() {
+    // A time-sharing chart: real rows, then the rest of the session installed as whitespace
+    // slots. Filling and revising the forming slot must cost the window, not the slots.
+    const ROWS: usize = 20_000;
+    const SLOTS: usize = 5_000;
+    const WORK_PER_BINDING: usize = 64;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let times = (0..ROWS + SLOTS)
+        .map(|row| row as f64 * 60.0)
+        .collect::<Vec<_>>();
+    let bars = (0..ROWS + SLOTS)
+        .map(|row| {
+            if row < ROWS {
+                swinging_bar(row, 0)
+            } else {
+                [f64::NAN; 4]
+            }
+        })
+        .collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+    let volumes = (0..ROWS + SLOTS)
+        .map(|row| {
+            if row < ROWS {
+                (row % 13 + 1) as f64
+            } else {
+                f64::NAN
+            }
+        })
+        .collect::<Vec<_>>();
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .unwrap();
+    for kind in every_indicator_kind() {
+        let weighted = indicator_reads_volume(&kind);
+        assert!(!chart
+            .add_indicator_kind(0, kind, weighted.then_some(volume))
+            .is_empty());
+    }
+    let rsi = chart.add_indicator_kind(
+        0,
+        IndicatorKind::Rsi {
+            period: 5,
+            seed: IndicatorSeed::Sma,
+        },
+        None,
+    )[0];
+    assert!(!chart
+        .add_indicator_kind(
+            rsi,
+            IndicatorKind::Ema {
+                period: 4,
+                seed: IndicatorSeed::Sma
+            },
+            None
+        )
+        .is_empty());
+    let assert_bounded = |chart: &ChartEngine, mutation: &str| {
+        for binding in &chart.indicators {
+            assert!(
+                binding.last_work_rows() <= WORK_PER_BINDING,
+                "{mutation}: {:?} did {} work rows (bound {WORK_PER_BINDING})",
+                binding.kind,
+                binding.last_work_rows()
+            );
+        }
+    };
+    for (step, row) in (ROWS..ROWS + 4).enumerate() {
+        let time = row as f64 * 60.0;
+        let leading = step % 2 == 1;
+        if leading {
+            chart.update_series_bar(volume, time, [3.0; 4]);
+            assert_bounded(&chart, "volume fills its slot first");
+        }
+        for revision in 0..3 {
+            chart.update_series_bar(0, time, swinging_bar(row, revision));
+            assert_bounded(&chart, "fill or revise the forming slot");
+        }
+        if !leading {
+            chart.update_series_bar(volume, time, [4.0; 4]);
+            assert_bounded(&chart, "volume fills its slot after the candle");
+        }
+    }
+    // A tick that clears the forming bar back to whitespace, then fills it again.
+    let time = (ROWS + 3) as f64 * 60.0;
+    chart.update_series_bar(0, time, [f64::NAN; 4]);
+    assert_bounded(&chart, "clear the forming bar");
+    chart.update_series_bar(0, time, swinging_bar(ROWS + 3, 9));
+    assert_bounded(&chart, "refill the forming bar");
+    for binding in 0..chart.indicators.len() {
+        assert_binding_matches_fresh_install(&chart, binding, "after filling session slots");
+    }
+}
+
+/// A chart of `rows` swinging one-minute bars with a volume and a turnover series, every
+/// built-in study (weighted ones on the volume), a turnover-weighted VWAP, and a study chained on
+/// an RSI output.
+fn replay_study_chart(rows: usize) -> (ChartEngine, SeriesId) {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let amount = chart.add_series(SeriesKind::Histogram);
+    let times = (0..rows).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
+    let bars = (0..rows)
+        .map(|row| swinging_bar(row, 0))
+        .collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+    let volumes = (0..rows)
+        .map(|row| (row % 13 + 1) as f64)
+        .collect::<Vec<_>>();
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .unwrap();
+    let amounts = volumes
+        .iter()
+        .map(|volume| volume * 101.0)
+        .collect::<Vec<_>>();
+    chart
+        .set_series_data(amount, &times, &amounts, &amounts, &amounts, &amounts)
+        .unwrap();
+    for kind in every_indicator_kind() {
+        let weighted = indicator_reads_volume(&kind);
+        assert!(!chart
+            .add_indicator_kind(0, kind, weighted.then_some(volume))
+            .is_empty());
+    }
+    assert!(!chart
+        .add_indicator_kind_with_sources(
+            0,
+            IndicatorInputSource::Hlc3,
+            IndicatorKind::Vwap,
+            Some(volume),
+            Some(amount),
+        )
+        .is_empty());
+    let rsi = chart.add_indicator_kind(
+        0,
+        IndicatorKind::Rsi {
+            period: 5,
+            seed: IndicatorSeed::Sma,
+        },
+        None,
+    )[0];
+    assert!(!chart
+        .add_indicator_kind(rsi, IndicatorKind::Sma { period: 3 }, None)
+        .is_empty());
+    (chart, volume)
+}
+
+#[test]
+fn one_bar_replay_steps_do_bounded_indicator_work() {
+    const ROWS: usize = 100_000;
+    const WORK_PER_BINDING: usize = 64;
+    let (mut chart, _) = replay_study_chart(ROWS);
+    let clock = |row: usize| Some(row as i64 * 60 * 1_000_000);
+    chart.set_replay_clock_micros(clock(90_000)).unwrap();
+    for row in 90_001..90_006 {
+        chart.set_replay_clock_micros(clock(row)).unwrap();
+        for binding in &chart.indicators {
+            assert!(
+                binding.last_work_rows() <= WORK_PER_BINDING,
+                "a one-bar step: {:?} did {} work rows (bound {WORK_PER_BINDING})",
+                binding.kind,
+                binding.last_work_rows()
+            );
+        }
+    }
+    for binding in 0..chart.indicators.len() {
+        assert_binding_matches_fresh_install(&chart, binding, "after one-bar steps");
+    }
+}
+
+#[test]
+fn replay_seeks_in_both_directions_match_a_fresh_install_for_every_indicator() {
+    let (mut chart, _) = replay_study_chart(240);
+    let clock = |row: i64| Some(row * 60 * 1_000_000);
+    // Forward, one bar and many; backward, one bar and many; before the data; cleared.
+    for (step, target) in [
+        clock(120),
+        clock(121),
+        clock(160),
+        clock(159),
+        clock(90),
+        clock(91),
+        clock(-5),
+        clock(40),
+        None,
+        clock(200),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        chart.set_replay_clock_micros(target).unwrap();
+        for binding in 0..chart.indicators.len() {
+            assert_binding_matches_fresh_install(
+                &chart,
+                binding,
+                &format!("seek {step} to {target:?}"),
+            );
+        }
+    }
+}
+
 #[test]
 fn batch_and_single_updates_are_semantically_identical_for_every_indicator() {
     let kinds = [
@@ -7050,6 +7667,83 @@ fn max_points_trims_a_full_install_before_the_scale_sees_it() {
 }
 
 #[test]
+fn max_points_during_replay_counts_and_evicts_only_the_revealed_rows() {
+    let minute = |row: usize| row as f64 * 60.0;
+    let clock = |row: usize| Some(row as i64 * 60 * 1_000_000);
+    let visible_rows = |chart: &ChartEngine| {
+        let (times, _) = chart.data.series_data(0).unwrap();
+        (
+            times.len(),
+            times.first().map(|&time| time / 60),
+            times.last().map(|&time| time / 60),
+        )
+    };
+    let load = |rows: usize| {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = (0..rows).map(minute).collect::<Vec<_>>();
+        let bars = (0..rows)
+            .map(|row| swinging_bar(row, 0))
+            .collect::<Vec<_>>();
+        let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+        chart
+            .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+            .unwrap();
+        chart
+    };
+    let keep = 500 - 500 / CAP_TRIM_MARGIN_DIVISOR;
+
+    // Live bars arriving past the clock stay hidden and uncounted: the replay view keeps its
+    // rows, and the pending future rows wait for the clock.
+    let mut chart = load(500);
+    let sma = chart.add_sma(0, 5).unwrap();
+    assert!(chart.set_series_max_points(0, Some(500)));
+    chart.set_replay_clock_micros(clock(300)).unwrap();
+    for row in 500..900 {
+        chart.update_series_bar(0, minute(row), swinging_bar(row, 0));
+    }
+    assert_eq!(visible_rows(&chart), (301, Some(0), Some(300)));
+    assert_eq!(chart.data.series_rows(0), Some(900));
+    // A seek that reveals past the ceiling trims only the oldest revealed rows.
+    chart.set_replay_clock_micros(clock(520)).unwrap();
+    assert_eq!(
+        visible_rows(&chart),
+        (keep, Some(521 - keep as i64), Some(520))
+    );
+    // Another hidden bar never pushes a revealed one out.
+    chart.update_series_bar(0, minute(900), swinging_bar(900, 0));
+    assert_eq!(
+        visible_rows(&chart),
+        (keep, Some(521 - keep as i64), Some(520))
+    );
+    let binding = chart
+        .indicators
+        .iter()
+        .position(|binding| binding.outputs[0] == sma)
+        .unwrap();
+    assert_binding_matches_fresh_install(&chart, binding, "after the revealing seek");
+    // Clearing the clock reveals the rest, trimmed like a load of them.
+    chart.set_replay_clock_micros(None).unwrap();
+    assert_eq!(
+        visible_rows(&chart),
+        (keep, Some(901 - keep as i64), Some(900))
+    );
+    assert_binding_matches_fresh_install(&chart, binding, "after clearing the clock");
+
+    // Applying a cap during replay keeps the newest revealed rows, however many are hidden.
+    for rows in [1_000, 1_200] {
+        let mut chart = load(rows);
+        chart.set_replay_clock_micros(clock(600)).unwrap();
+        assert!(chart.set_series_max_points(0, Some(500)));
+        assert_eq!(
+            visible_rows(&chart),
+            (keep, Some(601 - keep as i64), Some(600)),
+            "{rows} rows"
+        );
+        assert_eq!(chart.data.series_rows(0), Some(keep + rows - 601));
+    }
+}
+
+#[test]
 fn clearing_max_points_restores_unbounded_growth() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     install_bars(&mut chart, 100);
@@ -8260,8 +8954,9 @@ fn kdj_seed_is_an_explicit_parameter_with_the_textbook_default() {
         Some(aeris_charts_indicators::KdjSeed::FirstValue)
     );
     assert_eq!(
-        info.warmup_bars, 8,
-        "the RSV window still sets the first row"
+        (info.warmup_bars, info.convergence_bars),
+        (0, Some(44)),
+        "the formula-language RSV uses the bars available, so values start at the first bar"
     );
     let expected = aeris_charts_indicators::kdj_with_seed(
         &source.high,
@@ -8273,12 +8968,18 @@ fn kdj_seed_is_an_explicit_parameter_with_the_textbook_default() {
         aeris_charts_indicators::KdjSeed::FirstValue,
     );
     let d = chart.data.series_data(first_value[1]).unwrap().1[3];
-    assert_eq!(d[0], expected[8].k.unwrap(), "D starts at the first K");
-    for (offset, value) in d.iter().enumerate() {
-        assert!((value - expected[8 + offset].d.unwrap()).abs() < 1e-12);
+    assert_eq!(d.len(), source.close.len());
+    let first_rsv = 100.0 * (source.close[0] - source.low[0]) / (source.high[0] - source.low[0]);
+    assert!(
+        (d[0] - first_rsv).abs() < 1e-12,
+        "D starts at the first RSV"
+    );
+    for (row, value) in d.iter().enumerate() {
+        assert!((value - expected[row].d.unwrap()).abs() < 1e-12);
     }
     let textbook_d = chart.data.series_data(textbook[1]).unwrap().1[3];
-    assert_ne!(textbook_d[0], d[0]);
+    assert_eq!(textbook_d.len(), source.close.len() - 8);
+    assert_ne!(textbook_d[0], d[8]);
 
     let schema = ChartEngine::indicator_schema(&china);
     let seed = schema
@@ -8288,6 +8989,120 @@ fn kdj_seed_is_an_explicit_parameter_with_the_textbook_default() {
         .unwrap();
     assert_eq!(seed.default, serde_json::json!("first_value"));
     assert_eq!(seed.choices, ["fifty", "first_value"]);
+}
+
+#[test]
+fn china_kdj_starts_at_the_first_loaded_bar_through_streaming_trims_and_corrections() {
+    use aeris_charts_indicators::{kdj_with_seed, IndicatorConvention, KdjSeed};
+    let source = WhitespaceSource::new(64, &[]);
+    let bar = |row: usize| {
+        [
+            source.open[row],
+            source.high[row],
+            source.low[row],
+            source.close[row],
+        ]
+    };
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    // History begins at row 16; rows 0..16 are prepended later.
+    chart
+        .set_series_data(
+            0,
+            &source.times[16..17],
+            &source.open[16..17],
+            &source.high[16..17],
+            &source.low[16..17],
+            &source.close[16..17],
+        )
+        .unwrap();
+    let kdj = chart.add_indicator_kind(
+        0,
+        IndicatorKind::Kdj {
+            period: 9,
+            k_smoothing: 3,
+            d_smoothing: 3,
+            seed: KdjSeed::Fifty,
+        }
+        .with_convention(IndicatorConvention::China),
+        None,
+    );
+    // Every loaded bar has K, D and J, equal to the formula over exactly the loaded bars: the
+    // RSV of the first N-1 bars uses the bars available, so the start moves with the history.
+    let assert_formula = |chart: &ChartEngine, label: &str| {
+        let (times, values) = chart.data.series_data(0).unwrap();
+        let expected = kdj_with_seed(
+            values[1],
+            values[2],
+            values[3],
+            9,
+            3,
+            3,
+            KdjSeed::FirstValue,
+        );
+        for (output, &id) in kdj.iter().enumerate() {
+            let (output_times, output_values) = chart.data.series_data(id).unwrap();
+            assert_eq!(
+                output_times, times,
+                "{label}: output {output} covers every bar"
+            );
+            for (row, point) in expected.iter().enumerate() {
+                let expected = [point.k, point.d, point.j][output].unwrap();
+                assert!(
+                    (output_values[3][row] - expected).abs() < 1e-9,
+                    "{label}: output {output} row {row}: {} != {expected}",
+                    output_values[3][row]
+                );
+            }
+        }
+    };
+    assert_formula(&chart, "one bar");
+    for row in 17..48 {
+        assert!(chart.update_series_bar(0, source.times[row], bar(row)));
+        assert_formula(&chart, "append");
+    }
+    let mut current = bar(47);
+    current[1] += 2.0;
+    current[3] += 1.5;
+    assert!(chart.update_series_bar(0, source.times[47], current));
+    assert_formula(&chart, "current-bar replacement");
+
+    // Retention re-seeds at the new first bar with a partial window, like loading less history.
+    assert!(chart.set_series_max_points(0, Some(24)));
+    assert!(chart.data.series_data(0).unwrap().0.len() <= 24);
+    assert_formula(&chart, "trim");
+    for row in 48..56 {
+        assert!(chart.update_series_bar(0, source.times[row], bar(row)));
+        assert_formula(&chart, "append with retention");
+    }
+
+    // A historical correction inside the first window, then prepended history.
+    let first_time = chart.data.series_data(0).unwrap().0[2] as f64;
+    let outcome = chart.merge_series_bar(
+        0,
+        first_time,
+        SeriesBarPatch {
+            low: Some(80.0),
+            ..SeriesBarPatch::default()
+        },
+        None,
+    );
+    assert!(
+        matches!(outcome, SeriesUpdateOutcome::Applied),
+        "{outcome:?}"
+    );
+    assert_formula(&chart, "historical correction");
+    assert!(chart.set_series_max_points(0, None));
+    chart
+        .set_series_data(
+            0,
+            &source.times,
+            &source.open,
+            &source.high,
+            &source.low,
+            &source.close,
+        )
+        .unwrap();
+    assert_formula(&chart, "prepended history");
 }
 
 #[test]
@@ -8459,4 +9274,175 @@ fn weight_series_updates_resume_at_the_source_row_of_their_timestamp() {
     assert_eq!(values(&live, average), values(&fresh, fresh_average));
     assert_eq!(values(&live, typical), values(&fresh, fresh_typical));
     assert_eq!(*values(&live, average).last().unwrap(), 710.0 / 70.0);
+}
+
+/// Deterministic xorshift for the randomized engine-path equivalence test.
+struct MutationRng(u64);
+
+impl MutationRng {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % bound as u64) as usize
+    }
+}
+
+#[test]
+fn random_engine_mutations_keep_every_indicator_equal_to_a_fresh_install() {
+    // Candle ticks with the weights lagging, leading, or missing; whitespace ticks; historical
+    // corrections and late bars; weight gap fills and weight pops; source pops; retention trims;
+    // scalar-input switches; and a batch that closes the current bar and opens the next. After
+    // every mutation each output must equal the same study installed fresh from the current data.
+    let inputs = [
+        IndicatorInputSource::Close,
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ];
+    for (kind_index, kind) in every_indicator_kind().into_iter().enumerate() {
+        for seed in 1..=2_u64 {
+            let mut rng = MutationRng(seed * 0x51_7cc1 + kind_index as u64 * 977 + 1);
+            let with_amount = matches!(kind, IndicatorKind::Vwap) && seed == 2;
+            let input = inputs[rng.below(inputs.len())];
+            let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+            let volume = chart.add_series(SeriesKind::Histogram);
+            let amount = chart.add_series(SeriesKind::Histogram);
+            let rows = 30 + rng.below(10);
+            let times = (0..rows)
+                .map(|row| row as f64 * 3_600.0)
+                .collect::<Vec<_>>();
+            let bars = (0..rows)
+                .map(|row| swinging_bar(row, 0))
+                .collect::<Vec<_>>();
+            let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+            chart
+                .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+                .unwrap();
+            // The second seed starts from weight timelines that miss every fifth bar.
+            let weight_times = times
+                .iter()
+                .enumerate()
+                .filter(|(row, _)| seed == 1 || row % 5 != 2)
+                .map(|(_, &time)| time)
+                .collect::<Vec<_>>();
+            let volumes = weight_times
+                .iter()
+                .map(|time| (time / 3_600.0) % 9.0 + 1.0)
+                .collect::<Vec<_>>();
+            let amounts = volumes
+                .iter()
+                .map(|volume| volume * 97.0)
+                .collect::<Vec<_>>();
+            for (id, values) in [(volume, &volumes), (amount, &amounts)] {
+                chart
+                    .set_series_data(id, &weight_times, values, values, values, values)
+                    .unwrap();
+            }
+            let outputs = chart.add_indicator_kind_with_sources(
+                0,
+                input,
+                kind.clone(),
+                indicator_reads_volume(&kind).then_some(volume),
+                with_amount.then_some(amount),
+            );
+            assert!(!outputs.is_empty());
+            let binding = chart.indicators.len() - 1;
+            let mut last_time = (rows - 1) as f64 * 3_600.0;
+            for step in 0..160 {
+                let label = format!("{kind:?} {input:?} seed {seed} step {step}");
+                let weight = (rng.below(20) + 1) as f64;
+                match rng.below(15) {
+                    0..=2 => {
+                        last_time += 3_600.0 * (1 + rng.below(2)) as f64;
+                        let row = (last_time / 3_600.0) as usize;
+                        chart.update_series_bar(0, last_time, swinging_bar(row, step));
+                        if rng.below(3) != 0 {
+                            chart.update_series_bar(volume, last_time, [weight; 4]);
+                            chart.update_series_bar(amount, last_time, [weight * 97.0; 4]);
+                        }
+                    }
+                    3 => {
+                        last_time += 3_600.0;
+                        let row = (last_time / 3_600.0) as usize;
+                        chart.update_series_bar(volume, last_time, [weight; 4]);
+                        assert_binding_matches_fresh_install(&chart, binding, &label);
+                        chart.update_series_bar(amount, last_time, [weight * 97.0; 4]);
+                        assert_binding_matches_fresh_install(&chart, binding, &label);
+                        chart.update_series_bar(0, last_time, swinging_bar(row, step));
+                    }
+                    4..=6 => {
+                        let row = (last_time / 3_600.0) as usize;
+                        chart.update_series_bar(0, last_time, swinging_bar(row, step + 7));
+                        if rng.below(2) == 0 {
+                            chart.update_series_bar(volume, last_time, [weight; 4]);
+                        }
+                    }
+                    7 => {
+                        chart.update_series_bar(0, last_time, [f64::NAN; 4]);
+                    }
+                    8 => {
+                        let (times, _) = chart.data.series_data(0).unwrap();
+                        let row = rng.below(times.len());
+                        let late = if rng.below(2) == 0 { 0.0 } else { 1_800.0 };
+                        let time = times[row] as f64 + late;
+                        if time < last_time {
+                            chart.update_series_bar(0, time, swinging_bar(row, step + 3));
+                        }
+                    }
+                    9 => {
+                        let (times, _) = chart.data.series_data(0).unwrap();
+                        let time = times[rng.below(times.len())] as f64;
+                        chart.update_series_bar(volume, time, [weight; 4]);
+                        if rng.below(2) == 0 {
+                            chart.update_series_bar(amount, time, [weight * 97.0; 4]);
+                        }
+                    }
+                    10 => {
+                        let (times, _) = chart.data.series_data(0).unwrap();
+                        if times.len() > 20 {
+                            chart.series_pop(0, 1 + rng.below(2)).unwrap();
+                            let (times, _) = chart.data.series_data(0).unwrap();
+                            last_time = *times.last().unwrap() as f64;
+                        }
+                    }
+                    11 => {
+                        if rng.below(4) == 0 {
+                            let (times, _) = chart.data.series_data(0).unwrap();
+                            let cap = times.len().saturating_sub(3).max(20);
+                            chart.set_series_max_points(0, Some(cap));
+                        } else {
+                            let next = inputs[rng.below(inputs.len())];
+                            let output = chart.indicators[binding].outputs[0];
+                            chart.set_indicator_input_source(output, next);
+                        }
+                    }
+                    12 => {
+                        let (weight_times, _) = chart.data.series_data(volume).unwrap();
+                        if weight_times.len() > 20 {
+                            chart.series_pop(volume, 1).unwrap();
+                        }
+                    }
+                    13 => {
+                        let row = (last_time / 3_600.0) as usize;
+                        let bars = [swinging_bar(row, step + 11), swinging_bar(row + 1, step)];
+                        let column =
+                            |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+                        chart.update_series_bars_sanitized(
+                            0,
+                            vec![last_time as i64, last_time as i64 + 3_600],
+                            column(0),
+                            column(1),
+                            column(2),
+                            column(3),
+                        );
+                        last_time += 3_600.0;
+                    }
+                    _ => {}
+                }
+                assert_binding_matches_fresh_install(&chart, binding, &label);
+            }
+        }
+    }
 }

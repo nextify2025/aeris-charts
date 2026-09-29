@@ -260,7 +260,7 @@ impl ChartEngine {
     /// promote. Deselection, hover leave, cancellation, or removal restores idle.
     pub(crate) fn drawing_active_priority(&self, id: DrawingId) -> u8 {
         if self.drawing_drag.as_ref().is_some_and(|drag| drag.id == id)
-            || self.editing_drawing == Some(id)
+            || self.editing_drawing() == Some(id)
         {
             return PRIORITY_DRAG_EDIT;
         }

@@ -96,31 +96,46 @@ pub fn pivot_points_by_trading_day(
         return out;
     }
 
-    let mut current_day = None;
-    let mut current = None;
-    let mut previous = None;
+    let mut state = PivotState::default();
     for row in 0..n {
-        let day = trading_day_seconds(times[row]).div_euclid(86_400);
-        if current_day != Some(day) {
-            if let Some(session) = current.replace(Session {
+        pivot_step(
+            &mut state,
+            trading_day_seconds(times[row]).div_euclid(86_400),
+            Session {
                 open: opens[row],
                 high: highs[row],
                 low: lows[row],
                 close: closes[row],
-            }) {
-                previous = Some(session);
-            }
-            current_day = Some(day);
-        } else if let Some(session) = current.as_mut() {
-            session.high = session.high.max(highs[row]);
-            session.low = session.low.min(lows[row]);
-            session.close = closes[row];
-        }
-        if let Some(session) = previous {
+            },
+        );
+        if let Some(session) = state.previous {
             out[row] = pivot_levels(session, kind);
         }
     }
     out
+}
+
+/// Pivot carry: the current trading day's running OHLC and the previous completed session.
+#[derive(Clone, Copy, Debug, Default)]
+struct PivotState {
+    day: Option<i64>,
+    current: Option<Session>,
+    previous: Option<Session>,
+}
+
+/// Fold one bar of trading day `day` into the running session, completing the previous session
+/// when the day changes.
+fn pivot_step(state: &mut PivotState, day: i64, bar: Session) {
+    if state.day != Some(day) {
+        if let Some(session) = state.current.replace(bar) {
+            state.previous = Some(session);
+        }
+        state.day = Some(day);
+    } else if let Some(session) = state.current.as_mut() {
+        session.high = session.high.max(bar.high);
+        session.low = session.low.min(bar.low);
+        session.close = bar.close;
+    }
 }
 
 /// Compute confirmed ZigZag turning points from high/low bars.
@@ -135,54 +150,126 @@ pub fn zigzag(highs: &[f64], lows: &[f64], deviation_percent: f64) -> Vec<Option
         return out;
     }
     let threshold = deviation_percent / 100.0;
-    let mut direction = 0_i8;
-    let mut extreme_index = 0_usize;
-    let mut extreme = (highs[0] + lows[0]) / 2.0;
-    for index in 1..n {
-        if direction == 0 {
-            if high_at_least(highs[index], lows[0], threshold) {
-                direction = 1;
-                extreme_index = index;
-                extreme = highs[index];
-                out[0] = Some(lows[0]);
-            } else if low_at_most(lows[index], highs[0], threshold) {
-                direction = -1;
-                extreme_index = index;
-                extreme = lows[index];
-                out[0] = Some(highs[0]);
-            } else if highs[index] > extreme {
-                extreme = highs[index];
-                extreme_index = index;
-            } else if lows[index] < extreme {
-                extreme = lows[index];
-                extreme_index = index;
-            }
-            continue;
-        }
-        if direction > 0 {
-            if highs[index] >= extreme {
-                extreme = highs[index];
-                extreme_index = index;
-            } else if low_at_most(lows[index], extreme, threshold) {
-                out[extreme_index] = Some(extreme);
-                direction = -1;
-                extreme_index = index;
-                extreme = lows[index];
-            }
-        } else if lows[index] <= extreme {
-            extreme = lows[index];
-            extreme_index = index;
-        } else if high_at_least(highs[index], extreme, threshold) {
-            out[extreme_index] = Some(extreme);
-            direction = 1;
-            extreme_index = index;
-            extreme = highs[index];
+    let mut state = ZigZagState::default();
+    for row in 0..n {
+        if let Some((index, value)) = zigzag_step(&mut state, row, highs[row], lows[row], threshold)
+        {
+            out[index] = Some(value);
         }
     }
-    if direction != 0 {
-        out[extreme_index] = Some(extreme);
+    if let Some((index, value)) = state.endpoint() {
+        out[index] = Some(value);
     }
     out
+}
+
+/// The first sample of a ZigZag path: reversals are measured from its low or high until the
+/// first direction is established, which then confirms this row as the first turning point.
+#[derive(Clone, Copy, Debug, Default)]
+struct ZigZagAnchor {
+    row: usize,
+    high: f64,
+    low: f64,
+}
+
+/// ZigZag carry. `extreme_index` is an absolute source row; every turning point before it is
+/// final, so resuming from this state rewrites outputs only from that row onward.
+#[derive(Clone, Copy, Debug, Default)]
+struct ZigZagState {
+    anchor: Option<ZigZagAnchor>,
+    direction: i8,
+    extreme_index: usize,
+    extreme: f64,
+}
+
+impl ZigZagState {
+    /// The provisional endpoint: the current extreme once a direction exists.
+    fn endpoint(&self) -> Option<(usize, f64)> {
+        (self.direction != 0).then_some((self.extreme_index, self.extreme))
+    }
+
+    /// First row whose output a later sample can still change: the provisional endpoint, the
+    /// anchor while no direction exists, or `fallback` before any sample.
+    fn open_from(&self, fallback: usize) -> usize {
+        match (self.direction, self.anchor) {
+            (0, Some(anchor)) => anchor.row,
+            (0, None) => fallback,
+            _ => self.extreme_index,
+        }
+    }
+
+    /// Output at this state's open row once the path ends at `next`, which is this state or the
+    /// state one sample later: the extreme while it remains the endpoint or that sample confirms
+    /// it (NaN when a further extreme supersedes it), and the anchor's level once that sample
+    /// establishes the first direction.
+    fn open_value_after(&self, next: &ZigZagState) -> f64 {
+        match (self.direction, self.anchor) {
+            (0, Some(anchor)) if next.direction > 0 => anchor.low,
+            (0, Some(anchor)) if next.direction < 0 => anchor.high,
+            (0, _) => f64::NAN,
+            _ if next.extreme_index == self.extreme_index || next.direction != self.direction => {
+                self.extreme
+            }
+            _ => f64::NAN,
+        }
+    }
+}
+
+/// Advance ZigZag by the sample at `row`; returns the turning point it confirms, if any.
+fn zigzag_step(
+    state: &mut ZigZagState,
+    row: usize,
+    high: f64,
+    low: f64,
+    threshold: f64,
+) -> Option<(usize, f64)> {
+    let Some(anchor) = state.anchor else {
+        state.anchor = Some(ZigZagAnchor { row, high, low });
+        state.extreme_index = row;
+        state.extreme = (high + low) / 2.0;
+        return None;
+    };
+    if state.direction == 0 {
+        if high_at_least(high, anchor.low, threshold) {
+            state.direction = 1;
+            state.extreme_index = row;
+            state.extreme = high;
+            return Some((anchor.row, anchor.low));
+        } else if low_at_most(low, anchor.high, threshold) {
+            state.direction = -1;
+            state.extreme_index = row;
+            state.extreme = low;
+            return Some((anchor.row, anchor.high));
+        } else if high > state.extreme {
+            state.extreme = high;
+            state.extreme_index = row;
+        } else if low < state.extreme {
+            state.extreme = low;
+            state.extreme_index = row;
+        }
+        return None;
+    }
+    let confirmed = (state.extreme_index, state.extreme);
+    if state.direction > 0 {
+        if high >= state.extreme {
+            state.extreme = high;
+            state.extreme_index = row;
+        } else if low_at_most(low, state.extreme, threshold) {
+            state.direction = -1;
+            state.extreme_index = row;
+            state.extreme = low;
+            return Some(confirmed);
+        }
+    } else if low <= state.extreme {
+        state.extreme = low;
+        state.extreme_index = row;
+    } else if high_at_least(high, state.extreme, threshold) {
+        state.direction = 1;
+        state.extreme_index = row;
+        state.extreme = high;
+        return Some(confirmed);
+    }
+    None
 }
 
 fn high_at_least(high: f64, reference: f64, threshold: f64) -> bool {
@@ -193,7 +280,7 @@ fn low_at_most(low: f64, reference: f64, threshold: f64) -> bool {
     low <= reference * (1.0 - threshold)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Session {
     open: f64,
     high: f64,
@@ -382,19 +469,30 @@ pub enum DeviationEstimator {
     Sample,
 }
 
-/// Starting K and D of KDJ's `SMA(X,N,1)` smoothing.
+/// How KDJ starts: the first RSV window and the starting K and D of its `SMA(X,N,1)` smoothing.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum KdjSeed {
-    /// The textbook start: a missing previous K or D is 50 ("若无前一日K值与D值，则可分别用50来
-    /// 代替"), so the first K is `(RSV + (M1-1)*50) / M1`.
+    /// The textbook start (通达信 "KDJ传统版"): the first value needs a full `N`-row RSV window,
+    /// and a missing previous K or D is 50 ("若无前一日K值与D值，则可分别用50来代替"), so the first
+    /// K, at row `N - 1`, is `(RSV + (M1-1)*50) / M1`.
     #[default]
     Fifty,
-    /// 通达信/同花顺 formula `SMA(X,N,M)` semantics, where the first value is its input
-    /// (`Y0 = X0`): the first K equals the first RSV and the first D the first K.
+    /// The formula-language `KDJ` (通达信 "KDJ普通版"): `HHV`/`LLV` take the rows available while
+    /// fewer than `N` exist, so RSV exists from the first row, and `SMA(X,N,M)` starts at its
+    /// first input (`Y0 = X0`): the first K, D and J equal the first RSV.
     FirstValue,
+}
+
+/// Rows before KDJ's first value: a full RSV window for the textbook start, none for the
+/// formula-language start, whose `HHV`/`LLV` take the rows available so far.
+fn kdj_warmup_rows(seed: KdjSeed, period: usize) -> usize {
+    match seed {
+        KdjSeed::Fifty => period.saturating_sub(1),
+        KdjSeed::FirstValue => 0,
+    }
 }
 
 /// Convenience preset that expands to explicit indicator parameters. It selects values only;
@@ -407,7 +505,9 @@ pub enum IndicatorConvention {
     /// SMA seeds, `MACD - signal` histogram, population deviation (TradingView/TA-Lib).
     #[default]
     TradingView,
-    /// First-value seeds, `(DIF - DEA) * 2` histogram, sample deviation (通达信/同花顺/富途).
+    /// First-value seeds (and KDJ's formula-language start), `(DIF - DEA) * 2` histogram, sample
+    /// deviation: the 通达信/同花顺 formula language. See `docs/Public_api.md` for what each choice
+    /// was verified against.
     China,
 }
 
@@ -436,8 +536,8 @@ impl IndicatorConvention {
         }
     }
 
-    /// KDJ K/D start under this convention: the textbook 50, or the formula-language `SMA`
-    /// first value.
+    /// KDJ start under this convention: the textbook 50 after a full window, or the
+    /// formula-language first value over the available window.
     pub const fn kdj_seed(self) -> KdjSeed {
         match self {
             Self::TradingView => KdjSeed::Fifty,
@@ -656,17 +756,21 @@ pub fn standard_deviation(values: &[f64], period: usize) -> Vec<Option<f64>> {
     }
     let mut out = vec![None; values.len()];
     for (row, output) in out.iter_mut().enumerate().skip(period.saturating_sub(1)) {
-        let start = row + 1 - period;
-        let window = &values[start..=row];
-        let mean = window.iter().sum::<f64>() / period as f64;
-        let variance = window
-            .iter()
-            .map(|value| (value - mean).powi(2))
-            .sum::<f64>()
-            / period as f64;
-        *output = Some(variance.sqrt());
+        *output = Some(standard_deviation_at(values, row, period));
     }
     out
+}
+
+/// Population standard deviation of the `period` values ending at `row` (`row + 1 >= period`).
+fn standard_deviation_at(values: &[f64], row: usize, period: usize) -> f64 {
+    let window = &values[row + 1 - period..=row];
+    let mean = window.iter().sum::<f64>() / period as f64;
+    let variance = window
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / period as f64;
+    variance.sqrt()
 }
 
 /// Donchian channel: rolling high, midpoint, and rolling low over the high/low columns.
@@ -684,15 +788,7 @@ pub fn donchian(high: &[f64], low: &[f64], period: usize) -> Vec<DonchianPoint> 
         return out;
     }
     for (row, output) in out.iter_mut().enumerate().skip(period.saturating_sub(1)) {
-        let start = row + 1 - period;
-        let upper = high[start..=row]
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let lower = low[start..=row]
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
+        let (upper, lower) = window_extremes(high, low, row, period);
         *output = DonchianPoint {
             upper: Some(upper),
             middle: Some((upper + lower) * 0.5),
@@ -700,6 +796,21 @@ pub fn donchian(high: &[f64], low: &[f64], period: usize) -> Vec<DonchianPoint> 
         };
     }
     out
+}
+
+/// `(highest high, lowest low)` of the `period` rows ending at `row` (`row + 1 >= period`).
+fn window_extremes(highs: &[f64], lows: &[f64], row: usize, period: usize) -> (f64, f64) {
+    let start = row + 1 - period;
+    (
+        highs[start..=row]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max),
+        lows[start..=row]
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min),
+    )
 }
 
 /// Keltner channel using an EMA center and Wilder ATR envelope.
@@ -777,20 +888,25 @@ pub fn cci(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<Op
         return out;
     }
     for (row, output) in out.iter_mut().enumerate().skip(period.saturating_sub(1)) {
-        let start = row + 1 - period;
-        let typical = |index: usize| (highs[index] + lows[index] + closes[index]) / 3.0;
-        let mean = (start..=row).map(typical).sum::<f64>() / period as f64;
-        let mean_deviation = (start..=row)
-            .map(|index| (typical(index) - mean).abs())
-            .sum::<f64>()
-            / period as f64;
-        *output = Some(if mean_deviation > 0.0 {
-            (typical(row) - mean) / (0.015 * mean_deviation)
-        } else {
-            0.0
-        });
+        *output = Some(cci_at(highs, lows, closes, row, period));
     }
     out
+}
+
+/// CCI of the `period` rows ending at `row` (`row + 1 >= period`).
+fn cci_at(highs: &[f64], lows: &[f64], closes: &[f64], row: usize, period: usize) -> f64 {
+    let start = row + 1 - period;
+    let typical = |index: usize| (highs[index] + lows[index] + closes[index]) / 3.0;
+    let mean = (start..=row).map(typical).sum::<f64>() / period as f64;
+    let mean_deviation = (start..=row)
+        .map(|index| (typical(index) - mean).abs())
+        .sum::<f64>()
+        / period as f64;
+    if mean_deviation > 0.0 {
+        (typical(row) - mean) / (0.015 * mean_deviation)
+    } else {
+        0.0
+    }
 }
 
 /// Williams %R over a rolling high/low window. Flat windows emit zero instead of NaN.
@@ -801,22 +917,19 @@ pub fn williams_r(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) ->
         return out;
     }
     for (row, output) in out.iter_mut().enumerate().skip(period.saturating_sub(1)) {
-        let start = row + 1 - period;
-        let high = highs[start..=row]
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let low = lows[start..=row]
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
-        *output = Some(if high > low {
-            -100.0 * (high - closes[row]) / (high - low)
-        } else {
-            0.0
-        });
+        *output = Some(williams_r_at(highs, lows, closes, row, period));
     }
     out
+}
+
+/// Williams %R of the `period` rows ending at `row` (`row + 1 >= period`).
+fn williams_r_at(highs: &[f64], lows: &[f64], closes: &[f64], row: usize, period: usize) -> f64 {
+    let (high, low) = window_extremes(highs, lows, row, period);
+    if high > low {
+        -100.0 * (high - closes[row]) / (high - low)
+    } else {
+        0.0
+    }
 }
 
 /// Stochastic RSI: normalize Wilder RSI within a rolling RSI range.
@@ -877,14 +990,19 @@ pub fn rate_of_change(values: &[f64], period: usize) -> Vec<Option<f64>> {
         return out;
     }
     for (row, output) in out.iter_mut().enumerate().skip(period) {
-        let previous = values[row - period];
-        *output = Some(if previous != 0.0 {
-            (values[row] / previous - 1.0) * 100.0
-        } else {
-            0.0
-        });
+        *output = Some(rate_of_change_at(values, row, period));
     }
     out
+}
+
+/// Percentage change of `row` from the value `period` rows earlier (`row >= period`).
+fn rate_of_change_at(values: &[f64], row: usize, period: usize) -> f64 {
+    let previous = values[row - period];
+    if previous != 0.0 {
+        (values[row] / previous - 1.0) * 100.0
+    } else {
+        0.0
+    }
 }
 
 fn wma_at(values: &[f64], row: usize, period: usize) -> Option<f64> {
@@ -952,8 +1070,9 @@ fn deviation_divisor(period: usize, estimator: DeviationEstimator) -> f64 {
     }
 }
 
-/// Bollinger Bands with an explicit standard-deviation estimator. 通达信/同花顺 `BOLL` is
-/// `MID = MA(C,N)`, `UB/LB = MID ± k*STD(C,N)` with the sample estimator.
+/// Bollinger Bands with an explicit standard-deviation estimator. 通达信's `BOLL` formula is
+/// `MID = MA(C,N)`, `UB/LB = MID ± k*STD(C,N)`, and its function reference defines `STD` as the
+/// sample estimator; 雪球 and 东方财富 publish the population estimator instead.
 pub fn bollinger_with(
     values: &[f64],
     period: usize,
@@ -1236,9 +1355,9 @@ impl Default for KdjState {
     }
 }
 
-/// Advance KDJ by one sample. `extremes` is `(HHV(H,N), LLV(L,N))` over the last `N` samples, or
-/// `None` while fewer than `N` samples exist. A flat window (`HHV == LLV`) carries the previous
-/// RSV (50 before the first), so the lines never become NaN.
+/// Advance KDJ by one sample. `extremes` is `(HHV(H,N), LLV(L,N))` over the seed's window (see
+/// [`KdjSeed`]), or `None` while that window is incomplete. A flat window (`HHV == LLV`) carries
+/// the previous RSV (50 before the first), so the lines never become NaN.
 fn kdj_step(
     state: &mut KdjState,
     extremes: Option<(f64, f64)>,
@@ -1271,11 +1390,12 @@ fn kdj_step(
     Some((state.k, state.d, 3.0 * state.k - 2.0 * state.d))
 }
 
-/// KDJ stochastic oscillator (通达信/同花顺 `KDJ(N,M1,M2)`):
+/// KDJ stochastic oscillator `KDJ(N,M1,M2)`:
 /// `RSV:=(CLOSE-LLV(LOW,N))/(HHV(HIGH,N)-LLV(LOW,N))*100; K:SMA(RSV,M1,1); D:SMA(K,M2,1);
-/// J:3*K-2*D`. The textbook definition supplies 50 for the missing previous K and D ("若无前一日
-/// K值与D值，则可分别用50来代替"), so the first value lands at index `N - 1` with
-/// `K = (RSV + (M1-1)*50) / M1`. A flat window carries the previous RSV (50 for the first).
+/// J:3*K-2*D`, with the textbook start (通达信 "KDJ传统版"): a full `N`-row window, and 50 for the
+/// missing previous K and D ("若无前一日K值与D值，则可分别用50来代替"), so the first value lands at
+/// index `N - 1` with `K = (RSV + (M1-1)*50) / M1`. A flat window carries the previous RSV (50 for
+/// the first). [`kdj_with_seed`] selects the formula-language start instead.
 pub fn kdj(
     highs: &[f64],
     lows: &[f64],
@@ -1295,8 +1415,9 @@ pub fn kdj(
     )
 }
 
-/// [`kdj`] with an explicit K/D start. With [`KdjSeed::FirstValue`] the first value (still at
-/// index `N - 1`) is `K = D = J = RSV`, as 通达信's `SMA(X,N,1)` starts from its first input.
+/// [`kdj`] with an explicit start. With [`KdjSeed::FirstValue`] the RSV of rows before `N - 1`
+/// uses the rows available so far (通达信-style `HHV`/`LLV`), and the first value, at index 0, is
+/// `K = D = J = RSV`, as the formula language's `SMA(X,N,1)` starts from its first input.
 pub fn kdj_with_seed(
     highs: &[f64],
     lows: &[f64],
@@ -1319,9 +1440,10 @@ pub fn kdj_with_seed(
         return out;
     }
     let mut state = KdjState::default();
+    let warmup = kdj_warmup_rows(seed, period);
     for (row, point) in out.iter_mut().enumerate() {
-        let extremes = (row + 1 >= period).then(|| {
-            let window = row + 1 - period..=row;
+        let extremes = (row >= warmup).then(|| {
+            let window = (row + 1).saturating_sub(period)..=row;
             (
                 highs[window.clone()]
                     .iter()
@@ -1481,23 +1603,39 @@ pub fn cmf(
         return out;
     }
     for (row, slot) in out.iter_mut().enumerate().skip(period.saturating_sub(1)) {
-        let start = row + 1 - period;
-        let mut flow = 0.0;
-        let mut volume = 0.0;
-        for index in start..=row {
-            let bar_volume = volumes[index].max(0.0);
-            let range = highs[index] - lows[index];
-            let location = if range != 0.0 {
-                ((closes[index] - lows[index]) - (highs[index] - closes[index])) / range
-            } else {
-                0.0
-            };
-            flow += location * bar_volume;
-            volume += bar_volume;
-        }
-        *slot = Some(if volume > 0.0 { flow / volume } else { 0.0 });
+        *slot = Some(cmf_at(highs, lows, closes, volumes, row, period));
     }
     out
+}
+
+/// Chaikin money flow of the `period` rows ending at `row` (`row + 1 >= period`). Volume rows
+/// past the end of `volumes` are missing and contribute zero.
+fn cmf_at(
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+    volumes: &[f64],
+    row: usize,
+    period: usize,
+) -> f64 {
+    let mut flow = 0.0;
+    let mut volume = 0.0;
+    for index in row + 1 - period..=row {
+        let bar_volume = volumes.get(index).copied().unwrap_or(0.0).max(0.0);
+        let range = highs[index] - lows[index];
+        let location = if range != 0.0 {
+            ((closes[index] - lows[index]) - (highs[index] - closes[index])) / range
+        } else {
+            0.0
+        };
+        flow += location * bar_volume;
+        volume += bar_volume;
+    }
+    if volume > 0.0 {
+        flow / volume
+    } else {
+        0.0
+    }
 }
 
 /// Money flow index over a rolling window, using typical price and non-negative volume. The first
@@ -1519,31 +1657,43 @@ pub fn mfi(
     if period == 0 || n <= period {
         return out;
     }
-    let typical = |row: usize| (highs[row] + lows[row] + closes[row]) / 3.0;
     for (row, slot) in out.iter_mut().enumerate().skip(period) {
-        let start = row + 1 - period;
-        let mut positive = 0.0;
-        let mut negative = 0.0;
-        for (index, &bar_volume) in volumes.iter().enumerate().take(row + 1).skip(start) {
-            let previous = typical(index - 1);
-            let flow = typical(index) * bar_volume.max(0.0);
-            if typical(index) > previous {
-                positive += flow;
-            } else if typical(index) < previous {
-                negative += flow;
-            }
-        }
-        *slot = Some(if negative == 0.0 {
-            if positive == 0.0 {
-                50.0
-            } else {
-                100.0
-            }
-        } else {
-            100.0 - 100.0 / (1.0 + positive / negative)
-        });
+        *slot = Some(mfi_at(highs, lows, closes, volumes, row, period));
     }
     out
+}
+
+/// Money flow index of the `period` direction observations ending at `row` (`row >= period`).
+/// Volume rows past the end of `volumes` are missing and contribute zero.
+fn mfi_at(
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+    volumes: &[f64],
+    row: usize,
+    period: usize,
+) -> f64 {
+    let typical = |row: usize| (highs[row] + lows[row] + closes[row]) / 3.0;
+    let mut positive = 0.0;
+    let mut negative = 0.0;
+    for index in row + 1 - period..=row {
+        let previous = typical(index - 1);
+        let flow = typical(index) * volumes.get(index).copied().unwrap_or(0.0).max(0.0);
+        if typical(index) > previous {
+            positive += flow;
+        } else if typical(index) < previous {
+            negative += flow;
+        }
+    }
+    if negative == 0.0 {
+        if positive == 0.0 {
+            50.0
+        } else {
+            100.0
+        }
+    } else {
+        100.0 - 100.0 / (1.0 + positive / negative)
+    }
 }
 
 /// VWAP accumulation period. `Session` is one trading day, `Weekly` a Monday-start trading week,
@@ -1555,6 +1705,16 @@ pub enum VwapReset {
     Session,
     Weekly,
     Monthly,
+}
+
+impl VwapReset {
+    /// The accumulation period of a row whose trading day is `trading_day_seconds` (the value the
+    /// chart runtime passes, UTC-midnight seconds of the trading date). VWAP, VWAP bands, and
+    /// pivot sessions reset exactly where consecutive rows' keys differ, so chart geometry breaks
+    /// line runs on the same key.
+    pub fn period_key(self, trading_day_seconds: i64) -> i64 {
+        vwap_period_key(trading_day_seconds, self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1625,9 +1785,13 @@ pub struct IndicatorInput<'a> {
     pub high: &'a [f64],
     pub low: &'a [f64],
     pub close: &'a [f64],
+    /// Volume column aligned to the source rows. It may be shorter than the source: rows past
+    /// its end are missing weights, which VWAP, VWAP bands and VWMA weight as one, OBV, CMF, MFI
+    /// and the volume study as zero, and amount-weighted VWAP skips as "no trade".
     pub volume: &'a [f64],
     /// Optional turnover column aligned to the source rows. When non-empty, VWAP reports
-    /// `sum(amount) / sum(volume)` instead of weighting the typical price.
+    /// `sum(amount) / sum(volume)` instead of weighting the typical price. Like `volume`, it may
+    /// be shorter than the source.
     pub amount: &'a [f64],
 }
 
@@ -1638,8 +1802,14 @@ fn whitespace_row(input: &IndicatorInput<'_>, row: usize) -> bool {
 }
 
 /// `(highest high, lowest low)` over the last `period` non-whitespace rows ending at `row`, or
-/// `None` while fewer exist. Work is bounded by `period` plus the whitespace rows it skips.
-fn valid_extremes(input: &IndicatorInput<'_>, row: usize, period: usize) -> Option<(f64, f64)> {
+/// `None` while fewer than `required` (at most `period`) exist. Work is bounded by `period` plus
+/// the whitespace rows it skips.
+fn valid_extremes(
+    input: &IndicatorInput<'_>,
+    row: usize,
+    period: usize,
+    required: usize,
+) -> Option<(f64, f64)> {
     let mut high = f64::NEG_INFINITY;
     let mut low = f64::INFINITY;
     let mut found = 0;
@@ -1654,7 +1824,7 @@ fn valid_extremes(input: &IndicatorInput<'_>, row: usize, period: usize) -> Opti
         low = low.min(input.low[index]);
         found += 1;
     }
-    (found == period).then_some((high, low))
+    (found >= required).then_some((high, low))
 }
 
 /// The row from which `lookback` earlier non-whitespace rows precede `from` (or row 0).
@@ -1668,6 +1838,20 @@ fn valid_lookback_start(input: &IndicatorInput<'_>, from: usize, lookback: usize
         }
     }
     row
+}
+
+/// First row a runtime with a retained tail window (Stochastic `%D`, Stochastic RSI) replays
+/// from when it cannot resume from that window: `lookback` earlier non-whitespace rows precede
+/// both `requested` and the last row. The rebuilt window then still holds the `lookback` samples
+/// before the last row that a later replacement of that row needs, including after a truncation,
+/// where `requested` is the new length.
+fn tail_window_replay_start(
+    input: &IndicatorInput<'_>,
+    requested: usize,
+    n: usize,
+    lookback: usize,
+) -> usize {
+    valid_lookback_start(input, requested.min(n.saturating_sub(1)), lookback)
 }
 
 /// Recursive formulas keep one checkpoint per 1024 rows plus the two tail states needed by
@@ -1700,16 +1884,19 @@ impl<T: Copy + Default> RecursiveHistory<T> {
     }
 
     /// Whether [`Self::begin`] resumes exactly at `from` from a retained tail state: a
-    /// replacement of the last row alone, or an append (or no change) after the last row.
+    /// replacement of the last row (alone or with appended rows), or an append (or no change)
+    /// after the last row.
     fn resumes_at_tail(&self, n: usize, from: usize) -> bool {
         let from = from.min(n);
-        (n == self.len && from + 1 == n && self.before_tail.is_some())
+        (n >= self.len && from + 1 == self.len && self.before_tail.is_some())
             || (n >= self.len && from == self.len && self.tail.is_some())
     }
 
     fn begin(&mut self, n: usize, from: usize) -> (usize, T) {
         let from = from.min(n);
-        if n == self.len && from + 1 == n {
+        // `before_tail` is the state before the last row, so it resumes a replacement of that row
+        // whether or not the same rebuild also appends rows.
+        if n >= self.len && from + 1 == self.len {
             if let Some(state) = self.before_tail {
                 if self
                     .checkpoints
@@ -2172,16 +2359,20 @@ impl IncrementalStochasticState {
         let k_period = self.k_period.get();
         let d_period = self.d_period.get();
         let realtime = requested >= self.source_len.saturating_sub(1) && len >= self.source_len;
+        // Otherwise replay the `d - 1` samples before both `requested` and the last row, so the
+        // retained windows serve a later replacement of the last row even after a truncation.
         let state_from = if realtime {
             requested
         } else {
-            requested.saturating_sub(d_period.saturating_sub(1))
+            requested
+                .min(len.saturating_sub(1))
+                .saturating_sub(d_period.saturating_sub(1))
         };
         let (start, mut state) = self.history.begin(len, state_from);
         self.last_work_rows = len.saturating_sub(start);
         let mut recent = std::collections::VecDeque::with_capacity(d_period.min(len));
         if realtime {
-            if len == self.source_len && requested + 1 == len {
+            if requested + 1 == self.source_len {
                 recent.extend(self.before_tail_k.iter().copied());
             } else {
                 recent.extend(self.tail_k.iter().copied());
@@ -3052,6 +3243,12 @@ enum IncrementalKind {
     StochasticRsi {
         rsi_period: usize,
         stochastic_period: usize,
+        state: RecursiveHistory<IndexedRsiState>,
+        /// RSI values of the stochastic window as of the last source row (at most
+        /// `stochastic_period`), reused only where the tail state resumes.
+        tail_rsi: Vec<f64>,
+        tail_pushed: bool,
+        source_len: usize,
     },
     Momentum {
         period: usize,
@@ -3064,9 +3261,11 @@ enum IncrementalKind {
     },
     PivotPoints {
         kind: PivotKind,
+        state: RecursiveHistory<PivotState>,
     },
     ZigZag {
         deviation_percent: f64,
+        state: RecursiveHistory<ZigZagState>,
     },
     Keltner {
         period: usize,
@@ -3260,6 +3459,10 @@ impl IncrementalState {
             IncrementalKind::StochasticRsi {
                 rsi_period,
                 stochastic_period,
+                state: RecursiveHistory::new(),
+                tail_rsi: Vec::new(),
+                tail_pushed: false,
+                source_len: 0,
             },
             1,
         )
@@ -3278,11 +3481,23 @@ impl IncrementalState {
     }
 
     pub fn pivot_points(kind: PivotKind) -> Self {
-        Self::new(IncrementalKind::PivotPoints { kind }, 5)
+        Self::new(
+            IncrementalKind::PivotPoints {
+                kind,
+                state: RecursiveHistory::new(),
+            },
+            5,
+        )
     }
 
     pub fn zigzag(deviation_percent: f64) -> Self {
-        Self::new(IncrementalKind::ZigZag { deviation_percent }, 1)
+        Self::new(
+            IncrementalKind::ZigZag {
+                deviation_percent,
+                state: RecursiveHistory::new(),
+            },
+            1,
+        )
     }
 
     pub fn keltner(period: usize, multiplier: f64) -> Self {
@@ -3555,6 +3770,7 @@ impl IncrementalState {
             IncrementalKind::StochasticRsi {
                 rsi_period,
                 stochastic_period,
+                ..
             } => rsi_period + wilder_decay_rows(*rsi_period) + stochastic_period.saturating_sub(1),
             IncrementalKind::Macd {
                 fast_period,
@@ -3580,6 +3796,8 @@ impl IncrementalState {
                 d_smoothing,
                 ..
             } => {
+                // The first N-1 RSVs are missing (textbook) or over a partial window (formula
+                // language) either way, so both starts share the horizon.
                 let k = period.saturating_sub(1) + wilder_decay_rows(*k_smoothing);
                 if index == 0 {
                     k
@@ -3665,11 +3883,13 @@ impl IncrementalState {
             IncrementalKind::StandardDeviation { .. } => 0,
             IncrementalKind::Cci { .. } => 0,
             IncrementalKind::WilliamsR { .. } => 0,
-            IncrementalKind::StochasticRsi { .. } => 0,
+            IncrementalKind::StochasticRsi {
+                state, tail_rsi, ..
+            } => state.bytes() + tail_rsi.capacity() * std::mem::size_of::<f64>(),
             IncrementalKind::Momentum { .. } | IncrementalKind::RateOfChange { .. } => 0,
             IncrementalKind::Donchian { .. } => 0,
-            IncrementalKind::PivotPoints { .. } => 0,
-            IncrementalKind::ZigZag { .. } => 0,
+            IncrementalKind::PivotPoints { state, .. } => state.bytes(),
+            IncrementalKind::ZigZag { state, .. } => state.bytes(),
         }
     }
 
@@ -3680,6 +3900,10 @@ impl IncrementalState {
             .sum()
     }
 
+    /// Source rows the last rebuild evaluated: one formula step per replayed recursive row, one
+    /// window evaluation (bounded by the formula's period) per emitted windowed row, compacted
+    /// rows for a whitespace window, and for ZigZag the rows re-emitted back to a turning point
+    /// the rebuild changed.
     pub fn last_work_rows(&self) -> usize {
         self.last_work_rows
     }
@@ -3721,13 +3945,10 @@ impl IncrementalState {
         self.rebuild_rows(input, requested, n, trading_day_seconds);
     }
 
-    /// Prior non-whitespace rows a stateless formula reads before `from`; `usize::MAX` means the
-    /// whole history. `None` for recursive formulas, which skip whitespace inside their state.
+    /// Prior non-whitespace rows a stateless window formula reads before `from`. `None` for
+    /// recursive and path-dependent formulas, which skip whitespace inside their state.
     fn compaction_lookback(&self) -> Option<usize> {
         match &self.kind {
-            IncrementalKind::StochasticRsi { .. }
-            | IncrementalKind::PivotPoints { .. }
-            | IncrementalKind::ZigZag { .. } => Some(usize::MAX),
             IncrementalKind::Sma { .. }
             | IncrementalKind::Wma { .. }
             | IncrementalKind::Hma { .. }
@@ -3763,14 +3984,13 @@ impl IncrementalState {
         let rows = (start..n)
             .filter(|&row| !whitespace_row(&input, row))
             .collect::<Vec<_>>();
+        // A weight column shorter than the source keeps its missing tail missing, so every formula
+        // still applies its own missing-weight fallback to those rows.
         let pick = |column: &[f64]| -> Vec<f64> {
-            if column.is_empty() {
-                Vec::new()
-            } else {
-                rows.iter()
-                    .map(|&row| column.get(row).copied().unwrap_or(f64::NAN))
-                    .collect()
-            }
+            rows.iter()
+                .take_while(|&&row| row < column.len())
+                .map(|&row| column[row])
+                .collect()
         };
         let times = rows.iter().map(|&row| input.times[row]).collect::<Vec<_>>();
         let (open, high, low, close) = (
@@ -3796,16 +4016,10 @@ impl IncrementalState {
             trading_day_seconds,
         );
         let starts = output_starts(&self.kind);
-        // ZigZag rewrites its whole history on every rebuild (its `start` is row 0).
-        let rewrites_history = matches!(self.kind, IncrementalKind::ZigZag { .. });
         for (output, &warmup) in starts.iter().enumerate().take(self.output_count) {
             let local_output_from = self.output_from[output];
             let local = std::mem::take(&mut self.outputs[output]);
-            let row_from = if rewrites_history {
-                start
-            } else {
-                requested.max(warmup).min(n)
-            };
+            let row_from = requested.max(warmup).min(n);
             let mut values = Vec::with_capacity(n - row_from);
             let mut local_row = rows.partition_point(|&row| row < row_from);
             for row in row_from..n {
@@ -3978,103 +4192,272 @@ impl IncrementalState {
             IncrementalKind::StandardDeviation { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let values = standard_deviation(input.close, *period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                for row in start..n {
+                    self.outputs[0].push(standard_deviation_at(input.close, row, *period));
+                }
             }
             IncrementalKind::Cci { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let values = cci(input.high, input.low, input.close, *period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                for row in start..n {
+                    self.outputs[0].push(cci_at(input.high, input.low, input.close, row, *period));
+                }
             }
             IncrementalKind::WilliamsR { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let values = williams_r(input.high, input.low, input.close, *period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                for row in start..n {
+                    self.outputs[0].push(williams_r_at(
+                        input.high,
+                        input.low,
+                        input.close,
+                        row,
+                        *period,
+                    ));
+                }
             }
             IncrementalKind::StochasticRsi {
                 rsi_period,
                 stochastic_period,
+                state,
+                tail_rsi,
+                tail_pushed,
+                source_len,
             } => {
-                let start = self.output_from[0];
+                // Wilder RSI is recursive state; the stochastic window over its last
+                // `stochastic_period` values is rebuilt like Stochastic %D: from the retained tail
+                // window where the tail state resumes, otherwise by replaying enough prior rows.
+                let window = *stochastic_period;
+                let realtime = state.resumes_at_tail(n, requested);
+                let state_from = if realtime {
+                    requested
+                } else {
+                    tail_window_replay_start(&input, requested, n, window.saturating_sub(1))
+                };
+                let (start, mut accumulator) = state.begin(n, state_from);
+                debug_assert!(!realtime || start == requested);
                 self.last_work_rows = n - start;
-                let values = stochastic_rsi(input.close, *rsi_period, *stochastic_period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                let mut recent = std::collections::VecDeque::with_capacity(window);
+                if realtime {
+                    recent.extend(tail_rsi.iter().copied());
+                    if requested + 1 == *source_len && *tail_pushed {
+                        recent.pop_back();
+                    }
+                }
+                let mut tail = None;
+                let mut before_tail = None;
+                let mut pushed_last = *tail_pushed;
+                for row in start..n {
+                    let previous = accumulator;
+                    let mut value = None;
+                    let mut pushed = false;
+                    if !whitespace_row(&input, row) {
+                        if let Some(rsi) = indexed_rsi_step(
+                            &mut accumulator,
+                            input.close[row],
+                            *rsi_period,
+                            IndicatorSeed::Sma,
+                        ) {
+                            recent.push_back(rsi);
+                            if recent.len() > window {
+                                recent.pop_front();
+                            }
+                            pushed = true;
+                            if recent.len() == window {
+                                let low = recent.iter().copied().fold(f64::INFINITY, f64::min);
+                                let high = recent.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                                value = Some(if high > low {
+                                    100.0 * (rsi - low) / (high - low)
+                                } else {
+                                    0.0
+                                });
+                            }
+                        }
+                    }
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        self.outputs[0].push(value.unwrap_or(f64::NAN));
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                        pushed_last = pushed;
+                    }
+                }
+                state.finish(n, tail, before_tail);
+                tail_rsi.clear();
+                tail_rsi.extend(recent);
+                *tail_pushed = pushed_last;
+                *source_len = n;
             }
             IncrementalKind::Momentum { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let values = momentum(input.close, *period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                for row in start..n {
+                    self.outputs[0].push(input.close[row] - input.close[row - *period]);
+                }
             }
             IncrementalKind::RateOfChange { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let values = rate_of_change(input.close, *period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                for row in start..n {
+                    self.outputs[0].push(rate_of_change_at(input.close, row, *period));
+                }
             }
             IncrementalKind::Donchian { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let points = donchian(input.high, input.low, *period);
-                for point in points.into_iter().skip(start) {
-                    self.outputs[0].push(point.upper.expect("Donchian upper after warmup"));
-                    self.outputs[1].push(point.middle.expect("Donchian middle after warmup"));
-                    self.outputs[2].push(point.lower.expect("Donchian lower after warmup"));
+                for row in start..n {
+                    let (upper, lower) = window_extremes(input.high, input.low, row, *period);
+                    self.outputs[0].push(upper);
+                    self.outputs[1].push((upper + lower) * 0.5);
+                    self.outputs[2].push(lower);
                 }
             }
-            IncrementalKind::PivotPoints { kind } => {
-                let start = self.output_from[0];
+            IncrementalKind::PivotPoints { kind, state } => {
+                let (start, mut accumulator) = state.begin(n, requested);
                 self.last_work_rows = n - start;
-                let points = pivot_points_by_trading_day(
-                    input.times,
-                    input.open,
-                    input.high,
-                    input.low,
-                    input.close,
-                    *kind,
-                    trading_day_seconds,
-                );
-                for point in points.into_iter().skip(start) {
-                    self.outputs[0].push(point.pivot.unwrap_or(f64::NAN));
-                    self.outputs[1].push(point.resistance_1.unwrap_or(f64::NAN));
-                    self.outputs[2].push(point.support_1.unwrap_or(f64::NAN));
-                    self.outputs[3].push(point.resistance_2.unwrap_or(f64::NAN));
-                    self.outputs[4].push(point.support_2.unwrap_or(f64::NAN));
+                let mut tail = None;
+                let mut before_tail = None;
+                for row in start..n {
+                    let previous = accumulator;
+                    let levels = (!whitespace_row(&input, row)).then(|| {
+                        pivot_step(
+                            &mut accumulator,
+                            trading_day_seconds(input.times[row]).div_euclid(86_400),
+                            Session {
+                                open: input.open[row],
+                                high: input.high[row],
+                                low: input.low[row],
+                                close: input.close[row],
+                            },
+                        );
+                        accumulator
+                            .previous
+                            .map(|session| pivot_levels(session, *kind))
+                    });
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        let value = |pick: fn(PivotPoint) -> Option<f64>| {
+                            levels.flatten().and_then(pick).unwrap_or(f64::NAN)
+                        };
+                        self.outputs[0].push(value(|point| point.pivot));
+                        self.outputs[1].push(value(|point| point.resistance_1));
+                        self.outputs[2].push(value(|point| point.support_1));
+                        self.outputs[3].push(value(|point| point.resistance_2));
+                        self.outputs[4].push(value(|point| point.support_2));
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                    }
                 }
+                state.finish(n, tail, before_tail);
             }
-            IncrementalKind::ZigZag { deviation_percent } => {
-                // A new bar can move the provisional endpoint, and a historical correction can
-                // alter every later confirmation. Recompute the bounded source window so the
-                // sparse turning-point stream never leaves a stale endpoint behind.
-                self.output_from[0] = 0;
-                self.last_work_rows = n;
-                self.outputs[0].extend(
-                    zigzag(input.high, input.low, *deviation_percent)
-                        .into_iter()
-                        .map(|value| value.unwrap_or(f64::NAN)),
-                );
+            IncrementalKind::ZigZag {
+                deviation_percent,
+                state,
+            } => {
+                // Turning points are written back to earlier rows: a sample can confirm the
+                // current extreme or move the provisional endpoint. Every row before the resumed
+                // state's open row (its provisional endpoint, or its anchor while no direction
+                // exists) is final, and every row between the open row and the resume row is
+                // empty in both the retained and the rebuilt path. Only the open row itself can
+                // change, so a tail resume, which knows the value the host retained there,
+                // re-emits the rows back to it only when that value changes; other resumes
+                // re-emit from the open row.
+                let valid = deviation_percent.is_finite() && *deviation_percent > 0.0;
+                let threshold = *deviation_percent / 100.0;
+                let retained_open = if n >= state.len && requested + 1 == state.len {
+                    state
+                        .before_tail
+                        .zip(state.tail)
+                        .map(|(before, replaced)| before.open_value_after(&replaced))
+                } else if n >= state.len && requested == state.len {
+                    state.tail.map(|tail| tail.open_value_after(&tail))
+                } else {
+                    None
+                };
+                let (start, mut accumulator) = state.begin(n, requested);
+                let open_row = accumulator.open_from(start);
+                let mut output_from = if retained_open.is_some() {
+                    start
+                } else {
+                    open_row
+                };
+                self.outputs[0].clear();
+                self.outputs[0].resize(n - output_from, f64::NAN);
+                let mut open_value = f64::NAN;
+                let mut place = |outputs: &mut [f64], (index, value): (usize, f64)| match index
+                    .checked_sub(output_from)
+                {
+                    Some(offset) => outputs[offset] = value,
+                    None => {
+                        debug_assert_eq!(index, open_row);
+                        open_value = value;
+                    }
+                };
+                let mut tail = None;
+                let mut before_tail = None;
+                for row in start..n {
+                    let previous = accumulator;
+                    if valid && !whitespace_row(&input, row) {
+                        if let Some(point) = zigzag_step(
+                            &mut accumulator,
+                            row,
+                            input.high[row],
+                            input.low[row],
+                            threshold,
+                        ) {
+                            place(&mut self.outputs[0], point);
+                        }
+                    }
+                    state.checkpoint(row, accumulator);
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                    }
+                }
+                if let Some(point) = accumulator.endpoint() {
+                    place(&mut self.outputs[0], point);
+                }
+                let retained_open = retained_open.unwrap_or(f64::NAN);
+                let unchanged =
+                    open_value == retained_open || (open_value.is_nan() && retained_open.is_nan());
+                if open_row < output_from && !unchanged {
+                    self.outputs[0]
+                        .splice(0..0, std::iter::repeat_n(f64::NAN, output_from - open_row));
+                    self.outputs[0][0] = open_value;
+                    output_from = open_row;
+                }
+                self.output_from[0] = output_from;
+                self.last_work_rows = n - output_from.min(start);
+                state.finish(n, tail, before_tail);
             }
             IncrementalKind::Ichimoku => {
-                let points = ichimoku(input.high, input.low, input.close);
-                self.last_work_rows = n;
-                for (output_index, start) in
+                for (output_index, &start) in
                     self.output_from[..self.output_count].iter().enumerate()
                 {
-                    for &point in points.iter().skip(*start).take(n - *start) {
+                    for row in start..n {
                         let value = match output_index {
-                            0 => point.conversion,
-                            1 => point.base,
-                            2 => point.leading_a,
-                            3 => point.leading_b,
-                            4 => point.lagging,
+                            0 => rolling_midpoint(input.high, input.low, row, 9),
+                            1 => rolling_midpoint(input.high, input.low, row, 26),
+                            2 => rolling_midpoint(input.high, input.low, row, 9)
+                                .zip(rolling_midpoint(input.high, input.low, row, 26))
+                                .map(|(conversion, base)| (conversion + base) * 0.5),
+                            3 => rolling_midpoint(input.high, input.low, row, 52),
+                            4 => Some(input.close[row]),
                             _ => unreachable!("Ichimoku output index"),
                         };
                         self.outputs[output_index]
                             .push(value.expect("Ichimoku output after warmup"));
                     }
                 }
+                self.last_work_rows = n - self.output_from[..self.output_count]
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap_or(n);
             }
             IncrementalKind::Keltner {
                 period,
@@ -4380,7 +4763,7 @@ impl IncrementalState {
                 let state_from = if realtime {
                     requested
                 } else {
-                    valid_lookback_start(&input, requested, d_period.saturating_sub(1))
+                    tail_window_replay_start(&input, requested, n, d_period.saturating_sub(1))
                 };
                 let (start, mut accumulator) = state.begin(n, state_from);
                 debug_assert!(!realtime || start == requested);
@@ -4388,7 +4771,7 @@ impl IncrementalState {
                 let mut recent = std::collections::VecDeque::with_capacity(*d_period);
                 if realtime {
                     recent.extend(tail_k.iter().copied());
-                    if n == *source_len && requested + 1 == n && *tail_pushed {
+                    if requested + 1 == *source_len && *tail_pushed {
                         recent.pop_back();
                     }
                 }
@@ -4403,7 +4786,7 @@ impl IncrementalState {
                     let mut pushed = false;
                     if !whitespace_row(&input, row) {
                         accumulator.seen += 1;
-                        let k = match valid_extremes(&input, row, *k_period) {
+                        let k = match valid_extremes(&input, row, *k_period, *k_period) {
                             None => 50.0,
                             Some((high, low)) if high > low => {
                                 100.0 * (input.close[row] - low) / (high - low)
@@ -4461,7 +4844,12 @@ impl IncrementalState {
                     } else {
                         kdj_step(
                             &mut accumulator,
-                            valid_extremes(&input, row, *period),
+                            valid_extremes(
+                                &input,
+                                row,
+                                *period,
+                                kdj_warmup_rows(*seed, *period) + 1,
+                            ),
                             input.close[row],
                             *k_smoothing,
                             *d_smoothing,
@@ -4585,14 +4973,30 @@ impl IncrementalState {
             IncrementalKind::Cmf { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let values = cmf(input.high, input.low, input.close, input.volume, *period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                for row in start..n {
+                    self.outputs[0].push(cmf_at(
+                        input.high,
+                        input.low,
+                        input.close,
+                        input.volume,
+                        row,
+                        *period,
+                    ));
+                }
             }
             IncrementalKind::Mfi { period } => {
                 let start = self.output_from[0];
                 self.last_work_rows = n - start;
-                let values = mfi(input.high, input.low, input.close, input.volume, *period);
-                self.outputs[0].extend(values.into_iter().skip(start).flatten());
+                for row in start..n {
+                    self.outputs[0].push(mfi_at(
+                        input.high,
+                        input.low,
+                        input.close,
+                        input.volume,
+                        row,
+                        *period,
+                    ));
+                }
             }
             IncrementalKind::Volume { period } => {
                 let volume = input.volume;
@@ -4603,9 +5007,12 @@ impl IncrementalState {
                     self.outputs[0].push(volume.get(row).copied().unwrap_or(0.0).max(0.0));
                 }
                 for row in average_start..n {
-                    let window = &volume[row + 1 - *period..=row];
+                    let window = row + 1 - *period..=row;
                     self.outputs[1].push(
-                        window.iter().map(|value| value.max(0.0)).sum::<f64>() / *period as f64,
+                        window
+                            .map(|row| volume.get(row).copied().unwrap_or(0.0).max(0.0))
+                            .sum::<f64>()
+                            / *period as f64,
                     );
                 }
             }
@@ -4702,8 +5109,8 @@ fn output_starts(kind: &IncrementalKind) -> [usize; MAX_OUTPUTS] {
         IncrementalKind::Tema { period, .. } => {
             [period.saturating_mul(3).saturating_sub(3), 0, 0, 0, 0]
         }
-        IncrementalKind::Kdj { period, .. } => {
-            let start = period.saturating_sub(1);
+        IncrementalKind::Kdj { period, seed, .. } => {
+            let start = kdj_warmup_rows(*seed, *period);
             [start, start, start, 0, 0]
         }
         IncrementalKind::Smma { period, .. } => [period.saturating_sub(1), 0, 0, 0, 0],
@@ -4727,6 +5134,7 @@ fn output_starts(kind: &IncrementalKind) -> [usize; MAX_OUTPUTS] {
         IncrementalKind::StochasticRsi {
             rsi_period,
             stochastic_period,
+            ..
         } => [
             rsi_period
                 .saturating_add(*stochastic_period)
@@ -5662,6 +6070,106 @@ mod tests {
     }
 
     #[test]
+    fn indexed_stochastic_replacement_plus_append_resumes_from_the_tail_window() {
+        // Closing the current bar and opening the next one in a single rebuild resumes from the
+        // state before the replaced row with the `%D` window before it, even right after the
+        // sparse checkpoint at row 1023, where resuming from that checkpoint with the tail window
+        // would count the replaced row's old `%K` twice.
+        let k_period = NonZeroUsize::new(2).expect("k");
+        let d_period = NonZeroUsize::new(3).expect("d");
+        let sample = |index: usize, revision: f64| {
+            let close = 100.0 + (index as f64 * 0.7).sin() * 5.0 + revision;
+            Some(StochasticSample {
+                high: close + 1.0 + (index % 3) as f64,
+                low: close - 1.0,
+                close,
+            })
+        };
+        for len in 1_024..1_030 {
+            let mut samples = (0..len).map(|index| sample(index, 0.0)).collect::<Vec<_>>();
+            let mut output = vec![StochasticPoint { k: None, d: None }; len + 1];
+            let mut state = IncrementalStochasticState::new(k_period, d_period);
+            state.rebuild_from_indexed(
+                len,
+                0,
+                |index| samples[index],
+                |index, value| output[index] = value,
+            );
+            samples[len - 1] = sample(len - 1, 3.0);
+            samples.push(sample(len, 0.0));
+            state.rebuild_from_indexed(
+                len + 1,
+                len - 1,
+                |index| samples[index],
+                |index, value| output[index] = value,
+            );
+            assert_eq!(state.last_work_rows(), 2, "len {len}");
+            let mut expected = vec![StochasticPoint { k: None, d: None }; len + 1];
+            IncrementalStochasticState::new(k_period, d_period).rebuild_from_indexed(
+                len + 1,
+                0,
+                |index| samples[index],
+                |index, value| expected[index] = value,
+            );
+            assert_eq!(output, expected, "len {len}");
+        }
+    }
+
+    #[test]
+    fn indexed_stochastic_truncation_just_past_a_checkpoint_keeps_the_d_window() {
+        // A truncation resumes from the sparse checkpoint at row 1023 when the new length is just
+        // past it; the retained `%D` windows must still serve a later replacement of the new last
+        // row.
+        let k_period = NonZeroUsize::new(2).expect("k");
+        let d_period = NonZeroUsize::new(3).expect("d");
+        let sample = |index: usize, revision: f64| {
+            let close = 100.0 + (index as f64 * 0.7).sin() * 5.0 + revision;
+            Some(StochasticSample {
+                high: close + 1.0 + (index % 3) as f64,
+                low: close - 1.0,
+                close,
+            })
+        };
+        for len in 1_024..1_030 {
+            let mut samples = (0..1_040)
+                .map(|index| sample(index, 0.0))
+                .collect::<Vec<_>>();
+            let mut output = vec![StochasticPoint { k: None, d: None }; samples.len()];
+            let mut state = IncrementalStochasticState::new(k_period, d_period);
+            state.rebuild_from_indexed(
+                samples.len(),
+                0,
+                |index| samples[index],
+                |index, value| output[index] = value,
+            );
+            samples.truncate(len);
+            output.truncate(len);
+            state.rebuild_from_indexed(
+                len,
+                len,
+                |index| samples[index],
+                |index, value| output[index] = value,
+            );
+            samples[len - 1] = sample(len - 1, 3.0);
+            state.rebuild_from_indexed(
+                len,
+                len - 1,
+                |index| samples[index],
+                |index, value| output[index] = value,
+            );
+            assert_eq!(state.last_work_rows(), 1, "len {len}");
+            let mut expected = vec![StochasticPoint { k: None, d: None }; len];
+            IncrementalStochasticState::new(k_period, d_period).rebuild_from_indexed(
+                len,
+                0,
+                |index| samples[index],
+                |index, value| expected[index] = value,
+            );
+            assert_eq!(output, expected, "len {len}");
+        }
+    }
+
+    #[test]
     fn indexed_stochastic_d_period_does_not_preallocate_unbounded_memory() {
         let k_period = NonZeroUsize::new(2).expect("k");
         let d_period = NonZeroUsize::new(usize::MAX).expect("d");
@@ -5895,6 +6403,35 @@ mod tests {
     }
 
     #[test]
+    fn period_keys_change_exactly_where_vwap_resets() {
+        // 2024-01-04 (Thu) .. 2024-02-02 (Fri), one row per day.
+        let days: Vec<i64> = (0..30)
+            .map(|index| 1_704_326_400 + index * 86_400)
+            .collect();
+        let prices: Vec<f64> = (0..30).map(|index| 10.0 + index as f64).collect();
+        for reset in [VwapReset::Session, VwapReset::Weekly, VwapReset::Monthly] {
+            let points = vwap_bands(
+                &days,
+                &prices,
+                &prices,
+                &prices,
+                &[1.0; 30],
+                VwapBandsOptions {
+                    reset,
+                    standard_deviation: 1.0,
+                    percent: 0.0,
+                },
+            );
+            for row in 1..days.len() {
+                // A reset makes the row's basis its own price (one unit-weight sample).
+                let reset_here = points[row].basis == Some(prices[row]);
+                let key_changed = reset.period_key(days[row]) != reset.period_key(days[row - 1]);
+                assert_eq!(reset_here, key_changed, "{reset:?} row {row}");
+            }
+        }
+    }
+
+    #[test]
     fn chart_runtime_buckets_vwap_and_pivots_by_the_supplied_trading_day() {
         // US extended hours in winter: 18:00, 19:00 and 20:00 ET cross 00:00 UTC at 19:00 ET.
         // UTC bucketing resets mid-session; the Eastern trading day keeps one session.
@@ -6019,6 +6556,7 @@ mod tests {
         MacdChina,
         BollingerSample,
         Kdj,
+        KdjFirstValue,
     }
 
     fn expected(kind: TestKind, input: IndicatorInput<'_>) -> Vec<Vec<Option<f64>>> {
@@ -6179,8 +6717,13 @@ mod tests {
                     points.iter().map(|point| point.lower).collect(),
                 ]
             }
-            TestKind::Kdj => {
-                let points = kdj(input.high, input.low, input.close, 5, 3, 3);
+            TestKind::Kdj | TestKind::KdjFirstValue => {
+                let seed = if matches!(kind, TestKind::Kdj) {
+                    KdjSeed::Fifty
+                } else {
+                    KdjSeed::FirstValue
+                };
+                let points = kdj_with_seed(input.high, input.low, input.close, 5, 3, 3, seed);
                 vec![
                     points.iter().map(|point| point.k).collect(),
                     points.iter().map(|point| point.d).collect(),
@@ -6300,6 +6843,10 @@ mod tests {
                 IncrementalState::bollinger_with(5, 2.0, DeviationEstimator::Sample),
             ),
             (TestKind::Kdj, IncrementalState::kdj(5, 3, 3)),
+            (
+                TestKind::KdjFirstValue,
+                IncrementalState::kdj_with_seed(5, 3, 3, KdjSeed::FirstValue),
+            ),
         ];
         let mut times = (0..40).map(|index| index * 3_600).collect::<Vec<_>>();
         let mut close = (0..40)
@@ -6841,6 +7388,10 @@ mod tests {
             ("wma", IncrementalState::wma(5)),
             ("kdj", IncrementalState::kdj(5, 3, 3)),
             (
+                "kdj_first_value",
+                IncrementalState::kdj_with_seed(5, 3, 3, KdjSeed::FirstValue),
+            ),
+            (
                 "ema_first_value",
                 IncrementalState::ema_with_seed(5, IndicatorSeed::FirstValue),
             ),
@@ -7163,27 +7714,36 @@ mod tests {
     }
 
     #[test]
-    fn kdj_first_value_seed_starts_k_and_d_at_the_first_rsv() {
+    fn kdj_first_value_seed_starts_at_the_first_row_over_the_available_window() {
         let highs = [10.0, 12.0, 11.0, 13.0, 12.5];
         let lows = [8.0, 9.0, 9.5, 10.0, 11.0];
         let closes = [9.0, 11.0, 10.0, 12.5, 11.5];
         let points = kdj_with_seed(&highs, &lows, &closes, 3, 3, 3, KdjSeed::FirstValue);
-        assert_eq!(points[1].k, None, "the RSV window still needs N rows");
-        let rsv = 100.0 * (10.0 - 8.0) / (12.0 - 8.0);
+        // Formula-language HHV/LLV take the rows available while fewer than N exist, so the
+        // first RSV is row 0's own and SMA(X,N,1) starts there: K = D = J = RSV.
+        let rsv = 100.0 * (9.0 - 8.0) / (10.0 - 8.0);
         assert_eq!(
-            (points[2].k, points[2].d, points[2].j),
+            (points[0].k, points[0].d, points[0].j),
             (Some(rsv), Some(rsv), Some(rsv))
         );
-        let rsv = 100.0 * (12.5 - 9.0) / (13.0 - 9.0);
-        let k = (rsv + 2.0 * points[2].k.unwrap()) / 3.0;
-        let d = (k + 2.0 * points[2].d.unwrap()) / 3.0;
-        assert!((points[3].k.unwrap() - k).abs() < 1e-12);
-        assert!((points[3].d.unwrap() - d).abs() < 1e-12);
-        assert!((points[3].j.unwrap() - (3.0 * k - 2.0 * d)).abs() < 1e-12);
+        let mut k = rsv;
+        let mut d = rsv;
+        for (row, rsv) in [
+            (1, 100.0 * (11.0 - 8.0) / (12.0 - 8.0)),
+            (2, 100.0 * (10.0 - 8.0) / (12.0 - 8.0)),
+            (3, 100.0 * (12.5 - 9.0) / (13.0 - 9.0)),
+            (4, 100.0 * (11.5 - 9.5) / (13.0 - 9.5)),
+        ] {
+            k = (rsv + 2.0 * k) / 3.0;
+            d = (k + 2.0 * d) / 3.0;
+            assert!((points[row].k.unwrap() - k).abs() < 1e-12, "row {row}");
+            assert!((points[row].d.unwrap() - d).abs() < 1e-12, "row {row}");
+            assert!((points[row].j.unwrap() - (3.0 * k - 2.0 * d)).abs() < 1e-12);
+        }
         // A flat first window carries the conventional 50 RSV as its first value.
         let flat = [5.0; 4];
         let points = kdj_with_seed(&flat, &flat, &flat, 3, 3, 3, KdjSeed::FirstValue);
-        assert_eq!(points[2].k, Some(50.0));
+        assert_eq!(points[0].k, Some(50.0));
 
         // The default and the TradingView preset keep the textbook start; the China preset
         // selects the formula-language first value. Streaming matches the dense form.
@@ -7206,12 +7766,101 @@ mod tests {
             },
             0,
         );
-        assert_eq!(runtime.output_from(0), 2);
+        assert_eq!(runtime.output_from(0), 0);
         for (index, output) in [0, 1, 2].into_iter().enumerate() {
             let streamed = runtime.output(output);
-            for (offset, point) in dense[2..].iter().enumerate() {
+            assert_eq!(streamed.len(), dense.len());
+            for (offset, point) in dense.iter().enumerate() {
                 let expected = [point.k, point.d, point.j][index].unwrap();
                 assert!((streamed[offset] - expected).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn kdj_first_value_partial_window_counts_only_real_rows() {
+        // Whitespace before and inside the first N rows: the first value is the first real row's
+        // own RSV, and the partial window of a later row holds only the real rows before it.
+        let nan = f64::NAN;
+        let highs = [nan, 12.0, nan, 13.0, 12.5, 14.0, 13.5];
+        let lows = [nan, 9.0, nan, 10.0, 11.0, 10.5, 12.0];
+        let closes = [nan, 11.0, nan, 12.5, 11.5, 13.0, 12.5];
+        let times = (0..closes.len() as i64).collect::<Vec<_>>();
+        let input = IndicatorInput {
+            times: &times,
+            open: &closes,
+            high: &highs,
+            low: &lows,
+            close: &closes,
+            volume: &[],
+            amount: &[],
+        };
+        let real = [1, 3, 4, 5, 6];
+        let pick = |column: &[f64]| real.iter().map(|&row| column[row]).collect::<Vec<_>>();
+        let dense = kdj_with_seed(
+            &pick(&highs),
+            &pick(&lows),
+            &pick(&closes),
+            4,
+            3,
+            3,
+            KdjSeed::FirstValue,
+        );
+        let first_rsv = 100.0 * (11.0 - 9.0) / (12.0 - 9.0);
+        assert_eq!(dense[0].k, Some(first_rsv));
+        // Row 5's window is the last four real rows (1, 3, 4, 5); row 6 drops row 1.
+        let rsv = |close: f64, high: f64, low: f64| 100.0 * (close - low) / (high - low);
+        let k3 = (rsv(13.0, 14.0, 9.0) + 2.0 * dense[2].k.unwrap()) / 3.0;
+        assert!((dense[3].k.unwrap() - k3).abs() < 1e-12);
+        let k4 = (rsv(12.5, 14.0, 10.0) + 2.0 * k3) / 3.0;
+        assert!((dense[4].k.unwrap() - k4).abs() < 1e-12);
+
+        // A full rebuild and a stream that starts from one row agree with the compacted rows.
+        let mut full = IncrementalState::kdj_with_seed(4, 3, 3, KdjSeed::FirstValue);
+        full.rebuild_from(input, 0);
+        let mut streamed = IncrementalState::kdj_with_seed(4, 3, 3, KdjSeed::FirstValue);
+        let mut retained = vec![Vec::new(); 3];
+        for len in 1..=closes.len() {
+            streamed.rebuild_from(
+                IndicatorInput {
+                    times: &times[..len],
+                    open: &closes[..len],
+                    high: &highs[..len],
+                    low: &lows[..len],
+                    close: &closes[..len],
+                    volume: &[],
+                    amount: &[],
+                },
+                len - 1,
+            );
+            for (output, values) in retained.iter_mut().enumerate() {
+                let from = streamed.output_from(output);
+                values.truncate(from.min(values.len()));
+                values.resize(from, f64::NAN);
+                values.extend_from_slice(streamed.output(output));
+            }
+        }
+        for output in 0..3 {
+            assert_eq!(full.output_from(output), 0);
+            for (label, values) in [
+                ("full", full.output(output)),
+                ("streamed", &retained[output]),
+            ] {
+                assert_eq!(values.len(), closes.len(), "{label} output {output}");
+                let mut compact = 0;
+                for (row, &value) in values.iter().enumerate() {
+                    if closes[row].is_nan() {
+                        assert!(value.is_nan(), "{label} output {output} row {row}");
+                        continue;
+                    }
+                    let point = dense[compact];
+                    let expected = [point.k, point.d, point.j][output].unwrap();
+                    assert!(
+                        (value - expected).abs() < 1e-12,
+                        "{label} output {output} row {row}: {value} != {expected}"
+                    );
+                    compact += 1;
+                }
             }
         }
     }
@@ -7288,6 +7937,17 @@ mod tests {
         assert_eq!(
             rows(IncrementalState::kdj(9, 3, 3)),
             [(8, Some(26)), (8, Some(44)), (8, Some(44))]
+        );
+        // The first-value start has values from row 0, but its first N-1 RSVs use a partial
+        // window, so the loaded-history horizon is unchanged.
+        assert_eq!(
+            rows(IncrementalState::kdj_with_seed(
+                9,
+                3,
+                3,
+                KdjSeed::FirstValue
+            )),
+            [(0, Some(26)), (0, Some(44)), (0, Some(44))]
         );
         assert_eq!(rows(IncrementalState::vwap()), [(0, None)]);
 

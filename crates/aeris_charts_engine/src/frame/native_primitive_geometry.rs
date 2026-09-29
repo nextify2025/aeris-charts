@@ -196,7 +196,7 @@ impl ChartEngine {
                         row,
                         aeris_charts_core::model::plot_list::PlotValueIndex::Close,
                     );
-                    let Some(time) = times.get(row).copied() else {
+                    let Some(time) = times.get(plot.source_row(row)).copied() else {
                         continue;
                     };
                     items.push((
@@ -619,7 +619,8 @@ impl ChartEngine {
     }
 
     /// Official session-highlighting semantics: color every source bar, derive the slot width from
-    /// the first two source coordinates, clip in bitmap space, and paint below all series.
+    /// the first two source coordinates, clip in bitmap space, and paint below all series. An
+    /// as-of overlay colors each visible point, one bar spacing wide, as the row it shows.
     pub(super) fn build_native_session_highlighting_frame(
         &self,
         pane_index: usize,
@@ -641,7 +642,11 @@ impl ChartEngine {
             let Some((times, _)) = self.data.series_data(series.id) else {
                 continue;
             };
-            let bar_width = if times.len() > 1 {
+            let plot = self.data.plot(series.id);
+            let bar_width = if plot.is_as_of() {
+                // As-of points sit on consecutive chart slots, not on the series' own times.
+                self.time_scale.bar_spacing()
+            } else if times.len() > 1 {
                 let Some(first) = self.time_to_coordinate(times[0] as f64) else {
                     continue;
                 };
@@ -659,10 +664,7 @@ impl ChartEngine {
                 };
                 let mut pending: Option<(IRect, Color)> = None;
                 {
-                    let mut append = |time: i64, color: Color| {
-                        let Some(logical) = self.time_to_index(time as f64, false) else {
-                            return;
-                        };
+                    let mut append = |logical: i64, color: Color| {
                         if logical < from || logical > to {
                             return;
                         }
@@ -692,16 +694,40 @@ impl ChartEngine {
                             None => pending = Some((rect, color)),
                         }
                     };
-                    if let Some(highlights) = &state.highlights {
+                    let at = |time: i64| self.time_to_index(time as f64, false);
+                    if plot.is_as_of() {
+                        // Each visible point is highlighted as the row it shows.
+                        for row in plot.visible_rows(from, to) {
+                            let (Some(logical), Some(&time)) =
+                                (plot.index_at(row), times.get(plot.source_row(row)))
+                            else {
+                                continue;
+                            };
+                            let color = match &state.highlights {
+                                Some(highlights) => highlights
+                                    .binary_search_by_key(&time, |highlight| highlight.time)
+                                    .ok()
+                                    .map(|index| highlights[index].color),
+                                None => session_color(time, state.options, &self.exchange_time),
+                            };
+                            if let Some(color) = color {
+                                append(logical, color);
+                            }
+                        }
+                    } else if let Some(highlights) = &state.highlights {
                         for highlight in highlights {
-                            append(highlight.time, highlight.color);
+                            if let Some(logical) = at(highlight.time) {
+                                append(logical, highlight.color);
+                            }
                         }
                     } else {
                         for &time in times {
                             if let Some(color) =
                                 session_color(time, state.options, &self.exchange_time)
                             {
-                                append(time, color);
+                                if let Some(logical) = at(time) {
+                                    append(logical, color);
+                                }
                             }
                         }
                     }
@@ -778,14 +804,25 @@ impl ChartEngine {
                 let Some(time) = state.time else {
                     continue;
                 };
-                let Some(logical) = self.time_to_index(time as f64, false) else {
-                    continue;
-                };
                 let plot = self.data.plot(series.id);
-                let Some(row) = plot.search(
-                    logical,
-                    aeris_charts_core::model::plot_list::MismatchDirection::None,
-                ) else {
+                let row = if plot.is_as_of() {
+                    // An overlay row is focused on the first point showing it; a row collapsed
+                    // into a later one or waiting past the last point has no point.
+                    self.data
+                        .series_data(series.id)
+                        .and_then(|(times, _)| times.binary_search(&time).ok())
+                        .and_then(|row| plot.row_for_source(row))
+                } else {
+                    self.time_to_index(time as f64, false).and_then(|logical| {
+                        plot.search(
+                            logical,
+                            aeris_charts_core::model::plot_list::MismatchDirection::None,
+                        )
+                    })
+                };
+                let Some((row, logical)) =
+                    row.and_then(|row| plot.index_at(row).map(|logical| (row, logical)))
+                else {
                     continue;
                 };
                 if plot.is_whitespace_row(row) {

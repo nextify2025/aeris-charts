@@ -25,6 +25,10 @@ use aeris_charts_render::draw_list::{LineStyle, LineType};
 use super::*;
 
 mod geometry;
+pub(crate) mod handles;
+pub(crate) mod kinds;
+mod parts;
+mod stats;
 mod time_anchor;
 mod tools;
 
@@ -32,9 +36,10 @@ pub(crate) use geometry::{
     resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, PositionGeometry,
     PositionZone,
 };
+pub(crate) use parts::{cap_radius, DrawingPart, DrawingParts, PartContext};
 pub(crate) use tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
-    DrawingPriceExtent, DrawingStraightenMode, DRAWING_TOOL_SPECS,
+    DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement, DrawingPriceExtent,
+    DrawingStraightenMode, DrawingTextLayout, DRAWING_TOOL_SPECS,
 };
 
 /// Chart-unique drawing id (never reused within a chart; 0 is the "no drawing" sentinel).
@@ -134,6 +139,30 @@ impl DrawingBounds {
             DrawingPriceExtent::Full => (None, None),
             DrawingPriceExtent::Finite => (Some(min_price), Some(max_price)),
         };
+        // A family whose geometry reaches beyond its anchors reports its complete reach.
+        let reach = spec.family.and_then(|family| (family.bounds)(drawing));
+        let (logical, min_price, max_price) = match reach {
+            Some(reach) => (
+                reach
+                    .logical
+                    .map_or(LogicalBounds::Full, |(min, max)| LogicalBounds::Finite {
+                        min,
+                        max,
+                    }),
+                reach.price.map(|(min, _)| min),
+                reach.price.map(|(_, max)| max),
+            ),
+            None => (logical, min_price, max_price),
+        };
+        // An extended body reaches the pane edge in its own direction, which the anchors'
+        // box cannot bound; stay conservative instead of culling the visible extension.
+        if drawing.extend_left || drawing.extend_right {
+            return Self {
+                logical: LogicalBounds::Full,
+                min_price: None,
+                max_price: None,
+            };
+        }
         Self {
             logical,
             min_price,
@@ -174,6 +203,9 @@ struct DrawingCache {
     text_key: u64,
     text_width: f64,
     text_size: f64,
+    /// Family decoration reach (CSS px) cached under `decoration_key` (the text key).
+    decoration_key: u64,
+    decoration: f64,
     screen_valid: bool,
     geometry_valid: bool,
 }
@@ -190,6 +222,8 @@ impl DrawingCache {
             text_key: u64::MAX,
             text_width: 0.0,
             text_size: 0.0,
+            decoration_key: u64::MAX,
+            decoration: 0.0,
             screen_valid: false,
             geometry_valid: false,
         }
@@ -260,6 +294,7 @@ impl DrawingRuntime {
         entry.bounds = DrawingBounds::for_drawing(drawing);
         entry.screen_valid = false;
         entry.text_key = u64::MAX;
+        entry.decoration_key = u64::MAX;
         entry.geometry_valid = false;
         self.stats.bounds_rebuilds += 1;
     }
@@ -375,6 +410,176 @@ pub enum DrawingKind {
     AnchoredVolumeProfile,
     /// One-anchor VWAP with optional deviation bands through the latest source row.
     AnchoredVwap,
+    // B8: lines — begin
+    /// Two-anchor ray from the first anchor through the second to the pane edge.
+    Ray,
+    /// Two-anchor line extended through both anchors to the pane edges.
+    ExtendedLine,
+    /// Two-anchor segment with a measurement box (price/percent/bars/time/angle stats).
+    InfoLine,
+    /// Two-anchor segment with a horizontal reference, arc, and the screen angle.
+    TrendAngle,
+    /// One-anchor horizontal plus vertical line crossing at the anchor.
+    CrossLine,
+    /// Two-anchor segment ending in an arrowhead.
+    ArrowLine,
+    // B8: lines — end
+    // B8: channels — begin
+    /// Three-anchor channel: the first two anchors define the base line and the parallel line
+    /// passes through the third.
+    ParallelChannel,
+    /// Two-anchor least-squares regression of the source series over the anchored bar range,
+    /// with standard-deviation lines above and below.
+    RegressionTrend,
+    /// Three-anchor channel between the trend line through the first two anchors and a
+    /// horizontal line at the third anchor's price.
+    FlatTopBottom,
+    /// Three-anchor channel whose second line passes through the third anchor with the first
+    /// line's slope mirrored.
+    DisjointChannel,
+    // B8: channels — end
+    // B8: fibonacci — begin
+    /// Two-anchor Fibonacci retracement: horizontal ratio levels between the anchors' prices.
+    FibRetracement,
+    /// Three-anchor trend-based Fibonacci extension: the first leg's move projected from the
+    /// third anchor at ratio levels.
+    TrendBasedFibExtension,
+    /// Three-anchor Fibonacci channel: ratio lines parallel to the first two anchors, offset
+    /// toward the third.
+    FibChannel,
+    /// Two-anchor Fibonacci time zones: vertical lines at Fibonacci multiples of the anchors'
+    /// time distance.
+    FibTimeZone,
+    /// Three-anchor trend-based Fibonacci time: the first leg's duration projected from the
+    /// third anchor at ratio levels.
+    TrendBasedFibTime,
+    /// Two-anchor Fibonacci speed resistance fan: price and time ratio rays from the first anchor.
+    FibSpeedResistanceFan,
+    /// Two-anchor Fibonacci speed resistance arcs: ratio arcs around the first anchor.
+    FibSpeedResistanceArcs,
+    /// Two-anchor Fibonacci circles: concentric ratio circles around the anchors' midpoint.
+    FibCircles,
+    /// Two-anchor golden spiral around the first anchor through the second.
+    FibSpiral,
+    /// Three-anchor Fibonacci wedge: ratio arcs between two edges from the first anchor.
+    FibWedge,
+    // B8: fibonacci — end
+    // B8: pitchforks_gann — begin
+    /// Three-anchor Andrews pitchfork: a median from the first anchor through the midpoint of
+    /// the other two, with parallel level lines (tines) through them.
+    AndrewsPitchfork,
+    /// Andrews pitchfork whose median starts halfway between the first two anchors' prices at the
+    /// first anchor's time.
+    SchiffPitchfork,
+    /// Andrews pitchfork whose median starts at the midpoint of the first two anchors.
+    ModifiedSchiffPitchfork,
+    /// Pitchfork whose median runs from the midpoint of the first two anchors through the third,
+    /// with tines through the second anchor and its reflection about the third.
+    InsidePitchfork,
+    /// Three-anchor fan of lines from the first anchor through the pitchfork levels on the
+    /// segment between the other two.
+    Pitchfan,
+    /// Two-corner box of price and time levels with zone fills and optional Gann angles.
+    GannBox,
+    /// Two-corner Gann square: grid, angle fan, and arcs from its first corner.
+    GannSquare,
+    /// One-anchor Gann square of a fixed size in bars and a fixed price-per-bar scale ratio.
+    GannSquareFixed,
+    /// Two-anchor Gann fan: 1×8 … 8×1 angle lines from the first anchor, the 1×1 through the
+    /// second anchor or at a price-per-bar scale ratio.
+    GannFan,
+    // B8: pitchforks_gann — end
+    // B8: projection_annotations — begin
+    /// Two-anchor forecast (source, target) with engine-evaluated success or failure.
+    Forecast,
+    /// Two-anchor ghost copy of the bars between its anchors, captured at creation.
+    BarsPattern,
+    /// Two-anchor price measurement: range lines, arrow, fill, and change stats.
+    PriceRange,
+    /// Two-anchor time measurement: range lines, arrow, fill, and bar/duration stats.
+    DateRange,
+    /// Two-anchor price and time measurement.
+    DateAndPriceRange,
+    /// Three-anchor sector projection: apex, radius point, and price point.
+    Projection,
+    /// One-anchor text pinned to a pane position (the anchor is a pane fraction).
+    AnchoredText,
+    /// One-anchor pin marker with a note.
+    Note,
+    /// Two-anchor price note: a leader from the priced point to its price label.
+    PriceNote,
+    /// Two-anchor callout: a text box with a pointer to the annotated point.
+    Callout,
+    /// One-anchor speech bubble whose tail points at the anchor.
+    Comment,
+    /// One-anchor price tag whose tail points at the anchor.
+    PriceLabel,
+    /// One-anchor signpost: a pole from the anchor up to a text plate.
+    Signpost,
+    /// One-anchor flag marker.
+    FlagMark,
+    /// One-anchor up arrow whose tip sits on the anchor.
+    ArrowMarkUp,
+    /// One-anchor down arrow whose tip sits on the anchor.
+    ArrowMarkDown,
+    /// One-anchor left arrow whose tip sits on the anchor.
+    ArrowMarkLeft,
+    /// One-anchor right arrow whose tip sits on the anchor.
+    ArrowMarkRight,
+    /// One-anchor icon from the bounded built-in icon set.
+    Icon,
+    // B8: projection_annotations — end
+    // B8: patterns_elliott_cycles — begin
+    /// Five-anchor harmonic XABCD pattern with ratio connectors and shaded triangles.
+    XabcdPattern,
+    /// Five-anchor cypher harmonic pattern (C extends XA, D retraces XC).
+    CypherPattern,
+    /// Four-anchor ABCD pattern with ratio connectors.
+    AbcdPattern,
+    /// Seven-anchor head and shoulders with its neckline.
+    HeadAndShoulders,
+    /// Four-anchor triangle pattern whose sides converge to their apex.
+    TrianglePattern,
+    /// Seven-anchor three drives pattern with ratio connectors.
+    ThreeDrivesPattern,
+    /// Six-anchor Elliott impulse wave (0-1-2-3-4-5).
+    ElliottImpulseWave,
+    /// Four-anchor Elliott correction wave (0-A-B-C).
+    ElliottCorrectionWave,
+    /// Six-anchor Elliott triangle wave (0-A-B-C-D-E).
+    ElliottTriangleWave,
+    /// Four-anchor Elliott double combination (0-W-X-Y).
+    ElliottDoubleCombo,
+    /// Six-anchor Elliott triple combination (0-W-X-Y-X-Z).
+    ElliottTripleCombo,
+    /// Two-anchor cyclic lines: vertical lines every anchor interval to the right.
+    CyclicLines,
+    /// Two-anchor time cycles: repeated half-ellipse arches.
+    TimeCycles,
+    /// Two-anchor sine line through a peak and the following trough.
+    SineLine,
+    // B8: patterns_elliott_cycles — end
+    // B8: shapes — begin
+    /// Three-anchor rectangle at any angle: the first two anchors are the midpoints of its short
+    /// sides, the third lies on a long side.
+    RotatedRectangle,
+    /// Two-corner ellipse inscribed in the corners' box.
+    Ellipse,
+    /// Two-anchor screen circle: center and a point on the rim.
+    Circle,
+    /// Three-vertex triangle.
+    Triangle,
+    /// Three-anchor circular arc from the first anchor to the second through the third.
+    Arc,
+    /// Three-anchor quadratic curve from the first anchor to the second through the third.
+    Curve,
+    /// Four-anchor cubic curve from the first anchor to the second through the third and fourth.
+    DoubleCurve,
+    /// Multi-click polyline, open or closed.
+    Polyline,
+    /// Freehand wide translucent stroke.
+    Highlighter,
+    // B8: shapes — end
 }
 
 impl DrawingKind {
@@ -465,6 +670,11 @@ pub(crate) struct DrawingChartSettings {
     pub(crate) sequence_install: bool,
     /// The last synchronized axis was a non-time bar sequence.
     pub(crate) sequence_axis: bool,
+    /// Recent regression-trend fits (Channels family): derived, bounded, never persisted.
+    pub(crate) regression_memo: std::cell::RefCell<kinds::channels::RegressionMemo>,
+    /// Recent forecast outcomes over as-of sources (Projection & Annotations family): derived,
+    /// bounded, never persisted.
+    pub(crate) forecast_memo: std::cell::RefCell<kinds::projection_annotations::ForecastMemo>,
 }
 
 /// Full-resolution identity persisted alongside a logical drawing anchor on a non-time chart.
@@ -598,13 +808,15 @@ pub struct Drawing {
     pub price_scale: DrawingPriceScale,
     /// Optional engine-data binding for volume-profile and anchored-VWAP drawings.
     pub profile: Option<crate::ProfileDrawingOptions>,
+    /// B8 family-specific option blocks (`tool_options` in options JSON and persistence).
+    pub tool_options: crate::DrawingToolOptions,
     /// Line/border color CSS string (default [`DRAWING_DEFAULT_COLOR`]).
     pub color: String,
     /// Stroke width in CSS px (default 2; 1 for a rectangle's border).
     pub width: f64,
     pub style: LineStyle,
-    /// Rectangle fill CSS string; `None` fills with the border color at 20% alpha. Unused by
-    /// the line kinds and the text tool.
+    /// Region fill CSS string of the rectangle and of family tools that fill; `None` washes out
+    /// the stroke color (20% alpha for the rectangle). Unused by the line kinds and the text tool.
     pub fill_color: Option<String>,
     /// Rectangle creation-preview fill; `None` follows `fill_color`. Stored with the drawing so
     /// re-arming a tool from its options preserves the official preview color.
@@ -670,12 +882,14 @@ impl Drawing {
         mut points: Vec<DrawingPoint>,
     ) -> Self {
         Self::normalize_position_points(kind, &mut points);
-        let (text_h_align, text_v_align) = if kind == DrawingKind::TrendLine {
+        // Segment labels default to the top-right slot along the line.
+        let (text_h_align, text_v_align) = if kind.spec().text_layout == DrawingTextLayout::Segment
+        {
             (DrawingTextHAlign::Right, DrawingTextVAlign::Top)
         } else {
             (DrawingTextHAlign::Center, DrawingTextVAlign::Middle)
         };
-        Self {
+        let mut drawing = Self {
             id,
             kind,
             pane_index,
@@ -718,8 +932,13 @@ impl Drawing {
             box_color: None,
             box_border_color: None,
             box_border_width: aeris_charts_core::style::BORDER_WIDTH,
+            tool_options: Default::default(),
             pending_times: Vec::new(),
+        };
+        if let Some(family) = kind.spec().family {
+            (family.apply_defaults)(&mut drawing);
         }
+        drawing
     }
 
     /// Install per-anchor pending times, keeping the Long/Short stop on the entry's identity (the
@@ -733,7 +952,11 @@ impl Drawing {
         {
             pending[2] = pending[0];
         }
-        if pending.len() != self.points.len() || pending.iter().all(Option::is_none) {
+        // Pane-anchored anchors are pane fractions with no time identity.
+        if pending.len() != self.points.len()
+            || pending.iter().all(Option::is_none)
+            || self.kind.pane_anchored()
+        {
             pending.clear();
         }
         self.pending_times = pending;
@@ -788,6 +1011,27 @@ impl Drawing {
         })
     }
 
+    /// The stroke color: `color`, or the canonical primary when it does not parse. Frame
+    /// lowering and every family resolve the drawing color through this.
+    pub(crate) fn stroke_color(&self) -> Color {
+        Color::parse_css(&self.color).unwrap_or_else(|| {
+            let (r, g, b) = aeris_charts_core::style::DEFAULT_PRIMARY_RGB;
+            Color::rgb(r, g, b)
+        })
+    }
+
+    /// A region fill: `fill_color`, else the stroke color washed to `alpha` (the rectangle's
+    /// 20% wash is 51).
+    pub(crate) fn fill_or_wash(&self, alpha: u8) -> Color {
+        self.fill_color
+            .as_deref()
+            .and_then(Color::parse_css)
+            .unwrap_or_else(|| {
+                let stroke = self.stroke_color();
+                Color::rgba(stroke.r(), stroke.g(), stroke.b(), alpha)
+            })
+    }
+
     /// Typed common-contract view used by property panels and sync adapters.  It is derived from
     /// the authoritative live drawing, so the view cannot drift from render or hit-test state.
     pub fn common_snapshot(&self) -> crate::DrawingCommonSnapshot {
@@ -816,6 +1060,9 @@ impl Drawing {
 
     /// Typed kind-specific option block derived from the authoritative live drawing.
     pub fn kind_options(&self) -> crate::DrawingKindOptions {
+        if let Some(family) = self.kind.spec().family {
+            return (family.kind_options)(self);
+        }
         match self.kind {
             DrawingKind::Rectangle => crate::DrawingKindOptions::Rectangle {
                 fill_color: self.fill_color.clone(),
@@ -845,7 +1092,8 @@ impl Drawing {
     where
         F: Fn(f64) -> f64 + Copy,
     {
-        rebase_points_with(&mut self.points, map)
+        // Pane fractions do not follow the time axis.
+        !self.kind.pane_anchored() && rebase_points_with(&mut self.points, map)
     }
 }
 
@@ -862,12 +1110,16 @@ where
     changed
 }
 
-/// The part of a drawing a hit/drag landed on: the whole shape (a move drag) or one defining
-/// anchor (a re-anchor drag).
+/// The part of a drawing a hit/drag landed on: the whole shape (a move drag), one handle of the
+/// drawing's handle mode (a defining anchor, or a rectangle's bounds handle and a Long/Short
+/// Position's control by their handle index), or a derived handle its drawing family places on
+/// its geometry (a rotated rectangle's width handles, a pitchfork's base midpoint, a fixed Gann
+/// square's corner), numbered in the family's derived-handle order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawingDragPart {
     Body,
     Anchor(usize),
+    Handle(usize),
 }
 
 /// A drawing hit-test outcome (cf. [`SeriesHit`]): the drawing, the part under the cursor, and
@@ -916,11 +1168,70 @@ pub(crate) struct DrawingDrag {
     pub(crate) start_points: Vec<DrawingPoint>,
     /// Anchors converted to media px at drag start (the body-drag translation base).
     pub(crate) start_px: Vec<(f64, f64)>,
+    /// The dragged handle's media px at the baseline (a derived handle's drag base); the press
+    /// point for a body drag.
+    pub(crate) handle_px: (f64, f64),
     /// Original semantic snapshot retained for cancellation and the one committed history entry.
     pub(crate) history_points: Vec<DrawingPoint>,
+    /// Family options at the press: a family drag may edit them (a fixed square's size), and
+    /// cancellation and the history entry restore them with the anchors.
+    pub(crate) history_tool_options: crate::DrawingToolOptions,
+    /// A keyboard nudge's media-px step; `None` for a pointer drag.
+    pub(crate) keyboard_step: Option<(f64, f64)>,
+}
+
+/// Open inline text-edit session: the drawing the host's editor owns and its `text` and
+/// `revision` when the session began, which cancel restores and commit records as the undo
+/// step's `before`. Runtime only; restore, sync, clear, and removal end it.
+#[derive(Clone, Debug)]
+pub(crate) struct DrawingTextEdit {
+    pub(crate) id: DrawingId,
+    text: String,
+    revision: u64,
+}
+
+/// Where the host's inline editor lays out a family drawing's own `text`
+/// ([`ChartEngine::drawing_text_edit_layout`]), in media px: x from the pane's left edge, y from
+/// the chart top. The engine paints every line of the label left-aligned at `x`, line `i` of the
+/// text centered at `y + i * line_height`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct DrawingTextEditLayout {
+    /// Left edge of the text lines.
+    pub x: f64,
+    /// Vertical center of the text's first line.
+    pub y: f64,
+    /// Distance between line centers (1.25 × `size`).
+    pub line_height: f64,
+    /// Glyph size in CSS px.
+    pub size: f64,
+    pub font_family: String,
+    pub weight: u16,
+    pub italic: bool,
+    /// The painted text color as CSS.
+    pub color: String,
+    /// The whole label box (the edit target), `[left, top, right, bottom]`.
+    pub rect: [f64; 4],
 }
 
 const DRAWING_HISTORY_LIMIT: usize = 100;
+
+/// Drawing options that are identity, placement, visibility, or content rather than style, in
+/// both accepted spellings. Named templates never carry or apply them.
+const TEMPLATE_NON_STYLE_KEYS: &[&str] = &[
+    "name",
+    "group_id",
+    "groupId",
+    "revision",
+    "visible",
+    "locked",
+    "z_order",
+    "zOrder",
+    "interval_visibility",
+    "intervalVisibility",
+    "price_scale_id",
+    "priceScaleId",
+    "text",
+];
 
 #[derive(Clone)]
 enum DrawingCommand {
@@ -1179,18 +1490,27 @@ pub(crate) struct DrawingPatch {
     #[serde(alias = "boxBorderWidth")]
     box_border_width: Option<f64>,
     profile: Option<crate::ProfileDrawingOptions>,
+    /// Deep-merged into [`Drawing::tool_options`].
+    #[serde(alias = "toolOptions")]
+    tool_options: Option<serde_json::Value>,
 }
 
-/// A patch's `style`: the TS string form (`solid`/`dotted`/`dashed`), or the reference numeric
-/// enum for untyped callers. The retired names/values fold into their renamed equivalents
-/// (large_dashed → dashed, sparse_dotted → dotted), as in price_line_api.rs.
+/// A drawing style name (`solid`/`dotted`/`dashed`) as a line style: the retired names fold into
+/// their renamed equivalents (large_dashed → dashed, sparse_dotted → dotted), as in
+/// price_line_api.rs, and anything else is solid. Drawing and level styles both read through it.
+pub(crate) fn line_style_from_name(name: &str) -> LineStyle {
+    match name {
+        "dotted" | "sparse_dotted" => LineStyle::Dotted,
+        "dashed" | "large_dashed" => LineStyle::Dashed,
+        _ => LineStyle::Solid,
+    }
+}
+
+/// A patch's `style`: the TS string form ([`line_style_from_name`]), or the reference numeric
+/// enum for untyped callers.
 fn parse_drawing_style(value: &serde_json::Value) -> Option<LineStyle> {
     match value {
-        serde_json::Value::String(s) => Some(match s.as_str() {
-            "dotted" | "sparse_dotted" => LineStyle::Dotted,
-            "dashed" | "large_dashed" => LineStyle::Dashed,
-            _ => LineStyle::Solid,
-        }),
+        serde_json::Value::String(s) => Some(line_style_from_name(s)),
         serde_json::Value::Number(n) => n.as_u64().map(|v| line_style_from_u8(v as u8)),
         _ => None,
     }
@@ -1245,6 +1565,16 @@ impl Drawing {
             {
                 return false;
             }
+        }
+        let tool_options = match patch.tool_options.as_ref() {
+            Some(value) => match self.tool_options.merged(value) {
+                Some(merged) => Some(merged),
+                None => return false,
+            },
+            None => None,
+        };
+        if let Some(tool_options) = tool_options {
+            self.tool_options = tool_options;
         }
         if let Some(name) = patch.name {
             self.name = name;
@@ -1430,6 +1760,7 @@ impl Drawing {
             "box_color": self.box_color.as_deref().unwrap_or(""),
             "box_border_color": self.box_border_color.as_deref().unwrap_or(""),
             "box_border_width": self.box_border_width,
+            "tool_options": self.tool_options,
         })
     }
 }
@@ -1546,13 +1877,14 @@ impl ChartEngine {
     /// forward-adjusted and unadjusted history). Each anchor whose time falls inside a segment
     /// `[from_time, to_time)` has its price multiplied by that segment's factor (on non-time bar
     /// charts an anchor's time is the open time of the bar it sits on); Long/Short
-    /// Position anchors all use the entry anchor's segment so their levels stay consistent. This is
-    /// a data-basis change, not a user edit: it applies to locked drawings too, rewrites the undo
-    /// and redo stacks and any in-flight creation/drag in the same basis, records no undo step,
-    /// and optionally sets the price-basis label in the same transaction. It is atomic: invalid
-    /// segments, or a factor that would move any committed, historical, or in-flight price outside
-    /// the persisted value range, fail with nothing changed. Returns the number of committed
-    /// drawings that changed.
+    /// Position anchors all use the entry anchor's segment so their levels stay consistent, and
+    /// tool options measured in price units (a Gann fan's or fixed square's `scale_ratio`) scale
+    /// by their first anchor's segment. This is a data-basis change, not a user edit: it applies
+    /// to locked drawings too, rewrites the undo and redo stacks and any in-flight creation/drag
+    /// in the same basis, records no undo step, and optionally sets the price-basis label in the
+    /// same transaction. It is atomic: invalid segments, or a factor that would move any
+    /// committed, historical, or in-flight price (or price-unit option) outside its valid range,
+    /// fail with nothing changed. Returns the number of committed drawings that changed.
     pub fn rescale_drawing_prices(
         &mut self,
         segments: &[crate::DrawingPriceSegment],
@@ -1602,6 +1934,15 @@ impl ChartEngine {
             })
             .unwrap_or(1.0)
         };
+        let time_of = |pending: &[Option<f64>], index: usize, point: &DrawingPoint| {
+            pending.get(index).copied().flatten().or_else(|| {
+                if time_axis {
+                    time_anchor::time_at_logical(times, point.logical)
+                } else {
+                    sequence_time(point.logical)
+                }
+            })
+        };
         // One pass validates (`apply == false`) and a second mutates, so a factor that would push
         // any committed, historical, or in-flight price past the persisted value range rejects
         // the whole rescale. `None` reports that overflow; otherwise whether a price changes.
@@ -1610,21 +1951,17 @@ impl ChartEngine {
                        pending: &[Option<f64>],
                        apply: bool|
          -> Option<bool> {
-            let time_of = |index: usize, point: &DrawingPoint| {
-                pending.get(index).copied().flatten().or_else(|| {
-                    if time_axis {
-                        time_anchor::time_at_logical(times, point.logical)
-                    } else {
-                        sequence_time(point.logical)
-                    }
-                })
-            };
+            // Pane fractions are not prices.
+            if kind.pane_anchored() {
+                return Some(false);
+            }
             let position = points.len() == 3
                 && matches!(kind, DrawingKind::LongPosition | DrawingKind::ShortPosition);
-            let entry_factor = position.then(|| factor_at(time_of(0, &points[0])));
+            let entry_factor = position.then(|| factor_at(time_of(pending, 0, &points[0])));
             let mut changed = false;
             for (index, point) in points.iter_mut().enumerate() {
-                let factor = entry_factor.unwrap_or_else(|| factor_at(time_of(index, point)));
+                let factor =
+                    entry_factor.unwrap_or_else(|| factor_at(time_of(pending, index, point)));
                 if factor == 1.0 {
                     continue;
                 }
@@ -1639,13 +1976,41 @@ impl ChartEngine {
             }
             Some(changed)
         };
+        // Tool options measured in price units (a Gann scale ratio) scale with the first anchor's
+        // segment, like the Position levels follow their entry.
+        let rescale_options = |kind: DrawingKind,
+                               options: &mut crate::DrawingToolOptions,
+                               first: Option<(&DrawingPoint, &[Option<f64>])>,
+                               apply: bool|
+         -> Option<bool> {
+            let (Some(family), Some((point, pending))) = (kind.spec().family, first) else {
+                return Some(false);
+            };
+            if kind.pane_anchored() {
+                return Some(false);
+            }
+            let factor = factor_at(time_of(pending, 0, point));
+            if factor == 1.0 {
+                return Some(false);
+            }
+            (family.rescale_price_options)(kind, options, factor, apply)
+        };
         let rescale_drawing = |drawing: &mut Drawing, apply: bool| -> Option<bool> {
+            let first = drawing.points.first().copied();
+            let options_changed = rescale_options(
+                drawing.kind,
+                &mut drawing.tool_options,
+                first
+                    .as_ref()
+                    .map(|point| (point, &drawing.pending_times[..])),
+                apply,
+            )?;
             let changed = rescale(
                 drawing.kind,
                 &mut drawing.points,
                 &drawing.pending_times,
                 apply,
-            )?;
+            )? || options_changed;
             if changed && apply {
                 drawing.revision = drawing.revision.saturating_add(1);
             }
@@ -1695,6 +2060,13 @@ impl ChartEngine {
                     visit(rescale(DrawingKind::Brush, &mut capture.points, &[], apply));
             }
             if let (Some(drag), Some(kind)) = (self.drawing_drag.as_mut(), drag_kind) {
+                let first = drag.history_points.first().copied();
+                transient_changed |= visit(rescale_options(
+                    kind,
+                    &mut drag.history_tool_options,
+                    first.as_ref().map(|point| (point, &[][..])),
+                    apply,
+                ));
                 transient_changed |= visit(rescale(kind, &mut drag.start_points, &[], apply));
                 transient_changed |= visit(rescale(kind, &mut drag.history_points, &[], apply));
             }
@@ -1726,43 +2098,16 @@ impl ChartEngine {
 
     /// Media-px handles of a drawing in keyboard order, each paired with the drag part it drives:
     /// every anchor, the brush's two ends, the rectangle's eight bounds handles, or the Long/Short
-    /// Position's four controls (target, entry, width, stop). `None` when the drawing cannot be
-    /// placed on the current axis.
+    /// Position's four controls (target, entry, width, stop), as the family's `handles` hook edits
+    /// them (derived handles). `None` when the drawing cannot be placed on the current axis.
     fn drawing_handles(&self, drawing: &Drawing) -> Option<Vec<((f64, f64), DrawingDragPart)>> {
         let px = self.drawing_px(drawing)?;
-        Some(match drawing.kind.spec().handles {
-            DrawingHandleMode::None => Vec::new(),
-            DrawingHandleMode::Endpoints if px.len() >= 2 => {
-                let last = px.len() - 1;
-                vec![
-                    (px[0], DrawingDragPart::Anchor(0)),
-                    (px[last], DrawingDragPart::Anchor(last)),
-                ]
-            }
-            DrawingHandleMode::RectangleBounds if px.len() == 2 => Self::rectangle_anchors(&px)
+        Some(
+            self.drawing_handle_set(drawing, &px)
                 .into_iter()
-                .enumerate()
-                .map(|(index, point)| (point, DrawingDragPart::Anchor(index)))
+                .map(|handle| (handle.point, handle.part))
                 .collect(),
-            DrawingHandleMode::Position if px.len() == 3 => {
-                let (entry, target, stop) = (px[0], px[1], px[2]);
-                [
-                    (entry.0, target.1),
-                    (entry.0, entry.1),
-                    (target.0, entry.1),
-                    (entry.0, stop.1),
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(index, point)| (point, DrawingDragPart::Anchor(index)))
-                .collect()
-            }
-            _ => px
-                .iter()
-                .enumerate()
-                .map(|(index, &point)| (point, DrawingDragPart::Anchor(index)))
-                .collect(),
-        })
+        )
     }
 
     /// Number of keyboard-reachable handles of a drawing (see
@@ -1784,14 +2129,21 @@ impl ChartEngine {
         if let Some(pending) = self.drawing_controller.pending.as_mut() {
             transient_changed |= pending.drawing.rebase_logical_with(map);
             if let Some(preview) = pending.preview.as_mut() {
-                transient_changed |= rebase_points_with(std::slice::from_mut(preview), map);
+                if !pending.drawing.kind.pane_anchored() {
+                    transient_changed |= rebase_points_with(std::slice::from_mut(preview), map);
+                }
             }
         }
         if let Some(capture) = self.drawing_controller.brush.as_mut() {
             transient_changed |= rebase_points_with(&mut capture.points, map);
             transient_changed |= capture.options.rebase_logical_with(map);
         }
-        if let Some(drag) = self.drawing_drag.as_mut() {
+        let drag_pane_anchored = self.drawing_drag.as_ref().is_some_and(|drag| {
+            self.drawings
+                .iter()
+                .any(|drawing| drawing.id == drag.id && drawing.kind.pane_anchored())
+        });
+        if let Some(drag) = self.drawing_drag.as_mut().filter(|_| !drag_pane_anchored) {
             transient_changed |= rebase_points_with(&mut drag.start_points, map);
             transient_changed |= rebase_points_with(&mut drag.history_points, map);
         }
@@ -1964,21 +2316,25 @@ impl ChartEngine {
         let drag_baseline = self.drawing_drag.as_ref().and_then(|drag| {
             let drawing = self.drawing(drag.id)?;
             let points = drawing.points.clone();
-            let px = points
-                .iter()
-                .map(|&point| {
-                    self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, point)
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some((points, px, drag.current_x, drag.current_y))
+            let px = self.drawing_px(drawing)?;
+            // A derived handle rebases onto its current position (kept while the geometry
+            // cannot place it); every other part translates from the pointer.
+            let handle = match drag.part {
+                DrawingDragPart::Handle(_) => self
+                    .drawing_handle_px(drawing, drag.part)
+                    .unwrap_or(drag.handle_px),
+                _ => (drag.current_x, drag.current_y),
+            };
+            Some((points, px, handle, drag.current_x, drag.current_y))
         });
-        if let (Some(drag), Some((start_points, start_px, pointer_x, pointer_y))) =
+        if let (Some(drag), Some((start_points, start_px, handle_px, pointer_x, pointer_y))) =
             (self.drawing_drag.as_mut(), drag_baseline)
         {
             drag.start_x = pointer_x;
             drag.start_y = pointer_y;
             drag.start_points = start_points;
             drag.start_px = start_px;
+            drag.handle_px = handle_px;
         }
 
         let brush_px =
@@ -1990,12 +2346,16 @@ impl ChartEngine {
         }
     }
 
+    /// Record one committed drawing-semantic step. Every committed step is a change another cell
+    /// must accept, so recording it also advances the sync revision exactly once; the paths that
+    /// change drawings without recording (undo, redo, price basis, rescale) bump it themselves.
     fn record_drawing_command(&mut self, command: DrawingCommand) {
         if self.drawing_history.undo.len() == DRAWING_HISTORY_LIMIT {
             self.drawing_history.undo.remove(0);
         }
         self.drawing_history.undo.push(command);
         self.drawing_history.redo.clear();
+        self.bump_drawing_sync_revision();
     }
 
     fn bump_drawing_sync_revision(&mut self) {
@@ -2023,8 +2383,8 @@ impl ChartEngine {
         if self.drawing_drag.as_ref().is_some_and(|drag| drag.id == id) {
             self.drawing_drag = None;
         }
-        if self.editing_drawing == Some(id) {
-            self.editing_drawing = None;
+        if self.editing_drawing() == Some(id) {
+            self.text_edit = None;
         }
         if self.hovered_text == Some(id) {
             self.hovered_text = None;
@@ -2080,7 +2440,7 @@ impl ChartEngine {
                 }
                 self.selected_drawing = None;
                 self.drawing_drag = None;
-                self.editing_drawing = None;
+                self.text_edit = None;
                 self.hovered_drawing = None;
                 self.hovered_text = None;
             }
@@ -2101,11 +2461,14 @@ impl ChartEngine {
 
     /// Undo one committed drawing-semantic operation for this chart only. An active pointer or
     /// keyboard drag is cancelled first (rolled back to its start) so the next drag sample cannot
-    /// overwrite the restored state and the drag's end cannot record over the redo branch.
+    /// overwrite the restored state and the drag's end cannot record over the redo branch, and
+    /// an open text-edit session is committed first (the browser editor's own order), so undo
+    /// reverts that edit.
     pub fn undo_drawing(&mut self) -> bool {
         if self.drawing_drag.is_some() {
             self.drawing_drag_cancel();
         }
+        self.end_drawing_text_edit(true);
         let Some(command) = self.drawing_history.undo.pop() else {
             return false;
         };
@@ -2119,11 +2482,12 @@ impl ChartEngine {
     }
 
     /// Redo one previously undone drawing-semantic operation for this chart only. Like undo, an
-    /// active drag is cancelled first.
+    /// active drag is cancelled and an open text edit committed first.
     pub fn redo_drawing(&mut self) -> bool {
         if self.drawing_drag.is_some() {
             self.drawing_drag_cancel();
         }
+        self.end_drawing_text_edit(true);
         let Some(command) = self.drawing_history.redo.pop() else {
             return false;
         };
@@ -2320,6 +2684,7 @@ impl ChartEngine {
     }
 
     /// Reference-informed straighten behavior (Shift held): recompute the dragged anchor of a two-anchor tool
+    /// (or of a longer tool's first segment, such as a channel's base line)
     /// so the segment from the FIXED anchor snaps to the nearest 0°/45°/90° direction at the
     /// dragged pixel distance; a rectangle instead becomes a square (the larger dragged side
     /// wins, the drag quadrant's signs kept). Angles are visual, so the math runs in media-px
@@ -2364,7 +2729,7 @@ impl ChartEngine {
         drawing
             .points
             .iter()
-            .map(|&point| self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, point))
+            .map(|&point| self.drawing_point_px(drawing, point))
             .collect()
     }
 
@@ -2398,7 +2763,7 @@ impl ChartEngine {
         entry: &mut DrawingCache,
         key: [u64; 12],
         base: f64,
-        text_metrics: Option<(f64, f64)>,
+        label_pad: (f64, f64),
     ) -> bool {
         if entry.screen_valid && entry.bounds_key == key {
             return true;
@@ -2425,21 +2790,32 @@ impl ChartEngine {
                 self.time_scale.logical_to_coordinate(max),
             ),
         };
-        let (top, bottom) = match (entry.bounds.min_price, entry.bounds.max_price) {
+        let (mut top, mut bottom) = match (entry.bounds.min_price, entry.bounds.max_price) {
             (Some(min), Some(max)) => (
                 scale.price_to_coordinate(max, base),
                 scale.price_to_coordinate(min, base),
             ),
             _ => (pane.top, pane.top + pane.height),
         };
+        let (mut left, mut right) = (left, right);
+        // A drawing no semantic box bounds (a tool whose reach is screen-derived, or an
+        // extension) takes its family's paint box when the family can bound it.
+        if matches!(entry.bounds.logical, LogicalBounds::Full) && entry.bounds.min_price.is_none() {
+            if let Some(family) = drawing.kind.spec().family {
+                if self.refresh_drawing_media_px(drawing, entry, key).is_none() {
+                    return false;
+                }
+                if let Some(rect) = (family.paint_bounds)(self, drawing, &entry.media_px) {
+                    (left, right, top, bottom) = (rect.left, rect.right, rect.top, rect.bottom);
+                }
+            }
+        }
         let mut extra_x = drawing.width / 2.0 + HitProfile::TOUCH.drawing_stroke_tolerance;
         let mut extra_y = extra_x;
         extra_x = extra_x.max(HitProfile::TOUCH.drawing_anchor_radius);
         extra_y = extra_y.max(HitProfile::TOUCH.drawing_anchor_radius);
-        if let Some((width, size)) = text_metrics {
-            extra_x = extra_x.max(width + TEXT_PAD * 2.0);
-            extra_y = extra_y.max(size * 1.2 + TEXT_PAD * 2.0);
-        }
+        extra_x = extra_x.max(label_pad.0);
+        extra_y = extra_y.max(label_pad.1);
         entry.screen_bounds = ScreenBounds {
             left: left.min(right) - extra_x,
             right: left.max(right) + extra_x,
@@ -2458,14 +2834,12 @@ impl ChartEngine {
         pane_index: usize,
         visible: (f64, f64),
         base: f64,
-        text_metrics: Option<(f64, f64)>,
+        label_pad: (f64, f64),
     ) -> bool {
-        let mut extra_x = drawing.width / 2.0 + HitProfile::TOUCH.drawing_anchor_radius;
-        let mut extra_y = extra_x;
-        if let Some((width, size)) = text_metrics {
-            extra_x = extra_x.max(width + TEXT_PAD * 2.0);
-            extra_y = extra_y.max(size * 1.2 + TEXT_PAD * 2.0);
-        }
+        let extra_x =
+            (drawing.width / 2.0 + HitProfile::TOUCH.drawing_anchor_radius).max(label_pad.0);
+        let extra_y =
+            (drawing.width / 2.0 + HitProfile::TOUCH.drawing_anchor_radius).max(label_pad.1);
         let logical_pad = extra_x / self.time_scale.bar_spacing().max(f64::MIN_POSITIVE);
         let logical_intersects = match bounds.logical {
             LogicalBounds::Full => true,
@@ -2499,25 +2873,32 @@ impl ChartEngine {
         runtime: &'a mut DrawingRuntime,
         key: [u64; 12],
     ) -> Option<&'a [(f64, f64)]> {
-        let rebuild = runtime
-            .entries
-            .get(&drawing.id)
-            .is_some_and(|entry| !entry.geometry_valid || entry.geometry_key != key);
-        if rebuild {
-            let entry = runtime.entries.get_mut(&drawing.id)?;
-            entry.media_px.clear();
-            for &point in &drawing.points {
-                entry.media_px.push(self.drawing_to_px_for(
-                    drawing.pane_index,
-                    drawing.price_scale,
-                    point,
-                )?);
-            }
-            entry.geometry_key = key;
-            entry.geometry_valid = true;
+        let entry = runtime.entries.get_mut(&drawing.id)?;
+        if self.refresh_drawing_media_px(drawing, entry, key)? {
             runtime.stats.geometry_rebuilds += 1;
         }
         Some(&runtime.entries.get(&drawing.id)?.media_px)
+    }
+
+    /// Bring `entry`'s anchor media px up to coordinate key `key`: `Some(true)` when they were
+    /// rebuilt, `None` (and invalid) when an anchor cannot be placed.
+    fn refresh_drawing_media_px(
+        &self,
+        drawing: &Drawing,
+        entry: &mut DrawingCache,
+        key: [u64; 12],
+    ) -> Option<bool> {
+        if entry.geometry_valid && entry.geometry_key == key {
+            return Some(false);
+        }
+        entry.media_px.clear();
+        entry.geometry_valid = false;
+        for &point in &drawing.points {
+            entry.media_px.push(self.drawing_point_px(drawing, point)?);
+        }
+        entry.geometry_key = key;
+        entry.geometry_valid = true;
+        Some(true)
     }
 
     fn cached_drawing_layout(&self) -> (f64, Rc<str>) {
@@ -2565,6 +2946,33 @@ impl ChartEngine {
         Some((entry.text_width, entry.text_size))
     }
 
+    /// Screen pad `(x, y)` in CSS px that a drawing's text run and family decorations reach
+    /// beyond its anchors.
+    fn drawing_label_pad(text_metrics: Option<(f64, f64)>, decoration: f64) -> (f64, f64) {
+        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size)| {
+            (width + TEXT_PAD * 2.0, size * 1.2 + TEXT_PAD * 2.0)
+        });
+        (x.max(decoration), y.max(decoration))
+    }
+
+    /// A family tool's decoration reach (stats boxes, angle labels) beyond its anchors in CSS
+    /// px, cached with the text metrics and refreshed on drawing or options changes.
+    fn cached_drawing_decoration(
+        &self,
+        drawing: &Drawing,
+        entry: &mut DrawingCache,
+        key: u64,
+    ) -> f64 {
+        let Some(family) = drawing.kind.spec().family else {
+            return 0.0;
+        };
+        if entry.decoration_key != key {
+            entry.decoration = (family.decoration_extent)(self, drawing);
+            entry.decoration_key = key;
+        }
+        entry.decoration
+    }
+
     pub(crate) fn take_drawing_candidates(
         &self,
         pane_index: usize,
@@ -2610,17 +3018,19 @@ impl ChartEngine {
             };
             let text_metrics =
                 self.cached_drawing_text_metrics(drawing, entry, text_key, font_size, &font_family);
+            let decoration = self.cached_drawing_decoration(drawing, entry, text_key);
+            let label_pad = Self::drawing_label_pad(text_metrics, decoration);
             if !self.drawing_semantic_might_intersect(
                 drawing,
                 entry.bounds,
                 pane_index,
                 visible,
                 base,
-                text_metrics,
+                label_pad,
             ) {
                 continue;
             }
-            let valid = self.refresh_drawing_screen_bounds(drawing, entry, key, base, text_metrics);
+            let valid = self.refresh_drawing_screen_bounds(drawing, entry, key, base, label_pad);
             let bounds = entry.screen_bounds;
             if valid
                 && point.map_or_else(
@@ -2662,7 +3072,10 @@ impl ChartEngine {
             font_size,
             &font_family,
         );
-        self.refresh_drawing_screen_bounds(drawing, &mut entry, key, base, text_metrics)
+        let decoration =
+            self.cached_drawing_decoration(drawing, &mut entry, self.options.generation());
+        let label_pad = Self::drawing_label_pad(text_metrics, decoration);
+        self.refresh_drawing_screen_bounds(drawing, &mut entry, key, base, label_pad)
             && entry.screen_bounds.intersects(viewport)
     }
 
@@ -2770,7 +3183,7 @@ impl ChartEngine {
         size: f64,
         pad: f64,
     ) -> (f64, f64, DrawingTextHAlign, f64) {
-        if drawing.kind == DrawingKind::TrendLine && px.len() >= 2 {
+        if drawing.kind.spec().text_layout == DrawingTextLayout::Segment && px.len() >= 2 {
             let (mut start, mut end) = (px[0], px[1]);
             let mut dx = end.0 - start.0;
             let mut dy = end.1 - start.1;
@@ -2942,7 +3355,7 @@ impl ChartEngine {
                 ),
             ));
         }
-        let (points, pending) = self.resolve_drawing_anchors(anchors)?;
+        let (points, pending) = self.resolve_drawing_anchors(kind, anchors)?;
         let mut drawing = Drawing::new(0, kind, pane_index, points);
         drawing.set_pending_times(pending);
         let mut explicit_z_order = false;
@@ -2960,6 +3373,9 @@ impl ChartEngine {
                     "drawing options exceed the drawing contract bounds",
                 ));
             }
+        }
+        if let Some(family) = kind.spec().family {
+            (family.on_create)(self, &mut drawing, false);
         }
         let id = self.take_drawing_id().ok_or_else(|| {
             ChartError::new(
@@ -2979,7 +3395,6 @@ impl ChartEngine {
             drawing: self.drawings[index].clone(),
             index,
         });
-        self.bump_drawing_sync_revision();
         Ok(id)
     }
 
@@ -3008,7 +3423,6 @@ impl ChartEngine {
                 before,
                 after: Box::new(after),
             });
-            self.bump_drawing_sync_revision();
         }
         true
     }
@@ -3031,7 +3445,6 @@ impl ChartEngine {
             before,
             after: Box::new(after),
         });
-        self.bump_drawing_sync_revision();
         true
     }
 
@@ -3122,7 +3535,7 @@ impl ChartEngine {
                     ),
                 ));
             }
-            let (mut points, pending) = self.resolve_drawing_anchors(anchors)?;
+            let (mut points, pending) = self.resolve_drawing_anchors(kind, anchors)?;
             Drawing::normalize_position_points(kind, &mut points);
             staged.push((index, points, pending));
         }
@@ -3172,18 +3585,21 @@ impl ChartEngine {
                 });
             }
         }
-        self.bump_drawing_sync_revision();
         Ok(changed)
     }
 
     /// Resolve host anchors into live logical/price points plus pending times. A `time` resolves
     /// on the current ordinary time axis (it wins over a disagreeing `logical`); without time
-    /// points it stays pending with `logical` (or zero) as the placeholder.
+    /// points it stays pending with `logical` (or zero) as the placeholder. A pane-anchored
+    /// `kind` takes its pane fractions from `logical` and `price`, clamped into `0..=1`, and
+    /// ignores `time`.
     fn resolve_drawing_anchors(
         &self,
+        kind: DrawingKind,
         anchors: &[DrawingAnchor],
     ) -> Result<(Vec<DrawingPoint>, Vec<Option<f64>>), ChartError> {
-        let time_axis = self.drawing_time_axis();
+        let pane_anchored = kind.pane_anchored();
+        let time_axis = self.drawing_time_axis() && !pane_anchored;
         let times = self.data.merged_times();
         let finite = |value: f64| value.is_finite() && value.abs() <= MAX_SAFE_VALUE;
         let mut points = Vec::with_capacity(anchors.len());
@@ -3212,6 +3628,15 @@ impl ChartEngine {
                     }
                 }
                 (Some(logical), _) => (logical, None),
+                (None, Some(_)) if pane_anchored => {
+                    return Err(ChartError::new(
+                        ErrorCode::InvalidData,
+                        format!(
+                            "drawing anchor {index} of a pane-anchored {} needs a logical pane fraction",
+                            kind.name()
+                        ),
+                    ))
+                }
                 (None, Some(_)) => {
                     return Err(ChartError::new(
                         ErrorCode::UnsupportedOperation,
@@ -3233,9 +3658,17 @@ impl ChartEngine {
             if let Some(slot) = pending.get_mut(index) {
                 *slot = pending_time;
             }
-            points.push(DrawingPoint {
-                logical,
-                price: anchor.price,
+            // Pane fractions clamp into the pane, like a drag, so the drawing stays reachable.
+            points.push(if pane_anchored {
+                DrawingPoint {
+                    logical: logical.clamp(0.0, 1.0),
+                    price: anchor.price.clamp(0.0, 1.0),
+                }
+            } else {
+                DrawingPoint {
+                    logical,
+                    price: anchor.price,
+                }
             });
         }
         Ok((points, pending))
@@ -3263,6 +3696,9 @@ impl ChartEngine {
     /// The time identity of one anchor of `drawing`: its pending time while unresolved, otherwise
     /// the time derived from its logical position on the current axis.
     pub(crate) fn drawing_anchor_time_of(&self, drawing: &Drawing, index: usize) -> Option<f64> {
+        if drawing.kind.pane_anchored() {
+            return None;
+        }
         if let Some(Some(time)) = drawing.pending_times.get(index) {
             return Some(*time);
         }
@@ -3296,7 +3732,6 @@ impl ChartEngine {
             return false;
         };
         self.record_drawing_command(DrawingCommand::Delete { drawing, index });
-        self.bump_drawing_sync_revision();
         true
     }
 
@@ -3313,9 +3748,8 @@ impl ChartEngine {
         self.drawing_drag = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
-        self.editing_drawing = None;
+        self.text_edit = None;
         self.record_drawing_command(DrawingCommand::Clear { drawings });
-        self.bump_drawing_sync_revision();
     }
 
     /// The drawing's full options as a snake_case JSON object (reference `options`). `None` for
@@ -3371,16 +3805,59 @@ impl ChartEngine {
         &self.selected_drawings
     }
 
-    /// Copy selected or explicitly supplied drawings to a bounded, revisioned payload. Points
-    /// carry their anchor time identity and the payload carries the chart's price-basis label.
-    pub fn copy_drawings_json(&self, ids: &[DrawingId]) -> Option<String> {
+    /// Copy selected or explicitly supplied drawings (at most [`crate::MAX_DRAWING_OBJECTS`]) to a
+    /// revisioned payload. Points carry their anchor time identity and the payload carries the
+    /// chart's price-basis label. The payload is bounded like a persisted drawing document:
+    /// at most [`crate::MAX_DRAWING_CLIPBOARD_POINTS`] anchors and
+    /// [`crate::MAX_DRAWING_CLIPBOARD_BYTES`] bytes, beyond which it fails with
+    /// `ResourceLimit`; no known drawing to copy fails with `InvalidData`.
+    pub fn copy_drawings_json(&self, ids: &[DrawingId]) -> Result<String, ChartError> {
         let ids = if ids.is_empty() {
             &self.selected_drawings
         } else {
             ids
         };
-        let drawings = ids
-            .iter()
+        let drawings = self.clipboard_items(ids);
+        if drawings.is_empty() {
+            return Err(ChartError::new(
+                ErrorCode::InvalidData,
+                "no drawings could be copied",
+            ));
+        }
+        let points = drawings.iter().map(|item| item.points.len()).sum::<usize>();
+        if points > crate::MAX_DRAWING_CLIPBOARD_POINTS {
+            return Err(ChartError::new(
+                ErrorCode::ResourceLimit,
+                format!(
+                    "a drawing clipboard payload carries at most {} anchors ({points} selected)",
+                    crate::MAX_DRAWING_CLIPBOARD_POINTS
+                ),
+            ));
+        }
+        let payload = crate::DrawingClipboardPayload {
+            schema: "aeris_charts-drawings".to_string(),
+            revision: self.drawing_sync_revision,
+            drawings,
+            price_basis: self.drawing_settings.price_basis.clone(),
+        };
+        let json = serde_json::to_string(&payload)
+            .map_err(|error| ChartError::new(ErrorCode::InvalidData, error.to_string()))?;
+        if json.len() > crate::MAX_DRAWING_CLIPBOARD_BYTES {
+            return Err(ChartError::new(
+                ErrorCode::ResourceLimit,
+                format!(
+                    "a drawing clipboard payload is at most {} bytes",
+                    crate::MAX_DRAWING_CLIPBOARD_BYTES
+                ),
+            ));
+        }
+        Ok(json)
+    }
+
+    /// Clipboard records of the known drawings among `ids` (at most
+    /// [`crate::MAX_DRAWING_OBJECTS`]), in their order.
+    fn clipboard_items(&self, ids: &[DrawingId]) -> Vec<crate::DrawingClipboardItem> {
+        ids.iter()
             .take(crate::MAX_DRAWING_OBJECTS)
             .filter_map(|id| self.drawing(*id))
             .map(|drawing| crate::DrawingClipboardItem {
@@ -3390,21 +3867,15 @@ impl ChartEngine {
                 points: self.drawing_anchors_of(drawing),
                 options: drawing.options_json(),
             })
-            .collect::<Vec<_>>();
-        let payload = crate::DrawingClipboardPayload {
-            schema: "aeris_charts-drawings".to_string(),
-            revision: self.drawing_sync_revision,
-            drawings,
-            price_basis: self.drawing_settings.price_basis.clone(),
-        };
-        let bytes = serde_json::to_vec(&payload).ok()?;
-        (bytes.len() <= crate::MAX_DRAWING_TEMPLATE_BYTES).then(|| String::from_utf8(bytes).ok())?
+            .collect()
     }
 
     /// Paste a clipboard payload into one pane with a semantic anchor offset. Anchors resolve by
     /// their time on this chart's axis (so a payload copied from another interval or history
     /// window lands on the same moments), then the offsets apply. Validation happens before
-    /// mutation, so malformed or oversized payloads cannot partially change the chart.
+    /// mutation, so malformed or oversized payloads (beyond the bounds
+    /// [`ChartEngine::copy_drawings_json`] documents; the byte bound is checked before parsing)
+    /// cannot partially change the chart.
     pub fn paste_drawings_json(
         &mut self,
         json: &str,
@@ -3412,32 +3883,50 @@ impl ChartEngine {
         logical_offset: f64,
         price_offset: f64,
     ) -> Option<Vec<DrawingId>> {
-        if json.len() > crate::MAX_DRAWING_TEMPLATE_BYTES
-            || !logical_offset.is_finite()
-            || !price_offset.is_finite()
-            || pane_index >= self.panes.len()
-            || !self.pane_uses_financial_time(pane_index)
-        {
+        if json.len() > crate::MAX_DRAWING_CLIPBOARD_BYTES {
             return None;
         }
         let payload = serde_json::from_str::<crate::DrawingClipboardPayload>(json).ok()?;
-        if payload.schema != "aeris_charts-drawings"
-            || payload.drawings.is_empty()
-            || payload.drawings.len() > crate::MAX_DRAWING_OBJECTS
+        if payload.schema != "aeris_charts-drawings" {
+            return None;
+        }
+        self.paste_drawing_items(payload.drawings, pane_index, logical_offset, price_offset)
+    }
+
+    fn paste_drawing_items(
+        &mut self,
+        items: Vec<crate::DrawingClipboardItem>,
+        pane_index: usize,
+        logical_offset: f64,
+        price_offset: f64,
+    ) -> Option<Vec<DrawingId>> {
+        if !logical_offset.is_finite()
+            || !price_offset.is_finite()
+            || pane_index >= self.panes.len()
+            || !self.pane_uses_financial_time(pane_index)
+            || items.is_empty()
+            || items.len() > crate::MAX_DRAWING_OBJECTS
+            || items.iter().map(|item| item.points.len()).sum::<usize>()
+                > crate::MAX_DRAWING_CLIPBOARD_POINTS
         {
             return None;
         }
-        let mut staged = Vec::with_capacity(payload.drawings.len());
-        for item in payload.drawings {
+        let mut staged = Vec::with_capacity(items.len());
+        for item in items {
             if item.points.len() > MAX_DRAWING_POINTS
                 || !item.kind.valid_point_count(item.points.len())
             {
                 return None;
             }
-            let (mut points, mut pending) = self.resolve_drawing_anchors(&item.points).ok()?;
-            for point in &mut points {
-                point.logical += logical_offset;
-                point.price += price_offset;
+            let (mut points, mut pending) =
+                self.resolve_drawing_anchors(item.kind, &item.points).ok()?;
+            // Time and price offsets do not apply to pane fractions: a pane-anchored drawing
+            // pastes at its own pane position.
+            if !item.kind.pane_anchored() {
+                for point in &mut points {
+                    point.logical += logical_offset;
+                    point.price += price_offset;
+                }
             }
             if points
                 .iter()
@@ -3476,21 +3965,19 @@ impl ChartEngine {
         Some(ids)
     }
 
+    /// Duplicate a drawing in its pane with a semantic anchor offset, through the paste path but
+    /// staged from the live drawing, so any drawing the chart holds can be cloned.
     pub fn clone_drawing(
         &mut self,
         id: DrawingId,
         logical_offset: f64,
         price_offset: f64,
     ) -> Option<DrawingId> {
-        let payload = self.copy_drawings_json(&[id])?;
-        self.paste_drawings_json(
-            &payload,
-            self.drawing(id)?.pane_index,
-            logical_offset,
-            price_offset,
-        )?
-        .into_iter()
-        .next()
+        let pane_index = self.drawing(id)?.pane_index;
+        let items = self.clipboard_items(&[id]);
+        self.paste_drawing_items(items, pane_index, logical_offset, price_offset)?
+            .into_iter()
+            .next()
     }
 
     /// Move one drawing within the layer and normalize its stable z-order values. `delta` is a
@@ -3512,7 +3999,6 @@ impl ChartEngine {
         }
         let after = self.drawings.clone();
         self.record_drawing_command(DrawingCommand::Reorder { before, after });
-        self.bump_drawing_sync_revision();
         self.drawing_runtime
             .borrow_mut()
             .rebuild_all(&self.drawings, self.panes.len());
@@ -3561,7 +4047,6 @@ impl ChartEngine {
         if changed != 0 {
             let after = self.drawings.clone();
             self.record_drawing_command(DrawingCommand::BatchUpdate { before, after });
-            self.bump_drawing_sync_revision();
             self.drawing_runtime
                 .borrow_mut()
                 .rebuild_all(&self.drawings, self.panes.len());
@@ -3588,7 +4073,8 @@ impl ChartEngine {
             return 0;
         }
         self.update_group(group_id, |drawing| {
-            if drawing.locked {
+            // Time and price deltas do not apply to pane fractions (like paste offsets).
+            if drawing.locked || drawing.kind.pane_anchored() {
                 return;
             }
             for point in &mut drawing.points {
@@ -3619,30 +4105,79 @@ impl ChartEngine {
         removed
     }
 
+    /// Restyle drawing `id` from a named template. Only style applies: identity, placement,
+    /// visibility, and content keys are dropped even from a template a host wrote itself (see
+    /// [`TEMPLATE_NON_STYLE_KEYS`]), and a profile's settings keep the target's own series source.
     pub fn apply_drawing_template_json(&mut self, id: DrawingId, json: &str) -> bool {
-        let Ok(template) = serde_json::from_str::<crate::DrawingTemplate>(json) else {
+        let Ok(mut template) = serde_json::from_str::<crate::DrawingTemplate>(json) else {
             return false;
         };
-        if !template.validate()
-            || self
-                .drawing(id)
-                .is_none_or(|drawing| drawing.kind != template.kind)
-        {
+        let Some(drawing) = self.drawing(id) else {
             return false;
+        };
+        if !template.validate() || drawing.kind != template.kind {
+            return false;
+        }
+        let Some(options) = template.options.as_object_mut() else {
+            return false;
+        };
+        for key in TEMPLATE_NON_STYLE_KEYS {
+            options.remove(*key);
+        }
+        if let Some(profile) = options
+            .get_mut("profile")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            match drawing
+                .profile
+                .as_ref()
+                .and_then(|own| serde_json::to_value(own.source).ok())
+            {
+                Some(source) => {
+                    profile.insert("source".to_string(), source);
+                }
+                None => {
+                    options.remove("profile");
+                }
+            }
+        }
+        // A template states each style option it carries in full: its `tool_options` replace the
+        // drawing's family style, resetting any the template leaves at their defaults, while
+        // data the drawing captured (a bars pattern's copy) is not style and stays.
+        if let Some(tool_options) = options.get_mut("tool_options") {
+            *tool_options = drawing
+                .tool_options
+                .template_style()
+                .replacement_patch(tool_options);
         }
         let options = template.options.to_string();
         self.drawing_apply_options(id, &options)
     }
 
+    /// Export drawing `id`'s style as a named template: its options without identity, placement,
+    /// visibility, or content ([`TEMPLATE_NON_STYLE_KEYS`]), without a profile's series source,
+    /// and without data the drawing captured (a bars pattern's copy).
     pub fn drawing_template_json(&self, id: DrawingId, name: &str) -> Option<String> {
         if name.is_empty() || name.len() > crate::MAX_DRAWING_NAME_BYTES {
             return None;
         }
-        let drawing = self.drawing(id)?;
+        let mut style = self.drawing(id)?.clone();
+        style.tool_options = style.tool_options.template_style();
+        let mut options = style.options_json();
+        let object = options.as_object_mut()?;
+        for key in TEMPLATE_NON_STYLE_KEYS {
+            object.remove(*key);
+        }
+        if let Some(profile) = object
+            .get_mut("profile")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            profile.remove("source");
+        }
         serde_json::to_string(&crate::DrawingTemplate {
             name: name.to_string(),
-            kind: drawing.kind,
-            options: drawing.options_json(),
+            kind: style.kind,
+            options,
         })
         .ok()
     }
@@ -3709,7 +4244,8 @@ impl ChartEngine {
             if id == 0 {
                 return false;
             }
-            let Ok((points, pending)) = self.resolve_drawing_anchors(&item.points) else {
+            let Ok((points, pending)) = self.resolve_drawing_anchors(item.kind, &item.points)
+            else {
                 return false;
             };
             let mut drawing = Drawing::new(id, item.kind, item.pane_index, points);
@@ -3739,6 +4275,7 @@ impl ChartEngine {
         self.drawing_settings.price_basis = payload.price_basis.filter(|basis| !basis.is_empty());
         self.selected_drawing = None;
         self.selected_drawings.clear();
+        self.text_edit = None;
         self.drawing_history.clear();
         self.drawing_runtime
             .borrow_mut()
@@ -3759,7 +4296,7 @@ impl ChartEngine {
     pub fn drawing_point_to_coordinate(&self, id: DrawingId, index: usize) -> Option<(f64, f64)> {
         let drawing = self.drawing(id)?;
         let point = drawing.points.get(index)?;
-        self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, *point)
+        self.drawing_point_px(drawing, *point)
     }
 
     /// The exact media-px text-run anchor shared by frame rendering and the host caret overlay.
@@ -3796,6 +4333,46 @@ impl ChartEngine {
             TEXT_PAD,
         );
         Some((x, y, angle))
+    }
+
+    /// The inline editor's layout of a family drawing's own `text`: the label its parts mark
+    /// with [`DrawingParts::text_label`], resolved as while its editor is open (an empty text
+    /// keeps one caret line). `None` for core tools (the text tool and trend labels place their
+    /// single-line run through [`ChartEngine::drawing_text_transform`]), for a family drawing
+    /// that paints no text of its own, or when its anchors cannot convert.
+    pub fn drawing_text_edit_layout(&self, id: DrawingId) -> Option<DrawingTextEditLayout> {
+        let drawing = self.drawing(id)?;
+        let family = drawing.kind.spec().family?;
+        let px = self.drawing_px(drawing)?;
+        let mut context = PartContext::media(self, drawing, &px)?;
+        context.text_editing = true;
+        let mut parts = DrawingParts::default();
+        (family.build_parts)(&context, &mut parts);
+        let text = parts.text?;
+        let label = parts.labels.get(text.label)?;
+        let font_family = &self.options.get().layout.font_family;
+        let layout = label.layout(|line| {
+            self.measure_text_run(line, label.size, font_family, label.weight, label.italic)
+        });
+        Some(DrawingTextEditLayout {
+            x: layout.text_x,
+            y: layout.first_y + text.first_line as f64 * layout.line_height,
+            line_height: layout.line_height,
+            size: label.size,
+            font_family: font_family.clone(),
+            weight: label.weight,
+            italic: label.italic,
+            color: label
+                .color
+                .unwrap_or_else(|| self.drawing_label_color(drawing))
+                .to_css(),
+            rect: [
+                layout.rect.left,
+                layout.rect.top,
+                layout.rect.right,
+                layout.rect.bottom,
+            ],
+        })
     }
 
     /// Topmost trend-line label/placeholder at a media-px point. This keeps the browser host
@@ -3893,39 +4470,123 @@ impl ChartEngine {
         self.selected_drawing
     }
 
-    /// Mark the text-capable drawing the host's typing-mode editor currently owns. The frame keeps
-    /// painting the label and the focus border underneath the host's borderless caret overlay
-    /// (the public reference's overlay-caret model); this flag is the host/query seam for that session.
-    /// Cleared when the editor closes. An unknown id never sticks.
-    pub fn set_editing_drawing(&mut self, id: Option<DrawingId>) {
-        let valid = id.filter(|&eid| {
-            self.drawings.iter().any(|d| {
-                d.id == eid
-                    && !d.locked
-                    && d.visible
-                    && d.interval_visibility.allows(self.drawing_interval)
-                    && matches!(d.kind, DrawingKind::Text | DrawingKind::TrendLine)
-            })
-        });
-        let changes_trend_placeholder =
-            [self.editing_drawing, valid]
-                .into_iter()
-                .flatten()
-                .any(|id| {
-                    self.drawing(id).is_some_and(|drawing| {
-                        drawing.kind == DrawingKind::TrendLine && drawing.text.is_empty()
-                    })
-                });
-        if changes_trend_placeholder {
-            self.invalidate_frame_drawings();
-        } else {
-            self.invalidate_frame_overlay();
+    /// Whether the host's inline editor can edit `id`'s `text` in place: the text tool, a trend
+    /// line's label, or a family drawing whose parts carry a text label
+    /// ([`ChartEngine::drawing_text_edit_layout`]), while the drawing is unlocked, visible, and
+    /// shown on the current interval.
+    pub fn drawing_text_editable(&self, id: DrawingId) -> bool {
+        let Some(drawing) = self.drawing(id) else {
+            return false;
+        };
+        if drawing.locked
+            || !drawing.visible
+            || !drawing.interval_visibility.allows(self.drawing_interval)
+        {
+            return false;
         }
-        self.editing_drawing = valid;
+        match drawing.kind {
+            DrawingKind::Text | DrawingKind::TrendLine => true,
+            _ => self.drawing_text_edit_layout(id).is_some(),
+        }
     }
 
+    /// Open the inline text-edit session the host's typing-mode editor owns on a text-editable
+    /// drawing ([`ChartEngine::drawing_text_editable`]), committing any session open on another
+    /// drawing first. The frame keeps painting the label and the focus border underneath the
+    /// host's borderless caret overlay (the public reference's overlay-caret model), and an empty
+    /// family text box keeps one caret line. Returns false for a drawing that cannot be edited.
+    pub fn begin_drawing_text_edit(&mut self, id: DrawingId) -> bool {
+        if self.editing_drawing() == Some(id) {
+            return true;
+        }
+        if !self.drawing_text_editable(id) {
+            return false;
+        }
+        self.end_drawing_text_edit(true);
+        let Some(drawing) = self.drawing(id) else {
+            return false;
+        };
+        self.text_edit = Some(DrawingTextEdit {
+            id,
+            text: drawing.text.clone(),
+            revision: drawing.revision,
+        });
+        self.invalidate_frame_drawings();
+        true
+    }
+
+    /// Replace the edited drawing's `text` live while the session is open. Live text records no
+    /// undo step and no sync revision; [`ChartEngine::end_drawing_text_edit`] records the whole
+    /// edit once. Returns false while no session is open.
+    pub fn set_drawing_edit_text(&mut self, text: &str) -> bool {
+        let Some(id) = self.editing_drawing() else {
+            return false;
+        };
+        let Some(index) = self.drawings.iter().position(|drawing| drawing.id == id) else {
+            self.text_edit = None;
+            return false;
+        };
+        if self.drawings[index].text != text {
+            let drawing = &mut self.drawings[index];
+            drawing.text = text.to_string();
+            drawing.revision = drawing.revision.saturating_add(1);
+            self.update_drawing_runtime(id);
+            self.invalidate_frame_drawings();
+        }
+        true
+    }
+
+    /// Close the inline text-edit session. Commit records the edit as one undo step (the text
+    /// it began from against the text it ends with) and one sync revision, when the text
+    /// changed; cancel restores the text it began from without a history entry. Returns false
+    /// while no session is open.
+    pub fn end_drawing_text_edit(&mut self, commit: bool) -> bool {
+        let Some(edit) = self.text_edit.take() else {
+            return false;
+        };
+        self.invalidate_frame_drawings();
+        let Some(index) = self
+            .drawings
+            .iter()
+            .position(|drawing| drawing.id == edit.id)
+        else {
+            return true;
+        };
+        if self.drawings[index].text == edit.text {
+            return true;
+        }
+        if commit {
+            let after = self.drawings[index].clone();
+            let mut before = after.clone();
+            before.text = edit.text;
+            before.revision = edit.revision;
+            self.record_drawing_command(DrawingCommand::Update {
+                before,
+                after: Box::new(after),
+            });
+        } else {
+            let drawing = &mut self.drawings[index];
+            drawing.text = edit.text;
+            drawing.revision = edit.revision;
+            self.update_drawing_runtime(edit.id);
+        }
+        true
+    }
+
+    /// The drawing whose inline text-edit session is open.
     pub fn editing_drawing(&self) -> Option<DrawingId> {
-        self.editing_drawing
+        self.text_edit.as_ref().map(|edit| edit.id)
+    }
+
+    /// Whether `id` paints parts only while focused (`DrawingFamily::reveals_on_focus`).
+    pub(crate) fn drawing_reveals_on_focus(&self, id: DrawingId) -> bool {
+        self.drawing(id).is_some_and(|drawing| {
+            drawing
+                .kind
+                .spec()
+                .family
+                .is_some_and(|family| (family.reveals_on_focus)(drawing))
+        })
     }
 
     /// Mark a text drawing or trend line under the host pointer. Text drawings paint their
@@ -4041,65 +4702,19 @@ impl ChartEngine {
                     && drawing.interval_visibility.allows(self.drawing_interval)
                 {
                     if let Some(px) = self.drawing_px(drawing) {
-                        match drawing.kind.spec().handles {
-                            DrawingHandleMode::None => {}
-                            DrawingHandleMode::Endpoints if !px.is_empty() => {
-                                let last = px.len() - 1;
-                                for index in [0, last] {
-                                    let (ax, ay) = px[index];
-                                    if (x - ax).hypot(y - ay) <= profile.drawing_anchor_radius {
-                                        return Some(DrawingHit {
-                                            id: selected,
-                                            part: DrawingDragPart::Anchor(index),
-                                            cursor: "pointer",
-                                        });
-                                    }
-                                }
-                            }
-                            DrawingHandleMode::RectangleBounds if px.len() == 2 => {
-                                let anchors = Self::rectangle_anchors(&px);
-                                for (index, &(ax, ay)) in anchors.iter().enumerate() {
-                                    if (x - ax).hypot(y - ay) <= profile.drawing_anchor_radius {
-                                        return Some(DrawingHit {
-                                            id: selected,
-                                            part: DrawingDragPart::Anchor(index),
-                                            cursor: Self::rectangle_anchor_cursor(index),
-                                        });
-                                    }
-                                }
-                            }
-                            DrawingHandleMode::Position if px.len() == 3 => {
-                                let entry = px[0];
-                                let target = px[1];
-                                let stop = px[2];
-                                let handles = [
-                                    (entry.0, target.1, "ns-resize"),
-                                    (entry.0, entry.1, "move"),
-                                    (target.0, entry.1, "ew-resize"),
-                                    (entry.0, stop.1, "ns-resize"),
-                                ];
-                                for (index, &(ax, ay, cursor)) in handles.iter().enumerate() {
-                                    if (x - ax).hypot(y - ay) <= profile.drawing_anchor_radius {
-                                        return Some(DrawingHit {
-                                            id: selected,
-                                            part: DrawingDragPart::Anchor(index),
-                                            cursor,
-                                        });
-                                    }
-                                }
-                            }
-                            DrawingHandleMode::Anchors | DrawingHandleMode::Endpoints => {
-                                for (index, &(ax, ay)) in px.iter().enumerate() {
-                                    if (x - ax).hypot(y - ay) <= profile.drawing_anchor_radius {
-                                        return Some(DrawingHit {
-                                            id: selected,
-                                            part: DrawingDragPart::Anchor(index),
-                                            cursor: "pointer",
-                                        });
-                                    }
-                                }
-                            }
-                            DrawingHandleMode::RectangleBounds | DrawingHandleMode::Position => {}
+                        let handle =
+                            self.drawing_handle_set(drawing, &px)
+                                .into_iter()
+                                .find(|handle| {
+                                    (x - handle.point.0).hypot(y - handle.point.1)
+                                        <= profile.drawing_anchor_radius
+                                });
+                        if let Some(handle) = handle {
+                            return Some(DrawingHit {
+                                id: selected,
+                                part: handle.part,
+                                cursor: handle.cursor,
+                            });
                         }
                     }
                 }
@@ -4177,6 +4792,17 @@ impl ChartEngine {
         let Some(pane) = self.panes.get(drawing.pane_index) else {
             return false;
         };
+        if let Some(family) = drawing.kind.spec().family {
+            let Some(context) = PartContext::media(self, drawing, px) else {
+                return false;
+            };
+            let mut parts = DrawingParts::default();
+            (family.build_parts)(&context, &mut parts);
+            let font_family = &self.options.get().layout.font_family;
+            return parts.hit(drawing, (x, y), hit_tolerance, |label, line| {
+                self.measure_text_run(line, label.size, font_family, label.weight, label.italic)
+            });
+        }
         let Some(geometry) = resolve_drawing_geometry(
             drawing.kind,
             px,
@@ -4324,6 +4950,14 @@ impl ChartEngine {
         let Some(start_px) = self.drawing_px(drawing) else {
             return false;
         };
+        let handle_px = match hit.part {
+            DrawingDragPart::Handle(_) => match self.drawing_handle_px(drawing, hit.part) {
+                Some(point) => point,
+                None => return false,
+            },
+            _ => (x, y),
+        };
+        let history_tool_options = drawing.tool_options.clone();
         self.selected_drawing = Some(hit.id);
         self.drawing_drag = Some(DrawingDrag {
             id: hit.id,
@@ -4332,9 +4966,12 @@ impl ChartEngine {
             start_y: y,
             current_x: x,
             current_y: y,
+            handle_px,
             history_points: start_points.clone(),
+            history_tool_options,
             start_points,
             start_px,
+            keyboard_step: None,
         });
         true
     }
@@ -4379,6 +5016,7 @@ impl ChartEngine {
         let (dx, dy) = (x - drag.start_x, y - drag.start_y);
         let (id, part) = (drag.id, drag.part);
         let (start_points, start_px) = (drag.start_points.clone(), drag.start_px.clone());
+        let handle_px = drag.handle_px;
         let Some(drawing) = self.drawing(id) else {
             return;
         };
@@ -4388,11 +5026,29 @@ impl ChartEngine {
             drawing.price_scale,
             drawing.snap_time_to_data,
         );
-        let mut points = start_points;
+        // Pane fractions never snap to bars or prices.
+        let pane_anchored = kind.pane_anchored();
+        let snap_time_to_data = snap_time_to_data && !pane_anchored;
+        let magnet = if pane_anchored {
+            crate::DrawingMagnetMode::Off
+        } else {
+            magnet
+        };
+        let modifiers = DrawingModifiers {
+            magnet: modifiers.magnet && !pane_anchored,
+            ..modifiers
+        };
+        let mut points = start_points.clone();
         let convert = |index: usize, dx: f64, dy: f64| -> Option<DrawingPoint> {
             let (px, py) = start_px.get(index)?;
-            self.drawing_from_px_for(pane, price_scale, px + dx, py + dy)
+            self.drawing_anchor_from_px(kind, pane, price_scale, px + dx, py + dy)
         };
+        // The dragged point: a derived handle's baseline moved by the delta and snapped like an
+        // anchor (below), otherwise the pointer.
+        let Some(mut target) = self.drawing_anchor_from_px(kind, pane, price_scale, x, y) else {
+            return;
+        };
+        let mut target_px = (x, y);
         match part {
             DrawingDragPart::Anchor(index) => {
                 if kind.spec().handles == DrawingHandleMode::Position
@@ -4439,13 +5095,7 @@ impl ChartEngine {
                         }
                         _ => unreachable!(),
                     }
-                    if let Some(drawing) = self.drawings.iter_mut().find(|d| d.id == id) {
-                        drawing.points = points;
-                    }
-                    self.update_drawing_runtime(id);
-                    return;
-                }
-                if kind.spec().handles == DrawingHandleMode::RectangleBounds
+                } else if kind.spec().handles == DrawingHandleMode::RectangleBounds
                     && points.len() == 2
                     && index < 8
                 {
@@ -4532,53 +5182,37 @@ impl ChartEngine {
                     }
                     points[0] = p0;
                     points[1] = p1;
-                    if let Some(drawing) = self.drawings.iter_mut().find(|d| d.id == id) {
-                        drawing.points = points;
+                } else {
+                    if index >= points.len() {
+                        return;
                     }
-                    if kind.spec().placement.is_freehand() {
-                        self.invalidate_brush_drag_runtime(id);
-                    } else {
-                        self.update_drawing_runtime(id);
-                    }
-                    return;
-                }
-                if index >= points.len() {
-                    return;
-                }
-                let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
-                let Some(mut point) = convert(index, dx, dy) else {
-                    return;
-                };
-                if snap_time_to_data {
-                    let Some(snapped) = self.snap_drawing_time_to_data(point) else {
+                    let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
+                    let Some(mut point) = convert(index, dx, dy) else {
                         return;
                     };
-                    point = snapped;
-                }
-                if modifiers.magnet {
-                    let snapped = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
-                    point = match kind.spec().movement_axis {
-                        DrawingMovementAxis::VerticalOnly => DrawingPoint {
-                            price: snapped.price,
-                            ..point
-                        },
-                        DrawingMovementAxis::HorizontalOnly => DrawingPoint {
-                            logical: snapped.logical,
-                            ..point
-                        },
-                        DrawingMovementAxis::Both => snapped,
-                    };
-                }
-                if modifiers.straighten && points.len() == 2 {
-                    // The other anchor is the fixed one (only the dragged anchor moves).
-                    let fixed = points[1 - index];
-                    if let Some(snapped) =
-                        self.straighten_point(pane, price_scale, kind, fixed, point)
-                    {
+                    if snap_time_to_data {
+                        let Some(snapped) = self.snap_drawing_time_to_data(point) else {
+                            return;
+                        };
                         point = snapped;
                     }
+                    if modifiers.magnet {
+                        let snapped =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
+                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                    }
+                    if modifiers.straighten && index < 2 && points.len() >= 2 {
+                        // The first two anchors are the straightened segment (a channel's base line);
+                        // the other one is fixed (only the dragged anchor moves).
+                        let fixed = points[1 - index];
+                        if let Some(snapped) =
+                            self.straighten_point(pane, price_scale, kind, fixed, point)
+                        {
+                            point = snapped;
+                        }
+                    }
+                    points[index] = point;
                 }
-                points[index] = point;
             }
             DrawingDragPart::Body => {
                 // Reference-informed shift-move: constrain the translation to the dominant axis.
@@ -4609,24 +5243,67 @@ impl ChartEngine {
                     if modifiers.magnet && single_anchor {
                         let snapped =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
-                        point = match kind.spec().movement_axis {
-                            DrawingMovementAxis::VerticalOnly => DrawingPoint {
-                                price: snapped.price,
-                                ..point
-                            },
-                            DrawingMovementAxis::HorizontalOnly => DrawingPoint {
-                                logical: snapped.logical,
-                                ..point
-                            },
-                            DrawingMovementAxis::Both => snapped,
-                        };
+                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
                     }
                     *slot = point;
                 }
             }
+            DrawingDragPart::Handle(_) => {
+                // A derived handle moves from its own baseline like an anchor: along the spec's
+                // movement axis, time-snapped, then magnet-snapped. Its family's `drag` hook
+                // resolves what the handle drives.
+                let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
+                let Some(mut point) = self.drawing_anchor_from_px(
+                    kind,
+                    pane,
+                    price_scale,
+                    handle_px.0 + dx,
+                    handle_px.1 + dy,
+                ) else {
+                    return;
+                };
+                if snap_time_to_data {
+                    let Some(snapped) = self.snap_drawing_time_to_data(point) else {
+                        return;
+                    };
+                    point = snapped;
+                }
+                if modifiers.magnet {
+                    let snapped = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
+                    point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                }
+                let Some(point_px) = self.drawing_anchor_px(kind, pane, price_scale, point) else {
+                    return;
+                };
+                target = point;
+                target_px = point_px;
+            }
         }
+        let tool_options = match kind.spec().family {
+            Some(family) => {
+                let (Some(drawing), Some(drag)) = (self.drawing(id), self.drawing_drag.as_ref())
+                else {
+                    return;
+                };
+                let sample = handles::HandleDrag {
+                    part,
+                    start_points: &start_points,
+                    start_px: &start_px,
+                    start_tool_options: &drag.history_tool_options,
+                    target,
+                    target_px,
+                    straighten: modifiers.straighten,
+                    keyboard_step: drag.keyboard_step,
+                };
+                (family.drag)(self, drawing, &sample, &mut points)
+            }
+            None => None,
+        };
         if let Some(drawing) = self.drawings.iter_mut().find(|d| d.id == id) {
             drawing.points = points;
+            if let Some(tool_options) = tool_options {
+                drawing.tool_options = tool_options;
+            }
         }
         if kind.spec().placement.is_freehand() {
             self.invalidate_brush_drag_runtime(id);
@@ -4637,30 +5314,47 @@ impl ChartEngine {
 
     /// Close the drag session (pointer up/cancel).
     pub fn drawing_drag_end(&mut self) {
+        self.commit_drawing_drag();
+    }
+
+    /// Close the drag session and report whether it committed an undoable change. A session that
+    /// ends where it started (a clamped, axis-locked, or sub-bar move) records nothing, and so
+    /// leaves the drawing's revision and the sync revision where they were.
+    fn commit_drawing_drag(&mut self) -> bool {
         self.invalidate_frame_overlay();
-        if let Some(drag) = self.drawing_drag.take() {
-            let id = drag.id;
-            self.update_drawing_runtime(id);
-            if let Some(after) = self.drawing(id).cloned() {
-                let mut before = after.clone();
-                before.points = drag.history_points;
-                if before != after {
-                    // A price-only (vertical) edit keeps the non-time bar identity sidecar.
-                    if before
-                        .points
-                        .iter()
-                        .zip(&after.points)
-                        .any(|(a, b)| a.logical != b.logical)
-                    {
-                        self.drawing_anchor_times.remove(&id);
-                    }
-                    self.record_drawing_command(DrawingCommand::Update {
-                        before,
-                        after: Box::new(after),
-                    });
-                }
-            }
+        let Some(drag) = self.drawing_drag.take() else {
+            return false;
+        };
+        let id = drag.id;
+        self.update_drawing_runtime(id);
+        let Some(index) = self.drawings.iter().position(|drawing| drawing.id == id) else {
+            return false;
+        };
+        let mut before = self.drawings[index].clone();
+        before.points = drag.history_points;
+        before.tool_options = drag.history_tool_options;
+        if before == self.drawings[index] {
+            return false;
         }
+        // A price-only (vertical) edit keeps the non-time bar identity sidecar.
+        if before
+            .points
+            .iter()
+            .zip(&self.drawings[index].points)
+            .any(|(a, b)| a.logical != b.logical)
+        {
+            self.drawing_anchor_times.remove(&id);
+        }
+        // Like an options patch, a committed geometry edit advances the drawing's own revision;
+        // `before` keeps the old one so undo restores it.
+        let drawing = &mut self.drawings[index];
+        drawing.revision = drawing.revision.saturating_add(1);
+        let after = drawing.clone();
+        self.record_drawing_command(DrawingCommand::Update {
+            before,
+            after: Box::new(after),
+        });
+        true
     }
 
     /// Abort an interrupted host drag and restore its exact semantic start snapshot. Capture loss,
@@ -4676,6 +5370,7 @@ impl ChartEngine {
             .find(|drawing| drawing.id == drag.id)
         {
             drawing.points = drag.history_points;
+            drawing.tool_options = drag.history_tool_options;
             self.update_drawing_runtime(drag.id);
             self.invalidate_frame_drawings();
         }
@@ -4691,7 +5386,9 @@ impl ChartEngine {
     /// Position's target/entry/width/stop controls); `None` moves the whole drawing. The session
     /// starts at the handle's own media position so handle kinds that follow the pointer move by
     /// exactly the nudge delta. Keyboard nudges never magnet-snap, locked drawings do not move,
-    /// and an active pointer drag is left untouched.
+    /// and an active pointer drag is left untouched. Returns true only when the nudge recorded an
+    /// undoable change: a nudge along an axis the drawing cannot move, one clamped at the pane
+    /// edge, or one a family quantizes back to the same value returns false and records nothing.
     pub fn nudge_selected_drawing(
         &mut self,
         dx_css: f64,
@@ -4731,6 +5428,7 @@ impl ChartEngine {
         let Some(start_px) = self.drawing_px(drawing) else {
             return false;
         };
+        let history_tool_options = drawing.tool_options.clone();
         self.drawing_drag = Some(DrawingDrag {
             id,
             part,
@@ -4738,9 +5436,12 @@ impl ChartEngine {
             start_y,
             current_x: start_x,
             current_y: start_y,
+            handle_px: (start_x, start_y),
             history_points: start_points.clone(),
+            history_tool_options,
             start_points,
             start_px,
+            keyboard_step: Some((dx_css, dy_css)),
         });
         self.drawing_drag_apply(
             start_x + dx_css,
@@ -4748,8 +5449,7 @@ impl ChartEngine {
             crate::DrawingMagnetMode::Off,
             false,
         );
-        self.drawing_drag_end();
-        true
+        self.commit_drawing_drag()
     }
 
     // --- drawing-tool controller --------------------------------------------------------------
@@ -5207,9 +5907,23 @@ impl ChartEngine {
         if bound_pane.is_some() && self.pane_at_y(y) != Some(pane) {
             return -1;
         }
-        let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {
-            return -1;
-        };
+        // A click on the first vertex of a closable multi-click drawing closes and commits it.
+        if self.pending_close_hit(x, y).is_some() {
+            let Some(mut pending) = self.drawing_controller.pending.take() else {
+                return -1;
+            };
+            if let Some(close) = pending
+                .drawing
+                .kind
+                .spec()
+                .family
+                .and_then(|family| family.close_placement)
+            {
+                close(&mut pending.drawing);
+            }
+            pending.preview = None;
+            return i64::from(self.commit_pending_drawing(pending));
+        }
         let (anchor_count, kind, fixed, snap_time_to_data, own_magnet) = {
             let Some(pending) = &self.drawing_controller.pending else {
                 return 0;
@@ -5222,15 +5936,23 @@ impl ChartEngine {
                 pending.drawing.magnet,
             )
         };
+        let Some(mut point) = self.drawing_anchor_from_px(kind, pane, price_scale, x, y) else {
+            return -1;
+        };
+        // Pane fractions never snap to bars or prices.
+        let pane_anchored = kind.pane_anchored();
+        let snap_time_to_data = snap_time_to_data && !pane_anchored;
         if snap_time_to_data {
             let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                 return -1;
             };
             point = snapped;
         }
-        let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
-        point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
-        if modifiers.straighten {
+        if !pane_anchored {
+            let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
+            point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
+        }
+        if modifiers.straighten && !pane_anchored {
             if let Some(fixed) = fixed {
                 if let Some(snapped) = self.straighten_point(pane, price_scale, kind, fixed, point)
                 {
@@ -5283,6 +6005,22 @@ impl ChartEngine {
         i64::from(self.commit_pending_drawing(pending))
     }
 
+    /// The first vertex of the pending drawing when media px `(x, y)` lies within the anchor hit
+    /// radius of it and a click there would close the drawing: its family closes placements
+    /// (`DrawingFamily::close_placement`), it is a multi-click sequence, and at least three
+    /// vertices are placed.
+    fn pending_close_hit(&self, x: f64, y: f64) -> Option<DrawingPoint> {
+        let drawing = &self.drawing_controller.pending.as_ref()?.drawing;
+        let spec = drawing.kind.spec();
+        spec.family?.close_placement?;
+        if !spec.placement.is_sequence() || drawing.points.len() < 3 {
+            return None;
+        }
+        let first = *drawing.points.first()?;
+        let (fx, fy) = self.drawing_point_px(drawing, first)?;
+        ((x - fx).hypot(y - fy) <= HitProfile::PRECISION.drawing_anchor_radius).then_some(first)
+    }
+
     fn commit_pending_drawing(&mut self, pending: PendingDrawing) -> DrawingId {
         self.invalidate_frame_overlay();
         let Some(id) = self.take_drawing_id() else {
@@ -5290,6 +6028,9 @@ impl ChartEngine {
         };
         let mut drawing = pending.drawing;
         drawing.id = id;
+        if let Some(family) = drawing.kind.spec().family {
+            (family.on_create)(self, &mut drawing, true);
+        }
         self.drawings.push(drawing);
         self.insert_drawing_runtime(id);
         self.selected_drawing = Some(id);
@@ -5364,19 +6105,31 @@ impl ChartEngine {
         if self.pane_at_y(y) != Some(pane) {
             return;
         }
-        let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {
+        // Over the first vertex of a closable drawing the preview closes the outline.
+        if let Some(first) = self.pending_close_hit(x, y) {
+            if let Some(pending) = self.drawing_controller.pending.as_mut() {
+                pending.preview = Some(first);
+            }
+            return;
+        }
+        let kind = pending.drawing.kind;
+        let Some(mut point) = self.drawing_anchor_from_px(kind, pane, price_scale, x, y) else {
             return;
         };
+        // Pane fractions never snap to bars or prices.
+        let pane_anchored = kind.pane_anchored();
         let own_magnet = pending.drawing.magnet;
-        if pending.drawing.snap_time_to_data {
+        if pending.drawing.snap_time_to_data && !pane_anchored {
             let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                 return;
             };
             point = snapped;
         }
-        let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
-        point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
-        if modifiers.straighten {
+        if !pane_anchored {
+            let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
+            point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
+        }
+        if modifiers.straighten && !pane_anchored {
             if let Some(pending) = &self.drawing_controller.pending {
                 if let Some(&fixed) = pending.drawing.points.last() {
                     if let Some(snapped) =
@@ -5568,6 +6321,251 @@ impl ChartEngine {
     pub(crate) fn brush_capture(&self) -> Option<&BrushCapture> {
         self.drawing_controller.brush.as_ref()
     }
+}
+
+// --- pane-anchored anchors (B8 family hook `DrawingFamily::pane_anchored`) ---------------------
+
+impl DrawingKind {
+    /// Whether this kind's anchors are pane fractions (`logical` = x / pane width, `price` = y /
+    /// pane height from the pane top) instead of time and price. Such a drawing stays put while
+    /// the chart scrolls or rescales, carries no anchor time, ignores magnets and paste offsets,
+    /// and is never rebased or price-rescaled.
+    pub(crate) fn pane_anchored(self) -> bool {
+        self.spec()
+            .family
+            .is_some_and(|family| (family.pane_anchored)(self))
+    }
+}
+
+impl ChartEngine {
+    /// Media px of one anchor of `drawing` (x pane-relative, y chart-top): time and price
+    /// through the drawing's scale, or the pane fraction of a pane-anchored kind. Both need the
+    /// same live pane, scale, and time points, so every drawing appears and hides together.
+    pub(crate) fn drawing_point_px(
+        &self,
+        drawing: &Drawing,
+        point: DrawingPoint,
+    ) -> Option<(f64, f64)> {
+        self.drawing_anchor_px(drawing.kind, drawing.pane_index, drawing.price_scale, point)
+    }
+
+    /// [`ChartEngine::drawing_point_px`] for a drawing of `kind` on `pane_index` and `target`.
+    pub(crate) fn drawing_anchor_px(
+        &self,
+        kind: DrawingKind,
+        pane_index: usize,
+        target: DrawingPriceScale,
+        point: DrawingPoint,
+    ) -> Option<(f64, f64)> {
+        if !kind.pane_anchored() {
+            return self.drawing_to_px_for(pane_index, target, point);
+        }
+        self.drawing_scale_for(pane_index, target)?;
+        if self.data.merged_times().is_empty() {
+            return None;
+        }
+        let pane = self.panes.get(pane_index)?;
+        Some((
+            point.logical * self.pane_w,
+            pane.top + point.price * pane.height,
+        ))
+    }
+
+    /// The anchor of a `kind` drawing under media px `(x, y)`: the inverse of
+    /// [`ChartEngine::drawing_anchor_px`]. Pane fractions clamp to the pane, so a dragged or
+    /// placed pane-anchored drawing always stays reachable.
+    pub(crate) fn drawing_anchor_from_px(
+        &self,
+        kind: DrawingKind,
+        pane_index: usize,
+        target: DrawingPriceScale,
+        x: f64,
+        y: f64,
+    ) -> Option<DrawingPoint> {
+        if !kind.pane_anchored() {
+            return self.drawing_from_px_for(pane_index, target, x, y);
+        }
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        self.drawing_scale_for(pane_index, target)?;
+        if self.data.merged_times().is_empty() {
+            return None;
+        }
+        let pane = self.panes.get(pane_index)?;
+        if self.pane_w <= 0.0 || pane.height <= 0.0 {
+            return None;
+        }
+        Some(DrawingPoint {
+            logical: (x / self.pane_w).clamp(0.0, 1.0),
+            price: ((y - pane.top) / pane.height).clamp(0.0, 1.0),
+        })
+    }
+}
+
+// --- data-reading family drawings (B8 hook `DrawingFamily::reads_series_data`) ----------------
+
+impl ChartEngine {
+    /// The series a data-reading family drawing measures (a regression's fit, a forecast's
+    /// outcome, a bars pattern's copy): the first live ordinary series in creation order on the
+    /// drawing's pane and price scale, the series whose prices that scale shows. Creation order
+    /// is the smallest live [`SeriesId`] (identities are monotonic and never reused), not the
+    /// storage slot order, which reuses freed slots. Indicator outputs and custom series never
+    /// qualify; footprint and feature series do, through their OHLC projection. Hiding a series
+    /// does not move its drawings' source.
+    pub(crate) fn drawing_source_series(&self, drawing: &Drawing) -> Option<SeriesId> {
+        let target = drawing.price_scale.target();
+        self.series
+            .iter()
+            .filter(|series| {
+                !series.removed
+                    && series.pane_index == drawing.pane_index
+                    && series.price_scale_target == target
+                    && series.kind != SeriesKind::Custom
+                    && self.indicator_binding_id(series.id).is_none()
+            })
+            .map(|series| series.id)
+            .min()
+    }
+
+    /// A data-reading drawing's source series read in its own canonical rows. `None` without a
+    /// source series.
+    pub(crate) fn drawing_source_window(&self, drawing: &Drawing) -> Option<DrawingSourceRows<'_>> {
+        let series = self.drawing_source_series(drawing)?;
+        let plot = self.data.plot(series);
+        let as_of = plot.is_as_of().then(|| {
+            let times = self
+                .data
+                .series_data(series)
+                .map_or(&[][..], |(times, _)| times);
+            // Rows after the last shown one wait for the axis to reach them.
+            let shown = plot
+                .size()
+                .checked_sub(1)
+                .map_or(0, |last| plot.source_row(last) + 1);
+            (&times[..shown.min(times.len())], self.data.merged_times())
+        });
+        Some(DrawingSourceRows {
+            series,
+            plot,
+            as_of,
+        })
+    }
+}
+
+/// A data-reading drawing's source series in its canonical rows
+/// ([`ChartEngine::drawing_source_window`]). A union source's canonical rows are its plot rows. An
+/// as-of source's plot points repeat a row until the next one and skip rows collapsed between two
+/// points, so a reader that must see each of the source's own bars once (a regression fit, a
+/// forecast's outcome, a bars pattern's copy) reads canonical rows instead: each sits at the first
+/// axis point at or after its time (the point showing it, or for a collapsed row the later point),
+/// and rows after the last shown one wait.
+#[derive(Clone, Copy)]
+pub(crate) struct DrawingSourceRows<'a> {
+    pub(crate) series: SeriesId,
+    pub(crate) plot: aeris_charts_core::model::plot_list::PlotListView<'a>,
+    /// An as-of source's placed canonical row times and the merged axis times; `None` for a union
+    /// source.
+    as_of: Option<(&'a [i64], &'a [i64])>,
+}
+
+impl DrawingSourceRows<'_> {
+    pub(crate) fn is_as_of(self) -> bool {
+        self.as_of.is_some()
+    }
+
+    /// Canonical rows whose bar index lies in `[from, to]`, in order (empty when none).
+    pub(crate) fn rows_between(self, from: i64, to: i64) -> std::ops::Range<usize> {
+        use aeris_charts_core::model::plot_list::MismatchDirection;
+        if from > to {
+            return 0..0;
+        }
+        let Some((times, merged)) = self.as_of else {
+            return match (
+                self.plot.search(from, MismatchDirection::NearestRight),
+                self.plot.search(to, MismatchDirection::NearestLeft),
+            ) {
+                (Some(start), Some(end)) if start <= end => start..end + 1,
+                _ => 0..0,
+            };
+        };
+        let Some(last_point) = merged.len().checked_sub(1) else {
+            return 0..0;
+        };
+        if to < 0 || from > last_point as i64 {
+            return 0..0;
+        }
+        // A row sits at index `i` when its time is after point `i - 1` and at or before point `i`.
+        let start = match usize::try_from(from) {
+            Ok(from) if from > 0 => times.partition_point(|&time| time <= merged[from - 1]),
+            _ => 0,
+        };
+        let through = merged[usize::try_from(to).map_or(last_point, |to| to.min(last_point))];
+        let end = times.partition_point(|&time| time <= through);
+        start..end.max(start)
+    }
+
+    /// The bar index canonical `row` sits at.
+    pub(crate) fn index_of(self, row: usize) -> Option<i64> {
+        match self.as_of {
+            None => self.plot.index_at(row),
+            Some((times, merged)) => {
+                let time = *times.get(row)?;
+                Some(merged.partition_point(|&point| point < time) as i64)
+            }
+        }
+    }
+
+    pub(crate) fn value(
+        self,
+        row: usize,
+        field: aeris_charts_core::model::plot_list::PlotValueIndex,
+    ) -> f64 {
+        self.plot
+            .column(field)
+            .get(row)
+            .copied()
+            .unwrap_or(f64::NAN)
+    }
+
+    /// A row without any value (host whitespace, such as a future session slot).
+    pub(crate) fn is_whitespace(self, row: usize) -> bool {
+        use aeris_charts_core::model::plot_list::PlotValueIndex as Field;
+        [Field::Open, Field::High, Field::Low, Field::Close]
+            .into_iter()
+            .all(|field| self.value(row, field).is_nan())
+    }
+
+    /// End (exclusive) of the canonical rows placed on the axis.
+    pub(crate) fn placed_rows(self) -> usize {
+        match self.as_of {
+            None => self.plot.size(),
+            Some((times, _)) => times.len(),
+        }
+    }
+}
+
+/// Entries a per-drawing derived memo (regression fits, forecast outcomes) may hold beyond the
+/// chart's drawing count before it drops the entries of drawings that no longer exist.
+pub(crate) const DRAWING_MEMO_SLACK: usize = 16;
+
+/// Insert `value` for drawing `id` into a per-drawing derived memo, first dropping the entries of
+/// drawings the chart no longer holds once the memo exceeds the live drawings by
+/// [`DRAWING_MEMO_SLACK`], so such memos stay bounded by the live drawings.
+pub(crate) fn insert_drawing_memo<V>(
+    memo: &mut HashMap<DrawingId, V>,
+    drawings: &[Drawing],
+    id: DrawingId,
+    value: V,
+) {
+    if !memo.contains_key(&id) && memo.len() >= drawings.len() + DRAWING_MEMO_SLACK {
+        let live = drawings
+            .iter()
+            .map(|drawing| drawing.id)
+            .collect::<std::collections::HashSet<_>>();
+        memo.retain(|id, _| live.contains(id));
+    }
+    memo.insert(id, value);
 }
 
 #[cfg(test)]

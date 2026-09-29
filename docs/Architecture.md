@@ -23,7 +23,9 @@ Browser hosts enter through `packages/charts`, which translates the supported pu
 
 The web demo exposes all built-in calculation APIs in a searchable Indicators catalog. Entries create their engine bindings on demand and remove all owned outputs and synthetic volume dependencies when cleared. RSI uses the same engine calculation and oscillator pane as package consumers; no separate demo formula is maintained.
 
-Canonical series data uses opaque chart-local `u32` identities mapped to reusable storage slots. Identities are never reused, removed identities are classified as stale, and slot-backed vectors remain bounded by peak concurrent series rather than lifetime add/remove count. Each ordinary series owns one timestamp column and either one scalar value column or four OHLC columns. `PlotList` owns only a dense range or sparse logical-index mapping plus its chunked autoscale cache; allocation-free views join that mapping to the canonical values for queries and frame construction. Dense aligned mappings carry no per-row index allocation. Indicator outputs own one scalar value column and alias a contiguous source-time range by identity, so they duplicate neither source timestamps nor plot values. The merged timestamp union remains independently owned because ordinary source series are independently mutable and may diverge or carry whitespace. It carries a generation that changes only when its contents change; time weights use that generation, while value-only current-bar updates retain the O(1) fast path.
+Canonical series data uses opaque chart-local `u32` identities mapped to reusable storage slots. Identities are never reused, removed identities are classified as stale, and slot-backed vectors remain bounded by peak concurrent series rather than lifetime add/remove count. Each ordinary series owns one timestamp column and either one scalar value column or four OHLC columns. `PlotList` owns only a dense range or sparse logical-index mapping plus its chunked autoscale cache; allocation-free views join that mapping to the canonical values for queries and frame construction. Dense aligned mappings carry no per-row index allocation. Indicator outputs own one scalar value column and alias a contiguous source-time range by identity, so they duplicate neither source timestamps nor plot values. An output still before its warm-up holds no rows, so its range starts at the first value an update computes, also when that update rewrites earlier source rows. The merged timestamp union remains independently owned because ordinary source series are independently mutable and may diverge or carry whitespace. It carries a generation that changes only when its contents change; time weights use that generation, while value-only current-bar updates retain the O(1) fast path.
+
+A multi-calendar overlay opts out of that union per owned series (`TimeAlignment::AsOf`, the browser's `series_options.time_alignment: "as_of"`): it adds no merged time point, so the union-timed series keep a gapless axis. Its `PlotList` holds a dense or sparse logical-index mapping onto the merged points up to the union's data extent (the last point where a host-owned union series holds a real row, so an overlay never runs into host-installed future session slots) plus a non-decreasing plot-row to canonical-row map. Each point shows the last canonical row at or before its time; rows between two points collapse into the later one, a point with no newer row repeats the previous one unless that row is older than the optional `max_staleness`, and rows after the last point wait for it. Values are never copied: `PlotValues::AsOf` resolves every value, whitespace test, autoscale chunk, and per-point color through the map, and the pyramid of a mapped plot summarizes plot rows. Readers that need canonical rows (studies, `data()`, merges, bar times, selection anchors, visible-range volume profiles, Heikin Ashi, session highlighting, the accessibility focus ring, and the data-reading drawings: regression trend, forecast, and bars pattern) translate through `source_row`, `row_for_source`, or `source_range` (the drawings through `ChartEngine::drawing_source_window`, which places each canonical row at the first point at or after its time); markers resolve to the first point at or after their time and wait, like their rows, past the last point. A value tick of an as-of row repairs only the points showing it; a new as-of row rewrites only the points at or after its time; a new union point or a moved data extent appends or truncates only the tail; a historical as-of insert re-derives that series' map; any union rebuild re-derives every map in `O(points + rows)`. Indicator outputs of an as-of source compute on its own rows and alias its map with their row offset, rewriting only the changed tail. A series whose points move because of another series' data (a tail resync or any union reindex, including a reinstall or pop inside pre-installed session slots that leaves the time points unchanged) is reported once through the data layer's realigned list, which time synchronization drains into series-frame invalidation. Only engine-valued time series (line, area, baseline, histogram, bar, candlestick) that own their rows may be as-of; custom, advanced, footprint, trade-bound, trade-study, and synthetic series, indicator outputs, and any series while a non-time sequence axis is installed are refused, and a conversion to a host-valued kind or a footprint, a trade-bound binding, or a synthetic configuration rejoins the union first. An output that is re-aliased after owning its rows gives up its own alignment and follows its source again. The policy is host-owned series configuration and, like every financial series definition, is not persisted.
 
 Each canonical built-in series also owns an eager fanout-16 row-summary pyramid. A summary stores only six `u32` source-row identities: chronological endpoints, OHLC low/high, and close minimum/maximum. Values are always dereferenced from the canonical columns, so the hierarchy adds no second value owner and preserves whitespace. Point and tail mutations repair one node per affected level; typed batches repair the affected range once; historical insertion, replacement, and retention rebuild or repair the exact affected hierarchy before the mutation is visible. The same endpoint summaries bound latest and predecessor lookup to at most fanout work per hierarchy level even across pathological whitespace; no parallel predecessor index or value history is retained. Series removal releases the hierarchy with the canonical storage slot. Custom-series host geometry is not summarized because its semantics are not engine-owned.
 
@@ -61,6 +63,16 @@ date and placed inside the trading day the chart's session start defines (weeken
 Input is validated and the slot count is checked against a 100 000 bound before allocation. The
 browser package resolves the IANA zone and calls it through a free WASM function; which dates trade
 remains host-owned calendar data. Hosts install the slots as whitespace rows.
+
+The same placement (`session_window_bounds`, the UTC `(open, close)` of each window of one trading
+date) drives session-anchored bars. Core `SessionBarGrid` maps an instant to the open of its bar:
+the windows of the instant's trading day (or a previous-day window that reaches past the session
+start) each restart the bar grid at their open, the last bar of a window ends at its close, and a
+one-day interval spans the whole trading day. Prints outside every window either fold (before the
+day's first window into its first bar, later into the preceding window's last bar) or are excluded
+except in a window's closing second. A lookup places at most two trading days on stack buffers and
+allocates nothing. Trade streams opt into it per stream (below) in the chart's exchange time, and
+`resample_boundaries` turns host trading dates plus the same windows into resampling boundaries.
 
 Explicit time-axis marks (`timeScale.tickMarks`) are engine state beside the automatic tick
 weights: at most 512 strictly ascending UTC times with optional labels of at most 64 bytes. While
@@ -340,11 +352,13 @@ its selected light/dark theme through the WASM boundary because theme selection 
 
 ### `aeris_charts_indicators`
 
-Pure technical-indicator calculations over numeric slices. Warm-up gaps are explicit. Convention-dependent formulas take typed parameters owned here: an EMA-family/RSI seed (`Sma`, the TradingView/TA-Lib default, or `FirstValue`, the 通达信/同花顺 `EMA(X,N)`/`SMA(X,N,M)` convention), the MACD histogram multiplier (1, or 2 for `(DIF-DEA)*2`), and the Bollinger deviation estimator (population or sample); `IndicatorConvention` only maps a preset to those values. KDJ uses windowed RSV with `SMA(X,N,1)` K/D smoothing started from a typed `KdjSeed`: the textbook 50 (default) or the formula-language first value (`Y0 = X0`), which the China preset selects. Each runtime also reports, per output, its warm-up rows and a convergence horizon (rows until every recursive seed's weight is below 0.1%, or none for time-anchored and path-dependent formulas); the engine sums them along indicator chains. Whitespace source rows (NaN close/high/low) never enter formula state: recursive runtimes skip them in place and emit NaN, while stateless window formulas that meet whitespace in the rows they read evaluate over a bounded compacted window (their lookback plus the changed suffix) and scatter NaN back to the whitespace rows, so every value equals the value computed without those rows. Alongside clean full-recomputation functions, it owns the explicit per-formula rolling state used for append, current-bar replacement, and rebuild-from-index. Bounded-window formulas retain no source-length state; recursive formulas retain tail state and one checkpoint per 1,024 source rows, then recompute from the nearest prior checkpoint after a historical correction. Sparse checkpoint vectors are copy-on-write so hosts can transactionally clone recursive state without deep-copying retained history during ordinary tail work. Host-neutral indexed EMA, ATR, session-VWAP, RSI, MACD, and Stochastic states accept callback-provided optional samples so non-chart Rust hosts can lazily convert only the canonical rows replayed for a dirty suffix. `None` is a hard reset; recursive replay may begin at an earlier sparse checkpoint while writers receive only the requested suffix. Stochastic additionally retains only bounded tail `%K` windows needed for `%D` tail replacement; its windowed high/low scan remains bounded by the configured `%K` period rather than source-history length. Derived values use short-lived transfer buffers that move into or update the engine's canonical output series and are capped after partial repairs. This crate does not know about charts, panes, rendering, WebAssembly, or GPUI.
+Pure technical-indicator calculations over numeric slices. Warm-up gaps are explicit. Convention-dependent formulas take typed parameters owned here: an EMA-family/RSI seed (`Sma`, the TradingView/TA-Lib default, or `FirstValue`, the 通达信/同花顺 `EMA(X,N)`/`SMA(X,N,M)` convention), the MACD histogram multiplier (1, or 2 for `(DIF-DEA)*2`), and the Bollinger deviation estimator (population or sample); `IndicatorConvention` only maps a preset to those values. KDJ uses windowed RSV with `SMA(X,N,1)` K/D smoothing started from a typed `KdjSeed`: the textbook 50 after a full N-row window (default), or the formula-language start, which the China preset selects: RSV over the rows available while fewer than N exist and `Y0 = X0`, so values start at row 0. `tests/platform_values.rs` pins the verified platform rules (China MACD, population-σ Bollinger, the formula-language KDJ start, and the textbook start's convergence after `convergence_rows`) on a deterministic synthetic series with independently computed expected values; the comparison with a platform's published values for real bars was done out of tree, and that data is not committed. Each runtime also reports, per output, its warm-up rows and a convergence horizon (rows until every recursive seed's weight is below 0.1%, or none for time-anchored and path-dependent formulas); the engine sums them along indicator chains. Whitespace source rows (NaN close/high/low) never enter formula state: recursive runtimes skip them in place and emit NaN, while stateless window formulas that meet whitespace in the rows they read evaluate over a bounded compacted window (their lookback plus the changed suffix) and scatter NaN back to the whitespace rows, so every value equals the value computed without those rows. Alongside clean full-recomputation functions, it owns the explicit per-formula rolling state used for append, current-bar replacement, and rebuild-from-index. Bounded-window formulas retain no source-length state; recursive formulas retain tail state and one checkpoint per 1,024 source rows, then recompute from the nearest prior checkpoint after a historical correction. The retained state before the last row resumes a replacement of that row whether or not the same rebuild also appends rows, so closing the current bar and opening the next in one batch never falls back to a checkpoint. Every built-in kind therefore bounds a current-bar replacement, an append, or both in one rebuild by its window rather than the history: window formulas (moving averages, standard deviation, CCI, Williams %R, momentum, rate of change, Donchian, Ichimoku, CMF, MFI, volume) evaluate only the changed output rows, each over its own period, while Stochastic RSI (Wilder RSI state plus a retained tail window of its last RSI values, like Stochastic `%D`), pivots (the running and previous trading-day sessions), and ZigZag (its anchor, direction, and provisional extreme) are recursive states that skip whitespace in place. ZigZag writes turning points back to earlier rows, so a tail rebuild re-emits rows back to its one open turning point (the provisional endpoint it moves or restores, or the first-direction anchor it writes or clears) only when it changes that point's value, which bounds it by the rows since the last confirmed turning point; a tail revision that leaves that point alone touches only the forming bar, and a historical repair re-emits from the open turning point of the state it resumes. `last_work_rows` reports the rows each rebuild actually evaluated. Volume and turnover columns may be shorter than the source rows; rows past their end take each formula's missing-weight fallback (unit weight for VWAP, VWAP bands and VWMA, zero for OBV, CMF, MFI and volume, no trade for amount-weighted VWAP), which equals the engine's timestamp-alignment fallback. Sparse checkpoint vectors are copy-on-write so hosts can transactionally clone recursive state without deep-copying retained history during ordinary tail work. Host-neutral indexed EMA, ATR, session-VWAP, RSI, MACD, and Stochastic states accept callback-provided optional samples so non-chart Rust hosts can lazily convert only the canonical rows replayed for a dirty suffix. `None` is a hard reset; recursive replay may begin at an earlier sparse checkpoint while writers receive only the requested suffix. Stochastic additionally retains only bounded tail `%K` windows needed for `%D` tail replacement (Stochastic RSI likewise retains its last RSI values), and a rebuild that cannot resume from them, a truncation included, replays enough earlier rows to refill the window a later replacement of the new last row reads; its windowed high/low scan remains bounded by the configured `%K` period rather than source-history length. Derived values use short-lived transfer buffers that move into or update the engine's canonical output series and are capped after partial repairs. This crate does not know about charts, panes, rendering, WebAssembly, or GPUI.
 
 Calendar periods (VWAP session/weekly/monthly resets and pivot sessions) key on a caller-supplied
 trading-day mapping; the crate knows no time zones, and weekly periods start on Monday. The chart
 runtime passes the engine's exchange trading day, while the full-recomputation functions keep UTC days.
+`VwapReset::period_key` exposes the reset key itself, so chart geometry breaks lines exactly where
+the values reset.
 
 Visible-range volume profiles use a pure two-pass OHLCV bin calculation in this crate: uniform high/low overlap, bullish/bearish volume split by candle direction, deterministic point of control and contiguous value area, `O(visible bars + rows)` work and at most 512 rows. It does not claim tick-at-price accuracy.
 
@@ -370,8 +384,8 @@ Axis chrome is engine-owned and compact: axis-attached text resolves to 11/12 of
 (11 CSS px at the 12 px default) with the configured family, countdown text to 10/12 of layout
 (10 px), scaling proportionally with larger fonts. The price strip keeps a stable 1 px border slot,
 3 px tick, and 4 px padding on each side while the visible border inside that slot uses the canonical
-design-system width; the time strip likewise keeps its existing border slot, text, tick, and vertical padding,
-tick, and vertical padding, snapped to an even CSS-pixel height (22 px by default). Price tags are
+design-system width; the time strip likewise keeps its existing border slot, text, tick, and vertical
+padding, snapped to an even CSS-pixel height (22 px by default). Price tags are
 axis text plus 2 px padding above and below (15 px), while the crosshair Y-axis tag alone adds 2 px
 per side (19 px); countdown rows are countdown text plus 2 px padding per side (14 px), and time tags
 fit the strip height with 6 px horizontal padding per side. Axis-attached price, time, drawing,
@@ -434,24 +448,73 @@ All interaction hit tests use an engine `HitProfile`. Mouse and pen retain preci
 
 Built-in frame geometry and series hit testing share one viewport-density query. Resolvable spacing uses the raw rows unchanged. Below one physical pixel per row, the query chooses the deepest summary level whose group fits the average pixel density, uses aligned summary nodes for pixel-bucket interiors, and refines partial boundaries through lower levels or raw rows. The existing per-kind conflation then preserves chronological line endpoints and close extrema, candle first-open/high/low/last-close semantics, and histogram greatest absolute value. The resulting ordered `ChartFrame` remains the only backend contract. Crosshair and trading data lookup remain exact raw/cached canonical queries rather than LOD approximations. Heikin Ashi candlesticks use a generation-keyed engine presentation cache over canonical OHLC: frame geometry, autoscale, and candle chrome may consume the derived values, while `series_data`, crosshair, and trading paths continue to expose raw OHLC.
 
+Line runs break at period boundaries, not at whitespace (whitespace rows connect, as in the reference). Line, area, and baseline geometry, built-in series and indicator line outputs alike, starts a new run wherever two consecutive drawn rows have different period keys: a series with the host `break_on_trading_day` option keys the exchange trading day; VWAP (typical-price and amount-weighted) and pivot outputs key their trading-day session, and VWAP bands their session/weekly/monthly reset, through `VwapReset::period_key`, the same function over the same `ExchangeTime` trading day the runtime resets on. Keys are derived during frame construction and hit testing, so no break state is stored. An indicator output keys each drawn row's canonical timestamp, the time its runtime resets on; the host option keys the time axis's own bar time, which on a non-time sequence axis is the bar's open time rather than the data layer's row key. Full rebuilds, incremental tail updates, historical corrections, retention trims, and conflated row selections (keys are monotonic in time) break identically, and an exchange-time change, which invalidates every layer, moves them. Each run emits its own stroke, color runs, area fill (keeping its slice of the unbroken gradient), baseline quadrant runs, and Bollinger band fill; a run of one visible row draws the reference's one-bar horizontal segment, while a lone edge neighbour beyond the pane draws nothing (its real segments are off-screen). Hit testing evaluates each run alone, so the omitted connector is not hittable. The breaks are ordinary ordered primitives, identical on every executor, and a series without a period keeps its single-run geometry primitive for primitive.
+
 The official advanced-series examples are engine-owned feature series, not browser drawing callbacks. Each retains its complete validated payload beside an OHLC-shaped canonical projection used by the shared time/price-scale and query machinery. Grouped bars, heatmap, HLC area, pretty histogram, background shade, stacked area/bars, and whisker boxes construct backend-neutral primitives in the same ordered series layer as built-in geometry. Their official defaults, visible-range rules, pixel snapping, autoscale semantics, and source-data lifecycle are therefore identical in browser and native hosts. Brushable Area is deliberately not an advanced-series data type: it is an ordinary built-in Area series plus transient engine-owned range styling, so data ingestion, retention, LOD, hit testing, price-scale ownership, and all ordinary Area APIs remain on the canonical Area path. The legacy browser input name `brushable_area` is only a compatibility alias and normalizes to `area` immediately. Area-like fills share one design token (`market.area_fill_strong_alpha` → `area_fill_faint_alpha`): an unset Area fill, both unset baseline halves, and the brushable range defaults all derive their gradient from their own stroke color at that strength, strong at the series extreme and faint at its base. Brush default styles are engine-owned (`area_brush_defaults`); hosts send only the fields they override plus each range's positive/negative tone.
 
 Professional footprint / numbers-bar data has a chart-level tick-truth owner described in
 `Footprint.md`. `ChartEngine::add_trade_stream` retains one bounded keyed canonical microsecond tape;
-footprints, CVD, delta histograms, and bounded large-trade bubble markers hold dependent handles, not
-provider-event copies. The stream derives integer tick-grid levels, bid/ask/unknown/total volume, POC,
+footprints, CVD, delta and volume histograms, and bounded large-trade bubble markers hold dependent
+handles, not provider-event copies. The stream derives integer tick-grid levels, bid/ask/unknown/total volume, POC,
 final/session delta, delta percentage, running Max/Min Delta, and diagonal stacked imbalances. CVD
 supports session, continuous, and anchored resets, and every dependent carries the stream revision
 through tip, correction, and retention updates. Stream telemetry attributes retained tape capacity
 and dependent rebuild work.
-Live tip events update only the active derived bar: the projection writes the changed suffix straight
-from the stream, CVD/delta studies recompute only that suffix (CVD resumes a cached running fold that
-steps exactly like a clean rebuild), and bubble markers advance a resumable fold over the newly
-appended trades only, doing no work at all when the stream has no bubble dependents. Nothing on the tip
-path clones the retained bars or tape; stream stats expose `dependent_rows_computed` and
-`bubble_trades_scanned` as work counters. A late-event or provider-correction batch merges
+Time bars align to the stream's `anchor_micros` grid unless the host anchors the stream to
+exchange sessions (`set_trade_stream_sessions`): the stream then owns a `SessionBarGrid` in the
+chart's exchange time (calendar-date flag cleared), so ordinary trade-bound candles open at every
+window open (A-share 60-minute bars at 09:30, 10:30, 13:00, 14:00) and on exchange hours across
+DST. Configuring sessions validates and rebuilds a candidate stream once; a chart exchange-time
+change re-places every session-anchored stream once. Changing a footprint's aggregation
+(`apply_footprint_series_options`) re-aggregates its stream in place, keeping the retained tape
+(hidden prints included), replay clock, retention seed, and session anchoring, re-placed on the new
+interval; bound candles/bars follow it, and a switch onto the sequence axis is refused while
+resampling or synthetic bars share the chart. Excluded prints still feed aggressor
+classification but no bar or session delta. The chart clock also masks time-domain rows after it,
+so a bar opened ahead of the clock by a folded pre-open print appears when the clock reaches its
+open. A volume trade study (`add_trade_volume_series`) projects each derived bar's total volume
+into a `histogram_updown` histogram with the same tip, correction, replay, and retention lifecycle
+as the delta histogram, so hosts need no second volume source for tick-built candles. On time bars
+a large-trade bubble carries the open of the bar holding its print
+(`FootprintAggregator::print_bar_time`: markers snap an off-grid time to the next bar, and folded
+auction or lunch prints are stamped outside their bar) while an id-less marker keeps its print's
+own second as its name; a print the session policy excludes has no bubble. Non-time bubbles sit on
+their bar's row key. Rebuilds and live tips run the same fold, so both place bubbles identically.
+Live tip events update only the active derived bar. The footprint projection advances first and
+writes only the changed bar suffix straight from the stream, also under a `max_points` ceiling;
+trade-bound candles/bars project the same suffix, CVD/delta/volume studies recompute only that
+suffix (CVD resumes a cached running fold that steps exactly like a clean rebuild), and bubble
+markers advance a resumable fold over the newly appended trades only. The fold sizes only new or
+merged bubbles, rescales every retained marker only when the peak bubble volume changes (a
+sliding-window maximum tracks it), and does no work at all when the stream has no bubble
+dependents. Nothing on the tip path clones the retained bars or tape, and a tip's result equals a
+clean rebuild of every dependent, on session-anchored bars too. The tip that crosses a retention
+ceiling (once per hysteresis margin) evicts complete bars from the stream front together with
+exactly the trades they aggregated, counted per bar, and reconstructs nothing. Counting subsumes a
+bar-key cutoff on session-anchored bars: a bar counts the prints it folds, so a folded
+opening-auction print stamped before the bar's open leaves with its bar, and the walk steps over
+excluded prints (which join no bar), evicting those stamped before the first retained bar's first
+print with the evicted history. The tape is a deque, the trade-ID index keeps absolute positions so
+only evicted IDs leave it, replay checkpoints inside the retained suffix are re-addressed, and each
+bubble fold drops only the bubbles made of evicted trades (refolding once only if a merged bubble
+straddled the boundary). Every presentation, including every other footprint bound to the stream,
+then drops exactly the rows keyed before the footprint's first retained row, and the indicators and
+resampled series reading a trimmed presentation recompute from its retained rows, as after a
+retention trim of that series itself. Beyond work
+proportional to the evicted trades, only that data-layer trim and renumbering the retained bars
+scale with the retained rows; nothing scans the retained tape. The stream carries the evicted bars'
+cumulative delta, and an anchored CVD the base its evicted bars established, so evicting history
+never rewrites retained CVD values. Stream stats expose `dependent_rows_computed`,
+`bar_rows_projected`, `bubble_trades_scanned`, and `bubble_markers_sized` as lifetime work
+counters. Tape replacement, session changes, late-event, correction, and replay-seek paths rebuild
+each dependent once; a bubble refold materializes markers only for the retained bubbles, so it
+never holds more than `max_markers` markers. A late-event or provider-correction batch merges
 atomically into the final canonical tape, validates its final session/bar projection, and reconstructs
-exactly once.
+exactly once. Time-bar rows are keyed by bar open, so every tape path (replacement, tip, correction,
+session or aggregation change) rejects a tape on which a session change falls inside one bar
+interval (`ProjectionTimeCollision`) before anything changes. The check covers prints the replay
+clock still hides, so no clock move has to refuse a reveal; a tip checks only its batch against the
+tape's last bar key.
 Each derived bar also carries an engine-owned logical index plus its full-resolution open and close
 microsecond times. `FootprintAggregator::bar_sequence` exposes those bounds without collapsing them
 to whole-second labels, so several non-time bars in one second and long gaps remain distinct.
@@ -463,10 +526,10 @@ without collapsing duplicate second labels. Ordinary candlestick and OHLC-bar pr
 to that same chart-level stream and consume the aggregator's canonical OHLC bars; stream-identity
 replacement and live batches update footprint, ordinary bars, studies, and bubbles together without
 copying or reclassifying the tape. Bound ordinary bars reject independent retention caps because all
-presentations in a non-time domain must retain the same logical rows. Non-time tip updates now
-replace only the affected suffix (falling back to a full projection when retention can shift the
-prefix). The shared time sync reads the sidecar's open times in place instead of materializing a
-tick-time column, and extends tick weights incrementally only for a pure tail append. Derived delta studies and trade-bubble markers use the same logical row keys. Bubble aggregation windows compare
+presentations in a non-time domain must retain the same logical rows. Non-time tip updates
+replace only the affected suffix, also under retention: the sidecar changes in place before the rows,
+so a trim inside the update drains the matching prefix. The shared time sync reads the sidecar's open times in place instead of materializing a
+tick-time column, and extends tick weights incrementally only for a pure tail append. Derived delta studies and trade-bubble markers use the same logical row keys, continuing from the projection's first retained key after a trim, and a footprint, candle/bar, or study bound after a trim installs from that key too. Bubble aggregation windows compare
 the original microsecond trade times; value snapshots and series queries resolve their time labels
 through the same sidecar. Trading executions, host events, and round-trip geometry resolve their
 timestamp anchors through the same index helper. The sidecar is retired when the last live
@@ -503,18 +566,23 @@ not reconstruct replay state. Non-time dependents use their shared sequence proj
 interpreting logical row keys as UTC seconds; arbitrary independently timed series are not valid on
 that domain.
 
-Moving the clock forward applies newly revealed canonical events through the ordinary live path.
-Backward trade seeks restore the nearest retained aggregation checkpoint, replay only the reported
+Moving the clock forward applies newly revealed canonical events through the ordinary live path,
+classifying each at reveal time against its canonical predecessor, so an unknown-side trade ingested
+or reconstructed behind the clock uses the same tick rule as a fresh load. Backward trade seeks restore the nearest retained aggregation checkpoint, replay only the reported
 suffix, and produce the same bars as a fresh load to that clock. Checkpoints are recorded every
 1,024 eligible trades and capped at 64 per stream; an older seek starts from the retained tape's
 rebuild seed. Depth uses the same 1,024-event interval and 64-checkpoint cap, restores the nearest
 book snapshot, and replays only the reported suffix; its ladder, studies, heatmap, and marker
-queries all read the replay projection. Retention reconstructs checkpoints for the surviving suffix. Ingest wholly beyond
-the clock changes only source truth and performs no dependent work. The existing columnar
+queries all read the replay projection. Retention keeps the checkpoints inside the surviving suffix, re-addressed to it. A seek exposes the new clock's ordinary rows before trade-stream projections reinstall, so their retention ceilings count the rows a clean rebuild counts. An ordinary series' `max_points` likewise counts and evicts only the rows up to the clock, so it holds what a clean load to that clock holds, and a seek trims revealed rows the same way; rows ingested past the clock are pending source truth, retained uncounted until the clock reveals them, so hidden rows never push revealed ones out. A clock move refreshes each indicator from its dependencies' previous visible length (a forward move costs the revealed rows, like a tail append) and rebuilds it after a backward move; a dependency its owner rewrote during the move (a trade-derived or resampled series) already refreshed its bindings. Ingest wholly beyond
+the clock changes only source truth and performs no dependent work; a correction that moves a
+revealed print past the clock hides it and refreshes every dependent. The existing columnar
 `update_typed` path is the bulk ordered bar boundary, while trade batches cross as parallel typed
 arrays and update all stream dependents once. The release `perf_gate` advances a shared
 footprint/candle chart through 6,000 recorded seconds at 100×, builds every frame, and requires
-steady-state retained memory not to grow across complete passes.
+steady-state retained memory not to grow across complete passes. Its Target D also streams 9,000
+single-trade tips into a retained 250,000-trade footprint with bound candles, CVD, delta, and
+bubbles, requires the work counters to stay within the changed suffix and the new trade with no
+tape reconstruction, and budgets the tip p99 and the slowest (retention-crossing) tip.
 
 Renko, Line Break, Kagi, and Point & Figure are engine-owned price-action transforms over one
 canonical host OHLC source. Fixed-box Renko requires a two-box reversal; ATR Renko uses Wilder true
@@ -540,6 +608,30 @@ price series' tail to a live footprint without a second price model.
 Footprint bars ultimately emit the same ordered `ChartFrame` as every other series, and no backend
 may infer order flow from OHLC or recalculate footprint math.
 
+OHLCV resampling (`configure_resampled_series`) derives one candlestick/bar target and an optional
+volume histogram from a candlestick/bar source and its volume histogram over ordered, disjoint UTC
+boundaries (at most 32 bindings and 20 000 boundaries; hosts pass their own or derive them with
+`resample_boundaries`). Buckets restart at each boundary, rows outside every boundary are omitted,
+and whitespace rows reserve their bucket without prices (an all-whitespace bucket is a whitespace
+bar). Targets are source-owned: every host write path (install, update, typed batches, and merges)
+is rejected. Resampling buckets UTC seconds, so it and a non-time bar sequence (trade-count, volume,
+or range streams, synthetic bars) never share a chart axis; whichever arrives second is rejected. A
+source or volume mutation reports its first changed row like an indicator change; bars whose bucket
+closes by the last unchanged row's time plus one second are kept, the rest is rebuilt from the first
+affected bucket and reaches the target through the ordinary tail-update path, so a live minute costs
+one bucket of rows, and the scan stops at the last source row rather than visiting boundaries
+configured ahead. With the source's row count unchanged (a tick filling a pre-installed session
+slot), rows after the last priced row before and after the change are whitespace both times, so
+the scan also stops at the bucket holding that row and the reserved whitespace buckets after it
+are kept rather than rebuilt and rewritten. Resampling configuration refuses chained bindings in
+either configuration order (a target may not be another binding's source or output) and a binding
+whose volume source is its own volume target; a reconfigure keeps its source and may name its own
+targets again. A pop, a retention trim of the source head, a tail that loses a bar (backward
+replay), and a complete source replacement rebuild once. Replay-clock moves refresh from the earlier
+cutoff, so a forming bar never aggregates rows after the clock.
+`resample_stats` reports rebuilds, tail refreshes, and rows scanned. Resampling configuration, like
+every series definition, is runtime-only and outside chart-state persistence.
+
 The upstream heatmap-around-line and background-shade examples are compositions: the specialized engine series is ordered beneath an ordinary line series rather than duplicating that base-series geometry. Heatmap `cell_shader` callbacks are the one styling boundary in this group; the browser evaluates the callback while normalizing input, and Rust retains the resolved color with each bounded cell so every renderer executes the same prepared frame.
 
 Trading is a first-party engine domain, not a drawing, series, primitive, or plugin. Each chart owns host-supplied typed position, order, group, and execution identities; broker relationships and instrument metadata; semantic trading style; dedicated hit state; and a bounded intent queue. The host remains authoritative for broker state. Pointer movement changes only a chart-local snapped preview. Release emits one broker-neutral typed intent directly, and the chart offers no inline confirmation step of its own: a host that gates modifications runs its own confirmation around the intent before answering it, which keeps that policy where the host's instant-order-placement setting already lives. The chart also APPLIES the change as it emits — a closed order or position leaves the chart, a dragged line stays where it was dropped — and keeps only a rollback, so rejecting the intent restores the object exactly as it was. Nothing is parked in a pending tint waiting on an answer, because closing means the object is gone and moving means it has moved. Confirmed objects change only through a subsequent host snapshot or incremental update. Accepted previews remain visibly dotted and pending until that authoritative update arrives; rejected or discarded previews disappear without mutating the confirmed object. Trading state, previews, intents, and executions are runtime-only and never enter drawing persistence.
@@ -552,33 +644,42 @@ Official primitives with chart semantics are likewise retained by the engine. Se
 
 Session highlighting evaluates its optional fractional-hour gate and weekend test in exchange wall-clock time. Its callback records are merged at the tail: a live update sends only appended rows, the engine drops records for rows that retention evicted from the source's head, and it accepts the merge only while the record count and both endpoints still align with the source, otherwise the host re-sends the full aligned set once. The candle-close countdown shows only while the host clock lies inside the last bar's interval (for calendar-date bars, the exchange trading days of its date, or its calendar months for monthly and longer bars) and hides outside it; hosts supply the clock, and the engine never reads one.
 
-An indicator binding keeps its public definition, compact private runtime, and ordinary canonical output series separate. Sparse runtime checkpoints are tied to source row positions and to the source and optional volume/turnover-series generations. Volume and turnover columns pair with source rows by timestamp, so a change to one of them resumes at the first source row after its last unchanged timestamp rather than at its own row index. A tail mutation advances only bindings that depend on that source and installs only changed output rows; a historical mutation resumes from the nearest valid checkpoint and replaces the affected output suffix, while truncation or complete replacement performs a clean rebuild. The five-output EMA ribbon is one binding with one independently checkpointed recursive EMA state per configured period. Its atomic period update retains all output identities and presentation, rebuilds the five value columns once, and propagates the resulting changes through dependent indicators. Removed source/output series drop the binding and its runtime state together. VWAP bands use the same sparse checkpoint boundary for weighted basis, population deviation, and percentage bands, with an engine-owned session/weekly/monthly reset key derived from the chart's exchange trading day. A VWAP binding may also carry a timestamp-aligned turnover (amount) series; it then reports the 分时 average price `sum(amount) / sum(volume)` over the same reset key, skipping rows without positive volume or finite turnover. Convention presets are expanded into explicit `IndicatorKind` parameters at the host boundary, so bindings, metadata, and persistence never hold a preset name.
+An indicator binding keeps its public definition, compact private runtime, and ordinary canonical output series separate. Its runtime covers the source through the data end (one past the last real row, kept at least as far as the previous rebuild's), so trailing whitespace rows such as pre-installed session slots are neither evaluated nor rewritten: their outputs stay whitespace, recursive states resume from the retained tail state when the forming slot fills or changes, and `DataLayer::update_single_aligned_within` writes only the changed rows of an aligned output, so filling or revising a slot costs the window like an append. Sparse runtime checkpoints are tied to source row positions and to the source and optional volume/turnover-series generations. Volume and turnover columns pair with source rows by timestamp, so a change to one of them resumes at the first source row after its last unchanged timestamp rather than at its own row index. A tail mutation advances only bindings that depend on that source and installs only changed output rows; a historical mutation resumes from the nearest valid checkpoint and replaces the affected output suffix, while truncation or complete replacement performs a clean rebuild. The five-output EMA ribbon is one binding with one independently checkpointed recursive EMA state per configured period. Its atomic period update retains all output identities and presentation, rebuilds the five value columns once, and propagates the resulting changes through dependent indicators. Removed source/output series drop the binding and its runtime state together. VWAP bands use the same sparse checkpoint boundary for weighted basis, population deviation, and percentage bands, with an engine-owned session/weekly/monthly reset key derived from the chart's exchange trading day. A VWAP binding may also carry a timestamp-aligned turnover (amount) series; it then reports the 分时 average price `sum(amount) / sum(volume)` over the same reset key, skipping rows without positive volume or finite turnover. Convention presets are expanded into explicit `IndicatorKind` parameters at the host boundary, so bindings, metadata, and persistence never hold a preset name.
 
-Indicator output metadata is additive and binding-complete: the first output's monotonic series identity is the stable binding identity; every output reports the full structured parameters, source, optional VWAP/VWMA volume source and VWAP turnover source, stable output name, index, and count, plus its warm-up and convergence rows measured on the root price source through any chained indicator sources. Native hosts may also enumerate one typed definition per live binding in deterministic creation/dependency order and recreate it through the generic `IndicatorKind` entry point (`add_indicator_kind_with_sources`), remapping source, volume-source, turnover-source, and ordered output identities as they go. This definition snapshot excludes runtime calculation state. Scalar series can also carry renderer-neutral semantic presentation owned by the engine: fixed threshold regions lower into the canonical translucent oscillator channel plus dotted boundary lines, and momentum histograms reuse the canonical four-state market palette while treating whitespace as a reset. Hosts declare those semantics but never receive or retain render primitives or palette logic. The host groups and renders legends from binding metadata; indicator values still come through the ordinary chart value snapshot. Study bindings additionally carry a typed scalar input (`open`, `high`, `low`, `close`, `hl2`, `hlc3`, `ohlc4`, or `hlcc4`) selected at the engine boundary; aggregate inputs are materialized only for the bounded rebuild and never become duplicate canonical series storage. Multi-input bindings align VWAP and VWMA volume inputs by exact timestamp rather than row position, using the documented unit-weight fallback for missing timestamps. Each output also exposes a compact engine-owned style snapshot (visibility, line, marker, area, and directional colors) and accepts an atomic validated style replacement, so per-output styling survives host persistence without kind-specific reconstruction. WASM hosts can query the same bounded parameter/output schema by indicator kind, so property panels do not duplicate engine definitions.
+Indicator output metadata is additive and binding-complete: the first output's monotonic series identity is the stable binding identity; every output reports the full structured parameters, source, optional VWAP/VWMA volume source and VWAP turnover source, stable output name, index, and count, plus its warm-up and convergence rows measured on the root price source through any chained indicator sources. Native hosts may also enumerate one typed definition per live binding in deterministic creation/dependency order and recreate it through the generic `IndicatorKind` entry point (`add_indicator_kind_with_sources`), remapping source, volume-source, turnover-source, and ordered output identities as they go. This definition snapshot excludes runtime calculation state. Scalar series can also carry renderer-neutral semantic presentation owned by the engine: fixed threshold regions lower into the canonical translucent oscillator channel plus dotted boundary lines, and momentum histograms reuse the canonical four-state market palette while treating whitespace as a reset. Hosts declare those semantics but never receive or retain render primitives or palette logic. The host groups and renders legends from binding metadata; indicator values still come through the ordinary chart value snapshot. Study bindings additionally carry a typed scalar input (`open`, `high`, `low`, `close`, `hl2`, `hlc3`, `ohlc4`, or `hlcc4`) selected at the engine boundary; aggregate inputs never become canonical series: each binding keeps its aggregate column as private runtime state (counted in indicator runtime memory) and re-derives it only from the rebuild's first changed row, so a tick derives one row rather than the history. Multi-input bindings pair volume and turnover inputs with source rows by exact timestamp rather than row position. While one timeline is a prefix of the other (identical timelines, or a candle and its volume streaming a new bar in either order) the weight column is borrowed as is and only the newly shared rows are compared; a diverging timeline keeps a binding-owned aligned column with the documented fallback for missing timestamps (unit weight for VWAP, VWAP bands and VWMA, zero for OBV, CMF, MFI and volume, no trade for turnover), also re-derived only from the first changed row. `last_indicator_work_rows` sums, per binding, the formula rows and the derived input rows of its latest rebuild. Each output also exposes a compact engine-owned style snapshot (visibility, line, marker, area, and directional colors) and accepts an atomic validated style replacement, so per-output styling survives host persistence without kind-specific reconstruction. WASM hosts can query the same bounded parameter/output schema by indicator kind, so property panels do not duplicate engine definitions.
 
 Drawing anchors, kinds, styles, pane association, stable z-order, and metadata remain the only authoritative committed drawing state (temporary hover/selection/drag/edit promotion never rewrites it). Built-in tool semantics are described by one compile-time engine catalog: stable wire/name identity, placement class, point-count rule, handle policy, movement-axis restriction, straighten behavior, semantic bounds extent, defaults, and platform-edit requests. Trend-line labels resolve their 3×3 left/center/right and top/middle/bottom positions against the actual segment rather than its bounding box; an inline middle label splits the shared stroke around its measured text extent so no backend paints through the glyphs. The catalog includes Long Position and Short Position as single-click preset tools whose committed semantic points are entry, target/width, and stop. Target and stop are normalized to opposite sides of entry, stop shares the origin edge, and editing uses four dedicated controls (target, entry/origin, width, stop) rather than generic anchor behavior. Their one-click presets open asymmetrically at 2:1 reward/risk, with fill-only entry→target profit and entry→stop loss zones, a thin neutral-gray center entry line, target/stop boundary labels only, and filled neutral/green/red owning-scale Y-axis price tags; no PnL or risk/reward summary block is painted inside the position. Position run progress is a derived three-state model bounded by the position's horizontal lifetime. Pending positions emit no progress until the first post-placement candle reaches or crosses entry; that candle becomes the progress origin at the exact entry price. While filled and active, the endpoint is the latest in-box candle's Close/current value, so the active reward/risk side follows current position state rather than a historical or current wick extreme. The first candle after fill to touch target or stop completes the run: target-first freezes at the exact target price and stop-first at the exact stop price; a same-candle target+stop touch is conservatively stop-first because OHLC cannot determine intrabar ordering. The stronger opacity covers only the traveled x/y rectangle from first-fill entry to current/terminal price, never the whole TP/SL zone or untouched empty area, and neither overlay nor connector projects beyond the position rectangle. Reward and risk use the same explicit progress-emphasis opacity, stronger than the untouched base-zone opacity, so an SL run is emphasized exactly like a TP run rather than depending on subtle repeated alpha compositing. The connector remains dashed neutral gray. LOD extrema summaries plus prefix binary search keep entry-cross and first-boundary discovery bounded for long-lived positions; an OHLC gap across entry is deterministically treated as a cross and drawn at the semantic entry level because no exact intrabar path is available. The run overlay lowers through pane chrome so series updates do not rebuild retained drawing geometry, and the boundary labels are emitted after it so the dashed trend never paints over their text. The catalog is not a runtime plugin registry; adding a built-in tool extends this deterministic engine-owned definition rather than teaching each host or renderer how the tool behaves. One chart-local `DrawingController` owns the armed tool/template plus pending anchored placement or captured freehand state. Browser and GPUI hosts forward generic press/move/release/activation/finish/cancel actions and retain only platform duties such as pointer capture, event coalescing, editor surfaces, and repaint scheduling; hosts do not branch on concrete drawing kinds to decide creation behavior.
 
-A chart-local derived runtime maps the existing monotonic `DrawingId` values to conservative logical/price bounds, coordinate-keyed media-space anchor geometry, and pane-local z-ordered candidate lists. Candidate queries first reject drawings in semantic space, then test cached conservative screen bounds; only viewport or pointer candidates rebuild coordinate geometry and reach canonical primitive emission or precise hit testing. Tool anchors resolve into one backend-neutral drawing-geometry vocabulary before either body hit-testing or `Prim` emission, so the interactive body and the rendered body share the same segment/ray/full-line/rectangle/polyline geometry and terminal decorations. Frame construction alone lowers that resolved geometry into the shared render IR; Canvas2D, WebGPU, GPUI, and native/headless executors never receive a drawing kind and cannot fork tool semantics. Full-span horizontal lines, full-height vertical lines, and half-infinite horizontal rays retain explicit unbounded dimensions rather than fake finite extents. The multi-click Path stores two to 100,000 vertices, emits one straight polyline with an open terminal chevron, exposes every vertex for editing, treats the two arrowhead wings as body-movement targets, and commits one history command only when double-click or Enter finishes it; Backspace removes the latest pending vertex and Escape discards the pending path. Brush remains a press-drag freehand placement class: its bounds are computed once on semantic mutation, padded for curved interpolation, and remain conservatively unbounded during an active capture before one exact pointer-up rebuild. Capture decimates pointer samples by distance and leaves the frame untouched when a sample is rejected, so rapid input invalidates the drawings layer only per accepted point. Runtime bounds, resolved geometry, controller state, counters, and index entries are never serialized.
+A chart-local derived runtime maps the existing monotonic `DrawingId` values to conservative logical/price bounds, coordinate-keyed media-space anchor geometry, and pane-local z-ordered candidate lists. Candidate queries first reject drawings in semantic space, then test cached conservative screen bounds; only viewport or pointer candidates rebuild coordinate geometry and reach canonical primitive emission or precise hit testing. Tool anchors resolve into one backend-neutral drawing-geometry vocabulary before either body hit-testing or `Prim` emission, so the interactive body and the rendered body share the same segment/ray/full-line/rectangle/polyline geometry and terminal decorations (core tools through `drawings/geometry.rs`, B8 family tools through the shared part vocabulary described under "Drawing families (B8)"). Frame construction alone lowers that resolved geometry into the shared render IR; Canvas2D, WebGPU, GPUI, and native/headless executors never receive a drawing kind and cannot fork tool semantics. A dashed or dotted core stroke (trend lines, the path, the curved brush) reaches executors as solid dash runs through `push_styled_stroke` (`frame/series_geometry.rs`, beside the series lines' `push_line_stroke`): the run is expanded with its line type first, then clipped to the pane grown by the stroke's reach and split, so every executor paints the same dashes (the WebGPU stroker ignores `Polyline.style`) and a line reaching far past the pane splits only its visible reach; a solid stroke stays one polyline. General-series lines lower their dashes the same way. Full-span horizontal lines, full-height vertical lines, and half-infinite horizontal rays retain explicit unbounded dimensions rather than fake finite extents. The multi-click Path stores two to 100,000 vertices, emits one straight polyline with an open terminal chevron, exposes every vertex for editing, treats the two arrowhead wings as body-movement targets, and commits one history command only when double-click or Enter finishes it; Backspace removes the latest pending vertex and Escape discards the pending path. Brush remains a press-drag freehand placement class: its bounds are computed once on semantic mutation, padded for curved interpolation, and remain conservatively unbounded during an active capture before one exact pointer-up rebuild. Capture decimates pointer samples by distance and leaves the frame untouched when a sample is rejected, so rapid input invalidates the drawings layer only per accepted point. Runtime bounds, resolved geometry, controller state, counters, and index entries are never serialized.
 
 When a historical insertion, removal, series replacement, or retention trim changes merged logical indices, the engine rebases every drawing-semantic logical snapshot through the data layer's common-timestamp mapping: committed anchors, pending creation anchors and preview, active brush points, active drag start and current snapshots, and both drawing-history stacks. Non-time footprint rebuilds use the bar sequence's full-resolution open/close microsecond identity mapping instead of row keys or truncated seconds, including fractional anchors between bars. Common timestamps map exactly and fractional positions interpolate between them. The core mapping also reports its common extent, whether it is a pure index translation, and the old merged union it was built from. A translation (same-interval prepend, retention trim, or window shift) keeps slope-one bar-count extrapolation outside the common extent so live drawings never jump across session gaps while retention trims stream; the one exception is prepended history, where anchors left of the old data resolve their extrapolated time on the new bars, so an anchor an interval switch placed before a short history keeps its moment when the host pages in more. Otherwise (an interval switch, or a replacement with no common timestamp) every anchor outside the exact extent resolves its time on the old axis onto the new axis (`drawings/time_anchor.rs`). Derived times and logical positions outside the persisted value range are reported as unplaceable, and a pending time that already matches its placeholder keeps that logical bit-exact, so export and import round-trip deterministically. On ordinary time axes an anchor's time identity is derived, not stored: logical `i` sits at merged time `i`, fractional positions interpolate between neighbouring bar times, and positions beyond the data extrapolate with the prevailing bar interval (the most frequent of the last 16 spacings, so session and weekend gaps are never the step). Only an anchor that cannot be placed keeps an explicit pending time on its `Drawing` snapshot: a clear-then-set parks every committed and history anchor's time (cancelling in-flight creation and drag state), and time anchors supplied by the API, a restored document, or a sync/clipboard payload before data exists stay pending until the next time-point change resolves them. A bounded flag skips that walk in steady state, and row keys of non-time bar sequences are never read as times. The transient mapping compresses its common-timestamp breakpoints to slope changes and carries the moved-out old merged union only for the one synchronization in `sync_time_points`; both are dropped there, so no second merged timeline outlives the synchronization boundary. Pixel drag/brush baselines refresh immediately for input continuity and once more after the next frame settles layout and autoscale. This maintenance mutation creates no drawing-history command. Non-time drawings persist an optional bounded anchor-time sidecar (open/close microseconds) alongside their logical/price anchors; legacy documents omit it and retain their existing behavior, while restored sidecars resolve when the host installs the matching sequence. Ordinary time charts persist each anchor's time inline (`{logical, price, time}`), and that time is authoritative on import: it resolves immediately against loaded data or stays pending until the host installs data, so restoring into a shifted history window, another interval, or the grid workspace (which imports before data) lands on the saved moments.
 
-The time-scale view follows the same mappings. Before new points land, the engine maps the view's right border through the transaction's common-timestamp mapping (or, on a non-time axis, the bar-identity mapping) and lands the point count, base index, and right offset atomically, so a scrolled-back view keeps the same bars across out-of-order inserts, gap backfills, prepend-plus-append replacements, and retention trims. An active drag snapshot, kinetic coast, held keyboard pan, and animated scroll shift by the same rebase instead of overwriting it. The reference follow-latest rule is unchanged: while the latest bar is visible and `shift_visible_range_on_new_bar` is on (for a whitespace replacement only with `allow_shift_visible_range_on_whitespace_replacement`), the offset stays relative to the newest bar. A transaction without any common timestamp or bar identity keeps the reference first-time heuristic, compared in data-layer row units on every axis. Non-time retention computes its identity mapping against the rows that survive the cap. `set_visible_logical_range` keeps fractional borders like the reference. The opt-in `lock_visible_logical_range` time-scale option holds the visible logical range exactly across data synchronization and resizes (in-flight drag, coast, and animated motion rebase with it) and applies a range passed to `set_visible_logical_range` without the reference scroll clamps; the reference `maxRightOffset` rule would otherwise shift a full `[0, N - 1]` session one bar left while fewer than two bars have traded. Scroll, zoom, fit, and option mutations still apply their ordinary clamps and become the held range. This is the fixed full-session (intraday time-sharing) view contract; session slots are host-installed whitespace rows, generated with the engine's session-slot function.
+The time-scale view follows the same mappings. Before new points land, the engine maps the view's right border through the transaction's common-timestamp mapping (or, on a non-time axis, the bar-identity mapping) and lands the point count, base index, and right offset atomically, so a scrolled-back view keeps the same bars across out-of-order inserts, gap backfills, prepend-plus-append replacements, and retention trims. An active drag snapshot, kinetic coast, held keyboard pan, and animated scroll shift by the same rebase instead of overwriting it. The reference follow-latest rule is unchanged: while the latest bar is visible and `shift_visible_range_on_new_bar` is on (for a whitespace replacement only with `allow_shift_visible_range_on_whitespace_replacement`), the offset stays relative to the newest bar. A transaction without any common timestamp or bar identity keeps the reference first-time heuristic, compared in data-layer row units on every axis. Non-time retention computes its identity mapping against the rows that survive the cap. `set_visible_logical_range` keeps fractional borders like the reference. The opt-in `lock_visible_logical_range` time-scale option holds the visible logical range exactly across data synchronization and resizes (in-flight drag, coast, and animated motion rebase with it) and applies a range passed to `set_visible_logical_range` without the reference scroll clamps; the reference `maxRightOffset` rule would otherwise shift a full `[0, N - 1]` session one bar left while fewer than two bars have traded. Scroll, zoom, fit, and option mutations still apply their ordinary clamps and become the held range. This is the fixed full-session (intraday time-sharing) view contract; session slots are host-installed whitespace rows, generated with the engine's session-slot function. The base index (the last real bar across the union series) is found through each series' LOD pyramid, so the trailing slots add no work to a tick's time synchronization.
 
 Each chart also owns a bounded runtime-only drawing history of the last 100 committed semantic
 create, delete, anchor, style, and clear operations. Pointer-move samples mutate the active drag
 snapshot without adding commands; pointer-up records one start-to-end update. Undo/redo cancels an
 active drag first, rebuilds only the affected drawing runtime state, a new mutation clears the redo
 branch, and persistence never contains either history stack. A host batch anchor rewrite records one
-`BatchUpdate` command. A price-basis rescale (multiplicative factors over anchor-time segments,
-non-time bars dated by their open time, Long/Short Position levels on the entry's segment) is a
-data-basis change like the time rebase: it applies to locked drawings, rewrites both history stacks
-and in-flight creation/drag state in the new basis, records no command, and is rejected as a whole
-when any rescaled price would leave the persisted value range. The chart-level price-basis label is metadata carried by persistence and
+`BatchUpdate` command. Every committed history step (an API mutation, an interactive placement
+or freehand stroke, a drag or keyboard nudge that changed something, a text-edit commit) advances
+the chart's drawing sync revision once, as undo, redo, and price-basis changes do; a drag that ends
+where it started records nothing and advances nothing. A price-basis rescale (multiplicative
+factors over anchor-time segments, non-time bars dated by their open time, Long/Short Position
+levels on the entry's segment, and tool options measured in price units, such as a Gann fan's or
+fixed square's `scale_ratio`, on the first anchor's segment through the family's
+`rescale_price_options` hook) is a data-basis change like the time rebase: it applies to locked
+drawings, rewrites both history stacks and in-flight creation/drag state in the new basis, records
+no command, and is rejected as a whole when any rescaled price or price-unit option would leave
+its valid range. The chart-level price-basis label is metadata carried by persistence and
 sync/clipboard payloads.
 
 B2 extends that owner boundary with a versioned typed drawing contract. `drawing_contract.rs`
 defines bounded property descriptors, interval visibility, line caps, magnet modes, labels,
-levels, templates, clipboard payloads (with anchor times and the price-basis label), and revisioned
+levels, templates, clipboard payloads (with anchor times and the price-basis label, bounded like a
+persisted drawing document: at most `MAX_DRAWING_OBJECTS` drawings, `MAX_DRAWING_CLIPBOARD_POINTS`
+anchors, and `MAX_DRAWING_CLIPBOARD_BYTES` bytes, the byte bound checked before a paste parses;
+clone stages from the live drawing, so any drawing the chart holds can be cloned), and revisioned
 sync payloads. Magnet snapping resolves one effective mode from the stronger of the drawing's own
 mode and the chart's persistent mode, with the Ctrl/Cmd modifier as a temporary toggle; weak snaps
 only within a fixed vertical CSS-pixel distance, and keyboard nudges start at the focused handle's
@@ -591,9 +692,467 @@ emission and hit testing. Hidden or interval-ineligible drawings remain in persi
 object tree but are excluded from rendering and hit testing; locked drawings remain selectable
 but cannot be edited. Selection, clone/copy/paste, z-order, group operations, bulk removal, and
 sync are chart-owned and bounded, with sync IDs/revisions preventing stale or echoed updates.
-Named templates are validated data rather than host-side drawing copies. V1/V2 persistence keeps
+Named templates are validated style data rather than host-side drawing copies: a template never
+carries identity (name, group, revision, z-order), placement (price scale), visibility (visible,
+locked, interval visibility), or text content, neither when exported nor when applied (a
+host-written template's such keys are dropped, in either spelling), and a profile template keeps
+the target's own series source. V1/V2 persistence keeps
 these fields optional for lossless migration of existing layouts, while browser/WASM exposes the
 same schema, template, object-tree, and payload operations as the native engine.
+
+#### Drawing families (B8)
+
+B8 tools live in drawing families. The core tools (trend, horizontal, and vertical lines, horizontal
+ray, rectangle, text, brush, path, Long/Short Position, and the profile drawings) keep
+`family: None` in their catalog spec and resolve through `drawings/geometry.rs` rather than the
+family part vocabulary; their dashed and dotted strokes lower to solid dash runs through
+`push_styled_stroke`, as described with the drawing-geometry vocabulary above. Each family owns one module, `drawings/kinds/<family>.rs`, holding its tool specs, one
+`static FAMILY: DrawingFamily` hook table that every spec references, its typed option block, and
+its tests (`kinds/<family>/tests.rs`). The hook table is a closed compile-time table, not a plugin
+registry. `DrawingFamily::new` takes the two required hooks, `build_parts` and `kind_options`, and
+starts every optional hook at a neutral default that the family overrides by assignment in its
+`static` initializer: `apply_defaults` (kind defaults applied by `Drawing::new`, so creation,
+templates, restore, paste, and schema defaults agree), `decoration_extent` (conservative CSS-px
+culling pad for boxes and labels beyond the anchors), `extend_schema` (`tool_options.*`
+descriptors appended after the common ones, whose defaults the engine already takes from the
+kind's template drawing), and `owns_labels` (the family renders the common `labels` itself). A
+hook added later gets its default in `DrawingFamily::new`, so the other families compile
+unchanged; a hook more than one family sets, or one the foundation adds for every family, sits
+outside the family blocks. Those shared hooks are `paint_bounds`, `reads_series_data`,
+`partial_preview`, `handles`, `drag`, and `close_placement` (a foundation hook; today only the
+shapes polyline sets it). `paint_bounds` is the
+one family culling hook: a conservative media-px box of everything a drawing paints except text,
+computed from its anchors' media px whenever its coordinate key changes. A tool whose reach is
+screen-derived (pitchfork tines and levels, a circle through its rim anchor, a fixed-size square)
+declares `Full` logical and price extents, so no semantic box culls it, and while its bounds stay
+unbounded in both dimensions this box replaces the whole pane as its screen culling and
+hit-candidate box (`None`, or an extended drawing, keeps the pane). `reads_series_data` marks a
+drawing whose geometry reads series data (a regression's fit, a forecast's outcome): every such
+drawing measures `ChartEngine::drawing_source_series`, the first live ordinary series in creation
+order (the smallest live `SeriesId`; identities are monotonic, storage slots are reused) on its
+pane and price scale (indicator outputs and custom series never qualify, footprint and feature
+series do through their OHLC projection, and neither paint order nor visibility moves it), and
+`invalidate_frame_series` rebuilds the retained drawings layer only when the changed series is
+such a drawing's source (a scan of the drawing list per data mutation; structural source changes
+invalidate the whole scene). These readers work in the source's canonical rows: an as-of
+source's plot points repeat and skip canonical rows, so a regression, a forecast, and a bars
+pattern read each canonical row once, at the first axis point at or after its time (see
+`ChartEngine::drawing_source_window`). `partial_preview` lets a placement preview resolve parts from the second
+anchor on. `handles` and `drag` are the derived-handle foundation: `handles` edits the handle
+set `drawings/handles.rs` builds in media px from the spec's handle mode (moving a handle onto
+derived geometry, dropping one, or appending handles that drive `DrawingDragPart::Handle(index)`),
+and selected-handle painting, placement previews (the placed anchors' handles only), handle hit
+testing, keyboard handle cycling, and drag starts all read that one set. Every drag sample, pointer
+drag or keyboard nudge, then runs the generic part drag (an anchor re-anchored with time snap,
+magnet, and straighten; a body translated; a derived handle's baseline media px moved by the
+delta along the movement axis, time- and magnet-snapped like an anchor) and hands the result to
+`drag` as a `HandleDrag` sample (baseline anchors and px, the dragged point as an anchor and in
+px, Shift, and a keyboard nudge's step, so a hook that quantizes its target, such as the fixed
+Gann square's whole bars, moves at least one unit per key press). A nudge reports success only
+when it recorded an undoable change. The hook rewrites the anchors from that baseline alone and may return replacement
+tool options, which the drag session's history snapshot restores on cancel and records in the
+same undo step; a data-driven rebaseline also rebases a derived handle's baseline onto its
+current position. `close_placement` lets a multi-click tool close on its first vertex: with at
+least three vertices placed, a click within the precision anchor hit radius of the first calls
+the hook (a polyline sets `closed`) and commits without adding a vertex, and hovering there snaps
+the preview onto that vertex; Enter, double-click, and Escape keep finishing open and cancelling.
+Hooks run while the drawing runtime cache is borrowed during frame construction and hit
+testing, so they read the engine but never call candidate queries or cached anchor-geometry
+accessors. Spec fields replace per-kind checks in shared code: `text_layout` (`Box`, or
+`Segment`: the label follows, rotates with, and takes the stroke color of the first two anchors
+and a middle label splits the stroke) and `axis_price_label` (the horizontal-line axis tag).
+
+A family resolves one drawing into the shared part vocabulary of `drawings/parts.rs` in the
+caller's space (bitmap px at render, media px at hit test): anti-aliased strokes, crisp full-pixel
+horizontal and vertical lines, ribbon fills between paired chains (convex polygons via
+`fill_convex`, any polygon by the nonzero rule via `fill_polygon`), discs, wide strokes painted
+once per pixel (`Tube`, lowered to one band fill), and boxed text blocks laid out by one
+`PartLabel::layout`. Derived
+logical/price points (level lines, time zones, data-driven points) map into that space through
+`PartContext::point_px`, which applies the frame's separate horizontal and vertical bitmap ratios;
+frame construction debug-asserts that it reproduces every anchor. Frame construction lowers
+parts into existing `Prim`s in `frame/drawings.rs` (`build_family_prims`; every stroke run goes
+through `push_clipped_stroke`, which clips it to the pane grown by the stroke's reach with
+`shape::clip_polyline_to_rect`, so work and coordinates stay bounded however far the geometry reaches,
+and splits a dashed or dotted run into solid dash runs through `push_line_stroke`, like every
+engine-owned path stroke, because the WebGPU tessellator has no dash concept; clipped parts keep the
+unclipped run's dash phase, so dashes never shift while panning) and precise hit testing tests
+the same parts (`DrawingParts::hit`, where a dashed stroke stays one continuous body), so family
+tools cannot fork executor behavior and the painted and interactive shapes cannot drift. While a
+tool is being placed, the frame's pending path builds the tool's own parts once every anchor is
+placed or previewed (with `partial_preview`, from the second anchor on); before that, a tool of
+three or more anchors joins the placed anchors and the pointer in one guide polyline in the
+drawing's stroke, lowered through `push_clipped_stroke`, with handles on the placed anchors, so
+every click leaves visible ink. Shared helpers sit at their owners: pure geometry (segment
+extension, midpoints, and clipping to the pane, ray clipping, parallel offsets, arc/ellipse
+tessellation and clip-aware curve flattening, nonzero polygon ribbons, polyline/polygon/ribbon
+hit predicates, and `Rect` inflation, intersection, and bounding boxes) in
+`aeris_charts_render::shape`; line caps (`capped_segment` is the two-point `capped_polyline`, and
+`cap_radius` sizes every disc and arrowhead), arrow trimming, label layout, the stats box
+(`PartContext::stats_label` with the shared `STATS_*` gap, padding, and alpha and `text_on`'s
+black-or-white text), and the fill convention (`PartContext::fills_hit`: region fills are body
+targets only while the drawing is selected, like the rectangle's interior) in `parts.rs`; color
+resolution on the contract types (`Drawing::stroke_color` with the canonical primary fallback,
+`Drawing::fill_or_wash`, and `DrawingLevel::stroke_color`, `zone_fill`, and `line_style`, whose
+style names fold through `line_style_from_name` like a drawing's own `style`); the property
+descriptor builder `drawing_contract::descriptor`; engine-formatted measurement text (price
+through the drawing scale's formatter, percent, ticks, bars, time range, duration, screen angle,
+distance) and the text and stats glyph sizes (`drawing_text_size`, `drawing_stats_size`) in
+`drawings/stats.rs`; the one editable handle set used by painting, handle hit
+testing, keyboard cycling, and drags, with the `HandleDrag` sample and the `drawing_anchor_at`
+conversion family drags use, in `drawings/handles.rs`; the media-px `PartContext::media` of hit
+testing and handle hooks in `parts.rs`; and level lists as contract data
+(`FIBONACCI_RATIOS`, `FIBONACCI_TIME_ZONES`, `drawing_levels_from_ratios`,
+`DrawingLevel::price_between`, `DrawingLevel::label`). A drawing with `extend_left` or
+`extend_right` uses unbounded semantic bounds, so extensions stay visible and hittable when the
+anchors scroll away, while a ray or extended line whose extensions are switched off culls like any
+finite segment.
+
+Inline text editing is one engine session for every editable drawing, the text tool and trend
+labels included: `ChartEngine::begin_drawing_text_edit` (refused for a locked, hidden, or
+interval-hidden drawing, or one that is not `drawing_text_editable`) records the text it began
+from, `set_drawing_edit_text` replaces the text live (repainting and relaying out, with no undo
+step and no sync revision), and `end_drawing_text_edit` commits the edit as one `Update` undo step
+and one sync revision or cancels it back to the text it began from. Undo and redo commit an open
+session first (the browser editor's order); removal, clearing, a sync payload, and a restore end
+it. The session is runtime-only. A family marks the label that holds a drawing's own `text` with
+`DrawingParts::text_label` (lines from `first_line` on; earlier lines are engine text such as a
+formatted price), filled from `PartContext::text_lines`, which keeps one empty caret line while
+`PartContext::text_editing` is set, so an emptied box keeps its place. Such a family sets
+`owns_text`, so the generic text pass does not paint the same `text` a second time; a family that
+sets no `owns_text` gets the generic box or segment label (placed by `text_box` when set). A family drawing is
+text-editable exactly when its parts, resolved as while editing, mark such a label, and
+`ChartEngine::drawing_text_edit_layout` returns that label's layout in media px from the same
+`PartLabel::layout` the frame and the hit test use (the lines' left edge, the first text line's
+center, the line advance, glyph size, weight, italics, and painted color), so the host's caret
+overlay cannot drift from the painted text as the box grows in any direction.
+
+Family-specific options live in `Drawing.tool_options: DrawingToolOptions`, one optional block per
+family carried under `tool_options` by options JSON, templates, clipboard and sync payloads, and V1
+persistence. Patches deep-merge (absent keys keep their values, `null` resets a block) on a copy
+that is validated and size-bounded before one undoable install. A template that carries
+`tool_options` replaces the drawing's family style instead (`DrawingToolOptions::replacement_patch`
+against the drawing's `template_style`), so applying it also resets the family options it leaves
+at their defaults, while data the drawing captured (a bars pattern's copy) is not style and
+stays. Persistence writes each optional style field only when it differs from the kind's own
+defaults, so a restored ray keeps `extend_right` and a user-cleared one stays cleared.
+
+Each family documents its semantics in its own block below.
+
+<!-- B8: lines — begin -->
+The Lines family (`kinds/lines.rs`, wire ids 32..=47) delivers `ray`, `extended_line`,
+`info_line`, `trend_angle`, `cross_line`, and `arrow_line`. The five segment tools share one
+geometry: the first two anchors extended beyond the first by `extend_left` and beyond the second by
+`extend_right` (a ray and an extended line are these defaults), clipped to the pane in their own
+direction, with end caps on the ends that are not extended. Visible `labels` render as one stats
+box whose position is `tool_options.line.stats_position`; the info line enables price change,
+percent change, bar count, duration, and angle by default. The trend angle adds a dashed horizontal
+reference, the arc to the segment, and the screen angle. The cross line is full-span crisp
+horizontal and vertical lines with the horizontal line's axis price tag.
+<!-- B8: lines — end -->
+<!-- B8: channels — begin -->
+The Channels family (`kinds/channels.rs`, wire ids 48..=51) delivers `parallel_channel`,
+`regression_trend`, `flat_top_bottom`, and `disjoint_channel`. The three-anchor channels share one
+construction: the first two anchors are the base line, and the second line spans the same bars
+(vertical sides) on the line through the third anchor — translated vertically in px (parallel on
+every scale mode), horizontal at the third anchor's price, or with the base slope mirrored. Their
+price extent is `Full` except flat top/bottom's, because the second line's ends can leave the
+anchors' price box. Fills run between two lines over a common parameter span, split at the one
+crossing so each piece is convex, and are clipped to the pane with `shape::clip_polygon_to_rect`;
+they are body targets only while the drawing is selected. The family's shared `handles` hook
+moves the anchor handles onto the painted lines (the third anchor's handle to the second line's
+midpoint, the regression's to its fitted line's ends), so handle painting (placement previews
+included), handle hit testing, and keyboard nudges read them there, and each handle still drives
+its own anchor by pointer deltas.
+Shift straightens a dragged base-line end against the other like a trend line's (the anchor drag
+straightens the first two anchors of any tool with a straighten mode). With `partial_preview`
+set, placement previews the base line while the second anchor is placed, then the whole channel
+through the pointer.
+
+`regression_trend` fits its source series (`drawing_source_series`) over its canonical rows
+between its rounded anchor bars in one allocation-free pass of shifted sums
+(least-squares slope, sample residual deviation, Pearson's R). `RegressionMemo`
+(`DrawingChartSettings::regression_memo`) keeps each drawing's latest fit keyed by the series, the
+merged points' positions (`time_index_generation`; an as-of source also keys every time point),
+the replay clock, the bar range, and the source, together with the source data generation it read
+and the sums of every fitted row but the last. The engine reports each series data change it
+routes to indicators (`update_indicators_after_change`) to the memo with its first changed row, so
+a change that leaves every row before a fit's last row untouched (a live replacement of the latest
+bar, or appended bars) extends the fit by the changed rows, adding them in order so the result is
+bitwise identical to a full pass; a change at an earlier row, an unreported change, a moved point,
+or an as-of source pays the pass proportional to the anchored range. Panning, zooming, and pointer
+hit tests reuse the fit however many regressions the chart holds, and the release `perf_gate`
+Target N times live ticks plus frames with five regressions across a 1,000,000-row source. Fits of
+removed drawings are dropped once the memo exceeds the drawing count by 16 entries. Its anchors
+move along time only, and it sets the shared `reads_series_data` hook. The optional `tool_options.channel` block stores only fields that
+were set; per-tool defaults resolve at use.
+<!-- B8: channels — end -->
+<!-- B8: fibonacci — begin -->
+The Fibonacci family (`kinds/fibonacci.rs`, wire ids 64..=73 of 64..=95) delivers
+`fib_retracement`, `trend_based_fib_extension`, `fib_channel`, `fib_time_zone`,
+`trend_based_fib_time`, `fib_speed_resistance_fan`, `fib_speed_resistance_arcs`, `fib_circles`,
+`fib_spiral`, and `fib_wedge`. Every tool but the spiral paints the common level list
+(`Drawing::levels`, defaults set by `apply_defaults`): visible levels sort by value, bands between
+neighbours take the upper level's fill under the `fill_enabled` switch, and labels take the level
+color. The drawing's own stroke is the auxiliary line (trend line, fan grid, wedge edges, or the
+spiral). Price levels (retracement, extension, channel) are computed in price space, or log space
+with `tool_options.fibonacci.log_scale`, and mapped through `PartContext::point_px`, so they sit on
+exact prices on every scale mode; time levels interpolate the anchors' px because the time axis is
+affine in logical position; the fan, arcs, circles, spiral, and wedge are screen-space geometry
+from the anchors' px. Band fills are body targets only while the drawing is selected.
+
+The family adds the `bounds` hook (default in its block of `DrawingFamily::new`), which returns a
+drawing's complete semantic reach (`FamilyBounds`: logical and price ranges,
+`None` when unbounded) and replaces the anchor-derived culling bounds in
+`DrawingBounds::for_drawing`, so levels beyond the anchors stay visible and hittable while the
+anchors scroll away; screen-space tools keep unbounded spec extents and skip curves outside the
+pane. Arcs, circles, and the wedge set the shared `paint_bounds` to the anchors plus the square
+around their center reaching the largest visible level's radius (at least the unit), and their
+`decoration_extent` pads it by the level labels, so a ring tool far from the pane culls and skips
+hit testing like any finite drawing; the fan's rays and the spiral reach the pane edge and keep the
+pane. It sets the shared `partial_preview`, so a three-anchor tool shows its first leg before its
+second click. Level lists persist only when they
+differ from the kind's defaults, so a user-cleared list stays cleared.
+
+Every emitted coordinate stays within the pane's reach whatever the level values: fan rays end at
+the pane edge, channel lines that miss the pane are skipped, and ring radii beyond the farthest
+pane point close bands and wedge edges at that distance. Fan wedges and channel bands clip the
+pane polygon by half-planes (`aeris_charts_render::shape::clip_to_half_plane`), so an extended
+channel band covers the pane corner its lines leave through. Labels are culled by their own box
+(one glyph size per character), not by their level line, so a label whose line sits just outside
+the pane still paints. The spiral grows by φ per quarter turn from a sub-pixel radius until its
+radius passes the farthest pane point, at most 128 quarter turns. Arcs, circles, wedge arcs, and
+spiral turns skip what cannot reach the pane and, when their center lies outside it, tessellate
+only the angular window the pane subtends, so curves far beyond the pane stay within the curve
+tolerance at the capped segment count; one tool's arcs share a single table of unit angles, which
+also pairs its band chains. A windowed dashed or dotted curve starts at the last dash-period
+boundary before the window (arc length from the curve's own start, off the pane), and a full
+circle restarts its pattern where the whole circle does, so dashes stay put while the pane
+scrolls.
+<!-- B8: fibonacci — end -->
+<!-- B8: pitchforks_gann — begin -->
+The Pitchforks & Gann family (`kinds/pitchforks_gann.rs`, wire ids 96..=127) delivers
+`andrews_pitchfork`, `schiff_pitchfork`, `modified_schiff_pitchfork`, `inside_pitchfork`,
+`pitchfan`, `gann_box`, `gann_square`, `gann_square_fixed`, and `gann_fan`. A pitchfork resolves
+one frame from its anchors A, B, C: the median pivot (A; Schiff: A's time at the midpoint of A's
+and B's prices; modified Schiff and inside: the midpoint of A and B), the base center (the
+midpoint of B and C; inside: C), and the half handle (toward C; inside: back to B). Level `v` of
+the drawing's `levels` is the pair of tines parallel to the median through `center ± v · half`,
+so level 1 passes through the handle ends. Unextended lines reach one median length past the
+base; `extend_left`/`extend_right` run every line to the pane edge, and extended zone fills clip
+to the pane through `shape::clip_polygon_to_rect`. The shifted-pivot variants add a dashed A–B
+guide, and the pitchfan draws the levels as rays from A through the Andrews base. The Gann box
+divides its corners' box by the price `levels` and `tool_options.gann.time_levels`, with zone
+fills, ratio labels on all four sides, and optional `angles` from the pivot corner. Like the
+rectangle's interior, every zone fill of the family (pitchfork strips, fan sectors, Gann box
+zones, square arcs) is a drag target only while its drawing is selected. The Gann square draws
+the `levels` grid, the `angles` fan, and quarter-ellipse `arcs` around its pivot corner, plus an
+engine-formatted price range, bar count, and price-per-bar box. The fixed square is one anchor
+plus `size_bars` and an optional `scale_ratio` (without one it is square on screen). The Gann fan's
+`levels` are multiples of the 1×1 slope, which passes through the second anchor or rises
+`scale_ratio` price per bar. Its lines are rays by default, labeled `8x1` through `1x8`. Every
+tool of the family reaches past its anchors by a viewport-dependent amount, so the specs declare
+`Full` extents and the family's `paint_bounds` resolves the same corners and line ends in media
+px (an extended drawing keeps the pane). Crisp horizontal and vertical lines clamp to the pane
+with the dash-phase rule of `push_clipped_stroke` (executors dash them from their start pixel by
+pixel), and label boxes off the pane emit nothing, so an extreme level, size, or zoom never grows
+frame work with the geometry's length or leaves non-finite coordinates. Through the shared
+`handles` and `drag` hooks, the pitchforks and the pitchfan add a fourth handle on the base
+midpoint of B and C, which translates both by the midpoint's (magnet-snapped) move, and the fixed
+square adds its far corner, which resizes it: the corner's time sets `size_bars` in whole bars
+(1 at least) and its side of the anchor sets `reverse`; with a `scale_ratio` its price sets the
+ratio (Shift keeps it), and without one the square stays square on screen, sized by the corner's
+larger distance from the anchor. A pointer rounds the side to the nearest bar; a keyboard step
+moves it at least one whole bar the way the key moved (sized by the moved axis without a ratio), so
+sub-bar key presses accumulate. The option edit is part of the drag's single undo step. The
+fan's and the fixed square's `scale_ratio` is price per bar, so the family's
+`rescale_price_options` scales it with a price-basis rescale of the pivot anchor.
+<!-- B8: pitchforks_gann — end -->
+<!-- B8: projection_annotations — begin -->
+The Projection & Annotations family (`kinds/projection_annotations.rs`, wire ids 128..=159)
+delivers `forecast`, `bars_pattern`, `price_range`, `date_range`, `date_and_price_range`,
+`projection`, `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
+`signpost`, `flag_mark`, `arrow_mark_up`/`down`/`left`/`right`, and `icon`. Its options live in
+`tool_options.projection_annotation` (bars-pattern mode, mirror, flip, and copied bars; icon and
+icon size). It adds four hooks to `DrawingFamily`, each neutral by default: `on_create` (called
+before a new drawing is stored, by the armed tool's placement commit, which always captures since
+its options come from a tool template, and by `add_drawing`, which paste also uses and which keeps
+state its options already carry; sync and restore never call it), `owns_text` (the generic text
+pass skips the family's tools; they lay the common `text` out in their own parts),
+`pane_anchored` (per kind), and `reveals_on_focus` (a drawing that paints some parts only while
+hovered, selected, or edited; see the note below). A pane-anchored kind (`anchored_text`) stores its anchor as pane
+fractions (`logical` = x / pane width, `price` = y / pane height): every anchor conversion goes
+through `ChartEngine::drawing_anchor_px`/`drawing_anchor_from_px` (and `drawing_point_px`), so
+frames, hit tests, handles, drags, nudges, creation, stats, and `PartContext::point_px` agree. Its
+anchors carry no time (`set_pending_times` drops them, `resolve_drawing_anchors` ignores `time`,
+and restore ignores a non-time anchor-time sidecar), anchor resolution and drags clamp its
+fractions into `0..=1` (restore rejects a document outside that range), and it is never rebased
+on data changes, price-rescaled, magnet-snapped, or offset by paste or group moves. Culling uses
+full extents for it; the projection sector (a screen-px circle) declares full extents too, and the
+family's `paint_bounds` bounds it by the square around its apex reaching the radius point, padded
+by its stats box through `decoration_extent`.
+
+`forecast` evaluates its outcome from its source series (`drawing_source_series`, followed
+through the shared `reads_series_data` hook, so a tick of that series that moves no scale still
+updates it) through the LOD extrema and latest-bar queries (logarithmic in the range): success once
+a bar after the source bar reaches the target by the target bar, failure once a traded bar after
+the target bar exists (whitespace rows such as future session slots are not bars). An as-of source
+has no canonical-row pyramid (its LOD summarizes plot points), so its outcome scans its canonical
+rows in the window once per data, axis, clock, or anchor change and is memoized per drawing like
+the regression fit.
+`bars_pattern` copies at most 128 OHLC bars once at creation (a longer range aggregates into 128
+buckets, each read from its LOD summary rows, so the capture and the placement preview that
+repeats it per frame stay logarithmic in the range; an as-of source's buckets scan its canonical
+rows, bounded by the capture window), pins its anchors on the copy's box (the first
+bar at the highest value, the last bar at the lowest), fits the copy into the anchors' box
+(divided by the copy's full range, so small anchor drags scale it proportionally and a price-basis
+rescale scales it exactly; flip turns it upside down within the box, mirror reverses time), and
+converts only the columns inside the pane each frame. The ghost never leaves the anchors' box, so
+it culls like any finite drawing. After its first click the projection shows the shared placement
+guide; after its second it previews the sector through the pointer. Named templates carry
+style only: `DrawingToolOptions::template_style` drops the copied bars, so applying a template
+restyles a pattern without replacing its copy, and like every template it never carries identity,
+placement, visibility, or text content (see the drawing contract above). Filled markers are single
+regions: convex polygons, paired-chain outlines (arrow marks), or triangle fans around a kernel
+for star-shaped outlines (star and heart icons), so paint and hit test cover exactly the same
+area. Persistence compares `text` against the kind default, so a cleared default label stays
+cleared. The text boxes of anchored text, the note, price note, callout, comment, price label,
+signpost, and arrow marks are shared text labels (`DrawingParts::text_label`; the price note's and
+price label's text follows their price line), so the host's inline editor edits them in place;
+placement never opens it, since each tool starts from its default text. The flag, the icon, and
+the projection and measuring tools paint no text of their own. The note paints only its pin until
+it is hovered, selected, or edited, like the reference platform's note, unless
+`tool_options.projection_annotation.always_show_text` is set (serialized only when set); the
+family's `reveals_on_focus` hook names such a drawing, so frame construction rebuilds the retained
+drawings layer when it gains or loses hover or selection, while every other hover and selection
+change still only reassembles retained geometry. The culling pad counts an empty text as one line,
+the caret line its editor keeps.
+<!-- B8: projection_annotations — end -->
+<!-- B8: patterns_elliott_cycles — begin -->
+The Patterns, Elliott waves, and cycles family (`kinds/patterns_elliott_cycles.rs`, wire ids
+160..=191) delivers `xabcd_pattern`, `cypher_pattern`, `abcd_pattern`, `head_and_shoulders`,
+`triangle_pattern`, `three_drives_pattern`, `elliott_impulse_wave`, `elliott_correction_wave`,
+`elliott_triangle_wave`, `elliott_double_combo`, `elliott_triple_combo`, `cyclic_lines`,
+`time_cycles`, and `sine_line`, all `ClickAnchors` tools with one handle per anchor. Patterns are a
+zigzag through the anchors with boxed point labels placed above highs and below lows; XABCD, cypher,
+ABCD, and three drives add dashed connectors labeled with the conventional price ratios of their
+legs (`tool_options.pattern.show_ratios`), every connector painted beneath every label, and the
+culling pad measures the drawing's actual point, ratio, and wave labels; XABCD and cypher shade
+their two triangles, head and shoulders draws the neckline between the outer legs and shades the
+shoulders and head against it, and the triangle pattern extends its A–C and B–D sides to their apex
+when it lies ahead within one pattern width (its spec pads the logical bounds by that width and
+never culls on price). Elliott waves label each wave in the notation of
+`tool_options.pattern.degree`; ringed degrees draw the ring as stroke geometry instead of a circled
+glyph, so no executor depends on font coverage. Cycles resolve repeats only across the visible pane:
+cyclic lines from the earlier anchor rightward, time-cycle arches and the sine wave in both
+directions; repeats closer than 3 CSS px collapse to the defining cycle, and the arches and the wave
+each stay within a 16,384-point tessellation budget. Fills are body targets only while the drawing
+is selected (the rectangle convention). Every part resolves from any anchor prefix, so the family
+sets the shared `partial_preview` and previews multi-anchor placement from the second anchor on.
+It also adds the generic `aeris_charts_render::shape::line_intersection`.
+<!-- B8: patterns_elliott_cycles — end -->
+<!-- B8: shapes — begin -->
+The Shapes family (`kinds/shapes.rs`, wire ids 192..=223) delivers `rotated_rectangle`, `ellipse`,
+`circle`, `triangle`, `arc`, `curve`, `double_curve`, `polyline`, and `highlighter`. Every shape
+resolves in caller px from its anchors, so a circle stays round and a rotated rectangle keeps its
+right angles at any zoom and bitmap ratio. The rotated rectangle's first two anchors are its short
+sides' midpoints and the third lies on a long side; the ellipse is inscribed in its two corners and
+edits with the rectangle's eight bounds handles; the circle is its center and a rim point; the arc
+runs from the first anchor to the second through the third (their chord when collinear); the curve
+and double curve pass through every anchor (the quadratic's third at t = 1/2, the cubic's third and
+fourth at 1/3 and 2/3), and `extend_left`/`extend_right` continue their end tangents to the pane
+edge. Closed outlines start mid-edge so their butt ends meet collinearly; open strokes (arc, curves,
+open polyline) carry end caps through the shared `capped_polyline`, pointing along the exact end
+tangents. Fills use `fill_color` or the stroke color at 20% (the rectangle's wash), are body targets
+only while the drawing is selected, and never overlap themselves: convex regions through
+`fill_convex`, concave or self-crossing ones (a closed polyline, a cubic's chord region) through the
+shared `fill_polygon` over `shape::nonzero_ribbon`. Curves and circles flatten through clip-aware
+helpers (`shape::flatten_quadratic`/`flatten_cubic`, `EllipseArc::append_clipped_points`) that
+refine only where the curve can be visible and spend at most 1,024 points, so a zoomed-in circle
+thousands of px wide stays within 0.25 px on screen (a wholly visible arc takes the cheaper uniform
+chords). The rotated rectangle, circle, and arc reach screen-derived distances that no semantic box
+bounds and keep full extents; the curves pad their logical span by the interpolation overshoot. One
+shape box serves two hooks: the family's own `text_box` gives box-layout text the shape's box (a
+circle's rather than its center-to-rim anchors'), and the shared `paint_bounds` makes it the exact
+screen culling box of those full-extent tools, so they reach part building and precise hit testing only
+near the viewport or pointer. The highlighter is a freehand
+capture painted as the shared `Tube` part: the region within half its width of the path with round
+joins and caps, built by `shape::tube_ribbon` from the runs that can reach the pane, simplified
+within the chord tolerance in one pass, outlined so the nonzero rule yields exactly the union, and
+tessellated into non-overlapping strips. Its 40% amber therefore blends once per pixel on every
+executor instead of darkening where GPU stroke triangles overlap; the tolerance doubles when a
+stroke exceeds the fill bounds, and only past the coarsest attempt does it fall back to a plain
+stroke. Its hit test is the stroke distance. The multi-anchor shapes show the shared placement
+guide until every anchor but the last is placed, then preview their own parts through the pointer. Through the shared `handles` and `drag` hooks, the rotated rectangle's
+handles are its axis ends plus derived width handles at its long sides' midpoints (the third anchor
+has no handle of its own): a width handle sets the half width to its target's distance from the
+axis, and an axis-end drag re-places the third anchor at the baseline width about the new axis, so
+rotating the axis never collapses it; the width point is stored on its long side's midpoint
+without time snapping. The polyline sets the shared `close_placement`: clicking its first vertex
+once three are placed closes and commits it.
+<!-- B8: shapes — end -->
+
+Wire ids are reserved per family: core 0..=31, lines 32..=47, channels 48..=63, fibonacci 64..=95,
+pitchforks_gann 96..=127, projection_annotations 128..=159, patterns_elliott_cycles 160..=191,
+shapes 192..=223; 224..=255 are unassigned. A test asserts every spec sits in its family's range
+with a unique wire id and name, and that the serde and catalog names agree.
+
+Single-list registries carry one `// B8: <family> — begin/end` block per family (`<!-- -->` in
+HTML). A family edits only inside its own blocks, so parallel family work merges additively:
+
+| File | Blocks |
+| --- | --- |
+| `drawings.rs` | `DrawingKind` variants |
+| `drawings/tools.rs` | `DRAWING_TOOL_SPECS` entries; `DrawingKind::spec()` arms |
+| `drawings/kinds/mod.rs` | `mod` declaration; new family-specific `DrawingFamily` hooks and their defaults in `DrawingFamily::new` (a hook a second family needs, or one the foundation adds for every family, moves out of the blocks); wire-range test table |
+| `drawing_contract.rs` | `DrawingKindOptions` variants; `DrawingToolOptions` fields, `validate` checks, and `template_style` clears of captured data |
+| `lib.rs` | public re-exports of family option types |
+| `packages/charts/src/types.ts` | `drawing_kind` union; `DRAWING_KIND_TO_U8`; `drawing_kind_options`; family option types; `drawing_tool_options` |
+| `examples/web_demo/index.html` | drawing toolbar buttons |
+| `docs/Public_api.md` | drawing family catalog |
+| `docs/Architecture.md` | family semantics paragraph (above) |
+
+The `drawing_perf` native example measures every tool with a wire id of 32 or more in its
+`families` mix and places each with its catalog anchor count, so family work never edits it.
+
+Recipe for a family:
+
+1. Add the `DrawingKind` variants (the serde name is the spec name) and, in
+   `kinds/<family>.rs`, the specs with wire ids inside the family's range plus
+   `pub(crate) static FAMILY`, built with `DrawingFamily::new(build_parts, kind_options)` and
+   assigning the optional hooks it needs. Declare the module and list the specs and `spec()` arms
+   in their blocks.
+2. Resolve geometry only through `DrawingParts` using the shared helpers; add pure geometry to
+   `aeris_charts_render::shape` when it is generic. Never emit `Prim`s or branch on kinds in the
+   frame, hit tester, executors, WASM, or hosts. Map derived points with `PartContext::point_px`
+   and size strokes, glyphs, and gaps by the `PartContext.scale` ratio. Use the existing placement
+   classes and the `Anchors`, `Endpoints`, `RectangleBounds`, or `Position` handle modes. Derived
+   (non-anchor) handles and their drags go through the shared `handles` and `drag` hooks, and a
+   multi-click close through `close_placement`, never through per-family drag or placement code.
+   Paint a drawing's own `text` as `DrawingParts::text_label` over `PartContext::text_lines`, which
+   makes it editable in place with no host or WASM code; such a family sets `owns_text` so the
+   generic text pass does not paint the same `text` again. `owns_text` still lives in the
+   projection_annotations block of `kinds/mod.rs`, so the second family to set it first moves the
+   field and its default out of those blocks to the shared hooks (and its description from the
+   projection paragraph to the shared hook list).
+3. Put family options in one serde-default struct in the module, add its field to
+   `DrawingToolOptions` (plus an `&& ...` check in `validate` for lists, strings, or numbers), a
+   `DrawingKindOptions` variant, a `lib.rs` re-export, and schema descriptors named
+   `tool_options.<block>.<field>`. Persistence, clipboard, sync, templates, and WASM need no
+   family code, except that data a drawing captures (not style) is cleared for named templates
+   in `template_style`.
+4. Add the TypeScript union members, wire ids, kind-option and option types, the demo toolbar
+   buttons, and the `Public_api.md` entry in their blocks; `impl.ts` derives its reverse wire map.
+   `packages/charts/api/public-api-v1.json` is a generated hash that every stream changes;
+   regenerate it (`npm run update:api`) after merging instead of merging it.
+5. Tests: the wire-range table entry; family engine tests for defaults, armed placement, frame
+   parts at DPR 1 and 2 and at a fractional DPR whose bitmap ratios differ, hit testing including indexed against brute force with more than 20
+   drawings, anchor and body drags with straighten and magnet, keyboard handle count and nudge, time
+   identity across an interval switch, schema and kind options, atomic and undoable option
+   patches, persistence round trip with default omission, clipboard, and sync, and that the
+   drawing's own text paints exactly once; and a Playwright
+   spec (`drawings-<family>.spec.mjs`) for armed placement, hover and hit, options, persistence,
+   clipboard and sync, the toolbar, and WebGPU against Canvas2D parity.
 
 Versioned persistence is an engine-owned semantic DTO boundary, never serialization of live engine
 structs. Financial-only charts continue to export V1 with ordered pane topology, built-in
@@ -624,7 +1183,7 @@ restored drawings' anchor times resolve when that data arrives.
 
 ### `aeris_charts_render`
 
-Backend-neutral drawing primitives, colors, geometry, bar-width rules, and the ordered `DrawList`. This is the contract shared by every renderer. Pixel snapping, primitive ordering, clipping intent, and geometry must be decided before backend execution whenever possible. Curved polylines expand their Catmull-Rom spline adaptively by device-px interval length — intervals already a few pixels long render as their chord (dense freehand brush samples), long sparse intervals keep up to 16 segments — and round joins are emitted only where a turn opens a visible wedge, so tessellation volume stays proportional to what the pixels can show on every backend. Polyline strokes for the GPU backends come from one shared anti-aliased stroker (`line::stroke_aa`): a solid core ending half a device pixel inside the nominal edge, a centered one-pixel coverage transition, faded butt caps, and round joins that fill only the outer wedge of a turn. It emits each vertex with a signed edge distance, and each executor chooses the encoding — WebGPU multiplies vertex alpha by coverage on top of MSAA, GPUI writes the path shader `st` channel — so both backends tessellate identical geometry. Line points are never snapped to the pixel grid: sub-pixel positions plus coverage are what keep diagonals smooth. The Canvas2D contract strokes with round joins and butt caps, matching the reference line renderer. `line::round_rect_polygon` is likewise the single rounded-rectangle tessellation for WebGPU and GPUI, with corner chords scaled to the device radius.
+Backend-neutral drawing primitives, colors, geometry, bar-width rules, and the ordered `DrawList`. This is the contract shared by every renderer. The `shape` module holds the pure `f64` drawing-tool geometry that engine drawing families share: segment extension, line/segment clipping, polyline clipping (`clip_polyline_to_rect`), polygon clipping (`clip_polygon_to_rect`, `clip_to_half_plane`), parallel offsets, uniform arc/ellipse tessellation bounded to 256 chords (`EllipseArc::append_points`), clip-aware curve flattening that refines only where the curve can be visible under a 1,024-point budget (`EllipseArc::append_clipped_points`, `flatten_quadratic`, `flatten_cubic`), nonzero-winding ribbon fills (`nonzero_ribbon`), tube outlines and ribbons, polyline simplification, and polyline/polygon/ribbon hit predicates. It never snaps to pixels. Pixel snapping, primitive ordering, clipping intent, and geometry must be decided before backend execution whenever possible. Curved polylines expand their Catmull-Rom spline adaptively by device-px interval length — intervals already a few pixels long render as their chord (dense freehand brush samples), long sparse intervals keep up to 16 segments — and round joins are emitted only where a turn opens a visible wedge, so tessellation volume stays proportional to what the pixels can show on every backend. Polyline strokes for the GPU backends come from one shared anti-aliased stroker (`line::stroke_aa`): a solid core ending half a device pixel inside the nominal edge, a centered one-pixel coverage transition, faded butt caps, and round joins that fill only the outer wedge of a turn. It emits each vertex with a signed edge distance, and each executor chooses the encoding — WebGPU multiplies vertex alpha by coverage on top of MSAA, GPUI writes the path shader `st` channel — so both backends tessellate identical geometry. Line points are never snapped to the pixel grid: sub-pixel positions plus coverage are what keep diagonals smooth. The Canvas2D contract strokes with round joins and butt caps, matching the reference line renderer. `line::round_rect_polygon` is likewise the single rounded-rectangle tessellation for WebGPU and GPUI, with corner chords scaled to the device radius. The WebGPU stroker ignores `Polyline.style`, so engine frame construction never emits a dashed or dotted polyline: series lines lower dashes through `push_line_stroke`, drawings and general series through `push_styled_stroke`/`push_clipped_stroke`, so every executor receives the same solid dash runs for engine-built strokes.
 
 ### `aeris_charts_render_gpui`
 
@@ -649,7 +1208,7 @@ The WebGPU executor. It owns quad, triangle, textured-label, atlas, blend, multi
 
 The browser boundary. It exposes the engine through `wasm-bindgen`, decodes typed input, selects WebGPU or Canvas2D policy, executes browser frames, handles shared ring input, text measurement, workspace APIs, and browser telemetry.
 
-The browser boundary translates data and platform events and serializes engine-owned value snapshots. It must not become a second chart engine.
+The browser boundary translates data and platform events and serializes engine-owned value snapshots. It must not become a second chart engine. Exchange-session requests (session slots, trade-stream sessions, resampling boundaries and configuration) are parsed in the host-testable `session_slots` module into engine types; a host write to an engine-owned series (footprint, synthetic, or resampled) through `set_data`, `update`, `update_typed`, or a merge returns rejected ingestion diagnostics instead of a silent no-op (the engine itself rejects merges into those series).
 
 ### `aeris_charts_native`
 
@@ -659,7 +1218,7 @@ The headless native executor and verification support. It uses tiny-skia for det
 
 `packages/charts` publishes the `@aeristerminal/aeris-charts` browser API through GitHub Packages. It owns WebAssembly initialization, TypeScript chart handles, DOM canvas lifecycle, resize observation, Pointer Event translation for mouse/pen, cancellable Touch Event translation for direction-dependent page-scroll arbitration, platform capture/default policy, host callbacks, themes, shortcuts, offscreen support, and grid helpers. The root entry remains framework-neutral. The optional `@aeristerminal/aeris-charts/react` entry is a thin lifecycle/reconciliation adapter over those same public chart handles: React mounts one ordinary chart, applies option/data changes to retained engine objects (a `FinancialSeries` data change that only replaces the last point and/or appends later points streams through `series.update()`; anything else is one `setData`), and disposes through `chart.remove()`; it owns no scale, geometry, hit-test, persistence, or rendering semantics. Its module performs no DOM work at import time, so SSR can import it without constructing a browser chart. Drawing-tool arming and pointer events cross the browser boundary through the generic engine drawing controller; the package does not classify a tool as single-point, multi-point, sequence, or freehand, nor duplicate tool-specific placement state. Touch Events normalize into the same engine resolver rather than a parallel gesture state machine; static `touch-action` stays `auto`, and the host applies the reference-informed vertical-priority direction rule after the shared slop. Wheel samples retain floating-point deltas; informed by measurements from the pinned public reference fixture, `wheel_behavior: "auto"` independently maps vertical deltas to time zoom and horizontal deltas to time pan on every chart surface without modifier routing. Explicit `"pan"`/`"zoom"` modes remain host overrides, including price-axis wheel zoom only in explicit zoom mode.
 
-The package resolves IANA time-zone names to explicit offset schedules with `Intl.DateTimeFormat` over a bounded 1970–2100 span (cached per page for at most 32 zones), on the main thread and in workers, and never passes the browser's own zone to the engine. It derives the engine's calendar-date flag from the input form of its financial series (business days versus numeric instants), wraps host time formatters with a calendar-date context without re-entering WebAssembly during frame construction, formats package-owned tooltip and accessibility time text from engine-supplied exchange-local seconds, and lets hosts inject the countdown clock (`set_clock`) instead of `Date.now()`.
+The package resolves IANA time-zone names to explicit offset schedules with `Intl.DateTimeFormat` over a bounded 1970–2100 span (cached per page for at most 32 zones), on the main thread and in workers, and never passes the browser's own zone to the engine; the free `session_slot_times()` and `resample_boundaries()` helpers pass their resolved schedule, while trade-stream sessions use the chart's installed zone. It derives the engine's calendar-date flag from the input form of its financial series (business days versus numeric instants), wraps host time formatters with a calendar-date context without re-entering WebAssembly during frame construction, formats package-owned tooltip and accessibility time text from engine-supplied exchange-local seconds, and lets hosts inject the countdown clock (`set_clock`) instead of `Date.now()`.
 
 Wheel routing is one worker-safe function shared by the DOM recognizer and the OffscreenCanvas worker façade, including the reference delta-mode and Windows-Chromium device-pixel speed corrections; worker charts expose no `handle_scroll`/`handle_scale` options, so both wheel gestures stay enabled there. Keyboard time-scale motion from the input overlay and the accessibility surface honors the host gesture switches: arrow panning and accessibility point scrolling need a horizontal scroll gesture, +/- zoom follows wheel zoom, and Home fit/reset follows the time-axis reset gesture, so a view fixed with `handle_scroll: false` and `handle_scale: false` cannot be moved from the keyboard, and a gated key keeps its default browser action. Visible-range and size subscriptions never dispatch re-entrantly: a handler that mutates the chart marks the diff dirty, the current value finishes delivery, and a bounded re-read (eight passes, then the next frame) delivers the final range to every handler. `time_scale().scroll_to_real_time()` animates through the engine scroll animation to the configured `right_offset` over the reference 400 ms (with the engine's cubic ease-out rather than the reference's linear curve), immediately under reduced motion; the headless engine call applies the same target at once.
 
@@ -691,7 +1250,7 @@ Frame invalidation is an engine-owned generation graph. Layout, coordinates/auto
 
 Series and indicator selection owns one transient engine snapshot with a single primary command target and at most 64 related output members. Engine-owned indicator bindings expand automatically; hosts may supply the bounded member identities for study groups they author outside the built-in indicator registry. Each member retains at most 128 canonical output timestamps sampled from its own full canonical start-to-end extent only on the unselected-to-selected transition. Selection-time projection determines sparse density, while endpoint-inclusive logical spacing prevents a partial-series selection treatment. Overlay rebuilds resolve every member's identities against its current canonical values and coordinates, place candlestick handles at the current body midpoint, clip offscreen handles without replacement, and discard the snapshot on deselection; LOD geometry, screen coordinates, and persistence never own selection-anchor membership.
 
-Drawing semantic mutations reuse this graph: add/remove/style/anchor changes invalidate the drawing layer and update only the affected derived entry, while selection/hover/drag/edit promotion reassembles retained drawing segments without rebuilding geometry and selection changes additionally invalidate the overlay and axis frame for handles. Drawing selection handles are assembled at the beginning of the overlay, preserving their prior canonical order immediately after drawing bodies and before crosshair/series overlays without rebuilding unrelated drawing geometry. Temporary promotion (dragging/editing → hovered → selected → idle, hover gated by `hoveredSeriesOnTop`) never rewrites saved drawing z-order; deselection, hover leave, cancellation, or removal restores it. A selected price-spanning rectangle also emits primary-colored extent tags and a territory band on its bound price scale; those axis views follow creation, drag, and resize coordinates and disappear on deselection unless the drawing explicitly requests persistent axis views. The text tool is an exception: it emits no anchor discs — selection and hover paint the same focus border box (hover at reduced opacity), empty text paints nothing on the chart, and leaving the host editor without typed text removes the drawing. While typing, the host wrap is borderless with transparent glyphs; the engine keeps painting both the label and the focus border underneath, so edit entry cannot lift the text or shift the outline. Crosshair movement and unchanged-coordinate market-data updates do not invalidate drawing geometry. Pane add/remove/swap/move rebuilds pane membership because pane ownership itself changed; ordinary drawing drag updates one entry, and structural removal repairs the canonical vector's id-to-position map.
+Drawing semantic mutations reuse this graph: add/remove/style/anchor changes invalidate the drawing layer and update only the affected derived entry, while selection/hover/drag/edit promotion reassembles retained drawing segments without rebuilding geometry and selection changes additionally invalidate the overlay and axis frame for handles. The one exception is a family drawing that paints some parts only while focused (a note's text, `DrawingFamily::reveals_on_focus`): frame construction keys the hovered and selected drawing among those and rebuilds the drawings layer when that key changes; opening or closing a text-edit session rebuilds it too. Drawing selection handles are assembled at the beginning of the overlay, preserving their prior canonical order immediately after drawing bodies and before crosshair/series overlays without rebuilding unrelated drawing geometry. Temporary promotion (dragging/editing → hovered → selected → idle, hover gated by `hoveredSeriesOnTop`) never rewrites saved drawing z-order; deselection, hover leave, cancellation, or removal restores it. A selected price-spanning rectangle also emits primary-colored extent tags and a territory band on its bound price scale; those axis views follow creation, drag, and resize coordinates and disappear on deselection unless the drawing explicitly requests persistent axis views. The text tool is an exception: it emits no anchor discs — selection and hover paint the same focus border box (hover at reduced opacity), empty text paints nothing on the chart, and leaving the host editor without typed text removes the drawing. While typing, the host wrap is borderless with transparent glyphs; the engine keeps painting both the label and the focus border underneath, so edit entry cannot lift the text or shift the outline. Crosshair movement and unchanged-coordinate market-data updates do not invalidate drawing geometry. Pane add/remove/swap/move rebuilds pane membership because pane ownership itself changed; ordinary drawing drag updates one entry, and structural removal repairs the canonical vector's id-to-position map.
 
 The engine-owned crosshair overlay can paint the same configurable hover marker for every visible line, area, baseline, and line-shaped indicator output at the snapped logical index. Markers ship disabled and hosts opt in per series or indicator output; when enabled, marker coordinates, per-series colors, borders, pane ownership, and scale conversion are resolved before the shared frame reaches any backend. Crosshair and drawing magnets share one pixel-space candidate path: candle, bar, and footprint series expose their rendered OHLC fields, while line, area, histogram, baseline, and other scalar projections expose only the close/value they paint, so hidden storage columns cannot attract an anchor. An empty hovered trend line emits a low-opacity, borderless `+ Add text` run at its configured segment-relative slot; the engine owns its measured hit box and exact caret anchor, including the middle-slot stroke gap, while a browser host owns only the transparent content-editable caret overlay. Clicking either this affordance or existing trend text enters inline editing, and leaving an empty trend edit preserves the drawing. Bar-slot highlights and tooltip guides resolve their default tint from the current chart surface, using a light lift on dark surfaces and a dark tint on light surfaces; overlay price-scale text follows the current layout foreground. Explicit host colors remain authoritative, while implicit colors retokenize with chart options. Chrome that stands for a bar itself — the built-in live price line, its last-value axis chip, and the crosshair marker — follows one shared bar-color resolution. The built-in live price line is one canonical series feature: its default `partial` extent starts at the tracked bar/value and reaches the pane's right edge, while `full` is an explicit per-series option. Both extents use the same source, color, width, and solid/dotted/dashed line-style state, so ordinary series and engine indicator outputs cannot drift in thickness or dash semantics. Explicit user-created horizontal price-line objects remain full-width independent chart objects. For candlesticks that resolution walks the parts in paint order, body then border then wick, skipping any part that is transparent or switched off, so a hollow candle (a transparent body over a visible border frame, industry-standard) keeps its bullish or bearish color instead of resolving to an invisible fill. Bar presentation remains engine-owned as well: OHLC bars keep one vertical high/low body and independently gate the open and close ticks, so setting both visibility flags false produces an explicit high-low bar without a host-side geometry fork.
 
@@ -727,6 +1286,17 @@ explicit colored caret at the engine's exact anchor and angle, leaving the frame
 owner. Its selection pseudo-element is transparent as well, preventing browser selection/IME paint
 from leaking theme-colored duplicate glyphs during live transforms.
 Standalone Text retains its separate create/remove lifecycle and explicit toolbar text input.
+Family text boxes open the same transparent surface, as a native `textarea` because their text
+may span lines (Shift+Enter inserts a line; paste inserts plain text), laid out from the engine's
+`drawing_text_edit_layout`: lines left-aligned at the box's text edge and a caret positioned by
+line and column. After every keystroke the host relays the surface out from the engine, because a
+box can grow upward (a comment) or both ways (a centered callout). All three modes share the engine text-edit session,
+so a whole edit is one undo step and Escape restores the text without a history entry. A
+double-click on a selected drawing, or Enter or F2 on the chart or its accessibility drawing target
+(the target keeps Enter for geometry editing), opens the editor on whatever the engine reports
+`drawing_text_editable`; the editor is a labeled `textbox`, announces opening and closing through
+the accessibility live region, and returns focus to the element it was opened from inside the
+chart.
 
 Segment-following text is an explicit `RotatedText` frame primitive carrying the final aligned
 anchor, clockwise angle, font, weight, italics, size, color, and text; no executor reconstructs
@@ -840,24 +1410,34 @@ Markdown documentation may live at the root or beside the component it explains 
 
 ## Verification
 
-The standard gates mirror CI:
+The standard gates mirror CI (`.github/workflows/ci.yml`, in its order):
 
 ```text
+node packages/charts/scripts/namespace_guard.mjs
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy -p aeris_charts_wasm --target wasm32-unknown-unknown --locked -- -D warnings
 cargo test --workspace --locked
-cargo run -p aeris_charts_native --example perf_gate --release
+AERIS_CHARTS_PERF_STRICT=1 cargo run -p aeris_charts_native --example perf_gate --release
 
 cd packages/charts
 npm ci
 npm run lint
 npm run build
+node ../../benchmarks/benchmark.mjs size   # CI runs it from the repository root
 npm run typecheck
+npm run check:api
+npm run check:release-gates
 npm run test:pack
 ```
 
-The release performance gate also measures a 100,000-visible-bar volume-profile refresh through frame construction and verifies that unchanged frames retain the calculation revision.
+An intentional public-API change regenerates the snapshot with `npm run update:api` (a write
+step, not a gate) before `check:api`. CI also requires the portable browser suite
+(`AERIS_CHARTS_PORTABLE_BROWSER=1 npx playwright test` in `examples/web_demo` after
+`npm ci && npm run build` there) and the native GPUI tests
+(`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`).
+
+The release performance gate also measures a 100,000-visible-bar volume-profile refresh through frame construction and verifies that unchanged frames retain the calculation revision. Its Target M binds every built-in indicator kind plus aggregate-input studies to one 1,000,000-row candle source and its volume series and times current-bar replacements and candle-then-volume appends through the public engine path against a 1 ms per-tick budget. Its Target N times the same live ticks, each followed by one frame, with five regression trends anchored across a 1,000,000-row source against the same budget.
 
 Run Playwright for browser behavior, rendering, interaction, packaging, or parity changes. Run GPUI parity and replay checks for GPUI executor changes. The pixel-parity harness enforces the crosshair icon image against native rendering with at most one channel value of blending-rounding difference. Changes to the icon source or masks also run `node examples/web_demo/build_crosshair_icon.mjs --check`.
 

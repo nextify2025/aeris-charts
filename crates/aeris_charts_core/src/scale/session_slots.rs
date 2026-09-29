@@ -186,15 +186,71 @@ pub fn session_slot_times(
             seconds: interval_seconds,
         });
     }
+    let mut placed = [(0, 0); MAX_SESSION_WINDOWS];
+    let placed_count = place_windows(day, windows, time, &mut placed)?;
+    let bounds = &placed[..placed_count];
+    let interval = i64::from(interval_seconds);
+    let mut count = u64::from(convention == SessionSlotConvention::BarCloseWithOpen);
+    for &(utc_start, utc_end) in bounds {
+        count += (utc_end - utc_start).div_euclid(interval) as u64
+            + u64::from((utc_end - utc_start).rem_euclid(interval) != 0);
+        if count > MAX_SESSION_SLOTS as u64 {
+            return Err(SessionSlotError::TooManySlots { count });
+        }
+    }
+    let mut slots = Vec::with_capacity(count as usize);
+    if convention == SessionSlotConvention::BarCloseWithOpen {
+        slots.push(bounds[0].0);
+    }
+    for &(start, end) in bounds {
+        let mut open = start;
+        while open < end {
+            let close = (open + interval).min(end);
+            slots.push(match convention {
+                SessionSlotConvention::BarOpen => open,
+                SessionSlotConvention::BarClose | SessionSlotConvention::BarCloseWithOpen => close,
+            });
+            open = close;
+        }
+    }
+    Ok(slots)
+}
+
+/// UTC `(open, close)` of every session window of trading date `day`, placed exactly as
+/// [`session_slot_times`] places them: chronological, non-overlapping, one entry per window.
+/// Resampling hosts derive their period boundaries from these.
+pub fn session_window_bounds(
+    day: i64,
+    windows: &[SessionWindow],
+    time: &ExchangeTime,
+) -> Result<Vec<(i64, i64)>, SessionSlotError> {
+    let mut placed = [(0, 0); MAX_SESSION_WINDOWS];
+    let count = place_windows(day, windows, time, &mut placed)?;
+    Ok(placed[..count].to_vec())
+}
+
+/// Validate one trading day's windows and place them into `out` without allocating; returns
+/// the number of placed windows.
+fn place_windows(
+    day: i64,
+    windows: &[SessionWindow],
+    time: &ExchangeTime,
+    out: &mut [(i64, i64); MAX_SESSION_WINDOWS],
+) -> Result<usize, SessionSlotError> {
+    if windows.is_empty() {
+        return Err(SessionSlotError::NoWindows);
+    }
+    if windows.len() > MAX_SESSION_WINDOWS {
+        return Err(SessionSlotError::TooManyWindows {
+            count: windows.len(),
+        });
+    }
     // Days reachable from the supported timestamp range, with a day of margin for placement.
     if !(MIN_TIMESTAMP / DAY - 1..=MAX_TIMESTAMP / DAY + 1).contains(&day) {
         return Err(SessionSlotError::OutOfRange);
     }
     let session_start = i64::from(time.session_start_seconds());
     let evening_day = time.trading_day_start_local(day).div_euclid(DAY);
-    let interval = i64::from(interval_seconds);
-    let mut bounds = Vec::with_capacity(windows.len());
-    let mut count = u64::from(convention == SessionSlotConvention::BarCloseWithOpen);
     let mut previous_end: Option<i64> = None;
     for (index, window) in windows.iter().enumerate() {
         let (start, end) = (
@@ -230,34 +286,139 @@ pub fn session_slot_times(
             return Err(SessionSlotError::UnorderedWindow { index });
         }
         previous_end = Some(utc_end);
-        count += (utc_end - utc_start).div_euclid(interval) as u64
-            + u64::from((utc_end - utc_start).rem_euclid(interval) != 0);
-        if count > MAX_SESSION_SLOTS as u64 {
-            return Err(SessionSlotError::TooManySlots { count });
-        }
-        bounds.push((utc_start, utc_end));
+        out[index] = (utc_start, utc_end);
     }
-    let first = bounds[0].0;
-    let last = bounds[bounds.len() - 1].1;
-    if first < MIN_TIMESTAMP || last > MAX_TIMESTAMP {
+    let count = windows.len();
+    if out[0].0 < MIN_TIMESTAMP || out[count - 1].1 > MAX_TIMESTAMP {
         return Err(SessionSlotError::OutOfRange);
     }
-    let mut slots = Vec::with_capacity(count as usize);
-    if convention == SessionSlotConvention::BarCloseWithOpen {
-        slots.push(first);
-    }
-    for (start, end) in bounds {
-        let mut open = start;
-        while open < end {
-            let close = (open + interval).min(end);
-            slots.push(match convention {
-                SessionSlotConvention::BarOpen => open,
-                SessionSlotConvention::BarClose | SessionSlotConvention::BarCloseWithOpen => close,
+    Ok(count)
+}
+
+/// Where a print outside every session window goes when bars are anchored to sessions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutOfSessionPolicy {
+    /// Keep every print: one before the trading day's first window (the opening-auction print)
+    /// joins that window's first bar, and one after a window closes (the closing print, a lunch
+    /// or after-hours print) joins that window's last bar.
+    #[default]
+    Fold,
+    /// Leave prints outside the windows out of every bar, except prints stamped in a window's
+    /// closing second (the closing-auction print), which close that window's last bar.
+    Exclude,
+}
+
+/// Session-anchored bar opens. Each session window restarts the bar grid at its own open, so a
+/// 60-minute A-share bar opens at 09:30, 10:30, 13:00 and 14:00 exchange time on every trading
+/// day, and the last bar of a window ends at its close. An interval of one day spans the whole
+/// trading day: one bar opening at the day's first window. Windows are placed per trading day of
+/// the exchange time exactly as [`session_slot_times`] places them, so bar opens stay on exchange
+/// hours across DST.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionBarGrid {
+    windows: Vec<SessionWindow>,
+    interval_seconds: u32,
+    time: ExchangeTime,
+    policy: OutOfSessionPolicy,
+}
+
+impl SessionBarGrid {
+    /// Validate `windows` (as [`session_slot_times`] does) and an interval of 1 second to 1 day.
+    /// Bar opens are computed for real UTC instants, so the calendar-date flag of `time` is
+    /// ignored.
+    pub fn new(
+        windows: Vec<SessionWindow>,
+        interval_seconds: u32,
+        time: &ExchangeTime,
+        policy: OutOfSessionPolicy,
+    ) -> Result<Self, SessionSlotError> {
+        if !(1..=86_400).contains(&interval_seconds) {
+            return Err(SessionSlotError::InvalidInterval {
+                seconds: interval_seconds,
             });
-            open = close;
         }
+        // Structural validation, independent of the offset schedule: place the windows on an
+        // ordinary Wednesday (1970-01-07) in UTC with the same session start.
+        let structure = ExchangeTime::new(
+            crate::scale::exchange_time::UtcOffsetSchedule::utc(),
+            time.session_start_seconds(),
+        )
+        .map_err(|_| SessionSlotError::OutOfRange)?;
+        place_windows(6, &windows, &structure, &mut [(0, 0); MAX_SESSION_WINDOWS])?;
+        let mut time = time.clone();
+        time.set_calendar_dates(false);
+        Ok(Self {
+            windows,
+            interval_seconds,
+            time,
+            policy,
+        })
     }
-    Ok(slots)
+
+    pub fn windows(&self) -> &[SessionWindow] {
+        &self.windows
+    }
+
+    pub fn interval_seconds(&self) -> u32 {
+        self.interval_seconds
+    }
+
+    pub fn policy(&self) -> OutOfSessionPolicy {
+        self.policy
+    }
+
+    /// The exchange time the windows are placed in (calendar-date flag cleared).
+    pub fn exchange_time(&self) -> &ExchangeTime {
+        &self.time
+    }
+
+    /// UTC open of the bar containing the whole-second instant `time`, or `None` for a print the
+    /// [`OutOfSessionPolicy::Exclude`] policy leaves out. An instant inside a window of the
+    /// previous trading day (a window reaching past the next session start) stays in that
+    /// window. Errors when the windows cannot be placed on the instant's trading day (a DST
+    /// transition that collapses a window); callers choose their fallback. Allocation-free: at
+    /// most two trading days are placed per call.
+    pub fn bar_open(&self, time: i64) -> Result<Option<i64>, SessionSlotError> {
+        let day = self.time.trading_day(time);
+        let mut placed = [(0, 0); MAX_SESSION_WINDOWS];
+        let count = place_windows(day, &self.windows, &self.time, &mut placed)?;
+        if time < placed[0].0 {
+            let mut previous = [(0, 0); MAX_SESSION_WINDOWS];
+            if let Ok(previous_count) =
+                place_windows(day - 1, &self.windows, &self.time, &mut previous)
+            {
+                if time < previous[previous_count - 1].1 {
+                    return Ok(self.locate(time, &previous[..previous_count]));
+                }
+            }
+        }
+        Ok(self.locate(time, &placed[..count]))
+    }
+
+    fn locate(&self, time: i64, bounds: &[(i64, i64)]) -> Option<i64> {
+        let interval = i64::from(self.interval_seconds);
+        let open_in = |index: usize, at: i64| {
+            if interval >= DAY {
+                bounds[0].0
+            } else {
+                let open = bounds[index].0;
+                open + (at - open).div_euclid(interval) * interval
+            }
+        };
+        let Some(index) = bounds
+            .partition_point(|&(open, _)| open <= time)
+            .checked_sub(1)
+        else {
+            return (self.policy == OutOfSessionPolicy::Fold).then(|| open_in(0, bounds[0].0));
+        };
+        let close = bounds[index].1;
+        if time < close {
+            return Some(open_in(index, time));
+        }
+        (self.policy == OutOfSessionPolicy::Fold || time == close)
+            .then(|| open_in(index, close - 1))
+    }
 }
 
 #[cfg(test)]
@@ -666,5 +827,246 @@ mod tests {
             session_slot_times(date, &long, 1, &time, SessionSlotConvention::BarOpen),
             Err(SessionSlotError::TooManySlots { .. })
         ));
+    }
+
+    /// Exchange-local `"YYYY-MM-DD HH:MM:SS"` to UTC seconds.
+    fn at(time: &ExchangeTime, text: &str) -> i64 {
+        let (date, clock) = text.split_once(' ').unwrap();
+        time.offsets()
+            .to_utc(day(date) * DAY + i64::from(parse_wall_clock(clock, false).unwrap()))
+    }
+
+    fn open_label(time: &ExchangeTime, grid: &SessionBarGrid, text: &str) -> Option<String> {
+        grid.bar_open(at(time, text))
+            .unwrap()
+            .map(|open| local(time, open))
+    }
+
+    #[test]
+    fn window_bounds_match_the_slot_placement() {
+        let time = shanghai(0);
+        let bounds = session_window_bounds(day("2026-09-25"), &a_share(), &time).unwrap();
+        let labels: Vec<_> = bounds
+            .iter()
+            .map(|&(open, close)| (local(&time, open), local(&time, close)))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                (
+                    "2026-09-25 09:30".to_string(),
+                    "2026-09-25 11:30".to_string()
+                ),
+                (
+                    "2026-09-25 13:00".to_string(),
+                    "2026-09-25 15:00".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            session_window_bounds(day("2026-09-25"), &[], &time),
+            Err(SessionSlotError::NoWindows)
+        );
+    }
+
+    #[test]
+    fn a_share_hour_bars_open_at_each_window_and_fold_auction_prints() {
+        let time = shanghai(0);
+        let grid = SessionBarGrid::new(a_share().to_vec(), 3_600, &time, OutOfSessionPolicy::Fold)
+            .unwrap();
+        for (trade, open) in [
+            ("2026-09-25 09:30:00", "2026-09-25 09:30"),
+            ("2026-09-25 10:29:59", "2026-09-25 09:30"),
+            ("2026-09-25 10:30:00", "2026-09-25 10:30"),
+            ("2026-09-25 11:29:59", "2026-09-25 10:30"),
+            // The afternoon grid restarts at 13:00, not at 12:30 of a single 09:30 anchor.
+            ("2026-09-25 13:00:00", "2026-09-25 13:00"),
+            ("2026-09-25 13:59:59", "2026-09-25 13:00"),
+            ("2026-09-25 14:00:00", "2026-09-25 14:00"),
+            // Opening auction (09:25), the 11:30 print, a lunch print, and the closing auction.
+            ("2026-09-25 09:25:00", "2026-09-25 09:30"),
+            ("2026-09-25 11:30:00", "2026-09-25 10:30"),
+            ("2026-09-25 12:10:00", "2026-09-25 10:30"),
+            ("2026-09-25 15:00:00", "2026-09-25 14:00"),
+            ("2026-09-25 15:20:00", "2026-09-25 14:00"),
+        ] {
+            assert_eq!(
+                open_label(&time, &grid, trade).as_deref(),
+                Some(open),
+                "{trade}"
+            );
+        }
+        let minutes =
+            SessionBarGrid::new(a_share().to_vec(), 60, &time, OutOfSessionPolicy::Exclude)
+                .unwrap();
+        for (trade, open) in [
+            ("2026-09-25 09:25:00", None),
+            ("2026-09-25 09:30:59", Some("2026-09-25 09:30")),
+            ("2026-09-25 11:30:00", Some("2026-09-25 11:29")),
+            ("2026-09-25 11:30:01", None),
+            ("2026-09-25 12:10:00", None),
+            ("2026-09-25 13:00:00", Some("2026-09-25 13:00")),
+            ("2026-09-25 15:00:00", Some("2026-09-25 14:59")),
+            ("2026-09-25 15:05:00", None),
+        ] {
+            assert_eq!(
+                open_label(&time, &minutes, trade).as_deref(),
+                open,
+                "{trade}"
+            );
+        }
+        // One day spans the trading day, lunch included.
+        let daily =
+            SessionBarGrid::new(a_share().to_vec(), 86_400, &time, OutOfSessionPolicy::Fold)
+                .unwrap();
+        for trade in [
+            "2026-09-25 09:25:00",
+            "2026-09-25 11:00:00",
+            "2026-09-25 14:59:59",
+            "2026-09-25 15:00:00",
+        ] {
+            assert_eq!(
+                open_label(&time, &daily, trade).as_deref(),
+                Some("2026-09-25 09:30"),
+                "{trade}"
+            );
+        }
+        assert_eq!(
+            open_label(&time, &daily, "2026-09-28 09:31:00").as_deref(),
+            Some("2026-09-28 09:30")
+        );
+    }
+
+    #[test]
+    fn session_bar_opens_stay_on_exchange_hours_across_dst() {
+        let ts = |date: &str, hour: i64| day(date) * DAY + hour * HOUR;
+        let new_york = ExchangeTime::new(
+            UtcOffsetSchedule::new(vec![
+                UtcOffsetTransition {
+                    from_utc_seconds: ts("2023-11-05", 6),
+                    offset_seconds: -5 * 3_600,
+                },
+                UtcOffsetTransition {
+                    from_utc_seconds: ts("2024-03-10", 7),
+                    offset_seconds: -4 * 3_600,
+                },
+            ])
+            .unwrap(),
+            0,
+        )
+        .unwrap();
+        let grid = SessionBarGrid::new(
+            vec![window("09:30", "16:00")],
+            3_600,
+            &new_york,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        for date in ["2024-03-08", "2024-03-11"] {
+            assert_eq!(
+                open_label(&new_york, &grid, &format!("{date} 09:45:00")).as_deref(),
+                Some(format!("{date} 09:30").as_str())
+            );
+            // The last bar of the session is the short 15:30-16:00 bar.
+            assert_eq!(
+                open_label(&new_york, &grid, &format!("{date} 15:59:59")).as_deref(),
+                Some(format!("{date} 15:30").as_str())
+            );
+        }
+        assert_eq!(
+            grid.bar_open(at(&new_york, "2024-03-11 09:45:00")).unwrap(),
+            Some(ts("2024-03-11", 13) + 1_800)
+        );
+        assert_eq!(
+            grid.bar_open(at(&new_york, "2024-03-08 09:45:00")).unwrap(),
+            Some(ts("2024-03-08", 14) + 1_800)
+        );
+    }
+
+    #[test]
+    fn night_sessions_and_windows_past_the_session_start_keep_their_trading_day() {
+        let time = shanghai(-3 * 3_600);
+        let session = vec![
+            window("21:00", "02:30"),
+            window("09:00", "10:15"),
+            window("10:30", "11:30"),
+            window("13:30", "15:00"),
+        ];
+        let grid = SessionBarGrid::new(session, 3_600, &time, OutOfSessionPolicy::Fold).unwrap();
+        for (trade, open) in [
+            ("2026-09-28 21:10:00", "2026-09-28 21:00"),
+            ("2026-09-29 01:59:00", "2026-09-29 01:00"),
+            ("2026-09-29 02:20:00", "2026-09-29 02:00"),
+            // After the night session closes: folds into its last (short) bar.
+            ("2026-09-29 02:40:00", "2026-09-29 02:00"),
+            ("2026-09-29 08:59:00", "2026-09-29 02:00"),
+            ("2026-09-29 09:00:00", "2026-09-29 09:00"),
+            ("2026-09-29 10:20:00", "2026-09-29 10:00"),
+            ("2026-09-29 10:30:00", "2026-09-29 10:30"),
+            // Friday evening opens Monday's trading day.
+            ("2026-09-25 21:30:00", "2026-09-25 21:00"),
+        ] {
+            assert_eq!(
+                open_label(&time, &grid, trade).as_deref(),
+                Some(open),
+                "{trade}"
+            );
+        }
+        // A midnight session start with a window crossing midnight: the early-morning part of
+        // the window belongs to the previous trading day's window.
+        let utc = ExchangeTime::default();
+        let late = SessionBarGrid::new(
+            vec![window("08:00", "12:00"), window("22:00", "02:00")],
+            3_600,
+            &utc,
+            OutOfSessionPolicy::Exclude,
+        )
+        .unwrap();
+        assert_eq!(
+            open_label(&utc, &late, "2026-09-26 01:30:00").as_deref(),
+            Some("2026-09-26 01:00")
+        );
+        assert_eq!(open_label(&utc, &late, "2026-09-26 03:00:00"), None);
+    }
+
+    #[test]
+    fn session_bar_grids_validate_their_input() {
+        let time = shanghai(0);
+        assert_eq!(
+            SessionBarGrid::new(a_share().to_vec(), 0, &time, OutOfSessionPolicy::Fold),
+            Err(SessionSlotError::InvalidInterval { seconds: 0 })
+        );
+        assert_eq!(
+            SessionBarGrid::new(a_share().to_vec(), 86_401, &time, OutOfSessionPolicy::Fold),
+            Err(SessionSlotError::InvalidInterval { seconds: 86_401 })
+        );
+        assert_eq!(
+            SessionBarGrid::new(
+                vec![window("13:00", "15:00"), window("09:30", "11:30")],
+                60,
+                &time,
+                OutOfSessionPolicy::Fold
+            ),
+            Err(SessionSlotError::UnorderedWindow { index: 1 })
+        );
+        assert_eq!(
+            SessionBarGrid::new(Vec::new(), 60, &time, OutOfSessionPolicy::Fold),
+            Err(SessionSlotError::NoWindows)
+        );
+        // Calendar-date presentation does not change where instants fall.
+        let mut calendar = time.clone();
+        calendar.set_calendar_dates(true);
+        let grid = SessionBarGrid::new(
+            a_share().to_vec(),
+            3_600,
+            &calendar,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        assert!(!grid.exchange_time().calendar_dates());
+        assert_eq!(
+            open_label(&time, &grid, "2026-09-25 13:10:00").as_deref(),
+            Some("2026-09-25 13:00")
+        );
     }
 }

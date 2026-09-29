@@ -552,7 +552,7 @@ impl ChartEngine {
     /// Crosshair time label, honoring a host `timeFormatter` when installed. Otherwise the
     /// engine's `localization.dateFormat` pattern with the locale month-name table (reference
     /// chart-options-defaults.ts:34-37), in exchange wall-clock time.
-    pub(super) fn format_crosshair_ts(&self, ts: i64) -> String {
+    pub(crate) fn format_crosshair_ts(&self, ts: i64) -> String {
         if let Some(s) = self.host_time_label(ts) {
             return s;
         }
@@ -1846,12 +1846,7 @@ impl ChartEngine {
                 s.pane_index == pi && s.price_scale_target == PriceScaleTarget::Right && s.visible
             });
             for drawing in &self.drawings {
-                if drawing.pane_index != pi
-                    || !matches!(
-                        drawing.kind,
-                        DrawingKind::HorizontalLine | DrawingKind::HorizontalRay
-                    )
-                {
+                if drawing.pane_index != pi || !drawing.kind.spec().axis_price_label {
                     continue;
                 }
                 let Some(point) = drawing.points.first() else {
@@ -2480,13 +2475,23 @@ impl ChartEngine {
         // whitespace slots, and an all-whitespace series has no forming bar yet.
         let anchor = plot.last_non_whitespace_row_before(plot.size())?;
         // Up to 11 slots around it (→ 10 deltas) feed the interval inference. Whitespace slots
-        // count, so the first traded bar of a pre-filled session still has a neighbour.
-        let times = self.data.merged_times();
+        // count, so the first traded bar of a pre-filled session still has a neighbour. An as-of
+        // overlay forms its own bars, so it infers from its own rows rather than the points
+        // repeating them.
+        let (times, anchor, len) = if plot.is_as_of() {
+            let (times, _) = self.data.series_data(id)?;
+            (times, plot.source_row(anchor), times.len())
+        } else {
+            (self.data.merged_times(), anchor, plot.size())
+        };
         let time_at = |row: usize| {
+            if plot.is_as_of() {
+                return times.get(row).copied();
+            }
             plot.index_at(row)
                 .and_then(|index| times.get(index as usize).copied())
         };
-        let window_end = (anchor + 1).min(plot.size() - 1);
+        let window_end = (anchor + 1).min(len - 1);
         let tail_times: Vec<i64> = (window_end.saturating_sub(10)..=window_end)
             .filter_map(time_at)
             .collect();

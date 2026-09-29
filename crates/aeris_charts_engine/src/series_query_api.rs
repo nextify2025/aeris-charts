@@ -386,6 +386,7 @@ impl ChartEngine {
         insert("area_top_color", verbatim(&s.area_top_color).into());
         insert("area_bottom_color", verbatim(&s.area_bottom_color).into());
         insert("invert_filled_area", s.invert_filled_area.into());
+        insert("break_on_trading_day", s.break_on_trading_day.into());
         insert("histogram_updown", s.histogram_updown.into());
         insert(
             "histogram_updown_rule",
@@ -462,6 +463,15 @@ impl ChartEngine {
         insert("price_scale_id", price_scale_id.into());
         insert("pane", s.pane_index.into());
         insert("price_format", price_format);
+        let (time_alignment, max_staleness) = match self.data.time_alignment(id) {
+            Some(TimeAlignment::AsOf { max_staleness }) => ("as_of", max_staleness),
+            _ => ("union", None),
+        };
+        insert("time_alignment", time_alignment.into());
+        insert(
+            "as_of_max_staleness",
+            max_staleness.map_or(serde_json::Value::Null, Into::into),
+        );
         Some(serde_json::Value::Object(out).to_string())
     }
 
@@ -695,6 +705,11 @@ impl ChartEngine {
                         s.invert_filled_area = v;
                     }
                 }
+                "break_on_trading_day" => {
+                    if let Some(v) = value.as_bool() {
+                        s.break_on_trading_day = v;
+                    }
+                }
                 "open_visible" => {
                     if let Some(v) = value.as_bool() {
                         s.open_visible = v;
@@ -740,7 +755,12 @@ impl ChartEngine {
     fn series_point_at_row(&self, id: SeriesId, row: usize) -> Option<SeriesDataPoint> {
         let plot = self.data.plot(id);
         let index = plot.index_at(row)?;
-        let time = self.axis_time_key_at(index as usize)?;
+        // An as-of overlay point shows one of the series' own rows: report that row's time.
+        let time = if plot.is_as_of() {
+            *self.data.series_data(id)?.0.get(plot.source_row(row))?
+        } else {
+            self.axis_time_key_at(index as usize)?
+        };
         Some(SeriesDataPoint {
             time,
             open: plot.value_at(row, PlotValueIndex::Open),
@@ -761,6 +781,23 @@ impl ChartEngine {
     }
 
     pub fn series_data(&self, id: SeriesId) -> Vec<SeriesDataPoint> {
+        if self.data.plot(id).is_as_of() {
+            // An as-of overlay's data is its own rows, not the time points that show them.
+            let Some((times, columns)) = self.data.series_data(id) else {
+                return Vec::new();
+            };
+            return times
+                .iter()
+                .enumerate()
+                .map(|(row, &time)| SeriesDataPoint {
+                    time,
+                    open: columns[0][row],
+                    high: columns[1][row],
+                    low: columns[2][row],
+                    close: columns[3][row],
+                })
+                .collect();
+        }
         let size = self.data.plot(id).size();
         (0..size)
             .filter_map(|row| self.series_point_at_row(id, row))
@@ -835,7 +872,12 @@ impl ChartEngine {
         if !value.is_finite() {
             return None;
         }
-        let time = self.axis_time_key_at(plot.index_at(row)? as usize)?;
+        let time = if plot.is_as_of() {
+            // The as-of bar's own time, like `data()`.
+            *self.data.series_data(id)?.0.get(plot.source_row(row))?
+        } else {
+            self.axis_time_key_at(plot.index_at(row)? as usize)?
+        };
         let formatted = self.format_series_resolved(series, value);
         Some(
             serde_json::json!({

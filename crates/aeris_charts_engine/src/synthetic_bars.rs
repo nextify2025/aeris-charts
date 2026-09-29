@@ -78,7 +78,8 @@ impl core::fmt::Display for SyntheticBarError {
             }
             Self::SequenceDomainInUse => write!(
                 f,
-                "a chart can own only one independent non-time bar sequence"
+                "a chart can own only one independent non-time bar sequence, and none beside \
+                 time-resampled series"
             ),
             Self::Capacity => write!(
                 f,
@@ -487,10 +488,12 @@ impl crate::ChartEngine {
                 crate::FootprintBarAggregation::Time { .. }
             )
         });
-        if other_synthetic || non_time_stream {
+        if other_synthetic || non_time_stream || !self.resampled_series.is_empty() {
             return Err(SyntheticBarError::SequenceDomainInUse);
         }
         let aggregator = SyntheticBarAggregator::new(options)?;
+        // Synthetic bars live on the non-time sequence axis; an as-of overlay rejoins the union.
+        self.rejoin_time_union(id);
         self.synthetic_series.insert(id, aggregator);
         self.refresh_synthetic_bar_projection(id)
     }
@@ -565,8 +568,7 @@ impl crate::ChartEngine {
             .get(&id)
             .ok_or(SyntheticBarError::UnknownSeries(id))?
             .bars_at(self.replay_clock_micros())?;
-        let (points, open, high, low, close) = projection_columns(&bars);
-        if self.install_sequence_projection_inner(id, points, open, high, low, close) {
+        if self.install_sequence_projection_inner(id, None, projection_columns(&bars)) {
             Ok(())
         } else {
             Err(SyntheticBarError::InvalidSource { index: 0 })

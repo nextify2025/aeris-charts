@@ -52,7 +52,10 @@ late event can correctly change the classification of later ambiguous events.
 
 The aggregation model supports aligned time bars, fixed trade-count bars, whole-trade volume bars,
 and tick-grid range bars. A trade is never split to hit an exact volume or range threshold. A new session always starts a new
-bar. Time bars retain their whole-second display projection; trade-count, volume, and range bars
+bar. Time bars align to the configured anchor, or, once the host anchors the stream to exchange
+session windows, restart at every window open in the chart's exchange time with out-of-window
+prints folded into the nearest bar of their trading day or excluded (see `Public_api.md`, "Ticks to
+candles"). Time bars retain their whole-second display projection; trade-count, volume, and range bars
 are chart-integrated through a chart-local logical row key and an engine-owned sequence sidecar.
 That sidecar carries each bar's full-resolution open/close microsecond bounds for labels, crosshair,
 and visible-range lookup, so several bars in one second are never assigned false timestamps.
@@ -61,7 +64,8 @@ The chart retires the sidecar when its last non-time footprint and dependent are
 later time-only series cannot inherit stale logical labels.
 Non-time tip updates replace only the affected suffix and keep derived delta studies on the same
 logical row keys, including capped series: retention drops row keys from the front without re-keying,
-so later tips, studies, and bubble markers continue from the projection's first retained key. Trade
+so later tips, studies, and bubble markers continue from the projection's first retained key, and a
+footprint, candle/bar, or study bound after a trim installs from that same key. Trade
 bubbles also use logical bar indices while their aggregation windows retain microsecond comparison
 precision.
 Chart value snapshots and series queries expose the corresponding UTC-second label instead of the
@@ -103,15 +107,24 @@ data without rebuilding the tape.
 `ChartEngine::add_trade_stream` creates one bounded stream keyed by a host instrument identity.
 The stream owns classification, canonical ordering, corrections, retention, and a monotonic revision;
 footprints, CVD, delta histograms, and bubble markers bind to that identity rather than retaining a
-second provider-event tape. CVD supports session, continuous, and anchored resets. Delta dependents
-read final delta, Max/Min Delta, delta percentage, and bid/ask/unknown volumes from the same bars.
+second provider-event tape. CVD supports session, continuous, and anchored resets. Retention never
+rewrites the CVD values of retained bars: the stream carries the evicted bars' session and continuous
+cumulative delta as seeds, and an anchored CVD keeps the base its evicted bars established (a CVD
+created after its anchor bar was evicted anchors at the first retained bar). Delta dependents
+read final delta, Max/Min Delta, delta percentage, and bid/ask/unknown volumes from the same bars,
+and the volume dependent reads each bar's total volume for ordinary tick-built candles.
 
 Large-trade bubbles are bounded marker dependents: translucent circles centred on the traded price,
 colored by aggressor side, with area proportional to volume relative to the largest retained bubble.
 They support minimum-volume filtering, optional same-side same-price consecutive-print aggregation
-(merged volume sets the size), and a hard marker cap that retains the newest prints. Late events refresh
-all dependents after one canonical rebuild; stream telemetry reports revision, retained capacity,
-dependent count, and dependent rebuilds.
+within one bar (merged volume sets the size), and a hard marker cap that retains the newest prints.
+On time bars a bubble carries the open of the bar holding its print, so it paints on that bar even
+when session anchoring folds an auction or lunch print into it; an excluded print has no bubble, and
+an id-less marker is named by its print's own second. Rebuilds and live tips run the same resumable
+fold, so both place, merge, and size bubbles identically. Late events refresh all dependents after
+one canonical rebuild; stream telemetry reports revision, retained capacity, dependent count,
+dependent rebuilds and incremental updates, and lifetime work counters for study rows computed, bar
+rows projected, bubble trades folded, and bubble marker sizes computed.
 
 ## 4. Rendering and LOD
 
@@ -147,20 +160,38 @@ Every backend therefore receives exactly the same chosen LOD.
 ## 5. Storage, invalidation, and recovery
 
 One chart-level stream owns one canonical trade tape and one derived bar vector. A footprint series
-owns only visual options and a stream handle; CVD, delta, and bubble dependents own no provider tape.
+owns only visual options and a stream handle; CVD, delta, volume, and bubble dependents own no
+provider tape.
 A bar owns sorted price levels;
 there is no renderer-side cluster cache. Tip append mutates only the active bar or appends one bar,
-updates its canonical scale projection, and invalidates that series. CVD/delta studies recompute only
-that suffix from a cached running fold, and bubble markers fold only the appended trades (no work
-without bubble dependents); `trade_stream_stats` reports both as work counters. Closed bars are immutable on the
+projects only that changed suffix into the footprint and any bound candles/bars (also under a
+retention ceiling), and invalidates those series. CVD/delta/volume studies recompute only that suffix
+(CVD from a cached running fold), and bubble markers fold only the appended trades (no work without bubble
+dependents): they size only new or merged bubbles and rescale every retained marker only when the
+peak bubble volume changes. `trade_stream_stats` reports each as a work counter, and every tip
+result equals a clean rebuild of that dependent. The tip that crosses a retention ceiling (once per
+hysteresis margin, 1/32 of the cap) evicts the leading bars, exactly the trades they aggregated, and
+the bubbles made only of those trades in place: it reconstructs nothing and never scans the
+retained tape, so its work is proportional to the evicted trades plus the retained rows (renumbering
+the retained bars and the data layer's own trim of the affected rows).
+Closed bars are immutable on the
 live path. Historical insertion/correction reconstructs canonical state once after the final tape is
 known and replaces the projection once. The current reconstruction is intentionally full-series;
 work statistics expose that cost so suffix checkpoints can be added when measurements justify them.
 
-Vectors and the trade-ID index reuse their allocated capacity. Series retention evicts complete old
-bars and their source trades together while preserving the classification/session seed needed by the
-remaining tape; no orphan tape or derived history survives. Engine memory telemetry includes tape,
-levels, the ID index, and retained capacities.
+Vectors, the tape deque, and the trade-ID index reuse their allocated capacity. Series retention
+evicts complete old bars and the trades they aggregated together (counted per bar, so a trade sharing
+its microsecond with the next bar's open stays with its own bar, and a session-anchored bar's folded
+opening-auction print, stamped before the bar's open, leaves with that bar; prints the session policy
+excludes join no bar, so eviction steps over them and takes those stamped before the first retained
+bar's first print) while preserving the
+classification/session/cumulative-delta seed needed by the remaining tape; no orphan tape or derived
+history survives. The ID index keeps absolute tape positions, so eviction removes only the evicted
+IDs, and replay checkpoints inside the retained suffix are re-addressed rather than rebuilt. Every
+footprint bound to the stream drops the same rows, since footprint geometry reads stream bar `i` for
+row `i`. Bubble folds materialize markers only for retained bubbles, so a refold over a long tape
+holds at most `max_markers` markers. Engine memory telemetry includes tape, levels, the ID index,
+bubble folds, and retained capacities.
 
 Device loss is irrelevant to this model: the headless tape and derived bars remain intact while the
 browser executor falls back. Renderer caches are rebuilt from the same frame contract.
@@ -181,7 +212,8 @@ methods create CVD, delta, and bounded bubble dependents and query stream revisi
 
 Options cover tick size, ticks per row, time-bar interval/anchor or trade-count/volume/range construction, imbalance
 ratio/minimum/consecutive count, visual cell modes, colors, text size, summaries, and generic series
-retention. Changing tick size, ticks per row, or time aggregation rebuilds from the tape atomically. Visual-only
+retention. Changing tick size, ticks per row, or time aggregation rebuilds from the tape atomically, keeping
+prints the replay clock hides, the retention seed, and session anchoring; bound candles/bars follow. Visual-only
 options invalidate only the series frame layer.
 
 Host callbacks receive derived snapshots only through ordinary chart query/event paths. Aeris Terminal
@@ -202,9 +234,13 @@ budget; this measures scheduling and upload preparation, not device present time
 The sustained native release baseline remains Target D: 2,500 retained one-minute bars with 100
 trades per bar, a 100-bar live batch, and a 10-bar correction batch. Its budgets are 300 ms for
 historical load, 50 ms for the live batch, 300 ms for correction, and 16.67 ms for frame
-construction, with retention bounded to the configured history. Commands and thresholds are kept
-in the release examples so a clean `--release` run can be compared without importing machine-
-specific timings into the repository.
+construction, with retention bounded to the configured history. It then streams 9,000 single-trade
+live tips (crossing the retention ceiling once) into the chart with bound candles, CVD, delta, and
+bubbles, requires every tip's work counters to stay within the changed bar suffix and the new
+trade with no tape reconstruction, budgets the tip p99 at 0.25 ms, and budgets the slowest tip (the
+one crossing the ceiling) at one 16.67 ms frame. Commands and thresholds are kept in the release
+examples so a clean `--release` run can be compared without importing machine-specific timings into
+the repository; `perf_gate` prints the measured tip p99 and slowest tip against these budgets.
 
 The finite GPUI real-window probe was also exercised on the current Windows display with the
 footprint fixture: 30 frames at DPR 1.25 and 500 source bars produced 24 cached text runs (zero
@@ -229,8 +265,8 @@ The capture image remains a transient milestone artifact; the command and metada
 here so the evidence can be reproduced without adding binary fixtures to the repository.
 
 Deterministic synthetic tapes cover grid boundaries, unknown-side handling, quote/tick-rule
-classification, equal timestamps and sequences, late events, corrections, session resets, all bar
-modes, bid/ask/total/delta levels, POC ties, mean-reverting Max/Min Delta paths, both imbalance sides,
+classification, equal timestamps and sequences, late events, corrections, session resets,
+session-anchored time bars through live tips and retention, all bar modes, bid/ask/total/delta levels, POC ties, mean-reverting Max/Min Delta paths, both imbalance sides,
 and stacked-run breaks. Frame tests cover every shipped LOD and primitive ordering. Browser tests
 exercise the same engine-built frame through Canvas2D and WebGPU as well as typed ingest and public
 queries; GPUI and native consume those existing backend-neutral primitive kinds without footprint
