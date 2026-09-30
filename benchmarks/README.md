@@ -44,7 +44,7 @@ Environment classification defaults to `local`; shared workflows set `shared-ci`
 
 `shared.mjs` uses a versioned xorshift32 generator. A generator version, unsigned seed, start time, interval, start price, volatility, point count, series count, and pane count identify the dataset. Generated rows always satisfy `high >= open/close`, `low <= open/close`, and `high >= low`. Core sizes are 1K, 10K, 100K, 500K, and 1M candlesticks. Dataset creation occurs before timed installs.
 
-Canonical scenario definitions live in `scenarios.json`; this is intentionally a small manifest rather than a benchmark DSL. Scenario IDs and versions make methodology changes explicit. A material change creates a new scenario version instead of silently rewriting history. Workloads cover startup, historical loading, current-candle and append streaming, pan/zoom/crosshair input, lifecycle retention, multi-chart, multi-series/multi-pane scaling, a five-series/100K-row Phase 2 general dashboard, retained current-candle updates across 1/2/4/8/16 series and one/four panes, and soak stability. Retained scenarios record semantic rebuild counts plus WebGPU allocation, write, and upload volume alongside frame CPU percentiles. Native evidence additionally measures every representative indicator on 10K/100K/1M histories, typed-equivalent batches of 1/10/100/1K/10K rows, 1/4/8/16 mixed indicators on one source, and one active source across 1/2/4/8/16 source/indicator-pane pairs.
+Canonical scenario definitions live in `scenarios.json`; this is intentionally a small manifest rather than a benchmark DSL. Scenario IDs and versions make methodology changes explicit. A material change creates a new scenario version instead of silently rewriting history. Workloads cover startup, historical loading, current-candle and append streaming, pan/zoom/crosshair input, lifecycle retention, multi-chart, multi-series/multi-pane scaling, a five-series/100K-row Phase 2 general dashboard, retained current-candle updates across 1/2/4/8/16 series and one/four panes, and soak stability. Retained scenarios record semantic rebuild counts plus WebGPU allocation, write, and upload volume alongside frame CPU percentiles. Native evidence additionally measures every representative indicator on 10K/100K/1M histories, typed-equivalent batches of 1/10/100/1K/10K rows, 1/4/8/16 mixed indicators on one source, and one active source across 1/2/4/8/16 source/indicator-pane pairs. `crosshair-reset-studies-daily-2520` (Canvas2D forced, release profile) loads 2,520 daily candles with session VWAP, VWAP bands, and standard pivots, eleven outputs that each draw one bar-wide segment per bar because every bar is its own period, and traces the crosshair across them. It records the interval and study set in the dataset configuration, isolates the executor cost of period-reset studies, and its `canvas2d_ops`, `frame_cpu_ms`, and long-task samples are the evidence for the batched `Segments` primitive.
 
 ## Timing and statistics
 
@@ -131,6 +131,14 @@ ceilings rather than inheriting an open-ended exception.
 Phase 2 adds release-blocking maxima for `general-dashboard-100k`: p50 startup through the first following rAF
 must stay at or below 2,000 ms, and first-frame WebGPU vertex uploads must stay at or below 96 MiB. These are
 guardrails for catastrophic host regressions, not cross-machine performance claims.
+
+`crosshair-reset-studies-daily-2520` adds a release-blocking maximum of 4,500 Canvas2D paint operations per crosshair
+frame (p50). Before the period-reset studies' one-bar segments were batched into one `Segments` primitive per output,
+the scenario painted 31,116 operations per frame in headless Chromium 141 (Canvas2D forced, 1280x720, software
+raster); the same chart without studies paints 3,822 and with batching 3,884. The ceiling sits just above the batched
+count, leaving room for platform label differences, and far below the unbatched one, so a return to one stroke per bar
+fails the gate. It bounds operation count only: the measured frame CPU (`frame_cpu_ms` p50 63.8 ms before, 11.8 ms
+after, 5.0 ms without studies) is machine-dependent and stays report-only.
 
 These byte counts are reproducible filesystem/compression evidence, not an official wall-clock
 benchmark or a public performance claim. A deliberate size increase must explain the product

@@ -40,8 +40,8 @@ function samples(name, values, unit, direction, visibility, methodology, availab
 }
 
 function scenario_dataset(scenario) {
-  const dataset = dataset_metadata(scenario.points ?? 0, seed, { series_count: scenario.series_counts?.at(-1) ?? 1, pane_count: scenario.pane_counts?.at(-1) ?? 1 });
-  dataset.configuration.scenario = Object.fromEntries(Object.entries(scenario).filter(([key]) => !["id", "description", "profiles", "visibility", "warmup_runs", "measured_runs", "points", "version", "kind"].includes(key)));
+  const dataset = dataset_metadata(scenario.points ?? 0, seed, { series_count: scenario.series_counts?.at(-1) ?? 1, pane_count: scenario.pane_counts?.at(-1) ?? 1, interval_seconds: scenario.interval_seconds, studies: scenario.studies });
+  dataset.configuration.scenario = Object.fromEntries(Object.entries(scenario).filter(([key]) => !["id", "description", "profiles", "visibility", "warmup_runs", "measured_runs", "points", "version", "kind", "interval_seconds", "studies"].includes(key)));
   return dataset;
 }
 
@@ -264,7 +264,7 @@ async function interaction(page, scenario) {
   const rows = [];
   let backend = null;
   for (let run = 0; run < scenario.warmup_runs + scenario.measured_runs; run += 1) {
-    const prepared = await page.evaluate((input) => globalThis.__Aeris_bench.prepare_interaction(input.points, input.seed), { ...scenario, seed });
+    const prepared = await page.evaluate((input) => globalThis.__Aeris_bench.prepare_interaction(input.points, input.seed, { interval_seconds: input.interval_seconds, studies: input.studies, backend: input.backend }), { ...scenario, seed });
     backend = prepared.backend;
     const canvas = page.locator("#bench-root canvas").last();
     const box = await canvas.boundingBox();

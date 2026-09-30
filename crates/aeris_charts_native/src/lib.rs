@@ -657,38 +657,35 @@ pub fn render_engine_rgba(
     })
 }
 
-fn remap_prim_points(prim: Prim, base: u32) -> Prim {
-    match prim {
-        Prim::Polyline {
-            first_point,
-            point_count,
-            width,
-            style,
-            line_type,
-            color,
-        } => Prim::Polyline {
-            first_point: first_point + base,
-            point_count,
-            width,
-            style,
-            line_type,
-            color,
-        },
-        Prim::AreaFill {
-            first_point,
-            point_count,
-            base_y,
-            line_type,
-            gradient,
-        } => Prim::AreaFill {
-            first_point: first_point + base,
-            point_count,
-            base_y,
-            line_type,
-            gradient,
-        },
-        other => other,
+/// Rebase `prim`'s point-pool indices by `base`, where the image export concatenates every pane's
+/// pool into one. The match is exhaustive so a pool-indexed prim cannot be forgotten and silently
+/// read another pane's points.
+fn remap_prim_points(mut prim: Prim, base: u32) -> Prim {
+    match &mut prim {
+        Prim::Polyline { first_point, .. }
+        | Prim::Segments { first_point, .. }
+        | Prim::AreaFill { first_point, .. } => *first_point += base,
+        Prim::BandFill {
+            upper_first,
+            lower_first,
+            ..
+        } => {
+            *upper_first += base;
+            *lower_first += base;
+        }
+        Prim::Rect { .. }
+        | Prim::RectFrame { .. }
+        | Prim::HLine { .. }
+        | Prim::VLine { .. }
+        | Prim::RoundRect { .. }
+        | Prim::Circle { .. }
+        | Prim::Triangle { .. }
+        | Prim::Background { .. }
+        | Prim::Text { .. }
+        | Prim::RotatedText { .. }
+        | Prim::Image { .. } => {}
     }
+    prim
 }
 
 /// Result of comparing two rasterized images pixel-by-pixel.
@@ -760,6 +757,88 @@ mod tests {
     };
     use aeris_charts_render::draw_list::{Gradient, IRect};
     use std::sync::Arc;
+
+    #[test]
+    fn remap_rebases_every_pool_indexed_prim() {
+        let c = Color::rgb(1, 2, 3);
+        let rebased = |prim| remap_prim_points(prim, 100);
+        assert_eq!(
+            rebased(Prim::Polyline {
+                first_point: 4,
+                point_count: 3,
+                width: 1.0,
+                style: aeris_charts_render::draw_list::LineStyle::Solid,
+                line_type: aeris_charts_render::draw_list::LineType::Simple,
+                color: c,
+            }),
+            Prim::Polyline {
+                first_point: 104,
+                point_count: 3,
+                width: 1.0,
+                style: aeris_charts_render::draw_list::LineStyle::Solid,
+                line_type: aeris_charts_render::draw_list::LineType::Simple,
+                color: c,
+            }
+        );
+        assert_eq!(
+            rebased(Prim::Segments {
+                first_point: 4,
+                segment_count: 5,
+                width: 1.0,
+                color: c,
+            }),
+            Prim::Segments {
+                first_point: 104,
+                segment_count: 5,
+                width: 1.0,
+                color: c,
+            }
+        );
+        let gradient = Gradient { top: c, bottom: c };
+        assert_eq!(
+            rebased(Prim::AreaFill {
+                first_point: 4,
+                point_count: 3,
+                base_y: 9.0,
+                line_type: aeris_charts_render::draw_list::LineType::Simple,
+                gradient,
+            }),
+            Prim::AreaFill {
+                first_point: 104,
+                point_count: 3,
+                base_y: 9.0,
+                line_type: aeris_charts_render::draw_list::LineType::Simple,
+                gradient,
+            }
+        );
+        // Both boundaries of a band fill move (they were skipped before).
+        assert_eq!(
+            rebased(Prim::BandFill {
+                upper_first: 4,
+                lower_first: 10,
+                point_count: 3,
+                line_type: aeris_charts_render::draw_list::LineType::Simple,
+                fill: c,
+            }),
+            Prim::BandFill {
+                upper_first: 104,
+                lower_first: 110,
+                point_count: 3,
+                line_type: aeris_charts_render::draw_list::LineType::Simple,
+                fill: c,
+            }
+        );
+        let rect = Prim::Rect {
+            rect: IRect {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+            },
+            color: c,
+        };
+        assert_eq!(rebased(rect.clone()), rect, "prims without a pool window");
+    }
 
     #[test]
     fn fills_a_rect_at_expected_pixels() {

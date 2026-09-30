@@ -36,16 +36,7 @@ pub(super) fn push_line_stroke(
         });
         return;
     }
-    let device: Vec<LinePoint> = window
-        .iter()
-        .map(|p| LinePoint {
-            x: p[0] as f64,
-            y: p[1] as f64,
-        })
-        .collect();
-    let expanded = expand_line(&device, line_type);
-    let pattern: Vec<f64> = pattern.iter().map(|&len| len as f64).collect();
-    for run in dash_split(&expanded, &pattern) {
+    for run in dash_runs(window, &pattern, line_type) {
         let first = points.len() as u32;
         points.extend(run.iter().map(|p| [p.x as f32, p.y as f32]));
         out.push(Prim::Polyline {
@@ -56,6 +47,65 @@ pub(super) fn push_line_stroke(
             line_type: LineType::Simple,
             color,
         });
+    }
+}
+
+/// The solid "on" runs of `window` under a dash `pattern` (device px): the window is expanded with
+/// `line_type` first, so dashes follow the rendered path, then split with the pattern starting
+/// "on" at the first point.
+fn dash_runs(window: &[[f32; 2]], pattern: &[f32], line_type: LineType) -> Vec<Vec<LinePoint>> {
+    let device: Vec<LinePoint> = window
+        .iter()
+        .map(|p| LinePoint {
+            x: p[0] as f64,
+            y: p[1] as f64,
+        })
+        .collect();
+    let expanded = expand_line(&device, line_type);
+    let pattern: Vec<f64> = pattern.iter().map(|&len| len as f64).collect();
+    dash_split(&expanded, &pattern)
+}
+
+/// Append the strokes of one lone run's one-bar `segment` to `points` as independent point pairs
+/// and return the pair count: one pair for a solid style, one per dash piece for a dashed one
+/// (expanded and split like [`push_line_stroke`], the pattern restarting at every bar). The caller
+/// owns the pool window between its first append and the `Prim::Segments` it flushes, so nothing
+/// else may append to `points` in between.
+fn append_segment_pairs(
+    points: &mut Vec<[f32; 2]>,
+    segment: &[[f32; 2]; 2],
+    width: f32,
+    style: LineStyle,
+    line_type: LineType,
+) -> u32 {
+    let pattern = style.dash_pattern(width);
+    if pattern.is_empty() {
+        points.extend_from_slice(segment);
+        return 1;
+    }
+    let mut pairs = 0;
+    for run in dash_runs(segment, &pattern, line_type) {
+        for pair in run.windows(2) {
+            points.extend(pair.iter().map(|p| [p.x as f32, p.y as f32]));
+            pairs += 1;
+        }
+    }
+    pairs
+}
+
+/// Emit the lone-run pairs collected in `batch` (first pool index, pair count) as one
+/// `Prim::Segments` and clear it. A batch that gathered no pair (every dash piece degenerate)
+/// emits nothing.
+fn flush_segments(out: &mut Vec<Prim>, batch: &mut Option<(u32, u32)>, width: f32, color: Color) {
+    if let Some((first_point, segment_count)) = batch.take() {
+        if segment_count > 0 {
+            out.push(Prim::Segments {
+                first_point,
+                segment_count,
+                width,
+                color,
+            });
+        }
     }
 }
 
@@ -1216,6 +1266,8 @@ impl ChartEngine {
                 }
             } else {
                 let width = (rs.line_width * vpr) as f32;
+                // The plain stroke's pending lone runs: (first pool index, pair count).
+                let mut batch: Option<(u32, u32)> = None;
                 for run in &runs {
                     let segment = lone_segment(run);
                     match &resolved {
@@ -1266,16 +1318,30 @@ impl ChartEngine {
                         }
                         None => {
                             if let Some(segment) = segment {
-                                push_line_stroke(
-                                    out,
+                                // Lone runs gather into one batch of point pairs; a study that
+                                // resets every bar would otherwise emit a polyline per bar.
+                                let (_, pairs) = batch.get_or_insert((points.len() as u32, 0));
+                                *pairs += append_segment_pairs(
                                     points,
                                     &segment,
                                     width,
                                     rs.line_style,
                                     rs.line_type,
-                                    color,
                                 );
-                            } else if rs.line_style == LineStyle::Solid {
+                                // A solid batch is one pair per lone run, and a lone run is at
+                                // least one drawn row; dashes split a bar into several pairs.
+                                debug_assert!(
+                                    rs.line_style != LineStyle::Solid
+                                        || *pairs as usize <= rows.len(),
+                                    "{pairs} solid segments for {} rows",
+                                    rows.len()
+                                );
+                                continue;
+                            }
+                            // Every other emission flushes the batch first: the prims keep run
+                            // order, and the batch's pool window stays contiguous.
+                            flush_segments(out, &mut batch, width, color);
+                            if rs.line_style == LineStyle::Solid {
                                 out.push(Prim::Polyline {
                                     first_point: first + run.start as u32,
                                     point_count: run.len() as u32,
@@ -1298,6 +1364,7 @@ impl ChartEngine {
                         }
                     }
                 }
+                flush_segments(out, &mut batch, width, color);
             }
         }
         if rs.point_markers {

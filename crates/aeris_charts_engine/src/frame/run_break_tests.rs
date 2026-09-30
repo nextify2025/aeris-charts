@@ -114,10 +114,44 @@ fn settle(chart: &mut ChartEngine) -> ChartFrame {
     chart.build_frame()
 }
 
-/// Point lists of the price pane's polylines stroked in `color`, in paint order.
+/// Point lists of the price pane's strokes in `color`, in paint order: one list per polyline, and
+/// one two-point list per pair of a `Segments` batch (a lone run, however it was emitted).
 fn strokes(frame: &ChartFrame, color: Color) -> Vec<Vec<[f32; 2]>> {
     let pane = &frame.panes[0];
-    pane.main
+    let mut out = Vec::new();
+    for prim in &pane.main {
+        match prim {
+            Prim::Polyline {
+                first_point,
+                point_count,
+                color: stroke,
+                ..
+            } if *stroke == color => out.push(
+                pane.points[*first_point as usize..(*first_point + *point_count) as usize].to_vec(),
+            ),
+            Prim::Segments {
+                first_point,
+                segment_count,
+                color: stroke,
+                ..
+            } if *stroke == color => out.extend(
+                pane.points[*first_point as usize..(*first_point + 2 * *segment_count) as usize]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| pair.to_vec()),
+            ),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The price pane's prims stroked in `color`: `(polylines, segment batches)` in paint order as
+/// `(is_batch, pool window)`, where a window is `(first_point, point_count)`.
+fn stroke_windows(frame: &ChartFrame, color: Color) -> Vec<(bool, (usize, usize))> {
+    frame.panes[0]
+        .main
         .iter()
         .filter_map(|prim| match prim {
             Prim::Polyline {
@@ -125,9 +159,15 @@ fn strokes(frame: &ChartFrame, color: Color) -> Vec<Vec<[f32; 2]>> {
                 point_count,
                 color: stroke,
                 ..
-            } if *stroke == color => Some(
-                pane.points[*first_point as usize..(*first_point + *point_count) as usize].to_vec(),
-            ),
+            } if *stroke == color => Some((false, (*first_point as usize, *point_count as usize))),
+            Prim::Segments {
+                first_point,
+                segment_count,
+                color: stroke,
+                ..
+            } if *stroke == color => {
+                Some((true, (*first_point as usize, 2 * *segment_count as usize)))
+            }
             _ => None,
         })
         .collect()
@@ -747,4 +787,319 @@ fn an_as_of_vwap_breaks_on_the_row_it_resets_on() {
         Some(SeriesHitKind::Line),
         "session D stays one run"
     );
+}
+
+/// Distinct stroke color of the study output at `index`.
+fn output_color(index: usize) -> Color {
+    Color::rgb(0, 0, index as u8 + 1)
+}
+
+/// `rows` daily candles from 2024-01-01 with session VWAP, session VWAP bands, and standard pivots
+/// (11 outputs), each output in its own color. On daily bars every bar is its own period.
+fn daily_studies(rows: usize) -> (ChartEngine, Vec<SeriesId>) {
+    let times: Vec<f64> = (0..rows as i64)
+        .map(|day| (MONDAY_2024 + day * DAY) as f64)
+        .collect();
+    let close: Vec<f64> = (0..rows).map(|day| 10.0 + day as f64 * 0.25).collect();
+    let open: Vec<f64> = close.iter().map(|value| value - 0.1).collect();
+    let high: Vec<f64> = close.iter().map(|value| value + 0.3).collect();
+    let low: Vec<f64> = close.iter().map(|value| value - 0.4).collect();
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    let mut outputs = vec![chart.add_vwap(0, None).unwrap()];
+    outputs.extend(chart.add_vwap_bands(0, None, VwapReset::Session, 1.0, 5.0));
+    outputs.extend(chart.add_pivot_points(0, PivotKind::Standard));
+    assert_eq!(outputs.len(), 11);
+    for (index, &output) in outputs.iter().enumerate() {
+        apply(
+            &mut chart,
+            output,
+            &format!(r##"{{"color":"#0000{:02x}"}}"##, index + 1),
+        );
+    }
+    (chart, outputs)
+}
+
+/// The one-bar segments an output draws in the frame's device px: one pair per finite row,
+/// `half_bar` to each side of the bar's x, at the row's price.
+fn expected_segments(chart: &ChartEngine, output: SeriesId) -> Vec<Vec<[f32; 2]>> {
+    let hpr = chart.pane_w.round().max(1.0) / chart.pane_w.max(1.0);
+    let vpr = chart.pane_h.round().max(1.0) / chart.pane_h.max(1.0);
+    let half = chart.time_scale.bar_spacing() * hpr / 2.0;
+    let (_, columns) = chart.data.series_data(output).unwrap();
+    columns[3]
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .map(|(row, &value)| {
+            let x = chart.time_scale.index_to_coordinate(row as i64) * hpr;
+            let y = chart.series_price_to_coordinate(output, value).unwrap() * vpr;
+            vec![[(x - half) as f32, y as f32], [(x + half) as f32, y as f32]]
+        })
+        .collect()
+}
+
+fn assert_pairs_match(actual: &[Vec<[f32; 2]>], expected: &[Vec<[f32; 2]>], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: pair count");
+    for (index, (pair, want)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(pair.len(), 2, "{label}: pair {index}");
+        for (point, want) in pair.iter().zip(want) {
+            assert!(
+                (point[0] - want[0]).abs() < 1e-3 && (point[1] - want[1]).abs() < 1e-3,
+                "{label}: pair {index} is {pair:?}, expected {want:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn daily_reset_studies_emit_one_batch_per_output() {
+    let (mut chart, outputs) = daily_studies(60);
+    let frame = settle(&mut chart);
+    for (index, &output) in outputs.iter().enumerate() {
+        let color = output_color(index);
+        let windows = stroke_windows(&frame, color);
+        assert_eq!(
+            windows.iter().filter(|(batch, _)| *batch).count(),
+            1,
+            "output {index} batches its lone runs"
+        );
+        assert_eq!(
+            windows.iter().filter(|(batch, _)| !*batch).count(),
+            0,
+            "output {index} draws no two-point polyline"
+        );
+        let expected = expected_segments(&chart, output);
+        assert!(
+            expected.len() >= 50,
+            "output {index} draws a segment per finite bar"
+        );
+        assert_pairs_match(
+            &strokes(&frame, color),
+            &expected,
+            &format!("output {index}"),
+        );
+    }
+}
+
+#[test]
+fn interleaved_lone_and_long_runs_keep_order_and_pool_offsets() {
+    // Session VWAP over days of 1, 4, 1, 1, and 3 minute rows: lone, long, lone, lone, long.
+    let shape = [1usize, 4, 1, 1, 3];
+    let mut times = Vec::new();
+    for (day, &rows) in shape.iter().enumerate() {
+        for minute in 0..rows {
+            times.push((MONDAY + day as i64 * DAY + 90 * 60 + minute as i64 * 60) as f64);
+        }
+    }
+    let price: Vec<f64> = (0..times.len())
+        .map(|row| 10.0 + row as f64 * 0.5)
+        .collect();
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Line;
+    install(&mut chart, 0, &times, &price);
+    let average = chart.add_vwap(0, None).unwrap();
+    apply(&mut chart, average, r##"{"color":"#123456"}"##);
+    let frame = settle(&mut chart);
+
+    let windows = stroke_windows(&frame, AVERAGE);
+    let kinds: Vec<(bool, usize)> = windows
+        .iter()
+        .map(|&(batch, (_, len))| (batch, if batch { len / 2 } else { len }))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![(true, 1), (false, 4), (true, 2), (false, 3)],
+        "Segments(1), Polyline(4), Segments(2), Polyline(3) in run order"
+    );
+    // Every window lies inside the pool and none overlaps another (or the series' own points).
+    let pool = frame.panes[0].points.len();
+    let mut spans: Vec<(usize, usize)> = windows
+        .iter()
+        .map(|&(_, (first, len))| (first, first + len))
+        .collect();
+    assert!(spans.iter().all(|&(_, end)| end <= pool));
+    spans.sort_unstable();
+    assert!(
+        spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+        "{spans:?}"
+    );
+    // The batched pairs are the one-bar segments of the lone days, horizontal and in day order.
+    let pairs = strokes(&frame, AVERAGE);
+    let lone: Vec<&Vec<[f32; 2]>> = pairs.iter().filter(|pair| pair.len() == 2).collect();
+    assert_eq!(lone.len(), 3);
+    assert!(lone.iter().all(|pair| pair[0][1] == pair[1][1]));
+    assert!(lone[0][0][0] < lone[1][0][0] && lone[1][0][0] < lone[2][0][0]);
+}
+
+#[test]
+fn dashed_lone_runs_batch_pairs() {
+    let (mut chart, outputs) = daily_studies(20);
+    let vwap = outputs[0];
+    apply(&mut chart, vwap, r##"{"color":"#000001","line_style":2}"##);
+    let frame = settle(&mut chart);
+    let color = output_color(0);
+    let windows = stroke_windows(&frame, color);
+    assert_eq!(windows.len(), 1, "one batch, no lone-run polyline");
+    assert!(windows[0].0);
+
+    // The pairs are the dash pieces of each bar's one-bar segment; the pattern restarts per bar.
+    let width = frame.panes[0]
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Segments {
+                width, color: c, ..
+            } if *c == color => Some(*width),
+            _ => None,
+        })
+        .unwrap();
+    let pattern: Vec<f64> = LineStyle::Dashed
+        .dash_pattern(width)
+        .iter()
+        .map(|&len| f64::from(len))
+        .collect();
+    let mut expected = Vec::new();
+    for segment in expected_segments(&chart, vwap) {
+        let line: Vec<LinePoint> = segment
+            .iter()
+            .map(|p| LinePoint {
+                x: f64::from(p[0]),
+                y: f64::from(p[1]),
+            })
+            .collect();
+        for run in dash_split(&line, &pattern) {
+            expected.push(
+                run.iter()
+                    .map(|p| [p.x as f32, p.y as f32])
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    assert!(
+        expected.len() > 20,
+        "a one-bar segment is longer than one dash, so bars split into several pieces"
+    );
+    assert_pairs_match(&strokes(&frame, color), &expected, "dashed");
+}
+
+/// The retained (pool-relative) layer a series was built into, before frame assembly rebases it.
+fn retained_layer(chart: &ChartEngine, id: SeriesId) -> &RetainedLayer {
+    &chart.retained_frame.panes[0]
+        .series_layers
+        .iter()
+        .find(|layer| layer.id == id)
+        .expect("the series has a retained layer")
+        .layer
+}
+
+#[test]
+fn batched_segments_survive_retained_layer_assembly() {
+    // Indicators paint below ordinary series unless the order is explicit, which would put the
+    // study's layer first in the pane pool (rebase 0) and prove nothing. An explicit order puts the
+    // price line's layer ahead of the study, so assembly moves the study's batch by the points
+    // already in the pane pool.
+    let rows = 40;
+    let times: Vec<f64> = (0..rows as i64)
+        .map(|day| (MONDAY_2024 + day * DAY) as f64)
+        .collect();
+    let close: Vec<f64> = (0..rows).map(|day| 10.0 + day as f64 * 0.25).collect();
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Line;
+    install(&mut chart, 0, &times, &close);
+    apply(&mut chart, 0, r##"{"color":"#654321"}"##);
+    let vwap = chart.add_vwap(0, None).unwrap();
+    apply(&mut chart, vwap, r##"{"color":"#123456"}"##);
+    assert!(chart.set_series_order(vec![0, vwap]));
+    let frame = settle(&mut chart);
+
+    // The study's layer was built with its batch at its own layer-relative index.
+    let layer = retained_layer(&chart, vwap);
+    let own_first = layer
+        .prims
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Segments { first_point, .. } => Some(*first_point as usize),
+            _ => None,
+        })
+        .expect("the study layer carries its batch");
+    let price_points = retained_layer(&chart, 0).points.len();
+    assert!(
+        price_points >= rows,
+        "the price line's layer has its own points"
+    );
+
+    let windows = stroke_windows(&frame, AVERAGE);
+    assert_eq!(windows.len(), 1);
+    assert!(windows[0].0);
+    let (first, len) = windows[0].1;
+    // Assembly rebased it past the price line's points and everything else ahead of the layer.
+    assert!(
+        first >= own_first + price_points,
+        "the batch at {first} was not moved past the {price_points} price points (layer-relative {own_first})"
+    );
+    assert!(first + len <= frame.panes[0].points.len());
+    // The layer's whole pool lands at the rebased offset, so every index it holds stays valid.
+    let base = first - own_first;
+    assert_eq!(
+        &frame.panes[0].points[base..base + layer.points.len()],
+        layer.points.as_slice()
+    );
+    assert_pairs_match(
+        &strokes(&frame, AVERAGE),
+        &expected_segments(&chart, vwap),
+        "assembled",
+    );
+    assert_eq!(
+        strokes(&frame, PRICE).len(),
+        1,
+        "the price line stays whole"
+    );
+
+    // A cursor-only rebuild reassembles the retained layers at the same offsets: same prims, same
+    // pool.
+    assert!(chart.set_crosshair_position(12.0, times[20], 0));
+    let cursor = chart.build_frame();
+    assert_eq!(chart.frame_build_stats().series_rebuilds, 0);
+    assert_eq!(cursor.panes[0].points, frame.panes[0].points);
+    assert_eq!(
+        stroke_windows(&cursor, AVERAGE),
+        stroke_windows(&frame, AVERAGE)
+    );
+    assert_eq!(strokes(&cursor, AVERAGE), strokes(&frame, AVERAGE));
+}
+
+#[test]
+fn sub_pixel_daily_studies_stay_bounded_and_ordered() {
+    let rows = 25_200;
+    let (mut chart, outputs) = daily_studies(rows);
+    chart.set_min_bar_spacing(0.01);
+    let frame = settle(&mut chart);
+    assert!(chart.time_scale.bar_spacing() < 0.1, "deeply sub-pixel");
+    let device_px = chart.pane_w.round() as usize;
+    let mut segments = 0;
+    for index in 0..outputs.len() {
+        let windows = stroke_windows(&frame, output_color(index));
+        assert_eq!(windows.len(), 1, "output {index}: one batch, no polyline");
+        assert!(windows[0].0);
+        let count = windows[0].1 .1 / 2;
+        assert!(
+            count <= 4 * device_px + 2,
+            "output {index} batches {count} segments for {device_px} device px"
+        );
+        segments += count;
+        // Ascending start x; neighbours touch, so float rounding may order them by an ulp.
+        let starts: Vec<f32> = strokes(&frame, output_color(index))
+            .iter()
+            .map(|pair| pair[0][0])
+            .collect();
+        assert!(
+            starts.windows(2).all(|pair| pair[1] >= pair[0] - 1e-3),
+            "output {index} pairs ascend in x"
+        );
+    }
+    // Each drawn row keeps its own point in the pool, beside its pair's two.
+    assert_eq!(frame.panes[0].points.len(), 3 * segments);
 }

@@ -22,12 +22,12 @@ function host() {
   return element;
 }
 
-async function create(points = 0, seed = 0x02f6e2b1, options = {}, fixture = null) {
+async function create(points = 0, seed = 0x02f6e2b1, options = {}, fixture = null, configuration = {}) {
   const api = await load_package();
   const container = host();
   const chart = await api.create_chart(container, { autoSize: true, ...options });
   const series = chart.add_series("candlestick");
-  const columns = fixture ?? generate_ohlcv(points, seed);
+  const columns = fixture ?? generate_ohlcv(points, seed, configuration);
   if (points > 0) series.set_data_typed(columns);
   const entry = { chart, series, container, columns };
   live.push(entry);
@@ -187,9 +187,22 @@ async function realtime(points, seed, mode, update_rate_hz, duration_ms) {
   };
 }
 
-async function prepare_interaction(points, seed) {
+// The studies that restart at every trading-day boundary. On daily bars every bar is its own period,
+// so each of the 11 outputs (session VWAP, its 5 bands, 5 standard pivot levels) draws one bar-wide
+// segment per visible bar.
+function add_session_reset_studies({ chart, series, columns }) {
+  const volume = chart.add_series("histogram", { visible: false });
+  volume.set_data_typed({ times: columns.times, open: columns.volume, high: columns.volume, low: columns.volume, close: columns.volume });
+  chart.add_vwap(series, volume);
+  chart.add_vwap_bands(series, "session", 1, 1, volume);
+  chart.add_pivot_points(series, "standard");
+}
+
+async function prepare_interaction(points, seed, { interval_seconds, studies, backend } = {}) {
   reset();
-  const entry = await create(points, seed);
+  const entry = await create(points, seed, backend === undefined ? {} : { backend }, null, { interval_seconds });
+  if (studies === "session_reset") add_session_reset_studies(entry);
+  else if (studies !== undefined) throw new Error(`unknown study set ${studies}`);
   const scale = entry.chart.time_scale();
   scale.apply_options({ min_bar_spacing: 1280 / Math.max(points, 1) / 2 });
   scale.set_visible_logical_range({ from: 0, to: Math.max(points - 1, 0) });

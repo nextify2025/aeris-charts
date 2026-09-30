@@ -7,6 +7,8 @@
 //!   Target C — canonical pointer sample:      fixed-capacity resolver under 0.01 ms/sample
 //!   Target D — shared non-time candles/footprint history, live, correction, frame construction,
 //!              and bounded single-trade live tips across every stream dependent
+//!   Target D2 — report-only retention trim of the data layer across series counts and retained
+//!              rows: one `trim_fronts` versus one `trim_front` per series
 //!   Target E — 100k visible-bar volume profile refresh and cached shared frame
 //!   Target F — 100k-point general XY line frame + nearest-hit interaction
 //!   Target G — mixed 100k-row general dashboard frame, hit interaction, and retained memory
@@ -14,9 +16,13 @@
 //!   Target I — 100k-row numeric error bars frame, hit interaction, and retained memory
 //!   Target K — 100x replay clock advance, shared projections, frame work, and flat retained memory
 //!   Target L — sustained depth updates, bounded heatmap frame work, and live-edge upload size
-//!   Target M — per-tick cost of every built-in indicator bound to a 1M-row source
+//!   Target M — per-tick cost of every built-in indicator bound to a 1M-row source, and the
+//!              bounded capacity of the aggregate price columns composite-input studies retain
 //!   Target N — live ticks plus frame construction with regression trends anchored across a
 //!              1M-row source (data-reading drawings follow ticks by the changed rows)
+//!   Target O — daily-reset studies on daily bars: report-only frame, Canvas2D call, rasterizer,
+//!              WebGPU scheduling, and hover cost of the per-bar segments a session-reset study
+//!              draws when every bar is its own period
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
@@ -26,6 +32,7 @@
 
 use std::time::Instant;
 
+use aeris_charts_core::model::data_layer::DataLayer;
 use aeris_charts_engine::{
     AggressorSide, AxisDimension, ChartEngine, ChartFrame, ContinuousScaleType,
     DepthHeatmapOptions, DepthLevel, DepthOptions, DepthSide, DepthSnapshot, DepthUpdate,
@@ -34,6 +41,9 @@ use aeris_charts_engine::{
     GeneralSeriesOptions, GeneralXyInput, GestureResolver, HorizontalDomain, InputDevice,
     InputTarget, PointerSample, SeriesKind, TradeBubbleOptions, TradeStudyOptions,
 };
+use aeris_charts_native::render_prims;
+use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
+use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::Prim;
 use aeris_charts_render_wgpu::{prims_to_group, DrawGroup, TexQuadInstance};
 
@@ -76,6 +86,14 @@ fn report_bytes(label: &str, measured_bytes: usize, budget_bytes: usize) -> bool
         if pass { "PASS" } else { "FAIL" },
         measured_bytes as f64 / (1024.0 * 1024.0),
         budget_bytes as f64 / (1024.0 * 1024.0),
+    );
+    pass
+}
+
+fn report_check(label: &str, pass: bool, detail: &str) -> bool {
+    println!(
+        "  [{}] {label}: {detail}",
+        if pass { "PASS" } else { "FAIL" }
     );
     pass
 }
@@ -192,8 +210,19 @@ struct IndicatorTickCost {
     append_ms: (f64, f64, f64),
     /// The excluded first append after the bulk install.
     first_append_ms: f64,
+    /// Capacity the first append grew across the engine's data columns and indicator runtimes.
+    first_append_growth_bytes: usize,
     /// Largest `last_indicator_work_rows` any measured tick reported.
     max_work_rows: usize,
+}
+
+/// Deterministic `[open, high, low, close]` for `row`; `revision` moves the close so a tick
+/// replacing the forming bar changes its values.
+fn indicator_bar(row: usize, revision: usize) -> [f64; 4] {
+    let base = 100.0 + (row as f64 * 0.0007).sin() * 12.0 + (row as f64 * 0.013).sin() * 1.5;
+    let close = base + revision as f64 * 0.01;
+    let open = base - (row as f64 * 0.31).cos() * 0.4;
+    [open, open.max(close) + 0.35, open.min(close) - 0.3, close]
 }
 
 /// Target M: bind every built-in study kind (plus aggregate-input studies) to one `rows`-row
@@ -210,12 +239,6 @@ fn indicator_tick_cost(
         VwapReset,
     };
 
-    let bar = |row: usize, revision: usize| {
-        let base = 100.0 + (row as f64 * 0.0007).sin() * 12.0 + (row as f64 * 0.013).sin() * 1.5;
-        let close = base + revision as f64 * 0.01;
-        let open = base - (row as f64 * 0.31).cos() * 0.4;
-        [open, open.max(close) + 0.35, open.min(close) - 0.3, close]
-    };
     let volume_at = |row: usize, revision: usize| ((row * 37 + revision) % 900 + 100) as f64;
     // `slots` trailing whitespace rows model a pre-installed session: ticks then fill them in
     // place instead of appending.
@@ -225,7 +248,7 @@ fn indicator_tick_cost(
     for row in 0..rows + slots {
         times.push(row as f64 * 60.0);
         let (values, volume_value) = if row < rows {
-            (bar(row, 0), volume_at(row, 0))
+            (indicator_bar(row, 0), volume_at(row, 0))
         } else {
             ([f64::NAN; 4], f64::NAN)
         };
@@ -382,10 +405,15 @@ fn indicator_tick_cost(
     // (source, volume, and each study output) once. That amortized capacity growth is not per-tick
     // work, so it is reported separately and excluded from the tick statistics.
     let mut last = rows;
+    let before = chart.memory_usage();
     let started = Instant::now();
-    chart.update_series_bar(0, last as f64 * 60.0, bar(last, 0));
+    chart.update_series_bar(0, last as f64 * 60.0, indicator_bar(last, 0));
     chart.update_series_bar(volume, last as f64 * 60.0, [volume_at(last, 0); 4]);
     let first_append_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let after = chart.memory_usage();
+    let first_append_growth_bytes = (after.data.allocated_capacity_bytes
+        + after.indicator_runtime_bytes)
+        .saturating_sub(before.data.allocated_capacity_bytes + before.indicator_runtime_bytes);
 
     let mut replace_ms = Vec::new();
     let mut append_ms = Vec::new();
@@ -394,7 +422,7 @@ fn indicator_tick_cost(
         for revision in 1..=replaces_per_append {
             let time = last as f64 * 60.0;
             let started = Instant::now();
-            chart.update_series_bar(0, time, bar(last, revision));
+            chart.update_series_bar(0, time, indicator_bar(last, revision));
             let volume_value = volume_at(last, revision);
             chart.update_series_bar(volume, time, [volume_value; 4]);
             replace_ms.push(started.elapsed().as_secs_f64() * 1000.0);
@@ -403,7 +431,7 @@ fn indicator_tick_cost(
         last += 1;
         let time = last as f64 * 60.0;
         let started = Instant::now();
-        chart.update_series_bar(0, time, bar(last, 0));
+        chart.update_series_bar(0, time, indicator_bar(last, 0));
         chart.update_series_bar(volume, time, [volume_at(last, 0); 4]);
         append_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
@@ -418,7 +446,106 @@ fn indicator_tick_cost(
         replace_ms: summary(replace_ms),
         append_ms: summary(append_ms),
         first_append_ms,
+        first_append_growth_bytes,
         max_work_rows,
+    }
+}
+
+/// What Target M measures for studies on aggregate price inputs: the capacity their binding-private
+/// price columns hold, as a difference of indicator runtime bytes against the same studies on a
+/// canonical input.
+struct CompositeInputCost {
+    /// Composite minus canonical runtime bytes after the install, after the first append, and
+    /// after the remaining appends.
+    install_bytes: usize,
+    first_append_bytes: usize,
+    final_bytes: usize,
+    /// First append after the install for the canonical and the composite chart (context only).
+    first_append_ms: (f64, f64),
+    /// Mean milliseconds per append after the first, on the composite chart.
+    append_mean_ms: f64,
+}
+
+/// Target M (composite inputs): four studies on `rows` minute candles with no volume series, once
+/// each on Close and once each on Hl2, Hlc3, Ohlc4 and Hlcc4. The two charts carry the same runtime
+/// state except the aggregate price columns, so the byte difference is exactly those columns and
+/// is deterministic where first-append time on a shared machine is not. Charts are built and
+/// dropped one at a time to bound peak memory.
+fn composite_input_cost(rows: usize, appends: usize) -> CompositeInputCost {
+    use aeris_charts_engine::{IndicatorInputSource, IndicatorKind, IndicatorSeed};
+
+    let run = |inputs: [IndicatorInputSource; 4]| {
+        let mut times = Vec::with_capacity(rows);
+        let mut columns: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
+        for row in 0..rows {
+            times.push(row as f64 * 60.0);
+            for (column, value) in columns.iter_mut().zip(indicator_bar(row, 0)) {
+                column.push(value);
+            }
+        }
+        let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+        chart
+            .set_series_data(
+                0,
+                &times,
+                &columns[0],
+                &columns[1],
+                &columns[2],
+                &columns[3],
+            )
+            .expect("valid indicator source");
+        let kinds = [
+            IndicatorKind::Sma { period: 20 },
+            IndicatorKind::Ema {
+                period: 20,
+                seed: IndicatorSeed::Sma,
+            },
+            IndicatorKind::Rsi {
+                period: 14,
+                seed: IndicatorSeed::Sma,
+            },
+            IndicatorKind::StochasticRsi {
+                rsi_period: 14,
+                stochastic_period: 14,
+            },
+        ];
+        for (kind, input) in kinds.into_iter().zip(inputs) {
+            assert!(!chart
+                .add_indicator_kind_with_input(0, input, kind, None)
+                .is_empty());
+        }
+        let runtime_bytes = |chart: &ChartEngine| chart.memory_usage().indicator_runtime_bytes;
+        let install = runtime_bytes(&chart);
+        let started = Instant::now();
+        chart.update_series_bar(0, rows as f64 * 60.0, indicator_bar(rows, 0));
+        let first_append_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let first_append = runtime_bytes(&chart);
+        let mut append_ms = 0.0;
+        for row in rows + 1..=rows + appends {
+            let started = Instant::now();
+            chart.update_series_bar(0, row as f64 * 60.0, indicator_bar(row, 0));
+            append_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        (
+            [install, first_append, runtime_bytes(&chart)],
+            first_append_ms,
+            append_ms / appends as f64,
+        )
+    };
+    let (canonical, canonical_first_ms, _) = run([IndicatorInputSource::Close; 4]);
+    let (composite, composite_first_ms, append_mean_ms) = run([
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ]);
+    let delta = |index: usize| composite[index].saturating_sub(canonical[index]);
+    CompositeInputCost {
+        install_bytes: delta(0),
+        first_append_bytes: delta(1),
+        final_bytes: delta(2),
+        first_append_ms: (canonical_first_ms, composite_first_ms),
+        append_mean_ms,
     }
 }
 
@@ -489,6 +616,353 @@ fn regression_tick_cost(rows: usize, regressions: usize, ticks: usize) -> (f64, 
     samples.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
     (mean, samples[samples.len() / 2], samples[samples.len() - 1])
+}
+
+/// Counts every Canvas2D call one frame issues (the wasm host pays a JS call for each) and the
+/// path-building calls separately.
+#[derive(Default)]
+struct CallCounter {
+    calls: usize,
+    strokes: usize,
+}
+
+impl Canvas2d for CallCounter {
+    fn set_fill_solid(&mut self, _: Color) {
+        self.calls += 1;
+    }
+    fn set_fill_vgradient(&mut self, _: f32, _: f32, _: Color, _: Color) {
+        self.calls += 1;
+    }
+    fn set_stroke(&mut self, _: Color) {
+        self.calls += 1;
+    }
+    fn set_line_width(&mut self, _: f32) {
+        self.calls += 1;
+    }
+    fn set_line_dash(&mut self, _: &[f32]) {
+        self.calls += 1;
+    }
+    fn fill_rect(&mut self, _: f32, _: f32, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn begin_path(&mut self) {
+        self.calls += 1;
+    }
+    fn move_to(&mut self, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn line_to(&mut self, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn close_path(&mut self) {
+        self.calls += 1;
+    }
+    fn arc(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn stroke(&mut self) {
+        self.calls += 1;
+        self.strokes += 1;
+    }
+    fn fill(&mut self) {
+        self.calls += 1;
+    }
+    fn fill_rotated_text(
+        &mut self,
+        _: &str,
+        _: f32,
+        _: f32,
+        _: &str,
+        _: Color,
+        _: aeris_charts_render::draw_list::TextAlign,
+        _: f32,
+    ) {
+        self.calls += 1;
+    }
+}
+
+/// Every layer of `frame` in paint order (under, main, top) with its pane's point pool.
+fn for_each_layer(frame: &ChartFrame, mut visit: impl FnMut(&[Prim], &[[f32; 2]])) {
+    for pane in &frame.panes {
+        for layer in [&pane.under, &pane.main, &pane.top_prims] {
+            visit(layer, &pane.points);
+        }
+    }
+}
+
+/// What Target O measures for one daily-bar chart.
+struct DailyStudyCost {
+    outputs: usize,
+    prims: usize,
+    lone_polylines: usize,
+    batches: usize,
+    batched_pairs: usize,
+    pool_points: usize,
+    rebuild_ms: f64,
+    retained_ms: f64,
+    canvas_calls: usize,
+    canvas_strokes: usize,
+    canvas_counting_ms: f64,
+    raster_ms: f64,
+    group_ms: f64,
+    hit_ms: f64,
+}
+
+/// Target O: `rows` daily candles on a 1600 px chart, fit, optionally with the session-reset studies
+/// that draw one bar-wide segment per bar (session VWAP, VWAP bands, standard pivots). Times one
+/// full series rebuild, one crosshair-only (retained) frame, the Canvas2D call stream and its
+/// tiny-skia rasterization, WebGPU group scheduling, and one pointer hover arbitration.
+fn daily_reset_study_cost(rows: usize, min_bar_spacing: f64, studies: bool) -> DailyStudyCost {
+    use aeris_charts_engine::{IndicatorKind, PivotKind, VwapReset};
+
+    const DAY: f64 = 86_400.0;
+    const START: f64 = 1_789_948_800.0;
+    let times = (0..rows)
+        .map(|row| START + row as f64 * DAY)
+        .collect::<Vec<_>>();
+    let columns: [Vec<f64>; 4] =
+        std::array::from_fn(|column| (0..rows).map(|row| indicator_bar(row, 0)[column]).collect());
+    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &times,
+            &columns[0],
+            &columns[1],
+            &columns[2],
+            &columns[3],
+        )
+        .expect("valid daily source");
+    let mut outputs = 0;
+    if studies {
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let volumes = (0..rows)
+            .map(|row| ((row * 37) % 900 + 100) as f64)
+            .collect::<Vec<_>>();
+        chart
+            .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+            .expect("valid daily volume");
+        chart.set_series_visible(volume, false);
+        for (kind, weighted) in [
+            (IndicatorKind::Vwap, true),
+            (
+                IndicatorKind::VwapBands {
+                    reset: VwapReset::Session,
+                    standard_deviation: 1.0,
+                    percent: 1.0,
+                },
+                true,
+            ),
+            (
+                IndicatorKind::PivotPoints {
+                    variant: PivotKind::Standard,
+                },
+                false,
+            ),
+        ] {
+            outputs += chart
+                .add_indicator_kind(0, kind, weighted.then_some(volume))
+                .len();
+        }
+    }
+    chart.time_scale.set_width(1600.0);
+    chart.set_min_bar_spacing(min_bar_spacing);
+    chart.fit_content();
+    let mut frame = ChartFrame::default();
+    chart.build_frame_into(&mut frame);
+
+    // One full series rebuild: alternate the view by one bar so every coordinate changes.
+    let time_of_last = times[rows - 1];
+    let ranges = [(-0.5, rows as f64 - 0.5), (-1.5, rows as f64 - 1.5)];
+    const REBUILDS: usize = 20;
+    let mut samples = Vec::with_capacity(REBUILDS);
+    for index in 0..REBUILDS {
+        let (from, to) = ranges[index % 2];
+        chart.set_visible_logical_range(from, to);
+        let started = Instant::now();
+        chart.build_frame_into(&mut frame);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let rebuild_ms = samples[samples.len() / 2];
+    chart.set_visible_logical_range(ranges[0].0, ranges[0].1);
+    chart.build_frame_into(&mut frame);
+
+    // Crosshair-only frames: the retained series layer is re-assembled, never rebuilt.
+    const CURSOR_FRAMES: usize = 100;
+    let mut samples = Vec::with_capacity(CURSOR_FRAMES);
+    for index in 0..CURSOR_FRAMES {
+        let time = time_of_last - (index % 2) as f64 * DAY;
+        chart.set_crosshair_position(100.0, time, 0);
+        let started = Instant::now();
+        chart.build_frame_into(&mut frame);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let retained_ms = samples[samples.len() / 2];
+
+    let mut prims = 0;
+    let mut lone_polylines = 0;
+    let mut batches = 0;
+    let mut batched_pairs = 0;
+    let mut pool_points = 0;
+    for pane in &frame.panes {
+        pool_points += pane.points.len();
+        for prim in pane.under.iter().chain(&pane.main).chain(&pane.top_prims) {
+            prims += 1;
+            match prim {
+                Prim::Polyline { point_count: 2, .. } => lone_polylines += 1,
+                Prim::Segments { segment_count, .. } => {
+                    batches += 1;
+                    batched_pairs += *segment_count as usize;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let viewport = Viewport {
+        width: 1600.0,
+        height: 800.0,
+    };
+    let mut counter = CallCounter::default();
+    for_each_layer(&frame, |prims, points| {
+        execute(prims, points, &mut counter, viewport);
+    });
+    const EXECUTIONS: usize = 20;
+    let started = Instant::now();
+    for _ in 0..EXECUTIONS {
+        let mut counter = CallCounter::default();
+        for_each_layer(&frame, |prims, points| {
+            execute(prims, points, &mut counter, viewport);
+        });
+        std::hint::black_box(counter.calls);
+    }
+    let canvas_counting_ms = started.elapsed().as_secs_f64() * 1000.0 / EXECUTIONS as f64;
+
+    // The same stream into a real rasterizer (tiny-skia): a CPU proxy for the browser's 2D stroker,
+    // not a Chromium measurement.
+    const RASTERS: usize = 5;
+    let started = Instant::now();
+    for _ in 0..RASTERS {
+        for_each_layer(&frame, |prims, points| {
+            std::hint::black_box(render_prims(1600, 800, Color::rgb(0, 0, 0), prims, points));
+        });
+    }
+    let raster_ms = started.elapsed().as_secs_f64() * 1000.0 / RASTERS as f64;
+
+    const GROUPS: usize = 20;
+    let started = Instant::now();
+    for _ in 0..GROUPS {
+        let mut group = DrawGroup::default();
+        for_each_layer(&frame, |prims, points| {
+            prims_to_group(
+                prims,
+                points,
+                &mut group,
+                &mut |_: &Prim| None::<TexQuadInstance>,
+                &mut |_: &Prim| None::<TexQuadInstance>,
+            );
+        });
+        std::hint::black_box(group.tris.len());
+    }
+    let group_ms = started.elapsed().as_secs_f64() * 1000.0 / GROUPS as f64;
+
+    const HOVERS: usize = 200;
+    let started = Instant::now();
+    for index in 0..HOVERS {
+        let x = 20.0 + index as f64 * (1500.0 / HOVERS as f64);
+        std::hint::black_box(chart.hit_test_series(x, 200.0));
+    }
+    let hit_ms = started.elapsed().as_secs_f64() * 1000.0 / HOVERS as f64;
+
+    DailyStudyCost {
+        outputs,
+        prims,
+        lone_polylines,
+        batches,
+        batched_pairs,
+        pool_points,
+        rebuild_ms,
+        retained_ms,
+        canvas_calls: counter.calls,
+        canvas_strokes: counter.strokes,
+        canvas_counting_ms,
+        raster_ms,
+        group_ms,
+        hit_ms,
+    }
+}
+
+/// Target D2 (report-only): the data layer's share of one retention trim, across the series count
+/// `S` and the retained rows `N` that shape it together. One retention drops `evicted` rows from
+/// each of the `S` presentations of a stream, which share one timestamp union. Each cell times
+/// one `trim_fronts` against `S` separate `trim_front` calls on identical layers of `S` aligned
+/// OHLC series, and counts the union merges and reindexes each ran. No threshold: the trim still
+/// scales with the retained rows.
+// ponytail: add a threshold with the O(evicted) trim `DataLayer::trim_fronts` defers; the bar is
+// about 2 ms in the S >= 4, N = 28,800 cells.
+fn retention_trim_matrix() {
+    const EVICTED: usize = 80;
+    const RUNS: usize = 7;
+    let layer = |series: usize, rows: usize| {
+        let (times, open, high, low, close) = gen_series(rows, 0.0);
+        let times = times.iter().map(|&time| time as i64).collect::<Vec<_>>();
+        let mut data = DataLayer::new();
+        let ids = (0..series)
+            .map(|_| {
+                let id = data.add_series();
+                assert!(data.set_data(
+                    id,
+                    times.clone(),
+                    open.clone(),
+                    high.clone(),
+                    low.clone(),
+                    close.clone()
+                ));
+                id
+            })
+            .collect::<Vec<_>>();
+        (data, ids)
+    };
+    let median = |samples: &mut Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    };
+    println!("Target D2 — retention trim of the data layer, {EVICTED} rows evicted per series (report-only):");
+    for series in [1, 4, 8] {
+        for rows in [2_500, 10_000, 28_800, 40_000] {
+            let mut sequential_ms = Vec::with_capacity(RUNS);
+            let mut batched_ms = Vec::with_capacity(RUNS);
+            let (mut sequential_passes, mut batched_passes) = (0, 0);
+            for _ in 0..RUNS {
+                let (mut data, ids) = layer(series, rows);
+                let passes = data.index_rebuilds();
+                let start = Instant::now();
+                for &id in &ids {
+                    data.trim_front(id, rows - EVICTED);
+                }
+                sequential_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                sequential_passes = data.index_rebuilds() - passes;
+
+                let (mut data, ids) = layer(series, rows);
+                let trims = ids
+                    .iter()
+                    .map(|&id| (id, rows - EVICTED))
+                    .collect::<Vec<_>>();
+                let passes = data.index_rebuilds();
+                let start = Instant::now();
+                data.trim_fronts(&trims);
+                batched_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                batched_passes = data.index_rebuilds() - passes;
+            }
+            println!(
+                "  S={series} N={rows:>6}: trim_front x S {:>7.3} ms ({sequential_passes:>2} union passes) | trim_fronts {:>7.3} ms ({batched_passes} union passes)",
+                median(&mut sequential_ms),
+                median(&mut batched_ms),
+            );
+        }
+    }
 }
 
 fn main() {
@@ -775,14 +1249,24 @@ fn main() {
         .historical_rebuilds;
     let mut tip_samples = Vec::with_capacity(tip_trades.len());
     let mut tip_trims = 0u64;
+    // The retention trim tip: its time, and the timestamp-union rebuild and reindex passes the
+    // whole data layer ran for it (one union merge and one reindex for every presentation).
+    let mut trim_tip_ms = 0.0f64;
+    let mut trim_tip_passes = Vec::new();
     for trade in tip_trades {
         let first_key = first_row_key(&footprint);
+        let passes_before = footprint.data_layer().index_rebuilds();
         let start = Instant::now();
         footprint
             .update_footprint_trades(0, vec![trade])
             .expect("valid footprint tip");
-        tip_samples.push(start.elapsed().as_secs_f64() * 1000.0);
-        tip_trims += u64::from(first_row_key(&footprint) != first_key);
+        let tip_ms = start.elapsed().as_secs_f64() * 1000.0;
+        tip_samples.push(tip_ms);
+        if first_row_key(&footprint) != first_key {
+            tip_trims += 1;
+            trim_tip_ms = trim_tip_ms.max(tip_ms);
+            trim_tip_passes.push(footprint.data_layer().index_rebuilds() - passes_before);
+        }
     }
     let tip_work = footprint
         .trade_stream_stats(footprint_stream)
@@ -800,7 +1284,7 @@ fn main() {
     let tip_bubble_trades = tip_work.bubble_trades_scanned - tip_work_before.bubble_trades_scanned;
     let tip_bubble_sizes = tip_work.bubble_markers_sized - tip_work_before.bubble_markers_sized;
     println!(
-        "  live tips: {tip_count} single-trade tips, {tip_trims} retention trim(s), {tip_rebuilds} tape reconstruction(s); p50 {:.4} ms, max {:.2} ms; per tip {:.2} study rows, {:.2} bar rows, {:.2} bubble trades, {:.2} bubble sizes",
+        "  live tips: {tip_count} single-trade tips, {tip_trims} retention trim(s) (slowest {trim_tip_ms:.2} ms, {trim_tip_passes:?} union passes), {tip_rebuilds} tape reconstruction(s); p50 {:.4} ms, max {:.2} ms; per tip {:.2} study rows, {:.2} bar rows, {:.2} bubble trades, {:.2} bubble sizes",
         tip_percentile(0.5),
         tip_percentile(1.0),
         tip_study_rows as f64 / tip_count as f64,
@@ -810,12 +1294,14 @@ fn main() {
     );
     // CVD and delta each recompute the changed suffix (the active bar, plus the bar a tip opens);
     // the footprint and bound candles project the same suffix; bubbles fold each new trade exactly
-    // once, also across the retention trim, and nothing reconstructs the retained tape.
+    // once, also across the retention trim, and nothing reconstructs the retained tape. A trim
+    // runs one union merge and one reindex for all of its presentations, however many there are.
     let d_tip_work_pass = tip_study_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
         && tip_bar_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
         && tip_bubble_trades == tip_count
         && tip_rebuilds == 0
-        && tip_trims >= 1;
+        && tip_trims >= 1
+        && trim_tip_passes.iter().all(|&passes| passes == 2);
     println!(
         "  [{}] tip work bounded by the changed suffix and the new trade",
         if d_tip_work_pass { "PASS" } else { "FAIL" }
@@ -831,6 +1317,7 @@ fn main() {
         tip_percentile(1.0),
         FRAME_BUDGET_MS,
     );
+    retention_trim_matrix();
     let d_pass = d_load_pass
         && d_live_pass
         && d_correction_pass
@@ -1536,8 +2023,11 @@ fn main() {
     // burst of ticks inside one frame with most of its 16.67 ms left for frame construction.
     let tick_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 0, 4, INDICATOR_TICK_APPENDS);
     println!(
-        "Target M — per-tick indicator cost, {} bindings over {INDICATOR_TICK_ROWS} rows (max {} work rows per tick; first append after install {:.2} ms):",
-        tick_cost.bindings, tick_cost.max_work_rows, tick_cost.first_append_ms
+        "Target M — per-tick indicator cost, {} bindings over {INDICATOR_TICK_ROWS} rows (max {} work rows per tick; first append after install {:.2} ms, growing {:.2} MiB of column capacity):",
+        tick_cost.bindings,
+        tick_cost.max_work_rows,
+        tick_cost.first_append_ms,
+        tick_cost.first_append_growth_bytes as f64 / (1024.0 * 1024.0),
     );
     let (replace_mean, replace_median, replace_max) = tick_cost.replace_ms;
     let m_replace = report(
@@ -1558,8 +2048,21 @@ fn main() {
     // the source: filling and revising the forming slot must cost the same bounded window.
     let slot_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 23_400, 4, INDICATOR_TICK_APPENDS);
     println!(
-        "Target M (slots) — the same ticks filling 23,400 pre-installed session slots (max {} work rows per tick):",
-        slot_cost.max_work_rows
+        "Target M (slots) — the same ticks filling 23,400 pre-installed session slots (max {} work rows per tick; first fill after install {:.2} ms, growing {:.2} MiB of column capacity):",
+        slot_cost.max_work_rows,
+        slot_cost.first_append_ms,
+        slot_cost.first_append_growth_bytes as f64 / (1024.0 * 1024.0),
+    );
+    // Filling the first slot extends every column the runtime retains, the aggregate price columns
+    // among them, by one row inside capacity the install left. Unlike a live append past the
+    // source, it grows no other column, so any growth here is a retained column reallocating.
+    let m_slot_first_fill = report_check(
+        "first slot fill grows no column capacity",
+        slot_cost.first_append_growth_bytes == 0,
+        &format!(
+            "{:.2} MiB",
+            slot_cost.first_append_growth_bytes as f64 / (1024.0 * 1024.0)
+        ),
     );
     let (slot_replace_mean, slot_replace_median, slot_replace_max) = slot_cost.replace_ms;
     let m_slot_replace = report(
@@ -1578,6 +2081,56 @@ fn main() {
         INDICATOR_TICK_BUDGET_MS,
     );
 
+    // Aggregate-input studies keep one derived price column each. It must be resident (re-deriving
+    // the source per tick would be O(rows)), and it must carry bounded spare capacity so the first
+    // append after a bulk install does not reallocate it and later growth stays within one eighth
+    // plus a fixed floor of rows. The capacity is counted exactly, so these byte gates are not
+    // noise-sensitive; the times are context.
+    const COMPOSITE_COLUMNS: usize = 4;
+    let composite = composite_input_cost(INDICATOR_TICK_ROWS, INDICATOR_TICK_APPENDS);
+    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+    let resident_floor = COMPOSITE_COLUMNS * INDICATOR_TICK_ROWS * std::mem::size_of::<f64>();
+    let headroom_bound = COMPOSITE_COLUMNS
+        * (INDICATOR_TICK_ROWS + INDICATOR_TICK_ROWS / 8 + 4096)
+        * std::mem::size_of::<f64>();
+    println!(
+        "Target M (composite inputs) — {COMPOSITE_COLUMNS} studies on hl2/hlc3/ohlc4/hlcc4 versus close over {INDICATOR_TICK_ROWS} rows (first append {:.2} ms canonical, {:.2} ms composite; context only):",
+        composite.first_append_ms.0, composite.first_append_ms.1
+    );
+    let m_composite_resident = report_check(
+        "price columns are resident after install",
+        composite.install_bytes >= resident_floor,
+        &format!(
+            "{:.2} MiB (floor {:.2} MiB)",
+            mib(composite.install_bytes),
+            mib(resident_floor)
+        ),
+    );
+    let m_composite_install = report_bytes(
+        "price columns after install",
+        composite.install_bytes,
+        headroom_bound,
+    );
+    let m_composite_first = report_check(
+        "first append does not grow the price columns",
+        composite.first_append_bytes == composite.install_bytes,
+        &format!(
+            "{:.2} MiB -> {:.2} MiB",
+            mib(composite.install_bytes),
+            mib(composite.first_append_bytes)
+        ),
+    );
+    let m_composite_final = report_bytes(
+        &format!("price columns after {INDICATOR_TICK_APPENDS} more appends"),
+        composite.final_bytes,
+        headroom_bound,
+    );
+    let m_composite_append = report(
+        "composite new-bar append mean",
+        composite.append_mean_ms,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+
     // ---- Target N: regression trends across a 1M-row source under live ticks ----------------
     // Each regression spans the whole history; a tick replacing or appending the latest bar must
     // extend the fits by the changed rows, so a tick plus its frame stays inside the per-tick
@@ -1592,6 +2145,48 @@ fn main() {
         regression_mean,
         INDICATOR_TICK_BUDGET_MS,
     );
+
+    // ---- Target O: daily-reset studies on daily bars (report-only) ----------------------------
+    // A study that resets per session (session VWAP, VWAP bands, pivots) on daily bars makes every
+    // drawn bar its own period, so each bar draws one bar-wide segment. The study-attributable
+    // cost is the difference against the same chart without studies.
+    println!(
+        "Target O — daily-reset studies on daily bars (report-only, study cost = with - without):"
+    );
+    for (rows, spacing) in [(2_520, 0.5), (25_200, 0.01)] {
+        let without = daily_reset_study_cost(rows, spacing, false);
+        let with = daily_reset_study_cost(rows, spacing, true);
+        println!(
+            "  {rows} rows, min bar spacing {spacing} ({} study outputs): prims {} -> {} ({} two-point polylines, {} segment batches of {} pairs), pool {} -> {} points",
+            with.outputs,
+            without.prims,
+            with.prims,
+            with.lone_polylines,
+            with.batches,
+            with.batched_pairs,
+            without.pool_points,
+            with.pool_points,
+        );
+        println!(
+            "    full rebuild {:.2} -> {:.2} ms, cursor-only frame {:.3} -> {:.3} ms",
+            without.rebuild_ms, with.rebuild_ms, without.retained_ms, with.retained_ms
+        );
+        println!(
+            "    Canvas2D: {} calls / {} strokes (was {} / {}), counting canvas {:.2} ms (was {:.2}), tiny-skia {:.2} ms (was {:.2})",
+            with.canvas_calls,
+            with.canvas_strokes,
+            without.canvas_calls,
+            without.canvas_strokes,
+            with.canvas_counting_ms,
+            without.canvas_counting_ms,
+            with.raster_ms,
+            without.raster_ms,
+        );
+        println!(
+            "    prims_to_group {:.2} -> {:.2} ms, hit_test_series {:.3} -> {:.3} ms/sample",
+            without.group_ms, with.group_ms, without.hit_ms, with.hit_ms
+        );
+    }
 
     let all_pass = a_pass
         && b_pass
@@ -1620,7 +2215,13 @@ fn main() {
         && m_replace
         && m_append
         && m_slot_replace
+        && m_slot_first_fill
         && m_slot_fill
+        && m_composite_resident
+        && m_composite_install
+        && m_composite_first
+        && m_composite_final
+        && m_composite_append
         && n_tick;
     println!(
         "\n{}",

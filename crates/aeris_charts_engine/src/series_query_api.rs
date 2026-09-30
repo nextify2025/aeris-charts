@@ -179,6 +179,53 @@ impl ChartEngine {
         Some(snapshot)
     }
 
+    /// A pane's default price scale and base for a public conversion, or `None` when the pane is
+    /// missing, nothing is visible, or the scale has no range yet. This is the scale the crosshair
+    /// label reads, so conversions and labels never disagree.
+    fn pane_conversion_scale(&self, pane_index: usize) -> Option<(&PriceScaleCore, f64)> {
+        self.panes.get(pane_index)?;
+        let (from, _) = self.visible_range_for_frame()?;
+        let (scale, base) = self.pane_default_scale(pane_index, from);
+        (!scale.is_empty()).then_some((scale, base))
+    }
+
+    /// Chart-content y (CSS px from the top of the stacked pane area, never pane-local) for a
+    /// price on `pane_index`'s default price scale. Series handles convert on their own scale
+    /// through [`Self::series_price_to_coordinate`]; this is the pane-level counterpart used by
+    /// the chart-level converter (pane 0) and linked-crosshair application.
+    #[must_use]
+    pub fn pane_price_to_coordinate(&self, pane_index: usize, price: f64) -> Option<f64> {
+        if !price.is_finite() {
+            return None;
+        }
+        let (scale, base) = self.pane_conversion_scale(pane_index)?;
+        let y = scale.price_to_coordinate(price, base);
+        y.is_finite().then_some(y)
+    }
+
+    /// Price on `pane_index`'s default price scale for a chart-content y (the inverse of
+    /// [`Self::pane_price_to_coordinate`]).
+    #[must_use]
+    pub(crate) fn pane_coordinate_to_price(&self, pane_index: usize, y: f64) -> Option<f64> {
+        if !y.is_finite() {
+            return None;
+        }
+        let (scale, base) = self.pane_conversion_scale(pane_index)?;
+        let price = scale.coordinate_to_price(y, base);
+        price.is_finite().then_some(price)
+    }
+
+    /// Price for a chart-content y on the default price scale of the pane containing it (a
+    /// separator resolves to the pane above and a y below the content to the last pane), the same
+    /// scale the crosshair label uses there.
+    #[must_use]
+    pub fn coordinate_to_price(&self, y: f64) -> Option<f64> {
+        if !y.is_finite() {
+            return None;
+        }
+        self.pane_coordinate_to_price(self.pane_index_at_y(y), y)
+    }
+
     pub fn series_price_to_coordinate(&self, id: SeriesId, price: f64) -> Option<f64> {
         if !price.is_finite() {
             return None;

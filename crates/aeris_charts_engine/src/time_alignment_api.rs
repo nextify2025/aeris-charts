@@ -110,16 +110,10 @@ impl ChartEngine {
         {
             return Some("an indicator output follows its source series' time alignment".into());
         }
-        let trade_owned = self.synthetic_series.contains_key(&id)
-            || self
-                .trade_bar_dependents
-                .values()
-                .any(|dependents| dependents.iter().any(|dependent| dependent.series_id == id))
-            || self
-                .trade_dependents
-                .values()
-                .any(|dependents| dependents.iter().any(|dependent| dependent.series_id == id));
-        if trade_owned {
+        if matches!(
+            self.series_owner(id),
+            Some(SeriesOwner::Synthetic | SeriesOwner::TradeBars | SeriesOwner::TradeStudy)
+        ) {
             return Some(
                 "a trade-bound, trade-study, or synthetic series has no calendar of its own".into(),
             );

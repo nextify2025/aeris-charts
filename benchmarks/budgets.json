@@ -10,6 +10,7 @@
     "package-release-artifacts.wasm_raw_bytes.p50": 3000000,
     "package-release-artifacts.wasm_brotli_bytes.p50": 810000,
     "general-dashboard-100k.startup_ms.p50": 2000,
-    "general-dashboard-100k.gpu_uploaded_bytes.p50": 100663296
+    "general-dashboard-100k.gpu_uploaded_bytes.p50": 100663296,
+    "crosshair-reset-studies-daily-2520.canvas2d_ops.p50": 4500
   }
 }

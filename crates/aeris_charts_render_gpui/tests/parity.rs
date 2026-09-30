@@ -469,6 +469,15 @@ fn tessellated_prims_take_the_path_route_on_both_backends() {
             },
         ),
         (
+            "Segments",
+            Prim::Segments {
+                first_point: 0,
+                segment_count: 2,
+                width: 2.0,
+                color: c,
+            },
+        ),
+        (
             "AreaFill",
             Prim::AreaFill {
                 first_point: 0,
@@ -584,6 +593,43 @@ fn curved_brush_fixture_lowers_sparse_dense_and_scaled_widths_without_drops() {
         assert!(
             meshes.iter().all(|count| *count >= 3 && *count % 3 == 0),
             "DPR {dpr}: every curved brush must produce complete triangles"
+        );
+    }
+}
+
+#[test]
+fn tessellated_fixture_segments_reach_both_backends_without_drops() {
+    for dpr in [1.0f32, 1.25, 1.5, 2.0, 2.5] {
+        let fixture = fixtures::tessellated(dpr);
+        let (first_point, segment_count) = fixture
+            .prims
+            .iter()
+            .find_map(|prim| match prim {
+                Prim::Segments {
+                    first_point,
+                    segment_count,
+                    ..
+                } => Some((*first_point, *segment_count)),
+                _ => None,
+            })
+            .expect("the tessellated fixture carries a segment batch");
+        assert_eq!(segment_count, 10, "DPR {dpr}");
+        assert!(
+            first_point as usize + 2 * segment_count as usize <= fixture.points.len(),
+            "DPR {dpr}: the batch stays inside the pool"
+        );
+        let (_, metrics) = gpui_plan(&fixture.prims, &fixture.points);
+        assert_eq!(metrics.dropped_prims, 0, "DPR {dpr}: a prim was dropped");
+        // One Canvas2D stroke for the whole batch beside the fixture's other strokes.
+        let canvas = canvas_rects(&fixture.prims, &fixture.points);
+        let polylines = fixture
+            .prims
+            .iter()
+            .filter(|prim| matches!(prim, Prim::Polyline { .. }))
+            .count();
+        assert!(
+            canvas.path_strokes > polylines,
+            "DPR {dpr}: the segment batch takes the Canvas2D stroke route"
         );
     }
 }

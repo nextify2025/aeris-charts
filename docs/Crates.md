@@ -58,6 +58,56 @@ dependency and `/react` import from the legacy scoped npm package to `@aeristerm
 lockfiles, update any WASM asset names and release automation, and replace repository URLs with
 the `aeristerminal/aeris-charts` repository. No platform repository files are changed here.
 
+Moving the pinned revision to one that carries the sub-pane coordinate contract (see
+[Coordinates and panes](Public_api.md#coordinates-and-panes)) changes three host-visible behaviours
+that Terminal call sites should review:
+
+- The chart-level `price_to_coordinate` and `coordinate_to_price` no longer follow the first visible
+  series in creation order. The price converts on pane 0's default scale and the coordinate on the
+  default scale of the pane containing `y`, so a call that relied on an overlay-first or hidden main
+  series must use that series' own handle instead. Single-pane charts whose main series is created
+  first are unchanged, and series-handle conversions never changed.
+- Linked crosshairs on a lower pane (`pane_index` of 1 or more) now round-trip. Earlier revisions
+  applied the pane offset twice and read the wrong scale, so `crosshair_sync_position` and
+  `apply_external_crosshair` disagreed on any pane but the first. A synced price is now a price on
+  the pane's default scale, and an off-range price holds the line inside its pane.
+- `ChartEngine::pane_index_at_y` (and the browser package's `pane_index_at_y`) now returns the pane
+  above for a separator and pane 0 for a `y` above the content, where both used to resolve to the
+  last pane. GPUI hosts that pick a pane for price-axis hit-testing pick up the corrected mapping.
+
+Moving the pinned revision to one that guards trade-stream-derived series (see
+[Ticks to candles](Public_api.md#ticks-to-candles)) needs two more Terminal reviews, and the first
+cannot be checked from this repository:
+
+- Terminal must not write to a candle bound with `bind_trade_bar_series_to_stream` or to a CVD,
+  delta, or trade-volume series (`add_cvd_series`, `add_delta_series`, `add_trade_volume_series`).
+  Every host data write to them is now refused like a footprint's (`false`, `0`, `None`,
+  `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`; `series_is_source_owned(id)` tells
+  the refusal from an unknown id), and `apply_momentum_histogram_colors` returns `false` for the
+  delta and volume studies. The browser package rejects them with `code: "derived_series"`.
+- `FootprintError` gains the `SeriesOwned(SeriesId)` variant, so an exhaustive `match` on it needs
+  an arm. `bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler,
+  synthetic bars, or a study converted to a candle already writes (a footprint or scalar study still
+  gets `UnsupportedTradeBarSeries`, because the candle-kind check runs first), and
+  `configure_footprint_series` returns it for a series a stream, study, resampler, or synthetic bars
+  write. Resampling targets and synthetic-bar series refuse a trade-bound candle
+  (`ResampleError::UnsupportedTarget`, `SyntheticBarError::UnsupportedSeries`).
+
+Moving the pinned revision to one that batches period-reset study lines needs one Terminal review,
+and it is a compile-time break for Rust code that matches `aeris_charts_render::draw_list::Prim`
+exhaustively (a custom executor, a frame inspector, a point-pool rebase):
+
+- `Prim` gains `Segments { first_point, segment_count, width, color }`, a batch of `segment_count`
+  independent two-point strokes over `points[first_point .. first_point + 2 * segment_count]`, each
+  stroked like a solid simple two-point `Polyline` (dashes already expanded into one pair per dash).
+  The engine emits it in place of one two-point `Polyline` per bar for session VWAP, VWAP bands, and
+  pivot lines on bars of a day or longer, so a `_ => {}` arm that compiles silently stops drawing
+  those studies. Take the pair window from `draw_list::segment_points` (a range outside the pool is
+  a dropped prim), and move `first_point` with every other pool index when rebasing a layer. The
+  Canvas2D, WebGPU, GPUI, and native executors in this repository already handle it. The crates
+  keep their coordinated version; the integrator owns the bump that ships this variant, which is
+  breaking for exhaustive matchers.
+
 ## License
 
 Aeris Charts is open-source software under the

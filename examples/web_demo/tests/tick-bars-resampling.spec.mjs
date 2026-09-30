@@ -205,6 +205,7 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
     // used to write straight into the derived rows.
     const derived_before = { hour: hour.data(), volume: hour_volume.data() };
     const writes = {};
+    const codes = {};
     const one = (value) => Float64Array.of(value);
     for (const [name, target, attempt] of [
       ["set_data", hour, () => hour.set_data([{ time: slots[0], open: 1, high: 2, low: 0, close: 1 }])],
@@ -219,7 +220,10 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
     ]) {
       attempt();
       writes[name] = target.last_ingestion_diagnostics()?.status ?? null;
+      codes[name] = target.last_ingestion_diagnostics()?.code ?? null;
     }
+    hour.pop(1);
+    codes.pop = hour.last_ingestion_diagnostics()?.code ?? null;
     const derived_after = { hour: hour.data(), volume: hour_volume.data() };
     const expected = boundaries.flatMap((boundary) => {
       const bars = [];
@@ -242,6 +246,7 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
       last_close: rows.at(-1).close,
       refined,
       writes,
+      codes,
       derived_unchanged: JSON.stringify(derived_before) === JSON.stringify(derived_after),
       unbound: chart.resampled_bars(minute),
     };
@@ -271,9 +276,309 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
     volume_update: "rejected",
     volume_merge: "rejected",
   });
+  // The rejection names its cause, so a host can tell it from an invalid payload.
+  expect(Object.values(result.codes)).toEqual(Array(8).fill("derived_series"));
   expect(result.derived_unchanged).toBe(true);
   expect(result.local).toHaveLength(8);
   expect(result.unbound).toBeNull();
+});
+
+test("trade-bound candles and studies reject every host write and stay fed by their stream", async ({ page }) => {
+  const errors = await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const second = (index) => 1_700_000_000 + index;
+    const print = (index) => ({
+      timestamp_micros: second(index * 7) * 1_000_000,
+      price: 100 + ((index * 7) % 11) / 4,
+      volume: 1 + (index % 5),
+      aggressor: index % 3 === 0 ? "sell" : "buy",
+      session_id: 1,
+    });
+    const tape = Array.from({ length: 260 }, (_, index) => print(index));
+    const options = { tick_size: 0.25, bar_type: "time", interval_seconds: 60 };
+    const build = (key) => {
+      const candles = chart.add_series("candlestick");
+      const stream = chart.add_trade_stream(key, options);
+      chart.bind_trade_bar_series_to_stream(candles, stream);
+      return {
+        stream,
+        candles,
+        volume: chart.add_trade_volume_series(stream, 1),
+        cvd: chart.add_cvd_series(stream, 2, "continuous"),
+        delta: chart.add_delta_series(stream, 2),
+      };
+    };
+    const live = build("TEST:LIVE");
+    chart.set_trade_stream_trades(live.stream, tape.slice(0, 200));
+
+    const warnings = [];
+    const original_warn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(" ")); };
+    const one = (value) => Float64Array.of(value);
+    const time = second(60 * 3);
+    const attempts = {
+      set_data: (handle, scalar) => handle.set_data([scalar ? { time, value: 1 } : { time, open: 1, high: 2, low: 0, close: 1 }]),
+      set_data_typed: (handle) => handle.set_data_typed({ times: one(time), open: one(1), high: one(2), low: one(0), close: one(1) }),
+      update: (handle, scalar) => handle.update(scalar ? { time, value: 1 } : { time, open: 1, high: 2, low: 0, close: 1 }),
+      update_typed: (handle) => handle.update_typed({ times: one(time), open: one(1), high: one(2), low: one(0), close: one(1) }),
+      update_sequenced: (handle, scalar) => handle.update(scalar ? { time, value: 1 } : { time, open: 1, high: 2, low: 0, close: 1 }, { sequence: 3 }),
+      update_typed_sequenced: (handle) => handle.update_typed({ times: one(time), open: one(1), high: one(2), low: one(0), close: one(1) }, { sequence: 3 }),
+      merge: (handle) => handle.merge({ time, close: 99 }),
+      merge_typed: (handle) => handle.merge_typed({ times: one(time), close: one(99) }),
+      merge_sequenced: (handle) => handle.merge({ time, close: 5 }, { sequence: 9 }),
+      pop: (handle) => handle.pop(1),
+    };
+    const outcomes = {};
+    for (const [name, handle] of Object.entries({ candles: live.candles, volume: live.volume, cvd: live.cvd, delta: live.delta })) {
+      const scalar = name !== "candles";
+      const before = JSON.stringify(handle.data());
+      let notified = 0;
+      const on_change = () => { notified += 1; };
+      handle.subscribe_data_changed(on_change);
+      const seen = {};
+      for (const [attempt, run] of Object.entries(attempts)) {
+        const warned = warnings.length;
+        run(handle, scalar);
+        const diagnostics = handle.last_ingestion_diagnostics();
+        seen[attempt] = { status: diagnostics?.status, code: diagnostics?.code, warned: warnings.length > warned };
+      }
+      handle.unsubscribe_data_changed(on_change);
+      outcomes[name] = { seen, notified, unchanged: JSON.stringify(handle.data()) === before };
+    }
+
+    // A ring cannot feed them either, but unbinding stays allowed.
+    const ring = {};
+    for (const [name, handle] of Object.entries({ candles: live.candles, volume: live.volume })) {
+      try {
+        handle.set_ring_source(new SharedArrayBuffer(4096), {
+          data_offset: 64, row_stride: 48, capacity: 8, time_offset: 0, open_offset: 8, high_offset: 16,
+          low_offset: 24, close_offset: 32, sequence_offset: 40, write_cursor_offset: 0,
+        });
+        ring[name] = "bound";
+      } catch (error) {
+        ring[name] = error.code ?? String(error);
+      }
+      handle.set_ring_source(null);
+    }
+
+    // Presentation still works on the read-only series.
+    live.volume.apply_options({ histogram_updown_rule: "previous_close" });
+    live.volume.apply_options({ color: "#336699" });
+    live.delta.apply_options({ visible: false });
+    live.cvd.apply_options({ visible: true });
+    live.candles.move_to_pane(0);
+
+    // After every refused write, a live tip equals the same tape loaded fresh.
+    for (let index = 200; index < 260; index += 1) chart.update_trade_stream_trades(live.stream, [print(index)]);
+    const fresh = build("TEST:FRESH");
+    chart.set_trade_stream_trades(fresh.stream, tape);
+    const rows = (group) => JSON.stringify({
+      candles: group.candles.data(), volume: group.volume.data(), cvd: group.cvd.data(), delta: group.delta.data(),
+    });
+    const tip_equals_fresh = rows(live) === rows(fresh);
+    const candle_count = live.candles.data().length;
+    // One series has one engine writer: a bound candle is no resampling target, and it may still
+    // rebind to another stream.
+    const plain = chart.add_series("candlestick");
+    const refusals = {};
+    try {
+      chart.configure_resampled_series(live.candles, {
+        source: plain, interval_seconds: 300, boundaries: [{ start_time: 0, end_time: 4_000_000_000, session_id: 1 }],
+      });
+      refusals.resampled_target = "configured";
+    } catch (error) {
+      refusals.resampled_target = error.code ?? String(error);
+    }
+    const other = chart.add_trade_stream("TEST:OTHER", options);
+    chart.bind_trade_bar_series_to_stream(live.candles, other);
+    console.warn = original_warn;
+    return {
+      outcomes,
+      ring,
+      warned_pop: warnings.some((text) => text.includes("pop rejected")),
+      refusals,
+      candles: candle_count,
+      tip_equals_fresh,
+    };
+  });
+
+  expect(errors).toEqual([]);
+  for (const name of ["candles", "volume", "cvd", "delta"]) {
+    const outcome = result.outcomes[name];
+    for (const [attempt, seen] of Object.entries(outcome.seen)) {
+      expect(seen, `${name} ${attempt}`).toEqual({ status: "rejected", code: "derived_series", warned: true });
+    }
+    expect(outcome.unchanged, `${name} data`).toBe(true);
+    expect(outcome.notified, `${name} data_changed`).toBe(0);
+  }
+  expect(result.ring).toEqual({ candles: "unsupported_operation", volume: "unsupported_operation" });
+  expect(result.refusals).toEqual({ resampled_target: "invalid_options" });
+  expect(result.candles).toBeGreaterThan(3);
+  expect(result.tip_equals_fresh).toBe(true);
+});
+
+test("the legacy wasm write entries refuse engine-owned series and warn with the real reason", async ({ page }) => {
+  const errors = await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const wasm = chart.wasm;
+    chart.remove_series(window.__main);
+    const second = (index) => 1_700_000_000 + index * 7;
+    const tape = Array.from({ length: 120 }, (_, index) => ({
+      timestamp_micros: second(index) * 1_000_000,
+      price: 100 + (index % 11) / 4,
+      volume: 1 + (index % 5),
+      aggressor: index % 3 === 0 ? "sell" : "buy",
+      session_id: 1,
+    }));
+    const candles = chart.add_series("candlestick");
+    const plain = chart.add_series("candlestick");
+    const stream = chart.add_trade_stream("TEST:LEGACY", { tick_size: 0.25, bar_type: "time", interval_seconds: 60 });
+    chart.bind_trade_bar_series_to_stream(candles, stream);
+    const volume = chart.add_trade_volume_series(stream, 1);
+    chart.set_trade_stream_trades(stream, tape);
+    const time = second(0);
+    plain.set_data([{ time, open: 1, high: 2, low: 0, close: 1 }]);
+
+    const warnings = [];
+    const original_warn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(" ")); };
+    // Runs one legacy entry and returns what it logged, so each refusal is attributed to its call.
+    const warned_by = (run) => {
+      const before = warnings.length;
+      const returned = run();
+      return { returned, warnings: warnings.slice(before) };
+    };
+    const one = (value) => Float64Array.of(value);
+    const snapshot = (handles) => JSON.stringify(handles.map((handle) => handle.data()));
+    const owned = [candles, volume];
+    const rows_before = snapshot(owned);
+    const entries = {};
+    for (const [name, handle] of Object.entries({ candles, volume })) {
+      entries[name] = {
+        set_series_data: warned_by(() => wasm.set_series_data(handle.id, one(time), one(1), one(2), one(0), one(1))),
+        update_series_bar: warned_by(() => wasm.update_series_bar(handle.id, time, 1, 2, 0, 1)),
+        set_series_point_colors: warned_by(() => wasm.set_series_point_colors(handle.id, [0xff0000ff], undefined, undefined)),
+        set_ring_source: warned_by(() => {
+          const buffer = new SharedArrayBuffer(4096);
+          return wasm.set_ring_source(handle.id, new Uint8Array(buffer), new Int32Array(buffer, 0, 1), "{}");
+        }),
+        series_pop: warned_by(() => wasm.series_pop(handle.id, 1)),
+      };
+    }
+    // A bound candle keeps the retention of its stream; a study keeps a cap of its own.
+    const retention = {
+      candles: warned_by(() => wasm.set_series_max_points(candles.id, 50)),
+      volume: warned_by(() => wasm.set_series_max_points(volume.id, 50)),
+      unknown: warned_by(() => wasm.set_series_max_points(987_654, 50)),
+      candles_cap: wasm.series_max_points(candles.id) ?? null,
+      volume_cap: wasm.series_max_points(volume.id) ?? null,
+    };
+    const rows_after = snapshot(owned);
+
+    // An ordinary series is untouched by the guard: it writes and stays silent.
+    const control = {
+      update_series_bar: warned_by(() => wasm.update_series_bar(plain.id, time + 60, 2, 3, 1, 2)),
+      set_series_data: warned_by(() => wasm.set_series_data(plain.id, one(time), one(5), one(6), one(4), one(5))),
+      set_series_max_points: warned_by(() => wasm.set_series_max_points(plain.id, 50)),
+      plain_cap: wasm.series_max_points(plain.id) ?? null,
+      plain_rows: plain.data().length,
+    };
+    const derived = {
+      candles: wasm.series_is_derived(candles.id),
+      volume: wasm.series_is_derived(volume.id),
+      plain: wasm.series_is_derived(plain.id),
+      unknown: wasm.series_is_derived(987_654),
+    };
+    console.warn = original_warn;
+    return { entries, retention, control, derived, unchanged: rows_before === rows_after };
+  });
+
+  expect(errors).toEqual([]);
+  const refusal = /derived by the engine/;
+  for (const name of ["candles", "volume"]) {
+    const { set_series_data, update_series_bar, set_series_point_colors, set_ring_source, series_pop } = result.entries[name];
+    expect(set_series_data.warnings.join("\n"), `${name} set_series_data`).toMatch(/set_series_data rejected.*derived by the engine/);
+    expect(update_series_bar.warnings.join("\n"), `${name} update_series_bar`).toMatch(/update_bar rejected.*derived by the engine/);
+    expect(set_series_point_colors.warnings.join("\n"), `${name} set_series_point_colors`).toMatch(
+      /set_series_point_colors rejected.*derived by the engine/,
+    );
+    // The ring binding reports its reason as the return value, not a console line.
+    expect(set_ring_source.returned, `${name} set_ring_source`).toMatch(refusal);
+    expect(set_ring_source.warnings, `${name} set_ring_source warnings`).toEqual([]);
+    expect(series_pop.returned, `${name} series_pop`).toBe(0);
+  }
+  expect(result.unchanged).toBe(true);
+  expect(result.retention.candles.warnings).toEqual([
+    "aeris_charts: set_series_max_points ignored (series is engine-owned; retention is set on the trade stream or source)",
+  ]);
+  expect(result.retention.candles_cap).toBeNull();
+  expect(result.retention.volume.warnings).toEqual([]);
+  expect(result.retention.volume_cap).toBe(50);
+  expect(result.retention.unknown.warnings).toEqual([
+    "aeris_charts: set_series_max_points ignored (unknown or removed series id)",
+  ]);
+  expect(result.control.update_series_bar.warnings).toEqual([]);
+  expect(result.control.set_series_data.warnings).toEqual([]);
+  expect(result.control.set_series_max_points.warnings).toEqual([]);
+  expect(result.control.plain_cap).toBe(50);
+  expect(result.control.plain_rows).toBe(1);
+  expect(result.derived).toEqual({ candles: true, volume: true, plain: false, unknown: false });
+});
+
+test("one series has one engine writer: bound candles refuse a second owner with the real reason", async ({ page }) => {
+  const errors = await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const options = { tick_size: 0.25, bar_type: "time", interval_seconds: 60 };
+    const stream = chart.add_trade_stream("TEST:OWNER", options);
+    const attempt = (run) => {
+      try {
+        run();
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, code: error.code ?? null, message: String(error.message ?? error) };
+      }
+    };
+    const source = chart.add_series("candlestick");
+    const target = chart.add_series("candlestick");
+    chart.configure_resampled_series(target, {
+      source, interval_seconds: 300, boundaries: [{ start_time: 0, end_time: 4_000_000_000, session_id: 1 }],
+    });
+    const cvd = chart.add_cvd_series(stream, 2, "continuous");
+    cvd.set_type("candlestick");
+    const footprint = chart.add_series("footprint", { tick_size: 1, interval_seconds: 60 });
+    const bound = chart.add_series("candlestick");
+    chart.bind_trade_bar_series_to_stream(bound, stream);
+    const other = chart.add_trade_stream("TEST:OWNER:5M", { ...options, interval_seconds: 300 });
+    const outcomes = {
+      resampled_target: attempt(() => chart.bind_trade_bar_series_to_stream(target, stream)),
+      cvd_candle: attempt(() => chart.bind_trade_bar_series_to_stream(cvd, stream)),
+      footprint: attempt(() => chart.bind_trade_bar_series_to_stream(footprint, stream)),
+      rebind: attempt(() => chart.bind_trade_bar_series_to_stream(bound, other)),
+      rebind_same: attempt(() => chart.bind_trade_bar_series_to_stream(bound, other)),
+    };
+    // The refused binds registered nothing, so the stream keeps accepting trades.
+    const tip = attempt(() => chart.update_trade_stream_trades(stream, [
+      { timestamp_micros: 1_700_000_000_000_000, price: 100, volume: 1, aggressor: "buy", session_id: 1 },
+    ]));
+    return { outcomes, tip };
+  });
+
+  expect(errors).toEqual([]);
+  for (const name of ["resampled_target", "cvd_candle"]) {
+    expect(result.outcomes[name].ok, name).toBe(false);
+    expect(result.outcomes[name].code, name).toBe("invalid_options");
+    expect(result.outcomes[name].message, name).toMatch(/another engine feature|already writes/);
+  }
+  expect(result.outcomes.footprint.ok).toBe(false);
+  expect(result.outcomes.footprint.code).toBe("invalid_options");
+  expect(result.outcomes.rebind).toEqual({ ok: true });
+  expect(result.outcomes.rebind_same).toEqual({ ok: true });
+  expect(result.tip).toEqual({ ok: true });
 });
 
 test("reconfiguring a volume binding adds a trading date; self-feeding volume is refused", async ({ page }) => {

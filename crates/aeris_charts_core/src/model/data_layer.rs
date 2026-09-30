@@ -334,6 +334,34 @@ impl RawSeries {
             .rebuild(self.values.view().with_rows(self.plot.source_rows()));
         self.last_lod_update_nodes = self.lod.node_count();
     }
+
+    /// Whether this series' own timestamps join the merged union (owned and not as-of).
+    fn joins_union(&self) -> bool {
+        self.time_alias.is_none() && !self.alignment.is_as_of()
+    }
+}
+
+/// Most union series the timestamp merge handles as sorted runs; a wider layer sorts the
+/// concatenation instead.
+const MAX_MERGED_RUNS: usize = 16;
+
+/// Write the sorted, duplicate-free union of ascending `runs` to `out`, consuming the slices.
+fn merge_sorted_runs(runs: &mut [&[i64]], out: &mut Vec<i64>) {
+    if let [only] = runs {
+        out.extend_from_slice(only);
+        out.dedup();
+        return;
+    }
+    while let Some(&next) = runs.iter().filter_map(|run| run.first()).min() {
+        if out.last() != Some(&next) {
+            out.push(next);
+        }
+        for run in runs.iter_mut() {
+            if run.first() == Some(&next) {
+                *run = &run[1..];
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2052,12 +2080,52 @@ impl DataLayer {
     ///
     /// Cost is `O(total rows)` — the row shift plus a merged rebuild and reindex — so callers must
     /// not run this once per appended point. The engine trims with hysteresis for exactly that
-    /// reason (see `ChartEngine::enforce_series_cap`).
+    /// reason (see `ChartEngine::enforce_series_cap`). A retention that trims several series at
+    /// once calls [`trim_fronts`](Self::trim_fronts) instead, which rebuilds the shared axis once.
     pub fn trim_front(&mut self, id: SeriesId, keep: usize) -> Option<usize> {
+        let (rows, dropped) = self.trim_series_rows_front(id, keep)?;
+        if dropped {
+            self.rebuild_merged();
+            self.reindex_all();
+        }
+        Some(rows)
+    }
+
+    // ponytail: the trim still costs O(retained rows) per series (column shift, summary rebuild, and
+    // the union merge and reindex), so it is a constant-factor and series-count fix, not O(evicted).
+    // An O(evicted) trim needs absolute row identity in the summary pyramid, the plot indices and
+    // the values, a lazy head offset on the columns compacted at a fraction of their length, an
+    // O(log N) union front cut, and a margin capped in rows (a proportional margin grows an
+    // O(evicted) trim with the cap). Deferred for a product decision (must trim latency be
+    // independent of the retention cap?); `perf_gate` Target D2 at 28,800 rows and four or more
+    // series is its measure, against a bar of about 2 ms.
+    /// Apply [`trim_front`](Self::trim_front) to several series as one data-layer transaction: each
+    /// `(id, keep)` entry drops its series' oldest rows in order (an unknown id is skipped, a
+    /// repeated id applies again to the already trimmed rows), then the merged time points and
+    /// every plot index are rebuilt **once** if any row left. The result equals the sequence of
+    /// individual trims, without an `O(total rows)` union merge and reindex per series.
+    pub fn trim_fronts(&mut self, trims: &[(SeriesId, usize)]) {
+        let mut dropped = false;
+        for &(id, keep) in trims {
+            dropped |= self
+                .trim_series_rows_front(id, keep)
+                .is_some_and(|(_, dropped)| dropped);
+        }
+        if dropped {
+            self.rebuild_merged();
+            self.reindex_all();
+        }
+    }
+
+    /// The per-series half of a front trim: drop the oldest rows, their colors and summaries.
+    /// Leaves the merged axis and plot indices stale, which the caller must rebuild when this
+    /// reports rows dropped. `None` for an unknown id; otherwise the remaining row count and whether
+    /// any row left. An aliased series owns its times first, even when nothing is dropped.
+    fn trim_series_rows_front(&mut self, id: SeriesId, keep: usize) -> Option<(usize, bool)> {
         let slot = self.materialize_time_alias(id)?;
         let len = self.series[slot].times.len();
         if len <= keep {
-            return Some(len);
+            return Some((len, false));
         }
         let drop = len - keep;
         let s = &mut self.series[slot];
@@ -2070,42 +2138,51 @@ impl DataLayer {
             }
         }
         s.generation = s.generation.wrapping_add(1);
-        self.rebuild_merged();
-        self.reindex_all();
-        Some(keep)
-    }
-
-    /// Whether a live slot's own timestamps join the merged union (owned and not as-of).
-    fn joins_union(&self, slot: usize) -> bool {
-        let series = &self.series[slot];
-        series.time_alias.is_none() && !series.alignment.is_as_of()
+        Some((keep, true))
     }
 
     fn rebuild_merged(&mut self) {
         self.index_rebuilds = self.index_rebuilds.wrapping_add(1);
-        let total: usize = self
-            .live_slots
-            .values()
-            .filter(|&&slot| self.joins_union(slot))
-            .map(|&slot| self.series[slot].times.len())
-            .sum();
-        let all = &mut self.merged_times_scratch;
-        all.clear();
-        if all.capacity() < total {
-            all.reserve(total);
-        }
+        // Each union series' visible times are ascending and duplicate-free, so the union is a
+        // merge of sorted runs. The runs sit in a stack array: no allocation, no sort.
+        let mut runs: [&[i64]; MAX_MERGED_RUNS] = [&[]; MAX_MERGED_RUNS];
+        let mut run_count = 0;
+        let mut total = 0;
         for &slot in self.live_slots.values() {
             let series = &self.series[slot];
-            if series.time_alias.is_none() && !series.alignment.is_as_of() {
-                let times = &self.series[slot].times;
+            if series.joins_union() {
+                let times = &series.times;
                 let len = self.time_cutoff.map_or(times.len(), |cutoff| {
                     times.partition_point(|&time| time <= cutoff)
                 });
-                all.extend_from_slice(&times[..len]);
+                if let Some(run) = runs.get_mut(run_count) {
+                    *run = &times[..len];
+                }
+                run_count += 1;
+                total += len;
             }
         }
-        all.sort_unstable();
-        all.dedup();
+        let all = &mut self.merged_times_scratch;
+        all.clear();
+        if run_count <= MAX_MERGED_RUNS {
+            let runs = &mut runs[..run_count];
+            all.reserve(runs.iter().map(|run| run.len()).max().unwrap_or(0));
+            merge_sorted_runs(runs, all);
+        } else {
+            all.reserve(total);
+            for &slot in self.live_slots.values() {
+                let series = &self.series[slot];
+                if series.joins_union() {
+                    let times = &series.times;
+                    let len = self.time_cutoff.map_or(times.len(), |cutoff| {
+                        times.partition_point(|&time| time <= cutoff)
+                    });
+                    all.extend_from_slice(&times[..len]);
+                }
+            }
+            all.sort_unstable();
+            all.dedup();
+        }
         if *all != self.merged_times {
             if self.capture_merged_time_rebase && self.merged_time_rebase_source.is_none() {
                 self.merged_time_rebase_source = Some(self.merged_times.clone());
@@ -3197,6 +3274,248 @@ mod tests {
         assert_eq!(dl.merged_times(), &[3, 4]);
     }
 
+    /// Everything a front trim can change in one series, to compare two layers trim for trim.
+    #[derive(Debug, PartialEq)]
+    struct SeriesObservation {
+        times: Vec<i64>,
+        columns: Vec<Vec<u64>>,
+        indices: Vec<TimePointIndex>,
+        colors: [Vec<u32>; POINT_COLOR_CHANNELS],
+        generation: Option<u64>,
+        aliased: bool,
+        alignment: Option<TimeAlignment>,
+    }
+
+    fn observe(
+        dl: &DataLayer,
+        ids: &[SeriesId],
+    ) -> (Vec<i64>, Option<TimePointIndex>, Vec<SeriesObservation>) {
+        let series = ids
+            .iter()
+            .map(|&id| {
+                let (times, columns) = dl.series_data(id).unwrap();
+                let slot = dl.series_slot(id).unwrap();
+                SeriesObservation {
+                    times: times.to_vec(),
+                    columns: columns
+                        .iter()
+                        .map(|column| column.iter().map(|value| value.to_bits()).collect())
+                        .collect(),
+                    indices: indices(dl, id),
+                    colors: dl.series[slot].point_colors.clone(),
+                    generation: dl.series_generation(id),
+                    aliased: dl.series[slot].time_alias.is_some(),
+                    alignment: dl.time_alignment(id),
+                }
+            })
+            .collect();
+        (dl.merged_times().to_vec(), dl.base_index(), series)
+    }
+
+    /// Three union series (`a` with point colors, `b` offset in time, `c` sparse), an as-of
+    /// overlay and a `2 * close` output aliasing `a`.
+    fn trim_layer() -> (DataLayer, [SeriesId; 5]) {
+        let mut dl = DataLayer::new();
+        let ids = [(); 5].map(|()| dl.add_series());
+        let [a, b, c, overlay, output] = ids;
+        let values = |rows: usize| (0..rows).map(|row| row as f64 + 1.0).collect::<Vec<_>>();
+        set(&mut dl, a, &(1..=12).collect::<Vec<_>>(), &values(12));
+        set(&mut dl, b, &(5..=16).collect::<Vec<_>>(), &values(12));
+        set(&mut dl, c, &[3, 6, 9, 12, 15, 18], &values(6));
+        set(&mut dl, overlay, &[2, 7, 11, 14, 20], &values(5));
+        assert!(dl.set_time_alignment(overlay, AS_OF));
+        let colors = |base: u32| Some((0..12).map(|row| base + row).collect::<Vec<u32>>());
+        assert!(dl.set_point_colors(a, [colors(100), None, colors(300)]));
+        let doubled = (2..12).map(|row| f64::from(row) * 2.0).collect();
+        assert!(dl.set_single_data_aligned(output, a, 2, doubled));
+        (dl, ids)
+    }
+
+    /// Run `trims` as one `trim_fronts` on one layer and as sequential `trim_front` calls on an
+    /// identical one; both must end in the same state. Returns each arm's union and reindex passes.
+    fn assert_trim_fronts_equals_sequential(
+        prepare: impl Fn(&mut DataLayer, [SeriesId; 5]),
+        trims: impl Fn([SeriesId; 5]) -> Vec<(SeriesId, usize)>,
+    ) -> (u64, u64) {
+        let (mut batched, ids) = trim_layer();
+        let (mut sequential, _) = trim_layer();
+        for dl in [&mut batched, &mut sequential] {
+            prepare(dl, ids);
+            dl.begin_merged_time_transaction();
+        }
+        let trims = trims(ids);
+        let points = |dl: &DataLayer| (dl.time_points_generation(), dl.time_index_generation());
+        let (batched_points, sequential_points) = (points(&batched), points(&sequential));
+        let batched_passes = batched.index_rebuilds();
+        batched.trim_fronts(&trims);
+        let batched_passes = batched.index_rebuilds() - batched_passes;
+        let sequential_passes = sequential.index_rebuilds();
+        for &(id, keep) in &trims {
+            sequential.trim_front(id, keep);
+        }
+        let sequential_passes = sequential.index_rebuilds() - sequential_passes;
+
+        assert_eq!(observe(&batched, &ids), observe(&sequential, &ids));
+        // A batch bumps the union counters at most once where sequential trims bump them per
+        // step, so they only agree on whether the union moved at all.
+        assert_eq!(
+            points(&batched) != batched_points,
+            points(&sequential) != sequential_points
+        );
+        assert_eq!(
+            batched.take_merged_time_mapping(),
+            sequential.take_merged_time_mapping()
+        );
+        for id in &ids[..3] {
+            assert_lod_matches_fresh(&batched, *id);
+        }
+        assert_plot_lod_matches_fresh(&batched, ids[3]);
+        (batched_passes, sequential_passes)
+    }
+
+    #[test]
+    fn trim_fronts_matches_sequential_trims_with_one_union_rebuild() {
+        // Three series lose rows: one union merge and one reindex instead of three of each.
+        let passes = assert_trim_fronts_equals_sequential(
+            |_, _| {},
+            |[a, b, c, ..]| vec![(a, 8), (b, 9), (c, 4)],
+        );
+        assert_eq!(passes, (2, 6));
+
+        // Under a replay clock a row count keeps rows past the clock, exactly as before.
+        let passes = assert_trim_fronts_equals_sequential(
+            |dl, _| assert!(dl.set_time_cutoff(Some(9))),
+            |[a, b, c, ..]| vec![(a, 8), (b, 9), (c, 4)],
+        );
+        assert_eq!(passes, (2, 6));
+
+        // Trimming the aliased source and the output together.
+        let passes = assert_trim_fronts_equals_sequential(
+            |_, _| {},
+            |[a, _, _, _, output]| vec![(a, 6), (output, 3)],
+        );
+        assert_eq!(passes, (2, 4));
+    }
+
+    #[test]
+    fn trim_fronts_skips_unknown_ids_keeps_no_ops_free_and_applies_duplicates_in_order() {
+        // Nothing to drop and an unknown id: no union work at all.
+        let passes = assert_trim_fronts_equals_sequential(
+            |_, _| {},
+            |[a, b, ..]| vec![(a, 12), (b, 99), (9_999, 0)],
+        );
+        assert_eq!(passes, (0, 0));
+
+        // The second entry for a series sees the rows the first one left.
+        let passes = assert_trim_fronts_equals_sequential(
+            |_, _| {},
+            |[a, b, ..]| vec![(a, 8), (a, 5), (b, 7)],
+        );
+        assert_eq!(passes, (2, 6));
+
+        // An aliased output owns its times first, even when it drops nothing.
+        let (mut dl, [a, .., output]) = trim_layer();
+        let rebuilds = dl.index_rebuilds();
+        dl.trim_fronts(&[(output, 10)]);
+        assert_eq!(dl.index_rebuilds(), rebuilds);
+        assert!(dl.series[dl.series_slot(output).unwrap()]
+            .time_alias
+            .is_none());
+        assert_eq!(
+            dl.series_data(output).unwrap().0,
+            &dl.series_data(a).unwrap().0[2..]
+        );
+        let passes =
+            assert_trim_fronts_equals_sequential(|_, _| {}, |[.., output]| vec![(output, 10)]);
+        assert_eq!(passes, (0, 0));
+        let (mut dl, _) = trim_layer();
+        assert_eq!(dl.trim_front(9_999, 0), None);
+    }
+
+    /// The sorted union the way the merge replaced: concatenate, sort, deduplicate.
+    fn sorted_union(runs: &[Vec<i64>]) -> Vec<i64> {
+        let mut all = runs.concat();
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    #[test]
+    fn merge_sorted_runs_equals_sorting_the_concatenation() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let random_run = |rng: &mut Rng, len: u64, span: u64| {
+            let mut run = (0..len).map(|_| rng.below(span) as i64).collect::<Vec<_>>();
+            run.sort_unstable();
+            run.dedup();
+            run
+        };
+        let check = |runs: Vec<Vec<i64>>| {
+            let mut slices = runs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let mut merged = vec![-1];
+            merged.clear();
+            merge_sorted_runs(&mut slices, &mut merged);
+            assert_eq!(merged, sorted_union(&runs), "{runs:?}");
+        };
+        check(Vec::new());
+        check(vec![Vec::new(), Vec::new()]);
+        check(vec![vec![3, 5, 9]]);
+        check(vec![Vec::new(), vec![1, 2], Vec::new(), vec![2, 3]]);
+        // A run that repeats a time still yields each time once, as the sort did.
+        check(vec![vec![1, 1, 2], vec![2, 2, 3]]);
+        let identical = random_run(&mut rng, 200, 1_000);
+        check(vec![identical.clone(); 4]);
+        check(vec![identical; MAX_MERGED_RUNS]);
+        for _ in 0..200 {
+            let runs = (0..1 + rng.below(MAX_MERGED_RUNS as u64))
+                .map(|_| {
+                    let (len, span) = (rng.below(60), 1 + rng.below(150));
+                    random_run(&mut rng, len, span)
+                })
+                .collect::<Vec<_>>();
+            check(runs);
+        }
+    }
+
+    #[test]
+    fn merged_union_matches_a_sorted_concatenation_below_and_above_the_merge_width() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for series_count in [
+            1,
+            2,
+            MAX_MERGED_RUNS,
+            MAX_MERGED_RUNS + 1,
+            2 * MAX_MERGED_RUNS,
+        ] {
+            let mut dl = DataLayer::new();
+            let mut runs = Vec::new();
+            for _ in 0..series_count {
+                let id = dl.add_series();
+                let mut times = (0..40).map(|_| rng.below(120) as i64).collect::<Vec<_>>();
+                times.sort_unstable();
+                times.dedup();
+                let values = vec![1.0; times.len()];
+                set(&mut dl, id, &times, &values);
+                runs.push(times);
+            }
+            assert_eq!(
+                dl.merged_times(),
+                sorted_union(&runs),
+                "{series_count} series"
+            );
+            // The replay cutoff masks every run the same way before the merge.
+            assert!(dl.set_time_cutoff(Some(60)));
+            let visible = runs
+                .iter()
+                .map(|run| run.iter().copied().filter(|&time| time <= 60).collect())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                dl.merged_times(),
+                sorted_union(&visible),
+                "{series_count} series, cutoff"
+            );
+        }
+    }
+
     #[test]
     fn rows_count_as_data_series_anchor_the_base_index() {
         let mut dl = DataLayer::new();
@@ -4059,9 +4378,24 @@ mod tests {
                     }
                     8 => {
                         let len = dl.series_data(target).unwrap().0.len();
-                        dl.trim_front(target, len.saturating_sub(1 + rng.below(3) as usize));
-                        full = true;
-                        format!("trim {target}")
+                        let keep = len.saturating_sub(1 + rng.below(3) as usize);
+                        if rng.chance(40) {
+                            // One retention over two distinct series, in one transaction.
+                            let others = [main, volume, overlay]
+                                .into_iter()
+                                .filter(|&id| id != target)
+                                .collect::<Vec<_>>();
+                            let other = others[rng.below(2) as usize];
+                            let other_len = dl.series_data(other).unwrap().0.len();
+                            let other_keep = other_len.saturating_sub(1 + rng.below(3) as usize);
+                            dl.trim_fronts(&[(target, keep), (other, other_keep)]);
+                            full = true;
+                            format!("trim batch {target} and {other}")
+                        } else {
+                            dl.trim_front(target, keep);
+                            full = true;
+                            format!("trim {target}")
+                        }
                     }
                     9 => {
                         let cutoff = (!rng.chance(40)).then(|| rng.below(160) as i64);

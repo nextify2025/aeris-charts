@@ -265,7 +265,7 @@ pub use aeris_charts_core::scale::session_slots::{
     session_window_bounds, OutOfSessionPolicy, SessionBarGrid,
 };
 use aeris_charts_core::scale::time_scale_core::{TimeScaleCore, TimeScaleOptions};
-use aeris_charts_core::scale::time_tick_marks::TimeTickMarks;
+use aeris_charts_core::scale::time_tick_marks::{self, TimeTickMarks};
 use aeris_charts_core::TimePointIndex;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType};
@@ -1714,6 +1714,10 @@ impl Default for Pane {
     }
 }
 
+/// A linked-crosshair position. `price` is a price on `pane_index`'s default price scale (the
+/// scale the crosshair label reads) and `time` an exact merged chart time. Applying it puts the
+/// horizontal line at that price's chart-content y, held on the pane's edge when the price is
+/// outside the pane's visible range.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrosshairSyncPosition {
     pub time: f64,
@@ -1757,6 +1761,19 @@ pub(crate) struct PreparedOptionsPatch {
     exchange_time: exchange_time_api::ExchangeTimePatch,
     tick_marks: Option<Option<Vec<time_tick_marks_api::TimeTickMark>>>,
     bar_time_label: Option<BarTimeLabel>,
+}
+
+/// The engine feature that writes a series' rows. A series has at most one: every attach path
+/// refuses a series that already has another owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeriesOwner {
+    Footprint,
+    Synthetic,
+    Resampled,
+    /// A candlestick or bar presentation bound to a chart-level trade stream.
+    TradeBars,
+    /// A CVD, delta, or trade-volume study of a chart-level trade stream.
+    TradeStudy,
 }
 
 /// Platform-independent state for one chart instance.
@@ -3448,7 +3465,10 @@ impl ChartEngine {
         self.update_series_bars_sanitized_inner(id, times, open, high, low, close)
     }
 
-    fn update_series_bars_sanitized_inner(
+    /// The unguarded batch update for engine features that own the series they write. `0` means
+    /// nothing was applied (an empty batch, or rows the data layer rejected), so a caller that
+    /// keeps a full-install fallback takes it.
+    pub(crate) fn update_series_bars_sanitized_inner(
         &mut self,
         id: SeriesId,
         times: Vec<i64>,
@@ -3457,6 +3477,9 @@ impl ChartEngine {
         low: Vec<f64>,
         close: Vec<f64>,
     ) -> usize {
+        if times.is_empty() {
+            return 0;
+        }
         self.invalidate_frame_series(id);
         let previous_generation = self.data.series_generation(id).unwrap_or(0);
         let Some(from) = self
@@ -3701,7 +3724,8 @@ impl ChartEngine {
         self.install_series_data_inner(id, times, open, high, low, close)
     }
 
-    fn install_series_data_inner(
+    /// The unguarded installer for engine features that own the series they write.
+    pub(crate) fn install_series_data_inner(
         &mut self,
         id: SeriesId,
         times: Vec<i64>,
@@ -3729,16 +3753,50 @@ impl ChartEngine {
         })
     }
 
-    /// Source-owned series may only be mutated through their canonical footprint/trade or
-    /// synthetic-bar ingestion API. Generic OHLC writes would desynchronize the visible
-    /// projection from the state that owns replay, sequence identity, and incremental updates.
+    /// Which engine feature writes a series' rows, if any. Computed from the ownership registries
+    /// on demand, so removing a series or its owner can never leave a stale answer behind.
+    fn series_owner(&self, id: SeriesId) -> Option<SeriesOwner> {
+        if self.is_footprint_series(id) {
+            Some(SeriesOwner::Footprint)
+        } else if self.synthetic_series.contains_key(&id) {
+            Some(SeriesOwner::Synthetic)
+        } else if self
+            .resampled_series
+            .values()
+            .any(|binding| binding.target == id || binding.volume_target == Some(id))
+        {
+            Some(SeriesOwner::Resampled)
+        } else if self.is_trade_bar_dependent(id) {
+            Some(SeriesOwner::TradeBars)
+        } else if self
+            .trade_dependents
+            .values()
+            .flatten()
+            .any(|dependent| dependent.series_id == id)
+        {
+            Some(SeriesOwner::TradeStudy)
+        } else {
+            None
+        }
+    }
+
+    /// Source-owned series may only be mutated by their owning engine feature: the footprint and
+    /// trade-stream projections, synthetic bars, and resampling write them through the internal
+    /// `*_inner` installers. Every public host write refuses them, because a generic write would
+    /// desynchronize the visible rows from the state that owns replay, sequence identity, and
+    /// incremental updates.
     fn is_source_owned_series(&self, id: SeriesId) -> bool {
-        self.is_footprint_series(id)
-            || self.synthetic_series.contains_key(&id)
-            || self
-                .resampled_series
-                .values()
-                .any(|binding| binding.target == id || binding.volume_target == Some(id))
+        self.series_owner(id).is_some()
+    }
+
+    /// Whether an engine feature writes this series' rows: a footprint, a trade-bound candle or
+    /// bar, a CVD, delta, or trade-volume study, a resampled or synthetic-bar target. Every host
+    /// data write to such a series is refused with the write entry's ordinary refusal value
+    /// (`false`, `0`, `None`, `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`),
+    /// and those values also mean an unknown or removed id or invalid data. Hosts that must tell
+    /// them apart ask here. Indicator outputs are not source-owned in this sense.
+    pub fn series_is_source_owned(&self, id: SeriesId) -> bool {
+        self.is_source_owned_series(id)
     }
 
     pub(crate) fn install_footprint_projection(
@@ -3852,8 +3910,13 @@ impl ChartEngine {
         key_base: i64,
         projection: SequenceProjectionColumns,
     ) -> bool {
+        // A bound candle may be shown as any OHLC-derived chart type; only host-valued kinds and
+        // footprints have another writer.
         debug_assert!(self.series_entry(id).is_some_and(|series| {
-            matches!(series.kind, SeriesKind::Candlestick | SeriesKind::Bar)
+            !matches!(
+                series.kind,
+                SeriesKind::Custom | SeriesKind::Feature | SeriesKind::Footprint
+            )
         }));
         self.install_sequence_projection_inner(id, Some(key_base), projection)
     }
@@ -3978,8 +4041,13 @@ impl ChartEngine {
         from: usize,
         projection: SequenceProjectionColumns,
     ) -> usize {
+        // A bound candle may be shown as any OHLC-derived chart type; only host-valued kinds and
+        // footprints have another writer.
         debug_assert!(self.series_entry(id).is_some_and(|series| {
-            matches!(series.kind, SeriesKind::Candlestick | SeriesKind::Bar)
+            !matches!(
+                series.kind,
+                SeriesKind::Custom | SeriesKind::Feature | SeriesKind::Footprint
+            )
         }));
         self.update_sequence_projection_bars_inner(id, from, projection)
     }
@@ -4137,14 +4205,16 @@ impl ChartEngine {
         let footprint = self
             .series_entry(id)
             .is_some_and(|series| series.footprint.is_some());
-        let hidden = if footprint {
-            0
+        if footprint {
+            // The footprint's own rows leave with its stream's other presentations, in one
+            // data-layer transaction (`trim_footprint_rows_front`).
+            self.trim_feature_rows_front(id, keep);
+            self.trim_footprint_rows_front(id, keep);
         } else {
-            self.data.series_rows(id).unwrap_or(visible) - visible
-        };
-        self.data.trim_front(id, keep + hidden);
-        self.trim_feature_rows_front(id, keep + hidden);
-        self.trim_footprint_rows_front(id, keep);
+            let hidden = self.data.series_rows(id).unwrap_or(visible) - visible;
+            self.data.trim_front(id, keep + hidden);
+            self.trim_feature_rows_front(id, keep + hidden);
+        }
         true
     }
 
@@ -4370,7 +4440,9 @@ impl ChartEngine {
     /// reference `chart.setCrosshairPosition(price, time, series)` (chart-model.ts
     /// `setAndSaveSyntheticPosition`): position the crosshair at a data point without a DOM
     /// event. The time must land exactly on a merged time point (false otherwise); x is that
-    /// bar's coordinate and y the price converted through the given series' price scale.
+    /// bar's coordinate and y the price converted through the given series' price scale (the
+    /// queued sync event carries a price on the pane's default scale, see
+    /// [`CrosshairSyncPosition`]).
     /// Works headless — the next built frame draws it; hosts emit their crosshair event.
     pub fn set_crosshair_position(&mut self, price: f64, time: f64, series_id: SeriesId) -> bool {
         if !price.is_finite() || self.is_series_removed(series_id) {
@@ -4392,17 +4464,56 @@ impl ChartEngine {
         };
         let x = self.time_scale.index_to_coordinate(index);
         self.crosshair = Some((x, y));
+        let pane_index = self
+            .series_entry(series_id)
+            .map_or(0, |series| series.pane_index);
+        // The synced price is a price on the pane's default scale, which is what a linked chart
+        // converts. The raw host price is kept only when it already is one; a series on another
+        // scale (or on another percentage/indexed base) is re-read from the crosshair y so the
+        // receiver lands on the same line.
+        let sync_price = if self.series_price_is_on_pane_default_scale(series_id) {
+            price
+        } else {
+            self.pane_coordinate_to_price(pane_index, y)
+                .unwrap_or(price)
+        };
         self.queue_sync_event(ChartSyncEventKind::Crosshair {
             position: CrosshairSyncPosition {
                 time,
-                price,
-                pane_index: self
-                    .series_entry(series_id)
-                    .map_or(0, |series| series.pane_index),
+                price: sync_price,
+                pane_index,
             },
         });
         self.invalidate_frame_overlay();
         true
+    }
+
+    /// Whether a price on `series_id` is already a price on its pane's default scale: the series
+    /// sits on that scale and, in the modes that read a per-series base (percentage and indexed),
+    /// shares the default series' base.
+    fn series_price_is_on_pane_default_scale(&self, series_id: SeriesId) -> bool {
+        let Some(series) = self.series_entry(series_id) else {
+            return false;
+        };
+        let pane_index = series.pane_index;
+        if series.price_scale_target != self.pane_default_scale_target(pane_index) {
+            return false;
+        }
+        let series_based = self
+            .price_scale_for(pane_index, series.price_scale_target)
+            .is_some_and(|scale| {
+                matches!(
+                    scale.mode(),
+                    PriceScaleMode::Percentage | PriceScaleMode::IndexedTo100
+                )
+            });
+        if !series_based {
+            return true;
+        }
+        let Some((from, _)) = self.visible_range_for_frame() else {
+            return false;
+        };
+        self.series_base_value(series_id, from) == Some(self.pane_default_scale(pane_index, from).1)
     }
 
     /// reference `chart.clearCrosshairPosition`. The engine keeps a single stored position — the
@@ -4436,11 +4547,12 @@ impl ChartEngine {
         let (x, y) = self.crosshair?;
         let logical = self.time_scale.coordinate_to_index(x);
         let time = self.axis_time_seconds_at(logical as usize)?;
-        let pane_index = self.pane_at_y(y).unwrap_or(0);
-        let pane = self.panes.get(pane_index)?;
+        // The crosshair y is chart-content space and every scale already applies its own pane
+        // offset, so y goes to the scale untouched. A separator resolves to the pane above.
+        let pane_index = self.pane_index_at_y(y);
         Some(CrosshairSyncPosition {
             time,
-            price: pane.price_scale.coordinate_to_price(y - pane.top, 0.0),
+            price: self.pane_coordinate_to_price(pane_index, y)?,
             pane_index,
         })
     }
@@ -4462,8 +4574,16 @@ impl ChartEngine {
         let Some(pane) = self.panes.get(position.pane_index) else {
             return false;
         };
-        let y = pane.price_scale.price_to_coordinate(position.price, 0.0) + pane.top;
-        let next = (self.time_scale.index_to_coordinate(index), y);
+        let (top, bottom) = (pane.top, pane.top + pane.height);
+        let Some(y) = self.pane_price_to_coordinate(position.pane_index, position.price) else {
+            return false;
+        };
+        // The crosshair y is one chart-content value: keep it inside the requested pane so a
+        // price outside that pane's range sits on its edge instead of drawing in a neighbour.
+        let next = (
+            self.time_scale.index_to_coordinate(index),
+            y.max(top).min(bottom),
+        );
         let changed = self.crosshair != Some(next);
         self.crosshair = Some(next);
         if changed {
@@ -5089,6 +5209,22 @@ impl ChartEngine {
                 // Several non-time bars may open within one second.
                 time > last || (sequence.is_some() && time == last)
             });
+        // A retention trim on a time axis leaves the old union's tail as the new union's head. The
+        // weights describe the union as of the last sync, which the mapping's old union extends
+        // by any points a tip appended in place before the trim rebuilt it, so the check is
+        // against that old union, not against the key mapping. A sequence axis takes its tick
+        // times from the bar sidecar, which the union does not describe, so it re-weighs everything.
+        let front_trim = merged_time_mapping
+            .as_ref()
+            .filter(|mapping| {
+                time_points_changed
+                    && sequence.is_none()
+                    && self.synced_points_len > 0
+                    && mapping.old_times().get(self.synced_points_len - 1).copied()
+                        == self.synced_last_time
+            })
+            .and_then(|mapping| time_tick_marks::front_trim(mapping.old_times(), times))
+            .filter(|&dropped| dropped < self.synced_points_len);
         if appended {
             for index in self.synced_points_len..tick_len {
                 let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time_shifted(
@@ -5096,6 +5232,33 @@ impl ChartEngine {
                     tick_time(index - 1),
                     label_shift,
                     &self.exchange_time,
+                ) as u8;
+                self.tick_marks.push_weight(index as i64, weight);
+            }
+        } else if let Some(dropped) = front_trim {
+            // A retention trim on a time axis (and the points a tip appended with it): the
+            // surviving points keep their timestamps and so their weights. Only the first point,
+            // which has no predecessor, is re-weighed, then the new tail.
+            let time = &self.exchange_time;
+            let first_weight = if tick_len > 1 {
+                let span = tick_time(tick_len - 1) - tick_time(0);
+                time_tick_marks::first_point_weight_shifted_in(
+                    tick_time(0),
+                    span,
+                    tick_len,
+                    label_shift,
+                    time,
+                )
+            } else {
+                0
+            };
+            self.tick_marks.drop_front(dropped, first_weight);
+            for index in self.synced_points_len - dropped..tick_len {
+                let weight = time_tick_marks::weight_by_time_shifted(
+                    tick_time(index),
+                    tick_time(index - 1),
+                    label_shift,
+                    time,
                 ) as u8;
                 self.tick_marks.push_weight(index as i64, weight);
             }

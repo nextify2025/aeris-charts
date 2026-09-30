@@ -361,6 +361,51 @@ unless `break_on_trading_day: true` asks them to break at each exchange trading 
 bar axis such as Renko or tick bars, the day of each bar's open time); whitespace rows never break
 a line.
 
+## Coordinates and panes
+
+Every public coordinate lives in one chart-content space, and it is never pane-local. `x` is CSS px
+from the plot-area left edge (right of the left price strip), so the container `x` is
+`pane.get_geometry().left + x`. `y` is CSS px from the top of the stacked pane area, which is pane 0's
+top. A pane spans `[geometry.top, geometry.top + geometry.height]` in that `y`; its pane-local `y` is
+`y - geometry.top`. The same space carries `series.price_to_coordinate`/`coordinate_to_price`,
+`chart.price_to_coordinate`/`coordinate_to_price`, `time_scale()` conversions,
+`mouse_event_params.point`, the crosshair, hit tests, drawings, and trading geometry, so a `y` from one
+API can be handed to any other. All values reflect the last layout pass: after `pane.set_height`, a
+separator drag, or a pane move, read them again once the chart has laid out.
+
+**Choosing a pane.** A series handle converts on its own pane and price scale, in that scale's mode and
+base. A host that needs a lower pane's coordinates keeps a handle to a series in that pane:
+
+```ts
+// `rsi` is a series handle in pane 1, for example from `chart.add_rsi(candles, 14)`.
+const pane = chart.panes()[1].get_geometry();
+const y = rsi.price_to_coordinate(70); // in pane 1's [top, top + height] while 70 is in range; never pane-local
+const paneLocalY = y! - pane.top;      // pane-relative chrome subtracts the pane top itself
+rsi.coordinate_to_price(y!);           // 70
+```
+
+`chart.price_to_coordinate(price)` converts on pane 0's default scale (the first visible non-overlay
+series' scale, else the right scale), and `chart.coordinate_to_price(y)` uses the default scale of the
+pane containing `y`: a separator belongs to the pane above and a `y` below the panes to the last pane.
+That is the scale the crosshair label reads in that pane, so the two never disagree. Neither follows
+series creation order or an overlay's scale. Time, logical, and `x` conversions are the same for every
+pane.
+
+**Two other spaces.** Plugin draw-context converters (`price_to_y`, `time_to_x`, `logical_to_x`) return
+bitmap px of the whole chart with `x` including `pane_left`, the space the plugin canvas draws in;
+subtract `pane_left` and divide by `dpr` to compare them with the CSS-px converters above. A plugin
+axis-label descriptor's `coordinate` is pane-local (price: px from the pane top; time: px from the
+plot-area left) unless a series primitive supplies `price`, which is converted on the series' scale.
+
+**Linked crosshairs.** `crosshair_sync_position()` and the `crosshair` events from `take_sync_events()`
+carry `pane_index` and a `price` on that pane's default scale, with the pane picked from the crosshair
+`y` (a separator counts as the pane above). `set_crosshair_position(price, time, series)` places the
+line through the given series' scale; the emitted price is the raw `price` when that series is on the
+pane's default scale (and, in percentage and indexed modes, shares its base), otherwise it is
+re-expressed on the default scale so a linked chart lands on the same line. `apply_external_crosshair`
+converts the price on the requested pane's default scale and holds the line inside that pane: a price
+outside the pane's visible range sits on the pane's edge instead of drawing in a neighbouring pane.
+
 ## Time, exchange time zone, and trading sessions
 
 Canonical chart time is whole UTC seconds. `business_day` values and strict `"YYYY-MM-DD"` strings
@@ -670,6 +715,31 @@ closing second, such as the 16:00:00 closing cross. A print that is folded or ex
 part in aggressor classification. A trade `session_id` change always starts a new bar and resets
 session delta; the windows already split the morning and afternoon, so a per-date id is enough.
 
+**Engine-owned series.** A bound candle or bar and the volume, CVD, and delta studies are written
+only by their trade stream, and one series has one engine writer: `bind_trade_bar_series_to_stream`
+throws `invalid_options` for a series that is not a candlestick or bar, carries a `max_points`
+cap, or is already a footprint, a study, a resampled target, or a synthetic-bar series (rebinding a
+bound candle to another stream stays allowed), and a footprint, resampled target, or synthetic
+series cannot be created from a series that a stream writes. Their `set_data`, `set_data_typed`,
+`update`, `update_typed`, `merge`, `merge_typed` (with or without `{ sequence }`), `pop`, and
+`set_ring_source` are rejected: the data calls record `last_ingestion_diagnostics()` as
+`{ status: "rejected", code: "derived_series" }`, warn, and change nothing, `pop` records the same
+rejection without repainting or firing `data_changed`, and `set_ring_source` throws
+`unsupported_operation` (unbinding with `null` still works, and a ring bound before the series
+became derived keeps draining into `frame_stats().ring_dropped_rows` until unbound). Styling, pane
+moves, visibility, `histogram_updown_rule`, and a study's own `max_points` still apply; a bound
+candle refuses `max_points` because it follows the stream's retention. Feed the stream instead.
+
+Rust hosts get the same refusals from the ordinary write entries (`false`, `0`, `None`,
+`Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`), which also mean an unknown id or
+invalid data, so `ChartEngine::series_is_source_owned(id)` tells an engine-owned series apart, and
+`ChartEngine::apply_momentum_histogram_colors` returns `false` for the delta and volume studies.
+`FootprintError::SeriesOwned` is what `bind_trade_bar_series_to_stream` returns for a candlestick
+or bar that a resampler, synthetic bars, or a study (converted to a candle) already writes, and what
+`configure_footprint_series` returns for any series a stream, study, resampler, or synthetic bars
+write. `bind_trade_bar_series_to_stream` checks the series kind and `max_points` first, so a
+footprint or a scalar study gets `UnsupportedTradeBarSeries` or `InvalidAggregation` instead.
+
 **Live, corrections, and replay.** In-order prints update the forming bar in place and the first
 print at or after a bar boundary opens the next bar (`"tip"`); late or corrected prints rebuild the
 stream once (`"historical"`). The volume histogram, CVD/delta studies, and footprints on the same
@@ -749,7 +819,10 @@ source) or output, and a binding's volume source may not be its own volume targe
 `invalid_options` ("resampling dependencies may not be chained or cyclic") and changes nothing.
 
 The targets are engine-owned: `set_data`, `update`, `update_typed`, `merge`, and `merge_typed` on
-them are rejected (`last_ingestion_diagnostics().status === "rejected"`) and change nothing.
+them are rejected (`last_ingestion_diagnostics()` reports `status: "rejected"` with
+`code: "derived_series"`) and change nothing, and `pop` records the same rejection. A target must
+not be a footprint, a trade-bound candle, a trade study, or a synthetic-bar series (`invalid_options`);
+a trade-bound candle or the trade volume study may be the binding's source, however.
 Removing any series of a binding (source, volume source, or a target) removes the binding together
 with its target series, like indicator outputs. `chart.resampled_bars(target)` returns the derived
 bars with their `session_id` and aggregated source-row count. Rust hosts call
@@ -929,10 +1002,13 @@ Streaming ingestion keeps reference `series.update` semantics: a point replaces 
 time. `update()` reports the payloads that silently rewrite a bar with a machine-readable
 diagnostics `code` pointing to `merge()`: `value_on_ohlc_series` (`{ time, value }` flattens a
 candlestick/bar), `price_less_payload` (for example `{ time, volume }` becomes whitespace), and the
-rejected `partial_ohlc`. `series.merge(point, options?)` is the engine-owned partial path: present
-open/high/low/close/value fields overwrite, absent fields keep the existing bar, and candlestick/bar
-results are normalized so `high >= max(open, close)` and `low <= min(open, close)` (a close-only tick
-for a new time creates O=H=L=C; scalar series take `value`). A merge without a price field is
+rejected `partial_ohlc`. A write to an engine-owned series (a trade-bound candle or study,
+resampled or synthetic bars) is rejected with `derived_series` on every data path; a footprint
+handle throws `unsupported_operation` instead. `series.merge(point, options?)` is the engine-owned
+partial path: present open/high/low/close/value fields overwrite, absent fields keep the existing
+bar, and candlestick/bar results are normalized so `high >= max(open, close)` and
+`low <= min(open, close)` (a close-only tick for a new time creates O=H=L=C; scalar series take
+`value`). A merge without a price field is
 rejected with `empty_merge`; volume and turnover merge into their own series. `series.merge_typed(columns,
 options?)` is the columnar form: row `i` merges like `merge()` with `NaN` entries and omitted columns
 absent, rows apply in input order with one engine synchronization, and one invalid row rejects the

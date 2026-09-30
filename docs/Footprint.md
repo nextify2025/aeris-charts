@@ -114,6 +114,20 @@ created after its anchor bar was evicted anchors at the first retained bar). Del
 read final delta, Max/Min Delta, delta percentage, and bid/ask/unknown volumes from the same bars,
 and the volume dependent reads each bar's total volume for ordinary tick-built candles.
 
+A stream is the only writer of its dependents. A trade-bound candle or bar and the CVD, delta, and
+volume studies refuse every host data write (set, install, update, batch, merge, sequenced update,
+per-point colors, pop), exactly like a footprint, so a stray write can no longer rewrite the row
+keys that every other presentation of a non-time stream continues from. One series has one engine
+writer: `configure_footprint_series` returns `FootprintError::SeriesOwned` for a series that a
+stream, a study, a resampler, or synthetic bars already write, and
+`bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler, synthetic
+bars, or a study converted to a candle writes (a footprint or scalar study fails the candle-kind
+check first, with `UnsupportedTradeBarSeries`; a bound candle rebinds to another stream freely).
+Resampling and synthetic-bar configuration refuse such a series as their target. The tip and
+rebuild paths write through the engine's internal installers, not the host entry points, so the
+guard costs a tip nothing. Retention still follows the stream: a bound candle refuses a `max_points`
+cap, while a study keeps its own.
+
 Large-trade bubbles are bounded marker dependents: translucent circles centred on the traded price,
 colored by aggressor side, with area proportional to volume relative to the largest retained bubble.
 They support minimum-volume filtering, optional same-side same-price consecutive-print aggregation
@@ -173,7 +187,9 @@ result equals a clean rebuild of that dependent. The tip that crosses a retentio
 hysteresis margin, 1/32 of the cap) evicts the leading bars, exactly the trades they aggregated, and
 the bubbles made only of those trades in place: it reconstructs nothing and never scans the
 retained tape, so its work is proportional to the evicted trades plus the retained rows (renumbering
-the retained bars and the data layer's own trim of the affected rows).
+the retained bars and the data layer's own trim of the affected rows). Every presentation of the
+stream leaves the data layer in one transaction: the timestamp union merges and every plot
+reindexes once, however many presentations the stream has.
 Closed bars are immutable on the
 live path. Historical insertion/correction reconstructs canonical state once after the final tape is
 known and replaces the projection once. The current reconstruction is intentionally full-series;
@@ -238,9 +254,17 @@ construction, with retention bounded to the configured history. It then streams 
 live tips (crossing the retention ceiling once) into the chart with bound candles, CVD, delta, and
 bubbles, requires every tip's work counters to stay within the changed bar suffix and the new
 trade with no tape reconstruction, budgets the tip p99 at 0.25 ms, and budgets the slowest tip (the
-one crossing the ceiling) at one 16.67 ms frame. Commands and thresholds are kept in the release
-examples so a clean `--release` run can be compared without importing machine-specific timings into
-the repository; `perf_gate` prints the measured tip p99 and slowest tip against these budgets.
+one crossing the ceiling) at one 16.67 ms frame. The trim tip also runs exactly one union merge
+and one reindex for the whole data layer, which `perf_gate` requires alongside the work counters.
+Commands and thresholds are kept in the release examples so a clean `--release` run can be
+compared without importing machine-specific timings into the repository; `perf_gate` prints the
+measured tip p99 and slowest tip against these budgets. Its report-only Target D2 prints the
+data layer's retention trim across series counts (1, 4, 8) and retained rows (2,500 to 40,000),
+one `trim_fronts` against one `trim_front` per series, because the trim scales with both. It has no
+threshold: the trim stays proportional to the retained rows, and a cost independent of the cap
+(absolute row identity in the summary pyramid and plot indices, and a lazy head offset on the
+series columns) is deferred for a product decision on whether trim latency must not grow with the
+cap; Target D2 at 28,800 rows and four or more series, against a bar of about 2 ms, is its measure.
 
 The finite GPUI real-window probe was also exercised on the current Windows display with the
 footprint fixture: 30 frames at DPR 1.25 and 500 source bars produced 24 cached text runs (zero

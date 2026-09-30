@@ -1020,10 +1020,44 @@ fn translate_prims_x(prims: &mut [Prim], dx: i32) {
             Prim::Text { x, .. } | Prim::RotatedText { x, .. } => *x += dxf,
             Prim::Image { rect, .. } => rect[0] += dxf,
             Prim::Polyline { .. }
+            | Prim::Segments { .. }
             | Prim::AreaFill { .. }
             | Prim::BandFill { .. }
             | Prim::Background { .. } => {}
         }
+    }
+}
+
+/// Shift every point-pool index of `prim` by `offset` (wrapping, so a negative shift is passed as
+/// its two's complement). Retained layers and drawing parts keep pool-relative indices; assembling
+/// them into a frame pane moves them to their place in the pane's pool. The match is exhaustive so
+/// a future prim that references the pool cannot be forgotten here and read the wrong points.
+fn shift_point_indices(prim: &mut Prim, offset: u32) {
+    match prim {
+        Prim::Polyline { first_point, .. }
+        | Prim::Segments { first_point, .. }
+        | Prim::AreaFill { first_point, .. } => {
+            *first_point = first_point.wrapping_add(offset);
+        }
+        Prim::BandFill {
+            upper_first,
+            lower_first,
+            ..
+        } => {
+            *upper_first = upper_first.wrapping_add(offset);
+            *lower_first = lower_first.wrapping_add(offset);
+        }
+        Prim::Rect { .. }
+        | Prim::RectFrame { .. }
+        | Prim::HLine { .. }
+        | Prim::VLine { .. }
+        | Prim::RoundRect { .. }
+        | Prim::Circle { .. }
+        | Prim::Triangle { .. }
+        | Prim::Background { .. }
+        | Prim::Text { .. }
+        | Prim::RotatedText { .. }
+        | Prim::Image { .. } => {}
     }
 }
 
@@ -1056,20 +1090,7 @@ fn append_drawing_part(
     prims.reserve(prim_end - prim_start);
     for prim in &retained_prims[prim_start..prim_end] {
         let mut prim = prim.clone();
-        match &mut prim {
-            Prim::Polyline { first_point, .. } | Prim::AreaFill { first_point, .. } => {
-                *first_point = first_point.wrapping_add(adjust);
-            }
-            Prim::BandFill {
-                upper_first,
-                lower_first,
-                ..
-            } => {
-                *upper_first = upper_first.wrapping_add(adjust);
-                *lower_first = lower_first.wrapping_add(adjust);
-            }
-            _ => {}
-        }
+        shift_point_indices(&mut prim, adjust);
         prims.push(prim);
     }
 }
@@ -1080,20 +1101,7 @@ fn append_retained_layer(layer: &RetainedLayer, prims: &mut Vec<Prim>, points: &
     prims.reserve(layer.prims.len());
     for prim in &layer.prims {
         let mut prim = prim.clone();
-        match &mut prim {
-            Prim::Polyline { first_point, .. } | Prim::AreaFill { first_point, .. } => {
-                *first_point += point_base;
-            }
-            Prim::BandFill {
-                upper_first,
-                lower_first,
-                ..
-            } => {
-                *upper_first += point_base;
-                *lower_first += point_base;
-            }
-            _ => {}
-        }
+        shift_point_indices(&mut prim, point_base);
         prims.push(prim);
     }
 }

@@ -6,7 +6,8 @@
 use super::*;
 
 /// Scalar source selected by a study.  The aggregate sources are calculated from the source
-/// bar's OHLC columns without changing the canonical source series or duplicating its storage.
+/// bar's OHLC columns without changing the canonical source series; each binding keeps the derived
+/// column as private runtime state (see `IndicatorInputs`), not as a series.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndicatorInputSource {
@@ -427,6 +428,13 @@ impl AlignedWeights {
     }
 }
 
+/// Spare rows a retained aggregate column keeps past its source: one eighth of the rows plus a
+/// fixed floor, so the capacity stays within `rows + price_headroom(rows)`. The floor only spares
+/// small charts their first regrowth.
+fn price_headroom(rows: usize) -> usize {
+    rows / 8 + 4096
+}
+
 /// The scalar input column a study reads as its close: a canonical column, or the aggregate
 /// price retained in `cache` with rows `from..` re-derived. Returns the column and derived rows.
 fn price_input<'a>(
@@ -457,6 +465,15 @@ fn price_input<'a>(
     let rows = values.iter().map(|column| column.len()).min().unwrap_or(0);
     let keep = cache.len().min(from).min(rows);
     cache.truncate(keep);
+    // Capacity is explicit: a column built exactly to size would double on the first append after
+    // a bulk install, and plain `extend` growth would keep the largest size it ever reached.
+    let target = rows + price_headroom(rows);
+    if keep == 0 && cache.capacity() > 2 * target {
+        cache.shrink_to(target);
+    }
+    if cache.capacity() < rows {
+        cache.reserve_exact(target - keep);
+    }
     cache.extend((keep..rows).map(|row| {
         aggregate(
             values[0][row],
@@ -582,6 +599,10 @@ impl ChartEngine {
     ///
     /// Colors are derived from each value's sign and whether it moved toward or away from zero.
     /// The caller owns only the semantic request; Aeris retains palette and row-style ownership.
+    ///
+    /// Returns `false` for an unknown or non-histogram series and for a source-owned one (see
+    /// [`ChartEngine::series_is_source_owned`]), such as the trade delta and volume studies, which
+    /// keep the palette their stream installs. Indicator outputs are not source-owned and accept it.
     pub fn apply_momentum_histogram_colors(&mut self, id: SeriesId) -> bool {
         if self
             .series_entry(id)
@@ -2903,5 +2924,163 @@ fn indicator_output_name(kind: &IndicatorKind, output_index: usize) -> &'static 
         }
         IndicatorKind::Wma { .. } => "WMA",
         IndicatorKind::Kdj { .. } => ["K", "D", "J"][output_index],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AGGREGATES: [IndicatorInputSource; 4] = [
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ];
+
+    /// Deterministic OHLC columns with `high >= open, close >= low`.
+    fn ohlc(rows: usize) -> [Vec<f64>; 4] {
+        let mut columns: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
+        for row in 0..rows {
+            let base = 100.0 + (row as f64 * 0.013).sin() * 7.0;
+            let close = base + (row as f64 * 0.7).cos() * 0.2;
+            let open = base - 0.3;
+            columns[0].push(open);
+            columns[1].push(open.max(close) + 0.9);
+            columns[2].push(open.min(close) - 0.8);
+            columns[3].push(close);
+        }
+        columns
+    }
+
+    /// The per-row definition of each aggregate, written independently of `price_input`.
+    fn reference(source: IndicatorInputSource, [open, high, low, close]: [f64; 4]) -> f64 {
+        match source {
+            IndicatorInputSource::Hl2 => (high + low) * 0.5,
+            IndicatorInputSource::Hlc3 => (high + low + close) / 3.0,
+            IndicatorInputSource::Ohlc4 => (open + high + low + close) * 0.25,
+            IndicatorInputSource::Hlcc4 => (high + low + 2.0 * close) * 0.25,
+            _ => unreachable!("not an aggregate source"),
+        }
+    }
+
+    /// Derive rows `from..` and require exactly `derived` of them, bit-identical to the reference
+    /// over the whole column.
+    fn derive(
+        cache: &mut Vec<f64>,
+        source: IndicatorInputSource,
+        columns: &[Vec<f64>; 4],
+        from: usize,
+        derived: usize,
+    ) {
+        let (column, rows) = price_input(
+            cache,
+            source,
+            std::array::from_fn(|i| &columns[i][..]),
+            from,
+        );
+        assert_eq!(rows, derived, "{source:?} rows derived from {from}");
+        assert_eq!(column.len(), columns[0].len(), "{source:?} column length");
+        for (row, &value) in column.iter().enumerate() {
+            let expected = reference(source, std::array::from_fn(|i| columns[i][row]));
+            assert_eq!(
+                value.to_bits(),
+                expected.to_bits(),
+                "{source:?} row {row}: {value} != {expected}"
+            );
+        }
+    }
+
+    fn extend(columns: &mut [Vec<f64>; 4], rows: usize) {
+        let more = ohlc(rows);
+        for (column, more) in columns.iter_mut().zip(&more) {
+            let start = column.len();
+            column.extend_from_slice(&more[start..]);
+        }
+    }
+
+    #[test]
+    fn aggregate_column_keeps_bounded_tail_headroom() {
+        const ROWS: usize = 50_000;
+        for source in AGGREGATES {
+            let mut columns = ohlc(ROWS);
+            let mut cache = Vec::new();
+            derive(&mut cache, source, &columns, 0, ROWS);
+            assert!(
+                (ROWS..=ROWS + price_headroom(ROWS)).contains(&cache.capacity()),
+                "{source:?} install capacity {} for {ROWS} rows",
+                cache.capacity()
+            );
+
+            // A live append derives one row in place: the first append after a bulk install must
+            // not reallocate the column.
+            let (capacity, pointer) = (cache.capacity(), cache.as_ptr());
+            columns = ohlc(ROWS + 1);
+            derive(&mut cache, source, &columns, ROWS, 1);
+            assert_eq!(cache.capacity(), capacity, "{source:?} first append grew");
+            assert_eq!(cache.as_ptr(), pointer, "{source:?} first append moved");
+
+            // Appending past the headroom grows to a bounded size, not by doubling.
+            let rows = ROWS + price_headroom(ROWS) + 2;
+            columns = ohlc(rows);
+            derive(&mut cache, source, &columns, ROWS + 1, rows - ROWS - 1);
+            assert!(
+                (rows..=rows + price_headroom(rows)).contains(&cache.capacity()),
+                "{source:?} grown capacity {} for {rows} rows",
+                cache.capacity()
+            );
+
+            // A rebuild from row 0 over far fewer rows releases the oversized column.
+            columns = ohlc(1_000);
+            derive(&mut cache, source, &columns, 0, 1_000);
+            assert_eq!(
+                cache.capacity(),
+                1_000 + price_headroom(1_000),
+                "{source:?} rebuilt capacity"
+            );
+
+            // A source with no rows allocates nothing.
+            let mut empty = Vec::new();
+            derive(&mut empty, source, &ohlc(0), 0, 0);
+            assert_eq!(empty.capacity(), 0, "{source:?} empty capacity");
+        }
+    }
+
+    #[test]
+    fn canonical_inputs_borrow_the_source_and_drop_the_column() {
+        let columns = ohlc(1_000);
+        let values: [&[f64]; 4] = std::array::from_fn(|i| &columns[i][..]);
+        for (column, source) in [
+            IndicatorInputSource::Open,
+            IndicatorInputSource::High,
+            IndicatorInputSource::Low,
+            IndicatorInputSource::Close,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut cache = vec![0.0; 1_000];
+            let (input, derived) = price_input(&mut cache, source, values, 0);
+            assert_eq!(derived, 0, "{source:?}");
+            assert_eq!(input.as_ptr(), columns[column].as_ptr(), "{source:?}");
+            assert_eq!(cache.capacity(), 0, "{source:?} kept a column");
+        }
+    }
+
+    #[test]
+    fn tail_rebuilds_keep_the_retained_prefix() {
+        let mut columns = ohlc(2_000);
+        let mut cache = Vec::new();
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 0, 2_000);
+        // Revising the last bar re-derives it alone; growing by three rows derives three.
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 1_999, 1);
+        extend(&mut columns, 2_003);
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 2_000, 3);
+        // A retention trim shortens the source: the column follows it.
+        for column in &mut columns {
+            column.truncate(1_500);
+        }
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 1_500, 0);
+        assert_eq!(cache.len(), 1_500);
     }
 }

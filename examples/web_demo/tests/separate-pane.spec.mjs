@@ -56,6 +56,31 @@ test("RSI toggle stacks a separate pane with its own scale; unchecking prunes it
   // The oscillator's own scale maps mid-range RSI into pane 1 (below the separator)…
   const rsi_y = await page.evaluate(() => window.__rsi.price_to_coordinate(50));
   expect(rsi_y).toBeGreaterThan(sep[0]);
+
+  // Public coordinates are chart-content space, never pane-local: the RSI series converts inside
+  // pane 1, the chart-level inverse selects pane 1's default scale for that y (it used to
+  // extrapolate the main series), and the chart-level pair agrees with the main series on pane 0.
+  const coordinates = await page.evaluate(() => {
+    const chart = window.__chart;
+    const rsi_geometry = chart.panes()[1].get_geometry();
+    const y = window.__rsi.price_to_coordinate(50);
+    const main_price = window.__main.coordinate_to_price(rsi_geometry.top / 2);
+    return {
+      top: rsi_geometry.top,
+      bottom: rsi_geometry.top + rsi_geometry.height,
+      y,
+      price_at_y: chart.coordinate_to_price(y),
+      main_price,
+      main_round_trip: chart.coordinate_to_price(window.__main.price_to_coordinate(main_price)),
+      chart_y: chart.price_to_coordinate(main_price),
+      main_y: window.__main.price_to_coordinate(main_price),
+    };
+  });
+  expect(coordinates.y).toBeGreaterThanOrEqual(coordinates.top);
+  expect(coordinates.y).toBeLessThanOrEqual(coordinates.bottom);
+  expect(Math.abs(coordinates.price_at_y - 50)).toBeLessThan(1e-6);
+  expect(Math.abs(coordinates.main_round_trip - coordinates.main_price)).toBeLessThan(1e-6);
+  expect(coordinates.chart_y).toBeCloseTo(coordinates.main_y, 6);
   // …and the purple stroke actually paints there (with the 70/30 guide lines).
   const shot = await capture(page);
   expect(count_color_below(shot, PURPLE, sep[0] + 2)).toBeGreaterThan(50);

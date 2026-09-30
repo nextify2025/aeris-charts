@@ -1,5 +1,5 @@
-//! Converts the anti-aliased geometry subset of the Prim IR (`Polyline` / `AreaFill` / `BandFill` / `Circle` /
-//! `RoundRect`)
+//! Converts the anti-aliased geometry subset of the Prim IR (`Polyline` / `Segments` / `AreaFill` /
+//! `BandFill` / `Circle` / `RoundRect`)
 //! into triangle-mesh vertices for the wgpu tri pipeline.
 //!
 //! The crisp-rect subset goes through [`prims_to_instances`](crate::prims_to_instances); this is
@@ -10,7 +10,7 @@
 //! The shared point pool holds **device-space** points (the builders already baked the DPR in), so
 //! tessellation runs with identity pixel ratios — byte-identical to the old direct-to-tri path.
 
-use aeris_charts_render::draw_list::{LineType, Prim};
+use aeris_charts_render::draw_list::{segment_points, LineType, Prim};
 use aeris_charts_render::line::{
     build_area_fill, build_disc, expand_band, expand_line, round_rect_polygon, stroke_aa, AreaMesh,
     LineParams, LinePoint, LineVertex,
@@ -266,21 +266,27 @@ pub fn geom_prim_to_tris(prim: &Prim, points: &[[f32; 2]], out: &mut Vec<TriVert
             color,
             ..
         } => {
-            // Shared anti-aliased stroker (the one GPUI uses): per-vertex coverage gives edges a
-            // continuous ramp on top of MSAA instead of four coverage levels.
             let pts = expand_line(&pool_slice(points, *first_point, *point_count), *line_type);
-            let rgba = [
-                color.r() as f32 / 255.0,
-                color.g() as f32 / 255.0,
-                color.b() as f32 / 255.0,
-                color.a() as f32 / 255.0,
-            ];
-            stroke_aa(&pts, *width, |triangle| {
-                out.extend(triangle.map(|vertex| TriVertex {
-                    pos: vertex.position,
-                    color: [rgba[0], rgba[1], rgba[2], rgba[3] * vertex.coverage()],
-                }));
-            });
+            stroke_into(out, &pts, *width, *color);
+        }
+        Prim::Segments {
+            first_point,
+            segment_count,
+            width,
+            color,
+        } => {
+            // Each pair tessellates exactly like a solid two-point polyline; nothing is merged, so
+            // the triangles equal the separate strokes'.
+            let Some(pairs) = segment_points(points, *first_point, *segment_count) else {
+                return;
+            };
+            let point = |p: [f32; 2]| LinePoint {
+                x: p[0] as f64,
+                y: p[1] as f64,
+            };
+            for &[from, to] in pairs.as_chunks::<2>().0 {
+                stroke_into(out, &[point(from), point(to)], *width, *color);
+            }
         }
         Prim::Circle {
             cx,
@@ -339,8 +345,38 @@ pub fn geom_prim_to_tris(prim: &Prim, points: &[[f32; 2]], out: &mut Vec<TriVert
                 out,
             );
         }
-        _ => {}
+        // Rect-family prims render through the quad pipeline, text and images through their
+        // textured-quad pipelines: none tessellates here.
+        Prim::Rect { .. }
+        | Prim::RectFrame { .. }
+        | Prim::HLine { .. }
+        | Prim::VLine { .. }
+        | Prim::Text { .. }
+        | Prim::RotatedText { .. }
+        | Prim::Image { .. } => {}
     }
+}
+
+/// Stroke `pts` with the shared anti-aliased stroker (the one GPUI uses) into `out`: per-vertex
+/// coverage gives edges a continuous ramp on top of MSAA instead of four coverage levels.
+fn stroke_into(
+    out: &mut Vec<TriVertex>,
+    pts: &[LinePoint],
+    width: f32,
+    color: aeris_charts_render::color::Color,
+) {
+    let rgba = [
+        color.r() as f32 / 255.0,
+        color.g() as f32 / 255.0,
+        color.b() as f32 / 255.0,
+        color.a() as f32 / 255.0,
+    ];
+    stroke_aa(pts, width, |triangle| {
+        out.extend(triangle.map(|vertex| TriVertex {
+            pos: vertex.position,
+            color: [rgba[0], rgba[1], rgba[2], rgba[3] * vertex.coverage()],
+        }));
+    });
 }
 
 /// Tessellate the geometry prims into `fill` (area fills, drawn first/below) and `stroke` (line
@@ -392,6 +428,65 @@ mod tests {
         assert!(stroke.iter().any(|vertex| vertex.color[3] == 1.0));
         assert!(stroke.iter().any(|vertex| vertex.color[3] == 0.0));
         assert!(stroke.iter().all(|vertex| vertex.color[2] == 1.0));
+    }
+
+    #[test]
+    fn segments_tessellate_vertex_for_vertex_like_polylines() {
+        // Two touching one-bar pairs, then one far away, all in the pool after a stray point.
+        let points = [
+            [99.0f32, 99.0],
+            [0.0, 5.0],
+            [10.0, 5.0],
+            [10.0, 7.0],
+            [20.0, 7.0],
+            [40.0, 3.0],
+            [50.0, 3.0],
+        ];
+        let color = Color::rgb(0x12, 0x34, 0x56);
+        let batched = [Prim::Segments {
+            first_point: 1,
+            segment_count: 3,
+            width: 2.0,
+            color,
+        }];
+        let separate: Vec<Prim> = (0..3)
+            .map(|pair| Prim::Polyline {
+                first_point: 1 + 2 * pair,
+                point_count: 2,
+                width: 2.0,
+                style: aeris_charts_render::draw_list::LineStyle::Solid,
+                line_type: LineType::Simple,
+                color,
+            })
+            .collect();
+        let (mut fill, mut stroke, mut reference) = (Vec::new(), Vec::new(), Vec::new());
+        geom_prims_to_tris(&batched, &points, &mut fill, &mut stroke);
+        geom_prims_to_tris(&separate, &points, &mut Vec::new(), &mut reference);
+        assert!(fill.is_empty(), "a stroke batch never fills");
+        assert!(!stroke.is_empty());
+        let raw = |vertices: &[TriVertex]| {
+            vertices
+                .iter()
+                .map(|vertex| (vertex.pos, vertex.color))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(raw(&stroke), raw(&reference));
+        // A window past the pool, or an empty batch, tessellates nothing.
+        for (first_point, segment_count) in [(5, 2), (1, 0), (u32::MAX, 1)] {
+            let mut none = Vec::new();
+            geom_prims_to_tris(
+                &[Prim::Segments {
+                    first_point,
+                    segment_count,
+                    width: 2.0,
+                    color,
+                }],
+                &points,
+                &mut Vec::new(),
+                &mut none,
+            );
+            assert!(none.is_empty(), "{first_point}+{segment_count}");
+        }
     }
 
     #[test]

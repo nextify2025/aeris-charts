@@ -19,7 +19,7 @@ use aeris_charts_core::scale::session_slots::{
 use aeris_charts_core::scale::time_tick_marks::civil_from_timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::{ChartEngine, IndicatorChange, SeriesId, SeriesKind};
+use crate::{ChartEngine, IndicatorChange, SeriesId, SeriesKind, SeriesOwner};
 
 pub const MAX_RESAMPLE_BOUNDARIES: usize = 20_000;
 pub const MAX_RESAMPLED_SERIES: usize = 32;
@@ -236,6 +236,16 @@ impl ChartEngine {
                 } else {
                     ResampleError::UnsupportedTarget(id)
                 });
+            }
+        }
+        // One writer per series. A target may already be this binding's own output (a
+        // reconfigure), never a footprint, a trade-bound candle or study, or synthetic bars: the
+        // resampler installs through the unguarded internals, so nothing else would stop two
+        // writers from fighting over its rows. Sources are only read, so they may be trade-derived.
+        // Another binding's output is a chain, refused as a dependency cycle below.
+        for id in [Some(target), volume_target].into_iter().flatten() {
+            if !matches!(self.series_owner(id), None | Some(SeriesOwner::Resampled)) {
+                return Err(ResampleError::UnsupportedTarget(id));
             }
         }
         // The binding a reconfigure replaces (keyed at `target`) is not a conflict with itself:
@@ -522,6 +532,10 @@ impl ChartEngine {
         let low = bars.iter().map(|bar| bar.low).collect::<Vec<_>>();
         let close = bars.iter().map(|bar| bar.close).collect::<Vec<_>>();
         self.install_series_columns(target, out_times.clone(), open, high, low, close);
+        // ponytail: the target and its volume target each trim the whole layer on their own (a
+        // union merge and reindex per trim) and recompute their indicators one by one, the pattern
+        // `trim_stream_rows_front` batches for a stream. `DataLayer::trim_fronts` would trim both
+        // together; deferred because a resample refresh trims at most two series.
         self.enforce_series_cap(target);
         self.recompute_indicators_for(target);
         if let Some(volume_target) = volume_target {
@@ -1596,6 +1610,107 @@ mod tests {
             );
         }
         assert_matches_fresh(&live);
+    }
+
+    /// A trade-bound candle or trade volume study is written by its stream. A resampler cannot take
+    /// it as a target (two writers would fight over its rows), but may read it as a source.
+    #[test]
+    fn trade_derived_series_are_resample_sources_never_targets() {
+        use crate::{AggressorSide, FootprintAggregationOptions, FootprintTrade};
+
+        let print = |second: i64, price: f64| FootprintTrade {
+            timestamp_micros: second * 1_000_000,
+            price,
+            volume: 2.0,
+            aggressor: AggressorSide::Buy,
+            bid: None,
+            ask: None,
+            sequence: None,
+            trade_id: None,
+            conditions: 0,
+            session_id: Some(1),
+        };
+        let options = || ResampleOptions {
+            interval_seconds: 300,
+            boundaries: vec![ResampleBoundary {
+                start_time: 0,
+                end_time: 30 * 86_400,
+                session_id: 1,
+            }],
+        };
+        let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
+        let stream = chart
+            .add_trade_stream("K:1m", FootprintAggregationOptions::default())
+            .unwrap();
+        let candles = chart.add_series(SeriesKind::Candlestick);
+        chart
+            .bind_trade_bar_series_to_stream(candles, stream)
+            .unwrap();
+        let volume = chart.add_trade_volume_series(stream, 1).unwrap();
+        chart
+            .set_trade_stream_trades(
+                stream,
+                (0..40)
+                    .map(|index| print(60 + index * 20, 100.0 + (index % 7) as f64 * 0.25))
+                    .collect(),
+            )
+            .unwrap();
+        let plain = chart.add_series(SeriesKind::Candlestick);
+        let plain_volume = chart.add_series(SeriesKind::Histogram);
+        let (candle_rows, volume_rows) = (rows(&chart, candles), rows(&chart, volume));
+        assert!(!candle_rows.is_empty());
+
+        assert_eq!(
+            chart.configure_resampled_series(plain, None, candles, None, options()),
+            Err(ResampleError::UnsupportedTarget(candles))
+        );
+        assert_eq!(
+            chart.configure_resampled_series(
+                plain,
+                Some(plain_volume),
+                candles,
+                Some(volume),
+                options()
+            ),
+            Err(ResampleError::UnsupportedTarget(candles))
+        );
+        let target = chart.add_series(SeriesKind::Candlestick);
+        assert_eq!(
+            chart.configure_resampled_series(
+                plain,
+                Some(plain_volume),
+                target,
+                Some(volume),
+                options()
+            ),
+            Err(ResampleError::UnsupportedTarget(volume))
+        );
+        assert!(chart.resampled_bars(candles).is_none());
+        assert!(chart.resampled_bars(target).is_none());
+        assert!(!chart.series_is_source_owned(target));
+        assert_eq!(
+            (rows(&chart, candles), rows(&chart, volume)),
+            (candle_rows, volume_rows)
+        );
+
+        // Reading them is the supported direction: the stream keeps feeding the resampled bars.
+        let resampled = chart.add_series(SeriesKind::Candlestick);
+        let resampled_volume = chart.add_series(SeriesKind::Histogram);
+        chart
+            .configure_resampled_series(
+                candles,
+                Some(volume),
+                resampled,
+                Some(resampled_volume),
+                options(),
+            )
+            .unwrap();
+        assert!(!chart.resampled_bars(resampled).unwrap().is_empty());
+        chart
+            .update_trade_stream_trades(stream, vec![print(900, 101.0)])
+            .unwrap();
+        assert!(chart.series_is_source_owned(resampled));
+        assert!(chart.series_is_source_owned(candles));
     }
 
     #[test]

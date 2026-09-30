@@ -13,7 +13,7 @@
 //! Uses Aeris's coordinate, bar-width, and snapping calculations.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{IRect, LineStyle, LineType};
+use aeris_charts_render::draw_list::{segment_points, IRect, LineStyle, LineType};
 pub(crate) use aeris_charts_render::line::round_rect_polygon;
 use aeris_charts_render::line::{
     build_area_fill, expand_line_into, stroke_aa, AreaMesh, LineParams, LinePoint, STROKE_AA_SOLID,
@@ -271,6 +271,31 @@ pub(crate) fn polyline_mesh(
     // The pool already carries the DPR, so expansion adapts to device px directly.
     expand_line_into(window, line_type, 1.0, 1.0, expanded);
     stroke_aa_into(pool, expanded, width)
+}
+
+/// Tessellate a [`Prim::Segments`] batch into one contiguous mesh: each pair goes through the same
+/// [`stroke_aa`] stroker as a solid two-point polyline, so the triangles equal the per-pair
+/// `polyline_mesh` ones and the caller's single `push_mesh` applies the chunk bound to the whole
+/// batch. Returns a zero-length range when the pair window leaves the pool, which the caller
+/// reports as a dropped prim.
+pub(crate) fn segments_mesh(
+    pool: &mut Vec<MeshVertex>,
+    points: &[[f32; 2]],
+    first: u32,
+    segment_count: u32,
+    width: f32,
+) -> (u32, u32) {
+    let start = pool.len() as u32;
+    if let Some(pairs) = segment_points(points, first, segment_count) {
+        let point = |p: [f32; 2]| LinePoint {
+            x: p[0] as f64,
+            y: p[1] as f64,
+        };
+        for &[from, to] in pairs.as_chunks::<2>().0 {
+            stroke_aa_into(pool, &[point(from), point(to)], width);
+        }
+    }
+    (start, pool.len() as u32 - start)
 }
 
 /// Anti-aliased polyline stroke through the shared [`stroke_aa`] tessellator. GPUI encodes each
