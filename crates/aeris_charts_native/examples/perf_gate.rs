@@ -1766,8 +1766,21 @@ fn main() {
     // the source: filling and revising the forming slot must cost the same bounded window.
     let slot_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 23_400, 4, INDICATOR_TICK_APPENDS);
     println!(
-        "Target M (slots) — the same ticks filling 23,400 pre-installed session slots (max {} work rows per tick):",
-        slot_cost.max_work_rows
+        "Target M (slots) — the same ticks filling 23,400 pre-installed session slots (max {} work rows per tick; first fill after install {:.2} ms, growing {:.2} MiB of column capacity):",
+        slot_cost.max_work_rows,
+        slot_cost.first_append_ms,
+        slot_cost.first_append_growth_bytes as f64 / (1024.0 * 1024.0),
+    );
+    // Filling the first slot extends every column the runtime retains, the aggregate price columns
+    // among them, by one row inside capacity the install left. Unlike a live append past the
+    // source, it grows no other column, so any growth here is a retained column reallocating.
+    let m_slot_first_fill = report_check(
+        "first slot fill grows no column capacity",
+        slot_cost.first_append_growth_bytes == 0,
+        &format!(
+            "{:.2} MiB",
+            slot_cost.first_append_growth_bytes as f64 / (1024.0 * 1024.0)
+        ),
     );
     let (slot_replace_mean, slot_replace_median, slot_replace_max) = slot_cost.replace_ms;
     let m_slot_replace = report(
@@ -1878,6 +1891,7 @@ fn main() {
         && m_replace
         && m_append
         && m_slot_replace
+        && m_slot_first_fill
         && m_slot_fill
         && m_composite_resident
         && m_composite_install

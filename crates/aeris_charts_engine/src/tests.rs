@@ -2565,53 +2565,65 @@ fn streamed_aggregate_and_weight_inputs_match_a_fresh_install_for_every_indicato
     }
 }
 
-#[test]
-fn aggregate_input_columns_keep_bounded_tail_headroom() {
-    // Four studies on a canonical input (no derived column) versus the same four on the four
-    // aggregate inputs: every other runtime capacity cancels, so the difference is the binding-
-    // private aggregate columns. Each must be resident (an O(n) rebuild per tick is the
-    // alternative), must not reallocate on the first live append, and must stay within one
-    // eighth plus a fixed floor of spare rows however the source changes.
-    const ROWS: usize = 100_000;
-    const COLUMNS: usize = 4;
-    let kinds = || {
-        [
-            IndicatorKind::Sma { period: 20 },
-            IndicatorKind::Ema {
-                period: 20,
-                seed: IndicatorSeed::Sma,
-            },
-            IndicatorKind::Rsi {
-                period: 14,
-                seed: IndicatorSeed::Sma,
-            },
-            IndicatorKind::StochasticRsi {
-                rsi_period: 14,
-                stochastic_period: 14,
-            },
-        ]
-    };
+/// Aggregate price columns the twin charts of `aggregate_twin_charts` retain.
+const AGGREGATE_COLUMNS: usize = 4;
+
+/// Bytes of capacity a chart of `rows` rows may keep in `AGGREGATE_COLUMNS` aggregate columns:
+/// one eighth of the rows plus a fixed floor of spare rows each.
+fn aggregate_column_bound(rows: usize) -> usize {
+    AGGREGATE_COLUMNS * (rows + rows / 8 + 4096) * std::mem::size_of::<f64>()
+}
+
+/// Install `rows` real bars followed by `slots` whitespace rows on the primary series.
+fn load_aggregate_source(chart: &mut ChartEngine, rows: usize, slots: usize) {
+    let times = (0..rows + slots)
+        .map(|row| row as f64 * 60.0)
+        .collect::<Vec<_>>();
+    let bars = (0..rows + slots)
+        .map(|row| {
+            if row < rows {
+                swinging_bar(row, 0)
+            } else {
+                [f64::NAN; 4]
+            }
+        })
+        .collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+}
+
+/// Two charts over the same source: four studies on a canonical input (no derived column) and the
+/// same four on the four aggregate inputs. Every other runtime capacity cancels, so the
+/// difference in indicator runtime bytes is the binding-private aggregate columns.
+fn aggregate_twin_charts(rows: usize, slots: usize) -> (ChartEngine, ChartEngine) {
+    let kinds = [
+        IndicatorKind::Sma { period: 20 },
+        IndicatorKind::Ema {
+            period: 20,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Rsi {
+            period: 14,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::StochasticRsi {
+            rsi_period: 14,
+            stochastic_period: 14,
+        },
+    ];
     let aggregates = [
         IndicatorInputSource::Hl2,
         IndicatorInputSource::Hlc3,
         IndicatorInputSource::Ohlc4,
         IndicatorInputSource::Hlcc4,
     ];
-    let load = |chart: &mut ChartEngine, rows: usize| {
-        let times = (0..rows).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
-        let bars = (0..rows)
-            .map(|row| swinging_bar(row, 0))
-            .collect::<Vec<_>>();
-        let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
-        chart
-            .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
-            .unwrap();
-    };
     let mut canonical = ChartEngine::new(800.0, 500.0, 1.0);
     let mut composite = ChartEngine::new(800.0, 500.0, 1.0);
-    load(&mut canonical, ROWS);
-    load(&mut composite, ROWS);
-    for (kind, input) in kinds().into_iter().zip(aggregates) {
+    load_aggregate_source(&mut canonical, rows, slots);
+    load_aggregate_source(&mut composite, rows, slots);
+    for (kind, input) in kinds.into_iter().zip(aggregates) {
         assert!(!canonical
             .add_indicator_kind_with_input(0, IndicatorInputSource::Close, kind.clone(), None)
             .is_empty());
@@ -2619,25 +2631,35 @@ fn aggregate_input_columns_keep_bounded_tail_headroom() {
             .add_indicator_kind_with_input(0, input, kind, None)
             .is_empty());
     }
-    let columns_bytes = |canonical: &ChartEngine, composite: &ChartEngine| {
-        composite
-            .memory_usage()
-            .indicator_runtime_bytes
-            .checked_sub(canonical.memory_usage().indicator_runtime_bytes)
-            .expect("aggregate studies hold at least the canonical runtime state")
-    };
-    let f64_bytes = std::mem::size_of::<f64>();
-    let bound = |rows: usize| COLUMNS * (rows + rows / 8 + 4096) * f64_bytes;
+    (canonical, composite)
+}
 
-    let installed = columns_bytes(&canonical, &composite);
+fn aggregate_columns_bytes(canonical: &ChartEngine, composite: &ChartEngine) -> usize {
+    composite
+        .memory_usage()
+        .indicator_runtime_bytes
+        .checked_sub(canonical.memory_usage().indicator_runtime_bytes)
+        .expect("aggregate studies hold at least the canonical runtime state")
+}
+
+#[test]
+fn aggregate_input_columns_keep_bounded_tail_headroom() {
+    // Each aggregate column must be resident (an O(n) rebuild per tick is the alternative), must
+    // not reallocate on the first live append, and must stay within one eighth plus a fixed floor
+    // of spare rows however the source changes.
+    const ROWS: usize = 100_000;
+    let f64_bytes = std::mem::size_of::<f64>();
+    let (mut canonical, mut composite) = aggregate_twin_charts(ROWS, 0);
+
+    let installed = aggregate_columns_bytes(&canonical, &composite);
     assert!(
-        installed >= COLUMNS * ROWS * f64_bytes,
+        installed >= AGGREGATE_COLUMNS * ROWS * f64_bytes,
         "aggregate columns are resident: {installed} bytes"
     );
     assert!(
-        installed <= bound(ROWS),
+        installed <= aggregate_column_bound(ROWS),
         "install keeps bounded headroom: {installed} > {}",
-        bound(ROWS)
+        aggregate_column_bound(ROWS)
     );
 
     // The first live append after the bulk install derives one row into spare capacity.
@@ -2646,7 +2668,7 @@ fn aggregate_input_columns_keep_bounded_tail_headroom() {
         chart.update_series_bar(0, last as f64 * 60.0, swinging_bar(last, 0));
     }
     assert_eq!(
-        columns_bytes(&canonical, &composite),
+        aggregate_columns_bytes(&canonical, &composite),
         installed,
         "the first append reallocated an aggregate column"
     );
@@ -2656,21 +2678,52 @@ fn aggregate_input_columns_keep_bounded_tail_headroom() {
             chart.update_series_bar(0, last as f64 * 60.0, swinging_bar(last, 0));
         }
         assert!(
-            columns_bytes(&canonical, &composite) <= bound(last + 1),
+            aggregate_columns_bytes(&canonical, &composite) <= aggregate_column_bound(last + 1),
             "append {last} outgrew the headroom bound"
         );
     }
 
     // Replacing the source with far fewer rows releases the oversized columns.
     for chart in [&mut canonical, &mut composite] {
-        load(chart, 1_000);
+        load_aggregate_source(chart, 1_000, 0);
     }
-    let replaced = columns_bytes(&canonical, &composite);
+    let replaced = aggregate_columns_bytes(&canonical, &composite);
     assert!(
-        replaced >= COLUMNS * 1_000 * f64_bytes && replaced <= bound(1_000),
+        replaced >= AGGREGATE_COLUMNS * 1_000 * f64_bytes
+            && replaced <= aggregate_column_bound(1_000),
         "data replacement kept {replaced} bytes of aggregate columns (bound {})",
-        bound(1_000)
+        aggregate_column_bound(1_000)
     );
+}
+
+#[test]
+fn filling_the_first_session_slot_keeps_aggregate_input_columns() {
+    // A time-sharing chart installs the rest of the session as whitespace slots after its real
+    // rows. The runtime covers the source through the last real row, so the first fill extends
+    // each aggregate column by one row exactly like an append; it must not reallocate the column.
+    const ROWS: usize = 100_000;
+    const SLOTS: usize = 1_000;
+    let (mut canonical, mut composite) = aggregate_twin_charts(ROWS, SLOTS);
+
+    let installed = aggregate_columns_bytes(&canonical, &composite);
+    assert!(
+        installed >= AGGREGATE_COLUMNS * ROWS * std::mem::size_of::<f64>()
+            && installed <= aggregate_column_bound(ROWS),
+        "aggregate columns after the install: {installed} bytes"
+    );
+    for (filled, row) in (ROWS..ROWS + SLOTS).enumerate() {
+        for chart in [&mut canonical, &mut composite] {
+            chart.update_series_bar(0, row as f64 * 60.0, swinging_bar(row, 0));
+        }
+        let bytes = aggregate_columns_bytes(&canonical, &composite);
+        if filled == 0 {
+            assert_eq!(bytes, installed, "the first slot fill reallocated a column");
+        }
+        assert!(
+            bytes <= aggregate_column_bound(row + 1),
+            "filling slot {row} outgrew the headroom bound"
+        );
+    }
 }
 
 #[test]

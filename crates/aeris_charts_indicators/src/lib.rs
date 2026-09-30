@@ -4053,6 +4053,12 @@ impl IncrementalState {
             self.output_from[index] = requested.max(start).min(n);
             self.outputs[index].clear();
             let rows = n - self.output_from[index];
+            // ponytail: an output is reserved to exactly its rows and moves into the data layer
+            // unchanged, so the first append after a bulk install grows every output column once.
+            // Reserving a bounded share of spare rows here removes that growth, at the cost of that
+            // spare capacity on every output; deferred until that cost is accepted. The engine's
+            // aggregate price columns already keep such headroom, and one shared rule would then
+            // serve both.
             if self.outputs[index].capacity() < rows {
                 self.outputs[index].reserve(rows);
             }
