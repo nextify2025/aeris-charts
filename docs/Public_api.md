@@ -715,12 +715,16 @@ rejection without repainting or firing `data_changed`, and `set_ring_source` thr
 became derived keeps draining into `frame_stats().ring_dropped_rows` until unbound). Styling, pane
 moves, visibility, `histogram_updown_rule`, and a study's own `max_points` still apply; a bound
 candle refuses `max_points` because it follows the stream's retention. Feed the stream instead.
+
 Rust hosts get the same refusals from the ordinary write entries (`false`, `0`, `None`,
 `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`), which also mean an unknown id or
-invalid data, so `ChartEngine::series_is_source_owned(id)` tells an engine-owned series apart;
-`bind_trade_bar_series_to_stream` and `configure_footprint_series` return
-`FootprintError::SeriesOwned` for a series another feature writes, and
-`ChartEngine::apply_momentum_histogram_colors` now returns `false` for the delta and volume studies.
+invalid data, so `ChartEngine::series_is_source_owned(id)` tells an engine-owned series apart, and
+`ChartEngine::apply_momentum_histogram_colors` returns `false` for the delta and volume studies.
+`FootprintError::SeriesOwned` is what `bind_trade_bar_series_to_stream` returns for a candlestick
+or bar that a resampler, synthetic bars, or a study (converted to a candle) already writes, and what
+`configure_footprint_series` returns for any series a stream, study, resampler, or synthetic bars
+write. `bind_trade_bar_series_to_stream` checks the series kind and `max_points` first, so a
+footprint or a scalar study gets `UnsupportedTradeBarSeries` or `InvalidAggregation` instead.
 
 **Live, corrections, and replay.** In-order prints update the forming bar in place and the first
 print at or after a bar boundary opens the next bar (`"tip"`); late or corrected prints rebuild the
@@ -895,11 +899,13 @@ Streaming ingestion keeps reference `series.update` semantics: a point replaces 
 time. `update()` reports the payloads that silently rewrite a bar with a machine-readable
 diagnostics `code` pointing to `merge()`: `value_on_ohlc_series` (`{ time, value }` flattens a
 candlestick/bar), `price_less_payload` (for example `{ time, volume }` becomes whitespace), and the
-rejected `partial_ohlc`. A write to an engine-owned series (a footprint, a trade-bound candle or
-study, resampled or synthetic bars) is rejected with `derived_series` on every data path. `series.merge(point, options?)` is the engine-owned partial path: present
-open/high/low/close/value fields overwrite, absent fields keep the existing bar, and candlestick/bar
-results are normalized so `high >= max(open, close)` and `low <= min(open, close)` (a close-only tick
-for a new time creates O=H=L=C; scalar series take `value`). A merge without a price field is
+rejected `partial_ohlc`. A write to an engine-owned series (a trade-bound candle or study,
+resampled or synthetic bars) is rejected with `derived_series` on every data path; a footprint
+handle throws `unsupported_operation` instead. `series.merge(point, options?)` is the engine-owned
+partial path: present open/high/low/close/value fields overwrite, absent fields keep the existing
+bar, and candlestick/bar results are normalized so `high >= max(open, close)` and
+`low <= min(open, close)` (a close-only tick for a new time creates O=H=L=C; scalar series take
+`value`). A merge without a price field is
 rejected with `empty_merge`; volume and turnover merge into their own series. `series.merge_typed(columns,
 options?)` is the columnar form: row `i` merges like `merge()` with `NaN` entries and omitted columns
 absent, rows apply in input order with one engine synchronization, and one invalid row rejects the

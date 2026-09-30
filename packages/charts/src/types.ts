@@ -937,10 +937,10 @@ export interface ingestion_diagnostics {
    *   `{ time, volume }`) replaced the bar with whitespace (reference behavior; use `merge()`, and
    *   update volume on its own series);
    * - `empty_merge` — rejected: a `merge()` carried no price field;
-   * - `derived_series` — rejected: the series is engine-owned (a footprint, a trade-bound
-   *   candle or bar, a CVD, delta, or volume study, or resampled or synthetic bars), so a host
-   *   data write changed nothing. Feed its trade stream or source instead. `pop()` on such a
-   *   series records the same rejection.
+   * - `derived_series` — rejected: the series is engine-owned (a trade-bound candle or bar, a
+   *   CVD, delta, or volume study, or resampled or synthetic bars), so a host data write changed
+   *   nothing. Feed its trade stream or source instead. `pop()` on such a series records the same
+   *   rejection. A footprint handle throws `unsupported_operation` instead.
    */
   code?: "stale_sequence" | "partial_ohlc" | "value_on_ohlc_series" | "price_less_payload" | "empty_merge" | "derived_series";
   /** Last sequence applied to the series, reported with `code: "stale_sequence"`. */

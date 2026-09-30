@@ -118,12 +118,15 @@ A stream is the only writer of its dependents. A trade-bound candle or bar and t
 volume studies refuse every host data write (set, install, update, batch, merge, sequenced update,
 per-point colors, pop), exactly like a footprint, so a stray write can no longer rewrite the row
 keys that every other presentation of a non-time stream continues from. One series has one engine
-writer: `bind_trade_bar_series_to_stream` and `configure_footprint_series` return
-`FootprintError::SeriesOwned` for a series that a footprint, a study, a resampler, or synthetic bars
-already write (a bound candle rebinds to another stream freely), and resampling and synthetic-bar
-configuration refuse such a series as their target. The tip and rebuild paths write through the
-engine's internal installers, not the host entry points, so the guard costs a tip nothing. Retention
-still follows the stream: a bound candle refuses a `max_points` cap, while a study keeps its own.
+writer: `configure_footprint_series` returns `FootprintError::SeriesOwned` for a series that a
+stream, a study, a resampler, or synthetic bars already write, and
+`bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler, synthetic
+bars, or a study converted to a candle writes (a footprint or scalar study fails the candle-kind
+check first, with `UnsupportedTradeBarSeries`; a bound candle rebinds to another stream freely).
+Resampling and synthetic-bar configuration refuse such a series as their target. The tip and
+rebuild paths write through the engine's internal installers, not the host entry points, so the
+guard costs a tip nothing. Retention still follows the stream: a bound candle refuses a `max_points`
+cap, while a study keeps its own.
 
 Large-trade bubbles are bounded marker dependents: translucent circles centred on the traded price,
 colored by aggressor side, with area proportional to volume relative to the largest retained bubble.

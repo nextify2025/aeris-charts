@@ -85,11 +85,13 @@ cannot be checked from this repository:
   `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`; `series_is_source_owned(id)` tells
   the refusal from an unknown id), and `apply_momentum_histogram_colors` returns `false` for the
   delta and volume studies. The browser package rejects them with `code: "derived_series"`.
-- `FootprintError` gains the `SeriesOwned(SeriesId)` variant, returned when a series another engine
-  feature writes is bound to a trade stream or configured as a footprint, so an exhaustive `match`
-  on it needs an arm. `bind_trade_bar_series_to_stream` also refuses a series that a resampler,
-  synthetic bars, or a study already writes, and resampling targets and synthetic-bar series refuse
-  a trade-bound candle.
+- `FootprintError` gains the `SeriesOwned(SeriesId)` variant, so an exhaustive `match` on it needs
+  an arm. `bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler,
+  synthetic bars, or a study converted to a candle already writes (a footprint or scalar study still
+  gets `UnsupportedTradeBarSeries`, because the candle-kind check runs first), and
+  `configure_footprint_series` returns it for a series a stream, study, resampler, or synthetic bars
+  write. Resampling targets and synthetic-bar series refuse a trade-bound candle
+  (`ResampleError::UnsupportedTarget`, `SyntheticBarError::UnsupportedSeries`).
 
 ## License
 

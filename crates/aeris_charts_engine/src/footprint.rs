@@ -2054,6 +2054,12 @@ impl ChartEngine {
     /// Bind an ordinary candlestick or OHLC bar presentation to the canonical bars derived from
     /// a chart-level trade stream. The series retains presentation options only; trade ordering,
     /// corrections, aggregation, and logical non-time bar identity remain stream-owned.
+    ///
+    /// The kind check runs first: a footprint or scalar series is `UnsupportedTradeBarSeries`, and
+    /// a series with a `max_points` cap is `InvalidAggregation`. A candlestick or bar that another
+    /// engine feature writes (a resampled or synthetic-bar target, or a study converted to a
+    /// candle) is `SeriesOwned`; rebinding a bound candle to another stream is allowed. Every
+    /// refusal happens before anything changes.
     pub fn bind_trade_bar_series_to_stream(
         &mut self,
         id: SeriesId,
@@ -2294,6 +2300,8 @@ impl ChartEngine {
         Ok(id)
     }
 
+    /// Make `id` a footprint series. A series that a trade stream, study, resampler, or synthetic
+    /// bars already write is `SeriesOwned`, refused before anything changes.
     pub fn configure_footprint_series(
         &mut self,
         id: SeriesId,
@@ -5262,10 +5270,17 @@ mod tests {
             .update_trade_stream_trades(stream, vec![print(60_000_001)])
             .unwrap();
 
-        // A candle built from CVD keeps its study registration: the study still writes it.
+        // A study is a scalar series until it is converted, so the candle-kind check refuses it
+        // first. Once converted to a candle it keeps its study registration: the study still
+        // writes it.
         let cvd = chart
             .add_cvd_series(stream, 1, TradeStudyOptions::default())
             .unwrap();
+        assert_eq!(
+            chart.bind_trade_bar_series_to_stream(cvd, stream),
+            Err(FootprintError::UnsupportedTradeBarSeries(cvd))
+        );
+        assert_eq!(dependents(&chart, stream), 1);
         chart.convert_series_kind(cvd, SeriesKind::Candlestick);
         assert_eq!(
             chart.bind_trade_bar_series_to_stream(cvd, stream),

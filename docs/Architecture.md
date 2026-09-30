@@ -627,8 +627,9 @@ boundaries (at most 32 bindings and 20 000 boundaries; hosts pass their own or d
 and whitespace rows reserve their bucket without prices (an all-whitespace bucket is a whitespace
 bar). Targets are source-owned, like trade-bound candles and bars, trade studies, and synthetic
 bars: every host write path (install, update, typed batches, and merges) is rejected, and a
-footprint, trade-bound, trade-study, or synthetic series cannot be a target. Resampling buckets UTC seconds, so it and a non-time bar sequence (trade-count, volume,
-or range streams, synthetic bars) never share a chart axis; whichever arrives second is rejected. A
+footprint, trade-bound, trade-study, or synthetic series cannot be a target. Resampling buckets UTC
+seconds, so it and a non-time bar sequence (trade-count, volume, or range streams, synthetic bars)
+never share a chart axis; whichever arrives second is rejected. A
 source or volume mutation reports its first changed row like an indicator change; bars whose bucket
 closes by the last unchanged row's time plus one second are kept, the rest is rebuilt from the first
 affected bucket and reaches the target through the ordinary tail-update path, so a live minute costs
