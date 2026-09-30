@@ -2967,7 +2967,11 @@ export interface drawing_tool_options {
 
 /**
  * A drawing's options (engine `Drawing`). Every tool can carry a text label placed by the
- * 3×3 `text_h_align`/`text_v_align` against the tool's geometry. Colors parse per the engine's
+ * 3×3 `text_h_align`/`text_v_align` against the tool's geometry, except the eight tools that
+ * paint no text (`forecast`, `bars_pattern`, `price_range`, `date_range`, `date_and_price_range`,
+ * `projection`, `flag_mark`, `icon`), which keep `text` without showing it. A painted label is
+ * edited in place: double-click it (or select the drawing and press Enter or F2), and tools that
+ * start from a default text open the editor when placed. Colors parse per the engine's
  * CSS rules; `""` for optional colors means "follow the default" (the border color at
  * 20% alpha for a rectangle's fill, the chart's `layout.textColor` for labels), and
  * `text_size: null` follows `layout.fontSize`.

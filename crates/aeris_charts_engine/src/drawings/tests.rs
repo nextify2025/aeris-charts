@@ -4158,3 +4158,565 @@ fn data_reading_drawings_keep_creation_order_when_storage_slots_are_reused() {
         Some(remounted_candles)
     );
 }
+
+// --- inline text editing coverage (`drawing_text_hit_at`, run layout, tool-owned editing) -----
+
+fn pt(logical: f64, price: f64) -> DrawingPoint {
+    DrawingPoint { logical, price }
+}
+
+/// The media-px center of the box between two anchors.
+fn box_center(chart: &ChartEngine, a: DrawingPoint, b: DrawingPoint) -> (f64, f64) {
+    (
+        (x_at(chart, a.logical) + x_at(chart, b.logical)) / 2.0,
+        (y_at(chart, a.price) + y_at(chart, b.price)) / 2.0,
+    )
+}
+
+#[test]
+fn text_hit_reaches_the_label_of_a_shape_whose_interior_is_not_a_body_hit() {
+    let mut chart = settled_chart();
+    let (a, b) = (pt(2.0, 10.0), pt(7.0, 13.0));
+    let (cx, cy) = box_center(&chart, a, b);
+    let rectangle = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![a, b],
+            Some(r#"{"text":"box"}"#),
+        )
+        .unwrap();
+    assert_eq!(
+        chart.hit_test_drawing(cx, cy),
+        None,
+        "an unselected rectangle's interior stays a pan surface"
+    );
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), Some(rectangle));
+    // The rest of the interior is not the label.
+    assert_eq!(chart.drawing_text_hit_at(cx, cy + 60.0), None);
+    assert_eq!(chart.drawing_text_hit_at(cx + 200.0, cy), None);
+
+    let ellipse = chart
+        .add_drawing(
+            DrawingKind::Ellipse,
+            0,
+            vec![pt(1.0, 10.0), pt(8.0, 13.0)],
+            Some(r#"{"text":"oval","text_size":20}"#),
+        )
+        .unwrap();
+    let (ex, ey) = box_center(&chart, pt(1.0, 10.0), pt(8.0, 13.0));
+    assert_eq!(
+        chart.drawing_text_hit_at(ex, ey),
+        Some(ellipse),
+        "the topmost label wins"
+    );
+}
+
+#[test]
+fn text_hit_follows_a_rotated_segment_label_and_requires_text_off_the_trend_line() {
+    let mut chart = settled_chart();
+    let ray = chart
+        .add_drawing(
+            DrawingKind::Ray,
+            0,
+            vec![pt(1.0, 10.0), pt(6.0, 12.5)],
+            Some(r#"{"text":"rotated ray label","text_h_align":"center","text_v_align":"middle"}"#),
+        )
+        .unwrap();
+    let (x, y, angle) = chart.drawing_text_transform(ray).unwrap();
+    assert!(angle.abs() > 0.25, "the fixture must rotate the run");
+    let along = 30.0;
+    assert_eq!(
+        chart.drawing_text_hit_at(x + angle.cos() * along, y + angle.sin() * along),
+        Some(ray)
+    );
+    assert_eq!(
+        chart.drawing_text_hit_at(x + along, y),
+        None,
+        "the screen-horizontal spot is outside the rotated run"
+    );
+
+    // Only a trend line prompts `+ Add text`; an empty label elsewhere has no hit region.
+    let rectangle = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![pt(2.0, 10.0), pt(7.0, 13.0)],
+            None,
+        )
+        .unwrap();
+    let (cx, cy) = box_center(&chart, pt(2.0, 10.0), pt(7.0, 13.0));
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), None);
+    assert!(chart.drawing_apply_options(rectangle, r#"{"text":"x"}"#));
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), Some(rectangle));
+    assert!(chart.drawing_apply_options(rectangle, r#"{"text":""}"#));
+    let trend = add_trend(&mut chart);
+    let (tx, ty) = chart.drawing_text_coordinate(trend).unwrap();
+    assert_eq!(
+        chart.drawing_text_hit_at(tx - 20.0, ty),
+        Some(trend),
+        "an empty trend label keeps its placeholder region"
+    );
+}
+
+#[test]
+fn text_hit_skips_locked_hidden_and_interval_hidden_drawings_and_bounds_the_pointer() {
+    let mut chart = settled_chart();
+    let (a, b) = (pt(2.0, 10.0), pt(7.0, 13.0));
+    let (cx, cy) = box_center(&chart, a, b);
+    let id = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![a, b],
+            Some(r#"{"text":"box"}"#),
+        )
+        .unwrap();
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), Some(id));
+    for patch in [
+        r#"{"locked":true}"#,
+        r#"{"visible":false}"#,
+        r#"{"interval_visibility":{"enabled":true,"intervals":[]}}"#,
+    ] {
+        assert!(chart.drawing_apply_options(id, patch), "{patch}");
+        assert_eq!(chart.drawing_text_hit_at(cx, cy), None, "{patch}");
+        assert!(chart.undo_drawing());
+        assert_eq!(chart.drawing_text_hit_at(cx, cy), Some(id), "{patch}");
+    }
+    for (x, y) in [(f64::NAN, cy), (cx, f64::INFINITY)] {
+        assert_eq!(chart.drawing_text_hit_at(x, y), None);
+    }
+
+    // A label overhanging the pane edge is not hittable from the price-axis side.
+    let edge = chart.coordinate_to_logical(chart.pane_w - 5.0).unwrap();
+    let vline = chart
+        .add_drawing(
+            DrawingKind::VerticalLine,
+            0,
+            vec![pt(edge, 11.0)],
+            Some(r#"{"text":"overhanging label"}"#),
+        )
+        .unwrap();
+    let y = chart.drawing_text_coordinate(vline).unwrap().1;
+    assert_eq!(
+        chart.drawing_text_hit_at(chart.pane_w - 10.0, y),
+        Some(vline)
+    );
+    assert_eq!(chart.drawing_text_hit_at(chart.pane_w + 10.0, y), None);
+    assert_eq!(chart.drawing_text_hit_at(-10.0, y), None);
+}
+
+#[test]
+fn text_tool_and_annotation_boxes_stay_body_hits_not_label_hits() {
+    let mut chart = settled_chart();
+    let text = chart
+        .add_drawing(
+            DrawingKind::Text,
+            0,
+            vec![pt(4.0, 11.0)],
+            Some(r#"{"text":"levels"}"#),
+        )
+        .unwrap();
+    let (x, y) = chart.drawing_text_coordinate(text).unwrap();
+    assert_eq!(chart.hit_test_drawing(x, y).map(|hit| hit.id), Some(text));
+    assert_eq!(chart.drawing_text_hit_at(x, y), None);
+    let comment = chart
+        .add_drawing(DrawingKind::Comment, 0, vec![pt(6.0, 12.0)], None)
+        .unwrap();
+    let layout = chart.drawing_text_edit_layout(comment).unwrap();
+    let [left, top, right, bottom] = layout.rect;
+    let center = ((left + right) / 2.0, (top + bottom) / 2.0);
+    assert_eq!(
+        chart.hit_test_drawing(center.0, center.1).map(|hit| hit.id),
+        Some(comment)
+    );
+    assert_eq!(chart.drawing_text_hit_at(center.0, center.1), None);
+}
+
+#[test]
+fn a_higher_body_or_the_selected_handle_suppresses_a_lower_label_hit() {
+    let mut chart = settled_chart();
+    // The box's center sits on a bar (logical 5) and mid price, so an anchor can land on it.
+    let (a, b) = (pt(2.0, 10.0), pt(8.0, 13.0));
+    let (cx, cy) = box_center(&chart, a, b);
+    let rectangle = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![a, b],
+            Some(r#"{"text":"box"}"#),
+        )
+        .unwrap();
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), Some(rectangle));
+
+    // A higher-z trend line passing through the label covers it: the body wins.
+    let cover = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![pt(2.0, 11.5), pt(8.0, 11.5)],
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        chart.hit_test_drawing(cx, cy).map(|hit| hit.id),
+        Some(cover)
+    );
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), None);
+
+    // A label on top of the covering body wins.
+    assert!(chart.move_drawing_z_order(rectangle, 1));
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), Some(rectangle));
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), None);
+    assert!(chart.remove_drawing(cover));
+    assert_eq!(chart.drawing_text_hit_at(cx, cy), Some(rectangle));
+
+    // The selected drawing's anchor handle at the label wins over the label beneath it. The
+    // probe sits just left of the anchor: inside the handle's radius but outside the stroke.
+    let handle_owner = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![pt(5.0, 11.5), pt(9.0, 12.0)],
+            None,
+        )
+        .unwrap();
+    let probe = (cx - 5.0, cy);
+    assert_eq!(chart.hit_test_drawing(probe.0, probe.1), None);
+    assert_eq!(chart.drawing_text_hit_at(probe.0, probe.1), Some(rectangle));
+    chart.set_selected_drawing(Some(handle_owner));
+    assert_eq!(
+        chart
+            .hit_test_drawing(probe.0, probe.1)
+            .map(|hit| (hit.id, hit.part)),
+        Some((handle_owner, DrawingDragPart::Anchor(0)))
+    );
+    assert_eq!(chart.drawing_text_hit_at(probe.0, probe.1), None);
+    chart.set_selected_drawing(None);
+    assert_eq!(
+        chart.drawing_text_hit_at(cx, cy),
+        None,
+        "the trend line's stroke starts at the label center and covers it"
+    );
+}
+
+#[test]
+fn drawing_at_answers_what_a_click_would_select_without_moving_the_selection() {
+    let mut chart = settled_chart();
+    let (a, b) = (pt(2.0, 10.0), pt(8.0, 13.0));
+    let (cx, cy) = box_center(&chart, a, b);
+    let rectangle = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![a, b],
+            Some(r#"{"text":"box"}"#),
+        )
+        .unwrap();
+    let far = (chart.pane_w - 8.0, 8.0);
+    let inside_below_label = (cx, cy + 60.0);
+
+    // Unselected: only the label reaches the shape (its interior is a pan surface).
+    assert_eq!(chart.selected_drawing(), None);
+    assert_eq!(chart.drawing_at(cx, cy), Some(rectangle));
+    assert_eq!(
+        chart.drawing_at(inside_below_label.0, inside_below_label.1),
+        None
+    );
+    assert_eq!(chart.drawing_at(far.0, far.1), None);
+    assert_eq!(chart.selected_drawing(), None, "asking never selects");
+
+    // Selected: the whole interior and the anchor handles are the drawing; elsewhere is not.
+    chart.set_selected_drawing(Some(rectangle));
+    assert_eq!(
+        chart.drawing_at(inside_below_label.0, inside_below_label.1),
+        Some(rectangle)
+    );
+    let corner = (x_at(&chart, a.logical), y_at(&chart, a.price));
+    assert_eq!(chart.drawing_at(corner.0, corner.1), Some(rectangle));
+    assert_eq!(chart.drawing_at(far.0, far.1), None);
+    assert_eq!(chart.drawing_at(f64::NAN, cy), None);
+    assert_eq!(chart.selected_drawing(), Some(rectangle));
+
+    // A higher drawing's body at the point is the drawing there, not the selected one beneath.
+    let cover = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![pt(2.0, 11.5), pt(8.0, 11.5)],
+            None,
+        )
+        .unwrap();
+    chart.set_selected_drawing(Some(rectangle));
+    assert_eq!(chart.drawing_at(cx, cy), Some(cover));
+    assert_eq!(chart.selected_drawing(), Some(rectangle));
+}
+
+#[test]
+fn a_steep_short_segment_with_long_text_stays_a_candidate_along_its_whole_label() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![pt(4.0, 11.0), pt(4.02, 11.6)],
+            Some(r#"{"text":"a very long steep label that runs far past the segment end"}"#),
+        )
+        .unwrap();
+    let (x, y, angle) = chart.drawing_text_transform(id).unwrap();
+    assert!(angle.abs() > 1.4, "the fixture must be steep: {angle}");
+    // Walk the run: every point along its baseline is a text hit, however far from the anchors.
+    let width = 60.0 * 12.0 * 0.6;
+    let mut hits = 0;
+    for step in 1..=10 {
+        let along = -width * f64::from(step) / 11.0;
+        let (px, py) = (x + angle.cos() * along, y + angle.sin() * along);
+        if py < 0.0 || py > 500.0 {
+            continue;
+        }
+        assert_eq!(
+            chart.drawing_text_hit_at(px, py),
+            Some(id),
+            "step {step} at ({px}, {py})"
+        );
+        hits += 1;
+    }
+    assert!(hits >= 3, "the fixture must keep the run in the pane");
+}
+
+#[test]
+fn drawings_without_convertible_anchors_are_not_text_editable() {
+    // No data or scale: the anchors cannot convert, so no caret can be placed.
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let text = chart
+        .add_drawing(DrawingKind::Text, 0, vec![pt(3.0, 11.0)], None)
+        .unwrap();
+    let trend = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![pt(2.0, 10.5), pt(7.0, 12.5)],
+            None,
+        )
+        .unwrap();
+    for id in [text, trend] {
+        assert!(!chart.drawing_text_editable(id));
+        assert!(!chart.begin_drawing_text_edit(id));
+    }
+}
+
+#[test]
+fn placing_a_text_owning_annotation_requests_the_editor_but_price_labels_and_arrows_do_not() {
+    let mut chart = settled_chart();
+    let click = (x_at(&chart, 4.0), y_at(&chart, 11.0));
+    let second = (x_at(&chart, 7.0), y_at(&chart, 12.5));
+    for (kind, clicks, requests) in [
+        (DrawingKind::Text, 1, true),
+        (DrawingKind::AnchoredText, 1, true),
+        (DrawingKind::Note, 1, true),
+        (DrawingKind::Comment, 1, true),
+        (DrawingKind::Signpost, 1, true),
+        (DrawingKind::Callout, 2, true),
+        (DrawingKind::PriceNote, 2, false),
+        (DrawingKind::PriceLabel, 1, false),
+        (DrawingKind::ArrowMarkUp, 1, false),
+        (DrawingKind::ArrowMarkDown, 1, false),
+        (DrawingKind::ArrowMarkLeft, 1, false),
+        (DrawingKind::ArrowMarkRight, 1, false),
+        (DrawingKind::FlagMark, 1, false),
+        (DrawingKind::Icon, 1, false),
+        (DrawingKind::Rectangle, 2, false),
+        (DrawingKind::TrendLine, 2, false),
+    ] {
+        assert!(chart.set_drawing_tool(Some(kind), None, None), "{kind:?}");
+        let mut update = if kind == DrawingKind::Text {
+            chart.drawing_tool_pointer_down(click.0, click.1, DrawingModifiers::default())
+        } else {
+            chart.drawing_tool_activate(click.0, click.1, DrawingModifiers::default())
+        };
+        if clicks == 2 {
+            chart.drawing_tool_pointer_move(second.0, second.1, DrawingModifiers::default(), false);
+            update = chart.drawing_tool_activate(second.0, second.1, DrawingModifiers::default());
+        }
+        let id = update.created.unwrap_or_else(|| panic!("{kind:?} commits"));
+        assert_eq!(update.request_text_edit, requests, "{kind:?}");
+        assert_eq!(chart.drawing_requests_text_edit(id), requests, "{kind:?}");
+    }
+}
+
+#[test]
+fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owning_families() {
+    let mut chart = settled_chart();
+    let rectangle = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![pt(2.0, 10.0), pt(7.0, 13.0)],
+            Some(r#"{"text":"box"}"#),
+        )
+        .unwrap();
+    // A patch with an oversized text applies nothing, not even its other fields.
+    let before = chart.drawing(rectangle).unwrap().clone();
+    let oversized = serde_json::json!({
+        "color": "#ff0000",
+        "text": "a".repeat(crate::MAX_DRAWING_TEXT_BYTES + 1),
+    });
+    assert!(!chart.drawing_apply_options(rectangle, &oversized.to_string()));
+    assert_eq!(chart.drawing(rectangle).unwrap(), &before);
+    let exact = serde_json::json!({ "text": "a".repeat(crate::MAX_DRAWING_TEXT_BYTES) });
+    assert!(chart.drawing_apply_options(rectangle, &exact.to_string()));
+    assert!(chart.undo_drawing());
+
+    // An armed tool's template stays untouched by the same rejected patch.
+    assert!(chart.set_drawing_tool(Some(DrawingKind::Rectangle), None, None));
+    assert!(chart.drawing_tool_apply_options(&oversized.to_string()));
+    let click = (x_at(&chart, 3.0), y_at(&chart, 11.0));
+    let corner = (x_at(&chart, 6.0), y_at(&chart, 12.0));
+    chart.drawing_tool_activate(click.0, click.1, DrawingModifiers::default());
+    let created = chart
+        .drawing_tool_activate(corner.0, corner.1, DrawingModifiers::default())
+        .created
+        .unwrap();
+    let created = chart.drawing(created).unwrap();
+    assert_eq!(created.text, "");
+    assert_ne!(created.color, "#ff0000");
+
+    // Live editor text clamps to the bound at a character boundary.
+    assert!(chart.begin_drawing_text_edit(rectangle));
+    assert!(chart.set_drawing_edit_text(&"€".repeat(40_000)));
+    let clamped = &chart.drawing(rectangle).unwrap().text;
+    assert_eq!(
+        clamped.len(),
+        21_845 * 3,
+        "the longest prefix at a boundary"
+    );
+    assert!(clamped.len() <= crate::MAX_DRAWING_TEXT_BYTES);
+    // The engine keeps a run label on one line: a run of CR/LF becomes one space.
+    assert!(chart.set_drawing_edit_text("one\r\ntwo\n\nthree\rfour"));
+    assert_eq!(chart.drawing(rectangle).unwrap().text, "one two three four");
+    assert!(chart.end_drawing_text_edit(false));
+
+    // A family box owns its lines.
+    let comment = chart
+        .add_drawing(DrawingKind::Comment, 0, vec![pt(6.0, 12.0)], None)
+        .unwrap();
+    assert!(chart.begin_drawing_text_edit(comment));
+    assert!(chart.set_drawing_edit_text("one\ntwo"));
+    assert_eq!(chart.drawing(comment).unwrap().text, "one\ntwo");
+    assert!(chart.end_drawing_text_edit(true));
+}
+
+#[test]
+fn indexed_text_hit_matches_brute_force_for_rotated_boxed_and_full_extent_labels() {
+    let mut chart = settled_chart();
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) as f64 / f64::from(1_u32 << 31)
+    };
+    let kinds = [
+        DrawingKind::TrendLine,
+        DrawingKind::Ray,
+        DrawingKind::ExtendedLine,
+        DrawingKind::ArrowLine,
+        DrawingKind::ParallelChannel,
+        DrawingKind::Rectangle,
+        DrawingKind::Ellipse,
+        DrawingKind::HorizontalLine,
+        DrawingKind::HorizontalRay,
+        DrawingKind::VerticalLine,
+        DrawingKind::FibRetracement,
+        DrawingKind::AndrewsPitchfork,
+        DrawingKind::Triangle,
+    ];
+    let texts = [
+        "a",
+        "medium label",
+        "a very long label that runs far past the anchors of a short steep segment",
+    ];
+    let aligns = ["left", "center", "right"];
+    let valigns = ["top", "middle", "bottom"];
+    for index in 0..78 {
+        let kind = kinds[index % kinds.len()];
+        let steep = index % 3 == 0;
+        let mut logical = 1.0 + next() * 7.0;
+        let mut price = 10.0 + next() * 3.0;
+        let points = (0..kind.anchor_count())
+            .map(|_| {
+                // A steep short drawing keeps its anchors within a hair of one bar.
+                logical += if steep { 0.02 } else { next() * 3.0 - 1.0 };
+                price += if steep {
+                    next() - 0.5
+                } else {
+                    next() * 1.5 - 0.75
+                };
+                pt(logical, price)
+            })
+            .collect();
+        chart
+            .add_drawing(
+                kind,
+                0,
+                points,
+                Some(&format!(
+                    r#"{{"text":"{}","text_h_align":"{}","text_v_align":"{}"}}"#,
+                    texts[index % texts.len()],
+                    aligns[(index / 3) % 3],
+                    valigns[(index / 5) % 3],
+                )),
+            )
+            .unwrap();
+    }
+    let mut hits = 0;
+    for (from, to) in [
+        (0.0, 9.0),
+        (2.0, 6.0),
+        (-3.0, 15.0),
+        (4.4, 5.6),
+        (7.0, 30.0),
+    ] {
+        chart.set_visible_logical_range(from, to);
+        chart.build_frame();
+        let mut probes = Vec::new();
+        for gy in 0..25 {
+            for gx in 0..40 {
+                probes.push((f64::from(gx) * 20.0 + 3.0, f64::from(gy) * 20.0 + 5.0));
+            }
+        }
+        // Walk every label's run, where a culled label would show as a disagreement.
+        for id in chart
+            .drawings()
+            .iter()
+            .map(|drawing| drawing.id)
+            .collect::<Vec<_>>()
+        {
+            let Some(layout) = chart.drawing_text_edit_layout(id) else {
+                continue;
+            };
+            let width = layout.rect[2] - layout.rect[0];
+            for step in 0..=8 {
+                let along = width * f64::from(step) / 8.0;
+                probes.push((
+                    layout.x + layout.angle.cos() * along,
+                    layout.y + layout.angle.sin() * along,
+                ));
+            }
+        }
+        for (x, y) in probes {
+            let indexed = chart.drawing_text_hit_at(x, y);
+            assert_eq!(
+                indexed,
+                chart.drawing_text_hit_at_bruteforce(x, y),
+                "{from}..{to} ({x}, {y})"
+            );
+            hits += usize::from(indexed.is_some());
+        }
+    }
+    assert!(
+        hits > 100,
+        "the sweep must exercise real label hits: {hits}"
+    );
+}

@@ -3939,8 +3939,11 @@ class series_primitive_handle_impl implements series_primitive_handle {
 }
 
 /**
- * Where the engine paints a family text box's own text (`drawing_text_edit_layout_json`), in
- * overlay CSS px: lines left-aligned at `x`, line `i` centered at `y + i * line_height`.
+ * Where the engine paints a drawing's own text (`drawing_text_edit_layout_json`), in overlay CSS
+ * px. A `multiline` layout is a family text box: lines left-aligned at `x`, line `i` centered at
+ * `y + i * line_height`, never rotated. Otherwise it is one run: `x`, `y` are its start (left
+ * edge, vertical center), rotated clockwise by `angle` radians about that point, and `rect`
+ * bounds its padded box. The host only presents the editor the layout describes.
  */
 interface text_edit_layout {
   x: number;
@@ -3952,6 +3955,8 @@ interface text_edit_layout {
   italic: boolean;
   color: string;
   rect: [number, number, number, number];
+  angle: number;
+  multiline: boolean;
 }
 
 /** One registered canvas primitive (Phase C-e) in the package-side registry. */
@@ -4358,7 +4363,7 @@ export class chart_impl implements chart_api {
   private text_editor_id = 0;
   /** Snapshot of the drawing's text when the editor opened — restored on Escape. */
   private text_editor_original = "";
-  private text_editor_mode: "standalone_text" | "trend_label" | "part_label" | null = null;
+  private text_editor_mode: "standalone_text" | "run_label" | "part_label" | null = null;
   /** The edited drawing's kind in words, for accessibility announcements. */
   private text_editor_label = "";
   /** The element focused when the editor opened (an accessibility target regains focus). */
@@ -4367,7 +4372,9 @@ export class chart_impl implements chart_api {
    * The drawing selection snapshotted at pointer-DOWN, before the engine's drag grab selects
    * the hit (gestures.ts calls `note_drawing_press`). `emit_click` reads it for the public reference's
    * two-step text editing: a click opens typing mode only when the text drawing was already
-   * selected when the press began; the first click just selects (focus border).
+   * selected when the press began; the first click just selects (focus border). A double-click
+   * (`activate_drawing_double_click`) needs it too, plus the engine's word that the point is on
+   * that drawing: presses a trading object or the alert widget consumed never refresh it.
    */
   private text_press_selected: number | null = null;
   /**
@@ -6462,9 +6469,12 @@ export class chart_impl implements chart_api {
     // industry-standard click-to-select, drawings first: a drawing hit selects it and clears
     // the series selection; a miss clears the drawing selection and falls through to the
     // series under the click (or clears that on empty pane space).
-    const trend_text_hit = Number(this.wasm.drawing_text_hit_at(x, y));
-    const drawing_hit = trend_text_hit > 0 || this.wasm.select_drawing_at(x, y);
-    if (trend_text_hit > 0) this.wasm.set_selected_drawing(trend_text_hit);
+    // A drawing's own text under the click selects it (the engine answers for a trend line's
+    // label and prompt and for the text of every line, channel, Fibonacci, pitchfork, pattern,
+    // and shape tool, which an unselected shape's interior would otherwise not hit).
+    const label_hit = Number(this.wasm.drawing_text_hit_at(x, y));
+    const drawing_hit = label_hit > 0 || this.wasm.select_drawing_at(x, y);
+    if (label_hit > 0) this.wasm.set_selected_drawing(label_hit);
     const general_hit = !drawing_hit && this.hover?.general_hit != null;
     if (general_hit) this.wasm.select_general_hovered();
     else this.wasm.clear_general_selection();
@@ -6474,9 +6484,10 @@ export class chart_impl implements chart_api {
     // Text drawings: empty labels open typing mode on the first click (there is no ink to
     // "focus" otherwise). Non-empty labels follow the public reference's two-step model — first click
     // selects (focus border), a click opens typing mode only when already selected at press.
+    // Every other drawing's text opens on a double-click, Enter, or F2 (`edit_drawing_text`).
     if (drawing_hit) {
       const selected = this.selected_drawing();
-      if (selected !== null && selected.kind() === "trend_line" && selected.id === trend_text_hit) {
+      if (selected !== null && selected.kind() === "trend_line" && selected.id === label_hit) {
         this.open_trend_label_editor(selected);
       } else if (selected !== null && selected.kind() === "text") {
         const empty = !(selected.options().text ?? "").trim();
@@ -6512,12 +6523,19 @@ export class chart_impl implements chart_api {
 
   /**
    * Let an explicitly hit Aeris drawing consume the second click without a pane click event: the
-   * text tool and trend labels re-run their click activation, and any other drawing whose text
-   * the engine edits in place (a family text box) opens the inline editor.
+   * text tool and trend labels re-run their click activation, and any other selected drawing
+   * whose text the engine edits in place opens the inline editor. The first click of a pair on an
+   * unselected drawing's text selects it (`apply_primary_click`), so a double-click on the text
+   * of a line, channel, Fibonacci, pitchfork, pattern, or shape tool reaches the editor. Host
+   * `dbl_click` subscribers still run afterwards.
    */
   activate_drawing_double_click(x: number, y: number): void {
     const selected = this.selected_drawing();
     if (selected === null || selected.id !== this.text_press_selected) return;
+    // The press snapshot says the drawing was selected, not that this click is on it: a press
+    // another owner consumed (a trading object, the alert widget) leaves the selection and the
+    // snapshot behind. The engine says whether the point still belongs to the selected drawing.
+    if (this.wasm.drawing_at(x, y) !== selected.id) return;
     if (selected.kind() === "text" || selected.kind() === "trend_line") {
       this.apply_primary_click(x, y);
     } else {
@@ -6908,7 +6926,9 @@ export class chart_impl implements chart_api {
     // One-shot disarming happened inside the engine controller; mirror that public state change.
     this.tool_listener?.(null);
     for (const handler of this.tool_change_subs) handler(null);
-    if (this.wasm.drawing_requests_text_edit(created_id)) this.open_text_editor(created);
+    // The engine decides which tools start in the editor (the text tool and the annotation boxes
+    // that begin from a default text); the host presents the one its layout describes.
+    if (this.wasm.drawing_requests_text_edit(created_id)) this.edit_drawing_text(created_id);
     return true;
   }
 
@@ -6973,10 +6993,13 @@ export class chart_impl implements chart_api {
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Inline drawing editors. Standalone text, trend labels, and family text boxes (a note, callout,
-  // comment, ...) share the borderless caret surface and the engine's text-edit session: live
-  // text repaints without history, commit records one undo step, and cancel restores the
-  // pre-edit text. Each mode enters explicitly and owns its layout source and empty lifecycle.
+  // Inline drawing editors. Every drawing that paints text edits it through one engine session
+  // and the borderless caret surface: live text repaints without history, commit records one undo
+  // step, and cancel restores the pre-edit text. The engine's `drawing_text_edit_layout` says
+  // where the text sits and whether it is a run (the text tool, trend labels, and the text of
+  // lines, channels, Fibonacci tools, pitchforks, patterns, and shapes: one line, possibly
+  // rotated) or a family text box (several lines); the host only presents the matching surface.
+  // The text tool alone owns an empty lifecycle (leaving it empty removes the drawing).
   // ---------------------------------------------------------------------------------------------
 
   /**
@@ -6991,23 +7014,35 @@ export class chart_impl implements chart_api {
   }
 
   private open_trend_label_editor(drawing: drawing_api): void {
-    this.open_inline_editor(drawing, "trend_label");
+    this.open_inline_editor(drawing, "run_label");
   }
 
   /**
-   * Open the inline editor on a drawing's own text (Enter or F2 on a selected drawing, or a
-   * double-click on it): the text tool's typing mode, a trend line's label, or a family text box,
-   * whichever the engine reports editable. Returns whether an editor opened.
+   * Open the inline editor on a drawing's own text (Enter or F2 on a selected drawing, a
+   * double-click on it, or placement of a tool that starts in the editor): whatever the engine
+   * reports editable, presented as the surface its layout describes. Refuses a drawing whose
+   * text is entirely outside the chart, so no invisible editor captures the keys. Returns whether
+   * an editor opened.
    */
   edit_drawing_text(id: number): boolean {
     if (!this.wasm.drawing_text_editable(id)) return false;
+    const layout = this.text_edit_layout(id);
+    if (layout === null || !this.text_in_view(layout)) return false;
     const info = (JSON.parse(this.wasm.drawings_json()) as drawing_info[]).find((d) => d.id === id);
     if (info === undefined) return false;
     const drawing = new drawing_impl(this, info.id, info.kind, info.pane_index);
-    if (info.kind === "text") this.open_inline_editor(drawing, "standalone_text");
-    else if (info.kind === "trend_line") this.open_inline_editor(drawing, "trend_label");
-    else this.open_part_label_editor(drawing);
+    if (layout.multiline) this.open_part_label_editor(drawing);
+    else this.open_inline_editor(drawing, info.kind === "text" ? "standalone_text" : "run_label");
     return this.text_editor !== null && this.text_editor_id === id;
+  }
+
+  /** Whether any part of the layout's text box is inside the chart's visible area. */
+  private text_in_view(layout: text_edit_layout): boolean {
+    const width = this.overlay.clientWidth;
+    const height = this.overlay.clientHeight;
+    if (width <= 0 || height <= 0) return true;
+    const [left, top, right, bottom] = layout.rect;
+    return right > 0 && left < width && bottom > 0 && top < height;
   }
 
   /**
@@ -7125,7 +7160,7 @@ export class chart_impl implements chart_api {
    */
   private attach_text_editor(
     drawing: drawing_api,
-    mode: "standalone_text" | "trend_label" | "part_label",
+    mode: "standalone_text" | "run_label" | "part_label",
     editor: HTMLElement,
     return_focus: Element | null,
     on_input: () => void,
@@ -7143,7 +7178,9 @@ export class chart_impl implements chart_api {
         this.close_text_editor(false);
       }
     });
-    editor.addEventListener("blur", () => this.close_text_editor(true));
+    // Focus that moved to another element (a host panel or control) stays there: the editor
+    // commits, and the chart does not pull focus back.
+    editor.addEventListener("blur", (e) => this.close_text_editor(true, e.relatedTarget instanceof Element));
 
     this.text_editor = editor;
     this.text_editor_id = drawing.id;
@@ -7170,58 +7207,48 @@ export class chart_impl implements chart_api {
     );
   }
 
+  /**
+   * Open the single-line editor on a drawing's text run. The engine's layout gives the run's
+   * start point (left edge, vertical center), rotation, glyph size, font, and ink, and is read
+   * again after every keystroke, so the caret overlay cannot drift from the painted label: the
+   * host holds no placement, alignment, or color rule of its own.
+   */
   private open_inline_editor(
     drawing: drawing_api,
-    mode: "standalone_text" | "trend_label",
+    mode: "standalone_text" | "run_label",
   ): void {
     this.close_text_editor(true);
-    let transform = this.wasm.drawing_text_transform(drawing.id);
-    if (transform.length !== 3) return;
     const return_focus = document.activeElement;
     // The engine session keeps the canvas label under the caret overlay and records the edit as
     // one undo step; it refuses a locked, hidden, or otherwise uneditable drawing.
     if (!this.wasm.begin_drawing_text_edit(drawing.id)) return;
+    let layout = this.text_edit_layout(drawing.id);
+    if (layout === null || layout.multiline) {
+      this.wasm.end_drawing_text_edit(false);
+      return;
+    }
     const options = drawing.options();
-    const layout = (this.options() as {
-      layout?: {
-        fontSize?: number;
-        fontFamily?: string;
-        textColor?: string;
-        mutedTextColor?: string;
-        background?: { color?: string };
-      };
-    }).layout ?? {};
-    const font_size = options.text_size ?? (drawing.kind() === "text" ? 14 : (layout.fontSize ?? 12));
-    const font_family = layout.fontFamily ?? "sans-serif";
-    const style_prefix = options.text_italic ? "italic " : "";
-    const font = `${style_prefix}${options.text_weight ?? 400} ${font_size}px ${font_family}`;
-    // Same color the engine paints with: explicit drawing override, then a trend label's line,
-    // otherwise the chart foreground used by standalone text. Never infer a different trend-label
-    // default in the host.
-    const ink =
-      (options.text_color && options.text_color.trim() !== ""
-        ? options.text_color
-        : null) ??
-      (drawing.kind() === "trend_line" ? options.color : null) ??
-      layout.textColor ??
-      theme_palette(default_theme_name).foreground;
-
+    const font_of = (edit: text_edit_layout) =>
+      `${edit.italic ? "italic " : ""}${edit.weight} ${edit.size}px ${edit.font_family}`;
+    const font = font_of(layout);
+    const font_size = layout.size;
     const { wrap, editor, caret } = this.text_editor_surface(
       options.text,
       font,
       font_size,
-      font_size * 1.2,
-      ink,
+      layout.line_height,
+      layout.color,
       `${drawing.kind().replaceAll("_", " ")} text`,
       false,
     );
-    wrap.style.background = options.box_color || "transparent";
+    // Only the text tool paints a container behind its run.
+    if (mode === "standalone_text") wrap.style.background = options.box_color || "transparent";
 
     const dpr = window.devicePixelRatio || 1;
     const measure_ctx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
     let baseline_drop = 0;
     if (measure_ctx !== null) {
-      const device_font = `${style_prefix}${options.text_weight ?? 400} ${font_size * dpr}px ${font_family}`;
+      const device_font = `${layout.italic ? "italic " : ""}${layout.weight} ${font_size * dpr}px ${layout.font_family}`;
       const side = Math.ceil(font_size * dpr) + 16;
       const probe_canvas = measure_ctx.canvas;
       probe_canvas.width = side;
@@ -7255,34 +7282,40 @@ export class chart_impl implements chart_api {
     const position_caret = () => {
       const text = editor.textContent ?? "";
       const before_caret = text.slice(0, chart_impl.text_editor_caret_offset(editor));
+      if (measure_ctx !== null) measure_ctx.font = font;
       const x = measure_ctx === null ? 0 : measure_ctx.measureText(before_caret).width;
       caret.style.left = `${Math.ceil(x)}px`;
     };
+    // The wrap's left-middle sits on the run's start point and rotates about it, so the DOM run
+    // lies exactly on the painted one whatever its alignment or slope.
     const position_editor = () => {
-      const anchor_x = transform[0]!;
-      const anchor_y = transform[1]!;
-      const text = editor.textContent ?? "";
-      let left_edge = anchor_x - (editor.offsetWidth || 0) / 2;
-      if (measure_ctx !== null) {
-        measure_ctx.font = font;
-        const advance = text === "" ? font_size : measure_ctx.measureText(text).width;
-        if (options.text_h_align === "left") left_edge = anchor_x;
-        else if (options.text_h_align === "right") left_edge = anchor_x - advance;
-        else left_edge = anchor_x - advance / 2;
-      }
-      const baseline = anchor_y + baseline_drop;
-      wrap.style.left = `${left_edge}px`;
-      wrap.style.top = `${baseline - baseline_in_editor}px`;
-      wrap.style.transformOrigin = `${anchor_x - left_edge}px ${anchor_y - (baseline - baseline_in_editor)}px`;
-      wrap.style.transform = `rotate(${transform[2]!}rad)`;
+      const edit = layout!;
+      const middle = baseline_in_editor - baseline_drop;
+      wrap.style.left = `${edit.x}px`;
+      wrap.style.top = `${edit.y - middle}px`;
+      wrap.style.transformOrigin = `0px ${middle}px`;
+      wrap.style.transform = `rotate(${edit.angle}rad)`;
+      caret.style.background = edit.color;
       position_caret();
     };
-    const push_live_text = () => {
-      const text = (editor.textContent ?? "").replace(/\s*\n\s*/g, " ");
-      if (!this.wasm.set_drawing_edit_text(text)) {
+    // Re-read the engine's layout: the run may grow, shift, or slide along its stroke as the text
+    // changes. A layout that vanished (drawing removed or replaced) ends the session.
+    const relayout = () => {
+      const fresh = this.wasm.editing_drawing() === drawing.id ? this.text_edit_layout(drawing.id) : null;
+      if (fresh === null || fresh.multiline) {
         this.close_text_editor(false);
         return;
       }
+      layout = fresh;
+      position_editor();
+    };
+    const push_live_text = () => {
+      // The engine owns the single-line rule and the length bound.
+      if (!this.wasm.set_drawing_edit_text(editor.textContent ?? "")) {
+        this.close_text_editor(false);
+        return;
+      }
+      relayout();
       this.repaint();
     };
     const set_width = () => {
@@ -7292,7 +7325,6 @@ export class chart_impl implements chart_api {
         const w = text === "" ? font_size : measure_ctx.measureText(text).width;
         editor.style.width = `${Math.ceil(w) + 1}px`;
       }
-      position_editor();
       push_live_text();
     };
     editor.addEventListener("keyup", position_caret);
@@ -7317,14 +7349,7 @@ export class chart_impl implements chart_api {
     position_editor();
 
     this.text_editor_reposition = () => {
-      if (this.text_editor === null) return;
-      const fresh = this.wasm.drawing_text_transform(drawing.id);
-      if (fresh.length !== 3 || this.wasm.editing_drawing() !== drawing.id) {
-        this.close_text_editor(false);
-        return;
-      }
-      transform = fresh;
-      position_editor();
+      if (this.text_editor !== null) relayout();
     };
     this.attach_text_editor(drawing, mode, editor, return_focus, set_width);
     position_caret();
@@ -7418,9 +7443,11 @@ export class chart_impl implements chart_api {
   /**
    * Close the typing-mode editor. Commit keeps the typed text as one undo step; cancel restores
    * the pre-edit text. A standalone text left empty is removed. Focus returns to where the
-   * editor was opened from inside the chart (an accessibility target), else the overlay.
+   * editor was opened from inside the chart (an accessibility target), else the overlay, unless
+   * `focus_moved`: the editor lost focus to another element, which keeps it (taking focus back
+   * would cancel the host's own `focus()` call, as a blur handler moving focus does).
    */
-  close_text_editor(commit: boolean): void {
+  close_text_editor(commit: boolean, focus_moved = false): void {
     const editor = this.text_editor;
     if (editor === null) return;
     const mode = this.text_editor_mode;
@@ -7453,6 +7480,7 @@ export class chart_impl implements chart_api {
       : target === undefined
         ? null
         : this.container.querySelector<HTMLElement>(`[data-a11y-target="${CSS.escape(target)}"]`);
+    if (focus_moved) return;
     if (back !== null && back !== this.overlay_el() && this.container.contains(back)) back.focus();
     else this.overlay_el().focus();
   }

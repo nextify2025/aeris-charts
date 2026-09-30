@@ -892,16 +892,46 @@ handle by the nudge distance. `drawing_handle_count()` counts them. A nudge that
 locked drawing, an axis the drawing cannot move along, a clamp at the pane edge) records no undo
 step and is announced as such, so Escape rolls back only the nudges that moved the drawing.
 
-A drawing's own text is edited in place in the chart's inline editor: the text tool, a trend line's
-label, and the text boxes of the Projection & Annotations tools listed below. A double-click on a
-selected drawing, or Enter or F2 while the chart has focus and the drawing is selected (F2 on its
-accessibility drawing target, where Enter keeps geometry editing), opens the editor; locked,
-hidden, and interval-hidden drawings do not open it. Typing repaints live, Enter or leaving the
-editor commits, and Escape restores the text. The whole edit is one undo step and reaches
-`drawing_sync_payload` once, on commit. Family text boxes take several lines (Shift+Enter adds one,
-paste inserts plain text); the text tool and trend labels stay single-line. The editor is a
-labeled text box that announces opening and closing through the accessibility live region and
-returns focus to where it was opened from.
+A drawing's own text is edited in place in the chart's inline editor, for every drawing that paints
+it: the text tool, a trend line's label, the text of every line, channel, Fibonacci, pitchfork,
+pattern, and shape tool (one line, rotated along the stroke when the label follows a segment), and
+the text boxes of the Projection & Annotations tools listed below (several lines). Level, point,
+and wave labels, ratios, and stats are engine-formatted text and stay options-only. Eight tools
+accept `text` but never paint or edit it: `forecast`, `bars_pattern`, `price_range`, `date_range`,
+`date_and_price_range`, `projection`, `flag_mark`, and `icon`. A double-click on a selected
+drawing, or on the text of an unselected one (its first click selects it), or Enter or F2 while
+the chart has focus and the drawing is selected (F2 on its accessibility drawing target, where
+Enter keeps geometry editing), opens the editor; locked, hidden, and interval-hidden drawings do
+not open it, nor does a drawing whose text lies wholly outside the chart. The engine decides which
+text is edited and where it sits, so an unselected drawing with no text has no label to
+double-click: select it and double-click it, press Enter or F2, or use its options to add the first
+label (only a trend line prompts `+ Add text` on hover). An unselected drawing's text answers hover
+with the text cursor and a click with a selection, unless a higher drawing or the selected
+drawing's anchor handle is at that point.
+Typing repaints live, Enter or leaving the editor commits, and Escape restores the text. The whole
+edit is one undo step and reaches `drawing_sync_payload` once, on commit. Text is bounded by
+`MAX_DRAWING_TEXT_BYTES` (65,536 bytes: longer `text` in options is rejected without applying
+the rest of the patch, and typing stops at the bound); the text tool, trend labels, and every
+other run label stay on one line (line breaks become one space), while family text boxes take
+several lines (Shift+Enter adds one, paste inserts plain text). The editor is a labeled text box
+that announces opening and closing through the accessibility live region and returns focus to
+where it was opened from. Placing the text tool, `anchored_text`, `note`, `callout`, `comment`, or
+`signpost` opens the editor at once with the caret after the default text; committing or Escape
+keeps the drawing, even emptied (only the text tool removes itself when left empty). Placing a
+`price_note`, `price_label`, or arrow mark, which start with no text of their own, opens nothing.
+
+A double-click acts on the selected drawing only where a click would select it: on its text, its
+body, or one of its handles. A pair whose first click landed on a trading object or the alert
+widget acts on no drawing, and neither does a double-click elsewhere while a drawing stays
+selected.
+
+Host `dbl_click` subscribers still run after a double-click opened the editor. A host that binds
+double-click to its own settings panel therefore sees both: the editor is open when the handler
+runs, and calling `focus()` on a panel control closes it (the editor commits its text unchanged,
+which records no undo step and no sync revision) and leaves focus on that control, so the drawing
+is exactly as it was. A click on a host control while an editor is open closes it the same way and
+leaves focus on that control; only Enter and Escape return focus to where the editor opened from
+inside the chart.
 
 A drawing's dashed or dotted `style` paints the same dashes on WebGPU, Canvas2D, GPUI, and native
 rendering, and so does a general series' `line_style`: the engine splits those strokes into dash
@@ -958,7 +988,7 @@ descriptors name those options with dotted paths such as `tool_options.line.stat
   the pane edge in the line's own direction; a ray defaults to `extend_right`, an extended line to
   both. End caps (`stroke_start`, `stroke_end`) paint only on ends that are not extended; the arrow
   line defaults `stroke_end` to `"arrow"`. The `text` label follows the segment like a trend
-  line's; inline hover editing remains a trend-line feature.
+  line's and edits in place the same way; only a trend line prompts `+ Add text` on hover.
 - Visible `labels` render as one stats box: price, price change, percent change, and ticks on one
   line; bar count, time range, and duration on the next; screen angle and CSS-px distance last.
   Values use the drawing scale's price formatter and the anchors' time identity. `info_line`
@@ -1137,7 +1167,8 @@ Defaults follow the conventional professional-platform look: the drawing `color`
 primary unless noted) paints markers, leaders, and box backgrounds; box text is `text_color` or
 black/white contrast against the box; `box_border_color` frames annotation boxes; text uses the
 chart font size unless `text_size` is set. Every tool owns its `text` (it does not follow the
-3×3 box label of other tools) and renders any visible `labels` as engine-formatted stats.
+3×3 box label of other tools) and renders any visible `labels` as engine-formatted stats. Eight of
+the tools paint no text: their `text` is accepted and kept, never shown or edited in place.
 
 - `forecast` (source, target): a segment with end caps from `stroke_start`/`stroke_end`, a source
   dot and a source-price box on the far side, and a target box with the change and percent, the
@@ -1206,7 +1237,8 @@ chart font size unless `text_size` is set. Every tool owns its `text` (it does n
 - The text of `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
   `signpost`, and the arrow marks edits in place (see inline text editing above); the price note
   and price label keep their price line above it. An emptied box keeps one caret line while it is
-  edited. Placing one of these tools does not open the editor.
+  edited. Placing `anchored_text`, `note`, `callout`, `comment`, or `signpost` opens the editor on
+  the default text; placing `price_note`, `price_label`, or an arrow mark does not.
 - `drawing_kind_options()` returns `{ kind: "projection_annotation", bars_mode, mirrored, flipped,
   pattern_bars, icon, icon_size, always_show_text }` for every tool of the family.
 <!-- B8: projection_annotations — end -->

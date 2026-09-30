@@ -12,6 +12,10 @@ use crate::{ChartError, DrawingAnchor, DrawingKind, DrawingPriceScale, ErrorCode
 
 pub const DRAWING_CONTRACT_REVISION: u32 = 1;
 pub const MAX_DRAWING_NAME_BYTES: usize = 256;
+/// Byte bound of one drawing's `text`, on every path that sets it: options and patches reject a
+/// longer text, and the inline editor's live text clamps to it. Persistence accepts exactly this
+/// much per drawing (and bounds the document's total separately).
+pub const MAX_DRAWING_TEXT_BYTES: usize = 65_536;
 pub const MAX_DRAWING_GROUP_BYTES: usize = 128;
 pub const MAX_DRAWING_LABELS: usize = 32;
 pub const MAX_DRAWING_LEVELS: usize = 64;

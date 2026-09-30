@@ -2939,6 +2939,9 @@ impl ChartInner {
     pub fn drawing_text_hit_at(&self, x_css: f64, y_css: f64) -> u32 {
         self.engine.drawing_text_hit_at(x_css, y_css).unwrap_or(0)
     }
+    pub fn drawing_at(&self, x_css: f64, y_css: f64) -> u32 {
+        self.engine.drawing_at(x_css, y_css).unwrap_or(0)
+    }
     pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
         self.engine
             .drawing_text_edit_layout(id)

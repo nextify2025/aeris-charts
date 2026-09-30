@@ -235,9 +235,10 @@ impl ChartEngine {
     }
 
     /// Width source for the middle-line cutout. Hover reserves the full prompt; once editing
-    /// begins, an empty value uses the editor's one-em caret opening and measured text expands it.
+    /// begins (on any drawing with a segment-following label), an empty value uses the editor's
+    /// one-em caret opening and measured text expands it.
     fn drawing_frame_gap_text<'a>(&self, drawing: &'a Drawing) -> Option<&'a str> {
-        if drawing.kind == DrawingKind::TrendLine && self.editing_drawing() == Some(drawing.id) {
+        if self.editing_drawing() == Some(drawing.id) {
             return Some(drawing.display_text());
         }
         if !drawing.text.is_empty() {
@@ -570,7 +571,10 @@ impl ChartEngine {
         let Some(drawing) = self.drawing(id) else {
             return;
         };
-        if drawing.kind.spec().requests_text_editor {
+        // The text tool has no drag points; its selection affordance is the focus border alone.
+        // (`requests_text_editor` only says placement opens the editor, so other tools that
+        // request it keep their handles.)
+        if drawing.kind.spec().handles == DrawingHandleMode::None {
             let Some(px) = self.overlay_drawing_px(pane_index, id, hpr, vpr) else {
                 return;
             };

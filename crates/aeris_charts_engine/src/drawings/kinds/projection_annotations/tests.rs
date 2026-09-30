@@ -4,7 +4,7 @@
 //! identity, schema and kind options, patches with history, persistence, clipboard, and sync.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, Prim};
+use aeris_charts_render::draw_list::{LineStyle, Prim, TextAlign};
 
 use super::super::super::{DrawingPlacement, DrawingTextHAlign, DrawingTextVAlign};
 use super::{BarsPatternMode, DrawingIcon, MAX_BARS_PATTERN_BARS};
@@ -195,7 +195,21 @@ fn catalog_defaults_follow_each_tool() {
         let spec = kind.spec();
         assert!(spec.family.is_some(), "{kind:?} is a family tool");
         assert!((128..=146).contains(&spec.wire_id));
-        assert!(!spec.requests_text_editor && !spec.axis_price_label);
+        assert!(!spec.axis_price_label);
+        // Placement opens the editor for the tools that start from a default text the user
+        // replaces or extends; price texts start empty beside their price and arrows carry none.
+        assert_eq!(
+            spec.requests_text_editor,
+            matches!(
+                kind,
+                DrawingKind::AnchoredText
+                    | DrawingKind::Note
+                    | DrawingKind::Callout
+                    | DrawingKind::Comment
+                    | DrawingKind::Signpost
+            ),
+            "{kind:?}"
+        );
         let expected = match kind {
             DrawingKind::Projection => 3,
             DrawingKind::Forecast
@@ -2496,7 +2510,7 @@ fn sync_revision(chart: &ChartEngine) -> u64 {
 }
 
 #[test]
-fn text_boxes_are_editable_in_place_and_nothing_else_is() {
+fn text_boxes_are_editable_in_place_as_multiline_boxes() {
     let mut chart = chart();
     for kind in KINDS {
         let id = add(&mut chart, kind, points_for(kind), "{}");
@@ -2523,7 +2537,7 @@ fn text_boxes_are_editable_in_place_and_nothing_else_is() {
         assert_eq!(chart.begin_drawing_text_edit(id), expected, "{kind:?}");
         assert_eq!(chart.end_drawing_text_edit(true), expected, "{kind:?}");
     }
-    // Core tools keep their own single-line editors; other core text is not edited in place.
+    // The text tool and trend labels edit through the same session, as one-line runs.
     let text = add(&mut chart, DrawingKind::Text, vec![p(12.0, 102.0)], "{}");
     let trend = add(
         &mut chart,
@@ -2537,9 +2551,10 @@ fn text_boxes_are_editable_in_place_and_nothing_else_is() {
         vec![p(10.0, 101.0), p(20.0, 105.0)],
         r#"{"text":"box"}"#,
     );
-    assert!(chart.drawing_text_editable(text) && chart.drawing_text_editable(trend));
-    assert!(!chart.drawing_text_editable(rectangle));
-    assert!(chart.drawing_text_edit_layout(text).is_none());
+    for id in [text, trend, rectangle] {
+        assert!(chart.drawing_text_editable(id));
+        assert!(!chart.drawing_text_edit_layout(id).unwrap().multiline);
+    }
     // Locked, hidden, and interval-hidden drawings never open an editor.
     let comment = add(&mut chart, DrawingKind::Comment, vec![p(15.0, 103.0)], "{}");
     for patch in [
@@ -2555,6 +2570,84 @@ fn text_boxes_are_editable_in_place_and_nothing_else_is() {
         assert_eq!(chart.drawing(comment).unwrap(), &before);
     }
     assert!(chart.drawing_text_editable(comment));
+}
+
+/// Valid anchors for any catalog tool inside the fixture chart's data: pane fractions for a
+/// pane-anchored tool, otherwise the tool's minimum anchor count on a gentle zigzag.
+fn catalog_points(kind: DrawingKind) -> Vec<DrawingPoint> {
+    if kind.pane_anchored() {
+        return vec![p(0.3, 0.2)];
+    }
+    let count = kind.anchor_count();
+    (0..count)
+        .map(|index| {
+            let step = index as f64;
+            p(
+                8.0 + step * 12.0 / count.max(2) as f64,
+                if index % 2 == 0 {
+                    101.5 + step * 0.2
+                } else {
+                    105.0 - step * 0.2
+                },
+            )
+        })
+        .collect()
+}
+
+/// The tools whose drawing paints no text of its own, by design: their `text` is accepted but
+/// never painted, so there is nothing to edit in place.
+const TEXTLESS: [DrawingKind; 8] = [
+    DrawingKind::Forecast,
+    DrawingKind::BarsPattern,
+    DrawingKind::PriceRange,
+    DrawingKind::DateRange,
+    DrawingKind::DateAndPriceRange,
+    DrawingKind::Projection,
+    DrawingKind::FlagMark,
+    DrawingKind::Icon,
+];
+
+#[test]
+fn every_tool_is_text_editable_exactly_when_it_paints_its_text() {
+    let mut chart = chart();
+    let mut editable_tools = 0;
+    for spec in crate::drawings::DRAWING_TOOL_SPECS {
+        let kind = spec.kind;
+        let id = add(&mut chart, kind, catalog_points(kind), r#"{"text":"t"}"#);
+        let expected = !TEXTLESS.contains(&kind);
+        editable_tools += usize::from(expected);
+        assert_eq!(chart.drawing_text_editable(id), expected, "{kind:?}");
+        let layout = chart.drawing_text_edit_layout(id);
+        assert_eq!(layout.is_some(), expected, "{kind:?}");
+        if let Some(layout) = layout {
+            // Family boxes take several lines; every other drawing edits one rotated or level
+            // run, which the engine keeps on one line.
+            assert_eq!(
+                layout.multiline,
+                spec.family.is_some_and(|family| family.owns_text),
+                "{kind:?}"
+            );
+            assert!(layout.x.is_finite() && layout.y.is_finite() && layout.angle.is_finite());
+            assert!(layout.size > 0.0 && layout.line_height > layout.size);
+        }
+        assert_eq!(chart.begin_drawing_text_edit(id), expected, "{kind:?}");
+        assert_eq!(chart.editing_drawing().is_some(), expected, "{kind:?}");
+        assert_eq!(chart.end_drawing_text_edit(true), expected, "{kind:?}");
+        // Locked, hidden, and interval-hidden drawings never open an editor.
+        for patch in [
+            r#"{"locked":true}"#,
+            r#"{"visible":false}"#,
+            r#"{"interval_visibility":{"enabled":true,"intervals":[]}}"#,
+        ] {
+            assert!(chart.drawing_apply_options(id, patch), "{kind:?} {patch}");
+            assert!(!chart.drawing_text_editable(id), "{kind:?} {patch}");
+            assert!(!chart.begin_drawing_text_edit(id), "{kind:?} {patch}");
+            assert!(chart.undo_drawing());
+        }
+        assert_eq!(chart.drawing_text_editable(id), expected, "{kind:?}");
+    }
+    assert_eq!(crate::drawings::DRAWING_TOOL_SPECS.len(), 84);
+    assert_eq!(editable_tools, 76);
 }
 
 #[test]
@@ -2609,6 +2702,173 @@ fn the_edit_layout_is_the_painted_text_box() {
         (layout.size, layout.weight, layout.italic),
         (20.0, 700, true)
     );
+}
+
+/// One painted generic text run: `(x, y, clockwise angle, align, size, weight, italic, color)`.
+type PaintedRun = (f64, f64, f64, TextAlign, f64, u16, bool, Color);
+
+/// The painted run of `text` in the first pane, whether it lowers to `Text` or `RotatedText`.
+fn painted_run(chart: &mut ChartEngine, wanted: &str) -> PaintedRun {
+    let frame = chart.build_frame();
+    frame.panes[0]
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Text {
+                text,
+                x,
+                y,
+                color,
+                size,
+                align,
+                weight,
+                italic,
+                ..
+            } if text == wanted => Some((
+                f64::from(*x),
+                f64::from(*y),
+                0.0,
+                *align,
+                f64::from(*size),
+                *weight,
+                *italic,
+                *color,
+            )),
+            Prim::RotatedText {
+                text,
+                x,
+                y,
+                color,
+                size,
+                align,
+                weight,
+                italic,
+                angle,
+                ..
+            } if text == wanted => Some((
+                f64::from(*x),
+                f64::from(*y),
+                f64::from(*angle),
+                *align,
+                f64::from(*size),
+                *weight,
+                *italic,
+                *color,
+            )),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{wanted:?} is painted"))
+}
+
+/// Where a run painted at anchor `(x, y)` with `align` and clockwise `angle` starts (its left
+/// edge, vertically centered), for the advance `width`.
+fn run_start(run: &PaintedRun, width: f64) -> (f64, f64) {
+    let (x, y, angle, align, ..) = *run;
+    let left = match align {
+        TextAlign::Left => 0.0,
+        TextAlign::Center => -width / 2.0,
+        TextAlign::Right => -width,
+    };
+    (x + angle.cos() * left, y + angle.sin() * left)
+}
+
+#[test]
+fn the_run_edit_layout_is_where_the_frame_paints_the_generic_label() {
+    // The frame places runs in bitmap px, the layout in media px: they agree at any pixel ratio.
+    for dpr in [1.0, 2.0] {
+        let mut chart = chart_with(&hourly(40), dpr);
+        let cases = [
+            // A ray's label follows its stroke: rotated, top-right slot, stroke-colored.
+            (
+                DrawingKind::Ray,
+                r##"{"text":"ray text","color":"#123456","text_size":18,"text_weight":700,"text_italic":true}"##,
+                "ray text",
+            ),
+            // A rectangle's label is level and centered in its box; a circle's in its shape box.
+            (DrawingKind::Rectangle, r#"{"text":"box text"}"#, "box text"),
+            (
+                DrawingKind::Circle,
+                r#"{"text":"circle text"}"#,
+                "circle text",
+            ),
+        ];
+        for (kind, options, wanted) in cases {
+            let id = add(&mut chart, kind, points_for(kind), options);
+            let layout = chart.drawing_text_edit_layout(id).unwrap();
+            let mut painted = painted_run(&mut chart, wanted);
+            let (.., weight, italic, color) = painted;
+            // Bitmap px to media px.
+            painted.0 /= dpr;
+            painted.1 /= dpr;
+            painted.4 /= dpr;
+            let size = painted.4;
+            let width = wanted.chars().count() as f64 * size * 0.6;
+            let (x, y) = run_start(&painted, width);
+            let label = format!("{kind:?} at {dpr}x");
+            assert!((layout.x - x).abs() < 1e-3, "{label} x {} vs {x}", layout.x);
+            assert!((layout.y - y).abs() < 1e-3, "{label} y {} vs {y}", layout.y);
+            assert!((layout.angle - painted.2).abs() < 1e-6, "{label}");
+            assert!((layout.size - size).abs() < 1e-9, "{label}");
+            assert_eq!((layout.weight, layout.italic), (weight, italic), "{label}");
+            assert_eq!(layout.color, color.to_css(), "{label}");
+            assert_eq!(
+                layout.color,
+                chart
+                    .drawing_label_color(chart.drawing(id).unwrap())
+                    .to_css()
+            );
+            assert!(!layout.multiline);
+            assert!((layout.line_height - size * 1.2).abs() < 1e-9);
+            // The engine's caret transform and the layout agree on the run.
+            let (tx, ty, angle) = chart.drawing_text_transform(id).unwrap();
+            assert!((tx - painted.0).abs() < 1e-3 && (ty - painted.1).abs() < 1e-3);
+            assert!((angle - painted.2).abs() < 1e-6);
+            // The rect bounds the padded run box, whose center is the label's center.
+            let [left, top, right, bottom] = layout.rect;
+            let center = (x + angle.cos() * width / 2.0, y + angle.sin() * width / 2.0);
+            assert!(
+                ((left + right) / 2.0 - center.0).abs() < 1e-3
+                    && ((top + bottom) / 2.0 - center.1).abs() < 1e-3,
+                "{label}"
+            );
+            assert!(right - left >= width && bottom - top >= size, "{label}");
+            if kind == DrawingKind::Ray {
+                assert_eq!(
+                    layout.color,
+                    ink().to_css(),
+                    "a segment label follows the stroke"
+                );
+                assert!(angle.abs() > 0.1, "the ray label is rotated");
+            }
+            // The wasm host reads the layout as JSON: the new fields ride along.
+            let json = serde_json::to_value(&layout).unwrap();
+            assert_eq!(json["angle"], layout.angle, "{label}");
+            assert_eq!(json["multiline"], false, "{label}");
+            chart.remove_drawing(id);
+        }
+    }
+}
+
+#[test]
+fn an_empty_run_label_keeps_a_one_em_caret_slot_while_edited() {
+    let mut chart = chart();
+    let ray = add(
+        &mut chart,
+        DrawingKind::Ray,
+        points_for(DrawingKind::Ray),
+        r#"{"text_h_align":"right","text_v_align":"top"}"#,
+    );
+    let anchor = chart.drawing_text_transform(ray).unwrap();
+    let layout = chart.drawing_text_edit_layout(ray).unwrap();
+    let em = layout.size;
+    // A right-aligned empty run opens one em to the left of its aligned anchor, along the stroke.
+    assert!((layout.x - (anchor.0 - anchor.2.cos() * em)).abs() < 1e-3);
+    assert!((layout.y - (anchor.1 - anchor.2.sin() * em)).abs() < 1e-3);
+    assert!(chart.begin_drawing_text_edit(ray));
+    assert!(chart.set_drawing_edit_text("wider than one em"));
+    let typed = chart.drawing_text_edit_layout(ray).unwrap();
+    let width = "wider than one em".chars().count() as f64 * em * 0.6;
+    assert!((typed.x - (anchor.0 - anchor.2.cos() * width)).abs() < 1e-3);
 }
 
 #[test]

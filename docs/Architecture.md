@@ -808,24 +808,60 @@ testing and handle hooks in `parts.rs`; and level lists as contract data
 anchors scroll away, while a ray or extended line whose extensions are switched off culls like any
 finite segment.
 
-Inline text editing is one engine session for every editable drawing, the text tool and trend
-labels included: `ChartEngine::begin_drawing_text_edit` (refused for a locked, hidden, or
-interval-hidden drawing, or one that is not `drawing_text_editable`) records the text it began
-from, `set_drawing_edit_text` replaces the text live (repainting and relaying out, with no undo
-step and no sync revision), and `end_drawing_text_edit` commits the edit as one `Update` undo step
-and one sync revision or cancels it back to the text it began from. Undo and redo commit an open
-session first (the browser editor's order); removal, clearing, a sync payload, and a restore end
-it. The session is runtime-only. A family marks the label that holds a drawing's own `text` with
-`DrawingParts::text_label` (lines from `first_line` on; earlier lines are engine text such as a
-formatted price), filled from `PartContext::text_lines`, which keeps one empty caret line while
-`PartContext::text_editing` is set, so an emptied box keeps its place. Such a family sets
-`owns_text`, so the generic text pass does not paint the same `text` a second time; a family that
-sets no `owns_text` gets the generic box or segment label (placed by `text_box` when set). A family drawing is
-text-editable exactly when its parts, resolved as while editing, mark such a label, and
-`ChartEngine::drawing_text_edit_layout` returns that label's layout in media px from the same
-`PartLabel::layout` the frame and the hit test use (the lines' left edge, the first text line's
-center, the line advance, glyph size, weight, italics, and painted color), so the host's caret
-overlay cannot drift from the painted text as the box grows in any direction.
+Inline text editing is one engine session and one layout for every drawing that paints its own
+text, the text tool and trend labels included: `ChartEngine::begin_drawing_text_edit` (refused for
+a locked, hidden, or interval-hidden drawing, or one that is not `drawing_text_editable`) records
+the text it began from, `set_drawing_edit_text` replaces the text live (repainting and relaying
+out, with no undo step and no sync revision), and `end_drawing_text_edit` commits the edit as one
+`Update` undo step and one sync revision or cancels it back to the text it began from. Undo and
+redo commit an open session first (the browser editor's order); removal, clearing, a sync payload,
+and a restore end it. The session is runtime-only. The engine owns the text rules: every text is
+bounded by `MAX_DRAWING_TEXT_BYTES` (a patch that carries a longer one is refused before it
+applies anything, and live text clamps at a character boundary), and a run label stays on one line
+(a run of line breaks becomes one space). Persistence bounds each drawing's text by the same
+constant; its document-wide text total, the clipboard, and sync payloads are bounded separately.
+
+A drawing paints its text in one of two ways, and `ChartEngine::drawing_text_edit_layout` returns
+the matching layout in media px from the same geometry the frame and the hit test use, so the
+host's caret overlay cannot drift from the painted text. `DrawingTextEditLayout::multiline` names
+the mode; the presence of a layout only means the drawing paints text.
+
+- A family that owns its text (`DrawingFamily::owns_text`: the projection and annotation tools)
+  marks the label that holds the drawing's own `text` with `DrawingParts::text_label` (lines from
+  `first_line` on; earlier lines are engine text such as a formatted price), filled from
+  `PartContext::text_lines`, which keeps one empty caret line while `PartContext::text_editing`
+  is set, so an emptied box keeps its place. It is a box that may span lines (`multiline`,
+  `angle` 0): the lines' left edge, the first text line's center, the line advance, glyph size,
+  weight, italics, and painted color, from the same `PartLabel::layout` as painting and hit
+  testing, so the box may grow in any direction. Eight annotation tools add no such label (the
+  forecast, bars pattern, price range, date range, date and price range, projection, flag, and
+  icon): their `text` is accepted but never painted, and they are not editable.
+- Every other tool (`DrawingKind::paints_generic_text`: the text tool, the trend line and every
+  line, channel, Fibonacci, pitchfork, pattern, and shape tool) paints one generic run through
+  `build_drawing_text`, placed against its geometry by `text_box` (or along its first two anchors
+  for a segment layout). `ChartEngine::drawing_text_run` resolves that run once in media px
+  (returning `None`, and so no caret, when the geometry does not resolve), and the caret
+  transform, the editor layout, and the label hit test all read it; the frame keeps resolving the
+  same placement in bitmap px, and a test pins the two to each other at more than one pixel ratio.
+  The layout is one run (`multiline` false): `x`, `y` are its start point (left edge, vertical
+  center) after rotation, `angle` its clockwise rotation about that point, and an empty label
+  opens one em wide (nothing paints, so the caret needs a slot). Level names, ratios, point and
+  wave labels, and stats are engine text and stay options-only.
+
+`drawing_text_editable` is exactly "unlocked, visible, shown on the interval, and has a layout",
+so a drawing whose anchors cannot convert has no caret. The label region of a run drawing is
+`drawing_text_hit_at`: the padded run box in the run's local frame, only for a non-empty text
+(a trend line answers over its `+ Add text` prompt when empty), never for the text tool or a
+family text box, whose bodies are ordinary hits (`DrawingParts::hit`, or the text tool's chrome
+box). The topmost label wins, unless a higher drawing's body or the selected drawing's anchor
+handle is at the point, so a label never steals a click from what paints above it; the extra
+work runs only when a label is under the pointer. It walks the same culled candidates as
+`hit_test_drawing`, from the runtime position index and the candidate pass's cached anchors and
+text widths (no per-candidate scan or measure callback), and a randomized parity test pins it to a
+brute-force reference. A segment-layout label reaches past its anchors along the stroke, so its
+culling pad counts the run's whole length on both axes, and an open editor counts an empty label
+as one em. Only the text tool and trend lines have hover chrome (`set_hovered_text` ignores
+other ids); a label hit elsewhere still shows the text cursor and promotes its drawing.
 
 Family-specific options live in `Drawing.tool_options: DrawingToolOptions`, one optional block per
 family carried under `tool_options` by options JSON, templates, clipboard and sync payloads, and V1
@@ -1018,9 +1054,14 @@ for star-shaped outlines (star and heart icons), so paint and hit test cover exa
 area. Persistence compares `text` against the kind default, so a cleared default label stays
 cleared. The text boxes of anchored text, the note, price note, callout, comment, price label,
 signpost, and arrow marks are shared text labels (`DrawingParts::text_label`; the price note's and
-price label's text follows their price line), so the host's inline editor edits them in place;
-placement never opens it, since each tool starts from its default text. The flag, the icon, and
-the projection and measuring tools paint no text of their own. The note paints only its pin until
+price label's text follows their price line), so the host's inline editor edits them in place.
+Placing the anchored text, note, callout, comment, or signpost opens that editor at once
+(`DrawingToolSpec::requests_text_editor`, reported as `request_text_edit`), because each starts
+from a default text the user replaces or extends; the price note, the price label, and the arrow
+marks start with no text of their own and do not. That flag only requests the editor: the text
+focus border of the text tool follows `DrawingHandleMode::None`, so a placed note or callout
+keeps its anchor handles. The flag, the icon, and the projection and measuring tools paint no
+text of their own. The note paints only its pin until
 it is hovered, selected, or edited, like the reference platform's note, unless
 `tool_options.projection_annotation.always_show_text` is set (serialized only when set); the
 family's `reveals_on_focus` hook names such a drawing, so frame construction rebuilds the retained
@@ -1268,8 +1309,10 @@ separate stable pane identity and intentionally issues fresh live IDs during res
 The ordered frame contract contains pane backgrounds and grids, idle indicator geometry, idle drawings, ordinary series geometry, active series/drawings/previews, custom-series contributions spliced at their paint marks, pane chrome, trading regions, trading/alerts, crosshair overlays, axes, labels, and text, plus per-series and per-drawing segment ranges for retained backend groups. `series_order`/`drawings` stay the stable saved orders; the frame derives the effective paint order without rewriting them, and series/drawing hit tests tie-break on stable order so promotion cannot oscillate hover. Backends preserve ordering, clipping, blending, and coordinate conversion. A backend may batch compatible adjacent primitives only when visible output is unchanged.
 
 Trend-line labels are owned by the trend-line feature rather than by `DrawingKind::Text`: the
-engine owns their text state, dedicated hover affordance and hit region, edit-session identity,
-segment-local transform, and middle-stroke cutout. New trend labels default to the top-right slot;
+engine owns their text state, dedicated hover affordance, edit-session identity, and the
+segment-local transform and middle-stroke cutout that every segment-layout tool shares (the same
+hit region, run layout, and cutout serve the rays, channels, and other run labels; only the trend
+line has the hover prompt). New trend labels default to the top-right slot;
 their 3×3 slots resolve along and perpendicular to the actual segment. The direction is normalized
 into the readable half-plane, including a
 deterministic vertical orientation, so endpoint crossing preserves visual left/right and never
@@ -1282,21 +1325,42 @@ split the stroke in segment-parameter space using measured advance plus padding.
 prompt advance; editing starts with a compact one-em caret opening and expands from shaped text
 advance as the user types. Top and bottom slots never cut the stroke. The browser uses a fully
 transparent borderless editing surface (including native caret and IME composition paint) plus one
-explicit colored caret at the engine's exact anchor and angle, leaving the frame as the sole glyph
+explicit colored caret at the engine's exact run start and angle, leaving the frame as the sole glyph
 owner. Its selection pseudo-element is transparent as well, preventing browser selection/IME paint
 from leaking theme-colored duplicate glyphs during live transforms.
-Standalone Text retains its separate create/remove lifecycle and explicit toolbar text input.
-Family text boxes open the same transparent surface, as a native `textarea` because their text
-may span lines (Shift+Enter inserts a line; paste inserts plain text), laid out from the engine's
-`drawing_text_edit_layout`: lines left-aligned at the box's text edge and a caret positioned by
-line and column. After every keystroke the host relays the surface out from the engine, because a
-box can grow upward (a comment) or both ways (a centered callout). All three modes share the engine text-edit session,
-so a whole edit is one undo step and Escape restores the text without a history entry. A
-double-click on a selected drawing, or Enter or F2 on the chart or its accessibility drawing target
-(the target keeps Enter for geometry editing), opens the editor on whatever the engine reports
-`drawing_text_editable`; the editor is a labeled `textbox`, announces opening and closing through
-the accessibility live region, and returns focus to the element it was opened from inside the
-chart.
+Standalone Text retains its separate create/remove lifecycle and explicit toolbar text input; it
+is the only drawing the host removes when its editor closes empty. The host keeps a tool-kind
+check only there, in the text tool's two-step click, and in a trend line's open-on-click; which
+drawings are editable, where their text sits, and which tools start in the editor are engine
+answers. Run labels (the text tool, trend labels, and the text of every
+line, channel, Fibonacci, pitchfork, pattern, and shape tool) open the same transparent surface
+as one content-editable line, positioned from the engine's `drawing_text_edit_layout`: its
+left-middle sits on the run's start point and rotates about it by the layout's angle, in the
+layout's font size, weight, italics, and ink, and the host reads the layout again after every
+keystroke instead of measuring or aligning text itself. Family text boxes open it as a native
+`textarea` because their text may span lines (Shift+Enter inserts a line; paste inserts plain
+text), laid out from the same call: lines left-aligned at the box's text edge and a caret
+positioned by line and column; the box can grow upward (a comment) or both ways (a centered
+callout). Both modes share the engine text-edit session, so a whole edit is one undo step and
+Escape restores the text without a history entry. A double-click on a selected drawing (or on
+the text of an unselected one, whose first click selects it), or Enter or F2 on the chart or its
+accessibility drawing target (the target keeps Enter for geometry editing), opens the editor on
+whatever the engine reports `drawing_text_editable`, unless the whole text is outside the chart.
+The double-click is ownership-checked before it acts: the gesture recognizer skips it when the
+pair's first click or tap was taken by a trading object or the alert widget (whose presses never
+reach the drawing pipeline, so the selection and the press snapshot they leave behind are stale),
+and the host asks the engine `drawing_at` (the drawing a click at the point would select:
+`drawing_text_hit_at`, then `hit_test_drawing`, read-only) and acts only when that is the
+selected drawing. Placing a tool the engine marks `requests_text_editor` opens the editor too,
+and a commit or Escape keeps such a drawing even when its text was emptied. Host `dbl_click`
+subscribers still run after the editor opens. The editor is a labeled `textbox`, announces
+opening and closing through the accessibility live region, and returns focus to the element it
+was opened from inside the chart after Enter or Escape; when it closes because focus moved to
+another element (a host panel that calls `focus()` from its `dbl_click` handler, a click on a
+host control), it commits and leaves focus there, since pulling it back from inside a blur
+handler would cancel the host's own `focus()` call. The GPUI and native hover paths call only
+`hit_test_drawing`; a host that wants a label click to select an unselected shape there calls
+`drawing_text_hit_at` (or `drawing_at`) as the browser does.
 
 Segment-following text is an explicit `RotatedText` frame primitive carrying the final aligned
 anchor, clockwise angle, font, weight, italics, size, color, and text; no executor reconstructs

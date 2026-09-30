@@ -616,6 +616,13 @@ impl DrawingKind {
     pub fn valid_point_count(self, count: usize) -> bool {
         self.spec().placement.valid_point_count(count)
     }
+
+    /// Whether the generic label pass paints this kind's `text` as a single run placed against
+    /// its geometry (`DrawingTextLayout`). A family that owns its text lays it out in its own
+    /// parts instead (a text box that may span lines, or no text at all).
+    pub(crate) fn paints_generic_text(self) -> bool {
+        self.spec().family.is_none_or(|family| !family.owns_text)
+    }
 }
 
 /// One defining anchor of a drawing: a fractional logical bar index (integer values sit at bar
@@ -835,12 +842,13 @@ pub struct Drawing {
     /// Snap rectangle time anchors to canonical data times, matching the official plugin's
     /// `MouseEventParams.time` placement instead of retaining a fractional x coordinate.
     pub snap_time_to_data: bool,
-    /// The tool's text label (`""` = none). Empty text tools paint nothing on the chart; the
-    /// host typing-mode editor is the empty-state UI, and leaving it without typed text removes
-    /// the drawing.
+    /// The tool's text label (`""` = none), at most `MAX_DRAWING_TEXT_BYTES` bytes. Every tool that
+    /// paints text edits it in place (the eight tools that paint none keep it unpainted). An empty
+    /// label paints nothing and keeps its drawing, except for the text tool, whose empty state is
+    /// the host typing-mode editor: leaving that editor without typed text removes the drawing.
     pub text: String,
-    /// Label color CSS string. `None` follows the drawing stroke for trend lines and the chart's
-    /// `layout.textColor` for the standalone text tool.
+    /// Label color CSS string. `None` follows the drawing stroke for a label that follows a
+    /// segment (trend lines, rays, channels, ...) and the chart's `layout.textColor` otherwise.
     pub text_color: Option<String>,
     /// Label glyph size in CSS px; `None` follows the chart's `layout.fontSize`.
     pub text_size: Option<f64>,
@@ -993,9 +1001,10 @@ impl Drawing {
         }
     }
 
-    /// The label a drawing actually renders. Empty text tools render nothing — the host's
-    /// typing-mode editor is the only empty-state UI, and leaving that editor without typed
-    /// text removes the drawing (the public reference: no lingering "Add text" ghost on the chart).
+    /// The label a drawing actually renders. An empty label renders nothing, so no "Add text"
+    /// ghost lingers on the chart: the text tool's empty state is the host's typing-mode editor
+    /// (leaving it without typed text removes the drawing), and every other drawing simply shows
+    /// no label until one is typed.
     pub fn display_text(&self) -> &str {
         self.text.as_str()
     }
@@ -1190,17 +1199,18 @@ pub(crate) struct DrawingTextEdit {
     revision: u64,
 }
 
-/// Where the host's inline editor lays out a family drawing's own `text`
+/// Where the host's inline editor lays out a drawing's own `text`
 /// ([`ChartEngine::drawing_text_edit_layout`]), in media px: x from the pane's left edge, y from
 /// the chart top. The engine paints every line of the label left-aligned at `x`, line `i` of the
-/// text centered at `y + i * line_height`.
+/// text centered at `y + i * line_height`; a single run is one such line, rotated by `angle`
+/// about `(x, y)`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct DrawingTextEditLayout {
-    /// Left edge of the text lines.
+    /// Left edge of the text lines (of a run: its start point after rotation).
     pub x: f64,
     /// Vertical center of the text's first line.
     pub y: f64,
-    /// Distance between line centers (1.25 × `size`).
+    /// Distance between line centers: 1.25 × `size` in a family text box, 1.2 × `size` for a run.
     pub line_height: f64,
     /// Glyph size in CSS px.
     pub size: f64,
@@ -1211,6 +1221,93 @@ pub struct DrawingTextEditLayout {
     pub color: String,
     /// The whole label box (the edit target), `[left, top, right, bottom]`.
     pub rect: [f64; 4],
+    /// Clockwise rotation of the label in radians about its start point: the segment's angle
+    /// for a rotated run, 0 for a level run or a box.
+    pub angle: f64,
+    /// Whether the label is a box that may span lines (a family text box, `line_height` 1.25 ×
+    /// `size`), rather than one run on one line (`line_height` 1.2 × `size`, `rect` the
+    /// axis-aligned bounds of the padded run). Hosts choose their editor by this flag; the
+    /// presence of a layout only means the drawing paints text.
+    pub multiline: bool,
+}
+
+/// A drawing's generic text run in media px: the aligned anchor, the run's clockwise angle, and
+/// the alignment and glyph size the frame paints it with. Hit testing, the caret transform, and
+/// the editor layout resolve the run here so they cannot drift from
+/// `frame::drawings::text_run_geometry`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DrawingTextRun {
+    /// The run's aligned edge (left, center, or right, per `align`) and vertical center.
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    /// Clockwise radians; 0 for a level run.
+    pub(crate) angle: f64,
+    pub(crate) align: DrawingTextHAlign,
+    pub(crate) size: f64,
+}
+
+impl DrawingTextRun {
+    /// Distance from the anchor to the run's left edge along the run, for the advance `width`.
+    fn left(&self, width: f64) -> f64 {
+        match self.align {
+            DrawingTextHAlign::Left => 0.0,
+            DrawingTextHAlign::Center => -width / 2.0,
+            DrawingTextHAlign::Right => -width,
+        }
+    }
+
+    /// The run's start point (left edge, vertical center) for the advance `width`.
+    fn start(&self, width: f64) -> (f64, f64) {
+        let left = self.left(width);
+        (
+            self.x + self.angle.cos() * left,
+            self.y + self.angle.sin() * left,
+        )
+    }
+
+    /// The run box `[left - pad, left + width + pad] × [-0.6 size - pad, 0.6 size + pad]` in the
+    /// run's local frame (origin at the anchor, x along the run).
+    fn local_box(&self, width: f64) -> [f64; 4] {
+        let left = self.left(width);
+        let half = self.size * 0.6;
+        [
+            left - TEXT_PAD,
+            -half - TEXT_PAD,
+            left + width + TEXT_PAD,
+            half + TEXT_PAD,
+        ]
+    }
+
+    /// Whether the media-px point is inside the padded run box.
+    fn contains(&self, width: f64, x: f64, y: f64) -> bool {
+        let (sin, cos) = self.angle.sin_cos();
+        let (dx, dy) = (x - self.x, y - self.y);
+        let (local_x, local_y) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+        let [left, top, right, bottom] = self.local_box(width);
+        local_x >= left && local_x <= right && local_y >= top && local_y <= bottom
+    }
+
+    /// The axis-aligned bounds `[left, top, right, bottom]` of the padded run box.
+    fn bounds(&self, width: f64) -> [f64; 4] {
+        let (sin, cos) = self.angle.sin_cos();
+        let [left, top, right, bottom] = self.local_box(width);
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for (lx, ly) in [(left, top), (right, top), (right, bottom), (left, bottom)] {
+            let (x, y) = (self.x + lx * cos - ly * sin, self.y + lx * sin + ly * cos);
+            bounds = [
+                bounds[0].min(x),
+                bounds[1].min(y),
+                bounds[2].max(x),
+                bounds[3].max(y),
+            ];
+        }
+        bounds
+    }
 }
 
 const DRAWING_HISTORY_LIMIT: usize = 100;
@@ -1535,8 +1632,36 @@ fn update_css_slot(slot: &mut Option<String>, value: String) {
     }
 }
 
+/// `text` with every run of `\r` and `\n` replaced by one space (the single-line rule of a run
+/// label).
+fn collapse_line_breaks(text: &str) -> String {
+    let mut collapsed = String::with_capacity(text.len());
+    let mut in_break = false;
+    for c in text.chars() {
+        if matches!(c, '\r' | '\n') {
+            if !in_break {
+                collapsed.push(' ');
+            }
+            in_break = true;
+        } else {
+            in_break = false;
+            collapsed.push(c);
+        }
+    }
+    collapsed
+}
+
 impl Drawing {
     fn apply_patch(&mut self, patch: DrawingPatch) -> bool {
+        // Every rejection sits before the first mutation, so a refused patch applies nothing
+        // (several callers ignore the result and patch live values).
+        if patch
+            .text
+            .as_ref()
+            .is_some_and(|text| text.len() > crate::MAX_DRAWING_TEXT_BYTES)
+        {
+            return false;
+        }
         if let Some(name) = patch.name.as_ref() {
             if name.len() > crate::MAX_DRAWING_NAME_BYTES {
                 return false;
@@ -2921,7 +3046,11 @@ impl ChartEngine {
         font_size: f64,
         font_family: &str,
     ) -> Option<(f64, f64)> {
+        // An open editor gives an empty label its one-em caret slot, which the frame paints
+        // around and hit testing must not cull.
+        let editing = self.editing_drawing() == Some(drawing.id);
         if drawing.text.is_empty()
+            && !editing
             && !matches!(drawing.kind, DrawingKind::Text | DrawingKind::TrendLine)
         {
             return None;
@@ -2937,6 +3066,8 @@ impl ChartEngine {
                     drawing.text_weight.unwrap_or(400),
                     drawing.text_italic,
                 )
+            } else if editing && drawing.text.is_empty() {
+                size
             } else {
                 self.measure_drawing_text_with_family(drawing, size, font_family)
             };
@@ -2948,9 +3079,20 @@ impl ChartEngine {
 
     /// Screen pad `(x, y)` in CSS px that a drawing's text run and family decorations reach
     /// beyond its anchors.
-    fn drawing_label_pad(text_metrics: Option<(f64, f64)>, decoration: f64) -> (f64, f64) {
-        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size)| {
-            (width + TEXT_PAD * 2.0, size * 1.2 + TEXT_PAD * 2.0)
+    fn drawing_label_pad(
+        text_metrics: Option<(f64, f64)>,
+        text_layout: DrawingTextLayout,
+        decoration: f64,
+    ) -> (f64, f64) {
+        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size)| match text_layout {
+            DrawingTextLayout::Box => (width + TEXT_PAD * 2.0, size * 1.2 + TEXT_PAD * 2.0),
+            // A run along a segment rotates with it, so its length reaches past the anchors in
+            // either axis: the run itself, its slot's normal offset (pad + half a glyph), and
+            // half its thickness plus the pad.
+            DrawingTextLayout::Segment => {
+                let reach = width + size * 1.1 + TEXT_PAD * 3.0;
+                (reach, reach)
+            }
         });
         (x.max(decoration), y.max(decoration))
     }
@@ -3019,7 +3161,8 @@ impl ChartEngine {
             let text_metrics =
                 self.cached_drawing_text_metrics(drawing, entry, text_key, font_size, &font_family);
             let decoration = self.cached_drawing_decoration(drawing, entry, text_key);
-            let label_pad = Self::drawing_label_pad(text_metrics, decoration);
+            let label_pad =
+                Self::drawing_label_pad(text_metrics, drawing.kind.spec().text_layout, decoration);
             if !self.drawing_semantic_might_intersect(
                 drawing,
                 entry.bounds,
@@ -3074,7 +3217,8 @@ impl ChartEngine {
         );
         let decoration =
             self.cached_drawing_decoration(drawing, &mut entry, self.options.generation());
-        let label_pad = Self::drawing_label_pad(text_metrics, decoration);
+        let label_pad =
+            Self::drawing_label_pad(text_metrics, drawing.kind.spec().text_layout, decoration);
         self.refresh_drawing_screen_bounds(drawing, &mut entry, key, base, label_pad)
             && entry.screen_bounds.intersects(viewport)
     }
@@ -3127,13 +3271,14 @@ impl ChartEngine {
     /// already converted (bitmap px at render, media px at hit-test); `pane_w`/`pane_h` bound
     /// the full-width/full-height kinds in the same units. `pane_top` is the pane's vertical
     /// offset (0 for pane-local bitmap x media y are both chart-top-relative — see hit_test.rs).
+    /// `None` when the geometry does not resolve: a zero box would put a caret at the origin.
     pub(crate) fn text_box(
         kind: DrawingKind,
         px: &[(f64, f64)],
         pane_w: f64,
         pane_top: f64,
         pane_h: f64,
-    ) -> TextBox {
+    ) -> Option<TextBox> {
         resolve_drawing_geometry(
             kind,
             px,
@@ -3147,7 +3292,6 @@ impl ChartEngine {
             },
         )
         .map(|geometry| geometry.text_box)
-        .unwrap_or_default()
     }
 
     /// The label's draw anchor `(x, y_center)` and horizontal alignment in the caller's units,
@@ -3183,6 +3327,21 @@ impl ChartEngine {
         size: f64,
         pad: f64,
     ) -> (f64, f64, DrawingTextHAlign, f64) {
+        Self::try_drawing_text_placement(drawing, px, pane_w, pane_top, pane_h, size, pad)
+            .unwrap_or_else(|| Self::text_placement(drawing, &TextBox::default(), size, pad))
+    }
+
+    /// [`ChartEngine::drawing_text_placement`] that reports `None` for a drawing whose geometry
+    /// does not resolve, so the editor and the hit test leave it alone.
+    fn try_drawing_text_placement(
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w: f64,
+        pane_top: f64,
+        pane_h: f64,
+        size: f64,
+        pad: f64,
+    ) -> Option<(f64, f64, DrawingTextHAlign, f64)> {
         if drawing.kind.spec().text_layout == DrawingTextLayout::Segment && px.len() >= 2 {
             let (mut start, mut end) = (px[0], px[1]);
             let mut dx = end.0 - start.0;
@@ -3214,11 +3373,11 @@ impl ChartEngine {
                 // Screen y grows downward, so `(uy, -ux)` is the readable line's top normal.
                 x += uy * normal_distance;
                 y -= ux * normal_distance;
-                return (x, y, drawing.text_h_align, dy.atan2(dx));
+                return Some((x, y, drawing.text_h_align, dy.atan2(dx)));
             }
         }
-        let reference = Self::text_box(drawing.kind, px, pane_w, pane_top, pane_h);
-        Self::text_placement(drawing, &reference, size, pad)
+        let reference = Self::text_box(drawing.kind, px, pane_w, pane_top, pane_h)?;
+        Some(Self::text_placement(drawing, &reference, size, pad))
     }
 
     /// Measure (or estimate) a label's width in the same px units as `size`. Empty text tools
@@ -4299,52 +4458,75 @@ impl ChartEngine {
         self.drawing_point_px(drawing, *point)
     }
 
-    /// The exact media-px text-run anchor shared by frame rendering and the host caret overlay.
-    pub fn drawing_text_coordinate(&self, id: DrawingId) -> Option<(f64, f64)> {
-        let drawing = self.drawing(id)?;
-        let px = self.drawing_px(drawing)?;
+    /// The generic text run of `drawing` in media px, resolved exactly as the frame places it
+    /// (`frame::drawings::text_run_geometry`, in bitmap px), from the drawing's converted anchors.
+    /// `None` when the geometry does not resolve, so no caret is ever placed at the origin.
+    fn drawing_text_run(&self, drawing: &Drawing, px: &[(f64, f64)]) -> Option<DrawingTextRun> {
         let pane = self.panes.get(drawing.pane_index)?;
         let size = drawing.resolved_text_size(self.options.get().layout.font_size);
-        let (x, y, _, _) = Self::drawing_text_placement(
+        let (x, y, align, angle) = Self::try_drawing_text_placement(
             drawing,
-            &px,
+            px,
             self.pane_w,
             pane.top,
             pane.height,
             size,
             TEXT_PAD,
-        );
-        Some((x, y))
+        )?;
+        Some(DrawingTextRun {
+            x,
+            y,
+            angle,
+            align,
+            size,
+        })
+    }
+
+    /// The exact media-px text-run anchor shared by frame rendering and the host caret overlay.
+    pub fn drawing_text_coordinate(&self, id: DrawingId) -> Option<(f64, f64)> {
+        let drawing = self.drawing(id)?;
+        let run = self.drawing_text_run(drawing, &self.drawing_px(drawing)?)?;
+        Some((run.x, run.y))
     }
 
     /// Media-px text anchor plus clockwise radians, shared with the browser caret overlay.
     pub fn drawing_text_transform(&self, id: DrawingId) -> Option<(f64, f64, f64)> {
         let drawing = self.drawing(id)?;
-        let px = self.drawing_px(drawing)?;
-        let pane = self.panes.get(drawing.pane_index)?;
-        let size = drawing.resolved_text_size(self.options.get().layout.font_size);
-        let (x, y, _, angle) = Self::drawing_text_placement(
-            drawing,
-            &px,
-            self.pane_w,
-            pane.top,
-            pane.height,
-            size,
-            TEXT_PAD,
-        );
-        Some((x, y, angle))
+        let run = self.drawing_text_run(drawing, &self.drawing_px(drawing)?)?;
+        Some((run.x, run.y, run.angle))
     }
 
-    /// The inline editor's layout of a family drawing's own `text`: the label its parts mark
-    /// with [`DrawingParts::text_label`], resolved as while its editor is open (an empty text
-    /// keeps one caret line). `None` for core tools (the text tool and trend labels place their
-    /// single-line run through [`ChartEngine::drawing_text_transform`]), for a family drawing
-    /// that paints no text of its own, or when its anchors cannot convert.
+    /// The inline editor's layout of a drawing's own `text`, resolved as while its editor is open
+    /// (an empty text keeps a caret slot). Every drawing that paints its text has one:
+    ///
+    /// - a family text box (`multiline`) is the label its parts mark with
+    ///   [`DrawingParts::text_label`]: lines left-aligned at `x`, line `i` centered at
+    ///   `y + i * line_height`, never rotated;
+    /// - every other drawing (the text tool, trend lines, lines, channels, Fibonacci tools,
+    ///   pitchforks, patterns, shapes) paints one run placed against its geometry: `x`, `y` are
+    ///   the run's start (left edge, vertical center) after rotation by `angle`, so a host rotates
+    ///   a single-line editor about its own left-middle.
+    ///
+    /// `None` for a drawing that paints no text of its own (the flag, the icon, and the
+    /// projection and measuring tools), for an unknown id, or when its anchors cannot convert.
     pub fn drawing_text_edit_layout(&self, id: DrawingId) -> Option<DrawingTextEditLayout> {
         let drawing = self.drawing(id)?;
-        let family = drawing.kind.spec().family?;
         let px = self.drawing_px(drawing)?;
-        let mut context = PartContext::media(self, drawing, &px)?;
+        if drawing.kind.paints_generic_text() {
+            self.run_text_edit_layout(drawing, &px)
+        } else {
+            self.box_text_edit_layout(drawing, &px)
+        }
+    }
+
+    /// The editor layout of a family drawing's text box (see [`ChartEngine::drawing_text_edit_layout`]).
+    fn box_text_edit_layout(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+    ) -> Option<DrawingTextEditLayout> {
+        let family = drawing.kind.spec().family?;
+        let mut context = PartContext::media(self, drawing, px)?;
         context.text_editing = true;
         let mut parts = DrawingParts::default();
         (family.build_parts)(&context, &mut parts);
@@ -4372,64 +4554,182 @@ impl ChartEngine {
                 layout.rect.right,
                 layout.rect.bottom,
             ],
+            angle: 0.0,
+            multiline: true,
         })
     }
 
-    /// Topmost trend-line label/placeholder at a media-px point. This keeps the browser host
-    /// from duplicating text measurement or 3×3 segment placement when opening inline edit.
-    pub fn drawing_text_hit_at(&self, x: f64, y: f64) -> Option<DrawingId> {
-        let layout = &self.options.get().layout;
-        let pane_index = self.pane_at_y(y)?;
-        let candidates = self.take_drawing_candidates(pane_index, Some((x, y)));
-        let hit = candidates.iter().rev().find_map(|&id| {
-            let drawing = self.drawing(id)?;
-            if drawing.kind != DrawingKind::TrendLine
-                || !drawing.visible
-                || drawing.locked
-                || !drawing.interval_visibility.allows(self.drawing_interval)
-            {
-                return None;
-            }
-            let text = if drawing.text.is_empty() {
-                TREND_TEXT_PLACEHOLDER
-            } else {
-                drawing.display_text()
-            };
-            let px = self.drawing_px(drawing)?;
-            let pane = self.panes.get(drawing.pane_index)?;
-            let size = drawing.resolved_text_size(layout.font_size);
-            let (tx, ty, align, angle) = Self::drawing_text_placement(
-                drawing,
-                &px,
-                self.pane_w,
-                pane.top,
-                pane.height,
-                size,
-                TEXT_PAD,
-            );
-            let width = self.measure_text_run(
-                text,
-                size,
-                &layout.font_family,
-                drawing.text_weight.unwrap_or(400),
+    /// The editor layout of a drawing's generic text run (see
+    /// [`ChartEngine::drawing_text_edit_layout`]).
+    fn run_text_edit_layout(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+    ) -> Option<DrawingTextEditLayout> {
+        let run = self.drawing_text_run(drawing, px)?;
+        let font_family = &self.options.get().layout.font_family;
+        let weight = drawing.text_weight.unwrap_or(400);
+        // An empty label paints nothing, so its caret opens one em wide.
+        let width = if drawing.text.is_empty() {
+            run.size
+        } else {
+            self.measure_text_run(
+                drawing.display_text(),
+                run.size,
+                font_family,
+                weight,
                 drawing.text_italic,
-            );
-            let local_x = (x - tx) * angle.cos() + (y - ty) * angle.sin();
-            let local_y = -(x - tx) * angle.sin() + (y - ty) * angle.cos();
-            let left = match align {
-                DrawingTextHAlign::Left => 0.0,
-                DrawingTextHAlign::Center => -width / 2.0,
-                DrawingTextHAlign::Right => -width,
-            };
-            let half_height = size * 0.6;
-            (local_x >= left - TEXT_PAD
-                && local_x <= left + width + TEXT_PAD
-                && local_y >= -half_height - TEXT_PAD
-                && local_y <= half_height + TEXT_PAD)
-                .then_some(drawing.id)
+            )
+        };
+        let (x, y) = run.start(width);
+        Some(DrawingTextEditLayout {
+            x,
+            y,
+            line_height: run.size * 1.2,
+            size: run.size,
+            font_family: font_family.clone(),
+            weight,
+            italic: drawing.text_italic,
+            color: self.drawing_label_color(drawing).to_css(),
+            rect: run.bounds(width),
+            angle: run.angle,
+            multiline: false,
+        })
+    }
+
+    /// The topmost drawing whose own text sits under a media-px point: the text of any drawing
+    /// that paints a generic run (lines, channels, Fibonacci tools, pitchforks, patterns, shapes,
+    /// and the trend line), never the text tool or a family text box, whose bodies are ordinary
+    /// hits. A trend line with no text answers over its `+ Add text` prompt; any other drawing
+    /// needs text to have a region. Locked, hidden, and interval-hidden drawings never answer, and
+    /// a higher drawing's body or the selected drawing's anchor handle at the point wins over a
+    /// label beneath it, as it does for a click. This keeps the host from duplicating text
+    /// measurement or 3×3 placement when opening the inline editor.
+    pub fn drawing_text_hit_at(&self, x: f64, y: f64) -> Option<DrawingId> {
+        self.drawing_text_hit(x, y, true)
+    }
+
+    /// Brute-force reference used by the randomized parity tests: no candidate index and no
+    /// cached anchors or text widths.
+    #[doc(hidden)]
+    pub fn drawing_text_hit_at_bruteforce(&self, x: f64, y: f64) -> Option<DrawingId> {
+        self.drawing_text_hit(x, y, false)
+    }
+
+    fn drawing_text_hit(&self, x: f64, y: f64, indexed: bool) -> Option<DrawingId> {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || x > self.pane_w {
+            return None;
+        }
+        let pane = self.pane_at_y(y)?;
+        let candidates = if indexed {
+            self.take_drawing_candidates(pane, Some((x, y)))
+        } else {
+            self.drawings
+                .iter()
+                .filter(|drawing| drawing.pane_index == pane)
+                .map(|drawing| drawing.id)
+                .collect()
+        };
+        // Candidates are in z-order; the topmost label wins.
+        let hit = candidates
+            .iter()
+            .rev()
+            .position(|&id| self.drawing_label_hit(id, indexed, x, y));
+        let hit = hit.and_then(|above| {
+            let id = candidates[candidates.len() - 1 - above];
+            // A higher drawing's body covers the label; the selected drawing's handles paint above
+            // every body. Both only cost work when a label is under the pointer.
+            let covered = candidates.iter().rev().take(above).any(|&higher| {
+                self.with_candidate_px(higher, indexed, |drawing, px, _| {
+                    drawing.visible
+                        && drawing.interval_visibility.allows(self.drawing_interval)
+                        && self.drawing_body_hit(drawing, px, x, y, HitProfile::PRECISION)
+                })
+                .unwrap_or(false)
+            });
+            (!covered
+                && self
+                    .selected_handle_hit(pane, x, y, HitProfile::PRECISION)
+                    .is_none())
+            .then_some(id)
         });
-        self.recycle_drawing_candidates(candidates);
+        if indexed {
+            self.recycle_drawing_candidates(candidates);
+        }
         hit
+    }
+
+    /// The drawing `id` from the runtime position index (indexed) or a linear scan.
+    fn candidate_drawing(&self, id: DrawingId, indexed: bool) -> Option<&Drawing> {
+        if indexed {
+            let position = self.drawing_runtime.borrow().position(id)?;
+            self.drawings.get(position)
+        } else {
+            self.drawing(id)
+        }
+    }
+
+    /// Run `f` on a candidate with its anchors in media px and, when the candidate pass cached
+    /// it under the current options, its measured text width (`indexed` only; the reference
+    /// path recomputes everything). `None` when the anchors cannot convert.
+    fn with_candidate_px<R>(
+        &self,
+        id: DrawingId,
+        indexed: bool,
+        f: impl FnOnce(&Drawing, &[(f64, f64)], Option<f64>) -> R,
+    ) -> Option<R> {
+        let drawing = self.candidate_drawing(id, indexed)?;
+        if !indexed {
+            return Some(f(drawing, &self.drawing_px(drawing)?, None));
+        }
+        let key = self.drawing_coordinate_key(drawing)?;
+        let mut runtime = self.drawing_runtime.borrow_mut();
+        let width = runtime
+            .entries
+            .get(&id)
+            .filter(|entry| entry.text_key == self.options.generation())
+            .map(|entry| entry.text_width);
+        let px = self.drawing_px_cached(drawing, &mut runtime, key)?;
+        Some(f(drawing, px, width))
+    }
+
+    /// Whether the label of drawing `id` is under `(x, y)`. Eligibility and the text check come
+    /// before any anchor conversion or measuring, so a drawing with nothing to hit costs nothing.
+    fn drawing_label_hit(&self, id: DrawingId, indexed: bool, x: f64, y: f64) -> bool {
+        let Some(drawing) = self.candidate_drawing(id, indexed) else {
+            return false;
+        };
+        if !drawing.visible
+            || drawing.locked
+            || !drawing.interval_visibility.allows(self.drawing_interval)
+            || drawing.kind == DrawingKind::Text
+            || !drawing.kind.paints_generic_text()
+        {
+            return false;
+        }
+        let text = if !drawing.text.is_empty() {
+            drawing.display_text()
+        } else if drawing.kind == DrawingKind::TrendLine {
+            TREND_TEXT_PLACEHOLDER
+        } else {
+            return false;
+        };
+        self.with_candidate_px(id, indexed, |drawing, px, width| {
+            let Some(run) = self.drawing_text_run(drawing, px) else {
+                return false;
+            };
+            let width = width.unwrap_or_else(|| {
+                self.measure_text_run(
+                    text,
+                    run.size,
+                    &self.options.get().layout.font_family,
+                    drawing.text_weight.unwrap_or(400),
+                    drawing.text_italic,
+                )
+            });
+            run.contains(width, x, y)
+        })
+        .unwrap_or(false)
     }
 
     /// Every drawing as a JSON array of `{id, kind, pane_index, points, ...options}` in z-order.
@@ -4470,24 +4770,18 @@ impl ChartEngine {
         self.selected_drawing
     }
 
-    /// Whether the host's inline editor can edit `id`'s `text` in place: the text tool, a trend
-    /// line's label, or a family drawing whose parts carry a text label
-    /// ([`ChartEngine::drawing_text_edit_layout`]), while the drawing is unlocked, visible, and
-    /// shown on the current interval.
+    /// Whether the host's inline editor can edit `id`'s `text` in place: the drawing paints its
+    /// own text ([`ChartEngine::drawing_text_edit_layout`], so its anchors convert), and it is
+    /// unlocked, visible, and shown on the current interval. Every tool but the eight that paint
+    /// no text (the flag, the icon, and the projection and measuring tools) qualifies.
     pub fn drawing_text_editable(&self, id: DrawingId) -> bool {
         let Some(drawing) = self.drawing(id) else {
             return false;
         };
-        if drawing.locked
-            || !drawing.visible
-            || !drawing.interval_visibility.allows(self.drawing_interval)
-        {
-            return false;
-        }
-        match drawing.kind {
-            DrawingKind::Text | DrawingKind::TrendLine => true,
-            _ => self.drawing_text_edit_layout(id).is_some(),
-        }
+        !drawing.locked
+            && drawing.visible
+            && drawing.interval_visibility.allows(self.drawing_interval)
+            && self.drawing_text_edit_layout(id).is_some()
     }
 
     /// Open the inline text-edit session the host's typing-mode editor owns on a text-editable
@@ -4511,6 +4805,8 @@ impl ChartEngine {
             text: drawing.text.clone(),
             revision: drawing.revision,
         });
+        // The open session gives an empty label its caret slot, which changes its culling pad.
+        self.update_drawing_runtime(id);
         self.invalidate_frame_drawings();
         true
     }
@@ -4526,6 +4822,19 @@ impl ChartEngine {
             self.text_edit = None;
             return false;
         };
+        // The engine owns the text rules: a run label stays on one line (a run of line breaks is
+        // one space), and every text is bounded, clamped at a character boundary.
+        let single_line = self.drawings[index].kind.paints_generic_text();
+        let text = if single_line && text.contains(['\r', '\n']) {
+            std::borrow::Cow::Owned(collapse_line_breaks(text))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        let mut end = text.len().min(crate::MAX_DRAWING_TEXT_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = &text[..end];
         if self.drawings[index].text != text {
             let drawing = &mut self.drawings[index];
             drawing.text = text.to_string();
@@ -4544,6 +4853,7 @@ impl ChartEngine {
         let Some(edit) = self.text_edit.take() else {
             return false;
         };
+        self.update_drawing_runtime(edit.id);
         self.invalidate_frame_drawings();
         let Some(index) = self
             .drawings
@@ -4590,7 +4900,9 @@ impl ChartEngine {
     }
 
     /// Mark a text drawing or trend line under the host pointer. Text drawings paint their
-    /// hover ring; empty trend lines paint their inline `+ Add text` affordance.
+    /// hover ring; empty trend lines paint their inline `+ Add text` affordance. Any other
+    /// drawing has no hover chrome, so its id (a label hit on a ray or a rectangle) is stored as
+    /// `None`: widening the filter would only invalidate drawings for no visible change.
     pub fn set_hovered_text(&mut self, id: Option<DrawingId>) {
         let valid = id.filter(|&hid| {
             self.drawings.iter().any(|d| {
@@ -4647,6 +4959,17 @@ impl ChartEngine {
         self.selected_drawing.is_some()
     }
 
+    /// The drawing a click at pane-relative media px `(x, y)` would select, without selecting it:
+    /// a drawing's own text under the point ([`ChartEngine::drawing_text_hit_at`]) first, then the
+    /// selected drawing's anchor handle or the topmost body ([`ChartEngine::hit_test_drawing`]),
+    /// the order the click pipeline arbitrates in. A host that acts on a repeated click (a
+    /// double-click that opens the selected drawing's editor) asks this first, so a click that
+    /// landed on something else, or that another owner consumed, never acts on the selection.
+    pub fn drawing_at(&self, x: f64, y: f64) -> Option<DrawingId> {
+        self.drawing_text_hit_at(x, y)
+            .or_else(|| self.hit_test_drawing(x, y).map(|hit| hit.id))
+    }
+
     /// Remove the selected drawing (Delete/Backspace). Returns false while nothing is selected.
     pub fn remove_selected_drawing(&mut self) -> bool {
         let Some(id) = self.selected_drawing else {
@@ -4680,6 +5003,39 @@ impl ChartEngine {
         self.hit_test_drawing_impl(x, y, false, HitProfile::PRECISION)
     }
 
+    /// The selected drawing's anchor handle at `(x, y)` in `pane`. Handles win over every body
+    /// (they paint above all). The brush shows handles at its two ENDS only; the rectangle shows
+    /// its eight conventional anchors (four corners + four edge midpoints); the rest show one per
+    /// defining anchor.
+    fn selected_handle_hit(
+        &self,
+        pane: usize,
+        x: f64,
+        y: f64,
+        profile: HitProfile,
+    ) -> Option<DrawingHit> {
+        let selected = self.selected_drawing?;
+        let drawing = self.drawing(selected)?;
+        if drawing.pane_index != pane
+            || !drawing.visible
+            || !drawing.interval_visibility.allows(self.drawing_interval)
+        {
+            return None;
+        }
+        let px = self.drawing_px(drawing)?;
+        let handle = self
+            .drawing_handle_set(drawing, &px)
+            .into_iter()
+            .find(|handle| {
+                (x - handle.point.0).hypot(y - handle.point.1) <= profile.drawing_anchor_radius
+            })?;
+        Some(DrawingHit {
+            id: selected,
+            part: handle.part,
+            cursor: handle.cursor,
+        })
+    }
+
     fn hit_test_drawing_impl(
         &self,
         x: f64,
@@ -4691,34 +5047,8 @@ impl ChartEngine {
             return None;
         }
         let pane = self.pane_at_y(y)?;
-        // The selected drawing's anchor handles win over every body (they paint above all).
-        // The brush shows handles at its two ENDS only; the rectangle shows its eight
-        // Eight conventional anchors (four corners + four edge midpoints); the rest show one per
-        // defining anchor.
-        if let Some(selected) = self.selected_drawing {
-            if let Some(drawing) = self.drawing(selected) {
-                if drawing.pane_index == pane
-                    && drawing.visible
-                    && drawing.interval_visibility.allows(self.drawing_interval)
-                {
-                    if let Some(px) = self.drawing_px(drawing) {
-                        let handle =
-                            self.drawing_handle_set(drawing, &px)
-                                .into_iter()
-                                .find(|handle| {
-                                    (x - handle.point.0).hypot(y - handle.point.1)
-                                        <= profile.drawing_anchor_radius
-                                });
-                        if let Some(handle) = handle {
-                            return Some(DrawingHit {
-                                id: selected,
-                                part: handle.part,
-                                cursor: handle.cursor,
-                            });
-                        }
-                    }
-                }
-            }
+        if let Some(hit) = self.selected_handle_hit(pane, x, y, profile) {
+            return Some(hit);
         }
         if !indexed {
             for drawing in self.drawings.iter().rev() {

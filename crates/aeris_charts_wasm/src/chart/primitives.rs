@@ -346,8 +346,9 @@ impl ChartInner {
         // hovered-series promotion, and carries the part cursor (`move` on a body, `pointer`
         // on a selected drawing's anchor handle). Every kind sets generic hover promotion;
         // a TEXT drawing additionally gets the hover ring (the engine kind-filters; other
-        // kinds have no hover chrome). Hit testing stays on stable z-order so promotion
-        // cannot oscillate hover.
+        // kinds have no hover chrome, so a label hit on a ray or a rectangle stores no hovered
+        // text and only promotes the drawing). Hit testing stays on stable z-order so promotion
+        // cannot oscillate hover. A drawing's own label answers first, with the text cursor.
         if let Some(id) = self.engine.drawing_text_hit_at(x_css, y_css) {
             self.engine.clear_general_hover();
             self.engine.set_hovered_series(None);

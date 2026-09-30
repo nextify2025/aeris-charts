@@ -199,6 +199,9 @@ export function install_gestures(chart: chart_impl): () => void {
   let trading_dragging = false;
   let trading_press = false;
   let alert_press = false;
+  // The last single click or tap belonged to a trading object or the alert widget. Its pair's
+  // second click then acts on no drawing: the pair started on that control, not on a selection.
+  let control_click = false;
   // A drawing placement that committed directly on pointer-down. The trailing click/tap is
   // swallowed generically; which placement classes commit on press is engine-owned.
   let creation_press_committed = false;
@@ -892,6 +895,7 @@ export function install_gestures(chart: chart_impl): () => void {
   const run_single_click = (e: MouseEvent, p: { x: number; y: number }) => {
     const pressed_alert = alert_press;
     alert_press = false;
+    control_click = false;
     // Axis widgets own their clicks and never emit pane click callbacks.
     if (region_of(p) !== "pane") return;
     // A placement that committed on pointer-down swallows its trailing compatibility click.
@@ -901,11 +905,13 @@ export function install_gestures(chart: chart_impl): () => void {
     }
     const trading_hit = chart.trading_hit_at(p.x, p.y);
     if (trading_hit !== null) {
+      control_click = true;
       chart.trading_activate_at(p.x, p.y);
       chart.repaint();
       return;
     }
     if (pressed_alert && chart.alert_create_hit_at(p.x, p.y)) {
+      control_click = true;
       chart.activate_alert_create_at(p.x, p.y);
       chart.repaint();
       return;
@@ -951,7 +957,7 @@ export function install_gestures(chart: chart_impl): () => void {
     if (distance < DBL_CLICK_MANHATTAN) {
       if (chart.creation_sequence_active()) {
         chart.creation_click(p.x, p.y, e.ctrlKey || e.metaKey, e.shiftKey);
-      } else if (region_of(p) === "pane") {
+      } else if (region_of(p) === "pane" && !control_click) {
         chart.activate_drawing_double_click(p.x, p.y);
       }
       run_dblclick(p.x, p.y);
@@ -1131,6 +1137,7 @@ export function install_gestures(chart: chart_impl): () => void {
 
     if (tap_timer === null) {
       tap_count = 0;
+      control_click = false; // a new tap pair starts here
       tap_timer = setTimeout(reset_tap, TAP_RESET_MS);
       tap_position = { x: e.clientX, y: e.clientY };
     }
@@ -1239,15 +1246,17 @@ export function install_gestures(chart: chart_impl): () => void {
         // Unlike mouse compatibility events, the second tap has no preceding `click` event.
         // A variable-sequence placement receives this activation before the shared finish action.
         if (chart.creation_sequence_active()) chart.creation_click(p.x, p.y, false, false);
-        else if (region_of(p, true) === "pane") chart.activate_drawing_double_click(p.x, p.y);
+        else if (region_of(p, true) === "pane" && !control_click) chart.activate_drawing_double_click(p.x, p.y);
         run_dblclick(p.x, p.y);
       }
       reset_tap();
     } else if (was_tap && !committed_on_press) {
       const trading_hit = chart.trading_hit_at_device(p.x, p.y, InputDeviceCode.Touch);
       if (trading_press && trading_hit !== null) {
+        control_click = true;
         chart.trading_activate_at(p.x, p.y);
       } else if (alert_press && chart.alert_create_hit_at(p.x, p.y)) {
+        control_click = true;
         chart.activate_alert_create_at(p.x, p.y);
       } else if (chart.creation_armed() && chart.creation_click(p.x, p.y, false, false)) {
         // creation handled

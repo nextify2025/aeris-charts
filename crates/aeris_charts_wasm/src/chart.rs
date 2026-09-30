@@ -5144,17 +5144,30 @@ impl AerisChart {
     pub fn drawing_point_to_coordinate(&self, id: u32, index: usize) -> Vec<f64> {
         self.inner.borrow().drawing_point_to_coordinate(id, index)
     }
-    /// Exact text-run anchor `[x, y]` in overlay CSS px for inline drawing editing.
+    /// Exact text-run anchor `[x, y]` in overlay CSS px (the aligned edge of a drawing's generic
+    /// label run; empty when the drawing has no resolvable run).
     pub fn drawing_text_coordinate(&self, id: u32) -> Vec<f64> {
         self.inner.borrow().drawing_text_coordinate(id)
     }
-    /// Exact text-run transform `[x, y, clockwise_radians]` in overlay CSS px.
+    /// Exact text-run transform `[x, y, clockwise_radians]` in overlay CSS px: the aligned anchor
+    /// the frame paints the run at. Editors position from `drawing_text_edit_layout_json`, which
+    /// resolves the run's start point from it.
     pub fn drawing_text_transform(&self, id: u32) -> Vec<f64> {
         self.inner.borrow().drawing_text_transform(id)
     }
-    /// Trend-line label/placeholder hit identity, or zero when the point misses.
+    /// Identity of the topmost drawing whose own text is under the point, or zero: any drawing
+    /// that paints a generic label (a line, channel, Fibonacci, pitchfork, pattern, or shape
+    /// tool's text, or a trend line's `+ Add text` prompt), never the text tool or an annotation
+    /// text box, which are ordinary body hits. A higher drawing's body or the selected drawing's
+    /// anchor handle at the point wins over the label beneath it.
     pub fn drawing_text_hit_at(&self, x_css: f64, y_css: f64) -> u32 {
         self.inner.borrow().drawing_text_hit_at(x_css, y_css)
+    }
+    /// Identity of the drawing a click at the point would select, or zero, without selecting it:
+    /// a drawing's own text first, then the selected drawing's anchor handle or the topmost
+    /// body. The gesture layer asks it before a double-click acts on the selected drawing.
+    pub fn drawing_at(&self, x_css: f64, y_css: f64) -> u32 {
+        self.inner.borrow().drawing_at(x_css, y_css)
     }
     /// Every drawing as a JSON array in z-order (`{id, kind, pane_index, points, ...options}`).
     pub fn drawings_json(&self) -> String {
@@ -5259,8 +5272,9 @@ impl AerisChart {
     pub fn set_selected_drawing(&mut self, id: Option<u32>) {
         self.inner.borrow_mut().set_selected_drawing(id);
     }
-    /// Whether the host's inline editor can edit the drawing's text in place (the text tool, a
-    /// trend label, or a family text box), while it is unlocked, visible, and shown.
+    /// Whether the host's inline editor can edit the drawing's text in place: the drawing paints
+    /// its own text (every tool but the flag, the icon, and the projection and measuring tools)
+    /// and its anchors convert, while it is unlocked, visible, and shown.
     pub fn drawing_text_editable(&self, id: u32) -> bool {
         self.inner.borrow().engine.drawing_text_editable(id)
     }
@@ -5280,8 +5294,11 @@ impl AerisChart {
     pub fn editing_drawing(&self) -> Option<u32> {
         self.inner.borrow().engine.editing_drawing()
     }
-    /// A family text box's editor layout as JSON (`{x, y, line_height, size, font_family,
-    /// weight, italic, color, rect}` in overlay CSS px), or an empty string.
+    /// The drawing's editor layout as JSON (`{x, y, line_height, size, font_family, weight,
+    /// italic, color, rect, angle, multiline}` in overlay CSS px, `angle` in clockwise radians),
+    /// or an empty string for a drawing that paints no text or whose anchors cannot convert.
+    /// `multiline` chooses the editor: a family text box (lines left-aligned at `x`, unrotated)
+    /// or one run whose start (`x`, `y`) rotates by `angle` about itself.
     pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
         self.inner.borrow().drawing_text_edit_layout_json(id)
     }

@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::hint::black_box;
+use std::rc::Rc;
 use std::time::Instant;
 
 use aeris_charts_engine::{ChartEngine, ChartFrame, DrawingKind, DrawingModifiers, DrawingPoint};
@@ -210,6 +212,80 @@ fn brush_path_row(point_count: usize) {
     );
 }
 
+/// Pointer-move over about 1,000 text-bearing drawings: the host's hover path runs
+/// `drawing_text_hit_at` (a label under the pointer) and then `hit_test_drawing`. Every drawing
+/// paints a text run, so each candidate under the pointer is a label candidate. Text widths come
+/// from the candidate pass's cache, so a steady-state move makes no measure callback at all (a
+/// host callback crosses into JavaScript in the browser).
+fn hover_row() {
+    let measures = Rc::new(Cell::new(0_usize));
+    let mut chart = chart(100_000);
+    let counter = Rc::clone(&measures);
+    chart.set_text_measure(Some(Box::new(
+        move |text, size, _family, _weight, _italic| {
+            counter.set(counter.get() + 1);
+            text.chars().count() as f64 * size * 0.6
+        },
+    )));
+    let kinds = [
+        DrawingKind::TrendLine,
+        DrawingKind::Ray,
+        DrawingKind::Rectangle,
+        DrawingKind::Ellipse,
+        DrawingKind::HorizontalLine,
+    ];
+    for index in 0..1_000 {
+        let kind = kinds[index % kinds.len()];
+        chart
+            .add_drawing(
+                kind,
+                0,
+                points(kind, index, false),
+                Some(r#"{"text":"density label"}"#),
+            )
+            .expect("labeled drawing");
+    }
+    let mut frame = ChartFrame::default();
+    chart.build_frame_into(&mut frame);
+    let probes = (0..64)
+        .map(|index| {
+            (
+                40.0 + f64::from(index % 16) * 70.0,
+                60.0 + f64::from(index / 16) * 140.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    // One warm pass fills the candidate cache; the counted pass must then measure nothing.
+    for &(x, y) in &probes {
+        black_box(chart.drawing_text_hit_at(x, y));
+    }
+    measures.set(0);
+    chart.reset_drawing_work_stats();
+    let mut label_hits = 0;
+    for &(x, y) in &probes {
+        label_hits += usize::from(chart.drawing_text_hit_at(x, y).is_some());
+        black_box(chart.hit_test_drawing(x, y));
+    }
+    let work = chart.drawing_work_stats();
+    let steady_measures = measures.get();
+    assert_eq!(
+        steady_measures, 0,
+        "a pointer move measures no text beyond the cached candidate pass"
+    );
+    let mut probe = 0;
+    let hover_us = measure(|| {
+        let (x, y) = probes[probe % probes.len()];
+        probe += 1;
+        black_box(chart.drawing_text_hit_at(x, y));
+        black_box(chart.hit_test_drawing(x, y));
+    });
+    println!(
+        "hover_drawings=1000 hover_us={hover_us:?} label_hits={label_hits} candidates_per_move={:.1} precise_per_move={:.1} measure_calls={steady_measures}",
+        work.candidates as f64 / probes.len() as f64,
+        work.precise_hit_tests as f64 / probes.len() as f64,
+    );
+}
+
 fn combined_foundation_row() {
     let mut chart = chart(1_000_000);
     install_drawings(&mut chart, 1_000, "mixed", true);
@@ -268,6 +344,7 @@ fn main() {
         row(1_000, "mixed", true);
         row(1_000, "families", false);
         row(1_000, "families", true);
+        hover_row();
         combined_foundation_row();
         return;
     }
@@ -281,5 +358,6 @@ fn main() {
     for points in [100, 1_000, 10_000] {
         brush_path_row(points);
     }
+    hover_row();
     combined_foundation_row();
 }

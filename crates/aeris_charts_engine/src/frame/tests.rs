@@ -10402,6 +10402,192 @@ fn middle_trend_label_gap_shrinks_to_the_caret_then_expands_with_text() {
     assert_eq!(orange_segments(&mut chart), typing);
 }
 
+#[test]
+fn every_segment_layout_label_opens_its_stroke_gap_while_edited() {
+    use crate::{DrawingKind, DrawingPoint};
+
+    fn ink_segments(chart: &mut ChartEngine) -> Vec<Vec<[f32; 2]>> {
+        let frame = chart.build_frame();
+        let pane = &frame.panes[0];
+        pane.main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::Polyline {
+                    first_point,
+                    point_count,
+                    color,
+                    ..
+                } if *color == Color::rgb(0x12, 0x34, 0x56) => Some(
+                    pane.points[*first_point as usize..(*first_point + *point_count) as usize]
+                        .to_vec(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn gap_width(segments: &[Vec<[f32; 2]>]) -> f32 {
+        let left = segments[0].last().unwrap();
+        let right = segments[1].first().unwrap();
+        (right[0] - left[0]).hypot(right[1] - left[1])
+    }
+
+    let mut chart = anchor_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::Ray,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 0.0,
+                    price: 10.0,
+                },
+                DrawingPoint {
+                    logical: 3.0,
+                    price: 12.5,
+                },
+            ],
+            Some(
+                r##"{"color":"#123456","extend_right":false,"text_h_align":"center","text_v_align":"middle"}"##,
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        ink_segments(&mut chart).len(),
+        1,
+        "an empty label cuts nothing"
+    );
+    assert!(chart.begin_drawing_text_edit(id));
+    let editing_empty = ink_segments(&mut chart);
+    assert_eq!(
+        editing_empty.len(),
+        2,
+        "the open editor's caret slot splits the stroke"
+    );
+    assert!(chart.set_drawing_edit_text("typing"));
+    let typing = ink_segments(&mut chart);
+    assert_eq!(typing.len(), 2);
+    assert!(
+        gap_width(&typing) > gap_width(&editing_empty),
+        "typed text widens the opening"
+    );
+    assert!(chart.end_drawing_text_edit(false));
+    assert_eq!(ink_segments(&mut chart).len(), 1, "cancel closes the gap");
+}
+
+#[test]
+fn a_steep_label_reaching_far_past_its_anchors_paints_on_the_culled_frame_path() {
+    use crate::{DrawingKind, DrawingPoint};
+
+    let mut chart = anchor_chart();
+    // More than 20 drawings in the pane engage the culled (candidate) frame path.
+    for index in 0..21 {
+        chart
+            .add_drawing(
+                DrawingKind::VerticalLine,
+                0,
+                vec![DrawingPoint {
+                    logical: 0.5 + f64::from(index) * 0.1,
+                    price: 11.0,
+                }],
+                None,
+            )
+            .unwrap();
+    }
+    chart.build_frame();
+    // A short steep segment above the pane whose long left-aligned label runs down into it.
+    let label = "x".repeat(120);
+    let price_at = |chart: &ChartEngine, y: f64| chart.series_coordinate_to_price(0, y).unwrap();
+    let upper = price_at(&chart, -90.0);
+    let lower = price_at(&chart, -60.0);
+    let id = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 2.0,
+                    price: upper,
+                },
+                DrawingPoint {
+                    logical: 2.02,
+                    price: lower,
+                },
+            ],
+            Some(&format!(
+                r#"{{"text":"{label}","text_h_align":"left","text_v_align":"middle"}}"#
+            )),
+        )
+        .unwrap();
+    let lower_end = chart.series_price_to_coordinate(0, lower).unwrap();
+    assert!(
+        lower_end < -50.0,
+        "the segment sits above the pane: {lower_end}"
+    );
+    let painted = chart.build_frame().panes[0]
+        .main
+        .iter()
+        .any(|prim| matches!(prim, Prim::RotatedText { text, .. } if *text == label));
+    assert!(
+        painted,
+        "the label's visible tail must keep its drawing in the frame"
+    );
+    assert!(chart.remove_drawing(id));
+}
+
+#[test]
+fn placement_requesting_tools_keep_anchor_handles_and_paint_no_text_chrome() {
+    use crate::{DrawingKind, DrawingPoint};
+
+    let is_chrome = |color: Color| color.0 & 0xFFFF_FF00 == PRIMARY.0 & 0xFFFF_FF00;
+    let mut chart = anchor_chart();
+    let note = chart
+        .add_drawing(
+            DrawingKind::Note,
+            0,
+            vec![DrawingPoint {
+                logical: 2.0,
+                price: 11.0,
+            }],
+            None,
+        )
+        .unwrap();
+    let callout = chart
+        .add_drawing(
+            DrawingKind::Callout,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 1.0,
+                    price: 10.5,
+                },
+                DrawingPoint {
+                    logical: 3.0,
+                    price: 12.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    for (id, anchors) in [(note, 1), (callout, 2)] {
+        assert!(chart.drawing_requests_text_edit(id));
+        chart.set_selected_drawing(None);
+        let unselected = frame_discs(&mut chart).len();
+        chart.set_selected_drawing(Some(id));
+        assert_eq!(
+            frame_discs(&mut chart).len() - unselected,
+            anchors * 2,
+            "each anchor paints a border and a fill disc"
+        );
+        let chrome = chart.build_frame().panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::RectFrame { color, .. } if is_chrome(*color)))
+            .count();
+        assert_eq!(chrome, 0, "only the text tool paints the text focus border");
+    }
+}
+
 /// The circle prims in the primary pane's main layer as `(cx, radius, fill)`. With the
 /// default options (no pulse, no markers, no crosshair) only selection anchors emit discs.
 fn frame_discs(chart: &mut ChartEngine) -> Vec<(f32, f32, Color)> {

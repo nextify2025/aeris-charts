@@ -247,9 +247,10 @@ const TOOL: DrawingToolSpec = DrawingToolSpec {
     price_extent: DrawingPriceExtent::Finite,
     bounds_padding_ratio: 0.0,
     default_width: 1.0,
-    // Placement never opens the editor (every text tool starts from its default text);
-    // double-click, Enter, or F2 on a selected text box edits it in place through the label
-    // its parts mark with `DrawingParts::text_label`.
+    // Placement opens the editor only for the tools that start from a default text the user
+    // will replace or extend (see the overrides below); double-click, Enter, or F2 on a selected
+    // text box edits it in place through the label its parts mark with
+    // `DrawingParts::text_label`.
     requests_text_editor: false,
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
@@ -317,6 +318,7 @@ pub(crate) const ANCHORED_TEXT: DrawingToolSpec = DrawingToolSpec {
     name: "anchored_text",
     logical_extent: DrawingLogicalExtent::Full,
     price_extent: DrawingPriceExtent::Full,
+    requests_text_editor: true,
     ..MARK
 };
 
@@ -324,6 +326,7 @@ pub(crate) const NOTE: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Note,
     wire_id: 135,
     name: "note",
+    requests_text_editor: true,
     ..MARK
 };
 
@@ -339,6 +342,7 @@ pub(crate) const CALLOUT: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Callout,
     wire_id: 137,
     name: "callout",
+    requests_text_editor: true,
     ..TOOL
 };
 
@@ -346,6 +350,7 @@ pub(crate) const COMMENT: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Comment,
     wire_id: 138,
     name: "comment",
+    requests_text_editor: true,
     ..MARK
 };
 
@@ -360,6 +365,7 @@ pub(crate) const SIGNPOST: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Signpost,
     wire_id: 140,
     name: "signpost",
+    requests_text_editor: true,
     ..MARK
 };
 
