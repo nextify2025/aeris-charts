@@ -37,7 +37,9 @@
         "esbuild_version": { "type": ["string", "null"] },
         "package_lock_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "cargo_lock_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-        "wasm_opt_args": { "type": "array", "items": { "type": "string" } }
+        "wasm_opt_args": { "type": "array", "items": { "type": "string" } },
+        "cargo_profile": { "type": "string", "minLength": 1 },
+        "wasm_opt_version": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     },

@@ -1606,8 +1606,8 @@ resolves.
 
 CI, the tag-publish workflow and the benchmark workflows install `wasm-pack` 0.15.0 with
 `cargo install wasm-pack --locked --version 0.15.0`: its bundled `wasm-opt` shapes the shipped WASM
-bytes and therefore the package size budgets. `npm run check:release-gates` fails when `ci.yml` or
-`publish.yml` installs it unpinned or at another version.
+bytes and therefore the package size budgets. `npm run check:release-gates` fails when any of those workflows installs it
+unpinned or at another version.
 
 `perf_gate` prints PASS/FAIL per target and exits non-zero on a failure only when
 `AERIS_CHARTS_PERF_STRICT=1` (exactly `1`, the parse the browser perf specs use; unset or `0`
@@ -1638,6 +1638,8 @@ declaration and release-policy guards, V1 fixtures, Node import, and pack smoke 
 checks. Configured `perf_gate` budgets run strictly. Machine-calibrated screenshots, GPU timings,
 heap sampling, and wall-clock evidence stay in separate non-blocking diagnostic steps; approved hashes
 are never changed merely to satisfy a different host.
+
+The published WASM module is produced only by `npm run build:wasm` in `packages/charts`: `wasm-pack build --target web` on the shared `release` profile (opt-level 3 workspace crates, `opt-level = "z"` dependencies, fat LTO, one codegen unit, `panic = abort`, `+simd128` from `.cargo/config.toml`), then `wasm-opt` with the flags declared in `crates/aeris_charts_wasm/Cargo.toml`. wasm-pack is pinned to 0.15.0 in every workflow that builds the package, and the release-gate guard enforces that. It runs a `wasm-opt` found on `PATH` and otherwise downloads its own binaryen, so a locally installed `wasm-opt` changes the artifact: every benchmark result records the Cargo profile, the wasm-opt flags read from the crate metadata, and the wasm-opt version, and `node benchmarks/benchmark.mjs size` fails when the build log shows that wasm-opt did not run. The package-size ceilings in `benchmarks/budgets.json` block `ci.yml`, `metrics-smoke.yml`, and the nightly and release benchmark workflows; `node benchmarks/benchmark.mjs rebudget` derives replacement ceilings and their rationale from a measured result, and `benchmarks/README.md` ("WASM size levers and re-baselining") records which size levers were measured and why the release profile keeps workspace crates at opt-level 3.
 
 Indicator multi-input validation is engine-owned: VWAP and VWAP-band bindings require a distinct
 live scalar volume series, while missing volume remains the explicit unit-weight fallback. An

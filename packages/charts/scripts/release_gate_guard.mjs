@@ -5,6 +5,13 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../../..", import.meta.url));
 const ci = readFileSync(`${root}/.github/workflows/ci.yml`, "utf8");
 const publish = readFileSync(`${root}/.github/workflows/publish.yml`, "utf8");
+// The benchmark workflows build the same package, so their wasm-pack is held to the same pin.
+const benchmarkWorkflows = Object.fromEntries(
+  ["benchmark-nightly.yml", "benchmark-release.yml", "metrics-smoke.yml"].map((name) => [
+    name,
+    readFileSync(`${root}/.github/workflows/${name}`, "utf8"),
+  ]),
+);
 
 // Every release-relevant build installs the same wasm-pack: its bundled wasm-opt decides the
 // shipped WASM bytes, so an unpinned or differently pinned installer moves the size budgets and
@@ -19,7 +26,7 @@ function assertWasmPackPinned(source, workflow) {
   }
 }
 
-function verify(ciSource, publishSource) {
+function verify(ciSource, publishSource, benchmarkSources = benchmarkWorkflows) {
   assert.match(ciSource, /Run required portable browser suite[\s\S]*npx playwright test/,
     "portable Playwright must remain a required browser step");
   assert.doesNotMatch(ciSource, /Run required portable browser suite[\s\S]{0,180}continue-on-error: true/,
@@ -30,10 +37,18 @@ function verify(ciSource, publishSource) {
     "deterministic package and WASM size budgets must block CI");
   assert.doesNotMatch(ciSource, /Enforce production artifact size budgets[\s\S]{0,180}continue-on-error: true/,
     "artifact size budgets cannot continue on error");
+  // Beyond the named steps below, no step of either workflow may install an unpinned wasm-pack.
+  for (const [name, source] of [["ci.yml", ciSource], ["publish.yml", publishSource]]) {
+    assert.doesNotMatch(source, /wasm-pack\/installer\/init\.sh|cargo install wasm-pack --locked(?! --version 0\.15\.0)/,
+      `${name} cannot install an unpinned wasm-pack (it also selects the binaryen that optimizes the shipped module)`);
+  }
   assert.match(ciSource, /machine-sensitive[\s\S]{0,220}continue-on-error: true/,
     "machine-calibrated evidence must remain non-authoritative");
   assertWasmPackPinned(ciSource, "ci.yml");
   assertWasmPackPinned(publishSource, "publish.yml");
+  for (const [name, source] of Object.entries(benchmarkSources)) {
+    assertWasmPackPinned(source, name);
+  }
   assert.match(publishSource, /tags: \["v\*"\]/,
     "version tags must trigger publication");
   assert.match(publishSource, /actions: read[\s\S]*contents: read[\s\S]*packages: write/,
@@ -66,5 +81,12 @@ for (const [brokenCi, brokenPublish] of [
   [ci, publish.replace(WASM_PACK_INSTALL, "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh")],
 ]) {
   assert.throws(() => verify(brokenCi, brokenPublish), "a simulated release-gate regression was not detected");
+}
+for (const name of Object.keys(benchmarkWorkflows)) {
+  const broken = {
+    ...benchmarkWorkflows,
+    [name]: benchmarkWorkflows[name].replace(WASM_PACK_INSTALL, "cargo install wasm-pack --locked"),
+  };
+  assert.throws(() => verify(ci, publish, broken), `an unpinned wasm-pack in ${name} was not detected`);
 }
 console.log("release gate policy and failure simulations OK");

@@ -775,13 +775,7 @@ fn clean_tick_marks_shifted(
         },
     );
     let mut weights = vec![0u8; times.len()];
-    fill_weights_for_points_shifted_in(
-        &times,
-        &mut weights,
-        0,
-        label_shift,
-        &chart.exchange_time,
-    );
+    fill_weights_for_points_shifted_in(&times, &mut weights, 0, label_shift, &chart.exchange_time);
     let mut marks = TimeTickMarks::new();
     marks.set_weights(&weights);
     // A spacing wider than the label keeps every point, so the marks carry every weight.

@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,11 +32,56 @@ export async function product_version() {
   return (await read_json(path.join(repository_root, "packages", "charts", "package.json"))).version;
 }
 
+// wasm-pack reads its wasm-opt flags from the crate metadata section named after the build mode:
+// `release` for a plain `wasm-pack build`, `custom` for `--profile <name>`.
+export function wasm_opt_arguments(cargo_metadata, cargo_profile) {
+  const crate = cargo_metadata?.packages?.find(({ name }) => name === "aeris_charts_wasm");
+  const section = crate?.metadata?.["wasm-pack"]?.profile?.[cargo_profile === "release" ? "release" : "custom"];
+  const args = section?.["wasm-opt"];
+  if (!Array.isArray(args) || args.length === 0 || !args.every((argument) => typeof argument === "string")) {
+    throw new Error(`aeris_charts_wasm has no wasm-opt arguments for Cargo profile ${cargo_profile} (or \`cargo metadata\` could not run); wasm-pack would ship an unoptimized or default-optimized module`);
+  }
+  return args;
+}
+
+// Cargo profile wasm-pack builds with: the `--profile <name>` in the package's build:wasm script, else `release`.
+export function wasm_build_profile(build_wasm_script) {
+  return /--profile[ =]([A-Za-z0-9_-]+)/.exec(build_wasm_script)?.[1] ?? "release";
+}
+
+// wasm-pack runs a `wasm-opt` found on PATH and only otherwise downloads its own binaryen into
+// `<cache>/.wasm-pack`, so the version that optimized the module is the PATH one if present,
+// else the newest wasm-opt found under that cache. Null when neither can be found or run.
+export async function wasm_opt_version(cache_root = wasm_pack_cache_root()) {
+  const on_path = command("wasm-opt", ["--version"]);
+  if (on_path) return on_path;
+  const executable = process.platform === "win32" ? "wasm-opt.exe" : "wasm-opt";
+  const found = [];
+  async function scan(directory, depth) {
+    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+      const filename = path.join(directory, entry.name);
+      if (entry.isDirectory() && depth < 4) await scan(filename, depth + 1);
+      else if (entry.name === executable) found.push({ filename, modified: (await stat(filename)).mtimeMs });
+    }
+  }
+  await scan(cache_root, 0);
+  found.sort((left, right) => right.modified - left.modified);
+  return found.length > 0 ? command(found[0].filename, ["--version"]) : null;
+}
+
+function wasm_pack_cache_root() {
+  if (process.platform === "win32") return path.join(process.env.LOCALAPPDATA ?? os.homedir(), ".wasm-pack");
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Caches", ".wasm-pack");
+  return path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), ".wasm-pack");
+}
+
 export async function build_provenance(kind = "package") {
   const lock = await readFile(path.join(repository_root, "packages", "charts", "package-lock.json"));
   const cargo_lock = await readFile(path.join(repository_root, "Cargo.lock"));
   const esbuild = await read_json(path.join(repository_root, "packages", "charts", "node_modules", "esbuild", "package.json")).catch(() => null);
   const native = kind === "native";
+  const cargo_profile = native ? "release" : wasm_build_profile((await read_json(path.join(repository_root, "packages", "charts", "package.json"))).scripts?.["build:wasm"] ?? "");
+  const wasm_opt_args = native ? [] : wasm_opt_arguments(JSON.parse(command("cargo", ["metadata", "--no-deps", "--format-version", "1"]) ?? "null"), cargo_profile);
   return {
     profile: "release",
     logging: "default-no-verbose-debug",
@@ -48,7 +93,9 @@ export async function build_provenance(kind = "package") {
     esbuild_version: esbuild?.version ?? null,
     package_lock_sha256: createHash("sha256").update(lock).digest("hex"),
     cargo_lock_sha256: createHash("sha256").update(cargo_lock).digest("hex"),
-    wasm_opt_args: native ? [] : ["-Oz", "--enable-mutable-globals", "--enable-nontrapping-float-to-int", "--enable-bulk-memory", "--enable-sign-ext", "--enable-simd"],
+    cargo_profile,
+    wasm_opt_version: native ? null : await wasm_opt_version(),
+    wasm_opt_args,
   };
 }
 
@@ -102,6 +149,8 @@ export function validate_run(run) {
   if (run.schema_version !== 1) throw new Error(`unsupported schema_version ${run.schema_version}`);
   if (run.product?.name !== "aeris_charts-financial" || !run.product.version) throw new Error("invalid product metadata");
   if (run.build?.profile !== "release" || run.build?.logging !== "default-no-verbose-debug" || !run.build?.build_command || !/^[a-f0-9]{64}$/.test(run.build?.package_lock_sha256 ?? "") || !/^[a-f0-9]{64}$/.test(run.build?.cargo_lock_sha256 ?? "") || !Array.isArray(run.build?.wasm_opt_args)) throw new Error("invalid release build metadata");
+  // Optional so older results stay readable; `profile` above is the evidence channel, `cargo_profile` names the Cargo profile that built the wasm.
+  if ((run.build.cargo_profile !== undefined && (typeof run.build.cargo_profile !== "string" || run.build.cargo_profile === "")) || (run.build.wasm_opt_version !== undefined && run.build.wasm_opt_version !== null && typeof run.build.wasm_opt_version !== "string")) throw new Error("invalid wasm build provenance");
   assert_record(run.source, "source");
   if (typeof run.source.dirty_worktree !== "boolean") throw new Error("invalid source metadata");
   assert_record(run.environment, "environment");
@@ -278,6 +327,43 @@ export function evaluate_absolute_budgets(run, budgets = { absolute_maximums: {}
     },
     evaluations,
   };
+}
+
+// Replacement package-size ceilings from one measured `package-release-artifacts` run. Only a ceiling the run exceeds
+// moves: to the observed p50 plus `headroom_percent`, rounded up to the next 10,000 bytes (the Phase 2 reset carried
+// 6.4-8.5% headroom). Passing ceilings and every non-package maximum are copied unchanged, so a re-baseline never
+// silently tightens or loosens what still holds. The appended `rationale` entry records the observed values, the
+// toolchain and the stated product tradeoff; `budgets.json` ignores keys it does not evaluate, so the evidence stays
+// beside the numbers it justifies.
+export function propose_size_budgets(run, budgets, { headroom_percent = 7, levers = [], product_tradeoff = "" } = {}) {
+  validate_run(run);
+  const size = run.scenarios.find(({ id, status }) => id === "package-release-artifacts" && status === "passed");
+  if (!size) throw new Error("the run has no passed package-release-artifacts scenario");
+  const observed = {};
+  const raised = {};
+  const absolute_maximums = { ...budgets.absolute_maximums };
+  for (const [key, maximum] of Object.entries(absolute_maximums)) {
+    if (!key.startsWith("package-release-artifacts.")) continue;
+    const value = size.metrics[key.split(".")[1]]?.summary?.p50;
+    if (!Number.isFinite(value)) throw new Error(`${key}: the run has no measured value`);
+    observed[key] = value;
+    if (value <= maximum) continue;
+    absolute_maximums[key] = Math.ceil(Math.ceil(value * (100 + headroom_percent) / 100) / 10_000) * 10_000;
+    raised[key] = { from: maximum, to: absolute_maximums[key] };
+  }
+  const policy_version = (budgets.policy_version ?? 0) + 1;
+  const rationale = [...(budgets.rationale ?? []), {
+    policy_version,
+    commit: run.source.git_commit,
+    dirty_worktree: run.source.dirty_worktree,
+    headroom_percent,
+    observed,
+    raised,
+    toolchain: { rustc: run.build.rustc_version, wasm_pack: run.build.wasm_pack_version, wasm_opt: run.build.wasm_opt_version ?? null, cargo_profile: run.build.cargo_profile ?? null, wasm_opt_args: run.build.wasm_opt_args },
+    levers,
+    product_tradeoff,
+  }];
+  return { ...budgets, policy_version, absolute_maximums, rationale };
 }
 
 function render_value(value) {
