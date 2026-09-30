@@ -623,7 +623,7 @@ impl ChartInner {
             if !decoded.warnings.is_empty() {
                 web_sys::console::warn_1(
                     &format!(
-                        "aeris_charts: custom series skipped {} command(s) — {}",
+                        "aeris_charts: custom series raised {} command warning(s) — {}",
                         decoded.warnings.len(),
                         decoded.warnings.join("; ")
                     )

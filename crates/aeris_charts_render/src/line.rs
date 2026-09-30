@@ -158,12 +158,27 @@ pub fn push_line_stroke(
     }
 }
 
+/// The rect a stroke of `width` is clipped to (`pane` grown by the stroke's reach) and the dash
+/// pattern's length in px (0 for a solid style), shared by [`push_clipped_stroke`] and
+/// [`dash_run_bound`] so the bound and the lowering can never disagree about either.
+fn stroke_clip(pane: Rect, width: f32, style: LineStyle) -> (Rect, f64) {
+    let period = style
+        .dash_pattern(width)
+        .iter()
+        .copied()
+        .map(f64::from)
+        .sum();
+    (pane.inflate(f64::from(width) + 2.0), period)
+}
+
 /// Lower one stroke run that may reach far past `pane` (family and placement-guide strokes, and
 /// the dashed strokes of [`push_styled_stroke`]) for every executor. The run is clipped to `pane`
-/// grown by the stroke's reach, so frame work and coordinates stay bounded however far the
-/// geometry reaches (an extreme level or zoom), and a dashed or dotted run is split into solid
-/// dash runs through [`push_line_stroke`]; clipped parts keep the unclipped run's dash phase, so
-/// dashes never shift while panning.
+/// grown by the stroke's reach, so frame work and coordinates past the pane stay bounded however
+/// far the geometry reaches (an extreme level or zoom), and a dashed or dotted run is split into
+/// solid dash runs through [`push_line_stroke`]; clipped parts keep the unclipped run's dash
+/// phase, so dashes never shift while panning. The dash count inside the pane still grows with
+/// the run's visible path length ([`dash_run_bound`]): a caller fed by untrusted geometry checks
+/// it first.
 pub fn push_clipped_stroke(
     out: &mut Vec<Prim>,
     points: &mut Vec<[f32; 2]>,
@@ -172,13 +187,7 @@ pub fn push_clipped_stroke(
     (width, style, color): (f32, LineStyle, Color),
     scratch: &mut Vec<(f64, f64)>,
 ) {
-    let clip = pane.inflate(f64::from(width) + 2.0);
-    let period: f64 = style
-        .dash_pattern(width)
-        .iter()
-        .copied()
-        .map(f64::from)
-        .sum();
+    let (clip, period) = stroke_clip(pane, width, style);
     clip_polyline_to_rect(run, clip, period, scratch, |part| {
         if style == LineStyle::Solid {
             let first_point = points.len() as u32;
@@ -203,7 +212,8 @@ pub fn push_clipped_stroke(
 /// executor strokes alike. A dashed or dotted run is expanded with `line_type` first (a curve
 /// clipped before expansion would bend differently inside the pane) and then lowered through
 /// [`push_clipped_stroke`], so executors receive only solid dash runs, whatever their dash
-/// support, and dash work stays bounded by the pane.
+/// support, and the work past the pane stays bounded; inside it the dash count follows the run's
+/// visible path length ([`dash_run_bound`]).
 pub fn push_styled_stroke(
     out: &mut Vec<Prim>,
     points: &mut Vec<[f32; 2]>,
@@ -244,6 +254,29 @@ pub fn push_styled_stroke(
         (width, style, color),
         &mut Vec::new(),
     );
+}
+
+/// An upper bound on the solid dash runs [`push_styled_stroke`] emits for a dashed or dotted
+/// `run` of [`LineType::Simple`] (expand other line types first, as it does), computed without
+/// lowering it: the run is clipped exactly as the lowering clips it and each clipped part of arc
+/// length `L` can hold at most `L / period + 1` on-stretches of the dash pattern. The count grows
+/// with the path's visible length, not with the pane, so a caller fed by untrusted geometry (the
+/// browser's plugin command buffers) checks it before lowering. A solid style, which is never
+/// split, reports 0.
+pub fn dash_run_bound(run: &[(f64, f64)], pane: Rect, width: f32, style: LineStyle) -> f64 {
+    let (clip, period) = stroke_clip(pane, width, style);
+    if period <= 0.0 {
+        return 0.0;
+    }
+    let mut bound = 0.0;
+    clip_polyline_to_rect(run, clip, period, &mut Vec::new(), |part| {
+        let length: f64 = part
+            .windows(2)
+            .map(|pair| (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1))
+            .sum();
+        bound += length / period + 1.0;
+    });
+    bound
 }
 
 /// A crisp line's `[from, to]` span (either order) clamped to `pane` in whole pixels, `None` when
@@ -1570,6 +1603,70 @@ mod tests {
             .collect();
         assert_eq!(inside.first(), Some(&8.0));
         assert!(inside.iter().all(|x| (x - 8.0).rem_euclid(24.0) == 0.0));
+    }
+
+    #[test]
+    fn dash_run_bound_covers_the_lowered_run_count_of_any_path() {
+        // Straight, dense zigzag, re-entering spiral, and mostly-outside paths, at every dashed
+        // style and several widths: the bound never undercounts what `push_styled_stroke` emits
+        // and stays within a small factor of it (it only over-counts partial dashes per part).
+        let zigzag: Vec<(f64, f64)> = (0..500)
+            .map(|i| (f64::from(i) * 0.3, if i % 2 == 0 { 0.0 } else { 100.0 }))
+            .collect();
+        let spiral: Vec<(f64, f64)> = (0..800)
+            .map(|i| {
+                let t = f64::from(i) * 0.05;
+                (100.0 + 700.0 * t.cos(), 50.0 + 400.0 * t.sin())
+            })
+            .collect();
+        let paths: [(&str, Vec<(f64, f64)>); 5] = [
+            ("straight", vec![(0.0, 50.0), (200.0, 50.0)]),
+            ("far", vec![(-1000.0, 50.0), (1.0e9, 50.0)]),
+            ("zigzag", zigzag),
+            ("spiral", spiral),
+            ("outside", vec![(0.0, 500.0), (300.0, 500.0)]),
+        ];
+        for (name, run) in &paths {
+            for style in [LineStyle::Dotted, LineStyle::Dashed] {
+                for width in [0.5_f32, 1.0, 2.0, 5.0] {
+                    let (mut prims, mut pool) = (Vec::new(), Vec::new());
+                    push_styled_stroke(
+                        &mut prims,
+                        &mut pool,
+                        run,
+                        LineType::Simple,
+                        (width, style, BLUE),
+                        PANE,
+                    );
+                    let bound = dash_run_bound(run, PANE, width, style);
+                    let runs = prims.len() as f64;
+                    assert!(
+                        bound >= runs,
+                        "{name} {style:?} width {width}: {runs} runs over bound {bound}"
+                    );
+                    assert!(
+                        bound <= 2.0 * runs + 4.0 * (run.len() as f64),
+                        "{name} {style:?} width {width}: bound {bound} is loose for {runs} runs"
+                    );
+                }
+            }
+        }
+        // A path that misses the pane costs nothing; a long in-pane path costs its length.
+        assert_eq!(
+            dash_run_bound(&paths[4].1, PANE, 2.0, LineStyle::Dashed),
+            0.0
+        );
+        assert!(dash_run_bound(&paths[2].1, PANE, 1.0, LineStyle::Dotted) > 5_000.0);
+    }
+
+    #[test]
+    fn dash_run_bound_is_zero_when_nothing_is_split() {
+        let run = [(0.0, 50.0), (200.0, 50.0)];
+        assert_eq!(dash_run_bound(&run, PANE, 2.0, LineStyle::Solid), 0.0);
+        // A non-positive width has a non-positive pattern, which `dash_split` refuses to walk.
+        assert_eq!(dash_run_bound(&run, PANE, 0.0, LineStyle::Dashed), 0.0);
+        assert_eq!(dash_run_bound(&run, PANE, -3.0, LineStyle::Dotted), 0.0);
+        assert_eq!(dash_run_bound(&run[..1], PANE, 2.0, LineStyle::Dashed), 0.0);
     }
 
     #[test]

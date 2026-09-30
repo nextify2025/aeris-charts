@@ -18,21 +18,36 @@
 //! `polyline` is lowered to solid dash runs through
 //! [`aeris_charts_render::line::push_styled_stroke`], clipped to the owning pane (the absolute
 //! scissor, [`pane_clip`]) with the unclipped dash phase; a dashed `hline`/`vline` is clamped to
-//! the pane with the same phase, so the executors' dash loops stay bounded however far a plugin
-//! extends its geometry. Clipping to the pane is lossless because both backends already clip
-//! plugin layers to that scissor. A command may therefore yield zero or many prims.
+//! the pane with the same phase. Clipping to the pane is lossless because both backends already
+//! clip plugin layers to that scissor, and it bounds how far a plugin's geometry can reach past
+//! the pane (the executors' f32 dash loops never terminate on spans of hundreds of millions of
+//! px). Inside the pane the dash count follows the path's visible length, so a dashed polyline
+//! whose [`dash_run_bound`] exceeds [`MAX_DASH_RUNS`] is drawn solid with a warning instead. A
+//! command may therefore yield zero or many prims.
 
 use aeris_charts_engine::line_style_from_u8;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim, TextAlign};
-use aeris_charts_render::line::{crisp_span, push_styled_stroke};
+use aeris_charts_render::line::{crisp_span, dash_run_bound, push_styled_stroke};
 use aeris_charts_render::shape::Rect;
 
 /// Narrowest dashed stroke, in bitmap px. Dash patterns scale with the stroke width, so a
 /// vanishing width would explode the run count (or stall the splitter); at this width one
-/// straight pane crossing lowers to at most a few thousand runs. Thinner dashed polylines are
-/// skipped with a warning; solid ones are unaffected.
+/// straight pane crossing lowers to at most a few hundred runs. Thinner dashed polylines are
+/// skipped with a warning; solid ones are unaffected. This bounds the dash rate per px of path;
+/// [`MAX_DASH_RUNS`] bounds the total for a path that winds through the pane.
 const MIN_DASHED_WIDTH_PX: f64 = 0.5;
+
+/// Most solid dash runs one dashed `polyline` command may lower to. The pane bounds only the
+/// reach past its edges: inside it the run count follows the path's visible length
+/// ([`dash_run_bound`]), so a dense zigzag of thousands of points would otherwise cost hundreds
+/// of thousands of runs, pool points, and Canvas2D strokes every frame (plugin renderers re-run
+/// each frame). A command over the budget is drawn as one solid polyline with a warning, which
+/// keeps its ink, costs only its own points, and is what the WebGPU stroker painted for a dashed
+/// plugin line before lowering. A long dotted line across a wide pane is a few hundred runs, so
+/// real strokes sit far below it. The number of commands a buffer holds is the plugin's own cost,
+/// as for every other command kind.
+const MAX_DASH_RUNS: u32 = 4096;
 
 /// The pane's clip rect for a plugin command buffer: the pane's absolute bitmap-px scissor
 /// `[left, top, width, height]` as a [`Rect`]. Plugin coordinates are absolute bitmap px, so this
@@ -146,16 +161,17 @@ fn crisp_extent(
 
 fn decode_polyline(
     command: &serde_json::Value,
+    index: usize,
     pool: &mut Vec<[f32; 2]>,
     pane: Rect,
-    prims: &mut Vec<Prim>,
+    out: &mut DecodedCommands,
 ) -> Result<(), String> {
     let width = num(command, "width").ok_or("width")?;
     let style = style(command);
     let color = color(command, "color").ok_or("color")?;
     if style == LineStyle::Solid {
         let (first_point, point_count) = push_points(command, pool).ok_or(POINTS_ERROR)?;
-        prims.push(Prim::Polyline {
+        out.prims.push(Prim::Polyline {
             first_point,
             point_count,
             width: width as f32,
@@ -174,25 +190,41 @@ fn decode_polyline(
     for_each_point(command, |x, y| run.push((x, y)))
         .filter(|&count| count >= 2)
         .ok_or(POINTS_ERROR)?;
+    let width = width as f32;
+    let bound = dash_run_bound(&run, pane, width, style);
+    // A NaN bound compares false, so it also takes the solid path.
+    let style = if bound <= f64::from(MAX_DASH_RUNS) {
+        style
+    } else {
+        out.warn(
+            index,
+            format!(
+                "dashed polyline could lower to {bound:.0} dash runs, over the budget of \
+                 {MAX_DASH_RUNS}; drawn solid"
+            ),
+        );
+        LineStyle::Solid
+    };
     // Zero prims (a run wholly outside the pane) is not an error.
     push_styled_stroke(
-        prims,
+        &mut out.prims,
         pool,
         &run,
         LineType::Simple,
-        (width as f32, style, color),
+        (width, style, color),
         pane,
     );
     Ok(())
 }
 
-/// Decode one command, appending its prims (zero, one, or many) to `prims`.
+/// Decode the command at `index`, appending its prims (zero, one, or many) to `out`.
 fn decode_one(
     command: &serde_json::Value,
+    index: usize,
     pool: &mut Vec<[f32; 2]>,
     text_defaults: &TextDefaults,
     pane: Rect,
-    prims: &mut Vec<Prim>,
+    out: &mut DecodedCommands,
 ) -> Result<(), String> {
     let kind = command
         .get("c")
@@ -207,7 +239,7 @@ fn decode_one(
             let style = style(command);
             let color = color(command, "color").ok_or("color")?;
             if let Some((x0, x1)) = crisp_extent(x0, x1, (pane.left, pane.right), width, style) {
-                prims.push(Prim::HLine {
+                out.prims.push(Prim::HLine {
                     y,
                     x0,
                     x1,
@@ -226,7 +258,7 @@ fn decode_one(
             let style = style(command);
             let color = color(command, "color").ok_or("color")?;
             if let Some((y0, y1)) = crisp_extent(y0, y1, (pane.top, pane.bottom), width, style) {
-                prims.push(Prim::VLine {
+                out.prims.push(Prim::VLine {
                     x,
                     y0,
                     y1,
@@ -237,9 +269,10 @@ fn decode_one(
             }
             Ok(())
         }
-        "polyline" => decode_polyline(command, pool, pane, prims),
+        "polyline" => decode_polyline(command, index, pool, pane, out),
         _ => {
-            prims.push(decode_prim(kind, command, pool, text_defaults)?);
+            out.prims
+                .push(decode_prim(kind, command, pool, text_defaults)?);
             Ok(())
         }
     }
@@ -403,7 +436,7 @@ pub fn decode_commands(
         return out;
     };
     for (index, command) in commands.iter().enumerate() {
-        if let Err(detail) = decode_one(command, pool, text_defaults, pane, &mut out.prims) {
+        if let Err(detail) = decode_one(command, index, pool, text_defaults, pane, &mut out) {
             out.warn(index, format!("skipped ({detail})"));
         }
     }
@@ -1032,6 +1065,136 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(prims.len(), 1);
         assert_eq!(pool, vec![[0.0, 50.0], [300.0, 50.0]]);
+    }
+
+    /// A flat `[x,y,...]` zigzag of `count` points sweeping the pane's height, `step` px apart in
+    /// x: each segment crosses the whole 100 px pane height, so the in-pane path length is about
+    /// `count * 100` px however small the x extent is.
+    fn zigzag_points(count: usize, step: f64) -> String {
+        (0..count)
+            .map(|i| format!("{},{}", i as f64 * step, if i % 2 == 0 { 0 } else { 100 }))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn zigzag_command(count: usize, width: f64, style: u8) -> String {
+        format!(
+            r##"{{"c":"polyline","points":[{}],"color":"#0000ff","width":{width},"style":{style}}}"##,
+            zigzag_points(count, 0.2)
+        )
+    }
+
+    #[test]
+    fn dense_dashed_polyline_inside_the_pane_is_bounded_and_drawn_solid() {
+        // 2,000 points of 100 px each inside a 400x100 pane is ~200,000 px of visible dotted path:
+        // ~20,000 dash runs at width 2 (period 10) and ~80,000 at width 0.5. Unbounded, this is
+        // per-frame work and memory proportional to the plugin's path length, not to the pane.
+        for (width, style) in [(2.0, 1), (2.0, 2), (0.5, 1), (3.0, 4)] {
+            let (prims, pool, warnings) = decode_in(
+                &format!(
+                    "[{}, {}]",
+                    zigzag_command(2_000, width, style),
+                    zigzag_command(50, 2.0, 0)
+                ),
+                PANE,
+            );
+            assert!(
+                prims.len() <= MAX_DASH_RUNS as usize + 1,
+                "width {width} style {style}: {} prims",
+                prims.len()
+            );
+            assert!(
+                pool.len() <= 2 * (MAX_DASH_RUNS as usize + 1) + 2_000,
+                "{} pool points",
+                pool.len()
+            );
+            // The over-budget command keeps its ink as one solid polyline (the WebGPU stroker
+            // already painted dashed plugin lines solid); the solid command after it is untouched.
+            assert_eq!(prims.len(), 2, "width {width} style {style}");
+            let runs = solid_runs(&prims, &pool);
+            assert_eq!((runs[0].len(), runs[1].len()), (2_000, 50));
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("command 0"), "{warnings:?}");
+            assert!(warnings[0].contains("dash runs"), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn dashed_polylines_within_the_run_budget_still_lower_to_dashes() {
+        // 40 crossings of the pane at width 2 is ~4,000 px of dotted path: ~400 runs.
+        let (prims, pool, warnings) = decode_in(&format!("[{}]", zigzag_command(40, 2.0, 1)), PANE);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(prims.len() > 100 && prims.len() <= MAX_DASH_RUNS as usize);
+        solid_runs(&prims, &pool);
+    }
+
+    #[test]
+    fn the_run_budget_is_per_command_and_keeps_command_order() {
+        let dense = zigzag_command(2_000, 2.0, 1);
+        let (prims, pool, warnings) = decode_in(
+            &format!(
+                r##"[
+                    {{"c":"rect","x":0,"y":0,"w":5,"h":5,"color":"#111111"}},
+                    {dense},
+                    {{"c":"polyline","points":[0,50,200,50],"color":"#000","width":2,"style":2}},
+                    {dense},
+                    {{"c":"rect","x":9,"y":9,"w":5,"h":5,"color":"#222222"}}
+                ]"##
+            ),
+            PANE,
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("command 1") && warnings[1].contains("command 3"));
+        assert!(matches!(prims.first(), Some(Prim::Rect { .. })));
+        assert!(matches!(prims.last(), Some(Prim::Rect { .. })));
+        let middle = &prims[1..prims.len() - 1];
+        assert!(matches!(
+            middle[0],
+            Prim::Polyline {
+                point_count: 2_000,
+                ..
+            }
+        ));
+        assert!(matches!(
+            middle[middle.len() - 1],
+            Prim::Polyline {
+                point_count: 2_000,
+                ..
+            }
+        ));
+        // The in-budget dashed line between them is lowered to its nine dashes.
+        let dashes = solid_runs(&middle[1..middle.len() - 1], &pool);
+        assert_eq!(x_spans(&dashes), dash_spans(0.0, 200.0, 12.0, 24.0));
+    }
+
+    #[test]
+    fn dashed_polyline_work_is_bounded_by_the_budget_for_any_path_shape() {
+        // Dense zigzags that stay inside, cross, or mostly leave the pane, plus a spiral of
+        // segments that re-enter it: however the path winds, one command is capped.
+        let spiral: String = (0..3_000)
+            .map(|i| {
+                let t = f64::from(i) * 0.05;
+                format!("{},{}", 200.0 + 900.0 * t.cos(), 50.0 + 400.0 * t.sin())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let spiral = format!(
+            r##"{{"c":"polyline","points":[{spiral}],"color":"#000","width":1,"style":1}}"##
+        );
+        for command in [
+            zigzag_command(10_000, 1.0, 1),
+            zigzag_command(10_000, 0.5, 1),
+            zigzag_command(3_000, 0.0, 2),
+            spiral,
+        ] {
+            let (prims, pool, _) = decode_in(&format!("[{command}]"), PANE);
+            assert!(
+                prims.len() <= MAX_DASH_RUNS as usize,
+                "{} prims from one command",
+                prims.len()
+            );
+            assert!(pool.len() <= 10_000 + 2 * MAX_DASH_RUNS as usize);
+        }
     }
 
     #[test]

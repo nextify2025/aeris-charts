@@ -661,7 +661,7 @@ impl ChartInner {
         if !decoded.warnings.is_empty() {
             web_sys::console::warn_1(
                 &format!(
-                    "aeris_charts: pane primitive skipped {} command(s) — {}",
+                    "aeris_charts: pane primitive raised {} command warning(s) — {}",
                     decoded.warnings.len(),
                     decoded.warnings.join("; ")
                 )
