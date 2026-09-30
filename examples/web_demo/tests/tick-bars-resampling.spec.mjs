@@ -419,6 +419,168 @@ test("trade-bound candles and studies reject every host write and stay fed by th
   expect(result.tip_equals_fresh).toBe(true);
 });
 
+test("the legacy wasm write entries refuse engine-owned series and warn with the real reason", async ({ page }) => {
+  const errors = await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const wasm = chart.wasm;
+    chart.remove_series(window.__main);
+    const second = (index) => 1_700_000_000 + index * 7;
+    const tape = Array.from({ length: 120 }, (_, index) => ({
+      timestamp_micros: second(index) * 1_000_000,
+      price: 100 + (index % 11) / 4,
+      volume: 1 + (index % 5),
+      aggressor: index % 3 === 0 ? "sell" : "buy",
+      session_id: 1,
+    }));
+    const candles = chart.add_series("candlestick");
+    const plain = chart.add_series("candlestick");
+    const stream = chart.add_trade_stream("TEST:LEGACY", { tick_size: 0.25, bar_type: "time", interval_seconds: 60 });
+    chart.bind_trade_bar_series_to_stream(candles, stream);
+    const volume = chart.add_trade_volume_series(stream, 1);
+    chart.set_trade_stream_trades(stream, tape);
+    const time = second(0);
+    plain.set_data([{ time, open: 1, high: 2, low: 0, close: 1 }]);
+
+    const warnings = [];
+    const original_warn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(" ")); };
+    // Runs one legacy entry and returns what it logged, so each refusal is attributed to its call.
+    const warned_by = (run) => {
+      const before = warnings.length;
+      const returned = run();
+      return { returned, warnings: warnings.slice(before) };
+    };
+    const one = (value) => Float64Array.of(value);
+    const snapshot = (handles) => JSON.stringify(handles.map((handle) => handle.data()));
+    const owned = [candles, volume];
+    const rows_before = snapshot(owned);
+    const entries = {};
+    for (const [name, handle] of Object.entries({ candles, volume })) {
+      entries[name] = {
+        set_series_data: warned_by(() => wasm.set_series_data(handle.id, one(time), one(1), one(2), one(0), one(1))),
+        update_series_bar: warned_by(() => wasm.update_series_bar(handle.id, time, 1, 2, 0, 1)),
+        set_series_point_colors: warned_by(() => wasm.set_series_point_colors(handle.id, [0xff0000ff], undefined, undefined)),
+        set_ring_source: warned_by(() => {
+          const buffer = new SharedArrayBuffer(4096);
+          return wasm.set_ring_source(handle.id, new Uint8Array(buffer), new Int32Array(buffer, 0, 1), "{}");
+        }),
+        series_pop: warned_by(() => wasm.series_pop(handle.id, 1)),
+      };
+    }
+    // A bound candle keeps the retention of its stream; a study keeps a cap of its own.
+    const retention = {
+      candles: warned_by(() => wasm.set_series_max_points(candles.id, 50)),
+      volume: warned_by(() => wasm.set_series_max_points(volume.id, 50)),
+      unknown: warned_by(() => wasm.set_series_max_points(987_654, 50)),
+      candles_cap: wasm.series_max_points(candles.id) ?? null,
+      volume_cap: wasm.series_max_points(volume.id) ?? null,
+    };
+    const rows_after = snapshot(owned);
+
+    // An ordinary series is untouched by the guard: it writes and stays silent.
+    const control = {
+      update_series_bar: warned_by(() => wasm.update_series_bar(plain.id, time + 60, 2, 3, 1, 2)),
+      set_series_data: warned_by(() => wasm.set_series_data(plain.id, one(time), one(5), one(6), one(4), one(5))),
+      set_series_max_points: warned_by(() => wasm.set_series_max_points(plain.id, 50)),
+      plain_cap: wasm.series_max_points(plain.id) ?? null,
+      plain_rows: plain.data().length,
+    };
+    const derived = {
+      candles: wasm.series_is_derived(candles.id),
+      volume: wasm.series_is_derived(volume.id),
+      plain: wasm.series_is_derived(plain.id),
+      unknown: wasm.series_is_derived(987_654),
+    };
+    console.warn = original_warn;
+    return { entries, retention, control, derived, unchanged: rows_before === rows_after };
+  });
+
+  expect(errors).toEqual([]);
+  const refusal = /derived by the engine/;
+  for (const name of ["candles", "volume"]) {
+    const { set_series_data, update_series_bar, set_series_point_colors, set_ring_source, series_pop } = result.entries[name];
+    expect(set_series_data.warnings.join("\n"), `${name} set_series_data`).toMatch(/set_series_data rejected.*derived by the engine/);
+    expect(update_series_bar.warnings.join("\n"), `${name} update_series_bar`).toMatch(/update_bar rejected.*derived by the engine/);
+    expect(set_series_point_colors.warnings.join("\n"), `${name} set_series_point_colors`).toMatch(
+      /set_series_point_colors rejected.*derived by the engine/,
+    );
+    // The ring binding reports its reason as the return value, not a console line.
+    expect(set_ring_source.returned, `${name} set_ring_source`).toMatch(refusal);
+    expect(set_ring_source.warnings, `${name} set_ring_source warnings`).toEqual([]);
+    expect(series_pop.returned, `${name} series_pop`).toBe(0);
+  }
+  expect(result.unchanged).toBe(true);
+  expect(result.retention.candles.warnings).toEqual([
+    "aeris_charts: set_series_max_points ignored (series is engine-owned; retention is set on the trade stream or source)",
+  ]);
+  expect(result.retention.candles_cap).toBeNull();
+  expect(result.retention.volume.warnings).toEqual([]);
+  expect(result.retention.volume_cap).toBe(50);
+  expect(result.retention.unknown.warnings).toEqual([
+    "aeris_charts: set_series_max_points ignored (unknown or removed series id)",
+  ]);
+  expect(result.control.update_series_bar.warnings).toEqual([]);
+  expect(result.control.set_series_data.warnings).toEqual([]);
+  expect(result.control.set_series_max_points.warnings).toEqual([]);
+  expect(result.control.plain_cap).toBe(50);
+  expect(result.control.plain_rows).toBe(1);
+  expect(result.derived).toEqual({ candles: true, volume: true, plain: false, unknown: false });
+});
+
+test("one series has one engine writer: bound candles refuse a second owner with the real reason", async ({ page }) => {
+  const errors = await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const options = { tick_size: 0.25, bar_type: "time", interval_seconds: 60 };
+    const stream = chart.add_trade_stream("TEST:OWNER", options);
+    const attempt = (run) => {
+      try {
+        run();
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, code: error.code ?? null, message: String(error.message ?? error) };
+      }
+    };
+    const source = chart.add_series("candlestick");
+    const target = chart.add_series("candlestick");
+    chart.configure_resampled_series(target, {
+      source, interval_seconds: 300, boundaries: [{ start_time: 0, end_time: 4_000_000_000, session_id: 1 }],
+    });
+    const cvd = chart.add_cvd_series(stream, 2, "continuous");
+    cvd.set_type("candlestick");
+    const footprint = chart.add_series("footprint", { tick_size: 1, interval_seconds: 60 });
+    const bound = chart.add_series("candlestick");
+    chart.bind_trade_bar_series_to_stream(bound, stream);
+    const other = chart.add_trade_stream("TEST:OWNER:5M", { ...options, interval_seconds: 300 });
+    const outcomes = {
+      resampled_target: attempt(() => chart.bind_trade_bar_series_to_stream(target, stream)),
+      cvd_candle: attempt(() => chart.bind_trade_bar_series_to_stream(cvd, stream)),
+      footprint: attempt(() => chart.bind_trade_bar_series_to_stream(footprint, stream)),
+      rebind: attempt(() => chart.bind_trade_bar_series_to_stream(bound, other)),
+      rebind_same: attempt(() => chart.bind_trade_bar_series_to_stream(bound, other)),
+    };
+    // The refused binds registered nothing, so the stream keeps accepting trades.
+    const tip = attempt(() => chart.update_trade_stream_trades(stream, [
+      { timestamp_micros: 1_700_000_000_000_000, price: 100, volume: 1, aggressor: "buy", session_id: 1 },
+    ]));
+    return { outcomes, tip };
+  });
+
+  expect(errors).toEqual([]);
+  for (const name of ["resampled_target", "cvd_candle"]) {
+    expect(result.outcomes[name].ok, name).toBe(false);
+    expect(result.outcomes[name].code, name).toBe("invalid_options");
+    expect(result.outcomes[name].message, name).toMatch(/another engine feature|already writes/);
+  }
+  expect(result.outcomes.footprint.ok).toBe(false);
+  expect(result.outcomes.footprint.code).toBe("invalid_options");
+  expect(result.outcomes.rebind).toEqual({ ok: true });
+  expect(result.outcomes.rebind_same).toEqual({ ok: true });
+  expect(result.tip).toEqual({ ok: true });
+});
+
 test("reconfiguring a volume binding adds a trading date; self-feeding volume is refused", async ({ page }) => {
   const errors = await open_chart(page);
   const result = await page.evaluate(async (windows) => {
