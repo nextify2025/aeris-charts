@@ -17,6 +17,12 @@ function verify(ciSource, publishSource) {
     "deterministic package and WASM size budgets must block CI");
   assert.doesNotMatch(ciSource, /Enforce production artifact size budgets[\s\S]{0,180}continue-on-error: true/,
     "artifact size budgets cannot continue on error");
+  for (const [name, source] of [["ci.yml", ciSource], ["publish.yml", publishSource]]) {
+    assert.match(source, /cargo install wasm-pack --locked --version 0\.15\.0/,
+      `${name} must install the pinned wasm-pack the size budgets and docs are recorded against`);
+    assert.doesNotMatch(source, /wasm-pack\/installer\/init\.sh|cargo install wasm-pack --locked(?! --version 0\.15\.0)/,
+      `${name} cannot install an unpinned wasm-pack (it also selects the binaryen that optimizes the shipped module)`);
+  }
   assert.match(ciSource, /machine-sensitive[\s\S]{0,220}continue-on-error: true/,
     "machine-calibrated evidence must remain non-authoritative");
   assert.match(publishSource, /tags: \["v\*"\]/,
@@ -40,6 +46,8 @@ for (const [brokenCi, brokenPublish] of [
   [ci.replace("AERIS_CHARTS_PERF_STRICT: \"1\"", "AERIS_CHARTS_PERF_STRICT: \"0\""), publish],
   [ci.replace("node benchmarks/benchmark.mjs size", "node benchmarks/benchmark.mjs test"), publish],
   [ci.replace("id: portable-browser-suite", "id: portable-browser-suite\n        continue-on-error: true"), publish],
+  [ci.replace("cargo install wasm-pack --locked --version 0.15.0", "cargo install wasm-pack --locked"), publish],
+  [ci, publish.replace("cargo install wasm-pack --locked --version 0.15.0", "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh")],
   [ci, publish.replace("actions/workflows/ci.yml/runs", "actions/workflows/missing.yml/runs")],
   [ci, publish.replace("https://npm.pkg.github.com", "https://registry.npmjs.org")],
   [ci, publish.replace("npm publish --tag latest", "npm publish")],

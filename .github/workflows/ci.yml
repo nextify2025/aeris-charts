@@ -80,7 +80,7 @@ jobs:
         with:
           node-version: 22
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        run: cargo install wasm-pack --locked --version 0.15.0
       - name: Install package deps
         working-directory: packages/charts
         run: npm ci
@@ -118,7 +118,7 @@ jobs:
         with:
           node-version: 22
       - name: Install wasm-pack
-        run: cargo install wasm-pack --locked
+        run: cargo install wasm-pack --locked --version 0.15.0
       - name: Install package deps
         working-directory: packages/charts
         run: npm ci

@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { brotliCompressSync, gzipSync } from "node:zlib";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile, copyFile, mkdir } from "node:fs/promises";
 import os from "node:os";
@@ -12,6 +12,29 @@ const executable = process.platform === "win32" ? "npm.cmd" : "npm";
 function run(file, args, cwd) {
   const command = process.platform === "win32" && file.endsWith(".cmd") ? ["cmd.exe", ["/d", "/s", "/c", file, ...args]] : [file, args];
   return execFileSync(command[0], command[1], { cwd, encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "inherit"] });
+}
+
+// wasm-pack logs this line when it runs wasm-opt and only prints "Skipping wasm-opt" otherwise (for example on a
+// platform it cannot fetch binaryen for), so its absence means the measured module is not the optimized one.
+const wasm_opt_ran = /Optimizing wasm binaries with `wasm-opt`/;
+
+export function assert_wasm_opt_ran(build_log) {
+  if (!wasm_opt_ran.test(build_log)) throw new Error("the production build did not run wasm-opt, so the measured wasm is not the optimized module the package ships");
+}
+
+function run_logged(file, args, cwd) {
+  const command = process.platform === "win32" && file.endsWith(".cmd") ? ["cmd.exe", ["/d", "/s", "/c", file, ...args]] : [file, args];
+  return new Promise((resolve, reject) => {
+    const child = spawn(command[0], command[1], { cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let log = "";
+    for (const stream of [child.stdout, child.stderr]) stream.on("data", (chunk) => { log += chunk; process.stderr.write(chunk); });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(log) : reject(new Error(`${file} ${args.join(" ")} exited with status ${code}`)));
+  });
+}
+
+async function build_package() {
+  assert_wasm_opt_ran(await run_logged(executable, ["run", "build"], package_root));
 }
 
 async function compressed_metrics(prefix, filename, visibility = "public_candidate") {
@@ -42,7 +65,7 @@ async function consumer_bundle(kind, source, temporary) {
 }
 
 export async function prepare_browser_artifacts({ build = false } = {}) {
-  if (build) run(executable, ["run", "build"], package_root);
+  if (build) await build_package();
   const demo_dist = path.join(repository_root, "examples", "web_demo", "dist");
   await mkdir(demo_dist, { recursive: true });
   await copyFile(path.join(package_root, "dist", "index.js"), path.join(demo_dist, "aeris_charts_financial.js"));
@@ -60,7 +83,7 @@ export function parse_pack_manifest(output) {
 
 export async function measure_size({ build = true } = {}) {
   const started = performance.now();
-  if (build) run(executable, ["run", "build"], package_root);
+  if (build) await build_package();
   const pack = parse_pack_manifest(run(executable, ["pack", "--json", "--dry-run"], package_root));
   const dist = path.join(package_root, "dist");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "aeris_charts-bundle-"));
