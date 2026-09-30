@@ -16,7 +16,8 @@ use aeris_charts_core::style::{MARKET_DOWN_RGB, MARKET_UP_RGB};
 use aeris_charts_render::color::Color;
 
 use crate::{
-    marker_pos, marker_shape, ChartEngine, Marker, PriceFormatKind, SeriesKind, SeriesPriceFormat,
+    marker_pos, marker_shape, ChartEngine, Marker, PriceFormatKind, SeriesKind, SeriesOwner,
+    SeriesPriceFormat,
 };
 
 const MICROS_PER_SECOND: i64 = 1_000_000;
@@ -610,6 +611,7 @@ pub enum FootprintError {
     SequenceDomainInUse,
     ProjectionTimeCollision,
     UnsupportedTradeBarSeries(SeriesId),
+    SeriesOwned(SeriesId),
     UnknownSeries(SeriesId),
     StaleSeries(SeriesId),
     Depth(crate::DepthError),
@@ -655,6 +657,12 @@ impl core::fmt::Display for FootprintError {
                 f,
                 "series {id} must be a candlestick or OHLC bar presentation"
             ),
+            Self::SeriesOwned(id) => {
+                write!(
+                    f,
+                    "series {id} is already written by another engine feature"
+                )
+            }
             Self::UnknownSeries(id) => write!(f, "unknown series id {id}"),
             Self::StaleSeries(id) => write!(f, "stale series id {id}"),
             Self::Depth(error) => write!(f, "depth replay failed: {error}"),
@@ -1975,7 +1983,7 @@ impl ChartEngine {
     ) -> Result<(), FootprintError> {
         let installed = match projection {
             BarProjection::Time((times, open, high, low, close)) => {
-                self.install_series_data(id, times, open, high, low, close)
+                self.install_series_data_inner(id, times, open, high, low, close)
             }
             BarProjection::Sequence(projection) => {
                 let key_base = self.sequence_install_key_base(stream_id);
@@ -1995,7 +2003,7 @@ impl ChartEngine {
     ) -> bool {
         match projection {
             BarProjection::Time((times, open, high, low, close)) => {
-                self.update_series_bars_sanitized(id, times, open, high, low, close) > 0
+                self.update_series_bars_sanitized_inner(id, times, open, high, low, close) > 0
             }
             BarProjection::Sequence(projection) => {
                 self.update_trade_bar_sequence_projection_bars(id, from, projection) > 0
@@ -2061,6 +2069,13 @@ impl ChartEngine {
         if self.series_max_points(id).is_some() {
             return Err(FootprintError::InvalidAggregation);
         }
+        // One writer per series: only an unowned series, or one already bound to a stream (a
+        // rebind), may become a trade-bound presentation. The trade writers below install through
+        // the unguarded internals, so this is the only thing keeping a resampled or synthetic
+        // target, or a study, from having two writers.
+        if !matches!(self.series_owner(id), None | Some(SeriesOwner::TradeBars)) {
+            return Err(FootprintError::SeriesOwned(id));
+        }
         self.trade_stream(stream_id)
             .ok_or(FootprintError::UnknownTradeStream(stream_id))?;
         // Trade-bound bars take the stream's time domain; an as-of overlay rejoins the union.
@@ -2077,7 +2092,17 @@ impl ChartEngine {
                 rebuilds: 0,
                 incremental_updates: 0,
             });
-        self.refresh_trade_bar_dependents_from(stream_id, None)
+        let refreshed = self.refresh_trade_bar_dependents_from(stream_id, None);
+        if refreshed.is_err() {
+            // A failed first projection must not leave a registration that fails every tip.
+            if let Some(dependents) = self.trade_bar_dependents.get_mut(&stream_id) {
+                dependents.retain(|dependent| dependent.series_id != id);
+                if dependents.is_empty() {
+                    self.trade_bar_dependents.remove(&stream_id);
+                }
+            }
+        }
+        refreshed
     }
 
     pub fn add_cvd_series(
@@ -2277,6 +2302,11 @@ impl ChartEngine {
         validate_chart_projection(options.aggregation)?;
         validate_visual_options(&options.visual)?;
         self.validate_series_id(id).map_err(series_error)?;
+        // One writer per series: a trade-bound candle, a study, or a resampled or synthetic
+        // target cannot become a footprint.
+        if !matches!(self.series_owner(id), None | Some(SeriesOwner::Footprint)) {
+            return Err(FootprintError::SeriesOwned(id));
+        }
         let aggregator = FootprintAggregator::new(options.aggregation)?;
         // A footprint owns its trade-derived rows; an as-of overlay rejoins the union.
         self.rejoin_time_union(id);
@@ -2940,7 +2970,9 @@ impl ChartEngine {
         let rows = values.len();
         let incremental = incremental_from.is_some();
         if incremental {
-            if self.update_series_bars_sanitized(series_id, times, open, high, low, values) == 0 {
+            if self.update_series_bars_sanitized_inner(series_id, times, open, high, low, values)
+                == 0
+            {
                 // The study rows no longer line up with the stream: rebuild this study.
                 return self.refresh_trade_study(stream_id, index, None);
             }
@@ -2956,7 +2988,7 @@ impl ChartEngine {
                 }
             }
         } else {
-            if !self.install_series_data(series_id, times, open, high, low, values) {
+            if !self.install_series_data_inner(series_id, times, open, high, low, values) {
                 return Err(FootprintError::UnknownSeries(series_id));
             }
             if let Some(mut colors) = colors {
@@ -5173,6 +5205,171 @@ mod tests {
         assert!(chart.remove_series(bars));
         assert_eq!(chart.trade_stream_stats(stream).unwrap().dependent_count, 0);
         chart.remove_trade_stream(stream).unwrap();
+    }
+
+    /// A series has one engine writer. Every attach path refuses a series another feature already
+    /// writes, before it changes anything, so two writers never fight over one series' rows.
+    #[test]
+    fn single_owner_attach_checks() {
+        use crate::{ResampleBoundary, ResampleOptions, SyntheticBarOptions};
+
+        let dependents =
+            |chart: &ChartEngine, stream| chart.trade_stream_stats(stream).unwrap().dependent_count;
+        let print = |micros| trade(micros, 100.0, 1.0, AggressorSide::Buy);
+        let mut chart = ChartEngine::new(600.0, 400.0, 1.0);
+        let stream = chart
+            .add_trade_stream("K:1m", FootprintAggregationOptions::default())
+            .unwrap();
+        let other = chart
+            .add_trade_stream(
+                "K:5m",
+                FootprintAggregationOptions {
+                    bars: FootprintBarAggregation::Time {
+                        interval_micros: 300_000_000,
+                        anchor_micros: 0,
+                    },
+                    ..FootprintAggregationOptions::default()
+                },
+            )
+            .unwrap();
+
+        // A resampled target is written by its binding.
+        let source = chart.add_series(SeriesKind::Candlestick);
+        let target = chart.add_series(SeriesKind::Candlestick);
+        chart
+            .configure_resampled_series(
+                source,
+                None,
+                target,
+                None,
+                ResampleOptions {
+                    interval_seconds: 300,
+                    boundaries: vec![ResampleBoundary {
+                        start_time: 0,
+                        end_time: 30 * 86_400,
+                        session_id: 1,
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            chart.bind_trade_bar_series_to_stream(target, stream),
+            Err(FootprintError::SeriesOwned(target))
+        );
+        assert_eq!(dependents(&chart, stream), 0);
+        // The refused bind left nothing registered, so the stream keeps accepting trades.
+        chart
+            .update_trade_stream_trades(stream, vec![print(60_000_001)])
+            .unwrap();
+
+        // A candle built from CVD keeps its study registration: the study still writes it.
+        let cvd = chart
+            .add_cvd_series(stream, 1, TradeStudyOptions::default())
+            .unwrap();
+        chart.convert_series_kind(cvd, SeriesKind::Candlestick);
+        assert_eq!(
+            chart.bind_trade_bar_series_to_stream(cvd, stream),
+            Err(FootprintError::SeriesOwned(cvd))
+        );
+        assert_eq!(dependents(&chart, stream), 1);
+        chart
+            .update_trade_stream_trades(stream, vec![print(60_000_002)])
+            .unwrap();
+
+        // A footprint is not a candle presentation at all.
+        let footprint = chart
+            .add_footprint_series(FootprintSeriesOptions::default())
+            .unwrap();
+        assert_eq!(
+            chart.bind_trade_bar_series_to_stream(footprint, stream),
+            Err(FootprintError::UnsupportedTradeBarSeries(footprint))
+        );
+        assert_eq!(dependents(&chart, stream), 1);
+
+        // Candles bound to a stream, or studies of it, cannot become a footprint. Reconfiguring a
+        // footprint, and rebinding a bound candle to another stream, stay allowed.
+        let candles = chart.add_series(SeriesKind::Candlestick);
+        chart
+            .bind_trade_bar_series_to_stream(candles, stream)
+            .unwrap();
+        chart
+            .bind_trade_bar_series_to_stream(candles, stream)
+            .unwrap();
+        let delta = chart.add_delta_series(stream, 2).unwrap();
+        let volume = chart.add_trade_volume_series(stream, 2).unwrap();
+        assert_eq!(dependents(&chart, stream), 4);
+        for id in [candles, cvd, delta, volume] {
+            let kind = chart.series_kind(id);
+            assert_eq!(
+                chart.configure_footprint_series(id, FootprintSeriesOptions::default()),
+                Err(FootprintError::SeriesOwned(id))
+            );
+            assert_eq!(chart.series_kind(id), kind);
+        }
+        assert_eq!(dependents(&chart, stream), 4);
+        chart
+            .configure_footprint_series(footprint, FootprintSeriesOptions::default())
+            .unwrap();
+        chart
+            .bind_trade_bar_series_to_stream(candles, other)
+            .unwrap();
+        assert_eq!(dependents(&chart, stream), 3);
+        assert_eq!(dependents(&chart, other), 1);
+        chart
+            .update_trade_stream_trades(stream, vec![print(60_000_003)])
+            .unwrap();
+        chart
+            .update_trade_stream_trades(other, vec![print(60_000_004)])
+            .unwrap();
+
+        // A first refresh that fails leaves no registration behind: this stream's half-second bars
+        // share one chart second.
+        let half_seconds = chart
+            .add_trade_stream(
+                "K:500ms",
+                FootprintAggregationOptions {
+                    bars: FootprintBarAggregation::Time {
+                        interval_micros: 500_000,
+                        anchor_micros: 0,
+                    },
+                    ..FootprintAggregationOptions::default()
+                },
+            )
+            .unwrap();
+        chart
+            .set_trade_stream_trades(half_seconds, vec![print(1_000_000), print(1_500_000)])
+            .unwrap();
+        let unbound = chart.add_series(SeriesKind::Candlestick);
+        assert_eq!(
+            chart.bind_trade_bar_series_to_stream(unbound, half_seconds),
+            Err(FootprintError::ProjectionTimeCollision)
+        );
+        assert_eq!(dependents(&chart, half_seconds), 0);
+        assert!(!chart.series_is_source_owned(unbound));
+        chart
+            .update_trade_stream_trades(half_seconds, vec![print(2_000_000)])
+            .unwrap();
+
+        // Synthetic bars own their series, and no trade stream binds it.
+        let mut synthetic = ChartEngine::new(600.0, 400.0, 1.0);
+        let stream = synthetic
+            .add_trade_stream("K:1m", FootprintAggregationOptions::default())
+            .unwrap();
+        let renko = synthetic.add_series(SeriesKind::Candlestick);
+        synthetic
+            .configure_synthetic_bar_series(
+                renko,
+                SyntheticBarOptions::RenkoFixed { box_size: 1.0 },
+            )
+            .unwrap();
+        assert_eq!(
+            synthetic.bind_trade_bar_series_to_stream(renko, stream),
+            Err(FootprintError::SeriesOwned(renko))
+        );
+        assert_eq!(dependents(&synthetic, stream), 0);
+        synthetic
+            .update_trade_stream_trades(stream, vec![print(60_000_001)])
+            .unwrap();
     }
 
     #[test]

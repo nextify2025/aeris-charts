@@ -1802,6 +1802,16 @@ function rejected_ingestion(
   };
 }
 
+/** A host write to a series the engine owns (a footprint, a trade-bound candle or bar, a CVD,
+ *  delta, or volume study, resampled or synthetic bars). The wasm boundary reports the same
+ *  record for the typed, sequenced, and merge entries. */
+function derived_series_ingestion(id: number): ingestion_diagnostics {
+  return rejected_ingestion(
+    `series ${id} is derived by the engine; write to its trade stream, resampler source, or synthetic-bar source instead`,
+    "derived_series",
+  );
+}
+
 const INVALID_SEQUENCE = "sequence must be a non-negative safe integer";
 
 /** Custom and advanced series own their payloads outside the OHLC streaming path, so a sequence
@@ -1874,7 +1884,10 @@ class series_impl implements series_api {
     const accepted = this.record_ingestion(
       this.chart.wasm.set_series_data_typed(this.id, p.times, p.open, p.high, p.low, p.close),
     );
-    if (!accepted) return;
+    if (!accepted) {
+      this.warn_rejected("set_data");
+      return;
+    }
     // A full replace cleared the guard; a snapshot sequence becomes the new baseline.
     if (!Number.isNaN(sequence)) this.chart.wasm.set_series_update_sequence(this.id, sequence);
     // set_series_data resets point colors, so per-point channels must be applied after it.
@@ -1903,7 +1916,10 @@ class series_impl implements series_api {
     const accepted = this.record_ingestion(this.chart.wasm.set_series_data_typed(
       this.id, columns.times, columns.open, columns.high, columns.low, columns.close,
     ));
-    if (!accepted) return;
+    if (!accepted) {
+      this.warn_rejected("set_data_typed");
+      return;
+    }
     this.chart.note_series_times(this.id, columns.times.length === 0 ? null : false);
     if (!Number.isNaN(sequence)) this.chart.wasm.set_series_update_sequence(this.id, sequence);
     this.chart.sync_countdown_timer();
@@ -1928,7 +1944,10 @@ class series_impl implements series_api {
       : this.chart.wasm.update_series_bars_typed_sequenced(
         this.id, columns.times, columns.open, columns.high, columns.low, columns.close, sequence,
       ));
-    if (!accepted) return;
+    if (!accepted) {
+      this.warn_rejected("update_typed");
+      return;
+    }
     if (columns.times.length > 0) this.chart.note_series_update(this.id, false);
     // Same post-update bookkeeping as `update`: data arriving on a countdown-enabled series can
     // start the timer, and repaints coalesce onto the next frame rather than painting per batch.
@@ -1948,6 +1967,14 @@ class series_impl implements series_api {
       this.chart.wasm.clear_ring_source(this.id);
       this.chart.sync_ring_drain_loop();
       return;
+    }
+    // Unbinding stays allowed above: a ring bound before the series became derived must be
+    // releasable. Binding one now would only feed rows the engine drops on every frame.
+    if (this.chart.wasm.series_is_derived(this.id)) {
+      throw new AerisChartsError(
+        "unsupported_operation",
+        `series ${this.id} is derived by the engine; feed its trade stream or source instead of binding a ring`,
+      );
     }
     if (layout === undefined) {
       throw new AerisChartsError("invalid_options", "set_ring_source requires a layout when a buffer is given");
@@ -1998,12 +2025,13 @@ class series_impl implements series_api {
       return;
     }
     if (Number.isNaN(sequence)) {
-      // The values passed the boundary check above, so an engine rejection means the series is
-      // engine-derived (footprint, synthetic, or resampled bars) and changes only via its source.
+      // A refused write is also what invalid values look like, so ask the engine whether the
+      // series is derived (a footprint, trade-bound candle or study, synthetic or resampled bars)
+      // rather than guessing from the refusal.
       if (!this.chart.wasm.update_series_bar_styled(this.id, time, o, h, l, c, body, wick, border)) {
-        this.last_ingestion = rejected_ingestion(
-          `series ${this.id} is derived by the engine; write to its source instead`,
-        );
+        this.last_ingestion = this.chart.wasm.series_is_derived(this.id)
+          ? derived_series_ingestion(this.id)
+          : rejected_ingestion("the engine rejected the point (unknown series or invalid values)");
         this.warn_rejected("update");
         return;
       }
@@ -2188,6 +2216,13 @@ class series_impl implements series_api {
 
   pop(count = 1): void {
     this.assert_live();
+    // Popping is a data-path write: an engine-owned series keeps its rows, so this records the
+    // rejection like any other dropped write instead of repainting or firing `data_changed`.
+    if (this.chart.wasm.series_is_derived(this.id)) {
+      this.last_ingestion = derived_series_ingestion(this.id);
+      this.warn_rejected("pop");
+      return;
+    }
     this.chart.wasm.series_pop(this.id, count);
     this.chart.repaint();
     // Like set_data, popping is a full-range change, not an incremental update.
@@ -5509,7 +5544,7 @@ export class chart_impl implements chart_api {
     if (!this.wasm.bind_trade_bar_series_to_stream(id, stream_id)) {
       throw new AerisChartsError(
         "invalid_options",
-        "trade bar stream binding requires a candlestick or bar series",
+        "trade bar stream binding requires a candlestick or bar series without a max_points cap that no other engine feature (a footprint, trade study, resampler, or synthetic bars) already writes",
       );
     }
     this.repaint();

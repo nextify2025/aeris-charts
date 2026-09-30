@@ -701,6 +701,27 @@ closing second, such as the 16:00:00 closing cross. A print that is folded or ex
 part in aggressor classification. A trade `session_id` change always starts a new bar and resets
 session delta; the windows already split the morning and afternoon, so a per-date id is enough.
 
+**Engine-owned series.** A bound candle or bar and the volume, CVD, and delta studies are written
+only by their trade stream, and one series has one engine writer: `bind_trade_bar_series_to_stream`
+throws `invalid_options` for a series that is not a candlestick or bar, carries a `max_points`
+cap, or is already a footprint, a study, a resampled target, or a synthetic-bar series (rebinding a
+bound candle to another stream stays allowed), and a footprint, resampled target, or synthetic
+series cannot be created from a series that a stream writes. Their `set_data`, `set_data_typed`,
+`update`, `update_typed`, `merge`, `merge_typed` (with or without `{ sequence }`), `pop`, and
+`set_ring_source` are rejected: the data calls record `last_ingestion_diagnostics()` as
+`{ status: "rejected", code: "derived_series" }`, warn, and change nothing, `pop` records the same
+rejection without repainting or firing `data_changed`, and `set_ring_source` throws
+`unsupported_operation` (unbinding with `null` still works, and a ring bound before the series
+became derived keeps draining into `frame_stats().ring_dropped_rows` until unbound). Styling, pane
+moves, visibility, `histogram_updown_rule`, and a study's own `max_points` still apply; a bound
+candle refuses `max_points` because it follows the stream's retention. Feed the stream instead.
+Rust hosts get the same refusals from the ordinary write entries (`false`, `0`, `None`,
+`Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`), which also mean an unknown id or
+invalid data, so `ChartEngine::series_is_source_owned(id)` tells an engine-owned series apart;
+`bind_trade_bar_series_to_stream` and `configure_footprint_series` return
+`FootprintError::SeriesOwned` for a series another feature writes, and
+`ChartEngine::apply_momentum_histogram_colors` now returns `false` for the delta and volume studies.
+
 **Live, corrections, and replay.** In-order prints update the forming bar in place and the first
 print at or after a bar boundary opens the next bar (`"tip"`); late or corrected prints rebuild the
 stream once (`"historical"`). The volume histogram, CVD/delta studies, and footprints on the same
@@ -777,7 +798,10 @@ source) or output, and a binding's volume source may not be its own volume targe
 `invalid_options` ("resampling dependencies may not be chained or cyclic") and changes nothing.
 
 The targets are engine-owned: `set_data`, `update`, `update_typed`, `merge`, and `merge_typed` on
-them are rejected (`last_ingestion_diagnostics().status === "rejected"`) and change nothing.
+them are rejected (`last_ingestion_diagnostics()` reports `status: "rejected"` with
+`code: "derived_series"`) and change nothing, and `pop` records the same rejection. A target must
+not be a footprint, a trade-bound candle, a trade study, or a synthetic-bar series (`invalid_options`);
+a trade-bound candle or the trade volume study may be the binding's source, however.
 Removing any series of a binding (source, volume source, or a target) removes the binding together
 with its target series, like indicator outputs. `chart.resampled_bars(target)` returns the derived
 bars with their `session_id` and aggregated source-row count. Rust hosts call
@@ -871,7 +895,8 @@ Streaming ingestion keeps reference `series.update` semantics: a point replaces 
 time. `update()` reports the payloads that silently rewrite a bar with a machine-readable
 diagnostics `code` pointing to `merge()`: `value_on_ohlc_series` (`{ time, value }` flattens a
 candlestick/bar), `price_less_payload` (for example `{ time, volume }` becomes whitespace), and the
-rejected `partial_ohlc`. `series.merge(point, options?)` is the engine-owned partial path: present
+rejected `partial_ohlc`. A write to an engine-owned series (a footprint, a trade-bound candle or
+study, resampled or synthetic bars) is rejected with `derived_series` on every data path. `series.merge(point, options?)` is the engine-owned partial path: present
 open/high/low/close/value fields overwrite, absent fields keep the existing bar, and candlestick/bar
 results are normalized so `high >= max(open, close)` and `low <= min(open, close)` (a close-only tick
 for a new time creates O=H=L=C; scalar series take `value`). A merge without a price field is

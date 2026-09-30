@@ -936,9 +936,13 @@ export interface ingestion_diagnostics {
    * - `price_less_payload` — accepted: a point without price fields (for example
    *   `{ time, volume }`) replaced the bar with whitespace (reference behavior; use `merge()`, and
    *   update volume on its own series);
-   * - `empty_merge` — rejected: a `merge()` carried no price field.
+   * - `empty_merge` — rejected: a `merge()` carried no price field;
+   * - `derived_series` — rejected: the series is engine-owned (a footprint, a trade-bound
+   *   candle or bar, a CVD, delta, or volume study, or resampled or synthetic bars), so a host
+   *   data write changed nothing. Feed its trade stream or source instead. `pop()` on such a
+   *   series records the same rejection.
    */
-  code?: "stale_sequence" | "partial_ohlc" | "value_on_ohlc_series" | "price_less_payload" | "empty_merge";
+  code?: "stale_sequence" | "partial_ohlc" | "value_on_ohlc_series" | "price_less_payload" | "empty_merge" | "derived_series";
   /** Last sequence applied to the series, reported with `code: "stale_sequence"`. */
   last_sequence?: number;
 }
@@ -3336,7 +3340,8 @@ export interface series_api {
    * `code: "empty_merge"`. Volume and turnover merge into their own series.
    *
    * Emits one `data_changed("update")`. Throws `unsupported_operation` on custom, advanced, and
-   * footprint series.
+   * footprint series. An engine-owned series (a bound candle, a trade study, resampled or
+   * synthetic bars) rejects it with `code: "derived_series"` and changes nothing.
    */
   merge(point: series_merge_data, options?: series_update_options): void;
   /**
@@ -3423,7 +3428,11 @@ export interface series_api {
    *
    * Requires the page to be cross-origin isolated, since that is what makes `SharedArrayBuffer`
    * available at all. Throws if the layout is unusable (a channel that overruns `row_stride`, a
-   * misaligned cursor, a ring that does not fit the buffer, zero capacity).
+   * misaligned cursor, a ring that does not fit the buffer, zero capacity), and throws
+   * `unsupported_operation` for an engine-owned series (a bound candle, a trade study, resampled
+   * or synthetic bars), which only its trade stream or source feeds. A ring bound before its
+   * series became engine-owned is not unbound: unbind it with `set_ring_source(null)`, or its
+   * drained rows are dropped and counted in {@link frame_stats.ring_dropped_rows}.
    */
   set_ring_source(buffer: SharedArrayBuffer | null, layout?: ring_source_layout): void;
   /**
@@ -3434,7 +3443,9 @@ export interface series_api {
   /**
    * Remove `count` data items from the end of the series (reference `ISeriesApi.pop`, default
    * `count: 1`). Divergence: reference returns the removed items; here the engine drops them and the
-   * method returns nothing.
+   * method returns nothing. On an engine-owned series (a bound candle, a trade study, resampled or
+   * synthetic bars) it removes nothing: it records a `derived_series` rejection in
+   * {@link last_ingestion_diagnostics}, warns, and fires no `data_changed`.
    */
   pop(count?: number): void;
   /**
@@ -4118,9 +4129,30 @@ export interface chart_api {
   update_trade_stream_trades(stream_id: number, trades: readonly footprint_trade[]): "tip" | "historical";
   update_trade_stream_trades_typed(stream_id: number, columns: footprint_trade_columns): "tip" | "historical";
   bind_footprint_series_to_stream(series: footprint_series_api | number, stream_id: number): void;
-  /** Present one canonical trade stream as ordinary candlesticks or OHLC bars. */
+  /**
+   * Present one canonical trade stream as ordinary candlesticks or OHLC bars.
+   *
+   * The series becomes engine-owned and read-only: feed the trade stream, not the series. Host
+   * `set_data`, `update`, `merge`, their typed forms, `pop`, and `set_ring_source` are rejected
+   * with `code: "derived_series"` (see {@link series_api.last_ingestion_diagnostics}) and change
+   * nothing; styling, pane moves, visibility, and `histogram_updown_rule` still work. It throws
+   * `invalid_options` for a series that is not a candlestick or bar, carries a `max_points` cap
+   * (retention follows the stream), or is already written by another engine feature (a
+   * footprint, a CVD, delta, or volume study, or resampled or synthetic bars). Rebinding to
+   * another stream is allowed.
+   */
   bind_trade_bar_series_to_stream(series: series_api | number, stream_id: number): void;
+  /**
+   * Cumulative volume delta study of the stream. Engine-owned and read-only like a bound
+   * candle: feed the trade stream. Styling, pane moves, visibility, and the study's own
+   * `max_points` still work.
+   */
   add_cvd_series(stream_id: number, pane?: number, reset?: "session" | "continuous" | "anchored", anchor_timestamp_micros?: number): series_api;
+  /**
+   * Delta histogram of the stream's bars. Engine-owned and read-only like a bound candle: feed
+   * the trade stream. Styling, pane moves, visibility, and the study's own `max_points` still
+   * work.
+   */
   add_delta_series(stream_id: number, pane?: number): series_api;
   add_trade_bubbles(series: series_api | number, stream_id: number, options?: { minimum_volume?: number; max_markers?: number; aggregation_window_micros?: number }): void;
   /**
@@ -4133,7 +4165,9 @@ export interface chart_api {
   set_trade_stream_sessions(stream_id: number, sessions: trade_session_options | null): void;
   /**
    * Volume histogram derived from the stream's bars (total traded volume per bar), tinted by the
-   * primary price series' direction (`histogram_updown`); restyle it like any histogram.
+   * primary price series' direction (`histogram_updown`); restyle it like any histogram. It is
+   * engine-owned and read-only like a bound candle: feed the trade stream. Styling, pane moves,
+   * visibility, `histogram_updown_rule`, and the study's own `max_points` still work.
    */
   add_trade_volume_series(stream_id: number, pane?: number): series_api;
   /**

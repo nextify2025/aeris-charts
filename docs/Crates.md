@@ -75,6 +75,22 @@ that Terminal call sites should review:
   above for a separator and pane 0 for a `y` above the content, where both used to resolve to the
   last pane. GPUI hosts that pick a pane for price-axis hit-testing pick up the corrected mapping.
 
+Moving the pinned revision to one that guards trade-stream-derived series (see
+[Ticks to candles](Public_api.md#ticks-to-candles)) needs two more Terminal reviews, and the first
+cannot be checked from this repository:
+
+- Terminal must not write to a candle bound with `bind_trade_bar_series_to_stream` or to a CVD,
+  delta, or trade-volume series (`add_cvd_series`, `add_delta_series`, `add_trade_volume_series`).
+  Every host data write to them is now refused like a footprint's (`false`, `0`, `None`,
+  `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`; `series_is_source_owned(id)` tells
+  the refusal from an unknown id), and `apply_momentum_histogram_colors` returns `false` for the
+  delta and volume studies. The browser package rejects them with `code: "derived_series"`.
+- `FootprintError` gains the `SeriesOwned(SeriesId)` variant, returned when a series another engine
+  feature writes is bound to a trade stream or configured as a footprint, so an exhaustive `match`
+  on it needs an arm. `bind_trade_bar_series_to_stream` also refuses a series that a resampler,
+  synthetic bars, or a study already writes, and resampling targets and synthetic-bar series refuse
+  a trade-bound candle.
+
 ## License
 
 Aeris Charts is open-source software under the

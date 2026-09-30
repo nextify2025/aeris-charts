@@ -582,6 +582,10 @@ impl ChartEngine {
     ///
     /// Colors are derived from each value's sign and whether it moved toward or away from zero.
     /// The caller owns only the semantic request; Aeris retains palette and row-style ownership.
+    ///
+    /// Returns `false` for an unknown or non-histogram series and for a source-owned one (see
+    /// [`ChartEngine::series_is_source_owned`]), such as the trade delta and volume studies, which
+    /// keep the palette their stream installs. Indicator outputs are not source-owned and accept it.
     pub fn apply_momentum_histogram_colors(&mut self, id: SeriesId) -> bool {
         if self
             .series_entry(id)

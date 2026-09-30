@@ -461,7 +461,17 @@ handles, not provider-event copies. The stream derives integer tick-grid levels,
 final/session delta, delta percentage, running Max/Min Delta, and diagonal stacked imbalances. CVD
 supports session, continuous, and anchored resets, and every dependent carries the stream revision
 through tip, correction, and retention updates. Stream telemetry attributes retained tape capacity
-and dependent rebuild work.
+and dependent rebuild work. The stream is the only writer of its dependents: a trade-bound
+candle/bar and the CVD, delta, and volume studies are source-owned like a footprint, so every host
+data write (install, update, batch, merge, sequenced update, per-point colors, pop) is refused at
+the shared engine layer and reaches wasm, TypeScript, native, and GPUI unchanged. The stream's own
+tip and rebuild paths write through the unguarded `install_series_data_inner` and
+`update_series_bars_sanitized_inner` internals. A series has one engine writer
+(`ChartEngine::series_owner`, computed from the footprint, synthetic, resampling, trade-bar, and
+trade-study registries, so removal never leaves a stale answer), and every attach path
+(`bind_trade_bar_series_to_stream`, `configure_footprint_series`, `configure_resampled_series`
+targets, `configure_synthetic_bar_series`) checks it before mutating anything; without that check
+the unguarded internals would let two writers share one series.
 Time bars align to the stream's `anchor_micros` grid unless the host anchors the stream to
 exchange sessions (`set_trade_stream_sessions`): the stream then owns a `SessionBarGrid` in the
 chart's exchange time (calendar-date flag cleared), so ordinary trade-bound candles open at every
@@ -615,8 +625,9 @@ volume histogram from a candlestick/bar source and its volume histogram over ord
 boundaries (at most 32 bindings and 20 000 boundaries; hosts pass their own or derive them with
 `resample_boundaries`). Buckets restart at each boundary, rows outside every boundary are omitted,
 and whitespace rows reserve their bucket without prices (an all-whitespace bucket is a whitespace
-bar). Targets are source-owned: every host write path (install, update, typed batches, and merges)
-is rejected. Resampling buckets UTC seconds, so it and a non-time bar sequence (trade-count, volume,
+bar). Targets are source-owned, like trade-bound candles and bars, trade studies, and synthetic
+bars: every host write path (install, update, typed batches, and merges) is rejected, and a
+footprint, trade-bound, trade-study, or synthetic series cannot be a target. Resampling buckets UTC seconds, so it and a non-time bar sequence (trade-count, volume,
 or range streams, synthetic bars) never share a chart axis; whichever arrives second is rejected. A
 source or volume mutation reports its first changed row like an indicator change; bars whose bucket
 closes by the last unchanged row's time plus one second are kept, the rest is rebuilt from the first

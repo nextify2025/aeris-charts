@@ -159,12 +159,20 @@ fn rejected_diagnostics_json(reason: impl core::fmt::Display) -> String {
     .to_string()
 }
 
-/// Rejected ingestion for a host write to an engine-derived series (footprint, synthetic, or
-/// resampled bars), which changes only through its source.
+/// Rejected ingestion for a host write to a series the engine owns (a footprint, a trade-bound
+/// candle or bar, a CVD, delta, or volume study, or resampled or synthetic bars), which changes
+/// only through its trade stream or source. The `derived_series` code lets hosts tell it from an
+/// invalid payload. Callers decide ownership with `series_is_source_owned`, never from a refused
+/// write, because the engine's `false`/`0` also means unknown ids and invalid data.
 fn derived_series_rejection(id: u32) -> String {
-    rejected_diagnostics_json(format_args!(
-        "series {id} is derived by the engine; write to its source instead"
+    let mut json: serde_json::Value = serde_json::from_str(&rejected_diagnostics_json(
+        format_args!(
+            "series {id} is derived by the engine; write to its trade stream, resampler source, or synthetic-bar source instead"
+        ),
     ))
+    .unwrap_or_default();
+    json["code"] = "derived_series".into();
+    json.to_string()
 }
 
 fn rejected_validation_diagnostics_json(
@@ -5654,6 +5662,12 @@ impl AerisChart {
     }
     pub fn series_kind(&self, id: u32) -> Option<u8> {
         self.inner.borrow().series_kind(id)
+    }
+    /// Whether the engine writes this series' rows (a footprint, a trade-bound candle or bar, a
+    /// CVD, delta, or volume study, resampled or synthetic bars). Host data writes to such a
+    /// series are refused; `false` for an unknown or removed id.
+    pub fn series_is_derived(&self, id: u32) -> bool {
+        self.inner.borrow().series_is_source_owned(id)
     }
     pub fn series_data_by_index(&self, id: u32, index: f64, mismatch: i8) -> Vec<f64> {
         self.inner

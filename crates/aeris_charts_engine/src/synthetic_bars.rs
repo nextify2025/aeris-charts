@@ -73,7 +73,8 @@ impl core::fmt::Display for SyntheticBarError {
             Self::UnsupportedSeries(id) => {
                 write!(
                     f,
-                    "series {id} must use candlestick or OHLC-bar presentation"
+                    "series {id} must be an unowned candlestick or OHLC-bar series that no other \
+                     engine feature writes"
                 )
             }
             Self::SequenceDomainInUse => write!(
@@ -490,6 +491,15 @@ impl crate::ChartEngine {
         });
         if other_synthetic || non_time_stream || !self.resampled_series.is_empty() {
             return Err(SyntheticBarError::SequenceDomainInUse);
+        }
+        // One writer per series: a trade-bound candle on a time stream still belongs to its
+        // stream. Reconfiguring an existing synthetic series is allowed. Synthetic bars install
+        // through the unguarded internals, so nothing else would stop two writers.
+        if !matches!(
+            self.series_owner(id),
+            None | Some(crate::SeriesOwner::Synthetic)
+        ) {
+            return Err(SyntheticBarError::UnsupportedSeries(id));
         }
         let aggregator = SyntheticBarAggregator::new(options)?;
         // Synthetic bars live on the non-time sequence axis; an as-of overlay rejoins the union.
@@ -1161,6 +1171,30 @@ mod tests {
             ),
             Err(crate::FootprintError::SequenceDomainInUse)
         );
+    }
+
+    /// A series another engine feature writes cannot become synthetic bars: a trade-bound candle
+    /// on a time stream keeps its stream as the only writer, and nothing registers.
+    #[test]
+    fn a_trade_bound_candle_cannot_become_synthetic_bars() {
+        let mut chart = crate::ChartEngine::new(600.0, 400.0, 1.0);
+        let stream = chart
+            .add_trade_stream("K:1m", crate::FootprintAggregationOptions::default())
+            .unwrap();
+        let candles = chart.add_series(crate::SeriesKind::Candlestick);
+        chart
+            .bind_trade_bar_series_to_stream(candles, stream)
+            .unwrap();
+        assert_eq!(
+            chart.configure_synthetic_bar_series(
+                candles,
+                SyntheticBarOptions::RenkoFixed { box_size: 1.0 },
+            ),
+            Err(SyntheticBarError::UnsupportedSeries(candles))
+        );
+        assert!(chart.synthetic_bars(candles).is_none());
+        assert!(chart.sequence_points().is_none());
+        assert_eq!(chart.trade_stream_stats(stream).unwrap().dependent_count, 1);
     }
 
     #[test]

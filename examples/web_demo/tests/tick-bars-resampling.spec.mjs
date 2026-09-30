@@ -205,6 +205,7 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
     // used to write straight into the derived rows.
     const derived_before = { hour: hour.data(), volume: hour_volume.data() };
     const writes = {};
+    const codes = {};
     const one = (value) => Float64Array.of(value);
     for (const [name, target, attempt] of [
       ["set_data", hour, () => hour.set_data([{ time: slots[0], open: 1, high: 2, low: 0, close: 1 }])],
@@ -219,7 +220,10 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
     ]) {
       attempt();
       writes[name] = target.last_ingestion_diagnostics()?.status ?? null;
+      codes[name] = target.last_ingestion_diagnostics()?.code ?? null;
     }
+    hour.pop(1);
+    codes.pop = hour.last_ingestion_diagnostics()?.code ?? null;
     const derived_after = { hour: hour.data(), volume: hour_volume.data() };
     const expected = boundaries.flatMap((boundary) => {
       const bars = [];
@@ -242,6 +246,7 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
       last_close: rows.at(-1).close,
       refined,
       writes,
+      codes,
       derived_unchanged: JSON.stringify(derived_before) === JSON.stringify(derived_after),
       unbound: chart.resampled_bars(minute),
     };
@@ -271,9 +276,147 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
     volume_update: "rejected",
     volume_merge: "rejected",
   });
+  // The rejection names its cause, so a host can tell it from an invalid payload.
+  expect(Object.values(result.codes)).toEqual(Array(8).fill("derived_series"));
   expect(result.derived_unchanged).toBe(true);
   expect(result.local).toHaveLength(8);
   expect(result.unbound).toBeNull();
+});
+
+test("trade-bound candles and studies reject every host write and stay fed by their stream", async ({ page }) => {
+  const errors = await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const second = (index) => 1_700_000_000 + index;
+    const print = (index) => ({
+      timestamp_micros: second(index * 7) * 1_000_000,
+      price: 100 + ((index * 7) % 11) / 4,
+      volume: 1 + (index % 5),
+      aggressor: index % 3 === 0 ? "sell" : "buy",
+      session_id: 1,
+    });
+    const tape = Array.from({ length: 260 }, (_, index) => print(index));
+    const options = { tick_size: 0.25, bar_type: "time", interval_seconds: 60 };
+    const build = (key) => {
+      const candles = chart.add_series("candlestick");
+      const stream = chart.add_trade_stream(key, options);
+      chart.bind_trade_bar_series_to_stream(candles, stream);
+      return {
+        stream,
+        candles,
+        volume: chart.add_trade_volume_series(stream, 1),
+        cvd: chart.add_cvd_series(stream, 2, "continuous"),
+        delta: chart.add_delta_series(stream, 2),
+      };
+    };
+    const live = build("TEST:LIVE");
+    chart.set_trade_stream_trades(live.stream, tape.slice(0, 200));
+
+    const warnings = [];
+    const original_warn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(" ")); };
+    const one = (value) => Float64Array.of(value);
+    const time = second(60 * 3);
+    const attempts = {
+      set_data: (handle, scalar) => handle.set_data([scalar ? { time, value: 1 } : { time, open: 1, high: 2, low: 0, close: 1 }]),
+      set_data_typed: (handle) => handle.set_data_typed({ times: one(time), open: one(1), high: one(2), low: one(0), close: one(1) }),
+      update: (handle, scalar) => handle.update(scalar ? { time, value: 1 } : { time, open: 1, high: 2, low: 0, close: 1 }),
+      update_typed: (handle) => handle.update_typed({ times: one(time), open: one(1), high: one(2), low: one(0), close: one(1) }),
+      update_sequenced: (handle, scalar) => handle.update(scalar ? { time, value: 1 } : { time, open: 1, high: 2, low: 0, close: 1 }, { sequence: 3 }),
+      update_typed_sequenced: (handle) => handle.update_typed({ times: one(time), open: one(1), high: one(2), low: one(0), close: one(1) }, { sequence: 3 }),
+      merge: (handle) => handle.merge({ time, close: 99 }),
+      merge_typed: (handle) => handle.merge_typed({ times: one(time), close: one(99) }),
+      merge_sequenced: (handle) => handle.merge({ time, close: 5 }, { sequence: 9 }),
+      pop: (handle) => handle.pop(1),
+    };
+    const outcomes = {};
+    for (const [name, handle] of Object.entries({ candles: live.candles, volume: live.volume, cvd: live.cvd, delta: live.delta })) {
+      const scalar = name !== "candles";
+      const before = JSON.stringify(handle.data());
+      let notified = 0;
+      const on_change = () => { notified += 1; };
+      handle.subscribe_data_changed(on_change);
+      const seen = {};
+      for (const [attempt, run] of Object.entries(attempts)) {
+        const warned = warnings.length;
+        run(handle, scalar);
+        const diagnostics = handle.last_ingestion_diagnostics();
+        seen[attempt] = { status: diagnostics?.status, code: diagnostics?.code, warned: warnings.length > warned };
+      }
+      handle.unsubscribe_data_changed(on_change);
+      outcomes[name] = { seen, notified, unchanged: JSON.stringify(handle.data()) === before };
+    }
+
+    // A ring cannot feed them either, but unbinding stays allowed.
+    const ring = {};
+    for (const [name, handle] of Object.entries({ candles: live.candles, volume: live.volume })) {
+      try {
+        handle.set_ring_source(new SharedArrayBuffer(4096), {
+          data_offset: 64, row_stride: 48, capacity: 8, time_offset: 0, open_offset: 8, high_offset: 16,
+          low_offset: 24, close_offset: 32, sequence_offset: 40, write_cursor_offset: 0,
+        });
+        ring[name] = "bound";
+      } catch (error) {
+        ring[name] = error.code ?? String(error);
+      }
+      handle.set_ring_source(null);
+    }
+
+    // Presentation still works on the read-only series.
+    live.volume.apply_options({ histogram_updown_rule: "previous_close" });
+    live.volume.apply_options({ color: "#336699" });
+    live.delta.apply_options({ visible: false });
+    live.cvd.apply_options({ visible: true });
+    live.candles.move_to_pane(0);
+
+    // After every refused write, a live tip equals the same tape loaded fresh.
+    for (let index = 200; index < 260; index += 1) chart.update_trade_stream_trades(live.stream, [print(index)]);
+    const fresh = build("TEST:FRESH");
+    chart.set_trade_stream_trades(fresh.stream, tape);
+    const rows = (group) => JSON.stringify({
+      candles: group.candles.data(), volume: group.volume.data(), cvd: group.cvd.data(), delta: group.delta.data(),
+    });
+    const tip_equals_fresh = rows(live) === rows(fresh);
+    const candle_count = live.candles.data().length;
+    // One series has one engine writer: a bound candle is no resampling target, and it may still
+    // rebind to another stream.
+    const plain = chart.add_series("candlestick");
+    const refusals = {};
+    try {
+      chart.configure_resampled_series(live.candles, {
+        source: plain, interval_seconds: 300, boundaries: [{ start_time: 0, end_time: 4_000_000_000, session_id: 1 }],
+      });
+      refusals.resampled_target = "configured";
+    } catch (error) {
+      refusals.resampled_target = error.code ?? String(error);
+    }
+    const other = chart.add_trade_stream("TEST:OTHER", options);
+    chart.bind_trade_bar_series_to_stream(live.candles, other);
+    console.warn = original_warn;
+    return {
+      outcomes,
+      ring,
+      warned_pop: warnings.some((text) => text.includes("pop rejected")),
+      refusals,
+      candles: candle_count,
+      tip_equals_fresh,
+    };
+  });
+
+  expect(errors).toEqual([]);
+  for (const name of ["candles", "volume", "cvd", "delta"]) {
+    const outcome = result.outcomes[name];
+    for (const [attempt, seen] of Object.entries(outcome.seen)) {
+      expect(seen, `${name} ${attempt}`).toEqual({ status: "rejected", code: "derived_series", warned: true });
+    }
+    expect(outcome.unchanged, `${name} data`).toBe(true);
+    expect(outcome.notified, `${name} data_changed`).toBe(0);
+  }
+  expect(result.ring).toEqual({ candles: "unsupported_operation", volume: "unsupported_operation" });
+  expect(result.refusals).toEqual({ resampled_target: "invalid_options" });
+  expect(result.candles).toBeGreaterThan(3);
+  expect(result.tip_equals_fresh).toBe(true);
 });
 
 test("reconfiguring a volume binding adds a trading date; self-feeding volume is refused", async ({ page }) => {

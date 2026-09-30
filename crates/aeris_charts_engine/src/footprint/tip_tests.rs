@@ -1114,6 +1114,169 @@ fn capped_delta_histogram_keeps_its_sign_palette() {
     assert_same(&tipped, &live.clean_rebuild_in_place(), "capped delta");
 }
 
+/// Trade-bound candles and the CVD, delta, and volume studies belong to their stream: every host
+/// write path is refused with its documented refusal value, and nothing they hold, nor the
+/// sequence keys every other presentation continues from, moves. A live tip afterwards still
+/// equals a clean rebuild.
+#[test]
+fn trade_derived_series_reject_every_host_write() {
+    use crate::{SeriesBarPatch, SeriesUpdateOutcome, SeriesUpdateRejection};
+    use aeris_charts_core::model::data_validation::ValidationError;
+
+    let unsupported = SeriesUpdateOutcome::Rejected(SeriesUpdateRejection::UnsupportedSeries);
+    for aggregation in [time_bars(), trade_bars()] {
+        let context = format!("{aggregation:?}");
+        let mut live = Harness::new(aggregation, None);
+        live.load(tape(0..120));
+        let ordinary = live.chart.add_series(SeriesKind::Candlestick);
+        assert!(!live.chart.series_is_source_owned(ordinary), "{context}");
+        assert!(
+            live.chart.series_is_source_owned(live.footprint),
+            "{context}"
+        );
+        let before = live.snapshot();
+        let key_base = live.chart.sequence_key_base(live.stream);
+        let stream_bars = live.bar_opens();
+        assert_eq!(key_base.is_some(), aggregation != time_bars(), "{context}");
+        let time = 1_800_000_000.0;
+        let seconds = 1_800_000_000;
+        let ohlc = [1.0, 2.0, 0.5, 1.5];
+        let patch = SeriesBarPatch {
+            open: None,
+            high: Some(1_000.0),
+            low: None,
+            close: Some(999.0),
+            colors: [None; 3],
+        };
+        let mut owned = vec![live.candles];
+        owned.extend(live.studies);
+        for id in owned {
+            let context = format!("{context} series {id}");
+            assert!(live.chart.series_is_source_owned(id), "{context}");
+            let held = rows(&live.chart, id).times.len();
+            let chart = &mut live.chart;
+            assert_eq!(
+                chart.set_series_data(id, &[time], &[1.0], &[2.0], &[0.5], &[1.5]),
+                Err(ValidationError::UnsupportedSeriesData(id)),
+                "{context}"
+            );
+            assert_eq!(
+                chart.set_series_data_styled(
+                    id,
+                    &[time],
+                    &[1.0],
+                    &[2.0],
+                    &[0.5],
+                    &[1.5],
+                    [Some(vec![1]), None, None]
+                ),
+                Err(ValidationError::UnsupportedSeriesData(id)),
+                "{context}"
+            );
+            assert!(
+                !chart.install_series_data(
+                    id,
+                    vec![seconds],
+                    vec![1.0],
+                    vec![2.0],
+                    vec![0.5],
+                    vec![1.5]
+                ),
+                "{context}"
+            );
+            assert!(!chart.update_series_bar(id, time, ohlc), "{context}");
+            assert!(
+                !chart.update_series_bar_styled(id, time, ohlc, [Some(1), None, None]),
+                "{context}"
+            );
+            assert_eq!(chart.update_series_bars(id, [(time, ohlc)]), 0, "{context}");
+            assert_eq!(
+                chart.update_series_bars_sanitized(
+                    id,
+                    vec![seconds],
+                    vec![1.0],
+                    vec![2.0],
+                    vec![0.5],
+                    vec![1.5]
+                ),
+                0,
+                "{context}"
+            );
+            assert!(
+                !chart.set_series_point_colors(id, Some(vec![7; held]), None, None),
+                "{context}"
+            );
+            assert_eq!(chart.series_pop(id, 1), None, "{context}");
+            assert_eq!(
+                chart.merge_series_bar(id, time, patch, None),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(
+                chart.merge_series_bars(id, &[(time, patch)], Some(7)),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(
+                chart.update_series_bar_sequenced(id, time, ohlc, [None; 3], Some(7)),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(
+                chart.update_series_bars_sanitized_sequenced(
+                    id,
+                    vec![seconds],
+                    vec![1.0],
+                    vec![2.0],
+                    vec![0.5],
+                    vec![1.5],
+                    Some(7)
+                ),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(chart.series_update_sequence(id), None, "{context}");
+        }
+        assert!(
+            !live.chart.apply_momentum_histogram_colors(live.studies[3]),
+            "{context}"
+        );
+        assert_same(&live.snapshot(), &before, &context);
+        assert_eq!(live.chart.sequence_key_base(live.stream), key_base);
+        assert_eq!(live.bar_opens(), stream_bars, "{context}");
+
+        // The stream still feeds every presentation after the refused writes.
+        live.tip(tape(120..140));
+        let tipped = live.snapshot();
+        assert_same(&tipped, &live.clean_rebuild_in_place(), &context);
+        let mut fresh = Harness::new(aggregation, None);
+        fresh.load(tape(0..140));
+        assert_same(&tipped, &fresh.snapshot(), &context);
+    }
+}
+
+/// A trade-bound candle converted to another chart type stays fed by its stream on both axes: the
+/// tip still equals a clean rebuild and no sequence-axis writer assumes it is still a candle.
+#[test]
+fn converted_trade_bound_candles_keep_following_their_stream() {
+    for aggregation in [time_bars(), trade_bars()] {
+        for kind in [SeriesKind::Line, SeriesKind::Area, SeriesKind::Histogram] {
+            let context = format!("{aggregation:?} {kind:?}");
+            let mut live = Harness::new(aggregation, None);
+            live.load(tape(0..60));
+            live.chart.convert_series_kind(live.candles, kind);
+            assert_eq!(live.chart.series_kind(live.candles), Some(kind));
+            assert!(live.chart.series_is_source_owned(live.candles), "{context}");
+            for index in 60..100 {
+                live.tip(vec![tape_trade(index)]);
+            }
+            live.tip(tape(100..140));
+            let tipped = live.snapshot();
+            assert_same(&tipped, &live.clean_rebuild_in_place(), &context);
+        }
+    }
+}
+
 /// Tips into an empty stream, and retention ceilings of one bar (every new bar evicts one) and zero
 /// bars (every trim clears the stream), stay equal to an in-place clean rebuild on both axes.
 #[test]
