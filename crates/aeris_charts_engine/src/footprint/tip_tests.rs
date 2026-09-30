@@ -688,6 +688,83 @@ fn retained_live_tip_work_is_bounded_including_retention_trims() {
     }
 }
 
+/// One retention is one data-layer transaction: every presentation of the stream (footprint,
+/// bound candles, five studies) leaves the shared time axis in a single union rebuild plus a single
+/// reindex, not one pair per presentation. The tips that are not trims never rebuild at all.
+#[test]
+fn retention_trim_runs_one_union_rebuild_for_every_presentation() {
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut live = Harness::new(aggregation, Some(96));
+        live.load(tape(0..1_500));
+        let mut trims = 0;
+        for index in 1_500..2_700 {
+            let before = live.first_bar_open();
+            let work = tip_work(&mut live, vec![tape_trade(index)]);
+            if live.first_bar_open() != before {
+                trims += 1;
+                assert_eq!(
+                    work.index_rebuilds, 2,
+                    "{aggregation:?} trim tip {index}: one union rebuild and one reindex"
+                );
+            }
+        }
+        assert!(trims >= 3, "the scenario crosses the ceiling: {trims}");
+        assert_same(
+            &live.snapshot(),
+            &live.clean_rebuild_in_place(),
+            "after retained tips",
+        );
+    }
+}
+
+/// Every point's `(index, weight)` of the marks a clean rebuild gives the chart's current axis.
+fn clean_tick_marks(
+    chart: &ChartEngine,
+) -> Vec<aeris_charts_core::scale::time_tick_marks::TickMark> {
+    use aeris_charts_core::scale::time_tick_marks::{fill_weights_for_points_in, TimeTickMarks};
+    let times = chart.sequence_points().map_or_else(
+        || chart.data_layer().merged_times().to_vec(),
+        |points| {
+            points
+                .iter()
+                .map(|point| point.open_timestamp_micros.div_euclid(1_000_000))
+                .collect()
+        },
+    );
+    let mut weights = vec![0u8; times.len()];
+    fill_weights_for_points_in(&times, &mut weights, 0, &chart.exchange_time);
+    let mut marks = TimeTickMarks::new();
+    marks.set_weights(&weights);
+    // A spacing wider than the label keeps every point, so the marks carry every weight.
+    marks.build(1_000.0, 10.0).to_vec()
+}
+
+/// A retention trim re-weighs the axis: the marks after a trimming tip, on a time axis by dropping
+/// the evicted points and re-weighing only the first, equal a clean rebuild of the retained axis.
+#[test]
+fn retention_trims_leave_the_axis_weights_of_a_clean_rebuild() {
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut live = Harness::new(aggregation, Some(96));
+        live.load(tape(0..1_500));
+        let mut trims = 0;
+        for index in 1_500..2_700 {
+            let before = live.first_bar_open();
+            live.tip(vec![tape_trade(index)]);
+            if live.first_bar_open() == before {
+                continue;
+            }
+            trims += 1;
+            let marks = live.chart.tick_marks.build(1_000.0, 10.0).to_vec();
+            assert_eq!(
+                marks,
+                clean_tick_marks(&live.chart),
+                "{aggregation:?} trim tip {index}"
+            );
+        }
+        assert!(trims >= 3, "the scenario crosses the ceiling: {trims}");
+    }
+}
+
 /// A refold over a long tape materializes only the retained markers, so the series never holds
 /// capacity for every qualifying print it folded past.
 #[test]
@@ -1090,6 +1167,69 @@ fn replay_seeks_and_tips_under_retention_match_a_clean_rebuild() {
                 },
                 "{aggregation:?}"
             );
+        }
+    }
+}
+
+/// A retention trim counts the rows a series exposes up to the data layer's replay cutoff, yet drops
+/// the same leading bars from every presentation and keeps the rows past the cutoff in all of
+/// them, in one data-layer transaction: what remains is the tail of the unretained chart.
+#[test]
+fn retention_trim_keeps_the_rows_past_the_cutoff_in_every_presentation() {
+    const KEEP: usize = 30;
+    const HIDDEN: usize = 10;
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut live = Harness::new(aggregation, None);
+        let mut unretained = Harness::new(aggregation, None);
+        live.load(tape(0..1_200));
+        unretained.load(tape(0..1_200));
+        let reference = unretained.snapshot();
+        let bars = reference.bars.len();
+        assert!(bars > KEEP + HIDDEN);
+        // Hide the newest rows of every presentation, as a replay clock behind the last bars does.
+        let cutoff = reference.footprint.times[bars - HIDDEN - 1];
+        live.chart.data.set_time_cutoff(Some(cutoff));
+        let rebuilds = live.chart.data_layer().index_rebuilds();
+        assert!(live.chart.set_series_max_points(live.footprint, Some(KEEP)));
+        assert_eq!(
+            live.chart.data_layer().index_rebuilds() - rebuilds,
+            2,
+            "{aggregation:?}: one union rebuild and one reindex"
+        );
+        let presentations = [live.footprint, live.candles]
+            .into_iter()
+            .chain(live.studies);
+        for id in presentations {
+            let data = live.chart.data_layer();
+            assert_eq!(data.series_rows(id), Some(KEEP), "{aggregation:?} {id}");
+            let exposed = data.series_data(id).unwrap().0.len();
+            assert_eq!(
+                exposed,
+                KEEP - HIDDEN,
+                "{aggregation:?} {id}: rows past the cutoff"
+            );
+        }
+        live.chart.data.set_time_cutoff(None);
+        let retained = live.snapshot();
+        let tail = |rows: &Rows| Rows {
+            times: rows.times[bars - KEEP..].to_vec(),
+            values: rows.values[bars - KEEP..].to_vec(),
+            colors: rows.colors[bars - KEEP..].to_vec(),
+        };
+        assert_eq!(
+            retained.footprint,
+            tail(&reference.footprint),
+            "{aggregation:?}"
+        );
+        assert_eq!(
+            retained.candles,
+            tail(&reference.candles),
+            "{aggregation:?}"
+        );
+        for (study, (retained, reference)) in
+            retained.studies.iter().zip(&reference.studies).enumerate()
+        {
+            assert_eq!(*retained, tail(reference), "{aggregation:?} study {study}");
         }
     }
 }

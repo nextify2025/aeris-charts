@@ -162,13 +162,26 @@ pub fn fill_weights_for_points_in(
     }
 
     if start_index == 0 && times.len() > 1 {
-        // guess a weight for the first point: pretend the previous point was the average
-        // time diff back in history
-        let average_time_diff =
-            ((total_time_diff as f64) / (times.len() as f64 - 1.0)).ceil() as i64;
-        let approx_prev = times[0] - average_time_diff;
-        weights[0] = weight_by_time_in(times[0], approx_prev, time) as u8;
+        weights[0] = first_point_weight_in(times[0], total_time_diff, times.len(), time);
     }
+}
+
+/// The guessed weight of the first of `len > 1` points spanning `span` seconds: pretend the
+/// previous point was the average time diff back in history.
+pub fn first_point_weight_in(first: i64, span: i64, len: usize, time: &ExchangeTime) -> u8 {
+    let average_time_diff = ((span as f64) / (len as f64 - 1.0)).ceil() as i64;
+    weight_by_time_in(first, first - average_time_diff, time) as u8
+}
+
+/// `Some(k)` when `new` is `old` without its first `k >= 1` points, followed by any later points:
+/// every surviving point keeps its timestamp, and with it the weight it was given against its
+/// predecessor. Both sequences are ascending.
+pub fn front_trim(old: &[i64], new: &[i64]) -> Option<usize> {
+    let first = *new.first()?;
+    let dropped = old.partition_point(|&time| time < first);
+    let survivors = old.get(dropped..)?;
+    (dropped > 0 && survivors.first() == Some(&first) && new.starts_with(survivors))
+        .then_some(dropped)
 }
 
 /// A selectable tick mark: time-point index + weight.
@@ -227,6 +240,24 @@ impl TimeTickMarks {
                 .or_default()
                 .push(index as TimePointIndex);
         }
+    }
+
+    /// Drop the first `dropped` points: every other point keeps its weight at an index lowered by
+    /// `dropped`, and the point that becomes the first takes `first_weight` (it has no
+    /// predecessor, so it is guessed). Equals [`Self::set_weights`] over the surviving weights
+    /// without re-weighing any point.
+    pub fn drop_front(&mut self, dropped: usize, first_weight: u8) {
+        self.cache = None;
+        let first = dropped as TimePointIndex;
+        self.marks_by_weight.retain(|_, indices| {
+            indices.drain(..indices.partition_point(|&index| index <= first));
+            indices.iter_mut().for_each(|index| *index -= first);
+            !indices.is_empty()
+        });
+        self.marks_by_weight
+            .entry(first_weight)
+            .or_default()
+            .insert(0, 0);
     }
 
     /// Append weights for newly-added points without rebuilding prior weight buckets.
@@ -387,6 +418,90 @@ mod tests {
         // other intraday points are hour-weighted
         assert_eq!(weights[1], TickMarkWeight::Hour1 as u8);
         assert_eq!(weights[12], TickMarkWeight::Hour12 as u8);
+    }
+
+    /// Ascending times whose gaps reach every weight: seconds, minutes, hours, days, months.
+    fn spread_times(rng: &mut u64, len: usize) -> Vec<i64> {
+        let mut next = move || {
+            *rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *rng >> 33
+        };
+        let mut time = 1_579_046_400 + (next() % 86_400) as i64;
+        (0..len)
+            .map(|_| {
+                time += match next() % 8 {
+                    0 => 1,
+                    1 => 60,
+                    2 => 300,
+                    3 => 3_600,
+                    4 => 21_600,
+                    5 => 86_400,
+                    6 => 2_678_400,
+                    _ => 1 + (next() % 7_200) as i64,
+                };
+                time
+            })
+            .collect()
+    }
+
+    fn clean_marks(times: &[i64]) -> TimeTickMarks {
+        let mut weights = vec![0u8; times.len()];
+        fill_weights_for_points(times, &mut weights, 0);
+        let mut marks = TimeTickMarks::new();
+        marks.set_weights(&weights);
+        marks
+    }
+
+    #[test]
+    fn dropping_the_front_equals_a_clean_fill_of_the_surviving_points() {
+        let mut rng = 0x2545_F491_4F6C_DD1D_u64;
+        for round in 0..200 {
+            let len = 2 + (round * 7) % 90;
+            let times = spread_times(&mut rng, len + 12);
+            let (old, new) = (&times[..len], &times[..len + 12]);
+            for dropped in [1, len / 2, len - 1] {
+                let new = &new[dropped..];
+                assert_eq!(front_trim(old, new), Some(dropped), "round {round}");
+                let mut marks = clean_marks(old);
+                let span = new[new.len() - 1] - new[0];
+                let first = first_point_weight_in(new[0], span, new.len(), &ExchangeTime::UTC);
+                marks.drop_front(dropped, first);
+                for index in len - dropped..new.len() {
+                    let weight = weight_by_time(new[index], new[index - 1]) as u8;
+                    marks.push_weight(index as TimePointIndex, weight);
+                }
+                let clean = clean_marks(new);
+                assert_eq!(
+                    marks.marks_by_weight, clean.marks_by_weight,
+                    "round {round} dropped {dropped}"
+                );
+                assert_eq!(
+                    marks.build(1_000.0, 10.0),
+                    clean_marks(new).build(1_000.0, 10.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_front_trim_is_recognized_only_when_every_survivor_keeps_its_time() {
+        let old = [10, 20, 30, 40];
+        assert_eq!(front_trim(&old, &[30, 40]), Some(2));
+        assert_eq!(front_trim(&old, &[20, 30, 40, 50, 60]), Some(1));
+        // Nothing left of the old points, nothing dropped, or an empty side.
+        assert_eq!(front_trim(&old, &[50, 60]), None);
+        assert_eq!(front_trim(&old, &old), None);
+        assert_eq!(front_trim(&old, &[10, 20, 30, 40, 50]), None);
+        assert_eq!(front_trim(&old, &[]), None);
+        assert_eq!(front_trim(&[], &[1, 2]), None);
+        // The first survivor moved, a middle point was replaced, or the tail shrank.
+        assert_eq!(front_trim(&old, &[25, 30, 40]), None);
+        assert_eq!(front_trim(&old, &[20, 35, 40]), None);
+        assert_eq!(front_trim(&old, &[20, 30]), None);
+        // One surviving point followed by new ones.
+        assert_eq!(front_trim(&old, &[40, 50, 60]), Some(3));
     }
 
     #[test]

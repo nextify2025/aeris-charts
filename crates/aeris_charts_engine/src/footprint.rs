@@ -2698,20 +2698,9 @@ impl ChartEngine {
             .trade_streams
             .get_mut(&stream_id)
             .and_then(|stream| stream.retain_last_bars(keep));
-        // Presentations drop exactly the rows keyed before the footprint's first retained row. A
-        // live tip advances the projection before its studies and candles, which may therefore
-        // still lack the bars the tip appends; trimming by key keeps them aligned where a row
-        // count would not. Every other footprint bound to the stream drops the same rows, because
-        // footprint geometry reads stream bar `i` for row `i`.
-        let first_key = self
-            .data
-            .series_data(id)
-            .and_then(|(times, _)| times.first().copied());
-        let mut presentations = self
-            .stream_presentations(stream_id)
-            .filter(|&series_id| series_id != id)
-            .collect::<Vec<_>>();
-        presentations.retain(|&series_id| self.trim_rows_before_key(series_id, first_key));
+        // Every presentation leaves the data layer in one transaction, before the sidecar and
+        // bubble eviction below read the first retained row key from it.
+        let presentations = self.trim_stream_rows_front(id, stream_id, keep);
         let sequence_owner = self.trade_stream(stream_id).is_some_and(|stream| {
             !matches!(stream.options().bars, FootprintBarAggregation::Time { .. })
         });
@@ -2791,24 +2780,55 @@ impl ChartEngine {
         }
     }
 
-    /// Drop a stream presentation's rows keyed before `first_key` (every row when `None`).
-    /// Returns whether any row left.
-    fn trim_rows_before_key(&mut self, series_id: SeriesId, first_key: Option<i64>) -> bool {
-        let Some((times, _)) = self.data.series_data(series_id) else {
-            return false;
-        };
-        let evicted =
-            first_key.map_or(times.len(), |key| times.partition_point(|&time| time < key));
-        if evicted > 0 {
-            let rows = self
-                .data
-                .series_memory_usage(series_id)
-                .map_or(0, |usage| usage.rows);
-            self.data
-                .trim_front(series_id, rows.saturating_sub(evicted));
+    /// Drop the footprint `id`'s oldest rows down to `keep` and, from every other presentation of
+    /// its stream, the rows keyed before the footprint's first retained row, as one data-layer
+    /// transaction: the shared time axis and every plot index rebuild once, not once per
+    /// presentation. A live tip advances the projection before its studies and candles, which may
+    /// therefore still lack the bars the tip appends; trimming by key keeps them aligned where a
+    /// row count would not. Every other footprint bound to the stream drops the same rows, because
+    /// footprint geometry reads stream bar `i` for row `i`. Returns the presentations that lost
+    /// rows.
+    ///
+    /// Counts come from the rows each series exposes (up to the replay clock), so rows past the
+    /// clock survive; the footprint's own trim does not depend on its stream existing.
+    fn trim_stream_rows_front(
+        &mut self,
+        id: SeriesId,
+        stream_id: u64,
+        keep: usize,
+    ) -> Vec<SeriesId> {
+        let drop = self
+            .data
+            .series_rows(id)
+            .map_or(0, |rows| rows.saturating_sub(keep));
+        // The first row the footprint exposes after the trim (`None`: none is left to expose).
+        let first_key = self
+            .data
+            .series_data(id)
+            .and_then(|(times, _)| times.get(drop).copied());
+        let mut presentations = self
+            .stream_presentations(stream_id)
+            .filter(|&series_id| series_id != id)
+            .collect::<Vec<_>>();
+        let mut trims = Vec::with_capacity(presentations.len() + 1);
+        trims.push((id, keep));
+        presentations.retain(|&series_id| {
+            let Some((times, _)) = self.data.series_data(series_id) else {
+                return false;
+            };
+            let evicted =
+                first_key.map_or(times.len(), |key| times.partition_point(|&time| time < key));
+            if evicted > 0 {
+                let rows = self.data.series_rows(series_id).unwrap_or(0);
+                trims.push((series_id, rows.saturating_sub(evicted)));
+            }
+            evicted > 0
+        });
+        self.data.trim_fronts(&trims);
+        for &series_id in &presentations {
             self.invalidate_frame_series(series_id);
         }
-        evicted > 0
+        presentations
     }
 
     pub(crate) fn trade_stream(&self, stream_id: u64) -> Option<&FootprintAggregator> {

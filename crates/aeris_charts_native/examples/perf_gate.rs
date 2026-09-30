@@ -775,14 +775,24 @@ fn main() {
         .historical_rebuilds;
     let mut tip_samples = Vec::with_capacity(tip_trades.len());
     let mut tip_trims = 0u64;
+    // The retention trim tip: its time, and the timestamp-union rebuild and reindex passes the
+    // whole data layer ran for it (one union merge and one reindex for every presentation).
+    let mut trim_tip_ms = 0.0f64;
+    let mut trim_tip_passes = Vec::new();
     for trade in tip_trades {
         let first_key = first_row_key(&footprint);
+        let passes_before = footprint.data_layer().index_rebuilds();
         let start = Instant::now();
         footprint
             .update_footprint_trades(0, vec![trade])
             .expect("valid footprint tip");
-        tip_samples.push(start.elapsed().as_secs_f64() * 1000.0);
-        tip_trims += u64::from(first_row_key(&footprint) != first_key);
+        let tip_ms = start.elapsed().as_secs_f64() * 1000.0;
+        tip_samples.push(tip_ms);
+        if first_row_key(&footprint) != first_key {
+            tip_trims += 1;
+            trim_tip_ms = trim_tip_ms.max(tip_ms);
+            trim_tip_passes.push(footprint.data_layer().index_rebuilds() - passes_before);
+        }
     }
     let tip_work = footprint
         .trade_stream_stats(footprint_stream)
@@ -800,7 +810,7 @@ fn main() {
     let tip_bubble_trades = tip_work.bubble_trades_scanned - tip_work_before.bubble_trades_scanned;
     let tip_bubble_sizes = tip_work.bubble_markers_sized - tip_work_before.bubble_markers_sized;
     println!(
-        "  live tips: {tip_count} single-trade tips, {tip_trims} retention trim(s), {tip_rebuilds} tape reconstruction(s); p50 {:.4} ms, max {:.2} ms; per tip {:.2} study rows, {:.2} bar rows, {:.2} bubble trades, {:.2} bubble sizes",
+        "  live tips: {tip_count} single-trade tips, {tip_trims} retention trim(s) (slowest {trim_tip_ms:.2} ms, {trim_tip_passes:?} union passes), {tip_rebuilds} tape reconstruction(s); p50 {:.4} ms, max {:.2} ms; per tip {:.2} study rows, {:.2} bar rows, {:.2} bubble trades, {:.2} bubble sizes",
         tip_percentile(0.5),
         tip_percentile(1.0),
         tip_study_rows as f64 / tip_count as f64,
@@ -810,12 +820,14 @@ fn main() {
     );
     // CVD and delta each recompute the changed suffix (the active bar, plus the bar a tip opens);
     // the footprint and bound candles project the same suffix; bubbles fold each new trade exactly
-    // once, also across the retention trim, and nothing reconstructs the retained tape.
+    // once, also across the retention trim, and nothing reconstructs the retained tape. A trim
+    // runs one union merge and one reindex for all of its presentations, however many there are.
     let d_tip_work_pass = tip_study_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
         && tip_bar_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
         && tip_bubble_trades == tip_count
         && tip_rebuilds == 0
-        && tip_trims >= 1;
+        && tip_trims >= 1
+        && trim_tip_passes.iter().all(|&passes| passes == 2);
     println!(
         "  [{}] tip work bounded by the changed suffix and the new trade",
         if d_tip_work_pass { "PASS" } else { "FAIL" }

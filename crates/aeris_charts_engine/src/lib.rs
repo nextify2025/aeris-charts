@@ -263,7 +263,7 @@ pub use aeris_charts_core::scale::session_slots::{
     session_window_bounds, OutOfSessionPolicy, SessionBarGrid,
 };
 use aeris_charts_core::scale::time_scale_core::{TimeScaleCore, TimeScaleOptions};
-use aeris_charts_core::scale::time_tick_marks::TimeTickMarks;
+use aeris_charts_core::scale::time_tick_marks::{self, TimeTickMarks};
 use aeris_charts_core::TimePointIndex;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType};
@@ -4184,14 +4184,16 @@ impl ChartEngine {
         let footprint = self
             .series_entry(id)
             .is_some_and(|series| series.footprint.is_some());
-        let hidden = if footprint {
-            0
+        if footprint {
+            // The footprint's own rows leave with its stream's other presentations, in one
+            // data-layer transaction (`trim_footprint_rows_front`).
+            self.trim_feature_rows_front(id, keep);
+            self.trim_footprint_rows_front(id, keep);
         } else {
-            self.data.series_rows(id).unwrap_or(visible) - visible
-        };
-        self.data.trim_front(id, keep + hidden);
-        self.trim_feature_rows_front(id, keep + hidden);
-        self.trim_footprint_rows_front(id, keep);
+            let hidden = self.data.series_rows(id).unwrap_or(visible) - visible;
+            self.data.trim_front(id, keep + hidden);
+            self.trim_feature_rows_front(id, keep + hidden);
+        }
         true
     }
 
@@ -5144,12 +5146,48 @@ impl ChartEngine {
                 // Several non-time bars may open within one second.
                 time > last || (sequence.is_some() && time == last)
             });
+        // A retention trim on a time axis leaves the old union's tail as the new union's head. The
+        // weights describe the union as of the last sync, which the mapping's old union extends
+        // by any points a tip appended in place before the trim rebuilt it, so the check is
+        // against that old union, not against the key mapping. A sequence axis takes its tick
+        // times from the bar sidecar, which the union does not describe, so it re-weighs everything.
+        let front_trim = merged_time_mapping
+            .as_ref()
+            .filter(|mapping| {
+                time_points_changed
+                    && sequence.is_none()
+                    && self.synced_points_len > 0
+                    && mapping.old_times().get(self.synced_points_len - 1).copied()
+                        == self.synced_last_time
+            })
+            .and_then(|mapping| time_tick_marks::front_trim(mapping.old_times(), times))
+            .filter(|&dropped| dropped < self.synced_points_len);
         if appended {
             for index in self.synced_points_len..tick_len {
                 let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time_in(
                     tick_time(index),
                     tick_time(index - 1),
                     &self.exchange_time,
+                ) as u8;
+                self.tick_marks.push_weight(index as i64, weight);
+            }
+        } else if let Some(dropped) = front_trim {
+            // A retention trim on a time axis (and the points a tip appended with it): the
+            // surviving points keep their timestamps and so their weights. Only the first point,
+            // which has no predecessor, is re-weighed, then the new tail.
+            let time = &self.exchange_time;
+            let first_weight = if tick_len > 1 {
+                let span = tick_time(tick_len - 1) - tick_time(0);
+                time_tick_marks::first_point_weight_in(tick_time(0), span, tick_len, time)
+            } else {
+                0
+            };
+            self.tick_marks.drop_front(dropped, first_weight);
+            for index in self.synced_points_len - dropped..tick_len {
+                let weight = time_tick_marks::weight_by_time_in(
+                    tick_time(index),
+                    tick_time(index - 1),
+                    time,
                 ) as u8;
                 self.tick_marks.push_weight(index as i64, weight);
             }

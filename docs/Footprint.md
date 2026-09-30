@@ -187,7 +187,9 @@ result equals a clean rebuild of that dependent. The tip that crosses a retentio
 hysteresis margin, 1/32 of the cap) evicts the leading bars, exactly the trades they aggregated, and
 the bubbles made only of those trades in place: it reconstructs nothing and never scans the
 retained tape, so its work is proportional to the evicted trades plus the retained rows (renumbering
-the retained bars and the data layer's own trim of the affected rows).
+the retained bars and the data layer's own trim of the affected rows). Every presentation of the
+stream leaves the data layer in one transaction: the timestamp union merges and every plot
+reindexes once, however many presentations the stream has.
 Closed bars are immutable on the
 live path. Historical insertion/correction reconstructs canonical state once after the final tape is
 known and replaces the projection once. The current reconstruction is intentionally full-series;
@@ -252,9 +254,13 @@ construction, with retention bounded to the configured history. It then streams 
 live tips (crossing the retention ceiling once) into the chart with bound candles, CVD, delta, and
 bubbles, requires every tip's work counters to stay within the changed bar suffix and the new
 trade with no tape reconstruction, budgets the tip p99 at 0.25 ms, and budgets the slowest tip (the
-one crossing the ceiling) at one 16.67 ms frame. Commands and thresholds are kept in the release
-examples so a clean `--release` run can be compared without importing machine-specific timings into
-the repository; `perf_gate` prints the measured tip p99 and slowest tip against these budgets.
+one crossing the ceiling) at one 16.67 ms frame. The trim tip also runs exactly one union merge
+and one reindex for the whole data layer, which `perf_gate` requires alongside the work counters.
+Commands and thresholds are kept in the release examples so a clean `--release` run can be
+compared without importing machine-specific timings into the repository; `perf_gate` prints the
+measured tip p99 and slowest tip against these budgets. The `retention_perf` release example
+reports, without thresholds, the retention trim cost across series counts and retained rows, for
+the data layer alone and for a Target D shaped chart, because the trim scales with both.
 
 The finite GPUI real-window probe was also exercised on the current Windows display with the
 footprint fixture: 30 frames at DPR 1.25 and 500 source bars produced 24 cached text runs (zero
