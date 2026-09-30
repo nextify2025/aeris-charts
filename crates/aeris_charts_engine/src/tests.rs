@@ -8270,6 +8270,66 @@ fn axis_and_pane_borders_project_the_canonical_half_pixel_width() {
     }
 }
 
+/// The crosshair time label's vertical placement belongs to the shared axis builder and is keyed
+/// to the stable `Apr0` sample, never to the label's own glyphs. A host reports only that sample's
+/// ink metric, so the text sits at the same offset in the time strip for every month name (a label
+/// without descenders is not re-centred by its own ink), font, DPR and backend. Pixel probes of
+/// the painted label must therefore fix the label text rather than depend on the calendar.
+#[test]
+fn crosshair_time_text_is_placed_by_the_stable_sample_not_its_own_ink() {
+    use aeris_charts_render::draw_list::Prim;
+
+    const SAMPLE_CORRECTION: f64 = 3.5;
+    const OWN_INK_CORRECTION: f64 = 40.0;
+    let measure = |text: &str, _bold: bool| text.len() as f64 * 6.0;
+
+    for dpr in [1.0_f64, 1.25, 2.0] {
+        let mut chart = ChartEngine::new(800.0, 500.0, dpr);
+        let times: Vec<f64> = (0..10)
+            .map(|i| 1_700_000_000.0 + i as f64 * 3_600.0)
+            .collect();
+        let closes: Vec<f64> = (0..10).map(|i| 100.0 + i as f64).collect();
+        chart
+            .set_series_data(0, &times, &closes, &closes, &closes, &closes)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        chart.set_time_visible(true);
+        chart.recompute_layout_with_measure(true, measure, measure);
+        chart.build_frame();
+        let x = chart.time_scale.index_to_coordinate(5);
+        chart.set_crosshair_at(x, 100.0);
+
+        let axis = chart.build_axis_frame(80.0, measure, measure);
+        let label = axis
+            .labels
+            .iter()
+            .find(|label| label.midpoint == AxisTextMidpoint::StableTime)
+            .expect("the crosshair time label");
+        // Default 12 px layout font: 11 CSS px axis text centered below the 1 px border slot,
+        // 3 px tick allowance and 3 px padding.
+        assert_eq!(label.y, chart.pane_h + 1.0 + 3.0 + 3.0 + 11.0 / 2.0);
+
+        let mut prims = Vec::new();
+        chart.build_axis_primitives_into(&axis, &mut prims, |text| {
+            if text == "Apr0" {
+                SAMPLE_CORRECTION
+            } else {
+                OWN_INK_CORRECTION
+            }
+        });
+        let y = prims
+            .iter()
+            .find_map(|prim| match prim {
+                Prim::Text { text, y, .. } if *text == label.text => Some(*y),
+                _ => None,
+            })
+            .expect("the crosshair time text primitive");
+        let expected = ((label.y + SAMPLE_CORRECTION * label.font_scale) * dpr) as f32;
+        assert_eq!(y, expected, "text y follows the Apr0 sample at dpr {dpr}");
+    }
+}
+
 /// A hollow candle's chrome follows what is painted, not the invisible body.
 #[test]
 fn hollow_candles_keep_their_direction_color_on_the_live_price_chip() {

@@ -535,7 +535,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy -p aeris_charts_wasm --target wasm32-unknown-unknown --locked -- -D warnings
 cargo test --workspace --locked
-cargo run -p aeris_charts_native --example perf_gate --release
+AERIS_CHARTS_PERF_STRICT=1 cargo run -p aeris_charts_native --example perf_gate --release
 
 cd packages/charts
 npm ci

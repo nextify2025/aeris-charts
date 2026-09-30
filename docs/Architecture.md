@@ -1470,15 +1470,38 @@ canvases with this project's launch flags, so the pixel-parity specs run headed 
 display (`xvfb-run`). In that setup `prim-text`, `drawings`, `primitives`, `series-primitives`,
 `custom-series`, `builtin-plugins` and `canvas-primitives` pass with the default font stack, a bundled
 Roboto, and unhinted rendering alike, and the seven drawing-family parity specs pass with the default
-stack, so the demo fixtures do not pin a font. The one pixel spec that does not reproduce on Linux is
-`last-value-cluster` ("crosshair price and time glyphs stay centered"): its time-label ink offset
-measures 0 to -0.5 px against the required 1.5-4 px with the default, the Roboto, and the unhinted
-fonts alike, so a font pin does not cure it and a Windows reference run decides whether its window or
-the label placement changes.
+stack, so the demo fixtures do not pin a font.
+
+The one pixel spec that failed on Linux, `last-value-cluster` ("crosshair price and time glyphs stay
+centered"), failed because of its probe, not the label placement. The shared axis builder positions
+the crosshair time text by the host's ink metric of the stable `Apr0` sample (cap top to descender
+bottom), never by the label's own glyphs; the engine test
+`crosshair_time_text_is_placed_by_the_stable_sample_not_its_own_ink` pins that contract, so the text
+sits at the same strip offset for every month name and font. Painted `Apr0` ink lands within 0.65 px
+of the strip's text center on DejaVu Serif, Liberation Sans, Liberation Serif and FreeSans at DPR 1,
+1.25 and 2, on WebGPU and Canvas2D alike. The earlier probe measured the calendar label's ink at pure
+white, so its result depended on the month name (only some names carry a descender) and on whether
+thin descender strokes reach pure white on the host's rasterizer: it read 0 to 1 px for each of six
+month names on Linux against the required 1.5-4 px, and no font or hinting choice changed that. The spec now
+draws `Apr0` through `localization.time_formatter`, measures ink at half coverage on both backends,
+requires it within one device pixel of the strip's text center, and still checks that the calendar
+label keeps its tick space and padding. It passes on Linux; no `windows-latest` run exists yet, so
+the Windows result is unconfirmed.
+
+CI, the tag-publish workflow and the benchmark workflows install `wasm-pack` 0.15.0 with
+`cargo install wasm-pack --locked --version 0.15.0`: its bundled `wasm-opt` shapes the shipped WASM
+bytes and therefore the package size budgets. `npm run check:release-gates` fails when `ci.yml` or
+`publish.yml` installs it unpinned or at another version.
 
 `perf_gate` prints PASS/FAIL per target and exits non-zero on a failure only when
 `AERIS_CHARTS_PERF_STRICT=1` (exactly `1`, the parse the browser perf specs use; unset or `0`
 stays report-only), so the local gate line above keeps the variable to mirror CI.
+
+Known exception to the non-blocking wall-clock policy below: two `ring-source.spec.mjs` assertions
+measure wall-clock behaviour (the achieved producer rates and the 8 ms median frame cost of "frame
+cost includes a sustained 50,000 rows/s drain") and run in the required portable suite. The
+deterministic ring contracts (zero per-tick engine calls, drain per frame, overrun reporting) are
+blocking either way.
 
 The release performance gate also measures a 100,000-visible-bar volume-profile refresh through frame construction and verifies that unchanged frames retain the calculation revision. Its Target M binds every built-in indicator kind plus aggregate-input studies to one 1,000,000-row candle source and its volume series and times current-bar replacements and candle-then-volume appends through the public engine path against a 1 ms per-tick budget. Its Target N times the same live ticks, each followed by one frame, with five regression trends anchored across a 1,000,000-row source against the same budget.
 

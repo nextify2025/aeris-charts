@@ -6,6 +6,19 @@ const root = fileURLToPath(new URL("../../..", import.meta.url));
 const ci = readFileSync(`${root}/.github/workflows/ci.yml`, "utf8");
 const publish = readFileSync(`${root}/.github/workflows/publish.yml`, "utf8");
 
+// Every release-relevant build installs the same wasm-pack: its bundled wasm-opt decides the
+// shipped WASM bytes, so an unpinned or differently pinned installer moves the size budgets and
+// the published artifact without any source change. The benchmark workflows use this exact pin.
+const WASM_PACK_INSTALL = "cargo install wasm-pack --locked --version 0.15.0";
+
+function assertWasmPackPinned(source, workflow) {
+  const installs = [...source.matchAll(/- name: Install wasm-pack\r?\n\s+run: ([^\r\n]+)/g)];
+  assert.ok(installs.length > 0, `${workflow} must install wasm-pack through a named step`);
+  for (const [, command] of installs) {
+    assert.equal(command.trim(), WASM_PACK_INSTALL, `${workflow} must pin wasm-pack to the audited version`);
+  }
+}
+
 function verify(ciSource, publishSource) {
   assert.match(ciSource, /Run required portable browser suite[\s\S]*npx playwright test/,
     "portable Playwright must remain a required browser step");
@@ -19,6 +32,8 @@ function verify(ciSource, publishSource) {
     "artifact size budgets cannot continue on error");
   assert.match(ciSource, /machine-sensitive[\s\S]{0,220}continue-on-error: true/,
     "machine-calibrated evidence must remain non-authoritative");
+  assertWasmPackPinned(ciSource, "ci.yml");
+  assertWasmPackPinned(publishSource, "publish.yml");
   assert.match(publishSource, /tags: \["v\*"\]/,
     "version tags must trigger publication");
   assert.match(publishSource, /actions: read[\s\S]*contents: read[\s\S]*packages: write/,
@@ -43,6 +58,12 @@ for (const [brokenCi, brokenPublish] of [
   [ci, publish.replace("actions/workflows/ci.yml/runs", "actions/workflows/missing.yml/runs")],
   [ci, publish.replace("https://npm.pkg.github.com", "https://registry.npmjs.org")],
   [ci, publish.replace("npm publish --tag latest", "npm publish")],
+  [ci.replace(WASM_PACK_INSTALL, "cargo install wasm-pack --locked"), publish],
+  [ci.replace(WASM_PACK_INSTALL, "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh"), publish],
+  [ci.replace(WASM_PACK_INSTALL, WASM_PACK_INSTALL.replace("0.15.0", "0.14.0")), publish],
+  [ci.replaceAll("Install wasm-pack", "Install wasm toolchain"), publish],
+  [ci, publish.replace(WASM_PACK_INSTALL, "cargo install wasm-pack --locked --version 0.14.0")],
+  [ci, publish.replace(WASM_PACK_INSTALL, "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh")],
 ]) {
   assert.throws(() => verify(brokenCi, brokenPublish), "a simulated release-gate regression was not detected");
 }
