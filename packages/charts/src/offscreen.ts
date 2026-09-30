@@ -328,8 +328,10 @@ export class offscreen_chart {
    * call throws: `disposed`, `invalid_handle` or `stale_handle` for an id that names no live
    * series (even for an empty patch), `invalid_options` for a bad value or a non-object patch, and
    * `unsupported_operation` for a series without its own calendar or for any other series option,
-   * which a worker chart cannot change after creation. A worker chart has no series handles and
-   * so no `subscribe_data_changed` notification; read `visible_logical_range()` after the call.
+   * which a worker chart cannot change after creation. A call that succeeds repaints the canvas
+   * before it returns (an unchanged request too), one that throws paints nothing. A worker chart
+   * has no series handles and so no `subscribe_data_changed` notification; read
+   * `visible_logical_range()` after the call.
    */
   apply_series_options(options: offscreen_series_options, series_id = 0): void {
     this.assert_live();

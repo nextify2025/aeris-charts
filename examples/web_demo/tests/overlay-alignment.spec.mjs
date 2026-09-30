@@ -375,7 +375,7 @@ test("the alignment refusal table is refused unchanged on a main-thread series",
   expect(refusals).toEqual(ALIGNMENT_REFUSALS.map(() => ({ code: "invalid_options", unchanged: true })));
 });
 
-// One worker run feeds the three worker tests below; the handler replies once, then disposes.
+// One worker run feeds the four worker tests below; the handler replies once, then disposes.
 let update_reply = null;
 async function overlay_update_reply(page) {
   update_reply ??= await worker_reply(
@@ -409,6 +409,20 @@ test("worker charts change time_alignment after creation", async ({ page }) => {
   // reaches the engine; a real change reaches it once.
   expect(result.noop_calls).toEqual([0, 0, 0]);
   expect(result.change_calls).toEqual([1, 0]);
+});
+
+test("worker series option calls present their frame before they return", async ({ page }) => {
+  const { repaint } = await overlay_update_reply(page);
+  // The handler reads the counter and the canvas straight after each call, with no fit or render
+  // in between: [before, after a change, after an equal request, after a refusal].
+  const [before, changed, equal, refused] = repaint.frames;
+  expect(changed).toBeGreaterThan(before);
+  // The equal request is a successful call, so it repaints like every other worker mutator.
+  expect(equal).toBeGreaterThan(changed);
+  // A refusal throws before anything is applied or painted.
+  expect(refused).toBe(equal);
+  // The Canvas2D surface shows the new alignment (the overlay left the axis) as the call returns.
+  expect(repaint.pixels_changed).toBe(true);
 });
 
 test("worker alignment refusals match the main thread and change nothing", async ({ page }) => {

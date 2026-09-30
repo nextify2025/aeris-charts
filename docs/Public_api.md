@@ -406,8 +406,10 @@ it throws. It accepts only `time_alignment` and `as_of_max_staleness`: any other
 throws `unsupported_operation` naming it, and a non-object patch throws `invalid_options`. An id
 that is not a whole number in `0..=4294967295` or names no live series throws `invalid_handle`
 (`stale_handle` for a series that was removed), even for an empty patch, and a removed chart throws
-`disposed`. Worker charts have no series handle, so no `subscribe_data_changed` notification; read
-`visible_logical_range()` after the call. Rust hosts call
+`disposed`. A call that succeeds repaints the worker canvas before it returns, like the other
+worker mutations (an unchanged request too); a call that throws paints nothing. Worker charts have no
+series handle, so no `subscribe_data_changed` notification; read `visible_logical_range()` after the
+call. Rust hosts call
 `ChartEngine::set_series_time_alignment(id, TimeAlignment::AsOf { max_staleness })`. Like other
 financial series options, the setting is host-owned and not persisted.
 

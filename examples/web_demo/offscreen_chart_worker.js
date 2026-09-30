@@ -25,6 +25,15 @@ function columns(count) {
   return { times, open, high, low, close };
 }
 
+// A 32-bit FNV-1a hash of the pixels Canvas2D last painted into the fallback surface.
+function canvas_hash() {
+  const context = fallback_canvas.getContext("2d");
+  const { data } = context.getImageData(0, 0, fallback_canvas.width, fallback_canvas.height);
+  let hash = 2166136261;
+  for (let i = 0; i < data.length; i += 1) hash = Math.imul(hash ^ data[i], 16777619);
+  return hash >>> 0;
+}
+
 function state(type = "state") {
   postMessage({
     type,
@@ -207,7 +216,21 @@ self.onmessage = async (event) => {
       };
       const results = { primary, primary_range, union_range };
 
-      chart.apply_series_options({ time_alignment: "as_of" }, id);
+      // Repaint: a call presents its own frame before it returns. No fit or render follows the
+      // calls below, so a dropped repaint leaves the last frame on the canvas and the counter
+      // where it was. The pixels are read from the fallback surface, the one Canvas2D paints.
+      const presented = () => chart.frame_stats().presented_frames;
+      const frames = [presented()];
+      const pixels_before = canvas_hash();
+      chart.apply_series_options({ time_alignment: "as_of" }, id); // a change
+      frames.push(presented());
+      const pixels_after = canvas_hash();
+      chart.apply_series_options({ time_alignment: "as_of" }, id); // equal to the current values
+      frames.push(presented());
+      code_of(() => chart.apply_series_options({ as_of_max_staleness: -1 }, id)); // refused
+      frames.push(presented());
+      results.repaint = { frames, pixels_changed: pixels_after !== pixels_before };
+
       results.as_of = { range: fitted(), options: alignment() };
       chart.apply_series_options({ as_of_max_staleness: 0 }, id);
       results.staleness = alignment();
