@@ -1877,6 +1877,7 @@ mod flatten_and_fill_tests {
             0,
             "a collinear polygon encloses nothing"
         );
+        assert!(chains.is_empty(), "degenerate polygons append nothing");
     }
 
     /// A regular polygon of `count` vertices and radius 100: simple, convex, and never degenerate.
