@@ -804,7 +804,7 @@ mod tests {
         assert_eq!(pool, vec![[9.0, 9.0], [0.0, 0.0], [1.0, 1.0]]);
     }
 
-    /// A 400x100 pane at the origin.
+    /// A 400x100 pane whose top-left corner is (0, 0).
     const PANE: Rect = Rect {
         left: 0.0,
         top: 0.0,

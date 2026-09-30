@@ -1485,8 +1485,11 @@ thin descender strokes reach pure white on the host's rasterizer: it read 0 to 1
 month names on Linux against the required 1.5-4 px, and no font or hinting choice changed that. The spec now
 draws `Apr0` through `localization.time_formatter`, measures ink at half coverage on both backends,
 requires it within one device pixel of the strip's text center, and still checks that the calendar
-label keeps its tick space and padding. It passes on Linux; no `windows-latest` run exists yet, so
-the Windows result is unconfirmed.
+label keeps its tick space and padding. The one-device-pixel tolerance covers raster rounding of the
+half-coverage ink box, not a font calibration: the host's correction is the sample's own measured
+ink (`logical_midpoint_correction`, `(ascent - descent) / (2 * dpr)` against a `middle` baseline), so
+the sample's ink is centered on the strip's text center by construction for whichever font the host
+resolves.
 
 CI, the tag-publish workflow and the benchmark workflows install `wasm-pack` 0.15.0 with
 `cargo install wasm-pack --locked --version 0.15.0`: its bundled `wasm-opt` shapes the shipped WASM
@@ -1495,7 +1498,9 @@ bytes and therefore the package size budgets. `npm run check:release-gates` fail
 
 `perf_gate` prints PASS/FAIL per target and exits non-zero on a failure only when
 `AERIS_CHARTS_PERF_STRICT=1` (exactly `1`, the parse the browser perf specs use; unset or `0`
-stays report-only), so the local gate line above keeps the variable to mirror CI.
+stays report-only), so the local gate line above keeps the variable to mirror CI. The per-frame
+targets are single-window means after one warm-up frame, so run the gate on an otherwise idle
+machine: a concurrent build or browser run can fail a budget that an idle run passes.
 
 Known exception to the non-blocking wall-clock policy below: two `ring-source.spec.mjs` assertions
 measure wall-clock behaviour (the achieved producer rates and the 8 ms median frame cost of "frame

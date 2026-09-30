@@ -25,6 +25,7 @@
 //!
 //! Run: `cargo run -p aeris_charts_native --example perf_gate --release`
 
+use std::process::ExitCode;
 use std::time::Instant;
 
 use aeris_charts_engine::{
@@ -498,7 +499,17 @@ fn strict_requested(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-fn main() {
+/// The process status of a finished run: `main` returns it, so a failed target exits non-zero only
+/// when strict mode is requested and every other run (all targets passing, unset or `0`) exits zero.
+fn gate_exit(all_pass: bool, strict_value: Option<&str>) -> ExitCode {
+    if !all_pass && strict_requested(strict_value) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn main() -> ExitCode {
     const SERIES: usize = 10;
     const FRAME_BARS: usize = 50_000;
     const FRAME_BUDGET_MS: f64 = 1000.0 / 60.0;
@@ -1637,14 +1648,16 @@ fn main() {
             "SOME TARGETS FAILED"
         }
     );
-    if !all_pass && strict_requested(std::env::var("AERIS_CHARTS_PERF_STRICT").ok().as_deref()) {
-        std::process::exit(1);
-    }
+    gate_exit(
+        all_pass,
+        std::env::var("AERIS_CHARTS_PERF_STRICT").ok().as_deref(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::strict_requested;
+    use super::{gate_exit, strict_requested};
+    use std::process::ExitCode;
 
     /// Only `1` enforces, matching the browser perf specs (`=== "1"`) and the release-gate guard,
     /// which simulates a disabled gate by setting the variable to `0`.
@@ -1655,5 +1668,19 @@ mod tests {
         assert!(!strict_requested(Some("0")));
         assert!(!strict_requested(Some("")));
         assert!(!strict_requested(Some("true")));
+    }
+
+    /// `main` returns this value, so it is the process status: a failed target exits non-zero in
+    /// strict mode, and exits zero when the variable is unset or `0` (report-only) or when every
+    /// target passes.
+    #[test]
+    fn a_failed_target_exits_non_zero_only_in_strict_mode() {
+        assert_eq!(gate_exit(false, Some("1")), ExitCode::FAILURE);
+        assert_eq!(gate_exit(false, Some("0")), ExitCode::SUCCESS);
+        assert_eq!(gate_exit(false, None), ExitCode::SUCCESS);
+        assert_eq!(gate_exit(false, Some("true")), ExitCode::SUCCESS);
+        assert_eq!(gate_exit(true, Some("1")), ExitCode::SUCCESS);
+        assert_eq!(gate_exit(true, Some("0")), ExitCode::SUCCESS);
+        assert_eq!(gate_exit(true, None), ExitCode::SUCCESS);
     }
 }
