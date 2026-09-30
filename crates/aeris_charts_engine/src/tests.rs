@@ -2450,7 +2450,13 @@ fn streamed_aggregate_and_weight_inputs_match_a_fresh_install_for_every_indicato
     let mut cases = Vec::new();
     for kind in every_indicator_kind() {
         let weighted = indicator_reads_volume(&kind);
-        for input in [IndicatorInputSource::Close, IndicatorInputSource::Hlc3] {
+        for input in [
+            IndicatorInputSource::Close,
+            IndicatorInputSource::Hl2,
+            IndicatorInputSource::Hlc3,
+            IndicatorInputSource::Ohlc4,
+            IndicatorInputSource::Hlcc4,
+        ] {
             for order in orders.iter().take(if weighted { 3 } else { 1 }) {
                 cases.push((kind.clone(), input, *order, false));
             }
@@ -2557,6 +2563,114 @@ fn streamed_aggregate_and_weight_inputs_match_a_fresh_install_for_every_indicato
         tick(&mut chart, 43, 5);
         tick(&mut chart, 44, 0);
     }
+}
+
+#[test]
+fn aggregate_input_columns_keep_bounded_tail_headroom() {
+    // Four studies on a canonical input (no derived column) versus the same four on the four
+    // aggregate inputs: every other runtime capacity cancels, so the difference is the binding-
+    // private aggregate columns. Each must be resident (an O(n) rebuild per tick is the
+    // alternative), must not reallocate on the first live append, and must stay within one
+    // eighth plus a fixed floor of spare rows however the source changes.
+    const ROWS: usize = 100_000;
+    const COLUMNS: usize = 4;
+    let kinds = || {
+        [
+            IndicatorKind::Sma { period: 20 },
+            IndicatorKind::Ema {
+                period: 20,
+                seed: IndicatorSeed::Sma,
+            },
+            IndicatorKind::Rsi {
+                period: 14,
+                seed: IndicatorSeed::Sma,
+            },
+            IndicatorKind::StochasticRsi {
+                rsi_period: 14,
+                stochastic_period: 14,
+            },
+        ]
+    };
+    let aggregates = [
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ];
+    let load = |chart: &mut ChartEngine, rows: usize| {
+        let times = (0..rows).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
+        let bars = (0..rows)
+            .map(|row| swinging_bar(row, 0))
+            .collect::<Vec<_>>();
+        let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+        chart
+            .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+            .unwrap();
+    };
+    let mut canonical = ChartEngine::new(800.0, 500.0, 1.0);
+    let mut composite = ChartEngine::new(800.0, 500.0, 1.0);
+    load(&mut canonical, ROWS);
+    load(&mut composite, ROWS);
+    for (kind, input) in kinds().into_iter().zip(aggregates) {
+        assert!(!canonical
+            .add_indicator_kind_with_input(0, IndicatorInputSource::Close, kind.clone(), None)
+            .is_empty());
+        assert!(!composite
+            .add_indicator_kind_with_input(0, input, kind, None)
+            .is_empty());
+    }
+    let columns_bytes = |canonical: &ChartEngine, composite: &ChartEngine| {
+        composite
+            .memory_usage()
+            .indicator_runtime_bytes
+            .checked_sub(canonical.memory_usage().indicator_runtime_bytes)
+            .expect("aggregate studies hold at least the canonical runtime state")
+    };
+    let f64_bytes = std::mem::size_of::<f64>();
+    let bound = |rows: usize| COLUMNS * (rows + rows / 8 + 4096) * f64_bytes;
+
+    let installed = columns_bytes(&canonical, &composite);
+    assert!(
+        installed >= COLUMNS * ROWS * f64_bytes,
+        "aggregate columns are resident: {installed} bytes"
+    );
+    assert!(
+        installed <= bound(ROWS),
+        "install keeps bounded headroom: {installed} > {}",
+        bound(ROWS)
+    );
+
+    // The first live append after the bulk install derives one row into spare capacity.
+    let mut last = ROWS;
+    for chart in [&mut canonical, &mut composite] {
+        chart.update_series_bar(0, last as f64 * 60.0, swinging_bar(last, 0));
+    }
+    assert_eq!(
+        columns_bytes(&canonical, &composite),
+        installed,
+        "the first append reallocated an aggregate column"
+    );
+    for _ in 0..2_000 {
+        last += 1;
+        for chart in [&mut canonical, &mut composite] {
+            chart.update_series_bar(0, last as f64 * 60.0, swinging_bar(last, 0));
+        }
+        assert!(
+            columns_bytes(&canonical, &composite) <= bound(last + 1),
+            "append {last} outgrew the headroom bound"
+        );
+    }
+
+    // Replacing the source with far fewer rows releases the oversized columns.
+    for chart in [&mut canonical, &mut composite] {
+        load(chart, 1_000);
+    }
+    let replaced = columns_bytes(&canonical, &composite);
+    assert!(
+        replaced >= COLUMNS * 1_000 * f64_bytes && replaced <= bound(1_000),
+        "data replacement kept {replaced} bytes of aggregate columns (bound {})",
+        bound(1_000)
+    );
 }
 
 #[test]

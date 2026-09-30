@@ -16,7 +16,8 @@
 //!   Target I — 100k-row numeric error bars frame, hit interaction, and retained memory
 //!   Target K — 100x replay clock advance, shared projections, frame work, and flat retained memory
 //!   Target L — sustained depth updates, bounded heatmap frame work, and live-edge upload size
-//!   Target M — per-tick cost of every built-in indicator bound to a 1M-row source
+//!   Target M — per-tick cost of every built-in indicator bound to a 1M-row source, and the
+//!              bounded capacity of the aggregate price columns composite-input studies retain
 //!   Target N — live ticks plus frame construction with regression trends anchored across a
 //!              1M-row source (data-reading drawings follow ticks by the changed rows)
 //!
@@ -79,6 +80,14 @@ fn report_bytes(label: &str, measured_bytes: usize, budget_bytes: usize) -> bool
         if pass { "PASS" } else { "FAIL" },
         measured_bytes as f64 / (1024.0 * 1024.0),
         budget_bytes as f64 / (1024.0 * 1024.0),
+    );
+    pass
+}
+
+fn report_check(label: &str, pass: bool, detail: &str) -> bool {
+    println!(
+        "  [{}] {label}: {detail}",
+        if pass { "PASS" } else { "FAIL" }
     );
     pass
 }
@@ -195,8 +204,19 @@ struct IndicatorTickCost {
     append_ms: (f64, f64, f64),
     /// The excluded first append after the bulk install.
     first_append_ms: f64,
+    /// Capacity the first append grew across the engine's data columns and indicator runtimes.
+    first_append_growth_bytes: usize,
     /// Largest `last_indicator_work_rows` any measured tick reported.
     max_work_rows: usize,
+}
+
+/// Deterministic `[open, high, low, close]` for `row`; `revision` moves the close so a tick
+/// replacing the forming bar changes its values.
+fn indicator_bar(row: usize, revision: usize) -> [f64; 4] {
+    let base = 100.0 + (row as f64 * 0.0007).sin() * 12.0 + (row as f64 * 0.013).sin() * 1.5;
+    let close = base + revision as f64 * 0.01;
+    let open = base - (row as f64 * 0.31).cos() * 0.4;
+    [open, open.max(close) + 0.35, open.min(close) - 0.3, close]
 }
 
 /// Target M: bind every built-in study kind (plus aggregate-input studies) to one `rows`-row
@@ -213,12 +233,6 @@ fn indicator_tick_cost(
         VwapReset,
     };
 
-    let bar = |row: usize, revision: usize| {
-        let base = 100.0 + (row as f64 * 0.0007).sin() * 12.0 + (row as f64 * 0.013).sin() * 1.5;
-        let close = base + revision as f64 * 0.01;
-        let open = base - (row as f64 * 0.31).cos() * 0.4;
-        [open, open.max(close) + 0.35, open.min(close) - 0.3, close]
-    };
     let volume_at = |row: usize, revision: usize| ((row * 37 + revision) % 900 + 100) as f64;
     // `slots` trailing whitespace rows model a pre-installed session: ticks then fill them in
     // place instead of appending.
@@ -228,7 +242,7 @@ fn indicator_tick_cost(
     for row in 0..rows + slots {
         times.push(row as f64 * 60.0);
         let (values, volume_value) = if row < rows {
-            (bar(row, 0), volume_at(row, 0))
+            (indicator_bar(row, 0), volume_at(row, 0))
         } else {
             ([f64::NAN; 4], f64::NAN)
         };
@@ -385,10 +399,15 @@ fn indicator_tick_cost(
     // (source, volume, and each study output) once. That amortized capacity growth is not per-tick
     // work, so it is reported separately and excluded from the tick statistics.
     let mut last = rows;
+    let before = chart.memory_usage();
     let started = Instant::now();
-    chart.update_series_bar(0, last as f64 * 60.0, bar(last, 0));
+    chart.update_series_bar(0, last as f64 * 60.0, indicator_bar(last, 0));
     chart.update_series_bar(volume, last as f64 * 60.0, [volume_at(last, 0); 4]);
     let first_append_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let after = chart.memory_usage();
+    let first_append_growth_bytes = (after.data.allocated_capacity_bytes
+        + after.indicator_runtime_bytes)
+        .saturating_sub(before.data.allocated_capacity_bytes + before.indicator_runtime_bytes);
 
     let mut replace_ms = Vec::new();
     let mut append_ms = Vec::new();
@@ -397,7 +416,7 @@ fn indicator_tick_cost(
         for revision in 1..=replaces_per_append {
             let time = last as f64 * 60.0;
             let started = Instant::now();
-            chart.update_series_bar(0, time, bar(last, revision));
+            chart.update_series_bar(0, time, indicator_bar(last, revision));
             let volume_value = volume_at(last, revision);
             chart.update_series_bar(volume, time, [volume_value; 4]);
             replace_ms.push(started.elapsed().as_secs_f64() * 1000.0);
@@ -406,7 +425,7 @@ fn indicator_tick_cost(
         last += 1;
         let time = last as f64 * 60.0;
         let started = Instant::now();
-        chart.update_series_bar(0, time, bar(last, 0));
+        chart.update_series_bar(0, time, indicator_bar(last, 0));
         chart.update_series_bar(volume, time, [volume_at(last, 0); 4]);
         append_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
@@ -421,7 +440,106 @@ fn indicator_tick_cost(
         replace_ms: summary(replace_ms),
         append_ms: summary(append_ms),
         first_append_ms,
+        first_append_growth_bytes,
         max_work_rows,
+    }
+}
+
+/// What Target M measures for studies on aggregate price inputs: the capacity their binding-private
+/// price columns hold, as a difference of indicator runtime bytes against the same studies on a
+/// canonical input.
+struct CompositeInputCost {
+    /// Composite minus canonical runtime bytes after the install, after the first append, and
+    /// after the remaining appends.
+    install_bytes: usize,
+    first_append_bytes: usize,
+    final_bytes: usize,
+    /// First append after the install for the canonical and the composite chart (context only).
+    first_append_ms: (f64, f64),
+    /// Mean milliseconds per append after the first, on the composite chart.
+    append_mean_ms: f64,
+}
+
+/// Target M (composite inputs): four studies on `rows` minute candles with no volume series, once
+/// each on Close and once each on Hl2, Hlc3, Ohlc4 and Hlcc4. The two charts carry the same runtime
+/// state except the aggregate price columns, so the byte difference is exactly those columns and
+/// is deterministic where first-append time on a shared machine is not. Charts are built and
+/// dropped one at a time to bound peak memory.
+fn composite_input_cost(rows: usize, appends: usize) -> CompositeInputCost {
+    use aeris_charts_engine::{IndicatorInputSource, IndicatorKind, IndicatorSeed};
+
+    let run = |inputs: [IndicatorInputSource; 4]| {
+        let mut times = Vec::with_capacity(rows);
+        let mut columns: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
+        for row in 0..rows {
+            times.push(row as f64 * 60.0);
+            for (column, value) in columns.iter_mut().zip(indicator_bar(row, 0)) {
+                column.push(value);
+            }
+        }
+        let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+        chart
+            .set_series_data(
+                0,
+                &times,
+                &columns[0],
+                &columns[1],
+                &columns[2],
+                &columns[3],
+            )
+            .expect("valid indicator source");
+        let kinds = [
+            IndicatorKind::Sma { period: 20 },
+            IndicatorKind::Ema {
+                period: 20,
+                seed: IndicatorSeed::Sma,
+            },
+            IndicatorKind::Rsi {
+                period: 14,
+                seed: IndicatorSeed::Sma,
+            },
+            IndicatorKind::StochasticRsi {
+                rsi_period: 14,
+                stochastic_period: 14,
+            },
+        ];
+        for (kind, input) in kinds.into_iter().zip(inputs) {
+            assert!(!chart
+                .add_indicator_kind_with_input(0, input, kind, None)
+                .is_empty());
+        }
+        let runtime_bytes = |chart: &ChartEngine| chart.memory_usage().indicator_runtime_bytes;
+        let install = runtime_bytes(&chart);
+        let started = Instant::now();
+        chart.update_series_bar(0, rows as f64 * 60.0, indicator_bar(rows, 0));
+        let first_append_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let first_append = runtime_bytes(&chart);
+        let mut append_ms = 0.0;
+        for row in rows + 1..=rows + appends {
+            let started = Instant::now();
+            chart.update_series_bar(0, row as f64 * 60.0, indicator_bar(row, 0));
+            append_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        (
+            [install, first_append, runtime_bytes(&chart)],
+            first_append_ms,
+            append_ms / appends as f64,
+        )
+    };
+    let (canonical, canonical_first_ms, _) = run([IndicatorInputSource::Close; 4]);
+    let (composite, composite_first_ms, append_mean_ms) = run([
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ]);
+    let delta = |index: usize| composite[index].saturating_sub(canonical[index]);
+    CompositeInputCost {
+        install_bytes: delta(0),
+        first_append_bytes: delta(1),
+        final_bytes: delta(2),
+        first_append_ms: (canonical_first_ms, composite_first_ms),
+        append_mean_ms,
     }
 }
 
@@ -1623,8 +1741,11 @@ fn main() {
     // burst of ticks inside one frame with most of its 16.67 ms left for frame construction.
     let tick_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 0, 4, INDICATOR_TICK_APPENDS);
     println!(
-        "Target M — per-tick indicator cost, {} bindings over {INDICATOR_TICK_ROWS} rows (max {} work rows per tick; first append after install {:.2} ms):",
-        tick_cost.bindings, tick_cost.max_work_rows, tick_cost.first_append_ms
+        "Target M — per-tick indicator cost, {} bindings over {INDICATOR_TICK_ROWS} rows (max {} work rows per tick; first append after install {:.2} ms, growing {:.2} MiB of column capacity):",
+        tick_cost.bindings,
+        tick_cost.max_work_rows,
+        tick_cost.first_append_ms,
+        tick_cost.first_append_growth_bytes as f64 / (1024.0 * 1024.0),
     );
     let (replace_mean, replace_median, replace_max) = tick_cost.replace_ms;
     let m_replace = report(
@@ -1662,6 +1783,56 @@ fn main() {
             "next-slot fill mean (median {slot_fill_median:.3} ms, max {slot_fill_max:.2} ms)"
         ),
         slot_fill_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+
+    // Aggregate-input studies keep one derived price column each. It must be resident (re-deriving
+    // the source per tick would be O(rows)), and it must carry bounded spare capacity so the first
+    // append after a bulk install does not reallocate it and later growth stays within one eighth
+    // plus a fixed floor of rows. The capacity is counted exactly, so these byte gates are not
+    // noise-sensitive; the times are context.
+    const COMPOSITE_COLUMNS: usize = 4;
+    let composite = composite_input_cost(INDICATOR_TICK_ROWS, INDICATOR_TICK_APPENDS);
+    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+    let resident_floor = COMPOSITE_COLUMNS * INDICATOR_TICK_ROWS * std::mem::size_of::<f64>();
+    let headroom_bound = COMPOSITE_COLUMNS
+        * (INDICATOR_TICK_ROWS + INDICATOR_TICK_ROWS / 8 + 4096)
+        * std::mem::size_of::<f64>();
+    println!(
+        "Target M (composite inputs) — {COMPOSITE_COLUMNS} studies on hl2/hlc3/ohlc4/hlcc4 versus close over {INDICATOR_TICK_ROWS} rows (first append {:.2} ms canonical, {:.2} ms composite; context only):",
+        composite.first_append_ms.0, composite.first_append_ms.1
+    );
+    let m_composite_resident = report_check(
+        "price columns are resident after install",
+        composite.install_bytes >= resident_floor,
+        &format!(
+            "{:.2} MiB (floor {:.2} MiB)",
+            mib(composite.install_bytes),
+            mib(resident_floor)
+        ),
+    );
+    let m_composite_install = report_bytes(
+        "price columns after install",
+        composite.install_bytes,
+        headroom_bound,
+    );
+    let m_composite_first = report_check(
+        "first append does not grow the price columns",
+        composite.first_append_bytes == composite.install_bytes,
+        &format!(
+            "{:.2} MiB -> {:.2} MiB",
+            mib(composite.install_bytes),
+            mib(composite.first_append_bytes)
+        ),
+    );
+    let m_composite_final = report_bytes(
+        &format!("price columns after {INDICATOR_TICK_APPENDS} more appends"),
+        composite.final_bytes,
+        headroom_bound,
+    );
+    let m_composite_append = report(
+        "composite new-bar append mean",
+        composite.append_mean_ms,
         INDICATOR_TICK_BUDGET_MS,
     );
 
@@ -1708,6 +1879,11 @@ fn main() {
         && m_append
         && m_slot_replace
         && m_slot_fill
+        && m_composite_resident
+        && m_composite_install
+        && m_composite_first
+        && m_composite_final
+        && m_composite_append
         && n_tick;
     println!(
         "\n{}",
