@@ -95,8 +95,12 @@ pub struct IndicatorSchema {
 
 pub const INDICATOR_SCHEMA_REVISION: u32 = 2;
 
+// `remote = "Self"` makes serde emit the derived bodies as inherent functions, so the trait impls below can
+// keep the large internally tagged `Deserialize` body out of line. Without that, every call path
+// (`from_value` on one side, a struct field through `PhantomData` on the other) carried its own inlined
+// copy of the roughly 110 KB body in the shipped WASM.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", remote = "Self")]
 pub enum IndicatorKind {
     Sma {
         period: usize,
@@ -229,6 +233,19 @@ pub enum IndicatorKind {
         #[serde(default)]
         seed: aeris_charts_indicators::KdjSeed,
     },
+}
+
+impl serde::Serialize for IndicatorKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IndicatorKind {
+    #[inline(never)]
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::deserialize(deserializer)
+    }
 }
 
 fn default_histogram_multiplier() -> f64 {

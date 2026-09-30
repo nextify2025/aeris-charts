@@ -2375,6 +2375,43 @@ fn every_indicator_kind() -> Vec<IndicatorKind> {
     ]
 }
 
+/// `IndicatorKind` keeps its large internally tagged serde bodies out of line (see the enum), so every
+/// entry point that used to carry its own copy must still agree on one JSON contract.
+#[test]
+fn indicator_kind_json_contract_is_identical_across_every_deserialization_path() {
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        kind: IndicatorKind,
+    }
+    for kind in every_indicator_kind() {
+        let value = serde_json::to_value(&kind).expect("kind serializes");
+        assert!(value["kind"].is_string(), "{kind:?} is internally tagged");
+        assert_eq!(
+            serde_json::from_value::<IndicatorKind>(value.clone()).expect("from_value"),
+            kind
+        );
+        assert_eq!(
+            serde_json::from_str::<IndicatorKind>(&value.to_string()).expect("from_str"),
+            kind
+        );
+        let held = serde_json::from_value::<Holder>(serde_json::json!({ "kind": value }))
+            .expect("as a struct field");
+        assert_eq!(held.kind, kind);
+    }
+    assert_eq!(
+        serde_json::from_value::<IndicatorKind>(serde_json::json!({ "kind": "ema", "period": 9 }))
+            .expect("defaults fill omitted fields"),
+        IndicatorKind::Ema {
+            period: 9,
+            seed: IndicatorSeed::default()
+        }
+    );
+    assert!(serde_json::from_value::<IndicatorKind>(
+        serde_json::json!({ "kind": "unknown_study" })
+    )
+    .is_err());
+}
+
 fn indicator_reads_volume(kind: &IndicatorKind) -> bool {
     matches!(
         kind,
