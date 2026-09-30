@@ -820,12 +820,25 @@ fn closed_polylines_beyond_the_fill_vertex_bound_keep_only_their_outline() {
         None,
         "no interior target"
     );
-    let vertex = px(&beyond, convex_anchors(count)[0]);
-    assert_eq!(
-        hit(&beyond, vertex),
-        Some(id),
-        "the stroke still selects it"
-    );
+
+    // The selected drawing's anchor handles win every hit and 2,049 of them cover the whole
+    // outline, so a hit on the outline says nothing about the stroke while it is selected.
+    // Unselected, only the body can answer: the stroke, at a vertex and mid-edge, selects it.
+    let anchors = convex_anchors(count);
+    let vertex = px(&beyond, anchors[0]);
+    let (a, b) = (px(&beyond, anchors[100]), px(&beyond, anchors[101]));
+    let mid_edge = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    beyond.set_selected_drawing(None);
+    for point in [vertex, mid_edge] {
+        let stroke = beyond
+            .hit_test_drawing(point.0, point.1)
+            .expect("the stroke still selects it");
+        assert_eq!(
+            (stroke.id, stroke.part),
+            (id, DrawingDragPart::Body),
+            "the stroke, not an anchor handle"
+        );
+    }
 }
 
 #[test]
