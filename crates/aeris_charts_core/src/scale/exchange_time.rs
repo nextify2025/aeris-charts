@@ -345,12 +345,19 @@ impl ExchangeTime {
     /// UTC instant at which the trading day of calendar date `day` (days since the epoch) begins,
     /// the inverse of [`Self::trading_day`]. With a negative session start Monday's trading day
     /// begins on the preceding Friday evening, because the weekend days roll forward to Monday.
+    /// That is the earliest instant that maps to Monday, and it is the Friday evening a week that
+    /// opens then (China futures) trades; a market whose week opens on Sunday evening still has
+    /// its Friday-evening-to-Sunday instants in Monday's trading day, but does not trade them.
     pub fn trading_day_start_utc(&self, day: i64) -> i64 {
         self.offsets.to_utc(self.trading_day_start_local(day))
     }
 
     /// Exchange-local wall-clock seconds at which the trading day of calendar date `day` begins
-    /// (see [`Self::trading_day_start_utc`]).
+    /// (see [`Self::trading_day_start_utc`]). Session-window placement uses its calendar day as
+    /// the evening of a window that starts at or after the session-start time of day, so under a
+    /// negative start Monday's evening window is placed on Friday: correct for a week that opens
+    /// on Friday evening, not for one that opens on Sunday evening (use a session start of 0 in
+    /// the placement call there).
     pub fn trading_day_start_local(&self, day: i64) -> i64 {
         let start_day = if self.session_start_seconds < 0 && weekday_from_monday(day) == 0 {
             day.saturating_sub(2)
@@ -417,6 +424,25 @@ mod tests {
             UtcOffsetTransition {
                 from_utc_seconds: ts(2024, 11, 3, 6, 0),
                 offset_seconds: -5 * 3_600,
+            },
+        ])
+        .unwrap()
+    }
+
+    /// America/Chicago 2024: CST, CDT from 2024-03-10 08:00 UTC, CST from 2024-11-03 07:00 UTC.
+    fn chicago_2024() -> UtcOffsetSchedule {
+        UtcOffsetSchedule::new(vec![
+            UtcOffsetTransition {
+                from_utc_seconds: ts(2023, 11, 5, 7, 0),
+                offset_seconds: -6 * 3_600,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: ts(2024, 3, 10, 8, 0),
+                offset_seconds: -5 * 3_600,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: ts(2024, 11, 3, 7, 0),
+                offset_seconds: -6 * 3_600,
             },
         ])
         .unwrap()
@@ -529,6 +555,81 @@ mod tests {
         assert_eq!(
             ExchangeTime::default().set_session_start_seconds(86_400),
             Err(ExchangeTimeError::SessionStartOutOfRange { seconds: 86_400 })
+        );
+    }
+
+    #[test]
+    fn china_futures_friday_night_second_level_boundaries() {
+        let futures =
+            ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), -3 * 3_600).unwrap();
+        // Exchange-local wall clock (CST, UTC+8) to UTC seconds.
+        let at = |day: u32, hour: i64, minute: i64, second: i64| {
+            ts(2024, 1, day, hour, minute) + second - 8 * HOUR
+        };
+        // Friday 20:59:59 is the last second of Friday's trading day; 21:00:00 opens Monday's.
+        assert_eq!(futures.trading_date(at(5, 20, 59, 59)), (2024, 1, 5));
+        assert_eq!(futures.trading_date(at(5, 21, 0, 0)), (2024, 1, 8));
+        // The whole weekend belongs to Monday, including the instants a market never trades.
+        assert_eq!(futures.trading_date(at(6, 2, 29, 59)), (2024, 1, 8));
+        assert_eq!(futures.trading_date(at(7, 10, 0, 0)), (2024, 1, 8));
+        // Monday's trading day ends with the 20:59:59 second; 21:00:00 opens Tuesday's.
+        assert_eq!(futures.trading_date(at(8, 8, 59, 59)), (2024, 1, 8));
+        assert_eq!(futures.trading_date(at(8, 20, 59, 59)), (2024, 1, 8));
+        assert_eq!(futures.trading_date(at(8, 21, 0, 0)), (2024, 1, 9));
+    }
+
+    #[test]
+    fn cme_globex_sunday_evening_belongs_to_monday_under_a_seven_hour_start() {
+        // CME Globex: the week opens Sunday 17:00 Central and each session runs 17:00-16:00, so
+        // the start is -7 h and the evening belongs to the next trading day.
+        let globex = ExchangeTime::new(chicago_2024(), -7 * 3_600).unwrap();
+        let central = chicago_2024();
+        // Exchange-local wall clock to UTC seconds.
+        let at =
+            |year, month, day, hour, minute| central.to_utc(ts(year, month, day, hour, minute));
+        // Friday's last session minute stays on Friday; the Friday 17:00 instant rolls forward.
+        assert_eq!(globex.trading_date(at(2024, 1, 5, 15, 59)), (2024, 1, 5));
+        assert_eq!(globex.trading_date(at(2024, 1, 5, 17, 0)), (2024, 1, 8));
+        // The Sunday evening open and the whole of Monday up to 16:59 are Monday's trading day.
+        assert_eq!(globex.trading_date(at(2024, 1, 7, 16, 59)), (2024, 1, 8));
+        assert_eq!(globex.trading_date(at(2024, 1, 7, 17, 0)), (2024, 1, 8));
+        assert_eq!(globex.trading_date(at(2024, 1, 8, 0, 0)), (2024, 1, 8));
+        assert_eq!(globex.trading_date(at(2024, 1, 8, 16, 59)), (2024, 1, 8));
+        // Monday's evening session belongs to Tuesday.
+        assert_eq!(globex.trading_date(at(2024, 1, 8, 17, 0)), (2024, 1, 9));
+        // Both DST changes fall on a Sunday before the 17:00 open, so the open keeps its wall clock.
+        assert_eq!(globex.trading_date(at(2024, 3, 10, 17, 0)), (2024, 3, 11));
+        assert_eq!(
+            at(2024, 3, 10, 17, 0).rem_euclid(DAY),
+            22 * HOUR,
+            "17:00 CDT is 22:00 UTC"
+        );
+        assert_eq!(globex.trading_date(at(2024, 11, 3, 17, 0)), (2024, 11, 4));
+        assert_eq!(
+            at(2024, 11, 3, 17, 0).rem_euclid(DAY),
+            23 * HOUR,
+            "17:00 CST is 23:00 UTC"
+        );
+
+        // The inverse keeps the Friday-evening weekly anchor: `trading_day_start_utc` is the
+        // earliest instant that maps to Monday (Friday 17:00 CST), not the Sunday 17:00 open. The
+        // weekend window placement of `session_slot_times` builds on it, so a market that does
+        // not trade Friday evening sets the per-call session start to 0 there (see
+        // `session_slots.rs`).
+        let monday = days_from_civil(2024, 1, 8).unwrap();
+        let monday_start = globex.trading_day_start_utc(monday);
+        assert_eq!(monday_start, 1_704_495_600, "Friday 2024-01-05 17:00 CST");
+        assert_eq!(monday_start, at(2024, 1, 5, 17, 0));
+        assert_ne!(
+            monday_start, 1_704_668_400,
+            "not Sunday 2024-01-07 17:00 CST"
+        );
+        assert_eq!(globex.trading_day(monday_start), monday);
+        assert_eq!(globex.trading_day(monday_start - 1), monday - 3);
+        // Tuesday opens Monday 17:00.
+        assert_eq!(
+            globex.trading_day_start_utc(monday + 1),
+            at(2024, 1, 8, 17, 0)
         );
     }
 

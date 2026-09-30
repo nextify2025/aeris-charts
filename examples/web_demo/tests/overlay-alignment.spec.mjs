@@ -19,6 +19,58 @@ async function settle(page) {
   }));
 }
 
+// Patches that `apply_options` (main thread) and `apply_series_options` (worker) both refuse with
+// `invalid_options`, each in the alignment the series holds when it is applied. Plain JSON, so the
+// same table crosses `page.evaluate` and `postMessage`.
+const ALIGNMENT_REFUSALS = [
+  { patch: { time_alignment: "calendar" }, on: "as_of" },
+  { patch: { as_of_max_staleness: -1 }, on: "as_of" },
+  { patch: { as_of_max_staleness: 1.5 }, on: "as_of" },
+  { patch: { time_alignment: "union", as_of_max_staleness: 60 }, on: "as_of" },
+  { patch: { as_of_max_staleness: 60 }, on: "union" },
+];
+
+// Start the demo worker, wait for its first chart, send one request, and return the one reply of
+// `reply_type` (or the worker's `error`).
+async function worker_reply(page, request, reply_type) {
+  await page.goto("/");
+  const supported = await page.evaluate(() =>
+    typeof OffscreenCanvas !== "undefined"
+    && "transferControlToOffscreen" in HTMLCanvasElement.prototype,
+  );
+  test.skip(!supported, "OffscreenCanvas transfer is unavailable in this browser");
+  return page.evaluate(({ request, reply_type }) => new Promise((resolve) => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:fixed;left:0;top:0;width:640px;height:360px;z-index:1000";
+    const gpu = document.createElement("canvas");
+    const fallback = document.createElement("canvas");
+    host.append(gpu, fallback);
+    document.body.appendChild(host);
+    const worker = new Worker("/offscreen_chart_worker.js", { type: "module" });
+    worker.onerror = (event) => resolve({ type: "error", message: event.message });
+    worker.onmessage = (event) => {
+      if (event.data.type === "ready") worker.postMessage(request);
+      else if (event.data.type === reply_type || event.data.type === "error") {
+        worker.terminate();
+        resolve(event.data);
+      }
+    };
+    const gpu_canvas = gpu.transferControlToOffscreen();
+    const fallback_canvas = fallback.transferControlToOffscreen();
+    worker.postMessage({
+      type: "init",
+      gpu_canvas,
+      fallback_canvas,
+      width: 640,
+      height: 360,
+      dpr: 1,
+      backend: "canvas2d",
+      bars: request.bars,
+      force_fallback_adapter: true,
+    }, [gpu_canvas, fallback_canvas]);
+  }), { request, reply_type });
+}
+
 test.beforeEach(async ({ page }) => {
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
@@ -290,42 +342,7 @@ test("a synthetic transform returns an as-of series to the union and its axis re
 });
 
 test("worker charts take time_alignment when adding a series", async ({ page }) => {
-  await page.goto("/");
-  const supported = await page.evaluate(() =>
-    typeof OffscreenCanvas !== "undefined"
-    && "transferControlToOffscreen" in HTMLCanvasElement.prototype,
-  );
-  test.skip(!supported, "OffscreenCanvas transfer is unavailable in this browser");
-  const result = await page.evaluate(() => new Promise((resolve) => {
-    const host = document.createElement("div");
-    host.style.cssText = "position:fixed;left:0;top:0;width:640px;height:360px;z-index:1000";
-    const gpu = document.createElement("canvas");
-    const fallback = document.createElement("canvas");
-    host.append(gpu, fallback);
-    document.body.appendChild(host);
-    const worker = new Worker("/offscreen_chart_worker.js", { type: "module" });
-    worker.onerror = (event) => resolve({ type: "error", message: event.message });
-    worker.onmessage = (event) => {
-      if (event.data.type === "ready") worker.postMessage({ type: "as_of_overlay", bars: 600 });
-      else if (event.data.type === "as_of_overlay" || event.data.type === "error") {
-        worker.terminate();
-        resolve(event.data);
-      }
-    };
-    const gpu_canvas = gpu.transferControlToOffscreen();
-    const fallback_canvas = fallback.transferControlToOffscreen();
-    worker.postMessage({
-      type: "init",
-      gpu_canvas,
-      fallback_canvas,
-      width: 640,
-      height: 360,
-      dpr: 1,
-      backend: "canvas2d",
-      bars: 600,
-      force_fallback_adapter: true,
-    }, [gpu_canvas, fallback_canvas]);
-  }));
+  const result = await worker_reply(page, { type: "as_of_overlay", bars: 600 }, "as_of_overlay");
   expect(result.type, result.message).toBe("as_of_overlay");
   // The overlay's 30 s-offset minutes would double the points if they joined the union.
   expect(result.range_after).toEqual(result.range_before);
@@ -337,4 +354,111 @@ test("worker charts take time_alignment when adding a series", async ({ page }) 
   expect(result.first_invalid).toBe("invalid_options");
   expect(result.primary).toBe(0);
   expect(result.ids_after_invalid).toEqual(result.ids_before_invalid);
+});
+
+test("the alignment refusal table is refused unchanged on a main-thread series", async ({ page }) => {
+  await open_chart(page);
+  const refusals = await page.evaluate((table) => {
+    const series = window.__chart.add_series("line");
+    return table.map(({ patch, on }) => {
+      series.apply_options({ time_alignment: on });
+      const before = JSON.stringify(series.options());
+      let code = null;
+      try {
+        series.apply_options(patch);
+      } catch (error) {
+        code = error.code;
+      }
+      return { code, unchanged: JSON.stringify(series.options()) === before };
+    });
+  }, ALIGNMENT_REFUSALS);
+  expect(refusals).toEqual(ALIGNMENT_REFUSALS.map(() => ({ code: "invalid_options", unchanged: true })));
+});
+
+// One worker run feeds the four worker tests below; the handler replies once, then disposes.
+let update_reply = null;
+async function overlay_update_reply(page) {
+  update_reply ??= await worker_reply(
+    page,
+    { type: "as_of_overlay_update", bars: 600, refusals: ALIGNMENT_REFUSALS },
+    "as_of_overlay_update",
+  );
+  expect(update_reply.type, update_reply.message).toBe("as_of_overlay_update");
+  return update_reply.results;
+}
+
+test("worker charts change time_alignment after creation", async ({ page }) => {
+  const result = await overlay_update_reply(page);
+  expect(result.primary).toBe(0);
+  // As a union series the overlay's 30 s-offset minutes join the axis and grow the range; as-of it
+  // adds no point, so the range is the primary's again, and back to the union restores the growth.
+  expect(result.union_range.to).toBeGreaterThan(result.primary_range.to);
+  expect(result.as_of).toEqual({
+    range: result.primary_range,
+    options: { time_alignment: "as_of", as_of_max_staleness: null },
+  });
+  expect(result.staleness).toEqual({ time_alignment: "as_of", as_of_max_staleness: 0 });
+  expect(result.unbounded).toEqual({ time_alignment: "as_of", as_of_max_staleness: null });
+  expect(result.bounded).toEqual({ time_alignment: "as_of", as_of_max_staleness: 60 });
+  // Switching to the union clears the staleness bound.
+  expect(result.union_again).toEqual({
+    range: result.union_range,
+    options: { time_alignment: "union", as_of_max_staleness: null },
+  });
+  // A request equal to the current values (a React-style re-render patch, an empty patch) never
+  // reaches the engine; a real change reaches it once.
+  expect(result.noop_calls).toEqual([0, 0, 0]);
+  expect(result.change_calls).toEqual([1, 0]);
+});
+
+test("worker series option calls present their frame before they return", async ({ page }) => {
+  const { repaint } = await overlay_update_reply(page);
+  // The handler reads the counter and the canvas straight after each call, with no fit or render
+  // in between: [before, after a change, after an equal request, after a refusal].
+  const [before, changed, equal, refused] = repaint.frames;
+  expect(changed).toBeGreaterThan(before);
+  // The equal request is a successful call, so it repaints like every other worker mutator.
+  expect(equal).toBeGreaterThan(changed);
+  // A refusal throws before anything is applied or painted.
+  expect(refused).toBe(equal);
+  // The Canvas2D surface shows the new alignment (the overlay left the axis) as the call returns.
+  expect(repaint.pixels_changed).toBe(true);
+});
+
+test("worker alignment refusals match the main thread and change nothing", async ({ page }) => {
+  const result = await overlay_update_reply(page);
+  expect(result.refusals).toEqual(ALIGNMENT_REFUSALS.map(() => ({ code: "invalid_options", unchanged: true })));
+  // A refusal applies none of the call's options, and an option the worker cannot change is
+  // refused, not dropped.
+  expect(result.atomic).toMatchObject({
+    invalid: "invalid_options",
+    invalid_alignment: "union",
+    unsupported: { code: "unsupported_operation" },
+    color_unchanged: true,
+    mixed: "unsupported_operation",
+    mixed_alignment: "union",
+    null_options: "invalid_options",
+  });
+  expect(result.atomic.unsupported.message).toContain("color");
+  // A footprint series owns no calendar to align.
+  expect(result.footprint).toEqual({ code: "unsupported_operation", unchanged: true, alignment: "union" });
+});
+
+test("worker series ids are checked before they reach the engine", async ({ page }) => {
+  const result = await overlay_update_reply(page);
+  // `apply_series_options` and `series_options` both reject an id that names no live series, even
+  // for an empty patch. A removed id is stale (reachable only through the fixture's private hook);
+  // an unissued one is invalid.
+  expect(result.ids.unknown).toBe("invalid_handle");
+  expect(result.ids.unknown_read).toBe("invalid_handle");
+  expect(result.ids.removed).toBe("stale_handle");
+  expect(result.ids.removed_empty).toBe("stale_handle");
+  expect(result.ids.removed_read).toBe("stale_handle");
+  // NaN, 1.5, and 2**32 would wrap to live ids 0, 1, and 0 in the wasm u32 argument and silently
+  // change the wrong series: the primary and the overlay must both still read as the union.
+  expect(result.ids.coerced).toEqual(["invalid_handle", "invalid_handle", "invalid_handle", "invalid_handle"]);
+  expect(result.ids.coerced_read).toEqual(["invalid_handle", "invalid_handle", "invalid_handle", "invalid_handle"]);
+  expect(result.ids.alignments).toEqual(["union", "union"]);
+  // A removed worker chart refuses both calls.
+  expect(result.disposed).toEqual({ apply: "disposed", read: "disposed" });
 });

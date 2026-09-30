@@ -160,7 +160,11 @@ pub fn parse_iso_date(text: &str) -> Option<i64> {
 /// session start every window starts on `day` (a window starting before a positive session start
 /// runs after midnight, on the next calendar day); with a negative session start a window
 /// starting at or after the session-start time of day belongs to the preceding evening (Friday
-/// evening for a Monday, as [`ExchangeTime::trading_day`] rolls weekends forward). Windows are
+/// evening for a Monday, as [`ExchangeTime::trading_day`] rolls weekends forward). That placement
+/// assumes the week opens on Friday evening: a market that reopens on Sunday evening (a Globex
+/// 17:00-16:00 session under a `-7 h` chart start) passes an `ExchangeTime` with a session start
+/// of 0 and one call per evening date, since `day` is then the evening the session opens. Holidays
+/// and early closes are host calendar data: pass the windows that apply to `day`. Windows are
 /// converted with the offset in force at each boundary, so they stay on exchange hours across DST,
 /// and must be listed chronologically without overlapping. Slots step by elapsed
 /// `interval_seconds`; a window whose length is not a multiple of the interval ends with a
@@ -736,6 +740,199 @@ mod tests {
         assert_eq!(local(&time, slots[0]), "2026-09-25 21:00");
         assert_eq!(local(&time, slots[330]), "2026-09-28 09:00");
         assert!(slots.iter().all(|&slot| time.trading_day(slot) == monday));
+    }
+
+    /// America/Chicago 2024: CST, CDT from 2024-03-10 08:00 UTC, CST from 2024-11-03 07:00 UTC.
+    fn chicago_2024() -> UtcOffsetSchedule {
+        let ts = |date: &str, hour: i64| day(date) * DAY + hour * HOUR;
+        UtcOffsetSchedule::new(vec![
+            UtcOffsetTransition {
+                from_utc_seconds: ts("2023-11-05", 7),
+                offset_seconds: -6 * 3_600,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: ts("2024-03-10", 8),
+                offset_seconds: -5 * 3_600,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: ts("2024-11-03", 7),
+                offset_seconds: -6 * 3_600,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn cme_monday_session_opens_sunday_evening_with_a_per_call_midnight_start() {
+        // A Globex-style chart sets -7 h so its trading days and Day marks follow the Sunday
+        // 17:00 open. Window placement assumes the week reopens on Friday evening, so each call
+        // that places a Sunday-open session passes its own start of 0 and is keyed by the evening
+        // date it opens on.
+        let chart = ExchangeTime::new(chicago_2024(), -7 * 3_600).unwrap();
+        let call = ExchangeTime::new(chicago_2024(), 0).unwrap();
+        let globex = [window("17:00", "16:00")];
+        let slots = |date: &str, windows: &[SessionWindow], time: &ExchangeTime| {
+            session_slot_times(day(date), windows, 60, time, SessionSlotConvention::BarOpen)
+                .unwrap()
+        };
+
+        // One call per evening date: the Sunday date places Monday's whole trading day.
+        let monday = slots("2024-01-07", &globex, &call);
+        assert_eq!(monday.len(), 23 * 60);
+        assert_eq!(monday[0], at(&call, "2024-01-07 17:00:00"));
+        assert_eq!(monday[0], 1_704_668_400);
+        assert_eq!(local(&call, monday[0]), "2024-01-07 17:00");
+        assert_eq!(local(&call, monday[1379]), "2024-01-08 15:59");
+        assert!(monday.windows(2).all(|pair| pair[1] - pair[0] == 60));
+        assert!(monday
+            .iter()
+            .all(|&slot| chart.trading_day(slot) == day("2024-01-08")));
+
+        // The two-call form (the Sunday evening, then Monday's remaining windows under the chart's
+        // own start) places the same slots.
+        let mut split = slots("2024-01-07", &[window("17:00", "24:00")], &call);
+        assert_eq!(split.len(), 7 * 60);
+        let rest = slots("2024-01-08", &[window("00:00", "16:00")], &chart);
+        assert_eq!(rest.len(), 16 * 60);
+        split.extend(rest);
+        assert_eq!(split, monday);
+
+        // The trap: Monday's date under the chart's own start places a window that opens at or
+        // after 17:00 on the preceding Friday evening, where the market is closed on Saturday.
+        let trap = slots("2024-01-08", &globex, &chart);
+        assert_eq!(trap.len(), 23 * 60);
+        assert_eq!(trap[0], 1_704_495_600);
+        assert_eq!(local(&chart, trap[0]), "2024-01-05 17:00");
+        assert_eq!(local(&chart, trap[1379]), "2024-01-06 15:59");
+
+        // Tuesday to Friday under the chart's start open on the preceding evening (the trading
+        // date names the session). Under a per-call start of 0 the date is the evening itself,
+        // so the same Tuesday date opens Tuesday 17:00 and belongs to Wednesday's trading day.
+        let tuesday = slots("2024-01-09", &globex, &chart);
+        assert_eq!(local(&chart, tuesday[0]), "2024-01-08 17:00");
+        assert_eq!(local(&chart, tuesday[1379]), "2024-01-09 15:59");
+        let evening = slots("2024-01-09", &globex, &call);
+        assert_eq!(local(&call, evening[0]), "2024-01-09 17:00");
+        assert_eq!(local(&call, evening[1379]), "2024-01-10 15:59");
+        assert!(evening
+            .iter()
+            .all(|&slot| chart.trading_day(slot) == day("2024-01-10")));
+
+        // Both DST changes fall on a Sunday before the open, so the open keeps its wall clock
+        // (22:00 UTC in CDT, 23:00 UTC in CST) and the session still spans 23 hours.
+        for (date, open_utc_hour) in [("2024-03-10", 22), ("2024-11-03", 23)] {
+            let dst = slots(date, &globex, &call);
+            assert_eq!(dst.len(), 23 * 60, "{date}");
+            assert_eq!(dst[0].rem_euclid(DAY), open_utc_hour * HOUR, "{date}");
+            assert_eq!(local(&call, dst[0]), format!("{date} 17:00"));
+        }
+
+        // Synthetic Globex-like schedule, not real exchange hours: a Thursday date under the
+        // chart's start opens the evening before, and an early-close Tuesday is a shorter window
+        // the host passes for that date.
+        let thursday = slots("2024-12-26", &globex, &chart);
+        assert_eq!(local(&chart, thursday[0]), "2024-12-25 17:00");
+        let early = slots("2024-12-24", &[window("17:00", "12:15")], &chart);
+        assert_eq!(early.len(), 19 * 60 + 15);
+        assert_eq!(local(&chart, early[0]), "2024-12-23 17:00");
+        assert_eq!(local(&chart, early[early.len() - 1]), "2024-12-24 12:14");
+    }
+
+    #[test]
+    fn session_bar_grid_sunday_open_needs_a_midnight_start() {
+        let windows = || vec![window("17:00", "16:00")];
+        let midnight = ExchangeTime::new(chicago_2024(), 0).unwrap();
+        let grid =
+            SessionBarGrid::new(windows(), 3_600, &midnight, OutOfSessionPolicy::Fold).unwrap();
+        for (trade, open) in [
+            ("2024-01-07 18:00:00", "2024-01-07 18:00"),
+            ("2024-01-08 10:00:00", "2024-01-08 10:00"),
+            // After the 16:00 close, before the 17:00 reopen: folds forward into the next window.
+            ("2024-01-08 16:30:00", "2024-01-08 17:00"),
+        ] {
+            assert_eq!(
+                open_label(&midnight, &grid, trade).as_deref(),
+                Some(open),
+                "{trade}"
+            );
+        }
+        // A one-day interval spans the trading day: one bar opening Sunday 17:00.
+        let daily =
+            SessionBarGrid::new(windows(), 86_400, &midnight, OutOfSessionPolicy::Fold).unwrap();
+        assert_eq!(
+            open_label(&midnight, &daily, "2024-01-08 10:00:00").as_deref(),
+            Some("2024-01-07 17:00")
+        );
+
+        // Pinned known limit: a grid on the chart's own negative start places Monday's window on
+        // Friday evening (as `session_slot_times` does), so Sunday and Monday prints land after
+        // it. Fold maps them to its last bar (Saturday 15:00) and Exclude drops them. A
+        // first-class Sunday open would change these expectations.
+        let negative = ExchangeTime::new(chicago_2024(), -7 * 3_600).unwrap();
+        let folded =
+            SessionBarGrid::new(windows(), 3_600, &negative, OutOfSessionPolicy::Fold).unwrap();
+        let excluded =
+            SessionBarGrid::new(windows(), 3_600, &negative, OutOfSessionPolicy::Exclude).unwrap();
+        for trade in ["2024-01-07 18:00:00", "2024-01-08 10:00:00"] {
+            assert_eq!(
+                open_label(&negative, &folded, trade).as_deref(),
+                Some("2024-01-06 15:00"),
+                "{trade}"
+            );
+            assert_eq!(open_label(&negative, &excluded, trade), None, "{trade}");
+        }
+    }
+
+    #[test]
+    fn china_futures_holiday_night_sessions_are_host_calendar_data() {
+        // The engine has no holiday model: a date without a night session is a window list the
+        // host omits the night window from. The dates are illustrative host calendar data.
+        let time = shanghai(-3 * 3_600);
+        let night = [
+            window("21:00", "02:30"),
+            window("09:00", "10:15"),
+            window("10:30", "11:30"),
+            window("13:30", "15:00"),
+        ];
+        let day_only = &night[1..];
+        let slots = |date: &str, windows: &[SessionWindow]| {
+            session_slot_times(
+                day(date),
+                windows,
+                60,
+                &time,
+                SessionSlotConvention::BarOpen,
+            )
+            .unwrap()
+        };
+
+        // A Monday with its night session opens on Friday evening.
+        let monday = slots("2024-09-30", &night);
+        assert_eq!(local(&time, monday[0]), "2024-09-27 21:00");
+        assert!(monday
+            .iter()
+            .all(|&slot| time.trading_day(slot) == day("2024-09-30")));
+
+        // The first date after the break has no night session: it opens at 09:00 that morning,
+        // and nothing lands on the evening before.
+        let resumed = slots("2024-10-08", day_only);
+        assert_eq!(local(&time, resumed[0]), "2024-10-08 09:00");
+        assert!(resumed
+            .iter()
+            .all(|&slot| local(&time, slot).starts_with("2024-10-08")));
+        assert!(resumed
+            .iter()
+            .all(|&slot| time.trading_day(slot) == day("2024-10-08")));
+
+        // The next date has its night session again, placed on the evening of Oct 8.
+        let next = slots("2024-10-09", &night);
+        assert_eq!(local(&time, next[0]), "2024-10-08 21:00");
+        assert!(next
+            .iter()
+            .all(|&slot| time.trading_day(slot) == day("2024-10-09")));
+
+        assert!(monday[monday.len() - 1] < resumed[0]);
+        assert!(resumed[resumed.len() - 1] < next[0]);
     }
 
     #[test]

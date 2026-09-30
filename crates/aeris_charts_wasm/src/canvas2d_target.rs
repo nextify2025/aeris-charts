@@ -2,6 +2,7 @@
 //! executor (roadmap Phase D2). This is the in-browser fallback backend for machines without
 //! WebGPU — the same draw list the wgpu path renders, issued as 2D canvas calls.
 
+use crate::stroke_state::StrokeState;
 use aeris_charts_render::canvas2d::Canvas2d;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{RasterImage, TextAlign};
@@ -53,6 +54,7 @@ fn css(c: Color) -> String {
 pub struct WasmCanvas2d<'a> {
     ctx: &'a CanvasRenderingContext2d,
     image_store: Option<&'a mut CanvasImageStore>,
+    stroke_state: StrokeState,
     /// Paint ops issued through this target — the ones that put pixels on the canvas
     /// (`fillRect`/`stroke`/`fill`/`fillText`), not state setters or path building. Reported as
     /// part of `frame_stats().canvas2d_ops`.
@@ -64,6 +66,7 @@ impl<'a> WasmCanvas2d<'a> {
         Self {
             ctx,
             image_store: None,
+            stroke_state: StrokeState::default(),
             ops: 0,
         }
     }
@@ -75,6 +78,7 @@ impl<'a> WasmCanvas2d<'a> {
         Self {
             ctx,
             image_store: Some(image_store),
+            stroke_state: StrokeState::default(),
             ops: 0,
         }
     }
@@ -91,6 +95,8 @@ impl Canvas2d for WasmCanvas2d<'_> {
     }
     fn restore(&mut self) {
         self.ctx.restore();
+        // The popped state is whatever was current at the matching `save`, not what we applied.
+        self.stroke_state.invalidate();
     }
     fn clip_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
         self.ctx.begin_path();
@@ -116,12 +122,19 @@ impl Canvas2d for WasmCanvas2d<'_> {
         self.ctx.set_fill_style_canvas_gradient(&grad);
     }
     fn set_stroke(&mut self, color: Color) {
-        self.ctx.set_stroke_style_str(&css(color));
+        if self.stroke_state.needs_color(color) {
+            self.ctx.set_stroke_style_str(&css(color));
+        }
     }
     fn set_line_width(&mut self, width: f32) {
-        self.ctx.set_line_width(width as f64);
+        if self.stroke_state.needs_width(width) {
+            self.ctx.set_line_width(width as f64);
+        }
     }
     fn set_line_dash(&mut self, pattern: &[f32]) {
+        if !self.stroke_state.needs_dash(pattern) {
+            return;
+        }
         let arr = js_sys::Array::new();
         for &seg in pattern {
             arr.push(&JsValue::from_f64(seg as f64));
@@ -153,9 +166,10 @@ impl Canvas2d for WasmCanvas2d<'_> {
     }
     fn stroke(&mut self) {
         self.ops += 1;
-        // Set per stroke: host plugins share this context and may leave other join/cap state.
-        self.ctx.set_line_join("round");
-        self.ctx.set_line_cap("butt");
+        if self.stroke_state.needs_join_and_cap() {
+            self.ctx.set_line_join("round");
+            self.ctx.set_line_cap("butt");
+        }
         self.ctx.stroke();
     }
     fn fill(&mut self) {

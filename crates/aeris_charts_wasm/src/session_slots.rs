@@ -244,6 +244,54 @@ mod tests {
     }
 
     #[test]
+    fn a_request_session_start_is_its_own_and_defaults_to_midnight() {
+        // The request's `session_start` is independent of any chart: omitted, it is 0, so a
+        // Globex-style 17:00-16:00 session keyed by its evening date opens that evening.
+        const CST: &str = r#""time_zone":[{"from_utc_seconds":0,"offset_seconds":-21600}]"#;
+        let sunday = session_slot_times_json(&format!(
+            r#"{{"date":"2024-01-07","windows":[["17:00","16:00"]],"interval_seconds":60,{CST}}}"#
+        ))
+        .unwrap();
+        assert_eq!(sunday.len(), 23 * 60);
+        assert_eq!(sunday[0], 1_704_668_400, "Sunday 2024-01-07 17:00 CST");
+        // An explicit -7 h start places Monday's date on the preceding Friday evening instead.
+        let monday = session_slot_times_json(&format!(
+            r#"{{"date":"2024-01-08","windows":[["17:00","16:00"]],"interval_seconds":60,
+                "session_start":-25200,{CST}}}"#
+        ))
+        .unwrap();
+        assert_eq!(monday[0], 1_704_495_600, "Friday 2024-01-05 17:00 CST");
+
+        // The same holds for a China futures night window: without `session_start: -10800` it is
+        // placed on the calendar date (Monday 21:00), not on Friday evening.
+        const CHINA: &str = r#""time_zone":[{"from_utc_seconds":0,"offset_seconds":28800}]"#;
+        let night = |session_start: &str| {
+            session_slot_times_json(&format!(
+                r#"{{"date":"2024-01-08","windows":[["21:00","02:30"]],"interval_seconds":60,
+                    {session_start}{CHINA}}}"#
+            ))
+            .unwrap()[0]
+        };
+        let monday_21_00_utc = 1_704_672_000 + 13 * 3_600;
+        assert_eq!(night(""), monday_21_00_utc);
+        assert_eq!(
+            night(r#""session_start":-10800,"#),
+            monday_21_00_utc - 3 * 86_400
+        );
+
+        // resample_boundaries takes its own `session_start` with the same default.
+        let boundary_start = |session_start: &str| {
+            resample_boundaries_json(&format!(
+                r#"{{"dates":["2024-01-08"],"windows":[["17:00","16:00"]],{session_start}{CST}}}"#
+            ))
+            .unwrap()[0]
+                .start_time
+        };
+        assert_eq!(boundary_start(""), 1_704_754_800, "Monday 17:00 CST");
+        assert_eq!(boundary_start(r#""session_start":-25200,"#), 1_704_495_600);
+    }
+
+    #[test]
     fn resample_boundary_requests_place_sessions_per_date() {
         let boundaries = resample_boundaries_json(
             r#"{"dates":["2026-09-24","2026-09-25"],"windows":[["09:30","11:30"],["13:00","15:00"]],

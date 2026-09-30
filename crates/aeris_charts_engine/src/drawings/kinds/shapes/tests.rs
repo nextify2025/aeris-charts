@@ -772,6 +772,75 @@ fn closed_polylines_fill_by_the_nonzero_rule() {
     assert_eq!(fills(&mut chart, wash()).len(), 1);
 }
 
+/// `count` anchors of a convex polygon (an ellipse in logical and price space, so a convex one
+/// on screen) around the middle of the test data.
+fn convex_anchors(count: usize) -> Vec<DrawingPoint> {
+    (0..count)
+        .map(|index| {
+            let angle = index as f64 * std::f64::consts::TAU / count as f64;
+            p(20.0 + 8.0 * angle.cos(), 103.0 + 2.0 * angle.sin())
+        })
+        .collect()
+}
+
+#[test]
+fn closed_polylines_beyond_the_fill_vertex_bound_keep_only_their_outline() {
+    let closed = r##"{"color":"#123456","tool_options":{"shape":{"closed":true}}}"##;
+    let middle = p(20.0, 103.0);
+
+    // The largest polygon fills and its interior selects it.
+    let mut within = chart();
+    let count = shape::MAX_FILL_VERTICES;
+    let id = add(
+        &mut within,
+        DrawingKind::Polyline,
+        convex_anchors(count),
+        closed,
+    );
+    assert_eq!(fills(&mut within, wash()).len(), 1);
+    assert_eq!(ink_line(&mut within).len(), count + 2);
+    within.set_selected_drawing(Some(id));
+    assert_eq!(hit(&within, px(&within, middle)), Some(id));
+
+    // One vertex more paints its outline and nothing else, on the shared frame every backend
+    // executes: no fill part, so no interior target even while selected.
+    let mut beyond = chart();
+    let count = shape::MAX_FILL_VERTICES + 1;
+    let id = add(
+        &mut beyond,
+        DrawingKind::Polyline,
+        convex_anchors(count),
+        closed,
+    );
+    assert!(fills(&mut beyond, wash()).is_empty());
+    assert_eq!(ink_line(&mut beyond).len(), count + 2, "the outline stays");
+    beyond.set_selected_drawing(Some(id));
+    assert_eq!(
+        hit(&beyond, px(&beyond, middle)),
+        None,
+        "no interior target"
+    );
+
+    // The selected drawing's anchor handles win every hit and 2,049 of them cover the whole
+    // outline, so a hit on the outline says nothing about the stroke while it is selected.
+    // Unselected, only the body can answer: the stroke, at a vertex and mid-edge, selects it.
+    let anchors = convex_anchors(count);
+    let vertex = px(&beyond, anchors[0]);
+    let (a, b) = (px(&beyond, anchors[100]), px(&beyond, anchors[101]));
+    let mid_edge = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    beyond.set_selected_drawing(None);
+    for point in [vertex, mid_edge] {
+        let stroke = beyond
+            .hit_test_drawing(point.0, point.1)
+            .expect("the stroke still selects it");
+        assert_eq!(
+            (stroke.id, stroke.part),
+            (id, DrawingDragPart::Body),
+            "the stroke, not an anchor handle"
+        );
+    }
+}
+
 #[test]
 fn fills_follow_fill_enabled_and_fill_color() {
     let mut chart = chart();

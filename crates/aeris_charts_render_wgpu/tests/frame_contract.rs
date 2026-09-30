@@ -120,6 +120,12 @@ impl Canvas2d for CountingCanvas {
 }
 
 fn fixture() -> ChartEngine {
+    fixture_with_line_style(0)
+}
+
+/// The shared engine fixture with `line_style` (the reference numeric style: 0 solid, 1 dotted,
+/// 2 dashed) on the main series line and on one indicator output line.
+fn fixture_with_line_style(line_style: u8) -> ChartEngine {
     let mut chart = ChartEngine::new(320.0, 220.0, 1.0);
     let times: Vec<f64> = (0..24).map(|i| i as f64).collect();
     let open: Vec<f64> = (0..24).map(|i| 100.0 + i as f64 * 0.2).collect();
@@ -134,6 +140,7 @@ fn fixture() -> ChartEngine {
         .set_series_data(0, &times, &open, &high, &low, &close)
         .unwrap();
     chart.series[0].kind = SeriesKind::Line;
+    chart.series[0].line_style = line_style;
     let rsi = chart
         .add_indicator_kind_with_input(
             0,
@@ -148,6 +155,16 @@ fn fixture() -> ChartEngine {
         .next()
         .expect("RSI output");
     let sma = chart.add_sma(rsi, 2).expect("SMA output");
+    if line_style != 0 {
+        assert!(chart.set_indicator_output_style(
+            sma,
+            IndicatorOutputStyle {
+                visible: true,
+                line_style,
+                ..IndicatorOutputStyle::default()
+            }
+        ));
+    }
     let bands = chart.add_bollinger(sma, 2, 2.0);
     assert!(chart.set_indicator_output_style(
         bands[0],
@@ -282,6 +299,36 @@ fn one_engine_frame_is_consumable_by_canvas2d_and_webgpu_adapters() {
         ];
         assert_eq!(gpu.color, expected, "Canvas2D/WebGPU rect color diverged");
     }
+}
+
+/// The WebGPU stroker ignores `Prim::Polyline::style` (it has no dash concept), so the frame
+/// producer must lower every dashed or dotted line to solid dash runs before a frame reaches it.
+/// Pins that producer contract at the WebGPU boundary for a dashed series line and a dashed
+/// indicator output, in every layer a backend executes.
+#[test]
+fn engine_frames_reach_the_webgpu_stroker_with_only_solid_polylines() {
+    let polylines = |line_style: u8| {
+        let frame = fixture_with_line_style(line_style).build_frame();
+        let mut count = 0;
+        for pane in &frame.panes {
+            let layers = [&pane.under, &pane.main, &pane.top_prims];
+            for prim in layers.into_iter().flatten() {
+                if let Prim::Polyline { style, .. } = prim {
+                    assert_eq!(
+                        *style,
+                        LineStyle::Solid,
+                        "line style {line_style} reached the WebGPU boundary dashed: {prim:?}"
+                    );
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+    let solid = polylines(0);
+    // Vacuousness guard: dashing really happened, as extra runs of the same strokes.
+    assert!(polylines(2) > solid, "dashed lines lower to dash runs");
+    assert!(polylines(1) > solid, "dotted lines lower to dash runs");
 }
 
 #[test]

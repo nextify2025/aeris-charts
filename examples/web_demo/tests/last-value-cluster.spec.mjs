@@ -211,6 +211,25 @@ function white_ink_center(png, box) {
   return (top + bottom) / 2;
 }
 
+// Vertical center of the painted glyph ink at half coverage, as the pixel-edge midpoint of the
+// first and last ink rows. Coverage is judged by the weakest channel, so white text over a
+// saturated label fill counts once the blend passes 50%: thin descender strokes that never reach
+// pure white still count, which the pure-white probe above cannot promise on every rasterizer.
+function half_coverage_ink_extent(png, box) {
+  let top = Infinity;
+  let bottom = -Infinity;
+  for (let y = box.top; y < box.bottom; y += 1) {
+    for (let x = box.left; x < box.right; x += 1) {
+      if (Math.min(...px(png, x, y)) > 128) {
+        top = Math.min(top, y);
+        bottom = Math.max(bottom, y);
+      }
+    }
+  }
+  expect(top, "label must contain glyph ink").toBeLessThan(Infinity);
+  return { top, bottom: bottom + 1, center: (top + bottom + 1) / 2 };
+}
+
 function expect_white_ink_centered(png, box, tolerance = 1) {
   const box_center = (box.top + box.bottom - 1) / 2;
   expect(Math.abs(white_ink_center(png, box) - box_center)).toBeLessThanOrEqual(tolerance);
@@ -321,13 +340,19 @@ test("explicit light price-line color unifies the live cluster and selects dark 
   await context.close();
 });
 
-test("crosshair price and time glyphs stay centered in their label boxes", async ({ browser }) => {
+// The engine keys the time label's vertical position to the stable "Apr0" ink sample (cap top to
+// descender bottom), not to the glyphs of the label itself, so a label without descenders sits
+// higher than the same box holding one. The painted label text depends on the calendar month and
+// the font, so the placement contract is probed with the sample text itself: its ink must be
+// centered on the time-strip text center, whichever font, backend and DPR paint it.
+async function expect_crosshair_glyphs_centered(browser, query) {
   const { context, page } = await open_cluster_page(browser, {
     last_value_visible: false,
     title_visible: false,
     countdown_visible: false,
-  }, 1.25);
+  }, 1.25, query);
   await page.evaluate(() => window.__chart.apply_options({
+    localization: { time_formatter: () => "Apr0" },
     crosshair: {
       horzLine: { labelBackgroundColor: "#ff00ff" },
       vertLine: { labelBackgroundColor: "#ff00ff" },
@@ -358,14 +383,40 @@ test("crosshair price and time glyphs stay centered in their label boxes", async
   expect(near(px(shot, price_text_left - border_w, price_label.top + 3), BORDER)).toBe(true);
   expect(near(px(shot, Math.floor((time_label.left + time_label.right) / 2), time_label.top - border_w), BORDER)).toBe(true);
   expect_white_ink_centered(shot, price_text_label, 2);
-  // The compact time box includes border + 3px tick space above the text body. Its glyph is
-  // therefore deliberately below the full box center rather than incorrectly centered in it
-  // (1px border + 3px tick + 3px pad above vs 3px pad below the 11px body centers ink 1.5px low).
-  const time_box_center = (time_label.top + time_label.bottom - 1) / 2;
-  const time_ink_offset = white_ink_center(shot, time_label) - time_box_center;
-  expect(time_ink_offset).toBeGreaterThanOrEqual(1.5);
-  expect(time_ink_offset).toBeLessThanOrEqual(4);
+  // The time strip reserves 1px border + 3px tick + 3px padding above the 11px text body, so the
+  // text center sits 1.5 CSS px below the full box center: the glyphs are deliberately low in
+  // the box rather than centered in it. The sample ink lands within one device pixel of that
+  // center (measured -0.5..+0.6 px across DejaVu, Liberation and FreeSans faces at DPR 1, 1.25
+  // and 2 on both backends).
+  const text_center = (geometry.pane_h + 1 + 3 + 3 + 11 / 2) * geometry.dpr;
+  const ink = half_coverage_ink_extent(shot, time_label);
+  expect(Math.abs(ink.center - text_center), `Apr0 ink ${ink.top}..${ink.bottom} vs text center ${text_center}`)
+    .toBeLessThanOrEqual(1);
+  const box_center = (time_label.top + time_label.bottom) / 2;
+  expect(ink.center - box_center).toBeGreaterThan(0.5);
+
+  // The calendar label (month-dependent glyphs) stays fully inside its box with the tick space
+  // above and padding below intact.
+  await page.evaluate(() => window.__chart.apply_options({ localization: { time_formatter: null } }));
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const dated = await capture(page);
+  const dated_label = color_bands(dated, [255, 0, 255])
+    .filter((box) => box.bottom - box.top >= 12)
+    .sort((a, b) => (a.bottom - a.top) - (b.bottom - b.top))[1];
+  expect(dated_label.right - dated_label.left, "the default calendar label replaced the sample text")
+    .toBeGreaterThan(time_label.right - time_label.left + 20);
+  const dated_ink = half_coverage_ink_extent(dated, dated_label);
+  expect(dated_ink.top - dated_label.top, "calendar label keeps the tick space above its glyphs").toBeGreaterThanOrEqual(4);
+  expect(dated_label.bottom - dated_ink.bottom, "calendar label keeps padding below its glyphs").toBeGreaterThanOrEqual(2);
   await context.close();
+}
+
+test("crosshair price and time glyphs stay centered in their label boxes", async ({ browser }) => {
+  await expect_crosshair_glyphs_centered(browser, "");
+});
+
+test("crosshair price and time glyphs stay centered in their label boxes on Canvas2D", async ({ browser }) => {
+  await expect_crosshair_glyphs_centered(browser, "?backend=canvas2d");
 });
 
 test("crosshair paints one aligned price label on each visible scale", async ({ browser }) => {

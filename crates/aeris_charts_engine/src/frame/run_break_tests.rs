@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use super::*;
 use crate::synthetic_bars::{SyntheticBar, SyntheticBarOptions, SyntheticSourceBar};
 use crate::{PivotKind, SeriesHitKind, UtcOffsetSchedule, VwapReset};
+use aeris_charts_render::line::{dash_split, LinePoint};
 
 const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;

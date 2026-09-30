@@ -1081,8 +1081,10 @@ pub fn circle_through(a: Point, b: Point, c: Point) -> Option<(Point, f64)> {
 }
 
 /// Largest polygon [`nonzero_ribbon`] tessellates (vertices over all contours); with its bounds on
-/// edge crossings and output rungs, beyond which the polygon gets no fill. Real drawings sit far
-/// below all three.
+/// edge crossings and output rungs, beyond which the polygon gets no fill and no coarser fallback
+/// (unlike [`tube_ribbon`]). Real drawings sit far below all three. The vertex bound also caps the
+/// pairwise edge scan, which the crossing bound does not limit for a polygon without crossings; the
+/// values are safety limits, not tuned ones.
 pub const MAX_FILL_VERTICES: usize = 2048;
 const MAX_FILL_CROSSINGS: usize = 4096;
 const MAX_FILL_RUNGS: usize = 8192;
@@ -1875,8 +1877,47 @@ mod flatten_and_fill_tests {
             0,
             "a collinear polygon encloses nothing"
         );
-        let too_many = vec![(0.0, 0.0); MAX_FILL_VERTICES + 1];
-        assert_eq!(nonzero_ribbon(&too_many, &mut chains), 0);
+        assert!(chains.is_empty(), "degenerate polygons append nothing");
+    }
+
+    /// A regular polygon of `count` vertices and radius 100: simple, convex, and never degenerate.
+    fn regular_polygon(count: usize) -> Vec<Point> {
+        (0..count)
+            .map(|index| {
+                let angle = index as f64 * std::f64::consts::TAU / count as f64;
+                (100.0 * angle.cos(), 100.0 * angle.sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn polygons_beyond_the_vertex_bound_get_no_fill() {
+        // The bound is exact: the largest polygon still fills, and one vertex more gets nothing
+        // (a simple convex polygon, so neither the crossing nor the rung bound can be the cause).
+        let mut chains = Vec::new();
+        let length = nonzero_ribbon(&regular_polygon(MAX_FILL_VERTICES), &mut chains);
+        assert!(length > 0, "{length}");
+        assert_eq!(chains.len(), length * 2);
+        chains.clear();
+        assert_eq!(
+            nonzero_ribbon(&regular_polygon(MAX_FILL_VERTICES + 1), &mut chains),
+            0
+        );
+        assert!(chains.is_empty());
+    }
+
+    #[test]
+    fn polygons_beyond_the_crossing_bound_get_no_fill() {
+        // The star {200/99} joins every vertex to the one 99 steps on: 200 vertices, far below
+        // the vertex bound, but 200 * 98 = 19,600 proper edge crossings.
+        let star: Vec<Point> = (0..200)
+            .map(|index| {
+                let angle = (index * 99) as f64 * std::f64::consts::TAU / 200.0;
+                (100.0 * angle.cos(), 100.0 * angle.sin())
+            })
+            .collect();
+        let mut chains = Vec::new();
+        assert_eq!(nonzero_ribbon(&star, &mut chains), 0);
         assert!(chains.is_empty());
     }
 

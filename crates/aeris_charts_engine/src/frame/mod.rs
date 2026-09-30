@@ -35,7 +35,6 @@ use aeris_charts_render::draw_list::{
     Gradient, IRect, LineStyle, LineType, Prim, RasterImage, TextAlign,
 };
 use aeris_charts_render::histogram::{build_histogram, HistogramItem, HistogramParams};
-use aeris_charts_render::line::{dash_split, expand_line, LinePoint};
 
 const THRESHOLD_REGION_LINE_COLOR: Color = Color::rgb(0x78, 0x7B, 0x86);
 const THRESHOLD_REGION_FILL_COLOR: Color = Color::rgba(0x78, 0x7B, 0x86, 0x33);

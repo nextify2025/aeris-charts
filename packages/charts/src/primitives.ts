@@ -12,7 +12,15 @@
 /** Where in the pane's layer stack a view paints (reference `PrimitivePaneViewZOrder`). */
 export type primitive_z_order = "bottom" | "normal" | "top";
 
-/** reference `LineStyle` wire values: 0 solid, 1 dotted, 2 dashed, 3 large-dashed, 4 sparse-dotted. */
+/**
+ * reference `LineStyle` wire values: 0 solid, 1 dotted, 2 dashed, 3 large-dashed, 4 sparse-dotted.
+ * Every backend paints the same dashes: 1 and 4 are the sparse-dot pattern (`width` on, `4 * width`
+ * off) and 2 and 3 are the long-dash pattern (`6 * width` on, `6 * width` off), measured in bitmap
+ * px and started at the first point (`polyline`) or at `x1`/`y1` (`hline`/`vline`).
+ * A dashed `polyline` needs `width >= 0.5` bitmap px and is skipped with a console warning below it,
+ * and one whose visible path would lower to more than 4096 dashes (a dense zigzag through the
+ * pane) is drawn solid with a console warning, so a frame never pays for the path's length.
+ */
 export type primitive_line_style = 0 | 1 | 2 | 3 | 4;
 
 /**

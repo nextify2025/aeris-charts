@@ -245,6 +245,26 @@ mod tests {
         .unwrap()
     }
 
+    /// America/Chicago around 2024 (CST, CDT from 2024-03-10 08:00 UTC, CST from 2024-11-03).
+    fn chicago() -> UtcOffsetSchedule {
+        let at = |y, m, d, h: i64| days_from_civil(y, m, d).unwrap() * 86_400 + h * HOUR;
+        UtcOffsetSchedule::new(vec![
+            UtcOffsetTransition {
+                from_utc_seconds: at(2023, 11, 5, 7),
+                offset_seconds: -6 * HOUR as i32,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: at(2024, 3, 10, 8),
+                offset_seconds: -5 * HOUR as i32,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: at(2024, 11, 3, 7),
+                offset_seconds: -6 * HOUR as i32,
+            },
+        ])
+        .unwrap()
+    }
+
     /// UTC instants of exchange-local bars from `from` to `to` (inclusive) every `step` minutes.
     fn bars(
         zone: &UtcOffsetSchedule,
@@ -495,6 +515,92 @@ mod tests {
             chart.exchange_time().session_start_seconds(),
             -3 * HOUR as i32
         );
+    }
+
+    #[test]
+    fn china_futures_friday_night_and_holiday_reset() {
+        let vwap_reset = |times: &[i64]| {
+            let mut chart = line_chart(times);
+            let vwap = chart.add_vwap(0, None).unwrap();
+            chart.set_time_zone(shanghai());
+            chart.set_session_start_seconds(-3 * HOUR as i32).unwrap();
+            let marks = day_marks(&mut chart);
+            (marks, output(&chart, vwap))
+        };
+
+        // Friday's day session, then its 21:00 night session, then Monday's day session: the
+        // night session opens Monday's trading day, so the only Day mark is at 21:00 and the
+        // Monday morning continues the session.
+        let mut times = bars(&shanghai(), (2024, 1, 5), (13, 30), (15, 0), 30);
+        assert_eq!(times.len(), 4);
+        times.extend(bars(&shanghai(), (2024, 1, 5), (21, 0), (23, 0), 30));
+        times.extend(bars(&shanghai(), (2024, 1, 8), (9, 0), (10, 0), 30));
+        let (marks, vwap) = vwap_reset(&times);
+        assert_eq!(marks, vec![4]);
+        assert_eq!(vwap[4], 104.0);
+        // The session average of the night bars and the Monday morning: 104..=109.
+        assert_eq!(vwap[9], 106.5);
+
+        // A host calendar break: Sep 30 14:30-15:00, then the first date after the break opens
+        // with its day session (no night session before it), then the night session of the next
+        // trading day, then that day's session.
+        let mut times = bars(&shanghai(), (2024, 9, 30), (14, 30), (15, 0), 30);
+        times.extend(bars(&shanghai(), (2024, 10, 8), (9, 0), (10, 0), 30));
+        times.extend(bars(&shanghai(), (2024, 10, 8), (21, 0), (22, 0), 30));
+        times.extend(bars(&shanghai(), (2024, 10, 9), (9, 0), (9, 30), 30));
+        let (marks, vwap) = vwap_reset(&times);
+        assert_eq!(marks, vec![2, 5]);
+        assert_eq!(vwap[2], 102.0);
+        assert_eq!(vwap[5], 105.0);
+        // The day session after the night session does not reset again.
+        assert_eq!(vwap[8], 106.5);
+    }
+
+    #[test]
+    fn cme_sunday_open_starts_monday_and_weekly_vwap_resets() {
+        // Globex: the week opens Sunday 17:00 Central. Bars: Friday afternoon (idx 0-1), the
+        // Sunday evening open (2-3), Monday early morning (4-5) and afternoon (6), and Monday
+        // evening (7-8).
+        let zone = chicago();
+        let mut times = bars(&zone, (2024, 1, 5), (14, 0), (15, 0), 60);
+        times.extend(bars(&zone, (2024, 1, 7), (17, 0), (18, 0), 60));
+        times.extend(bars(&zone, (2024, 1, 8), (0, 0), (1, 0), 60));
+        times.extend(bars(&zone, (2024, 1, 8), (15, 0), (15, 0), 60));
+        times.extend(bars(&zone, (2024, 1, 8), (17, 0), (18, 0), 60));
+        assert_eq!(times.len(), 9);
+        let mut chart = line_chart(&times);
+        let session = chart.add_vwap(0, None).unwrap();
+        let weekly = chart.add_vwap_bands(
+            0,
+            None,
+            aeris_charts_indicators::VwapReset::Weekly,
+            1.0,
+            1.0,
+        )[0];
+        chart.set_time_zone(zone);
+
+        // A -7 h start makes the Sunday 17:00 open Monday's trading day: one Day mark where the
+        // Friday afternoon ends, one where Monday's evening (Tuesday's trading day) opens, and
+        // the session and weekly VWAP reset at the open rather than at Monday midnight.
+        chart.set_session_start_seconds(-7 * HOUR as i32).unwrap();
+        assert_eq!(day_marks(&mut chart), vec![2, 7]);
+        let values = output(&chart, session);
+        assert_eq!(values[2], 102.0);
+        assert_eq!(values[6], 104.0); // the average of 102..=106
+        assert_eq!(values[7], 107.0);
+        let basis = output(&chart, weekly);
+        assert_eq!(basis[2], 102.0);
+        assert_eq!(basis[8], 105.0); // 102..=108: Sunday open, Monday and Tuesday's evening
+        assert_eq!(crosshair_label(&mut chart, 2), "07 Jan '24   17:00");
+
+        // With a midnight start the Sunday block is its own trading day: a Day mark appears at
+        // Monday midnight in the middle of the session, and the weekly reset waits for Monday's
+        // calendar date (one session late).
+        chart.set_session_start_seconds(0).unwrap();
+        assert_eq!(day_marks(&mut chart), vec![2, 4]);
+        let basis = output(&chart, weekly);
+        assert_eq!(basis[2], 101.0, "Sunday stays in the week of Friday");
+        assert_eq!(basis[4], 104.0);
     }
 
     #[test]

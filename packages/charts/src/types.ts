@@ -1471,8 +1471,12 @@ export interface time_scale_options {
   /**
    * Seconds from exchange-local midnight at which a trading day begins (default `0`). Negative
    * values assign an evening session to the next trading day (e.g. `-3 * 3600` makes a 21:00
-   * night session start the next day; a Friday-night session then belongs to Monday). Drives
-   * Day/Month/Year tick marks, VWAP session/weekly/monthly resets, and pivot sessions.
+   * night session start the next day; a Friday-night session then belongs to Monday, and
+   * `-25200` makes the Sunday 17:00 open of a Globex-style market belong to Monday). With a
+   * negative start every Saturday or Sunday instant belongs to Monday, and window placement
+   * (`session_slot_times`, `resample_boundaries`, `set_trade_stream_sessions`) assumes the week
+   * opens on Friday evening. Drives Day/Month/Year tick marks, VWAP session/weekly/monthly
+   * resets, and pivot sessions.
    */
   session_start?: number;
   /**
@@ -1540,7 +1544,13 @@ export interface session_slot_options {
   interval_seconds: number;
   /** Exchange time zone: an IANA name or an explicit schedule (default `"UTC"`). */
   time_zone?: time_zone;
-  /** Trading-day start relative to local midnight, like the chart's `session_start` (default 0). */
+  /**
+   * Trading-day start relative to local midnight (default 0). It is this call's own value and is
+   * not read from the chart, so pass the chart's `session_start` (`-10800` for China futures) to
+   * place night windows on the evening before. A negative start places windows assuming the week
+   * opens on Friday evening; a Sunday-open market (CME Globex) passes `0` with one call per
+   * evening date and `[["17:00", "16:00"]]`.
+   */
   session_start?: number;
   /**
    * `"bar_open"` (default, the canonical bar time): 09:30..11:29 and 13:00..14:59 for an A-share
@@ -1563,7 +1573,10 @@ export interface trade_session_options {
   /**
    * Exchange-local `["HH:MM", "HH:MM"]` windows in chronological order (at most 32), placed in the
    * chart's `time_zone` and `session_start` like {@link session_slot_options.windows}. Each window
-   * restarts the bar grid at its open; an interval of one day gives one bar per trading day.
+   * restarts the bar grid at its open; an interval of one day gives one bar per trading day. The
+   * one list applies to every date, and there is no per-call start: a Sunday-open market (CME
+   * Globex) keeps the chart's `session_start` at `0` with one crossing window
+   * `[["17:00", "16:00"]]`, because a negative chart start places Monday's window on Friday evening.
    */
   windows: readonly (readonly [string, string])[];
   /** Default `"fold"`. */
@@ -1575,7 +1588,10 @@ export interface resample_boundary {
   start_time: number;
   /** Exclusive. */
   end_time: number;
-  /** Opaque session identity; {@link resample_boundaries} uses the trading date as `YYYYMMDD`. */
+  /**
+   * Opaque session identity; {@link resample_boundaries} uses the requested date as `YYYYMMDD`
+   * (the trading date, or the evening date for a Sunday-open market passed with `session_start: 0`).
+   */
   session_id: number;
 }
 
@@ -1587,7 +1603,14 @@ export interface resample_boundary_options {
   windows: readonly (readonly [string, string])[];
   /** Exchange time zone: an IANA name or an explicit schedule (default `"UTC"`). */
   time_zone?: time_zone;
-  /** Trading-day start relative to local midnight, like the chart's `session_start` (default 0). */
+  /**
+   * Trading-day start relative to local midnight (default 0). It is this call's own value and is
+   * not read from the chart: pass `-10800` for China futures. A Sunday-open market (CME Globex)
+   * passes `0`, the evening dates, and `[["17:00", "16:00"]]`; `-25200` with the Monday date places
+   * that session on Friday evening and omits the Sunday and Monday rows. `windows` apply to every
+   * date of the call, so call once per window set and concatenate the boundaries when dates differ
+   * (for example the first trading day after a break has no night window).
+   */
   session_start?: number;
   /**
    * `"window"` (default): one boundary per session window, so intraday bars restart at every
@@ -2013,7 +2036,8 @@ export interface series_options {
    * compute on its own rows and follow the same points, `data()` keeps its own rows, and value
    * snapshots report the point's time. Line, area, baseline, histogram, bar, and candlestick
    * series that own their rows, on a time axis, only; others (and any series on a non-time bar
-   * axis) throw `unsupported_operation`.
+   * axis) throw `unsupported_operation`. Worker charts take it in `add_series` options and change
+   * it with `offscreen_chart.apply_series_options`.
    */
   time_alignment: time_alignment;
   /**
@@ -2984,7 +3008,10 @@ export interface pattern_tool_options {
 export interface shape_tool_options {
   /**
    * Polyline only: join the last vertex back to the first and, while `fill_enabled`, fill the
-   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it.
+   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it. The fill is
+   * bounded work: more than 2,048 vertices, or a polygon so heavily self-intersecting that its
+   * fill exceeds the tessellation bounds, paints the outline only (no fill, no interior selection
+   * target, no error).
    */
   closed?: boolean;
 }

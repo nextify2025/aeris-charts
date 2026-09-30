@@ -11,8 +11,10 @@
 
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, LineStyle, LineType, Prim, TextAlign};
+use aeris_charts_render::line::{
+    crisp_span, push_clipped_stroke, push_line_stroke, push_styled_stroke,
+};
 
-use super::series_geometry::{push_clipped_stroke, push_styled_stroke};
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
 use crate::drawings::{
@@ -44,35 +46,6 @@ const TREND_TEXT_PLACEHOLDER_ALPHA: u8 = 0x99;
 
 fn point_on_segment(a: (f64, f64), b: (f64, f64), t: f64) -> (f64, f64) {
     (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
-}
-
-/// A crisp line's `[from, to]` span (either order) clamped to `pane` in whole pixels, `None` when
-/// it misses the pane. Executors dash a crisp line from its start, so a start clamped into the
-/// pane moves back to a whole dash period from the unclamped start and keeps the pattern's phase;
-/// the executors' dash loops stay bounded by the pane.
-fn crisp_span(
-    from: f64,
-    to: f64,
-    (low, high): (f64, f64),
-    width: i32,
-    style: LineStyle,
-) -> Option<(i32, i32)> {
-    let (start, end) = (from.min(to).round(), from.max(to).round());
-    if !(start <= high && end >= low) {
-        return None;
-    }
-    let period: f64 = style
-        .dash_pattern(width as f32)
-        .iter()
-        .copied()
-        .map(f64::from)
-        .sum();
-    let clamped = if start < low && period > 0.0 {
-        low - (low - start).rem_euclid(period)
-    } else {
-        start.max(low)
-    };
-    Some((clamped.round() as i32, end.min(high) as i32))
 }
 
 /// A core segment stroke; a dashed or dotted one reaches executors as solid dash runs clipped to
@@ -793,7 +766,7 @@ impl ChartEngine {
                         [left_px as f32, position.entry_y as f32],
                         [right_px as f32, position.entry_y as f32],
                     ];
-                    super::series_geometry::push_line_stroke(
+                    push_line_stroke(
                         out,
                         points,
                         &entry_path,
@@ -1305,7 +1278,7 @@ impl ChartEngine {
                     }
                 }
                 let color = drawing.stroke_color();
-                super::series_geometry::push_line_stroke(
+                push_line_stroke(
                     out,
                     points,
                     &center,
@@ -1316,7 +1289,7 @@ impl ChartEngine {
                 );
                 let band = Color::rgba(color.r(), color.g(), color.b(), color.a().min(150));
                 for path in [&upper, &lower] {
-                    super::series_geometry::push_line_stroke(
+                    push_line_stroke(
                         out,
                         points,
                         path,
@@ -1789,7 +1762,7 @@ impl ChartEngine {
                 [run_x as f32, run_y as f32],
             ];
             if progress_path[0] != progress_path[1] {
-                super::series_geometry::push_line_stroke(
+                push_line_stroke(
                     out,
                     points,
                     &progress_path,
