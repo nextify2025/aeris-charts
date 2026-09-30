@@ -15,7 +15,7 @@ pub struct GpuiFrameMetrics {
     pub ops: u32,
     /// Axis-aligned quads (`Rect`/`RectFrame`/`HLine`/`VLine`/`Background`/`RoundRect` fast path).
     pub quads: u32,
-    /// Triangle-mesh paths (`Polyline`/`AreaFill`/`BandFill`/`Circle`/`Triangle`/`RoundRect`).
+    /// Triangle-mesh paths (`Polyline`/`Segments`/`AreaFill`/`BandFill`/`Circle`/`Triangle`/`RoundRect`).
     pub paths: u32,
     /// Triangles across every mesh.
     pub triangles: u32,

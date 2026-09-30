@@ -85,6 +85,7 @@ export function dataset_metadata(points, seed, configuration = {}) {
       interval_seconds: configuration.interval_seconds ?? 60,
       start_price: configuration.start_price ?? 100,
       volatility: configuration.volatility ?? 0.8,
+      ...(configuration.studies === undefined ? {} : { studies: configuration.studies }),
     },
   };
 }

@@ -150,8 +150,8 @@ pub fn crisp_rects(dpr: f32) -> Fixture {
     }
 }
 
-/// **Antialiased triangle geometry.** Polyline strokes, a band fill, a disc, a triangle, and a
-/// rounded rect. Both GPUI and WebGPU consume Aeris's triangles; Canvas2D and tiny-skia describe
+/// **Antialiased triangle geometry.** A polyline stroke, a batch of one-bar segments, a band fill, a
+/// disc, a triangle, and a rounded rect. Both GPUI and WebGPU consume Aeris's triangles; Canvas2D and tiny-skia describe
 /// the same shapes analytically and antialias them. A residual here is expected and is attributable
 /// to edge antialiasing, not to geometry.
 pub fn tessellated(dpr: f32) -> Fixture {
@@ -186,6 +186,24 @@ pub fn tessellated(dpr: f32) -> Fixture {
         style: LineStyle::Solid,
         line_type: LineType::Simple,
         color: LINE,
+    });
+
+    // A batch of touching one-bar segments at stepping heights, like a period-reset study drawn
+    // on daily bars. The pairs share boundary columns, where a single-path stroke (Canvas2D)
+    // unions coverage and a per-pair mesh (GPUI, WebGPU) composites twice.
+    let first = points.len() as u32;
+    let bars = 10u32;
+    for bar in 0..bars {
+        let x = 20.0 + bar as f32 * 44.0;
+        let y = 36.0 + (bar % 4) as f32 * 7.0;
+        points.push([x * dpr, y * dpr]);
+        points.push([(x + 44.0) * dpr, y * dpr]);
+    }
+    prims.push(Prim::Segments {
+        first_point: first,
+        segment_count: bars,
+        width: 3.0 * dpr,
+        color: DOWN,
     });
 
     // A solid band fill between two edges over a shared x sequence.

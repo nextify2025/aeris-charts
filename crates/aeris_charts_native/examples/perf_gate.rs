@@ -20,6 +20,9 @@
 //!              bounded capacity of the aggregate price columns composite-input studies retain
 //!   Target N — live ticks plus frame construction with regression trends anchored across a
 //!              1M-row source (data-reading drawings follow ticks by the changed rows)
+//!   Target O — daily-reset studies on daily bars: report-only frame, Canvas2D call, rasterizer,
+//!              WebGPU scheduling, and hover cost of the per-bar segments a session-reset study
+//!              draws when every bar is its own period
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
@@ -38,6 +41,9 @@ use aeris_charts_engine::{
     GeneralSeriesOptions, GeneralXyInput, GestureResolver, HorizontalDomain, InputDevice,
     InputTarget, PointerSample, SeriesKind, TradeBubbleOptions, TradeStudyOptions,
 };
+use aeris_charts_native::render_prims;
+use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
+use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::Prim;
 use aeris_charts_render_wgpu::{prims_to_group, DrawGroup, TexQuadInstance};
 
@@ -610,6 +616,282 @@ fn regression_tick_cost(rows: usize, regressions: usize, ticks: usize) -> (f64, 
     samples.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
     (mean, samples[samples.len() / 2], samples[samples.len() - 1])
+}
+
+/// Counts every Canvas2D call one frame issues (the wasm host pays a JS call for each) and the
+/// path-building calls separately.
+#[derive(Default)]
+struct CallCounter {
+    calls: usize,
+    strokes: usize,
+}
+
+impl Canvas2d for CallCounter {
+    fn set_fill_solid(&mut self, _: Color) {
+        self.calls += 1;
+    }
+    fn set_fill_vgradient(&mut self, _: f32, _: f32, _: Color, _: Color) {
+        self.calls += 1;
+    }
+    fn set_stroke(&mut self, _: Color) {
+        self.calls += 1;
+    }
+    fn set_line_width(&mut self, _: f32) {
+        self.calls += 1;
+    }
+    fn set_line_dash(&mut self, _: &[f32]) {
+        self.calls += 1;
+    }
+    fn fill_rect(&mut self, _: f32, _: f32, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn begin_path(&mut self) {
+        self.calls += 1;
+    }
+    fn move_to(&mut self, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn line_to(&mut self, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn close_path(&mut self) {
+        self.calls += 1;
+    }
+    fn arc(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32) {
+        self.calls += 1;
+    }
+    fn stroke(&mut self) {
+        self.calls += 1;
+        self.strokes += 1;
+    }
+    fn fill(&mut self) {
+        self.calls += 1;
+    }
+    fn fill_rotated_text(
+        &mut self,
+        _: &str,
+        _: f32,
+        _: f32,
+        _: &str,
+        _: Color,
+        _: aeris_charts_render::draw_list::TextAlign,
+        _: f32,
+    ) {
+        self.calls += 1;
+    }
+}
+
+/// Every layer of `frame` in paint order (under, main, top) with its pane's point pool.
+fn for_each_layer(frame: &ChartFrame, mut visit: impl FnMut(&[Prim], &[[f32; 2]])) {
+    for pane in &frame.panes {
+        for layer in [&pane.under, &pane.main, &pane.top_prims] {
+            visit(layer, &pane.points);
+        }
+    }
+}
+
+/// What Target O measures for one daily-bar chart.
+struct DailyStudyCost {
+    outputs: usize,
+    prims: usize,
+    lone_polylines: usize,
+    batches: usize,
+    batched_pairs: usize,
+    pool_points: usize,
+    rebuild_ms: f64,
+    retained_ms: f64,
+    canvas_calls: usize,
+    canvas_strokes: usize,
+    canvas_counting_ms: f64,
+    raster_ms: f64,
+    group_ms: f64,
+    hit_ms: f64,
+}
+
+/// Target O: `rows` daily candles on a 1600 px chart, fit, optionally with the session-reset studies
+/// that draw one bar-wide segment per bar (session VWAP, VWAP bands, standard pivots). Times one
+/// full series rebuild, one crosshair-only (retained) frame, the Canvas2D call stream and its
+/// tiny-skia rasterization, WebGPU group scheduling, and one pointer hover arbitration.
+fn daily_reset_study_cost(rows: usize, min_bar_spacing: f64, studies: bool) -> DailyStudyCost {
+    use aeris_charts_engine::{IndicatorKind, PivotKind, VwapReset};
+
+    const DAY: f64 = 86_400.0;
+    const START: f64 = 1_789_948_800.0;
+    let times = (0..rows)
+        .map(|row| START + row as f64 * DAY)
+        .collect::<Vec<_>>();
+    let columns: [Vec<f64>; 4] =
+        std::array::from_fn(|column| (0..rows).map(|row| indicator_bar(row, 0)[column]).collect());
+    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &times,
+            &columns[0],
+            &columns[1],
+            &columns[2],
+            &columns[3],
+        )
+        .expect("valid daily source");
+    let mut outputs = 0;
+    if studies {
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let volumes = (0..rows)
+            .map(|row| ((row * 37) % 900 + 100) as f64)
+            .collect::<Vec<_>>();
+        chart
+            .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+            .expect("valid daily volume");
+        chart.set_series_visible(volume, false);
+        for (kind, weighted) in [
+            (IndicatorKind::Vwap, true),
+            (
+                IndicatorKind::VwapBands {
+                    reset: VwapReset::Session,
+                    standard_deviation: 1.0,
+                    percent: 1.0,
+                },
+                true,
+            ),
+            (
+                IndicatorKind::PivotPoints {
+                    variant: PivotKind::Standard,
+                },
+                false,
+            ),
+        ] {
+            outputs += chart
+                .add_indicator_kind(0, kind, weighted.then_some(volume))
+                .len();
+        }
+    }
+    chart.time_scale.set_width(1600.0);
+    chart.set_min_bar_spacing(min_bar_spacing);
+    chart.fit_content();
+    let mut frame = ChartFrame::default();
+    chart.build_frame_into(&mut frame);
+
+    // One full series rebuild: alternate the view by one bar so every coordinate changes.
+    let time_of_last = times[rows - 1];
+    let ranges = [(-0.5, rows as f64 - 0.5), (-1.5, rows as f64 - 1.5)];
+    const REBUILDS: usize = 20;
+    let mut samples = Vec::with_capacity(REBUILDS);
+    for index in 0..REBUILDS {
+        let (from, to) = ranges[index % 2];
+        chart.set_visible_logical_range(from, to);
+        let started = Instant::now();
+        chart.build_frame_into(&mut frame);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let rebuild_ms = samples[samples.len() / 2];
+    chart.set_visible_logical_range(ranges[0].0, ranges[0].1);
+    chart.build_frame_into(&mut frame);
+
+    // Crosshair-only frames: the retained series layer is re-assembled, never rebuilt.
+    const CURSOR_FRAMES: usize = 100;
+    let mut samples = Vec::with_capacity(CURSOR_FRAMES);
+    for index in 0..CURSOR_FRAMES {
+        let time = time_of_last - (index % 2) as f64 * DAY;
+        chart.set_crosshair_position(100.0, time, 0);
+        let started = Instant::now();
+        chart.build_frame_into(&mut frame);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let retained_ms = samples[samples.len() / 2];
+
+    let mut prims = 0;
+    let mut lone_polylines = 0;
+    let mut batches = 0;
+    let mut batched_pairs = 0;
+    let mut pool_points = 0;
+    for pane in &frame.panes {
+        pool_points += pane.points.len();
+        for prim in pane.under.iter().chain(&pane.main).chain(&pane.top_prims) {
+            prims += 1;
+            match prim {
+                Prim::Polyline { point_count: 2, .. } => lone_polylines += 1,
+                Prim::Segments { segment_count, .. } => {
+                    batches += 1;
+                    batched_pairs += *segment_count as usize;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let viewport = Viewport {
+        width: 1600.0,
+        height: 800.0,
+    };
+    let mut counter = CallCounter::default();
+    for_each_layer(&frame, |prims, points| {
+        execute(prims, points, &mut counter, viewport);
+    });
+    const EXECUTIONS: usize = 20;
+    let started = Instant::now();
+    for _ in 0..EXECUTIONS {
+        let mut counter = CallCounter::default();
+        for_each_layer(&frame, |prims, points| {
+            execute(prims, points, &mut counter, viewport);
+        });
+        std::hint::black_box(counter.calls);
+    }
+    let canvas_counting_ms = started.elapsed().as_secs_f64() * 1000.0 / EXECUTIONS as f64;
+
+    // The same stream into a real rasterizer (tiny-skia): a CPU proxy for the browser's 2D stroker,
+    // not a Chromium measurement.
+    const RASTERS: usize = 5;
+    let started = Instant::now();
+    for _ in 0..RASTERS {
+        for_each_layer(&frame, |prims, points| {
+            std::hint::black_box(render_prims(1600, 800, Color::rgb(0, 0, 0), prims, points));
+        });
+    }
+    let raster_ms = started.elapsed().as_secs_f64() * 1000.0 / RASTERS as f64;
+
+    const GROUPS: usize = 20;
+    let started = Instant::now();
+    for _ in 0..GROUPS {
+        let mut group = DrawGroup::default();
+        for_each_layer(&frame, |prims, points| {
+            prims_to_group(
+                prims,
+                points,
+                &mut group,
+                &mut |_: &Prim| None::<TexQuadInstance>,
+                &mut |_: &Prim| None::<TexQuadInstance>,
+            );
+        });
+        std::hint::black_box(group.tris.len());
+    }
+    let group_ms = started.elapsed().as_secs_f64() * 1000.0 / GROUPS as f64;
+
+    const HOVERS: usize = 200;
+    let started = Instant::now();
+    for index in 0..HOVERS {
+        let x = 20.0 + index as f64 * (1500.0 / HOVERS as f64);
+        std::hint::black_box(chart.hit_test_series(x, 200.0));
+    }
+    let hit_ms = started.elapsed().as_secs_f64() * 1000.0 / HOVERS as f64;
+
+    DailyStudyCost {
+        outputs,
+        prims,
+        lone_polylines,
+        batches,
+        batched_pairs,
+        pool_points,
+        rebuild_ms,
+        retained_ms,
+        canvas_calls: counter.calls,
+        canvas_strokes: counter.strokes,
+        canvas_counting_ms,
+        raster_ms,
+        group_ms,
+        hit_ms,
+    }
 }
 
 /// Target D2 (report-only): the data layer's share of one retention trim, across the series count
@@ -1863,6 +2145,48 @@ fn main() {
         regression_mean,
         INDICATOR_TICK_BUDGET_MS,
     );
+
+    // ---- Target O: daily-reset studies on daily bars (report-only) ----------------------------
+    // A study that resets per session (session VWAP, VWAP bands, pivots) on daily bars makes every
+    // drawn bar its own period, so each bar draws one bar-wide segment. The study-attributable
+    // cost is the difference against the same chart without studies.
+    println!(
+        "Target O — daily-reset studies on daily bars (report-only, study cost = with - without):"
+    );
+    for (rows, spacing) in [(2_520, 0.5), (25_200, 0.01)] {
+        let without = daily_reset_study_cost(rows, spacing, false);
+        let with = daily_reset_study_cost(rows, spacing, true);
+        println!(
+            "  {rows} rows, min bar spacing {spacing} ({} study outputs): prims {} -> {} ({} two-point polylines, {} segment batches of {} pairs), pool {} -> {} points",
+            with.outputs,
+            without.prims,
+            with.prims,
+            with.lone_polylines,
+            with.batches,
+            with.batched_pairs,
+            without.pool_points,
+            with.pool_points,
+        );
+        println!(
+            "    full rebuild {:.2} -> {:.2} ms, cursor-only frame {:.3} -> {:.3} ms",
+            without.rebuild_ms, with.rebuild_ms, without.retained_ms, with.retained_ms
+        );
+        println!(
+            "    Canvas2D: {} calls / {} strokes (was {} / {}), counting canvas {:.2} ms (was {:.2}), tiny-skia {:.2} ms (was {:.2})",
+            with.canvas_calls,
+            with.canvas_strokes,
+            without.canvas_calls,
+            without.canvas_strokes,
+            with.canvas_counting_ms,
+            without.canvas_counting_ms,
+            with.raster_ms,
+            without.raster_ms,
+        );
+        println!(
+            "    prims_to_group {:.2} -> {:.2} ms, hit_test_series {:.3} -> {:.3} ms/sample",
+            without.group_ms, with.group_ms, without.hit_ms, with.hit_ms
+        );
+    }
 
     let all_pass = a_pass
         && b_pass

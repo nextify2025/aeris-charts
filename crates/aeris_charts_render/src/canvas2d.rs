@@ -13,7 +13,9 @@
 //! map onto native 2D path/gradient calls, which the wgpu path approximates with tessellation.
 
 use crate::color::Color;
-use crate::draw_list::{text_font_spec, IRect, LineStyle, LineType, Prim, RasterImage, TextAlign};
+use crate::draw_list::{
+    segment_points, text_font_spec, IRect, LineStyle, LineType, Prim, RasterImage, TextAlign,
+};
 use crate::line::{expand_band, expand_line, LinePoint};
 
 /// Abstract 2D drawing target: the subset of `CanvasRenderingContext2D` this executor needs.
@@ -190,7 +192,7 @@ fn pool_slice(points: &[[f32; 2]], first: u32, count: u32) -> Vec<LinePoint> {
 }
 
 /// Execute one layer of prims against a 2D target. `points` is the layer's shared point pool
-/// (referenced by `Polyline`/`AreaFill`). `Text` runs go through the target's text engine in
+/// (referenced by `Polyline`/`Segments`/`AreaFill`/`BandFill`). `Text` runs go through the target's text engine in
 /// prim order — the browser target rasterizes the same glyphs the WebGPU host samples into its
 /// atlas, keeping the two backends pixel-identical.
 pub fn execute(
@@ -276,6 +278,30 @@ pub fn execute(
                 trace_polyline(target, &pts, *line_type);
                 target.stroke();
                 target.set_line_dash(&[]);
+            }
+            Prim::Segments {
+                first_point,
+                segment_count,
+                width,
+                color,
+            } => {
+                let Some(pairs) = segment_points(points, *first_point, *segment_count) else {
+                    continue;
+                };
+                if pairs.is_empty() {
+                    continue;
+                }
+                // One path of independent pairs, one stroke. The dash reset stays explicit: a host
+                // plugin sharing the context may have left a pattern behind.
+                target.set_stroke(*color);
+                target.set_line_width(*width);
+                target.set_line_dash(&[]);
+                target.begin_path();
+                for [from, to] in pairs.as_chunks::<2>().0 {
+                    target.move_to(from[0], from[1]);
+                    target.line_to(to[0], to[1]);
+                }
+                target.stroke();
             }
             Prim::AreaFill {
                 first_point,
@@ -796,6 +822,42 @@ mod tests {
                 "line_dash []".into(),
             ]
         );
+    }
+
+    #[test]
+    fn segments_stroke_as_one_path() {
+        let points = [
+            [9.0f32, 9.0],
+            [0.0, 5.0],
+            [10.0, 5.0],
+            [12.0, 7.0],
+            [22.0, 7.0],
+        ];
+        let segments = |first_point, segment_count| Prim::Segments {
+            first_point,
+            segment_count,
+            width: 2.0,
+            color: C,
+        };
+        // Two independent pairs share one path and one stroke, with the dash reset up front.
+        assert_eq!(
+            run(&[segments(1, 2)], &points),
+            vec![
+                "stroke_color 102030ff".to_string(),
+                "line_width 2".into(),
+                "line_dash []".into(),
+                "begin".into(),
+                "move 0 5".into(),
+                "line 10 5".into(),
+                "move 12 7".into(),
+                "line 22 7".into(),
+                "stroke".into(),
+            ]
+        );
+        // A window that leaves the pool, or holds no pair, draws nothing and touches no state.
+        assert!(run(&[segments(3, 2)], &points).is_empty());
+        assert!(run(&[segments(1, 0)], &points).is_empty());
+        assert!(run(&[segments(u32::MAX, 1)], &points).is_empty());
     }
 
     #[test]

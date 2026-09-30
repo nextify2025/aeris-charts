@@ -7,11 +7,12 @@
 use aeris_charts_engine::{
     marker_pos, marker_shape, AxisDimension, CategoryScaleType, ChartEngine, ContinuousScaleType,
     GeneralAxisOptions, GeneralScaleType, GeneralSeriesOptions, GeneralXyInput, HorizontalDomain,
-    IndicatorInputSource, IndicatorKind, IndicatorOutputStyle, Marker, PriceLine, SeriesKind,
+    IndicatorInputSource, IndicatorKind, IndicatorOutputStyle, Marker, PivotKind, PriceLine,
+    SeriesKind, VwapReset,
 };
 use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, Prim, RasterImage};
+use aeris_charts_render::draw_list::{LineStyle, LineType, Prim, RasterImage};
 use std::sync::Arc;
 
 use aeris_charts_render_wgpu::{
@@ -729,6 +730,77 @@ fn range_area_segment_reaches_canvas2d_and_webgpu_fill_and_stroke_paths() {
 }
 
 /// Runs must tile their pipeline's buffer contiguously, in ascending order, covering it exactly.
+/// Session VWAP, its bands, and standard pivots over 60 daily candles: every bar is its own
+/// period, so each of the 11 outputs lowers to one `Segments` batch.
+#[test]
+fn daily_reset_studies_reach_the_wgpu_group() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times: Vec<f64> = (0..60).map(|day| (day * 86_400) as f64).collect();
+    let close: Vec<f64> = (0..60).map(|day| 10.0 + day as f64 * 0.25).collect();
+    let open: Vec<f64> = close.iter().map(|v| v - 0.1).collect();
+    let high: Vec<f64> = close.iter().map(|v| v + 0.3).collect();
+    let low: Vec<f64> = close.iter().map(|v| v - 0.4).collect();
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    chart.add_vwap(0, None).unwrap();
+    chart.add_vwap_bands(0, None, VwapReset::Session, 1.0, 5.0);
+    chart.add_pivot_points(0, PivotKind::Standard);
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+
+    let batches: Vec<&Prim> = pane
+        .main
+        .iter()
+        .filter(|prim| matches!(prim, Prim::Segments { .. }))
+        .collect();
+    assert_eq!(batches.len(), 11, "one batch per study output");
+    let group_of = |prims: &[Prim]| {
+        let mut group = DrawGroup::default();
+        prims_to_group(prims, &pane.points, &mut group, &mut |_| None, &mut |_| {
+            None
+        });
+        group
+    };
+    for batch in batches {
+        let Prim::Segments {
+            first_point,
+            segment_count,
+            width,
+            color,
+        } = batch
+        else {
+            unreachable!("filtered to Segments");
+        };
+        // The same pairs as separate solid two-point polylines.
+        let reference: Vec<Prim> = (0..*segment_count)
+            .map(|pair| Prim::Polyline {
+                first_point: first_point + 2 * pair,
+                point_count: 2,
+                width: *width,
+                style: LineStyle::Solid,
+                line_type: LineType::Simple,
+                color: *color,
+            })
+            .collect();
+        let batched = group_of(std::slice::from_ref(batch));
+        let separate = group_of(&reference);
+        assert!(!batched.tris.is_empty(), "the batch reaches the tri buffer");
+        let vertices = |group: &DrawGroup| {
+            group
+                .tris
+                .iter()
+                .map(|vertex| (vertex.pos, vertex.color))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(vertices(&batched), vertices(&separate));
+        assert_eq!(batched.runs, separate.runs);
+        assert_runs_tile_buffers(&batched);
+    }
+}
+
 fn assert_runs_tile_buffers(group: &DrawGroup) {
     for (pipeline, len) in [
         (RunPipeline::Tri, group.tris.len()),
