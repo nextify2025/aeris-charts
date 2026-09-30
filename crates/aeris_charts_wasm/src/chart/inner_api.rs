@@ -2200,10 +2200,12 @@ impl ChartInner {
     }
 
     /// Apply `timeScale.timeZone` (`"UTC"` or explicit `{from_utc_seconds, offset_seconds}`
-    /// transitions), `timeScale.sessionStart` (seconds from local midnight), and/or
-    /// `timeScale.tickMarks` (explicit `[{time, label?}]` axis marks or `null`). The package
-    /// resolves IANA names to schedules and mark times to UTC seconds before calling. Returns an
-    /// empty string on success or the validation message; a rejected patch changes nothing.
+    /// transitions), `timeScale.sessionStart` (seconds from local midnight),
+    /// `timeScale.tickMarks` (explicit `[{time, label?}]` axis marks or `null`), and/or
+    /// `timeScale.barTimeLabel` (`"open"`, `null`, or `{anchor: "close", interval_seconds,
+    /// windows?}`). The package resolves IANA names to schedules and mark times to UTC seconds
+    /// before calling. Returns an empty string on success or the validation message; a rejected
+    /// patch changes nothing.
     pub fn set_exchange_time_json(&mut self, time_scale_json: &str) -> String {
         let time_scale: serde_json::Value = match serde_json::from_str(time_scale_json) {
             Ok(value) => value,
@@ -2240,6 +2242,15 @@ impl ChartInner {
             return f64::NAN;
         }
         self.engine.exchange_local_seconds(time as i64) as f64
+    }
+
+    /// The UTC instant a bar identified by open time `time` prints under
+    /// `timeScale.barTimeLabel` (`time` itself unless a close-time label is set).
+    pub fn bar_label_time(&self, time: f64) -> f64 {
+        if !time.is_finite() {
+            return f64::NAN;
+        }
+        self.engine.bar_label_time(time as i64) as f64
     }
 
     /// 0 = normal, 1 = magnet (reference default), 2 = hidden, 3 = magnet OHLC.

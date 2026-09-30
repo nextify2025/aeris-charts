@@ -657,6 +657,71 @@ mod tests {
     }
 
     #[test]
+    fn sequence_axis_weights_ignore_a_close_time_label() {
+        // A close-time label prints an interval after a bar's identity, but a non-time sequence
+        // axis prints and weighs its own open times: every weight path stays unshifted, the
+        // plain append included and a retention trim in the same sync as an append.
+        let close_label = crate::BarTimeLabel::Close {
+            interval_seconds: 60,
+            windows: Vec::new(),
+        };
+        let installed_and_expected = |chart: &mut ChartEngine| {
+            let times = chart
+                .sequence_points()
+                .unwrap()
+                .iter()
+                .map(|point| point.open_timestamp_micros.div_euclid(1_000_000))
+                .collect::<Vec<_>>();
+            let mut expected = vec![0u8; times.len()];
+            aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_in(
+                &times,
+                &mut expected,
+                0,
+                &chart.exchange_time,
+            );
+            let mut installed = chart
+                .tick_marks
+                .build(1.0, 0.0)
+                .iter()
+                .map(|mark| (mark.index as usize, mark.weight))
+                .collect::<Vec<_>>();
+            installed.sort_unstable_by_key(|(index, _)| *index);
+            (
+                installed
+                    .into_iter()
+                    .map(|(_, weight)| weight)
+                    .collect::<Vec<_>>(),
+                expected,
+            )
+        };
+        let (mut chart, id) = sequence_chart(100);
+        chart.set_bar_time_label(close_label).unwrap();
+        let (installed, expected) = installed_and_expected(&mut chart);
+        assert_eq!(installed, expected, "label set after the data");
+        // Ten appended bars extend the weights incrementally.
+        for i in 100..110 {
+            chart
+                .update_footprint_trade(id, trade(1_000_000_000 + i * 1_000_000, 101.0))
+                .unwrap();
+        }
+        let (installed, expected) = installed_and_expected(&mut chart);
+        assert_eq!(installed, expected, "incremental append");
+        // A batch that trims and appends in one sync rebuilds them.
+        assert!(chart.set_series_max_points(id, Some(128)));
+        let batch = (110..150)
+            .map(|i| trade(1_000_000_000 + i * 1_000_000, 101.0))
+            .collect::<Vec<_>>();
+        chart.update_footprint_trades(id, batch).unwrap();
+        assert_eq!(chart.sequence_points().unwrap().len(), 124);
+        let (installed, expected) = installed_and_expected(&mut chart);
+        assert_eq!(installed, expected, "trim and append");
+        // Clearing the label rebuilds them again without changing a sequence axis.
+        chart.set_bar_time_label(crate::BarTimeLabel::Open).unwrap();
+        let (installed, expected) = installed_and_expected(&mut chart);
+        assert_eq!(installed, expected, "label cleared");
+    }
+
+    #[test]
     fn sequence_axis_retention_keeps_a_scrolled_back_view() {
         let (mut chart, id) = sequence_chart(128);
         assert!(chart.set_series_max_points(id, Some(128)));

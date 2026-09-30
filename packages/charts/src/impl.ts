@@ -3609,8 +3609,16 @@ class time_scale_impl implements time_scale_api {
   apply_options(options: Partial<time_scale_options>): void {
     // Exchange time and explicit marks validate first, together, so a rejected zone or mark list
     // leaves every other option untouched.
-    if (options.time_zone !== undefined || options.session_start !== undefined || options.tick_marks !== undefined) {
-      this.chart.apply_exchange_time(options.time_zone, options.session_start, options.tick_marks);
+    if (
+      options.time_zone !== undefined || options.session_start !== undefined ||
+      options.tick_marks !== undefined || options.bar_time_label !== undefined
+    ) {
+      this.chart.apply_exchange_time(
+        options.time_zone,
+        options.session_start,
+        options.tick_marks,
+        options.bar_time_label,
+      );
     }
   if (options.bar_spacing !== undefined) this.chart.wasm.apply_bar_spacing_option(options.bar_spacing);
   if (options.right_offset !== undefined) this.chart.wasm.apply_right_offset_option(options.right_offset);
@@ -5075,11 +5083,18 @@ export class chart_impl implements chart_api {
     return Date.now() / 1000;
   }
 
-  /** Resolve and apply `time_zone` / `session_start` / explicit `tick_marks` as one validated step;
-   *  throws without changing anything on error. */
-  apply_exchange_time(zone: time_zone | undefined, session_start: number | undefined, tick_marks?: unknown): void {
+  /** Resolve and apply `time_zone` / `session_start` / explicit `tick_marks` / `bar_time_label` as
+   *  one validated step; throws without changing anything on error. */
+  apply_exchange_time(
+    zone: time_zone | undefined,
+    session_start: number | undefined,
+    tick_marks?: unknown,
+    bar_time_label?: unknown,
+  ): void {
     const marks = tick_marks === undefined ? undefined : normalize_time_tick_marks(tick_marks);
-    const reason = this.wasm.set_exchange_time_json(exchange_time_json(zone, session_start, marks));
+    const reason = this.wasm.set_exchange_time_json(
+      exchange_time_json(zone, session_start, marks, bar_time_label),
+    );
     if (reason !== "") throw new AerisChartsError("invalid_options", reason);
     if (typeof zone === "string") {
       const engine = JSON.parse(this.wasm.time_scale_options_json()) as { time_zone: unknown };
@@ -5142,9 +5157,11 @@ export class chart_impl implements chart_api {
   /**
    * Time text for package-owned surfaces (tooltip, accessibility): the host `time_formatter`
    * when installed, else a locale date — plus time of day for intraday rows — in the chart's
-   * exchange time. Calendar-date rows always show their own date.
+   * exchange time. `identity_seconds` is a bar's open time; the text prints its label time (the
+   * close under `time_scale.bar_time_label`). Calendar-date rows always show their own date.
    */
-  format_time_text(seconds: number): string {
+  format_time_text(identity_seconds: number): string {
+    const seconds = this.wasm.bar_label_time(identity_seconds);
     const formatter = this.host_time_formatter;
     if (formatter !== undefined) {
       try {
@@ -7503,8 +7520,11 @@ export class chart_impl implements chart_api {
     // IANA time-zone names resolve here (the engine accepts only explicit schedules). Validate
     // and apply them before any other key so a rejected zone changes nothing.
     const exchange = split_exchange_time_options(rest as Record<string, unknown>);
-    if (exchange.zone !== undefined || exchange.session_start !== undefined || exchange.tick_marks !== undefined) {
-      this.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks);
+    if (
+      exchange.zone !== undefined || exchange.session_start !== undefined ||
+      exchange.tick_marks !== undefined || exchange.bar_time_label !== undefined
+    ) {
+      this.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks, exchange.bar_time_label);
     }
     let engine_options: Record<string, unknown> = exchange.engine;
     // layout.panes.enableResize (reference) drives the separator drag here, not the engine; strip it

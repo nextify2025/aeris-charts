@@ -213,6 +213,85 @@ fn a_share_hour_candles_from_ticks_open_at_each_session_window() {
     assert_eq!(rows(&tick.chart, tick.candles).len(), 7);
 }
 
+/// Crosshair time text at bar `index` of a chart that shows time.
+fn crosshair_text(chart: &mut ChartEngine, index: usize) -> String {
+    let x = chart.time_scale.index_to_coordinate(index as i64);
+    chart.set_crosshair_at(x, 100.0);
+    chart
+        .build_axis_frame(
+            80.0,
+            |text, _| text.len() as f64 * 7.0,
+            |text, _| text.len() as f64 * 6.0,
+        )
+        .labels
+        .into_iter()
+        .find(|label| label.midpoint == crate::AxisTextMidpoint::StableTime)
+        .map(|label| label.text)
+        .expect("crosshair time label")
+}
+
+#[test]
+fn tick_built_hour_candles_label_by_close() {
+    let zone = shanghai();
+    let mut tick = tick_chart(zone.clone(), time_bars(HOUR, 0));
+    tick.chart
+        .set_trade_stream_sessions(
+            tick.stream,
+            Some(a_share_sessions(OutOfSessionPolicy::Fold)),
+        )
+        .unwrap();
+    tick.chart
+        .set_trade_stream_trades(tick.stream, a_share_day("2026-09-25"))
+        .unwrap();
+    tick.chart.time_scale.set_width(800.0);
+    tick.chart.fit_content();
+    tick.chart.set_time_visible(true);
+    let identity = local_times(&zone, &rows(&tick.chart, tick.candles));
+    assert_eq!(identity, ["09:30", "10:30", "13:00", "14:00"]);
+    assert_eq!(crosshair_text(&mut tick.chart, 0), "25 Sep '26   09:30");
+
+    tick.chart
+        .set_bar_time_label(crate::BarTimeLabel::Close {
+            interval_seconds: 3_600,
+            windows: vec![window("09:30", "11:30"), window("13:00", "15:00")],
+        })
+        .unwrap();
+    // Bars keep their open identities; the text prints the closes, the short afternoon-open
+    // hour included, and the 09:25 auction print still opens the first bar.
+    let candles = rows(&tick.chart, tick.candles);
+    assert_eq!(local_times(&zone, &candles), identity);
+    assert_eq!(candles[0].1, [10.00, 10.05, 10.00, 10.05]);
+    let printed: Vec<String> = (0..4)
+        .map(|index| crosshair_text(&mut tick.chart, index))
+        .collect();
+    assert_eq!(
+        printed,
+        [
+            "25 Sep '26   10:30",
+            "25 Sep '26   11:30",
+            "25 Sep '26   14:00",
+            "25 Sep '26   15:00"
+        ]
+    );
+    // The volume study aligns with the candles by identity.
+    assert_eq!(
+        rows(&tick.chart, tick.volume)
+            .iter()
+            .map(|&(time, _)| time)
+            .collect::<Vec<_>>(),
+        candles.iter().map(|&(time, _)| time).collect::<Vec<_>>()
+    );
+    // Replay at 10:00 reveals the bar that opened 09:30, which prints 10:30.
+    tick.chart
+        .set_replay_clock_micros(Some(at(&zone, "2026-09-25 10:00:00") * MICROS))
+        .unwrap();
+    let revealed = rows(&tick.chart, tick.candles);
+    assert_eq!(local_times(&zone, &revealed), ["09:30"]);
+    assert_eq!(crosshair_text(&mut tick.chart, 0), "25 Sep '26   10:30");
+    tick.chart.set_replay_clock_micros(None).unwrap();
+    assert_eq!(rows(&tick.chart, tick.candles).len(), 4);
+}
+
 #[test]
 fn a_share_minute_candles_skip_the_lunch_break_and_fold_closing_prints() {
     let zone = shanghai();

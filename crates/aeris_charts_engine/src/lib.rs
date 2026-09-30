@@ -8,6 +8,7 @@
 mod alerts;
 mod axis_metrics;
 mod axis_primitives;
+mod bar_time_label_api;
 mod depth;
 mod domains;
 mod drawing_contract;
@@ -115,6 +116,7 @@ pub use drawings::kinds::patterns_elliott_cycles::{ElliottWaveDegree, PatternToo
 // B8: shapes — begin
 pub use drawings::kinds::shapes::ShapeToolOptions;
 // B8: shapes — end
+pub use bar_time_label_api::BarTimeLabel;
 pub use drawings::{
     Drawing, DrawingAnchor, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId,
     DrawingKind, DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingTextEditLayout,
@@ -1749,6 +1751,14 @@ pub enum SyncMismatchPolicy {
     Clear,
 }
 
+/// The validated keys of an options patch that can be rejected (see
+/// [`ChartEngine::prepare_options_patch`]).
+pub(crate) struct PreparedOptionsPatch {
+    exchange_time: exchange_time_api::ExchangeTimePatch,
+    tick_marks: Option<Option<Vec<time_tick_marks_api::TimeTickMark>>>,
+    bar_time_label: Option<BarTimeLabel>,
+}
+
 /// Platform-independent state for one chart instance.
 pub struct ChartEngine {
     pub time_scale: TimeScaleCore,
@@ -1879,6 +1889,11 @@ pub struct ChartEngine {
     /// weights, built-in time labels, trading-day indicator resets, session highlighting, and
     /// the countdown window. Defaults to UTC with a midnight session start.
     pub(crate) exchange_time: ExchangeTime,
+    /// Which instant of a bar its time text prints (open by default) and, for a close-time
+    /// label with session windows, the window grid that ends short last bars exactly. The grid
+    /// is derived from the configured windows and the exchange time (`bar_time_label_api`).
+    bar_time_label: BarTimeLabel,
+    bar_label_grid: Option<SessionBarGrid>,
     /// Series ids in stable order, bottom to top (topmost LAST — the reference's z-order, pane.ts
     /// `orderedSources`/`setSeriesOrder`). Live series only: removed slots leave the list.
     /// This is the saved ordering: insertion order until an explicit `set_series_order`
@@ -2082,6 +2097,8 @@ impl ChartEngine {
             date_format: DEFAULT_DATE_FORMAT.to_string(),
             month_names: MonthNames::default(),
             exchange_time: ExchangeTime::default(),
+            bar_time_label: BarTimeLabel::default(),
+            bar_label_grid: None,
             series_order,
             series_order_explicit: false,
             hovered_series: None,
@@ -2188,8 +2205,12 @@ impl ChartEngine {
             self.indicator_memory_usage();
         EngineMemoryUsage {
             data: self.data.memory_usage(),
-            tick_payload_bytes: self.tick_marks.payload_bytes() + self.time_tick_marks_bytes().0,
-            tick_capacity_bytes: self.tick_marks.capacity_bytes() + self.time_tick_marks_bytes().1,
+            tick_payload_bytes: self.tick_marks.payload_bytes()
+                + self.time_tick_marks_bytes().0
+                + self.bar_time_label_bytes().0,
+            tick_capacity_bytes: self.tick_marks.capacity_bytes()
+                + self.time_tick_marks_bytes().1
+                + self.bar_time_label_bytes().1,
             indicator_runtime_bytes,
             indicator_transfer_capacity_bytes,
             retained_frame_capacity_bytes: self.retained_frame.capacity_bytes(),
@@ -4576,25 +4597,63 @@ impl ChartEngine {
     /// public time-scale API. Returns the parse error for a malformed patch.
     pub fn apply_options(&mut self, patch_json: &str) -> Result<(), serde_json::Error> {
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
-        // Exchange-time keys validate before anything mutates so a rejected schedule never
-        // reaches the options store (and therefore persistence).
-        let exchange_time = Self::parse_exchange_time_patch(&patch)
-            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
-        let tick_marks = time_tick_marks_api::parse_time_tick_marks_patch(&patch)
-            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
-        self.options.apply(&patch);
+        let prepared = self.prepare_options_patch(&patch)?;
+        self.apply_prepared_options(&patch, prepared);
+        Ok(())
+    }
+
+    /// Validate the keys of an options patch that can be rejected, before anything mutates: a
+    /// rejected schedule, tick mark list, or bar time label never reaches the options store (and
+    /// therefore persistence). They are judged against the state that will be in force after the
+    /// patch, so a session start that the installed bar time label windows do not fit is
+    /// rejected here. Read-only: callers that replace other chart state first (a V2 import)
+    /// prepare before their first mutation and apply afterwards without a failure path.
+    pub(crate) fn prepare_options_patch(
+        &self,
+        patch: &serde_json::Value,
+    ) -> Result<PreparedOptionsPatch, serde_json::Error> {
+        let custom = <serde_json::Error as serde::de::Error>::custom;
+        let exchange_time = Self::parse_exchange_time_patch(patch).map_err(custom)?;
+        let tick_marks = time_tick_marks_api::parse_time_tick_marks_patch(patch).map_err(custom)?;
+        let bar_time_label = self
+            .parse_bar_time_label_patch(patch, exchange_time.session_start_seconds())
+            .map_err(custom)?;
+        Ok(PreparedOptionsPatch {
+            exchange_time,
+            tick_marks,
+            bar_time_label,
+        })
+    }
+
+    /// Apply a patch validated by [`Self::prepare_options_patch`] against this chart's current
+    /// state (the store merge, the runtime keys, the exchange time, the bar time label, and the
+    /// explicit tick marks). Infallible.
+    pub(crate) fn apply_prepared_options(
+        &mut self,
+        patch: &serde_json::Value,
+        prepared: PreparedOptionsPatch,
+    ) {
+        self.options.apply(patch);
         // Re-derive runtime state that isn't read straight from the store each frame.
         self.crosshair_mode = crosshair_mode_from_u8(self.options.get().crosshair.mode);
-        self.route_time_scale_patch(&patch);
-        self.route_price_scale_patch(&patch);
-        self.route_localization_patch(&patch);
-        self.apply_exchange_time_patch(exchange_time);
-        if let Some(marks) = tick_marks {
+        self.route_time_scale_patch(patch);
+        self.route_price_scale_patch(patch);
+        self.route_localization_patch(patch);
+        // The label is stored before the exchange time changes and placed after it: the patch
+        // validated the label for the session start it installs, so the window grid is never
+        // placed for the old start.
+        let label_changed = prepared
+            .bar_time_label
+            .map(|label| self.replace_bar_time_label(label));
+        self.apply_exchange_time_patch(prepared.exchange_time);
+        if let Some(changed) = label_changed {
+            self.bar_time_label_replaced(changed);
+        }
+        if let Some(marks) = prepared.tick_marks {
             self.set_time_tick_marks(marks)
                 .expect("time tick marks were validated before the options patch applied");
         }
         self.invalidate_frame_all();
-        Ok(())
     }
 
     /// Switch all chart cosmetics using Aeris's canonical style-token source.
@@ -4813,6 +4872,7 @@ impl ChartEngine {
             "session_start": self.exchange_time.session_start_seconds(),
             "lock_visible_logical_range": options.lock_visible_logical_range,
             "tick_marks": self.time_tick_marks_json(),
+            "bar_time_label": self.bar_time_label_json(),
         })
         .to_string()
     }
@@ -5004,6 +5064,9 @@ impl ChartEngine {
         // Non-time footprint axes label ticks by full-resolution bar open times. Read them in
         // place; only a full weight rebuild materializes the column, so a live tip stays O(1).
         let sequence = self.sequence_points.as_deref();
+        // Close-time labels print an interval after the bar's identity time; the hour and minute
+        // marks follow the printed time. Non-time sequence axes print their own open times.
+        let label_shift = self.tick_label_shift();
         let times = self.data.merged_times();
         let tick_len = sequence.map_or(times.len(), <[BarSequencePoint]>::len);
         let tick_time = |index: usize| {
@@ -5028,9 +5091,10 @@ impl ChartEngine {
             });
         if appended {
             for index in self.synced_points_len..tick_len {
-                let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time_in(
+                let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time_shifted(
                     tick_time(index),
                     tick_time(index - 1),
+                    label_shift,
                     &self.exchange_time,
                 ) as u8;
                 self.tick_marks.push_weight(index as i64, weight);
@@ -5038,10 +5102,11 @@ impl ChartEngine {
         } else if time_points_changed {
             let tick_times = (0..tick_len).map(tick_time).collect::<Vec<_>>();
             let mut weights = vec![0u8; tick_len];
-            aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_in(
+            aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_shifted_in(
                 &tick_times,
                 &mut weights,
                 0,
+                label_shift,
                 &self.exchange_time,
             );
             self.tick_marks.set_weights(&weights);

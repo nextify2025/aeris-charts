@@ -187,8 +187,11 @@ export async function create_chart(
     ) {
       chart.apply_gesture_options(handle_scroll, handle_scale, kinetic_scroll, tracking_mode);
     }
-    if (exchange.zone !== undefined || exchange.session_start !== undefined || exchange.tick_marks !== undefined) {
-      chart.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks);
+    if (
+      exchange.zone !== undefined || exchange.session_start !== undefined ||
+      exchange.tick_marks !== undefined || exchange.bar_time_label !== undefined
+    ) {
+      chart.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks, exchange.bar_time_label);
     }
     if (wheel_behavior !== undefined) chart.apply_options({ wheel_behavior });
     if (panes_resize !== undefined) {

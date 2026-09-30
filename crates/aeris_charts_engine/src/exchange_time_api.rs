@@ -6,7 +6,7 @@
 //! an explicit UTC-offset schedule; the engine never consults a platform time zone.
 
 use aeris_charts_core::scale::exchange_time::{ExchangeTime, UtcOffsetSchedule};
-use aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_in;
+use aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_shifted_in;
 
 use crate::{ChartEngine, ExchangeTimeError, UtcOffsetTransition};
 
@@ -15,6 +15,13 @@ use crate::{ChartEngine, ExchangeTimeError, UtcOffsetTransition};
 pub(crate) struct ExchangeTimePatch {
     offsets: Option<UtcOffsetSchedule>,
     session_start_seconds: Option<i32>,
+}
+
+impl ExchangeTimePatch {
+    /// The trading-day start this patch installs, if it carries one.
+    pub(crate) fn session_start_seconds(&self) -> Option<i32> {
+        self.session_start_seconds
+    }
 }
 
 fn parse_time_zone(value: &serde_json::Value) -> Result<UtcOffsetSchedule, String> {
@@ -51,8 +58,22 @@ impl ChartEngine {
     }
 
     /// Seconds from local midnight at which the exchange trading day begins (default 0). Negative
-    /// values assign an evening session to the next trading day. Rejects values outside ±1 day.
+    /// values assign an evening session to the next trading day. Rejects values outside ±1 day
+    /// and, while a close-time bar label with session windows is installed, a start those
+    /// windows cannot be placed on ([`ExchangeTimeError::BarTimeLabelWindows`]); a rejection
+    /// changes nothing.
     pub fn set_session_start_seconds(&mut self, seconds: i32) -> Result<(), ExchangeTimeError> {
+        if seconds != self.exchange_time.session_start_seconds() {
+            ExchangeTime::new(UtcOffsetSchedule::utc(), seconds)?;
+            self.check_bar_time_label_fits(seconds)
+                .map_err(ExchangeTimeError::BarTimeLabelWindows)?;
+        }
+        self.install_session_start(seconds)
+    }
+
+    /// Install a session start that was range-checked and validated against the bar time label
+    /// that will be in force (an options patch may replace the label in the same step).
+    fn install_session_start(&mut self, seconds: i32) -> Result<(), ExchangeTimeError> {
         let previous = self.exchange_time.session_start_seconds();
         self.exchange_time.set_session_start_seconds(seconds)?;
         if previous != seconds {
@@ -137,17 +158,20 @@ impl ChartEngine {
         })
     }
 
+    /// Install a validated patch. The session start goes first: the bar time label the patch
+    /// installs was validated for it, so the label grid must never be placed at the old start.
     pub(crate) fn apply_exchange_time_patch(&mut self, patch: ExchangeTimePatch) {
+        if let Some(seconds) = patch.session_start_seconds {
+            self.install_session_start(seconds)
+                .expect("session start was validated before the options patch applied");
+        }
         if let Some(offsets) = patch.offsets {
             self.set_time_zone(offsets);
-        }
-        if let Some(seconds) = patch.session_start_seconds {
-            self.set_session_start_seconds(seconds)
-                .expect("session start was validated before the options patch applied");
         }
     }
 
     fn exchange_time_changed(&mut self) {
+        self.rebuild_bar_label_grid();
         self.rebuild_tick_weights();
         self.rebuild_trading_day_indicators();
         self.refresh_trade_stream_sessions();
@@ -155,7 +179,7 @@ impl ChartEngine {
     }
 
     /// Recompute every axis weight in the current exchange time without touching view state.
-    fn rebuild_tick_weights(&mut self) {
+    pub(crate) fn rebuild_tick_weights(&mut self) {
         let sequence_times = self.sequence_points().map(|points| {
             points
                 .iter()
@@ -165,8 +189,15 @@ impl ChartEngine {
         let times = sequence_times
             .as_deref()
             .unwrap_or_else(|| self.data.merged_times());
+        let label_shift = self.tick_label_shift();
         let mut weights = vec![0u8; times.len()];
-        fill_weights_for_points_in(times, &mut weights, 0, &self.exchange_time);
+        fill_weights_for_points_shifted_in(
+            times,
+            &mut weights,
+            0,
+            label_shift,
+            &self.exchange_time,
+        );
         self.tick_marks.set_weights(&weights);
     }
 }

@@ -253,19 +253,21 @@ impl ChartEngine {
                 let tooltip_lines = |item: &(f64, i64, f64, i64)| {
                     let mut lines = vec![self.format_series_plain_value(series, item.2)];
                     // A host `timeFormatter` owns the whole time text; otherwise the built-in
-                    // date and time lines use exchange wall-clock time.
-                    if let Some(text) = self.host_time_label(item.3) {
+                    // date and time lines use exchange wall-clock time. Both print the bar's
+                    // label time.
+                    let printed = self.bar_label_time(item.3);
+                    if let Some(text) = self.host_time_label(printed) {
                         lines.push(text);
                         return lines;
                     }
                     lines.push(format_date_pattern(
-                        self.exchange_time.local_seconds(item.3),
+                        self.exchange_time.local_seconds(printed),
                         "dd MMM yyyy",
                         &self.month_names,
                     ));
                     if state.options.show_time {
                         lines.push(format_tick_label_in(
-                            item.3,
+                            printed,
                             TickMarkType::Time,
                             &self.month_names,
                             &self.exchange_time,

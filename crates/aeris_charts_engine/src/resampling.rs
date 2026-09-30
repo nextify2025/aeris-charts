@@ -992,6 +992,64 @@ mod tests {
     }
 
     #[test]
+    fn resampled_hour_bars_label_by_close() {
+        let zone = shanghai();
+        let dates = ["2026-09-24", "2026-09-25"];
+        let (times, columns, volume) = minutes(&zone, &a_share(), &dates);
+        let time = ExchangeTime::new(zone.clone(), 0).unwrap();
+        let boundaries =
+            resample_boundaries(&dates.map(day), &a_share(), &time, ResampleSpan::Window).unwrap();
+        let mut chart = resampled(&zone, &times, &columns, &volume, 3_600, boundaries);
+        chart
+            .chart
+            .set_bar_time_label(crate::BarTimeLabel::Close {
+                interval_seconds: 3_600,
+                windows: a_share(),
+            })
+            .unwrap();
+        let bars = chart.chart.resampled_bars(chart.target).unwrap();
+        // Bars keep their open identities; the labels print the closes of the same windows.
+        assert_eq!(
+            bars.iter()
+                .map(|bar| local_clock(&zone, bar.timestamp))
+                .collect::<Vec<_>>(),
+            ["09:30", "10:30", "13:00", "14:00", "09:30", "10:30", "13:00", "14:00"]
+        );
+        assert_eq!(
+            bars.iter()
+                .map(|bar| local_clock(&zone, chart.chart.bar_label_time(bar.timestamp)))
+                .collect::<Vec<_>>(),
+            ["10:30", "11:30", "14:00", "15:00", "10:30", "11:30", "14:00", "15:00"]
+        );
+        assert_eq!(rows(&chart.chart, chart.target).len(), 8);
+    }
+
+    #[test]
+    fn a_host_fed_241_bar_feed_shifted_back_drops_its_auction_row_from_resampling() {
+        // The shifted auction row sits at 09:29, before the first window opens: resampling skips
+        // it like any out-of-session row, so the first hour bar still holds exactly the 60
+        // regular minutes and opens at the 09:30 row.
+        let zone = shanghai();
+        let date = ["2026-09-25"];
+        let (mut times, mut columns, mut volume) = minutes(&zone, &a_share(), &date);
+        times.insert(0, times[0] - 60);
+        for column in &mut columns {
+            column.insert(0, 999.0);
+        }
+        volume.insert(0, 1.0);
+        assert_eq!(times.len(), 241);
+        let time = ExchangeTime::new(zone.clone(), 0).unwrap();
+        let boundaries =
+            resample_boundaries(&date.map(day), &a_share(), &time, ResampleSpan::Window).unwrap();
+        let chart = resampled(&zone, &times, &columns, &volume, 3_600, boundaries);
+        let bars = chart.chart.resampled_bars(chart.target).unwrap();
+        assert_eq!(bars.len(), 4);
+        assert_eq!(bars[0].source_rows, 60);
+        assert_eq!(bars[0].open, columns[0][1]);
+        assert_eq!(bars[0].volume, volume[1..61].iter().sum::<f64>());
+    }
+
+    #[test]
     fn us_daily_bars_from_extended_hours_minutes_respect_dst() {
         let zone = new_york();
         let windows = [window("04:00", "20:00")];

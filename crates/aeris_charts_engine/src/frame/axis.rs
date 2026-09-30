@@ -553,6 +553,8 @@ impl ChartEngine {
     /// engine's `localization.dateFormat` pattern with the locale month-name table (reference
     /// chart-options-defaults.ts:34-37), in exchange wall-clock time.
     pub(crate) fn format_crosshair_ts(&self, ts: i64) -> String {
+        // `ts` is a bar's identity time; the text prints its label time.
+        let ts = self.bar_label_time(ts);
         if let Some(s) = self.host_time_label(ts) {
             return s;
         }
@@ -813,13 +815,15 @@ impl ChartEngine {
                 }
                 let kind =
                     weight_to_tick_mark_type(weight, self.time_visible, self.seconds_visible);
+                // The tick sits on the bar with this identity time and prints its label time.
+                let printed = self.bar_label_time(ts);
                 let custom_text = self
                     .tick_mark_formatter_fn
                     .as_ref()
-                    .and_then(|formatter| formatter(ts, kind as u8));
+                    .and_then(|formatter| formatter(printed, kind as u8));
                 let built_in = custom_text.is_none();
                 let text = custom_text.unwrap_or_else(|| {
-                    format_tick_label_in(ts, kind, &self.month_names, &self.exchange_time)
+                    format_tick_label_in(printed, kind, &self.month_names, &self.exchange_time)
                 });
                 if kind == TickMarkType::Year
                     && built_in
@@ -1109,9 +1113,10 @@ impl ChartEngine {
                 else {
                     continue;
                 };
-                let text = self.host_time_label(time).unwrap_or_else(|| {
+                let printed = self.bar_label_time(time);
+                let text = self.host_time_label(printed).unwrap_or_else(|| {
                     format_date_pattern(
-                        self.exchange_time.local_seconds(time),
+                        self.exchange_time.local_seconds(printed),
                         "M/d/yyyy",
                         &self.month_names,
                     )

@@ -1,5 +1,19 @@
 import { create_offscreen_chart } from "./dist/aeris_charts_financial.js";
 
+// Canvas text the worker's own engine paints (Canvas2D backend), so tests can read the axis strings
+// a worker chart draws: the OffscreenCanvas cannot be read back from the page.
+const painted_text = [];
+{
+  const prototype = self.OffscreenCanvasRenderingContext2D?.prototype;
+  const original = prototype?.fillText;
+  if (original) {
+    prototype.fillText = function (text, ...args) {
+      painted_text.push(String(text));
+      return original.call(this, text, ...args);
+    };
+  }
+}
+
 let chart = null;
 let gpu_canvas = null;
 let fallback_canvas = null;
@@ -105,9 +119,18 @@ self.onmessage = async (event) => {
         time_zone: options.time_zone,
         session_start: options.session_start,
         tick_marks: options.tick_marks,
+        bar_time_label: options.bar_time_label,
         local: chart.wasm.exchange_local_seconds(message.probe),
+        printed: chart.wasm.bar_label_time(message.probe),
       });
       // One reply per request: a trailing state message would race the reply in `send`.
+      return;
+    } else if (message.type === "axis_texts") {
+      // Hover a point of the pane and report the canvas text the frame paints.
+      painted_text.length = 0;
+      chart.inject_pointer_event({ type: "move", x: message.x, y: message.y });
+      chart.render();
+      postMessage({ type: "axis_texts", texts: [...painted_text] });
       return;
     } else if (message.type === "sequenced_stream") {
       // Worker-side streaming: the sequence guard on typed updates and typed partial merges.

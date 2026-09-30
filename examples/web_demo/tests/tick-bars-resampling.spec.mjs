@@ -374,3 +374,70 @@ test("US daily bars from extended-hours minutes follow the exchange day across D
   expect(result.friday_last_minute).toBe(Date.UTC(2024, 2, 9, 0, 59) / 1000);
   expect(result.bars[0].close).toBeCloseTo(100.5 + 959 / 100, 10);
 });
+
+test("tooltip and accessibility print a tick-built candle's close under bar_time_label", async ({ page }) => {
+  const errors = await open_chart(page);
+  const built = await page.evaluate(async (windows) => {
+    const api = await import("/dist/aeris_charts_financial.js");
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    chart.apply_options({
+      localization: { locale: "en-US" },
+      timeScale: { timeZone: "Asia/Shanghai", timeVisible: true },
+    });
+    const micros = (clock) => {
+      const [hour, minute, second] = clock.split(":").map(Number);
+      return Date.UTC(2026, 8, 25, hour - 8, minute, second) * 1000;
+    };
+    const candles = chart.add_series("candlestick");
+    const stream = chart.add_trade_stream("SSE:600000", { tick_size: 0.01, bar_type: "time", interval_seconds: 3600 });
+    chart.bind_trade_bar_series_to_stream(candles, stream);
+    chart.set_trade_stream_sessions(stream, { windows });
+    chart.set_trade_stream_trades(stream, [
+      ["09:25:00", 10.00, 500], ["09:30:01", 10.02, 100], ["10:29:59", 10.05, 100], ["10:30:00", 10.04, 100],
+      ["13:00:02", 10.06, 100], ["14:00:00", 10.07, 100], ["14:59:59", 10.08, 100],
+    ].map(([clock, price, volume]) => ({
+      timestamp_micros: micros(clock), price, volume, aggressor: "buy", session_id: 1,
+    })));
+    // Bars are open-stamped: 09:30, 10:30, 13:00, 14:00 (the auction folds into the first).
+    chart.apply_options({
+      timeScale: { barTimeLabel: { anchor: "close", interval_seconds: 3600, windows } },
+    });
+    chart.time_scale().fit_content();
+    window.__tooltip = api.create_tooltip(chart, { series: candles });
+    const x = (logical) => chart.time_scale().logical_to_coordinate(logical);
+    const pane = chart.panes()[0].get_geometry();
+    const bounds = chart.chart_element().getBoundingClientRect();
+    return {
+      identity: candles.data().map((bar) => new Date((bar.time + 8 * 3600) * 1000).toISOString().slice(11, 16)),
+      x: bounds.left + pane.left + x(0),
+      last_x: bounds.left + pane.left + x(3),
+      y: bounds.top + pane.top + pane.height * 0.5,
+    };
+  }, A_SHARE);
+  expect(built.identity).toEqual(["09:30", "10:30", "13:00", "14:00"]);
+
+  // The tooltip prints the close of the bar under the pointer: the 09:30 bar reads 10:30.
+  await page.mouse.move(built.x, built.y);
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Sep 25, 2026, 10:30");
+  await page.mouse.move(built.last_x, built.y);
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Sep 25, 2026, 15:00");
+
+  // Accessibility text follows the same label: End moves to the 14:00 bar, announced as 15:00.
+  const announced = await page.evaluate(async () => {
+    const api = await import("/dist/aeris_charts_financial.js");
+    const accessibility = api.enable_accessibility(window.__chart, { data_scope: "all" });
+    accessibility.focus(0);
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return window.__chart.chart_element().querySelector(".aeris_charts-a11y-live-region")?.textContent ?? "";
+  });
+  expect(announced).toContain("Sep 25, 2026, 15:00");
+  expect(announced).not.toContain("Sep 25, 2026, 14:00");
+
+  // Restoring the open text restores the open times everywhere.
+  await page.evaluate(() => window.__chart.apply_options({ timeScale: { barTimeLabel: "open" } }));
+  await page.mouse.move(built.x + 1, built.y);
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Sep 25, 2026, 09:30");
+  expect(errors).toEqual([]);
+});

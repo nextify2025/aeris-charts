@@ -9,7 +9,7 @@
 
 use aeris_charts_core::format::time_formatter::{format_tick_label_in, weight_to_tick_mark_type};
 use aeris_charts_core::model::data_validation::validate_timestamp;
-use aeris_charts_core::scale::time_tick_marks::{weight_by_time_in, TickMarkWeight};
+use aeris_charts_core::scale::time_tick_marks::{weight_by_time_shifted, TickMarkWeight};
 use serde::{Deserialize, Serialize};
 
 use crate::axis_metrics::AXIS_FONT_SCALE;
@@ -211,11 +211,12 @@ impl ChartEngine {
         let Some(time) = self.axis_time_key_at(index) else {
             return TickMarkWeight::LessThanSecond as u8;
         };
+        let shift = self.tick_label_shift();
         if index > 0 {
             return self
                 .axis_time_key_at(index - 1)
                 .map_or(TickMarkWeight::LessThanSecond as u8, |previous| {
-                    weight_by_time_in(time, previous, &self.exchange_time) as u8
+                    weight_by_time_shifted(time, previous, shift, &self.exchange_time) as u8
                 });
         }
         let count = self
@@ -228,7 +229,7 @@ impl ChartEngine {
             return TickMarkWeight::LessThanSecond as u8;
         };
         let average = ((last - time) as f64 / (count as f64 - 1.0)).ceil() as i64;
-        let weight = weight_by_time_in(time, time - average, &self.exchange_time) as u8;
+        let weight = weight_by_time_shifted(time, time - average, shift, &self.exchange_time) as u8;
         if self.exchange_time.trading_day(time) != self.exchange_time.trading_day(last) {
             weight.max(TickMarkWeight::Day as u8)
         } else {
@@ -278,11 +279,19 @@ impl ChartEngine {
                         self.time_visible,
                         self.seconds_visible,
                     );
+                    // The mark sits on the bar with this identity time; its default text prints
+                    // the bar's label time (the close under a close-time label).
+                    let printed = self.bar_label_time(ts);
                     self.tick_mark_formatter_fn
                         .as_ref()
-                        .and_then(|formatter| formatter(ts, kind as u8))
+                        .and_then(|formatter| formatter(printed, kind as u8))
                         .unwrap_or_else(|| {
-                            format_tick_label_in(ts, kind, &self.month_names, &self.exchange_time)
+                            format_tick_label_in(
+                                printed,
+                                kind,
+                                &self.month_names,
+                                &self.exchange_time,
+                            )
                         })
                 }
             };

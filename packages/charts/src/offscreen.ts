@@ -83,6 +83,7 @@ function split_offscreen_options(options: offscreen_chart_options): {
   zone: time_zone | undefined;
   session_start: number | undefined;
   tick_marks: unknown;
+  bar_time_label: unknown;
 } {
   const raw = options as Record<string, unknown>;
   for (const key of UNSUPPORTED_WORKER_OPTIONS) {
@@ -96,9 +97,10 @@ function split_offscreen_options(options: offscreen_chart_options): {
     );
   }
   const { theme, wheel_behavior, ...engine } = options;
-  // Declarative `timeScale.timeZone` (IANA name or schedule), `timeScale.sessionStart`, and
-  // `timeScale.tickMarks` resolve here with the worker's own `Intl`; the engine receives an explicit
-  // schedule and UTC-second mark times.
+  // Declarative `timeScale.timeZone` (IANA name or schedule), `timeScale.sessionStart`,
+  // `timeScale.tickMarks`, and `timeScale.barTimeLabel` resolve here with the worker's own `Intl`;
+  // the engine receives an explicit schedule, UTC-second mark times, and the label to validate
+  // together with the session start.
   const exchange = split_exchange_time_options(engine as Record<string, unknown>);
   return {
     theme,
@@ -107,6 +109,7 @@ function split_offscreen_options(options: offscreen_chart_options): {
     zone: exchange.zone,
     session_start: exchange.session_start,
     tick_marks: exchange.tick_marks,
+    bar_time_label: exchange.bar_time_label,
   };
 }
 
@@ -117,10 +120,14 @@ function apply_offscreen_exchange_time(
   zone: time_zone | undefined,
   session_start: number | undefined,
   tick_marks: unknown,
+  bar_time_label: unknown,
 ): void {
-  if (zone === undefined && session_start === undefined && tick_marks === undefined) return;
+  if (
+    zone === undefined && session_start === undefined && tick_marks === undefined &&
+    bar_time_label === undefined
+  ) return;
   const marks = tick_marks === undefined ? undefined : normalize_time_tick_marks(tick_marks);
-  const reason = wasm.set_exchange_time_json(exchange_time_json(zone, session_start, marks));
+  const reason = wasm.set_exchange_time_json(exchange_time_json(zone, session_start, marks, bar_time_label));
   if (reason !== "") throw new AerisChartsError("invalid_options", reason);
 }
 
@@ -528,8 +535,9 @@ export class offscreen_chart {
 
   apply_options(options: offscreen_chart_options): void {
     this.assert_live();
-    const { theme, wheel_behavior, engine, zone, session_start, tick_marks } = split_offscreen_options(options);
-    apply_offscreen_exchange_time(this.wasm, zone, session_start, tick_marks);
+    const { theme, wheel_behavior, engine, zone, session_start, tick_marks, bar_time_label } =
+      split_offscreen_options(options);
+    apply_offscreen_exchange_time(this.wasm, zone, session_start, tick_marks, bar_time_label);
     if (wheel_behavior !== undefined) this.wheel_behavior = wheel_behavior;
     if (theme !== undefined) {
       this.selected_theme = theme;
@@ -820,7 +828,7 @@ export async function create_offscreen_chart(
   const height = Math.max(init.height, 1);
   const dpr = Math.max(init.dpr, Number.EPSILON);
   const options = init.options ?? {};
-  const { theme, wheel_behavior, engine: engine_options, zone, session_start, tick_marks } =
+  const { theme, wheel_behavior, engine: engine_options, zone, session_start, tick_marks, bar_time_label } =
     split_offscreen_options(options);
   const wasm = await wasm_create_offscreen_chart(
     gpu_canvas,
@@ -838,7 +846,7 @@ export async function create_offscreen_chart(
     wasm.apply_options(JSON.stringify(engine_options));
   }
   try {
-    apply_offscreen_exchange_time(wasm, zone, session_start, tick_marks);
+    apply_offscreen_exchange_time(wasm, zone, session_start, tick_marks, bar_time_label);
   } catch (error) {
     wasm.dispose();
     wasm.free();

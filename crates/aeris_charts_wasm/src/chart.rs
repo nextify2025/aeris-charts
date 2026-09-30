@@ -4592,9 +4592,11 @@ impl AerisChart {
         self.inner.borrow_mut().set_time_formatter(f);
     }
 
-    /// Exchange time zone / trading-day start / explicit time-axis marks (`{"timeZone": "UTC" |
-    /// transitions, "sessionStart": seconds, "tickMarks": [{time, label?}] | null}`), validated
-    /// together. Returns "" on success or the validation message; a rejection changes nothing.
+    /// Exchange time zone / trading-day start / explicit time-axis marks / bar time label
+    /// (`{"timeZone": "UTC" | transitions, "sessionStart": seconds, "tickMarks": [{time, label?}] |
+    /// null, "barTimeLabel": "open" | null | {anchor: "close", interval_seconds, windows?}}`),
+    /// validated together. Returns "" on success or the validation message; a rejection changes
+    /// nothing.
     pub fn set_exchange_time_json(&mut self, time_scale_json: &str) -> String {
         self.inner
             .borrow_mut()
@@ -4611,6 +4613,12 @@ impl AerisChart {
     /// Exchange-local wall-clock seconds for a UTC timestamp.
     pub fn exchange_local_seconds(&self, time: f64) -> f64 {
         self.inner.borrow().exchange_local_seconds(time)
+    }
+
+    /// The UTC instant a bar identified by open time `time` prints under
+    /// `timeScale.barTimeLabel`: `time` itself by default, its close under a close-time label.
+    pub fn bar_label_time(&self, time: f64) -> f64 {
+        self.inner.borrow().bar_label_time(time)
     }
 
     /// Bit 0 `timeVisible`, bit 1 `secondsVisible`, bit 2 calendar-date axis.

@@ -14,6 +14,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::model::data_validation::{MAX_TIMESTAMP, MIN_TIMESTAMP};
+use crate::scale::session_slots::SessionSlotError;
 use crate::scale::time_tick_marks::{civil_from_timestamp, days_from_civil};
 
 /// Upper bound on offset transitions. Browser hosts resolve IANA zones over 1970..2100, which
@@ -39,11 +40,26 @@ pub struct UtcOffsetTransition {
 /// Validation failures for exchange-time configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExchangeTimeError {
-    TooManyTransitions { count: usize },
-    TransitionOutOfRange { index: usize },
-    UnorderedTransition { index: usize },
-    OffsetOutOfRange { index: usize, offset_seconds: i32 },
-    SessionStartOutOfRange { seconds: i64 },
+    TooManyTransitions {
+        count: usize,
+    },
+    TransitionOutOfRange {
+        index: usize,
+    },
+    UnorderedTransition {
+        index: usize,
+    },
+    OffsetOutOfRange {
+        index: usize,
+        offset_seconds: i32,
+    },
+    SessionStartOutOfRange {
+        seconds: i64,
+    },
+    /// A chart-level rejection: the session windows of the installed close-time bar label cannot
+    /// be placed on trading days that start at the requested session start. Never returned by
+    /// [`ExchangeTime`] itself.
+    BarTimeLabelWindows(SessionSlotError),
 }
 
 impl fmt::Display for ExchangeTimeError {
@@ -71,6 +87,10 @@ impl fmt::Display for ExchangeTimeError {
             Self::SessionStartOutOfRange { seconds } => write!(
                 f,
                 "session start {seconds}s is outside ±{MAX_SESSION_START_SECONDS}s of local midnight"
+            ),
+            Self::BarTimeLabelWindows(error) => write!(
+                f,
+                "the session start does not fit the installed bar time label windows: {error}"
             ),
         }
     }

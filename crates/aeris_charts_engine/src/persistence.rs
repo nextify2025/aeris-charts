@@ -1985,10 +1985,19 @@ impl ChartEngine {
                 stack_mode: series.stack_mode,
             })?;
         }
+        // The document's exchange-time keys are optional and an absent key keeps the chart's
+        // installed value, so both the staged chart and the live chart judge the options against
+        // the exchange time the live chart will run with.
+        staged.exchange_time = self.exchange_time.clone();
         let options_json = serde_json::to_string(&state.chart_options)
             .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
         staged
             .apply_options(&options_json)
+            .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
+        // Everything the live chart's own state can reject (an installed bar time label that the
+        // document's session start does not fit) is decided before the first field is replaced.
+        let prepared_options = self
+            .prepare_options_patch(&state.chart_options)
             .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
         self.panes = staged.panes;
         self.general_horizontal_domains = staged.general_horizontal_domains;
@@ -2002,8 +2011,7 @@ impl ChartEngine {
         self.next_persistent_pane_id = staged.next_persistent_pane_id;
         self.next_drawing_id = staged.next_drawing_id;
         self.options = staged.options;
-        self.apply_options(&options_json)
-            .expect("validated V2 chart options must serialize");
+        self.apply_prepared_options(&state.chart_options, prepared_options);
         // A document without exchange-time keys keeps the chart's installed zone and session
         // start; mirror a non-default one so the replaced options store still describes the live
         // chart (absent keys already mean UTC, keeping default documents byte-stable).
@@ -2013,6 +2021,10 @@ impl ChartEngine {
         // Likewise explicit time-axis marks the document does not carry stay installed.
         if self.time_tick_marks().is_some() {
             self.mirror_time_tick_marks_option();
+        }
+        // And a close-time bar label a document without the key does not carry.
+        if *self.bar_time_label() != crate::BarTimeLabel::Open {
+            self.mirror_bar_time_label_option();
         }
         self.selected_drawing = None;
         self.selected_drawings.clear();

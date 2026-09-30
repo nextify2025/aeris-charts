@@ -1466,7 +1466,38 @@ export interface time_scale_options {
    * inside the axis and skip one that would overlap its predecessor.
    */
   tick_marks?: readonly time_tick_mark[] | null;
+  /**
+   * Which instant of a bar its time TEXT prints (Aeris extension, default `"open"`). A bar keeps
+   * its open time as its identity everywhere (rows, series data, crosshair events, snapshots,
+   * countdown, replay, sessions, drawings, markers, alerts, `tick_marks[].time`, visible ranges);
+   * `{ anchor: "close", ... }` only changes what the chart prints for a bar: the crosshair label,
+   * automatic and default explicit tick labels, drawing axis tags and statistics, and the tooltip
+   * and accessibility time text. A one-minute bar opened 09:30 then reads 09:31. See
+   * {@link bar_time_label}. Ignored on calendar-date axes and non-time bar sequences. While a
+   * label with windows is set, a `session_start` those windows do not fit is rejected with
+   * `invalid_options` (send both in one call, or set `"open"` first).
+   */
+  bar_time_label?: bar_time_label;
 }
+
+/**
+ * Close-time display labels (see {@link time_scale_options.bar_time_label}). `interval_seconds`
+ * is the chart's primary bar interval, 1 to 86 399: the printed time of a bar is its open plus
+ * that interval. Optional exchange-local `windows` (the `["HH:MM", "HH:MM"]` form of
+ * {@link session_slot_options.windows}, at most 32, valid for the chart's `session_start`) end
+ * each window's short last bar exactly, so a 15:30 hourly bar of a 16:00 session prints 16:00
+ * rather than 16:30. A bar whose open lies in no window (for example a host-shifted 09:29
+ * auction row) prints open plus the interval. Every bar time the host passes in or reads back
+ * stays open-stamped. The windows must fit the chart's `session_start`: the same call may change
+ * both, and a later `session_start` the windows cannot be placed on is rejected.
+ */
+export type bar_time_label =
+  | "open"
+  | {
+      anchor: "close";
+      interval_seconds: number;
+      windows?: readonly (readonly [string, string])[];
+    };
 
 /** One explicit time-axis mark (see {@link time_scale_options.tick_marks}). */
 export interface time_tick_mark {
@@ -1839,8 +1870,9 @@ export interface chart_options {
   rightPriceScale: chart_price_scale_options;
   /**
    * Time-axis strip cosmetics (reference `timeScale.borderVisible`/`borderColor`) plus the
-   * declarative exchange time zone and trading-day start (same semantics as
-   * {@link time_scale_options.time_zone} / {@link time_scale_options.session_start}); these two
+   * declarative exchange time zone, trading-day start, explicit marks, and bar time label (same
+   * semantics as {@link time_scale_options.time_zone} / {@link time_scale_options.session_start} /
+   * {@link time_scale_options.tick_marks} / {@link time_scale_options.bar_time_label}); these
    * also work for worker charts.
    */
   timeScale: {
@@ -1850,6 +1882,8 @@ export interface chart_options {
     sessionStart?: number;
     /** Declarative {@link time_scale_options.tick_marks} (also for worker charts). */
     tickMarks?: readonly time_tick_mark[] | null;
+    /** Declarative {@link time_scale_options.bar_time_label} (also for worker charts). */
+    barTimeLabel?: bar_time_label;
   };
   /**
    * Large text label painted inside the pane (reference v4 `watermark`). `color` is any CSS color

@@ -380,6 +380,40 @@ impl SessionBarGrid {
     /// transition that collapses a window); callers choose their fallback. Allocation-free: at
     /// most two trading days are placed per call.
     pub fn bar_open(&self, time: i64) -> Result<Option<i64>, SessionSlotError> {
+        self.with_window_bounds(time, |bounds| self.locate(time, bounds))
+    }
+
+    /// UTC close of the bar that opened at `bar_open`: one interval later, or the end of the
+    /// session window that contains the open when the bar is the window's short last bar (the
+    /// 15:30 bar of an hourly US session closes 16:00). An interval of one day spans the trading
+    /// day, so its bar closes with the day's last window. `None` when `bar_open` lies outside
+    /// every window (strictly: an open at a window's close belongs to no window), so a caller
+    /// labels such an instant its own way. Errors like [`Self::bar_open`]. Allocation-free.
+    pub fn bar_close(&self, bar_open: i64) -> Result<Option<i64>, SessionSlotError> {
+        let interval = i64::from(self.interval_seconds);
+        self.with_window_bounds(bar_open, |bounds| {
+            let index = bounds
+                .partition_point(|&(open, _)| open <= bar_open)
+                .checked_sub(1)?;
+            let window_end = bounds[index].1;
+            (bar_open < window_end).then(|| {
+                let end = if interval >= DAY {
+                    bounds[bounds.len() - 1].1
+                } else {
+                    window_end
+                };
+                end.min(bar_open.saturating_add(interval))
+            })
+        })
+    }
+
+    /// Run `visit` with the placed windows of the trading day that owns `time`, or of the
+    /// previous trading day when `time` still lies inside that day's last window.
+    fn with_window_bounds<R>(
+        &self,
+        time: i64,
+        visit: impl FnOnce(&[(i64, i64)]) -> R,
+    ) -> Result<R, SessionSlotError> {
         let day = self.time.trading_day(time);
         let mut placed = [(0, 0); MAX_SESSION_WINDOWS];
         let count = place_windows(day, &self.windows, &self.time, &mut placed)?;
@@ -389,11 +423,11 @@ impl SessionBarGrid {
                 place_windows(day - 1, &self.windows, &self.time, &mut previous)
             {
                 if time < previous[previous_count - 1].1 {
-                    return Ok(self.locate(time, &previous[..previous_count]));
+                    return Ok(visit(&previous[..previous_count]));
                 }
             }
         }
-        Ok(self.locate(time, &placed[..count]))
+        Ok(visit(&placed[..count]))
     }
 
     fn locate(&self, time: i64, bounds: &[(i64, i64)]) -> Option<i64> {
@@ -1027,6 +1061,227 @@ mod tests {
             Some("2026-09-26 01:00")
         );
         assert_eq!(open_label(&utc, &late, "2026-09-26 03:00:00"), None);
+    }
+
+    /// America/New_York 2023-11-05 .. 2024-11-03 (EST, EDT from 2024-03-10, EST from 2024-11-03).
+    fn new_york_2024() -> ExchangeTime {
+        let ts = |date: &str, hour: i64| day(date) * DAY + hour * HOUR;
+        ExchangeTime::new(
+            UtcOffsetSchedule::new(vec![
+                UtcOffsetTransition {
+                    from_utc_seconds: ts("2023-11-05", 6),
+                    offset_seconds: -5 * 3_600,
+                },
+                UtcOffsetTransition {
+                    from_utc_seconds: ts("2024-03-10", 7),
+                    offset_seconds: -4 * 3_600,
+                },
+                UtcOffsetTransition {
+                    from_utc_seconds: ts("2024-11-03", 6),
+                    offset_seconds: -5 * 3_600,
+                },
+            ])
+            .unwrap(),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bar_close_matches_the_bar_close_slots() {
+        let shanghai = shanghai(0);
+        let new_york = new_york_2024();
+        let cases: Vec<(&ExchangeTime, Vec<SessionWindow>, u32, &str)> = vec![
+            (&shanghai, a_share().to_vec(), 60, "2026-09-25"),
+            (&shanghai, a_share().to_vec(), 300, "2026-09-25"),
+            (&shanghai, a_share().to_vec(), 3_600, "2026-09-25"),
+            // A 7-minute grid over a 30-minute window ends with a 2-minute bar.
+            (
+                &shanghai,
+                vec![window("09:30", "10:00")],
+                7 * 60,
+                "2026-09-25",
+            ),
+            (&new_york, vec![window("09:30", "16:00")], 60, "2024-03-08"),
+            (
+                &new_york,
+                vec![window("09:30", "16:00")],
+                3_600,
+                "2024-03-08",
+            ),
+            (
+                &new_york,
+                vec![window("09:30", "16:00")],
+                3_600,
+                "2024-03-11",
+            ),
+            (
+                &new_york,
+                vec![window("09:30", "16:00")],
+                3_600,
+                "2024-11-01",
+            ),
+            (
+                &new_york,
+                vec![window("09:30", "16:00")],
+                3_600,
+                "2024-11-04",
+            ),
+        ];
+        for (time, windows, interval, date) in cases {
+            let grid =
+                SessionBarGrid::new(windows.clone(), interval, time, OutOfSessionPolicy::Fold)
+                    .unwrap();
+            let opens = session_slot_times(
+                day(date),
+                &windows,
+                interval,
+                time,
+                SessionSlotConvention::BarOpen,
+            )
+            .unwrap();
+            let closes = session_slot_times(
+                day(date),
+                &windows,
+                interval,
+                time,
+                SessionSlotConvention::BarClose,
+            )
+            .unwrap();
+            assert_eq!(opens.len(), closes.len());
+            for (open, close) in opens.iter().zip(&closes) {
+                assert_eq!(
+                    grid.bar_close(*open),
+                    Ok(Some(*close)),
+                    "{date} {interval}s open {}",
+                    local(time, *open)
+                );
+                // Any instant inside the bar resolves to the same open, hence the same close.
+                assert_eq!(grid.bar_open(*open), Ok(Some(*open)));
+            }
+        }
+    }
+
+    #[test]
+    fn bar_close_handles_short_last_bars_and_outside_windows() {
+        // Hong Kong (UTC+8): the 11:30 hourly bar of the morning window closes at the 12:00 end.
+        let hong_kong = shanghai(0);
+        let hk = SessionBarGrid::new(
+            vec![window("09:30", "12:00"), window("13:00", "16:00")],
+            3_600,
+            &hong_kong,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        let close_of = |time: &ExchangeTime, grid: &SessionBarGrid, open: &str| {
+            grid.bar_close(at(time, open))
+                .unwrap()
+                .map(|close| local(time, close))
+        };
+        assert_eq!(
+            close_of(&hong_kong, &hk, "2026-09-25 11:30:00").as_deref(),
+            Some("2026-09-25 12:00")
+        );
+        assert_eq!(
+            close_of(&hong_kong, &hk, "2026-09-25 09:30:00").as_deref(),
+            Some("2026-09-25 10:30")
+        );
+        assert_eq!(
+            close_of(&hong_kong, &hk, "2026-09-25 15:00:00").as_deref(),
+            Some("2026-09-25 16:00")
+        );
+        // The lunch break, the pre-open minute, and an open at the window's own close belong to
+        // no window; strict containment gives them no close.
+        for open in [
+            "2026-09-25 09:29:00",
+            "2026-09-25 12:00:00",
+            "2026-09-25 12:30:00",
+            "2026-09-25 16:00:00",
+            "2026-09-25 20:00:00",
+        ] {
+            assert_eq!(close_of(&hong_kong, &hk, open), None, "{open}");
+        }
+
+        // New York: the 15:30 bar closes 16:00 on both sides of the DST change.
+        let new_york = new_york_2024();
+        let us = SessionBarGrid::new(
+            vec![window("09:30", "16:00")],
+            3_600,
+            &new_york,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        for date in ["2024-03-08", "2024-03-11"] {
+            assert_eq!(
+                close_of(&new_york, &us, &format!("{date} 15:30:00")).as_deref(),
+                Some(format!("{date} 16:00").as_str())
+            );
+        }
+
+        // A night window crossing midnight places on the previous trading day, in both the
+        // positive-session-start-free (UTC) and the negative-session-start layouts.
+        let utc = ExchangeTime::default();
+        let late = SessionBarGrid::new(
+            vec![window("08:00", "12:00"), window("22:00", "02:00")],
+            3_600,
+            &utc,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        assert_eq!(
+            close_of(&utc, &late, "2026-09-26 01:00:00").as_deref(),
+            Some("2026-09-26 02:00")
+        );
+        assert_eq!(
+            close_of(&utc, &late, "2026-09-25 23:00:00").as_deref(),
+            Some("2026-09-26 00:00")
+        );
+        assert_eq!(close_of(&utc, &late, "2026-09-26 03:00:00"), None);
+        let futures = shanghai(-3 * 3_600);
+        let night = SessionBarGrid::new(
+            vec![window("21:00", "02:30"), window("09:00", "10:15")],
+            3_600,
+            &futures,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        assert_eq!(
+            close_of(&futures, &night, "2026-09-29 02:00:00").as_deref(),
+            Some("2026-09-29 02:30")
+        );
+        assert_eq!(
+            close_of(&futures, &night, "2026-09-29 10:00:00").as_deref(),
+            Some("2026-09-29 10:15")
+        );
+
+        // A one-day interval spans the whole trading day, lunch break included.
+        let daily = SessionBarGrid::new(
+            a_share().to_vec(),
+            86_400,
+            &hong_kong,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        assert_eq!(
+            close_of(&hong_kong, &daily, "2026-09-25 09:30:00").as_deref(),
+            Some("2026-09-25 15:00")
+        );
+
+        // A DST transition that collapses a window (02:00-03:00 does not exist on 2024-03-10)
+        // cannot be placed: the caller falls back.
+        let collapsed = SessionBarGrid::new(
+            vec![window("02:00", "03:00")],
+            60,
+            &new_york,
+            OutOfSessionPolicy::Fold,
+        )
+        .unwrap();
+        assert!(collapsed
+            .bar_close(at(&new_york, "2024-03-10 04:00:00"))
+            .is_err());
+        assert!(collapsed
+            .bar_close(at(&new_york, "2024-03-12 02:10:00"))
+            .is_ok());
     }
 
     #[test]

@@ -31,7 +31,9 @@ The supported root surface is:
   `session_slot_times()`, explicit time-axis `tick_marks`, the `histogram_updown_rule`
   previous-close volume tint with host `up_color`/`down_color`, a baseline series that shows
   its first traded bar, the additive `break_on_trading_day` line/area/baseline option (default
-  `false`), and VWAP/pivot lines that restart at every reset;
+  `false`), and VWAP/pivot lines that restart at every reset; the close-time display label
+  `time_scale_options.bar_time_label` prints bars by their close while they stay open-stamped
+  (see [Close-time labels](#close-time-labels));
 - multi-calendar overlays through the series options `time_alignment: "as_of"` and
   `as_of_max_staleness` (see [Multi-calendar overlays](#time-exchange-time-zone-and-trading-sessions));
 - built-in series, indicators, drawing kinds, options, themes, data ingestion, interactions,
@@ -410,8 +412,9 @@ as `"Asia/Shanghai"` or `"America/New_York"`, or an explicit schedule of
 zone with `Intl.DateTimeFormat` over 1970–2100 (at most ~262 DST transitions) and keeps at most 32
 resolved zones; outside that span the nearest offset applies. The engine itself is platform-free,
 accepts only explicit schedules, and never reads the browser's time zone. An unknown zone, malformed
-schedule, or out-of-range session start throws `invalid_options` before any other key in the same
-call is applied. `time_scale().options()` reports the IANA name (or the schedule) and
+schedule, out-of-range session start, or session start that the windows of an installed close-time
+label do not fit ([Close-time labels](#close-time-labels)) throws `invalid_options` before any other
+key in the same call is applied. `time_scale().options()` reports the IANA name (or the schedule) and
 `session_start`. Rust hosts call `ChartEngine::set_time_zone(UtcOffsetSchedule)` and
 `set_session_start_seconds(i32)`; the engine JSON options accept `timeScale.timeZone` (`"UTC"` or a
 transition array) and `timeScale.sessionStart`, and V2 persistence round-trips both. Importing a
@@ -446,7 +449,10 @@ whose `business_day` is the calendar date for calendar-date rows and `null` for 
 axis tags, delta tooltip, `create_tooltip`, and accessibility (unless the accessibility options set
 their own `time_formatter`). Without it, `create_tooltip` and accessibility format in the chart time
 zone with `localization.locale`, adding the time of day for intraday rows. Rust `TickMarkFormatterFn`
-and `TimeFormatterFn` signatures are unchanged.
+and `TimeFormatterFn` signatures are unchanged. With a close-time label configured
+([Close-time labels](#close-time-labels)) both callbacks receive the LABEL instant (the bar's
+close), not the bar's open time; a host that adds one interval inside its formatter must drop that
+addition when it adopts the option.
 
 **Countdown clock.** The candle-close countdown shows only while the clock is inside the forming
 bar's interval `[last_bar_time, last_bar_time + bar_interval)`; outside it — lunch breaks,
@@ -494,6 +500,13 @@ first point: `"bar_close_with_open"` reproduces their 241 points (09:30, 09:31..
 `"bar_close"` is the close-labelled form without the opening point. Use the convention your data
 provider stamps its minutes with. The lunch break takes no width either way: the last morning slot
 and the first afternoon slot are neighbours.
+
+The two families of chart use the conventions differently. An instant-sampled line (the classic
+time-sharing price line, one price per minute end) uses close-stamped slots: its points ARE those
+instants, and 241 points are a property of the line. Interval bars (candles built from ticks or
+resampled minutes) use `"bar_open"` slots and open-stamped rows, and print their close time through
+the `bar_time_label` option ([Close-time labels](#close-time-labels)); they do not grow a separate
+241st auction bar, because the 09:25 auction print folds into the first bar.
 
 **2. Reserve the session.** Install every slot, traded or not; untraded minutes are whitespace rows
 (`{ time }`). Lock the whole session in view and disable gestures (keyboard motion follows the same
@@ -616,8 +629,9 @@ segment). Open `intraday.html?traded=0` to see that state.
 
 Both recipes build ordinary candles on the time axis in the chart's exchange time, so set the
 exchange time zone (and `session_start` for night sessions) first. Candles are stamped with their
-open time, the canonical Aeris bar time; platforms that label a minute by its close (同花顺, 富途)
-show the same bars one interval later.
+open time, the canonical Aeris bar time. To print each candle's close time (09:31 … 15:00 for A-share
+minutes) instead, set `bar_time_label` ([Close-time labels](#close-time-labels)): the candles, their
+volume, replay, countdown, and every time your host passes in or reads back stay open-stamped.
 
 ### Ticks to candles
 
@@ -707,10 +721,13 @@ resampled series per chart. Hosts may also pass their own `{ start_time, end_tim
 periods (for weeks or months, for example).
 
 **Source rows.** Source rows must be stamped with bar-open times; rows outside every boundary are
-omitted, so shift close-stamped minutes (09:31 … 15:00) back by one interval first. A feed that also
-carries a separate opening-auction minute (241-bar feeds stamp it 09:30 beside the close-stamped
-09:31) must merge that row into the first minute before resampling: shifted, it falls before the
-first window and is omitted with its volume. Whitespace rows (`session_slot_times` reservations)
+omitted, so the host still converts provider close stamps (09:31 … 15:00) to open stamps by
+subtracting one interval before resampling. A feed that also carries a separate opening-auction
+minute (241-bar feeds stamp it 09:30 beside the close-stamped 09:31) must merge that row into the
+first minute before RESAMPLING: shifted, it falls before the first window and is omitted with its
+volume. A 241-bar feed that is drawn directly and not resampled may instead shift the auction row
+back too: it lands at 09:29, outside every window, and `bar_time_label` prints it 09:30 (see
+[Close-time labels](#close-time-labels)). Whitespace rows (`session_slot_times` reservations)
 reserve their bucket without prices: an untraded bucket is a whitespace bar, and the forming bucket
 closes at its last traded row. Resampling needs a time axis: it is rejected on a chart whose axis is
 a non-time bar sequence (trade-count, volume, or range streams, synthetic bars), and such a sequence
@@ -740,6 +757,92 @@ bars with their `session_id` and aggregated source-row count. Rust hosts call
 ResampleOptions { interval_seconds, boundaries })` and
 `aeris_charts_engine::resample_boundaries(&days, &windows, chart.exchange_time(),
 ResampleSpan::Window)`.
+
+## Close-time labels
+
+Every bar is stamped with its OPEN time, the canonical Aeris bar time, and keeps that stamp as its
+identity: rows, series data, crosshair events, snapshots, the countdown, replay, sessions, trading
+days, drawings, markers, alerts, resampling, and every time a host passes in or reads back are
+open-stamped. An A-share minute chart therefore holds 09:30 … 14:59. A user who reads bars by the
+time they close expects 09:31 … 15:00. `time_scale_options.bar_time_label` (declaratively
+`timeScale.barTimeLabel`, also accepted by worker charts) changes only the TEXT the chart prints for
+a bar:
+
+```ts
+chart.time_scale().apply_options({
+  time_zone: "Asia/Shanghai", time_visible: true,
+  bar_time_label: {
+    anchor: "close", interval_seconds: 60,
+    windows: [["09:30", "11:30"], ["13:00", "15:00"]],   // optional, exchange-local
+  },
+});
+```
+
+The default `"open"` changes nothing. With `{ anchor: "close", … }` the printed time of a bar is its
+open plus `interval_seconds` (1 to 86 399), or the end of the session window that contains its open
+when the bar is that window's short last bar. Set `"open"` to restore the open text. `time_scale().options().bar_time_label` reports `"open"` or `{ anchor,
+interval_seconds, windows }`. An invalid label (an interval outside 1..86 399, more than 32,
+unordered, or zero-length windows for the chart's `session_start`, unknown keys) throws
+`invalid_options` and changes nothing; the label is validated together with `time_zone`,
+`session_start`, and `tick_marks` of the same call, against the session start that call installs.
+
+**What prints the label.** The crosshair time label, automatic tick labels, the default text of
+explicit `tick_marks`, drawing axis tags, drawing statistics (`date_time_range`) and the forecast
+target time, the delta tooltip's time line, `create_tooltip`, and accessibility text. The host
+`tick_mark_formatter` and `localization.time_formatter` receive the label instant. Hour and minute
+tick weights follow the printed time, so the "10:00" tick sits on the bar that closes on the hour
+(the bar opened 09:59) and never on the bar opened 10:00; Day, Month, and Year weights and every
+trading-day reset keep following the bar's own trading day, so the last bar of a window that ends
+at midnight prints 00:00 of the next date and still belongs to its own trading day. Worker charts
+print the label on every engine-drawn surface; the package-owned tooltip and accessibility text are
+main-thread surfaces. Labels are ordinary text: nothing in the frame contract, the draw list, or any
+backend changes.
+
+**What stays open-stamped.** All times in and out: `series_data`, `bars_in_logical_range`,
+crosshair and click events, series snapshots, `coordinate_to_time`, visible ranges, the crosshair
+sync position, markers, executions, alerts, drawing anchors, `tick_marks[].time`, the countdown,
+the replay clock, session highlighting, and resampling. A host whose provider stamps bars by close
+still converts them to open stamps on the way in (subtract one interval) and reads open stamps on the
+way out. Native vertical-line labels keep their host text. The `time_formatter` of the
+accessibility options receives the host's own data time, not the label. An explicit tick mark
+names its bar by identity: to label the bar opened 11:29 (printing 11:30) pass `11:29`; a mark at
+the label-only instant 11:30 matches no bar and draws nothing.
+
+**One interval per chart.** `interval_seconds` is the chart's primary bar interval. A resampled
+target and its source share one time axis, so a one-minute source with an hourly target cannot be
+labelled per series: pick the interval of the bars the user reads, and update the option in the same
+step as the timeframe switch (until then the labels use the old interval).
+
+**Windows and short last bars.** `windows` are exchange-local `["HH:MM", "HH:MM"]` pairs placed in
+the chart's `time_zone` and `session_start` exactly like `session_slot_times` (at most 32; an end at
+or before its start crosses midnight, `"24:00"` ends at midnight). They end a window's last bar
+exactly: a US hourly session 09:30–16:00 has a short 15:30 bar that prints 16:00 on both sides of a
+DST change, and an HK morning window 09:30–12:00 prints 12:00 for its 11:30 bar. Without windows a
+short last bar prints its open plus the interval (16:30). A bar whose open lies in no window prints
+its open plus the interval as well, which is how a host-fed 241-bar feed that shifts the auction row
+back one interval (09:29) prints 09:30, 09:31 … 15:00 with no engine-built auction bar. The windows
+and the `session_start` must fit each other: while a label with windows is installed, a
+`session_start` (through `apply_options`, `timeScale.sessionStart`, a V2 import, or
+`set_session_start_seconds`) that the windows cannot be placed on throws `invalid_options`
+(`ExchangeTimeError::BarTimeLabelWindows` in Rust) and changes nothing, so a saved document always
+imports again. To move both, send them in one `apply_options` call (the label is checked against the
+start of that call) or set the label to `"open"` first. A `time_zone` change never conflicts with the
+windows; only an instant whose windows a DST transition collapses prints open plus the interval.
+How 同花顺 and 富途 label a short last hourly bar could not be verified (no live terminal was
+available), so compare the printed window end with your reference terminal before relying on it.
+
+**Where it does not apply.** Calendar-date axes and non-time bar sequences (trade-count, volume,
+and range streams, synthetic bars) print their own times and ignore the option. Interval bars do not
+grow a separate 241st auction bar: engine-built candles fold the 09:25 auction print into the first
+bar, as tick-built candles already do, and the 241 points of a time-sharing LINE remain a property
+of close-stamped instant slots (`session_slot_times` with `"bar_close_with_open"`).
+
+The label lives in the options store, so V2 persistence carries it while it is not `"open"`;
+importing a document without the key keeps the installed label (a document whose `sessionStart` the
+installed windows do not fit is rejected whole), and a default chart's document is unchanged. Rust
+hosts call `ChartEngine::set_bar_time_label(BarTimeLabel::Close { interval_seconds, windows })`,
+`bar_time_label()`, and `bar_label_time(open_time)` (the instant a bar prints); the engine JSON
+option is `timeScale.barTimeLabel`, and the WASM export `bar_label_time(seconds)`.
 
 ## Experimental surfaces
 
