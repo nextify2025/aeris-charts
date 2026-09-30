@@ -436,6 +436,17 @@ with a negative start a day that would fall on Saturday or Sunday rolls forward 
 Friday-night session belongs to Monday. Day/Month/Year tick marks, VWAP `session`/`weekly`/`monthly`
 resets, and pivot sessions use trading days. Weekly periods start on Monday.
 
+A market whose week opens on Sunday evening (CME Globex, 17:00 Central) sets `session_start:
+-25200`: Sunday 17:00 belongs to Monday's trading day and Monday 17:00 to Tuesday's, so Day marks,
+session and weekly VWAP resets, and pivots align with the session. With `0` the Sunday evening is its
+own trading day: a Day mark and a session VWAP reset appear at midnight in the middle of the
+session, and the weekly VWAP keeps the Sunday evening bars in the previous week and resets at that
+midnight. With a negative start every Saturday or Sunday instant belongs to Monday, and window
+placement (`session_slot_times`, `resample_boundaries`, `set_trade_stream_sessions`)
+assumes the week opens on Friday evening: right for China futures, but a Sunday-open market places
+its evening windows with a per-call `session_start` of `0` (see *Intraday (分时) charts* and *Ticks
+to candles and resampling*).
+
 **What follows exchange time.** Tick boundaries (Day/Month/Year from trading days; hour and minute
 marks on exchange wall-clock time, so they stay on exchange hours across DST and non-hour offsets),
 built-in labels on every surface (axis ticks, crosshair, rectangle drawing axis tags, the delta
@@ -464,8 +475,10 @@ and `TimeFormatterFn` signatures are unchanged.
 bar's interval `[last_bar_time, last_bar_time + bar_interval)`; outside it — lunch breaks,
 overnight, weekends, after an early close — it hides instead of cycling. Calendar-date bars form
 during the exchange trading day(s) of their date (with a negative `session_start`, Monday's bar
-starts with Friday's night session), and bars 28 or more days apart run to the end of their
-calendar month(s). `chart.set_clock(() => utc_seconds)` and `offscreen_chart.set_clock(...)`
+starts on Friday evening at the session-start time of day: Friday's night session for China
+futures, Friday 17:00 Central for a Sunday-open market such as CME Globex), and bars 28 or more
+days apart run to the end of their calendar month(s). `chart.set_clock(() => utc_seconds)` and
+`offscreen_chart.set_clock(...)`
 replace `Date.now()` for countdown ticks; `null` (or a clock that throws or returns a non-finite
 value) falls back to the system clock.
 
@@ -491,12 +504,24 @@ are exchange-local `["HH:MM", "HH:MM"]` pairs in chronological order (at most 32
 its start crosses midnight, `"24:00"` ends at midnight), `time_zone` is an IANA name or an explicit
 schedule, and the result is bounded to 100 000 slots and validated (`invalid_options`). Each window
 converts with the offset in force on that date, so the same windows stay on exchange hours across
-DST. With a negative `session_start`, windows starting at or after the session-start time of day
-belong to the evening before (Friday evening for Monday), matching the chart's trading days and the
-night sessions of Chinese futures. A market whose week reopens on Sunday evening (CME Globex)
-requests that evening separately: the Sunday date with `session_start: 0` and
-`[["17:00", "24:00"]]`, then the Monday date with its remaining windows. It
-needs the engine module: call it after `init_wasm()` or `create_chart()`. Rust hosts call
+DST. `session_start` is this call's own and defaults to `0`; it is not read from the chart, so a
+China futures host must pass `session_start: -10800` explicitly (omitted, a 21:00 night window is
+placed on the calendar date, Monday 21:00, instead of Friday 21:00, and nothing reports it). With a
+negative `session_start`, windows starting at or after the session-start time of day belong to the
+evening before (Friday evening for Monday), matching the chart's trading days and the night
+sessions of Chinese futures. That placement assumes the week opens on Friday evening.
+
+A market whose week reopens on Sunday evening (CME Globex) passes `session_start: 0` and makes one
+call per evening date with `windows: [["17:00", "16:00"]]`. The date is the evening the session
+opens: the Sunday date places Monday's trading day (1380 one-minute slots, Sunday 17:00 to Monday
+16:00), the Monday date places Tuesday's, and so on, so with `0` every call is keyed by the
+evening's calendar date rather than by trading date. Two calls give the same slots: the Sunday date
+with `[["17:00", "24:00"]]` and `session_start: 0`, then the Monday date with `[["00:00", "16:00"]]`.
+Do not give the Monday date a window that starts at or after 17:00 under a negative `session_start`:
+that places Friday 17:00 to Saturday 16:00. Which dates trade, holidays, and early closes are host
+calendar data; pass the windows that apply to each date (a date without a night session is a
+window list without it). It needs the engine module: call it after `init_wasm()` or
+`create_chart()`. Rust hosts call
 `aeris_charts_engine::session_slot_times(day, &windows, interval, chart.exchange_time(), convention)`.
 
 `convention` decides which instant names a slot. Aeris bars are stamped with their open time, so
@@ -660,6 +685,14 @@ one bar per trading day, opening at its first window. Changing the chart's time 
 re-places the windows; `null` restores the plain grid. Only whole-second time bars accept sessions;
 invalid windows or other bar types throw `invalid_options` and change nothing.
 
+`set_trade_stream_sessions()` always uses the chart's own `session_start` (there is no per-call
+override) and takes one window list for all dates, so a date after a break cannot drop its night
+window. For a Sunday-open market (CME Globex) keep the chart's `session_start` at `0` and pass one
+crossing window, `[["17:00", "16:00"]]`: the previous-day lookup places the Sunday evening, at the
+cost of midnight trading-day semantics for Day marks and VWAP resets. A chart at `-25200` places
+Monday's window on Friday evening, so Sunday and Monday prints fall after it: `fold` sends them to
+that window's last bar (Saturday 15:xx) and `exclude` drops them.
+
 **Prints outside the windows.** `outside: "fold"` (the default) keeps every print: the 09:25
 opening auction opens the 09:30 bar, and the 11:30:00 and 15:00:00 closing prints close the last bar
 of their window, as Chinese platforms show them. `outside: "exclude"` leaves pre-market and
@@ -712,11 +745,27 @@ chart.configure_resampled_series(hour, {
 `span: "day"` returns one boundary per trading date from its first open to its last close; with
 `interval_seconds: 86400` that is one daily bar per date, stamped at the session open, so US daily
 bars built from extended-hours minutes (04:00–20:00 Eastern) stay one bar per day across DST even
-though winter sessions run past UTC midnight. Every boundary carries the trading date as
-`session_id` (`YYYYMMDD`). Dates are strictly ascending and use `session_slot_times` placement
-(night sessions with a negative `session_start` included); at most 20 000 boundaries and 32
-resampled series per chart. Hosts may also pass their own `{ start_time, end_time, session_id }`
+though winter sessions run past UTC midnight. Every boundary carries the requested date as
+`session_id` (`YYYYMMDD`): the trading date for a market whose sessions start on it, the evening
+date for a Sunday-open market (below). Dates are strictly ascending and use `session_slot_times`
+placement (night sessions with a negative `session_start` included); at most 20 000 boundaries and
+32 resampled series per chart. Hosts may also pass their own `{ start_time, end_time, session_id }`
 periods (for weeks or months, for example).
+
+`resample_boundaries` has its own `session_start`, default `0` and independent of the chart's, so
+China futures pass `-10800` explicitly. For a Sunday-open market (CME Globex) pass `session_start:
+0`, the evening dates, and `windows: [["17:00", "16:00"]]`; the `session_id` of each boundary is then
+the requested evening date (`20240107` for the session that opens Sunday 2024-01-07 and is Monday's
+trading day), or build the `{ start_time, end_time, session_id }` periods yourself. Never pass
+`-25200` with the Monday date: it places that session on Friday 17:00 to Saturday 16:00, so Sunday
+and Monday rows fall outside every boundary and are omitted.
+
+The window list applies to every date of a call. Hosts with a calendar call `resample_boundaries`
+once per window set and concatenate the arrays, which only need to be ordered and disjoint: night
+and day windows for normal dates, day windows only for a date whose night session does not trade,
+such as the first trading day after a break. With `span: "day"` the bar is stamped at the first
+window's open, so a shared night-plus-day list would stamp that date's daily bar on the night
+session that never traded.
 
 **Source rows.** Source rows must be stamped with bar-open times; rows outside every boundary are
 omitted, so shift close-stamped minutes (09:31 … 15:00) back by one interval first. A feed that also
