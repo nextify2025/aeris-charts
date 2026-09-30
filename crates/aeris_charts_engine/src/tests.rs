@@ -8160,16 +8160,24 @@ fn chart_with_overlay_series() -> (ChartEngine, SeriesId) {
     (chart, overlay)
 }
 
-/// `chart_with_indicator_pane` plus a second pane-0 line on the same Right scale whose first
-/// visible value differs from the main series', in percentage mode (per-series bases differ).
-fn chart_with_percentage_comparison() -> (ChartEngine, SeriesId) {
-    let mut chart = chart_with_indicator_pane();
+/// A second pane-0 line on `target` whose values (300..378) sit far outside the main series'
+/// (about 55..195), so its scale can never be mistaken for the main series'.
+fn add_pane_zero_comparison(chart: &mut ChartEngine, target: PriceScaleTarget) -> SeriesId {
     let comparison = chart.add_series(SeriesKind::Line);
     let times: Vec<f64> = (1..=40).map(|i| i as f64).collect();
     let values: Vec<f64> = (0..40).map(|i| 300.0 + i as f64 * 2.0).collect();
     chart
         .set_series_data(comparison, &times, &values, &values, &values, &values)
         .unwrap();
+    chart.set_series_price_scale(comparison, target);
+    comparison
+}
+
+/// `chart_with_indicator_pane` plus a second pane-0 line on the same Right scale whose first
+/// visible value differs from the main series', in percentage mode (per-series bases differ).
+fn chart_with_percentage_comparison() -> (ChartEngine, SeriesId) {
+    let mut chart = chart_with_indicator_pane();
+    let comparison = add_pane_zero_comparison(&mut chart, PriceScaleTarget::Right);
     chart.set_price_scale_mode(0, false, PriceScaleMode::Percentage);
     chart.build_frame();
     (chart, comparison)
@@ -8243,6 +8251,97 @@ fn pane_and_chart_level_conversions_select_pane_by_y_and_default_scale() {
     let empty = ChartEngine::new(800.0, 500.0, 1.0);
     assert_eq!(empty.coordinate_to_price(10.0), None);
     assert_eq!(empty.pane_price_to_coordinate(0, 100.0), None);
+}
+
+/// The chart-level pair must agree with `series` (the pane-0 series whose scale is the pane's
+/// default) at `price` and round-trip through pane 0. When `other` is given it names a pane-0
+/// series on a different scale that the pair must not follow.
+fn assert_chart_level_follows(
+    chart: &ChartEngine,
+    series: SeriesId,
+    other: Option<SeriesId>,
+    price: f64,
+    context: &str,
+) {
+    let y = chart
+        .pane_price_to_coordinate(0, price)
+        .unwrap_or_else(|| panic!("{context}: no chart-level coordinate for {price}"));
+    let y_series = chart.series_price_to_coordinate(series, price).unwrap();
+    assert!(
+        (y - y_series).abs() < 1e-9,
+        "{context}: chart-level y {y} is not series {series}'s y {y_series}"
+    );
+    if let Some(other) = other {
+        let y_other = chart.series_price_to_coordinate(other, price).unwrap();
+        assert!(
+            (y - y_other).abs() > 1.0,
+            "{context}: chart-level y {y} follows series {other}'s scale ({y_other})"
+        );
+    }
+    assert_eq!(chart.pane_index_at_y(y), 0, "{context}: y {y} left pane 0");
+    let back = chart
+        .coordinate_to_price(y)
+        .unwrap_or_else(|| panic!("{context}: no chart-level price for y {y}"));
+    assert!(
+        (back - price).abs() < 1e-6,
+        "{context}: {price} -> {y} -> {back}"
+    );
+    let back_series = chart.series_coordinate_to_price(series, y).unwrap();
+    assert!(
+        (back - back_series).abs() < 1e-9,
+        "{context}: chart-level price {back} is not series {series}'s {back_series}"
+    );
+}
+
+#[test]
+fn chart_level_conversions_use_the_pane_default_scale_not_the_first_series() {
+    // The main series (created first) moves to the overlay scale, which never decides a pane's
+    // default; the comparison on the right scale does. A converter that follows series creation
+    // order would read the main series' overlay scale here.
+    let mut chart = chart_with_indicator_pane();
+    let comparison = add_pane_zero_comparison(&mut chart, PriceScaleTarget::Right);
+    chart.set_series_price_scale(0, PriceScaleTarget::Overlay);
+    chart.build_frame();
+    assert_eq!(chart.pane_default_scale_target(0), PriceScaleTarget::Right);
+    assert_chart_level_follows(&chart, comparison, Some(0), 340.0, "main on overlay");
+
+    // Back on the right scale the main series is the pane's first visible source again.
+    chart.set_series_price_scale(0, PriceScaleTarget::Right);
+    chart.build_frame();
+    assert_chart_level_follows(&chart, 0, None, 120.0, "main back on the right scale");
+}
+
+#[test]
+fn chart_level_conversions_follow_a_hidden_main_series_to_the_next_source() {
+    for target in [PriceScaleTarget::Right, PriceScaleTarget::Left] {
+        let mut chart = chart_with_indicator_pane();
+        let comparison = add_pane_zero_comparison(&mut chart, target);
+        chart.build_frame();
+
+        // A visible main series is the default source: a comparison on the left scale never
+        // takes the chart-level pair away from it.
+        assert_eq!(chart.pane_default_scale_target(0), PriceScaleTarget::Right);
+        let other = (target == PriceScaleTarget::Left).then_some(comparison);
+        assert_chart_level_follows(&chart, 0, other, 120.0, "visible main");
+        let with_main = chart.pane_price_to_coordinate(0, 340.0).unwrap();
+
+        // Hiding it hands the pane's default scale to the comparison.
+        chart.set_series_visible(0, false);
+        chart.build_frame();
+        assert_eq!(chart.pane_default_scale_target(0), target);
+        assert_chart_level_follows(&chart, comparison, None, 340.0, "hidden main");
+        let without_main = chart.pane_price_to_coordinate(0, 340.0).unwrap();
+        assert!(
+            (with_main - without_main).abs() > 1.0,
+            "{target:?}: hiding the main series left the chart-level y at {with_main}"
+        );
+
+        // Showing it again restores the main series as the default source.
+        chart.set_series_visible(0, true);
+        chart.build_frame();
+        assert_eq!(chart.pane_default_scale_target(0), PriceScaleTarget::Right);
+        assert_chart_level_follows(&chart, 0, other, 120.0, "main shown again");
+    }
 }
 
 #[test]
