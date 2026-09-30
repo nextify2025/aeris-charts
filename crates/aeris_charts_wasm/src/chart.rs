@@ -5692,11 +5692,13 @@ impl AerisChart {
 
     // --- coordinate & logical-range API (roadmap Phase A4) ---
 
-    /// Y (CSS px) for a price, or `undefined` if the price scale has no range yet.
+    /// Y (CSS px, chart content) for a price on pane 0's default price scale, or `undefined` if
+    /// that scale has no range yet.
     pub fn price_to_coordinate(&self, price: f64) -> Option<f64> {
         self.inner.borrow().price_to_coordinate(price)
     }
-    /// Price for a Y (CSS px), or `undefined` if the price scale has no range yet.
+    /// Price for a Y (CSS px, chart content) on the default price scale of the pane containing
+    /// it, or `undefined` if that scale has no range yet.
     pub fn coordinate_to_price(&self, y_css: f64) -> Option<f64> {
         self.inner.borrow().coordinate_to_price(y_css)
     }

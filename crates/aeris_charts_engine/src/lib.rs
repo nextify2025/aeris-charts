@@ -1712,6 +1712,10 @@ impl Default for Pane {
     }
 }
 
+/// A linked-crosshair position. `price` is a price on `pane_index`'s default price scale (the
+/// scale the crosshair label reads) and `time` an exact merged chart time. Applying it puts the
+/// horizontal line at that price's chart-content y, held on the pane's edge when the price is
+/// outside the pane's visible range.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrosshairSyncPosition {
     pub time: f64,
@@ -4349,7 +4353,9 @@ impl ChartEngine {
     /// reference `chart.setCrosshairPosition(price, time, series)` (chart-model.ts
     /// `setAndSaveSyntheticPosition`): position the crosshair at a data point without a DOM
     /// event. The time must land exactly on a merged time point (false otherwise); x is that
-    /// bar's coordinate and y the price converted through the given series' price scale.
+    /// bar's coordinate and y the price converted through the given series' price scale (the
+    /// queued sync event carries a price on the pane's default scale, see
+    /// [`CrosshairSyncPosition`]).
     /// Works headless — the next built frame draws it; hosts emit their crosshair event.
     pub fn set_crosshair_position(&mut self, price: f64, time: f64, series_id: SeriesId) -> bool {
         if !price.is_finite() || self.is_series_removed(series_id) {
@@ -4371,17 +4377,56 @@ impl ChartEngine {
         };
         let x = self.time_scale.index_to_coordinate(index);
         self.crosshair = Some((x, y));
+        let pane_index = self
+            .series_entry(series_id)
+            .map_or(0, |series| series.pane_index);
+        // The synced price is a price on the pane's default scale, which is what a linked chart
+        // converts. The raw host price is kept only when it already is one; a series on another
+        // scale (or on another percentage/indexed base) is re-read from the crosshair y so the
+        // receiver lands on the same line.
+        let sync_price = if self.series_price_is_on_pane_default_scale(series_id) {
+            price
+        } else {
+            self.pane_coordinate_to_price(pane_index, y)
+                .unwrap_or(price)
+        };
         self.queue_sync_event(ChartSyncEventKind::Crosshair {
             position: CrosshairSyncPosition {
                 time,
-                price,
-                pane_index: self
-                    .series_entry(series_id)
-                    .map_or(0, |series| series.pane_index),
+                price: sync_price,
+                pane_index,
             },
         });
         self.invalidate_frame_overlay();
         true
+    }
+
+    /// Whether a price on `series_id` is already a price on its pane's default scale: the series
+    /// sits on that scale and, in the modes that read a per-series base (percentage and indexed),
+    /// shares the default series' base.
+    fn series_price_is_on_pane_default_scale(&self, series_id: SeriesId) -> bool {
+        let Some(series) = self.series_entry(series_id) else {
+            return false;
+        };
+        let pane_index = series.pane_index;
+        if series.price_scale_target != self.pane_default_scale_target(pane_index) {
+            return false;
+        }
+        let series_based = self
+            .price_scale_for(pane_index, series.price_scale_target)
+            .is_some_and(|scale| {
+                matches!(
+                    scale.mode(),
+                    PriceScaleMode::Percentage | PriceScaleMode::IndexedTo100
+                )
+            });
+        if !series_based {
+            return true;
+        }
+        let Some((from, _)) = self.visible_range_for_frame() else {
+            return false;
+        };
+        self.series_base_value(series_id, from) == Some(self.pane_default_scale(pane_index, from).1)
     }
 
     /// reference `chart.clearCrosshairPosition`. The engine keeps a single stored position — the
@@ -4415,11 +4460,12 @@ impl ChartEngine {
         let (x, y) = self.crosshair?;
         let logical = self.time_scale.coordinate_to_index(x);
         let time = self.axis_time_seconds_at(logical as usize)?;
-        let pane_index = self.pane_at_y(y).unwrap_or(0);
-        let pane = self.panes.get(pane_index)?;
+        // The crosshair y is chart-content space and every scale already applies its own pane
+        // offset, so y goes to the scale untouched. A separator resolves to the pane above.
+        let pane_index = self.pane_index_at_y(y);
         Some(CrosshairSyncPosition {
             time,
-            price: pane.price_scale.coordinate_to_price(y - pane.top, 0.0),
+            price: self.pane_coordinate_to_price(pane_index, y)?,
             pane_index,
         })
     }
@@ -4441,8 +4487,16 @@ impl ChartEngine {
         let Some(pane) = self.panes.get(position.pane_index) else {
             return false;
         };
-        let y = pane.price_scale.price_to_coordinate(position.price, 0.0) + pane.top;
-        let next = (self.time_scale.index_to_coordinate(index), y);
+        let (top, bottom) = (pane.top, pane.top + pane.height);
+        let Some(y) = self.pane_price_to_coordinate(position.pane_index, position.price) else {
+            return false;
+        };
+        // The crosshair y is one chart-content value: keep it inside the requested pane so a
+        // price outside that pane's range sits on its edge instead of drawing in a neighbour.
+        let next = (
+            self.time_scale.index_to_coordinate(index),
+            y.max(top).min(bottom),
+        );
         let changed = self.crosshair != Some(next);
         self.crosshair = Some(next);
         if changed {

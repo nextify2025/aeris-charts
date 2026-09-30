@@ -3298,30 +3298,21 @@ impl ChartInner {
 
     // --- coordinate & logical-range API (roadmap Phase A4) ---
     //
-    // Reflects the state of the last render (scale height/width, price range). All coordinates
-    // are media (CSS) pixels relative to the pane offset, matching the pointer coords JS passes
-    // to `set_crosshair`. `None`/empty means the query falls off the chart or there is no data.
+    // Reflects the state of the last render (scale height/width, price range). X is CSS px from
+    // the plot-area left edge and Y CSS px from the top of the stacked pane area (never
+    // pane-local), matching the pointer coords JS passes to `set_crosshair`. `None`/empty means
+    // the query falls off the chart or there is no data.
 
-    /// The primary series id for the pane-level coordinate API: the first visible,
-    /// non-removed series (id 0 may be tombstoned via `remove_series`).
-    fn primary_series_id(&self) -> Option<SeriesId> {
-        self.series
-            .iter()
-            .find(|s| s.visible && !s.removed)
-            .map(|s| s.id)
-    }
-
-    /// Y (CSS px) for a price on the active price scale, or `None` if the scale has no range yet.
-    /// In percentage/indexed modes the price is its own base value (as in the render path).
+    /// Y (CSS px, chart content) for a price on pane 0's default price scale, or `None` if that
+    /// scale has no range yet. Series handles convert on their own pane and scale instead.
     pub fn price_to_coordinate(&self, price: f64) -> Option<f64> {
-        self.engine
-            .series_price_to_coordinate(self.primary_series_id()?, price)
+        self.engine.pane_price_to_coordinate(0, price)
     }
 
-    /// Price for a Y (CSS px), or `None` if the scale has no range yet.
+    /// Price for a Y (CSS px, chart content) on the default price scale of the pane containing it
+    /// (the scale the crosshair label reads there), or `None` if that scale has no range yet.
     pub fn coordinate_to_price(&self, y_css: f64) -> Option<f64> {
-        self.engine
-            .series_coordinate_to_price(self.primary_series_id()?, y_css)
+        self.engine.coordinate_to_price(y_css)
     }
 
     /// X (CSS px) for a UTC-seconds timestamp that sits exactly on a data point, else `None`

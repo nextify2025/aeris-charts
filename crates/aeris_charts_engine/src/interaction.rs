@@ -955,18 +955,15 @@ impl ChartEngine {
 
     // --- pane hit-testing ---
 
-    /// Index of the stacked pane containing content-y `y` (panes own their bounds; separators
-    /// between them count as the pane above). Clamped to the last pane so coordinates below the
-    /// content area still resolve.
+    /// Index of the stacked pane containing content-y `y`. A pane owns everything above the next
+    /// pane's top, so a separator between panes belongs to the pane above; a `y` above the content
+    /// resolves to the first pane and one below it to the last, so coordinates outside the stack
+    /// still resolve.
     pub fn pane_index_at_y(&self, y: f64) -> usize {
-        let mut index = 0;
-        for (i, pane) in self.panes.iter().enumerate() {
-            if y >= pane.top && (y < pane.top + pane.height || i + 1 == self.panes.len()) {
-                return i;
-            }
-            index = i;
-        }
-        index
+        self.panes
+            .windows(2)
+            .position(|pair| y < pair[1].top)
+            .unwrap_or(self.panes.len().saturating_sub(1))
     }
 
     /// Resolve a secondary-click payload without mutating hover, selection, drawing, or trading
@@ -1676,5 +1673,25 @@ mod tests {
         assert_eq!(chart.pane_index_at_y(first_h - 1.0), 0);
         assert_eq!(chart.pane_index_at_y(first_h + 10.0), 1);
         assert_eq!(chart.pane_index_at_y(299.0), 1);
+    }
+
+    #[test]
+    fn pane_index_at_y_resolves_separators_to_the_pane_above() {
+        let mut chart = chart_with_data(400.0, 300.0);
+        chart.add_pane(true);
+        chart.add_pane(true);
+        chart.layout_panes(300.0);
+        assert_eq!(chart.panes.len(), 3);
+        for index in 0..2 {
+            let pane = &chart.panes[index];
+            let separator = pane.top + pane.height + PANE_SEPARATOR / 2.0;
+            assert_eq!(
+                chart.pane_index_at_y(separator),
+                index,
+                "a separator below pane {index} belongs to that pane, not the last one"
+            );
+        }
+        assert_eq!(chart.pane_index_at_y(-10.0), 0);
+        assert_eq!(chart.pane_index_at_y(10_000.0), 2);
     }
 }

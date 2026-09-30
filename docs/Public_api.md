@@ -359,6 +359,51 @@ unless `break_on_trading_day: true` asks them to break at each exchange trading 
 bar axis such as Renko or tick bars, the day of each bar's open time); whitespace rows never break
 a line.
 
+## Coordinates and panes
+
+Every public coordinate lives in one chart-content space, and it is never pane-local. `x` is CSS px
+from the plot-area left edge (right of the left price strip), so the container `x` is
+`pane.get_geometry().left + x`. `y` is CSS px from the top of the stacked pane area, which is pane 0's
+top. A pane spans `[geometry.top, geometry.top + geometry.height]` in that `y`; its pane-local `y` is
+`y - geometry.top`. The same space carries `series.price_to_coordinate`/`coordinate_to_price`,
+`chart.price_to_coordinate`/`coordinate_to_price`, `time_scale()` conversions,
+`mouse_event_params.point`, the crosshair, hit tests, drawings, and trading geometry, so a `y` from one
+API can be handed to any other. All values reflect the last layout pass: after `pane.set_height`, a
+separator drag, or a pane move, read them again once the chart has laid out.
+
+**Choosing a pane.** A series handle converts on its own pane and price scale, in that scale's mode and
+base. A host that needs a lower pane's coordinates keeps a handle to a series in that pane:
+
+```ts
+// `rsi` is a series handle in pane 1, for example from `chart.add_rsi(candles, 14)`.
+const pane = chart.panes()[1].get_geometry();
+const y = rsi.price_to_coordinate(70); // in pane 1's [top, top + height] while 70 is in range; never pane-local
+const paneLocalY = y! - pane.top;      // pane-relative chrome subtracts the pane top itself
+rsi.coordinate_to_price(y!);           // 70
+```
+
+`chart.price_to_coordinate(price)` converts on pane 0's default scale (the first visible non-overlay
+series' scale, else the right scale), and `chart.coordinate_to_price(y)` uses the default scale of the
+pane containing `y`: a separator belongs to the pane above and a `y` below the panes to the last pane.
+That is the scale the crosshair label reads in that pane, so the two never disagree. Neither follows
+series creation order or an overlay's scale. Time, logical, and `x` conversions are the same for every
+pane.
+
+**Two other spaces.** Plugin draw-context converters (`price_to_y`, `time_to_x`, `logical_to_x`) return
+bitmap px of the whole chart with `x` including `pane_left`, the space the plugin canvas draws in;
+subtract `pane_left` and divide by `dpr` to compare them with the CSS-px converters above. A plugin
+axis-label descriptor's `coordinate` is pane-local (price: px from the pane top; time: px from the
+plot-area left) unless a series primitive supplies `price`, which is converted on the series' scale.
+
+**Linked crosshairs.** `crosshair_sync_position()` and the `crosshair` events from `take_sync_events()`
+carry `pane_index` and a `price` on that pane's default scale, with the pane picked from the crosshair
+`y` (a separator counts as the pane above). `set_crosshair_position(price, time, series)` places the
+line through the given series' scale; the emitted price is the raw `price` when that series is on the
+pane's default scale (and, in percentage and indexed modes, shares its base), otherwise it is
+re-expressed on the default scale so a linked chart lands on the same line. `apply_external_crosshair`
+converts the price on the requested pane's default scale and holds the line inside that pane: a price
+outside the pane's visible range sits on the pane's edge instead of drawing in a neighbouring pane.
+
 ## Time, exchange time zone, and trading sessions
 
 Canonical chart time is whole UTC seconds. `business_day` values and strict `"YYYY-MM-DD"` strings

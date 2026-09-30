@@ -8142,6 +8142,238 @@ fn two_indicator_panes_and_a_named_pane_scale_stay_independent() {
     assert!(ranges[1].min_value() > ranges[2].max_value());
 }
 
+// --- sub-pane coordinate contract and crosshair sync -----------------------------------------------
+
+/// `chart_with_indicator_pane` plus a volume-like series on the pane-0 overlay scale.
+fn chart_with_overlay_series() -> (ChartEngine, SeriesId) {
+    let mut chart = chart_with_indicator_pane();
+    let overlay = chart.add_series(SeriesKind::Histogram);
+    let times: Vec<f64> = (1..=40).map(|i| i as f64).collect();
+    let volume: Vec<f64> = (0..40)
+        .map(|i| 1_000.0 + (i as f64 * 37.0) % 900.0)
+        .collect();
+    chart
+        .set_series_data(overlay, &times, &volume, &volume, &volume, &volume)
+        .unwrap();
+    chart.set_series_price_scale(overlay, PriceScaleTarget::Overlay);
+    chart.build_frame();
+    (chart, overlay)
+}
+
+/// `chart_with_indicator_pane` plus a second pane-0 line on the same Right scale whose first
+/// visible value differs from the main series', in percentage mode (per-series bases differ).
+fn chart_with_percentage_comparison() -> (ChartEngine, SeriesId) {
+    let mut chart = chart_with_indicator_pane();
+    let comparison = chart.add_series(SeriesKind::Line);
+    let times: Vec<f64> = (1..=40).map(|i| i as f64).collect();
+    let values: Vec<f64> = (0..40).map(|i| 300.0 + i as f64 * 2.0).collect();
+    chart
+        .set_series_data(comparison, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.set_price_scale_mode(0, false, PriceScaleMode::Percentage);
+    chart.build_frame();
+    (chart, comparison)
+}
+
+#[test]
+fn crosshair_sync_round_trips_on_a_sub_pane() {
+    let mut chart = chart_with_indicator_pane();
+    let rsi = chart.pane_series_ids(1)[0];
+    assert!(chart.set_crosshair_position(50.0, 30.0, rsi));
+    let (_, y) = chart.crosshair.expect("the synthetic crosshair");
+    assert_eq!(
+        chart.pane_at_y(y),
+        Some(1),
+        "the crosshair sits in the RSI pane"
+    );
+
+    let sync = chart.crosshair_sync_position().expect("a sync position");
+    assert_eq!(sync.pane_index, 1);
+    assert!(
+        (sync.price - 50.0).abs() < 1e-6,
+        "the sync price {} is not the RSI price the crosshair was placed at",
+        sync.price
+    );
+
+    // A linked, identically laid out chart lands on the same chart-content y.
+    let mut linked = chart_with_indicator_pane();
+    assert!(linked.apply_external_crosshair(Some(sync)));
+    let (_, linked_y) = linked.crosshair.expect("the applied crosshair");
+    assert!(
+        (linked_y - y).abs() < 1e-9,
+        "the applied crosshair y {linked_y} is not the source y {y}"
+    );
+}
+
+#[test]
+fn pane_and_chart_level_conversions_select_pane_by_y_and_default_scale() {
+    let chart = chart_with_indicator_pane();
+    let rsi = chart.pane_series_ids(1)[0];
+    let y_rsi = chart.series_price_to_coordinate(rsi, 50.0).unwrap();
+    let y_main = chart.series_price_to_coordinate(0, 120.0).unwrap();
+    // The public coordinate space is the shared chart content, never pane-local.
+    assert!(y_rsi >= chart.panes[1].top);
+    assert!(y_rsi > chart.panes[0].top + chart.panes[0].height);
+
+    let series_price = |id: SeriesId, y: f64| chart.series_coordinate_to_price(id, y).unwrap();
+    assert!((chart.coordinate_to_price(y_rsi).unwrap() - series_price(rsi, y_rsi)).abs() < 1e-9);
+    assert!((chart.coordinate_to_price(y_main).unwrap() - series_price(0, y_main)).abs() < 1e-9);
+    assert!((chart.pane_price_to_coordinate(1, 50.0).unwrap() - y_rsi).abs() < 1e-9);
+    assert!((chart.pane_price_to_coordinate(0, 120.0).unwrap() - y_main).abs() < 1e-9);
+
+    // A separator resolves to the pane above and a y below the content to the last pane.
+    let separator_y = chart.panes[0].top + chart.panes[0].height + 0.5;
+    assert_eq!(chart.pane_index_at_y(separator_y), 0);
+    assert!(
+        (chart.coordinate_to_price(separator_y).unwrap() - series_price(0, separator_y)).abs()
+            < 1e-9
+    );
+    let below_y = chart.pane_h + 40.0;
+    assert_eq!(chart.pane_index_at_y(below_y), 1);
+    assert!(
+        (chart.coordinate_to_price(below_y).unwrap() - series_price(rsi, below_y)).abs() < 1e-9
+    );
+
+    // Unusable inputs are `None`, never a panic or a non-finite number.
+    assert_eq!(chart.pane_price_to_coordinate(9, 50.0), None);
+    assert_eq!(chart.pane_coordinate_to_price(9, y_rsi), None);
+    assert_eq!(chart.pane_price_to_coordinate(1, f64::NAN), None);
+    assert_eq!(chart.pane_coordinate_to_price(1, f64::INFINITY), None);
+    assert_eq!(chart.coordinate_to_price(f64::NAN), None);
+    let empty = ChartEngine::new(800.0, 500.0, 1.0);
+    assert_eq!(empty.coordinate_to_price(10.0), None);
+    assert_eq!(empty.pane_price_to_coordinate(0, 100.0), None);
+}
+
+#[test]
+fn sub_pane_series_conversions_stay_in_the_shared_content_space() {
+    let mut chart = chart_with_indicator_pane();
+    let rsi = chart.pane_series_ids(1)[0];
+    let check = |chart: &ChartEngine| {
+        let pane = &chart.panes[1];
+        for price in [45.0, 50.0, 55.0] {
+            let y = chart.series_price_to_coordinate(rsi, price).unwrap();
+            assert!(
+                y >= pane.top && y <= pane.top + pane.height,
+                "price {price} maps to {y}, outside pane 1 [{}, {}]",
+                pane.top,
+                pane.top + pane.height
+            );
+            let back = chart.series_coordinate_to_price(rsi, y).unwrap();
+            assert!((back - price).abs() < 1e-9, "{price} -> {y} -> {back}");
+            assert_eq!(y, pane.price_scale.price_to_coordinate(price, 0.0));
+        }
+    };
+    check(&chart);
+    // Conversions reflect the last layout pass: after a divider drag and a rebuild the contract
+    // still holds against the moved pane.
+    chart.drag_pane_separator(0, 90.0);
+    chart.build_frame();
+    check(&chart);
+}
+
+#[test]
+fn sync_price_uses_the_pane_default_scale_for_overlay_series() {
+    let (mut chart, overlay) = chart_with_overlay_series();
+    let volume = chart.series_data(overlay)[29].close;
+    assert!(chart.set_crosshair_position(volume, 30.0, overlay));
+    let (_, y) = chart.crosshair.unwrap();
+    let events = chart.take_sync_events();
+    let ChartSyncEventKind::Crosshair { position } = events[0].kind.clone() else {
+        panic!("a crosshair event");
+    };
+    assert_eq!(position.pane_index, 0);
+    // The chart-level pair ignores the overlay series' own scale too.
+    let y_main = chart.series_price_to_coordinate(0, 120.0).unwrap();
+    assert!((chart.pane_price_to_coordinate(0, 120.0).unwrap() - y_main).abs() < 1e-9);
+    let expected = chart.pane_coordinate_to_price(0, y).unwrap();
+    assert_eq!(
+        position.price, expected,
+        "the price is on the pane default scale"
+    );
+    assert!(
+        (position.price - volume).abs() > 1.0,
+        "the raw overlay value must not leak into the sync price"
+    );
+
+    let (mut linked, _) = chart_with_overlay_series();
+    assert!(linked.apply_external_crosshair(Some(position)));
+    let (_, linked_y) = linked.crosshair.unwrap();
+    assert!(
+        (linked_y - y).abs() < 1e-9,
+        "linked y {linked_y} vs source y {y}"
+    );
+}
+
+#[test]
+fn sync_price_is_rebased_for_non_default_series_in_percentage_mode() {
+    let (mut chart, comparison) = chart_with_percentage_comparison();
+    let main_close = chart.series_data(0)[29].close;
+    let comparison_close = chart.series_data(comparison)[29].close;
+
+    // The default series keeps its raw host price bit-exact.
+    assert!(chart.set_crosshair_position(main_close, 30.0, 0));
+    let ChartSyncEventKind::Crosshair { position: main } = chart.take_sync_events()[0].kind.clone()
+    else {
+        panic!("a crosshair event");
+    };
+    assert_eq!(main.price, main_close);
+
+    // The comparison shares the Right scale but has its own first-value base, so its raw price is
+    // not a price on the default series' base and is re-expressed on it.
+    assert!(chart.set_crosshair_position(comparison_close, 30.0, comparison));
+    let (_, y) = chart.crosshair.unwrap();
+    let ChartSyncEventKind::Crosshair { position } = chart.take_sync_events()[0].kind.clone()
+    else {
+        panic!("a crosshair event");
+    };
+    assert!(
+        (position.price - comparison_close).abs() > 1.0,
+        "the comparison's raw price {comparison_close} must be rebased, got {}",
+        position.price
+    );
+
+    let (mut linked, _) = chart_with_percentage_comparison();
+    assert!(linked.apply_external_crosshair(Some(position)));
+    let (_, linked_y) = linked.crosshair.unwrap();
+    assert!(
+        (linked_y - y).abs() < 1e-9,
+        "linked y {linked_y} vs source y {y}"
+    );
+}
+
+#[test]
+fn external_crosshair_price_outside_the_pane_range_stays_in_that_pane() {
+    for (pane_index, price) in [(1, 1.0e6), (1, -1.0e6), (0, -1.0e6), (0, 1.0e6)] {
+        let mut chart = chart_with_indicator_pane();
+        assert!(chart.apply_external_crosshair(Some(CrosshairSyncPosition {
+            time: 30.0,
+            price,
+            pane_index,
+        })));
+        let (_, y) = chart.crosshair.unwrap();
+        assert_eq!(
+            chart.pane_at_y(y),
+            Some(pane_index),
+            "price {price} on pane {pane_index} drew the crosshair at y {y}"
+        );
+    }
+}
+
+#[test]
+fn crosshair_sync_position_survives_the_indicator_warmup_window() {
+    let mut chart = chart_with_indicator_pane();
+    // RSI(14) has no value before row 14: park the window inside the warmup rows.
+    chart.set_visible_logical_range(0.0, 8.0);
+    chart.build_frame();
+    let rsi_y = chart.panes[1].top + chart.panes[1].height / 2.0;
+    let x = chart.time_scale.index_to_coordinate(4);
+    chart.crosshair = Some((x, rsi_y));
+    let sync = chart.crosshair_sync_position().expect("a sync position");
+    assert_eq!(sync.pane_index, 1);
+    assert!(sync.price.is_finite());
+}
+
 #[test]
 fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
     use aeris_charts_render::draw_list::Prim;

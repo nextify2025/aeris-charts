@@ -1130,7 +1130,12 @@ export interface mouse_event_params {
   time: number | null;
   /** Float logical (bar) index under the cursor, or `null` when there is no data. */
   logical: number | null;
-  /** Cursor position in CSS px relative to the pane, or `null` when the cursor left the chart. */
+  /**
+   * Cursor position in CSS px in the chart's shared coordinate space (see {@link pane_geometry}):
+   * `x` from the plot-area left edge (right of the left price strip), `y` from the top of the
+   * stacked pane area. `y` is not pane-local; subtract the hovered pane's `get_geometry().top`
+   * for that. `null` when the cursor left the chart.
+   */
   point: { x: number; y: number } | null;
   /** Index of the pane under the cursor, or `null` over an axis strip or outside the panes. */
   pane_index: number | null;
@@ -1166,8 +1171,18 @@ export type visible_time_range_handler = (range: time_range | null) => void;
 /** Receives the time scale's new media size in px (reference `SizeChangeEventHandler`). */
 export type size_change_handler = (width: number, height: number) => void;
 
-/** Geometry of a pane's content area in CSS px relative to the chart container's top-left —
- *  the anchor for platform-rendered per-pane chrome (indicator chips, legends). */
+/**
+ * Geometry of a pane's content area in CSS px relative to the chart container's top-left —
+ * the anchor for platform-rendered per-pane chrome (indicator chips, legends). It also defines
+ * the chart's public coordinate space, shared by every `price_to_coordinate` /
+ * `coordinate_to_price` / `time_to_coordinate` / `coordinate_to_time` / `logical_to_coordinate` /
+ * `coordinate_to_logical` conversion, pointer `point`, crosshair, hit-test, drawing and trading
+ * position: `x` is CSS px from the plot-area left edge (container x = `left` + x) and `y` is CSS
+ * px from the top of the stacked pane area (pane 0's `top`). A pane spans
+ * `[top, top + height]` in that `y`; pane-local `y` is `y - top`. A `y` is never pane-local, so a
+ * lower pane's price maps to a `y` at or below that pane's `top`. All values reflect the last
+ * layout pass.
+ */
 export interface pane_geometry {
   left: number;
   top: number;
@@ -3454,7 +3469,15 @@ export interface series_api {
   price_scale_id(): string;
   /** Rebind to an existing price scale in this pane without recreating the series. */
   move_to_price_scale(id: string): void;
+  /**
+   * Chart-content `y` (CSS px from the top of the stacked pane area, see {@link pane_geometry}) for
+   * a price on this series' own pane and price scale, in that scale's mode and base. For a series
+   * in a lower pane the result lies inside that pane's `[top, top + height]`, not pane-local: this
+   * is how a host targets a sub-pane. `null` when the scale has no range yet or the price is not
+   * finite.
+   */
   price_to_coordinate(price: number): number | null;
+  /** Inverse of {@link series_api.price_to_coordinate}: price on this series' scale at chart-content `y`. */
   coordinate_to_price(coordinate: number): number | null;
   bars_in_logical_range(range: logical_range): bars_info | null;
   data_by_index(logical_index: number, mismatch_direction?: mismatch_direction): series_data | null;
@@ -3544,9 +3567,16 @@ export interface time_scale_api {
   /** Fire after the time scale's media size changes (reference `subscribeSizeChange`). */
   subscribe_size_change(handler: size_change_handler): void;
   unsubscribe_size_change(handler: size_change_handler): void;
+  /**
+   * `x` (CSS px from the plot-area left edge; add {@link pane_geometry.left} for container x) of an
+   * exact bar timestamp. Time, logical and `x` conversions are the same for every pane.
+   */
   time_to_coordinate(time: number): number | null;
+  /** Timestamp of the bar nearest `x` (CSS px from the plot-area left edge). */
   coordinate_to_time(x: number): number | null;
+  /** `x` (CSS px from the plot-area left edge) of a possibly fractional logical bar index. */
   logical_to_coordinate(logical: number): number | null;
+  /** Logical bar index at `x` (CSS px from the plot-area left edge). */
   coordinate_to_logical(x: number): number | null;
   /** Exact timestamp lookup, or reference-compatible lower-bound lookup when `find_nearest` is true. */
   time_to_index(time: number, find_nearest?: boolean): number | null;
@@ -3804,6 +3834,13 @@ export interface host_event_hit {
   window: boolean;
 }
 
+/**
+ * A linked-chart crosshair position. `pane_index` selects the pane and `price` is a price on that
+ * pane's default price scale (the scale its crosshair label reads: the first visible non-overlay
+ * series' scale, else the right scale), not on the price scale of whichever series a host used to
+ * place it. `time` is an exact bar timestamp. Applying it puts the horizontal line at that price
+ * inside the requested pane, held on the pane's edge when the price is outside its visible range.
+ */
 export interface crosshair_sync_position {
   time: number;
   price: number;
@@ -4331,19 +4368,33 @@ export interface chart_api {
    * over-zoomed scale fits the data again on the next frame.
    */
   reset_view(): void;
+  /**
+   * Chart-content `y` (CSS px from the top of the stacked pane area, see {@link pane_geometry}) for
+   * a price on the top pane's (pane 0) default price scale. To convert on another pane or scale
+   * use that series' {@link series_api.price_to_coordinate}. `null` when the scale has no range yet.
+   */
   price_to_coordinate(price: number): number | null;
+  /**
+   * Price for a chart-content `y` on the default price scale of the pane containing `y` (the scale
+   * its crosshair label reads): a separator belongs to the pane above and a `y` below the panes to
+   * the last pane. `null` when that scale has no range yet.
+   */
   coordinate_to_price(y: number): number | null;
   /**
    * Set the crosshair position within the chart (reference `IChartApi.setCrosshairPosition`). The
    * crosshair normally follows the user's cursor; setting it explicitly is useful to synchronise
    * the crosshairs of two separate charts. `time` accepts the same forms as data times.
    * Divergence: reference throws on an unknown series; here the call is a silent no-op when the
-   * position cannot be applied.
+   * position cannot be applied. The line is placed through `series`' own price scale; the sync
+   * event it queues carries a price on the pane's default scale (see {@link crosshair_sync_position}).
    */
   set_crosshair_position(price: number, time: time, series: series_api): void;
   /** Clear the crosshair position within the chart (reference `IChartApi.clearCrosshairPosition`). */
   clear_crosshair_position(): void;
-  /** Read the semantic crosshair state for linked-chart coordinators. */
+  /**
+   * Read the semantic crosshair state for linked-chart coordinators: the pane under the crosshair
+   * (a separator counts as the pane above) and the price on that pane's default scale.
+   */
   crosshair_sync_position(): crosshair_sync_position | null;
   /** Apply a coordinator-provided crosshair without generating local pointer input. */
   apply_external_crosshair(position: crosshair_sync_position | null): void;

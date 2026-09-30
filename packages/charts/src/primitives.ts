@@ -23,6 +23,11 @@ export type primitive_line_style = 0 | 1 | 2 | 3 | 4;
  * scales (the pane's right price scale by default) and return `null` when a value falls off the
  * scale — mirroring the reference's `timeToCoordinate`/`priceToCoordinate` nullability.
  *
+ * `price_to_y`/`time_to_x`/`logical_to_x` return this bitmap space (device px, `x` including
+ * `pane_left`), not the CSS-px space of the chart and series `*_to_coordinate` converters, whose
+ * `x` starts at the plot-area left edge: subtract `pane_left` from an `x` and divide by `dpr`
+ * before mixing the two.
+ *
  * The context is valid only for the duration of the synchronous `renderer` call.
  */
 export interface primitive_draw_context {
@@ -124,9 +129,11 @@ export interface primitive_hit_result {
 
 /**
  * A boxed axis label descriptor (cf. reference `ISeriesPrimitiveAxisView`). `coordinate` is media px
- * from the pane's top edge (price axis) or the pane's left edge (time axis). `background_color`
- * (or `color` as a shorthand) fills the box; omitted `text_color` automatically selects black or
- * white for contrast with the effective background.
+ * from the pane's top edge (price axis) or the pane's left edge (time axis): unlike the chart's
+ * public converters, which return chart-content `y` from the top of the stacked panes, it is
+ * pane-local (a series primitive's `price` wins over it and is converted on the series' scale).
+ * `background_color` (or `color` as a shorthand) fills the box; omitted `text_color` automatically
+ * selects black or white for contrast with the effective background.
  * Extension over reference: reference exposes axis views only on series primitives; Aeris
  * accepts them on pane primitives too (painted on the pane's right scale / the time strip).
  */
