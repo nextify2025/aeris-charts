@@ -58,6 +58,23 @@ dependency and `/react` import from the legacy scoped npm package to `@aeristerm
 lockfiles, update any WASM asset names and release automation, and replace repository URLs with
 the `aeristerminal/aeris-charts` repository. No platform repository files are changed here.
 
+Moving the pinned revision to one that carries the sub-pane coordinate contract (see
+[Coordinates and panes](Public_api.md#coordinates-and-panes)) changes three host-visible behaviours
+that Terminal call sites should review:
+
+- The chart-level `price_to_coordinate` and `coordinate_to_price` no longer follow the first visible
+  series in creation order. The price converts on pane 0's default scale and the coordinate on the
+  default scale of the pane containing `y`, so a call that relied on an overlay-first or hidden main
+  series must use that series' own handle instead. Single-pane charts whose main series is created
+  first are unchanged, and series-handle conversions never changed.
+- Linked crosshairs on a lower pane (`pane_index` of 1 or more) now round-trip. Earlier revisions
+  applied the pane offset twice and read the wrong scale, so `crosshair_sync_position` and
+  `apply_external_crosshair` disagreed on any pane but the first. A synced price is now a price on
+  the pane's default scale, and an off-range price holds the line inside its pane.
+- `ChartEngine::pane_index_at_y` (and the browser package's `pane_index_at_y`) now returns the pane
+  above for a separator and pane 0 for a `y` above the content, where both used to resolve to the
+  last pane. GPUI hosts that pick a pane for price-axis hit-testing pick up the corrected mapping.
+
 ## License
 
 Aeris Charts is open-source software under the
