@@ -717,6 +717,39 @@ fn retention_trim_runs_one_union_rebuild_for_every_presentation() {
     }
 }
 
+/// A non-time retention trim evicts bubbles in place, without refolding the retained tape. Eviction
+/// addresses the bubbles against the first retained row key, so it must run after the data layer
+/// has trimmed every presentation: before it, the key base still names an evicted row, the fold
+/// refuses the in-place path and every trim tip rescans the whole retained tape.
+#[test]
+fn retention_trim_evicts_bubbles_in_place_on_the_trimmed_row_keys() {
+    let mut live = Harness::new(trade_bars(), Some(96));
+    live.load(tape(0..1_500));
+    let mut trims = 0;
+    for index in 1_500..2_700 {
+        let before = live.first_bar_open();
+        let work = tip_work(&mut live, vec![tape_trade(index)]);
+        if live.first_bar_open() != before {
+            trims += 1;
+            assert_eq!(
+                work.bubble_trades, 1,
+                "trim tip {index}: bubbles refolded the retained tape"
+            );
+        }
+    }
+    assert!(trims >= 3, "the scenario crosses the ceiling: {trims}");
+    let retained = live.snapshot();
+    assert!(
+        !retained.markers.is_empty(),
+        "the tape leaves retained bubbles"
+    );
+    assert_same(
+        &retained,
+        &live.clean_rebuild_in_place(),
+        "after retained tips",
+    );
+}
+
 /// Every point's `(index, weight)` of the marks a clean rebuild gives the chart's current axis.
 fn clean_tick_marks(
     chart: &ChartEngine,
@@ -1230,6 +1263,116 @@ fn retention_trim_keeps_the_rows_past_the_cutoff_in_every_presentation() {
             retained.studies.iter().zip(&reference.studies).enumerate()
         {
             assert_eq!(*retained, tail(reference), "{aggregation:?} study {study}");
+        }
+    }
+}
+
+/// The data-layer trims a retention ran before its presentations were batched, as the reference a
+/// batched trim must equal: the footprint down to `keep` rows on its own, then every other
+/// presentation of the stream by the first key the footprint then exposes (all its exposed rows
+/// when it exposes none), one `trim_front` and so one union rebuild and reindex per series.
+fn sequential_retention_reference(harness: &mut Harness, keep: usize) {
+    let chart = &mut harness.chart;
+    chart.data.trim_front(harness.footprint, keep);
+    let first_key = chart
+        .data
+        .series_data(harness.footprint)
+        .and_then(|(times, _)| times.first().copied());
+    let presentations = chart
+        .stream_presentations(harness.stream)
+        .filter(|&id| id != harness.footprint)
+        .collect::<Vec<_>>();
+    for id in presentations {
+        let (times, _) = chart.data.series_data(id).unwrap();
+        let evicted =
+            first_key.map_or(times.len(), |key| times.partition_point(|&time| time < key));
+        if evicted > 0 {
+            let rows = chart.data.series_rows(id).unwrap();
+            chart.data.trim_front(id, rows - evicted);
+        }
+    }
+}
+
+/// Every canonical row of every presentation (rows past the cutoff included) plus the shared axis.
+fn canonical_rows(harness: &mut Harness) -> (Vec<Rows>, Vec<i64>) {
+    harness.chart.data.set_time_cutoff(None);
+    let ids = [harness.footprint, harness.candles]
+        .into_iter()
+        .chain(harness.studies);
+    let presentations = ids.map(|id| rows(&harness.chart, id)).collect();
+    (
+        presentations,
+        harness.chart.data_layer().merged_times().to_vec(),
+    )
+}
+
+/// The retention trim of a stream whose presentations hold rows past the replay cutoff equals the
+/// sequence of per-presentation trims it replaced, in every presentation's rows and in the shared
+/// axis, while running one union rebuild and one reindex instead of one pair per presentation. The
+/// cutoff is set on the data layer itself: a seek projects only the revealed bars into a stream's
+/// presentations (the replay tests above cover those), so this is how rows past the clock reach
+/// the trim. The first case leaves the footprint rows it exposes, the second none of them: its
+/// `keep` retained rows are all past the cutoff, so every other presentation drops every row it
+/// exposes and keeps the rows past the cutoff.
+#[test]
+fn retention_trim_under_a_cutoff_equals_the_sequential_trims() {
+    const KEEP: usize = 30;
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut probe = Harness::new(aggregation, None);
+        probe.load(tape(0..1_200));
+        let reference = probe.snapshot();
+        let bars = reference.bars.len();
+        for (exposed, exposed_after) in [(bars - 10, KEEP - 10), (KEEP + 5, 0)] {
+            assert!(
+                exposed > KEEP && exposed < bars,
+                "{aggregation:?}: {bars} bars"
+            );
+            let cutoff = reference.footprint.times[exposed - 1];
+            let context = format!("{aggregation:?} exposing {exposed} of {bars} bars");
+            let mut batched = Harness::new(aggregation, None);
+            let mut sequential = Harness::new(aggregation, None);
+            for harness in [&mut batched, &mut sequential] {
+                harness.load(tape(0..1_200));
+                harness.chart.data.set_time_cutoff(Some(cutoff));
+            }
+            let rebuilds = |harness: &Harness| harness.chart.data_layer().index_rebuilds();
+            let (before_batched, before_sequential) = (rebuilds(&batched), rebuilds(&sequential));
+            assert!(batched
+                .chart
+                .set_series_max_points(batched.footprint, Some(KEEP)));
+            sequential_retention_reference(&mut sequential, KEEP);
+            assert_eq!(
+                rebuilds(&batched) - before_batched,
+                2,
+                "{context}: one union rebuild and one reindex"
+            );
+            assert_eq!(
+                rebuilds(&sequential) - before_sequential,
+                2 * (2 + STUDIES) as u64,
+                "{context}: the reference trims each presentation on its own"
+            );
+            let footprint_exposed = |harness: &Harness| {
+                harness
+                    .chart
+                    .data_layer()
+                    .series_data(harness.footprint)
+                    .unwrap()
+                    .0
+                    .len()
+            };
+            assert_eq!(footprint_exposed(&batched), exposed_after, "{context}");
+            assert_eq!(footprint_exposed(&sequential), exposed_after, "{context}");
+            let (batched_rows, batched_axis) = canonical_rows(&mut batched);
+            let (sequential_rows, sequential_axis) = canonical_rows(&mut sequential);
+            let lengths =
+                |rows: &[Rows]| rows.iter().map(|rows| rows.times.len()).collect::<Vec<_>>();
+            assert_eq!(
+                lengths(&batched_rows),
+                lengths(&sequential_rows),
+                "{context}: rows per presentation"
+            );
+            assert!(batched_rows == sequential_rows, "{context}: row contents");
+            assert!(batched_axis == sequential_axis, "{context}: shared axis");
         }
     }
 }

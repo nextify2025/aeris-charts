@@ -258,9 +258,13 @@ one crossing the ceiling) at one 16.67 ms frame. The trim tip also runs exactly 
 and one reindex for the whole data layer, which `perf_gate` requires alongside the work counters.
 Commands and thresholds are kept in the release examples so a clean `--release` run can be
 compared without importing machine-specific timings into the repository; `perf_gate` prints the
-measured tip p99 and slowest tip against these budgets. The `retention_perf` release example
-reports, without thresholds, the retention trim cost across series counts and retained rows, for
-the data layer alone and for a Target D shaped chart, because the trim scales with both.
+measured tip p99 and slowest tip against these budgets. Its report-only Target D2 prints the
+data layer's retention trim across series counts (1, 4, 8) and retained rows (2,500 to 40,000),
+one `trim_fronts` against one `trim_front` per series, because the trim scales with both. It has no
+threshold: the trim stays proportional to the retained rows, and a cost independent of the cap
+(absolute row identity in the summary pyramid and plot indices, and a lazy head offset on the
+series columns) is deferred for a product decision on whether trim latency must not grow with the
+cap; Target D2 at 28,800 rows and four or more series, against a bar of about 2 ms, is its measure.
 
 The finite GPUI real-window probe was also exercised on the current Windows display with the
 footprint fixture: 30 frames at DPR 1.25 and 500 source bars produced 24 cached text runs (zero

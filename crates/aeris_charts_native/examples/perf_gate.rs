@@ -7,6 +7,8 @@
 //!   Target C — canonical pointer sample:      fixed-capacity resolver under 0.01 ms/sample
 //!   Target D — shared non-time candles/footprint history, live, correction, frame construction,
 //!              and bounded single-trade live tips across every stream dependent
+//!   Target D2 — report-only retention trim of the data layer across series counts and retained
+//!              rows: one `trim_fronts` versus one `trim_front` per series
 //!   Target E — 100k visible-bar volume profile refresh and cached shared frame
 //!   Target F — 100k-point general XY line frame + nearest-hit interaction
 //!   Target G — mixed 100k-row general dashboard frame, hit interaction, and retained memory
@@ -26,6 +28,7 @@
 
 use std::time::Instant;
 
+use aeris_charts_core::model::data_layer::DataLayer;
 use aeris_charts_engine::{
     AggressorSide, AxisDimension, ChartEngine, ChartFrame, ContinuousScaleType,
     DepthHeatmapOptions, DepthLevel, DepthOptions, DepthSide, DepthSnapshot, DepthUpdate,
@@ -491,6 +494,77 @@ fn regression_tick_cost(rows: usize, regressions: usize, ticks: usize) -> (f64, 
     (mean, samples[samples.len() / 2], samples[samples.len() - 1])
 }
 
+/// Target D2 (report-only): the data layer's share of one retention trim, across the series count
+/// `S` and the retained rows `N` that shape it together. One retention drops `evicted` rows from
+/// each of the `S` presentations of a stream, which share one timestamp union. Each cell times
+/// one `trim_fronts` against `S` separate `trim_front` calls on identical layers of `S` aligned
+/// OHLC series, and counts the union merges and reindexes each ran. No threshold: the trim still
+/// scales with the retained rows.
+// ponytail: add a threshold with the O(evicted) trim `DataLayer::trim_fronts` defers; the bar is
+// about 2 ms in the S >= 4, N = 28,800 cells.
+fn retention_trim_matrix() {
+    const EVICTED: usize = 80;
+    const RUNS: usize = 7;
+    let layer = |series: usize, rows: usize| {
+        let (times, open, high, low, close) = gen_series(rows, 0.0);
+        let times = times.iter().map(|&time| time as i64).collect::<Vec<_>>();
+        let mut data = DataLayer::new();
+        let ids = (0..series)
+            .map(|_| {
+                let id = data.add_series();
+                assert!(data.set_data(
+                    id,
+                    times.clone(),
+                    open.clone(),
+                    high.clone(),
+                    low.clone(),
+                    close.clone()
+                ));
+                id
+            })
+            .collect::<Vec<_>>();
+        (data, ids)
+    };
+    let median = |samples: &mut Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    };
+    println!("Target D2 — retention trim of the data layer, {EVICTED} rows evicted per series (report-only):");
+    for series in [1, 4, 8] {
+        for rows in [2_500, 10_000, 28_800, 40_000] {
+            let mut sequential_ms = Vec::with_capacity(RUNS);
+            let mut batched_ms = Vec::with_capacity(RUNS);
+            let (mut sequential_passes, mut batched_passes) = (0, 0);
+            for _ in 0..RUNS {
+                let (mut data, ids) = layer(series, rows);
+                let passes = data.index_rebuilds();
+                let start = Instant::now();
+                for &id in &ids {
+                    data.trim_front(id, rows - EVICTED);
+                }
+                sequential_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                sequential_passes = data.index_rebuilds() - passes;
+
+                let (mut data, ids) = layer(series, rows);
+                let trims = ids
+                    .iter()
+                    .map(|&id| (id, rows - EVICTED))
+                    .collect::<Vec<_>>();
+                let passes = data.index_rebuilds();
+                let start = Instant::now();
+                data.trim_fronts(&trims);
+                batched_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                batched_passes = data.index_rebuilds() - passes;
+            }
+            println!(
+                "  S={series} N={rows:>6}: trim_front x S {:>7.3} ms ({sequential_passes:>2} union passes) | trim_fronts {:>7.3} ms ({batched_passes} union passes)",
+                median(&mut sequential_ms),
+                median(&mut batched_ms),
+            );
+        }
+    }
+}
+
 fn main() {
     const SERIES: usize = 10;
     const FRAME_BARS: usize = 50_000;
@@ -843,6 +917,7 @@ fn main() {
         tip_percentile(1.0),
         FRAME_BUDGET_MS,
     );
+    retention_trim_matrix();
     let d_pass = d_load_pass
         && d_live_pass
         && d_correction_pass

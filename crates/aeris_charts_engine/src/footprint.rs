@@ -2730,6 +2730,10 @@ impl ChartEngine {
         // footprint trims them, would keep indicators computed over the evicted history. The rows
         // and the sequence sidecar are final here, so the time sync this runs sees exactly the
         // state the caller's own sync does.
+        // ponytail: each consumed presentation recomputes (and time-syncs) on its own, where the
+        // data-layer trim above runs once for all of them. One propagation over every trimmed
+        // source would make this pass independent of the presentation count; deferred until a
+        // stream with many consumed presentations measures slow.
         for series_id in presentations {
             let consumed = self.indicators.iter().any(|binding| {
                 binding.source == series_id

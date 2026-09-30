@@ -596,7 +596,9 @@ footprint/candle chart through 6,000 recorded seconds at 100×, builds every fra
 steady-state retained memory not to grow across complete passes. Its Target D also streams 9,000
 single-trade tips into a retained 250,000-trade footprint with bound candles, CVD, delta, and
 bubbles, requires the work counters to stay within the changed suffix and the new trade with no
-tape reconstruction, and budgets the tip p99 and the slowest (retention-crossing) tip.
+tape reconstruction, and budgets the tip p99 and the slowest (retention-crossing) tip, which must
+run one union merge and one reindex for every presentation. Its report-only Target D2 prints the
+data-layer retention trim across series counts and retained rows.
 
 Renko, Line Break, Kagi, and Point & Figure are engine-owned price-action transforms over one
 canonical host OHLC source. Fixed-box Renko requires a two-box reversal; ATR Renko uses Wilder true

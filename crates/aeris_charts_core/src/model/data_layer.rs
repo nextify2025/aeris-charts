@@ -2091,6 +2091,14 @@ impl DataLayer {
         Some(rows)
     }
 
+    // ponytail: the trim still costs O(retained rows) per series (column shift, summary rebuild, and
+    // the union merge and reindex), so it is a constant-factor and series-count fix, not O(evicted).
+    // An O(evicted) trim needs absolute row identity in the summary pyramid, the plot indices and
+    // the values, a lazy head offset on the columns compacted at a fraction of their length, an
+    // O(log N) union front cut, and a margin capped in rows (a proportional margin grows an
+    // O(evicted) trim with the cap). Deferred for a product decision (must trim latency be
+    // independent of the retention cap?); `perf_gate` Target D2 at 28,800 rows and four or more
+    // series is its measure, against a bar of about 2 ms.
     /// Apply [`trim_front`](Self::trim_front) to several series as one data-layer transaction: each
     /// `(id, keep)` entry drops its series' oldest rows in order (an unknown id is skipped, a
     /// repeated id applies again to the already trimmed rows), then the merged time points and

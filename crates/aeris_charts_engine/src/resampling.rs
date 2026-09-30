@@ -532,6 +532,10 @@ impl ChartEngine {
         let low = bars.iter().map(|bar| bar.low).collect::<Vec<_>>();
         let close = bars.iter().map(|bar| bar.close).collect::<Vec<_>>();
         self.install_series_columns(target, out_times.clone(), open, high, low, close);
+        // ponytail: the target and its volume target each trim the whole layer on their own (a
+        // union merge and reindex per trim) and recompute their indicators one by one, the pattern
+        // `trim_stream_rows_front` batches for a stream. `DataLayer::trim_fronts` would trim both
+        // together; deferred because a resample refresh trims at most two series.
         self.enforce_series_cap(target);
         self.recompute_indicators_for(target);
         if let Some(volume_target) = volume_target {
