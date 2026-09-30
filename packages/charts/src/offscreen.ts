@@ -5,7 +5,7 @@
 import { create_offscreen_chart as wasm_create_offscreen_chart, AerisChart } from "../pkg/aeris_charts_wasm.js";
 
 import {
-  apply_series_time_alignment, ensure_init, normalize_time_tick_marks, time_to_utc_seconds,
+  apply_series_time_alignment, assert_live_series, ensure_init, normalize_time_tick_marks, time_to_utc_seconds,
   validate_series_time_alignment,
 } from "./impl.js";
 import { route_wheel, wheel_speed_adjustment } from "./gestures.js";
@@ -27,6 +27,7 @@ import type {
   series_kind,
   series_data,
   series_merge_columns,
+  series_options,
   series_update_options,
   time_zone,
 } from "./types.js";
@@ -75,6 +76,10 @@ export type offscreen_chart_options = Omit<
   deep_partial<chart_options>,
   (typeof UNSUPPORTED_WORKER_OPTIONS)[number] | "layout"
 > & { layout?: offscreen_layout_options };
+
+/** The series options a worker chart can change after creation: how a series' timestamps land on
+ * the shared time axis (`series_options.time_alignment`, `series_options.as_of_max_staleness`). */
+export type offscreen_series_options = Partial<Pick<series_options, "time_alignment" | "as_of_max_staleness">>;
 
 function split_offscreen_options(options: offscreen_chart_options): {
   theme: "light" | "dark" | undefined;
@@ -257,7 +262,8 @@ export class offscreen_chart {
   }
 
   /** Adopt the primary series on the first call; later calls append independent series. An
-   *  ordinary series takes `time_alignment` and `as_of_max_staleness` from `options`. */
+   *  ordinary series takes `time_alignment` and `as_of_max_staleness` from `options`; change them
+   *  later with {@link apply_series_options}. */
   add_series(kind: series_kind, options: Partial<any_series_options> = {}): number {
     this.assert_live();
     if (kind === "custom") {
@@ -312,6 +318,43 @@ export class offscreen_chart {
     }
     this.render();
     return id;
+  }
+
+  /**
+   * Change a series' `time_alignment` and `as_of_max_staleness` after creation, exactly as
+   * `series.apply_options` does on the main thread (an omitted key keeps its value, switching to
+   * `"union"` clears the staleness bound, a request equal to the current values is a no-op).
+   * `series_id` is the id `add_series` returned (0 is the primary). Nothing is applied when the
+   * call throws: `disposed`, `invalid_handle` or `stale_handle` for an id that names no live
+   * series (even for an empty patch), `invalid_options` for a bad value or a non-object patch, and
+   * `unsupported_operation` for a series without its own calendar or for any other series option,
+   * which a worker chart cannot change after creation. A worker chart has no series handles and
+   * so no `subscribe_data_changed` notification; read `visible_logical_range()` after the call.
+   */
+  apply_series_options(options: offscreen_series_options, series_id = 0): void {
+    this.assert_live();
+    assert_live_series(this.wasm, series_id);
+    if (typeof options !== "object" || options === null) {
+      throw new AerisChartsError("invalid_options", "series options must be an object");
+    }
+    for (const [key, value] of Object.entries(options)) {
+      if (value !== undefined && key !== "time_alignment" && key !== "as_of_max_staleness") {
+        throw new AerisChartsError(
+          "unsupported_operation",
+          `worker charts cannot change series option ${key} after creation`,
+        );
+      }
+    }
+    apply_series_time_alignment(this.wasm, series_id, options);
+    this.render();
+  }
+
+  /** A snapshot of a series' current options as the engine reports them (`series_id` as in
+   *  {@link apply_series_options}). Throws like it for an id that names no live series. */
+  series_options(series_id = 0): Readonly<series_options> {
+    this.assert_live();
+    assert_live_series(this.wasm, series_id);
+    return Object.freeze(JSON.parse(this.wasm.series_options_json(series_id)) as series_options);
   }
 
   /** Replace a series' columns. `options.sequence` installs the snapshot's sequence guard

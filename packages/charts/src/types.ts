@@ -1960,7 +1960,8 @@ export interface series_options {
    * compute on its own rows and follow the same points, `data()` keeps its own rows, and value
    * snapshots report the point's time. Line, area, baseline, histogram, bar, and candlestick
    * series that own their rows, on a time axis, only; others (and any series on a non-time bar
-   * axis) throw `unsupported_operation`.
+   * axis) throw `unsupported_operation`. Worker charts take it in `add_series` options and change
+   * it with `offscreen_chart.apply_series_options`.
    */
   time_alignment: time_alignment;
   /**

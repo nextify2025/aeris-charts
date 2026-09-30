@@ -277,6 +277,24 @@ export function apply_series_time_alignment(
   return true;
 }
 
+/**
+ * Throw unless `id` names a live series of the chart behind `wasm`; worker charts address series
+ * by raw numeric id. A number that is not a `u32` is refused with `invalid_handle` before it
+ * reaches the engine, because the wasm boundary would wrap it onto a real series (`NaN` and `2**32`
+ * to 0, `1.5` to 1). A dead id gets the engine's own answer, `stale_handle` for a removed series
+ * and `invalid_handle` for one never issued.
+ */
+export function assert_live_series(wasm: AerisChart, id: number): void {
+  if (!Number.isInteger(id) || id < 0 || id > 0xffffffff) {
+    throw new AerisChartsError("invalid_handle", `series id ${id} is not a valid series handle`);
+  }
+  if (wasm.series_kind(id) !== undefined) return;
+  // `set_series_time_alignment` validates the id before it reads anything else, so this union
+  // request on a dead id changes nothing and reports why the id is dead.
+  assert_trading_result(wasm.set_series_time_alignment(id, false, undefined));
+  throw new AerisChartsError("invalid_handle", `series ${id} does not exist`);
+}
+
 function undef_to_null<T>(v: T | undefined): T | null {
   return v === undefined ? null : v;
 }

@@ -397,7 +397,17 @@ transform returns it to the union. A bad value or a staleness without `"as_of"` 
 creates (or adopts) the series, and a refusal leaves no series behind on the main thread or in a
 worker. Re-applying the current alignment is a no-op that notifies no `subscribe_data_changed`
 handler; a change notifies each once with `"full"`. Worker charts take both keys in
-`add_series` options. Rust hosts call
+`add_series` options and change them later with `offscreen_chart.apply_series_options(patch,
+series_id)`; `offscreen_chart.series_options(series_id)` reads the options back. A worker chart
+addresses series by the numeric id `add_series` returned (`0` is the primary). The patch follows the
+same rules and throws the same codes as `apply_options` (an omitted key keeps its value, switching
+to `"union"` clears the staleness bound, an unchanged request is a no-op) and applies nothing when
+it throws. It accepts only `time_alignment` and `as_of_max_staleness`: any other key with a value
+throws `unsupported_operation` naming it, and a non-object patch throws `invalid_options`. An id
+that is not a whole number in `0..=4294967295` or names no live series throws `invalid_handle`
+(`stale_handle` for a series that was removed), even for an empty patch, and a removed chart throws
+`disposed`. Worker charts have no series handle, so no `subscribe_data_changed` notification; read
+`visible_logical_range()` after the call. Rust hosts call
 `ChartEngine::set_series_time_alignment(id, TimeAlignment::AsOf { max_staleness })`. Like other
 financial series options, the setting is host-owned and not persisted.
 
