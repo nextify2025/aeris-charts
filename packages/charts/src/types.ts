@@ -2955,7 +2955,10 @@ export interface pattern_tool_options {
 export interface shape_tool_options {
   /**
    * Polyline only: join the last vertex back to the first and, while `fill_enabled`, fill the
-   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it.
+   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it. The fill is
+   * bounded work: more than 2,048 vertices, or a polygon so heavily self-intersecting that its
+   * fill exceeds the tessellation bounds, paints the outline only (no fill, no interior selection
+   * target, no error).
    */
   closed?: boolean;
 }

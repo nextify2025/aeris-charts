@@ -1339,7 +1339,12 @@ overrides their contrasting default); they are body targets.
   removes the latest vertex, Escape cancels. Once three vertices are placed, clicking the first
   vertex again finishes the polyline closed (the preview snaps shut while the pointer is over it).
   `tool_options.shape.closed` (default `false`) joins the last vertex to the first and fills the
-  enclosed region by the nonzero rule.
+  enclosed region by the nonzero rule. The fill is bounded work: a closed polyline of more than
+  2,048 vertices, or one so heavily self-intersecting that its fill exceeds the tessellation
+  bounds, paints its outline only, with no fill and no interior selection target (its stroke still
+  selects it). This is not an error, every vertex is kept, and it is identical on every backend; a
+  region that follows thousands of bars of chart data belongs in a series rather than in a
+  drawing polyline.
 - `highlighter` is a freehand drag like `brush`: a 20 px marker stroke in 40% amber with round
   ends. It keeps one opacity where it overlaps itself on every backend, and ignores `style`, end
   caps, and fill.

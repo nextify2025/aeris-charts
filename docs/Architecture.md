@@ -1070,7 +1070,21 @@ open polyline) carry end caps through the shared `capped_polyline`, pointing alo
 tangents. Fills use `fill_color` or the stroke color at 20% (the rectangle's wash), are body targets
 only while the drawing is selected, and never overlap themselves: convex regions through
 `fill_convex`, concave or self-crossing ones (a closed polyline, a cubic's chord region) through the
-shared `fill_polygon` over `shape::nonzero_ribbon`. Curves and circles flatten through clip-aware
+shared `fill_polygon` over `shape::nonzero_ribbon`. That tessellation is bounded work with no
+coarsening fallback (unlike the highlighter's tube below): more than `shape::MAX_FILL_VERTICES`
+(2,048) vertices, more than 4,096 proper edge crossings, or more than 8,192 output rungs yield no
+fill part, so the drawing paints its outline only and has no interior body target. Hit testing
+rebuilds the same parts, so paint and hit agree, and every backend executes the same frame. Nothing
+reports it: drawings have no diagnostics channel, and `closed` can be toggled after creation, so
+add-time validation could not cover the vertex bound. The vertex bound is also the only limit on the
+pairwise edge scan of a polygon without crossings, and all three values are safety limits, not
+tuned ones. The decision covers the whole unclipped polygon, so a 3,000-vertex polygon with 50
+vertices on screen loses its whole fill; on a linear price scale it does not change while panning,
+and on a log scale the crossing count can change with zoom. A curve's chord region flattens to at
+most 1,024 points, so in practice only a closed polyline, whose vertex count the host controls,
+reaches the bounds. Lifting them means coarsening like `shape::tube_ribbon` or clipping to the pane
+before filling, at a parity risk: do it for a demonstrated host need with a release benchmark, and
+never by raising the constant alone. Curves and circles flatten through clip-aware
 helpers (`shape::flatten_quadratic`/`flatten_cubic`, `EllipseArc::append_clipped_points`) that
 refine only where the curve can be visible and spend at most 1,024 points, so a zoomed-in circle
 thousands of px wide stays within 0.25 px on screen (a wholly visible arc takes the cheaper uniform

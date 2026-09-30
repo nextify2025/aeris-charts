@@ -21,7 +21,10 @@
 //!   tangents to the pane edge, and the fill covers the region between the curve and its chord.
 //! - polyline: multi-click vertices; `tool_options.shape.closed` joins the last vertex to the
 //!   first and fills the enclosed region by the nonzero rule. Clicking the first vertex once three
-//!   are placed sets it and finishes the placement.
+//!   are placed sets it and finishes the placement. The fill is bounded work
+//!   ([`shape::MAX_FILL_VERTICES`] vertices and the crossing and rung bounds of
+//!   [`shape::nonzero_ribbon_contours`]): beyond them the outline is painted without a fill or an
+//!   interior hit target.
 //! - highlighter: a freehand wide translucent marker stroke with round joins and caps, painted as
 //!   the region within half its width of the captured path (the shared `Tube` part), so every
 //!   executor blends each pixel once and the stroke keeps one opacity where it overlaps itself.
@@ -54,7 +57,8 @@ use crate::{
 #[serde(default)]
 pub struct ShapeToolOptions {
     /// Polyline only: join the last vertex back to the first and, while `fill_enabled`, fill the
-    /// enclosed region (nonzero rule). The other shapes ignore it.
+    /// enclosed region (nonzero rule; outline only beyond [`shape::MAX_FILL_VERTICES`] vertices or
+    /// the fill's crossing and rung bounds). The other shapes ignore it.
     pub closed: bool,
 }
 
@@ -421,7 +425,9 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
 }
 
 /// A closed outline through `vertices` over its fill. The stroke starts and ends mid-edge, so its
-/// two butt ends meet collinearly instead of notching a corner.
+/// two butt ends meet collinearly instead of notching a corner. A non-convex fill beyond the
+/// [`shape::nonzero_ribbon_contours`] bounds is skipped (the outline remains); the decision is made
+/// on the whole unclipped polygon, not its visible part.
 fn closed_polygon(
     ctx: &PartContext<'_>,
     vertices: &[Point],
