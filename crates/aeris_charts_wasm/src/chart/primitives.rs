@@ -25,7 +25,7 @@
 
 use super::inner_render::measure_text_ctx;
 use super::*;
-use crate::prim_decode::decode_commands;
+use crate::prim_decode::{decode_commands, pane_clip};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
 use aeris_charts_core::scale::price_scale_core::PriceScaleCore;
 use aeris_charts_core::style::{DEFAULT_AXIS_TEXT_RGB, DEFAULT_CROSSHAIR_RGB};
@@ -652,7 +652,12 @@ impl ChartInner {
         let Some(frame_pane) = self.frame.panes.get_mut(pane) else {
             return;
         };
-        let decoded = decode_commands(&json, &mut frame_pane.points, &text_defaults);
+        let decoded = decode_commands(
+            &json,
+            &mut frame_pane.points,
+            &text_defaults,
+            pane_clip(scissor),
+        );
         if !decoded.warnings.is_empty() {
             web_sys::console::warn_1(
                 &format!(

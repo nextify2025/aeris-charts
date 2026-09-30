@@ -132,6 +132,12 @@ pub enum Prim {
         color: Color,
     },
     /// Anti-aliased polyline over `points[range]`, round joins / butt caps.
+    ///
+    /// Canvas2D, GPUI and native honor `style`, but the WebGPU stroker ignores it. Producers must
+    /// therefore lower dashed and dotted strokes to solid runs through
+    /// [`crate::line::push_styled_stroke`] (engine frame construction and the browser host's
+    /// decoded plugin primitives both do) and emit only `LineStyle::Solid` polylines, so every
+    /// executor paints identical dashes.
     Polyline {
         first_point: u32,
         point_count: u32,

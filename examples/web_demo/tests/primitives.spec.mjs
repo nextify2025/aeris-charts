@@ -170,6 +170,74 @@ test("pane primitive paints identically on both backends, changes its regions, a
   expect(await page.evaluate(() => window.__day_bands_active())).toBe(false);
 });
 
+test("plugin dashed polylines paint identical dashes on WebGPU and Canvas2D", async ({ page }, test_info) => {
+  // The WebGPU stroker has no dash concept and ignores `Polyline.style`, so the decoder lowers
+  // dashed and dotted plugin polylines to solid dash runs clipped to the owning pane (the same
+  // shared lowering the engine's own strokes use). No packaged plugin emits a styled polyline,
+  // so this test defines its own: a horizontal dashed one, a dotted diagonal that starts left of
+  // the pane and leaves past its right edge, and a solid control.
+  const run_scenario = async (backend, styles) => {
+    await goto_fixture(page, backend);
+    await page.evaluate((styles) => {
+      window.__dash_handle = window.__chart.panes()[0].attach_primitive({
+        pane_views: () => [
+          {
+            z_order: "top",
+            renderer(ctx) {
+              const { pane_left: left, pane_top: top, pane_width: w, pane_height: h } = ctx;
+              ctx.polyline([left + 20, top + h * 0.25, left + w - 20, top + h * 0.25], "#7b1fa2", 3, styles[0]);
+              ctx.polyline([left - 300, top + h * 0.9, left + w + 300, top + h * 0.4], "#e91e63", 3, styles[1]);
+              ctx.polyline([left + 20, top + h * 0.6, left + w - 20, top + h * 0.6], "#00897b", 3, 0);
+            },
+          },
+        ],
+      });
+    }, styles);
+    await settle_frames(page);
+    return {
+      backend: await page.evaluate(() => window.__chart.backend()),
+      png: PNG.sync.read(await page.screenshot({ animations: "disabled", fullPage: false })),
+    };
+  };
+  const dashed = [2, 1];
+  const canvas = await run_scenario("canvas2d", dashed);
+  expect(canvas.backend).toBe("canvas2d");
+  const gpu = await run_scenario("auto", dashed);
+  expect(gpu.backend).toBe("webgpu");
+  expect([canvas.png.width, canvas.png.height]).toEqual([gpu.png.width, gpu.png.height]);
+
+  // Vacuousness guard: the dashes leave gaps that solid strokes would ink on each backend.
+  const solid_canvas = await run_scenario("canvas2d", [0, 0]);
+  const solid_gpu = await run_scenario("auto", [0, 0]);
+  expect(count_different(solid_canvas.png, canvas.png), "Canvas2D dashes the plugin polylines").toBeGreaterThan(500);
+  expect(count_different(solid_gpu.png, gpu.png), "WebGPU dashes the plugin polylines").toBeGreaterThan(500);
+
+  // A dash painted where the other backend leaves a gap (a WebGPU stroke that ignores the style)
+  // differs by the stroke's full contrast, far above any raster difference. Dash ends may differ
+  // by one coverage step between Canvas2D's analytic coverage and WebGPU's faded butt caps, so
+  // those stay few and isolated (the same bound as the core-drawing dash parity test).
+  let paint_diff = 0;
+  let dash_end_diff = 0;
+  for (let offset = 0; offset < canvas.png.data.length; offset += 4) {
+    let pixel_delta = 0;
+    for (let channel = 0; channel < 4; channel += 1) {
+      pixel_delta = Math.max(pixel_delta, Math.abs(canvas.png.data[offset + channel] - gpu.png.data[offset + channel]));
+    }
+    if (pixel_delta > 200) paint_diff += 1;
+    else if (pixel_delta > 128) dash_end_diff += 1;
+  }
+  console.log(`plugin dashed polylines parity: ${dash_end_diff} dash-end coverage pixels, ${paint_diff} paint pixels`);
+  if (paint_diff !== 0 || dash_end_diff > 32) {
+    const visual = new PNG({ width: canvas.png.width, height: canvas.png.height });
+    pixelmatch(canvas.png.data, gpu.png.data, visual.data, canvas.png.width, canvas.png.height, { threshold: 0, includeAA: true });
+    await test_info.attach("canvas2d.png", { body: PNG.sync.write(canvas.png), contentType: "image/png" });
+    await test_info.attach("webgpu.png", { body: PNG.sync.write(gpu.png), contentType: "image/png" });
+    await test_info.attach("diff.png", { body: PNG.sync.write(visual), contentType: "image/png" });
+  }
+  expect(paint_diff, "plugin dashed polylines paint the same dashes on both executors").toBe(0);
+  expect(dash_end_diff, "dash-end coverage steps stay isolated").toBeLessThanOrEqual(32);
+});
+
 test("legacy text_views are clipped to their owning pane and cannot cover axis chrome", async ({ page }) => {
   const pixel_ratio = fixture.pixel_ratio;
   const pane_width = Math.round((fixture.css_width - fixture.price_axis_width) * pixel_ratio);

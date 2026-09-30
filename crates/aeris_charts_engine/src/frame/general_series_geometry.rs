@@ -1,6 +1,7 @@
 use aeris_charts_core::scale::general_scale::{BandScale, LinearScale, PointScale};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim, TextAlign};
+use aeris_charts_render::line::push_styled_stroke;
 use aeris_charts_render::shape::Rect;
 
 use crate::general_axes::NumericAxisScale;
@@ -51,14 +52,7 @@ fn push_general_stroke(
         .iter()
         .map(|point| (f64::from(point[0]), f64::from(point[1])))
         .collect();
-    super::series_geometry::push_styled_stroke(
-        out,
-        points,
-        &run,
-        line_type,
-        (width, style, color),
-        pane,
-    );
+    push_styled_stroke(out, points, &run, line_type, (width, style, color), pane);
 }
 
 fn push_general_point_symbol(

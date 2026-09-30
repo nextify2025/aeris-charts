@@ -20,7 +20,7 @@
 
 use super::primitives::PrimitiveConverters;
 use super::*;
-use crate::prim_decode::decode_commands;
+use crate::prim_decode::{decode_commands, pane_clip};
 use aeris_charts_engine::{CustomSeriesFrameValues, CustomSeriesLastValue, SeriesEntry};
 
 #[wasm_bindgen(inline_js = r#"
@@ -614,7 +614,12 @@ impl ChartInner {
             };
             let text_defaults = self.text_defaults();
             let frame_pane = &mut self.frame.panes[p.pane];
-            let decoded = decode_commands(&json, &mut frame_pane.points, &text_defaults);
+            let decoded = decode_commands(
+                &json,
+                &mut frame_pane.points,
+                &text_defaults,
+                pane_clip(scissor),
+            );
             if !decoded.warnings.is_empty() {
                 web_sys::console::warn_1(
                     &format!(
