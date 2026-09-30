@@ -1462,6 +1462,24 @@ step, not a gate) before `check:api`. CI also requires the portable browser suit
 `npm ci && npm run build` there) and the native GPUI tests
 (`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`).
 
+Local browser runs need the browser build Playwright pins (Chrome for Testing 151 for the pinned
+Playwright 1.62). The WebGPU device is lost at startup on older Chromium builds (observed with
+Chromium 141 and the pinned `wgpu`), which fails every WebGPU-versus-Canvas2D spec at its backend
+assertion before a pixel is compared. On Linux, headless Chromium also returns blank screenshots of WebGPU
+canvases with this project's launch flags, so the pixel-parity specs run headed under a virtual
+display (`xvfb-run`). In that setup `prim-text`, `drawings`, `primitives`, `series-primitives`,
+`custom-series`, `builtin-plugins` and `canvas-primitives` pass with the default font stack, a bundled
+Roboto, and unhinted rendering alike, and the seven drawing-family parity specs pass with the default
+stack, so the demo fixtures do not pin a font. The one pixel spec that does not reproduce on Linux is
+`last-value-cluster` ("crosshair price and time glyphs stay centered"): its time-label ink offset
+measures 0 to -0.5 px against the required 1.5-4 px with the default, the Roboto, and the unhinted
+fonts alike, so a font pin does not cure it and a Windows reference run decides whether its window or
+the label placement changes.
+
+`perf_gate` prints PASS/FAIL per target and exits non-zero on a failure only when
+`AERIS_CHARTS_PERF_STRICT=1` (exactly `1`, the parse the browser perf specs use; unset or `0`
+stays report-only), so the local gate line above keeps the variable to mirror CI.
+
 The release performance gate also measures a 100,000-visible-bar volume-profile refresh through frame construction and verifies that unchanged frames retain the calculation revision. Its Target M binds every built-in indicator kind plus aggregate-input studies to one 1,000,000-row candle source and its volume series and times current-bar replacements and candle-then-volume appends through the public engine path against a 1 ms per-tick budget. Its Target N times the same live ticks, each followed by one frame, with five regression trends anchored across a 1,000,000-row source against the same budget.
 
 Run Playwright for browser behavior, rendering, interaction, packaging, or parity changes. Run GPUI parity and replay checks for GPUI executor changes. The pixel-parity harness enforces the crosshair icon image against native rendering with at most one channel value of blending-rounding difference. Changes to the icon source or masks also run `node examples/web_demo/build_crosshair_icon.mjs --check`.

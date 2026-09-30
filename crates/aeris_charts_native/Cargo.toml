@@ -23,5 +23,11 @@ tiny-skia = "0.12"
 aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu", version = "0.3.0" }
 serde_json = "1"
 
+# Examples are built but their unit tests are not run by default; this one owns the gate's
+# strict-mode parse, which has to stay part of `cargo test --workspace`.
+[[example]]
+name = "perf_gate"
+test = true
+
 [lints]
 workspace = true

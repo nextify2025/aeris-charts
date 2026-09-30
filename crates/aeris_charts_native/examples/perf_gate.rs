@@ -20,7 +20,8 @@
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
-//! strict mode is opt-in rather than the default.
+//! strict mode is opt-in rather than the default. Only the value `1` enforces: unset, `0`, or
+//! anything else stays report-only.
 //!
 //! Run: `cargo run -p aeris_charts_native --example perf_gate --release`
 
@@ -489,6 +490,12 @@ fn regression_tick_cost(rows: usize, regressions: usize, ticks: usize) -> (f64, 
     samples.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
     (mean, samples[samples.len() / 2], samples[samples.len() - 1])
+}
+
+/// Whether `AERIS_CHARTS_PERF_STRICT` asks for a non-zero exit on a failed target: exactly `1`,
+/// the browser perf specs' parse, so `AERIS_CHARTS_PERF_STRICT=0` turns enforcement off.
+fn strict_requested(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 fn main() {
@@ -1630,7 +1637,23 @@ fn main() {
             "SOME TARGETS FAILED"
         }
     );
-    if !all_pass && std::env::var("AERIS_CHARTS_PERF_STRICT").is_ok() {
+    if !all_pass && strict_requested(std::env::var("AERIS_CHARTS_PERF_STRICT").ok().as_deref()) {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strict_requested;
+
+    /// Only `1` enforces, matching the browser perf specs (`=== "1"`) and the release-gate guard,
+    /// which simulates a disabled gate by setting the variable to `0`.
+    #[test]
+    fn only_one_enables_strict_mode() {
+        assert!(strict_requested(Some("1")));
+        assert!(!strict_requested(None));
+        assert!(!strict_requested(Some("0")));
+        assert!(!strict_requested(Some("")));
+        assert!(!strict_requested(Some("true")));
     }
 }
