@@ -1328,6 +1328,14 @@ impl ChartEngine {
                                     rs.line_style,
                                     rs.line_type,
                                 );
+                                // A solid batch is one pair per lone run, and a lone run is at
+                                // least one drawn row; dashes split a bar into several pairs.
+                                debug_assert!(
+                                    rs.line_style != LineStyle::Solid
+                                        || *pairs as usize <= rows.len(),
+                                    "{pairs} solid segments for {} rows",
+                                    rows.len()
+                                );
                                 continue;
                             }
                             // Every other emission flushes the batch first: the prims keep run

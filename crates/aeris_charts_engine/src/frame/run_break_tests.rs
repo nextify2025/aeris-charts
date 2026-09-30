@@ -985,10 +985,22 @@ fn dashed_lone_runs_batch_pairs() {
     assert_pairs_match(&strokes(&frame, color), &expected, "dashed");
 }
 
+/// The retained (pool-relative) layer a series was built into, before frame assembly rebases it.
+fn retained_layer(chart: &ChartEngine, id: SeriesId) -> &RetainedLayer {
+    &chart.retained_frame.panes[0]
+        .series_layers
+        .iter()
+        .find(|layer| layer.id == id)
+        .expect("the series has a retained layer")
+        .layer
+}
+
 #[test]
 fn batched_segments_survive_retained_layer_assembly() {
-    // A line series first, so the study's points land after the series' own in the pane pool and
-    // its batch starts at a non-zero pool index.
+    // Indicators paint below ordinary series unless the order is explicit, which would put the
+    // study's layer first in the pane pool (rebase 0) and prove nothing. An explicit order puts the
+    // price line's layer ahead of the study, so assembly moves the study's batch by the points
+    // already in the pane pool.
     let rows = 40;
     let times: Vec<f64> = (0..rows as i64)
         .map(|day| (MONDAY_2024 + day * DAY) as f64)
@@ -997,21 +1009,57 @@ fn batched_segments_survive_retained_layer_assembly() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Line;
     install(&mut chart, 0, &times, &close);
+    apply(&mut chart, 0, r##"{"color":"#654321"}"##);
     let vwap = chart.add_vwap(0, None).unwrap();
     apply(&mut chart, vwap, r##"{"color":"#123456"}"##);
+    assert!(chart.set_series_order(vec![0, vwap]));
     let frame = settle(&mut chart);
+
+    // The study's layer was built with its batch at its own layer-relative index.
+    let layer = retained_layer(&chart, vwap);
+    let own_first = layer
+        .prims
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Segments { first_point, .. } => Some(*first_point as usize),
+            _ => None,
+        })
+        .expect("the study layer carries its batch");
+    let price_points = retained_layer(&chart, 0).points.len();
+    assert!(
+        price_points >= rows,
+        "the price line's layer has its own points"
+    );
+
     let windows = stroke_windows(&frame, AVERAGE);
     assert_eq!(windows.len(), 1);
+    assert!(windows[0].0);
     let (first, len) = windows[0].1;
-    assert!(first >= rows, "the batch follows the line series' points");
+    // Assembly rebased it past the price line's points and everything else ahead of the layer.
+    assert!(
+        first >= own_first + price_points,
+        "the batch at {first} was not moved past the {price_points} price points (layer-relative {own_first})"
+    );
     assert!(first + len <= frame.panes[0].points.len());
+    // The layer's whole pool lands at the rebased offset, so every index it holds stays valid.
+    let base = first - own_first;
+    assert_eq!(
+        &frame.panes[0].points[base..base + layer.points.len()],
+        layer.points.as_slice()
+    );
     assert_pairs_match(
         &strokes(&frame, AVERAGE),
         &expected_segments(&chart, vwap),
         "assembled",
     );
+    assert_eq!(
+        strokes(&frame, PRICE).len(),
+        1,
+        "the price line stays whole"
+    );
 
-    // A cursor-only rebuild reassembles the retained layer: same prims, same pool.
+    // A cursor-only rebuild reassembles the retained layers at the same offsets: same prims, same
+    // pool.
     assert!(chart.set_crosshair_position(12.0, times[20], 0));
     let cursor = chart.build_frame();
     assert_eq!(chart.frame_build_stats().series_rebuilds, 0);

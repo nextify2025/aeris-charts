@@ -93,6 +93,21 @@ cannot be checked from this repository:
   write. Resampling targets and synthetic-bar series refuse a trade-bound candle
   (`ResampleError::UnsupportedTarget`, `SyntheticBarError::UnsupportedSeries`).
 
+Moving the pinned revision to one that batches period-reset study lines needs one Terminal review,
+and it is a compile-time break for Rust code that matches `aeris_charts_render::draw_list::Prim`
+exhaustively (a custom executor, a frame inspector, a point-pool rebase):
+
+- `Prim` gains `Segments { first_point, segment_count, width, color }`, a batch of `segment_count`
+  independent two-point strokes over `points[first_point .. first_point + 2 * segment_count]`, each
+  stroked like a solid simple two-point `Polyline` (dashes already expanded into one pair per dash).
+  The engine emits it in place of one two-point `Polyline` per bar for session VWAP, VWAP bands, and
+  pivot lines on bars of a day or longer, so a `_ => {}` arm that compiles silently stops drawing
+  those studies. Take the pair window from `draw_list::segment_points` (a range outside the pool is
+  a dropped prim), and move `first_point` with every other pool index when rebasing a layer. The
+  Canvas2D, WebGPU, GPUI, and native executors in this repository already handle it. The crates
+  keep their coordinated version; the integrator owns the bump that ships this variant, which is
+  breaking for exhaustive matchers.
+
 ## License
 
 Aeris Charts is open-source software under the
