@@ -1266,7 +1266,7 @@ impl DrawingTextRun {
     }
 
     /// The run box `[left - pad, left + width + pad] × [-0.6 size - pad, 0.6 size + pad]` in the
-    /// run's local frame (origin at the anchor, x along the run).
+    /// run's local frame (the anchor is (0, 0), x along the run).
     fn local_box(&self, width: f64) -> [f64; 4] {
         let left = self.left(width);
         let half = self.size * 0.6;
@@ -3271,7 +3271,7 @@ impl ChartEngine {
     /// already converted (bitmap px at render, media px at hit-test); `pane_w`/`pane_h` bound
     /// the full-width/full-height kinds in the same units. `pane_top` is the pane's vertical
     /// offset (0 for pane-local bitmap x media y are both chart-top-relative — see hit_test.rs).
-    /// `None` when the geometry does not resolve: a zero box would put a caret at the origin.
+    /// `None` when the geometry does not resolve: a zero box would put a caret at (0, 0).
     pub(crate) fn text_box(
         kind: DrawingKind,
         px: &[(f64, f64)],
@@ -4460,7 +4460,7 @@ impl ChartEngine {
 
     /// The generic text run of `drawing` in media px, resolved exactly as the frame places it
     /// (`frame::drawings::text_run_geometry`, in bitmap px), from the drawing's converted anchors.
-    /// `None` when the geometry does not resolve, so no caret is ever placed at the origin.
+    /// `None` when the geometry does not resolve, so no caret is ever placed at (0, 0).
     fn drawing_text_run(&self, drawing: &Drawing, px: &[(f64, f64)]) -> Option<DrawingTextRun> {
         let pane = self.panes.get(drawing.pane_index)?;
         let size = drawing.resolved_text_size(self.options.get().layout.font_size);
