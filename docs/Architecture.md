@@ -518,8 +518,8 @@ interaction is therefore added to the controller once and every native host inhe
 double-click acts only on the drawing under the pointer (a trading control or the alert chip keeps
 its click) and opens the editor of every text-bearing drawing; Enter (when no sequence is being
 finished) and F2 open the selected drawing's editor; keyboard bindings honour `InteractionOptions`
-(scroll keys need pan or wheel scroll, +/- need wheel zoom, Home needs the time-axis reset switch,
-and a gated key stays unconsumed); wheel and pinch anchors are clamped into the plot. Typed scale
+(scroll keys need pan or wheel scroll, +/- need wheel zoom, Home refits the time axis only and
+needs the time-axis reset switch, and a gated key stays unconsumed); wheel and pinch anchors are clamped into the plot. Typed scale
 commands resolve the effective series, propagate price format across a scale, toggle series/axis
 chrome, and move every attached series between price axes as one operation; hosts do not walk engine
 series to reproduce these transactions. Committed drawing edits, undo and redo, price-basis changes,
@@ -1620,9 +1620,12 @@ statistics box beyond the end level (below the area for the date tool). The box 
 visible `labels` (price change, percent change, and ticks; bar count and duration; or all five),
 with ticks counted on the grid the anchors snap to and elapsed time taken from the anchors' time
 identity (extrapolated with the prevailing bar interval beyond the data), so it never depends on a
-display projection. A committed range paints in the drawing's own color in both directions. While
-selected or being placed they project their endpoints onto the axes as price tags on the bound
-scale and time tags in the drawing color. The family's `decoration_extent` keeps a visible label's
+display projection. Every price a drawing prints goes through one chain (host formatter,
+instrument precision on the tick grid, the bound scale's series format, the default), and a change
+that rounds to zero prints unsigned. A committed range paints in the drawing's own color in both
+directions. While selected or being placed they project their endpoints onto the axes as price
+tags on the bound scale and time tags in the drawing color (an anchor beyond the data shows its
+extrapolated time, the one the statistics use). The family's `decoration_extent` keeps a visible label's
 drawing in the viewport candidates when its area is off-screen.
 
 The Shift-click quick measure is transient state owned by the `DrawingController`: a

@@ -1382,7 +1382,12 @@ impl ChartEngine {
                 if x < 0.0 || x > self.pane_w {
                     continue;
                 }
-                let Some(time) = self.axis_time_key_at_logical(index) else {
+                // Anchors beyond the data show their extrapolated anchor time, the one the
+                // statistics print.
+                let Some(time) = self.axis_time_key_at_logical(index).or_else(|| {
+                    self.anchor_time_at_logical(index as f64)
+                        .map(|time| time.floor() as i64)
+                }) else {
                     continue;
                 };
                 let text = self.format_crosshair_ts(time);

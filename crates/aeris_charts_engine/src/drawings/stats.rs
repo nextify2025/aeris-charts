@@ -15,6 +15,11 @@ impl DrawingPriceScale {
     }
 }
 
+/// Whether formatted text reads as zero: it carries no digit other than `0`.
+fn prints_zero(text: &str) -> bool {
+    !text.chars().any(|c| c.is_ascii_digit() && c != '0')
+}
+
 /// Stats line a metric belongs to: price, time, then geometry.
 fn metric_group(metric: DrawingLabelMetric) -> usize {
     match metric {
@@ -63,15 +68,28 @@ impl ChartEngine {
         (self.options.get().layout.font_size * 0.92).max(10.0)
     }
 
-    /// A price or price difference through the formatter that owns the drawing's scale.
+    /// A price or price difference in the drawing's own price format: the host formatter, then
+    /// instrument precision on the tick grid, then the bound scale's series format, then the
+    /// default. One owner for every price a drawing prints (positions, ranges, Fibonacci, Gann),
+    /// in the order the price axis itself follows.
     pub(crate) fn drawing_price_text(&self, drawing: &Drawing, value: f64) -> String {
+        if let Some(text) = self
+            .price_formatter_fn
+            .as_ref()
+            .and_then(|format| format(value))
+        {
+            return text;
+        }
+        if let Some(precision) = self.trading_state.instrument.price_precision {
+            let tick = self.position_price_tick(drawing.pane_index, drawing.price_scale);
+            return crate::PriceFormatter::from_precision(
+                precision,
+                tick.unwrap_or(10.0_f64.powi(-(precision as i32))),
+            )
+            .format(value);
+        }
         self.scale_formatter_source(drawing.pane_index, drawing.price_scale.target())
             .and_then(|series| self.format_with_price_format(&series.price_format, value))
-            .or_else(|| {
-                self.price_formatter_fn
-                    .as_ref()
-                    .and_then(|format| format(value))
-            })
             .unwrap_or_else(|| self.price_formatter.format(value))
     }
 
@@ -98,17 +116,29 @@ impl ChartEngine {
         let first = drawing.points.get(from)?;
         let last = drawing.points.get(to)?;
         let change = last.price - first.price;
-        let sign = if change > 0.0 { "+" } else { "" };
         Some(match metric {
             DrawingLabelMetric::Price => self.drawing_price_text(drawing, last.price),
             DrawingLabelMetric::PriceChange => {
-                format!("{sign}{}", self.drawing_price_text(drawing, change))
+                let text = self.drawing_price_text(drawing, change);
+                // Zero is unsigned: a change that rounds to nothing prints without a sign.
+                if prints_zero(&text) {
+                    text.trim_start_matches(['-', '\u{2212}', '+']).to_string()
+                } else if change > 0.0 {
+                    format!("+{text}")
+                } else {
+                    text
+                }
             }
             DrawingLabelMetric::PercentChange => {
                 if first.price.abs() <= f64::EPSILON {
                     return None;
                 }
-                format!("{:+.2}%", change / first.price.abs() * 100.0)
+                let percent = change / first.price.abs() * 100.0;
+                if prints_zero(&format!("{percent:.2}")) {
+                    "0.00%".to_string()
+                } else {
+                    format!("{percent:+.2}%")
+                }
             }
             DrawingLabelMetric::Ticks => {
                 // Ticks count on the grid the anchors snap to: the instrument tick or price-band
@@ -129,7 +159,12 @@ impl ChartEngine {
                         )
                     })?
                     .round() as i64;
-                format!("{:+} ticks", if change < 0.0 { -ticks } else { ticks })
+                let ticks = if change < 0.0 { -ticks } else { ticks };
+                if ticks == 0 {
+                    "0 ticks".to_string()
+                } else {
+                    format!("{ticks:+} ticks")
+                }
             }
             DrawingLabelMetric::BarCount => {
                 format!("{} bars", (last.logical - first.logical).round() as i64)

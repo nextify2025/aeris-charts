@@ -1773,34 +1773,6 @@ impl ChartEngine {
         }
     }
 
-    /// A price-valued drawing statistic in the drawing's own price format: the host formatter,
-    /// then instrument precision on the tick grid, then the bound scale's series format.
-    fn format_drawing_price(&self, drawing: &Drawing, value: f64) -> String {
-        if let Some(text) = self
-            .price_formatter_fn
-            .as_ref()
-            .and_then(|formatter| formatter(value))
-        {
-            return text;
-        }
-        let tick = self.position_price_tick(drawing.pane_index, drawing.price_scale);
-        if let Some(precision) = self.trading_state.instrument.price_precision {
-            return super::PriceFormatter::from_precision(
-                precision,
-                tick.unwrap_or(10.0_f64.powi(-(precision as i32))),
-            )
-            .format(value);
-        }
-        let scale_target = match drawing.price_scale {
-            crate::DrawingPriceScale::Right => crate::PriceScaleTarget::Right,
-            crate::DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
-            crate::DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
-        };
-        self.scale_formatter_source(drawing.pane_index, scale_target)
-            .and_then(|series| self.format_with_price_format(&series.price_format, value))
-            .unwrap_or_else(|| self.price_formatter.format(value))
-    }
-
     fn build_position_labels(
         &self,
         drawing: &Drawing,
@@ -1835,7 +1807,7 @@ impl ChartEngine {
             crate::DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
             crate::DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
         };
-        let format_price = |value: f64| self.format_drawing_price(drawing, value);
+        let format_price = |value: f64| self.drawing_price_text(drawing, value);
         let ticks = |from: f64, to: f64| {
             self.position_price_ticks_between(drawing.pane_index, drawing.price_scale, from, to)
                 .map_or_else(|| "—".to_string(), |ticks| position_stat_number(ticks, 0))

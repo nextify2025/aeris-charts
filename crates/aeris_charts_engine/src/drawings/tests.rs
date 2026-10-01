@@ -5991,6 +5991,85 @@ fn measure_elapsed_time_follows_the_anchor_time_identity_not_the_display_project
 }
 
 #[test]
+fn measure_axis_time_tags_extrapolate_beyond_the_data_like_the_statistics() {
+    let mut chart = settled_chart();
+    // Leave room after the last bar so slot 12, beyond the ten bars, is inside the plot.
+    chart.set_right_offset(6.0);
+    chart.build_frame();
+    assert!((0.0..=chart.pane_w).contains(&x_at(&chart, 6.0)));
+    assert!((0.0..=chart.pane_w).contains(&x_at(&chart, 12.0)));
+    let id = add_measure(
+        &mut chart,
+        DrawingKind::DateRange,
+        (6.0, 11.0),
+        (12.0, 11.0),
+    );
+    chart.axis_w = 80.0;
+    chart.build_frame();
+    let tags = |chart: &mut ChartEngine| {
+        chart
+            .build_axis_frame(
+                80.0,
+                |text, _bold| text.len() as f64 * 7.0,
+                |text, _bold| text.len() as f64 * 6.0,
+            )
+            .labels
+            .into_iter()
+            .filter(|label| {
+                label
+                    .background
+                    .is_some_and(|background| background.4 == primary())
+            })
+            .count()
+    };
+    let before = tags(&mut chart);
+    // Slot 12 is beyond the data: the statistics print the extrapolated "6 bars  6h", so the
+    // time axis keeps a tag for that anchor too instead of silently dropping it.
+    assert!(pane_texts(&mut chart).contains(&"6 bars  6h".to_string()));
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(tags(&mut chart) - before, 2);
+}
+
+#[test]
+fn measure_statistics_never_print_a_signed_zero() {
+    // A change that rounds to zero is unsigned in both the price and the percentage, whatever
+    // its direction.
+    for end in [10.9999, 11.0001] {
+        let mut chart = settled_chart();
+        add_measure(&mut chart, DrawingKind::PriceRange, (2.0, 11.0), (6.0, end));
+        let texts = pane_texts(&mut chart);
+        assert!(
+            texts.iter().any(|text| text.starts_with("0.00  0.00%")),
+            "{end}: {texts:?}"
+        );
+    }
+}
+
+#[test]
+fn measure_prices_honour_the_instrument_precision() {
+    let mut chart = settled_chart();
+    chart
+        .set_instrument_metadata(crate::InstrumentMetadata {
+            tick_size: Some(0.0001),
+            price_precision: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+    add_measure(
+        &mut chart,
+        DrawingKind::PriceRange,
+        (2.0, 10.0),
+        (6.0, 10.0123),
+    );
+    // The same four decimals a Long Position on this chart prints, not the factory two.
+    let texts = pane_texts(&mut chart);
+    assert!(
+        texts.iter().any(|text| text.starts_with("+0.0123  ")),
+        "{texts:?}"
+    );
+}
+
+#[test]
 fn measure_label_keeps_an_offscreen_area_in_the_viewport_candidates() {
     let mut chart = settled_chart();
     // More than 20 drawings switches frame construction to indexed viewport culling.

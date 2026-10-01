@@ -1221,9 +1221,10 @@ fn range(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
 
 /// One measured axis' arrow from `from` to `to` (coordinates along the axis) through `middle` (the
 /// area's center line across it): a crisp device-pixel shaft like the rules, ended by the drawing's
-/// own caps. Shaft, rules, and area edges are whole device pixels on every executor, so the
-/// measured area paints identically on WebGPU and Canvas2D; the caps' apexes sit on the shaft's
-/// pixel center. An arrow-capped end trims the shaft back by one stroke width (as
+/// own caps. Shaft and rules are whole device pixels on every executor, so the lines of a measured
+/// area paint identically on WebGPU and Canvas2D; the translucent fill is not snapped, so its own
+/// edges may anti-alias by up to half a device pixel off the rules. The caps' apexes sit on the
+/// shaft's pixel center. An arrow-capped end trims the shaft back by one stroke width (as
 /// [`DrawingParts::capped_polyline`] does), and an arrow whose ends share a pixel paints nothing.
 fn range_arrow(
     ctx: &PartContext<'_>,

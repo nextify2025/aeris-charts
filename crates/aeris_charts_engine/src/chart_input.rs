@@ -22,7 +22,8 @@ pub const PANE_SEPARATOR_HIT: f64 = 4.0;
 pub const TRADING_TOOLTIP_DWELL_MS: f64 = 450.0;
 /// Host requests retained between drains; the oldest is dropped when a host stops draining.
 const MAX_PENDING_INPUT_EVENTS: usize = 32;
-/// Keyboard `+`/`-` zoom step around the plot center.
+/// Keyboard `+`/`-` zoom step. It anchors at the plot center, or keeps the newest bar in place
+/// while `right_bar_stays_on_scroll` (the default) pins the right edge.
 const KEYBOARD_ZOOM_STEP: f64 = 0.5;
 /// Share of the plot width one PageUp/PageDown scrolls.
 const KEYBOARD_PAGE_FRACTION: f64 = 0.8;
@@ -808,8 +809,11 @@ impl ChartEngine {
                 true
             }
             ChartKey::ZoomIn | ChartKey::ZoomOut => false,
+            // Home refits the time axis, as the browser and worker hosts do. The time-axis reset
+            // switch gates it, so it never touches a price scale: a manual price range is the
+            // user's until they reset that axis.
             ChartKey::Home if options.axis_double_click_reset_time => {
-                self.reset_view();
+                self.fit_content();
                 self.input.layout_dirty = true;
                 true
             }
@@ -971,11 +975,23 @@ impl ChartEngine {
         self.set_crosshair_ohlc_magnet(armed || dragging)
     }
 
+    /// Whether a press lands on the text being edited: its label, a text tool's body, or the box
+    /// of any family text (the layout rect the caret is placed in), so a click inside a note or
+    /// callout positions the caret instead of committing.
     fn point_on_edited_text(&self, x: f64, y: f64) -> bool {
         let Some(editing) = self.editing_drawing() else {
             return false;
         };
         if self.drawing_text_hit_at(x, y) == Some(editing) {
+            return true;
+        }
+        if self
+            .drawing_text_edit_layout(editing)
+            .is_some_and(|layout| {
+                let [left, top, right, bottom] = layout.rect;
+                (left..=right).contains(&x) && (top..=bottom).contains(&y)
+            })
+        {
             return true;
         }
         self.hit_test_drawing(x, y).is_some_and(|hit| {
@@ -1971,6 +1987,45 @@ mod tests {
     }
 
     #[test]
+    fn a_press_inside_an_edited_family_text_box_places_the_caret_instead_of_committing() {
+        let mut chart = chart();
+        let callout = chart
+            .add_drawing(
+                DrawingKind::Callout,
+                0,
+                vec![
+                    DrawingPoint {
+                        logical: 30.0,
+                        price: 101.0,
+                    },
+                    DrawingPoint {
+                        logical: 45.0,
+                        price: 106.0,
+                    },
+                ],
+                Some(r#"{"text":"a note that spans the box"}"#),
+            )
+            .unwrap();
+        chart.build_frame();
+        assert!(chart.begin_drawing_text_edit(callout, true));
+        let rect = chart.drawing_text_edit_layout(callout).unwrap().rect;
+        let (x, y) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+        // The press is on the box being edited: it positions the caret and the session stays.
+        click(&mut chart, x, y);
+        assert_eq!(chart.editing_drawing(), Some(callout));
+        // A press outside the box still commits it.
+        let (outside_x, outside_y) = empty_pane_point(&chart);
+        assert!(
+            outside_x < rect[0]
+                || outside_x > rect[2]
+                || outside_y < rect[1]
+                || outside_y > rect[3]
+        );
+        click(&mut chart, outside_x, outside_y);
+        assert_eq!(chart.editing_drawing(), None);
+    }
+
+    #[test]
     fn a_trading_object_under_the_second_click_keeps_it() {
         use crate::{
             OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, TradingPriceScale,
@@ -2164,6 +2219,24 @@ mod tests {
         assert!(chart.bar_spacing() > spacing);
         assert!(chart.input_key_down(ChartKey::Home, none, false, 0.0));
         assert!(!chart.input_key_down(ChartKey::PageUp, none, false, 0.0));
+    }
+
+    #[test]
+    fn home_resets_the_time_axis_only_like_the_browser_and_worker_hosts() {
+        let mut chart = chart();
+        let none = InputModifiers::default();
+        // A manual price range is the user's, and the time-axis reset switch does not own it.
+        chart.set_price_scale_auto_scale(0, false, false);
+        assert_eq!(chart.price_scale_auto_scale(0, false), Some(false));
+        chart.set_bar_spacing(chart.bar_spacing() * 3.0);
+        let zoomed = chart.bar_spacing();
+        assert!(chart.input_key_down(ChartKey::Home, none, false, 0.0));
+        assert_ne!(chart.bar_spacing(), zoomed, "Home refits the time axis");
+        assert_eq!(
+            chart.price_scale_auto_scale(0, false),
+            Some(false),
+            "Home keeps a manual price scale"
+        );
     }
 
     #[test]

@@ -1195,9 +1195,10 @@ for (const kind of ["long_position", "short_position"]) {
   });
 }
 
-// Measuring tools emit crisp device-pixel fills, rules and arrow shafts; only the arrowheads and
-// label glyphs are antialiased. Their measured areas must therefore be pixel-identical between
-// WebGPU and Canvas2D, for rising and falling pulls in both themes.
+// Measuring tools emit crisp device-pixel rules and arrow shafts over a translucent area fill;
+// the arrowheads, label glyphs and the fill's own edges are antialiased. The interior of each
+// measured area (two pixels in from every edge, clear of the arrow tips) must therefore be
+// pixel-identical between WebGPU and Canvas2D, for rising and falling pulls in both themes.
 async function render_measures(page, backend, theme) {
   await page.goto(`/?backend=${backend}&theme=${theme}&forceFallbackAdapter=1`);
   await page.waitForFunction(() => window.__main && window.__chart.time_scale().get_visible_logical_range());
