@@ -745,19 +745,21 @@ impl ChartEngine {
                 crate::TradingAnnotationPlacement::Inline => line_y,
             };
             let color = self.trading_annotation_color(annotation.tone);
+            let device =
+                super::DeviceBox::snap(cursor, center_y - height / 2.0, width, height, hpr, vpr);
             out.push(Prim::RoundRect {
-                x: (cursor * hpr) as f32,
-                y: ((center_y - height / 2.0) * vpr) as f32,
-                w: (width * hpr) as f32,
-                h: (height * vpr) as f32,
+                x: device.x,
+                y: device.y,
+                w: device.w,
+                h: device.h,
                 radii: [2.0; 4],
                 fill: self.trading_chip_background(),
                 border_width: Self::trading_border_width(vpr) as f32,
                 border_color: color,
             });
             out.push(Prim::Text {
-                x: ((cursor + width / 2.0) * hpr) as f32,
-                y: ((center_y + text_offset) * vpr) as f32,
+                x: device.center_x(),
+                y: device.y + device.h / 2.0 + (text_offset * vpr) as f32,
                 text: annotation.text.clone(),
                 color,
                 size: (self.options.get().layout.font_size * vpr) as f32,
@@ -771,19 +773,21 @@ impl ChartEngine {
         if annotations.len() > visible {
             let text = format!("+{}", annotations.len() - visible);
             let width = self.trading_annotation_width(&text);
+            let device =
+                super::DeviceBox::snap(cursor, line_y - height / 2.0, width, height, hpr, vpr);
             out.push(Prim::RoundRect {
-                x: (cursor * hpr) as f32,
-                y: ((line_y - height / 2.0) * vpr) as f32,
-                w: (width * hpr) as f32,
-                h: (height * vpr) as f32,
+                x: device.x,
+                y: device.y,
+                w: device.w,
+                h: device.h,
                 radii: [2.0; 4],
                 fill: self.trading_chip_background(),
                 border_width: Self::trading_border_width(vpr) as f32,
                 border_color: self.trading_state.style.control,
             });
             out.push(Prim::Text {
-                x: ((cursor + width / 2.0) * hpr) as f32,
-                y: ((line_y + text_offset) * vpr) as f32,
+                x: device.center_x(),
+                y: device.y + device.h / 2.0 + (text_offset * vpr) as f32,
                 text,
                 color: self.trading_state.style.control,
                 size: (self.options.get().layout.font_size * vpr) as f32,
@@ -1258,19 +1262,20 @@ impl ChartEngine {
             false,
         ) + 12.0;
         let x = (center_x - width / 2.0).clamp(4.0, (self.pane_w - width - 4.0).max(4.0));
+        let device = super::DeviceBox::snap(x, y, width, height, hpr, vpr);
         out.push(Prim::RoundRect {
-            x: (x * hpr) as f32,
-            y: (y * vpr) as f32,
-            w: (width * hpr) as f32,
-            h: (height * vpr) as f32,
-            radii: [radius; 4],
+            x: device.x,
+            y: device.y,
+            w: device.w,
+            h: device.h,
+            radii: [radius.round(); 4],
             fill: self.trading_chip_background(),
             border_width: Self::trading_border_width(vpr) as f32,
             border_color: self.trading_chrome_border(),
         });
         out.push(Prim::Text {
-            x: ((x + width / 2.0) * hpr) as f32,
-            y: ((y + height / 2.0 + self.trading_text_offset()) * vpr) as f32,
+            x: device.center_x(),
+            y: device.y + device.h / 2.0 + (self.trading_text_offset() * vpr) as f32,
             text: text.to_string(),
             color: self.primary_text_color(),
             size: (font_size * vpr) as f32,

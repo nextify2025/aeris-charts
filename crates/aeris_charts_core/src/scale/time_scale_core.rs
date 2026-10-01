@@ -54,9 +54,11 @@ impl Default for TimeScaleOptions {
             fix_left_edge: false,
             fix_right_edge: false,
             lock_visible_time_range_on_resize: false,
-            // the public reference's default: ordinary wheel zoom keeps the logical point under the
-            // cursor fixed. Hosts may explicitly enable right-edge pinning through the option.
-            right_bar_stays_on_scroll: false,
+            // Measured TradingView behavior: ordinary wheel zoom keeps the right edge pinned (the
+            // right offset in bars is preserved), so the latest bars stay put while history
+            // compresses or expands. Ctrl/Cmd wheel zoom and pinch remain anchored at the pointer;
+            // hosts may opt back into cursor-anchored ordinary zoom by setting this to false.
+            right_bar_stays_on_scroll: true,
             // reference defaults (time-scale-options-defaults.ts:17-18).
             shift_visible_range_on_new_bar: true,
             allow_shift_visible_range_on_whitespace_replacement: false,
@@ -717,8 +719,8 @@ impl TimeScaleCore {
         self.zoom_impl(zoom_point, scale, !self.options.right_bar_stays_on_scroll);
     }
 
-    /// Aeris explicit-mode focused-area zoom always keeps the logical point under `zoom_point`
-    /// fixed.
+    /// Focused zoom always keeps the logical point under `zoom_point` fixed, whatever
+    /// `right_bar_stays_on_scroll` says: Ctrl/Cmd wheel zoom and pinch use it on every host.
     pub fn zoom_focused(&mut self, zoom_point: Coordinate, scale: f64) {
         self.zoom_impl(zoom_point, scale, true);
     }
@@ -982,9 +984,11 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_zoom_keeps_right_offset_with_explicit_right_pin() {
+    fn ordinary_zoom_pins_the_right_edge_by_default_like_tradingview() {
+        // Measured on TradingView: one wheel notch scales bar spacing by exactly 1.1 / 0.9 while
+        // the right offset in bars (the gap after the latest bar) stays constant.
         let mut s = scale(400.0, 6.0, 7.0, 500, 300);
-        s.set_right_bar_stays_on_scroll(true);
+        assert!(s.options().right_bar_stays_on_scroll);
         let cursor = 250.0;
         let before_index = s.coordinate_to_float_index(cursor);
         let before_offset = s.right_offset();
@@ -992,12 +996,15 @@ mod tests {
         assert!((s.bar_spacing() - 6.6).abs() < 1e-12);
         assert_eq!(s.right_offset(), before_offset);
         assert_ne!(s.coordinate_to_float_index(cursor), before_index);
+        s.zoom(cursor, -1.0); // zoom out 10%
+        assert!((s.bar_spacing() - 5.94).abs() < 1e-12);
+        assert_eq!(s.right_offset(), before_offset);
     }
 
     #[test]
-    fn ordinary_zoom_is_cursor_anchored_by_default() {
+    fn ordinary_zoom_is_cursor_anchored_when_the_right_pin_is_disabled() {
         let mut s = scale(400.0, 6.0, 0.0, 500, 300);
-        assert!(!s.options().right_bar_stays_on_scroll);
+        s.set_right_bar_stays_on_scroll(false);
         let cursor = 250.0;
         let before = s.coordinate_to_float_index(cursor);
         s.zoom(cursor, 1.0); // zoom in 10%

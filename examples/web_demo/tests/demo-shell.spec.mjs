@@ -598,3 +598,31 @@ test("theme action and compact inspector remain directly usable", async ({ page 
   await expect(page.locator("#inspector")).toHaveAttribute("data-open", "true");
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBe(false);
 });
+
+for (const [backend, url] of [
+  ["webgpu", "/"],
+  ["canvas2d", "/?backend=canvas2d&forceFallbackAdapter=1"],
+]) {
+  test(`${backend} live-price pulse stops when a line becomes candles without a reload`, async ({ page }) => {
+    await open_demo(page, url);
+    const pulse = () => page.evaluate(() => ({
+      option: window.__main.options().last_price_animation,
+      animating: window.__chart.wasm.wants_animation(),
+    }));
+    // The demo re-sends the line's default-on pulse with its style; that must not become an
+    // opt-in that survives the switch to candles or bars.
+    await page.locator('input[name="series"][value="line"]').check();
+    expect(await pulse()).toEqual({ option: true, animating: true });
+    for (const kind of ["candlestick", "hollow_candlestick", "bar"]) {
+      await page.locator(`input[name="series"][value="${kind}"]`).check();
+      expect(await pulse(), kind).toEqual({ option: false, animating: false });
+      await page.locator('input[name="series"][value="area"]').check();
+      expect(await pulse(), `area after ${kind}`).toEqual({ option: true, animating: true });
+    }
+    // A user's explicit opt-out still survives type changes.
+    await page.locator("#last_price_pulse_toggle").uncheck();
+    await page.locator('input[name="series"][value="candlestick"]').check();
+    await page.locator('input[name="series"][value="line"]').check();
+    expect(await pulse()).toEqual({ option: false, animating: false });
+  });
+}

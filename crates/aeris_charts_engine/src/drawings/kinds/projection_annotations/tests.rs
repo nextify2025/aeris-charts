@@ -236,6 +236,8 @@ fn catalog_defaults_follow_each_tool() {
             drawing.fill_enabled,
             ranged || kind == DrawingKind::Projection
         );
+        // Only the measuring ranges snap their anchors to whole bars and price ticks.
+        assert_eq!(spec.grid_snap, ranged, "{kind:?}");
         assert_eq!(
             drawing.stroke_end,
             if ranged {
@@ -712,9 +714,16 @@ fn ranges_measure_with_fills_arrows_and_engine_stats() {
         .find(|(outline, color)| *color == ink() && outline.len() >= 6)
         .expect("arrowhead");
     let middle_x = (a.0 + b.0) / 2.0;
+    // The shaft is one crisp device-pixel column through the area's middle and the arrow's apex
+    // sits on that pixel's center at the second price's pixel row.
     assert!(
-        close(arrowhead.0[0], (middle_x, b.1), 0.01),
-        "the arrow points at the second price"
+        close(
+            arrowhead.0[0],
+            (middle_x.round() + 0.5, b.1.round() + 0.5),
+            1e-9
+        ),
+        "the arrow points at the second price: {:?}",
+        arrowhead.0[0]
     );
     // The fill is a body target; turning it off leaves only the lines.
     let inside = (middle_x + 20.0, (a.1 + b.1) / 2.0);
@@ -769,6 +778,64 @@ fn ranges_measure_with_fills_arrows_and_engine_stats() {
     assert!(!texts_of(&mut chart)
         .iter()
         .any(|text| text.contains("bars")));
+}
+
+#[test]
+fn range_arrows_are_crisp_device_pixel_shafts_ended_by_the_drawing_caps() {
+    for dpr in [1.0, 1.25, 2.0] {
+        let mut chart = chart_with(&hourly(40), dpr);
+        add(
+            &mut chart,
+            DrawingKind::DateAndPriceRange,
+            vec![p(10.0, 105.0), p(20.0, 100.0)],
+            r##"{"color":"#123456"}"##,
+        );
+        // No antialiased stroke: both shafts are crisp full-pixel lines of the stroke width.
+        assert!(ink_polylines(&mut chart).is_empty(), "dpr {dpr}");
+        let width = dpr.round().max(1.0) as i32;
+        let frame = chart.build_frame();
+        let main = &frame.panes[0].main;
+        let verticals = main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::VLine {
+                    x, width: w, color, ..
+                } if *color == ink() => Some((*x, *w)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let horizontals = main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::HLine {
+                    y, width: w, color, ..
+                } if *color == ink() => Some((*y, *w)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(verticals.len(), 1, "dpr {dpr}: the price arrow's shaft");
+        assert_eq!(horizontals.len(), 1, "dpr {dpr}: the time arrow's shaft");
+        assert_eq!((verticals[0].1, horizontals[0].1), (width, width));
+        // Each cap's apex sits on its shaft's pixel center.
+        let (x, w) = verticals[0];
+        let shaft_x = f64::from(x - w / 2) + f64::from(w) / 2.0;
+        let (y, w) = horizontals[0];
+        let shaft_y = f64::from(y - w / 2) + f64::from(w) / 2.0;
+        let apexes = fills(&mut chart)
+            .into_iter()
+            .filter(|(_, color)| *color == ink())
+            .map(|(outline, _)| outline[0])
+            .collect::<Vec<_>>();
+        assert_eq!(apexes.len(), 2, "dpr {dpr}");
+        assert!(
+            apexes.iter().any(|apex| (apex.0 - shaft_x).abs() < 1e-9),
+            "dpr {dpr}: the price arrow's apex is on its column {apexes:?} {shaft_x}"
+        );
+        assert!(
+            apexes.iter().any(|apex| (apex.1 - shaft_y).abs() < 1e-9),
+            "dpr {dpr}: the time arrow's apex is on its row {apexes:?} {shaft_y}"
+        );
+    }
 }
 
 #[test]
@@ -1791,6 +1858,36 @@ fn anchors_px(chart: &ChartEngine, id: DrawingId) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// A grid-snapped tool's anchor after a move: on the bar slot and price tick nearest the raw
+/// point, never further than half a slot or half a tick (0.01 on this scale) from it.
+fn assert_snapped_to_the_grid(
+    chart: &ChartEngine,
+    now: DrawingPoint,
+    raw_px: (f64, f64),
+    context: &str,
+) {
+    let raw = chart
+        .drawing_from_px_for(0, crate::DrawingPriceScale::Right, raw_px.0, raw_px.1)
+        .unwrap();
+    assert_eq!(now.logical, now.logical.round(), "{context}: whole bar");
+    assert!(
+        (now.logical - raw.logical).abs() <= 0.5 + 1e-9,
+        "{context}: nearest slot ({} vs {})",
+        now.logical,
+        raw.logical
+    );
+    assert!(
+        (now.price * 100.0 - (now.price * 100.0).round()).abs() < 1e-6,
+        "{context}: price tick"
+    );
+    assert!(
+        (now.price - raw.price).abs() <= 0.005 + 1e-9,
+        "{context}: nearest tick ({} vs {})",
+        now.price,
+        raw.price
+    );
+}
+
 #[test]
 fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entries() {
     for kind in KINDS {
@@ -1801,6 +1898,10 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
         let count = kind.anchor_count();
         assert_eq!(chart.drawing_handle_count(id), Some(count), "{kind:?}");
         let start = anchors_px(&chart, id);
+        let start_points = chart.drawing(id).unwrap().points.clone();
+        // Grid-snapped tools (the measuring ranges) land on whole bars and price ticks instead
+        // of following the pointer pixel for pixel.
+        let grid = kind.spec().grid_snap;
         for handle in 0..count {
             // Pointer drag of the handle: only that anchor follows the pointer.
             let (x, y) = start[handle];
@@ -1813,47 +1914,109 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
             assert!(chart.drawing_drag_start_at(x, y));
             chart.drawing_drag_to(x + 13.0, y - 9.0, DrawingModifiers::default());
             chart.drawing_drag_end();
-            let moved = anchors_px(&chart, id);
-            for (index, (&now, &before)) in moved.iter().zip(&start).enumerate() {
-                let expected = if index == handle {
-                    (before.0 + 13.0, before.1 - 9.0)
-                } else {
-                    before
-                };
-                assert!(
-                    close(now, expected, 1e-6),
-                    "{kind:?} handle {handle} anchor {index}"
-                );
+            if grid {
+                let points = chart.drawing(id).unwrap().points.clone();
+                for (index, (now, before)) in points.iter().zip(&start_points).enumerate() {
+                    if index == handle {
+                        assert_snapped_to_the_grid(
+                            &chart,
+                            *now,
+                            (start[handle].0 + 13.0, start[handle].1 - 9.0),
+                            &format!("{kind:?} handle {handle} drag"),
+                        );
+                    } else {
+                        assert_eq!(now, before, "{kind:?} handle {handle} anchor {index}");
+                    }
+                }
+            } else {
+                let moved = anchors_px(&chart, id);
+                for (index, (&now, &before)) in moved.iter().zip(&start).enumerate() {
+                    let expected = if index == handle {
+                        (before.0 + 13.0, before.1 - 9.0)
+                    } else {
+                        before
+                    };
+                    assert!(
+                        close(now, expected, 1e-6),
+                        "{kind:?} handle {handle} anchor {index}"
+                    );
+                }
             }
             assert!(chart.undo_drawing(), "{kind:?}");
             // Keyboard nudge of the same handle.
             assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(handle)));
-            let nudged = anchor(&chart, id, handle);
-            assert!(
-                close(nudged, (start[handle].0, start[handle].1 - 10.0), 1e-6),
-                "{kind:?} nudged handle {handle}"
-            );
+            if grid {
+                let points = chart.drawing(id).unwrap().points.clone();
+                assert_snapped_to_the_grid(
+                    &chart,
+                    points[handle],
+                    (start[handle].0, start[handle].1 - 10.0),
+                    &format!("{kind:?} nudged handle {handle}"),
+                );
+                assert_eq!(points[handle].logical, start_points[handle].logical);
+            } else {
+                let nudged = anchor(&chart, id, handle);
+                assert!(
+                    close(nudged, (start[handle].0, start[handle].1 - 10.0), 1e-6),
+                    "{kind:?} nudged handle {handle}"
+                );
+            }
             assert!(chart.undo_drawing());
             assert!(close(anchor(&chart, id, handle), start[handle], 1e-6));
         }
-        // Body drag and body nudge translate every anchor rigidly.
+        // Body drag and body nudge translate every anchor rigidly (grid-snapped tools: by one
+        // shared whole-bar step, each anchor's price on its own tick).
         let (x, y) = body_point(&chart, id);
         assert!(chart.drawing_drag_start_at(x, y), "{kind:?}");
         chart.drawing_drag_to(x + 17.0, y + 11.0, DrawingModifiers::default());
         chart.drawing_drag_end();
-        for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
-            assert!(
-                close(now, (before.0 + 17.0, before.1 + 11.0), 1e-6),
-                "{kind:?} body drag"
-            );
+        if grid {
+            let points = chart.drawing(id).unwrap().points.clone();
+            let steps = points[0].logical - start_points[0].logical;
+            assert_eq!(steps, steps.round(), "{kind:?} body drag whole bars");
+            for (index, (now, before)) in points.iter().zip(&start_points).enumerate() {
+                assert_eq!(now.logical - before.logical, steps, "{kind:?} body drag");
+                let raw = chart
+                    .drawing_from_px_for(
+                        0,
+                        crate::DrawingPriceScale::Right,
+                        start[index].0 + 17.0,
+                        start[index].1 + 11.0,
+                    )
+                    .unwrap();
+                assert!(
+                    (now.price - raw.price).abs() <= 0.005 + 1e-9
+                        && (now.price * 100.0 - (now.price * 100.0).round()).abs() < 1e-6,
+                    "{kind:?} body drag price tick"
+                );
+            }
+        } else {
+            for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
+                assert!(
+                    close(now, (before.0 + 17.0, before.1 + 11.0), 1e-6),
+                    "{kind:?} body drag"
+                );
+            }
         }
         assert!(chart.undo_drawing());
         assert!(chart.nudge_selected_drawing(5.0, 0.0, None));
-        for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
-            assert!(
-                close(now, (before.0 + 5.0, before.1), 1e-6),
-                "{kind:?} body nudge"
-            );
+        if grid {
+            // A key step below one bar still moves the whole body by exactly one bar.
+            let points = chart.drawing(id).unwrap().points.clone();
+            for (now, before) in points.iter().zip(&start_points) {
+                assert_eq!(now.logical, before.logical + 1.0, "{kind:?} body nudge");
+                assert!(
+                    (now.price - before.price).abs() < 1e-9,
+                    "{kind:?} body nudge"
+                );
+            }
+        } else {
+            for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
+                assert!(
+                    close(now, (before.0 + 5.0, before.1), 1e-6),
+                    "{kind:?} body nudge"
+                );
+            }
         }
         assert!(chart.undo_drawing());
         for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {

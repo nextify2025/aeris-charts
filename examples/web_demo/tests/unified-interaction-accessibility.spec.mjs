@@ -6,7 +6,7 @@ async function open_chart(page) {
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
 
-test("auto wheel retains reference-informed cursor anchoring, modifier neutrality, and independent horizontal pan", async ({ page }) => {
+test("auto wheel pins the right edge, Ctrl zooms at the cursor, and horizontal deltas pan", async ({ page }) => {
   await open_chart(page);
   const box = await page.locator("#chart_container canvas:last-of-type").boundingBox();
   const geometry = await page.evaluate(() => ({
@@ -22,13 +22,15 @@ test("auto wheel retains reference-informed cursor anchoring, modifier neutralit
   }), paneX);
   await page.mouse.move(box.x + geometry.paneLeft + paneX, box.y + box.height / 2);
 
+  // Measured TradingView behavior: a plain wheel keeps the right offset (the latest bars stay
+  // put) while the bar under the cursor moves.
   const beforeZoom = await state();
-  expect(beforeZoom.rightBarStays).toBe(false);
+  expect(beforeZoom.rightBarStays).toBe(true);
   await page.mouse.wheel(0, -24);
   const afterZoom = await state();
   expect(afterZoom.spacing).toBeGreaterThan(beforeZoom.spacing);
-  expect(afterZoom.logical).toBeCloseTo(beforeZoom.logical, 5);
-  expect(afterZoom.offset).not.toBeCloseTo(beforeZoom.offset, 8);
+  expect(afterZoom.offset).toBeCloseTo(beforeZoom.offset, 8);
+  expect(afterZoom.logical).not.toBeCloseTo(beforeZoom.logical, 5);
 
   const beforeFocused = await state();
   await page.keyboard.down("Control");
@@ -39,13 +41,14 @@ test("auto wheel retains reference-informed cursor anchoring, modifier neutralit
   expect(afterFocused.logical).toBeCloseTo(beforeFocused.logical, 5);
   expect(afterFocused.offset).not.toBeCloseTo(beforeFocused.offset, 8);
 
+  // Shift is not a zoom-anchor modifier: it zooms like a plain wheel.
   const beforeShiftPan = await state();
   await page.keyboard.down("Shift");
   await page.mouse.wheel(0, -24);
   await page.keyboard.up("Shift");
   const afterShiftPan = await state();
   expect(afterShiftPan.spacing).toBeGreaterThan(beforeShiftPan.spacing);
-  expect(afterShiftPan.logical).toBeCloseTo(beforeShiftPan.logical, 5);
+  expect(afterShiftPan.offset).toBeCloseTo(beforeShiftPan.offset, 8);
 
   const beforePan = await state();
   await page.mouse.wheel(24, 0);

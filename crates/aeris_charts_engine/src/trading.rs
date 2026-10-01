@@ -5340,6 +5340,77 @@ mod tests {
         assert_eq!(chart.trading_price_tick_index(102.6), None);
     }
 
+    /// Bordered trading chrome (markers, buttons, the action tooltip, annotation chips) must put
+    /// every edge on a whole device pixel. A `RoundRect` border paints inside the box, so a
+    /// fractional edge smears the 1 px border over two pixel rows on some sides only.
+    #[test]
+    fn bordered_trading_chrome_and_tooltips_land_on_whole_device_pixels() {
+        let mut chart = chart_with_market();
+        let mut value = position(PositionSide::Long);
+        value.annotations = ["Q 12", "slipped 3", "w"]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| TradingAnnotation {
+                id: format!("a-{index}"),
+                text: text.to_string(),
+                tone: TradingAnnotationTone::Info,
+                tooltip: None,
+                placement: [
+                    TradingAnnotationPlacement::Above,
+                    TradingAnnotationPlacement::Inline,
+                    TradingAnnotationPlacement::Below,
+                ][index],
+            })
+            .collect();
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                positions: vec![value],
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        let (cancel_x, cancel_y) = cancel_center(
+            &mut chart,
+            TradingObjectId::Position(id("position-1", PositionId::new)),
+        );
+        assert!(chart.set_trading_hover(cancel_x, cancel_y));
+        assert!(chart.arm_trading_tooltip());
+        for ratio in [1.0_f64, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            let mut out = Vec::new();
+            let mut regions = Vec::new();
+            chart.build_trading_frame_for_test(0, ratio, ratio, &mut regions, &mut out);
+            let mut boxes = 0;
+            let mut tooltip = false;
+            for primitive in &out {
+                match primitive {
+                    Prim::RoundRect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        border_width,
+                        ..
+                    } if *border_width > 0.0 => {
+                        boxes += 1;
+                        for edge in [*x, *y, *x + *w, *y + *h] {
+                            assert_eq!(
+                                edge.fract(),
+                                0.0,
+                                "bordered box {x},{y} {w}x{h} at ratio {ratio}"
+                            );
+                        }
+                    }
+                    Prim::Text { text, .. } if text == "Close position" => tooltip = true,
+                    _ => {}
+                }
+            }
+            assert!(tooltip, "the armed action tooltip renders at ratio {ratio}");
+            assert!(
+                boxes >= 5,
+                "marker, annotations and tooltip at ratio {ratio}"
+            );
+        }
+    }
+
     #[test]
     fn annotations_are_bounded_rendered_and_hit_tested_atomically() {
         let mut chart = chart_with_market();

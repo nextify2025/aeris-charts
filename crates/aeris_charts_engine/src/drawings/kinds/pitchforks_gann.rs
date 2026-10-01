@@ -249,6 +249,7 @@ const PITCHFORK_TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 pub(crate) const ANDREWS_PITCHFORK: DrawingToolSpec = PITCHFORK_TOOL;

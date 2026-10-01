@@ -1686,6 +1686,7 @@ impl ChartEngine {
         // state and historically survived import. Abort only the in-flight placement/capture.
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
+        self.drawing_controller.measure = None;
         self.drawing_text_edit = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
@@ -2072,6 +2073,7 @@ impl ChartEngine {
         self.drawing_history = crate::DrawingHistory::default();
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
+        self.drawing_controller.measure = None;
         self.drawing_text_edit = None;
         self.hovered_drawing = None;
         self.hovered_text = None;

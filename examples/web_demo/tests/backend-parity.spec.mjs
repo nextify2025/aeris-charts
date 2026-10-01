@@ -474,8 +474,8 @@ test("public time and price scale handles are engine-owned and reference-compati
     fix_left_edge: false,
     fix_right_edge: false,
     lock_visible_time_range_on_resize: false,
-    // the public reference default: zoom remains anchored at the cursor.
-    right_bar_stays_on_scroll: false,
+    // Measured TradingView default: ordinary wheel zoom keeps the right edge pinned.
+    right_bar_stays_on_scroll: true,
     shift_visible_range_on_new_bar: true,
     allow_shift_visible_range_on_whitespace_replacement: false,
     allow_bold_labels: true,
@@ -484,11 +484,12 @@ test("public time and price scale handles are engine-owned and reference-compati
     tick_mark_max_character_length: 8,
     visible: true,
     // Aeris extensions (defaults): exchange time zone and trading-day start, explicit time-axis
-    // marks, and the fixed-session logical-range lock.
+    // marks, the fixed-session logical-range lock, and bars labeled by their open time.
     time_zone: "UTC",
     session_start: 0,
     tick_marks: null,
     lock_visible_logical_range: false,
+    bar_time_label: "open",
   });
   expect(result.series_queries.length).toBe(fixture.bar_count);
   expect(result.series_queries.type).toBe("candlestick");
@@ -1190,6 +1191,86 @@ for (const kind of ["long_position", "short_position"]) {
       expect(updated.options.position_risk_percent).toBe(2);
       expect(updated.text.some((text) => text.startsWith("Target:") && text.endsWith(", Amount: 2080"))).toBe(true);
       expect(updated.text.some((text) => text.startsWith("Stop:") && text.endsWith(", Amount: 1960"))).toBe(true);
+    }
+  });
+}
+
+// Measuring tools emit crisp device-pixel fills, rules and arrow shafts; only the arrowheads and
+// label glyphs are antialiased. Their measured areas must therefore be pixel-identical between
+// WebGPU and Canvas2D, for rising and falling pulls in both themes.
+async function render_measures(page, backend, theme) {
+  await page.goto(`/?backend=${backend}&theme=${theme}&forceFallbackAdapter=1`);
+  await page.waitForFunction(() => window.__main && window.__chart.time_scale().get_visible_logical_range());
+  const areas = await page.evaluate(() => {
+    const chart = window.__chart;
+    const series = window.__main;
+    const range = chart.time_scale().get_visible_logical_range();
+    const logical = (fraction) => Math.round(range.from + (range.to - range.from) * fraction);
+    const close = (index) => series.data_by_index(index).close;
+    const specs = [
+      ["price_range", 0.1, 0.22, 0.97, 1.04],
+      ["date_range", 0.48, 0.3, 1.02, 0.98],
+      ["date_and_price_range", 0.55, 0.75, 1.03, 0.95],
+    ];
+    const box = document.getElementById("chart_container").getBoundingClientRect();
+    const left = box.left + chart.wasm.pane_left();
+    const css = (l, price) => [left + chart.time_scale().logical_to_coordinate(l), box.top + series.price_to_coordinate(price)];
+    const result = [];
+    for (const [kind, from, to, start_scale, end_scale] of specs) {
+      const base = close(logical(from));
+      const points = [
+        { logical: logical(from), price: Math.round(base * start_scale * 100) / 100 },
+        { logical: logical(to), price: Math.round(base * end_scale * 100) / 100 },
+      ];
+      chart.add_drawing(kind, points);
+      result.push(points.map((point) => css(point.logical, point.price)));
+    }
+    // The transient Shift-click measure, pulled downward.
+    const a = logical(0.78);
+    const b = logical(0.92);
+    const start = [chart.time_scale().logical_to_coordinate(a), series.price_to_coordinate(close(a) * 1.02)];
+    const end = [chart.time_scale().logical_to_coordinate(b), series.price_to_coordinate(close(a) * 0.97)];
+    chart.wasm.measure_pointer_down(start[0], start[1], true, false);
+    chart.wasm.measure_pointer_move(end[0], end[1], false);
+    chart.wasm.measure_pointer_up(end[0], end[1], false);
+    const measured = JSON.parse(chart.wasm.measure_points_json());
+    result.push(measured.map((point) => css(point.logical, point.price)));
+    return result;
+  });
+  await page.mouse.move(2, 2);
+  await settle_page(page);
+  const png = PNG.sync.read(await page.screenshot({ animations: "disabled" }));
+  const dpr = await page.evaluate(() => window.devicePixelRatio);
+  return { png, dpr, areas, backend: await page.evaluate(() => window.__chart.backend()) };
+}
+
+for (const theme of ["light", "dark"]) {
+  test(`measure areas are pixel-identical across WebGPU and Canvas2D in ${theme}`, async ({ page }) => {
+    const gpu = await render_measures(page, "auto", theme);
+    const canvas = await render_measures(page, "canvas2d", theme);
+    expect(gpu.backend).toBe("webgpu");
+    expect(canvas.backend).toBe("canvas2d");
+    expect(gpu.areas).toEqual(canvas.areas);
+    for (const [[sx, sy], [ex, ey]] of gpu.areas) {
+      const left = Math.round(Math.min(sx, ex) * gpu.dpr) + 2;
+      const right = Math.round(Math.max(sx, ex) * gpu.dpr) - 2;
+      const top = Math.round(Math.min(sy, ey) * gpu.dpr) + 2;
+      const bottom = Math.round(Math.max(sy, ey) * gpu.dpr) - 2;
+      // Antialiased arrowheads sit at the arrow tips on the end edges.
+      const tips = [[(sx + ex) / 2, ey], [ex, (sy + ey) / 2]].map(([x, y]) => [x * gpu.dpr, y * gpu.dpr]);
+      let compared = 0;
+      let different = 0;
+      for (let y = top; y <= bottom; y += 1) {
+        for (let x = left; x <= right; x += 1) {
+          if (tips.some(([tx, ty]) => Math.abs(x - tx) <= 10 * gpu.dpr && Math.abs(y - ty) <= 10 * gpu.dpr)) continue;
+          const offset = (y * gpu.png.width + x) * 4;
+          const delta = Math.max(...[0, 1, 2].map((channel) => Math.abs(gpu.png.data[offset + channel] - canvas.png.data[offset + channel])));
+          compared += 1;
+          if (delta > 3) different += 1;
+        }
+      }
+      expect(compared, "measure area was sampled").toBeGreaterThan(400);
+      expect(different, `measure area ${left},${top}–${right},${bottom} matches across backends`).toBe(0);
     }
   });
 }

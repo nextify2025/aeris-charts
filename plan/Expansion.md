@@ -1022,7 +1022,7 @@ volume-based tools, which are delivered in B7.
 | Patterns | XABCD, cypher, ABCD, head and shoulders, triangle pattern, three drives |
 | Elliott waves | Impulse (12345), correction (ABC), triangle (ABCDE), double and triple combination, with degree labels |
 | Cycles | Cyclic lines, time cycles, sine line |
-| Projection and measuring | Long position ✓, short position ✓, forecast, bars pattern (ghost copy), price range, date range, date and price range, projection |
+| Projection and measuring | Long position ✓, short position ✓, forecast, bars pattern (ghost copy), price range ✓, date range ✓, date and price range ✓ (plus the Shift-click quick measure), projection |
 | Volume-based | Fixed-range volume profile (OF4), anchored volume profile (OF5), anchored VWAP (OF10) |
 | Shapes | Rectangle ✓, rotated rectangle, ellipse, circle, triangle, arc, curve, double curve, polyline, path ✓, brush ✓, highlighter |
 | Annotations | Text ✓, anchored text (screen-anchored), note, price note, callout, comment, price label, signpost, flag mark, arrow markers (up/down/left/right), icon/emoji stamp from a host-provided bounded image set |

@@ -603,6 +603,15 @@ impl ChartEngine {
         }
     }
 
+    /// Whether one live price scale aligns colliding labels.
+    pub fn price_scale_align_labels_for(
+        &self,
+        pane: usize,
+        target: PriceScaleTarget,
+    ) -> Option<bool> {
+        Some(self.price_scale_for(pane, target)?.options().align_labels)
+    }
+
     /// Toggle label collision alignment for one live price scale.
     pub fn toggle_price_scale_align_labels(
         &mut self,

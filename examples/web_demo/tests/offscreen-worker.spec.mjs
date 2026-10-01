@@ -167,8 +167,9 @@ test("worker wheel routing matches the main-thread gesture router", async ({ pag
   const samples = [
     // Auto mode: vertical wheel over the price axis zooms time, not price.
     { x: 628, y: 150, delta_x: 0, delta_y: -120, delta_mode: 0 },
-    // Auto mode ignores Ctrl and Shift.
+    // Ctrl and Cmd zoom around the pointer; a plain wheel pins the right edge; Shift is neutral.
     { x: 200, y: 150, delta_x: 0, delta_y: -120, delta_mode: 0, ctrl_key: true },
+    { x: 260, y: 150, delta_x: 0, delta_y: 120, delta_mode: 0, meta_key: true },
     { x: 300, y: 150, delta_x: 0, delta_y: 120, delta_mode: 0, shift_key: true },
     { x: 320, y: 150, delta_x: 80, delta_y: 0, delta_mode: 0 },
     { x: 420, y: 150, delta_x: 0, delta_y: -3, delta_mode: 1 },
@@ -186,6 +187,7 @@ test("worker wheel routing matches the main-thread gesture router", async ({ pag
         deltaMode: sample.delta_mode,
         ctrlKey: sample.ctrl_key === true,
         shiftKey: sample.shift_key === true,
+        metaKey: sample.meta_key === true,
         clientX: rect.left + sample.x,
         clientY: rect.top + sample.y,
         bubbles: true,

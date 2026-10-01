@@ -87,6 +87,7 @@ const SHAPE_TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 // The rotated rectangle, circle, and arc derive their extent from screen-space perpendiculars

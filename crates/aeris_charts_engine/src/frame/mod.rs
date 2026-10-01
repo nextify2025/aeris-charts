@@ -124,6 +124,38 @@ const CROSSHAIR_LABEL_BG: Color = Color::rgb(
     DEFAULT_CROSSHAIR_LABEL_RGB.2,
 );
 
+/// A bordered chrome box (tooltip, chip) in device px with every edge on a whole device pixel.
+/// `RoundRect` borders paint inside the rect, so an edge at a fractional coordinate spreads a
+/// 1 px border across two pixel rows or columns: the same border reads crisp on one side and
+/// blurred on another, and the blur changes as the box moves. Snapping each edge independently
+/// (rather than position and size separately) keeps all four borders one device pixel wide.
+pub(crate) struct DeviceBox {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+}
+
+impl DeviceBox {
+    /// Snap a CSS-px box at `(left, top)` of `width × height` with the frame's ratios.
+    pub(crate) fn snap(left: f64, top: f64, width: f64, height: f64, hpr: f64, vpr: f64) -> Self {
+        let x0 = (left * hpr).round();
+        let y0 = (top * vpr).round();
+        let x1 = ((left + width) * hpr).round().max(x0 + 1.0);
+        let y1 = ((top + height) * vpr).round().max(y0 + 1.0);
+        Self {
+            x: x0 as f32,
+            y: y0 as f32,
+            w: (x1 - x0) as f32,
+            h: (y1 - y0) as f32,
+        }
+    }
+
+    pub(crate) fn center_x(&self) -> f32 {
+        self.x + self.w / 2.0
+    }
+}
+
 fn ceiled_odd(value: f64) -> f64 {
     let ceiled = value.ceil() as i64;
     if ceiled % 2 == 0 {
@@ -283,6 +315,11 @@ pub(crate) struct FrameInvalidation {
 }
 
 impl FrameInvalidation {
+    /// Advances on every invalidation of any layer.
+    pub(crate) const fn clock(&self) -> u64 {
+        self.clock
+    }
+
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.wrapping_add(1).max(1);
         self.clock
@@ -453,6 +490,8 @@ pub(crate) struct RetainedFrame {
     last_series_revision: u64,
     last_time_scale_revision: u64,
     last_price_scale_revisions: Vec<Vec<u64>>,
+    /// Invalidation clock observed by the last prepared host frame.
+    prepared_clock: u64,
 }
 
 impl RetainedFrame {
@@ -1162,6 +1201,12 @@ impl ChartEngine {
         self.frame_invalidation.overlay();
     }
 
+    /// Paint order changed while every retained layer stays valid: the next prepared frame must
+    /// reassemble, but no geometry is rebuilt.
+    pub(crate) fn invalidate_frame_assembly(&mut self) {
+        self.frame_invalidation.tick();
+    }
+
     pub(crate) fn invalidate_frame_axis(&mut self) {
         self.frame_invalidation.axis();
     }
@@ -1210,6 +1255,15 @@ impl ChartEngine {
 
     pub fn frame_requires_axis(&self) -> bool {
         self.retained_frame.axis_generation != self.frame_invalidation.axis
+    }
+
+    /// Whether any layer was invalidated since the last prepared host frame.
+    pub(crate) fn frame_invalidated_since_prepare(&self) -> bool {
+        self.retained_frame.prepared_clock != self.frame_invalidation.clock()
+    }
+
+    pub(crate) fn frame_prepared(&mut self) {
+        self.retained_frame.prepared_clock = self.frame_invalidation.clock();
     }
 
     /// Force the next axis build to start from engine-owned labels. Browser extensions use this

@@ -111,12 +111,25 @@ impl ChartEngine {
                 format!("{:+.2}%", change / first.price.abs() * 100.0)
             }
             DrawingLabelMetric::Ticks => {
-                let tick =
-                    self.scale_autoscale_min_move(drawing.pane_index, drawing.price_scale.target());
-                if !tick.is_finite() || tick <= 0.0 {
-                    return None;
-                }
-                format!("{:+} ticks", (change / tick).round() as i64)
+                // Ticks count on the grid the anchors snap to: the instrument tick or price-band
+                // ladder, falling back to the bound scale's `min_move`. The count is a magnitude;
+                // the sign follows the price change.
+                let (pane, scale) = (drawing.pane_index, drawing.price_scale);
+                let ticks = self
+                    .position_price_ticks_between(pane, scale, first.price, last.price)
+                    // Free anchors on a price-band ladder sit off its grid: count between the
+                    // nearest grid prices instead of dropping the metric.
+                    .or_else(|| {
+                        let snap = |price| self.snap_position_price(pane, scale, price);
+                        self.position_price_ticks_between(
+                            pane,
+                            scale,
+                            snap(first.price),
+                            snap(last.price),
+                        )
+                    })?
+                    .round() as i64;
+                format!("{:+} ticks", if change < 0.0 { -ticks } else { ticks })
             }
             DrawingLabelMetric::BarCount => {
                 format!("{} bars", (last.logical - first.logical).round() as i64)

@@ -175,8 +175,10 @@ export interface offscreen_wheel_event {
   delta_y: number;
   /** 0 = pixels, 1 = lines, 2 = pages (the WheelEvent values). */
   delta_mode?: 0 | 1 | 2;
+  /** Ctrl (or `meta_key`, macOS Cmd) zooms around the pointer instead of pinning the right edge. */
   ctrl_key?: boolean;
   shift_key?: boolean;
+  meta_key?: boolean;
 }
 
 export interface offscreen_key_event {
@@ -708,7 +710,9 @@ export class offscreen_chart {
           if (update.kind === 6) {
             this.wasm.scroll_move(update.x);
             if (update.scale_delta !== 0) {
-              this.wasm.zoom(update.x, this.wasm.pinch_zoom_scale(update.scale_delta));
+              // Pinching is direct manipulation: it stays anchored at the pinch point even though
+              // wheel zoom pins the right edge.
+              this.wasm.zoom_focused(update.x, this.wasm.pinch_zoom_scale(update.scale_delta));
             }
           } else if (this.drag_pointer_id === id) {
             this.wasm.scroll_move(x);
@@ -757,6 +761,7 @@ export class offscreen_chart {
         delta_mode,
         ctrl_key: event.ctrl_key === true,
         shift_key: event.shift_key === true,
+        meta_key: event.meta_key === true,
         speed: wheel_speed_adjustment(delta_mode, this.dpr),
         point: () => ({ x: event.x - this.wasm.pane_left(), y: event.y }),
       },

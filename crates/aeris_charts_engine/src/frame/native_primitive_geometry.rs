@@ -368,24 +368,34 @@ impl ChartEngine {
                 } else {
                     positions[0].1.round()
                 };
+                let device = super::DeviceBox::snap(main_x, top, main_width, main_height, hpr, vpr);
                 out.push(Prim::RoundRect {
-                    x: (main_x * hpr) as f32,
-                    y: (top * vpr) as f32,
-                    w: (main_width * hpr) as f32,
-                    h: (main_height * vpr) as f32,
-                    radii: [(6.0 * hpr.min(vpr)) as f32; 4],
+                    x: device.x,
+                    y: device.y,
+                    w: device.w,
+                    h: device.h,
+                    radii: [(6.0 * hpr.min(vpr)).round() as f32; 4],
                     fill: background,
                     border_width: aeris_charts_core::style::border_width_device_px(hpr.min(vpr))
                         as f32,
                     border_color: border,
                 });
                 if items.len() == 2 && delta_width > 0.0 {
+                    // The delta band spans the box's own snapped rows so it meets both borders.
+                    let band = super::DeviceBox::snap(
+                        positions[0].0 + positions[0].1,
+                        top,
+                        delta_width,
+                        main_height,
+                        hpr,
+                        vpr,
+                    );
                     out.push(Prim::Rect {
                         rect: IRect {
-                            x: ((positions[0].0 + positions[0].1) * hpr).round() as i32,
-                            y: (top * vpr).round() as i32,
-                            w: (delta_width * hpr).round() as i32,
-                            h: (main_height * vpr).round() as i32,
+                            x: band.x as i32,
+                            y: device.y as i32,
+                            w: band.w as i32,
+                            h: device.h as i32,
                         },
                         color: delta_bg,
                     });

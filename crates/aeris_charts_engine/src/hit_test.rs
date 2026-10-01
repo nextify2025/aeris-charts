@@ -530,7 +530,8 @@ impl ChartEngine {
         if self.hovered_series != next {
             self.hovered_series = next;
             // Hover-on-top changes only retained-layer assembly order; per-series geometry stays
-            // valid and is reassembled in the new order by every canonical frame build.
+            // valid and is reassembled in the new order by the next frame build.
+            self.invalidate_frame_assembly();
         }
     }
 

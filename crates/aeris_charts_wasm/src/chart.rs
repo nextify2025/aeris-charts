@@ -4754,6 +4754,13 @@ impl AerisChart {
     pub fn zoom_focused(&mut self, x_css: f64, scale: f64) {
         self.inner.borrow_mut().zoom_focused(x_css, scale);
     }
+    /// Ordinary wheel zoom: the engine resolves the anchor (Ctrl/Cmd zooms around the pointer,
+    /// otherwise the time scale's right-edge pin policy applies).
+    pub fn wheel_zoom_time(&mut self, x_css: f64, scale: f64, control: bool, meta: bool) {
+        self.inner
+            .borrow_mut()
+            .wheel_zoom_time(x_css, scale, control, meta);
+    }
     pub fn scroll_start(&mut self, x_css: f64) {
         self.inner.borrow_mut().scroll_start(x_css);
     }
@@ -5534,6 +5541,45 @@ impl AerisChart {
     }
     pub fn cancel_drawing_tool(&mut self) {
         self.inner.borrow_mut().cancel_drawing_tool();
+    }
+
+    // --- transient Shift-click measure (engine-owned; never a committed drawing) ---
+
+    /// Forward a primary pane press. A live measure always consumes it (freeze or dismiss);
+    /// otherwise `begin` (Shift held, after the host's object hit tests) starts one.
+    pub fn measure_pointer_down(
+        &mut self,
+        x_css: f64,
+        y_css: f64,
+        begin: bool,
+        magnet: bool,
+    ) -> bool {
+        self.inner
+            .borrow_mut()
+            .measure_pointer_down(x_css, y_css, begin, magnet)
+    }
+    /// Follow the pointer with a live measure's end anchor. Returns whether it changed.
+    pub fn measure_pointer_move(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.inner
+            .borrow_mut()
+            .measure_pointer_move(x_css, y_css, magnet)
+    }
+    /// Release after a measure press; a drag release freezes the measure.
+    pub fn measure_pointer_up(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.inner
+            .borrow_mut()
+            .measure_pointer_up(x_css, y_css, magnet)
+    }
+    /// Dismiss the transient measure. Returns whether one existed.
+    pub fn cancel_measure(&mut self) -> bool {
+        self.inner.borrow_mut().cancel_measure()
+    }
+    pub fn measure_active(&self) -> bool {
+        self.inner.borrow().measure_active()
+    }
+    /// `[{logical, price}, {logical, price}]` for the live measure, or `null`.
+    pub fn measure_points_json(&self) -> String {
+        self.inner.borrow().measure_points_json()
     }
 
     /// Arm interactive creation of a tool kind ("" options = defaults): the next clicks place

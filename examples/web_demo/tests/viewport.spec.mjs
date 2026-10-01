@@ -1,9 +1,10 @@
 import { test, expect } from "@playwright/test";
 
 // Viewport contract through the public browser API: data changes never move a scrolled-back view,
-// the live edge still follows, wheel zoom is pointer-anchored, range subscriptions converge after
-// re-entrant data loads, fractional ranges restore exactly, `scroll_to_real_time` animates to the
-// configured right offset, and a locked full-session view survives data, resizes, and keyboard.
+// the live edge still follows, Ctrl/Cmd wheel zoom is pointer-anchored while a plain wheel pins the
+// right edge, range subscriptions converge after re-entrant data loads, fractional ranges restore
+// exactly, `scroll_to_real_time` animates to the configured right offset, and a locked
+// full-session view survives data, resizes, and keyboard.
 
 const T0 = 1_700_000_000;
 
@@ -96,7 +97,7 @@ test("history loads, backfills, and appends keep a scrolled-back view; the live 
   expect(result.live_right_time).toBe(result.live_time);
 });
 
-test("off-center wheel zoom keeps the logical point under the pointer", async ({ page }) => {
+test("off-center Ctrl wheel zoom keeps the logical point under the pointer", async ({ page }) => {
   await make_chart(page);
   const result = await page.evaluate(async () => {
     const { chart, series, scale, rows } = window.__vp;
@@ -115,6 +116,7 @@ test("off-center wheel zoom keeps the logical point under the pointer", async ({
       deltaX: 0,
       deltaY: -120,
       deltaMode: 0,
+      ctrlKey: true,
       clientX: rect.left + chart.wasm.pane_left() + pointer_x,
       clientY: rect.top + chart.wasm.pane_height(0) / 2,
       bubbles: true,
@@ -132,6 +134,44 @@ test("off-center wheel zoom keeps the logical point under the pointer", async ({
   expect(Math.abs(result.after.at_pointer - result.before.at_pointer)).toBeLessThan(1e-6);
   // A center-anchored zoom would have kept the center instead.
   expect(Math.abs(result.after.at_center - result.before.at_center)).toBeGreaterThan(1);
+});
+
+test("off-center plain wheel zoom pins the right edge instead of the pointer", async ({ page }) => {
+  await make_chart(page);
+  const result = await page.evaluate(async () => {
+    const { chart, series, scale, rows } = window.__vp;
+    series.set_data(rows(0, 999));
+    scale.scroll_to_position(-100, false);
+    const float_index = (x) => {
+      const range = scale.get_visible_logical_range();
+      return range.to - (scale.width() - 1 - x) / chart.wasm.bar_spacing();
+    };
+    const pointer_x = 150;
+    const before = { at_pointer: float_index(pointer_x), right: scale.get_visible_logical_range().to };
+    const spacing_before = chart.wasm.bar_spacing();
+    const overlay = chart.chart_element().querySelector("canvas:last-of-type");
+    const rect = overlay.getBoundingClientRect();
+    overlay.dispatchEvent(new WheelEvent("wheel", {
+      deltaX: 0,
+      deltaY: -120,
+      deltaMode: 0,
+      clientX: rect.left + chart.wasm.pane_left() + pointer_x,
+      clientY: rect.top + chart.wasm.pane_height(0) / 2,
+      bubbles: true,
+      cancelable: true,
+    }));
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    return {
+      before,
+      after: { at_pointer: float_index(pointer_x), right: scale.get_visible_logical_range().to },
+      spacing_before,
+      spacing_after: chart.wasm.bar_spacing(),
+    };
+  });
+  expect(result.spacing_after).toBeGreaterThan(result.spacing_before);
+  // The right edge (the bar offset past the latest bar) stays put; the bar under the pointer moves.
+  expect(Math.abs(result.after.right - result.before.right)).toBeLessThan(1e-6);
+  expect(Math.abs(result.after.at_pointer - result.before.at_pointer)).toBeGreaterThan(1);
 });
 
 test("range subscriptions fire on pan and data, and converge after a re-entrant history load", async ({ page }) => {

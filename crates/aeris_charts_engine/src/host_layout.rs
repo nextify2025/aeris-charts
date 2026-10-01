@@ -66,8 +66,11 @@ impl ChartEngine {
             self.css_height = request.height;
             self.dpr = request.dpr;
         }
-        let layout_recomputed = dimensions_changed || request.force_layout;
+        let (input_frame, input_layout) = self.input.take_frame_invalidation();
+        let layout_recomputed = dimensions_changed || request.force_layout || input_layout;
         if !layout_recomputed
+            && !input_frame
+            && !self.frame_invalidated_since_prepare()
             && !self.frame_requires_layout()
             && !self.frame_requires_axis()
             && !request.frame.panes.is_empty()
@@ -91,6 +94,7 @@ impl ChartEngine {
         let axis_frame = self.build_axis_frame(max_label_width, measure, countdown_measure);
         self.build_frame_into(request.frame);
         self.build_axis_primitives_into(&axis_frame, request.axis_primitives, |_| 0.0);
+        self.frame_prepared();
         FinancialFramePreparation {
             frame_built: true,
             layout_recomputed,

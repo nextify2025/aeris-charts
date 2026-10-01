@@ -48,6 +48,16 @@ Ponytail removes accidental complexity. It must not simplify away render parity,
 - Fix root causes at the owning shared layer. Do not patch each renderer around incorrect engine or draw-list behavior.
 - Keep `aeris_charts_core`, `aeris_charts_indicators`, `aeris_charts_engine`, and `aeris_charts_render` free of browser, GPUI, and application dependencies.
 - Keep one chart model and one ordered frame contract. Backends execute it; they do not fork semantics.
+- Interaction policy is engine-owned. Pointer, wheel, and keyboard routing, press arbitration, gesture
+  lifecycles, click and double-click semantics, key bindings, hover promotion, and cursor choice live in
+  the engine input controller (`aeris_charts_engine` `chart_input.rs`). GPUI hosts bind through
+  `aeris_charts_render_gpui::input` with one adapter call per listener. Never add routing, cursor
+  priority, key handling, or per-feature input wiring to a host, example, or Aeris Terminal; extend the
+  controller so every host inherits the feature unchanged.
+- Hosts receive behavior, not mechanisms. If every host would have to call a sequence of engine methods
+  the same way, that sequence belongs inside the engine as one operation. A feature that needs host
+  wiring beyond supplying data or performing a genuinely platform-only effect (capture, cursor
+  application, timers, menus, clipboard, persistence) is incomplete.
 - Keep media-space math in `f64` until backend encoding. Make device-pixel conversion and snapping explicit.
 - Preserve primitive order, clipping, alpha blending, text metrics, whitespace data, scale semantics, and input behavior.
 - Bound caches, queues, rings, retries, frame work, and memory. Define invalidation and device-loss behavior.

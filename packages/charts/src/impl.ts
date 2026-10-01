@@ -6940,7 +6940,7 @@ export class chart_impl implements chart_api {
 
   active_drawing_tool(): drawing_kind | null {
     const wire = Number(this.wasm.active_drawing_tool());
-    return wire >= 0 ? (DRAWING_KIND_FROM_U8.get(wire) ?? null) : null;
+    return DRAWING_KIND_FROM_U8.get(wire) ?? null;
   }
 
   set_drawing_tool_listener(listener: ((tool: drawing_kind | null) => void) | null): void {

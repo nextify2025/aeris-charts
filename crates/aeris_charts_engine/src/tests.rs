@@ -6683,6 +6683,33 @@ fn pulse_follows_kind_defaults_but_an_explicit_choice_survives_type_changes() {
 }
 
 #[test]
+fn restating_the_line_pulse_default_does_not_carry_the_pulse_onto_candles() {
+    use aeris_charts_render::draw_list::Prim;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    install_bars(&mut chart, 20);
+    chart.fit_content();
+    chart.convert_series_kind(0, SeriesKind::Line);
+    // Hosts re-send their whole style on every apply, including the default-on line pulse.
+    assert!(chart.set_series_last_price_animation(0, true));
+    assert!(chart.last_price_pulse_active());
+    chart.convert_series_kind(0, SeriesKind::Candlestick);
+    assert!(
+        !chart.last_price_pulse_active(),
+        "candles stop the animation clock"
+    );
+    let frame = chart.build_frame();
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Circle { .. })),
+        "candles paint no live-price pulse"
+    );
+    chart.convert_series_kind(0, SeriesKind::Area);
+    assert!(chart.last_price_pulse_active(), "area restores its default");
+}
+
+#[test]
 fn pulse_clock_runs_only_while_the_primary_series_draws_a_pulse() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     // The engine starts with one candlestick main series; the primary series owns the pulse.

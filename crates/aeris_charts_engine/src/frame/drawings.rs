@@ -560,6 +560,17 @@ impl ChartEngine {
                 }
             }
         }
+        // The transient Shift-click measure paints the date-and-price range geometry without
+        // handles; it is never a committed drawing.
+        if let Some(session) = self.measure_session() {
+            if session.drawing.pane_index == pane_index {
+                if let Some(px) = self.drawing_px(&session.drawing) {
+                    let px: Vec<(f64, f64)> =
+                        px.into_iter().map(|(x, y)| (x * hpr, y * vpr)).collect();
+                    self.build_drawing_prims(&session.drawing, &px, pane_w_px, vpr, out, points);
+                }
+            }
+        }
     }
 
     /// The selected/hovered drawing's converted bitmap-px anchor points, or `None` when the
@@ -1762,6 +1773,34 @@ impl ChartEngine {
         }
     }
 
+    /// A price-valued drawing statistic in the drawing's own price format: the host formatter,
+    /// then instrument precision on the tick grid, then the bound scale's series format.
+    fn format_drawing_price(&self, drawing: &Drawing, value: f64) -> String {
+        if let Some(text) = self
+            .price_formatter_fn
+            .as_ref()
+            .and_then(|formatter| formatter(value))
+        {
+            return text;
+        }
+        let tick = self.position_price_tick(drawing.pane_index, drawing.price_scale);
+        if let Some(precision) = self.trading_state.instrument.price_precision {
+            return super::PriceFormatter::from_precision(
+                precision,
+                tick.unwrap_or(10.0_f64.powi(-(precision as i32))),
+            )
+            .format(value);
+        }
+        let scale_target = match drawing.price_scale {
+            crate::DrawingPriceScale::Right => crate::PriceScaleTarget::Right,
+            crate::DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
+            crate::DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
+        };
+        self.scale_formatter_source(drawing.pane_index, scale_target)
+            .and_then(|series| self.format_with_price_format(&series.price_format, value))
+            .unwrap_or_else(|| self.price_formatter.format(value))
+    }
+
     fn build_position_labels(
         &self,
         drawing: &Drawing,
@@ -1796,26 +1835,7 @@ impl ChartEngine {
             crate::DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
             crate::DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
         };
-        let tick = self.position_price_tick(drawing.pane_index, drawing.price_scale);
-        let format_price = |value: f64| {
-            if let Some(text) = self
-                .price_formatter_fn
-                .as_ref()
-                .and_then(|formatter| formatter(value))
-            {
-                return text;
-            }
-            if let Some(precision) = self.trading_state.instrument.price_precision {
-                return super::PriceFormatter::from_precision(
-                    precision,
-                    tick.unwrap_or(10.0_f64.powi(-(precision as i32))),
-                )
-                .format(value);
-            }
-            self.scale_formatter_source(drawing.pane_index, scale_target)
-                .and_then(|series| self.format_with_price_format(&series.price_format, value))
-                .unwrap_or_else(|| self.price_formatter.format(value))
-        };
+        let format_price = |value: f64| self.format_drawing_price(drawing, value);
         let ticks = |from: f64, to: f64| {
             self.position_price_ticks_between(drawing.pane_index, drawing.price_scale, from, to)
                 .map_or_else(|| "—".to_string(), |ticks| position_stat_number(ticks, 0))
@@ -1894,7 +1914,7 @@ impl ChartEngine {
         } else {
             position.stop_y + label_offset
         };
-        self.push_position_label_block(
+        self.push_stat_label_block(
             drawing.pane_index,
             out,
             (center_x, target_label_y),
@@ -1902,7 +1922,7 @@ impl ChartEngine {
             reward,
             vpr,
         );
-        self.push_position_label_block(
+        self.push_stat_label_block(
             drawing.pane_index,
             out,
             (center_x, stop_label_y),
@@ -1915,7 +1935,7 @@ impl ChartEngine {
         } else {
             reward
         };
-        self.push_position_label_block(
+        self.push_stat_label_block(
             drawing.pane_index,
             out,
             (center_x, position.entry_y),
@@ -2318,7 +2338,7 @@ impl ChartEngine {
         }
     }
 
-    fn push_position_label_block(
+    fn push_stat_label_block(
         &self,
         pane_index: usize,
         out: &mut Vec<Prim>,

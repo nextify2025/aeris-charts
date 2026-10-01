@@ -18,30 +18,28 @@
 //! - `AERIS_CHARTS_PROBE_FEATURE=footprint` — finite probes start in the deterministic detailed-LOD
 //!   footprint fixture instead of the default candlestick fixture.
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_engine::{
-    crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, BrushRange, BrushStyle,
-    ChartEngine, ChartFrame, DeltaTooltipActiveRange, DeltaTooltipOptions, DrawingId, DrawingKind,
-    DrawingModifiers, DrawingPoint, DrawingTextEditKey, FootprintAggregationOptions,
+    crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, ChartEngine, ChartFrame,
+    ChartInputEvent, DeltaTooltipOptions, DrawingKind, DrawingPoint, FootprintAggregationOptions,
     FootprintBarAggregation, FootprintImbalanceOptions, FootprintSeriesOptions, FootprintTrade,
-    GestureResolver, GestureUpdateKind, InputDevice, InputModifiers, InputTarget, Marker,
-    NativePrimitiveId, PointerSample, PriceLineExtent, PriceScaleTarget,
-    PrimitiveAutoscaleContribution, SeriesKind, SplitDirection, TradeStudyOptions, WheelBehavior,
-    WheelDeltaMode, WheelIntent, WheelSample, Workspace, WorkspaceLayout,
+    Marker, PriceLineExtent, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
+    SplitDirection, TradeStudyOptions, Workspace, WorkspaceLayout,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, LineStyle, Prim, TextAlign};
 use aeris_charts_render_gpui::{
-    backend::{measure_text, text_cap_centerer, text_measurer},
+    backend::measure_text,
+    input::{cursor_style, install_text_metrics, GpuiChartInput},
     AerisViewport, GpuiChartRenderer, GpuiFrameMetrics, PreparedAerisFrame,
 };
 use gpui::{
     canvas, div, prelude::*, px, relative, rgb, size, AnyElement, App, Bounds, Context,
     CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Subscription, Window, WindowBounds, WindowOptions,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Render, ScrollHandle,
+    ScrollWheelEvent, Subscription, Task, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -416,69 +414,6 @@ fn cvd_demo_bar_trades(bars: &Bars, index: usize, trade_id: &mut u64) -> Vec<Foo
     trades
 }
 
-const CLICK_SLOP_MANHATTAN: f64 = 5.0;
-const PANE_SEPARATOR_HIT: f64 = 4.0;
-const WHEEL_LINE_HEIGHT: f32 = 32.0;
-
-/// The browser host's resolved desktop defaults. Keeping them explicit prevents a demo-only
-/// behavior from silently diverging from `packages/charts/src/impl.ts`.
-#[derive(Clone, Copy, Debug)]
-struct GestureConfig {
-    pan: bool,
-    wheel_scroll: bool,
-    wheel_zoom: bool,
-    wheel_behavior: WheelBehavior,
-    axis_dblclick_reset_time: bool,
-    axis_dblclick_reset_price: bool,
-    axis_scale_price: bool,
-    axis_scale_time: bool,
-    kinetic_mouse: bool,
-    panes_resize: bool,
-}
-
-impl Default for GestureConfig {
-    fn default() -> Self {
-        Self {
-            pan: true,
-            wheel_scroll: true,
-            wheel_zoom: true,
-            wheel_behavior: WheelBehavior::Auto,
-            axis_dblclick_reset_time: true,
-            axis_dblclick_reset_price: true,
-            axis_scale_price: true,
-            axis_scale_time: true,
-            kinetic_mouse: false,
-            panes_resize: true,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum DragMode {
-    Pan {
-        price_pan: Option<(usize, PriceScaleTarget)>,
-    },
-    TimeAxis,
-    PriceAxis {
-        pane: usize,
-        target: PriceScaleTarget,
-    },
-    PaneSeparator {
-        index: usize,
-        last_y: f64,
-    },
-    Drawing,
-    DrawingCreation,
-    DeltaTooltip,
-    CrosshairAction,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BrushableAreaState {
-    tooltip_id: NativePrimitiveId,
-    styled_range: Option<DeltaTooltipActiveRange>,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct FootprintDemoState {
     series_id: SeriesId,
@@ -590,32 +525,10 @@ struct Probe {
     plan_dirty: bool,
     fitted: bool,
     fit_on_first_frame: bool,
-    /// Newest captured drawing sample since the last painted frame. Wayland may deliver motion at
-    /// HID cadence; the platform host coalesces that stream to presentation cadence before
-    /// forwarding it to the engine-owned drawing controller.
-    pending_creation_point: Option<(f64, f64, DrawingModifiers)>,
-    /// A placement committed on pointer-down. Suppresses the release-side click selection without
-    /// the host knowing which concrete drawing kind uses press placement.
-    creation_press_committed: bool,
-    viewport_offset: (f32, f32),
-    gesture_config: GestureConfig,
-    input: GestureResolver,
-    input_target: InputTarget,
-    cursor_style: CursorStyle,
-    press_start: Option<(f64, f64)>,
-    press_moved: bool,
-    /// The drawing selected when the current press began: a selected text drawing opens its
-    /// editor on the next click (the browser host's two-step select-then-type model).
-    text_press_selected: Option<DrawingId>,
-    /// A press on the label being edited: the engine session keeps it, so its release must not
-    /// fall through to click selection (which would reopen and reset the session).
-    press_in_text_editor: bool,
-    drag: Option<DragMode>,
-    drag_started: bool,
-    kinetic_active: bool,
-    keyboard_pan_direction: i8,
-    keyboard_pan_delta: f64,
-    brushable_area: Option<BrushableAreaState>,
+    /// GPUI event translation; every interaction decision lives in the engine controller.
+    input: GpuiChartInput,
+    /// The single scheduled wake for deferred engine input work (trading-tooltip dwell).
+    input_wake: Option<Task<()>>,
     footprint: Option<FootprintDemoState>,
     source_bars: Bars,
     drawing_template: DrawingTemplate,
@@ -635,7 +548,6 @@ struct Probe {
     /// Distinct scale factors and sizes observed, to prove the propagation actually happened.
     seen_scales: Vec<f32>,
     seen_sizes: Vec<(f32, f32)>,
-    started: Instant,
 }
 
 impl Probe {
@@ -684,23 +596,8 @@ impl Probe {
             plan_dirty: true,
             fitted: false,
             fit_on_first_frame: true,
-            pending_creation_point: None,
-            creation_press_committed: false,
-            viewport_offset: (0.0, 0.0),
-            gesture_config: GestureConfig::default(),
-            input: GestureResolver::default(),
-            input_target: InputTarget::Pane,
-            cursor_style: CursorStyle::Crosshair,
-            press_start: None,
-            press_moved: false,
-            text_press_selected: None,
-            press_in_text_editor: false,
-            drag: None,
-            drag_started: false,
-            kinetic_active: false,
-            keyboard_pan_direction: 0,
-            keyboard_pan_delta: 0.0,
-            brushable_area: None,
+            input: GpuiChartInput::default(),
+            input_wake: None,
             footprint: None,
             source_bars: b,
             drawing_template: DrawingTemplate::default(),
@@ -719,7 +616,6 @@ impl Probe {
             last: GpuiFrameMetrics::default(),
             seen_scales: Vec::new(),
             seen_sizes: Vec::new(),
-            started: Instant::now(),
         }
     }
 
@@ -766,8 +662,6 @@ impl Probe {
     }
 
     fn arm_drawing(&mut self, kind: DrawingKind) {
-        self.pending_creation_point = None;
-        self.creation_press_committed = false;
         let next = (self.engine.active_drawing_tool() != Some(kind)).then_some(kind);
         let template = next.map(|kind| self.drawing_template.json(kind));
         let armed = self
@@ -779,62 +673,6 @@ impl Probe {
             |tool| format!("{} armed", tool.name()),
         );
         self.dirty = true;
-    }
-
-    /// A committed placement. Text-capable tools that request typing open the engine session.
-    fn drawing_created(&mut self, id: DrawingId) {
-        self.click_status = format!("created drawing #{id}");
-        if self.engine.drawing_requests_text_edit(id) {
-            self.engine.begin_drawing_text_edit(id, true);
-        }
-        self.dirty = true;
-    }
-
-    /// Whether a pane point lies on the label the open text session is editing.
-    fn on_text_editor(&self, pane_x: f64, y: f64) -> bool {
-        let Some((editing, _, _)) = self.engine.drawing_text_edit() else {
-            return false;
-        };
-        self.engine.drawing_text_hit_at(pane_x, y) == Some(editing)
-            || self.engine.hit_test_drawing(pane_x, y).is_some_and(|hit| {
-                hit.id == editing
-                    && self
-                        .engine
-                        .drawing(editing)
-                        .is_some_and(|drawing| drawing.kind == DrawingKind::Text)
-            })
-    }
-
-    fn place_drawing_anchor(&mut self, x: f64, y: f64, modifiers: DrawingModifiers) -> i64 {
-        if self.engine.active_drawing_tool().is_none() {
-            return 0;
-        }
-        let update = self.engine.drawing_tool_activate(x, y, modifiers);
-        if let Some(id) = update.created {
-            self.drawing_created(id);
-            return i64::from(id);
-        }
-        if update.consumed {
-            -1
-        } else {
-            0
-        }
-    }
-
-    fn finish_drawing_creation(&mut self) -> bool {
-        let update = self.engine.drawing_tool_finish();
-        let Some(id) = update.created else {
-            return false;
-        };
-        self.drawing_created(id);
-        self.dirty = true;
-        true
-    }
-
-    fn pop_drawing_anchor(&mut self) -> bool {
-        let changed = self.engine.drawing_tool_pop_anchor();
-        self.dirty |= changed;
-        changed
     }
 
     fn update_drawing_template(&mut self, mutate: impl FnOnce(&mut DrawingTemplate)) {
@@ -945,14 +783,13 @@ impl Probe {
         self.disable_footprint();
         self.disable_brushable_area();
         self.engine.convert_series_kind(0, SeriesKind::Area);
-        let tooltip_id = self
+        let attached = self
             .engine
-            .add_delta_tooltip(0, DeltaTooltipOptions::default())
-            .expect("the built-in Area series accepts the delta-tooltip interaction");
-        self.brushable_area = Some(BrushableAreaState {
-            tooltip_id,
-            styled_range: None,
-        });
+            .set_brushable_area(0, Some(DeltaTooltipOptions::default()));
+        debug_assert!(
+            attached,
+            "the built-in Area series accepts the brushable area"
+        );
         self.click_status = "series: brushable area · drag to compare".into();
         self.dirty = true;
     }
@@ -1033,72 +870,10 @@ impl Probe {
     }
 
     fn disable_brushable_area(&mut self) {
-        let Some(state) = self.brushable_area.take() else {
-            return;
-        };
-        self.engine.remove_native_primitive(state.tooltip_id);
-        self.engine.clear_area_brush_state(0);
-        if matches!(self.drag, Some(DragMode::DeltaTooltip)) {
-            self.drag = None;
+        if self.engine.is_brushable_area(0) {
+            self.engine.set_brushable_area(0, None);
+            self.dirty = true;
         }
-        self.dirty = true;
-    }
-
-    fn clear_brushable_area_selection(&mut self) -> bool {
-        let Some(state) = self.brushable_area else {
-            return false;
-        };
-        self.engine.clear_delta_tooltip(state.tooltip_id);
-        self.sync_brushable_area();
-        true
-    }
-
-    fn sync_brushable_area(&mut self) {
-        let Some(mut state) = self.brushable_area else {
-            return;
-        };
-        let range = self.engine.delta_tooltip_active_range(state.tooltip_id);
-        if state.styled_range == range {
-            return;
-        }
-        if let Some(range) = range {
-            let faded = BrushStyle {
-                line_color: Color::rgba(40, 98, 255, 51),
-                top_color: Color::rgba(40, 98, 255, 13),
-                bottom_color: Color::rgba(40, 98, 255, 0),
-                line_width: 2.0,
-            };
-            let selected = if range.positive {
-                BrushStyle {
-                    line_color: Color::rgb(4, 153, 129),
-                    top_color: Color::rgba(4, 153, 129, 102),
-                    bottom_color: Color::rgba(4, 153, 129, 0),
-                    line_width: 3.0,
-                }
-            } else {
-                BrushStyle {
-                    line_color: Color::rgb(239, 83, 80),
-                    top_color: Color::rgba(239, 83, 80, 102),
-                    bottom_color: Color::rgba(239, 83, 80, 0),
-                    line_width: 3.0,
-                }
-            };
-            let applied = self.engine.set_area_brush_state(
-                0,
-                faded,
-                vec![BrushRange {
-                    from: range.from as f64,
-                    to: range.to as f64,
-                    style: selected,
-                }],
-            );
-            debug_assert!(applied, "brush state belongs to the live Area series");
-        } else {
-            self.engine.clear_area_brush_state(0);
-        }
-        state.styled_range = range;
-        self.brushable_area = Some(state);
-        self.dirty = true;
     }
 
     fn toggle_sma(&mut self) {
@@ -1586,23 +1361,8 @@ impl Probe {
         );
     }
 
-    /// Forward the newest coalesced captured-drawing sample (at most one per painted frame).
-    /// Only a semantic change dirties the frame.
-    fn flush_pending_drawing_creation(&mut self) {
-        if let Some((x, y, modifiers)) = self.pending_creation_point.take() {
-            if self
-                .engine
-                .drawing_tool_pointer_move(x, y, modifiers, true)
-                .changed
-            {
-                self.dirty = true;
-            }
-        }
-    }
-
     /// GPUI prepaint entry: use the exact native shaper that the paint backend uses.
     fn rebuild(&mut self, width: f32, height: f32, scale_factor: f32, window: &Window) {
-        self.flush_pending_drawing_creation();
         if self.built_for == (width, height, scale_factor)
             && !self.dirty
             && !self.frame.panes.is_empty()
@@ -1610,12 +1370,7 @@ impl Probe {
             return;
         }
         let layout = self.engine.options.get().layout.clone();
-        // Live native measurement for every engine request (labels, caret prefixes, the trend
-        // prompt, device-scaled frame runs), matching the browser host's canvas measurer.
-        self.engine
-            .set_text_measure(Some(Box::new(text_measurer(window))));
-        self.engine
-            .set_text_cap_center(Some(Box::new(text_cap_centerer(window))));
+        install_text_metrics(&mut self.engine, window);
         let axis_size = self.engine.axis_font_size();
         let countdown_size = self.engine.countdown_font_size();
         self.rebuild_with_measure(
@@ -1656,312 +1411,55 @@ impl Probe {
         self.painted += 1;
     }
 
-    fn now_ms(&self) -> f64 {
-        self.started.elapsed().as_secs_f64() * 1_000.0
-    }
-
     fn needs_animation_frame(&self) -> bool {
-        self.frame_budget.is_some()
-            || self.kinetic_active
-            || self.engine.keyboard_scroll_active()
-            || self.engine.scroll_animation_active()
+        self.frame_budget.is_some() || self.engine.input_animating()
     }
 
-    fn local_position(&self, position: gpui::Point<gpui::Pixels>) -> (f64, f64, f64) {
-        let window_x: f32 = position.x.into();
-        let window_y: f32 = position.y.into();
-        let chart_x = f64::from(window_x - self.viewport_offset.0);
-        let y = f64::from(window_y - self.viewport_offset.1);
-        (chart_x, chart_x - self.engine.pane_left, y)
-    }
-
-    fn separator_at(&self, y: f64) -> Option<usize> {
-        self.engine
-            .panes
-            .iter()
-            .skip(1)
-            .position(|pane| (y - pane.top).abs() <= PANE_SEPARATOR_HIT)
-    }
-
-    fn update_cursor(&mut self, chart_x: f64, y: f64) {
-        let pane_x = chart_x - self.engine.pane_left;
-        let active_separator = matches!(self.drag, Some(DragMode::PaneSeparator { .. }));
-        let separator = self
-            .gesture_config
-            .panes_resize
-            .then(|| self.separator_at(y))
-            .flatten();
-        let separator_hover = (!active_separator).then_some(separator).flatten();
-        if self.engine.separator_hover != separator_hover {
-            self.engine.set_separator_hover(separator_hover);
-            self.dirty = true;
+    /// Common tail of every input listener: report engine requests in the status line, follow the
+    /// crosshair in the OHLC legend, schedule deferred engine work, and repaint.
+    fn after_input(&mut self, cx: &mut Context<Self>) {
+        for event in self.engine.take_input_events() {
+            self.click_status = match event {
+                ChartInputEvent::DrawingCreated(id) => format!("created drawing #{id}"),
+                ChartInputEvent::ContextMenu(menu) => match menu.context {
+                    Some(context) => format!(
+                        "context: pane {} price {:.2}",
+                        context.pane_index, context.price
+                    ),
+                    None => format!("context: {:?}", menu.region),
+                },
+                ChartInputEvent::RemoveSeries(series) => format!("remove series #{series}"),
+            };
         }
-        let drawing_cursor = (self.engine.active_drawing_tool().is_none()
-            && pane_x >= 0.0
-            && pane_x <= self.engine.pane_w
-            && y >= 0.0
-            && y <= self.engine.pane_h)
-            .then(|| self.engine.drawing_hover_at(pane_x, y))
-            .flatten()
-            .map(|(_, cursor)| match cursor {
-                "text" => CursorStyle::IBeam,
-                "pointer" => CursorStyle::PointingHand,
-                "move" => CursorStyle::ClosedHand,
-                "ns-resize" => CursorStyle::ResizeUpDown,
-                "ew-resize" => CursorStyle::ResizeLeftRight,
-                "nwse-resize" => CursorStyle::ResizeUpLeftDownRight,
-                "nesw-resize" => CursorStyle::ResizeUpRightDownLeft,
-                _ => CursorStyle::Crosshair,
-            });
-        let cursor = if self.engine.alert_create_hit_at(pane_x, y) {
-            CursorStyle::PointingHand
-        } else if active_separator || separator.is_some() {
-            CursorStyle::ResizeRow
-        } else if y > self.engine.pane_h {
-            if self.gesture_config.axis_scale_time {
-                CursorStyle::ResizeLeftRight
-            } else {
-                CursorStyle::Arrow
-            }
-        } else if chart_x < self.engine.pane_left
-            || chart_x > self.engine.pane_left + self.engine.pane_w
-        {
-            let pane = self.engine.pane_index_at_y(y);
-            let target = self.engine.price_axis_target_at(pane, pane_x);
-            if self.gesture_config.axis_scale_price
-                && target.is_some_and(|target| self.engine.price_axis_scalable(pane, target))
-            {
-                CursorStyle::ResizeUpDown
-            } else {
-                CursorStyle::Arrow
-            }
-        } else if let Some(cursor) = drawing_cursor {
-            cursor
-        } else if self.engine.hovered_series().is_some() {
-            CursorStyle::PointingHand
-        } else {
-            CursorStyle::Crosshair
-        };
-        if self.cursor_style != cursor {
-            self.cursor_style = cursor;
-            self.dirty = true;
+        for request in self.engine.take_alert_create_requests() {
+            self.click_status = format!(
+                "action requested: pane {} price {}",
+                request.pane_index, request.price
+            );
         }
-    }
-
-    fn cancel_kinetic_scroll(&mut self) {
-        self.engine.kinetic_stop();
-        if self.kinetic_active {
-            self.engine.time_scale_end_scroll();
+        match self.engine.crosshair {
+            Some((x, _)) => self.update_legend(x),
+            None => self.legend = "O —  H —  L —  C —".to_string(),
         }
-        self.kinetic_active = false;
-    }
-
-    fn begin_keyboard_pan_at(&mut self, direction: i8, step: f64, is_held: bool, now_ms: f64) {
-        debug_assert!(direction == -1 || direction == 1);
-        let delta = f64::from(direction) * step;
-        self.cancel_kinetic_scroll();
-        self.engine.cancel_scroll_animation();
-        // GPUI reports OS key repeats through `is_held`. The engine owns the repeat cadence, so
-        // an unchanged repeat must not reset velocity; only a new direction or modifier speed
-        // retunes the live session.
-        if !is_held || self.keyboard_pan_direction != direction || self.keyboard_pan_delta != delta
-        {
-            self.engine.start_keyboard_scroll(delta, now_ms);
-            self.keyboard_pan_direction = direction;
-            self.keyboard_pan_delta = delta;
-        }
-    }
-
-    fn cancel_keyboard_pan(&mut self) {
-        self.engine.cancel_keyboard_scroll();
-        self.keyboard_pan_direction = 0;
-        self.keyboard_pan_delta = 0.0;
-    }
-
-    fn begin_mouse_pan(&mut self, pane_x: f64) {
-        // Close any stale snapshot first. In particular, clicking during a previous coast must not
-        // let the next `scroll_to` reuse that coast's source start point.
-        self.engine.time_scale_end_scroll();
-        self.engine.time_scale_start_scroll(pane_x);
-        self.engine.kinetic_begin_sampling(
-            self.gesture_config.kinetic_mouse,
-            self.engine.scroll_position(),
-            self.now_ms(),
-        );
-    }
-
-    fn end_mouse_pan(&mut self) {
-        self.kinetic_active = self.gesture_config.kinetic_mouse
-            && self
-                .engine
-                .kinetic_release(self.engine.scroll_position(), self.now_ms());
-        if !self.kinetic_active {
-            self.engine.kinetic_stop();
-            self.engine.time_scale_end_scroll();
-        }
-    }
-
-    fn mark_press_moved(&mut self, pane_x: f64, y: f64) {
-        if let Some((start_x, start_y)) = self.press_start {
-            self.press_moved |=
-                (pane_x - start_x).abs() + (y - start_y).abs() >= CLICK_SLOP_MANHATTAN;
-        }
-    }
-
-    fn mouse_sample(
-        &self,
-        pane_x: f64,
-        y: f64,
-        target: InputTarget,
-        modifiers: gpui::Modifiers,
-    ) -> PointerSample {
-        PointerSample {
-            id: 1,
-            device: InputDevice::Mouse,
-            target,
-            modifiers: InputModifiers {
-                shift: modifiers.shift,
-                control: modifiers.control,
-                alt: modifiers.alt,
-                meta: modifiers.platform,
-            },
-            x: pane_x,
-            y,
-            timestamp_ms: self.now_ms(),
-            pressure: 0.5,
-            tilt_x: 0.0,
-            tilt_y: 0.0,
-        }
-    }
-
-    fn input_target_at(&self, chart_x: f64, pane_x: f64, y: f64) -> InputTarget {
-        if self.engine.alert_create_hit_at(pane_x, y) {
-            InputTarget::Alert
-        } else if self.gesture_config.panes_resize && self.separator_at(y).is_some() {
-            InputTarget::Separator
-        } else if y > self.engine.pane_h {
-            InputTarget::TimeAxis
-        } else if chart_x < self.engine.pane_left
-            || chart_x > self.engine.pane_left + self.engine.pane_w
-        {
-            InputTarget::PriceAxis
-        } else if self.engine.active_drawing_tool().is_some()
-            || self.engine.hit_test_drawing(pane_x, y).is_some()
-        {
-            InputTarget::Drawing
-        } else {
-            InputTarget::Pane
-        }
-    }
-
-    /// Browser-host parity (`clear_hover`): release every hover promotion together so the
-    /// series bump, drawing promotion, and text hover ring can never desync across hosts.
-    fn clear_hover(&mut self) {
-        self.engine.set_hovered_series(None);
-        self.engine.set_hovered_text(None);
-        self.engine.set_hovered_drawing(None);
-    }
-
-    fn update_crosshair(&mut self, pane_x: f64, y: f64) {
-        if pane_x >= 0.0 && pane_x <= self.engine.pane_w && y >= 0.0 && y <= self.engine.pane_h {
-            self.engine.crosshair = Some((pane_x, y));
-            // Browser-host parity (wasm `hover_at`): a drawing hit wins over series hits so
-            // overlaps stay selectable, clears the series bump, and drives generic hover
-            // promotion plus the text-only hover ring. Hit testing stays on stable order so
-            // promotion cannot oscillate hover.
-            // Engine-owned arbitration: a trend label or its `+ Add text` prompt wins before
-            // the drawing body, so moving onto the label keeps the prompt clickable.
-            if self.engine.update_drawing_hover(pane_x, y).is_some() {
-                self.engine.set_hovered_series(None);
-            } else {
-                let hovered = self.engine.hit_test_series(pane_x, y);
-                self.engine.set_hovered_series(hovered);
-            }
-        } else {
-            self.engine.crosshair = None;
-            self.clear_hover();
-        }
+        self.input_wake = self.input.wake_delay(&self.engine).map(|delay| {
+            cx.spawn(async move |probe, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = probe.update(cx, |probe, cx| {
+                    probe.input_wake = None;
+                    probe.dirty = true;
+                    cx.notify();
+                });
+            })
+        });
         self.dirty = true;
-    }
-
-    fn update_pointer_feedback(&mut self, chart_x: f64, pane_x: f64, y: f64) {
-        let over_separator = self.gesture_config.panes_resize && self.separator_at(y).is_some();
-        if matches!(self.drag, Some(DragMode::PaneSeparator { .. })) || over_separator {
-            self.engine.crosshair = None;
-            self.clear_hover();
-            self.dirty = true;
-        } else {
-            // Match the browser host: refresh the hit-test first, then derive the cursor from the
-            // same move so a candle/series immediately exposes its click affordance.
-            self.update_crosshair(pane_x, y);
-        }
-        self.update_cursor(chart_x, y);
-    }
-
-    fn update_crosshair_modifier(&mut self, control: bool, platform: bool) {
-        let enabled = (control || platform)
-            && (self.engine.active_drawing_tool().is_some() || self.engine.drawing_drag_active());
-        if self.engine.crosshair_ohlc_magnet != enabled {
-            self.engine.crosshair_ohlc_magnet = enabled;
-            self.dirty = true;
-        }
-    }
-
-    fn clear_pointer_state(&mut self) {
-        self.input.cancel();
-        match self.drag.take() {
-            Some(DragMode::Pan { price_pan }) => {
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_end_scroll(pane, target);
-                }
-                if self.drag_started {
-                    self.engine.time_scale_end_scroll();
-                }
-            }
-            Some(DragMode::TimeAxis) => self.engine.time_axis_end_scale(),
-            Some(DragMode::PriceAxis { pane, target }) => {
-                self.engine.price_axis_end_scale(pane, target);
-            }
-            Some(DragMode::Drawing) => self.engine.drawing_drag_end(),
-            Some(DragMode::DrawingCreation) => {
-                self.engine.cancel_drawing_creation();
-                self.pending_creation_point = None;
-            }
-            Some(
-                DragMode::PaneSeparator { .. } | DragMode::DeltaTooltip | DragMode::CrosshairAction,
-            )
-            | None => {}
-        }
-        self.engine.delta_tooltip_leave();
-        self.sync_brushable_area();
-        self.cancel_kinetic_scroll();
-        self.drag_started = false;
-        self.press_start = None;
-        self.press_moved = false;
-        self.engine.crosshair_ohlc_magnet = false;
-        self.engine.crosshair = None;
-        self.clear_hover();
-        self.engine.set_separator_hover(None);
-        self.legend = "O —  H —  L —  C —".to_string();
-        self.cursor_style = CursorStyle::Crosshair;
-        self.dirty = true;
+        cx.notify();
     }
 
     fn on_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
         if !*hovered {
-            self.clear_pointer_state();
-            cx.notify();
+            self.engine.input_pointer_leave();
+            self.after_input(cx);
         }
-    }
-
-    fn on_modifiers_changed(
-        &mut self,
-        event: &ModifiersChangedEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_crosshair_modifier(event.control, event.platform);
-        cx.notify();
     }
 
     fn on_mouse_down(
@@ -1973,157 +1471,18 @@ impl Probe {
         if let Some(focus) = &self.focus_handle {
             window.focus(focus, cx);
         }
-        self.cancel_kinetic_scroll();
-        self.cancel_keyboard_pan();
-        // Recover defensively from a stale scroll snapshot left by an interrupted host gesture.
-        self.engine.time_scale_end_scroll();
-        self.engine.cancel_scroll_animation();
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        // Typing mode behaves like the browser's focused editor: a press on the edited label
-        // stays in the session, any other press commits it (blur) and proceeds normally.
-        self.press_in_text_editor = self.on_text_editor(pane_x, y);
-        if self.press_in_text_editor {
-            // Like the browser editor: a click inside the label places the caret there.
-            if self.engine.drawing_text_edit_caret_at(pane_x, y) {
-                self.dirty = true;
-            }
-            cx.notify();
-            return;
-        }
-        if self.engine.commit_drawing_text_edit() {
-            self.dirty = true;
-        }
-        self.text_press_selected = self.engine.selected_drawing();
-        self.input_target = self.input_target_at(chart_x, pane_x, y);
-        let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
-        self.input.pointer_down(sample);
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        let pane = self.engine.pane_index_at_y(y);
-        self.update_cursor(chart_x, y);
-        self.press_start = Some((pane_x, y));
-        self.press_moved = false;
+        self.input.mouse_down(&mut self.engine, event);
+        self.after_input(cx);
+    }
 
-        if self.input_target == InputTarget::Alert {
-            self.drag = Some(DragMode::CrosshairAction);
-            cx.notify();
-            return;
-        }
-
-        if event.click_count >= 2 && self.engine.drawing_tool_sequence_active() {
-            self.engine.drawing_tool_activate(
-                pane_x,
-                y,
-                DrawingModifiers {
-                    magnet: event.modifiers.control || event.modifiers.platform,
-                    straighten: event.modifiers.shift,
-                },
-            );
-            self.finish_drawing_creation();
-            self.press_moved = true;
-            self.dirty = true;
-            cx.notify();
-            return;
-        }
-
-        if self.engine.active_drawing_tool().is_some() {
-            let update = self.engine.drawing_tool_pointer_down(
-                pane_x,
-                y,
-                DrawingModifiers {
-                    magnet: event.modifiers.control || event.modifiers.platform,
-                    straighten: event.modifiers.shift,
-                },
-            );
-            self.creation_press_committed = update.created.is_some();
-            if let Some(id) = update.created {
-                self.drawing_created(id);
-            }
-            if update.pointer_capture {
-                self.drag = Some(DragMode::DrawingCreation);
-            }
-            self.update_crosshair(pane_x, y);
-            self.dirty |= update.changed;
-            cx.notify();
-            return;
-        }
-
-        if event.click_count >= 2 {
-            if chart_x >= self.engine.pane_left
-                && chart_x <= self.engine.pane_left + self.engine.pane_w
-                && (0.0..=self.engine.pane_h).contains(&y)
-                && self.clear_brushable_area_selection()
-            {
-                self.click_status = "brush selection cleared".into();
-            } else if y > self.engine.pane_h && self.gesture_config.axis_dblclick_reset_time {
-                self.engine.reset_time_scale();
-            } else if self.gesture_config.axis_dblclick_reset_price {
-                if let Some(target) = self.engine.price_axis_target_at(pane, pane_x) {
-                    self.engine.reset_price_scale(pane, target);
-                }
-            }
-            self.press_moved = true;
-            self.dirty = true;
-            cx.notify();
-            return;
-        }
-
-        self.drag = if let Some(index) = self
-            .gesture_config
-            .panes_resize
-            .then(|| self.separator_at(y))
-            .flatten()
-        {
-            self.engine.set_separator_hover(None);
-            Some(DragMode::PaneSeparator { index, last_y: y })
-        } else if y > self.engine.pane_h {
-            if self.gesture_config.axis_scale_time {
-                self.engine.time_axis_start_scale(pane_x);
-                Some(DragMode::TimeAxis)
-            } else {
-                None
-            }
-        } else if chart_x < self.engine.pane_left
-            || chart_x > self.engine.pane_left + self.engine.pane_w
-        {
-            if let Some(target) = self.engine.price_axis_target_at(pane, pane_x) {
-                if self.gesture_config.axis_scale_price
-                    && self.engine.price_axis_scalable(pane, target)
-                {
-                    self.engine.price_axis_start_scale(pane, target, y);
-                    Some(DragMode::PriceAxis { pane, target })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else if self.engine.active_drawing_tool().is_some() {
-            None
-        } else if self.engine.drawing_drag_start_at(pane_x, y) {
-            Some(DragMode::Drawing)
-        } else if self
-            .engine
-            .delta_tooltip_mouse_down_with_shift(pane_x, event.modifiers.shift)
-        {
-            self.sync_brushable_area();
-            Some(DragMode::DeltaTooltip)
-        } else if self.gesture_config.pan {
-            let price_pan = self
-                .engine
-                .price_pan_target_at(pane, pane_x, y)
-                .map(|target| (pane, target));
-            Some(DragMode::Pan { price_pan })
-        } else {
-            None
-        };
-        if matches!(self.drag, Some(DragMode::PaneSeparator { .. })) {
-            self.engine.crosshair = None;
-            self.clear_hover();
-            self.dirty = true;
-        } else {
-            self.update_crosshair(pane_x, y);
-        }
-        cx.notify();
+    fn on_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.context_menu(&mut self.engine, event);
+        self.after_input(cx);
     }
 
     fn on_mouse_move(
@@ -2132,234 +1491,13 @@ impl Probe {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
-        let update = self.input.pointer_move(sample);
-        if self.engine.delta_tooltip_mouse_move(pane_x) {
-            self.sync_brushable_area();
-            self.dirty = true;
-        }
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        if event.dragging() {
-            self.mark_press_moved(pane_x, y);
-        }
-        match self.drag {
-            Some(DragMode::Pan { price_pan })
-                if event.dragging() && update.kind == GestureUpdateKind::DragStarted =>
-            {
-                // Open at the 5 px crossing sample; movement starts on the following sample.
-                self.begin_mouse_pan(pane_x);
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_start_scroll(pane, target, y);
-                }
-                self.drag = Some(DragMode::Pan { price_pan });
-                self.drag_started = true;
-            }
-            Some(DragMode::Pan { price_pan })
-                if event.dragging()
-                    && self.drag_started
-                    && update.kind == GestureUpdateKind::DragMoved =>
-            {
-                self.engine.time_scale_scroll_to(pane_x);
-                self.engine
-                    .kinetic_add_sample(self.engine.scroll_position(), self.now_ms());
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_scroll_to(pane, target, y);
-                }
-            }
-            Some(DragMode::TimeAxis)
-                if event.dragging()
-                    && matches!(
-                        update.kind,
-                        GestureUpdateKind::DragStarted | GestureUpdateKind::DragMoved
-                    ) =>
-            {
-                self.engine.time_axis_scale_to(pane_x);
-                self.drag_started = true;
-            }
-            Some(DragMode::PriceAxis { pane, target })
-                if event.dragging()
-                    && matches!(
-                        update.kind,
-                        GestureUpdateKind::DragStarted | GestureUpdateKind::DragMoved
-                    ) =>
-            {
-                self.engine.price_axis_scale_to(pane, target, y);
-                self.drag_started = true;
-            }
-            Some(DragMode::PaneSeparator { index, last_y })
-                if event.dragging()
-                    && matches!(
-                        update.kind,
-                        GestureUpdateKind::DragStarted | GestureUpdateKind::DragMoved
-                    ) =>
-            {
-                self.engine.drag_pane_separator(index, y - last_y);
-                self.drag = Some(DragMode::PaneSeparator { index, last_y: y });
-                self.drag_started = true;
-                self.dirty = true;
-            }
-            Some(DragMode::Drawing) if event.dragging() => {
-                self.engine.drawing_drag_to(
-                    pane_x,
-                    y,
-                    DrawingModifiers {
-                        magnet: event.modifiers.control || event.modifiers.platform,
-                        straighten: event.modifiers.shift,
-                    },
-                );
-            }
-            Some(DragMode::DrawingCreation) if event.dragging() => {
-                // Keep only the newest captured sample; `rebuild` forwards it once per painted
-                // frame so native high-Hz pointer delivery does not perturb canonical tool math.
-                self.pending_creation_point = Some((
-                    pane_x,
-                    y,
-                    DrawingModifiers {
-                        magnet: event.modifiers.control || event.modifiers.platform,
-                        straighten: event.modifiers.shift,
-                    },
-                ));
-            }
-            Some(DragMode::DeltaTooltip) => {}
-            Some(DragMode::CrosshairAction) => {}
-            _ => {
-                if self.engine.active_drawing_tool().is_some() {
-                    let update = self.engine.drawing_tool_pointer_move(
-                        pane_x,
-                        y,
-                        DrawingModifiers {
-                            magnet: event.modifiers.control || event.modifiers.platform,
-                            straighten: event.modifiers.shift,
-                        },
-                        event.dragging(),
-                    );
-                    self.dirty |= update.changed;
-                }
-            }
-        }
-        if chart_x >= self.engine.pane_left
-            && chart_x <= self.engine.pane_left + self.engine.pane_w
-            && (0.0..=self.engine.pane_h).contains(&y)
-        {
-            self.update_legend(pane_x);
-        } else {
-            self.legend = "O —  H —  L —  C —".to_string();
-        }
-        self.update_pointer_feedback(chart_x, pane_x, y);
-        cx.notify();
+        self.input.mouse_move(&mut self.engine, event);
+        self.after_input(cx);
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.press_in_text_editor) {
-            return;
-        }
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
-        self.input.pointer_up(sample);
-        if self.engine.delta_tooltip_mouse_up() {
-            self.sync_brushable_area();
-            self.dirty = true;
-        }
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        self.mark_press_moved(pane_x, y);
-        let moved = self.press_moved;
-        let committed_on_press = std::mem::take(&mut self.creation_press_committed);
-        self.press_start = None;
-        self.press_moved = false;
-        let select_click = match self.drag.take() {
-            Some(DragMode::CrosshairAction) => {
-                if !moved && self.engine.activate_alert_create_at(pane_x, y) {
-                    for request in self.engine.take_alert_create_requests() {
-                        self.click_status = format!(
-                            "action requested: pane {} price {}",
-                            request.pane_index, request.price
-                        );
-                    }
-                }
-                false
-            }
-            Some(DragMode::Pan { price_pan }) => {
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_end_scroll(pane, target);
-                }
-                if self.drag_started {
-                    self.end_mouse_pan();
-                }
-                !moved
-            }
-            Some(DragMode::TimeAxis) => {
-                self.engine.time_axis_end_scale();
-                false
-            }
-            Some(DragMode::PriceAxis { pane, target }) => {
-                self.engine.price_axis_end_scale(pane, target);
-                false
-            }
-            Some(DragMode::PaneSeparator { .. }) => false,
-            Some(DragMode::Drawing) => {
-                self.engine.drawing_drag_end();
-                false
-            }
-            Some(DragMode::DrawingCreation) => {
-                let modifiers = DrawingModifiers {
-                    magnet: event.modifiers.control || event.modifiers.platform,
-                    straighten: event.modifiers.shift,
-                };
-                // Flush the newest coalesced move first. The controller itself then owns the exact
-                // release endpoint, so browser and native hosts cannot disagree on the terminal
-                // freehand point because of platform event cadence.
-                self.flush_pending_drawing_creation();
-                let update = self.engine.drawing_tool_pointer_up(pane_x, y, modifiers);
-                if let Some(id) = update.created {
-                    self.drawing_created(id);
-                }
-                false
-            }
-            Some(DragMode::DeltaTooltip) => false,
-            None if committed_on_press => false,
-            None if self.engine.active_drawing_tool().is_some() => {
-                if !moved {
-                    self.place_drawing_anchor(
-                        pane_x,
-                        y,
-                        DrawingModifiers {
-                            magnet: event.modifiers.control || event.modifiers.platform,
-                            straighten: event.modifiers.shift,
-                        },
-                    );
-                }
-                false
-            }
-            None => !moved,
-        };
-        self.drag_started = false;
-        if select_click {
-            let selected = self.engine.hit_test_series(pane_x, y);
-            self.engine.set_selected_series(selected);
-            // Browser-host parity: a trend label (or its `+ Add text` prompt) opens typing on the
-            // first click; a text drawing opens it when empty or already selected at press.
-            if let Some(id) = self.engine.drawing_text_hit_at(pane_x, y) {
-                self.engine.set_selected_drawing(Some(id));
-                self.engine.begin_drawing_text_edit(id, true);
-            } else if self.engine.select_drawing_at(pane_x, y) {
-                if let Some(drawing) = self
-                    .engine
-                    .selected_drawing()
-                    .and_then(|id| self.engine.drawing(id))
-                    .filter(|drawing| drawing.kind == DrawingKind::Text)
-                {
-                    let id = drawing.id;
-                    if drawing.text.trim().is_empty() || self.text_press_selected == Some(id) {
-                        self.engine.begin_drawing_text_edit(id, true);
-                    }
-                }
-            }
-            self.update_legend(pane_x);
-            self.click_status = format!("click x={pane_x:.1} y={y:.1}");
-        }
-        self.update_pointer_feedback(chart_x, pane_x, y);
-        cx.notify();
+        self.input.mouse_up(&mut self.engine, event);
+        self.after_input(cx);
     }
 
     fn on_scroll_wheel(
@@ -2368,278 +1506,40 @@ impl Probe {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        // GPUI's Windows backend reports wheel-up as a positive line delta. The browser turns
-        // wheel-up's negative DOM deltaY into the same positive normalized value. Convert lines
-        // with the browser's 32px adjustment and do not reverse either axis a second time.
-        let delta = event.delta.pixel_delta(px(WHEEL_LINE_HEIGHT));
-        let dx: f32 = delta.x.into();
-        let dy: f32 = delta.y.into();
-        let normalized_x = f64::from(dx) / 100.0;
-        let normalized_y = f64::from(dy) / 100.0;
-        let delta_mode = if matches!(event.delta, ScrollDelta::Pixels(_)) {
-            WheelDeltaMode::Pixel
-        } else {
-            WheelDeltaMode::Line
-        };
-        let intent = WheelSample {
-            x: pane_x,
-            y,
-            delta_x: normalized_x,
-            delta_y: normalized_y,
-            delta_mode,
-            modifiers: InputModifiers {
-                shift: event.modifiers.shift,
-                control: event.modifiers.control,
-                alt: event.modifiers.alt,
-                meta: event.modifiers.platform,
-            },
-            timestamp_ms: self.now_ms(),
+        if self.input.scroll_wheel(&mut self.engine, event) {
+            cx.stop_propagation();
+            self.after_input(cx);
         }
-        .intent(self.gesture_config.wheel_behavior);
-        if matches!(intent, WheelIntent::Zoom | WheelIntent::PanAndZoom)
-            && normalized_y != 0.0
-            && self.gesture_config.wheel_zoom
-        {
-            let zoom = aeris_charts_engine::wheel_zoom_scale(normalized_y);
-            let pane = self.engine.pane_index_at_y(y);
-            let price_target = self.engine.price_axis_target_at(pane, pane_x);
-            if self.gesture_config.wheel_behavior == WheelBehavior::Zoom {
-                if let Some(price_target) = price_target {
-                    self.engine
-                        .price_axis_wheel_zoom(pane, price_target, y, zoom);
-                } else {
-                    self.engine.time_scale_zoom(pane_x, zoom);
-                }
-            } else {
-                // Auto mode implements the reference-informed behavior: every surface targets the time scale and
-                // modifiers do not change routing. Focused Ctrl zoom remains an explicit-mode
-                // Aeris extension.
-                if self.gesture_config.wheel_behavior == WheelBehavior::Zoom
-                    && event.modifiers.control
-                {
-                    self.engine.time_scale_zoom_focused(pane_x, zoom);
-                } else {
-                    self.engine.time_scale_zoom(pane_x, zoom);
-                }
-            }
-        }
-        let pan_delta = if normalized_x.abs() >= normalized_y.abs() {
-            normalized_x
-        } else {
-            -normalized_y
-        };
-        if matches!(intent, WheelIntent::Pan | WheelIntent::PanAndZoom)
-            && pan_delta != 0.0
-            && self.gesture_config.wheel_scroll
-        {
-            self.engine.time_scale_start_scroll(0.0);
-            self.engine
-                .time_scale_scroll_to(aeris_charts_engine::WHEEL_SCROLL_PX_PER_DELTA * pan_delta);
-            self.engine.time_scale_end_scroll();
-        }
-        self.update_pointer_feedback(chart_x, pane_x, y);
-        cx.stop_propagation();
-        cx.notify();
     }
 
     fn on_pinch(&mut self, event: &PinchEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        let intent = WheelSample {
-            x: pane_x,
-            y,
-            delta_y: f64::from(event.delta),
-            modifiers: InputModifiers {
-                control: true,
-                ..InputModifiers::default()
-            },
-            timestamp_ms: self.now_ms(),
-            ..WheelSample::default()
-        }
-        .intent(self.gesture_config.wheel_behavior);
-        if intent == WheelIntent::Zoom && self.gesture_config.wheel_zoom {
-            self.engine.time_scale_zoom(
-                pane_x,
-                aeris_charts_engine::pinch_zoom_scale(f64::from(event.delta)),
-            );
-            self.update_pointer_feedback(chart_x, pane_x, y);
+        if self.input.pinch(&mut self.engine, event) {
             cx.stop_propagation();
-            cx.notify();
+            self.after_input(cx);
         }
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.modifiers_changed(&mut self.engine, event);
+        self.after_input(cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.engine.drawing_text_edit().is_some() {
-            let modifiers = event.keystroke.modifiers;
-            let command = (modifiers.control || modifiers.platform) && !modifiers.alt;
-            match event.keystroke.key.as_str() {
-                // Clipboard shortcuts, like the browser editor: paste flattens to one line.
-                "v" if command => {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                        self.engine.drawing_text_edit_insert(&text);
-                    }
-                }
-                "c" | "x" if command => {
-                    if let Some(selected) = self.engine.drawing_text_edit_selection() {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                            selected.to_string(),
-                        ));
-                        if event.keystroke.key == "x" {
-                            self.engine
-                                .drawing_text_edit_key(DrawingTextEditKey::Backspace, false);
-                        }
-                    }
-                }
-                _ => self.on_text_edit_key(event),
-            }
-            self.dirty = true;
+        if self.input.key_down(&mut self.engine, event, cx) {
             cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        let step = if event.keystroke.modifiers.control || event.keystroke.modifiers.shift {
-            10.0
-        } else {
-            1.0
-        };
-        let center = self.engine.pane_w / 2.0;
-        let handled = match event.keystroke.key.as_str() {
-            "left" => {
-                self.begin_keyboard_pan_at(-1, step, event.is_held, self.now_ms());
-                true
-            }
-            "right" => {
-                self.begin_keyboard_pan_at(1, step, event.is_held, self.now_ms());
-                true
-            }
-            "+" | "=" if self.gesture_config.wheel_zoom => {
-                self.engine.time_scale_zoom(center, 0.5);
-                true
-            }
-            "-" | "_" if self.gesture_config.wheel_zoom => {
-                self.engine.time_scale_zoom(center, -0.5);
-                true
-            }
-            "home" => {
-                self.engine.fit_content();
-                true
-            }
-            "enter" => self.finish_drawing_creation(),
-            "backspace"
-                if self.engine.drawing_tool_sequence_active()
-                    && self.engine.drawing_create_active() =>
-            {
-                self.pop_drawing_anchor()
-            }
-            "delete" | "backspace" => self.engine.remove_selected_drawing(),
-            "escape" => {
-                self.clear_brushable_area_selection();
-                self.engine.cancel_drawing_tool();
-                self.pending_creation_point = None;
-                self.creation_press_committed = false;
-                self.engine.set_selected_drawing(None);
-                self.engine.crosshair = None;
-                self.clear_hover();
-                true
-            }
-            _ => false,
-        };
-        if handled {
-            // Browser keyboard gestures stop any wheel/mouse coast and close its saved scroll
-            // snapshot. Left/Right keeps its separate engine-owned velocity session until key-up.
-            self.cancel_kinetic_scroll();
-            self.dirty = true;
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
-    /// Typing mode owns the keyboard: editing keys and committed characters go to the engine
-    /// session; chart and workspace shortcuts stay inert until the session ends.
-    fn on_text_edit_key(&mut self, event: &KeyDownEvent) {
-        let keystroke = &event.keystroke;
-        let modifiers = keystroke.modifiers;
-        // Word motion follows the platform convention: Ctrl on Windows/Linux, Option on macOS;
-        // Cmd+arrows jump to the line ends on macOS.
-        let word = if cfg!(target_os = "macos") {
-            modifiers.alt
-        } else {
-            modifiers.control
-        };
-        let line = cfg!(target_os = "macos") && modifiers.platform;
-        let key = match keystroke.key.as_str() {
-            "enter" => {
-                self.engine.commit_drawing_text_edit();
-                return;
-            }
-            "escape" => {
-                self.engine.cancel_drawing_text_edit();
-                return;
-            }
-            "a" if (modifiers.control || modifiers.platform) && !modifiers.alt => {
-                self.engine.drawing_text_edit_select_all();
-                return;
-            }
-            "backspace" if word => Some(DrawingTextEditKey::DeleteWordBackward),
-            "backspace" => Some(DrawingTextEditKey::Backspace),
-            "delete" if word => Some(DrawingTextEditKey::DeleteWordForward),
-            "delete" => Some(DrawingTextEditKey::Delete),
-            "left" if line => Some(DrawingTextEditKey::Home),
-            "right" if line => Some(DrawingTextEditKey::End),
-            "left" if word => Some(DrawingTextEditKey::WordLeft),
-            "right" if word => Some(DrawingTextEditKey::WordRight),
-            "left" => Some(DrawingTextEditKey::Left),
-            "right" => Some(DrawingTextEditKey::Right),
-            "home" | "up" => Some(DrawingTextEditKey::Home),
-            "end" | "down" => Some(DrawingTextEditKey::End),
-            _ => None,
-        };
-        if let Some(key) = key {
-            self.engine.drawing_text_edit_key(key, modifiers.shift);
-        } else if let Some(text) = keystroke.key_char.as_deref().filter(|_| {
-            // AltGr characters arrive with Ctrl+Alt on Windows; GPUI marks them as text.
-            event.prefer_character_input
-                || (!keystroke.modifiers.control && !keystroke.modifiers.platform)
-        }) {
-            self.engine.drawing_text_edit_insert(text);
+            self.after_input(cx);
         }
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let direction = match event.keystroke.key.as_str() {
-            "left" => -1,
-            "right" => 1,
-            _ => return,
-        };
-        if self.keyboard_pan_direction != direction {
-            return;
-        }
-        self.cancel_keyboard_pan();
-        self.dirty = true;
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn tick_animations(&mut self) {
-        let now = self.now_ms();
-        if self.kinetic_active {
-            if self.engine.kinetic_finished(now) {
-                self.engine.time_scale_end_scroll();
-                self.engine.kinetic_stop();
-                self.kinetic_active = false;
-            } else if let Some(position) = self.engine.kinetic_position(now) {
-                self.engine.scroll_to_position(position);
-                self.dirty = true;
-            }
-        }
-        if self.engine.keyboard_scroll_active() {
-            self.engine.keyboard_scroll_tick(now);
-            self.dirty = true;
-        }
-        if self.engine.scroll_animation_active() {
-            self.engine.scroll_animation_tick(now);
-            self.dirty = true;
+        if self.input.key_up(&mut self.engine, event) {
+            cx.stop_propagation();
+            self.after_input(cx);
         }
     }
 }
@@ -2726,12 +1626,13 @@ impl Render for Probe {
             .relative()
             .bg(background)
             .size_full()
-            .cursor(self.cursor_style)
+            .cursor(cursor_style(self.engine.input_cursor()))
             .id("aeris_charts-chart-root")
             .track_focus(&focus)
             .key_context("AerisGpuiChart")
             .on_hover(cx.listener(Self::on_hover))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -2745,8 +1646,6 @@ impl Render for Probe {
                     move |bounds: Bounds<gpui::Pixels>, window, cx| {
                         let w: f32 = bounds.size.width.into();
                         let h: f32 = bounds.size.height.into();
-                        let offset_x: f32 = bounds.origin.x.into();
-                        let offset_y: f32 = bounds.origin.y.into();
                         let scale_factor = window.scale_factor();
                         prepaint_entity.update(cx, |probe: &mut Probe, _| {
                             if probe
@@ -2755,8 +1654,8 @@ impl Render for Probe {
                             {
                                 return;
                             }
-                            probe.viewport_offset = (offset_x, offset_y);
-                            probe.tick_animations();
+                            probe.input.set_canvas_bounds(bounds);
+                            probe.dirty |= probe.input.prepare_frame(&mut probe.engine);
                             probe.rebuild(w, h, scale_factor, window);
                         });
                         bounds
@@ -3449,8 +2348,8 @@ impl InteractiveDemo {
             DemoAction::WatermarkText => self.update_root(cx, |p| { let current = &p.engine.options.get().watermark.text; let text = if current == "Aeris" { "aeris-charts" } else { "Aeris" }; p.engine.options.apply_str(&format!(r#"{{"watermark":{{"text":"{text}"}}}}"#)).unwrap(); }),
             DemoAction::WatermarkColor => self.update_root(cx, |p| { let current = &p.engine.options.get().watermark.color; let color = if current == "#b0b8c480" { "#2962ff80" } else { "#b0b8c480" }; p.engine.options.apply_str(&format!(r#"{{"watermark":{{"color":"{color}"}}}}"#)).unwrap(); }),
             DemoAction::WatermarkSize => self.update_root(cx, |p| { let current = p.engine.options.get().watermark.font_size; let size = if current >= 160.0 { 16.0 } else { current + 4.0 }; p.engine.options.apply_str(&format!(r#"{{"watermark":{{"fontSize":{size}}}}}"#)).unwrap(); }),
-            DemoAction::AxisScaling => self.update_root(cx, |p| { p.gesture_config.axis_scale_price = !p.gesture_config.axis_scale_price; p.gesture_config.axis_scale_time = p.gesture_config.axis_scale_price; }),
-            DemoAction::Kinetic => self.update_root(cx, |p| p.gesture_config.kinetic_mouse = !p.gesture_config.kinetic_mouse),
+            DemoAction::AxisScaling => self.update_root(cx, |p| { let mut options = p.engine.interaction_options(); options.axis_scale_price = !options.axis_scale_price; options.axis_scale_time = options.axis_scale_price; p.engine.set_interaction_options(options); }),
+            DemoAction::Kinetic => self.update_root(cx, |p| { let mut options = p.engine.interaction_options(); options.kinetic_mouse = !options.kinetic_mouse; p.engine.set_interaction_options(options); }),
             DemoAction::Reset => self.update_root(cx, |p| { p.engine.reset_time_scale(); p.engine.fit_content(); for pane in 0..p.engine.panes.len() { p.engine.set_price_scale_auto_scale_for(pane, PriceScaleTarget::Left, true); p.engine.set_price_scale_auto_scale_for(pane, PriceScaleTarget::Right, true); } }),
             DemoAction::Fixture(index) => self.update_root(cx, move |p| match index {
                 0 => p.fixtures.day_bands = !p.fixtures.day_bands,
@@ -3489,11 +2388,11 @@ impl InteractiveDemo {
                     .first()
                     .is_some_and(|series| series.kind == kind)
                     && probe.footprint.is_none()
-                    && (kind != SeriesKind::Area || probe.brushable_area.is_none())
+                    && (kind != SeriesKind::Area || !probe.engine.is_brushable_area(0))
             }),
             DemoAction::BrushableArea => active
                 .as_ref()
-                .is_some_and(|chart| chart.read(cx).brushable_area.is_some()),
+                .is_some_and(|chart| chart.read(cx).engine.is_brushable_area(0)),
             DemoAction::Footprint => active
                 .as_ref()
                 .is_some_and(|chart| chart.read(cx).footprint.is_some()),
@@ -3592,10 +2491,10 @@ impl InteractiveDemo {
                 .is_some_and(|chart| chart.read(cx).engine.options.get().watermark.visible),
             DemoAction::AxisScaling => root
                 .as_ref()
-                .is_some_and(|chart| chart.read(cx).gesture_config.axis_scale_price),
+                .is_some_and(|chart| chart.read(cx).engine.interaction_options().axis_scale_price),
             DemoAction::Kinetic => root
                 .as_ref()
-                .is_some_and(|chart| chart.read(cx).gesture_config.kinetic_mouse),
+                .is_some_and(|chart| chart.read(cx).engine.interaction_options().kinetic_mouse),
             DemoAction::Fixture(index) => root.as_ref().is_some_and(|chart| {
                 let fixtures = chart.read(cx).fixtures;
                 match index {
@@ -4042,6 +2941,12 @@ impl Render for InteractiveDemo {
                     b("text", DemoAction::Drawing(DrawingKind::Text)),
                     b("path", DemoAction::Drawing(DrawingKind::Path)),
                     b("brush", DemoAction::Drawing(DrawingKind::Brush)),
+                    b("price range", DemoAction::Drawing(DrawingKind::PriceRange)),
+                    b("date range", DemoAction::Drawing(DrawingKind::DateRange)),
+                    b(
+                        "date & price",
+                        DemoAction::Drawing(DrawingKind::DateAndPriceRange),
+                    ),
                     b("clear", DemoAction::ClearDrawings),
                 ],
             ),
@@ -4467,9 +3372,41 @@ fn main() {
     });
 }
 
+/// Place one click anchor with the armed tool: the id of a committed drawing, `-1` when the click
+/// was consumed without committing, `0` when no tool is armed.
+#[cfg(test)]
+fn place_drawing_anchor(
+    probe: &mut Probe,
+    x: f64,
+    y: f64,
+    modifiers: aeris_charts_engine::DrawingModifiers,
+) -> i64 {
+    if probe.engine.active_drawing_tool().is_none() {
+        return 0;
+    }
+    let update = probe.engine.drawing_tool_activate(x, y, modifiers);
+    match update.created {
+        Some(id) => i64::from(id),
+        None if update.consumed => -1,
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeris_charts_engine::{
+        ChartCursor, ChartKey, DrawingModifiers, InputModifiers, PointerInput,
+    };
+    use aeris_charts_render_gpui::input::text_edit_key;
+
+    fn pointer(x: f64, y: f64) -> PointerInput {
+        PointerInput {
+            x,
+            y,
+            ..PointerInput::default()
+        }
+    }
 
     /// Typing mode is engine-owned in GPUI: a new text drawing opens the session, committed
     /// characters and editing keys reach it, shortcuts never type, and Enter commits.
@@ -4507,22 +3444,25 @@ mod tests {
             |text, _bold| text.chars().count() as f64 * 7.0,
             |text, _bold| text.chars().count() as f64 * 6.0,
         );
-        probe.drawing_created(id);
+        assert!(probe.engine.begin_drawing_text_edit(id, true));
         assert_eq!(probe.engine.editing_drawing(), Some(id));
 
         for c in ["H", "i", "!"] {
-            probe.on_text_edit_key(&key(c, Some(c), Modifiers::default()));
+            text_edit_key(&mut probe.engine, &key(c, Some(c), Modifiers::default()));
         }
-        probe.on_text_edit_key(&key("left", None, Modifiers::default()));
-        probe.on_text_edit_key(&key("backspace", None, Modifiers::default()));
+        text_edit_key(&mut probe.engine, &key("left", None, Modifiers::default()));
+        text_edit_key(
+            &mut probe.engine,
+            &key("backspace", None, Modifiers::default()),
+        );
         let ctrl = Modifiers {
             control: true,
             ..Modifiers::default()
         };
-        probe.on_text_edit_key(&key("z", Some("z"), ctrl));
+        text_edit_key(&mut probe.engine, &key("z", Some("z"), ctrl));
         let mut alt_gr = key("q", Some("@"), Modifiers { alt: true, ..ctrl });
         alt_gr.prefer_character_input = true;
-        probe.on_text_edit_key(&alt_gr);
+        text_edit_key(&mut probe.engine, &alt_gr);
         assert_eq!(probe.engine.drawing_text_edit(), Some((id, "H@!", 2)));
 
         // Shift+Home selects to the start; typing replaces the selection.
@@ -4530,17 +3470,17 @@ mod tests {
             shift: true,
             ..Modifiers::default()
         };
-        probe.on_text_edit_key(&key("home", None, shift));
+        text_edit_key(&mut probe.engine, &key("home", None, shift));
         assert_eq!(probe.engine.drawing_text_edit_selection(), Some("H@"));
-        probe.on_text_edit_key(&key("W", Some("W"), shift));
+        text_edit_key(&mut probe.engine, &key("W", Some("W"), shift));
         assert_eq!(probe.engine.drawing_text_edit(), Some((id, "W!", 1)));
         // Select-all, then a word-delete clears the selection.
-        probe.on_text_edit_key(&key("a", Some("a"), ctrl));
+        text_edit_key(&mut probe.engine, &key("a", Some("a"), ctrl));
         assert_eq!(probe.engine.drawing_text_edit_selection(), Some("W!"));
-        probe.on_text_edit_key(&key("right", None, Modifiers::default()));
+        text_edit_key(&mut probe.engine, &key("right", None, Modifiers::default()));
         assert_eq!(probe.engine.drawing_text_edit(), Some((id, "W!", 2)));
 
-        probe.on_text_edit_key(&key("enter", None, Modifiers::default()));
+        text_edit_key(&mut probe.engine, &key("enter", None, Modifiers::default()));
         assert_eq!(probe.engine.editing_drawing(), None);
         assert_eq!(probe.engine.drawing(id).unwrap().text, "W!");
     }
@@ -4551,6 +3491,7 @@ mod tests {
     fn indicator_panes_rebuild_and_cvd_follows_the_candle_times() {
         let mut probe = Probe::new(64, Some(1));
         let rebuild = |probe: &mut Probe| {
+            probe.dirty = true;
             probe.rebuild_with_measure(
                 1024.0,
                 640.0,
@@ -4596,81 +3537,28 @@ mod tests {
             |text, _| text.len() as f64 * 6.0,
         );
         probe.engine.clear_drawings();
-        let pane_x = probe.engine.pane_w - 9.5;
-        let chart_x = probe.engine.pane_left + pane_x;
+        let x = probe.engine.pane_w - 9.5;
         let y = 200.0;
-        probe.update_pointer_feedback(chart_x, pane_x, y);
-        assert!(probe.engine.alert_create_hit_at(pane_x, y));
-        assert_eq!(probe.cursor_style, CursorStyle::PointingHand);
+        probe.engine.input_pointer_move(pointer(x, y), false);
+        assert!(probe.engine.alert_create_hit_at(x, y));
         assert_eq!(
-            probe.input_target_at(chart_x, pane_x, y),
-            InputTarget::Alert
+            cursor_style(probe.engine.input_cursor()),
+            CursorStyle::PointingHand
         );
+        let scroll = probe.engine.scroll_position();
+        probe.engine.input_pointer_down(pointer(x, y), 1);
+        probe.engine.input_pointer_up(pointer(x, y));
+        assert_eq!(probe.engine.take_alert_create_requests().len(), 1);
+        assert_eq!(
+            probe.engine.scroll_position(),
+            scroll,
+            "the chip never pans"
+        );
+
         probe.engine.set_alert_create_button_visible(false);
-        probe.update_pointer_feedback(chart_x, pane_x, y);
-        assert_ne!(
-            probe.input_target_at(chart_x, pane_x, y),
-            InputTarget::Alert
-        );
-    }
-
-    /// Issue #12: Wayland delivers per-HID-report pointer motion (~1000 Hz, often one axis per
-    /// event). A captured drawing stream must forward at most one coalesced sample per painted
-    /// frame — the newest one — or device-specific event cadence leaks into canonical geometry.
-    #[test]
-    fn drawing_capture_coalesces_pointer_samples_to_one_knot_per_frame() {
-        let mut probe = Probe::new(32, Some(1));
-        let measure = |text: &str, _bold: bool| text.chars().count() as f64 * 7.0;
-        let countdown_measure = |text: &str, _bold: bool| text.chars().count() as f64 * 6.0;
-        probe.rebuild_with_measure(1024.0, 640.0, 1.0, measure, countdown_measure);
-        assert!(probe
-            .engine
-            .set_drawing_tool(Some(DrawingKind::Brush), None, None));
-        assert!(
-            probe
-                .engine
-                .drawing_tool_pointer_down(100.0, 100.0, DrawingModifiers::default())
-                .pointer_capture
-        );
-
-        // A diagonal drag as Wayland reports it: one axis per event, far above frame cadence.
-        for (x, y) in [
-            (101.5, 100.0),
-            (101.5, 101.5),
-            (103.0, 101.5),
-            (103.0, 103.0),
-        ] {
-            probe.pending_creation_point = Some((x, y, DrawingModifiers::default()));
-        }
-        probe.flush_pending_drawing_creation();
-        assert!(probe.dirty, "a captured knot repaints the frame");
-        assert_eq!(
-            probe.pending_creation_point, None,
-            "the pending sample is consumed by the frame"
-        );
-
-        // An idle frame with no pending sample captures nothing.
-        probe.dirty = false;
-        probe.flush_pending_drawing_creation();
-        assert!(!probe.dirty);
-
-        // Only the newest sample became a knot: start + one coalesced capture.
-        let id = probe
-            .engine
-            .drawing_tool_pointer_up(103.0, 103.0, DrawingModifiers::default())
-            .created
-            .expect("captured drawing commits");
-        let drawing = probe
-            .engine
-            .drawings()
-            .iter()
-            .find(|d| d.id == id)
-            .expect("the committed brush exists");
-        assert_eq!(
-            drawing.points.len(),
-            2,
-            "intermediate staircase samples must not become knots"
-        );
+        probe.engine.input_pointer_down(pointer(x, y), 1);
+        probe.engine.input_pointer_up(pointer(x, y));
+        assert!(probe.engine.take_alert_create_requests().is_empty());
     }
 
     #[test]
@@ -4730,59 +3618,6 @@ mod tests {
             .axis
             .iter()
             .any(|prim| matches!(prim, Prim::Text { .. })));
-    }
-
-    #[test]
-    fn desktop_gesture_defaults_match_browser_host() {
-        let config = GestureConfig::default();
-
-        assert!(config.pan);
-        assert!(config.wheel_scroll);
-        assert!(config.wheel_zoom);
-        assert!(config.axis_dblclick_reset_time);
-        assert!(config.axis_dblclick_reset_price);
-        assert!(config.axis_scale_price);
-        assert!(config.axis_scale_time);
-        assert!(config.panes_resize);
-        assert!(!config.kinetic_mouse);
-    }
-
-    #[test]
-    fn click_after_pan_preserves_position_and_next_pan_uses_current_snapshot() {
-        let mut probe = Probe::new(64, Some(1));
-        probe.rebuild_with_measure(
-            1024.0,
-            640.0,
-            1.0,
-            |text, _bold| text.chars().count() as f64 * 7.0,
-            |text, _bold| text.chars().count() as f64 * 6.0,
-        );
-        probe.engine.scroll_to_position(0.0);
-        let initial = probe.engine.scroll_position();
-
-        probe.begin_mouse_pan(200.0);
-        probe.engine.time_scale_scroll_to(160.0);
-        probe.end_mouse_pan();
-        let after_first_pan = probe.engine.scroll_position();
-        let first_delta = after_first_pan - initial;
-        assert!(first_delta > 0.0);
-
-        // A press/release below click slop still enters the pane pan recognizer, but must close its
-        // snapshot without restoring the position reached by the previous drag.
-        probe.cancel_kinetic_scroll();
-        probe.begin_mouse_pan(120.0);
-        probe.end_mouse_pan();
-        let after_click = probe.engine.scroll_position();
-        assert!((after_click - after_first_pan).abs() < 1e-12);
-
-        // A fresh 20px drag must start at `after_click`, rather than reusing the first drag's saved
-        // state. It therefore moves half as far as the first 40px drag at unchanged bar spacing.
-        probe.begin_mouse_pan(120.0);
-        probe.engine.time_scale_scroll_to(100.0);
-        probe.end_mouse_pan();
-        let after_second_pan = probe.engine.scroll_position();
-        let expected = after_click + first_delta / 2.0;
-        assert!((after_second_pan - expected).abs() < 1e-12);
     }
 
     fn assert_theme(engine: &ChartEngine, theme: DemoTheme) {
@@ -4857,7 +3692,7 @@ mod tests {
                 "missing toolbar feature {required}"
             );
         }
-        assert!(!GestureConfig::default().kinetic_mouse);
+        assert!(!aeris_charts_engine::InteractionOptions::default().kinetic_mouse);
     }
 
     #[test]
@@ -4873,7 +3708,7 @@ mod tests {
         probe.engine.clear_drawings();
         probe.arm_drawing(DrawingKind::TrendLine);
         assert_eq!(
-            probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default()),
+            place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default()),
             -1
         );
         probe.update_drawing_template(|template| {
@@ -4882,11 +3717,85 @@ mod tests {
             template.text_italic = true;
         });
         assert!(probe.engine.drawing_create_active());
-        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
         assert!(id > 0, "changing style must not discard the first anchor");
         assert_eq!(probe.drawing_template.color, "#ff9800");
         assert_eq!(probe.drawing_template.width, 4);
         assert!(probe.drawing_template.text_italic);
+    }
+
+    /// Browser parity for the measuring tools: the toolbar tool places a snapped date-and-price
+    /// range, and a live Shift-click measure paints in the native frame while keeping the
+    /// crosshair cursor even over another drawing's body.
+    #[test]
+    fn measure_tools_paint_natively_and_a_live_measure_keeps_the_crosshair_cursor() {
+        let mut probe = Probe::new(64, Some(1));
+        let rebuild = |probe: &mut Probe| {
+            probe.dirty = true;
+            probe.rebuild_with_measure(
+                1024.0,
+                640.0,
+                1.0,
+                |text, _bold| text.chars().count() as f64 * 7.0,
+                |text, _bold| text.chars().count() as f64 * 6.0,
+            );
+        };
+        rebuild(&mut probe);
+        probe.engine.clear_drawings();
+        probe.arm_drawing(DrawingKind::DateAndPriceRange);
+        assert_eq!(
+            place_drawing_anchor(&mut probe, 200.0, 200.0, DrawingModifiers::default()),
+            -1
+        );
+        let id = place_drawing_anchor(&mut probe, 500.0, 400.0, DrawingModifiers::default());
+        assert!(id > 0);
+        let drawing = probe.engine.drawing(id as u32).unwrap();
+        assert_eq!(drawing.kind, DrawingKind::DateAndPriceRange);
+        assert!(drawing
+            .points
+            .iter()
+            .all(|point| point.logical.fract() == 0.0));
+        rebuild(&mut probe);
+
+        let inside = (350.0, 300.0);
+        probe
+            .engine
+            .input_pointer_move(pointer(inside.0, inside.1), false);
+        assert_eq!(probe.engine.input_cursor(), ChartCursor::Move);
+
+        // A Shift-press on empty space starts the live measure, which then follows the pointer.
+        let shift = PointerInput {
+            modifiers: InputModifiers {
+                shift: true,
+                ..InputModifiers::default()
+            },
+            ..pointer(100.0, 150.0)
+        };
+        probe.engine.input_pointer_down(shift, 1);
+        probe.engine.input_pointer_up(shift);
+        assert!(probe.engine.measure_active());
+        probe
+            .engine
+            .input_pointer_move(pointer(inside.0, inside.1), false);
+        assert_eq!(probe.engine.input_cursor(), ChartCursor::Crosshair);
+        rebuild(&mut probe);
+        let labels = probe.frame.panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::Text { text, .. } if text.contains(" bars")))
+            .count();
+        assert_eq!(
+            labels, 2,
+            "the tool and the live measure both label elapsed time"
+        );
+        // Escape dismisses the measure.
+        assert!(probe.engine.input_key_down(
+            ChartKey::Escape,
+            InputModifiers::default(),
+            false,
+            0.0
+        ));
+        assert!(!probe.engine.measure_active());
     }
 
     /// Moving from a trend line onto its `+ Add text` prompt keeps the prompt hovered with the
@@ -4895,6 +3804,7 @@ mod tests {
     fn trend_label_prompt_stays_hovered_with_a_text_cursor() {
         let mut probe = Probe::new(64, Some(1));
         let rebuild = |probe: &mut Probe| {
+            probe.dirty = true;
             probe.rebuild_with_measure(
                 1024.0,
                 640.0,
@@ -4906,18 +3816,22 @@ mod tests {
         rebuild(&mut probe);
         probe.engine.clear_drawings();
         probe.arm_drawing(DrawingKind::TrendLine);
-        probe.place_drawing_anchor(200.0, 300.0, DrawingModifiers::default());
-        let id = probe.place_drawing_anchor(600.0, 300.0, DrawingModifiers::default()) as u32;
+        place_drawing_anchor(&mut probe, 200.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 600.0, 300.0, DrawingModifiers::default()) as u32;
         rebuild(&mut probe);
 
         // Right/top template: the prompt sits above the line near its right end, off the body.
         let (x, y, _) = probe.engine.drawing_text_transform(id).unwrap();
         let (label_x, label_y) = (x - 20.0, y);
         assert!(probe.engine.hit_test_drawing(label_x, label_y).is_none());
-        probe.update_crosshair(label_x, label_y);
-        probe.update_cursor(label_x + probe.engine.pane_left, label_y);
+        probe
+            .engine
+            .input_pointer_move(pointer(label_x, label_y), false);
         assert_eq!(probe.engine.hovered_text(), Some(id));
-        assert_eq!(probe.cursor_style, CursorStyle::IBeam);
+        assert_eq!(
+            cursor_style(probe.engine.input_cursor()),
+            CursorStyle::IBeam
+        );
         rebuild(&mut probe);
         assert!(probe.frame.panes[0].main.iter().any(|prim| matches!(
             prim,
@@ -4948,8 +3862,8 @@ mod tests {
         );
         probe.engine.clear_drawings();
         probe.arm_drawing(DrawingKind::TrendLine);
-        probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default());
-        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
         assert!(id > 0);
         let drawing = probe.engine.drawing(id as u32).unwrap();
         assert!(drawing.text.is_empty(), "a new trend line starts unlabeled");
@@ -4986,10 +3900,10 @@ mod tests {
         probe.arm_drawing(DrawingKind::TrendLine);
         assert!(!probe.engine.drawing_create_active());
         assert_eq!(
-            probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default()),
+            place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default()),
             -1
         );
-        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
         assert!(id > 0);
         assert_eq!(probe.engine.drawings().len(), 1);
         assert_eq!(probe.engine.selected_drawing(), Some(id as u32));
@@ -5009,12 +3923,17 @@ mod tests {
         probe.arm_drawing(DrawingKind::Path);
         for (x, y) in [(200.0, 180.0), (350.0, 260.0), (500.0, 200.0)] {
             assert_eq!(
-                probe.place_drawing_anchor(x, y, DrawingModifiers::default()),
+                place_drawing_anchor(&mut probe, x, y, DrawingModifiers::default()),
                 -1
             );
         }
-        assert!(probe.pop_drawing_anchor());
-        assert!(probe.finish_drawing_creation());
+        let none = InputModifiers::default();
+        assert!(probe
+            .engine
+            .input_key_down(ChartKey::Backspace, none, false, 0.0));
+        assert!(probe
+            .engine
+            .input_key_down(ChartKey::Enter, none, false, 0.0));
         assert_eq!(probe.engine.drawings().len(), 1);
         assert_eq!(probe.engine.drawings()[0].kind, DrawingKind::Path);
         assert_eq!(probe.engine.drawings()[0].points.len(), 2);
@@ -5032,16 +3951,26 @@ mod tests {
             |text, _bold| text.chars().count() as f64 * 6.0,
         );
         probe.engine.clear_drawings();
-        probe.update_crosshair_modifier(true, false);
-        assert!(!probe.engine.crosshair_ohlc_magnet);
+        let ctrl = InputModifiers {
+            control: true,
+            ..InputModifiers::default()
+        };
+        probe.engine.input_modifiers_changed(ctrl);
+        assert!(
+            !probe.engine.crosshair_ohlc_magnet,
+            "free browsing never snaps"
+        );
+        probe
+            .engine
+            .input_modifiers_changed(InputModifiers::default());
         probe.arm_drawing(DrawingKind::TrendLine);
         assert!(!probe.engine.drawing_create_active());
 
         let x = probe.engine.time_scale.logical_to_coordinate(32.0);
         let y = 200.0;
-        probe.update_crosshair(x, y);
+        probe.engine.input_pointer_move(pointer(x, y), false);
         let free = probe.engine.build_frame();
-        probe.update_crosshair_modifier(true, false);
+        probe.engine.input_modifiers_changed(ctrl);
         let snapped = probe.engine.build_frame();
         let crosshair_color =
             Color::parse_css(&probe.engine.options.get().crosshair.horz_line.color)
@@ -5069,6 +3998,7 @@ mod tests {
 #[cfg(test)]
 mod semantic_regressions {
     use super::*;
+    use aeris_charts_engine::DrawingModifiers;
 
     #[test]
     fn pending_template_patch_reaches_committed_drawing() {
@@ -5083,7 +4013,7 @@ mod semantic_regressions {
         probe.engine.clear_drawings();
         probe.arm_drawing(DrawingKind::TrendLine);
         assert_eq!(
-            probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default()),
+            place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default()),
             -1
         );
         probe.update_drawing_template(|template| {
@@ -5091,7 +4021,7 @@ mod semantic_regressions {
             template.width = 4;
             template.text_italic = true;
         });
-        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
         assert!(id > 0);
         let options = probe.engine.drawing_options_json(id as u32).unwrap();
         assert!(options.contains("\"color\":\"#ff9800\""));
@@ -5164,14 +4094,16 @@ mod semantic_regressions {
 
     #[test]
     fn idle_interactive_probe_stops_requesting_frames() {
+        use aeris_charts_engine::{ChartKey, InputModifiers};
         let mut interactive = Probe::new(8, None);
         assert!(!interactive.needs_animation_frame());
-        interactive.kinetic_active = true;
+        let none = InputModifiers::default();
+        assert!(interactive
+            .engine
+            .input_key_down(ChartKey::ArrowLeft, none, false, 1_000.0));
         assert!(interactive.needs_animation_frame());
-        interactive.kinetic_active = false;
-        interactive.begin_keyboard_pan_at(-1, 10.0, false, 1_000.0);
-        assert!(interactive.needs_animation_frame());
-        interactive.cancel_keyboard_pan();
+        assert!(interactive.engine.input_key_up(ChartKey::ArrowLeft));
+        assert!(!interactive.needs_animation_frame());
         interactive.engine.start_scroll_animation(3.0, 160.0, 0.0);
         assert!(interactive.needs_animation_frame());
         assert!(Probe::new(8, Some(2)).needs_animation_frame());
@@ -5179,42 +4111,47 @@ mod semantic_regressions {
 
     #[test]
     fn brushable_area_uses_the_native_area_and_delta_tooltip_paths() {
+        use aeris_charts_engine::PointerInput;
         let mut probe = Probe::new(32, None);
+        probe.rebuild_with_measure(
+            1024.0,
+            640.0,
+            1.0,
+            |text, _bold| text.chars().count() as f64 * 7.0,
+            |text, _bold| text.chars().count() as f64 * 6.0,
+        );
         probe.enable_brushable_area();
-        let state = probe.brushable_area.expect("brush interaction is attached");
+        assert!(probe.engine.is_brushable_area(0));
         assert_eq!(probe.engine.series[0].kind, SeriesKind::Area);
         assert!(probe.engine.has_delta_tooltip());
 
-        probe.engine.time_scale.set_width(probe.engine.pane_w);
         probe.engine.set_visible_logical_range(0.0, 31.0);
+        let at = |x| PointerInput {
+            x,
+            y: 200.0,
+            ..PointerInput::default()
+        };
         let from = probe.engine.time_scale.index_to_coordinate(4);
         let to = probe.engine.time_scale.index_to_coordinate(12);
-        assert!(probe
-            .engine
-            .set_delta_tooltip_points(state.tooltip_id, &[from, to]));
-        let active_range = probe.engine.delta_tooltip_active_range(state.tooltip_id);
-        assert!(
-            active_range.is_some(),
-            "expected active range for coordinates {from}..{to} in pane {}",
-            probe.engine.pane_w
-        );
-        probe.sync_brushable_area();
-        assert!(probe
-            .brushable_area
-            .is_some_and(|brush| brush.styled_range.is_some()));
-
-        assert!(probe.clear_brushable_area_selection());
+        let scroll = probe.engine.scroll_position();
+        probe.engine.input_pointer_down(at(from), 1);
+        probe.engine.input_pointer_move(at(to), true);
+        probe.engine.input_pointer_up(at(to));
+        assert!(probe.engine.brushable_area_range(0).is_some());
         assert_eq!(
-            probe.engine.delta_tooltip_active_range(state.tooltip_id),
-            None
+            probe.engine.scroll_position(),
+            scroll,
+            "the comparison owns the drag"
         );
-        assert!(probe
-            .brushable_area
-            .is_some_and(|brush| brush.styled_range.is_none()));
+
+        // A double-click on the pane clears the brushed range.
+        probe.engine.input_pointer_down(at(from), 2);
+        probe.engine.input_pointer_up(at(from));
+        assert_eq!(probe.engine.brushable_area_range(0), None);
 
         probe.set_series_kind(SeriesKind::Line);
         assert_eq!(probe.engine.series[0].kind, SeriesKind::Line);
-        assert!(probe.brushable_area.is_none());
+        assert!(!probe.engine.is_brushable_area(0));
         assert!(!probe.engine.has_delta_tooltip());
     }
 

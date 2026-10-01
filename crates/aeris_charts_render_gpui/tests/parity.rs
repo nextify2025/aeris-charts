@@ -1997,6 +1997,109 @@ fn range_area_engine_frame_reaches_canvas_and_gpui_fill_routes() {
 }
 
 #[test]
+fn measure_tools_reach_canvas_and_gpui_with_identical_quads_strokes_and_text() {
+    use aeris_charts_engine::{DrawingKind, DrawingModifiers, DrawingPoint};
+    for dpr in [1.0f64, 1.25, 1.5, 2.0, 2.5] {
+        let mut engine = real_engine_frame(dpr);
+        engine.build_frame();
+        // A rising price range, a backward date range, a falling date-and-price range, and the
+        // transient Shift-drag measure (a falling pull, painted market-down): every arrow
+        // direction and both the drawing and the pull colors.
+        for (kind, from, to) in [
+            (DrawingKind::PriceRange, (20.0, 94.0), (45.0, 107.5)),
+            (DrawingKind::DateRange, (110.0, 96.0), (80.0, 104.0)),
+            (
+                DrawingKind::DateAndPriceRange,
+                (125.0, 108.0),
+                (160.0, 93.25),
+            ),
+        ] {
+            engine
+                .add_drawing(
+                    kind,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: from.0,
+                            price: from.1,
+                        },
+                        DrawingPoint {
+                            logical: to.0,
+                            price: to.1,
+                        },
+                    ],
+                    None,
+                )
+                .expect("measure drawing");
+        }
+        let at = |engine: &ChartEngine, logical: f64, price: f64| {
+            (
+                engine.logical_to_coordinate(logical).unwrap(),
+                engine.series_price_to_coordinate(0, price).unwrap(),
+            )
+        };
+        let start = at(&engine, 50.0, 99.0);
+        let end = at(&engine, 75.0, 92.0);
+        let modifiers = DrawingModifiers::default();
+        assert!(engine.measure_pointer_down(start.0, start.1, true, modifiers));
+        engine.measure_pointer_move(end.0, end.1, modifiers);
+        assert!(engine.measure_pointer_up(end.0, end.1, modifiers));
+
+        let frame = engine.build_frame();
+        let pane = &frame.panes[0];
+        let labels = pane
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::Text { text, .. } if text.contains(" bars") || text.contains('%') => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            labels.len() >= 6,
+            "DPR {dpr}: every measure must label its statistics ({labels:?})"
+        );
+        // Every arrow ends in the drawing's cap: an opaque filled head (the area wash is
+        // translucent). Price range 1 + date range 1 + date-and-price range 2 + quick measure 2.
+        let arrowheads = pane
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::BandFill { fill, .. } if fill.a() == 255))
+            .count();
+        assert!(arrowheads >= 6, "DPR {dpr}: missing measure arrowheads");
+
+        let canvas = canvas_rects(&pane.main, &pane.points);
+        let (plan, metrics) = gpui_plan(&pane.main, &pane.points);
+        assert_eq!(
+            gpui_quads(&plan),
+            canvas.rects,
+            "DPR {dpr}: measure fills, rules, and shafts must be draw-call identical"
+        );
+        assert_eq!(metrics.dropped_prims, 0, "DPR {dpr}: {metrics:?}");
+        assert!(canvas.path_fills >= arrowheads && metrics.paths as usize >= arrowheads);
+        let gpui_text = plan
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SceneOp::Text(run) => Some((run.text.clone(), run.x, run.y)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let canvas_text = canvas
+            .text_runs
+            .iter()
+            .map(|(text, x, y, _)| (text.clone(), *x, *y))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gpui_text, canvas_text,
+            "DPR {dpr}: measure labels must reach both backends at the same anchors"
+        );
+    }
+}
+
+#[test]
 fn a_real_engine_frame_lowers_every_prim_it_contains() {
     let mut engine = real_engine_frame(1.5);
     let frame = engine.build_frame();

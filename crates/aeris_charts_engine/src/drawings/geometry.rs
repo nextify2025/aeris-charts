@@ -48,6 +48,34 @@ pub(crate) struct PositionGeometry {
     pub(crate) stop_y: f64,
 }
 
+/// Which dimensions a measuring tool reports. Price arrows run vertically, time arrows
+/// horizontally; the combined tool draws both through the box center.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeasureAxes {
+    Price,
+    Date,
+    DatePrice,
+}
+
+impl MeasureAxes {
+    pub(crate) const fn for_kind(kind: DrawingKind) -> Option<Self> {
+        match kind {
+            DrawingKind::PriceRange => Some(Self::Price),
+            DrawingKind::DateRange => Some(Self::Date),
+            DrawingKind::DateAndPriceRange => Some(Self::DatePrice),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn price(self) -> bool {
+        matches!(self, Self::Price | Self::DatePrice)
+    }
+
+    pub(crate) const fn date(self) -> bool {
+        matches!(self, Self::Date | Self::DatePrice)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PositionZone {
     pub(crate) left: f64,

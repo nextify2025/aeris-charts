@@ -45,6 +45,17 @@ The supported root surface is:
   statistics use two persisted drawing options, `position_account_size` (a hypothetical balance,
   default 1,000) and `position_risk_percent` (the share of it risked at the stop, 0–100, default 25),
   independent of broker orders;
+- measuring drawings through the canonical `drawing_kind` values `"price_range"`, `"date_range"`,
+  and `"date_and_price_range"` (the earlier spelling `"date_price_range"` is still read on import,
+  templates, clipboard, and sync, and never written); each stores an editable start and end anchor
+  snapped to whole bars and price ticks, labels the signed price change, percentage, ticks (counted
+  on the instrument tick or price-band ladder), bar count, and elapsed time (the `labels` option
+  chooses the metrics), and paints in the drawing color;
+- the Shift-click quick measure in the built-in pointer handling: Shift + press on empty chart
+  space starts a transient date-and-price measurement that follows the pointer (drawing default
+  color for a rise, market-down color for a fall), freezes on release after a drag or on the next
+  click, and is dismissed by the following click or Escape. It is never a drawing, history entry,
+  or persisted object;
 - visible-range volume profiles through `chart.add_volume_profile(prices, volume, options)`,
   returning a distribution handle with `options()`, `apply_options()`, `snapshot()` and `remove()`;
 - first-class tick-driven footprint / numbers-bar series through `chart.add_series("footprint")`,
@@ -191,12 +202,15 @@ semantic follow states such as unpinned series colors and price-scale text. Wate
 visibility, scale modes/ranges/margins/layout constraints, viewport zoom/scroll, and indicator/data
 semantics survive the reset; only their engine-owned visual styling is restored.
 
-Default mouse-wheel behavior is informed by measurements from the pinned public reference fixture:
-a saturated vertical step uses a 1.0 zoom increment, smaller trackpad deltas stay proportional, and the logical point under
-the cursor remains anchored because `right_bar_stays_on_scroll` defaults to `false`. Vertical and
-horizontal deltas independently zoom and pan the time scale on the pane, time axis, or price axis;
-Ctrl and Shift do not change routing. `wheel_behavior: "pan"` and `"zoom"` are explicit Aeris
-extensions; explicit zoom retains price-axis wheel zoom and focused Ctrl zoom.
+Default mouse-wheel zoom follows measurements of TradingView: a saturated vertical step changes bar
+spacing by exactly 10% (smaller trackpad deltas stay proportional) and keeps the right edge pinned,
+because `right_bar_stays_on_scroll` defaults to `true`: the gap after the latest bar stays constant
+while history compresses or expands. Ctrl/Cmd + wheel, macOS trackpad pinch (delivered as Ctrl +
+wheel), and touch pinch zoom around the pointer instead. Setting `right_bar_stays_on_scroll: false`
+restores cursor-anchored ordinary zoom. Vertical and horizontal deltas independently zoom and pan
+the time scale on the pane, time axis, or price axis; Shift does not change routing.
+`wheel_behavior: "pan"` and `"zoom"` are explicit Aeris extensions; explicit zoom retains
+price-axis wheel zoom.
 
 The built-in series live-price line is engine-owned. `price_line_extent` defaults to `"partial"`
 (tracked bar/value to the pane's right edge); `"full"` preserves the conventional pane-wide line.
@@ -1459,7 +1473,12 @@ the tools paint no text: their `text` is accepted and kept, never shown or edite
   (`fill_enabled` defaults on; `fill_color` or the drawing color at 20%), the edge lines of the
   measured axis, arrowed measures through the middle toward the second anchor (`stroke_end`
   defaults to `"arrow"`), and a stats box beyond the measured end (below a date range). Default
-  `labels`: price change, percent change, and ticks; bar count and duration; or all five.
+  `labels`: price change, percent change, and ticks; bar count and duration; or all five. Anchors
+  snap to whole bars and price ticks (also while dragging, nudging with the keyboard, or moving the
+  body); ticks count on the instrument tick or price-band ladder, falling back to the scale's
+  `min_move`. `"date_price_range"`, the spelling of earlier builds, is read as
+  `"date_and_price_range"` and never written. The Shift-click quick measure draws a transient
+  date-and-price range.
 - `projection` (apex, radius point, price point): the circular sector around the apex from
   the ray through the radius point to the ray through the price point (the shorter turn), filled
   (`fill_enabled` defaults on) and outlined. Visible `labels` measure from the apex to the price
@@ -1770,9 +1789,11 @@ Three call-site reviews:
   line navigation yet.
 - `drawing_text_hit_at` answers for the label of every tool that paints a text run (lines,
   channels, Fibonacci, shapes), not only the trend line, and arbitrates against higher drawing bodies.
-  Which click starts typing is the host's rule: the browser opens on the first click only for a trend
-  label and otherwise on double-click, Enter or F2, while the GPUI probe starts typing on any label
-  hit. A native host that wants the browser's rule must apply it itself.
+  Which click starts typing is one rule for every host: the first click opens it only for the text
+  tool's two-step click and a trend label, and placing a tool that requests an editor opens it on
+  placement; a double-click on the selected drawing, Enter, or F2 opens the editor of every
+  text-bearing drawing. The browser gesture layer and the native input controller both apply it; a
+  host that drives the engine API directly applies it itself.
 - Rectangles now default to no border (`border_visible: false`). A saved document that omits the key
   imports with the border visible, so earlier documents keep their look.
 

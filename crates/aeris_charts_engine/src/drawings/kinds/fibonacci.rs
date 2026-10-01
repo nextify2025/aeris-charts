@@ -182,6 +182,7 @@ const FIB_TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 /// Screen-space tools reach beyond their anchors by radii that depend on the zoom, so no

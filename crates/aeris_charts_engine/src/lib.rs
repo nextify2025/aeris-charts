@@ -13,6 +13,7 @@ mod alerts;
 mod axis_metrics;
 mod axis_primitives;
 mod bar_time_label_api;
+mod chart_input;
 mod depth;
 mod domains;
 mod drawing_contract;
@@ -74,6 +75,10 @@ pub use aeris_charts_indicators::{
 pub use alerts::{
     AlertCondition, AlertCreateRequest, AlertFrequency, AlertId, AlertLine, AlertLineStatus,
     AlertPriceScale, AlertSnapshot, MAX_ALERT_LINES,
+};
+pub use chart_input::{
+    ChartContextMenu, ChartCursor, ChartInputEvent, ChartKey, ChartRegion, InteractionOptions,
+    PointerInput, PANE_SEPARATOR_HIT, TRADING_TOOLTIP_DWELL_MS,
 };
 pub use depth::{
     DepthBook, DepthBucket, DepthError, DepthEventCluster, DepthEventKind, DepthEventLayerOptions,
@@ -207,12 +212,11 @@ pub use indicators::{
     INDICATOR_SCHEMA_REVISION,
 };
 pub use interaction::{
-    pinch_zoom_scale, wheel_zoom_scale, CancelReason, ChartContext, FinancialDrag,
-    FinancialNavigation, GestureResolver, GestureState, GestureUpdate, GestureUpdateKind,
-    HitProfile, InputDevice, InputEvent, InputModifiers, InputTarget, PointerSample,
-    ScrollAnimation, WheelBehavior, WheelDeltaMode, WheelIntent, WheelSample, KINETIC_DUMPING,
-    KINETIC_MAX_SPEED, KINETIC_MIN_MOVE, KINETIC_MIN_SPEED, MAX_ACTIVE_POINTERS,
-    PINCH_ZOOM_INTENSITY, WHEEL_SCROLL_PX_PER_DELTA,
+    pinch_zoom_scale, wheel_zoom_scale, CancelReason, ChartContext, GestureResolver, GestureState,
+    GestureUpdate, GestureUpdateKind, HitProfile, InputDevice, InputEvent, InputModifiers,
+    InputTarget, PointerSample, ScrollAnimation, WheelBehavior, WheelDeltaMode, WheelIntent,
+    WheelSample, KINETIC_DUMPING, KINETIC_MAX_SPEED, KINETIC_MIN_MOVE, KINETIC_MIN_SPEED,
+    MAX_ACTIVE_POINTERS, PINCH_ZOOM_INTENSITY, WHEEL_SCROLL_PX_PER_DELTA,
 };
 pub use native_primitives::{
     AccessibilityFocusOptions, AnchoredTextHorizontalAlign, AnchoredTextOptions,
@@ -2066,7 +2070,11 @@ pub struct ChartEngine {
     /// Velocity-owned keyboard pan. This is separate from public `scroll_to_position(..., true)`:
     /// a held arrow receives bounded engine-timed velocity kicks with light drag; key-up stops it.
     keyboard_scroll_animation: Option<interaction::KeyboardKineticScroll>,
-    financial_drag: Option<FinancialDrag>,
+    /// Host-neutral pointer, wheel and keyboard routing (chart_input.rs). Runtime-only.
+    input: chart_input::InputController,
+    /// Area series composed with a Delta Tooltip into a brushable comparison: the tooltip owns the
+    /// range gesture and the engine restyles the area from its active range. At most one per series.
+    brushable_areas: Vec<native_primitives::BrushableArea>,
     /// In-flight eased scroll-to-position (engine interaction module); the host schedules the
     /// ticks, the engine owns the easing and applies each step.
     scroll_animation: Option<interaction::ScrollAnimation>,
@@ -2230,7 +2238,8 @@ impl ChartEngine {
             text_cap_center_fn: None,
             kinetic: None,
             keyboard_scroll_animation: None,
-            financial_drag: None,
+            input: chart_input::InputController::default(),
+            brushable_areas: Vec::new(),
             scroll_animation: None,
             price_formatter_fn: None,
             tick_mark_formatter_fn: None,
@@ -3517,14 +3526,18 @@ impl ChartEngine {
         self.series.iter().find(|s| !s.removed && s.visible)
     }
 
-    /// Host choice for a series' last-price pulse. Line and area default on; this records an
-    /// explicit opt-out (or opt-in for other kinds) that later kind changes preserve.
+    /// Host choice for a series' last-price pulse. Line and area default on; a value that differs
+    /// from the current kind's default records an explicit opt-out (or opt-in for other kinds)
+    /// that later kind changes preserve. Restating the default is not a preference: hosts re-send
+    /// their whole style, and treating a line's default-on pulse as an opt-in would carry it onto
+    /// candles after a type change.
     pub fn set_series_last_price_animation(&mut self, id: SeriesId, enabled: bool) -> bool {
         let Some(series) = self.series.iter_mut().find(|s| s.id == id && !s.removed) else {
             return false;
         };
         series.last_price_animation = enabled;
-        series.last_price_animation_explicit = true;
+        series.last_price_animation_explicit =
+            enabled != SeriesEntry::default_last_price_animation(series.kind);
         true
     }
 

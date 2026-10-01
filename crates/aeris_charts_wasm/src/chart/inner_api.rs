@@ -2452,6 +2452,18 @@ impl ChartInner {
         let x = x_css.max(1.0).min(self.time_scale.width());
         self.time_scale_zoom_focused(x, scale);
     }
+    pub fn wheel_zoom_time(&mut self, x_css: f64, scale: f64, control: bool, meta: bool) {
+        // The engine clamps the anchor into the plot.
+        self.wheel_zoom_time_scale(
+            x_css,
+            scale,
+            aeris_charts_engine::InputModifiers {
+                control,
+                meta,
+                ..Default::default()
+            },
+        );
+    }
     pub fn scroll_start(&mut self, x_css: f64) {
         self.time_scale_start_scroll(x_css);
     }
@@ -3331,6 +3343,61 @@ impl ChartInner {
 
     pub fn cancel_drawing_tool(&mut self) {
         self.engine.cancel_drawing_tool();
+    }
+
+    pub fn measure_pointer_down(
+        &mut self,
+        x_css: f64,
+        y_css: f64,
+        begin: bool,
+        magnet: bool,
+    ) -> bool {
+        self.engine.measure_pointer_down(
+            x_css,
+            y_css,
+            begin,
+            DrawingModifiers {
+                magnet,
+                straighten: false,
+            },
+        )
+    }
+
+    pub fn measure_pointer_move(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.engine.measure_pointer_move(
+            x_css,
+            y_css,
+            DrawingModifiers {
+                magnet,
+                straighten: false,
+            },
+        )
+    }
+
+    pub fn measure_pointer_up(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.engine.measure_pointer_up(
+            x_css,
+            y_css,
+            DrawingModifiers {
+                magnet,
+                straighten: false,
+            },
+        )
+    }
+
+    pub fn cancel_measure(&mut self) -> bool {
+        self.engine.cancel_measure()
+    }
+
+    pub fn measure_active(&self) -> bool {
+        self.engine.measure_active()
+    }
+
+    pub fn measure_points_json(&self) -> String {
+        self.engine
+            .measure_points()
+            .and_then(|points| serde_json::to_string(&points).ok())
+            .unwrap_or_else(|| "null".to_string())
     }
 
     /// Arm interactive creation of a tool kind ("" options = defaults).

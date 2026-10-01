@@ -184,6 +184,7 @@ const CHANNEL_TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 pub(crate) const PARALLEL_CHANNEL: DrawingToolSpec = CHANNEL_TOOL;

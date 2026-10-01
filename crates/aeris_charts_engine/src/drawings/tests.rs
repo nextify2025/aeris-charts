@@ -5127,3 +5127,666 @@ fn position_account_settings_are_atomic_and_survive_history_and_persistence() {
     assert!(restored.import_state_json(&invalid.to_string()).is_err());
     assert_eq!(restored.drawing(id).unwrap().position_risk_percent, 2.0);
 }
+
+// --- measuring tools (price range, date range, date and price range, Shift-click measure) ---
+//
+// The three measuring tools are catalog entries of the Projection & Annotations family
+// (`kinds/projection_annotations.rs`): they paint through the family range lowering (a `BandFill`
+// area, crisp rules, arrows ended by the drawing's caps, and a statistics box), keep the drawing's
+// own color in both directions, and print `+2.50  +25.00%  +250 ticks` / `10 bars  10h`. The
+// transient Shift-click measure is a date-and-price range lowered through the same parts whose
+// color alone follows its pull.
+
+fn pane_texts(chart: &mut ChartEngine) -> Vec<String> {
+    chart.build_frame().panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn market_down() -> Color {
+    Color::parse_css(aeris_charts_core::style::MARKET_DOWN_CSS).unwrap()
+}
+
+fn primary() -> Color {
+    Color::rgb(
+        DEFAULT_PRIMARY_RGB.0,
+        DEFAULT_PRIMARY_RGB.1,
+        DEFAULT_PRIMARY_RGB.2,
+    )
+}
+
+/// The measured-area wash: the tool color at 20% alpha, painted as one `BandFill`.
+fn has_fill(chart: &mut ChartEngine, color: Color) -> bool {
+    let wash = Color::rgba(color.r(), color.g(), color.b(), 51);
+    chart.build_frame().panes[0]
+        .main
+        .iter()
+        .any(|prim| matches!(prim, Prim::BandFill { fill, .. } if *fill == wash))
+}
+
+/// Filled regions in exactly `color`: the arrowheads (caps) of the measured axes.
+fn arrowheads(chart: &mut ChartEngine, color: Color) -> usize {
+    chart.build_frame().panes[0]
+        .main
+        .iter()
+        .filter(|prim| matches!(prim, Prim::BandFill { fill, .. } if *fill == color))
+        .count()
+}
+
+fn add_measure(
+    chart: &mut ChartEngine,
+    kind: DrawingKind,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> DrawingId {
+    chart
+        .add_drawing(
+            kind,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: from.0,
+                    price: from.1,
+                },
+                DrawingPoint {
+                    logical: to.0,
+                    price: to.1,
+                },
+            ],
+            None,
+        )
+        .unwrap()
+}
+
+#[test]
+fn measure_tools_have_stable_catalog_identity_and_defaults() {
+    for (kind, wire, name) in [
+        (DrawingKind::PriceRange, 130, "price_range"),
+        (DrawingKind::DateRange, 131, "date_range"),
+        (DrawingKind::DateAndPriceRange, 132, "date_and_price_range"),
+    ] {
+        assert_eq!(DrawingKind::from_u8(wire), Some(kind));
+        assert_eq!(DrawingKind::from_name(name), Some(kind));
+        assert_eq!((kind.to_u8(), kind.name()), (wire, name));
+        assert_eq!(kind.anchor_count(), 2);
+        assert!(kind.valid_point_count(2) && !kind.valid_point_count(3));
+        assert!(kind.is_measure() && kind.spec().grid_snap);
+        let drawing = Drawing::new(1, kind, 0, Vec::new());
+        assert!(drawing.fill_enabled);
+        assert_eq!(drawing.width, 1.0);
+    }
+    let mut unique = DRAWING_TOOL_SPECS
+        .iter()
+        .map(|spec| spec.wire_id)
+        .collect::<Vec<_>>();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), DRAWING_TOOL_SPECS.len());
+    // Only the measuring tools and the position tools snap their anchors to bars and ticks.
+    for spec in DRAWING_TOOL_SPECS {
+        let snaps = spec.kind.is_measure()
+            || matches!(
+                spec.kind,
+                DrawingKind::LongPosition | DrawingKind::ShortPosition
+            );
+        assert_eq!(spec.grid_snap, snaps, "{:?}", spec.kind);
+    }
+}
+
+#[test]
+fn the_pre_merge_date_price_range_spelling_is_read_but_never_written() {
+    let alias = "date_price_range";
+    assert_eq!(
+        DrawingKind::from_name(alias),
+        Some(DrawingKind::DateAndPriceRange)
+    );
+    assert!(DRAWING_TOOL_SPECS.iter().all(|spec| spec.name != alias));
+    assert_eq!(
+        serde_json::from_str::<DrawingKind>(&format!("\"{alias}\"")).unwrap(),
+        DrawingKind::DateAndPriceRange
+    );
+    assert_eq!(
+        serde_json::to_value(DrawingKind::DateAndPriceRange).unwrap(),
+        "date_and_price_range"
+    );
+}
+
+#[test]
+fn date_and_price_range_pulled_down_places_on_slots_and_ticks_and_reads_negative() {
+    let mut chart = settled_chart();
+    chart
+        .set_instrument_metadata(crate::InstrumentMetadata {
+            tick_size: Some(0.25),
+            ..Default::default()
+        })
+        .unwrap();
+    let spacing = x_at(&chart, 3.0) - x_at(&chart, 2.0);
+    assert!(chart.set_drawing_tool(Some(DrawingKind::DateAndPriceRange), None, None));
+    let first = chart.drawing_tool_activate(
+        x_at(&chart, 2.0) + spacing * 0.3,
+        y_at(&chart, 12.1),
+        DrawingModifiers::default(),
+    );
+    assert!(first.consumed && first.created.is_none());
+    chart.drawing_tool_pointer_move(
+        x_at(&chart, 7.0) - spacing * 0.3,
+        y_at(&chart, 10.6),
+        DrawingModifiers::default(),
+        false,
+    );
+    // The live preview already shows the final statistics: ticks count on the instrument tick.
+    let falling = "\u{2212}1.50  -12.50%  -6 ticks".to_string();
+    let elapsed = "5 bars  5h".to_string();
+    let texts = pane_texts(&mut chart);
+    assert!(texts.contains(&falling), "{texts:?}");
+    assert!(texts.contains(&elapsed), "{texts:?}");
+    let id = chart
+        .drawing_tool_activate(
+            x_at(&chart, 7.0) - spacing * 0.3,
+            y_at(&chart, 10.6),
+            DrawingModifiers::default(),
+        )
+        .created
+        .unwrap();
+    let points = chart.drawing(id).unwrap().points.clone();
+    assert_eq!(
+        points,
+        vec![
+            DrawingPoint {
+                logical: 2.0,
+                price: 12.0
+            },
+            DrawingPoint {
+                logical: 7.0,
+                price: 10.5
+            },
+        ]
+    );
+    let texts = pane_texts(&mut chart);
+    assert!(texts.contains(&falling), "{texts:?}");
+    assert!(texts.contains(&elapsed), "{texts:?}");
+    // A committed range keeps its own color in both directions: only the transient Shift-click
+    // measure follows its pull.
+    assert!(has_fill(&mut chart, primary()));
+    assert!(!has_fill(&mut chart, market_down()));
+
+    // Both arrows end in the drawing's cap and the label sits beyond the falling end level.
+    assert_eq!(arrowheads(&mut chart, primary()), 2);
+    assert_eq!(arrowheads(&mut chart, market_down()), 0);
+    let end_y = y_at(&chart, 10.5);
+    let frame = chart.build_frame();
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::Text { text, y, .. } if *text == elapsed && f64::from(*y) > end_y)));
+}
+
+#[test]
+fn measure_direction_follows_the_pull_for_every_tool() {
+    let mut chart = settled_chart();
+    // Pulled up: positive statistics, drawing color, label above the end level.
+    let up = add_measure(
+        &mut chart,
+        DrawingKind::PriceRange,
+        (2.0, 10.0),
+        (6.0, 12.5),
+    );
+    let rising = "+2.50  +25.00%  +250 ticks".to_string();
+    let texts = pane_texts(&mut chart);
+    assert!(texts.contains(&rising), "{texts:?}");
+    assert!(has_fill(&mut chart, primary()));
+    let frame = chart.build_frame();
+    let main = &frame.panes[0].main;
+    let end_y = y_at(&chart, 12.5);
+    assert!(main.iter().any(|prim| matches!(prim,
+        Prim::Text { text, y, .. } if *text == rising && f64::from(*y) < end_y)));
+    // The price tool frames its two levels with horizontal rules only.
+    assert_eq!(
+        main.iter()
+            .filter(|prim| matches!(prim, Prim::HLine { color, .. } if *color == primary()))
+            .count(),
+        2
+    );
+    assert!(chart.remove_drawing(up));
+
+    // Date range pulled backward in time: negative bars and elapsed time, vertical rules, and
+    // still the drawing color (the direction is in the sign, not the paint).
+    add_measure(&mut chart, DrawingKind::DateRange, (7.0, 11.0), (4.0, 12.0));
+    let texts = pane_texts(&mut chart);
+    assert!(texts.contains(&"-3 bars  -3h".to_string()), "{texts:?}");
+    assert!(has_fill(&mut chart, primary()));
+    assert!(!has_fill(&mut chart, market_down()));
+    let frame = chart.build_frame();
+    assert_eq!(
+        frame.panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::VLine { color, .. } if *color == primary()))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn measure_body_hits_inside_its_area_and_selection_exposes_both_anchors() {
+    let mut chart = settled_chart();
+    let id = add_measure(
+        &mut chart,
+        DrawingKind::DateAndPriceRange,
+        (2.0, 10.5),
+        (7.0, 12.5),
+    );
+    let spacing = x_at(&chart, 3.0) - x_at(&chart, 2.0);
+    let inside = (x_at(&chart, 4.0) + spacing * 0.5, y_at(&chart, 11.5));
+    let hit = chart.hit_test_drawing(inside.0, inside.1).unwrap();
+    assert_eq!((hit.id, hit.part), (id, DrawingDragPart::Body));
+    assert!(chart
+        .hit_test_drawing(x_at(&chart, 8.0) + spacing * 0.5, y_at(&chart, 11.5))
+        .is_none());
+    chart.set_selected_drawing(Some(id));
+    let end = chart
+        .hit_test_drawing(x_at(&chart, 7.0), y_at(&chart, 12.5))
+        .unwrap();
+    assert_eq!(end.part, DrawingDragPart::Anchor(1));
+
+    // Anchor drags stay on whole bars and price ticks (scale min_move 0.01 here).
+    assert!(chart.drawing_drag_start_at(x_at(&chart, 7.0), y_at(&chart, 12.5)));
+    chart.drawing_drag_to(
+        x_at(&chart, 8.0) + spacing * 0.2,
+        y_at(&chart, 12.0) + 0.37,
+        DrawingModifiers::default(),
+    );
+    chart.drawing_drag_end();
+    let end = chart.drawing(id).unwrap().points[1];
+    assert_eq!(end.logical, 8.0);
+    assert!((end.price * 100.0 - (end.price * 100.0).round()).abs() < 1e-6);
+}
+
+#[test]
+fn measure_persists_and_its_axis_views_follow_selection() {
+    let mut chart = settled_chart();
+    let id = add_measure(
+        &mut chart,
+        DrawingKind::DateAndPriceRange,
+        (2.0, 12.0),
+        (6.0, 10.0),
+    );
+    chart.axis_w = 80.0;
+    chart.build_frame();
+    // Axis tags carry the drawing's own color as their background.
+    let tags = |chart: &mut ChartEngine| {
+        chart
+            .build_axis_frame(
+                80.0,
+                |text, _bold| text.len() as f64 * 7.0,
+                |text, _bold| text.len() as f64 * 6.0,
+            )
+            .labels
+            .into_iter()
+            .filter(|label| {
+                label
+                    .background
+                    .is_some_and(|background| background.4 == primary())
+            })
+            .count()
+    };
+    let before = tags(&mut chart);
+    chart.set_selected_drawing(Some(id));
+    // Two price tags plus two time tags while the range is selected.
+    assert_eq!(tags(&mut chart) - before, 4);
+
+    assert!(chart.drawing_apply_options(id, r#"{"fill_enabled":false}"#));
+    let saved = chart.export_state_json().unwrap();
+    // The canonical name is written; the pre-merge spelling never is.
+    assert!(saved.contains("\"date_and_price_range\""));
+    assert!(!saved.contains("date_price_range"));
+    let mut restored = settled_chart();
+    restored.import_state_json(&saved).unwrap();
+    let drawing = restored.drawing(id).unwrap();
+    assert_eq!(drawing.kind, DrawingKind::DateAndPriceRange);
+    assert_eq!(drawing.points, chart.drawing(id).unwrap().points);
+    assert!(!drawing.fill_enabled);
+
+    // Documents written by upstream builds name the earlier spelling and still import.
+    let legacy = saved.replace("\"date_and_price_range\"", "\"date_price_range\"");
+    let mut migrated = settled_chart();
+    migrated.import_state_json(&legacy).unwrap();
+    let drawing = migrated.drawing(id).unwrap();
+    assert_eq!(drawing.kind, DrawingKind::DateAndPriceRange);
+    assert_eq!(drawing.points, chart.drawing(id).unwrap().points);
+    assert!(!migrated
+        .export_state_json()
+        .unwrap()
+        .contains("date_price_range"));
+}
+
+#[test]
+fn shift_measure_drag_freezes_on_release_and_the_next_press_dismisses_it() {
+    let mut chart = settled_chart();
+    let start = (x_at(&chart, 3.0), y_at(&chart, 11.0));
+    let end = (x_at(&chart, 6.0), y_at(&chart, 12.5));
+    let none = DrawingModifiers::default();
+    // Without Shift (or an existing measure) the press belongs to the host's other gestures.
+    assert!(!chart.measure_pointer_down(start.0, start.1, false, none));
+    assert!(chart.measure_pointer_down(start.0, start.1, true, none));
+    assert!(chart.measure_following());
+    assert!(chart.measure_pointer_move(end.0, end.1, none));
+    assert!(chart.measure_pointer_up(end.0, end.1, none));
+    assert!(chart.measure_active() && !chart.measure_following());
+    assert_eq!(
+        chart.measure_points().unwrap(),
+        [
+            DrawingPoint {
+                logical: 3.0,
+                price: 11.0
+            },
+            DrawingPoint {
+                logical: 6.0,
+                price: 12.5
+            },
+        ]
+    );
+    // Frozen: moves no longer change it.
+    assert!(!chart.measure_pointer_move(start.0, start.1, none));
+    let texts = pane_texts(&mut chart);
+    assert!(
+        texts.contains(&"+1.50  +13.64%  +150 ticks".to_string()),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&"3 bars  3h".to_string()));
+    // A rising pull paints in the drawing default color.
+    assert!(has_fill(&mut chart, primary()));
+    // Transient: never a drawing, history entry, or persisted object.
+    assert!(chart.drawings().is_empty());
+    assert!(!chart.can_undo_drawing());
+    let saved = chart.export_state_json().unwrap();
+    assert!(!saved.contains("date_and_price_range") && !saved.contains("date_price_range"));
+
+    assert!(chart.measure_pointer_down(end.0, end.1, false, none));
+    assert!(!chart.measure_active());
+    assert!(!pane_texts(&mut chart).contains(&"3 bars  3h".to_string()));
+}
+
+#[test]
+fn shift_measure_click_move_click_and_cancellation() {
+    let mut chart = settled_chart();
+    let none = DrawingModifiers::default();
+    let start = (x_at(&chart, 6.0), y_at(&chart, 12.0));
+    assert!(chart.measure_pointer_down(start.0, start.1, true, none));
+    // A release inside the click slop keeps following until the next press.
+    assert!(!chart.measure_pointer_up(start.0 + 2.0, start.1 + 1.0, none));
+    assert!(chart.measure_following());
+    assert!(chart.measure_pointer_move(x_at(&chart, 2.0), y_at(&chart, 10.0), none));
+    assert!(chart.measure_pointer_down(x_at(&chart, 2.0), y_at(&chart, 10.0), false, none));
+    assert!(!chart.measure_following());
+    assert!(!chart.measure_pointer_up(x_at(&chart, 2.0), y_at(&chart, 10.0), none));
+    let texts = pane_texts(&mut chart);
+    assert!(
+        texts.contains(&"\u{2212}2.00  -16.67%  -200 ticks".to_string()),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&"-4 bars  -4h".to_string()), "{texts:?}");
+    // A falling pull paints in the market-down color, not the drawing default.
+    assert!(has_fill(&mut chart, market_down()));
+    assert!(!has_fill(&mut chart, primary()));
+
+    // A pointer beyond the pane clamps into it instead of dropping the measure.
+    assert!(chart.cancel_measure());
+    assert!(chart.measure_pointer_down(start.0, start.1, true, none));
+    chart.measure_pointer_move(start.0, -500.0, none);
+    let top_price = chart.measure_points().unwrap()[1].price;
+    assert!(top_price.is_finite() && top_price > 12.0);
+
+    // Escape (the drawing-tool cancel) dismisses it; arming a tool replaces it and owns presses.
+    chart.cancel_drawing_tool();
+    assert!(!chart.measure_active());
+    assert!(chart.measure_pointer_down(start.0, start.1, true, none));
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    assert!(!chart.measure_active());
+    assert!(!chart.measure_pointer_down(start.0, start.1, true, none));
+}
+
+#[test]
+fn shift_measure_color_follows_its_pull_and_flips_with_the_end_anchor() {
+    let mut chart = settled_chart();
+    let none = DrawingModifiers::default();
+    let start = (x_at(&chart, 4.0), y_at(&chart, 11.0));
+    assert!(chart.measure_pointer_down(start.0, start.1, true, none));
+    // Pulled up, then down, then up again: the session recolors on each flip of the pull.
+    for (price, down) in [(12.0, false), (10.0, true), (13.0, false)] {
+        assert!(chart.measure_pointer_move(x_at(&chart, 7.0), y_at(&chart, price), none));
+        assert_eq!(has_fill(&mut chart, market_down()), down, "{price}");
+        assert_eq!(has_fill(&mut chart, primary()), !down, "{price}");
+    }
+    // A committed range keeps its own color whatever the transient measure does.
+    chart.cancel_measure();
+    add_measure(
+        &mut chart,
+        DrawingKind::PriceRange,
+        (2.0, 12.0),
+        (6.0, 10.0),
+    );
+    assert!(has_fill(&mut chart, primary()));
+    assert!(!has_fill(&mut chart, market_down()));
+}
+
+#[test]
+fn grid_snapped_ranges_nudge_by_at_least_one_bar_and_one_tick() {
+    for kind in [
+        DrawingKind::PriceRange,
+        DrawingKind::DateRange,
+        DrawingKind::DateAndPriceRange,
+    ] {
+        let mut chart = settled_chart();
+        let id = add_measure(&mut chart, kind, (2.0, 10.5), (7.0, 12.5));
+        chart.set_selected_drawing(Some(id));
+        let before = chart.drawing(id).unwrap().points.clone();
+        // A one-pixel key step is far below a bar or a tick, yet a handle moves one whole bar.
+        assert!(chart.nudge_selected_drawing(1.0, 0.0, Some(0)), "{kind:?}");
+        let points = chart.drawing(id).unwrap().points.clone();
+        assert_eq!(points[0].logical, 3.0, "{kind:?}");
+        assert_eq!(points[1], before[1], "{kind:?}");
+        assert!(chart.undo_drawing(), "{kind:?}");
+        assert_eq!(chart.drawing(id).unwrap().points, before, "{kind:?}");
+        // The body moves rigidly by whole bars.
+        assert!(chart.nudge_selected_drawing(-1.0, 0.0, None), "{kind:?}");
+        let points = chart.drawing(id).unwrap().points.clone();
+        assert_eq!(
+            (points[0].logical, points[1].logical),
+            (1.0, 6.0),
+            "{kind:?}"
+        );
+        assert!(chart.undo_drawing(), "{kind:?}");
+        // Up is one price tick (0.01 on this scale) or more, and lands on the tick grid.
+        assert!(chart.nudge_selected_drawing(0.0, -1.0, Some(1)), "{kind:?}");
+        let moved = chart.drawing(id).unwrap().points[1];
+        assert!(moved.price > before[1].price, "{kind:?}");
+        assert!((moved.price * 100.0 - (moved.price * 100.0).round()).abs() < 1e-6);
+        assert!(chart.undo_drawing(), "{kind:?}");
+        assert_eq!(chart.drawing(id).unwrap().points, before, "{kind:?}");
+    }
+}
+
+#[test]
+fn range_ticks_count_on_the_instrument_tick_and_the_price_band_ladder() {
+    let mut chart = settled_chart();
+    chart
+        .set_instrument_metadata(crate::InstrumentMetadata {
+            tick_size: Some(0.25),
+            ..Default::default()
+        })
+        .unwrap();
+    // The instrument tick, not the 0.01 display tick: 1.50 is six ticks.
+    let range = add_measure(
+        &mut chart,
+        DrawingKind::PriceRange,
+        (2.0, 10.0),
+        (6.0, 11.5),
+    );
+    let texts = pane_texts(&mut chart);
+    assert!(
+        texts.contains(&"+1.50  +15.00%  +6 ticks".to_string()),
+        "{texts:?}"
+    );
+    assert!(chart.remove_drawing(range));
+
+    // A price-band ladder is the scale's single tick source: 100 ticks of 0.01 below 10, then
+    // 0.02 ticks, so 9.00 to 11.00 is 150 ticks whatever the instrument tick says.
+    assert!(chart.series_apply_price_format_json(
+        0,
+        r#"{"type":"price","tick_ladder":[{"from":0,"min_move":0.01},{"from":10,"min_move":0.02}]}"#
+    ));
+    chart.build_frame();
+    let range = add_measure(&mut chart, DrawingKind::PriceRange, (2.0, 9.0), (6.0, 11.0));
+    let texts = pane_texts(&mut chart);
+    assert!(
+        texts.iter().any(|text| text.ends_with("+150 ticks")),
+        "{texts:?}"
+    );
+    // Free anchors sit off the ladder grid: ticks count between the nearest grid prices
+    // (9.00 to 11.02 is 151 ticks) instead of dropping the metric.
+    assert!(chart.remove_drawing(range));
+    add_measure(
+        &mut chart,
+        DrawingKind::PriceRange,
+        (2.0, 9.0),
+        (6.0, 11.013),
+    );
+    let texts = pane_texts(&mut chart);
+    assert!(
+        texts.iter().any(|text| text.ends_with("+151 ticks")),
+        "{texts:?}"
+    );
+}
+
+#[test]
+fn measure_elapsed_time_follows_the_anchor_time_identity_not_the_display_projection() {
+    let mut chart = settled_chart();
+    add_measure(
+        &mut chart,
+        DrawingKind::DateRange,
+        (6.0, 11.0),
+        (12.0, 11.0),
+    );
+    // Slot 12 is beyond the data: the elapsed time extrapolates with the prevailing bar interval,
+    // and a display-only time projection never changes what the anchors measure.
+    assert!(pane_texts(&mut chart).contains(&"6 bars  6h".to_string()));
+    assert!(chart.set_future_time_projection(Some(3600), 10));
+    let texts = pane_texts(&mut chart);
+    assert!(texts.contains(&"6 bars  6h".to_string()), "{texts:?}");
+    // A reload at a 2h cadence re-spaces the bars under the anchors, which keep their time
+    // identity: the bar count follows the new spacing and the elapsed time stays 6h, and the
+    // label refreshes without any pointer or option change.
+    let times = (0..10).map(|i| (i * 7200) as f64).collect::<Vec<_>>();
+    let values = [11.0, 12.0, 11.0, 10.0, 11.0, 12.0, 13.0, 12.0, 11.0, 10.0];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    let texts = pane_texts(&mut chart);
+    assert!(texts.contains(&"3 bars  6h".to_string()), "{texts:?}");
+}
+
+#[test]
+fn measure_label_keeps_an_offscreen_area_in_the_viewport_candidates() {
+    let mut chart = settled_chart();
+    // More than 20 drawings switches frame construction to indexed viewport culling.
+    for index in 0..24 {
+        add_measure(
+            &mut chart,
+            DrawingKind::PriceRange,
+            (1.0 + index as f64 * 0.1, 10.5),
+            (2.0, 11.0),
+        );
+    }
+    // The area ends 34 px above the pane, beyond the touch hit padding, while the two-line
+    // statistics box beyond that end still reaches into the pane.
+    let above = chart.series_coordinate_to_price(0, -90.0).unwrap();
+    let edge = chart.series_coordinate_to_price(0, -34.0).unwrap();
+    // A fall that ends just above the pane: its box paints below the end, partly inside the pane.
+    add_measure(
+        &mut chart,
+        DrawingKind::DateAndPriceRange,
+        (4.0, above),
+        (6.0, edge),
+    );
+    let falling = pane_texts(&mut chart)
+        .into_iter()
+        .filter(|text| text.starts_with('\u{2212}'))
+        .count();
+    assert_eq!(falling, 1);
+}
+
+#[test]
+fn drawing_revision_advances_on_every_committed_path_and_not_on_hover_selection_drag_or_typing() {
+    // Hosts persist when this one counter changes (the drawing sync revision). A cell's
+    // accepted sync payload replaces its drawings, so it counts too.
+    let mut source = settled_chart();
+    add_trend(&mut source);
+    let payload = source.drawing_sync_payload_json("cell-b").unwrap();
+    let mut chart = settled_chart();
+    let mut last = chart.drawing_revision();
+    fn advanced(chart: &ChartEngine, last: &mut u64, what: &str) {
+        let now = chart.drawing_revision();
+        assert!(
+            now > *last,
+            "{what} advances the revision ({last} -> {now})"
+        );
+        *last = now;
+    }
+    assert!(chart.apply_drawing_sync_payload_json(&payload));
+    advanced(&chart, &mut last, "an accepted sync payload");
+    let id = chart.drawings()[0].id;
+    // Same payload again: stale, rejected, no revision.
+    assert!(!chart.apply_drawing_sync_payload_json(&payload));
+    assert_eq!(chart.drawing_revision(), last);
+
+    // Hover, selection, an unfinished drag, and live typing are not committed edits.
+    let anchor = (x_at(&chart, 2.0), y_at(&chart, 10.5));
+    chart.update_drawing_hover(anchor.0, anchor.1);
+    chart.set_selected_drawing(Some(id));
+    assert!(chart.drawing_drag_start_at(anchor.0, anchor.1));
+    chart.drawing_drag_to(
+        anchor.0 + 30.0,
+        anchor.1 - 20.0,
+        DrawingModifiers::default(),
+    );
+    assert_eq!(chart.drawing_revision(), last, "an unfinished drag");
+    chart.drawing_drag_end();
+    advanced(&chart, &mut last, "a finished anchor drag");
+
+    chart.build_frame();
+    assert!(chart.begin_drawing_text_edit(id, true));
+    assert!(chart.drawing_text_edit_insert("note"));
+    assert_eq!(chart.drawing_revision(), last, "live typing");
+    assert!(chart.commit_drawing_text_edit());
+    advanced(&chart, &mut last, "a text commit");
+
+    assert!(chart.drawing_apply_options(id, r##"{"color":"#123456"}"##));
+    advanced(&chart, &mut last, "a style change");
+    assert!(chart.undo_drawing());
+    advanced(&chart, &mut last, "undo");
+    assert!(chart.redo_drawing());
+    advanced(&chart, &mut last, "redo");
+    assert!(chart.set_drawing_price_basis(Some("adjusted")).is_ok());
+    advanced(&chart, &mut last, "a price-basis label");
+    let rescaled = chart
+        .rescale_drawing_prices(
+            &[crate::DrawingPriceSegment {
+                from_time: None,
+                to_time: None,
+                factor: 2.0,
+            }],
+            None,
+        )
+        .unwrap();
+    assert_eq!(rescaled, 1);
+    advanced(&chart, &mut last, "a price rescale");
+    assert!(chart.remove_drawing(id));
+    advanced(&chart, &mut last, "a delete");
+    let created = add_trend(&mut chart);
+    advanced(&chart, &mut last, "a create");
+    assert!(chart.remove_drawing(created));
+}

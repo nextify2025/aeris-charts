@@ -694,7 +694,7 @@ fn escape_svg_text(value: &str) -> String {
 
 /// The SVG renderer may resolve a different font face from GPUI's text shaper. Leave one em
 /// around the measured run so descenders, italic overhang, and antialiasing are not cut by the
-/// SVG viewport. The sprite moves by the same amount, keeping the visible text at its anchor.
+/// SVG viewport. The sprite corner moves by the same amount, keeping the visible text at its anchor.
 fn rotated_text_sprite_bounds(
     left: f32,
     top: f32,

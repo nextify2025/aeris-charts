@@ -737,7 +737,7 @@ export function create_tooltip(chart: chart_api, options: tooltip_options = {}):
   const host = chart.chart_element();
   const element = document.createElement("div");
   element.className = current.class_name;
-  element.style.cssText = "position:absolute;transform:translate(calc(0px - 50%),0);opacity:0;left:0;top:0;z-index:100;pointer-events:none";
+  element.style.cssText = "position:absolute;transform:translate(0px,0px);opacity:0;left:0;top:0;z-index:100;pointer-events:none";
 
   const header = document.createElement("div");
   header.className = "aeris_charts-tooltip__header";
@@ -847,11 +847,22 @@ export function create_tooltip(chart: chart_api, options: tooltip_options = {}):
       : event.point.y + (pane_y <= current.vertical_spacing + current.vertical_deadzone_height
         ? current.vertical_spacing
         : -current.vertical_spacing);
-    const y_percent = current.follow_mode === "tracking"
-      && pane_y > current.vertical_spacing + current.vertical_deadzone_height
-      ? " - 100%"
-      : "";
-    element.style.transform = `translate(calc(${x}px - 50%), calc(${y}px${y_percent}))`;
+    const above = current.follow_mode === "tracking"
+      && pane_y > current.vertical_spacing + current.vertical_deadzone_height;
+    // Resolve centering in pixels and land the box on the device-pixel grid. A `-50%` translate
+    // of an odd- or fractional-width box (or a fractional pointer/host offset) composites the
+    // whole tooltip on a half pixel, blurring its border unevenly and its text.
+    const box = element.getBoundingClientRect();
+    // Translation is relative to the containing block's padding box (the nearest positioned
+    // ancestor), which may itself sit at a fractional page offset.
+    const parent = element.offsetParent ?? host;
+    const parent_box = parent.getBoundingClientRect();
+    const ratio = window.devicePixelRatio || 1;
+    const snap = (offset: number, base: number): number =>
+      Math.round((base + offset) * ratio) / ratio - base;
+    const left = snap(x - box.width / 2, parent_box.left + parent.clientLeft);
+    const top = snap(above ? y - box.height : y, parent_box.top + parent.clientTop);
+    element.style.transform = `translate(${left}px, ${top}px)`;
     element.style.opacity = "1";
   };
   chart.apply_options({

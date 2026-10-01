@@ -229,6 +229,7 @@ const PATTERN_TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 pub(crate) const XABCD_PATTERN: DrawingToolSpec = PATTERN_TOOL;

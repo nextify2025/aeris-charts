@@ -1408,8 +1408,10 @@ export interface time_scale_options {
   /** Keep the visible range constant across chart resizes (reference `lockVisibleTimeRangeOnResize`). */
   lock_visible_time_range_on_resize?: boolean;
   /**
-   * Keep the right-most bar pinned during ordinary time-scale zoom. Defaults to `false`, matching
-   * reference-informed cursor anchoring.
+   * Keep the right-most bar pinned during ordinary time-scale zoom. Defaults to `true`, matching
+   * measured TradingView wheel zoom: the gap after the latest bar stays constant while history
+   * compresses or expands. Ctrl/Cmd + wheel and pinch always zoom around the pointer. Set `false`
+   * for cursor-anchored ordinary zoom (the Lightweight Charts default).
    */
   right_bar_stays_on_scroll?: boolean;
   /**
@@ -2114,7 +2116,9 @@ export interface series_options {
   baseline_value: number;
   /**
    * Pulse an expanding ring at the last value (drives an rAF loop while visible). Default `true`
-   * for line and area series and `false` for every other type; set `false` to disable.
+   * for line and area series and `false` for every other type; set `false` to disable. A value
+   * equal to the current type's default keeps following the default when the series type
+   * changes; a value that differs from it (an opt-out on a line, an opt-in on candles) is kept.
    */
   last_price_animation: boolean;
   /** Keep the series in the engine while toggling its visibility. */
@@ -2489,8 +2493,12 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * The drawing-tool kinds. Each tool is an engine-owned drawing object with defining anchor
  * points: trend line (2), rectangle (2), Long Position / Short Position tools (3: entry, target,
  * stop), horizontal line/ray, vertical line, and text (1 each), a multi-click arrow-ended
- * straight-segment path (variable length, every vertex editable), and the freehand brush (a
- * variable-length curve, anchor handles at the two ends).
+ * straight-segment path (variable length, every vertex editable), the freehand brush (a
+ * variable-length curve, anchor handles at the two ends), and the price range, date range, and
+ * date-and-price range measuring tools (2: start, end; the measured sign follows start → end).
+ * The measuring tools snap both anchors to whole bars and price ticks. Holding Shift while
+ * clicking an empty pane starts a transient date-and-price range (the quick measure; it is never a
+ * drawing, history entry, or persisted object).
  *
  * Lines family (B8): `ray`, `extended_line`, `info_line`, `trend_angle`, and `arrow_line` place
  * two anchors; `extend_left` extends beyond the first anchor and `extend_right` beyond the second

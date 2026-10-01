@@ -869,6 +869,7 @@ impl ChartEngine {
         let movable_label_start = out.labels.len();
         self.append_rectangle_drawing_axis_views(&mut out, &measure);
         self.append_position_drawing_axis_views(&mut out, &measure);
+        self.append_measure_drawing_axis_views(&mut out, &measure);
         self.append_price_line_labels(&mut out.labels, &measure);
         self.append_drawing_line_labels(&mut out.labels, &measure);
         let last_value_start = out.labels.len();
@@ -1248,6 +1249,160 @@ impl ChartEngine {
                     font_scale: AXIS_FONT_SCALE,
                     bold: false,
                     background: Some((box_x, self.pane_h, width, height, drawing_label_background)),
+                    background_corners: AxisLabelCorners::BOTTOM,
+                    measure_extra: 0.0,
+                    attach_group: None,
+                    border: None,
+                });
+            }
+        }
+    }
+
+    /// Measuring tools project their endpoints onto the axes while active (selected, being
+    /// placed, or the transient Shift-click measure): price tags on the bound scale for the price
+    /// tools and time tags for the date tools, in the drawing's color (the transient measure's
+    /// color follows its pull).
+    fn append_measure_drawing_axis_views<F>(&self, out: &mut AxisFrame, measure: &F)
+    where
+        F: Fn(&str, bool) -> f64,
+    {
+        for drawing in &self.drawings {
+            if drawing.kind.is_measure()
+                && drawing.points.len() == 2
+                && self.selected_drawing == Some(drawing.id)
+                && drawing.visible
+                && drawing.interval_visibility.allows(self.drawing_interval)
+            {
+                self.append_measure_axis_view(drawing, out, measure);
+            }
+        }
+        if let Some(pending) = self
+            .pending_drawing()
+            .filter(|pending| pending.drawing.kind.is_measure())
+        {
+            let mut drawing = pending.drawing.clone();
+            if drawing.points.len() < 2 {
+                drawing.points.extend(pending.preview);
+            }
+            if drawing.points.len() == 2 {
+                self.append_measure_axis_view(&drawing, out, measure);
+            }
+        }
+        if let Some(session) = self.measure_session() {
+            self.append_measure_axis_view(&session.drawing, out, measure);
+        }
+    }
+
+    fn append_measure_axis_view<F>(
+        &self,
+        drawing: &crate::Drawing,
+        out: &mut AxisFrame,
+        measure: &F,
+    ) where
+        F: Fn(&str, bool) -> f64,
+    {
+        let Some(axes) = crate::drawings::MeasureAxes::for_kind(drawing.kind) else {
+            return;
+        };
+        let Some(pane) = self.panes.get(drawing.pane_index) else {
+            return;
+        };
+        let background = drawing.stroke_color().solid();
+        let text_color = self.axis_label_text_color(background);
+        let metrics = self.axis_metrics();
+        let target = match drawing.price_scale {
+            crate::DrawingPriceScale::Right => PriceScaleTarget::Right,
+            crate::DrawingPriceScale::Left => PriceScaleTarget::Left,
+            crate::DrawingPriceScale::Overlay => PriceScaleTarget::Overlay,
+        };
+        let left_side = matches!(drawing.price_scale, crate::DrawingPriceScale::Left);
+        let scale_visible = if left_side {
+            self.options.get().left_price_scale.visible && self.left_axis_w > 0.0
+        } else {
+            self.options.get().right_price_scale.visible && self.axis_w > 0.0
+        };
+        if axes.price() && scale_visible {
+            if let Some(scale) = self.price_scale_for(drawing.pane_index, target) {
+                let base = self.drawing_scale_base_for(drawing.pane_index, drawing.price_scale);
+                for point in &drawing.points {
+                    let Some((_, y)) =
+                        self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, *point)
+                    else {
+                        continue;
+                    };
+                    if y < pane.top || y > pane.top + pane.height {
+                        continue;
+                    }
+                    let logical_price = scale.price_to_logical_value(point.price, base);
+                    let text =
+                        self.format_tick_value(drawing.pane_index, target, scale, logical_price);
+                    let width = AxisMetrics::price_tag_width(measure(&text, false));
+                    let height = metrics.price_tag_height();
+                    let (x, align, background_x) = if left_side {
+                        (
+                            self.pane_left - AxisMetrics::PRICE_TEXT_INSET,
+                            AxisTextAlign::Right,
+                            self.pane_left - width,
+                        )
+                    } else {
+                        (
+                            self.pane_left + self.pane_w + AxisMetrics::PRICE_TEXT_INSET,
+                            AxisTextAlign::Left,
+                            self.pane_left + self.pane_w,
+                        )
+                    };
+                    out.labels.push(AxisLabel {
+                        text,
+                        x,
+                        y,
+                        color: text_color,
+                        align,
+                        midpoint: AxisTextMidpoint::Label,
+                        font_scale: AXIS_FONT_SCALE,
+                        bold: false,
+                        background: Some((
+                            background_x,
+                            y - height / 2.0,
+                            width,
+                            height,
+                            background,
+                        )),
+                        background_corners: AxisLabelCorners::for_align(align),
+                        measure_extra: 0.0,
+                        attach_group: None,
+                        border: None,
+                    });
+                }
+            }
+        }
+        if axes.date() && self.time_axis_visible {
+            for point in &drawing.points {
+                let index = point.logical.round() as i64;
+                let x = self.time_scale.index_to_coordinate(index);
+                if x < 0.0 || x > self.pane_w {
+                    continue;
+                }
+                let Some(time) = self.axis_time_key_at_logical(index) else {
+                    continue;
+                };
+                let text = self.format_crosshair_ts(time);
+                let width = AxisMetrics::time_tag_width(measure(&text, false));
+                let height = metrics.time_strip_height();
+                let chart_x = self.pane_left + x;
+                let box_x = (chart_x - width / 2.0).clamp(
+                    self.pane_left,
+                    (self.pane_left + self.pane_w - width).max(self.pane_left),
+                );
+                out.labels.push(AxisLabel {
+                    text,
+                    x: box_x + width / 2.0,
+                    y: self.pane_h + metrics.time_text_dy(),
+                    color: text_color,
+                    align: AxisTextAlign::Center,
+                    midpoint: AxisTextMidpoint::StableTime,
+                    font_scale: AXIS_FONT_SCALE,
+                    bold: false,
+                    background: Some((box_x, self.pane_h, width, height, background)),
                     background_corners: AxisLabelCorners::BOTTOM,
                     measure_extra: 0.0,
                     attach_group: None,

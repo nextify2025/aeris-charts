@@ -703,7 +703,12 @@ test("tooltip presents themed OHLC market data with explicit volume", async ({ p
     color: getComputedStyle(element).color,
     borderRadius: getComputedStyle(element).borderRadius,
     shadow: getComputedStyle(element).boxShadow,
-    transform: element.style.transform,
+    box: (() => {
+      const rect = element.getBoundingClientRect();
+      const pane_top = window.__chart.chart_element().getBoundingClientRect().top
+        + window.__chart.panes()[0].get_geometry().top;
+      return { left: rect.left, top: rect.top, offset: rect.top - pane_top, dpr: window.devicePixelRatio };
+    })(),
   }));
   expect(content.timestamp).toMatch(/\w{3} \d{1,2}.*\d{1,2}:\d{2}/);
   expect(content.title).toBe("AAPL");
@@ -720,7 +725,12 @@ test("tooltip presents themed OHLC market data with explicit volume", async ({ p
   expect(content.color).toBe("rgb(245, 245, 245)");
   expect(content.borderRadius).toBe("8px");
   expect(content.shadow).toBe("none");
-  expect(content.transform).toContain("20px");
+  // `top_offset` places the box 20 px below the pane top, snapped to the device-pixel grid so
+  // its border and text render crisp on every side (a half-pixel position blurs them).
+  expect(Math.abs(content.box.offset - 20)).toBeLessThanOrEqual(1 / content.box.dpr + 1e-6);
+  for (const edge of [content.box.left, content.box.top]) {
+    expect(Math.abs(edge * content.box.dpr - Math.round(edge * content.box.dpr))).toBeLessThan(1e-3);
+  }
 
   await page.evaluate(async () => {
     const api = await import("/dist/aeris_charts_financial.js");
