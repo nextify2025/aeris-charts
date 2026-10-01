@@ -1953,10 +1953,10 @@ impl ChartEngine {
         if !state.chart_options.is_object() {
             return Err(invalid("V2 chart_options must be an object"));
         }
-        serde_json::from_value::<aeris_charts_core::options::ChartOptions>(
-            state.chart_options.clone(),
-        )
-        .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
+        let chart_options =
+            crate::exchange_time_api::importable_chart_options(&state.chart_options);
+        serde_json::from_value::<aeris_charts_core::options::ChartOptions>(chart_options.clone())
+            .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
         let domains = state
             .panes
             .iter()
@@ -2027,7 +2027,7 @@ impl ChartEngine {
         // installed value, so both the staged chart and the live chart judge the options against
         // the exchange time the live chart will run with.
         staged.exchange_time = self.exchange_time.clone();
-        let options_json = serde_json::to_string(&state.chart_options)
+        let options_json = serde_json::to_string(&chart_options)
             .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
         staged
             .apply_options(&options_json)
@@ -2035,7 +2035,7 @@ impl ChartEngine {
         // Everything the live chart's own state can reject (an installed bar time label that the
         // document's session start does not fit) is decided before the first field is replaced.
         let prepared_options = self
-            .prepare_options_patch(&state.chart_options)
+            .prepare_options_patch(&chart_options)
             .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
         self.panes = staged.panes;
         self.general_horizontal_domains = staged.general_horizontal_domains;
@@ -2049,7 +2049,7 @@ impl ChartEngine {
         self.next_persistent_pane_id = staged.next_persistent_pane_id;
         self.next_drawing_id = staged.next_drawing_id;
         self.options = staged.options;
-        self.apply_prepared_options(&state.chart_options, prepared_options);
+        self.apply_prepared_options(&chart_options, prepared_options);
         // A document without exchange-time keys keeps the chart's installed zone and session
         // start; mirror a non-default one so the replaced options store still describes the live
         // chart (absent keys already mean UTC, keeping default documents byte-stable).

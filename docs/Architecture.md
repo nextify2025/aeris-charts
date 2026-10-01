@@ -147,7 +147,7 @@ Platform-free chart fundamentals: validated canonical columnar data, compact plo
 
 The `time_zone` module (`ChartTimeZone`, `TRADINGVIEW_TIME_ZONES`) maps the 98 TradingView parity zone ids
 onto the embedded `chrono-tz` database (chrono without its `clock` feature, so no system zone is ever read)
-and resolves a zone into a bounded `UtcOffsetSchedule` (`ChartTimeZone::offset_schedule`, about 4 ms per
+and resolves a zone into a bounded `UtcOffsetSchedule` (`ChartTimeZone::offset_schedule`, 2.6–5.9 ms per
 zone natively, paid once per zone change). `.cargo/config.toml` sets `CHRONO_TZ_TIMEZONE_FILTER` so the
 tables compiled into this repository's artifacts hold only the parity zones; a consumer that takes the
 crate by Git does not read that file and compiles the complete database, which costs only native size.
@@ -1516,8 +1516,9 @@ pair's first click or tap was taken by a trading object or the alert widget (who
 reach the drawing pipeline, so the selection and the press snapshot they leave behind are stale),
 and the host asks the engine `drawing_at` (the drawing a click at the point would select:
 `drawing_text_hit_at`, then `hit_test_drawing`, read-only) and acts only when that is the
-selected drawing. Placing a tool the engine marks `requests_text_editor` opens the editor too,
-and a commit or Escape keeps such a drawing even when its text was emptied. Host `dbl_click`
+selected drawing. Placing a tool the engine marks `requests_text_editor` opens the editor too.
+A commit or Escape keeps such a drawing even when its text was emptied, except the text tool,
+which is removed when it is left empty (Escape on a fresh placement included). Host `dbl_click`
 subscribers still run after the editor opens. The editor is a labeled `textbox`, announces
 opening and closing through the accessibility live region, and returns focus to the element it
 was opened from inside the chart after Enter or Escape; when it closes because focus moved to

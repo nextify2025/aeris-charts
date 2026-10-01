@@ -298,13 +298,37 @@ impl ChartEngine {
                 layout.italic,
             )
         };
-        let mut best = (0, local_x.abs());
-        let mut prefix = String::with_capacity(line.len());
-        for (index, c) in line.chars().enumerate() {
-            prefix.push(c);
-            let distance = (measure(&prefix) - local_x).abs();
-            if distance < best.1 {
-                best = (index + 1, distance);
+        // The width of a prefix never shrinks as the prefix grows, so the boundary nearest the
+        // pointer is found by bisection (a handful of measures) instead of measuring every
+        // prefix, which is quadratic on the 64 KiB label bound.
+        let boundaries: Vec<usize> = line
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(line.len()))
+            .collect();
+        let width_at = |index: usize| {
+            if index == 0 {
+                0.0
+            } else {
+                measure(&line[..boundaries[index]])
+            }
+        };
+        let (mut low, mut high) = (0, boundaries.len() - 1);
+        while low < high {
+            let middle = (low + high) / 2;
+            if width_at(middle) < local_x {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        // The first boundary at or past the pointer and the one before it; a tie takes the
+        // earlier boundary.
+        let mut best = (low, (width_at(low) - local_x).abs());
+        if low > 0 {
+            let before = (width_at(low - 1) - local_x).abs();
+            if before <= best.1 {
+                best = (low - 1, before);
             }
         }
         let before: usize = lines[..row]
@@ -552,6 +576,39 @@ mod tests {
         assert_eq!(chart.drawing_text_edit(), Some((id, "abcd", 3)));
         assert!(chart.drawing_text_edit_caret_at(x - 30.0, y));
         assert_eq!(chart.drawing_text_edit(), Some((id, "abcd", 0)));
+    }
+
+    #[test]
+    fn click_placement_on_a_long_line_measures_a_logarithmic_number_of_prefixes() {
+        // The text bound is 64 KiB, so a click inside a long label must not measure every prefix
+        // (that is quadratic work on the input thread). Prefix widths grow with the prefix, so a
+        // bisection finds the nearest boundary.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut chart, id) = chart_with(DrawingKind::Text, "");
+        let counter = Arc::clone(&calls);
+        chart.set_text_measure(Some(Box::new(move |text, _, _, _, _| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            text.chars().count() as f64 * 10.0
+        })));
+        let long = "a".repeat(20_000);
+        assert!(chart
+            .drawing_apply_options(id, &format!(r#"{{"text":"{long}","text_h_align":"left"}}"#)));
+        chart.build_frame();
+        assert!(chart.begin_drawing_text_edit(id, true));
+        let (x, y, _) = chart.drawing_text_transform(id).unwrap();
+        calls.store(0, Ordering::Relaxed);
+        // 123_457 px at 10 px per character is 12_345.7 characters in: nearest boundary 12_346.
+        assert!(chart.drawing_text_edit_caret_at(x + 123_457.0, y));
+        assert_eq!(chart.drawing_text_edit().map(|edit| edit.2), Some(12_346));
+        let measured = calls.load(Ordering::Relaxed);
+        assert!(measured <= 60, "{measured} prefix measures for one click");
+        // Past either end the caret clamps to the boundary, and a tie takes the earlier one.
+        assert!(chart.drawing_text_edit_caret_at(x + 1.0e9, y));
+        assert_eq!(chart.drawing_text_edit().map(|edit| edit.2), Some(20_000));
+        assert!(chart.drawing_text_edit_caret_at(x + 15.0, y));
+        assert_eq!(chart.drawing_text_edit().map(|edit| edit.2), Some(1));
     }
 
     #[test]

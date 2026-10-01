@@ -41,7 +41,10 @@ The supported root surface is:
 - Long Position and Short Position drawings through the canonical `drawing_kind` values
   `"long_position"` and `"short_position"`; each stores three editable anchors in entry, target,
   stop order, paints target/entry/stop information, projects all three prices onto the owning Y-axis,
-  and uses the shared drawing history, persistence, hit testing, and backend frame path;
+  and uses the shared drawing history, persistence, hit testing, and backend frame path. The
+  statistics use two persisted drawing options, `position_account_size` (a hypothetical balance,
+  default 1,000) and `position_risk_percent` (the share of it risked at the stop, 0–100, default 25),
+  independent of broker orders;
 - visible-range volume profiles through `chart.add_volume_profile(prices, volume, options)`,
   returning a distribution handle with `options()`, `apply_options()`, `snapshot()` and `remove()`;
 - first-class tick-driven footprint / numbers-bar series through `chart.add_series("footprint")`,
@@ -1128,7 +1131,8 @@ a text edit) advances the sync revision, so an already synced cell accepts the n
 Clipboard payloads are bounded like a persisted drawing document (at most 10,000 drawings, 250,000
 anchors, and 8 MiB): `copy_drawings` throws `resource_limit` past them and `invalid_data` when no
 listed drawing exists, and `clone_drawing` copies any drawing the chart holds. Named templates
-(`drawing_template`, `apply_drawing_template`) carry style only: never a drawing's name, group,
+(`drawing_template`, `apply_drawing_template`) carry style only (plus a position tool's
+`position_account_size` and `position_risk_percent`): never a drawing's name, group,
 revision, visibility, lock, z-order, interval visibility, price scale, or text, so applying one
 restyles the target and keeps its identity and its own text.
 
@@ -1735,7 +1739,12 @@ Four behaviours to review:
   not, and `time_zone_id()` then returns `custom` instead of a TradingView id.
 - A top-level `timezone` option that is not a string, or names an id outside the parity list, now
   rejects the whole options patch (earlier revisions ignored it silently). A host that forwards a
-  TradingView placeholder such as `exchange` must filter it before the patch.
+  TradingView placeholder such as `exchange` must filter it before the patch. Importing a saved V2
+  document is the exception: an unresolvable or non-string `timezone` in its options (a raw value an
+  earlier build stored) is dropped so the rest of the layout still restores.
+- `time_scale_options_json()["time_zone"]` reports the exchange schedule (`"UTC"` or the transition
+  array), not the TradingView id an earlier revision printed there; read the named zone through
+  `time_zone_id()`.
 - A V2 document can carry an additive `timezone` string beside `timeScale.timeZone`, written only
   while a named zone is installed. A consumer that takes `aeris_charts_core` by Git does not read
   this repository's `.cargo/config.toml`, so it compiles the complete tz tables rather than the 98
@@ -1759,6 +1768,13 @@ Three call-site reviews:
   stays on one line; family text boxes (`comment`, `callout`, `note`, `signpost`, `anchored_text`)
   keep line breaks. Native hosts get click-to-caret placement and typing in a box but not Up/Down
   line navigation yet.
+- `drawing_text_hit_at` answers for the label of every tool that paints a text run (lines,
+  channels, Fibonacci, shapes), not only the trend line, and arbitrates against higher drawing bodies.
+  Which click starts typing is the host's rule: the browser opens on the first click only for a trend
+  label and otherwise on double-click, Enter or F2, while the GPUI probe starts typing on any label
+  hit. A native host that wants the browser's rule must apply it itself.
+- Rectangles now default to no border (`border_visible: false`). A saved document that omits the key
+  imports with the border visible, so earlier documents keep their look.
 
 ## Release policy
 

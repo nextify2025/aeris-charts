@@ -36,13 +36,31 @@ fn parse_time_zone(value: &serde_json::Value) -> Result<UtcOffsetSchedule, Strin
             Ok(UtcOffsetSchedule::utc())
         } else {
             Err(format!(
-                "timeScale.timeZone {name:?} must be \"UTC\" or an explicit offset schedule; hosts resolve IANA names"
+                "timeScale.timeZone {name:?} must be \"UTC\" or an explicit offset schedule; name a zone through the top-level timezone option"
             ))
         };
     }
     let transitions: Vec<UtcOffsetTransition> = serde_json::from_value(value.clone())
         .map_err(|error| format!("invalid timeScale.timeZone schedule: {error}"))?;
     UtcOffsetSchedule::new(transitions).map_err(|error| error.to_string())
+}
+
+/// A saved document's `chart_options` as this engine can restore them. A top-level `timezone` that
+/// does not name a supported zone (a raw value an earlier build stored, or a non-string) is
+/// dropped so the rest of the layout still restores; a live patch keeps rejecting it atomically.
+pub(crate) fn importable_chart_options(options: &serde_json::Value) -> serde_json::Value {
+    let mut options = options.clone();
+    let usable = match options.get("timezone") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(id)) => ChartTimeZone::parse(id).is_some(),
+        Some(_) => false,
+    };
+    if !usable {
+        if let Some(map) = options.as_object_mut() {
+            map.remove("timezone");
+        }
+    }
+    options
 }
 
 impl ChartEngine {
@@ -1040,6 +1058,56 @@ mod tests {
         restored.import_state_json(&document).unwrap();
         assert_eq!(restored.time_zone_id(), "custom");
         assert_eq!(restored.exchange_time().offsets(), &shanghai());
+    }
+
+    #[test]
+    fn a_document_naming_an_unresolvable_zone_still_imports_with_the_rest_of_its_options() {
+        // Documents saved by builds that stored the raw `timezone` value can carry an id this
+        // engine does not know (or a non-string). A live patch rejects it atomically, but a saved
+        // layout must still restore: the zone is dropped, everything else applies.
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .add_pane_with_domain(
+                true,
+                crate::HorizontalDomain::Category {
+                    scale: crate::CategoryScaleType::Band,
+                },
+            )
+            .unwrap();
+        chart
+            .apply_options(r#"{"timeScale":{"sessionStart":3600}}"#)
+            .unwrap();
+        let fresh_id = ChartEngine::new(800.0, 500.0, 1.0).time_zone_id();
+        for unresolvable in [
+            serde_json::json!("Mars/Olympus_Mons"),
+            serde_json::json!("exchange"),
+            serde_json::json!(5),
+        ] {
+            let mut document: serde_json::Value =
+                serde_json::from_str(&chart.export_state_json().unwrap()).unwrap();
+            document["chart_options"]["timezone"] = unresolvable.clone();
+            let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+            restored
+                .import_state_json(&document.to_string())
+                .unwrap_or_else(|error| panic!("{unresolvable}: {error:?}"));
+            assert_eq!(restored.time_zone_id(), fresh_id, "{unresolvable}");
+            assert_eq!(
+                restored.exchange_time().session_start_seconds(),
+                3600,
+                "{unresolvable}: the rest of the options applied"
+            );
+            assert!(
+                restored.options.value()["timezone"].is_null(),
+                "{unresolvable}: the unusable value is not kept in the options store"
+            );
+        }
+        // A resolvable id in the same position still installs.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&chart.export_state_json().unwrap()).unwrap();
+        document["chart_options"]["timezone"] = serde_json::json!("Asia/Tokyo");
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        restored.import_state_json(&document.to_string()).unwrap();
+        assert_eq!(restored.time_zone_id(), "Asia/Tokyo");
     }
 
     #[test]

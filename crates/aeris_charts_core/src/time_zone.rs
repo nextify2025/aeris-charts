@@ -258,7 +258,7 @@ impl ChartTimeZone {
 
     /// This zone's UTC-offset schedule over 1970..2100, for the one clock the chart runs on
     /// (`ExchangeTime`): the offset in force at 1970-01-01 also applies before it, and every later
-    /// change is one transition. Resolving a name is a one-time cost (about 2 ms natively), paid
+    /// change is one transition. Resolving a name is a one-time cost (2.6–5.9 ms natively), paid
     /// when a zone is selected, never per frame. The embedded database carries DST through 2099, so
     /// the schedule is complete up to its 2100 end; the offset of its last transition holds beyond.
     pub fn offset_schedule(self) -> Result<UtcOffsetSchedule, ExchangeTimeError> {
