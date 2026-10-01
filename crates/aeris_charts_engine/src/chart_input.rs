@@ -2049,6 +2049,70 @@ mod tests {
     }
 
     #[test]
+    fn a_drawing_whose_text_is_scrolled_out_of_view_opens_no_editor() {
+        let mut chart = chart();
+        let none = InputModifiers::default();
+        let (id, _) = trend_line_body(&mut chart);
+        chart.set_selected_drawing(Some(id));
+        // Pan until the whole line, and with it the label, is left of the plot: the selection
+        // persists, but an editor opened there would be invisible and swallow the keys.
+        chart.set_right_offset(200.0);
+        chart.build_frame();
+        let layout = chart.drawing_text_edit_layout(id).unwrap();
+        assert!(layout.rect[2] <= 0.0, "{:?}", layout.rect);
+        assert_eq!(chart.selected_drawing(), Some(id));
+        assert!(!chart.input_key_down(ChartKey::Enter, none, false, 0.0));
+        assert!(!chart.input_key_down(ChartKey::EditText, none, false, 0.0));
+        assert_eq!(chart.editing_drawing(), None);
+
+        // Back in view, the same keys edit it.
+        chart.set_right_offset(0.0);
+        chart.build_frame();
+        assert!(chart.input_key_down(ChartKey::Enter, none, false, 0.0));
+        assert_eq!(chart.editing_drawing(), Some(id));
+        assert!(chart.cancel_drawing_text_edit());
+        assert!(chart.input_key_down(ChartKey::EditText, none, false, 0.0));
+        assert_eq!(chart.editing_drawing(), Some(id));
+    }
+
+    #[test]
+    fn double_click_on_a_visible_body_whose_label_is_out_of_view_opens_no_editor() {
+        let mut chart = chart();
+        // A line running far beyond the right edge: its body crosses the plot while its
+        // label, at the midpoint, is off-screen.
+        let id = chart
+            .add_drawing(
+                DrawingKind::TrendLine,
+                0,
+                vec![
+                    DrawingPoint {
+                        logical: 10.0,
+                        price: 102.0,
+                    },
+                    DrawingPoint {
+                        logical: 300.0,
+                        price: 104.0,
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+        chart.build_frame();
+        let layout = chart.drawing_text_edit_layout(id).unwrap();
+        assert!(layout.rect[0] >= chart.pane_w, "{:?}", layout.rect);
+        let a = chart.drawing_point_to_coordinate(id, 0).unwrap();
+        let slope = (chart.drawing_point_to_coordinate(id, 1).unwrap().1 - a.1)
+            / (chart.drawing_point_to_coordinate(id, 1).unwrap().0 - a.0);
+        let x = a.0 + 150.0;
+        let y = a.1 + slope * 150.0;
+        chart.set_selected_drawing(Some(id));
+        assert_eq!(chart.drawing_at(x, y), Some(id));
+        double_click(&mut chart, x, y);
+        assert_eq!(chart.editing_drawing(), None);
+        assert_eq!(chart.selected_drawing(), Some(id));
+    }
+
+    #[test]
     fn keyboard_keys_follow_the_gesture_switches() {
         let mut chart = chart();
         let none = InputModifiers::default();

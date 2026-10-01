@@ -7096,29 +7096,20 @@ export class chart_impl implements chart_api {
   /**
    * Open the inline editor on a drawing's own text (Enter or F2 on a selected drawing, a
    * double-click on it, or placement of a tool that starts in the editor): whatever the engine
-   * reports editable, presented as the surface its layout describes. Refuses a drawing whose
-   * text is entirely outside the chart, so no invisible editor captures the keys. Returns whether
-   * an editor opened.
+   * reports editable, presented as the surface its layout describes. The engine refuses a
+   * drawing whose text is entirely outside its pane's plot (the same rule the native hosts get),
+   * so no invisible editor captures the keys. Returns whether an editor opened.
    */
   edit_drawing_text(id: number): boolean {
     if (!this.wasm.drawing_text_editable(id)) return false;
     const layout = this.text_edit_layout(id);
-    if (layout === null || !this.text_in_view(layout)) return false;
+    if (layout === null) return false;
     const info = (JSON.parse(this.wasm.drawings_json()) as drawing_info[]).find((d) => d.id === id);
     if (info === undefined) return false;
     const drawing = new drawing_impl(this, info.id, info.kind, info.pane_index);
     if (layout.multiline) this.open_part_label_editor(drawing);
     else this.open_inline_editor(drawing, info.kind === "text" ? "standalone_text" : "run_label");
     return this.text_editor !== null && this.text_editor_id === id;
-  }
-
-  /** Whether any part of the layout's text box is inside the chart's visible area. */
-  private text_in_view(layout: text_edit_layout): boolean {
-    const width = this.overlay.clientWidth;
-    const height = this.overlay.clientHeight;
-    if (width <= 0 || height <= 0) return true;
-    const [left, top, right, bottom] = layout.rect;
-    return right > 0 && left < width && bottom > 0 && top < height;
   }
 
   /**

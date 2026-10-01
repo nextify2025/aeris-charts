@@ -116,11 +116,12 @@ impl ChartEngine {
     }
 
     /// Open typing mode on any drawing that paints its own text ([`ChartEngine::drawing_text_editable`]:
-    /// unlocked, visible, shown on the interval, with a layout). `paint_caret` asks the frame to
-    /// draw the caret (native hosts); a browser host that paints its own caret passes `false`.
-    /// Beginning on the drawing already being edited only refreshes `paint_caret`. A refused
-    /// begin (unknown, locked, hidden, not text-bearing, or anchors that cannot convert) leaves
-    /// any open session alone; otherwise a session open on another drawing is committed first.
+    /// unlocked, visible, shown on the interval, with a layout inside its pane's plot).
+    /// `paint_caret` asks the frame to draw the caret (native hosts); a browser host that paints
+    /// its own caret passes `false`. Beginning on the drawing already being edited only refreshes
+    /// `paint_caret`. A refused begin (unknown, locked, hidden, not text-bearing, anchors that
+    /// cannot convert, or text wholly outside the plot) leaves any open session alone; otherwise
+    /// a session open on another drawing is committed first.
     pub fn begin_drawing_text_edit(&mut self, id: DrawingId, paint_caret: bool) -> bool {
         if let Some(session) = self
             .drawing_text_edit
@@ -459,11 +460,14 @@ mod tests {
             .map(|i| 1_700_000_000.0 + f64::from(i) * 60.0)
             .collect::<Vec<_>>();
         let values = vec![100.0; 20];
+        let (high, low) = (vec![110.0; 20], vec![90.0; 20]);
         chart
-            .set_series_data(0, &times, &values, &values, &values, &values)
+            .set_series_data(0, &times, &values, &high, &low, &values)
             .expect("valid bars");
         chart.time_scale.set_width(800.0);
         chart.fit_content();
+        // The drawings sit inside the scaled bars: an editor opens only on text in view.
+        chart.autoscale_visible();
         let points = match kind {
             DrawingKind::Text => vec![DrawingPoint {
                 logical: 5.0,
@@ -487,6 +491,10 @@ mod tests {
         }
         // Beginning an edit needs a settled chart: the editor layout converts the anchors.
         chart.build_frame();
+        assert!(
+            chart.drawing_text_editable(id),
+            "the fixture text is in view"
+        );
         (chart, id)
     }
 

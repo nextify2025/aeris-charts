@@ -5356,7 +5356,8 @@ impl AerisChart {
     }
     /// Whether the host's inline editor can edit the drawing's text in place: the drawing paints
     /// its own text (every tool but the flag, the icon, and the projection and measuring tools)
-    /// and its anchors convert, while it is unlocked, visible, and shown.
+    /// and its anchors convert, while it is unlocked, visible, shown, and some part of its text is
+    /// inside its pane's plot (text panned wholly out of view is not editable).
     pub fn drawing_text_editable(&self, id: u32) -> bool {
         self.inner.borrow().engine.drawing_text_editable(id)
     }

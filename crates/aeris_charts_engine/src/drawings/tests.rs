@@ -3881,6 +3881,134 @@ fn typing_into_a_text_drawing_is_one_undo_step_and_locked_text_never_edits() {
     assert_eq!(chart.editing_drawing(), None);
 }
 
+/// Whether any part of the layout's text box is inside the pane's plot, the rule the editor
+/// refuses against: a drawing is clipped to its pane, so text wholly outside paints nothing.
+fn text_in_its_pane(chart: &ChartEngine, id: DrawingId) -> bool {
+    let layout = chart.drawing_text_edit_layout(id).unwrap();
+    let pane = &chart.panes[chart.drawing(id).unwrap().pane_index];
+    let [left, top, right, bottom] = layout.rect;
+    right > 0.0 && left < chart.pane_w && bottom > pane.top && top < pane.top + pane.height
+}
+
+#[test]
+fn text_wholly_outside_the_plot_is_not_editable_and_never_opens() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::Text,
+            0,
+            vec![DrawingPoint {
+                logical: 5.0,
+                price: 11.0,
+            }],
+            Some(r##"{"text":"live"}"##),
+        )
+        .unwrap();
+    // Pan the text across the left edge a quarter bar at a time: it stays editable exactly
+    // while any part of its box is inside the plot (including straddling the edge), and a
+    // refused begin leaves no session behind.
+    let (mut inside, mut outside) = (0, 0);
+    for step in 0..400 {
+        chart.set_right_offset(f64::from(step) * 0.25);
+        chart.build_frame();
+        let expected = text_in_its_pane(&chart, id);
+        assert_eq!(chart.drawing_text_editable(id), expected, "step {step}");
+        assert_eq!(chart.begin_drawing_text_edit(id, false), expected);
+        assert_eq!(chart.editing_drawing(), expected.then_some(id));
+        chart.cancel_drawing_text_edit();
+        if expected {
+            inside += 1;
+        } else {
+            outside += 1;
+        }
+    }
+    assert!(
+        inside > 0 && outside > 0,
+        "{inside} inside, {outside} outside"
+    );
+
+    // Vertically too: a price far above the scale puts the text above the plot.
+    chart.set_right_offset(0.0);
+    let high = chart
+        .add_drawing(
+            DrawingKind::Text,
+            0,
+            vec![DrawingPoint {
+                logical: 5.0,
+                price: 1.0e6,
+            }],
+            Some(r##"{"text":"high"}"##),
+        )
+        .unwrap();
+    chart.build_frame();
+    assert!(!text_in_its_pane(&chart, high));
+    assert!(!chart.drawing_text_editable(high));
+    assert!(!chart.begin_drawing_text_edit(high, false));
+    assert_eq!(chart.editing_drawing(), None);
+}
+
+#[test]
+fn text_over_another_pane_is_outside_its_own_pane_and_not_editable() {
+    let mut chart = settled_chart();
+    let lower = chart.add_pane(true).unwrap();
+    let series = chart.add_series(SeriesKind::Line);
+    // The same bar times as the candles, so the logical slots keep their meaning.
+    let times = (0..10).map(|i| (i * 3600) as f64).collect::<Vec<_>>();
+    let values = vec![10.0; 10];
+    chart
+        .set_series_data(series, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.set_series_pane(series, lower, 1.0);
+    chart.build_frame();
+    // A price on the lower pane's scale that lands in the middle of the upper pane: the text box
+    // is inside the chart, but the lower pane clips its drawings, so nothing of it paints.
+    let (x, y) = (
+        chart.time_scale.logical_to_coordinate(5.0),
+        chart.panes[0].top + chart.panes[0].height / 2.0,
+    );
+    let price = chart
+        .drawing_from_px_for(lower, crate::DrawingPriceScale::Right, x, y)
+        .unwrap()
+        .price;
+    let id = chart
+        .add_drawing(
+            DrawingKind::Text,
+            lower,
+            vec![DrawingPoint {
+                logical: 5.0,
+                price,
+            }],
+            Some(r##"{"text":"stray"}"##),
+        )
+        .unwrap();
+    chart.build_frame();
+    let layout = chart.drawing_text_edit_layout(id).unwrap();
+    let upper = &chart.panes[0];
+    assert!(layout.rect[1] >= upper.top && layout.rect[3] <= upper.top + upper.height);
+    assert!(
+        layout.rect[0] > 0.0 && layout.rect[2] < chart.pane_w,
+        "{:?}",
+        layout.rect
+    );
+    assert!(!chart.drawing_text_editable(id));
+    assert!(!chart.begin_drawing_text_edit(id, false));
+    // On its own pane the same text edits.
+    let own = chart
+        .add_drawing(
+            DrawingKind::Text,
+            lower,
+            vec![DrawingPoint {
+                logical: 5.0,
+                price: 10.0,
+            }],
+            Some(r##"{"text":"own"}"##),
+        )
+        .unwrap();
+    chart.build_frame();
+    assert!(chart.drawing_text_editable(own));
+    assert!(chart.begin_drawing_text_edit(own, false));
+}
+
 #[test]
 fn text_tool_container_draws_a_crisp_box_behind_the_run() {
     let mut chart = settled_chart();
@@ -5608,6 +5736,179 @@ fn grid_snapped_ranges_nudge_by_at_least_one_bar_and_one_tick() {
         assert!(chart.undo_drawing(), "{kind:?}");
         assert_eq!(chart.drawing(id).unwrap().points, before, "{kind:?}");
     }
+}
+
+/// The three ways a magnet can be on (the weak chart mode, the strong chart mode, and Ctrl
+/// toggling an off chart into a strong one) with the modifiers each one is driven by.
+fn magnet_cases() -> [(crate::DrawingMagnetMode, DrawingModifiers, &'static str); 3] {
+    use crate::DrawingMagnetMode::{Off, Strong, Weak};
+    [
+        (Weak, NONE, "weak chart magnet"),
+        (Strong, NONE, "strong chart magnet"),
+        (Off, MAGNET, "ctrl on an off chart"),
+    ]
+}
+
+/// A range chart with room on both sides of the data (bars 2 to 11 are on screen), magnet `mode`
+/// on the chart.
+fn range_chart(mode: crate::DrawingMagnetMode) -> ChartEngine {
+    let mut chart = settled_chart();
+    chart.set_bar_spacing(40.0);
+    chart.set_right_offset(4.0);
+    chart.build_frame();
+    chart.set_drawing_magnet_mode(mode);
+    chart
+}
+
+/// Pointer ends for the magnet tests: off-bar slots, halfway between two prices (farther from
+/// every candle than the weak magnet reaches), the last one beyond the last bar where no candle
+/// exists for any magnet to choose.
+fn off_bar_pointers(chart: &ChartEngine) -> Vec<(f64, f64)> {
+    let y = y_at(chart, 11.5);
+    assert!((y - y_at(chart, 11.0)).abs() > DRAWING_WEAK_MAGNET_DISTANCE);
+    assert!((y - y_at(chart, 12.0)).abs() > DRAWING_WEAK_MAGNET_DISTANCE);
+    let pointers =
+        [2.3, 6.3, 11.3].map(|logical| (chart.time_scale.logical_to_coordinate(logical), y));
+    assert!(pointers.iter().all(|&(x, _)| x < chart.pane_w));
+    pointers.to_vec()
+}
+
+/// An anchor of a grid-snapped tool sits on the crosshair's whole slot under the pointer and on
+/// the price tick grid, whether or not a magnet was on.
+fn assert_on_the_slot_grid(chart: &ChartEngine, point: DrawingPoint, x: f64, context: &str) {
+    assert_eq!(
+        point.logical,
+        chart.snapped_crosshair_index(x) as f64,
+        "{context}: whole slot"
+    );
+    assert!(
+        (point.price * 100.0 - (point.price * 100.0).round()).abs() < 1e-6,
+        "{context}: price tick ({})",
+        point.price
+    );
+}
+
+#[test]
+fn magnet_that_chooses_no_candle_still_places_range_anchors_on_whole_bars() {
+    for (mode, modifiers, case) in magnet_cases() {
+        for kind in [
+            DrawingKind::PriceRange,
+            DrawingKind::DateRange,
+            DrawingKind::DateAndPriceRange,
+        ] {
+            let mut chart = range_chart(mode);
+            let pointers = off_bar_pointers(&chart);
+            for &(end_x, end_y) in &pointers[1..] {
+                let (start_x, start_y) = pointers[0];
+                let context = format!("{kind:?} {case} end at x={end_x:.1}");
+                assert!(chart.set_drawing_tool(Some(kind), None, None));
+                let first = chart.drawing_tool_activate(start_x, start_y, modifiers);
+                assert!(first.consumed && first.created.is_none(), "{context}");
+                // The live preview already follows the same grid as the committed anchor.
+                chart.drawing_tool_pointer_move(end_x, end_y, modifiers, false);
+                let preview = chart.pending_drawing().unwrap().preview.unwrap();
+                assert_on_the_slot_grid(&chart, preview, end_x, &format!("{context} preview"));
+                let id = chart
+                    .drawing_tool_activate(end_x, end_y, modifiers)
+                    .created
+                    .unwrap();
+                let points = chart.drawing(id).unwrap().points.clone();
+                assert_on_the_slot_grid(&chart, points[0], start_x, &format!("{context} start"));
+                assert_on_the_slot_grid(&chart, points[1], end_x, &format!("{context} end"));
+                assert!(chart.remove_drawing(id));
+            }
+        }
+    }
+}
+
+#[test]
+fn magnet_that_chooses_no_candle_still_drags_range_anchors_onto_whole_bars() {
+    for (mode, modifiers, case) in magnet_cases() {
+        for kind in [
+            DrawingKind::PriceRange,
+            DrawingKind::DateRange,
+            DrawingKind::DateAndPriceRange,
+        ] {
+            for handle in 0..2 {
+                for target in 0..3 {
+                    // A fresh chart per drag: a drag the magnet leaves where it started records
+                    // no history entry to undo.
+                    let mut chart = range_chart(mode);
+                    let (x, y) = off_bar_pointers(&chart)[target];
+                    let context = format!("{kind:?} {case} handle {handle} to x={x:.1}");
+                    let id = add_measure(&mut chart, kind, (2.0, 11.0), (6.0, 12.0));
+                    chart.set_selected_drawing(Some(id));
+                    chart.build_frame();
+                    let (hx, hy) = chart.drawing_point_to_coordinate(id, handle).unwrap();
+                    let hit = chart.hit_test_drawing(hx, hy).unwrap();
+                    assert_eq!(
+                        (hit.id, hit.part),
+                        (id, DrawingDragPart::Anchor(handle)),
+                        "{context}"
+                    );
+                    assert!(chart.drawing_drag_start_at(hx, hy), "{context}");
+                    chart.drawing_drag_to(x, y, modifiers);
+                    chart.drawing_drag_end();
+                    let points = chart.drawing(id).unwrap().points.clone();
+                    assert_on_the_slot_grid(&chart, points[handle], x, &context);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn magnet_that_chooses_no_candle_still_places_the_shift_measure_on_whole_bars() {
+    for (mode, modifiers, case) in magnet_cases() {
+        let mut chart = range_chart(mode);
+        let pointers = off_bar_pointers(&chart);
+        for &(end_x, end_y) in &pointers[1..] {
+            let (start_x, start_y) = pointers[0];
+            let context = format!("{case} end at x={end_x:.1}");
+            assert!(chart.measure_pointer_down(start_x, start_y, true, modifiers));
+            assert!(
+                chart.measure_pointer_move(end_x, end_y, modifiers),
+                "{context}"
+            );
+            let [start, end] = chart.measure_points().unwrap();
+            assert_on_the_slot_grid(&chart, start, start_x, &format!("{context} start"));
+            assert_on_the_slot_grid(&chart, end, end_x, &format!("{context} end"));
+            assert!(chart.cancel_measure());
+        }
+    }
+}
+
+#[test]
+fn magnet_that_chooses_a_candle_keeps_its_bar_and_price_for_range_anchors() {
+    // A strong magnet next to a candle still wins: the anchor takes the candle's own price
+    // (not the pointer's) on that candle's slot.
+    let mut chart = range_chart(crate::DrawingMagnetMode::Strong);
+    let at = |chart: &ChartEngine, logical: f64, price: f64| {
+        (
+            chart.time_scale.logical_to_coordinate(logical),
+            y_at(chart, price),
+        )
+    };
+    let (x, y) = at(&chart, 6.2, 12.6);
+    assert!(chart.set_drawing_tool(Some(DrawingKind::PriceRange), None, None));
+    assert!(chart.drawing_tool_activate(x, y, NONE).created.is_none());
+    let (x, y) = at(&chart, 2.2, 10.6);
+    chart.drawing_tool_pointer_move(x, y, NONE, false);
+    let id = chart.drawing_tool_activate(x, y, NONE).created.unwrap();
+    let points = chart.drawing(id).unwrap().points.clone();
+    assert_eq!(
+        points,
+        vec![
+            DrawingPoint {
+                logical: 6.0,
+                price: 13.0
+            },
+            DrawingPoint {
+                logical: 2.0,
+                price: 11.0
+            },
+        ]
+    );
 }
 
 #[test]

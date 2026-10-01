@@ -1537,7 +1537,9 @@ callout). Both modes share the engine text-edit session, so a whole edit is one 
 Escape restores the text without a history entry. A double-click on a selected drawing (or on
 the text of an unselected one, whose first click selects it), or Enter or F2 on the chart or its
 accessibility drawing target (the target keeps Enter for geometry editing), opens the editor on
-whatever the engine reports `drawing_text_editable`, unless the whole text is outside the chart.
+whatever the engine reports `drawing_text_editable`, which includes refusing a drawing whose whole
+text lies outside its pane's plot (one engine rule for every host and path, so no invisible editor
+captures the keys).
 The double-click is ownership-checked before it acts: the gesture recognizer skips it when the
 pair's first click or tap was taken by a trading object or the alert widget (whose presses never
 reach the drawing pipeline, so the selection and the press snapshot they leave behind are stale),
@@ -1605,7 +1607,10 @@ Measuring tools are catalog entries of the Projection & Annotations family
 range, and date-and-price range are two-anchor `ClickAnchors` tools whose anchors, like Long/Short
 Position, carry the catalog's `grid_snap` flag: creation, anchor drags, and body moves (pointer and
 keyboard) resolve x to the crosshair's time slot and price to the instrument tick or price-band
-ladder (falling back to the bound scale's `min_move`), so statistics read whole bars and ticks. The
+ladder (falling back to the bound scale's `min_move`), so statistics read whole bars and ticks. A
+magnet that finds a candle chooses that bar and price; a magnet that is on but chooses nothing (weak
+and too far from every price, or no bar under the pointer, as beyond the last bar) leaves the slot
+and tick to the grid, so an anchor never sits off a bar. The
 earlier spelling `date_price_range` is read as `date_and_price_range` wherever kind names are
 parsed (persistence import, templates, clipboard and sync payloads) and is never written. They
 lower through the shared drawing parts like every family tool: a translucent fill, crisp `HLine`

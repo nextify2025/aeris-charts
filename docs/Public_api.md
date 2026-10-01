@@ -1176,8 +1176,9 @@ accept `text` but never paint or edit it: `forecast`, `bars_pattern`, `price_ran
 drawing, or on the text of an unselected one (its first click selects it), or Enter or F2 while
 the chart has focus and the drawing is selected (F2 on its accessibility drawing target, where
 Enter keeps geometry editing), opens the editor; locked, hidden, and interval-hidden drawings do
-not open it, nor does a drawing whose text lies wholly outside the chart. The engine decides which
-text is edited and where it sits, so an unselected drawing with no text has no label to
+not open it, nor does a drawing whose text lies wholly outside its pane's plot (the engine applies
+this on every host and path: double-click, Enter, F2, placement, and a direct begin). The engine
+decides which text is edited and where it sits, so an unselected drawing with no text has no label to
 double-click: select it and double-click it, press Enter or F2, or use its options to add the first
 label (only a trend line prompts `+ Add text` on hover). An unselected drawing's text answers hover
 with the text cursor and a click with a selection, unless a higher drawing or the selected
