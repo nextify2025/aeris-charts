@@ -1736,6 +1736,12 @@ CI, the tag-publish workflow and the benchmark workflows install `wasm-pack` 0.1
 bytes and therefore the package size budgets. `npm run check:release-gates` fails when any of those workflows installs it
 unpinned or at another version.
 
+The Rust toolchain is an exact release as well: `rust-toolchain.toml` names it (1.99.0) and every
+workflow installs that release through its `toolchain:` input, so a new stable Rust cannot change
+what CI compiles or lints with (a floating `stable` once added a Clippy lint to an unchanged tree).
+`npm run check:release-gates` fails when a workflow and the file disagree. Moving the pin is a
+deliberate commit that moves both and re-runs the size and performance budgets.
+
 `perf_gate` prints PASS/FAIL per target and exits non-zero on a failure only when
 `AERIS_CHARTS_PERF_STRICT=1` (exactly `1`, the parse the browser perf specs use; unset or `0`
 stays report-only), so the local gate line above keeps the variable to mirror CI. The per-frame

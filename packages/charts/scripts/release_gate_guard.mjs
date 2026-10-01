@@ -13,6 +13,23 @@ const benchmarkWorkflows = Object.fromEntries(
   ]),
 );
 
+// The Rust toolchain is an exact release in rust-toolchain.toml, and every workflow installs that
+// release: a floating `stable` let a new Rust release add a Clippy lint to an unchanged tree.
+const RUST_RELEASE = readFileSync(`${root}/rust-toolchain.toml`, "utf8").match(/^channel\s*=\s*"([^"]+)"/m)?.[1];
+assert.match(RUST_RELEASE ?? "", /^\d+\.\d+\.\d+$/, "rust-toolchain.toml must pin an exact Rust release, not a channel");
+
+function assertRustToolchainPinned(source, workflow) {
+  const steps = source.split(/\r?\n(?=\s*- )/).filter((step) => step.includes("dtolnay/rust-toolchain@"));
+  assert.ok(steps.length > 0, `${workflow} must install Rust through dtolnay/rust-toolchain`);
+  for (const step of steps) {
+    const toolchain = step.match(/^\s+toolchain:\s*(\S+)/m)?.[1];
+    assert.ok(
+      toolchain === RUST_RELEASE || toolchain?.startsWith(`${RUST_RELEASE}-`),
+      `${workflow} must install Rust ${RUST_RELEASE} like rust-toolchain.toml, not ${toolchain ?? "the floating default"}`,
+    );
+  }
+}
+
 // Every release-relevant build installs the same wasm-pack: its bundled wasm-opt decides the
 // shipped WASM bytes, so an unpinned or differently pinned installer moves the size budgets and
 // the published artifact without any source change. The benchmark workflows use this exact pin.
@@ -46,8 +63,11 @@ function verify(ciSource, publishSource, benchmarkSources = benchmarkWorkflows) 
     "machine-calibrated evidence must remain non-authoritative");
   assertWasmPackPinned(ciSource, "ci.yml");
   assertWasmPackPinned(publishSource, "publish.yml");
+  assertRustToolchainPinned(ciSource, "ci.yml");
+  assertRustToolchainPinned(publishSource, "publish.yml");
   for (const [name, source] of Object.entries(benchmarkSources)) {
     assertWasmPackPinned(source, name);
+    assertRustToolchainPinned(source, name);
   }
   assert.match(publishSource, /tags: \["v\*"\]/,
     "version tags must trigger publication");
@@ -77,6 +97,9 @@ for (const [brokenCi, brokenPublish] of [
   [ci.replace(WASM_PACK_INSTALL, "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh"), publish],
   [ci.replace(WASM_PACK_INSTALL, WASM_PACK_INSTALL.replace("0.15.0", "0.14.0")), publish],
   [ci.replaceAll("Install wasm-pack", "Install wasm toolchain"), publish],
+  [ci.replaceAll(`toolchain: ${RUST_RELEASE}`, "toolchain: stable"), publish],
+  [ci.replace(`          toolchain: ${RUST_RELEASE}\n`, ""), publish],
+  [ci, publish.replace(`toolchain: ${RUST_RELEASE}`, "toolchain: 1.98.1")],
   [ci, publish.replace(WASM_PACK_INSTALL, "cargo install wasm-pack --locked --version 0.14.0")],
   [ci, publish.replace(WASM_PACK_INSTALL, "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh")],
 ]) {
@@ -88,5 +111,10 @@ for (const name of Object.keys(benchmarkWorkflows)) {
     [name]: benchmarkWorkflows[name].replace(WASM_PACK_INSTALL, "cargo install wasm-pack --locked"),
   };
   assert.throws(() => verify(ci, publish, broken), `an unpinned wasm-pack in ${name} was not detected`);
+  const floating = {
+    ...benchmarkWorkflows,
+    [name]: benchmarkWorkflows[name].replace(new RegExp(`toolchain: ${RUST_RELEASE.replaceAll(".", "\\.")}`), "toolchain: stable"),
+  };
+  assert.throws(() => verify(ci, publish, floating), `a floating Rust toolchain in ${name} was not detected`);
 }
 console.log("release gate policy and failure simulations OK");

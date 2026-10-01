@@ -1,5 +1,8 @@
 [toolchain]
-channel = "stable"
+# An exact release, not the floating channel: a new stable must not change what CI or a local build
+# compiles with (it added a Clippy lint overnight once). Move it in a deliberate commit that also moves
+# `toolchain:` in every workflow; `npm run check:release-gates` fails when they disagree.
+channel = "1.99.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
