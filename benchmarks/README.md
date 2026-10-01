@@ -149,7 +149,29 @@ compiled engine code, so the WASM and package-container ceilings take the same ~
 
 The largest reducible share measured in the unstripped module is serde JSON (de)serialization
 monomorphization (about a fifth of pre-optimization code), led by the internally tagged `IndicatorKind`
-enum (its deserializer now ships out of line, see below). Future growth is blocked at the v4 ceilings.
+enum (its deserializer now ships out of line, see below). Until policy v5 below, future growth was blocked at the
+v4 ceilings.
+
+Budget policy v5 is the reset after the B1-B8 K-line capabilities (exchange time and session slots, the price tick
+ladder, the B8 drawing catalog with text editing for every text-bearing tool, multi-calendar overlays, tick-built
+candles and resampling, close-time labels) and the merge of upstream's later work, whose IANA time-zone tables add
+about 350 KB raw and 41 KB Brotli after being filtered to the 98 TradingView zones (about 914 KB and 84 KB for the
+complete database). The bytes were measured on the GitHub runner with the pinned wasm-pack 0.15.0 and its bundled
+`wasm-opt`, the one lossless lever found (the `IndicatorKind` deserializer) was shipped first, and the ceilings that
+the module still exceeded took the same 7% release headroom, rounded up to 10,000 bytes. JavaScript stays inside its
+unchanged ceilings. Every remaining reduction is an opt-level change that costs frame time (priced below) and awaits a
+product decision; the evidence is recorded in `budgets.json`'s `rationale`.
+
+| Phase 4 metric | Observed bytes | Blocking maximum |
+| --- | ---: | ---: |
+| npm tarball | 1,969,915 | 2,110,000 |
+| npm unpacked | 5,953,058 | 6,370,000 |
+| JavaScript raw | 415,362 | 620,000 |
+| JavaScript Brotli | 74,089 | 95,000 |
+| WASM raw | 5,041,592 | 5,400,000 |
+| WASM Brotli | 1,237,844 | 1,330,000 |
+
+Future growth is blocked at the v5 ceilings.
 
 ### WASM size levers and re-baselining
 
