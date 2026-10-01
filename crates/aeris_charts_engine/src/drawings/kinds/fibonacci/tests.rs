@@ -9,7 +9,8 @@ use aeris_charts_render::draw_list::{LineStyle, Prim};
 
 use super::super::super::{DrawingPlacement, DrawingTextLayout};
 use super::{
-    trimmed, visible_arc, FibonacciLabelHAlign, FibonacciLabelVAlign, FibonacciToolOptions, PHI,
+    golden_ratio, trimmed, visible_arc, FibonacciLabelHAlign, FibonacciLabelVAlign,
+    FibonacciToolOptions,
 };
 use crate::{
     ChartEngine, DrawingAnchor, DrawingDragPart, DrawingId, DrawingKind, DrawingMagnetMode,
@@ -900,6 +901,15 @@ fn circles_far_beyond_the_pane_stay_within_the_curve_tolerance() {
 }
 
 #[test]
+fn the_golden_ratio_satisfies_its_defining_equation() {
+    // φ is computed rather than written as a literal; it is the positive root of φ² = φ + 1, and
+    // the spiral tests below take it as their expected growth per quarter turn.
+    let phi = golden_ratio();
+    assert!((phi * phi - phi - 1.0).abs() < 1e-15, "{phi}");
+    assert!(phi > 1.0 && (phi - 1.618).abs() < 1e-3, "{phi}");
+}
+
+#[test]
 fn spirals_grow_by_phi_every_quarter_turn_through_the_second_anchor() {
     let mut chart = chart();
     let id = add(
@@ -929,7 +939,7 @@ fn spirals_grow_by_phi_every_quarter_turn_through_the_second_anchor() {
         let pi = std::f64::consts::PI;
         spiral.windows(2).all(|pair| {
             let turn = (angle(pair[1]) - angle(pair[0]) + pi).rem_euclid(2.0 * pi) - pi;
-            let expected = PHI.powf(turn.abs() / std::f64::consts::FRAC_PI_2);
+            let expected = golden_ratio().powf(turn.abs() / std::f64::consts::FRAC_PI_2);
             // Frame points are f32, so the innermost sub-pixel turns are too coarse to compare.
             radius(pair[0]) < 2.0
                 || ((turn > 0.0) == clockwise

@@ -158,8 +158,12 @@ const LABEL_LIFT: f64 = 2.0;
 const SPIRAL_MIN_RADIUS: f64 = 0.5;
 /// Upper bound on the spiral's quarter turns (φ^128 ≈ 1.6e26 px: beyond any pane).
 const MAX_SPIRAL_QUARTERS: usize = 128;
-/// The golden ratio: the spiral grows by φ every quarter turn.
-const PHI: f64 = 1.618_033_988_749_895;
+/// The golden ratio φ = (1 + √5) / 2: the spiral grows by φ every quarter turn. It is computed
+/// instead of written as a literal because `std::f64::consts::GOLDEN_RATIO` is stable only from
+/// Rust 1.99, hosts pin their own toolchain, and Clippy denies the literal where the constant exists.
+fn golden_ratio() -> f64 {
+    (1.0 + 5.0_f64.sqrt()) / 2.0
+}
 
 /// Shared two-anchor Fibonacci behavior; every spec below overrides its identity.
 const FIB_TOOL: DrawingToolSpec = DrawingToolSpec {
@@ -1571,7 +1575,7 @@ fn spiral(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         let theta0 = (b.1 - a.1).atan2(b.0 - a.0);
         let turn = if options.reverse { -1.0 } else { 1.0 };
         // r = r0·e^(k·t) after turning `t` radians past the second anchor; k = ln φ / (π/2).
-        let growth = PHI.ln() / FRAC_PI_2;
+        let growth = golden_ratio().ln() / FRAC_PI_2;
         let radius = |t: f64| r0 * (growth * t).exp();
         let turned = |r: f64| (r / r0).ln() / growth;
         // A logarithmic spiral's arc length grows linearly with its radius.
