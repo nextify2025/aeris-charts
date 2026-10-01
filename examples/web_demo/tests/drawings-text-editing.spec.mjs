@@ -367,6 +367,41 @@ test("a note shows its text only while hovered or selected unless it always show
     .toMatchObject({ kind: "projection_annotation", always_show_text: true });
 });
 
+test("a double-click on a trend line's body opens its editor like every other text tool", async ({ page }) => {
+  await goto_fixture(page);
+  const id = await add_diagonal(page, "trend_line", { text: "trend label" });
+  await deselect(page);
+  // A point on the stroke a fifth of the way along, away from the label: the engine does not
+  // answer for the label there, so only the body-double-click rule can open the editor.
+  const probe = await page.evaluate((id) => {
+    const chart = window.__chart;
+    const [a, b] = chart.drawings().find((drawing) => drawing.id === id).points();
+    const at = (t) => ({
+      x: chart.time_scale().logical_to_coordinate(a.logical + (b.logical - a.logical) * t),
+      y: window.__main.price_to_coordinate(a.price + (b.price - a.price) * t),
+    });
+    const point = at(0.2);
+    const offset = document.getElementById("chart_container").getBoundingClientRect();
+    return {
+      x: point.x + offset.left,
+      y: point.y + offset.top,
+      label_hit: Number(chart.wasm.drawing_text_hit_at(point.x, point.y)),
+      drawing_at: Number(chart.wasm.drawing_at(point.x, point.y)),
+    };
+  }, id);
+  expect(probe.label_hit, "the probe is on the body, not the label").toBe(0);
+  expect(probe.drawing_at, "the probe is on the trend line").toBe(id);
+  const editor = page.locator(EDITOR);
+  await page.mouse.dblclick(probe.x, probe.y);
+  await expect(editor).toBeFocused();
+  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(id);
+  expect(await page.evaluate(() => window.__chart.wasm.editing_drawing())).toBe(id);
+  expect(await text_of(page, id)).toBe("trend label");
+  await page.keyboard.press("Escape");
+  await expect(editor).toHaveCount(0);
+  expect(await text_of(page, id), "Escape leaves the text as it was").toBe("trend label");
+});
+
 test("a ray's text edits in place along its stroke: one rotated line in the stroke's ink, one undo step", async ({ page }) => {
   await goto_fixture(page);
   const id = await add_diagonal(page, "ray", { text: "ray label" });

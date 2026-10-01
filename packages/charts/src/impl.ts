@@ -6590,8 +6590,9 @@ export class chart_impl implements chart_api {
 
   /**
    * Let an explicitly hit Aeris drawing consume the second click without a pane click event: the
-   * text tool and trend labels re-run their click activation, and any other selected drawing
-   * whose text the engine edits in place opens the inline editor. The first click of a pair on an
+   * text tool and a trend line's label re-run their click activation, and any other selected
+   * drawing whose text the engine edits in place (a trend line's body included) opens the inline
+   * editor. The first click of a pair on an
    * unselected drawing's text selects it (`apply_primary_click`), so a double-click on the text
    * of a line, channel, Fibonacci, pitchfork, pattern, or shape tool reaches the editor. Host
    * `dbl_click` subscribers still run afterwards.
@@ -6603,7 +6604,12 @@ export class chart_impl implements chart_api {
     // another owner consumed (a trading object, the alert widget) leaves the selection and the
     // snapshot behind. The engine says whether the point still belongs to the selected drawing.
     if (this.wasm.drawing_at(x, y) !== selected.id) return;
-    if (selected.kind() === "text" || selected.kind() === "trend_line") {
+    // The text tool and a trend line's own label re-run their click activation (its prompt and
+    // two-step focus); every other double-click on the selected drawing, a trend line's body
+    // included, opens the editor.
+    const on_trend_label = selected.kind() === "trend_line"
+      && Number(this.wasm.drawing_text_hit_at(x, y)) === selected.id;
+    if (selected.kind() === "text" || on_trend_label) {
       this.apply_primary_click(x, y);
     } else {
       this.edit_drawing_text(selected.id);
