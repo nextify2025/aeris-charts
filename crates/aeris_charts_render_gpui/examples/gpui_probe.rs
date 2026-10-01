@@ -8,8 +8,11 @@
 //! silently (a smoke run of layout, native text measurement, and chrome). The demo data is static.
 //!
 //! ```text
-//! cargo run -p aeris_charts_render_gpui --features gpui-backend --example gpui_probe
+//! cargo run --release -p aeris_charts_render_gpui --features gpui-backend --example gpui_probe
 //! ```
+//!
+//! Judge interaction feel only in release: an unoptimized build spends roughly ten times longer
+//! per frame (GPUI layout and painting dominate), so pointer feedback lags visibly.
 //!
 //! Environment knobs:
 //! - `AERIS_CHARTS_PROBE_BARS` — synthetic bars to load (default 500).
