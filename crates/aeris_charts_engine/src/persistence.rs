@@ -231,6 +231,10 @@ struct DrawingStyleV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<crate::ProfileDrawingOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    position_account_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_risk_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<String>,
@@ -732,6 +736,16 @@ impl ChartEngine {
                     anchor_times_micros: self.drawing_anchor_times_for(drawing),
                     style: DrawingStyleV1 {
                         profile: drawing.profile.clone(),
+                        position_account_size: matches!(
+                            drawing.kind,
+                            DrawingKind::LongPosition | DrawingKind::ShortPosition
+                        )
+                        .then_some(drawing.position_account_size),
+                        position_risk_percent: matches!(
+                            drawing.kind,
+                            DrawingKind::LongPosition | DrawingKind::ShortPosition
+                        )
+                        .then_some(drawing.position_risk_percent),
                         name: (!drawing.name.is_empty()).then(|| drawing.name.clone()),
                         group_id: drawing.group_id.clone(),
                         revision: (drawing.revision != 1).then_some(drawing.revision),
@@ -763,7 +777,9 @@ impl ChartEngine {
                         line_style: Some(line_style_name(drawing.style).to_string()),
                         fill_color: drawing.fill_color.clone(),
                         preview_fill_color: drawing.preview_fill_color.clone(),
-                        border_visible: (!drawing.border_visible).then_some(false),
+                        border_visible: (drawing.kind == DrawingKind::Rectangle
+                            || !drawing.border_visible)
+                            .then_some(drawing.border_visible),
                         show_labels: drawing.show_labels.then_some(true),
                         axis_bands_visible: drawing.axis_bands_visible.then_some(true),
                         label_color: drawing.label_color.clone(),
@@ -1370,6 +1386,28 @@ impl ChartEngine {
             let mut drawing = Drawing::new(item.id, kind, pane_index, anchors);
             drawing.set_pending_times(pending_times);
             let style = item.style;
+            if kind == DrawingKind::Rectangle && style.border_visible.is_none() {
+                // Older documents omitted the then-visible default. Preserve their appearance.
+                drawing.border_visible = true;
+            }
+            if let Some(value) = style.position_account_size {
+                if !value.is_finite() || value <= 0.0 || value > 1e15 {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid position account size",
+                        item.id
+                    )));
+                }
+                drawing.position_account_size = value;
+            }
+            if let Some(value) = style.position_risk_percent {
+                if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid position risk percent",
+                        item.id
+                    )));
+                }
+                drawing.position_risk_percent = value;
+            }
             if let Some(profile) = style.profile {
                 if !profile.valid() {
                     return Err(invalid(format!(
@@ -1648,7 +1686,7 @@ impl ChartEngine {
         // state and historically survived import. Abort only the in-flight placement/capture.
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
-        self.text_edit = None;
+        self.drawing_text_edit = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
         #[cfg(not(target_arch = "wasm32"))]
@@ -2015,7 +2053,9 @@ impl ChartEngine {
         // A document without exchange-time keys keeps the chart's installed zone and session
         // start; mirror a non-default one so the replaced options store still describes the live
         // chart (absent keys already mean UTC, keeping default documents byte-stable).
-        if !self.exchange_time().is_utc_identity() {
+        if !self.exchange_time().is_utc_identity()
+            || self.time_zone != crate::ChartTimeZone::default()
+        {
             self.mirror_exchange_time_options();
         }
         // Likewise explicit time-axis marks the document does not carry stay installed.
@@ -2032,7 +2072,7 @@ impl ChartEngine {
         self.drawing_history = crate::DrawingHistory::default();
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
-        self.text_edit = None;
+        self.drawing_text_edit = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
         for series in &mut self.series {

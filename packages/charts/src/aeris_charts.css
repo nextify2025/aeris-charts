@@ -32,7 +32,7 @@
   --border-softer: #f5f5f5;
   --border-strong: #c2c2c2;
   --border-inverse: #222222;
-  --border-width: 0.5px;
+  --border-width: 1px;
 
   /* Text */
   --text-primary: #222222;
@@ -134,7 +134,7 @@
   --border-softer: #2b2b2b;
   --border-strong: #404040;
   --border-inverse: #ffffff;
-  --border-width: 0.5px;
+  --border-width: 1px;
 
   /* Text */
   --text-primary: #f5f5f5;
@@ -187,8 +187,8 @@
 
   /* Buttons — neutral default button */
   --button-fill: #f5f5f5;
-  --button-fill-hover: #f0f0f0;
-  --button-fill-active: #e5e5e5;
+  --button-fill-hover: #e0e0e0;
+  --button-fill-active: #d4d4d4;
   --button-fill-foreground: #404040;
   --button-fill-subtle: #222222;
 

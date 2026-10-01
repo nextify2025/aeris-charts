@@ -493,7 +493,7 @@ mod tests {
         let times = slots(&zone, "2024-01-02", &a_share(), 60);
         assert_eq!(times.len(), 240);
         let mut chart = line_chart(&times);
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         (chart, times)
     }
 
@@ -529,7 +529,7 @@ mod tests {
         times.extend(&slot_times);
         assert_eq!(times.len(), 241);
         let mut chart = line_chart(&times);
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         chart.set_bar_time_label(close(60, windows)).unwrap();
         assert_eq!(chart.data_layer().merged_times(), times.as_slice());
         assert_eq!(chart.time_to_index(times[0] as f64, false), Some(0));
@@ -968,7 +968,7 @@ mod tests {
         times.extend(slots(&zone, "2024-03-11", &windows, 3_600));
         assert_eq!(times.len(), 14);
         let mut chart = line_chart(&times);
-        chart.set_time_zone(zone.clone());
+        chart.set_exchange_offsets(zone.clone());
         chart
             .set_bar_time_label(close(3_600, windows.clone()))
             .unwrap();
@@ -988,7 +988,7 @@ mod tests {
         let zone = shanghai();
         let times = slots(&zone, "2024-01-02", &hong_kong, 3_600);
         let mut chart = line_chart(&times);
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         chart.set_bar_time_label(close(3_600, hong_kong)).unwrap();
         assert_eq!(crosshair_label(&mut chart, 2), "02 Jan '24   12:00");
         assert_eq!(crosshair_label(&mut chart, 5), "02 Jan '24   16:00");
@@ -1002,7 +1002,7 @@ mod tests {
         let daily = |label: BarTimeLabel| {
             let mut chart = line_chart(&days);
             chart.set_time_visible(false);
-            chart.set_time_zone(new_york());
+            chart.set_exchange_offsets(new_york());
             chart.set_calendar_date_axis(true);
             chart.set_bar_time_label(label).unwrap();
             let texts: Vec<String> = (0..6).map(|i| crosshair_label(&mut chart, i)).collect();
@@ -1024,7 +1024,7 @@ mod tests {
             };
             let mut chart = ChartEngine::new(800.0, 420.0, 1.0);
             chart.set_time_visible(true);
-            chart.set_time_zone(new_york());
+            chart.set_exchange_offsets(new_york());
             chart.set_bar_time_label(label).unwrap();
             let id = chart
                 .add_footprint_series(FootprintSeriesOptions {
@@ -1109,7 +1109,7 @@ mod tests {
         chart.series[0].kind = SeriesKind::Line;
         chart.time_scale.set_width(1_600.0);
         chart.set_time_visible(true);
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         chart.set_bar_time_label(label).unwrap();
         chart
     }
@@ -1128,7 +1128,7 @@ mod tests {
     fn printed_instant_weights(times: &[i64]) -> Vec<u8> {
         let printed: Vec<i64> = times.iter().map(|time| time + 60).collect();
         let mut chart = line_chart(&printed);
-        chart.set_time_zone(shanghai());
+        chart.set_exchange_offsets(shanghai());
         installed_weights(&mut chart)
     }
 
@@ -1272,9 +1272,9 @@ mod tests {
             .unwrap();
         let short = at(&new_york(), "2024-03-08 15:30");
         assert_eq!(chart.bar_label_time(short), short + 3_600);
-        chart.set_time_zone(new_york());
+        chart.set_exchange_offsets(new_york());
         assert_eq!(chart.bar_label_time(short), short + 1_800);
-        chart.set_time_zone(utc.clone());
+        chart.set_exchange_offsets(utc.clone());
         assert_eq!(chart.bar_label_time(short), short + 3_600);
 
         // One patch that changes the session start and the windows validates against the new
@@ -1452,7 +1452,7 @@ mod tests {
         assert_eq!(chart.bar_time_label(), &label);
 
         // A zone change never orphans windows: placement is structural, independent of offsets.
-        chart.set_time_zone(new_york());
+        chart.set_exchange_offsets(new_york());
         assert_eq!(chart.bar_time_label(), &label);
 
         // One patch may move the zone, the session start, and the windows together: the label

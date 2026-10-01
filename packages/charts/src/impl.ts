@@ -4422,9 +4422,6 @@ export class chart_impl implements chart_api {
   /** Borderless caret surface shared by the explicitly separate product edit modes. */
   private text_editor: HTMLElement | null = null;
   private text_editor_id = 0;
-  /** Snapshot of the drawing's text when the editor opened — restored on Escape. */
-  private text_editor_original = "";
-  private text_editor_mode: "standalone_text" | "run_label" | "part_label" | null = null;
   /** The edited drawing's kind in words, for accessibility announcements. */
   private text_editor_label = "";
   /** The element focused when the editor opened (an accessibility target regains focus). */
@@ -7064,12 +7061,15 @@ export class chart_impl implements chart_api {
 
   // ---------------------------------------------------------------------------------------------
   // Inline drawing editors. Every drawing that paints text edits it through one engine session
-  // and the borderless caret surface: live text repaints without history, commit records one undo
-  // step, and cancel restores the pre-edit text. The engine's `drawing_text_edit_layout` says
-  // where the text sits and whether it is a run (the text tool, trend labels, and the text of
-  // lines, channels, Fibonacci tools, pitchforks, patterns, and shapes: one line, possibly
-  // rotated) or a family text box (several lines); the host only presents the matching surface.
-  // The text tool alone owns an empty lifecycle (leaving it empty removes the drawing).
+  // (`begin/set/commit/cancel_drawing_text_edit`) and the borderless caret surface: live text
+  // repaints without history, commit records one undo step, and cancel restores the pre-edit
+  // text. The engine owns the trim, the single-line rule of a run, the length bound, and the text
+  // tool's empty lifecycle (leaving it empty removes the drawing); the DOM surface only supplies
+  // IME/clipboard-aware input and the caret, mirrored into the session with
+  // `set_drawing_text_edit`. The engine's `drawing_text_edit_layout` says where the text sits and
+  // whether it is a run (the text tool, trend labels, and the text of lines, channels, Fibonacci
+  // tools, pitchforks, patterns, and shapes: one line, possibly rotated) or a family text box
+  // (several lines); the host only presents the matching surface.
   // ---------------------------------------------------------------------------------------------
 
   /**
@@ -7224,6 +7224,14 @@ export class chart_impl implements chart_api {
   }
 
   /**
+   * The editor's caret in `char`s (code points) of its text, the unit the engine session keeps:
+   * the UTF-16 offset above is not one for text outside the BMP.
+   */
+  private static text_editor_caret_chars(editor: HTMLElement): number {
+    return Array.from(chart_impl.text_editor_value(editor).slice(0, chart_impl.text_editor_caret_offset(editor))).length;
+  }
+
+  /**
    * Hand the mounted surface the session: Enter (outside IME composition) and blur commit and
    * Escape cancels; a multi-line editor keeps Shift+Enter for its native line break. The caret
    * starts at the end of the text and focus returns where it was on close.
@@ -7254,8 +7262,6 @@ export class chart_impl implements chart_api {
 
     this.text_editor = editor;
     this.text_editor_id = drawing.id;
-    this.text_editor_original = drawing.options().text ?? "";
-    this.text_editor_mode = mode;
     this.text_editor_label = drawing.kind().replaceAll("_", " ");
     this.text_editor_return_focus = return_focus;
     this.repaint();
@@ -7291,10 +7297,10 @@ export class chart_impl implements chart_api {
     const return_focus = document.activeElement;
     // The engine session keeps the canvas label under the caret overlay and records the edit as
     // one undo step; it refuses a locked, hidden, or otherwise uneditable drawing.
-    if (!this.wasm.begin_drawing_text_edit(drawing.id)) return;
+    if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
     let layout = this.text_edit_layout(drawing.id);
     if (layout === null || layout.multiline) {
-      this.wasm.end_drawing_text_edit(false);
+      this.wasm.cancel_drawing_text_edit();
       return;
     }
     const options = drawing.options();
@@ -7381,7 +7387,12 @@ export class chart_impl implements chart_api {
     };
     const push_live_text = () => {
       // The engine owns the single-line rule and the length bound.
-      if (!this.wasm.set_drawing_edit_text(editor.textContent ?? "")) {
+      if (
+        !this.wasm.set_drawing_text_edit(
+          chart_impl.text_editor_value(editor),
+          chart_impl.text_editor_caret_chars(editor),
+        )
+      ) {
         this.close_text_editor(false);
         return;
       }
@@ -7434,10 +7445,10 @@ export class chart_impl implements chart_api {
   private open_part_label_editor(drawing: drawing_api): void {
     this.close_text_editor(true);
     const return_focus = document.activeElement;
-    if (!this.wasm.begin_drawing_text_edit(drawing.id)) return;
+    if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
     let layout = this.text_edit_layout(drawing.id);
     if (layout === null) {
-      this.wasm.end_drawing_text_edit(false);
+      this.wasm.cancel_drawing_text_edit();
       return;
     }
     const font_of = (edit: text_edit_layout) =>
@@ -7479,7 +7490,7 @@ export class chart_impl implements chart_api {
       caret.style.background = edit.color;
     };
     const push_live_text = () => {
-      if (!this.wasm.set_drawing_edit_text(text_of())) {
+      if (!this.wasm.set_drawing_text_edit(text_of(), chart_impl.text_editor_caret_chars(editor))) {
         this.close_text_editor(false);
         return;
       }
@@ -7520,25 +7531,25 @@ export class chart_impl implements chart_api {
   close_text_editor(commit: boolean, focus_moved = false): void {
     const editor = this.text_editor;
     if (editor === null) return;
-    const mode = this.text_editor_mode;
     this.text_editor = null;
     this.text_editor_reposition = null;
     const wrap = this.container.querySelector("#aeris_charts-text-editor");
     wrap?.remove();
-    const id = this.text_editor_id;
-    const raw = chart_impl.text_editor_value(editor);
-    const text = (mode === "part_label" ? raw.replace(/\r\n?/g, "\n") : raw.replace(/\s*\n\s*/g, " ")).trim();
-    if (commit) this.wasm.set_drawing_edit_text(text);
-    // A session the engine already ended (the drawing was removed, restored, or replaced by a
-    // sync payload) is not this editor's to finish.
-    const ended = this.wasm.end_drawing_text_edit(commit);
-    if (ended && mode === "standalone_text" && !(commit ? text : this.text_editor_original.trim())) {
-      this.wasm.remove_drawing(id);
+    // The engine session owns trim, restore, and the text tool's empty lifecycle; the final DOM
+    // value is mirrored first. A session the engine already ended (the drawing was removed,
+    // restored, or replaced by a sync payload) is not this editor's to finish.
+    let ended: boolean;
+    if (commit) {
+      this.wasm.set_drawing_text_edit(
+        chart_impl.text_editor_value(editor),
+        chart_impl.text_editor_caret_chars(editor),
+      );
+      ended = this.wasm.commit_drawing_text_edit();
+    } else {
+      ended = this.wasm.cancel_drawing_text_edit();
     }
     const label = this.text_editor_label;
     const return_focus = this.text_editor_return_focus;
-    this.text_editor_original = "";
-    this.text_editor_mode = null;
     this.text_editor_label = "";
     this.text_editor_return_focus = null;
     this.repaint();

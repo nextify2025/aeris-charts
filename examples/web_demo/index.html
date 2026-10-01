@@ -431,6 +431,8 @@
       <button type="button" data-tool="polyline" title="Polyline: click vertices; double-click or Enter to finish, Backspace to remove the latest vertex">polyline</button>
       <button type="button" data-tool="highlighter" title="Highlighter: drag a wide translucent marker stroke">highlighter</button>
       <!-- B8: shapes — end -->
+      <label title="Hypothetical balance used by position drawing statistics">balance <input type="number" id="position_account_size" min="0.01" max="1000000000000000" step="any" value="1000"></label>
+      <label title="Percentage of the hypothetical balance risked at the stop">risk % <input type="number" id="position_risk_percent" min="0" max="100" step="any" value="25"></label>
       <label title="Host-supplied quantity for placing the selected Long/Short Position drawing">order qty <input type="number" id="position_order_quantity" min="0.00000001" step="any" value="1"></label>
       <button id="place_position_order" type="button" disabled title="Place one host-authoritative bracket order from the selected Long/Short Position drawing">place order</button>
       <label title="Stroke/border color — templates new drawings and applies live to the selected one">color <input type="color" id="drawing_color" value="#168ef7"></label>
@@ -472,7 +474,7 @@
         </select>
       </label>
       <button id="clear_drawings" type="button" title="Remove every drawing">clear all</button>
-      <span class="hint">Ctrl = snap (while drawing) · Ctrl+click chart = fullscreen · Ctrl+H/V = split ↔/↕ · Shift = straighten</span>
+      <span class="hint">Ctrl = snap (while drawing) · Alt+click chart = fullscreen · Ctrl+H/V = split ↔/↕ · Shift = straighten</span>
     </div>
 
     <div class="group" data-caption="Crosshair">
@@ -839,6 +841,7 @@ const volume_data = volume_fixture(data);
 let vol_series = null;
 window.__demo_catalogs = install_demo_catalogs({ chart, series: main, data, on_series_change: sync_style_visibility });
 if (requested_feature === "trading") window.__demo_catalogs.lab.activate("trading-bracket");
+if (requested_feature === "executions") window.__demo_catalogs.lab.activate("execution-marks");
 if (requested_feature === "footprint") window.__demo_catalogs.series.activate("footprint");
 
 // Fidelity fixtures use only the package's public handles. The demo supplies data and options;
@@ -1221,6 +1224,8 @@ function sync_drawing_tool_buttons(tool) {
 const drawing_explicit_options = new Set();
 function drawing_options_from_inputs(kind = null) {
   const value_of = {
+    position_account_size: () => Number(document.getElementById("position_account_size").value),
+    position_risk_percent: () => Number(document.getElementById("position_risk_percent").value),
     color: () => document.getElementById("drawing_color").value,
     style: () => document.getElementById("drawing_style").value,
     width: () => Number(document.getElementById("drawing_width").value),
@@ -1265,6 +1270,8 @@ function sync_drawing_inputs_from_selection() {
   if (selected === null) return;
   const o = selected.options();
   const set = (id, value) => { if (value !== null && value !== undefined) document.getElementById(id).value = value; };
+  set("position_account_size", o.position_account_size);
+  set("position_risk_percent", o.position_risk_percent);
   set("drawing_color", css_to_hex(o.color));
   set("drawing_style", o.style);
   document.getElementById("drawing_width").value = String(o.width);
@@ -1287,6 +1294,8 @@ function sync_drawing_inputs_from_selection() {
 }
 document.getElementById("chart_container").addEventListener("pointerup", () => setTimeout(sync_drawing_inputs_from_selection, 0));
 const drawing_option_of_input = {
+  position_account_size: "position_account_size",
+  position_risk_percent: "position_risk_percent",
   drawing_color: "color",
   drawing_style: "style",
   drawing_width: "width",

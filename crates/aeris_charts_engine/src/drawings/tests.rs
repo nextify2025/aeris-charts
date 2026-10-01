@@ -1319,14 +1319,16 @@ fn a_selected_rectangle_paints_eight_handles_and_a_styleable_border() {
         rounds, 8,
         "four midpoint squares (border + fill each), got {rounds}"
     );
+    assert!(!chart.drawing(id).unwrap().border_visible);
     assert!(
-        main.iter()
+        !main
+            .iter()
             .any(|p| matches!(p, Prim::RectFrame { color, .. } if *color == drawing_color)),
-        "the default border is the solid frame"
+        "the default rectangle has no border"
     );
 
     // Dotted/dashed borders: the frame becomes four crisp line prims in the drawing color.
-    assert!(chart.drawing_apply_options(id, r#"{"style":"dotted"}"#));
+    assert!(chart.drawing_apply_options(id, r#"{"style":"dotted","border_visible":true}"#));
     let frame = chart.build_frame();
     let main = &frame.panes[0].main;
     assert!(
@@ -1347,6 +1349,49 @@ fn a_selected_rectangle_paints_eight_handles_and_a_styleable_border() {
         })
         .count();
     assert_eq!(dotted_lines, 4, "four dotted border segments");
+}
+
+#[test]
+fn rectangle_border_default_and_explicit_override_survive_persistence() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 2.0,
+                    price: 10.0,
+                },
+                DrawingPoint {
+                    logical: 6.0,
+                    price: 12.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    let saved = chart.export_state_json().unwrap();
+    assert!(saved.contains("\"border_visible\":false"));
+    let mut restored = settled_chart();
+    restored.import_state_json(&saved).unwrap();
+    assert!(!restored.drawing(id).unwrap().border_visible);
+
+    assert!(chart.drawing_apply_options(id, r#"{"border_visible":true}"#));
+    let saved = chart.export_state_json().unwrap();
+    assert!(saved.contains("\"border_visible\":true"));
+    let mut restored = settled_chart();
+    restored.import_state_json(&saved).unwrap();
+    assert!(restored.drawing(id).unwrap().border_visible);
+
+    let mut legacy: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    legacy["drawings"][0]["style"]
+        .as_object_mut()
+        .unwrap()
+        .remove("border_visible");
+    let mut restored = settled_chart();
+    restored.import_state_json(&legacy.to_string()).unwrap();
+    assert!(restored.drawing(id).unwrap().border_visible);
 }
 
 #[test]
@@ -1709,6 +1754,270 @@ fn position_controls_have_dedicated_target_entry_extent_and_stop_drag_semantics(
     let points = &chart.drawing(id).unwrap().points;
     assert!((points[2].logical - 3.0).abs() < 1e-6);
     assert!((points[2].price - 10.25).abs() < 1e-9);
+}
+
+#[test]
+fn position_drag_resolves_price_ticks_smaller_than_a_device_pixel() {
+    use aeris_charts_core::model::price_range::PriceRange;
+
+    for kind in [DrawingKind::LongPosition, DrawingKind::ShortPosition] {
+        for dpr in [1.0, 1.5, 2.0] {
+            for part in [
+                DrawingDragPart::Body,
+                DrawingDragPart::Anchor(0),
+                DrawingDragPart::Anchor(1),
+                DrawingDragPart::Anchor(3),
+            ] {
+                let mut chart = settled_chart();
+                chart.dpr = dpr;
+                chart.panes[0]
+                    .price_scale
+                    .set_price_range(Some(PriceRange::new(0.0, 30.0)));
+                let direction = if kind == DrawingKind::LongPosition {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let initial = vec![
+                    DrawingPoint {
+                        logical: 2.0,
+                        price: 11.5,
+                    },
+                    DrawingPoint {
+                        logical: 7.0,
+                        price: 11.5 + direction,
+                    },
+                    DrawingPoint {
+                        logical: 2.0,
+                        price: 11.5 - direction,
+                    },
+                ];
+                let id = chart.add_drawing(kind, 0, initial.clone(), None).unwrap();
+                chart.set_selected_drawing(Some(id));
+                let px = chart.drawing_px(chart.drawing(id).unwrap()).unwrap();
+                let (grab, changed) = match part {
+                    DrawingDragPart::Body => ((px[0].0 + 30.0, px[0].1), None),
+                    DrawingDragPart::Anchor(0) => ((px[0].0, px[1].1), Some(1)),
+                    DrawingDragPart::Anchor(1) => (px[0], Some(0)),
+                    DrawingDragPart::Anchor(3) => (px[2], Some(2)),
+                    _ => unreachable!(),
+                };
+                let price = initial[changed.unwrap_or(0)].price;
+                let tick_px = y_at(&chart, price + 0.01) - y_at(&chart, price);
+                assert!(
+                    tick_px.abs() * dpr < 1.0,
+                    "fixture must exercise subpixel price ticks"
+                );
+                assert!(chart.drawing_drag_start_at(grab.0, grab.1));
+                assert_eq!(chart.drawing_drag.as_ref().unwrap().part, part);
+                chart.drawing_drag_to(grab.0, grab.1 + tick_px * 0.3, DrawingModifiers::default());
+                for (before, after) in initial.iter().zip(&chart.drawing(id).unwrap().points) {
+                    assert!(
+                        (after.price - before.price).abs() < 1e-9,
+                        "below half a tick: {kind:?}, {part:?}, DPR {dpr}"
+                    );
+                }
+                chart.drawing_drag_to(grab.0, grab.1 + tick_px * 0.7, DrawingModifiers::default());
+                for (index, (before, after)) in initial
+                    .iter()
+                    .zip(&chart.drawing(id).unwrap().points)
+                    .enumerate()
+                {
+                    let expected = before.price
+                        + if changed.is_none() || changed == Some(index) {
+                            0.01
+                        } else {
+                            0.0
+                        };
+                    assert!(
+                        (after.price - expected).abs() < 1e-9,
+                        "one exact tick: {kind:?}, {part:?}, DPR {dpr}, {after:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn position_horizontal_drag_follows_crosshair_steps_in_both_directions() {
+    for kind in [DrawingKind::LongPosition, DrawingKind::ShortPosition] {
+        for spacing in [6.0, 14.25] {
+            for part in [
+                DrawingDragPart::Body,
+                DrawingDragPart::Anchor(1),
+                DrawingDragPart::Anchor(2),
+            ] {
+                let mut chart = settled_chart();
+                chart.time_scale.set_bar_spacing(spacing);
+                chart.time_scale.set_right_offset(5.0);
+                let sign = if kind == DrawingKind::LongPosition {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let initial = vec![
+                    DrawingPoint {
+                        logical: 2.0,
+                        price: 11.5,
+                    },
+                    DrawingPoint {
+                        logical: 7.0,
+                        price: 11.5 + sign,
+                    },
+                    DrawingPoint {
+                        logical: 2.0,
+                        price: 11.5 - sign,
+                    },
+                ];
+                let id = chart.add_drawing(kind, 0, initial.clone(), None).unwrap();
+                chart.set_selected_drawing(Some(id));
+                let px = chart.drawing_px(chart.drawing(id).unwrap()).unwrap();
+                let grab = match part {
+                    DrawingDragPart::Body => (px[0].0 + (px[1].0 - px[0].0) * 0.37, px[0].1),
+                    DrawingDragPart::Anchor(1) => px[0],
+                    DrawingDragPart::Anchor(2) => (px[1].0, px[0].1),
+                    _ => unreachable!(),
+                };
+                assert!(chart.drawing_drag_start_at(grab.0, grab.1));
+                assert_eq!(chart.drawing_drag.as_ref().unwrap().part, part);
+                let cursor_start = chart.snapped_crosshair_index(grab.0);
+                for fraction in [0.2, 0.4, 0.7, 1.2, 1.7, -0.2, -0.4, -0.7, -1.2, -1.7, 8.7] {
+                    let x = grab.0 + spacing * fraction;
+                    let cursor = chart.snapped_crosshair_index(x);
+                    chart.drawing_drag_to(x, grab.1, DrawingModifiers::default());
+                    for (index, (before, after)) in initial
+                        .iter()
+                        .zip(&chart.drawing(id).unwrap().points)
+                        .enumerate()
+                    {
+                        let expected = match part {
+                            DrawingDragPart::Body => {
+                                before.logical + (cursor - cursor_start) as f64
+                            }
+                            DrawingDragPart::Anchor(1) if index != 1 => cursor as f64,
+                            DrawingDragPart::Anchor(2) if index == 1 => cursor as f64,
+                            _ => before.logical,
+                        };
+                        assert!((after.logical - expected).abs() < 1e-9, "{kind:?} {part:?}, spacing {spacing}, movement {fraction}: {after:?}, cursor {cursor}");
+                        assert!((after.price - before.price).abs() < 1e-9);
+                    }
+                }
+                assert!(
+                    chart
+                        .drawing(id)
+                        .unwrap()
+                        .points
+                        .iter()
+                        .any(|point| point.logical > 9.0),
+                    "time-slot snapping must allow future empty space"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn position_creation_and_drag_use_instrument_and_crosshair_ticks() {
+    for kind in [DrawingKind::LongPosition, DrawingKind::ShortPosition] {
+        let mut chart = settled_chart();
+        chart
+            .set_instrument_metadata(crate::InstrumentMetadata {
+                tick_size: Some(0.25),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(chart.set_drawing_tool(Some(kind), None, None));
+        let id = chart
+            .drawing_tool_activate(
+                x_at(&chart, 4.0) + (x_at(&chart, 5.0) - x_at(&chart, 4.0)) * 0.24,
+                y_at(&chart, 11.4),
+                DrawingModifiers::default(),
+            )
+            .created
+            .unwrap();
+        let initial = chart.drawing(id).unwrap().points.clone();
+        assert_eq!(initial[0].logical, 4.0);
+        assert!(initial.iter().all(|point| point.logical.fract() == 0.0));
+        assert!(initial
+            .iter()
+            .all(|point| (point.price / 0.25 - (point.price / 0.25).round()).abs() < 1e-9));
+        let risk = (initial[0].price - initial[2].price).abs();
+        let reward = (initial[1].price - initial[0].price).abs();
+        assert!(risk > 0.0 && (reward / risk - 2.0).abs() < 1e-9);
+        let entry = chart.drawing_px(chart.drawing(id).unwrap()).unwrap()[0];
+        let tick_px = y_at(&chart, initial[0].price + 0.25) - entry.1;
+        let dx = (x_at(&chart, 5.0) - x_at(&chart, 4.0)) * 0.4;
+        let cursor_start = chart.snapped_crosshair_index(entry.0 + 30.0);
+        let cursor_end = chart.snapped_crosshair_index(entry.0 + 30.0 + dx);
+        assert!(chart.drawing_drag_start_at(entry.0 + 30.0, entry.1));
+        chart.drawing_drag_to(
+            entry.0 + 30.0 + dx,
+            entry.1 + tick_px * 0.7,
+            DrawingModifiers::default(),
+        );
+        for (before, after) in initial.iter().zip(&chart.drawing(id).unwrap().points) {
+            assert!((after.price - before.price - 0.25).abs() < 1e-9);
+            assert!(
+                (after.logical - before.logical - (cursor_end - cursor_start) as f64).abs() < 1e-6
+            );
+        }
+    }
+}
+
+#[test]
+fn position_levels_follow_the_price_band_ladder_of_their_scale() {
+    let mut chart = settled_chart();
+    // A ladder is the scale's single tick source: 0.01 below 10 and 0.02 from 10 up, whatever
+    // scalar tick the instrument or the display format carries.
+    chart
+        .set_instrument_metadata(crate::InstrumentMetadata {
+            tick_size: Some(0.25),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(chart.series_apply_price_format_json(
+        0,
+        r#"{"type":"price","tick_ladder":[{"from":0,"min_move":0.01},{"from":10,"min_move":0.02}]}"#
+    ));
+    chart.build_frame();
+    let id = chart
+        .add_drawing(
+            DrawingKind::LongPosition,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 2.0,
+                    price: 12.0,
+                },
+                DrawingPoint {
+                    logical: 7.0,
+                    price: 13.0,
+                },
+                DrawingPoint {
+                    logical: 2.0,
+                    price: 11.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    let scale = DrawingPriceScale::Right;
+    // Prices snap to the band tick, not the instrument tick.
+    assert!((chart.snap_position_price(0, scale, 11.013) - 11.02).abs() < 1e-9);
+    assert!((chart.snap_position_price(0, scale, 9.987) - 9.99).abs() < 1e-9);
+    // Ticks count the ladder's cumulative band ticks: 100 of 0.01 below 10, then 50 of 0.02.
+    assert_eq!(
+        chart.position_price_ticks_between(0, scale, 9.0, 11.0),
+        Some(150.0)
+    );
+    assert_eq!(chart.position_price_tick_at(0, scale, 9.5), Some(0.01));
+    assert_eq!(chart.position_price_tick_at(0, scale, 11.0), Some(0.02));
+    // A keyboard nudge far below one tick still steps one band tick the key's way.
+    chart.set_selected_drawing(Some(id));
+    assert!(chart.nudge_selected_drawing(0.0, 1.0, Some(3)));
+    let stop = chart.drawing(id).unwrap().points[2].price;
+    assert!((stop - 10.98).abs() < 1e-9, "stop {stop}");
 }
 
 #[test]
@@ -3015,30 +3324,75 @@ fn ctrl_magnet_snaps_the_crosshair_to_ohlc() {
     chart.crosshair = Some((x, y_free));
     // Normal mode without the flag: the horizontal line follows the raw cursor y.
     assert_eq!(crosshair_hline_y(&mut chart), Some(y_free.round() as i32));
-    // Ctrl held (the public reference's temporary magnet): the line snaps to the bar's high.
+    // A host can forward Ctrl while browsing. Without drawing work it stays at the raw price.
     chart.crosshair_ohlc_magnet = true;
-    assert_eq!(
-        crosshair_hline_y(&mut chart),
-        Some(y_at(&chart, 12.0).round() as i32)
-    );
-    let crosshair_y = crosshair_hline_y(&mut chart).unwrap();
+    assert_eq!(crosshair_hline_y(&mut chart), Some(y_free.round() as i32));
+    // Drawing creation: Ctrl now resolves the same OHLC candidate as the anchor.
     assert!(chart.drawing_create_begin(DrawingKind::HorizontalLine, None));
+    let (from, to) = chart.visible_range_for_frame().unwrap();
+    let snapped_y = chart.crosshair_snap(0, x, y_free, from, to).1;
+    assert_eq!(snapped_y.round() as i32, y_at(&chart, 12.0).round() as i32);
+    assert_eq!(crosshair_hline_y(&mut chart), None);
     let drawing_id = chart.drawing_create_click(x, y_free, MAGNET) as DrawingId;
     let (_, drawing_y) = chart
         .drawing_to_px(0, chart.drawing(drawing_id).unwrap().points[0])
         .unwrap();
     assert_eq!(
         drawing_y.round() as i32,
-        crosshair_y,
+        snapped_y.round() as i32,
         "crosshair and drawing magnets must resolve the same pixel-space OHLC candidate"
     );
-    // Released: raw again (the configured mode is untouched).
-    chart.crosshair_ohlc_magnet = false;
+    // Creation finished: free browsing is raw even if the modifier flag remains set.
     assert_eq!(crosshair_hline_y(&mut chart), Some(y_free.round() as i32));
+    chart.crosshair_ohlc_magnet = false;
     // Hidden mode stays hidden even with the flag set.
     chart.crosshair_ohlc_magnet = true;
     chart.crosshair_mode = aeris_charts_core::model::magnet::CrosshairMode::Hidden;
     assert_eq!(crosshair_hline_y(&mut chart), None);
+}
+
+#[test]
+fn ctrl_crosshair_magnet_ignores_external_study_on_price_pane() {
+    let mut chart = ohlc_chart();
+    let times = (0..10)
+        .map(|index| i64::from(index) * 3_600_000_000_000)
+        .collect::<Vec<_>>();
+    let values = [Some(11.8); 10];
+    chart
+        .install_external_study_output(
+            7,
+            0,
+            ExternalStudyOutputDescriptor {
+                title: "EMA",
+                legend_label: None,
+                plot: ExternalStudyPlotKind::Line,
+                pane: ExternalStudyPaneTarget::Price,
+                scale: ExternalStudyScaleTarget::Primary,
+                settings_available: true,
+                threshold_region: None,
+                point_style: ExternalStudyPointStyle::Uniform,
+                input_requirements: ExternalStudyInputRequirements::BARS,
+            },
+            1,
+            &times,
+            &values,
+        )
+        .unwrap();
+    chart.build_frame();
+
+    let x = x_at(&chart, 3.0);
+    chart.crosshair = Some((x, y_at(&chart, 11.8)));
+    assert!(chart.drawing_create_begin(DrawingKind::HorizontalLine, None));
+    chart.crosshair_ohlc_magnet = true;
+    let (from, to) = chart.visible_range_for_frame().unwrap();
+    assert_eq!(
+        chart
+            .crosshair_snap(0, x, y_at(&chart, 11.8), from, to)
+            .1
+            .round() as i32,
+        y_at(&chart, 12.0).round() as i32,
+        "the external EMA must remain inspectable without attracting Ctrl magnetism"
+    );
 }
 
 #[test]
@@ -3063,14 +3417,15 @@ fn ohlc_magnet_snaps_scalar_series_to_the_rendered_value() {
     let empty_y = y_at(&chart, 25.0);
     let rendered_y = y_at(&chart, 20.0);
     chart.crosshair = Some((x, empty_y));
+    assert!(chart.drawing_create_begin(DrawingKind::HorizontalLine, None));
     chart.crosshair_ohlc_magnet = true;
+    let (from, to) = chart.visible_range_for_frame().unwrap();
     assert_eq!(
-        crosshair_hline_y(&mut chart),
-        Some(rendered_y.round() as i32),
+        chart.crosshair_snap(0, x, empty_y, from, to).1.round() as i32,
+        rendered_y.round() as i32,
         "an area series exposes only its rendered close/value to the OHLC magnet"
     );
 
-    assert!(chart.drawing_create_begin(DrawingKind::HorizontalLine, None));
     let drawing_id = chart.drawing_create_click(x, empty_y, MAGNET) as DrawingId;
     assert!((chart.drawing(drawing_id).unwrap().points[0].price - 20.0).abs() < 1e-9);
 }
@@ -3483,11 +3838,11 @@ fn editing_drawing_keeps_the_label_for_overlay_caret() {
     assert!(texts.iter().any(|(t, _)| t == "live"));
     // Typing mode: the host wrap owns the border, but the canvas label stays so the
     // transparent editor cannot lift/recolor the glyphs.
-    assert!(chart.begin_drawing_text_edit(id));
+    assert!(chart.begin_drawing_text_edit(id, false));
     assert_eq!(chart.editing_drawing(), Some(id));
     let (texts, _) = text_prims(&mut chart);
     assert!(texts.iter().any(|(t, _)| t == "live"));
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     let (texts, _) = text_prims(&mut chart);
     assert!(texts.iter().any(|(t, _)| t == "live"));
 }
@@ -3506,13 +3861,13 @@ fn typing_into_a_text_drawing_is_one_undo_step_and_locked_text_never_edits() {
             Some(r##"{"text":"a"}"##),
         )
         .unwrap();
-    assert!(chart.begin_drawing_text_edit(id));
+    assert!(chart.begin_drawing_text_edit(id, false));
     for text in ["ab", "abc", "abcd"] {
-        assert!(chart.set_drawing_edit_text(text));
+        assert!(chart.set_drawing_text_edit(text, usize::MAX));
     }
     let (texts, _) = text_prims(&mut chart);
     assert!(texts.iter().any(|(t, _)| t == "abcd"), "live text paints");
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().text, "a", "one step per edit");
     assert!(chart.undo_drawing());
@@ -3522,7 +3877,7 @@ fn typing_into_a_text_drawing_is_one_undo_step_and_locked_text_never_edits() {
 
     assert!(chart.drawing_apply_options(id, r#"{"locked":true}"#));
     assert!(!chart.drawing_text_editable(id));
-    assert!(!chart.begin_drawing_text_edit(id));
+    assert!(!chart.begin_drawing_text_edit(id, false));
     assert_eq!(chart.editing_drawing(), None);
 }
 
@@ -4502,7 +4857,7 @@ fn drawings_without_convertible_anchors_are_not_text_editable() {
         .unwrap();
     for id in [text, trend] {
         assert!(!chart.drawing_text_editable(id));
-        assert!(!chart.begin_drawing_text_edit(id));
+        assert!(!chart.begin_drawing_text_edit(id, false));
     }
 }
 
@@ -4583,8 +4938,8 @@ fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owning_famil
     assert_ne!(created.color, "#ff0000");
 
     // Live editor text clamps to the bound at a character boundary.
-    assert!(chart.begin_drawing_text_edit(rectangle));
-    assert!(chart.set_drawing_edit_text(&"€".repeat(40_000)));
+    assert!(chart.begin_drawing_text_edit(rectangle, false));
+    assert!(chart.set_drawing_text_edit(&"€".repeat(40_000), usize::MAX));
     let clamped = &chart.drawing(rectangle).unwrap().text;
     assert_eq!(
         clamped.len(),
@@ -4593,18 +4948,18 @@ fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owning_famil
     );
     assert!(clamped.len() <= crate::MAX_DRAWING_TEXT_BYTES);
     // The engine keeps a run label on one line: a run of CR/LF becomes one space.
-    assert!(chart.set_drawing_edit_text("one\r\ntwo\n\nthree\rfour"));
+    assert!(chart.set_drawing_text_edit("one\r\ntwo\n\nthree\rfour", usize::MAX));
     assert_eq!(chart.drawing(rectangle).unwrap().text, "one two three four");
-    assert!(chart.end_drawing_text_edit(false));
+    assert!(chart.cancel_drawing_text_edit());
 
     // A family box owns its lines.
     let comment = chart
         .add_drawing(DrawingKind::Comment, 0, vec![pt(6.0, 12.0)], None)
         .unwrap();
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.set_drawing_edit_text("one\ntwo"));
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.set_drawing_text_edit("one\ntwo", usize::MAX));
     assert_eq!(chart.drawing(comment).unwrap().text, "one\ntwo");
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
 }
 
 #[test]
@@ -4719,4 +5074,56 @@ fn indexed_text_hit_matches_brute_force_for_rotated_boxed_and_full_extent_labels
         hits > 100,
         "the sweep must exercise real label hits: {hits}"
     );
+}
+
+#[test]
+fn position_account_settings_are_atomic_and_survive_history_and_persistence() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::LongPosition,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 2.0,
+                    price: 11.0,
+                },
+                DrawingPoint {
+                    logical: 6.0,
+                    price: 12.0,
+                },
+                DrawingPoint {
+                    logical: 2.0,
+                    price: 10.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"position_account_size":2000,"position_risk_percent":2}"#
+    ));
+    let updated = chart.drawing(id).unwrap().clone();
+    assert_eq!(updated.position_account_size, 2000.0);
+    assert_eq!(updated.position_risk_percent, 2.0);
+    for patch in [
+        r#"{"position_account_size":0,"color":"red"}"#,
+        r#"{"position_risk_percent":101,"position_account_size":1000}"#,
+    ] {
+        assert!(!chart.drawing_apply_options(id, patch));
+        assert_eq!(chart.drawing(id).unwrap(), &updated);
+    }
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().position_account_size, 1000.0);
+    assert!(chart.redo_drawing());
+    let saved = chart.export_state_json().unwrap();
+    let mut restored = settled_chart();
+    restored.import_state_json(&saved).unwrap();
+    assert_eq!(restored.drawing(id).unwrap().position_account_size, 2000.0);
+    assert_eq!(restored.drawing(id).unwrap().position_risk_percent, 2.0);
+    let mut invalid: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    invalid["drawings"][0]["style"]["position_risk_percent"] = serde_json::json!(-1.0);
+    assert!(restored.import_state_json(&invalid.to_string()).is_err());
+    assert_eq!(restored.drawing(id).unwrap().position_risk_percent, 2.0);
 }

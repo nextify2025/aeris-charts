@@ -158,6 +158,63 @@ pub fn measure_text(
     weight: u16,
     italic: bool,
 ) -> GpuiTextMetrics {
+    measure_with(window.text_system(), text, family, size, weight, italic)
+}
+
+/// A live engine text measurer (`ChartEngine::set_text_measure`) backed by the window's native
+/// shaper. Every engine request is shaped exactly as painting shapes it — full labels, caret
+/// prefixes, the trend `+ Add text` prompt, and device-scaled frame runs alike — the native
+/// counterpart of the browser host's canvas `measureText` hook. It holds only the shared text
+/// system, so it stays valid across frames without borrowing the window.
+pub fn text_measurer(window: &Window) -> impl Fn(&str, f64, &str, u16, bool) -> f64 + 'static {
+    let text_system = window.text_system().clone();
+    move |text, size, family, weight, italic| {
+        if text.is_empty() || !(size.is_finite() && size > 0.0) {
+            return 0.0;
+        }
+        f64::from(measure_with(&text_system, text, family, size as f32, weight, italic).width)
+    }
+}
+
+/// A live engine glyph metric (`ChartEngine::set_text_cap_center`) backed by the window's native
+/// font metrics, the counterpart of the browser host's `measureText` ink bounds. `paint_text`
+/// places the baseline `(ascent - descent) / 2` below the middle anchor, so capitals and figures
+/// center on the anchor once it moves by `cap_height / 2` minus that distance.
+pub fn text_cap_centerer(window: &Window) -> impl Fn(f64, &str, u16, bool) -> f64 + 'static {
+    let text_system = window.text_system().clone();
+    move |size, family, weight, italic| {
+        if !(size.is_finite() && size > 0.0) {
+            return 0.0;
+        }
+        let font = to_font(&TextRun {
+            x: 0.0,
+            y: 0.0,
+            text: String::new(),
+            color: Color::rgb(0, 0, 0),
+            size: size as f32,
+            family: family.to_owned(),
+            align: aeris_charts_render::draw_list::TextAlign::Left,
+            weight,
+            italic,
+            angle: 0.0,
+        });
+        let font_size = px(size as f32);
+        let font_id = text_system.resolve_font(&font);
+        let ascent: f32 = text_system.ascent(font_id, font_size).into();
+        let descent: f32 = text_system.descent(font_id, font_size).into();
+        let cap_height: f32 = text_system.cap_height(font_id, font_size).into();
+        f64::from(cap_height / 2.0 - (ascent - descent) / 2.0)
+    }
+}
+
+fn measure_with(
+    text_system: &Arc<gpui::WindowTextSystem>,
+    text: &str,
+    family: &str,
+    size: f32,
+    weight: u16,
+    italic: bool,
+) -> GpuiTextMetrics {
     let run = TextRun {
         x: 0.0,
         y: 0.0,
@@ -171,7 +228,6 @@ pub fn measure_text(
         angle: 0.0,
     };
     let font = to_font(&run);
-    let text_system = window.text_system().clone();
     let font_size = px(size);
     let font_id = text_system.resolve_font(&font);
     let ascent: f32 = text_system.ascent(font_id, font_size).into();
@@ -636,6 +692,22 @@ fn escape_svg_text(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// The SVG renderer may resolve a different font face from GPUI's text shaper. Leave one em
+/// around the measured run so descenders, italic overhang, and antialiasing are not cut by the
+/// SVG viewport. The sprite moves by the same amount, keeping the visible text at its anchor.
+fn rotated_text_sprite_bounds(
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    pad: f32,
+) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(px(left - pad), px(top - pad)),
+        size: size(px(width + 2.0 * pad), px(height + 2.0 * pad)),
+    }
+}
+
 /// GPUI's shaped-line painter has no affine-transform parameter. Rotated runs therefore use
 /// GPUI's transformed monochrome-sprite path: the same system font is rasterized once into the
 /// sprite atlas and the sprite is rotated around the canonical aligned anchor. The atlas key
@@ -693,16 +765,17 @@ fn paint_rotated_text(
     let anchor_y = f32::from(transform.y(run.y));
     let left = text::aligned_left(anchor_x, width, run.align);
     let top = anchor_y - height / 2.0;
-    let bounds = Bounds {
-        origin: point(px(left), px(top)),
-        size: size(px(width), px(height)),
-    };
+    // Use a whole device-pixel margin so GPUI's bounds snapping does not shift the glyphs.
+    let pad = run.size.ceil().max(1.0) * transform.inv_scale;
+    let bounds = rotated_text_sprite_bounds(left, top, width, height, pad);
+    let sprite_width = width + 2.0 * pad;
+    let sprite_height = height + 2.0 * pad;
     let family = escape_svg_text(&run.family);
     let value = escape_svg_text(&run.text);
     let style = if run.italic { "italic" } else { "normal" };
     let svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><text x="0" y="{ascent}" font-family="{family}" font-size="{font_size_value}" font-weight="{weight}" font-style="{style}" fill="white">{value}</text></svg>"#,
-        ascent = cached.ascent,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{sprite_width}" height="{sprite_height}" viewBox="0 0 {sprite_width} {sprite_height}"><text x="{pad}" y="{baseline}" font-family="{family}" font-size="{font_size_value}" font-weight="{weight}" font-style="{style}" fill="white">{value}</text></svg>"#,
+        baseline = pad + cached.ascent,
         weight = run.weight,
     );
     let scale_factor = 1.0 / transform.inv_scale;
@@ -984,6 +1057,18 @@ mod tests {
 
     const OPAQUE: Color = Color::rgb(0x26, 0xa6, 0x9a);
     const OPAQUE2: Color = Color::rgb(0xef, 0x53, 0x50);
+
+    #[test]
+    fn rotated_label_sprite_leaves_ink_room_without_moving_the_run() {
+        let bounds = rotated_text_sprite_bounds(23.5, 36.0, 42.0, 15.0, 12.0);
+        assert_eq!(f32::from(bounds.origin.x), 11.5);
+        assert_eq!(f32::from(bounds.origin.y), 24.0);
+        assert_eq!(f32::from(bounds.size.width), 66.0);
+        assert_eq!(f32::from(bounds.size.height), 39.0);
+        // The SVG text starts at (pad, pad + ascent), retaining the original ink anchor.
+        assert_eq!(f32::from(bounds.origin.x) + 12.0, 23.5);
+        assert_eq!(f32::from(bounds.origin.y) + 12.0, 36.0);
+    }
 
     #[test]
     fn a_run_of_identical_opaque_quads_is_batchable() {

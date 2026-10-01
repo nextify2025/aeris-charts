@@ -385,7 +385,7 @@ mod tests {
             .set_series_data(0, &times_f, &values, &values, &values, &values)
             .unwrap();
         chart.time_scale.set_width(WIDTH);
-        chart.set_time_zone(shanghai());
+        chart.set_exchange_offsets(shanghai());
         chart.set_time_visible(true);
         chart.set_lock_visible_logical_range(true);
         chart.set_visible_logical_range(0.0, times.len() as f64 - 1.0);

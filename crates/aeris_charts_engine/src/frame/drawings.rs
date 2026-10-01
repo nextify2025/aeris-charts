@@ -153,9 +153,9 @@ mod trend_label_tests {
             ] {
                 drawing.text_h_align = h_align;
                 for (v_align, expected_normal) in [
-                    (DrawingTextVAlign::Top, 10.0),
+                    (DrawingTextVAlign::Top, 11.2),
                     (DrawingTextVAlign::Middle, 0.0),
-                    (DrawingTextVAlign::Bottom, -10.0),
+                    (DrawingTextVAlign::Bottom, -11.2),
                 ] {
                     drawing.text_v_align = v_align;
                     let (x, y, align, angle) = ChartEngine::drawing_text_placement(
@@ -194,6 +194,67 @@ pub(super) struct PositionRunProgress {
     pub(super) start: crate::drawings::DrawingPoint,
     pub(super) point: crate::drawings::DrawingPoint,
     pub(super) side: PositionRunSide,
+    pub(super) closed: bool,
+}
+
+/// Where one engine-painted text caret bar sits: the run's anchor `(x, y)` in bitmap px, the
+/// caret's offset `local_x` along the run, half the bar's height, and the run's clockwise angle.
+struct CaretBar {
+    x: f64,
+    y: f64,
+    local_x: f64,
+    half_height: f64,
+    angle: f64,
+}
+
+/// Emit one caret bar: a crisp device-grid rect when unrotated (one thickness wherever the caret
+/// moves), a two-point solid polyline when the run is rotated.
+fn push_caret_bar(
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+    bar: CaretBar,
+    vpr: f64,
+    color: Color,
+) {
+    let CaretBar {
+        x,
+        y,
+        local_x,
+        half_height,
+        angle,
+    } = bar;
+    if angle.abs() <= 1e-6 {
+        // An unrotated caret snaps to the device grid like every other crisp 1px rule, so
+        // it keeps one thickness wherever the caret moves.
+        let width = vpr.round().max(1.0) as i32;
+        out.push(Prim::Rect {
+            rect: IRect {
+                x: (x + local_x).round() as i32,
+                y: (y - half_height).round() as i32,
+                w: width,
+                h: ((y + half_height).round() - (y - half_height).round()).max(1.0) as i32,
+            },
+            color,
+        });
+        return;
+    }
+    let (sin, cos) = angle.sin_cos();
+    let at = |local_y: f64| {
+        [
+            (x + cos * local_x - sin * local_y) as f32,
+            (y + sin * local_x + cos * local_y) as f32,
+        ]
+    };
+    let first_point = points.len() as u32;
+    points.extend([at(-half_height), at(half_height)]);
+    out.push(Prim::Polyline {
+        first_point,
+        point_count: 2,
+        width: vpr.max(1.0) as f32,
+        style: LineStyle::Solid,
+        line_type: LineType::Simple,
+        color,
+    });
 }
 
 impl ChartEngine {
@@ -259,6 +320,7 @@ impl ChartEngine {
                 .collect::<Vec<_>>();
             self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
             self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+            self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
             self.build_drawing_labels(drawing, &px, vpr, out);
         }
     }
@@ -301,6 +363,7 @@ impl ChartEngine {
                 let point_start = points.len();
                 self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+                self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_labels(drawing, &px, vpr, out);
                 parts.push(super::RetainedDrawingPart {
                     id: drawing.id,
@@ -337,6 +400,7 @@ impl ChartEngine {
                 let point_start = points.len();
                 self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+                self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_labels(drawing, &px, vpr, out);
                 parts.push(super::RetainedDrawingPart {
                     id: drawing.id,
@@ -1134,6 +1198,41 @@ impl ChartEngine {
                             italic: label.italic,
                         });
                     }
+                    // The open native session's caret in a family text box: a 1 CSS px bar on the
+                    // caret's own line, measured like the glyphs just painted. An empty box
+                    // edits as one empty line, so row 0 at the line start is its caret slot.
+                    if let (Some(text_part), Some(session)) = (
+                        parts.text.filter(|text| text.label == index),
+                        self.drawing_text_edit
+                            .as_ref()
+                            .filter(|session| session.id == drawing.id && session.paint_caret),
+                    ) {
+                        let prefix: String = session.text.chars().take(session.caret).collect();
+                        let row = prefix.matches('\n').count();
+                        let line = prefix.rsplit('\n').next().unwrap_or("");
+                        // Browser caret parity: the next whole CSS px after the prefix run.
+                        let advance_css = self.measure_text_run(
+                            line,
+                            label.size,
+                            &layout.font_family,
+                            label.weight,
+                            label.italic,
+                        ) / vpr;
+                        push_caret_bar(
+                            out,
+                            points,
+                            CaretBar {
+                                x: box_layout.text_x,
+                                y: box_layout.first_y
+                                    + (text_part.first_line + row) as f64 * box_layout.line_height,
+                                local_x: advance_css.ceil() * vpr,
+                                half_height: label.size * 0.6,
+                                angle: 0.0,
+                            },
+                            vpr,
+                            text_color,
+                        );
+                    }
                 }
             }
         }
@@ -1301,6 +1400,64 @@ impl ChartEngine {
                 }
             }
         }
+    }
+
+    /// The engine-painted caret of an open drawing text session (native hosts). It sits on the
+    /// label's own transform: the run's measured advance places it, and it rotates with a trend
+    /// label. An empty run uses the one-em editing slot the middle-line cutout reserves.
+    fn build_drawing_text_caret(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w_px: i32,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
+    ) {
+        let Some(session) = self
+            .drawing_text_edit
+            .as_ref()
+            .filter(|session| session.id == drawing.id && session.paint_caret)
+        else {
+            return;
+        };
+        // A family text box paints its caret with its label (`build_family_prims`): falling
+        // through to the run placement would put the bar where the generic label would sit.
+        if !drawing.kind.paints_generic_text() {
+            return;
+        }
+        let (size, x, y, align, angle) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
+        let text = drawing.display_text();
+        let advance = if text.is_empty() {
+            size
+        } else {
+            self.measure_drawing_frame_text(drawing, text, size)
+        };
+        let prefix: String = text.chars().take(session.caret).collect();
+        let start = match align {
+            DrawingTextHAlign::Left => 0.0,
+            DrawingTextHAlign::Center => -advance / 2.0,
+            DrawingTextHAlign::Right => -advance,
+        };
+        // Browser caret parity: a 1 CSS px bar at the next whole CSS px after the prefix run,
+        // spanning the label's 1.2em line box, rotated with the label.
+        let prefix_css = self.measure_drawing_frame_text(drawing, &prefix, size) / vpr;
+        let local_x = start + prefix_css.ceil() * vpr;
+        let half_height = size * 0.6;
+        let color = self.drawing_label_color(drawing);
+        push_caret_bar(
+            out,
+            points,
+            CaretBar {
+                x,
+                y,
+                local_x,
+                half_height,
+                angle,
+            },
+            vpr,
+            color,
+        );
     }
 
     /// The text run's resolved glyph size (bitmap px, placeholder floor included), aligned
@@ -1634,14 +1791,97 @@ impl ChartEngine {
         } else {
             0.0
         };
+        let scale_target = match drawing.price_scale {
+            crate::DrawingPriceScale::Right => crate::PriceScaleTarget::Right,
+            crate::DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
+            crate::DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
+        };
+        let tick = self.position_price_tick(drawing.pane_index, drawing.price_scale);
+        let format_price = |value: f64| {
+            if let Some(text) = self
+                .price_formatter_fn
+                .as_ref()
+                .and_then(|formatter| formatter(value))
+            {
+                return text;
+            }
+            if let Some(precision) = self.trading_state.instrument.price_precision {
+                return super::PriceFormatter::from_precision(
+                    precision,
+                    tick.unwrap_or(10.0_f64.powi(-(precision as i32))),
+                )
+                .format(value);
+            }
+            self.scale_formatter_source(drawing.pane_index, scale_target)
+                .and_then(|series| self.format_with_price_format(&series.price_format, value))
+                .unwrap_or_else(|| self.price_formatter.format(value))
+        };
+        let ticks = |from: f64, to: f64| {
+            self.position_price_ticks_between(drawing.pane_index, drawing.price_scale, from, to)
+                .map_or_else(|| "—".to_string(), |ticks| position_stat_number(ticks, 0))
+        };
+        let point_value = self.trading_state.instrument.point_value.unwrap_or(1.0);
+        let risk_amount = drawing.position_account_size * drawing.position_risk_percent / 100.0;
+        let quantity = if risk_distance > 0.0 {
+            risk_amount / risk_distance / point_value
+        } else {
+            f64::NAN
+        };
+        let quantity_precision = self
+            .trading_state
+            .instrument
+            .quantity_precision
+            .unwrap_or(3) as usize;
+        let target_amount =
+            drawing.position_account_size + reward_distance * quantity * point_value;
+        let stop_amount = drawing.position_account_size - risk_distance * quantity * point_value;
         let target_text = format!(
-            "Target: {} ({reward_percent:.2}%)",
-            self.price_formatter.format(reward_distance)
+            "Target: {} ({reward_percent:.3}%) {}, Amount: {}",
+            format_price(reward_distance),
+            ticks(entry.price, target.price),
+            position_stat_number(target_amount, 2),
         );
         let stop_text = format!(
-            "Stop: {} ({risk_percent:.2}%)",
-            self.price_formatter.format(risk_distance)
+            "Stop: {} ({risk_percent:.3}%) {}, Amount: {}",
+            format_price(risk_distance),
+            ticks(entry.price, stop.price),
+            position_stat_number(stop_amount, 2),
         );
+        let run = self.position_run_progress(drawing);
+        // Unfilled/historical/future drawings still show the right-edge or latest close.
+        // This is an estimate, not a broker execution; preserve the run's exact frozen exit.
+        let current = run.map(|run| run.point.price).or_else(|| {
+            let series = self.scale_formatter_source(drawing.pane_index, scale_target)?;
+            if series.kind == crate::SeriesKind::Custom {
+                return None;
+            }
+            let plot = self.data.plot(series.id);
+            let row = plot.last_non_whitespace_row(target.logical.floor() as i64)?;
+            let close = plot.value_at(row, PlotValueIndex::Close);
+            close.is_finite().then_some(close)
+        });
+        let direction = if drawing.kind == DrawingKind::LongPosition {
+            1.0
+        } else {
+            -1.0
+        };
+        let pnl = current.map(|price| (price - entry.price) * direction);
+        let status = if run.is_some_and(|run| run.closed) {
+            "Closed"
+        } else {
+            "Open"
+        };
+        let middle = [
+            format!(
+                "{status} P&L: {}, Qty: {}",
+                pnl.map_or_else(|| "—".to_string(), format_price),
+                position_stat_number(quantity, quantity_precision)
+            ),
+            format!(
+                "Risk/reward ratio: {}",
+                position_stat_number(reward_distance / risk_distance, 2)
+            ),
+        ];
         let center_x = (position.left + position.right) / 2.0;
         let label_offset = 14.0 * vpr;
         let target_label_y = if position.target_y < position.entry_y {
@@ -1654,8 +1894,35 @@ impl ChartEngine {
         } else {
             position.stop_y + label_offset
         };
-        self.push_position_label_block(out, center_x, target_label_y, &[target_text], reward, vpr);
-        self.push_position_label_block(out, center_x, stop_label_y, &[stop_text], risk, vpr);
+        self.push_position_label_block(
+            drawing.pane_index,
+            out,
+            (center_x, target_label_y),
+            &[target_text],
+            reward,
+            vpr,
+        );
+        self.push_position_label_block(
+            drawing.pane_index,
+            out,
+            (center_x, stop_label_y),
+            &[stop_text],
+            risk,
+            vpr,
+        );
+        let pnl_color = if pnl.is_some_and(|value| value < 0.0) {
+            risk
+        } else {
+            reward
+        };
+        self.push_position_label_block(
+            drawing.pane_index,
+            out,
+            (center_x, position.entry_y),
+            &middle,
+            pnl_color,
+            vpr,
+        );
     }
 
     /// Dynamic position progress belongs to pane chrome rather than retained drawing geometry:
@@ -1671,6 +1938,8 @@ impl ChartEngine {
     ) {
         for drawing in self.drawings.iter().filter(|drawing| {
             drawing.pane_index == pane_index
+                && drawing.visible
+                && drawing.interval_visibility.allows(self.drawing_interval)
                 && matches!(
                     drawing.kind,
                     DrawingKind::LongPosition | DrawingKind::ShortPosition
@@ -1993,6 +2262,7 @@ impl ChartEngine {
                 price,
             },
             side,
+            closed,
         })
     }
 
@@ -2011,6 +2281,8 @@ impl ChartEngine {
             .unwrap_or(Color::rgb(247, 82, 95));
         for drawing in self.drawings.iter().filter(|drawing| {
             drawing.pane_index == pane_index
+                && drawing.visible
+                && drawing.interval_visibility.allows(self.drawing_interval)
                 && matches!(
                     drawing.kind,
                     DrawingKind::LongPosition | DrawingKind::ShortPosition
@@ -2048,13 +2320,14 @@ impl ChartEngine {
 
     fn push_position_label_block(
         &self,
+        pane_index: usize,
         out: &mut Vec<Prim>,
-        x: f64,
-        y: f64,
+        center: (f64, f64),
         lines: &[String],
         background: Color,
         vpr: f64,
     ) {
+        let (x, y) = center;
         if lines.is_empty() {
             return;
         }
@@ -2075,15 +2348,35 @@ impl ChartEngine {
             w: width.round().max(1.0) as i32,
             h: height.round().max(1.0) as i32,
         };
-        out.push(Prim::Rect {
-            rect,
-            color: Color::rgba(background.r(), background.g(), background.b(), 224),
+        let fallback = aeris_charts_core::style::DEFAULT_SURFACE_RGB;
+        let mut surface = Color::parse_css(&layout.background.color)
+            .unwrap_or(Color::rgb(fallback.0, fallback.1, fallback.2));
+        if matches!(
+            layout.background.kind.as_str(),
+            "gradient" | "vertical_gradient"
+        ) {
+            let pane = &self.panes[pane_index];
+            let mix = ((y / vpr - pane.top) / pane.height.max(1.0)).clamp(0.0, 1.0);
+            let top = Color::parse_css(&layout.background.top_color).unwrap_or(surface);
+            let bottom = Color::parse_css(&layout.background.bottom_color).unwrap_or(surface);
+            let blend = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * mix).round() as u8;
+            surface = Color::rgb(
+                blend(top.r(), bottom.r()),
+                blend(top.g(), bottom.g()),
+                blend(top.b(), bottom.b()),
+            );
+        }
+        out.push(Prim::RoundRect {
+            x: rect.x as f32,
+            y: rect.y as f32,
+            w: rect.w as f32,
+            h: rect.h as f32,
+            radii: [(3.0 * vpr).round().max(1.0) as f32; 4],
+            fill: background.solid(),
+            border_width: vpr.round().max(1.0) as f32,
+            border_color: surface.contrast_srgb(),
         });
-        let text_color = if background.luminance() > 175.0 {
-            Color::rgb(0, 0, 0)
-        } else {
-            Color::rgb(255, 255, 255)
-        };
+        let text_color = background.contrast_text();
         let first_y = y - ((lines.len() as f64 - 1.0) * line_height) / 2.0;
         for (index, text) in lines.iter().enumerate() {
             out.push(Prim::Text {
@@ -2160,35 +2453,29 @@ fn build_anchor_handles(px: &[(f64, f64)], vpr: f64, fill: Color, out: &mut Vec<
 }
 
 /// Paint a handle set (`drawings/handles.rs`) in its order: discs are the anchor disc pair,
-/// squares the Long/Short Position control pair, and rounded squares the rectangle edge-midpoint
-/// pair (2 px corner radius).
+/// squares the Long/Short Position controls (one bordered rounded square: the fill and a
+/// device-snapped inside border), and rounded squares the rectangle edge-midpoint pair (2 px
+/// corner radius).
 fn build_handles(handles: &[DrawingHandle], vpr: f64, fill: Color, out: &mut Vec<Prim>) {
     for handle in handles {
         let (cx, cy) = handle.point;
         match handle.shape {
             HandleShape::Disc => build_anchor_handles(&[handle.point], vpr, fill, out),
             HandleShape::Square => {
+                // One shape owns both the fill and the inside border: two independently rounded
+                // rects gave opposite sides different thicknesses at fractional coordinates/DPR.
                 let side = (2.0 * (ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr)
                     .round()
-                    .max(1.0) as i32;
-                let inner_side = (2.0 * ANCHOR_RADIUS * vpr).round().max(1.0) as i32;
-                out.push(Prim::Rect {
-                    rect: IRect {
-                        x: (cx - f64::from(side) / 2.0).round() as i32,
-                        y: (cy - f64::from(side) / 2.0).round() as i32,
-                        w: side,
-                        h: side,
-                    },
-                    color: ANCHOR_BORDER,
-                });
-                out.push(Prim::Rect {
-                    rect: IRect {
-                        x: (cx - f64::from(inner_side) / 2.0).round() as i32,
-                        y: (cy - f64::from(inner_side) / 2.0).round() as i32,
-                        w: inner_side,
-                        h: inner_side,
-                    },
-                    color: fill,
+                    .max(1.0);
+                out.push(Prim::RoundRect {
+                    x: (cx - side / 2.0).round() as f32,
+                    y: (cy - side / 2.0).round() as f32,
+                    w: side as f32,
+                    h: side as f32,
+                    radii: [(2.0 * vpr).round().max(1.0) as f32; 4],
+                    fill,
+                    border_width: (ANCHOR_BORDER_WIDTH * vpr).floor().max(1.0) as f32,
+                    border_color: ANCHOR_BORDER,
                 });
             }
             HandleShape::RoundedSquare => {
@@ -2217,5 +2504,22 @@ fn build_handles(handles: &[DrawingHandle], vpr: f64, fill: Color, out: &mut Vec
                 });
             }
         }
+    }
+}
+
+fn position_stat_number(value: f64, precision: usize) -> String {
+    if !value.is_finite() {
+        return "—".to_string();
+    }
+    let text = format!("{value:.precision$}");
+    let text = if precision > 0 {
+        text.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &text
+    };
+    if text == "-0" {
+        "0".to_string()
+    } else {
+        text.to_string()
     }
 }

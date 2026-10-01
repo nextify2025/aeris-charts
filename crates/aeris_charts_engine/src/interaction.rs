@@ -65,6 +65,35 @@ pub enum WheelIntent {
     PanAndZoom = 3,
 }
 
+/// Active native financial-chart gesture. Platform hosts translate events; the engine owns
+/// target resolution, lifecycle, and scale/separator mutation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FinancialDrag {
+    Pane {
+        price_pan: Option<(usize, PriceScaleTarget)>,
+    },
+    TimeAxis,
+    PriceAxis {
+        pane: usize,
+        target: PriceScaleTarget,
+    },
+    PaneSeparator {
+        index: usize,
+        grab_offset_y: f64,
+    },
+}
+
+/// Semantic keyboard navigation actions for a native financial chart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinancialNavigation {
+    PreviousBar,
+    NextBar,
+    PreviousPage,
+    NextPage,
+    ZoomIn,
+    ZoomOut,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WheelSample {
     pub x: f64,
@@ -913,6 +942,222 @@ impl ChartEngine {
         Some(target)
     }
 
+    /// Active engine-owned native financial gesture, if any.
+    #[must_use]
+    pub const fn financial_drag(&self) -> Option<FinancialDrag> {
+        self.financial_drag
+    }
+
+    /// Apply one canonical keyboard navigation action. Hosts own key mapping only.
+    pub fn apply_financial_navigation(&mut self, action: FinancialNavigation, accelerated: bool) {
+        let step = if accelerated { 10.0 } else { 1.0 };
+        let page = (self.pane_w / self.bar_spacing() * 0.8).max(1.0);
+        let center = self.pane_w / 2.0;
+        match action {
+            FinancialNavigation::PreviousBar => {
+                self.scroll_to_position(self.scroll_position() - step);
+            }
+            FinancialNavigation::NextBar => {
+                self.scroll_to_position(self.scroll_position() + step);
+            }
+            FinancialNavigation::PreviousPage => {
+                self.scroll_to_position(self.scroll_position() - page);
+            }
+            FinancialNavigation::NextPage => {
+                self.scroll_to_position(self.scroll_position() + page);
+            }
+            FinancialNavigation::ZoomIn => self.time_scale.zoom(center, 0.5),
+            FinancialNavigation::ZoomOut => self.time_scale.zoom(center, -0.5),
+        }
+    }
+
+    /// Enable or disable the temporary modifier-driven OHLC magnet.
+    pub fn set_crosshair_ohlc_magnet(&mut self, enabled: bool) -> bool {
+        if self.crosshair_ohlc_magnet == enabled {
+            return false;
+        }
+        self.crosshair_ohlc_magnet = enabled;
+        self.invalidate_frame_overlay();
+        true
+    }
+
+    /// Current pane-separator hover target.
+    #[must_use]
+    pub const fn separator_hover(&self) -> Option<usize> {
+        self.separator_hover
+    }
+
+    /// Configured crosshair mode in the public wire representation.
+    #[must_use]
+    pub fn configured_crosshair_mode(&self) -> u8 {
+        self.options.get().crosshair.mode
+    }
+
+    /// Set the configured crosshair mode from its stable public wire value.
+    pub fn set_configured_crosshair_mode(&mut self, mode: u8) -> bool {
+        if mode > 3 || self.configured_crosshair_mode() == mode {
+            return false;
+        }
+        self.options
+            .apply(&serde_json::json!({"crosshair": {"mode": mode}}));
+        self.crosshair_mode = crosshair_mode_from_u8(mode);
+        self.invalidate_frame_overlay();
+        true
+    }
+
+    /// Resolve a pane separator using a host-selected interaction halo.
+    #[must_use]
+    pub fn pane_separator_at(&self, y: f64, hit_radius: f64) -> Option<usize> {
+        if !y.is_finite() || !hit_radius.is_finite() || hit_radius < 0.0 {
+            return None;
+        }
+        self.panes
+            .iter()
+            .skip(1)
+            .position(|pane| (y - pane.top).abs() <= hit_radius)
+    }
+
+    /// Install or clear the financial crosshair from one pane-space pointer sample.
+    pub fn update_financial_crosshair(&mut self, x: f64, y: f64, separator_hit_radius: f64) {
+        self.crosshair = (self.pane_separator_at(y, separator_hit_radius).is_none()
+            && x >= 0.0
+            && x <= self.pane_w
+            && y >= 0.0
+            && y <= self.pane_h)
+            .then_some((x, y));
+        self.invalidate_frame_overlay();
+    }
+
+    /// Begin the canonical pane, price-axis, time-axis, or separator gesture.
+    /// Double-click performs the corresponding native reset and leaves no active gesture.
+    pub fn begin_financial_drag(
+        &mut self,
+        x: f64,
+        y: f64,
+        click_count: usize,
+        separator_hit_radius: f64,
+    ) -> bool {
+        self.end_financial_drag();
+        let pane = self.pane_index_at_y(y);
+        if click_count >= 2 {
+            if y > self.pane_h {
+                self.reset_time_scale();
+                return true;
+            }
+            if self.price_axis_target_at(pane, x).is_some() {
+                self.reset_price_scales();
+                return true;
+            }
+            return false;
+        }
+        self.financial_drag = if let Some(index) = self.pane_separator_at(y, separator_hit_radius) {
+            self.set_separator_hover(None);
+            self.panes
+                .get(index + 1)
+                .map(|pane_below| FinancialDrag::PaneSeparator {
+                    index,
+                    grab_offset_y: y - pane_below.top,
+                })
+        } else if y > self.pane_h {
+            self.time_axis_start_scale(x);
+            Some(FinancialDrag::TimeAxis)
+        } else if let Some(target) = self.price_axis_target_at(pane, x) {
+            if self.price_axis_scalable(pane, target) {
+                self.set_price_scale_auto_scale_for(pane, target, false);
+                self.price_axis_start_scale(pane, target, y);
+                Some(FinancialDrag::PriceAxis { pane, target })
+            } else {
+                None
+            }
+        } else if x >= 0.0 && y >= 0.0 && y <= self.pane_h {
+            self.time_scale.start_scroll(x);
+            let price_pan = self
+                .begin_price_pan_at(pane, x, y)
+                .or_else(|| {
+                    let target = [PriceScaleTarget::Right, PriceScaleTarget::Left]
+                        .into_iter()
+                        .find(|&target| {
+                            self.price_scale_auto_scale_for(pane, target) == Some(false)
+                                && self.price_axis_scalable(pane, target)
+                        })?;
+                    self.price_axis_start_scroll(pane, target, y);
+                    Some(target)
+                })
+                .map(|target| (pane, target));
+            Some(FinancialDrag::Pane { price_pan })
+        } else {
+            None
+        };
+        self.financial_drag.is_some()
+    }
+
+    /// Advance the active native financial gesture. Returns whether pane layout changed.
+    pub fn update_financial_drag(&mut self, x: f64, y: f64) -> bool {
+        match self.financial_drag {
+            Some(FinancialDrag::Pane { price_pan }) => {
+                self.time_scale.scroll_to(x);
+                if let Some((pane, target)) = price_pan {
+                    self.price_axis_scroll_to(pane, target, y);
+                }
+            }
+            Some(FinancialDrag::TimeAxis) => self.time_axis_scale_to(x),
+            Some(FinancialDrag::PriceAxis { pane, target }) => {
+                self.price_axis_scale_to(pane, target, y);
+            }
+            Some(FinancialDrag::PaneSeparator {
+                index,
+                grab_offset_y,
+            }) => {
+                if let Some(pane_below) = self.panes.get(index + 1) {
+                    let delta = y - grab_offset_y - pane_below.top;
+                    self.drag_pane_separator(index, delta);
+                    return true;
+                }
+            }
+            None => {}
+        }
+        false
+    }
+
+    /// Finish the active native financial gesture exactly once.
+    pub fn end_financial_drag(&mut self) {
+        match self.financial_drag.take() {
+            Some(FinancialDrag::Pane { price_pan }) => {
+                self.time_scale.end_scroll();
+                if let Some((pane, target)) = price_pan {
+                    self.price_axis_end_scroll(pane, target);
+                }
+            }
+            Some(FinancialDrag::TimeAxis) => self.time_axis_end_scale(),
+            Some(FinancialDrag::PriceAxis { pane, target }) => {
+                self.price_axis_end_scale(pane, target);
+            }
+            Some(FinancialDrag::PaneSeparator { .. }) | None => {}
+        }
+    }
+
+    /// Apply canonical financial wheel semantics in pane coordinates.
+    pub fn apply_financial_wheel(&mut self, x: f64, y: f64, normalized_x: f64, normalized_y: f64) {
+        if normalized_y != 0.0 {
+            let zoom = wheel_zoom_scale(normalized_y);
+            let pane = self.pane_index_at_y(y);
+            if let Some(target) = (y <= self.pane_h)
+                .then(|| self.price_axis_target_at(pane, x))
+                .flatten()
+            {
+                self.price_axis_wheel_zoom(pane, target, y, zoom);
+            } else {
+                self.time_scale.zoom(x, zoom);
+            }
+        }
+        if normalized_x != 0.0 {
+            self.time_scale.start_scroll(0.0);
+            self.time_scale
+                .scroll_to(WHEEL_SCROLL_PX_PER_DELTA * normalized_x);
+            self.time_scale.end_scroll();
+        }
+    }
+
     // --- animated scroll-to-position ---
 
     /// Start an eased scroll to `target_position` (logical bars from the right edge), replacing
@@ -1014,6 +1259,59 @@ mod tests {
             tilt_x: 0.0,
             tilt_y: 0.0,
         }
+    }
+
+    #[test]
+    fn native_financial_drag_owns_target_lifecycle_and_separator_resize() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.add_pane(true).unwrap();
+        chart.recompute_layout_with_measure(true, |_, _| 48.0, |_, _| 48.0);
+        let separator_y = chart.panes[1].top;
+        assert_eq!(chart.pane_separator_at(separator_y, 4.0), Some(0));
+        assert!(chart.begin_financial_drag(300.0, separator_y, 1, 4.0));
+        assert!(matches!(
+            chart.financial_drag(),
+            Some(FinancialDrag::PaneSeparator { index: 0, .. })
+        ));
+        let top_stretch = chart.panes[0].stretch_factor;
+        assert!(chart.update_financial_drag(300.0, separator_y + 20.0));
+        assert!(chart.panes[0].stretch_factor > top_stretch);
+        chart.end_financial_drag();
+        assert_eq!(chart.financial_drag(), None);
+
+        let time_y = chart.pane_h + 5.0;
+        assert!(chart.begin_financial_drag(300.0, time_y, 1, 4.0));
+        assert_eq!(chart.financial_drag(), Some(FinancialDrag::TimeAxis));
+        chart.end_financial_drag();
+        assert_eq!(chart.financial_drag(), None);
+    }
+
+    #[test]
+    fn financial_crosshair_excludes_dividers_and_wheel_routes_to_engine_scales() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.add_pane(true).unwrap();
+        chart.recompute_layout_with_measure(true, |_, _| 48.0, |_, _| 48.0);
+        let separator_y = chart.panes[1].top;
+        chart.update_financial_crosshair(200.0, separator_y, 4.0);
+        assert_eq!(chart.crosshair, None);
+        chart.update_financial_crosshair(200.0, 100.0, 4.0);
+        assert_eq!(chart.crosshair, Some((200.0, 100.0)));
+
+        let spacing = chart.bar_spacing();
+        chart.apply_financial_wheel(200.0, 100.0, 0.0, 1.0);
+        assert_ne!(chart.bar_spacing(), spacing);
+
+        let scroll = chart.scroll_position();
+        chart.apply_financial_navigation(FinancialNavigation::PreviousBar, true);
+        assert_eq!(chart.scroll_position(), scroll - 10.0);
+        chart.apply_financial_navigation(FinancialNavigation::NextPage, false);
+        assert!(chart.scroll_position() > scroll - 10.0);
+        assert!(chart.set_crosshair_ohlc_magnet(true));
+        assert!(!chart.set_crosshair_ohlc_magnet(true));
+        assert!(chart.crosshair_ohlc_magnet);
+        assert!(chart.set_configured_crosshair_mode(2));
+        assert_eq!(chart.configured_crosshair_mode(), 2);
+        assert!(!chart.set_configured_crosshair_mode(4));
     }
 
     #[test]

@@ -1173,7 +1173,7 @@ class PaneAccessibility {
       row.style.cssText = "display:flex;gap:10px;align-items:baseline;margin-top:3px";
       const key = document.createElement("kbd");
       key.textContent = keys;
-      key.style.cssText = "flex:0 0 auto;border:var(--border-width, 0.5px) solid currentColor;border-radius:3px;padding:0 5px;font-family:monospace;white-space:nowrap";
+      key.style.cssText = "flex:0 0 auto;border:var(--border-width, 1px) solid currentColor;border-radius:3px;padding:0 5px;font-family:monospace;white-space:nowrap";
       const text = document.createElement("span");
       text.textContent = action;
       row.append(key, text);
@@ -1186,7 +1186,7 @@ class PaneAccessibility {
     const surface = this.high_contrast
       ? "background:#000;border:2px solid #fff;"
       // High contrast keeps its heavy outline on purpose; the default surface uses the brand border.
-      : "background:rgba(20,24,28,0.9);border:var(--border-width, 0.5px) solid rgba(255,255,255,0.25);";
+      : "background:rgba(20,24,28,0.9);border:var(--border-width, 1px) solid rgba(255,255,255,0.25);";
     this.hint.style.cssText = `${base}${surface}left:8px;bottom:8px;padding:3px 8px;border-radius:4px;white-space:nowrap;${this.controller.options.show_shortcuts && this.focused && !this.shortcuts_open ? "" : "display:none"}`;
     this.panel.style.cssText = `${base}${surface}left:8px;top:8px;max-width:calc(100% - 16px);padding:8px 11px;border-radius:6px;${this.high_contrast ? "" : "box-shadow:0 2px 10px rgba(0,0,0,0.45);"}${this.controller.options.show_shortcuts && this.shortcuts_open ? "" : "display:none"}`;
   }

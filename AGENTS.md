@@ -120,27 +120,12 @@ npm run test:pack
 
 Run Playwright once per batch when the batch changes browser-facing behavior, and GPUI parity/replay checks once per batch when it changes GPUI executor behavior. Documentation-only changes may skip code gates, but still require diff, link/path, architecture-consistency, and documentation-hygiene checks.
 
-### crates.io releases
+### Rust crates
 
-Keep every publishable Aeris crate on one coordinated version and keep each internal dependency's
-`path` plus `version` fields aligned. `aeris_charts_render_gpui` is repository-only and must retain
-`publish = false` while it depends on the reviewed Zed Git revision.
-
-After the complete gates pass, publish with `--locked` in dependency order and wait for each crate to
-be indexed before publishing its consumers:
-
-```text
-aeris_charts_indicators
-aeris_charts_core
-aeris_charts_render
-aeris_charts_engine
-aeris_charts_render_wgpu
-aeris_charts_native
-aeris_charts_wasm
-```
-
-Run a package or publish dry run at each layer before its irreversible upload. Never place a crates.io
-token in repository files, shell history, logs, or task messages.
+Rust crates are repository-only and keep `publish = false`; never publish them to crates.io. Hosts
+consume them through pinned Git revisions or local paths. The only published artifact is the
+`@aeristerminal/aeris-charts` npm package on GitHub Packages, released by pushing a `v<version>` tag
+that matches `packages/charts/package.json` after CI passes on that commit.
 
 When a batch is complete and its gates pass, review the diff, commit the batch once with a structured message describing the delivered capabilities and verification, push `main` to `github` without force, and report remaining manual verification honestly.
 

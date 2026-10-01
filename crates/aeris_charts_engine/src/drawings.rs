@@ -817,6 +817,10 @@ pub struct Drawing {
     pub profile: Option<crate::ProfileDrawingOptions>,
     /// B8 family-specific option blocks (`tool_options` in options JSON and persistence).
     pub tool_options: crate::DrawingToolOptions,
+    /// Hypothetical account balance for position drawing statistics; never a broker balance.
+    pub position_account_size: f64,
+    /// Percentage of the hypothetical balance risked at the stop (0..=100).
+    pub position_risk_percent: f64,
     /// Line/border color CSS string (default [`DRAWING_DEFAULT_COLOR`]).
     pub color: String,
     /// Stroke width in CSS px (default 2; 1 for a rectangle's border).
@@ -919,12 +923,14 @@ impl Drawing {
             levels: Vec::new(),
             price_scale: DrawingPriceScale::Right,
             profile: None,
+            position_account_size: 1000.0,
+            position_risk_percent: 25.0,
             color: DRAWING_DEFAULT_COLOR.to_string(),
             width: kind.spec().default_width,
             style: LineStyle::Solid,
             fill_color: None,
             preview_fill_color: None,
-            border_visible: true,
+            border_visible: kind != DrawingKind::Rectangle,
             show_labels: false,
             axis_bands_visible: false,
             label_color: None,
@@ -1091,6 +1097,8 @@ impl Drawing {
             DrawingKind::LongPosition | DrawingKind::ShortPosition => {
                 crate::DrawingKindOptions::Position {
                     levels: self.levels.clone(),
+                    account_size: self.position_account_size,
+                    risk_percent: self.position_risk_percent,
                 }
             }
             _ => crate::DrawingKindOptions::Generic,
@@ -1162,6 +1170,13 @@ pub struct DrawingModifiers {
 /// tests).
 pub type TextMeasureFn = Box<dyn Fn(&str, f64, &str, u16, bool) -> f64>;
 
+/// Host vertical glyph metric for `{italic} {weight} {size}px {family}`: the offset, in the same px
+/// units as `size`, that moves a `Prim::Text` anchor (Canvas `textBaseline: "middle"`, the em-box
+/// center) so the ink of capitals and figures is centered on the intended line instead. Browser
+/// hosts derive it from `measureText` ink bounds and native hosts from the font's cap height.
+/// Without one the engine uses no correction (deterministic for native tests).
+pub type TextCapCenterFn = Box<dyn Fn(f64, &str, u16, bool) -> f64>;
+
 /// Active anchor/body drag session (the interaction.rs session pattern: the engine owns the
 /// start snapshot and the math; hosts forward drag positions).
 pub(crate) struct DrawingDrag {
@@ -1187,16 +1202,6 @@ pub(crate) struct DrawingDrag {
     pub(crate) history_tool_options: crate::DrawingToolOptions,
     /// A keyboard nudge's media-px step; `None` for a pointer drag.
     pub(crate) keyboard_step: Option<(f64, f64)>,
-}
-
-/// Open inline text-edit session: the drawing the host's editor owns and its `text` and
-/// `revision` when the session began, which cancel restores and commit records as the undo
-/// step's `before`. Runtime only; restore, sync, clear, and removal end it.
-#[derive(Clone, Debug)]
-pub(crate) struct DrawingTextEdit {
-    pub(crate) id: DrawingId,
-    text: String,
-    revision: u64,
 }
 
 /// Where the host's inline editor lays out a drawing's own `text`
@@ -1590,6 +1595,10 @@ pub(crate) struct DrawingPatch {
     /// Deep-merged into [`Drawing::tool_options`].
     #[serde(alias = "toolOptions")]
     tool_options: Option<serde_json::Value>,
+    #[serde(alias = "positionAccountSize")]
+    position_account_size: Option<f64>,
+    #[serde(alias = "positionRiskPercent")]
+    position_risk_percent: Option<f64>,
 }
 
 /// A drawing style name (`solid`/`dotted`/`dashed`) as a line style: the retired names fold into
@@ -1634,7 +1643,7 @@ fn update_css_slot(slot: &mut Option<String>, value: String) {
 
 /// `text` with every run of `\r` and `\n` replaced by one space (the single-line rule of a run
 /// label).
-fn collapse_line_breaks(text: &str) -> String {
+pub(crate) fn collapse_line_breaks(text: &str) -> String {
     let mut collapsed = String::with_capacity(text.len());
     let mut in_break = false;
     for c in text.chars() {
@@ -1659,6 +1668,12 @@ impl Drawing {
             .text
             .as_ref()
             .is_some_and(|text| text.len() > crate::MAX_DRAWING_TEXT_BYTES)
+            || patch
+                .position_account_size
+                .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1e15)
+            || patch
+                .position_risk_percent
+                .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
         {
             return false;
         }
@@ -1838,6 +1853,12 @@ impl Drawing {
                 self.box_border_width = width;
             }
         }
+        if let Some(value) = patch.position_account_size {
+            self.position_account_size = value;
+        }
+        if let Some(value) = patch.position_risk_percent {
+            self.position_risk_percent = value;
+        }
         if let Some(profile) = patch.profile {
             self.profile = Some(profile);
         }
@@ -1863,6 +1884,8 @@ impl Drawing {
             "levels": self.levels,
             "price_scale_id": self.price_scale.name(),
             "profile": self.profile,
+            "position_account_size": self.position_account_size,
+            "position_risk_percent": self.position_risk_percent,
             "color": self.color,
             "width": self.width,
             "style": style_name(self.style),
@@ -2483,6 +2506,15 @@ impl ChartEngine {
         self.bump_drawing_sync_revision();
     }
 
+    /// Record one committed text edit (drawing_text_edit.rs): `before` is the drawing as the
+    /// session began, `after` as it ended.
+    pub(crate) fn record_drawing_update(&mut self, before: Drawing, after: Drawing) {
+        self.record_drawing_command(DrawingCommand::Update {
+            before,
+            after: Box::new(after),
+        });
+    }
+
     fn bump_drawing_sync_revision(&mut self) {
         self.drawing_sync_revision = self.drawing_sync_revision.wrapping_add(1).max(1);
     }
@@ -2509,7 +2541,7 @@ impl ChartEngine {
             self.drawing_drag = None;
         }
         if self.editing_drawing() == Some(id) {
-            self.text_edit = None;
+            self.drawing_text_edit = None;
         }
         if self.hovered_text == Some(id) {
             self.hovered_text = None;
@@ -2565,7 +2597,7 @@ impl ChartEngine {
                 }
                 self.selected_drawing = None;
                 self.drawing_drag = None;
-                self.text_edit = None;
+                self.drawing_text_edit = None;
                 self.hovered_drawing = None;
                 self.hovered_text = None;
             }
@@ -2593,7 +2625,7 @@ impl ChartEngine {
         if self.drawing_drag.is_some() {
             self.drawing_drag_cancel();
         }
-        self.end_drawing_text_edit(true);
+        self.commit_drawing_text_edit();
         let Some(command) = self.drawing_history.undo.pop() else {
             return false;
         };
@@ -2612,7 +2644,7 @@ impl ChartEngine {
         if self.drawing_drag.is_some() {
             self.drawing_drag_cancel();
         }
-        self.end_drawing_text_edit(true);
+        self.commit_drawing_text_edit();
         let Some(command) = self.drawing_history.redo.pop() else {
             return false;
         };
@@ -2764,6 +2796,124 @@ impl ChartEngine {
             logical: self.time_scale.coordinate_to_float_index(x) + 0.5,
             price: scale.coordinate_to_price(y, base),
         })
+    }
+
+    /// The price-band tick ladder governing the scale a position is bound to, when one is
+    /// installed. Like order snapping it is then the single tick source: the scalar instrument
+    /// tick applies only where no ladder is configured.
+    fn position_tick_ladder(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+    ) -> Option<&crate::PriceTickLadder> {
+        let target = match price_scale {
+            DrawingPriceScale::Right => crate::PriceScaleTarget::Right,
+            DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
+            DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
+        };
+        self.scale_formatter_source(pane_index, target)?
+            .price_format
+            .active_tick_ladder()
+    }
+
+    /// Position levels use the instrument's orderable grid, or their bound scale's display tick.
+    /// Resolve this in price space: a tick can be much smaller than a device pixel. A scale with a
+    /// price-band ladder has no single tick: ask [`Self::position_price_tick_at`].
+    pub(crate) fn position_price_tick(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+    ) -> Option<f64> {
+        let target = match price_scale {
+            DrawingPriceScale::Right => crate::PriceScaleTarget::Right,
+            DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
+            DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
+        };
+        self.trading_state
+            .instrument
+            .tick_size
+            .or_else(|| {
+                self.scale_formatter_source(pane_index, target)
+                    .map(|series| series.price_format.min_move)
+            })
+            .filter(|tick| tick.is_finite() && *tick > 0.0)
+    }
+
+    /// The tick in force at `price`: the ladder band's, else [`Self::position_price_tick`].
+    pub(crate) fn position_price_tick_at(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        price: f64,
+    ) -> Option<f64> {
+        match self.position_tick_ladder(pane_index, price_scale) {
+            Some(ladder) => Some(ladder.min_move_at(price)),
+            None => self.position_price_tick(pane_index, price_scale),
+        }
+        .filter(|tick| tick.is_finite() && *tick > 0.0)
+    }
+
+    /// Whole ticks between two on-grid prices of a position: the ladder's cumulative band ticks,
+    /// else the distance over the single tick. `None` without a tick or off the ladder grid.
+    pub(crate) fn position_price_ticks_between(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        from: f64,
+        to: f64,
+    ) -> Option<f64> {
+        match self.position_tick_ladder(pane_index, price_scale) {
+            Some(ladder) => Some((ladder.tick_index(to)? - ladder.tick_index(from)?).abs() as f64),
+            None => self
+                .position_price_tick(pane_index, price_scale)
+                .map(|tick| (to - from).abs() / tick),
+        }
+    }
+
+    /// A keyboard nudge of a position level on its price grid: a nudge that snaps back to the
+    /// level it started from still steps one tick the way the key points (the sign of the raw
+    /// price move, or the key's own direction when that is zero). `snapped` is the nudge's
+    /// result on the grid; levels that are off the grid or move a whole tick or more keep it.
+    fn keyboard_position_price(
+        &self,
+        scale: (usize, DrawingPriceScale),
+        start: f64,
+        raw: f64,
+        snapped: f64,
+        key_y: f64,
+    ) -> f64 {
+        let Some(tick) = self.position_price_tick_at(scale.0, scale.1, start) else {
+            return snapped;
+        };
+        if key_y == 0.0 || (snapped - start).abs() >= tick * 0.5 {
+            return snapped;
+        }
+        let direction = if raw == start {
+            -key_y.signum()
+        } else {
+            (raw - start).signum()
+        };
+        self.snap_position_price(scale.0, scale.1, start + direction * tick)
+    }
+
+    fn snap_position_price(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        price: f64,
+    ) -> f64 {
+        if let Some(ladder) = self.position_tick_ladder(pane_index, price_scale) {
+            return ladder.snap(price);
+        }
+        let Some(tick) = self.position_price_tick(pane_index, price_scale) else {
+            return price;
+        };
+        let snapped = (price / tick).round() * tick;
+        if snapped.is_finite() {
+            snapped
+        } else {
+            price
+        }
     }
 
     fn snap_drawing_time_to_data(&self, mut point: DrawingPoint) -> Option<DrawingPoint> {
@@ -3365,10 +3515,13 @@ impl ChartEngine {
                 };
                 let mut x = start.0 + ux * distance;
                 let mut y = start.1 + uy * distance;
+                // Placement and hit testing use the same 1.2em line box. Half a bare em can
+                // put descenders against the stroke, particularly when the line is tilted.
+                let half_line_height = size * 0.6;
                 let normal_distance = match drawing.text_v_align {
-                    DrawingTextVAlign::Top => pad + size / 2.0,
+                    DrawingTextVAlign::Top => pad + half_line_height,
                     DrawingTextVAlign::Middle => 0.0,
-                    DrawingTextVAlign::Bottom => -pad - size / 2.0,
+                    DrawingTextVAlign::Bottom => -pad - half_line_height,
                 };
                 // Screen y grows downward, so `(uy, -ux)` is the readable line's top normal.
                 x += uy * normal_distance;
@@ -3420,6 +3573,30 @@ impl ChartEngine {
             entry.text_key = u64::MAX;
         }
         self.invalidate_frame_drawings();
+        // Trading marker cells size themselves from measured quantity text.
+        self.invalidate_frame_trading();
+    }
+
+    /// Cap-and-figure ink correction for a middle-anchored run (see [`TextCapCenterFn`]).
+    pub(crate) fn text_cap_center(
+        &self,
+        size: f64,
+        family: &str,
+        weight: u16,
+        italic: bool,
+    ) -> f64 {
+        self.text_cap_center_fn
+            .as_ref()
+            .map(|correction| correction(size, family, weight, italic))
+            .filter(|correction| correction.is_finite())
+            .unwrap_or(0.0)
+    }
+
+    /// Install (or clear with `None`) the host vertical glyph metric used to optically center
+    /// control text inside its box (see [`TextCapCenterFn`]).
+    pub fn set_text_cap_center(&mut self, f: Option<TextCapCenterFn>) {
+        self.text_cap_center_fn = f;
+        self.invalidate_frame_trading();
     }
 
     fn insert_drawing_runtime(&self, id: DrawingId) {
@@ -3439,7 +3616,7 @@ impl ChartEngine {
         Some(id)
     }
 
-    fn update_drawing_runtime(&self, id: DrawingId) {
+    pub(crate) fn update_drawing_runtime(&self, id: DrawingId) {
         let Some(drawing) = self.drawing(id) else {
             return;
         };
@@ -3907,7 +4084,7 @@ impl ChartEngine {
         self.drawing_drag = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
-        self.text_edit = None;
+        self.drawing_text_edit = None;
         self.record_drawing_command(DrawingCommand::Clear { drawings });
     }
 
@@ -4434,7 +4611,7 @@ impl ChartEngine {
         self.drawing_settings.price_basis = payload.price_basis.filter(|basis| !basis.is_empty());
         self.selected_drawing = None;
         self.selected_drawings.clear();
-        self.text_edit = None;
+        self.drawing_text_edit = None;
         self.drawing_history.clear();
         self.drawing_runtime
             .borrow_mut()
@@ -4732,6 +4909,28 @@ impl ChartEngine {
         .unwrap_or(false)
     }
 
+    /// The drawing under a media-px pointer and the cursor it shows. A trend label or its
+    /// `+ Add text` prompt wins with the text cursor, so moving from the line onto the label
+    /// keeps the affordance; otherwise the body/handle hit and its drag cursor. Pure: hosts use
+    /// it to resolve cursors without changing hover state.
+    pub fn drawing_hover_at(&self, x: f64, y: f64) -> Option<(DrawingId, &'static str)> {
+        if let Some(id) = self.drawing_text_hit_at(x, y) {
+            return Some((id, "text"));
+        }
+        self.hit_test_drawing(x, y).map(|hit| (hit.id, hit.cursor))
+    }
+
+    /// Canonical drawing hover for every host: resolves [`Self::drawing_hover_at`] and applies
+    /// the generic hover promotion plus the text hover ring / trend `+ Add text` prompt, or
+    /// clears both. Returns the hovered drawing and its cursor.
+    pub fn update_drawing_hover(&mut self, x: f64, y: f64) -> Option<(DrawingId, &'static str)> {
+        let hover = self.drawing_hover_at(x, y);
+        let id = hover.map(|(id, _)| id);
+        self.set_hovered_text(id);
+        self.set_hovered_drawing(id);
+        hover
+    }
+
     /// Every drawing as a JSON array of `{id, kind, pane_index, points, ...options}` in z-order.
     pub fn drawings_json(&self) -> String {
         let list: Vec<serde_json::Value> = self
@@ -4784,108 +4983,9 @@ impl ChartEngine {
             && self.drawing_text_edit_layout(id).is_some()
     }
 
-    /// Open the inline text-edit session the host's typing-mode editor owns on a text-editable
-    /// drawing ([`ChartEngine::drawing_text_editable`]), committing any session open on another
-    /// drawing first. The frame keeps painting the label and the focus border underneath the
-    /// host's borderless caret overlay (the public reference's overlay-caret model), and an empty
-    /// family text box keeps one caret line. Returns false for a drawing that cannot be edited.
-    pub fn begin_drawing_text_edit(&mut self, id: DrawingId) -> bool {
-        if self.editing_drawing() == Some(id) {
-            return true;
-        }
-        if !self.drawing_text_editable(id) {
-            return false;
-        }
-        self.end_drawing_text_edit(true);
-        let Some(drawing) = self.drawing(id) else {
-            return false;
-        };
-        self.text_edit = Some(DrawingTextEdit {
-            id,
-            text: drawing.text.clone(),
-            revision: drawing.revision,
-        });
-        // The open session gives an empty label its caret slot, which changes its culling pad.
-        self.update_drawing_runtime(id);
-        self.invalidate_frame_drawings();
-        true
-    }
-
-    /// Replace the edited drawing's `text` live while the session is open. Live text records no
-    /// undo step and no sync revision; [`ChartEngine::end_drawing_text_edit`] records the whole
-    /// edit once. Returns false while no session is open.
-    pub fn set_drawing_edit_text(&mut self, text: &str) -> bool {
-        let Some(id) = self.editing_drawing() else {
-            return false;
-        };
-        let Some(index) = self.drawings.iter().position(|drawing| drawing.id == id) else {
-            self.text_edit = None;
-            return false;
-        };
-        // The engine owns the text rules: a run label stays on one line (a run of line breaks is
-        // one space), and every text is bounded, clamped at a character boundary.
-        let single_line = self.drawings[index].kind.paints_generic_text();
-        let text = if single_line && text.contains(['\r', '\n']) {
-            std::borrow::Cow::Owned(collapse_line_breaks(text))
-        } else {
-            std::borrow::Cow::Borrowed(text)
-        };
-        let mut end = text.len().min(crate::MAX_DRAWING_TEXT_BYTES);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let text = &text[..end];
-        if self.drawings[index].text != text {
-            let drawing = &mut self.drawings[index];
-            drawing.text = text.to_string();
-            drawing.revision = drawing.revision.saturating_add(1);
-            self.update_drawing_runtime(id);
-            self.invalidate_frame_drawings();
-        }
-        true
-    }
-
-    /// Close the inline text-edit session. Commit records the edit as one undo step (the text
-    /// it began from against the text it ends with) and one sync revision, when the text
-    /// changed; cancel restores the text it began from without a history entry. Returns false
-    /// while no session is open.
-    pub fn end_drawing_text_edit(&mut self, commit: bool) -> bool {
-        let Some(edit) = self.text_edit.take() else {
-            return false;
-        };
-        self.update_drawing_runtime(edit.id);
-        self.invalidate_frame_drawings();
-        let Some(index) = self
-            .drawings
-            .iter()
-            .position(|drawing| drawing.id == edit.id)
-        else {
-            return true;
-        };
-        if self.drawings[index].text == edit.text {
-            return true;
-        }
-        if commit {
-            let after = self.drawings[index].clone();
-            let mut before = after.clone();
-            before.text = edit.text;
-            before.revision = edit.revision;
-            self.record_drawing_command(DrawingCommand::Update {
-                before,
-                after: Box::new(after),
-            });
-        } else {
-            let drawing = &mut self.drawings[index];
-            drawing.text = edit.text;
-            drawing.revision = edit.revision;
-            self.update_drawing_runtime(edit.id);
-        }
-        true
-    }
-
     /// The drawing whose inline text-edit session is open.
     pub fn editing_drawing(&self) -> Option<DrawingId> {
-        self.text_edit.as_ref().map(|edit| edit.id)
+        self.drawing_text_edit.as_ref().map(|session| session.id)
     }
 
     /// Whether `id` paints parts only while focused (`DrawingFamily::reveals_on_focus`).
@@ -4962,12 +5062,11 @@ impl ChartEngine {
     /// The drawing a click at pane-relative media px `(x, y)` would select, without selecting it:
     /// a drawing's own text under the point ([`ChartEngine::drawing_text_hit_at`]) first, then the
     /// selected drawing's anchor handle or the topmost body ([`ChartEngine::hit_test_drawing`]),
-    /// the order the click pipeline arbitrates in. A host that acts on a repeated click (a
+    /// the order the click pipeline arbitrates in (shared with [`ChartEngine::drawing_hover_at`]). A host that acts on a repeated click (a
     /// double-click that opens the selected drawing's editor) asks this first, so a click that
     /// landed on something else, or that another owner consumed, never acts on the selection.
     pub fn drawing_at(&self, x: f64, y: f64) -> Option<DrawingId> {
-        self.drawing_text_hit_at(x, y)
-            .or_else(|| self.hit_test_drawing(x, y).map(|hit| hit.id))
+        self.drawing_hover_at(x, y).map(|(id, _)| id)
     }
 
     /// Remove the selected drawing (Delete/Backspace). Returns false while nothing is selected.
@@ -5343,10 +5442,12 @@ impl ChartEngine {
         };
         drag.current_x = x;
         drag.current_y = y;
-        let (dx, dy) = (x - drag.start_x, y - drag.start_y);
+        let start_x = drag.start_x;
+        let (dx, dy) = (x - start_x, y - drag.start_y);
         let (id, part) = (drag.id, drag.part);
         let (start_points, start_px) = (drag.start_points.clone(), drag.start_px.clone());
         let handle_px = drag.handle_px;
+        let keyboard_step = drag.keyboard_step;
         let Some(drawing) = self.drawing(id) else {
             return;
         };
@@ -5392,6 +5493,36 @@ impl ChartEngine {
                     if modifiers.magnet && index != 2 {
                         cursor_pt =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y, cursor_pt);
+                    }
+                    let raw_price = cursor_pt.price;
+                    if matches!(index, 1 | 2) {
+                        cursor_pt.logical = self.snapped_crosshair_index(x) as f64;
+                        // The keyboard honours the same slot grid: a nudge that rounds back to
+                        // the grabbed slot still steps one slot the way the key points.
+                        if let Some((key_x, _)) = keyboard_step {
+                            let start = start_points[if index == 1 { 0 } else { 1 }].logical;
+                            if key_x != 0.0 && (cursor_pt.logical - start).abs() < 0.5 {
+                                cursor_pt.logical = start + key_x.signum();
+                            }
+                        }
+                    }
+                    cursor_pt.price = self.snap_position_price(pane, price_scale, raw_price);
+                    if let (Some((_, key_y)), Some(start_index)) = (
+                        keyboard_step,
+                        match index {
+                            0 => Some(1),
+                            1 => Some(0),
+                            3 => Some(2),
+                            _ => None,
+                        },
+                    ) {
+                        cursor_pt.price = self.keyboard_position_price(
+                            (pane, price_scale),
+                            start_points[start_index].price,
+                            raw_price,
+                            cursor_pt.price,
+                            key_y,
+                        );
                     }
                     match index {
                         // Target: vertical level only.
@@ -5556,11 +5687,29 @@ impl ChartEngine {
                     (dx, dy)
                 };
                 let single_anchor = points.len() == 1;
+                let position = kind.spec().handles == DrawingHandleMode::Position;
+                // Follow the crosshair's slot changes from the grabbed point. One shared
+                // logical delta moves the body rigidly and preserves the grab offset/width.
+                let mut time_steps = if position {
+                    (self.snapped_crosshair_index(start_x + dx)
+                        - self.snapped_crosshair_index(start_x)) as f64
+                } else {
+                    0.0
+                };
+                if let (true, Some((key_x, _))) = (position, keyboard_step) {
+                    // A keyboard nudge steps at least one slot the way the key points.
+                    if key_x != 0.0 && time_steps == 0.0 {
+                        time_steps = key_x.signum();
+                    }
+                }
                 for (index, slot) in points.iter_mut().enumerate() {
                     let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
                     let Some(mut point) = convert(index, dx, dy) else {
                         return;
                     };
+                    if position {
+                        point.logical = slot.logical + time_steps;
+                    }
                     if snap_time_to_data {
                         let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                             return;
@@ -5574,6 +5723,19 @@ impl ChartEngine {
                         let snapped =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
                         point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                    }
+                    if position {
+                        let raw_price = point.price;
+                        point.price = self.snap_position_price(pane, price_scale, raw_price);
+                        if let Some((_, key_y)) = keyboard_step {
+                            point.price = self.keyboard_position_price(
+                                (pane, price_scale),
+                                slot.price,
+                                raw_price,
+                                point.price,
+                                key_y,
+                            );
+                        }
                     }
                     *slot = point;
                 }
@@ -6162,6 +6324,12 @@ impl ChartEngine {
             return None;
         }
         let pane_geometry = self.panes.get(pane)?;
+        let entry = DrawingPoint {
+            logical: self
+                .snapped_crosshair_index(self.time_scale.logical_to_coordinate(entry.logical))
+                as f64,
+            price: self.snap_position_price(pane, price_scale, entry.price),
+        };
         let (entry_x, entry_y) = self.drawing_to_px_for(pane, price_scale, entry)?;
 
         // A position is born at a useful editable size from one click. Horizontal extent prefers
@@ -6183,6 +6351,7 @@ impl ChartEngine {
         let upper = self.drawing_from_px_for(pane, price_scale, entry_x, upper_y)?;
         let lower = self.drawing_from_px_for(pane, price_scale, entry_x, lower_y)?;
         let mut extent = self.drawing_from_px_for(pane, price_scale, extent_x, entry_y)?;
+        extent.logical = self.snapped_crosshair_index(extent_x) as f64;
         if snap_time_to_data {
             extent = self.snap_drawing_time_to_data(extent)?;
         }
@@ -6193,11 +6362,23 @@ impl ChartEngine {
             DrawingKind::ShortPosition => (high, -1.0),
             _ => return None,
         };
-        let risk_distance = (entry.price - stop_price).abs();
+        let mut risk_distance =
+            (entry.price - self.snap_position_price(pane, price_scale, stop_price)).abs();
+        if risk_distance <= f64::EPSILON {
+            risk_distance = self
+                .position_price_tick_at(pane, price_scale, entry.price)
+                .unwrap_or(0.0);
+        }
         if !risk_distance.is_finite() || risk_distance <= f64::EPSILON {
             return None;
         }
-        let target_price = entry.price + reward_sign * risk_distance * 2.0;
+        let stop_price =
+            self.snap_position_price(pane, price_scale, entry.price - reward_sign * risk_distance);
+        let target_price = self.snap_position_price(
+            pane,
+            price_scale,
+            entry.price + reward_sign * risk_distance * 2.0,
+        );
         Some(vec![
             entry,
             DrawingPoint {

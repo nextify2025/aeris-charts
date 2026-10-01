@@ -508,25 +508,59 @@ fn keyboard_nudge_moves_rectangle_and_position_handles_by_the_delta() {
     chart.set_selected_drawing(Some(position));
     assert_eq!(chart.drawing_handle_count(position), Some(4));
     let before = [0, 1, 2].map(|index| px(&chart, position, index));
+    // A position's levels sit on the price grid (the 0.01 display tick) and its width on whole
+    // bar slots, like a pointer drag, so a nudge lands on the grid. It still moves: one that
+    // rounds back to where it started steps one tick or slot the way the key points.
+    let slot = (before[1].0 - before[0].0) / 5.0;
+    let tick = (before[2].1 - before[0].1) * 0.01;
     // Handle 3 (the stop) is reachable from the keyboard and moves only the stop level.
     assert!(chart.nudge_selected_drawing(0.0, 4.0, Some(3)));
-    // Handle 2 (the width) moves only the target's x.
+    // Handle 2 (the width) moves only the target's x: five px is under a slot, so it takes one.
     assert!(chart.nudge_selected_drawing(5.0, 0.0, Some(2)));
     let after = [0, 1, 2].map(|index| px(&chart, position, index));
     assert_close(after[0].0, before[0].0, "entry x");
     assert_close(after[0].1, before[0].1, "entry price");
     assert_close(after[1].1, before[1].1, "target price");
-    assert_close(after[1].0, before[1].0 + 5.0, "width moved by the nudge");
-    assert_close(after[2].1, before[2].1 + 4.0, "stop moved by the nudge");
+    assert_close(
+        after[1].0,
+        before[1].0 + slot,
+        "width moved by one whole slot",
+    );
+    assert_eq!(logicals(&chart, position), vec![2.0, 8.0, 2.0]);
+    let stop = prices(&chart, position)[2];
+    assert_close(
+        stop,
+        (stop * 100.0).round() / 100.0,
+        "stop level on the price tick",
+    );
+    assert!(
+        (after[2].1 - (before[2].1 + 4.0)).abs() <= tick / 2.0 + 1e-6,
+        "stop moved by the nudge to the nearest tick: {} vs {}",
+        after[2].1,
+        before[2].1 + 4.0
+    );
+    // A nudge far below one tick still steps one tick the key's way (down is a lower price).
+    let before_tick = prices(&chart, position)[2];
+    assert!(chart.nudge_selected_drawing(0.0, tick / 10.0, Some(3)));
+    assert_close(
+        prices(&chart, position)[2],
+        before_tick - 0.01,
+        "a sub-tick nudge steps one tick down",
+    );
+    assert!(chart.nudge_selected_drawing(0.0, -tick / 10.0, Some(3)));
+    assert_close(
+        prices(&chart, position)[2],
+        before_tick,
+        "and one tick back up",
+    );
     assert!(!chart.nudge_selected_drawing(0.0, 1.0, Some(4)));
 
     // Keyboard handles never jump to the pane's top-left corner even with a chart magnet.
     chart.set_drawing_magnet_mode(DrawingMagnetMode::Strong);
     assert!(chart.nudge_selected_drawing(0.0, 1.0, Some(3)));
-    assert_close(
-        px(&chart, position, 2).1,
-        after[2].1 + 1.0,
-        "unsnapped stop nudge",
+    assert!(
+        (px(&chart, position, 2).1 - (after[2].1 + 1.0)).abs() <= tick / 2.0 + 1e-6,
+        "an unsnapped stop nudge stays on the tick grid near the key's delta"
     );
     // Locked drawings stay put.
     assert!(chart.set_drawing_locked(position, true));

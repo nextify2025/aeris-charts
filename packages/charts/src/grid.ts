@@ -134,7 +134,7 @@ export interface chart_grid {
   /** Compose layout and each cell's existing chart persistence V1 for host-owned storage. */
   export_state(): chart_workspace_state_v1;
   /** Maximize a cell to the full container (the others + dividers hide), or pass `null` to
-   *  restore. Ctrl/Cmd+click on a cell toggles this (the public reference's maximize pane). */
+   *  restore. Alt+click on a cell toggles this whenever the grid shows more than one chart. */
   maximize(cell: grid_cell | null): void;
   /** The maximized cell, or `null` when the grid is in its normal layout. */
   maximized_cell(): grid_cell | null;
@@ -229,6 +229,31 @@ export async function create_chart_grid(
   let workspace_tool_options: Partial<drawing_options> | undefined;
   let workspace_tool_listener: ((tool: drawing_kind | null) => void) | null = null;
 
+  /** Pointer id of an Alt+click maximize press. Its up/click must not reach any chart: the
+   *  layout changes under the pointer, so the release can land on a different cell. */
+  let swallowed_press: number | null = null;
+  /** The compatibility click dispatched right after that release (if the browser sends one). */
+  let swallow_click = false;
+  const swallow_press_release = (e: Event) => {
+    if (e.type === "click") {
+      if (!swallow_click) return;
+      swallow_click = false;
+    } else {
+      if (swallowed_press === null || (e as PointerEvent).pointerId !== swallowed_press) return;
+      swallowed_press = null;
+      if (e.type === "pointerup") {
+        // A click follows in the same input task or not at all; never leak into a later press.
+        swallow_click = true;
+        setTimeout(() => { swallow_click = false; }, 0);
+      }
+    }
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  for (const type of ["pointerup", "pointercancel", "click"]) {
+    container.addEventListener(type, swallow_press_release, true);
+  }
+
   const activate = (id: number) => {
     if (id === active_id || !cells.has(id)) return;
     const previous = cells.get(active_id);
@@ -278,7 +303,7 @@ export async function create_chart_grid(
     requestAnimationFrame(() => {
       if (!el.isConnected) return;
       const dpr = window.devicePixelRatio || 1;
-      const device_w = Math.max(1, Math.round(style_tokens.border_width * dpr));
+      const device_w = Math.max(1, Math.floor(style_tokens.border_width * dpr));
       const w = device_w / dpr; // css px per full-coverage device pixel(s)
       const rect = el.getBoundingClientRect();
       const edge = horizontal ? rect.left : rect.top;
@@ -395,12 +420,18 @@ export async function create_chart_grid(
     } as handle_record;
     cells.set(id, record);
     // The last pointer-pressed cell is the ACTIVE one — the target of the split shortcuts.
-    // Ctrl/Cmd+click toggles the cell's full-container maximize (never while a drawing tool is
-    // armed on it — a Ctrl+click there is a magnet anchor placement). CAPTURE phase: the
-    // chart's gesture layer stops propagation on bubble, which would otherwise eat both.
+    // Alt+primary-click toggles the cell's full-container maximize in a multi-chart layout.
+    // CAPTURE phase, and the whole press is consumed: the chart never sees it, so the shortcut
+    // cannot also pan, select, or place a drawing anchor. Alt carries no chart gesture meaning.
     slot.addEventListener("pointerdown", (e) => {
       activate(id);
-      if ((e.ctrlKey || e.metaKey) && record.chart !== null && record.chart.active_drawing_tool() === null) {
+      // A new press always starts clean, even if the last swallowed release left the grid.
+      swallowed_press = null;
+      swallow_click = false;
+      if (e.altKey && e.button === 0 && (cells.size > 1 || maximized_id !== null)) {
+        e.preventDefault();
+        e.stopPropagation();
+        swallowed_press = e.pointerId;
         toggle_maximize(id);
       }
     }, true);
@@ -492,7 +523,7 @@ export async function create_chart_grid(
     maximized_id = id;
     reconcile();
   };
-  /** Ctrl/Cmd+click semantics: maximize the cell, or restore when it's already maximized. */
+  /** Alt+click semantics: maximize the cell, or restore when it's already maximized. */
   const toggle_maximize = (id: number) => {
     set_maximized(maximized_id === id ? null : id);
   };
@@ -648,6 +679,9 @@ export async function create_chart_grid(
     destroy: () => {
       if (heartbeat !== null) clearInterval(heartbeat);
       window.removeEventListener("resize", on_window_resize);
+      for (const type of ["pointerup", "pointercancel", "click"]) {
+        container.removeEventListener(type, swallow_press_release, true);
+      }
       detach_shortcuts?.();
       for (const cell of cells.values()) {
         cell.chart.unsubscribe_options_change(restyle_dividers);

@@ -2084,7 +2084,7 @@ mod tests {
         // In UTC the 09:30..16:00 gate covers the 13:00..15:30 UTC bars; in New York (-5h) the
         // same exchange-local gate covers 14:30..20:30 UTC.
         let utc_width = shaded(&mut chart, weekday);
-        chart.set_time_zone(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
+        chart.set_exchange_offsets(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
         let eastern_width = shaded(&mut chart, weekday);
         assert!(utc_width > 0 && eastern_width > utc_width);
         assert_eq!(shaded(&mut chart, weekend), 0);
@@ -2096,7 +2096,7 @@ mod tests {
             .unwrap();
         all_day.time_scale.set_width(800.0);
         all_day.fit_content();
-        all_day.set_time_zone(crate::UtcOffsetSchedule::fixed(9 * 3_600).unwrap());
+        all_day.set_exchange_offsets(crate::UtcOffsetSchedule::fixed(9 * 3_600).unwrap());
         all_day
             .add_session_highlighting(
                 0,
@@ -2352,7 +2352,7 @@ mod tests {
             ..crate::SeriesPriceFormat::default()
         };
         // America/New_York winter offset: day 2 (1970-01-03 00:00 UTC) is 2 Jan 19:00 locally.
-        chart.set_time_zone(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
+        chart.set_exchange_offsets(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
         chart
             .add_delta_tooltip(
                 0,

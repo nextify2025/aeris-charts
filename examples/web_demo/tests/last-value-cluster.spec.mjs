@@ -340,6 +340,38 @@ test("explicit light price-line color unifies the live cluster and selects dark 
   await context.close();
 });
 
+test("price-line tag clears the live-price tag on the rendered axis", async ({ browser }) => {
+  const BLUE = [0, 80, 255];
+  const { context, page } = await open_cluster_page(browser, {
+    title_visible: false,
+    countdown_visible: false,
+  });
+  await page.evaluate(() => window.__main.create_price_line({
+    price: window.__cluster_close,
+    color: "#0050ff",
+    title: "target",
+    line_visible: false,
+  }));
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  const anchor = await cluster_anchor(page);
+  const shot = await capture(page);
+  const rows = (color) => {
+    const found = [];
+    for (let y = 0; y < shot.height; y += 1) {
+      if (near(px(shot, anchor.pane_w + 2, y), color)) found.push(y);
+    }
+    return found;
+  };
+  const live = rows(LABEL);
+  const target = rows(BLUE);
+  expect(live.length).toBeGreaterThanOrEqual(ROW - 2);
+  expect(target.length).toBeGreaterThanOrEqual(ROW - 2);
+  expect(Math.max(...live) < Math.min(...target) || Math.max(...target) < Math.min(...live)).toBe(true);
+  await context.close();
+});
+
 // The engine keys the time label's vertical position to the stable "Apr0" ink sample (cap top to
 // descender bottom), not to the glyphs of the label itself, so a label without descenders sits
 // higher than the same box holding one. The painted label text depends on the calendar month and

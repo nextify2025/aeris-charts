@@ -208,7 +208,7 @@ test("trading lines use dedicated hits and render semantic colors through the sh
       return { id, y, hit: trading.hit_at(window.__close_x(id, y), y) };
     });
     return {
-      empty_left: trading.hit_at(40, window.__main.price_to_coordinate(target.price)),
+      left_line: trading.hit_at(40, window.__main.price_to_coordinate(target.price)),
       chart_width: width,
       order: trading.hit_at(width - 200, window.__main.price_to_coordinate(target.price)),
       position: trading.hit_at(width - 200, position_y),
@@ -218,15 +218,16 @@ test("trading lines use dedicated hits and render semantic colors through the sh
       exact_axis_controls,
     };
   });
-  expect(probe.empty_left).toBeNull();
+  // A confirmed protection order is draggable from its complete visible rule, not only the marker.
+  expect(probe.left_line).toMatchObject({ id: "demo-target", kind: "order_line" });
   expect(probe.order).toMatchObject({
     object_type: "order",
     id: "demo-target",
     kind: "order_line",
   });
   expect(probe.position).toMatchObject({ object_type: "position", kind: "position_line" });
-  expect(probe.position_start, "the line begins flush with its shifted container").toBe(probe.order_start);
-  expect(Math.round(probe.chart_width - probe.order_start), "the complete marker span moves left").toBe(304);
+  expect(probe.position_start, "order and position rules share one interactive start").toBe(probe.order_start);
+  expect(probe.order_start, "the complete visible rule is interactive, not only its marker").toBeLessThan(40);
   expect(probe.close).toMatchObject({ object_type: "position", kind: "cancel_button" });
   for (const control of probe.exact_axis_controls) {
     expect(control.hit, `${control.id} close control must remain on its exact price coordinate`).toMatchObject({
@@ -444,7 +445,7 @@ test("cancel control removes the order, emits the intent, and a rejection restor
   });
 });
 
-test("confirmed bracket connector deactivates on an empty-canvas click without removing orders", async ({ page }) => {
+test("bracket connector disappears as soon as the host acknowledges the drag", async ({ page }) => {
   await open_trading_demo(page, "canvas2d");
   const probe = await page.evaluate(() => {
     window.__connector_intents = [];
@@ -464,41 +465,35 @@ test("confirmed bracket connector deactivates on an empty-canvas click without r
   await page.mouse.down();
   await page.mouse.move(probe.overlay.left + 30, probe.overlay.top + probe.to_y, { steps: 5 });
   await page.mouse.up();
-  const active = await page.evaluate(() => {
+  const states = await page.evaluate(() => {
     const trading = window.__chart.trading();
     const intent = window.__connector_intents[0];
+    const pending_canvas = window.__chart.take_screenshot();
     trading.resolve_intent(intent.sequence, true);
     const target = trading.state().orders.find((order) => order.id === "demo-target");
     trading.update_order({ ...target, price: intent.price, revision: target.revision + 1 });
     const stop = trading.state().orders.find((order) => order.id === "demo-stop");
-    const canvas = window.__chart.take_screenshot();
+    const acknowledged_canvas = window.__chart.take_screenshot();
     return {
-      url: canvas.toDataURL("image/png"),
-      width: canvas.width,
-      height: canvas.height,
+      pending_url: pending_canvas.toDataURL("image/png"),
+      acknowledged_url: acknowledged_canvas.toDataURL("image/png"),
+      width: acknowledged_canvas.width,
+      height: acknowledged_canvas.height,
       top: window.__main.price_to_coordinate(intent.price),
       bottom: window.__main.price_to_coordinate(stop.price),
+      order_ids: trading.state().orders.map((order) => order.id),
     };
   });
-
-  await page.mouse.click(probe.overlay.left + probe.pane_width / 2, probe.overlay.top + 20);
-  const inactive = await page.evaluate(() => {
-    const canvas = window.__chart.take_screenshot();
-    return {
-      url: canvas.toDataURL("image/png"),
-      order_ids: window.__chart.trading().state().orders.map((order) => order.id),
-    };
-  });
-  expect(inactive.order_ids).toEqual(["demo-target", "demo-stop", "demo-partial"]);
+  expect(states.order_ids).toEqual(["demo-target", "demo-stop", "demo-partial"]);
 
   const connector_pixels = (url) => {
     const image = PNG.sync.read(Buffer.from(url.split(",")[1], "base64"));
     const connector_rgb = probe.connector_color.match(/[\da-f]{2}/gi).map((value) => Number.parseInt(value, 16));
-    const scale_x = active.width / probe.overlay.width;
-    const scale_y = active.height / probe.overlay.height;
+    const scale_x = states.width / probe.overlay.width;
+    const scale_y = states.height / probe.overlay.height;
     const x = Math.round((probe.pane_width - 8) * scale_x);
-    const y0 = Math.round(Math.min(active.top, active.bottom) * scale_y);
-    const y1 = Math.round(Math.max(active.top, active.bottom) * scale_y);
+    const y0 = Math.round(Math.min(states.top, states.bottom) * scale_y);
+    const y1 = Math.round(Math.max(states.top, states.bottom) * scale_y);
     let count = 0;
     for (let y = y0; y <= y1; y += 1) {
       for (let dx = -2; dx <= 2; dx += 1) {
@@ -513,10 +508,10 @@ test("confirmed bracket connector deactivates on an empty-canvas click without r
     }
     return count;
   };
-  expect(connector_pixels(active.url)).toBeGreaterThan(connector_pixels(inactive.url) + 20);
+  expect(connector_pixels(states.pending_url)).toBeGreaterThan(connector_pixels(states.acknowledged_url) + 20);
 });
 
-test("entry-line drags create side-aware protection for limit and market orders", async ({ page }) => {
+test("dedicated entry TP and SL buttons create fixed-role protection", async ({ page }) => {
   await open_trading_demo(page);
   const probe = await page.evaluate(() => {
     const trading = window.__chart.trading();
@@ -531,13 +526,23 @@ test("entry-line drags create side-aware protection for limit and market orders"
     trading.subscribe_intents((intent) => window.__manual_intents.push(intent));
     const overlay = document.querySelector("#chart_container canvas:last-of-type").getBoundingClientRect();
     const width = window.__chart.time_scale().width();
+    const button_x = (kind, y) => {
+      for (let x = 0; x <= width; x += 0.5) {
+        if (trading.hit_at(x, y)?.kind === kind) return x;
+      }
+      throw new Error(`missing ${kind}`);
+    };
+    const buy_y = window.__main.price_to_coordinate(100);
+    const sell_y = window.__main.price_to_coordinate(98);
     return {
       overlay: { left: overlay.left, top: overlay.top },
       width,
-      buy_y: window.__main.price_to_coordinate(100),
+      buy_y,
       target_y: window.__main.price_to_coordinate(101.25),
-      sell_y: window.__main.price_to_coordinate(98),
+      sell_y,
       sell_target_y: window.__main.price_to_coordinate(99.25),
+      buy_tp_x: button_x("take_profit_button", buy_y),
+      sell_sl_x: button_x("stop_loss_button", sell_y),
       hits: {
         empty_left: trading.hit_at(40, window.__main.price_to_coordinate(100)),
         marker: trading.hit_at(width - 200, window.__main.price_to_coordinate(100)),
@@ -548,12 +553,12 @@ test("entry-line drags create side-aware protection for limit and market orders"
       },
     };
   });
-  expect(probe.hits.empty_left).toBeNull();
+  expect(probe.hits.empty_left).toMatchObject({ id: "buy-limit", kind: "order_line" });
   expect(probe.hits.marker).toMatchObject({ id: "buy-limit", kind: "order_line" });
   expect(probe.hits.cancel).toMatchObject({ id: "buy-limit", kind: "cancel_button" });
 
   // A buy entry dragged upward creates a take profit and leaves the entry untouched.
-  await page.mouse.move(probe.overlay.left + probe.width - 200, probe.overlay.top + probe.buy_y);
+  await page.mouse.move(probe.overlay.left + probe.buy_tp_x, probe.overlay.top + probe.buy_y);
   await page.mouse.down();
   await page.mouse.move(probe.overlay.left + 30, probe.overlay.top + probe.target_y, { steps: 5 });
   await page.mouse.up();
@@ -578,7 +583,7 @@ test("entry-line drags create side-aware protection for limit and market orders"
 
   // A filled sell-side market entry dragged upward creates a stop loss. Market entries use the
   // same interaction even though their remaining quantity is zero.
-  await page.mouse.move(probe.overlay.left + probe.width - 200, probe.overlay.top + probe.sell_y);
+  await page.mouse.move(probe.overlay.left + probe.sell_sl_x, probe.overlay.top + probe.sell_y);
   await page.mouse.down();
   await page.mouse.move(probe.overlay.left + 30, probe.overlay.top + probe.sell_target_y, { steps: 5 });
   await page.mouse.up();
@@ -648,7 +653,7 @@ test("existing TP and SL adjustments release into intents with no confirmation s
 });
 
 for (const backend of ["canvas2d", "webgpu"]) {
-  test(`${backend} compact position marker has no TP/SL creation surface and uses an attached close chip`, async ({ page }) => {
+  test(`${backend} compact position marker uses dedicated protection buttons and an attached close chip`, async ({ page }) => {
     await open_trading_demo(page, backend);
     const probe = await page.evaluate(() => {
       const trading = window.__chart.trading();
@@ -660,36 +665,59 @@ for (const backend of ["canvas2d", "webgpu"]) {
       trading.subscribe_intents((intent) => window.__creation_intents.push(intent));
       const overlay = document.querySelector("#chart_container canvas:last-of-type").getBoundingClientRect();
       const width = window.__chart.time_scale().width();
+      const left_x = width / 2;
       const entry_y = window.__main.price_to_coordinate(100);
+      let take_profit_x = null;
+      for (let x = 0; x <= width; x += 0.5) {
+        if (trading.hit_at(x, entry_y)?.kind === "take_profit_button") {
+          take_profit_x = x;
+          break;
+        }
+      }
       return {
         overlay: { left: overlay.left, top: overlay.top },
         width,
+        left_x,
         entry_y,
-        empty_left: trading.hit_at(40, entry_y),
+        take_profit_x,
+        left_line: trading.hit_at(left_x, entry_y),
         marker: trading.hit_at(width - 200, entry_y),
         close_x: window.__close_x("position-only", entry_y),
         close: trading.hit_at(window.__close_x("position-only", entry_y), entry_y),
       };
     });
-    expect(probe.empty_left).toBeNull();
+    expect(probe.left_line).toMatchObject({ id: "position-only", kind: "position_line" });
     expect(probe.marker).toMatchObject({ id: "position-only", kind: "position_line" });
     expect(probe.close).toMatchObject({ id: "position-only", kind: "cancel_button" });
 
-    await page.mouse.move(probe.overlay.left + probe.width - 200, probe.overlay.top + probe.entry_y);
+    expect(probe.take_profit_x).not.toBeNull();
+    await page.mouse.move(probe.overlay.left + probe.take_profit_x, probe.overlay.top + probe.entry_y);
+    expect(await page.locator("#chart_container canvas:last-of-type").evaluate((canvas) => canvas.style.cursor)).toBe("pointer");
     await page.mouse.down();
     await page.mouse.move(
-      probe.overlay.left + probe.width - 200,
+      probe.overlay.left + probe.take_profit_x,
       probe.overlay.top + probe.entry_y - 40,
       { steps: 6 },
     );
     await page.mouse.up();
-    expect(await page.evaluate(() => ({
+    // Dragging a long position above its average price requests an attached take profit.
+    const drag = await page.evaluate(() => ({
       intents: window.__creation_intents,
       preview: window.__chart.trading().preview(),
-    }))).toEqual({ intents: [], preview: null });
+    }));
+    expect(drag.preview).toBeNull();
+    expect(drag.intents).toEqual([
+      expect.objectContaining({
+        action: "create_take_profit",
+        position_id: "position-only",
+        role: "take_profit",
+        side: "sell",
+      }),
+    ]);
+    await page.evaluate((sequence) => window.__chart.trading().resolve_intent(sequence, false), drag.intents[0].sequence);
 
     await page.mouse.click(probe.overlay.left + probe.close_x, probe.overlay.top + probe.entry_y);
-    expect(await page.evaluate(() => window.__creation_intents)).toEqual([
+    expect(await page.evaluate(() => window.__creation_intents.slice(1))).toEqual([
       expect.objectContaining({
         action: "close_position",
         position_id: "position-only",
@@ -697,3 +725,39 @@ for (const backend of ["canvas2d", "webgpu"]) {
     ]);
   });
 }
+
+test("execution marks sit outside their bar, stack same-bar fills, and read as clickable", async ({ page }) => {
+  await page.goto("/?feature=executions&backend=canvas2d");
+  await page.waitForFunction(() => window.__demo_catalogs?.lab.active_ids().includes("execution-marks"));
+  // The scenario frames its fills after the first painted frames.
+  await page.waitForFunction(() => window.__chart.timeScale().getVisibleLogicalRange().from > window.__data.length - 50);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const bars = window.__data;
+    const probe = (back, id) => {
+      const logical = bars.length - back;
+      const bar = bars[logical];
+      const x = chart.timeScale().logical_to_coordinate(logical);
+      const high = window.__main.price_to_coordinate(bar.high);
+      const low = window.__main.price_to_coordinate(bar.low);
+      const ys = [];
+      for (let y = 0; y < 2000; y += 1) {
+        const hit = chart.trading_hit_at(x, y);
+        if (hit?.object_type === "execution" && hit.id.startsWith(id)) ys.push(y);
+      }
+      return { high, low, top: Math.min(...ys), bottom: Math.max(...ys), id: chart.trading_hit_at(x, ys[0])?.id,
+        cursor: chart.trading_cursor_at(x, ys[0]),
+        inside: chart.trading_hit_at(x, (high + low) / 2) };
+    };
+    return { buy: probe(23, "multi-buy"), sell: probe(17, "multi-sell"), single: probe(34, "single-buy") };
+  });
+  // Buys answer only below the bar's low, sells only above its high; the candle body is free.
+  expect(result.buy.top).toBeGreaterThan(result.buy.low);
+  expect(result.sell.bottom).toBeLessThan(result.sell.high);
+  expect(result.buy.inside).toBeNull();
+  // A stacked mark answers with the bar's latest fill and is taller than a single arrow.
+  expect(result.buy.id).toBe("multi-buy-2");
+  expect(result.sell.id).toBe("multi-sell-3");
+  expect(result.buy.bottom - result.buy.top).toBeGreaterThan(result.single.bottom - result.single.top);
+  expect(result.buy.cursor).toBe("pointer");
+});

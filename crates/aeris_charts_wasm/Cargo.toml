@@ -5,9 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
 publish.workspace = true
 description = "wasm-bindgen host shell: canvas surface, data ingestion, gestures, RAF plumbing"
 
@@ -17,10 +14,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-aeris_charts_core = { path = "../aeris_charts_core", version = "0.3.0" }
-aeris_charts_engine = { path = "../aeris_charts_engine", version = "0.3.0" }
-aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
-aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu", version = "0.3.0" }
+aeris_charts_core = { path = "../aeris_charts_core" }
+aeris_charts_engine = { path = "../aeris_charts_engine" }
+aeris_charts_render = { path = "../aeris_charts_render" }
+aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu" }
 
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

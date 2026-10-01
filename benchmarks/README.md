@@ -131,19 +131,39 @@ This reset is tied to the Phase 2 engine-owned Cartesian surface (additional dat
 shared-tooltip APIs, heatmap variants, persistence, and WASM bindings). Future growth is again blocked at the v3
 ceilings rather than inheriting an open-ended exception.
 
+Budget policy v4 records the Phase 3 package-size reset after the trading-workstation surface landed: order-flow
+footprints and trade streams, depth heatmaps and liquidity replay, session replay with non-time bars, profile
+workflows, the expanded indicator catalog, and additional chart types. Before changing ceilings, the release
+`wasm-opt -Oz` output was re-run with `--converge` and with producer/debug stripping; neither reduced the module
+(3,826,918 and 3,833,897 bytes). JavaScript stays well inside its unchanged ceilings. Remaining growth is
+compiled engine code, so the WASM and package-container ceilings take the same ~7% release headroom as v3:
+
+| Phase 3 metric | Observed bytes | Blocking maximum |
+| --- | ---: | ---: |
+| npm tarball | 1,549,907 | 1,650,000 |
+| npm unpacked | 4,628,626 | 4,950,000 |
+| JavaScript raw | 372,974 | 620,000 |
+| JavaScript Brotli | 66,155 | 95,000 |
+| WASM raw | 3,827,699 | 4,100,000 |
+| WASM Brotli | 977,494 | 1,050,000 |
+
+The largest reducible share measured in the unstripped module is serde JSON (de)serialization
+monomorphization (about a fifth of pre-optimization code), led by the internally tagged `IndicatorKind`
+enum (its deserializer now ships out of line, see below). Future growth is blocked at the v4 ceilings.
+
 ### WASM size levers and re-baselining
 
-Once B1-B8 landed, the optimized WASM no longer fit the v3 ceilings. Before any ceiling moves, the bytes were measured and the lossless levers were priced. All numbers below come from one machine (rustc 1.98.1, wasm-pack 0.15.0, wasm-bindgen 0.2.127, `wasm-opt` version_117 from the `binaryen@117.0.0` npm package on `PATH`, Chromium 141 headless, Canvas2D forced, a shared four-core sandbox) at base commit `78d7d59`. The build route was also run by hand (`cargo build -p aeris_charts_wasm --release --target wasm32-unknown-unknown`, `wasm-bindgen --target web --out-name aeris_charts_wasm`, `wasm-opt` with the crate-metadata flags) and produced a module byte-identical to `wasm-pack build`. They are engineering evidence, not CI-runner or public performance claims.
+Once B1-B8 landed, the optimized WASM no longer fit the v4 ceilings. Before any ceiling moves, the bytes were measured and the lossless levers were priced. All numbers below come from one machine (rustc 1.98.1, wasm-pack 0.15.0, wasm-bindgen 0.2.127, `wasm-opt` version_117 from the `binaryen@117.0.0` npm package on `PATH`, Chromium 141 headless, Canvas2D forced, a shared four-core sandbox) at base commit `78d7d59`. The build route was also run by hand (`cargo build -p aeris_charts_wasm --release --target wasm32-unknown-unknown`, `wasm-bindgen --target web --out-name aeris_charts_wasm`, `wasm-opt` with the crate-metadata flags) and produced a module byte-identical to `wasm-pack build`. They are engineering evidence, not CI-runner or public performance claims.
 
-| Package metric | `78d7d59` | With `IndicatorKind` serde out of line | v3 ceiling |
+| Package metric | `78d7d59` | With `IndicatorKind` serde out of line | v4 ceiling |
 | --- | ---: | ---: | ---: |
-| npm tarball | 1,876,748 | 1,860,741 | 1,300,000 |
-| npm unpacked | 5,636,275 | 5,503,213 | 3,700,000 |
+| npm tarball | 1,876,748 | 1,860,741 | 1,650,000 |
+| npm unpacked | 5,636,275 | 5,503,213 | 4,950,000 |
 | JavaScript raw | 412,622 | 412,622 | 620,000 |
 | JavaScript Brotli | 73,630 | 73,635 | 95,000 |
-| WASM raw | 4,739,804 | 4,606,742 | 3,000,000 |
+| WASM raw | 4,739,804 | 4,606,742 | 4,100,000 |
 | WASM gzip-9 | 1,663,479 | 1,647,743 | - |
-| WASM Brotli | 1,175,083 | 1,172,054 | 810,000 |
+| WASM Brotli | 1,175,083 | 1,172,054 | 1,050,000 |
 
 (Both tarball and unpacked columns already exclude `dist/react.js.map`, which the same change stops shipping: 8,165 tarball and 27,149 unpacked bytes. Ceilings are not changed by measuring: derive them with `rebudget` below on the final code.)
 

@@ -948,3 +948,248 @@ test("screenshot add_top_layer keeps shared axes optional on both backends", asy
     0,
   ).different_pixels, "time-axis chrome must be omitted with add_top_layer=false").toBeGreaterThan(0);
 });
+
+// Exercise the ordinary demo and its default price tick through real pointer events. In this
+// view a price tick is smaller than a device pixel; rounding motion first would skip ticks.
+async function drag_position(page, backend, kind, theme) {
+  await page.goto(`/?backend=${backend}&theme=${theme}&forceFallbackAdapter=1`);
+  await page.waitForFunction(() => window.__main && window.__chart.time_scale().get_visible_logical_range());
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const placement = await page.evaluate(() => {
+    const chart = window.__chart;
+    const series = window.__main;
+    const range = chart.time_scale().get_visible_logical_range();
+    const logical = Math.floor(range.from + (range.to - range.from) * 0.4);
+    const bar = series.data_by_index(logical);
+    const box = document.getElementById("chart_container").getBoundingClientRect();
+    return {
+      x: box.left + chart.time_scale().logical_to_coordinate(logical),
+      y: box.top + series.price_to_coordinate(bar.close),
+      tick: chart.trading().state().instrument.tick_size ?? series.options().price_format.min_move,
+    };
+  });
+  expect(placement.tick).toBe(0.01);
+  await page.click(`#drawings_group [data-tool="${kind}"]`);
+  await page.mouse.click(placement.x, placement.y);
+  const initial = await page.evaluate(() => window.__chart.drawings().at(-1).points());
+  for (const point of initial) {
+    expect(point.price / placement.tick).toBeCloseTo(Math.round(point.price / placement.tick), 8);
+  }
+  const controls = await page.evaluate(() => {
+    const [entry, target, stop] = window.__chart.drawings().at(-1).points();
+    const box = document.getElementById("chart_container").getBoundingClientRect();
+    const scale = window.__chart.time_scale();
+    // The public coordinate query takes integer bar indices; interpolate a drawing's
+    // fractional logical coordinate using those adjacent bar centers.
+    const x = (p) => {
+      const logical = Math.floor(p.logical);
+      const left = scale.logical_to_coordinate(logical);
+      return box.left + left + (scale.logical_to_coordinate(logical + 1) - left) * (p.logical - logical);
+    };
+    const y = (p) => box.top + window.__main.price_to_coordinate(p.price);
+    return [[x(entry), y(target)], [x(target), y(entry)], [x(entry), y(stop)]];
+  });
+  await page.mouse.move(2, 2);
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const screenshot = PNG.sync.read(await page.screenshot({ animations: "disabled" }));
+  const dpr = await page.evaluate(() => window.devicePixelRatio);
+  const squares = controls.map(([x, y]) => {
+    const cx = Math.round(x * dpr);
+    const cy = Math.round(y * dpr);
+    const radius = Math.ceil(6 * dpr);
+    const pixels = [];
+    for (let py = cy - radius; py <= cy + radius; py += 1) {
+      for (let px = cx - radius; px <= cx + radius; px += 1) {
+        const offset = (py * screenshot.width + px) * 4;
+        pixels.push(...screenshot.data.subarray(offset, offset + 4));
+      }
+    }
+    const center = (cy * screenshot.width + cx) * 4;
+    const fill = theme === "light" ? [255, 255, 255] : [0, 0, 0];
+    expect([...screenshot.data.subarray(center, center + 3)], "square anchor has an opaque theme fill").toEqual(fill);
+    let border_pixels = 0;
+    for (let offset = 0; offset < pixels.length; offset += 4) {
+      if (pixels[offset] < 20 && Math.abs(pixels[offset + 1] - 145) < 20 && pixels[offset + 2] > 235) border_pixels += 1;
+    }
+    expect(border_pixels, "square anchor has a visible thin primary border").toBeGreaterThan(12);
+    return pixels;
+  });
+  const trail = [];
+  for (const part of ["body", "target", "entry", "stop"]) {
+    const grab = await page.evaluate(({ part, tick }) => {
+      const [entry, target, stop] = window.__chart.drawings().at(-1).points();
+      const point = part === "target" ? target : part === "stop" ? stop : entry;
+      const box = document.getElementById("chart_container").getBoundingClientRect();
+      const y = window.__main.price_to_coordinate(point.price);
+      const scale = window.__chart.time_scale();
+      const logical = Math.floor(entry.logical);
+      const left = scale.logical_to_coordinate(logical);
+      const bar_px = scale.logical_to_coordinate(logical + 1) - left;
+      return {
+        x: box.left + left + bar_px * (entry.logical - logical) + (part === "body" ? 30 : 0),
+        y: box.top + y,
+        tick_px: window.__main.price_to_coordinate(point.price + tick) - y,
+        bar_px,
+        start: [entry, target, stop],
+      };
+    }, { part, tick: placement.tick });
+    expect(Math.abs(grab.tick_px) * dpr).toBeLessThan(1);
+    await page.mouse.move(grab.x, grab.y);
+    await page.mouse.down();
+    for (const [fraction, ticks] of [[0.3, 0], [0.7, 1], [1.3, 1], [1.7, 2]]) {
+      await page.mouse.move(grab.x, grab.y + grab.tick_px * fraction);
+      const points = await page.evaluate(() => window.__chart.drawings().at(-1).points());
+      for (let index = 0; index < points.length; index += 1) {
+        const changes = part === "body" || index === (part === "target" ? 1 : part === "stop" ? 2 : 0);
+        expect(points[index].price, `${part} at ${fraction} tick`).toBeCloseTo(grab.start[index].price + (changes ? ticks * placement.tick : 0), 8);
+      }
+      trail.push(points);
+    }
+    await page.mouse.up();
+  }
+  await page.evaluate(() => window.__chart.subscribe_crosshair_move((event) => {
+    window.__position_cursor_logical = event.logical;
+  }));
+  for (const part of ["body", "entry", "extent"]) {
+    const grab = await page.evaluate((part) => {
+      const start = window.__chart.drawings().at(-1).points();
+      const box = document.getElementById("chart_container").getBoundingClientRect();
+      const scale = window.__chart.time_scale();
+      const point = start[part === "extent" ? 1 : 0];
+      const logical = Math.floor(point.logical);
+      const left = scale.logical_to_coordinate(logical);
+      const spacing = scale.logical_to_coordinate(logical + 1) - left;
+      return {
+        x: box.left + left + spacing * (point.logical - logical) + (part === "body" ? 30 : 0),
+        y: box.top + window.__main.price_to_coordinate(start[0].price),
+        spacing, start,
+      };
+    }, part);
+    await page.mouse.move(grab.x, grab.y);
+    const cursor_start = await page.evaluate(() => window.__position_cursor_logical);
+    expect(Number.isInteger(cursor_start)).toBe(true);
+    await page.mouse.down();
+    for (const fraction of [0.2, 0.3, 0.7, 1.3, 1.7, -0.2, -0.3, -0.7, -1.3, -1.7]) {
+      await page.mouse.move(grab.x + grab.spacing * fraction, grab.y);
+      const { points, cursor } = await page.evaluate(() => ({
+        points: window.__chart.drawings().at(-1).points(),
+        cursor: window.__position_cursor_logical,
+      }));
+      for (let index = 0; index < points.length; index += 1) {
+        const expected = part === "body" ? grab.start[index].logical + cursor - cursor_start
+          : ((part === "entry" && index !== 1) || (part === "extent" && index === 1)) ? cursor
+          : grab.start[index].logical;
+        expect(points[index].logical, `${part} follows cursor at ${fraction} bars`).toBeCloseTo(expected, 6);
+        expect(points[index].price).toBeCloseTo(grab.start[index].price, 8);
+      }
+      trail.push(points);
+    }
+    await page.mouse.up();
+  }
+  return { initial, trail, squares, backend: await page.evaluate(() => window.__chart.backend()) };
+}
+
+for (const kind of ["long_position", "short_position"]) {
+  for (const theme of ["light", "dark"]) {
+    test(`${kind} uses crosshair time steps, exact price ticks and filled rounded anchors in ${theme}`, async ({ page }) => {
+      const gpu = await drag_position(page, "auto", kind, theme);
+      const canvas = await drag_position(page, "canvas2d", kind, theme);
+      expect(gpu.backend).toBe("webgpu");
+      expect(canvas.backend).toBe("canvas2d");
+      expect(gpu.initial).toEqual(canvas.initial);
+      expect(gpu.trail).toEqual(canvas.trail);
+      for (let square = 0; square < gpu.squares.length; square += 1) {
+        let different = 0;
+        for (let offset = 0; offset < gpu.squares[square].length; offset += 4) {
+          const delta = Math.max(...[0, 1, 2, 3].map((channel) => Math.abs(gpu.squares[square][offset + channel] - canvas.squares[square][offset + channel])));
+          if (delta > 96) different += 1;
+        }
+        expect(different, "anchor fill and border match across WebGPU and Canvas2D").toBe(0);
+      }
+    });
+  }
+}
+
+for (const kind of ["long_position", "short_position"]) {
+  test(`${kind} stats render amounts, quantity and adaptive borders on both backends`, async ({ page }) => {
+    await page.addInitScript(() => {
+      const original = CanvasRenderingContext2D.prototype.fillText;
+      window.__position_stats_text = [];
+      CanvasRenderingContext2D.prototype.fillText = function (text, ...args) {
+        if (/^(Target:|Stop:|Open P&L:|Closed P&L:|Risk\/reward ratio:)/.test(String(text))) {
+          window.__position_stats_text.push(String(text));
+        }
+        return original.call(this, text, ...args);
+      };
+    });
+    for (const backend of ["auto", "canvas2d"]) {
+      await page.goto(`/?backend=${backend}&theme=dark&forceFallbackAdapter=1`);
+      await wait_for_chart(page);
+      await page.evaluate(() => window.__chart.trading().apply_snapshot({
+        instrument: { tick_size: 0.25, point_value: 20, quantity_precision: 3 },
+        positions: [], orders: [], executions: [],
+      }));
+      const placement = await page.evaluate(() => {
+        const range = window.__chart.time_scale().get_visible_logical_range();
+        const logical = Math.floor(range.from + (range.to - range.from) * 0.4);
+        const bar = window.__main.data_by_index(logical);
+        const box = document.getElementById("chart_container").getBoundingClientRect();
+        return { x: box.left + window.__chart.time_scale().logical_to_coordinate(logical), y: box.top + window.__main.price_to_coordinate(bar.close) };
+      });
+      await page.click(`#drawings_group [data-tool="${kind}"]`);
+      await page.mouse.click(placement.x, placement.y);
+      await page.mouse.move(2, 2);
+      await settle_page(page);
+      const stats = await page.evaluate(() => {
+        const [entry, target, stop] = window.__chart.drawings().at(-1).points();
+        const risk = Math.abs(entry.price - stop.price);
+        const reward = Math.abs(target.price - entry.price);
+        return { risk, reward, quantity: 250 / risk / 20, text: window.__position_stats_text };
+      });
+      expect(stats.text.some((text) => text.startsWith("Target:") && text.endsWith(", Amount: 1500"))).toBe(true);
+      expect(stats.text.some((text) => text.startsWith("Stop:") && text.endsWith(", Amount: 750"))).toBe(true);
+      const quantity = String(Number(stats.quantity.toFixed(3)));
+      expect(stats.text.some((text) => text.includes(`, Qty: ${quantity}`))).toBe(true);
+      expect(stats.text).toContain("Risk/reward ratio: 2");
+      for (const [color, border] of [["#089981", 0], ["#f7525f", 0], ["#0000ff", 255], ["#000000", 255], ["#ffffff", 0]]) {
+        const label = await page.evaluate((color) => {
+          window.__chart.apply_options({ layout: { background: { type: "solid", color } } });
+          const [entry, target] = window.__chart.drawings().at(-1).points();
+          const scale = window.__chart.time_scale();
+          const box = document.getElementById("chart_container").getBoundingClientRect();
+          const x = (scale.logical_to_coordinate(entry.logical) + scale.logical_to_coordinate(target.logical)) / 2;
+          const target_y = window.__main.price_to_coordinate(target.price);
+          const entry_y = window.__main.price_to_coordinate(entry.price);
+          const y = target_y + (target_y < entry_y ? -14 : 14);
+          const size = Math.max(window.__chart.options().layout.fontSize * 0.92, 10);
+          return { x: box.left + x, top: box.top + y - (size * 1.25 + 6) / 2, dpr: window.devicePixelRatio };
+        }, color);
+        await settle_page(page);
+        const png = PNG.sync.read(await page.screenshot({ animations: "disabled", path: color === "#000000" ? `test-results/position-stats-${kind}-${backend}.png` : undefined }));
+        let best = 0;
+        for (let dy = -2; dy <= 2; dy += 1) {
+          const y = Math.round(label.top * label.dpr) + dy;
+          let pixels = 0;
+          for (let dx = -15; dx <= 15; dx += 1) {
+            const x = Math.round(label.x * label.dpr) + dx;
+            const offset = (y * png.width + x) * 4;
+            if ([0, 1, 2].every((channel) => Math.abs(png.data[offset + channel] - border) < 16)) pixels += 1;
+          }
+          best = Math.max(best, pixels);
+        }
+        expect(best, `${backend} border remains visible on ${color}`).toBeGreaterThan(25);
+      }
+      await page.locator("#position_account_size").fill("2000");
+      await page.locator("#position_account_size").press("Tab");
+      await page.locator("#position_risk_percent").fill("2");
+      await page.locator("#position_risk_percent").press("Tab");
+      await settle_page(page);
+      const updated = await page.evaluate(() => ({ options: window.__chart.drawings().at(-1).options(), text: window.__position_stats_text }));
+      expect(updated.options.position_account_size).toBe(2000);
+      expect(updated.options.position_risk_percent).toBe(2);
+      expect(updated.text.some((text) => text.startsWith("Target:") && text.endsWith(", Amount: 2080"))).toBe(true);
+      expect(updated.text.some((text) => text.startsWith("Stop:") && text.endsWith(", Amount: 1960"))).toBe(true);
+    }
+  });
+}

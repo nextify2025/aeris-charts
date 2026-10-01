@@ -809,6 +809,26 @@ pub async fn create_chart(
                 .unwrap_or(0.0)
         },
     )));
+    let cap_ctx = inner.axis_ctx.clone();
+    inner.engine.set_text_cap_center(Some(Box::new(
+        move |size: f64, family: &str, weight: u16, italic: bool| {
+            cap_ctx.set_font(&aeris_charts_render::draw_list::text_font_spec(
+                size as f32,
+                family,
+                weight,
+                italic,
+            ));
+            cap_ctx.set_text_baseline("middle");
+            // Figures carry the trading readouts; their ink spans the cap height on the baseline.
+            cap_ctx
+                .measure_text("0")
+                .map(|metrics| {
+                    (metrics.actual_bounding_box_ascent() - metrics.actual_bounding_box_descent())
+                        / 2.0
+                })
+                .unwrap_or(0.0)
+        },
+    )));
 
     Ok(AerisChart {
         inner: Rc::new(RefCell::new(inner)),
@@ -942,6 +962,26 @@ pub async fn create_offscreen_chart(
             measure_ctx
                 .measure_text(text)
                 .map(|metrics| metrics.width())
+                .unwrap_or(0.0)
+        },
+    )));
+    let cap_ctx = inner.axis_ctx.clone();
+    inner.engine.set_text_cap_center(Some(Box::new(
+        move |size: f64, family: &str, weight: u16, italic: bool| {
+            cap_ctx.set_font(&aeris_charts_render::draw_list::text_font_spec(
+                size as f32,
+                family,
+                weight,
+                italic,
+            ));
+            cap_ctx.set_text_baseline("middle");
+            // Figures carry the trading readouts; their ink spans the cap height on the baseline.
+            cap_ctx
+                .measure_text("0")
+                .map(|metrics| {
+                    (metrics.actual_bounding_box_ascent() - metrics.actual_bounding_box_descent())
+                        / 2.0
+                })
                 .unwrap_or(0.0)
         },
     )));
@@ -1213,6 +1253,8 @@ impl AerisChart {
                 let kind = match hit.kind {
                     aeris_charts_engine::TradingHitKind::PositionLine => "position_line",
                     aeris_charts_engine::TradingHitKind::OrderLine => "order_line",
+                    aeris_charts_engine::TradingHitKind::TakeProfitButton => "take_profit_button",
+                    aeris_charts_engine::TradingHitKind::StopLossButton => "stop_loss_button",
                     aeris_charts_engine::TradingHitKind::CancelButton => "cancel_button",
                     aeris_charts_engine::TradingHitKind::ExecutionMarker => "execution_marker",
                     aeris_charts_engine::TradingHitKind::Annotation => "annotation",
@@ -1237,11 +1279,10 @@ impl AerisChart {
     }
 
     pub fn trading_cursor_at(&self, x_css: f64, y_css: f64) -> u8 {
-        match self.inner.borrow().engine.trading_hit_at(x_css, y_css) {
+        match self.inner.borrow().engine.trading_cursor_at(x_css, y_css) {
             None => 0,
-            Some(hit) if hit.kind == aeris_charts_engine::TradingHitKind::OrderLine => 2,
-            Some(hit) if matches!(hit.kind, aeris_charts_engine::TradingHitKind::CancelButton) => 1,
-            Some(_) => 0,
+            Some(aeris_charts_engine::TradingCursor::Pointer) => 1,
+            Some(aeris_charts_engine::TradingCursor::Grab) => 2,
         }
     }
 
@@ -4491,6 +4532,24 @@ impl AerisChart {
         self.inner.borrow_mut().set_seconds_visible(visible);
     }
 
+    /// Set the chart display time zone using an IANA identifier. Canonical timestamps stay UTC;
+    /// axis/crosshair calendar boundaries and labels are localized with DST-aware rules.
+    pub fn set_time_zone(&mut self, time_zone: &str) -> bool {
+        self.inner.borrow_mut().set_time_zone(time_zone)
+    }
+
+    /// Current IANA chart display time-zone identifier (`custom` when an explicit offset schedule
+    /// that no named zone produced is installed).
+    pub fn time_zone(&self) -> String {
+        self.inner.borrow().time_zone().to_string()
+    }
+
+    /// Exact built-in TradingView-parity time-zone identifiers as JSON.
+    pub fn supported_time_zones_json(&self) -> String {
+        serde_json::to_string(aeris_charts_engine::TRADINGVIEW_TIME_ZONES)
+            .unwrap_or_else(|_| "[]".to_string())
+    }
+
     /// reference `timeScale.minBarSpacing` (CSS px).
     pub fn set_min_bar_spacing(&mut self, spacing: f64) {
         self.inner.borrow_mut().set_min_bar_spacing(spacing);
@@ -5294,19 +5353,6 @@ impl AerisChart {
     pub fn drawing_text_editable(&self, id: u32) -> bool {
         self.inner.borrow().engine.drawing_text_editable(id)
     }
-    /// Open the engine's text-edit session for the host editor. Frame construction keeps the
-    /// committed glyphs under the overlay caret while it is open. False when not editable.
-    pub fn begin_drawing_text_edit(&mut self, id: u32) -> bool {
-        self.inner.borrow_mut().engine.begin_drawing_text_edit(id)
-    }
-    /// Live text of the open session: repaints without an undo step or a sync revision.
-    pub fn set_drawing_edit_text(&mut self, text: &str) -> bool {
-        self.inner.borrow_mut().engine.set_drawing_edit_text(text)
-    }
-    /// Close the open session: commit records one undo step, cancel restores the text.
-    pub fn end_drawing_text_edit(&mut self, commit: bool) -> bool {
-        self.inner.borrow_mut().engine.end_drawing_text_edit(commit)
-    }
     pub fn editing_drawing(&self) -> Option<u32> {
         self.inner.borrow().engine.editing_drawing()
     }
@@ -5317,6 +5363,37 @@ impl AerisChart {
     /// or one run whose start (`x`, `y`) rotates by `angle` about itself.
     pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
         self.inner.borrow().drawing_text_edit_layout_json(id)
+    }
+    /// Open the engine-owned typing session on every drawing that paints its own text
+    /// ([`Self::drawing_text_editable`]); a session open on another drawing is committed first.
+    /// The browser keeps its native editable surface (IME, clipboard, accessibility) and paints
+    /// its own caret, so it passes `paint_caret = false`; the engine owns the live text and the
+    /// commit/cancel lifecycle. Frame construction keeps the committed glyphs under the overlay
+    /// caret while it is open. False when the drawing cannot be edited (an open session survives).
+    pub fn begin_drawing_text_edit(&mut self, id: u32, paint_caret: bool) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .begin_drawing_text_edit(id, paint_caret)
+    }
+    /// Mirror the editable surface into the session: its whole value and caret (in chars). Live
+    /// text repaints without an undo step or a sync revision; the engine owns the single-line
+    /// rule of a run label and the length bound.
+    pub fn set_drawing_text_edit(&mut self, text: &str, caret: u32) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .set_drawing_text_edit(text, caret as usize)
+    }
+    /// Enter/blur: keep the typed text, trimmed, as one undo step (an emptied standalone text
+    /// drawing is removed; every other drawing keeps its emptied label).
+    pub fn commit_drawing_text_edit(&mut self) -> bool {
+        self.inner.borrow_mut().engine.commit_drawing_text_edit()
+    }
+    /// Escape: restore the pre-edit text without history (a fresh empty standalone text drawing
+    /// is removed).
+    pub fn cancel_drawing_text_edit(&mut self) -> bool {
+        self.inner.borrow_mut().engine.cancel_drawing_text_edit()
     }
     pub fn selected_drawing(&self) -> Option<u32> {
         self.inner.borrow().selected_drawing()

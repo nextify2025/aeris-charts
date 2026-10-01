@@ -112,7 +112,7 @@ struct TickChart {
 
 fn tick_chart(zone: UtcOffsetSchedule, options: FootprintAggregationOptions) -> TickChart {
     let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
-    chart.set_time_zone(zone);
+    chart.set_exchange_offsets(zone);
     let stream = chart.add_trade_stream("SSE:600000", options).unwrap();
     let candles = chart.add_series(SeriesKind::Candlestick);
     chart
@@ -474,7 +474,7 @@ fn exchange_time_changes_re_place_the_session_windows() {
         .unwrap();
     // In UTC every Shanghai print precedes the 09:30 UTC window and folds into its first bar.
     assert_eq!(rows(&tick.chart, tick.candles).len(), 1);
-    tick.chart.set_time_zone(zone.clone());
+    tick.chart.set_exchange_offsets(zone.clone());
     assert_eq!(
         local_times(&zone, &rows(&tick.chart, tick.candles)),
         ["09:30", "10:30", "13:00", "14:00"]
@@ -649,7 +649,7 @@ fn trade_bubbles_sit_on_the_bar_holding_their_print() {
 fn sessions_require_whole_second_time_bars_and_valid_windows() {
     let zone = shanghai();
     let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
-    chart.set_time_zone(zone.clone());
+    chart.set_exchange_offsets(zone.clone());
     let ticks = chart
         .add_trade_stream(
             "SSE:600000:ticks",
@@ -708,7 +708,7 @@ fn session_footprint(
     clock: Option<i64>,
 ) -> (ChartEngine, u64, SeriesId) {
     let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
-    chart.set_time_zone(shanghai());
+    chart.set_exchange_offsets(shanghai());
     let stream = chart.add_trade_stream("SSE:600000", aggregation).unwrap();
     chart
         .set_trade_stream_sessions(stream, Some(a_share_sessions(OutOfSessionPolicy::Fold)))

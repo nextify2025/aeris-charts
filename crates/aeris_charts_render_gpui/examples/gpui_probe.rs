@@ -4,9 +4,8 @@
 //! independently seeded `Workspace` split cells, drawing creation, indicators, exact package
 //! themes, OHLC/click status, and host-side visual approximations of the web plugin fixtures. Those fixture
 //! toggles insert engine `Prim`s or use native engine APIs; they are explicitly not a JavaScript
-//! object bridge. With `AERIS_CHARTS_PROBE_FRAMES` set the source single-chart metrics/probe path is
-//! retained: responsive layout, native text measurement, axis/crosshair chrome, pan/zoom/scale,
-//! pane separators, drawing selection, fractional DPR, and live updates.
+//! object bridge. With `AERIS_CHARTS_PROBE_FRAMES` set a single chart paints N frames and exits
+//! silently (a smoke run of layout, native text measurement, and chrome). The demo data is static.
 //!
 //! ```text
 //! cargo run -p aeris_charts_render_gpui --features gpui-backend --example gpui_probe
@@ -14,31 +13,29 @@
 //!
 //! Environment knobs:
 //! - `AERIS_CHARTS_PROBE_BARS` — synthetic bars to load (default 500).
-//! - `AERIS_CHARTS_PROBE_FRAMES` — quit after N painted frames and print a metrics summary. Unset runs
-//!   interactively until the window closes.
+//! - `AERIS_CHARTS_PROBE_FRAMES` — quit after N painted frames. Unset runs interactively until the
+//!   window closes. The demo never prints frame data.
 //! - `AERIS_CHARTS_PROBE_FEATURE=footprint` — finite probes start in the deterministic detailed-LOD
 //!   footprint fixture instead of the default candlestick fixture.
 
-use std::{
-    collections::HashMap,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_engine::{
     crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, BrushRange, BrushStyle,
-    ChartEngine, ChartFrame, DeltaTooltipActiveRange, DeltaTooltipOptions, DrawingKind,
-    DrawingModifiers, DrawingPoint, FootprintAggregationOptions, FootprintBarAggregation,
-    FootprintImbalanceOptions, FootprintSeriesOptions, FootprintTrade, GestureResolver,
-    GestureUpdateKind, InputDevice, InputModifiers, InputTarget, Marker, NativePrimitiveId,
-    PointerSample, PriceLineExtent, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
-    SplitDirection, WheelBehavior, WheelDeltaMode, WheelIntent, WheelSample, Workspace,
-    WorkspaceLayout,
+    ChartEngine, ChartFrame, DeltaTooltipActiveRange, DeltaTooltipOptions, DrawingId, DrawingKind,
+    DrawingModifiers, DrawingPoint, DrawingTextEditKey, FootprintAggregationOptions,
+    FootprintBarAggregation, FootprintImbalanceOptions, FootprintSeriesOptions, FootprintTrade,
+    GestureResolver, GestureUpdateKind, InputDevice, InputModifiers, InputTarget, Marker,
+    NativePrimitiveId, PointerSample, PriceLineExtent, PriceScaleTarget,
+    PrimitiveAutoscaleContribution, SeriesKind, SplitDirection, TradeStudyOptions, WheelBehavior,
+    WheelDeltaMode, WheelIntent, WheelSample, Workspace, WorkspaceLayout,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, LineStyle, Prim, TextAlign};
 use aeris_charts_render_gpui::{
-    backend::measure_text, AerisViewport, GpuiChartRenderer, GpuiFrameMetrics, PreparedAerisFrame,
+    backend::{measure_text, text_cap_centerer, text_measurer},
+    AerisViewport, GpuiChartRenderer, GpuiFrameMetrics, PreparedAerisFrame,
 };
 use gpui::{
     canvas, div, prelude::*, px, relative, rgb, size, AnyElement, App, Bounds, Context,
@@ -207,7 +204,7 @@ fn shell_rgb(css: &str, fallback: u32) -> u32 {
 const TOOLBAR_FEATURE_MANIFEST: &[&str] = &[
     "series:candlestick,bar,line,area,brushable-area,footprint,histogram,baseline",
     "style:candle-body,wick-colors,border-colors,wick-visible,border-visible,reset-parts,line-color,line-width,area-fill",
-    "overlay:sma20,volume,rsi14",
+    "overlay:sma20,volume,volume-profile,rsi14,cvd",
     "workspace:split-horizontal,split-vertical,shortcuts,maximize,restore,close,cap,usage,active,resize",
     "drawing:trend,h-line,h-ray,v-line,rect,text,path,brush,clear,color,style,width,label,text-color,size,weight,italic",
     "crosshair:mode,color,width,style,label-background,labels",
@@ -218,6 +215,13 @@ const TOOLBAR_FEATURE_MANIFEST: &[&str] = &[
     "interaction:axis-scaling,mouse-kinetic,reset-view",
     "native-visual-approximations:day-bands,position-band,autoscale-band,markers,vertical-line",
 ];
+
+/// The CVD study's canonical trade stream and its line series.
+#[derive(Clone, Copy)]
+struct CvdDemoState {
+    stream_id: u64,
+    series_id: SeriesId,
+}
 
 /// Column-major OHLC, in the shape `ChartEngine::set_series_data` takes.
 #[derive(Clone)]
@@ -255,19 +259,6 @@ fn synthetic_bars(count: usize) -> Bars {
         low,
         close,
     }
-}
-
-fn next_bar_timestamp(times: &[f64]) -> f64 {
-    let Some(&latest) = times.last() else {
-        return 1_600_000_000.0;
-    };
-    let cadence = times
-        .windows(2)
-        .rev()
-        .map(|pair| pair[1] - pair[0])
-        .find(|cadence| cadence.is_finite() && *cadence > 0.0)
-        .unwrap_or(60.0);
-    latest + cadence
 }
 
 /// Match the Web demo's root-cell fixture: 1,000 deterministic hourly bars by default.
@@ -380,6 +371,51 @@ fn footprint_demo_trades(bars: &Bars) -> Vec<FootprintTrade> {
     trades
 }
 
+/// One minute bar's synthetic prints for the CVD study: an open → extreme → extreme → close
+/// path whose aggressor mix follows the bar direction, so cumulative delta tracks the candles.
+fn cvd_demo_bar_trades(bars: &Bars, index: usize, trade_id: &mut u64) -> Vec<FootprintTrade> {
+    let (open, high, low, close) = (
+        bars.open[index],
+        bars.high[index],
+        bars.low[index],
+        bars.close[index],
+    );
+    let path = if close >= open {
+        [open, low, high, close]
+    } else {
+        [open, high, low, close]
+    };
+    let start_micros = bars.times[index] as i64 * 1_000_000;
+    let buy_share = (0.5 + (close - open) / (high - low).max(1e-9) * 0.4).clamp(0.1, 0.9);
+    let mut trades = Vec::with_capacity(path.len() * 2);
+    for (step, price) in path.into_iter().enumerate() {
+        let volume = 40.0 + ((index * 7 + step * 13) % 23) as f64;
+        for (offset, (side, share)) in [
+            (AggressorSide::Buy, buy_share),
+            (AggressorSide::Sell, 1.0 - buy_share),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            trades.push(FootprintTrade {
+                timestamp_micros: start_micros + (step * 2 + offset) as i64 * 1_000_000 + 1,
+                // Real prints trade on the stream's 0.01 tick grid.
+                price: (price * 100.0).round() / 100.0,
+                volume: (volume * share).round().max(1.0),
+                aggressor: side,
+                bid: None,
+                ask: None,
+                sequence: None,
+                trade_id: Some(*trade_id),
+                conditions: 0,
+                session_id: Some(1),
+            });
+            *trade_id += 1;
+        }
+    }
+    trades
+}
+
 const CLICK_SLOP_MANHATTAN: f64 = 5.0;
 const PANE_SEPARATOR_HIT: f64 = 4.0;
 const WHEEL_LINE_HEIGHT: f32 = 32.0;
@@ -455,70 +491,78 @@ struct DrawingTemplate {
     color: String,
     style: &'static str,
     width: u8,
+    /// Content for the standalone Text tool only. Trend-line labels are typed in place, so the
+    /// template never writes a label onto a trend line or over a selected drawing's text.
     text: String,
-    text_color: String,
+    /// `None` keeps the engine default: a trend label follows its line color and standalone
+    /// text follows the chart foreground. Set only once the user explicitly picks a color.
+    text_color: Option<String>,
     text_size: u8,
     text_weight: u16,
     text_italic: bool,
+    text_h_align: &'static str,
+    text_v_align: &'static str,
 }
 
 impl Default for DrawingTemplate {
+    /// The browser demo's toolbar defaults, so both hosts create identical drawings.
     fn default() -> Self {
         Self {
-            color: "#2962ff".into(),
+            color: "#168ef7".into(),
             style: "solid",
             width: 2,
-            text: "Native".into(),
-            text_color: "#0a0a0a".into(),
-            text_size: 12,
+            text: String::new(),
+            text_color: None,
+            text_size: 14,
             text_weight: 400,
             text_italic: false,
+            text_h_align: "right",
+            text_v_align: "top",
         }
     }
 }
 
 impl DrawingTemplate {
-    fn json(&self) -> String {
-        format!(
-            r#"{{"color":"{}","style":"{}","width":{},"text":"{}","text_color":"{}","text_size":{},"text_weight":{},"text_italic":{}}}"#,
-            self.color,
-            self.style,
-            self.width,
-            self.text,
-            self.text_color,
-            self.text_size,
-            self.text_weight,
-            self.text_italic
-        )
+    /// Style fields every tool shares; label content and ink stay opt-in.
+    fn style_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("color".into(), self.color.clone().into());
+        fields.insert("style".into(), self.style.into());
+        fields.insert("width".into(), self.width.into());
+        fields.insert("text_size".into(), self.text_size.into());
+        fields.insert("text_weight".into(), self.text_weight.into());
+        fields.insert("text_italic".into(), self.text_italic.into());
+        fields.insert("text_h_align".into(), self.text_h_align.into());
+        fields.insert("text_v_align".into(), self.text_v_align.into());
+        if let Some(color) = &self.text_color {
+            fields.insert("text_color".into(), color.clone().into());
+        }
+        fields
     }
 
+    /// Options for arming `kind`. Only the Text tool receives template content.
+    fn json(&self, kind: DrawingKind) -> String {
+        let mut fields = self.style_fields();
+        if kind == DrawingKind::Text {
+            fields.insert("text".into(), self.text.clone().into());
+        }
+        serde_json::Value::Object(fields).to_string()
+    }
+
+    /// Changed style fields only, merged into an in-flight creation and the selected drawing.
+    /// Label content is never part of a live patch, so it cannot wipe a drawing's real text.
     fn patch_from(&self, previous: &Self) -> String {
-        let mut fields = Vec::new();
-        if self.color != previous.color {
-            fields.push(format!(r#""color":"{}""#, self.color));
+        let current = self.style_fields();
+        let before = previous.style_fields();
+        let mut patch: serde_json::Map<String, serde_json::Value> = current
+            .into_iter()
+            .filter(|(key, value)| before.get(key) != Some(value))
+            .collect();
+        if self.text_color.is_none() && previous.text_color.is_some() {
+            // Back to the inherited default: an empty color clears the explicit override.
+            patch.insert("text_color".into(), "".into());
         }
-        if self.style != previous.style {
-            fields.push(format!(r#""style":"{}""#, self.style));
-        }
-        if self.width != previous.width {
-            fields.push(format!(r#""width":{}"#, self.width));
-        }
-        if self.text != previous.text {
-            fields.push(format!(r#""text":"{}""#, self.text));
-        }
-        if self.text_color != previous.text_color {
-            fields.push(format!(r#""text_color":"{}""#, self.text_color));
-        }
-        if self.text_size != previous.text_size {
-            fields.push(format!(r#""text_size":{}"#, self.text_size));
-        }
-        if self.text_weight != previous.text_weight {
-            fields.push(format!(r#""text_weight":{}"#, self.text_weight));
-        }
-        if self.text_italic != previous.text_italic {
-            fields.push(format!(r#""text_italic":{}"#, self.text_italic));
-        }
-        format!("{{{}}}", fields.join(","))
+        serde_json::Value::Object(patch).to_string()
     }
 }
 
@@ -560,6 +604,12 @@ struct Probe {
     cursor_style: CursorStyle,
     press_start: Option<(f64, f64)>,
     press_moved: bool,
+    /// The drawing selected when the current press began: a selected text drawing opens its
+    /// editor on the next click (the browser host's two-step select-then-type model).
+    text_press_selected: Option<DrawingId>,
+    /// A press on the label being edited: the engine session keeps it, so its release must not
+    /// fall through to click selection (which would reopen and reset the session).
+    press_in_text_editor: bool,
     drag: Option<DragMode>,
     drag_started: bool,
     kinetic_active: bool,
@@ -575,22 +625,17 @@ struct Probe {
     volume_id: Option<SeriesId>,
     volume_profile: Option<(u32, SeriesId)>,
     rsi_id: Option<SeriesId>,
+    cvd: Option<CvdDemoState>,
     legend: String,
     click_status: String,
     bars: usize,
-    appended: usize,
-    last_append_epoch: u64,
     painted: u64,
     frame_budget: Option<u64>,
-    plan_nanos: Vec<u64>,
-    paint_nanos: Vec<u64>,
-    total_nanos: Vec<u64>,
     last: GpuiFrameMetrics,
     /// Distinct scale factors and sizes observed, to prove the propagation actually happened.
     seen_scales: Vec<f32>,
     seen_sizes: Vec<(f32, f32)>,
     started: Instant,
-    reported: bool,
 }
 
 impl Probe {
@@ -648,6 +693,8 @@ impl Probe {
             cursor_style: CursorStyle::Crosshair,
             press_start: None,
             press_moved: false,
+            text_press_selected: None,
+            press_in_text_editor: false,
             drag: None,
             drag_started: false,
             kinetic_active: false,
@@ -663,21 +710,16 @@ impl Probe {
             volume_id: None,
             volume_profile: None,
             rsi_id: None,
+            cvd: None,
             legend: "O —  H —  L —  C —".to_string(),
             click_status: "ready".to_string(),
             bars,
-            appended: 0,
-            last_append_epoch: 0,
             painted: 0,
             frame_budget,
-            plan_nanos: Vec::new(),
-            paint_nanos: Vec::new(),
-            total_nanos: Vec::new(),
             last: GpuiFrameMetrics::default(),
             seen_scales: Vec::new(),
             seen_sizes: Vec::new(),
             started: Instant::now(),
-            reported: false,
         }
     }
 
@@ -712,8 +754,6 @@ impl Probe {
             .expect("split-cell synthetic series is well formed");
         self.bars = bars.times.len();
         self.source_bars = bars;
-        self.appended = 0;
-        self.last_append_epoch = 0;
         self.fitted = false;
         self.dirty = true;
     }
@@ -729,10 +769,10 @@ impl Probe {
         self.pending_creation_point = None;
         self.creation_press_committed = false;
         let next = (self.engine.active_drawing_tool() != Some(kind)).then_some(kind);
-        let template = self.drawing_template.json();
+        let template = next.map(|kind| self.drawing_template.json(kind));
         let armed = self
             .engine
-            .set_drawing_tool(next, next.map(|_| template.as_str()), None);
+            .set_drawing_tool(next, template.as_deref(), None);
         debug_assert!(armed, "native drawing template is always valid JSON");
         self.click_status = self.engine.active_drawing_tool().map_or_else(
             || "drawing tool disarmed".to_string(),
@@ -741,13 +781,37 @@ impl Probe {
         self.dirty = true;
     }
 
+    /// A committed placement. Text-capable tools that request typing open the engine session.
+    fn drawing_created(&mut self, id: DrawingId) {
+        self.click_status = format!("created drawing #{id}");
+        if self.engine.drawing_requests_text_edit(id) {
+            self.engine.begin_drawing_text_edit(id, true);
+        }
+        self.dirty = true;
+    }
+
+    /// Whether a pane point lies on the label the open text session is editing.
+    fn on_text_editor(&self, pane_x: f64, y: f64) -> bool {
+        let Some((editing, _, _)) = self.engine.drawing_text_edit() else {
+            return false;
+        };
+        self.engine.drawing_text_hit_at(pane_x, y) == Some(editing)
+            || self.engine.hit_test_drawing(pane_x, y).is_some_and(|hit| {
+                hit.id == editing
+                    && self
+                        .engine
+                        .drawing(editing)
+                        .is_some_and(|drawing| drawing.kind == DrawingKind::Text)
+            })
+    }
+
     fn place_drawing_anchor(&mut self, x: f64, y: f64, modifiers: DrawingModifiers) -> i64 {
         if self.engine.active_drawing_tool().is_none() {
             return 0;
         }
         let update = self.engine.drawing_tool_activate(x, y, modifiers);
         if let Some(id) = update.created {
-            self.click_status = format!("created drawing #{id}");
+            self.drawing_created(id);
             return i64::from(id);
         }
         if update.consumed {
@@ -762,7 +826,7 @@ impl Probe {
         let Some(id) = update.created else {
             return false;
         };
-        self.click_status = format!("created drawing #{id}");
+        self.drawing_created(id);
         self.dirty = true;
         true
     }
@@ -1155,6 +1219,73 @@ impl Probe {
         self.dirty = true;
     }
 
+    /// CVD derives from trades, not OHLC: build a one-minute trade stream from the demo candles
+    /// and let the engine's cumulative-delta study own the line in its own pane.
+    fn toggle_cvd(&mut self) {
+        if let Some(cvd) = self.cvd.take() {
+            self.engine.remove_series(cvd.series_id);
+            let _ = self.engine.remove_trade_stream(cvd.stream_id);
+            self.dirty = true;
+            return;
+        }
+        // Anchor the one-minute buckets on the candle opens so every CVD point shares its
+        // candle's timestamp instead of interleaving new time points.
+        let anchor_micros = self
+            .source_bars
+            .times
+            .first()
+            .map_or(0, |&time| (time as i64).rem_euclid(60) * 1_000_000);
+        let Ok(stream_id) = self.engine.add_trade_stream(
+            "GPUI:CVD",
+            FootprintAggregationOptions {
+                tick_size: 0.01,
+                ticks_per_row: 1,
+                bars: FootprintBarAggregation::Time {
+                    interval_micros: 60_000_000,
+                    anchor_micros,
+                },
+                imbalance: FootprintImbalanceOptions::default(),
+            },
+        ) else {
+            self.click_status = "CVD: trade stream unavailable".into();
+            return;
+        };
+        let mut next_trade_id = 1;
+        let trades = (0..self.source_bars.times.len())
+            .flat_map(|index| cvd_demo_bar_trades(&self.source_bars, index, &mut next_trade_id))
+            .collect::<Vec<_>>();
+        let pane = self.engine.panes.len();
+        let installed = self
+            .engine
+            .set_trade_stream_trades(stream_id, trades)
+            .and_then(|_| {
+                self.engine
+                    .add_cvd_series(stream_id, pane, TradeStudyOptions::default())
+            });
+        match installed {
+            Ok(series_id) => {
+                if let Some(series) = self
+                    .engine
+                    .series
+                    .iter_mut()
+                    .find(|series| series.id == series_id && !series.removed)
+                {
+                    series.line_color = Some("#26a69a".into());
+                    series.line_width = Some(2.0);
+                }
+                self.cvd = Some(CvdDemoState {
+                    stream_id,
+                    series_id,
+                });
+            }
+            Err(error) => {
+                let _ = self.engine.remove_trade_stream(stream_id);
+                self.click_status = format!("CVD: {error}");
+            }
+        }
+        self.dirty = true;
+    }
+
     fn toggle_markers(&mut self) {
         self.fixtures.markers = !self.fixtures.markers;
         let markers = if self.fixtures.markers && !self.source_bars.times.is_empty() {
@@ -1431,7 +1562,10 @@ impl Probe {
             .expect("the probe engine always has a primary pane");
         let expected_x_px = (self.engine.pane_left * self.engine.dpr).round() as u32;
         let expected_w_px = (self.engine.pane_w * self.engine.dpr).round() as u32;
-        let expected_h_px = (content_h * self.engine.dpr).round() as u32;
+        // The primary pane shares the content height with any indicator panes below it, so its
+        // scissor follows the engine's own vertical pixel ratio for that pane's height.
+        let vpr = (content_h * self.engine.dpr).round().max(1.0) / content_h.max(1.0);
+        let expected_h_px = (self.engine.panes[0].height * vpr).round() as u32;
         assert!(
             (self.engine.pane_left + self.engine.pane_w + self.engine.axis_w - f64::from(width))
                 .abs()
@@ -1449,16 +1583,6 @@ impl Probe {
             [pane.scissor[0], pane.scissor[2], pane.scissor[3]],
             [expected_x_px, expected_w_px, expected_h_px],
             "probe pane scissor must follow the physical negotiated pane extent"
-        );
-        println!(
-            "aeris_charts probe viewport: canvas={width:.1}x{height:.1} logical, pane=({:.1},{:.1}) {:.1}x{:.1}, axes={:.1}/{:.1}, scissor={:?} device, dpr={scale_factor:.3}",
-            self.engine.pane_left,
-            0.0,
-            self.engine.pane_w,
-            self.engine.pane_h,
-            self.engine.left_axis_w,
-            self.engine.axis_w,
-            pane.scissor
         );
     }
 
@@ -1486,42 +1610,12 @@ impl Probe {
             return;
         }
         let layout = self.engine.options.get().layout.clone();
-        let mut drawing_widths = HashMap::new();
-        for drawing in self.engine.drawings() {
-            let text = drawing.display_text();
-            let size = drawing.resolved_text_size(layout.font_size);
-            let weight = if drawing.kind == DrawingKind::Text && drawing.text.is_empty() {
-                700
-            } else {
-                drawing.text_weight.unwrap_or(400)
-            };
-            let key = format!(
-                "{text}\u{0}{size}\u{0}{}\u{0}{weight}\u{0}{}",
-                layout.font_family, drawing.text_italic
-            );
-            drawing_widths.insert(
-                key,
-                f64::from(
-                    measure_text(
-                        window,
-                        text,
-                        &layout.font_family,
-                        size as f32,
-                        weight,
-                        drawing.text_italic,
-                    )
-                    .width,
-                ),
-            );
-        }
+        // Live native measurement for every engine request (labels, caret prefixes, the trend
+        // prompt, device-scaled frame runs), matching the browser host's canvas measurer.
         self.engine
-            .set_text_measure(Some(Box::new(move |text, size, family, weight, italic| {
-                let key = format!("{text}\u{0}{size}\u{0}{family}\u{0}{weight}\u{0}{italic}");
-                drawing_widths
-                    .get(&key)
-                    .copied()
-                    .unwrap_or_else(|| text.chars().count() as f64 * size * 0.6)
-            })));
+            .set_text_measure(Some(Box::new(text_measurer(window))));
+        self.engine
+            .set_text_cap_center(Some(Box::new(text_cap_centerer(window))));
         let axis_size = self.engine.axis_font_size();
         let countdown_size = self.engine.countdown_font_size();
         self.rebuild_with_measure(
@@ -1557,68 +1651,7 @@ impl Probe {
         );
     }
 
-    /// Append one live bar, forcing a rebuild on the next prepaint.
-    fn append_bar(&mut self) {
-        let i = self.bars + self.appended;
-        let t = i as f64;
-        let c = 100.0 + (t * 0.11).sin() * 6.0 + (t * 0.031).cos() * 14.0;
-        let o = self.source_bars.close.last().copied().unwrap_or(c);
-        let high = o.max(c) + 2.0;
-        let low = o.min(c) - 2.0;
-        let time = next_bar_timestamp(&self.source_bars.times);
-        self.engine.update_series_bar(0, time, [o, high, low, c]);
-        if let Some(id) = self.volume_id {
-            let volume = (high - low) * 25_000.0 + i as f64 * 31.0;
-            self.engine
-                .update_series_bar(id, time, [volume, volume, volume, volume]);
-        }
-        if let Some((_, id)) = self.volume_profile {
-            let volume = (800.0 + (c - o).abs() * 4000.0).round();
-            self.engine.update_series_bar(id, time, [volume; 4]);
-        }
-        self.source_bars.times.push(time);
-        self.source_bars.open.push(o);
-        self.source_bars.high.push(high);
-        self.source_bars.low.push(low);
-        self.source_bars.close.push(c);
-        if let Some(footprint) = self.footprint {
-            self.engine
-                .set_footprint_trades(
-                    footprint.series_id,
-                    footprint_demo_trades(&self.source_bars),
-                )
-                .expect("the refreshed GPUI footprint tape is valid");
-        }
-        self.appended += 1;
-        self.dirty = true;
-    }
-
-    fn maybe_append_live_bar(&mut self) {
-        if self
-            .frame_budget
-            .is_some_and(|budget| self.painted >= budget)
-        {
-            return;
-        }
-        let epoch = if self.frame_budget.is_some() {
-            self.painted / 60
-        } else {
-            self.started.elapsed().as_secs()
-        };
-        if self.painted > 0 && epoch > self.last_append_epoch {
-            self.last_append_epoch = epoch;
-            self.append_bar();
-        }
-    }
-
     fn record_frame_metrics(&mut self, metrics: GpuiFrameMetrics) {
-        // Finite probe mode retains full samples for percentile reporting. Interactive charts
-        // keep only the latest aggregate so an indefinitely open split workspace is bounded.
-        if self.frame_budget.is_some() {
-            self.plan_nanos.push(metrics.plan_nanos);
-            self.paint_nanos.push(metrics.paint_nanos);
-            self.total_nanos.push(metrics.total_nanos());
-        }
         self.last = metrics;
         self.painted += 1;
     }
@@ -1668,9 +1701,10 @@ impl Probe {
             && pane_x <= self.engine.pane_w
             && y >= 0.0
             && y <= self.engine.pane_h)
-            .then(|| self.engine.hit_test_drawing(pane_x, y))
+            .then(|| self.engine.drawing_hover_at(pane_x, y))
             .flatten()
-            .map(|hit| match hit.cursor {
+            .map(|(_, cursor)| match cursor {
+                "text" => CursorStyle::IBeam,
                 "pointer" => CursorStyle::PointingHand,
                 "move" => CursorStyle::ClosedHand,
                 "ns-resize" => CursorStyle::ResizeUpDown,
@@ -1835,13 +1869,11 @@ impl Probe {
             // overlaps stay selectable, clears the series bump, and drives generic hover
             // promotion plus the text-only hover ring. Hit testing stays on stable order so
             // promotion cannot oscillate hover.
-            if let Some(drawing) = self.engine.hit_test_drawing(pane_x, y) {
+            // Engine-owned arbitration: a trend label or its `+ Add text` prompt wins before
+            // the drawing body, so moving onto the label keeps the prompt clickable.
+            if self.engine.update_drawing_hover(pane_x, y).is_some() {
                 self.engine.set_hovered_series(None);
-                self.engine.set_hovered_text(Some(drawing.id));
-                self.engine.set_hovered_drawing(Some(drawing.id));
             } else {
-                self.engine.set_hovered_text(None);
-                self.engine.set_hovered_drawing(None);
                 let hovered = self.engine.hit_test_series(pane_x, y);
                 self.engine.set_hovered_series(hovered);
             }
@@ -1867,7 +1899,8 @@ impl Probe {
     }
 
     fn update_crosshair_modifier(&mut self, control: bool, platform: bool) {
-        let enabled = (control || platform) && self.engine.active_drawing_tool().is_some();
+        let enabled = (control || platform)
+            && (self.engine.active_drawing_tool().is_some() || self.engine.drawing_drag_active());
         if self.engine.crosshair_ohlc_magnet != enabled {
             self.engine.crosshair_ohlc_magnet = enabled;
             self.dirty = true;
@@ -1946,6 +1979,21 @@ impl Probe {
         self.engine.time_scale_end_scroll();
         self.engine.cancel_scroll_animation();
         let (chart_x, pane_x, y) = self.local_position(event.position);
+        // Typing mode behaves like the browser's focused editor: a press on the edited label
+        // stays in the session, any other press commits it (blur) and proceeds normally.
+        self.press_in_text_editor = self.on_text_editor(pane_x, y);
+        if self.press_in_text_editor {
+            // Like the browser editor: a click inside the label places the caret there.
+            if self.engine.drawing_text_edit_caret_at(pane_x, y) {
+                self.dirty = true;
+            }
+            cx.notify();
+            return;
+        }
+        if self.engine.commit_drawing_text_edit() {
+            self.dirty = true;
+        }
+        self.text_press_selected = self.engine.selected_drawing();
         self.input_target = self.input_target_at(chart_x, pane_x, y);
         let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
         self.input.pointer_down(sample);
@@ -1988,7 +2036,7 @@ impl Probe {
             );
             self.creation_press_committed = update.created.is_some();
             if let Some(id) = update.created {
-                self.click_status = format!("created drawing #{id}");
+                self.drawing_created(id);
             }
             if update.pointer_capture {
                 self.drag = Some(DragMode::DrawingCreation);
@@ -2203,6 +2251,9 @@ impl Probe {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.press_in_text_editor) {
+            return;
+        }
         let (chart_x, pane_x, y) = self.local_position(event.position);
         let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
         self.input.pointer_up(sample);
@@ -2261,7 +2312,7 @@ impl Probe {
                 self.flush_pending_drawing_creation();
                 let update = self.engine.drawing_tool_pointer_up(pane_x, y, modifiers);
                 if let Some(id) = update.created {
-                    self.click_status = format!("created drawing #{id}");
+                    self.drawing_created(id);
                 }
                 false
             }
@@ -2286,7 +2337,24 @@ impl Probe {
         if select_click {
             let selected = self.engine.hit_test_series(pane_x, y);
             self.engine.set_selected_series(selected);
-            self.engine.select_drawing_at(pane_x, y);
+            // Browser-host parity: a trend label (or its `+ Add text` prompt) opens typing on the
+            // first click; a text drawing opens it when empty or already selected at press.
+            if let Some(id) = self.engine.drawing_text_hit_at(pane_x, y) {
+                self.engine.set_selected_drawing(Some(id));
+                self.engine.begin_drawing_text_edit(id, true);
+            } else if self.engine.select_drawing_at(pane_x, y) {
+                if let Some(drawing) = self
+                    .engine
+                    .selected_drawing()
+                    .and_then(|id| self.engine.drawing(id))
+                    .filter(|drawing| drawing.kind == DrawingKind::Text)
+                {
+                    let id = drawing.id;
+                    if drawing.text.trim().is_empty() || self.text_press_selected == Some(id) {
+                        self.engine.begin_drawing_text_edit(id, true);
+                    }
+                }
+            }
             self.update_legend(pane_x);
             self.click_status = format!("click x={pane_x:.1} y={y:.1}");
         }
@@ -2402,6 +2470,34 @@ impl Probe {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.engine.drawing_text_edit().is_some() {
+            let modifiers = event.keystroke.modifiers;
+            let command = (modifiers.control || modifiers.platform) && !modifiers.alt;
+            match event.keystroke.key.as_str() {
+                // Clipboard shortcuts, like the browser editor: paste flattens to one line.
+                "v" if command => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        self.engine.drawing_text_edit_insert(&text);
+                    }
+                }
+                "c" | "x" if command => {
+                    if let Some(selected) = self.engine.drawing_text_edit_selection() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            selected.to_string(),
+                        ));
+                        if event.keystroke.key == "x" {
+                            self.engine
+                                .drawing_text_edit_key(DrawingTextEditKey::Backspace, false);
+                        }
+                    }
+                }
+                _ => self.on_text_edit_key(event),
+            }
+            self.dirty = true;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let step = if event.keystroke.modifiers.control || event.keystroke.modifiers.shift {
             10.0
         } else {
@@ -2459,6 +2555,57 @@ impl Probe {
         }
     }
 
+    /// Typing mode owns the keyboard: editing keys and committed characters go to the engine
+    /// session; chart and workspace shortcuts stay inert until the session ends.
+    fn on_text_edit_key(&mut self, event: &KeyDownEvent) {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        // Word motion follows the platform convention: Ctrl on Windows/Linux, Option on macOS;
+        // Cmd+arrows jump to the line ends on macOS.
+        let word = if cfg!(target_os = "macos") {
+            modifiers.alt
+        } else {
+            modifiers.control
+        };
+        let line = cfg!(target_os = "macos") && modifiers.platform;
+        let key = match keystroke.key.as_str() {
+            "enter" => {
+                self.engine.commit_drawing_text_edit();
+                return;
+            }
+            "escape" => {
+                self.engine.cancel_drawing_text_edit();
+                return;
+            }
+            "a" if (modifiers.control || modifiers.platform) && !modifiers.alt => {
+                self.engine.drawing_text_edit_select_all();
+                return;
+            }
+            "backspace" if word => Some(DrawingTextEditKey::DeleteWordBackward),
+            "backspace" => Some(DrawingTextEditKey::Backspace),
+            "delete" if word => Some(DrawingTextEditKey::DeleteWordForward),
+            "delete" => Some(DrawingTextEditKey::Delete),
+            "left" if line => Some(DrawingTextEditKey::Home),
+            "right" if line => Some(DrawingTextEditKey::End),
+            "left" if word => Some(DrawingTextEditKey::WordLeft),
+            "right" if word => Some(DrawingTextEditKey::WordRight),
+            "left" => Some(DrawingTextEditKey::Left),
+            "right" => Some(DrawingTextEditKey::Right),
+            "home" | "up" => Some(DrawingTextEditKey::Home),
+            "end" | "down" => Some(DrawingTextEditKey::End),
+            _ => None,
+        };
+        if let Some(key) = key {
+            self.engine.drawing_text_edit_key(key, modifiers.shift);
+        } else if let Some(text) = keystroke.key_char.as_deref().filter(|_| {
+            // AltGr characters arrive with Ctrl+Alt on Windows; GPUI marks them as text.
+            event.prefer_character_input
+                || (!keystroke.modifiers.control && !keystroke.modifiers.platform)
+        }) {
+            self.engine.drawing_text_edit_insert(text);
+        }
+    }
+
     fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let direction = match event.keystroke.key.as_str() {
             "left" => -1,
@@ -2494,67 +2641,6 @@ impl Probe {
             self.engine.scroll_animation_tick(now);
             self.dirty = true;
         }
-    }
-
-    fn report(&self) {
-        let pct = |data: &[u64], p: f64| -> f64 {
-            if data.is_empty() {
-                return 0.0;
-            }
-            let mut v = data.to_vec();
-            v.sort_unstable();
-            let idx = ((v.len() as f64 - 1.0) * p).round() as usize;
-            v[idx] as f64 / 1_000_000.0
-        };
-        println!("--- aeris_charts_render_gpui probe ---");
-        println!("frames painted  : {}", self.painted);
-        println!("bars            : {}", self.bars + self.appended);
-        println!("wall clock      : {:.2?}", self.started.elapsed());
-        println!("scale factors   : {:?}", self.seen_scales);
-        println!("sizes (logical) : {:?}", self.seen_sizes);
-        println!(
-            "last frame      : prims={} ops={} quads={} paths={} tris={} text_runs={} painted_runs={} dropped={}",
-            self.last.prims,
-            self.last.ops,
-            self.last.quads,
-            self.last.paths,
-            self.last.triangles,
-            self.last.text_runs,
-            self.last.glyph_runs_painted,
-            self.last.dropped_prims
-        );
-        println!("mesh vertices   : {}", self.last.mesh_vertices);
-        println!(
-            "quad batching   : {} quads -> {} paths ({} paint_quad calls saved)",
-            self.last.batched_quads,
-            self.last.quad_batches,
-            self.last
-                .batched_quads
-                .saturating_sub(self.last.quad_batches)
-        );
-        println!(
-            "adapter total ms: p50={:.3} p99={:.3}  (plan + gpui submission)",
-            pct(&self.total_nanos, 0.50),
-            pct(&self.total_nanos, 0.99)
-        );
-        println!(
-            "text cache      : {} hits / {} misses",
-            self.last.text_cache_hits, self.last.text_cache_misses
-        );
-        println!(
-            "plan build ms   : p50={:.3} p95={:.3} p99={:.3} max={:.3}",
-            pct(&self.plan_nanos, 0.50),
-            pct(&self.plan_nanos, 0.95),
-            pct(&self.plan_nanos, 0.99),
-            pct(&self.plan_nanos, 1.0)
-        );
-        println!(
-            "gpui paint ms   : p50={:.3} p95={:.3} p99={:.3} max={:.3}",
-            pct(&self.paint_nanos, 0.50),
-            pct(&self.paint_nanos, 0.95),
-            pct(&self.paint_nanos, 0.99),
-            pct(&self.paint_nanos, 1.0)
-        );
     }
 }
 
@@ -2619,10 +2705,6 @@ impl Render for Probe {
             .frame_budget
             .is_some_and(|budget| self.painted >= budget);
         if done {
-            if !self.reported {
-                self.report();
-                self.reported = true;
-            }
             cx.quit();
         } else if self.needs_animation_frame() {
             window.request_animation_frame();
@@ -2675,7 +2757,6 @@ impl Render for Probe {
                             }
                             probe.viewport_offset = (offset_x, offset_y);
                             probe.tick_animations();
-                            probe.maybe_append_live_bar();
                             probe.rebuild(w, h, scale_factor, window);
                         });
                         bounds
@@ -2798,6 +2879,7 @@ enum DemoAction {
     Volume,
     VolumeProfile,
     Rsi,
+    Cvd,
     Split(SplitDirection),
     Close,
     Cap,
@@ -2867,6 +2949,9 @@ struct InteractiveDemo {
     cells: Vec<DemoCell>,
     active: u64,
     maximized: Option<u64>,
+    /// The release of an Alt+click maximize press. The layout changes under the pointer, so the
+    /// mouse-up must not reach whichever chart is now there (no stray click or drawing anchor).
+    swallow_mouse_up: bool,
     theme: DemoTheme,
     max_index: usize,
     max_charts: Option<usize>,
@@ -2892,6 +2977,7 @@ impl InteractiveDemo {
             cells: vec![DemoCell { id: 1, chart }],
             active: 1,
             maximized: None,
+            swallow_mouse_up: false,
             theme: DemoTheme::Dark,
             max_index: 0,
             max_charts: None,
@@ -3005,7 +3091,7 @@ impl InteractiveDemo {
         self.maximized = (self.maximized != Some(id)).then_some(id);
         self.status = self.maximized.map_or_else(
             || format!("restored split layout; active cell {id}"),
-            |_| format!("maximized cell {id}; Ctrl/Cmd+click to restore"),
+            |_| format!("maximized cell {id}; Alt+click to restore"),
         );
     }
 
@@ -3167,6 +3253,7 @@ impl InteractiveDemo {
             DemoAction::Volume => self.update_root(cx, Probe::toggle_volume),
             DemoAction::VolumeProfile => self.update_root(cx, Probe::toggle_volume_profile),
             DemoAction::Rsi => self.update_root(cx, Probe::toggle_rsi),
+            DemoAction::Cvd => self.update_root(cx, Probe::toggle_cvd),
             DemoAction::Split(direction) => self.split(direction, true, cx),
             DemoAction::Close => self.close_active(),
             DemoAction::Cap => {
@@ -3179,7 +3266,7 @@ impl InteractiveDemo {
             DemoAction::ClearDrawings => self.update_root(cx, |p| p.engine.clear_drawings()),
             DemoAction::DrawingColor => self.update_root(cx, |p| {
                 p.update_drawing_template(|t| {
-                    t.color = if t.color == "#2962ff" { "#ff9800" } else { "#2962ff" }.into();
+                    t.color = if t.color == "#168ef7" { "#ff9800" } else { "#168ef7" }.into();
                 });
             }),
             DemoAction::DrawingStyle => self.update_root(cx, |p| {
@@ -3191,13 +3278,15 @@ impl InteractiveDemo {
                 p.update_drawing_template(|t| t.width = if t.width >= 4 { 1 } else { t.width + 1 });
             }),
             DemoAction::DrawingText => self.update_root(cx, |p| {
-                p.update_drawing_template(|t| t.text = if t.text == "Native" { "Aeris native" } else { "Native" }.into());
+                // Content for the next standalone Text drawing only (trend labels are typed).
+                p.update_drawing_template(|t| t.text = if t.text.is_empty() { "Note".into() } else { String::new() });
             }),
             DemoAction::DrawingTextColor => self.update_root(cx, |p| {
-                p.update_drawing_template(|t| t.text_color = if t.text_color == "#0a0a0a" { "#ab47bc" } else { "#0a0a0a" }.into());
+                // Explicit ink, then back to the inherited default (line color / foreground).
+                p.update_drawing_template(|t| t.text_color = match t.text_color { None => Some("#ab47bc".into()), Some(_) => None });
             }),
             DemoAction::DrawingTextSize => self.update_root(cx, |p| {
-                p.update_drawing_template(|t| t.text_size = if t.text_size >= 18 { 12 } else { t.text_size + 2 });
+                p.update_drawing_template(|t| t.text_size = if t.text_size >= 20 { 12 } else { t.text_size + 2 });
             }),
             DemoAction::DrawingTextWeight => self.update_root(cx, |p| {
                 p.update_drawing_template(|t| t.text_weight = if t.text_weight >= 700 { 400 } else { t.text_weight + 100 });
@@ -3428,6 +3517,9 @@ impl InteractiveDemo {
             DemoAction::Rsi => root
                 .as_ref()
                 .is_some_and(|chart| chart.read(cx).rsi_id.is_some()),
+            DemoAction::Cvd => root
+                .as_ref()
+                .is_some_and(|chart| chart.read(cx).cvd.is_some()),
             DemoAction::Cap => self.max_index != 0,
             DemoAction::Drawing(kind) => root
                 .as_ref()
@@ -3645,26 +3737,46 @@ impl InteractiveDemo {
                     .expect("workspace snapshots reference a live GPUI cell")
                     .chart
                     .clone();
-                let activation_chart = chart.clone();
+                let maximize_entity = cx.entity();
+                let release_entity = cx.entity();
                 let entity = cx.entity();
                 let id = *id;
                 div()
                     .relative()
                     .size_full()
-                    .on_mouse_down(MouseButton::Left, move |event, _, app| {
-                        entity.update(app, |demo, cx| {
-                            let drawing_armed = activation_chart
-                                .read(cx)
-                                .engine
-                                .active_drawing_tool()
-                                .is_some();
-                            if (event.modifiers.control || event.modifiers.platform)
-                                && !drawing_armed
+                    // Alt+click toggles this cell's maximize in a multi-chart layout. Capture
+                    // phase plus stop_propagation: the chart never sees the press, so the
+                    // shortcut cannot also pan, select, or place a drawing anchor.
+                    .capture_any_mouse_down(move |event, _, app| {
+                        let toggled = maximize_entity.update(app, |demo, cx| {
+                            // A new press always starts clean, even if the previous release
+                            // landed outside every chart cell.
+                            demo.swallow_mouse_up = false;
+                            if event.button != MouseButton::Left
+                                || !event.modifiers.alt
+                                || (demo.cells.len() < 2 && demo.maximized.is_none())
                             {
-                                demo.toggle_maximize(id);
-                            } else {
-                                demo.activate(id, cx);
+                                return false;
                             }
+                            demo.toggle_maximize(id);
+                            demo.swallow_mouse_up = true;
+                            cx.notify();
+                            true
+                        });
+                        if toggled {
+                            app.stop_propagation();
+                        }
+                    })
+                    .capture_any_mouse_up(move |_, _, app| {
+                        let swallow = release_entity
+                            .update(app, |demo, _| std::mem::take(&mut demo.swallow_mouse_up));
+                        if swallow {
+                            app.stop_propagation();
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_, _, app| {
+                        entity.update(app, |demo, cx| {
+                            demo.activate(id, cx);
                             cx.notify();
                         });
                     })
@@ -3897,6 +4009,7 @@ impl Render for InteractiveDemo {
                     b("volume overlay", DemoAction::Volume),
                     b("volume profile", DemoAction::VolumeProfile),
                     b("RSI(14) pane", DemoAction::Rsi),
+                    b("CVD pane", DemoAction::Cvd),
                 ],
             ),
             self.group(
@@ -4026,30 +4139,18 @@ impl Render for InteractiveDemo {
             },
             |chart| {
                 let probe = chart.read(cx);
-                // Live frame cost, so an open demo answers "how much FPS" without a finite probe.
-                let frame_ms = probe.last.total_nanos() as f64 / 1.0e6;
-                let fps = if frame_ms > 0.0 {
-                    1.0e3 / frame_ms
-                } else {
-                    0.0
-                };
                 (
                     shell_rgb(
                         &probe.engine.options.get().time_scale.border_color,
                         shell_rgb(theme_border(self.theme), 0xe5e5e5),
                     ),
-                    format!(
-                        "{}  ·  {}  ·  {frame_ms:.1} ms ({fps:.0} fps)",
-                        probe.legend, probe.click_status
-                    ),
+                    format!("{}  ·  {}", probe.legend, probe.click_status),
                 )
             },
         );
         let dpr = window.scale_factor();
-        let divider_line_width = (aeris_charts_core::style::BORDER_WIDTH as f32 * dpr)
-            .round()
-            .max(1.0)
-            / dpr;
+        let divider_line_width =
+            aeris_charts_core::style::border_width_device_px(f64::from(dpr)) as f32 / dpr;
         let chart = if let Some(id) = self.maximized {
             self.render_node(
                 &WorkspaceLayout::Cell { id },
@@ -4370,6 +4471,120 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Typing mode is engine-owned in GPUI: a new text drawing opens the session, committed
+    /// characters and editing keys reach it, shortcuts never type, and Enter commits.
+    #[test]
+    fn text_drawing_typing_mode_edits_through_the_engine_session() {
+        use gpui::{Keystroke, Modifiers};
+
+        let key = |key: &str, key_char: Option<&str>, modifiers: Modifiers| KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers,
+                key: key.into(),
+                key_char: key_char.map(str::to_string),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        let mut probe = Probe::new(32, Some(1));
+        let id = probe
+            .engine
+            .add_drawing(
+                DrawingKind::Text,
+                0,
+                vec![DrawingPoint {
+                    logical: 10.0,
+                    price: 100.0,
+                }],
+                None,
+            )
+            .expect("text drawing");
+        // Beginning an edit needs a settled chart: the editor layout converts the anchors.
+        probe.rebuild_with_measure(
+            1024.0,
+            640.0,
+            1.0,
+            |text, _bold| text.chars().count() as f64 * 7.0,
+            |text, _bold| text.chars().count() as f64 * 6.0,
+        );
+        probe.drawing_created(id);
+        assert_eq!(probe.engine.editing_drawing(), Some(id));
+
+        for c in ["H", "i", "!"] {
+            probe.on_text_edit_key(&key(c, Some(c), Modifiers::default()));
+        }
+        probe.on_text_edit_key(&key("left", None, Modifiers::default()));
+        probe.on_text_edit_key(&key("backspace", None, Modifiers::default()));
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        probe.on_text_edit_key(&key("z", Some("z"), ctrl));
+        let mut alt_gr = key("q", Some("@"), Modifiers { alt: true, ..ctrl });
+        alt_gr.prefer_character_input = true;
+        probe.on_text_edit_key(&alt_gr);
+        assert_eq!(probe.engine.drawing_text_edit(), Some((id, "H@!", 2)));
+
+        // Shift+Home selects to the start; typing replaces the selection.
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        probe.on_text_edit_key(&key("home", None, shift));
+        assert_eq!(probe.engine.drawing_text_edit_selection(), Some("H@"));
+        probe.on_text_edit_key(&key("W", Some("W"), shift));
+        assert_eq!(probe.engine.drawing_text_edit(), Some((id, "W!", 1)));
+        // Select-all, then a word-delete clears the selection.
+        probe.on_text_edit_key(&key("a", Some("a"), ctrl));
+        assert_eq!(probe.engine.drawing_text_edit_selection(), Some("W!"));
+        probe.on_text_edit_key(&key("right", None, Modifiers::default()));
+        assert_eq!(probe.engine.drawing_text_edit(), Some((id, "W!", 2)));
+
+        probe.on_text_edit_key(&key("enter", None, Modifiers::default()));
+        assert_eq!(probe.engine.editing_drawing(), None);
+        assert_eq!(probe.engine.drawing(id).unwrap().text, "W!");
+    }
+
+    /// Indicator panes share the content height with the primary pane. Adding one must not trip
+    /// the layout self-check, and CVD must be a real trade-derived study aligned to the candles.
+    #[test]
+    fn indicator_panes_rebuild_and_cvd_follows_the_candle_times() {
+        let mut probe = Probe::new(64, Some(1));
+        let rebuild = |probe: &mut Probe| {
+            probe.rebuild_with_measure(
+                1024.0,
+                640.0,
+                1.25,
+                |text, _| text.len() as f64 * 7.0,
+                |text, _| text.len() as f64 * 6.0,
+            );
+        };
+        rebuild(&mut probe);
+        probe.toggle_rsi();
+        rebuild(&mut probe);
+        probe.toggle_cvd();
+        rebuild(&mut probe);
+        assert_eq!(probe.engine.panes.len(), 3, "{}", probe.click_status);
+
+        let cvd = probe.cvd.expect("CVD installs from the demo trade tape");
+        let (times, ..) = probe
+            .engine
+            .data_layer()
+            .series_data(cvd.series_id)
+            .unwrap();
+        let candle_times = &probe.source_bars.times;
+        assert_eq!(times.len(), candle_times.len());
+        assert!(times
+            .iter()
+            .zip(candle_times)
+            .all(|(cvd, candle)| (*cvd as f64 - candle).abs() < 1e-9));
+
+        probe.toggle_cvd();
+        probe.toggle_rsi();
+        rebuild(&mut probe);
+        assert_eq!(probe.engine.panes.len(), 1);
+    }
+
     #[test]
     fn action_chip_hover_uses_click_cursor_and_control_input_target() {
         let mut probe = Probe::new(64, Some(1));
@@ -4459,20 +4674,11 @@ mod tests {
     }
 
     #[test]
-    fn volume_profile_demo_owns_sources_and_tracks_live_append() {
+    fn volume_profile_demo_owns_its_sources() {
         let mut probe = Probe::new_interactive(32);
         probe.toggle_volume_profile();
         let (id, volume) = probe.volume_profile.unwrap();
         probe.engine.time_scale.set_width(1024.0);
-        probe.engine.fit_content();
-        probe.engine.build_frame();
-        let before = probe
-            .engine
-            .volume_profile_indicator_snapshot(id)
-            .unwrap()
-            .profile
-            .total_volume;
-        probe.append_bar();
         probe.engine.fit_content();
         probe.engine.build_frame();
         assert!(
@@ -4482,33 +4688,12 @@ mod tests {
                 .unwrap()
                 .profile
                 .total_volume
-                > before
+                > 0.0
         );
         probe.toggle_volume_profile();
         assert!(probe.volume_profile.is_none());
         assert!(probe.engine.volume_profile_indicator_snapshot(id).is_none());
         assert!(!probe.engine.remove_series(volume));
-    }
-
-    #[test]
-    fn live_append_uses_the_latest_source_cadence() {
-        let mut probe = Probe::new_interactive(3);
-        let previous = *probe.source_bars.times.last().unwrap();
-        probe.append_bar();
-        assert_eq!(probe.source_bars.times.len(), 4);
-        assert_eq!(*probe.source_bars.times.last().unwrap(), previous + 3_600.0);
-
-        let mut hourly = vec![1_600_000_000.0, 1_600_003_600.0, 1_600_007_200.0];
-        let first_append = next_bar_timestamp(&hourly);
-        assert_eq!(first_append, 1_600_010_800.0);
-        hourly.push(first_append);
-        assert_eq!(next_bar_timestamp(&hourly), 1_600_014_400.0);
-
-        assert_eq!(
-            next_bar_timestamp(&[1_600_000_000.0, 1_600_000_060.0]),
-            1_600_000_120.0,
-            "the finite probe's minute cadence remains unchanged"
-        );
     }
 
     #[test]
@@ -4704,6 +4889,89 @@ mod tests {
         assert!(probe.drawing_template.text_italic);
     }
 
+    /// Moving from a trend line onto its `+ Add text` prompt keeps the prompt hovered with the
+    /// text cursor (the browser's engine-owned arbitration), so the label stays clickable.
+    #[test]
+    fn trend_label_prompt_stays_hovered_with_a_text_cursor() {
+        let mut probe = Probe::new(64, Some(1));
+        let rebuild = |probe: &mut Probe| {
+            probe.rebuild_with_measure(
+                1024.0,
+                640.0,
+                1.0,
+                |text, _bold| text.chars().count() as f64 * 7.0,
+                |text, _bold| text.chars().count() as f64 * 6.0,
+            );
+        };
+        rebuild(&mut probe);
+        probe.engine.clear_drawings();
+        probe.arm_drawing(DrawingKind::TrendLine);
+        probe.place_drawing_anchor(200.0, 300.0, DrawingModifiers::default());
+        let id = probe.place_drawing_anchor(600.0, 300.0, DrawingModifiers::default()) as u32;
+        rebuild(&mut probe);
+
+        // Right/top template: the prompt sits above the line near its right end, off the body.
+        let (x, y, _) = probe.engine.drawing_text_transform(id).unwrap();
+        let (label_x, label_y) = (x - 20.0, y);
+        assert!(probe.engine.hit_test_drawing(label_x, label_y).is_none());
+        probe.update_crosshair(label_x, label_y);
+        probe.update_cursor(label_x + probe.engine.pane_left, label_y);
+        assert_eq!(probe.engine.hovered_text(), Some(id));
+        assert_eq!(probe.cursor_style, CursorStyle::IBeam);
+        rebuild(&mut probe);
+        assert!(probe.frame.panes[0].main.iter().any(|prim| matches!(
+            prim,
+            Prim::RotatedText { text, .. } if text == "+ Add text"
+        )));
+    }
+
+    /// The native template matches the browser toolbar: a new trend line has no label (so it
+    /// shows the `+ Add text` prompt) and its label ink follows the line color; only the
+    /// standalone Text tool takes template content, and live style patches never touch labels.
+    #[test]
+    fn drawing_template_matches_the_browser_defaults() {
+        let template = DrawingTemplate::default();
+        let trend: serde_json::Value =
+            serde_json::from_str(&template.json(DrawingKind::TrendLine)).unwrap();
+        assert!(trend.get("text").is_none());
+        assert!(trend.get("text_color").is_none());
+        assert_eq!(trend["color"], "#168ef7");
+        assert_eq!(trend["text_size"], 14);
+
+        let mut probe = Probe::new(64, Some(1));
+        probe.rebuild_with_measure(
+            1024.0,
+            640.0,
+            1.0,
+            |text, _bold| text.chars().count() as f64 * 7.0,
+            |text, _bold| text.chars().count() as f64 * 6.0,
+        );
+        probe.engine.clear_drawings();
+        probe.arm_drawing(DrawingKind::TrendLine);
+        probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default());
+        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        assert!(id > 0);
+        let drawing = probe.engine.drawing(id as u32).unwrap();
+        assert!(drawing.text.is_empty(), "a new trend line starts unlabeled");
+        assert!(
+            drawing.text_color.is_none(),
+            "trend label ink follows the line"
+        );
+
+        // Typing a label, then restyling, keeps the label; resetting ink restores inheritance.
+        probe.engine.set_selected_drawing(Some(id as u32));
+        assert!(probe.engine.begin_drawing_text_edit(id as u32, true));
+        assert!(probe.engine.drawing_text_edit_insert("breakout"));
+        assert!(probe.engine.commit_drawing_text_edit());
+        probe.update_drawing_template(|t| t.text_color = Some("#ab47bc".into()));
+        probe.update_drawing_template(|t| t.width = 3);
+        probe.update_drawing_template(|t| t.text_color = None);
+        let drawing = probe.engine.drawing(id as u32).unwrap();
+        assert_eq!(drawing.text, "breakout");
+        assert_eq!(drawing.width, 3.0);
+        assert!(drawing.text_color.is_none());
+    }
+
     #[test]
     fn interactive_drawing_creation_commits_and_selects() {
         let mut probe = Probe::new(64, Some(1));
@@ -4764,6 +5032,8 @@ mod tests {
             |text, _bold| text.chars().count() as f64 * 6.0,
         );
         probe.engine.clear_drawings();
+        probe.update_crosshair_modifier(true, false);
+        assert!(!probe.engine.crosshair_ohlc_magnet);
         probe.arm_drawing(DrawingKind::TrendLine);
         assert!(!probe.engine.drawing_create_active());
 
@@ -4893,25 +5163,6 @@ mod semantic_regressions {
     }
 
     #[test]
-    fn interactive_metrics_are_bounded_while_finite_metrics_are_retained() {
-        let mut interactive = Probe::new(8, None);
-        for _ in 0..10_000 {
-            interactive.record_frame_metrics(GpuiFrameMetrics::default());
-        }
-        assert_eq!(interactive.painted, 10_000);
-        assert!(interactive.plan_nanos.is_empty());
-        assert!(interactive.paint_nanos.is_empty());
-        assert!(interactive.total_nanos.is_empty());
-
-        let mut finite = Probe::new(8, Some(2));
-        finite.record_frame_metrics(GpuiFrameMetrics::default());
-        finite.record_frame_metrics(GpuiFrameMetrics::default());
-        assert_eq!(finite.plan_nanos.len(), 2);
-        assert_eq!(finite.paint_nanos.len(), 2);
-        assert_eq!(finite.total_nanos.len(), 2);
-    }
-
-    #[test]
     fn idle_interactive_probe_stops_requesting_frames() {
         let mut interactive = Probe::new(8, None);
         assert!(!interactive.needs_animation_frame());
@@ -5005,21 +5256,6 @@ mod semantic_regressions {
             .series
             .iter()
             .all(|series| series.id != state.series_id || series.removed));
-    }
-
-    #[test]
-    fn finite_live_append_occurs_once_per_epoch_before_the_frame_budget() {
-        let mut probe = Probe::new(8, Some(120));
-        probe.painted = 59;
-        probe.maybe_append_live_bar();
-        assert_eq!(probe.appended, 0);
-        probe.painted = 60;
-        probe.maybe_append_live_bar();
-        probe.maybe_append_live_bar();
-        assert_eq!(probe.appended, 1);
-        probe.painted = 120;
-        probe.maybe_append_live_bar();
-        assert_eq!(probe.appended, 1);
     }
 
     #[test]

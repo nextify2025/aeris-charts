@@ -80,7 +80,7 @@ test("design tokens and chart theme projections match the supplied light/dark pa
     primary: "#0091ff",
     primary_foreground: "#ffffff",
     button_fill: "#333333",
-    border_width: "0.5px",
+    border_width: "1px",
   });
   expect(light.palette).toMatchObject({
     background: "#ffffff",
@@ -113,7 +113,7 @@ test("design tokens and chart theme projections match the supplied light/dark pa
     primary: "#0091ff",
     primary_foreground: "#ffffff",
     button_fill: "#f5f5f5",
-    border_width: "0.5px",
+    border_width: "1px",
   });
   expect(dark.palette).toMatchObject({
     background: "#1f1f1f",
@@ -268,7 +268,7 @@ test("demo shell is responsive, icon-led, and has no horizontal control ribbon",
 test("canonical series stay in Series while feature lab contains only composable scenarios", async ({ page }) => {
   await open_demo(page);
   await expect(page.locator("#series_grid .feature-card")).toHaveCount(11);
-  await expect(page.locator("#feature_grid .feature-card")).toHaveCount(9);
+  await expect(page.locator("#feature_grid .feature-card")).toHaveCount(10);
   expect(await page.locator('input[name="series"]').evaluateAll((radios) => radios.map((radio) => radio.value))).toEqual([
     "candlestick", "hollow_candlestick", "bar", "line", "line_markers", "area", "histogram", "baseline",
   ]);

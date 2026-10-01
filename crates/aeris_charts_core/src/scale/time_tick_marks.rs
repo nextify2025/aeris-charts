@@ -276,13 +276,21 @@ impl TimeTickMarks {
     /// Full rebuild from per-point weights (incremental `firstChangedPointIndex` variant
     /// comes with the data layer).
     pub fn set_weights(&mut self, weights: &[u8]) {
+        self.set_weights_from(0, weights);
+    }
+
+    /// Full rebuild from per-point weights whose first logical index may be negative.
+    pub fn set_weights_from(&mut self, start_index: TimePointIndex, weights: &[u8]) {
         self.marks_by_weight.clear();
         self.cache = None;
         for (index, &weight) in weights.iter().enumerate() {
-            self.marks_by_weight
-                .entry(weight)
-                .or_default()
-                .push(index as TimePointIndex);
+            let Ok(index) = TimePointIndex::try_from(index) else {
+                break;
+            };
+            let Some(index) = start_index.checked_add(index) else {
+                break;
+            };
+            self.marks_by_weight.entry(weight).or_default().push(index);
         }
     }
 
@@ -415,6 +423,28 @@ mod tests {
             assert_eq!(civil_from_timestamp(days * 86_400), (year, month, day));
         }
         assert_eq!(days_from_civil(2021, 2, 29), None);
+    }
+
+    #[test]
+    fn selected_time_zone_controls_calendar_tick_boundaries() {
+        use crate::time_zone::ChartTimeZone;
+        let new_york = ExchangeTime::new(
+            ChartTimeZone::parse("America/New_York")
+                .unwrap()
+                .offset_schedule()
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        // 2026-01-02 04:59 -> 05:00 UTC is 2026-01-01 23:59 -> 2026-01-02 00:00 in New York.
+        assert_eq!(
+            weight_by_time_in(1_767_330_000, 1_767_329_940, &new_york),
+            TickMarkWeight::Day
+        );
+        assert_eq!(
+            weight_by_time(1_767_330_000, 1_767_329_940),
+            TickMarkWeight::Hour1
+        );
     }
 
     #[test]
@@ -854,6 +884,17 @@ mod tests {
         marks.set_weights(&[50]);
         marks.append_weights(1, &[50, 50]);
         let built = marks.build(10.0, 10.0);
+        assert!(built.iter().any(|mark| mark.index == 0));
+        assert!(built.iter().any(|mark| mark.index == 1));
+    }
+
+    #[test]
+    fn full_rebuild_preserves_negative_projected_indices() {
+        let mut marks = TimeTickMarks::new();
+        marks.set_weights_from(-2, &[70, 60, 50, 40]);
+        let built = marks.build(100.0, 1.0);
+        assert!(built.iter().any(|mark| mark.index == -2));
+        assert!(built.iter().any(|mark| mark.index == -1));
         assert!(built.iter().any(|mark| mark.index == 0));
         assert!(built.iter().any(|mark| mark.index == 1));
     }

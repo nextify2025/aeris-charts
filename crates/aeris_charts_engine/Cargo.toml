@@ -5,18 +5,15 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
 publish.workspace = true
 description = "Headless chart model and frame-production state for Aeris Charts"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-aeris_charts_core = { path = "../aeris_charts_core", version = "0.3.0" }
-aeris_charts_indicators = { path = "../aeris_charts_indicators", version = "0.3.0" }
-aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
+aeris_charts_core = { path = "../aeris_charts_core" }
+aeris_charts_indicators = { path = "../aeris_charts_indicators" }
+aeris_charts_render = { path = "../aeris_charts_render" }
 
 [lints]
 workspace = true

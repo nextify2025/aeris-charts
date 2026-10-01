@@ -511,14 +511,32 @@ pub(crate) struct IndicatorChange {
     pub(crate) full_replace: bool,
 }
 
-/// Stretch factor of the pane a separate-pane indicator creates for itself (the public reference
-/// oscillators stack as a shorter strip under the price pane).
-pub(crate) const OSCILLATOR_PANE_STRETCH: f64 = 0.3;
-
 pub const EMA_RIBBON_DEFAULT_PERIODS: [usize; aeris_charts_indicators::MAX_OUTPUTS] =
     [5, 10, 20, 50, 200];
 pub const EMA_RIBBON_DEFAULT_COLORS: [&str; aeris_charts_indicators::MAX_OUTPUTS] =
     ["#335cff", "#FF9800", "#7d52f4", "#fb4ba3", "#fb3748"];
+
+/// Chart-wide chrome policy for engine-owned indicator bindings.
+///
+/// The engine retains this policy so newly-created and restored bindings cannot silently diverge
+/// from existing outputs. Hosts choose the preference; they do not walk output series to enforce
+/// it themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndicatorChromeOptions {
+    pub name_labels_visible: bool,
+    pub value_labels_visible: bool,
+    pub price_lines_visible: bool,
+}
+
+impl Default for IndicatorChromeOptions {
+    fn default() -> Self {
+        Self {
+            name_labels_visible: true,
+            value_labels_visible: true,
+            price_lines_visible: true,
+        }
+    }
+}
 
 /// MACD histogram four-state palette: strong when moving away from zero, weak when falling
 /// back toward it (industry-standard). Packed `0xRRGGBBAA`.
@@ -594,6 +612,20 @@ pub struct IndicatorParameters {
     pub kdj_seed: Option<aeris_charts_indicators::KdjSeed>,
 }
 
+fn indicator_default_line_width(kind: &IndicatorKind) -> f64 {
+    if matches!(
+        kind,
+        IndicatorKind::Ema { .. }
+            | IndicatorKind::Dema { .. }
+            | IndicatorKind::Tema { .. }
+            | IndicatorKind::EmaRibbon { .. }
+    ) {
+        1.0
+    } else {
+        2.0
+    }
+}
+
 impl ChartEngine {
     pub(crate) fn reset_indicator_output_styles_to_defaults(&mut self) {
         let outputs = self
@@ -608,7 +640,7 @@ impl ChartEngine {
                 };
                 series.countdown_visible = false;
                 series.title_visible = true;
-                series.line_width = Some(2.0);
+                series.line_width = Some(indicator_default_line_width(&kind));
                 series.line_color = indicator_output_color(&kind, output_index).map(str::to_string);
             }
         }
@@ -676,6 +708,101 @@ impl ChartEngine {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Whether the chart currently owns at least one live native indicator binding.
+    #[must_use]
+    pub fn has_indicator_bindings(&self) -> bool {
+        !self.indicators.is_empty()
+    }
+
+    /// Remove every native indicator binding as one engine-owned operation.
+    pub fn clear_indicator_bindings(&mut self) -> bool {
+        let binding_ids = self
+            .indicators
+            .iter()
+            .filter_map(|binding| binding.outputs.first().copied())
+            .collect::<Vec<_>>();
+        if binding_ids.is_empty() {
+            return false;
+        }
+        for binding_id in binding_ids {
+            let _ = self.remove_indicator_binding(binding_id);
+        }
+        true
+    }
+
+    /// Current chart-wide chrome policy inherited by every engine-owned indicator output.
+    #[must_use]
+    pub const fn indicator_chrome_options(&self) -> IndicatorChromeOptions {
+        self.indicator_chrome
+    }
+
+    /// Apply one chart-wide indicator chrome policy to current and future bindings.
+    pub fn set_indicator_chrome_options(&mut self, options: IndicatorChromeOptions) -> bool {
+        let mut changed = self.indicator_chrome != options;
+        self.indicator_chrome = options;
+        let outputs = self
+            .indicators
+            .iter()
+            .flat_map(|binding| binding.outputs.iter().copied())
+            .collect::<Vec<_>>();
+        for output in outputs {
+            if let Some(series) = self.series_entry_mut(output) {
+                changed |= series.title_visible != options.name_labels_visible
+                    || series.last_value_visible != options.value_labels_visible
+                    || series.price_line_visible != options.price_lines_visible;
+                series.title_visible = options.name_labels_visible;
+                series.last_value_visible = options.value_labels_visible;
+                series.price_line_visible = options.price_lines_visible;
+            }
+        }
+        changed |= self.apply_indicator_chrome_to_external_studies(options);
+        changed |= self.apply_indicator_chrome_to_trade_studies(options);
+        if changed {
+            self.invalidate_frame_layout_and_axis();
+        }
+        changed
+    }
+
+    /// Set every output in one binding visible or hidden as one engine-owned operation.
+    pub fn set_indicator_binding_visible(&mut self, binding_id: SeriesId, visible: bool) -> bool {
+        let Some(outputs) = self
+            .indicators
+            .iter()
+            .find(|binding| binding.outputs.first() == Some(&binding_id))
+            .map(|binding| binding.outputs.clone())
+        else {
+            return false;
+        };
+        let changed = outputs.iter().any(|&output| {
+            self.series_entry(output)
+                .is_some_and(|series| series.visible != visible)
+        });
+        for output in outputs {
+            self.set_series_visible(output, visible);
+        }
+        changed
+    }
+
+    /// Remove one complete indicator binding by its stable binding identity.
+    pub fn remove_indicator_binding(&mut self, binding_id: SeriesId) -> bool {
+        if !self
+            .indicators
+            .iter()
+            .any(|binding| binding.outputs.first() == Some(&binding_id))
+        {
+            return false;
+        }
+        self.remove_series(binding_id)
+    }
+
+    /// Remove the complete native indicator binding that owns one output series.
+    pub fn remove_indicator_for_series(&mut self, series_id: SeriesId) -> bool {
+        let Some(binding_id) = self.indicator_binding_id(series_id) else {
+            return false;
+        };
+        self.remove_indicator_binding(binding_id)
     }
 
     /// Replace one output's presentation atomically while retaining the binding and output id.
@@ -1926,10 +2053,10 @@ impl ChartEngine {
             return;
         };
         if let Some(p) = self.panes.get_mut(pane) {
-            p.stretch_factor = OSCILLATOR_PANE_STRETCH;
+            p.stretch_factor = crate::SEPARATE_INDICATOR_PANE_STRETCH;
         }
         for &id in ids {
-            self.set_series_pane(id, pane, OSCILLATOR_PANE_STRETCH);
+            self.set_series_pane(id, pane, crate::SEPARATE_INDICATOR_PANE_STRETCH);
         }
     }
 
@@ -2129,14 +2256,16 @@ impl ChartEngine {
         // Indicator chrome defaults: no candle-close countdown (theirs is a line value, not a
         // bar close), the auto-generated name chip shows (platforms override the name through
         // the series `title` option — custom-script indicators will set their own), and the
-        // line draws at 2px without a last-price pulse — every default is overridable through
-        // the ordinary series options.
+        // line draws at its kind's default width without a last-price pulse — every default is
+        // overridable through the ordinary series options.
         for (output_index, &id) in ids.iter().enumerate() {
             if let Some(s) = self.series.iter_mut().find(|s| s.id == id) {
                 s.countdown_visible = false;
-                s.title_visible = true;
+                s.title_visible = self.indicator_chrome.name_labels_visible;
+                s.last_value_visible = self.indicator_chrome.value_labels_visible;
+                s.price_line_visible = self.indicator_chrome.price_lines_visible;
                 s.title = indicator_output_title(&kind, output_index);
-                s.line_width = Some(2.0);
+                s.line_width = Some(indicator_default_line_width(&kind));
                 // The last-price pulse marks the traded series, never a derived study line.
                 s.last_price_animation = false;
                 if output_index == 0 {

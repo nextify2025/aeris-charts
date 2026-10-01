@@ -98,7 +98,7 @@ pub fn install_trading_fixture(chart: &mut ChartEngine) {
                 quantity: 5.0,
                 order_id: Some(OrderId::new("demo-partial").unwrap()),
                 position_id: Some(position_id),
-                marker_shape: ExecutionMarkerShape::Circle,
+                marker_shape: ExecutionMarkerShape::Arrow,
                 size_by_quantity: false,
             }],
             round_trips: Vec::new(),

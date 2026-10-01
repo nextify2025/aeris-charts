@@ -840,7 +840,7 @@ mod tests {
         boundaries: Vec<ResampleBoundary>,
     ) -> Resampled {
         let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
-        chart.set_time_zone(zone.clone());
+        chart.set_exchange_offsets(zone.clone());
         let source = chart.add_series(SeriesKind::Candlestick);
         let volume_series = chart.add_series(SeriesKind::Histogram);
         let seconds = times.iter().map(|&time| time as f64).collect::<Vec<_>>();

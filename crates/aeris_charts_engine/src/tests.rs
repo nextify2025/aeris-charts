@@ -991,6 +991,89 @@ fn reset_view_restores_time_defaults_and_reenables_autoscale() {
 }
 
 #[test]
+fn chart_time_zone_rebuilds_tick_weights_and_formats_live_clock() {
+    let mut chart = ChartEngine::new(300.0, 200.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_767_329_940.0, 1_767_330_000.0],
+            &[100.0, 101.0],
+            &[101.0, 102.0],
+            &[99.0, 100.0],
+            &[100.5, 101.5],
+        )
+        .unwrap();
+    assert_eq!(chart.time_zone_id(), DEFAULT_TIME_ZONE);
+    assert!(chart.set_time_zone("America/New_York").unwrap());
+    assert_eq!(chart.time_zone_id(), "America/New_York");
+    let marks = chart.time_marks(1.0);
+    assert!(marks.iter().any(|&(index, weight)| {
+        index == 1 && weight == aeris_charts_core::scale::time_tick_marks::TickMarkWeight::Day as u8
+    }));
+    assert_eq!(
+        chart.time_zone_clock_text(1_784_116_800, true),
+        "08:00:00 EDT"
+    );
+    assert!(!chart.set_time_zone("America/New_York").unwrap());
+    assert!(chart.set_time_zone("Mars/Olympus_Mons").is_err());
+}
+
+#[test]
+fn future_time_projection_labels_empty_space_without_creating_data() {
+    let mut chart = ChartEngine::new(600.0, 300.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_000.0, 1_060.0, 1_120.0],
+            &[100.0, 101.0, 102.0],
+            &[101.0, 102.0, 103.0],
+            &[99.0, 100.0, 101.0],
+            &[100.5, 101.5, 102.5],
+        )
+        .unwrap();
+    let canonical_len = chart.data_layer().merged_times().len();
+    let base_index = chart.time_scale.base_index();
+
+    assert!(chart.set_future_time_projection(Some(60), 32));
+    assert_eq!(chart.axis_time_key_at(3), Some(1_180));
+    assert_eq!(chart.axis_time_key_at(34), Some(3_040));
+    assert_eq!(chart.axis_time_key_at(35), None);
+    assert_eq!(chart.data_layer().merged_times().len(), canonical_len);
+    assert_eq!(chart.time_scale.base_index(), base_index);
+    assert_eq!(chart.time_scale.points_len(), canonical_len);
+    assert!(chart
+        .time_marks(1.0)
+        .iter()
+        .any(|(index, _)| *index > base_index));
+}
+
+#[test]
+fn past_time_projection_labels_left_whitespace_without_creating_data() {
+    let mut chart = ChartEngine::new(600.0, 300.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_000.0, 1_060.0, 1_120.0],
+            &[100.0, 101.0, 102.0],
+            &[101.0, 102.0, 103.0],
+            &[99.0, 100.0, 101.0],
+            &[100.5, 101.5, 102.5],
+        )
+        .unwrap();
+    let canonical_len = chart.data_layer().merged_times().len();
+    let base_index = chart.time_scale.base_index();
+
+    assert!(chart.set_past_time_projection(Some(60), 32));
+    assert_eq!(chart.axis_time_key_at_logical(-1), Some(940));
+    assert_eq!(chart.axis_time_key_at_logical(-32), Some(-920));
+    assert_eq!(chart.axis_time_key_at_logical(-33), None);
+    assert_eq!(chart.data_layer().merged_times().len(), canonical_len);
+    assert_eq!(chart.time_scale.base_index(), base_index);
+    assert_eq!(chart.time_scale.points_len(), canonical_len);
+    assert!(chart.time_marks(1.0).iter().any(|(index, _)| *index < 0));
+}
+
+#[test]
 fn reset_style_to_defaults_preserves_runtime_view_and_semantic_state() {
     let mut chart = ChartEngine::new(640.0, 400.0, 1.0);
     chart
@@ -1585,6 +1668,40 @@ fn indicators_are_engine_owned_series() {
     chart.update_series_bar(0, 5.0, [5.0, 6.0, 4.0, 6.0]);
     let ema_rows = chart.data.series_data(ema).unwrap();
     assert!((ema_rows.1[3].last().copied().unwrap() - 5.388888888888889).abs() < 1e-12);
+}
+
+#[test]
+fn ema_family_defaults_to_one_pixel_and_respects_explicit_widths() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..30).map(|i| i as f64).collect::<Vec<_>>();
+    let values = times.iter().map(|v| v + 100.0).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+
+    let sma = chart.add_sma(0, 5).unwrap();
+    let mut ema_outputs = vec![
+        chart.add_ema(0, 5).unwrap(),
+        chart.add_dema(0, 5).unwrap(),
+        chart.add_tema(0, 5).unwrap(),
+    ];
+    ema_outputs.extend(chart.add_ema_ribbon(0, [2, 3, 5, 8, 13]));
+    assert_eq!(chart.series_entry(sma).unwrap().line_width, Some(2.0));
+    for &id in &ema_outputs {
+        assert_eq!(chart.series_entry(id).unwrap().line_width, Some(1.0));
+    }
+
+    let customized = ema_outputs[0];
+    assert!(chart.series_apply_options_json(customized, r#"{"line_width":3}"#));
+    assert_eq!(
+        chart.series_entry(customized).unwrap().line_width,
+        Some(3.0)
+    );
+    chart.reset_style_to_defaults();
+    for &id in &ema_outputs {
+        assert_eq!(chart.series_entry(id).unwrap().line_width, Some(1.0));
+    }
+    assert_eq!(chart.series_entry(sma).unwrap().line_width, Some(2.0));
 }
 
 #[test]
@@ -3690,6 +3807,133 @@ fn indicator_outputs_drop_the_countdown_show_the_name_chip_and_default_to_2px() 
     assert_eq!(title_of(atr), "ATR 2");
     assert_eq!(title_of(vwap), "VWAP");
     assert_eq!(title_of(wma), "WMA 3");
+}
+
+#[test]
+fn indicator_binding_owns_group_chrome_visibility_and_removal() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [1.0, 2.0, 3.0, 4.0, 5.0];
+    chart
+        .set_series_data(
+            0,
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &values,
+            &values,
+            &values,
+            &values,
+        )
+        .unwrap();
+    let chrome = IndicatorChromeOptions {
+        name_labels_visible: false,
+        value_labels_visible: false,
+        price_lines_visible: false,
+    };
+    assert!(chart.set_indicator_chrome_options(chrome));
+    let outputs = chart.add_macd(0, 2, 3, 2);
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(chart.indicator_chrome_options(), chrome);
+    assert!(outputs.iter().all(|output| {
+        chart.series_entry(*output).is_some_and(|series| {
+            !series.title_visible && !series.last_value_visible && !series.price_line_visible
+        })
+    }));
+
+    chart
+        .series_entry_mut(outputs[0])
+        .expect("MACD output exists")
+        .title_visible = true;
+    assert!(
+        chart.set_indicator_chrome_options(chrome),
+        "reapplying the retained policy must repair a drifted output"
+    );
+    assert!(
+        !chart
+            .series_entry(outputs[0])
+            .expect("MACD output exists")
+            .title_visible
+    );
+
+    assert!(chart.set_indicator_binding_visible(outputs[0], false));
+    assert!(outputs.iter().all(|output| {
+        chart
+            .series_entry(*output)
+            .is_some_and(|series| !series.visible)
+    }));
+    assert!(chart.remove_indicator_for_series(outputs[1]));
+    assert!(outputs
+        .iter()
+        .all(|output| chart.series_entry(*output).is_none()));
+    assert!(chart.indicator_bindings().is_empty());
+    assert!(!chart.has_indicator_bindings());
+
+    let sma = chart.add_sma(0, 2).expect("valid SMA");
+    let rsi = chart.add_rsi(0, 2).expect("valid RSI");
+    assert!(chart.has_indicator_bindings());
+    assert!(chart.clear_indicator_bindings());
+    assert!(!chart.has_indicator_bindings());
+    assert!(chart.series_entry(sma).is_none());
+    assert!(chart.series_entry(rsi).is_none());
+    assert!(!chart.clear_indicator_bindings());
+}
+
+#[test]
+fn price_scale_series_operations_are_typed_and_atomic() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [10.0, 11.0, 12.0];
+    chart
+        .set_series_data(0, &[1.0, 2.0, 3.0], &values, &values, &values, &values)
+        .unwrap();
+    let second = chart.add_series(SeriesKind::Line);
+    chart
+        .set_series_data(second, &[1.0, 2.0, 3.0], &values, &values, &values, &values)
+        .unwrap();
+    chart.set_series_price_scale(second, PriceScaleTarget::Left);
+
+    assert_eq!(
+        chart
+            .primary_series_on_price_scale(0, PriceScaleTarget::Right)
+            .map(|series| series.series_id),
+        Some(0)
+    );
+    assert_eq!(
+        chart
+            .primary_series_on_price_scale(0, PriceScaleTarget::Left)
+            .map(|series| series.series_id),
+        Some(second)
+    );
+    assert_eq!(chart.series_visible(second), Some(true));
+    let align = chart
+        .price_scale_for(0, PriceScaleTarget::Right)
+        .unwrap()
+        .options()
+        .align_labels;
+    assert!(chart.toggle_price_scale_align_labels(0, PriceScaleTarget::Right));
+    assert_eq!(
+        chart
+            .price_scale_for(0, PriceScaleTarget::Right)
+            .unwrap()
+            .options()
+            .align_labels,
+        !align
+    );
+    assert!(chart.toggle_series_chrome(0, SeriesChromeFlag::PriceLine));
+    assert!(!chart.series_entry(0).unwrap().price_line_visible);
+
+    assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 4, 0.0001));
+    assert_eq!(chart.series_entry(0).unwrap().price_format.precision, 4);
+    assert_eq!(
+        chart.series_entry(second).unwrap().price_format.precision,
+        2
+    );
+    assert!(!chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 4, f64::NAN));
+
+    assert!(chart.rebind_price_scale_series(0, PriceScaleTarget::Right, PriceScaleTarget::Left));
+    assert_eq!(
+        chart.series_entry(0).unwrap().price_scale_target,
+        PriceScaleTarget::Left
+    );
+    assert!(!chart.price_scale_visible_for(0, PriceScaleTarget::Right));
+    assert!(chart.price_scale_visible_for(0, PriceScaleTarget::Left));
 }
 
 #[test]
@@ -8708,7 +8952,7 @@ fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
     let resting = prims
         .iter()
         .filter_map(|p| match p {
-            Prim::Rect { rect, .. } if rect.y == separator_y && rect.h == 1 => Some(*rect),
+            Prim::Rect { rect, .. } if rect.y == separator_y && rect.h == 2 => Some(*rect),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -8732,7 +8976,7 @@ fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
     let hover = prims
         .iter()
         .find_map(|p| match p {
-            Prim::Rect { rect, .. } if rect.h == 9 => Some(*rect),
+            Prim::Rect { rect, .. } if rect.h == 10 => Some(*rect),
             _ => None,
         })
         .expect("the hover band");
@@ -8742,10 +8986,10 @@ fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
 }
 
 #[test]
-fn axis_and_pane_borders_project_the_canonical_half_pixel_width() {
+fn axis_borders_are_one_css_px_and_pane_separators_two() {
     use aeris_charts_render::draw_list::Prim;
 
-    for dpr in [1.0_f64, 1.5, 2.0, 3.0] {
+    for dpr in [1.0_f64, 1.25, 1.5, 2.0, 3.0] {
         let mut chart = chart_with_indicator_pane();
         chart.dpr = dpr;
         chart.recompute_layout_with_measure(
@@ -8768,6 +9012,12 @@ fn axis_and_pane_borders_project_the_canonical_half_pixel_width() {
         let pane_bottom = (chart.pane_h * dpr).round() as i32;
         let bitmap_w = (chart.css_width * dpr).round().max(1.0) as i32;
         let separator_y = (axis.separators[0] * dpr).round() as i32;
+        let separator_h = (crate::PANE_SEPARATOR * dpr).round().max(1.0) as i32;
+        assert_eq!(expected, dpr.floor() as i32, "1 CSS px border at dpr {dpr}");
+        assert!(
+            (separator_h - (2.0 * dpr) as i32).abs() <= 1,
+            "2 CSS px separator at dpr {dpr}"
+        );
 
         assert!(
             prims.iter().any(|p| matches!(
@@ -8798,9 +9048,9 @@ fn axis_and_pane_borders_project_the_canonical_half_pixel_width() {
                     if rect.x == 0
                         && rect.y == separator_y
                         && rect.w == bitmap_w
-                        && rect.h == expected
+                        && rect.h == separator_h
             )),
-            "pane separator must use {expected} device px at dpr {dpr}"
+            "pane separator must use {separator_h} device px at dpr {dpr}"
         );
     }
 }
@@ -8863,6 +9113,47 @@ fn crosshair_time_text_is_placed_by_the_stable_sample_not_its_own_ink() {
         let expected = ((label.y + SAMPLE_CORRECTION * label.font_scale) * dpr) as f32;
         assert_eq!(y, expected, "text y follows the Apr0 sample at dpr {dpr}");
     }
+}
+
+#[test]
+fn pane_separators_have_identical_device_thickness_at_fractional_dpr() {
+    use aeris_charts_render::draw_list::Prim;
+
+    let mut chart = chart_with_indicator_pane();
+    let extra = chart.add_series(SeriesKind::Line);
+    chart.set_series_pane(extra, 2, 1.0);
+    chart.dpr = 1.25;
+    chart.recompute_layout_with_measure(
+        true,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 5.0,
+    );
+    chart.build_frame();
+
+    let axis = chart.build_axis_frame(
+        80.0,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 5.0,
+    );
+    assert_eq!(axis.separators.len(), 2);
+    let mut prims = Vec::new();
+    chart.build_axis_primitives_into(&axis, &mut prims, |_| 0.0);
+    let expected_height = (crate::PANE_SEPARATOR * chart.dpr).round() as i32;
+    let heights = axis
+        .separators
+        .iter()
+        .map(|separator| {
+            let y = (separator * chart.dpr).round() as i32;
+            prims
+                .iter()
+                .find_map(|primitive| match primitive {
+                    Prim::Rect { rect, .. } if rect.x == 0 && rect.y == y => Some(rect.h),
+                    _ => None,
+                })
+                .expect("full-width separator primitive")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(heights, vec![expected_height; 2]);
 }
 
 /// A hollow candle's chrome follows what is painted, not the invisible body.

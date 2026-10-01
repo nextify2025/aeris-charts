@@ -432,6 +432,8 @@ pub enum DrawingKindOptions {
     },
     Position {
         levels: Vec<DrawingLevel>,
+        account_size: f64,
+        risk_percent: f64,
     },
     Generic,
     // B8: lines — begin
@@ -807,6 +809,21 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
             serde_json::json!("right"),
         ),
     ];
+    if matches!(kind, DrawingKind::LongPosition | DrawingKind::ShortPosition) {
+        for (name, default, min, max) in [
+            ("position_account_size", 1000.0, f64::MIN_POSITIVE, 1e15),
+            ("position_risk_percent", 25.0, 0.0, 100.0),
+        ] {
+            let mut property = descriptor(
+                name,
+                DrawingPropertyType::Number,
+                serde_json::json!(default),
+            );
+            property.min = Some(min);
+            property.max = Some(max);
+            properties.push(property);
+        }
+    }
     for property in &mut properties {
         if property.name == "style" {
             property.enum_values = ["solid", "dotted", "dashed", "large_dashed", "sparse_dotted"]

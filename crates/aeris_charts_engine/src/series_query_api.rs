@@ -6,6 +6,42 @@ use super::*;
 const MAX_AREA_BRUSH_RANGES: usize = 64;
 
 impl ChartEngine {
+    /// Apply one standard price format to every live series sharing a pane price scale. A price-band
+    /// tick ladder already installed on a series is kept, as with the price-format JSON: only a
+    /// `tick_ladder: null` patch clears it.
+    pub fn set_price_format_for_scale(
+        &mut self,
+        pane: usize,
+        target: PriceScaleTarget,
+        precision: u32,
+        min_move: f64,
+    ) -> bool {
+        if !min_move.is_finite() || min_move <= 0.0 {
+            return false;
+        }
+        let ids = self
+            .series
+            .iter()
+            .filter(|series| {
+                !series.removed && series.pane_index == pane && series.price_scale_target == target
+            })
+            .map(|series| series.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return false;
+        }
+        for id in ids {
+            if let Some(series) = self.series_entry_mut(id) {
+                series.price_format.kind = PriceFormatKind::Price;
+                series.price_format.precision = precision.min(15);
+                series.price_format.min_move = min_move;
+                series.price_format.formatter = None;
+            }
+        }
+        self.invalidate_frame_all();
+        true
+    }
+
     /// Install transient brush styling on an ordinary Area series. Canonical data and all ordinary
     /// series behavior stay on the built-in Area path; an empty/absent interaction clears this state.
     pub fn set_area_brush_state(

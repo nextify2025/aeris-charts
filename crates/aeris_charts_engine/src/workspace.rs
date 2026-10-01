@@ -65,6 +65,55 @@ impl WorkspaceLayout {
             WorkspaceLayout::Split { b, .. } => b.last_leaf(),
         }
     }
+
+    /// Stable leaf identities in visual traversal order.
+    #[must_use]
+    pub fn leaf_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        self.cell_ids(&mut ids);
+        ids
+    }
+
+    /// Ratio owned by the split at one adjacent leaf boundary.
+    #[must_use]
+    pub fn boundary_ratio(&self, left_id: u64, right_id: u64) -> Option<f64> {
+        match self {
+            Self::Cell { .. } => None,
+            Self::Split { ratio, a, b, .. } => {
+                if a.last_leaf() == left_id && b.first_leaf() == right_id {
+                    Some(*ratio)
+                } else {
+                    a.boundary_ratio(left_id, right_id)
+                        .or_else(|| b.boundary_ratio(left_id, right_id))
+                }
+            }
+        }
+    }
+
+    /// Normalized 10,000-point leaf weights for legacy persistence migration.
+    #[must_use]
+    pub fn basis_points(&self) -> Vec<(u64, u32)> {
+        let mut weighted = Vec::new();
+        collect_weights(self, 1.0, &mut weighted);
+        let mut remaining = 10_000_u32;
+        let last = weighted.len().saturating_sub(1);
+        weighted
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, weight))| {
+                let basis = if index == last {
+                    remaining
+                } else {
+                    let remaining_leaves = u32::try_from(last.saturating_sub(index)).unwrap_or(0);
+                    let rounded = (weight * 10_000.0).round().clamp(1.0, 10_000.0) as u32;
+                    let basis = rounded.min(remaining.saturating_sub(remaining_leaves));
+                    remaining = remaining.saturating_sub(basis);
+                    basis
+                };
+                (id, basis)
+            })
+            .collect()
+    }
 }
 
 /// Why a split/remove was rejected (the host maps these to its own UI affordances).
@@ -99,15 +148,34 @@ impl Workspace {
         }
     }
 
+    /// A workspace rooted at a host-issued stable identity.
+    pub fn new_with_id(id: u64) -> Result<Self, WorkspaceError> {
+        if id == 0 {
+            return Err(WorkspaceError::InvalidLayout);
+        }
+        Ok(Self {
+            root: WorkspaceLayout::Cell { id },
+            next_id: id.checked_add(1).ok_or(WorkspaceError::InvalidLayout)?,
+        })
+    }
+
+    /// Restore a typed stable-identity layout without replaying mutations in the host.
+    pub fn from_layout(root: &WorkspaceLayout) -> Result<Self, WorkspaceError> {
+        let mut ids = std::collections::HashSet::new();
+        let max_id = validate_layout(root, 0, &mut ids)?;
+        let next_id = max_id.checked_add(1).ok_or(WorkspaceError::InvalidLayout)?;
+        Ok(Self {
+            root: root.clone(),
+            next_id,
+        })
+    }
+
     /// Restore only the generic split topology and stable cell identities. Chart state remains
     /// independently owned by each host-created chart and is composed by the browser grid.
     pub fn from_layout_json(json: &str) -> Result<Self, WorkspaceError> {
         let root = serde_json::from_str::<WorkspaceLayout>(json)
             .map_err(|_| WorkspaceError::InvalidLayout)?;
-        let mut ids = std::collections::HashSet::new();
-        let max_id = validate_layout(&root, 0, &mut ids)?;
-        let next_id = max_id.checked_add(1).ok_or(WorkspaceError::InvalidLayout)?;
-        Ok(Self { root, next_id })
+        Self::from_layout(&root)
     }
 
     /// Atomically replace this workspace's topology with a validated persisted layout.
@@ -127,20 +195,36 @@ impl Workspace {
         self.cell_ids().len()
     }
 
+    /// The identity the next [`Self::split`] will issue, so a host with a narrower id space can
+    /// refuse the split before mutating the layout.
+    pub fn next_cell_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Split a cell in two; the existing chart keeps its state in the first half and the new
     /// cell (returned id) fills the second. `NotFound` for an unknown cell.
     pub fn split(&mut self, id: u64, direction: SplitDirection) -> Result<u64, WorkspaceError> {
         let new_id = self.next_id;
-        // Browser mutations accept u32 identities, as does persisted-layout validation.
-        // Reject before changing the tree so every returned cell remains addressable.
-        if new_id > u64::from(u32::MAX) {
+        self.split_with_id(id, direction, new_id)?;
+        Ok(new_id)
+    }
+
+    /// Split a leaf using a host-issued stable identity.
+    pub fn split_with_id(
+        &mut self,
+        id: u64,
+        direction: SplitDirection,
+        new_id: u64,
+    ) -> Result<(), WorkspaceError> {
+        let next_id = new_id.checked_add(1).ok_or(WorkspaceError::InvalidLayout)?;
+        if new_id == 0 || self.cell_ids().contains(&new_id) {
             return Err(WorkspaceError::InvalidLayout);
         }
         if !split_node(&mut self.root, id, direction, new_id) {
             return Err(WorkspaceError::NotFound);
         }
-        self.next_id += 1;
-        Ok(new_id)
+        self.next_id = self.next_id.max(next_id);
+        Ok(())
     }
 
     /// Remove a cell: its sibling subtree absorbs the freed space. `LastCell` refuses to
@@ -178,6 +262,23 @@ impl Workspace {
         }
     }
 
+    /// Set one adjacent boundary to an absolute normalized ratio.
+    pub fn resize_between_to(
+        &mut self,
+        left_id: u64,
+        right_id: u64,
+        ratio: f64,
+    ) -> Result<(), WorkspaceError> {
+        if !ratio.is_finite() {
+            return Err(WorkspaceError::InvalidLayout);
+        }
+        let current = self
+            .root
+            .boundary_ratio(left_id, right_id)
+            .ok_or(WorkspaceError::NotFound)?;
+        self.resize_between(left_id, right_id, ratio.clamp(0.05, 0.95) - current)
+    }
+
     /// A cloned typed snapshot of the current workspace layout.
     pub fn layout(&self) -> WorkspaceLayout {
         self.root.clone()
@@ -203,7 +304,7 @@ fn validate_layout(
     }
     match node {
         WorkspaceLayout::Cell { id } => {
-            if *id == 0 || *id > u64::from(u32::MAX) || !ids.insert(*id) {
+            if *id == 0 || !ids.insert(*id) {
                 return Err(WorkspaceError::InvalidLayout);
             }
             Ok(*id)
@@ -215,6 +316,16 @@ fn validate_layout(
             let a_max = validate_layout(a, depth + 1, ids)?;
             let b_max = validate_layout(b, depth + 1, ids)?;
             Ok(a_max.max(b_max))
+        }
+    }
+}
+
+fn collect_weights(node: &WorkspaceLayout, weight: f64, out: &mut Vec<(u64, f64)>) {
+    match node {
+        WorkspaceLayout::Cell { id } => out.push((*id, weight)),
+        WorkspaceLayout::Split { ratio, a, b, .. } => {
+            collect_weights(a, weight * *ratio, out);
+            collect_weights(b, weight * (1.0 - *ratio), out);
         }
     }
 }
@@ -298,15 +409,15 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_browser_cell_ids_reject_split_atomically() {
-        let mut ws = Workspace::from_layout_json(r#"{"kind":"cell","id":4294967294}"#).unwrap();
+    fn exhausted_cell_ids_reject_split_atomically() {
+        let mut ws = Workspace::from_layout(&WorkspaceLayout::Cell { id: u64::MAX - 1 }).unwrap();
         assert_eq!(
-            ws.split(4294967294, SplitDirection::Horizontal),
-            Ok(u64::from(u32::MAX))
+            ws.split(u64::MAX - 1, SplitDirection::Horizontal),
+            Err(WorkspaceError::InvalidLayout)
         );
         let before = ws.layout_json();
         assert_eq!(
-            ws.split(4294967294, SplitDirection::Vertical),
+            ws.split_with_id(u64::MAX - 1, SplitDirection::Vertical, u64::MAX),
             Err(WorkspaceError::InvalidLayout)
         );
         assert_eq!(ws.layout_json(), before);
@@ -336,6 +447,27 @@ mod tests {
         assert_eq!(ws.cell_ids(), [4, 9]);
         assert_eq!(ws.layout_json(), json);
         assert_eq!(ws.split(4, SplitDirection::Vertical).unwrap(), 10);
+    }
+
+    #[test]
+    fn typed_layout_accepts_host_issued_ids_and_reports_weights() {
+        let layout = WorkspaceLayout::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.25,
+            a: Box::new(WorkspaceLayout::Cell { id: 9_000_000_000 }),
+            b: Box::new(WorkspaceLayout::Cell { id: 17 }),
+        };
+        let mut ws = Workspace::from_layout(&layout).unwrap();
+        assert_eq!(ws.layout().leaf_ids(), [9_000_000_000, 17]);
+        assert_eq!(
+            ws.layout().basis_points(),
+            [(9_000_000_000, 2_500), (17, 7_500)]
+        );
+
+        ws.split_with_id(17, SplitDirection::Vertical, 42).unwrap();
+        assert_eq!(ws.cell_ids(), [9_000_000_000, 17, 42]);
+        ws.resize_between_to(17, 42, 0.8).unwrap();
+        assert_eq!(ws.layout().boundary_ratio(17, 42), Some(0.8));
     }
 
     #[test]

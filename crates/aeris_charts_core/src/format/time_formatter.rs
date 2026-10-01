@@ -327,6 +327,33 @@ mod tests {
     }
 
     #[test]
+    fn time_zone_changes_tick_and_crosshair_calendar_text() {
+        use crate::time_zone::ChartTimeZone;
+        let new_york = ExchangeTime::new(
+            ChartTimeZone::parse("America/New_York")
+                .unwrap()
+                .offset_schedule()
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        // 2026-01-02 04:30 UTC = 2026-01-01 23:30 EST.
+        let ts = 1_767_328_200;
+        assert_eq!(
+            format_tick_label_in(ts, TickMarkType::Time, english_months(), &new_york),
+            "23:30"
+        );
+        assert_eq!(
+            format_date_pattern(new_york.local_seconds(ts), "dd MMM yyyy", english_months()),
+            "01 Jan 2026"
+        );
+        assert_eq!(
+            format_crosshair_time_in(ts, true, false, "dd MMM yyyy", english_months(), &new_york),
+            "01 Jan 2026   23:30"
+        );
+    }
+
+    #[test]
     fn weight_mapping() {
         // intraday weights show time when timeVisible
         assert_eq!(

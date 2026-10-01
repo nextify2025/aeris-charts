@@ -2071,7 +2071,7 @@ export interface series_options {
   wick_visible: boolean;
   /** Candlestick body-border visibility (default true; ignored by bar series). */
   border_visible: boolean;
-  /** Line/area stroke width in css px (default 2, matching indicator lines). */
+  /** Line/area stroke width in CSS px (default 2; EMA-family indicators default to 1). */
   line_width: number;
   /** Area fill color at the line (top of the gradient). */
   area_top_color: string;
@@ -2771,7 +2771,7 @@ export interface drawing_template { name: string; kind: drawing_kind; options: P
 export type drawing_kind_options =
   | { kind: "rectangle"; fill_color?: string; preview_fill_color?: string; border_visible: boolean; show_labels: boolean; axis_bands_visible: boolean; label_color?: string; label_text_color?: string; snap_time_to_data: boolean }
   | { kind: "text"; box_color?: string; box_border_color?: string; box_border_width: number }
-  | { kind: "position"; levels: drawing_level[] }
+  | { kind: "position"; levels: drawing_level[]; account_size: number; risk_percent: number }
   | { kind: "generic" }
   // B8: lines — begin
   | { kind: "line"; stats_position: drawing_stats_position }
@@ -3057,6 +3057,10 @@ export interface drawing_tool_options {
  * `text_size: null` follows `layout.fontSize`.
  */
 export interface drawing_options {
+  /** Hypothetical balance for Long/Short Position statistics (default 1,000); independent of broker orders. */
+  position_account_size: number;
+  /** Percentage of the hypothetical balance risked at the stop, 0–100 (default 25). */
+  position_risk_percent: number;
   name: string;
   group_id: string;
   revision: number;
@@ -3087,7 +3091,7 @@ export interface drawing_options {
   fill_color: string;
   /** Interactive rectangle preview fill (`""` = `fill_color`). */
   preview_fill_color: string;
-  /** Rectangle outline visibility (generic drawings default true; official plugin false). */
+  /** Rectangle outline visibility (default false). */
   border_visible: boolean;
   /** Rectangle endpoint labels on the price and time axes. */
   show_labels: boolean;
@@ -3147,6 +3151,8 @@ export interface persisted_pane_v1 {
 
 /** Stable semantic drawing style persisted by schema V1. Omitted fields restore defaults. */
 export interface persisted_drawing_style_v1 {
+  position_account_size?: number;
+  position_risk_percent?: number;
   name?: string;
   group_id?: string;
   revision?: number;
@@ -3876,6 +3882,12 @@ export interface trading_execution {
   quantity: number;
   order_id?: string;
   position_id?: string;
+  /**
+   * Mark drawn outside the bar that contains `time`: buys below its rendered low, sells above
+   * its rendered high (the plotted line for line-type series). Fills of one side on one bar
+   * share one mark (an arrow with stacked chevrons when there are several) that clears a line
+   * series across its width; hovering it marks each fill's exact price. Defaults to `"arrow"`.
+   */
   marker_shape?: "circle" | "arrow" | "triangle";
   size_by_quantity?: boolean;
 }
@@ -3941,6 +3953,8 @@ export interface trading_hit {
   kind:
     | "position_line"
     | "order_line"
+    | "take_profit_button"
+    | "stop_loss_button"
     | "cancel_button"
     | "execution_marker"
     | "annotation";
@@ -4007,6 +4021,9 @@ export interface trading_style_options {
   rejected: string;
   control: string;
   label: string;
+  /** Execution arrow colors; default blue buy and red sell. */
+  execution_buy: string;
+  execution_sell: string;
 }
 
 /** First-party, broker-neutral runtime trading state. Live objects are never chart-persisted. */

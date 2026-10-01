@@ -17,10 +17,8 @@ edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Aeris Terminal"]
 repository = "https://github.com/aeristerminal/aeris-charts"
-readme = "docs/Crates.md"
-keywords = ["finance", "charts", "trading", "webgpu", "wasm"]
-categories = ["visualization", "graphics", "wasm"]
-publish = ["crates-io"]
+# Rust crates are consumed from this repository only; nothing is published to crates.io.
+publish = false
 
 # Shared lint policy; every crate opts in via `[lints] workspace = true`.
 # CI enforces clippy with `-D warnings` on top of this.

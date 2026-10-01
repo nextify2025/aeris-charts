@@ -538,7 +538,8 @@ impl ChartEngine {
         self.hovered_series
     }
 
-    /// Select one series, expanding engine-owned indicator outputs into one interaction group.
+    /// Select one series, expanding engine-owned indicator and external-study outputs into one
+    /// interaction group.
     /// The primary id remains the hit-tested series for compatibility with commands that need a
     /// single target.
     pub fn set_selected_series(&mut self, id: Option<SeriesId>) {
@@ -549,15 +550,20 @@ impl ChartEngine {
             }
             return;
         };
-        let binding = self.indicator_binding_id(series);
-        let members = binding.map_or_else(|| vec![series], |id| self.indicator_group_outputs(id));
+        let members = if let Some(binding) = self.indicator_binding_id(series) {
+            self.indicator_group_outputs(binding)
+        } else if let Some(study) = self.external_study_for_series(series) {
+            self.external_study_series(study)
+        } else {
+            vec![series]
+        };
         let _ = self.set_selected_series_group(series, &members);
     }
 
     /// Select a host-defined group of related output series while retaining `primary` as the
     /// command target. Invalid, duplicate, empty, or oversized groups are rejected atomically.
-    /// This is the integration boundary for multi-output studies whose ownership lives outside
-    /// the engine's built-in indicator registry.
+    /// This remains the integration boundary for product-owned multi-output series that are not
+    /// registered as engine indicators or external studies.
     pub fn set_selected_series_group(&mut self, primary: SeriesId, members: &[SeriesId]) -> bool {
         if members.is_empty()
             || members.len() > MAX_SELECTION_MEMBERS

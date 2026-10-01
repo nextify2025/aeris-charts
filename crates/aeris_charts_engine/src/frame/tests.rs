@@ -5403,7 +5403,15 @@ fn trading_objects_suppress_the_visual_crosshair_without_clearing_its_position()
     let y = chart
         .trading_price_coordinate(0, crate::TradingPriceScale::Right, 11.5)
         .unwrap();
-    assert!(chart.set_trading_hover(chart.trading_marker_start() + 20.0, y));
+    let stop_x = (0..=(chart.pane_w * 2.0) as usize)
+        .map(|step| step as f64 / 2.0)
+        .find(|x| {
+            chart
+                .trading_hit_at(*x, y)
+                .is_some_and(|hit| hit.kind == crate::TradingHitKind::StopLossButton)
+        })
+        .expect("visible stop-loss button");
+    assert!(chart.set_trading_hover(stop_x, y));
     assert!(chart.crosshair_suppressed_by_interaction());
     assert_eq!(visual_crosshair_presence(&mut chart), (false, false));
     assert!(
@@ -5411,7 +5419,7 @@ fn trading_objects_suppress_the_visual_crosshair_without_clearing_its_position()
         "callbacks retain the pointer position"
     );
 
-    assert!(chart.trading_drag_start_at(chart.trading_marker_start() + 20.0, y));
+    assert!(chart.trading_drag_start_at(stop_x, y));
     assert!(chart.clear_trading_hover());
     assert_eq!(visual_crosshair_presence(&mut chart), (false, false));
     assert!(chart.cancel_trading_drag());
@@ -6312,6 +6320,123 @@ fn last_value_labels_cover_every_visible_series_and_resolve_overlap() {
     assert_eq!(boxed(&mut chart).len(), 1);
 }
 
+#[test]
+fn price_line_tag_makes_room_for_live_label_then_returns_to_its_price() {
+    let mut chart = two_identical_line_series();
+    chart.set_series_visible(1, false);
+    let line = chart.create_price_line(0, 12.5, LINE, 1, LineStyle::Solid, "target");
+    assert_ne!(line, 0);
+    let labels = |chart: &mut ChartEngine| {
+        chart
+            .build_axis_frame(
+                80.0,
+                |t, _| t.len() as f64 * 7.0,
+                |t, _| t.len() as f64 * 6.0,
+            )
+            .labels
+    };
+    let crowded = labels(&mut chart);
+    let live = crowded
+        .iter()
+        .find(|label| label.text == "12.50" && label.background.is_some())
+        .unwrap();
+    let target = crowded.iter().find(|label| label.text == "target").unwrap();
+    let live_box = live.background.unwrap();
+    let target_box = target.background.unwrap();
+    assert!(
+        target_box.1 + target_box.3 <= live_box.1 || live_box.1 + live_box.3 <= target_box.1,
+        "the target and live price tags must not cover each other"
+    );
+
+    for (close, above) in [(12.49, true), (12.51, false)] {
+        let values = [10.0, 11.0, 12.0, 11.5, close];
+        chart
+            .set_series_data(
+                0,
+                &[0.0, 60.0, 120.0, 180.0, 240.0],
+                &values,
+                &values,
+                &values,
+                &values,
+            )
+            .unwrap();
+        let crossing = labels(&mut chart);
+        let target = crossing
+            .iter()
+            .find(|label| label.text == "target")
+            .unwrap();
+        let raw = chart
+            .runtime_price_coordinate(0, PriceScaleTarget::Right, 12.5)
+            .unwrap();
+        assert_eq!(
+            target.y < raw,
+            above,
+            "tag should move to the free side as the live price crosses"
+        );
+    }
+
+    let values = [10.0, 11.0, 12.0, 11.5, 14.0];
+    chart
+        .set_series_data(
+            0,
+            &[0.0, 60.0, 120.0, 180.0, 240.0],
+            &values,
+            &values,
+            &values,
+            &values,
+        )
+        .unwrap();
+    let clear = labels(&mut chart);
+    let target = clear.iter().find(|label| label.text == "target").unwrap();
+    let raw = chart
+        .runtime_price_coordinate(0, PriceScaleTarget::Right, 12.5)
+        .unwrap();
+    assert!(
+        (target.y - raw).abs() < 1e-9,
+        "tag must return to its price when clear"
+    );
+}
+
+#[test]
+fn overfull_price_axis_omits_tags_that_have_no_free_slot() {
+    let mut chart = ChartEngine::new(800.0, 120.0, 1.0);
+    let values = [10.0, 11.0, 12.0, 11.5, 12.5];
+    chart
+        .set_series_data(
+            0,
+            &[0.0, 60.0, 120.0, 180.0, 240.0],
+            &values,
+            &values,
+            &values,
+            &values,
+        )
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    for i in 0..12 {
+        chart.create_price_line(0, 12.5, LINE, 1, LineStyle::Solid, &format!("tag-{i}"));
+    }
+    let labels = chart
+        .build_axis_frame(
+            80.0,
+            |t, _| t.len() as f64 * 7.0,
+            |t, _| t.len() as f64 * 6.0,
+        )
+        .labels;
+    let tags: Vec<_> = labels
+        .iter()
+        .filter(|label| label.text.starts_with("tag-") && label.background.is_some())
+        .collect();
+    assert!(!tags.is_empty() && tags.len() < 12);
+    for (index, tag) in tags.iter().enumerate() {
+        let first = tag.background.unwrap();
+        for other in &tags[index + 1..] {
+            let second = other.background.unwrap();
+            assert!(first.1 + first.3 <= second.1 || second.1 + second.3 <= first.1);
+        }
+    }
+}
+
 /// the public reference marks a last-value chip hollow only when its value is no longer live — i.e. the
 /// series' final bar has been scrolled out of view (what a negative right offset produces).
 #[test]
@@ -7168,10 +7293,10 @@ fn position_drawings_paint_information_and_entry_target_stop_axis_prices() {
         .collect::<Vec<_>>();
     assert!(text.iter().any(|text| text.starts_with("Target: ")));
     assert!(text.iter().any(|text| text.starts_with("Stop: ")));
-    assert!(!text.iter().any(|text| text.starts_with("Open PnL: ")));
-    assert!(!text
-        .iter()
-        .any(|text| text.starts_with("Risk / reward ratio: ")));
+    assert!(text.iter().any(|text| text.contains(", Amount: 1250")));
+    assert!(text.iter().any(|text| text.contains(", Amount: 750")));
+    assert!(text.iter().any(|text| text.contains(", Qty: 250")));
+    assert!(text.contains(&"Risk/reward ratio: 1"));
 
     let labels = chart
         .build_axis_frame(
@@ -7200,6 +7325,81 @@ fn position_drawings_paint_information_and_entry_target_stop_axis_prices() {
     assert!(boxed
         .iter()
         .any(|(text, color)| text.as_str() == "11.00" && *color == risk));
+}
+
+#[test]
+fn position_square_controls_have_one_rounded_fill_and_inside_border() {
+    use crate::drawings::{DrawingKind, DrawingPoint};
+
+    for dpr in [1.0, 1.5, 2.0] {
+        for (background, fill) in [
+            ("#ffffff", Color::rgb(255, 255, 255)),
+            ("#000000", Color::rgb(0, 0, 0)),
+        ] {
+            let mut chart = countdown_chart();
+            chart.dpr = dpr;
+            chart
+                .apply_options(&format!(
+                    r##"{{"layout":{{"background":{{"color":"{background}"}}}}}}"##
+                ))
+                .unwrap();
+            let id = chart
+                .add_drawing(
+                    DrawingKind::LongPosition,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: 1.17,
+                            price: 12.13,
+                        },
+                        DrawingPoint {
+                            logical: 3.17,
+                            price: 13.13,
+                        },
+                        DrawingPoint {
+                            logical: 1.17,
+                            price: 11.13,
+                        },
+                    ],
+                    None,
+                )
+                .unwrap();
+            chart.set_selected_drawing(Some(id));
+            let frame = chart.build_frame();
+            let squares = frame.panes[0]
+                .main
+                .iter()
+                .filter_map(|prim| match prim {
+                    Prim::RoundRect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        radii,
+                        fill: actual_fill,
+                        border_width,
+                        border_color,
+                    } if *border_width > 0.0 && *border_color == super::PRIMARY => {
+                        assert_eq!(*actual_fill, fill);
+                        assert_eq!(*border_color, super::PRIMARY);
+                        assert_eq!(*border_width, (1.5_f64 * dpr).floor().max(1.0) as f32);
+                        assert_eq!(*w, *h);
+                        assert_eq!(x.fract(), 0.0);
+                        assert_eq!(y.fract(), 0.0);
+                        assert!(radii
+                            .iter()
+                            .all(|radius| *radius > 0.0 && *radius == radii[0]));
+                        Some(())
+                    }
+                    _ => None,
+                })
+                .count();
+            assert_eq!(
+                squares, 3,
+                "one bordered rounded shape per square position control"
+            );
+        }
+    }
 }
 
 #[test]
@@ -7313,10 +7513,9 @@ fn position_progress_darkens_the_run_and_keeps_labels_above_the_gray_trend() {
         last_progress_prim < first_position_label,
         "position labels must paint over the dashed run line"
     );
-    assert!(!frame.panes[0].main.iter().any(|prim| matches!(
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(
         prim,
-        Prim::Text { text, .. }
-            if text.starts_with("Open PnL: ") || text.starts_with("Risk / reward ratio: ")
+        Prim::Text { text, .. } if text.starts_with("Open P&L: ")
     )));
 }
 
@@ -9282,6 +9481,102 @@ fn allow_bold_labels_gates_major_time_ticks() {
     );
 }
 
+#[test]
+fn future_time_projection_paints_axis_labels_past_the_last_real_bar() {
+    let mut chart = ChartEngine::new(600.0, 300.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_000.0, 1_060.0, 1_120.0],
+            &[100.0, 101.0, 102.0],
+            &[101.0, 102.0, 103.0],
+            &[99.0, 100.0, 101.0],
+            &[100.5, 101.5, 102.5],
+        )
+        .unwrap();
+    chart.set_future_time_projection(Some(60), 64);
+    chart.recompute_layout_with_measure(
+        true,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 6.0,
+    );
+    chart.set_right_offset(12.0);
+    chart.set_tick_mark_formatter(Some(Box::new(|timestamp, _| Some(timestamp.to_string()))));
+
+    let visible = chart.time_scale.visible_strict_range().unwrap();
+    assert!(visible.right() > 2, "future logical space must be visible");
+    let marks = chart.time_marks(40.0);
+    assert!(
+        marks.iter().any(|(index, _)| *index > 2),
+        "future projected tick marks must exist before axis rendering"
+    );
+
+    let frame = chart.build_axis_frame(
+        40.0,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 6.0,
+    );
+
+    assert!(
+        frame.labels.iter().any(|label| {
+            label.midpoint == AxisTextMidpoint::None
+                && label
+                    .text
+                    .parse::<i64>()
+                    .is_ok_and(|timestamp| timestamp > 1_120)
+        }),
+        "future projected timestamps must survive the frame's visible-range filter"
+    );
+}
+
+#[test]
+fn past_time_projection_paints_axis_labels_before_the_first_real_bar() {
+    let mut chart = ChartEngine::new(600.0, 300.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_000.0, 1_060.0, 1_120.0],
+            &[100.0, 101.0, 102.0],
+            &[101.0, 102.0, 103.0],
+            &[99.0, 100.0, 101.0],
+            &[100.5, 101.5, 102.5],
+        )
+        .unwrap();
+    chart.set_past_time_projection(Some(60), 64);
+    chart.recompute_layout_with_measure(
+        true,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 6.0,
+    );
+    chart.set_visible_logical_range(-12.0, 2.0);
+    chart.set_tick_mark_formatter(Some(Box::new(|timestamp, _| Some(timestamp.to_string()))));
+
+    let visible = chart.time_scale.visible_strict_range().unwrap();
+    assert!(visible.left() < 0, "past logical space must be visible");
+    let marks = chart.time_marks(40.0);
+    assert!(
+        marks.iter().any(|(index, _)| *index < 0),
+        "past projected tick marks must exist before axis rendering"
+    );
+
+    let frame = chart.build_axis_frame(
+        40.0,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 6.0,
+    );
+
+    assert!(
+        frame.labels.iter().any(|label| {
+            label.midpoint == AxisTextMidpoint::None
+                && label
+                    .text
+                    .parse::<i64>()
+                    .is_ok_and(|timestamp| timestamp < 1_000)
+        }),
+        "past projected timestamps must survive the frame's visible-range filter"
+    );
+}
+
 // ---- industry-standard last-value cluster: title chip + price + candle-close countdown ----
 
 #[test]
@@ -10150,6 +10445,35 @@ fn last_value_cluster_overlap_resolution_uses_the_total_height() {
     );
 }
 
+#[test]
+fn mixed_height_series_clusters_do_not_overlap() {
+    let mut chart = two_identical_line_series();
+    // Inside the last bar's interval (bars at 0..240 s, 60 s apart): the countdown row hides
+    // outside `[last_bar_time, last_bar_time + interval)`.
+    chart.now_override = Some(252.0);
+    chart.series[1].countdown_visible = true;
+    let labels = chart
+        .build_axis_frame(
+            80.0,
+            |t, _| t.len() as f64 * 7.0,
+            |t, _| t.len() as f64 * 6.0,
+        )
+        .labels;
+    let live: Vec<_> = labels
+        .iter()
+        .filter(|label| label.text == "12.50" && label.background.is_some())
+        .collect();
+    assert_eq!(live.len(), 2);
+    let countdown = labels.iter().find(|label| label.text == "00:48").unwrap();
+    let plain_box = live[0].background.unwrap();
+    let countdown_box = countdown.background.unwrap();
+    assert!(
+        plain_box.1 + plain_box.3 <= countdown_box.1
+            || countdown_box.1 + countdown_box.3 <= plain_box.1,
+        "a taller indicator cluster must clear the plain live-price label"
+    );
+}
+
 /// One candle series on 60s bars (light default background) for the selection-anchor tests.
 fn anchor_chart() -> ChartEngine {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
@@ -10230,6 +10554,47 @@ fn trend_line_middle_label_follows_the_segment_and_opens_a_gap() {
     assert!((label.1 - line_mid[1]).abs() < 0.01);
     assert!(orange_runs[0][1][0] < label.0);
     assert!(orange_runs[1][0][0] > label.0);
+}
+
+#[test]
+fn tilted_trend_label_keeps_its_line_box_clear_of_the_stroke() {
+    use crate::{DrawingKind, DrawingPoint};
+
+    let mut chart = anchor_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 0.0,
+                    price: 10.0,
+                },
+                DrawingPoint {
+                    logical: 4.0,
+                    price: 10.4,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    chart.build_frame();
+    let start = chart.drawing_point_to_coordinate(id, 0).unwrap();
+    let end = chart.drawing_point_to_coordinate(id, 1).unwrap();
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let length = dx.hypot(dy);
+    let top_normal = (dy / length, -dx / length);
+
+    for (slot, sign) in [("top", 1.0), ("bottom", -1.0)] {
+        assert!(chart.drawing_apply_options(
+            id,
+            &format!(r#"{{"text":"Devraj","text_size":12,"text_v_align":"{slot}"}}"#),
+        ));
+        let (x, y) = chart.drawing_text_coordinate(id).unwrap();
+        let distance = (x - start.0) * top_normal.0 + (y - start.1) * top_normal.1;
+        assert!((distance - sign * (4.0 + 12.0 * 0.6)).abs() < 0.001);
+    }
 }
 
 #[test]
@@ -10317,6 +10682,153 @@ fn rotated_trend_label_hit_test_uses_label_local_coordinates() {
 }
 
 #[test]
+fn native_text_session_paints_a_rotated_caret_that_follows_the_typed_run() {
+    use crate::{DrawingKind, DrawingPoint, DrawingTextEditKey};
+
+    // The caret is the one polyline in the label's ink that is not a line segment.
+    fn caret(chart: &mut ChartEngine) -> Option<[[f32; 2]; 2]> {
+        let frame = chart.build_frame();
+        let pane = &frame.panes[0];
+        pane.main.iter().find_map(|prim| match prim {
+            Prim::Polyline {
+                first_point,
+                point_count: 2,
+                color,
+                ..
+            } if *color == Color::rgb(0x24, 0x68, 0xac) => {
+                let first = *first_point as usize;
+                Some([pane.points[first], pane.points[first + 1]])
+            }
+            _ => None,
+        })
+    }
+
+    let mut chart = anchor_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 0.0,
+                    price: 10.0,
+                },
+                DrawingPoint {
+                    logical: 4.0,
+                    price: 12.5,
+                },
+            ],
+            Some(r##"{"color":"#123456","text_color":"#2468ac","text_h_align":"center"}"##),
+        )
+        .unwrap();
+    // Beginning an edit needs a settled chart: the editor layout converts the anchors.
+    chart.build_frame();
+
+    // A browser host paints its own caret, so the engine draws none.
+    assert!(chart.begin_drawing_text_edit(id, false));
+    assert!(caret(&mut chart).is_none());
+    assert!(chart.cancel_drawing_text_edit());
+
+    assert!(chart.begin_drawing_text_edit(id, true));
+    let empty = caret(&mut chart).expect("native session paints a caret on an empty label");
+    assert!(chart.drawing_text_edit_insert("breakout"));
+    let end = caret(&mut chart).unwrap();
+    let (_, _, angle) = chart.drawing_text_transform(id).unwrap();
+    // The caret stands perpendicular to the rotated run and advances along it as text grows.
+    let stroke = (end[1][0] - end[0][0], end[1][1] - end[0][1]);
+    let along = (angle.cos() as f32, angle.sin() as f32);
+    assert!((stroke.0 * along.0 + stroke.1 * along.1).abs() < 1e-3);
+    let advance = (end[0][0] - empty[0][0]) * along.0 + (end[0][1] - empty[0][1]) * along.1;
+    assert!(
+        advance > 1.0,
+        "typed text must move the caret along the label"
+    );
+
+    assert!(chart.drawing_text_edit_key(DrawingTextEditKey::Home, false));
+    let home = caret(&mut chart).unwrap();
+    let back = (home[0][0] - end[0][0]) * along.0 + (home[0][1] - end[0][1]) * along.1;
+    assert!(
+        back < -1.0,
+        "Home must move the caret to the start of the run"
+    );
+
+    assert!(chart.commit_drawing_text_edit());
+    assert!(caret(&mut chart).is_none());
+    assert_eq!(chart.drawing(id).unwrap().text, "breakout");
+}
+
+#[test]
+fn native_text_session_paints_its_caret_on_the_clicked_line_of_a_family_text_box() {
+    use crate::{DrawingKind, DrawingPoint};
+
+    // The caret is the one 1 px wide rect in the text's ink.
+    fn carets(chart: &mut ChartEngine) -> Vec<IRect> {
+        let frame = chart.build_frame();
+        frame.panes[0]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::Rect { rect, color } if *color == Color::rgb(0x24, 0x68, 0xac) => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let mut chart = anchor_chart();
+    chart.set_text_measure(Some(Box::new(|text, _, _, _, _| {
+        text.chars().count() as f64 * 10.0
+    })));
+    let id = chart
+        .add_drawing(
+            DrawingKind::Comment,
+            0,
+            vec![DrawingPoint {
+                logical: 2.0,
+                price: 11.0,
+            }],
+            Some(r##"{"text":"ab\ncd","text_color":"#2468ac"}"##),
+        )
+        .unwrap();
+    chart.build_frame();
+    // A browser host paints its own caret; so does nobody before a session opens.
+    assert!(chart.begin_drawing_text_edit(id, false));
+    assert!(carets(&mut chart).is_empty());
+    assert!(chart.cancel_drawing_text_edit());
+    assert!(carets(&mut chart).is_empty());
+
+    assert!(chart.begin_drawing_text_edit(id, true));
+    let layout = chart.drawing_text_edit_layout(id).unwrap();
+    assert!(layout.multiline);
+    // Click one character into the second line: the caret stands there, not at the run slot.
+    assert!(chart.drawing_text_edit_caret_at(layout.x + 10.0, layout.y + layout.line_height));
+    assert_eq!(
+        chart.drawing_text_edit().map(|(_, _, caret)| caret),
+        Some(4)
+    );
+    let caret = carets(&mut chart);
+    assert_eq!(caret.len(), 1, "one caret bar: {caret:?}");
+    let caret = caret[0];
+    assert_eq!(caret.w, 1);
+    assert_eq!(f64::from(caret.x), (layout.x + 10.0).round());
+    let center = f64::from(caret.y) + f64::from(caret.h) / 2.0;
+    assert!(
+        (center - (layout.y + layout.line_height)).abs() <= 1.0,
+        "the caret is centred on the second line: {center} vs {}",
+        layout.y + layout.line_height
+    );
+    // Moving to the first line moves it up a whole line.
+    assert!(chart.drawing_text_edit_caret_at(layout.x + 20.0, layout.y));
+    let first = carets(&mut chart)[0];
+    assert_eq!(f64::from(first.x), (layout.x + 20.0).round());
+    assert!(
+        (f64::from(caret.y - first.y) - layout.line_height).abs() <= 1.0,
+        "one line apart"
+    );
+    assert!(chart.commit_drawing_text_edit());
+    assert!(carets(&mut chart).is_empty());
+}
+
+#[test]
 fn middle_trend_label_gap_shrinks_to_the_caret_then_expands_with_text() {
     use crate::{DrawingKind, DrawingPoint};
 
@@ -10383,21 +10895,21 @@ fn middle_trend_label_gap_shrinks_to_the_caret_then_expands_with_text() {
     );
     assert!(prompt_color.a() < 0xff);
 
-    assert!(chart.begin_drawing_text_edit(id));
+    assert!(chart.begin_drawing_text_edit(id, false));
     let editing_empty = orange_segments(&mut chart);
     assert_eq!(editing_empty.len(), 2);
     assert!(
         gap_width(&editing_empty) < gap_width(&hovered),
         "clicking the prompt must shrink its opening to the one-character caret slot"
     );
-    assert!(chart.set_drawing_edit_text("typing"));
+    assert!(chart.set_drawing_text_edit("typing", usize::MAX));
     let typing = orange_segments(&mut chart);
     assert_eq!(typing.len(), 2);
     assert!(
         gap_width(&typing) > gap_width(&editing_empty),
         "measured typed text must expand the opening"
     );
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     chart.set_hovered_text(None);
     assert_eq!(orange_segments(&mut chart), typing);
 }
@@ -10457,21 +10969,21 @@ fn every_segment_layout_label_opens_its_stroke_gap_while_edited() {
         1,
         "an empty label cuts nothing"
     );
-    assert!(chart.begin_drawing_text_edit(id));
+    assert!(chart.begin_drawing_text_edit(id, false));
     let editing_empty = ink_segments(&mut chart);
     assert_eq!(
         editing_empty.len(),
         2,
         "the open editor's caret slot splits the stroke"
     );
-    assert!(chart.set_drawing_edit_text("typing"));
+    assert!(chart.set_drawing_text_edit("typing", usize::MAX));
     let typing = ink_segments(&mut chart);
     assert_eq!(typing.len(), 2);
     assert!(
         gap_width(&typing) > gap_width(&editing_empty),
         "typed text widens the opening"
     );
-    assert!(chart.end_drawing_text_edit(false));
+    assert!(chart.cancel_drawing_text_edit());
     assert_eq!(ink_segments(&mut chart).len(), 1, "cancel closes the gap");
 }
 
@@ -10770,12 +11282,12 @@ fn text_tool_selection_paints_a_focus_border_without_anchor_handles() {
         })
         .expect("hovered trend placeholder");
     assert_eq!(placeholder.a(), 0x99);
-    assert!(chart.begin_drawing_text_edit(line));
+    assert!(chart.begin_drawing_text_edit(line, false));
     assert!(chart.build_frame().panes[0]
         .main
         .iter()
         .all(|prim| !matches!(prim, Prim::RotatedText { text, .. } if text == "+ Add text")));
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     chart.set_hovered_text(None);
     chart.set_hovered_text(Some(text));
     assert_eq!(chart.hovered_text(), Some(text));
@@ -10805,14 +11317,14 @@ fn text_tool_selection_paints_a_focus_border_without_anchor_handles() {
 
     // While the typing-mode editor owns the drawing, the engine still paints the focus
     // border (the host wrap is borderless) — the wrap's border is not a second outline.
-    assert!(chart.begin_drawing_text_edit(text));
+    assert!(chart.begin_drawing_text_edit(text, false));
     let editing = border_frames(&mut chart);
     assert_eq!(editing.len(), 1, "focus border stays while editing");
     assert_eq!(
         editing[0].0, selected[0].0,
         "edit does not move the focus border"
     );
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
 
     // The trend line keeps its anchor handles on selection (border discs + fill discs).
     chart.set_selected_drawing(Some(line));
@@ -12136,4 +12648,242 @@ fn position_progress_re_evaluates_after_a_price_basis_rescale() {
     assert_eq!(after.start.price, before.start.price * 0.5);
     assert_eq!(after.point.logical, before.point.logical);
     assert_eq!(after.point.price, before.point.price * 0.5);
+}
+
+#[test]
+fn position_stats_have_opaque_rounded_fills_and_srgb_surface_borders() {
+    use crate::drawings::{DrawingKind, DrawingPoint};
+    for dpr in [1.0, 1.5, 2.0] {
+        for (surface, border) in [
+            ("#089981", Color::rgb(0, 0, 0)),
+            ("#f7525f", Color::rgb(0, 0, 0)),
+            ("#0000ff", Color::rgb(255, 255, 255)),
+            ("#000000", Color::rgb(255, 255, 255)),
+            ("#ffffff", Color::rgb(0, 0, 0)),
+        ] {
+            let mut chart = countdown_chart();
+            chart.dpr = dpr;
+            chart
+                .apply_options(&format!(
+                    r##"{{"layout":{{"background":{{"color":"{surface}"}}}}}}"##
+                ))
+                .unwrap();
+            chart
+                .add_drawing(
+                    DrawingKind::LongPosition,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: 1.0,
+                            price: 12.0,
+                        },
+                        DrawingPoint {
+                            logical: 3.0,
+                            price: 13.0,
+                        },
+                        DrawingPoint {
+                            logical: 1.0,
+                            price: 11.0,
+                        },
+                    ],
+                    None,
+                )
+                .unwrap();
+            let frame = chart.build_frame();
+            let stats = frame.panes[0]
+                .main
+                .iter()
+                .filter_map(|prim| match prim {
+                    Prim::RoundRect {
+                        fill,
+                        border_color,
+                        border_width,
+                        radii,
+                        ..
+                    } if fill.r() == 8 || fill.r() == 247 => {
+                        Some((fill, border_color, border_width, radii))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(stats.len(), 3, "target, stop and two-line PnL block");
+            for (fill, stroke, width, radii) in stats {
+                assert_eq!(fill.a(), 255);
+                assert_eq!(*stroke, border);
+                assert_eq!(*width, dpr.round().max(1.0) as f32);
+                assert!(radii.iter().all(|radius| *radius > 0.0));
+            }
+        }
+    }
+}
+
+#[test]
+fn position_stats_follow_open_and_frozen_exit_prices_for_both_sides() {
+    use crate::drawings::{DrawingKind, DrawingPoint};
+    for kind in [DrawingKind::LongPosition, DrawingKind::ShortPosition] {
+        let direction = if kind == DrawingKind::LongPosition {
+            1.0
+        } else {
+            -1.0
+        };
+        for (terminal, closed) in [(102.0, false), (110.0, true), (90.0, true)] {
+            let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+            chart.series[0].kind = SeriesKind::Candlestick;
+            chart
+                .set_series_data(
+                    0,
+                    &[0.0, 60.0, 120.0],
+                    &[100.0, terminal, 100.0],
+                    &[101.0, terminal + 0.5, 101.0],
+                    &[99.0, terminal - 0.5, 99.0],
+                    &[100.0, terminal, 100.0],
+                )
+                .unwrap();
+            chart.time_scale.set_width(800.0);
+            chart.fit_content();
+            chart
+                .set_instrument_metadata(crate::InstrumentMetadata {
+                    tick_size: Some(0.25),
+                    point_value: Some(20.0),
+                    ..Default::default()
+                })
+                .unwrap();
+            // Keep an open run's right edge at candle 1. Closed runs must freeze there even
+            // though candle 2 returns to entry.
+            chart
+                .add_drawing(
+                    kind,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: 0.0,
+                            price: 100.0,
+                        },
+                        DrawingPoint {
+                            logical: if closed { 2.0 } else { 1.0 },
+                            price: 100.0 + direction * 10.0,
+                        },
+                        DrawingPoint {
+                            logical: 0.0,
+                            price: 100.0 - direction * 5.0,
+                        },
+                    ],
+                    None,
+                )
+                .unwrap();
+            let frame = chart.build_frame();
+            let pnl = if !closed {
+                (terminal - 100.0) * direction
+            } else if (terminal - 100.0) * direction > 0.0 {
+                10.0
+            } else {
+                -5.0
+            };
+            let expected = format!(
+                "{} P&L: {pnl:.2}, Qty: 2.5",
+                if closed { "Closed" } else { "Open" }
+            )
+            .replace('-', "\u{2212}");
+            assert!(
+                frame.panes[0]
+                    .main
+                    .iter()
+                    .any(|prim| matches!(prim, Prim::Text { text, .. } if *text == expected)),
+                "{kind:?} {terminal}: {expected}; texts {:?}",
+                frame.panes[0]
+                    .main
+                    .iter()
+                    .filter_map(|prim| if let Prim::Text { text, .. } = prim {
+                        Some(text)
+                    } else {
+                        None
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert!(frame.panes[0].main.iter().any(|prim| matches!(prim, Prim::Text { text, .. } if text == "Target: 10.00 (10.000%) 40, Amount: 1500")));
+        }
+    }
+}
+
+#[test]
+fn position_stats_refresh_instrument_metadata_and_handle_future_zero_risk_and_visibility() {
+    use crate::drawings::{DrawingKind, DrawingPoint};
+    fn texts(chart: &mut ChartEngine) -> Vec<String> {
+        chart.build_frame().panes[0]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    let mut chart = countdown_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::LongPosition,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 6.0,
+                    price: 12.0,
+                },
+                DrawingPoint {
+                    logical: 8.0,
+                    price: 13.0,
+                },
+                DrawingPoint {
+                    logical: 6.0,
+                    price: 11.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    assert!(texts(&mut chart)
+        .iter()
+        .any(|text| text == "Open P&L: 0.50, Qty: 250"));
+    chart
+        .set_trading_snapshot(crate::TradingSnapshot {
+            instrument: crate::InstrumentMetadata {
+                tick_size: Some(0.25),
+                point_value: Some(20.0),
+                quantity_precision: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    let refreshed = texts(&mut chart);
+    assert!(refreshed
+        .iter()
+        .any(|text| text == "Open P&L: 0.50, Qty: 12.5"));
+    assert!(refreshed
+        .iter()
+        .any(|text| text == "Target: 1.00 (8.333%) 4, Amount: 1250"));
+    chart
+        .set_instrument_metadata(crate::InstrumentMetadata {
+            tick_size: Some(0.5),
+            point_value: Some(10.0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(texts(&mut chart)
+        .iter()
+        .any(|text| text == "Open P&L: 0.50, Qty: 25"));
+    assert!(chart.drawing_set_points(
+        id,
+        r#"[{"logical":6,"price":12},{"logical":8,"price":13},{"logical":6,"price":12}]"#
+    ));
+    let zero = texts(&mut chart);
+    assert!(zero
+        .iter()
+        .any(|text| text == "Risk/reward ratio: \u{2014}"));
+    assert!(zero.iter().any(|text| text.ends_with("Qty: \u{2014}")));
+    assert!(chart.drawing_apply_options(id, r#"{"visible":false}"#));
+    assert!(!texts(&mut chart)
+        .iter()
+        .any(|text| text.starts_with("Target:")
+            || text.starts_with("Stop:")
+            || text.contains("Qty:")));
 }

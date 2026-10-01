@@ -5,19 +5,16 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
 publish.workspace = true
 description = "WebGPU backend for aeris_charts_render draw lists (pipelines, glyph atlas, batching)"
 
 [dependencies]
-aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
+aeris_charts_render = { path = "../aeris_charts_render" }
 wgpu = { version = "30", default-features = false, features = ["webgpu", "wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-aeris_charts_engine = { path = "../aeris_charts_engine", version = "0.3.0" }
+aeris_charts_engine = { path = "../aeris_charts_engine" }
 
 [lints]
 workspace = true

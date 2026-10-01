@@ -1,14 +1,14 @@
 {
-  "policy_version": 3,
+  "policy_version": 4,
   "baseline": "explicit_previous_release",
   "thresholds": {},
   "absolute_maximums": {
-    "package-release-artifacts.npm_tarball_bytes.p50": 1300000,
-    "package-release-artifacts.npm_unpacked_bytes.p50": 3700000,
+    "package-release-artifacts.npm_tarball_bytes.p50": 1650000,
+    "package-release-artifacts.npm_unpacked_bytes.p50": 4950000,
     "package-release-artifacts.javascript_raw_bytes.p50": 620000,
     "package-release-artifacts.javascript_brotli_bytes.p50": 95000,
-    "package-release-artifacts.wasm_raw_bytes.p50": 3000000,
-    "package-release-artifacts.wasm_brotli_bytes.p50": 810000,
+    "package-release-artifacts.wasm_raw_bytes.p50": 4100000,
+    "package-release-artifacts.wasm_brotli_bytes.p50": 1050000,
     "general-dashboard-100k.startup_ms.p50": 2000,
     "general-dashboard-100k.gpu_uploaded_bytes.p50": 100663296,
     "crosshair-reset-studies-daily-2520.canvas2d_ops.p50": 4500

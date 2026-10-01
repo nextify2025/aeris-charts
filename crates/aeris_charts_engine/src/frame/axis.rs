@@ -221,12 +221,17 @@ where
 /// would fall off the scale. Only labels from `alignLabels` scales participate (reference gates
 /// the whole pass on that option); the rest keep their raw coordinates. Fewer than two
 /// aligned labels are left untouched.
-fn resolve_last_value_label_overlap(labels: &mut [LastValueLabel], scale_height: f64) {
+fn resolve_last_value_label_overlap(
+    labels: &mut [LastValueLabel],
+    pane_top: f64,
+    pane_height: f64,
+) {
     let aligned: Vec<usize> = (0..labels.len()).filter(|&i| labels[i].align).collect();
     if aligned.len() < 2 {
         return;
     }
     let center = labels[aligned[0]].y;
+    let pane_bottom = pane_top + pane_height;
     // Split around the center and sort each side toward it (reference sorts by the source
     // coordinate, so capture the order before any adjustment).
     let mut top: Vec<usize> = aligned
@@ -248,15 +253,15 @@ fn resolve_last_value_label_overlap(labels: &mut [LastValueLabel], scale_height:
     for &i in &aligned {
         let label = &mut labels[i];
         let half = (label.height / 2.0).floor();
-        if label.y > -half && label.y < half {
-            label.y = half;
+        if label.y > pane_top - half && label.y < pane_top + half {
+            label.y = pane_top + half;
         }
-        if label.y > scale_height - half && label.y < scale_height + half {
-            label.y = scale_height - half;
+        if label.y > pane_bottom - half && label.y < pane_bottom + half {
+            label.y = pane_bottom - half;
         }
     }
-    recalculate_overlapping(labels, &top, 1.0, scale_height);
-    recalculate_overlapping(labels, &bottom, -1.0, scale_height);
+    recalculate_overlapping(labels, &top, 1.0, pane_top, pane_bottom);
+    recalculate_overlapping(labels, &bottom, -1.0, pane_top, pane_bottom);
 }
 
 /// reference `recalculateOverlapping` (price-axis-widget.ts:77-121): walk the labels outward from
@@ -267,43 +272,45 @@ fn recalculate_overlapping(
     labels: &mut [LastValueLabel],
     order: &[usize],
     direction: f64,
-    scale_height: f64,
+    pane_top: f64,
+    pane_bottom: f64,
 ) {
     if order.is_empty() {
         return;
     }
     let first = order[0];
     let init_height = labels[first].height;
+    let midpoint = (pane_top + pane_bottom) / 2.0;
     let mut space_before_group = (if direction > 0.0 {
-        scale_height / 2.0 - (labels[first].y - init_height / 2.0)
+        midpoint - (labels[first].y - init_height / 2.0)
     } else {
-        labels[first].y - init_height / 2.0 - scale_height / 2.0
+        labels[first].y - init_height / 2.0 - midpoint
     })
     .max(0.0);
     let mut group_start = 0usize;
     for i in 1..order.len() {
         let view = order[i];
         let prev = order[i - 1];
-        let height = labels[prev].height;
+        let clearance = (labels[prev].height + labels[view].height) / 2.0;
         let overlap = if direction > 0.0 {
-            labels[view].y > labels[prev].y - height
+            labels[view].y > labels[prev].y - clearance
         } else {
-            labels[view].y < labels[prev].y + height
+            labels[view].y < labels[prev].y + clearance
         };
         if overlap {
-            let render_y = labels[prev].y - height * direction;
+            let render_y = labels[prev].y - clearance * direction;
             labels[view].y = render_y;
-            let edge_point = render_y - direction * height / 2.0;
+            let edge_point = render_y - direction * labels[view].height / 2.0;
             let out_of_viewport = if direction > 0.0 {
-                edge_point < 0.0
+                edge_point < pane_top
             } else {
-                edge_point > scale_height
+                edge_point > pane_bottom
             };
             if out_of_viewport && space_before_group > 0.0 {
                 let desired_shift = if direction > 0.0 {
-                    -1.0 - edge_point
+                    pane_top - 1.0 - edge_point
                 } else {
-                    edge_point - scale_height
+                    edge_point - pane_bottom
                 };
                 let shift = desired_shift.min(space_before_group);
                 for &k in &order[group_start..] {
@@ -314,9 +321,9 @@ fn recalculate_overlapping(
         } else {
             group_start = i;
             space_before_group = if direction > 0.0 {
-                labels[prev].y - height - labels[view].y
+                labels[prev].y - clearance - labels[view].y
             } else {
-                labels[view].y - (labels[prev].y + height)
+                labels[view].y - (labels[prev].y + clearance)
             };
         }
     }
@@ -678,7 +685,14 @@ impl ChartEngine {
             separator_hover: self.separator_hover,
             ..AxisFrame::default()
         };
-        let visible = self.visible_range_for_frame();
+        // Time-axis ticks may legitimately extend beyond the last canonical data row when the
+        // host enables display-only future time projection. Price/series geometry must continue
+        // using the canonical visible data range above, but time labels should follow the full
+        // logical viewport and let `axis_time_key_at` decide whether a projected timestamp exists.
+        let visible_time_axis = self
+            .time_scale
+            .visible_strict_range()
+            .map(|range| (range.left(), range.right()));
         let layout_text_color = self.primary_text_color();
         // Per-scale label color (reference `textColor`): the scale's own color when set, else the
         // layout text color (price-axis-widget.ts:569).
@@ -785,12 +799,14 @@ impl ChartEngine {
             }
         }
         let explicit_marks = self.resolved_time_tick_marks();
-        if let (Some(range), Some(explicit)) = (visible, explicit_marks.as_deref()) {
+        if let (Some(range), Some(explicit)) =
+            (self.visible_range_for_frame(), explicit_marks.as_deref())
+        {
             if self.time_axis_visible {
                 self.append_explicit_time_labels(&mut out, explicit, range, &measure);
             }
             self.append_native_vertical_line_labels(&mut out.labels, &measure);
-        } else if let Some((from, to)) = visible {
+        } else if let Some((from, to)) = visible_time_axis {
             let time_marks = self.time_marks(max_label_width);
             let maximum_weight = time_marks
                 .iter()
@@ -801,7 +817,7 @@ impl ChartEngine {
                 if index < from || index > to {
                     continue;
                 }
-                let Some(ts) = self.axis_time_key_at(index as usize) else {
+                let Some(ts) = self.axis_time_key_at_logical(index) else {
                     continue;
                 };
                 // A hidden time axis (reference `timeScale.visible` false) drops its whole strip,
@@ -850,6 +866,7 @@ impl ChartEngine {
             }
             self.append_native_vertical_line_labels(&mut out.labels, &measure);
         }
+        let movable_label_start = out.labels.len();
         self.append_rectangle_drawing_axis_views(&mut out, &measure);
         self.append_position_drawing_axis_views(&mut out, &measure);
         self.append_price_line_labels(&mut out.labels, &measure);
@@ -857,6 +874,10 @@ impl ChartEngine {
         let last_value_start = out.labels.len();
         let live_price_regions =
             self.append_last_value_label(&mut out.labels, &measure, &countdown_measure);
+        self.resolve_boxed_price_label_overlap(
+            &mut out.labels,
+            movable_label_start..last_value_start,
+        );
         let mut action_labels = Vec::new();
         self.append_action_axis_labels(&mut action_labels, &live_price_regions, &measure);
         out.labels
@@ -873,6 +894,99 @@ impl ChartEngine {
             .map(|p| p.top - PANE_SEPARATOR)
             .collect();
         out
+    }
+
+    /// Place line and drawing price tags around the already resolved series clusters. Each
+    /// frame starts from the tags' price coordinates, so a tag returns there as soon as the
+    /// obstacle moves away. Financial-action and crosshair tags retain their exact anchors.
+    fn resolve_boxed_price_label_overlap(
+        &self,
+        labels: &mut [AxisLabel],
+        movable: std::ops::Range<usize>,
+    ) {
+        let fixed_start = movable.end;
+        let mut occupied: Vec<(f64, f64, f64, f64)> = labels[fixed_start..]
+            .iter()
+            .filter_map(|label| {
+                label
+                    .background
+                    .map(|(x, y, width, height, _)| (x, y, width, height))
+            })
+            .collect();
+        for index in movable {
+            let Some((x, top, width, height, _)) = labels[index].background else {
+                continue;
+            };
+            if labels[index].text.is_empty() || width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            let Some(pane) = self.panes.iter().find(|pane| {
+                top + height / 2.0 >= pane.top && top + height / 2.0 <= pane.top + pane.height
+            }) else {
+                continue;
+            };
+            let target = match labels[index].align {
+                AxisTextAlign::Right => PriceScaleTarget::Left,
+                AxisTextAlign::Left => PriceScaleTarget::Right,
+                AxisTextAlign::Center => continue,
+            };
+            if !pane_scale(pane, target).options().align_labels || height > pane.height {
+                continue;
+            }
+            let raw_top = top;
+            let mut blocked = Vec::new();
+            for &(other_x, other_top, other_width, other_height) in &occupied {
+                if x < other_x + other_width
+                    && other_x < x + width
+                    && other_top < pane.top + pane.height
+                    && other_top + other_height > pane.top
+                {
+                    blocked.push((other_top, other_top + other_height));
+                }
+            }
+            if blocked.is_empty() {
+                occupied.push((x, top, width, height));
+                continue;
+            }
+            let find_space = |above: bool| {
+                let mut candidate = raw_top.clamp(pane.top, pane.top + pane.height - height);
+                for _ in 0..=blocked.len() {
+                    let overlap = blocked
+                        .iter()
+                        .find(|&&(start, end)| candidate < end && candidate + height > start);
+                    let Some(&(start, end)) = overlap else {
+                        return Some(candidate);
+                    };
+                    candidate = if above { start - height } else { end };
+                    if candidate < pane.top || candidate + height > pane.top + pane.height {
+                        return None;
+                    }
+                }
+                None
+            };
+            let above = find_space(true);
+            let below = find_space(false);
+            let placed = match (above, below) {
+                (Some(a), Some(b)) if (a - raw_top).abs() < (b - raw_top).abs() => Some(a),
+                (Some(_), Some(b)) => Some(b),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(placed) = placed {
+                let shift = placed - top;
+                labels[index].y += shift;
+                if let Some(background) = labels[index].background.as_mut() {
+                    background.1 = placed;
+                }
+                occupied.push((x, placed, width, height));
+            } else {
+                // An overfull pane cannot show every optional tag without covering a price.
+                // This tag will be rebuilt from its anchor and reappear once a slot opens.
+                labels[index].text.clear();
+                labels[index].background = None;
+            }
+        }
     }
 
     fn append_rectangle_drawing_axis_views<F>(&self, out: &mut AxisFrame, measure: &F)
@@ -1103,14 +1217,10 @@ impl ChartEngine {
                 }
                 let logical = point.logical.round();
                 // Anchors beyond the data show their extrapolated anchor time.
-                let Some(time) = usize::try_from(logical as i64)
-                    .ok()
-                    .and_then(|index| self.axis_time_key_at(index))
-                    .or_else(|| {
-                        self.anchor_time_at_logical(logical)
-                            .map(|time| time.floor() as i64)
-                    })
-                else {
+                let Some(time) = self.axis_time_key_at_logical(logical as i64).or_else(|| {
+                    self.anchor_time_at_logical(logical)
+                        .map(|time| time.floor() as i64)
+                }) else {
                     continue;
                 };
                 let printed = self.bar_label_time(time);
@@ -2145,7 +2255,8 @@ impl ChartEngine {
             // Chips that would collide are SPACED, not restyled: `resolve_last_value_label_overlap`
             // already pushes them a full box apart, so a chip's fill carries only whether its
             // value is live (see `hollow`) rather than doubling as collision feedback.
-            resolve_last_value_label_overlap(&mut group, self.pane_h);
+            let pane = &self.panes[pane_index];
+            resolve_last_value_label_overlap(&mut group, pane.top, pane.height);
             for label in &group {
                 live_price_regions.push(LivePriceRegion {
                     pane_index,
@@ -2625,12 +2736,9 @@ impl ChartEngine {
         }
         if ch.vert_line.label_visible && x_css <= self.pane_w && self.time_axis_visible {
             let index = self.snapped_crosshair_index(x_css);
-            // reference `indexToTime` returns null in the empty area — the time label is hidden
-            // when the snapped index has no bar (past either data edge).
-            if index >= 0 {
-                let Some(time) = self.axis_time_key_at(index as usize) else {
-                    return;
-                };
+            // Deterministic time-based charts may have display-only projected timestamps in the
+            // empty area on either side of canonical data. Sequence axes still return `None`.
+            if let Some(time) = self.axis_time_key_at_logical(index) {
                 let text = self.format_crosshair_ts(time);
                 let width = AxisMetrics::time_tag_width(measure(&text, false));
                 let height = metrics.time_strip_height();

@@ -2063,6 +2063,26 @@ impl ChartInner {
         self.engine.set_seconds_visible(visible);
     }
 
+    pub fn set_time_zone(&mut self, time_zone: &str) -> bool {
+        match self.engine.set_time_zone(time_zone) {
+            Ok(changed) => {
+                // Period-keyed studies and every label follow the zone: settle the axis widths.
+                if changed {
+                    self.recompute_layout(true);
+                }
+                changed
+            }
+            Err(error) => {
+                web_sys::console::warn_1(&format!("aeris_charts: {error}").into());
+                false
+            }
+        }
+    }
+
+    pub fn time_zone(&self) -> &'static str {
+        self.engine.time_zone_id()
+    }
+
     /// reference `timeScale.minBarSpacing`.
     pub fn set_min_bar_spacing(&mut self, spacing: f64) {
         self.engine.set_min_bar_spacing(spacing);

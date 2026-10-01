@@ -17,7 +17,7 @@ use aeris_charts_render::color::Color;
 
 use crate::{
     marker_pos, marker_shape, ChartEngine, Marker, PriceFormatKind, SeriesKind, SeriesOwner,
-    SeriesPriceFormat,
+    SeriesPriceFormat, SEPARATE_INDICATOR_PANE_STRETCH,
 };
 
 const MICROS_PER_SECOND: i64 = 1_000_000;
@@ -28,6 +28,11 @@ const MAX_TIMESTAMP_MICROS: i64 = 253_402_300_799 * MICROS_PER_SECOND + 999_999;
 pub const MAX_TRADE_STREAMS: usize = 64;
 pub const MAX_TRADE_STREAM_KEY_BYTES: usize = 128;
 pub const MAX_TIME_AND_SALES_ROWS: usize = 4_096;
+pub const ORDER_FLOW_TRADE_BUBBLE_CAPACITY: usize = 2_048;
+pub const ORDER_FLOW_SWEEP_WINDOW_MICROS: i64 = 100_000;
+const ORDER_FLOW_AUTO_ROWS_PER_BAR: f64 = 24.0;
+const MAXIMUM_AUTO_TICKS_PER_ROW: u32 = 1_000_000;
+const MAXIMUM_BUBBLE_THRESHOLD_SAMPLES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TradeStudyKind {
@@ -344,6 +349,58 @@ impl FootprintVisualOptions {
 pub struct FootprintSeriesOptions {
     pub aggregation: FootprintAggregationOptions,
     pub visual: FootprintVisualOptions,
+}
+
+/// One atomic chart presentation derived from a shared canonical trade stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderFlowPresentationOptions {
+    pub aggregation: FootprintAggregationOptions,
+    pub visual: FootprintVisualOptions,
+    pub recent_median_price_range: Option<f64>,
+    pub show_footprint: bool,
+    pub show_cumulative_delta: bool,
+    pub show_delta_histogram: bool,
+    pub show_trade_bubbles: bool,
+    /// Zero selects the bounded adaptive 90th-percentile policy.
+    pub trade_bubble_minimum_volume: f64,
+}
+
+/// Engine-issued identities for one order-flow presentation graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderFlowPresentation {
+    trade_stream: u64,
+    footprint_series: Option<SeriesId>,
+    cumulative_delta_series: Option<SeriesId>,
+    delta_series: Option<SeriesId>,
+    ticks_per_row: u32,
+    primary_series: SeriesId,
+}
+
+impl OrderFlowPresentation {
+    #[must_use]
+    pub const fn trade_stream(self) -> u64 {
+        self.trade_stream
+    }
+
+    #[must_use]
+    pub const fn footprint_series(self) -> Option<SeriesId> {
+        self.footprint_series
+    }
+
+    #[must_use]
+    pub const fn cumulative_delta_series(self) -> Option<SeriesId> {
+        self.cumulative_delta_series
+    }
+
+    #[must_use]
+    pub const fn delta_series(self) -> Option<SeriesId> {
+        self.delta_series
+    }
+
+    #[must_use]
+    pub const fn ticks_per_row(self) -> u32 {
+        self.ticks_per_row
+    }
 }
 
 impl Default for FootprintAggregationOptions {
@@ -1650,6 +1707,30 @@ impl FootprintAggregator {
 }
 
 impl ChartEngine {
+    pub(crate) fn apply_indicator_chrome_to_trade_studies(
+        &mut self,
+        options: crate::IndicatorChromeOptions,
+    ) -> bool {
+        let ids = self
+            .trade_dependents
+            .values()
+            .flatten()
+            .map(|dependent| dependent.series_id)
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for id in ids {
+            if let Some(series) = self.series_entry_mut(id) {
+                changed |= series.title_visible != options.name_labels_visible
+                    || series.last_value_visible != options.value_labels_visible
+                    || series.price_line_visible != options.price_lines_visible;
+                series.title_visible = options.name_labels_visible;
+                series.last_value_visible = options.value_labels_visible;
+                series.price_line_visible = options.price_lines_visible;
+            }
+        }
+        changed
+    }
+
     pub fn replay_clock_micros(&self) -> Option<i64> {
         self.replay_clock_micros
     }
@@ -2125,7 +2206,7 @@ impl ChartEngine {
             return Err(FootprintError::InvalidAggregation);
         }
         let id = self.add_series(SeriesKind::Line);
-        self.set_series_pane(id, pane_index, 1.0);
+        self.set_series_pane(id, pane_index, SEPARATE_INDICATOR_PANE_STRETCH);
         if let Some(series) = self.series_entry_mut(id) {
             series.title = "CVD".to_string();
         }
@@ -2145,7 +2226,7 @@ impl ChartEngine {
         self.trade_stream(stream_id)
             .ok_or(FootprintError::UnknownTradeStream(stream_id))?;
         let id = self.add_series(SeriesKind::Histogram);
-        self.set_series_pane(id, pane_index, 1.0);
+        self.set_series_pane(id, pane_index, SEPARATE_INDICATOR_PANE_STRETCH);
         if let Some(series) = self.series_entry_mut(id) {
             series.title = "Delta".to_string();
         }
@@ -2283,6 +2364,149 @@ impl ChartEngine {
                 fold: None,
             });
         self.refresh_trade_bubbles(stream_id, false)
+    }
+
+    /// Create the complete series/pane graph for one shared order-flow stream.
+    ///
+    /// Any failure rolls back every series, pane dependency, and stream created by this call.
+    pub fn add_order_flow_presentation(
+        &mut self,
+        stream_key: &str,
+        primary_series: SeriesId,
+        mut options: OrderFlowPresentationOptions,
+        initial_trade_volumes: &[f64],
+    ) -> Result<OrderFlowPresentation, FootprintError> {
+        self.validate_series_id(primary_series)
+            .map_err(series_error)?;
+        if options.aggregation.ticks_per_row == 0 {
+            options.aggregation.ticks_per_row = auto_footprint_ticks_per_row(
+                options.recent_median_price_range,
+                options.aggregation.tick_size,
+            );
+        }
+        if !options.trade_bubble_minimum_volume.is_finite()
+            || options.trade_bubble_minimum_volume < 0.0
+        {
+            return Err(FootprintError::InvalidAggregation);
+        }
+        validate_chart_projection(options.aggregation)?;
+        validate_visual_options(&options.visual)?;
+
+        let stream = self.add_trade_stream(stream_key, options.aggregation)?;
+        let mut presentation = OrderFlowPresentation {
+            trade_stream: stream,
+            footprint_series: None,
+            cumulative_delta_series: None,
+            delta_series: None,
+            ticks_per_row: options.aggregation.ticks_per_row,
+            primary_series,
+        };
+        let result = (|| {
+            if options.show_footprint {
+                let series = self.add_footprint_series(FootprintSeriesOptions {
+                    aggregation: options.aggregation,
+                    visual: options.visual,
+                })?;
+                self.bind_footprint_series_to_stream(series, stream)?;
+                if let Some(entry) = self.series_entry_mut(series) {
+                    entry.last_value_visible = false;
+                    entry.price_line_visible = false;
+                }
+                presentation.footprint_series = Some(series);
+            }
+            if options.show_cumulative_delta {
+                let pane = self
+                    .add_pane(false)
+                    .ok_or(FootprintError::InvalidAggregation)?;
+                self.panes[pane].stretch_factor = SEPARATE_INDICATOR_PANE_STRETCH;
+                presentation.cumulative_delta_series =
+                    Some(self.add_cvd_series(stream, pane, TradeStudyOptions::default())?);
+            }
+            if options.show_delta_histogram {
+                let pane = self
+                    .add_pane(false)
+                    .ok_or(FootprintError::InvalidAggregation)?;
+                self.panes[pane].stretch_factor = SEPARATE_INDICATOR_PANE_STRETCH;
+                presentation.delta_series = Some(self.add_delta_series(stream, pane)?);
+            }
+            if options.show_trade_bubbles {
+                if let Some(series) = presentation.footprint_series {
+                    self.add_trade_bubbles(
+                        stream,
+                        series,
+                        TradeBubbleOptions {
+                            minimum_volume: adaptive_trade_bubble_threshold(
+                                options.trade_bubble_minimum_volume,
+                                initial_trade_volumes,
+                            ),
+                            max_markers: ORDER_FLOW_TRADE_BUBBLE_CAPACITY,
+                            aggregation_window_micros: ORDER_FLOW_SWEEP_WINDOW_MICROS,
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.remove_order_flow_presentation(presentation);
+            return Err(error);
+        }
+        let chrome = self.indicator_chrome;
+        for id in [
+            presentation.cumulative_delta_series,
+            presentation.delta_series,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(series) = self.series_entry_mut(id) {
+                series.title_visible = chrome.name_labels_visible;
+                series.last_value_visible = chrome.value_labels_visible;
+                series.price_line_visible = chrome.price_lines_visible;
+            }
+        }
+        Ok(presentation)
+    }
+
+    /// Replace or append canonical tape data and atomically advance every dependent presentation.
+    pub fn update_order_flow_presentation(
+        &mut self,
+        presentation: OrderFlowPresentation,
+        trades: Vec<FootprintTrade>,
+        append: bool,
+    ) -> Result<FootprintUpdateKind, FootprintError> {
+        let update = if append {
+            self.update_trade_stream_trades(presentation.trade_stream, trades)?
+        } else {
+            self.set_trade_stream_trades(presentation.trade_stream, trades)?;
+            FootprintUpdateKind::Historical
+        };
+        let footprint_start = presentation.footprint_series.and_then(|series| {
+            self.footprint_bar(series, 0)
+                .map(|bar| bar.start_timestamp_micros.div_euclid(MICROS_PER_SECOND))
+        });
+        self.set_series_render_before_time(presentation.primary_series, footprint_start);
+        Ok(update)
+    }
+
+    /// Tear down a complete order-flow graph and release its fixed aggregation stream.
+    pub fn remove_order_flow_presentation(&mut self, presentation: OrderFlowPresentation) -> bool {
+        let mut changed = false;
+        for series in [
+            presentation.cumulative_delta_series,
+            presentation.delta_series,
+            presentation.footprint_series,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            changed |= self.remove_series(series);
+        }
+        if self.remove_trade_stream(presentation.trade_stream).is_ok() {
+            changed = true;
+        }
+        self.set_series_render_before_time(presentation.primary_series, None);
+        changed
     }
 
     /// Add a first-class tick-driven footprint series. Time bars use the chart's UTC-second
@@ -3613,6 +3837,54 @@ impl BubbleFold {
     }
 }
 
+/// Resolve an automatic footprint row size to a legible 1-2-5 tick step.
+#[must_use]
+pub fn auto_footprint_ticks_per_row(recent_median_price_range: Option<f64>, tick_size: f64) -> u32 {
+    let Some(range) = recent_median_price_range.filter(|range| range.is_finite() && *range > 0.0)
+    else {
+        return 1;
+    };
+    if !tick_size.is_finite() || tick_size <= 0.0 {
+        return 1;
+    }
+    let wanted = range / ORDER_FLOW_AUTO_ROWS_PER_BAR / tick_size;
+    if !wanted.is_finite() || wanted <= 1.0 {
+        return 1;
+    }
+    let mut decade = 1_u32;
+    while decade <= MAXIMUM_AUTO_TICKS_PER_ROW {
+        for step in [1, 2, 5] {
+            let candidate = decade.saturating_mul(step);
+            if f64::from(candidate) >= wanted {
+                return candidate.min(MAXIMUM_AUTO_TICKS_PER_ROW);
+            }
+        }
+        decade = decade.saturating_mul(10);
+    }
+    MAXIMUM_AUTO_TICKS_PER_ROW
+}
+
+/// Resolve zero to a bounded recent-volume 90th percentile; explicit thresholds pass through.
+#[must_use]
+pub fn adaptive_trade_bubble_threshold(configured: f64, trade_volumes: &[f64]) -> f64 {
+    if configured > 0.0 {
+        return configured;
+    }
+    let mut volumes = trade_volumes
+        .iter()
+        .rev()
+        .take(MAXIMUM_BUBBLE_THRESHOLD_SAMPLES)
+        .copied()
+        .filter(|volume| volume.is_finite() && *volume > 0.0)
+        .collect::<Vec<_>>();
+    if volumes.is_empty() {
+        return f64::MAX;
+    }
+    let index = volumes.len().saturating_mul(9).saturating_sub(1) / 10;
+    volumes.select_nth_unstable_by(index, f64::total_cmp);
+    volumes[index]
+}
+
 /// Running cumulative-delta state after a prefix of bars. Clean rebuilds and live tips step the
 /// same fold, so their floating-point results are identical.
 #[derive(Clone, Copy, Debug, Default)]
@@ -4840,6 +5112,61 @@ mod tests {
         assert_eq!(historical, FootprintUpdateKind::Historical);
         assert_eq!(chart.data_layer().series_data(0).unwrap().0.len(), 2);
         assert_eq!(chart.footprint_bar(0, 0).unwrap().delta, 12.0);
+    }
+
+    #[test]
+    fn retained_time_footprint_appends_live_bars_like_a_full_reinstall() {
+        let options = FootprintSeriesOptions {
+            aggregation: FootprintAggregationOptions {
+                tick_size: 1.0,
+                ticks_per_row: 1,
+                bars: FootprintBarAggregation::Time {
+                    interval_micros: 1_000_000,
+                    anchor_micros: 0,
+                },
+                imbalance: FootprintImbalanceOptions::default(),
+            },
+            visual: FootprintVisualOptions::default(),
+        };
+        let history = (1..=4)
+            .map(|second| {
+                trade(
+                    second * 1_000_000,
+                    100.0 + second as f64,
+                    1.0,
+                    AggressorSide::Buy,
+                )
+            })
+            .collect::<Vec<_>>();
+        let live = vec![
+            trade(4_500_000, 90.0, 2.0, AggressorSide::Sell),
+            trade(5_000_000, 106.0, 3.0, AggressorSide::Buy),
+            trade(6_000_000, 107.0, 1.0, AggressorSide::Buy),
+        ];
+
+        // A retention cap must not force time bars through a full reinstall per live batch:
+        // timestamps key the suffix, so the appended result matches a fresh projection.
+        let mut live_chart = ChartEngine::new(600.0, 400.0, 1.0);
+        live_chart
+            .configure_footprint_series(0, options.clone())
+            .unwrap();
+        live_chart.set_footprint_trades(0, history.clone()).unwrap();
+        assert!(live_chart.set_series_max_points(0, Some(3)));
+        let update = live_chart.update_footprint_trades(0, live.clone()).unwrap();
+        assert_eq!(update, FootprintUpdateKind::Tip);
+
+        let mut fresh = ChartEngine::new(600.0, 400.0, 1.0);
+        fresh.configure_footprint_series(0, options).unwrap();
+        fresh
+            .set_footprint_trades(0, history.into_iter().chain(live).collect())
+            .unwrap();
+        assert!(fresh.set_series_max_points(0, Some(3)));
+
+        assert_eq!(live_chart.footprint_bars(0), fresh.footprint_bars(0));
+        assert_eq!(
+            live_chart.data_layer().series_data(0),
+            fresh.data_layer().series_data(0)
+        );
     }
 
     #[test]
@@ -6350,5 +6677,87 @@ mod tests {
         let bars = chart.footprint_bars(0).unwrap();
         assert_eq!((bars[0].session_delta, bars[1].session_delta), (6.0, 8.0));
         assert_eq!(chart.data_layer().series_data(0).unwrap().0.len(), 2);
+    }
+
+    #[test]
+    fn trade_studies_open_at_the_same_small_height_as_other_indicators() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let stream = chart
+            .add_trade_stream("pane-sizing", FootprintAggregationOptions::default())
+            .unwrap();
+        let cvd = chart
+            .add_cvd_series(stream, 1, TradeStudyOptions::default())
+            .unwrap();
+        let delta = chart.add_delta_series(stream, 2).unwrap();
+        assert_eq!(chart.series_entry(cvd).unwrap().pane_index, 1);
+        assert_eq!(chart.series_entry(delta).unwrap().pane_index, 2);
+        assert_eq!(chart.panes[1].stretch_factor, 0.3);
+        assert_eq!(chart.panes[2].stretch_factor, 0.3);
+
+        chart.layout_panes(400.0);
+        assert_eq!(chart.panes[1].height, chart.panes[2].height);
+        assert!(chart.panes[1].height < chart.panes[0].height);
+
+        let custom_pane = chart.add_pane(true).unwrap();
+        chart.panes[custom_pane].stretch_factor = 0.8;
+        chart
+            .add_cvd_series(stream, custom_pane, TradeStudyOptions::default())
+            .unwrap();
+        assert_eq!(chart.panes[custom_pane].stretch_factor, 0.8);
+    }
+
+    #[test]
+    fn order_flow_presentation_is_atomic_and_owns_cutover_and_policy() {
+        let mut chart = ChartEngine::new(600.0, 400.0, 1.0);
+        let presentation = chart
+            .add_order_flow_presentation(
+                "BTC:provider-generation-7",
+                0,
+                OrderFlowPresentationOptions {
+                    aggregation: FootprintAggregationOptions {
+                        tick_size: 0.25,
+                        ticks_per_row: 0,
+                        ..FootprintAggregationOptions::default()
+                    },
+                    visual: FootprintVisualOptions::default(),
+                    recent_median_price_range: Some(120.0),
+                    show_footprint: true,
+                    show_cumulative_delta: true,
+                    show_delta_histogram: true,
+                    show_trade_bubbles: true,
+                    trade_bubble_minimum_volume: 0.0,
+                },
+                &[1.0, 2.0, 3.0, 100.0],
+            )
+            .unwrap();
+        assert_eq!(presentation.ticks_per_row(), 20);
+        assert!(presentation.footprint_series().is_some());
+        assert!(presentation.cumulative_delta_series().is_some());
+        assert!(presentation.delta_series().is_some());
+        assert_eq!(chart.panes[1].stretch_factor, 0.3);
+        assert_eq!(chart.panes[2].stretch_factor, 0.3);
+
+        chart
+            .update_order_flow_presentation(
+                presentation,
+                vec![trade(60_000_000, 100.0, 2.0, AggressorSide::Buy)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(chart.series_entry(0).unwrap().render_before_time, Some(60));
+        assert!(chart.remove_order_flow_presentation(presentation));
+        assert_eq!(chart.series_entry(0).unwrap().render_before_time, None);
+        assert!(chart.trade_stream(presentation.trade_stream()).is_none());
+    }
+
+    #[test]
+    fn automatic_order_flow_policies_are_bounded_and_deterministic() {
+        assert_eq!(auto_footprint_ticks_per_row(Some(120.0), 0.25), 20);
+        assert_eq!(auto_footprint_ticks_per_row(None, 0.25), 1);
+        assert_eq!(adaptive_trade_bubble_threshold(7.0, &[1.0, 2.0]), 7.0);
+        assert_eq!(
+            adaptive_trade_bubble_threshold(0.0, &[1.0, 2.0, 3.0, 100.0]),
+            100.0
+        );
     }
 }

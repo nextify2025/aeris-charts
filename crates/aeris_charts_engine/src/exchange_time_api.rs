@@ -3,17 +3,23 @@
 //! The chart keeps canonical UTC seconds everywhere. These settings only change how instants are
 //! grouped into trading days and presented: tick weights, built-in time labels, VWAP/pivot resets,
 //! session highlighting, and the countdown window all read the same [`ExchangeTime`]. Hosts supply
-//! an explicit UTC-offset schedule; the engine never consults a platform time zone.
+//! an explicit UTC-offset schedule or name a zone from the TradingView parity list, which
+//! `ChartTimeZone` resolves once into one; the engine never consults a platform time zone.
 
 use aeris_charts_core::scale::exchange_time::{ExchangeTime, UtcOffsetSchedule};
 use aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_shifted_in;
 
-use crate::{ChartEngine, ExchangeTimeError, UtcOffsetTransition};
+use crate::{ChartEngine, ChartTimeZone, ExchangeTimeError, UtcOffsetTransition};
 
-/// Parsed, validated `timeScale.timeZone` / `timeScale.sessionStart` keys of an options patch.
+/// Parsed, validated `timeScale.timeZone` / `timeScale.sessionStart` keys and top-level `timezone`
+/// name of an options patch.
 #[derive(Debug, Default)]
 pub(crate) struct ExchangeTimePatch {
     offsets: Option<UtcOffsetSchedule>,
+    /// The `timezone` name (a TradingView parity id), validated.
+    named: Option<ChartTimeZone>,
+    /// The named zone's own schedule, resolved only when no explicit schedule travels with it.
+    named_schedule: Option<UtcOffsetSchedule>,
     session_start_seconds: Option<i32>,
 }
 
@@ -48,11 +54,56 @@ impl ChartEngine {
     /// Install the exchange time zone as a validated UTC-offset schedule (UTC by default). Tick
     /// weights, built-in labels, trading-day indicator resets, session highlighting, and the
     /// countdown follow it. The schedule is mirrored into the options store so option snapshots
-    /// and V2 persistence round-trip it.
-    pub fn set_time_zone(&mut self, offsets: UtcOffsetSchedule) {
+    /// and V2 persistence round-trip it. An explicit schedule clears the named zone: general
+    /// temporal axes and the clock then stay UTC and [`Self::time_zone_id`] reports `custom`.
+    pub fn set_exchange_offsets(&mut self, offsets: UtcOffsetSchedule) {
+        self.install_time_zone(ChartTimeZone::default(), offsets);
+    }
+
+    /// Select one of [`crate::TRADINGVIEW_TIME_ZONES`] by IANA id. The zone is resolved once into
+    /// the same offset schedule [`Self::set_exchange_offsets`] takes, so tick weights, labels,
+    /// period resets, sessions and the countdown follow it exactly like the explicit schedule;
+    /// general temporal axes and [`Self::time_zone_clock_text`] follow the name. `Ok(false)` when
+    /// the zone is already installed.
+    pub fn set_time_zone(&mut self, value: &str) -> Result<bool, String> {
+        let zone = ChartTimeZone::parse(value)
+            .ok_or_else(|| format!("unsupported IANA time zone: {value}"))?;
+        if self.zone_installed(zone) {
+            return Ok(false);
+        }
+        let offsets = zone.offset_schedule().map_err(|error| error.to_string())?;
+        self.install_time_zone(zone, offsets);
+        Ok(true)
+    }
+
+    /// Whether `zone` is the named zone already in force (the default zone counts only while the
+    /// offsets are UTC, since an explicit schedule leaves the default name behind).
+    fn zone_installed(&self, zone: ChartTimeZone) -> bool {
+        self.time_zone == zone
+            && (zone != ChartTimeZone::default() || self.exchange_time.offsets().is_utc())
+    }
+
+    /// The installed named zone (`Etc/UTC` by default), or `custom` when an explicit schedule that
+    /// no named zone produced is installed. Canonical data and public timestamps remain UTC.
+    pub fn time_zone_id(&self) -> &'static str {
+        if self.time_zone == ChartTimeZone::default() && !self.exchange_time.offsets().is_utc() {
+            "custom"
+        } else {
+            self.time_zone.id()
+        }
+    }
+
+    /// Install a schedule together with the named zone that produced it (the default zone for an
+    /// explicit schedule).
+    fn install_time_zone(&mut self, zone: ChartTimeZone, offsets: UtcOffsetSchedule) {
+        let zone_changed = self.time_zone != zone;
+        self.time_zone = zone;
         if self.exchange_time.offsets() != &offsets {
             self.exchange_time.set_offsets(offsets);
             self.exchange_time_changed();
+        } else if zone_changed {
+            // General temporal axes and the clock follow the named zone.
+            self.invalidate_frame_all();
         }
         self.mirror_exchange_time_options();
     }
@@ -110,34 +161,46 @@ impl ChartEngine {
         time_zone_json(self.exchange_time.offsets())
     }
 
-    /// Write the live time zone and session start into the options store, so option snapshots
-    /// and V2 persistence always describe the exchange time the chart actually uses (including
-    /// after importing a document that predates these keys).
+    /// Write the live time zone, its name and the session start into the options store, so option
+    /// snapshots and V2 persistence always describe the exchange time the chart actually uses
+    /// (including after importing a document that predates these keys). The `timezone` name is
+    /// written only while a named zone is installed and cleared when an explicit schedule
+    /// replaces it, so a persisted name is never stale.
     pub(crate) fn mirror_exchange_time_options(&mut self) {
-        self.options.apply(&serde_json::json!({
+        let mut patch = serde_json::json!({
             "timeScale": {
                 "timeZone": self.time_zone_json(),
                 "sessionStart": self.exchange_time.session_start_seconds(),
             }
-        }));
+        });
+        if self.time_zone != ChartTimeZone::default() {
+            patch["timezone"] = serde_json::json!(self.time_zone.id());
+        } else if self
+            .options
+            .value()
+            .get("timezone")
+            .is_some_and(|value| !value.is_null())
+        {
+            patch["timezone"] = serde_json::Value::Null;
+        }
+        self.options.apply(&patch);
     }
 
-    /// Validate the exchange-time keys of an options patch without mutating anything.
+    /// Validate the exchange-time keys of an options patch without mutating anything. Judged against
+    /// the state in force now, so a name that is already installed costs nothing.
     pub(crate) fn parse_exchange_time_patch(
+        &self,
         patch: &serde_json::Value,
     ) -> Result<ExchangeTimePatch, String> {
-        let Some(time_scale) = patch
+        let time_scale = patch
             .get("timeScale")
-            .and_then(serde_json::Value::as_object)
-        else {
-            return Ok(ExchangeTimePatch::default());
-        };
+            .and_then(serde_json::Value::as_object);
         let offsets = time_scale
-            .get("timeZone")
+            .and_then(|time_scale| time_scale.get("timeZone"))
             .map(parse_time_zone)
             .transpose()?;
         let session_start_seconds = time_scale
-            .get("sessionStart")
+            .and_then(|time_scale| time_scale.get("sessionStart"))
             .map(|value| {
                 let seconds = value
                     .as_f64()
@@ -152,8 +215,28 @@ impl ChartEngine {
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
+        // The top-level `timezone` option names a TradingView parity zone. It is validated like
+        // every other rejectable key; its own schedule is resolved only when `timeScale.timeZone`
+        // does not carry one (a V2 document carries both, written together).
+        let named = match patch.get("timezone") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(id)) => Some(
+                ChartTimeZone::parse(id)
+                    .ok_or_else(|| format!("unsupported IANA time zone: {id}"))?,
+            ),
+            Some(_) => return Err("timezone must be an IANA time zone id string".to_string()),
+        };
+        let named_schedule = match (named, &offsets) {
+            // A host may resend the installed name with every patch: resolve nothing for it.
+            (Some(zone), None) if !self.zone_installed(zone) => {
+                Some(zone.offset_schedule().map_err(|error| error.to_string())?)
+            }
+            _ => None,
+        };
         Ok(ExchangeTimePatch {
             offsets,
+            named,
+            named_schedule,
             session_start_seconds,
         })
     }
@@ -165,8 +248,11 @@ impl ChartEngine {
             self.install_session_start(seconds)
                 .expect("session start was validated before the options patch applied");
         }
-        if let Some(offsets) = patch.offsets {
-            self.set_time_zone(offsets);
+        match (patch.offsets, patch.named, patch.named_schedule) {
+            (Some(offsets), Some(zone), _) => self.install_time_zone(zone, offsets),
+            (Some(offsets), None, _) => self.set_exchange_offsets(offsets),
+            (None, Some(zone), Some(offsets)) => self.install_time_zone(zone, offsets),
+            (None, _, _) => {}
         }
     }
 
@@ -178,27 +264,20 @@ impl ChartEngine {
         self.invalidate_frame_all();
     }
 
-    /// Recompute every axis weight in the current exchange time without touching view state.
+    /// Recompute every axis weight in the current exchange time without touching view state. The
+    /// column covers the display-only projected labels on both sides of the data (negative
+    /// logical indices for past labels) and the non-time sequence axis.
     pub(crate) fn rebuild_tick_weights(&mut self) {
-        let sequence_times = self.sequence_points().map(|points| {
-            points
-                .iter()
-                .map(|point| point.open_timestamp_micros.div_euclid(1_000_000))
-                .collect::<Vec<_>>()
-        });
-        let times = sequence_times
-            .as_deref()
-            .unwrap_or_else(|| self.data.merged_times());
-        let label_shift = self.tick_label_shift();
+        let (start_index, times) = self.axis_tick_times();
         let mut weights = vec![0u8; times.len()];
         fill_weights_for_points_shifted_in(
-            times,
+            &times,
             &mut weights,
             0,
-            label_shift,
+            self.tick_label_shift(),
             &self.exchange_time,
         );
-        self.tick_marks.set_weights(&weights);
+        self.tick_marks.set_weights_from(start_index, &weights);
     }
 }
 
@@ -354,7 +433,7 @@ mod tests {
         }
         let mut chart = line_chart(&times);
         // Installing the zone after the data rebuilds weights and labels.
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         let lunch_close = 120; // 11:30
         let afternoon_open = 121; // 13:00
         let spacing = chart.time_scale.bar_spacing();
@@ -387,7 +466,7 @@ mod tests {
             }
         }
         // Resetting to UTC restores the historical labels.
-        chart.set_time_zone(UtcOffsetSchedule::utc());
+        chart.set_exchange_offsets(UtcOffsetSchedule::utc());
         assert_eq!(crosshair_label(&mut chart, 0), "02 Jan '24   01:30");
     }
 
@@ -415,7 +494,7 @@ mod tests {
         chart
             .set_series_data(0, &slot_times, &values, &values, &values, &values)
             .unwrap();
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         chart.series[0].countdown_visible = true;
         let forming = times[traded - 1];
         chart.now_override = Some((forming + 45) as f64);
@@ -440,7 +519,7 @@ mod tests {
         let last = *half_day.last().unwrap();
         times.extend(half_day);
         let mut chart = line_chart(&times);
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         chart.series[0].countdown_visible = true;
         chart.now_override = Some((last + 30) as f64);
         assert_eq!(chart.series_countdown_text(0).as_deref(), Some("00:30"));
@@ -462,7 +541,7 @@ mod tests {
         let monday = times.len();
         times.extend(bars(&zone, (2024, 3, 11), (9, 30), (16, 0), 30));
         let mut chart = line_chart(&times);
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         assert_eq!(crosshair_label(&mut chart, 0), "08 Mar '24   09:30");
         assert_eq!(crosshair_label(&mut chart, monday), "11 Mar '24   09:30");
         assert_eq!(times[0] % 86_400, 14 * HOUR + 30 * 60);
@@ -483,7 +562,7 @@ mod tests {
         assert_eq!(utc_vwap[15], 115.0);
         assert!(day_marks(&mut chart).contains(&15));
 
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         assert_eq!(day_marks(&mut chart), vec![next]);
         let eastern = output(&chart, vwap);
         // Unit weights: the session average of 100..=115 and a fresh session at 04:00 ET.
@@ -501,7 +580,7 @@ mod tests {
         times.extend(bars(&zone, (2024, 1, 3), (9, 0), (11, 30), 30));
         let mut chart = line_chart(&times);
         let vwap = chart.add_vwap(0, None).unwrap();
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         chart.set_session_start_seconds(-3 * HOUR as i32).unwrap();
         assert_eq!(day_marks(&mut chart), vec![night]);
         let values = output(&chart, vwap);
@@ -522,7 +601,7 @@ mod tests {
         let vwap_reset = |times: &[i64]| {
             let mut chart = line_chart(times);
             let vwap = chart.add_vwap(0, None).unwrap();
-            chart.set_time_zone(shanghai());
+            chart.set_exchange_offsets(shanghai());
             chart.set_session_start_seconds(-3 * HOUR as i32).unwrap();
             let marks = day_marks(&mut chart);
             (marks, output(&chart, vwap))
@@ -577,7 +656,7 @@ mod tests {
             1.0,
             1.0,
         )[0];
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
 
         // A -7 h start makes the Sunday 17:00 open Monday's trading day: one Day mark where the
         // Friday afternoon ends, one where Monday's evening (Tuesday's trading day) opens, and
@@ -610,7 +689,7 @@ mod tests {
         let times: Vec<i64> = (0..6).map(|index| first + index * 86_400).collect();
         let mut chart = line_chart(&times);
         chart.set_calendar_date_axis(true);
-        chart.set_time_zone(new_york());
+        chart.set_exchange_offsets(new_york());
         let outputs = chart.add_vwap_bands(
             0,
             None,
@@ -628,7 +707,7 @@ mod tests {
         let times: Vec<i64> = (0..3).map(|index| first + index * 86_400).collect();
         let mut chart = line_chart(&times);
         chart.set_time_visible(false);
-        chart.set_time_zone(new_york());
+        chart.set_exchange_offsets(new_york());
         // Treated as instants, UTC midnight is the previous evening in New York.
         assert_eq!(crosshair_label(&mut chart, 0), "07 Jan '24");
         chart.set_calendar_date_axis(true);
@@ -654,7 +733,7 @@ mod tests {
             .collect();
         let mut chart = line_chart(&times);
         chart.set_time_visible(false);
-        chart.set_time_zone(shanghai());
+        chart.set_exchange_offsets(shanghai());
         chart.set_session_start_seconds(-3 * HOUR as i32).unwrap();
         chart.set_calendar_date_axis(true);
         chart.series[0].countdown_visible = true;
@@ -760,7 +839,7 @@ mod tests {
             day_marks(&mut chart).contains(&1),
             "UTC puts a Day mark at 00:00 UTC"
         );
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         assert_eq!(day_marks(&mut chart), Vec::<usize>::new());
     }
 
@@ -775,7 +854,7 @@ mod tests {
                 },
             )
             .unwrap();
-        chart.set_time_zone(new_york());
+        chart.set_exchange_offsets(new_york());
         chart.set_session_start_seconds(-6 * HOUR as i32).unwrap();
         let document = chart.export_state_json().unwrap();
         let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
@@ -799,7 +878,7 @@ mod tests {
         fresh.import_state_json(&legacy).unwrap();
         assert!(fresh.exchange_time().is_utc_identity());
         let mut zoned = ChartEngine::new(800.0, 500.0, 1.0);
-        zoned.set_time_zone(shanghai());
+        zoned.set_exchange_offsets(shanghai());
         zoned.import_state_json(&legacy).unwrap();
         assert_eq!(zoned.exchange_time().offsets(), &shanghai());
         assert_eq!(
@@ -819,7 +898,7 @@ mod tests {
         let zone = shanghai();
         let times = bars(&zone, (2024, 1, 2), (9, 30), (10, 30), 1);
         let mut chart = line_chart(&times);
-        chart.set_time_zone(zone);
+        chart.set_exchange_offsets(zone);
         chart.set_time_formatter(Some(Box::new(|time| Some(format!("H{time}")))));
         assert_eq!(crosshair_label(&mut chart, 0), format!("H{}", times[0]));
         chart.set_time_formatter(None);
@@ -867,11 +946,212 @@ mod tests {
                 .collect()
         };
         assert!(tags(&mut chart).contains(&"1/1/2024".to_string()));
-        chart.set_time_zone(shanghai());
+        chart.set_exchange_offsets(shanghai());
         let exchange = tags(&mut chart);
         assert!(exchange.contains(&"1/2/2024".to_string()), "{exchange:?}");
         chart.set_time_formatter(Some(Box::new(|time| Some(format!("H{time}")))));
         let hosted = tags(&mut chart);
         assert!(hosted.contains(&format!("H{}", times[2])), "{hosted:?}");
+    }
+
+    #[test]
+    fn a_named_zone_installs_the_clock_its_explicit_schedule_would() {
+        let zone = new_york();
+        let mut times = bars(&zone, (2024, 3, 8), (9, 30), (16, 0), 30);
+        let monday = times.len();
+        times.extend(bars(&zone, (2024, 3, 11), (9, 30), (16, 0), 30));
+        let mut named = line_chart(&times);
+        let mut explicit = line_chart(&times);
+        assert_eq!(named.set_time_zone("America/New_York"), Ok(true));
+        explicit.set_exchange_offsets(zone.clone());
+        assert_eq!(named.time_zone_id(), "America/New_York");
+        assert_eq!(explicit.time_zone_id(), "custom");
+        assert_eq!(day_marks(&mut named), vec![monday]);
+        assert_eq!(day_marks(&mut explicit), vec![monday]);
+        assert_eq!(tick_labels(&mut named), tick_labels(&mut explicit));
+        assert_eq!(crosshair_label(&mut named, monday), "11 Mar '24   09:30");
+        assert_eq!(crosshair_label(&mut explicit, monday), "11 Mar '24   09:30");
+        for &time in &times {
+            assert_eq!(
+                named.exchange_time().offsets().offset_at(time),
+                zone.offset_at(time)
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_schedule_clears_the_named_zone_and_the_utc_name_restores_utc() {
+        let mut chart = line_chart(&[0, 60, 120]);
+        assert_eq!(chart.time_zone_id(), "Etc/UTC");
+        assert_eq!(chart.set_time_zone("America/New_York"), Ok(true));
+        assert_eq!(chart.options.value()["timezone"], "America/New_York");
+        chart.set_exchange_offsets(shanghai());
+        assert_eq!(chart.time_zone_id(), "custom");
+        assert!(chart.options.value()["timezone"].is_null());
+        assert_eq!(chart.set_time_zone("Etc/UTC"), Ok(true));
+        assert!(chart.exchange_time().is_utc_identity());
+        assert_eq!(chart.set_time_zone("Etc/UTC"), Ok(false));
+        assert!(chart.set_time_zone("Mars/Olympus_Mons").is_err());
+    }
+
+    #[test]
+    fn the_timezone_option_names_a_zone_validates_atomically_and_replays_through_v2() {
+        // A general pane makes the export a V2 document, which carries the options store.
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .add_pane_with_domain(
+                true,
+                crate::HorizontalDomain::Category {
+                    scale: crate::CategoryScaleType::Band,
+                },
+            )
+            .unwrap();
+        chart.apply_options(r#"{"timezone":"Asia/Tokyo"}"#).unwrap();
+        assert_eq!(chart.time_zone_id(), "Asia/Tokyo");
+        assert_eq!(
+            chart.exchange_time().offsets().offset_at(1_700_000_000),
+            9 * HOUR as i32
+        );
+        // Resending the installed name resolves and changes nothing.
+        let before = chart.options.value().clone();
+        chart.apply_options(r#"{"timezone":"Asia/Tokyo"}"#).unwrap();
+        assert_eq!(chart.options.value(), &before);
+        for invalid in [
+            r#"{"timezone":"Mars/Olympus_Mons","timeScale":{"sessionStart":3600}}"#,
+            r#"{"timezone":5}"#,
+        ] {
+            assert!(chart.apply_options(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(chart.options.value(), &before);
+        assert_eq!(chart.exchange_time().session_start_seconds(), 0);
+        // V2: the name comes back through the options replay; a schedule installed later never
+        // leaves a stale name in the exported document.
+        let document = chart.export_state_json().unwrap();
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(restored.time_zone_id(), "Asia/Tokyo");
+        assert_eq!(
+            restored.exchange_time().offsets(),
+            chart.exchange_time().offsets()
+        );
+        chart.set_exchange_offsets(shanghai());
+        let document = chart.export_state_json().unwrap();
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(restored.time_zone_id(), "custom");
+        assert_eq!(restored.exchange_time().offsets(), &shanghai());
+    }
+
+    #[test]
+    fn projected_labels_weigh_like_real_bars_under_the_exchange_time_and_the_close_label() {
+        // A projection's label points must carry the weights real bars at the same times would.
+        let zone = shanghai();
+        let times = bars(&zone, (2024, 1, 2), (9, 30), (11, 30), 1);
+        let last = *times.last().unwrap();
+        let mut extended = times.clone();
+        extended.extend((1..=3).map(|step| last + 60 * step));
+        let mut real = line_chart(&extended);
+        let mut projected = line_chart(&times);
+        for chart in [&mut real, &mut projected] {
+            chart.set_exchange_offsets(zone.clone());
+            chart
+                .set_bar_time_label(crate::BarTimeLabel::Close {
+                    interval_seconds: 60,
+                    windows: Vec::new(),
+                })
+                .unwrap();
+        }
+        assert!(projected.set_future_time_projection(Some(60), 3));
+        assert_eq!(projected.axis_time_key_at(times.len()), Some(last + 60));
+        assert_eq!(projected.bar_label_time(last + 60), last + 120);
+        let marks = |chart: &mut ChartEngine| {
+            let mut marks = chart.time_marks(0.001);
+            marks.sort_unstable();
+            marks
+        };
+        assert_eq!(marks(&mut projected), marks(&mut real));
+    }
+
+    /// The axis weight column in index order (past labels at negative indices included), without
+    /// its first mark: a tail append never re-guesses the extrapolated weight of the first point.
+    fn axis_weights(chart: &mut ChartEngine) -> Vec<(i64, u8)> {
+        let mut marks: Vec<(i64, u8)> = chart
+            .tick_marks
+            .build(1.0, 0.0)
+            .iter()
+            .map(|mark| (mark.index, mark.weight))
+            .collect();
+        marks.sort_unstable();
+        marks.remove(0);
+        marks
+    }
+
+    #[test]
+    fn live_appends_and_trims_keep_the_axis_weights_of_a_clean_rebuild_under_projection() {
+        // Four New York sessions across the 2024 spring-forward, 30-minute bars.
+        let zone = new_york();
+        let mut all = Vec::new();
+        for date in [(2024, 3, 7), (2024, 3, 8), (2024, 3, 11), (2024, 3, 12)] {
+            all.extend(bars(&zone, date, (9, 30), (16, 0), 30));
+        }
+        let zones = [UtcOffsetSchedule::utc(), zone, shanghai()];
+        let label = |close: bool| {
+            if close {
+                crate::BarTimeLabel::Close {
+                    interval_seconds: 1_800,
+                    windows: Vec::new(),
+                }
+            } else {
+                crate::BarTimeLabel::Open
+            }
+        };
+        // The settings the live chart carries: zone, close label, future and past projections.
+        let (mut zone_index, mut close) = (0_usize, false);
+        let (mut future, mut past) = (0_usize, 0_usize);
+        let mut live = line_chart(&all[..20]);
+        assert!(live.set_series_max_points(0, Some(30)));
+        let mut next = 20;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for step in 0..120 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            match (seed >> 33) % 8 {
+                // Streaming dominates, so appends, trims and settings interleave.
+                0..=3 if next < all.len() => {
+                    assert!(live.update_series_bar(0, all[next] as f64, [100.0; 4]));
+                    next += 1;
+                }
+                4 => {
+                    zone_index = (zone_index + 1) % zones.len();
+                    live.set_exchange_offsets(zones[zone_index].clone());
+                }
+                5 => {
+                    close = !close;
+                    live.set_bar_time_label(label(close)).unwrap();
+                }
+                6 => {
+                    future = (future + 3) % 7;
+                    live.set_future_time_projection(Some(1_800), future);
+                }
+                _ => {
+                    past = (past + 2) % 5;
+                    live.set_past_time_projection(Some(1_800), past);
+                }
+            }
+            let retained = live.data_layer().merged_times().to_vec();
+            let mut clean = line_chart(&retained);
+            clean.set_exchange_offsets(zones[zone_index].clone());
+            clean.set_bar_time_label(label(close)).unwrap();
+            clean.set_future_time_projection(Some(1_800), future);
+            clean.set_past_time_projection(Some(1_800), past);
+            assert_eq!(
+                axis_weights(&mut live),
+                axis_weights(&mut clean),
+                "step {step}: zone {zone_index}, close {close}, future {future}, past {past}, {} bars",
+                retained.len()
+            );
+        }
+        assert!(next > 40, "the run streamed past the cap: {next}");
     }
 }

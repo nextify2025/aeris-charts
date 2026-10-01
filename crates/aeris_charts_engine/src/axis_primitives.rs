@@ -175,25 +175,27 @@ impl ChartEngine {
             // A pane boundary is a structural divider, not plot chrome: it spans the complete
             // chart width, crossing every visible left/right price-scale strip, so the resting
             // line describes the same full-width boundary as the hover band and the hit test.
+            // The rule fills the whole `PANE_SEPARATOR` layout slot on the device grid, so it
+            // never leaves an unpainted gap. Resolve its height once per DPR instead of snapping
+            // both edges independently: at fractional DPRs edge snapping can otherwise make two
+            // identical separators alternate between adjacent device-pixel thicknesses.
             let separator_color = parse(&layout.panes.separator_color, right_border);
+            let separator_h = (crate::PANE_SEPARATOR * dpr).round().max(1.0);
             for separator in &axis_frame.separators {
-                rect(
-                    0.0,
-                    (separator * dpr).round(),
-                    bitmap_w,
-                    f64::from(border_w),
-                    separator_color,
-                );
+                let y0 = (separator * dpr).round();
+                rect(0.0, y0, bitmap_w, separator_h, separator_color);
             }
             if let Some(separator) = axis_frame
                 .separator_hover
                 .and_then(|index| axis_frame.separators.get(index))
             {
+                // The hover band extends 4 CSS px beyond both sides of the separator rule.
+                let y0 = ((separator - 4.0) * dpr).round();
                 rect(
                     0.0,
-                    ((separator - 4.0) * dpr).round(),
+                    y0,
                     bitmap_w,
-                    (9.0 * dpr).round(),
+                    ((crate::PANE_SEPARATOR + 8.0) * dpr).round().max(1.0),
                     parse(&layout.panes.separator_hover_color, separator_color),
                 );
             }

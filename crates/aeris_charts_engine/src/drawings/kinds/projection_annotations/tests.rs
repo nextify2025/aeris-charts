@@ -2534,8 +2534,12 @@ fn text_boxes_are_editable_in_place_as_multiline_boxes() {
             expected,
             "{kind:?}"
         );
-        assert_eq!(chart.begin_drawing_text_edit(id), expected, "{kind:?}");
-        assert_eq!(chart.end_drawing_text_edit(true), expected, "{kind:?}");
+        assert_eq!(
+            chart.begin_drawing_text_edit(id, false),
+            expected,
+            "{kind:?}"
+        );
+        assert_eq!(chart.commit_drawing_text_edit(), expected, "{kind:?}");
     }
     // The text tool and trend labels edit through the same session, as one-line runs.
     let text = add(&mut chart, DrawingKind::Text, vec![p(12.0, 102.0)], "{}");
@@ -2565,7 +2569,7 @@ fn text_boxes_are_editable_in_place_as_multiline_boxes() {
         let before = chart.drawing(comment).unwrap().clone();
         assert!(chart.drawing_apply_options(comment, patch), "{patch}");
         assert!(!chart.drawing_text_editable(comment), "{patch}");
-        assert!(!chart.begin_drawing_text_edit(comment), "{patch}");
+        assert!(!chart.begin_drawing_text_edit(comment, false), "{patch}");
         assert!(chart.undo_drawing());
         assert_eq!(chart.drawing(comment).unwrap(), &before);
     }
@@ -2630,9 +2634,13 @@ fn every_tool_is_text_editable_exactly_when_it_paints_its_text() {
             assert!(layout.x.is_finite() && layout.y.is_finite() && layout.angle.is_finite());
             assert!(layout.size > 0.0 && layout.line_height > layout.size);
         }
-        assert_eq!(chart.begin_drawing_text_edit(id), expected, "{kind:?}");
+        assert_eq!(
+            chart.begin_drawing_text_edit(id, false),
+            expected,
+            "{kind:?}"
+        );
         assert_eq!(chart.editing_drawing().is_some(), expected, "{kind:?}");
-        assert_eq!(chart.end_drawing_text_edit(true), expected, "{kind:?}");
+        assert_eq!(chart.commit_drawing_text_edit(), expected, "{kind:?}");
         // Locked, hidden, and interval-hidden drawings never open an editor.
         for patch in [
             r#"{"locked":true}"#,
@@ -2641,7 +2649,10 @@ fn every_tool_is_text_editable_exactly_when_it_paints_its_text() {
         ] {
             assert!(chart.drawing_apply_options(id, patch), "{kind:?} {patch}");
             assert!(!chart.drawing_text_editable(id), "{kind:?} {patch}");
-            assert!(!chart.begin_drawing_text_edit(id), "{kind:?} {patch}");
+            assert!(
+                !chart.begin_drawing_text_edit(id, false),
+                "{kind:?} {patch}"
+            );
             assert!(chart.undo_drawing());
         }
         assert_eq!(chart.drawing_text_editable(id), expected, "{kind:?}");
@@ -2864,8 +2875,8 @@ fn an_empty_run_label_keeps_a_one_em_caret_slot_while_edited() {
     // A right-aligned empty run opens one em to the left of its aligned anchor, along the stroke.
     assert!((layout.x - (anchor.0 - anchor.2.cos() * em)).abs() < 1e-3);
     assert!((layout.y - (anchor.1 - anchor.2.sin() * em)).abs() < 1e-3);
-    assert!(chart.begin_drawing_text_edit(ray));
-    assert!(chart.set_drawing_edit_text("wider than one em"));
+    assert!(chart.begin_drawing_text_edit(ray, false));
+    assert!(chart.set_drawing_text_edit("wider than one em", usize::MAX));
     let typed = chart.drawing_text_edit_layout(ray).unwrap();
     let width = "wider than one em".chars().count() as f64 * em * 0.6;
     assert!((typed.x - (anchor.0 - anchor.2.cos() * width)).abs() < 1e-3);
@@ -2879,12 +2890,12 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
     let revision = sync_revision(&chart);
 
     // Live text repaints and relays out, but records nothing until the session ends.
-    assert!(!chart.set_drawing_edit_text("orphan"), "no session open");
-    assert!(chart.begin_drawing_text_edit(comment));
+    assert!(!chart.set_drawing_text_edit("orphan", 0), "no session open");
+    assert!(chart.begin_drawing_text_edit(comment, false));
     assert_eq!(chart.editing_drawing(), Some(comment));
     let one_line = chart.drawing_text_edit_layout(comment).unwrap();
     for text in ["A", "AB", "AB\nC"] {
-        assert!(chart.set_drawing_edit_text(text));
+        assert!(chart.set_drawing_text_edit(text, usize::MAX));
     }
     assert!(texts_of(&mut chart).contains(&"C".to_string()));
     let two_lines = chart.drawing_text_edit_layout(comment).unwrap();
@@ -2893,9 +2904,9 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
         "the bottom-aligned bubble grows upward, so the first line moves up"
     );
     assert_eq!(sync_revision(&chart), revision);
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     assert_eq!(chart.editing_drawing(), None);
-    assert!(!chart.end_drawing_text_edit(true), "already closed");
+    assert!(!chart.commit_drawing_text_edit(), "already closed");
     assert_eq!(chart.drawing(comment).unwrap().text, "AB\nC");
     assert_eq!(sync_revision(&chart), revision + 1);
 
@@ -2907,9 +2918,9 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
 
     // Cancel restores the text it began from without a history entry.
     let committed = chart.drawing(comment).unwrap().clone();
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.set_drawing_edit_text("discarded"));
-    assert!(chart.end_drawing_text_edit(false));
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.set_drawing_text_edit("discarded", usize::MAX));
+    assert!(chart.cancel_drawing_text_edit());
     assert_eq!(chart.drawing(comment).unwrap(), &committed);
     assert!(chart.undo_drawing());
     assert_eq!(
@@ -2920,10 +2931,10 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
     assert!(chart.redo_drawing());
 
     // An unchanged session records nothing; undo during a session commits it first.
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.end_drawing_text_edit(true));
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.set_drawing_edit_text("typed"));
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.commit_drawing_text_edit());
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.set_drawing_text_edit("typed", usize::MAX));
     assert!(chart.undo_drawing());
     assert_eq!(chart.editing_drawing(), None);
     assert_eq!(chart.drawing(comment).unwrap().text, "AB\nC");
@@ -2941,7 +2952,7 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
     );
     assert_eq!(mirror.drawings()[0].text, "typed");
     let mirrored = mirror.drawings()[0].id;
-    assert!(mirror.begin_drawing_text_edit(mirrored));
+    assert!(mirror.begin_drawing_text_edit(mirrored, false));
     assert!(chart.drawing_apply_options(comment, r#"{"text":"synced"}"#));
     assert!(
         mirror.apply_drawing_sync_payload_json(&chart.drawing_sync_payload_json("cell-b").unwrap())
@@ -2951,7 +2962,7 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
         None,
         "a sync payload ends the session"
     );
-    assert!(chart.begin_drawing_text_edit(comment));
+    assert!(chart.begin_drawing_text_edit(comment, false));
     assert!(chart.remove_drawing(comment));
     assert_eq!(chart.editing_drawing(), None, "removal ends the session");
 }
@@ -2969,13 +2980,13 @@ fn an_emptied_text_box_keeps_its_caret_line_while_edited() {
             .count()
     };
     let resting = boxes(&mut chart);
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.set_drawing_edit_text(""));
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.set_drawing_text_edit("", usize::MAX));
     assert_eq!(boxes(&mut chart), resting, "the caret line keeps the box");
     let layout = chart.drawing_text_edit_layout(comment).unwrap();
     let [left, _, right, _] = layout.rect;
     assert!(right - left > 0.0);
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     assert_eq!(
         boxes(&mut chart),
         resting - 1,
@@ -2997,19 +3008,19 @@ fn an_emptied_text_box_keeps_its_caret_line_while_edited() {
         vec![p(10.0, 101.0), p(20.0, 105.0)],
         "{}",
     );
-    assert!(chart.begin_drawing_text_edit(price_note));
+    assert!(chart.begin_drawing_text_edit(price_note, false));
     let layout = chart.drawing_text_edit_layout(price_note).unwrap();
     let runs = text_runs(&mut chart);
     let (_, _, price_y, _) = runs.iter().find(|(text, ..)| text == "101.00").unwrap();
     assert!((layout.y - price_y - layout.line_height).abs() < 1e-3);
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
 
     // A note hidden until focus reveals its text box while it is edited.
     let note = add(&mut chart, DrawingKind::Note, vec![p(25.0, 104.0)], "{}");
     assert!(!texts_of(&mut chart).contains(&"Note".to_string()));
-    assert!(chart.begin_drawing_text_edit(note));
+    assert!(chart.begin_drawing_text_edit(note, false));
     assert!(texts_of(&mut chart).contains(&"Note".to_string()));
-    assert!(chart.end_drawing_text_edit(false));
+    assert!(chart.cancel_drawing_text_edit());
     assert!(!texts_of(&mut chart).contains(&"Note".to_string()));
 }
 

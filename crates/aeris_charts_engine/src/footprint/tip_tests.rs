@@ -1728,7 +1728,7 @@ fn session_bars() -> FootprintAggregationOptions {
 
 fn session_harness(outside: OutOfSessionPolicy, max_points: Option<usize>) -> Harness {
     let mut harness = Harness::with_bubbles(session_bars(), max_points, bubble_options());
-    harness.chart.set_time_zone(shanghai());
+    harness.chart.set_exchange_offsets(shanghai());
     harness
         .chart
         .set_trade_stream_sessions(harness.stream, Some(a_share_sessions(outside)))
@@ -2371,8 +2371,9 @@ impl ScenarioChart {
                 Ok(None)
             }
             ScenarioOp::Zone(hours) => {
-                chart
-                    .set_time_zone(crate::UtcOffsetSchedule::fixed((*hours * 3_600) as _).unwrap());
+                chart.set_exchange_offsets(
+                    crate::UtcOffsetSchedule::fixed((*hours * 3_600) as _).unwrap(),
+                );
                 self.zone_hours = *hours;
                 Ok(None)
             }

@@ -2,8 +2,9 @@
 
 include!(concat!(env!("OUT_DIR"), "/style_tokens.rs"));
 
-/// `--border-width` in device pixels with browser border semantics: whole device pixels, rounded
-/// down, never thinner than one. At DPR 1 and 2 this is one device pixel; at DPR 4, two.
+/// `--border-width` (1 CSS px) in device pixels with browser border semantics: whole device
+/// pixels, rounded down, never thinner than one. At DPR 1 and 1.5 this is one device pixel; at
+/// DPR 2, two.
 pub fn border_width_device_px(pixel_ratio: f64) -> f64 {
     (BORDER_WIDTH * pixel_ratio).floor().max(1.0)
 }
@@ -14,7 +15,7 @@ mod tests {
 
     #[test]
     fn brand_border_snaps_like_a_browser_border() {
-        for (ratio, expected) in [(1.0, 1.0), (1.5, 1.0), (2.0, 1.0), (3.0, 1.0), (4.0, 2.0)] {
+        for (ratio, expected) in [(1.0, 1.0), (1.25, 1.0), (1.5, 1.0), (2.0, 2.0), (3.0, 3.0)] {
             assert_eq!(border_width_device_px(ratio), expected, "dpr {ratio}");
         }
     }
@@ -22,7 +23,7 @@ mod tests {
     #[test]
     fn canonical_dark_and_market_tokens_are_exact() {
         assert_eq!(DEFAULT_THEME_NAME, "dark");
-        assert_eq!(BORDER_WIDTH, 0.5);
+        assert_eq!(BORDER_WIDTH, 1.0);
         assert_eq!(RADIUS_SMALL, 4.0);
         assert_eq!(RADIUS_DEFAULT, 8.0);
         assert_eq!(RADIUS_MEDIUM, 12.0);

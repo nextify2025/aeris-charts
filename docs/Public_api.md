@@ -467,15 +467,32 @@ as `"Asia/Shanghai"` or `"America/New_York"`, or an explicit schedule of
 `{ from_utc_seconds, offset_seconds }` transitions (strictly ascending, at most 1024, offsets within
 ±18 h; the first offset also applies before its entry). The package resolves an IANA name once per
 zone with `Intl.DateTimeFormat` over 1970–2100 (at most ~262 DST transitions) and keeps at most 32
-resolved zones; outside that span the nearest offset applies. The engine itself is platform-free,
-accepts only explicit schedules, and never reads the browser's time zone. An unknown zone, malformed
-schedule, out-of-range session start, or session start that the windows of an installed close-time
-label do not fit ([Close-time labels](#close-time-labels)) throws `invalid_options` before any other
-key in the same call is applied. `time_scale().options()` reports the IANA name (or the schedule) and
-`session_start`. Rust hosts call `ChartEngine::set_time_zone(UtcOffsetSchedule)` and
-`set_session_start_seconds(i32)`; the engine JSON options accept `timeScale.timeZone` (`"UTC"` or a
-transition array) and `timeScale.sessionStart`, and V2 persistence round-trips both. Importing a
-document that predates these keys keeps the chart's installed zone and session start.
+resolved zones; outside that span the nearest offset applies. The engine itself never reads the
+browser's time zone: `timeScale.timeZone` takes only `"UTC"` or an explicit schedule. A zone from the
+TradingView parity list (`TRADINGVIEW_TIME_ZONES`; WASM `supported_time_zones_json()`) can instead be
+named to the engine with `ChartEngine::set_time_zone(&str)` (`Ok(true)` when it changed; WASM
+`set_time_zone`) or the top-level engine option `timezone`; it is resolved once into the same schedule
+(1970–2100, about 4 ms natively), so grouping and labels match the explicit schedule, and the name
+also localizes the general (non-financial) temporal axes and
+`ChartEngine::time_zone_clock_text(utc_seconds, show_seconds)`. `ChartEngine::time_zone_id()` (WASM
+`time_zone()`) returns the named zone, `Etc/UTC` by default, or `custom` while an explicit schedule is
+installed. An unknown zone, malformed schedule, out-of-range session start, or session start that the
+windows of an installed close-time label do not fit ([Close-time labels](#close-time-labels)) throws
+`invalid_options` before any other key in the same call is applied; an unsupported or non-string
+`timezone` rejects the patch the same way. `time_scale().options()` reports the IANA name (or the
+schedule) and `session_start`. Rust hosts call `ChartEngine::set_exchange_offsets(UtcOffsetSchedule)`
+for an explicit schedule and `set_session_start_seconds(i32)`; the engine JSON options accept
+`timeScale.timeZone` (`"UTC"` or a transition array), `timeScale.sessionStart`, and `timezone`. V2
+persistence round-trips them: the schedule always, and the `timezone` name while a named zone is
+installed (an explicit schedule clears it). When one patch carries both a schedule and a name, the
+schedule drives grouping and labels and the name the general axes and the clock. Importing a document
+that predates these keys keeps the chart's installed zone and session start.
+
+Display-only time projection: `ChartEngine::set_future_time_projection(cadence_seconds, points)` and
+`set_past_time_projection(cadence_seconds, points)` (each bounded at 4,096 points; `None` or zero points
+clears it; `has_future_time_projection` / `has_past_time_projection` read it back) label the whitespace
+after the last and before the first bar of a time axis. Projected points are labels only (no data rows,
+base index or point count) and are not persisted.
 
 **Trading day.** `session_start` is the offset in seconds from exchange-local midnight at which a
 trading day begins (default `0`, range ±86 399). A negative value assigns an evening session to the
@@ -1017,8 +1034,7 @@ codes: `disposed`, `invalid_handle`, `stale_handle`, `invalid_data`, `invalid_op
 
 The browser package is `@aeristerminal/aeris-charts` (with `@aeristerminal/aeris-charts/react`). The former branded error
 exports were renamed to `AerisChartsError` and `AerisChartsErrorCode`; update imports and
-`instanceof` checks when migrating. Rust consumers use the `aeris_charts_*` crates listed in
-`Crates.md`.
+`instanceof` checks when migrating. Rust consumers use the repository-only `aeris_charts_*` crates.
 
 Every former brand-bearing public identifier was hard renamed:
 
@@ -1645,20 +1661,104 @@ support follows the separately documented persistence window and is a major comp
 
 ## Rust distribution
 
-The Rust crates are prepared as one coordinated release family. Version `0.3.0`
-publishes `aeris_charts_core`, `aeris_charts_indicators`, `aeris_charts_render`,
-`aeris_charts_engine`, `aeris_charts_render_wgpu`, `aeris_charts_native`, and
-`aeris_charts_wasm`. Workspace manifests retain local path dependencies with the same explicit
-version, so repository builds exercise the same dependency boundaries used by registry consumers.
+The Rust crates are repository-only (`publish = false`); nothing is published to crates.io, and the
+browser package is the only published artifact. Hosts such as Aeris Terminal consume the
+`aeris_charts_*` crates through pinned Git revisions or local paths. The Rust API is below 1.0 and
+may change in any revision, so a host reviews the notes below when it moves its pin.
 
-The Rust API is below 1.0 and may evolve between minor releases. Patch releases preserve the public
-API within their minor line except where a correctness or security repair cannot do so safely; minor
-releases may add, change, or remove pre-1.0 Rust APIs. All published Aeris crates in one release use
-the same version, and consumers should keep direct Aeris dependencies aligned.
+`aeris_charts_render_gpui` is experimental because it tracks a reviewed Zed Git revision whose API
+differs from the crates.io `gpui` release. Exact Git revisions are required for that backend;
+floating Git dependencies are unsupported.
 
-`aeris_charts_render_gpui` remains repository-only and experimental because it tracks a reviewed
-Zed Git revision whose API differs from the crates.io `gpui` release. Exact Git revisions are
-required for that backend; floating Git dependencies are unsupported.
+### Moving the pinned revision
+
+These notes list the host-visible changes a pinned-revision move carries, so call sites can be
+reviewed once. Each group names the revision-level change and the call sites it affects.
+
+**Sub-pane coordinates** (see [Coordinates and panes](#coordinates-and-panes)). Three behaviours
+changed:
+
+- The chart-level `price_to_coordinate` and `coordinate_to_price` no longer follow the first visible
+  series in creation order. The price converts on pane 0's default scale and the coordinate on the
+  default scale of the pane containing `y`, so a call that relied on an overlay-first or hidden main
+  series must use that series' own handle instead. Single-pane charts whose main series is created
+  first are unchanged, and series-handle conversions never changed.
+- Linked crosshairs on a lower pane (`pane_index` of 1 or more) now round-trip. Earlier revisions
+  applied the pane offset twice and read the wrong scale, so `crosshair_sync_position` and
+  `apply_external_crosshair` disagreed on any pane but the first. A synced price is now a price on
+  the pane's default scale, and an off-range price holds the line inside its pane.
+- `ChartEngine::pane_index_at_y` (and the browser package's `pane_index_at_y`) now returns the pane
+  above for a separator and pane 0 for a `y` above the content, where both used to resolve to the
+  last pane. GPUI hosts that pick a pane for price-axis hit-testing pick up the corrected mapping.
+
+**Trade-stream-derived series** (see [Ticks to candles](#ticks-to-candles)). Two reviews, and the
+first cannot be checked from this repository:
+
+- Terminal must not write to a candle bound with `bind_trade_bar_series_to_stream` or to a CVD,
+  delta, or trade-volume series (`add_cvd_series`, `add_delta_series`, `add_trade_volume_series`).
+  Every host data write to them is now refused like a footprint's (`false`, `0`, `None`,
+  `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`; `series_is_source_owned(id)` tells
+  the refusal from an unknown id), and `apply_momentum_histogram_colors` returns `false` for the
+  delta and volume studies. The browser package rejects them with `code: "derived_series"`.
+- `FootprintError` gains the `SeriesOwned(SeriesId)` variant, so an exhaustive `match` on it needs
+  an arm. `bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler,
+  synthetic bars, or a study converted to a candle already writes (a footprint or scalar study still
+  gets `UnsupportedTradeBarSeries`, because the candle-kind check runs first), and
+  `configure_footprint_series` returns it for a series a stream, study, resampler, or synthetic bars
+  write. Resampling targets and synthetic-bar series refuse a trade-bound candle
+  (`ResampleError::UnsupportedTarget`, `SyntheticBarError::UnsupportedSeries`).
+
+**Batched period-reset study lines.** This is a compile-time break for Rust code that matches
+`aeris_charts_render::draw_list::Prim` exhaustively (a custom executor, a frame inspector, a
+point-pool rebase):
+
+- `Prim` gains `Segments { first_point, segment_count, width, color }`, a batch of `segment_count`
+  independent two-point strokes over `points[first_point .. first_point + 2 * segment_count]`, each
+  stroked like a solid simple two-point `Polyline` (dashes already expanded into one pair per dash).
+  The engine emits it in place of one two-point `Polyline` per bar for session VWAP, VWAP bands, and
+  pivot lines on bars of a day or longer, so a `_ => {}` arm that compiles silently stops drawing
+  those studies. Take the pair window from `draw_list::segment_points` (a range outside the pool is
+  a dropped prim), and move `first_point` with every other pool index when rebasing a layer. The
+  Canvas2D, WebGPU, GPUI, and native executors in this repository already handle it. Because hosts
+  take the change by moving their pin, it is breaking for exhaustive matchers.
+
+**Named time zones** (see [Time, exchange time zone, and trading sessions](#time-exchange-time-zone-and-trading-sessions)).
+Four behaviours to review:
+
+- `ChartEngine::set_time_zone` takes an IANA id from `TRADINGVIEW_TIME_ZONES`
+  (`Result<bool, String>`; `Ok(false)` when it is already installed). The setter that takes a
+  `UtcOffsetSchedule` is `set_exchange_offsets`, so a call site written against a revision where
+  `set_time_zone` took a schedule must use the new name.
+- A named zone is resolved once into the explicit schedule, so tick weights, labels, VWAP and pivot
+  period keys, sessions, and the countdown follow it exactly like `set_exchange_offsets`. The name
+  also localizes the general temporal axes and `time_zone_clock_text`; an explicit schedule does
+  not, and `time_zone_id()` then returns `custom` instead of a TradingView id.
+- A top-level `timezone` option that is not a string, or names an id outside the parity list, now
+  rejects the whole options patch (earlier revisions ignored it silently). A host that forwards a
+  TradingView placeholder such as `exchange` must filter it before the patch.
+- A V2 document can carry an additive `timezone` string beside `timeScale.timeZone`, written only
+  while a named zone is installed. A consumer that takes `aeris_charts_core` by Git does not read
+  this repository's `.cargo/config.toml`, so it compiles the complete tz tables rather than the 98
+  parity zones the repository's artifacts keep.
+
+**Drawing text editing** (see [Drawing anchors, magnet, and price basis](#drawing-anchors-magnet-and-price-basis)).
+Three call-site reviews:
+
+- One engine session replaces the former pair of flags. `ChartEngine::set_editing_drawing` is gone;
+  `editing_drawing()` reads the open session. Open it with `begin_drawing_text_edit(id,
+  paint_caret)`; mirror a host's editable surface with `set_drawing_text_edit(text, caret)` and end it
+  with `commit_drawing_text_edit()` or `cancel_drawing_text_edit()` (native hosts use
+  `drawing_text_edit_insert`, `drawing_text_edit_key`, `drawing_text_edit_select_all`, and
+  `drawing_text_edit_caret_at`). Live text records no undo step; a commit records one.
+- `begin_drawing_text_edit` accepts every drawing that paints its own text, not only the text tool
+  and trend lines, and refuses (leaving an open session alone) a locked, hidden, interval-hidden, or
+  non-text drawing, or one whose anchors cannot convert yet. A chart that has not been laid out has
+  no price scale to convert them, so a host that begins a session before its first frame sees `false`.
+- Text is bounded by `MAX_DRAWING_TEXT_BYTES` (65,536 bytes) instead of 256: an insert that would
+  exceed it is refused whole, and a mirrored value is clamped at a character boundary. A run label
+  stays on one line; family text boxes (`comment`, `callout`, `note`, `signpost`, `anchored_text`)
+  keep line breaks. Native hosts get click-to-caret placement and typing in a box but not Up/Down
+  line navigation yet.
 
 ## Release policy
 

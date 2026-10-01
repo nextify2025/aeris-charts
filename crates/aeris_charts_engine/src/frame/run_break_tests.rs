@@ -74,7 +74,7 @@ struct Intraday {
 fn intraday(data: &Session, rows: usize, price_breaks: bool) -> Intraday {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Line;
-    chart.set_time_zone(UtcOffsetSchedule::fixed(8 * HOUR as i32).unwrap());
+    chart.set_exchange_offsets(UtcOffsetSchedule::fixed(8 * HOUR as i32).unwrap());
     let volume = chart.add_series(SeriesKind::Histogram);
     let amount = chart.add_series(SeriesKind::Line);
     chart.set_series_visible(volume, false);
@@ -514,7 +514,7 @@ fn session_start_moves_the_breaks_with_the_trading_day() {
     let close: Vec<f64> = (0..times.len()).map(|row| 10.0 + row as f64).collect();
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Line;
-    chart.set_time_zone(UtcOffsetSchedule::fixed(8 * HOUR as i32).unwrap());
+    chart.set_exchange_offsets(UtcOffsetSchedule::fixed(8 * HOUR as i32).unwrap());
     install(&mut chart, 0, &times, &close);
     apply(
         &mut chart,
@@ -718,7 +718,7 @@ fn an_as_of_vwap_breaks_on_the_row_it_resets_on() {
     let d = MONDAY;
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Line;
-    chart.set_time_zone(UtcOffsetSchedule::fixed(0).unwrap());
+    chart.set_exchange_offsets(UtcOffsetSchedule::fixed(0).unwrap());
     let main_times = [
         d + 10 * HOUR,
         d + 14 * HOUR,
