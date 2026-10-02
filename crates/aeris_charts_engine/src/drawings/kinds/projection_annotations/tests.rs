@@ -2820,8 +2820,8 @@ fn every_tool_is_text_editable_exactly_when_it_paints_its_text() {
         }
         assert_eq!(chart.drawing_text_editable(id), expected, "{kind:?}");
     }
-    assert_eq!(crate::drawings::DRAWING_TOOL_SPECS.len(), 84);
-    assert_eq!(editable_tools, 76);
+    assert_eq!(crate::drawings::DRAWING_TOOL_SPECS.len(), 88);
+    assert_eq!(editable_tools, 80);
 }
 
 #[test]

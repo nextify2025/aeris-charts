@@ -441,6 +441,14 @@ impl ChartEngine {
                 if let Some(preview) = pending.preview {
                     if is_sequence || anchors.len() < pending.drawing.kind.anchor_count() {
                         anchors.push(preview);
+                        // The preview already keeps a linked coordinate shared, as the result will.
+                        let last = anchors.len() - 1;
+                        pending
+                            .drawing
+                            .kind
+                            .spec()
+                            .anchor_link
+                            .apply(&mut anchors, last);
                     }
                 }
                 // Families that resolve partial anchors preview from the second anchor on.

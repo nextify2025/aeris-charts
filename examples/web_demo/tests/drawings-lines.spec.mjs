@@ -3,7 +3,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 
-// B8 Lines family (ray, extended line, info line, trend angle, cross line, arrow line) through the
+// B8 Lines family (ray, extended line, info line, trend angle, cross line, arrow line, and the
+// axis-locked horizontal segment, vertical ray, and vertical segment) through the
 // public API and real pointer input: armed placement, edge-reaching extensions and their hit
 // testing, the engine-formatted info stats box and its typed tool options, cross-line body drags,
 // persistence and clipboard round trips, the demo toolbar entries, and WebGPU == Canvas2D parity.
@@ -11,7 +12,8 @@ import { PNG } from "pngjs";
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
-const LINES = ["ray", "extended_line", "info_line", "trend_angle", "cross_line", "arrow_line"];
+const LOCKED = ["horizontal_segment", "vertical_ray", "vertical_segment"];
+const LINES = ["ray", "extended_line", "info_line", "trend_angle", "cross_line", "arrow_line", ...LOCKED];
 const PINK = [233, 30, 99]; // #e91e63 — collides with no fixture pixel
 
 test.beforeEach(async ({ page }) => {
@@ -341,6 +343,35 @@ test("Lines tools round-trip through persistence, clipboard, and sync with their
   expect(semantic(result.synced)).toEqual(semantic(result.expected));
 });
 
+test("axis-locked segments keep their anchors on one price or bar through the armed flow and the API", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  for (const kind of LOCKED) {
+    await page.evaluate((kind) => window.__chart.set_drawing_tool(kind, { color: "#e91e63" }), kind);
+    for (const [logical, price] of [[s.l0, s.p_lo], [s.l1, s.p_hi]]) {
+      const point = await spot(page, logical, price);
+      await page.mouse.click(point.x, point.y);
+    }
+    await settle_frames(page);
+  }
+  const placed = await drawings(page);
+  expect(placed.map((drawing) => drawing.kind)).toEqual(LOCKED);
+  const [horizontal, ray, segment] = placed;
+  expect(horizontal.points[0].price).toBe(horizontal.points[1].price);
+  expect(horizontal.points[0].time).not.toBe(horizontal.points[1].time);
+  for (const drawing of [ray, segment]) {
+    expect(drawing.points[0].time, `${drawing.kind} shares one bar`).toBe(drawing.points[1].time);
+    expect(drawing.points[0].price).not.toBe(drawing.points[1].price);
+  }
+  // Anchors supplied through the API are repaired to the last one, as the placement result is.
+  const repaired = await page.evaluate(({ l0, l1, p_lo, p_hi }) => {
+    const drawing = window.__chart.add_drawing("horizontal_segment", [{ logical: l0, price: p_lo }, { logical: l1, price: p_hi }]);
+    return drawing.points().map((point) => point.price);
+  }, s);
+  expect(repaired[0]).toBe(repaired[1]);
+  expect(repaired[1]).toBeCloseTo(s.p_hi, 6);
+});
+
 test("the demo toolbar arms every Lines tool", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
@@ -348,7 +379,8 @@ test("the demo toolbar arms every Lines tool", async ({ page }) => {
     await page.click(`#drawings_group [data-tool='${kind}']`);
     expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBe(kind);
   }
-  await page.click("#drawings_group [data-tool='arrow_line']");
+  // Clicking the armed tool again disarms it.
+  await page.click(`#drawings_group [data-tool='${LINES[LINES.length - 1]}']`);
   expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
 });
 
@@ -372,6 +404,9 @@ test("Lines tools render pixel-identical on WebGPU and Canvas2D (AA coverage ste
       chart.add_drawing("trend_angle", [{ logical: at(0.55), price: lo }, { logical: at(0.7), price: mid }], { color: "#7b1fa2" });
       chart.add_drawing("cross_line", [{ logical: at(0.8), price: up(0.25) }], { style: "dotted" });
       chart.add_drawing("arrow_line", [{ logical: at(0.15), price: mid }, { logical: at(0.35), price: lo }], { color: "#ff6d00", width: 3, stroke_start: "circle" });
+      chart.add_drawing("horizontal_segment", [{ logical: at(0.62), price: up(0.8) }, { logical: at(0.78), price: up(0.8) }], { color: "#2962ff", width: 2 });
+      chart.add_drawing("vertical_ray", [{ logical: at(0.88), price: up(0.4) }, { logical: at(0.88), price: up(0.6) }], { color: "#d50000" });
+      chart.add_drawing("vertical_segment", [{ logical: at(0.4), price: up(0.15) }, { logical: at(0.4), price: up(0.55) }], { color: "#00897b", style: "dashed" });
       const first = chart.drawings()[0];
       chart.wasm.set_selected_drawing(first.id);
       chart.render();

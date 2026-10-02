@@ -1045,11 +1045,22 @@ direction, with end caps on the ends that are not extended. Visible `labels` ren
 box whose position is `tool_options.line.stats_position`; the info line enables price change,
 percent change, bar count, duration, and angle by default. The trend angle adds a dashed horizontal
 reference, the arc to the segment, and the screen angle. The cross line is full-span crisp
-horizontal and vertical lines with the horizontal line's axis price tag.
+horizontal and vertical lines with the horizontal line's axis price tag. `horizontal_segment`,
+`vertical_ray`, and `vertical_segment` (wire ids 38..=40, translated from KLineChart's overlays) are
+the same segment geometry with a catalog `anchor_link` (`DrawingToolSpec::anchor_link`): every
+anchor shares the first's price (`SamePrice`) or bar (`SameLogical`), taken from the anchor placed or
+dragged last. The link is applied where a point list enters the model (`Drawing::normalize_points`:
+construction, import, programmatic anchors, and committing a placement) and while an anchor is
+dragged or previewed, so a locked tool cannot leave its axis; Shift has nothing to straighten on
+them. A vertical ray defaults to `extend_right`, which runs it through its second anchor to the
+pane edge.
 <!-- B8: lines — end -->
 <!-- B8: channels — begin -->
-The Channels family (`kinds/channels.rs`, wire ids 48..=51) delivers `parallel_channel`,
-`regression_trend`, `flat_top_bottom`, and `disjoint_channel`. The three-anchor channels share one
+The Channels family (`kinds/channels.rs`, wire ids 48..=52) delivers `parallel_channel`,
+`regression_trend`, `flat_top_bottom`, `disjoint_channel`, and `price_channel` (KLineChart's price
+channel: the base line is the centre, with its parallel through the third anchor and the mirror of
+that parallel on the other side; it defaults to extending both ways with no fill, and a fill covers
+the whole band). The three-anchor channels share one
 construction: the first two anchors are the base line, and the second line spans the same bars
 (vertical sides) on the line through the third anchor — translated vertically in px (parallel on
 every scale mode), horizontal at the third anchor's price, or with the base slope mirrored. Their

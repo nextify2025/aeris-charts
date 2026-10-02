@@ -5,8 +5,10 @@
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim};
 
+use super::super::super::tools::DrawingAnchorLink;
 use super::super::super::{
-    DrawingPlacement, DrawingTextHAlign, DrawingTextLayout, DrawingTextVAlign,
+    DrawingPlacement, DrawingStraightenMode, DrawingTextHAlign, DrawingTextLayout,
+    DrawingTextVAlign,
 };
 use crate::{
     ChartEngine, DrawingAnchor, DrawingDragPart, DrawingId, DrawingKind, DrawingLineCap,
@@ -1096,4 +1098,309 @@ fn derived_points_share_the_anchor_space_when_bitmap_ratios_differ() {
     let stroke = ink_polylines(&mut chart).remove(0).0;
     assert!((stroke[1].0 - b.0 * hpr).abs() < 1e-3);
     assert!((stroke[1].1 - b.1 * vpr).abs() < 1e-3);
+}
+
+/// Axis-locked segments (KLineChart `horizontalSegment`, `verticalRayLine`, `verticalSegment`):
+/// the anchors share one price or one bar, taken from the anchor placed last.
+const LOCKED_KINDS: [DrawingKind; 3] = [
+    DrawingKind::HorizontalSegment,
+    DrawingKind::VerticalRay,
+    DrawingKind::VerticalSegment,
+];
+
+#[test]
+fn axis_locked_segments_have_their_own_catalog_entries() {
+    for (kind, wire, name, link, extends) in [
+        (
+            DrawingKind::HorizontalSegment,
+            38,
+            "horizontal_segment",
+            DrawingAnchorLink::SamePrice,
+            (false, false),
+        ),
+        (
+            DrawingKind::VerticalRay,
+            39,
+            "vertical_ray",
+            DrawingAnchorLink::SameLogical,
+            (false, true),
+        ),
+        (
+            DrawingKind::VerticalSegment,
+            40,
+            "vertical_segment",
+            DrawingAnchorLink::SameLogical,
+            (false, false),
+        ),
+    ] {
+        let spec = kind.spec();
+        assert_eq!((spec.wire_id, spec.name), (wire, name));
+        assert_eq!(DrawingKind::from_u8(wire), Some(kind));
+        assert_eq!(DrawingKind::from_name(name), Some(kind));
+        assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 2 });
+        assert_eq!(spec.anchor_link, link);
+        // The lock leaves nothing for Shift to straighten.
+        assert_eq!(spec.straighten, DrawingStraightenMode::None);
+        assert!(spec.family.is_some(), "{kind:?} is a lines-family tool");
+        let drawing = crate::Drawing::new(1, kind, 0, Vec::new());
+        assert_eq!((drawing.extend_left, drawing.extend_right), extends);
+    }
+    // Every other tool leaves its anchors free.
+    for spec in super::super::super::DRAWING_TOOL_SPECS {
+        assert_eq!(
+            spec.anchor_link != DrawingAnchorLink::None,
+            LOCKED_KINDS.contains(&spec.kind),
+            "{}",
+            spec.name
+        );
+    }
+}
+
+#[test]
+fn axis_locked_segments_repair_supplied_anchors_to_the_last_one() {
+    let mut chart = chart();
+    let horizontal = add(
+        &mut chart,
+        DrawingKind::HorizontalSegment,
+        vec![p(5.0, 101.0), p(15.0, 104.0)],
+        "{}",
+    );
+    assert_eq!(
+        chart.drawing(horizontal).unwrap().points,
+        vec![p(5.0, 104.0), p(15.0, 104.0)]
+    );
+    let vertical = add(
+        &mut chart,
+        DrawingKind::VerticalRay,
+        vec![p(5.0, 101.0), p(9.0, 104.0)],
+        "{}",
+    );
+    assert_eq!(
+        chart.drawing(vertical).unwrap().points,
+        vec![p(9.0, 101.0), p(9.0, 104.0)]
+    );
+    // Replacing the anchors later goes through the same repair, as one undo step.
+    assert!(chart.drawing_set_points(
+        horizontal,
+        r#"[{"logical":6,"price":102},{"logical":16,"price":107}]"#
+    ));
+    assert_eq!(
+        chart.drawing(horizontal).unwrap().points,
+        vec![p(6.0, 107.0), p(16.0, 107.0)]
+    );
+    assert!(chart.undo_drawing());
+    assert_eq!(
+        chart.drawing(horizontal).unwrap().points,
+        vec![p(5.0, 104.0), p(15.0, 104.0)]
+    );
+}
+
+#[test]
+fn placing_an_axis_locked_segment_keeps_its_axis_in_the_preview_and_the_result() {
+    for kind in LOCKED_KINDS {
+        let mut chart = chart();
+        assert!(chart.set_drawing_tool(Some(kind), Some(r##"{"color":"#123456"}"##), None));
+        let start = (200.0, 260.0);
+        let end = (420.0, 150.0);
+        chart.drawing_tool_activate(start.0, start.1, DrawingModifiers::default());
+        chart.drawing_tool_pointer_move(end.0, end.1, DrawingModifiers::default(), false);
+        let preview = ink_polylines(&mut chart);
+        let line = &preview.last().expect("the pending segment previews").0;
+        let (first, last) = (line[0], line[line.len() - 1]);
+        if kind == DrawingKind::HorizontalSegment {
+            assert!(
+                (first.1 - last.1).abs() < 0.01,
+                "{kind:?} previews flat: {line:?}"
+            );
+        } else {
+            assert!(
+                (first.0 - last.0).abs() < 0.01,
+                "{kind:?} previews upright: {line:?}"
+            );
+        }
+        let created = chart
+            .drawing_tool_activate(end.0, end.1, DrawingModifiers::default())
+            .created
+            .unwrap_or_else(|| panic!("{kind:?} committed"));
+        let points = &chart.drawing(created).unwrap().points;
+        if kind == DrawingKind::HorizontalSegment {
+            assert_eq!(points[0].price, points[1].price);
+            assert_ne!(points[0].logical, points[1].logical);
+        } else {
+            assert_eq!(points[0].logical, points[1].logical);
+            assert_ne!(points[0].price, points[1].price);
+        }
+    }
+}
+
+#[test]
+fn dragging_one_anchor_of_an_axis_locked_segment_moves_the_shared_coordinate() {
+    let mut chart = chart();
+    let horizontal = add(
+        &mut chart,
+        DrawingKind::HorizontalSegment,
+        vec![p(10.0, 102.0), p(20.0, 102.0)],
+        "{}",
+    );
+    chart.set_selected_drawing(Some(horizontal));
+    let (bx, by) = anchor(&chart, horizontal, 1);
+    assert!(chart.drawing_drag_start_at(bx, by));
+    chart.drawing_drag_to(bx + 30.0, by + 25.0, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    let points = chart.drawing(horizontal).unwrap().points.clone();
+    assert_eq!(points[0].price, points[1].price, "the other anchor follows");
+    assert_ne!(points[1].price, 102.0, "the price moved");
+    assert_eq!(
+        points[0].logical, 10.0,
+        "only the free coordinate stays per anchor"
+    );
+    assert!(points[1].logical > 20.0);
+    assert!(chart.undo_drawing());
+    assert_eq!(
+        chart.drawing(horizontal).unwrap().points,
+        vec![p(10.0, 102.0), p(20.0, 102.0)]
+    );
+
+    let vertical = add(
+        &mut chart,
+        DrawingKind::VerticalSegment,
+        vec![p(12.0, 101.0), p(12.0, 105.0)],
+        "{}",
+    );
+    chart.set_selected_drawing(Some(vertical));
+    let (ax, ay) = anchor(&chart, vertical, 0);
+    assert!(chart.drawing_drag_start_at(ax, ay));
+    chart.drawing_drag_to(ax + 40.0, ay - 10.0, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    let points = chart.drawing(vertical).unwrap().points.clone();
+    assert_eq!(
+        points[0].logical, points[1].logical,
+        "the other anchor follows"
+    );
+    assert!(points[0].logical > 12.0);
+    assert_eq!(points[1].price, 105.0, "each anchor keeps its own price");
+}
+
+#[test]
+fn axis_locked_segments_paint_and_extend_like_klinechart() {
+    let mut chart = chart();
+    let pane_top = chart.panes[0].top;
+    let pane_bottom = chart.panes[0].top + chart.panes[0].height;
+    let near = |a: f64, b: f64| (a - b).abs() < 0.5;
+
+    let horizontal = add(
+        &mut chart,
+        DrawingKind::HorizontalSegment,
+        vec![p(10.0, 102.0), p(20.0, 107.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    let (a, b) = (anchor(&chart, horizontal, 0), anchor(&chart, horizontal, 1));
+    let line = ink_polylines(&mut chart).remove(0).0;
+    assert!(
+        near(line[0].1, line[1].1) && near(line[0].1, b.1),
+        "flat at the last price"
+    );
+    assert!(
+        near(line[0].0, a.0) && near(line[1].0, b.0),
+        "between the anchors"
+    );
+    chart.remove_drawing(horizontal);
+
+    let segment = add(
+        &mut chart,
+        DrawingKind::VerticalSegment,
+        vec![p(12.0, 101.0), p(12.0, 106.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    let (a, b) = (anchor(&chart, segment, 0), anchor(&chart, segment, 1));
+    let line = ink_polylines(&mut chart).remove(0).0;
+    assert!(near(line[0].0, line[1].0));
+    assert!(
+        near(line[0].1, a.1) && near(line[1].1, b.1),
+        "between the anchors only"
+    );
+    chart.remove_drawing(segment);
+
+    // A vertical ray runs from its first anchor through the second to the pane edge on the
+    // second anchor's side.
+    let downward = add(
+        &mut chart,
+        DrawingKind::VerticalRay,
+        vec![p(12.0, 106.0), p(12.0, 103.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    let (a, b) = (anchor(&chart, downward, 0), anchor(&chart, downward, 1));
+    assert!(b.1 > a.1, "the second anchor sits below the first");
+    let line = ink_polylines(&mut chart).remove(0).0;
+    assert!(
+        near(line[0].1, a.1) && near(line[1].1, pane_bottom),
+        "{line:?}"
+    );
+    chart.remove_drawing(downward);
+    let upward = add(
+        &mut chart,
+        DrawingKind::VerticalRay,
+        vec![p(12.0, 103.0), p(12.0, 106.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    let a = anchor(&chart, upward, 0);
+    let line = ink_polylines(&mut chart).remove(0).0;
+    assert!(
+        near(line[0].1, a.1) && near(line[1].1, pane_top),
+        "{line:?}"
+    );
+}
+
+#[test]
+fn axis_locked_segments_are_hit_on_their_body_and_nowhere_else() {
+    let mut chart = chart();
+    for kind in LOCKED_KINDS {
+        let id = add(&mut chart, kind, vec![p(10.0, 102.0), p(20.0, 106.0)], "{}");
+        let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+        let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        assert_eq!(chart.drawing_at(middle.0, middle.1), Some(id), "{kind:?}");
+        assert_eq!(
+            chart.drawing_at(middle.0 + 120.0, middle.1 + 120.0),
+            None,
+            "{kind:?}"
+        );
+        chart.remove_drawing(id);
+    }
+}
+
+#[test]
+fn axis_locked_segments_round_trip_and_documents_repair_unlocked_anchors() {
+    let mut chart = chart();
+    for kind in LOCKED_KINDS {
+        add(&mut chart, kind, vec![p(10.0, 102.0), p(20.0, 106.0)], "{}");
+    }
+    let document = chart.export_state_json().unwrap();
+    let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+    restored.import_state_json(&document).unwrap();
+    assert_eq!(restored.export_state_json().unwrap(), document);
+    for (restored, original) in restored.drawings().iter().zip(chart.drawings()) {
+        assert_eq!(restored.kind, original.kind);
+        assert_eq!(restored.points, original.points);
+    }
+
+    // A document whose anchors disagree on the locked coordinate loads repaired, like the
+    // programmatic path.
+    let mut tampered: serde_json::Value = serde_json::from_str(&document).unwrap();
+    for drawing in tampered["drawings"].as_array_mut().unwrap() {
+        let anchors = drawing["anchors"].as_array_mut().unwrap();
+        anchors[0]["price"] = serde_json::json!(101.0);
+        anchors[0]["logical"] = serde_json::json!(8.0);
+    }
+    let mut repaired = ChartEngine::new(800.0, 500.0, 1.0);
+    repaired.import_state_json(&tampered.to_string()).unwrap();
+    for drawing in repaired.drawings() {
+        let [first, second] = drawing.points[..] else {
+            panic!("two anchors");
+        };
+        if drawing.kind == DrawingKind::HorizontalSegment {
+            assert_eq!(first.price, second.price);
+        } else {
+            assert_eq!(first.logical, second.logical);
+        }
+    }
 }

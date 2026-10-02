@@ -32,8 +32,9 @@ use super::super::parts::{
     text_on, DrawingParts, PartContext, PartLabel, PartStroke, CURVE_TOLERANCE,
 };
 use super::super::tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
-    DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout, DrawingToolSpec,
+    DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
+    DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
+    DrawingToolSpec,
 };
 use super::super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use super::DrawingFamily;
@@ -230,6 +231,7 @@ const PATTERN_TOOL: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 pub(crate) const XABCD_PATTERN: DrawingToolSpec = PATTERN_TOOL;

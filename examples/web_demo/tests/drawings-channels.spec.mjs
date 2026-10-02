@@ -12,7 +12,7 @@ import { PNG } from "pngjs";
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
-const CHANNELS = ["parallel_channel", "regression_trend", "flat_top_bottom", "disjoint_channel"];
+const CHANNELS = ["parallel_channel", "regression_trend", "flat_top_bottom", "disjoint_channel", "price_channel"];
 const PINK = [233, 30, 99]; // #e91e63 — collides with no fixture pixel
 
 test.beforeEach(async ({ page }) => {
@@ -184,7 +184,8 @@ test("every Channels tool places through the armed-tool flow and paints", async 
     expect(list[index].kind).toBe(kind);
     expect(list[index].points).toHaveLength(clicks.length);
     expect(list[index].options.color).toBe("#e91e63");
-    expect(list[index].options.fill_enabled).toBe(true);
+    // Every channel fills by default except KLineChart's price channel, which is three bare lines.
+    expect(list[index].options.fill_enabled).toBe(kind !== "price_channel");
     for (const point of list[index].points) expect(Number.isFinite(point.time)).toBe(true);
     expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
     const pixels = await capture(page);
@@ -526,7 +527,8 @@ test("the demo toolbar arms every Channels tool", async ({ page }) => {
     await page.click(`#drawings_group [data-tool='${kind}']`);
     expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBe(kind);
   }
-  await page.click("#drawings_group [data-tool='disjoint_channel']");
+  // Clicking the armed tool again disarms it.
+  await page.click(`#drawings_group [data-tool='${CHANNELS[CHANNELS.length - 1]}']`);
   expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
 });
 
@@ -547,6 +549,7 @@ test("Channels render pixel-identical on WebGPU and Canvas2D (AA coverage steps 
       chart.add_drawing("regression_trend", [{ logical: at(0.35), price: up(0.5) }, { logical: at(0.6), price: up(0.5) }], { color: "#089981" });
       chart.add_drawing("flat_top_bottom", [{ logical: at(0.62), price: up(0.2) }, { logical: at(0.8), price: up(0.6) }, { logical: at(0.7), price: up(0.4) }], { color: "#7b1fa2" });
       chart.add_drawing("disjoint_channel", [{ logical: at(0.82), price: up(0.5) }, { logical: at(0.95), price: up(0.7) }, { logical: at(0.9), price: up(0.3) }], { color: "#ff6d00", style: "dotted", tool_options: { channel: { middle_line: true } } });
+      chart.add_drawing("price_channel", [{ logical: at(0.1), price: up(0.55) }, { logical: at(0.3), price: up(0.65) }, { logical: at(0.2), price: up(0.4) }], { color: "#2962ff", width: 2 });
       const first = chart.drawings()[0];
       chart.wasm.set_selected_drawing(first.id);
       chart.render();

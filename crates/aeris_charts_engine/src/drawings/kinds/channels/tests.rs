@@ -2274,3 +2274,139 @@ fn regressions_on_an_as_of_source_fit_its_own_bars_once_each() {
     assert!((stats.deviation - deviation).abs() < 1e-9);
     assert!((stats.pearson.unwrap() - pearson).abs() < 1e-9);
 }
+
+/// KLineChart's `priceChannelLine`: the base line is the channel's centre, with its parallel
+/// through the third anchor and the mirror of that parallel on the other side.
+#[test]
+fn price_channels_are_symmetric_about_their_base_line_and_bare_by_default() {
+    let kind = DrawingKind::PriceChannel;
+    let spec = kind.spec();
+    assert_eq!((spec.wire_id, spec.name), (52, "price_channel"));
+    assert_eq!(DrawingKind::from_u8(52), Some(kind));
+    assert_eq!(DrawingKind::from_name("price_channel"), Some(kind));
+    assert!(std::ptr::eq(spec.family.unwrap(), &FAMILY));
+    assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 3 });
+    let drawing = crate::Drawing::new(1, kind, 0, Vec::new());
+    // Three bare lines across the pane: no fill, no middle line, extended both ways.
+    assert!(!drawing.fill_enabled);
+    assert!(drawing.extend_left && drawing.extend_right);
+
+    let mut chart = chart();
+    let points = channel_points(&chart, 80.0);
+    let id = add(&mut chart, kind, points, r##"{"color":"#123456"}"##);
+    let (a, b, c) = (
+        anchor(&chart, id, 0),
+        anchor(&chart, id, 1),
+        anchor(&chart, id, 2),
+    );
+    let (boundaries, middles) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!(
+        (boundaries.len(), middles.len()),
+        (3, 0),
+        "base, parallel and mirror"
+    );
+    let lines = boundaries.iter().map(Stroke::line).collect::<Vec<_>>();
+    // The first line is the base; the second passes through the third anchor, parallel to it;
+    // the third is the same distance on the other side.
+    assert!(collinear(lines[0][0], lines[0][1], a) && collinear(lines[0][0], lines[0][1], b));
+    assert!(collinear(lines[1][0], lines[1][1], c));
+    let base_slope = slope(&lines[0]);
+    assert!((slope(&lines[1]) - base_slope).abs() < 1e-6);
+    assert!((slope(&lines[2]) - base_slope).abs() < 1e-6);
+    let at = |line: &[(f64, f64); 2], x: f64| line[0].1 + base_slope * (x - line[0].0);
+    let x = 400.0;
+    let (middle, parallel, mirror) = (at(&lines[0], x), at(&lines[1], x), at(&lines[2], x));
+    assert!(
+        ((parallel - middle) + (mirror - middle)).abs() < 1e-3,
+        "the parallel and the mirror sit on opposite sides at the same distance"
+    );
+    assert!((parallel - middle).abs() > 10.0);
+    // All three reach the pane edges at both ends (extended both ways by default).
+    let (top, bottom) = (
+        chart.panes[0].top,
+        chart.panes[0].top + chart.panes[0].height,
+    );
+    let on_edge = |point: (f64, f64)| {
+        point.0.abs() < 0.5
+            || (point.0 - chart.pane_w).abs() < 0.5
+            || (point.1 - top).abs() < 0.5
+            || (point.1 - bottom).abs() < 0.5
+    };
+    for line in &lines {
+        assert!(on_edge(line[0]) && on_edge(line[1]), "{line:?}");
+    }
+    // The mirror is a body target too, far from the anchors.
+    let y = at(&lines[2], x);
+    assert_eq!(hit_id(&chart, (x, y)), Some(id));
+}
+
+#[test]
+fn vertical_price_channels_step_horizontally_and_fill_the_whole_band_when_enabled() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::PriceChannel,
+        vec![p(12.0, 101.0), p(12.0, 106.0), p(10.0, 103.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    let (a, c) = (anchor(&chart, id, 0), anchor(&chart, id, 2));
+    let (boundaries, _) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!(boundaries.len(), 3);
+    let xs = boundaries
+        .iter()
+        .map(|line| {
+            let [start, end] = line.line();
+            assert!((start.0 - end.0).abs() < 1e-6, "vertical: {line:?}");
+            start.0
+        })
+        .collect::<Vec<_>>();
+    assert!((xs[0] - a.0).abs() < 1e-6 && (xs[1] - c.0).abs() < 1e-6);
+    assert!(
+        (xs[2] - (2.0 * a.0 - c.0)).abs() < 1e-6,
+        "mirrored about the base"
+    );
+
+    // Two anchors preview the base line alone.
+    let mut chart = super::tests::chart();
+    assert!(chart.set_drawing_tool(
+        Some(DrawingKind::PriceChannel),
+        Some(r##"{"color":"#123456"}"##),
+        None
+    ));
+    chart.drawing_tool_activate(200.0, 260.0, DrawingModifiers::default());
+    chart.drawing_tool_activate(420.0, 150.0, DrawingModifiers::default());
+    chart.drawing_tool_pointer_move(300.0, 330.0, DrawingModifiers::default(), false);
+    let (preview, _) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!(
+        preview.len(),
+        3,
+        "the pending channel previews all three lines"
+    );
+
+    // Enabling the fill shades the whole band, mirror to parallel.
+    let mut chart = super::tests::chart();
+    let points = channel_points(&chart, 80.0);
+    let id = add(
+        &mut chart,
+        DrawingKind::PriceChannel,
+        points,
+        r##"{"color":"#123456","fill_enabled":true}"##,
+    );
+    let c = anchor(&chart, id, 2);
+    let (boundaries, _) = split_lines(&ink_polylines(&mut chart));
+    let mirror = boundaries[2].line();
+    let regions = fills(&mut chart, wash());
+    assert_eq!(regions.len(), 1, "one convex region");
+    assert!(
+        point_in_polygon((c.0, c.1 - 10.0), &regions[0]),
+        "covers the base-to-parallel half"
+    );
+    let probe_x = 400.0;
+    // The band lies between the mirror (above the base) and the parallel (below it), so a point
+    // just under the mirror line is inside it.
+    let probe_y = mirror[0].1 + slope(&mirror) * (probe_x - mirror[0].0) + 10.0;
+    assert!(
+        point_in_polygon((probe_x, probe_y), &regions[0]),
+        "and the mirror half too"
+    );
+}

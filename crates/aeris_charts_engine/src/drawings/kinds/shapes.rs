@@ -42,8 +42,9 @@ use aeris_charts_render::shape::{self, EllipseArc, Point, Rect};
 use super::super::handles::{DrawingHandle, HandleDrag, HandleShape};
 use super::super::parts::{cap_radius, DrawingParts, PartContext, PartStroke, CURVE_TOLERANCE};
 use super::super::tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
-    DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout, DrawingToolSpec,
+    DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
+    DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
+    DrawingToolSpec,
 };
 use super::super::Drawing;
 use super::DrawingFamily;
@@ -88,6 +89,7 @@ const SHAPE_TOOL: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 // The rotated rectangle, circle, and arc derive their extent from screen-space perpendiculars

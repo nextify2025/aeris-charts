@@ -44,8 +44,9 @@ use aeris_charts_render::shape::{self, Point, Rect};
 use super::super::handles::DrawingHandle;
 use super::super::parts::{DrawingParts, PartContext, PartLabel, PartStroke};
 use super::super::tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
-    DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout, DrawingToolSpec,
+    DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
+    DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
+    DrawingToolSpec,
 };
 use super::super::{
     Drawing, DrawingPoint, DrawingSourceRows, DrawingTextHAlign, DrawingTextVAlign,
@@ -185,6 +186,7 @@ const CHANNEL_TOOL: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 pub(crate) const PARALLEL_CHANNEL: DrawingToolSpec = CHANNEL_TOOL;
@@ -218,6 +220,15 @@ pub(crate) const DISJOINT_CHANNEL: DrawingToolSpec = DrawingToolSpec {
     ..CHANNEL_TOOL
 };
 
+// The base line is the channel's centre: its parallel through the third anchor and the mirror of
+// that parallel on the other side bound it.
+pub(crate) const PRICE_CHANNEL: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::PriceChannel,
+    wire_id: 52,
+    name: "price_channel",
+    ..CHANNEL_TOOL
+};
+
 pub(crate) static FAMILY: DrawingFamily = {
     let mut family = DrawingFamily::new(build_parts, kind_options);
     family.apply_defaults = apply_defaults;
@@ -231,7 +242,11 @@ pub(crate) static FAMILY: DrawingFamily = {
 };
 
 fn apply_defaults(drawing: &mut Drawing) {
-    drawing.fill_enabled = true;
+    // KLineChart's price channel is three bare lines across the pane.
+    let price_channel = drawing.kind == DrawingKind::PriceChannel;
+    drawing.fill_enabled = !price_channel;
+    drawing.extend_left = price_channel;
+    drawing.extend_right = price_channel;
 }
 
 fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
@@ -256,9 +271,14 @@ fn channel_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     };
     let other = second_line(drawing.kind, a, b, c);
     let resolved = options(drawing);
+    // A price channel is symmetric about its base line: the third line mirrors `other`.
+    let mirror = (drawing.kind == DrawingKind::PriceChannel).then(|| {
+        let reflect = |p: Point, q: Point| (2.0 * p.0 - q.0, 2.0 * p.1 - q.1);
+        (reflect(a, other.0), reflect(b, other.1))
+    });
     if drawing.fill_enabled && (b.0 - a.0).abs() > f64::EPSILON {
         let span = extended_span(ctx.pane, base, drawing);
-        fill_between(ctx, parts, base, other, span);
+        fill_between(ctx, parts, mirror.unwrap_or(base), other, span);
     }
     if resolved.middle_line {
         let middle = (shape::midpoint(a, other.0), shape::midpoint(b, other.1));
@@ -266,6 +286,9 @@ fn channel_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     }
     stroke_line(ctx, parts, base, PartStroke::default(), true);
     stroke_line(ctx, parts, other, PartStroke::default(), false);
+    if let Some(mirror) = mirror {
+        stroke_line(ctx, parts, mirror, PartStroke::default(), false);
+    }
 }
 
 /// The channel's second boundary through `c`, spanning the base line's x range.
