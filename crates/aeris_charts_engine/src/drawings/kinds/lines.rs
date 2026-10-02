@@ -20,8 +20,9 @@ use super::super::parts::{
     STATS_GAP, STATS_PADDING,
 };
 use super::super::tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
-    DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout, DrawingToolSpec,
+    DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
+    DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
+    DrawingToolSpec,
 };
 use super::super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use super::DrawingFamily;
@@ -86,6 +87,7 @@ const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 // A ray's and an extended line's reach comes from their `extend_left`/`extend_right` defaults:
@@ -139,6 +141,35 @@ pub(crate) const ARROW_LINE: DrawingToolSpec = DrawingToolSpec {
     ..SEGMENT_TOOL
 };
 
+// KLineChart's axis-locked segments: the anchors cannot leave their axis, so there is nothing for
+// Shift to straighten. A vertical ray extends beyond its second anchor by default.
+pub(crate) const HORIZONTAL_SEGMENT: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::HorizontalSegment,
+    wire_id: 38,
+    name: "horizontal_segment",
+    straighten: DrawingStraightenMode::None,
+    anchor_link: DrawingAnchorLink::SamePrice,
+    ..SEGMENT_TOOL
+};
+
+pub(crate) const VERTICAL_RAY: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::VerticalRay,
+    wire_id: 39,
+    name: "vertical_ray",
+    straighten: DrawingStraightenMode::None,
+    anchor_link: DrawingAnchorLink::SameLogical,
+    ..SEGMENT_TOOL
+};
+
+pub(crate) const VERTICAL_SEGMENT: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::VerticalSegment,
+    wire_id: 40,
+    name: "vertical_segment",
+    straighten: DrawingStraightenMode::None,
+    anchor_link: DrawingAnchorLink::SameLogical,
+    ..SEGMENT_TOOL
+};
+
 pub(crate) static FAMILY: DrawingFamily = {
     let mut family = DrawingFamily::new(build_parts, kind_options);
     family.apply_defaults = apply_defaults;
@@ -169,7 +200,7 @@ fn default_info_stats() -> Vec<DrawingLabelOptions> {
 
 fn apply_defaults(drawing: &mut Drawing) {
     match drawing.kind {
-        DrawingKind::Ray => drawing.extend_right = true,
+        DrawingKind::Ray | DrawingKind::VerticalRay => drawing.extend_right = true,
         DrawingKind::ExtendedLine => {
             drawing.extend_left = true;
             drawing.extend_right = true;

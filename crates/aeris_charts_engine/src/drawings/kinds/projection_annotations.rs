@@ -31,8 +31,9 @@ use super::super::parts::{
     STATS_ALPHA, STATS_PADDING,
 };
 use super::super::tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
-    DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout, DrawingToolSpec,
+    DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
+    DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
+    DrawingToolSpec,
 };
 use super::super::{Drawing, DrawingPoint, DrawingTextHAlign, DrawingTextVAlign};
 use super::DrawingFamily;
@@ -256,6 +257,7 @@ const TOOL: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 /// One-anchor annotation behavior.
@@ -285,6 +287,7 @@ pub(crate) const PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     name: "price_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
     grid_snap: true,
+    anchor_link: DrawingAnchorLink::None,
     ..TOOL
 };
 
@@ -294,6 +297,7 @@ pub(crate) const DATE_RANGE: DrawingToolSpec = DrawingToolSpec {
     name: "date_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
     grid_snap: true,
+    anchor_link: DrawingAnchorLink::None,
     ..TOOL
 };
 
@@ -303,6 +307,7 @@ pub(crate) const DATE_AND_PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     name: "date_and_price_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
     grid_snap: true,
+    anchor_link: DrawingAnchorLink::None,
     ..TOOL
 };
 

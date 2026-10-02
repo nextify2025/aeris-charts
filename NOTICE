@@ -16,3 +16,6 @@ Copyright (c) 2019 lihu. Licensed under the Apache License, Version 2.0
     code.
   - crates/aeris_charts_engine/src/klinechart_indicators.rs: KLineChart's default indicator
     styles (line palette, bar and dot colors).
+  - crates/aeris_charts_engine/src/drawings/kinds/lines.rs (horizontal_segment, vertical_ray,
+    vertical_segment) and channels.rs (price_channel): the geometry and anchor rules of the
+    corresponding overlays (src/extension/overlay), reimplemented on the Aeris drawing model.

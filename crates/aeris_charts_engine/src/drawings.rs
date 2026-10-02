@@ -423,6 +423,13 @@ pub enum DrawingKind {
     CrossLine,
     /// Two-anchor segment ending in an arrowhead.
     ArrowLine,
+    /// Two-anchor segment whose anchors share one price (KLineChart `horizontalSegment`).
+    HorizontalSegment,
+    /// Two-anchor vertical line from the first anchor through the second to the pane edge; both
+    /// anchors share one bar (KLineChart `verticalRayLine`).
+    VerticalRay,
+    /// Two-anchor vertical segment; both anchors share one bar (KLineChart `verticalSegment`).
+    VerticalSegment,
     // B8: lines — end
     // B8: channels — begin
     /// Three-anchor channel: the first two anchors define the base line and the parallel line
@@ -437,6 +444,9 @@ pub enum DrawingKind {
     /// Three-anchor channel whose second line passes through the third anchor with the first
     /// line's slope mirrored.
     DisjointChannel,
+    /// Three-anchor channel: the base line through the first two anchors, its parallel through
+    /// the third, and the base line mirrored on the other side (KLineChart `priceChannelLine`).
+    PriceChannel,
     // B8: channels — end
     // B8: fibonacci — begin
     /// Two-anchor Fibonacci retracement: horizontal ratio levels between the anchors' prices.
@@ -898,7 +908,7 @@ impl Drawing {
         pane_index: usize,
         mut points: Vec<DrawingPoint>,
     ) -> Self {
-        Self::normalize_position_points(kind, &mut points);
+        Self::normalize_points(kind, &mut points);
         // Segment labels default to the top-right slot along the line.
         let (text_h_align, text_v_align) = if kind.spec().text_layout == DrawingTextLayout::Segment
         {
@@ -983,6 +993,16 @@ impl Drawing {
 
     pub(crate) fn has_pending_times(&self) -> bool {
         !self.pending_times.is_empty()
+    }
+
+    /// Repair a supplied point list to the kind's invariants: linked anchors share their linked
+    /// coordinate (taken from the last anchor, the one placed last), and positions keep their
+    /// semantic levels.
+    pub(crate) fn normalize_points(kind: DrawingKind, points: &mut [DrawingPoint]) {
+        kind.spec()
+            .anchor_link
+            .apply(points, points.len().saturating_sub(1));
+        Self::normalize_position_points(kind, points);
     }
 
     /// Long/Short Position has semantic levels, not three unrelated corners. Keep the stop on the
@@ -3944,7 +3964,7 @@ impl ChartEngine {
                 ));
             }
             let (mut points, pending) = self.resolve_drawing_anchors(kind, anchors)?;
-            Drawing::normalize_position_points(kind, &mut points);
+            Drawing::normalize_points(kind, &mut points);
             staged.push((index, points, pending));
         }
         let before_all = batch.then(|| self.drawings.clone());
@@ -5798,6 +5818,9 @@ impl ChartEngine {
                         }
                     }
                     points[index] = point;
+                    // A horizontal or vertical segment drags its linked coordinate on every
+                    // anchor.
+                    kind.spec().anchor_link.apply(&mut points, index);
                 }
             }
             DrawingDragPart::Body => {
@@ -6848,6 +6871,7 @@ impl ChartEngine {
         };
         let mut drawing = pending.drawing;
         drawing.id = id;
+        Drawing::normalize_points(drawing.kind, &mut drawing.points);
         if let Some(family) = drawing.kind.spec().family {
             (family.on_create)(self, &mut drawing, true);
         }

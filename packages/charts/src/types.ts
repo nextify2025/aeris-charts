@@ -2503,6 +2503,13 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * Lines family (B8): `ray`, `extended_line`, `info_line`, `trend_angle`, and `arrow_line` place
  * two anchors; `extend_left` extends beyond the first anchor and `extend_right` beyond the second
  * (a ray defaults to `extend_right`, an extended line to both). `cross_line` places one anchor.
+ * `horizontal_segment` keeps both anchors on one price, and `vertical_ray` and `vertical_segment`
+ * keep both on one bar (the shared coordinate follows the anchor placed or dragged last); the
+ * vertical ray defaults to `extend_right`, which runs it through its second anchor to the pane edge.
+ *
+ * Channels family (B8): `price_channel` places three anchors: the base line through the first two,
+ * its parallel through the third, and the base line mirrored on the other side. It defaults to
+ * extending both ways, with no fill.
  */
 export type drawing_kind =
   | "trend_line"
@@ -2522,12 +2529,16 @@ export type drawing_kind =
   | "trend_angle"
   | "cross_line"
   | "arrow_line"
+  | "horizontal_segment"
+  | "vertical_ray"
+  | "vertical_segment"
   // B8: lines — end
   // B8: channels — begin
   | "parallel_channel"
   | "regression_trend"
   | "flat_top_bottom"
   | "disjoint_channel"
+  | "price_channel"
   // B8: channels — end
   // B8: fibonacci — begin
   // Fibonacci family: two anchors (retracement, time zone, speed resistance fan and arcs,
@@ -2633,12 +2644,16 @@ export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   trend_angle: 35,
   cross_line: 36,
   arrow_line: 37,
+  horizontal_segment: 38,
+  vertical_ray: 39,
+  vertical_segment: 40,
   // B8: lines — end
   // B8: channels — begin (wire ids 48..=63)
   parallel_channel: 48,
   regression_trend: 49,
   flat_top_bottom: 50,
   disjoint_channel: 51,
+  price_channel: 52,
   // B8: channels — end
   // B8: fibonacci — begin (wire ids 64..=95)
   fib_retracement: 64,

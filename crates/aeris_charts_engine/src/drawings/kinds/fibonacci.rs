@@ -29,8 +29,9 @@ use aeris_charts_render::shape::{self, Point, Rect};
 
 use super::super::parts::{DrawingParts, PartContext, PartLabel, PartStroke, CURVE_TOLERANCE};
 use super::super::tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis, DrawingPlacement,
-    DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout, DrawingToolSpec,
+    DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
+    DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
+    DrawingToolSpec,
 };
 use super::super::{Drawing, DrawingPoint, DrawingTextHAlign, DrawingTextVAlign};
 use super::{DrawingFamily, FamilyBounds};
@@ -183,6 +184,7 @@ const FIB_TOOL: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 /// Screen-space tools reach beyond their anchors by radii that depend on the zoom, so no

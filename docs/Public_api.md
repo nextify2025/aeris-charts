@@ -1276,6 +1276,11 @@ descriptors name those options with dotted paths such as `tool_options.line.stat
   segment, and the screen angle in degrees (rising positive, -90 to 90).
 - `cross_line` places one anchor and paints full-span horizontal and vertical lines through it,
   with the horizontal line's price tag on the axis. Its body drags on both axes.
+- `horizontal_segment` keeps both anchors on one price, and `vertical_ray` and `vertical_segment`
+  keep both on one bar. Placing, dragging, or supplying an anchor moves the shared coordinate on the
+  other, taken from the anchor placed or dragged last, so a supplied or imported pair that
+  disagrees is repaired the same way. The vertical ray defaults to `extend_right`, which runs it
+  from the first anchor through the second to the pane edge on the second anchor's side.
 - `drawing_kind_options()` returns `{ kind: "line", stats_position }` for every Lines tool.
 <!-- B8: lines — end -->
 <!-- B8: channels — begin -->
@@ -1289,6 +1294,10 @@ descriptors name those options with dotted paths such as `tool_options.line.stat
   `extend_right` extend both lines and the fill to the pane edge beyond the first and second
   anchor. Placement previews the base line after the first click and the whole channel after the
   second.
+- `price_channel` is KLineChart's price channel: the base line through the first two anchors is the
+  centre, the second line passes through the third anchor parallel to it, and the third line mirrors
+  the second on the other side of the base. It defaults to `extend_left` and `extend_right` with no
+  fill (`fill_enabled: true` shades the whole band), and has no middle line.
 - The fill between the lines is on by default (`fill_enabled`); `fill_color` defaults to the stroke
   color at 20% alpha. Where the lines cross (flat top/bottom, disjoint channel) the fill meets at
   the crossing. Lines are body targets; the fill is a drag surface only while the drawing is
@@ -1611,6 +1620,26 @@ overrides their contrasting default); they are body targets.
 - `drawing_kind_options()` returns `{ kind: "shape", closed }` for every Shapes tool; the
   `tool_options.shape.closed` schema descriptor is listed for `polyline` only.
 <!-- B8: shapes — end -->
+
+### Equivalents of KLineChart's overlays
+
+A host moving from KLineChart finds each of its drawing overlays here. Four are tools of their own
+(wire ids 38..=40 and 52); the others are an existing tool with options, and the table says where
+the look differs.
+
+| KLineChart overlay | Aeris tool |
+|---|---|
+| `straightLine` | `extended_line` |
+| `rayLine` | `ray` |
+| `horizontalSegment` | `horizontal_segment` |
+| `verticalRayLine` | `vertical_ray` |
+| `verticalSegment` | `vertical_segment` |
+| `parallelStraightLine` | `parallel_channel` with `extend_left` and `extend_right`, `fill_enabled: false`, and `tool_options.channel.middle_line: false` |
+| `priceChannelLine` | `price_channel` |
+| `fibonacciLine` | `fib_retracement` with `extend_left` and `extend_right` (levels span the pane) |
+| `priceLine` | `horizontal_ray`: the price is a tag on the price axis, not text on the line |
+| `simpleTag` | `horizontal_line`: the axis tag shows the price, never custom text |
+| `simpleAnnotation` | `signpost`: the nearest tool, a label joined to its anchor by a post, drawn in Aeris's style |
 
 ## Persistence V1
 

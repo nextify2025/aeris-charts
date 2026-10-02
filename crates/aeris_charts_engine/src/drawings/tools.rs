@@ -154,6 +154,36 @@ pub(crate) struct DrawingToolSpec {
     /// Anchors land on the crosshair's time slot and the instrument/scale price tick during
     /// creation, anchor drags, and body moves, so derived statistics read whole bars and ticks.
     pub(crate) grid_snap: bool,
+    /// A coordinate every anchor shares (a horizontal segment's price, a vertical ray's bar).
+    pub(crate) anchor_link: DrawingAnchorLink,
+}
+
+/// A coordinate every anchor of a drawing shares. Placing, dragging, or supplying one anchor moves
+/// that coordinate on the others, so the shape cannot leave its axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DrawingAnchorLink {
+    #[default]
+    None,
+    /// All anchors share one price (a horizontal segment).
+    SamePrice,
+    /// All anchors share one logical index (a vertical ray or segment).
+    SameLogical,
+}
+
+impl DrawingAnchorLink {
+    /// Give every point the linked coordinate of `points[source]`.
+    pub(crate) fn apply(self, points: &mut [super::DrawingPoint], source: usize) {
+        let Some(&anchor) = points.get(source) else {
+            return;
+        };
+        for point in points {
+            match self {
+                Self::None => {}
+                Self::SamePrice => point.price = anchor.price,
+                Self::SameLogical => point.logical = anchor.logical,
+            }
+        }
+    }
 }
 
 /// How the common text label is placed.
@@ -183,6 +213,7 @@ const TREND_LINE: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const HORIZONTAL_LINE: DrawingToolSpec = DrawingToolSpec {
@@ -202,6 +233,7 @@ const HORIZONTAL_LINE: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: true,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const HORIZONTAL_RAY: DrawingToolSpec = DrawingToolSpec {
@@ -221,6 +253,7 @@ const HORIZONTAL_RAY: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: true,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const VERTICAL_LINE: DrawingToolSpec = DrawingToolSpec {
@@ -240,6 +273,7 @@ const VERTICAL_LINE: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const RECTANGLE: DrawingToolSpec = DrawingToolSpec {
@@ -259,6 +293,7 @@ const RECTANGLE: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const TEXT: DrawingToolSpec = DrawingToolSpec {
@@ -278,6 +313,7 @@ const TEXT: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const BRUSH: DrawingToolSpec = DrawingToolSpec {
@@ -297,6 +333,7 @@ const BRUSH: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const PATH: DrawingToolSpec = DrawingToolSpec {
@@ -316,6 +353,7 @@ const PATH: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const LONG_POSITION: DrawingToolSpec = DrawingToolSpec {
@@ -335,6 +373,7 @@ const LONG_POSITION: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: true,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const SHORT_POSITION: DrawingToolSpec = DrawingToolSpec {
@@ -354,6 +393,7 @@ const SHORT_POSITION: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: true,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const FIXED_RANGE_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
@@ -373,6 +413,7 @@ const FIXED_RANGE_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const ANCHORED_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
@@ -392,6 +433,7 @@ const ANCHORED_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
@@ -411,6 +453,7 @@ const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
     grid_snap: false,
+    anchor_link: DrawingAnchorLink::None,
 };
 
 /// Every built-in tool. B8 families append only inside their own reserved block.
@@ -435,12 +478,16 @@ pub(crate) const DRAWING_TOOL_SPECS: &[DrawingToolSpec] = &[
     super::kinds::lines::TREND_ANGLE,
     super::kinds::lines::CROSS_LINE,
     super::kinds::lines::ARROW_LINE,
+    super::kinds::lines::HORIZONTAL_SEGMENT,
+    super::kinds::lines::VERTICAL_RAY,
+    super::kinds::lines::VERTICAL_SEGMENT,
     // B8: lines — end
     // B8: channels — begin
     super::kinds::channels::PARALLEL_CHANNEL,
     super::kinds::channels::REGRESSION_TREND,
     super::kinds::channels::FLAT_TOP_BOTTOM,
     super::kinds::channels::DISJOINT_CHANNEL,
+    super::kinds::channels::PRICE_CHANNEL,
     // B8: channels — end
     // B8: fibonacci — begin
     super::kinds::fibonacci::FIB_RETRACEMENT,
@@ -546,12 +593,16 @@ impl DrawingKind {
             Self::TrendAngle => &super::kinds::lines::TREND_ANGLE,
             Self::CrossLine => &super::kinds::lines::CROSS_LINE,
             Self::ArrowLine => &super::kinds::lines::ARROW_LINE,
+            Self::HorizontalSegment => &super::kinds::lines::HORIZONTAL_SEGMENT,
+            Self::VerticalRay => &super::kinds::lines::VERTICAL_RAY,
+            Self::VerticalSegment => &super::kinds::lines::VERTICAL_SEGMENT,
             // B8: lines — end
             // B8: channels — begin
             Self::ParallelChannel => &super::kinds::channels::PARALLEL_CHANNEL,
             Self::RegressionTrend => &super::kinds::channels::REGRESSION_TREND,
             Self::FlatTopBottom => &super::kinds::channels::FLAT_TOP_BOTTOM,
             Self::DisjointChannel => &super::kinds::channels::DISJOINT_CHANNEL,
+            Self::PriceChannel => &super::kinds::channels::PRICE_CHANNEL,
             // B8: channels — end
             // B8: fibonacci — begin
             Self::FibRetracement => &super::kinds::fibonacci::FIB_RETRACEMENT,
