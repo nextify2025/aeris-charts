@@ -9,6 +9,15 @@ import { PNG } from "pngjs";
 const enabled = process.env.AERIS_CHARTS_RUN_GPUI_WEBGPU_MATRIX === "1";
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const repository_root = fileURLToPath(new URL("../../..", import.meta.url));
+// The approved WebGPU hashes and the exact/limit expectations below were measured on Windows (Chrome
+// with SwiftShader against GPUI on Direct3D). On Linux, headed Chromium and GPUI on X11 (both on
+// software rasterizers, under `xvfb-run`) are compared only for the cases marked `linux`, which were
+// measured byte-exact there. No hash is approved for Linux, so its WebGPU hash is recorded in the
+// report instead of asserted. The dark case is excluded because it cannot be exact until the demo's
+// dark fixture is aligned: it paints #131722 (fixture_styles.js) while the engine and GPUI example use
+// the canonical dark surface #1f1f1f. The marker and trading cases are excluded because their Windows
+// limits depend on the host's fonts and text rasterization.
+const approved_host = process.platform === "win32";
 const matrix_cases = [
   {
     name: "dpr-1_5-spacing-fit-light-base",
@@ -16,6 +25,7 @@ const matrix_cases = [
     spacing: null,
     feature: "base",
     exact: true,
+    linux: true,
     webgpu_rgba_sha256: "a8d1a0343f76fb44d0ca99403dfc6e0204598300346d3e3ef67e4220afaaeecc",
   },
   {
@@ -24,6 +34,7 @@ const matrix_cases = [
     spacing: 0.5,
     feature: "base",
     exact: true,
+    linux: true,
     webgpu_rgba_sha256: "04e6d8d3dc66e213d1b97f35721292a3869c15e345cf88b860e5738f352520f3",
   },
   {
@@ -32,6 +43,7 @@ const matrix_cases = [
     spacing: 6,
     feature: "base",
     exact: true,
+    linux: true,
     webgpu_rgba_sha256: "de10d01e7634124b12ce2006b18393a5270805fefabed2849fbe4f727bc69a11",
   },
   {
@@ -40,6 +52,7 @@ const matrix_cases = [
     spacing: 50,
     feature: "base",
     exact: true,
+    linux: true,
     webgpu_rgba_sha256: "bad3dbf54adb6bf35d281f77bf0feeaee5d9b70914f2af1d6a505cf89d29fe30",
   },
   {
@@ -68,9 +81,10 @@ const matrix_cases = [
   },
 ];
 const requested_case = process.env.AERIS_CHARTS_GPUI_CASE;
+const host_cases = approved_host ? matrix_cases : matrix_cases.filter((matrix_case) => matrix_case.linux);
 const selected_cases = requested_case === undefined
-  ? matrix_cases
-  : matrix_cases.filter((matrix_case) => matrix_case.name === requested_case);
+  ? host_cases
+  : host_cases.filter((matrix_case) => matrix_case.name === requested_case);
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -140,6 +154,12 @@ function capture_gpui(output, metadata, matrix_case) {
   };
   delete env.AERIS_CHARTS_GPUI_BAR_SPACING;
   if (matrix_case.spacing !== null) env.AERIS_CHARTS_GPUI_BAR_SPACING = String(matrix_case.spacing);
+  if (process.platform === "linux") {
+    // GPUI prefers Wayland when WAYLAND_DISPLAY is set, and the harness reads an X11 window.
+    // The display scale of an X11 session comes from this variable.
+    delete env.WAYLAND_DISPLAY;
+    env.GPUI_X11_SCALE_FACTOR = String(fixture.pixel_ratio);
+  }
   const result = spawnSync("cargo", args, {
     cwd: repository_root,
     encoding: "utf8",
@@ -173,7 +193,10 @@ async function capture_webgpu(page, matrix_case) {
 
 test.describe("GPUI versus presented WebGPU matrix", () => {
   test.skip(!enabled, "run explicitly with `npm run test:gpui-webgpu`");
-  test.skip(process.platform !== "win32", "the current GPUI capture helper uses Windows DWM");
+  test.skip(
+    process.platform !== "win32" && process.platform !== "linux",
+    "the GPUI capture helper reads the window through Windows DWM or the Linux X server",
+  );
 
   test("D1 pane matrix at physical DPR 1.5", async ({ page }, test_info) => {
     test.setTimeout(900_000);
@@ -196,10 +219,12 @@ test.describe("GPUI versus presented WebGPU matrix", () => {
         expect([presented.width, presented.height]).toEqual(expected_page_size);
         const webgpu = crop_png(presented, pane_width, pane_height);
         const webgpu_rgba_sha256 = sha256(webgpu.data);
-        expect(
-          webgpu_rgba_sha256,
-          `${matrix_case.name} presented WebGPU output must match its approved canonical RGBA`,
-        ).toBe(matrix_case.webgpu_rgba_sha256);
+        if (approved_host) {
+          expect(
+            webgpu_rgba_sha256,
+            `${matrix_case.name} presented WebGPU output must match its approved canonical RGBA`,
+          ).toBe(matrix_case.webgpu_rgba_sha256);
+        }
 
         const artifact_dir = test_info.outputPath(matrix_case.name);
         mkdirSync(artifact_dir, { recursive: true });
@@ -237,7 +262,9 @@ test.describe("GPUI versus presented WebGPU matrix", () => {
           bar_spacing: matrix_case.spacing,
           feature: matrix_case.feature,
           reference: "Chromium presented WebGPU frame (page.screenshot), cropped before axes",
-          candidate: "official GPUI 0.2.2 presented client area (DWM PrintWindow)",
+          candidate: process.platform === "linux"
+            ? "official GPUI presented client area (X server GetImage)"
+            : "official GPUI 0.2.2 presented client area (DWM PrintWindow)",
           tolerance: 0,
           width: pane_width,
           height: pane_height,

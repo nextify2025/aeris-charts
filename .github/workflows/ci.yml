@@ -70,6 +70,60 @@ jobs:
       - name: Test native GPUI backend
         run: cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked
 
+  # Evidence, not yet a required check: what the GPUI executor actually presents in a real window,
+  # diffed against the native (tiny-skia) reference. It runs on a virtual X server with Mesa
+  # lavapipe (software Vulkan), so it says nothing about hardware GPUs, and its Prim-layer fixtures
+  # say nothing about clipping (docs/Architecture.md, Verification, lists what a pass does and does
+  # not prove, the calibration build and the criteria for promoting this job).
+  #
+  # Neither a gate failure, a hang, the job timeout nor an apt flake may turn this run red:
+  # publish.yml requires a green ci.yml run for a release commit. Hence `continue-on-error` on the
+  # job and on the harness step. When the job becomes a required check, remove both flags and add
+  # the job to the tag-publish requirements.
+  gpui-pixel-parity:
+    name: GPUI pixel parity (Linux, xvfb + lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - name: Install GPUI dependencies, a virtual X server and software Vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            xvfb mesa-vulkan-drivers libvulkan1 fonts-dejavu-core
+      - uses: Swatinem/rust-cache@v2
+      # Built apart from the run so the harness step's timeout bounds a hang, not a cold GPUI build.
+      - name: Build the pixel-parity harness
+        run: cargo build -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity --locked
+      - name: Run the pixel-parity harness
+        id: pixel-parity
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          AERIS_CHARTS_PARITY_OUT: ${{ runner.temp }}/pixel_parity
+          GPUI_X11_SCALE_FACTOR: "1"
+        run: |
+          # GPUI picks Wayland over X11 when WAYLAND_DISPLAY is set; the harness reads an X11 window.
+          unset WAYLAND_DISPLAY
+          # Force Mesa's software Vulkan driver (lavapipe); the file name varies with the Mesa version.
+          export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)"
+          # The virtual screen must be larger than the harness window or GetImage cannot read it.
+          xvfb-run -a -s "-screen 0 2560x1600x24" \
+            cargo run -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity --locked
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpui-pixel-parity-linux
+          path: ${{ runner.temp }}/pixel_parity/
+          retention-days: 7
+      - name: Surface an evidence failure
+        if: steps.pixel-parity.outcome == 'failure'
+        run: echo "::warning title=GPUI pixel parity::a gate failed or the harness did not run; see results.json in the gpui-pixel-parity-linux artifact"
+
   package:
     name: TypeScript package (lint, typecheck, build)
     runs-on: ubuntu-latest

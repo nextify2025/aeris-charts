@@ -55,6 +55,13 @@ serde_json = "1"
 sha2 = "0.11"
 tiny-skia = "0.12"
 
+# The Linux window capture (`examples/support/x11_capture.rs`) reads GPUI's own X11 window: the id
+# comes from GPUI's raw-window-handle support and the pixels from the X server. Both crates are
+# already in GPUI's Linux dependency graph (same versions), so this adds dependency edges only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+raw-window-handle = "0.6"
+x11rb = { version = "0.13", default-features = false }
+
 [lints]
 workspace = true
 
