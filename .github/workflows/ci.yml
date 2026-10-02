@@ -151,7 +151,11 @@ jobs:
         id: machine-retention-evidence
         continue-on-error: true
         working-directory: examples/web_demo
-        run: npx playwright test tests/retention.spec.mjs --project=chromium --grep @machine
+        # bash, not the runner's default PowerShell: the npx shim re-parses its arguments there, and
+        # PowerShell reads a bare @machine as a splatted variable, so this step failed on every run
+        # before Playwright started.
+        shell: bash
+        run: npx playwright test tests/retention.spec.mjs --project=chromium --grep "@machine"
       - uses: actions/upload-artifact@v4
         if: failure() || steps.machine-evidence.outcome == 'failure' || steps.machine-retention-evidence.outcome == 'failure'
         with:
