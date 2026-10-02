@@ -4,6 +4,7 @@
 //! rendering. It consumes a close/value slice and returns a derived value column that the
 //! headless engine can install as an ordinary series. `None` represents the warm-up window.
 
+pub mod klinechart;
 pub mod volume_profile;
 
 use std::{num::NonZeroUsize, sync::Arc};
@@ -3350,6 +3351,9 @@ enum IncrementalKind {
     Wma {
         period: usize,
     },
+    KLineChart {
+        indicator: klinechart::Indicator,
+    },
 }
 
 /// Incremental formula state. Output columns are short-lived transfer buffers: a full rebuild
@@ -3710,6 +3714,15 @@ impl IncrementalState {
         Self::new(IncrementalKind::Wma { period }, 1)
     }
 
+    /// A KLineChart indicator. Like KLineChart, it recomputes from the first row on every update;
+    /// since each output row depends only on earlier rows, only the requested suffix is emitted.
+    /// Rows an output leaves unset after its warm-up (see
+    /// [`klinechart::Indicator::output_starts`]) are emitted as NaN whitespace.
+    pub fn klinechart(indicator: klinechart::Indicator) -> Self {
+        let output_count = indicator.output_count().min(MAX_OUTPUTS);
+        Self::new(IncrementalKind::KLineChart { indicator }, output_count)
+    }
+
     pub fn output_count(&self) -> usize {
         self.output_count
     }
@@ -3828,6 +3841,11 @@ impl IncrementalState {
             | IncrementalKind::Mfi { .. }
             | IncrementalKind::Volume { .. }
             | IncrementalKind::Wma { .. } => warmup,
+            // A KLineChart indicator that smooths recursively, keeps a running total, or carries
+            // a path state reads the whole loaded history; a windowed one needs its warm-up.
+            IncrementalKind::KLineChart { indicator } => {
+                warmup + indicator.extra_convergence_rows()?
+            }
         })
     }
 
@@ -3890,6 +3908,7 @@ impl IncrementalState {
             IncrementalKind::Donchian { .. } => 0,
             IncrementalKind::PivotPoints { state, .. } => state.bytes(),
             IncrementalKind::ZigZag { state, .. } => state.bytes(),
+            IncrementalKind::KLineChart { .. } => 0,
         }
     }
 
@@ -4439,6 +4458,43 @@ impl IncrementalState {
                 self.output_from[0] = output_from;
                 self.last_work_rows = n - output_from.min(start);
                 state.finish(n, tail, before_tail);
+            }
+            IncrementalKind::KLineChart { indicator } => {
+                // KLineChart recomputes the whole series on every update, and so does this
+                // binding. Outputs are causal, so rows before `requested` cannot have changed and
+                // only the suffix is emitted.
+                self.last_work_rows = n;
+                let missing = indicator.missing_volume();
+                let volume: std::borrow::Cow<'_, [f64]> = if input.volume.len() >= n {
+                    std::borrow::Cow::Borrowed(&input.volume[..n])
+                } else {
+                    let mut padded = input.volume.to_vec();
+                    padded.resize(n, missing);
+                    std::borrow::Cow::Owned(padded)
+                };
+                let open = if input.open.len() >= n {
+                    &input.open[..n]
+                } else {
+                    &input.close[..n]
+                };
+                let bars = klinechart::Bars {
+                    open,
+                    high: &input.high[..n],
+                    low: &input.low[..n],
+                    close: &input.close[..n],
+                    volume: &volume,
+                    // An AVP binding's source series carries turnover as its value.
+                    turnover: &input.close[..n],
+                };
+                let columns = indicator.compute(&bars);
+                for (index, column) in columns.iter().enumerate().take(self.output_count) {
+                    let from = self.output_from[index];
+                    self.outputs[index].extend(
+                        column[from..n].iter().map(|value| {
+                            value.filter(|value| value.is_finite()).unwrap_or(f64::NAN)
+                        }),
+                    );
+                }
             }
             IncrementalKind::Ichimoku => {
                 for (output_index, &start) in
@@ -5162,6 +5218,7 @@ fn output_starts(kind: &IncrementalKind) -> [usize; MAX_OUTPUTS] {
         ],
         IncrementalKind::PivotPoints { .. } => [0; MAX_OUTPUTS],
         IncrementalKind::ZigZag { .. } => [0; MAX_OUTPUTS],
+        IncrementalKind::KLineChart { indicator } => indicator.output_starts(),
         IncrementalKind::Keltner { period, .. } => [*period, *period, *period, 0, 0],
         IncrementalKind::AdxDmi { period, .. } => {
             let start = period.saturating_add(period.saturating_sub(1));

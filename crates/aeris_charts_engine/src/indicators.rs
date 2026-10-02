@@ -236,6 +236,15 @@ pub enum IndicatorKind {
         #[serde(default)]
         seed: aeris_charts_indicators::KdjSeed,
     },
+    /// One of the 27 KLineChart indicators with KLineChart's formulas and presentation (see
+    /// [`aeris_charts_indicators::klinechart`]). Serialized with its template tag beside the kind:
+    /// `{"kind": "klinechart", "indicator": "macd", "short": 12, "long": 26, "signal": 9}`.
+    ///
+    /// `VOL`, `OBV`, `PVT`, `EMV`, and `VR` require a scalar `volume_source`. `AVP` reads turnover
+    /// from its source, which must then be a scalar series (typically hidden), and volume from its
+    /// `volume_source`.
+    #[serde(rename = "klinechart")]
+    KLineChart(aeris_charts_indicators::klinechart::Indicator),
 }
 
 impl serde::Serialize for IndicatorKind {
@@ -610,6 +619,9 @@ pub struct IndicatorParameters {
     pub d_smoothing: Option<usize>,
     /// KDJ K/D start (the `seed` field of a KDJ definition).
     pub kdj_seed: Option<aeris_charts_indicators::KdjSeed>,
+    /// The full definition of a KLineChart indicator binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub klinechart: Option<aeris_charts_indicators::klinechart::Indicator>,
 }
 
 fn indicator_default_line_width(kind: &IndicatorKind) -> f64 {
@@ -642,6 +654,9 @@ impl ChartEngine {
                 series.title_visible = true;
                 series.line_width = Some(indicator_default_line_width(&kind));
                 series.line_color = indicator_output_color(&kind, output_index).map(str::to_string);
+                if let IndicatorKind::KLineChart(indicator) = &kind {
+                    apply_klinechart_output_style(series, indicator, output_index);
+                }
             }
         }
     }
@@ -1182,6 +1197,15 @@ impl ChartEngine {
                                 k_smoothing: Some(k_smoothing),
                                 d_smoothing: Some(d_smoothing),
                                 kdj_seed: Some(seed),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::KLineChart(ref indicator) => (
+                            klinechart_kind_name(indicator),
+                            klinechart_primary_period(indicator),
+                            None,
+                            IndicatorParameters {
+                                klinechart: Some(indicator.clone()),
                                 ..IndicatorParameters::default()
                             },
                         ),
@@ -1784,6 +1808,11 @@ impl ChartEngine {
                     self.place_outputs_in_oscillator_pane(&ids);
                 }
             }
+            IndicatorKind::KLineChart(indicator) => {
+                if !ids.is_empty() {
+                    self.lay_out_klinechart_outputs(&indicator, &ids);
+                }
+            }
             IndicatorKind::Sma { .. }
             | IndicatorKind::Ema { .. }
             | IndicatorKind::Dema { .. }
@@ -2022,6 +2051,18 @@ impl ChartEngine {
                 parameters.push(number("percent", percent));
                 parameters.push(series("volume_source"));
             }
+            IndicatorKind::KLineChart(ref indicator) => {
+                for param in indicator.params() {
+                    parameters.push(if param.integer {
+                        integer(&param.name, param.value as usize)
+                    } else {
+                        number(&param.name, param.value)
+                    });
+                }
+                if indicator.needs_volume() {
+                    parameters.push(series("volume_source"));
+                }
+            }
         }
         let output_count = incremental_state(kind).output_count();
         IndicatorSchema {
@@ -2040,7 +2081,7 @@ impl ChartEngine {
 
     /// Move output series into a fresh oscillator pane below everything (the public reference
     /// separate-pane default, reduced stretch).
-    fn place_outputs_in_oscillator_pane(&mut self, ids: &[SeriesId]) {
+    pub(crate) fn place_outputs_in_oscillator_pane(&mut self, ids: &[SeriesId]) {
         let restored_pane = self.study_restore_pane_cursor.take().and_then(|index| {
             if index > 0 && index < self.panes.len() {
                 self.study_restore_pane_cursor = Some(index + 1);
@@ -2162,6 +2203,21 @@ impl ChartEngine {
                             .series_entry(id)
                             .is_none_or(|series| !series.kind.stores_scalar_values())
                 }),
+                // AVP reads turnover as the value of a scalar source series.
+                IndicatorKind::KLineChart(aeris_charts_indicators::klinechart::Indicator::Avp)
+                    if self
+                        .series_entry(source)
+                        .is_some_and(|series| !series.kind.stores_scalar_values()) =>
+                {
+                    true
+                }
+                IndicatorKind::KLineChart(indicator) if indicator.needs_volume() => volume_source
+                    .is_none_or(|id| {
+                        id == source
+                            || self
+                                .series_entry(id)
+                                .is_none_or(|series| !series.kind.stores_scalar_values())
+                    }),
                 _ => volume_source.is_some(),
             }
             || match &kind {
@@ -2237,6 +2293,7 @@ impl ChartEngine {
                         || !percent.is_finite()
                         || *percent < 0.0
                 }
+                IndicatorKind::KLineChart(indicator) => !indicator.is_valid(),
             }
         {
             return Vec::new();
@@ -2302,6 +2359,10 @@ impl ChartEngine {
                     s.price_format.kind = kind;
                     s.price_format.precision = precision;
                     s.price_format.min_move = min_move;
+                }
+                if let IndicatorKind::KLineChart(indicator) = &kind {
+                    apply_klinechart_output_style(s, indicator, output_index);
+                    apply_klinechart_value_format(s, indicator);
                 }
             }
         }
@@ -2582,16 +2643,8 @@ impl ChartEngine {
             // amount-weighted average price.
             let fallback = if amount_source.is_some() {
                 f64::NAN
-            } else if matches!(
-                &self.indicators[index].kind,
-                IndicatorKind::Obv
-                    | IndicatorKind::Cmf { .. }
-                    | IndicatorKind::Mfi { .. }
-                    | IndicatorKind::Volume { .. }
-            ) {
-                0.0
             } else {
-                1.0
+                missing_volume(&self.indicators[index].kind)
             };
             let weight = |column: Option<SeriesId>| {
                 column
@@ -2636,6 +2689,8 @@ impl ChartEngine {
             amount_source.and_then(|id| self.data.series_generation(id));
 
         let mut full_histogram_colors = None;
+        // First output row each output rewrote, for per-row colors.
+        let mut changed_rows = [0usize; aeris_charts_indicators::MAX_OUTPUTS];
         for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
             let previous_generation = self.data.series_generation(output).unwrap_or(0);
             // The runtime stops at the data end, so an output whose first row lies past it (its
@@ -2673,6 +2728,7 @@ impl ChartEngine {
                 }
                 .expect("indicator output remains aligned to its source")
             };
+            changed_rows[output_index] = output_from;
             if self.data.series_generation(output).unwrap_or(0) != previous_generation {
                 changes[output_index] = Some((
                     output,
@@ -2723,6 +2779,21 @@ impl ChartEngine {
                 }
             }
         }
+        if let IndicatorKind::KLineChart(indicator) = &self.indicators[index].kind {
+            let rules: [Option<KLineChartColorRule>; aeris_charts_indicators::MAX_OUTPUTS] =
+                std::array::from_fn(|output_index| klinechart_color_rule(indicator, output_index));
+            for (output_index, rule) in rules.into_iter().enumerate() {
+                if let (Some(rule), Some(output)) = (rule, outputs[output_index]) {
+                    self.color_klinechart_output(
+                        rule,
+                        source,
+                        output,
+                        changed_rows[output_index],
+                        full_replace,
+                    );
+                }
+            }
+        }
         self.indicators[index].runtime.release_transfer_capacity();
         changes
     }
@@ -2741,6 +2812,19 @@ fn momentum_histogram_colors(values: &[f64]) -> Vec<u32> {
         }
     }
     colors
+}
+
+/// The volume assumed for a source bar the volume series has no row for: zero for volume-flow
+/// studies, the formula's own default for KLineChart indicators, and a unit weight otherwise.
+fn missing_volume(kind: &IndicatorKind) -> f64 {
+    match kind {
+        IndicatorKind::Obv
+        | IndicatorKind::Cmf { .. }
+        | IndicatorKind::Mfi { .. }
+        | IndicatorKind::Volume { .. } => 0.0,
+        IndicatorKind::KLineChart(indicator) => indicator.missing_volume(),
+        _ => 1.0,
+    }
 }
 
 fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {
@@ -2780,6 +2864,7 @@ fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {
         IndicatorKind::VwapBands { .. } => "vwap_bands",
         IndicatorKind::Wma { .. } => "wma",
         IndicatorKind::Kdj { .. } => "kdj",
+        IndicatorKind::KLineChart(indicator) => klinechart_kind_name(indicator),
     }
 }
 
@@ -2905,6 +2990,9 @@ fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::Increment
             aeris_charts_indicators::IncrementalState::rate_of_change(period)
         }
         IndicatorKind::Wma { period } => aeris_charts_indicators::IncrementalState::wma(period),
+        IndicatorKind::KLineChart(ref indicator) => {
+            aeris_charts_indicators::IncrementalState::klinechart(indicator.clone())
+        }
     }
 }
 
@@ -2995,18 +3083,28 @@ fn indicator_title(kind: &IndicatorKind) -> String {
             d_smoothing,
             ..
         } => format!("KDJ {period} {k_smoothing} {d_smoothing}"),
+        IndicatorKind::KLineChart(indicator) => indicator.title(),
     }
 }
 
 fn indicator_output_title(kind: &IndicatorKind, output_index: usize) -> String {
     match kind {
         IndicatorKind::EmaRibbon { periods } => format!("EMA {}", periods[output_index]),
+        IndicatorKind::KLineChart(indicator) => indicator
+            .output_titles()
+            .into_iter()
+            .nth(output_index)
+            .unwrap_or_default(),
         _ => indicator_title(kind),
     }
 }
 
 fn indicator_output_color(kind: &IndicatorKind, output_index: usize) -> Option<&'static str> {
-    matches!(kind, IndicatorKind::EmaRibbon { .. }).then(|| EMA_RIBBON_DEFAULT_COLORS[output_index])
+    match kind {
+        IndicatorKind::EmaRibbon { .. } => Some(EMA_RIBBON_DEFAULT_COLORS[output_index]),
+        IndicatorKind::KLineChart(indicator) => klinechart_output_color(indicator, output_index),
+        _ => None,
+    }
 }
 
 pub(crate) fn indicator_output_style(series: &SeriesEntry) -> IndicatorOutputStyle {
@@ -3072,6 +3170,11 @@ fn indicator_output_name(kind: &IndicatorKind, output_index: usize) -> &'static 
         }
         IndicatorKind::Wma { .. } => "WMA",
         IndicatorKind::Kdj { .. } => ["K", "D", "J"][output_index],
+        IndicatorKind::KLineChart(indicator) => indicator
+            .output_keys()
+            .get(output_index)
+            .copied()
+            .unwrap_or_default(),
     }
 }
 

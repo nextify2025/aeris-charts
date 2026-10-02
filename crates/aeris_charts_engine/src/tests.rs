@@ -747,6 +747,39 @@ fn hidden_series_do_not_expand_autoscale() {
 }
 
 #[test]
+fn histogram_autoscale_includes_the_column_base() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart.set_series_visible(0, false);
+    chart
+        .set_series_data(
+            volume,
+            &[1.0, 2.0, 3.0],
+            &[120.0, 150.0, 180.0],
+            &[120.0, 150.0, 180.0],
+            &[120.0, 150.0, 180.0],
+            &[120.0, 150.0, 180.0],
+        )
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart.autoscale_visible();
+    let range = chart.panes[0].price_scale.price_range().unwrap();
+    assert_eq!((range.min_value(), range.max_value()), (0.0, 180.0));
+
+    // A base above the data extends the range upward instead.
+    chart
+        .series
+        .iter_mut()
+        .find(|series| series.id == volume)
+        .unwrap()
+        .base = 200.0;
+    chart.autoscale_visible();
+    let range = chart.panes[0].price_scale.price_range().unwrap();
+    assert_eq!((range.min_value(), range.max_value()), (120.0, 200.0));
+}
+
+#[test]
 fn marker_autoscale_margins_are_headless_and_can_be_disabled() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart
@@ -1852,7 +1885,7 @@ fn add_test_indicator(
     )
 }
 
-fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding_index: usize) {
+pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding_index: usize) {
     let binding = &chart.indicators[binding_index];
     let (times, source) = chart.data.series_data(binding.source).unwrap();
     let expected = match binding.kind {
@@ -2189,10 +2222,56 @@ fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding_index: usi
                 points.iter().map(|point| point.j).collect(),
             ]
         }
+        IndicatorKind::KLineChart(ref indicator) => {
+            let missing = indicator.missing_volume();
+            let volume = binding
+                .volume_source
+                .and_then(|id| chart.data.series_data(id))
+                .map(|(volume_times, values)| {
+                    let mut aligned = vec![missing; times.len()];
+                    let mut volume_row = 0;
+                    for (source_row, &time) in times.iter().enumerate() {
+                        while volume_row < volume_times.len() && volume_times[volume_row] < time {
+                            volume_row += 1;
+                        }
+                        if volume_times.get(volume_row) == Some(&time) {
+                            aligned[source_row] = values[3][volume_row];
+                        }
+                    }
+                    aligned
+                })
+                .unwrap_or_else(|| vec![missing; times.len()]);
+            indicator.compute(&aeris_charts_indicators::klinechart::Bars {
+                open: source[0],
+                high: source[1],
+                low: source[2],
+                close: source[3],
+                volume: &volume,
+                turnover: source[3],
+            })
+        }
     };
 
-    for (&output, expected) in binding.outputs.iter().zip(expected) {
-        let expected = if matches!(
+    // KLineChart outputs are dense from their declared warm-up row, with NaN where unset.
+    let klinechart_starts = match &binding.kind {
+        IndicatorKind::KLineChart(indicator) => Some(indicator.output_starts()),
+        _ => None,
+    };
+    for (output_index, (&output, expected)) in binding.outputs.iter().zip(expected).enumerate() {
+        let expected = if let Some(starts) = klinechart_starts {
+            times
+                .iter()
+                .copied()
+                .zip(expected)
+                .skip(starts[output_index])
+                .map(|(time, value)| {
+                    (
+                        time,
+                        value.filter(|value| value.is_finite()).unwrap_or(f64::NAN),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else if matches!(
             binding.kind,
             IndicatorKind::PivotPoints { .. } | IndicatorKind::ZigZag { .. }
         ) {

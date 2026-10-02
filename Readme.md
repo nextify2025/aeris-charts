@@ -287,6 +287,10 @@ and observed behavior from established charting products are used to learn commo
 and to build development-only compatibility comparisons. Those references do not share Aeris's
 engine, rendering, or state-management implementation.
 
+The KLineChart indicator port is the exception: its formulas are translated from
+[KLineChart](https://github.com/klinecharts/KLineChart) v10.0.3 (Apache-2.0) and credited in
+[NOTICE](NOTICE) and the module documentation.
+
 Development tests use Lightweight Charts as a pinned Apache-2.0 dependency through its public API.
 That dependency is not included in the published `@aeristerminal/aeris-charts` package. TradingView and
 Lightweight Charts are trademarks of their respective owners; Aeris Charts is not affiliated with
