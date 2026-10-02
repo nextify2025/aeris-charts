@@ -295,7 +295,7 @@ impl ChartEngine {
             })
             .collect::<Vec<_>>();
         for (rule, source, output) in targets {
-            self.color_klinechart_output(rule, source, output, 0, true);
+            self.color_klinechart_output(rule, source, output, None);
             self.invalidate_frame_series(output);
         }
     }
@@ -315,15 +315,15 @@ impl ChartEngine {
         )
     }
 
-    /// Recolors the rows of a bar or dot output from `from_row` (all rows when `full`), after the
-    /// output's values changed.
+    /// Recolors the rows `changed` of a bar or dot output after its values changed there, or
+    /// every row when `changed` is `None`. Rows past the range keep their colors: they are the
+    /// whitespace slots of a pre-installed session, which a tick does not touch.
     pub(crate) fn color_klinechart_output(
         &mut self,
         rule: KLineChartColorRule,
         source: SeriesId,
         output: SeriesId,
-        from_row: usize,
-        full: bool,
+        changed: Option<std::ops::Range<usize>>,
     ) {
         let palette = self.klinechart_palette(source);
         let (from, colors) = {
@@ -338,8 +338,11 @@ impl ChartEngine {
             let Some(offset) = bars[3].len().checked_sub(values.len()) else {
                 return;
             };
-            let from = if full { 0 } else { from_row.min(values.len()) };
-            let colors = (from..values.len())
+            let (from, to) = match &changed {
+                Some(rows) => (rows.start.min(values.len()), rows.end.min(values.len())),
+                None => (0, values.len()),
+            };
+            let colors = (from..to)
                 .map(|row| {
                     let source_row = offset + row;
                     let candle = [
@@ -354,7 +357,7 @@ impl ChartEngine {
                 .collect::<Vec<_>>();
             (from, colors)
         };
-        if full {
+        if changed.is_none() {
             self.data
                 .set_point_colors(output, [Some(colors), None, None]);
         } else {

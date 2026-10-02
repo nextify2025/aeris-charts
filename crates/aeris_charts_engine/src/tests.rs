@@ -2241,14 +2241,40 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
                     aligned
                 })
                 .unwrap_or_else(|| vec![missing; times.len()]);
-            indicator.compute(&aeris_charts_indicators::klinechart::Bars {
-                open: source[0],
-                high: source[1],
-                low: source[2],
-                close: source[3],
-                volume: &volume,
-                turnover: source[3],
-            })
+            // The whitespace contract: whitespace rows (NaN close, high or low) are absent from
+            // every window, so the expected values are the formula over the remaining rows (their
+            // volumes with them), scattered back with no value on the whitespace rows.
+            let kept = (0..times.len())
+                .filter(|&row| {
+                    !(source[1][row].is_nan() || source[2][row].is_nan() || source[3][row].is_nan())
+                })
+                .collect::<Vec<_>>();
+            let compact = |column: &[f64]| kept.iter().map(|&row| column[row]).collect::<Vec<_>>();
+            let (open, high, low, close, volume) = (
+                compact(source[0]),
+                compact(source[1]),
+                compact(source[2]),
+                compact(source[3]),
+                compact(&volume),
+            );
+            indicator
+                .compute(&aeris_charts_indicators::klinechart::Bars {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                    volume: &volume,
+                    turnover: &close,
+                })
+                .into_iter()
+                .map(|column| {
+                    let mut scattered = vec![None; times.len()];
+                    for (&row, value) in kept.iter().zip(column) {
+                        scattered[row] = value;
+                    }
+                    scattered
+                })
+                .collect()
         }
     };
 

@@ -472,8 +472,10 @@ draw over the candles on the main pane, and every other template in a pane of it
 `volume_source`. Rows before an output's `warmup_bars` hold no value and are not returned by `data()`;
 `convergence_bars` is `null` for `ema`, `sma`, `macd`, `kdj`, `rsi`, `dmi`, `trix`, `obv`, `pvt`, `avp`,
 and `sar`, whose values depend on the whole loaded history (recursive smoothing, running totals, or a
-path state). Like KLineChart, a binding recomputes from its first row on every data change
-and publishes the changed suffix. V3 chart state stores the definition as `{"kind": "klinechart",
+path state). A binding steps each formula one row at a time from checkpointed state, so a live
+tick costs the formula's window rather than the history, and publishes the changed suffix. A
+whitespace row (a missing bar, or a pre-installed session slot) emits no value and never enters a
+window: every value equals the one computed on the chart without that row. V3 chart state stores the definition as `{"kind": "klinechart",
 "indicator": "macd", "short": 12, "long": 26, "signal": 9 }` with the source, volume-source, and
 per-output style references, and restores into a fresh chart like every other study. The formulas are
 translated from KLineChart v10.0.3 and match its output bit for bit (see `docs/Architecture.md` and

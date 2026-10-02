@@ -1860,6 +1860,11 @@ fn tail_window_replay_start(
 /// most 1023 rows of work to a historical repair.
 const CHECKPOINT_INTERVAL: usize = 1024;
 
+/// Rows of transfer or scratch capacity a runtime keeps after `release_transfer_capacity`: large
+/// enough for a realtime batch, small enough that one historical repair never becomes permanent
+/// state. `tests/klinechart_incremental.rs` keeps a copy that must equal this value.
+const MAX_RETAINED_ROWS: usize = 65_536;
+
 #[derive(Clone, Copy, Debug)]
 struct Checkpoint<T> {
     row: usize,
@@ -3353,6 +3358,8 @@ enum IncrementalKind {
     },
     KLineChart {
         indicator: klinechart::Indicator,
+        // Boxed: the runtime's checkpoint state is larger than every other variant.
+        runtime: Box<klinechart::KlRuntime>,
     },
 }
 
@@ -3714,13 +3721,23 @@ impl IncrementalState {
         Self::new(IncrementalKind::Wma { period }, 1)
     }
 
-    /// A KLineChart indicator. Like KLineChart, it recomputes from the first row on every update;
-    /// since each output row depends only on earlier rows, only the requested suffix is emitted.
-    /// Rows an output leaves unset after its warm-up (see
+    /// A KLineChart indicator. The runtime steps the formula one valid row at a time from a
+    /// checkpointed state, kept like the built-in studies' (one checkpoint per 1,024 rows plus the
+    /// two tail states), so a current-bar replacement or append costs the formula's window and a
+    /// historical repair replays at most 1,023 rows before the changed one. Whitespace source rows
+    /// (NaN close, high or low) emit NaN and never enter formula state: windows and lags count
+    /// only the rows that carry a sample, so every value equals the value computed with the
+    /// whitespace rows removed. Rows an output leaves unset after its warm-up (see
     /// [`klinechart::Indicator::output_starts`]) are emitted as NaN whitespace.
     pub fn klinechart(indicator: klinechart::Indicator) -> Self {
         let output_count = indicator.output_count().min(MAX_OUTPUTS);
-        Self::new(IncrementalKind::KLineChart { indicator }, output_count)
+        Self::new(
+            IncrementalKind::KLineChart {
+                indicator,
+                runtime: Box::new(klinechart::KlRuntime::new()),
+            },
+            output_count,
+        )
     }
 
     pub fn output_count(&self) -> usize {
@@ -3842,8 +3859,9 @@ impl IncrementalState {
             | IncrementalKind::Volume { .. }
             | IncrementalKind::Wma { .. } => warmup,
             // A KLineChart indicator that smooths recursively, keeps a running total, or carries
-            // a path state reads the whole loaded history; a windowed one needs its warm-up.
-            IncrementalKind::KLineChart { indicator } => {
+            // a path state depends on every row loaded before it, so no row count makes it
+            // independent of where the loaded history begins; a windowed one needs its warm-up.
+            IncrementalKind::KLineChart { indicator, .. } => {
                 warmup + indicator.extra_convergence_rows()?
             }
         })
@@ -3857,12 +3875,14 @@ impl IncrementalState {
     /// Drop historical transfer capacity after the caller has copied a partial repair. Realtime
     /// batches retain up to 64K rows; larger suffix buffers must not become permanent state.
     pub fn release_transfer_capacity(&mut self) {
-        const MAX_RETAINED_ROWS: usize = 65_536;
         for output in &mut self.outputs[..self.output_count] {
             output.clear();
             if output.capacity() > MAX_RETAINED_ROWS {
                 output.shrink_to(MAX_RETAINED_ROWS);
             }
+        }
+        if let IncrementalKind::KLineChart { runtime, .. } = &mut self.kind {
+            runtime.release_scratch();
         }
     }
 
@@ -3908,7 +3928,7 @@ impl IncrementalState {
             IncrementalKind::Donchian { .. } => 0,
             IncrementalKind::PivotPoints { state, .. } => state.bytes(),
             IncrementalKind::ZigZag { state, .. } => state.bytes(),
-            IncrementalKind::KLineChart { .. } => 0,
+            IncrementalKind::KLineChart { runtime, .. } => runtime.bytes(),
         }
     }
 
@@ -3965,7 +3985,9 @@ impl IncrementalState {
     }
 
     /// Prior non-whitespace rows a stateless window formula reads before `from`. `None` for
-    /// recursive and path-dependent formulas, which skip whitespace inside their state.
+    /// recursive and path-dependent formulas, which skip whitespace inside their state, and for
+    /// KLineChart bindings, whose runtime skips whitespace itself in source-row coordinates (the
+    /// checkpoint rows of its state stay valid; this generic compaction renumbers rows).
     fn compaction_lookback(&self) -> Option<usize> {
         match &self.kind {
             IncrementalKind::Sma { .. }
@@ -4459,42 +4481,15 @@ impl IncrementalState {
                 self.last_work_rows = n - output_from.min(start);
                 state.finish(n, tail, before_tail);
             }
-            IncrementalKind::KLineChart { indicator } => {
-                // KLineChart recomputes the whole series on every update, and so does this
-                // binding. Outputs are causal, so rows before `requested` cannot have changed and
-                // only the suffix is emitted.
-                self.last_work_rows = n;
-                let missing = indicator.missing_volume();
-                let volume: std::borrow::Cow<'_, [f64]> = if input.volume.len() >= n {
-                    std::borrow::Cow::Borrowed(&input.volume[..n])
-                } else {
-                    let mut padded = input.volume.to_vec();
-                    padded.resize(n, missing);
-                    std::borrow::Cow::Owned(padded)
-                };
-                let open = if input.open.len() >= n {
-                    &input.open[..n]
-                } else {
-                    &input.close[..n]
-                };
-                let bars = klinechart::Bars {
-                    open,
-                    high: &input.high[..n],
-                    low: &input.low[..n],
-                    close: &input.close[..n],
-                    volume: &volume,
-                    // An AVP binding's source series carries turnover as its value.
-                    turnover: &input.close[..n],
-                };
-                let columns = indicator.compute(&bars);
-                for (index, column) in columns.iter().enumerate().take(self.output_count) {
-                    let from = self.output_from[index];
-                    self.outputs[index].extend(
-                        column[from..n].iter().map(|value| {
-                            value.filter(|value| value.is_finite()).unwrap_or(f64::NAN)
-                        }),
-                    );
-                }
+            IncrementalKind::KLineChart { indicator, runtime } => {
+                self.last_work_rows = runtime.rebuild(
+                    indicator,
+                    &input,
+                    requested,
+                    n,
+                    &self.output_from,
+                    &mut self.outputs,
+                );
             }
             IncrementalKind::Ichimoku => {
                 for (output_index, &start) in
@@ -5218,7 +5213,7 @@ fn output_starts(kind: &IncrementalKind) -> [usize; MAX_OUTPUTS] {
         ],
         IncrementalKind::PivotPoints { .. } => [0; MAX_OUTPUTS],
         IncrementalKind::ZigZag { .. } => [0; MAX_OUTPUTS],
-        IncrementalKind::KLineChart { indicator } => indicator.output_starts(),
+        IncrementalKind::KLineChart { indicator, .. } => indicator.output_starts(),
         IncrementalKind::Keltner { period, .. } => [*period, *period, *period, 0, 0],
         IncrementalKind::AdxDmi { period, .. } => {
             let start = period.saturating_add(period.saturating_sub(1));
@@ -7405,7 +7400,7 @@ mod tests {
 
     /// One fresh runtime per built-in kind, used by the whitespace-equivalence checks.
     fn whitespace_test_states() -> Vec<(&'static str, IncrementalState)> {
-        vec![
+        let mut states = vec![
             ("sma", IncrementalState::sma(5)),
             ("ema", IncrementalState::ema(5)),
             ("dema", IncrementalState::dema(4)),
@@ -7478,6 +7473,163 @@ mod tests {
                 "bollinger_sample",
                 IncrementalState::bollinger_with(5, 2.0, DeviationEstimator::Sample),
             ),
+        ];
+        states.extend(
+            klinechart_whitespace_templates()
+                .into_iter()
+                .map(|(label, indicator)| (label, IncrementalState::klinechart(indicator))),
+        );
+        states
+    }
+
+    /// Every KLineChart template, with periods short enough for the 72-row whitespace series.
+    fn klinechart_whitespace_templates() -> Vec<(&'static str, klinechart::Indicator)> {
+        use klinechart::Indicator;
+        vec![
+            (
+                "klc_ma",
+                Indicator::Ma {
+                    periods: vec![3, 5, 8],
+                },
+            ),
+            (
+                "klc_ema",
+                Indicator::Ema {
+                    periods: vec![3, 6],
+                },
+            ),
+            (
+                "klc_sma",
+                Indicator::Sma {
+                    period: 4,
+                    weight: 2.0,
+                },
+            ),
+            (
+                "klc_boll",
+                Indicator::Boll {
+                    period: 5,
+                    multiplier: 2.0,
+                },
+            ),
+            (
+                "klc_sar",
+                Indicator::Sar {
+                    start: 2.0,
+                    step: 2.0,
+                    max: 20.0,
+                },
+            ),
+            (
+                "klc_bbi",
+                Indicator::Bbi {
+                    periods: [2, 3, 4, 5],
+                },
+            ),
+            ("klc_avp", Indicator::Avp),
+            (
+                "klc_vol",
+                Indicator::Vol {
+                    periods: vec![3, 4],
+                },
+            ),
+            (
+                "klc_macd",
+                Indicator::Macd {
+                    short: 3,
+                    long: 6,
+                    signal: 4,
+                },
+            ),
+            (
+                "klc_kdj",
+                Indicator::Kdj {
+                    period: 5,
+                    k_smoothing: 3,
+                    d_smoothing: 3,
+                },
+            ),
+            (
+                "klc_rsi",
+                Indicator::Rsi {
+                    periods: vec![3, 5],
+                },
+            ),
+            (
+                "klc_bias",
+                Indicator::Bias {
+                    periods: vec![3, 5],
+                },
+            ),
+            ("klc_brar", Indicator::Brar { period: 5 }),
+            ("klc_cci", Indicator::Cci { period: 5 }),
+            (
+                "klc_dmi",
+                Indicator::Dmi {
+                    period: 4,
+                    adxr_period: 3,
+                },
+            ),
+            (
+                "klc_cr",
+                Indicator::Cr {
+                    period: 5,
+                    ma_periods: [2, 3, 4, 5],
+                },
+            ),
+            (
+                "klc_psy",
+                Indicator::Psy {
+                    period: 4,
+                    ma_period: 3,
+                },
+            ),
+            (
+                "klc_dma",
+                Indicator::Dma {
+                    short: 3,
+                    long: 6,
+                    signal: 4,
+                },
+            ),
+            (
+                "klc_trix",
+                Indicator::Trix {
+                    period: 3,
+                    ma_period: 3,
+                },
+            ),
+            ("klc_obv", Indicator::Obv { ma_period: 4 }),
+            (
+                "klc_vr",
+                Indicator::Vr {
+                    period: 4,
+                    ma_period: 3,
+                },
+            ),
+            (
+                "klc_wr",
+                Indicator::Wr {
+                    periods: vec![3, 5],
+                },
+            ),
+            (
+                "klc_mtm",
+                Indicator::Mtm {
+                    period: 3,
+                    ma_period: 2,
+                },
+            ),
+            ("klc_emv", Indicator::Emv { period: 4 }),
+            (
+                "klc_roc",
+                Indicator::Roc {
+                    period: 3,
+                    ma_period: 2,
+                },
+            ),
+            ("klc_pvt", Indicator::Pvt),
+            ("klc_ao", Indicator::Ao { short: 2, long: 5 }),
         ]
     }
 
