@@ -320,11 +320,13 @@ fn extra_convergence_rows_follow_how_much_history_each_indicator_reads() {
                 let first = starts[output] + skip;
                 let end = (starts[output] + CHECKED_ROWS).min(shifted[output].len());
                 assert!(first < end, "{name} output {output} has rows to compare");
-                (first..end).all(|row| match (full[output][row + DROPPED], shifted[output][row]) {
-                    (Some(a), Some(b)) => (a - b).abs() <= 1e-9 * a.abs().max(1.0),
-                    (None, None) => true,
-                    _ => false,
-                })
+                (first..end).all(
+                    |row| match (full[output][row + DROPPED], shifted[output][row]) {
+                        (Some(a), Some(b)) => (a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                        (None, None) => true,
+                        _ => false,
+                    },
+                )
             })
         };
         let extra = if matches_from(0) {

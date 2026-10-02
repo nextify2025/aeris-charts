@@ -71,7 +71,8 @@ use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 
 pub use aeris_charts_indicators::{
-    klinechart, DeviationEstimator, IndicatorConvention, IndicatorSeed, KdjSeed, PivotKind, VwapReset,
+    klinechart, DeviationEstimator, IndicatorConvention, IndicatorSeed, KdjSeed, PivotKind,
+    VwapReset,
 };
 pub use alerts::{
     AlertCondition, AlertCreateRequest, AlertFrequency, AlertId, AlertLine, AlertLineStatus,
