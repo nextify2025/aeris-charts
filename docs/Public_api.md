@@ -58,6 +58,8 @@ The supported root surface is:
   or persisted object;
 - visible-range volume profiles through `chart.add_volume_profile(prices, volume, options)`,
   returning a distribution handle with `options()`, `apply_options()`, `snapshot()` and `remove()`;
+- KLineChart's 27 indicator templates through `chart.add_klinechart_indicator(source, indicator,
+  volume_source?, options?)`, described under [KLineChart indicators](#klinechart-indicators);
 - first-class tick-driven footprint / numbers-bar series through `chart.add_series("footprint")`,
   including object and typed-column trade ingestion, explicit/quote/tick-rule aggressor handling,
   per-level Bid × Ask/total/delta, POC, final/Max/Min/session delta, configurable diagonal and
@@ -377,6 +379,105 @@ bars shows one short segment per bar. Ordinary line, area, and baseline series c
 unless `break_on_trading_day: true` asks them to break at each exchange trading day (on a non-time
 bar axis such as Renko or tick bars, the day of each bar's open time); whitespace rows never break
 a line.
+
+### KLineChart indicators
+
+`chart.add_klinechart_indicator(source, indicator, volume_source?, options?)` adds one of KLineChart's
+27 indicator templates, with KLineChart's formulas and presentation, and returns one `series_api` per
+output in output order. `indicator` is a `klinechart_indicator`: the template name in `indicator` plus
+that template's parameters, all spelled out (nothing is defaulted, so a missing field is rejected):
+
+```ts
+const [dif, dea, histogram] = chart.add_klinechart_indicator(candles, { indicator: "macd", short: 12, long: 26, signal: 9 });
+const [volume_bars, ma5, ma10] = chart.add_klinechart_indicator(candles, { indicator: "vol", periods: [5, 10] }, volume);
+const [average_price] = chart.add_klinechart_indicator(turnover, { indicator: "avp" }, volume);
+```
+
+`options` (the last argument, after `volume_source`, as in `add_vwap`) is a `Partial<series_options>` applied to every output; style one output
+through its returned handle. The 27 names are the `klinechart_indicator_name` union, price overlays first:
+`ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`, `vol`, `macd`, `kdj`, `rsi`, `bias`, `brar`, `cci`, `dmi`,
+`cr`, `psy`, `dma`, `trix`, `obv`, `vr`, `wr`, `mtm`, `emv`, `roc`, `pvt`, `ao`. Each row below gives the
+parameters at KLineChart's defaults, the outputs (`key`, drawn as a line unless noted), and what the
+template needs:
+
+| `indicator` | Parameters (KLineChart default) | Outputs | Needs |
+| --- | --- | --- | --- |
+| `ma` | `periods` `[5, 10, 30, 60]` | `ma1`..`ma4`, one per period | |
+| `ema` | `periods` `[6, 12, 20]` | `ema1`..`ema3` | |
+| `sma` | `period` 12, `weight` 2 | `sma` | |
+| `boll` | `period` 20, `multiplier` 2 | `up`, `mid`, `dn` | |
+| `sar` | `start` 2, `step` 2, `max` 20 (percent) | `sar` (dots) | |
+| `bbi` | `periods` `[3, 6, 12, 24]`, exactly four | `bbi` | |
+| `avp` | none | `avp` | a scalar source series holding turnover, and volume |
+| `vol` | `periods` `[5, 10, 20]`, at most four | `volume` (bars), `ma1`..`ma3` | volume |
+| `macd` | `short` 12, `long` 26, `signal` 9 | `dif`, `dea`, `macd` (bars) | |
+| `kdj` | `period` 9, `k_smoothing` 3, `d_smoothing` 3 | `k`, `d`, `j` | |
+| `rsi` | `periods` `[6, 12, 24]` | `rsi1`..`rsi3` | |
+| `bias` | `periods` `[6, 12, 24]` | `bias1`..`bias3` | |
+| `brar` | `period` 26 | `br`, `ar` | |
+| `cci` | `period` 20 | `cci` | |
+| `dmi` | `period` 14, `adxr_period` 6 | `pdi`, `mdi`, `adx`, `adxr` | |
+| `cr` | `period` 26, `ma_periods` `[10, 20, 40, 60]`, exactly four | `cr`, `ma1`..`ma4` | |
+| `psy` | `period` 12, `ma_period` 6 | `psy`, `maPsy` | |
+| `dma` | `short` 10, `long` 50, `signal` 10 | `dma`, `ama` | |
+| `trix` | `period` 12, `ma_period` 9 | `trix`, `maTrix` | |
+| `obv` | `ma_period` 30 | `obv`, `maObv` | volume |
+| `vr` | `period` 26, `ma_period` 6 | `vr`, `maVr` | volume |
+| `wr` | `periods` `[6, 10, 14]` | `wr1`..`wr3` | |
+| `mtm` | `period` 12, `ma_period` 6 | `mtm`, `maMtm` | |
+| `emv` | `period` 14 | `emv`, `maEmv` | volume |
+| `roc` | `period` 12, `ma_period` 6 | `roc`, `maRoc` | |
+| `pvt` | none | `pvt` | volume |
+| `ao` | `short` 5, `long` 34 | `ao` (bars) | |
+
+A list of periods (`periods`) holds one to five entries, and one output line per entry (`vol`: one to
+four, because the volume bars take the first output). Periods are whole numbers from 1 to 1,000,000;
+the `sma` weight and the `sar` factors are positive and the `boll` multiplier is not negative.
+`indicator_schema("klinechart_<name>")` reports the same defaults (a list as `period_1`, `period_2`,
+...) and output names from the engine, so a settings editor can read them instead of copying this table.
+KLineChart lists a second `emv` parameter, 9, that its formula never reads; it is not part of the
+definition.
+
+**Sources.** `source` is the OHLC series the formulas read. `avp` is the exception: its source is a
+scalar series holding the traded value (turnover) per bar, typically hidden, and it divides the running
+sum of that series by the running volume. A scalar series (a line, area, baseline, or histogram) is also
+accepted as the source of every other template and is read as open = high = low = close = its value, so
+`macd` over a line series computes the MACD of that line. The templates marked "volume" need a scalar `volume_source`
+(a scalar series such as a histogram or a line, never the source itself); volume pairs with source rows by exact timestamp,
+and a bar without a volume uses KLineChart's own default (1 for `pvt`, 0 for the others). Every other
+template must not be given a volume series. `add_klinechart_indicator` has no `amount_source`: the
+engine accepts a turnover series only for VWAP, so a KLineChart binding carries turnover in `avp`'s
+source instead.
+
+**Invalid input.** An unknown template name (the name is case-sensitive and lower case), a missing,
+non-whole, out-of-range, or non-numeric parameter, too many or too few periods, a source series that
+no longer exists, an OHLC source given to `avp`, or a volume series that is missing, extra, equal to the
+source, or not scalar throws `AerisChartsError` with code `invalid_options` and leaves the chart
+unchanged. The engine decides every one of these, and the message names the template that was passed. Nothing is rounded: `{ short: 2.5 }` is rejected
+instead of floored, unlike the period arguments of the other `add_*` methods.
+
+**Presentation.** The engine owns the look, as KLineChart draws it. Line outputs are 1px lines in
+KLineChart's five-color palette in output order, with no title chip, last-value label, or price line.
+`vol`, `macd`, and `ao` draw their bar output as a histogram, and `sar` draws marker-only dots. Bars and
+dots are colored per row by the engine, from the source candles' up and down colors: `vol` bars by
+candle direction (grey when flat), `macd` bars by sign and by whether they are rising, `ao` bars by
+whether they are rising, and `sar` dots by their position against the candle's midpoint. KLineChart
+outlines a rising `macd` or `ao` column; Aeris histograms have no outline style, so those columns are
+filled at a lighter alpha instead. Price templates (`ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`)
+draw over the candles on the main pane, and every other template in a pane of its own below it.
+
+**Lineage, warm-up, and persistence.** Every output's `indicator_info()` has `kind:
+"klinechart_<name>"` (a member of `indicator_kind`), the whole definition in `parameters.klinechart`,
+`period` set to the first period (0 for `avp`, `pvt`, and `sar`), `deviation: null`, and the bound
+`volume_source`. Rows before an output's `warmup_bars` hold no value and are not returned by `data()`;
+`convergence_bars` is `null` for `ema`, `sma`, `macd`, `kdj`, `rsi`, `dmi`, `trix`, `obv`, `pvt`, `avp`,
+and `sar`, whose values depend on the whole loaded history (recursive smoothing, running totals, or a
+path state). Like KLineChart, a binding recomputes from its first row on every data change
+and publishes the changed suffix. V3 chart state stores the definition as `{"kind": "klinechart",
+"indicator": "macd", "short": 12, "long": 26, "signal": 9 }` with the source, volume-source, and
+per-output style references, and restores into a fresh chart like every other study. The formulas are
+translated from KLineChart v10.0.3 and match its output bit for bit (see `docs/Architecture.md` and
+`NOTICE`).
 
 ## Coordinates and panes
 

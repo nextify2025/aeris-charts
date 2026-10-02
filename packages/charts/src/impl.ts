@@ -38,7 +38,7 @@ import type {
   error_bar_row, heatmap_grid_row, range_area_row, temporal_error_columns, temporal_heatmap_columns, temporal_range_columns, temporal_xy_columns,
   ingestion_diagnostics,
   handle_scale_options, handle_scroll_options, indicator_info, indicator_input_source, indicator_kind, indicator_output_style, indicator_schema, kinetic_scroll_options, pivot_kind, vwap_reset,
-  bollinger_parameters, indicator_convention, indicator_seed_parameters, macd_parameters, vwap_parameters,
+  bollinger_parameters, indicator_convention, indicator_seed_parameters, klinechart_indicator, macd_parameters, vwap_parameters,
   last_value_data, localization_options, logical_range,
   mismatch_direction, mouse_event_handler, mouse_event_params, ohlc_columns, ohlc_data, options_change_handler, pane_api, pane_geometry, price_line_api, price_line_options,
   persistence_restore_result, price_range, price_scale_api, price_scale_create_options,
@@ -6085,6 +6085,19 @@ export class chart_impl implements chart_api {
     const schema = JSON.parse(raw) as indicator_schema | null;
     if (schema === null) throw new AerisChartsError("invalid_options", "unknown indicator kind");
     return schema;
+  }
+
+  add_klinechart_indicator(source: series_api, indicator: klinechart_indicator, volume_source?: series_api | null, options?: Partial<series_options>): series_api[] {
+    // The tag is spread last so a stray `kind` field of the definition cannot retarget the study.
+    const ids = this.add_indicator_definition(source, "close", { ...indicator, kind: "klinechart" }, undefined, volume_source);
+    if (ids.length === 0) {
+      const name = String((indicator as { indicator?: unknown } | null | undefined)?.indicator);
+      throw new AerisChartsError(
+        "invalid_options",
+        `invalid KLineChart "${name}" definition: check that the template name is one of the klinechart_indicator names, its parameters, its source series, and whether it needs (or must not have) a volume series`,
+      );
+    }
+    return ids.map((id) => this.indicator_series(id, options));
   }
 
   add_macd(source: series_api, fast: number, slow: number, signal: number, options?: Partial<series_options>, parameters?: macd_parameters): [series_api, series_api, series_api] {

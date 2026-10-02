@@ -1208,7 +1208,80 @@ export interface comparison_legend_entry {
 
 /** Scalar input accepted by a built-in indicator. The source series may itself be an indicator output. */
 export type indicator_input_source = "open" | "high" | "low" | "close" | "hl2" | "hlc3" | "ohlc4" | "hlcc4";
-export type indicator_kind = "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma" | "kdj";
+export type indicator_kind = "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma" | "kdj" | klinechart_indicator_kind;
+/**
+ * One KLineChart indicator template with its parameters, as {@link chart_api.add_klinechart_indicator}
+ * takes it and `indicator_info().parameters.klinechart` reports it. `indicator` names the template and
+ * every other field is that template's `calcParams`, spelled out: nothing is defaulted, so a definition
+ * missing a field is rejected. Periods are whole numbers from 1 to 1,000,000 and the `SMA` weight and
+ * `SAR` factors are positive; the `BOLL` multiplier is not negative. A list of periods holds one to five
+ * entries (`VOL`: one to four), one output line each.
+ *
+ * The doc comment of each template gives KLineChart's default parameters.
+ */
+export type klinechart_indicator =
+  /** Rolling mean of close per period. Default `[5, 10, 30, 60]`. Outputs `ma1`..`ma5`. */
+  | { indicator: "ma"; periods: number[] }
+  /** Exponential moving average of close per period. Default `[6, 12, 20]`. Outputs `ema1`..`ema5`. */
+  | { indicator: "ema"; periods: number[] }
+  /** Weighted `SMA(CLOSE, N, M)` smoothing. Default `period` 12, `weight` 2. Output `sma`. */
+  | { indicator: "sma"; period: number; weight: number }
+  /** Bollinger bands. Default `period` 20, `multiplier` 2. Outputs `up`, `mid`, `dn`. */
+  | { indicator: "boll"; period: number; multiplier: number }
+  /** Parabolic stop-and-reverse, with `start`, `step`, and `max` in percent. Default 2, 2, 20. Output `sar`, drawn as dots. */
+  | { indicator: "sar"; start: number; step: number; max: number }
+  /** Bull and bear index: the average of four moving averages. Default `[3, 6, 12, 24]`. Output `bbi`. */
+  | { indicator: "bbi"; periods: [number, number, number, number] }
+  /** Average traded price, `SUM(TURNOVER) / SUM(VOLUME)`. No parameters. Output `avp`. The source series carries turnover; needs a volume series. */
+  | { indicator: "avp" }
+  /** Volume bars plus a moving average of volume per period. Default `[5, 10, 20]`. Outputs `volume` (bars), `ma1`..`ma4`. Needs a volume series. */
+  | { indicator: "vol"; periods: number[] }
+  /** Moving average convergence divergence. Default `short` 12, `long` 26, `signal` 9. Outputs `dif`, `dea`, `macd` (bars). */
+  | { indicator: "macd"; short: number; long: number; signal: number }
+  /** Stochastic KDJ. Default `period` 9, `k_smoothing` 3, `d_smoothing` 3. Outputs `k`, `d`, `j`. */
+  | { indicator: "kdj"; period: number; k_smoothing: number; d_smoothing: number }
+  /** Relative strength index, one line per period. Default `[6, 12, 24]`. Outputs `rsi1`..`rsi5`. */
+  | { indicator: "rsi"; periods: number[] }
+  /** Bias ratio, one line per period. Default `[6, 12, 24]`. Outputs `bias1`..`bias5`. */
+  | { indicator: "bias"; periods: number[] }
+  /** Buying and selling momentum (BR and AR). Default `period` 26. Outputs `br`, `ar`. */
+  | { indicator: "brar"; period: number }
+  /** Commodity channel index. Default `period` 20. Output `cci`. */
+  | { indicator: "cci"; period: number }
+  /** Directional movement index. Default `period` 14, `adxr_period` 6. Outputs `pdi`, `mdi`, `adx`, `adxr`. */
+  | { indicator: "dmi"; period: number; adxr_period: number }
+  /** Current ratio plus four shifted moving averages of it. Default `period` 26, `ma_periods` `[10, 20, 40, 60]`. Outputs `cr`, `ma1`..`ma4`. */
+  | { indicator: "cr"; period: number; ma_periods: [number, number, number, number] }
+  /** Psychological line. Default `period` 12, `ma_period` 6. Outputs `psy`, `maPsy`. */
+  | { indicator: "psy"; period: number; ma_period: number }
+  /** Different of moving average. Default `short` 10, `long` 50, `signal` 10. Outputs `dma`, `ama`. */
+  | { indicator: "dma"; short: number; long: number; signal: number }
+  /** Triple exponentially smoothed average. Default `period` 12, `ma_period` 9. Outputs `trix`, `maTrix`. */
+  | { indicator: "trix"; period: number; ma_period: number }
+  /** On-balance volume. Default `ma_period` 30. Outputs `obv`, `maObv`. Needs a volume series. */
+  | { indicator: "obv"; ma_period: number }
+  /** Volume ratio. Default `period` 26, `ma_period` 6. Outputs `vr`, `maVr`. Needs a volume series. */
+  | { indicator: "vr"; period: number; ma_period: number }
+  /** Williams %R, one line per period. Default `[6, 10, 14]`. Outputs `wr1`..`wr5`. */
+  | { indicator: "wr"; periods: number[] }
+  /** Momentum. Default `period` 12, `ma_period` 6. Outputs `mtm`, `maMtm`. */
+  | { indicator: "mtm"; period: number; ma_period: number }
+  /** Ease of movement value. Default `period` 14 (KLineChart lists a second parameter, 9, that its formula never reads). Outputs `emv`, `maEmv`. Needs a volume series. */
+  | { indicator: "emv"; period: number }
+  /** Rate of change. Default `period` 12, `ma_period` 6. Outputs `roc`, `maRoc`. */
+  | { indicator: "roc"; period: number; ma_period: number }
+  /** Price and volume trend. No parameters. Output `pvt`. Needs a volume series. */
+  | { indicator: "pvt" }
+  /** Awesome oscillator. Default `short` 5, `long` 34. Output `ao` (bars). */
+  | { indicator: "ao"; short: number; long: number };
+/**
+ * KLineChart's 27 template names, price overlays first: `ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`,
+ * `vol`, `macd`, `kdj`, `rsi`, `bias`, `brar`, `cci`, `dmi`, `cr`, `psy`, `dma`, `trix`, `obv`, `vr`, `wr`,
+ * `mtm`, `emv`, `roc`, `pvt`, `ao`. The discriminant of {@link klinechart_indicator}.
+ */
+export type klinechart_indicator_name = klinechart_indicator["indicator"];
+/** The {@link indicator_kind} of a KLineChart binding (and the `kind` {@link chart_api.indicator_schema} takes): `klinechart_` followed by the template name. */
+export type klinechart_indicator_kind = `klinechart_${klinechart_indicator_name}`;
 export type pivot_kind = "standard" | "fibonacci" | "camarilla" | "woodie" | "demark";
 /** VWAP reset period in exchange trading days: one day, a Monday-start week, or a calendar month. */
 export type vwap_reset = "session" | "weekly" | "monthly";
@@ -1334,15 +1407,20 @@ export interface indicator_info {
     d_smoothing: number | null;
     /** KDJ K/D start (the `seed` of `add_kdj` parameters). */
     kdj_seed: kdj_seed | null;
+    /** The complete KLineChart definition of a `klinechart_*` binding, as passed to
+     *  {@link chart_api.add_klinechart_indicator}. Absent for every other kind. */
+    klinechart?: klinechart_indicator;
   };
+  /** For a KLineChart template, its first period (0 for `avp`, `pvt`, and `sar`, which have none). */
   period: number;
   /** Second parameter when the kind has one: Bollinger deviation, MACD signal period,
-   *  Stochastic %D period; otherwise `null`. */
+   *  Stochastic %D period; otherwise `null`. KLineChart bindings always report `null`. */
   deviation: number | null;
   source: series_api;
   /** Scalar OHLC/aggregate input selected for the binding. */
   source_input: indicator_input_source;
-  /** VWAP's bound volume series, otherwise `null`. */
+  /** The bound volume series (VWAP, the volume studies, and KLineChart's `vol`, `obv`, `pvt`, `emv`,
+   *  `vr`, and `avp`), otherwise `null`. */
   volume_source: series_api | null;
   /** The turnover series of an amount-weighted VWAP, otherwise `null`. */
   amount_source: series_api | null;
@@ -3336,8 +3414,11 @@ export interface chart_state_v3 {
   panes: persisted_pane_v1[];
   drawings: persisted_drawing_v1[];
   indicators: {
-    /** Engine indicator definition: `{ kind: indicator_kind, ...parameters }`. */
-    kind: { kind: indicator_kind } & Record<string, unknown>;
+    /** Engine indicator definition: `{ kind: indicator_kind, ...parameters }`. A KLineChart study stores
+     *  `kind: "klinechart"` beside its {@link klinechart_indicator} fields. */
+    kind:
+      | ({ kind: "klinechart" } & klinechart_indicator)
+      | ({ kind: Exclude<indicator_kind, klinechart_indicator_kind> } & Record<string, unknown>);
     source: persisted_indicator_source_v3;
     source_input: indicator_input_source;
     volume_source?: persisted_indicator_source_v3 | null;
@@ -4372,8 +4453,30 @@ export interface chart_api {
   add_rsi_with_source(source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>, parameters?: indicator_seed_parameters): series_api;
   /** Change an existing indicator binding's scalar input while retaining its output handle. */
   set_indicator_input_source(indicator: series_api, input: indicator_input_source): boolean;
-  /** Return the bounded typed editor schema for a built-in indicator kind. */
+  /** Return the bounded typed editor schema for a built-in indicator kind. A `klinechart_*` kind
+   *  reports the template's KLineChart default parameters (a list of periods as `period_1`, `period_2`, ...)
+   *  and its output names; `period` and `deviation` are ignored for it. */
   indicator_schema(kind: indicator_kind, period?: number, deviation?: number): indicator_schema;
+  /**
+   * Add one of KLineChart's 27 indicator templates, with KLineChart's formulas and presentation, and
+   * return its output series in output order (the keys listed on {@link klinechart_indicator}; one
+   * handle per output, so `ma` returns one per period and `macd` returns `dif`, `dea`, `macd`).
+   * Price templates (`ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`) draw over the candles on the main pane
+   * and every other template in a pane of its own. Lines use KLineChart's line palette; the `vol`, `macd`, and `ao`
+   * bars and the `sar` dots are colored per row by the engine. `options` applies to every output.
+   *
+   * `source` is the OHLC series the formulas read, except for `avp`, whose source is a scalar series
+   * holding the traded value (turnover) per bar. A scalar source series (a line, area, baseline, or histogram)
+   * is accepted for every other template too and is read as open = high = low = close = its value.
+   * `vol`, `obv`, `pvt`, `emv`, `vr`, and `avp` require a scalar `volume_source` distinct from
+   * `source`; every other template must not be given one.
+   *
+   * Throws {@link AerisChartsError} `invalid_options` for an unknown template name (names are case-sensitive)
+   * or any definition the engine rejects (a missing or non-whole period, a period outside 1 to 1,000,000,
+   * too many periods, a `source` series that no longer exists, an OHLC `source` given to `avp`, or a
+   * volume series that is missing, extra, equal to `source`, or not scalar), leaving the chart unchanged.
+   */
+  add_klinechart_indicator(source: series_api, indicator: klinechart_indicator, volume_source?: series_api | null, options?: Partial<series_options>): series_api[];
   /** Add MACD line, signal line, and histogram in their own oscillator pane; the histogram's
    *  per-bar color follows four conventional states (strong/weak × above/below zero). */
   add_macd(source: series_api, fast: number, slow: number, signal: number, options?: Partial<series_options>, parameters?: macd_parameters): [series_api, series_api, series_api];
