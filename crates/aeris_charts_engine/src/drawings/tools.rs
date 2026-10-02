@@ -156,6 +156,9 @@ pub(crate) struct DrawingToolSpec {
     pub(crate) grid_snap: bool,
     /// A coordinate every anchor shares (a horizontal segment's price, a vertical ray's bar).
     pub(crate) anchor_link: DrawingAnchorLink,
+    /// The axis tag (`axis_price_label`) shows the drawing's `text` instead of its price when it
+    /// has any, and the text is not painted on the chart (KLineChart's simple tag).
+    pub(crate) axis_tag_text: bool,
 }
 
 /// A coordinate every anchor of a drawing shares. Placing, dragging, or supplying one anchor moves
@@ -214,6 +217,7 @@ const TREND_LINE: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const HORIZONTAL_LINE: DrawingToolSpec = DrawingToolSpec {
@@ -234,6 +238,7 @@ const HORIZONTAL_LINE: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: true,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const HORIZONTAL_RAY: DrawingToolSpec = DrawingToolSpec {
@@ -254,6 +259,7 @@ const HORIZONTAL_RAY: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: true,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const VERTICAL_LINE: DrawingToolSpec = DrawingToolSpec {
@@ -274,6 +280,7 @@ const VERTICAL_LINE: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const RECTANGLE: DrawingToolSpec = DrawingToolSpec {
@@ -294,6 +301,7 @@ const RECTANGLE: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const TEXT: DrawingToolSpec = DrawingToolSpec {
@@ -314,6 +322,7 @@ const TEXT: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const BRUSH: DrawingToolSpec = DrawingToolSpec {
@@ -334,6 +343,7 @@ const BRUSH: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const PATH: DrawingToolSpec = DrawingToolSpec {
@@ -354,6 +364,7 @@ const PATH: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const LONG_POSITION: DrawingToolSpec = DrawingToolSpec {
@@ -374,6 +385,7 @@ const LONG_POSITION: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: true,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const SHORT_POSITION: DrawingToolSpec = DrawingToolSpec {
@@ -394,6 +406,7 @@ const SHORT_POSITION: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: true,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const FIXED_RANGE_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
@@ -414,6 +427,7 @@ const FIXED_RANGE_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const ANCHORED_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
@@ -434,6 +448,7 @@ const ANCHORED_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
@@ -454,6 +469,7 @@ const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 /// Every built-in tool. B8 families append only inside their own reserved block.
@@ -481,6 +497,7 @@ pub(crate) const DRAWING_TOOL_SPECS: &[DrawingToolSpec] = &[
     super::kinds::lines::HORIZONTAL_SEGMENT,
     super::kinds::lines::VERTICAL_RAY,
     super::kinds::lines::VERTICAL_SEGMENT,
+    super::kinds::lines::PRICE_LINE,
     // B8: lines — end
     // B8: channels — begin
     super::kinds::channels::PARALLEL_CHANNEL,
@@ -532,6 +549,8 @@ pub(crate) const DRAWING_TOOL_SPECS: &[DrawingToolSpec] = &[
     super::kinds::projection_annotations::ARROW_MARK_LEFT,
     super::kinds::projection_annotations::ARROW_MARK_RIGHT,
     super::kinds::projection_annotations::ICON,
+    super::kinds::projection_annotations::SIMPLE_TAG,
+    super::kinds::projection_annotations::SIMPLE_ANNOTATION,
     // B8: projection_annotations — end
     // B8: patterns_elliott_cycles — begin
     super::kinds::patterns_elliott_cycles::XABCD_PATTERN,
@@ -596,6 +615,7 @@ impl DrawingKind {
             Self::HorizontalSegment => &super::kinds::lines::HORIZONTAL_SEGMENT,
             Self::VerticalRay => &super::kinds::lines::VERTICAL_RAY,
             Self::VerticalSegment => &super::kinds::lines::VERTICAL_SEGMENT,
+            Self::PriceLine => &super::kinds::lines::PRICE_LINE,
             // B8: lines — end
             // B8: channels — begin
             Self::ParallelChannel => &super::kinds::channels::PARALLEL_CHANNEL,
@@ -649,6 +669,8 @@ impl DrawingKind {
             Self::ArrowMarkLeft => &super::kinds::projection_annotations::ARROW_MARK_LEFT,
             Self::ArrowMarkRight => &super::kinds::projection_annotations::ARROW_MARK_RIGHT,
             Self::Icon => &super::kinds::projection_annotations::ICON,
+            Self::SimpleTag => &super::kinds::projection_annotations::SIMPLE_TAG,
+            Self::SimpleAnnotation => &super::kinds::projection_annotations::SIMPLE_ANNOTATION,
             // B8: projection_annotations — end
             // B8: patterns_elliott_cycles — begin
             Self::XabcdPattern => &super::kinds::patterns_elliott_cycles::XABCD_PATTERN,

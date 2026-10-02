@@ -1170,9 +1170,10 @@ A drawing's own text is edited in place in the chart's inline editor, for every 
 it: the text tool, a trend line's label, the text of every line, channel, Fibonacci, pitchfork,
 pattern, and shape tool (one line, rotated along the stroke when the label follows a segment), and
 the text boxes of the Projection & Annotations tools listed below (several lines). Level, point,
-and wave labels, ratios, and stats are engine-formatted text and stay options-only. Eight tools
-accept `text` but never paint or edit it: `forecast`, `bars_pattern`, `price_range`, `date_range`,
-`date_and_price_range`, `projection`, `flag_mark`, and `icon`. A double-click on a selected
+and wave labels, ratios, and stats are engine-formatted text and stay options-only. Nine tools
+accept `text` but never paint or edit it on the chart: `forecast`, `bars_pattern`, `price_range`,
+`date_range`, `date_and_price_range`, `projection`, `flag_mark`, `icon`, and `simple_tag` (whose
+`text` is its price-axis tag). A double-click on a selected
 drawing, or on the text of an unselected one (its first click selects it), or Enter or F2 while
 the chart has focus and the drawing is selected (F2 on its accessibility drawing target, where
 Enter keeps geometry editing), opens the editor; locked, hidden, and interval-hidden drawings do
@@ -1190,8 +1191,8 @@ the rest of the patch, and typing stops at the bound); the text tool, trend labe
 other run label stay on one line (line breaks become one space), while family text boxes take
 several lines (Shift+Enter adds one, paste inserts plain text). The editor is a labeled text box
 that announces opening and closing through the accessibility live region and returns focus to
-where it was opened from. Placing the text tool, `anchored_text`, `note`, `callout`, `comment`, or
-`signpost` opens the editor at once with the caret after the default text; committing or Escape
+where it was opened from. Placing the text tool, `anchored_text`, `note`, `callout`, `comment`,
+`signpost`, or `simple_annotation` opens the editor at once with the caret after the default text; committing or Escape
 keeps the drawing, even emptied (only the text tool removes itself when left empty). Placing a
 `price_note`, `price_label`, or arrow mark, which start with no text of their own, opens nothing.
 
@@ -1281,6 +1282,10 @@ descriptors name those options with dotted paths such as `tool_options.line.stat
   other, taken from the anchor placed or dragged last, so a supplied or imported pair that
   disagrees is repaired the same way. The vertical ray defaults to `extend_right`, which runs it
   from the first anchor through the second to the pane edge on the second anchor's side.
+- `price_line` places one anchor and paints a crisp line from it to the right pane edge, with the
+  anchor's price printed above the line's start and tagged on the price axis (KLineChart's price
+  line). Its body is the ray. A `text` of its own is the generic line label, placed like a
+  horizontal ray's, and does not replace the price.
 - `drawing_kind_options()` returns `{ kind: "line", stats_position }` for every Lines tool.
 <!-- B8: lines — end -->
 <!-- B8: channels — begin -->
@@ -1517,6 +1522,13 @@ the tools paint no text: their `text` is accepted and kept, never shown or edite
 - `arrow_mark_up`, `arrow_mark_down`, `arrow_mark_left`, `arrow_mark_right` (one anchor): a block
   arrow whose tip is the anchor, with any text past its tail in `text_color` or the arrow color.
   Up defaults to the market-up color and down to the market-down color.
+- `simple_tag` (one anchor): KLineChart's simple tag: a dashed line across the whole pane at the
+  anchor's price, tagged on the price axis. The tag shows the drawing's `text` when it has any
+  and the price otherwise; the text is not painted on the chart, so it has no inline editor (set
+  it through `text` in the options).
+- `simple_annotation` (one anchor): KLineChart's simple annotation: a dashed stem rising from the
+  anchor to a small head, with the `text` in a box above the head (it starts empty). Placing it
+  opens the editor.
 - `icon` (one anchor): `tool_options.projection_annotation.icon` — `"star"` (default), `"heart"`,
   `"check"`, `"cross"`, `"circle"`, `"square"`, `"diamond"`, `"triangle_up"`, or
   `"triangle_down"` — centered on the anchor, `icon_size` CSS px across (8..128, default 24), in
@@ -1524,10 +1536,11 @@ the tools paint no text: their `text` is accepted and kept, never shown or edite
 - Kind defaults (fills, arrows, stats, default texts, arrow colors) are schema defaults and are
   omitted from persistence; a cleared default text persists as `""`.
 - The text of `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
-  `signpost`, and the arrow marks edits in place (see inline text editing above); the price note
-  and price label keep their price line above it. An emptied box keeps one caret line while it is
-  edited. Placing `anchored_text`, `note`, `callout`, `comment`, or `signpost` opens the editor on
-  the default text; placing `price_note`, `price_label`, or an arrow mark does not.
+  `signpost`, `simple_annotation`, and the arrow marks edits in place (see inline text editing
+  above); the price note and price label keep their price line above it. An emptied box keeps one
+  caret line while it is edited. Placing `anchored_text`, `note`, `callout`, `comment`, `signpost`,
+  or `simple_annotation` opens the editor (on the default text, where the tool has one); placing
+  `price_note`, `price_label`, or an arrow mark does not.
 - `drawing_kind_options()` returns `{ kind: "projection_annotation", bars_mode, mirrored, flipped,
   pattern_bars, icon, icon_size, always_show_text }` for every tool of the family.
 <!-- B8: projection_annotations — end -->
@@ -1623,9 +1636,9 @@ overrides their contrasting default); they are body targets.
 
 ### Equivalents of KLineChart's overlays
 
-A host moving from KLineChart finds each of its drawing overlays here. Four are tools of their own
-(wire ids 38..=40 and 52); the others are an existing tool with options, and the table says where
-the look differs.
+A host moving from KLineChart finds each of its drawing overlays here. Seven are tools of their own
+(wire ids 38..=41, 52, 147, and 148); the others are an existing tool with options, and the table
+says how.
 
 | KLineChart overlay | Aeris tool |
 |---|---|
@@ -1637,9 +1650,9 @@ the look differs.
 | `parallelStraightLine` | `parallel_channel` with `extend_left` and `extend_right`, `fill_enabled: false`, and `tool_options.channel.middle_line: false` |
 | `priceChannelLine` | `price_channel` |
 | `fibonacciLine` | `fib_retracement` with `extend_left` and `extend_right` (levels span the pane) |
-| `priceLine` | `horizontal_ray`: the price is a tag on the price axis, not text on the line |
-| `simpleTag` | `horizontal_line`: the axis tag shows the price, never custom text |
-| `simpleAnnotation` | `signpost`: the nearest tool, a label joined to its anchor by a post, drawn in Aeris's style |
+| `priceLine` | `price_line` |
+| `simpleTag` | `simple_tag` |
+| `simpleAnnotation` | `simple_annotation` |
 
 ## Persistence V1
 
@@ -1719,9 +1732,10 @@ browser package is the only published artifact. Hosts such as Aeris Terminal con
 `aeris_charts_*` crates through pinned Git revisions or local paths. The Rust API is below 1.0 and
 may change in any revision, so a host reviews the notes below when it moves its pin.
 
-`aeris_charts_render_gpui` is experimental because it tracks a reviewed Zed Git revision whose API
-differs from the crates.io `gpui` release. Exact Git revisions are required for that backend;
-floating Git dependencies are unsupported.
+`aeris_charts_render_gpui` is experimental. It pins `gpui-pre` 0.3.6, the GPUI snapshot gpui-kit
+0.6.6 depends on, with an exact version requirement, so a host that draws the chart must use that
+same `gpui` (a host on another GPUI build, such as a Zed Git revision, holds two incompatible copies
+of its types). GPUI upgrades are explicit manifest and lockfile changes.
 
 ### Moving the pinned revision
 

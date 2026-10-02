@@ -90,6 +90,7 @@ const SHAPE_TOOL: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 // The rotated rectangle, circle, and arc derive their extent from screen-space perpendiculars

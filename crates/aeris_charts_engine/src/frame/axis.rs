@@ -2132,9 +2132,14 @@ impl ChartEngine {
                     continue;
                 }
                 let logical = scale.price_to_logical_value(point.price, base);
-                let text = match series {
-                    Some(s) => self.format_series_value(s, scale, logical),
-                    None => self.format_scale_value(scale, logical),
+                // A tag whose tool carries text (KLineChart's simple tag) shows that text.
+                let text = if drawing.kind.spec().axis_tag_text && !drawing.text.is_empty() {
+                    drawing.text.clone()
+                } else {
+                    match series {
+                        Some(s) => self.format_series_value(s, scale, logical),
+                        None => self.format_scale_value(scale, logical),
+                    }
                 };
                 // The label IS the line: background in the drawing's color (parsed per frame,
                 // so option changes track), with an explicit text override when configured.

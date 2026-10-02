@@ -2506,6 +2506,8 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * `horizontal_segment` keeps both anchors on one price, and `vertical_ray` and `vertical_segment`
  * keep both on one bar (the shared coordinate follows the anchor placed or dragged last); the
  * vertical ray defaults to `extend_right`, which runs it through its second anchor to the pane edge.
+ * `price_line` places one anchor: a line from it to the right pane edge with its price printed on
+ * the line and on the price axis.
  *
  * Channels family (B8): `price_channel` places three anchors: the base line through the first two,
  * its parallel through the third, and the base line mirrored on the other side. It defaults to
@@ -2532,6 +2534,7 @@ export type drawing_kind =
   | "horizontal_segment"
   | "vertical_ray"
   | "vertical_segment"
+  | "price_line"
   // B8: lines — end
   // B8: channels — begin
   | "parallel_channel"
@@ -2569,6 +2572,8 @@ export type drawing_kind =
   // B8: projection_annotations — begin
   // Projection & Annotations: `projection` places three anchors; `forecast`, `bars_pattern`,
   // the three ranges, `price_note`, and `callout` two; the other annotations one.
+  // `simple_tag` is a dashed line across the pane whose price-axis tag shows the drawing's `text`
+  // (the price when it has none); `simple_annotation` is a dashed stem with a head under boxed text.
   // `anchored_text` anchors are pane fractions (`logical` = x / pane width, `price` = y / pane
   // height) and carry no `time`.
   | "forecast"
@@ -2590,6 +2595,8 @@ export type drawing_kind =
   | "arrow_mark_left"
   | "arrow_mark_right"
   | "icon"
+  | "simple_tag"
+  | "simple_annotation"
   // B8: projection_annotations — end
   // B8: patterns_elliott_cycles — begin
   // Patterns (boxed point labels; XABCD, cypher, ABCD, and three drives add ratio connectors),
@@ -2647,6 +2654,7 @@ export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   horizontal_segment: 38,
   vertical_ray: 39,
   vertical_segment: 40,
+  price_line: 41,
   // B8: lines — end
   // B8: channels — begin (wire ids 48..=63)
   parallel_channel: 48,
@@ -2698,6 +2706,8 @@ export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   arrow_mark_left: 144,
   arrow_mark_right: 145,
   icon: 146,
+  simple_tag: 147,
+  simple_annotation: 148,
   // B8: projection_annotations — end
   // B8: patterns_elliott_cycles — begin (wire ids 160..=191)
   xabcd_pattern: 160,
@@ -3070,9 +3080,10 @@ export interface drawing_tool_options {
 
 /**
  * A drawing's options (engine `Drawing`). Every tool can carry a text label placed by the
- * 3×3 `text_h_align`/`text_v_align` against the tool's geometry, except the eight tools that
- * paint no text (`forecast`, `bars_pattern`, `price_range`, `date_range`, `date_and_price_range`,
- * `projection`, `flag_mark`, `icon`), which keep `text` without showing it. A painted label is
+ * 3×3 `text_h_align`/`text_v_align` against the tool's geometry, except the nine tools that
+ * paint no text on the chart (`forecast`, `bars_pattern`, `price_range`, `date_range`,
+ * `date_and_price_range`, `projection`, `flag_mark`, `icon`, `simple_tag`), which keep `text`
+ * without showing it (the simple tag shows it as its price-axis tag). A painted label is
  * edited in place: double-click it (or select the drawing and press Enter or F2), and tools that
  * start from a default text open the editor when placed. Colors parse per the engine's
  * CSS rules; `""` for optional colors means "follow the default" (the border color at

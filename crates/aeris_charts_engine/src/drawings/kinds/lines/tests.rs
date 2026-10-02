@@ -1404,3 +1404,103 @@ fn axis_locked_segments_round_trip_and_documents_repair_unlocked_anchors() {
         }
     }
 }
+
+/// Texts of the price-axis tags (labels with a background) in the axis frame.
+fn axis_tags(chart: &mut ChartEngine) -> Vec<String> {
+    chart.axis_w = 80.0;
+    chart.build_frame();
+    chart
+        .build_axis_frame(
+            80.0,
+            |text, _bold| text.len() as f64 * 7.0,
+            |text, _bold| text.len() as f64 * 6.0,
+        )
+        .labels
+        .into_iter()
+        .filter(|label| label.background.is_some())
+        .map(|label| label.text)
+        .collect()
+}
+
+#[test]
+fn price_lines_run_right_from_one_anchor_with_their_price_on_the_line_and_the_axis() {
+    let kind = DrawingKind::PriceLine;
+    let spec = kind.spec();
+    assert_eq!((spec.wire_id, spec.name), (41, "price_line"));
+    assert_eq!(DrawingKind::from_u8(41), Some(kind));
+    assert_eq!(DrawingKind::from_name("price_line"), Some(kind));
+    assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 1 });
+    assert!(spec.axis_price_label && !spec.axis_tag_text);
+    assert!(spec.family.is_some(), "a lines-family tool");
+
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        kind,
+        vec![p(10.0, 102.5)],
+        r##"{"color":"#123456"}"##,
+    );
+    let a = anchor(&chart, id, 0);
+    let pane_right = chart.pane_w;
+    // The line is a crisp horizontal from the anchor to the pane's right edge, level with it.
+    let frame = chart.build_frame();
+    let hlines = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::HLine {
+                y, x0, x1, color, ..
+            } if *color == ink() => Some((*y, *x0, *x1)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hlines.len(), 1, "{hlines:?}");
+    let (y, x0, x1) = hlines[0];
+    assert!(
+        (f64::from(y) - a.1).abs() <= 1.0,
+        "level with the anchor: {hlines:?}"
+    );
+    assert!(
+        (f64::from(x0) - a.0).abs() <= 1.0 && x1 == pane_right.round() as i32,
+        "{hlines:?}"
+    );
+    // The price is printed above the line, starting at the anchor.
+    let runs = texts(&mut chart);
+    let (_, x, y) = runs
+        .iter()
+        .find(|(text, ..)| text == "102.50")
+        .unwrap_or_else(|| panic!("the price on the line: {runs:?}"));
+    assert!(
+        f64::from(*x) >= a.0 - 0.5 && f64::from(*x) < a.0 + 8.0,
+        "starts at the anchor"
+    );
+    assert!(f64::from(*y) < a.1, "above the line");
+    // It is also tagged on the price axis.
+    assert!(axis_tags(&mut chart).contains(&"102.50".to_string()));
+    // The body is the ray: hit to the right of the anchor, not to its left.
+    assert_eq!(chart.drawing_at(a.0 + 150.0, a.1), Some(id));
+    assert_eq!(chart.drawing_at(a.0 - 60.0, a.1), None);
+}
+
+#[test]
+fn a_price_lines_own_text_does_not_cover_its_price() {
+    let mut chart = chart();
+    add(
+        &mut chart,
+        DrawingKind::PriceLine,
+        vec![p(10.0, 102.5)],
+        r##"{"color":"#123456","text":"entry"}"##,
+    );
+    let runs = texts(&mut chart);
+    let at = |wanted: &str| {
+        runs.iter()
+            .find(|(text, ..)| text == wanted)
+            .unwrap_or_else(|| panic!("{wanted} in {runs:?}"))
+    };
+    let (_, price_x, price_y) = at("102.50");
+    let (_, text_x, text_y) = at("entry");
+    assert!(
+        (price_x - text_x).abs() > 4.0 || (price_y - text_y).abs() > 4.0,
+        "the two runs sit apart: price ({price_x}, {price_y}), text ({text_x}, {text_y})"
+    );
+}

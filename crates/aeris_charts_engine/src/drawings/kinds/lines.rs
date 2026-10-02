@@ -88,6 +88,7 @@ const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 // A ray's and an extended line's reach comes from their `extend_left`/`extend_right` defaults:
@@ -170,6 +171,20 @@ pub(crate) const VERTICAL_SEGMENT: DrawingToolSpec = DrawingToolSpec {
     ..SEGMENT_TOOL
 };
 
+// KLineChart's price line: a ray to the right from one anchor, its price printed above the line
+// and tagged on the price axis.
+pub(crate) const PRICE_LINE: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::PriceLine,
+    wire_id: 41,
+    name: "price_line",
+    placement: DrawingPlacement::ClickAnchors { count: 1 },
+    straighten: DrawingStraightenMode::None,
+    logical_extent: DrawingLogicalExtent::FromFirst,
+    text_layout: DrawingTextLayout::Box,
+    axis_price_label: true,
+    ..SEGMENT_TOOL
+};
+
 pub(crate) static FAMILY: DrawingFamily = {
     let mut family = DrawingFamily::new(build_parts, kind_options);
     family.apply_defaults = apply_defaults;
@@ -223,6 +238,8 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     if drawing.kind == DrawingKind::CrossLine {
         parts.hline(a.1, ctx.pane.left, ctx.pane.right, PartStroke::default());
         parts.vline(a.0, ctx.pane.top, ctx.pane.bottom, PartStroke::default());
+    } else if drawing.kind == DrawingKind::PriceLine {
+        price_line(ctx, a, parts);
     } else {
         let Some(&b) = ctx.px.get(1) else {
             return;
@@ -235,6 +252,32 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         }
     }
     stats_box(ctx, parts);
+}
+
+/// Gap between a price line and the price printed above its start (CSS px).
+const PRICE_LINE_GAP: f64 = 2.0;
+
+/// The line from the anchor to the pane's right edge, with the anchor's price above its start.
+fn price_line(ctx: &PartContext<'_>, a: Point, parts: &mut DrawingParts) {
+    let drawing = ctx.drawing;
+    parts.hline(a.1, a.0, ctx.pane.right, PartStroke::default());
+    let Some(point) = drawing.points.first() else {
+        return;
+    };
+    parts.label(PartLabel {
+        anchor: (a.0, a.1 - PRICE_LINE_GAP * ctx.scale),
+        h_align: DrawingTextHAlign::Left,
+        v_align: DrawingTextVAlign::Bottom,
+        lines: vec![ctx.engine.drawing_price_text(drawing, point.price)],
+        size: ctx.engine.drawing_text_size(drawing) * ctx.scale,
+        weight: drawing.text_weight.unwrap_or(400),
+        italic: drawing.text_italic,
+        color: None,
+        background: None,
+        border: None,
+        padding: (0.0, 0.0),
+        hit: false,
+    });
 }
 
 /// The dashed horizontal reference toward the second anchor's side, the arc from it to the

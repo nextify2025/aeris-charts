@@ -430,6 +430,9 @@ pub enum DrawingKind {
     VerticalRay,
     /// Two-anchor vertical segment; both anchors share one bar (KLineChart `verticalSegment`).
     VerticalSegment,
+    /// One-anchor line from the anchor to the pane's right edge with its price printed on the
+    /// line and tagged on the price axis (KLineChart `priceLine`).
+    PriceLine,
     // B8: lines — end
     // B8: channels — begin
     /// Three-anchor channel: the first two anchors define the base line and the parallel line
@@ -540,6 +543,12 @@ pub enum DrawingKind {
     ArrowMarkRight,
     /// One-anchor icon from the bounded built-in icon set.
     Icon,
+    /// One-anchor dashed line across the pane tagged on the price axis with the drawing's text,
+    /// or its price when it has none (KLineChart `simpleTag`).
+    SimpleTag,
+    /// One-anchor annotation: a dashed stem above the anchor ending in a downward head under a
+    /// boxed text (KLineChart `simpleAnnotation`).
+    SimpleAnnotation,
     // B8: projection_annotations — end
     // B8: patterns_elliott_cycles — begin
     /// Five-anchor harmonic XABCD pattern with ratio connectors and shaded triangles.
@@ -862,7 +871,7 @@ pub struct Drawing {
     /// `MouseEventParams.time` placement instead of retaining a fractional x coordinate.
     pub snap_time_to_data: bool,
     /// The tool's text label (`""` = none), at most `MAX_DRAWING_TEXT_BYTES` bytes. Every tool that
-    /// paints text edits it in place (the eight tools that paint none keep it unpainted). An empty
+    /// paints text edits it in place (the nine tools that paint none keep it unpainted). An empty
     /// label paints nothing and keeps its drawing, except for the text tool, whose empty state is
     /// the host typing-mode editor: leaving that editor without typed text removes the drawing.
     pub text: String,

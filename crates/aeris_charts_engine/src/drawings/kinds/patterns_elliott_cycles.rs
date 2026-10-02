@@ -232,6 +232,7 @@ const PATTERN_TOOL: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 pub(crate) const XABCD_PATTERN: DrawingToolSpec = PATTERN_TOOL;
