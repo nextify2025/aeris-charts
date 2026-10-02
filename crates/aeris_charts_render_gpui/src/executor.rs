@@ -18,7 +18,7 @@ use aeris_charts_render::draw_list::{LineStyle, Prim};
 use crate::geometry::{
     area_fill_mesh, band_fill_mesh, dash_spans, dashed_polyline_meshes, disc_mesh, fill_polygon,
     irect, line_span_start, polyline_mesh, rect_frame_edges, ring_mesh, round_rect_polygon,
-    Scratch,
+    segments_mesh, Scratch,
 };
 use crate::metrics::GpuiFrameMetrics;
 use crate::scene::{DeviceRect, Paint, SceneOp, ScenePlan, TextRun};
@@ -38,7 +38,7 @@ pub struct ExecutorOptions {
 
 /// Lower one layer of prims into `plan`, appending to whatever is already there.
 ///
-/// `points` is the layer's shared point pool (indexed by `Polyline`/`AreaFill`/`BandFill`).
+/// `points` is the layer's shared point pool (indexed by `Polyline`/`Segments`/`AreaFill`/`BandFill`).
 /// `metrics` accumulates across every call in a frame.
 pub fn execute_layer(
     prims: &[Prim],
@@ -141,9 +141,11 @@ fn lower_prim(
             color,
         } => {
             // A solid style tessellates the whole run; a dashed one is split into solid runs
-            // first, exactly as `aeris_charts_engine::frame::series_geometry::push_line_stroke` does for
-            // the series it owns. Doing it here too means a dashed `Polyline` arriving from a host
-            // plugin still dashes (the wgpu tri executor silently ignores `style`).
+            // first, exactly as `aeris_charts_render::line::push_line_stroke` does for the strokes
+            // the engine and the browser decoder produce. Doing it here too means a dashed
+            // `Polyline` arriving from a host plugin (Terminal-side GPUI plugins) still dashes.
+            // The wgpu tri executor still ignores `style`, which is why every producer feeding it
+            // must pre-lower dashes and this path stays only for GPUI-native hosts.
             let pattern = style.dash_pattern(*width);
             if pattern.is_empty() {
                 let range = polyline_mesh(
@@ -173,6 +175,24 @@ fn lower_prim(
                     push_mesh(plan, metrics, range, Paint::Solid(*color));
                 }
             }
+        }
+
+        Prim::Segments {
+            first_point,
+            segment_count,
+            width,
+            color,
+        } => {
+            // One contiguous mesh for the batch: `push_mesh` chunks it at the path-buffer bound, and
+            // an out-of-pool range yields an empty mesh that `execute_layer` counts as dropped.
+            let range = segments_mesh(
+                &mut plan.vertices,
+                points,
+                *first_point,
+                *segment_count,
+                *width,
+            );
+            push_mesh(plan, metrics, range, Paint::Solid(*color));
         }
 
         Prim::AreaFill {
@@ -683,6 +703,68 @@ mod tests {
             ),
             "every chunk fits one bounded GPUI path upload"
         );
+    }
+
+    #[test]
+    fn segments_lower_to_bounded_meshes() {
+        // 3,000 touching one-bar pairs, far past one path upload: the single batch must chunk.
+        const PAIRS: u32 = 3_000;
+        let points: Vec<[f32; 2]> = (0..PAIRS)
+            .flat_map(|pair| {
+                let x = pair as f32 * 4.0;
+                [[x, 5.0], [x + 4.0, 5.0]]
+            })
+            .collect();
+        let (plan, metrics) = run(
+            &[Prim::Segments {
+                first_point: 0,
+                segment_count: PAIRS,
+                width: 2.0,
+                color: C,
+            }],
+            &points,
+        );
+        let separate: Vec<Prim> = (0..PAIRS)
+            .map(|pair| Prim::Polyline {
+                first_point: 2 * pair,
+                point_count: 2,
+                width: 2.0,
+                style: LineStyle::Solid,
+                line_type: LineType::Simple,
+                color: C,
+            })
+            .collect();
+        let (_, reference) = run(&separate, &points);
+        assert_eq!(reference.paths, PAIRS, "separate strokes are a path each");
+        assert_eq!(metrics.dropped_prims, 0);
+        assert_eq!(
+            metrics.triangles, reference.triangles,
+            "the batch tessellates exactly the separate strokes' triangles"
+        );
+        assert_eq!(
+            metrics.paths,
+            (metrics.triangles * 3).div_ceil(12_288),
+            "one mesh, chunked at the bounded path size"
+        );
+        assert!(
+            plan.ops.iter().all(
+                |op| matches!(op, SceneOp::Mesh { vertex_count, .. } if *vertex_count <= 12_288)
+            ),
+            "every chunk fits one bounded GPUI path upload"
+        );
+
+        // A window that leaves the pool lowers to nothing and counts as dropped.
+        let (plan, metrics) = run(
+            &[Prim::Segments {
+                first_point: 2 * PAIRS - 2,
+                segment_count: 2,
+                width: 2.0,
+                color: C,
+            }],
+            &points,
+        );
+        assert!(plan.ops.is_empty());
+        assert_eq!(metrics.dropped_prims, 1);
     }
 
     #[test]

@@ -652,8 +652,8 @@ impl ChartEngine {
         self.time_scale.zoom(x, scale);
     }
 
-    /// Explicit Aeris focused-area zoom: keep the logical point under `x` fixed even when normal
-    /// wheel zoom is configured to keep the right-most bar pinned.
+    /// Focused zoom: keep the logical point under `x` fixed even when ordinary wheel zoom keeps the
+    /// right-most bar pinned. Ctrl/Cmd wheel zoom and pinch (see `wheel_zoom_time_scale`) use it.
     pub fn time_scale_zoom_focused(&mut self, x: f64, scale: f64) {
         self.time_scale.zoom_focused(x, scale);
     }
@@ -913,6 +913,52 @@ impl ChartEngine {
         Some(target)
     }
 
+    /// Enable or disable the temporary modifier-driven OHLC magnet.
+    pub fn set_crosshair_ohlc_magnet(&mut self, enabled: bool) -> bool {
+        if self.crosshair_ohlc_magnet == enabled {
+            return false;
+        }
+        self.crosshair_ohlc_magnet = enabled;
+        self.invalidate_frame_overlay();
+        true
+    }
+
+    /// Current pane-separator hover target.
+    #[must_use]
+    pub const fn separator_hover(&self) -> Option<usize> {
+        self.separator_hover
+    }
+
+    /// Configured crosshair mode in the public wire representation.
+    #[must_use]
+    pub fn configured_crosshair_mode(&self) -> u8 {
+        self.options.get().crosshair.mode
+    }
+
+    /// Set the configured crosshair mode from its stable public wire value.
+    pub fn set_configured_crosshair_mode(&mut self, mode: u8) -> bool {
+        if mode > 3 || self.configured_crosshair_mode() == mode {
+            return false;
+        }
+        self.options
+            .apply(&serde_json::json!({"crosshair": {"mode": mode}}));
+        self.crosshair_mode = crosshair_mode_from_u8(mode);
+        self.invalidate_frame_overlay();
+        true
+    }
+
+    /// Resolve a pane separator using a host-selected interaction halo.
+    #[must_use]
+    pub fn pane_separator_at(&self, y: f64, hit_radius: f64) -> Option<usize> {
+        if !y.is_finite() || !hit_radius.is_finite() || hit_radius < 0.0 {
+            return None;
+        }
+        self.panes
+            .iter()
+            .skip(1)
+            .position(|pane| (y - pane.top).abs() <= hit_radius)
+    }
+
     // --- animated scroll-to-position ---
 
     /// Start an eased scroll to `target_position` (logical bars from the right edge), replacing
@@ -955,18 +1001,15 @@ impl ChartEngine {
 
     // --- pane hit-testing ---
 
-    /// Index of the stacked pane containing content-y `y` (panes own their bounds; separators
-    /// between them count as the pane above). Clamped to the last pane so coordinates below the
-    /// content area still resolve.
+    /// Index of the stacked pane containing content-y `y`. A pane owns everything above the next
+    /// pane's top, so a separator between panes belongs to the pane above; a `y` above the content
+    /// resolves to the first pane and one below it to the last, so coordinates outside the stack
+    /// still resolve.
     pub fn pane_index_at_y(&self, y: f64) -> usize {
-        let mut index = 0;
-        for (i, pane) in self.panes.iter().enumerate() {
-            if y >= pane.top && (y < pane.top + pane.height || i + 1 == self.panes.len()) {
-                return i;
-            }
-            index = i;
-        }
-        index
+        self.panes
+            .windows(2)
+            .position(|pair| y < pair[1].top)
+            .unwrap_or(self.panes.len().saturating_sub(1))
     }
 
     /// Resolve a secondary-click payload without mutating hover, selection, drawing, or trading
@@ -1017,6 +1060,17 @@ mod tests {
             tilt_x: 0.0,
             tilt_y: 0.0,
         }
+    }
+
+    #[test]
+    fn crosshair_modes_and_magnet_are_engine_owned() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        assert!(chart.set_crosshair_ohlc_magnet(true));
+        assert!(!chart.set_crosshair_ohlc_magnet(true));
+        assert!(chart.crosshair_ohlc_magnet);
+        assert!(chart.set_configured_crosshair_mode(2));
+        assert_eq!(chart.configured_crosshair_mode(), 2);
+        assert!(!chart.set_configured_crosshair_mode(4));
     }
 
     #[test]
@@ -1676,5 +1730,25 @@ mod tests {
         assert_eq!(chart.pane_index_at_y(first_h - 1.0), 0);
         assert_eq!(chart.pane_index_at_y(first_h + 10.0), 1);
         assert_eq!(chart.pane_index_at_y(299.0), 1);
+    }
+
+    #[test]
+    fn pane_index_at_y_resolves_separators_to_the_pane_above() {
+        let mut chart = chart_with_data(400.0, 300.0);
+        chart.add_pane(true);
+        chart.add_pane(true);
+        chart.layout_panes(300.0);
+        assert_eq!(chart.panes.len(), 3);
+        for index in 0..2 {
+            let pane = &chart.panes[index];
+            let separator = pane.top + pane.height + PANE_SEPARATOR / 2.0;
+            assert_eq!(
+                chart.pane_index_at_y(separator),
+                index,
+                "a separator below pane {index} belongs to that pane, not the last one"
+            );
+        }
+        assert_eq!(chart.pane_index_at_y(-10.0), 0);
+        assert_eq!(chart.pane_index_at_y(10_000.0), 2);
     }
 }

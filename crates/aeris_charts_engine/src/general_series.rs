@@ -587,6 +587,23 @@ struct ScatterGeometryContext {
     plot_bottom: f64,
 }
 
+/// Memoized O(rows) contribution of one series to one automatic numeric axis domain. It is valid
+/// while the series keeps the same dataset generation, kind, and stacking; hit tests and frame
+/// construction resolve auto domains repeatedly, so rescanning every row per call is not bounded.
+#[derive(Clone, Copy)]
+struct AxisScanEntry {
+    dimension: AxisDimension,
+    scale: GeneralScaleType,
+    dataset: GeneralDatasetId,
+    generation: u64,
+    kind: GeneralSeriesKind,
+    stacked: bool,
+    value: (Option<(f64, f64)>, bool),
+}
+
+/// A series binds one X and one Y axis; a small bound still covers scale-type changes.
+const MAX_AXIS_SCANS_PER_SERIES: usize = 4;
+
 struct ScatterSpatialIndex {
     key: ScatterGeometryKey,
     origin_y: f64,
@@ -1138,6 +1155,7 @@ pub(crate) struct GeneralSeriesRegistry {
     references: Vec<GeneralReference>,
     next_reference_id: u32,
     scatter_spatial: RefCell<HashMap<GeneralSeriesId, ScatterSpatialIndex>>,
+    axis_scans: RefCell<HashMap<GeneralSeriesId, Vec<AxisScanEntry>>>,
     hovered: Option<GeneralInteractionTarget>,
     selected: Option<GeneralInteractionTarget>,
     accessibility_focused: Option<GeneralInteractionTarget>,
@@ -1152,6 +1170,7 @@ impl GeneralSeriesRegistry {
             references: Vec::new(),
             next_reference_id: 1,
             scatter_spatial: RefCell::new(HashMap::new()),
+            axis_scans: RefCell::new(HashMap::new()),
             hovered: None,
             selected: None,
             accessibility_focused: None,
@@ -1322,6 +1341,7 @@ impl GeneralSeriesRegistry {
         };
         self.series.remove(index);
         self.scatter_spatial.get_mut().remove(&id);
+        self.axis_scans.get_mut().remove(&id);
         if self
             .hovered
             .as_ref()
@@ -1395,6 +1415,13 @@ impl GeneralSeriesRegistry {
                     .map(ScatterSpatialIndex::estimated_bytes)
                     .sum::<usize>()
         });
+        let axis_scan_bytes = self.axis_scans.try_borrow().map_or(0, |cache| {
+            cache.capacity() * std::mem::size_of::<(GeneralSeriesId, Vec<AxisScanEntry>)>()
+                + cache
+                    .values()
+                    .map(|entries| entries.capacity() * std::mem::size_of::<AxisScanEntry>())
+                    .sum::<usize>()
+        });
         let brush_bytes = self.brush.as_ref().map_or(0, |brush| {
             brush.axis_id.capacity()
                 + match &brush.range {
@@ -1411,6 +1438,7 @@ impl GeneralSeriesRegistry {
                 .map(GeneralSeries::estimated_bytes)
                 .sum::<usize>()
             + scatter_bytes
+            + axis_scan_bytes
             + self.references.capacity() * std::mem::size_of::<GeneralReference>()
             + self
                 .references
@@ -4215,6 +4243,57 @@ impl ChartEngine {
         Some(use_index(index))
     }
 
+    /// Resolve one series' auto-domain contribution for an axis, rescanning its rows only when
+    /// the dataset generation or the series binding that shapes the scan changed.
+    pub(crate) fn cached_general_series_axis_scan<F>(
+        &self,
+        series: &GeneralSeries,
+        dataset: &crate::general_data::GeneralDataset,
+        dimension: AxisDimension,
+        scale: GeneralScaleType,
+        scan: F,
+    ) -> (Option<(f64, f64)>, bool)
+    where
+        F: FnOnce() -> (Option<(f64, f64)>, bool),
+    {
+        let Some(registry) = self.general_series.as_ref() else {
+            return scan();
+        };
+        let matches = |entry: &AxisScanEntry| {
+            entry.dimension == dimension
+                && entry.scale == scale
+                && entry.dataset == series.dataset
+                && entry.generation == dataset.generation()
+                && entry.kind == series.kind
+                && entry.stacked == series.stack_id.is_some()
+        };
+        if let Some(entry) = registry
+            .axis_scans
+            .borrow()
+            .get(&series.id)
+            .and_then(|entries| entries.iter().find(|entry| matches(entry)))
+        {
+            return entry.value;
+        }
+        let value = scan();
+        let mut cache = registry.axis_scans.borrow_mut();
+        let entries = cache.entry(series.id).or_default();
+        entries.retain(|entry| !(entry.dimension == dimension && entry.scale == scale));
+        if entries.len() >= MAX_AXIS_SCANS_PER_SERIES {
+            entries.remove(0);
+        }
+        entries.push(AxisScanEntry {
+            dimension,
+            scale,
+            dataset: series.dataset,
+            generation: dataset.generation(),
+            kind: series.kind,
+            stacked: series.stack_id.is_some(),
+            value,
+        });
+        value
+    }
+
     pub(crate) fn visit_general_scatter_points<F>(&self, series: &GeneralSeries, mut visit: F)
     where
         F: FnMut(GeneralScatterGeometry),
@@ -4619,7 +4698,32 @@ impl ChartEngine {
                     });
                 }
                 GeneralSeriesKind::ErrorBar => {
+                    // Every error-bar segment lies inside the bar's bounding box, so a pointer
+                    // farther than the hit reach from that box can skip the segment distances.
+                    let reach = max_distance + 3.0;
                     self.visit_general_error_bars(series, |geometry| {
+                        let cap = geometry.cap_half_size;
+                        let [left, right] = error_bar_extent(
+                            geometry.x,
+                            geometry.x_low,
+                            geometry.x_high,
+                            geometry.y_low.is_some() || geometry.y_high.is_some(),
+                            cap,
+                        );
+                        let [top, bottom] = error_bar_extent(
+                            geometry.y,
+                            geometry.y_low,
+                            geometry.y_high,
+                            geometry.x_low.is_some() || geometry.x_high.is_some(),
+                            cap,
+                        );
+                        if x_css < left - reach
+                            || x_css > right + reach
+                            || y_css < top - reach
+                            || y_css > bottom + reach
+                        {
+                            return;
+                        }
                         consider(
                             geometry.row,
                             (distance_to_error_bar(x_css, y_css, geometry) - 3.0).max(0.0),
@@ -5653,6 +5757,28 @@ fn distance_to_point_symbol(
                 .fold(f64::INFINITY, f64::min)
         }
     }
+}
+
+/// The span of an error bar along one axis: the center, its own error bounds, and the caps drawn
+/// across it by the other axis's error bounds.
+fn error_bar_extent(
+    center: f64,
+    low: Option<f64>,
+    high: Option<f64>,
+    crossed_by_caps: bool,
+    cap_half_size: f64,
+) -> [f64; 2] {
+    let mut from = center;
+    let mut to = center;
+    for bound in [low, high].into_iter().flatten() {
+        from = from.min(bound);
+        to = to.max(bound);
+    }
+    if crossed_by_caps {
+        from = from.min(center - cap_half_size);
+        to = to.max(center + cap_half_size);
+    }
+    [from, to]
 }
 
 fn distance_to_error_bar(x: f64, y: f64, geometry: GeneralErrorBarGeometry) -> f64 {

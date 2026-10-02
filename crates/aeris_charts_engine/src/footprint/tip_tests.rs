@@ -688,6 +688,171 @@ fn retained_live_tip_work_is_bounded_including_retention_trims() {
     }
 }
 
+/// One retention is one data-layer transaction: every presentation of the stream (footprint,
+/// bound candles, five studies) leaves the shared time axis in a single union rebuild plus a single
+/// reindex, not one pair per presentation. The tips that are not trims never rebuild at all.
+#[test]
+fn retention_trim_runs_one_union_rebuild_for_every_presentation() {
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut live = Harness::new(aggregation, Some(96));
+        live.load(tape(0..1_500));
+        let mut trims = 0;
+        for index in 1_500..2_700 {
+            let before = live.first_bar_open();
+            let work = tip_work(&mut live, vec![tape_trade(index)]);
+            if live.first_bar_open() != before {
+                trims += 1;
+                assert_eq!(
+                    work.index_rebuilds, 2,
+                    "{aggregation:?} trim tip {index}: one union rebuild and one reindex"
+                );
+            }
+        }
+        assert!(trims >= 3, "the scenario crosses the ceiling: {trims}");
+        assert_same(
+            &live.snapshot(),
+            &live.clean_rebuild_in_place(),
+            "after retained tips",
+        );
+    }
+}
+
+/// A non-time retention trim evicts bubbles in place, without refolding the retained tape. Eviction
+/// addresses the bubbles against the first retained row key, so it must run after the data layer
+/// has trimmed every presentation: before it, the key base still names an evicted row, the fold
+/// refuses the in-place path and every trim tip rescans the whole retained tape.
+#[test]
+fn retention_trim_evicts_bubbles_in_place_on_the_trimmed_row_keys() {
+    let mut live = Harness::new(trade_bars(), Some(96));
+    live.load(tape(0..1_500));
+    let mut trims = 0;
+    for index in 1_500..2_700 {
+        let before = live.first_bar_open();
+        let work = tip_work(&mut live, vec![tape_trade(index)]);
+        if live.first_bar_open() != before {
+            trims += 1;
+            assert_eq!(
+                work.bubble_trades, 1,
+                "trim tip {index}: bubbles refolded the retained tape"
+            );
+        }
+    }
+    assert!(trims >= 3, "the scenario crosses the ceiling: {trims}");
+    let retained = live.snapshot();
+    assert!(
+        !retained.markers.is_empty(),
+        "the tape leaves retained bubbles"
+    );
+    assert_same(
+        &retained,
+        &live.clean_rebuild_in_place(),
+        "after retained tips",
+    );
+}
+
+/// Every point's `(index, weight)` of the marks a clean rebuild gives the chart's current axis.
+fn clean_tick_marks(
+    chart: &ChartEngine,
+) -> Vec<aeris_charts_core::scale::time_tick_marks::TickMark> {
+    clean_tick_marks_shifted(chart, chart.tick_label_shift())
+}
+
+/// [`clean_tick_marks`] for time labels printed `label_shift` seconds after each bar's open.
+fn clean_tick_marks_shifted(
+    chart: &ChartEngine,
+    label_shift: i64,
+) -> Vec<aeris_charts_core::scale::time_tick_marks::TickMark> {
+    use aeris_charts_core::scale::time_tick_marks::{
+        fill_weights_for_points_shifted_in, TimeTickMarks,
+    };
+    let times = chart.sequence_points().map_or_else(
+        || chart.data_layer().merged_times().to_vec(),
+        |points| {
+            points
+                .iter()
+                .map(|point| point.open_timestamp_micros.div_euclid(1_000_000))
+                .collect()
+        },
+    );
+    let mut weights = vec![0u8; times.len()];
+    fill_weights_for_points_shifted_in(&times, &mut weights, 0, label_shift, &chart.exchange_time);
+    let mut marks = TimeTickMarks::new();
+    marks.set_weights(&weights);
+    // A spacing wider than the label keeps every point, so the marks carry every weight.
+    marks.build(1_000.0, 10.0).to_vec()
+}
+
+/// A retention trim re-weighs the axis: the marks after a trimming tip, on a time axis by dropping
+/// the evicted points and re-weighing only the first, equal a clean rebuild of the retained axis.
+#[test]
+fn retention_trims_leave_the_axis_weights_of_a_clean_rebuild() {
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut live = Harness::new(aggregation, Some(96));
+        live.load(tape(0..1_500));
+        let mut trims = 0;
+        for index in 1_500..2_700 {
+            let before = live.first_bar_open();
+            live.tip(vec![tape_trade(index)]);
+            if live.first_bar_open() == before {
+                continue;
+            }
+            trims += 1;
+            let marks = live.chart.tick_marks.build(1_000.0, 10.0).to_vec();
+            assert_eq!(
+                marks,
+                clean_tick_marks(&live.chart),
+                "{aggregation:?} trim tip {index}"
+            );
+        }
+        assert!(trims >= 3, "the scenario crosses the ceiling: {trims}");
+    }
+}
+
+/// A close-time label prints each time bar an interval after its open, and the hour and minute
+/// marks follow the printed time. A retention trim re-weighs the first point and the appended tail
+/// incrementally, so they must carry the same shift as a clean rebuild; a trade-count axis prints
+/// its own open times and stays unshifted.
+#[test]
+fn retention_trims_keep_the_close_label_shift_in_the_axis_weights() {
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut live = Harness::new(aggregation, Some(96));
+        live.chart
+            .set_bar_time_label(crate::BarTimeLabel::Close {
+                interval_seconds: 60,
+                windows: Vec::new(),
+            })
+            .unwrap();
+        live.load(tape(0..1_500));
+        let mut trims = 0;
+        let mut shift_shows = 0;
+        for index in 1_500..2_700 {
+            let before = live.first_bar_open();
+            live.tip(vec![tape_trade(index)]);
+            if live.first_bar_open() == before {
+                continue;
+            }
+            trims += 1;
+            let marks = live.chart.tick_marks.build(1_000.0, 10.0).to_vec();
+            assert_eq!(
+                marks,
+                clean_tick_marks(&live.chart),
+                "{aggregation:?} trim tip {index}"
+            );
+            if marks != clean_tick_marks_shifted(&live.chart, 0) {
+                shift_shows += 1;
+            }
+        }
+        assert!(trims >= 3, "the scenario crosses the ceiling: {trims}");
+        // On a time axis the shift moves the hour marks, so the comparison above is not vacuous;
+        // a sequence axis ignores the label and the two rebuilds agree.
+        assert_eq!(
+            shift_shows > 0,
+            live.chart.sequence_points().is_none(),
+            "{aggregation:?}: the close label shifts the weights only on a time axis"
+        );
+    }
+}
+
 /// A refold over a long tape materializes only the retained markers, so the series never holds
 /// capacity for every qualifying print it folded past.
 #[test]
@@ -1094,6 +1259,179 @@ fn replay_seeks_and_tips_under_retention_match_a_clean_rebuild() {
     }
 }
 
+/// A retention trim counts the rows a series exposes up to the data layer's replay cutoff, yet drops
+/// the same leading bars from every presentation and keeps the rows past the cutoff in all of
+/// them, in one data-layer transaction: what remains is the tail of the unretained chart.
+#[test]
+fn retention_trim_keeps_the_rows_past_the_cutoff_in_every_presentation() {
+    const KEEP: usize = 30;
+    const HIDDEN: usize = 10;
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut live = Harness::new(aggregation, None);
+        let mut unretained = Harness::new(aggregation, None);
+        live.load(tape(0..1_200));
+        unretained.load(tape(0..1_200));
+        let reference = unretained.snapshot();
+        let bars = reference.bars.len();
+        assert!(bars > KEEP + HIDDEN);
+        // Hide the newest rows of every presentation, as a replay clock behind the last bars does.
+        let cutoff = reference.footprint.times[bars - HIDDEN - 1];
+        live.chart.data.set_time_cutoff(Some(cutoff));
+        let rebuilds = live.chart.data_layer().index_rebuilds();
+        assert!(live.chart.set_series_max_points(live.footprint, Some(KEEP)));
+        assert_eq!(
+            live.chart.data_layer().index_rebuilds() - rebuilds,
+            2,
+            "{aggregation:?}: one union rebuild and one reindex"
+        );
+        let presentations = [live.footprint, live.candles]
+            .into_iter()
+            .chain(live.studies);
+        for id in presentations {
+            let data = live.chart.data_layer();
+            assert_eq!(data.series_rows(id), Some(KEEP), "{aggregation:?} {id}");
+            let exposed = data.series_data(id).unwrap().0.len();
+            assert_eq!(
+                exposed,
+                KEEP - HIDDEN,
+                "{aggregation:?} {id}: rows past the cutoff"
+            );
+        }
+        live.chart.data.set_time_cutoff(None);
+        let retained = live.snapshot();
+        let tail = |rows: &Rows| Rows {
+            times: rows.times[bars - KEEP..].to_vec(),
+            values: rows.values[bars - KEEP..].to_vec(),
+            colors: rows.colors[bars - KEEP..].to_vec(),
+        };
+        assert_eq!(
+            retained.footprint,
+            tail(&reference.footprint),
+            "{aggregation:?}"
+        );
+        assert_eq!(
+            retained.candles,
+            tail(&reference.candles),
+            "{aggregation:?}"
+        );
+        for (study, (retained, reference)) in
+            retained.studies.iter().zip(&reference.studies).enumerate()
+        {
+            assert_eq!(*retained, tail(reference), "{aggregation:?} study {study}");
+        }
+    }
+}
+
+/// The data-layer trims a retention ran before its presentations were batched, as the reference a
+/// batched trim must equal: the footprint down to `keep` rows on its own, then every other
+/// presentation of the stream by the first key the footprint then exposes (all its exposed rows
+/// when it exposes none), one `trim_front` and so one union rebuild and reindex per series.
+fn sequential_retention_reference(harness: &mut Harness, keep: usize) {
+    let chart = &mut harness.chart;
+    chart.data.trim_front(harness.footprint, keep);
+    let first_key = chart
+        .data
+        .series_data(harness.footprint)
+        .and_then(|(times, _)| times.first().copied());
+    let presentations = chart
+        .stream_presentations(harness.stream)
+        .filter(|&id| id != harness.footprint)
+        .collect::<Vec<_>>();
+    for id in presentations {
+        let (times, _) = chart.data.series_data(id).unwrap();
+        let evicted =
+            first_key.map_or(times.len(), |key| times.partition_point(|&time| time < key));
+        if evicted > 0 {
+            let rows = chart.data.series_rows(id).unwrap();
+            chart.data.trim_front(id, rows - evicted);
+        }
+    }
+}
+
+/// Every canonical row of every presentation (rows past the cutoff included) plus the shared axis.
+fn canonical_rows(harness: &mut Harness) -> (Vec<Rows>, Vec<i64>) {
+    harness.chart.data.set_time_cutoff(None);
+    let ids = [harness.footprint, harness.candles]
+        .into_iter()
+        .chain(harness.studies);
+    let presentations = ids.map(|id| rows(&harness.chart, id)).collect();
+    (
+        presentations,
+        harness.chart.data_layer().merged_times().to_vec(),
+    )
+}
+
+/// The retention trim of a stream whose presentations hold rows past the replay cutoff equals the
+/// sequence of per-presentation trims it replaced, in every presentation's rows and in the shared
+/// axis, while running one union rebuild and one reindex instead of one pair per presentation. The
+/// cutoff is set on the data layer itself: a seek projects only the revealed bars into a stream's
+/// presentations (the replay tests above cover those), so this is how rows past the clock reach
+/// the trim. The first case leaves the footprint rows it exposes, the second none of them: its
+/// `keep` retained rows are all past the cutoff, so every other presentation drops every row it
+/// exposes and keeps the rows past the cutoff.
+#[test]
+fn retention_trim_under_a_cutoff_equals_the_sequential_trims() {
+    const KEEP: usize = 30;
+    for aggregation in [time_bars(), trade_bars()] {
+        let mut probe = Harness::new(aggregation, None);
+        probe.load(tape(0..1_200));
+        let reference = probe.snapshot();
+        let bars = reference.bars.len();
+        for (exposed, exposed_after) in [(bars - 10, KEEP - 10), (KEEP + 5, 0)] {
+            assert!(
+                exposed > KEEP && exposed < bars,
+                "{aggregation:?}: {bars} bars"
+            );
+            let cutoff = reference.footprint.times[exposed - 1];
+            let context = format!("{aggregation:?} exposing {exposed} of {bars} bars");
+            let mut batched = Harness::new(aggregation, None);
+            let mut sequential = Harness::new(aggregation, None);
+            for harness in [&mut batched, &mut sequential] {
+                harness.load(tape(0..1_200));
+                harness.chart.data.set_time_cutoff(Some(cutoff));
+            }
+            let rebuilds = |harness: &Harness| harness.chart.data_layer().index_rebuilds();
+            let (before_batched, before_sequential) = (rebuilds(&batched), rebuilds(&sequential));
+            assert!(batched
+                .chart
+                .set_series_max_points(batched.footprint, Some(KEEP)));
+            sequential_retention_reference(&mut sequential, KEEP);
+            assert_eq!(
+                rebuilds(&batched) - before_batched,
+                2,
+                "{context}: one union rebuild and one reindex"
+            );
+            assert_eq!(
+                rebuilds(&sequential) - before_sequential,
+                2 * (2 + STUDIES) as u64,
+                "{context}: the reference trims each presentation on its own"
+            );
+            let footprint_exposed = |harness: &Harness| {
+                harness
+                    .chart
+                    .data_layer()
+                    .series_data(harness.footprint)
+                    .unwrap()
+                    .0
+                    .len()
+            };
+            assert_eq!(footprint_exposed(&batched), exposed_after, "{context}");
+            assert_eq!(footprint_exposed(&sequential), exposed_after, "{context}");
+            let (batched_rows, batched_axis) = canonical_rows(&mut batched);
+            let (sequential_rows, sequential_axis) = canonical_rows(&mut sequential);
+            let lengths =
+                |rows: &[Rows]| rows.iter().map(|rows| rows.times.len()).collect::<Vec<_>>();
+            assert_eq!(
+                lengths(&batched_rows),
+                lengths(&sequential_rows),
+                "{context}: rows per presentation"
+            );
+            assert!(batched_rows == sequential_rows, "{context}: row contents");
+            assert!(batched_axis == sequential_axis, "{context}: shared axis");
+        }
+    }
+}
+
 /// A host retention cap on a delta histogram keeps the sign palette of every retained row, on the
 /// full install and across live tips, and tips still equal a clean rebuild.
 #[test]
@@ -1112,6 +1450,169 @@ fn capped_delta_histogram_keeps_its_sign_palette() {
     }
     let tipped = live.snapshot();
     assert_same(&tipped, &live.clean_rebuild_in_place(), "capped delta");
+}
+
+/// Trade-bound candles and the CVD, delta, and volume studies belong to their stream: every host
+/// write path is refused with its documented refusal value, and nothing they hold, nor the
+/// sequence keys every other presentation continues from, moves. A live tip afterwards still
+/// equals a clean rebuild.
+#[test]
+fn trade_derived_series_reject_every_host_write() {
+    use crate::{SeriesBarPatch, SeriesUpdateOutcome, SeriesUpdateRejection};
+    use aeris_charts_core::model::data_validation::ValidationError;
+
+    let unsupported = SeriesUpdateOutcome::Rejected(SeriesUpdateRejection::UnsupportedSeries);
+    for aggregation in [time_bars(), trade_bars()] {
+        let context = format!("{aggregation:?}");
+        let mut live = Harness::new(aggregation, None);
+        live.load(tape(0..120));
+        let ordinary = live.chart.add_series(SeriesKind::Candlestick);
+        assert!(!live.chart.series_is_source_owned(ordinary), "{context}");
+        assert!(
+            live.chart.series_is_source_owned(live.footprint),
+            "{context}"
+        );
+        let before = live.snapshot();
+        let key_base = live.chart.sequence_key_base(live.stream);
+        let stream_bars = live.bar_opens();
+        assert_eq!(key_base.is_some(), aggregation != time_bars(), "{context}");
+        let time = 1_800_000_000.0;
+        let seconds = 1_800_000_000;
+        let ohlc = [1.0, 2.0, 0.5, 1.5];
+        let patch = SeriesBarPatch {
+            open: None,
+            high: Some(1_000.0),
+            low: None,
+            close: Some(999.0),
+            colors: [None; 3],
+        };
+        let mut owned = vec![live.candles];
+        owned.extend(live.studies);
+        for id in owned {
+            let context = format!("{context} series {id}");
+            assert!(live.chart.series_is_source_owned(id), "{context}");
+            let held = rows(&live.chart, id).times.len();
+            let chart = &mut live.chart;
+            assert_eq!(
+                chart.set_series_data(id, &[time], &[1.0], &[2.0], &[0.5], &[1.5]),
+                Err(ValidationError::UnsupportedSeriesData(id)),
+                "{context}"
+            );
+            assert_eq!(
+                chart.set_series_data_styled(
+                    id,
+                    &[time],
+                    &[1.0],
+                    &[2.0],
+                    &[0.5],
+                    &[1.5],
+                    [Some(vec![1]), None, None]
+                ),
+                Err(ValidationError::UnsupportedSeriesData(id)),
+                "{context}"
+            );
+            assert!(
+                !chart.install_series_data(
+                    id,
+                    vec![seconds],
+                    vec![1.0],
+                    vec![2.0],
+                    vec![0.5],
+                    vec![1.5]
+                ),
+                "{context}"
+            );
+            assert!(!chart.update_series_bar(id, time, ohlc), "{context}");
+            assert!(
+                !chart.update_series_bar_styled(id, time, ohlc, [Some(1), None, None]),
+                "{context}"
+            );
+            assert_eq!(chart.update_series_bars(id, [(time, ohlc)]), 0, "{context}");
+            assert_eq!(
+                chart.update_series_bars_sanitized(
+                    id,
+                    vec![seconds],
+                    vec![1.0],
+                    vec![2.0],
+                    vec![0.5],
+                    vec![1.5]
+                ),
+                0,
+                "{context}"
+            );
+            assert!(
+                !chart.set_series_point_colors(id, Some(vec![7; held]), None, None),
+                "{context}"
+            );
+            assert_eq!(chart.series_pop(id, 1), None, "{context}");
+            assert_eq!(
+                chart.merge_series_bar(id, time, patch, None),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(
+                chart.merge_series_bars(id, &[(time, patch)], Some(7)),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(
+                chart.update_series_bar_sequenced(id, time, ohlc, [None; 3], Some(7)),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(
+                chart.update_series_bars_sanitized_sequenced(
+                    id,
+                    vec![seconds],
+                    vec![1.0],
+                    vec![2.0],
+                    vec![0.5],
+                    vec![1.5],
+                    Some(7)
+                ),
+                unsupported,
+                "{context}"
+            );
+            assert_eq!(chart.series_update_sequence(id), None, "{context}");
+        }
+        assert!(
+            !live.chart.apply_momentum_histogram_colors(live.studies[3]),
+            "{context}"
+        );
+        assert_same(&live.snapshot(), &before, &context);
+        assert_eq!(live.chart.sequence_key_base(live.stream), key_base);
+        assert_eq!(live.bar_opens(), stream_bars, "{context}");
+
+        // The stream still feeds every presentation after the refused writes.
+        live.tip(tape(120..140));
+        let tipped = live.snapshot();
+        assert_same(&tipped, &live.clean_rebuild_in_place(), &context);
+        let mut fresh = Harness::new(aggregation, None);
+        fresh.load(tape(0..140));
+        assert_same(&tipped, &fresh.snapshot(), &context);
+    }
+}
+
+/// A trade-bound candle converted to another chart type stays fed by its stream on both axes: the
+/// tip still equals a clean rebuild and no sequence-axis writer assumes it is still a candle.
+#[test]
+fn converted_trade_bound_candles_keep_following_their_stream() {
+    for aggregation in [time_bars(), trade_bars()] {
+        for kind in [SeriesKind::Line, SeriesKind::Area, SeriesKind::Histogram] {
+            let context = format!("{aggregation:?} {kind:?}");
+            let mut live = Harness::new(aggregation, None);
+            live.load(tape(0..60));
+            live.chart.convert_series_kind(live.candles, kind);
+            assert_eq!(live.chart.series_kind(live.candles), Some(kind));
+            assert!(live.chart.series_is_source_owned(live.candles), "{context}");
+            for index in 60..100 {
+                live.tip(vec![tape_trade(index)]);
+            }
+            live.tip(tape(100..140));
+            let tipped = live.snapshot();
+            assert_same(&tipped, &live.clean_rebuild_in_place(), &context);
+        }
+    }
 }
 
 /// Tips into an empty stream, and retention ceilings of one bar (every new bar evicts one) and zero
@@ -1227,7 +1728,7 @@ fn session_bars() -> FootprintAggregationOptions {
 
 fn session_harness(outside: OutOfSessionPolicy, max_points: Option<usize>) -> Harness {
     let mut harness = Harness::with_bubbles(session_bars(), max_points, bubble_options());
-    harness.chart.set_time_zone(shanghai());
+    harness.chart.set_exchange_offsets(shanghai());
     harness
         .chart
         .set_trade_stream_sessions(harness.stream, Some(a_share_sessions(outside)))
@@ -1870,8 +2371,9 @@ impl ScenarioChart {
                 Ok(None)
             }
             ScenarioOp::Zone(hours) => {
-                chart
-                    .set_time_zone(crate::UtcOffsetSchedule::fixed((*hours * 3_600) as _).unwrap());
+                chart.set_exchange_offsets(
+                    crate::UtcOffsetSchedule::fixed((*hours * 3_600) as _).unwrap(),
+                );
                 self.zone_hours = *hours;
                 Ok(None)
             }

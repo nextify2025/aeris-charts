@@ -12,3 +12,19 @@
 # well past that, and the Canvas2D fallback target set is too.
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "target-feature=+simd128"]
+
+# Time-zone tables compiled into the engine artifact.
+#
+# `aeris_charts_core` resolves the TradingView parity zone list (`TRADINGVIEW_TIME_ZONES`, 98 ids) through
+# `chrono-tz`. Its `filter-by-regex` feature generates the tz tables at build time and keeps only the zones
+# this expression matches (the parity ids plus `Asia/Almaty`, whose rules `Asia/Astana` uses). That cuts the
+# wasm module by about 540 KB raw / 35 KB brotli against the complete database (isolated wasm32 build; see
+# docs/Architecture.md). Like the simd flag above it lives here so local builds, `wasm-pack` and CI agree.
+# Consumers that depend on the repository by Git do not read this file and compile the complete database,
+# which costs nothing but native binary size. An unset or empty value means "no filtering"; an invalid
+# regex fails the build. `time_zone::tests::every_tradingview_zone_parses` fails if a zone of
+# `TRADINGVIEW_TIME_ZONES` is missing from this list (extra ids are harmless). A consumer that sets
+# `CHRONO_TZ_TIMEZONE_FILTER` itself must keep it a superset of that list, or `set_time_zone` returns an
+# error for the missing zones at runtime.
+[env]
+CHRONO_TZ_TIMEZONE_FILTER = "^(Africa/Cairo|Africa/Casablanca|Africa/Johannesburg|Africa/Lagos|Africa/Nairobi|Africa/Tunis|America/Anchorage|America/Argentina/Buenos_Aires|America/Bogota|America/Caracas|America/Chicago|America/El_Salvador|America/Halifax|America/Juneau|America/Lima|America/Los_Angeles|America/Mexico_City|America/New_York|America/Phoenix|America/Santiago|America/Sao_Paulo|America/Toronto|America/Vancouver|Asia/Almaty|Asia/Ashkhabad|Asia/Astana|Asia/Bahrain|Asia/Bangkok|Asia/Chongqing|Asia/Colombo|Asia/Dhaka|Asia/Dubai|Asia/Ho_Chi_Minh|Asia/Hong_Kong|Asia/Jakarta|Asia/Jerusalem|Asia/Kabul|Asia/Karachi|Asia/Kathmandu|Asia/Kolkata|Asia/Kuala_Lumpur|Asia/Kuwait|Asia/Manila|Asia/Muscat|Asia/Nicosia|Asia/Qatar|Asia/Riyadh|Asia/Seoul|Asia/Shanghai|Asia/Singapore|Asia/Taipei|Asia/Tehran|Asia/Tokyo|Asia/Yangon|Atlantic/Azores|Atlantic/Reykjavik|Australia/Adelaide|Australia/Brisbane|Australia/Perth|Australia/Sydney|Etc/UTC|Europe/Amsterdam|Europe/Athens|Europe/Belgrade|Europe/Berlin|Europe/Bratislava|Europe/Brussels|Europe/Bucharest|Europe/Budapest|Europe/Copenhagen|Europe/Dublin|Europe/Helsinki|Europe/Istanbul|Europe/Lisbon|Europe/Ljubljana|Europe/London|Europe/Luxembourg|Europe/Madrid|Europe/Malta|Europe/Moscow|Europe/Oslo|Europe/Paris|Europe/Prague|Europe/Riga|Europe/Rome|Europe/Sofia|Europe/Stockholm|Europe/Tallinn|Europe/Vienna|Europe/Vilnius|Europe/Warsaw|Europe/Zagreb|Europe/Zurich|Pacific/Auckland|Pacific/Chatham|Pacific/Fakaofo|Pacific/Honolulu|Pacific/Norfolk|US/Mountain)$"

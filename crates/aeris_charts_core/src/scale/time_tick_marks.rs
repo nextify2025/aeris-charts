@@ -101,6 +101,20 @@ pub fn weight_by_time(current_ts: i64, prev_ts: i64) -> TickMarkWeight {
 /// (local date shifted by the session start); intraday boundaries compare local wall-clock time,
 /// so hour and minute marks stay on exchange hours across DST and non-hour offsets.
 pub fn weight_by_time_in(current_ts: i64, prev_ts: i64, time: &ExchangeTime) -> TickMarkWeight {
+    weight_by_time_shifted(current_ts, prev_ts, 0, time)
+}
+
+/// [`weight_by_time_in`] for bars whose time labels print `label_shift` seconds after the bar's
+/// identity time (a close-time label is the open plus the interval). Year/Month/Day boundaries
+/// still compare the trading days of the identity times, so a bar keeps its trading day whatever
+/// it prints; the intraday boundaries compare the wall-clock of the printed instants, so the
+/// hour mark lands on the bar that prints the hour. A shift of zero is [`weight_by_time_in`].
+pub fn weight_by_time_shifted(
+    current_ts: i64,
+    prev_ts: i64,
+    label_shift: i64,
+    time: &ExchangeTime,
+) -> TickMarkWeight {
     let current_day = time.trading_day(current_ts);
     let prev_day = time.trading_day(prev_ts);
     if current_day != prev_day {
@@ -115,8 +129,8 @@ pub fn weight_by_time_in(current_ts: i64, prev_ts: i64, time: &ExchangeTime) -> 
         };
     }
 
-    let current = time.local_seconds(current_ts);
-    let prev = time.local_seconds(prev_ts);
+    let current = time.local_seconds(current_ts.saturating_add(label_shift));
+    let prev = time.local_seconds(prev_ts.saturating_add(label_shift));
     for &(divisor, weight) in INTRADAY_DIVISORS.iter().rev() {
         if prev.div_euclid(divisor) != current.div_euclid(divisor) {
             return weight;
@@ -140,6 +154,18 @@ pub fn fill_weights_for_points_in(
     start_index: usize,
     time: &ExchangeTime,
 ) {
+    fill_weights_for_points_shifted_in(times, weights, start_index, 0, time);
+}
+
+/// [`fill_weights_for_points_in`] for time labels printed `label_shift` seconds after each
+/// point's identity time (see [`weight_by_time_shifted`]).
+pub fn fill_weights_for_points_shifted_in(
+    times: &[i64],
+    weights: &mut [u8],
+    start_index: usize,
+    label_shift: i64,
+    time: &ExchangeTime,
+) {
     debug_assert_eq!(times.len(), weights.len());
     if times.is_empty() {
         return;
@@ -155,20 +181,51 @@ pub fn fill_weights_for_points_in(
     for index in start_index..times.len() {
         let current = times[index];
         if let Some(prev) = prev_time {
-            weights[index] = weight_by_time_in(current, prev, time) as u8;
+            weights[index] = weight_by_time_shifted(current, prev, label_shift, time) as u8;
         }
         total_time_diff += current - prev_time.unwrap_or(current);
         prev_time = Some(current);
     }
 
     if start_index == 0 && times.len() > 1 {
-        // guess a weight for the first point: pretend the previous point was the average
-        // time diff back in history
-        let average_time_diff =
-            ((total_time_diff as f64) / (times.len() as f64 - 1.0)).ceil() as i64;
-        let approx_prev = times[0] - average_time_diff;
-        weights[0] = weight_by_time_in(times[0], approx_prev, time) as u8;
+        weights[0] = first_point_weight_shifted_in(
+            times[0],
+            total_time_diff,
+            times.len(),
+            label_shift,
+            time,
+        );
     }
+}
+
+/// The guessed weight of the first of `len > 1` points spanning `span` seconds: pretend the
+/// previous point was the average time diff back in history.
+pub fn first_point_weight_in(first: i64, span: i64, len: usize, time: &ExchangeTime) -> u8 {
+    first_point_weight_shifted_in(first, span, len, 0, time)
+}
+
+/// [`first_point_weight_in`] for time labels printed `label_shift` seconds after each point's
+/// identity time (see [`weight_by_time_shifted`]).
+pub fn first_point_weight_shifted_in(
+    first: i64,
+    span: i64,
+    len: usize,
+    label_shift: i64,
+    time: &ExchangeTime,
+) -> u8 {
+    let average_time_diff = ((span as f64) / (len as f64 - 1.0)).ceil() as i64;
+    weight_by_time_shifted(first, first - average_time_diff, label_shift, time) as u8
+}
+
+/// `Some(k)` when `new` is `old` without its first `k >= 1` points, followed by any later points:
+/// every surviving point keeps its timestamp, and with it the weight it was given against its
+/// predecessor. Both sequences are ascending.
+pub fn front_trim(old: &[i64], new: &[i64]) -> Option<usize> {
+    let first = *new.first()?;
+    let dropped = old.partition_point(|&time| time < first);
+    let survivors = old.get(dropped..)?;
+    (dropped > 0 && survivors.first() == Some(&first) && new.starts_with(survivors))
+        .then_some(dropped)
 }
 
 /// A selectable tick mark: time-point index + weight.
@@ -219,14 +276,40 @@ impl TimeTickMarks {
     /// Full rebuild from per-point weights (incremental `firstChangedPointIndex` variant
     /// comes with the data layer).
     pub fn set_weights(&mut self, weights: &[u8]) {
+        self.set_weights_from(0, weights);
+    }
+
+    /// Full rebuild from per-point weights whose first logical index may be negative.
+    pub fn set_weights_from(&mut self, start_index: TimePointIndex, weights: &[u8]) {
         self.marks_by_weight.clear();
         self.cache = None;
         for (index, &weight) in weights.iter().enumerate() {
-            self.marks_by_weight
-                .entry(weight)
-                .or_default()
-                .push(index as TimePointIndex);
+            let Ok(index) = TimePointIndex::try_from(index) else {
+                break;
+            };
+            let Some(index) = start_index.checked_add(index) else {
+                break;
+            };
+            self.marks_by_weight.entry(weight).or_default().push(index);
         }
+    }
+
+    /// Drop the first `dropped` points: every other point keeps its weight at an index lowered by
+    /// `dropped`, and the point that becomes the first takes `first_weight` (it has no
+    /// predecessor, so it is guessed). Equals [`Self::set_weights`] over the surviving weights
+    /// without re-weighing any point.
+    pub fn drop_front(&mut self, dropped: usize, first_weight: u8) {
+        self.cache = None;
+        let first = dropped as TimePointIndex;
+        self.marks_by_weight.retain(|_, indices| {
+            indices.drain(..indices.partition_point(|&index| index <= first));
+            indices.iter_mut().for_each(|index| *index -= first);
+            !indices.is_empty()
+        });
+        self.marks_by_weight
+            .entry(first_weight)
+            .or_default()
+            .insert(0, 0);
     }
 
     /// Append weights for newly-added points without rebuilding prior weight buckets.
@@ -343,6 +426,28 @@ mod tests {
     }
 
     #[test]
+    fn selected_time_zone_controls_calendar_tick_boundaries() {
+        use crate::time_zone::ChartTimeZone;
+        let new_york = ExchangeTime::new(
+            ChartTimeZone::parse("America/New_York")
+                .unwrap()
+                .offset_schedule()
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        // 2026-01-02 04:59 -> 05:00 UTC is 2026-01-01 23:59 -> 2026-01-02 00:00 in New York.
+        assert_eq!(
+            weight_by_time_in(1_767_330_000, 1_767_329_940, &new_york),
+            TickMarkWeight::Day
+        );
+        assert_eq!(
+            weight_by_time(1_767_330_000, 1_767_329_940),
+            TickMarkWeight::Hour1
+        );
+    }
+
+    #[test]
     fn weights_by_boundary() {
         let day = 86_400;
         // year boundary: 2019-12-31 -> 2020-01-01
@@ -387,6 +492,90 @@ mod tests {
         // other intraday points are hour-weighted
         assert_eq!(weights[1], TickMarkWeight::Hour1 as u8);
         assert_eq!(weights[12], TickMarkWeight::Hour12 as u8);
+    }
+
+    /// Ascending times whose gaps reach every weight: seconds, minutes, hours, days, months.
+    fn spread_times(rng: &mut u64, len: usize) -> Vec<i64> {
+        let mut next = move || {
+            *rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *rng >> 33
+        };
+        let mut time = 1_579_046_400 + (next() % 86_400) as i64;
+        (0..len)
+            .map(|_| {
+                time += match next() % 8 {
+                    0 => 1,
+                    1 => 60,
+                    2 => 300,
+                    3 => 3_600,
+                    4 => 21_600,
+                    5 => 86_400,
+                    6 => 2_678_400,
+                    _ => 1 + (next() % 7_200) as i64,
+                };
+                time
+            })
+            .collect()
+    }
+
+    fn clean_marks(times: &[i64]) -> TimeTickMarks {
+        let mut weights = vec![0u8; times.len()];
+        fill_weights_for_points(times, &mut weights, 0);
+        let mut marks = TimeTickMarks::new();
+        marks.set_weights(&weights);
+        marks
+    }
+
+    #[test]
+    fn dropping_the_front_equals_a_clean_fill_of_the_surviving_points() {
+        let mut rng = 0x2545_F491_4F6C_DD1D_u64;
+        for round in 0..200 {
+            let len = 2 + (round * 7) % 90;
+            let times = spread_times(&mut rng, len + 12);
+            let (old, new) = (&times[..len], &times[..len + 12]);
+            for dropped in [1, len / 2, len - 1] {
+                let new = &new[dropped..];
+                assert_eq!(front_trim(old, new), Some(dropped), "round {round}");
+                let mut marks = clean_marks(old);
+                let span = new[new.len() - 1] - new[0];
+                let first = first_point_weight_in(new[0], span, new.len(), &ExchangeTime::UTC);
+                marks.drop_front(dropped, first);
+                for index in len - dropped..new.len() {
+                    let weight = weight_by_time(new[index], new[index - 1]) as u8;
+                    marks.push_weight(index as TimePointIndex, weight);
+                }
+                let clean = clean_marks(new);
+                assert_eq!(
+                    marks.marks_by_weight, clean.marks_by_weight,
+                    "round {round} dropped {dropped}"
+                );
+                assert_eq!(
+                    marks.build(1_000.0, 10.0),
+                    clean_marks(new).build(1_000.0, 10.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_front_trim_is_recognized_only_when_every_survivor_keeps_its_time() {
+        let old = [10, 20, 30, 40];
+        assert_eq!(front_trim(&old, &[30, 40]), Some(2));
+        assert_eq!(front_trim(&old, &[20, 30, 40, 50, 60]), Some(1));
+        // Nothing left of the old points, nothing dropped, or an empty side.
+        assert_eq!(front_trim(&old, &[50, 60]), None);
+        assert_eq!(front_trim(&old, &old), None);
+        assert_eq!(front_trim(&old, &[10, 20, 30, 40, 50]), None);
+        assert_eq!(front_trim(&old, &[]), None);
+        assert_eq!(front_trim(&[], &[1, 2]), None);
+        // The first survivor moved, a middle point was replaced, or the tail shrank.
+        assert_eq!(front_trim(&old, &[25, 30, 40]), None);
+        assert_eq!(front_trim(&old, &[20, 35, 40]), None);
+        assert_eq!(front_trim(&old, &[20, 30]), None);
+        // One surviving point followed by new ones.
+        assert_eq!(front_trim(&old, &[40, 50, 60]), Some(3));
     }
 
     #[test]
@@ -596,12 +785,116 @@ mod tests {
         assert_eq!(weights_in(&days, &eastern), reference);
     }
 
+    fn shifted_weights_in(times: &[i64], shift: i64, time: &ExchangeTime) -> Vec<u8> {
+        let mut weights = vec![0u8; times.len()];
+        fill_weights_for_points_shifted_in(times, &mut weights, 0, shift, time);
+        weights
+    }
+
+    #[test]
+    fn shifted_weights_rank_intraday_by_label_and_days_by_identity() {
+        let shanghai = ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), 0).unwrap();
+        let mut times = Vec::new();
+        for day in [2, 3] {
+            times.extend(minute_bars(&shanghai, (2024, 1, day), (9, 30), (11, 29), 1));
+            times.extend(minute_bars(&shanghai, (2024, 1, day), (13, 0), (14, 59), 1));
+        }
+        let per_day = times.len() / 2;
+        let open = weights_in(&times, &shanghai);
+        let closed = shifted_weights_in(&times, 60, &shanghai);
+        // The bar opened 09:59 closes at 10:00 and carries the hour mark; the bar opened 10:00
+        // does not. By open time it is the other way round.
+        assert_eq!(closed[29], TickMarkWeight::Hour1 as u8);
+        assert_eq!(open[29], TickMarkWeight::Minute1 as u8);
+        assert_eq!(closed[30], TickMarkWeight::Minute1 as u8);
+        assert_eq!(open[30], TickMarkWeight::Hour1 as u8);
+        // The bar opened 11:29 closes at 11:30 (a half-hour mark); the bar opened 13:00 closes
+        // at 13:01 and crosses local noon from the 11:30 label.
+        assert_eq!(closed[119], TickMarkWeight::Minute30 as u8);
+        assert_eq!(closed[120], TickMarkWeight::Hour12 as u8);
+        // The trading day follows the identity: the first bar of the second day carries the Day
+        // mark and no other bar does, whichever label the bars print.
+        let day_marks: Vec<usize> = closed
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, &weight)| weight >= TickMarkWeight::Day as u8)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(day_marks, vec![per_day]);
+
+        // A window ending at 24:00: the last bar (opened 23:59, closing 00:00 of the next date)
+        // still belongs to its own trading day, and the next day's first bar opens the Day.
+        let utc = ExchangeTime::UTC;
+        let day = days_from_civil(2024, 1, 8).unwrap() * 86_400;
+        let times = [
+            day + 23 * 3_600 + 58 * 60,
+            day + 23 * 3_600 + 59 * 60,
+            day + 86_400,
+            day + 86_400 + 60,
+        ];
+        let weights = shifted_weights_in(&times, 60, &utc);
+        assert_eq!(weights[1], TickMarkWeight::Hour12 as u8, "label 00:00");
+        assert_eq!(weights[2], TickMarkWeight::Day as u8, "next trading day");
+        assert_eq!(weights[3], TickMarkWeight::Minute1 as u8);
+
+        // A shift of zero is the historical weight function for every input.
+        let eastern = new_york();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for time in [&ExchangeTime::UTC, &shanghai, &eastern] {
+            let mut times: Vec<i64> = (0..300)
+                .map(|_| 1_700_000_000 + (next() % 4_000_000) as i64)
+                .collect();
+            times.sort_unstable();
+            times.dedup();
+            assert_eq!(
+                shifted_weights_in(&times, 0, time),
+                weights_in(&times, time)
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_incremental_weights_match_a_full_rebuild() {
+        // Appending points weighs them against their predecessor exactly like a full rebuild.
+        let shanghai = ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), 0).unwrap();
+        let times = minute_bars(&shanghai, (2024, 1, 2), (9, 30), (10, 40), 1);
+        let full = shifted_weights_in(&times, 60, &shanghai);
+        for index in 1..times.len() {
+            assert_eq!(
+                weight_by_time_shifted(times[index], times[index - 1], 60, &shanghai) as u8,
+                full[index]
+            );
+        }
+        let mut partial = full.clone();
+        partial[40..].fill(0);
+        fill_weights_for_points_shifted_in(&times, &mut partial, 40, 60, &shanghai);
+        assert_eq!(partial, full);
+    }
+
     #[test]
     fn append_weights_keeps_existing_marks_and_adds_new_point() {
         let mut marks = TimeTickMarks::new();
         marks.set_weights(&[50]);
         marks.append_weights(1, &[50, 50]);
         let built = marks.build(10.0, 10.0);
+        assert!(built.iter().any(|mark| mark.index == 0));
+        assert!(built.iter().any(|mark| mark.index == 1));
+    }
+
+    #[test]
+    fn full_rebuild_preserves_negative_projected_indices() {
+        let mut marks = TimeTickMarks::new();
+        marks.set_weights_from(-2, &[70, 60, 50, 40]);
+        let built = marks.build(100.0, 1.0);
+        assert!(built.iter().any(|mark| mark.index == -2));
+        assert!(built.iter().any(|mark| mark.index == -1));
         assert!(built.iter().any(|mark| mark.index == 0));
         assert!(built.iter().any(|mark| mark.index == 1));
     }

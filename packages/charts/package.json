@@ -51,7 +51,7 @@
   },
   "files": [
     "dist",
-    "!dist/index.js.map"
+    "!dist/*.js.map"
   ],
   "sideEffects": [
     "./dist/aeris_charts.css"

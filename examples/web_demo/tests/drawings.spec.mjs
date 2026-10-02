@@ -1350,11 +1350,9 @@ test("Ctrl magnets the crosshair to the hovered bar's OHLC", async ({ page }) =>
   // The Ctrl magnet engages only for drawing work: arm a tool first (plain browsing never
   // price-snaps on Ctrl).
   await page.evaluate(() => window.__chart.set_drawing_tool("trend_line"));
-  // The crosshair's horizontal line is the default crosshair gray — find the pane row with
+  // The crosshair's horizontal line is the default crosshair color — find the pane row with
   // the most of it (the dashed line covers the pane width).
-  // d2c9b95 ("pin crosshair to dark chrome tokens") pins the crosshair line to the dark-theme
-  // border #333333 in both themes, including this light fixture.
-  const CROSS = [51, 51, 51];
+  const CROSS = [51, 51, 51]; // crosshair line pinned to the dark border token #333333
   const crosshair_row = async () => {
     const png = await capture(page);
     const pane_bottom = Math.round((fixture.css_height - fixture.time_axis_height) * PR);
@@ -2144,6 +2142,7 @@ test("rectangle: middle pans unselected, drags selected, 8 anchors from the firs
   }, s);
   await settle_frames(page);
   const before = (await drawings(page))[0];
+  expect(await page.evaluate(() => window.__chart.drawings()[0].options().border_visible)).toBe(false);
   const center_of = (points) => page.evaluate(({ points }) => ({
     x: (window.__chart.time_scale().logical_to_coordinate(points[0].logical) + window.__chart.time_scale().logical_to_coordinate(points[1].logical)) / 2,
     y: (window.__main.price_to_coordinate(points[0].price) + window.__main.price_to_coordinate(points[1].price)) / 2,
@@ -2223,7 +2222,7 @@ test("a vertical line body-drag with Ctrl snaps to the bar center (the public re
   expect(Number.isInteger(points[0].logical), "snapped onto a bar center").toBe(true);
 });
 
-test("Ctrl magnet engages only while a drawing tool is armed", async ({ page }) => {
+test("Ctrl OHLC magnet engages only during drawing creation or drag", async ({ page }) => {
   await page.goto("/?runtimeTest=presentedFrame&backend=canvas2d&forceFallbackAdapter=1");
   await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
   await page.waitForFunction(() => performance.now() > 600);
@@ -2250,6 +2249,26 @@ test("Ctrl magnet engages only while a drawing tool is armed", async ({ page }) 
   await focus_overlay(page);
   await page.keyboard.press("Escape");
   await hover();
+  expect(await magnet()).toBe(false);
+
+  // Grabbing an existing drawing also counts as drawing work, even with no tool armed.
+  const drag = await page.evaluate(() => {
+    const range = window.__chart.time_scale().get_visible_logical_range();
+    const index = Math.floor((range.from + range.to) / 2);
+    const bar = window.__main.data_by_index(index);
+    window.__chart.add_drawing("horizontal_line", [{ logical: index, price: bar.close }]);
+    return {
+      x: window.__chart.time_scale().logical_to_coordinate(index),
+      y: window.__main.price_to_coordinate(bar.close),
+    };
+  });
+  await settle_frames(page);
+  await page.mouse.move(box.x + drag.x, box.y + drag.y);
+  await page.mouse.down();
+  await page.mouse.move(box.x + drag.x + 8, box.y + drag.y + 8);
+  expect(await page.evaluate(() => window.__chart.wasm.drawing_drag_active())).toBe(true);
+  expect(await magnet()).toBe(true);
+  await page.mouse.up();
   expect(await magnet()).toBe(false);
   await page.keyboard.up("Control");
 });

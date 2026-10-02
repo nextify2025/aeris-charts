@@ -277,6 +277,24 @@ export function apply_series_time_alignment(
   return true;
 }
 
+/**
+ * Throw unless `id` names a live series of the chart behind `wasm`; worker charts address series
+ * by raw numeric id. A number that is not a `u32` is refused with `invalid_handle` before it
+ * reaches the engine, because the wasm boundary would wrap it onto a real series (`NaN` and `2**32`
+ * to 0, `1.5` to 1). A dead id gets the engine's own answer, `stale_handle` for a removed series
+ * and `invalid_handle` for one never issued.
+ */
+export function assert_live_series(wasm: AerisChart, id: number): void {
+  if (!Number.isInteger(id) || id < 0 || id > 0xffffffff) {
+    throw new AerisChartsError("invalid_handle", `series id ${id} is not a valid series handle`);
+  }
+  if (wasm.series_kind(id) !== undefined) return;
+  // `set_series_time_alignment` validates the id before it reads anything else, so this union
+  // request on a dead id changes nothing and reports why the id is dead.
+  assert_trading_result(wasm.set_series_time_alignment(id, false, undefined));
+  throw new AerisChartsError("invalid_handle", `series ${id} does not exist`);
+}
+
 function undef_to_null<T>(v: T | undefined): T | null {
   return v === undefined ? null : v;
 }
@@ -1802,6 +1820,16 @@ function rejected_ingestion(
   };
 }
 
+/** A host write to a series the engine owns (a footprint, a trade-bound candle or bar, a CVD,
+ *  delta, or volume study, resampled or synthetic bars). The wasm boundary reports the same
+ *  record for the typed, sequenced, and merge entries. */
+function derived_series_ingestion(id: number): ingestion_diagnostics {
+  return rejected_ingestion(
+    `series ${id} is derived by the engine; write to its trade stream, resampler source, or synthetic-bar source instead`,
+    "derived_series",
+  );
+}
+
 const INVALID_SEQUENCE = "sequence must be a non-negative safe integer";
 
 /** Custom and advanced series own their payloads outside the OHLC streaming path, so a sequence
@@ -1874,7 +1902,10 @@ class series_impl implements series_api {
     const accepted = this.record_ingestion(
       this.chart.wasm.set_series_data_typed(this.id, p.times, p.open, p.high, p.low, p.close),
     );
-    if (!accepted) return;
+    if (!accepted) {
+      this.warn_rejected("set_data");
+      return;
+    }
     // A full replace cleared the guard; a snapshot sequence becomes the new baseline.
     if (!Number.isNaN(sequence)) this.chart.wasm.set_series_update_sequence(this.id, sequence);
     // set_series_data resets point colors, so per-point channels must be applied after it.
@@ -1903,7 +1934,10 @@ class series_impl implements series_api {
     const accepted = this.record_ingestion(this.chart.wasm.set_series_data_typed(
       this.id, columns.times, columns.open, columns.high, columns.low, columns.close,
     ));
-    if (!accepted) return;
+    if (!accepted) {
+      this.warn_rejected("set_data_typed");
+      return;
+    }
     this.chart.note_series_times(this.id, columns.times.length === 0 ? null : false);
     if (!Number.isNaN(sequence)) this.chart.wasm.set_series_update_sequence(this.id, sequence);
     this.chart.sync_countdown_timer();
@@ -1928,7 +1962,10 @@ class series_impl implements series_api {
       : this.chart.wasm.update_series_bars_typed_sequenced(
         this.id, columns.times, columns.open, columns.high, columns.low, columns.close, sequence,
       ));
-    if (!accepted) return;
+    if (!accepted) {
+      this.warn_rejected("update_typed");
+      return;
+    }
     if (columns.times.length > 0) this.chart.note_series_update(this.id, false);
     // Same post-update bookkeeping as `update`: data arriving on a countdown-enabled series can
     // start the timer, and repaints coalesce onto the next frame rather than painting per batch.
@@ -1948,6 +1985,14 @@ class series_impl implements series_api {
       this.chart.wasm.clear_ring_source(this.id);
       this.chart.sync_ring_drain_loop();
       return;
+    }
+    // Unbinding stays allowed above: a ring bound before the series became derived must be
+    // releasable. Binding one now would only feed rows the engine drops on every frame.
+    if (this.chart.wasm.series_is_derived(this.id)) {
+      throw new AerisChartsError(
+        "unsupported_operation",
+        `series ${this.id} is derived by the engine; feed its trade stream or source instead of binding a ring`,
+      );
     }
     if (layout === undefined) {
       throw new AerisChartsError("invalid_options", "set_ring_source requires a layout when a buffer is given");
@@ -1998,12 +2043,13 @@ class series_impl implements series_api {
       return;
     }
     if (Number.isNaN(sequence)) {
-      // The values passed the boundary check above, so an engine rejection means the series is
-      // engine-derived (footprint, synthetic, or resampled bars) and changes only via its source.
+      // A refused write is also what invalid values look like, so ask the engine whether the
+      // series is derived (a footprint, trade-bound candle or study, synthetic or resampled bars)
+      // rather than guessing from the refusal.
       if (!this.chart.wasm.update_series_bar_styled(this.id, time, o, h, l, c, body, wick, border)) {
-        this.last_ingestion = rejected_ingestion(
-          `series ${this.id} is derived by the engine; write to its source instead`,
-        );
+        this.last_ingestion = this.chart.wasm.series_is_derived(this.id)
+          ? derived_series_ingestion(this.id)
+          : rejected_ingestion("the engine rejected the point (unknown series or invalid values)");
         this.warn_rejected("update");
         return;
       }
@@ -2188,6 +2234,13 @@ class series_impl implements series_api {
 
   pop(count = 1): void {
     this.assert_live();
+    // Popping is a data-path write: an engine-owned series keeps its rows, so this records the
+    // rejection like any other dropped write instead of repainting or firing `data_changed`.
+    if (this.chart.wasm.series_is_derived(this.id)) {
+      this.last_ingestion = derived_series_ingestion(this.id);
+      this.warn_rejected("pop");
+      return;
+    }
     this.chart.wasm.series_pop(this.id, count);
     this.chart.repaint();
     // Like set_data, popping is a full-range change, not an incremental update.
@@ -3609,8 +3662,16 @@ class time_scale_impl implements time_scale_api {
   apply_options(options: Partial<time_scale_options>): void {
     // Exchange time and explicit marks validate first, together, so a rejected zone or mark list
     // leaves every other option untouched.
-    if (options.time_zone !== undefined || options.session_start !== undefined || options.tick_marks !== undefined) {
-      this.chart.apply_exchange_time(options.time_zone, options.session_start, options.tick_marks);
+    if (
+      options.time_zone !== undefined || options.session_start !== undefined ||
+      options.tick_marks !== undefined || options.bar_time_label !== undefined
+    ) {
+      this.chart.apply_exchange_time(
+        options.time_zone,
+        options.session_start,
+        options.tick_marks,
+        options.bar_time_label,
+      );
     }
   if (options.bar_spacing !== undefined) this.chart.wasm.apply_bar_spacing_option(options.bar_spacing);
   if (options.right_offset !== undefined) this.chart.wasm.apply_right_offset_option(options.right_offset);
@@ -3939,8 +4000,11 @@ class series_primitive_handle_impl implements series_primitive_handle {
 }
 
 /**
- * Where the engine paints a family text box's own text (`drawing_text_edit_layout_json`), in
- * overlay CSS px: lines left-aligned at `x`, line `i` centered at `y + i * line_height`.
+ * Where the engine paints a drawing's own text (`drawing_text_edit_layout_json`), in overlay CSS
+ * px. A `multiline` layout is a family text box: lines left-aligned at `x`, line `i` centered at
+ * `y + i * line_height`, never rotated. Otherwise it is one run: `x`, `y` are its start (left
+ * edge, vertical center), rotated clockwise by `angle` radians about that point, and `rect`
+ * bounds its padded box. The host only presents the editor the layout describes.
  */
 interface text_edit_layout {
   x: number;
@@ -3952,6 +4016,8 @@ interface text_edit_layout {
   italic: boolean;
   color: string;
   rect: [number, number, number, number];
+  angle: number;
+  multiline: boolean;
 }
 
 /** One registered canvas primitive (Phase C-e) in the package-side registry. */
@@ -4356,9 +4422,6 @@ export class chart_impl implements chart_api {
   /** Borderless caret surface shared by the explicitly separate product edit modes. */
   private text_editor: HTMLElement | null = null;
   private text_editor_id = 0;
-  /** Snapshot of the drawing's text when the editor opened — restored on Escape. */
-  private text_editor_original = "";
-  private text_editor_mode: "standalone_text" | "trend_label" | "part_label" | null = null;
   /** The edited drawing's kind in words, for accessibility announcements. */
   private text_editor_label = "";
   /** The element focused when the editor opened (an accessibility target regains focus). */
@@ -4367,7 +4430,9 @@ export class chart_impl implements chart_api {
    * The drawing selection snapshotted at pointer-DOWN, before the engine's drag grab selects
    * the hit (gestures.ts calls `note_drawing_press`). `emit_click` reads it for the public reference's
    * two-step text editing: a click opens typing mode only when the text drawing was already
-   * selected when the press began; the first click just selects (focus border).
+   * selected when the press began; the first click just selects (focus border). A double-click
+   * (`activate_drawing_double_click`) needs it too, plus the engine's word that the point is on
+   * that drawing: presses a trading object or the alert widget consumed never refresh it.
    */
   private text_press_selected: number | null = null;
   /**
@@ -5068,11 +5133,18 @@ export class chart_impl implements chart_api {
     return Date.now() / 1000;
   }
 
-  /** Resolve and apply `time_zone` / `session_start` / explicit `tick_marks` as one validated step;
-   *  throws without changing anything on error. */
-  apply_exchange_time(zone: time_zone | undefined, session_start: number | undefined, tick_marks?: unknown): void {
+  /** Resolve and apply `time_zone` / `session_start` / explicit `tick_marks` / `bar_time_label` as
+   *  one validated step; throws without changing anything on error. */
+  apply_exchange_time(
+    zone: time_zone | undefined,
+    session_start: number | undefined,
+    tick_marks?: unknown,
+    bar_time_label?: unknown,
+  ): void {
     const marks = tick_marks === undefined ? undefined : normalize_time_tick_marks(tick_marks);
-    const reason = this.wasm.set_exchange_time_json(exchange_time_json(zone, session_start, marks));
+    const reason = this.wasm.set_exchange_time_json(
+      exchange_time_json(zone, session_start, marks, bar_time_label),
+    );
     if (reason !== "") throw new AerisChartsError("invalid_options", reason);
     if (typeof zone === "string") {
       const engine = JSON.parse(this.wasm.time_scale_options_json()) as { time_zone: unknown };
@@ -5135,9 +5207,11 @@ export class chart_impl implements chart_api {
   /**
    * Time text for package-owned surfaces (tooltip, accessibility): the host `time_formatter`
    * when installed, else a locale date — plus time of day for intraday rows — in the chart's
-   * exchange time. Calendar-date rows always show their own date.
+   * exchange time. `identity_seconds` is a bar's open time; the text prints its label time (the
+   * close under `time_scale.bar_time_label`). Calendar-date rows always show their own date.
    */
-  format_time_text(seconds: number): string {
+  format_time_text(identity_seconds: number): string {
+    const seconds = this.wasm.bar_label_time(identity_seconds);
     const formatter = this.host_time_formatter;
     if (formatter !== undefined) {
       try {
@@ -5509,7 +5583,7 @@ export class chart_impl implements chart_api {
     if (!this.wasm.bind_trade_bar_series_to_stream(id, stream_id)) {
       throw new AerisChartsError(
         "invalid_options",
-        "trade bar stream binding requires a candlestick or bar series",
+        "trade bar stream binding requires a candlestick or bar series without a max_points cap that no other engine feature (a footprint, trade study, resampler, or synthetic bars) already writes",
       );
     }
     this.repaint();
@@ -6462,9 +6536,12 @@ export class chart_impl implements chart_api {
     // industry-standard click-to-select, drawings first: a drawing hit selects it and clears
     // the series selection; a miss clears the drawing selection and falls through to the
     // series under the click (or clears that on empty pane space).
-    const trend_text_hit = Number(this.wasm.drawing_text_hit_at(x, y));
-    const drawing_hit = trend_text_hit > 0 || this.wasm.select_drawing_at(x, y);
-    if (trend_text_hit > 0) this.wasm.set_selected_drawing(trend_text_hit);
+    // A drawing's own text under the click selects it (the engine answers for a trend line's
+    // label and prompt and for the text of every line, channel, Fibonacci, pitchfork, pattern,
+    // and shape tool, which an unselected shape's interior would otherwise not hit).
+    const label_hit = Number(this.wasm.drawing_text_hit_at(x, y));
+    const drawing_hit = label_hit > 0 || this.wasm.select_drawing_at(x, y);
+    if (label_hit > 0) this.wasm.set_selected_drawing(label_hit);
     const general_hit = !drawing_hit && this.hover?.general_hit != null;
     if (general_hit) this.wasm.select_general_hovered();
     else this.wasm.clear_general_selection();
@@ -6474,9 +6551,10 @@ export class chart_impl implements chart_api {
     // Text drawings: empty labels open typing mode on the first click (there is no ink to
     // "focus" otherwise). Non-empty labels follow the public reference's two-step model — first click
     // selects (focus border), a click opens typing mode only when already selected at press.
+    // Every other drawing's text opens on a double-click, Enter, or F2 (`edit_drawing_text`).
     if (drawing_hit) {
       const selected = this.selected_drawing();
-      if (selected !== null && selected.kind() === "trend_line" && selected.id === trend_text_hit) {
+      if (selected !== null && selected.kind() === "trend_line" && selected.id === label_hit) {
         this.open_trend_label_editor(selected);
       } else if (selected !== null && selected.kind() === "text") {
         const empty = !(selected.options().text ?? "").trim();
@@ -6512,13 +6590,26 @@ export class chart_impl implements chart_api {
 
   /**
    * Let an explicitly hit Aeris drawing consume the second click without a pane click event: the
-   * text tool and trend labels re-run their click activation, and any other drawing whose text
-   * the engine edits in place (a family text box) opens the inline editor.
+   * text tool and a trend line's label re-run their click activation, and any other selected
+   * drawing whose text the engine edits in place (a trend line's body included) opens the inline
+   * editor. The first click of a pair on an
+   * unselected drawing's text selects it (`apply_primary_click`), so a double-click on the text
+   * of a line, channel, Fibonacci, pitchfork, pattern, or shape tool reaches the editor. Host
+   * `dbl_click` subscribers still run afterwards.
    */
   activate_drawing_double_click(x: number, y: number): void {
     const selected = this.selected_drawing();
     if (selected === null || selected.id !== this.text_press_selected) return;
-    if (selected.kind() === "text" || selected.kind() === "trend_line") {
+    // The press snapshot says the drawing was selected, not that this click is on it: a press
+    // another owner consumed (a trading object, the alert widget) leaves the selection and the
+    // snapshot behind. The engine says whether the point still belongs to the selected drawing.
+    if (this.wasm.drawing_at(x, y) !== selected.id) return;
+    // The text tool and a trend line's own label re-run their click activation (its prompt and
+    // two-step focus); every other double-click on the selected drawing, a trend line's body
+    // included, opens the editor.
+    const on_trend_label = selected.kind() === "trend_line"
+      && Number(this.wasm.drawing_text_hit_at(x, y)) === selected.id;
+    if (selected.kind() === "text" || on_trend_label) {
       this.apply_primary_click(x, y);
     } else {
       this.edit_drawing_text(selected.id);
@@ -6849,7 +6940,7 @@ export class chart_impl implements chart_api {
 
   active_drawing_tool(): drawing_kind | null {
     const wire = Number(this.wasm.active_drawing_tool());
-    return wire >= 0 ? (DRAWING_KIND_FROM_U8.get(wire) ?? null) : null;
+    return DRAWING_KIND_FROM_U8.get(wire) ?? null;
   }
 
   set_drawing_tool_listener(listener: ((tool: drawing_kind | null) => void) | null): void {
@@ -6908,7 +6999,9 @@ export class chart_impl implements chart_api {
     // One-shot disarming happened inside the engine controller; mirror that public state change.
     this.tool_listener?.(null);
     for (const handler of this.tool_change_subs) handler(null);
-    if (this.wasm.drawing_requests_text_edit(created_id)) this.open_text_editor(created);
+    // The engine decides which tools start in the editor (the text tool and the annotation boxes
+    // that begin from a default text); the host presents the one its layout describes.
+    if (this.wasm.drawing_requests_text_edit(created_id)) this.edit_drawing_text(created_id);
     return true;
   }
 
@@ -6973,10 +7066,16 @@ export class chart_impl implements chart_api {
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Inline drawing editors. Standalone text, trend labels, and family text boxes (a note, callout,
-  // comment, ...) share the borderless caret surface and the engine's text-edit session: live
-  // text repaints without history, commit records one undo step, and cancel restores the
-  // pre-edit text. Each mode enters explicitly and owns its layout source and empty lifecycle.
+  // Inline drawing editors. Every drawing that paints text edits it through one engine session
+  // (`begin/set/commit/cancel_drawing_text_edit`) and the borderless caret surface: live text
+  // repaints without history, commit records one undo step, and cancel restores the pre-edit
+  // text. The engine owns the trim, the single-line rule of a run, the length bound, and the text
+  // tool's empty lifecycle (leaving it empty removes the drawing); the DOM surface only supplies
+  // IME/clipboard-aware input and the caret, mirrored into the session with
+  // `set_drawing_text_edit`. The engine's `drawing_text_edit_layout` says where the text sits and
+  // whether it is a run (the text tool, trend labels, and the text of lines, channels, Fibonacci
+  // tools, pitchforks, patterns, and shapes: one line, possibly rotated) or a family text box
+  // (several lines); the host only presents the matching surface.
   // ---------------------------------------------------------------------------------------------
 
   /**
@@ -6991,22 +7090,25 @@ export class chart_impl implements chart_api {
   }
 
   private open_trend_label_editor(drawing: drawing_api): void {
-    this.open_inline_editor(drawing, "trend_label");
+    this.open_inline_editor(drawing, "run_label");
   }
 
   /**
-   * Open the inline editor on a drawing's own text (Enter or F2 on a selected drawing, or a
-   * double-click on it): the text tool's typing mode, a trend line's label, or a family text box,
-   * whichever the engine reports editable. Returns whether an editor opened.
+   * Open the inline editor on a drawing's own text (Enter or F2 on a selected drawing, a
+   * double-click on it, or placement of a tool that starts in the editor): whatever the engine
+   * reports editable, presented as the surface its layout describes. The engine refuses a
+   * drawing whose text is entirely outside its pane's plot (the same rule the native hosts get),
+   * so no invisible editor captures the keys. Returns whether an editor opened.
    */
   edit_drawing_text(id: number): boolean {
     if (!this.wasm.drawing_text_editable(id)) return false;
+    const layout = this.text_edit_layout(id);
+    if (layout === null) return false;
     const info = (JSON.parse(this.wasm.drawings_json()) as drawing_info[]).find((d) => d.id === id);
     if (info === undefined) return false;
     const drawing = new drawing_impl(this, info.id, info.kind, info.pane_index);
-    if (info.kind === "text") this.open_inline_editor(drawing, "standalone_text");
-    else if (info.kind === "trend_line") this.open_inline_editor(drawing, "trend_label");
-    else this.open_part_label_editor(drawing);
+    if (layout.multiline) this.open_part_label_editor(drawing);
+    else this.open_inline_editor(drawing, info.kind === "text" ? "standalone_text" : "run_label");
     return this.text_editor !== null && this.text_editor_id === id;
   }
 
@@ -7119,13 +7221,21 @@ export class chart_impl implements chart_api {
   }
 
   /**
+   * The editor's caret in `char`s (code points) of its text, the unit the engine session keeps:
+   * the UTF-16 offset above is not one for text outside the BMP.
+   */
+  private static text_editor_caret_chars(editor: HTMLElement): number {
+    return Array.from(chart_impl.text_editor_value(editor).slice(0, chart_impl.text_editor_caret_offset(editor))).length;
+  }
+
+  /**
    * Hand the mounted surface the session: Enter (outside IME composition) and blur commit and
    * Escape cancels; a multi-line editor keeps Shift+Enter for its native line break. The caret
    * starts at the end of the text and focus returns where it was on close.
    */
   private attach_text_editor(
     drawing: drawing_api,
-    mode: "standalone_text" | "trend_label" | "part_label",
+    mode: "standalone_text" | "run_label" | "part_label",
     editor: HTMLElement,
     return_focus: Element | null,
     on_input: () => void,
@@ -7143,12 +7253,12 @@ export class chart_impl implements chart_api {
         this.close_text_editor(false);
       }
     });
-    editor.addEventListener("blur", () => this.close_text_editor(true));
+    // Focus that moved to another element (a host panel or control) stays there: the editor
+    // commits, and the chart does not pull focus back.
+    editor.addEventListener("blur", (e) => this.close_text_editor(true, e.relatedTarget instanceof Element));
 
     this.text_editor = editor;
     this.text_editor_id = drawing.id;
-    this.text_editor_original = drawing.options().text ?? "";
-    this.text_editor_mode = mode;
     this.text_editor_label = drawing.kind().replaceAll("_", " ");
     this.text_editor_return_focus = return_focus;
     this.repaint();
@@ -7170,58 +7280,48 @@ export class chart_impl implements chart_api {
     );
   }
 
+  /**
+   * Open the single-line editor on a drawing's text run. The engine's layout gives the run's
+   * start point (left edge, vertical center), rotation, glyph size, font, and ink, and is read
+   * again after every keystroke, so the caret overlay cannot drift from the painted label: the
+   * host holds no placement, alignment, or color rule of its own.
+   */
   private open_inline_editor(
     drawing: drawing_api,
-    mode: "standalone_text" | "trend_label",
+    mode: "standalone_text" | "run_label",
   ): void {
     this.close_text_editor(true);
-    let transform = this.wasm.drawing_text_transform(drawing.id);
-    if (transform.length !== 3) return;
     const return_focus = document.activeElement;
     // The engine session keeps the canvas label under the caret overlay and records the edit as
     // one undo step; it refuses a locked, hidden, or otherwise uneditable drawing.
-    if (!this.wasm.begin_drawing_text_edit(drawing.id)) return;
+    if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
+    let layout = this.text_edit_layout(drawing.id);
+    if (layout === null || layout.multiline) {
+      this.wasm.cancel_drawing_text_edit();
+      return;
+    }
     const options = drawing.options();
-    const layout = (this.options() as {
-      layout?: {
-        fontSize?: number;
-        fontFamily?: string;
-        textColor?: string;
-        mutedTextColor?: string;
-        background?: { color?: string };
-      };
-    }).layout ?? {};
-    const font_size = options.text_size ?? (drawing.kind() === "text" ? 14 : (layout.fontSize ?? 12));
-    const font_family = layout.fontFamily ?? "sans-serif";
-    const style_prefix = options.text_italic ? "italic " : "";
-    const font = `${style_prefix}${options.text_weight ?? 400} ${font_size}px ${font_family}`;
-    // Same color the engine paints with: explicit drawing override, then a trend label's line,
-    // otherwise the chart foreground used by standalone text. Never infer a different trend-label
-    // default in the host.
-    const ink =
-      (options.text_color && options.text_color.trim() !== ""
-        ? options.text_color
-        : null) ??
-      (drawing.kind() === "trend_line" ? options.color : null) ??
-      layout.textColor ??
-      theme_palette(default_theme_name).foreground;
-
+    const font_of = (edit: text_edit_layout) =>
+      `${edit.italic ? "italic " : ""}${edit.weight} ${edit.size}px ${edit.font_family}`;
+    const font = font_of(layout);
+    const font_size = layout.size;
     const { wrap, editor, caret } = this.text_editor_surface(
       options.text,
       font,
       font_size,
-      font_size * 1.2,
-      ink,
+      layout.line_height,
+      layout.color,
       `${drawing.kind().replaceAll("_", " ")} text`,
       false,
     );
-    wrap.style.background = options.box_color || "transparent";
+    // Only the text tool paints a container behind its run.
+    if (mode === "standalone_text") wrap.style.background = options.box_color || "transparent";
 
     const dpr = window.devicePixelRatio || 1;
     const measure_ctx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
     let baseline_drop = 0;
     if (measure_ctx !== null) {
-      const device_font = `${style_prefix}${options.text_weight ?? 400} ${font_size * dpr}px ${font_family}`;
+      const device_font = `${layout.italic ? "italic " : ""}${layout.weight} ${font_size * dpr}px ${layout.font_family}`;
       const side = Math.ceil(font_size * dpr) + 16;
       const probe_canvas = measure_ctx.canvas;
       probe_canvas.width = side;
@@ -7255,34 +7355,45 @@ export class chart_impl implements chart_api {
     const position_caret = () => {
       const text = editor.textContent ?? "";
       const before_caret = text.slice(0, chart_impl.text_editor_caret_offset(editor));
+      if (measure_ctx !== null) measure_ctx.font = font;
       const x = measure_ctx === null ? 0 : measure_ctx.measureText(before_caret).width;
       caret.style.left = `${Math.ceil(x)}px`;
     };
+    // The wrap's left-middle sits on the run's start point and rotates about it, so the DOM run
+    // lies exactly on the painted one whatever its alignment or slope.
     const position_editor = () => {
-      const anchor_x = transform[0]!;
-      const anchor_y = transform[1]!;
-      const text = editor.textContent ?? "";
-      let left_edge = anchor_x - (editor.offsetWidth || 0) / 2;
-      if (measure_ctx !== null) {
-        measure_ctx.font = font;
-        const advance = text === "" ? font_size : measure_ctx.measureText(text).width;
-        if (options.text_h_align === "left") left_edge = anchor_x;
-        else if (options.text_h_align === "right") left_edge = anchor_x - advance;
-        else left_edge = anchor_x - advance / 2;
-      }
-      const baseline = anchor_y + baseline_drop;
-      wrap.style.left = `${left_edge}px`;
-      wrap.style.top = `${baseline - baseline_in_editor}px`;
-      wrap.style.transformOrigin = `${anchor_x - left_edge}px ${anchor_y - (baseline - baseline_in_editor)}px`;
-      wrap.style.transform = `rotate(${transform[2]!}rad)`;
+      const edit = layout!;
+      const middle = baseline_in_editor - baseline_drop;
+      wrap.style.left = `${edit.x}px`;
+      wrap.style.top = `${edit.y - middle}px`;
+      wrap.style.transformOrigin = `0px ${middle}px`;
+      wrap.style.transform = `rotate(${edit.angle}rad)`;
+      caret.style.background = edit.color;
       position_caret();
     };
-    const push_live_text = () => {
-      const text = (editor.textContent ?? "").replace(/\s*\n\s*/g, " ");
-      if (!this.wasm.set_drawing_edit_text(text)) {
+    // Re-read the engine's layout: the run may grow, shift, or slide along its stroke as the text
+    // changes. A layout that vanished (drawing removed or replaced) ends the session.
+    const relayout = () => {
+      const fresh = this.wasm.editing_drawing() === drawing.id ? this.text_edit_layout(drawing.id) : null;
+      if (fresh === null || fresh.multiline) {
         this.close_text_editor(false);
         return;
       }
+      layout = fresh;
+      position_editor();
+    };
+    const push_live_text = () => {
+      // The engine owns the single-line rule and the length bound.
+      if (
+        !this.wasm.set_drawing_text_edit(
+          chart_impl.text_editor_value(editor),
+          chart_impl.text_editor_caret_chars(editor),
+        )
+      ) {
+        this.close_text_editor(false);
+        return;
+      }
+      relayout();
       this.repaint();
     };
     const set_width = () => {
@@ -7292,7 +7403,6 @@ export class chart_impl implements chart_api {
         const w = text === "" ? font_size : measure_ctx.measureText(text).width;
         editor.style.width = `${Math.ceil(w) + 1}px`;
       }
-      position_editor();
       push_live_text();
     };
     editor.addEventListener("keyup", position_caret);
@@ -7317,14 +7427,7 @@ export class chart_impl implements chart_api {
     position_editor();
 
     this.text_editor_reposition = () => {
-      if (this.text_editor === null) return;
-      const fresh = this.wasm.drawing_text_transform(drawing.id);
-      if (fresh.length !== 3 || this.wasm.editing_drawing() !== drawing.id) {
-        this.close_text_editor(false);
-        return;
-      }
-      transform = fresh;
-      position_editor();
+      if (this.text_editor !== null) relayout();
     };
     this.attach_text_editor(drawing, mode, editor, return_focus, set_width);
     position_caret();
@@ -7339,10 +7442,10 @@ export class chart_impl implements chart_api {
   private open_part_label_editor(drawing: drawing_api): void {
     this.close_text_editor(true);
     const return_focus = document.activeElement;
-    if (!this.wasm.begin_drawing_text_edit(drawing.id)) return;
+    if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
     let layout = this.text_edit_layout(drawing.id);
     if (layout === null) {
-      this.wasm.end_drawing_text_edit(false);
+      this.wasm.cancel_drawing_text_edit();
       return;
     }
     const font_of = (edit: text_edit_layout) =>
@@ -7384,7 +7487,7 @@ export class chart_impl implements chart_api {
       caret.style.background = edit.color;
     };
     const push_live_text = () => {
-      if (!this.wasm.set_drawing_edit_text(text_of())) {
+      if (!this.wasm.set_drawing_text_edit(text_of(), chart_impl.text_editor_caret_chars(editor))) {
         this.close_text_editor(false);
         return;
       }
@@ -7418,30 +7521,32 @@ export class chart_impl implements chart_api {
   /**
    * Close the typing-mode editor. Commit keeps the typed text as one undo step; cancel restores
    * the pre-edit text. A standalone text left empty is removed. Focus returns to where the
-   * editor was opened from inside the chart (an accessibility target), else the overlay.
+   * editor was opened from inside the chart (an accessibility target), else the overlay, unless
+   * `focus_moved`: the editor lost focus to another element, which keeps it (taking focus back
+   * would cancel the host's own `focus()` call, as a blur handler moving focus does).
    */
-  close_text_editor(commit: boolean): void {
+  close_text_editor(commit: boolean, focus_moved = false): void {
     const editor = this.text_editor;
     if (editor === null) return;
-    const mode = this.text_editor_mode;
     this.text_editor = null;
     this.text_editor_reposition = null;
     const wrap = this.container.querySelector("#aeris_charts-text-editor");
     wrap?.remove();
-    const id = this.text_editor_id;
-    const raw = chart_impl.text_editor_value(editor);
-    const text = (mode === "part_label" ? raw.replace(/\r\n?/g, "\n") : raw.replace(/\s*\n\s*/g, " ")).trim();
-    if (commit) this.wasm.set_drawing_edit_text(text);
-    // A session the engine already ended (the drawing was removed, restored, or replaced by a
-    // sync payload) is not this editor's to finish.
-    const ended = this.wasm.end_drawing_text_edit(commit);
-    if (ended && mode === "standalone_text" && !(commit ? text : this.text_editor_original.trim())) {
-      this.wasm.remove_drawing(id);
+    // The engine session owns trim, restore, and the text tool's empty lifecycle; the final DOM
+    // value is mirrored first. A session the engine already ended (the drawing was removed,
+    // restored, or replaced by a sync payload) is not this editor's to finish.
+    let ended: boolean;
+    if (commit) {
+      this.wasm.set_drawing_text_edit(
+        chart_impl.text_editor_value(editor),
+        chart_impl.text_editor_caret_chars(editor),
+      );
+      ended = this.wasm.commit_drawing_text_edit();
+    } else {
+      ended = this.wasm.cancel_drawing_text_edit();
     }
     const label = this.text_editor_label;
     const return_focus = this.text_editor_return_focus;
-    this.text_editor_original = "";
-    this.text_editor_mode = null;
     this.text_editor_label = "";
     this.text_editor_return_focus = null;
     this.repaint();
@@ -7453,6 +7558,7 @@ export class chart_impl implements chart_api {
       : target === undefined
         ? null
         : this.container.querySelector<HTMLElement>(`[data-a11y-target="${CSS.escape(target)}"]`);
+    if (focus_moved) return;
     if (back !== null && back !== this.overlay_el() && this.container.contains(back)) back.focus();
     else this.overlay_el().focus();
   }
@@ -7475,8 +7581,11 @@ export class chart_impl implements chart_api {
     // IANA time-zone names resolve here (the engine accepts only explicit schedules). Validate
     // and apply them before any other key so a rejected zone changes nothing.
     const exchange = split_exchange_time_options(rest as Record<string, unknown>);
-    if (exchange.zone !== undefined || exchange.session_start !== undefined || exchange.tick_marks !== undefined) {
-      this.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks);
+    if (
+      exchange.zone !== undefined || exchange.session_start !== undefined ||
+      exchange.tick_marks !== undefined || exchange.bar_time_label !== undefined
+    ) {
+      this.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks, exchange.bar_time_label);
     }
     let engine_options: Record<string, unknown> = exchange.engine;
     // layout.panes.enableResize (reference) drives the separator drag here, not the engine; strip it

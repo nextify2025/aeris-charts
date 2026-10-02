@@ -4,7 +4,7 @@
 //! identity, schema and kind options, patches with history, persistence, clipboard, and sync.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, Prim};
+use aeris_charts_render::draw_list::{LineStyle, Prim, TextAlign};
 
 use super::super::super::{DrawingPlacement, DrawingTextHAlign, DrawingTextVAlign};
 use super::{BarsPatternMode, DrawingIcon, MAX_BARS_PATTERN_BARS};
@@ -195,7 +195,21 @@ fn catalog_defaults_follow_each_tool() {
         let spec = kind.spec();
         assert!(spec.family.is_some(), "{kind:?} is a family tool");
         assert!((128..=146).contains(&spec.wire_id));
-        assert!(!spec.requests_text_editor && !spec.axis_price_label);
+        assert!(!spec.axis_price_label);
+        // Placement opens the editor for the tools that start from a default text the user
+        // replaces or extends; price texts start empty beside their price and arrows carry none.
+        assert_eq!(
+            spec.requests_text_editor,
+            matches!(
+                kind,
+                DrawingKind::AnchoredText
+                    | DrawingKind::Note
+                    | DrawingKind::Callout
+                    | DrawingKind::Comment
+                    | DrawingKind::Signpost
+            ),
+            "{kind:?}"
+        );
         let expected = match kind {
             DrawingKind::Projection => 3,
             DrawingKind::Forecast
@@ -222,6 +236,8 @@ fn catalog_defaults_follow_each_tool() {
             drawing.fill_enabled,
             ranged || kind == DrawingKind::Projection
         );
+        // Only the measuring ranges snap their anchors to whole bars and price ticks.
+        assert_eq!(spec.grid_snap, ranged, "{kind:?}");
         assert_eq!(
             drawing.stroke_end,
             if ranged {
@@ -698,9 +714,16 @@ fn ranges_measure_with_fills_arrows_and_engine_stats() {
         .find(|(outline, color)| *color == ink() && outline.len() >= 6)
         .expect("arrowhead");
     let middle_x = (a.0 + b.0) / 2.0;
+    // The shaft is one crisp device-pixel column through the area's middle and the arrow's apex
+    // sits on that pixel's center at the second price's pixel row.
     assert!(
-        close(arrowhead.0[0], (middle_x, b.1), 0.01),
-        "the arrow points at the second price"
+        close(
+            arrowhead.0[0],
+            (middle_x.round() + 0.5, b.1.round() + 0.5),
+            1e-9
+        ),
+        "the arrow points at the second price: {:?}",
+        arrowhead.0[0]
     );
     // The fill is a body target; turning it off leaves only the lines.
     let inside = (middle_x + 20.0, (a.1 + b.1) / 2.0);
@@ -755,6 +778,64 @@ fn ranges_measure_with_fills_arrows_and_engine_stats() {
     assert!(!texts_of(&mut chart)
         .iter()
         .any(|text| text.contains("bars")));
+}
+
+#[test]
+fn range_arrows_are_crisp_device_pixel_shafts_ended_by_the_drawing_caps() {
+    for dpr in [1.0, 1.25, 2.0] {
+        let mut chart = chart_with(&hourly(40), dpr);
+        add(
+            &mut chart,
+            DrawingKind::DateAndPriceRange,
+            vec![p(10.0, 105.0), p(20.0, 100.0)],
+            r##"{"color":"#123456"}"##,
+        );
+        // No antialiased stroke: both shafts are crisp full-pixel lines of the stroke width.
+        assert!(ink_polylines(&mut chart).is_empty(), "dpr {dpr}");
+        let width = dpr.round().max(1.0) as i32;
+        let frame = chart.build_frame();
+        let main = &frame.panes[0].main;
+        let verticals = main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::VLine {
+                    x, width: w, color, ..
+                } if *color == ink() => Some((*x, *w)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let horizontals = main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::HLine {
+                    y, width: w, color, ..
+                } if *color == ink() => Some((*y, *w)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(verticals.len(), 1, "dpr {dpr}: the price arrow's shaft");
+        assert_eq!(horizontals.len(), 1, "dpr {dpr}: the time arrow's shaft");
+        assert_eq!((verticals[0].1, horizontals[0].1), (width, width));
+        // Each cap's apex sits on its shaft's pixel center.
+        let (x, w) = verticals[0];
+        let shaft_x = f64::from(x - w / 2) + f64::from(w) / 2.0;
+        let (y, w) = horizontals[0];
+        let shaft_y = f64::from(y - w / 2) + f64::from(w) / 2.0;
+        let apexes = fills(&mut chart)
+            .into_iter()
+            .filter(|(_, color)| *color == ink())
+            .map(|(outline, _)| outline[0])
+            .collect::<Vec<_>>();
+        assert_eq!(apexes.len(), 2, "dpr {dpr}");
+        assert!(
+            apexes.iter().any(|apex| (apex.0 - shaft_x).abs() < 1e-9),
+            "dpr {dpr}: the price arrow's apex is on its column {apexes:?} {shaft_x}"
+        );
+        assert!(
+            apexes.iter().any(|apex| (apex.1 - shaft_y).abs() < 1e-9),
+            "dpr {dpr}: the time arrow's apex is on its row {apexes:?} {shaft_y}"
+        );
+    }
 }
 
 #[test]
@@ -1777,6 +1858,36 @@ fn anchors_px(chart: &ChartEngine, id: DrawingId) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// A grid-snapped tool's anchor after a move: on the bar slot and price tick nearest the raw
+/// point, never further than half a slot or half a tick (0.01 on this scale) from it.
+fn assert_snapped_to_the_grid(
+    chart: &ChartEngine,
+    now: DrawingPoint,
+    raw_px: (f64, f64),
+    context: &str,
+) {
+    let raw = chart
+        .drawing_from_px_for(0, crate::DrawingPriceScale::Right, raw_px.0, raw_px.1)
+        .unwrap();
+    assert_eq!(now.logical, now.logical.round(), "{context}: whole bar");
+    assert!(
+        (now.logical - raw.logical).abs() <= 0.5 + 1e-9,
+        "{context}: nearest slot ({} vs {})",
+        now.logical,
+        raw.logical
+    );
+    assert!(
+        (now.price * 100.0 - (now.price * 100.0).round()).abs() < 1e-6,
+        "{context}: price tick"
+    );
+    assert!(
+        (now.price - raw.price).abs() <= 0.005 + 1e-9,
+        "{context}: nearest tick ({} vs {})",
+        now.price,
+        raw.price
+    );
+}
+
 #[test]
 fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entries() {
     for kind in KINDS {
@@ -1787,6 +1898,10 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
         let count = kind.anchor_count();
         assert_eq!(chart.drawing_handle_count(id), Some(count), "{kind:?}");
         let start = anchors_px(&chart, id);
+        let start_points = chart.drawing(id).unwrap().points.clone();
+        // Grid-snapped tools (the measuring ranges) land on whole bars and price ticks instead
+        // of following the pointer pixel for pixel.
+        let grid = kind.spec().grid_snap;
         for handle in 0..count {
             // Pointer drag of the handle: only that anchor follows the pointer.
             let (x, y) = start[handle];
@@ -1799,47 +1914,109 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
             assert!(chart.drawing_drag_start_at(x, y));
             chart.drawing_drag_to(x + 13.0, y - 9.0, DrawingModifiers::default());
             chart.drawing_drag_end();
-            let moved = anchors_px(&chart, id);
-            for (index, (&now, &before)) in moved.iter().zip(&start).enumerate() {
-                let expected = if index == handle {
-                    (before.0 + 13.0, before.1 - 9.0)
-                } else {
-                    before
-                };
-                assert!(
-                    close(now, expected, 1e-6),
-                    "{kind:?} handle {handle} anchor {index}"
-                );
+            if grid {
+                let points = chart.drawing(id).unwrap().points.clone();
+                for (index, (now, before)) in points.iter().zip(&start_points).enumerate() {
+                    if index == handle {
+                        assert_snapped_to_the_grid(
+                            &chart,
+                            *now,
+                            (start[handle].0 + 13.0, start[handle].1 - 9.0),
+                            &format!("{kind:?} handle {handle} drag"),
+                        );
+                    } else {
+                        assert_eq!(now, before, "{kind:?} handle {handle} anchor {index}");
+                    }
+                }
+            } else {
+                let moved = anchors_px(&chart, id);
+                for (index, (&now, &before)) in moved.iter().zip(&start).enumerate() {
+                    let expected = if index == handle {
+                        (before.0 + 13.0, before.1 - 9.0)
+                    } else {
+                        before
+                    };
+                    assert!(
+                        close(now, expected, 1e-6),
+                        "{kind:?} handle {handle} anchor {index}"
+                    );
+                }
             }
             assert!(chart.undo_drawing(), "{kind:?}");
             // Keyboard nudge of the same handle.
             assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(handle)));
-            let nudged = anchor(&chart, id, handle);
-            assert!(
-                close(nudged, (start[handle].0, start[handle].1 - 10.0), 1e-6),
-                "{kind:?} nudged handle {handle}"
-            );
+            if grid {
+                let points = chart.drawing(id).unwrap().points.clone();
+                assert_snapped_to_the_grid(
+                    &chart,
+                    points[handle],
+                    (start[handle].0, start[handle].1 - 10.0),
+                    &format!("{kind:?} nudged handle {handle}"),
+                );
+                assert_eq!(points[handle].logical, start_points[handle].logical);
+            } else {
+                let nudged = anchor(&chart, id, handle);
+                assert!(
+                    close(nudged, (start[handle].0, start[handle].1 - 10.0), 1e-6),
+                    "{kind:?} nudged handle {handle}"
+                );
+            }
             assert!(chart.undo_drawing());
             assert!(close(anchor(&chart, id, handle), start[handle], 1e-6));
         }
-        // Body drag and body nudge translate every anchor rigidly.
+        // Body drag and body nudge translate every anchor rigidly (grid-snapped tools: by one
+        // shared whole-bar step, each anchor's price on its own tick).
         let (x, y) = body_point(&chart, id);
         assert!(chart.drawing_drag_start_at(x, y), "{kind:?}");
         chart.drawing_drag_to(x + 17.0, y + 11.0, DrawingModifiers::default());
         chart.drawing_drag_end();
-        for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
-            assert!(
-                close(now, (before.0 + 17.0, before.1 + 11.0), 1e-6),
-                "{kind:?} body drag"
-            );
+        if grid {
+            let points = chart.drawing(id).unwrap().points.clone();
+            let steps = points[0].logical - start_points[0].logical;
+            assert_eq!(steps, steps.round(), "{kind:?} body drag whole bars");
+            for (index, (now, before)) in points.iter().zip(&start_points).enumerate() {
+                assert_eq!(now.logical - before.logical, steps, "{kind:?} body drag");
+                let raw = chart
+                    .drawing_from_px_for(
+                        0,
+                        crate::DrawingPriceScale::Right,
+                        start[index].0 + 17.0,
+                        start[index].1 + 11.0,
+                    )
+                    .unwrap();
+                assert!(
+                    (now.price - raw.price).abs() <= 0.005 + 1e-9
+                        && (now.price * 100.0 - (now.price * 100.0).round()).abs() < 1e-6,
+                    "{kind:?} body drag price tick"
+                );
+            }
+        } else {
+            for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
+                assert!(
+                    close(now, (before.0 + 17.0, before.1 + 11.0), 1e-6),
+                    "{kind:?} body drag"
+                );
+            }
         }
         assert!(chart.undo_drawing());
         assert!(chart.nudge_selected_drawing(5.0, 0.0, None));
-        for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
-            assert!(
-                close(now, (before.0 + 5.0, before.1), 1e-6),
-                "{kind:?} body nudge"
-            );
+        if grid {
+            // A key step below one bar still moves the whole body by exactly one bar.
+            let points = chart.drawing(id).unwrap().points.clone();
+            for (now, before) in points.iter().zip(&start_points) {
+                assert_eq!(now.logical, before.logical + 1.0, "{kind:?} body nudge");
+                assert!(
+                    (now.price - before.price).abs() < 1e-9,
+                    "{kind:?} body nudge"
+                );
+            }
+        } else {
+            for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
+                assert!(
+                    close(now, (before.0 + 5.0, before.1), 1e-6),
+                    "{kind:?} body nudge"
+                );
+            }
         }
         assert!(chart.undo_drawing());
         for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
@@ -2496,7 +2673,7 @@ fn sync_revision(chart: &ChartEngine) -> u64 {
 }
 
 #[test]
-fn text_boxes_are_editable_in_place_and_nothing_else_is() {
+fn text_boxes_are_editable_in_place_as_multiline_boxes() {
     let mut chart = chart();
     for kind in KINDS {
         let id = add(&mut chart, kind, points_for(kind), "{}");
@@ -2520,10 +2697,14 @@ fn text_boxes_are_editable_in_place_and_nothing_else_is() {
             expected,
             "{kind:?}"
         );
-        assert_eq!(chart.begin_drawing_text_edit(id), expected, "{kind:?}");
-        assert_eq!(chart.end_drawing_text_edit(true), expected, "{kind:?}");
+        assert_eq!(
+            chart.begin_drawing_text_edit(id, false),
+            expected,
+            "{kind:?}"
+        );
+        assert_eq!(chart.commit_drawing_text_edit(), expected, "{kind:?}");
     }
-    // Core tools keep their own single-line editors; other core text is not edited in place.
+    // The text tool and trend labels edit through the same session, as one-line runs.
     let text = add(&mut chart, DrawingKind::Text, vec![p(12.0, 102.0)], "{}");
     let trend = add(
         &mut chart,
@@ -2537,9 +2718,10 @@ fn text_boxes_are_editable_in_place_and_nothing_else_is() {
         vec![p(10.0, 101.0), p(20.0, 105.0)],
         r#"{"text":"box"}"#,
     );
-    assert!(chart.drawing_text_editable(text) && chart.drawing_text_editable(trend));
-    assert!(!chart.drawing_text_editable(rectangle));
-    assert!(chart.drawing_text_edit_layout(text).is_none());
+    for id in [text, trend, rectangle] {
+        assert!(chart.drawing_text_editable(id));
+        assert!(!chart.drawing_text_edit_layout(id).unwrap().multiline);
+    }
     // Locked, hidden, and interval-hidden drawings never open an editor.
     let comment = add(&mut chart, DrawingKind::Comment, vec![p(15.0, 103.0)], "{}");
     for patch in [
@@ -2550,11 +2732,96 @@ fn text_boxes_are_editable_in_place_and_nothing_else_is() {
         let before = chart.drawing(comment).unwrap().clone();
         assert!(chart.drawing_apply_options(comment, patch), "{patch}");
         assert!(!chart.drawing_text_editable(comment), "{patch}");
-        assert!(!chart.begin_drawing_text_edit(comment), "{patch}");
+        assert!(!chart.begin_drawing_text_edit(comment, false), "{patch}");
         assert!(chart.undo_drawing());
         assert_eq!(chart.drawing(comment).unwrap(), &before);
     }
     assert!(chart.drawing_text_editable(comment));
+}
+
+/// Valid anchors for any catalog tool inside the fixture chart's data: pane fractions for a
+/// pane-anchored tool, otherwise the tool's minimum anchor count on a gentle zigzag.
+fn catalog_points(kind: DrawingKind) -> Vec<DrawingPoint> {
+    if kind.pane_anchored() {
+        return vec![p(0.3, 0.2)];
+    }
+    let count = kind.anchor_count();
+    (0..count)
+        .map(|index| {
+            let step = index as f64;
+            p(
+                8.0 + step * 12.0 / count.max(2) as f64,
+                if index % 2 == 0 {
+                    101.5 + step * 0.2
+                } else {
+                    105.0 - step * 0.2
+                },
+            )
+        })
+        .collect()
+}
+
+/// The tools whose drawing paints no text of its own, by design: their `text` is accepted but
+/// never painted, so there is nothing to edit in place.
+const TEXTLESS: [DrawingKind; 8] = [
+    DrawingKind::Forecast,
+    DrawingKind::BarsPattern,
+    DrawingKind::PriceRange,
+    DrawingKind::DateRange,
+    DrawingKind::DateAndPriceRange,
+    DrawingKind::Projection,
+    DrawingKind::FlagMark,
+    DrawingKind::Icon,
+];
+
+#[test]
+fn every_tool_is_text_editable_exactly_when_it_paints_its_text() {
+    let mut chart = chart();
+    let mut editable_tools = 0;
+    for spec in crate::drawings::DRAWING_TOOL_SPECS {
+        let kind = spec.kind;
+        let id = add(&mut chart, kind, catalog_points(kind), r#"{"text":"t"}"#);
+        let expected = !TEXTLESS.contains(&kind);
+        editable_tools += usize::from(expected);
+        assert_eq!(chart.drawing_text_editable(id), expected, "{kind:?}");
+        let layout = chart.drawing_text_edit_layout(id);
+        assert_eq!(layout.is_some(), expected, "{kind:?}");
+        if let Some(layout) = layout {
+            // Family boxes take several lines; every other drawing edits one rotated or level
+            // run, which the engine keeps on one line.
+            assert_eq!(
+                layout.multiline,
+                spec.family.is_some_and(|family| family.owns_text),
+                "{kind:?}"
+            );
+            assert!(layout.x.is_finite() && layout.y.is_finite() && layout.angle.is_finite());
+            assert!(layout.size > 0.0 && layout.line_height > layout.size);
+        }
+        assert_eq!(
+            chart.begin_drawing_text_edit(id, false),
+            expected,
+            "{kind:?}"
+        );
+        assert_eq!(chart.editing_drawing().is_some(), expected, "{kind:?}");
+        assert_eq!(chart.commit_drawing_text_edit(), expected, "{kind:?}");
+        // Locked, hidden, and interval-hidden drawings never open an editor.
+        for patch in [
+            r#"{"locked":true}"#,
+            r#"{"visible":false}"#,
+            r#"{"interval_visibility":{"enabled":true,"intervals":[]}}"#,
+        ] {
+            assert!(chart.drawing_apply_options(id, patch), "{kind:?} {patch}");
+            assert!(!chart.drawing_text_editable(id), "{kind:?} {patch}");
+            assert!(
+                !chart.begin_drawing_text_edit(id, false),
+                "{kind:?} {patch}"
+            );
+            assert!(chart.undo_drawing());
+        }
+        assert_eq!(chart.drawing_text_editable(id), expected, "{kind:?}");
+    }
+    assert_eq!(crate::drawings::DRAWING_TOOL_SPECS.len(), 84);
+    assert_eq!(editable_tools, 76);
 }
 
 #[test]
@@ -2611,6 +2878,173 @@ fn the_edit_layout_is_the_painted_text_box() {
     );
 }
 
+/// One painted generic text run: `(x, y, clockwise angle, align, size, weight, italic, color)`.
+type PaintedRun = (f64, f64, f64, TextAlign, f64, u16, bool, Color);
+
+/// The painted run of `text` in the first pane, whether it lowers to `Text` or `RotatedText`.
+fn painted_run(chart: &mut ChartEngine, wanted: &str) -> PaintedRun {
+    let frame = chart.build_frame();
+    frame.panes[0]
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Text {
+                text,
+                x,
+                y,
+                color,
+                size,
+                align,
+                weight,
+                italic,
+                ..
+            } if text == wanted => Some((
+                f64::from(*x),
+                f64::from(*y),
+                0.0,
+                *align,
+                f64::from(*size),
+                *weight,
+                *italic,
+                *color,
+            )),
+            Prim::RotatedText {
+                text,
+                x,
+                y,
+                color,
+                size,
+                align,
+                weight,
+                italic,
+                angle,
+                ..
+            } if text == wanted => Some((
+                f64::from(*x),
+                f64::from(*y),
+                f64::from(*angle),
+                *align,
+                f64::from(*size),
+                *weight,
+                *italic,
+                *color,
+            )),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{wanted:?} is painted"))
+}
+
+/// Where a run painted at anchor `(x, y)` with `align` and clockwise `angle` starts (its left
+/// edge, vertically centered), for the advance `width`.
+fn run_start(run: &PaintedRun, width: f64) -> (f64, f64) {
+    let (x, y, angle, align, ..) = *run;
+    let left = match align {
+        TextAlign::Left => 0.0,
+        TextAlign::Center => -width / 2.0,
+        TextAlign::Right => -width,
+    };
+    (x + angle.cos() * left, y + angle.sin() * left)
+}
+
+#[test]
+fn the_run_edit_layout_is_where_the_frame_paints_the_generic_label() {
+    // The frame places runs in bitmap px, the layout in media px: they agree at any pixel ratio.
+    for dpr in [1.0, 2.0] {
+        let mut chart = chart_with(&hourly(40), dpr);
+        let cases = [
+            // A ray's label follows its stroke: rotated, top-right slot, stroke-colored.
+            (
+                DrawingKind::Ray,
+                r##"{"text":"ray text","color":"#123456","text_size":18,"text_weight":700,"text_italic":true}"##,
+                "ray text",
+            ),
+            // A rectangle's label is level and centered in its box; a circle's in its shape box.
+            (DrawingKind::Rectangle, r#"{"text":"box text"}"#, "box text"),
+            (
+                DrawingKind::Circle,
+                r#"{"text":"circle text"}"#,
+                "circle text",
+            ),
+        ];
+        for (kind, options, wanted) in cases {
+            let id = add(&mut chart, kind, points_for(kind), options);
+            let layout = chart.drawing_text_edit_layout(id).unwrap();
+            let mut painted = painted_run(&mut chart, wanted);
+            let (.., weight, italic, color) = painted;
+            // Bitmap px to media px.
+            painted.0 /= dpr;
+            painted.1 /= dpr;
+            painted.4 /= dpr;
+            let size = painted.4;
+            let width = wanted.chars().count() as f64 * size * 0.6;
+            let (x, y) = run_start(&painted, width);
+            let label = format!("{kind:?} at {dpr}x");
+            assert!((layout.x - x).abs() < 1e-3, "{label} x {} vs {x}", layout.x);
+            assert!((layout.y - y).abs() < 1e-3, "{label} y {} vs {y}", layout.y);
+            assert!((layout.angle - painted.2).abs() < 1e-6, "{label}");
+            assert!((layout.size - size).abs() < 1e-9, "{label}");
+            assert_eq!((layout.weight, layout.italic), (weight, italic), "{label}");
+            assert_eq!(layout.color, color.to_css(), "{label}");
+            assert_eq!(
+                layout.color,
+                chart
+                    .drawing_label_color(chart.drawing(id).unwrap())
+                    .to_css()
+            );
+            assert!(!layout.multiline);
+            assert!((layout.line_height - size * 1.2).abs() < 1e-9);
+            // The engine's caret transform and the layout agree on the run.
+            let (tx, ty, angle) = chart.drawing_text_transform(id).unwrap();
+            assert!((tx - painted.0).abs() < 1e-3 && (ty - painted.1).abs() < 1e-3);
+            assert!((angle - painted.2).abs() < 1e-6);
+            // The rect bounds the padded run box, whose center is the label's center.
+            let [left, top, right, bottom] = layout.rect;
+            let center = (x + angle.cos() * width / 2.0, y + angle.sin() * width / 2.0);
+            assert!(
+                ((left + right) / 2.0 - center.0).abs() < 1e-3
+                    && ((top + bottom) / 2.0 - center.1).abs() < 1e-3,
+                "{label}"
+            );
+            assert!(right - left >= width && bottom - top >= size, "{label}");
+            if kind == DrawingKind::Ray {
+                assert_eq!(
+                    layout.color,
+                    ink().to_css(),
+                    "a segment label follows the stroke"
+                );
+                assert!(angle.abs() > 0.1, "the ray label is rotated");
+            }
+            // The wasm host reads the layout as JSON: the new fields ride along.
+            let json = serde_json::to_value(&layout).unwrap();
+            assert_eq!(json["angle"], layout.angle, "{label}");
+            assert_eq!(json["multiline"], false, "{label}");
+            chart.remove_drawing(id);
+        }
+    }
+}
+
+#[test]
+fn an_empty_run_label_keeps_a_one_em_caret_slot_while_edited() {
+    let mut chart = chart();
+    let ray = add(
+        &mut chart,
+        DrawingKind::Ray,
+        points_for(DrawingKind::Ray),
+        r#"{"text_h_align":"right","text_v_align":"top"}"#,
+    );
+    let anchor = chart.drawing_text_transform(ray).unwrap();
+    let layout = chart.drawing_text_edit_layout(ray).unwrap();
+    let em = layout.size;
+    // A right-aligned empty run opens one em to the left of its aligned anchor, along the stroke.
+    assert!((layout.x - (anchor.0 - anchor.2.cos() * em)).abs() < 1e-3);
+    assert!((layout.y - (anchor.1 - anchor.2.sin() * em)).abs() < 1e-3);
+    assert!(chart.begin_drawing_text_edit(ray, false));
+    assert!(chart.set_drawing_text_edit("wider than one em", usize::MAX));
+    let typed = chart.drawing_text_edit_layout(ray).unwrap();
+    let width = "wider than one em".chars().count() as f64 * em * 0.6;
+    assert!((typed.x - (anchor.0 - anchor.2.cos() * width)).abs() < 1e-3);
+}
+
 #[test]
 fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
     let mut chart = chart();
@@ -2619,12 +3053,12 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
     let revision = sync_revision(&chart);
 
     // Live text repaints and relays out, but records nothing until the session ends.
-    assert!(!chart.set_drawing_edit_text("orphan"), "no session open");
-    assert!(chart.begin_drawing_text_edit(comment));
+    assert!(!chart.set_drawing_text_edit("orphan", 0), "no session open");
+    assert!(chart.begin_drawing_text_edit(comment, false));
     assert_eq!(chart.editing_drawing(), Some(comment));
     let one_line = chart.drawing_text_edit_layout(comment).unwrap();
     for text in ["A", "AB", "AB\nC"] {
-        assert!(chart.set_drawing_edit_text(text));
+        assert!(chart.set_drawing_text_edit(text, usize::MAX));
     }
     assert!(texts_of(&mut chart).contains(&"C".to_string()));
     let two_lines = chart.drawing_text_edit_layout(comment).unwrap();
@@ -2633,9 +3067,9 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
         "the bottom-aligned bubble grows upward, so the first line moves up"
     );
     assert_eq!(sync_revision(&chart), revision);
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     assert_eq!(chart.editing_drawing(), None);
-    assert!(!chart.end_drawing_text_edit(true), "already closed");
+    assert!(!chart.commit_drawing_text_edit(), "already closed");
     assert_eq!(chart.drawing(comment).unwrap().text, "AB\nC");
     assert_eq!(sync_revision(&chart), revision + 1);
 
@@ -2647,9 +3081,9 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
 
     // Cancel restores the text it began from without a history entry.
     let committed = chart.drawing(comment).unwrap().clone();
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.set_drawing_edit_text("discarded"));
-    assert!(chart.end_drawing_text_edit(false));
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.set_drawing_text_edit("discarded", usize::MAX));
+    assert!(chart.cancel_drawing_text_edit());
     assert_eq!(chart.drawing(comment).unwrap(), &committed);
     assert!(chart.undo_drawing());
     assert_eq!(
@@ -2660,10 +3094,10 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
     assert!(chart.redo_drawing());
 
     // An unchanged session records nothing; undo during a session commits it first.
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.end_drawing_text_edit(true));
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.set_drawing_edit_text("typed"));
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.commit_drawing_text_edit());
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.set_drawing_text_edit("typed", usize::MAX));
     assert!(chart.undo_drawing());
     assert_eq!(chart.editing_drawing(), None);
     assert_eq!(chart.drawing(comment).unwrap().text, "AB\nC");
@@ -2681,7 +3115,7 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
     );
     assert_eq!(mirror.drawings()[0].text, "typed");
     let mirrored = mirror.drawings()[0].id;
-    assert!(mirror.begin_drawing_text_edit(mirrored));
+    assert!(mirror.begin_drawing_text_edit(mirrored, false));
     assert!(chart.drawing_apply_options(comment, r#"{"text":"synced"}"#));
     assert!(
         mirror.apply_drawing_sync_payload_json(&chart.drawing_sync_payload_json("cell-b").unwrap())
@@ -2691,7 +3125,7 @@ fn an_edit_session_is_one_undo_step_and_one_sync_revision() {
         None,
         "a sync payload ends the session"
     );
-    assert!(chart.begin_drawing_text_edit(comment));
+    assert!(chart.begin_drawing_text_edit(comment, false));
     assert!(chart.remove_drawing(comment));
     assert_eq!(chart.editing_drawing(), None, "removal ends the session");
 }
@@ -2709,13 +3143,13 @@ fn an_emptied_text_box_keeps_its_caret_line_while_edited() {
             .count()
     };
     let resting = boxes(&mut chart);
-    assert!(chart.begin_drawing_text_edit(comment));
-    assert!(chart.set_drawing_edit_text(""));
+    assert!(chart.begin_drawing_text_edit(comment, false));
+    assert!(chart.set_drawing_text_edit("", usize::MAX));
     assert_eq!(boxes(&mut chart), resting, "the caret line keeps the box");
     let layout = chart.drawing_text_edit_layout(comment).unwrap();
     let [left, _, right, _] = layout.rect;
     assert!(right - left > 0.0);
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
     assert_eq!(
         boxes(&mut chart),
         resting - 1,
@@ -2737,19 +3171,19 @@ fn an_emptied_text_box_keeps_its_caret_line_while_edited() {
         vec![p(10.0, 101.0), p(20.0, 105.0)],
         "{}",
     );
-    assert!(chart.begin_drawing_text_edit(price_note));
+    assert!(chart.begin_drawing_text_edit(price_note, false));
     let layout = chart.drawing_text_edit_layout(price_note).unwrap();
     let runs = text_runs(&mut chart);
     let (_, _, price_y, _) = runs.iter().find(|(text, ..)| text == "101.00").unwrap();
     assert!((layout.y - price_y - layout.line_height).abs() < 1e-3);
-    assert!(chart.end_drawing_text_edit(true));
+    assert!(chart.commit_drawing_text_edit());
 
     // A note hidden until focus reveals its text box while it is edited.
     let note = add(&mut chart, DrawingKind::Note, vec![p(25.0, 104.0)], "{}");
     assert!(!texts_of(&mut chart).contains(&"Note".to_string()));
-    assert!(chart.begin_drawing_text_edit(note));
+    assert!(chart.begin_drawing_text_edit(note, false));
     assert!(texts_of(&mut chart).contains(&"Note".to_string()));
-    assert!(chart.end_drawing_text_edit(false));
+    assert!(chart.cancel_drawing_text_edit());
     assert!(!texts_of(&mut chart).contains(&"Note".to_string()));
 }
 

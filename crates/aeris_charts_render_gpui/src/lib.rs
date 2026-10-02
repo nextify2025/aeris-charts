@@ -61,6 +61,8 @@ pub mod text;
 
 #[cfg(feature = "gpui-backend")]
 pub mod backend;
+#[cfg(feature = "gpui-backend")]
+pub mod input;
 
 use aeris_charts_engine::{ChartEngine, ChartFrame};
 use aeris_charts_render::color::Color;

@@ -192,8 +192,7 @@ fixture and reports primitive/text counts plus p50/p95/p99 scene-lowering cost. 
 stops at GPUI scene construction, while native `perf_gate` Target J covers WebGPU CPU-side
 frame encoding and verifies every resolved dense text run is scheduled. Neither benchmark covers
 native window shaping or actual GPU present time; `gpui_probe` now accepts
-`AERIS_CHARTS_PROBE_FEATURE=footprint` for that real-window capture and reports the shaped-run
-cache. The screenshot and accessibility milestone is recorded in `docs/Footprint.md`. The
+`AERIS_CHARTS_PROBE_FEATURE=footprint` for that real-window capture (it prints no frame data). The screenshot and accessibility milestone is recorded in `docs/Footprint.md`. The
 screenshot harness accepts
 `AERIS_CHARTS_GPUI_FEATURE=footprint` and emits a DPR-aware PNG plus metadata for the dense
 12-bar fixture; the capture has been exercised on the current Windows display after fixing the
@@ -1023,7 +1022,7 @@ volume-based tools, which are delivered in B7.
 | Patterns | XABCD, cypher, ABCD, head and shoulders, triangle pattern, three drives |
 | Elliott waves | Impulse (12345), correction (ABC), triangle (ABCDE), double and triple combination, with degree labels |
 | Cycles | Cyclic lines, time cycles, sine line |
-| Projection and measuring | Long position ✓, short position ✓, forecast, bars pattern (ghost copy), price range, date range, date and price range, projection |
+| Projection and measuring | Long position ✓, short position ✓, forecast, bars pattern (ghost copy), price range ✓, date range ✓, date and price range ✓ (plus the Shift-click quick measure), projection |
 | Volume-based | Fixed-range volume profile (OF4), anchored volume profile (OF5), anchored VWAP (OF10) |
 | Shapes | Rectangle ✓, rotated rectangle, ellipse, circle, triangle, arc, curve, double curve, polyline, path ✓, brush ✓, highlighter |
 | Annotations | Text ✓, anchored text (screen-anchored), note, price note, callout, comment, price label, signpost, flag mark, arrow markers (up/down/left/right), icon/emoji stamp from a host-provided bounded image set |

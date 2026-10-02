@@ -7,6 +7,7 @@ use aeris_charts_core::scale::general_scale::{
 };
 use aeris_charts_core::scale::time_tick_marks::{civil_from_timestamp, days_from_civil};
 use aeris_charts_core::style::DEFAULT_BORDER_RGB;
+use aeris_charts_core::time_zone::ChartTimeZone;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim};
 
@@ -494,7 +495,9 @@ impl ChartEngine {
             let widest_tick = effective_domains
                 .iter()
                 .find(|(handle, _)| *handle == axis.handle)
-                .map(|(_, domain)| tick_labels_for_domain(axis, domain, month_names))
+                .map(|(_, domain)| {
+                    tick_labels_for_domain(axis, domain, month_names, self.time_zone)
+                })
                 .unwrap_or_default()
                 .into_iter()
                 .map(|label| measure(&label, false))
@@ -642,8 +645,15 @@ impl ChartEngine {
                     AxisDimension::Angle | AxisDimension::Radius => false,
                 }
             {
-                for tick in axis_ticks(axis, &domain, range.0, range.1, metrics, &self.month_names)
-                {
+                for tick in axis_ticks(
+                    axis,
+                    &domain,
+                    range.0,
+                    range.1,
+                    metrics,
+                    &self.month_names,
+                    self.time_zone,
+                ) {
                     match axis.dimension {
                         AxisDimension::X => {
                             let coordinate = (tick.coordinate * hpr).round() as i32;
@@ -888,7 +898,15 @@ impl ChartEngine {
                 let Some(domain) = self.effective_general_axis_domain(axis) else {
                     continue;
                 };
-                let ticks = axis_ticks(axis, &domain, range.0, range.1, metrics, &self.month_names);
+                let ticks = axis_ticks(
+                    axis,
+                    &domain,
+                    range.0,
+                    range.1,
+                    metrics,
+                    &self.month_names,
+                    self.time_zone,
+                );
                 let ticks =
                     collision_filtered_ticks(axis, ticks, measure, metrics, range.0, range.1);
                 for tick in ticks {
@@ -1162,166 +1180,17 @@ impl ChartEngine {
                     let Some(dataset) = self.general_dataset(series.dataset()) else {
                         continue;
                     };
-                    if axis.dimension == AxisDimension::Y {
-                        if series.kind() == crate::GeneralSeriesKind::HeatmapGrid {
-                            if let Some(values) = dataset.heatmap_y_numeric() {
-                                for &value in values {
-                                    if axis.scale == GeneralScaleType::Logarithmic && value <= 0.0 {
-                                        continue;
-                                    }
-                                    extend_numeric_bounds(&mut bounds, value);
-                                }
-                                continue;
-                            }
-                        }
-                        if series.kind() == crate::GeneralSeriesKind::Column {
-                            include_zero = true;
-                            continue;
-                        }
-                        if series.kind() == crate::GeneralSeriesKind::XyArea
-                            && series.stack_id().is_some()
-                        {
-                            include_zero = true;
-                            continue;
-                        }
-                        if matches!(
-                            series.kind(),
-                            crate::GeneralSeriesKind::RangeArea
-                                | crate::GeneralSeriesKind::RangeBar
-                        ) {
-                            let Some(low_values) = dataset.low() else {
-                                continue;
-                            };
-                            for (index, &high) in dataset.y().iter().enumerate() {
-                                let low = low_values[index];
-                                if !dataset.y_is_valid(index)
-                                    || !dataset.low_is_valid(index)
-                                    || (axis.scale == GeneralScaleType::Logarithmic
-                                        && (low <= 0.0 || high <= 0.0))
-                                {
-                                    continue;
-                                }
-                                extend_numeric_bounds(&mut bounds, low);
-                                extend_numeric_bounds(&mut bounds, high);
-                            }
-                            continue;
-                        }
-                        if series.kind() == crate::GeneralSeriesKind::BoxPlot {
-                            let (
-                                Some(min_values),
-                                Some(max_values),
-                                Some(q1_values),
-                                Some(q3_values),
-                            ) = (
-                                dataset.low(),
-                                dataset.high(),
-                                dataset.x_low(),
-                                dataset.x_high(),
-                            )
-                            else {
-                                continue;
-                            };
-                            for (index, &median) in dataset.y().iter().enumerate() {
-                                if !dataset.y_is_valid(index)
-                                    || !dataset.low_is_valid(index)
-                                    || !dataset.high_is_valid(index)
-                                    || !dataset.x_low_is_valid(index)
-                                    || !dataset.x_high_is_valid(index)
-                                {
-                                    continue;
-                                }
-                                let values = [
-                                    min_values[index],
-                                    q1_values[index],
-                                    median,
-                                    q3_values[index],
-                                    max_values[index],
-                                ];
-                                if axis.scale == GeneralScaleType::Logarithmic
-                                    && values.iter().any(|value| *value <= 0.0)
-                                {
-                                    continue;
-                                }
-                                extend_numeric_bounds(&mut bounds, min_values[index]);
-                                extend_numeric_bounds(&mut bounds, max_values[index]);
-                            }
-                            continue;
-                        }
-                        if series.kind() == crate::GeneralSeriesKind::ErrorBar {
-                            let (Some(low_values), Some(high_values)) =
-                                (dataset.low(), dataset.high())
-                            else {
-                                continue;
-                            };
-                            for (index, &value) in dataset.y().iter().enumerate() {
-                                if !dataset.y_is_valid(index)
-                                    || (axis.scale == GeneralScaleType::Logarithmic && value <= 0.0)
-                                {
-                                    continue;
-                                }
-                                extend_numeric_bounds(&mut bounds, value);
-                                if dataset.low_is_valid(index) {
-                                    let low = low_values[index];
-                                    if axis.scale != GeneralScaleType::Logarithmic || low > 0.0 {
-                                        extend_numeric_bounds(&mut bounds, low);
-                                    }
-                                }
-                                if dataset.high_is_valid(index) {
-                                    let high = high_values[index];
-                                    if axis.scale != GeneralScaleType::Logarithmic || high > 0.0 {
-                                        extend_numeric_bounds(&mut bounds, high);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        for (index, &value) in dataset.y().iter().enumerate() {
-                            if !dataset.y_is_valid(index)
-                                || (axis.scale == GeneralScaleType::Logarithmic && value <= 0.0)
-                            {
-                                continue;
-                            }
-                            extend_numeric_bounds(&mut bounds, value);
-                        }
-                    } else if series.kind() == crate::GeneralSeriesKind::HorizontalBar {
-                        include_zero = true;
-                        if series.stack_id().is_some() {
-                            continue;
-                        }
-                        for (index, &value) in dataset.y().iter().enumerate() {
-                            if dataset.y_is_valid(index) {
-                                extend_numeric_bounds(&mut bounds, value);
-                            }
-                        }
-                    } else if let Some(values) = dataset.numeric_x() {
-                        for (index, &value) in values.iter().enumerate() {
-                            if axis.scale == GeneralScaleType::Logarithmic && value <= 0.0 {
-                                continue;
-                            }
-                            extend_numeric_bounds(&mut bounds, value);
-                            if series.kind() == crate::GeneralSeriesKind::ErrorBar
-                                && dataset.y_is_valid(index)
-                            {
-                                if let Some(low_values) = dataset.x_low() {
-                                    if dataset.x_low_is_valid(index) {
-                                        let low = low_values[index];
-                                        if axis.scale != GeneralScaleType::Logarithmic || low > 0.0
-                                        {
-                                            extend_numeric_bounds(&mut bounds, low);
-                                        }
-                                    }
-                                }
-                                if let Some(high_values) = dataset.x_high() {
-                                    if dataset.x_high_is_valid(index) {
-                                        let high = high_values[index];
-                                        if axis.scale != GeneralScaleType::Logarithmic || high > 0.0
-                                        {
-                                            extend_numeric_bounds(&mut bounds, high);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    let (series_bounds, series_zero) = self.cached_general_series_axis_scan(
+                        series,
+                        dataset,
+                        axis.dimension,
+                        axis.scale,
+                        || scan_general_series_numeric_bounds(axis, series, dataset),
+                    );
+                    include_zero |= series_zero;
+                    if let Some((low, high)) = series_bounds {
+                        extend_numeric_bounds(&mut bounds, low);
+                        extend_numeric_bounds(&mut bounds, high);
                     }
                 }
                 for reference in self.general_reference_iter().filter(|reference| {
@@ -1705,6 +1574,7 @@ fn tick_labels_for_domain(
     axis: &GeneralAxis,
     domain: &GeneralAxisDomain,
     month_names: &MonthNames,
+    time_zone: ChartTimeZone,
 ) -> Vec<String> {
     match (&axis.scale, domain) {
         (
@@ -1737,6 +1607,7 @@ fn tick_labels_for_domain(
             *domain,
             axis.tick_count.unwrap_or(6) as usize,
             month_names,
+            time_zone,
         )
         .into_iter()
         .map(|(_, label)| label)
@@ -1752,6 +1623,7 @@ fn axis_ticks(
     range_to: f64,
     metrics: AxisMetrics,
     month_names: &MonthNames,
+    time_zone: ChartTimeZone,
 ) -> Vec<AxisTickLayout> {
     match (&axis.scale, domain) {
         (
@@ -1804,7 +1676,7 @@ fn axis_ticks(
                 },
                 usize::from,
             );
-            temporal_tick_entries(axis, *domain, target, month_names)
+            temporal_tick_entries(axis, *domain, target, month_names, time_zone)
                 .into_iter()
                 .filter_map(|(value, label)| {
                     scale
@@ -1894,6 +1766,7 @@ fn temporal_tick_entries(
     domain: [i64; 2],
     target: usize,
     month_names: &MonthNames,
+    time_zone: ChartTimeZone,
 ) -> Vec<(i64, String)> {
     let interval = temporal_tick_interval(domain, target);
     if let Some(ticks) = axis.ticks.as_ref() {
@@ -1905,18 +1778,23 @@ fn temporal_tick_entries(
                 {
                     Some((
                         *value,
-                        label
-                            .clone()
-                            .unwrap_or_else(|| format_temporal_tick(*value, interval, month_names)),
+                        label.clone().unwrap_or_else(|| {
+                            format_temporal_tick(*value, interval, month_names, time_zone)
+                        }),
                     ))
                 }
                 _ => None,
             })
             .collect();
     }
-    temporal_tick_values(domain, interval)
+    temporal_tick_values(domain, interval, time_zone)
         .into_iter()
-        .map(|value| (value, format_temporal_tick(value, interval, month_names)))
+        .map(|value| {
+            (
+                value,
+                format_temporal_tick(value, interval, month_names, time_zone),
+            )
+        })
         .collect()
 }
 
@@ -2018,36 +1896,58 @@ fn temporal_tick_interval(domain: [i64; 2], target: usize) -> TemporalTickInterv
     TemporalTickInterval::Years(desired_years)
 }
 
-fn temporal_tick_values(domain: [i64; 2], interval: TemporalTickInterval) -> Vec<i64> {
+fn temporal_tick_values(
+    domain: [i64; 2],
+    interval: TemporalTickInterval,
+    time_zone: ChartTimeZone,
+) -> Vec<i64> {
     const DAY: i64 = 86_400_000;
     let mut values = Vec::new();
-    let mut push_until_end = |mut value: i64, step: i64| {
-        while value <= domain[1] && values.len() < usize::from(MAX_GENERAL_AXIS_TICKS) {
-            if value >= domain[0] {
-                values.push(value);
-            }
-            let Some(next) = value.checked_add(step) else {
-                break;
-            };
-            value = next;
-        }
-    };
 
     match interval {
         TemporalTickInterval::Fixed(step) => {
-            let first = domain[0].div_euclid(step).checked_mul(step);
-            if let Some(first) = first.and_then(|value| {
-                if value < domain[0] {
-                    value.checked_add(step)
-                } else {
-                    Some(value)
+            let start_seconds = domain[0].div_euclid(1_000);
+            let start_millis = domain[0].rem_euclid(1_000);
+            let local_start = time_zone
+                .local_epoch_seconds(start_seconds)
+                .checked_mul(1_000)
+                .and_then(|value| value.checked_add(start_millis));
+            let first = local_start
+                .and_then(|value| value.div_euclid(step).checked_mul(step))
+                .and_then(|value| {
+                    if value < local_start? {
+                        value.checked_add(step)
+                    } else {
+                        Some(value)
+                    }
+                });
+            if let Some(mut local_value) = first {
+                while values.len() < usize::from(MAX_GENERAL_AXIS_TICKS) {
+                    if let Some(value) = time_zone.utc_millis_from_local_epoch_millis(local_value) {
+                        if value > domain[1] {
+                            break;
+                        }
+                        if value >= domain[0] && values.last().copied() != Some(value) {
+                            values.push(value);
+                        }
+                    }
+                    let Some(next) = local_value.checked_add(step) else {
+                        break;
+                    };
+                    local_value = next;
                 }
-            }) {
-                push_until_end(first, step);
             }
         }
         TemporalTickInterval::Months(step) => {
-            let (year, month, _) = civil_from_timestamp(domain[0].div_euclid(1_000));
+            let seconds = domain[0].div_euclid(1_000);
+            let (year, month, _) = if time_zone == ChartTimeZone::default() {
+                civil_from_timestamp(seconds)
+            } else {
+                let Some(parts) = time_zone.local_parts(seconds) else {
+                    return values;
+                };
+                (i64::from(parts.year), parts.month, parts.day)
+            };
             let Some(total_month) = year
                 .checked_mul(12)
                 .and_then(|value| value.checked_add(i64::from(month) - 1))
@@ -2056,12 +1956,14 @@ fn temporal_tick_values(domain: [i64; 2], interval: TemporalTickInterval) -> Vec
             };
             let aligned = total_month.div_euclid(step).saturating_mul(step);
             let mut current_month = aligned;
-            if calendar_month_milliseconds(current_month).is_none_or(|value| value < domain[0]) {
+            if calendar_month_milliseconds(current_month, time_zone)
+                .is_none_or(|value| value < domain[0])
+            {
                 current_month = current_month.saturating_add(step);
             }
-            if calendar_month_milliseconds(current_month).is_some() {
+            if calendar_month_milliseconds(current_month, time_zone).is_some() {
                 while values.len() < usize::from(MAX_GENERAL_AXIS_TICKS) {
-                    let Some(value) = calendar_month_milliseconds(current_month) else {
+                    let Some(value) = calendar_month_milliseconds(current_month, time_zone) else {
                         break;
                     };
                     if value > domain[1] {
@@ -2076,16 +1978,26 @@ fn temporal_tick_values(domain: [i64; 2], interval: TemporalTickInterval) -> Vec
             }
         }
         TemporalTickInterval::Years(step) => {
-            let (year, _, _) = civil_from_timestamp(domain[0].div_euclid(1_000));
+            let seconds = domain[0].div_euclid(1_000);
+            let year = if time_zone == ChartTimeZone::default() {
+                civil_from_timestamp(seconds).0
+            } else {
+                let Some(parts) = time_zone.local_parts(seconds) else {
+                    return values;
+                };
+                i64::from(parts.year)
+            };
             let aligned = year.div_euclid(step).saturating_mul(step);
             let first_year = days_from_civil(aligned, 1, 1)
                 .and_then(|days| days.checked_mul(DAY))
+                .and_then(|local| time_zone.utc_millis_from_local_epoch_millis(local))
                 .filter(|value| *value >= domain[0])
                 .map_or_else(|| aligned.saturating_add(step), |_| aligned);
             let mut current_year = first_year;
             while values.len() < usize::from(MAX_GENERAL_AXIS_TICKS) {
-                let Some(value) =
-                    days_from_civil(current_year, 1, 1).and_then(|days| days.checked_mul(DAY))
+                let Some(value) = days_from_civil(current_year, 1, 1)
+                    .and_then(|days| days.checked_mul(DAY))
+                    .and_then(|local| time_zone.utc_millis_from_local_epoch_millis(local))
                 else {
                     break;
                 };
@@ -2103,23 +2015,45 @@ fn temporal_tick_values(domain: [i64; 2], interval: TemporalTickInterval) -> Vec
     values
 }
 
-fn calendar_month_milliseconds(total_month: i64) -> Option<i64> {
+fn calendar_month_milliseconds(total_month: i64, time_zone: ChartTimeZone) -> Option<i64> {
     let year = total_month.div_euclid(12);
     let month = u32::try_from(total_month.rem_euclid(12) + 1).ok()?;
-    days_from_civil(year, month, 1)?.checked_mul(86_400_000)
+    let local = days_from_civil(year, month, 1)?.checked_mul(86_400_000)?;
+    time_zone.utc_millis_from_local_epoch_millis(local)
 }
 
 fn format_temporal_tick(
     epoch_ms: i64,
     interval: TemporalTickInterval,
     month_names: &MonthNames,
+    time_zone: ChartTimeZone,
 ) -> String {
     let seconds = epoch_ms.div_euclid(1_000);
-    let (year, month, day) = civil_from_timestamp(seconds);
-    let seconds_of_day = seconds.rem_euclid(86_400);
-    let hour = seconds_of_day / 3_600;
-    let minute = seconds_of_day.rem_euclid(3_600) / 60;
-    let second = seconds_of_day.rem_euclid(60);
+    let (year, month, day, hour, minute, second) = if time_zone == ChartTimeZone::default() {
+        let (year, month, day) = civil_from_timestamp(seconds);
+        let seconds_of_day = seconds.rem_euclid(86_400);
+        (
+            year,
+            month,
+            day,
+            seconds_of_day / 3_600,
+            seconds_of_day.rem_euclid(3_600) / 60,
+            seconds_of_day.rem_euclid(60),
+        )
+    } else {
+        let Some(parts) = time_zone.local_parts(seconds) else {
+            return String::new();
+        };
+        (
+            i64::from(parts.year),
+            parts.month,
+            parts.day,
+            i64::from(parts.hour),
+            i64::from(parts.minute),
+            i64::from(parts.second),
+        )
+    };
+    let seconds_of_day = hour * 3_600 + minute * 60 + second;
     let month_name = &month_names.short[(month - 1) as usize];
     match interval {
         TemporalTickInterval::Fixed(step) if step < 1_000 => {
@@ -2140,6 +2074,164 @@ fn format_temporal_tick(
         TemporalTickInterval::Months(_) => format!("{month_name} {year}"),
         TemporalTickInterval::Years(_) => year.to_string(),
     }
+}
+
+/// One series' contribution to an automatic numeric axis domain: its data bounds and whether the
+/// series anchors the domain at zero. This is the O(rows) part of auto-domain resolution, so
+/// callers memoize it per dataset generation.
+fn scan_general_series_numeric_bounds(
+    axis: &GeneralAxis,
+    series: &crate::GeneralSeries,
+    dataset: &crate::general_data::GeneralDataset,
+) -> (Option<(f64, f64)>, bool) {
+    let mut bounds: Option<(f64, f64)> = None;
+    let mut include_zero = false;
+    if axis.dimension == AxisDimension::Y {
+        if series.kind() == crate::GeneralSeriesKind::HeatmapGrid {
+            if let Some(values) = dataset.heatmap_y_numeric() {
+                for &value in values {
+                    if axis.scale == GeneralScaleType::Logarithmic && value <= 0.0 {
+                        continue;
+                    }
+                    extend_numeric_bounds(&mut bounds, value);
+                }
+                return (bounds, include_zero);
+            }
+        }
+        if series.kind() == crate::GeneralSeriesKind::Column {
+            include_zero = true;
+            return (bounds, include_zero);
+        }
+        if series.kind() == crate::GeneralSeriesKind::XyArea && series.stack_id().is_some() {
+            include_zero = true;
+            return (bounds, include_zero);
+        }
+        if matches!(
+            series.kind(),
+            crate::GeneralSeriesKind::RangeArea | crate::GeneralSeriesKind::RangeBar
+        ) {
+            let Some(low_values) = dataset.low() else {
+                return (bounds, include_zero);
+            };
+            for (index, &high) in dataset.y().iter().enumerate() {
+                let low = low_values[index];
+                if !dataset.y_is_valid(index)
+                    || !dataset.low_is_valid(index)
+                    || (axis.scale == GeneralScaleType::Logarithmic && (low <= 0.0 || high <= 0.0))
+                {
+                    continue;
+                }
+                extend_numeric_bounds(&mut bounds, low);
+                extend_numeric_bounds(&mut bounds, high);
+            }
+            return (bounds, include_zero);
+        }
+        if series.kind() == crate::GeneralSeriesKind::BoxPlot {
+            let (Some(min_values), Some(max_values), Some(q1_values), Some(q3_values)) = (
+                dataset.low(),
+                dataset.high(),
+                dataset.x_low(),
+                dataset.x_high(),
+            ) else {
+                return (bounds, include_zero);
+            };
+            for (index, &median) in dataset.y().iter().enumerate() {
+                if !dataset.y_is_valid(index)
+                    || !dataset.low_is_valid(index)
+                    || !dataset.high_is_valid(index)
+                    || !dataset.x_low_is_valid(index)
+                    || !dataset.x_high_is_valid(index)
+                {
+                    continue;
+                }
+                let values = [
+                    min_values[index],
+                    q1_values[index],
+                    median,
+                    q3_values[index],
+                    max_values[index],
+                ];
+                if axis.scale == GeneralScaleType::Logarithmic
+                    && values.iter().any(|value| *value <= 0.0)
+                {
+                    continue;
+                }
+                extend_numeric_bounds(&mut bounds, min_values[index]);
+                extend_numeric_bounds(&mut bounds, max_values[index]);
+            }
+            return (bounds, include_zero);
+        }
+        if series.kind() == crate::GeneralSeriesKind::ErrorBar {
+            let (Some(low_values), Some(high_values)) = (dataset.low(), dataset.high()) else {
+                return (bounds, include_zero);
+            };
+            for (index, &value) in dataset.y().iter().enumerate() {
+                if !dataset.y_is_valid(index)
+                    || (axis.scale == GeneralScaleType::Logarithmic && value <= 0.0)
+                {
+                    continue;
+                }
+                extend_numeric_bounds(&mut bounds, value);
+                if dataset.low_is_valid(index) {
+                    let low = low_values[index];
+                    if axis.scale != GeneralScaleType::Logarithmic || low > 0.0 {
+                        extend_numeric_bounds(&mut bounds, low);
+                    }
+                }
+                if dataset.high_is_valid(index) {
+                    let high = high_values[index];
+                    if axis.scale != GeneralScaleType::Logarithmic || high > 0.0 {
+                        extend_numeric_bounds(&mut bounds, high);
+                    }
+                }
+            }
+            return (bounds, include_zero);
+        }
+        for (index, &value) in dataset.y().iter().enumerate() {
+            if !dataset.y_is_valid(index)
+                || (axis.scale == GeneralScaleType::Logarithmic && value <= 0.0)
+            {
+                continue;
+            }
+            extend_numeric_bounds(&mut bounds, value);
+        }
+    } else if series.kind() == crate::GeneralSeriesKind::HorizontalBar {
+        include_zero = true;
+        if series.stack_id().is_some() {
+            return (bounds, include_zero);
+        }
+        for (index, &value) in dataset.y().iter().enumerate() {
+            if dataset.y_is_valid(index) {
+                extend_numeric_bounds(&mut bounds, value);
+            }
+        }
+    } else if let Some(values) = dataset.numeric_x() {
+        for (index, &value) in values.iter().enumerate() {
+            if axis.scale == GeneralScaleType::Logarithmic && value <= 0.0 {
+                continue;
+            }
+            extend_numeric_bounds(&mut bounds, value);
+            if series.kind() == crate::GeneralSeriesKind::ErrorBar && dataset.y_is_valid(index) {
+                if let Some(low_values) = dataset.x_low() {
+                    if dataset.x_low_is_valid(index) {
+                        let low = low_values[index];
+                        if axis.scale != GeneralScaleType::Logarithmic || low > 0.0 {
+                            extend_numeric_bounds(&mut bounds, low);
+                        }
+                    }
+                }
+                if let Some(high_values) = dataset.x_high() {
+                    if dataset.x_high_is_valid(index) {
+                        let high = high_values[index];
+                        if axis.scale != GeneralScaleType::Logarithmic || high > 0.0 {
+                            extend_numeric_bounds(&mut bounds, high);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (bounds, include_zero)
 }
 
 fn extend_numeric_bounds(bounds: &mut Option<(f64, f64)>, value: f64) {
@@ -2965,6 +3057,53 @@ mod tests {
     }
 
     #[test]
+    fn memoized_auto_domains_follow_dataset_generations() {
+        use crate::{GeneralSeriesOptions, GeneralXyInput};
+
+        let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
+        let pane = chart
+            .add_pane_with_domain(
+                true,
+                HorizontalDomain::Continuous {
+                    scale: ContinuousScaleType::Linear,
+                },
+            )
+            .unwrap();
+        for (id, dimension) in [("x", AxisDimension::X), ("y", AxisDimension::Y)] {
+            chart
+                .add_general_axis(GeneralAxisOptions::new(
+                    id,
+                    pane,
+                    dimension,
+                    GeneralScaleType::Linear,
+                ))
+                .unwrap();
+        }
+        let input = |high: f64| GeneralXyInput::Numeric {
+            ids: None,
+            x: vec![1.0, 2.0, 3.0],
+            y: vec![1.0, high / 2.0, high],
+            y_valid: None,
+        };
+        let dataset = chart.create_general_xy_dataset(input(10.0)).unwrap();
+        chart
+            .add_general_series(GeneralSeriesOptions::xy_line(pane, dataset, "x", "y"))
+            .unwrap();
+        let y_high = |chart: &ChartEngine| match chart.general_axis_effective_domain("y") {
+            Some(GeneralAxisDomain::Numeric([_, high])) => high,
+            other => panic!("unexpected domain {other:?}"),
+        };
+        let small = y_high(&chart);
+        assert!((10.0..100.0).contains(&small));
+        // Repeated resolution reuses the scan; a new dataset generation must rescan it.
+        assert_eq!(y_high(&chart), small);
+        chart
+            .replace_general_xy_dataset(dataset, input(1_000.0))
+            .unwrap();
+        assert!(y_high(&chart) >= 1_000.0);
+    }
+
+    #[test]
     fn degenerate_numeric_auto_domains_remain_finite_at_extreme_values() {
         for (scale, value) in [
             (GeneralScaleType::Linear, f64::MAX),
@@ -3099,7 +3238,11 @@ mod tests {
     fn temporal_ticks_are_calendar_aligned_bounded_and_locale_aware() {
         let months = MonthNames::english();
         let quarter = TemporalTickInterval::Months(3);
-        let values = temporal_tick_values([1_767_225_600_000, 1_783_036_800_000], quarter);
+        let values = temporal_tick_values(
+            [1_767_225_600_000, 1_783_036_800_000],
+            quarter,
+            ChartTimeZone::default(),
+        );
         assert_eq!(
             values,
             [1_767_225_600_000, 1_775_001_600_000, 1_782_864_000_000]
@@ -3107,7 +3250,9 @@ mod tests {
         assert_eq!(
             values
                 .iter()
-                .map(|value| format_temporal_tick(*value, quarter, &months))
+                .map(|value| {
+                    format_temporal_tick(*value, quarter, &months, ChartTimeZone::default())
+                })
                 .collect::<Vec<_>>(),
             ["Jan 2026", "Apr 2026", "Jul 2026"]
         );
@@ -3124,9 +3269,23 @@ mod tests {
                 ],
                 usize::from(MAX_GENERAL_AXIS_TICKS),
             ),
+            ChartTimeZone::default(),
         );
         assert!(!full_safe_range.is_empty());
         assert!(full_safe_range.len() <= usize::from(MAX_GENERAL_AXIS_TICKS));
         assert!(full_safe_range.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn temporal_ticks_use_local_calendar_boundaries() {
+        let new_york = ChartTimeZone::parse("America/New_York").unwrap();
+        let year = TemporalTickInterval::Years(1);
+        let domain = [1_767_200_000_000, 1_767_400_000_000];
+        let values = temporal_tick_values(domain, year, new_york);
+        assert_eq!(values, [1_767_243_600_000]); // 2026-01-01 00:00 EST = 05:00 UTC.
+        assert_eq!(
+            format_temporal_tick(values[0], year, &MonthNames::english(), new_york),
+            "2026"
+        );
     }
 }

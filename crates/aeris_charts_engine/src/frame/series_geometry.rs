@@ -5,146 +5,49 @@ use super::conflation::line_runs;
 use super::*;
 use crate::VwapReset;
 use aeris_charts_core::TimePointIndex;
+use aeris_charts_render::line::{dash_runs, push_line_stroke};
 
-/// Emit a polyline stroke. A solid style emits a single `Polyline` prim (the backends expand
-/// `line_type` themselves, as before). Any dashed style is expanded with `line_type` and split
-/// into solid dash sub-segments here in the frame builder — reference `setLineDash` semantics on the
-/// device-px path (draw-line.ts `getDashPattern`) — because the WebGPU tessellator has no dash
-/// concept; generating the gap geometry once keeps both backends pixel-identical by
-/// construction.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn push_line_stroke(
-    out: &mut Vec<Prim>,
+/// Append the strokes of one lone run's one-bar `segment` to `points` as independent point pairs
+/// and return the pair count: one pair for a solid style, one per dash piece for a dashed one
+/// (expanded and split like [`push_line_stroke`], the pattern restarting at every bar). The caller
+/// owns the pool window between its first append and the `Prim::Segments` it flushes, so nothing
+/// else may append to `points` in between.
+fn append_segment_pairs(
     points: &mut Vec<[f32; 2]>,
-    window: &[[f32; 2]],
+    segment: &[[f32; 2]; 2],
     width: f32,
     style: LineStyle,
     line_type: LineType,
-    color: Color,
-) {
+) -> u32 {
     let pattern = style.dash_pattern(width);
     if pattern.is_empty() {
-        let first = points.len() as u32;
-        points.extend_from_slice(window);
-        out.push(Prim::Polyline {
-            first_point: first,
-            point_count: window.len() as u32,
-            width,
-            style: LineStyle::Solid,
-            line_type,
-            color,
-        });
-        return;
+        points.extend_from_slice(segment);
+        return 1;
     }
-    let device: Vec<LinePoint> = window
-        .iter()
-        .map(|p| LinePoint {
-            x: p[0] as f64,
-            y: p[1] as f64,
-        })
-        .collect();
-    let expanded = expand_line(&device, line_type);
-    let pattern: Vec<f64> = pattern.iter().map(|&len| len as f64).collect();
-    for run in dash_split(&expanded, &pattern) {
-        let first = points.len() as u32;
-        points.extend(run.iter().map(|p| [p.x as f32, p.y as f32]));
-        out.push(Prim::Polyline {
-            first_point: first,
-            point_count: run.len() as u32,
-            width,
-            style: LineStyle::Solid,
-            line_type: LineType::Simple,
-            color,
-        });
+    let mut pairs = 0;
+    for run in dash_runs(segment, &pattern, line_type) {
+        for pair in run.windows(2) {
+            points.extend(pair.iter().map(|p| [p.x as f32, p.y as f32]));
+            pairs += 1;
+        }
     }
+    pairs
 }
 
-/// Lower one stroke run that may reach far past `pane` (family and placement-guide strokes, and
-/// the dashed strokes of [`push_styled_stroke`]) for every executor. The run is clipped to `pane`
-/// grown by the stroke's reach, so frame work and coordinates stay bounded however far the
-/// geometry reaches (an extreme level or zoom), and a dashed or dotted run is split into solid
-/// dash runs through [`push_line_stroke`]; clipped parts keep the unclipped run's dash phase, so
-/// dashes never shift while panning.
-pub(super) fn push_clipped_stroke(
-    out: &mut Vec<Prim>,
-    points: &mut Vec<[f32; 2]>,
-    run: &[(f64, f64)],
-    pane: aeris_charts_render::shape::Rect,
-    (width, style, color): (f32, LineStyle, Color),
-    scratch: &mut Vec<(f64, f64)>,
-) {
-    let clip = pane.inflate(f64::from(width) + 2.0);
-    let period: f64 = style
-        .dash_pattern(width)
-        .iter()
-        .copied()
-        .map(f64::from)
-        .sum();
-    aeris_charts_render::shape::clip_polyline_to_rect(run, clip, period, scratch, |part| {
-        if style == LineStyle::Solid {
-            let first_point = points.len() as u32;
-            points.extend(part.iter().map(|&(x, y)| [x as f32, y as f32]));
-            out.push(Prim::Polyline {
+/// Emit the lone-run pairs collected in `batch` (first pool index, pair count) as one
+/// `Prim::Segments` and clear it. A batch that gathered no pair (every dash piece degenerate)
+/// emits nothing.
+fn flush_segments(out: &mut Vec<Prim>, batch: &mut Option<(u32, u32)>, width: f32, color: Color) {
+    if let Some((first_point, segment_count)) = batch.take() {
+        if segment_count > 0 {
+            out.push(Prim::Segments {
                 first_point,
-                point_count: part.len() as u32,
+                segment_count,
                 width,
-                style,
-                line_type: LineType::Simple,
                 color,
             });
-        } else {
-            let path: Vec<[f32; 2]> = part.iter().map(|&(x, y)| [x as f32, y as f32]).collect();
-            push_line_stroke(out, points, &path, width, style, LineType::Simple, color);
         }
-    });
-}
-
-/// Lower a styled stroke through `run` (bitmap px) whose geometry is not bounded by the viewport
-/// (core drawings, general series). A solid run stays one polyline in `line_type`, which every
-/// executor strokes alike. A dashed or dotted run is expanded with `line_type` first (a curve
-/// clipped before expansion would bend differently inside the pane) and then lowered through
-/// [`push_clipped_stroke`], so executors receive only solid dash runs, whatever their dash
-/// support, and dash work stays bounded by the pane.
-pub(super) fn push_styled_stroke(
-    out: &mut Vec<Prim>,
-    points: &mut Vec<[f32; 2]>,
-    run: &[(f64, f64)],
-    line_type: LineType,
-    (width, style, color): (f32, LineStyle, Color),
-    pane: aeris_charts_render::shape::Rect,
-) {
-    if style == LineStyle::Solid {
-        let first_point = points.len() as u32;
-        points.extend(run.iter().map(|&(x, y)| [x as f32, y as f32]));
-        out.push(Prim::Polyline {
-            first_point,
-            point_count: run.len() as u32,
-            width,
-            style,
-            line_type,
-            color,
-        });
-        return;
     }
-    let expanded;
-    let run = if line_type == LineType::Simple {
-        run
-    } else {
-        let line: Vec<LinePoint> = run.iter().map(|&(x, y)| LinePoint { x, y }).collect();
-        expanded = expand_line(&line, line_type)
-            .into_iter()
-            .map(|point| (point.x, point.y))
-            .collect::<Vec<_>>();
-        &expanded
-    };
-    push_clipped_stroke(
-        out,
-        points,
-        run,
-        pane,
-        (width, style, color),
-        &mut Vec::new(),
-    );
 }
 
 /// Per-point-color stroke runs over a resolved per-point color list, porting reference walkLine's
@@ -1216,6 +1119,8 @@ impl ChartEngine {
                 }
             } else {
                 let width = (rs.line_width * vpr) as f32;
+                // The plain stroke's pending lone runs: (first pool index, pair count).
+                let mut batch: Option<(u32, u32)> = None;
                 for run in &runs {
                     let segment = lone_segment(run);
                     match &resolved {
@@ -1266,16 +1171,30 @@ impl ChartEngine {
                         }
                         None => {
                             if let Some(segment) = segment {
-                                push_line_stroke(
-                                    out,
+                                // Lone runs gather into one batch of point pairs; a study that
+                                // resets every bar would otherwise emit a polyline per bar.
+                                let (_, pairs) = batch.get_or_insert((points.len() as u32, 0));
+                                *pairs += append_segment_pairs(
                                     points,
                                     &segment,
                                     width,
                                     rs.line_style,
                                     rs.line_type,
-                                    color,
                                 );
-                            } else if rs.line_style == LineStyle::Solid {
+                                // A solid batch is one pair per lone run, and a lone run is at
+                                // least one drawn row; dashes split a bar into several pairs.
+                                debug_assert!(
+                                    rs.line_style != LineStyle::Solid
+                                        || *pairs as usize <= rows.len(),
+                                    "{pairs} solid segments for {} rows",
+                                    rows.len()
+                                );
+                                continue;
+                            }
+                            // Every other emission flushes the batch first: the prims keep run
+                            // order, and the batch's pool window stays contiguous.
+                            flush_segments(out, &mut batch, width, color);
+                            if rs.line_style == LineStyle::Solid {
                                 out.push(Prim::Polyline {
                                     first_point: first + run.start as u32,
                                     point_count: run.len() as u32,
@@ -1298,6 +1217,7 @@ impl ChartEngine {
                         }
                     }
                 }
+                flush_segments(out, &mut batch, width, color);
             }
         }
         if rs.point_markers {

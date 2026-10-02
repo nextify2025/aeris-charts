@@ -33,8 +33,8 @@ mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{
-    resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, PositionGeometry,
-    PositionZone,
+    resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, MeasureAxes,
+    PositionGeometry, PositionZone,
 };
 pub(crate) use parts::{cap_radius, DrawingPart, DrawingParts, PartContext};
 pub(crate) use tools::{
@@ -498,7 +498,9 @@ pub enum DrawingKind {
     PriceRange,
     /// Two-anchor time measurement: range lines, arrow, fill, and bar/duration stats.
     DateRange,
-    /// Two-anchor price and time measurement.
+    /// Two-anchor price and time measurement (also the Shift-click quick measure). The
+    /// pre-merge spelling `date_price_range` is still read, never written.
+    #[serde(alias = "date_price_range")]
     DateAndPriceRange,
     /// Three-anchor sector projection: apex, radius point, and price point.
     Projection,
@@ -604,6 +606,9 @@ impl DrawingKind {
             .iter()
             .find(|spec| spec.name == name)
             .map(|spec| spec.kind)
+            // Input-only alias of the spelling documents, templates, and clipboard payloads carried
+            // before the measuring tools became catalog entries of the projection family.
+            .or((name == "date_price_range").then_some(Self::DateAndPriceRange))
     }
 
     /// The number of defining anchors the kind is placed with (and its handles show). Brush and
@@ -615,6 +620,13 @@ impl DrawingKind {
     /// Whether `count` is a valid point count for a stored drawing of this kind.
     pub fn valid_point_count(self, count: usize) -> bool {
         self.spec().placement.valid_point_count(count)
+    }
+
+    /// Whether the generic label pass paints this kind's `text` as a single run placed against
+    /// its geometry (`DrawingTextLayout`). A family that owns its text lays it out in its own
+    /// parts instead (a text box that may span lines, or no text at all).
+    pub(crate) fn paints_generic_text(self) -> bool {
+        self.spec().family.is_none_or(|family| !family.owns_text)
     }
 }
 
@@ -810,6 +822,10 @@ pub struct Drawing {
     pub profile: Option<crate::ProfileDrawingOptions>,
     /// B8 family-specific option blocks (`tool_options` in options JSON and persistence).
     pub tool_options: crate::DrawingToolOptions,
+    /// Hypothetical account balance for position drawing statistics; never a broker balance.
+    pub position_account_size: f64,
+    /// Percentage of the hypothetical balance risked at the stop (0..=100).
+    pub position_risk_percent: f64,
     /// Line/border color CSS string (default [`DRAWING_DEFAULT_COLOR`]).
     pub color: String,
     /// Stroke width in CSS px (default 2; 1 for a rectangle's border).
@@ -835,12 +851,13 @@ pub struct Drawing {
     /// Snap rectangle time anchors to canonical data times, matching the official plugin's
     /// `MouseEventParams.time` placement instead of retaining a fractional x coordinate.
     pub snap_time_to_data: bool,
-    /// The tool's text label (`""` = none). Empty text tools paint nothing on the chart; the
-    /// host typing-mode editor is the empty-state UI, and leaving it without typed text removes
-    /// the drawing.
+    /// The tool's text label (`""` = none), at most `MAX_DRAWING_TEXT_BYTES` bytes. Every tool that
+    /// paints text edits it in place (the eight tools that paint none keep it unpainted). An empty
+    /// label paints nothing and keeps its drawing, except for the text tool, whose empty state is
+    /// the host typing-mode editor: leaving that editor without typed text removes the drawing.
     pub text: String,
-    /// Label color CSS string. `None` follows the drawing stroke for trend lines and the chart's
-    /// `layout.textColor` for the standalone text tool.
+    /// Label color CSS string. `None` follows the drawing stroke for a label that follows a
+    /// segment (trend lines, rays, channels, ...) and the chart's `layout.textColor` otherwise.
     pub text_color: Option<String>,
     /// Label glyph size in CSS px; `None` follows the chart's `layout.fontSize`.
     pub text_size: Option<f64>,
@@ -911,12 +928,14 @@ impl Drawing {
             levels: Vec::new(),
             price_scale: DrawingPriceScale::Right,
             profile: None,
+            position_account_size: 1000.0,
+            position_risk_percent: 25.0,
             color: DRAWING_DEFAULT_COLOR.to_string(),
             width: kind.spec().default_width,
             style: LineStyle::Solid,
             fill_color: None,
             preview_fill_color: None,
-            border_visible: true,
+            border_visible: kind != DrawingKind::Rectangle,
             show_labels: false,
             axis_bands_visible: false,
             label_color: None,
@@ -993,9 +1012,10 @@ impl Drawing {
         }
     }
 
-    /// The label a drawing actually renders. Empty text tools render nothing — the host's
-    /// typing-mode editor is the only empty-state UI, and leaving that editor without typed
-    /// text removes the drawing (the public reference: no lingering "Add text" ghost on the chart).
+    /// The label a drawing actually renders. An empty label renders nothing, so no "Add text"
+    /// ghost lingers on the chart: the text tool's empty state is the host's typing-mode editor
+    /// (leaving it without typed text removes the drawing), and every other drawing simply shows
+    /// no label until one is typed.
     pub fn display_text(&self) -> &str {
         self.text.as_str()
     }
@@ -1082,6 +1102,8 @@ impl Drawing {
             DrawingKind::LongPosition | DrawingKind::ShortPosition => {
                 crate::DrawingKindOptions::Position {
                     levels: self.levels.clone(),
+                    account_size: self.position_account_size,
+                    risk_percent: self.position_risk_percent,
                 }
             }
             _ => crate::DrawingKindOptions::Generic,
@@ -1153,6 +1175,13 @@ pub struct DrawingModifiers {
 /// tests).
 pub type TextMeasureFn = Box<dyn Fn(&str, f64, &str, u16, bool) -> f64>;
 
+/// Host vertical glyph metric for `{italic} {weight} {size}px {family}`: the offset, in the same px
+/// units as `size`, that moves a `Prim::Text` anchor (Canvas `textBaseline: "middle"`, the em-box
+/// center) so the ink of capitals and figures is centered on the intended line instead. Browser
+/// hosts derive it from `measureText` ink bounds and native hosts from the font's cap height.
+/// Without one the engine uses no correction (deterministic for native tests).
+pub type TextCapCenterFn = Box<dyn Fn(f64, &str, u16, bool) -> f64>;
+
 /// Active anchor/body drag session (the interaction.rs session pattern: the engine owns the
 /// start snapshot and the math; hosts forward drag positions).
 pub(crate) struct DrawingDrag {
@@ -1180,27 +1209,18 @@ pub(crate) struct DrawingDrag {
     pub(crate) keyboard_step: Option<(f64, f64)>,
 }
 
-/// Open inline text-edit session: the drawing the host's editor owns and its `text` and
-/// `revision` when the session began, which cancel restores and commit records as the undo
-/// step's `before`. Runtime only; restore, sync, clear, and removal end it.
-#[derive(Clone, Debug)]
-pub(crate) struct DrawingTextEdit {
-    pub(crate) id: DrawingId,
-    text: String,
-    revision: u64,
-}
-
-/// Where the host's inline editor lays out a family drawing's own `text`
+/// Where the host's inline editor lays out a drawing's own `text`
 /// ([`ChartEngine::drawing_text_edit_layout`]), in media px: x from the pane's left edge, y from
 /// the chart top. The engine paints every line of the label left-aligned at `x`, line `i` of the
-/// text centered at `y + i * line_height`.
+/// text centered at `y + i * line_height`; a single run is one such line, rotated by `angle`
+/// about `(x, y)`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct DrawingTextEditLayout {
-    /// Left edge of the text lines.
+    /// Left edge of the text lines (of a run: its start point after rotation).
     pub x: f64,
     /// Vertical center of the text's first line.
     pub y: f64,
-    /// Distance between line centers (1.25 × `size`).
+    /// Distance between line centers: 1.25 × `size` in a family text box, 1.2 × `size` for a run.
     pub line_height: f64,
     /// Glyph size in CSS px.
     pub size: f64,
@@ -1211,6 +1231,93 @@ pub struct DrawingTextEditLayout {
     pub color: String,
     /// The whole label box (the edit target), `[left, top, right, bottom]`.
     pub rect: [f64; 4],
+    /// Clockwise rotation of the label in radians about its start point: the segment's angle
+    /// for a rotated run, 0 for a level run or a box.
+    pub angle: f64,
+    /// Whether the label is a box that may span lines (a family text box, `line_height` 1.25 ×
+    /// `size`), rather than one run on one line (`line_height` 1.2 × `size`, `rect` the
+    /// axis-aligned bounds of the padded run). Hosts choose their editor by this flag; the
+    /// presence of a layout only means the drawing paints text.
+    pub multiline: bool,
+}
+
+/// A drawing's generic text run in media px: the aligned anchor, the run's clockwise angle, and
+/// the alignment and glyph size the frame paints it with. Hit testing, the caret transform, and
+/// the editor layout resolve the run here so they cannot drift from
+/// `frame::drawings::text_run_geometry`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DrawingTextRun {
+    /// The run's aligned edge (left, center, or right, per `align`) and vertical center.
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    /// Clockwise radians; 0 for a level run.
+    pub(crate) angle: f64,
+    pub(crate) align: DrawingTextHAlign,
+    pub(crate) size: f64,
+}
+
+impl DrawingTextRun {
+    /// Distance from the anchor to the run's left edge along the run, for the advance `width`.
+    fn left(&self, width: f64) -> f64 {
+        match self.align {
+            DrawingTextHAlign::Left => 0.0,
+            DrawingTextHAlign::Center => -width / 2.0,
+            DrawingTextHAlign::Right => -width,
+        }
+    }
+
+    /// The run's start point (left edge, vertical center) for the advance `width`.
+    fn start(&self, width: f64) -> (f64, f64) {
+        let left = self.left(width);
+        (
+            self.x + self.angle.cos() * left,
+            self.y + self.angle.sin() * left,
+        )
+    }
+
+    /// The run box `[left - pad, left + width + pad] × [-0.6 size - pad, 0.6 size + pad]` in the
+    /// run's local frame (the anchor is (0, 0), x along the run).
+    fn local_box(&self, width: f64) -> [f64; 4] {
+        let left = self.left(width);
+        let half = self.size * 0.6;
+        [
+            left - TEXT_PAD,
+            -half - TEXT_PAD,
+            left + width + TEXT_PAD,
+            half + TEXT_PAD,
+        ]
+    }
+
+    /// Whether the media-px point is inside the padded run box.
+    fn contains(&self, width: f64, x: f64, y: f64) -> bool {
+        let (sin, cos) = self.angle.sin_cos();
+        let (dx, dy) = (x - self.x, y - self.y);
+        let (local_x, local_y) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+        let [left, top, right, bottom] = self.local_box(width);
+        local_x >= left && local_x <= right && local_y >= top && local_y <= bottom
+    }
+
+    /// The axis-aligned bounds `[left, top, right, bottom]` of the padded run box.
+    fn bounds(&self, width: f64) -> [f64; 4] {
+        let (sin, cos) = self.angle.sin_cos();
+        let [left, top, right, bottom] = self.local_box(width);
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for (lx, ly) in [(left, top), (right, top), (right, bottom), (left, bottom)] {
+            let (x, y) = (self.x + lx * cos - ly * sin, self.y + lx * sin + ly * cos);
+            bounds = [
+                bounds[0].min(x),
+                bounds[1].min(y),
+                bounds[2].max(x),
+                bounds[3].max(y),
+            ];
+        }
+        bounds
+    }
 }
 
 const DRAWING_HISTORY_LIMIT: usize = 100;
@@ -1365,6 +1472,36 @@ pub(crate) struct ArmedDrawingTool {
     pub(crate) template: Drawing,
 }
 
+/// The transient Shift-click measure: a date-and-price range that follows the pointer, freezes
+/// on release (after a drag) or on the next click, and is dismissed by the click after that or
+/// by Escape. It never enters the committed drawings, history, persistence, or sync.
+pub(crate) struct MeasureSession {
+    /// Start/end anchors plus the bound pane and price scale, in drawing form so the frame and
+    /// axis paths reuse the date-and-price range geometry unchanged.
+    pub(crate) drawing: Drawing,
+    /// Press position in pane-relative media px (the drag threshold reference).
+    pub(crate) press: (f64, f64),
+    /// Whether the end anchor still follows the pointer.
+    pub(crate) following: bool,
+}
+
+impl MeasureSession {
+    /// Move the end anchor. The session has no user style, so its color follows the pull: the
+    /// drawing default for a rise, the market-down color for a fall. It reallocates the color
+    /// string only when the direction flips, never per pointer move.
+    fn set_end(&mut self, end: DrawingPoint) {
+        self.drawing.points[1] = end;
+        let color = if end.price < self.drawing.points[0].price {
+            aeris_charts_core::style::MARKET_DOWN_CSS
+        } else {
+            DRAWING_DEFAULT_COLOR
+        };
+        if self.drawing.color != color {
+            self.drawing.color = color.to_string();
+        }
+    }
+}
+
 /// All transient drawing-tool creation state.  Keeping arming, click/multi-click placement and
 /// freehand capture under one owner prevents browser and native hosts from growing independent
 /// per-tool state machines.
@@ -1373,6 +1510,7 @@ pub(crate) struct DrawingController {
     pub(crate) armed: Option<ArmedDrawingTool>,
     pub(crate) pending: Option<PendingDrawing>,
     pub(crate) brush: Option<BrushCapture>,
+    pub(crate) measure: Option<MeasureSession>,
 }
 
 /// Result of forwarding a platform drawing-creation event into the engine.  Platform hosts use
@@ -1393,6 +1531,9 @@ pub(crate) const BRUSH_MIN_POINT_DISTANCE: f64 = 1.5;
 
 /// Padding between a tool's reference box and its text label, in CSS px.
 pub(crate) const TEXT_PAD: f64 = 4.0;
+
+/// A press-release farther than the shared 5 px Manhattan click slop is a drag-measure.
+const MEASURE_DRAG_SLOP: f64 = 5.0;
 
 /// reference `distanceToSegment` (renderers/hit-test-common.ts), duplicated from hit_test.rs so
 /// the drawing geometry stays self-contained.
@@ -1493,6 +1634,10 @@ pub(crate) struct DrawingPatch {
     /// Deep-merged into [`Drawing::tool_options`].
     #[serde(alias = "toolOptions")]
     tool_options: Option<serde_json::Value>,
+    #[serde(alias = "positionAccountSize")]
+    position_account_size: Option<f64>,
+    #[serde(alias = "positionRiskPercent")]
+    position_risk_percent: Option<f64>,
 }
 
 /// A drawing style name (`solid`/`dotted`/`dashed`) as a line style: the retired names fold into
@@ -1535,8 +1680,42 @@ fn update_css_slot(slot: &mut Option<String>, value: String) {
     }
 }
 
+/// `text` with every run of `\r` and `\n` replaced by one space (the single-line rule of a run
+/// label).
+pub(crate) fn collapse_line_breaks(text: &str) -> String {
+    let mut collapsed = String::with_capacity(text.len());
+    let mut in_break = false;
+    for c in text.chars() {
+        if matches!(c, '\r' | '\n') {
+            if !in_break {
+                collapsed.push(' ');
+            }
+            in_break = true;
+        } else {
+            in_break = false;
+            collapsed.push(c);
+        }
+    }
+    collapsed
+}
+
 impl Drawing {
     fn apply_patch(&mut self, patch: DrawingPatch) -> bool {
+        // Every rejection sits before the first mutation, so a refused patch applies nothing
+        // (several callers ignore the result and patch live values).
+        if patch
+            .text
+            .as_ref()
+            .is_some_and(|text| text.len() > crate::MAX_DRAWING_TEXT_BYTES)
+            || patch
+                .position_account_size
+                .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1e15)
+            || patch
+                .position_risk_percent
+                .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+        {
+            return false;
+        }
         if let Some(name) = patch.name.as_ref() {
             if name.len() > crate::MAX_DRAWING_NAME_BYTES {
                 return false;
@@ -1713,6 +1892,12 @@ impl Drawing {
                 self.box_border_width = width;
             }
         }
+        if let Some(value) = patch.position_account_size {
+            self.position_account_size = value;
+        }
+        if let Some(value) = patch.position_risk_percent {
+            self.position_risk_percent = value;
+        }
         if let Some(profile) = patch.profile {
             self.profile = Some(profile);
         }
@@ -1738,6 +1923,8 @@ impl Drawing {
             "levels": self.levels,
             "price_scale_id": self.price_scale.name(),
             "profile": self.profile,
+            "position_account_size": self.position_account_size,
+            "position_risk_percent": self.position_risk_percent,
             "color": self.color,
             "width": self.width,
             "style": style_name(self.style),
@@ -2138,6 +2325,9 @@ impl ChartEngine {
             transient_changed |= rebase_points_with(&mut capture.points, map);
             transient_changed |= capture.options.rebase_logical_with(map);
         }
+        if let Some(session) = self.drawing_controller.measure.as_mut() {
+            transient_changed |= session.drawing.rebase_logical_with(map);
+        }
         let drag_pane_anchored = self.drawing_drag.as_ref().is_some_and(|drag| {
             self.drawings
                 .iter()
@@ -2358,6 +2548,25 @@ impl ChartEngine {
         self.bump_drawing_sync_revision();
     }
 
+    /// Record one committed text edit (drawing_text_edit.rs): `before` is the drawing as the
+    /// session began, `after` as it ended.
+    pub(crate) fn record_drawing_update(&mut self, before: Drawing, after: Drawing) {
+        self.record_drawing_command(DrawingCommand::Update {
+            before,
+            after: Box::new(after),
+        });
+    }
+
+    /// Monotonic revision of committed drawing semantics: every recorded create, delete, anchor,
+    /// style, lock, text, or clear operation, every undo/redo step, and every price-basis change,
+    /// rescale, or accepted sync payload advances it; hover, selection, previews, in-flight
+    /// drags, and live typing do not. Hosts persist when it changes. It is the drawing sync
+    /// revision (the value `drawing_sync_payload_json` carries), so "the drawings changed" has
+    /// one counter.
+    pub fn drawing_revision(&self) -> u64 {
+        self.drawing_sync_revision
+    }
+
     fn bump_drawing_sync_revision(&mut self) {
         self.drawing_sync_revision = self.drawing_sync_revision.wrapping_add(1).max(1);
     }
@@ -2384,7 +2593,7 @@ impl ChartEngine {
             self.drawing_drag = None;
         }
         if self.editing_drawing() == Some(id) {
-            self.text_edit = None;
+            self.drawing_text_edit = None;
         }
         if self.hovered_text == Some(id) {
             self.hovered_text = None;
@@ -2440,7 +2649,7 @@ impl ChartEngine {
                 }
                 self.selected_drawing = None;
                 self.drawing_drag = None;
-                self.text_edit = None;
+                self.drawing_text_edit = None;
                 self.hovered_drawing = None;
                 self.hovered_text = None;
             }
@@ -2468,7 +2677,7 @@ impl ChartEngine {
         if self.drawing_drag.is_some() {
             self.drawing_drag_cancel();
         }
-        self.end_drawing_text_edit(true);
+        self.commit_drawing_text_edit();
         let Some(command) = self.drawing_history.undo.pop() else {
             return false;
         };
@@ -2487,7 +2696,7 @@ impl ChartEngine {
         if self.drawing_drag.is_some() {
             self.drawing_drag_cancel();
         }
-        self.end_drawing_text_edit(true);
+        self.commit_drawing_text_edit();
         let Some(command) = self.drawing_history.redo.pop() else {
             return false;
         };
@@ -2641,6 +2850,148 @@ impl ChartEngine {
         })
     }
 
+    /// The price-band tick ladder governing the scale a position is bound to, when one is
+    /// installed. Like order snapping it is then the single tick source: the scalar instrument
+    /// tick applies only where no ladder is configured.
+    fn position_tick_ladder(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+    ) -> Option<&crate::PriceTickLadder> {
+        let target = match price_scale {
+            DrawingPriceScale::Right => crate::PriceScaleTarget::Right,
+            DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
+            DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
+        };
+        self.scale_formatter_source(pane_index, target)?
+            .price_format
+            .active_tick_ladder()
+    }
+
+    /// Position levels use the instrument's orderable grid, or their bound scale's display tick.
+    /// Resolve this in price space: a tick can be much smaller than a device pixel. A scale with a
+    /// price-band ladder has no single tick: ask [`Self::position_price_tick_at`].
+    pub(crate) fn position_price_tick(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+    ) -> Option<f64> {
+        let target = match price_scale {
+            DrawingPriceScale::Right => crate::PriceScaleTarget::Right,
+            DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
+            DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
+        };
+        self.trading_state
+            .instrument
+            .tick_size
+            .or_else(|| {
+                self.scale_formatter_source(pane_index, target)
+                    .map(|series| series.price_format.min_move)
+            })
+            .filter(|tick| tick.is_finite() && *tick > 0.0)
+    }
+
+    /// The tick in force at `price`: the ladder band's, else [`Self::position_price_tick`].
+    pub(crate) fn position_price_tick_at(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        price: f64,
+    ) -> Option<f64> {
+        match self.position_tick_ladder(pane_index, price_scale) {
+            Some(ladder) => Some(ladder.min_move_at(price)),
+            None => self.position_price_tick(pane_index, price_scale),
+        }
+        .filter(|tick| tick.is_finite() && *tick > 0.0)
+    }
+
+    /// Whole ticks between two on-grid prices of a position: the ladder's cumulative band ticks,
+    /// else the distance over the single tick. `None` without a tick or off the ladder grid.
+    pub(crate) fn position_price_ticks_between(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        from: f64,
+        to: f64,
+    ) -> Option<f64> {
+        match self.position_tick_ladder(pane_index, price_scale) {
+            Some(ladder) => Some((ladder.tick_index(to)? - ladder.tick_index(from)?).abs() as f64),
+            None => self
+                .position_price_tick(pane_index, price_scale)
+                .map(|tick| (to - from).abs() / tick),
+        }
+    }
+
+    /// A keyboard nudge of a position level on its price grid: a nudge that snaps back to the
+    /// level it started from still steps one tick the way the key points (the sign of the raw
+    /// price move, or the key's own direction when that is zero). `snapped` is the nudge's
+    /// result on the grid; levels that are off the grid or move a whole tick or more keep it.
+    fn keyboard_position_price(
+        &self,
+        scale: (usize, DrawingPriceScale),
+        start: f64,
+        raw: f64,
+        snapped: f64,
+        key_y: f64,
+    ) -> f64 {
+        let Some(tick) = self.position_price_tick_at(scale.0, scale.1, start) else {
+            return snapped;
+        };
+        if key_y == 0.0 || (snapped - start).abs() >= tick * 0.5 {
+            return snapped;
+        }
+        let direction = if raw == start {
+            -key_y.signum()
+        } else {
+            (raw - start).signum()
+        };
+        self.snap_position_price(scale.0, scale.1, start + direction * tick)
+    }
+
+    fn snap_position_price(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        price: f64,
+    ) -> f64 {
+        if let Some(ladder) = self.position_tick_ladder(pane_index, price_scale) {
+            return ladder.snap(price);
+        }
+        let Some(tick) = self.position_price_tick(pane_index, price_scale) else {
+            return price;
+        };
+        let snapped = (price / tick).round() * tick;
+        if snapped.is_finite() {
+            snapped
+        } else {
+            price
+        }
+    }
+
+    /// Grid-snapped tools place anchors on the crosshair's time slot under `x` and on the price
+    /// tick grid. `magnet_chose` holds when the magnet actually moved `point` onto a bar (it
+    /// found a candle to attract it); a magnet that is merely on, but kept the pointer's point
+    /// (weak and too far from every price, or no bar under the pointer), leaves the slot to this
+    /// snap so every anchor still lands on a whole bar.
+    fn grid_snap_point(
+        &self,
+        kind: DrawingKind,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        x: f64,
+        mut point: DrawingPoint,
+        magnet_chose: bool,
+    ) -> DrawingPoint {
+        if !kind.spec().grid_snap {
+            return point;
+        }
+        if !magnet_chose {
+            point.logical = self.snapped_crosshair_index(x) as f64;
+        }
+        point.price = self.snap_position_price(pane_index, price_scale, point.price);
+        point
+    }
+
     fn snap_drawing_time_to_data(&self, mut point: DrawingPoint) -> Option<DrawingPoint> {
         let logical = point.logical.round() as i64;
         if logical < 0 || logical as usize >= self.data.merged_times().len() {
@@ -2653,8 +3004,10 @@ impl ChartEngine {
     /// Reference-informed magnet behavior: resolve the live pointer through the same pixel-space
     /// rendered-price candidate path as the crosshair, then encode the winning coordinate on the
     /// drawing's own price scale. Strong always snaps to the nearest candidate of the bar under the
-    /// pointer; weak snaps only within [`DRAWING_WEAK_MAGNET_DISTANCE`] vertical CSS px. A bar with
-    /// no visible real candidate keeps the unsnapped point.
+    /// pointer; weak snaps only within [`DRAWING_WEAK_MAGNET_DISTANCE`] vertical CSS px. `None`
+    /// when the magnet keeps the pointer's own point: it is off, the bar under the pointer has no
+    /// visible real candidate (or no bar exists there), or a weak magnet is too far from every
+    /// price.
     fn magnet_snap_point_at(
         &self,
         mode: crate::DrawingMagnetMode,
@@ -2662,25 +3015,19 @@ impl ChartEngine {
         price_scale: DrawingPriceScale,
         x: f64,
         y: f64,
-        point: DrawingPoint,
-    ) -> DrawingPoint {
+    ) -> Option<DrawingPoint> {
         if mode == crate::DrawingMagnetMode::Off {
-            return point;
+            return None;
         }
-        let Some((logical, snapped_y)) = self.magnet_snap_coordinate(pane_index, x, y, true) else {
-            return point;
-        };
+        let (logical, snapped_y) = self.magnet_snap_coordinate(pane_index, x, y, true)?;
         if mode == crate::DrawingMagnetMode::Weak
             && (snapped_y - y).abs() > DRAWING_WEAK_MAGNET_DISTANCE
         {
-            return point;
+            return None;
         }
-        let Some(mut snapped) = self.drawing_from_px_for(pane_index, price_scale, x, snapped_y)
-        else {
-            return point;
-        };
+        let mut snapped = self.drawing_from_px_for(pane_index, price_scale, x, snapped_y)?;
         snapped.logical = logical as f64;
-        snapped
+        Some(snapped)
     }
 
     /// Reference-informed straighten behavior (Shift held): recompute the dragged anchor of a two-anchor tool
@@ -2921,7 +3268,11 @@ impl ChartEngine {
         font_size: f64,
         font_family: &str,
     ) -> Option<(f64, f64)> {
+        // An open editor gives an empty label its one-em caret slot, which the frame paints
+        // around and hit testing must not cull.
+        let editing = self.editing_drawing() == Some(drawing.id);
         if drawing.text.is_empty()
+            && !editing
             && !matches!(drawing.kind, DrawingKind::Text | DrawingKind::TrendLine)
         {
             return None;
@@ -2937,6 +3288,8 @@ impl ChartEngine {
                     drawing.text_weight.unwrap_or(400),
                     drawing.text_italic,
                 )
+            } else if editing && drawing.text.is_empty() {
+                size
             } else {
                 self.measure_drawing_text_with_family(drawing, size, font_family)
             };
@@ -2948,9 +3301,20 @@ impl ChartEngine {
 
     /// Screen pad `(x, y)` in CSS px that a drawing's text run and family decorations reach
     /// beyond its anchors.
-    fn drawing_label_pad(text_metrics: Option<(f64, f64)>, decoration: f64) -> (f64, f64) {
-        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size)| {
-            (width + TEXT_PAD * 2.0, size * 1.2 + TEXT_PAD * 2.0)
+    fn drawing_label_pad(
+        text_metrics: Option<(f64, f64)>,
+        text_layout: DrawingTextLayout,
+        decoration: f64,
+    ) -> (f64, f64) {
+        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size)| match text_layout {
+            DrawingTextLayout::Box => (width + TEXT_PAD * 2.0, size * 1.2 + TEXT_PAD * 2.0),
+            // A run along a segment rotates with it, so its length reaches past the anchors in
+            // either axis: the run itself, its slot's normal offset (pad + half a glyph), and
+            // half its thickness plus the pad.
+            DrawingTextLayout::Segment => {
+                let reach = width + size * 1.1 + TEXT_PAD * 3.0;
+                (reach, reach)
+            }
         });
         (x.max(decoration), y.max(decoration))
     }
@@ -3019,7 +3383,8 @@ impl ChartEngine {
             let text_metrics =
                 self.cached_drawing_text_metrics(drawing, entry, text_key, font_size, &font_family);
             let decoration = self.cached_drawing_decoration(drawing, entry, text_key);
-            let label_pad = Self::drawing_label_pad(text_metrics, decoration);
+            let label_pad =
+                Self::drawing_label_pad(text_metrics, drawing.kind.spec().text_layout, decoration);
             if !self.drawing_semantic_might_intersect(
                 drawing,
                 entry.bounds,
@@ -3074,7 +3439,8 @@ impl ChartEngine {
         );
         let decoration =
             self.cached_drawing_decoration(drawing, &mut entry, self.options.generation());
-        let label_pad = Self::drawing_label_pad(text_metrics, decoration);
+        let label_pad =
+            Self::drawing_label_pad(text_metrics, drawing.kind.spec().text_layout, decoration);
         self.refresh_drawing_screen_bounds(drawing, &mut entry, key, base, label_pad)
             && entry.screen_bounds.intersects(viewport)
     }
@@ -3127,13 +3493,14 @@ impl ChartEngine {
     /// already converted (bitmap px at render, media px at hit-test); `pane_w`/`pane_h` bound
     /// the full-width/full-height kinds in the same units. `pane_top` is the pane's vertical
     /// offset (0 for pane-local bitmap x media y are both chart-top-relative — see hit_test.rs).
+    /// `None` when the geometry does not resolve: a zero box would put a caret at (0, 0).
     pub(crate) fn text_box(
         kind: DrawingKind,
         px: &[(f64, f64)],
         pane_w: f64,
         pane_top: f64,
         pane_h: f64,
-    ) -> TextBox {
+    ) -> Option<TextBox> {
         resolve_drawing_geometry(
             kind,
             px,
@@ -3147,7 +3514,6 @@ impl ChartEngine {
             },
         )
         .map(|geometry| geometry.text_box)
-        .unwrap_or_default()
     }
 
     /// The label's draw anchor `(x, y_center)` and horizontal alignment in the caller's units,
@@ -3183,6 +3549,21 @@ impl ChartEngine {
         size: f64,
         pad: f64,
     ) -> (f64, f64, DrawingTextHAlign, f64) {
+        Self::try_drawing_text_placement(drawing, px, pane_w, pane_top, pane_h, size, pad)
+            .unwrap_or_else(|| Self::text_placement(drawing, &TextBox::default(), size, pad))
+    }
+
+    /// [`ChartEngine::drawing_text_placement`] that reports `None` for a drawing whose geometry
+    /// does not resolve, so the editor and the hit test leave it alone.
+    fn try_drawing_text_placement(
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w: f64,
+        pane_top: f64,
+        pane_h: f64,
+        size: f64,
+        pad: f64,
+    ) -> Option<(f64, f64, DrawingTextHAlign, f64)> {
         if drawing.kind.spec().text_layout == DrawingTextLayout::Segment && px.len() >= 2 {
             let (mut start, mut end) = (px[0], px[1]);
             let mut dx = end.0 - start.0;
@@ -3206,19 +3587,22 @@ impl ChartEngine {
                 };
                 let mut x = start.0 + ux * distance;
                 let mut y = start.1 + uy * distance;
+                // Placement and hit testing use the same 1.2em line box. Half a bare em can
+                // put descenders against the stroke, particularly when the line is tilted.
+                let half_line_height = size * 0.6;
                 let normal_distance = match drawing.text_v_align {
-                    DrawingTextVAlign::Top => pad + size / 2.0,
+                    DrawingTextVAlign::Top => pad + half_line_height,
                     DrawingTextVAlign::Middle => 0.0,
-                    DrawingTextVAlign::Bottom => -pad - size / 2.0,
+                    DrawingTextVAlign::Bottom => -pad - half_line_height,
                 };
                 // Screen y grows downward, so `(uy, -ux)` is the readable line's top normal.
                 x += uy * normal_distance;
                 y -= ux * normal_distance;
-                return (x, y, drawing.text_h_align, dy.atan2(dx));
+                return Some((x, y, drawing.text_h_align, dy.atan2(dx)));
             }
         }
-        let reference = Self::text_box(drawing.kind, px, pane_w, pane_top, pane_h);
-        Self::text_placement(drawing, &reference, size, pad)
+        let reference = Self::text_box(drawing.kind, px, pane_w, pane_top, pane_h)?;
+        Some(Self::text_placement(drawing, &reference, size, pad))
     }
 
     /// Measure (or estimate) a label's width in the same px units as `size`. Empty text tools
@@ -3261,6 +3645,30 @@ impl ChartEngine {
             entry.text_key = u64::MAX;
         }
         self.invalidate_frame_drawings();
+        // Trading marker cells size themselves from measured quantity text.
+        self.invalidate_frame_trading();
+    }
+
+    /// Cap-and-figure ink correction for a middle-anchored run (see [`TextCapCenterFn`]).
+    pub(crate) fn text_cap_center(
+        &self,
+        size: f64,
+        family: &str,
+        weight: u16,
+        italic: bool,
+    ) -> f64 {
+        self.text_cap_center_fn
+            .as_ref()
+            .map(|correction| correction(size, family, weight, italic))
+            .filter(|correction| correction.is_finite())
+            .unwrap_or(0.0)
+    }
+
+    /// Install (or clear with `None`) the host vertical glyph metric used to optically center
+    /// control text inside its box (see [`TextCapCenterFn`]).
+    pub fn set_text_cap_center(&mut self, f: Option<TextCapCenterFn>) {
+        self.text_cap_center_fn = f;
+        self.invalidate_frame_trading();
     }
 
     fn insert_drawing_runtime(&self, id: DrawingId) {
@@ -3280,7 +3688,7 @@ impl ChartEngine {
         Some(id)
     }
 
-    fn update_drawing_runtime(&self, id: DrawingId) {
+    pub(crate) fn update_drawing_runtime(&self, id: DrawingId) {
         let Some(drawing) = self.drawing(id) else {
             return;
         };
@@ -3748,7 +4156,7 @@ impl ChartEngine {
         self.drawing_drag = None;
         self.hovered_drawing = None;
         self.hovered_text = None;
-        self.text_edit = None;
+        self.drawing_text_edit = None;
         self.record_drawing_command(DrawingCommand::Clear { drawings });
     }
 
@@ -4275,7 +4683,7 @@ impl ChartEngine {
         self.drawing_settings.price_basis = payload.price_basis.filter(|basis| !basis.is_empty());
         self.selected_drawing = None;
         self.selected_drawings.clear();
-        self.text_edit = None;
+        self.drawing_text_edit = None;
         self.drawing_history.clear();
         self.drawing_runtime
             .borrow_mut()
@@ -4299,52 +4707,75 @@ impl ChartEngine {
         self.drawing_point_px(drawing, *point)
     }
 
-    /// The exact media-px text-run anchor shared by frame rendering and the host caret overlay.
-    pub fn drawing_text_coordinate(&self, id: DrawingId) -> Option<(f64, f64)> {
-        let drawing = self.drawing(id)?;
-        let px = self.drawing_px(drawing)?;
+    /// The generic text run of `drawing` in media px, resolved exactly as the frame places it
+    /// (`frame::drawings::text_run_geometry`, in bitmap px), from the drawing's converted anchors.
+    /// `None` when the geometry does not resolve, so no caret is ever placed at (0, 0).
+    fn drawing_text_run(&self, drawing: &Drawing, px: &[(f64, f64)]) -> Option<DrawingTextRun> {
         let pane = self.panes.get(drawing.pane_index)?;
         let size = drawing.resolved_text_size(self.options.get().layout.font_size);
-        let (x, y, _, _) = Self::drawing_text_placement(
+        let (x, y, align, angle) = Self::try_drawing_text_placement(
             drawing,
-            &px,
+            px,
             self.pane_w,
             pane.top,
             pane.height,
             size,
             TEXT_PAD,
-        );
-        Some((x, y))
+        )?;
+        Some(DrawingTextRun {
+            x,
+            y,
+            angle,
+            align,
+            size,
+        })
+    }
+
+    /// The exact media-px text-run anchor shared by frame rendering and the host caret overlay.
+    pub fn drawing_text_coordinate(&self, id: DrawingId) -> Option<(f64, f64)> {
+        let drawing = self.drawing(id)?;
+        let run = self.drawing_text_run(drawing, &self.drawing_px(drawing)?)?;
+        Some((run.x, run.y))
     }
 
     /// Media-px text anchor plus clockwise radians, shared with the browser caret overlay.
     pub fn drawing_text_transform(&self, id: DrawingId) -> Option<(f64, f64, f64)> {
         let drawing = self.drawing(id)?;
-        let px = self.drawing_px(drawing)?;
-        let pane = self.panes.get(drawing.pane_index)?;
-        let size = drawing.resolved_text_size(self.options.get().layout.font_size);
-        let (x, y, _, angle) = Self::drawing_text_placement(
-            drawing,
-            &px,
-            self.pane_w,
-            pane.top,
-            pane.height,
-            size,
-            TEXT_PAD,
-        );
-        Some((x, y, angle))
+        let run = self.drawing_text_run(drawing, &self.drawing_px(drawing)?)?;
+        Some((run.x, run.y, run.angle))
     }
 
-    /// The inline editor's layout of a family drawing's own `text`: the label its parts mark
-    /// with [`DrawingParts::text_label`], resolved as while its editor is open (an empty text
-    /// keeps one caret line). `None` for core tools (the text tool and trend labels place their
-    /// single-line run through [`ChartEngine::drawing_text_transform`]), for a family drawing
-    /// that paints no text of its own, or when its anchors cannot convert.
+    /// The inline editor's layout of a drawing's own `text`, resolved as while its editor is open
+    /// (an empty text keeps a caret slot). Every drawing that paints its text has one:
+    ///
+    /// - a family text box (`multiline`) is the label its parts mark with
+    ///   [`DrawingParts::text_label`]: lines left-aligned at `x`, line `i` centered at
+    ///   `y + i * line_height`, never rotated;
+    /// - every other drawing (the text tool, trend lines, lines, channels, Fibonacci tools,
+    ///   pitchforks, patterns, shapes) paints one run placed against its geometry: `x`, `y` are
+    ///   the run's start (left edge, vertical center) after rotation by `angle`, so a host rotates
+    ///   a single-line editor about its own left-middle.
+    ///
+    /// `None` for a drawing that paints no text of its own (the flag, the icon, and the
+    /// projection and measuring tools), for an unknown id, or when its anchors cannot convert.
     pub fn drawing_text_edit_layout(&self, id: DrawingId) -> Option<DrawingTextEditLayout> {
         let drawing = self.drawing(id)?;
-        let family = drawing.kind.spec().family?;
         let px = self.drawing_px(drawing)?;
-        let mut context = PartContext::media(self, drawing, &px)?;
+        if drawing.kind.paints_generic_text() {
+            self.run_text_edit_layout(drawing, &px)
+        } else {
+            self.box_text_edit_layout(drawing, &px)
+        }
+    }
+
+    /// The editor layout of a family drawing's text box (see [`ChartEngine::drawing_text_edit_layout`]).
+    fn box_text_edit_layout(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+    ) -> Option<DrawingTextEditLayout> {
+        let family = drawing.kind.spec().family?;
+        let mut context = PartContext::media(self, drawing, px)?;
         context.text_editing = true;
         let mut parts = DrawingParts::default();
         (family.build_parts)(&context, &mut parts);
@@ -4372,64 +4803,204 @@ impl ChartEngine {
                 layout.rect.right,
                 layout.rect.bottom,
             ],
+            angle: 0.0,
+            multiline: true,
         })
     }
 
-    /// Topmost trend-line label/placeholder at a media-px point. This keeps the browser host
-    /// from duplicating text measurement or 3×3 segment placement when opening inline edit.
-    pub fn drawing_text_hit_at(&self, x: f64, y: f64) -> Option<DrawingId> {
-        let layout = &self.options.get().layout;
-        let pane_index = self.pane_at_y(y)?;
-        let candidates = self.take_drawing_candidates(pane_index, Some((x, y)));
-        let hit = candidates.iter().rev().find_map(|&id| {
-            let drawing = self.drawing(id)?;
-            if drawing.kind != DrawingKind::TrendLine
-                || !drawing.visible
-                || drawing.locked
-                || !drawing.interval_visibility.allows(self.drawing_interval)
-            {
-                return None;
-            }
-            let text = if drawing.text.is_empty() {
-                TREND_TEXT_PLACEHOLDER
-            } else {
-                drawing.display_text()
-            };
-            let px = self.drawing_px(drawing)?;
-            let pane = self.panes.get(drawing.pane_index)?;
-            let size = drawing.resolved_text_size(layout.font_size);
-            let (tx, ty, align, angle) = Self::drawing_text_placement(
-                drawing,
-                &px,
-                self.pane_w,
-                pane.top,
-                pane.height,
-                size,
-                TEXT_PAD,
-            );
-            let width = self.measure_text_run(
-                text,
-                size,
-                &layout.font_family,
-                drawing.text_weight.unwrap_or(400),
+    /// The editor layout of a drawing's generic text run (see
+    /// [`ChartEngine::drawing_text_edit_layout`]).
+    fn run_text_edit_layout(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+    ) -> Option<DrawingTextEditLayout> {
+        let run = self.drawing_text_run(drawing, px)?;
+        let font_family = &self.options.get().layout.font_family;
+        let weight = drawing.text_weight.unwrap_or(400);
+        // An empty label paints nothing, so its caret opens one em wide.
+        let width = if drawing.text.is_empty() {
+            run.size
+        } else {
+            self.measure_text_run(
+                drawing.display_text(),
+                run.size,
+                font_family,
+                weight,
                 drawing.text_italic,
-            );
-            let local_x = (x - tx) * angle.cos() + (y - ty) * angle.sin();
-            let local_y = -(x - tx) * angle.sin() + (y - ty) * angle.cos();
-            let left = match align {
-                DrawingTextHAlign::Left => 0.0,
-                DrawingTextHAlign::Center => -width / 2.0,
-                DrawingTextHAlign::Right => -width,
-            };
-            let half_height = size * 0.6;
-            (local_x >= left - TEXT_PAD
-                && local_x <= left + width + TEXT_PAD
-                && local_y >= -half_height - TEXT_PAD
-                && local_y <= half_height + TEXT_PAD)
-                .then_some(drawing.id)
+            )
+        };
+        let (x, y) = run.start(width);
+        Some(DrawingTextEditLayout {
+            x,
+            y,
+            line_height: run.size * 1.2,
+            size: run.size,
+            font_family: font_family.clone(),
+            weight,
+            italic: drawing.text_italic,
+            color: self.drawing_label_color(drawing).to_css(),
+            rect: run.bounds(width),
+            angle: run.angle,
+            multiline: false,
+        })
+    }
+
+    /// The topmost drawing whose own text sits under a media-px point: the text of any drawing
+    /// that paints a generic run (lines, channels, Fibonacci tools, pitchforks, patterns, shapes,
+    /// and the trend line), never the text tool or a family text box, whose bodies are ordinary
+    /// hits. A trend line with no text answers over its `+ Add text` prompt; any other drawing
+    /// needs text to have a region. Locked, hidden, and interval-hidden drawings never answer, and
+    /// a higher drawing's body or the selected drawing's anchor handle at the point wins over a
+    /// label beneath it, as it does for a click. This keeps the host from duplicating text
+    /// measurement or 3×3 placement when opening the inline editor.
+    pub fn drawing_text_hit_at(&self, x: f64, y: f64) -> Option<DrawingId> {
+        self.drawing_text_hit(x, y, true)
+    }
+
+    /// Brute-force reference used by the randomized parity tests: no candidate index and no
+    /// cached anchors or text widths.
+    #[doc(hidden)]
+    pub fn drawing_text_hit_at_bruteforce(&self, x: f64, y: f64) -> Option<DrawingId> {
+        self.drawing_text_hit(x, y, false)
+    }
+
+    fn drawing_text_hit(&self, x: f64, y: f64, indexed: bool) -> Option<DrawingId> {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || x > self.pane_w {
+            return None;
+        }
+        let pane = self.pane_at_y(y)?;
+        let candidates = if indexed {
+            self.take_drawing_candidates(pane, Some((x, y)))
+        } else {
+            self.drawings
+                .iter()
+                .filter(|drawing| drawing.pane_index == pane)
+                .map(|drawing| drawing.id)
+                .collect()
+        };
+        // Candidates are in z-order; the topmost label wins.
+        let hit = candidates
+            .iter()
+            .rev()
+            .position(|&id| self.drawing_label_hit(id, indexed, x, y));
+        let hit = hit.and_then(|above| {
+            let id = candidates[candidates.len() - 1 - above];
+            // A higher drawing's body covers the label; the selected drawing's handles paint above
+            // every body. Both only cost work when a label is under the pointer.
+            let covered = candidates.iter().rev().take(above).any(|&higher| {
+                self.with_candidate_px(higher, indexed, |drawing, px, _| {
+                    drawing.visible
+                        && drawing.interval_visibility.allows(self.drawing_interval)
+                        && self.drawing_body_hit(drawing, px, x, y, HitProfile::PRECISION)
+                })
+                .unwrap_or(false)
+            });
+            (!covered
+                && self
+                    .selected_handle_hit(pane, x, y, HitProfile::PRECISION)
+                    .is_none())
+            .then_some(id)
         });
-        self.recycle_drawing_candidates(candidates);
+        if indexed {
+            self.recycle_drawing_candidates(candidates);
+        }
         hit
+    }
+
+    /// The drawing `id` from the runtime position index (indexed) or a linear scan.
+    fn candidate_drawing(&self, id: DrawingId, indexed: bool) -> Option<&Drawing> {
+        if indexed {
+            let position = self.drawing_runtime.borrow().position(id)?;
+            self.drawings.get(position)
+        } else {
+            self.drawing(id)
+        }
+    }
+
+    /// Run `f` on a candidate with its anchors in media px and, when the candidate pass cached
+    /// it under the current options, its measured text width (`indexed` only; the reference
+    /// path recomputes everything). `None` when the anchors cannot convert.
+    fn with_candidate_px<R>(
+        &self,
+        id: DrawingId,
+        indexed: bool,
+        f: impl FnOnce(&Drawing, &[(f64, f64)], Option<f64>) -> R,
+    ) -> Option<R> {
+        let drawing = self.candidate_drawing(id, indexed)?;
+        if !indexed {
+            return Some(f(drawing, &self.drawing_px(drawing)?, None));
+        }
+        let key = self.drawing_coordinate_key(drawing)?;
+        let mut runtime = self.drawing_runtime.borrow_mut();
+        let width = runtime
+            .entries
+            .get(&id)
+            .filter(|entry| entry.text_key == self.options.generation())
+            .map(|entry| entry.text_width);
+        let px = self.drawing_px_cached(drawing, &mut runtime, key)?;
+        Some(f(drawing, px, width))
+    }
+
+    /// Whether the label of drawing `id` is under `(x, y)`. Eligibility and the text check come
+    /// before any anchor conversion or measuring, so a drawing with nothing to hit costs nothing.
+    fn drawing_label_hit(&self, id: DrawingId, indexed: bool, x: f64, y: f64) -> bool {
+        let Some(drawing) = self.candidate_drawing(id, indexed) else {
+            return false;
+        };
+        if !drawing.visible
+            || drawing.locked
+            || !drawing.interval_visibility.allows(self.drawing_interval)
+            || drawing.kind == DrawingKind::Text
+            || !drawing.kind.paints_generic_text()
+        {
+            return false;
+        }
+        let text = if !drawing.text.is_empty() {
+            drawing.display_text()
+        } else if drawing.kind == DrawingKind::TrendLine {
+            TREND_TEXT_PLACEHOLDER
+        } else {
+            return false;
+        };
+        self.with_candidate_px(id, indexed, |drawing, px, width| {
+            let Some(run) = self.drawing_text_run(drawing, px) else {
+                return false;
+            };
+            let width = width.unwrap_or_else(|| {
+                self.measure_text_run(
+                    text,
+                    run.size,
+                    &self.options.get().layout.font_family,
+                    drawing.text_weight.unwrap_or(400),
+                    drawing.text_italic,
+                )
+            });
+            run.contains(width, x, y)
+        })
+        .unwrap_or(false)
+    }
+
+    /// The drawing under a media-px pointer and the cursor it shows. A trend label or its
+    /// `+ Add text` prompt wins with the text cursor, so moving from the line onto the label
+    /// keeps the affordance; otherwise the body/handle hit and its drag cursor. Pure: hosts use
+    /// it to resolve cursors without changing hover state.
+    pub fn drawing_hover_at(&self, x: f64, y: f64) -> Option<(DrawingId, &'static str)> {
+        if let Some(id) = self.drawing_text_hit_at(x, y) {
+            return Some((id, "text"));
+        }
+        self.hit_test_drawing(x, y).map(|hit| (hit.id, hit.cursor))
+    }
+
+    /// Canonical drawing hover for every host: resolves [`Self::drawing_hover_at`] and applies
+    /// the generic hover promotion plus the text hover ring / trend `+ Add text` prompt, or
+    /// clears both. Returns the hovered drawing and its cursor.
+    pub fn update_drawing_hover(&mut self, x: f64, y: f64) -> Option<(DrawingId, &'static str)> {
+        let hover = self.drawing_hover_at(x, y);
+        let id = hover.map(|(id, _)| id);
+        self.set_hovered_text(id);
+        self.set_hovered_drawing(id);
+        hover
     }
 
     /// Every drawing as a JSON array of `{id, kind, pane_index, points, ...options}` in z-order.
@@ -4470,10 +5041,14 @@ impl ChartEngine {
         self.selected_drawing
     }
 
-    /// Whether the host's inline editor can edit `id`'s `text` in place: the text tool, a trend
-    /// line's label, or a family drawing whose parts carry a text label
-    /// ([`ChartEngine::drawing_text_edit_layout`]), while the drawing is unlocked, visible, and
-    /// shown on the current interval.
+    /// Whether the host's inline editor can edit `id`'s `text` in place: the drawing paints its
+    /// own text ([`ChartEngine::drawing_text_edit_layout`], so its anchors convert), it is
+    /// unlocked, visible, and shown on the current interval, and some part of its text box is
+    /// inside its own pane's plot. A drawing is clipped to its pane, so text panned or scrolled
+    /// wholly out of it paints nothing, and an editor opened there would be invisible and capture
+    /// the keys. Every tool but the eight that paint no text (the flag, the icon, and the
+    /// projection and measuring tools) qualifies. This is the one rule every host and every
+    /// path (double-click, Enter, F2, placement, a direct begin) shares.
     pub fn drawing_text_editable(&self, id: DrawingId) -> bool {
         let Some(drawing) = self.drawing(id) else {
             return false;
@@ -4484,98 +5059,19 @@ impl ChartEngine {
         {
             return false;
         }
-        match drawing.kind {
-            DrawingKind::Text | DrawingKind::TrendLine => true,
-            _ => self.drawing_text_edit_layout(id).is_some(),
-        }
-    }
-
-    /// Open the inline text-edit session the host's typing-mode editor owns on a text-editable
-    /// drawing ([`ChartEngine::drawing_text_editable`]), committing any session open on another
-    /// drawing first. The frame keeps painting the label and the focus border underneath the
-    /// host's borderless caret overlay (the public reference's overlay-caret model), and an empty
-    /// family text box keeps one caret line. Returns false for a drawing that cannot be edited.
-    pub fn begin_drawing_text_edit(&mut self, id: DrawingId) -> bool {
-        if self.editing_drawing() == Some(id) {
-            return true;
-        }
-        if !self.drawing_text_editable(id) {
-            return false;
-        }
-        self.end_drawing_text_edit(true);
-        let Some(drawing) = self.drawing(id) else {
+        let (Some(layout), Some(pane)) = (
+            self.drawing_text_edit_layout(id),
+            self.panes.get(drawing.pane_index),
+        ) else {
             return false;
         };
-        self.text_edit = Some(DrawingTextEdit {
-            id,
-            text: drawing.text.clone(),
-            revision: drawing.revision,
-        });
-        self.invalidate_frame_drawings();
-        true
-    }
-
-    /// Replace the edited drawing's `text` live while the session is open. Live text records no
-    /// undo step and no sync revision; [`ChartEngine::end_drawing_text_edit`] records the whole
-    /// edit once. Returns false while no session is open.
-    pub fn set_drawing_edit_text(&mut self, text: &str) -> bool {
-        let Some(id) = self.editing_drawing() else {
-            return false;
-        };
-        let Some(index) = self.drawings.iter().position(|drawing| drawing.id == id) else {
-            self.text_edit = None;
-            return false;
-        };
-        if self.drawings[index].text != text {
-            let drawing = &mut self.drawings[index];
-            drawing.text = text.to_string();
-            drawing.revision = drawing.revision.saturating_add(1);
-            self.update_drawing_runtime(id);
-            self.invalidate_frame_drawings();
-        }
-        true
-    }
-
-    /// Close the inline text-edit session. Commit records the edit as one undo step (the text
-    /// it began from against the text it ends with) and one sync revision, when the text
-    /// changed; cancel restores the text it began from without a history entry. Returns false
-    /// while no session is open.
-    pub fn end_drawing_text_edit(&mut self, commit: bool) -> bool {
-        let Some(edit) = self.text_edit.take() else {
-            return false;
-        };
-        self.invalidate_frame_drawings();
-        let Some(index) = self
-            .drawings
-            .iter()
-            .position(|drawing| drawing.id == edit.id)
-        else {
-            return true;
-        };
-        if self.drawings[index].text == edit.text {
-            return true;
-        }
-        if commit {
-            let after = self.drawings[index].clone();
-            let mut before = after.clone();
-            before.text = edit.text;
-            before.revision = edit.revision;
-            self.record_drawing_command(DrawingCommand::Update {
-                before,
-                after: Box::new(after),
-            });
-        } else {
-            let drawing = &mut self.drawings[index];
-            drawing.text = edit.text;
-            drawing.revision = edit.revision;
-            self.update_drawing_runtime(edit.id);
-        }
-        true
+        let [left, top, right, bottom] = layout.rect;
+        right > 0.0 && left < self.pane_w && bottom > pane.top && top < pane.top + pane.height
     }
 
     /// The drawing whose inline text-edit session is open.
     pub fn editing_drawing(&self) -> Option<DrawingId> {
-        self.text_edit.as_ref().map(|edit| edit.id)
+        self.drawing_text_edit.as_ref().map(|session| session.id)
     }
 
     /// Whether `id` paints parts only while focused (`DrawingFamily::reveals_on_focus`).
@@ -4590,7 +5086,9 @@ impl ChartEngine {
     }
 
     /// Mark a text drawing or trend line under the host pointer. Text drawings paint their
-    /// hover ring; empty trend lines paint their inline `+ Add text` affordance.
+    /// hover ring; empty trend lines paint their inline `+ Add text` affordance. Any other
+    /// drawing has no hover chrome, so its id (a label hit on a ray or a rectangle) is stored as
+    /// `None`: widening the filter would only invalidate drawings for no visible change.
     pub fn set_hovered_text(&mut self, id: Option<DrawingId>) {
         let valid = id.filter(|&hid| {
             self.drawings.iter().any(|d| {
@@ -4647,6 +5145,16 @@ impl ChartEngine {
         self.selected_drawing.is_some()
     }
 
+    /// The drawing a click at pane-relative media px `(x, y)` would select, without selecting it:
+    /// a drawing's own text under the point ([`ChartEngine::drawing_text_hit_at`]) first, then the
+    /// selected drawing's anchor handle or the topmost body ([`ChartEngine::hit_test_drawing`]),
+    /// the order the click pipeline arbitrates in (shared with [`ChartEngine::drawing_hover_at`]). A host that acts on a repeated click (a
+    /// double-click that opens the selected drawing's editor) asks this first, so a click that
+    /// landed on something else, or that another owner consumed, never acts on the selection.
+    pub fn drawing_at(&self, x: f64, y: f64) -> Option<DrawingId> {
+        self.drawing_hover_at(x, y).map(|(id, _)| id)
+    }
+
     /// Remove the selected drawing (Delete/Backspace). Returns false while nothing is selected.
     pub fn remove_selected_drawing(&mut self) -> bool {
         let Some(id) = self.selected_drawing else {
@@ -4680,6 +5188,39 @@ impl ChartEngine {
         self.hit_test_drawing_impl(x, y, false, HitProfile::PRECISION)
     }
 
+    /// The selected drawing's anchor handle at `(x, y)` in `pane`. Handles win over every body
+    /// (they paint above all). The brush shows handles at its two ENDS only; the rectangle shows
+    /// its eight conventional anchors (four corners + four edge midpoints); the rest show one per
+    /// defining anchor.
+    fn selected_handle_hit(
+        &self,
+        pane: usize,
+        x: f64,
+        y: f64,
+        profile: HitProfile,
+    ) -> Option<DrawingHit> {
+        let selected = self.selected_drawing?;
+        let drawing = self.drawing(selected)?;
+        if drawing.pane_index != pane
+            || !drawing.visible
+            || !drawing.interval_visibility.allows(self.drawing_interval)
+        {
+            return None;
+        }
+        let px = self.drawing_px(drawing)?;
+        let handle = self
+            .drawing_handle_set(drawing, &px)
+            .into_iter()
+            .find(|handle| {
+                (x - handle.point.0).hypot(y - handle.point.1) <= profile.drawing_anchor_radius
+            })?;
+        Some(DrawingHit {
+            id: selected,
+            part: handle.part,
+            cursor: handle.cursor,
+        })
+    }
+
     fn hit_test_drawing_impl(
         &self,
         x: f64,
@@ -4691,34 +5232,8 @@ impl ChartEngine {
             return None;
         }
         let pane = self.pane_at_y(y)?;
-        // The selected drawing's anchor handles win over every body (they paint above all).
-        // The brush shows handles at its two ENDS only; the rectangle shows its eight
-        // Eight conventional anchors (four corners + four edge midpoints); the rest show one per
-        // defining anchor.
-        if let Some(selected) = self.selected_drawing {
-            if let Some(drawing) = self.drawing(selected) {
-                if drawing.pane_index == pane
-                    && drawing.visible
-                    && drawing.interval_visibility.allows(self.drawing_interval)
-                {
-                    if let Some(px) = self.drawing_px(drawing) {
-                        let handle =
-                            self.drawing_handle_set(drawing, &px)
-                                .into_iter()
-                                .find(|handle| {
-                                    (x - handle.point.0).hypot(y - handle.point.1)
-                                        <= profile.drawing_anchor_radius
-                                });
-                        if let Some(handle) = handle {
-                            return Some(DrawingHit {
-                                id: selected,
-                                part: handle.part,
-                                cursor: handle.cursor,
-                            });
-                        }
-                    }
-                }
-            }
+        if let Some(hit) = self.selected_handle_hit(pane, x, y, profile) {
+            return Some(hit);
         }
         if !indexed {
             for drawing in self.drawings.iter().rev() {
@@ -5013,10 +5528,12 @@ impl ChartEngine {
         };
         drag.current_x = x;
         drag.current_y = y;
-        let (dx, dy) = (x - drag.start_x, y - drag.start_y);
+        let start_x = drag.start_x;
+        let (dx, dy) = (x - start_x, y - drag.start_y);
         let (id, part) = (drag.id, drag.part);
         let (start_points, start_px) = (drag.start_points.clone(), drag.start_px.clone());
         let handle_px = drag.handle_px;
+        let keyboard_step = drag.keyboard_step;
         let Some(drawing) = self.drawing(id) else {
             return;
         };
@@ -5060,8 +5577,41 @@ impl ChartEngine {
                         return;
                     };
                     if modifiers.magnet && index != 2 {
-                        cursor_pt =
-                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, cursor_pt);
+                        if let Some(snapped) =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
+                        {
+                            cursor_pt = snapped;
+                        }
+                    }
+                    let raw_price = cursor_pt.price;
+                    if matches!(index, 1 | 2) {
+                        cursor_pt.logical = self.snapped_crosshair_index(x) as f64;
+                        // The keyboard honours the same slot grid: a nudge that rounds back to
+                        // the grabbed slot still steps one slot the way the key points.
+                        if let Some((key_x, _)) = keyboard_step {
+                            let start = start_points[if index == 1 { 0 } else { 1 }].logical;
+                            if key_x != 0.0 && (cursor_pt.logical - start).abs() < 0.5 {
+                                cursor_pt.logical = start + key_x.signum();
+                            }
+                        }
+                    }
+                    cursor_pt.price = self.snap_position_price(pane, price_scale, raw_price);
+                    if let (Some((_, key_y)), Some(start_index)) = (
+                        keyboard_step,
+                        match index {
+                            0 => Some(1),
+                            1 => Some(0),
+                            3 => Some(2),
+                            _ => None,
+                        },
+                    ) {
+                        cursor_pt.price = self.keyboard_position_price(
+                            (pane, price_scale),
+                            start_points[start_index].price,
+                            raw_price,
+                            cursor_pt.price,
+                            key_y,
+                        );
                     }
                     match index {
                         // Target: vertical level only.
@@ -5116,8 +5666,11 @@ impl ChartEngine {
                         cursor_pt = snapped;
                     }
                     if modifiers.magnet {
-                        cursor_pt =
-                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, cursor_pt);
+                        if let Some(snapped) =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
+                        {
+                            cursor_pt = snapped;
+                        }
                     }
                     let Some((mx, my)) = self.drawing_to_px_for(pane, price_scale, cursor_pt)
                     else {
@@ -5196,10 +5749,14 @@ impl ChartEngine {
                         };
                         point = snapped;
                     }
+                    let mut magnet_chose = false;
                     if modifiers.magnet {
-                        let snapped =
-                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
-                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                        if let Some(snapped) =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
+                        {
+                            point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                            magnet_chose = true;
+                        }
                     }
                     if modifiers.straighten && index < 2 && points.len() >= 2 {
                         // The first two anchors are the straightened segment (a channel's base line);
@@ -5209,6 +5766,35 @@ impl ChartEngine {
                             self.straighten_point(pane, price_scale, kind, fixed, point)
                         {
                             point = snapped;
+                        }
+                    }
+                    if kind.spec().grid_snap {
+                        let raw_price = point.price;
+                        let anchor_x = start_px.get(index).map_or(x, |&(px, _)| px + dx);
+                        point = self.grid_snap_point(
+                            kind,
+                            pane,
+                            price_scale,
+                            anchor_x,
+                            point,
+                            magnet_chose,
+                        );
+                        // A keyboard nudge that snaps back to where it started still steps one
+                        // slot or tick the way the key points, like the position handles above.
+                        if let Some((key_x, key_y)) = keyboard_step {
+                            let start = start_points[index];
+                            if key_x != 0.0 && point.logical == start.logical {
+                                point.logical = start.logical + key_x.signum();
+                            }
+                            if key_y != 0.0 {
+                                point.price = self.keyboard_position_price(
+                                    (pane, price_scale),
+                                    start.price,
+                                    raw_price,
+                                    point.price,
+                                    key_y,
+                                );
+                            }
                         }
                     }
                     points[index] = point;
@@ -5226,11 +5812,29 @@ impl ChartEngine {
                     (dx, dy)
                 };
                 let single_anchor = points.len() == 1;
+                let grid = kind.spec().grid_snap;
+                // Follow the crosshair's slot changes from the grabbed point. One shared
+                // logical delta moves the body rigidly and preserves the grab offset/width.
+                let mut time_steps = if grid {
+                    (self.snapped_crosshair_index(start_x + dx)
+                        - self.snapped_crosshair_index(start_x)) as f64
+                } else {
+                    0.0
+                };
+                if let (true, Some((key_x, _))) = (grid, keyboard_step) {
+                    // A keyboard nudge steps at least one slot the way the key points.
+                    if key_x != 0.0 && time_steps == 0.0 {
+                        time_steps = key_x.signum();
+                    }
+                }
                 for (index, slot) in points.iter_mut().enumerate() {
                     let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
                     let Some(mut point) = convert(index, dx, dy) else {
                         return;
                     };
+                    if grid {
+                        point.logical = slot.logical + time_steps;
+                    }
                     if snap_time_to_data {
                         let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                             return;
@@ -5241,9 +5845,24 @@ impl ChartEngine {
                     // the anchor drag, so the magnet applies here too (a Ctrl-dragged vertical
                     // line snaps to bar centers, a horizontal one to the nearest rendered price).
                     if modifiers.magnet && single_anchor {
-                        let snapped =
-                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
-                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                        if let Some(snapped) =
+                            self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
+                        {
+                            point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                        }
+                    }
+                    if grid {
+                        let raw_price = point.price;
+                        point.price = self.snap_position_price(pane, price_scale, raw_price);
+                        if let Some((_, key_y)) = keyboard_step {
+                            point.price = self.keyboard_position_price(
+                                (pane, price_scale),
+                                slot.price,
+                                raw_price,
+                                point.price,
+                                key_y,
+                            );
+                        }
                     }
                     *slot = point;
                 }
@@ -5269,8 +5888,11 @@ impl ChartEngine {
                     point = snapped;
                 }
                 if modifiers.magnet {
-                    let snapped = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
-                    point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                    if let Some(snapped) =
+                        self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
+                    {
+                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                    }
                 }
                 let Some(point_px) = self.drawing_anchor_px(kind, pane, price_scale, point) else {
                     return;
@@ -5483,6 +6105,7 @@ impl ChartEngine {
         self.invalidate_frame_overlay();
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
+        self.drawing_controller.measure = None;
         self.drawing_controller.armed = match (kind, template) {
             (Some(kind), Some(template)) => Some(ArmedDrawingTool {
                 kind,
@@ -5771,13 +6394,185 @@ impl ChartEngine {
             && self.drawing_create_pop_anchor()
     }
 
-    /// Cancel creation and disarm the tool as one atomic controller operation.
+    /// Cancel creation and disarm the tool as one atomic controller operation. Escape routes
+    /// here, so it also dismisses a transient measure.
     pub fn cancel_drawing_tool(&mut self) {
         self.invalidate_frame_drawings();
         self.invalidate_frame_overlay();
         self.drawing_controller.armed = None;
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
+        self.drawing_controller.measure = None;
+    }
+
+    // --- transient Shift-click measure ------------------------------------------------------
+
+    /// The measure anchor under a pointer: clamped into the bound pane, magnet-snapped on
+    /// request, then placed on the crosshair time slot and price tick like the measure tools.
+    fn measure_point_at(
+        &self,
+        pane_index: usize,
+        price_scale: DrawingPriceScale,
+        x: f64,
+        y: f64,
+        magnet: crate::DrawingMagnetMode,
+    ) -> Option<DrawingPoint> {
+        let pane = self.panes.get(pane_index)?;
+        let x = x.clamp(0.0, self.pane_w);
+        let y = y.clamp(pane.top, pane.top + pane.height);
+        let point = self.drawing_from_px_for(pane_index, price_scale, x, y)?;
+        let magnet_point = self.magnet_snap_point_at(magnet, pane_index, price_scale, x, y);
+        Some(self.grid_snap_point(
+            DrawingKind::DateAndPriceRange,
+            pane_index,
+            price_scale,
+            x,
+            magnet_point.unwrap_or(point),
+            magnet_point.is_some(),
+        ))
+    }
+
+    /// The magnet the quick measure snaps with: the chart's mode, with Ctrl/Cmd as the temporary
+    /// toggle, exactly like an armed tool that sets no mode of its own.
+    fn measure_magnet(&self, modifiers: DrawingModifiers) -> crate::DrawingMagnetMode {
+        self.effective_drawing_magnet(crate::DrawingMagnetMode::Off, modifiers.magnet)
+    }
+
+    /// Forward a primary press to the transient measure. A live measure always consumes it: a
+    /// following measure freezes at the press, a frozen one is dismissed. Otherwise `begin`
+    /// (the host's Shift state, after its own object hit tests) starts a measure in the pane
+    /// under the pointer on that pane's default price scale. Returns whether the press was
+    /// consumed; an armed drawing tool keeps ownership of its presses.
+    pub fn measure_pointer_down(
+        &mut self,
+        x: f64,
+        y: f64,
+        begin: bool,
+        modifiers: DrawingModifiers,
+    ) -> bool {
+        if let Some(session) = self.drawing_controller.measure.as_ref() {
+            if session.following {
+                let (pane, scale) = (session.drawing.pane_index, session.drawing.price_scale);
+                let end = self.measure_point_at(pane, scale, x, y, self.measure_magnet(modifiers));
+                if let Some(session) = self.drawing_controller.measure.as_mut() {
+                    if let Some(end) = end {
+                        session.set_end(end);
+                    }
+                    session.following = false;
+                }
+            } else {
+                self.drawing_controller.measure = None;
+            }
+            self.invalidate_frame_drawings();
+            return true;
+        }
+        if !begin || !x.is_finite() || self.drawing_controller.armed.is_some() {
+            return false;
+        }
+        let Some(pane) = self.pane_at_y(y) else {
+            return false;
+        };
+        if !self.pane_uses_financial_time(pane) || x < 0.0 || x > self.pane_w {
+            return false;
+        }
+        let price_scale = match self.pane_default_scale_target(pane) {
+            PriceScaleTarget::Left => DrawingPriceScale::Left,
+            PriceScaleTarget::Overlay => DrawingPriceScale::Overlay,
+            PriceScaleTarget::Right | PriceScaleTarget::Named(_) => DrawingPriceScale::Right,
+        };
+        let magnet = self.measure_magnet(modifiers);
+        let Some(start) = self.measure_point_at(pane, price_scale, x, y, magnet) else {
+            return false;
+        };
+        let mut drawing = Drawing::new(0, DrawingKind::DateAndPriceRange, pane, vec![start, start]);
+        drawing.price_scale = price_scale;
+        self.drawing_controller.measure = Some(MeasureSession {
+            drawing,
+            press: (x, y),
+            following: true,
+        });
+        self.invalidate_frame_drawings();
+        true
+    }
+
+    /// Follow the pointer with a live measure's end anchor (button held or not). Returns whether
+    /// the measure changed.
+    pub fn measure_pointer_move(&mut self, x: f64, y: f64, modifiers: DrawingModifiers) -> bool {
+        let Some(session) = self
+            .drawing_controller
+            .measure
+            .as_ref()
+            .filter(|session| session.following)
+        else {
+            return false;
+        };
+        let (pane, scale) = (session.drawing.pane_index, session.drawing.price_scale);
+        let Some(end) = self.measure_point_at(pane, scale, x, y, self.measure_magnet(modifiers))
+        else {
+            return false;
+        };
+        let Some(session) = self.drawing_controller.measure.as_mut() else {
+            return false;
+        };
+        if session.drawing.points[1] == end {
+            return false;
+        }
+        session.set_end(end);
+        self.invalidate_frame_drawings();
+        true
+    }
+
+    /// Release after a measure press. A release beyond the click slop ends a press-drag
+    /// measure; a click leaves it following until the next press. Returns whether it changed.
+    pub fn measure_pointer_up(&mut self, x: f64, y: f64, modifiers: DrawingModifiers) -> bool {
+        let Some(session) = self
+            .drawing_controller
+            .measure
+            .as_ref()
+            .filter(|session| session.following)
+        else {
+            return false;
+        };
+        if (x - session.press.0).abs() + (y - session.press.1).abs() < MEASURE_DRAG_SLOP {
+            return false;
+        }
+        self.measure_pointer_move(x, y, modifiers);
+        if let Some(session) = self.drawing_controller.measure.as_mut() {
+            session.following = false;
+        }
+        self.invalidate_frame_drawings();
+        true
+    }
+
+    /// Dismiss the transient measure (Escape, focus/capture loss). Returns whether one existed.
+    pub fn cancel_measure(&mut self) -> bool {
+        if self.drawing_controller.measure.take().is_none() {
+            return false;
+        }
+        self.invalidate_frame_drawings();
+        true
+    }
+
+    pub fn measure_active(&self) -> bool {
+        self.drawing_controller.measure.is_some()
+    }
+
+    /// Whether the measure's end anchor still follows the pointer.
+    pub fn measure_following(&self) -> bool {
+        self.drawing_controller
+            .measure
+            .as_ref()
+            .is_some_and(|session| session.following)
+    }
+
+    /// The transient measure's start/end anchors, for hosts and tests.
+    pub fn measure_points(&self) -> Option<[DrawingPoint; 2]> {
+        let points = &self.drawing_controller.measure.as_ref()?.drawing.points;
+        Some([points[0], points[1]])
+    }
+
+    pub(crate) fn measure_session(&self) -> Option<&MeasureSession> {
+        self.drawing_controller.measure.as_ref()
     }
 
     /// Abort only the in-flight placement/capture while leaving the currently armed tool intact.
@@ -5832,6 +6627,12 @@ impl ChartEngine {
             return None;
         }
         let pane_geometry = self.panes.get(pane)?;
+        let entry = DrawingPoint {
+            logical: self
+                .snapped_crosshair_index(self.time_scale.logical_to_coordinate(entry.logical))
+                as f64,
+            price: self.snap_position_price(pane, price_scale, entry.price),
+        };
         let (entry_x, entry_y) = self.drawing_to_px_for(pane, price_scale, entry)?;
 
         // A position is born at a useful editable size from one click. Horizontal extent prefers
@@ -5853,6 +6654,7 @@ impl ChartEngine {
         let upper = self.drawing_from_px_for(pane, price_scale, entry_x, upper_y)?;
         let lower = self.drawing_from_px_for(pane, price_scale, entry_x, lower_y)?;
         let mut extent = self.drawing_from_px_for(pane, price_scale, extent_x, entry_y)?;
+        extent.logical = self.snapped_crosshair_index(extent_x) as f64;
         if snap_time_to_data {
             extent = self.snap_drawing_time_to_data(extent)?;
         }
@@ -5863,11 +6665,23 @@ impl ChartEngine {
             DrawingKind::ShortPosition => (high, -1.0),
             _ => return None,
         };
-        let risk_distance = (entry.price - stop_price).abs();
+        let mut risk_distance =
+            (entry.price - self.snap_position_price(pane, price_scale, stop_price)).abs();
+        if risk_distance <= f64::EPSILON {
+            risk_distance = self
+                .position_price_tick_at(pane, price_scale, entry.price)
+                .unwrap_or(0.0);
+        }
         if !risk_distance.is_finite() || risk_distance <= f64::EPSILON {
             return None;
         }
-        let target_price = entry.price + reward_sign * risk_distance * 2.0;
+        let stop_price =
+            self.snap_position_price(pane, price_scale, entry.price - reward_sign * risk_distance);
+        let target_price = self.snap_position_price(
+            pane,
+            price_scale,
+            entry.price + reward_sign * risk_distance * 2.0,
+        );
         Some(vec![
             entry,
             DrawingPoint {
@@ -5948,9 +6762,14 @@ impl ChartEngine {
             };
             point = snapped;
         }
-        if !pane_anchored {
-            let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
-            point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
+        let magnet = if pane_anchored {
+            crate::DrawingMagnetMode::Off
+        } else {
+            self.effective_drawing_magnet(own_magnet, modifiers.magnet)
+        };
+        let magnet_point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y);
+        if let Some(snapped) = magnet_point {
+            point = snapped;
         }
         if modifiers.straighten && !pane_anchored {
             if let Some(fixed) = fixed {
@@ -5960,6 +6779,7 @@ impl ChartEngine {
                 }
             }
         }
+        point = self.grid_snap_point(kind, pane, price_scale, x, point, magnet_point.is_some());
         let preset_points = if matches!(
             kind.spec().placement,
             DrawingPlacement::SingleClickPreset { .. }
@@ -6125,9 +6945,14 @@ impl ChartEngine {
             };
             point = snapped;
         }
-        if !pane_anchored {
-            let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
-            point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y, point);
+        let magnet = if pane_anchored {
+            crate::DrawingMagnetMode::Off
+        } else {
+            self.effective_drawing_magnet(own_magnet, modifiers.magnet)
+        };
+        let magnet_point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y);
+        if let Some(snapped) = magnet_point {
+            point = snapped;
         }
         if modifiers.straighten && !pane_anchored {
             if let Some(pending) = &self.drawing_controller.pending {
@@ -6139,6 +6964,14 @@ impl ChartEngine {
                     }
                 }
             }
+        }
+        if let Some(kind) = self
+            .drawing_controller
+            .pending
+            .as_ref()
+            .map(|pending| pending.drawing.kind)
+        {
+            point = self.grid_snap_point(kind, pane, price_scale, x, point, magnet_point.is_some());
         }
         if let Some(pending) = self.drawing_controller.pending.as_mut() {
             pending.drawing.pane_index = pane;

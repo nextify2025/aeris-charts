@@ -159,12 +159,20 @@ fn rejected_diagnostics_json(reason: impl core::fmt::Display) -> String {
     .to_string()
 }
 
-/// Rejected ingestion for a host write to an engine-derived series (footprint, synthetic, or
-/// resampled bars), which changes only through its source.
+/// Rejected ingestion for a host write to a series the engine owns (a footprint, a trade-bound
+/// candle or bar, a CVD, delta, or volume study, or resampled or synthetic bars), which changes
+/// only through its trade stream or source. The `derived_series` code lets hosts tell it from an
+/// invalid payload. Callers decide ownership with `series_is_source_owned`, never from a refused
+/// write, because the engine's `false`/`0` also means unknown ids and invalid data.
 fn derived_series_rejection(id: u32) -> String {
-    rejected_diagnostics_json(format_args!(
-        "series {id} is derived by the engine; write to its source instead"
+    let mut json: serde_json::Value = serde_json::from_str(&rejected_diagnostics_json(
+        format_args!(
+            "series {id} is derived by the engine; write to its trade stream, resampler source, or synthetic-bar source instead"
+        ),
     ))
+    .unwrap_or_default();
+    json["code"] = "derived_series".into();
+    json.to_string()
 }
 
 fn rejected_validation_diagnostics_json(
@@ -801,6 +809,26 @@ pub async fn create_chart(
                 .unwrap_or(0.0)
         },
     )));
+    let cap_ctx = inner.axis_ctx.clone();
+    inner.engine.set_text_cap_center(Some(Box::new(
+        move |size: f64, family: &str, weight: u16, italic: bool| {
+            cap_ctx.set_font(&aeris_charts_render::draw_list::text_font_spec(
+                size as f32,
+                family,
+                weight,
+                italic,
+            ));
+            cap_ctx.set_text_baseline("middle");
+            // Figures carry the trading readouts; their ink spans the cap height on the baseline.
+            cap_ctx
+                .measure_text("0")
+                .map(|metrics| {
+                    (metrics.actual_bounding_box_ascent() - metrics.actual_bounding_box_descent())
+                        / 2.0
+                })
+                .unwrap_or(0.0)
+        },
+    )));
 
     Ok(AerisChart {
         inner: Rc::new(RefCell::new(inner)),
@@ -934,6 +962,26 @@ pub async fn create_offscreen_chart(
             measure_ctx
                 .measure_text(text)
                 .map(|metrics| metrics.width())
+                .unwrap_or(0.0)
+        },
+    )));
+    let cap_ctx = inner.axis_ctx.clone();
+    inner.engine.set_text_cap_center(Some(Box::new(
+        move |size: f64, family: &str, weight: u16, italic: bool| {
+            cap_ctx.set_font(&aeris_charts_render::draw_list::text_font_spec(
+                size as f32,
+                family,
+                weight,
+                italic,
+            ));
+            cap_ctx.set_text_baseline("middle");
+            // Figures carry the trading readouts; their ink spans the cap height on the baseline.
+            cap_ctx
+                .measure_text("0")
+                .map(|metrics| {
+                    (metrics.actual_bounding_box_ascent() - metrics.actual_bounding_box_descent())
+                        / 2.0
+                })
                 .unwrap_or(0.0)
         },
     )));
@@ -1205,6 +1253,8 @@ impl AerisChart {
                 let kind = match hit.kind {
                     aeris_charts_engine::TradingHitKind::PositionLine => "position_line",
                     aeris_charts_engine::TradingHitKind::OrderLine => "order_line",
+                    aeris_charts_engine::TradingHitKind::TakeProfitButton => "take_profit_button",
+                    aeris_charts_engine::TradingHitKind::StopLossButton => "stop_loss_button",
                     aeris_charts_engine::TradingHitKind::CancelButton => "cancel_button",
                     aeris_charts_engine::TradingHitKind::ExecutionMarker => "execution_marker",
                     aeris_charts_engine::TradingHitKind::Annotation => "annotation",
@@ -1229,11 +1279,10 @@ impl AerisChart {
     }
 
     pub fn trading_cursor_at(&self, x_css: f64, y_css: f64) -> u8 {
-        match self.inner.borrow().engine.trading_hit_at(x_css, y_css) {
+        match self.inner.borrow().engine.trading_cursor_at(x_css, y_css) {
             None => 0,
-            Some(hit) if hit.kind == aeris_charts_engine::TradingHitKind::OrderLine => 2,
-            Some(hit) if matches!(hit.kind, aeris_charts_engine::TradingHitKind::CancelButton) => 1,
-            Some(_) => 0,
+            Some(aeris_charts_engine::TradingCursor::Pointer) => 1,
+            Some(aeris_charts_engine::TradingCursor::Grab) => 2,
         }
     }
 
@@ -4483,6 +4532,24 @@ impl AerisChart {
         self.inner.borrow_mut().set_seconds_visible(visible);
     }
 
+    /// Set the chart display time zone using an IANA identifier. Canonical timestamps stay UTC;
+    /// axis/crosshair calendar boundaries and labels are localized with DST-aware rules.
+    pub fn set_time_zone(&mut self, time_zone: &str) -> bool {
+        self.inner.borrow_mut().set_time_zone(time_zone)
+    }
+
+    /// Current IANA chart display time-zone identifier (`custom` when an explicit offset schedule
+    /// that no named zone produced is installed).
+    pub fn time_zone(&self) -> String {
+        self.inner.borrow().time_zone().to_string()
+    }
+
+    /// Exact built-in TradingView-parity time-zone identifiers as JSON.
+    pub fn supported_time_zones_json(&self) -> String {
+        serde_json::to_string(aeris_charts_engine::TRADINGVIEW_TIME_ZONES)
+            .unwrap_or_else(|_| "[]".to_string())
+    }
+
     /// reference `timeScale.minBarSpacing` (CSS px).
     pub fn set_min_bar_spacing(&mut self, spacing: f64) {
         self.inner.borrow_mut().set_min_bar_spacing(spacing);
@@ -4592,9 +4659,11 @@ impl AerisChart {
         self.inner.borrow_mut().set_time_formatter(f);
     }
 
-    /// Exchange time zone / trading-day start / explicit time-axis marks (`{"timeZone": "UTC" |
-    /// transitions, "sessionStart": seconds, "tickMarks": [{time, label?}] | null}`), validated
-    /// together. Returns "" on success or the validation message; a rejection changes nothing.
+    /// Exchange time zone / trading-day start / explicit time-axis marks / bar time label
+    /// (`{"timeZone": "UTC" | transitions, "sessionStart": seconds, "tickMarks": [{time, label?}] |
+    /// null, "barTimeLabel": "open" | null | {anchor: "close", interval_seconds, windows?}}`),
+    /// validated together. Returns "" on success or the validation message; a rejection changes
+    /// nothing.
     pub fn set_exchange_time_json(&mut self, time_scale_json: &str) -> String {
         self.inner
             .borrow_mut()
@@ -4611,6 +4680,12 @@ impl AerisChart {
     /// Exchange-local wall-clock seconds for a UTC timestamp.
     pub fn exchange_local_seconds(&self, time: f64) -> f64 {
         self.inner.borrow().exchange_local_seconds(time)
+    }
+
+    /// The UTC instant a bar identified by open time `time` prints under
+    /// `timeScale.barTimeLabel`: `time` itself by default, its close under a close-time label.
+    pub fn bar_label_time(&self, time: f64) -> f64 {
+        self.inner.borrow().bar_label_time(time)
     }
 
     /// Bit 0 `timeVisible`, bit 1 `secondsVisible`, bit 2 calendar-date axis.
@@ -4678,6 +4753,13 @@ impl AerisChart {
     }
     pub fn zoom_focused(&mut self, x_css: f64, scale: f64) {
         self.inner.borrow_mut().zoom_focused(x_css, scale);
+    }
+    /// Ordinary wheel zoom: the engine resolves the anchor (Ctrl/Cmd zooms around the pointer,
+    /// otherwise the time scale's right-edge pin policy applies).
+    pub fn wheel_zoom_time(&mut self, x_css: f64, scale: f64, control: bool, meta: bool) {
+        self.inner
+            .borrow_mut()
+            .wheel_zoom_time(x_css, scale, control, meta);
     }
     pub fn scroll_start(&mut self, x_css: f64) {
         self.inner.borrow_mut().scroll_start(x_css);
@@ -5144,17 +5226,30 @@ impl AerisChart {
     pub fn drawing_point_to_coordinate(&self, id: u32, index: usize) -> Vec<f64> {
         self.inner.borrow().drawing_point_to_coordinate(id, index)
     }
-    /// Exact text-run anchor `[x, y]` in overlay CSS px for inline drawing editing.
+    /// Exact text-run anchor `[x, y]` in overlay CSS px (the aligned edge of a drawing's generic
+    /// label run; empty when the drawing has no resolvable run).
     pub fn drawing_text_coordinate(&self, id: u32) -> Vec<f64> {
         self.inner.borrow().drawing_text_coordinate(id)
     }
-    /// Exact text-run transform `[x, y, clockwise_radians]` in overlay CSS px.
+    /// Exact text-run transform `[x, y, clockwise_radians]` in overlay CSS px: the aligned anchor
+    /// the frame paints the run at. Editors position from `drawing_text_edit_layout_json`, which
+    /// resolves the run's start point from it.
     pub fn drawing_text_transform(&self, id: u32) -> Vec<f64> {
         self.inner.borrow().drawing_text_transform(id)
     }
-    /// Trend-line label/placeholder hit identity, or zero when the point misses.
+    /// Identity of the topmost drawing whose own text is under the point, or zero: any drawing
+    /// that paints a generic label (a line, channel, Fibonacci, pitchfork, pattern, or shape
+    /// tool's text, or a trend line's `+ Add text` prompt), never the text tool or an annotation
+    /// text box, which are ordinary body hits. A higher drawing's body or the selected drawing's
+    /// anchor handle at the point wins over the label beneath it.
     pub fn drawing_text_hit_at(&self, x_css: f64, y_css: f64) -> u32 {
         self.inner.borrow().drawing_text_hit_at(x_css, y_css)
+    }
+    /// Identity of the drawing a click at the point would select, or zero, without selecting it:
+    /// a drawing's own text first, then the selected drawing's anchor handle or the topmost
+    /// body. The gesture layer asks it before a double-click acts on the selected drawing.
+    pub fn drawing_at(&self, x_css: f64, y_css: f64) -> u32 {
+        self.inner.borrow().drawing_at(x_css, y_css)
     }
     /// Every drawing as a JSON array in z-order (`{id, kind, pane_index, points, ...options}`).
     pub fn drawings_json(&self) -> String {
@@ -5259,31 +5354,54 @@ impl AerisChart {
     pub fn set_selected_drawing(&mut self, id: Option<u32>) {
         self.inner.borrow_mut().set_selected_drawing(id);
     }
-    /// Whether the host's inline editor can edit the drawing's text in place (the text tool, a
-    /// trend label, or a family text box), while it is unlocked, visible, and shown.
+    /// Whether the host's inline editor can edit the drawing's text in place: the drawing paints
+    /// its own text (every tool but the flag, the icon, and the projection and measuring tools)
+    /// and its anchors convert, while it is unlocked, visible, shown, and some part of its text is
+    /// inside its pane's plot (text panned wholly out of view is not editable).
     pub fn drawing_text_editable(&self, id: u32) -> bool {
         self.inner.borrow().engine.drawing_text_editable(id)
-    }
-    /// Open the engine's text-edit session for the host editor. Frame construction keeps the
-    /// committed glyphs under the overlay caret while it is open. False when not editable.
-    pub fn begin_drawing_text_edit(&mut self, id: u32) -> bool {
-        self.inner.borrow_mut().engine.begin_drawing_text_edit(id)
-    }
-    /// Live text of the open session: repaints without an undo step or a sync revision.
-    pub fn set_drawing_edit_text(&mut self, text: &str) -> bool {
-        self.inner.borrow_mut().engine.set_drawing_edit_text(text)
-    }
-    /// Close the open session: commit records one undo step, cancel restores the text.
-    pub fn end_drawing_text_edit(&mut self, commit: bool) -> bool {
-        self.inner.borrow_mut().engine.end_drawing_text_edit(commit)
     }
     pub fn editing_drawing(&self) -> Option<u32> {
         self.inner.borrow().engine.editing_drawing()
     }
-    /// A family text box's editor layout as JSON (`{x, y, line_height, size, font_family,
-    /// weight, italic, color, rect}` in overlay CSS px), or an empty string.
+    /// The drawing's editor layout as JSON (`{x, y, line_height, size, font_family, weight,
+    /// italic, color, rect, angle, multiline}` in overlay CSS px, `angle` in clockwise radians),
+    /// or an empty string for a drawing that paints no text or whose anchors cannot convert.
+    /// `multiline` chooses the editor: a family text box (lines left-aligned at `x`, unrotated)
+    /// or one run whose start (`x`, `y`) rotates by `angle` about itself.
     pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
         self.inner.borrow().drawing_text_edit_layout_json(id)
+    }
+    /// Open the engine-owned typing session on every drawing that paints its own text
+    /// ([`Self::drawing_text_editable`]); a session open on another drawing is committed first.
+    /// The browser keeps its native editable surface (IME, clipboard, accessibility) and paints
+    /// its own caret, so it passes `paint_caret = false`; the engine owns the live text and the
+    /// commit/cancel lifecycle. Frame construction keeps the committed glyphs under the overlay
+    /// caret while it is open. False when the drawing cannot be edited (an open session survives).
+    pub fn begin_drawing_text_edit(&mut self, id: u32, paint_caret: bool) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .begin_drawing_text_edit(id, paint_caret)
+    }
+    /// Mirror the editable surface into the session: its whole value and caret (in chars). Live
+    /// text repaints without an undo step or a sync revision; the engine owns the single-line
+    /// rule of a run label and the length bound.
+    pub fn set_drawing_text_edit(&mut self, text: &str, caret: u32) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .set_drawing_text_edit(text, caret as usize)
+    }
+    /// Enter/blur: keep the typed text, trimmed, as one undo step (an emptied standalone text
+    /// drawing is removed; every other drawing keeps its emptied label).
+    pub fn commit_drawing_text_edit(&mut self) -> bool {
+        self.inner.borrow_mut().engine.commit_drawing_text_edit()
+    }
+    /// Escape: restore the pre-edit text without history (a fresh empty standalone text drawing
+    /// is removed).
+    pub fn cancel_drawing_text_edit(&mut self) -> bool {
+        self.inner.borrow_mut().engine.cancel_drawing_text_edit()
     }
     pub fn selected_drawing(&self) -> Option<u32> {
         self.inner.borrow().selected_drawing()
@@ -5424,6 +5542,45 @@ impl AerisChart {
     }
     pub fn cancel_drawing_tool(&mut self) {
         self.inner.borrow_mut().cancel_drawing_tool();
+    }
+
+    // --- transient Shift-click measure (engine-owned; never a committed drawing) ---
+
+    /// Forward a primary pane press. A live measure always consumes it (freeze or dismiss);
+    /// otherwise `begin` (Shift held, after the host's object hit tests) starts one.
+    pub fn measure_pointer_down(
+        &mut self,
+        x_css: f64,
+        y_css: f64,
+        begin: bool,
+        magnet: bool,
+    ) -> bool {
+        self.inner
+            .borrow_mut()
+            .measure_pointer_down(x_css, y_css, begin, magnet)
+    }
+    /// Follow the pointer with a live measure's end anchor. Returns whether it changed.
+    pub fn measure_pointer_move(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.inner
+            .borrow_mut()
+            .measure_pointer_move(x_css, y_css, magnet)
+    }
+    /// Release after a measure press; a drag release freezes the measure.
+    pub fn measure_pointer_up(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.inner
+            .borrow_mut()
+            .measure_pointer_up(x_css, y_css, magnet)
+    }
+    /// Dismiss the transient measure. Returns whether one existed.
+    pub fn cancel_measure(&mut self) -> bool {
+        self.inner.borrow_mut().cancel_measure()
+    }
+    pub fn measure_active(&self) -> bool {
+        self.inner.borrow().measure_active()
+    }
+    /// `[{logical, price}, {logical, price}]` for the live measure, or `null`.
+    pub fn measure_points_json(&self) -> String {
+        self.inner.borrow().measure_points_json()
     }
 
     /// Arm interactive creation of a tool kind ("" options = defaults): the next clicks place
@@ -5655,6 +5812,12 @@ impl AerisChart {
     pub fn series_kind(&self, id: u32) -> Option<u8> {
         self.inner.borrow().series_kind(id)
     }
+    /// Whether the engine writes this series' rows (a footprint, a trade-bound candle or bar, a
+    /// CVD, delta, or volume study, resampled or synthetic bars). Host data writes to such a
+    /// series are refused; `false` for an unknown or removed id.
+    pub fn series_is_derived(&self, id: u32) -> bool {
+        self.inner.borrow().series_is_source_owned(id)
+    }
     pub fn series_data_by_index(&self, id: u32, index: f64, mismatch: i8) -> Vec<f64> {
         self.inner
             .borrow()
@@ -5692,11 +5855,13 @@ impl AerisChart {
 
     // --- coordinate & logical-range API (roadmap Phase A4) ---
 
-    /// Y (CSS px) for a price, or `undefined` if the price scale has no range yet.
+    /// Y (CSS px, chart content) for a price on pane 0's default price scale, or `undefined` if
+    /// that scale has no range yet.
     pub fn price_to_coordinate(&self, price: f64) -> Option<f64> {
         self.inner.borrow().price_to_coordinate(price)
     }
-    /// Price for a Y (CSS px), or `undefined` if the price scale has no range yet.
+    /// Price for a Y (CSS px, chart content) on the default price scale of the pane containing
+    /// it, or `undefined` if that scale has no range yet.
     pub fn coordinate_to_price(&self, y_css: f64) -> Option<f64> {
         self.inner.borrow().coordinate_to_price(y_css)
     }

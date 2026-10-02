@@ -40,8 +40,11 @@ impl SeriesBarPatch {
 pub enum SeriesUpdateRejection {
     /// Unknown or removed series identity.
     UnknownSeries,
-    /// Custom, advanced (feature), footprint, and engine-derived (synthetic or resampled)
-    /// series own their payloads elsewhere.
+    /// Custom, advanced (feature), footprint, and engine-derived series own their payloads
+    /// elsewhere. Engine-derived means trade-bound candles and bars, CVD, delta, and volume
+    /// studies, and synthetic or resampled targets: their stream, source, or resampler is the
+    /// only writer. [`ChartEngine::series_is_source_owned`] tells the derived case apart from a
+    /// custom, feature, or footprint series.
     UnsupportedSeries,
     /// The patch carried no price the series stores: none of open/high/low/close, or no close
     /// (value) for a line/area/baseline/histogram series.
@@ -211,8 +214,9 @@ impl ChartEngine {
                 SeriesUpdateRejection::UnknownSeries,
             ));
         };
-        // Engine-derived targets (synthetic and resampled bars) change only through their
-        // source; a merge written straight into their rows would diverge from it.
+        // Engine-derived series (trade-bound candles and studies, synthetic and resampled bars)
+        // change only through their owner; a merge written straight into their rows would
+        // diverge from it.
         if matches!(
             series.kind,
             SeriesKind::Custom | SeriesKind::Feature | SeriesKind::Footprint

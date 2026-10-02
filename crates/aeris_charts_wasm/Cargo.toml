@@ -5,9 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
 publish.workspace = true
 description = "wasm-bindgen host shell: canvas surface, data ingestion, gestures, RAF plumbing"
 
@@ -17,10 +14,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-aeris_charts_core = { path = "../aeris_charts_core", version = "0.3.0" }
-aeris_charts_engine = { path = "../aeris_charts_engine", version = "0.3.0" }
-aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
-aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu", version = "0.3.0" }
+aeris_charts_core = { path = "../aeris_charts_core" }
+aeris_charts_engine = { path = "../aeris_charts_engine" }
+aeris_charts_render = { path = "../aeris_charts_render" }
+aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu" }
 
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -54,14 +51,19 @@ console_error_panic_hook = "0.1"
 [lints]
 workspace = true
 
-# wasm-pack runs wasm-opt on release builds (binaryen from the wasm-pack cache).
+# wasm-pack runs wasm-opt after wasm-bindgen. It uses a `wasm-opt` found on PATH and otherwise downloads its
+# own pinned binaryen (version_117 in wasm-pack 0.15.0, which CI pins), so the flags below and the wasm-pack
+# version together define the shipped module. `benchmarks/` records the flags, the wasm-opt version and the
+# Cargo profile with every result, and the size gate fails when wasm-opt did not run.
 #
 # `--enable-simd` is required, not optional: `.cargo/config.toml` builds wasm32 with
 # `+simd128`, so the module contains v128 instructions and wasm-opt refuses to read it
 # without the matching feature flag.
 #
-# Optimization level: `-Oz` stays because package size is a product metric. Evaluate any future
-# change with the versioned release artifact and browser scenarios under `benchmarks/`, preserving
-# the tradeoff as raw evidence instead of a handwritten performance claim.
+# Optimization level: `-Oz` stays because package size is a product metric. Measured on the same module
+# (benchmarks/README.md, "WASM size levers"): binaryen 132 instead of 117 saves 0.5%, and `--converge` saves
+# under 0.02%, so neither is worth a second wasm-opt source. The larger lever is the Cargo profile; evaluate
+# changes with the versioned release artifact and the browser scenarios under `benchmarks/`, preserving the
+# tradeoff as raw evidence instead of a handwritten performance claim.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-Oz", "--enable-mutable-globals", "--enable-nontrapping-float-to-int", "--enable-bulk-memory", "--enable-sign-ext", "--enable-simd"]

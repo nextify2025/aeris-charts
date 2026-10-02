@@ -673,3 +673,145 @@ test("an autoscale provider that calls the chart fails safely on every render pa
   expect(warnings.some((text) => text.includes("autoscale_info_provider"))).toBe(true);
   expect(errors).toEqual([]);
 });
+
+// Open-stamped minute candles keep their open identity and print their close time when the chart
+// option `bar_time_label` asks for it: the crosshair reads 09:31 on the first candle (opened 09:30)
+// and 15:00 on the last (opened 14:59), on both backends. Every time the API reports stays the open.
+for (const backend of ["canvas2d", "webgpu"]) {
+  test(`minute candles with bar_open slots print their close time (${backend})`, async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.addInitScript(() => {
+      window.__texts = [];
+      const original = CanvasRenderingContext2D.prototype.fillText;
+      CanvasRenderingContext2D.prototype.fillText = function (text, ...args) {
+        window.__texts.push(String(text));
+        return original.call(this, text, ...args);
+      };
+    });
+    await page.goto(`/?runtimeTest=presentedFrame&backend=${backend}&forceFallbackAdapter=1`);
+    await page.waitForFunction((expected) => window.__chart?.backend?.() === expected, backend);
+    const windows = [["09:30", "11:30"], ["13:00", "15:00"]];
+    const setup = await page.evaluate(async (windows) => {
+      const { session_slot_times } = await import("/dist/aeris_charts_financial.js");
+      const chart = window.__chart;
+      chart.remove_series(window.__main);
+      const slots = session_slot_times({
+        date: "2026-09-25", windows, interval_seconds: 60, time_zone: "Asia/Shanghai", convention: "bar_open",
+      });
+      const candles = chart.add_series("candlestick");
+      candles.set_data(slots.map((time, index) => ({
+        time, open: 10 + index / 1000, high: 10.05 + index / 1000, low: 9.95 + index / 1000, close: 10.01 + index / 1000,
+      })));
+      chart.apply_options({
+        timeScale: {
+          timeZone: "Asia/Shanghai", timeVisible: true, lockVisibleLogicalRange: true,
+          barTimeLabel: { anchor: "close", interval_seconds: 60, windows },
+        },
+      });
+      chart.time_scale().set_visible_logical_range({ from: -0.5, to: slots.length - 0.5 });
+      window.__candles = candles;
+      window.__slots = slots;
+      return { count: slots.length, first: slots[0], last: slots.at(-1), options: chart.time_scale().options() };
+    }, windows);
+    expect(setup.count).toBe(240);
+    expect(setup.options.bar_time_label).toEqual({ anchor: "close", interval_seconds: 60, windows });
+    await settle(page);
+
+    // Crosshair label of the first and last slot: the text the executor paints.
+    const label_at = async (index) => {
+      await page.evaluate((slot) => {
+        window.__texts.length = 0;
+        window.__chart.set_crosshair_position(10, slot, window.__candles);
+      }, setup[index === 0 ? "first" : "last"]);
+      await settle(page);
+      return page.evaluate(() => window.__texts.find((text) => /^\d\d \w{3} '\d\d\s+\d\d:\d\d$/.test(text)) ?? null);
+    };
+    expect(await label_at(0)).toMatch(/09:31$/);
+    expect(await label_at(239)).toMatch(/15:00$/);
+
+    // Identity: the rows, the visible range, and the coordinate mapping are still open-stamped.
+    const identity = await page.evaluate(() => {
+      const scale = window.__chart.time_scale();
+      const rows = window.__candles.data();
+      return {
+        first: rows[0].time,
+        last: rows.at(-1).time,
+        at_first: scale.coordinate_to_time(scale.logical_to_coordinate(0)),
+        at_last: scale.coordinate_to_time(scale.logical_to_coordinate(239)),
+        label_only_instant: scale.time_to_coordinate(window.__slots[119] + 60) ?? null,
+      };
+    });
+    expect(identity.first).toBe(setup.first);
+    expect(identity.last).toBe(setup.last);
+    expect(identity.at_first).toBe(setup.first);
+    expect(identity.at_last).toBe(setup.last);
+    // 11:30 is the close of the 11:29 bar, not a bar: it has no slot to point at.
+    expect(identity.label_only_instant).toBeNull();
+
+    // Back to the open text.
+    await page.evaluate(() => window.__chart.apply_options({ timeScale: { barTimeLabel: "open" } }));
+    await settle(page);
+    expect(await label_at(0)).toMatch(/09:30$/);
+    expect(errors).toEqual([]);
+  });
+}
+
+// The close-time label windows and the session start must fit each other. A `session_start` the
+// installed windows cannot be placed on is rejected with `invalid_options` through both option
+// entry points and changes nothing; one call that moves the start and replaces the label is judged
+// against the label it installs.
+test("a session_start that the close-label windows do not fit is rejected atomically", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/?runtimeTest=presentedFrame&backend=canvas2d&forceFallbackAdapter=1");
+  await page.waitForFunction(() => window.__chart?.backend?.() === "canvas2d");
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const scale = chart.time_scale();
+    const windows = [["09:00", "10:00"], ["20:00", "21:00"]];
+    const label = { anchor: "close", interval_seconds: 2_700, windows };
+    chart.apply_options({ timeScale: { timeZone: "UTC", sessionStart: 0, barTimeLabel: label } });
+    const attempt = (run) => {
+      try {
+        run();
+        return null;
+      } catch (error) {
+        return { code: error.code, message: String(error.message) };
+      }
+    };
+    const snapshot = () => {
+      const options = scale.options();
+      return { session_start: options.session_start, label: options.bar_time_label };
+    };
+    const before = snapshot();
+    // Windows [09:00-10:00, 20:00-21:00] are unordered when the trading day starts at 12:00.
+    const rejected = [
+      attempt(() => scale.apply_options({ session_start: 43_200 })),
+      attempt(() => chart.apply_options({ timeScale: { sessionStart: 43_200 } })),
+    ];
+    const unchanged = snapshot();
+    // One call that also replaces the windows is judged against the label it installs.
+    const moved_windows = [["20:00", "21:00"], ["09:00", "10:00"]];
+    const both = attempt(() => scale.apply_options({
+      session_start: 43_200,
+      bar_time_label: { anchor: "close", interval_seconds: 2_700, windows: moved_windows },
+    }));
+    const moved = snapshot();
+    // Clearing the label first lets the start move on its own.
+    const cleared = attempt(() => scale.apply_options({ bar_time_label: "open", session_start: 0 }));
+    return { before, rejected, unchanged, both, moved, cleared, after: snapshot(), label, moved_windows };
+  });
+  for (const rejection of result.rejected) {
+    expect(rejection.code).toBe("invalid_options");
+    expect(rejection.message).toContain("barTimeLabel");
+  }
+  expect(result.before).toEqual({ session_start: 0, label: result.label });
+  expect(result.unchanged).toEqual(result.before);
+  expect(result.both).toBeNull();
+  expect(result.moved.session_start).toBe(43_200);
+  expect(result.moved.label.windows).toEqual(result.moved_windows);
+  expect(result.cleared).toBeNull();
+  expect(result.after).toEqual({ session_start: 0, label: "open" });
+  expect(errors).toEqual([]);
+});

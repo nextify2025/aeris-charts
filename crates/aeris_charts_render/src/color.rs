@@ -107,6 +107,28 @@ impl Color {
         }
     }
 
+    /// Choose opaque black or white by the larger WCAG contrast ratio against this RGB.
+    /// sRGB channels are linearized before relative luminance is computed. Callers resolve
+    /// alpha against the painted surface first; this method treats RGB as opaque.
+    pub fn contrast_srgb(&self) -> Color {
+        let linear = |channel: u8| {
+            let srgb = channel as f64 / 255.0;
+            if srgb <= 0.04045 {
+                srgb / 12.92
+            } else {
+                ((srgb + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance =
+            0.2126 * linear(self.r()) + 0.7152 * linear(self.g()) + 0.0722 * linear(self.b());
+        // (L+.05)/.05 >= 1.05/(L+.05) exactly when L >= sqrt(.0525)-.05.
+        if luminance >= 0.179128784747792 {
+            Color::rgb(0, 0, 0)
+        } else {
+            Color::rgb(255, 255, 255)
+        }
+    }
+
     /// Contrast text after compositing this color over an opaque surface. Opaque label colors
     /// take the existing fast path; translucent labels follow the color users actually see.
     pub fn contrast_text_over(&self, surface: Color) -> Color {
@@ -283,6 +305,23 @@ mod tests {
             translucent_white.contrast_text_over(Color::rgb(255, 255, 255)),
             Color::rgb(0, 0, 0)
         );
+    }
+
+    #[test]
+    fn srgb_contrast_linearizes_saturated_colors_and_switches_at_equal_ratios() {
+        let black = Color::rgb(0, 0, 0);
+        let white = Color::rgb(255, 255, 255);
+        for (color, expected) in [
+            (black, white),
+            (white, black),
+            (Color::rgb(255, 0, 0), black),
+            (Color::rgb(0, 255, 0), black),
+            (Color::rgb(0, 0, 255), white),
+            (Color::rgb(117, 117, 117), white),
+            (Color::rgb(118, 118, 118), black),
+        ] {
+            assert_eq!(color.contrast_srgb(), expected);
+        }
     }
 
     #[test]

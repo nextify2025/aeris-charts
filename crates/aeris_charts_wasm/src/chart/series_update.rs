@@ -50,9 +50,11 @@ fn outcome_json(outcome: SeriesUpdateOutcome, sequence: Option<u64>) -> Option<S
         SeriesUpdateOutcome::Rejected(SeriesUpdateRejection::UnknownSeries) => {
             ("unknown or stale series id", None)
         }
+        // Engine-owned series never reach this: the entry points below refuse them first with the
+        // `derived_series` code, because the engine reports them and custom or advanced series
+        // with the same outcome.
         SeriesUpdateOutcome::Rejected(SeriesUpdateRejection::UnsupportedSeries) => (
-            "custom, advanced, and footprint series, and engine-derived synthetic or resampled \
-             bars, do not accept host OHLC writes",
+            "custom and advanced series own their payloads and do not accept host OHLC writes",
             None,
         ),
         SeriesUpdateOutcome::Rejected(SeriesUpdateRejection::EmptyPatch) => (
@@ -132,6 +134,9 @@ impl ChartInner {
         border: Option<u32>,
         sequence: f64,
     ) -> Option<String> {
+        if let Some(rejected) = self.derived_write_rejection(id) {
+            return Some(rejected);
+        }
         let sequence = match decode_sequence(sequence) {
             Ok(sequence) => sequence,
             Err(json) => return Some(json),
@@ -165,6 +170,9 @@ impl ChartInner {
         border: Option<u32>,
         sequence: f64,
     ) -> Option<String> {
+        if let Some(rejected) = self.derived_write_rejection(id) {
+            return Some(rejected);
+        }
         let sequence = match decode_sequence(sequence) {
             Ok(sequence) => sequence,
             Err(json) => return Some(json),
@@ -192,6 +200,9 @@ impl ChartInner {
         close: &Float64Array,
         sequence: f64,
     ) -> Option<String> {
+        if let Some(rejected) = self.derived_write_rejection(id) {
+            return Some(rejected);
+        }
         let sequence = match decode_sequence(sequence) {
             Ok(sequence) => sequence,
             Err(json) => return Some(json),
@@ -236,6 +247,9 @@ impl ChartInner {
         close: Option<Float64Array>,
         sequence: f64,
     ) -> Option<String> {
+        if let Some(rejected) = self.derived_write_rejection(id) {
+            return Some(rejected);
+        }
         let sequence = match decode_sequence(sequence) {
             Ok(sequence) => sequence,
             Err(json) => return Some(json),

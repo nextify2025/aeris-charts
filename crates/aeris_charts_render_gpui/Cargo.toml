@@ -5,10 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
-publish = false
+publish.workspace = true
 description = "Optional GPUI executor for the Prim IR: lowers Aeris's backend-neutral frame into GPUI scene primitives"
 
 # GPUI itself is OPTIONAL and off by default, so `cargo build/test --workspace` never compiles it
@@ -20,9 +17,9 @@ default = []
 gpui-backend = ["dep:gpui", "dep:image", "dep:smallvec"]
 
 [dependencies]
-aeris_charts_core = { path = "../aeris_charts_core", version = "0.3.0" }
-aeris_charts_engine = { path = "../aeris_charts_engine", version = "0.3.0" }
-aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
+aeris_charts_core = { path = "../aeris_charts_core" }
+aeris_charts_engine = { path = "../aeris_charts_engine" }
+aeris_charts_render = { path = "../aeris_charts_render" }
 
 # GPUI is sourced from Zed because Aeris and Aeris Terminal intentionally track the current pre-1.0
 # API. Both dependencies pin the same reviewed immutable commit; upgrades are explicit manifest and
@@ -47,7 +44,8 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1057c2cf
     "wayland",
     "x11",
 ] }
-aeris_charts_native = { path = "../aeris_charts_native", version = "0.3.0" }
+aeris_charts_native = { path = "../aeris_charts_native" }
+serde_json = "1"
 sha2 = "0.11"
 tiny-skia = "0.12"
 

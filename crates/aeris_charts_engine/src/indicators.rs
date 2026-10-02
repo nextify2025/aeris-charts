@@ -6,7 +6,8 @@
 use super::*;
 
 /// Scalar source selected by a study.  The aggregate sources are calculated from the source
-/// bar's OHLC columns without changing the canonical source series or duplicating its storage.
+/// bar's OHLC columns without changing the canonical source series; each binding keeps the derived
+/// column as private runtime state (see `IndicatorInputs`), not as a series.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndicatorInputSource {
@@ -95,8 +96,14 @@ pub struct IndicatorSchema {
 
 pub const INDICATOR_SCHEMA_REVISION: u32 = 2;
 
+// `remote = "Self"` makes serde emit the derived bodies as inherent functions, so the trait impls below can
+// keep the large internally tagged `Deserialize` body out of line. Without that, every call path
+// (`from_value` on one side, a struct field through `PhantomData` on the other) carried its own inlined
+// copy of the roughly 110 KB body in the shipped WASM. The price is two public inherent functions on the
+// published type, `IndicatorKind::serialize` and `IndicatorKind::deserialize`, which serde generates with
+// the type's visibility; the `Serialize`/`Deserialize` trait impls remain the supported entry points.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", remote = "Self")]
 pub enum IndicatorKind {
     Sma {
         period: usize,
@@ -229,6 +236,19 @@ pub enum IndicatorKind {
         #[serde(default)]
         seed: aeris_charts_indicators::KdjSeed,
     },
+}
+
+impl serde::Serialize for IndicatorKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IndicatorKind {
+    #[inline(never)]
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::deserialize(deserializer)
+    }
 }
 
 fn default_histogram_multiplier() -> f64 {
@@ -427,6 +447,13 @@ impl AlignedWeights {
     }
 }
 
+/// Spare rows a retained aggregate column keeps past its source: one eighth of the rows plus a
+/// fixed floor, so the capacity stays within `rows + price_headroom(rows)`. The floor only spares
+/// small charts their first regrowth.
+fn price_headroom(rows: usize) -> usize {
+    rows / 8 + 4096
+}
+
 /// The scalar input column a study reads as its close: a canonical column, or the aggregate
 /// price retained in `cache` with rows `from..` re-derived. Returns the column and derived rows.
 fn price_input<'a>(
@@ -457,6 +484,15 @@ fn price_input<'a>(
     let rows = values.iter().map(|column| column.len()).min().unwrap_or(0);
     let keep = cache.len().min(from).min(rows);
     cache.truncate(keep);
+    // Capacity is explicit: a column built exactly to size would double on the first append after
+    // a bulk install, and plain `extend` growth would keep the largest size it ever reached.
+    let target = rows + price_headroom(rows);
+    if keep == 0 && cache.capacity() > 2 * target {
+        cache.shrink_to(target);
+    }
+    if cache.capacity() < rows {
+        cache.reserve_exact(target - keep);
+    }
     cache.extend((keep..rows).map(|row| {
         aggregate(
             values[0][row],
@@ -475,14 +511,32 @@ pub(crate) struct IndicatorChange {
     pub(crate) full_replace: bool,
 }
 
-/// Stretch factor of the pane a separate-pane indicator creates for itself (the public reference
-/// oscillators stack as a shorter strip under the price pane).
-pub(crate) const OSCILLATOR_PANE_STRETCH: f64 = 0.3;
-
 pub const EMA_RIBBON_DEFAULT_PERIODS: [usize; aeris_charts_indicators::MAX_OUTPUTS] =
     [5, 10, 20, 50, 200];
 pub const EMA_RIBBON_DEFAULT_COLORS: [&str; aeris_charts_indicators::MAX_OUTPUTS] =
     ["#335cff", "#FF9800", "#7d52f4", "#fb4ba3", "#fb3748"];
+
+/// Chart-wide chrome policy for engine-owned indicator bindings.
+///
+/// The engine retains this policy so newly-created and restored bindings cannot silently diverge
+/// from existing outputs. Hosts choose the preference; they do not walk output series to enforce
+/// it themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndicatorChromeOptions {
+    pub name_labels_visible: bool,
+    pub value_labels_visible: bool,
+    pub price_lines_visible: bool,
+}
+
+impl Default for IndicatorChromeOptions {
+    fn default() -> Self {
+        Self {
+            name_labels_visible: true,
+            value_labels_visible: true,
+            price_lines_visible: true,
+        }
+    }
+}
 
 /// MACD histogram four-state palette: strong when moving away from zero, weak when falling
 /// back toward it (industry-standard). Packed `0xRRGGBBAA`.
@@ -558,6 +612,20 @@ pub struct IndicatorParameters {
     pub kdj_seed: Option<aeris_charts_indicators::KdjSeed>,
 }
 
+fn indicator_default_line_width(kind: &IndicatorKind) -> f64 {
+    if matches!(
+        kind,
+        IndicatorKind::Ema { .. }
+            | IndicatorKind::Dema { .. }
+            | IndicatorKind::Tema { .. }
+            | IndicatorKind::EmaRibbon { .. }
+    ) {
+        1.0
+    } else {
+        2.0
+    }
+}
+
 impl ChartEngine {
     pub(crate) fn reset_indicator_output_styles_to_defaults(&mut self) {
         let outputs = self
@@ -572,7 +640,7 @@ impl ChartEngine {
                 };
                 series.countdown_visible = false;
                 series.title_visible = true;
-                series.line_width = Some(2.0);
+                series.line_width = Some(indicator_default_line_width(&kind));
                 series.line_color = indicator_output_color(&kind, output_index).map(str::to_string);
             }
         }
@@ -582,6 +650,10 @@ impl ChartEngine {
     ///
     /// Colors are derived from each value's sign and whether it moved toward or away from zero.
     /// The caller owns only the semantic request; Aeris retains palette and row-style ownership.
+    ///
+    /// Returns `false` for an unknown or non-histogram series and for a source-owned one (see
+    /// [`ChartEngine::series_is_source_owned`]), such as the trade delta and volume studies, which
+    /// keep the palette their stream installs. Indicator outputs are not source-owned and accept it.
     pub fn apply_momentum_histogram_colors(&mut self, id: SeriesId) -> bool {
         if self
             .series_entry(id)
@@ -636,6 +708,101 @@ impl ChartEngine {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Whether the chart currently owns at least one live native indicator binding.
+    #[must_use]
+    pub fn has_indicator_bindings(&self) -> bool {
+        !self.indicators.is_empty()
+    }
+
+    /// Remove every native indicator binding as one engine-owned operation.
+    pub fn clear_indicator_bindings(&mut self) -> bool {
+        let binding_ids = self
+            .indicators
+            .iter()
+            .filter_map(|binding| binding.outputs.first().copied())
+            .collect::<Vec<_>>();
+        if binding_ids.is_empty() {
+            return false;
+        }
+        for binding_id in binding_ids {
+            let _ = self.remove_indicator_binding(binding_id);
+        }
+        true
+    }
+
+    /// Current chart-wide chrome policy inherited by every engine-owned indicator output.
+    #[must_use]
+    pub const fn indicator_chrome_options(&self) -> IndicatorChromeOptions {
+        self.indicator_chrome
+    }
+
+    /// Apply one chart-wide indicator chrome policy to current and future bindings.
+    pub fn set_indicator_chrome_options(&mut self, options: IndicatorChromeOptions) -> bool {
+        let mut changed = self.indicator_chrome != options;
+        self.indicator_chrome = options;
+        let outputs = self
+            .indicators
+            .iter()
+            .flat_map(|binding| binding.outputs.iter().copied())
+            .collect::<Vec<_>>();
+        for output in outputs {
+            if let Some(series) = self.series_entry_mut(output) {
+                changed |= series.title_visible != options.name_labels_visible
+                    || series.last_value_visible != options.value_labels_visible
+                    || series.price_line_visible != options.price_lines_visible;
+                series.title_visible = options.name_labels_visible;
+                series.last_value_visible = options.value_labels_visible;
+                series.price_line_visible = options.price_lines_visible;
+            }
+        }
+        changed |= self.apply_indicator_chrome_to_external_studies(options);
+        changed |= self.apply_indicator_chrome_to_trade_studies(options);
+        if changed {
+            self.invalidate_frame_layout_and_axis();
+        }
+        changed
+    }
+
+    /// Set every output in one binding visible or hidden as one engine-owned operation.
+    pub fn set_indicator_binding_visible(&mut self, binding_id: SeriesId, visible: bool) -> bool {
+        let Some(outputs) = self
+            .indicators
+            .iter()
+            .find(|binding| binding.outputs.first() == Some(&binding_id))
+            .map(|binding| binding.outputs.clone())
+        else {
+            return false;
+        };
+        let changed = outputs.iter().any(|&output| {
+            self.series_entry(output)
+                .is_some_and(|series| series.visible != visible)
+        });
+        for output in outputs {
+            self.set_series_visible(output, visible);
+        }
+        changed
+    }
+
+    /// Remove one complete indicator binding by its stable binding identity.
+    pub fn remove_indicator_binding(&mut self, binding_id: SeriesId) -> bool {
+        if !self
+            .indicators
+            .iter()
+            .any(|binding| binding.outputs.first() == Some(&binding_id))
+        {
+            return false;
+        }
+        self.remove_series(binding_id)
+    }
+
+    /// Remove the complete native indicator binding that owns one output series.
+    pub fn remove_indicator_for_series(&mut self, series_id: SeriesId) -> bool {
+        let Some(binding_id) = self.indicator_binding_id(series_id) else {
+            return false;
+        };
+        self.remove_indicator_binding(binding_id)
     }
 
     /// Replace one output's presentation atomically while retaining the binding and output id.
@@ -1886,10 +2053,10 @@ impl ChartEngine {
             return;
         };
         if let Some(p) = self.panes.get_mut(pane) {
-            p.stretch_factor = OSCILLATOR_PANE_STRETCH;
+            p.stretch_factor = crate::SEPARATE_INDICATOR_PANE_STRETCH;
         }
         for &id in ids {
-            self.set_series_pane(id, pane, OSCILLATOR_PANE_STRETCH);
+            self.set_series_pane(id, pane, crate::SEPARATE_INDICATOR_PANE_STRETCH);
         }
     }
 
@@ -2089,14 +2256,16 @@ impl ChartEngine {
         // Indicator chrome defaults: no candle-close countdown (theirs is a line value, not a
         // bar close), the auto-generated name chip shows (platforms override the name through
         // the series `title` option — custom-script indicators will set their own), and the
-        // line draws at 2px without a last-price pulse — every default is overridable through
-        // the ordinary series options.
+        // line draws at its kind's default width without a last-price pulse — every default is
+        // overridable through the ordinary series options.
         for (output_index, &id) in ids.iter().enumerate() {
             if let Some(s) = self.series.iter_mut().find(|s| s.id == id) {
                 s.countdown_visible = false;
-                s.title_visible = true;
+                s.title_visible = self.indicator_chrome.name_labels_visible;
+                s.last_value_visible = self.indicator_chrome.value_labels_visible;
+                s.price_line_visible = self.indicator_chrome.price_lines_visible;
                 s.title = indicator_output_title(&kind, output_index);
-                s.line_width = Some(2.0);
+                s.line_width = Some(indicator_default_line_width(&kind));
                 // The last-price pulse marks the traded series, never a derived study line.
                 s.last_price_animation = false;
                 if output_index == 0 {
@@ -2903,5 +3072,163 @@ fn indicator_output_name(kind: &IndicatorKind, output_index: usize) -> &'static 
         }
         IndicatorKind::Wma { .. } => "WMA",
         IndicatorKind::Kdj { .. } => ["K", "D", "J"][output_index],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AGGREGATES: [IndicatorInputSource; 4] = [
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ];
+
+    /// Deterministic OHLC columns with `high >= open, close >= low`.
+    fn ohlc(rows: usize) -> [Vec<f64>; 4] {
+        let mut columns: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
+        for row in 0..rows {
+            let base = 100.0 + (row as f64 * 0.013).sin() * 7.0;
+            let close = base + (row as f64 * 0.7).cos() * 0.2;
+            let open = base - 0.3;
+            columns[0].push(open);
+            columns[1].push(open.max(close) + 0.9);
+            columns[2].push(open.min(close) - 0.8);
+            columns[3].push(close);
+        }
+        columns
+    }
+
+    /// The per-row definition of each aggregate, written independently of `price_input`.
+    fn reference(source: IndicatorInputSource, [open, high, low, close]: [f64; 4]) -> f64 {
+        match source {
+            IndicatorInputSource::Hl2 => (high + low) * 0.5,
+            IndicatorInputSource::Hlc3 => (high + low + close) / 3.0,
+            IndicatorInputSource::Ohlc4 => (open + high + low + close) * 0.25,
+            IndicatorInputSource::Hlcc4 => (high + low + 2.0 * close) * 0.25,
+            _ => unreachable!("not an aggregate source"),
+        }
+    }
+
+    /// Derive rows `from..` and require exactly `derived` of them, bit-identical to the reference
+    /// over the whole column.
+    fn derive(
+        cache: &mut Vec<f64>,
+        source: IndicatorInputSource,
+        columns: &[Vec<f64>; 4],
+        from: usize,
+        derived: usize,
+    ) {
+        let (column, rows) = price_input(
+            cache,
+            source,
+            std::array::from_fn(|i| &columns[i][..]),
+            from,
+        );
+        assert_eq!(rows, derived, "{source:?} rows derived from {from}");
+        assert_eq!(column.len(), columns[0].len(), "{source:?} column length");
+        for (row, &value) in column.iter().enumerate() {
+            let expected = reference(source, std::array::from_fn(|i| columns[i][row]));
+            assert_eq!(
+                value.to_bits(),
+                expected.to_bits(),
+                "{source:?} row {row}: {value} != {expected}"
+            );
+        }
+    }
+
+    fn extend(columns: &mut [Vec<f64>; 4], rows: usize) {
+        let more = ohlc(rows);
+        for (column, more) in columns.iter_mut().zip(&more) {
+            let start = column.len();
+            column.extend_from_slice(&more[start..]);
+        }
+    }
+
+    #[test]
+    fn aggregate_column_keeps_bounded_tail_headroom() {
+        const ROWS: usize = 50_000;
+        for source in AGGREGATES {
+            let mut columns = ohlc(ROWS);
+            let mut cache = Vec::new();
+            derive(&mut cache, source, &columns, 0, ROWS);
+            assert!(
+                (ROWS..=ROWS + price_headroom(ROWS)).contains(&cache.capacity()),
+                "{source:?} install capacity {} for {ROWS} rows",
+                cache.capacity()
+            );
+
+            // A live append derives one row in place: the first append after a bulk install must
+            // not reallocate the column.
+            let (capacity, pointer) = (cache.capacity(), cache.as_ptr());
+            columns = ohlc(ROWS + 1);
+            derive(&mut cache, source, &columns, ROWS, 1);
+            assert_eq!(cache.capacity(), capacity, "{source:?} first append grew");
+            assert_eq!(cache.as_ptr(), pointer, "{source:?} first append moved");
+
+            // Appending past the headroom grows to a bounded size, not by doubling.
+            let rows = ROWS + price_headroom(ROWS) + 2;
+            columns = ohlc(rows);
+            derive(&mut cache, source, &columns, ROWS + 1, rows - ROWS - 1);
+            assert!(
+                (rows..=rows + price_headroom(rows)).contains(&cache.capacity()),
+                "{source:?} grown capacity {} for {rows} rows",
+                cache.capacity()
+            );
+
+            // A rebuild from row 0 over far fewer rows releases the oversized column.
+            columns = ohlc(1_000);
+            derive(&mut cache, source, &columns, 0, 1_000);
+            assert_eq!(
+                cache.capacity(),
+                1_000 + price_headroom(1_000),
+                "{source:?} rebuilt capacity"
+            );
+
+            // A source with no rows allocates nothing.
+            let mut empty = Vec::new();
+            derive(&mut empty, source, &ohlc(0), 0, 0);
+            assert_eq!(empty.capacity(), 0, "{source:?} empty capacity");
+        }
+    }
+
+    #[test]
+    fn canonical_inputs_borrow_the_source_and_drop_the_column() {
+        let columns = ohlc(1_000);
+        let values: [&[f64]; 4] = std::array::from_fn(|i| &columns[i][..]);
+        for (column, source) in [
+            IndicatorInputSource::Open,
+            IndicatorInputSource::High,
+            IndicatorInputSource::Low,
+            IndicatorInputSource::Close,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut cache = vec![0.0; 1_000];
+            let (input, derived) = price_input(&mut cache, source, values, 0);
+            assert_eq!(derived, 0, "{source:?}");
+            assert_eq!(input.as_ptr(), columns[column].as_ptr(), "{source:?}");
+            assert_eq!(cache.capacity(), 0, "{source:?} kept a column");
+        }
+    }
+
+    #[test]
+    fn tail_rebuilds_keep_the_retained_prefix() {
+        let mut columns = ohlc(2_000);
+        let mut cache = Vec::new();
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 0, 2_000);
+        // Revising the last bar re-derives it alone; growing by three rows derives three.
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 1_999, 1);
+        extend(&mut columns, 2_003);
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 2_000, 3);
+        // A retention trim shortens the source: the column follows it.
+        for column in &mut columns {
+            column.truncate(1_500);
+        }
+        derive(&mut cache, IndicatorInputSource::Ohlc4, &columns, 1_500, 0);
+        assert_eq!(cache.len(), 1_500);
     }
 }

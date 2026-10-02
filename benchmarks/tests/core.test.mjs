@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { base_environment, benchmark_root, compare_runs, evaluate_absolute_budgets, load_manifest, public_summary, validate_run } from "../core.mjs";
-import { parse_pack_manifest } from "../size.mjs";
+import { base_environment, benchmark_root, build_provenance, compare_runs, evaluate_absolute_budgets, load_manifest, propose_size_budgets, public_summary, repository_root, validate_run, wasm_build_profile, wasm_opt_arguments, wasm_opt_version } from "../core.mjs";
+import { assert_wasm_opt_ran, parse_pack_manifest } from "../size.mjs";
 import { dataset_metadata, generate_ohlcv, metric, percentile, summarize } from "../shared.mjs";
 
 function fixture() {
@@ -12,7 +13,7 @@ function fixture() {
     schema_version: 1,
     product: { name: "aeris_charts-financial", version: "0.8.13" },
     source: { git_commit: "abc", git_branch: "main", git_tag: null, dirty_worktree: false },
-    build: { profile: "release", logging: "default-no-verbose-debug", build_command: "npm run build", rustc_version: "rustc test", wasm_pack_version: "wasm-pack test", node_version: process.version, npm_version: "test", esbuild_version: "test", package_lock_sha256: "0".repeat(64), cargo_lock_sha256: "1".repeat(64), wasm_opt_args: ["-Oz"] },
+    build: { profile: "release", logging: "default-no-verbose-debug", build_command: "npm run build", rustc_version: "rustc test", wasm_pack_version: "wasm-pack test", cargo_profile: "release", wasm_opt_version: "wasm-opt test", node_version: process.version, npm_version: "test", esbuild_version: "test", package_lock_sha256: "0".repeat(64), cargo_lock_sha256: "1".repeat(64), wasm_opt_args: ["-Oz"] },
     environment: { ...base_environment("official-benchmark-runner"), id: "official-test" },
     execution: { profile: "release", started_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:01:00.000Z", clock: "performance.now monotonic in browser and Node; std::time::Instant monotonic in native Rust; wall time is metadata only", command: "benchmark release" },
     scenarios: [{
@@ -183,4 +184,93 @@ test("scenario registry and JSON schema remain versioned and complete", async ()
   assert.ok(schema.required.includes("environment"));
   assert.ok(schema.$defs.summary.required.includes("p95"));
   assert.equal(schema.$defs.dataset.properties.seed.maximum, 0xffff_ffff);
+});
+
+test("wasm build provenance reads the wasm-opt flags wasm-pack actually uses from the crate metadata", async () => {
+  const cargo_toml = await readFile(path.join(repository_root, "crates", "aeris_charts_wasm", "Cargo.toml"), "utf8");
+  const declared = (section) => JSON.parse(new RegExp(`\\[package\\.metadata\\.wasm-pack\\.profile\\.${section}\\]\\s*wasm-opt = (\\[.*\\])`).exec(cargo_toml)?.[1] ?? "null");
+  const build_script = JSON.parse(await readFile(path.join(repository_root, "packages", "charts", "package.json"), "utf8")).scripts["build:wasm"];
+  const profile = wasm_build_profile(build_script);
+  const expected = declared(profile === "release" ? "release" : "custom");
+  assert.ok(expected.length > 0 && expected.includes("--enable-simd"));
+  assert.deepEqual(declared("custom") ?? expected, declared("release"), "the custom-profile wasm-opt flags cannot drift from the release list");
+  const provenance = await build_provenance("package");
+  assert.deepEqual(provenance.wasm_opt_args, expected);
+  assert.equal(provenance.cargo_profile, profile);
+  assert.ok(provenance.wasm_opt_version === null || /^wasm-opt version \d+/.test(provenance.wasm_opt_version));
+  const native = await build_provenance("native");
+  assert.deepEqual([native.wasm_opt_args, native.wasm_opt_version, native.cargo_profile], [[], null, "release"]);
+
+  const metadata = { packages: [{ name: "aeris_charts_wasm", metadata: { "wasm-pack": { profile: { release: { "wasm-opt": ["-Oz"] }, custom: { "wasm-opt": ["-Os"] } } } } }] };
+  assert.deepEqual(wasm_opt_arguments(metadata, "release"), ["-Oz"]);
+  assert.deepEqual(wasm_opt_arguments(metadata, "wasm-release"), ["-Os"]);
+  assert.throws(() => wasm_opt_arguments({ packages: [] }, "release"), /no wasm-opt arguments/);
+  assert.throws(() => wasm_opt_arguments({ packages: [{ name: "aeris_charts_wasm", metadata: { "wasm-pack": { profile: { release: { "wasm-opt": [] } } } } }] }, "release"), /no wasm-opt arguments/);
+  assert.equal(wasm_build_profile("wasm-pack build ../../crates/aeris_charts_wasm --target web"), "release");
+  assert.equal(wasm_build_profile("wasm-pack build ../../crates/aeris_charts_wasm --target web --profile wasm-release --out-dir pkg"), "wasm-release");
+});
+
+test("wasm-opt version falls back to the newest wasm-pack cache binary only when none is on PATH", { skip: process.platform === "win32" }, async () => {
+  const cache = await mkdtemp(path.join(os.tmpdir(), "aeris_charts-wasm-pack-cache-"));
+  const original_path = process.env.PATH;
+  try {
+    const bin = path.join(cache, "wasm-opt-abc", "bin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(path.join(bin, "wasm-opt"), "#!/bin/sh\necho 'wasm-opt version 117 (version_117)'\n");
+    await chmod(path.join(bin, "wasm-opt"), 0o755);
+    const empty = path.join(cache, "empty");
+    await mkdir(empty);
+    process.env.PATH = empty;
+    assert.equal(await wasm_opt_version(cache), "wasm-opt version 117 (version_117)");
+    assert.equal(await wasm_opt_version(path.join(cache, "missing")), null);
+  } finally {
+    process.env.PATH = original_path;
+    await rm(cache, { recursive: true, force: true });
+  }
+});
+
+test("release build metadata stays on the release channel and the size step requires a wasm-opt run", () => {
+  assert.equal(validate_run(fixture()).build.cargo_profile, "release");
+  const debug = fixture();
+  debug.build.profile = "wasm-release";
+  assert.throws(() => validate_run(debug), /invalid release build metadata/);
+  const unnamed = fixture();
+  unnamed.build.cargo_profile = "";
+  assert.throws(() => validate_run(unnamed), /invalid wasm build provenance/);
+  const legacy = fixture();
+  delete legacy.build.cargo_profile;
+  delete legacy.build.wasm_opt_version;
+  assert.equal(validate_run(legacy).schema_version, 1);
+  assert.doesNotThrow(() => assert_wasm_opt_ran("[INFO]: Optimizing wasm binaries with `wasm-opt`...\n[INFO]: :-) Done in 1s"));
+  assert.throws(() => assert_wasm_opt_ran("[INFO]: Skipping wasm-opt because it is not supported on this platform"), /did not run wasm-opt/);
+});
+
+test("only exceeded size ceilings are raised, to observed plus headroom rounded up, with the evidence recorded beside them", () => {
+  const run = fixture();
+  const bytes = (value) => ({ availability: "measured", unit: "bytes", direction: "lower_is_better", visibility: "public_candidate", methodology: "test", samples: [value], summary: summarize([value]) });
+  run.scenarios[0] = { ...run.scenarios[0], id: "package-release-artifacts", metrics: { wasm_raw_bytes: bytes(4_739_804), wasm_brotli_bytes: bytes(1_175_083), npm_tarball_bytes: bytes(1_000_000), javascript_raw_bytes: bytes(412_622) } };
+  const budgets = { policy_version: 3, thresholds: {}, absolute_maximums: {
+    "package-release-artifacts.wasm_raw_bytes.p50": 3_000_000,
+    "package-release-artifacts.wasm_brotli_bytes.p50": 810_000,
+    "package-release-artifacts.npm_tarball_bytes.p50": 1_000_000,
+    "package-release-artifacts.javascript_raw_bytes.p50": 620_000,
+    "general-dashboard-100k.startup_ms.p50": 2000,
+  } };
+  const proposal = propose_size_budgets(run, budgets, { levers: ["example lever"], product_tradeoff: "example tradeoff" });
+  assert.equal(proposal.absolute_maximums["package-release-artifacts.wasm_raw_bytes.p50"], 5_080_000);
+  assert.equal(proposal.absolute_maximums["package-release-artifacts.wasm_brotli_bytes.p50"], 1_260_000);
+  assert.equal(proposal.absolute_maximums["package-release-artifacts.npm_tarball_bytes.p50"], 1_000_000, "a ceiling that holds (observed equals it) is not moved");
+  assert.equal(proposal.absolute_maximums["package-release-artifacts.javascript_raw_bytes.p50"], 620_000, "a ceiling with headroom is not tightened");
+  assert.equal(proposal.absolute_maximums["general-dashboard-100k.startup_ms.p50"], 2000);
+  assert.equal(proposal.policy_version, 4);
+  assert.equal(proposal.rationale.length, 1);
+  assert.equal(proposal.rationale[0].headroom_percent, 7);
+  assert.deepEqual(Object.keys(proposal.rationale[0].raised), ["package-release-artifacts.wasm_raw_bytes.p50", "package-release-artifacts.wasm_brotli_bytes.p50"]);
+  assert.deepEqual(proposal.rationale[0].raised["package-release-artifacts.wasm_raw_bytes.p50"], { from: 3_000_000, to: 5_080_000 });
+  assert.equal(proposal.rationale[0].observed["package-release-artifacts.wasm_raw_bytes.p50"], 4_739_804);
+  assert.equal(proposal.rationale[0].toolchain.wasm_opt, "wasm-opt test");
+  assert.equal(proposal.rationale[0].product_tradeoff, "example tradeoff");
+  assert.equal(budgets.policy_version, 3, "the input budgets are not mutated");
+  assert.equal(evaluate_absolute_budgets(run, proposal).evaluations.filter(({ status }) => status === "fail").length, 0, "the proposal passes the run it was derived from");
+  assert.throws(() => propose_size_budgets(fixture(), budgets), /no passed package-release-artifacts scenario/);
 });

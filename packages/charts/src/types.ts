@@ -936,9 +936,13 @@ export interface ingestion_diagnostics {
    * - `price_less_payload` — accepted: a point without price fields (for example
    *   `{ time, volume }`) replaced the bar with whitespace (reference behavior; use `merge()`, and
    *   update volume on its own series);
-   * - `empty_merge` — rejected: a `merge()` carried no price field.
+   * - `empty_merge` — rejected: a `merge()` carried no price field;
+   * - `derived_series` — rejected: the series is engine-owned (a trade-bound candle or bar, a
+   *   CVD, delta, or volume study, or resampled or synthetic bars), so a host data write changed
+   *   nothing. Feed its trade stream or source instead. `pop()` on such a series records the same
+   *   rejection. A footprint handle throws `unsupported_operation` instead.
    */
-  code?: "stale_sequence" | "partial_ohlc" | "value_on_ohlc_series" | "price_less_payload" | "empty_merge";
+  code?: "stale_sequence" | "partial_ohlc" | "value_on_ohlc_series" | "price_less_payload" | "empty_merge" | "derived_series";
   /** Last sequence applied to the series, reported with `code: "stale_sequence"`. */
   last_sequence?: number;
 }
@@ -1130,7 +1134,12 @@ export interface mouse_event_params {
   time: number | null;
   /** Float logical (bar) index under the cursor, or `null` when there is no data. */
   logical: number | null;
-  /** Cursor position in CSS px relative to the pane, or `null` when the cursor left the chart. */
+  /**
+   * Cursor position in CSS px in the chart's shared coordinate space (see {@link pane_geometry}):
+   * `x` from the plot-area left edge (right of the left price strip), `y` from the top of the
+   * stacked pane area. `y` is not pane-local; subtract the hovered pane's `get_geometry().top`
+   * for that. `null` when the cursor left the chart.
+   */
   point: { x: number; y: number } | null;
   /** Index of the pane under the cursor, or `null` over an axis strip or outside the panes. */
   pane_index: number | null;
@@ -1166,8 +1175,18 @@ export type visible_time_range_handler = (range: time_range | null) => void;
 /** Receives the time scale's new media size in px (reference `SizeChangeEventHandler`). */
 export type size_change_handler = (width: number, height: number) => void;
 
-/** Geometry of a pane's content area in CSS px relative to the chart container's top-left —
- *  the anchor for platform-rendered per-pane chrome (indicator chips, legends). */
+/**
+ * Geometry of a pane's content area in CSS px relative to the chart container's top-left —
+ * the anchor for platform-rendered per-pane chrome (indicator chips, legends). It also defines
+ * the chart's public coordinate space, shared by every `price_to_coordinate` /
+ * `coordinate_to_price` / `time_to_coordinate` / `coordinate_to_time` / `logical_to_coordinate` /
+ * `coordinate_to_logical` conversion, pointer `point`, crosshair, hit-test, drawing and trading
+ * position: `x` is CSS px from the plot-area left edge (container x = `left` + x) and `y` is CSS
+ * px from the top of the stacked pane area (pane 0's `top`). A pane spans
+ * `[top, top + height]` in that `y`; pane-local `y` is `y - top`. A `y` is never pane-local, so a
+ * lower pane's price maps to a `y` at or below that pane's `top`. All values reflect the last
+ * layout pass.
+ */
 export interface pane_geometry {
   left: number;
   top: number;
@@ -1389,8 +1408,10 @@ export interface time_scale_options {
   /** Keep the visible range constant across chart resizes (reference `lockVisibleTimeRangeOnResize`). */
   lock_visible_time_range_on_resize?: boolean;
   /**
-   * Keep the right-most bar pinned during ordinary time-scale zoom. Defaults to `false`, matching
-   * reference-informed cursor anchoring.
+   * Keep the right-most bar pinned during ordinary time-scale zoom. Defaults to `true`, matching
+   * measured TradingView wheel zoom: the gap after the latest bar stays constant while history
+   * compresses or expands. Ctrl/Cmd + wheel and pinch always zoom around the pointer. Set `false`
+   * for cursor-anchored ordinary zoom (the Lightweight Charts default).
    */
   right_bar_stays_on_scroll?: boolean;
   /**
@@ -1452,8 +1473,12 @@ export interface time_scale_options {
   /**
    * Seconds from exchange-local midnight at which a trading day begins (default `0`). Negative
    * values assign an evening session to the next trading day (e.g. `-3 * 3600` makes a 21:00
-   * night session start the next day; a Friday-night session then belongs to Monday). Drives
-   * Day/Month/Year tick marks, VWAP session/weekly/monthly resets, and pivot sessions.
+   * night session start the next day; a Friday-night session then belongs to Monday, and
+   * `-25200` makes the Sunday 17:00 open of a Globex-style market belong to Monday). With a
+   * negative start every Saturday or Sunday instant belongs to Monday, and window placement
+   * (`session_slot_times`, `resample_boundaries`, `set_trade_stream_sessions`) assumes the week
+   * opens on Friday evening. Drives Day/Month/Year tick marks, VWAP session/weekly/monthly
+   * resets, and pivot sessions.
    */
   session_start?: number;
   /**
@@ -1466,7 +1491,38 @@ export interface time_scale_options {
    * inside the axis and skip one that would overlap its predecessor.
    */
   tick_marks?: readonly time_tick_mark[] | null;
+  /**
+   * Which instant of a bar its time TEXT prints (Aeris extension, default `"open"`). A bar keeps
+   * its open time as its identity everywhere (rows, series data, crosshair events, snapshots,
+   * countdown, replay, sessions, drawings, markers, alerts, `tick_marks[].time`, visible ranges);
+   * `{ anchor: "close", ... }` only changes what the chart prints for a bar: the crosshair label,
+   * automatic and default explicit tick labels, drawing axis tags and statistics, and the tooltip
+   * and accessibility time text. A one-minute bar opened 09:30 then reads 09:31. See
+   * {@link bar_time_label}. Ignored on calendar-date axes and non-time bar sequences. While a
+   * label with windows is set, a `session_start` those windows do not fit is rejected with
+   * `invalid_options` (send both in one call, or set `"open"` first).
+   */
+  bar_time_label?: bar_time_label;
 }
+
+/**
+ * Close-time display labels (see {@link time_scale_options.bar_time_label}). `interval_seconds`
+ * is the chart's primary bar interval, 1 to 86 399: the printed time of a bar is its open plus
+ * that interval. Optional exchange-local `windows` (the `["HH:MM", "HH:MM"]` form of
+ * {@link session_slot_options.windows}, at most 32, valid for the chart's `session_start`) end
+ * each window's short last bar exactly, so a 15:30 hourly bar of a 16:00 session prints 16:00
+ * rather than 16:30. A bar whose open lies in no window (for example a host-shifted 09:29
+ * auction row) prints open plus the interval. Every bar time the host passes in or reads back
+ * stays open-stamped. The windows must fit the chart's `session_start`: the same call may change
+ * both, and a later `session_start` the windows cannot be placed on is rejected.
+ */
+export type bar_time_label =
+  | "open"
+  | {
+      anchor: "close";
+      interval_seconds: number;
+      windows?: readonly (readonly [string, string])[];
+    };
 
 /** One explicit time-axis mark (see {@link time_scale_options.tick_marks}). */
 export interface time_tick_mark {
@@ -1490,7 +1546,13 @@ export interface session_slot_options {
   interval_seconds: number;
   /** Exchange time zone: an IANA name or an explicit schedule (default `"UTC"`). */
   time_zone?: time_zone;
-  /** Trading-day start relative to local midnight, like the chart's `session_start` (default 0). */
+  /**
+   * Trading-day start relative to local midnight (default 0). It is this call's own value and is
+   * not read from the chart, so pass the chart's `session_start` (`-10800` for China futures) to
+   * place night windows on the evening before. A negative start places windows assuming the week
+   * opens on Friday evening; a Sunday-open market (CME Globex) passes `0` with one call per
+   * evening date and `[["17:00", "16:00"]]`.
+   */
   session_start?: number;
   /**
    * `"bar_open"` (default, the canonical bar time): 09:30..11:29 and 13:00..14:59 for an A-share
@@ -1513,7 +1575,10 @@ export interface trade_session_options {
   /**
    * Exchange-local `["HH:MM", "HH:MM"]` windows in chronological order (at most 32), placed in the
    * chart's `time_zone` and `session_start` like {@link session_slot_options.windows}. Each window
-   * restarts the bar grid at its open; an interval of one day gives one bar per trading day.
+   * restarts the bar grid at its open; an interval of one day gives one bar per trading day. The
+   * one list applies to every date, and there is no per-call start: a Sunday-open market (CME
+   * Globex) keeps the chart's `session_start` at `0` with one crossing window
+   * `[["17:00", "16:00"]]`, because a negative chart start places Monday's window on Friday evening.
    */
   windows: readonly (readonly [string, string])[];
   /** Default `"fold"`. */
@@ -1525,7 +1590,10 @@ export interface resample_boundary {
   start_time: number;
   /** Exclusive. */
   end_time: number;
-  /** Opaque session identity; {@link resample_boundaries} uses the trading date as `YYYYMMDD`. */
+  /**
+   * Opaque session identity; {@link resample_boundaries} uses the requested date as `YYYYMMDD`
+   * (the trading date, or the evening date for a Sunday-open market passed with `session_start: 0`).
+   */
   session_id: number;
 }
 
@@ -1537,7 +1605,14 @@ export interface resample_boundary_options {
   windows: readonly (readonly [string, string])[];
   /** Exchange time zone: an IANA name or an explicit schedule (default `"UTC"`). */
   time_zone?: time_zone;
-  /** Trading-day start relative to local midnight, like the chart's `session_start` (default 0). */
+  /**
+   * Trading-day start relative to local midnight (default 0). It is this call's own value and is
+   * not read from the chart: pass `-10800` for China futures. A Sunday-open market (CME Globex)
+   * passes `0`, the evening dates, and `[["17:00", "16:00"]]`; `-25200` with the Monday date places
+   * that session on Friday evening and omits the Sunday and Monday rows. `windows` apply to every
+   * date of the call, so call once per window set and concatenate the boundaries when dates differ
+   * (for example the first trading day after a break has no night window).
+   */
   session_start?: number;
   /**
    * `"window"` (default): one boundary per session window, so intraday bars restart at every
@@ -1839,8 +1914,9 @@ export interface chart_options {
   rightPriceScale: chart_price_scale_options;
   /**
    * Time-axis strip cosmetics (reference `timeScale.borderVisible`/`borderColor`) plus the
-   * declarative exchange time zone and trading-day start (same semantics as
-   * {@link time_scale_options.time_zone} / {@link time_scale_options.session_start}); these two
+   * declarative exchange time zone, trading-day start, explicit marks, and bar time label (same
+   * semantics as {@link time_scale_options.time_zone} / {@link time_scale_options.session_start} /
+   * {@link time_scale_options.tick_marks} / {@link time_scale_options.bar_time_label}); these
    * also work for worker charts.
    */
   timeScale: {
@@ -1850,6 +1926,8 @@ export interface chart_options {
     sessionStart?: number;
     /** Declarative {@link time_scale_options.tick_marks} (also for worker charts). */
     tickMarks?: readonly time_tick_mark[] | null;
+    /** Declarative {@link time_scale_options.bar_time_label} (also for worker charts). */
+    barTimeLabel?: bar_time_label;
   };
   /**
    * Large text label painted inside the pane (reference v4 `watermark`). `color` is any CSS color
@@ -1960,7 +2038,8 @@ export interface series_options {
    * compute on its own rows and follow the same points, `data()` keeps its own rows, and value
    * snapshots report the point's time. Line, area, baseline, histogram, bar, and candlestick
    * series that own their rows, on a time axis, only; others (and any series on a non-time bar
-   * axis) throw `unsupported_operation`.
+   * axis) throw `unsupported_operation`. Worker charts take it in `add_series` options and change
+   * it with `offscreen_chart.apply_series_options`.
    */
   time_alignment: time_alignment;
   /**
@@ -1994,7 +2073,7 @@ export interface series_options {
   wick_visible: boolean;
   /** Candlestick body-border visibility (default true; ignored by bar series). */
   border_visible: boolean;
-  /** Line/area stroke width in css px (default 2, matching indicator lines). */
+  /** Line/area stroke width in CSS px (default 2; EMA-family indicators default to 1). */
   line_width: number;
   /** Area fill color at the line (top of the gradient). */
   area_top_color: string;
@@ -2037,7 +2116,9 @@ export interface series_options {
   baseline_value: number;
   /**
    * Pulse an expanding ring at the last value (drives an rAF loop while visible). Default `true`
-   * for line and area series and `false` for every other type; set `false` to disable.
+   * for line and area series and `false` for every other type; set `false` to disable. A value
+   * equal to the current type's default keeps following the default when the series type
+   * changes; a value that differs from it (an opt-out on a line, an opt-in on candles) is kept.
    */
   last_price_animation: boolean;
   /** Keep the series in the engine while toggling its visibility. */
@@ -2412,8 +2493,12 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * The drawing-tool kinds. Each tool is an engine-owned drawing object with defining anchor
  * points: trend line (2), rectangle (2), Long Position / Short Position tools (3: entry, target,
  * stop), horizontal line/ray, vertical line, and text (1 each), a multi-click arrow-ended
- * straight-segment path (variable length, every vertex editable), and the freehand brush (a
- * variable-length curve, anchor handles at the two ends).
+ * straight-segment path (variable length, every vertex editable), the freehand brush (a
+ * variable-length curve, anchor handles at the two ends), and the price range, date range, and
+ * date-and-price range measuring tools (2: start, end; the measured sign follows start → end).
+ * The measuring tools snap both anchors to whole bars and price ticks. Holding Shift while
+ * clicking an empty pane starts a transient date-and-price range (the quick measure; it is never a
+ * drawing, history entry, or persisted object).
  *
  * Lines family (B8): `ray`, `extended_line`, `info_line`, `trend_angle`, and `arrow_line` place
  * two anchors; `extend_left` extends beyond the first anchor and `extend_right` beyond the second
@@ -2694,7 +2779,7 @@ export interface drawing_template { name: string; kind: drawing_kind; options: P
 export type drawing_kind_options =
   | { kind: "rectangle"; fill_color?: string; preview_fill_color?: string; border_visible: boolean; show_labels: boolean; axis_bands_visible: boolean; label_color?: string; label_text_color?: string; snap_time_to_data: boolean }
   | { kind: "text"; box_color?: string; box_border_color?: string; box_border_width: number }
-  | { kind: "position"; levels: drawing_level[] }
+  | { kind: "position"; levels: drawing_level[]; account_size: number; risk_percent: number }
   | { kind: "generic" }
   // B8: lines — begin
   | { kind: "line"; stats_position: drawing_stats_position }
@@ -2931,7 +3016,10 @@ export interface pattern_tool_options {
 export interface shape_tool_options {
   /**
    * Polyline only: join the last vertex back to the first and, while `fill_enabled`, fill the
-   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it.
+   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it. The fill is
+   * bounded work: more than 2,048 vertices, or a polygon so heavily self-intersecting that its
+   * fill exceeds the tessellation bounds, paints the outline only (no fill, no interior selection
+   * target, no error).
    */
   closed?: boolean;
 }
@@ -2967,12 +3055,20 @@ export interface drawing_tool_options {
 
 /**
  * A drawing's options (engine `Drawing`). Every tool can carry a text label placed by the
- * 3×3 `text_h_align`/`text_v_align` against the tool's geometry. Colors parse per the engine's
+ * 3×3 `text_h_align`/`text_v_align` against the tool's geometry, except the eight tools that
+ * paint no text (`forecast`, `bars_pattern`, `price_range`, `date_range`, `date_and_price_range`,
+ * `projection`, `flag_mark`, `icon`), which keep `text` without showing it. A painted label is
+ * edited in place: double-click it (or select the drawing and press Enter or F2), and tools that
+ * start from a default text open the editor when placed. Colors parse per the engine's
  * CSS rules; `""` for optional colors means "follow the default" (the border color at
  * 20% alpha for a rectangle's fill, the chart's `layout.textColor` for labels), and
  * `text_size: null` follows `layout.fontSize`.
  */
 export interface drawing_options {
+  /** Hypothetical balance for Long/Short Position statistics (default 1,000); independent of broker orders. */
+  position_account_size: number;
+  /** Percentage of the hypothetical balance risked at the stop, 0–100 (default 25). */
+  position_risk_percent: number;
   name: string;
   group_id: string;
   revision: number;
@@ -3003,7 +3099,7 @@ export interface drawing_options {
   fill_color: string;
   /** Interactive rectangle preview fill (`""` = `fill_color`). */
   preview_fill_color: string;
-  /** Rectangle outline visibility (generic drawings default true; official plugin false). */
+  /** Rectangle outline visibility (default false). */
   border_visible: boolean;
   /** Rectangle endpoint labels on the price and time axes. */
   show_labels: boolean;
@@ -3063,6 +3159,8 @@ export interface persisted_pane_v1 {
 
 /** Stable semantic drawing style persisted by schema V1. Omitted fields restore defaults. */
 export interface persisted_drawing_style_v1 {
+  position_account_size?: number;
+  position_risk_percent?: number;
   name?: string;
   group_id?: string;
   revision?: number;
@@ -3321,7 +3419,8 @@ export interface series_api {
    * `code: "empty_merge"`. Volume and turnover merge into their own series.
    *
    * Emits one `data_changed("update")`. Throws `unsupported_operation` on custom, advanced, and
-   * footprint series.
+   * footprint series. An engine-owned series (a bound candle, a trade study, resampled or
+   * synthetic bars) rejects it with `code: "derived_series"` and changes nothing.
    */
   merge(point: series_merge_data, options?: series_update_options): void;
   /**
@@ -3408,7 +3507,11 @@ export interface series_api {
    *
    * Requires the page to be cross-origin isolated, since that is what makes `SharedArrayBuffer`
    * available at all. Throws if the layout is unusable (a channel that overruns `row_stride`, a
-   * misaligned cursor, a ring that does not fit the buffer, zero capacity).
+   * misaligned cursor, a ring that does not fit the buffer, zero capacity), and throws
+   * `unsupported_operation` for an engine-owned series (a bound candle, a trade study, resampled
+   * or synthetic bars), which only its trade stream or source feeds. A ring bound before its
+   * series became engine-owned is not unbound: unbind it with `set_ring_source(null)`, or its
+   * drained rows are dropped and counted in {@link frame_stats.ring_dropped_rows}.
    */
   set_ring_source(buffer: SharedArrayBuffer | null, layout?: ring_source_layout): void;
   /**
@@ -3419,7 +3522,9 @@ export interface series_api {
   /**
    * Remove `count` data items from the end of the series (reference `ISeriesApi.pop`, default
    * `count: 1`). Divergence: reference returns the removed items; here the engine drops them and the
-   * method returns nothing.
+   * method returns nothing. On an engine-owned series (a bound candle, a trade study, resampled or
+   * synthetic bars) it removes nothing: it records a `derived_series` rejection in
+   * {@link last_ingestion_diagnostics}, warns, and fires no `data_changed`.
    */
   pop(count?: number): void;
   /**
@@ -3454,7 +3559,15 @@ export interface series_api {
   price_scale_id(): string;
   /** Rebind to an existing price scale in this pane without recreating the series. */
   move_to_price_scale(id: string): void;
+  /**
+   * Chart-content `y` (CSS px from the top of the stacked pane area, see {@link pane_geometry}) for
+   * a price on this series' own pane and price scale, in that scale's mode and base. For a series
+   * in a lower pane the result lies inside that pane's `[top, top + height]`, not pane-local: this
+   * is how a host targets a sub-pane. `null` when the scale has no range yet or the price is not
+   * finite.
+   */
   price_to_coordinate(price: number): number | null;
+  /** Inverse of {@link series_api.price_to_coordinate}: price on this series' scale at chart-content `y`. */
   coordinate_to_price(coordinate: number): number | null;
   bars_in_logical_range(range: logical_range): bars_info | null;
   data_by_index(logical_index: number, mismatch_direction?: mismatch_direction): series_data | null;
@@ -3544,9 +3657,16 @@ export interface time_scale_api {
   /** Fire after the time scale's media size changes (reference `subscribeSizeChange`). */
   subscribe_size_change(handler: size_change_handler): void;
   unsubscribe_size_change(handler: size_change_handler): void;
+  /**
+   * `x` (CSS px from the plot-area left edge; add {@link pane_geometry.left} for container x) of an
+   * exact bar timestamp. Time, logical and `x` conversions are the same for every pane.
+   */
   time_to_coordinate(time: number): number | null;
+  /** Timestamp of the bar nearest `x` (CSS px from the plot-area left edge). */
   coordinate_to_time(x: number): number | null;
+  /** `x` (CSS px from the plot-area left edge) of a possibly fractional logical bar index. */
   logical_to_coordinate(logical: number): number | null;
+  /** Logical bar index at `x` (CSS px from the plot-area left edge). */
   coordinate_to_logical(x: number): number | null;
   /** Exact timestamp lookup, or reference-compatible lower-bound lookup when `find_nearest` is true. */
   time_to_index(time: number, find_nearest?: boolean): number | null;
@@ -3770,6 +3890,12 @@ export interface trading_execution {
   quantity: number;
   order_id?: string;
   position_id?: string;
+  /**
+   * Mark drawn outside the bar that contains `time`: buys below its rendered low, sells above
+   * its rendered high (the plotted line for line-type series). Fills of one side on one bar
+   * share one mark (an arrow with stacked chevrons when there are several) that clears a line
+   * series across its width; hovering it marks each fill's exact price. Defaults to `"arrow"`.
+   */
   marker_shape?: "circle" | "arrow" | "triangle";
   size_by_quantity?: boolean;
 }
@@ -3804,6 +3930,13 @@ export interface host_event_hit {
   window: boolean;
 }
 
+/**
+ * A linked-chart crosshair position. `pane_index` selects the pane and `price` is a price on that
+ * pane's default price scale (the scale its crosshair label reads: the first visible non-overlay
+ * series' scale, else the right scale), not on the price scale of whichever series a host used to
+ * place it. `time` is an exact bar timestamp. Applying it puts the horizontal line at that price
+ * inside the requested pane, held on the pane's edge when the price is outside its visible range.
+ */
 export interface crosshair_sync_position {
   time: number;
   price: number;
@@ -3828,6 +3961,8 @@ export interface trading_hit {
   kind:
     | "position_line"
     | "order_line"
+    | "take_profit_button"
+    | "stop_loss_button"
     | "cancel_button"
     | "execution_marker"
     | "annotation";
@@ -3894,6 +4029,9 @@ export interface trading_style_options {
   rejected: string;
   control: string;
   label: string;
+  /** Execution arrow colors; default blue buy and red sell. */
+  execution_buy: string;
+  execution_sell: string;
 }
 
 /** First-party, broker-neutral runtime trading state. Live objects are never chart-persisted. */
@@ -4081,9 +4219,30 @@ export interface chart_api {
   update_trade_stream_trades(stream_id: number, trades: readonly footprint_trade[]): "tip" | "historical";
   update_trade_stream_trades_typed(stream_id: number, columns: footprint_trade_columns): "tip" | "historical";
   bind_footprint_series_to_stream(series: footprint_series_api | number, stream_id: number): void;
-  /** Present one canonical trade stream as ordinary candlesticks or OHLC bars. */
+  /**
+   * Present one canonical trade stream as ordinary candlesticks or OHLC bars.
+   *
+   * The series becomes engine-owned and read-only: feed the trade stream, not the series. Host
+   * `set_data`, `update`, `merge`, their typed forms, `pop`, and `set_ring_source` are rejected
+   * with `code: "derived_series"` (see {@link series_api.last_ingestion_diagnostics}) and change
+   * nothing; styling, pane moves, visibility, and `histogram_updown_rule` still work. It throws
+   * `invalid_options` for a series that is not a candlestick or bar, carries a `max_points` cap
+   * (retention follows the stream), or is already written by another engine feature (a
+   * footprint, a CVD, delta, or volume study, or resampled or synthetic bars). Rebinding to
+   * another stream is allowed.
+   */
   bind_trade_bar_series_to_stream(series: series_api | number, stream_id: number): void;
+  /**
+   * Cumulative volume delta study of the stream. Engine-owned and read-only like a bound
+   * candle: feed the trade stream. Styling, pane moves, visibility, and the study's own
+   * `max_points` still work.
+   */
   add_cvd_series(stream_id: number, pane?: number, reset?: "session" | "continuous" | "anchored", anchor_timestamp_micros?: number): series_api;
+  /**
+   * Delta histogram of the stream's bars. Engine-owned and read-only like a bound candle: feed
+   * the trade stream. Styling, pane moves, visibility, and the study's own `max_points` still
+   * work.
+   */
   add_delta_series(stream_id: number, pane?: number): series_api;
   add_trade_bubbles(series: series_api | number, stream_id: number, options?: { minimum_volume?: number; max_markers?: number; aggregation_window_micros?: number }): void;
   /**
@@ -4096,7 +4255,9 @@ export interface chart_api {
   set_trade_stream_sessions(stream_id: number, sessions: trade_session_options | null): void;
   /**
    * Volume histogram derived from the stream's bars (total traded volume per bar), tinted by the
-   * primary price series' direction (`histogram_updown`); restyle it like any histogram.
+   * primary price series' direction (`histogram_updown`); restyle it like any histogram. It is
+   * engine-owned and read-only like a bound candle: feed the trade stream. Styling, pane moves,
+   * visibility, `histogram_updown_rule`, and the study's own `max_points` still work.
    */
   add_trade_volume_series(stream_id: number, pane?: number): series_api;
   /**
@@ -4331,19 +4492,33 @@ export interface chart_api {
    * over-zoomed scale fits the data again on the next frame.
    */
   reset_view(): void;
+  /**
+   * Chart-content `y` (CSS px from the top of the stacked pane area, see {@link pane_geometry}) for
+   * a price on the top pane's (pane 0) default price scale. To convert on another pane or scale
+   * use that series' {@link series_api.price_to_coordinate}. `null` when the scale has no range yet.
+   */
   price_to_coordinate(price: number): number | null;
+  /**
+   * Price for a chart-content `y` on the default price scale of the pane containing `y` (the scale
+   * its crosshair label reads): a separator belongs to the pane above and a `y` below the panes to
+   * the last pane. `null` when that scale has no range yet.
+   */
   coordinate_to_price(y: number): number | null;
   /**
    * Set the crosshair position within the chart (reference `IChartApi.setCrosshairPosition`). The
    * crosshair normally follows the user's cursor; setting it explicitly is useful to synchronise
    * the crosshairs of two separate charts. `time` accepts the same forms as data times.
    * Divergence: reference throws on an unknown series; here the call is a silent no-op when the
-   * position cannot be applied.
+   * position cannot be applied. The line is placed through `series`' own price scale; the sync
+   * event it queues carries a price on the pane's default scale (see {@link crosshair_sync_position}).
    */
   set_crosshair_position(price: number, time: time, series: series_api): void;
   /** Clear the crosshair position within the chart (reference `IChartApi.clearCrosshairPosition`). */
   clear_crosshair_position(): void;
-  /** Read the semantic crosshair state for linked-chart coordinators. */
+  /**
+   * Read the semantic crosshair state for linked-chart coordinators: the pane under the crosshair
+   * (a separator counts as the pane above) and the price on that pane's default scale.
+   */
   crosshair_sync_position(): crosshair_sync_position | null;
   /** Apply a coordinator-provided crosshair without generating local pointer input. */
   apply_external_crosshair(position: crosshair_sync_position | null): void;

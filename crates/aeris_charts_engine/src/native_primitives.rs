@@ -95,6 +95,15 @@ pub struct DeltaTooltipPoint {
     pub index: i64,
 }
 
+/// One Area series composed with its Delta Tooltip (see [`ChartEngine::set_brushable_area`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BrushableArea {
+    pub(crate) series: SeriesId,
+    pub(crate) tooltip: NativePrimitiveId,
+    /// The active range the area brush currently reflects.
+    pub(crate) styled: Option<DeltaTooltipActiveRange>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeltaTooltipActiveRange {
     pub from: i64,
@@ -1328,6 +1337,115 @@ impl ChartEngine {
         true
     }
 
+    /// Compose a Delta Tooltip with an ordinary Area series into a brushable comparison, or remove
+    /// that composition with `None`. The tooltip owns the range gesture; the engine restyles the
+    /// area from its active range with the engine-owned brush defaults, so no host repeats the
+    /// styling. Returns false when the series is not a live Area series or rejects the tooltip.
+    pub fn set_brushable_area(
+        &mut self,
+        series_id: SeriesId,
+        options: Option<DeltaTooltipOptions>,
+    ) -> bool {
+        if let Some(index) = self
+            .brushable_areas
+            .iter()
+            .position(|area| area.series == series_id)
+        {
+            let area = self.brushable_areas.swap_remove(index);
+            self.remove_native_primitive(area.tooltip);
+            self.clear_area_brush_state(series_id);
+        }
+        let Some(options) = options else {
+            return true;
+        };
+        if self.series_entry(series_id).map(|series| series.kind) != Some(SeriesKind::Area) {
+            return false;
+        }
+        let Some(tooltip) = self.add_delta_tooltip(series_id, options) else {
+            return false;
+        };
+        self.brushable_areas.push(BrushableArea {
+            series: series_id,
+            tooltip,
+            styled: None,
+        });
+        true
+    }
+
+    /// Whether `series_id` is currently composed as a brushable area.
+    pub fn is_brushable_area(&self, series_id: SeriesId) -> bool {
+        self.brushable_areas
+            .iter()
+            .any(|area| area.series == series_id)
+    }
+
+    /// The brushed comparison range of a brushable area, if one is selected.
+    pub fn brushable_area_range(&self, series_id: SeriesId) -> Option<DeltaTooltipActiveRange> {
+        let area = self
+            .brushable_areas
+            .iter()
+            .find(|area| area.series == series_id)?;
+        self.delta_tooltip_active_range(area.tooltip)
+    }
+
+    /// Clear every brushed comparison range (double-click and Escape).
+    pub(crate) fn clear_brushable_ranges(&mut self) {
+        let tooltips: Vec<_> = self
+            .brushable_areas
+            .iter()
+            .map(|area| area.tooltip)
+            .collect();
+        for tooltip in tooltips {
+            self.clear_delta_tooltip(tooltip);
+        }
+        self.sync_brushable_areas();
+    }
+
+    /// Restyle each brushable area from its tooltip's active range. Compositions whose series or
+    /// tooltip no longer exists are dropped.
+    pub(crate) fn sync_brushable_areas(&mut self) {
+        let mut index = 0;
+        while index < self.brushable_areas.len() {
+            let area = self.brushable_areas[index];
+            let live = self.series_entry(area.series).map(|series| series.kind)
+                == Some(SeriesKind::Area)
+                && self.series.iter().any(|series| {
+                    series
+                        .native_primitives
+                        .iter()
+                        .any(|primitive| primitive.id == area.tooltip)
+                });
+            if !live {
+                self.brushable_areas.swap_remove(index);
+                self.clear_area_brush_state(area.series);
+                continue;
+            }
+            let range = self.delta_tooltip_active_range(area.tooltip);
+            if range != area.styled {
+                match (range, self.area_brush_defaults(area.series)) {
+                    (Some(range), Some(defaults)) => {
+                        let style = if range.positive {
+                            defaults.positive
+                        } else {
+                            defaults.negative
+                        };
+                        let brush = crate::BrushRange {
+                            from: range.from as f64,
+                            to: range.to as f64,
+                            style,
+                        };
+                        self.set_area_brush_state(area.series, defaults.outside, vec![brush]);
+                    }
+                    _ => {
+                        self.clear_area_brush_state(area.series);
+                    }
+                }
+                self.brushable_areas[index].styled = range;
+            }
+            index += 1;
+        }
+    }
+
     /// Whether any live series currently owns a delta-tooltip interaction. Hosts use this rather
     /// than retained callback/listener counts so converting an attached series to candlesticks
     /// immediately stops delta-tooltip touch ownership after the engine removes the primitive.
@@ -1670,6 +1788,48 @@ mod tests {
                     .is_some(),
                 "delta tooltip should support {kind:?}"
             );
+        }
+    }
+
+    /// The comparison tooltip's bordered box lands on whole device pixels, and its colored delta
+    /// band spans exactly the box's rows, so all four borders stay one crisp device pixel.
+    #[test]
+    fn delta_tooltip_box_and_band_land_on_whole_device_pixels() {
+        use aeris_charts_render::draw_list::Prim;
+        for dpr in [1.0_f64, 1.25, 1.5, 1.75, 2.0, 2.5] {
+            let mut chart = delta_chart();
+            chart.dpr = dpr;
+            chart
+                .add_delta_tooltip(0, DeltaTooltipOptions::default())
+                .unwrap();
+            let x2 = chart.time_scale.index_to_coordinate(2) + 0.37;
+            let x7 = chart.time_scale.index_to_coordinate(7) + 0.61;
+            assert!(chart.delta_tooltip_mouse_down(x2));
+            assert!(chart.delta_tooltip_mouse_move(x7));
+            let frame = chart.build_frame();
+            let prims = frame.panes.iter().flat_map(|pane| pane.main.iter());
+            let mut boxes = Vec::new();
+            let mut bands = Vec::new();
+            for primitive in prims {
+                match primitive {
+                    Prim::RoundRect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        border_width,
+                        ..
+                    } if *border_width > 0.0 => boxes.push((*x, *y, *w, *h)),
+                    Prim::Rect { rect, color } if color.a() == 51 => bands.push(*rect),
+                    _ => {}
+                }
+            }
+            let &(x, y, w, h) = boxes.first().expect("tooltip box");
+            for edge in [x, y, x + w, y + h] {
+                assert_eq!(edge.fract(), 0.0, "box {x},{y} {w}x{h} at dpr {dpr}");
+            }
+            let band = bands.first().expect("delta band");
+            assert_eq!((band.y as f32, band.h as f32), (y, h), "dpr {dpr}");
         }
     }
 
@@ -2084,7 +2244,7 @@ mod tests {
         // In UTC the 09:30..16:00 gate covers the 13:00..15:30 UTC bars; in New York (-5h) the
         // same exchange-local gate covers 14:30..20:30 UTC.
         let utc_width = shaded(&mut chart, weekday);
-        chart.set_time_zone(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
+        chart.set_exchange_offsets(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
         let eastern_width = shaded(&mut chart, weekday);
         assert!(utc_width > 0 && eastern_width > utc_width);
         assert_eq!(shaded(&mut chart, weekend), 0);
@@ -2096,7 +2256,7 @@ mod tests {
             .unwrap();
         all_day.time_scale.set_width(800.0);
         all_day.fit_content();
-        all_day.set_time_zone(crate::UtcOffsetSchedule::fixed(9 * 3_600).unwrap());
+        all_day.set_exchange_offsets(crate::UtcOffsetSchedule::fixed(9 * 3_600).unwrap());
         all_day
             .add_session_highlighting(
                 0,
@@ -2352,7 +2512,7 @@ mod tests {
             ..crate::SeriesPriceFormat::default()
         };
         // America/New_York winter offset: day 2 (1970-01-03 00:00 UTC) is 2 Jan 19:00 locally.
-        chart.set_time_zone(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
+        chart.set_exchange_offsets(crate::UtcOffsetSchedule::fixed(-5 * 3_600).unwrap());
         chart
             .add_delta_tooltip(
                 0,

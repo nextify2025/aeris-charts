@@ -7,6 +7,11 @@ impl ChartEngine {
     /// Keep the stored crosshair position for host callbacks and snapping, but do not paint its
     /// lines, markers, or labels through the object the pointer is acting on.
     pub(crate) fn crosshair_suppressed_by_interaction(&self) -> bool {
+        // A live Shift-click measure reads the pointer through the crosshair, even while it
+        // passes over other chart objects.
+        if self.measure_following() {
+            return false;
+        }
         self.hovered_drawing.is_some()
             || self.drawing_drag.is_some()
             || self.pending_drawing().is_some()
@@ -254,7 +259,8 @@ impl ChartEngine {
 
     /// Resolve the rendered source-series candidate nearest `(x_css, y_css)` in pixel space.
     /// Drawings and the crosshair share this path so they choose the same bar, visible series, and
-    /// field. Derived indicator outputs remain inspectable but never attract the magnet.
+    /// field. Derived indicator and external-study outputs remain inspectable but never attract
+    /// the magnet.
     /// OHLC mode exposes all four prices only for series that paint them; scalar-rendered series
     /// expose their close/value so hidden input columns cannot attract the magnet.
     pub(crate) fn magnet_snap_coordinate(
@@ -275,6 +281,7 @@ impl ChartEngine {
             if !series.visible
                 || series.removed
                 || self.indicator_binding_id(series.id).is_some()
+                || self.external_study_for_series(series.id).is_some()
                 || series.price_scale_target == PriceScaleTarget::Overlay
                 || series.pane_index != pane_index
             {
@@ -343,7 +350,14 @@ impl ChartEngine {
         let include_ohlc = match self.crosshair_mode {
             CrosshairMode::MagnetOhlc => Some(true),
             CrosshairMode::Magnet => Some(false),
-            CrosshairMode::Normal if self.crosshair_ohlc_magnet => Some(true),
+            CrosshairMode::Normal
+                if self.crosshair_ohlc_magnet
+                    && (self.active_drawing_tool().is_some()
+                        || self.drawing_create_active()
+                        || self.drawing_drag_active()) =>
+            {
+                Some(true)
+            }
             _ => None,
         };
         let Some(include_ohlc) = include_ohlc else {

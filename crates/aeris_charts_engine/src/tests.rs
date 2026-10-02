@@ -991,6 +991,89 @@ fn reset_view_restores_time_defaults_and_reenables_autoscale() {
 }
 
 #[test]
+fn chart_time_zone_rebuilds_tick_weights_and_formats_live_clock() {
+    let mut chart = ChartEngine::new(300.0, 200.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_767_329_940.0, 1_767_330_000.0],
+            &[100.0, 101.0],
+            &[101.0, 102.0],
+            &[99.0, 100.0],
+            &[100.5, 101.5],
+        )
+        .unwrap();
+    assert_eq!(chart.time_zone_id(), DEFAULT_TIME_ZONE);
+    assert!(chart.set_time_zone("America/New_York").unwrap());
+    assert_eq!(chart.time_zone_id(), "America/New_York");
+    let marks = chart.time_marks(1.0);
+    assert!(marks.iter().any(|&(index, weight)| {
+        index == 1 && weight == aeris_charts_core::scale::time_tick_marks::TickMarkWeight::Day as u8
+    }));
+    assert_eq!(
+        chart.time_zone_clock_text(1_784_116_800, true),
+        "08:00:00 EDT"
+    );
+    assert!(!chart.set_time_zone("America/New_York").unwrap());
+    assert!(chart.set_time_zone("Mars/Olympus_Mons").is_err());
+}
+
+#[test]
+fn future_time_projection_labels_empty_space_without_creating_data() {
+    let mut chart = ChartEngine::new(600.0, 300.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_000.0, 1_060.0, 1_120.0],
+            &[100.0, 101.0, 102.0],
+            &[101.0, 102.0, 103.0],
+            &[99.0, 100.0, 101.0],
+            &[100.5, 101.5, 102.5],
+        )
+        .unwrap();
+    let canonical_len = chart.data_layer().merged_times().len();
+    let base_index = chart.time_scale.base_index();
+
+    assert!(chart.set_future_time_projection(Some(60), 32));
+    assert_eq!(chart.axis_time_key_at(3), Some(1_180));
+    assert_eq!(chart.axis_time_key_at(34), Some(3_040));
+    assert_eq!(chart.axis_time_key_at(35), None);
+    assert_eq!(chart.data_layer().merged_times().len(), canonical_len);
+    assert_eq!(chart.time_scale.base_index(), base_index);
+    assert_eq!(chart.time_scale.points_len(), canonical_len);
+    assert!(chart
+        .time_marks(1.0)
+        .iter()
+        .any(|(index, _)| *index > base_index));
+}
+
+#[test]
+fn past_time_projection_labels_left_whitespace_without_creating_data() {
+    let mut chart = ChartEngine::new(600.0, 300.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &[1_000.0, 1_060.0, 1_120.0],
+            &[100.0, 101.0, 102.0],
+            &[101.0, 102.0, 103.0],
+            &[99.0, 100.0, 101.0],
+            &[100.5, 101.5, 102.5],
+        )
+        .unwrap();
+    let canonical_len = chart.data_layer().merged_times().len();
+    let base_index = chart.time_scale.base_index();
+
+    assert!(chart.set_past_time_projection(Some(60), 32));
+    assert_eq!(chart.axis_time_key_at_logical(-1), Some(940));
+    assert_eq!(chart.axis_time_key_at_logical(-32), Some(-920));
+    assert_eq!(chart.axis_time_key_at_logical(-33), None);
+    assert_eq!(chart.data_layer().merged_times().len(), canonical_len);
+    assert_eq!(chart.time_scale.base_index(), base_index);
+    assert_eq!(chart.time_scale.points_len(), canonical_len);
+    assert!(chart.time_marks(1.0).iter().any(|(index, _)| *index < 0));
+}
+
+#[test]
 fn reset_style_to_defaults_preserves_runtime_view_and_semantic_state() {
     let mut chart = ChartEngine::new(640.0, 400.0, 1.0);
     chart
@@ -1585,6 +1668,40 @@ fn indicators_are_engine_owned_series() {
     chart.update_series_bar(0, 5.0, [5.0, 6.0, 4.0, 6.0]);
     let ema_rows = chart.data.series_data(ema).unwrap();
     assert!((ema_rows.1[3].last().copied().unwrap() - 5.388888888888889).abs() < 1e-12);
+}
+
+#[test]
+fn ema_family_defaults_to_one_pixel_and_respects_explicit_widths() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..30).map(|i| i as f64).collect::<Vec<_>>();
+    let values = times.iter().map(|v| v + 100.0).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+
+    let sma = chart.add_sma(0, 5).unwrap();
+    let mut ema_outputs = vec![
+        chart.add_ema(0, 5).unwrap(),
+        chart.add_dema(0, 5).unwrap(),
+        chart.add_tema(0, 5).unwrap(),
+    ];
+    ema_outputs.extend(chart.add_ema_ribbon(0, [2, 3, 5, 8, 13]));
+    assert_eq!(chart.series_entry(sma).unwrap().line_width, Some(2.0));
+    for &id in &ema_outputs {
+        assert_eq!(chart.series_entry(id).unwrap().line_width, Some(1.0));
+    }
+
+    let customized = ema_outputs[0];
+    assert!(chart.series_apply_options_json(customized, r#"{"line_width":3}"#));
+    assert_eq!(
+        chart.series_entry(customized).unwrap().line_width,
+        Some(3.0)
+    );
+    chart.reset_style_to_defaults();
+    for &id in &ema_outputs {
+        assert_eq!(chart.series_entry(id).unwrap().line_width, Some(1.0));
+    }
+    assert_eq!(chart.series_entry(sma).unwrap().line_width, Some(2.0));
 }
 
 #[test]
@@ -2375,6 +2492,43 @@ fn every_indicator_kind() -> Vec<IndicatorKind> {
     ]
 }
 
+/// `IndicatorKind` keeps its large internally tagged serde bodies out of line (see the enum), so every
+/// entry point that used to carry its own copy must still agree on one JSON contract.
+#[test]
+fn indicator_kind_json_contract_is_identical_across_every_deserialization_path() {
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        kind: IndicatorKind,
+    }
+    for kind in every_indicator_kind() {
+        let value = serde_json::to_value(&kind).expect("kind serializes");
+        assert!(value["kind"].is_string(), "{kind:?} is internally tagged");
+        assert_eq!(
+            serde_json::from_value::<IndicatorKind>(value.clone()).expect("from_value"),
+            kind
+        );
+        assert_eq!(
+            serde_json::from_str::<IndicatorKind>(&value.to_string()).expect("from_str"),
+            kind
+        );
+        let held = serde_json::from_value::<Holder>(serde_json::json!({ "kind": value }))
+            .expect("as a struct field");
+        assert_eq!(held.kind, kind);
+    }
+    assert_eq!(
+        serde_json::from_value::<IndicatorKind>(serde_json::json!({ "kind": "ema", "period": 9 }))
+            .expect("defaults fill omitted fields"),
+        IndicatorKind::Ema {
+            period: 9,
+            seed: IndicatorSeed::default()
+        }
+    );
+    assert!(serde_json::from_value::<IndicatorKind>(
+        serde_json::json!({ "kind": "unknown_study" })
+    )
+    .is_err());
+}
+
 fn indicator_reads_volume(kind: &IndicatorKind) -> bool {
     matches!(
         kind,
@@ -2450,7 +2604,13 @@ fn streamed_aggregate_and_weight_inputs_match_a_fresh_install_for_every_indicato
     let mut cases = Vec::new();
     for kind in every_indicator_kind() {
         let weighted = indicator_reads_volume(&kind);
-        for input in [IndicatorInputSource::Close, IndicatorInputSource::Hlc3] {
+        for input in [
+            IndicatorInputSource::Close,
+            IndicatorInputSource::Hl2,
+            IndicatorInputSource::Hlc3,
+            IndicatorInputSource::Ohlc4,
+            IndicatorInputSource::Hlcc4,
+        ] {
             for order in orders.iter().take(if weighted { 3 } else { 1 }) {
                 cases.push((kind.clone(), input, *order, false));
             }
@@ -2556,6 +2716,167 @@ fn streamed_aggregate_and_weight_inputs_match_a_fresh_install_for_every_indicato
         assert_binding_matches_fresh_install(&chart, binding, &label);
         tick(&mut chart, 43, 5);
         tick(&mut chart, 44, 0);
+    }
+}
+
+/// Aggregate price columns the twin charts of `aggregate_twin_charts` retain.
+const AGGREGATE_COLUMNS: usize = 4;
+
+/// Bytes of capacity a chart of `rows` rows may keep in `AGGREGATE_COLUMNS` aggregate columns:
+/// one eighth of the rows plus a fixed floor of spare rows each.
+fn aggregate_column_bound(rows: usize) -> usize {
+    AGGREGATE_COLUMNS * (rows + rows / 8 + 4096) * std::mem::size_of::<f64>()
+}
+
+/// Install `rows` real bars followed by `slots` whitespace rows on the primary series.
+fn load_aggregate_source(chart: &mut ChartEngine, rows: usize, slots: usize) {
+    let times = (0..rows + slots)
+        .map(|row| row as f64 * 60.0)
+        .collect::<Vec<_>>();
+    let bars = (0..rows + slots)
+        .map(|row| {
+            if row < rows {
+                swinging_bar(row, 0)
+            } else {
+                [f64::NAN; 4]
+            }
+        })
+        .collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+}
+
+/// Two charts over the same source: four studies on a canonical input (no derived column) and the
+/// same four on the four aggregate inputs. Every other runtime capacity cancels, so the
+/// difference in indicator runtime bytes is the binding-private aggregate columns.
+fn aggregate_twin_charts(rows: usize, slots: usize) -> (ChartEngine, ChartEngine) {
+    let kinds = [
+        IndicatorKind::Sma { period: 20 },
+        IndicatorKind::Ema {
+            period: 20,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::Rsi {
+            period: 14,
+            seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::StochasticRsi {
+            rsi_period: 14,
+            stochastic_period: 14,
+        },
+    ];
+    let aggregates = [
+        IndicatorInputSource::Hl2,
+        IndicatorInputSource::Hlc3,
+        IndicatorInputSource::Ohlc4,
+        IndicatorInputSource::Hlcc4,
+    ];
+    let mut canonical = ChartEngine::new(800.0, 500.0, 1.0);
+    let mut composite = ChartEngine::new(800.0, 500.0, 1.0);
+    load_aggregate_source(&mut canonical, rows, slots);
+    load_aggregate_source(&mut composite, rows, slots);
+    for (kind, input) in kinds.into_iter().zip(aggregates) {
+        assert!(!canonical
+            .add_indicator_kind_with_input(0, IndicatorInputSource::Close, kind.clone(), None)
+            .is_empty());
+        assert!(!composite
+            .add_indicator_kind_with_input(0, input, kind, None)
+            .is_empty());
+    }
+    (canonical, composite)
+}
+
+fn aggregate_columns_bytes(canonical: &ChartEngine, composite: &ChartEngine) -> usize {
+    composite
+        .memory_usage()
+        .indicator_runtime_bytes
+        .checked_sub(canonical.memory_usage().indicator_runtime_bytes)
+        .expect("aggregate studies hold at least the canonical runtime state")
+}
+
+#[test]
+fn aggregate_input_columns_keep_bounded_tail_headroom() {
+    // Each aggregate column must be resident (an O(n) rebuild per tick is the alternative), must
+    // not reallocate on the first live append, and must stay within one eighth plus a fixed floor
+    // of spare rows however the source changes.
+    const ROWS: usize = 100_000;
+    let f64_bytes = std::mem::size_of::<f64>();
+    let (mut canonical, mut composite) = aggregate_twin_charts(ROWS, 0);
+
+    let installed = aggregate_columns_bytes(&canonical, &composite);
+    assert!(
+        installed >= AGGREGATE_COLUMNS * ROWS * f64_bytes,
+        "aggregate columns are resident: {installed} bytes"
+    );
+    assert!(
+        installed <= aggregate_column_bound(ROWS),
+        "install keeps bounded headroom: {installed} > {}",
+        aggregate_column_bound(ROWS)
+    );
+
+    // The first live append after the bulk install derives one row into spare capacity.
+    let mut last = ROWS;
+    for chart in [&mut canonical, &mut composite] {
+        chart.update_series_bar(0, last as f64 * 60.0, swinging_bar(last, 0));
+    }
+    assert_eq!(
+        aggregate_columns_bytes(&canonical, &composite),
+        installed,
+        "the first append reallocated an aggregate column"
+    );
+    for _ in 0..2_000 {
+        last += 1;
+        for chart in [&mut canonical, &mut composite] {
+            chart.update_series_bar(0, last as f64 * 60.0, swinging_bar(last, 0));
+        }
+        assert!(
+            aggregate_columns_bytes(&canonical, &composite) <= aggregate_column_bound(last + 1),
+            "append {last} outgrew the headroom bound"
+        );
+    }
+
+    // Replacing the source with far fewer rows releases the oversized columns.
+    for chart in [&mut canonical, &mut composite] {
+        load_aggregate_source(chart, 1_000, 0);
+    }
+    let replaced = aggregate_columns_bytes(&canonical, &composite);
+    assert!(
+        replaced >= AGGREGATE_COLUMNS * 1_000 * f64_bytes
+            && replaced <= aggregate_column_bound(1_000),
+        "data replacement kept {replaced} bytes of aggregate columns (bound {})",
+        aggregate_column_bound(1_000)
+    );
+}
+
+#[test]
+fn filling_the_first_session_slot_keeps_aggregate_input_columns() {
+    // A time-sharing chart installs the rest of the session as whitespace slots after its real
+    // rows. The runtime covers the source through the last real row, so the first fill extends
+    // each aggregate column by one row exactly like an append; it must not reallocate the column.
+    const ROWS: usize = 100_000;
+    const SLOTS: usize = 1_000;
+    let (mut canonical, mut composite) = aggregate_twin_charts(ROWS, SLOTS);
+
+    let installed = aggregate_columns_bytes(&canonical, &composite);
+    assert!(
+        installed >= AGGREGATE_COLUMNS * ROWS * std::mem::size_of::<f64>()
+            && installed <= aggregate_column_bound(ROWS),
+        "aggregate columns after the install: {installed} bytes"
+    );
+    for (filled, row) in (ROWS..ROWS + SLOTS).enumerate() {
+        for chart in [&mut canonical, &mut composite] {
+            chart.update_series_bar(0, row as f64 * 60.0, swinging_bar(row, 0));
+        }
+        let bytes = aggregate_columns_bytes(&canonical, &composite);
+        if filled == 0 {
+            assert_eq!(bytes, installed, "the first slot fill reallocated a column");
+        }
+        assert!(
+            bytes <= aggregate_column_bound(row + 1),
+            "filling slot {row} outgrew the headroom bound"
+        );
     }
 }
 
@@ -3486,6 +3807,133 @@ fn indicator_outputs_drop_the_countdown_show_the_name_chip_and_default_to_2px() 
     assert_eq!(title_of(atr), "ATR 2");
     assert_eq!(title_of(vwap), "VWAP");
     assert_eq!(title_of(wma), "WMA 3");
+}
+
+#[test]
+fn indicator_binding_owns_group_chrome_visibility_and_removal() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [1.0, 2.0, 3.0, 4.0, 5.0];
+    chart
+        .set_series_data(
+            0,
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &values,
+            &values,
+            &values,
+            &values,
+        )
+        .unwrap();
+    let chrome = IndicatorChromeOptions {
+        name_labels_visible: false,
+        value_labels_visible: false,
+        price_lines_visible: false,
+    };
+    assert!(chart.set_indicator_chrome_options(chrome));
+    let outputs = chart.add_macd(0, 2, 3, 2);
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(chart.indicator_chrome_options(), chrome);
+    assert!(outputs.iter().all(|output| {
+        chart.series_entry(*output).is_some_and(|series| {
+            !series.title_visible && !series.last_value_visible && !series.price_line_visible
+        })
+    }));
+
+    chart
+        .series_entry_mut(outputs[0])
+        .expect("MACD output exists")
+        .title_visible = true;
+    assert!(
+        chart.set_indicator_chrome_options(chrome),
+        "reapplying the retained policy must repair a drifted output"
+    );
+    assert!(
+        !chart
+            .series_entry(outputs[0])
+            .expect("MACD output exists")
+            .title_visible
+    );
+
+    assert!(chart.set_indicator_binding_visible(outputs[0], false));
+    assert!(outputs.iter().all(|output| {
+        chart
+            .series_entry(*output)
+            .is_some_and(|series| !series.visible)
+    }));
+    assert!(chart.remove_indicator_for_series(outputs[1]));
+    assert!(outputs
+        .iter()
+        .all(|output| chart.series_entry(*output).is_none()));
+    assert!(chart.indicator_bindings().is_empty());
+    assert!(!chart.has_indicator_bindings());
+
+    let sma = chart.add_sma(0, 2).expect("valid SMA");
+    let rsi = chart.add_rsi(0, 2).expect("valid RSI");
+    assert!(chart.has_indicator_bindings());
+    assert!(chart.clear_indicator_bindings());
+    assert!(!chart.has_indicator_bindings());
+    assert!(chart.series_entry(sma).is_none());
+    assert!(chart.series_entry(rsi).is_none());
+    assert!(!chart.clear_indicator_bindings());
+}
+
+#[test]
+fn price_scale_series_operations_are_typed_and_atomic() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [10.0, 11.0, 12.0];
+    chart
+        .set_series_data(0, &[1.0, 2.0, 3.0], &values, &values, &values, &values)
+        .unwrap();
+    let second = chart.add_series(SeriesKind::Line);
+    chart
+        .set_series_data(second, &[1.0, 2.0, 3.0], &values, &values, &values, &values)
+        .unwrap();
+    chart.set_series_price_scale(second, PriceScaleTarget::Left);
+
+    assert_eq!(
+        chart
+            .primary_series_on_price_scale(0, PriceScaleTarget::Right)
+            .map(|series| series.series_id),
+        Some(0)
+    );
+    assert_eq!(
+        chart
+            .primary_series_on_price_scale(0, PriceScaleTarget::Left)
+            .map(|series| series.series_id),
+        Some(second)
+    );
+    assert_eq!(chart.series_visible(second), Some(true));
+    let align = chart
+        .price_scale_for(0, PriceScaleTarget::Right)
+        .unwrap()
+        .options()
+        .align_labels;
+    assert!(chart.toggle_price_scale_align_labels(0, PriceScaleTarget::Right));
+    assert_eq!(
+        chart
+            .price_scale_for(0, PriceScaleTarget::Right)
+            .unwrap()
+            .options()
+            .align_labels,
+        !align
+    );
+    assert!(chart.toggle_series_chrome(0, SeriesChromeFlag::PriceLine));
+    assert!(!chart.series_entry(0).unwrap().price_line_visible);
+
+    assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 4, 0.0001));
+    assert_eq!(chart.series_entry(0).unwrap().price_format.precision, 4);
+    assert_eq!(
+        chart.series_entry(second).unwrap().price_format.precision,
+        2
+    );
+    assert!(!chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 4, f64::NAN));
+
+    assert!(chart.rebind_price_scale_series(0, PriceScaleTarget::Right, PriceScaleTarget::Left));
+    assert_eq!(
+        chart.series_entry(0).unwrap().price_scale_target,
+        PriceScaleTarget::Left
+    );
+    assert!(!chart.price_scale_visible_for(0, PriceScaleTarget::Right));
+    assert!(chart.price_scale_visible_for(0, PriceScaleTarget::Left));
 }
 
 #[test]
@@ -6235,6 +6683,33 @@ fn pulse_follows_kind_defaults_but_an_explicit_choice_survives_type_changes() {
 }
 
 #[test]
+fn restating_the_line_pulse_default_does_not_carry_the_pulse_onto_candles() {
+    use aeris_charts_render::draw_list::Prim;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    install_bars(&mut chart, 20);
+    chart.fit_content();
+    chart.convert_series_kind(0, SeriesKind::Line);
+    // Hosts re-send their whole style on every apply, including the default-on line pulse.
+    assert!(chart.set_series_last_price_animation(0, true));
+    assert!(chart.last_price_pulse_active());
+    chart.convert_series_kind(0, SeriesKind::Candlestick);
+    assert!(
+        !chart.last_price_pulse_active(),
+        "candles stop the animation clock"
+    );
+    let frame = chart.build_frame();
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Circle { .. })),
+        "candles paint no live-price pulse"
+    );
+    chart.convert_series_kind(0, SeriesKind::Area);
+    assert!(chart.last_price_pulse_active(), "area restores its default");
+}
+
+#[test]
 fn pulse_clock_runs_only_while_the_primary_series_draws_a_pulse() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     // The engine starts with one candlestick main series; the primary series owns the pulse.
@@ -8142,6 +8617,337 @@ fn two_indicator_panes_and_a_named_pane_scale_stay_independent() {
     assert!(ranges[1].min_value() > ranges[2].max_value());
 }
 
+// --- sub-pane coordinate contract and crosshair sync -----------------------------------------------
+
+/// `chart_with_indicator_pane` plus a volume-like series on the pane-0 overlay scale.
+fn chart_with_overlay_series() -> (ChartEngine, SeriesId) {
+    let mut chart = chart_with_indicator_pane();
+    let overlay = chart.add_series(SeriesKind::Histogram);
+    let times: Vec<f64> = (1..=40).map(|i| i as f64).collect();
+    let volume: Vec<f64> = (0..40)
+        .map(|i| 1_000.0 + (i as f64 * 37.0) % 900.0)
+        .collect();
+    chart
+        .set_series_data(overlay, &times, &volume, &volume, &volume, &volume)
+        .unwrap();
+    chart.set_series_price_scale(overlay, PriceScaleTarget::Overlay);
+    chart.build_frame();
+    (chart, overlay)
+}
+
+/// A second pane-0 line on `target` whose values (300..378) sit far outside the main series'
+/// (about 55..195), so its scale can never be mistaken for the main series'.
+fn add_pane_zero_comparison(chart: &mut ChartEngine, target: PriceScaleTarget) -> SeriesId {
+    let comparison = chart.add_series(SeriesKind::Line);
+    let times: Vec<f64> = (1..=40).map(|i| i as f64).collect();
+    let values: Vec<f64> = (0..40).map(|i| 300.0 + i as f64 * 2.0).collect();
+    chart
+        .set_series_data(comparison, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.set_series_price_scale(comparison, target);
+    comparison
+}
+
+/// `chart_with_indicator_pane` plus a second pane-0 line on the same Right scale whose first
+/// visible value differs from the main series', in percentage mode (per-series bases differ).
+fn chart_with_percentage_comparison() -> (ChartEngine, SeriesId) {
+    let mut chart = chart_with_indicator_pane();
+    let comparison = add_pane_zero_comparison(&mut chart, PriceScaleTarget::Right);
+    chart.set_price_scale_mode(0, false, PriceScaleMode::Percentage);
+    chart.build_frame();
+    (chart, comparison)
+}
+
+#[test]
+fn crosshair_sync_round_trips_on_a_sub_pane() {
+    let mut chart = chart_with_indicator_pane();
+    let rsi = chart.pane_series_ids(1)[0];
+    assert!(chart.set_crosshair_position(50.0, 30.0, rsi));
+    let (_, y) = chart.crosshair.expect("the synthetic crosshair");
+    assert_eq!(
+        chart.pane_at_y(y),
+        Some(1),
+        "the crosshair sits in the RSI pane"
+    );
+
+    let sync = chart.crosshair_sync_position().expect("a sync position");
+    assert_eq!(sync.pane_index, 1);
+    assert!(
+        (sync.price - 50.0).abs() < 1e-6,
+        "the sync price {} is not the RSI price the crosshair was placed at",
+        sync.price
+    );
+
+    // A linked, identically laid out chart lands on the same chart-content y.
+    let mut linked = chart_with_indicator_pane();
+    assert!(linked.apply_external_crosshair(Some(sync)));
+    let (_, linked_y) = linked.crosshair.expect("the applied crosshair");
+    assert!(
+        (linked_y - y).abs() < 1e-9,
+        "the applied crosshair y {linked_y} is not the source y {y}"
+    );
+}
+
+#[test]
+fn pane_and_chart_level_conversions_select_pane_by_y_and_default_scale() {
+    let chart = chart_with_indicator_pane();
+    let rsi = chart.pane_series_ids(1)[0];
+    let y_rsi = chart.series_price_to_coordinate(rsi, 50.0).unwrap();
+    let y_main = chart.series_price_to_coordinate(0, 120.0).unwrap();
+    // The public coordinate space is the shared chart content, never pane-local.
+    assert!(y_rsi >= chart.panes[1].top);
+    assert!(y_rsi > chart.panes[0].top + chart.panes[0].height);
+
+    let series_price = |id: SeriesId, y: f64| chart.series_coordinate_to_price(id, y).unwrap();
+    assert!((chart.coordinate_to_price(y_rsi).unwrap() - series_price(rsi, y_rsi)).abs() < 1e-9);
+    assert!((chart.coordinate_to_price(y_main).unwrap() - series_price(0, y_main)).abs() < 1e-9);
+    assert!((chart.pane_price_to_coordinate(1, 50.0).unwrap() - y_rsi).abs() < 1e-9);
+    assert!((chart.pane_price_to_coordinate(0, 120.0).unwrap() - y_main).abs() < 1e-9);
+
+    // A separator resolves to the pane above and a y below the content to the last pane.
+    let separator_y = chart.panes[0].top + chart.panes[0].height + 0.5;
+    assert_eq!(chart.pane_index_at_y(separator_y), 0);
+    assert!(
+        (chart.coordinate_to_price(separator_y).unwrap() - series_price(0, separator_y)).abs()
+            < 1e-9
+    );
+    let below_y = chart.pane_h + 40.0;
+    assert_eq!(chart.pane_index_at_y(below_y), 1);
+    assert!(
+        (chart.coordinate_to_price(below_y).unwrap() - series_price(rsi, below_y)).abs() < 1e-9
+    );
+
+    // Unusable inputs are `None`, never a panic or a non-finite number.
+    assert_eq!(chart.pane_price_to_coordinate(9, 50.0), None);
+    assert_eq!(chart.pane_coordinate_to_price(9, y_rsi), None);
+    assert_eq!(chart.pane_price_to_coordinate(1, f64::NAN), None);
+    assert_eq!(chart.pane_coordinate_to_price(1, f64::INFINITY), None);
+    assert_eq!(chart.coordinate_to_price(f64::NAN), None);
+    let empty = ChartEngine::new(800.0, 500.0, 1.0);
+    assert_eq!(empty.coordinate_to_price(10.0), None);
+    assert_eq!(empty.pane_price_to_coordinate(0, 100.0), None);
+}
+
+/// The chart-level pair must agree with `series` (the pane-0 series whose scale is the pane's
+/// default) at `price` and round-trip through pane 0. When `other` is given it names a pane-0
+/// series on a different scale that the pair must not follow.
+fn assert_chart_level_follows(
+    chart: &ChartEngine,
+    series: SeriesId,
+    other: Option<SeriesId>,
+    price: f64,
+    context: &str,
+) {
+    let y = chart
+        .pane_price_to_coordinate(0, price)
+        .unwrap_or_else(|| panic!("{context}: no chart-level coordinate for {price}"));
+    let y_series = chart.series_price_to_coordinate(series, price).unwrap();
+    assert!(
+        (y - y_series).abs() < 1e-9,
+        "{context}: chart-level y {y} is not series {series}'s y {y_series}"
+    );
+    if let Some(other) = other {
+        let y_other = chart.series_price_to_coordinate(other, price).unwrap();
+        assert!(
+            (y - y_other).abs() > 1.0,
+            "{context}: chart-level y {y} follows series {other}'s scale ({y_other})"
+        );
+    }
+    assert_eq!(chart.pane_index_at_y(y), 0, "{context}: y {y} left pane 0");
+    let back = chart
+        .coordinate_to_price(y)
+        .unwrap_or_else(|| panic!("{context}: no chart-level price for y {y}"));
+    assert!(
+        (back - price).abs() < 1e-6,
+        "{context}: {price} -> {y} -> {back}"
+    );
+    let back_series = chart.series_coordinate_to_price(series, y).unwrap();
+    assert!(
+        (back - back_series).abs() < 1e-9,
+        "{context}: chart-level price {back} is not series {series}'s {back_series}"
+    );
+}
+
+#[test]
+fn chart_level_conversions_use_the_pane_default_scale_not_the_first_series() {
+    // The main series (created first) moves to the overlay scale, which never decides a pane's
+    // default; the comparison on the right scale does. A converter that follows series creation
+    // order would read the main series' overlay scale here.
+    let mut chart = chart_with_indicator_pane();
+    let comparison = add_pane_zero_comparison(&mut chart, PriceScaleTarget::Right);
+    chart.set_series_price_scale(0, PriceScaleTarget::Overlay);
+    chart.build_frame();
+    assert_eq!(chart.pane_default_scale_target(0), PriceScaleTarget::Right);
+    assert_chart_level_follows(&chart, comparison, Some(0), 340.0, "main on overlay");
+
+    // Back on the right scale the main series is the pane's first visible source again.
+    chart.set_series_price_scale(0, PriceScaleTarget::Right);
+    chart.build_frame();
+    assert_chart_level_follows(&chart, 0, None, 120.0, "main back on the right scale");
+}
+
+#[test]
+fn chart_level_conversions_follow_a_hidden_main_series_to_the_next_source() {
+    for target in [PriceScaleTarget::Right, PriceScaleTarget::Left] {
+        let mut chart = chart_with_indicator_pane();
+        let comparison = add_pane_zero_comparison(&mut chart, target);
+        chart.build_frame();
+
+        // A visible main series is the default source: a comparison on the left scale never
+        // takes the chart-level pair away from it.
+        assert_eq!(chart.pane_default_scale_target(0), PriceScaleTarget::Right);
+        let other = (target == PriceScaleTarget::Left).then_some(comparison);
+        assert_chart_level_follows(&chart, 0, other, 120.0, "visible main");
+        let with_main = chart.pane_price_to_coordinate(0, 340.0).unwrap();
+
+        // Hiding it hands the pane's default scale to the comparison.
+        chart.set_series_visible(0, false);
+        chart.build_frame();
+        assert_eq!(chart.pane_default_scale_target(0), target);
+        assert_chart_level_follows(&chart, comparison, None, 340.0, "hidden main");
+        let without_main = chart.pane_price_to_coordinate(0, 340.0).unwrap();
+        assert!(
+            (with_main - without_main).abs() > 1.0,
+            "{target:?}: hiding the main series left the chart-level y at {with_main}"
+        );
+
+        // Showing it again restores the main series as the default source.
+        chart.set_series_visible(0, true);
+        chart.build_frame();
+        assert_eq!(chart.pane_default_scale_target(0), PriceScaleTarget::Right);
+        assert_chart_level_follows(&chart, 0, other, 120.0, "main shown again");
+    }
+}
+
+#[test]
+fn sub_pane_series_conversions_stay_in_the_shared_content_space() {
+    let mut chart = chart_with_indicator_pane();
+    let rsi = chart.pane_series_ids(1)[0];
+    let check = |chart: &ChartEngine| {
+        let pane = &chart.panes[1];
+        for price in [45.0, 50.0, 55.0] {
+            let y = chart.series_price_to_coordinate(rsi, price).unwrap();
+            assert!(
+                y >= pane.top && y <= pane.top + pane.height,
+                "price {price} maps to {y}, outside pane 1 [{}, {}]",
+                pane.top,
+                pane.top + pane.height
+            );
+            let back = chart.series_coordinate_to_price(rsi, y).unwrap();
+            assert!((back - price).abs() < 1e-9, "{price} -> {y} -> {back}");
+            assert_eq!(y, pane.price_scale.price_to_coordinate(price, 0.0));
+        }
+    };
+    check(&chart);
+    // Conversions reflect the last layout pass: after a divider drag and a rebuild the contract
+    // still holds against the moved pane.
+    chart.drag_pane_separator(0, 90.0);
+    chart.build_frame();
+    check(&chart);
+}
+
+#[test]
+fn sync_price_uses_the_pane_default_scale_for_overlay_series() {
+    let (mut chart, overlay) = chart_with_overlay_series();
+    let volume = chart.series_data(overlay)[29].close;
+    assert!(chart.set_crosshair_position(volume, 30.0, overlay));
+    let (_, y) = chart.crosshair.unwrap();
+    let events = chart.take_sync_events();
+    let ChartSyncEventKind::Crosshair { position } = events[0].kind.clone() else {
+        panic!("a crosshair event");
+    };
+    assert_eq!(position.pane_index, 0);
+    // The chart-level pair ignores the overlay series' own scale too.
+    let y_main = chart.series_price_to_coordinate(0, 120.0).unwrap();
+    assert!((chart.pane_price_to_coordinate(0, 120.0).unwrap() - y_main).abs() < 1e-9);
+    let expected = chart.pane_coordinate_to_price(0, y).unwrap();
+    assert_eq!(
+        position.price, expected,
+        "the price is on the pane default scale"
+    );
+    assert!(
+        (position.price - volume).abs() > 1.0,
+        "the raw overlay value must not leak into the sync price"
+    );
+
+    let (mut linked, _) = chart_with_overlay_series();
+    assert!(linked.apply_external_crosshair(Some(position)));
+    let (_, linked_y) = linked.crosshair.unwrap();
+    assert!(
+        (linked_y - y).abs() < 1e-9,
+        "linked y {linked_y} vs source y {y}"
+    );
+}
+
+#[test]
+fn sync_price_is_rebased_for_non_default_series_in_percentage_mode() {
+    let (mut chart, comparison) = chart_with_percentage_comparison();
+    let main_close = chart.series_data(0)[29].close;
+    let comparison_close = chart.series_data(comparison)[29].close;
+
+    // The default series keeps its raw host price bit-exact.
+    assert!(chart.set_crosshair_position(main_close, 30.0, 0));
+    let ChartSyncEventKind::Crosshair { position: main } = chart.take_sync_events()[0].kind.clone()
+    else {
+        panic!("a crosshair event");
+    };
+    assert_eq!(main.price, main_close);
+
+    // The comparison shares the Right scale but has its own first-value base, so its raw price is
+    // not a price on the default series' base and is re-expressed on it.
+    assert!(chart.set_crosshair_position(comparison_close, 30.0, comparison));
+    let (_, y) = chart.crosshair.unwrap();
+    let ChartSyncEventKind::Crosshair { position } = chart.take_sync_events()[0].kind.clone()
+    else {
+        panic!("a crosshair event");
+    };
+    assert!(
+        (position.price - comparison_close).abs() > 1.0,
+        "the comparison's raw price {comparison_close} must be rebased, got {}",
+        position.price
+    );
+
+    let (mut linked, _) = chart_with_percentage_comparison();
+    assert!(linked.apply_external_crosshair(Some(position)));
+    let (_, linked_y) = linked.crosshair.unwrap();
+    assert!(
+        (linked_y - y).abs() < 1e-9,
+        "linked y {linked_y} vs source y {y}"
+    );
+}
+
+#[test]
+fn external_crosshair_price_outside_the_pane_range_stays_in_that_pane() {
+    for (pane_index, price) in [(1, 1.0e6), (1, -1.0e6), (0, -1.0e6), (0, 1.0e6)] {
+        let mut chart = chart_with_indicator_pane();
+        assert!(chart.apply_external_crosshair(Some(CrosshairSyncPosition {
+            time: 30.0,
+            price,
+            pane_index,
+        })));
+        let (_, y) = chart.crosshair.unwrap();
+        assert_eq!(
+            chart.pane_at_y(y),
+            Some(pane_index),
+            "price {price} on pane {pane_index} drew the crosshair at y {y}"
+        );
+    }
+}
+
+#[test]
+fn crosshair_sync_position_survives_the_indicator_warmup_window() {
+    let mut chart = chart_with_indicator_pane();
+    // RSI(14) has no value before row 14: park the window inside the warmup rows.
+    chart.set_visible_logical_range(0.0, 8.0);
+    chart.build_frame();
+    let rsi_y = chart.panes[1].top + chart.panes[1].height / 2.0;
+    let x = chart.time_scale.index_to_coordinate(4);
+    chart.crosshair = Some((x, rsi_y));
+    let sync = chart.crosshair_sync_position().expect("a sync position");
+    assert_eq!(sync.pane_index, 1);
+    assert!(sync.price.is_finite());
+}
+
 #[test]
 fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
     use aeris_charts_render::draw_list::Prim;
@@ -8173,7 +8979,7 @@ fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
     let resting = prims
         .iter()
         .filter_map(|p| match p {
-            Prim::Rect { rect, .. } if rect.y == separator_y && rect.h == 1 => Some(*rect),
+            Prim::Rect { rect, .. } if rect.y == separator_y && rect.h == 2 => Some(*rect),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -8197,7 +9003,7 @@ fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
     let hover = prims
         .iter()
         .find_map(|p| match p {
-            Prim::Rect { rect, .. } if rect.h == 9 => Some(*rect),
+            Prim::Rect { rect, .. } if rect.h == 10 => Some(*rect),
             _ => None,
         })
         .expect("the hover band");
@@ -8207,10 +9013,10 @@ fn pane_separators_span_the_full_chart_width_at_rest_and_on_hover() {
 }
 
 #[test]
-fn axis_and_pane_borders_project_the_canonical_half_pixel_width() {
+fn axis_borders_are_one_css_px_and_pane_separators_two() {
     use aeris_charts_render::draw_list::Prim;
 
-    for dpr in [1.0_f64, 1.5, 2.0, 3.0] {
+    for dpr in [1.0_f64, 1.25, 1.5, 2.0, 3.0] {
         let mut chart = chart_with_indicator_pane();
         chart.dpr = dpr;
         chart.recompute_layout_with_measure(
@@ -8233,6 +9039,12 @@ fn axis_and_pane_borders_project_the_canonical_half_pixel_width() {
         let pane_bottom = (chart.pane_h * dpr).round() as i32;
         let bitmap_w = (chart.css_width * dpr).round().max(1.0) as i32;
         let separator_y = (axis.separators[0] * dpr).round() as i32;
+        let separator_h = (crate::PANE_SEPARATOR * dpr).round().max(1.0) as i32;
+        assert_eq!(expected, dpr.floor() as i32, "1 CSS px border at dpr {dpr}");
+        assert!(
+            (separator_h - (2.0 * dpr) as i32).abs() <= 1,
+            "2 CSS px separator at dpr {dpr}"
+        );
 
         assert!(
             prims.iter().any(|p| matches!(
@@ -8263,11 +9075,112 @@ fn axis_and_pane_borders_project_the_canonical_half_pixel_width() {
                     if rect.x == 0
                         && rect.y == separator_y
                         && rect.w == bitmap_w
-                        && rect.h == expected
+                        && rect.h == separator_h
             )),
-            "pane separator must use {expected} device px at dpr {dpr}"
+            "pane separator must use {separator_h} device px at dpr {dpr}"
         );
     }
+}
+
+/// The crosshair time label's vertical placement belongs to the shared axis builder and is keyed
+/// to the stable `Apr0` sample, never to the label's own glyphs. A host reports only that sample's
+/// ink metric, so the text sits at the same offset in the time strip for every month name (a label
+/// without descenders is not re-centred by its own ink), font, DPR and backend. Pixel probes of
+/// the painted label must therefore fix the label text rather than depend on the calendar.
+#[test]
+fn crosshair_time_text_is_placed_by_the_stable_sample_not_its_own_ink() {
+    use aeris_charts_render::draw_list::Prim;
+
+    const SAMPLE_CORRECTION: f64 = 3.5;
+    const OWN_INK_CORRECTION: f64 = 40.0;
+    let measure = |text: &str, _bold: bool| text.len() as f64 * 6.0;
+
+    for dpr in [1.0_f64, 1.25, 2.0] {
+        let mut chart = ChartEngine::new(800.0, 500.0, dpr);
+        let times: Vec<f64> = (0..10)
+            .map(|i| 1_700_000_000.0 + i as f64 * 3_600.0)
+            .collect();
+        let closes: Vec<f64> = (0..10).map(|i| 100.0 + i as f64).collect();
+        chart
+            .set_series_data(0, &times, &closes, &closes, &closes, &closes)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        chart.set_time_visible(true);
+        chart.recompute_layout_with_measure(true, measure, measure);
+        chart.build_frame();
+        let x = chart.time_scale.index_to_coordinate(5);
+        chart.set_crosshair_at(x, 100.0);
+
+        let axis = chart.build_axis_frame(80.0, measure, measure);
+        let label = axis
+            .labels
+            .iter()
+            .find(|label| label.midpoint == AxisTextMidpoint::StableTime)
+            .expect("the crosshair time label");
+        // Default 12 px layout font: 11 CSS px axis text centered below the 1 px border slot,
+        // 3 px tick allowance and 3 px padding.
+        assert_eq!(label.y, chart.pane_h + 1.0 + 3.0 + 3.0 + 11.0 / 2.0);
+
+        let mut prims = Vec::new();
+        chart.build_axis_primitives_into(&axis, &mut prims, |text| {
+            if text == "Apr0" {
+                SAMPLE_CORRECTION
+            } else {
+                OWN_INK_CORRECTION
+            }
+        });
+        let y = prims
+            .iter()
+            .find_map(|prim| match prim {
+                Prim::Text { text, y, .. } if *text == label.text => Some(*y),
+                _ => None,
+            })
+            .expect("the crosshair time text primitive");
+        let expected = ((label.y + SAMPLE_CORRECTION * label.font_scale) * dpr) as f32;
+        assert_eq!(y, expected, "text y follows the Apr0 sample at dpr {dpr}");
+    }
+}
+
+#[test]
+fn pane_separators_have_identical_device_thickness_at_fractional_dpr() {
+    use aeris_charts_render::draw_list::Prim;
+
+    let mut chart = chart_with_indicator_pane();
+    let extra = chart.add_series(SeriesKind::Line);
+    chart.set_series_pane(extra, 2, 1.0);
+    chart.dpr = 1.25;
+    chart.recompute_layout_with_measure(
+        true,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 5.0,
+    );
+    chart.build_frame();
+
+    let axis = chart.build_axis_frame(
+        80.0,
+        |text, _bold| text.len() as f64 * 6.0,
+        |text, _bold| text.len() as f64 * 5.0,
+    );
+    assert_eq!(axis.separators.len(), 2);
+    let mut prims = Vec::new();
+    chart.build_axis_primitives_into(&axis, &mut prims, |_| 0.0);
+    let expected_height = (crate::PANE_SEPARATOR * chart.dpr).round() as i32;
+    let heights = axis
+        .separators
+        .iter()
+        .map(|separator| {
+            let y = (separator * chart.dpr).round() as i32;
+            prims
+                .iter()
+                .find_map(|primitive| match primitive {
+                    Prim::Rect { rect, .. } if rect.x == 0 && rect.y == y => Some(rect.h),
+                    _ => None,
+                })
+                .expect("full-width separator primitive")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(heights, vec![expected_height; 2]);
 }
 
 /// A hollow candle's chrome follows what is painted, not the invisible body.

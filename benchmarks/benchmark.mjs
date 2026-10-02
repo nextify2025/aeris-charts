@@ -12,6 +12,7 @@ import {
   markdown_report,
   product_version,
   promote_baseline,
+  propose_size_budgets,
   public_summary,
   read_json,
   repository_root,
@@ -186,6 +187,16 @@ async function claims() {
   console.log(output);
 }
 
+// Prints the proposed budgets.json (new ceilings plus an appended rationale entry); never writes the file, so the
+// diff is reviewed and committed deliberately. The product tradeoff is mandatory: a size increase must explain it.
+async function rebudget(size_result) {
+  const product_tradeoff = option("--tradeoff");
+  if (!size_result || !product_tradeoff) throw new Error("usage: rebudget <size-result.json> --tradeoff <text> [--lever <text>]... [--headroom-percent 7]");
+  const levers = args.flatMap((argument, index) => argument === "--lever" ? [args[index + 1]] : []);
+  const budgets = await read_json(path.join(benchmark_root, "budgets.json"));
+  console.log(JSON.stringify(propose_size_budgets(await read_json(size_result), budgets, { headroom_percent: Number(option("--headroom-percent", "7")), levers, product_tradeoff }), null, 2));
+}
+
 function help() {
   console.log(`Aeris Charts evidence benchmark CLI
 
@@ -197,6 +208,7 @@ function help() {
   node benchmarks/benchmark.mjs scenario <id> [--duration-ms N]
   node benchmarks/benchmark.mjs native
   node benchmarks/benchmark.mjs size
+  node benchmarks/benchmark.mjs rebudget <size-result.json> --tradeoff <text> [--lever <text>]... [--headroom-percent 7]
   node benchmarks/benchmark.mjs compare <baseline.json> <current.json>
   node benchmarks/benchmark.mjs report <result.json>
   node benchmarks/benchmark.mjs public <official-release-result.json>
@@ -209,6 +221,7 @@ try {
   else if (command === "scenario") await run_scenario(args[0]);
   else if (command === "size") await build_run("scenario", [(await load_manifest()).scenarios.find(({ kind }) => kind === "size")], "node benchmarks/benchmark.mjs size");
   else if (command === "native") await build_run("scenario", [(await load_manifest()).scenarios.find(({ kind }) => kind === "native")], "node benchmarks/benchmark.mjs native");
+  else if (command === "rebudget") await rebudget(args[0]);
   else if (command === "compare") await compare(args[0], args[1]);
   else if (command === "report") await report(args[0]);
   else if (command === "public") await publish_summary(args[0]);

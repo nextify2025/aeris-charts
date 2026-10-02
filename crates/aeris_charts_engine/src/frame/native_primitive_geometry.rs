@@ -253,19 +253,21 @@ impl ChartEngine {
                 let tooltip_lines = |item: &(f64, i64, f64, i64)| {
                     let mut lines = vec![self.format_series_plain_value(series, item.2)];
                     // A host `timeFormatter` owns the whole time text; otherwise the built-in
-                    // date and time lines use exchange wall-clock time.
-                    if let Some(text) = self.host_time_label(item.3) {
+                    // date and time lines use exchange wall-clock time. Both print the bar's
+                    // label time.
+                    let printed = self.bar_label_time(item.3);
+                    if let Some(text) = self.host_time_label(printed) {
                         lines.push(text);
                         return lines;
                     }
                     lines.push(format_date_pattern(
-                        self.exchange_time.local_seconds(item.3),
+                        self.exchange_time.local_seconds(printed),
                         "dd MMM yyyy",
                         &self.month_names,
                     ));
                     if state.options.show_time {
                         lines.push(format_tick_label_in(
-                            item.3,
+                            printed,
                             TickMarkType::Time,
                             &self.month_names,
                             &self.exchange_time,
@@ -366,24 +368,34 @@ impl ChartEngine {
                 } else {
                     positions[0].1.round()
                 };
+                let device = super::DeviceBox::snap(main_x, top, main_width, main_height, hpr, vpr);
                 out.push(Prim::RoundRect {
-                    x: (main_x * hpr) as f32,
-                    y: (top * vpr) as f32,
-                    w: (main_width * hpr) as f32,
-                    h: (main_height * vpr) as f32,
-                    radii: [(6.0 * hpr.min(vpr)) as f32; 4],
+                    x: device.x,
+                    y: device.y,
+                    w: device.w,
+                    h: device.h,
+                    radii: [(6.0 * hpr.min(vpr)).round() as f32; 4],
                     fill: background,
                     border_width: aeris_charts_core::style::border_width_device_px(hpr.min(vpr))
                         as f32,
                     border_color: border,
                 });
                 if items.len() == 2 && delta_width > 0.0 {
+                    // The delta band spans the box's own snapped rows so it meets both borders.
+                    let band = super::DeviceBox::snap(
+                        positions[0].0 + positions[0].1,
+                        top,
+                        delta_width,
+                        main_height,
+                        hpr,
+                        vpr,
+                    );
                     out.push(Prim::Rect {
                         rect: IRect {
-                            x: ((positions[0].0 + positions[0].1) * hpr).round() as i32,
-                            y: (top * vpr).round() as i32,
-                            w: (delta_width * hpr).round() as i32,
-                            h: (main_height * vpr).round() as i32,
+                            x: band.x as i32,
+                            y: device.y as i32,
+                            w: band.w as i32,
+                            h: device.h as i32,
                         },
                         color: delta_bg,
                     });

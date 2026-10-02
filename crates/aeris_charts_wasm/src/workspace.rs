@@ -30,6 +30,10 @@ impl AerisWorkspace {
             _ => return -1,
         };
         let _ = now;
+        // Browser cell identities are u32; refuse a split whose new cell could not be addressed.
+        if u32::try_from(self.workspace.next_cell_id()).is_err() {
+            return -1;
+        }
         match self.workspace.split(id as u64, direction) {
             Ok(new_id) => new_id as i64,
             Err(_) => -1,

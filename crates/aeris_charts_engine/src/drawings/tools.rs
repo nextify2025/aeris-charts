@@ -151,6 +151,9 @@ pub(crate) struct DrawingToolSpec {
     pub(crate) text_layout: DrawingTextLayout,
     /// Paint the first anchor's price as a tag on the owning price axis (horizontal-line idiom).
     pub(crate) axis_price_label: bool,
+    /// Anchors land on the crosshair's time slot and the instrument/scale price tick during
+    /// creation, anchor drags, and body moves, so derived statistics read whole bars and ticks.
+    pub(crate) grid_snap: bool,
 }
 
 /// How the common text label is placed.
@@ -179,6 +182,7 @@ const TREND_LINE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const HORIZONTAL_LINE: DrawingToolSpec = DrawingToolSpec {
@@ -197,6 +201,7 @@ const HORIZONTAL_LINE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: true,
+    grid_snap: false,
 };
 
 const HORIZONTAL_RAY: DrawingToolSpec = DrawingToolSpec {
@@ -215,6 +220,7 @@ const HORIZONTAL_RAY: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: true,
+    grid_snap: false,
 };
 
 const VERTICAL_LINE: DrawingToolSpec = DrawingToolSpec {
@@ -233,6 +239,7 @@ const VERTICAL_LINE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const RECTANGLE: DrawingToolSpec = DrawingToolSpec {
@@ -251,6 +258,7 @@ const RECTANGLE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const TEXT: DrawingToolSpec = DrawingToolSpec {
@@ -269,6 +277,7 @@ const TEXT: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const BRUSH: DrawingToolSpec = DrawingToolSpec {
@@ -287,6 +296,7 @@ const BRUSH: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const PATH: DrawingToolSpec = DrawingToolSpec {
@@ -305,6 +315,7 @@ const PATH: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const LONG_POSITION: DrawingToolSpec = DrawingToolSpec {
@@ -323,6 +334,7 @@ const LONG_POSITION: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: true,
 };
 
 const SHORT_POSITION: DrawingToolSpec = DrawingToolSpec {
@@ -341,6 +353,7 @@ const SHORT_POSITION: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: true,
 };
 
 const FIXED_RANGE_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
@@ -359,6 +372,7 @@ const FIXED_RANGE_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const ANCHORED_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
@@ -377,6 +391,7 @@ const ANCHORED_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
@@ -395,6 +410,7 @@ const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 /// Every built-in tool. B8 families append only inside their own reserved block.
@@ -500,6 +516,14 @@ pub(crate) const DRAWING_TOOL_SPECS: &[DrawingToolSpec] = &[
 ];
 
 impl DrawingKind {
+    /// The measuring tools (price, date, and date-and-price range).
+    pub(crate) const fn is_measure(self) -> bool {
+        matches!(
+            self,
+            Self::PriceRange | Self::DateRange | Self::DateAndPriceRange
+        )
+    }
+
     pub(crate) const fn spec(self) -> &'static DrawingToolSpec {
         match self {
             Self::TrendLine => &TREND_LINE,

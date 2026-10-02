@@ -590,46 +590,66 @@ test("the shortcut registry accepts combo overrides", async ({ page }) => {
   await page.evaluate(() => { window.__scratch.destroy(); document.getElementById("scratch_grid").remove(); });
 });
 
-test("Ctrl+click maximizes a cell to full container and restores", async ({ page }) => {
-  await page.goto("/");
-  await wait_grid(page);
-  await page.click("#split_h");
-  await page.waitForFunction(() => document.querySelectorAll("#chart_container canvas").length === 8);
-  await wait_cell_charts(page);
+for (const backend of ["canvas2d", "auto"]) {
+  test(`Alt+click maximizes a cell to full container and restores (${backend})`, async ({ page, browserName }) => {
+    await page.goto(backend === "canvas2d" ? "/?backend=canvas2d" : "/");
+    await wait_grid(page);
+    await page.click("#split_h");
+    await page.waitForFunction(() => document.querySelectorAll("#chart_container canvas").length === 8);
+    await wait_cell_charts(page);
+    const expected_backend = backend === "canvas2d" || browserName !== "chromium" ? "canvas2d" : "webgpu";
+    expect(await page.evaluate(() => window.__grid.cells().map((c) => c.chart.backend())))
+      .toEqual([expected_backend, expected_backend]);
 
-  const widths = () => page.evaluate(() => window.__grid.cells().map((c) => {
-    const r = c.element.getBoundingClientRect();
-    // Hidden = detached from the container (the grid mounts only the maximized slot; a
-    // detached slot never collapses its chart through a 0-size resize).
-    return { attached: c.element.isConnected, width: r.width };
-  }));
-  const before = await widths();
-  expect(before[1].width).toBeGreaterThan(100);
+    const widths = () => page.evaluate(() => window.__grid.cells().map((c) => {
+      const r = c.element.getBoundingClientRect();
+      // Hidden = detached from the container (the grid mounts only the maximized slot; a
+      // detached slot never collapses its chart through a 0-size resize).
+      return { attached: c.element.isConnected, width: r.width };
+    }));
+    const before = await widths();
+    expect(before[1].width).toBeGreaterThan(100);
+    const point = await page.evaluate(() => {
+      const rect = window.__grid.cells()[1].element.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    });
+    const alt_click = async () => {
+      await page.keyboard.down("Alt");
+      await page.mouse.click(point.x, point.y);
+      await page.keyboard.up("Alt");
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    };
 
-  // Ctrl+click the second cell: it takes the container, the first cell and dividers hide.
-  const point = await page.evaluate(() => {
-    const rect = window.__grid.cells()[1].element.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    // Ctrl+click is no longer the maximize shortcut (Ctrl stays the drawing magnet).
+    await page.keyboard.down("Control");
+    await page.mouse.click(point.x, point.y);
+    await page.keyboard.up("Control");
+    expect(await page.evaluate(() => window.__grid.maximized_cell())).toBeNull();
+
+    // With a drawing tool armed, Alt+click still only toggles: the chart never sees the press.
+    await page.evaluate(() => window.__grid.cells()[1].chart.set_drawing_tool("horizontal_line"));
+    await alt_click();
+    const maximized = await widths();
+    expect(maximized[0].attached).toBe(false);
+    expect(maximized[1].attached).toBe(true);
+    expect(maximized[1].width).toBeGreaterThan(before[1].width + before[0].width - 20);
+    expect(await page.evaluate(() => window.__grid.maximized_cell()?.id ?? null)).toBe(2);
+    expect(await page.evaluate(() => window.__grid.cells()[1].chart.drawings().length)).toBe(0);
+
+    // Alt+click again restores the layout.
+    await alt_click();
+    const restored = await widths();
+    expect(restored[0].attached).toBe(true);
+    expect(restored[1].attached).toBe(true);
+    expect(restored[1].width).toBeLessThan(restored[0].width + 20);
+    expect(await page.evaluate(() => window.__grid.maximized_cell())).toBeNull();
+    expect(await page.evaluate(() => window.__grid.cells()[1].chart.drawings().length)).toBe(0);
+
+    // The swallowed press leaves normal clicks intact: the armed tool places its drawing.
+    await page.mouse.click(point.x, point.y);
+    await page.waitForFunction(() => window.__grid.cells()[1].chart.drawings().length === 1);
   });
-  await page.keyboard.down("Control");
-  await page.mouse.click(point.x, point.y);
-  await page.keyboard.up("Control");
-  const maximized = await widths();
-  expect(maximized[0].attached).toBe(false);
-  expect(maximized[1].attached).toBe(true);
-  expect(maximized[1].width).toBeGreaterThan(before[1].width + before[0].width - 20);
-  expect(await page.evaluate(() => window.__grid.maximized_cell()?.id ?? null)).toBe(2);
-
-  // Ctrl+click again: everything reappears.
-  await page.keyboard.down("Control");
-  await page.mouse.click(point.x, point.y);
-  await page.keyboard.up("Control");
-  const restored = await widths();
-  expect(restored[0].attached).toBe(true);
-  expect(restored[1].attached).toBe(true);
-  expect(restored[1].width).toBeLessThan(restored[0].width + 20);
-  expect(await page.evaluate(() => window.__grid.maximized_cell())).toBeNull();
-});
+}
 
 test("drawing tools and history route only to the stable active cell", async ({ page }) => {
   await page.goto("/");

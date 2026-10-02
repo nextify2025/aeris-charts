@@ -19,7 +19,7 @@ use aeris_charts_core::scale::session_slots::{
 use aeris_charts_core::scale::time_tick_marks::civil_from_timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::{ChartEngine, IndicatorChange, SeriesId, SeriesKind};
+use crate::{ChartEngine, IndicatorChange, SeriesId, SeriesKind, SeriesOwner};
 
 pub const MAX_RESAMPLE_BOUNDARIES: usize = 20_000;
 pub const MAX_RESAMPLED_SERIES: usize = 32;
@@ -88,8 +88,11 @@ pub enum ResampleSpan {
 /// Resampling boundaries for the host's trading dates (days since 1970-01-01, strictly
 /// ascending): each date's session windows are placed in `time` exactly as
 /// [`crate::session_slot_times`] places them, so the boundaries stay on exchange hours across
-/// DST and around night sessions. Every boundary of a date carries the session id `YYYYMMDD`.
-/// Dates without data produce no bars, so a host may include future dates it will stream.
+/// DST and around night sessions. Every boundary of a date carries the session id `YYYYMMDD` of
+/// that requested date, which is the evening the session opens when `time` has a session start of
+/// 0 for a market that reopens on Sunday evening. Dates without data produce no bars, so a host
+/// may include future dates it will stream. One window list applies to every date: a host with a
+/// calendar calls this once per window set and concatenates the ordered, disjoint results.
 pub fn resample_boundaries(
     days: &[i64],
     windows: &[SessionWindow],
@@ -236,6 +239,16 @@ impl ChartEngine {
                 } else {
                     ResampleError::UnsupportedTarget(id)
                 });
+            }
+        }
+        // One writer per series. A target may already be this binding's own output (a
+        // reconfigure), never a footprint, a trade-bound candle or study, or synthetic bars: the
+        // resampler installs through the unguarded internals, so nothing else would stop two
+        // writers from fighting over its rows. Sources are only read, so they may be trade-derived.
+        // Another binding's output is a chain, refused as a dependency cycle below.
+        for id in [Some(target), volume_target].into_iter().flatten() {
+            if !matches!(self.series_owner(id), None | Some(SeriesOwner::Resampled)) {
+                return Err(ResampleError::UnsupportedTarget(id));
             }
         }
         // The binding a reconfigure replaces (keyed at `target`) is not a conflict with itself:
@@ -522,6 +535,10 @@ impl ChartEngine {
         let low = bars.iter().map(|bar| bar.low).collect::<Vec<_>>();
         let close = bars.iter().map(|bar| bar.close).collect::<Vec<_>>();
         self.install_series_columns(target, out_times.clone(), open, high, low, close);
+        // ponytail: the target and its volume target each trim the whole layer on their own (a
+        // union merge and reindex per trim) and recompute their indicators one by one, the pattern
+        // `trim_stream_rows_front` batches for a stream. `DataLayer::trim_fronts` would trim both
+        // together; deferred because a resample refresh trims at most two series.
         self.enforce_series_cap(target);
         self.recompute_indicators_for(target);
         if let Some(volume_target) = volume_target {
@@ -823,7 +840,7 @@ mod tests {
         boundaries: Vec<ResampleBoundary>,
     ) -> Resampled {
         let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
-        chart.set_time_zone(zone.clone());
+        chart.set_exchange_offsets(zone.clone());
         let source = chart.add_series(SeriesKind::Candlestick);
         let volume_series = chart.add_series(SeriesKind::Histogram);
         let seconds = times.iter().map(|&time| time as f64).collect::<Vec<_>>();
@@ -989,6 +1006,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             bars.iter().map(|bar| bar.volume).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn resampled_hour_bars_label_by_close() {
+        let zone = shanghai();
+        let dates = ["2026-09-24", "2026-09-25"];
+        let (times, columns, volume) = minutes(&zone, &a_share(), &dates);
+        let time = ExchangeTime::new(zone.clone(), 0).unwrap();
+        let boundaries =
+            resample_boundaries(&dates.map(day), &a_share(), &time, ResampleSpan::Window).unwrap();
+        let mut chart = resampled(&zone, &times, &columns, &volume, 3_600, boundaries);
+        chart
+            .chart
+            .set_bar_time_label(crate::BarTimeLabel::Close {
+                interval_seconds: 3_600,
+                windows: a_share(),
+            })
+            .unwrap();
+        let bars = chart.chart.resampled_bars(chart.target).unwrap();
+        // Bars keep their open identities; the labels print the closes of the same windows.
+        assert_eq!(
+            bars.iter()
+                .map(|bar| local_clock(&zone, bar.timestamp))
+                .collect::<Vec<_>>(),
+            ["09:30", "10:30", "13:00", "14:00", "09:30", "10:30", "13:00", "14:00"]
+        );
+        assert_eq!(
+            bars.iter()
+                .map(|bar| local_clock(&zone, chart.chart.bar_label_time(bar.timestamp)))
+                .collect::<Vec<_>>(),
+            ["10:30", "11:30", "14:00", "15:00", "10:30", "11:30", "14:00", "15:00"]
+        );
+        assert_eq!(rows(&chart.chart, chart.target).len(), 8);
+    }
+
+    #[test]
+    fn a_host_fed_241_bar_feed_shifted_back_drops_its_auction_row_from_resampling() {
+        // The shifted auction row sits at 09:29, before the first window opens: resampling skips
+        // it like any out-of-session row, so the first hour bar still holds exactly the 60
+        // regular minutes and opens at the 09:30 row.
+        let zone = shanghai();
+        let date = ["2026-09-25"];
+        let (mut times, mut columns, mut volume) = minutes(&zone, &a_share(), &date);
+        times.insert(0, times[0] - 60);
+        for column in &mut columns {
+            column.insert(0, 999.0);
+        }
+        volume.insert(0, 1.0);
+        assert_eq!(times.len(), 241);
+        let time = ExchangeTime::new(zone.clone(), 0).unwrap();
+        let boundaries =
+            resample_boundaries(&date.map(day), &a_share(), &time, ResampleSpan::Window).unwrap();
+        let chart = resampled(&zone, &times, &columns, &volume, 3_600, boundaries);
+        let bars = chart.chart.resampled_bars(chart.target).unwrap();
+        assert_eq!(bars.len(), 4);
+        assert_eq!(bars[0].source_rows, 60);
+        assert_eq!(bars[0].open, columns[0][1]);
+        assert_eq!(bars[0].volume, volume[1..61].iter().sum::<f64>());
     }
 
     #[test]
@@ -1540,6 +1615,107 @@ mod tests {
         assert_matches_fresh(&live);
     }
 
+    /// A trade-bound candle or trade volume study is written by its stream. A resampler cannot take
+    /// it as a target (two writers would fight over its rows), but may read it as a source.
+    #[test]
+    fn trade_derived_series_are_resample_sources_never_targets() {
+        use crate::{AggressorSide, FootprintAggregationOptions, FootprintTrade};
+
+        let print = |second: i64, price: f64| FootprintTrade {
+            timestamp_micros: second * 1_000_000,
+            price,
+            volume: 2.0,
+            aggressor: AggressorSide::Buy,
+            bid: None,
+            ask: None,
+            sequence: None,
+            trade_id: None,
+            conditions: 0,
+            session_id: Some(1),
+        };
+        let options = || ResampleOptions {
+            interval_seconds: 300,
+            boundaries: vec![ResampleBoundary {
+                start_time: 0,
+                end_time: 30 * 86_400,
+                session_id: 1,
+            }],
+        };
+        let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
+        let stream = chart
+            .add_trade_stream("K:1m", FootprintAggregationOptions::default())
+            .unwrap();
+        let candles = chart.add_series(SeriesKind::Candlestick);
+        chart
+            .bind_trade_bar_series_to_stream(candles, stream)
+            .unwrap();
+        let volume = chart.add_trade_volume_series(stream, 1).unwrap();
+        chart
+            .set_trade_stream_trades(
+                stream,
+                (0..40)
+                    .map(|index| print(60 + index * 20, 100.0 + (index % 7) as f64 * 0.25))
+                    .collect(),
+            )
+            .unwrap();
+        let plain = chart.add_series(SeriesKind::Candlestick);
+        let plain_volume = chart.add_series(SeriesKind::Histogram);
+        let (candle_rows, volume_rows) = (rows(&chart, candles), rows(&chart, volume));
+        assert!(!candle_rows.is_empty());
+
+        assert_eq!(
+            chart.configure_resampled_series(plain, None, candles, None, options()),
+            Err(ResampleError::UnsupportedTarget(candles))
+        );
+        assert_eq!(
+            chart.configure_resampled_series(
+                plain,
+                Some(plain_volume),
+                candles,
+                Some(volume),
+                options()
+            ),
+            Err(ResampleError::UnsupportedTarget(candles))
+        );
+        let target = chart.add_series(SeriesKind::Candlestick);
+        assert_eq!(
+            chart.configure_resampled_series(
+                plain,
+                Some(plain_volume),
+                target,
+                Some(volume),
+                options()
+            ),
+            Err(ResampleError::UnsupportedTarget(volume))
+        );
+        assert!(chart.resampled_bars(candles).is_none());
+        assert!(chart.resampled_bars(target).is_none());
+        assert!(!chart.series_is_source_owned(target));
+        assert_eq!(
+            (rows(&chart, candles), rows(&chart, volume)),
+            (candle_rows, volume_rows)
+        );
+
+        // Reading them is the supported direction: the stream keeps feeding the resampled bars.
+        let resampled = chart.add_series(SeriesKind::Candlestick);
+        let resampled_volume = chart.add_series(SeriesKind::Histogram);
+        chart
+            .configure_resampled_series(
+                candles,
+                Some(volume),
+                resampled,
+                Some(resampled_volume),
+                options(),
+            )
+            .unwrap();
+        assert!(!chart.resampled_bars(resampled).unwrap().is_empty());
+        chart
+            .update_trade_stream_trades(stream, vec![print(900, 101.0)])
+            .unwrap();
+        assert!(chart.series_is_source_owned(resampled));
+        assert!(chart.series_is_source_owned(candles));
+    }
+
     #[test]
     fn resampling_and_non_time_bar_sequences_do_not_share_an_axis() {
         use crate::{
@@ -1603,6 +1779,154 @@ mod tests {
                 }
             ),
             Err(ResampleError::TimeAxisRequired)
+        );
+    }
+
+    fn chicago() -> UtcOffsetSchedule {
+        let ts = |date: &str, hour: i64| day(date) * DAY + hour * HOUR;
+        UtcOffsetSchedule::new(vec![
+            UtcOffsetTransition {
+                from_utc_seconds: ts("2023-11-05", 7),
+                offset_seconds: -6 * 3_600,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: ts("2024-03-10", 8),
+                offset_seconds: -5 * 3_600,
+            },
+            UtcOffsetTransition {
+                from_utc_seconds: ts("2024-11-03", 7),
+                offset_seconds: -6 * 3_600,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn resample_boundaries_for_cme_monday_and_china_holiday_groups() {
+        // CME Globex (17:00-16:00 sessions, week reopening Sunday evening). The chart's -7 h
+        // start assumes a Friday-evening weekly open, so `resample_boundaries` with that start
+        // puts Monday's session on Friday 17:00 to Saturday 16:00 and the real Sunday and Monday
+        // rows fall outside every boundary.
+        let zone = chicago();
+        let globex = [window("17:00", "16:00")];
+        let local = |text: &str| {
+            let (date, clock) = text.split_once(' ').unwrap();
+            zone.to_utc(day(date) * DAY + i64::from(parse_wall_clock(clock, false).unwrap()))
+        };
+        let negative = ExchangeTime::new(zone.clone(), -7 * 3_600).unwrap();
+        let skewed = resample_boundaries(
+            &["2024-01-05", "2024-01-08", "2024-01-09"].map(day),
+            &globex,
+            &negative,
+            ResampleSpan::Window,
+        )
+        .unwrap();
+        assert_eq!(
+            skewed[1],
+            ResampleBoundary {
+                start_time: local("2024-01-05 17:00:00"),
+                end_time: local("2024-01-06 16:00:00"),
+                session_id: 20_240_108,
+            }
+        );
+        assert_eq!(skewed[2].start_time, local("2024-01-08 17:00:00"));
+
+        // Source rows: Sunday 18:00, Monday 10:00 (Monday's trading day) and Tuesday 10:00.
+        let rows = [
+            "2024-01-07 18:00:00",
+            "2024-01-08 10:00:00",
+            "2024-01-09 10:00:00",
+        ];
+        let times = rows.map(local).to_vec();
+        let price = |index: usize| 100.0 + index as f64;
+        let columns: [Vec<f64>; 4] =
+            std::array::from_fn(|_| (0..times.len()).map(price).collect::<Vec<_>>());
+        let volume = vec![1.0; times.len()];
+        let omitted = resampled(&zone, &times, &columns, &volume, 3_600, skewed);
+        let bars = omitted.chart.resampled_bars(omitted.target).unwrap();
+        // Only Tuesday's row lands in a boundary (Monday 17:00 to Tuesday 16:00).
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].timestamp, local("2024-01-09 10:00:00"));
+        assert_eq!(bars[0].session_id, 20_240_109);
+
+        // The recipe: a midnight start, the evening dates, and one crossing window. The Sunday
+        // date is Monday's trading day and its boundary id is the requested (evening) date.
+        let midnight = ExchangeTime::new(zone.clone(), 0).unwrap();
+        let evenings = resample_boundaries(
+            &["2024-01-07", "2024-01-08", "2024-01-09"].map(day),
+            &globex,
+            &midnight,
+            ResampleSpan::Window,
+        )
+        .unwrap();
+        assert_eq!(
+            evenings[0],
+            ResampleBoundary {
+                start_time: local("2024-01-07 17:00:00"),
+                end_time: local("2024-01-08 16:00:00"),
+                session_id: 20_240_107,
+            }
+        );
+        let resumed = resampled(&zone, &times, &columns, &volume, 3_600, evenings);
+        let bars = resumed.chart.resampled_bars(resumed.target).unwrap();
+        assert_eq!(
+            bars.iter()
+                .map(|bar| (bar.timestamp, bar.session_id))
+                .collect::<Vec<_>>(),
+            [
+                (local("2024-01-07 18:00:00"), 20_240_107),
+                (local("2024-01-08 10:00:00"), 20_240_107),
+                // Tuesday 10:00 is in the session opened on Monday evening, id 20240108.
+                (local("2024-01-09 10:00:00"), 20_240_108),
+            ]
+        );
+
+        // China futures (-3 h start) with a host-owned calendar. Each call places one window set,
+        // and the concatenated boundaries stay ordered and disjoint: normal dates pass the night
+        // and day windows, the first date after a break passes the day windows only. The dates are
+        // illustrative host calendar data.
+        let china = ExchangeTime::new(shanghai(), -3 * 3_600).unwrap();
+        let night = [
+            window("21:00", "02:30"),
+            window("09:00", "10:15"),
+            window("10:30", "11:30"),
+            window("13:30", "15:00"),
+        ];
+        let call = |date: &str, windows: &[SessionWindow], span| {
+            resample_boundaries(&[day(date)], windows, &china, span).unwrap()
+        };
+        let mut all = call("2024-09-30", &night, ResampleSpan::Window);
+        all.extend(call("2024-10-08", &night[1..], ResampleSpan::Window));
+        all.extend(call("2024-10-09", &night, ResampleSpan::Window));
+        assert_eq!(all.len(), 4 + 3 + 4);
+        validate_options(&ResampleOptions {
+            interval_seconds: 1,
+            boundaries: all.clone(),
+        })
+        .unwrap();
+        let clock = |date: &str, hour: i64| shanghai().to_utc(day(date) * DAY + hour * HOUR);
+        assert_eq!(all[0].start_time, clock("2024-09-27", 21));
+        assert_eq!(all[4].start_time, clock("2024-10-08", 9));
+        assert_eq!(all[7].start_time, clock("2024-10-08", 21));
+        assert_eq!(
+            all.iter().map(|b| b.session_id).collect::<Vec<_>>(),
+            [
+                [20_240_930; 4].as_slice(),
+                [20_241_008; 3].as_slice(),
+                [20_241_009; 4].as_slice()
+            ]
+            .concat()
+        );
+
+        // With span "day" the bar stamps at the first window's open, so the first date after a
+        // break needs its own day-only call: a shared night+day list would stamp it on the
+        // evening before.
+        let daily = call("2024-10-08", &night[1..], ResampleSpan::Day);
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].start_time, clock("2024-10-08", 9));
+        assert_eq!(
+            call("2024-10-08", &night, ResampleSpan::Day)[0].start_time,
+            clock("2024-10-07", 21)
         );
     }
 

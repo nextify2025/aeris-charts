@@ -11,7 +11,8 @@ use super::{ChartEngine, Drawing, DrawingDragPart, DrawingHandleMode, DrawingPoi
 pub(crate) enum HandleShape {
     /// Border disc under a fill disc (anchors, rectangle corners, a position's entry).
     Disc,
-    /// Square border under a square fill (a position's target, width, and stop controls).
+    /// One bordered rounded square: the fill and a device-snapped inside border (a position's
+    /// target, width, and stop controls).
     Square,
     /// Slightly rounded square (a rectangle's edge midpoints).
     RoundedSquare,

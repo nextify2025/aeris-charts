@@ -4,7 +4,7 @@ This subsystem is the source of truth for Aeris Charts performance, artifact-siz
 
 ## Requirements
 
-- The repository's configured Rust toolchain and `wasm-pack` 0.15.0 for the production WASM build.
+- The repository's configured Rust toolchain and `wasm-pack` 0.15.0 for the production WASM build. Every workflow installs exactly that version (`release_gate_guard.mjs` enforces it for `ci.yml`, `publish.yml`, and the three benchmark workflows). wasm-pack runs a `wasm-opt` found on `PATH` and otherwise downloads its own binaryen `version_117`, so a locally installed `wasm-opt` silently changes the artifact; the provenance below records which one ran.
 - Node.js 18 or newer.
 - Chromium installed for Playwright (`cd examples/web_demo && npx playwright install chromium`).
 - For official release results, a clean checkout on a controlled runner with `AERIS_CHARTS_BENCH_ENV_CLASS=official-benchmark-runner` and a stable `AERIS_CHARTS_BENCH_ENV_ID`.
@@ -21,6 +21,7 @@ node benchmarks/benchmark.mjs release
 node benchmarks/benchmark.mjs soak --duration-ms 600000
 node benchmarks/benchmark.mjs scenario pan-candlestick-100k
 node benchmarks/benchmark.mjs size
+node benchmarks/benchmark.mjs rebudget <size-result.json> --tradeoff <text> [--lever <text>]... [--headroom-percent 7]
 node benchmarks/benchmark.mjs native
 node benchmarks/benchmark.mjs compare <baseline.json> <current.json>
 node benchmarks/benchmark.mjs report <result.json>
@@ -44,7 +45,7 @@ Environment classification defaults to `local`; shared workflows set `shared-ci`
 
 `shared.mjs` uses a versioned xorshift32 generator. A generator version, unsigned seed, start time, interval, start price, volatility, point count, series count, and pane count identify the dataset. Generated rows always satisfy `high >= open/close`, `low <= open/close`, and `high >= low`. Core sizes are 1K, 10K, 100K, 500K, and 1M candlesticks. Dataset creation occurs before timed installs.
 
-Canonical scenario definitions live in `scenarios.json`; this is intentionally a small manifest rather than a benchmark DSL. Scenario IDs and versions make methodology changes explicit. A material change creates a new scenario version instead of silently rewriting history. Workloads cover startup, historical loading, current-candle and append streaming, pan/zoom/crosshair input, lifecycle retention, multi-chart, multi-series/multi-pane scaling, a five-series/100K-row Phase 2 general dashboard, retained current-candle updates across 1/2/4/8/16 series and one/four panes, and soak stability. Retained scenarios record semantic rebuild counts plus WebGPU allocation, write, and upload volume alongside frame CPU percentiles. Native evidence additionally measures every representative indicator on 10K/100K/1M histories, typed-equivalent batches of 1/10/100/1K/10K rows, 1/4/8/16 mixed indicators on one source, and one active source across 1/2/4/8/16 source/indicator-pane pairs.
+Canonical scenario definitions live in `scenarios.json`; this is intentionally a small manifest rather than a benchmark DSL. Scenario IDs and versions make methodology changes explicit. A material change creates a new scenario version instead of silently rewriting history. Workloads cover startup, historical loading, current-candle and append streaming, pan/zoom/crosshair input, lifecycle retention, multi-chart, multi-series/multi-pane scaling, a five-series/100K-row Phase 2 general dashboard, retained current-candle updates across 1/2/4/8/16 series and one/four panes, and soak stability. Retained scenarios record semantic rebuild counts plus WebGPU allocation, write, and upload volume alongside frame CPU percentiles. Native evidence additionally measures every representative indicator on 10K/100K/1M histories, typed-equivalent batches of 1/10/100/1K/10K rows, 1/4/8/16 mixed indicators on one source, and one active source across 1/2/4/8/16 source/indicator-pane pairs. `crosshair-reset-studies-daily-2520` (Canvas2D forced, release profile) loads 2,520 daily candles with session VWAP, VWAP bands, and standard pivots, eleven outputs that each draw one bar-wide segment per bar because every bar is its own period, and traces the crosshair across them. It records the interval and study set in the dataset configuration, isolates the executor cost of period-reset studies, and its `canvas2d_ops`, `frame_cpu_ms`, and long-task samples are the evidence for the batched `Segments` primitive.
 
 ## Timing and statistics
 
@@ -85,6 +86,8 @@ The size scenario runs the same production `npm run build` used before publicati
 - minimal, typical, and full minified consumer JavaScript bundles built by the package's existing esbuild dependency.
 
 Consumer JavaScript bundle metrics explicitly exclude the separately shipped WASM asset, whose sizes are reported independently.
+
+A size result is only meaningful if the optimized module was measured, so the step fails when the build log shows that wasm-opt did not run (wasm-pack prints `Skipping wasm-opt` on a platform it cannot fetch binaryen for). Every result records `build.cargo_profile`, `build.wasm_opt_args` (read from the crate metadata wasm-pack itself reads, not a copy) and `build.wasm_opt_version` (the `wasm-opt` on `PATH`, else the newest one in the wasm-pack cache, else `null`) next to the rustc and wasm-pack versions. `build.profile` stays `release`, the evidence channel, and `compare` treats a result with different build metadata as incompatible.
 
 ## Results, baselines, budgets, and reports
 
@@ -128,9 +131,109 @@ This reset is tied to the Phase 2 engine-owned Cartesian surface (additional dat
 shared-tooltip APIs, heatmap variants, persistence, and WASM bindings). Future growth is again blocked at the v3
 ceilings rather than inheriting an open-ended exception.
 
+Budget policy v4 records the Phase 3 package-size reset after the trading-workstation surface landed: order-flow
+footprints and trade streams, depth heatmaps and liquidity replay, session replay with non-time bars, profile
+workflows, the expanded indicator catalog, and additional chart types. Before changing ceilings, the release
+`wasm-opt -Oz` output was re-run with `--converge` and with producer/debug stripping; neither reduced the module
+(3,826,918 and 3,833,897 bytes). JavaScript stays well inside its unchanged ceilings. Remaining growth is
+compiled engine code, so the WASM and package-container ceilings take the same ~7% release headroom as v3:
+
+| Phase 3 metric | Observed bytes | Blocking maximum |
+| --- | ---: | ---: |
+| npm tarball | 1,549,907 | 1,650,000 |
+| npm unpacked | 4,628,626 | 4,950,000 |
+| JavaScript raw | 372,974 | 620,000 |
+| JavaScript Brotli | 66,155 | 95,000 |
+| WASM raw | 3,827,699 | 4,100,000 |
+| WASM Brotli | 977,494 | 1,050,000 |
+
+The largest reducible share measured in the unstripped module is serde JSON (de)serialization
+monomorphization (about a fifth of pre-optimization code), led by the internally tagged `IndicatorKind`
+enum (its deserializer now ships out of line, see below). Until policy v5 below, future growth was blocked at the
+v4 ceilings.
+
+Budget policy v5 is the reset after the B1-B8 K-line capabilities (exchange time and session slots, the price tick
+ladder, the B8 drawing catalog with text editing for every text-bearing tool, multi-calendar overlays, tick-built
+candles and resampling, close-time labels) and the merge of upstream's later work, whose IANA time-zone tables add
+about 350 KB raw and 41 KB Brotli after being filtered to the 98 TradingView zones (about 914 KB and 84 KB for the
+complete database). The bytes were measured on the GitHub runner with the pinned wasm-pack 0.15.0 and its bundled
+`wasm-opt`, the one lossless lever found (the `IndicatorKind` deserializer) was shipped first, and the ceilings that
+the module still exceeded took the same 7% release headroom, rounded up to 10,000 bytes. JavaScript stays inside its
+unchanged ceilings. Every remaining reduction is an opt-level change that costs frame time (priced below) and awaits a
+product decision; the evidence is recorded in `budgets.json`'s `rationale`.
+
+| Phase 4 metric | Observed bytes | Blocking maximum |
+| --- | ---: | ---: |
+| npm tarball | 1,969,915 | 2,110,000 |
+| npm unpacked | 5,953,058 | 6,370,000 |
+| JavaScript raw | 415,362 | 620,000 |
+| JavaScript Brotli | 74,089 | 95,000 |
+| WASM raw | 5,041,592 | 5,400,000 |
+| WASM Brotli | 1,237,844 | 1,330,000 |
+
+Future growth is blocked at the v5 ceilings.
+
+### WASM size levers and re-baselining
+
+Once B1-B8 landed, the optimized WASM no longer fit the v4 ceilings. Before any ceiling moves, the bytes were measured and the lossless levers were priced. All numbers below come from one machine (rustc 1.98.1, wasm-pack 0.15.0, wasm-bindgen 0.2.127, `wasm-opt` version_117 from the `binaryen@117.0.0` npm package on `PATH`, Chromium 141 headless, Canvas2D forced, a shared four-core sandbox) at base commit `78d7d59`. The build route was also run by hand (`cargo build -p aeris_charts_wasm --release --target wasm32-unknown-unknown`, `wasm-bindgen --target web --out-name aeris_charts_wasm`, `wasm-opt` with the crate-metadata flags) and produced a module byte-identical to `wasm-pack build`. They are engineering evidence, not CI-runner or public performance claims.
+
+| Package metric | `78d7d59` | With `IndicatorKind` serde out of line | v4 ceiling |
+| --- | ---: | ---: | ---: |
+| npm tarball | 1,876,748 | 1,860,741 | 1,650,000 |
+| npm unpacked | 5,636,275 | 5,503,213 | 4,950,000 |
+| JavaScript raw | 412,622 | 412,622 | 620,000 |
+| JavaScript Brotli | 73,630 | 73,635 | 95,000 |
+| WASM raw | 4,739,804 | 4,606,742 | 4,100,000 |
+| WASM gzip-9 | 1,663,479 | 1,647,743 | - |
+| WASM Brotli | 1,175,083 | 1,172,054 | 1,050,000 |
+
+(Both tarball and unpacked columns already exclude `dist/react.js.map`, which the same change stops shipping: 8,165 tarball and 27,149 unpacked bytes. Ceilings are not changed by measuring: derive them with `rebudget` below on the final code.)
+
+The module is 93% code (4.40 MB), 6% data (0.28 MB, of which the crosshair mask is 100,368 bytes) and under 1% imports and exports. The code is a long tail, not one hotspot. Twiggy on a names-preserving `-Oz -g` build of the same module attributes it (percent of code) to `aeris_charts_engine` 31%, the wasm crate 11% plus its wasm-bindgen export shims, libcore and alloc generics instantiated for those crates 25% (`slice::sort` alone 6%, across about fifteen element types), serde-derived deserialization about 25% across the engine and wasm crates (`serde_json` itself 3%), `aeris_charts_core` 3%, indicators 2%, render, render_wgpu and wgpu about 1% each. The largest function, the per-frame `ChartInner::render_inner`, is 6.6% of code; the ten largest are 20%. Dependencies were already at `opt-level = "z"`.
+
+| Lever (workspace crates not listed stay at `opt-level` 3) | WASM raw | Brotli | raw vs current | pan / stream frame CPU p50, paired ratio vs current |
+| --- | ---: | ---: | ---: | --- |
+| current | 4,739,804 | 1,175,083 | - | 1.00 / 1.00 |
+| `IndicatorKind` serde out of line (shipped) | 4,606,742 | 1,172,054 | -2.8% | 1.00 / 1.06 (pan 3 of 7 rounds slower, stream 6 of 7: the stream figure is this machine's noise floor on a change that is off the frame path) |
+| `wasm-opt` binaryen 132 instead of 117 | 4,717,722 | 1,174,150 | -0.5% | not timed |
+| `wasm-opt --converge` | 4,738,993 | 1,173,017 | -0.02% | not timed |
+| without `+simd128` | 4,803,949 | 1,179,862 | +1.4% | not timed (SIMD costs no bytes) |
+| engine `s` | 4,268,389 | 1,115,992 | -10.0% | 0.99-1.03 / 1.01-1.06 |
+| engine `z` | 3,895,650 | 1,057,463 | -17.8% | 1.06-1.08 / 1.00-1.07; zoom 1.18, crosshair 1.11 |
+| wasm crate `z` | 4,515,650 | 1,172,435 | -4.7% | 0.99 / 1.17 |
+| `aeris_charts_core` `z` | 4,656,252 | 1,170,339 | -1.8% | not timed alone |
+| indicators `z` | 4,707,715 | 1,171,271 | -0.7% | not timed alone |
+| render and render_wgpu `z` | 4,718,680 | 1,172,342 | -0.4% | not timed alone |
+| engine + wasm crate `z` | 3,464,533 | 987,566 | -26.9% | 1.09 / 1.18 |
+| engine + wasm + core + indicators `z` | 3,292,048 | 944,719 | -30.5% | 1.42 / 1.19 |
+| every workspace crate `s` | 3,741,299 | 1,025,898 | -21.1% | one screening round: 1.09 / 1.14 |
+| every workspace crate `z` | 3,250,690 | 933,355 | -31.4% | 1.49 / 1.30 |
+
+Only the first row is shipped: it is the one lever whose effect is pure code volume (the roughly 110 KB internally tagged `IndicatorKind` deserializer existed twice, once for `from_value` and once for struct fields, and Brotli already hid most of the duplicate), on a cold path, with byte-identical rendered frames. Every `opt-level` row trades frame time for bytes and stays unshipped pending a product decision.
+
+Timing rows are medians of per-round paired ratios from interleaved A/B runs (at least seven alternating runs per variant, a fresh browser per run, `pan-candlestick-100k`, `stream-current-candle-60hz`, `zoom-candlestick-100k`, `crosshair-candlestick-100k`); the range is across independent sets. The noise floor on this machine is large: the current build's own run-to-run p50 spread is about 15-22% for pan and 16-54% for stream, and the 100k dashboard p50 (five samples per run) varies by about 30%, so no dashboard difference in any row is distinguishable. Fifteen interleaved pan and stream rounds of engine `s` gave p50 ratios 1.03 (pan, 10 of 15 rounds slower) and 1.01 (stream, 9 of 15), pooled p95 +5% and -3%: a cost of up to a few percent on pan cannot be excluded, which is why the release profile was not changed. Rendered frames of the current and engine-`s` builds were byte-identical for five deterministic Canvas2D demo captures. Adding `aeris_charts_core` and indicators at `z` to the engine and wasm-crate build raised pan from 1.09 to 1.42; the split between those two crates was not timed, so which of them carries the per-frame loops is not established; the wasm crate at `z` showed +17% on stream with a wide spread (0.76-1.37 per round).
+
+Reproduce a variant without editing the release profile: build with `--config 'profile.release.package.<crate>.opt-level="z"'` (Cargo environment variables cannot express per-package overrides), run `wasm-bindgen` and `wasm-opt` as above, and rebundle `dist/index.js` from that variant's `aeris_charts_wasm.js` (the glue names closure shims by per-build index, so a glue file from another build does not match).
+
+To re-baseline after a deliberate size increase, run `node benchmarks/benchmark.mjs size` on the final code (it writes the result JSON under `benchmarks/results/` and exits non-zero while a ceiling is exceeded), then
+
+```text
+node benchmarks/benchmark.mjs rebudget <that result.json> --tradeoff "<the product capability that added the bytes>" --lever "<lever applied and its measured effect>"
+```
+
+It prints the proposed `budgets.json` without writing it: only ceilings the run exceeds move, to the observed p50 plus 7% rounded up to 10,000 bytes (the Phase 2 reset carried 6.4-8.5%), `policy_version` increments, and a `rationale` entry is appended holding the commit, observed bytes, raised ceilings, toolchain (rustc, wasm-pack, wasm-opt version, Cargo profile, wasm-opt flags), levers and tradeoff. `budgets.json` ignores keys it does not evaluate, so the evidence stays beside the numbers. Review the diff, commit it with the code that caused the growth, and confirm `ci.yml`, `metrics-smoke.yml` and the nightly and release workflows pass against it.
+
 Phase 2 adds release-blocking maxima for `general-dashboard-100k`: p50 startup through the first following rAF
 must stay at or below 2,000 ms, and first-frame WebGPU vertex uploads must stay at or below 96 MiB. These are
 guardrails for catastrophic host regressions, not cross-machine performance claims.
+
+`crosshair-reset-studies-daily-2520` adds a release-blocking maximum of 4,500 Canvas2D paint operations per crosshair
+frame (p50). Before the period-reset studies' one-bar segments were batched into one `Segments` primitive per output,
+the scenario painted 31,116 operations per frame in headless Chromium 141 (Canvas2D forced, 1280x720, software
+raster); the same chart without studies paints 3,822 and with batching 3,884. The ceiling sits just above the batched
+count, leaving room for platform label differences, and far below the unbatched one, so a return to one stroke per bar
+fails the gate. It bounds operation count only: the measured frame CPU (`frame_cpu_ms` p50 63.8 ms before, 11.8 ms
+after, 5.0 ms without studies) is machine-dependent and stays report-only.
 
 These byte counts are reproducible filesystem/compression evidence, not an official wall-clock
 benchmark or a public performance claim. A deliberate size increase must explain the product

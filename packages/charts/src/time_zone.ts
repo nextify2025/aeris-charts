@@ -158,16 +158,20 @@ export function resolve_time_zone(zone: time_zone): readonly utc_offset_transiti
 export type engine_time_tick_marks = readonly { time: number; label?: string }[] | null;
 
 /**
- * Engine JSON for `timeScale.timeZone` / `timeScale.sessionStart` / `timeScale.tickMarks`, which the
- * engine validates together. `undefined` keys are omitted.
+ * Engine JSON for `timeScale.timeZone` / `timeScale.sessionStart` / `timeScale.tickMarks` /
+ * `timeScale.barTimeLabel`, which the engine validates together. `undefined` keys are omitted.
  */
 export function exchange_time_json(
   zone: time_zone | undefined,
   session_start: number | undefined,
   tick_marks?: engine_time_tick_marks,
+  bar_time_label?: unknown,
 ): string {
   const patch: Record<string, unknown> = {};
   if (tick_marks !== undefined) patch.tickMarks = tick_marks;
+  // The engine validates the label (interval range, window order and count against the session
+  // start in this same patch) and rejects the whole patch on error.
+  if (bar_time_label !== undefined) patch.barTimeLabel = bar_time_label;
   if (zone !== undefined) {
     const transitions = resolve_time_zone(zone);
     patch.timeZone = transitions.length === 0 ? "UTC" : transitions;
@@ -182,23 +186,34 @@ export function exchange_time_json(
 }
 
 /**
- * Split `timeScale.timeZone` / `timeScale.sessionStart` / `timeScale.tickMarks` out of an engine
- * options patch: IANA names and mark times must be resolved here before the engine sees them, and
- * the three keys apply as one validated step. The caller's object is never mutated.
+ * Split `timeScale.timeZone` / `timeScale.sessionStart` / `timeScale.tickMarks` /
+ * `timeScale.barTimeLabel` out of an engine options patch: IANA names and mark times must be
+ * resolved here before the engine sees them, and the four keys apply as one validated step (the
+ * label's windows are checked against the session start of the same patch). The caller's object
+ * is never mutated.
  */
 export function split_exchange_time_options(options: Record<string, unknown>): {
   engine: Record<string, unknown>;
   zone: time_zone | undefined;
   session_start: number | undefined;
   tick_marks: unknown;
+  bar_time_label: unknown;
 } {
   const time_scale = options.timeScale;
-  if (time_scale === null || typeof time_scale !== "object") {
-    return { engine: options, zone: undefined, session_start: undefined, tick_marks: undefined };
-  }
-  const { timeZone, sessionStart, tickMarks, ...rest } = time_scale as Record<string, unknown>;
-  if (timeZone === undefined && sessionStart === undefined && tickMarks === undefined) {
-    return { engine: options, zone: undefined, session_start: undefined, tick_marks: undefined };
+  const untouched = {
+    engine: options,
+    zone: undefined,
+    session_start: undefined,
+    tick_marks: undefined,
+    bar_time_label: undefined,
+  };
+  if (time_scale === null || typeof time_scale !== "object") return untouched;
+  const { timeZone, sessionStart, tickMarks, barTimeLabel, ...rest } = time_scale as Record<string, unknown>;
+  if (
+    timeZone === undefined && sessionStart === undefined && tickMarks === undefined &&
+    barTimeLabel === undefined
+  ) {
+    return untouched;
   }
   const engine = { ...options };
   if (Object.keys(rest).length > 0) engine.timeScale = rest;
@@ -208,6 +223,7 @@ export function split_exchange_time_options(options: Record<string, unknown>): {
     zone: timeZone as time_zone | undefined,
     session_start: sessionStart as number | undefined,
     tick_marks: tickMarks,
+    bar_time_label: barTimeLabel,
   };
 }
 

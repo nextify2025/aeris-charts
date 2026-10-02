@@ -374,7 +374,47 @@ function trading_features(chart, bars) {
   const entry = middle.close;
   const target = entry + Math.max(entry * 0.018, 1);
   const stop = entry - Math.max(entry * 0.012, 0.75);
+  // Fills sit inside their bar's time and price range: single and multi-fill bars on both
+  // sides, so the shared arrow, stacked-chevron, and exact-fill hover paths are all visible.
+  const execution_fills = () => {
+    const step = bars[bars.length - 1].time - bars[bars.length - 2].time;
+    const fill = (id, back, side, parts, price_at) => parts.map((part, index) => {
+      const bar = bars[bars.length - back];
+      return {
+        id: `${id}-${index}`,
+        side,
+        kind: index === 0 ? "entry" : "partial_fill",
+        time: bar.time + Math.floor(step * part),
+        price: bar.low + (bar.high - bar.low) * price_at[index],
+        quantity: index + 1,
+      };
+    });
+    return [
+      ...fill("single-buy", 34, "buy", [0.4], [0.35]),
+      ...fill("single-sell", 29, "sell", [0.6], [0.8]),
+      ...fill("multi-buy", 23, "buy", [0.1, 0.45, 0.8], [0.2, 0.45, 0.6]),
+      ...fill("multi-sell", 17, "sell", [0.15, 0.4, 0.65, 0.9], [0.9, 0.75, 0.6, 0.5]),
+      ...fill("both-buy", 11, "buy", [0.2], [0.3]),
+      ...fill("both-sell", 11, "sell", [0.7], [0.85]),
+      ...fill("pair-buy", 5, "buy", [0.1, 0.5], [0.25, 0.4]),
+      ...fill("pair-sell", 5, "sell", [0.3, 0.9], [0.7, 0.9]),
+    ];
+  };
   return [{
+    id: "execution-marks",
+    label: "Execution marks",
+    detail: "Single and multi-fill arrows, exact-fill hover",
+    icon: "analysis",
+    activate: () => {
+      const trading = chart.trading();
+      trading.apply_snapshot({ instrument: { price_precision: 2 }, executions: execution_fills() });
+      // Frame the fills so single and stacked marks are readable at a glance. Wait for the first
+      // painted frames: a scenario opened from the URL activates before the chart is sized.
+      requestAnimationFrame(() => requestAnimationFrame(() =>
+        chart.timeScale().setVisibleLogicalRange({ from: bars.length - 45, to: bars.length + 2 })));
+      return () => trading.apply_snapshot({});
+    },
+  }, {
     id: "trading-bracket",
     label: "Trading bracket",
     detail: "Position, OCO orders, partial fill",

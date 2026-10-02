@@ -132,12 +132,37 @@ pub enum Prim {
         color: Color,
     },
     /// Anti-aliased polyline over `points[range]`, round joins / butt caps.
+    ///
+    /// Canvas2D, GPUI and native honor `style`, but the WebGPU stroker ignores it. Producers must
+    /// therefore lower dashed and dotted strokes to solid runs through
+    /// [`crate::line::push_styled_stroke`] (engine frame construction and the browser host's
+    /// decoded plugin primitives both do) and emit only `LineStyle::Solid` polylines, so every
+    /// executor paints identical dashes.
     Polyline {
         first_point: u32,
         point_count: u32,
         width: f32,
         style: LineStyle,
         line_type: LineType,
+        color: Color,
+    },
+    /// A batch of independent two-point strokes over
+    /// `points[first_point .. first_point + 2 * segment_count]`: pair `i` is
+    /// `points[first_point + 2 * i]` to `points[first_point + 2 * i + 1]`. Each pair strokes exactly
+    /// like a solid simple two-point [`Prim::Polyline`] of this `width` and `color` (anti-aliased,
+    /// butt caps, no joins); a dashed line is already expanded into one pair per dash. The engine
+    /// emits it for period-reset study lines on bars of a day or longer, where every bar is its own
+    /// line run and would otherwise cost one `Polyline` (and one executor state change) per bar.
+    ///
+    /// The engine's pairs are ascending in x, each spans at most one bar, and neighbours may touch
+    /// at their endpoints (overlapping by float rounding). An executor may stroke the batch as one
+    /// path or one mesh; the only visible difference from separate strokes is at those shared
+    /// boundary pixels, where a single-path stroke unions coverage instead of compositing twice.
+    /// A range outside the point pool is dropped.
+    Segments {
+        first_point: u32,
+        segment_count: u32,
+        width: f32,
         color: Color,
     },
     /// Fill between polyline and a horizontal base with a vertical gradient.
@@ -230,6 +255,20 @@ pub enum Prim {
     },
 }
 
+/// The `2 * segment_count` pool points of a [`Prim::Segments`] batch, or `None` when the range
+/// leaves the pool, which every executor treats as a dropped prim (as it does a short `Polyline`
+/// range). The bound is checked `usize` math: a `u32` sum would wrap on 64-bit hosts' pool
+/// indices, and `usize` itself is 32 bits on wasm32.
+pub fn segment_points(
+    points: &[[f32; 2]],
+    first_point: u32,
+    segment_count: u32,
+) -> Option<&[[f32; 2]]> {
+    let start = usize::try_from(first_point).ok()?;
+    let len = usize::try_from(segment_count).ok()?.checked_mul(2)?;
+    points.get(start..start.checked_add(len)?)
+}
+
 /// One pane's frame output: `main` is redrawn on Light/Full invalidation; `top`
 /// (crosshair + top primitives) is redrawn on every Cursor invalidation.
 #[derive(Clone, Debug, Default)]
@@ -246,4 +285,32 @@ pub struct DrawList {
     pub time_axis: PaneLayers,
     pub left_price_axes: Vec<PaneLayers>,
     pub right_price_axes: Vec<PaneLayers>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::segment_points;
+
+    #[test]
+    fn segment_window_is_bounded_by_the_pool() {
+        let pool = [
+            [0.0f32, 0.0],
+            [1.0, 0.0],
+            [2.0, 1.0],
+            [3.0, 1.0],
+            [9.0, 9.0],
+        ];
+        assert_eq!(segment_points(&pool, 0, 2), Some(&pool[0..4]));
+        assert_eq!(segment_points(&pool, 2, 1), Some(&pool[2..4]));
+        assert_eq!(segment_points(&pool, 1, 2), Some(&pool[1..5]));
+        assert_eq!(segment_points(&pool, 4, 0), Some(&pool[4..4]));
+        assert_eq!(segment_points(&pool, 4, 1), None, "one point short");
+        assert_eq!(segment_points(&pool, 6, 0), None, "start past the pool");
+        assert_eq!(segment_points(&pool, u32::MAX, 1), None, "no wrap past u32");
+        assert_eq!(
+            segment_points(&pool, 1, u32::MAX),
+            None,
+            "no wrap on the pair count"
+        );
+    }
 }

@@ -5,7 +5,7 @@
 import { create_offscreen_chart as wasm_create_offscreen_chart, AerisChart } from "../pkg/aeris_charts_wasm.js";
 
 import {
-  apply_series_time_alignment, ensure_init, normalize_time_tick_marks, time_to_utc_seconds,
+  apply_series_time_alignment, assert_live_series, ensure_init, normalize_time_tick_marks, time_to_utc_seconds,
   validate_series_time_alignment,
 } from "./impl.js";
 import { route_wheel, wheel_speed_adjustment } from "./gestures.js";
@@ -27,6 +27,7 @@ import type {
   series_kind,
   series_data,
   series_merge_columns,
+  series_options,
   series_update_options,
   time_zone,
 } from "./types.js";
@@ -76,6 +77,10 @@ export type offscreen_chart_options = Omit<
   (typeof UNSUPPORTED_WORKER_OPTIONS)[number] | "layout"
 > & { layout?: offscreen_layout_options };
 
+/** The series options a worker chart can change after creation: how a series' timestamps land on
+ * the shared time axis (`series_options.time_alignment`, `series_options.as_of_max_staleness`). */
+export type offscreen_series_options = Partial<Pick<series_options, "time_alignment" | "as_of_max_staleness">>;
+
 function split_offscreen_options(options: offscreen_chart_options): {
   theme: "light" | "dark" | undefined;
   wheel_behavior: "auto" | "pan" | "zoom" | undefined;
@@ -83,6 +88,7 @@ function split_offscreen_options(options: offscreen_chart_options): {
   zone: time_zone | undefined;
   session_start: number | undefined;
   tick_marks: unknown;
+  bar_time_label: unknown;
 } {
   const raw = options as Record<string, unknown>;
   for (const key of UNSUPPORTED_WORKER_OPTIONS) {
@@ -96,9 +102,10 @@ function split_offscreen_options(options: offscreen_chart_options): {
     );
   }
   const { theme, wheel_behavior, ...engine } = options;
-  // Declarative `timeScale.timeZone` (IANA name or schedule), `timeScale.sessionStart`, and
-  // `timeScale.tickMarks` resolve here with the worker's own `Intl`; the engine receives an explicit
-  // schedule and UTC-second mark times.
+  // Declarative `timeScale.timeZone` (IANA name or schedule), `timeScale.sessionStart`,
+  // `timeScale.tickMarks`, and `timeScale.barTimeLabel` resolve here with the worker's own `Intl`;
+  // the engine receives an explicit schedule, UTC-second mark times, and the label to validate
+  // together with the session start.
   const exchange = split_exchange_time_options(engine as Record<string, unknown>);
   return {
     theme,
@@ -107,6 +114,7 @@ function split_offscreen_options(options: offscreen_chart_options): {
     zone: exchange.zone,
     session_start: exchange.session_start,
     tick_marks: exchange.tick_marks,
+    bar_time_label: exchange.bar_time_label,
   };
 }
 
@@ -117,10 +125,14 @@ function apply_offscreen_exchange_time(
   zone: time_zone | undefined,
   session_start: number | undefined,
   tick_marks: unknown,
+  bar_time_label: unknown,
 ): void {
-  if (zone === undefined && session_start === undefined && tick_marks === undefined) return;
+  if (
+    zone === undefined && session_start === undefined && tick_marks === undefined &&
+    bar_time_label === undefined
+  ) return;
   const marks = tick_marks === undefined ? undefined : normalize_time_tick_marks(tick_marks);
-  const reason = wasm.set_exchange_time_json(exchange_time_json(zone, session_start, marks));
+  const reason = wasm.set_exchange_time_json(exchange_time_json(zone, session_start, marks, bar_time_label));
   if (reason !== "") throw new AerisChartsError("invalid_options", reason);
 }
 
@@ -163,8 +175,10 @@ export interface offscreen_wheel_event {
   delta_y: number;
   /** 0 = pixels, 1 = lines, 2 = pages (the WheelEvent values). */
   delta_mode?: 0 | 1 | 2;
+  /** Ctrl (or `meta_key`, macOS Cmd) zooms around the pointer instead of pinning the right edge. */
   ctrl_key?: boolean;
   shift_key?: boolean;
+  meta_key?: boolean;
 }
 
 export interface offscreen_key_event {
@@ -257,7 +271,8 @@ export class offscreen_chart {
   }
 
   /** Adopt the primary series on the first call; later calls append independent series. An
-   *  ordinary series takes `time_alignment` and `as_of_max_staleness` from `options`. */
+   *  ordinary series takes `time_alignment` and `as_of_max_staleness` from `options`; change them
+   *  later with {@link apply_series_options}. */
   add_series(kind: series_kind, options: Partial<any_series_options> = {}): number {
     this.assert_live();
     if (kind === "custom") {
@@ -312,6 +327,45 @@ export class offscreen_chart {
     }
     this.render();
     return id;
+  }
+
+  /**
+   * Change a series' `time_alignment` and `as_of_max_staleness` after creation, exactly as
+   * `series.apply_options` does on the main thread (an omitted key keeps its value, switching to
+   * `"union"` clears the staleness bound, a request equal to the current values is a no-op).
+   * `series_id` is the id `add_series` returned (0 is the primary). Nothing is applied when the
+   * call throws: `disposed`, `invalid_handle` or `stale_handle` for an id that names no live
+   * series (even for an empty patch), `invalid_options` for a bad value or a non-object patch, and
+   * `unsupported_operation` for a series without its own calendar or for any other series option,
+   * which a worker chart cannot change after creation. A call that succeeds repaints the canvas
+   * before it returns (an unchanged request too), one that throws paints nothing. A worker chart
+   * has no series handles and so no `subscribe_data_changed` notification; read
+   * `visible_logical_range()` after the call.
+   */
+  apply_series_options(options: offscreen_series_options, series_id = 0): void {
+    this.assert_live();
+    assert_live_series(this.wasm, series_id);
+    if (typeof options !== "object" || options === null) {
+      throw new AerisChartsError("invalid_options", "series options must be an object");
+    }
+    for (const [key, value] of Object.entries(options)) {
+      if (value !== undefined && key !== "time_alignment" && key !== "as_of_max_staleness") {
+        throw new AerisChartsError(
+          "unsupported_operation",
+          `worker charts cannot change series option ${key} after creation`,
+        );
+      }
+    }
+    apply_series_time_alignment(this.wasm, series_id, options);
+    this.render();
+  }
+
+  /** A snapshot of a series' current options as the engine reports them (`series_id` as in
+   *  {@link apply_series_options}). Throws like it for an id that names no live series. */
+  series_options(series_id = 0): Readonly<series_options> {
+    this.assert_live();
+    assert_live_series(this.wasm, series_id);
+    return Object.freeze(JSON.parse(this.wasm.series_options_json(series_id)) as series_options);
   }
 
   /** Replace a series' columns. `options.sequence` installs the snapshot's sequence guard
@@ -528,8 +582,9 @@ export class offscreen_chart {
 
   apply_options(options: offscreen_chart_options): void {
     this.assert_live();
-    const { theme, wheel_behavior, engine, zone, session_start, tick_marks } = split_offscreen_options(options);
-    apply_offscreen_exchange_time(this.wasm, zone, session_start, tick_marks);
+    const { theme, wheel_behavior, engine, zone, session_start, tick_marks, bar_time_label } =
+      split_offscreen_options(options);
+    apply_offscreen_exchange_time(this.wasm, zone, session_start, tick_marks, bar_time_label);
     if (wheel_behavior !== undefined) this.wheel_behavior = wheel_behavior;
     if (theme !== undefined) {
       this.selected_theme = theme;
@@ -655,7 +710,9 @@ export class offscreen_chart {
           if (update.kind === 6) {
             this.wasm.scroll_move(update.x);
             if (update.scale_delta !== 0) {
-              this.wasm.zoom(update.x, this.wasm.pinch_zoom_scale(update.scale_delta));
+              // Pinching is direct manipulation: it stays anchored at the pinch point even though
+              // wheel zoom pins the right edge.
+              this.wasm.zoom_focused(update.x, this.wasm.pinch_zoom_scale(update.scale_delta));
             }
           } else if (this.drag_pointer_id === id) {
             this.wasm.scroll_move(x);
@@ -704,6 +761,7 @@ export class offscreen_chart {
         delta_mode,
         ctrl_key: event.ctrl_key === true,
         shift_key: event.shift_key === true,
+        meta_key: event.meta_key === true,
         speed: wheel_speed_adjustment(delta_mode, this.dpr),
         point: () => ({ x: event.x - this.wasm.pane_left(), y: event.y }),
       },
@@ -820,7 +878,7 @@ export async function create_offscreen_chart(
   const height = Math.max(init.height, 1);
   const dpr = Math.max(init.dpr, Number.EPSILON);
   const options = init.options ?? {};
-  const { theme, wheel_behavior, engine: engine_options, zone, session_start, tick_marks } =
+  const { theme, wheel_behavior, engine: engine_options, zone, session_start, tick_marks, bar_time_label } =
     split_offscreen_options(options);
   const wasm = await wasm_create_offscreen_chart(
     gpu_canvas,
@@ -838,7 +896,7 @@ export async function create_offscreen_chart(
     wasm.apply_options(JSON.stringify(engine_options));
   }
   try {
-    apply_offscreen_exchange_time(wasm, zone, session_start, tick_marks);
+    apply_offscreen_exchange_time(wasm, zone, session_start, tick_marks, bar_time_label);
   } catch (error) {
     wasm.dispose();
     wasm.free();

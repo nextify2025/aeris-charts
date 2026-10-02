@@ -31,7 +31,9 @@ The supported root surface is:
   `session_slot_times()`, explicit time-axis `tick_marks`, the `histogram_updown_rule`
   previous-close volume tint with host `up_color`/`down_color`, a baseline series that shows
   its first traded bar, the additive `break_on_trading_day` line/area/baseline option (default
-  `false`), and VWAP/pivot lines that restart at every reset;
+  `false`), and VWAP/pivot lines that restart at every reset; the close-time display label
+  `time_scale_options.bar_time_label` prints bars by their close while they stay open-stamped
+  (see [Close-time labels](#close-time-labels));
 - multi-calendar overlays through the series options `time_alignment: "as_of"` and
   `as_of_max_staleness` (see [Multi-calendar overlays](#time-exchange-time-zone-and-trading-sessions));
 - built-in series, indicators, drawing kinds, options, themes, data ingestion, interactions,
@@ -39,7 +41,21 @@ The supported root surface is:
 - Long Position and Short Position drawings through the canonical `drawing_kind` values
   `"long_position"` and `"short_position"`; each stores three editable anchors in entry, target,
   stop order, paints target/entry/stop information, projects all three prices onto the owning Y-axis,
-  and uses the shared drawing history, persistence, hit testing, and backend frame path;
+  and uses the shared drawing history, persistence, hit testing, and backend frame path. The
+  statistics use two persisted drawing options, `position_account_size` (a hypothetical balance,
+  default 1,000) and `position_risk_percent` (the share of it risked at the stop, 0–100, default 25),
+  independent of broker orders;
+- measuring drawings through the canonical `drawing_kind` values `"price_range"`, `"date_range"`,
+  and `"date_and_price_range"` (the earlier spelling `"date_price_range"` is still read on import,
+  templates, clipboard, and sync, and never written); each stores an editable start and end anchor
+  snapped to whole bars and price ticks, labels the signed price change, percentage, ticks (counted
+  on the instrument tick or price-band ladder), bar count, and elapsed time (the `labels` option
+  chooses the metrics), and paints in the drawing color;
+- the Shift-click quick measure in the built-in pointer handling: Shift + press on empty chart
+  space starts a transient date-and-price measurement that follows the pointer (drawing default
+  color for a rise, market-down color for a fall), freezes on release after a drag or on the next
+  click, and is dismissed by the following click or Escape. It is never a drawing, history entry,
+  or persisted object;
 - visible-range volume profiles through `chart.add_volume_profile(prices, volume, options)`,
   returning a distribution handle with `options()`, `apply_options()`, `snapshot()` and `remove()`;
 - first-class tick-driven footprint / numbers-bar series through `chart.add_series("footprint")`,
@@ -186,12 +202,15 @@ semantic follow states such as unpinned series colors and price-scale text. Wate
 visibility, scale modes/ranges/margins/layout constraints, viewport zoom/scroll, and indicator/data
 semantics survive the reset; only their engine-owned visual styling is restored.
 
-Default mouse-wheel behavior is informed by measurements from the pinned public reference fixture:
-a saturated vertical step uses a 1.0 zoom increment, smaller trackpad deltas stay proportional, and the logical point under
-the cursor remains anchored because `right_bar_stays_on_scroll` defaults to `false`. Vertical and
-horizontal deltas independently zoom and pan the time scale on the pane, time axis, or price axis;
-Ctrl and Shift do not change routing. `wheel_behavior: "pan"` and `"zoom"` are explicit Aeris
-extensions; explicit zoom retains price-axis wheel zoom and focused Ctrl zoom.
+Default mouse-wheel zoom follows measurements of TradingView: a saturated vertical step changes bar
+spacing by exactly 10% (smaller trackpad deltas stay proportional) and keeps the right edge pinned,
+because `right_bar_stays_on_scroll` defaults to `true`: the gap after the latest bar stays constant
+while history compresses or expands. Ctrl/Cmd + wheel, macOS trackpad pinch (delivered as Ctrl +
+wheel), and touch pinch zoom around the pointer instead. Setting `right_bar_stays_on_scroll: false`
+restores cursor-anchored ordinary zoom. Vertical and horizontal deltas independently zoom and pan
+the time scale on the pane, time axis, or price axis; Shift does not change routing.
+`wheel_behavior: "pan"` and `"zoom"` are explicit Aeris extensions; explicit zoom retains
+price-axis wheel zoom.
 
 The built-in series live-price line is engine-owned. `price_line_extent` defaults to `"partial"`
 (tracked bar/value to the pane's right edge); `"full"` preserves the conventional pane-wide line.
@@ -359,6 +378,51 @@ unless `break_on_trading_day: true` asks them to break at each exchange trading 
 bar axis such as Renko or tick bars, the day of each bar's open time); whitespace rows never break
 a line.
 
+## Coordinates and panes
+
+Every public coordinate lives in one chart-content space, and it is never pane-local. `x` is CSS px
+from the plot-area left edge (right of the left price strip), so the container `x` is
+`pane.get_geometry().left + x`. `y` is CSS px from the top of the stacked pane area, which is pane 0's
+top. A pane spans `[geometry.top, geometry.top + geometry.height]` in that `y`; its pane-local `y` is
+`y - geometry.top`. The same space carries `series.price_to_coordinate`/`coordinate_to_price`,
+`chart.price_to_coordinate`/`coordinate_to_price`, `time_scale()` conversions,
+`mouse_event_params.point`, the crosshair, hit tests, drawings, and trading geometry, so a `y` from one
+API can be handed to any other. All values reflect the last layout pass: after `pane.set_height`, a
+separator drag, or a pane move, read them again once the chart has laid out.
+
+**Choosing a pane.** A series handle converts on its own pane and price scale, in that scale's mode and
+base. A host that needs a lower pane's coordinates keeps a handle to a series in that pane:
+
+```ts
+// `rsi` is a series handle in pane 1, for example from `chart.add_rsi(candles, 14)`.
+const pane = chart.panes()[1].get_geometry();
+const y = rsi.price_to_coordinate(70); // in pane 1's [top, top + height] while 70 is in range; never pane-local
+const paneLocalY = y! - pane.top;      // pane-relative chrome subtracts the pane top itself
+rsi.coordinate_to_price(y!);           // 70
+```
+
+`chart.price_to_coordinate(price)` converts on pane 0's default scale (the first visible non-overlay
+series' scale, else the right scale), and `chart.coordinate_to_price(y)` uses the default scale of the
+pane containing `y`: a separator belongs to the pane above and a `y` below the panes to the last pane.
+That is the scale the crosshair label reads in that pane, so the two never disagree. Neither follows
+series creation order or an overlay's scale. Time, logical, and `x` conversions are the same for every
+pane.
+
+**Two other spaces.** Plugin draw-context converters (`price_to_y`, `time_to_x`, `logical_to_x`) return
+bitmap px of the whole chart with `x` including `pane_left`, the space the plugin canvas draws in;
+subtract `pane_left` and divide by `dpr` to compare them with the CSS-px converters above. A plugin
+axis-label descriptor's `coordinate` is pane-local (price: px from the pane top; time: px from the
+plot-area left) unless a series primitive supplies `price`, which is converted on the series' scale.
+
+**Linked crosshairs.** `crosshair_sync_position()` and the `crosshair` events from `take_sync_events()`
+carry `pane_index` and a `price` on that pane's default scale, with the pane picked from the crosshair
+`y` (a separator counts as the pane above). `set_crosshair_position(price, time, series)` places the
+line through the given series' scale; the emitted price is the raw `price` when that series is on the
+pane's default scale (and, in percentage and indexed modes, shares its base), otherwise it is
+re-expressed on the default scale so a linked chart lands on the same line. `apply_external_crosshair`
+converts the price on the requested pane's default scale and holds the line inside that pane: a price
+outside the pane's visible range sits on the pane's edge instead of drawing in a neighbouring pane.
+
 ## Time, exchange time zone, and trading sessions
 
 Canonical chart time is whole UTC seconds. `business_day` values and strict `"YYYY-MM-DD"` strings
@@ -397,7 +461,19 @@ transform returns it to the union. A bad value or a staleness without `"as_of"` 
 creates (or adopts) the series, and a refusal leaves no series behind on the main thread or in a
 worker. Re-applying the current alignment is a no-op that notifies no `subscribe_data_changed`
 handler; a change notifies each once with `"full"`. Worker charts take both keys in
-`add_series` options. Rust hosts call
+`add_series` options and change them later with `offscreen_chart.apply_series_options(patch,
+series_id)`; `offscreen_chart.series_options(series_id)` reads the options back. A worker chart
+addresses series by the numeric id `add_series` returned (`0` is the primary). The patch follows the
+same rules and throws the same codes as `apply_options` (an omitted key keeps its value, switching
+to `"union"` clears the staleness bound, an unchanged request is a no-op) and applies nothing when
+it throws. It accepts only `time_alignment` and `as_of_max_staleness`: any other key with a value
+throws `unsupported_operation` naming it, and a non-object patch throws `invalid_options`. An id
+that is not a whole number in `0..=4294967295` or names no live series throws `invalid_handle`
+(`stale_handle` for a series that was removed), even for an empty patch, and a removed chart throws
+`disposed`. A call that succeeds repaints the worker canvas before it returns, like the other
+worker mutations (an unchanged request too); a call that throws paints nothing. Worker charts have no
+series handle, so no `subscribe_data_changed` notification; read `visible_logical_range()` after the
+call. Rust hosts call
 `ChartEngine::set_series_time_alignment(id, TimeAlignment::AsOf { max_staleness })`. Like other
 financial series options, the setting is host-owned and not persisted.
 
@@ -408,14 +484,32 @@ as `"Asia/Shanghai"` or `"America/New_York"`, or an explicit schedule of
 `{ from_utc_seconds, offset_seconds }` transitions (strictly ascending, at most 1024, offsets within
 ±18 h; the first offset also applies before its entry). The package resolves an IANA name once per
 zone with `Intl.DateTimeFormat` over 1970–2100 (at most ~262 DST transitions) and keeps at most 32
-resolved zones; outside that span the nearest offset applies. The engine itself is platform-free,
-accepts only explicit schedules, and never reads the browser's time zone. An unknown zone, malformed
-schedule, or out-of-range session start throws `invalid_options` before any other key in the same
-call is applied. `time_scale().options()` reports the IANA name (or the schedule) and
-`session_start`. Rust hosts call `ChartEngine::set_time_zone(UtcOffsetSchedule)` and
-`set_session_start_seconds(i32)`; the engine JSON options accept `timeScale.timeZone` (`"UTC"` or a
-transition array) and `timeScale.sessionStart`, and V2 persistence round-trips both. Importing a
-document that predates these keys keeps the chart's installed zone and session start.
+resolved zones; outside that span the nearest offset applies. The engine itself never reads the
+browser's time zone: `timeScale.timeZone` takes only `"UTC"` or an explicit schedule. A zone from the
+TradingView parity list (`TRADINGVIEW_TIME_ZONES`; WASM `supported_time_zones_json()`) can instead be
+named to the engine with `ChartEngine::set_time_zone(&str)` (`Ok(true)` when it changed; WASM
+`set_time_zone`) or the top-level engine option `timezone`; it is resolved once into the same schedule
+(1970–2100, about 4 ms natively), so grouping and labels match the explicit schedule, and the name
+also localizes the general (non-financial) temporal axes and
+`ChartEngine::time_zone_clock_text(utc_seconds, show_seconds)`. `ChartEngine::time_zone_id()` (WASM
+`time_zone()`) returns the named zone, `Etc/UTC` by default, or `custom` while an explicit schedule is
+installed. An unknown zone, malformed schedule, out-of-range session start, or session start that the
+windows of an installed close-time label do not fit ([Close-time labels](#close-time-labels)) throws
+`invalid_options` before any other key in the same call is applied; an unsupported or non-string
+`timezone` rejects the patch the same way. `time_scale().options()` reports the IANA name (or the
+schedule) and `session_start`. Rust hosts call `ChartEngine::set_exchange_offsets(UtcOffsetSchedule)`
+for an explicit schedule and `set_session_start_seconds(i32)`; the engine JSON options accept
+`timeScale.timeZone` (`"UTC"` or a transition array), `timeScale.sessionStart`, and `timezone`. V2
+persistence round-trips them: the schedule always, and the `timezone` name while a named zone is
+installed (an explicit schedule clears it). When one patch carries both a schedule and a name, the
+schedule drives grouping and labels and the name the general axes and the clock. Importing a document
+that predates these keys keeps the chart's installed zone and session start.
+
+Display-only time projection: `ChartEngine::set_future_time_projection(cadence_seconds, points)` and
+`set_past_time_projection(cadence_seconds, points)` (each bounded at 4,096 points; `None` or zero points
+clears it; `has_future_time_projection` / `has_past_time_projection` read it back) label the whitespace
+after the last and before the first bar of a time axis. Projected points are labels only (no data rows,
+base index or point count) and are not persisted.
 
 **Trading day.** `session_start` is the offset in seconds from exchange-local midnight at which a
 trading day begins (default `0`, range ±86 399). A negative value assigns an evening session to the
@@ -423,6 +517,17 @@ next trading day, e.g. `-3 * 3600` makes a 21:00 China futures night session sta
 with a negative start a day that would fall on Saturday or Sunday rolls forward to Monday, so a
 Friday-night session belongs to Monday. Day/Month/Year tick marks, VWAP `session`/`weekly`/`monthly`
 resets, and pivot sessions use trading days. Weekly periods start on Monday.
+
+A market whose week opens on Sunday evening (CME Globex, 17:00 Central) sets `session_start:
+-25200`: Sunday 17:00 belongs to Monday's trading day and Monday 17:00 to Tuesday's, so Day marks,
+session and weekly VWAP resets, and pivots align with the session. With `0` the Sunday evening is its
+own trading day: a Day mark and a session VWAP reset appear at midnight in the middle of the
+session, and the weekly VWAP keeps the Sunday evening bars in the previous week and resets at that
+midnight. With a negative start every Saturday or Sunday instant belongs to Monday, and window
+placement (`session_slot_times`, `resample_boundaries`, `set_trade_stream_sessions`)
+assumes the week opens on Friday evening: right for China futures, but a Sunday-open market places
+its evening windows with a per-call `session_start` of `0` (see *Intraday (分时) charts* and *Ticks
+to candles and resampling*).
 
 **What follows exchange time.** Tick boundaries (Day/Month/Year from trading days; hour and minute
 marks on exchange wall-clock time, so they stay on exchange hours across DST and non-hour offsets),
@@ -446,14 +551,19 @@ whose `business_day` is the calendar date for calendar-date rows and `null` for 
 axis tags, delta tooltip, `create_tooltip`, and accessibility (unless the accessibility options set
 their own `time_formatter`). Without it, `create_tooltip` and accessibility format in the chart time
 zone with `localization.locale`, adding the time of day for intraday rows. Rust `TickMarkFormatterFn`
-and `TimeFormatterFn` signatures are unchanged.
+and `TimeFormatterFn` signatures are unchanged. With a close-time label configured
+([Close-time labels](#close-time-labels)) both callbacks receive the LABEL instant (the bar's
+close), not the bar's open time; a host that adds one interval inside its formatter must drop that
+addition when it adopts the option.
 
 **Countdown clock.** The candle-close countdown shows only while the clock is inside the forming
 bar's interval `[last_bar_time, last_bar_time + bar_interval)`; outside it — lunch breaks,
 overnight, weekends, after an early close — it hides instead of cycling. Calendar-date bars form
 during the exchange trading day(s) of their date (with a negative `session_start`, Monday's bar
-starts with Friday's night session), and bars 28 or more days apart run to the end of their
-calendar month(s). `chart.set_clock(() => utc_seconds)` and `offscreen_chart.set_clock(...)`
+starts on Friday evening at the session-start time of day: Friday's night session for China
+futures, Friday 17:00 Central for a Sunday-open market such as CME Globex), and bars 28 or more
+days apart run to the end of their calendar month(s). `chart.set_clock(() => utc_seconds)` and
+`offscreen_chart.set_clock(...)`
 replace `Date.now()` for countdown ticks; `null` (or a clock that throws or returns a non-finite
 value) falls back to the system clock.
 
@@ -479,12 +589,24 @@ are exchange-local `["HH:MM", "HH:MM"]` pairs in chronological order (at most 32
 its start crosses midnight, `"24:00"` ends at midnight), `time_zone` is an IANA name or an explicit
 schedule, and the result is bounded to 100 000 slots and validated (`invalid_options`). Each window
 converts with the offset in force on that date, so the same windows stay on exchange hours across
-DST. With a negative `session_start`, windows starting at or after the session-start time of day
-belong to the evening before (Friday evening for Monday), matching the chart's trading days and the
-night sessions of Chinese futures. A market whose week reopens on Sunday evening (CME Globex)
-requests that evening separately: the Sunday date with `session_start: 0` and
-`[["17:00", "24:00"]]`, then the Monday date with its remaining windows. It
-needs the engine module: call it after `init_wasm()` or `create_chart()`. Rust hosts call
+DST. `session_start` is this call's own and defaults to `0`; it is not read from the chart, so a
+China futures host must pass `session_start: -10800` explicitly (omitted, a 21:00 night window is
+placed on the calendar date, Monday 21:00, instead of Friday 21:00, and nothing reports it). With a
+negative `session_start`, windows starting at or after the session-start time of day belong to the
+evening before (Friday evening for Monday), matching the chart's trading days and the night
+sessions of Chinese futures. That placement assumes the week opens on Friday evening.
+
+A market whose week reopens on Sunday evening (CME Globex) passes `session_start: 0` and makes one
+call per evening date with `windows: [["17:00", "16:00"]]`. The date is the evening the session
+opens: the Sunday date places Monday's trading day (1380 one-minute slots, Sunday 17:00 to Monday
+16:00), the Monday date places Tuesday's, and so on, so with `0` every call is keyed by the
+evening's calendar date rather than by trading date. Two calls give the same slots: the Sunday date
+with `[["17:00", "24:00"]]` and `session_start: 0`, then the Monday date with `[["00:00", "16:00"]]`.
+Do not give the Monday date a window that starts at or after 17:00 under a negative `session_start`:
+that places Friday 17:00 to Saturday 16:00. Which dates trade, holidays, and early closes are host
+calendar data; pass the windows that apply to each date (a date without a night session is a
+window list without it). It needs the engine module: call it after `init_wasm()` or
+`create_chart()`. Rust hosts call
 `aeris_charts_engine::session_slot_times(day, &windows, interval, chart.exchange_time(), convention)`.
 
 `convention` decides which instant names a slot. Aeris bars are stamped with their open time, so
@@ -494,6 +616,13 @@ first point: `"bar_close_with_open"` reproduces their 241 points (09:30, 09:31..
 `"bar_close"` is the close-labelled form without the opening point. Use the convention your data
 provider stamps its minutes with. The lunch break takes no width either way: the last morning slot
 and the first afternoon slot are neighbours.
+
+The two families of chart use the conventions differently. An instant-sampled line (the classic
+time-sharing price line, one price per minute end) uses close-stamped slots: its points ARE those
+instants, and 241 points are a property of the line. Interval bars (candles built from ticks or
+resampled minutes) use `"bar_open"` slots and open-stamped rows, and print their close time through
+the `bar_time_label` option ([Close-time labels](#close-time-labels)); they do not grow a separate
+241st auction bar, because the 09:25 auction print folds into the first bar.
 
 **2. Reserve the session.** Install every slot, traded or not; untraded minutes are whitespace rows
 (`{ time }`). Lock the whole session in view and disable gestures (keyboard motion follows the same
@@ -616,8 +745,9 @@ segment). Open `intraday.html?traded=0` to see that state.
 
 Both recipes build ordinary candles on the time axis in the chart's exchange time, so set the
 exchange time zone (and `session_start` for night sessions) first. Candles are stamped with their
-open time, the canonical Aeris bar time; platforms that label a minute by its close (同花顺, 富途)
-show the same bars one interval later.
+open time, the canonical Aeris bar time. To print each candle's close time (09:31 … 15:00 for A-share
+minutes) instead, set `bar_time_label` ([Close-time labels](#close-time-labels)): the candles, their
+volume, replay, countdown, and every time your host passes in or reads back stay open-stamped.
 
 ### Ticks to candles
 
@@ -648,6 +778,14 @@ one bar per trading day, opening at its first window. Changing the chart's time 
 re-places the windows; `null` restores the plain grid. Only whole-second time bars accept sessions;
 invalid windows or other bar types throw `invalid_options` and change nothing.
 
+`set_trade_stream_sessions()` always uses the chart's own `session_start` (there is no per-call
+override) and takes one window list for all dates, so a date after a break cannot drop its night
+window. For a Sunday-open market (CME Globex) keep the chart's `session_start` at `0` and pass one
+crossing window, `[["17:00", "16:00"]]`: the previous-day lookup places the Sunday evening, at the
+cost of midnight trading-day semantics for Day marks and VWAP resets. A chart at `-25200` places
+Monday's window on Friday evening, so Sunday and Monday prints fall after it: `fold` sends them to
+that window's last bar (Saturday 15:xx) and `exclude` drops them.
+
 **Prints outside the windows.** `outside: "fold"` (the default) keeps every print: the 09:25
 opening auction opens the 09:30 bar, and the 11:30:00 and 15:00:00 closing prints close the last bar
 of their window, as Chinese platforms show them. `outside: "exclude"` leaves pre-market and
@@ -655,6 +793,31 @@ after-hours prints out of every bar (a US regular-hours chart) but keeps prints 
 closing second, such as the 16:00:00 closing cross. A print that is folded or excluded still takes
 part in aggressor classification. A trade `session_id` change always starts a new bar and resets
 session delta; the windows already split the morning and afternoon, so a per-date id is enough.
+
+**Engine-owned series.** A bound candle or bar and the volume, CVD, and delta studies are written
+only by their trade stream, and one series has one engine writer: `bind_trade_bar_series_to_stream`
+throws `invalid_options` for a series that is not a candlestick or bar, carries a `max_points`
+cap, or is already a footprint, a study, a resampled target, or a synthetic-bar series (rebinding a
+bound candle to another stream stays allowed), and a footprint, resampled target, or synthetic
+series cannot be created from a series that a stream writes. Their `set_data`, `set_data_typed`,
+`update`, `update_typed`, `merge`, `merge_typed` (with or without `{ sequence }`), `pop`, and
+`set_ring_source` are rejected: the data calls record `last_ingestion_diagnostics()` as
+`{ status: "rejected", code: "derived_series" }`, warn, and change nothing, `pop` records the same
+rejection without repainting or firing `data_changed`, and `set_ring_source` throws
+`unsupported_operation` (unbinding with `null` still works, and a ring bound before the series
+became derived keeps draining into `frame_stats().ring_dropped_rows` until unbound). Styling, pane
+moves, visibility, `histogram_updown_rule`, and a study's own `max_points` still apply; a bound
+candle refuses `max_points` because it follows the stream's retention. Feed the stream instead.
+
+Rust hosts get the same refusals from the ordinary write entries (`false`, `0`, `None`,
+`Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`), which also mean an unknown id or
+invalid data, so `ChartEngine::series_is_source_owned(id)` tells an engine-owned series apart, and
+`ChartEngine::apply_momentum_histogram_colors` returns `false` for the delta and volume studies.
+`FootprintError::SeriesOwned` is what `bind_trade_bar_series_to_stream` returns for a candlestick
+or bar that a resampler, synthetic bars, or a study (converted to a candle) already writes, and what
+`configure_footprint_series` returns for any series a stream, study, resampler, or synthetic bars
+write. `bind_trade_bar_series_to_stream` checks the series kind and `max_points` first, so a
+footprint or a scalar study gets `UnsupportedTradeBarSeries` or `InvalidAggregation` instead.
 
 **Live, corrections, and replay.** In-order prints update the forming bar in place and the first
 print at or after a bar boundary opens the next bar (`"tip"`); late or corrected prints rebuild the
@@ -700,17 +863,36 @@ chart.configure_resampled_series(hour, {
 `span: "day"` returns one boundary per trading date from its first open to its last close; with
 `interval_seconds: 86400` that is one daily bar per date, stamped at the session open, so US daily
 bars built from extended-hours minutes (04:00–20:00 Eastern) stay one bar per day across DST even
-though winter sessions run past UTC midnight. Every boundary carries the trading date as
-`session_id` (`YYYYMMDD`). Dates are strictly ascending and use `session_slot_times` placement
-(night sessions with a negative `session_start` included); at most 20 000 boundaries and 32
-resampled series per chart. Hosts may also pass their own `{ start_time, end_time, session_id }`
+though winter sessions run past UTC midnight. Every boundary carries the requested date as
+`session_id` (`YYYYMMDD`): the trading date for a market whose sessions start on it, the evening
+date for a Sunday-open market (below). Dates are strictly ascending and use `session_slot_times`
+placement (night sessions with a negative `session_start` included); at most 20 000 boundaries and
+32 resampled series per chart. Hosts may also pass their own `{ start_time, end_time, session_id }`
 periods (for weeks or months, for example).
 
+`resample_boundaries` has its own `session_start`, default `0` and independent of the chart's, so
+China futures pass `-10800` explicitly. For a Sunday-open market (CME Globex) pass `session_start:
+0`, the evening dates, and `windows: [["17:00", "16:00"]]`; the `session_id` of each boundary is then
+the requested evening date (`20240107` for the session that opens Sunday 2024-01-07 and is Monday's
+trading day), or build the `{ start_time, end_time, session_id }` periods yourself. Never pass
+`-25200` with the Monday date: it places that session on Friday 17:00 to Saturday 16:00, so Sunday
+and Monday rows fall outside every boundary and are omitted.
+
+The window list applies to every date of a call. Hosts with a calendar call `resample_boundaries`
+once per window set and concatenate the arrays, which only need to be ordered and disjoint: night
+and day windows for normal dates, day windows only for a date whose night session does not trade,
+such as the first trading day after a break. With `span: "day"` the bar is stamped at the first
+window's open, so a shared night-plus-day list would stamp that date's daily bar on the night
+session that never traded.
+
 **Source rows.** Source rows must be stamped with bar-open times; rows outside every boundary are
-omitted, so shift close-stamped minutes (09:31 … 15:00) back by one interval first. A feed that also
-carries a separate opening-auction minute (241-bar feeds stamp it 09:30 beside the close-stamped
-09:31) must merge that row into the first minute before resampling: shifted, it falls before the
-first window and is omitted with its volume. Whitespace rows (`session_slot_times` reservations)
+omitted, so the host still converts provider close stamps (09:31 … 15:00) to open stamps by
+subtracting one interval before resampling. A feed that also carries a separate opening-auction
+minute (241-bar feeds stamp it 09:30 beside the close-stamped 09:31) must merge that row into the
+first minute before RESAMPLING: shifted, it falls before the first window and is omitted with its
+volume. A 241-bar feed that is drawn directly and not resampled may instead shift the auction row
+back too: it lands at 09:29, outside every window, and `bar_time_label` prints it 09:30 (see
+[Close-time labels](#close-time-labels)). Whitespace rows (`session_slot_times` reservations)
 reserve their bucket without prices: an untraded bucket is a whitespace bar, and the forming bucket
 closes at its last traded row. Resampling needs a time axis: it is rejected on a chart whose axis is
 a non-time bar sequence (trade-count, volume, or range streams, synthetic bars), and such a sequence
@@ -732,7 +914,10 @@ source) or output, and a binding's volume source may not be its own volume targe
 `invalid_options` ("resampling dependencies may not be chained or cyclic") and changes nothing.
 
 The targets are engine-owned: `set_data`, `update`, `update_typed`, `merge`, and `merge_typed` on
-them are rejected (`last_ingestion_diagnostics().status === "rejected"`) and change nothing.
+them are rejected (`last_ingestion_diagnostics()` reports `status: "rejected"` with
+`code: "derived_series"`) and change nothing, and `pop` records the same rejection. A target must
+not be a footprint, a trade-bound candle, a trade study, or a synthetic-bar series (`invalid_options`);
+a trade-bound candle or the trade volume study may be the binding's source, however.
 Removing any series of a binding (source, volume source, or a target) removes the binding together
 with its target series, like indicator outputs. `chart.resampled_bars(target)` returns the derived
 bars with their `session_id` and aggregated source-row count. Rust hosts call
@@ -740,6 +925,92 @@ bars with their `session_id` and aggregated source-row count. Rust hosts call
 ResampleOptions { interval_seconds, boundaries })` and
 `aeris_charts_engine::resample_boundaries(&days, &windows, chart.exchange_time(),
 ResampleSpan::Window)`.
+
+## Close-time labels
+
+Every bar is stamped with its OPEN time, the canonical Aeris bar time, and keeps that stamp as its
+identity: rows, series data, crosshair events, snapshots, the countdown, replay, sessions, trading
+days, drawings, markers, alerts, resampling, and every time a host passes in or reads back are
+open-stamped. An A-share minute chart therefore holds 09:30 … 14:59. A user who reads bars by the
+time they close expects 09:31 … 15:00. `time_scale_options.bar_time_label` (declaratively
+`timeScale.barTimeLabel`, also accepted by worker charts) changes only the TEXT the chart prints for
+a bar:
+
+```ts
+chart.time_scale().apply_options({
+  time_zone: "Asia/Shanghai", time_visible: true,
+  bar_time_label: {
+    anchor: "close", interval_seconds: 60,
+    windows: [["09:30", "11:30"], ["13:00", "15:00"]],   // optional, exchange-local
+  },
+});
+```
+
+The default `"open"` changes nothing. With `{ anchor: "close", … }` the printed time of a bar is its
+open plus `interval_seconds` (1 to 86 399), or the end of the session window that contains its open
+when the bar is that window's short last bar. Set `"open"` to restore the open text. `time_scale().options().bar_time_label` reports `"open"` or `{ anchor,
+interval_seconds, windows }`. An invalid label (an interval outside 1..86 399, more than 32,
+unordered, or zero-length windows for the chart's `session_start`, unknown keys) throws
+`invalid_options` and changes nothing; the label is validated together with `time_zone`,
+`session_start`, and `tick_marks` of the same call, against the session start that call installs.
+
+**What prints the label.** The crosshair time label, automatic tick labels, the default text of
+explicit `tick_marks`, drawing axis tags, drawing statistics (`date_time_range`) and the forecast
+target time, the delta tooltip's time line, `create_tooltip`, and accessibility text. The host
+`tick_mark_formatter` and `localization.time_formatter` receive the label instant. Hour and minute
+tick weights follow the printed time, so the "10:00" tick sits on the bar that closes on the hour
+(the bar opened 09:59) and never on the bar opened 10:00; Day, Month, and Year weights and every
+trading-day reset keep following the bar's own trading day, so the last bar of a window that ends
+at midnight prints 00:00 of the next date and still belongs to its own trading day. Worker charts
+print the label on every engine-drawn surface; the package-owned tooltip and accessibility text are
+main-thread surfaces. Labels are ordinary text: nothing in the frame contract, the draw list, or any
+backend changes.
+
+**What stays open-stamped.** All times in and out: `series_data`, `bars_in_logical_range`,
+crosshair and click events, series snapshots, `coordinate_to_time`, visible ranges, the crosshair
+sync position, markers, executions, alerts, drawing anchors, `tick_marks[].time`, the countdown,
+the replay clock, session highlighting, and resampling. A host whose provider stamps bars by close
+still converts them to open stamps on the way in (subtract one interval) and reads open stamps on the
+way out. Native vertical-line labels keep their host text. The `time_formatter` of the
+accessibility options receives the host's own data time, not the label. An explicit tick mark
+names its bar by identity: to label the bar opened 11:29 (printing 11:30) pass `11:29`; a mark at
+the label-only instant 11:30 matches no bar and draws nothing.
+
+**One interval per chart.** `interval_seconds` is the chart's primary bar interval. A resampled
+target and its source share one time axis, so a one-minute source with an hourly target cannot be
+labelled per series: pick the interval of the bars the user reads, and update the option in the same
+step as the timeframe switch (until then the labels use the old interval).
+
+**Windows and short last bars.** `windows` are exchange-local `["HH:MM", "HH:MM"]` pairs placed in
+the chart's `time_zone` and `session_start` exactly like `session_slot_times` (at most 32; an end at
+or before its start crosses midnight, `"24:00"` ends at midnight). They end a window's last bar
+exactly: a US hourly session 09:30–16:00 has a short 15:30 bar that prints 16:00 on both sides of a
+DST change, and an HK morning window 09:30–12:00 prints 12:00 for its 11:30 bar. Without windows a
+short last bar prints its open plus the interval (16:30). A bar whose open lies in no window prints
+its open plus the interval as well, which is how a host-fed 241-bar feed that shifts the auction row
+back one interval (09:29) prints 09:30, 09:31 … 15:00 with no engine-built auction bar. The windows
+and the `session_start` must fit each other: while a label with windows is installed, a
+`session_start` (through `apply_options`, `timeScale.sessionStart`, a V2 import, or
+`set_session_start_seconds`) that the windows cannot be placed on throws `invalid_options`
+(`ExchangeTimeError::BarTimeLabelWindows` in Rust) and changes nothing, so a saved document always
+imports again. To move both, send them in one `apply_options` call (the label is checked against the
+start of that call) or set the label to `"open"` first. A `time_zone` change never conflicts with the
+windows; only an instant whose windows a DST transition collapses prints open plus the interval.
+How 同花顺 and 富途 label a short last hourly bar could not be verified (no live terminal was
+available), so compare the printed window end with your reference terminal before relying on it.
+
+**Where it does not apply.** Calendar-date axes and non-time bar sequences (trade-count, volume,
+and range streams, synthetic bars) print their own times and ignore the option. Interval bars do not
+grow a separate 241st auction bar: engine-built candles fold the 09:25 auction print into the first
+bar, as tick-built candles already do, and the 241 points of a time-sharing LINE remain a property
+of close-stamped instant slots (`session_slot_times` with `"bar_close_with_open"`).
+
+The label lives in the options store, so V2 persistence carries it while it is not `"open"`;
+importing a document without the key keeps the installed label (a document whose `sessionStart` the
+installed windows do not fit is rejected whole), and a default chart's document is unchanged. Rust
+hosts call `ChartEngine::set_bar_time_label(BarTimeLabel::Close { interval_seconds, windows })`,
+`bar_time_label()`, and `bar_label_time(open_time)` (the instant a bar prints); the engine JSON
+option is `timeScale.barTimeLabel`, and the WASM export `bar_label_time(seconds)`.
 
 ## Experimental surfaces
 
@@ -780,8 +1051,7 @@ codes: `disposed`, `invalid_handle`, `stale_handle`, `invalid_data`, `invalid_op
 
 The browser package is `@aeristerminal/aeris-charts` (with `@aeristerminal/aeris-charts/react`). The former branded error
 exports were renamed to `AerisChartsError` and `AerisChartsErrorCode`; update imports and
-`instanceof` checks when migrating. Rust consumers use the `aeris_charts_*` crates listed in
-`Crates.md`.
+`instanceof` checks when migrating. Rust consumers use the repository-only `aeris_charts_*` crates.
 
 Every former brand-bearing public identifier was hard renamed:
 
@@ -826,10 +1096,13 @@ Streaming ingestion keeps reference `series.update` semantics: a point replaces 
 time. `update()` reports the payloads that silently rewrite a bar with a machine-readable
 diagnostics `code` pointing to `merge()`: `value_on_ohlc_series` (`{ time, value }` flattens a
 candlestick/bar), `price_less_payload` (for example `{ time, volume }` becomes whitespace), and the
-rejected `partial_ohlc`. `series.merge(point, options?)` is the engine-owned partial path: present
-open/high/low/close/value fields overwrite, absent fields keep the existing bar, and candlestick/bar
-results are normalized so `high >= max(open, close)` and `low <= min(open, close)` (a close-only tick
-for a new time creates O=H=L=C; scalar series take `value`). A merge without a price field is
+rejected `partial_ohlc`. A write to an engine-owned series (a trade-bound candle or study,
+resampled or synthetic bars) is rejected with `derived_series` on every data path; a footprint
+handle throws `unsupported_operation` instead. `series.merge(point, options?)` is the engine-owned
+partial path: present open/high/low/close/value fields overwrite, absent fields keep the existing
+bar, and candlestick/bar results are normalized so `high >= max(open, close)` and
+`low <= min(open, close)` (a close-only tick for a new time creates O=H=L=C; scalar series take
+`value`). A merge without a price field is
 rejected with `empty_merge`; volume and turnover merge into their own series. `series.merge_typed(columns,
 options?)` is the columnar form: row `i` merges like `merge()` with `NaN` entries and omitted columns
 absent, rows apply in input order with one engine synchronization, and one invalid row rejects the
@@ -872,7 +1145,8 @@ a text edit) advances the sync revision, so an already synced cell accepts the n
 Clipboard payloads are bounded like a persisted drawing document (at most 10,000 drawings, 250,000
 anchors, and 8 MiB): `copy_drawings` throws `resource_limit` past them and `invalid_data` when no
 listed drawing exists, and `clone_drawing` copies any drawing the chart holds. Named templates
-(`drawing_template`, `apply_drawing_template`) carry style only: never a drawing's name, group,
+(`drawing_template`, `apply_drawing_template`) carry style only (plus a position tool's
+`position_account_size` and `position_risk_percent`): never a drawing's name, group,
 revision, visibility, lock, z-order, interval visibility, price scale, or text, so applying one
 restyles the target and keeps its identity and its own text.
 
@@ -892,16 +1166,47 @@ handle by the nudge distance. `drawing_handle_count()` counts them. A nudge that
 locked drawing, an axis the drawing cannot move along, a clamp at the pane edge) records no undo
 step and is announced as such, so Escape rolls back only the nudges that moved the drawing.
 
-A drawing's own text is edited in place in the chart's inline editor: the text tool, a trend line's
-label, and the text boxes of the Projection & Annotations tools listed below. A double-click on a
-selected drawing, or Enter or F2 while the chart has focus and the drawing is selected (F2 on its
-accessibility drawing target, where Enter keeps geometry editing), opens the editor; locked,
-hidden, and interval-hidden drawings do not open it. Typing repaints live, Enter or leaving the
-editor commits, and Escape restores the text. The whole edit is one undo step and reaches
-`drawing_sync_payload` once, on commit. Family text boxes take several lines (Shift+Enter adds one,
-paste inserts plain text); the text tool and trend labels stay single-line. The editor is a
-labeled text box that announces opening and closing through the accessibility live region and
-returns focus to where it was opened from.
+A drawing's own text is edited in place in the chart's inline editor, for every drawing that paints
+it: the text tool, a trend line's label, the text of every line, channel, Fibonacci, pitchfork,
+pattern, and shape tool (one line, rotated along the stroke when the label follows a segment), and
+the text boxes of the Projection & Annotations tools listed below (several lines). Level, point,
+and wave labels, ratios, and stats are engine-formatted text and stay options-only. Eight tools
+accept `text` but never paint or edit it: `forecast`, `bars_pattern`, `price_range`, `date_range`,
+`date_and_price_range`, `projection`, `flag_mark`, and `icon`. A double-click on a selected
+drawing, or on the text of an unselected one (its first click selects it), or Enter or F2 while
+the chart has focus and the drawing is selected (F2 on its accessibility drawing target, where
+Enter keeps geometry editing), opens the editor; locked, hidden, and interval-hidden drawings do
+not open it, nor does a drawing whose text lies wholly outside its pane's plot (the engine applies
+this on every host and path: double-click, Enter, F2, placement, and a direct begin). The engine
+decides which text is edited and where it sits, so an unselected drawing with no text has no label to
+double-click: select it and double-click it, press Enter or F2, or use its options to add the first
+label (only a trend line prompts `+ Add text` on hover). An unselected drawing's text answers hover
+with the text cursor and a click with a selection, unless a higher drawing or the selected
+drawing's anchor handle is at that point.
+Typing repaints live, Enter or leaving the editor commits, and Escape restores the text. The whole
+edit is one undo step and reaches `drawing_sync_payload` once, on commit. Text is bounded by
+`MAX_DRAWING_TEXT_BYTES` (65,536 bytes: longer `text` in options is rejected without applying
+the rest of the patch, and typing stops at the bound); the text tool, trend labels, and every
+other run label stay on one line (line breaks become one space), while family text boxes take
+several lines (Shift+Enter adds one, paste inserts plain text). The editor is a labeled text box
+that announces opening and closing through the accessibility live region and returns focus to
+where it was opened from. Placing the text tool, `anchored_text`, `note`, `callout`, `comment`, or
+`signpost` opens the editor at once with the caret after the default text; committing or Escape
+keeps the drawing, even emptied (only the text tool removes itself when left empty). Placing a
+`price_note`, `price_label`, or arrow mark, which start with no text of their own, opens nothing.
+
+A double-click acts on the selected drawing only where a click would select it: on its text, its
+body, or one of its handles. A pair whose first click landed on a trading object or the alert
+widget acts on no drawing, and neither does a double-click elsewhere while a drawing stays
+selected.
+
+Host `dbl_click` subscribers still run after a double-click opened the editor. A host that binds
+double-click to its own settings panel therefore sees both: the editor is open when the handler
+runs, and calling `focus()` on a panel control closes it (the editor commits its text unchanged,
+which records no undo step and no sync revision) and leaves focus on that control, so the drawing
+is exactly as it was. A click on a host control while an editor is open closes it the same way and
+leaves focus on that control; only Enter and Escape return focus to where the editor opened from
+inside the chart.
 
 A drawing's dashed or dotted `style` paints the same dashes on WebGPU, Canvas2D, GPUI, and native
 rendering, and so does a general series' `line_style`: the engine splits those strokes into dash
@@ -958,7 +1263,7 @@ descriptors name those options with dotted paths such as `tool_options.line.stat
   the pane edge in the line's own direction; a ray defaults to `extend_right`, an extended line to
   both. End caps (`stroke_start`, `stroke_end`) paint only on ends that are not extended; the arrow
   line defaults `stroke_end` to `"arrow"`. The `text` label follows the segment like a trend
-  line's; inline hover editing remains a trend-line feature.
+  line's and edits in place the same way; only a trend line prompts `+ Add text` on hover.
 - Visible `labels` render as one stats box: price, price change, percent change, and ticks on one
   line; bar count, time range, and duration on the next; screen angle and CSS-px distance last.
   Values use the drawing scale's price formatter and the anchors' time identity. `info_line`
@@ -1137,7 +1442,8 @@ Defaults follow the conventional professional-platform look: the drawing `color`
 primary unless noted) paints markers, leaders, and box backgrounds; box text is `text_color` or
 black/white contrast against the box; `box_border_color` frames annotation boxes; text uses the
 chart font size unless `text_size` is set. Every tool owns its `text` (it does not follow the
-3×3 box label of other tools) and renders any visible `labels` as engine-formatted stats.
+3×3 box label of other tools) and renders any visible `labels` as engine-formatted stats. Eight of
+the tools paint no text: their `text` is accepted and kept, never shown or edited in place.
 
 - `forecast` (source, target): a segment with end caps from `stroke_start`/`stroke_end`, a source
   dot and a source-price box on the far side, and a target box with the change and percent, the
@@ -1168,7 +1474,12 @@ chart font size unless `text_size` is set. Every tool owns its `text` (it does n
   (`fill_enabled` defaults on; `fill_color` or the drawing color at 20%), the edge lines of the
   measured axis, arrowed measures through the middle toward the second anchor (`stroke_end`
   defaults to `"arrow"`), and a stats box beyond the measured end (below a date range). Default
-  `labels`: price change, percent change, and ticks; bar count and duration; or all five.
+  `labels`: price change, percent change, and ticks; bar count and duration; or all five. Anchors
+  snap to whole bars and price ticks (also while dragging, nudging with the keyboard, or moving the
+  body); ticks count on the instrument tick or price-band ladder, falling back to the scale's
+  `min_move`. `"date_price_range"`, the spelling of earlier builds, is read as
+  `"date_and_price_range"` and never written. The Shift-click quick measure draws a transient
+  date-and-price range.
 - `projection` (apex, radius point, price point): the circular sector around the apex from
   the ray through the radius point to the ray through the price point (the shorter turn), filled
   (`fill_enabled` defaults on) and outlined. Visible `labels` measure from the apex to the price
@@ -1206,7 +1517,8 @@ chart font size unless `text_size` is set. Every tool owns its `text` (it does n
 - The text of `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
   `signpost`, and the arrow marks edits in place (see inline text editing above); the price note
   and price label keep their price line above it. An emptied box keeps one caret line while it is
-  edited. Placing one of these tools does not open the editor.
+  edited. Placing `anchored_text`, `note`, `callout`, `comment`, or `signpost` opens the editor on
+  the default text; placing `price_note`, `price_label`, or an arrow mark does not.
 - `drawing_kind_options()` returns `{ kind: "projection_annotation", bars_mode, mirrored, flipped,
   pattern_bars, icon, icon_size, always_show_text }` for every tool of the family.
 <!-- B8: projection_annotations — end -->
@@ -1278,7 +1590,12 @@ overrides their contrasting default); they are body targets.
   removes the latest vertex, Escape cancels. Once three vertices are placed, clicking the first
   vertex again finishes the polyline closed (the preview snaps shut while the pointer is over it).
   `tool_options.shape.closed` (default `false`) joins the last vertex to the first and fills the
-  enclosed region by the nonzero rule.
+  enclosed region by the nonzero rule. The fill is bounded work: a closed polyline of more than
+  2,048 vertices, or one so heavily self-intersecting that its fill exceeds the tessellation
+  bounds, paints its outline only, with no fill and no interior selection target (its stroke still
+  selects it). This is not an error, every vertex is kept, and it is identical on every backend; a
+  region that follows thousands of bars of chart data belongs in a series rather than in a
+  drawing polyline.
 - `highlighter` is a freehand drag like `brush`: a 20 px marker stroke in 40% amber with round
   ends. It keeps one opacity where it overlaps itself on every backend, and ignores `style`, end
   caps, and fill.
@@ -1368,20 +1685,118 @@ support follows the separately documented persistence window and is a major comp
 
 ## Rust distribution
 
-The Rust crates are prepared as one coordinated release family. Version `0.3.0`
-publishes `aeris_charts_core`, `aeris_charts_indicators`, `aeris_charts_render`,
-`aeris_charts_engine`, `aeris_charts_render_wgpu`, `aeris_charts_native`, and
-`aeris_charts_wasm`. Workspace manifests retain local path dependencies with the same explicit
-version, so repository builds exercise the same dependency boundaries used by registry consumers.
+The Rust crates are repository-only (`publish = false`); nothing is published to crates.io, and the
+browser package is the only published artifact. Hosts such as Aeris Terminal consume the
+`aeris_charts_*` crates through pinned Git revisions or local paths. The Rust API is below 1.0 and
+may change in any revision, so a host reviews the notes below when it moves its pin.
 
-The Rust API is below 1.0 and may evolve between minor releases. Patch releases preserve the public
-API within their minor line except where a correctness or security repair cannot do so safely; minor
-releases may add, change, or remove pre-1.0 Rust APIs. All published Aeris crates in one release use
-the same version, and consumers should keep direct Aeris dependencies aligned.
+`aeris_charts_render_gpui` is experimental because it tracks a reviewed Zed Git revision whose API
+differs from the crates.io `gpui` release. Exact Git revisions are required for that backend;
+floating Git dependencies are unsupported.
 
-`aeris_charts_render_gpui` remains repository-only and experimental because it tracks a reviewed
-Zed Git revision whose API differs from the crates.io `gpui` release. Exact Git revisions are
-required for that backend; floating Git dependencies are unsupported.
+### Moving the pinned revision
+
+These notes list the host-visible changes a pinned-revision move carries, so call sites can be
+reviewed once. Each group names the revision-level change and the call sites it affects.
+
+**Sub-pane coordinates** (see [Coordinates and panes](#coordinates-and-panes)). Three behaviours
+changed:
+
+- The chart-level `price_to_coordinate` and `coordinate_to_price` no longer follow the first visible
+  series in creation order. The price converts on pane 0's default scale and the coordinate on the
+  default scale of the pane containing `y`, so a call that relied on an overlay-first or hidden main
+  series must use that series' own handle instead. Single-pane charts whose main series is created
+  first are unchanged, and series-handle conversions never changed.
+- Linked crosshairs on a lower pane (`pane_index` of 1 or more) now round-trip. Earlier revisions
+  applied the pane offset twice and read the wrong scale, so `crosshair_sync_position` and
+  `apply_external_crosshair` disagreed on any pane but the first. A synced price is now a price on
+  the pane's default scale, and an off-range price holds the line inside its pane.
+- `ChartEngine::pane_index_at_y` (and the browser package's `pane_index_at_y`) now returns the pane
+  above for a separator and pane 0 for a `y` above the content, where both used to resolve to the
+  last pane. GPUI hosts that pick a pane for price-axis hit-testing pick up the corrected mapping.
+
+**Trade-stream-derived series** (see [Ticks to candles](#ticks-to-candles)). Two reviews, and the
+first cannot be checked from this repository:
+
+- Terminal must not write to a candle bound with `bind_trade_bar_series_to_stream` or to a CVD,
+  delta, or trade-volume series (`add_cvd_series`, `add_delta_series`, `add_trade_volume_series`).
+  Every host data write to them is now refused like a footprint's (`false`, `0`, `None`,
+  `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`; `series_is_source_owned(id)` tells
+  the refusal from an unknown id), and `apply_momentum_histogram_colors` returns `false` for the
+  delta and volume studies. The browser package rejects them with `code: "derived_series"`.
+- `FootprintError` gains the `SeriesOwned(SeriesId)` variant, so an exhaustive `match` on it needs
+  an arm. `bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler,
+  synthetic bars, or a study converted to a candle already writes (a footprint or scalar study still
+  gets `UnsupportedTradeBarSeries`, because the candle-kind check runs first), and
+  `configure_footprint_series` returns it for a series a stream, study, resampler, or synthetic bars
+  write. Resampling targets and synthetic-bar series refuse a trade-bound candle
+  (`ResampleError::UnsupportedTarget`, `SyntheticBarError::UnsupportedSeries`).
+
+**Batched period-reset study lines.** This is a compile-time break for Rust code that matches
+`aeris_charts_render::draw_list::Prim` exhaustively (a custom executor, a frame inspector, a
+point-pool rebase):
+
+- `Prim` gains `Segments { first_point, segment_count, width, color }`, a batch of `segment_count`
+  independent two-point strokes over `points[first_point .. first_point + 2 * segment_count]`, each
+  stroked like a solid simple two-point `Polyline` (dashes already expanded into one pair per dash).
+  The engine emits it in place of one two-point `Polyline` per bar for session VWAP, VWAP bands, and
+  pivot lines on bars of a day or longer, so a `_ => {}` arm that compiles silently stops drawing
+  those studies. Take the pair window from `draw_list::segment_points` (a range outside the pool is
+  a dropped prim), and move `first_point` with every other pool index when rebasing a layer. The
+  Canvas2D, WebGPU, GPUI, and native executors in this repository already handle it. Because hosts
+  take the change by moving their pin, it is breaking for exhaustive matchers.
+
+**Named time zones** (see [Time, exchange time zone, and trading sessions](#time-exchange-time-zone-and-trading-sessions)).
+Four behaviours to review:
+
+- `ChartEngine::set_time_zone` takes an IANA id from `TRADINGVIEW_TIME_ZONES`
+  (`Result<bool, String>`; `Ok(false)` when it is already installed). The setter that takes a
+  `UtcOffsetSchedule` is `set_exchange_offsets`, so a call site written against a revision where
+  `set_time_zone` took a schedule must use the new name.
+- A named zone is resolved once into the explicit schedule, so tick weights, labels, VWAP and pivot
+  period keys, sessions, and the countdown follow it exactly like `set_exchange_offsets`. The name
+  also localizes the general temporal axes and `time_zone_clock_text`; an explicit schedule does
+  not, and `time_zone_id()` then returns `custom` instead of a TradingView id.
+- A top-level `timezone` option that is not a string, or names an id outside the parity list, now
+  rejects the whole options patch (earlier revisions ignored it silently). A host that forwards a
+  TradingView placeholder such as `exchange` must filter it before the patch. Importing a saved V2
+  document is the exception: an unresolvable or non-string `timezone` in its options (a raw value an
+  earlier build stored) is dropped so the rest of the layout still restores.
+- `time_scale_options_json()["time_zone"]` reports the exchange schedule (`"UTC"` or the transition
+  array), not the TradingView id an earlier revision printed there; read the named zone through
+  `time_zone_id()`.
+- A V2 document can carry an additive `timezone` string beside `timeScale.timeZone`, written only
+  while a named zone is installed. A consumer that takes `aeris_charts_core` by Git does not read
+  this repository's `.cargo/config.toml`, so it compiles the complete tz tables rather than the 98
+  parity zones the repository's artifacts keep.
+
+**Drawing text editing** (see [Drawing anchors, magnet, and price basis](#drawing-anchors-magnet-and-price-basis)).
+Three call-site reviews:
+
+- One engine session replaces the former pair of flags. `ChartEngine::set_editing_drawing` is gone;
+  `editing_drawing()` reads the open session. Open it with `begin_drawing_text_edit(id,
+  paint_caret)`; mirror a host's editable surface with `set_drawing_text_edit(text, caret)` and end it
+  with `commit_drawing_text_edit()` or `cancel_drawing_text_edit()` (native hosts use
+  `drawing_text_edit_insert`, `drawing_text_edit_key`, `drawing_text_edit_select_all`, and
+  `drawing_text_edit_caret_at`). Live text records no undo step; a commit records one.
+- `begin_drawing_text_edit` accepts every drawing that paints its own text, not only the text tool
+  and trend lines, and refuses (leaving an open session alone) a locked, hidden, interval-hidden, or
+  non-text drawing, or one whose anchors cannot convert yet. A chart that has not been laid out has
+  no price scale to convert them, so a host that begins a session before its first frame sees `false`.
+- Text is bounded by `MAX_DRAWING_TEXT_BYTES` (65,536 bytes) instead of 256: an insert that would
+  exceed it is refused whole, and a mirrored value is clamped at a character boundary. A run label
+  stays on one line; family text boxes (`comment`, `callout`, `note`, `signpost`, `anchored_text`)
+  keep line breaks. Native hosts get click-to-caret placement and typing in a box but not Up/Down
+  line navigation yet.
+- `drawing_text_hit_at` answers for the label of every tool that paints a text run (lines,
+  channels, Fibonacci, shapes), not only the trend line, and arbitrates against higher drawing bodies.
+  Which click starts typing is one rule for every host: the first click opens it only for the text
+  tool's two-step click and a trend label, and placing a tool that requests an editor opens it on
+  placement; a double-click on the selected drawing, Enter, or F2 opens the editor of every
+  text-bearing drawing. The browser gesture layer and the native input controller both apply it; a
+  host that drives the engine API directly applies it itself.
+- Rectangles now default to no border (`border_visible: false`). A saved document that omits the key
+  imports with the border visible, so earlier documents keep their look.
 
 ## Release policy
 

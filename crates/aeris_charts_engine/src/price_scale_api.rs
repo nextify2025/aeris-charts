@@ -4,6 +4,81 @@
 use super::*;
 
 impl ChartEngine {
+    /// Resolve the primary live series for one price scale. Series zero wins when attached;
+    /// otherwise the first visible attached series is returned.
+    #[must_use]
+    pub fn primary_series_on_price_scale(
+        &self,
+        pane: usize,
+        target: PriceScaleTarget,
+    ) -> Option<PriceScalePrimarySeries> {
+        let mut fallback = None;
+        for series in &self.series {
+            if series.removed || series.pane_index != pane || series.price_scale_target != target {
+                continue;
+            }
+            let snapshot = PriceScalePrimarySeries {
+                series_id: series.id,
+                price_line_visible: series.price_line_visible,
+                last_value_visible: series.last_value_visible,
+                title_visible: series.title_visible,
+                countdown_visible: series.countdown_visible,
+                bid_ask_visible: series.bid_ask_visible,
+            };
+            if series.id == 0 {
+                return Some(snapshot);
+            }
+            if series.visible && fallback.is_none() {
+                fallback = Some(snapshot);
+            }
+        }
+        fallback
+    }
+
+    /// Move every live series attached to one built-in price scale to another, carrying the
+    /// source scale options and retiring its axis when no series remain.
+    pub fn rebind_price_scale_series(
+        &mut self,
+        pane: usize,
+        from: PriceScaleTarget,
+        to: PriceScaleTarget,
+    ) -> bool {
+        if from == to
+            || !self
+                .panes
+                .get(pane)
+                .is_some_and(|entry| entry.scale(from).is_some() && entry.scale(to).is_some())
+        {
+            return false;
+        }
+        let ids = self
+            .series
+            .iter()
+            .filter(|series| {
+                !series.removed && series.pane_index == pane && series.price_scale_target == from
+            })
+            .map(|series| series.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return false;
+        }
+        let options = self.price_scale_options_json(pane, from);
+        for id in ids {
+            self.set_series_price_scale(id, to);
+        }
+        let _ = self.set_price_scale_visible_for(pane, to, true);
+        if let Some(options) = options {
+            let _ = self.price_scale_apply_options_json(pane, to, &options);
+        }
+        let from_still_used = self.series.iter().any(|series| {
+            !series.removed && series.pane_index == pane && series.price_scale_target == from
+        });
+        if !from_still_used {
+            let _ = self.set_price_scale_visible_for(pane, from, false);
+        }
+        true
+    }
+
     pub fn price_scale_axis_width(&self, pane: usize, target: PriceScaleTarget) -> Option<f64> {
         self.panes.get(pane)?.scale(target)?;
         if !self.price_scale_visible_for(pane, target) {
@@ -526,6 +601,29 @@ impl ChartEngine {
         if let Some(scale) = self.price_scale_for_mut(pane, target) {
             scale.set_mode(mode);
         }
+    }
+
+    /// Whether one live price scale aligns colliding labels.
+    pub fn price_scale_align_labels_for(
+        &self,
+        pane: usize,
+        target: PriceScaleTarget,
+    ) -> Option<bool> {
+        Some(self.price_scale_for(pane, target)?.options().align_labels)
+    }
+
+    /// Toggle label collision alignment for one live price scale.
+    pub fn toggle_price_scale_align_labels(
+        &mut self,
+        pane: usize,
+        target: PriceScaleTarget,
+    ) -> bool {
+        let Some(scale) = self.price_scale_for_mut(pane, target) else {
+            return false;
+        };
+        scale.set_align_labels(!scale.options().align_labels);
+        self.invalidate_frame_all();
+        true
     }
 
     pub fn set_series_price_scale(&mut self, id: SeriesId, target: PriceScaleTarget) {

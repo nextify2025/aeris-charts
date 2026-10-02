@@ -167,8 +167,9 @@ test("worker wheel routing matches the main-thread gesture router", async ({ pag
   const samples = [
     // Auto mode: vertical wheel over the price axis zooms time, not price.
     { x: 628, y: 150, delta_x: 0, delta_y: -120, delta_mode: 0 },
-    // Auto mode ignores Ctrl and Shift.
+    // Ctrl and Cmd zoom around the pointer; a plain wheel pins the right edge; Shift is neutral.
     { x: 200, y: 150, delta_x: 0, delta_y: -120, delta_mode: 0, ctrl_key: true },
+    { x: 260, y: 150, delta_x: 0, delta_y: 120, delta_mode: 0, meta_key: true },
     { x: 300, y: 150, delta_x: 0, delta_y: 120, delta_mode: 0, shift_key: true },
     { x: 320, y: 150, delta_x: 80, delta_y: 0, delta_mode: 0 },
     { x: 420, y: 150, delta_x: 0, delta_y: -3, delta_mode: 1 },
@@ -186,6 +187,7 @@ test("worker wheel routing matches the main-thread gesture router", async ({ pag
         deltaMode: sample.delta_mode,
         ctrlKey: sample.ctrl_key === true,
         shiftKey: sample.shift_key === true,
+        metaKey: sample.meta_key === true,
         clientX: rect.left + sample.x,
         clientY: rect.top + sample.y,
         bubbles: true,
@@ -317,6 +319,61 @@ test("worker charts accept declarative explicit time-axis marks", async ({ page 
     options: { timeScale: { tickMarks: null } },
   });
   expect(cleared.tick_marks).toBeNull();
+});
+
+test("worker charts accept a declarative bar time label and paint the close on the axis", async ({ page }) => {
+  test.setTimeout(120_000);
+  await create_worker_chart(page, "canvas2d");
+  const probe = 1_704_159_000; // the worker fixture stamps minute bars 60 s apart
+  // Crosshair text of the frame the worker's own engine paints: the date and the wall-clock time.
+  const crosshair_minutes = async () => {
+    const { texts } = await send(page, { type: "axis_texts", x: 320, y: 120 });
+    const label = texts.find((text) => /^\d\d \w{3} '\d\d\s+\d\d:\d\d$/.test(text));
+    expect(label, `crosshair text among ${JSON.stringify(texts)}`).toBeDefined();
+    const [hours, minutes] = label.slice(-5).split(":").map(Number);
+    return hours * 60 + minutes;
+  };
+  const shown = await send(page, { type: "time_zone", probe, options: { timeScale: { timeVisible: true } } });
+  expect(shown.bar_time_label).toBe("open");
+  expect(shown.printed).toBe(probe);
+  const open_minute = await crosshair_minutes();
+
+  // A label-only patch (no zone, session start, or marks) must reach the engine.
+  const closed = await send(page, {
+    type: "time_zone",
+    probe,
+    options: { timeScale: { barTimeLabel: { anchor: "close", interval_seconds: 60 } } },
+  });
+  expect(closed.bar_time_label).toMatchObject({ anchor: "close", interval_seconds: 60, windows: [] });
+  expect(closed.printed).toBe(probe + 60);
+  expect((await crosshair_minutes() - open_minute + 1_440) % 1_440).toBe(1);
+
+  // An invalid label rejects the whole patch and keeps the installed one.
+  const rejected = await send(page, {
+    type: "time_zone",
+    options: { timeScale: { barTimeLabel: { anchor: "close", interval_seconds: 0 }, timeVisible: false } },
+  });
+  expect(rejected).toMatchObject({ type: "time_zone_error", code: "invalid_options" });
+  const unchanged = await send(page, { type: "time_zone", probe });
+  expect(unchanged.bar_time_label).toMatchObject({ anchor: "close", interval_seconds: 60 });
+
+  // Windows validate together with the zone and session start of the same patch.
+  const windowed = await send(page, {
+    type: "time_zone",
+    probe,
+    options: {
+      timeScale: {
+        timeZone: "Asia/Shanghai",
+        barTimeLabel: { anchor: "close", interval_seconds: 3_600, windows: [["09:30", "11:30"], ["13:00", "15:00"]] },
+      },
+    },
+  });
+  expect(windowed.bar_time_label.windows).toEqual([["09:30", "11:30"], ["13:00", "15:00"]]);
+  const opened = await send(page, { type: "time_zone", probe, options: { timeScale: { barTimeLabel: "open" } } });
+  expect(opened.bar_time_label).toBe("open");
+  expect(opened.printed).toBe(probe);
+  // Back to the open text, now in Shanghai time: the same bar, eight hours later on the clock.
+  expect(await crosshair_minutes()).toBe((open_minute + 480) % 1_440);
 });
 
 test("OffscreenCanvas typed streaming honors the sequence guard and merges partial columns", async ({ page }) => {

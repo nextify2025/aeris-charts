@@ -247,13 +247,15 @@ const TOOL: DrawingToolSpec = DrawingToolSpec {
     price_extent: DrawingPriceExtent::Finite,
     bounds_padding_ratio: 0.0,
     default_width: 1.0,
-    // Placement never opens the editor (every text tool starts from its default text);
-    // double-click, Enter, or F2 on a selected text box edits it in place through the label
-    // its parts mark with `DrawingParts::text_label`.
+    // Placement opens the editor only for the tools that start from a default text the user
+    // will replace or extend (see the overrides below); double-click, Enter, or F2 on a selected
+    // text box edits it in place through the label its parts mark with
+    // `DrawingParts::text_label`.
     requests_text_editor: false,
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 /// One-anchor annotation behavior.
@@ -281,6 +283,8 @@ pub(crate) const PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::PriceRange,
     wire_id: 130,
     name: "price_range",
+    // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
+    grid_snap: true,
     ..TOOL
 };
 
@@ -288,6 +292,8 @@ pub(crate) const DATE_RANGE: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::DateRange,
     wire_id: 131,
     name: "date_range",
+    // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
+    grid_snap: true,
     ..TOOL
 };
 
@@ -295,6 +301,8 @@ pub(crate) const DATE_AND_PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::DateAndPriceRange,
     wire_id: 132,
     name: "date_and_price_range",
+    // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
+    grid_snap: true,
     ..TOOL
 };
 
@@ -317,6 +325,7 @@ pub(crate) const ANCHORED_TEXT: DrawingToolSpec = DrawingToolSpec {
     name: "anchored_text",
     logical_extent: DrawingLogicalExtent::Full,
     price_extent: DrawingPriceExtent::Full,
+    requests_text_editor: true,
     ..MARK
 };
 
@@ -324,6 +333,7 @@ pub(crate) const NOTE: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Note,
     wire_id: 135,
     name: "note",
+    requests_text_editor: true,
     ..MARK
 };
 
@@ -339,6 +349,7 @@ pub(crate) const CALLOUT: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Callout,
     wire_id: 137,
     name: "callout",
+    requests_text_editor: true,
     ..TOOL
 };
 
@@ -346,6 +357,7 @@ pub(crate) const COMMENT: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Comment,
     wire_id: 138,
     name: "comment",
+    requests_text_editor: true,
     ..MARK
 };
 
@@ -360,6 +372,7 @@ pub(crate) const SIGNPOST: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Signpost,
     wire_id: 140,
     name: "signpost",
+    requests_text_editor: true,
     ..MARK
 };
 
@@ -1161,14 +1174,8 @@ fn range(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
             true,
         );
     }
-    let price = matches!(
-        drawing.kind,
-        DrawingKind::PriceRange | DrawingKind::DateAndPriceRange
-    );
-    let time = matches!(
-        drawing.kind,
-        DrawingKind::DateRange | DrawingKind::DateAndPriceRange
-    );
+    let (price, time) = crate::drawings::MeasureAxes::for_kind(drawing.kind)
+        .map_or((false, false), |axes| (axes.price(), axes.date()));
     if drawing.kind == DrawingKind::PriceRange {
         parts.hline(a.1, left, right, PartStroke::default());
         parts.hline(b.1, left, right, PartStroke::default());
@@ -1178,22 +1185,10 @@ fn range(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         parts.vline(b.0, top, bottom, PartStroke::default());
     }
     if price {
-        parts.capped_segment(
-            drawing,
-            (middle_x, a.1),
-            (middle_x, b.1),
-            (true, true),
-            ctx.scale,
-        );
+        range_arrow(ctx, parts, true, middle_x, a.1, b.1);
     }
     if time {
-        parts.capped_segment(
-            drawing,
-            (a.0, middle_y),
-            (b.0, middle_y),
-            (true, true),
-            ctx.scale,
-        );
+        range_arrow(ctx, parts, false, middle_y, a.0, b.0);
     }
     if !drawing.labels.iter().any(|label| label.visible) {
         return;
@@ -1222,6 +1217,62 @@ fn range(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         lines,
         with_alpha(drawing.stroke_color(), STATS_ALPHA),
     ));
+}
+
+/// One measured axis' arrow from `from` to `to` (coordinates along the axis) through `middle` (the
+/// area's center line across it): a crisp device-pixel shaft like the rules, ended by the drawing's
+/// own caps. Shaft and rules are whole device pixels on every executor, so the lines of a measured
+/// area paint identically on WebGPU and Canvas2D; the translucent fill is not snapped, so its own
+/// edges may anti-alias by up to half a device pixel off the rules. The caps' apexes sit on the
+/// shaft's pixel center. An arrow-capped end trims the shaft back by one stroke width (as
+/// [`DrawingParts::capped_polyline`] does), and an arrow whose ends share a pixel paints nothing.
+fn range_arrow(
+    ctx: &PartContext<'_>,
+    parts: &mut DrawingParts,
+    vertical: bool,
+    middle: f64,
+    from: f64,
+    to: f64,
+) {
+    let drawing = ctx.drawing;
+    let width = (drawing.width * ctx.scale).round().max(1.0);
+    // A crisp line at integer coordinate `v` covers `[v - width / 2, v - width / 2 + width)`.
+    let center = |v: f64| v - (width / 2.0).floor() + width / 2.0;
+    let (from_px, to_px) = (from.round(), to.round());
+    if from_px == to_px {
+        return;
+    }
+    let lane = middle.round();
+    let trims = |cap: crate::DrawingLineCap| {
+        if cap == crate::DrawingLineCap::Arrow && (to_px - from_px).abs() > width * 2.0 {
+            width
+        } else {
+            0.0
+        }
+    };
+    let (start_trim, end_trim) = (trims(drawing.stroke_start), trims(drawing.stroke_end));
+    // The shaft covers both end pixels.
+    let (low, high) = if to_px > from_px {
+        (from_px + start_trim, to_px - end_trim + 1.0)
+    } else {
+        (to_px + end_trim, from_px - start_trim + 1.0)
+    };
+    if vertical {
+        parts.vline(lane, low, high, PartStroke::default());
+    } else {
+        parts.hline(lane, low, high, PartStroke::default());
+    }
+    let tip = |along: f64| {
+        if vertical {
+            (center(lane), center(along))
+        } else {
+            (center(along), center(lane))
+        }
+    };
+    let (start, end) = (tip(from_px), tip(to_px));
+    let cap_width = drawing.width * ctx.scale;
+    parts.line_cap(drawing.stroke_end, end, start, cap_width);
+    parts.line_cap(drawing.stroke_start, start, end, cap_width);
 }
 
 /// Projection: the circular sector around the apex from the ray through the radius point to

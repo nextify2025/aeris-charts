@@ -10,6 +10,7 @@ pub mod model;
 pub mod options;
 pub mod scale;
 pub mod style;
+pub mod time_zone;
 
 /// Media-space (CSS px) coordinate. Bitmap conversion happens at encode time only.
 pub type Coordinate = f64;

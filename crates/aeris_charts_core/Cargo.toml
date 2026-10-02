@@ -5,13 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
 publish.workspace = true
 description = "Platform-free chart data, scales, ranges, invalidation, and formatting for Aeris Charts"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10", features = ["filter-by-regex"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

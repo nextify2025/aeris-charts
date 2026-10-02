@@ -4,47 +4,45 @@
 //! independently seeded `Workspace` split cells, drawing creation, indicators, exact package
 //! themes, OHLC/click status, and host-side visual approximations of the web plugin fixtures. Those fixture
 //! toggles insert engine `Prim`s or use native engine APIs; they are explicitly not a JavaScript
-//! object bridge. With `AERIS_CHARTS_PROBE_FRAMES` set the source single-chart metrics/probe path is
-//! retained: responsive layout, native text measurement, axis/crosshair chrome, pan/zoom/scale,
-//! pane separators, drawing selection, fractional DPR, and live updates.
+//! object bridge. With `AERIS_CHARTS_PROBE_FRAMES` set a single chart paints N frames and exits
+//! silently (a smoke run of layout, native text measurement, and chrome). The demo data is static.
 //!
 //! ```text
-//! cargo run -p aeris_charts_render_gpui --features gpui-backend --example gpui_probe
+//! cargo run --release -p aeris_charts_render_gpui --features gpui-backend --example gpui_probe
 //! ```
+//!
+//! Judge interaction feel only in release: an unoptimized build spends roughly ten times longer
+//! per frame (GPUI layout and painting dominate), so pointer feedback lags visibly.
 //!
 //! Environment knobs:
 //! - `AERIS_CHARTS_PROBE_BARS` — synthetic bars to load (default 500).
-//! - `AERIS_CHARTS_PROBE_FRAMES` — quit after N painted frames and print a metrics summary. Unset runs
-//!   interactively until the window closes.
+//! - `AERIS_CHARTS_PROBE_FRAMES` — quit after N painted frames. Unset runs interactively until the
+//!   window closes. The demo never prints frame data.
 //! - `AERIS_CHARTS_PROBE_FEATURE=footprint` — finite probes start in the deterministic detailed-LOD
 //!   footprint fixture instead of the default candlestick fixture.
 
-use std::{
-    collections::HashMap,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_engine::{
-    crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, BrushRange, BrushStyle,
-    ChartEngine, ChartFrame, DeltaTooltipActiveRange, DeltaTooltipOptions, DrawingKind,
-    DrawingModifiers, DrawingPoint, FootprintAggregationOptions, FootprintBarAggregation,
-    FootprintImbalanceOptions, FootprintSeriesOptions, FootprintTrade, GestureResolver,
-    GestureUpdateKind, InputDevice, InputModifiers, InputTarget, Marker, NativePrimitiveId,
-    PointerSample, PriceLineExtent, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
-    SplitDirection, WheelBehavior, WheelDeltaMode, WheelIntent, WheelSample, Workspace,
-    WorkspaceLayout,
+    crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, ChartEngine, ChartFrame,
+    ChartInputEvent, DeltaTooltipOptions, DrawingKind, DrawingPoint, FootprintAggregationOptions,
+    FootprintBarAggregation, FootprintImbalanceOptions, FootprintSeriesOptions, FootprintTrade,
+    Marker, PriceLineExtent, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
+    SplitDirection, TradeStudyOptions, Workspace, WorkspaceLayout,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, LineStyle, Prim, TextAlign};
 use aeris_charts_render_gpui::{
-    backend::measure_text, AerisViewport, GpuiChartRenderer, GpuiFrameMetrics, PreparedAerisFrame,
+    backend::measure_text,
+    input::{cursor_style, install_text_metrics, GpuiChartInput},
+    AerisViewport, GpuiChartRenderer, GpuiFrameMetrics, PreparedAerisFrame,
 };
 use gpui::{
     canvas, div, prelude::*, px, relative, rgb, size, AnyElement, App, Bounds, Context,
     CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Subscription, Window, WindowBounds, WindowOptions,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Render, ScrollHandle,
+    ScrollWheelEvent, Subscription, Task, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -207,7 +205,7 @@ fn shell_rgb(css: &str, fallback: u32) -> u32 {
 const TOOLBAR_FEATURE_MANIFEST: &[&str] = &[
     "series:candlestick,bar,line,area,brushable-area,footprint,histogram,baseline",
     "style:candle-body,wick-colors,border-colors,wick-visible,border-visible,reset-parts,line-color,line-width,area-fill",
-    "overlay:sma20,volume,rsi14",
+    "overlay:sma20,volume,volume-profile,rsi14,cvd",
     "workspace:split-horizontal,split-vertical,shortcuts,maximize,restore,close,cap,usage,active,resize",
     "drawing:trend,h-line,h-ray,v-line,rect,text,path,brush,clear,color,style,width,label,text-color,size,weight,italic",
     "crosshair:mode,color,width,style,label-background,labels",
@@ -218,6 +216,13 @@ const TOOLBAR_FEATURE_MANIFEST: &[&str] = &[
     "interaction:axis-scaling,mouse-kinetic,reset-view",
     "native-visual-approximations:day-bands,position-band,autoscale-band,markers,vertical-line",
 ];
+
+/// The CVD study's canonical trade stream and its line series.
+#[derive(Clone, Copy)]
+struct CvdDemoState {
+    stream_id: u64,
+    series_id: SeriesId,
+}
 
 /// Column-major OHLC, in the shape `ChartEngine::set_series_data` takes.
 #[derive(Clone)]
@@ -255,19 +260,6 @@ fn synthetic_bars(count: usize) -> Bars {
         low,
         close,
     }
-}
-
-fn next_bar_timestamp(times: &[f64]) -> f64 {
-    let Some(&latest) = times.last() else {
-        return 1_600_000_000.0;
-    };
-    let cadence = times
-        .windows(2)
-        .rev()
-        .map(|pair| pair[1] - pair[0])
-        .find(|cadence| cadence.is_finite() && *cadence > 0.0)
-        .unwrap_or(60.0);
-    latest + cadence
 }
 
 /// Match the Web demo's root-cell fixture: 1,000 deterministic hourly bars by default.
@@ -380,67 +372,49 @@ fn footprint_demo_trades(bars: &Bars) -> Vec<FootprintTrade> {
     trades
 }
 
-const CLICK_SLOP_MANHATTAN: f64 = 5.0;
-const PANE_SEPARATOR_HIT: f64 = 4.0;
-const WHEEL_LINE_HEIGHT: f32 = 32.0;
-
-/// The browser host's resolved desktop defaults. Keeping them explicit prevents a demo-only
-/// behavior from silently diverging from `packages/charts/src/impl.ts`.
-#[derive(Clone, Copy, Debug)]
-struct GestureConfig {
-    pan: bool,
-    wheel_scroll: bool,
-    wheel_zoom: bool,
-    wheel_behavior: WheelBehavior,
-    axis_dblclick_reset_time: bool,
-    axis_dblclick_reset_price: bool,
-    axis_scale_price: bool,
-    axis_scale_time: bool,
-    kinetic_mouse: bool,
-    panes_resize: bool,
-}
-
-impl Default for GestureConfig {
-    fn default() -> Self {
-        Self {
-            pan: true,
-            wheel_scroll: true,
-            wheel_zoom: true,
-            wheel_behavior: WheelBehavior::Auto,
-            axis_dblclick_reset_time: true,
-            axis_dblclick_reset_price: true,
-            axis_scale_price: true,
-            axis_scale_time: true,
-            kinetic_mouse: false,
-            panes_resize: true,
+/// One minute bar's synthetic prints for the CVD study: an open → extreme → extreme → close
+/// path whose aggressor mix follows the bar direction, so cumulative delta tracks the candles.
+fn cvd_demo_bar_trades(bars: &Bars, index: usize, trade_id: &mut u64) -> Vec<FootprintTrade> {
+    let (open, high, low, close) = (
+        bars.open[index],
+        bars.high[index],
+        bars.low[index],
+        bars.close[index],
+    );
+    let path = if close >= open {
+        [open, low, high, close]
+    } else {
+        [open, high, low, close]
+    };
+    let start_micros = bars.times[index] as i64 * 1_000_000;
+    let buy_share = (0.5 + (close - open) / (high - low).max(1e-9) * 0.4).clamp(0.1, 0.9);
+    let mut trades = Vec::with_capacity(path.len() * 2);
+    for (step, price) in path.into_iter().enumerate() {
+        let volume = 40.0 + ((index * 7 + step * 13) % 23) as f64;
+        for (offset, (side, share)) in [
+            (AggressorSide::Buy, buy_share),
+            (AggressorSide::Sell, 1.0 - buy_share),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            trades.push(FootprintTrade {
+                timestamp_micros: start_micros + (step * 2 + offset) as i64 * 1_000_000 + 1,
+                // Real prints trade on the stream's 0.01 tick grid.
+                price: (price * 100.0).round() / 100.0,
+                volume: (volume * share).round().max(1.0),
+                aggressor: side,
+                bid: None,
+                ask: None,
+                sequence: None,
+                trade_id: Some(*trade_id),
+                conditions: 0,
+                session_id: Some(1),
+            });
+            *trade_id += 1;
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum DragMode {
-    Pan {
-        price_pan: Option<(usize, PriceScaleTarget)>,
-    },
-    TimeAxis,
-    PriceAxis {
-        pane: usize,
-        target: PriceScaleTarget,
-    },
-    PaneSeparator {
-        index: usize,
-        last_y: f64,
-    },
-    Drawing,
-    DrawingCreation,
-    DeltaTooltip,
-    CrosshairAction,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BrushableAreaState {
-    tooltip_id: NativePrimitiveId,
-    styled_range: Option<DeltaTooltipActiveRange>,
+    trades
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -455,70 +429,78 @@ struct DrawingTemplate {
     color: String,
     style: &'static str,
     width: u8,
+    /// Content for the standalone Text tool only. Trend-line labels are typed in place, so the
+    /// template never writes a label onto a trend line or over a selected drawing's text.
     text: String,
-    text_color: String,
+    /// `None` keeps the engine default: a trend label follows its line color and standalone
+    /// text follows the chart foreground. Set only once the user explicitly picks a color.
+    text_color: Option<String>,
     text_size: u8,
     text_weight: u16,
     text_italic: bool,
+    text_h_align: &'static str,
+    text_v_align: &'static str,
 }
 
 impl Default for DrawingTemplate {
+    /// The browser demo's toolbar defaults, so both hosts create identical drawings.
     fn default() -> Self {
         Self {
-            color: "#2962ff".into(),
+            color: "#168ef7".into(),
             style: "solid",
             width: 2,
-            text: "Native".into(),
-            text_color: "#0a0a0a".into(),
-            text_size: 12,
+            text: String::new(),
+            text_color: None,
+            text_size: 14,
             text_weight: 400,
             text_italic: false,
+            text_h_align: "right",
+            text_v_align: "top",
         }
     }
 }
 
 impl DrawingTemplate {
-    fn json(&self) -> String {
-        format!(
-            r#"{{"color":"{}","style":"{}","width":{},"text":"{}","text_color":"{}","text_size":{},"text_weight":{},"text_italic":{}}}"#,
-            self.color,
-            self.style,
-            self.width,
-            self.text,
-            self.text_color,
-            self.text_size,
-            self.text_weight,
-            self.text_italic
-        )
+    /// Style fields every tool shares; label content and ink stay opt-in.
+    fn style_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("color".into(), self.color.clone().into());
+        fields.insert("style".into(), self.style.into());
+        fields.insert("width".into(), self.width.into());
+        fields.insert("text_size".into(), self.text_size.into());
+        fields.insert("text_weight".into(), self.text_weight.into());
+        fields.insert("text_italic".into(), self.text_italic.into());
+        fields.insert("text_h_align".into(), self.text_h_align.into());
+        fields.insert("text_v_align".into(), self.text_v_align.into());
+        if let Some(color) = &self.text_color {
+            fields.insert("text_color".into(), color.clone().into());
+        }
+        fields
     }
 
+    /// Options for arming `kind`. Only the Text tool receives template content.
+    fn json(&self, kind: DrawingKind) -> String {
+        let mut fields = self.style_fields();
+        if kind == DrawingKind::Text {
+            fields.insert("text".into(), self.text.clone().into());
+        }
+        serde_json::Value::Object(fields).to_string()
+    }
+
+    /// Changed style fields only, merged into an in-flight creation and the selected drawing.
+    /// Label content is never part of a live patch, so it cannot wipe a drawing's real text.
     fn patch_from(&self, previous: &Self) -> String {
-        let mut fields = Vec::new();
-        if self.color != previous.color {
-            fields.push(format!(r#""color":"{}""#, self.color));
+        let current = self.style_fields();
+        let before = previous.style_fields();
+        let mut patch: serde_json::Map<String, serde_json::Value> = current
+            .into_iter()
+            .filter(|(key, value)| before.get(key) != Some(value))
+            .collect();
+        if self.text_color.is_none() && previous.text_color.is_some() {
+            // Back to the inherited default: an empty color clears the explicit override.
+            patch.insert("text_color".into(), "".into());
         }
-        if self.style != previous.style {
-            fields.push(format!(r#""style":"{}""#, self.style));
-        }
-        if self.width != previous.width {
-            fields.push(format!(r#""width":{}"#, self.width));
-        }
-        if self.text != previous.text {
-            fields.push(format!(r#""text":"{}""#, self.text));
-        }
-        if self.text_color != previous.text_color {
-            fields.push(format!(r#""text_color":"{}""#, self.text_color));
-        }
-        if self.text_size != previous.text_size {
-            fields.push(format!(r#""text_size":{}"#, self.text_size));
-        }
-        if self.text_weight != previous.text_weight {
-            fields.push(format!(r#""text_weight":{}"#, self.text_weight));
-        }
-        if self.text_italic != previous.text_italic {
-            fields.push(format!(r#""text_italic":{}"#, self.text_italic));
-        }
-        format!("{{{}}}", fields.join(","))
+        serde_json::Value::Object(patch).to_string()
     }
 }
 
@@ -546,26 +528,10 @@ struct Probe {
     plan_dirty: bool,
     fitted: bool,
     fit_on_first_frame: bool,
-    /// Newest captured drawing sample since the last painted frame. Wayland may deliver motion at
-    /// HID cadence; the platform host coalesces that stream to presentation cadence before
-    /// forwarding it to the engine-owned drawing controller.
-    pending_creation_point: Option<(f64, f64, DrawingModifiers)>,
-    /// A placement committed on pointer-down. Suppresses the release-side click selection without
-    /// the host knowing which concrete drawing kind uses press placement.
-    creation_press_committed: bool,
-    viewport_offset: (f32, f32),
-    gesture_config: GestureConfig,
-    input: GestureResolver,
-    input_target: InputTarget,
-    cursor_style: CursorStyle,
-    press_start: Option<(f64, f64)>,
-    press_moved: bool,
-    drag: Option<DragMode>,
-    drag_started: bool,
-    kinetic_active: bool,
-    keyboard_pan_direction: i8,
-    keyboard_pan_delta: f64,
-    brushable_area: Option<BrushableAreaState>,
+    /// GPUI event translation; every interaction decision lives in the engine controller.
+    input: GpuiChartInput,
+    /// The single scheduled wake for deferred engine input work (trading-tooltip dwell).
+    input_wake: Option<Task<()>>,
     footprint: Option<FootprintDemoState>,
     source_bars: Bars,
     drawing_template: DrawingTemplate,
@@ -575,22 +541,16 @@ struct Probe {
     volume_id: Option<SeriesId>,
     volume_profile: Option<(u32, SeriesId)>,
     rsi_id: Option<SeriesId>,
+    cvd: Option<CvdDemoState>,
     legend: String,
     click_status: String,
     bars: usize,
-    appended: usize,
-    last_append_epoch: u64,
     painted: u64,
     frame_budget: Option<u64>,
-    plan_nanos: Vec<u64>,
-    paint_nanos: Vec<u64>,
-    total_nanos: Vec<u64>,
     last: GpuiFrameMetrics,
     /// Distinct scale factors and sizes observed, to prove the propagation actually happened.
     seen_scales: Vec<f32>,
     seen_sizes: Vec<(f32, f32)>,
-    started: Instant,
-    reported: bool,
 }
 
 impl Probe {
@@ -639,21 +599,8 @@ impl Probe {
             plan_dirty: true,
             fitted: false,
             fit_on_first_frame: true,
-            pending_creation_point: None,
-            creation_press_committed: false,
-            viewport_offset: (0.0, 0.0),
-            gesture_config: GestureConfig::default(),
-            input: GestureResolver::default(),
-            input_target: InputTarget::Pane,
-            cursor_style: CursorStyle::Crosshair,
-            press_start: None,
-            press_moved: false,
-            drag: None,
-            drag_started: false,
-            kinetic_active: false,
-            keyboard_pan_direction: 0,
-            keyboard_pan_delta: 0.0,
-            brushable_area: None,
+            input: GpuiChartInput::default(),
+            input_wake: None,
             footprint: None,
             source_bars: b,
             drawing_template: DrawingTemplate::default(),
@@ -663,21 +610,15 @@ impl Probe {
             volume_id: None,
             volume_profile: None,
             rsi_id: None,
+            cvd: None,
             legend: "O —  H —  L —  C —".to_string(),
             click_status: "ready".to_string(),
             bars,
-            appended: 0,
-            last_append_epoch: 0,
             painted: 0,
             frame_budget,
-            plan_nanos: Vec::new(),
-            paint_nanos: Vec::new(),
-            total_nanos: Vec::new(),
             last: GpuiFrameMetrics::default(),
             seen_scales: Vec::new(),
             seen_sizes: Vec::new(),
-            started: Instant::now(),
-            reported: false,
         }
     }
 
@@ -712,8 +653,6 @@ impl Probe {
             .expect("split-cell synthetic series is well formed");
         self.bars = bars.times.len();
         self.source_bars = bars;
-        self.appended = 0;
-        self.last_append_epoch = 0;
         self.fitted = false;
         self.dirty = true;
     }
@@ -726,51 +665,17 @@ impl Probe {
     }
 
     fn arm_drawing(&mut self, kind: DrawingKind) {
-        self.pending_creation_point = None;
-        self.creation_press_committed = false;
         let next = (self.engine.active_drawing_tool() != Some(kind)).then_some(kind);
-        let template = self.drawing_template.json();
+        let template = next.map(|kind| self.drawing_template.json(kind));
         let armed = self
             .engine
-            .set_drawing_tool(next, next.map(|_| template.as_str()), None);
+            .set_drawing_tool(next, template.as_deref(), None);
         debug_assert!(armed, "native drawing template is always valid JSON");
         self.click_status = self.engine.active_drawing_tool().map_or_else(
             || "drawing tool disarmed".to_string(),
             |tool| format!("{} armed", tool.name()),
         );
         self.dirty = true;
-    }
-
-    fn place_drawing_anchor(&mut self, x: f64, y: f64, modifiers: DrawingModifiers) -> i64 {
-        if self.engine.active_drawing_tool().is_none() {
-            return 0;
-        }
-        let update = self.engine.drawing_tool_activate(x, y, modifiers);
-        if let Some(id) = update.created {
-            self.click_status = format!("created drawing #{id}");
-            return i64::from(id);
-        }
-        if update.consumed {
-            -1
-        } else {
-            0
-        }
-    }
-
-    fn finish_drawing_creation(&mut self) -> bool {
-        let update = self.engine.drawing_tool_finish();
-        let Some(id) = update.created else {
-            return false;
-        };
-        self.click_status = format!("created drawing #{id}");
-        self.dirty = true;
-        true
-    }
-
-    fn pop_drawing_anchor(&mut self) -> bool {
-        let changed = self.engine.drawing_tool_pop_anchor();
-        self.dirty |= changed;
-        changed
     }
 
     fn update_drawing_template(&mut self, mutate: impl FnOnce(&mut DrawingTemplate)) {
@@ -881,14 +786,13 @@ impl Probe {
         self.disable_footprint();
         self.disable_brushable_area();
         self.engine.convert_series_kind(0, SeriesKind::Area);
-        let tooltip_id = self
+        let attached = self
             .engine
-            .add_delta_tooltip(0, DeltaTooltipOptions::default())
-            .expect("the built-in Area series accepts the delta-tooltip interaction");
-        self.brushable_area = Some(BrushableAreaState {
-            tooltip_id,
-            styled_range: None,
-        });
+            .set_brushable_area(0, Some(DeltaTooltipOptions::default()));
+        debug_assert!(
+            attached,
+            "the built-in Area series accepts the brushable area"
+        );
         self.click_status = "series: brushable area · drag to compare".into();
         self.dirty = true;
     }
@@ -969,72 +873,10 @@ impl Probe {
     }
 
     fn disable_brushable_area(&mut self) {
-        let Some(state) = self.brushable_area.take() else {
-            return;
-        };
-        self.engine.remove_native_primitive(state.tooltip_id);
-        self.engine.clear_area_brush_state(0);
-        if matches!(self.drag, Some(DragMode::DeltaTooltip)) {
-            self.drag = None;
+        if self.engine.is_brushable_area(0) {
+            self.engine.set_brushable_area(0, None);
+            self.dirty = true;
         }
-        self.dirty = true;
-    }
-
-    fn clear_brushable_area_selection(&mut self) -> bool {
-        let Some(state) = self.brushable_area else {
-            return false;
-        };
-        self.engine.clear_delta_tooltip(state.tooltip_id);
-        self.sync_brushable_area();
-        true
-    }
-
-    fn sync_brushable_area(&mut self) {
-        let Some(mut state) = self.brushable_area else {
-            return;
-        };
-        let range = self.engine.delta_tooltip_active_range(state.tooltip_id);
-        if state.styled_range == range {
-            return;
-        }
-        if let Some(range) = range {
-            let faded = BrushStyle {
-                line_color: Color::rgba(40, 98, 255, 51),
-                top_color: Color::rgba(40, 98, 255, 13),
-                bottom_color: Color::rgba(40, 98, 255, 0),
-                line_width: 2.0,
-            };
-            let selected = if range.positive {
-                BrushStyle {
-                    line_color: Color::rgb(4, 153, 129),
-                    top_color: Color::rgba(4, 153, 129, 102),
-                    bottom_color: Color::rgba(4, 153, 129, 0),
-                    line_width: 3.0,
-                }
-            } else {
-                BrushStyle {
-                    line_color: Color::rgb(239, 83, 80),
-                    top_color: Color::rgba(239, 83, 80, 102),
-                    bottom_color: Color::rgba(239, 83, 80, 0),
-                    line_width: 3.0,
-                }
-            };
-            let applied = self.engine.set_area_brush_state(
-                0,
-                faded,
-                vec![BrushRange {
-                    from: range.from as f64,
-                    to: range.to as f64,
-                    style: selected,
-                }],
-            );
-            debug_assert!(applied, "brush state belongs to the live Area series");
-        } else {
-            self.engine.clear_area_brush_state(0);
-        }
-        state.styled_range = range;
-        self.brushable_area = Some(state);
-        self.dirty = true;
     }
 
     fn toggle_sma(&mut self) {
@@ -1150,6 +992,73 @@ impl Probe {
                     series.line_color = Some("#ab47bc".into());
                     series.line_width = Some(2.0);
                 }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// CVD derives from trades, not OHLC: build a one-minute trade stream from the demo candles
+    /// and let the engine's cumulative-delta study own the line in its own pane.
+    fn toggle_cvd(&mut self) {
+        if let Some(cvd) = self.cvd.take() {
+            self.engine.remove_series(cvd.series_id);
+            let _ = self.engine.remove_trade_stream(cvd.stream_id);
+            self.dirty = true;
+            return;
+        }
+        // Anchor the one-minute buckets on the candle opens so every CVD point shares its
+        // candle's timestamp instead of interleaving new time points.
+        let anchor_micros = self
+            .source_bars
+            .times
+            .first()
+            .map_or(0, |&time| (time as i64).rem_euclid(60) * 1_000_000);
+        let Ok(stream_id) = self.engine.add_trade_stream(
+            "GPUI:CVD",
+            FootprintAggregationOptions {
+                tick_size: 0.01,
+                ticks_per_row: 1,
+                bars: FootprintBarAggregation::Time {
+                    interval_micros: 60_000_000,
+                    anchor_micros,
+                },
+                imbalance: FootprintImbalanceOptions::default(),
+            },
+        ) else {
+            self.click_status = "CVD: trade stream unavailable".into();
+            return;
+        };
+        let mut next_trade_id = 1;
+        let trades = (0..self.source_bars.times.len())
+            .flat_map(|index| cvd_demo_bar_trades(&self.source_bars, index, &mut next_trade_id))
+            .collect::<Vec<_>>();
+        let pane = self.engine.panes.len();
+        let installed = self
+            .engine
+            .set_trade_stream_trades(stream_id, trades)
+            .and_then(|_| {
+                self.engine
+                    .add_cvd_series(stream_id, pane, TradeStudyOptions::default())
+            });
+        match installed {
+            Ok(series_id) => {
+                if let Some(series) = self
+                    .engine
+                    .series
+                    .iter_mut()
+                    .find(|series| series.id == series_id && !series.removed)
+                {
+                    series.line_color = Some("#26a69a".into());
+                    series.line_width = Some(2.0);
+                }
+                self.cvd = Some(CvdDemoState {
+                    stream_id,
+                    series_id,
+                });
+            }
+            Err(error) => {
+                let _ = self.engine.remove_trade_stream(stream_id);
+                self.click_status = format!("CVD: {error}");
             }
         }
         self.dirty = true;
@@ -1431,7 +1340,10 @@ impl Probe {
             .expect("the probe engine always has a primary pane");
         let expected_x_px = (self.engine.pane_left * self.engine.dpr).round() as u32;
         let expected_w_px = (self.engine.pane_w * self.engine.dpr).round() as u32;
-        let expected_h_px = (content_h * self.engine.dpr).round() as u32;
+        // The primary pane shares the content height with any indicator panes below it, so its
+        // scissor follows the engine's own vertical pixel ratio for that pane's height.
+        let vpr = (content_h * self.engine.dpr).round().max(1.0) / content_h.max(1.0);
+        let expected_h_px = (self.engine.panes[0].height * vpr).round() as u32;
         assert!(
             (self.engine.pane_left + self.engine.pane_w + self.engine.axis_w - f64::from(width))
                 .abs()
@@ -1450,35 +1362,10 @@ impl Probe {
             [expected_x_px, expected_w_px, expected_h_px],
             "probe pane scissor must follow the physical negotiated pane extent"
         );
-        println!(
-            "aeris_charts probe viewport: canvas={width:.1}x{height:.1} logical, pane=({:.1},{:.1}) {:.1}x{:.1}, axes={:.1}/{:.1}, scissor={:?} device, dpr={scale_factor:.3}",
-            self.engine.pane_left,
-            0.0,
-            self.engine.pane_w,
-            self.engine.pane_h,
-            self.engine.left_axis_w,
-            self.engine.axis_w,
-            pane.scissor
-        );
-    }
-
-    /// Forward the newest coalesced captured-drawing sample (at most one per painted frame).
-    /// Only a semantic change dirties the frame.
-    fn flush_pending_drawing_creation(&mut self) {
-        if let Some((x, y, modifiers)) = self.pending_creation_point.take() {
-            if self
-                .engine
-                .drawing_tool_pointer_move(x, y, modifiers, true)
-                .changed
-            {
-                self.dirty = true;
-            }
-        }
     }
 
     /// GPUI prepaint entry: use the exact native shaper that the paint backend uses.
     fn rebuild(&mut self, width: f32, height: f32, scale_factor: f32, window: &Window) {
-        self.flush_pending_drawing_creation();
         if self.built_for == (width, height, scale_factor)
             && !self.dirty
             && !self.frame.panes.is_empty()
@@ -1486,42 +1373,7 @@ impl Probe {
             return;
         }
         let layout = self.engine.options.get().layout.clone();
-        let mut drawing_widths = HashMap::new();
-        for drawing in self.engine.drawings() {
-            let text = drawing.display_text();
-            let size = drawing.resolved_text_size(layout.font_size);
-            let weight = if drawing.kind == DrawingKind::Text && drawing.text.is_empty() {
-                700
-            } else {
-                drawing.text_weight.unwrap_or(400)
-            };
-            let key = format!(
-                "{text}\u{0}{size}\u{0}{}\u{0}{weight}\u{0}{}",
-                layout.font_family, drawing.text_italic
-            );
-            drawing_widths.insert(
-                key,
-                f64::from(
-                    measure_text(
-                        window,
-                        text,
-                        &layout.font_family,
-                        size as f32,
-                        weight,
-                        drawing.text_italic,
-                    )
-                    .width,
-                ),
-            );
-        }
-        self.engine
-            .set_text_measure(Some(Box::new(move |text, size, family, weight, italic| {
-                let key = format!("{text}\u{0}{size}\u{0}{family}\u{0}{weight}\u{0}{italic}");
-                drawing_widths
-                    .get(&key)
-                    .copied()
-                    .unwrap_or_else(|| text.chars().count() as f64 * size * 0.6)
-            })));
+        install_text_metrics(&mut self.engine, window);
         let axis_size = self.engine.axis_font_size();
         let countdown_size = self.engine.countdown_font_size();
         self.rebuild_with_measure(
@@ -1557,378 +1409,60 @@ impl Probe {
         );
     }
 
-    /// Append one live bar, forcing a rebuild on the next prepaint.
-    fn append_bar(&mut self) {
-        let i = self.bars + self.appended;
-        let t = i as f64;
-        let c = 100.0 + (t * 0.11).sin() * 6.0 + (t * 0.031).cos() * 14.0;
-        let o = self.source_bars.close.last().copied().unwrap_or(c);
-        let high = o.max(c) + 2.0;
-        let low = o.min(c) - 2.0;
-        let time = next_bar_timestamp(&self.source_bars.times);
-        self.engine.update_series_bar(0, time, [o, high, low, c]);
-        if let Some(id) = self.volume_id {
-            let volume = (high - low) * 25_000.0 + i as f64 * 31.0;
-            self.engine
-                .update_series_bar(id, time, [volume, volume, volume, volume]);
-        }
-        if let Some((_, id)) = self.volume_profile {
-            let volume = (800.0 + (c - o).abs() * 4000.0).round();
-            self.engine.update_series_bar(id, time, [volume; 4]);
-        }
-        self.source_bars.times.push(time);
-        self.source_bars.open.push(o);
-        self.source_bars.high.push(high);
-        self.source_bars.low.push(low);
-        self.source_bars.close.push(c);
-        if let Some(footprint) = self.footprint {
-            self.engine
-                .set_footprint_trades(
-                    footprint.series_id,
-                    footprint_demo_trades(&self.source_bars),
-                )
-                .expect("the refreshed GPUI footprint tape is valid");
-        }
-        self.appended += 1;
-        self.dirty = true;
-    }
-
-    fn maybe_append_live_bar(&mut self) {
-        if self
-            .frame_budget
-            .is_some_and(|budget| self.painted >= budget)
-        {
-            return;
-        }
-        let epoch = if self.frame_budget.is_some() {
-            self.painted / 60
-        } else {
-            self.started.elapsed().as_secs()
-        };
-        if self.painted > 0 && epoch > self.last_append_epoch {
-            self.last_append_epoch = epoch;
-            self.append_bar();
-        }
-    }
-
     fn record_frame_metrics(&mut self, metrics: GpuiFrameMetrics) {
-        // Finite probe mode retains full samples for percentile reporting. Interactive charts
-        // keep only the latest aggregate so an indefinitely open split workspace is bounded.
-        if self.frame_budget.is_some() {
-            self.plan_nanos.push(metrics.plan_nanos);
-            self.paint_nanos.push(metrics.paint_nanos);
-            self.total_nanos.push(metrics.total_nanos());
-        }
         self.last = metrics;
         self.painted += 1;
     }
 
-    fn now_ms(&self) -> f64 {
-        self.started.elapsed().as_secs_f64() * 1_000.0
-    }
-
     fn needs_animation_frame(&self) -> bool {
-        self.frame_budget.is_some()
-            || self.kinetic_active
-            || self.engine.keyboard_scroll_active()
-            || self.engine.scroll_animation_active()
+        self.frame_budget.is_some() || self.engine.input_animating()
     }
 
-    fn local_position(&self, position: gpui::Point<gpui::Pixels>) -> (f64, f64, f64) {
-        let window_x: f32 = position.x.into();
-        let window_y: f32 = position.y.into();
-        let chart_x = f64::from(window_x - self.viewport_offset.0);
-        let y = f64::from(window_y - self.viewport_offset.1);
-        (chart_x, chart_x - self.engine.pane_left, y)
-    }
-
-    fn separator_at(&self, y: f64) -> Option<usize> {
-        self.engine
-            .panes
-            .iter()
-            .skip(1)
-            .position(|pane| (y - pane.top).abs() <= PANE_SEPARATOR_HIT)
-    }
-
-    fn update_cursor(&mut self, chart_x: f64, y: f64) {
-        let pane_x = chart_x - self.engine.pane_left;
-        let active_separator = matches!(self.drag, Some(DragMode::PaneSeparator { .. }));
-        let separator = self
-            .gesture_config
-            .panes_resize
-            .then(|| self.separator_at(y))
-            .flatten();
-        let separator_hover = (!active_separator).then_some(separator).flatten();
-        if self.engine.separator_hover != separator_hover {
-            self.engine.set_separator_hover(separator_hover);
-            self.dirty = true;
+    /// Common tail of every input listener: report engine requests in the status line, follow the
+    /// crosshair in the OHLC legend, schedule deferred engine work, and repaint.
+    fn after_input(&mut self, cx: &mut Context<Self>) {
+        for event in self.engine.take_input_events() {
+            self.click_status = match event {
+                ChartInputEvent::DrawingCreated(id) => format!("created drawing #{id}"),
+                ChartInputEvent::ContextMenu(menu) => match menu.context {
+                    Some(context) => format!(
+                        "context: pane {} price {:.2}",
+                        context.pane_index, context.price
+                    ),
+                    None => format!("context: {:?}", menu.region),
+                },
+                ChartInputEvent::RemoveSeries(series) => format!("remove series #{series}"),
+            };
         }
-        let drawing_cursor = (self.engine.active_drawing_tool().is_none()
-            && pane_x >= 0.0
-            && pane_x <= self.engine.pane_w
-            && y >= 0.0
-            && y <= self.engine.pane_h)
-            .then(|| self.engine.hit_test_drawing(pane_x, y))
-            .flatten()
-            .map(|hit| match hit.cursor {
-                "pointer" => CursorStyle::PointingHand,
-                "move" => CursorStyle::ClosedHand,
-                "ns-resize" => CursorStyle::ResizeUpDown,
-                "ew-resize" => CursorStyle::ResizeLeftRight,
-                "nwse-resize" => CursorStyle::ResizeUpLeftDownRight,
-                "nesw-resize" => CursorStyle::ResizeUpRightDownLeft,
-                _ => CursorStyle::Crosshair,
-            });
-        let cursor = if self.engine.alert_create_hit_at(pane_x, y) {
-            CursorStyle::PointingHand
-        } else if active_separator || separator.is_some() {
-            CursorStyle::ResizeRow
-        } else if y > self.engine.pane_h {
-            if self.gesture_config.axis_scale_time {
-                CursorStyle::ResizeLeftRight
-            } else {
-                CursorStyle::Arrow
-            }
-        } else if chart_x < self.engine.pane_left
-            || chart_x > self.engine.pane_left + self.engine.pane_w
-        {
-            let pane = self.engine.pane_index_at_y(y);
-            let target = self.engine.price_axis_target_at(pane, pane_x);
-            if self.gesture_config.axis_scale_price
-                && target.is_some_and(|target| self.engine.price_axis_scalable(pane, target))
-            {
-                CursorStyle::ResizeUpDown
-            } else {
-                CursorStyle::Arrow
-            }
-        } else if let Some(cursor) = drawing_cursor {
-            cursor
-        } else if self.engine.hovered_series().is_some() {
-            CursorStyle::PointingHand
-        } else {
-            CursorStyle::Crosshair
-        };
-        if self.cursor_style != cursor {
-            self.cursor_style = cursor;
-            self.dirty = true;
+        for request in self.engine.take_alert_create_requests() {
+            self.click_status = format!(
+                "action requested: pane {} price {}",
+                request.pane_index, request.price
+            );
         }
-    }
-
-    fn cancel_kinetic_scroll(&mut self) {
-        self.engine.kinetic_stop();
-        if self.kinetic_active {
-            self.engine.time_scale_end_scroll();
+        match self.engine.crosshair {
+            Some((x, _)) => self.update_legend(x),
+            None => self.legend = "O —  H —  L —  C —".to_string(),
         }
-        self.kinetic_active = false;
-    }
-
-    fn begin_keyboard_pan_at(&mut self, direction: i8, step: f64, is_held: bool, now_ms: f64) {
-        debug_assert!(direction == -1 || direction == 1);
-        let delta = f64::from(direction) * step;
-        self.cancel_kinetic_scroll();
-        self.engine.cancel_scroll_animation();
-        // GPUI reports OS key repeats through `is_held`. The engine owns the repeat cadence, so
-        // an unchanged repeat must not reset velocity; only a new direction or modifier speed
-        // retunes the live session.
-        if !is_held || self.keyboard_pan_direction != direction || self.keyboard_pan_delta != delta
-        {
-            self.engine.start_keyboard_scroll(delta, now_ms);
-            self.keyboard_pan_direction = direction;
-            self.keyboard_pan_delta = delta;
-        }
-    }
-
-    fn cancel_keyboard_pan(&mut self) {
-        self.engine.cancel_keyboard_scroll();
-        self.keyboard_pan_direction = 0;
-        self.keyboard_pan_delta = 0.0;
-    }
-
-    fn begin_mouse_pan(&mut self, pane_x: f64) {
-        // Close any stale snapshot first. In particular, clicking during a previous coast must not
-        // let the next `scroll_to` reuse that coast's source start point.
-        self.engine.time_scale_end_scroll();
-        self.engine.time_scale_start_scroll(pane_x);
-        self.engine.kinetic_begin_sampling(
-            self.gesture_config.kinetic_mouse,
-            self.engine.scroll_position(),
-            self.now_ms(),
-        );
-    }
-
-    fn end_mouse_pan(&mut self) {
-        self.kinetic_active = self.gesture_config.kinetic_mouse
-            && self
-                .engine
-                .kinetic_release(self.engine.scroll_position(), self.now_ms());
-        if !self.kinetic_active {
-            self.engine.kinetic_stop();
-            self.engine.time_scale_end_scroll();
-        }
-    }
-
-    fn mark_press_moved(&mut self, pane_x: f64, y: f64) {
-        if let Some((start_x, start_y)) = self.press_start {
-            self.press_moved |=
-                (pane_x - start_x).abs() + (y - start_y).abs() >= CLICK_SLOP_MANHATTAN;
-        }
-    }
-
-    fn mouse_sample(
-        &self,
-        pane_x: f64,
-        y: f64,
-        target: InputTarget,
-        modifiers: gpui::Modifiers,
-    ) -> PointerSample {
-        PointerSample {
-            id: 1,
-            device: InputDevice::Mouse,
-            target,
-            modifiers: InputModifiers {
-                shift: modifiers.shift,
-                control: modifiers.control,
-                alt: modifiers.alt,
-                meta: modifiers.platform,
-            },
-            x: pane_x,
-            y,
-            timestamp_ms: self.now_ms(),
-            pressure: 0.5,
-            tilt_x: 0.0,
-            tilt_y: 0.0,
-        }
-    }
-
-    fn input_target_at(&self, chart_x: f64, pane_x: f64, y: f64) -> InputTarget {
-        if self.engine.alert_create_hit_at(pane_x, y) {
-            InputTarget::Alert
-        } else if self.gesture_config.panes_resize && self.separator_at(y).is_some() {
-            InputTarget::Separator
-        } else if y > self.engine.pane_h {
-            InputTarget::TimeAxis
-        } else if chart_x < self.engine.pane_left
-            || chart_x > self.engine.pane_left + self.engine.pane_w
-        {
-            InputTarget::PriceAxis
-        } else if self.engine.active_drawing_tool().is_some()
-            || self.engine.hit_test_drawing(pane_x, y).is_some()
-        {
-            InputTarget::Drawing
-        } else {
-            InputTarget::Pane
-        }
-    }
-
-    /// Browser-host parity (`clear_hover`): release every hover promotion together so the
-    /// series bump, drawing promotion, and text hover ring can never desync across hosts.
-    fn clear_hover(&mut self) {
-        self.engine.set_hovered_series(None);
-        self.engine.set_hovered_text(None);
-        self.engine.set_hovered_drawing(None);
-    }
-
-    fn update_crosshair(&mut self, pane_x: f64, y: f64) {
-        if pane_x >= 0.0 && pane_x <= self.engine.pane_w && y >= 0.0 && y <= self.engine.pane_h {
-            self.engine.crosshair = Some((pane_x, y));
-            // Browser-host parity (wasm `hover_at`): a drawing hit wins over series hits so
-            // overlaps stay selectable, clears the series bump, and drives generic hover
-            // promotion plus the text-only hover ring. Hit testing stays on stable order so
-            // promotion cannot oscillate hover.
-            if let Some(drawing) = self.engine.hit_test_drawing(pane_x, y) {
-                self.engine.set_hovered_series(None);
-                self.engine.set_hovered_text(Some(drawing.id));
-                self.engine.set_hovered_drawing(Some(drawing.id));
-            } else {
-                self.engine.set_hovered_text(None);
-                self.engine.set_hovered_drawing(None);
-                let hovered = self.engine.hit_test_series(pane_x, y);
-                self.engine.set_hovered_series(hovered);
-            }
-        } else {
-            self.engine.crosshair = None;
-            self.clear_hover();
-        }
+        self.input_wake = self.input.wake_delay(&self.engine).map(|delay| {
+            cx.spawn(async move |probe, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = probe.update(cx, |probe, cx| {
+                    probe.input_wake = None;
+                    probe.dirty = true;
+                    cx.notify();
+                });
+            })
+        });
         self.dirty = true;
-    }
-
-    fn update_pointer_feedback(&mut self, chart_x: f64, pane_x: f64, y: f64) {
-        let over_separator = self.gesture_config.panes_resize && self.separator_at(y).is_some();
-        if matches!(self.drag, Some(DragMode::PaneSeparator { .. })) || over_separator {
-            self.engine.crosshair = None;
-            self.clear_hover();
-            self.dirty = true;
-        } else {
-            // Match the browser host: refresh the hit-test first, then derive the cursor from the
-            // same move so a candle/series immediately exposes its click affordance.
-            self.update_crosshair(pane_x, y);
-        }
-        self.update_cursor(chart_x, y);
-    }
-
-    fn update_crosshair_modifier(&mut self, control: bool, platform: bool) {
-        let enabled = (control || platform) && self.engine.active_drawing_tool().is_some();
-        if self.engine.crosshair_ohlc_magnet != enabled {
-            self.engine.crosshair_ohlc_magnet = enabled;
-            self.dirty = true;
-        }
-    }
-
-    fn clear_pointer_state(&mut self) {
-        self.input.cancel();
-        match self.drag.take() {
-            Some(DragMode::Pan { price_pan }) => {
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_end_scroll(pane, target);
-                }
-                if self.drag_started {
-                    self.engine.time_scale_end_scroll();
-                }
-            }
-            Some(DragMode::TimeAxis) => self.engine.time_axis_end_scale(),
-            Some(DragMode::PriceAxis { pane, target }) => {
-                self.engine.price_axis_end_scale(pane, target);
-            }
-            Some(DragMode::Drawing) => self.engine.drawing_drag_end(),
-            Some(DragMode::DrawingCreation) => {
-                self.engine.cancel_drawing_creation();
-                self.pending_creation_point = None;
-            }
-            Some(
-                DragMode::PaneSeparator { .. } | DragMode::DeltaTooltip | DragMode::CrosshairAction,
-            )
-            | None => {}
-        }
-        self.engine.delta_tooltip_leave();
-        self.sync_brushable_area();
-        self.cancel_kinetic_scroll();
-        self.drag_started = false;
-        self.press_start = None;
-        self.press_moved = false;
-        self.engine.crosshair_ohlc_magnet = false;
-        self.engine.crosshair = None;
-        self.clear_hover();
-        self.engine.set_separator_hover(None);
-        self.legend = "O —  H —  L —  C —".to_string();
-        self.cursor_style = CursorStyle::Crosshair;
-        self.dirty = true;
+        cx.notify();
     }
 
     fn on_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
         if !*hovered {
-            self.clear_pointer_state();
-            cx.notify();
+            self.engine.input_pointer_leave();
+            self.after_input(cx);
         }
-    }
-
-    fn on_modifiers_changed(
-        &mut self,
-        event: &ModifiersChangedEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_crosshair_modifier(event.control, event.platform);
-        cx.notify();
     }
 
     fn on_mouse_down(
@@ -1940,142 +1474,18 @@ impl Probe {
         if let Some(focus) = &self.focus_handle {
             window.focus(focus, cx);
         }
-        self.cancel_kinetic_scroll();
-        self.cancel_keyboard_pan();
-        // Recover defensively from a stale scroll snapshot left by an interrupted host gesture.
-        self.engine.time_scale_end_scroll();
-        self.engine.cancel_scroll_animation();
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        self.input_target = self.input_target_at(chart_x, pane_x, y);
-        let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
-        self.input.pointer_down(sample);
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        let pane = self.engine.pane_index_at_y(y);
-        self.update_cursor(chart_x, y);
-        self.press_start = Some((pane_x, y));
-        self.press_moved = false;
+        self.input.mouse_down(&mut self.engine, event);
+        self.after_input(cx);
+    }
 
-        if self.input_target == InputTarget::Alert {
-            self.drag = Some(DragMode::CrosshairAction);
-            cx.notify();
-            return;
-        }
-
-        if event.click_count >= 2 && self.engine.drawing_tool_sequence_active() {
-            self.engine.drawing_tool_activate(
-                pane_x,
-                y,
-                DrawingModifiers {
-                    magnet: event.modifiers.control || event.modifiers.platform,
-                    straighten: event.modifiers.shift,
-                },
-            );
-            self.finish_drawing_creation();
-            self.press_moved = true;
-            self.dirty = true;
-            cx.notify();
-            return;
-        }
-
-        if self.engine.active_drawing_tool().is_some() {
-            let update = self.engine.drawing_tool_pointer_down(
-                pane_x,
-                y,
-                DrawingModifiers {
-                    magnet: event.modifiers.control || event.modifiers.platform,
-                    straighten: event.modifiers.shift,
-                },
-            );
-            self.creation_press_committed = update.created.is_some();
-            if let Some(id) = update.created {
-                self.click_status = format!("created drawing #{id}");
-            }
-            if update.pointer_capture {
-                self.drag = Some(DragMode::DrawingCreation);
-            }
-            self.update_crosshair(pane_x, y);
-            self.dirty |= update.changed;
-            cx.notify();
-            return;
-        }
-
-        if event.click_count >= 2 {
-            if chart_x >= self.engine.pane_left
-                && chart_x <= self.engine.pane_left + self.engine.pane_w
-                && (0.0..=self.engine.pane_h).contains(&y)
-                && self.clear_brushable_area_selection()
-            {
-                self.click_status = "brush selection cleared".into();
-            } else if y > self.engine.pane_h && self.gesture_config.axis_dblclick_reset_time {
-                self.engine.reset_time_scale();
-            } else if self.gesture_config.axis_dblclick_reset_price {
-                if let Some(target) = self.engine.price_axis_target_at(pane, pane_x) {
-                    self.engine.reset_price_scale(pane, target);
-                }
-            }
-            self.press_moved = true;
-            self.dirty = true;
-            cx.notify();
-            return;
-        }
-
-        self.drag = if let Some(index) = self
-            .gesture_config
-            .panes_resize
-            .then(|| self.separator_at(y))
-            .flatten()
-        {
-            self.engine.set_separator_hover(None);
-            Some(DragMode::PaneSeparator { index, last_y: y })
-        } else if y > self.engine.pane_h {
-            if self.gesture_config.axis_scale_time {
-                self.engine.time_axis_start_scale(pane_x);
-                Some(DragMode::TimeAxis)
-            } else {
-                None
-            }
-        } else if chart_x < self.engine.pane_left
-            || chart_x > self.engine.pane_left + self.engine.pane_w
-        {
-            if let Some(target) = self.engine.price_axis_target_at(pane, pane_x) {
-                if self.gesture_config.axis_scale_price
-                    && self.engine.price_axis_scalable(pane, target)
-                {
-                    self.engine.price_axis_start_scale(pane, target, y);
-                    Some(DragMode::PriceAxis { pane, target })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else if self.engine.active_drawing_tool().is_some() {
-            None
-        } else if self.engine.drawing_drag_start_at(pane_x, y) {
-            Some(DragMode::Drawing)
-        } else if self
-            .engine
-            .delta_tooltip_mouse_down_with_shift(pane_x, event.modifiers.shift)
-        {
-            self.sync_brushable_area();
-            Some(DragMode::DeltaTooltip)
-        } else if self.gesture_config.pan {
-            let price_pan = self
-                .engine
-                .price_pan_target_at(pane, pane_x, y)
-                .map(|target| (pane, target));
-            Some(DragMode::Pan { price_pan })
-        } else {
-            None
-        };
-        if matches!(self.drag, Some(DragMode::PaneSeparator { .. })) {
-            self.engine.crosshair = None;
-            self.clear_hover();
-            self.dirty = true;
-        } else {
-            self.update_crosshair(pane_x, y);
-        }
-        cx.notify();
+    fn on_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.context_menu(&mut self.engine, event);
+        self.after_input(cx);
     }
 
     fn on_mouse_move(
@@ -2084,214 +1494,13 @@ impl Probe {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
-        let update = self.input.pointer_move(sample);
-        if self.engine.delta_tooltip_mouse_move(pane_x) {
-            self.sync_brushable_area();
-            self.dirty = true;
-        }
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        if event.dragging() {
-            self.mark_press_moved(pane_x, y);
-        }
-        match self.drag {
-            Some(DragMode::Pan { price_pan })
-                if event.dragging() && update.kind == GestureUpdateKind::DragStarted =>
-            {
-                // Open at the 5 px crossing sample; movement starts on the following sample.
-                self.begin_mouse_pan(pane_x);
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_start_scroll(pane, target, y);
-                }
-                self.drag = Some(DragMode::Pan { price_pan });
-                self.drag_started = true;
-            }
-            Some(DragMode::Pan { price_pan })
-                if event.dragging()
-                    && self.drag_started
-                    && update.kind == GestureUpdateKind::DragMoved =>
-            {
-                self.engine.time_scale_scroll_to(pane_x);
-                self.engine
-                    .kinetic_add_sample(self.engine.scroll_position(), self.now_ms());
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_scroll_to(pane, target, y);
-                }
-            }
-            Some(DragMode::TimeAxis)
-                if event.dragging()
-                    && matches!(
-                        update.kind,
-                        GestureUpdateKind::DragStarted | GestureUpdateKind::DragMoved
-                    ) =>
-            {
-                self.engine.time_axis_scale_to(pane_x);
-                self.drag_started = true;
-            }
-            Some(DragMode::PriceAxis { pane, target })
-                if event.dragging()
-                    && matches!(
-                        update.kind,
-                        GestureUpdateKind::DragStarted | GestureUpdateKind::DragMoved
-                    ) =>
-            {
-                self.engine.price_axis_scale_to(pane, target, y);
-                self.drag_started = true;
-            }
-            Some(DragMode::PaneSeparator { index, last_y })
-                if event.dragging()
-                    && matches!(
-                        update.kind,
-                        GestureUpdateKind::DragStarted | GestureUpdateKind::DragMoved
-                    ) =>
-            {
-                self.engine.drag_pane_separator(index, y - last_y);
-                self.drag = Some(DragMode::PaneSeparator { index, last_y: y });
-                self.drag_started = true;
-                self.dirty = true;
-            }
-            Some(DragMode::Drawing) if event.dragging() => {
-                self.engine.drawing_drag_to(
-                    pane_x,
-                    y,
-                    DrawingModifiers {
-                        magnet: event.modifiers.control || event.modifiers.platform,
-                        straighten: event.modifiers.shift,
-                    },
-                );
-            }
-            Some(DragMode::DrawingCreation) if event.dragging() => {
-                // Keep only the newest captured sample; `rebuild` forwards it once per painted
-                // frame so native high-Hz pointer delivery does not perturb canonical tool math.
-                self.pending_creation_point = Some((
-                    pane_x,
-                    y,
-                    DrawingModifiers {
-                        magnet: event.modifiers.control || event.modifiers.platform,
-                        straighten: event.modifiers.shift,
-                    },
-                ));
-            }
-            Some(DragMode::DeltaTooltip) => {}
-            Some(DragMode::CrosshairAction) => {}
-            _ => {
-                if self.engine.active_drawing_tool().is_some() {
-                    let update = self.engine.drawing_tool_pointer_move(
-                        pane_x,
-                        y,
-                        DrawingModifiers {
-                            magnet: event.modifiers.control || event.modifiers.platform,
-                            straighten: event.modifiers.shift,
-                        },
-                        event.dragging(),
-                    );
-                    self.dirty |= update.changed;
-                }
-            }
-        }
-        if chart_x >= self.engine.pane_left
-            && chart_x <= self.engine.pane_left + self.engine.pane_w
-            && (0.0..=self.engine.pane_h).contains(&y)
-        {
-            self.update_legend(pane_x);
-        } else {
-            self.legend = "O —  H —  L —  C —".to_string();
-        }
-        self.update_pointer_feedback(chart_x, pane_x, y);
-        cx.notify();
+        self.input.mouse_move(&mut self.engine, event);
+        self.after_input(cx);
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        let sample = self.mouse_sample(pane_x, y, self.input_target, event.modifiers);
-        self.input.pointer_up(sample);
-        if self.engine.delta_tooltip_mouse_up() {
-            self.sync_brushable_area();
-            self.dirty = true;
-        }
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        self.mark_press_moved(pane_x, y);
-        let moved = self.press_moved;
-        let committed_on_press = std::mem::take(&mut self.creation_press_committed);
-        self.press_start = None;
-        self.press_moved = false;
-        let select_click = match self.drag.take() {
-            Some(DragMode::CrosshairAction) => {
-                if !moved && self.engine.activate_alert_create_at(pane_x, y) {
-                    for request in self.engine.take_alert_create_requests() {
-                        self.click_status = format!(
-                            "action requested: pane {} price {}",
-                            request.pane_index, request.price
-                        );
-                    }
-                }
-                false
-            }
-            Some(DragMode::Pan { price_pan }) => {
-                if let Some((pane, target)) = price_pan {
-                    self.engine.price_axis_end_scroll(pane, target);
-                }
-                if self.drag_started {
-                    self.end_mouse_pan();
-                }
-                !moved
-            }
-            Some(DragMode::TimeAxis) => {
-                self.engine.time_axis_end_scale();
-                false
-            }
-            Some(DragMode::PriceAxis { pane, target }) => {
-                self.engine.price_axis_end_scale(pane, target);
-                false
-            }
-            Some(DragMode::PaneSeparator { .. }) => false,
-            Some(DragMode::Drawing) => {
-                self.engine.drawing_drag_end();
-                false
-            }
-            Some(DragMode::DrawingCreation) => {
-                let modifiers = DrawingModifiers {
-                    magnet: event.modifiers.control || event.modifiers.platform,
-                    straighten: event.modifiers.shift,
-                };
-                // Flush the newest coalesced move first. The controller itself then owns the exact
-                // release endpoint, so browser and native hosts cannot disagree on the terminal
-                // freehand point because of platform event cadence.
-                self.flush_pending_drawing_creation();
-                let update = self.engine.drawing_tool_pointer_up(pane_x, y, modifiers);
-                if let Some(id) = update.created {
-                    self.click_status = format!("created drawing #{id}");
-                }
-                false
-            }
-            Some(DragMode::DeltaTooltip) => false,
-            None if committed_on_press => false,
-            None if self.engine.active_drawing_tool().is_some() => {
-                if !moved {
-                    self.place_drawing_anchor(
-                        pane_x,
-                        y,
-                        DrawingModifiers {
-                            magnet: event.modifiers.control || event.modifiers.platform,
-                            straighten: event.modifiers.shift,
-                        },
-                    );
-                }
-                false
-            }
-            None => !moved,
-        };
-        self.drag_started = false;
-        if select_click {
-            let selected = self.engine.hit_test_series(pane_x, y);
-            self.engine.set_selected_series(selected);
-            self.engine.select_drawing_at(pane_x, y);
-            self.update_legend(pane_x);
-            self.click_status = format!("click x={pane_x:.1} y={y:.1}");
-        }
-        self.update_pointer_feedback(chart_x, pane_x, y);
-        cx.notify();
+        self.input.mouse_up(&mut self.engine, event);
+        self.after_input(cx);
     }
 
     fn on_scroll_wheel(
@@ -2300,261 +1509,41 @@ impl Probe {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        self.update_crosshair_modifier(event.modifiers.control, event.modifiers.platform);
-        // GPUI's Windows backend reports wheel-up as a positive line delta. The browser turns
-        // wheel-up's negative DOM deltaY into the same positive normalized value. Convert lines
-        // with the browser's 32px adjustment and do not reverse either axis a second time.
-        let delta = event.delta.pixel_delta(px(WHEEL_LINE_HEIGHT));
-        let dx: f32 = delta.x.into();
-        let dy: f32 = delta.y.into();
-        let normalized_x = f64::from(dx) / 100.0;
-        let normalized_y = f64::from(dy) / 100.0;
-        let delta_mode = if matches!(event.delta, ScrollDelta::Pixels(_)) {
-            WheelDeltaMode::Pixel
-        } else {
-            WheelDeltaMode::Line
-        };
-        let intent = WheelSample {
-            x: pane_x,
-            y,
-            delta_x: normalized_x,
-            delta_y: normalized_y,
-            delta_mode,
-            modifiers: InputModifiers {
-                shift: event.modifiers.shift,
-                control: event.modifiers.control,
-                alt: event.modifiers.alt,
-                meta: event.modifiers.platform,
-            },
-            timestamp_ms: self.now_ms(),
+        if self.input.scroll_wheel(&mut self.engine, event) {
+            cx.stop_propagation();
+            self.after_input(cx);
         }
-        .intent(self.gesture_config.wheel_behavior);
-        if matches!(intent, WheelIntent::Zoom | WheelIntent::PanAndZoom)
-            && normalized_y != 0.0
-            && self.gesture_config.wheel_zoom
-        {
-            let zoom = aeris_charts_engine::wheel_zoom_scale(normalized_y);
-            let pane = self.engine.pane_index_at_y(y);
-            let price_target = self.engine.price_axis_target_at(pane, pane_x);
-            if self.gesture_config.wheel_behavior == WheelBehavior::Zoom {
-                if let Some(price_target) = price_target {
-                    self.engine
-                        .price_axis_wheel_zoom(pane, price_target, y, zoom);
-                } else {
-                    self.engine.time_scale_zoom(pane_x, zoom);
-                }
-            } else {
-                // Auto mode implements the reference-informed behavior: every surface targets the time scale and
-                // modifiers do not change routing. Focused Ctrl zoom remains an explicit-mode
-                // Aeris extension.
-                if self.gesture_config.wheel_behavior == WheelBehavior::Zoom
-                    && event.modifiers.control
-                {
-                    self.engine.time_scale_zoom_focused(pane_x, zoom);
-                } else {
-                    self.engine.time_scale_zoom(pane_x, zoom);
-                }
-            }
-        }
-        let pan_delta = if normalized_x.abs() >= normalized_y.abs() {
-            normalized_x
-        } else {
-            -normalized_y
-        };
-        if matches!(intent, WheelIntent::Pan | WheelIntent::PanAndZoom)
-            && pan_delta != 0.0
-            && self.gesture_config.wheel_scroll
-        {
-            self.engine.time_scale_start_scroll(0.0);
-            self.engine
-                .time_scale_scroll_to(aeris_charts_engine::WHEEL_SCROLL_PX_PER_DELTA * pan_delta);
-            self.engine.time_scale_end_scroll();
-        }
-        self.update_pointer_feedback(chart_x, pane_x, y);
-        cx.stop_propagation();
-        cx.notify();
     }
 
     fn on_pinch(&mut self, event: &PinchEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let (chart_x, pane_x, y) = self.local_position(event.position);
-        let intent = WheelSample {
-            x: pane_x,
-            y,
-            delta_y: f64::from(event.delta),
-            modifiers: InputModifiers {
-                control: true,
-                ..InputModifiers::default()
-            },
-            timestamp_ms: self.now_ms(),
-            ..WheelSample::default()
-        }
-        .intent(self.gesture_config.wheel_behavior);
-        if intent == WheelIntent::Zoom && self.gesture_config.wheel_zoom {
-            self.engine.time_scale_zoom(
-                pane_x,
-                aeris_charts_engine::pinch_zoom_scale(f64::from(event.delta)),
-            );
-            self.update_pointer_feedback(chart_x, pane_x, y);
+        if self.input.pinch(&mut self.engine, event) {
             cx.stop_propagation();
-            cx.notify();
+            self.after_input(cx);
         }
     }
 
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.modifiers_changed(&mut self.engine, event);
+        self.after_input(cx);
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let step = if event.keystroke.modifiers.control || event.keystroke.modifiers.shift {
-            10.0
-        } else {
-            1.0
-        };
-        let center = self.engine.pane_w / 2.0;
-        let handled = match event.keystroke.key.as_str() {
-            "left" => {
-                self.begin_keyboard_pan_at(-1, step, event.is_held, self.now_ms());
-                true
-            }
-            "right" => {
-                self.begin_keyboard_pan_at(1, step, event.is_held, self.now_ms());
-                true
-            }
-            "+" | "=" if self.gesture_config.wheel_zoom => {
-                self.engine.time_scale_zoom(center, 0.5);
-                true
-            }
-            "-" | "_" if self.gesture_config.wheel_zoom => {
-                self.engine.time_scale_zoom(center, -0.5);
-                true
-            }
-            "home" => {
-                self.engine.fit_content();
-                true
-            }
-            "enter" => self.finish_drawing_creation(),
-            "backspace"
-                if self.engine.drawing_tool_sequence_active()
-                    && self.engine.drawing_create_active() =>
-            {
-                self.pop_drawing_anchor()
-            }
-            "delete" | "backspace" => self.engine.remove_selected_drawing(),
-            "escape" => {
-                self.clear_brushable_area_selection();
-                self.engine.cancel_drawing_tool();
-                self.pending_creation_point = None;
-                self.creation_press_committed = false;
-                self.engine.set_selected_drawing(None);
-                self.engine.crosshair = None;
-                self.clear_hover();
-                true
-            }
-            _ => false,
-        };
-        if handled {
-            // Browser keyboard gestures stop any wheel/mouse coast and close its saved scroll
-            // snapshot. Left/Right keeps its separate engine-owned velocity session until key-up.
-            self.cancel_kinetic_scroll();
-            self.dirty = true;
+        if self.input.key_down(&mut self.engine, event, cx) {
             cx.stop_propagation();
-            cx.notify();
+            self.after_input(cx);
         }
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let direction = match event.keystroke.key.as_str() {
-            "left" => -1,
-            "right" => 1,
-            _ => return,
-        };
-        if self.keyboard_pan_direction != direction {
-            return;
+        if self.input.key_up(&mut self.engine, event) {
+            cx.stop_propagation();
+            self.after_input(cx);
         }
-        self.cancel_keyboard_pan();
-        self.dirty = true;
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn tick_animations(&mut self) {
-        let now = self.now_ms();
-        if self.kinetic_active {
-            if self.engine.kinetic_finished(now) {
-                self.engine.time_scale_end_scroll();
-                self.engine.kinetic_stop();
-                self.kinetic_active = false;
-            } else if let Some(position) = self.engine.kinetic_position(now) {
-                self.engine.scroll_to_position(position);
-                self.dirty = true;
-            }
-        }
-        if self.engine.keyboard_scroll_active() {
-            self.engine.keyboard_scroll_tick(now);
-            self.dirty = true;
-        }
-        if self.engine.scroll_animation_active() {
-            self.engine.scroll_animation_tick(now);
-            self.dirty = true;
-        }
-    }
-
-    fn report(&self) {
-        let pct = |data: &[u64], p: f64| -> f64 {
-            if data.is_empty() {
-                return 0.0;
-            }
-            let mut v = data.to_vec();
-            v.sort_unstable();
-            let idx = ((v.len() as f64 - 1.0) * p).round() as usize;
-            v[idx] as f64 / 1_000_000.0
-        };
-        println!("--- aeris_charts_render_gpui probe ---");
-        println!("frames painted  : {}", self.painted);
-        println!("bars            : {}", self.bars + self.appended);
-        println!("wall clock      : {:.2?}", self.started.elapsed());
-        println!("scale factors   : {:?}", self.seen_scales);
-        println!("sizes (logical) : {:?}", self.seen_sizes);
-        println!(
-            "last frame      : prims={} ops={} quads={} paths={} tris={} text_runs={} painted_runs={} dropped={}",
-            self.last.prims,
-            self.last.ops,
-            self.last.quads,
-            self.last.paths,
-            self.last.triangles,
-            self.last.text_runs,
-            self.last.glyph_runs_painted,
-            self.last.dropped_prims
-        );
-        println!("mesh vertices   : {}", self.last.mesh_vertices);
-        println!(
-            "quad batching   : {} quads -> {} paths ({} paint_quad calls saved)",
-            self.last.batched_quads,
-            self.last.quad_batches,
-            self.last
-                .batched_quads
-                .saturating_sub(self.last.quad_batches)
-        );
-        println!(
-            "adapter total ms: p50={:.3} p99={:.3}  (plan + gpui submission)",
-            pct(&self.total_nanos, 0.50),
-            pct(&self.total_nanos, 0.99)
-        );
-        println!(
-            "text cache      : {} hits / {} misses",
-            self.last.text_cache_hits, self.last.text_cache_misses
-        );
-        println!(
-            "plan build ms   : p50={:.3} p95={:.3} p99={:.3} max={:.3}",
-            pct(&self.plan_nanos, 0.50),
-            pct(&self.plan_nanos, 0.95),
-            pct(&self.plan_nanos, 0.99),
-            pct(&self.plan_nanos, 1.0)
-        );
-        println!(
-            "gpui paint ms   : p50={:.3} p95={:.3} p99={:.3} max={:.3}",
-            pct(&self.paint_nanos, 0.50),
-            pct(&self.paint_nanos, 0.95),
-            pct(&self.paint_nanos, 0.99),
-            pct(&self.paint_nanos, 1.0)
-        );
     }
 }
 
@@ -2619,10 +1608,6 @@ impl Render for Probe {
             .frame_budget
             .is_some_and(|budget| self.painted >= budget);
         if done {
-            if !self.reported {
-                self.report();
-                self.reported = true;
-            }
             cx.quit();
         } else if self.needs_animation_frame() {
             window.request_animation_frame();
@@ -2644,12 +1629,13 @@ impl Render for Probe {
             .relative()
             .bg(background)
             .size_full()
-            .cursor(self.cursor_style)
+            .cursor(cursor_style(self.engine.input_cursor()))
             .id("aeris_charts-chart-root")
             .track_focus(&focus)
             .key_context("AerisGpuiChart")
             .on_hover(cx.listener(Self::on_hover))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -2663,8 +1649,6 @@ impl Render for Probe {
                     move |bounds: Bounds<gpui::Pixels>, window, cx| {
                         let w: f32 = bounds.size.width.into();
                         let h: f32 = bounds.size.height.into();
-                        let offset_x: f32 = bounds.origin.x.into();
-                        let offset_y: f32 = bounds.origin.y.into();
                         let scale_factor = window.scale_factor();
                         prepaint_entity.update(cx, |probe: &mut Probe, _| {
                             if probe
@@ -2673,9 +1657,8 @@ impl Render for Probe {
                             {
                                 return;
                             }
-                            probe.viewport_offset = (offset_x, offset_y);
-                            probe.tick_animations();
-                            probe.maybe_append_live_bar();
+                            probe.input.set_canvas_bounds(bounds);
+                            probe.dirty |= probe.input.prepare_frame(&mut probe.engine);
                             probe.rebuild(w, h, scale_factor, window);
                         });
                         bounds
@@ -2798,6 +1781,7 @@ enum DemoAction {
     Volume,
     VolumeProfile,
     Rsi,
+    Cvd,
     Split(SplitDirection),
     Close,
     Cap,
@@ -2867,6 +1851,9 @@ struct InteractiveDemo {
     cells: Vec<DemoCell>,
     active: u64,
     maximized: Option<u64>,
+    /// The release of an Alt+click maximize press. The layout changes under the pointer, so the
+    /// mouse-up must not reach whichever chart is now there (no stray click or drawing anchor).
+    swallow_mouse_up: bool,
     theme: DemoTheme,
     max_index: usize,
     max_charts: Option<usize>,
@@ -2892,6 +1879,7 @@ impl InteractiveDemo {
             cells: vec![DemoCell { id: 1, chart }],
             active: 1,
             maximized: None,
+            swallow_mouse_up: false,
             theme: DemoTheme::Dark,
             max_index: 0,
             max_charts: None,
@@ -3005,7 +1993,7 @@ impl InteractiveDemo {
         self.maximized = (self.maximized != Some(id)).then_some(id);
         self.status = self.maximized.map_or_else(
             || format!("restored split layout; active cell {id}"),
-            |_| format!("maximized cell {id}; Ctrl/Cmd+click to restore"),
+            |_| format!("maximized cell {id}; Alt+click to restore"),
         );
     }
 
@@ -3167,6 +2155,7 @@ impl InteractiveDemo {
             DemoAction::Volume => self.update_root(cx, Probe::toggle_volume),
             DemoAction::VolumeProfile => self.update_root(cx, Probe::toggle_volume_profile),
             DemoAction::Rsi => self.update_root(cx, Probe::toggle_rsi),
+            DemoAction::Cvd => self.update_root(cx, Probe::toggle_cvd),
             DemoAction::Split(direction) => self.split(direction, true, cx),
             DemoAction::Close => self.close_active(),
             DemoAction::Cap => {
@@ -3179,7 +2168,7 @@ impl InteractiveDemo {
             DemoAction::ClearDrawings => self.update_root(cx, |p| p.engine.clear_drawings()),
             DemoAction::DrawingColor => self.update_root(cx, |p| {
                 p.update_drawing_template(|t| {
-                    t.color = if t.color == "#2962ff" { "#ff9800" } else { "#2962ff" }.into();
+                    t.color = if t.color == "#168ef7" { "#ff9800" } else { "#168ef7" }.into();
                 });
             }),
             DemoAction::DrawingStyle => self.update_root(cx, |p| {
@@ -3191,13 +2180,15 @@ impl InteractiveDemo {
                 p.update_drawing_template(|t| t.width = if t.width >= 4 { 1 } else { t.width + 1 });
             }),
             DemoAction::DrawingText => self.update_root(cx, |p| {
-                p.update_drawing_template(|t| t.text = if t.text == "Native" { "Aeris native" } else { "Native" }.into());
+                // Content for the next standalone Text drawing only (trend labels are typed).
+                p.update_drawing_template(|t| t.text = if t.text.is_empty() { "Note".into() } else { String::new() });
             }),
             DemoAction::DrawingTextColor => self.update_root(cx, |p| {
-                p.update_drawing_template(|t| t.text_color = if t.text_color == "#0a0a0a" { "#ab47bc" } else { "#0a0a0a" }.into());
+                // Explicit ink, then back to the inherited default (line color / foreground).
+                p.update_drawing_template(|t| t.text_color = match t.text_color { None => Some("#ab47bc".into()), Some(_) => None });
             }),
             DemoAction::DrawingTextSize => self.update_root(cx, |p| {
-                p.update_drawing_template(|t| t.text_size = if t.text_size >= 18 { 12 } else { t.text_size + 2 });
+                p.update_drawing_template(|t| t.text_size = if t.text_size >= 20 { 12 } else { t.text_size + 2 });
             }),
             DemoAction::DrawingTextWeight => self.update_root(cx, |p| {
                 p.update_drawing_template(|t| t.text_weight = if t.text_weight >= 700 { 400 } else { t.text_weight + 100 });
@@ -3360,8 +2351,8 @@ impl InteractiveDemo {
             DemoAction::WatermarkText => self.update_root(cx, |p| { let current = &p.engine.options.get().watermark.text; let text = if current == "Aeris" { "aeris-charts" } else { "Aeris" }; p.engine.options.apply_str(&format!(r#"{{"watermark":{{"text":"{text}"}}}}"#)).unwrap(); }),
             DemoAction::WatermarkColor => self.update_root(cx, |p| { let current = &p.engine.options.get().watermark.color; let color = if current == "#b0b8c480" { "#2962ff80" } else { "#b0b8c480" }; p.engine.options.apply_str(&format!(r#"{{"watermark":{{"color":"{color}"}}}}"#)).unwrap(); }),
             DemoAction::WatermarkSize => self.update_root(cx, |p| { let current = p.engine.options.get().watermark.font_size; let size = if current >= 160.0 { 16.0 } else { current + 4.0 }; p.engine.options.apply_str(&format!(r#"{{"watermark":{{"fontSize":{size}}}}}"#)).unwrap(); }),
-            DemoAction::AxisScaling => self.update_root(cx, |p| { p.gesture_config.axis_scale_price = !p.gesture_config.axis_scale_price; p.gesture_config.axis_scale_time = p.gesture_config.axis_scale_price; }),
-            DemoAction::Kinetic => self.update_root(cx, |p| p.gesture_config.kinetic_mouse = !p.gesture_config.kinetic_mouse),
+            DemoAction::AxisScaling => self.update_root(cx, |p| { let mut options = p.engine.interaction_options(); options.axis_scale_price = !options.axis_scale_price; options.axis_scale_time = options.axis_scale_price; p.engine.set_interaction_options(options); }),
+            DemoAction::Kinetic => self.update_root(cx, |p| { let mut options = p.engine.interaction_options(); options.kinetic_mouse = !options.kinetic_mouse; p.engine.set_interaction_options(options); }),
             DemoAction::Reset => self.update_root(cx, |p| { p.engine.reset_time_scale(); p.engine.fit_content(); for pane in 0..p.engine.panes.len() { p.engine.set_price_scale_auto_scale_for(pane, PriceScaleTarget::Left, true); p.engine.set_price_scale_auto_scale_for(pane, PriceScaleTarget::Right, true); } }),
             DemoAction::Fixture(index) => self.update_root(cx, move |p| match index {
                 0 => p.fixtures.day_bands = !p.fixtures.day_bands,
@@ -3400,11 +2391,11 @@ impl InteractiveDemo {
                     .first()
                     .is_some_and(|series| series.kind == kind)
                     && probe.footprint.is_none()
-                    && (kind != SeriesKind::Area || probe.brushable_area.is_none())
+                    && (kind != SeriesKind::Area || !probe.engine.is_brushable_area(0))
             }),
             DemoAction::BrushableArea => active
                 .as_ref()
-                .is_some_and(|chart| chart.read(cx).brushable_area.is_some()),
+                .is_some_and(|chart| chart.read(cx).engine.is_brushable_area(0)),
             DemoAction::Footprint => active
                 .as_ref()
                 .is_some_and(|chart| chart.read(cx).footprint.is_some()),
@@ -3428,6 +2419,9 @@ impl InteractiveDemo {
             DemoAction::Rsi => root
                 .as_ref()
                 .is_some_and(|chart| chart.read(cx).rsi_id.is_some()),
+            DemoAction::Cvd => root
+                .as_ref()
+                .is_some_and(|chart| chart.read(cx).cvd.is_some()),
             DemoAction::Cap => self.max_index != 0,
             DemoAction::Drawing(kind) => root
                 .as_ref()
@@ -3500,10 +2494,10 @@ impl InteractiveDemo {
                 .is_some_and(|chart| chart.read(cx).engine.options.get().watermark.visible),
             DemoAction::AxisScaling => root
                 .as_ref()
-                .is_some_and(|chart| chart.read(cx).gesture_config.axis_scale_price),
+                .is_some_and(|chart| chart.read(cx).engine.interaction_options().axis_scale_price),
             DemoAction::Kinetic => root
                 .as_ref()
-                .is_some_and(|chart| chart.read(cx).gesture_config.kinetic_mouse),
+                .is_some_and(|chart| chart.read(cx).engine.interaction_options().kinetic_mouse),
             DemoAction::Fixture(index) => root.as_ref().is_some_and(|chart| {
                 let fixtures = chart.read(cx).fixtures;
                 match index {
@@ -3645,26 +2639,46 @@ impl InteractiveDemo {
                     .expect("workspace snapshots reference a live GPUI cell")
                     .chart
                     .clone();
-                let activation_chart = chart.clone();
+                let maximize_entity = cx.entity();
+                let release_entity = cx.entity();
                 let entity = cx.entity();
                 let id = *id;
                 div()
                     .relative()
                     .size_full()
-                    .on_mouse_down(MouseButton::Left, move |event, _, app| {
-                        entity.update(app, |demo, cx| {
-                            let drawing_armed = activation_chart
-                                .read(cx)
-                                .engine
-                                .active_drawing_tool()
-                                .is_some();
-                            if (event.modifiers.control || event.modifiers.platform)
-                                && !drawing_armed
+                    // Alt+click toggles this cell's maximize in a multi-chart layout. Capture
+                    // phase plus stop_propagation: the chart never sees the press, so the
+                    // shortcut cannot also pan, select, or place a drawing anchor.
+                    .capture_any_mouse_down(move |event, _, app| {
+                        let toggled = maximize_entity.update(app, |demo, cx| {
+                            // A new press always starts clean, even if the previous release
+                            // landed outside every chart cell.
+                            demo.swallow_mouse_up = false;
+                            if event.button != MouseButton::Left
+                                || !event.modifiers.alt
+                                || (demo.cells.len() < 2 && demo.maximized.is_none())
                             {
-                                demo.toggle_maximize(id);
-                            } else {
-                                demo.activate(id, cx);
+                                return false;
                             }
+                            demo.toggle_maximize(id);
+                            demo.swallow_mouse_up = true;
+                            cx.notify();
+                            true
+                        });
+                        if toggled {
+                            app.stop_propagation();
+                        }
+                    })
+                    .capture_any_mouse_up(move |_, _, app| {
+                        let swallow = release_entity
+                            .update(app, |demo, _| std::mem::take(&mut demo.swallow_mouse_up));
+                        if swallow {
+                            app.stop_propagation();
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_, _, app| {
+                        entity.update(app, |demo, cx| {
+                            demo.activate(id, cx);
                             cx.notify();
                         });
                     })
@@ -3897,6 +2911,7 @@ impl Render for InteractiveDemo {
                     b("volume overlay", DemoAction::Volume),
                     b("volume profile", DemoAction::VolumeProfile),
                     b("RSI(14) pane", DemoAction::Rsi),
+                    b("CVD pane", DemoAction::Cvd),
                 ],
             ),
             self.group(
@@ -3929,6 +2944,12 @@ impl Render for InteractiveDemo {
                     b("text", DemoAction::Drawing(DrawingKind::Text)),
                     b("path", DemoAction::Drawing(DrawingKind::Path)),
                     b("brush", DemoAction::Drawing(DrawingKind::Brush)),
+                    b("price range", DemoAction::Drawing(DrawingKind::PriceRange)),
+                    b("date range", DemoAction::Drawing(DrawingKind::DateRange)),
+                    b(
+                        "date & price",
+                        DemoAction::Drawing(DrawingKind::DateAndPriceRange),
+                    ),
                     b("clear", DemoAction::ClearDrawings),
                 ],
             ),
@@ -4026,30 +3047,18 @@ impl Render for InteractiveDemo {
             },
             |chart| {
                 let probe = chart.read(cx);
-                // Live frame cost, so an open demo answers "how much FPS" without a finite probe.
-                let frame_ms = probe.last.total_nanos() as f64 / 1.0e6;
-                let fps = if frame_ms > 0.0 {
-                    1.0e3 / frame_ms
-                } else {
-                    0.0
-                };
                 (
                     shell_rgb(
                         &probe.engine.options.get().time_scale.border_color,
                         shell_rgb(theme_border(self.theme), 0xe5e5e5),
                     ),
-                    format!(
-                        "{}  ·  {}  ·  {frame_ms:.1} ms ({fps:.0} fps)",
-                        probe.legend, probe.click_status
-                    ),
+                    format!("{}  ·  {}", probe.legend, probe.click_status),
                 )
             },
         );
         let dpr = window.scale_factor();
-        let divider_line_width = (aeris_charts_core::style::BORDER_WIDTH as f32 * dpr)
-            .round()
-            .max(1.0)
-            / dpr;
+        let divider_line_width =
+            aeris_charts_core::style::border_width_device_px(f64::from(dpr)) as f32 / dpr;
         let chart = if let Some(id) = self.maximized {
             self.render_node(
                 &WorkspaceLayout::Cell { id },
@@ -4366,9 +3375,159 @@ fn main() {
     });
 }
 
+/// Place one click anchor with the armed tool: the id of a committed drawing, `-1` when the click
+/// was consumed without committing, `0` when no tool is armed.
+#[cfg(test)]
+fn place_drawing_anchor(
+    probe: &mut Probe,
+    x: f64,
+    y: f64,
+    modifiers: aeris_charts_engine::DrawingModifiers,
+) -> i64 {
+    if probe.engine.active_drawing_tool().is_none() {
+        return 0;
+    }
+    let update = probe.engine.drawing_tool_activate(x, y, modifiers);
+    match update.created {
+        Some(id) => i64::from(id),
+        None if update.consumed => -1,
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeris_charts_engine::{
+        ChartCursor, ChartKey, DrawingModifiers, InputModifiers, PointerInput,
+    };
+    use aeris_charts_render_gpui::input::text_edit_key;
+
+    fn pointer(x: f64, y: f64) -> PointerInput {
+        PointerInput {
+            x,
+            y,
+            ..PointerInput::default()
+        }
+    }
+
+    /// Typing mode is engine-owned in GPUI: a new text drawing opens the session, committed
+    /// characters and editing keys reach it, shortcuts never type, and Enter commits.
+    #[test]
+    fn text_drawing_typing_mode_edits_through_the_engine_session() {
+        use gpui::{Keystroke, Modifiers};
+
+        let key = |key: &str, key_char: Option<&str>, modifiers: Modifiers| KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers,
+                key: key.into(),
+                key_char: key_char.map(str::to_string),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        let mut probe = Probe::new(32, Some(1));
+        let id = probe
+            .engine
+            .add_drawing(
+                DrawingKind::Text,
+                0,
+                vec![DrawingPoint {
+                    logical: 10.0,
+                    price: 100.0,
+                }],
+                None,
+            )
+            .expect("text drawing");
+        // Beginning an edit needs a settled chart: the editor layout converts the anchors.
+        probe.rebuild_with_measure(
+            1024.0,
+            640.0,
+            1.0,
+            |text, _bold| text.chars().count() as f64 * 7.0,
+            |text, _bold| text.chars().count() as f64 * 6.0,
+        );
+        assert!(probe.engine.begin_drawing_text_edit(id, true));
+        assert_eq!(probe.engine.editing_drawing(), Some(id));
+
+        for c in ["H", "i", "!"] {
+            text_edit_key(&mut probe.engine, &key(c, Some(c), Modifiers::default()));
+        }
+        text_edit_key(&mut probe.engine, &key("left", None, Modifiers::default()));
+        text_edit_key(
+            &mut probe.engine,
+            &key("backspace", None, Modifiers::default()),
+        );
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        text_edit_key(&mut probe.engine, &key("z", Some("z"), ctrl));
+        let mut alt_gr = key("q", Some("@"), Modifiers { alt: true, ..ctrl });
+        alt_gr.prefer_character_input = true;
+        text_edit_key(&mut probe.engine, &alt_gr);
+        assert_eq!(probe.engine.drawing_text_edit(), Some((id, "H@!", 2)));
+
+        // Shift+Home selects to the start; typing replaces the selection.
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        text_edit_key(&mut probe.engine, &key("home", None, shift));
+        assert_eq!(probe.engine.drawing_text_edit_selection(), Some("H@"));
+        text_edit_key(&mut probe.engine, &key("W", Some("W"), shift));
+        assert_eq!(probe.engine.drawing_text_edit(), Some((id, "W!", 1)));
+        // Select-all, then a word-delete clears the selection.
+        text_edit_key(&mut probe.engine, &key("a", Some("a"), ctrl));
+        assert_eq!(probe.engine.drawing_text_edit_selection(), Some("W!"));
+        text_edit_key(&mut probe.engine, &key("right", None, Modifiers::default()));
+        assert_eq!(probe.engine.drawing_text_edit(), Some((id, "W!", 2)));
+
+        text_edit_key(&mut probe.engine, &key("enter", None, Modifiers::default()));
+        assert_eq!(probe.engine.editing_drawing(), None);
+        assert_eq!(probe.engine.drawing(id).unwrap().text, "W!");
+    }
+
+    /// Indicator panes share the content height with the primary pane. Adding one must not trip
+    /// the layout self-check, and CVD must be a real trade-derived study aligned to the candles.
+    #[test]
+    fn indicator_panes_rebuild_and_cvd_follows_the_candle_times() {
+        let mut probe = Probe::new(64, Some(1));
+        let rebuild = |probe: &mut Probe| {
+            probe.dirty = true;
+            probe.rebuild_with_measure(
+                1024.0,
+                640.0,
+                1.25,
+                |text, _| text.len() as f64 * 7.0,
+                |text, _| text.len() as f64 * 6.0,
+            );
+        };
+        rebuild(&mut probe);
+        probe.toggle_rsi();
+        rebuild(&mut probe);
+        probe.toggle_cvd();
+        rebuild(&mut probe);
+        assert_eq!(probe.engine.panes.len(), 3, "{}", probe.click_status);
+
+        let cvd = probe.cvd.expect("CVD installs from the demo trade tape");
+        let (times, ..) = probe
+            .engine
+            .data_layer()
+            .series_data(cvd.series_id)
+            .unwrap();
+        let candle_times = &probe.source_bars.times;
+        assert_eq!(times.len(), candle_times.len());
+        assert!(times
+            .iter()
+            .zip(candle_times)
+            .all(|(cvd, candle)| (*cvd as f64 - candle).abs() < 1e-9));
+
+        probe.toggle_cvd();
+        probe.toggle_rsi();
+        rebuild(&mut probe);
+        assert_eq!(probe.engine.panes.len(), 1);
+    }
 
     #[test]
     fn action_chip_hover_uses_click_cursor_and_control_input_target() {
@@ -4381,98 +3540,36 @@ mod tests {
             |text, _| text.len() as f64 * 6.0,
         );
         probe.engine.clear_drawings();
-        let pane_x = probe.engine.pane_w - 9.5;
-        let chart_x = probe.engine.pane_left + pane_x;
+        let x = probe.engine.pane_w - 9.5;
         let y = 200.0;
-        probe.update_pointer_feedback(chart_x, pane_x, y);
-        assert!(probe.engine.alert_create_hit_at(pane_x, y));
-        assert_eq!(probe.cursor_style, CursorStyle::PointingHand);
+        probe.engine.input_pointer_move(pointer(x, y), false);
+        assert!(probe.engine.alert_create_hit_at(x, y));
         assert_eq!(
-            probe.input_target_at(chart_x, pane_x, y),
-            InputTarget::Alert
+            cursor_style(probe.engine.input_cursor()),
+            CursorStyle::PointingHand
         );
+        let scroll = probe.engine.scroll_position();
+        probe.engine.input_pointer_down(pointer(x, y), 1);
+        probe.engine.input_pointer_up(pointer(x, y));
+        assert_eq!(probe.engine.take_alert_create_requests().len(), 1);
+        assert_eq!(
+            probe.engine.scroll_position(),
+            scroll,
+            "the chip never pans"
+        );
+
         probe.engine.set_alert_create_button_visible(false);
-        probe.update_pointer_feedback(chart_x, pane_x, y);
-        assert_ne!(
-            probe.input_target_at(chart_x, pane_x, y),
-            InputTarget::Alert
-        );
-    }
-
-    /// Issue #12: Wayland delivers per-HID-report pointer motion (~1000 Hz, often one axis per
-    /// event). A captured drawing stream must forward at most one coalesced sample per painted
-    /// frame — the newest one — or device-specific event cadence leaks into canonical geometry.
-    #[test]
-    fn drawing_capture_coalesces_pointer_samples_to_one_knot_per_frame() {
-        let mut probe = Probe::new(32, Some(1));
-        let measure = |text: &str, _bold: bool| text.chars().count() as f64 * 7.0;
-        let countdown_measure = |text: &str, _bold: bool| text.chars().count() as f64 * 6.0;
-        probe.rebuild_with_measure(1024.0, 640.0, 1.0, measure, countdown_measure);
-        assert!(probe
-            .engine
-            .set_drawing_tool(Some(DrawingKind::Brush), None, None));
-        assert!(
-            probe
-                .engine
-                .drawing_tool_pointer_down(100.0, 100.0, DrawingModifiers::default())
-                .pointer_capture
-        );
-
-        // A diagonal drag as Wayland reports it: one axis per event, far above frame cadence.
-        for (x, y) in [
-            (101.5, 100.0),
-            (101.5, 101.5),
-            (103.0, 101.5),
-            (103.0, 103.0),
-        ] {
-            probe.pending_creation_point = Some((x, y, DrawingModifiers::default()));
-        }
-        probe.flush_pending_drawing_creation();
-        assert!(probe.dirty, "a captured knot repaints the frame");
-        assert_eq!(
-            probe.pending_creation_point, None,
-            "the pending sample is consumed by the frame"
-        );
-
-        // An idle frame with no pending sample captures nothing.
-        probe.dirty = false;
-        probe.flush_pending_drawing_creation();
-        assert!(!probe.dirty);
-
-        // Only the newest sample became a knot: start + one coalesced capture.
-        let id = probe
-            .engine
-            .drawing_tool_pointer_up(103.0, 103.0, DrawingModifiers::default())
-            .created
-            .expect("captured drawing commits");
-        let drawing = probe
-            .engine
-            .drawings()
-            .iter()
-            .find(|d| d.id == id)
-            .expect("the committed brush exists");
-        assert_eq!(
-            drawing.points.len(),
-            2,
-            "intermediate staircase samples must not become knots"
-        );
+        probe.engine.input_pointer_down(pointer(x, y), 1);
+        probe.engine.input_pointer_up(pointer(x, y));
+        assert!(probe.engine.take_alert_create_requests().is_empty());
     }
 
     #[test]
-    fn volume_profile_demo_owns_sources_and_tracks_live_append() {
+    fn volume_profile_demo_owns_its_sources() {
         let mut probe = Probe::new_interactive(32);
         probe.toggle_volume_profile();
         let (id, volume) = probe.volume_profile.unwrap();
         probe.engine.time_scale.set_width(1024.0);
-        probe.engine.fit_content();
-        probe.engine.build_frame();
-        let before = probe
-            .engine
-            .volume_profile_indicator_snapshot(id)
-            .unwrap()
-            .profile
-            .total_volume;
-        probe.append_bar();
         probe.engine.fit_content();
         probe.engine.build_frame();
         assert!(
@@ -4482,33 +3579,12 @@ mod tests {
                 .unwrap()
                 .profile
                 .total_volume
-                > before
+                > 0.0
         );
         probe.toggle_volume_profile();
         assert!(probe.volume_profile.is_none());
         assert!(probe.engine.volume_profile_indicator_snapshot(id).is_none());
         assert!(!probe.engine.remove_series(volume));
-    }
-
-    #[test]
-    fn live_append_uses_the_latest_source_cadence() {
-        let mut probe = Probe::new_interactive(3);
-        let previous = *probe.source_bars.times.last().unwrap();
-        probe.append_bar();
-        assert_eq!(probe.source_bars.times.len(), 4);
-        assert_eq!(*probe.source_bars.times.last().unwrap(), previous + 3_600.0);
-
-        let mut hourly = vec![1_600_000_000.0, 1_600_003_600.0, 1_600_007_200.0];
-        let first_append = next_bar_timestamp(&hourly);
-        assert_eq!(first_append, 1_600_010_800.0);
-        hourly.push(first_append);
-        assert_eq!(next_bar_timestamp(&hourly), 1_600_014_400.0);
-
-        assert_eq!(
-            next_bar_timestamp(&[1_600_000_000.0, 1_600_000_060.0]),
-            1_600_000_120.0,
-            "the finite probe's minute cadence remains unchanged"
-        );
     }
 
     #[test]
@@ -4545,59 +3621,6 @@ mod tests {
             .axis
             .iter()
             .any(|prim| matches!(prim, Prim::Text { .. })));
-    }
-
-    #[test]
-    fn desktop_gesture_defaults_match_browser_host() {
-        let config = GestureConfig::default();
-
-        assert!(config.pan);
-        assert!(config.wheel_scroll);
-        assert!(config.wheel_zoom);
-        assert!(config.axis_dblclick_reset_time);
-        assert!(config.axis_dblclick_reset_price);
-        assert!(config.axis_scale_price);
-        assert!(config.axis_scale_time);
-        assert!(config.panes_resize);
-        assert!(!config.kinetic_mouse);
-    }
-
-    #[test]
-    fn click_after_pan_preserves_position_and_next_pan_uses_current_snapshot() {
-        let mut probe = Probe::new(64, Some(1));
-        probe.rebuild_with_measure(
-            1024.0,
-            640.0,
-            1.0,
-            |text, _bold| text.chars().count() as f64 * 7.0,
-            |text, _bold| text.chars().count() as f64 * 6.0,
-        );
-        probe.engine.scroll_to_position(0.0);
-        let initial = probe.engine.scroll_position();
-
-        probe.begin_mouse_pan(200.0);
-        probe.engine.time_scale_scroll_to(160.0);
-        probe.end_mouse_pan();
-        let after_first_pan = probe.engine.scroll_position();
-        let first_delta = after_first_pan - initial;
-        assert!(first_delta > 0.0);
-
-        // A press/release below click slop still enters the pane pan recognizer, but must close its
-        // snapshot without restoring the position reached by the previous drag.
-        probe.cancel_kinetic_scroll();
-        probe.begin_mouse_pan(120.0);
-        probe.end_mouse_pan();
-        let after_click = probe.engine.scroll_position();
-        assert!((after_click - after_first_pan).abs() < 1e-12);
-
-        // A fresh 20px drag must start at `after_click`, rather than reusing the first drag's saved
-        // state. It therefore moves half as far as the first 40px drag at unchanged bar spacing.
-        probe.begin_mouse_pan(120.0);
-        probe.engine.time_scale_scroll_to(100.0);
-        probe.end_mouse_pan();
-        let after_second_pan = probe.engine.scroll_position();
-        let expected = after_click + first_delta / 2.0;
-        assert!((after_second_pan - expected).abs() < 1e-12);
     }
 
     fn assert_theme(engine: &ChartEngine, theme: DemoTheme) {
@@ -4672,7 +3695,7 @@ mod tests {
                 "missing toolbar feature {required}"
             );
         }
-        assert!(!GestureConfig::default().kinetic_mouse);
+        assert!(!aeris_charts_engine::InteractionOptions::default().kinetic_mouse);
     }
 
     #[test]
@@ -4688,7 +3711,7 @@ mod tests {
         probe.engine.clear_drawings();
         probe.arm_drawing(DrawingKind::TrendLine);
         assert_eq!(
-            probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default()),
+            place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default()),
             -1
         );
         probe.update_drawing_template(|template| {
@@ -4697,11 +3720,173 @@ mod tests {
             template.text_italic = true;
         });
         assert!(probe.engine.drawing_create_active());
-        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
         assert!(id > 0, "changing style must not discard the first anchor");
         assert_eq!(probe.drawing_template.color, "#ff9800");
         assert_eq!(probe.drawing_template.width, 4);
         assert!(probe.drawing_template.text_italic);
+    }
+
+    /// Browser parity for the measuring tools: the toolbar tool places a snapped date-and-price
+    /// range, and a live Shift-click measure paints in the native frame while keeping the
+    /// crosshair cursor even over another drawing's body.
+    #[test]
+    fn measure_tools_paint_natively_and_a_live_measure_keeps_the_crosshair_cursor() {
+        let mut probe = Probe::new(64, Some(1));
+        let rebuild = |probe: &mut Probe| {
+            probe.dirty = true;
+            probe.rebuild_with_measure(
+                1024.0,
+                640.0,
+                1.0,
+                |text, _bold| text.chars().count() as f64 * 7.0,
+                |text, _bold| text.chars().count() as f64 * 6.0,
+            );
+        };
+        rebuild(&mut probe);
+        probe.engine.clear_drawings();
+        probe.arm_drawing(DrawingKind::DateAndPriceRange);
+        assert_eq!(
+            place_drawing_anchor(&mut probe, 200.0, 200.0, DrawingModifiers::default()),
+            -1
+        );
+        let id = place_drawing_anchor(&mut probe, 500.0, 400.0, DrawingModifiers::default());
+        assert!(id > 0);
+        let drawing = probe.engine.drawing(id as u32).unwrap();
+        assert_eq!(drawing.kind, DrawingKind::DateAndPriceRange);
+        assert!(drawing
+            .points
+            .iter()
+            .all(|point| point.logical.fract() == 0.0));
+        rebuild(&mut probe);
+
+        let inside = (350.0, 300.0);
+        probe
+            .engine
+            .input_pointer_move(pointer(inside.0, inside.1), false);
+        assert_eq!(probe.engine.input_cursor(), ChartCursor::Move);
+
+        // A Shift-press on empty space starts the live measure, which then follows the pointer.
+        let shift = PointerInput {
+            modifiers: InputModifiers {
+                shift: true,
+                ..InputModifiers::default()
+            },
+            ..pointer(100.0, 150.0)
+        };
+        probe.engine.input_pointer_down(shift, 1);
+        probe.engine.input_pointer_up(shift);
+        assert!(probe.engine.measure_active());
+        probe
+            .engine
+            .input_pointer_move(pointer(inside.0, inside.1), false);
+        assert_eq!(probe.engine.input_cursor(), ChartCursor::Crosshair);
+        rebuild(&mut probe);
+        let labels = probe.frame.panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::Text { text, .. } if text.contains(" bars")))
+            .count();
+        assert_eq!(
+            labels, 2,
+            "the tool and the live measure both label elapsed time"
+        );
+        // Escape dismisses the measure.
+        assert!(probe.engine.input_key_down(
+            ChartKey::Escape,
+            InputModifiers::default(),
+            false,
+            0.0
+        ));
+        assert!(!probe.engine.measure_active());
+    }
+
+    /// Moving from a trend line onto its `+ Add text` prompt keeps the prompt hovered with the
+    /// text cursor (the browser's engine-owned arbitration), so the label stays clickable.
+    #[test]
+    fn trend_label_prompt_stays_hovered_with_a_text_cursor() {
+        let mut probe = Probe::new(64, Some(1));
+        let rebuild = |probe: &mut Probe| {
+            probe.dirty = true;
+            probe.rebuild_with_measure(
+                1024.0,
+                640.0,
+                1.0,
+                |text, _bold| text.chars().count() as f64 * 7.0,
+                |text, _bold| text.chars().count() as f64 * 6.0,
+            );
+        };
+        rebuild(&mut probe);
+        probe.engine.clear_drawings();
+        probe.arm_drawing(DrawingKind::TrendLine);
+        place_drawing_anchor(&mut probe, 200.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 600.0, 300.0, DrawingModifiers::default()) as u32;
+        rebuild(&mut probe);
+
+        // Right/top template: the prompt sits above the line near its right end, off the body.
+        let (x, y, _) = probe.engine.drawing_text_transform(id).unwrap();
+        let (label_x, label_y) = (x - 20.0, y);
+        assert!(probe.engine.hit_test_drawing(label_x, label_y).is_none());
+        probe
+            .engine
+            .input_pointer_move(pointer(label_x, label_y), false);
+        assert_eq!(probe.engine.hovered_text(), Some(id));
+        assert_eq!(
+            cursor_style(probe.engine.input_cursor()),
+            CursorStyle::IBeam
+        );
+        rebuild(&mut probe);
+        assert!(probe.frame.panes[0].main.iter().any(|prim| matches!(
+            prim,
+            Prim::RotatedText { text, .. } if text == "+ Add text"
+        )));
+    }
+
+    /// The native template matches the browser toolbar: a new trend line has no label (so it
+    /// shows the `+ Add text` prompt) and its label ink follows the line color; only the
+    /// standalone Text tool takes template content, and live style patches never touch labels.
+    #[test]
+    fn drawing_template_matches_the_browser_defaults() {
+        let template = DrawingTemplate::default();
+        let trend: serde_json::Value =
+            serde_json::from_str(&template.json(DrawingKind::TrendLine)).unwrap();
+        assert!(trend.get("text").is_none());
+        assert!(trend.get("text_color").is_none());
+        assert_eq!(trend["color"], "#168ef7");
+        assert_eq!(trend["text_size"], 14);
+
+        let mut probe = Probe::new(64, Some(1));
+        probe.rebuild_with_measure(
+            1024.0,
+            640.0,
+            1.0,
+            |text, _bold| text.chars().count() as f64 * 7.0,
+            |text, _bold| text.chars().count() as f64 * 6.0,
+        );
+        probe.engine.clear_drawings();
+        probe.arm_drawing(DrawingKind::TrendLine);
+        place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
+        assert!(id > 0);
+        let drawing = probe.engine.drawing(id as u32).unwrap();
+        assert!(drawing.text.is_empty(), "a new trend line starts unlabeled");
+        assert!(
+            drawing.text_color.is_none(),
+            "trend label ink follows the line"
+        );
+
+        // Typing a label, then restyling, keeps the label; resetting ink restores inheritance.
+        probe.engine.set_selected_drawing(Some(id as u32));
+        assert!(probe.engine.begin_drawing_text_edit(id as u32, true));
+        assert!(probe.engine.drawing_text_edit_insert("breakout"));
+        assert!(probe.engine.commit_drawing_text_edit());
+        probe.update_drawing_template(|t| t.text_color = Some("#ab47bc".into()));
+        probe.update_drawing_template(|t| t.width = 3);
+        probe.update_drawing_template(|t| t.text_color = None);
+        let drawing = probe.engine.drawing(id as u32).unwrap();
+        assert_eq!(drawing.text, "breakout");
+        assert_eq!(drawing.width, 3.0);
+        assert!(drawing.text_color.is_none());
     }
 
     #[test]
@@ -4718,10 +3903,10 @@ mod tests {
         probe.arm_drawing(DrawingKind::TrendLine);
         assert!(!probe.engine.drawing_create_active());
         assert_eq!(
-            probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default()),
+            place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default()),
             -1
         );
-        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
         assert!(id > 0);
         assert_eq!(probe.engine.drawings().len(), 1);
         assert_eq!(probe.engine.selected_drawing(), Some(id as u32));
@@ -4741,12 +3926,17 @@ mod tests {
         probe.arm_drawing(DrawingKind::Path);
         for (x, y) in [(200.0, 180.0), (350.0, 260.0), (500.0, 200.0)] {
             assert_eq!(
-                probe.place_drawing_anchor(x, y, DrawingModifiers::default()),
+                place_drawing_anchor(&mut probe, x, y, DrawingModifiers::default()),
                 -1
             );
         }
-        assert!(probe.pop_drawing_anchor());
-        assert!(probe.finish_drawing_creation());
+        let none = InputModifiers::default();
+        assert!(probe
+            .engine
+            .input_key_down(ChartKey::Backspace, none, false, 0.0));
+        assert!(probe
+            .engine
+            .input_key_down(ChartKey::Enter, none, false, 0.0));
         assert_eq!(probe.engine.drawings().len(), 1);
         assert_eq!(probe.engine.drawings()[0].kind, DrawingKind::Path);
         assert_eq!(probe.engine.drawings()[0].points.len(), 2);
@@ -4764,14 +3954,26 @@ mod tests {
             |text, _bold| text.chars().count() as f64 * 6.0,
         );
         probe.engine.clear_drawings();
+        let ctrl = InputModifiers {
+            control: true,
+            ..InputModifiers::default()
+        };
+        probe.engine.input_modifiers_changed(ctrl);
+        assert!(
+            !probe.engine.crosshair_ohlc_magnet,
+            "free browsing never snaps"
+        );
+        probe
+            .engine
+            .input_modifiers_changed(InputModifiers::default());
         probe.arm_drawing(DrawingKind::TrendLine);
         assert!(!probe.engine.drawing_create_active());
 
         let x = probe.engine.time_scale.logical_to_coordinate(32.0);
         let y = 200.0;
-        probe.update_crosshair(x, y);
+        probe.engine.input_pointer_move(pointer(x, y), false);
         let free = probe.engine.build_frame();
-        probe.update_crosshair_modifier(true, false);
+        probe.engine.input_modifiers_changed(ctrl);
         let snapped = probe.engine.build_frame();
         let crosshair_color =
             Color::parse_css(&probe.engine.options.get().crosshair.horz_line.color)
@@ -4799,6 +4001,7 @@ mod tests {
 #[cfg(test)]
 mod semantic_regressions {
     use super::*;
+    use aeris_charts_engine::DrawingModifiers;
 
     #[test]
     fn pending_template_patch_reaches_committed_drawing() {
@@ -4813,7 +4016,7 @@ mod semantic_regressions {
         probe.engine.clear_drawings();
         probe.arm_drawing(DrawingKind::TrendLine);
         assert_eq!(
-            probe.place_drawing_anchor(200.0, 180.0, DrawingModifiers::default()),
+            place_drawing_anchor(&mut probe, 200.0, 180.0, DrawingModifiers::default()),
             -1
         );
         probe.update_drawing_template(|template| {
@@ -4821,7 +4024,7 @@ mod semantic_regressions {
             template.width = 4;
             template.text_italic = true;
         });
-        let id = probe.place_drawing_anchor(500.0, 300.0, DrawingModifiers::default());
+        let id = place_drawing_anchor(&mut probe, 500.0, 300.0, DrawingModifiers::default());
         assert!(id > 0);
         let options = probe.engine.drawing_options_json(id as u32).unwrap();
         assert!(options.contains("\"color\":\"#ff9800\""));
@@ -4893,34 +4096,17 @@ mod semantic_regressions {
     }
 
     #[test]
-    fn interactive_metrics_are_bounded_while_finite_metrics_are_retained() {
-        let mut interactive = Probe::new(8, None);
-        for _ in 0..10_000 {
-            interactive.record_frame_metrics(GpuiFrameMetrics::default());
-        }
-        assert_eq!(interactive.painted, 10_000);
-        assert!(interactive.plan_nanos.is_empty());
-        assert!(interactive.paint_nanos.is_empty());
-        assert!(interactive.total_nanos.is_empty());
-
-        let mut finite = Probe::new(8, Some(2));
-        finite.record_frame_metrics(GpuiFrameMetrics::default());
-        finite.record_frame_metrics(GpuiFrameMetrics::default());
-        assert_eq!(finite.plan_nanos.len(), 2);
-        assert_eq!(finite.paint_nanos.len(), 2);
-        assert_eq!(finite.total_nanos.len(), 2);
-    }
-
-    #[test]
     fn idle_interactive_probe_stops_requesting_frames() {
+        use aeris_charts_engine::{ChartKey, InputModifiers};
         let mut interactive = Probe::new(8, None);
         assert!(!interactive.needs_animation_frame());
-        interactive.kinetic_active = true;
+        let none = InputModifiers::default();
+        assert!(interactive
+            .engine
+            .input_key_down(ChartKey::ArrowLeft, none, false, 1_000.0));
         assert!(interactive.needs_animation_frame());
-        interactive.kinetic_active = false;
-        interactive.begin_keyboard_pan_at(-1, 10.0, false, 1_000.0);
-        assert!(interactive.needs_animation_frame());
-        interactive.cancel_keyboard_pan();
+        assert!(interactive.engine.input_key_up(ChartKey::ArrowLeft));
+        assert!(!interactive.needs_animation_frame());
         interactive.engine.start_scroll_animation(3.0, 160.0, 0.0);
         assert!(interactive.needs_animation_frame());
         assert!(Probe::new(8, Some(2)).needs_animation_frame());
@@ -4928,42 +4114,47 @@ mod semantic_regressions {
 
     #[test]
     fn brushable_area_uses_the_native_area_and_delta_tooltip_paths() {
+        use aeris_charts_engine::PointerInput;
         let mut probe = Probe::new(32, None);
+        probe.rebuild_with_measure(
+            1024.0,
+            640.0,
+            1.0,
+            |text, _bold| text.chars().count() as f64 * 7.0,
+            |text, _bold| text.chars().count() as f64 * 6.0,
+        );
         probe.enable_brushable_area();
-        let state = probe.brushable_area.expect("brush interaction is attached");
+        assert!(probe.engine.is_brushable_area(0));
         assert_eq!(probe.engine.series[0].kind, SeriesKind::Area);
         assert!(probe.engine.has_delta_tooltip());
 
-        probe.engine.time_scale.set_width(probe.engine.pane_w);
         probe.engine.set_visible_logical_range(0.0, 31.0);
+        let at = |x| PointerInput {
+            x,
+            y: 200.0,
+            ..PointerInput::default()
+        };
         let from = probe.engine.time_scale.index_to_coordinate(4);
         let to = probe.engine.time_scale.index_to_coordinate(12);
-        assert!(probe
-            .engine
-            .set_delta_tooltip_points(state.tooltip_id, &[from, to]));
-        let active_range = probe.engine.delta_tooltip_active_range(state.tooltip_id);
-        assert!(
-            active_range.is_some(),
-            "expected active range for coordinates {from}..{to} in pane {}",
-            probe.engine.pane_w
-        );
-        probe.sync_brushable_area();
-        assert!(probe
-            .brushable_area
-            .is_some_and(|brush| brush.styled_range.is_some()));
-
-        assert!(probe.clear_brushable_area_selection());
+        let scroll = probe.engine.scroll_position();
+        probe.engine.input_pointer_down(at(from), 1);
+        probe.engine.input_pointer_move(at(to), true);
+        probe.engine.input_pointer_up(at(to));
+        assert!(probe.engine.brushable_area_range(0).is_some());
         assert_eq!(
-            probe.engine.delta_tooltip_active_range(state.tooltip_id),
-            None
+            probe.engine.scroll_position(),
+            scroll,
+            "the comparison owns the drag"
         );
-        assert!(probe
-            .brushable_area
-            .is_some_and(|brush| brush.styled_range.is_none()));
+
+        // A double-click on the pane clears the brushed range.
+        probe.engine.input_pointer_down(at(from), 2);
+        probe.engine.input_pointer_up(at(from));
+        assert_eq!(probe.engine.brushable_area_range(0), None);
 
         probe.set_series_kind(SeriesKind::Line);
         assert_eq!(probe.engine.series[0].kind, SeriesKind::Line);
-        assert!(probe.brushable_area.is_none());
+        assert!(!probe.engine.is_brushable_area(0));
         assert!(!probe.engine.has_delta_tooltip());
     }
 
@@ -5005,21 +4196,6 @@ mod semantic_regressions {
             .series
             .iter()
             .all(|series| series.id != state.series_id || series.removed));
-    }
-
-    #[test]
-    fn finite_live_append_occurs_once_per_epoch_before_the_frame_budget() {
-        let mut probe = Probe::new(8, Some(120));
-        probe.painted = 59;
-        probe.maybe_append_live_bar();
-        assert_eq!(probe.appended, 0);
-        probe.painted = 60;
-        probe.maybe_append_live_bar();
-        probe.maybe_append_live_bar();
-        assert_eq!(probe.appended, 1);
-        probe.painted = 120;
-        probe.maybe_append_live_bar();
-        assert_eq!(probe.appended, 1);
     }
 
     #[test]

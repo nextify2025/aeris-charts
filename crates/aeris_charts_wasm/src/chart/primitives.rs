@@ -25,7 +25,7 @@
 
 use super::inner_render::measure_text_ctx;
 use super::*;
-use crate::prim_decode::decode_commands;
+use crate::prim_decode::{decode_commands, pane_clip};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
 use aeris_charts_core::scale::price_scale_core::PriceScaleCore;
 use aeris_charts_core::style::{DEFAULT_AXIS_TEXT_RGB, DEFAULT_CROSSHAIR_RGB};
@@ -346,34 +346,21 @@ impl ChartInner {
         // hovered-series promotion, and carries the part cursor (`move` on a body, `pointer`
         // on a selected drawing's anchor handle). Every kind sets generic hover promotion;
         // a TEXT drawing additionally gets the hover ring (the engine kind-filters; other
-        // kinds have no hover chrome). Hit testing stays on stable z-order so promotion
-        // cannot oscillate hover.
-        if let Some(id) = self.engine.drawing_text_hit_at(x_css, y_css) {
+        // kinds have no hover chrome, so a label hit on a ray or a rectangle stores no hovered
+        // text and only promotes the drawing). Hit testing stays on stable z-order so promotion
+        // cannot oscillate hover. The engine owns drawing hover arbitration (a drawing's own
+        // label, trend prompt included, answers first with the text cursor, then body/handle),
+        // shared verbatim with native hosts.
+        if let Some((id, cursor)) = self.engine.update_drawing_hover(x_css, y_css) {
             self.engine.clear_general_hover();
             self.engine.set_hovered_series(None);
-            self.engine.set_hovered_text(Some(id));
-            self.engine.set_hovered_drawing(Some(id));
             return result(
                 None,
                 Some(format!("drawing:{id}")),
-                Some("text".to_string()),
+                Some(cursor.to_string()),
                 None,
             );
         }
-        if let Some(drawing) = self.engine.hit_test_drawing(x_css, y_css) {
-            self.engine.clear_general_hover();
-            self.engine.set_hovered_series(None);
-            self.engine.set_hovered_text(Some(drawing.id));
-            self.engine.set_hovered_drawing(Some(drawing.id));
-            return result(
-                None,
-                Some(format!("drawing:{}", drawing.id)),
-                Some(drawing.cursor.to_string()),
-                None,
-            );
-        }
-        self.engine.set_hovered_text(None);
-        self.engine.set_hovered_drawing(None);
         // Walk the sources topmost-first, accumulating the best series hit (the reference's
         // `isBetterHit` arbitration); reaching the best primitive hit's owning series
         // returns whatever accumulated above it, else the primitive hit.
@@ -652,11 +639,16 @@ impl ChartInner {
         let Some(frame_pane) = self.frame.panes.get_mut(pane) else {
             return;
         };
-        let decoded = decode_commands(&json, &mut frame_pane.points, &text_defaults);
+        let decoded = decode_commands(
+            &json,
+            &mut frame_pane.points,
+            &text_defaults,
+            pane_clip(scissor),
+        );
         if !decoded.warnings.is_empty() {
             web_sys::console::warn_1(
                 &format!(
-                    "aeris_charts: pane primitive skipped {} command(s) — {}",
+                    "aeris_charts: pane primitive raised {} command warning(s) — {}",
                     decoded.warnings.len(),
                     decoded.warnings.join("; ")
                 )

@@ -1,6 +1,6 @@
 {
   "default_theme": "dark",
-  "border_width": 0.5,
+  "border_width": 1.0,
   "radius": {
     "small": 4,
     "default": 8,

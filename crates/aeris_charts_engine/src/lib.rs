@@ -5,15 +5,25 @@
 //! frame produced from this state. During the architecture recovery, frame construction is being
 //! migrated here incrementally from `aeris_charts_wasm`.
 
+// `Drawing::options_json` lists every drawing option, position settings and the family option
+// blocks included, in one `json!` literal, which needs more than the default macro depth.
+#![recursion_limit = "256"]
+
 mod alerts;
 mod axis_metrics;
 mod axis_primitives;
+mod bar_time_label_api;
+mod chart_input;
 mod depth;
 mod domains;
 mod drawing_contract;
+mod drawing_text_edit;
 mod drawings;
 mod exchange_time_api;
+mod external_studies;
 mod feature_series;
+mod financial_appearance;
+mod financial_legend;
 mod footprint;
 mod frame;
 mod general_axes;
@@ -50,9 +60,12 @@ mod trading;
 mod viewport;
 mod workspace;
 
+/// Initial stretch for engine-created separate indicator panes across all hosts.
+pub(crate) const SEPARATE_INDICATOR_PANE_STRETCH: f64 = 0.3;
+
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 
@@ -62,6 +75,10 @@ pub use aeris_charts_indicators::{
 pub use alerts::{
     AlertCondition, AlertCreateRequest, AlertFrequency, AlertId, AlertLine, AlertLineStatus,
     AlertPriceScale, AlertSnapshot, MAX_ALERT_LINES,
+};
+pub use chart_input::{
+    ChartContextMenu, ChartCursor, ChartInputEvent, ChartKey, ChartRegion, InteractionOptions,
+    PointerInput, PANE_SEPARATOR_HIT, TRADING_TOOLTIP_DWELL_MS,
 };
 pub use depth::{
     DepthBook, DepthBucket, DepthError, DepthEventCluster, DepthEventKind, DepthEventLayerOptions,
@@ -88,7 +105,7 @@ pub use drawing_contract::{
     DrawingSyncPayload, DrawingTemplate, DRAWING_CONTRACT_REVISION, MAX_DRAWING_CLIPBOARD_BYTES,
     MAX_DRAWING_CLIPBOARD_POINTS, MAX_DRAWING_GROUP_BYTES, MAX_DRAWING_LABELS, MAX_DRAWING_LEVELS,
     MAX_DRAWING_NAME_BYTES, MAX_DRAWING_OBJECTS, MAX_DRAWING_PRICE_SEGMENTS, MAX_DRAWING_TEMPLATES,
-    MAX_DRAWING_TEMPLATE_BYTES,
+    MAX_DRAWING_TEMPLATE_BYTES, MAX_DRAWING_TEXT_BYTES,
 };
 // B8: lines — begin
 pub use drawings::kinds::lines::{DrawingStatsPosition, LineToolOptions};
@@ -115,27 +132,43 @@ pub use drawings::kinds::patterns_elliott_cycles::{ElliottWaveDegree, PatternToo
 // B8: shapes — begin
 pub use drawings::kinds::shapes::ShapeToolOptions;
 // B8: shapes — end
+pub use bar_time_label_api::BarTimeLabel;
+pub use drawing_text_edit::DrawingTextEditKey;
 pub use drawings::{
     Drawing, DrawingAnchor, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId,
     DrawingKind, DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingTextEditLayout,
-    DrawingWorkStats, TextMeasureFn, DRAWING_DEFAULT_COLOR, DRAWING_WEAK_MAGNET_DISTANCE,
+    DrawingWorkStats, TextCapCenterFn, TextMeasureFn, DRAWING_DEFAULT_COLOR,
+    DRAWING_WEAK_MAGNET_DISTANCE,
 };
 pub(crate) use drawings::{
     DrawingAnchorTime, DrawingChartSettings, DrawingController, DrawingDrag, DrawingHistory,
-    DrawingRuntime, DrawingTextEdit,
+    DrawingRuntime,
+};
+pub use external_studies::{
+    ExternalStudyError, ExternalStudyInputRequirements, ExternalStudyInputStream,
+    ExternalStudyOutputDescriptor, ExternalStudyOutputInfo, ExternalStudyPaneTarget,
+    ExternalStudyPlotKind, ExternalStudyPointStyle, ExternalStudyScaleTarget,
+    ExternalStudyThresholdRegion, MAX_EXTERNAL_STUDY_OUTPUTS,
 };
 pub use feature_series::{
     FeatureDataPoint, FeatureSeriesKind, FeatureSeriesOptionsPatch, FeatureValue, HeatmapCell,
     StackedAreaColor,
 };
+pub use financial_appearance::{AppearanceColor, FinancialAppearance, FinancialThemeColors};
+pub use financial_legend::{
+    FinancialLegendIdentity, FinancialLegendRequest, FinancialLegendRow, FinancialLegendTone,
+    FinancialLegendValue, HostLegendSeries,
+};
 pub use footprint::{
-    AggressorSide, BarSequence, BarSequenceMapping, BarSequencePoint, CumulativeDeltaReset,
-    FootprintAggregationOptions, FootprintAggregator, FootprintBar, FootprintBarAggregation,
-    FootprintCellMode, FootprintError, FootprintImbalanceOptions, FootprintLevel,
-    FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind, FootprintVisualOptions,
-    FootprintWorkStats, ReplayClockStats, ReplaySeekStats, TimeAndSalesOptions, TimeAndSalesRow,
-    TradeBubbleOptions, TradeSessionOptions, TradeStreamStats, TradeStudyKind, TradeStudyOptions,
-    MAX_TIME_AND_SALES_ROWS, MAX_TRADE_STREAMS, MAX_TRADE_STREAM_KEY_BYTES,
+    adaptive_trade_bubble_threshold, auto_footprint_ticks_per_row, AggressorSide, BarSequence,
+    BarSequenceMapping, BarSequencePoint, CumulativeDeltaReset, FootprintAggregationOptions,
+    FootprintAggregator, FootprintBar, FootprintBarAggregation, FootprintCellMode, FootprintError,
+    FootprintImbalanceOptions, FootprintLevel, FootprintSeriesOptions, FootprintTrade,
+    FootprintUpdateKind, FootprintVisualOptions, FootprintWorkStats, OrderFlowPresentation,
+    OrderFlowPresentationOptions, ReplayClockStats, ReplaySeekStats, TimeAndSalesOptions,
+    TimeAndSalesRow, TradeBubbleOptions, TradeSessionOptions, TradeStreamStats, TradeStudyKind,
+    TradeStudyOptions, MAX_TIME_AND_SALES_ROWS, MAX_TRADE_STREAMS, MAX_TRADE_STREAM_KEY_BYTES,
+    ORDER_FLOW_SWEEP_WINDOW_MICROS, ORDER_FLOW_TRADE_BUBBLE_CAPACITY,
 };
 pub use frame::{
     AxisBand, AxisFrame, AxisIcon, AxisLabel, AxisLabelCorners, AxisRotatedLabel, AxisTextAlign,
@@ -170,11 +203,13 @@ pub use general_series::{
     MAX_GENERAL_SHARED_TOOLTIP_ITEMS, MIN_GENERAL_POINT_RADIUS,
 };
 pub use hit_test::{SeriesHit, SeriesHitKind};
+pub use host_layout::{FinancialFramePreparation, FinancialFrameRequest};
 pub(crate) use indicators::{IndicatorBinding, IndicatorChange};
 pub use indicators::{
-    IndicatorBindingInfo, IndicatorInputSource, IndicatorKind, IndicatorOutputDescriptor,
-    IndicatorOutputStyle, IndicatorParameterDescriptor, IndicatorParameterType, IndicatorSchema,
-    EMA_RIBBON_DEFAULT_COLORS, EMA_RIBBON_DEFAULT_PERIODS, INDICATOR_SCHEMA_REVISION,
+    IndicatorBindingInfo, IndicatorChromeOptions, IndicatorInputSource, IndicatorKind,
+    IndicatorOutputDescriptor, IndicatorOutputStyle, IndicatorParameterDescriptor,
+    IndicatorParameterType, IndicatorSchema, EMA_RIBBON_DEFAULT_COLORS, EMA_RIBBON_DEFAULT_PERIODS,
+    INDICATOR_SCHEMA_REVISION,
 };
 pub use interaction::{
     pinch_zoom_scale, wheel_zoom_scale, CancelReason, ChartContext, GestureResolver, GestureState,
@@ -221,11 +256,11 @@ pub use trading::{
     AccountId, ExecutionId, ExecutionKind, ExecutionMarkerShape, HostEventHit, HostEventMarker,
     HostOverlaySnapshot, HostTimeWindow, InstrumentMetadata, OrderId, OrderKind, OrderRole,
     OrderSide, OrderStatus, PositionId, PositionSide, TradingAnnotation,
-    TradingAnnotationPlacement, TradingAnnotationTone, TradingExecution, TradingGroupId,
-    TradingHit, TradingHitKind, TradingIntent, TradingIntentAction, TradingObjectId,
-    TradingPosition, TradingPreview, TradingPreviewSource, TradingPriceScale, TradingRoundTrip,
-    TradingRoundTripOutcome, TradingSnapshot, TradingStyle, TradingStyleOptions, WorkingOrder,
-    MAX_HOST_EVENTS, MAX_HOST_WINDOWS, MAX_TRADING_ANNOTATIONS, MAX_TRADING_OBJECTS,
+    TradingAnnotationPlacement, TradingAnnotationTone, TradingCursor, TradingExecution,
+    TradingGroupId, TradingHit, TradingHitKind, TradingIntent, TradingIntentAction,
+    TradingObjectId, TradingPosition, TradingPreview, TradingPreviewSource, TradingPriceScale,
+    TradingRoundTrip, TradingRoundTripOutcome, TradingSnapshot, TradingStyle, TradingStyleOptions,
+    WorkingOrder, MAX_HOST_EVENTS, MAX_HOST_WINDOWS, MAX_TRADING_ANNOTATIONS, MAX_TRADING_OBJECTS,
     MAX_TRADING_ROUND_TRIPS,
 };
 pub use workspace::{SplitDirection, Workspace, WorkspaceError, WorkspaceLayout};
@@ -252,8 +287,9 @@ use aeris_charts_core::options::{chart_theme_patch, ChartOptionsStore};
 pub use aeris_charts_core::scale::exchange_time::{
     ExchangeTime, ExchangeTimeError, UtcOffsetSchedule, UtcOffsetTransition,
 };
+pub use aeris_charts_core::scale::price_scale_core::PriceScaleMode;
 use aeris_charts_core::scale::price_scale_core::{
-    PriceScaleCore, PriceScaleCoreOptions, PriceScaleMargins, PriceScaleMode,
+    PriceScaleCore, PriceScaleCoreOptions, PriceScaleMargins,
 };
 pub use aeris_charts_core::scale::session_slots::{
     parse_iso_date, parse_wall_clock, session_slot_times, SessionSlotConvention, SessionSlotError,
@@ -263,7 +299,8 @@ pub use aeris_charts_core::scale::session_slots::{
     session_window_bounds, OutOfSessionPolicy, SessionBarGrid,
 };
 use aeris_charts_core::scale::time_scale_core::{TimeScaleCore, TimeScaleOptions};
-use aeris_charts_core::scale::time_tick_marks::TimeTickMarks;
+use aeris_charts_core::scale::time_tick_marks::{self, TimeTickMarks};
+pub use aeris_charts_core::time_zone::{ChartTimeZone, DEFAULT_TIME_ZONE, TRADINGVIEW_TIME_ZONES};
 use aeris_charts_core::TimePointIndex;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType};
@@ -721,6 +758,27 @@ pub struct PriceScaleInfo {
     pub built_in: bool,
     pub pane_index: usize,
     pub series_ids: Vec<SeriesId>,
+}
+
+/// Chrome state of the engine-resolved primary series attached to one price scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PriceScalePrimarySeries {
+    pub series_id: SeriesId,
+    pub price_line_visible: bool,
+    pub last_value_visible: bool,
+    pub title_visible: bool,
+    pub countdown_visible: bool,
+    pub bid_ask_visible: bool,
+}
+
+/// One independently toggled piece of built-in series chrome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeriesChromeFlag {
+    PriceLine,
+    LastValue,
+    Title,
+    Countdown,
+    BidAsk,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1388,10 +1446,9 @@ impl<'a> IntoIterator for &'a mut SeriesStore {
     }
 }
 
-/// Stable pane-boundary layout slot in CSS pixels. The visible separator rule is thinner and uses
-/// the canonical design-system border width during axis-frame lowering; hover/hit geometry is also
-/// independently expanded for usability.
-pub const PANE_SEPARATOR: f64 = 1.0;
+/// Pane-boundary layout slot in CSS pixels. The visible separator rule fills exactly this slot on
+/// the device-pixel grid; hover/hit geometry is independently expanded for usability.
+pub const PANE_SEPARATOR: f64 = 2.0;
 
 /// `pane_index` sentinel for a series whose pane was removed (reference `removePane` orphans the
 /// pane's series — `paneForSource` turns null): the series keeps its data but renders and
@@ -1712,6 +1769,10 @@ impl Default for Pane {
     }
 }
 
+/// A linked-crosshair position. `price` is a price on `pane_index`'s default price scale (the
+/// scale the crosshair label reads) and `time` an exact merged chart time. Applying it puts the
+/// horizontal line at that price's chart-content y, held on the pane's edge when the price is
+/// outside the pane's visible range.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrosshairSyncPosition {
     pub time: f64,
@@ -1747,6 +1808,27 @@ pub enum SyncMismatchPolicy {
     #[default]
     Nearest,
     Clear,
+}
+
+/// The validated keys of an options patch that can be rejected (see
+/// [`ChartEngine::prepare_options_patch`]).
+pub(crate) struct PreparedOptionsPatch {
+    exchange_time: exchange_time_api::ExchangeTimePatch,
+    tick_marks: Option<Option<Vec<time_tick_marks_api::TimeTickMark>>>,
+    bar_time_label: Option<BarTimeLabel>,
+}
+
+/// The engine feature that writes a series' rows. A series has at most one: every attach path
+/// refuses a series that already has another owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeriesOwner {
+    Footprint,
+    Synthetic,
+    Resampled,
+    /// A candlestick or bar presentation bound to a chart-level trade stream.
+    TradeBars,
+    /// A CVD, delta, or trade-volume study of a chart-level trade stream.
+    TradeStudy,
 }
 
 /// Platform-independent state for one chart instance.
@@ -1788,10 +1870,13 @@ pub struct ChartEngine {
     general_series: Option<general_series::GeneralSeriesRegistry>,
     pub options: ChartOptionsStore,
     theme: ChartTheme,
+    grid_color_follows_theme: bool,
+    crosshair_color_follows_theme: bool,
     pub crosshair_mode: CrosshairMode,
-    /// the public reference's Ctrl-held magnet: while set, a Normal-mode crosshair snaps to the hovered
-    /// bar's rendered prices exactly like `CrosshairMode::MagnetOhlc` (OHLC for candles/bars,
-    /// close/value for scalar series; frame/crosshair.rs `crosshair_snap`). The gesture layer
+    /// The temporary Ctrl-held drawing magnet: while set during drawing creation or drag, a
+    /// Normal-mode crosshair snaps to the hovered bar's rendered prices exactly like
+    /// `CrosshairMode::MagnetOhlc` (OHLC for candles/bars, close/value for scalar series;
+    /// frame/crosshair.rs `crosshair_snap`). Free browsing stays raw. The gesture layer
     /// forwards the live modifier state; the configured `crosshair_mode` is untouched
     /// (Magnet/MagnetOhlc stay as configured, Hidden stays hidden).
     pub crosshair_ohlc_magnet: bool,
@@ -1821,6 +1906,21 @@ pub struct ChartEngine {
     /// reference `timeScale.secondsVisible` — include seconds in axis/crosshair time labels when
     /// `time_visible` is set. Defaults to false (reference default).
     pub seconds_visible: bool,
+    /// The named IANA zone that produced `exchange_time`'s offsets (the default zone when an explicit
+    /// schedule was installed). Drives general temporal axes and the clock; canonical data and
+    /// public timestamps remain UTC.
+    time_zone: ChartTimeZone,
+    /// Display-only future time projection for deterministic time-based bars. These points extend
+    /// axis/crosshair labels into right-side whitespace without entering the data layer or moving
+    /// the canonical base index.
+    future_time_projection: Option<(i64, usize)>,
+    future_time_projection_revision: u64,
+    synced_future_time_projection_revision: u64,
+    /// Display-only historical time projection for deterministic time-based bars. These points
+    /// extend axis/crosshair labels into left-side whitespace without entering the data layer.
+    past_time_projection: Option<(i64, usize)>,
+    past_time_projection_revision: u64,
+    synced_past_time_projection_revision: u64,
     pub css_width: f64,
     pub css_height: f64,
     pub dpr: f64,
@@ -1852,6 +1952,9 @@ pub struct ChartEngine {
     pub(crate) left_builtin_axis_w: f64,
     pub(crate) right_builtin_axis_w: f64,
     indicators: Vec<IndicatorBinding>,
+    indicator_chrome: IndicatorChromeOptions,
+    external_study_outputs: BTreeMap<(u64, usize), external_studies::ExternalStudyOutputState>,
+    external_study_panes: BTreeMap<(u64, u8), PaneId>,
     /// During study-state restore, persisted oscillator panes are empty until their studies are
     /// recreated. The cursor lets the normal placement path reuse those panes without changing
     /// interactive study creation semantics.
@@ -1879,6 +1982,11 @@ pub struct ChartEngine {
     /// weights, built-in time labels, trading-day indicator resets, session highlighting, and
     /// the countdown window. Defaults to UTC with a midnight session start.
     pub(crate) exchange_time: ExchangeTime,
+    /// Which instant of a bar its time text prints (open by default) and, for a close-time
+    /// label with session windows, the window grid that ends short last bars exactly. The grid
+    /// is derived from the configured windows and the exchange time (`bar_time_label_api`).
+    bar_time_label: BarTimeLabel,
+    bar_label_grid: Option<SessionBarGrid>,
     /// Series ids in stable order, bottom to top (topmost LAST — the reference's z-order, pane.ts
     /// `orderedSources`/`setSeriesOrder`). Live series only: removed slots leave the list.
     /// This is the saved ordering: insertion order until an explicit `set_series_order`
@@ -1934,11 +2042,13 @@ pub struct ChartEngine {
     /// Chart-level drawing settings (magnet mode, price-basis label) and anchor time-identity
     /// bookkeeping; drawings.rs owns every field.
     drawing_settings: DrawingChartSettings,
-    /// The open inline text-edit session (drawings.rs): the drawing whose host editor owns
-    /// text input, with the text it began from. Frame construction keeps committed glyphs for
-    /// the transparent overlay-caret model, keeps an empty trend label's measured middle gap,
-    /// and keeps an empty family text box's caret line while it is open. Runtime only.
-    text_edit: Option<DrawingTextEdit>,
+    /// The one engine-owned typing session (drawing_text_edit.rs): the drawing whose editor owns
+    /// text input, its live text, caret and selection, and the revision it began from. The
+    /// drawing id is the source of `editing_drawing()`. Frame construction keeps committed
+    /// glyphs for the transparent overlay-caret model, keeps an empty trend label's measured
+    /// middle gap, and keeps an empty family text box's caret line while it is open. Runtime
+    /// only.
+    drawing_text_edit: Option<drawing_text_edit::DrawingTextEditSession>,
     /// The text drawing under the host's pointer (drawings.rs): the overlay frame paints its
     /// focus border at hover opacity (the public reference's hover ring). Only the text tool has hover
     /// chrome — other kinds show nothing until selected.
@@ -1951,12 +2061,20 @@ pub struct ChartEngine {
     /// Optional host text-measure callback for drawing-label hit boxes (drawings.rs
     /// [`TextMeasureFn`]); without one the engine estimates widths by character count.
     text_measure_fn: Option<TextMeasureFn>,
+    /// Optional host vertical glyph metric that optically centers control text (drawings.rs
+    /// [`TextCapCenterFn`]); without one text stays on the em-box middle.
+    text_cap_center_fn: Option<TextCapCenterFn>,
     /// Kinetic (momentum) scroll sampler/coast for the active drag (engine interaction module,
     /// reference `KineticAnimation`); the host feeds samples and drives the coast per frame.
     kinetic: Option<aeris_charts_core::model::kinetic_animation::KineticAnimation>,
     /// Velocity-owned keyboard pan. This is separate from public `scroll_to_position(..., true)`:
     /// a held arrow receives bounded engine-timed velocity kicks with light drag; key-up stops it.
     keyboard_scroll_animation: Option<interaction::KeyboardKineticScroll>,
+    /// Host-neutral pointer, wheel and keyboard routing (chart_input.rs). Runtime-only.
+    input: chart_input::InputController,
+    /// Area series composed with a Delta Tooltip into a brushable comparison: the tooltip owns the
+    /// range gesture and the engine restyles the area from its active range. At most one per series.
+    brushable_areas: Vec<native_primitives::BrushableArea>,
     /// In-flight eased scroll-to-position (engine interaction module); the host schedules the
     /// ticks, the engine owns the easing and applies each step.
     scroll_animation: Option<interaction::ScrollAnimation>,
@@ -2033,6 +2151,8 @@ impl ChartEngine {
             general_series: None,
             options: ChartOptionsStore::new(),
             theme: ChartTheme::default(),
+            grid_color_follows_theme: true,
+            crosshair_color_follows_theme: true,
             crosshair_mode: CrosshairMode::Normal,
             crosshair_ohlc_magnet: false,
             animation_time: 0.0,
@@ -2048,6 +2168,13 @@ impl ChartEngine {
             tick_mark_max_character_length: 8,
             separator_hover: None,
             seconds_visible: false,
+            time_zone: ChartTimeZone::default(),
+            future_time_projection: None,
+            future_time_projection_revision: 0,
+            synced_future_time_projection_revision: 0,
+            past_time_projection: None,
+            past_time_projection_revision: 0,
+            synced_past_time_projection_revision: 0,
             css_width,
             css_height,
             dpr,
@@ -2067,6 +2194,9 @@ impl ChartEngine {
             left_builtin_axis_w: 0.0,
             right_builtin_axis_w: 0.0,
             indicators: Vec::new(),
+            indicator_chrome: IndicatorChromeOptions::default(),
+            external_study_outputs: BTreeMap::new(),
+            external_study_panes: BTreeMap::new(),
             study_restore_pane_cursor: None,
             indicator_changes: Vec::new(),
             trade_streams: HashMap::new(),
@@ -2082,6 +2212,8 @@ impl ChartEngine {
             date_format: DEFAULT_DATE_FORMAT.to_string(),
             month_names: MonthNames::default(),
             exchange_time: ExchangeTime::default(),
+            bar_time_label: BarTimeLabel::default(),
+            bar_label_grid: None,
             series_order,
             series_order_explicit: false,
             hovered_series: None,
@@ -2099,12 +2231,15 @@ impl ChartEngine {
             drawing_sync_source: String::new(),
             drawing_sync_revision: 0,
             drawing_settings: DrawingChartSettings::default(),
-            text_edit: None,
+            drawing_text_edit: None,
             hovered_text: None,
             hovered_drawing: None,
             text_measure_fn: None,
+            text_cap_center_fn: None,
             kinetic: None,
             keyboard_scroll_animation: None,
+            input: chart_input::InputController::default(),
+            brushable_areas: Vec::new(),
             scroll_animation: None,
             price_formatter_fn: None,
             tick_mark_formatter_fn: None,
@@ -2152,7 +2287,15 @@ impl ChartEngine {
                 .get(index)
                 .map(|point| point.open_timestamp_micros as f64 / 1_000_000.0);
         }
-        self.data.merged_times().get(index).map(|&time| time as f64)
+        self.projected_axis_time_at(index).map(|time| time as f64)
+    }
+
+    pub(crate) fn axis_time_seconds_at_logical(&self, index: i64) -> Option<f64> {
+        if index >= 0 {
+            return self.axis_time_seconds_at(usize::try_from(index).ok()?);
+        }
+        self.projected_axis_time_at_logical(index)
+            .map(|time| time as f64)
     }
 
     pub(crate) fn axis_time_key_at(&self, index: usize) -> Option<i64> {
@@ -2161,9 +2304,49 @@ impl ChartEngine {
                 .get(index)
                 .map(|point| point.open_timestamp_micros.div_euclid(1_000_000));
         }
-        self.data.merged_times().get(index).copied()
+        self.projected_axis_time_at(index)
     }
 
+    pub(crate) fn axis_time_key_at_logical(&self, index: i64) -> Option<i64> {
+        if index >= 0 {
+            return self.axis_time_key_at(usize::try_from(index).ok()?);
+        }
+        self.projected_axis_time_at_logical(index)
+    }
+
+    fn projected_axis_time_at(&self, index: usize) -> Option<i64> {
+        let times = self.data.merged_times();
+        if let Some(&time) = times.get(index) {
+            return Some(time);
+        }
+        let (&last, (step, count)) = (times.last()?, self.future_time_projection?);
+        let future_index = index.checked_sub(times.len())?;
+        if future_index >= count {
+            return None;
+        }
+        let multiple = i64::try_from(future_index.checked_add(1)?).ok()?;
+        last.checked_add(step.checked_mul(multiple)?)
+    }
+
+    fn projected_axis_time_at_logical(&self, index: i64) -> Option<i64> {
+        if index >= 0 {
+            return self.projected_axis_time_at(usize::try_from(index).ok()?);
+        }
+        let (&first, (step, count)) = (
+            self.data.merged_times().first()?,
+            self.past_time_projection?,
+        );
+        let distance = usize::try_from(index.checked_neg()?).ok()?;
+        if distance == 0 || distance > count {
+            return None;
+        }
+        let multiple = i64::try_from(distance).ok()?;
+        first.checked_sub(step.checked_mul(multiple)?)
+    }
+
+    /// The bar that contains `time`: the last bar opening at or before it, so an intraday event
+    /// lands on its own daily candle rather than the next one. Times before the first bar clamp
+    /// to it, matching the sequence-axis path.
     pub(crate) fn axis_index_for_time(&self, time: i64) -> Option<usize> {
         if self.sequence_points().is_some() {
             return self
@@ -2176,8 +2359,8 @@ impl ChartEngine {
         }
         Some(
             times
-                .binary_search(&time)
-                .unwrap_or_else(|index| index.min(times.len() - 1)),
+                .partition_point(|&open| open <= time)
+                .saturating_sub(1),
         )
     }
 
@@ -2188,8 +2371,12 @@ impl ChartEngine {
             self.indicator_memory_usage();
         EngineMemoryUsage {
             data: self.data.memory_usage(),
-            tick_payload_bytes: self.tick_marks.payload_bytes() + self.time_tick_marks_bytes().0,
-            tick_capacity_bytes: self.tick_marks.capacity_bytes() + self.time_tick_marks_bytes().1,
+            tick_payload_bytes: self.tick_marks.payload_bytes()
+                + self.time_tick_marks_bytes().0
+                + self.bar_time_label_bytes().0,
+            tick_capacity_bytes: self.tick_marks.capacity_bytes()
+                + self.time_tick_marks_bytes().1
+                + self.bar_time_label_bytes().1,
             indicator_runtime_bytes,
             indicator_transfer_capacity_bytes,
             retained_frame_capacity_bytes: self.retained_frame.capacity_bytes(),
@@ -2404,6 +2591,83 @@ impl ChartEngine {
     pub fn set_time_formatter(&mut self, f: Option<TimeFormatterFn>) {
         self.time_formatter_fn = f;
         self.invalidate_frame_overlay();
+    }
+
+    /// Configure display-only future timestamps for deterministic time-based bars.
+    ///
+    /// These timestamps participate only in time-axis/crosshair labeling. They never enter the
+    /// canonical data layer, never create candle/volume rows, and never advance the base index.
+    /// Passing `None` or `points == 0` disables the projection.
+    pub fn set_future_time_projection(
+        &mut self,
+        cadence_seconds: Option<i64>,
+        points: usize,
+    ) -> bool {
+        const MAX_FUTURE_TIME_POINTS: usize = 4_096;
+        let next = cadence_seconds
+            .filter(|step| *step > 0)
+            .filter(|_| points > 0)
+            .map(|step| (step, points.min(MAX_FUTURE_TIME_POINTS)));
+        if self.future_time_projection == next {
+            return false;
+        }
+        self.future_time_projection = next;
+        self.future_time_projection_revision = self.future_time_projection_revision.wrapping_add(1);
+        self.rebuild_tick_weights();
+        self.invalidate_frame_layout_and_axis();
+        self.invalidate_frame_overlay();
+        true
+    }
+
+    /// Configure display-only historical timestamps for deterministic time-based bars.
+    ///
+    /// These timestamps participate only in time-axis/crosshair labeling. They never enter the
+    /// canonical data layer, never create candle/volume rows, and never change the base index.
+    /// Passing `None` or `points == 0` disables the projection.
+    pub fn set_past_time_projection(
+        &mut self,
+        cadence_seconds: Option<i64>,
+        points: usize,
+    ) -> bool {
+        const MAX_PAST_TIME_POINTS: usize = 4_096;
+        let next = cadence_seconds
+            .filter(|step| *step > 0)
+            .filter(|_| points > 0)
+            .map(|step| (step, points.min(MAX_PAST_TIME_POINTS)));
+        if self.past_time_projection == next {
+            return false;
+        }
+        self.past_time_projection = next;
+        self.past_time_projection_revision = self.past_time_projection_revision.wrapping_add(1);
+        self.rebuild_tick_weights();
+        self.invalidate_frame_layout_and_axis();
+        self.invalidate_frame_overlay();
+        true
+    }
+
+    /// Whether this chart currently has display-only historical time points configured.
+    #[must_use]
+    pub const fn has_past_time_projection(&self) -> bool {
+        self.past_time_projection.is_some()
+    }
+
+    /// Whether this chart currently has display-only future time points configured.
+    #[must_use]
+    pub const fn has_future_time_projection(&self) -> bool {
+        self.future_time_projection.is_some()
+    }
+
+    /// Live clock text in the selected chart time zone, suitable for host chrome.
+    pub fn time_zone_clock_text(&self, utc_seconds: i64, show_seconds: bool) -> String {
+        let Some(parts) = self.time_zone.local_parts(utc_seconds) else {
+            return "--:--".to_string();
+        };
+        let clock = if show_seconds {
+            format!("{:02}:{:02}:{:02}", parts.hour, parts.minute, parts.second)
+        } else {
+            format!("{:02}:{:02}", parts.hour, parts.minute)
+        };
+        format!("{clock} {}", self.time_zone.abbreviation(utc_seconds))
     }
 
     /// reference `localization.dateFormat` (default `dd MMM \'yy`): the pattern driving the
@@ -3231,6 +3495,30 @@ impl ChartEngine {
         }
     }
 
+    /// Current visibility of a live series.
+    #[must_use]
+    pub fn series_visible(&self, id: SeriesId) -> Option<bool> {
+        self.series_entry(id).map(|series| series.visible)
+    }
+
+    /// Toggle one typed series-chrome flag without a JSON round trip.
+    pub fn toggle_series_chrome(&mut self, id: SeriesId, flag: SeriesChromeFlag) -> bool {
+        let Some(series) = self.series_entry_mut(id) else {
+            return false;
+        };
+        match flag {
+            SeriesChromeFlag::PriceLine => series.price_line_visible = !series.price_line_visible,
+            SeriesChromeFlag::LastValue => series.last_value_visible = !series.last_value_visible,
+            SeriesChromeFlag::Title => series.title_visible = !series.title_visible,
+            SeriesChromeFlag::Countdown => {
+                series.countdown_visible = !series.countdown_visible;
+            }
+            SeriesChromeFlag::BidAsk => series.bid_ask_visible = !series.bid_ask_visible,
+        }
+        self.invalidate_frame_layout_and_axis();
+        true
+    }
+
     /// The effective primary series: the first visible, non-removed entry. reference lets any
     /// series be removed (`removeSeries`), so every "first series" anchor resolves through
     /// this fallback instead of assuming id 0 is alive.
@@ -3238,14 +3526,18 @@ impl ChartEngine {
         self.series.iter().find(|s| !s.removed && s.visible)
     }
 
-    /// Host choice for a series' last-price pulse. Line and area default on; this records an
-    /// explicit opt-out (or opt-in for other kinds) that later kind changes preserve.
+    /// Host choice for a series' last-price pulse. Line and area default on; a value that differs
+    /// from the current kind's default records an explicit opt-out (or opt-in for other kinds)
+    /// that later kind changes preserve. Restating the default is not a preference: hosts re-send
+    /// their whole style, and treating a line's default-on pulse as an opt-in would carry it onto
+    /// candles after a type change.
     pub fn set_series_last_price_animation(&mut self, id: SeriesId, enabled: bool) -> bool {
         let Some(series) = self.series.iter_mut().find(|s| s.id == id && !s.removed) else {
             return false;
         };
         series.last_price_animation = enabled;
-        series.last_price_animation_explicit = true;
+        series.last_price_animation_explicit =
+            enabled != SeriesEntry::default_last_price_animation(series.kind);
         true
     }
 
@@ -3427,7 +3719,10 @@ impl ChartEngine {
         self.update_series_bars_sanitized_inner(id, times, open, high, low, close)
     }
 
-    fn update_series_bars_sanitized_inner(
+    /// The unguarded batch update for engine features that own the series they write. `0` means
+    /// nothing was applied (an empty batch, or rows the data layer rejected), so a caller that
+    /// keeps a full-install fallback takes it.
+    pub(crate) fn update_series_bars_sanitized_inner(
         &mut self,
         id: SeriesId,
         times: Vec<i64>,
@@ -3436,6 +3731,9 @@ impl ChartEngine {
         low: Vec<f64>,
         close: Vec<f64>,
     ) -> usize {
+        if times.is_empty() {
+            return 0;
+        }
         self.invalidate_frame_series(id);
         let previous_generation = self.data.series_generation(id).unwrap_or(0);
         let Some(from) = self
@@ -3680,7 +3978,8 @@ impl ChartEngine {
         self.install_series_data_inner(id, times, open, high, low, close)
     }
 
-    fn install_series_data_inner(
+    /// The unguarded installer for engine features that own the series they write.
+    pub(crate) fn install_series_data_inner(
         &mut self,
         id: SeriesId,
         times: Vec<i64>,
@@ -3708,16 +4007,50 @@ impl ChartEngine {
         })
     }
 
-    /// Source-owned series may only be mutated through their canonical footprint/trade or
-    /// synthetic-bar ingestion API. Generic OHLC writes would desynchronize the visible
-    /// projection from the state that owns replay, sequence identity, and incremental updates.
+    /// Which engine feature writes a series' rows, if any. Computed from the ownership registries
+    /// on demand, so removing a series or its owner can never leave a stale answer behind.
+    fn series_owner(&self, id: SeriesId) -> Option<SeriesOwner> {
+        if self.is_footprint_series(id) {
+            Some(SeriesOwner::Footprint)
+        } else if self.synthetic_series.contains_key(&id) {
+            Some(SeriesOwner::Synthetic)
+        } else if self
+            .resampled_series
+            .values()
+            .any(|binding| binding.target == id || binding.volume_target == Some(id))
+        {
+            Some(SeriesOwner::Resampled)
+        } else if self.is_trade_bar_dependent(id) {
+            Some(SeriesOwner::TradeBars)
+        } else if self
+            .trade_dependents
+            .values()
+            .flatten()
+            .any(|dependent| dependent.series_id == id)
+        {
+            Some(SeriesOwner::TradeStudy)
+        } else {
+            None
+        }
+    }
+
+    /// Source-owned series may only be mutated by their owning engine feature: the footprint and
+    /// trade-stream projections, synthetic bars, and resampling write them through the internal
+    /// `*_inner` installers. Every public host write refuses them, because a generic write would
+    /// desynchronize the visible rows from the state that owns replay, sequence identity, and
+    /// incremental updates.
     fn is_source_owned_series(&self, id: SeriesId) -> bool {
-        self.is_footprint_series(id)
-            || self.synthetic_series.contains_key(&id)
-            || self
-                .resampled_series
-                .values()
-                .any(|binding| binding.target == id || binding.volume_target == Some(id))
+        self.series_owner(id).is_some()
+    }
+
+    /// Whether an engine feature writes this series' rows: a footprint, a trade-bound candle or
+    /// bar, a CVD, delta, or trade-volume study, a resampled or synthetic-bar target. Every host
+    /// data write to such a series is refused with the write entry's ordinary refusal value
+    /// (`false`, `0`, `None`, `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`),
+    /// and those values also mean an unknown or removed id or invalid data. Hosts that must tell
+    /// them apart ask here. Indicator outputs are not source-owned in this sense.
+    pub fn series_is_source_owned(&self, id: SeriesId) -> bool {
+        self.is_source_owned_series(id)
     }
 
     pub(crate) fn install_footprint_projection(
@@ -3831,8 +4164,13 @@ impl ChartEngine {
         key_base: i64,
         projection: SequenceProjectionColumns,
     ) -> bool {
+        // A bound candle may be shown as any OHLC-derived chart type; only host-valued kinds and
+        // footprints have another writer.
         debug_assert!(self.series_entry(id).is_some_and(|series| {
-            matches!(series.kind, SeriesKind::Candlestick | SeriesKind::Bar)
+            !matches!(
+                series.kind,
+                SeriesKind::Custom | SeriesKind::Feature | SeriesKind::Footprint
+            )
         }));
         self.install_sequence_projection_inner(id, Some(key_base), projection)
     }
@@ -3957,8 +4295,13 @@ impl ChartEngine {
         from: usize,
         projection: SequenceProjectionColumns,
     ) -> usize {
+        // A bound candle may be shown as any OHLC-derived chart type; only host-valued kinds and
+        // footprints have another writer.
         debug_assert!(self.series_entry(id).is_some_and(|series| {
-            matches!(series.kind, SeriesKind::Candlestick | SeriesKind::Bar)
+            !matches!(
+                series.kind,
+                SeriesKind::Custom | SeriesKind::Feature | SeriesKind::Footprint
+            )
         }));
         self.update_sequence_projection_bars_inner(id, from, projection)
     }
@@ -4116,14 +4459,16 @@ impl ChartEngine {
         let footprint = self
             .series_entry(id)
             .is_some_and(|series| series.footprint.is_some());
-        let hidden = if footprint {
-            0
+        if footprint {
+            // The footprint's own rows leave with its stream's other presentations, in one
+            // data-layer transaction (`trim_footprint_rows_front`).
+            self.trim_feature_rows_front(id, keep);
+            self.trim_footprint_rows_front(id, keep);
         } else {
-            self.data.series_rows(id).unwrap_or(visible) - visible
-        };
-        self.data.trim_front(id, keep + hidden);
-        self.trim_feature_rows_front(id, keep + hidden);
-        self.trim_footprint_rows_front(id, keep);
+            let hidden = self.data.series_rows(id).unwrap_or(visible) - visible;
+            self.data.trim_front(id, keep + hidden);
+            self.trim_feature_rows_front(id, keep + hidden);
+        }
         true
     }
 
@@ -4349,7 +4694,9 @@ impl ChartEngine {
     /// reference `chart.setCrosshairPosition(price, time, series)` (chart-model.ts
     /// `setAndSaveSyntheticPosition`): position the crosshair at a data point without a DOM
     /// event. The time must land exactly on a merged time point (false otherwise); x is that
-    /// bar's coordinate and y the price converted through the given series' price scale.
+    /// bar's coordinate and y the price converted through the given series' price scale (the
+    /// queued sync event carries a price on the pane's default scale, see
+    /// [`CrosshairSyncPosition`]).
     /// Works headless — the next built frame draws it; hosts emit their crosshair event.
     pub fn set_crosshair_position(&mut self, price: f64, time: f64, series_id: SeriesId) -> bool {
         if !price.is_finite() || self.is_series_removed(series_id) {
@@ -4371,17 +4718,56 @@ impl ChartEngine {
         };
         let x = self.time_scale.index_to_coordinate(index);
         self.crosshair = Some((x, y));
+        let pane_index = self
+            .series_entry(series_id)
+            .map_or(0, |series| series.pane_index);
+        // The synced price is a price on the pane's default scale, which is what a linked chart
+        // converts. The raw host price is kept only when it already is one; a series on another
+        // scale (or on another percentage/indexed base) is re-read from the crosshair y so the
+        // receiver lands on the same line.
+        let sync_price = if self.series_price_is_on_pane_default_scale(series_id) {
+            price
+        } else {
+            self.pane_coordinate_to_price(pane_index, y)
+                .unwrap_or(price)
+        };
         self.queue_sync_event(ChartSyncEventKind::Crosshair {
             position: CrosshairSyncPosition {
                 time,
-                price,
-                pane_index: self
-                    .series_entry(series_id)
-                    .map_or(0, |series| series.pane_index),
+                price: sync_price,
+                pane_index,
             },
         });
         self.invalidate_frame_overlay();
         true
+    }
+
+    /// Whether a price on `series_id` is already a price on its pane's default scale: the series
+    /// sits on that scale and, in the modes that read a per-series base (percentage and indexed),
+    /// shares the default series' base.
+    fn series_price_is_on_pane_default_scale(&self, series_id: SeriesId) -> bool {
+        let Some(series) = self.series_entry(series_id) else {
+            return false;
+        };
+        let pane_index = series.pane_index;
+        if series.price_scale_target != self.pane_default_scale_target(pane_index) {
+            return false;
+        }
+        let series_based = self
+            .price_scale_for(pane_index, series.price_scale_target)
+            .is_some_and(|scale| {
+                matches!(
+                    scale.mode(),
+                    PriceScaleMode::Percentage | PriceScaleMode::IndexedTo100
+                )
+            });
+        if !series_based {
+            return true;
+        }
+        let Some((from, _)) = self.visible_range_for_frame() else {
+            return false;
+        };
+        self.series_base_value(series_id, from) == Some(self.pane_default_scale(pane_index, from).1)
     }
 
     /// reference `chart.clearCrosshairPosition`. The engine keeps a single stored position — the
@@ -4414,12 +4800,13 @@ impl ChartEngine {
     pub fn crosshair_sync_position(&self) -> Option<CrosshairSyncPosition> {
         let (x, y) = self.crosshair?;
         let logical = self.time_scale.coordinate_to_index(x);
-        let time = self.axis_time_seconds_at(logical as usize)?;
-        let pane_index = self.pane_at_y(y).unwrap_or(0);
-        let pane = self.panes.get(pane_index)?;
+        let time = self.axis_time_seconds_at_logical(logical)?;
+        // The crosshair y is chart-content space and every scale already applies its own pane
+        // offset, so y goes to the scale untouched. A separator resolves to the pane above.
+        let pane_index = self.pane_index_at_y(y);
         Some(CrosshairSyncPosition {
             time,
-            price: pane.price_scale.coordinate_to_price(y - pane.top, 0.0),
+            price: self.pane_coordinate_to_price(pane_index, y)?,
             pane_index,
         })
     }
@@ -4441,14 +4828,38 @@ impl ChartEngine {
         let Some(pane) = self.panes.get(position.pane_index) else {
             return false;
         };
-        let y = pane.price_scale.price_to_coordinate(position.price, 0.0) + pane.top;
-        let next = (self.time_scale.index_to_coordinate(index), y);
+        let (top, bottom) = (pane.top, pane.top + pane.height);
+        let Some(y) = self.pane_price_to_coordinate(position.pane_index, position.price) else {
+            return false;
+        };
+        // The crosshair y is one chart-content value: keep it inside the requested pane so a
+        // price outside that pane's range sits on its edge instead of drawing in a neighbour.
+        let next = (
+            self.time_scale.index_to_coordinate(index),
+            y.max(top).min(bottom),
+        );
         let changed = self.crosshair != Some(next);
         self.crosshair = Some(next);
         if changed {
             self.invalidate_frame_overlay();
         }
         changed
+    }
+
+    /// Apply one coordinator-originated synchronization event without publishing it back to the
+    /// local synchronization queue. This is the canonical linked-chart ingress: hosts must not
+    /// drain the queue after applying an external event because doing so can discard unrelated
+    /// user-originated events that were already waiting for delivery.
+    pub fn apply_external_sync_event(&mut self, kind: &ChartSyncEventKind) -> bool {
+        match kind {
+            ChartSyncEventKind::Crosshair { position } => {
+                self.apply_external_crosshair(Some(*position))
+            }
+            ChartSyncEventKind::ClearCrosshair => self.apply_external_crosshair(None),
+            ChartSyncEventKind::VisibleTimeRange { range } => {
+                self.set_visible_time_range_impl(range.from, range.to, false)
+            }
+        }
     }
 
     #[must_use]
@@ -4576,32 +4987,118 @@ impl ChartEngine {
     /// public time-scale API. Returns the parse error for a malformed patch.
     pub fn apply_options(&mut self, patch_json: &str) -> Result<(), serde_json::Error> {
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
-        // Exchange-time keys validate before anything mutates so a rejected schedule never
-        // reaches the options store (and therefore persistence).
-        let exchange_time = Self::parse_exchange_time_patch(&patch)
-            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
-        let tick_marks = time_tick_marks_api::parse_time_tick_marks_patch(&patch)
-            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
-        self.options.apply(&patch);
+        let prepared = self.prepare_options_patch(&patch)?;
+        self.apply_prepared_options(&patch, prepared);
+        Ok(())
+    }
+
+    /// Validate the keys of an options patch that can be rejected, before anything mutates: a
+    /// rejected schedule, tick mark list, or bar time label never reaches the options store (and
+    /// therefore persistence). They are judged against the state that will be in force after the
+    /// patch, so a session start that the installed bar time label windows do not fit is
+    /// rejected here. Read-only: callers that replace other chart state first (a V2 import)
+    /// prepare before their first mutation and apply afterwards without a failure path.
+    pub(crate) fn prepare_options_patch(
+        &self,
+        patch: &serde_json::Value,
+    ) -> Result<PreparedOptionsPatch, serde_json::Error> {
+        let custom = <serde_json::Error as serde::de::Error>::custom;
+        let exchange_time = self.parse_exchange_time_patch(patch).map_err(custom)?;
+        let tick_marks = time_tick_marks_api::parse_time_tick_marks_patch(patch).map_err(custom)?;
+        let bar_time_label = self
+            .parse_bar_time_label_patch(patch, exchange_time.session_start_seconds())
+            .map_err(custom)?;
+        Ok(PreparedOptionsPatch {
+            exchange_time,
+            tick_marks,
+            bar_time_label,
+        })
+    }
+
+    /// Apply a patch validated by [`Self::prepare_options_patch`] against this chart's current
+    /// state (the store merge, the runtime keys, the exchange time, the bar time label, and the
+    /// explicit tick marks). Infallible.
+    pub(crate) fn apply_prepared_options(
+        &mut self,
+        patch: &serde_json::Value,
+        prepared: PreparedOptionsPatch,
+    ) {
+        if patch
+            .get("grid")
+            .and_then(|grid| grid.get("vertLines").or_else(|| grid.get("horzLines")))
+            .and_then(|lines| lines.get("color"))
+            .is_some()
+        {
+            self.grid_color_follows_theme = false;
+        }
+        if patch
+            .get("crosshair")
+            .and_then(|crosshair| {
+                crosshair
+                    .get("vertLine")
+                    .or_else(|| crosshair.get("horzLine"))
+            })
+            .and_then(|line| line.get("color"))
+            .is_some()
+        {
+            self.crosshair_color_follows_theme = false;
+        }
+        self.options.apply(patch);
         // Re-derive runtime state that isn't read straight from the store each frame.
         self.crosshair_mode = crosshair_mode_from_u8(self.options.get().crosshair.mode);
-        self.route_time_scale_patch(&patch);
-        self.route_price_scale_patch(&patch);
-        self.route_localization_patch(&patch);
-        self.apply_exchange_time_patch(exchange_time);
-        if let Some(marks) = tick_marks {
+        self.route_time_scale_patch(patch);
+        self.route_price_scale_patch(patch);
+        self.route_localization_patch(patch);
+        // The label is stored before the exchange time changes and placed after it: the patch
+        // validated the label for the session start it installs, so the window grid is never
+        // placed for the old start.
+        let label_changed = prepared
+            .bar_time_label
+            .map(|label| self.replace_bar_time_label(label));
+        self.apply_exchange_time_patch(prepared.exchange_time);
+        if let Some(changed) = label_changed {
+            self.bar_time_label_replaced(changed);
+        }
+        if let Some(marks) = prepared.tick_marks {
             self.set_time_tick_marks(marks)
                 .expect("time tick marks were validated before the options patch applied");
         }
         self.invalidate_frame_all();
-        Ok(())
     }
 
     /// Switch all chart cosmetics using Aeris's canonical style-token source.
     pub fn set_theme(&mut self, theme: ChartTheme) {
+        let custom_grid = (!self.grid_color_follows_theme).then(|| {
+            (
+                self.options.get().grid.vert_lines.color.clone(),
+                self.options.get().grid.horz_lines.color.clone(),
+            )
+        });
+        let custom_crosshair = (!self.crosshair_color_follows_theme).then(|| {
+            (
+                self.options.get().crosshair.vert_line.color.clone(),
+                self.options.get().crosshair.horz_line.color.clone(),
+            )
+        });
         self.theme = theme;
         let patch = chart_theme_patch(theme);
         self.options.apply(&patch);
+        if let Some((vert, horz)) = custom_grid {
+            self.options.apply(&serde_json::json!({
+                "grid": {
+                    "vertLines": { "color": vert },
+                    "horzLines": { "color": horz },
+                }
+            }));
+        }
+        if let Some((vert, horz)) = custom_crosshair {
+            self.options.apply(&serde_json::json!({
+                "crosshair": {
+                    "vertLine": { "color": vert },
+                    "horzLine": { "color": horz },
+                }
+            }));
+        }
         self.route_price_scale_patch(&patch);
         self.invalidate_frame_all();
     }
@@ -4619,6 +5116,8 @@ impl ChartEngine {
     /// Theme-aware form used by hosts whose selected theme lives outside the headless engine.
     pub fn reset_style_to_theme_defaults(&mut self, theme: ChartTheme) {
         self.theme = theme;
+        self.grid_color_follows_theme = true;
+        self.crosshair_color_follows_theme = true;
         self.options.reset_style_to_defaults(theme);
 
         for pane in &mut self.panes {
@@ -4813,6 +5312,7 @@ impl ChartEngine {
             "session_start": self.exchange_time.session_start_seconds(),
             "lock_visible_logical_range": options.lock_visible_logical_range,
             "tick_marks": self.time_tick_marks_json(),
+            "bar_time_label": self.bar_time_label_json(),
         })
         .to_string()
     }
@@ -4890,7 +5390,7 @@ impl ChartEngine {
             return None;
         }
         let index = self.time_scale.coordinate_to_index(x);
-        (index >= 0).then(|| self.axis_time_seconds_at(index as usize))?
+        self.axis_time_seconds_at_logical(index)
     }
 
     pub fn visible_logical_range(&self) -> Option<(f64, f64)> {
@@ -4924,12 +5424,16 @@ impl ChartEngine {
 
     /// Set the visible window to the points bracketing a UTC-seconds range.
     pub fn set_visible_time_range(&mut self, from: f64, to: f64) {
+        let _ = self.set_visible_time_range_impl(from, to, true);
+    }
+
+    fn set_visible_time_range_impl(&mut self, from: f64, to: f64, publish: bool) -> bool {
         if !from.is_finite() || !to.is_finite() || from > to {
-            return;
+            return false;
         }
         let point_count = self.data.merged_times().len();
         if point_count == 0 {
-            return;
+            return false;
         }
         let (left, right) = if let Some(points) = self.sequence_points() {
             let left = points
@@ -4945,19 +5449,27 @@ impl ChartEngine {
             )
         };
         if right == 0 || left >= point_count {
-            return;
+            return false;
         }
         let last = point_count - 1;
         let left = left.min(last) as i64;
         let right = (right - 1).min(last) as i64;
-        if left <= right {
-            self.time_scale
-                .set_visible_range(StrictRange::new(left, right), false);
-            self.queue_sync_event(ChartSyncEventKind::VisibleTimeRange {
-                range: VisibleTimeRangeSync { from, to },
-            });
+        if left > right {
+            return false;
+        }
+        let before = self.visible_logical_range();
+        self.time_scale
+            .set_visible_range(StrictRange::new(left, right), false);
+        let changed = before != self.visible_logical_range();
+        if changed {
+            if publish {
+                self.queue_sync_event(ChartSyncEventKind::VisibleTimeRange {
+                    range: VisibleTimeRangeSync { from, to },
+                });
+            }
             self.invalidate_frame_scene();
         }
+        changed
     }
 
     /// Lay out stacked panes inside the chart content area. This is shared by hosts that need
@@ -5004,6 +5516,9 @@ impl ChartEngine {
         // Non-time footprint axes label ticks by full-resolution bar open times. Read them in
         // place; only a full weight rebuild materializes the column, so a live tip stays O(1).
         let sequence = self.sequence_points.as_deref();
+        // Close-time labels print an interval after the bar's identity time; the hour and minute
+        // marks follow the printed time. Non-time sequence axes print their own open times.
+        let label_shift = self.tick_label_shift();
         let times = self.data.merged_times();
         let tick_len = sequence.map_or(times.len(), <[BarSequencePoint]>::len);
         let tick_time = |index: usize| {
@@ -5012,12 +5527,24 @@ impl ChartEngine {
                 |points| points[index].open_timestamp_micros.div_euclid(1_000_000),
             )
         };
-        let time_points_changed =
-            self.data.time_points_generation() != self.synced_time_points_generation;
+        let projection_changed = self.future_time_projection_revision
+            != self.synced_future_time_projection_revision
+            || self.past_time_projection_revision != self.synced_past_time_projection_revision;
+        let time_points_changed = self.data.time_points_generation()
+            != self.synced_time_points_generation
+            || projection_changed;
+        // Display-only projected labels (future and past) are not canonical points. They live in
+        // the weight column only, and only on time axes: a sequence axis never projects.
+        let has_projected_axis = sequence.is_none()
+            && (self.future_time_projection.is_some() || self.past_time_projection.is_some());
+        // The incremental paths below (tail append, front trim) describe canonical points only, so
+        // they serve a column that carries no projected labels now and carried none at the last sync.
+        let incremental = !projection_changed && !has_projected_axis;
         // Only a pure tail append may extend the weights incrementally. Any union rebuild in this
         // transaction (a retention trim, a history insert, a replacement) records a mapping, and
         // the surviving weights then no longer line up with their indices.
-        let appended = time_points_changed
+        let appended = incremental
+            && time_points_changed
             && merged_time_mapping.is_none()
             && tick_len > self.synced_points_len
             && self.synced_points_len > 0
@@ -5026,29 +5553,94 @@ impl ChartEngine {
                 // Several non-time bars may open within one second.
                 time > last || (sequence.is_some() && time == last)
             });
+        // A retention trim on a time axis leaves the old union's tail as the new union's head. The
+        // weights describe the union as of the last sync, which the mapping's old union extends
+        // by any points a tip appended in place before the trim rebuilt it, so the check is
+        // against that old union, not against the key mapping. A sequence axis takes its tick
+        // times from the bar sidecar, which the union does not describe, so it re-weighs everything.
+        let front_trim = merged_time_mapping
+            .as_ref()
+            .filter(|mapping| {
+                incremental
+                    && time_points_changed
+                    && sequence.is_none()
+                    && self.synced_points_len > 0
+                    && mapping.old_times().get(self.synced_points_len - 1).copied()
+                        == self.synced_last_time
+            })
+            .and_then(|mapping| time_tick_marks::front_trim(mapping.old_times(), times))
+            .filter(|&dropped| dropped < self.synced_points_len);
         if appended {
             for index in self.synced_points_len..tick_len {
-                let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time_in(
+                let weight = aeris_charts_core::scale::time_tick_marks::weight_by_time_shifted(
                     tick_time(index),
                     tick_time(index - 1),
+                    label_shift,
                     &self.exchange_time,
                 ) as u8;
                 self.tick_marks.push_weight(index as i64, weight);
             }
+        } else if let Some(dropped) = front_trim {
+            // A retention trim on a time axis (and the points a tip appended with it): the
+            // surviving points keep their timestamps and so their weights. Only the first point,
+            // which has no predecessor, is re-weighed, then the new tail.
+            let time = &self.exchange_time;
+            let first_weight = if tick_len > 1 {
+                let span = tick_time(tick_len - 1) - tick_time(0);
+                time_tick_marks::first_point_weight_shifted_in(
+                    tick_time(0),
+                    span,
+                    tick_len,
+                    label_shift,
+                    time,
+                )
+            } else {
+                0
+            };
+            self.tick_marks.drop_front(dropped, first_weight);
+            for index in self.synced_points_len - dropped..tick_len {
+                let weight = time_tick_marks::weight_by_time_shifted(
+                    tick_time(index),
+                    tick_time(index - 1),
+                    label_shift,
+                    time,
+                ) as u8;
+                self.tick_marks.push_weight(index as i64, weight);
+            }
         } else if time_points_changed {
-            let tick_times = (0..tick_len).map(tick_time).collect::<Vec<_>>();
-            let mut weights = vec![0u8; tick_len];
-            aeris_charts_core::scale::time_tick_marks::fill_weights_for_points_in(
-                &tick_times,
-                &mut weights,
-                0,
-                &self.exchange_time,
-            );
-            self.tick_marks.set_weights(&weights);
+            if has_projected_axis {
+                // Projected labels extend the column on both sides (past labels take negative
+                // indices), so it is rebuilt whole from the projected axis times.
+                let (start_index, axis_times) = self.axis_tick_times();
+                let mut weights = vec![0u8; axis_times.len()];
+                time_tick_marks::fill_weights_for_points_shifted_in(
+                    &axis_times,
+                    &mut weights,
+                    0,
+                    label_shift,
+                    &self.exchange_time,
+                );
+                self.tick_marks.set_weights_from(start_index, &weights);
+            } else {
+                let tick_times = (0..tick_len).map(tick_time).collect::<Vec<_>>();
+                let mut weights = vec![0u8; tick_len];
+                time_tick_marks::fill_weights_for_points_shifted_in(
+                    &tick_times,
+                    &mut weights,
+                    0,
+                    label_shift,
+                    &self.exchange_time,
+                );
+                self.tick_marks.set_weights(&weights);
+            }
         }
         self.synced_points_len = tick_len;
         self.synced_time_points_generation = self.data.time_points_generation();
+        self.synced_future_time_projection_revision = self.future_time_projection_revision;
+        self.synced_past_time_projection_revision = self.past_time_projection_revision;
         self.synced_last_time = tick_len.checked_sub(1).map(tick_time);
+        // Canonical count: projected labels are display-only and never points of the time scale,
+        // so fit-content, scroll clamps, the base index and whitespace data are unaffected.
         let points_len = tick_len;
         // Data-layer units (chart-local row keys on a non-time sequence axis), matching the
         // unit of the compensation fallback's first-time comparison.
@@ -5090,6 +5682,59 @@ impl ChartEngine {
             .time_scale
             .sync_points(times.len(), self.data.base_index(), None);
         self.rebase_view_motion(rebase);
+    }
+
+    fn axis_tick_times(&self) -> (i64, Vec<i64>) {
+        if let Some(points) = self.sequence_points() {
+            return (
+                0,
+                points
+                    .iter()
+                    .map(|point| point.open_timestamp_micros.div_euclid(1_000_000))
+                    .collect(),
+            );
+        }
+        let canonical = self.data.merged_times();
+        let Some(&first) = canonical.first() else {
+            return (0, Vec::new());
+        };
+        let mut past = Vec::new();
+        if let Some((step, count)) = self.past_time_projection {
+            past.reserve(count);
+            for offset in (1..=count).rev() {
+                let Ok(offset) = i64::try_from(offset) else {
+                    continue;
+                };
+                let Some(time) = step
+                    .checked_mul(offset)
+                    .and_then(|delta| first.checked_sub(delta))
+                else {
+                    continue;
+                };
+                past.push(time);
+            }
+        }
+        let start_index = -i64::try_from(past.len()).unwrap_or(i64::MAX);
+        let future_count = self.future_time_projection.map_or(0, |(_, count)| count);
+        let mut times = Vec::with_capacity(past.len() + canonical.len() + future_count);
+        times.extend(past);
+        times.extend_from_slice(canonical);
+        if let (Some(&last), Some((step, count))) = (canonical.last(), self.future_time_projection)
+        {
+            for offset in 1..=count {
+                let Ok(offset) = i64::try_from(offset) else {
+                    break;
+                };
+                let Some(time) = step
+                    .checked_mul(offset)
+                    .and_then(|delta| last.checked_add(delta))
+                else {
+                    break;
+                };
+                times.push(time);
+            }
+        }
+        (start_index, times)
     }
 
     fn clear_sequence_axis_if_unused(&mut self) {

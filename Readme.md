@@ -7,30 +7,10 @@ The project includes professional chart interactions, drawings, technical indica
 
 ## Rust crates
 
-Rust consumers can use the engine and backends directly:
-
-```sh
-cargo add aeris_charts_engine
-```
-
-The current coordinated Rust release is `0.2.0` and is available on crates.io. Repository source
-is preparing the AGPL-licensed `0.3.0` release:
-
-| Crate | Purpose |
-| --- | --- |
-| [`aeris_charts_engine`](https://crates.io/crates/aeris_charts_engine) | Headless chart state, interactions, drawings, indicators, and frame construction |
-| [`aeris_charts_core`](https://crates.io/crates/aeris_charts_core) | Platform-free data, scales, options, validation, and formatting |
-| [`aeris_charts_indicators`](https://crates.io/crates/aeris_charts_indicators) | Pure Rust technical-indicator calculations |
-| [`aeris_charts_render`](https://crates.io/crates/aeris_charts_render) | Backend-neutral draw-list contract and rendering math |
-| [`aeris_charts_render_wgpu`](https://crates.io/crates/aeris_charts_render_wgpu) | WebGPU executor |
-| [`aeris_charts_native`](https://crates.io/crates/aeris_charts_native) | Native tiny-skia rasterizer and server-side PNG rendering |
-| [`aeris_charts_wasm`](https://crates.io/crates/aeris_charts_wasm) | WebAssembly browser host |
-
-The GPUI executor remains available from this repository because it relies on a reviewed Zed commit
-whose API differs from the crates.io `gpui` release. It is deliberately not published as a broken
-registry fallback. All published Aeris crates in a release use the same version. Existing
-registry artifacts remain under the license bundled with their release; repository source and
-future releases use the [AGPL and commercial dual-license model](#license).
+Rust hosts depend on the `aeris_charts_*` crates from this repository through Git or path
+dependencies; they are not published to crates.io. `aeris_charts_engine` owns chart state,
+interactions, drawings, indicators, and frame construction, and hosts pair it with a renderer such
+as `aeris_charts_render_wgpu` or `aeris_charts_native` (see [Repository layout](#repository-layout)).
 
 ## Browser package
 
@@ -175,7 +155,7 @@ drawings, session highlighting, volume profile, and user-defined price lines.
 
 Heatmap-around-line and shaded-background examples are composed beneath a normal line series.
 
-Features that Aeris already owns—drawings (including Long Position and Short Position tools), bands, price lines, overlay scales, partial-last-price
+Features that Aeris already owns—drawings (including Long Position and Short Position tools, the price range, date range, and date-and-price range measuring tools, and the Shift-click quick measure), bands, price lines, overlay scales, partial-last-price
 lines, session shading, highlighted bar slots, and time-anchored volume profiles—are thin helpers
 over those engine APIs. Accessibility is enabled by default; `chart.accessibility()` returns its
 singleton controller and `enable_accessibility(chart, options)` configures the same instance for
@@ -259,13 +239,12 @@ for crosshair lines, and muted for crosshair-label surfaces.
 - `crates/aeris_charts_native` — deterministic native rendering and performance verification.
 - `packages/charts` — TypeScript browser package.
 - `examples/web_demo` — browser integration and parity test host; it is not a published package.
-- `docs` — architecture, public API, domain-model, crate, and contribution documentation.
+- `docs` — architecture, public API, domain-model, and contribution documentation.
 - `plan` — active product and expansion plans.
 
 See [Architecture.md](docs/Architecture.md) for ownership, data flow, and backend boundaries.
 See [Public_api.md](docs/Public_api.md) for supported/experimental surfaces, persistence, errors, and
-version policy. Published Rust crates use coordinated versions and retain matching local path
-dependencies inside this workspace.
+version policy.
 
 ## Development
 

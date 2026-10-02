@@ -786,6 +786,15 @@ impl ChartInner {
         low: &[f64],
         close: &[f64],
     ) {
+        if self.series_is_source_owned(id) {
+            web_sys::console::warn_1(
+                &format!(
+                    "aeris_charts: set_series_data rejected — series {id} is derived by the engine; write to its trade stream or source instead"
+                )
+                .into(),
+            );
+            return;
+        }
         // Repair messy feed data (out-of-order, duplicate times, NaN/Inf, length mismatch) at the
         // boundary so the DataLayer's ascending-unique-finite contract always holds — a malformed
         // feed yields a warning and a rendered chart, never a wasm panic (roadmap Phase A3).
@@ -810,8 +819,14 @@ impl ChartInner {
                 .into(),
             );
         }
-        self.engine
-            .install_series_data(id as SeriesId, s.times, s.open, s.high, s.low, s.close);
+        if !self
+            .engine
+            .install_series_data(id as SeriesId, s.times, s.open, s.high, s.low, s.close)
+        {
+            web_sys::console::warn_1(
+                &"aeris_charts: set_series_data rejected — the engine did not install the data (unknown or removed series id)".into(),
+            );
+        }
     }
 
     pub fn set_series_data_typed(
@@ -825,6 +840,10 @@ impl ChartInner {
     ) -> Option<String> {
         if let Err(error) = self.engine.validate_series_id(id as SeriesId) {
             return Some(rejected_diagnostics_json(format_args!("{error:?}")));
+        }
+        // Decide ownership before copying and sanitizing a batch that is about to be refused.
+        if let Some(rejected) = self.derived_write_rejection(id) {
+            return Some(rejected);
         }
         let s = match aeris_charts_core::model::data_validation::sanitize_ohlc_owned(
             times.to_vec(),
@@ -852,7 +871,9 @@ impl ChartInner {
             .engine
             .install_series_data(id as SeriesId, s.times, s.open, s.high, s.low, s.close)
         {
-            return Some(derived_series_rejection(id));
+            return Some(rejected_diagnostics_json(
+                "the engine did not install the series data",
+            ));
         }
         diagnostics
     }
@@ -881,6 +902,9 @@ impl ChartInner {
             web_sys::console::warn_1(&"aeris_charts: update_typed for unknown series id".into());
             return Some(rejected_diagnostics_json("unknown or stale series id"));
         }
+        if let Some(rejected) = self.derived_write_rejection(id) {
+            return Some(rejected);
+        }
         let (s, diagnostics) =
             match super::series_update::sanitize_typed_batch(times, open, high, low, close) {
                 Ok(batch) => batch,
@@ -896,7 +920,9 @@ impl ChartInner {
             s.close,
         );
         if rows > 0 && applied == 0 {
-            return Some(derived_series_rejection(id));
+            return Some(rejected_diagnostics_json(
+                "the engine did not apply the update batch",
+            ));
         }
         diagnostics
     }
@@ -912,6 +938,12 @@ impl ChartInner {
     ) -> String {
         if !self.series.iter().any(|s| s.id == series_id as SeriesId) {
             return "unknown or removed series id".into();
+        }
+        // A drain would write host rows into rows the engine owns, and be dropped on every frame.
+        if self.series_is_source_owned(series_id) {
+            return format!(
+                "series {series_id} is derived by the engine; feed its trade stream or source instead of binding a ring"
+            );
         }
         let layout: super::RingLayoutInput = match serde_json::from_str(layout_json) {
             Ok(layout) => layout,
@@ -1014,6 +1046,15 @@ impl ChartInner {
             );
             return;
         }
+        if self.series_is_source_owned(series_id) {
+            web_sys::console::warn_1(
+                &format!(
+                    "aeris_charts: update_bar rejected — series {series_id} is derived by the engine; write to its trade stream or source instead"
+                )
+                .into(),
+            );
+            return;
+        }
         if !self
             .engine
             .update_series_bar(series_id as SeriesId, time, [open, high, low, close])
@@ -1034,6 +1075,15 @@ impl ChartInner {
         wick: Option<Vec<u32>>,
         border: Option<Vec<u32>>,
     ) {
+        if self.series_is_source_owned(id) {
+            web_sys::console::warn_1(
+                &format!(
+                    "aeris_charts: set_series_point_colors rejected — series {id} is derived by the engine"
+                )
+                .into(),
+            );
+            return;
+        }
         if !self
             .engine
             .set_series_point_colors(id as SeriesId, body, wick, border)
@@ -1046,8 +1096,9 @@ impl ChartInner {
 
     /// Streaming update like [`update_series_bar`] that also sets the target bar's per-point
     /// color channels (None = no custom color for that channel). Returns whether the engine
-    /// applied the bar; the caller has already validated the values, so a rejection means the
-    /// series is engine-derived (footprint, synthetic, or resampled).
+    /// applied the bar. A `false` also covers invalid values and unknown ids, so callers ask
+    /// [`Self::series_is_source_owned`] to tell an engine-derived series (a footprint, a
+    /// trade-bound candle or study, synthetic or resampled bars) apart.
     #[allow(clippy::too_many_arguments)] // mirrors update_series_bar plus the three reference color slots
     pub fn update_series_bar_styled(
         &mut self,
@@ -1178,9 +1229,15 @@ impl ChartInner {
             .filter(|n| n.is_finite() && *n >= 1.0)
             .map(|n| n as usize);
         if !self.engine.set_series_max_points(id as SeriesId, cap) {
+            // A bound candle or synthetic series keeps the retention of the stream or source
+            // that feeds it; only unknown and removed ids are otherwise refused.
+            let reason = if self.series_is_source_owned(id) {
+                "series is engine-owned; retention is set on the trade stream or source"
+            } else {
+                "unknown or removed series id"
+            };
             web_sys::console::warn_1(
-                &"aeris_charts: set_series_max_points ignored (unknown or removed series id)"
-                    .into(),
+                &format!("aeris_charts: set_series_max_points ignored ({reason})").into(),
             );
         }
     }
@@ -2006,6 +2063,26 @@ impl ChartInner {
         self.engine.set_seconds_visible(visible);
     }
 
+    pub fn set_time_zone(&mut self, time_zone: &str) -> bool {
+        match self.engine.set_time_zone(time_zone) {
+            Ok(changed) => {
+                // Period-keyed studies and every label follow the zone: settle the axis widths.
+                if changed {
+                    self.recompute_layout(true);
+                }
+                changed
+            }
+            Err(error) => {
+                web_sys::console::warn_1(&format!("aeris_charts: {error}").into());
+                false
+            }
+        }
+    }
+
+    pub fn time_zone(&self) -> &'static str {
+        self.engine.time_zone_id()
+    }
+
     /// reference `timeScale.minBarSpacing`.
     pub fn set_min_bar_spacing(&mut self, spacing: f64) {
         self.engine.set_min_bar_spacing(spacing);
@@ -2200,10 +2277,12 @@ impl ChartInner {
     }
 
     /// Apply `timeScale.timeZone` (`"UTC"` or explicit `{from_utc_seconds, offset_seconds}`
-    /// transitions), `timeScale.sessionStart` (seconds from local midnight), and/or
-    /// `timeScale.tickMarks` (explicit `[{time, label?}]` axis marks or `null`). The package
-    /// resolves IANA names to schedules and mark times to UTC seconds before calling. Returns an
-    /// empty string on success or the validation message; a rejected patch changes nothing.
+    /// transitions), `timeScale.sessionStart` (seconds from local midnight),
+    /// `timeScale.tickMarks` (explicit `[{time, label?}]` axis marks or `null`), and/or
+    /// `timeScale.barTimeLabel` (`"open"`, `null`, or `{anchor: "close", interval_seconds,
+    /// windows?}`). The package resolves IANA names to schedules and mark times to UTC seconds
+    /// before calling. Returns an empty string on success or the validation message; a rejected
+    /// patch changes nothing.
     pub fn set_exchange_time_json(&mut self, time_scale_json: &str) -> String {
         let time_scale: serde_json::Value = match serde_json::from_str(time_scale_json) {
             Ok(value) => value,
@@ -2240,6 +2319,15 @@ impl ChartInner {
             return f64::NAN;
         }
         self.engine.exchange_local_seconds(time as i64) as f64
+    }
+
+    /// The UTC instant a bar identified by open time `time` prints under
+    /// `timeScale.barTimeLabel` (`time` itself unless a close-time label is set).
+    pub fn bar_label_time(&self, time: f64) -> f64 {
+        if !time.is_finite() {
+            return f64::NAN;
+        }
+        self.engine.bar_label_time(time as i64) as f64
     }
 
     /// 0 = normal, 1 = magnet (reference default), 2 = hidden, 3 = magnet OHLC.
@@ -2363,6 +2451,18 @@ impl ChartInner {
     pub fn zoom_focused(&mut self, x_css: f64, scale: f64) {
         let x = x_css.max(1.0).min(self.time_scale.width());
         self.time_scale_zoom_focused(x, scale);
+    }
+    pub fn wheel_zoom_time(&mut self, x_css: f64, scale: f64, control: bool, meta: bool) {
+        // The engine clamps the anchor into the plot.
+        self.wheel_zoom_time_scale(
+            x_css,
+            scale,
+            aeris_charts_engine::InputModifiers {
+                control,
+                meta,
+                ..Default::default()
+            },
+        );
     }
     pub fn scroll_start(&mut self, x_css: f64) {
         self.time_scale_start_scroll(x_css);
@@ -2672,6 +2772,20 @@ impl ChartInner {
             .series_kind(id as SeriesId)
             .map(SeriesKind::to_u8)
     }
+
+    /// Whether the engine writes this series' rows: a footprint, a trade-bound candle or bar, a
+    /// CVD, delta, or volume study, resampled or synthetic bars. Every host data write to such a
+    /// series is refused, so the boundary decides with this, never from a refused write.
+    pub fn series_is_source_owned(&self, id: u32) -> bool {
+        self.engine.series_is_source_owned(id as SeriesId)
+    }
+
+    /// The `derived_series` rejection for a host write to an engine-owned series, `None` for any
+    /// other id. Checked before a batch is copied or sanitized.
+    pub(super) fn derived_write_rejection(&self, id: u32) -> Option<String> {
+        self.series_is_source_owned(id)
+            .then(|| derived_series_rejection(id))
+    }
     pub fn series_data_by_index(&self, id: u32, index: f64, mismatch: i8) -> Vec<f64> {
         if !index.is_finite() || index.fract() != 0.0 {
             return Vec::new();
@@ -2938,6 +3052,9 @@ impl ChartInner {
     }
     pub fn drawing_text_hit_at(&self, x_css: f64, y_css: f64) -> u32 {
         self.engine.drawing_text_hit_at(x_css, y_css).unwrap_or(0)
+    }
+    pub fn drawing_at(&self, x_css: f64, y_css: f64) -> u32 {
+        self.engine.drawing_at(x_css, y_css).unwrap_or(0)
     }
     pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
         self.engine
@@ -3228,6 +3345,61 @@ impl ChartInner {
         self.engine.cancel_drawing_tool();
     }
 
+    pub fn measure_pointer_down(
+        &mut self,
+        x_css: f64,
+        y_css: f64,
+        begin: bool,
+        magnet: bool,
+    ) -> bool {
+        self.engine.measure_pointer_down(
+            x_css,
+            y_css,
+            begin,
+            DrawingModifiers {
+                magnet,
+                straighten: false,
+            },
+        )
+    }
+
+    pub fn measure_pointer_move(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.engine.measure_pointer_move(
+            x_css,
+            y_css,
+            DrawingModifiers {
+                magnet,
+                straighten: false,
+            },
+        )
+    }
+
+    pub fn measure_pointer_up(&mut self, x_css: f64, y_css: f64, magnet: bool) -> bool {
+        self.engine.measure_pointer_up(
+            x_css,
+            y_css,
+            DrawingModifiers {
+                magnet,
+                straighten: false,
+            },
+        )
+    }
+
+    pub fn cancel_measure(&mut self) -> bool {
+        self.engine.cancel_measure()
+    }
+
+    pub fn measure_active(&self) -> bool {
+        self.engine.measure_active()
+    }
+
+    pub fn measure_points_json(&self) -> String {
+        self.engine
+            .measure_points()
+            .and_then(|points| serde_json::to_string(&points).ok())
+            .unwrap_or_else(|| "null".to_string())
+    }
+
     /// Arm interactive creation of a tool kind ("" options = defaults).
     pub fn drawing_create_begin(&mut self, kind: u8, options_json: &str) -> bool {
         let Some(kind) = DrawingKind::from_u8(kind) else {
@@ -3298,30 +3470,21 @@ impl ChartInner {
 
     // --- coordinate & logical-range API (roadmap Phase A4) ---
     //
-    // Reflects the state of the last render (scale height/width, price range). All coordinates
-    // are media (CSS) pixels relative to the pane offset, matching the pointer coords JS passes
-    // to `set_crosshair`. `None`/empty means the query falls off the chart or there is no data.
+    // Reflects the state of the last render (scale height/width, price range). X is CSS px from
+    // the plot-area left edge and Y CSS px from the top of the stacked pane area (never
+    // pane-local), matching the pointer coords JS passes to `set_crosshair`. `None`/empty means
+    // the query falls off the chart or there is no data.
 
-    /// The primary series id for the pane-level coordinate API: the first visible,
-    /// non-removed series (id 0 may be tombstoned via `remove_series`).
-    fn primary_series_id(&self) -> Option<SeriesId> {
-        self.series
-            .iter()
-            .find(|s| s.visible && !s.removed)
-            .map(|s| s.id)
-    }
-
-    /// Y (CSS px) for a price on the active price scale, or `None` if the scale has no range yet.
-    /// In percentage/indexed modes the price is its own base value (as in the render path).
+    /// Y (CSS px, chart content) for a price on pane 0's default price scale, or `None` if that
+    /// scale has no range yet. Series handles convert on their own pane and scale instead.
     pub fn price_to_coordinate(&self, price: f64) -> Option<f64> {
-        self.engine
-            .series_price_to_coordinate(self.primary_series_id()?, price)
+        self.engine.pane_price_to_coordinate(0, price)
     }
 
-    /// Price for a Y (CSS px), or `None` if the scale has no range yet.
+    /// Price for a Y (CSS px, chart content) on the default price scale of the pane containing it
+    /// (the scale the crosshair label reads there), or `None` if that scale has no range yet.
     pub fn coordinate_to_price(&self, y_css: f64) -> Option<f64> {
-        self.engine
-            .series_coordinate_to_price(self.primary_series_id()?, y_css)
+        self.engine.coordinate_to_price(y_css)
     }
 
     /// X (CSS px) for a UTC-seconds timestamp that sits exactly on a data point, else `None`

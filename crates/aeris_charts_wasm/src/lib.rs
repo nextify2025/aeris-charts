@@ -31,6 +31,10 @@ mod ring_source;
 // Session slot generation boundary (JSON request → engine); host-testable.
 #[cfg(any(target_arch = "wasm32", test))]
 mod session_slots;
+// Redundant stroke-setter elimination for the browser Canvas2D target; compiled for the host
+// target too so its state rules are tested outside the browser.
+#[cfg(any(target_arch = "wasm32", test))]
+mod stroke_state;
 
 #[cfg(target_arch = "wasm32")]
 mod canvas2d_target;

@@ -85,6 +85,7 @@ const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
+    grid_snap: false,
 };
 
 // A ray's and an extended line's reach comes from their `extend_left`/`extend_right` defaults:

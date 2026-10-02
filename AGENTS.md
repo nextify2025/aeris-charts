@@ -48,6 +48,16 @@ Ponytail removes accidental complexity. It must not simplify away render parity,
 - Fix root causes at the owning shared layer. Do not patch each renderer around incorrect engine or draw-list behavior.
 - Keep `aeris_charts_core`, `aeris_charts_indicators`, `aeris_charts_engine`, and `aeris_charts_render` free of browser, GPUI, and application dependencies.
 - Keep one chart model and one ordered frame contract. Backends execute it; they do not fork semantics.
+- Interaction policy is engine-owned. Pointer, wheel, and keyboard routing, press arbitration, gesture
+  lifecycles, click and double-click semantics, key bindings, hover promotion, and cursor choice live in
+  the engine input controller (`aeris_charts_engine` `chart_input.rs`). GPUI hosts bind through
+  `aeris_charts_render_gpui::input` with one adapter call per listener. Never add routing, cursor
+  priority, key handling, or per-feature input wiring to a host, example, or Aeris Terminal; extend the
+  controller so every host inherits the feature unchanged.
+- Hosts receive behavior, not mechanisms. If every host would have to call a sequence of engine methods
+  the same way, that sequence belongs inside the engine as one operation. A feature that needs host
+  wiring beyond supplying data or performing a genuinely platform-only effect (capture, cursor
+  application, timers, menus, clipboard, persistence) is incomplete.
 - Keep media-space math in `f64` until backend encoding. Make device-pixel conversion and snapping explicit.
 - Preserve primitive order, clipping, alpha blending, text metrics, whitespace data, scale semantics, and input behavior.
 - Bound caches, queues, rings, retries, frame work, and memory. Define invalidation and device-loss behavior.
@@ -108,7 +118,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p aeris_charts_wasm --target wasm32-unknown-unknown -- -D warnings
 cargo test --workspace
-cargo run -p aeris_charts_native --example perf_gate --release
+AERIS_CHARTS_PERF_STRICT=1 cargo run -p aeris_charts_native --example perf_gate --release
 
 cd packages/charts
 npm ci
@@ -120,27 +130,12 @@ npm run test:pack
 
 Run Playwright once per batch when the batch changes browser-facing behavior, and GPUI parity/replay checks once per batch when it changes GPUI executor behavior. Documentation-only changes may skip code gates, but still require diff, link/path, architecture-consistency, and documentation-hygiene checks.
 
-### crates.io releases
+### Rust crates
 
-Keep every publishable Aeris crate on one coordinated version and keep each internal dependency's
-`path` plus `version` fields aligned. `aeris_charts_render_gpui` is repository-only and must retain
-`publish = false` while it depends on the reviewed Zed Git revision.
-
-After the complete gates pass, publish with `--locked` in dependency order and wait for each crate to
-be indexed before publishing its consumers:
-
-```text
-aeris_charts_indicators
-aeris_charts_core
-aeris_charts_render
-aeris_charts_engine
-aeris_charts_render_wgpu
-aeris_charts_native
-aeris_charts_wasm
-```
-
-Run a package or publish dry run at each layer before its irreversible upload. Never place a crates.io
-token in repository files, shell history, logs, or task messages.
+Rust crates are repository-only and keep `publish = false`; never publish them to crates.io. Hosts
+consume them through pinned Git revisions or local paths. The only published artifact is the
+`@aeristerminal/aeris-charts` npm package on GitHub Packages, released by pushing a `v<version>` tag
+that matches `packages/charts/package.json` after CI passes on that commit.
 
 When a batch is complete and its gates pass, review the diff, commit the batch once with a structured message describing the delivered capabilities and verification, push `main` to `github` without force, and report remaining manual verification honestly.
 

@@ -35,7 +35,6 @@ use aeris_charts_render::draw_list::{
     Gradient, IRect, LineStyle, LineType, Prim, RasterImage, TextAlign,
 };
 use aeris_charts_render::histogram::{build_histogram, HistogramItem, HistogramParams};
-use aeris_charts_render::line::{dash_split, expand_line, LinePoint};
 
 const THRESHOLD_REGION_LINE_COLOR: Color = Color::rgb(0x78, 0x7B, 0x86);
 const THRESHOLD_REGION_FILL_COLOR: Color = Color::rgba(0x78, 0x7B, 0x86, 0x33);
@@ -124,6 +123,38 @@ const CROSSHAIR_LABEL_BG: Color = Color::rgb(
     DEFAULT_CROSSHAIR_LABEL_RGB.1,
     DEFAULT_CROSSHAIR_LABEL_RGB.2,
 );
+
+/// A bordered chrome box (tooltip, chip) in device px with every edge on a whole device pixel.
+/// `RoundRect` borders paint inside the rect, so an edge at a fractional coordinate spreads a
+/// 1 px border across two pixel rows or columns: the same border reads crisp on one side and
+/// blurred on another, and the blur changes as the box moves. Snapping each edge independently
+/// (rather than position and size separately) keeps all four borders one device pixel wide.
+pub(crate) struct DeviceBox {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+}
+
+impl DeviceBox {
+    /// Snap a CSS-px box at `(left, top)` of `width × height` with the frame's ratios.
+    pub(crate) fn snap(left: f64, top: f64, width: f64, height: f64, hpr: f64, vpr: f64) -> Self {
+        let x0 = (left * hpr).round();
+        let y0 = (top * vpr).round();
+        let x1 = ((left + width) * hpr).round().max(x0 + 1.0);
+        let y1 = ((top + height) * vpr).round().max(y0 + 1.0);
+        Self {
+            x: x0 as f32,
+            y: y0 as f32,
+            w: (x1 - x0) as f32,
+            h: (y1 - y0) as f32,
+        }
+    }
+
+    pub(crate) fn center_x(&self) -> f32 {
+        self.x + self.w / 2.0
+    }
+}
 
 fn ceiled_odd(value: f64) -> f64 {
     let ceiled = value.ceil() as i64;
@@ -284,6 +315,11 @@ pub(crate) struct FrameInvalidation {
 }
 
 impl FrameInvalidation {
+    /// Advances on every invalidation of any layer.
+    pub(crate) const fn clock(&self) -> u64 {
+        self.clock
+    }
+
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.wrapping_add(1).max(1);
         self.clock
@@ -454,6 +490,8 @@ pub(crate) struct RetainedFrame {
     last_series_revision: u64,
     last_time_scale_revision: u64,
     last_price_scale_revisions: Vec<Vec<u64>>,
+    /// Invalidation clock observed by the last prepared host frame.
+    prepared_clock: u64,
 }
 
 impl RetainedFrame {
@@ -1020,10 +1058,44 @@ fn translate_prims_x(prims: &mut [Prim], dx: i32) {
             Prim::Text { x, .. } | Prim::RotatedText { x, .. } => *x += dxf,
             Prim::Image { rect, .. } => rect[0] += dxf,
             Prim::Polyline { .. }
+            | Prim::Segments { .. }
             | Prim::AreaFill { .. }
             | Prim::BandFill { .. }
             | Prim::Background { .. } => {}
         }
+    }
+}
+
+/// Shift every point-pool index of `prim` by `offset` (wrapping, so a negative shift is passed as
+/// its two's complement). Retained layers and drawing parts keep pool-relative indices; assembling
+/// them into a frame pane moves them to their place in the pane's pool. The match is exhaustive so
+/// a future prim that references the pool cannot be forgotten here and read the wrong points.
+fn shift_point_indices(prim: &mut Prim, offset: u32) {
+    match prim {
+        Prim::Polyline { first_point, .. }
+        | Prim::Segments { first_point, .. }
+        | Prim::AreaFill { first_point, .. } => {
+            *first_point = first_point.wrapping_add(offset);
+        }
+        Prim::BandFill {
+            upper_first,
+            lower_first,
+            ..
+        } => {
+            *upper_first = upper_first.wrapping_add(offset);
+            *lower_first = lower_first.wrapping_add(offset);
+        }
+        Prim::Rect { .. }
+        | Prim::RectFrame { .. }
+        | Prim::HLine { .. }
+        | Prim::VLine { .. }
+        | Prim::RoundRect { .. }
+        | Prim::Circle { .. }
+        | Prim::Triangle { .. }
+        | Prim::Background { .. }
+        | Prim::Text { .. }
+        | Prim::RotatedText { .. }
+        | Prim::Image { .. } => {}
     }
 }
 
@@ -1056,20 +1128,7 @@ fn append_drawing_part(
     prims.reserve(prim_end - prim_start);
     for prim in &retained_prims[prim_start..prim_end] {
         let mut prim = prim.clone();
-        match &mut prim {
-            Prim::Polyline { first_point, .. } | Prim::AreaFill { first_point, .. } => {
-                *first_point = first_point.wrapping_add(adjust);
-            }
-            Prim::BandFill {
-                upper_first,
-                lower_first,
-                ..
-            } => {
-                *upper_first = upper_first.wrapping_add(adjust);
-                *lower_first = lower_first.wrapping_add(adjust);
-            }
-            _ => {}
-        }
+        shift_point_indices(&mut prim, adjust);
         prims.push(prim);
     }
 }
@@ -1080,20 +1139,7 @@ fn append_retained_layer(layer: &RetainedLayer, prims: &mut Vec<Prim>, points: &
     prims.reserve(layer.prims.len());
     for prim in &layer.prims {
         let mut prim = prim.clone();
-        match &mut prim {
-            Prim::Polyline { first_point, .. } | Prim::AreaFill { first_point, .. } => {
-                *first_point += point_base;
-            }
-            Prim::BandFill {
-                upper_first,
-                lower_first,
-                ..
-            } => {
-                *upper_first += point_base;
-                *lower_first += point_base;
-            }
-            _ => {}
-        }
+        shift_point_indices(&mut prim, point_base);
         prims.push(prim);
     }
 }
@@ -1155,6 +1201,12 @@ impl ChartEngine {
         self.frame_invalidation.overlay();
     }
 
+    /// Paint order changed while every retained layer stays valid: the next prepared frame must
+    /// reassemble, but no geometry is rebuilt.
+    pub(crate) fn invalidate_frame_assembly(&mut self) {
+        self.frame_invalidation.tick();
+    }
+
     pub(crate) fn invalidate_frame_axis(&mut self) {
         self.frame_invalidation.axis();
     }
@@ -1203,6 +1255,15 @@ impl ChartEngine {
 
     pub fn frame_requires_axis(&self) -> bool {
         self.retained_frame.axis_generation != self.frame_invalidation.axis
+    }
+
+    /// Whether any layer was invalidated since the last prepared host frame.
+    pub(crate) fn frame_invalidated_since_prepare(&self) -> bool {
+        self.retained_frame.prepared_clock != self.frame_invalidation.clock()
+    }
+
+    pub(crate) fn frame_prepared(&mut self) {
+        self.retained_frame.prepared_clock = self.frame_invalidation.clock();
     }
 
     /// Force the next axis build to start from engine-owned labels. Browser extensions use this
@@ -1889,6 +1950,7 @@ impl ChartEngine {
                     vpr,
                     &mut cache.trading_regions.prims,
                     &mut cache.trading.prims,
+                    &mut cache.trading.points,
                 );
                 cache.trading_regions.revision = self.frame_invalidation.trading;
                 cache.trading_regions.coordinate_revision = self.frame_invalidation.coordinate;

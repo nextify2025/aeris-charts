@@ -12,7 +12,15 @@
 /** Where in the pane's layer stack a view paints (reference `PrimitivePaneViewZOrder`). */
 export type primitive_z_order = "bottom" | "normal" | "top";
 
-/** reference `LineStyle` wire values: 0 solid, 1 dotted, 2 dashed, 3 large-dashed, 4 sparse-dotted. */
+/**
+ * reference `LineStyle` wire values: 0 solid, 1 dotted, 2 dashed, 3 large-dashed, 4 sparse-dotted.
+ * Every backend paints the same dashes: 1 and 4 are the sparse-dot pattern (`width` on, `4 * width`
+ * off) and 2 and 3 are the long-dash pattern (`6 * width` on, `6 * width` off), measured in bitmap
+ * px and started at the first point (`polyline`) or at `x1`/`y1` (`hline`/`vline`).
+ * A dashed `polyline` needs `width >= 0.5` bitmap px and is skipped with a console warning below it,
+ * and one whose visible path would lower to more than 4096 dashes (a dense zigzag through the
+ * pane) is drawn solid with a console warning, so a frame never pays for the path's length.
+ */
 export type primitive_line_style = 0 | 1 | 2 | 3 | 4;
 
 /**
@@ -22,6 +30,11 @@ export type primitive_line_style = 0 | 1 | 2 | 3 | 4;
  * `dpr` the nominal device pixel ratio. The converters resolve against the settled post-layout
  * scales (the pane's right price scale by default) and return `null` when a value falls off the
  * scale — mirroring the reference's `timeToCoordinate`/`priceToCoordinate` nullability.
+ *
+ * `price_to_y`/`time_to_x`/`logical_to_x` return this bitmap space (device px, `x` including
+ * `pane_left`), not the CSS-px space of the chart and series `*_to_coordinate` converters, whose
+ * `x` starts at the plot-area left edge: subtract `pane_left` from an `x` and divide by `dpr`
+ * before mixing the two.
  *
  * The context is valid only for the duration of the synchronous `renderer` call.
  */
@@ -124,9 +137,11 @@ export interface primitive_hit_result {
 
 /**
  * A boxed axis label descriptor (cf. reference `ISeriesPrimitiveAxisView`). `coordinate` is media px
- * from the pane's top edge (price axis) or the pane's left edge (time axis). `background_color`
- * (or `color` as a shorthand) fills the box; omitted `text_color` automatically selects black or
- * white for contrast with the effective background.
+ * from the pane's top edge (price axis) or the pane's left edge (time axis): unlike the chart's
+ * public converters, which return chart-content `y` from the top of the stacked panes, it is
+ * pane-local (a series primitive's `price` wins over it and is converted on the series' scale).
+ * `background_color` (or `color` as a shorthand) fills the box; omitted `text_color` automatically
+ * selects black or white for contrast with the effective background.
  * Extension over reference: reference exposes axis views only on series primitives; Aeris
  * accepts them on pane primitives too (painted on the pane's right scale / the time strip).
  */

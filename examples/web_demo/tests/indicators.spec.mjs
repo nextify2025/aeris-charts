@@ -33,6 +33,7 @@ test("EMA ribbon owns five colored outputs and updates periods in place", async 
       const info = series.indicator_info();
       return {
         color: series.options().color,
+        line_width: series.options().line_width,
         title: series.options().title,
         binding_id: info.binding_id,
         kind: info.kind,
@@ -71,6 +72,7 @@ test("EMA ribbon owns five colored outputs and updates periods in place", async 
     "EMA 200",
   ]);
   expect(result.before.map((output) => output.kind)).toEqual(Array(5).fill("ema_ribbon"));
+  expect(result.before.map((output) => output.line_width)).toEqual(Array(5).fill(1));
   expect(result.before.map((output) => output.period)).toEqual([5, 10, 20, 50, 200]);
   expect(result.before.map((output) => output.output_name)).toEqual([
     "EMA 1",

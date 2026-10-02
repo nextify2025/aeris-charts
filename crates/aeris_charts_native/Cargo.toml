@@ -5,23 +5,26 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
 publish.workspace = true
 description = "Native rasterizer target for the Prim IR: tiny-skia backend for golden-image tests and server-side PNG rendering"
 
 [dependencies]
-aeris_charts_core = { path = "../aeris_charts_core", version = "0.3.0" }
-aeris_charts_engine = { path = "../aeris_charts_engine", version = "0.3.0" }
-aeris_charts_render = { path = "../aeris_charts_render", version = "0.3.0" }
+aeris_charts_core = { path = "../aeris_charts_core" }
+aeris_charts_engine = { path = "../aeris_charts_engine" }
+aeris_charts_render = { path = "../aeris_charts_render" }
 ab_glyph = "0.2"
 fontdb = "0.24"
 tiny-skia = "0.12"
 
 [dev-dependencies]
-aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu", version = "0.3.0" }
+aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu" }
 serde_json = "1"
+
+# Examples are built but their unit tests are not run by default; this one owns the gate's
+# strict-mode parse and exit status, which have to stay part of `cargo test --workspace`.
+[[example]]
+name = "perf_gate"
+test = true
 
 [lints]
 workspace = true

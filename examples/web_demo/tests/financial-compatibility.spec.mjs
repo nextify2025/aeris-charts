@@ -5,6 +5,20 @@ async function open_chart(page) {
   await page.waitForFunction(() => window.__chart?.backend?.() === "canvas2d");
 }
 
+test("CVD and delta start at the same small height as oscillator panes", async ({ page }) => {
+  await open_chart(page);
+  const factors = await page.evaluate(() => {
+    const chart = window.__chart;
+    const stream = chart.add_trade_stream("pane-sizing");
+    chart.add_cvd_series(stream, 1);
+    chart.add_delta_series(stream, 2);
+    chart.add_rsi(window.__main, 5);
+    return chart.panes().map((pane) => pane.get_stretch_factor());
+  });
+  expect(factors.slice(1)).toEqual([0.3, 0.3, 0.3]);
+  expect(factors[0]).toBeGreaterThan(0.3);
+});
+
 test("financial product composes through one public chart and ordered frame", async ({ page }) => {
   await open_chart(page);
 
