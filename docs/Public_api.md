@@ -1732,9 +1732,10 @@ browser package is the only published artifact. Hosts such as Aeris Terminal con
 `aeris_charts_*` crates through pinned Git revisions or local paths. The Rust API is below 1.0 and
 may change in any revision, so a host reviews the notes below when it moves its pin.
 
-`aeris_charts_render_gpui` is experimental because it tracks a reviewed Zed Git revision whose API
-differs from the crates.io `gpui` release. Exact Git revisions are required for that backend;
-floating Git dependencies are unsupported.
+`aeris_charts_render_gpui` is experimental. It pins `gpui-pre` 0.3.6, the GPUI snapshot gpui-kit
+0.6.6 depends on, with an exact version requirement, so a host that draws the chart must use that
+same `gpui` (a host on another GPUI build, such as a Zed Git revision, holds two incompatible copies
+of its types). GPUI upgrades are explicit manifest and lockfile changes.
 
 ### Moving the pinned revision
 
