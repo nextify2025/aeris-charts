@@ -907,7 +907,9 @@ Hooks run while the drawing runtime cache is borrowed during frame construction 
 testing, so they read the engine but never call candidate queries or cached anchor-geometry
 accessors. Spec fields replace per-kind checks in shared code: `text_layout` (`Box`, or
 `Segment`: the label follows, rotates with, and takes the stroke color of the first two anchors
-and a middle label splits the stroke) and `axis_price_label` (the horizontal-line axis tag).
+and a middle label splits the stroke), `axis_price_label` (the horizontal-line axis tag), and
+`axis_tag_text` (that tag shows the drawing's `text` instead of the price when it has any, and the
+text is not painted on the chart, as the simple tag does).
 
 A family resolves one drawing into the shared part vocabulary of `drawings/parts.rs` in the
 caller's space (bitmap px at render, media px at hit test): anti-aliased strokes, crisp full-pixel
@@ -1053,7 +1055,9 @@ dragged last. The link is applied where a point list enters the model (`Drawing:
 construction, import, programmatic anchors, and committing a placement) and while an anchor is
 dragged or previewed, so a locked tool cannot leave its axis; Shift has nothing to straighten on
 them. A vertical ray defaults to `extend_right`, which runs it through its second anchor to the
-pane edge.
+pane edge. `price_line` (wire id 41, one anchor) is a crisp `hline` from the anchor to the pane's
+right edge plus a part label with the anchor's price above its start; it takes the horizontal
+line's `axis_price_label` tag and is hit as the ray.
 <!-- B8: lines — end -->
 <!-- B8: channels — begin -->
 The Channels family (`kinds/channels.rs`, wire ids 48..=52) delivers `parallel_channel`,
@@ -1180,7 +1184,8 @@ fan's and the fixed square's `scale_ratio` is price per bar, so the family's
 The Projection & Annotations family (`kinds/projection_annotations.rs`, wire ids 128..=159)
 delivers `forecast`, `bars_pattern`, `price_range`, `date_range`, `date_and_price_range`,
 `projection`, `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
-`signpost`, `flag_mark`, `arrow_mark_up`/`down`/`left`/`right`, and `icon`. Its options live in
+`signpost`, `flag_mark`, `arrow_mark_up`/`down`/`left`/`right`, `icon`, and KLineChart's
+`simple_tag` and `simple_annotation` (wire ids 147 and 148). Its options live in
 `tool_options.projection_annotation` (bars-pattern mode, mirror, flip, and copied bars; icon and
 icon size). It adds four hooks to `DrawingFamily`, each neutral by default: `on_create` (called
 before a new drawing is stored, by the armed tool's placement commit, which always captures since
@@ -1227,13 +1232,13 @@ area. Persistence compares `text` against the kind default, so a cleared default
 cleared. The text boxes of anchored text, the note, price note, callout, comment, price label,
 signpost, and arrow marks are shared text labels (`DrawingParts::text_label`; the price note's and
 price label's text follows their price line), so the host's inline editor edits them in place.
-Placing the anchored text, note, callout, comment, or signpost opens that editor at once
+Placing the anchored text, note, callout, comment, signpost, or simple annotation opens that editor at once
 (`DrawingToolSpec::requests_text_editor`, reported as `request_text_edit`), because each starts
 from a default text the user replaces or extends; the price note, the price label, and the arrow
 marks start with no text of their own and do not. That flag only requests the editor: the text
 focus border of the text tool follows `DrawingHandleMode::None`, so a placed note or callout
-keeps its anchor handles. The flag, the icon, and the projection and measuring tools paint no
-text of their own. The note paints only its pin until
+keeps its anchor handles. The flag, the icon, the simple tag (its text is the axis tag), and the
+projection and measuring tools paint no text of their own on the chart. The note paints only its pin until
 it is hovered, selected, or edited, like the reference platform's note, unless
 `tool_options.projection_annotation.always_show_text` is set (serialized only when set); the
 family's `reveals_on_focus` hook names such a drawing, so frame construction rebuilds the retained

@@ -31,6 +31,8 @@ const TOOLS = [
   "arrow_mark_left",
   "arrow_mark_right",
   "icon",
+  "simple_tag",
+  "simple_annotation",
 ];
 const ANCHORS = { projection: 3, forecast: 2, bars_pattern: 2, price_range: 2, date_range: 2, date_and_price_range: 2, price_note: 2, callout: 2 };
 const PINK = [233, 30, 99]; // #e91e63 — collides with no fixture pixel
@@ -124,7 +126,7 @@ test("every Projection & Annotations tool places through the armed-tool flow and
   const range = await visible_range(page);
   let previous = await capture(page);
   for (const [index, kind] of TOOLS.entries()) {
-    const l0 = Math.floor(range.from + (range.to - range.from) * (0.06 + index * 0.046));
+    const l0 = Math.floor(range.from + (range.to - range.from) * (0.06 + index * 0.04));
     const b0 = await bar(page, l0);
     const b1 = await bar(page, l0 + 4);
     const count = ANCHORS[kind] ?? 1;
@@ -175,7 +177,7 @@ test("the demo toolbar arms every Projection & Annotations tool", async ({ page 
     await page.click(`#drawings_group [data-tool='${kind}']`);
     expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBe(kind);
   }
-  await page.click("#drawings_group [data-tool='icon']");
+  await page.click(`#drawings_group [data-tool='${TOOLS[TOOLS.length - 1]}']`);
   expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
 });
 
@@ -665,6 +667,8 @@ test("Projection & Annotations tools round-trip through persistence, clipboard, 
       ["callout", [{ logical: 2, price: 11 }, { logical: 4, price: 12.5 }], { text: "two\nlines", text_h_align: "left" }],
       ["icon", [{ logical: 5, price: 11 }], { tool_options: { projection_annotation: { icon: "heart", icon_size: 40 } } }],
       ["arrow_mark_down", [{ logical: 6, price: 12 }], { text: "sell" }],
+      ["simple_tag", [{ logical: 4, price: 11.5 }], { text: "TAG" }],
+      ["simple_annotation", [{ logical: 3, price: 10.5 }], { text: "watch\nhere" }],
     ];
     for (const [kind, anchors, style] of additions) first.add_drawing(kind, anchors, style);
     const state = first.export_state();
@@ -704,6 +708,8 @@ test("Projection & Annotations tools round-trip through persistence, clipboard, 
   expect(styles[3].fill_enabled).toBeUndefined();
   expect(styles[6].text).toBe("");
   expect(styles[7].text).toBe("two\nlines");
+  expect(styles[10].text).toBe("TAG");
+  expect(styles[11].text).toBe("watch\nhere");
   expect(result.state.drawings[5].anchors[0].time).toBeUndefined();
   const semantic = (list) => list.map(({ kind, options }) => ({
     kind,
@@ -749,6 +755,8 @@ test("Projection & Annotations tools render pixel-identical on WebGPU and Canvas
       chart.add_drawing("flag_mark", [{ logical: at(0.58), price: hi }], { color: "#e91e63" });
       chart.add_drawing("icon", [{ logical: at(0.68), price: up(0.15) }], { color: "#ffb300" });
       chart.add_drawing("icon", [{ logical: at(0.7), price: up(0.3) }], { tool_options: { projection_annotation: { icon: "heart", icon_size: 30 } } });
+      chart.add_drawing("simple_tag", [{ logical: at(0.15), price: up(0.75) }], { color: "#2962ff", text: "Target" });
+      chart.add_drawing("simple_annotation", [{ logical: at(0.52), price: up(0.45) }], { color: "#d50000", text: "Watch" });
       const first = chart.drawings()[0];
       chart.wasm.set_selected_drawing(first.id);
       chart.render();

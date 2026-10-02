@@ -3,8 +3,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 
-// B8 Lines family (ray, extended line, info line, trend angle, cross line, arrow line, and the
-// axis-locked horizontal segment, vertical ray, and vertical segment) through the
+// B8 Lines family (ray, extended line, info line, trend angle, cross line, arrow line, the
+// axis-locked horizontal segment, vertical ray, and vertical segment, and the price line) through the
 // public API and real pointer input: armed placement, edge-reaching extensions and their hit
 // testing, the engine-formatted info stats box and its typed tool options, cross-line body drags,
 // persistence and clipboard round trips, the demo toolbar entries, and WebGPU == Canvas2D parity.
@@ -13,7 +13,8 @@ import { PNG } from "pngjs";
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
 const LOCKED = ["horizontal_segment", "vertical_ray", "vertical_segment"];
-const LINES = ["ray", "extended_line", "info_line", "trend_angle", "cross_line", "arrow_line", ...LOCKED];
+const SINGLE_ANCHOR = ["cross_line", "price_line"];
+const LINES = ["ray", "extended_line", "info_line", "trend_angle", "cross_line", "arrow_line", ...LOCKED, "price_line"];
 const PINK = [233, 30, 99]; // #e91e63 — collides with no fixture pixel
 
 test.beforeEach(async ({ page }) => {
@@ -101,7 +102,7 @@ test("every Lines tool places through the armed-tool flow and paints", async ({ 
       window.__chart.set_drawing_tool(kind, { color: "#e91e63" });
       if (window.__chart.active_drawing_tool() !== kind) throw new Error(`${kind} not armed`);
     }, kind);
-    const clicks = kind === "cross_line"
+    const clicks = SINGLE_ANCHOR.includes(kind)
       ? [[s.l1 + 3, s.p_mid]]
       : [[s.l0, s.p_lo], [s.l1, s.p_hi]];
     for (const [logical, price] of clicks) {
@@ -407,6 +408,7 @@ test("Lines tools render pixel-identical on WebGPU and Canvas2D (AA coverage ste
       chart.add_drawing("horizontal_segment", [{ logical: at(0.62), price: up(0.8) }, { logical: at(0.78), price: up(0.8) }], { color: "#2962ff", width: 2 });
       chart.add_drawing("vertical_ray", [{ logical: at(0.88), price: up(0.4) }, { logical: at(0.88), price: up(0.6) }], { color: "#d50000" });
       chart.add_drawing("vertical_segment", [{ logical: at(0.4), price: up(0.15) }, { logical: at(0.4), price: up(0.55) }], { color: "#00897b", style: "dashed" });
+      chart.add_drawing("price_line", [{ logical: at(0.5), price: up(0.9) }], { color: "#6a1b9a", width: 2 });
       const first = chart.drawings()[0];
       chart.wasm.set_selected_drawing(first.id);
       chart.render();

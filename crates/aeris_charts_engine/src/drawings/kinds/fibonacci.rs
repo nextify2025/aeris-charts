@@ -185,6 +185,7 @@ const FIB_TOOL: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 /// Screen-space tools reach beyond their anchors by radii that depend on the zoom, so no

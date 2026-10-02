@@ -220,6 +220,12 @@ const TAIL_WIDTH: f64 = 10.0;
 const POINTER_HALF_WIDTH: f64 = 7.0;
 /// Signpost pole height (CSS px).
 const SIGNPOST_POLE: f64 = 40.0;
+/// Simple annotation: the gap under the stem, the stem length, and the head's height and half
+/// width (CSS px), as in KLineChart's overlay.
+const ANNOTATION_GAP: f64 = 6.0;
+const ANNOTATION_STEM: f64 = 50.0;
+const ANNOTATION_HEAD: f64 = 5.0;
+const ANNOTATION_HEAD_HALF: f64 = 4.0;
 /// Flag mark: pole height and width, flag width and height (CSS px).
 const FLAG_POLE: f64 = 24.0;
 const FLAG_POLE_WIDTH: f64 = 2.0;
@@ -258,6 +264,7 @@ const TOOL: DrawingToolSpec = DrawingToolSpec {
     axis_price_label: false,
     grid_snap: false,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
 };
 
 /// One-anchor annotation behavior.
@@ -288,6 +295,7 @@ pub(crate) const PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
     grid_snap: true,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
     ..TOOL
 };
 
@@ -298,6 +306,7 @@ pub(crate) const DATE_RANGE: DrawingToolSpec = DrawingToolSpec {
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
     grid_snap: true,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
     ..TOOL
 };
 
@@ -308,6 +317,7 @@ pub(crate) const DATE_AND_PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
     grid_snap: true,
     anchor_link: DrawingAnchorLink::None,
+    axis_tag_text: false,
     ..TOOL
 };
 
@@ -377,6 +387,28 @@ pub(crate) const SIGNPOST: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::Signpost,
     wire_id: 140,
     name: "signpost",
+    requests_text_editor: true,
+    ..MARK
+};
+
+// KLineChart's simple tag: a line across the pane whose text, or price, is the price-axis tag. The
+// text is never painted on the chart, so there is nothing to edit in place.
+pub(crate) const SIMPLE_TAG: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::SimpleTag,
+    wire_id: 147,
+    name: "simple_tag",
+    logical_extent: DrawingLogicalExtent::Full,
+    axis_price_label: true,
+    axis_tag_text: true,
+    ..MARK
+};
+
+// KLineChart's simple annotation: a stem with a head under a boxed text. Placing it opens the
+// editor, like the other tools whose text the user supplies.
+pub(crate) const SIMPLE_ANNOTATION: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::SimpleAnnotation,
+    wire_id: 148,
+    name: "simple_annotation",
     requests_text_editor: true,
     ..MARK
 };
@@ -482,6 +514,8 @@ fn apply_defaults(drawing: &mut Drawing) {
         DrawingKind::Callout => drawing.text = "Callout".to_string(),
         DrawingKind::Comment => drawing.text = "Comment".to_string(),
         DrawingKind::Signpost => drawing.text = "Signpost".to_string(),
+        // KLineChart draws both dashed.
+        DrawingKind::SimpleTag | DrawingKind::SimpleAnnotation => drawing.style = LineStyle::Dashed,
         DrawingKind::ArrowMarkUp => {
             drawing.color = aeris_charts_core::style::MARKET_UP_CSS.to_string();
         }
@@ -534,6 +568,8 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
             bubble(ctx, parts, vec![price]);
         }
         DrawingKind::Signpost => signpost(ctx, parts),
+        DrawingKind::SimpleTag => simple_tag(ctx, parts),
+        DrawingKind::SimpleAnnotation => simple_annotation(ctx, parts),
         DrawingKind::FlagMark => flag_mark(ctx, parts),
         DrawingKind::ArrowMarkUp => arrow_mark(ctx, parts, (0.0, -1.0)),
         DrawingKind::ArrowMarkDown => arrow_mark(ctx, parts, (0.0, 1.0)),
@@ -1526,6 +1562,47 @@ fn signpost(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     );
 }
 
+/// Simple tag: a line across the pane at the anchor's price. Its text, or its price, is the tag on
+/// the price axis; nothing is painted on the chart.
+fn simple_tag(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
+    let Some(&a) = ctx.px.first() else {
+        return;
+    };
+    parts.hline(a.1, ctx.pane.left, ctx.pane.right, PartStroke::default());
+}
+
+/// Simple annotation: a stem rising from just above the anchor, a head pointing down at the stem's
+/// top, and the boxed text above the head.
+fn simple_annotation(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
+    let Some(&foot) = ctx.px.first() else {
+        return;
+    };
+    let s = ctx.scale;
+    let stem_bottom = foot.1 - ANNOTATION_GAP * s;
+    let stem_top = stem_bottom - ANNOTATION_STEM * s;
+    let head_top = stem_top - ANNOTATION_HEAD * s;
+    parts.vline(foot.0, stem_top, stem_bottom, PartStroke::default());
+    parts.fill_convex(
+        &[
+            (foot.0, stem_top),
+            (foot.0 - ANNOTATION_HEAD_HALF * s, head_top),
+            (foot.0 + ANNOTATION_HEAD_HALF * s, head_top),
+        ],
+        None,
+        true,
+    );
+    parts.text_label(
+        text_box(
+            ctx,
+            (foot.0, head_top),
+            (DrawingTextHAlign::Center, DrawingTextVAlign::Bottom),
+            ctx.text_lines(),
+            Some(ctx.drawing.stroke_color()),
+        ),
+        0,
+    );
+}
+
 /// Flag mark: a pole standing on the anchor with a flag at its top right.
 fn flag_mark(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     let Some(&foot) = ctx.px.first() else {
@@ -1756,6 +1833,12 @@ fn decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
         }
         DrawingKind::Signpost => {
             SIGNPOST_POLE + box_reach(engine, drawing, &lines, size, BOX_PADDING, 0.0)
+        }
+        DrawingKind::SimpleAnnotation => {
+            ANNOTATION_GAP
+                + ANNOTATION_STEM
+                + ANNOTATION_HEAD
+                + box_reach(engine, drawing, &lines, size, BOX_PADDING, 0.0)
         }
         DrawingKind::FlagMark => FLAG_POLE + FLAG_WIDTH,
         DrawingKind::ArrowMarkUp

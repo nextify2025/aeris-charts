@@ -2763,7 +2763,7 @@ fn catalog_points(kind: DrawingKind) -> Vec<DrawingPoint> {
 
 /// The tools whose drawing paints no text of its own, by design: their `text` is accepted but
 /// never painted, so there is nothing to edit in place.
-const TEXTLESS: [DrawingKind; 8] = [
+const TEXTLESS: [DrawingKind; 9] = [
     DrawingKind::Forecast,
     DrawingKind::BarsPattern,
     DrawingKind::PriceRange,
@@ -2772,6 +2772,7 @@ const TEXTLESS: [DrawingKind; 8] = [
     DrawingKind::Projection,
     DrawingKind::FlagMark,
     DrawingKind::Icon,
+    DrawingKind::SimpleTag,
 ];
 
 #[test]
@@ -2820,8 +2821,8 @@ fn every_tool_is_text_editable_exactly_when_it_paints_its_text() {
         }
         assert_eq!(chart.drawing_text_editable(id), expected, "{kind:?}");
     }
-    assert_eq!(crate::drawings::DRAWING_TOOL_SPECS.len(), 88);
-    assert_eq!(editable_tools, 80);
+    assert_eq!(crate::drawings::DRAWING_TOOL_SPECS.len(), 91);
+    assert_eq!(editable_tools, 82);
 }
 
 #[test]
@@ -3290,4 +3291,153 @@ fn forecasts_and_bars_patterns_read_an_as_of_sources_own_bars() {
     // Pinned on the copy's box: the first bar at logical 0, the last (d5) at its point, 3.
     let points = &chart.drawing(pattern).unwrap().points;
     assert_eq!((points[0].logical, points[1].logical), (0.0, 3.0));
+}
+
+/// Texts of the price-axis tags (labels with a background) in the axis frame.
+fn axis_tags(chart: &mut ChartEngine) -> Vec<String> {
+    chart.axis_w = 80.0;
+    chart.build_frame();
+    chart
+        .build_axis_frame(
+            80.0,
+            |text, _bold| text.len() as f64 * 7.0,
+            |text, _bold| text.len() as f64 * 6.0,
+        )
+        .labels
+        .into_iter()
+        .filter(|label| label.background.is_some())
+        .map(|label| label.text)
+        .collect()
+}
+
+#[test]
+fn simple_tags_tag_the_price_axis_with_their_text_or_price_and_paint_no_chart_text() {
+    let kind = DrawingKind::SimpleTag;
+    let spec = kind.spec();
+    assert_eq!((spec.wire_id, spec.name), (147, "simple_tag"));
+    assert_eq!(DrawingKind::from_u8(147), Some(kind));
+    assert_eq!(DrawingKind::from_name("simple_tag"), Some(kind));
+    assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 1 });
+    assert!(spec.axis_price_label && spec.axis_tag_text);
+    assert_eq!(
+        crate::Drawing::new(1, kind, 0, Vec::new()).style,
+        LineStyle::Dashed
+    );
+
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        kind,
+        vec![p(4.0, 103.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    let a = anchor(&chart, id, 0);
+    let pane_w = chart.pane_w;
+    // A dashed crisp line across the whole pane at the anchor's price.
+    let frame = chart.build_frame();
+    let hlines = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::HLine {
+                y,
+                x0,
+                x1,
+                style,
+                color,
+                ..
+            } if *color == ink() => Some((*y, *x0, *x1, *style)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hlines.len(), 1, "{hlines:?}");
+    let (y, x0, x1, style) = hlines[0];
+    assert!((f64::from(y) - a.1).abs() <= 1.0, "{hlines:?}");
+    assert_eq!((x0, x1), (0, pane_w.round() as i32), "across the pane");
+    assert_eq!(style, LineStyle::Dashed);
+    // Without text the axis tag is the price.
+    assert!(axis_tags(&mut chart).contains(&"103.00".to_string()));
+    // With text the tag shows the text instead, and nothing is painted on the chart: there is no
+    // text to edit in place.
+    assert!(chart.drawing_apply_options(id, r#"{"text":"Support"}"#));
+    let tags = axis_tags(&mut chart);
+    assert!(tags.contains(&"Support".to_string()), "{tags:?}");
+    assert!(!tags.contains(&"103.00".to_string()), "{tags:?}");
+    assert!(!texts_of(&mut chart).contains(&"Support".to_string()));
+    assert!(!chart.drawing_text_editable(id));
+    // Hit across the pane, far from the anchor.
+    assert_eq!(hit(&chart, pane_w - 20.0, a.1), Some(id));
+}
+
+#[test]
+fn simple_annotations_stand_a_dashed_stem_with_a_head_under_a_boxed_text() {
+    let kind = DrawingKind::SimpleAnnotation;
+    let spec = kind.spec();
+    assert_eq!((spec.wire_id, spec.name), (148, "simple_annotation"));
+    assert_eq!(DrawingKind::from_u8(148), Some(kind));
+    assert_eq!(DrawingKind::from_name("simple_annotation"), Some(kind));
+    assert!(spec.requests_text_editor, "placing it opens the editor");
+    let defaults = crate::Drawing::new(1, kind, 0, Vec::new());
+    assert_eq!(defaults.style, LineStyle::Dashed);
+    assert!(defaults.text.is_empty(), "the user supplies the text");
+
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        kind,
+        vec![p(6.0, 102.0)],
+        r##"{"color":"#123456","text":"Earnings"}"##,
+    );
+    let a = anchor(&chart, id, 0);
+    // KLineChart's geometry at device scale 1: the stem runs 6 px above the anchor to 56 px above
+    // it, the head's apex sits on the stem's top, 5 px tall and 8 px wide, and the box sits above.
+    let stems = ink_vlines(&mut chart);
+    assert_eq!(stems.len(), 1, "{stems:?}");
+    let (x, y0, y1) = stems[0];
+    assert!((f64::from(x) - a.0).abs() <= 1.0);
+    assert!(
+        (f64::from(y1) - (a.1 - 6.0)).abs() <= 1.0 && (f64::from(y0) - (a.1 - 56.0)).abs() <= 1.0,
+        "{stems:?}"
+    );
+    let heads = fills(&mut chart)
+        .into_iter()
+        .filter(|(_, color)| *color == ink())
+        .collect::<Vec<_>>();
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    let head = &heads[0].0;
+    let top = head
+        .iter()
+        .map(|point| point.1)
+        .fold(f64::INFINITY, f64::min);
+    let bottom = head
+        .iter()
+        .map(|point| point.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let (left, right) = (
+        head.iter()
+            .map(|point| point.0)
+            .fold(f64::INFINITY, f64::min),
+        head.iter()
+            .map(|point| point.0)
+            .fold(f64::NEG_INFINITY, f64::max),
+    );
+    assert!(
+        (bottom - (a.1 - 56.0)).abs() <= 1.0 && (top - (a.1 - 61.0)).abs() <= 1.0,
+        "{head:?}"
+    );
+    assert!(((right - left) - 8.0).abs() <= 1.0, "{head:?}");
+    // The text is above the head.
+    let runs = texts(&mut chart);
+    let (_, _, text_y) = runs
+        .iter()
+        .find(|(text, ..)| text == "Earnings")
+        .expect("the text");
+    assert!(f64::from(*text_y) < a.1 - 61.0, "{runs:?}");
+    // Without text only the stem and head remain.
+    assert!(chart.drawing_apply_options(id, r#"{"text":""}"#));
+    assert!(!texts_of(&mut chart).contains(&"Earnings".to_string()));
+    assert_eq!(ink_vlines(&mut chart).len(), 1);
+    // The stem is a body target.
+    assert_eq!(hit(&chart, a.0, a.1 - 30.0), Some(id));
+    assert_eq!(hit(&chart, a.0 + 60.0, a.1 - 30.0), None);
 }
