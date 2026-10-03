@@ -3,8 +3,8 @@
 //! Axis label selection and geometry already live in [`crate::AxisFrame`]. This module owns the
 //! remaining chart policy that every host must execute identically: watermark placement, axis
 //! chrome, tick stubs, pane separators, boxed-label attachment, and text primitive placement.
-//! Hosts contribute only the platform font metric used to reproduce Canvas2D's middle-baseline
-//! correction.
+//! Hosts contribute the exact-font cap-center metric installed on the engine for all middle-
+//! anchored chart text.
 
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, Prim, TextAlign};
@@ -16,16 +16,9 @@ use crate::{
 impl ChartEngine {
     /// Build the final unscissored axis/top primitive layer into `output`, retaining its capacity.
     ///
-    /// `midpoint_correction` returns `(ascent - descent) / 2` in logical pixels for the supplied
-    /// text in the chart layout font. A host without vertical ink metrics may return `0.0`.
-    pub fn build_axis_primitives_into<F>(
-        &self,
-        axis_frame: &AxisFrame,
-        output: &mut Vec<Prim>,
-        midpoint_correction: F,
-    ) where
-        F: Fn(&str) -> f64,
-    {
+    /// The host's installed cap-center metric is sampled at each run's painted size, family,
+    /// and weight. Without native metrics the correction is zero.
+    pub fn build_axis_primitives_into(&self, axis_frame: &AxisFrame, output: &mut Vec<Prim>) {
         output.clear();
         let dpr = self.dpr;
         let bitmap_w = (self.css_width * dpr).round().max(1.0);
@@ -202,26 +195,26 @@ impl ChartEngine {
         }
 
         let append_text = |label: &AxisLabel, output: &mut Vec<Prim>| {
-            let metrics_text = match label.midpoint {
-                AxisTextMidpoint::None => None,
-                AxisTextMidpoint::Label => Some(label.text.as_str()),
-                AxisTextMidpoint::StableTime => Some("Apr0"),
+            let size = layout.font_size * label.font_scale;
+            let weight = if label.bold { 700 } else { 400 };
+            let correction = if label.midpoint == AxisTextMidpoint::None || label.text.is_empty() {
+                0.0
+            } else {
+                self.text_cap_center(size, &layout.font_family, weight, false)
             };
-            let correction =
-                metrics_text.map(&midpoint_correction).unwrap_or(0.0) * label.font_scale;
             output.push(Prim::Text {
                 x: (label.x * dpr) as f32,
                 y: ((label.y + correction) * dpr) as f32,
                 text: label.text.clone(),
                 color: label.color,
-                size: (layout.font_size * label.font_scale * dpr) as f32,
+                size: (size * dpr) as f32,
                 family: layout.font_family.clone(),
                 align: match label.align {
                     AxisTextAlign::Left => TextAlign::Left,
                     AxisTextAlign::Right => TextAlign::Right,
                     AxisTextAlign::Center => TextAlign::Center,
                 },
-                weight: if label.bold { 700 } else { 400 },
+                weight,
                 italic: false,
             });
         };

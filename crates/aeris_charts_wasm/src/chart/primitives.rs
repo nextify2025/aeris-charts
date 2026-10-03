@@ -28,15 +28,46 @@ use super::*;
 use crate::prim_decode::{decode_commands, pane_clip};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
 use aeris_charts_core::scale::price_scale_core::PriceScaleCore;
-use aeris_charts_core::style::{DEFAULT_AXIS_TEXT_RGB, DEFAULT_CROSSHAIR_RGB};
+use aeris_charts_core::style::{DARK_BORDER_RGB, DEFAULT_AXIS_TEXT_RGB};
+use aeris_charts_engine::{ChartHover, HostPrimitiveHit, HostPrimitiveLayer};
+use aeris_charts_render::draw_list::TextAlign;
 
 /// Fallback background for a primitive axis label with no color given — the reference crosshair
 /// label default (frame/mod.rs `PRIMITIVE_LABEL_BG`).
-const PRIMITIVE_LABEL_BG: Color = Color::rgb(
-    DEFAULT_CROSSHAIR_RGB.0,
-    DEFAULT_CROSSHAIR_RGB.1,
-    DEFAULT_CROSSHAIR_RGB.2,
-);
+const PRIMITIVE_LABEL_BG: Color =
+    Color::rgb(DARK_BORDER_RGB.0, DARK_BORDER_RGB.1, DARK_BORDER_RGB.2);
+
+/// Parse the canvas-normalized subset every frame executor can represent. Unsupported font
+/// variants are rejected instead of painting one font in the browser and another in native.
+fn parse_primitive_font(spec: &str) -> Option<(f64, String, u16, bool)> {
+    let (prefix, family) = spec.split_once("px ")?;
+    let family = family.trim();
+    if family.is_empty() {
+        return None;
+    }
+    let mut tokens = prefix.split_whitespace().collect::<Vec<_>>();
+    let size = tokens.pop()?.parse::<f64>().ok()?;
+    if !size.is_finite() || size <= 0.0 {
+        return None;
+    }
+    let mut weight = 400;
+    let mut italic = false;
+    for token in tokens {
+        match token {
+            "normal" => {}
+            "italic" | "oblique" => italic = true,
+            "bold" => weight = 700,
+            _ => {
+                let parsed = token.parse::<u16>().ok()?;
+                if !(100..=900).contains(&parsed) {
+                    return None;
+                }
+                weight = parsed;
+            }
+        }
+    }
+    Some((size, family.to_string(), weight, italic))
+}
 
 #[wasm_bindgen(inline_js = r#"
 // One draw context per renderer call. The converter fns arrive ready-made from Rust (they close
@@ -237,62 +268,103 @@ impl ChartInner {
             }
 
             self.append_primitive_axis_labels(&obj, pane);
-            self.append_primitive_text_views(&obj, scissor, snapshot.hpr, snapshot.vpr);
+            self.append_primitive_text_views(&obj, pane, scissor, snapshot.hpr, snapshot.vpr);
         }
     }
 
-    /// Hover hit testing (plugin platform Phase C-d; reference pane-hit-test.ts `hitTestPane`).
-    /// Resolves the primitive object and/or series under pane-relative media px `(x_css,
-    /// y_css)` (x from the pane's left edge, y from the chart's top — the crosshair's space)
-    /// and refreshes the engine's hovered series for the `hoveredSeriesOnTop` z-bump.
-    /// Returns JSON `{"series_id":number|null,"object_id":string|null,"cursor":string|null}`:
-    /// a series-primitive hit reports its owning series too (the reference's source IS the series), a
-    /// pane-primitive hit reports no series, and only a primitive hit carries a cursor.
-    ///
-    /// Primitives receive the same absolute bitmap-px coordinates their draw context uses.
-    /// Arbitration ports `hitTestPane`: the best primitive hit is the highest z-order
-    /// (`top` > `normal` > `bottom`, first-come within a layer — the reference's priority/distance
-    /// fields are not modeled); a `top` hit always wins, a `normal` hit blocks its own
-    /// series' built-in hit and every series below it, and a `bottom` hit only survives
-    /// when no series hit exists. Hidden series' primitives are skipped (a hidden series
-    /// paints nothing, so it captures no hover — reference gates the built-in hit on visibility
-    /// but overlooks its primitive path).
+    /// Hover hit testing (plugin platform Phase C-d; reference pane-hit-test.ts `hitTestPane`) at
+    /// pane-relative media px `(x_css, y_css)` (x from the pane's left edge, y from the chart's
+    /// top — the crosshair's space). Primitives are JS objects, so their best hit is gathered
+    /// here; the engine arbitrates it against drawings and series
+    /// (`ChartEngine::resolve_pointer_hover`) and refreshes hover promotion and the cursor.
+    /// Returns JSON `{"series_id","object_id","cursor","general_hit"}`: a series-primitive hit
+    /// reports its owning series too (the reference's source IS the series), a pane-primitive hit
+    /// reports no series, and only primitive and drawing hits carry a cursor.
     pub(super) fn hover_at(&mut self, x_css: f64, y_css: f64) -> String {
-        let result =
-            |series_id: Option<SeriesId>,
-             object_id: Option<String>,
-             cursor: Option<String>,
-             general_hit: Option<&aeris_charts_engine::GeneralSeriesHit>| {
-                serde_json::json!({
-                    "series_id": series_id,
-                    "object_id": object_id,
-                    "cursor": cursor,
-                    "general_hit": general_hit.map(super::general_charts::general_hit_value),
-                })
-                .to_string()
-            };
-        let Some(pane) = self.engine.pane_at_y(y_css) else {
-            self.engine.set_hovered_series(None);
-            self.engine.set_hovered_text(None);
-            self.engine.set_hovered_drawing(None);
-            self.engine.clear_general_hover();
-            return result(None, None, None, None);
+        let primitive = self.primitive_hit_at(x_css, y_css);
+        let hover = self.engine.resolve_pointer_hover(
+            x_css,
+            y_css,
+            primitive.as_ref().map(PrimitiveHit::engine_hit),
+        );
+        self.hover_json(hover, primitive.as_ref())
+    }
+
+    /// The input controller's current hover as `hover_at` JSON. The controller already resolved
+    /// every built-in candidate at its hover point, so arbitration re-runs only when a primitive
+    /// is hit there.
+    pub(super) fn controller_hover_json(&mut self) -> String {
+        let Some((x, y)) = self.engine.crosshair else {
+            return self.hover_json(ChartHover::None, None);
         };
-        let general_hit = self.engine.update_general_hover(pane, x_css, y_css);
-        // Absolute bitmap px of the whole chart, exactly like the draw context (module
-        // docs): the frame build's ratios, plus the integer pane offset on x.
+        let primitive = if self.primitives.is_empty() && self.series_primitives.is_empty() {
+            None
+        } else {
+            self.primitive_hit_at(x, y)
+        };
+        let hover = match &primitive {
+            Some(hit) => self
+                .engine
+                .resolve_pointer_hover(x, y, Some(hit.engine_hit())),
+            None => self.engine.input_hover(),
+        };
+        self.hover_json(hover, primitive.as_ref())
+    }
+
+    fn hover_json(&self, hover: ChartHover, primitive: Option<&PrimitiveHit>) -> String {
+        let (series_id, object_id, cursor, general_hit) = match hover {
+            ChartHover::None => (None, None, None, None),
+            ChartHover::HostPrimitive(hit) => (
+                hit.series,
+                primitive.and_then(|primitive| primitive.external_id.clone()),
+                primitive.and_then(|primitive| primitive.cursor.clone()),
+                None,
+            ),
+            ChartHover::Drawing { id, cursor } => (
+                None,
+                Some(format!("drawing:{id}")),
+                Some(cursor.to_string()),
+                None,
+            ),
+            ChartHover::Series(id) => (Some(id), None, None, None),
+            ChartHover::VolumeProfile(id) => {
+                (None, Some(format!("volume_profile:{id}")), None, None)
+            }
+            ChartHover::General => (None, None, None, self.engine.general_hovered_hit()),
+        };
+        serde_json::json!({
+            "series_id": series_id,
+            "object_id": object_id,
+            "cursor": cursor,
+            "general_hit": general_hit.as_ref().map(super::general_charts::general_hit_value),
+        })
+        .to_string()
+    }
+
+    /// The best primitive hit at a hover point: the highest z-order (`top` > `normal` >
+    /// `bottom`, first-come within a layer — the reference's priority/distance fields are not
+    /// modeled), series in stable paint order topmost first, then the pane's own primitives (the
+    /// pane is the lowest source — the reference's `[pane, ...orderedSources()].reverse()`).
+    /// Primitives receive the same absolute bitmap-px coordinates their draw context uses.
+    /// Hidden series' primitives are skipped (a hidden series paints nothing, so it captures no
+    /// hover — reference gates the built-in hit on visibility but overlooks its primitive path).
+    fn primitive_hit_at(&self, x_css: f64, y_css: f64) -> Option<PrimitiveHit> {
+        let pane = self.engine.pane_at_y(y_css)?;
         let nominal_dpr = self.dpr.max(0.01);
         let hpr = (self.pane_w * nominal_dpr).round().max(1.0) / self.pane_w.max(1.0);
         let vpr = (self.pane_h * nominal_dpr).round().max(1.0) / self.pane_h.max(1.0);
         let pane_left_px = (self.pane_left * nominal_dpr).round().max(0.0);
         let (bx, by) = (x_css * hpr + pane_left_px, y_css * vpr);
-
-        // Gather the best primitive hit: series in stable paint order, topmost first (the
-        // pane is the lowest source — the reference's `[pane, ...orderedSources()].reverse()`). The
-        // order is cloned so the loop may refresh the engine's hovered series on return.
-        let order: Vec<SeriesId> = self.engine.series_order().to_vec();
-        let mut best_primitive: Option<PrimitiveHit> = None;
-        for &id in order.iter().rev() {
+        let mut best: Option<PrimitiveHit> = None;
+        let mut offer = |hit: PrimitiveHit| {
+            if best
+                .as_ref()
+                .is_none_or(|current| hit.layer() > current.layer())
+            {
+                best = Some(hit);
+            }
+        };
+        for &id in self.engine.series_order().iter().rev() {
             let on_hit_pane = self
                 .series
                 .iter()
@@ -302,124 +374,16 @@ impl ChartInner {
             }
             for entry in self.series_primitives.iter().filter(|e| e.series == id) {
                 if let Some(hit) = call_hit_test(&entry.obj, bx, by) {
-                    let hit = hit.for_series(id);
-                    if best_primitive
-                        .as_ref()
-                        .is_none_or(|current| hit.z_rank() > current.z_rank())
-                    {
-                        best_primitive = Some(hit);
-                    }
+                    offer(hit.for_series(id));
                 }
             }
         }
         for entry in self.primitives.iter().filter(|e| e.pane as usize == pane) {
             if let Some(hit) = call_hit_test(&entry.obj, bx, by) {
-                let hit = hit.for_pane();
-                if best_primitive
-                    .as_ref()
-                    .is_none_or(|current| hit.z_rank() > current.z_rank())
-                {
-                    best_primitive = Some(hit);
-                }
+                offer(hit.for_pane());
             }
         }
-
-        // A `top`-layer primitive hit always beats the built-in series hit tests.
-        if let Some(hit) = &best_primitive {
-            if hit.z_rank() == 2 {
-                self.engine.clear_general_hover();
-                self.engine.set_hovered_series(hit.series);
-                self.engine.set_hovered_text(None);
-                self.engine.set_hovered_drawing(None);
-                return result(
-                    hit.series,
-                    hit.external_id.clone(),
-                    hit.cursor.clone(),
-                    None,
-                );
-            }
-        }
-        // Engine-owned drawing tools (drawings.rs): their hit wins over series and
-        // normal/bottom primitives (overlaps stay selectable) except a `top`-layer primitive
-        // (handled above), independent of the pane-local paint order (idle drawings below
-        // price series, active above). A drawing hit reports no series and releases the
-        // hovered-series promotion, and carries the part cursor (`move` on a body, `pointer`
-        // on a selected drawing's anchor handle). Every kind sets generic hover promotion;
-        // a TEXT drawing additionally gets the hover ring (the engine kind-filters; other
-        // kinds have no hover chrome, so a label hit on a ray or a rectangle stores no hovered
-        // text and only promotes the drawing). Hit testing stays on stable z-order so promotion
-        // cannot oscillate hover. The engine owns drawing hover arbitration (a drawing's own
-        // label, trend prompt included, answers first with the text cursor, then body/handle),
-        // shared verbatim with native hosts.
-        if let Some((id, cursor)) = self.engine.update_drawing_hover(x_css, y_css) {
-            self.engine.clear_general_hover();
-            self.engine.set_hovered_series(None);
-            return result(
-                None,
-                Some(format!("drawing:{id}")),
-                Some(cursor.to_string()),
-                None,
-            );
-        }
-        // Walk the sources topmost-first, accumulating the best series hit (the reference's
-        // `isBetterHit` arbitration); reaching the best primitive hit's owning series
-        // returns whatever accumulated above it, else the primitive hit.
-        let mut best_series: Option<aeris_charts_engine::SeriesHit> = None;
-        for &id in order.iter().rev() {
-            if let Some(hit) = &best_primitive {
-                if hit.series == Some(id) && hit.z_rank() != 0 {
-                    let (series_id, object_id, cursor) = match best_series {
-                        Some(hit) => (Some(hit.series), None, None),
-                        None => (hit.series, hit.external_id.clone(), hit.cursor.clone()),
-                    };
-                    self.engine.clear_general_hover();
-                    self.engine.set_hovered_series(series_id);
-                    return result(series_id, object_id, cursor, None);
-                }
-            }
-            if self
-                .series
-                .iter()
-                .find(|series| series.id == id && !series.removed)
-                .is_none_or(|series| series.pane_index != pane)
-            {
-                continue;
-            }
-            let Some(candidate) = self.engine.hit_test_one_series(id, x_css, y_css) else {
-                continue;
-            };
-            if best_series.is_none_or(|current| candidate.is_better_than(&current)) {
-                best_series = Some(candidate);
-            }
-        }
-        if let Some(hit) = best_series {
-            self.engine.clear_general_hover();
-            self.engine.set_hovered_series(Some(hit.series));
-            return result(Some(hit.series), None, None, None);
-        }
-        if let Some(hit) = &best_primitive {
-            if hit.z_rank() == 1 && hit.series.is_none() {
-                self.engine.clear_general_hover();
-                self.engine.set_hovered_series(None);
-                return result(None, hit.external_id.clone(), hit.cursor.clone(), None);
-            }
-        }
-        if let Some(hit) = &general_hit {
-            self.engine.set_hovered_series(None);
-            return result(None, None, None, Some(hit));
-        }
-        // A pane-sourced or `bottom`-layer primitive hit survives only without a series hit.
-        if let Some(hit) = &best_primitive {
-            self.engine.set_hovered_series(hit.series);
-            return result(
-                hit.series,
-                hit.external_id.clone(),
-                hit.cursor.clone(),
-                None,
-            );
-        }
-        self.engine.set_hovered_series(None);
-        result(None, None, None, None)
+        best
     }
 
     /// Refresh the engine's per-frame autoscale store from every series primitive's
@@ -563,7 +527,7 @@ impl ChartInner {
             }
 
             self.append_series_primitive_axis_labels(&obj, pane, target, base);
-            self.append_primitive_text_views(&obj, scissor, snapshot.hpr, snapshot.vpr);
+            self.append_primitive_text_views(&obj, pane, scissor, snapshot.hpr, snapshot.vpr);
         }
     }
 
@@ -663,22 +627,20 @@ impl ChartInner {
         layer.extend(decoded.prims);
     }
 
-    /// Collect a primitive's `text_views(info)` draws (plugin platform Phase 3.5) into the legacy
-    /// Canvas2D compatibility overlay. Each descriptor keeps its owning pane clip: the overlay is
-    /// composited above the backend surface, but plugin text cannot cover price/time-axis chrome.
+    /// Lower a primitive's `text_views(info)` draws into the owning pane's ordered top layer.
+    /// The pane scissor keeps text out of shared axis chrome on every backend.
     /// The hook receives the pane's bitmap dimensions, exact pixel ratios, and layout font — state
     /// a plugin cannot read mid-render otherwise (chart APIs are off-limits from render hooks).
-    /// Descriptors carry absolute bitmap-px coordinates, converted here to media space with the
-    /// frame ratios. Shared by the pane- and series-primitive passes.
+    /// Descriptors carry absolute bitmap-px coordinates. Shared by pane and series passes.
     fn append_primitive_text_views(
         &mut self,
         obj: &js_sys::Object,
+        pane: usize,
         scissor: [u32; 4],
         hpr: f64,
         vpr: f64,
     ) {
-        let options = self.opts();
-        let layout = options.layout;
+        let layout = self.opts().layout;
         let info = js_sys::Object::new();
         let [pane_left_px, pane_top_px, pane_w_px, pane_h_px] = scissor;
         for (key, value) in [
@@ -734,24 +696,68 @@ impl ChartInner {
                     .filter(|v| allowed.contains(&v.as_str()))
                     .unwrap_or_else(|| fallback.to_string())
             };
-            self.primitive_texts.push(PrimitiveOverlayText {
+            let align = match keyword("align", &["left", "center", "right"], "left").as_str() {
+                "center" => TextAlign::Center,
+                "right" => TextAlign::Right,
+                _ => TextAlign::Left,
+            };
+            let baseline = keyword(
+                "baseline",
+                &["top", "middle", "bottom", "alphabetic"],
+                "alphabetic",
+            );
+            let ctx = &self.axis_ctx;
+            ctx.save();
+            ctx.set_font("10px sans-serif");
+            ctx.set_font(&font);
+            let normalized_font = js_sys::Reflect::get(ctx.as_ref(), &"font".into())
+                .ok()
+                .and_then(|value| value.as_string());
+            let parsed = normalized_font.as_deref().and_then(parse_primitive_font);
+            ctx.set_text_baseline(&baseline);
+            let target_ascent = ctx
+                .measure_text(&text)
+                .ok()
+                .map(|m| m.actual_bounding_box_ascent());
+            ctx.set_text_baseline("middle");
+            let middle_ascent = ctx
+                .measure_text(&text)
+                .ok()
+                .map(|m| m.actual_bounding_box_ascent());
+            ctx.set_fill_style_str("#000000");
+            ctx.set_fill_style_str(
+                &non_empty_string("color").unwrap_or_else(|| layout.text_color.clone()),
+            );
+            let color = js_sys::Reflect::get(ctx.as_ref(), &"fillStyle".into())
+                .ok()
+                .and_then(|value| value.as_string())
+                .and_then(|value| Color::parse_css(&value));
+            ctx.restore();
+            let (
+                Some((size, family, weight, italic)),
+                Some(color),
+                Some(target_ascent),
+                Some(middle_ascent),
+            ) = (parsed, color, target_ascent, middle_ascent)
+            else {
+                web_sys::console::warn_1(
+                    &"aeris_charts: unsupported primitive text font or color".into(),
+                );
+                continue;
+            };
+            let Some(frame_pane) = self.frame.panes.get_mut(pane) else {
+                continue;
+            };
+            frame_pane.top_prims.push(Prim::Text {
+                x: x as f32,
+                y: (y + (middle_ascent - target_ascent) * vpr) as f32,
                 text,
-                x: x / hpr,
-                y: y / vpr,
-                clip: [
-                    f64::from(pane_left_px) / hpr,
-                    f64::from(pane_top_px) / vpr,
-                    f64::from(pane_w_px) / hpr,
-                    f64::from(pane_h_px) / vpr,
-                ],
-                color: non_empty_string("color").unwrap_or_else(|| layout.text_color.clone()),
-                font,
-                align: keyword("align", &["left", "center", "right"], "left"),
-                baseline: keyword(
-                    "baseline",
-                    &["top", "middle", "bottom", "alphabetic"],
-                    "alphabetic",
-                ),
+                color,
+                size: (size * vpr) as f32,
+                family,
+                align,
+                weight,
+                italic,
             });
         }
     }
@@ -1142,12 +1148,19 @@ impl PrimitiveHit {
         self
     }
 
-    /// Z layer as a rank (`top` 2 > `normal` 1 > `bottom` 0) for the best-hit walk.
-    fn z_rank(&self) -> u8 {
+    fn layer(&self) -> HostPrimitiveLayer {
         match self.z_order.as_str() {
-            "top" => 2,
-            "bottom" => 0,
-            _ => 1,
+            "top" => HostPrimitiveLayer::Top,
+            "bottom" => HostPrimitiveLayer::Bottom,
+            _ => HostPrimitiveLayer::Normal,
+        }
+    }
+
+    fn engine_hit(&self) -> HostPrimitiveHit {
+        HostPrimitiveHit {
+            series: self.series,
+            layer: self.layer(),
+            cursor: self.cursor.is_some(),
         }
     }
 }

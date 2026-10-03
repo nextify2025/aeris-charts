@@ -636,7 +636,7 @@ mod tests {
             );
             assert_eq!(icon.image.pixels, expected.pixels);
             let mut prims = Vec::new();
-            chart.build_axis_primitives_into(&axis, &mut prims, |_| 0.0);
+            chart.build_axis_primitives_into(&axis, &mut prims);
             let Some(Prim::Image {
                 image,
                 rect,

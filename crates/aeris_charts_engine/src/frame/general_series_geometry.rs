@@ -27,8 +27,8 @@ fn opacity_alpha(opacity: f64) -> u8 {
 
 /// A series stroke over the pooled points `[first, first + count)` (shared with its area or band
 /// fill). A solid style strokes them as they are; a dashed or dotted one reaches executors as
-/// solid dash runs clipped to the pane, like every engine-owned dashed stroke, because the WebGPU
-/// stroker has no dash concept.
+/// solid dash runs clipped to the pane, like every engine-owned dashed stroke, so the dash count
+/// follows the visible length.
 fn push_general_stroke(
     out: &mut Vec<Prim>,
     points: &mut Vec<[f32; 2]>,

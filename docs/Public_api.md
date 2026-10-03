@@ -652,8 +652,9 @@ and `localization.time_formatter(time, context)` receive UTC seconds plus a `tim
 whose `business_day` is the calendar date for calendar-date rows and `null` for instants. The host
 `time_formatter` overrides every surface that prints a point in time: crosshair label, rectangle
 axis tags, delta tooltip, `create_tooltip`, and accessibility (unless the accessibility options set
-their own `time_formatter`). Without it, `create_tooltip` and accessibility format in the chart time
-zone with `localization.locale`, adding the time of day for intraday rows. Rust `TickMarkFormatterFn`
+their own `time_formatter`). Without it, `create_tooltip` and accessibility print the crosshair label
+(`chart.format_time_label()`): `localization.date_format` and `localization.locale` in the chart time
+zone, adding the time of day for intraday rows and none for calendar-date rows. Rust `TickMarkFormatterFn`
 and `TimeFormatterFn` signatures are unchanged. With a close-time label configured
 ([Close-time labels](#close-time-labels)) both callbacks receive the LABEL instant (the bar's
 close), not the bar's open time; a host that adds one interval inside its formatter must drop that
@@ -1243,7 +1244,7 @@ lands 37/60 of the way from the 10:00 hourly bar to the next one, and inside tha
 daily data. Undo/redo history and in-flight creation or drag state follow the same rules. Sync
 payloads (`drawing_sync_payload`) and clipboard payloads (`copy_drawings`) carry anchor times, so the
 receiving chart resolves them on its own interval and history window. Every committed drawing change
-(an API call, a placement, a freehand stroke, a pointer drag or keyboard nudge that moved something,
+(an API call, a placement, a freehand stroke, a pointer drag or keyboard edit that moved something,
 a text edit) advances the sync revision, so an already synced cell accepts the next payload.
 Clipboard payloads are bounded like a persisted drawing document (at most 10,000 drawings, 250,000
 anchors, and 8 MiB): `copy_drawings` throws `resource_limit` past them and `invalid_data` when no
@@ -1265,9 +1266,10 @@ dropping the options. Undo/redo during an active drag cancels the drag first. Ke
 (`Enter`, `Tab`, arrows) cycles the drawing's editable handles (every anchor, a rectangle's eight
 bounds handles, a Long/Short Position's target, entry, width, and stop controls, or the handles a
 drawing family places on its geometry, listed with each family below) and moves the focused
-handle by the nudge distance. `drawing_handle_count()` counts them. A nudge that moves nothing (a
-locked drawing, an axis the drawing cannot move along, a clamp at the pane edge) records no undo
-step and is announced as such, so Escape rolls back only the nudges that moved the drawing.
+handle by the nudge distance. `drawing_handle_count()` counts them. Every nudge applies live; `Enter`
+commits the whole keyboard edit as one undo step and `Escape` restores the drawing as it was when the
+edit began. A nudge that moves nothing (a locked drawing, an axis the drawing cannot move along, a
+clamp at the pane edge) changes nothing and is announced as such.
 
 A drawing's own text is edited in place in the chart's inline editor, for every drawing that paints
 it: the text tool, a trend line's label, the text of every line, channel, Fibonacci, pitchfork,
@@ -1352,7 +1354,7 @@ B8 drawing families extend the `drawing_kind` catalog. Their tools use the same 
 selection, handles, drags, magnet, keyboard editing, anchor time identity, history, persistence,
 clipboard, sync, and schema APIs as every other drawing. Some tools add handles on their geometry
 beyond their anchors (listed with each family); those drag, magnet-snap, and keyboard-nudge like
-anchor handles, and each drag or nudge is one undo step, including any option it edits. Family-specific options live in one block
+anchor handles, and each drag, and each keyboard edit session, is one undo step, including any option it edits. Family-specific options live in one block
 per family under `options.tool_options`; a patch deep-merges it (absent keys keep their values,
 `null` resets a block, an invalid block rejects the whole patch with `invalid_options`). Schema
 descriptors name those options with dotted paths such as `tool_options.line.stats_position`, and

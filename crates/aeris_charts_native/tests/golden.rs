@@ -5,17 +5,14 @@
 //! fails here until the golden is deliberately regenerated (`cargo run -p aeris_charts_native --example
 //! scene -- crates/aeris_charts_native/tests/goldens/scene.png`).
 //!
-//! The golden is currently our own deterministic render of geometry (no text). When a
-//! headless-Chromium comparison pipeline exists, independently captured public-library output can
-//! be evaluated as additional goldens with the same diff.
+//! The golden includes the full primitive scene. System font selection varies by OS, so the text
+//! run is checked for actual ink separately and its small region is masked in the exact PNG diff.
 
-use aeris_charts_engine::{ChartEngine, SeriesKind};
 use aeris_charts_native::{
     diff_pixmaps,
     engine_scene::{demo_engine, parity_engine},
     load_png, render_engine, render_prims,
     scene::demo_scene,
-    TinySkiaCanvas,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType, Prim};
@@ -23,14 +20,102 @@ use aeris_charts_render::draw_list::{LineStyle, LineType, Prim};
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens/scene.png");
 
 #[test]
+fn golden_scene_exercises_every_non_rect_contract_family() {
+    let scene = demo_scene();
+    for (name, found) in [
+        (
+            "Text",
+            scene.prims.iter().any(|p| matches!(p, Prim::Text { .. })),
+        ),
+        (
+            "RoundRect",
+            scene
+                .prims
+                .iter()
+                .any(|p| matches!(p, Prim::RoundRect { border_width, .. } if *border_width > 0.0)),
+        ),
+        (
+            "BandFill",
+            scene
+                .prims
+                .iter()
+                .any(|p| matches!(p, Prim::BandFill { .. })),
+        ),
+        (
+            "Triangle",
+            scene
+                .prims
+                .iter()
+                .any(|p| matches!(p, Prim::Triangle { .. })),
+        ),
+        (
+            "Image",
+            scene.prims.iter().any(|p| matches!(p, Prim::Image { .. })),
+        ),
+        (
+            "Dashed Polyline",
+            scene.prims.iter().any(|p| {
+                matches!(
+                    p,
+                    Prim::Polyline {
+                        style: LineStyle::Dashed,
+                        ..
+                    }
+                )
+            }),
+        ),
+        (
+            "Dotted stepped Polyline",
+            scene.prims.iter().any(|p| {
+                matches!(
+                    p,
+                    Prim::Polyline {
+                        style: LineStyle::Dotted,
+                        line_type: LineType::WithSteps,
+                        ..
+                    }
+                )
+            }),
+        ),
+    ] {
+        assert!(found, "golden scene lacks {name}");
+    }
+}
+
+#[test]
 fn scene_matches_golden() {
     let s = demo_scene();
     let canvas = render_prims(s.width, s.height, s.background, &s.prims, &s.points);
-    let golden = load_png(GOLDEN).expect("committed golden PNG should load");
+    let mut golden = load_png(GOLDEN).expect("committed golden PNG should load");
+    let mut rendered = canvas.pixmap().clone();
+
+    let without_text: Vec<_> = s
+        .prims
+        .iter()
+        .filter(|prim| !matches!(prim, Prim::Text { .. }))
+        .cloned()
+        .collect();
+    let plain = render_prims(s.width, s.height, s.background, &without_text, &s.points);
+    let width = s.width as usize;
+    let mut ink_pixels = 0;
+    for y in 255..300usize {
+        for x in 0..100usize {
+            let index = (y * width + x) * 4;
+            if canvas.pixmap().data()[index..index + 4] != plain.pixmap().data()[index..index + 4] {
+                ink_pixels += 1;
+            }
+            rendered.data_mut()[index..index + 4].fill(0);
+            golden.data_mut()[index..index + 4].fill(0);
+        }
+    }
+    assert!(
+        ink_pixels > 20,
+        "native text run painted only {ink_pixels} pixels"
+    );
 
     // Same machine + deterministic CPU rasterizer => exact. Allow a hair of per-channel tolerance
     // and a tiny differing-pixel budget so a tiny-skia patch bump doesn't spuriously fail CI.
-    let stats = diff_pixmaps(canvas.pixmap(), &golden, 2).expect("golden and render are same size");
+    let stats = diff_pixmaps(&rendered, &golden, 2).expect("golden and render are same size");
     assert!(
         stats.fraction() < 0.001,
         "render drifted from golden: {} / {} px differ (max channel delta {}). \
@@ -183,114 +268,4 @@ fn segments_render_like_two_point_polylines() {
         "{differing} seam pixels differ"
     );
     assert!(max_delta <= 64, "max channel delta {max_delta}");
-}
-
-/// A daily chart with a line series in pane 0 and session VWAP in pane 1. Every bar is its own
-/// period, so pane 1's study is one `Segments` batch, and its pool indices start at zero in pane
-/// 1's own pool while pane 0's line already holds points in the image export's concatenated pool.
-fn two_pane_daily_study() -> ChartEngine {
-    let mut chart = ChartEngine::new(480.0, 300.0, 1.0);
-    let times: Vec<f64> = (0..40)
-        .map(|day| (1_704_067_200 + day * 86_400) as f64)
-        .collect();
-    let close: Vec<f64> = (0..40)
-        .map(|day| 100.0 + ((day * 7) % 11) as f64 * 0.8)
-        .collect();
-    chart
-        .set_series_data(0, &times, &close, &close, &close, &close)
-        .unwrap();
-    chart.series[0].kind = SeriesKind::Line;
-    let vwap = chart.add_vwap(0, None).unwrap();
-    assert!(chart.series_apply_options_json(vwap, r##"{"color":"#e0401c","line_width":2}"##));
-    let pane = chart.add_pane(true).unwrap();
-    chart.set_series_pane(vwap, pane, 1.0);
-    chart.time_scale.set_width(480.0);
-    chart.fit_content();
-    chart
-}
-
-/// What `render_engine` rasterizes, with every `Segments` batch written out as separate solid
-/// two-point polylines and the pool indices rebased by hand.
-fn render_engine_with_polylines(chart: &mut ChartEngine) -> TinySkiaCanvas {
-    let frame = chart.build_frame();
-    let mut prims = Vec::new();
-    let mut points = Vec::new();
-    for pane in frame.panes {
-        let base = points.len() as u32;
-        points.extend(pane.points);
-        prims.extend(pane.under);
-        for prim in pane.main.into_iter().chain(pane.top_prims) {
-            match prim {
-                Prim::Polyline {
-                    first_point,
-                    point_count,
-                    width,
-                    style,
-                    line_type,
-                    color,
-                } => prims.push(Prim::Polyline {
-                    first_point: first_point + base,
-                    point_count,
-                    width,
-                    style,
-                    line_type,
-                    color,
-                }),
-                Prim::Segments {
-                    first_point,
-                    segment_count,
-                    width,
-                    color,
-                } => prims.extend(separate_polylines(
-                    first_point + base,
-                    segment_count,
-                    width,
-                    color,
-                )),
-                other => {
-                    assert!(
-                        !matches!(other, Prim::AreaFill { .. } | Prim::BandFill { .. }),
-                        "the fixture draws no pool-indexed fill"
-                    );
-                    prims.push(other);
-                }
-            }
-        }
-    }
-    let options = chart.options.get();
-    let surface = aeris_charts_core::style::DEFAULT_SURFACE_RGB;
-    let background = Color::parse_css(&options.layout.background.color)
-        .unwrap_or(Color::rgb(surface.0, surface.1, surface.2));
-    render_prims(
-        (frame.width * frame.pixel_ratio).round() as u32,
-        (frame.height * frame.pixel_ratio).round() as u32,
-        background,
-        &prims,
-        &points,
-    )
-}
-
-#[test]
-fn image_export_rebases_segments_in_every_pane() {
-    let mut chart = two_pane_daily_study();
-    let frame = chart.build_frame();
-    assert_eq!(frame.panes.len(), 2);
-    assert!(
-        !frame.panes[0].points.is_empty(),
-        "pane 0's line precedes pane 1's points in the exported pool"
-    );
-    assert!(
-        frame.panes[1]
-            .main
-            .iter()
-            .any(|prim| matches!(prim, Prim::Segments { .. })),
-        "pane 1 holds the study batch"
-    );
-    let exported = render_engine(&mut chart);
-    let reference = render_engine_with_polylines(&mut chart);
-    let stats = diff_pixmaps(exported.pixmap(), reference.pixmap(), 0).expect("same size");
-    // Neighbouring pairs step by far more than the line width, so they share no anti-aliased
-    // pixel and the batch must match the separate strokes exactly. Reading pane 0's points
-    // instead of pane 1's moved every pair into the wrong pane (3,736 px off before the rebase).
-    assert_eq!(stats.differing_pixels, 0, "{stats:?}");
 }

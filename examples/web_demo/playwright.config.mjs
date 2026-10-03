@@ -10,7 +10,8 @@ export default defineConfig({
   timeout: process.env.CI ? 60_000 : 30_000,
   fullyParallel: false,
   workers: 1,
-  reporter: [["list"], ["html", { open: "never" }]],
+  // CI also annotates each failed test on the check run, so a failure is named without the job log.
+  reporter: [["list"], ["html", { open: "never" }], ...(process.env.CI ? [["github"]] : [])],
   outputDir: "test-results",
   use: {
     baseURL: `http://127.0.0.1:${port}`,
@@ -25,11 +26,10 @@ export default defineConfig({
       // Chromium runs the full suite: the WebGPU backend (SwiftShader adapter) plus the shared
       // Canvas2D-fallback smoke. The WebGPU launch flags are Chromium-specific.
       name: "chromium",
-      // These suites intentionally depend on a calibrated machine/GPU, exact raster output, or
-      // wall-clock budgets. CI runs them separately as evidence; all other runtime/parity tests
-      // are the portable publication gate.
+      // Timing budgets and the native GPUI matrix remain machine evidence. Deterministic
+      // browser/backend pixel comparisons run in the portable publication gate.
       testIgnore: portable_browser
-        ? /(backend-parity|engine-bench|gpui-webgpu-matrix|perf-gate)\.spec\.mjs/
+        ? /(engine-bench|gpui-webgpu-matrix|perf-gate)\.spec\.mjs/
         : undefined,
       grepInvert: portable_browser ? /@machine/ : undefined,
       use: {

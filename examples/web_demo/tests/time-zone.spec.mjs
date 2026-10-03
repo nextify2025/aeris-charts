@@ -126,10 +126,10 @@ test("time_formatter receives calendar-date context and drives the tooltip", asy
   expect(hosted.contexts).toContainEqual({ year: 2024, month: 1, day: 8 });
   expect(hosted.contexts.every((context) => context !== null)).toBe(true);
 
-  // Built-in text: the calendar date stays Jan 8 even though UTC midnight is Jan 7 in New York.
+  // Built-in text: the calendar date stays Jan 8 (and prints no clock time) even though UTC midnight is Jan 7 in New York.
   await page.evaluate(() => window.__chart.apply_options({ localization: { time_formatter: null } }));
   await page.mouse.move(target.x + 1, target.y);
-  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Jan 8, 2024");
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("08 Jan '24");
 });
 
 test("tooltip and accessibility show exchange-local intraday times", async ({ page }) => {
@@ -163,7 +163,7 @@ test("tooltip and accessibility show exchange-local intraday times", async ({ pa
   // No gap across the lunch break.
   expect(Math.abs(target.spacing - target.bar_spacing)).toBeLessThan(1e-6);
   await page.mouse.move(target.x, target.y);
-  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Jan 2, 2024, 13:00");
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("02 Jan '24   13:00");
 
   const announced = await page.evaluate(async () => {
     const api = await import("/dist/aeris_charts_financial.js");
@@ -174,7 +174,7 @@ test("tooltip and accessibility show exchange-local intraday times", async ({ pa
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     return window.__chart.chart_element().querySelector(".aeris_charts-a11y-live-region")?.textContent ?? "";
   });
-  expect(announced).toContain("Jan 2, 2024, 15:00");
+  expect(announced).toContain("02 Jan '24   15:00");
 });
 
 test("the host clock drives the countdown, which hides outside the forming bar", async ({ page }) => {

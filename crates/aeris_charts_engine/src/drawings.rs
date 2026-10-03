@@ -1206,8 +1206,8 @@ pub type TextMeasureFn = Box<dyn Fn(&str, f64, &str, u16, bool) -> f64>;
 
 /// Host vertical glyph metric for `{italic} {weight} {size}px {family}`: the offset, in the same px
 /// units as `size`, that moves a `Prim::Text` anchor (Canvas `textBaseline: "middle"`, the em-box
-/// center) so the ink of capitals and figures is centered on the intended line instead. Browser
-/// hosts derive it from `measureText` ink bounds and native hosts from the font's cap height.
+/// center) so cap-height ink is centered on the intended line instead. Browser hosts derive it
+/// from `measureText` font bounds and cap ink; native hosts use the font's cap height.
 /// Without one the engine uses no correction (deterministic for native tests).
 pub type TextCapCenterFn = Box<dyn Fn(f64, &str, u16, bool) -> f64>;
 
@@ -3678,6 +3678,12 @@ impl ChartEngine {
         self.invalidate_frame_trading();
     }
 
+    /// Whether a host has installed a glyph-width measurer. Native renderers use this to avoid
+    /// invalidating drawing geometry on every screenshot after their first measurement install.
+    pub fn has_text_measure(&self) -> bool {
+        self.text_measure_fn.is_some()
+    }
+
     /// Cap-and-figure ink correction for a middle-anchored run (see [`TextCapCenterFn`]).
     pub(crate) fn text_cap_center(
         &self,
@@ -3697,6 +3703,7 @@ impl ChartEngine {
     /// control text inside its box (see [`TextCapCenterFn`]).
     pub fn set_text_cap_center(&mut self, f: Option<TextCapCenterFn>) {
         self.text_cap_center_fn = f;
+        self.invalidate_axis_frame();
         self.invalidate_frame_trading();
     }
 
@@ -5064,6 +5071,9 @@ impl ChartEngine {
         self.invalidate_frame_overlay();
         self.selected_drawing = id.filter(|&sid| self.drawings.iter().any(|d| d.id == sid));
         self.selected_drawings = self.selected_drawing.into_iter().collect();
+        if self.selected_drawing.is_some() {
+            self.clear_volume_profile_selection();
+        }
     }
 
     pub fn selected_drawing(&self) -> Option<DrawingId> {
@@ -6049,6 +6059,18 @@ impl ChartEngine {
         dy_css: f64,
         handle: Option<usize>,
     ) -> bool {
+        self.nudge_selected_drawing_with_history(dx_css, dy_css, handle, true)
+    }
+
+    /// [`Self::nudge_selected_drawing`]; without `record`, the step joins an open keyboard edit
+    /// that commits through [`Self::record_drawing_edit`].
+    pub(crate) fn nudge_selected_drawing_with_history(
+        &mut self,
+        dx_css: f64,
+        dy_css: f64,
+        handle: Option<usize>,
+        record: bool,
+    ) -> bool {
         if !dx_css.is_finite()
             || !dy_css.is_finite()
             || (dx_css == 0.0 && dy_css == 0.0)
@@ -6103,7 +6125,39 @@ impl ChartEngine {
             crate::DrawingMagnetMode::Off,
             false,
         );
-        self.commit_drawing_drag()
+        if record {
+            return self.commit_drawing_drag();
+        }
+        // Part of an open keyboard edit: the session records one undo entry when it commits.
+        if let Some(drag) = self.drawing_drag.take() {
+            self.update_drawing_runtime(drag.id);
+            self.invalidate_frame_overlay();
+        }
+        true
+    }
+
+    /// Record the change from `before` to the drawing's current state as one undo entry.
+    pub(crate) fn record_drawing_edit(&mut self, before: Drawing) {
+        let Some(after) = self.drawing(before.id).cloned() else {
+            return;
+        };
+        if before != after {
+            self.drawing_anchor_times.remove(&before.id);
+            self.record_drawing_command(DrawingCommand::Update {
+                before,
+                after: Box::new(after),
+            });
+        }
+    }
+
+    /// Restore a drawing's anchors from `before` without recording history.
+    pub(crate) fn restore_drawing_points(&mut self, before: Drawing) {
+        let id = before.id;
+        if let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) {
+            drawing.points = before.points;
+            self.update_drawing_runtime(id);
+            self.invalidate_frame_drawings();
+        }
     }
 
     // --- drawing-tool controller --------------------------------------------------------------

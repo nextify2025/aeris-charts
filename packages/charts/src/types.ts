@@ -2049,6 +2049,8 @@ export interface chart_options {
    * routing. `pan` and `zoom` are explicit Aeris extensions.
    */
   wheel_behavior: "auto" | "pan" | "zoom";
+  /** Zoom the hovered price axis in auto wheel mode. Default `false`. Package-level. */
+  price_axis_wheel_zoom: boolean;
   /** Chart-owned keyboard and assistive-technology surface. Enabled by default. */
   accessibility: boolean | accessibility_options;
   /** Touch crosshair tracking-mode behavior (reference `trackingMode`). Package-level. */
@@ -4235,11 +4237,17 @@ export interface volume_profile_indicator_api {
   options(): volume_profile_indicator_options;
   apply_options(options: Partial<volume_profile_indicator_options>): void;
   snapshot(): volume_profile_indicator_snapshot;
+  /** Whether the profile is the chart's selection (click-to-select, cleared by Escape). */
+  selected(): boolean;
+  /** Select the profile, or clear it with `false`; selecting clears other chart selections. */
+  select(selected?: boolean): void;
   remove(): void;
 }
 
 /** The chart. Create with {@link create_chart}. */
 export interface chart_api {
+  /** Format a time with the chart's time zone, date pattern, and crosshair time formatter. */
+  format_time_label(value: time): string;
   /** Camel-case aliases; both naming styles operate on this same chart handle. */
   addSeries: chart_api["add_series"];
   removeSeries: chart_api["remove_series"];

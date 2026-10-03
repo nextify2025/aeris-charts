@@ -83,7 +83,7 @@ export interface primitive_draw_context {
    * (default: `layout.fontFamily`), `options.color` any CSS color (default:
    * `layout.textColor`), `options.weight` the numeric CSS font weight 100–900 (default 400;
    * `options.bold` is the legacy shorthand for 700), and `options.italic` the style. For
-   * overlay text below the axis chrome use {@link pane_primitive.text_views}.
+   * text in the shared top pane layer use {@link pane_primitive.text_views}.
    */
   text(
     x: number,
@@ -154,17 +154,16 @@ export interface primitive_axis_label {
 }
 
 /**
- * An in-pane compatibility text draw registered through {@link pane_primitive.text_views} /
+ * An in-pane text draw registered through {@link pane_primitive.text_views} /
  * {@link series_primitive.text_views} (plugin platform Phase 3.5). It is painted through the
- * Canvas2D compatibility overlay on both live backends and clipped strictly to its owning pane,
+ * shared top pane layer on every backend and clipped strictly to its owning pane,
  * so it cannot cover price/time-axis chrome. For text at a specific layer position between the
- * engine's own primitives (for example above the crosshair or behind the series), use
+ * engine's own primitives (for example behind the series), use
  * {@link primitive_draw_context.text} instead.
  *
- * `x`/`y` are absolute bitmap px (the draw context's coordinate space); the host converts to
- * the overlay's media space with the frame's exact pixel ratios and applies the owning-pane clip.
- * `color` is any CSS color
- * (alpha preserved). `font` is a full CSS font shorthand and wins over `size`/`font_family`/
+ * `x`/`y` are absolute bitmap px (the draw context's coordinate space); the shared frame applies
+ * the owning-pane clip. `color` is a CSS color resolved by Canvas and encoded as shared RGBA.
+ * `font` is a CSS font shorthand for style, weight, pixel size and family, and wins over `size`/`font_family`/
  * `bold`; without it the host composes `{bold } {size}px {family}` defaulting to the chart's
  * `layout.fontSize`/`layout.fontFamily` — the same string the engine's own axis labels use.
  */
@@ -221,8 +220,8 @@ export interface pane_primitive {
   /** Boxed labels on the time strip. */
   time_axis_views?(): primitive_axis_label[];
   /**
-   * In-pane compatibility text draws (Phase 3.5; see {@link primitive_text_view}), painted on
-   * the Canvas2D compatibility overlay and clipped to the owning pane. Called after `pane_views`
+   * In-pane text draws (Phase 3.5; see {@link primitive_text_view}), painted in
+   * the shared pane frame and clipped to the owning pane. Called after `pane_views`
    * in the same render pass, so geometry cached by the view renderers is fresh.
    */
   text_views?(info: primitive_text_context): primitive_text_view[];
@@ -309,8 +308,8 @@ export interface series_primitive {
   /** Boxed labels on the time strip. */
   time_axis_views?(): primitive_axis_label[];
   /**
-   * In-pane compatibility text draws (Phase 3.5; see {@link primitive_text_view}), painted on
-   * the Canvas2D compatibility overlay and clipped to the owning pane. Called after `pane_views`
+   * In-pane text draws (Phase 3.5; see {@link primitive_text_view}), painted in
+   * the shared pane frame and clipped to the owning pane. Called after `pane_views`
    * in the same render pass, so geometry cached by the view renderers is fresh. A hidden series paints no
    * text (its views and autoscale are gated the same way).
    */

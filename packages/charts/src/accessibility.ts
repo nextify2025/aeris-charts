@@ -2,12 +2,12 @@
 
 import {
   attach_native_accessibility_focus,
-  chart_time_text,
   time_to_utc_seconds,
 } from "./impl.js";
 import type { native_accessibility_focus_handle } from "./impl.js";
 import type {
   chart_api,
+  drawing_api,
   general_accessibility_snapshot,
   general_series_api,
   pane_api,
@@ -252,9 +252,6 @@ class PaneAccessibility {
   private point_index = -1;
   private focused = false;
   private shortcuts_open = false;
-  private drawing_editing = false;
-  private drawing_anchor = -1;
-  private drawing_nudge_count = 0;
   private owns_general_focus = false;
   private high_contrast = false;
   private contrast_queries: MediaQueryList[] = [];
@@ -451,35 +448,14 @@ class PaneAccessibility {
   };
 
   private handle_semantic_target_key(event: KeyboardEvent, target: string): boolean {
-    if (target === "price-axis") {
-      const scale = this.controller.chart.price_scale("right", this.pane_index);
-      if (event.key === "Home") scale.set_auto_scale(true);
-      else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-        const range = scale.get_visible_range();
-        if (range === null) return false;
-        const center = (range.from + range.to) / 2;
-        const half = (range.to - range.from) * (event.key === "ArrowUp" ? 0.475 : 0.525);
-        scale.set_visible_range({ from: center - half, to: center + half });
-      } else return false;
+    if (target === "price-axis" || target === "separator") {
+      return this.engine_target_key(event, `${target}:${this.pane_index}`);
     } else if (target === "time-axis") {
-      const scale = this.controller.chart.time_scale();
-      const gates = keyboard_time_gates(this.controller.chart);
-      if (event.key === "Home" && gates.reset) scale.reset_time_scale();
-      else if (event.key === "ArrowLeft" && gates.scroll) scale.scroll_to_position(scale.scroll_position() - 1, false);
-      else if (event.key === "ArrowRight" && gates.scroll) scale.scroll_to_position(scale.scroll_position() + 1, false);
-      else return false;
-    } else if (target === "separator") {
-      if (event.key === "Home") this.pane.set_stretch_factor(1);
-      else if (event.key === "ArrowUp") this.pane.set_height(Math.max(1, this.pane.get_height() - 10));
-      else if (event.key === "ArrowDown") this.pane.set_height(this.pane.get_height() + 10);
-      else return false;
+      return this.engine_target_key(event, target);
     } else if (target.startsWith("drawing:")) {
-      const id = Number(target.slice("drawing:".length));
-      const chart = this.controller.chart as chart_api & { select_drawing_for_accessibility(id: number): void };
-      chart.select_drawing_for_accessibility(id);
-      const drawing = this.controller.chart.selected_drawing();
-      if (drawing === null) return false;
-      return this.handle_drawing_key(event, drawing);
+      const drawing = this.controller.chart.drawings()
+        .find((candidate) => `drawing:${candidate.id}` === target);
+      return drawing !== undefined && this.handle_drawing_key(event, drawing);
     } else if (target.startsWith("order:")) {
       const id = target.slice("order:".length);
       const chart = this.controller.chart as chart_api & {
@@ -553,64 +529,37 @@ class PaneAccessibility {
     }
   }
 
-  private handle_drawing_key(event: KeyboardEvent, drawing: import("./types.js").drawing_api): boolean {
+  private engine_target_key(event: KeyboardEvent, target: string): boolean {
     const chart = this.controller.chart as chart_api & {
-      nudge_selected_drawing(dx: number, dy: number, handle: number | null): boolean;
-      drawing_handle_count(id: number): number;
-      edit_drawing_text(id: number): boolean;
+      input_target_key(target: string, event: KeyboardEvent): boolean;
     };
-    if (event.key === "F2") {
-      // Edit the drawing's own text in the chart's inline editor, which announces itself and
-      // returns focus here when it closes.
-      if (!chart.edit_drawing_text(drawing.id)) return false;
-    } else if (event.key === "Enter") {
-      this.drawing_editing = !this.drawing_editing;
-      this.drawing_anchor = -1;
-      this.drawing_nudge_count = 0;
-      this.writer.write(`${drawing.kind().replaceAll("_", " ")} ${this.drawing_editing ? "editing" : "edit committed"}.`);
-    } else if (event.key === "Escape" && this.drawing_editing) {
-      for (let index = 0; index < this.drawing_nudge_count; index++) {
-        this.controller.chart.undo_drawing();
-      }
-      this.drawing_editing = false;
-      this.drawing_anchor = -1;
-      this.drawing_nudge_count = 0;
-      this.writer.write("Drawing edit cancelled.");
-    } else if (event.key === "Delete" || event.key === "Backspace") {
-      const kind = drawing.kind().replaceAll("_", " ");
-      this.drawing_editing = false;
-      this.drawing_nudge_count = 0;
-      drawing.remove();
-      this.writer.write(`${kind} removed.`);
-    } else if (event.key === "Tab" && this.drawing_editing) {
-      // Cycle the engine's editable handles (every anchor, a rectangle's eight bounds handles, a
-      // position's target/entry/width/stop controls, or a family's derived handles), not the raw
-      // anchor list.
-      const count = chart.drawing_handle_count(drawing.id);
-      if (count === 0) return false;
-      this.drawing_anchor = event.shiftKey
-        ? (this.drawing_anchor <= 0 ? count - 1 : this.drawing_anchor - 1)
-        : (this.drawing_anchor + 1) % count;
-      this.writer.write(`Handle ${this.drawing_anchor + 1} of ${count}.`);
-    } else if (this.drawing_editing && event.key.startsWith("Arrow")) {
-      const step = event.shiftKey ? 10 : 1;
-      const [dx, dy] = event.key === "ArrowLeft" ? [-step, 0]
-        : event.key === "ArrowRight" ? [step, 0]
-          : event.key === "ArrowUp" ? [0, -step] : [0, step];
-      // Escape undoes one step per counted nudge, so only a nudge that recorded an undoable
-      // change counts. A refused one (locked, clamped at the pane edge, or along an axis the
-      // drawing cannot move) still consumes the key so it never falls through to series
-      // navigation while editing.
-      if (chart.nudge_selected_drawing(dx, dy, this.drawing_anchor < 0 ? null : this.drawing_anchor)) {
-        this.drawing_nudge_count += 1;
-        this.writer.write(`Drawing moved ${step} CSS pixel${step === 1 ? "" : "s"}.`);
-      } else {
-        this.writer.write("Drawing did not move.");
-      }
-    } else {
-      return false;
-    }
+    if (!chart.input_target_key(target, event)) return false;
     event.preventDefault();
+    return true;
+  }
+
+  /** Drawing edits run in the engine; this layer only announces their outcome. */
+  private handle_drawing_key(event: KeyboardEvent, drawing: drawing_api): boolean {
+    const chart = this.controller.chart as chart_api & {
+      drawing_edit_session(): { id: number; anchor: number | null } | null;
+    };
+    const kind = drawing.kind().replaceAll("_", " ");
+    const was_editing = chart.drawing_edit_session()?.id === drawing.id;
+    if (!this.engine_target_key(event, `drawing:${drawing.id}`)) return false;
+    const session = chart.drawing_edit_session();
+    const editing = session?.id === drawing.id;
+    if (event.key === "Delete" || event.key === "Backspace") {
+      this.writer.write(`${kind} removed.`);
+    } else if (event.key === "Enter") {
+      this.writer.write(`${kind} ${editing ? "editing" : "edit committed"}.`);
+    } else if (event.key === "Escape" && was_editing) {
+      this.writer.write("Drawing edit cancelled.");
+    } else if (event.key === "Tab" && session !== null && session.anchor !== null) {
+      this.writer.write(`Anchor ${session.anchor + 1} of ${drawing.points().length}.`);
+    } else if (event.key.startsWith("Arrow")) {
+      const step = event.shiftKey ? 10 : 1;
+      this.writer.write(`Drawing moved ${step} CSS pixel${step === 1 ? "" : "s"}.`);
+    }
     return true;
   }
 
@@ -872,9 +821,9 @@ class PaneAccessibility {
 
   private format_time(value: time): string {
     if (this.controller.options.time_formatter !== undefined) return this.controller.options.time_formatter(value);
-    // The chart's host `localization.time_formatter`, else a locale date in the chart's exchange
-    // time zone with the time of day for intraday rows (calendar dates keep their own date).
-    return chart_time_text(this.controller.chart, time_to_utc_seconds(value));
+    // The chart's own crosshair label: host `localization.time_formatter`, else its date_format in
+    // the chart's exchange time zone, with the time of day for intraday rows.
+    return this.controller.chart.format_time_label(value);
   }
 
   private describe_values(point: series_data, series = this.active_series()): string {

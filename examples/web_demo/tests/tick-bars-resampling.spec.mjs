@@ -724,9 +724,9 @@ test("tooltip and accessibility print a tick-built candle's close under bar_time
 
   // The tooltip prints the close of the bar under the pointer: the 09:30 bar reads 10:30.
   await page.mouse.move(built.x, built.y);
-  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Sep 25, 2026, 10:30");
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("25 Sep '26   10:30");
   await page.mouse.move(built.last_x, built.y);
-  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Sep 25, 2026, 15:00");
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("25 Sep '26   15:00");
 
   // Accessibility text follows the same label: End moves to the 14:00 bar, announced as 15:00.
   const announced = await page.evaluate(async () => {
@@ -737,12 +737,12 @@ test("tooltip and accessibility print a tick-built candle's close under bar_time
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     return window.__chart.chart_element().querySelector(".aeris_charts-a11y-live-region")?.textContent ?? "";
   });
-  expect(announced).toContain("Sep 25, 2026, 15:00");
-  expect(announced).not.toContain("Sep 25, 2026, 14:00");
+  expect(announced).toContain("25 Sep '26   15:00");
+  expect(announced).not.toContain("25 Sep '26   14:00");
 
   // Restoring the open text restores the open times everywhere.
   await page.evaluate(() => window.__chart.apply_options({ timeScale: { barTimeLabel: "open" } }));
   await page.mouse.move(built.x + 1, built.y);
-  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("Sep 25, 2026, 09:30");
+  await expect.poll(() => page.locator(".aeris_charts-tooltip__timestamp").textContent()).toBe("25 Sep '26   09:30");
   expect(errors).toEqual([]);
 });

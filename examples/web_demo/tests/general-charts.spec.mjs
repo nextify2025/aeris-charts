@@ -406,12 +406,19 @@ test("public category-column and XY-scatter slices share the chart lifecycle", a
       buttons: 0,
       bubbles: true,
     }));
-    overlay.dispatchEvent(new MouseEvent("click", {
-      clientX: browser_x,
-      clientY: hit_point.y,
-      button: 0,
-      bubbles: true,
-    }));
+    for (const [type, buttons] of [["pointerdown", 1], ["pointerup", 0]]) {
+      overlay.dispatchEvent(new PointerEvent(type, {
+        clientX: browser_x,
+        clientY: hit_point.y,
+        pointerId: 1,
+        pointerType: "mouse",
+        isPrimary: true,
+        button: 0,
+        buttons,
+        detail: 1,
+        bubbles: true,
+      }));
+    }
     await new Promise((resolve) => requestAnimationFrame(resolve));
 
     x_axis.zoom(2, 0);

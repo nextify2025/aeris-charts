@@ -493,6 +493,8 @@ test("anchor drag re-anchors one point; body drag moves the whole drawing", asyn
   await page.mouse.move(anchor.x, anchor.y);
   await page.mouse.down();
   await page.mouse.move(drop.x, drop.y, { steps: 5 });
+  expect(await page.locator("#chart_container canvas:last-of-type").evaluate((canvas) => canvas.style.cursor))
+    .toBe("grabbing");
   await page.mouse.up();
   await settle_frames(page);
 
@@ -519,6 +521,8 @@ test("anchor drag re-anchors one point; body drag moves the whole drawing", asyn
   await page.mouse.move(seg.x, seg.y);
   await page.mouse.down();
   await page.mouse.move(body_drop.x, body_drop.y, { steps: 5 });
+  expect(await page.locator("#chart_container canvas:last-of-type").evaluate((canvas) => canvas.style.cursor))
+    .toBe("grabbing");
   await page.mouse.up();
   await settle_frames(page);
 
@@ -806,6 +810,57 @@ test("public drawing history reverses create, delete, anchors, and style with co
   expect(await page.evaluate(() => window.__chart.can_redo_drawing())).toBe(false);
 });
 
+test("rotated white text keeps its edge brightness on WebGPU", async ({ page }) => {
+  const render = async (backend) => {
+    await goto_fixture(page, backend);
+    await page.evaluate(() => {
+      window.__chart.apply_options({
+        layout: { background: { type: "solid", color: "#101820" }, textColor: "#ffffff" },
+        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+      });
+      window.__main.apply_options({ visible: false });
+    });
+    await settle_frames(page);
+    const base = PNG.sync.read(await page.screenshot({ animations: "disabled", fullPage: false }));
+    const spots = await anchor_spots(page);
+    await page.evaluate((s) => {
+      window.__chart.add_drawing("trend_line", [
+        { logical: s.l0, price: s.p_lo },
+        { logical: s.l1, price: s.p_hi },
+      ], {
+        color: "rgba(0,0,0,0)", width: 0,
+        text: "Rotated white label", text_color: "#ffffff", text_size: 24,
+        text_h_align: "center", text_v_align: "middle",
+      });
+    }, spots);
+    await settle_frames(page);
+    const image = PNG.sync.read(await page.screenshot({ animations: "disabled", fullPage: false }));
+    return { backend: await page.evaluate(() => window.__chart.backend()), base, image };
+  };
+  const canvas = await render("canvas2d");
+  const gpu = await render("auto");
+  expect(canvas.backend).toBe("canvas2d");
+  expect(gpu.backend).toBe("webgpu");
+  expect([gpu.image.width, gpu.image.height]).toEqual([canvas.image.width, canvas.image.height]);
+  let edge_samples = 0;
+  let darkened_edges = 0;
+  let below_background = 0;
+  for (let offset = 0; offset < canvas.image.data.length; offset += 4) {
+    const canvas_ink = canvas.image.data[offset] - canvas.base.data[offset];
+    const gpu_ink = gpu.image.data[offset] - gpu.base.data[offset];
+    if (gpu_ink < -1) below_background += 1;
+    if (canvas_ink >= 20 && canvas_ink <= 220 && gpu_ink >= 20) {
+      edge_samples += 1;
+      if (gpu_ink + 32 < canvas_ink) darkened_edges += 1;
+    }
+  }
+  expect(edge_samples, "rotated glyph edge must be visible on both backends").toBeGreaterThan(20);
+  expect(below_background, "white glyph pixels must not darken the background").toBe(0);
+  // Canvas2D rasterizes after rotation; WebGPU rotates a cached raster. Their edge shapes still
+  // differ, but premultiplying before filtering reduced this measured residual from 393 to 356.
+  expect(darkened_edges, "WebGPU rotated glyph edges regressed").toBeLessThanOrEqual(370);
+});
+
 test("drawing tools render pixel-identical on WebGPU and Canvas2D (AA coverage steps aside)", async ({ page }, test_info) => {
   const run_scenario = async (backend) => {
     await goto_fixture(page, backend);
@@ -891,16 +946,29 @@ test("drawing tools render pixel-identical on WebGPU and Canvas2D (AA coverage s
       context.font = `${options.text_italic ? "italic " : ""}${options.text_weight ?? 400} ${size}px ${layout.fontFamily}`;
       return { x, y, angle, size, width: context.measureText(options.text).width };
     });
+    const rotated_labels = await page.evaluate(() => window.__chart.drawings().flatMap((drawing) => {
+      const options = drawing.options();
+      const [x, y, angle] = window.__chart.wasm.drawing_text_transform(drawing.id);
+      if (Math.abs(angle) < 1e-6) return [];
+      const size = options.text_size ?? window.__chart.options().layout.fontSize;
+      const context = document.createElement("canvas").getContext("2d");
+      context.font = `${options.text_weight ?? 400} ${size}px ${window.__chart.options().layout.fontFamily}`;
+      return [{ x, y, angle, width: context.measureText(options.text || "+ Add text").width,
+        size, align: options.text_h_align }];
+    }));
     return {
       backend: await page.evaluate(() => window.__chart.backend()),
       png: PNG.sync.read(await page.screenshot({ animations: "disabled", fullPage: false })),
       trend_label,
+      rotated_labels,
     };
   };
 
   const canvas = await run_scenario("canvas2d");
   expect(canvas.backend).toBe("canvas2d");
   const gpu = await run_scenario("auto");
+  expect(gpu.rotated_labels.length).toBe(2);
+  expect(gpu.rotated_labels).toEqual(canvas.rotated_labels);
   expect(gpu.backend).toBe("webgpu");
   expect([canvas.png.width, canvas.png.height]).toEqual([gpu.png.width, gpu.png.height]);
   expect(gpu.trend_label.x).toBeCloseTo(canvas.trend_label.x, 6);
@@ -922,8 +990,9 @@ test("drawing tools render pixel-identical on WebGPU and Canvas2D (AA coverage s
   // diagonal-stroke coverage deltas at up to 121; paint-order swaps remain far above this band
   // (the regression fixture measured 201), so 128 separates raster coverage from wrong paint.
   // Rotated browser text is the one intentional exception: Canvas2D rotates during fillText,
-  // while WebGPU rotates the cached unrotated glyph-atlas quad. Verify the canonical transform
-  // exactly above, then bound high-coverage differences to that measured glyph rectangle only.
+  // while WebGPU rotates the cached unrotated glyph-atlas quad. Verify both canonical transforms
+  // exactly above, including the empty trend line's "+ Add text" prompt, then bound high-coverage
+  // differences to those measured glyph rectangles only.
   let ordering_diff = 0;
   let rotated_glyph_diff = 0;
   let edge_diff = 0;
@@ -936,15 +1005,17 @@ test("drawing tools render pixel-identical on WebGPU and Canvas2D (AA coverage s
     maximum_channel_delta = Math.max(maximum_channel_delta, pixel_delta);
     if (pixel_delta > 128) {
       const pixel = offset / 4;
-      const dx = (pixel % canvas.png.width) / PR - canvas.trend_label.x;
-      const dy = Math.floor(pixel / canvas.png.width) / PR - canvas.trend_label.y;
-      const cos = Math.cos(canvas.trend_label.angle);
-      const sin = Math.sin(canvas.trend_label.angle);
-      const local_x = dx * cos + dy * sin;
-      const local_y = -dx * sin + dy * cos;
-      const in_rotated_glyph =
-        Math.abs(local_x) <= canvas.trend_label.width / 2 + 3 &&
-        Math.abs(local_y) <= canvas.trend_label.size / 2 + 3;
+      const in_rotated_glyph = canvas.rotated_labels.some((label) => {
+        const dx = (pixel % canvas.png.width) / PR - label.x;
+        const dy = Math.floor(pixel / canvas.png.width) / PR - label.y;
+        const cos = Math.cos(label.angle);
+        const sin = Math.sin(label.angle);
+        const local_x = dx * cos + dy * sin;
+        const local_y = -dx * sin + dy * cos;
+        const left = label.align === "right" ? -label.width : label.align === "left" ? 0 : -label.width / 2;
+        return local_x >= left - 3 && local_x <= left + label.width + 3
+          && Math.abs(local_y) <= label.size / 2 + 3;
+      });
       if (in_rotated_glyph) rotated_glyph_diff += 1;
       else ordering_diff += 1;
     }
@@ -958,14 +1029,17 @@ test("drawing tools render pixel-identical on WebGPU and Canvas2D (AA coverage s
     await test_info.attach("webgpu.png", { body: PNG.sync.write(gpu.png), contentType: "image/png" });
     await test_info.attach("diff.png", { body: PNG.sync.write(visual), contentType: "image/png" });
   }
-  expect(rotated_glyph_diff, "rotated glyph raster residual stays bounded").toBeLessThanOrEqual(128);
+  // Windows SwiftShader measurement: 49 rotated-glyph pixels above the 128-step classifier,
+  // 39 inside the "trend" label and 10 inside the hovered "+ Add text" prompt. The prompt's
+  // pixels lie on its glyph rows (|local y| <= 2 px) with deltas of 135-148 at its 0x99 alpha,
+  // the same rotate-before versus rotate-after raster residual as the label, not paint order.
+  expect(rotated_glyph_diff, "rotated glyph raster residual stays bounded").toBeLessThanOrEqual(64);
   expect(ordering_diff, "drawing geometry/paint order must match (only AA coverage steps may differ)").toBe(0);
 });
 
 test("dashed and dotted core drawings paint identical dashes on WebGPU and Canvas2D", async ({ page }, test_info) => {
   // The frame lowers every dashed or dotted core stroke (trend line, path, curved brush) into
-  // solid dash runs, so the WebGPU stroker, which has no dash concept, paints the same dashes
-  // Canvas2D does instead of a solid line.
+  // solid dash runs, so WebGPU paints the same dashes Canvas2D does instead of a solid line.
   const run_scenario = async (backend, styles) => {
     await goto_fixture(page, backend);
     await page.evaluate(() => window.__chart.apply_options({ crosshair: { mode: 2 } }));
@@ -1010,8 +1084,7 @@ test("dashed and dotted core drawings paint identical dashes on WebGPU and Canva
   expect(pixel_diff(solid_canvas.png, canvas.png), "Canvas2D dashes the strokes").toBeGreaterThan(500);
   expect(pixel_diff(solid_gpu.png, gpu.png), "WebGPU dashes the strokes").toBeGreaterThan(500);
 
-  // A dash painted where the other backend leaves a gap (a WebGPU stroke that ignores the style)
-  // differs by the stroke's full contrast, far above any raster difference. Every dash run has two
+  // A dash painted where the other backend leaves a gap (a stroke painted solid) differs by the stroke's full contrast, far above any raster difference. Every dash run has two
   // butt ends, where Canvas2D's analytic coverage and WebGPU's faded butt caps may differ by one
   // coverage step beyond the drawing parity test's 128 diagonal-stroke bound: measured at most
   // 142, on 3 isolated pixels of this teal on white. Such end pixels stay few and isolated.
@@ -1352,7 +1425,7 @@ test("Ctrl magnets the crosshair to the hovered bar's OHLC", async ({ page }) =>
   await page.evaluate(() => window.__chart.set_drawing_tool("trend_line"));
   // The crosshair's horizontal line is the default crosshair color — find the pane row with
   // the most of it (the dashed line covers the pane width).
-  const CROSS = [51, 51, 51]; // crosshair line pinned to the dark border token #333333
+  const CROSS = [74, 74, 74]; // crosshair line token #4a4a4a
   const crosshair_row = async () => {
     const png = await capture(page);
     const pane_bottom = Math.round((fixture.css_height - fixture.time_axis_height) * PR);
@@ -1769,6 +1842,57 @@ test("text tool: press places and opens typing mode; typing commits; leaving emp
   await page.keyboard.press("Escape");
   await settle_frames(page);
   expect(await drawings(page)).toHaveLength(1);
+});
+
+test("inline editor caret follows engine geometry for aligned and rotated labels", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  const cases = [
+    { kind: "text", align: "left" },
+    { kind: "text", align: "center" },
+    { kind: "text", align: "right" },
+    { kind: "trend_line", align: "right" },
+  ];
+  for (const item of cases) {
+    const actual = await page.evaluate(({ kind, align, s }) => {
+      const points = kind === "text"
+        ? [{ logical: s.l0, price: s.p_mid }]
+        : [{ logical: s.l0, price: s.p_lo }, { logical: s.l1, price: s.p_hi }];
+      const drawing = window.__chart.add_drawing(kind, points, {
+        text: "Caret parity", text_h_align: align, text_size: 19, text_weight: 700, text_italic: true,
+      });
+      window.__chart.open_text_editor(drawing);
+      const editor = document.querySelector("#aeris_charts-text-input");
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.setStart(editor.firstChild, 3);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      editor.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "ArrowLeft" }));
+      const expected = JSON.parse(window.__chart.wasm.drawing_text_edit_layout_json(drawing.id));
+      const wrap = document.querySelector("#aeris_charts-text-editor");
+      const caret = document.querySelector("#aeris_charts-text-caret");
+      const context = document.createElement("canvas").getContext("2d");
+      context.font = editor.style.font;
+      return {
+        expected,
+        left: parseFloat(wrap.style.left), top: parseFloat(wrap.style.top),
+        origin_y: parseFloat(wrap.style.transformOrigin.split(" ")[1]),
+        caret_left: parseFloat(caret.style.left), angle: parseFloat(wrap.style.transform.slice(7)),
+        before_caret: context.measureText("Car").width,
+        font: editor.style.font,
+      };
+    }, { ...item, s });
+    expect(actual.expected).not.toBeNull();
+    // The wrap's left-middle sits on the run's start point and rotates about it.
+    expect(actual.left).toBeCloseTo(actual.expected.x, 2);
+    expect(actual.top + actual.origin_y).toBeCloseTo(actual.expected.y, 2);
+    expect(actual.angle).toBeCloseTo(actual.expected.angle, 4);
+    expect(actual.caret_left).toBe(Math.ceil(actual.before_caret));
+    expect(actual.font.replaceAll('"', "'")).toContain(actual.expected.font_family);
+    await page.evaluate(() => window.__chart.close_text_editor(false));
+  }
 });
 
 test("text tool: first click selects (focus border), a second click opens typing mode; Escape cancels", async ({ page }) => {

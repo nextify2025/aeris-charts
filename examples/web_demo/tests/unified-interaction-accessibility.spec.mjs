@@ -6,6 +6,64 @@ async function open_chart(page) {
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
 
+test("a captured pane pan uses the shared grabbing cursor", async ({ page }) => {
+  await open_chart(page);
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  const box = await overlay.boundingBox();
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x + 8, y);
+  await page.mouse.move(x + 24, y);
+  expect(await overlay.evaluate((element) => element.style.cursor)).toBe("grabbing");
+  await page.mouse.up();
+});
+
+test("browser second press at the same pane point can become a pan", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const overlay = chart.chart_element().querySelector("canvas:last-of-type");
+    const rect = overlay.getBoundingClientRect();
+    const x = rect.left + chart.wasm.pane_left() + chart.wasm.time_scale_width() / 2;
+    const y = rect.top + chart.wasm.pane_height(0) / 2;
+    const send = (type, clientX, buttons) => overlay.dispatchEvent(new PointerEvent(type, {
+      pointerId: 81, pointerType: "mouse", button: 0, buttons, clientX, clientY: y,
+      bubbles: true, cancelable: true,
+    }));
+    send("pointerdown", x, 1);
+    send("pointerup", x, 0);
+    const before = chart.wasm.scroll_position();
+    send("pointerdown", x, 1);
+    send("pointermove", x + 25, 1);
+    send("pointermove", x + 60, 1);
+    const moved = chart.wasm.scroll_position();
+    send("pointerup", x + 60, 0);
+    let doubleClicks = 0;
+    chart.subscribe_dbl_click(() => { doubleClicks += 1; });
+    send("pointerdown", x + 120, 1);
+    send("pointerup", x + 120, 0);
+    send("pointerdown", x + 120, 1);
+    send("pointerup", x + 120, 0);
+    return { before, moved, doubleClicks };
+  });
+  expect(result.moved).not.toBeCloseTo(result.before, 8);
+  expect(result.doubleClicks).toBe(1);
+});
+
+test("an armed drawing tool keeps the engine crosshair cursor over series", async ({ page }) => {
+  await open_chart(page);
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  const box = await overlay.boundingBox();
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  await page.mouse.move(x, y);
+  await page.evaluate(() => window.__chart.set_drawing_tool("trend_line"));
+  await page.mouse.move(x + 1, y);
+  expect(await overlay.evaluate((element) => element.style.cursor)).toBe("crosshair");
+});
+
 test("auto wheel pins the right edge, Ctrl zooms at the cursor, and horizontal deltas pan", async ({ page }) => {
   await open_chart(page);
   const box = await page.locator("#chart_container canvas:last-of-type").boundingBox();
@@ -55,6 +113,182 @@ test("auto wheel pins the right edge, Ctrl zooms at the cursor, and horizontal d
   const afterPan = await state();
   expect(afterPan.spacing).toBeCloseTo(beforePan.spacing, 8);
   expect(afterPan.offset).not.toBeCloseTo(beforePan.offset, 8);
+});
+
+test("auto wheel can zoom the price axis when that option is enabled", async ({ page }) => {
+  await open_chart(page);
+  const before = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.price_scale("right").set_visible_range({ from: 80, to: 120 });
+    chart.apply_options({ price_axis_wheel_zoom: true });
+    return {
+      range: chart.price_scale("right").get_visible_range(),
+      spacing: chart.wasm.bar_spacing(),
+      x: chart.wasm.pane_left() + chart.wasm.time_scale_width() + 12,
+      y: chart.wasm.pane_height(0) / 2,
+    };
+  });
+  await page.evaluate(({ x, y }) => {
+    const overlay = document.querySelector("#chart_container canvas:last-of-type");
+    const rect = overlay.getBoundingClientRect();
+    overlay.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -100, clientX: rect.left + x, clientY: rect.top + y,
+      bubbles: true, cancelable: true,
+    }));
+  }, before);
+  const after = await page.evaluate(() => ({
+    range: window.__chart.price_scale("right").get_visible_range(),
+    spacing: window.__chart.wasm.bar_spacing(),
+  }));
+  expect(after.range).not.toEqual(before.range);
+  expect(after.spacing).toBeCloseTo(before.spacing, 8);
+});
+
+test("wheel refreshes the engine hover and cursor at its event position", async ({ page }) => {
+  await open_chart(page);
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  const geometry = await page.evaluate(() => ({
+    left: window.__chart.wasm.pane_left(),
+    width: window.__chart.wasm.time_scale_width(),
+    height: window.__chart.wasm.pane_height(0),
+  }));
+  const box = await overlay.boundingBox();
+  await page.mouse.move(box.x + geometry.left + geometry.width / 2, box.y + geometry.height / 2);
+  await page.evaluate(({ x, y }) => {
+    const canvas = document.querySelector("#chart_container canvas:last-of-type");
+    const rect = canvas.getBoundingClientRect();
+    canvas.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -24, clientX: rect.left + x, clientY: rect.top + y,
+      bubbles: true, cancelable: true,
+    }));
+  }, { x: geometry.left + geometry.width + 12, y: geometry.height / 2 });
+  expect(await overlay.evaluate((element) => element.style.cursor)).toBe("ns-resize");
+});
+
+test("price-axis wheel zoom applies only inside the plot height", async ({ page }) => {
+  await open_chart(page);
+  const before = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.price_scale("right").set_visible_range({ from: 80, to: 120 });
+    chart.apply_options({ price_axis_wheel_zoom: true });
+    return {
+      range: chart.price_scale("right").get_visible_range(),
+      spacing: chart.wasm.bar_spacing(),
+      x: chart.wasm.pane_left() + chart.wasm.time_scale_width() + 12,
+      y: chart.wasm.pane_height(0) + chart.wasm.time_scale_height() / 2,
+    };
+  });
+  await page.evaluate(({ x, y }) => {
+    const canvas = document.querySelector("#chart_container canvas:last-of-type");
+    const rect = canvas.getBoundingClientRect();
+    canvas.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -100, clientX: rect.left + x, clientY: rect.top + y,
+      bubbles: true, cancelable: true,
+    }));
+  }, before);
+  const after = await page.evaluate(() => ({
+    range: window.__chart.price_scale("right").get_visible_range(),
+    spacing: window.__chart.wasm.bar_spacing(),
+  }));
+  expect(after.range).toEqual(before.range);
+  expect(after.spacing).not.toBeCloseTo(before.spacing, 8);
+});
+
+test("wheel input cancels a held keyboard pan", async ({ page }) => {
+  await open_chart(page);
+  await page.evaluate(() => {
+    const overlay = document.querySelector("#chart_container canvas:last-of-type");
+    overlay.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+  });
+  await page.waitForTimeout(100);
+  await page.evaluate(() => {
+    const overlay = document.querySelector("#chart_container canvas:last-of-type");
+    overlay.dispatchEvent(new WheelEvent("wheel", {
+      deltaX: 0,
+      deltaY: -24,
+      clientX: overlay.getBoundingClientRect().left + 200,
+      clientY: overlay.getBoundingClientRect().top + 100,
+      bubbles: true,
+      cancelable: true,
+    }));
+  });
+  const afterWheel = await page.evaluate(() => window.__chart.wasm.scroll_position());
+  await page.waitForTimeout(150);
+  const afterWait = await page.evaluate(() => window.__chart.wasm.scroll_position());
+  expect(afterWait).toBeCloseTo(afterWheel, 8);
+  await page.evaluate(() => window.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowRight" })));
+});
+
+test("End returns to the latest bar through the shared key controller", async ({ page }) => {
+  await open_chart(page);
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  await overlay.focus();
+  await page.evaluate(() => window.__chart.wasm.scroll_to_position(-30));
+  const before = await page.evaluate(() => window.__chart.wasm.scroll_position());
+  expect(before).toBeLessThan(-20);
+  await overlay.press("End");
+  const after = await page.evaluate(() => window.__chart.wasm.scroll_position());
+  expect(after).toBeGreaterThan(before + 20);
+});
+
+test("Page keys, zoom keys, and Home follow the engine navigation bindings", async ({ page }) => {
+  await open_chart(page);
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  await overlay.focus();
+  await page.evaluate(() => window.__chart.wasm.scroll_to_position(-30));
+  const start = await page.evaluate(() => window.__chart.wasm.scroll_position());
+  await overlay.press("PageUp");
+  const older = await page.evaluate(() => window.__chart.wasm.scroll_position());
+  expect(older).toBeLessThan(start);
+  await overlay.press("PageDown");
+  const newer = await page.evaluate(() => window.__chart.wasm.scroll_position());
+  expect(newer).toBeGreaterThan(older);
+
+  const spacing = await page.evaluate(() => window.__chart.wasm.bar_spacing());
+  await overlay.press("+");
+  const zoomed = await page.evaluate(() => window.__chart.wasm.bar_spacing());
+  expect(zoomed).toBeGreaterThan(spacing);
+  await overlay.press("-");
+  expect(await page.evaluate(() => window.__chart.wasm.bar_spacing())).toBeLessThan(zoomed);
+
+  await page.evaluate(() => {
+    window.__chart.wasm.set_bar_spacing(20);
+    window.__chart.price_scale("right").set_visible_range({ from: 80, to: 120 });
+  });
+  await overlay.press("Home");
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(await page.evaluate(() => window.__chart.wasm.bar_spacing())).toBe(6);
+  expect(await page.evaluate(() => window.__chart.price_scale("right").get_visible_range())).not.toEqual({ from: 80, to: 120 });
+});
+
+test("Delete removes a selected host series through the controller event queue", async ({ page }) => {
+  await open_chart(page);
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  await overlay.focus();
+  const id = await page.evaluate(() => {
+    const id = window.__main.id;
+    window.__chart.wasm.set_selected_series(id);
+    return id;
+  });
+  expect(await page.evaluate((id) => window.__chart.series_by_id.has(id), id)).toBe(true);
+  await overlay.press("Delete");
+  expect(await page.evaluate((id) => window.__chart.series_by_id.has(id), id)).toBe(false);
+});
+
+test("Escape reports that the crosshair left the chart", async ({ page }) => {
+  await open_chart(page);
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  await overlay.focus();
+  await page.evaluate(() => {
+    window.__escapeCrosshairPoints = [];
+    window.__chart.subscribe_crosshair_move((event) => window.__escapeCrosshairPoints.push(event.point));
+  });
+  const box = await overlay.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await overlay.press("Escape");
+  const points = await page.evaluate(() => window.__escapeCrosshairPoints);
+  expect(points.length).toBeGreaterThan(1);
+  expect(points.at(-1)).toBeNull();
 });
 
 test("pointer interaction does not move focus into the accessibility application", async ({ page }) => {
@@ -157,6 +391,85 @@ test("touch cancellation ends the canonical gesture and ignores later samples", 
     return { atLoss, after };
   });
   expect(result.after).toBeCloseTo(result.atLoss, 8);
+});
+
+test("Touch Events use the controller long-press deadline and next-tap exit", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "Firefox lacks Touch constructors and WebKit forbids synthetic construction");
+  await open_chart(page);
+  const result = await page.evaluate(async () => {
+    const chart = window.__chart;
+    const overlay = chart.chart_element().querySelector("canvas:last-of-type");
+    const rect = overlay.getBoundingClientRect();
+    const x = rect.left + chart.wasm.pane_left() + chart.wasm.time_scale_width() / 2;
+    const y = rect.top + chart.wasm.pane_height(0) / 2;
+    const touch = (identifier, clientX) => new Touch({
+      identifier, target: overlay, clientX, clientY: y, pageX: clientX, pageY: y,
+      screenX: clientX, screenY: y, radiusX: 1, radiusY: 1, rotationAngle: 0, force: 0.5,
+    });
+    const send = (type, touches, changedTouches) => overlay.dispatchEvent(new TouchEvent(type, {
+      touches, targetTouches: touches, changedTouches, bubbles: true, cancelable: true,
+    }));
+    const crosshair = () => {
+      const point = new Float64Array(2);
+      chart.wasm.controller_crosshair_into(point);
+      return Array.from(point);
+    };
+    const start = touch(41, x);
+    send("touchstart", [start], [start]);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const scroll = chart.wasm.scroll_position();
+    const moved = touch(41, x + 30);
+    send("touchmove", [moved], [moved]);
+    const tracked = crosshair();
+    const afterMove = chart.wasm.scroll_position();
+    send("touchend", [], [moved]);
+    const afterEnd = crosshair();
+    const next = touch(42, x + 50);
+    send("touchstart", [next], [next]);
+    send("touchend", [], [next]);
+    return { tracked, afterEnd, afterTap: crosshair(), scroll, afterMove,
+      localX: x + 30 - rect.left - chart.wasm.pane_left(), localY: y - rect.top };
+  });
+  expect(result.tracked[0]).toBeCloseTo(result.localX, 5);
+  expect(result.tracked[1]).toBeCloseTo(result.localY, 5);
+  expect(result.afterMove).toBeCloseTo(result.scroll, 8);
+  expect(result.afterEnd[0]).toBeCloseTo(result.localX, 5);
+  expect(Number.isNaN(result.afterTap[0])).toBe(true);
+});
+
+test("vertical page-scroll arbitration releases the controller touch press", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "Firefox lacks Touch constructors and WebKit forbids synthetic construction");
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.apply_options({ handle_scroll: { vert_touch_drag: false, horz_touch_drag: true } });
+    const overlay = chart.chart_element().querySelector("canvas:last-of-type");
+    const rect = overlay.getBoundingClientRect();
+    const x = rect.left + chart.wasm.pane_left() + chart.wasm.time_scale_width() / 2;
+    const y = rect.top + chart.wasm.pane_height(0) / 2;
+    const touch = (clientY) => new Touch({
+      identifier: 51, target: overlay, clientX: x, clientY, pageX: x, pageY: clientY,
+      screenX: x, screenY: clientY, radiusX: 1, radiusY: 1, rotationAngle: 0, force: 0.5,
+    });
+    const send = (type, touches, changedTouches) => {
+      const event = new TouchEvent(type, {
+        touches, targetTouches: touches, changedTouches, bubbles: true, cancelable: true,
+      });
+      overlay.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    const start = touch(y);
+    send("touchstart", [start], [start]);
+    const candidateBefore = chart.wasm.controller_touch_page_scroll_candidate(51);
+    const moved = touch(y + 35);
+    const prevented = send("touchmove", [moved], [moved]);
+    const candidateAfter = chart.wasm.controller_touch_page_scroll_candidate(51);
+    send("touchend", [], [moved]);
+    return { candidateBefore, candidateAfter, prevented };
+  });
+  expect(result.candidateBefore).toBe(true);
+  expect(result.candidateAfter).toBe(false);
+  expect(result.prevented).toBe(false);
 });
 
 test("accessibility is default, singleton, bounded, silent for streaming, and keyboard drawing edits roll back", async ({ page }) => {

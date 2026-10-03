@@ -920,23 +920,18 @@ test("the double-click activation acts only on the drawing under the pointer", a
   const editor = page.locator(EDITOR);
   const id = await add_diagonal(page, "rectangle", { text: "here" });
   await select_by_text(page, id);
-  const layout = await edit_layout(page, id);
   const away = await page.evaluate(() => {
     const canvas = document.querySelector("#chart_container canvas:last-of-type").getBoundingClientRect();
     return { x: canvas.left + 12, y: canvas.top + 12 };
   });
-  // The gesture layer hands the point over without a click of its own; the drawing is selected
-  // (and was at press), but the point is elsewhere.
-  await page.evaluate(({ x, y }) => {
-    const offset = document.getElementById("chart_container").getBoundingClientRect();
-    window.__chart.note_drawing_press();
-    window.__chart.activate_drawing_double_click(x - offset.left, y - offset.top);
-  }, away);
+  // The controller owns the click pair: a double-click elsewhere edits nothing, though the
+  // drawing was selected when the pair began.
+  await page.mouse.dblclick(away.x, away.y);
   await expect(editor).toHaveCount(0);
   expect(await page.evaluate(() => window.__chart.wasm.editing_drawing())).toBeUndefined();
-  await page.evaluate(({ x, y }) => {
-    const offset = document.getElementById("chart_container").getBoundingClientRect();
-    window.__chart.activate_drawing_double_click(x - offset.left, y - offset.top);
-  }, layout.center);
+  // The same gesture on the drawing's own text opens its editor.
+  await select_by_text(page, id);
+  const layout = await edit_layout(page, id);
+  await page.mouse.dblclick(layout.center.x, layout.center.y);
   await expect(editor).toBeFocused();
 });

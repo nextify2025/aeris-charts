@@ -165,6 +165,16 @@ impl ChartEngine {
             .map(|session| (session.id, session.text.as_str(), session.caret))
     }
 
+    /// A host with a native text input surface paints its own caret over the shared label.
+    pub fn set_drawing_text_edit_paint_caret(&mut self, paint_caret: bool) {
+        if let Some(session) = self.drawing_text_edit.as_mut() {
+            if session.paint_caret != paint_caret {
+                session.paint_caret = paint_caret;
+                self.invalidate_frame_drawings();
+            }
+        }
+    }
+
     /// The selected `char` range, if any.
     fn drawing_text_edit_range(session: &DrawingTextEditSession) -> Option<(usize, usize)> {
         session

@@ -1,6 +1,7 @@
 {
   "default_theme": "dark",
   "border_width": 1.0,
+  "crosshair_line": "#4a4a4a",
   "radius": {
     "small": 4,
     "default": 8,

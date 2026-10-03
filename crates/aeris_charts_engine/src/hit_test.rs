@@ -551,6 +551,7 @@ impl ChartEngine {
             }
             return;
         };
+        self.clear_volume_profile_selection();
         let members = if let Some(binding) = self.indicator_binding_id(series) {
             self.indicator_group_outputs(binding)
         } else if let Some(study) = self.external_study_for_series(series) {

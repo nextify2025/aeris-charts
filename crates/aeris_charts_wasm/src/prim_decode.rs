@@ -13,15 +13,15 @@
 //! converters already applied the pane's pixel ratios and offset); integer prims round here
 //! exactly like the engine's own geometry.
 //!
-//! Executors receive only solid runs from a producer, and the WebGPU stroker has no dash
-//! concept, so this decoder is a producer like the engine's frame builders: a dashed or dotted
+//! Executors receive only solid runs from a producer, so this decoder is a producer like the
+//! engine's frame builders: a dashed or dotted
 //! `polyline` is lowered to solid dash runs through
 //! [`aeris_charts_render::line::push_styled_stroke`], clipped to the owning pane (the absolute
 //! scissor, [`pane_clip`]) with the unclipped dash phase; a dashed `hline`/`vline` is clamped to
 //! the pane with the same phase. Clipping to the pane is lossless because both backends already
 //! clip plugin layers to that scissor, and it bounds how far a plugin's geometry can reach past
-//! the pane (the executors' f32 dash loops never terminate on spans of hundreds of millions of
-//! px). Inside the pane the dash count follows the path's visible length, so a dashed polyline
+//! the pane (the shared `dash_split` strokes a path too fine for its step cap solid, which
+//! would replace the plugin's dashes). Inside the pane the dash count follows the path's visible length, so a dashed polyline
 //! whose [`dash_run_bound`] exceeds [`MAX_DASH_RUNS`] is drawn solid with a warning instead. A
 //! command may therefore yield zero or many prims.
 
@@ -965,8 +965,8 @@ mod tests {
 
     #[test]
     fn decoded_dashed_polyline_has_gaps_on_the_webgpu_tessellator() {
-        // The WebGPU stroker ignores `Prim::Polyline::style`, so gapped ink only exists when the
-        // decoder pre-lowered the dashes: no triangle may reach across a gap.
+        // Gapped ink exists on the tessellated backends only through the lowered dash runs: no
+        // triangle may reach across a gap.
         let (prims, pool, warnings) = decode_in(
             r##"[{"c":"polyline","points":[0,50,200,50],"color":"#0000ff","width":2,"style":2}]"##,
             PANE,

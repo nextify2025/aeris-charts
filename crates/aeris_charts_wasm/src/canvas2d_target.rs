@@ -224,6 +224,19 @@ impl Canvas2d for WasmCanvas2d<'_> {
         let [x, y, w, h] = rect;
         self.ctx.save();
         self.ctx.set_global_alpha(f64::from(opacity));
+        self.ctx.set_image_smoothing_enabled(true);
+        // web-sys does not currently expose CanvasImageSmoothing.imageSmoothingQuality.
+        match js_sys::Reflect::set(
+            self.ctx.as_ref(),
+            &JsValue::from_str("imageSmoothingQuality"),
+            &JsValue::from_str("low"),
+        ) {
+            Ok(true) => {}
+            Ok(false) => web_sys::console::warn_1(&JsValue::from_str(
+                "Canvas2D could not set low-quality image smoothing",
+            )),
+            Err(error) => web_sys::console::warn_1(&error),
+        }
         let result = self.ctx.draw_image_with_offscreen_canvas_and_dw_and_dh(
             canvas,
             f64::from(x),
