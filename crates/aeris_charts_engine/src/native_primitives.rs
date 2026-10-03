@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::{ChartEngine, PaneId, SeriesId, SeriesKind};
+use crate::{AreaBrushOverrides, ChartEngine, PaneId, SeriesId, SeriesKind};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::RasterImage;
 
@@ -96,12 +96,13 @@ pub struct DeltaTooltipPoint {
 }
 
 /// One Area series composed with its Delta Tooltip (see [`ChartEngine::set_brushable_area`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BrushableArea {
     pub(crate) series: SeriesId,
     pub(crate) tooltip: NativePrimitiveId,
     /// The active range the area brush currently reflects.
     pub(crate) styled: Option<DeltaTooltipActiveRange>,
+    pub(crate) overrides: AreaBrushOverrides,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1129,7 +1130,7 @@ impl ChartEngine {
             .collect();
         let mut handled = false;
         let mut changed = false;
-        for series in &mut self.series {
+        for series in self.series.presentation_iter_mut() {
             for primitive in &mut series.native_primitives {
                 let NativeSeriesPrimitiveKind::DeltaTooltip(state) = &mut primitive.kind else {
                     continue;
@@ -1181,7 +1182,7 @@ impl ChartEngine {
             })
             .collect();
         let mut changed = false;
-        for series in &mut self.series {
+        for series in self.series.presentation_iter_mut() {
             for primitive in &mut series.native_primitives {
                 let NativeSeriesPrimitiveKind::DeltaTooltip(state) = &mut primitive.kind else {
                     continue;
@@ -1215,7 +1216,7 @@ impl ChartEngine {
     /// committed range intact.
     pub fn delta_tooltip_mouse_up(&mut self) -> bool {
         let mut changed = false;
-        for series in &mut self.series {
+        for series in self.series.presentation_iter_mut() {
             for primitive in &mut series.native_primitives {
                 let NativeSeriesPrimitiveKind::DeltaTooltip(state) = &mut primitive.kind else {
                     continue;
@@ -1273,7 +1274,7 @@ impl ChartEngine {
             })
             .collect();
         let mut changed = false;
-        for series in &mut self.series {
+        for series in self.series.presentation_iter_mut() {
             for primitive in &mut series.native_primitives {
                 let NativeSeriesPrimitiveKind::DeltaTooltip(state) = &mut primitive.kind else {
                     continue;
@@ -1346,6 +1347,16 @@ impl ChartEngine {
         series_id: SeriesId,
         options: Option<DeltaTooltipOptions>,
     ) -> bool {
+        self.set_brushable_area_with_styles(series_id, options, AreaBrushOverrides::default())
+    }
+
+    /// Compose an Area and Delta Tooltip with explicit style overrides owned by the engine.
+    pub fn set_brushable_area_with_styles(
+        &mut self,
+        series_id: SeriesId,
+        options: Option<DeltaTooltipOptions>,
+        overrides: AreaBrushOverrides,
+    ) -> bool {
         if let Some(index) = self
             .brushable_areas
             .iter()
@@ -1368,6 +1379,7 @@ impl ChartEngine {
             series: series_id,
             tooltip,
             styled: None,
+            overrides,
         });
         true
     }
@@ -1386,6 +1398,21 @@ impl ChartEngine {
             .iter()
             .find(|area| area.series == series_id)?;
         self.delta_tooltip_active_range(area.tooltip)
+    }
+
+    /// Clear one brushable Area's comparison while keeping its interaction attached.
+    pub fn clear_brushable_area_range(&mut self, series_id: SeriesId) -> bool {
+        let Some(tooltip) = self
+            .brushable_areas
+            .iter()
+            .find(|area| area.series == series_id)
+            .map(|area| area.tooltip)
+        else {
+            return false;
+        };
+        self.clear_delta_tooltip(tooltip);
+        self.sync_brushable_areas();
+        true
     }
 
     /// Clear every brushed comparison range (double-click and Escape).
@@ -1422,7 +1449,11 @@ impl ChartEngine {
             }
             let range = self.delta_tooltip_active_range(area.tooltip);
             if range != area.styled {
-                match (range, self.area_brush_defaults(area.series)) {
+                match (
+                    range,
+                    self.area_brush_defaults(area.series)
+                        .map(|defaults| area.overrides.apply(defaults)),
+                ) {
                     (Some(range), Some(defaults)) => {
                         let style = if range.positive {
                             defaults.positive
@@ -1474,7 +1505,7 @@ impl ChartEngine {
 
     fn clear_delta_tooltip_previews(&mut self, end_mouse: bool) -> bool {
         let mut changed = false;
-        for series in &mut self.series {
+        for series in self.series.presentation_iter_mut() {
             for primitive in &mut series.native_primitives {
                 let NativeSeriesPrimitiveKind::DeltaTooltip(state) = &mut primitive.kind else {
                     continue;

@@ -242,6 +242,22 @@ test("trading lines use dedicated hits and render semantic colors through the sh
   expect(count_near(image, [8, 153, 129]), "long position and buy order pixels").toBeGreaterThan(100);
 });
 
+test("trading-line hover and drag apply the engine cursor", async ({ page }) => {
+  await open_trading_demo(page);
+  const y = await page.evaluate(() => {
+    const order = window.__chart.trading().state().orders.find((entry) => entry.id === "demo-target");
+    return window.__main.price_to_coordinate(order.price);
+  });
+  const overlay = page.locator("#chart_container canvas:last-of-type");
+  const box = await overlay.boundingBox();
+  await page.mouse.move(box.x + 40, box.y + y);
+  expect(await overlay.evaluate((element) => element.style.cursor)).toBe("grab");
+  await page.mouse.down();
+  await page.mouse.move(box.x + 40, box.y + y - 20);
+  expect(await overlay.evaluate((element) => element.style.cursor)).toBe("grabbing");
+  await page.mouse.up();
+});
+
 test("trading state is chart-local and clear removes all live objects", async ({ page }) => {
   await open_trading_demo(page);
   await page.evaluate(() => window.__demo_catalogs.lab.clear());
@@ -443,6 +459,39 @@ test("cancel control removes the order, emits the intent, and a rejection restor
     id: "demo-stop",
     status: "working",
   });
+});
+
+test("releasing over a trading close control requires the press to start there", async ({ page }) => {
+  await open_trading_demo(page);
+  const probe = await page.evaluate(() => {
+    const chart = window.__chart;
+    const trading = chart.trading();
+    const order = trading.state().orders.find((entry) => entry.id === "demo-stop");
+    const y = window.__main.price_to_coordinate(order.price);
+    const close = window.__close_x(order.id, y);
+    let marker = null;
+    for (let x = close - 2; x > close - 150; x -= 1) {
+      const hit = trading.hit_at(x, y);
+      if (hit?.id === order.id && hit.kind !== "cancel_button") {
+        marker = x;
+        break;
+      }
+    }
+    if (marker === null) throw new Error("no adjacent trading marker segment");
+    window.__press_origin_intents = [];
+    trading.subscribe_intents((intent) => window.__press_origin_intents.push(intent));
+    const bounds = chart.chart_element().querySelector("canvas:last-of-type").getBoundingClientRect();
+    return { start: { x: bounds.left + marker, y: bounds.top + y },
+      close: { x: bounds.left + close, y: bounds.top + y } };
+  });
+  await page.mouse.move(probe.start.x, probe.start.y);
+  await page.mouse.down();
+  await page.mouse.move(probe.close.x, probe.close.y);
+  await page.mouse.up();
+  expect(await page.evaluate(() => window.__press_origin_intents.some((intent) =>
+    intent.action === "cancel_order" && intent.order_id === "demo-stop"))).toBe(false);
+  expect(await page.evaluate(() => window.__chart.trading().state().orders.some((order) =>
+    order.id === "demo-stop"))).toBe(true);
 });
 
 test("bracket connector disappears as soon as the host acknowledges the drag", async ({ page }) => {

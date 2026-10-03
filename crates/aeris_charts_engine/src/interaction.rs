@@ -69,7 +69,10 @@ pub enum WheelIntent {
 pub struct WheelSample {
     pub x: f64,
     pub y: f64,
+    /// Browser-normalized horizontal delta divided by 100; positive pans in the DOM deltaX
+    /// direction. GPUI adapters reverse the native horizontal sign before constructing this.
     pub delta_x: f64,
+    /// Browser-normalized vertical delta divided by 100; wheel-up is positive.
     pub delta_y: f64,
     pub delta_mode: WheelDeltaMode,
     pub modifiers: InputModifiers,
@@ -77,6 +80,27 @@ pub struct WheelSample {
 }
 
 impl WheelSample {
+    /// Normalize one raw wheel axis into the controller's 100-pixel notch units. Pixel deltas
+    /// that arrive in device pixels supply their DPR; logical-pixel sources supply `1.0`.
+    /// DOM line-mode deltas use 32 px per line, while page mode retains 120 px per page.
+    pub fn normalize_delta(raw: f64, mode: WheelDeltaMode, pixel_ratio: f64) -> f64 {
+        if !raw.is_finite() {
+            return 0.0;
+        }
+        let pixels = match mode {
+            WheelDeltaMode::Pixel => {
+                raw / if pixel_ratio.is_finite() && pixel_ratio > 0.0 {
+                    pixel_ratio
+                } else {
+                    1.0
+                }
+            }
+            WheelDeltaMode::Line => raw * 32.0,
+            WheelDeltaMode::Page => raw * 120.0,
+        };
+        pixels / 100.0
+    }
+
     pub fn intent(self, behavior: WheelBehavior) -> WheelIntent {
         match behavior {
             WheelBehavior::Pan => WheelIntent::Pan,
@@ -91,6 +115,25 @@ impl WheelSample {
                     (false, false) => WheelIntent::Ignore,
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wheel_normalization_tests {
+    use super::{WheelDeltaMode, WheelSample};
+
+    #[test]
+    fn browser_and_gpui_raw_notches_normalize_identically_at_each_dpr() {
+        for dpr in [1.0, 1.5, 2.0] {
+            let browser = WheelSample::normalize_delta(100.0 * dpr, WheelDeltaMode::Pixel, dpr);
+            let gpui = WheelSample::normalize_delta(3.0 * (25.0 / 24.0), WheelDeltaMode::Line, 1.0);
+            assert_eq!(browser, 1.0);
+            assert_eq!(gpui, browser);
+            assert_eq!(
+                WheelSample::normalize_delta(-100.0 * dpr, WheelDeltaMode::Pixel, dpr),
+                -gpui
+            );
         }
     }
 }
@@ -248,6 +291,23 @@ impl GestureResolver {
         self.pointers.iter().flatten().count()
     }
 
+    pub(crate) fn contains_pointer(&self, id: u32) -> bool {
+        self.find(id).is_some()
+    }
+
+    /// Current x of up to two retained touch pointers and how many were found.
+    pub(crate) fn touch_xs(&self) -> ([f64; 2], usize) {
+        let mut xs = [0.0; 2];
+        let mut count = 0;
+        for pointer in self.pointers.iter().flatten() {
+            if pointer.current.device == InputDevice::Touch && count < xs.len() {
+                xs[count] = pointer.current.x;
+                count += 1;
+            }
+        }
+        (xs, count)
+    }
+
     pub fn pointer_down(&mut self, sample: PointerSample) -> GestureUpdate {
         if !sample.x.is_finite()
             || !sample.y.is_finite()
@@ -355,7 +415,9 @@ impl GestureResolver {
         }
         if self.state == GestureState::PendingSinglePointer {
             let start = self.pointers[index].expect("located pointer").start;
-            if (sample.x - start.x).abs() + (sample.y - start.y).abs() < 5.0 {
+            if (sample.x - start.x).abs() + (sample.y - start.y).abs()
+                < crate::chart_input::CLICK_SLOP_MANHATTAN
+            {
                 return self.update(GestureUpdateKind::None, sample, previous.x, previous.y, 0.0);
             }
             self.state = match sample.target {

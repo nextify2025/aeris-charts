@@ -8,7 +8,7 @@ import {
   apply_series_time_alignment, assert_live_series, ensure_init, normalize_time_tick_marks, time_to_utc_seconds,
   validate_series_time_alignment,
 } from "./impl.js";
-import { route_wheel, wheel_speed_adjustment } from "./gestures.js";
+import { controller_pointer_flags } from "./gestures.js";
 import { AerisChartsError } from "./errors.js";
 import { default_theme_name, theme_options, theme_palette, type theme_name } from "./theme.js";
 import { exchange_time_json, split_exchange_time_options } from "./time_zone.js";
@@ -84,6 +84,7 @@ export type offscreen_series_options = Partial<Pick<series_options, "time_alignm
 function split_offscreen_options(options: offscreen_chart_options): {
   theme: "light" | "dark" | undefined;
   wheel_behavior: "auto" | "pan" | "zoom" | undefined;
+  price_axis_wheel_zoom: boolean | undefined;
   engine: Record<string, unknown>;
   zone: time_zone | undefined;
   session_start: number | undefined;
@@ -101,7 +102,7 @@ function split_offscreen_options(options: offscreen_chart_options): {
       "worker charts do not support option layout.panes.enableResize",
     );
   }
-  const { theme, wheel_behavior, ...engine } = options;
+  const { theme, wheel_behavior, price_axis_wheel_zoom, ...engine } = options;
   // Declarative `timeScale.timeZone` (IANA name or schedule), `timeScale.sessionStart`,
   // `timeScale.tickMarks`, and `timeScale.barTimeLabel` resolve here with the worker's own `Intl`;
   // the engine receives an explicit schedule, UTC-second mark times, and the label to validate
@@ -110,6 +111,7 @@ function split_offscreen_options(options: offscreen_chart_options): {
   return {
     theme,
     wheel_behavior,
+    price_axis_wheel_zoom,
     engine: exchange.engine,
     zone: exchange.zone,
     session_start: exchange.session_start,
@@ -155,13 +157,17 @@ export interface offscreen_pointer_event {
   x: number;
   y: number;
   pointer_id?: number;
+  click_count?: number;
   button?: number;
   buttons?: number;
   ctrl_key?: boolean;
   meta_key?: boolean;
   shift_key?: boolean;
+  alt_key?: boolean;
   pointer_type?: "mouse" | "touch" | "pen";
   timestamp_ms?: number;
+  /** The relaying page's `prefers-reduced-motion`; the worker keeps the last reported value. */
+  reduced_motion?: boolean;
   pressure?: number;
   tilt_x?: number;
   tilt_y?: number;
@@ -175,17 +181,27 @@ export interface offscreen_wheel_event {
   delta_y: number;
   /** 0 = pixels, 1 = lines, 2 = pages (the WheelEvent values). */
   delta_mode?: 0 | 1 | 2;
+  /** Pixel-mode raw delta unit, in device pixels per CSS pixel; omit for CSS-pixel events. */
+  pixel_ratio?: number;
   /** Ctrl (or `meta_key`, macOS Cmd) zooms around the pointer instead of pinning the right edge. */
   ctrl_key?: boolean;
   shift_key?: boolean;
+  alt_key?: boolean;
   meta_key?: boolean;
+  timestamp_ms?: number;
 }
 
 export interface offscreen_key_event {
   key: string;
+  /** Omit for a discrete press; use down/up for a held key. */
+  type?: "press" | "down" | "up";
   ctrl_key?: boolean;
   shift_key?: boolean;
+  alt_key?: boolean;
   meta_key?: boolean;
+  repeat?: boolean;
+  timestamp_ms?: number;
+  reduced_motion?: boolean;
 }
 
 /**
@@ -195,17 +211,16 @@ export interface offscreen_key_event {
  */
 export class offscreen_chart {
   private readonly stats_scratch = new Float64Array(AerisChart.frame_stats_len());
-  private readonly input_scratch = new Float64Array(AerisChart.input_update_len());
   private readonly backend_change_handlers = new Set<(backend: "webgpu" | "canvas2d") => void>();
   private primary_adopted = false;
-  private drag_pointer_id: number | null = null;
-  private pinch_active = false;
   private last_ingestion: ingestion_diagnostics | null = null;
   private removed = false;
+  private input_timer: ReturnType<typeof setTimeout> | null = null;
   private width: number;
   private height: number;
   private dpr: number;
   private last_backend: "webgpu" | "canvas2d";
+  private reduced_motion = false;
   private readonly backend_loss_handler: EventListener;
   /** Host clock (UTC seconds) for the countdown; `null` uses the system clock. */
   private clock: (() => number) | null = null;
@@ -221,6 +236,7 @@ export class offscreen_chart {
     height: number,
     dpr: number,
     private wheel_behavior: "auto" | "pan" | "zoom",
+    private price_axis_wheel_zoom: boolean,
     private selected_theme: theme_name = default_theme_name,
   ) {
     this.width = width;
@@ -582,10 +598,11 @@ export class offscreen_chart {
 
   apply_options(options: offscreen_chart_options): void {
     this.assert_live();
-    const { theme, wheel_behavior, engine, zone, session_start, tick_marks, bar_time_label } =
+    const { theme, wheel_behavior, price_axis_wheel_zoom, engine, zone, session_start, tick_marks, bar_time_label } =
       split_offscreen_options(options);
     apply_offscreen_exchange_time(this.wasm, zone, session_start, tick_marks, bar_time_label);
     if (wheel_behavior !== undefined) this.wheel_behavior = wheel_behavior;
+    if (price_axis_wheel_zoom !== undefined) this.price_axis_wheel_zoom = price_axis_wheel_zoom;
     if (theme !== undefined) {
       this.selected_theme = theme;
       this.wasm.apply_options(JSON.stringify(theme_options(theme_palette(theme))));
@@ -636,6 +653,7 @@ export class offscreen_chart {
       }
       this.wasm.set_now_seconds(Number.isFinite(now) ? now : Number.NaN);
     }
+    this.wasm.controller_flush_coalesced_input();
     this.wasm.render();
     const backend = this.backend();
     if (backend !== this.last_backend) {
@@ -659,153 +677,106 @@ export class offscreen_chart {
     const id = event.pointer_id ?? 1;
     const x = event.x - this.wasm.pane_left();
     const y = event.y;
-    const pane_width = this.wasm.time_scale_width();
-    const pane_height = this.height - this.wasm.time_scale_height();
-    const in_pane = x >= 0 && x <= pane_width && y >= 0 && y <= pane_height;
     const primary = (event.button ?? 0) === 0;
     const device = event.pointer_type === "touch" ? 1 : event.pointer_type === "pen" ? 2 : 0;
-    const target = in_pane ? 0 : y > pane_height ? 4 : 3;
-    const feed = (phase: "down" | "move" | "up") => {
-      const method = phase === "down" ? this.wasm.input_pointer_down.bind(this.wasm)
-        : phase === "move" ? this.wasm.input_pointer_move.bind(this.wasm)
-          : this.wasm.input_pointer_up.bind(this.wasm);
-      const modifiers = (event.shift_key ? 1 : 0) | (event.ctrl_key ? 2 : 0)
-        | (event.meta_key ? 8 : 0);
-      method(
-        id, device, target, modifiers, x, y, event.timestamp_ms ?? performance.now(),
-        event.pressure ?? (primary ? 0.5 : 0), event.tilt_x ?? 0, event.tilt_y ?? 0,
-        this.input_scratch,
-      );
-      return {
-        kind: this.input_scratch[0]!,
-        pointer_id: this.input_scratch[2]!,
-        x: this.input_scratch[5]!,
-        y: this.input_scratch[6]!,
-        previous_x: this.input_scratch[7]!,
-        scale_delta: this.input_scratch[9]!,
-      };
-    };
-
+    const modifiers = (event.shift_key ? 1 : 0) | (event.ctrl_key ? 2 : 0)
+      | (event.alt_key ? 4 : 0) | (event.meta_key ? 8 : 0);
+    const timestamp = event.timestamp_ms ?? performance.now();
+    if (event.reduced_motion !== undefined) this.reduced_motion = event.reduced_motion;
+    // Default worker policy matches the controller's mouse and touch interaction defaults.
+    const options = 0b111_1100_1111 | (this.reduced_motion ? 32 : 0);
+    const flags = controller_pointer_flags(device, modifiers, options);
     switch (event.type) {
       case "down":
         if (!primary) return;
-        {
-          const update = feed("down");
-          if (update.kind === 11) return;
-          if (update.kind === 5) {
-            if (this.drag_pointer_id !== null) this.wasm.scroll_end();
-            this.drag_pointer_id = null;
-            this.pinch_active = true;
-            this.wasm.scroll_start(update.x);
-          } else if (in_pane && this.drag_pointer_id === null) {
-            this.wasm.scroll_start(x);
-            this.drag_pointer_id = id;
-            this.wasm.set_crosshair(x, y);
-          }
-        }
+        this.wasm.controller_pointer_down(id, x, y, timestamp, event.click_count ?? 1, flags);
         break;
       case "move":
-        {
-          const update = feed("move");
-          if (update.kind === 6) {
-            this.wasm.scroll_move(update.x);
-            if (update.scale_delta !== 0) {
-              // Pinching is direct manipulation: it stays anchored at the pinch point even though
-              // wheel zoom pins the right edge.
-              this.wasm.zoom_focused(update.x, this.wasm.pinch_zoom_scale(update.scale_delta));
-            }
-          } else if (this.drag_pointer_id === id) {
-            this.wasm.scroll_move(x);
-          }
-        }
-        if (in_pane || this.drag_pointer_id === id) this.wasm.set_crosshair(x, y);
-        else this.wasm.clear_crosshair();
+        if (event.buttons !== undefined && event.buttons !== 0 && (event.buttons & 1) === 0) return;
+        this.wasm.controller_pointer_move(id, x, y, timestamp,
+          ((event.buttons ?? (device === 1 ? 1 : 0)) & 1) !== 0, flags);
         break;
-      case "up": {
-        const update = feed("up");
-        if (update.kind === 7) {
-          this.wasm.scroll_end();
-          this.wasm.scroll_start(update.x);
-          this.drag_pointer_id = update.pointer_id;
-          this.pinch_active = false;
-        } else if (this.drag_pointer_id === id || this.pinch_active) {
-          this.wasm.scroll_end();
-          this.drag_pointer_id = null;
-          this.pinch_active = false;
-        }
+      case "up":
+        if (!primary) return;
+        this.wasm.controller_pointer_up(id, x, y, timestamp, flags);
         break;
-      }
       case "cancel":
-        this.wasm.input_cancel_all(this.input_scratch);
-        if (this.drag_pointer_id !== null || this.pinch_active) this.wasm.scroll_end();
-        this.drag_pointer_id = null;
-        this.pinch_active = false;
+        this.wasm.controller_pointer_cancel_id(id);
         break;
       case "leave":
-        if (this.drag_pointer_id !== id) this.wasm.clear_crosshair();
+        this.wasm.controller_pointer_leave();
         break;
     }
-    this.render();
+    this.consume_input_events();
+    if (this.wasm.frame_pending()) this.render();
+    this.schedule_input_tick();
   }
 
   /** Inject a relayed wheel sample through the same router as the DOM recognizer. Worker charts
    *  expose no `handle_scroll`/`handle_scale` options, so both wheel gestures stay enabled. */
   inject_wheel_event(event: offscreen_wheel_event): void {
     this.assert_live();
-    const delta_mode = event.delta_mode ?? 0;
-    route_wheel(
-      this.wasm,
-      {
-        delta_x: event.delta_x,
-        delta_y: event.delta_y,
-        delta_mode,
-        ctrl_key: event.ctrl_key === true,
-        shift_key: event.shift_key === true,
-        meta_key: event.meta_key === true,
-        speed: wheel_speed_adjustment(delta_mode, this.dpr),
-        point: () => ({ x: event.x - this.wasm.pane_left(), y: event.y }),
-      },
-      { wheel_behavior: this.wheel_behavior, wheel_zoom: true, wheel_scroll: true },
-    );
-    this.render();
+    const behavior = this.wheel_behavior === "pan" ? 1 : this.wheel_behavior === "zoom" ? 2 : 0;
+    const modifiers = (event.shift_key ? 1 : 0) | (event.ctrl_key ? 2 : 0)
+      | (event.alt_key ? 4 : 0) | (event.meta_key ? 8 : 0);
+    if (this.wasm.input_wheel(
+      event.x - this.wasm.pane_left(),
+      event.y,
+      event.delta_x,
+      event.delta_y,
+      event.delta_mode ?? 0,
+      event.pixel_ratio ?? 1,
+      modifiers,
+      behavior,
+      true,
+      true,
+      this.price_axis_wheel_zoom,
+      event.timestamp_ms ?? performance.now(),
+    )) this.render();
   }
 
-  /** Inject the keyboard subset that has deterministic worker semantics. */
+  /** Route a worker key sample through the same controller used by browser and GPUI hosts. */
   inject_key_event(event: offscreen_key_event): boolean {
     this.assert_live();
-    const step = event.ctrl_key || event.shift_key ? 10 : 1;
-    const center = this.wasm.time_scale_width() / 2;
-    let handled = true;
-    switch (event.key) {
-      case "ArrowLeft":
-        this.wasm.scroll_to_position(this.wasm.scroll_position() - step);
-        break;
-      case "ArrowRight":
-        this.wasm.scroll_to_position(this.wasm.scroll_position() + step);
-        break;
-      case "+":
-      case "=":
-        this.wasm.zoom(center, 0.5);
-        break;
-      case "-":
-      case "_":
-        this.wasm.zoom(center, -0.5);
-        break;
-      case "Home":
-        this.wasm.fit_content();
-        break;
-      case "Delete":
-      case "Backspace":
-        handled = this.wasm.remove_selected_drawing();
-        break;
-      case "Escape":
-        this.wasm.clear_crosshair();
-        break;
-      default:
-        handled = false;
-    }
+    const modifiers = (event.shift_key ? 1 : 0) | (event.ctrl_key ? 2 : 0)
+      | (event.alt_key ? 4 : 0) | (event.meta_key ? 8 : 0);
+    if (event.reduced_motion !== undefined) this.reduced_motion = event.reduced_motion;
+    const handled = event.type === "up"
+      ? this.wasm.input_key_up(event.key, modifiers)
+      : this.wasm.input_key_down(event.key, modifiers, event.repeat ?? false,
+        event.timestamp_ms ?? performance.now(),
+        // Worker charts expose no `handle_scroll`/`handle_scale`, so every key gate is open.
+        (event.type === "down" ? (this.reduced_motion ? 1 : 0) : 1) | 2 | 4 | 8);
+    if (handled) this.consume_input_events();
     if (handled) this.render();
+    if (this.wasm.input_animating()) this.schedule_input_tick();
     return handled;
+  }
+
+  private consume_input_events(): void {
+    const events = JSON.parse(this.wasm.take_input_events_json()) as Array<
+      { kind: string; id?: number }
+    >;
+    for (const event of events) {
+      if (event.kind !== "remove_series" || event.id === undefined) continue;
+      if (this.wasm.remove_series_tracked(event.id).length > 0 && event.id === 0) {
+        this.primary_adopted = true;
+      }
+    }
+  }
+
+  private schedule_input_tick(): void {
+    if (this.input_timer !== null) return;
+    const deadline = this.wasm.input_wake_deadline_ms();
+    const animating = this.wasm.input_animating();
+    if (!animating && (deadline === undefined || !Number.isFinite(deadline))) return;
+    const delay = animating ? 16 : Math.max(0, deadline! - performance.now());
+    this.input_timer = setTimeout(() => {
+      this.input_timer = null;
+      if (this.removed) return;
+      if (this.wasm.input_tick(performance.now())) this.render();
+      this.schedule_input_tick();
+    }, delay);
   }
 
   visible_logical_range(): { from: number; to: number } | null {
@@ -846,11 +817,10 @@ export class offscreen_chart {
 
   remove(): void {
     if (this.removed) return;
+    if (this.input_timer !== null) clearTimeout(this.input_timer);
+    this.input_timer = null;
     globalThis.removeEventListener("aeris_charts-chart-backend-lost", this.backend_loss_handler);
-    if (this.drag_pointer_id !== null) this.wasm.scroll_end();
-    this.wasm.input_cancel_all(this.input_scratch);
-    this.drag_pointer_id = null;
-    this.pinch_active = false;
+    this.wasm.controller_pointer_cancel();
     this.backend_change_handlers.clear();
     this.removed = true;
     this.wasm.dispose();
@@ -878,8 +848,10 @@ export async function create_offscreen_chart(
   const height = Math.max(init.height, 1);
   const dpr = Math.max(init.dpr, Number.EPSILON);
   const options = init.options ?? {};
-  const { theme, wheel_behavior, engine: engine_options, zone, session_start, tick_marks, bar_time_label } =
-    split_offscreen_options(options);
+  const {
+    theme, wheel_behavior, price_axis_wheel_zoom, engine: engine_options, zone, session_start, tick_marks,
+    bar_time_label,
+  } = split_offscreen_options(options);
   const wasm = await wasm_create_offscreen_chart(
     gpu_canvas,
     fallback_canvas,
@@ -911,7 +883,8 @@ export async function create_offscreen_chart(
     wasm.set_series_type(KIND_TO_U8[initial_kind]);
   }
   const chart = new offscreen_chart(
-    wasm, gpu_canvas, fallback_canvas, width, height, dpr, wheel_behavior ?? "auto", selected_theme,
+    wasm, gpu_canvas, fallback_canvas, width, height, dpr,
+    wheel_behavior ?? "auto", price_axis_wheel_zoom ?? false, selected_theme,
   );
   chart.render();
   return chart;

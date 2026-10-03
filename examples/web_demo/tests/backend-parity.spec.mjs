@@ -80,6 +80,374 @@ function crop_png(source, x, y, width, height) {
   return output;
 }
 
+test("scaled four-color image matches WebGPU, Canvas2D, and native", async ({ browser }, test_info) => {
+  const context = await browser.newContext({ viewport: { width: 120, height: 120 }, deviceScaleFactor: 1 });
+  const page = await context.newPage();
+  page.on("console", (message) => console.log(`[image-browser:${message.type()}] ${message.text()}`));
+  page.on("pageerror", (error) => console.log(`[image-browser:pageerror] ${error.message}`));
+  await page.goto("/");
+  const capture = async (backend) => {
+    const actual_backend = await page.evaluate(async (requested_backend) => {
+      const api = await import("/dist/aeris_charts_financial.js");
+      const prior = window.__image_parity_chart;
+      prior?.remove();
+      document.getElementById("image-parity-host")?.remove();
+      const host = document.createElement("div");
+      host.id = "image-parity-host";
+      host.style.cssText = "position:fixed;left:0;top:0;width:64px;height:64px;background:#fff;z-index:9999";
+      document.body.append(host);
+      const chart = await api.create_chart(host, {
+        autoSize: false,
+        backend: requested_backend,
+        __force_webgpu_fallback_adapter: true,
+        layout: { background: { type: "solid", color: "#ffffff" } },
+        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+        leftPriceScale: { visible: false },
+        rightPriceScale: { visible: false },
+        timeScale: { visible: false },
+      });
+      chart.resize(64, 64, 1);
+      const series = chart.add_series("line");
+      series.set_data([{ time: 1, value: 100 }]);
+      const image = document.createElement("canvas");
+      image.width = image.height = 2;
+      const ctx = image.getContext("2d");
+      ctx.fillStyle = "#ff0000"; ctx.fillRect(0, 0, 1, 1);
+      ctx.fillStyle = "#0000ff"; ctx.fillRect(1, 0, 1, 1);
+      ctx.fillStyle = "#00ff00"; ctx.fillRect(0, 1, 1, 1);
+      ctx.fillStyle = "#ffffff"; ctx.fillRect(1, 1, 1, 1);
+      api.create_image_watermark(series, image, { maxWidth: 20, maxHeight: 20, alpha: 0.72 });
+      window.__image_parity_chart = chart;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return chart.backend();
+    }, backend);
+    const image = PNG.sync.read(await page.locator("#image-parity-host").screenshot());
+    return { actual_backend, image };
+  };
+  const gpu = await capture("auto");
+  const canvas = await capture("canvas2d");
+  expect(gpu.actual_backend).toBe("webgpu");
+  expect(canvas.actual_backend).toBe("canvas2d");
+  const gpu_center = crop_png(gpu.image, 22, 22, 20, 20);
+  const canvas_center = crop_png(canvas.image, 22, 22, 20, 20);
+  const native_path = test_info.outputPath("native-image.png");
+  const native_run = spawnSync("cargo", ["run", "-p", "aeris_charts_native", "--example", "image_parity_fixture", "--", native_path], {
+    cwd: repository_root, encoding: "utf8",
+  });
+  expect(native_run.status, `${native_run.stdout}\n${native_run.stderr}`).toBe(0);
+  const native_center = crop_png(PNG.sync.read(readFileSync(native_path)), 22, 22, 20, 20);
+  expect(rgba_diff(gpu_center.data, canvas_center.data, 1).different_pixels).toBe(0);
+  expect(rgba_diff(gpu_center.data, native_center.data, 1).different_pixels).toBe(0);
+  await context.close();
+});
+
+test("dashed and dotted pane paths, stepped series and stroked circles share browser geometry", async ({ page }) => {
+  await page.goto("/?backend=canvas2d&forceFallbackAdapter=1");
+  const capture = async (backend) => {
+    const actual_backend = await page.evaluate(async (requested) => {
+      window.__contract_chart?.remove();
+      document.getElementById("contract-host")?.remove();
+      const api = await import("/dist/aeris_charts_financial.js");
+      const host = document.createElement("div");
+      host.id = "contract-host";
+      host.style.cssText = "position:fixed;left:0;top:0;width:360px;height:220px;background:#fff;z-index:9999";
+      document.body.appendChild(host);
+      const chart = await api.create_chart(host, {
+        backend: requested, autoSize: false,
+        layout: { background: { type: "solid", color: "#ffffff" } },
+        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+        leftPriceScale: { visible: false }, rightPriceScale: { visible: false },
+        timeScale: { visible: false },
+      });
+      chart.resize(360, 220, 1.5);
+      const series = chart.add_series("line", {
+        color: "#008a66", line_width: 3, line_type: "stepped",
+        price_line_visible: false, last_value_visible: false,
+      });
+      series.set_data(Array.from({ length: 20 }, (_, i) => ({ time: i + 1, value: 40 + (i % 4) * 10 })));
+      chart.time_scale().fit_content();
+      chart.panes()[0].attach_primitive({ pane_views: () => [{ z_order: "top", renderer(ctx) {
+        const x = ctx.pane_left, y = ctx.pane_top;
+        ctx.polyline([x + 20, y + 22, x + 110, y + 32, x + 210, y + 20], "#e91e63", 3, 2);
+        ctx.polyline([x + 20, y + 55, x + 110, y + 45, x + 210, y + 60], "#3867ff", 3, 1);
+        ctx.circle(x + 270, y + 45, 15, "#8a00ff", "#ff9900", 3);
+      } }] });
+      window.__contract_chart = chart;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return chart.backend();
+    }, backend);
+    return { backend: actual_backend, png: PNG.sync.read(await page.locator("#contract-host").screenshot()) };
+  };
+  const canvas = await capture("canvas2d");
+  const gpu = await capture("auto");
+  expect(canvas.backend).toBe("canvas2d");
+  expect(gpu.backend).toBe("webgpu");
+  const parity = rgba_diff(gpu.png.data, canvas.png.data, 0);
+  console.log(`contract variants: ${parity.different_pixels} residual pixels, max delta ${parity.maximum_channel_delta}`);
+  const compare_solid_ink = (source, target, rgb) => {
+    const width = source.width, height = source.height;
+    const mask = (image) => {
+      const out = new Uint8Array(width * height);
+      for (let p = 0; p < out.length; p += 1) {
+        const offset = p * 4;
+        if ([0, 1, 2].every((channel) => Math.abs(image.data[offset + channel] - rgb[channel]) <= 12)) out[p] = 1;
+      }
+      return out;
+    };
+    const a = mask(source), b = mask(target);
+    let count = 0, missing = 0;
+    for (let y = 1; y < height - 1; y += 1) for (let x = 1; x < width - 1; x += 1) {
+      if (!a[y * width + x]) continue;
+      count += 1;
+      let found = false;
+      for (let dy = -1; dy <= 1 && !found; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+        if (b[(y + dy) * width + x + dx]) { found = true; break; }
+      }
+      if (!found) missing += 1;
+    }
+    return { count, missing };
+  };
+  for (const [name, rgb] of [
+    ["dashed", [233, 30, 99]], ["dotted", [56, 103, 255]],
+    ["stepped", [0, 138, 102]], ["circle", [138, 0, 255]], ["circle stroke", [255, 153, 0]],
+  ]) {
+    const forward = compare_solid_ink(canvas.png, gpu.png, rgb);
+    const backward = compare_solid_ink(gpu.png, canvas.png, rgb);
+    console.log(`${name} solid ink: Canvas ${forward.count}, WebGPU ${backward.count}, unmatched ${forward.missing}/${backward.missing}`);
+    expect(forward.count, `${name} must paint on Canvas2D`).toBeGreaterThan(20);
+    expect(backward.count, `${name} must paint on WebGPU`).toBeGreaterThan(20);
+    expect(forward.missing + backward.missing, `${name} geometry must agree within one device pixel`).toBeLessThanOrEqual(20);
+  }
+});
+
+test("transparent rounded tooltip keeps its outlined interior clear", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 400, height: 240 }, deviceScaleFactor: 2 });
+  const page = await context.newPage();
+  await page.goto("/");
+  for (const backend of ["auto", "canvas2d"]) {
+    const geometry = await page.evaluate(async (requested_backend) => {
+      const api = await import("/dist/aeris_charts_financial.js");
+      window.__round_rect_chart?.remove();
+      document.getElementById("round-rect-host")?.remove();
+      const host = document.createElement("div");
+      host.id = "round-rect-host";
+      host.style.cssText = "position:fixed;left:0;top:0;width:320px;height:180px;background:#ffffff;z-index:9999";
+      document.body.append(host);
+      const chart = await api.create_chart(host, {
+        autoSize: false,
+        backend: requested_backend,
+        __force_webgpu_fallback_adapter: true,
+        layout: { background: { type: "solid", color: "rgba(255,255,255,0)" } },
+        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+        leftPriceScale: { visible: false },
+        rightPriceScale: { visible: false, borderColor: "#ff00ff" },
+        timeScale: { visible: false },
+      });
+      chart.resize(320, 180, 2);
+      const series = chart.add_series("line", { color: "#008800", priceLineVisible: false, lastValueVisible: false });
+      series.set_data(Array.from({ length: 30 }, (_, index) => ({ time: index + 1, value: 100 + index % 5 })));
+      chart.time_scale().fit_content();
+      api.create_delta_tooltip(chart, { series, requires_shift_drag: false });
+      window.__round_rect_chart = chart;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return {
+        backend: chart.backend(),
+        from: chart.time_scale().logical_to_coordinate(8),
+        to: chart.time_scale().logical_to_coordinate(22),
+      };
+    }, backend);
+    expect(geometry.backend).toBe(backend === "auto" ? "webgpu" : "canvas2d");
+    await page.mouse.move(geometry.from, 130);
+    await page.mouse.down();
+    await page.mouse.move(geometry.to, 130, { steps: 5 });
+    await page.mouse.up();
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const png = PNG.sync.read(await page.locator("#round-rect-host").screenshot());
+    const is_border = (x, y) => {
+      const offset = (y * png.width + x) * 4;
+      return png.data[offset] > 240 && png.data[offset + 1] < 30 && png.data[offset + 2] > 240;
+    };
+    let top = null;
+    for (let y = 0; y < 150 && top === null; y += 1) {
+      for (let x = 0; x < png.width - 50; x += 1) {
+        if (Array.from({ length: 50 }, (_, dx) => is_border(x + dx, y)).every(Boolean)) {
+          top = { x, y };
+          break;
+        }
+      }
+    }
+    expect(top, `${geometry.backend} must paint the tooltip border`).not.toBe(null);
+    for (let dy = 7; dy < 17; dy += 1) {
+      for (let dx = 8; dx < 48; dx += 1) {
+        expect(is_border(top.x + dx, top.y + dy), `${geometry.backend} border leaked into tooltip at ${dx},${dy}`).toBe(false);
+      }
+    }
+  }
+  await context.close();
+});
+
+test("translucent zig-zag joins match Canvas2D on WebGPU", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 320, height: 200 }, deviceScaleFactor: 1 });
+  const page = await context.newPage();
+  await page.goto("/");
+  const capture = async (backend) => {
+    const geometry = await page.evaluate(async (requested_backend) => {
+      const api = await import("/dist/aeris_charts_financial.js");
+      window.__join_chart?.remove();
+      document.getElementById("join-host")?.remove();
+      const host = document.createElement("div");
+      host.id = "join-host";
+      host.style.cssText = "position:fixed;left:0;top:0;width:260px;height:160px;background:#fff;z-index:9999";
+      document.body.append(host);
+      const chart = await api.create_chart(host, {
+        autoSize: false, backend: requested_backend, __force_webgpu_fallback_adapter: true,
+        layout: { background: { type: "solid", color: "#ffffff" } },
+        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+        leftPriceScale: { visible: false }, rightPriceScale: { visible: false },
+        timeScale: { visible: false },
+      });
+      chart.resize(260, 160, 1);
+      const series = chart.add_series("line", {
+        color: "rgba(0,0,0,0.5)", line_width: 8,
+        price_line_visible: false, last_value_visible: false,
+      });
+      const data = Array.from({ length: 7 }, (_, i) => ({ time: i + 1, value: i % 2 ? 80 : 20 }));
+      series.set_data(data);
+      chart.time_scale().fit_content();
+      window.__join_chart = chart;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return {
+        backend: chart.backend(),
+        joins: [2, 3, 4].map((index) => ({
+          x: chart.time_scale().logical_to_coordinate(index),
+          y: series.price_to_coordinate(data[index].value),
+        })),
+      };
+    }, backend);
+    const png = PNG.sync.read(await page.locator("#join-host").screenshot());
+    return { ...geometry, png };
+  };
+  const gpu = await capture("auto");
+  const canvas = await capture("canvas2d");
+  expect(gpu.backend).toBe("webgpu");
+  expect(canvas.backend).toBe("canvas2d");
+  for (let index = 0; index < gpu.joins.length; index += 1) {
+    const x = Math.round(gpu.joins[index].x);
+    const y = Math.round(gpu.joins[index].y);
+    const gpu_join = crop_png(gpu.png, x - 6, y - 6, 13, 13);
+    const canvas_join = crop_png(canvas.png, x - 6, y - 6, 13, 13);
+    const stats = rgba_diff(gpu_join.data, canvas_join.data, 32);
+    expect(stats.different_pixels, `join ${index} at ${x},${y}: max delta ${stats.maximum_channel_delta}`).toBe(0);
+  }
+  await context.close();
+});
+
+test("translucent chart background composites the same on both browser backends", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 300, height: 200 }, deviceScaleFactor: 1 });
+  const page = await context.newPage();
+  await page.goto("/");
+  const capture = async (backend) => {
+    const actual = await page.evaluate(async (requested) => {
+      const api = await import("/dist/aeris_charts_financial.js");
+      window.__alpha_chart?.remove();
+      document.getElementById("alpha-host")?.remove();
+      const host = document.createElement("div");
+      host.id = "alpha-host";
+      host.style.cssText = "position:fixed;left:0;top:0;width:260px;height:160px;background:#ff0000;z-index:9999";
+      document.body.append(host);
+      const chart = await api.create_chart(host, {
+        autoSize: false, backend: requested, __force_webgpu_fallback_adapter: true,
+        layout: { background: { type: "solid", color: "rgba(0,0,255,0.5)" } },
+        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+        leftPriceScale: { visible: false }, rightPriceScale: { visible: false },
+        timeScale: { visible: false },
+      });
+      chart.resize(260, 160, 1);
+      window.__alpha_chart = chart;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return chart.backend_status();
+    }, backend);
+    const png = PNG.sync.read(await page.locator("#alpha-host").screenshot());
+    return { actual, pixel: Array.from(png.data.subarray((80 * png.width + 130) * 4, (80 * png.width + 130) * 4 + 4)) };
+  };
+  const canvas = await capture("canvas2d");
+  const gpu = await capture("auto");
+  expect(canvas.actual.active_backend).toBe("canvas2d");
+  expect(gpu.actual.active_backend).toBe("webgpu");
+  expect(canvas.pixel[0]).toBeGreaterThan(100);
+  expect(canvas.pixel[2]).toBeGreaterThan(100);
+  for (let channel = 0; channel < 4; channel += 1) {
+    expect(Math.abs(canvas.pixel[channel] - gpu.pixel[channel]), `channel ${channel}: ${canvas.pixel} vs ${gpu.pixel}`).toBeLessThanOrEqual(2);
+  }
+  await context.close();
+});
+
+test("oversized text run remains visible on the WebGPU chart", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 1400, height: 250 }, deviceScaleFactor: 1 });
+  const page = await context.newPage();
+  await page.goto("/");
+  const capture = async (backend) => {
+    const actual = await page.evaluate(async (requested) => {
+      const api = await import("/dist/aeris_charts_financial.js");
+      window.__wide_chart?.remove();
+      document.getElementById("wide-host")?.remove();
+      const host = document.createElement("div");
+      host.id = "wide-host";
+      host.style.cssText = "position:fixed;left:0;top:0;width:1300px;height:180px;background:#101820;z-index:9999";
+      document.body.append(host);
+      const chart = await api.create_chart(host, {
+        autoSize: false, backend: requested, __force_webgpu_fallback_adapter: true,
+        layout: { background: { type: "solid", color: "#101820" } },
+        grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+        leftPriceScale: { visible: false }, rightPriceScale: { visible: false },
+        timeScale: { visible: false },
+      });
+      chart.resize(1300, 180, 1);
+      const series = chart.add_series("line", {
+        color: "#101820", line_width: 1, price_line_visible: false, last_value_visible: false,
+      });
+      series.set_data([{ time: 1, value: 40 }, { time: 2, value: 60 }]);
+      chart.time_scale().fit_content();
+      chart.add_drawing("text", [{ logical: 0, price: 50 }], {
+        text: "Wide label ".repeat(25), text_size: 32, text_color: "#ffffff",
+        text_h_align: "left", text_v_align: "middle",
+      });
+      window.__wide_chart = chart;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return chart.backend();
+    }, backend);
+    const png = PNG.sync.read(await page.locator("#wide-host").screenshot());
+    let white = 0;
+    for (let offset = 0; offset < png.data.length; offset += 4) {
+      if (png.data[offset] > 200 && png.data[offset + 1] > 200 && png.data[offset + 2] > 200) white += 1;
+    }
+    let recovery = null;
+    if (backend === "auto") {
+      recovery = await page.evaluate(async () => {
+        const host = document.getElementById("wide-host");
+        const visibility = () => Array.from(host.querySelectorAll("canvas"), (canvas) => canvas.style.visibility);
+        const before = visibility();
+        window.__wide_chart.drawings()[0].remove();
+        window.__wide_chart.render();
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return { before, after: visibility(), backend: window.__wide_chart.backend() };
+      });
+    }
+    return { actual, white, png, recovery };
+  };
+  const canvas = await capture("canvas2d");
+  const gpu = await capture("auto");
+  expect(canvas.actual).toBe("canvas2d");
+  expect(gpu.actual).toBe("webgpu");
+  expect(canvas.white).toBeGreaterThan(100);
+  expect(gpu.white, `Canvas2D paints ${canvas.white} white text pixels; WebGPU paints ${gpu.white}`).toBeGreaterThan(canvas.white * 0.8);
+  const diff = rgba_diff(canvas.png.data, gpu.png.data, 2);
+  expect(diff.different_pixels, `oversized-run fallback max delta ${diff.maximum_channel_delta}`).toBe(0);
+  expect(gpu.recovery.backend).toBe("webgpu");
+  expect(gpu.recovery.after, "removing the wide label restores the WebGPU surface").not.toEqual(gpu.recovery.before);
+  await context.close();
+});
+
 function image_stats(a, b) {
   expect([a.width, a.height]).toEqual([b.width, b.height]);
   const exact = rgba_diff(a.data, b.data, 0);
@@ -233,8 +601,9 @@ test("presented WebGPU and Canvas2D frames share geometry with bounded text-AA d
   // hinting plus analytic Canvas2D versus 4x-MSAA rounded-label edges can leave a bounded AA
   // coverage residual, but no paint-order or solid-interior mismatch (which exceeds this band) is
   // permitted.
-  expect(parity.different_pixels).toBeLessThanOrEqual(5_000);
-  expect(parity.maximum_channel_delta).toBeLessThanOrEqual(64);
+  // Windows SwiftShader measurement after the A–E fixes: 2,307 pixels, max delta 32.
+  expect(parity.different_pixels).toBeLessThanOrEqual(2_600);
+  expect(parity.maximum_channel_delta).toBeLessThanOrEqual(40);
 
   // The same presented-frame gate with engine markers visible (?feature=markers) — the state
   // that exposed the WebGPU paint-order bug: markers are tri-family shapes emitted after the
@@ -664,7 +1033,65 @@ test("public time and price scale handles are engine-owned and reference-compati
   ).toBeLessThanOrEqual(1);
 });
 
-test("reference 5.2 reference is deterministic and reports Aeris fidelity", async ({ page }, test_info) => {
+test("browser and GPUI fixture negotiate the same axis width with the same glyph widths", async ({ page }) => {
+  await page.addInitScript(() => {
+    const native_measure = CanvasRenderingContext2D.prototype.measureText;
+    CanvasRenderingContext2D.prototype.measureText = function(text) {
+      const metrics = native_measure.call(this, text);
+      return new Proxy(metrics, {
+        get(target, key) {
+          return key === "width" ? String(text).length * 7 : Reflect.get(target, key, target);
+        },
+      });
+    };
+  });
+  await page.goto("/?backend=canvas2d&forceFallbackAdapter=1");
+  await wait_for_chart(page);
+  const width = await page.evaluate(async () => {
+    const { create_chart } = await import("/dist/aeris_charts_financial.js");
+    const host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:-10000px;width:800px;height:500px";
+    document.body.append(host);
+    const chart = await create_chart(host, { backend: "canvas2d", autoSize: false });
+    chart.resize(800, 500, 1);
+    const series = chart.add_series("candlestick");
+    series.set_data([
+      { time: 1, open: 101, high: 102, low: 100, close: 101 },
+      { time: 2, open: 102, high: 103, low: 101, close: 102 },
+    ]);
+    chart.time_scale().fit_content();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const axis_width = chart.wasm.price_axis_width();
+    chart.remove();
+    host.remove();
+    return axis_width;
+  });
+  expect(width).toBe(54);
+});
+
+test("axis cap centering measures the painted axis font size", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__axis_cap_fonts = [];
+    const measure = CanvasRenderingContext2D.prototype.measureText;
+    CanvasRenderingContext2D.prototype.measureText = function(text) {
+      if (text === "H") window.__axis_cap_fonts.push(this.font);
+      return measure.call(this, text);
+    };
+  });
+  await page.goto("/?runtimeTest=presentedFrame&backend=canvas2d");
+  await wait_for_chart(page);
+  const fonts = await page.evaluate(async () => {
+    window.__axis_cap_fonts.length = 0;
+    window.__chart.apply_options({ layout: { fontSize: 24 } });
+    window.__chart.render();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return window.__axis_cap_fonts;
+  });
+  expect(fonts.some((font) => /\b22px\b/.test(font)), `axis labels must measure at 22px: ${fonts}`).toBe(true);
+  expect(fonts.some((font) => /\b24px\b/.test(font)), `layout 24px must not stand in for the axis font: ${fonts}`).toBe(false);
+});
+
+test("reference 5.2 reference is deterministic and reports Aeris fidelity @machine", async ({ page }, test_info) => {
   // Pin bar spacing like the matrix cases: compact strips change default-fit spacing, so only
   // equal spacing keeps bars pixel-aligned for the comparison.
   await page.goto("/?runtimeTest=presentedFrame&backend=canvas2d&spacing=6");
@@ -726,7 +1153,7 @@ test("reference 5.2 reference is deterministic and reports Aeris fidelity", asyn
   }
 });
 
-test("reference spacing, DPR, and theme matrix reports regional fidelity", async ({ browser }, test_info) => {
+test("reference spacing, DPR, and theme matrix reports regional fidelity @machine", async ({ browser }, test_info) => {
   expect(reference_matrix.fixture).toBe(fixture.name);
   expect(reference_matrix.ref_version).toBe("5.2.0");
   const cases = reference_matrix.cases;
@@ -810,7 +1237,7 @@ test("reference spacing, DPR, and theme matrix reports regional fidelity", async
   }
 });
 
-test("reference marker and overlay-volume fixtures report regional fidelity", async ({ browser }, test_info) => {
+test("reference marker and overlay-volume fixtures report regional fidelity @machine", async ({ browser }, test_info) => {
   expect(reference_features.fixture).toBe(fixture.name);
   expect(reference_features.ref_version).toBe("5.2.0");
   const feature_reports = {};

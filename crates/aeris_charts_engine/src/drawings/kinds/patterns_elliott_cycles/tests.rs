@@ -484,8 +484,8 @@ fn ratio_labels_paint_above_every_connector() {
 
 #[test]
 fn dashed_and_dotted_styles_reach_executors_as_solid_runs() {
-    // The WebGPU tessellator has no dash concept, so the frame splits every family stroke's
-    // dash pattern itself and executors receive only solid polylines.
+    // The frame splits every family stroke's dash pattern itself, clipped to the pane, and
+    // executors receive only solid polylines.
     let mut chart = chart();
     for (kind, style) in [
         (DrawingKind::AbcdPattern, "dashed"),

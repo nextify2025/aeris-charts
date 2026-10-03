@@ -197,6 +197,62 @@ test("crosshair hides on separator hover and during the resize drag, then resume
   expect(await legend(), "crosshair resumes over the pane").toContain("H");
 });
 
+test("pane divider returns to its grab point after hitting the height clamp", async ({ page }) => {
+  await page.goto("/?backend=canvas2d&forceFallbackAdapter=1");
+  await wait_for_chart(page);
+  await page.check("#rsi_toggle");
+  await wait_for_chart(page);
+  const geometry = await page.evaluate(() => {
+    const rect = document.querySelector("#chart_container").getBoundingClientRect();
+    return { x: rect.left + 400, top: rect.top,
+      separator: Array.from(window.__chart.wasm.pane_separator_ys())[0] };
+  });
+  const separator = () => page.evaluate(() => Array.from(window.__chart.wasm.pane_separator_ys())[0]);
+  await page.mouse.move(geometry.x, geometry.top + geometry.separator);
+  await page.mouse.down();
+  await page.mouse.move(geometry.x, geometry.top + geometry.separator + 400);
+  const clamped = await separator();
+  await page.mouse.move(geometry.x, geometry.top + geometry.separator + 60);
+  const reversed = await separator();
+  await page.mouse.up();
+  expect(clamped).toBeGreaterThan(geometry.separator + 60);
+  expect(reversed).toBeCloseTo(geometry.separator + 60, 0);
+});
+
+test("touch divider keeps its original grab point after the height clamp", async ({ page }) => {
+  await page.goto("/?backend=canvas2d&forceFallbackAdapter=1");
+  await wait_for_chart(page);
+  await page.check("#rsi_toggle");
+  await wait_for_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const overlay = chart.chart_element().querySelector("canvas:last-of-type");
+    const rect = overlay.getBoundingClientRect();
+    const initial = Array.from(chart.wasm.pane_separator_ys())[0];
+    const x = rect.left + 400;
+    const touch = (y) => new Touch({
+      identifier: 37, target: overlay, clientX: x, clientY: rect.top + y,
+      pageX: x, pageY: rect.top + y, screenX: x, screenY: rect.top + y,
+      radiusX: 1, radiusY: 1, rotationAngle: 0, force: 0.5,
+    });
+    const send = (type, touches, changedTouches) => overlay.dispatchEvent(new TouchEvent(type, {
+      touches, targetTouches: touches, changedTouches, bubbles: true, cancelable: true,
+    }));
+    const start = touch(initial + 10);
+    send("touchstart", [start], [start]);
+    const far = touch(initial + 400);
+    send("touchmove", [far], [far]);
+    const clamped = Array.from(chart.wasm.pane_separator_ys())[0];
+    const back = touch(initial + 60);
+    send("touchmove", [back], [back]);
+    const reversed = Array.from(chart.wasm.pane_separator_ys())[0];
+    send("touchend", [], [back]);
+    return { initial, clamped, reversed };
+  });
+  expect(result.clamped).toBeGreaterThan(result.initial + 50);
+  expect(result.reversed).toBeCloseTo(result.initial + 50, 0);
+});
+
 for (const backend of ["canvas2d", "webgpu"]) {
   test(`price-axis glyphs never paint across a pane separator (${backend})`, async ({ page }) => {
     await page.goto(`/?backend=${backend}&forceFallbackAdapter=1`);

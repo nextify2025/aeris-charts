@@ -50,11 +50,9 @@ impl ChartEngine {
         outside: BrushStyle,
         ranges: Vec<BrushRange>,
     ) -> bool {
-        let Some(series) = self
-            .series
-            .iter_mut()
-            .find(|series| series.id == id && !series.removed && series.kind == SeriesKind::Area)
-        else {
+        let Some(series) = self.series.presentation_mut(|series| {
+            series.id == id && !series.removed && series.kind == SeriesKind::Area
+        }) else {
             return false;
         };
         if ranges.len() > MAX_AREA_BRUSH_RANGES
@@ -70,7 +68,9 @@ impl ChartEngine {
             return false;
         }
         series.area_brush = Some(AreaBrushState { outside, ranges });
-        self.invalidate_frame_scene();
+        // Brush styling is presentation inside this series' geometry only; it never changes
+        // layout, autoscale, grid, axes, or any other layer, so a drag rebuilds one series.
+        self.invalidate_frame_series_geometry(id);
         true
     }
 
@@ -86,14 +86,13 @@ impl ChartEngine {
     pub fn clear_area_brush_state(&mut self, id: SeriesId) -> bool {
         let Some(series) = self
             .series
-            .iter_mut()
-            .find(|series| series.id == id && !series.removed)
+            .presentation_mut(|series| series.id == id && !series.removed)
         else {
             return false;
         };
         let changed = series.area_brush.take().is_some();
         if changed {
-            self.invalidate_frame_scene();
+            self.invalidate_frame_series_geometry(id);
         }
         true
     }

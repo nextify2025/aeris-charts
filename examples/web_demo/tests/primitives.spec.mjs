@@ -152,12 +152,14 @@ test("pane primitive paints identically on both backends, changes its regions, a
   expect(pane_backend_diff, "pane primitive geometry must remain pixel-identical").toBe(0);
   const backend_diff = count_different(gpu_attached, canvas_attached);
   const backend_max_delta = max_channel_delta(gpu_attached, canvas_attached);
-  if (backend_diff > 5_000 || backend_max_delta > 64) {
+  console.log(`pane-primitive full-frame residual: ${backend_diff} px, max delta ${backend_max_delta}`);
+  if (backend_diff > 2_600 || backend_max_delta > 40) {
     await test_info.attach("webgpu.png", { body: PNG.sync.write(gpu_attached), contentType: "image/png" });
     await test_info.attach("canvas2d.png", { body: PNG.sync.write(canvas_attached), contentType: "image/png" });
   }
-  expect(backend_diff, "full-frame differences must stay confined to bounded AA edges").toBeLessThanOrEqual(5_000);
-  expect(backend_max_delta).toBeLessThanOrEqual(64);
+  // Windows SwiftShader measurement: 2,307 pixels, max delta 32.
+  expect(backend_diff, "full-frame differences must stay confined to bounded AA edges").toBeLessThanOrEqual(2_600);
+  expect(backend_max_delta).toBeLessThanOrEqual(40);
 
   // Sanity: the demo's built-in session-bands primitive (z_order "bottom") also toggles.
   await page.evaluate(() => window.__set_day_bands(true));
@@ -171,9 +173,8 @@ test("pane primitive paints identically on both backends, changes its regions, a
 });
 
 test("plugin dashed polylines paint identical dashes on WebGPU and Canvas2D", async ({ page }, test_info) => {
-  // The WebGPU stroker has no dash concept and ignores `Polyline.style`, so the decoder lowers
-  // dashed and dotted plugin polylines to solid dash runs clipped to the owning pane (the same
-  // shared lowering the engine's own strokes use). No packaged plugin emits a styled polyline,
+  // The decoder lowers dashed and dotted plugin polylines to solid dash runs clipped to the
+  // owning pane (the same shared lowering the engine's own strokes use). No packaged plugin emits a styled polyline,
   // so this test defines its own: a horizontal dashed one, a dotted diagonal that starts left of
   // the pane and leaves past its right edge, and a solid control.
   const run_scenario = async (backend, styles) => {
@@ -212,8 +213,7 @@ test("plugin dashed polylines paint identical dashes on WebGPU and Canvas2D", as
   expect(count_different(solid_canvas.png, canvas.png), "Canvas2D dashes the plugin polylines").toBeGreaterThan(500);
   expect(count_different(solid_gpu.png, gpu.png), "WebGPU dashes the plugin polylines").toBeGreaterThan(500);
 
-  // A dash painted where the other backend leaves a gap (a WebGPU stroke that ignores the style)
-  // differs by the stroke's full contrast, far above any raster difference. Dash ends may differ
+  // A dash painted where the other backend leaves a gap (a stroke painted solid) differs by the stroke's full contrast, far above any raster difference. Dash ends may differ
   // by one coverage step between Canvas2D's analytic coverage and WebGPU's faded butt caps, so
   // those stay few and isolated (the same bound as the core-drawing dash parity test).
   let paint_diff = 0;
@@ -238,7 +238,7 @@ test("plugin dashed polylines paint identical dashes on WebGPU and Canvas2D", as
   expect(dash_end_diff, "dash-end coverage steps stay isolated").toBeLessThanOrEqual(32);
 });
 
-test("legacy text_views are clipped to their owning pane and cannot cover axis chrome", async ({ page }) => {
+test("text_views are clipped to their owning pane and cannot cover axis chrome", async ({ page }) => {
   const pixel_ratio = fixture.pixel_ratio;
   const pane_width = Math.round((fixture.css_width - fixture.price_axis_width) * pixel_ratio);
   const pane_height = Math.round((fixture.css_height - fixture.time_axis_height) * pixel_ratio);
@@ -274,4 +274,59 @@ test("legacy text_views are clipped to their owning pane and cannot cover axis c
   await settle_frames(page);
   const restored = PNG.sync.read(await page.screenshot({ animations: "disabled", fullPage: false }));
   expect(count_different(before, restored)).toBe(0);
+});
+
+test("plugin text_views enter the ordered pane frame used by pane-only screenshots", async ({ page }) => {
+  await goto_fixture(page, "canvas2d");
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const handle = chart.panes()[0].attach_primitive({
+      text_views: (info) => [{
+        text: "FRAME TEXT", x: info.pane_left + 75, y: info.pane_top + 80,
+        font: "italic bold 24px Arial", color: "#ff00ff", baseline: "alphabetic",
+      }],
+    });
+    const count_magenta = () => {
+      const screenshot = chart.take_screenshot(false, false);
+      const pixels = screenshot.getContext("2d").getImageData(0, 0, screenshot.width, screenshot.height).data;
+      let magenta = 0;
+      for (let index = 0; index < pixels.length; index += 4) {
+        if (pixels[index] > 220 && pixels[index + 1] < 80 && pixels[index + 2] > 220 && pixels[index + 3] > 200) magenta++;
+      }
+      return magenta;
+    };
+    const painted = count_magenta();
+    const cover = chart.panes()[0].attach_primitive({
+      pane_views: () => [{
+        z_order: "top",
+        renderer(ctx) { ctx.rect(ctx.pane_left + 50, ctx.pane_top + 45, 260, 55, "#000000"); },
+      }],
+    });
+    const covered = count_magenta();
+    cover.detach();
+    handle.detach();
+    return { painted, covered };
+  });
+  expect(result.painted).toBeGreaterThan(30);
+  expect(result.covered).toBe(0);
+});
+
+test("plugin text_views paint through the WebGPU presented frame", async ({ page }) => {
+  await goto_fixture(page, "auto");
+  expect(await page.evaluate(() => window.__chart.backend())).toBe("webgpu");
+  await page.evaluate(() => {
+    window.__frame_text_handle = window.__chart.panes()[0].attach_primitive({
+      text_views: (info) => [{
+        text: "GPU FRAME", x: info.pane_left + 75, y: info.pane_top + 80,
+        font: "italic bold 24px Arial", color: "#ff00ff", baseline: "alphabetic",
+      }],
+    });
+  });
+  await settle_frames(page);
+  const image = PNG.sync.read(await page.screenshot({ animations: "disabled", fullPage: false }));
+  let magenta = 0;
+  for (let index = 0; index < image.data.length; index += 4) {
+    if (image.data[index] > 220 && image.data[index + 1] < 80 && image.data[index + 2] > 220 && image.data[index + 3] > 200) magenta++;
+  }
+  expect(magenta).toBeGreaterThan(30);
 });

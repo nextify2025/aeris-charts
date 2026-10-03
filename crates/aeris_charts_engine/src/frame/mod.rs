@@ -366,15 +366,21 @@ impl FrameInvalidation {
     }
 
     fn series(&mut self, id: SeriesId) {
+        let generation = self.series_geometry(id);
+        self.chrome = generation;
+        self.overlay = generation;
+        self.autoscale = generation;
+        self.axis = generation;
+    }
+
+    /// Only this series' own geometry layer; autoscale, axes, chrome, and overlay stay retained.
+    fn series_geometry(&mut self, id: SeriesId) -> u64 {
         let generation = self.tick();
         match self.series.iter_mut().find(|entry| entry.0 == id) {
             Some(entry) => entry.1 = generation,
             None => self.series.push((id, generation)),
         }
-        self.chrome = generation;
-        self.overlay = generation;
-        self.autoscale = generation;
-        self.axis = generation;
+        generation
     }
 
     fn series_generation(&self, id: SeriesId) -> u64 {
@@ -1187,6 +1193,11 @@ impl ChartEngine {
         self.primary_series().map_or(own, |primary| {
             own.max(self.frame_invalidation.series_generation(primary.id))
         })
+    }
+
+    /// A presentation change that only restyles this series' own primitives.
+    pub(crate) fn invalidate_frame_series_geometry(&mut self, id: SeriesId) {
+        self.frame_invalidation.series_geometry(id);
     }
 
     pub(crate) fn invalidate_frame_drawings(&mut self) {

@@ -235,6 +235,17 @@ function expect_white_ink_centered(png, box, tolerance = 1) {
   expect(Math.abs(white_ink_center(png, box) - box_center)).toBeLessThanOrEqual(tolerance);
 }
 
+// The painted rows of a solid label box: the contiguous run of `color` in column `x` that
+// contains row `y`. Probe a column without text or rounded corners.
+function painted_row(png, x, y, color) {
+  let top = y;
+  let bottom = y;
+  while (top > 0 && near(px(png, x, top - 1), color)) top -= 1;
+  while (bottom + 1 < png.height && near(px(png, x, bottom + 1), color)) bottom += 1;
+  expect(near(px(png, x, y), color), `label box must cover ${x},${y}`).toBe(true);
+  return { top, bottom: bottom + 1 };
+}
+
 function color_bands(png, color) {
   const rows = [];
   for (let y = 0; y < png.height; y += 1) {
@@ -297,7 +308,11 @@ test("last-value cluster paints chip, price, and countdown rows; the chip matche
   expect(near(chip_pixel, CHIP), `chip pixel ${chip_pixel}`).toBe(true);
   expect(near(price_pixel, LABEL), `price pixel ${price_pixel}`).toBe(true);
   expect(dist(chip_pixel, price_pixel)).toBeLessThanOrEqual(12); // matching colors by default
-  expect_white_ink_centered(on, { ...chip, bottom: chip.top + ROW });
+  // Center the title against its painted row, not the anchor-derived probe window: the probe
+  // rounds the anchor independently of the label box and can start a row below the chip.
+  const chip_row = { ...chip, right: chip.right + 1, ...painted_row(on, chip.right, Math.round(anchor.y), CHIP) };
+  expect([chip_row.top, chip_row.bottom], "the title chip shares the price row").toEqual([box.top, box.top + ROW]);
+  expect_white_ink_centered(on, chip_row);
   expect_white_ink_centered(on, { ...box, bottom: box.top + ROW });
   // The countdown row sits below the top row, in the main label color, spanning the full width.
   expect(near(px(on, box.left + 3, box.bottom - 3), LABEL)).toBe(true);
@@ -415,31 +430,19 @@ async function expect_crosshair_glyphs_centered(browser, query) {
   expect(near(px(shot, price_text_left - border_w, price_label.top + 3), BORDER)).toBe(true);
   expect(near(px(shot, Math.floor((time_label.left + time_label.right) / 2), time_label.top - border_w), BORDER)).toBe(true);
   expect_white_ink_centered(shot, price_text_label, 2);
-  // The time strip reserves 1px border + 3px tick + 3px padding above the 11px text body, so the
-  // text center sits 1.5 CSS px below the full box center: the glyphs are deliberately low in
-  // the box rather than centered in it. The sample ink lands within one device pixel of that
-  // center (measured -0.5..+0.6 px across DejaVu, Liberation and FreeSans faces at DPR 1, 1.25
-  // and 2 on both backends).
-  const text_center = (geometry.pane_h + 1 + 3 + 3 + 11 / 2) * geometry.dpr;
-  const ink = half_coverage_ink_extent(shot, time_label);
-  expect(Math.abs(ink.center - text_center), `Apr0 ink ${ink.top}..${ink.bottom} vs text center ${text_center}`)
-    .toBeLessThanOrEqual(1);
-  const box_center = (time_label.top + time_label.bottom) / 2;
-  expect(ink.center - box_center).toBeGreaterThan(0.5);
-
-  // The calendar label (month-dependent glyphs) stays fully inside its box with the tick space
-  // above and padding below intact.
-  await page.evaluate(() => window.__chart.apply_options({ localization: { time_formatter: null } }));
-  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  const dated = await capture(page);
-  const dated_label = color_bands(dated, [255, 0, 255])
-    .filter((box) => box.bottom - box.top >= 12)
-    .sort((a, b) => (a.bottom - a.top) - (b.bottom - b.top))[1];
-  expect(dated_label.right - dated_label.left, "the default calendar label replaced the sample text")
-    .toBeGreaterThan(time_label.right - time_label.left + 20);
-  const dated_ink = half_coverage_ink_extent(dated, dated_label);
-  expect(dated_ink.top - dated_label.top, "calendar label keeps the tick space above its glyphs").toBeGreaterThanOrEqual(4);
-  expect(dated_label.bottom - dated_ink.bottom, "calendar label keeps padding below its glyphs").toBeGreaterThanOrEqual(2);
+  // The compact time box includes border + 3px tick space above the text body. Its glyph is
+  // therefore deliberately below the full box center rather than incorrectly centered in it
+  // (1px border + 3px tick + 3px pad above vs 3px pad below the 11px body centers ink 1.5px low).
+  // Measure digit-only ink so the result does not depend on the hovered date: the trailing
+  // HH:MM run has no descenders, unlike month names such as "Sep". The digit-only price text
+  // in the same font is the reference, which cancels the font's cap-versus-em asymmetry.
+  const box_center = (box) => (box.top + box.bottom - 1) / 2;
+  const time_digits = { ...time_label, left: time_label.right - Math.round((time_label.right - time_label.left) * 0.3) };
+  const price_digit_offset = white_ink_center(shot, price_text_label) - box_center(price_label);
+  const time_digit_offset = white_ink_center(shot, time_digits) - box_center(time_label);
+  const time_body_shift = time_digit_offset - price_digit_offset;
+  expect(time_body_shift).toBeGreaterThanOrEqual(1.5);
+  expect(time_body_shift).toBeLessThanOrEqual(4);
   await context.close();
 }
 

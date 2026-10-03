@@ -73,6 +73,72 @@ for (const backend of ["canvas2d", "webgpu"]) {
   });
 }
 
+function count_anchor_border(png) {
+  // Semantic primary #0091ff, the selection anchor border.
+  let n = 0;
+  for (let o = 0; o < png.data.length; o += 4) {
+    if (Math.abs(png.data[o]) <= 30 && Math.abs(png.data[o + 1] - 145) <= 30 && Math.abs(png.data[o + 2] - 255) <= 30) n += 1;
+  }
+  return n;
+}
+
+async function chart_capture(page) {
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const data_url = await page.evaluate(() => window.__chart.take_screenshot().toDataURL("image/png"));
+  return PNG.sync.read(Buffer.from(data_url.split(",")[1], "base64"));
+}
+
+test("volume profile is hovered, selected, deselected and deleted like other indicators", async ({ page }) => {
+  await page.goto("/?backend=canvas2d");
+  await page.waitForFunction(() => window.__chart?.backend?.() === "canvas2d");
+  const spot = await page.evaluate(() => {
+    const chart = window.__chart;
+    window.__main.apply_options({ visible: false });
+    // The profile follows its price series' visibility, so the prices stay visible.
+    const prices = chart.add_series("candlestick");
+    const times = window.__data.slice(-3).map((bar) => bar.time);
+    prices.set_data(times.map((time) => ({ time, open: 101, high: 104, low: 100, close: 102 })));
+    const volume = chart.add_series("histogram", { visible: false });
+    volume.set_data([{ time: times[0], value: 40 }, { time: times[2], value: 80 }]);
+    chart.time_scale().set_visible_range({ from: times[0], to: times[2] });
+    const profile = chart.add_volume_profile(prices, volume, { rows: 4 });
+    window.__profile_select = { profile };
+    const poc = profile.snapshot().poc;
+    const bounds = document.getElementById("chart_container").getBoundingClientRect();
+    return {
+      x: bounds.left + chart.wasm.pane_left() + chart.time_scale().width() - 60,
+      y: bounds.top + prices.price_to_coordinate(poc),
+    };
+  });
+  const cursor = () => page.evaluate(() => {
+    const canvases = document.querySelectorAll("#chart_container canvas");
+    return canvases[canvases.length - 1].style.cursor;
+  });
+  const selected = () => page.evaluate(() => window.__profile_select.profile.selected());
+
+  const before = count_anchor_border(await chart_capture(page));
+  await page.mouse.move(spot.x, spot.y);
+  await expect.poll(cursor).toBe("pointer");
+  await page.mouse.click(spot.x, spot.y);
+  expect(await selected()).toBe(true);
+  expect(count_anchor_border(await chart_capture(page)), "selection anchors paint").toBeGreaterThan(before + 20);
+
+  await page.keyboard.press("Escape");
+  expect(await selected()).toBe(false);
+  expect(count_anchor_border(await chart_capture(page))).toBeLessThanOrEqual(before);
+
+  // Outlast the engine's 500 ms double-click window so the next press is a fresh click.
+  await page.waitForTimeout(550);
+  await page.mouse.click(spot.x, spot.y);
+  expect(await selected()).toBe(true);
+  await page.keyboard.press("Delete");
+  const stale = await page.evaluate(() => {
+    try { window.__profile_select.profile.snapshot(); } catch (error) { return error.code; }
+    return null;
+  });
+  expect(stale).toBe("stale_handle");
+});
+
 test("demo volume profile uses the built-in calculation", async ({ page }) => {
   await page.goto("/?backend=canvas2d");
   await page.waitForFunction(() => window.__chart?.backend?.() === "canvas2d");

@@ -2756,6 +2756,22 @@ class series_impl implements series_api {
     this.assert_live();
     return this.chart.wasm.add_native_delta_tooltip(this.id, options_json);
   }
+  native_set_brushable_area(options_json: string): boolean {
+    this.assert_live();
+    const accepted = this.chart.wasm.set_native_brushable_area(this.id, options_json);
+    if (accepted) this.chart.repaint();
+    return accepted;
+  }
+  native_brushable_area_range_json(): string {
+    this.assert_live();
+    return this.chart.wasm.native_brushable_area_range_json(this.id);
+  }
+  native_clear_brushable_area(): boolean {
+    this.assert_live();
+    const accepted = this.chart.wasm.clear_native_brushable_area(this.id);
+    if (accepted) this.chart.repaint();
+    return accepted;
+  }
   native_set_area_brush_state(state_json: string): boolean {
     this.assert_live();
     const changed = this.chart.wasm.set_series_area_brush_state(this.id, state_json);
@@ -2895,6 +2911,28 @@ function native_series(series: series_api): series_impl {
 /** Package-internal controller for transient brush styling on a built-in Area series. */
 export function set_native_area_brush_state(series: series_api, state_json: string): boolean {
   return native_series(series).native_set_area_brush_state(state_json);
+}
+
+/** Package-internal attachment for the engine-owned brushable Area composition. */
+export function attach_native_brushable_area(series: series_api, options_json: string): {
+  active_range_json(): string;
+  clear(): boolean;
+  detach(): void;
+} {
+  const owner = native_series(series);
+  if (!owner.native_set_brushable_area(options_json)) {
+    throw new AerisChartsError("invalid_data", "engine rejected brushable Area options");
+  }
+  let attached = true;
+  return {
+    active_range_json: () => owner.native_brushable_area_range_json(),
+    clear: () => owner.native_clear_brushable_area(),
+    detach() {
+      if (!attached) return;
+      attached = false;
+      owner.native_set_brushable_area("null");
+    },
+  };
 }
 
 function native_handle(series: series_impl, id: number): native_primitive_handle {
@@ -4104,6 +4142,7 @@ export interface resolved_gestures {
   pan_vert_touch: boolean;
   wheel_scroll: boolean;
   wheel_zoom: boolean;
+  price_axis_wheel_zoom: boolean;
   pinch_zoom: boolean;
   axis_dblclick_reset_time: boolean;
   axis_dblclick_reset_price: boolean;
@@ -4355,6 +4394,7 @@ export class chart_impl implements chart_api {
     pan_vert_touch: true,
     wheel_scroll: true,
     wheel_zoom: true,
+    price_axis_wheel_zoom: false,
     pinch_zoom: true,
     axis_dblclick_reset_time: true,
     axis_dblclick_reset_price: true,
@@ -4397,6 +4437,7 @@ export class chart_impl implements chart_api {
   private last_ts_height: number;
   private auto_size: boolean;
   private dpr_query: MediaQueryList | null = null;
+  private reduced_motion_query: MediaQueryList | null = null;
   private readonly dpr_change_handler = (): void => {
     if (this.removed || !this.auto_size) return;
     const bounds = this.container.getBoundingClientRect();
@@ -4426,15 +4467,6 @@ export class chart_impl implements chart_api {
   private text_editor_label = "";
   /** The element focused when the editor opened (an accessibility target regains focus). */
   private text_editor_return_focus: Element | null = null;
-  /**
-   * The drawing selection snapshotted at pointer-DOWN, before the engine's drag grab selects
-   * the hit (gestures.ts calls `note_drawing_press`). `emit_click` reads it for the public reference's
-   * two-step text editing: a click opens typing mode only when the text drawing was already
-   * selected when the press began; the first click just selects (focus border). A double-click
-   * (`activate_drawing_double_click`) needs it too, plus the engine's word that the point is on
-   * that drawing: presses a trading object or the alert widget consumed never refresh it.
-   */
-  private text_press_selected: number | null = null;
   /**
    * Re-anchor the open editor after any repaint-driving change (wheel zoom/scroll, pinch,
    * resize, data update): it re-queries the anchor's coordinates from the settled engine
@@ -4530,16 +4562,17 @@ export class chart_impl implements chart_api {
     this.accessibility_handle = handle;
   }
 
-  trading_hover_at(x: number, y: number): boolean {
-    return this.wasm.trading_hover_at(x, y);
-  }
-
   alert_create_hit_at(x: number, y: number): boolean {
     return this.wasm.alert_create_hit_at(x, y);
   }
 
   activate_alert_create_at(x: number, y: number): boolean {
     const activated = this.wasm.activate_alert_create_at(x, y);
+    this.dispatch_alert_create_requests();
+    return activated;
+  }
+
+  private dispatch_alert_create_requests(): void {
     const requests = JSON.parse(this.wasm.take_alert_create_requests_json()) as engine_alert_create_request[];
     for (const request of requests) {
       const action: crosshair_action_request = {
@@ -4550,7 +4583,6 @@ export class chart_impl implements chart_api {
       };
       for (const handler of this.crosshair_action_handlers) handler(action);
     }
-    return activated;
   }
 
   trading_hit_at(x: number, y: number): trading_hit | null {
@@ -4564,10 +4596,6 @@ export class chart_impl implements chart_api {
   trading_cursor_at(x: number, y: number): string | null {
     const cursor = this.wasm.trading_cursor_at(x, y);
     return cursor === 2 ? "grab" : cursor === 1 ? "pointer" : null;
-  }
-
-  arm_trading_tooltip(): boolean {
-    return this.wasm.arm_trading_tooltip();
   }
 
   clear_trading_hover(): boolean {
@@ -4643,35 +4671,6 @@ export class chart_impl implements chart_api {
     const activated = this.wasm.trading_activate_at(x, y);
     this.trading_handle.dispatch_pending_intents();
     return activated;
-  }
-
-  /** Standard gesture forwarding for the engine-owned delta-tooltip interaction model. */
-  native_delta_tooltip_mouse_down(x: number, shift: boolean): boolean {
-    return this.wasm.native_delta_tooltip_mouse_down(x, shift);
-  }
-
-  native_delta_tooltip_mouse_move(x: number): void {
-    if (this.wasm.native_delta_tooltip_mouse_move(x)) this.notify_delta_tooltip_ranges();
-  }
-
-  native_delta_tooltip_mouse_up(): void {
-    if (this.wasm.native_delta_tooltip_mouse_up()) this.notify_delta_tooltip_ranges();
-  }
-
-  native_delta_tooltip_touch_move(xs: Float64Array): boolean {
-    const changed = this.wasm.native_delta_tooltip_touch_move(xs);
-    if (changed) this.notify_delta_tooltip_ranges();
-    return this.wasm.native_delta_tooltip_active();
-  }
-
-  native_delta_tooltip_touch_active(): boolean {
-    return this.wasm.native_delta_tooltip_active();
-  }
-
-  native_delta_tooltip_leave(): boolean {
-    const changed = this.wasm.native_delta_tooltip_leave();
-    if (changed) this.notify_delta_tooltip_ranges();
-    return changed;
   }
 
   add_delta_tooltip_range_listener(listener: () => void): () => void {
@@ -6219,6 +6218,14 @@ export class chart_impl implements chart_api {
         if (result === null) throw new AerisChartsError("stale_handle", "volume-profile indicator has been removed");
         return result;
       },
+      selected: () => !removed && this.wasm.selected_volume_profile_indicator() === id,
+      select: (selected = true) => {
+        read_options();
+        const current = this.wasm.selected_volume_profile_indicator() === id;
+        if (selected === current) return;
+        this.wasm.set_selected_volume_profile_indicator(selected ? id : 0);
+        this.repaint();
+      },
       remove: () => {
         if (removed) return;
         if (this.wasm.remove_native_primitive(id)) this.repaint();
@@ -6479,28 +6486,18 @@ export class chart_impl implements chart_api {
   }
 
   /**
-   * Refresh the hover hit-test state (Phase C-d) for a crosshair at pane CSS px (x, y): runs
-   * the engine's series hit test plus the primitives' `hit_test`, stashes the result for
-   * `build_params`, and updates the engine's hovered series for `hoveredSeriesOnTop` (the
-   * caller repaints, so the z-bump lands on the next frame). Called by the gesture
-   * recognizer on every crosshair move.
+   * Read the engine-arbitrated hover (Phase C-d) after pointer input and stash it for
+   * `build_params`. The engine already updated hover promotion, the hover ring, and the cursor;
+   * the gesture recognizer repaints only when the engine reports a pending frame.
    */
-  update_hover(x: number, y: number): void {
-    const previous_object = this.hover?.object_id ?? null;
-    this.hover = JSON.parse(this.wasm.hover_at(x, y)) as chart_impl["hover"];
-    // The hover ring (text drawings' dimmed focus border) changes with the hovered object:
-    // repaint exactly on transitions, even when the crosshair itself is hidden.
-    if ((this.hover?.object_id ?? null) !== previous_object) this.repaint();
+  sync_hover(): void {
+    this.hover = JSON.parse(this.wasm.controller_hover_json()) as chart_impl["hover"];
   }
 
-  /** Clear the hover state (cursor left the chart) and release the z-bump; caller repaints. */
+  /** Clear the hover state (cursor left the chart) and release the z-bump. */
   clear_hover(): void {
-    const had_object = this.hover?.object_id != null;
     this.hover = null;
     this.wasm.clear_hover();
-    // A visible hover ring (drawing under the cursor) must paint out even if the caller
-    // skips its own repaint.
-    if (had_object) this.repaint();
   }
 
   /** The cursor a primitive's `hit_test` reports for the current hover, or `null`. */
@@ -6531,54 +6528,6 @@ export class chart_impl implements chart_api {
     };
     for (const h of this.crosshair_subs) h(params);
   }
-  /**
-   * Snapshot the drawing selection at pointer-down (gestures.ts, before the engine's drag
-   * grab selects the hit). Drives the two-step text-editing rule in `emit_click`.
-   */
-  note_drawing_press(): void {
-    this.text_press_selected = this.wasm.selected_drawing() ?? null;
-  }
-
-  /** Apply the chart-owned selection/editing work shared by click and drawing-owned double-click. */
-  private apply_primary_click(x: number, y: number): void {
-    // industry-standard click-to-select: select the series under the click (the frame build
-    // paints anchor points on it) and clear the selection on empty pane space. The hover
-    // hit-test refreshes at the click point first, so a click without a preceding move still
-    // arbitrates correctly.
-    this.update_hover(x, y);
-    // industry-standard click-to-select, drawings first: a drawing hit selects it and clears
-    // the series selection; a miss clears the drawing selection and falls through to the
-    // series under the click (or clears that on empty pane space).
-    // A drawing's own text under the click selects it (the engine answers for a trend line's
-    // label and prompt and for the text of every line, channel, Fibonacci, pitchfork, pattern,
-    // and shape tool, which an unselected shape's interior would otherwise not hit).
-    const label_hit = Number(this.wasm.drawing_text_hit_at(x, y));
-    const drawing_hit = label_hit > 0 || this.wasm.select_drawing_at(x, y);
-    if (label_hit > 0) this.wasm.set_selected_drawing(label_hit);
-    const general_hit = !drawing_hit && this.hover?.general_hit != null;
-    if (general_hit) this.wasm.select_general_hovered();
-    else this.wasm.clear_general_selection();
-    this.wasm.set_selected_series(
-      drawing_hit || general_hit ? undefined : (this.hover?.series_id ?? undefined),
-    );
-    // Text drawings: empty labels open typing mode on the first click (there is no ink to
-    // "focus" otherwise). Non-empty labels follow the public reference's two-step model — first click
-    // selects (focus border), a click opens typing mode only when already selected at press.
-    // Every other drawing's text opens on a double-click, Enter, or F2 (`edit_drawing_text`).
-    if (drawing_hit) {
-      const selected = this.selected_drawing();
-      if (selected !== null && selected.kind() === "trend_line" && selected.id === label_hit) {
-        this.open_trend_label_editor(selected);
-      } else if (selected !== null && selected.kind() === "text") {
-        const empty = !(selected.options().text ?? "").trim();
-        if (empty || this.text_press_selected === selected.id) {
-          this.open_text_editor(selected);
-        }
-      }
-    }
-    this.repaint();
-  }
-
   remove_general_series_handle(series: general_series_impl): void {
     const live = this.general_series_by_id.get(series.id);
     if (live !== series) return;
@@ -6590,43 +6539,22 @@ export class chart_impl implements chart_api {
     this.repaint();
   }
 
-  /** Emit a click event (called by the gesture recognizer). */
-  emit_click(x: number, y: number): void {
+  /** The controller has already applied selection and editing for this pane click. */
+  emit_controller_click(x: number, y: number): void {
     // A click/tap is a discrete, intentional action, so it is a good moment to announce the point
     // to assistive tech (unlike mouse hover, which would flood the live region).
     this.announce(x, y);
-    this.apply_primary_click(x, y);
     if (this.click_subs.size === 0) return;
     const params = this.build_params(x, y);
-    for (const h of this.click_subs) h(params);
+    for (const handler of this.click_subs) handler(params);
   }
 
   /**
-   * Let an explicitly hit Aeris drawing consume the second click without a pane click event: the
-   * text tool and a trend line's label re-run their click activation, and any other selected
-   * drawing whose text the engine edits in place (a trend line's body included) opens the inline
-   * editor. The first click of a pair on an
-   * unselected drawing's text selects it (`apply_primary_click`), so a double-click on the text
-   * of a line, channel, Fibonacci, pitchfork, pattern, or shape tool reaches the editor. Host
-   * `dbl_click` subscribers still run afterwards.
+   * Present the engine controller's already-open text-edit session (a double-click on a drawing,
+   * or a click on a selected text drawing) in the DOM surface its layout describes.
    */
-  activate_drawing_double_click(x: number, y: number): void {
-    const selected = this.selected_drawing();
-    if (selected === null || selected.id !== this.text_press_selected) return;
-    // The press snapshot says the drawing was selected, not that this click is on it: a press
-    // another owner consumed (a trading object, the alert widget) leaves the selection and the
-    // snapshot behind. The engine says whether the point still belongs to the selected drawing.
-    if (this.wasm.drawing_at(x, y) !== selected.id) return;
-    // The text tool and a trend line's own label re-run their click activation (its prompt and
-    // two-step focus); every other double-click on the selected drawing, a trend line's body
-    // included, opens the editor.
-    const on_trend_label = selected.kind() === "trend_line"
-      && Number(this.wasm.drawing_text_hit_at(x, y)) === selected.id;
-    if (selected.kind() === "text" || on_trend_label) {
-      this.apply_primary_click(x, y);
-    } else {
-      this.edit_drawing_text(selected.id);
-    }
+  open_controller_text_editor(id: number): void {
+    this.edit_drawing_text(id, true);
   }
 
   /** Enter or F2 on the chart: edit the selected drawing's text in place, when it has one. */
@@ -7003,7 +6931,7 @@ export class chart_impl implements chart_api {
     return this.wasm.drawing_tool_sequence_active();
   }
 
-  private drawing_created(created_id: number): boolean {
+  private drawing_created(created_id: number, controller_owned = false): boolean {
     if (created_id <= 0) return false;
     const info = (JSON.parse(this.wasm.drawings_json()) as drawing_info[]).find((drawing) => drawing.id === created_id);
     if (info === undefined) return false;
@@ -7014,7 +6942,7 @@ export class chart_impl implements chart_api {
     for (const handler of this.tool_change_subs) handler(null);
     // The engine decides which tools start in the editor (the text tool and the annotation boxes
     // that begin from a default text); the host presents the one its layout describes.
-    if (this.wasm.drawing_requests_text_edit(created_id)) this.edit_drawing_text(created_id);
+    if (this.wasm.drawing_requests_text_edit(created_id)) this.edit_drawing_text(created_id, controller_owned);
     return true;
   }
 
@@ -7102,26 +7030,26 @@ export class chart_impl implements chart_api {
     this.open_inline_editor(drawing, "standalone_text");
   }
 
-  private open_trend_label_editor(drawing: drawing_api): void {
-    this.open_inline_editor(drawing, "run_label");
-  }
-
   /**
    * Open the inline editor on a drawing's own text (Enter or F2 on a selected drawing, a
    * double-click on it, or placement of a tool that starts in the editor): whatever the engine
    * reports editable, presented as the surface its layout describes. The engine refuses a
    * drawing whose text is entirely outside its pane's plot (the same rule the native hosts get),
-   * so no invisible editor captures the keys. Returns whether an editor opened.
+   * so no invisible editor captures the keys. `controller_owned` presents a session the engine
+   * input controller already opened (the engine keeps its caret hidden for the DOM surface).
+   * Returns whether an editor opened.
    */
-  edit_drawing_text(id: number): boolean {
+  edit_drawing_text(id: number, controller_owned = false): boolean {
     if (!this.wasm.drawing_text_editable(id)) return false;
     const layout = this.text_edit_layout(id);
     if (layout === null) return false;
     const info = (JSON.parse(this.wasm.drawings_json()) as drawing_info[]).find((d) => d.id === id);
     if (info === undefined) return false;
     const drawing = new drawing_impl(this, info.id, info.kind, info.pane_index);
-    if (layout.multiline) this.open_part_label_editor(drawing);
-    else this.open_inline_editor(drawing, info.kind === "text" ? "standalone_text" : "run_label");
+    if (layout.multiline) this.open_part_label_editor(drawing, controller_owned);
+    else {
+      this.open_inline_editor(drawing, info.kind === "text" ? "standalone_text" : "run_label", controller_owned);
+    }
     return this.text_editor !== null && this.text_editor_id === id;
   }
 
@@ -7302,12 +7230,14 @@ export class chart_impl implements chart_api {
   private open_inline_editor(
     drawing: drawing_api,
     mode: "standalone_text" | "run_label",
+    controller_owned = false,
   ): void {
     this.close_text_editor(true);
     const return_focus = document.activeElement;
     // The engine session keeps the canvas label under the caret overlay and records the edit as
     // one undo step; it refuses a locked, hidden, or otherwise uneditable drawing.
-    if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
+    if (controller_owned) this.wasm.set_drawing_text_edit_paint_caret(false);
+    else if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
     let layout = this.text_edit_layout(drawing.id);
     if (layout === null || layout.multiline) {
       this.wasm.cancel_drawing_text_edit();
@@ -7417,6 +7347,7 @@ export class chart_impl implements chart_api {
         editor.style.width = `${Math.ceil(w) + 1}px`;
       }
       push_live_text();
+      position_editor();
     };
     editor.addEventListener("keyup", position_caret);
     editor.addEventListener("pointerup", position_caret);
@@ -7452,10 +7383,11 @@ export class chart_impl implements chart_api {
    * a price label's price) and relays it out after every keystroke, since a box can grow in any
    * direction (a comment grows upward, a centered callout both ways). The text may span lines.
    */
-  private open_part_label_editor(drawing: drawing_api): void {
+  private open_part_label_editor(drawing: drawing_api, controller_owned = false): void {
     this.close_text_editor(true);
     const return_focus = document.activeElement;
-    if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
+    if (controller_owned) this.wasm.set_drawing_text_edit_paint_caret(false);
+    else if (!this.wasm.begin_drawing_text_edit(drawing.id, false)) return;
     let layout = this.text_edit_layout(drawing.id);
     if (layout === null) {
       this.wasm.cancel_drawing_text_edit();
@@ -7580,7 +7512,7 @@ export class chart_impl implements chart_api {
     // handle_scroll / handle_scale / kinetic_scroll / tracking_mode (gestures), the pane-resize
     // toggle, and localization (JS callbacks) are package-level; intercept and strip them so only
     // engine-owned, JSON-serializable options reach the wasm store.
-    const { theme, handle_scroll, handle_scale, kinetic_scroll, wheel_behavior, tracking_mode, localization, accessibility, ...rest } =
+    const { theme, handle_scroll, handle_scale, kinetic_scroll, wheel_behavior, price_axis_wheel_zoom, tracking_mode, localization, accessibility, ...rest } =
       options as deep_partial<chart_options> & {
         theme?: theme_name;
         handle_scroll?: boolean | handle_scroll_options;
@@ -7624,6 +7556,7 @@ export class chart_impl implements chart_api {
       this.apply_gesture_options(handle_scroll, handle_scale, kinetic_scroll, tracking_mode);
     }
     if (wheel_behavior !== undefined) this.gestures_cfg.wheel_behavior = wheel_behavior;
+    if (price_axis_wheel_zoom !== undefined) this.gestures_cfg.price_axis_wheel_zoom = price_axis_wheel_zoom;
     this.sync_touch_action();
     if (localization !== undefined) this.apply_localization(localization);
     if (accessibility !== undefined) {
@@ -7663,20 +7596,25 @@ export class chart_impl implements chart_api {
     }
   }
 
-  nudge_selected_drawing(dx: number, dy: number, handle: number | null): boolean {
-    const changed = this.wasm.nudge_selected_drawing(dx, dy, handle ?? -1);
-    if (changed) this.repaint();
-    return changed;
+  /**
+   * Forward a key pressed on an accessibility focus target (`price-axis:<pane>`, `time-axis`,
+   * `separator:<pane>`, `drawing:<id>`) to the engine input controller. Returns whether it was
+   * consumed.
+   */
+  input_target_key(target: string, event: KeyboardEvent): boolean {
+    const modifiers = (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0)
+      | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
+    if (!this.wasm.input_target_key_down(target, event.key, modifiers, this.keyboard_gates())) {
+      return false;
+    }
+    this.consume_input_events();
+    if (this.wasm.frame_pending()) this.repaint();
+    return true;
   }
 
-  /** Keyboard-reachable handle count of a drawing (0 when unknown or not placeable). */
-  drawing_handle_count(id: number): number {
-    return Math.max(0, this.wasm.drawing_handle_count(id));
-  }
-
-  select_drawing_for_accessibility(id: number): void {
-    this.wasm.set_selected_drawing(id);
-    this.repaint();
+  /** The open keyboard drawing edit: the drawing and its focused anchor (`null` moves it all). */
+  drawing_edit_session(): { id: number; anchor: number | null } | null {
+    return JSON.parse(this.wasm.drawing_edit_session_json()) as { id: number; anchor: number | null } | null;
   }
 
   /** DPR-only display transitions do not reliably resize CSS bounds on every WebKit host. */
@@ -7701,6 +7639,10 @@ export class chart_impl implements chart_api {
 
   chart_element(): HTMLElement {
     return this.container;
+  }
+
+  format_time_label(value: time): string {
+    return this.wasm.format_time_label(time_to_utc_seconds(value));
   }
 
   /** Install the host price/time formatters (reference `localization`). Callbacks cross into wasm. */
@@ -7770,9 +7712,11 @@ export class chart_impl implements chart_api {
   }
 
   /** Whether the user has requested reduced motion (gates kinetic scroll). */
+  /** Read on every pointer move, so the live `MediaQueryList` is created once and reused. */
   prefers_reduced_motion(): boolean {
-    return this.container.ownerDocument.defaultView?.matchMedia?.("(prefers-reduced-motion: reduce)")
-      .matches === true;
+    this.reduced_motion_query ??= this.container.ownerDocument.defaultView
+      ?.matchMedia?.("(prefers-reduced-motion: reduce)") ?? null;
+    return this.reduced_motion_query?.matches === true;
   }
 
   /** Current resolved gesture toggles (read by the gesture recognizer). */
@@ -7797,9 +7741,69 @@ export class chart_impl implements chart_api {
     return this.gestures_cfg.axis_dblclick_reset_time;
   }
 
+  /** The switches above and reduced motion as the engine's key-gate word (bit 0 reduced motion,
+   *  1 scroll, 2 zoom, 3 reset), passed with every key so the engine's keyboard bindings, not the
+   *  host, keep a fixed view fixed. */
+  keyboard_gates(): number {
+    return (this.prefers_reduced_motion() ? 1 : 0) | (this.keyboard_time_scroll_enabled() ? 2 : 0)
+      | (this.keyboard_time_zoom_enabled() ? 4 : 0) | (this.keyboard_time_reset_enabled() ? 8 : 0);
+  }
+
   /** Whether `remove()` ran; host frame loops stop instead of touching the freed engine. */
   is_removed(): boolean {
     return this.removed;
+  }
+
+  has_chart_context_subscribers(): boolean {
+    return this.chart_context_subs.size > 0;
+  }
+
+  /** Perform platform effects requested by the bounded engine input controller. */
+  consume_input_events(complete_press = false): void {
+    type controller_event =
+      | { kind: "drawing_created"; id: number }
+      | { kind: "click"; x: number; y: number }
+      | { kind: "double_click"; x: number; y: number }
+      | { kind: "text_editor_opened"; id: number }
+      | { kind: "remove_series"; id: number }
+      | { kind: "crosshair_left" }
+      | { kind: "context_menu"; x: number; y: number }
+      | { kind: "delta_tooltip_changed" };
+    const events = JSON.parse(this.wasm.take_input_events_json()) as controller_event[];
+    for (const event of events) {
+      switch (event.kind) {
+        case "drawing_created":
+          this.drawing_created(event.id, true);
+          break;
+        case "click":
+          this.emit_controller_click(event.x, event.y);
+          break;
+        case "double_click":
+          this.emit_dbl_click(event.x, event.y);
+          break;
+        case "text_editor_opened":
+          this.open_controller_text_editor(event.id);
+          break;
+        case "remove_series": {
+          const series = this.series_by_id.get(event.id) ?? this.general_series_by_id.get(event.id);
+          if (series) this.remove_series(series);
+          break;
+        }
+        case "crosshair_left":
+          this.emit_crosshair_left();
+          break;
+        case "context_menu":
+          this.emit_chart_context(event.x, event.y);
+          break;
+        case "delta_tooltip_changed":
+          this.notify_delta_tooltip_ranges();
+          break;
+      }
+    }
+    if (complete_press) {
+      this.trading_handle.dispatch_pending_intents();
+      this.dispatch_alert_create_requests();
+    }
   }
 
   options(): unknown {
@@ -8249,7 +8253,10 @@ export class chart_impl implements chart_api {
     this.accessibility_handle?.detach();
     this.accessibility_handle = null;
     wasm.dispose();
-    wasm.free();
+    // Device-loss notifications can dispose a chart while a WASM frame callback still holds a
+    // borrowed wrapper. The heavy resources are released above; free the wrapper after that
+    // callback unwinds so wasm-bindgen never consumes a borrowed Rust value.
+    queueMicrotask(() => wasm.free());
     this.wasm_instance = null;
     this.gpu_pane.remove();
     this.fallback_pane.remove();

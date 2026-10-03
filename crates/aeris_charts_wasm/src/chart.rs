@@ -5,8 +5,8 @@
 //!   backend-neutral primitives;
 //! - WebGPU consumes every engine primitive in one render pass, with a final unscissored top-layer
 //!   group, while Canvas2D executes the same retained frame as the fallback and screenshot path;
-//! - the transparent DOM overlay remains an input surface and a compatibility escape hatch only
-//!   for plugin `text_views` that cannot yet enter the shared frame.
+//! - the transparent DOM overlay remains an input surface; plugin `text_views` enter the same
+//!   ordered pane frame as other primitive output.
 //!
 //! Axis text is browser-rasterized into the shared WebGPU atlas. At fractional DPR, browser font
 //! hinting and WebGPU's 4x-MSAA rounded-label coverage can leave bounded antialiasing differences
@@ -59,12 +59,12 @@ use aeris_charts_core::scale::price_scale_core::PriceScaleMode;
 use aeris_charts_engine::{
     crosshair_mode_from_u8, line_style_from_u8, marker_pos, marker_shape, AccountId, AlertId,
     AlertLine, AlertSnapshot, AxisFrame, AxisLabel, AxisLabelCorners, AxisTextAlign,
-    AxisTextMidpoint, BrushRange, BrushStyle, ChartEngine, DrawingKind, DrawingModifiers,
-    ExecutionId, FeatureSeriesKind, GestureResolver, GestureUpdate, InputDevice, InputModifiers,
-    InputTarget, InstrumentMetadata, Marker, OrderId, PaneId, PointerSample, PositionId,
-    PriceFormatterFn, PriceScaleId, PriceScaleSide, PriceScaleTarget,
-    PrimitiveAutoscaleContribution, SeriesKind, TickMarkFormatterFn, TimeFormatterFn,
-    TradingExecution, TradingPosition, TradingSnapshot, TradingStyleOptions, WorkingOrder,
+    AxisTextMidpoint, BrushRange, BrushStyle, ChartEngine, DrawingId, DrawingKind,
+    DrawingModifiers, ExecutionId, FeatureSeriesKind, InputDevice, InputModifiers,
+    InstrumentMetadata, Marker, OrderId, PaneId, PositionId, PriceFormatterFn, PriceScaleId,
+    PriceScaleSide, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
+    TickMarkFormatterFn, TimeFormatterFn, TradingExecution, TradingPosition, TradingSnapshot,
+    TradingStyleOptions, WorkingOrder,
 };
 use aeris_charts_render::canvas2d::{
     execute as execute_canvas2d, Canvas2d, Viewport as CanvasViewport,
@@ -119,6 +119,51 @@ fn warn_backend_fallback(status: &BackendStatus) {
         )
         .into(),
     );
+}
+
+/// Canvas's alphabetic font bounds give the same cap-center contract as GPUI's native
+/// ascent/descent and cap height. The returned offset is in the run's media-pixel font units.
+fn browser_text_cap_center(
+    ctx: &CanvasRenderingContext2d,
+    size: f64,
+    family: &str,
+    weight: u16,
+    italic: bool,
+) -> f64 {
+    ctx.set_font(&aeris_charts_render::draw_list::text_font_spec(
+        size as f32,
+        family,
+        weight,
+        italic,
+    ));
+    ctx.set_text_baseline("alphabetic");
+    if let Ok(metrics) = ctx.measure_text("H") {
+        let cap_height =
+            metrics.actual_bounding_box_ascent() + metrics.actual_bounding_box_descent();
+        let ascent = metrics.font_bounding_box_ascent();
+        let descent = metrics.font_bounding_box_descent();
+        let offset = (cap_height - ascent + descent) / 2.0;
+        if cap_height.is_finite()
+            && cap_height > 0.0
+            && ascent.is_finite()
+            && ascent > 0.0
+            && descent.is_finite()
+            && descent >= 0.0
+            && offset.is_finite()
+        {
+            return offset;
+        }
+    }
+    // Older Canvas implementations can omit fontBoundingBox*. The same cap run measured
+    // against the middle baseline still supplies a bounded optical correction.
+    ctx.set_text_baseline("middle");
+    ctx.measure_text("H")
+        .ok()
+        .map(|metrics| {
+            (metrics.actual_bounding_box_ascent() - metrics.actual_bounding_box_descent()) / 2.0
+        })
+        .filter(|offset| offset.is_finite())
+        .unwrap_or(0.0)
 }
 
 fn validation_diagnostics_json(
@@ -216,8 +261,6 @@ fn trading_result_json(result: Result<(), aeris_charts_engine::ChartError>) -> S
     }
 }
 
-const INPUT_UPDATE_LEN: usize = 12;
-
 fn input_device_from_u8(value: u8) -> InputDevice {
     match value {
         1 => InputDevice::Touch,
@@ -226,69 +269,102 @@ fn input_device_from_u8(value: u8) -> InputDevice {
     }
 }
 
-fn input_target_from_u8(value: u8) -> InputTarget {
-    match value {
-        1 => InputTarget::Drawing,
-        2 => InputTarget::Trading,
-        3 => InputTarget::PriceAxis,
-        4 => InputTarget::TimeAxis,
-        5 => InputTarget::Separator,
-        6 => InputTarget::Alert,
-        _ => InputTarget::Pane,
+fn input_modifiers_from_u8(modifiers: u8) -> InputModifiers {
+    InputModifiers {
+        shift: modifiers & 1 != 0,
+        control: modifiers & 2 != 0,
+        alt: modifiers & 4 != 0,
+        meta: modifiers & 8 != 0,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn pointer_sample(
+/// ABI for host pointer policy toggles: mouse/touch pan, axis scale, pane resize, kinetic,
+/// reduced motion, axis double-click reset, pinch zoom, and touch tracking exit mode.
+fn set_controller_pointer_options(engine: &mut aeris_charts_engine::ChartEngine, bits: u16) {
+    let mut options = engine.interaction_options();
+    options.pan = bits & (1 << 0) != 0;
+    options.axis_scale_price = bits & (1 << 1) != 0;
+    options.axis_scale_time = bits & (1 << 2) != 0;
+    options.panes_resize = bits & (1 << 3) != 0;
+    options.kinetic_mouse = bits & (1 << 4) != 0;
+    options.reduced_motion = bits & (1 << 5) != 0;
+    options.axis_double_click_reset_time = bits & (1 << 6) != 0;
+    options.axis_double_click_reset_price = bits & (1 << 7) != 0;
+    options.touch_pan = bits & (1 << 8) != 0;
+    options.kinetic_touch = bits & (1 << 9) != 0;
+    options.pinch_zoom = bits & (1 << 10) != 0;
+    options.touch_tracking_exit_on_end = bits & (1 << 11) != 0;
+    engine.set_interaction_options(options);
+}
+
+/// ABI for the host switches keyboard bindings honour, carried with every key like the pointer
+/// flags and wheel switches: bit 0 reduced motion, bit 1 scroll gestures enabled (arrow and page
+/// keys), bit 2 wheel zoom (+/-), bit 3 time-axis double-click reset (Home). A disabled scroll
+/// switch clears mouse pan too, as the engine gates the keys on `pan || wheel_scroll`; the next
+/// pointer or wheel call restores each from its own switch.
+fn set_key_gates(engine: &mut aeris_charts_engine::ChartEngine, gates: u8) {
+    let scroll = gates & 2 != 0;
+    let mut options = engine.interaction_options();
+    options.reduced_motion = gates & 1 != 0;
+    options.pan &= scroll;
+    options.wheel_scroll = scroll;
+    options.wheel_zoom = gates & 4 != 0;
+    options.axis_double_click_reset_time = gates & 8 != 0;
+    engine.set_interaction_options(options);
+}
+
+fn controller_pointer_input(
     id: u32,
-    device: u8,
-    target: u8,
-    modifiers: u8,
+    flags: u32,
     x: f64,
     y: f64,
     timestamp_ms: f64,
-    pressure: f64,
-    tilt_x: f64,
-    tilt_y: f64,
-) -> PointerSample {
-    PointerSample {
+) -> aeris_charts_engine::PointerInput {
+    aeris_charts_engine::PointerInput {
         id,
-        device: input_device_from_u8(device),
-        target: input_target_from_u8(target),
-        modifiers: InputModifiers {
-            shift: modifiers & 1 != 0,
-            control: modifiers & 2 != 0,
-            alt: modifiers & 4 != 0,
-            meta: modifiers & 8 != 0,
+        device: match flags as u8 {
+            1 => aeris_charts_engine::InputDevice::Touch,
+            2 => aeris_charts_engine::InputDevice::Pen,
+            _ => aeris_charts_engine::InputDevice::Mouse,
         },
         x,
         y,
+        modifiers: input_modifiers_from_u8((flags >> 8) as u8),
         timestamp_ms,
-        pressure,
-        tilt_x,
-        tilt_y,
     }
 }
 
-fn write_input_update(out: &mut [f64], update: GestureUpdate) -> bool {
-    if out.len() < INPUT_UPDATE_LEN {
-        return false;
+fn chart_key_from_dom(
+    key: &str,
+    modifiers: InputModifiers,
+) -> Option<aeris_charts_engine::ChartKey> {
+    use aeris_charts_engine::ChartKey;
+    if (modifiers.control || modifiers.meta) && !modifiers.alt && key.eq_ignore_ascii_case("z") {
+        return Some(if modifiers.shift {
+            ChartKey::Redo
+        } else {
+            ChartKey::Undo
+        });
     }
-    out[..INPUT_UPDATE_LEN].copy_from_slice(&[
-        update.kind as u8 as f64,
-        update.state as u8 as f64,
-        f64::from(update.pointer_id),
-        update.target as u8 as f64,
-        update.device as u8 as f64,
-        update.x,
-        update.y,
-        update.previous_x,
-        update.previous_y,
-        update.scale_delta,
-        f64::from(update.active_pointers),
-        if update.prevent_default { 1.0 } else { 0.0 },
-    ]);
-    true
+    Some(match key {
+        "ArrowLeft" => ChartKey::ArrowLeft,
+        "ArrowRight" => ChartKey::ArrowRight,
+        "ArrowUp" => ChartKey::ArrowUp,
+        "ArrowDown" => ChartKey::ArrowDown,
+        "Tab" => ChartKey::Tab,
+        "PageUp" => ChartKey::PageUp,
+        "PageDown" => ChartKey::PageDown,
+        "+" | "=" => ChartKey::ZoomIn,
+        "-" | "_" => ChartKey::ZoomOut,
+        "Home" => ChartKey::Home,
+        "End" => ChartKey::End,
+        "Enter" => ChartKey::Enter,
+        "F2" => ChartKey::EditText,
+        "Backspace" => ChartKey::Backspace,
+        "Delete" => ChartKey::Delete,
+        "Escape" => ChartKey::Escape,
+        _ => return None,
+    })
 }
 
 fn broadcast_gpu_loss() {
@@ -417,7 +493,7 @@ impl SharedGpu {
                 self.atlas.borrow().view(),
                 SAMPLE_COUNT,
             ),
-            image: TexQuadRenderer::new(
+            image: TexQuadRenderer::new_image(
                 &self.device,
                 format,
                 self.image_atlas.borrow().view(),
@@ -462,7 +538,6 @@ struct ChartInner {
     bitmap_w: u32,
     bitmap_h: u32,
     engine: ChartEngine,
-    input: GestureResolver,
     frame: aeris_charts_engine::ChartFrame,
     axis_frame: AxisFrame,
     /// Backend-neutral top-layer primitives: watermark, axis chrome, ticks, and all axis/crosshair
@@ -486,13 +561,6 @@ struct ChartInner {
     /// object plus its raw items per custom series, aligned with the engine's time-only
     /// rows. Removing the series drops the entry (firing the view's `destroy` hook).
     custom_series: Vec<CustomSeriesEntry>,
-    /// Overlay text draws collected from primitives' `text_views` hooks during primitive passes.
-    /// The legacy Canvas2D compatibility overlay sits above the backend surface, so every draw is
-    /// clipped to its owning pane and cannot cover shared price/time-axis chrome.
-    primitive_texts: Vec<PrimitiveOverlayText>,
-    /// Whether the transparent input overlay contains plugin text from the previous frame. Normal
-    /// WebGPU frames never touch this Canvas2D surface; it is cleared only on plugin detach.
-    overlay_had_plugin_text: bool,
     /// Browser-rasterized text-run store for `Prim::Text` on the WebGPU backend (offscreen
     /// canvas + atlas cache). `None` only if the offscreen context could not be created —
     /// the Canvas2D backend draws text directly and never consults this.
@@ -511,23 +579,6 @@ struct ChartInner {
     /// The page's high-resolution clock, resolved once (`None` = no `performance` global, so
     /// `frame_stats().cpu_ms` stays 0 rather than costing a failed lookup per frame).
     clock: Option<web_sys::Performance>,
-}
-
-/// One in-pane overlay text draw registered by a primitive's `text_views` hook (plugin
-/// platform Phase 3.5). Painted through the legacy Canvas2D compatibility overlay and clipped to
-/// its owning pane, so it remains above pane geometry without reaching shared axis chrome. `font`
-/// is a fully-resolved CSS font shorthand; `align`/`baseline` are canvas keywords.
-pub(super) struct PrimitiveOverlayText {
-    pub(super) text: String,
-    pub(super) x: f64,
-    pub(super) y: f64,
-    /// Owning pane in media coordinates. The compatibility overlay sits above the backend canvas,
-    /// so clipping is what preserves the historical guarantee that plugin text cannot cover axes.
-    pub(super) clip: [f64; 4],
-    pub(super) color: String,
-    pub(super) font: String,
-    pub(super) align: String,
-    pub(super) baseline: String,
 }
 
 /// One attached pane primitive (reference `IPanePrimitive`, adapted to a plain JS object by the TS
@@ -758,7 +809,6 @@ pub async fn create_chart(
             initial_horizontal_domain,
         )
         .map_err(|error| JsValue::from_str(error.message()))?,
-        input: GestureResolver::default(),
         frame: aeris_charts_engine::ChartFrame::default(),
         axis_frame: AxisFrame::default(),
         axis_prims: Vec::new(),
@@ -771,8 +821,6 @@ pub async fn create_chart(
         series_primitives: Vec::new(),
         next_primitive_id: 1,
         custom_series: Vec::new(),
-        primitive_texts: Vec::new(),
-        overlay_had_plugin_text: false,
         now_override: None,
         rings: Vec::new(),
         telemetry: FrameTelemetry::default(),
@@ -812,21 +860,7 @@ pub async fn create_chart(
     let cap_ctx = inner.axis_ctx.clone();
     inner.engine.set_text_cap_center(Some(Box::new(
         move |size: f64, family: &str, weight: u16, italic: bool| {
-            cap_ctx.set_font(&aeris_charts_render::draw_list::text_font_spec(
-                size as f32,
-                family,
-                weight,
-                italic,
-            ));
-            cap_ctx.set_text_baseline("middle");
-            // Figures carry the trading readouts; their ink spans the cap height on the baseline.
-            cap_ctx
-                .measure_text("0")
-                .map(|metrics| {
-                    (metrics.actual_bounding_box_ascent() - metrics.actual_bounding_box_descent())
-                        / 2.0
-                })
-                .unwrap_or(0.0)
+            browser_text_cap_center(&cap_ctx, size, family, weight, italic)
         },
     )));
 
@@ -917,7 +951,6 @@ pub async fn create_offscreen_chart(
         bitmap_w,
         bitmap_h,
         engine: ChartEngine::new(css_width, css_height, dpr),
-        input: GestureResolver::default(),
         frame: aeris_charts_engine::ChartFrame::default(),
         axis_frame: AxisFrame::default(),
         axis_prims: Vec::new(),
@@ -930,8 +963,6 @@ pub async fn create_offscreen_chart(
         series_primitives: Vec::new(),
         next_primitive_id: 1,
         custom_series: Vec::new(),
-        primitive_texts: Vec::new(),
-        overlay_had_plugin_text: false,
         text_runs: match TextRunStore::new_offscreen() {
             Ok(store) => Some(store),
             Err(error) => {
@@ -968,21 +999,7 @@ pub async fn create_offscreen_chart(
     let cap_ctx = inner.axis_ctx.clone();
     inner.engine.set_text_cap_center(Some(Box::new(
         move |size: f64, family: &str, weight: u16, italic: bool| {
-            cap_ctx.set_font(&aeris_charts_render::draw_list::text_font_spec(
-                size as f32,
-                family,
-                weight,
-                italic,
-            ));
-            cap_ctx.set_text_baseline("middle");
-            // Figures carry the trading readouts; their ink spans the cap height on the baseline.
-            cap_ctx
-                .measure_text("0")
-                .map(|metrics| {
-                    (metrics.actual_bounding_box_ascent() - metrics.actual_bounding_box_descent())
-                        / 2.0
-                })
-                .unwrap_or(0.0)
+            browser_text_cap_center(&cap_ctx, size, family, weight, italic)
         },
     )));
 
@@ -2183,6 +2200,25 @@ impl AerisChart {
             .add_native_delta_tooltip(series_id, options_json)
     }
 
+    pub fn set_native_brushable_area(&mut self, series_id: u32, options_json: &str) -> bool {
+        self.inner
+            .borrow_mut()
+            .set_native_brushable_area(series_id, options_json)
+    }
+
+    pub fn native_brushable_area_range_json(&self, series_id: u32) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.brushable_area_range(series_id)
+            .map(|range| serde_json::json!({"from": range.from, "to": range.to, "positive": range.positive})))
+            .unwrap_or_else(|_| "null".to_string())
+    }
+
+    pub fn clear_native_brushable_area(&mut self, series_id: u32) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .clear_brushable_area_range(series_id)
+    }
+
     pub fn add_native_tooltip(&mut self, series_id: u32, options_json: &str) -> u32 {
         self.inner
             .borrow_mut()
@@ -2213,32 +2249,8 @@ impl AerisChart {
             .clear_delta_tooltip(primitive_id)
     }
 
-    /// Forward normalized host mouse samples to every engine-owned delta tooltip.
-    pub fn native_delta_tooltip_mouse_down(&mut self, x: f64, shift: bool) -> bool {
-        self.inner
-            .borrow_mut()
-            .engine
-            .delta_tooltip_mouse_down_with_shift(x, shift)
-    }
-
-    pub fn native_delta_tooltip_mouse_move(&mut self, x: f64) -> bool {
-        self.inner.borrow_mut().engine.delta_tooltip_mouse_move(x)
-    }
-
-    pub fn native_delta_tooltip_mouse_up(&mut self) -> bool {
-        self.inner.borrow_mut().engine.delta_tooltip_mouse_up()
-    }
-
-    pub fn native_delta_tooltip_touch_move(&mut self, xs: &[f64]) -> bool {
-        self.inner.borrow_mut().engine.delta_tooltip_touch_move(xs)
-    }
-
     pub fn native_delta_tooltip_active(&self) -> bool {
         self.inner.borrow().engine.has_delta_tooltip()
-    }
-
-    pub fn native_delta_tooltip_leave(&mut self) -> bool {
-        self.inner.borrow_mut().engine.delta_tooltip_leave()
     }
 
     /// Attach the two-point series primitive with endpoint labels. This is not the interactive
@@ -4544,6 +4556,16 @@ impl AerisChart {
         self.inner.borrow().time_zone().to_string()
     }
 
+    /// Format a canonical UTC-second timestamp exactly as the shared crosshair time label.
+    pub fn format_time_label(&self, timestamp: f64) -> String {
+        let Ok(timestamp) =
+            aeris_charts_core::model::data_validation::validate_timestamp(timestamp)
+        else {
+            return String::new();
+        };
+        self.inner.borrow().engine.format_crosshair_ts(timestamp)
+    }
+
     /// Exact built-in TradingView-parity time-zone identifiers as JSON.
     pub fn supported_time_zones_json(&self) -> String {
         serde_json::to_string(aeris_charts_engine::TRADINGVIEW_TIME_ZONES)
@@ -4748,246 +4770,316 @@ impl AerisChart {
         self.inner.borrow_mut().resize(css_width, css_height, dpr);
     }
 
-    pub fn zoom(&mut self, x_css: f64, scale: f64) {
-        self.inner.borrow_mut().zoom(x_css, scale);
+    /// One platform pointer listener call. All press ownership and chart mutation live in the
+    /// engine controller; the packed flags carry device, modifiers, and host options in three
+    /// disjoint bytes/words without allocating an input object at the WASM boundary.
+    pub fn controller_pointer_down(
+        &mut self,
+        id: u32,
+        x: f64,
+        y: f64,
+        timestamp_ms: f64,
+        click_count: u32,
+        flags: u32,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        set_controller_pointer_options(&mut inner.engine, (flags >> 16) as u16);
+        inner.engine.input_pointer_down(
+            controller_pointer_input(id, flags, x, y, timestamp_ms),
+            click_count,
+        );
     }
-    pub fn zoom_focused(&mut self, x_css: f64, scale: f64) {
-        self.inner.borrow_mut().zoom_focused(x_css, scale);
+
+    pub fn controller_pointer_move(
+        &mut self,
+        id: u32,
+        x: f64,
+        y: f64,
+        timestamp_ms: f64,
+        primary_pressed: bool,
+        flags: u32,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        set_controller_pointer_options(&mut inner.engine, (flags >> 16) as u16);
+        inner.engine.input_pointer_move(
+            controller_pointer_input(id, flags, x, y, timestamp_ms),
+            primary_pressed,
+        );
     }
-    /// Ordinary wheel zoom: the engine resolves the anchor (Ctrl/Cmd zooms around the pointer,
-    /// otherwise the time scale's right-edge pin policy applies).
-    pub fn wheel_zoom_time(&mut self, x_css: f64, scale: f64, control: bool, meta: bool) {
+
+    pub fn controller_pointer_up(
+        &mut self,
+        id: u32,
+        x: f64,
+        y: f64,
+        timestamp_ms: f64,
+        flags: u32,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        set_controller_pointer_options(&mut inner.engine, (flags >> 16) as u16);
+        inner
+            .engine
+            .input_pointer_up(controller_pointer_input(id, flags, x, y, timestamp_ms));
+    }
+
+    pub fn controller_pointer_leave(&mut self) {
+        self.inner.borrow_mut().engine.input_pointer_leave();
+    }
+
+    pub fn controller_pointer_cancel(&mut self) {
+        self.inner.borrow_mut().engine.input_cancel();
+    }
+
+    pub fn controller_pointer_cancel_id(&mut self, id: u32) {
+        self.inner.borrow_mut().engine.input_cancel_pointer(id);
+    }
+
+    pub fn controller_context_menu(&mut self, x: f64, y: f64) {
+        self.inner.borrow_mut().engine.input_context_menu(x, y);
+    }
+
+    pub fn controller_input_cursor(&self) -> u8 {
+        self.inner.borrow().engine.input_cursor() as u8
+    }
+
+    /// DOM-only page scroll arbitration may yield only a pane-owned pending touch.
+    pub fn controller_touch_page_scroll_candidate(&self, id: u32) -> bool {
         self.inner
-            .borrow_mut()
-            .wheel_zoom_time(x_css, scale, control, meta);
-    }
-    pub fn scroll_start(&mut self, x_css: f64) {
-        self.inner.borrow_mut().scroll_start(x_css);
-    }
-    pub fn scroll_move(&mut self, x_css: f64) {
-        self.inner.borrow_mut().scroll_move(x_css);
-    }
-    pub fn scroll_end(&mut self) {
-        self.inner.borrow_mut().scroll_end();
+            .borrow()
+            .engine
+            .input_touch_page_scroll_candidate(id)
     }
 
-    // --- engine-owned interaction models (the TS recognizer forwards samples; all formulas
-    // live in the engine — see aeris_charts_engine::interaction) ---
-
-    pub fn input_update_len() -> usize {
-        INPUT_UPDATE_LEN
+    /// Current controller crosshair in pane coordinates; NaNs mean it is hidden.
+    pub fn controller_crosshair_into(&self, out: &mut [f64]) {
+        if out.len() < 2 {
+            return;
+        }
+        let crosshair = self.inner.borrow().engine.crosshair;
+        out[0] = crosshair.map_or(f64::NAN, |point| point.0);
+        out[1] = crosshair.map_or(f64::NAN, |point| point.1);
     }
 
+    pub fn controller_flush_coalesced_input(&mut self) -> bool {
+        self.inner.borrow_mut().engine.flush_coalesced_input()
+    }
+
+    /// Route one raw DOM wheel event through the engine input controller. The browser supplies
+    /// only platform units and resolved user options; zoom, pan, motion cancellation, hover, and
+    /// cursor policy remain engine-owned.
     #[allow(clippy::too_many_arguments)]
-    pub fn input_pointer_down(
+    pub fn input_wheel(
         &mut self,
-        id: u32,
-        device: u8,
-        target: u8,
-        modifiers: u8,
         x: f64,
         y: f64,
-        timestamp_ms: f64,
-        pressure: f64,
-        tilt_x: f64,
-        tilt_y: f64,
-        out: &mut [f64],
-    ) -> bool {
-        let sample = pointer_sample(
-            id,
-            device,
-            target,
-            modifiers,
-            x,
-            y,
-            timestamp_ms,
-            pressure,
-            tilt_x,
-            tilt_y,
-        );
-        write_input_update(out, self.inner.borrow_mut().input.pointer_down(sample))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn input_pointer_move(
-        &mut self,
-        id: u32,
-        device: u8,
-        target: u8,
-        modifiers: u8,
-        x: f64,
-        y: f64,
-        timestamp_ms: f64,
-        pressure: f64,
-        tilt_x: f64,
-        tilt_y: f64,
-        out: &mut [f64],
-    ) -> bool {
-        let sample = pointer_sample(
-            id,
-            device,
-            target,
-            modifiers,
-            x,
-            y,
-            timestamp_ms,
-            pressure,
-            tilt_x,
-            tilt_y,
-        );
-        write_input_update(out, self.inner.borrow_mut().input.pointer_move(sample))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn input_pointer_up(
-        &mut self,
-        id: u32,
-        device: u8,
-        target: u8,
-        modifiers: u8,
-        x: f64,
-        y: f64,
-        timestamp_ms: f64,
-        pressure: f64,
-        tilt_x: f64,
-        tilt_y: f64,
-        out: &mut [f64],
-    ) -> bool {
-        let sample = pointer_sample(
-            id,
-            device,
-            target,
-            modifiers,
-            x,
-            y,
-            timestamp_ms,
-            pressure,
-            tilt_x,
-            tilt_y,
-        );
-        write_input_update(out, self.inner.borrow_mut().input.pointer_up(sample))
-    }
-
-    pub fn input_long_press(&mut self, id: u32, out: &mut [f64]) -> bool {
-        write_input_update(out, self.inner.borrow_mut().input.long_press(id))
-    }
-
-    pub fn input_cancel_all(&mut self, out: &mut [f64]) -> bool {
-        write_input_update(out, self.inner.borrow_mut().input.cancel())
-    }
-
-    pub fn classify_wheel(
-        &self,
-        behavior: u8,
-        delta_x: f64,
-        delta_y: f64,
+        raw_delta_x: f64,
+        raw_delta_y: f64,
         delta_mode: u8,
-        control: bool,
-        shift: bool,
-    ) -> u8 {
-        let behavior = match behavior {
-            1 => aeris_charts_engine::WheelBehavior::Pan,
-            2 => aeris_charts_engine::WheelBehavior::Zoom,
-            _ => aeris_charts_engine::WheelBehavior::Auto,
-        };
-        let delta_mode = match delta_mode {
+        pixel_ratio: f64,
+        modifier_bits: u8,
+        behavior: u8,
+        wheel_scroll: bool,
+        wheel_zoom: bool,
+        price_axis_wheel_zoom: bool,
+        timestamp_ms: f64,
+    ) -> bool {
+        let mode = match delta_mode {
             1 => aeris_charts_engine::WheelDeltaMode::Line,
             2 => aeris_charts_engine::WheelDeltaMode::Page,
             _ => aeris_charts_engine::WheelDeltaMode::Pixel,
         };
-        aeris_charts_engine::WheelSample {
-            delta_x,
-            delta_y,
-            delta_mode,
-            modifiers: aeris_charts_engine::InputModifiers {
-                control,
-                shift,
-                ..aeris_charts_engine::InputModifiers::default()
+        let mut inner = self.inner.borrow_mut();
+        let mut options = inner.engine.interaction_options();
+        options.wheel_behavior = match behavior {
+            1 => aeris_charts_engine::WheelBehavior::Pan,
+            2 => aeris_charts_engine::WheelBehavior::Zoom,
+            _ => aeris_charts_engine::WheelBehavior::Auto,
+        };
+        options.wheel_scroll = wheel_scroll;
+        options.wheel_zoom = wheel_zoom;
+        options.price_axis_wheel_zoom = price_axis_wheel_zoom;
+        inner.engine.set_interaction_options(options);
+        inner.engine.input_wheel(aeris_charts_engine::WheelSample {
+            x,
+            y,
+            delta_x: aeris_charts_engine::WheelSample::normalize_delta(
+                raw_delta_x,
+                mode,
+                pixel_ratio,
+            ),
+            delta_y: aeris_charts_engine::WheelSample::normalize_delta(
+                -raw_delta_y,
+                mode,
+                pixel_ratio,
+            ),
+            delta_mode: mode,
+            modifiers: input_modifiers_from_u8(modifier_bits),
+            timestamp_ms,
+        })
+    }
+
+    /// Route a browser key through the engine controller after translating its DOM key name.
+    /// `key_gates` carries the host switches the keyboard bindings honour (see `set_key_gates`),
+    /// so a fixed view stays fixed from the keyboard.
+    pub fn input_key_down(
+        &mut self,
+        key: &str,
+        modifier_bits: u8,
+        repeat: bool,
+        timestamp_ms: f64,
+        key_gates: u8,
+    ) -> bool {
+        let modifiers = input_modifiers_from_u8(modifier_bits);
+        let mut inner = self.inner.borrow_mut();
+        inner.engine.input_modifiers_changed(modifiers);
+        let Some(chart_key) = chart_key_from_dom(key, modifiers) else {
+            return matches!(key, "Control" | "Meta" | "Shift" | "Alt");
+        };
+        set_key_gates(&mut inner.engine, key_gates);
+        inner
+            .engine
+            .input_key_down(chart_key, modifiers, repeat, timestamp_ms)
+    }
+
+    /// Route a key from a focused accessibility target through the engine's target bindings.
+    /// `target` is `price-axis:<pane>`, `time-axis`, `separator:<pane>`, or `drawing:<id>`.
+    pub fn input_target_key_down(
+        &mut self,
+        target: &str,
+        key: &str,
+        modifier_bits: u8,
+        key_gates: u8,
+    ) -> bool {
+        use aeris_charts_engine::ChartFocusTarget;
+        let (kind, index) = target.split_once(':').unwrap_or((target, ""));
+        let index = index.parse::<usize>().ok();
+        let target = match (kind, index) {
+            ("price-axis", Some(pane)) => ChartFocusTarget::PriceAxis {
+                pane,
+                target: aeris_charts_engine::PriceScaleTarget::Right,
             },
-            ..aeris_charts_engine::WheelSample::default()
+            ("time-axis", _) => ChartFocusTarget::TimeAxis,
+            ("separator", Some(pane)) => ChartFocusTarget::Separator(pane),
+            ("drawing", Some(id)) => ChartFocusTarget::Drawing(id as DrawingId),
+            _ => return false,
+        };
+        let modifiers = input_modifiers_from_u8(modifier_bits);
+        let Some(chart_key) = chart_key_from_dom(key, modifiers) else {
+            return false;
+        };
+        let mut inner = self.inner.borrow_mut();
+        set_key_gates(&mut inner.engine, key_gates);
+        inner
+            .engine
+            .input_target_key_down(target, chart_key, modifiers)
+    }
+
+    /// The open keyboard drawing edit as JSON `{"id":number,"anchor":number|null}` or `null`.
+    pub fn drawing_edit_session_json(&self) -> String {
+        match self.inner.borrow().engine.drawing_edit_session() {
+            Some((id, anchor)) => serde_json::json!({"id": id, "anchor": anchor}).to_string(),
+            None => "null".to_string(),
         }
-        .intent(behavior) as u8
     }
 
-    /// reference wheel zoom increment: `sign(deltaY) * min(1, |deltaY|)`.
-    pub fn wheel_zoom_scale(&self, delta_y: f64) -> f64 {
-        self.inner.borrow().wheel_zoom_scale(delta_y)
-    }
-    /// reference pinch zoom increment: the scale-ratio delta ×5.
-    pub fn pinch_zoom_scale(&self, scale_delta: f64) -> f64 {
-        self.inner.borrow().pinch_zoom_scale(scale_delta)
-    }
-    /// reference wheel scroll delta: `deltaX * -80` px.
-    pub fn wheel_scroll_delta(&self, delta_x: f64) -> f64 {
-        self.inner.borrow().wheel_scroll_delta(delta_x)
+    /// Whether input or any mutation left the prepared frame stale; hosts render after input
+    /// only while this holds.
+    pub fn frame_pending(&self) -> bool {
+        self.inner.borrow().engine.frame_pending()
     }
 
-    /// Open a kinetic sampling session alongside the drag (`enabled = false` = no coast).
-    pub fn kinetic_begin_sampling(&mut self, enabled: bool, position: f64, now_ms: f64) {
+    /// The engine drag threshold that DOM page-scroll arbitration must wait for.
+    pub fn click_slop_manhattan(&self) -> f64 {
+        aeris_charts_engine::CLICK_SLOP_MANHATTAN
+    }
+
+    pub fn input_key_up(&mut self, key: &str, modifier_bits: u8) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .engine
+            .input_modifiers_changed(input_modifiers_from_u8(modifier_bits));
+        let Some(chart_key) = chart_key_from_dom(key, InputModifiers::default()) else {
+            return matches!(key, "Control" | "Meta" | "Shift" | "Alt");
+        };
+        inner.engine.input_key_up(chart_key)
+    }
+
+    /// Browser window modifier events can arrive while the chart overlay is not keyboard-
+    /// focused. Forward their raw state to the same controller for live drawing magnet updates.
+    pub fn input_modifiers_changed(&mut self, modifier_bits: u8) {
         self.inner
             .borrow_mut()
-            .kinetic_begin_sampling(enabled, position, now_ms);
-    }
-    pub fn kinetic_add_sample(&mut self, position: f64, now_ms: f64) {
-        self.inner.borrow_mut().kinetic_add_sample(position, now_ms);
-    }
-    /// The drag was released: whether a momentum coast engaged (drive `kinetic_position`
-    /// per frame instead of ending the scroll session).
-    pub fn kinetic_release(&mut self, position: f64, now_ms: f64) -> bool {
-        self.inner.borrow_mut().kinetic_release(position, now_ms)
-    }
-    /// The coast's logical rightOffset at `now_ms` (NaN when no coast is running).
-    pub fn kinetic_position(&self, now_ms: f64) -> f64 {
-        self.inner.borrow().kinetic_position(now_ms)
-    }
-    pub fn kinetic_finished(&self, now_ms: f64) -> bool {
-        self.inner.borrow().kinetic_finished(now_ms)
-    }
-    pub fn kinetic_stop(&mut self) {
-        self.inner.borrow_mut().kinetic_stop();
+            .engine
+            .input_modifiers_changed(input_modifiers_from_u8(modifier_bits));
     }
 
-    /// Start or retune one held keyboard-pan direction in logical bars.
-    pub fn start_keyboard_scroll(&mut self, delta_bars: f64, now_ms: f64) {
-        self.inner
-            .borrow_mut()
-            .start_keyboard_scroll(delta_bars, now_ms);
+    pub fn input_animating(&self) -> bool {
+        self.inner.borrow().engine.input_animating()
     }
-    /// Apply one keyboard-pan tick; NaN when no held kinetic session is active.
-    pub fn keyboard_scroll_tick(&mut self, now_ms: f64) -> f64 {
-        self.inner.borrow_mut().keyboard_scroll_tick(now_ms)
+
+    /// Host timer deadline for deferred controller effects such as trading tooltip dwell.
+    pub fn input_wake_deadline_ms(&self) -> Option<f64> {
+        self.inner.borrow().engine.input_wake_deadline_ms()
     }
+
+    pub fn input_tick(&mut self, timestamp_ms: f64) -> bool {
+        self.inner.borrow_mut().engine.input_tick(timestamp_ms)
+    }
+
+    pub fn input_cancel_motion(&mut self) {
+        self.inner.borrow_mut().engine.input_cancel_motion();
+    }
+
+    /// Drain the bounded controller event queue for platform-only effects.
+    pub fn take_input_events_json(&mut self) -> String {
+        use aeris_charts_engine::{ChartInputEvent, ChartRegion};
+        let events = self.inner.borrow_mut().engine.take_input_events();
+        let values: Vec<_> = events
+            .into_iter()
+            .map(|event| match event {
+                ChartInputEvent::Click { x, y } => {
+                    serde_json::json!({"kind":"click","x":x,"y":y})
+                }
+                ChartInputEvent::DoubleClick { x, y } => {
+                    serde_json::json!({"kind":"double_click","x":x,"y":y})
+                }
+                ChartInputEvent::TextEditorOpened(id) => {
+                    serde_json::json!({"kind":"text_editor_opened","id":id})
+                }
+                ChartInputEvent::DrawingCreated(id) => {
+                    serde_json::json!({"kind":"drawing_created","id":id})
+                }
+                ChartInputEvent::RemoveSeries(id) => {
+                    serde_json::json!({"kind":"remove_series","id":id})
+                }
+                ChartInputEvent::CrosshairLeft => serde_json::json!({"kind":"crosshair_left"}),
+                ChartInputEvent::DeltaTooltipChanged => {
+                    serde_json::json!({"kind":"delta_tooltip_changed"})
+                }
+                ChartInputEvent::ContextMenu(menu) => {
+                    let region = match menu.region {
+                        ChartRegion::Pane => "pane",
+                        ChartRegion::PriceAxis { .. } => "price_axis",
+                        ChartRegion::TimeAxis => "time_axis",
+                        ChartRegion::Separator(_) => "separator",
+                    };
+                    serde_json::json!({
+                        "kind":"context_menu",
+                        "x":menu.x,
+                        "y":menu.y,
+                        "region":region,
+                        "pane":menu.context.map(|context| context.pane_index),
+                    })
+                }
+            })
+            .collect();
+        serde_json::to_string(&values).expect("input events are JSON values")
+    }
+
     pub fn cancel_keyboard_scroll(&mut self) {
         self.inner.borrow_mut().cancel_keyboard_scroll();
     }
 
-    /// Axis drag-to-scale (reference pressedMouseMove on the axis widgets).
-    pub fn time_axis_start_scale(&mut self, x_css: f64) {
-        self.inner.borrow_mut().time_axis_start_scale(x_css);
-    }
-    pub fn time_axis_scale_to(&mut self, x_css: f64) {
-        self.inner.borrow_mut().time_axis_scale_to(x_css);
-    }
-    pub fn time_axis_end_scale(&mut self) {
-        self.inner.borrow_mut().time_axis_end_scale();
-    }
-    /// Whether a price-axis drag can scale this scale (false in percentage/indexed modes).
-    pub fn price_axis_scalable(&self, pane: usize, target: u32) -> bool {
-        self.inner.borrow().price_axis_scalable(pane, target)
-    }
-    pub fn price_axis_start_scale(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.inner
-            .borrow_mut()
-            .price_axis_start_scale(pane, target, y_css);
-    }
-    pub fn price_axis_scale_to(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.inner
-            .borrow_mut()
-            .price_axis_scale_to(pane, target, y_css);
-    }
-    pub fn price_axis_end_scale(&mut self, pane: usize, target: u32) {
-        self.inner.borrow_mut().price_axis_end_scale(pane, target);
-    }
     /// industry-standard bid/ask quotes: push the current values for a series (NaN clears that
     /// side). Lines and chips render while the series' `bid_ask_visible` option holds. Call
     /// `render()` after.
@@ -5008,31 +5100,6 @@ impl AerisChart {
             scale,
         );
     }
-    /// Vertical price pan (reference `startScrollPrice`/`scrollPriceTo`).
-    pub fn price_axis_start_scroll(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.inner
-            .borrow_mut()
-            .price_axis_start_scroll(pane, target, y_css);
-    }
-    pub fn price_axis_scroll_to(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.inner
-            .borrow_mut()
-            .price_axis_scroll_to(pane, target, y_css);
-    }
-    pub fn price_axis_end_scroll(&mut self, pane: usize, target: u32) {
-        self.inner.borrow_mut().price_axis_end_scroll(pane, target);
-    }
-    /// Resolve the intended series scale and begin its drag session when already manual.
-    pub fn begin_price_pan_at(&mut self, pane: usize, x_css: f64, y_css: f64) -> Option<u32> {
-        self.inner
-            .borrow_mut()
-            .begin_price_pan_at(pane, x_css, y_css)
-    }
-    /// Resolve the intended pane price scale without opening or mutating its drag session.
-    pub fn price_pan_target_at(&self, pane: usize, x_css: f64, y_css: f64) -> Option<u32> {
-        self.inner.borrow().price_pan_target_at(pane, x_css, y_css)
-    }
-
     /// Eased scroll-to-position (the engine owns the cubic ease-out and applies each tick).
     pub fn start_scroll_animation(&mut self, target: f64, duration_ms: f64, now_ms: f64) {
         self.inner
@@ -5096,11 +5163,13 @@ impl AerisChart {
     /// lets go on the next `render()` and active drawings return to stable order. The text
     /// drawings' hover ring releases too.
     pub fn clear_hover(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.engine.set_hovered_series(None);
-        inner.engine.set_hovered_text(None);
-        inner.engine.set_hovered_drawing(None);
-        inner.engine.clear_general_hover();
+        self.inner.borrow_mut().engine.clear_hover();
+    }
+    /// The input controller's hover after the last pointer input, in `hover_at` JSON. Plugin
+    /// primitives under the controller's hover point are arbitrated in; everything else was
+    /// already resolved by the input call.
+    pub fn controller_hover_json(&mut self) -> String {
+        self.inner.borrow_mut().controller_hover_json()
     }
     /// industry-standard click-to-select: the host's click pipeline sets the series under the
     /// click (`None` on empty pane space); the engine snapshots sparse canonical anchor identities
@@ -5110,6 +5179,23 @@ impl AerisChart {
             .borrow_mut()
             .engine
             .set_selected_series(id.map(|id| id as SeriesId));
+    }
+
+    /// The selected volume-profile indicator id, or 0 when none is selected.
+    pub fn selected_volume_profile_indicator(&self) -> u32 {
+        self.inner
+            .borrow()
+            .engine
+            .selected_volume_profile_indicator()
+            .unwrap_or(0)
+    }
+
+    /// Select a volume-profile indicator (0 clears). Returns `false` for an unknown id.
+    pub fn set_selected_volume_profile_indicator(&mut self, id: u32) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .set_selected_volume_profile_indicator((id != 0).then_some(id))
     }
 
     /// Deterministic browser-test hook for the transient canonical selection-anchor timestamps.
@@ -5384,6 +5470,12 @@ impl AerisChart {
             .engine
             .begin_drawing_text_edit(id, paint_caret)
     }
+    pub fn set_drawing_text_edit_paint_caret(&mut self, paint_caret: bool) {
+        self.inner
+            .borrow_mut()
+            .engine
+            .set_drawing_text_edit_paint_caret(paint_caret);
+    }
     /// Mirror the editable surface into the session: its whole value and caret (in chars). Live
     /// text repaints without an undo step or a sync revision; the engine owns the single-line
     /// rule of a run label and the length bound.
@@ -5436,13 +5528,6 @@ impl AerisChart {
     }
     pub fn drawing_drag_active(&self) -> bool {
         self.inner.borrow().drawing_drag_active()
-    }
-    pub fn nudge_selected_drawing(&mut self, dx_css: f64, dy_css: f64, anchor: i32) -> bool {
-        self.inner.borrow_mut().engine.nudge_selected_drawing(
-            dx_css,
-            dy_css,
-            usize::try_from(anchor).ok(),
-        )
     }
     /// Undo one committed drawing mutation in this chart's bounded semantic history.
     pub fn undo_drawing(&mut self) -> bool {
@@ -6158,11 +6243,14 @@ async fn try_create_gfx(
         .map_err(|e| BackendStartupFailure::surface(format!("create_surface failed: {e}")))?;
     let bitmap_w = (css_width * dpr).round().max(1.0) as u32;
     let bitmap_h = (css_height * dpr).round().max(1.0) as u32;
-    let config = surface
+    let mut config = surface
         .get_default_config(&shared.adapter, bitmap_w, bitmap_h)
         .ok_or_else(|| {
             BackendStartupFailure::surface("surface not supported by adapter".to_string())
         })?;
+    // Browser Canvas2D preserves translucent chart backgrounds. The presentation surface must
+    // expose premultiplied alpha for the WebGPU clear to composite with the same DOM backdrop.
+    config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
     surface.configure(&shared.device, &config);
     let renderers = shared.renderers_for(config.format);
     let msaa = MsaaTarget::new(&shared.device, config.format, bitmap_w, bitmap_h);

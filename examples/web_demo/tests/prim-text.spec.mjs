@@ -289,8 +289,8 @@ test("prim text paints on both backends, is pixel-identical, z-orders, caches, a
   // and placement are identical — nothing is shifted by a whole pixel. The measured strict
   // residual is confined to per-channel ±1/255 rounding on AA edge pixels (the documented
   // sp=0 premultiplied-blend class, blend.rs; the doubled Aeris CACHE call blends twice, so
-  // its AA edges carry the residual twice). Measured on this fixture: 162 strict-diff px
-  // (30 for a single draw of the same runs), EVERY differing channel exactly ±1.
+  // its AA edges carry the residual twice). Current Windows SwiftShader measurement: 176
+  // strict-diff pixels, EVERY differing channel exactly ±1.
   const text_region = { x: OVER_BAND.x - 4, y: OVER_BAND.y - 4, w: CACHE_BAND.w + 8, h: CACHE_BAND.y + CACHE_BAND.h - OVER_BAND.y + 8 };
   const text_analysis = analyze_diff(
     crop_png(gpu_attached, text_region.x, text_region.y, text_region.w, text_region.h),
@@ -301,7 +301,7 @@ test("prim text paints on both backends, is pixel-identical, z-orders, caches, a
     await test_info.attach("canvas2d-text.png", { body: PNG.sync.write(crop_png(canvas_attached, text_region.x, text_region.y, text_region.w, text_region.h)), contentType: "image/png" });
   }
   console.log(`text-region parity: ${text_analysis.count} strict-diff px, max channel delta ${text_analysis.max_delta}/255`);
-  expect(text_analysis.count, "text-region residual must stay in the measured ±1 class").toBeLessThanOrEqual(250);
+  expect(text_analysis.count, "text-region residual must stay in the measured ±1 class").toBeLessThanOrEqual(200);
   expect(text_analysis.max_delta, "no pixel may differ by more than 1/255 (no whole-pixel shifts)").toBeLessThanOrEqual(1);
 
   // The primitive must not introduce any cross-backend differences outside its text region.

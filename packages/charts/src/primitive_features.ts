@@ -709,7 +709,6 @@ function tooltip_row_text(row: HTMLDivElement, value: HTMLSpanElement, text: str
   row.hidden = text.length === 0;
 }
 
-
 /** Structured OHLC market-data tooltip; source lookup and its vertical guide are engine-owned. */
 export function create_tooltip(chart: chart_api, options: tooltip_options = {}): tooltip_handle {
   let current: Required<Omit<tooltip_options, "series" | "volume_series" | "format" | "line_color">>

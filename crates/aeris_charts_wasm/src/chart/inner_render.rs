@@ -31,7 +31,6 @@ impl ChartInner {
     }
 
     fn render_inner(&mut self) -> Result<(), JsValue> {
-        self.engine.begin_frame_build();
         // Series primitives (plugin platform Phase C-b): pull this frame's autoscale
         // contributions from the plugin hooks before any layout/autoscale pass runs, so the
         // axis-width negotiation, axis frame, and pane frame all see the merged ranges.
@@ -57,52 +56,40 @@ impl ChartInner {
             .unwrap_or_else(|| js_sys::Date::now() / 1000.0);
         self.engine.set_now_seconds(now);
 
-        // ---- layout (price axis width negotiated against the price labels) ----
-        if self.engine.frame_requires_layout() {
-            self.recompute_layout(false);
-        }
-
-        // Settle layout, autoscale, and retained pane layers before building axis labels so the
-        // axis consumes the same finalized scale ranges as the canonical pane frame.
-        self.engine.build_frame_into_accumulating(&mut self.frame);
-        self.telemetry.set_rebuilds(self.engine.frame_build_stats());
-
-        // Build the retained axis labels only when an axis input changed.
-        // Sizes resolve in the engine (`axis_font_size`/`countdown_font_size` from
-        // `layout.fontSize`/`fontFamily`): they drive the tick-density estimate, host text
-        // measurement (with matching weight), and glyph drawing so all three agree. The label
-        // width cap is reference `timeScale.tickMarkMaxCharacterLength` (default 8).
+        // The engine settles layout, autoscale, pane layers, and base axis labels together.
+        // Plugin labels enter after this call and before axis primitive lowering.
         let layout = self.opts().layout;
         let font_family = layout.font_family;
         let axis_size = self.engine.axis_font_size();
         let countdown_size = self.engine.countdown_font_size();
-        let pixels_per_character = (axis_size + 4.0) * 5.0 / 8.0;
-        let max_label_width =
-            pixels_per_character * f64::from(self.engine.tick_mark_max_character_length);
         let axis_ctx = &self.axis_ctx;
         let dpr = self.dpr;
-        if self.engine.frame_requires_axis() {
-            let next_axis_frame = self.engine.build_axis_frame(
-                max_label_width,
-                |text, bold| measure_text_ctx(axis_ctx, dpr, &font_family, axis_size, bold, text),
-                |text, bold| {
-                    measure_text_ctx(axis_ctx, dpr, &font_family, countdown_size, bold, text)
-                },
-            );
-            if next_axis_frame != self.axis_frame {
-                self.axis_frame = next_axis_frame;
-            }
-            // Axis lowering also consumes option colors that are not stored in `AxisFrame`.
-            // Rebuild its primitives whenever the engine invalidates the axis, even when label
-            // geometry itself compares equal (for example a separator-only theme change).
+        let prepared = self.engine.prepare_financial_frame_with_measure(
+            aeris_charts_engine::FinancialFrameRequest {
+                width: self.css_width,
+                height: self.css_height,
+                dpr,
+                force_layout: false,
+                allow_axis_shrink: false,
+                force_frame: plugin_active,
+                force_axis: self.axis_dirty,
+                layout_only: false,
+                fit_content: false,
+                frame: &mut self.frame,
+                axis_frame: Some(&mut self.axis_frame),
+                axis_primitives: None,
+            },
+            |text, bold| measure_text_ctx(axis_ctx, dpr, &font_family, axis_size, bold, text),
+            |text, bold| measure_text_ctx(axis_ctx, dpr, &font_family, countdown_size, bold, text),
+        );
+        self.telemetry.set_rebuilds(self.engine.frame_build_stats());
+        if prepared.axis_rebuilt {
+            // Colors and chrome options may change without label geometry changing.
             self.axis_dirty = true;
         }
 
-        // Pane primitives (plugin platform Phase C-a): plugin renderers record Prim commands
-        // into the pane layers and boxed labels into the axis frame, after the engine frame is
-        // settled and before either backend consumes it. The Phase 3.5 overlay-text store is
-        // cleared first so a detached primitive leaves no stale glyphs behind.
-        self.primitive_texts.clear();
+        // Pane primitives record their geometry and text in the ordered pane layers after the
+        // engine frame is settled and before either backend consumes it.
         self.run_pane_primitives();
         // Series primitives (Phase C-b): same pass, bound to each owning series' scale.
         self.run_series_primitives();
@@ -191,212 +178,84 @@ impl ChartInner {
                 image_atlas.protect_retained_frame_slots();
             }
             let queue = &shared.queue;
-            if plugin_active {
+            let mut lowering = GroupLowering {
+                text_runs,
+                atlas: &mut atlas,
+                image_atlas: &mut image_atlas,
+                queue,
+            };
+            // An unchanged group that already dropped a text run would drop it again, so the
+            // frame is routed to Canvas2D before any WebGPU tessellation. Every other retained
+            // group keeps its geometry for the frame after the offending text changes or goes.
+            let known_text_failure = !atlas_changed
+                && !image_atlas_changed
+                && (is_known_text_failure(
+                    &self.gpu_groups[pane_group_count],
+                    AXIS_GROUP_KEY,
+                    self.axis_revision,
+                    None,
+                ) || (!plugin_active && {
+                    let groups = &self.gpu_groups;
+                    let mut known = false;
+                    for_each_retained_group(&self.engine, engine_frame, |index, slot| {
+                        known |= is_known_text_failure(
+                            &groups[index],
+                            slot.key,
+                            slot.source_revision,
+                            slot.scissor,
+                        );
+                    });
+                    known
+                }));
+            let mut text_failed = known_text_failure;
+            if !known_text_failure && plugin_active {
                 for (pane, pane_frame) in engine_frame.panes.iter().enumerate() {
                     let group = &mut self.gpu_groups[pane];
                     group.key = 0x1000_0000 | pane as u64;
                     group.scissor = Some(pane_frame.scissor);
                     group.clear();
-                    let mut resolve_text = |prim: &Prim| {
-                        text_runs
-                            .as_mut()
-                            .and_then(|runs| runs.resolve(&mut atlas, queue, prim))
-                    };
-                    let mut resolve_image =
-                        |prim: &Prim| super::image_runs::resolve(&mut image_atlas, queue, prim);
-                    prims_to_group(
-                        &pane_frame.under,
-                        &pane_frame.points,
-                        group,
-                        &mut resolve_text,
-                        &mut resolve_image,
-                    );
-                    prims_to_group(
-                        &pane_frame.main,
-                        &pane_frame.points,
-                        group,
-                        &mut resolve_text,
-                        &mut resolve_image,
-                    );
-                    prims_to_group(
-                        &pane_frame.top_prims,
-                        &pane_frame.points,
-                        group,
-                        &mut resolve_text,
-                        &mut resolve_image,
-                    );
+                    for layer in [&pane_frame.under, &pane_frame.main, &pane_frame.top_prims] {
+                        text_failed |= lowering.lower(group, layer, &pane_frame.points);
+                    }
                 }
-            } else {
-                let mut build_group = |group: &mut DrawGroup,
-                                       key: u64,
-                                       source_revision: u64,
-                                       scissor: Option<[u32; 4]>,
-                                       prims: &[Prim],
-                                       points: &[[f32; 2]]| {
+            } else if !known_text_failure {
+                let groups = &mut self.gpu_groups;
+                for_each_retained_group(&self.engine, engine_frame, |index, slot| {
+                    let group = &mut groups[index];
                     if !atlas_changed
                         && !image_atlas_changed
-                        && group.key == key
-                        && group.source_revision == source_revision
-                        && group.scissor == scissor
+                        && group.key == slot.key
+                        && group.source_revision == slot.source_revision
+                        && group.scissor == slot.scissor
                     {
                         return;
                     }
-                    group.scissor = scissor;
-                    group.rebuild(key, source_revision);
-                    let mut resolve_text = |prim: &Prim| {
-                        text_runs
-                            .as_mut()
-                            .and_then(|runs| runs.resolve(&mut atlas, queue, prim))
-                    };
-                    let mut resolve_image =
-                        |prim: &Prim| super::image_runs::resolve(&mut image_atlas, queue, prim);
-                    prims_to_group(prims, points, group, &mut resolve_text, &mut resolve_image);
-                };
-                let mut group_index = 0;
-                for (pane, pane_frame) in engine_frame.panes.iter().enumerate() {
-                    let segments = self.engine.frame_pane_segments(pane).unwrap_or_default();
-                    let main = &pane_frame.main;
-                    build_group(
-                        &mut self.gpu_groups[group_index],
-                        0x2000_0000 | (pane as u64) << 4,
-                        segments.under_revision,
-                        Some(pane_frame.scissor),
-                        &pane_frame.under[..segments.under_end.min(pane_frame.under.len())],
-                        &pane_frame.points,
-                    );
-                    group_index += 1;
-                    // Chart content merged in paint order (ordering.rs): idle indicators, idle
-                    // drawings, ordinary series, active series/drawings/previews, chrome.
-                    // Series and drawing segments both carry out.main ranges; merging by start
-                    // preserves pane-local order so WebGPU blends like Canvas2D. Ordering-only
-                    // promotion swaps group order (key mismatch re-uploads moved groups) without
-                    // rebuilding retained geometry.
-                    {
-                        let series_segs = self.engine.frame_series_segments(pane);
-                        let drawing_segs = self.engine.frame_drawing_segments(pane);
-                        let mut si = 0usize;
-                        let mut di = 0usize;
-                        while si < series_segs.len() || di < drawing_segs.len() {
-                            let take_series = match (series_segs.get(si), drawing_segs.get(di)) {
-                                (Some(s), Some(d)) => s.start <= d.start,
-                                (Some(_), None) => true,
-                                (None, Some(_)) => false,
-                                (None, None) => break,
-                            };
-                            if take_series {
-                                let series = &series_segs[si];
-                                si += 1;
-                                let key = match series.series_id {
-                                    Some(id) => 0x3000_0000 | (pane as u64) << 32 | u64::from(id),
-                                    None => 0x4000_0000 | pane as u64,
-                                };
-                                build_group(
-                                    &mut self.gpu_groups[group_index],
-                                    key,
-                                    series.revision,
-                                    Some(pane_frame.scissor),
-                                    &main[series.start.min(main.len())..series.end.min(main.len())],
-                                    &pane_frame.points,
-                                );
-                                group_index += 1;
-                            } else {
-                                let drawing = &drawing_segs[di];
-                                di += 1;
-                                let key = match drawing.drawing_id {
-                                    Some(id) => 0x5000_0000 | (pane as u64) << 32 | u64::from(id),
-                                    None => 0x6000_0000 | pane as u64,
-                                };
-                                build_group(
-                                    &mut self.gpu_groups[group_index],
-                                    key,
-                                    drawing.revision,
-                                    Some(pane_frame.scissor),
-                                    &main[drawing.start.min(main.len())
-                                        ..drawing.end.min(main.len())],
-                                    &pane_frame.points,
-                                );
-                                group_index += 1;
-                            }
-                        }
+                    group.scissor = slot.scissor;
+                    group.rebuild(slot.key, slot.source_revision);
+                    if lowering.lower(group, slot.prims, slot.points) {
+                        group.key ^= TEXT_FAILED_KEY_BIT;
+                        text_failed = true;
                     }
-                    build_group(
-                        &mut self.gpu_groups[group_index],
-                        0x2000_0005 | (pane as u64) << 4,
-                        segments.trading_revision,
-                        Some(pane_frame.scissor),
-                        &main[segments.series_end.min(main.len())
-                            ..segments.trading_regions_end.min(main.len())],
-                        &pane_frame.points,
-                    );
-                    group_index += 1;
-                    build_group(
-                        &mut self.gpu_groups[group_index],
-                        0x2000_0002 | (pane as u64) << 4,
-                        segments.drawings_revision,
-                        Some(pane_frame.scissor),
-                        &main[segments.trading_regions_end.min(main.len())
-                            ..segments.drawings_end.min(main.len())],
-                        &pane_frame.points,
-                    );
-                    group_index += 1;
-                    build_group(
-                        &mut self.gpu_groups[group_index],
-                        0x2000_0006 | (pane as u64) << 4,
-                        segments.trading_revision,
-                        Some(pane_frame.scissor),
-                        &main[segments.drawings_end.min(main.len())
-                            ..segments.trading_end.min(main.len())],
-                        &pane_frame.points,
-                    );
-                    group_index += 1;
-                    build_group(
-                        &mut self.gpu_groups[group_index],
-                        0x2000_0003 | (pane as u64) << 4,
-                        segments.overlay_revision,
-                        Some(pane_frame.scissor),
-                        &main[segments.trading_end.min(main.len())
-                            ..segments.overlay_end.min(main.len())],
-                        &pane_frame.points,
-                    );
-                    group_index += 1;
-                    build_group(
-                        &mut self.gpu_groups[group_index],
-                        0x2000_0004 | (pane as u64) << 4,
-                        segments.top_revision,
-                        Some(pane_frame.scissor),
-                        &pane_frame.top_prims,
-                        &pane_frame.points,
-                    );
-                    group_index += 1;
-                }
+                });
             }
             // Final unscissored top-layer group: watermark, axis chrome and axis/crosshair labels.
             // It is submitted in this same pass after every pane group, so no engine Canvas2D paint
             // follows a WebGPU frame.
             let axis_group = &mut self.gpu_groups[pane_group_count];
-            if atlas_changed
-                || image_atlas_changed
-                || axis_group.key != u64::MAX
-                || axis_group.source_revision != self.axis_revision
+            if !known_text_failure
+                && (atlas_changed
+                    || image_atlas_changed
+                    || axis_group.key != AXIS_GROUP_KEY
+                    || axis_group.source_revision != self.axis_revision)
             {
                 axis_group.scissor = None;
-                axis_group.rebuild(u64::MAX, self.axis_revision);
-                let mut resolve_text = |prim: &Prim| {
-                    text_runs
-                        .as_mut()
-                        .and_then(|runs| runs.resolve(&mut atlas, queue, prim))
-                };
-                let mut resolve_image =
-                    |prim: &Prim| super::image_runs::resolve(&mut image_atlas, queue, prim);
-                prims_to_group(
-                    &self.axis_prims,
-                    &[],
-                    axis_group,
-                    &mut resolve_text,
-                    &mut resolve_image,
-                );
+                axis_group.rebuild(AXIS_GROUP_KEY, self.axis_revision);
+                if lowering.lower(axis_group, &self.axis_prims, &[]) {
+                    axis_group.key ^= TEXT_FAILED_KEY_BIT;
+                    text_failed = true;
+                }
             }
-            let atlas_valid = atlas.frame_valid() && image_atlas.frame_valid();
+            let atlas_valid = atlas.frame_valid() && image_atlas.frame_valid() && !text_failed;
             drop(atlas);
             drop(image_atlas);
             if !atlas_valid {
@@ -441,10 +300,10 @@ impl ChartInner {
                             .texture
                             .create_view(&wgpu::TextureViewDescriptor::default());
                         let bg_clear = wgpu::Color {
-                            r: bg.r() as f64 / 255.0,
-                            g: bg.g() as f64 / 255.0,
-                            b: bg.b() as f64 / 255.0,
-                            a: 1.0,
+                            r: f64::from(bg.r()) * f64::from(bg.a()) / (255.0 * 255.0),
+                            g: f64::from(bg.g()) * f64::from(bg.a()) / (255.0 * 255.0),
+                            b: f64::from(bg.b()) * f64::from(bg.a()) / (255.0 * 255.0),
+                            a: f64::from(bg.a()) / 255.0,
                         };
                         let resources_before = gfx.frame_resources.stats();
                         let draw_calls = render_frame(
@@ -494,7 +353,9 @@ impl ChartInner {
         );
 
         match pane_outcome {
-            PaneRenderOutcome::Presented => {}
+            PaneRenderOutcome::Presented => {
+                set_backend_visibility(self.gpu_pane.as_ref(), self.fallback_pane.as_ref(), true);
+            }
             PaneRenderOutcome::Timeout => {
                 // Keep the last complete frame. The next animation/input repaint retries.
                 // This is exactly `frame_stats().dropped_frames`: encoded but never presented.
@@ -505,10 +366,12 @@ impl ChartInner {
                 self.activate_canvas2d("surface_acquisition_failed", &reason);
                 self.render_canvas2d()?;
             }
-            PaneRenderOutcome::Canvas2d => self.render_canvas2d()?,
+            PaneRenderOutcome::Canvas2d => {
+                self.render_canvas2d()?;
+                set_backend_visibility(self.gpu_pane.as_ref(), self.fallback_pane.as_ref(), false);
+            }
         }
 
-        self.paint_primitive_text_overlay()?;
         self.telemetry.count_presented();
         Ok(())
     }
@@ -522,92 +385,10 @@ impl ChartInner {
         if !self.axis_dirty {
             return;
         }
-        let axis_ctx = &self.axis_ctx;
-        let layout = self.opts().layout.clone();
-        let dpr = self.dpr;
-        // `measure_text_ctx` leaves the measurement canvas in bitmap-font space. Axis primitive
-        // placement is expressed in logical pixels until the engine performs the single DPR
-        // conversion, so normalize the browser's bitmap ink metrics before returning them.
-        axis_ctx.set_font(&format!(
-            "{}px {}",
-            layout.font_size * dpr,
-            layout.font_family
-        ));
-        axis_ctx.set_text_baseline("middle");
         self.engine
-            .build_axis_primitives_into(&self.axis_frame, &mut self.axis_prims, |text| {
-                axis_ctx
-                    .measure_text(text)
-                    .ok()
-                    .map(|metrics| {
-                        crate::text_cache::logical_midpoint_correction(
-                            metrics.actual_bounding_box_ascent(),
-                            metrics.actual_bounding_box_descent(),
-                            dpr,
-                        )
-                    })
-                    .unwrap_or(0.0)
-            });
+            .build_axis_primitives_into(&self.axis_frame, &mut self.axis_prims);
         self.axis_revision = self.axis_revision.wrapping_add(1).max(1);
         self.axis_dirty = false;
-    }
-
-    // ---- Legacy Canvas2D plugin-text escape hatch ----
-
-    fn paint_primitive_text_overlay(&mut self) -> Result<(), JsValue> {
-        if self.primitive_texts.is_empty() {
-            if self.overlay_had_plugin_text {
-                self.axis_ctx
-                    .clear_rect(0.0, 0.0, self.bitmap_w as f64, self.bitmap_h as f64);
-                self.overlay_had_plugin_text = false;
-                self.telemetry.add_canvas2d_ops(1);
-            }
-            return Ok(());
-        }
-        self.axis_ctx
-            .clear_rect(0.0, 0.0, self.bitmap_w as f64, self.bitmap_h as f64);
-        let ops = 1 + self.draw_primitive_overlay_texts(self.dpr)?;
-        self.overlay_had_plugin_text = true;
-        self.telemetry.add_canvas2d_ops(ops);
-        Ok(())
-    }
-
-    /// Paint the primitives' `text_views` overlay draws (plugin platform Phase 3.5) in media
-    /// coordinates (context scaled by DPR) like the axis labels. Each draw carries its own
-    /// fully-resolved font, color, and canvas alignment keywords; colors pass through verbatim
-    /// so alpha is preserved (same rule as the watermark).
-    fn draw_primitive_overlay_texts(&self, dpr: f64) -> Result<u32, JsValue> {
-        if self.primitive_texts.is_empty() {
-            return Ok(0);
-        }
-        let ctx = &self.axis_ctx;
-        ctx.save();
-        if let Err(error) = ctx.scale(dpr, dpr) {
-            ctx.restore();
-            return Err(error);
-        }
-        let mut ops = 0;
-        let mut draw_result = Ok(0);
-        for text in &self.primitive_texts {
-            ctx.save();
-            ctx.begin_path();
-            ctx.rect(text.clip[0], text.clip[1], text.clip[2], text.clip[3]);
-            ctx.clip();
-            ctx.set_font(&text.font);
-            ctx.set_fill_style_str(&text.color);
-            ctx.set_text_align(&text.align);
-            ctx.set_text_baseline(&text.baseline);
-            let result = ctx.fill_text(&text.text, text.x, text.y).map(|_| ());
-            ctx.restore();
-            if let Err(error) = result {
-                draw_result = Err(error);
-                break;
-            }
-            ops += 1;
-            draw_result = Ok(ops);
-        }
-        ctx.restore();
-        draw_result
     }
 
     /// Permanently switch this chart instance to its already-initialized Canvas2D pane.
@@ -658,6 +439,190 @@ impl ChartInner {
         // The `clear_rect` + background `fill_rect` above, plus every executed prim.
         self.telemetry.add_canvas2d_ops(2 + target.ops());
         Ok(())
+    }
+}
+
+const AXIS_GROUP_KEY: u64 = u64::MAX;
+
+/// Toggled into a retained group's key when lowering it dropped a visible text run. No live slot
+/// key uses this bit (the axis key is all ones and toggles to a value no pane slot can reach), so
+/// a marked group never matches as clean and is rebuilt as soon as its source changes.
+const TEXT_FAILED_KEY_BIT: u64 = 1 << 63;
+
+fn is_known_text_failure(
+    group: &DrawGroup,
+    key: u64,
+    source_revision: u64,
+    scissor: Option<[u32; 4]>,
+) -> bool {
+    group.key == key ^ TEXT_FAILED_KEY_BIT
+        && group.source_revision == source_revision
+        && group.scissor == scissor
+}
+
+/// One retained WebGPU pane group: its stable slot key, the engine revision of its source
+/// range, its scissor, and the primitives it lowers.
+struct RetainedGroup<'a> {
+    key: u64,
+    source_revision: u64,
+    scissor: Option<[u32; 4]>,
+    prims: &'a [Prim],
+    points: &'a [[f32; 2]],
+}
+
+/// Visits every retained pane group in submission order with its `gpu_groups` index. The
+/// failure pre-check and the build pass share this walk so they always agree on slot identity.
+fn for_each_retained_group<'a>(
+    engine: &'a ChartEngine,
+    frame: &'a aeris_charts_engine::ChartFrame,
+    mut visit: impl FnMut(usize, RetainedGroup<'a>),
+) {
+    let mut index = 0;
+    let mut emit = |key: u64,
+                    source_revision: u64,
+                    scissor: [u32; 4],
+                    prims: &'a [Prim],
+                    points: &'a [[f32; 2]]| {
+        visit(
+            index,
+            RetainedGroup {
+                key,
+                source_revision,
+                scissor: Some(scissor),
+                prims,
+                points,
+            },
+        );
+        index += 1;
+    };
+    for (pane, pane_frame) in frame.panes.iter().enumerate() {
+        let segments = engine.frame_pane_segments(pane).unwrap_or_default();
+        let main = &pane_frame.main[..];
+        let points = &pane_frame.points[..];
+        let scissor = pane_frame.scissor;
+        let range = |start: usize, end: usize| &main[start.min(main.len())..end.min(main.len())];
+        emit(
+            0x2000_0000 | (pane as u64) << 4,
+            segments.under_revision,
+            scissor,
+            &pane_frame.under[..segments.under_end.min(pane_frame.under.len())],
+            points,
+        );
+        // Chart content merged in paint order (ordering.rs): idle indicators, idle drawings,
+        // ordinary series, active series/drawings/previews, chrome. Series and drawing segments
+        // both carry out.main ranges; merging by start preserves pane-local order so WebGPU
+        // blends like Canvas2D. Ordering-only promotion swaps group order (key mismatch
+        // re-uploads moved groups) without rebuilding retained geometry.
+        let series_segs = engine.frame_series_segments(pane);
+        let drawing_segs = engine.frame_drawing_segments(pane);
+        let (mut si, mut di) = (0usize, 0usize);
+        loop {
+            let take_series = match (series_segs.get(si), drawing_segs.get(di)) {
+                (Some(s), Some(d)) => s.start <= d.start,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_series {
+                let series = &series_segs[si];
+                si += 1;
+                let key = match series.series_id {
+                    Some(id) => 0x3000_0000 | (pane as u64) << 32 | u64::from(id),
+                    None => 0x4000_0000 | pane as u64,
+                };
+                emit(
+                    key,
+                    series.revision,
+                    scissor,
+                    range(series.start, series.end),
+                    points,
+                );
+            } else {
+                let drawing = &drawing_segs[di];
+                di += 1;
+                let key = match drawing.drawing_id {
+                    Some(id) => 0x5000_0000 | (pane as u64) << 32 | u64::from(id),
+                    None => 0x6000_0000 | pane as u64,
+                };
+                emit(
+                    key,
+                    drawing.revision,
+                    scissor,
+                    range(drawing.start, drawing.end),
+                    points,
+                );
+            }
+        }
+        emit(
+            0x2000_0005 | (pane as u64) << 4,
+            segments.trading_revision,
+            scissor,
+            range(segments.series_end, segments.trading_regions_end),
+            points,
+        );
+        emit(
+            0x2000_0002 | (pane as u64) << 4,
+            segments.drawings_revision,
+            scissor,
+            range(segments.trading_regions_end, segments.drawings_end),
+            points,
+        );
+        emit(
+            0x2000_0006 | (pane as u64) << 4,
+            segments.trading_revision,
+            scissor,
+            range(segments.drawings_end, segments.trading_end),
+            points,
+        );
+        emit(
+            0x2000_0003 | (pane as u64) << 4,
+            segments.overlay_revision,
+            scissor,
+            range(segments.trading_end, segments.overlay_end),
+            points,
+        );
+        emit(
+            0x2000_0004 | (pane as u64) << 4,
+            segments.top_revision,
+            scissor,
+            &pane_frame.top_prims,
+            points,
+        );
+    }
+}
+
+/// Per-frame text/image resolution state shared by every group lowered in one WebGPU frame.
+struct GroupLowering<'f> {
+    text_runs: &'f mut Option<TextRunStore>,
+    atlas: &'f mut LabelAtlas,
+    image_atlas: &'f mut LabelAtlas,
+    queue: &'f wgpu::Queue,
+}
+
+impl GroupLowering<'_> {
+    /// Appends `prims` to `group`; returns whether a visible text run could not be resolved.
+    fn lower(&mut self, group: &mut DrawGroup, prims: &[Prim], points: &[[f32; 2]]) -> bool {
+        let mut failed = false;
+        let Self {
+            text_runs,
+            atlas,
+            image_atlas,
+            queue,
+        } = self;
+        let mut resolve_text = |prim: &Prim| {
+            let instance = text_runs
+                .as_mut()
+                .and_then(|runs| runs.resolve(atlas, queue, prim));
+            if instance.is_none()
+                && matches!(prim, Prim::Text { text, .. } | Prim::RotatedText { text, .. } if !text.trim().is_empty())
+            {
+                failed = true;
+            }
+            instance
+        };
+        let mut resolve_image = |prim: &Prim| super::image_runs::resolve(image_atlas, queue, prim);
+        prims_to_group(prims, points, group, &mut resolve_text, &mut resolve_image);
+        failed
     }
 }
 

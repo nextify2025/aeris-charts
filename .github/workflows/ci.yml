@@ -69,6 +69,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test native GPUI backend
         run: cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked
+      - name: Assert official GPUI pixel parity against tiny-skia
+        if: runner.os == 'Windows'
+        timeout-minutes: 20
+        run: cargo run -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity --locked
+      - uses: actions/upload-artifact@v7
+        if: failure() && runner.os == 'Windows'
+        with:
+          name: gpui-pixel-parity
+          path: target/pixel_parity/
+          retention-days: 7
 
   # Evidence, not yet a required check: what the GPUI executor actually presents in a real window,
   # diffed against the native (tiny-skia) reference. It runs on a virtual X server with Mesa
@@ -202,11 +212,16 @@ jobs:
         run: bunx playwright test
         env:
           AERIS_CHARTS_PORTABLE_BROWSER: "1"
-      - name: Run machine-sensitive pixel/GPU/performance evidence
+      - name: Run machine-sensitive reference/GPU/performance evidence
         id: machine-evidence
         continue-on-error: true
         working-directory: examples/web_demo
-        run: bunx playwright test tests/backend-parity.spec.mjs tests/engine-bench.spec.mjs tests/frame-stats.spec.mjs tests/gpui-webgpu-matrix.spec.mjs tests/perf-gate.spec.mjs --project=chromium
+        run: |
+          bunx playwright test tests/backend-parity.spec.mjs --project=chromium --grep "@machine"
+          $referenceEvidenceExit = $LASTEXITCODE
+          bunx playwright test tests/engine-bench.spec.mjs tests/frame-stats.spec.mjs tests/gpui-webgpu-matrix.spec.mjs tests/perf-gate.spec.mjs --project=chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          exit $referenceEvidenceExit
       - name: Run machine-sensitive retention-memory evidence
         id: machine-retention-evidence
         continue-on-error: true

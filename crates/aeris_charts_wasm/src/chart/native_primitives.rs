@@ -4,10 +4,10 @@ use super::*;
 use aeris_charts_core::model::data_validation::validate_timestamp;
 use aeris_charts_engine::{
     AccessibilityFocusOptions, AnchoredTextHorizontalAlign, AnchoredTextOptions,
-    AnchoredTextVerticalAlign, BandsIndicatorOptions, DeltaTooltipOptions, ImageWatermarkOptions,
-    OverlayPriceScaleOptions, OverlayPriceScaleSide, SessionHighlightingData,
-    SessionHighlightingOptions, TextWatermarkLine, TextWatermarkOptions, TooltipOptions,
-    TrendLineOptions, VerticalLineOptions, VolumeProfileData, VolumeProfileOptions,
+    AnchoredTextVerticalAlign, AreaBrushOverrides, BandsIndicatorOptions, BrushStyleOverride,
+    DeltaTooltipOptions, ImageWatermarkOptions, OverlayPriceScaleOptions, OverlayPriceScaleSide,
+    SessionHighlightingData, SessionHighlightingOptions, TextWatermarkLine, TextWatermarkOptions,
+    TooltipOptions, TrendLineOptions, VerticalLineOptions, VolumeProfileData, VolumeProfileOptions,
     VolumeProfilePoint,
 };
 use std::sync::Arc;
@@ -25,6 +25,27 @@ fn json_optional_color(value: &serde_json::Value, key: &str) -> Option<Color> {
         .get(key)
         .and_then(serde_json::Value::as_str)
         .and_then(Color::parse_css)
+}
+
+fn parse_brush_override(value: &serde_json::Value) -> Option<BrushStyleOverride> {
+    let color = |key: &str| match value.get(key) {
+        None => Some(None),
+        Some(field) => Some(Some(Color::parse_css(field.as_str()?)?)),
+    };
+    let line_width = match value.get("line_width") {
+        None => None,
+        Some(field) => Some(
+            field
+                .as_f64()
+                .filter(|width| width.is_finite() && *width > 0.0)?,
+        ),
+    };
+    Some(BrushStyleOverride {
+        line_color: color("line_color")?,
+        top_color: color("top_color")?,
+        bottom_color: color("bottom_color")?,
+        line_width,
+    })
 }
 
 fn parse_session_highlights(json: &str) -> Option<Vec<SessionHighlightingData>> {
@@ -233,6 +254,36 @@ impl ChartInner {
                 },
             )
             .unwrap_or(0)
+    }
+
+    pub(super) fn set_native_brushable_area(&mut self, series_id: u32, options_json: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(options_json) else {
+            return false;
+        };
+        if value.is_null() {
+            return self.engine.set_brushable_area(series_id, None);
+        }
+        let defaults = DeltaTooltipOptions::default();
+        let tooltip = DeltaTooltipOptions {
+            line_color: None,
+            show_time: defaults.show_time,
+            top_offset: defaults.top_offset,
+            requires_shift_drag: defaults.requires_shift_drag,
+        };
+        let (Some(outside), Some(positive), Some(negative)) = (
+            parse_brush_override(&value["outside"]),
+            parse_brush_override(&value["positive"]),
+            parse_brush_override(&value["negative"]),
+        ) else {
+            return false;
+        };
+        let overrides = AreaBrushOverrides {
+            outside,
+            positive,
+            negative,
+        };
+        self.engine
+            .set_brushable_area_with_styles(series_id, Some(tooltip), overrides)
     }
 
     pub(super) fn add_native_tooltip(&mut self, series_id: u32, options_json: &str) -> u32 {

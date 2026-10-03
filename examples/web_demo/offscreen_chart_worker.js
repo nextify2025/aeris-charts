@@ -49,11 +49,22 @@ function canvas_hash() {
 }
 
 function state(type = "state") {
+  const crosshair = new Float64Array(2);
+  chart.wasm.controller_crosshair_into(crosshair);
   postMessage({
     type,
     backend: chart.backend(),
     stats: chart.frame_stats(),
     range: chart.visible_logical_range(),
+    logical_320: chart.wasm.coordinate_to_logical(320 - chart.wasm.pane_left()),
+    price_range: chart.wasm.price_scale_visible_range(0, 0),
+    bar_spacing: chart.wasm.bar_spacing(),
+    crosshair: Number.isFinite(crosshair[0]) && Number.isFinite(crosshair[1])
+      ? [crosshair[0], crosshair[1]] : null,
+    axis_x: chart.wasm.pane_left() + chart.wasm.time_scale_width() + 12,
+    axis_y: chart.wasm.pane_height(0) / 2,
+    time_axis_y: chart.wasm.pane_height(0) + chart.wasm.time_scale_height() / 2,
+    series_ids: JSON.parse(chart.wasm.series_order_json()),
     size: [gpu_canvas.width, gpu_canvas.height],
     frame,
   });
@@ -85,6 +96,11 @@ self.onmessage = async (event) => {
     if (message.type === "pointer") chart.inject_pointer_event(message.event);
     else if (message.type === "wheel") chart.inject_wheel_event(message.event);
     else if (message.type === "key") chart.inject_key_event(message.event);
+    else if (message.type === "options") chart.apply_options(message.options);
+    else if (message.type === "select_series") chart.wasm.set_selected_series(message.id);
+    else if (message.type === "add_series") chart.add_series(message.kind);
+    else if (message.type === "bar_spacing") chart.wasm.set_bar_spacing(message.value);
+    else if (message.type === "price_range") chart.wasm.set_price_scale_visible_range(0, 0, message.from, message.to);
     else if (message.type === "resize") chart.resize(message.width, message.height, message.dpr);
     else if (message.type === "start") {
       if (timer !== null) clearInterval(timer);

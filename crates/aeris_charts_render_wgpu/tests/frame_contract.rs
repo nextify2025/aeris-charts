@@ -12,13 +12,165 @@ use aeris_charts_engine::{
 };
 use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, LineType, Prim, RasterImage};
+use aeris_charts_render::draw_list::{Gradient, LineStyle, LineType, Prim, RasterImage};
+use aeris_charts_render::line::{dash_split, expand_line, stroke_aa, LinePoint};
 use std::sync::Arc;
 
 use aeris_charts_render_wgpu::{
     geom_prims_to_tris, prims_to_group, prims_to_instances, DrawGroup, DrawRun, RunPipeline,
     TexQuadInstance,
 };
+
+#[test]
+fn native_golden_scene_reaches_every_webgpu_pipeline_in_prim_order() {
+    let scene = aeris_charts_native::scene::demo_scene();
+    let mut group = DrawGroup::default();
+    prims_to_group(
+        &scene.prims,
+        &scene.points,
+        &mut group,
+        &mut dummy_quad,
+        &mut |prim| {
+            matches!(prim, Prim::Image { .. }).then_some(TexQuadInstance {
+                rect: [371.0, 19.0, 32.0, 32.0],
+                uv: [0.0, 0.0, 1.0, 1.0],
+                color: [1.0; 4],
+            })
+        },
+    );
+    let routes: Vec<_> = group.runs.iter().map(|run| run.pipeline).collect();
+    for required in [
+        RunPipeline::Quad,
+        RunPipeline::Tri,
+        RunPipeline::TexQuad,
+        RunPipeline::ImageQuad,
+    ] {
+        assert!(
+            routes.contains(&required),
+            "golden scene lost {required:?} on WebGPU"
+        );
+    }
+    assert!(group.quads.len() > 10);
+    assert!(group.tris.len() > 100);
+    assert_eq!(group.tex_quads.len(), 1);
+    assert_eq!(group.image_quads.len(), 1);
+}
+
+#[test]
+fn styled_polylines_follow_shared_dashes_after_path_expansion() {
+    let points = [[0.0, 20.0], [40.0, 70.0], [100.0, 20.0]];
+    let color = Color::rgb(255, 0, 0);
+    for line_type in [LineType::Simple, LineType::Curved] {
+        for style in [LineStyle::Dashed, LineStyle::Dotted] {
+            let prim = Prim::Polyline {
+                first_point: 0,
+                point_count: points.len() as u32,
+                width: 2.0,
+                line_type,
+                style,
+                color,
+            };
+            let mut actual = Vec::new();
+            aeris_charts_render_wgpu::geom_prim_to_tris(&prim, &points, &mut actual);
+
+            let source: Vec<_> = points
+                .iter()
+                .map(|p| LinePoint {
+                    x: f64::from(p[0]),
+                    y: f64::from(p[1]),
+                })
+                .collect();
+            let expanded = expand_line(&source, line_type);
+            let pattern: Vec<_> = style.dash_pattern(2.0).into_iter().map(f64::from).collect();
+            let runs = dash_split(&expanded, &pattern);
+            assert!(runs.len() > 1, "fixture must contain visible gaps");
+            let mut expected = Vec::new();
+            for run in runs {
+                stroke_aa(&run, 2.0, |triangle| {
+                    expected.extend(triangle.map(|v| aeris_charts_render_wgpu::TriVertex {
+                        pos: v.position,
+                        color: [1.0, 0.0, 0.0, v.coverage()],
+                    }));
+                });
+            }
+            assert_eq!(actual.len(), expected.len(), "{line_type:?} {style:?}");
+            for (got, want) in actual.iter().zip(expected.iter()) {
+                assert_eq!(got.pos, want.pos, "{line_type:?} {style:?}");
+                assert_eq!(got.color, want.color, "{line_type:?} {style:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn background_gradient_uses_its_own_rect_on_canvas_and_webgpu() {
+    let top = Color::rgba(20, 30, 40, 255);
+    let bottom = Color::rgba(90, 110, 130, 200);
+    let prim = Prim::Background {
+        rect: [7.0, 11.0, 37.0, 41.0],
+        gradient: Gradient { top, bottom },
+    };
+    let mut canvas = CountingCanvas::default();
+    execute(
+        std::slice::from_ref(&prim),
+        &[],
+        &mut canvas,
+        Viewport {
+            width: 200.0,
+            height: 200.0,
+        },
+    );
+    assert_eq!(canvas.gradients, vec![(11.0, 52.0, top, bottom)]);
+    assert_eq!(canvas.rects[0].0, [7.0, 11.0, 37.0, 41.0]);
+    let mut gpu = Vec::new();
+    aeris_charts_render_wgpu::geom_prim_to_tris(&prim, &[], &mut gpu);
+    assert_eq!(gpu.len(), 6);
+    let expected = [
+        [7.0, 11.0],
+        [44.0, 11.0],
+        [7.0, 52.0],
+        [44.0, 11.0],
+        [44.0, 52.0],
+        [7.0, 52.0],
+    ];
+    for (vertex, position) in gpu.iter().zip(expected) {
+        assert_eq!(vertex.pos, position);
+        let wanted = if position[1] == 11.0 { top } else { bottom };
+        let color = [wanted.r(), wanted.g(), wanted.b(), wanted.a()]
+            .map(|channel| f32::from(channel) / 255.0);
+        assert_eq!(vertex.color, color);
+    }
+}
+
+#[test]
+fn transparent_round_rect_fill_has_no_border_geometry_inside_the_inner_rect() {
+    let prim = Prim::RoundRect {
+        x: 10.0,
+        y: 10.0,
+        w: 20.0,
+        h: 20.0,
+        radii: [0.0; 4],
+        fill: Color::rgba(0, 0, 0, 0),
+        border_width: 2.0,
+        border_color: Color::rgb(255, 0, 0),
+    };
+    let mut vertices = Vec::new();
+    aeris_charts_render_wgpu::geom_prim_to_tris(&prim, &[], &mut vertices);
+    let mut border_triangles = 0;
+    for triangle in vertices.as_chunks::<3>().0 {
+        if triangle[0].color[3] == 0.0 {
+            continue;
+        }
+        border_triangles += 1;
+        let x = triangle.iter().map(|vertex| vertex.pos[0]).sum::<f32>() / 3.0;
+        let y = triangle.iter().map(|vertex| vertex.pos[1]).sum::<f32>() / 3.0;
+        assert!(
+            x <= 12.0 || x >= 28.0 || y <= 12.0 || y >= 28.0,
+            "border triangle covers the transparent inner rect at ({x}, {y})"
+        );
+    }
+    assert!(border_triangles > 0);
+}
 
 /// A minimal text prim for scheduling tests (content is irrelevant to the group builder).
 fn text_prim(x: f32) -> Prim {
@@ -56,6 +208,7 @@ struct CountingCanvas {
     rects: Vec<([f32; 4], Color)>,
     arcs: usize,
     fills: usize,
+    gradients: Vec<(f32, f32, Color, Color)>,
 }
 
 impl Canvas2d for CountingCanvas {
@@ -63,8 +216,10 @@ impl Canvas2d for CountingCanvas {
         self.calls += 1;
         self.fill_color = Some(color);
     }
-    fn set_fill_vgradient(&mut self, _: f32, _: f32, _: Color, _: Color) {
+    fn set_fill_vgradient(&mut self, top_y: f32, bottom_y: f32, top: Color, bottom: Color) {
         self.calls += 1;
+        self.fill_color = Some(top);
+        self.gradients.push((top_y, bottom_y, top, bottom));
     }
     fn set_stroke(&mut self, _: Color) {
         self.calls += 1;
@@ -301,8 +456,8 @@ fn one_engine_frame_is_consumable_by_canvas2d_and_webgpu_adapters() {
     }
 }
 
-/// The WebGPU stroker ignores `Prim::Polyline::style` (it has no dash concept), so the frame
-/// producer must lower every dashed or dotted line to solid dash runs before a frame reaches it.
+/// The frame producer lowers every dashed or dotted line to solid dash runs before a frame
+/// reaches an executor, clipped to the pane so the dash count follows the visible length.
 /// Pins that producer contract at the WebGPU boundary for a dashed series line and a dashed
 /// indicator output, in every layer a backend executes.
 #[test]

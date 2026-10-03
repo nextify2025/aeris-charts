@@ -183,10 +183,18 @@ fn the_op_stream_shape_matches_the_canvas2d_call_stream() {
             height: 200.0,
         },
     );
+    let mut expected = rec.ops;
+    // AreaFill paints its solid core and coverage fringe as adjacent paths. Keeping the fringe
+    // separate preserves GPUI's bounds-relative gradient while retaining one logical frame prim.
+    let area_index = expected
+        .iter()
+        .position(|kind| *kind == "mesh")
+        .expect("area mesh");
+    expected.insert(area_index + 1, "mesh");
     assert_eq!(
         kinds(&plan),
-        rec.ops,
-        "the GPUI op stream must have the same shape and order as Canvas2D's call stream"
+        expected,
+        "GPUI keeps the area fringe beside its core"
     );
 }
 

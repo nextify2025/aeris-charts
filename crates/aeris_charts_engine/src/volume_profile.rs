@@ -1,4 +1,5 @@
 //! Engine-owned visible-range OHLCV volume-profile indicator.
+use crate::frame::{pane_scale, series_scale_target};
 use crate::native_primitives::NativeSeriesPrimitiveKind;
 use crate::{ChartEngine, NativePrimitiveId, SeriesId};
 use aeris_charts_indicators::volume_profile::{
@@ -183,6 +184,9 @@ impl ChartEngine {
         }
         state.options = options;
         self.invalidate_frame_series(source);
+        if self.selected_volume_profile == Some(id) {
+            self.invalidate_frame_overlay();
+        }
         true
     }
 
@@ -225,6 +229,174 @@ impl ChartEngine {
                     _ => None,
                 }
             })
+    }
+
+    /// Visit the painted rows of one profile in chart CSS px as `(row, left, top, bottom)`. Each
+    /// bar spans `left` to the pane's right edge, matching the frame geometry.
+    fn for_each_volume_profile_row(
+        &self,
+        series: &crate::SeriesEntry,
+        state: &VolumeProfileIndicatorState,
+        mut visit: impl FnMut(usize, f64, f64, f64),
+    ) {
+        if !series.visible || !state.options.visible || series.pane_index >= self.panes.len() {
+            return;
+        }
+        let profile = &state.snapshot.profile;
+        let Some(max_volume) = profile.poc_index.map(|poc| profile.rows[poc].volume) else {
+            return;
+        };
+        if max_volume <= 0.0 {
+            return;
+        }
+        let Some((from, _)) = self.visible_range_for_frame() else {
+            return;
+        };
+        let Some(base_value) = self.series_base_value(series.id, from) else {
+            return;
+        };
+        let scale = pane_scale(&self.panes[series.pane_index], series_scale_target(series));
+        if scale.is_empty() {
+            return;
+        }
+        let right = self.pane_w.max(0.0);
+        let width = right * state.options.width_percent / 100.0;
+        for (index, row) in profile.rows.iter().enumerate() {
+            if row.volume <= 0.0 {
+                continue;
+            }
+            let low = scale.price_to_coordinate(row.low, base_value);
+            let high = scale.price_to_coordinate(row.high, base_value);
+            visit(
+                index,
+                right - width * row.volume / max_volume,
+                low.min(high),
+                low.max(high),
+            );
+        }
+    }
+
+    /// The topmost visible volume-profile indicator painted at `(x, y)` (chart CSS px).
+    pub fn volume_profile_indicator_at(&self, x: f64, y: f64) -> Option<NativePrimitiveId> {
+        // Rows can be thinner than a pixel; keep a one-pixel band hittable.
+        const ROW_TOLERANCE: f64 = 0.5;
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || x > self.pane_w {
+            return None;
+        }
+        let pane = self.pane_at_y(y)?;
+        for &series_id in self.series_order.iter().rev() {
+            let Some(series) = self.series_entry(series_id) else {
+                continue;
+            };
+            if series.pane_index != pane {
+                continue;
+            }
+            for primitive in series.native_primitives.iter().rev() {
+                let NativeSeriesPrimitiveKind::VolumeProfileIndicator(state) = &primitive.kind
+                else {
+                    continue;
+                };
+                let mut hit = false;
+                self.for_each_volume_profile_row(series, state, |_, left, top, bottom| {
+                    hit |= x >= left && y >= top - ROW_TOLERANCE && y <= bottom + ROW_TOLERANCE;
+                });
+                if hit {
+                    return Some(primitive.id);
+                }
+            }
+        }
+        None
+    }
+
+    fn volume_profile_indicator_exists(&self, id: NativePrimitiveId) -> bool {
+        self.volume_profile_indicator_options(id).is_some()
+    }
+
+    /// The selected volume-profile indicator. Selecting one clears series, drawing, and
+    /// general-series selection; any of those selections clears it.
+    pub fn selected_volume_profile_indicator(&self) -> Option<NativePrimitiveId> {
+        self.selected_volume_profile
+            .filter(|&id| self.volume_profile_indicator_exists(id))
+    }
+
+    /// Select (or clear with `None`) a volume-profile indicator. Returns `false` for an unknown id.
+    pub fn set_selected_volume_profile_indicator(&mut self, id: Option<NativePrimitiveId>) -> bool {
+        if id.is_some_and(|id| !self.volume_profile_indicator_exists(id)) {
+            return false;
+        }
+        if id.is_some() {
+            self.set_selected_series(None);
+            self.set_selected_drawing(None);
+            self.clear_general_selection();
+        }
+        if self.selected_volume_profile != id {
+            self.selected_volume_profile = id;
+            self.invalidate_frame_overlay();
+        }
+        true
+    }
+
+    pub(crate) fn clear_volume_profile_selection(&mut self) {
+        if self.selected_volume_profile.take().is_some() {
+            self.invalidate_frame_overlay();
+        }
+    }
+
+    pub fn hovered_volume_profile_indicator(&self) -> Option<NativePrimitiveId> {
+        self.hovered_volume_profile
+            .filter(|&id| self.volume_profile_indicator_exists(id))
+    }
+
+    pub(crate) fn set_hovered_volume_profile(&mut self, id: Option<NativePrimitiveId>) {
+        self.hovered_volume_profile = id;
+    }
+
+    /// Selection anchors for the selected profile: accent-bordered discs at the bar tips of its
+    /// outer rows, value-area bounds, and POC, so a selected profile reads like a selected
+    /// indicator line.
+    pub(crate) fn volume_profile_selection_anchor_points(
+        &self,
+        pane_index: usize,
+    ) -> Vec<(f64, f64)> {
+        let Some(id) = self.selected_volume_profile_indicator() else {
+            return Vec::new();
+        };
+        let Some((series, state)) = self.series.iter().find_map(|series| {
+            series.native_primitives.iter().find_map(|primitive| {
+                match (&primitive.kind, primitive.id == id) {
+                    (NativeSeriesPrimitiveKind::VolumeProfileIndicator(state), true) => {
+                        Some((series, state))
+                    }
+                    _ => None,
+                }
+            })
+        }) else {
+            return Vec::new();
+        };
+        if series.pane_index != pane_index {
+            return Vec::new();
+        }
+        let profile = &state.snapshot.profile;
+        let mut rows = Vec::with_capacity(5);
+        let mut first = None;
+        let mut last = None;
+        self.for_each_volume_profile_row(series, state, |index, left, top, bottom| {
+            let point = (index, left, (top + bottom) / 2.0);
+            first.get_or_insert(point);
+            last = Some(point);
+            if Some(index) == profile.poc_index
+                || (state.options.show_value_area
+                    && (Some(index) == profile.value_area_low_index
+                        || Some(index) == profile.value_area_high_index))
+            {
+                rows.push(point);
+            }
+        });
+        rows.extend(first);
+        rows.extend(last);
+        rows.sort_by_key(|&(index, _, _)| index);
+        rows.dedup_by_key(|&mut (index, _, _)| index);
+        rows.into_iter().map(|(_, x, y)| (x, y)).collect()
     }
 
     pub(crate) fn drop_volume_profiles_using(&mut self, volume_source: SeriesId) {
@@ -343,6 +515,9 @@ impl ChartEngine {
                 }
             }
             self.invalidate_frame_series(source);
+            if self.selected_volume_profile == Some(id) {
+                self.invalidate_frame_overlay();
+            }
         }
     }
 }

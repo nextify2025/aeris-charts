@@ -171,7 +171,7 @@ pub struct GeneralAxis {
     view_domain: Option<GeneralAxisView>,
     /// Negotiated strip width for vertical axes. Horizontal strip heights are derived from the
     /// shared font metrics because they do not depend on glyph advance.
-    layout_thickness: f64,
+    pub(crate) layout_thickness: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

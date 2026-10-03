@@ -25,7 +25,7 @@ export interface chart_theme {
   border: string;
   muted_border: string;
   ring: string;
-  /** Crosshair line color. Named themes alias this to the dark-theme `border`. */
+  /** Crosshair line color. Named themes share the theme-independent `crosshair_line` token. */
   crosshair_line: string;
   /** Crosshair label surface. Named themes alias this to the dark-theme `muted`. */
   crosshair_label: string;
@@ -47,7 +47,7 @@ export const light_theme: chart_theme = {
   border: style_tokens.light.border,
   muted_border: style_tokens.light.muted_border,
   ring: style_tokens.light.ring,
-  crosshair_line: style_tokens.dark.border,
+  crosshair_line: style_tokens.crosshair_line,
   crosshair_label: style_tokens.dark.muted,
   bullish: style_tokens.light.bullish,
   bearish: style_tokens.light.bearish,
@@ -65,7 +65,7 @@ export const dark_theme: chart_theme = {
   border: style_tokens.dark.border,
   muted_border: style_tokens.dark.muted_border,
   ring: style_tokens.dark.ring,
-  crosshair_line: style_tokens.dark.border,
+  crosshair_line: style_tokens.crosshair_line,
   crosshair_label: style_tokens.dark.muted,
   bullish: style_tokens.dark.bullish,
   bearish: style_tokens.dark.bearish,

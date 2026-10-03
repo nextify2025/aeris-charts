@@ -1041,7 +1041,7 @@ impl ChartEngine {
                         None
                     };
                     // Dashed styles split into solid dash runs (the series' dash contract), so
-                    // the WebGPU tessellator, which has no dash concept, paints Canvas2D's dashes.
+                    // every executor paints the same dashes over the stroke's visible reach.
                     let mut push = |run: &[(f64, f64)]| {
                         push_clipped_stroke(
                             out,

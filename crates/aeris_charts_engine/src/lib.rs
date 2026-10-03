@@ -79,8 +79,9 @@ pub use alerts::{
     AlertPriceScale, AlertSnapshot, MAX_ALERT_LINES,
 };
 pub use chart_input::{
-    ChartContextMenu, ChartCursor, ChartInputEvent, ChartKey, ChartRegion, InteractionOptions,
-    PointerInput, PANE_SEPARATOR_HIT, TRADING_TOOLTIP_DWELL_MS,
+    ChartContextMenu, ChartCursor, ChartFocusTarget, ChartHover, ChartInputEvent, ChartKey,
+    ChartRegion, HostPrimitiveHit, HostPrimitiveLayer, InteractionOptions, PointerInput,
+    CLICK_SLOP_MANHATTAN, PANE_SEPARATOR_HIT, TRADING_TOOLTIP_DWELL_MS,
 };
 pub use depth::{
     DepthBook, DepthBucket, DepthError, DepthEventCluster, DepthEventKind, DepthEventLayerOptions,
@@ -205,7 +206,9 @@ pub use general_series::{
     MAX_GENERAL_SHARED_TOOLTIP_ITEMS, MIN_GENERAL_POINT_RADIUS,
 };
 pub use hit_test::{SeriesHit, SeriesHitKind};
-pub use host_layout::{FinancialFramePreparation, FinancialFrameRequest};
+pub use host_layout::{
+    ExportFrame, ExportFrameRequest, FinancialFramePreparation, FinancialFrameRequest,
+};
 pub(crate) use indicators::{IndicatorBinding, IndicatorChange};
 pub use indicators::{
     IndicatorBindingInfo, IndicatorChromeOptions, IndicatorInputSource, IndicatorKind,
@@ -996,6 +999,53 @@ pub struct AreaBrushDefaults {
     pub negative: BrushStyle,
 }
 
+/// Explicit host color and width overrides for one brush state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BrushStyleOverride {
+    pub line_color: Option<Color>,
+    pub top_color: Option<Color>,
+    pub bottom_color: Option<Color>,
+    pub line_width: Option<f64>,
+}
+
+impl BrushStyleOverride {
+    fn apply(self, mut style: BrushStyle) -> BrushStyle {
+        if let Some(color) = self.line_color {
+            style.line_color = color;
+        }
+        if let Some(color) = self.top_color {
+            style.top_color = color;
+        }
+        if let Some(color) = self.bottom_color {
+            style.bottom_color = color;
+        }
+        if let Some(width) = self
+            .line_width
+            .filter(|width| width.is_finite() && *width > 0.0)
+        {
+            style.line_width = width;
+        }
+        style
+    }
+}
+
+/// Optional presentation overrides retained with an engine-owned brushable Area.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AreaBrushOverrides {
+    pub outside: BrushStyleOverride,
+    pub positive: BrushStyleOverride,
+    pub negative: BrushStyleOverride,
+}
+
+impl AreaBrushOverrides {
+    fn apply(self, mut defaults: AreaBrushDefaults) -> AreaBrushDefaults {
+        defaults.outside = self.outside.apply(defaults.outside);
+        defaults.positive = self.positive.apply(defaults.positive);
+        defaults.negative = self.negative.apply(defaults.negative);
+        defaults
+    }
+}
+
 /// One logical half-open range styled by the brushable-area interaction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrushRange {
@@ -1408,6 +1458,22 @@ impl SeriesStore {
     fn changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
     }
+
+    /// Mutable lookup that does not advance the revision. A revision change invalidates the whole
+    /// retained scene, so this is only for presentation state whose caller issues its own narrower
+    /// frame invalidation.
+    pub(crate) fn presentation_mut(
+        &mut self,
+        mut matches: impl FnMut(&SeriesEntry) -> bool,
+    ) -> Option<&mut SeriesEntry> {
+        self.entries.iter_mut().find(|series| matches(series))
+    }
+
+    /// Every entry for presentation state, without advancing the revision; the same contract as
+    /// [`Self::presentation_mut`].
+    pub(crate) fn presentation_iter_mut(&mut self) -> std::slice::IterMut<'_, SeriesEntry> {
+        self.entries.iter_mut()
+    }
 }
 
 impl From<Vec<SeriesEntry>> for SeriesStore {
@@ -1462,6 +1528,7 @@ pub const PANE_SEPARATOR: f64 = 2.0;
 /// scales nowhere until re-assigned to a live pane.
 pub(crate) const PANELESS: usize = usize::MAX;
 
+#[derive(Clone)]
 pub struct Pane {
     /// Chart-local identity that survives index changes and is never reused. Zero is reserved for
     /// standalone/default panes that are not owned by a [`ChartEngine`].
@@ -1592,6 +1659,7 @@ impl Pane {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct NamedPriceScale {
     pub id: PriceScaleId,
     pub public_id: String,
@@ -2015,6 +2083,10 @@ pub struct ChartEngine {
     /// The series the host last clicked plus the canonical source timestamps sampled on the
     /// unselected -> selected transition. Coordinate changes only reproject this snapshot.
     selection: Option<SelectionAnchorSnapshot>,
+    /// Engine volume-profile indicators are series primitives rather than output series, so their
+    /// hover and selection live beside the series selection and exclude it.
+    hovered_volume_profile: Option<NativePrimitiveId>,
+    selected_volume_profile: Option<NativePrimitiveId>,
     /// Series-primitive autoscale contributions for the current frame build (Phase C-b).
     /// Hosts clear and re-record them per frame, before any layout/autoscale pass runs;
     /// `autoscale_for_frame` unions them into the owning scales.
@@ -2229,6 +2301,8 @@ impl ChartEngine {
             series_order_explicit: false,
             hovered_series: None,
             selection: None,
+            hovered_volume_profile: None,
+            selected_volume_profile: None,
             primitive_autoscale: Vec::new(),
             drawings: Vec::new(),
             drawing_runtime: RefCell::new(DrawingRuntime::default()),

@@ -160,12 +160,14 @@ test("series primitive paints identically on both backends, labels its series' a
   expect(pane_backend_diff, "series primitive pane geometry must remain pixel-identical").toBe(0);
   const backend_diff = count_different(gpu_attached, canvas_attached);
   const backend_max_delta = max_channel_delta(gpu_attached, canvas_attached);
-  if (backend_diff > 5_000 || backend_max_delta > 64) {
+  console.log(`series-primitive full-frame residual: ${backend_diff} px, max delta ${backend_max_delta}`);
+  if (backend_diff > 2_600 || backend_max_delta > 40) {
     await test_info.attach("webgpu.png", { body: PNG.sync.write(gpu_attached), contentType: "image/png" });
     await test_info.attach("canvas2d.png", { body: PNG.sync.write(canvas_attached), contentType: "image/png" });
   }
-  expect(backend_diff, "full-frame differences must stay confined to bounded AA edges").toBeLessThanOrEqual(5_000);
-  expect(backend_max_delta).toBeLessThanOrEqual(64);
+  // Windows SwiftShader measurement: 2,307 pixels, max delta 32.
+  expect(backend_diff, "full-frame differences must stay confined to bounded AA edges").toBeLessThanOrEqual(2_600);
+  expect(backend_max_delta).toBeLessThanOrEqual(40);
 });
 
 test("series primitive autoscale_info expands the owning scale and detach restores it", async ({ page }) => {
