@@ -10,7 +10,7 @@
  *
  *   git clone https://github.com/klinecharts/KLineChart.git /tmp/KLineChart
  *   git -C /tmp/KLineChart checkout 044773a57fbbb8fa70f8bb00661a87f9089b5d29   # v10.0.3
- *   npx tsx tools/klinechart_parity/generate.ts /tmp/KLineChart \
+ *   bunx tsx tools/klinechart_parity/generate.ts /tmp/KLineChart \
  *     > crates/aeris_charts_indicators/tests/fixtures/klinechart_parity.json
  *
  * KLineChart is Copyright (c) 2019 lihu and licensed under the Apache License, Version 2.0.

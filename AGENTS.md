@@ -121,11 +121,11 @@ cargo test --workspace
 AERIS_CHARTS_PERF_STRICT=1 cargo run -p aeris_charts_native --example perf_gate --release
 
 cd packages/charts
-npm ci
-npm run lint
-npm run build
-npm run typecheck
-npm run test:pack
+bun install --frozen-lockfile
+bun run lint
+bun run build
+bun run typecheck
+bun run test:pack
 ```
 
 Run Playwright once per batch when the batch changes browser-facing behavior, and GPUI parity/replay checks once per batch when it changes GPUI executor behavior. Documentation-only changes may skip code gates, but still require diff, link/path, architecture-consistency, and documentation-hygiene checks.

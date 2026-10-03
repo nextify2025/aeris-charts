@@ -6,7 +6,7 @@ import { test, expect } from "@playwright/test";
 // .wasm*, so the same numbers can be taken before and after a build-flag change.
 //
 // Run it against a build, record the numbers, change the flags, rebuild, run it again:
-//   npx playwright test tests/engine-bench.spec.mjs --project=chromium
+//   bunx playwright test tests/engine-bench.spec.mjs --project=chromium
 //
 // Report-only by design: these are comparative numbers for a PR, not a gate. Absolute values on a
 // software rasterizer mean nothing on their own.

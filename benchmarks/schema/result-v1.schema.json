@@ -34,6 +34,7 @@
         "wasm_pack_version": { "type": ["string", "null"] },
         "node_version": { "type": "string" },
         "npm_version": { "type": ["string", "null"] },
+        "bun_version": { "type": ["string", "null"] },
         "esbuild_version": { "type": ["string", "null"] },
         "package_lock_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "cargo_lock_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },

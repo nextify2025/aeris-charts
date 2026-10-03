@@ -538,11 +538,11 @@ cargo test --workspace --locked
 AERIS_CHARTS_PERF_STRICT=1 cargo run -p aeris_charts_native --example perf_gate --release
 
 cd packages/charts
-npm ci
-npm run lint
-npm run build
-npm run typecheck
-npm run test:pack
+bun install --frozen-lockfile
+bun run lint
+bun run build
+bun run typecheck
+bun run test:pack
 ```
 
 Also run public API/namespace/release-policy guards, applicable Chromium/Firefox/WebKit Playwright
