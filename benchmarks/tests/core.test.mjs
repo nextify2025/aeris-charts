@@ -13,7 +13,7 @@ function fixture() {
     schema_version: 1,
     product: { name: "aeris_charts-financial", version: "0.8.13" },
     source: { git_commit: "abc", git_branch: "main", git_tag: null, dirty_worktree: false },
-    build: { profile: "release", logging: "default-no-verbose-debug", build_command: "npm run build", rustc_version: "rustc test", wasm_pack_version: "wasm-pack test", cargo_profile: "release", wasm_opt_version: "wasm-opt test", node_version: process.version, npm_version: "test", esbuild_version: "test", package_lock_sha256: "0".repeat(64), cargo_lock_sha256: "1".repeat(64), wasm_opt_args: ["-Oz"] },
+    build: { profile: "release", logging: "default-no-verbose-debug", build_command: "bun run build", rustc_version: "rustc test", wasm_pack_version: "wasm-pack test", cargo_profile: "release", wasm_opt_version: "wasm-opt test", node_version: process.version, npm_version: "test", esbuild_version: "test", package_lock_sha256: "0".repeat(64), cargo_lock_sha256: "1".repeat(64), wasm_opt_args: ["-Oz"] },
     environment: { ...base_environment("official-benchmark-runner"), id: "official-test" },
     execution: { profile: "release", started_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:01:00.000Z", clock: "performance.now monotonic in browser and Node; std::time::Instant monotonic in native Rust; wall time is metadata only", command: "benchmark release" },
     scenarios: [{

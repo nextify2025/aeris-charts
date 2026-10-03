@@ -191,8 +191,8 @@ latest mode exposes only the most recently recorded visible-frame value and may 
 the series is not rendered.
 
 The declaration manifest at `packages/charts/api/public-api-v1.json` records every supported
-declaration file. CI runs `npm run check:api`; after deliberate review, update it with
-`npm run update:api`.
+declaration file. CI runs `bun run check:api`; after deliberate review, update it with
+`bun run update:api`.
 
 Grid lines are engine-owned and default to visible dashed lines. Demo hosts may hide grid
 visibility without replacing the canonical grid style/color; that presentation choice is not a
@@ -1835,8 +1835,8 @@ browser package is the only published artifact. Hosts such as Aeris Terminal con
 `aeris_charts_*` crates through pinned Git revisions or local paths. The Rust API is below 1.0 and
 may change in any revision, so a host reviews the notes below when it moves its pin.
 
-`aeris_charts_render_gpui` is experimental. It pins `gpui-pre` 0.3.6, the GPUI snapshot gpui-kit
-0.6.6 depends on, with an exact version requirement, so a host that draws the chart must use that
+`aeris_charts_render_gpui` is experimental. It pins `gpui-pre` 0.3.7, the GPUI snapshot gpui-kit
+0.7.0 depends on, with an exact version requirement, so a host that draws the chart must use that
 same `gpui` (a host on another GPUI build, such as a Zed Git revision, holds two incompatible copies
 of its types). GPUI upgrades are explicit manifest and lockfile changes.
 
@@ -2142,6 +2142,24 @@ depending on a Zed Git revision:
   source compiled unchanged against `gpui-pre` 0.3.6, so Aeris's own API did not change. The
   host's own GPUI code is not checked from this repository: moving to `gpui-pre` 0.3.6 is the
   host's change to make and verify.
+
+**GPUI snapshot 0.3.7** (own line, the commit that moves `gpui-pre` to 0.3.7 and every other
+dependency to its latest release; find it with `git log -S'=0.3.7' --
+crates/aeris_charts_render_gpui/Cargo.toml`). It follows gpui-kit, which moved from 0.6.6 to 0.7.0
+and pins `gpui-pre =0.3.7` together with `gpui-pre-platform`, `gpui-pre-web`, `gpui-pre-macros`
+and `gpui-pre-sum-tree` at the same version:
+
+- A host that consumes this executor must be on one `gpui-pre` version, so a host still on
+  gpui-kit 0.6.6 (`gpui-pre =0.3.6`) moves to gpui-kit 0.7.0 in the same change as the Aeris pin;
+  with one on each side Cargo resolves two incompatible `gpui` copies and every adapter and
+  executor call that takes or returns a GPUI type fails to type-check, as with the earlier Zed
+  revision above.
+- Aeris's own API did not change: the executor and adapter source compiled unchanged against
+  0.3.7 and the complete GPUI test suite passed unchanged. The host's own GPUI code is not checked
+  from this repository.
+- The parity harness's X11 capture moved to `x11rb` 0.14 (a Linux dev-dependency of the examples
+  only). GPUI's Linux platform still depends on `x11rb` 0.13, so the example build holds both;
+  nothing a host links is affected.
 
 **Measuring tools** (both lines, from the merge `3eef45e merge: sync with
 AerisTerminal/aeris-charts main (range tools, input controller)`). Upstream's `5a2e6e8 feat(drawings): add price/date range

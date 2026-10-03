@@ -192,7 +192,7 @@ async function capture_webgpu(page, matrix_case) {
 }
 
 test.describe("GPUI versus presented WebGPU matrix", () => {
-  test.skip(!enabled, "run explicitly with `npm run test:gpui-webgpu`");
+  test.skip(!enabled, "run explicitly with `bun run test:gpui-webgpu`");
   test.skip(
     process.platform !== "win32" && process.platform !== "linux",
     "the GPUI capture helper reads the window through Windows DWM or the Linux X server",

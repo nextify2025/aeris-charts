@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const dist = join(root, "dist");
 const snapshot_path = join(root, "api", "public-api-v1.json");
-assert.ok(existsSync(dist), "dist is missing; run npm run build first");
+assert.ok(existsSync(dist), "dist is missing; run bun run build first");
 
 const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
   const path = join(dir, entry.name);
@@ -37,6 +37,6 @@ if (process.argv.includes("--update")) {
   console.log(`updated ${snapshot_path}`);
 } else {
   assert.equal(readFileSync(snapshot_path, "utf8"), snapshot,
-    "public TypeScript declarations changed; review them, then run npm run update:api");
+    "public TypeScript declarations changed; review them, then run bun run update:api");
   console.log(`public API snapshot OK (${files.length} declaration files)`);
 }

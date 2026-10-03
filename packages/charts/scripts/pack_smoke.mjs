@@ -1,5 +1,5 @@
 /**
- * `npm run test:pack` — publish-readiness smoke test.
+ * `bun run test:pack` — publish-readiness smoke test.
  *
  * Packs the package exactly as npm would for publish, installs the tarball into a scratch dir,
  * and asserts the installed artifact is complete and importable:
@@ -27,9 +27,13 @@ const scratch = mkdtempSync(join(tmpdir(), "aeris_charts-pack-smoke-"));
 const env = { ...process.env };
 delete env.npm_config_dry_run;
 
+// `npm_execpath` names whichever package manager started this script; only npm's own CLI can be
+// re-run through node (under `bun run` it is the bun binary, so `npm` is called by name instead).
+const npm_cli = /npm-cli\.[cm]?js$/.test(process.env.npm_execpath ?? "") ? process.env.npm_execpath : null;
+
 const run = (cmd, args, cwd) => {
-  if (cmd === "npm" && process.env.npm_execpath) {
-    return execFileSync(process.execPath, [process.env.npm_execpath, ...args], { cwd, env, encoding: "utf8" }).trim();
+  if (cmd === "npm" && npm_cli) {
+    return execFileSync(process.execPath, [npm_cli, ...args], { cwd, env, encoding: "utf8" }).trim();
   }
   return execFileSync(cmd, args, { cwd, env, encoding: "utf8" }).trim();
 };
@@ -51,7 +55,7 @@ try {
   }
   assert.ok(
     !files.some((f) => f.startsWith("package/dist/src/")),
-    "stale dist/src/*.d.ts duplicates leaked into the tarball (run npm run clean first)",
+    "stale dist/src/*.d.ts duplicates leaked into the tarball (run bun run clean first)",
   );
 
   // 2. Install the tarball into a scratch consumer.

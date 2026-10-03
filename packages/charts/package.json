@@ -69,11 +69,11 @@
     "build:types": "tsc --declaration --emitDeclarationOnly --outDir dist --noEmit false",
     "build:copy-wasm": "node -e \"const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.copyFileSync('pkg/aeris_charts_wasm_bg.wasm','dist/aeris_charts_wasm_bg.wasm')\"",
     "build:copy-design": "node -e \"const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.copyFileSync('src/aeris_charts.css','dist/aeris_charts.css')\"",
-    "build": "npm run build:wasm && npm run build:js && npm run build:react && npm run build:types && npm run build:copy-wasm && npm run build:copy-design",
+    "build": "bun run build:wasm && bun run build:js && bun run build:react && bun run build:types && bun run build:copy-wasm && bun run build:copy-design",
     "lint": "oxlint src",
     "test:react-ssr": "node -e \"import('./dist/react.js').then(m=>{if(typeof m.AerisChart!=='function')process.exit(1)})\"",
     "test:pack": "node scripts/pack_smoke.mjs",
-    "prepublishOnly": "npm run clean && npm run build && npm run check:api && npm run check:namespace && npm run check:release-gates && npm run test:react-ssr && npm run test:pack"
+    "prepublishOnly": "bun run clean && bun run build && bun run check:api && bun run check:namespace && bun run check:release-gates && bun run test:react-ssr && bun run test:pack"
   },
   "peerDependencies": {
     "react": ">=18.2.0"
@@ -84,10 +84,10 @@
     }
   },
   "devDependencies": {
-    "@types/react": "^18.3.24",
+    "@types/react": "^19.3.0",
     "esbuild": "^0.28.2",
-    "oxlint": "^1.81.0",
-    "react": "^18.3.1",
+    "oxlint": "^1.86.0",
+    "react": "^19.3.0",
     "typescript": "^7.0.2"
   }
 }
