@@ -3337,6 +3337,15 @@ fn main() {
         });
 
     application().run(move |cx: &mut App| {
+        // A GPUI platform built without its text system (macOS `font-kit`) quietly substitutes a
+        // no-op one: every label then paints nothing and measures zero. Refuse to run blind.
+        if cx.text_system().all_font_names().is_empty() {
+            eprintln!(
+                "gpui_probe: GPUI has no text system, so no text would render \
+                 (on macOS the GPUI platform needs its `font-kit` feature)"
+            );
+            std::process::exit(1);
+        }
         let interactive = budget.is_none();
         let bounds = Bounds::centered(
             None,

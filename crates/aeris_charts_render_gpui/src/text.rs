@@ -125,6 +125,12 @@ pub fn middle_baseline(center_y: f32, ascent: f32, descent: f32) -> f32 {
     center_y + (ascent + descent) / 2.0
 }
 
+/// How far to move a `middle`-anchored run so its cap-height ink centers on the anchor, with
+/// [`middle_baseline`]'s sign convention (`descent` negative below the baseline).
+pub fn cap_center_offset(ascent: f32, descent: f32, cap_height: f32) -> f32 {
+    cap_height / 2.0 - middle_baseline(0.0, ascent, descent)
+}
+
 /// Resolve a run plus its measured metrics into a concrete placement.
 pub fn place(run: &TextRun, metrics: TextMetrics) -> TextPlacement {
     TextPlacement {
@@ -280,6 +286,18 @@ mod tests {
         // ab_glyph convention: ascent positive, descent negative.
         assert_eq!(middle_baseline(30.0, 12.0, -4.0), 34.0);
         assert_eq!(middle_baseline(0.0, 10.0, -10.0), 0.0);
+    }
+
+    #[test]
+    fn cap_center_offset_centers_cap_ink_on_the_anchor() {
+        // GPUI's 12 px test font metrics (ascent 1025, descent -275, cap 698 per 1000 em).
+        let (ascent, descent, cap) = (12.3, -3.3, 8.376);
+        let offset = cap_center_offset(ascent, descent, cap);
+        let baseline = middle_baseline(20.0 + offset, ascent, descent);
+        // The cap ink spans `baseline - cap ..= baseline`, so its center lands on the anchor.
+        assert!((baseline - cap / 2.0 - 20.0).abs() < 1e-4);
+        // A negative descent must not be treated as a positive one (which raised text by it).
+        assert!((offset - (-0.312)).abs() < 1e-4);
     }
 
     #[test]

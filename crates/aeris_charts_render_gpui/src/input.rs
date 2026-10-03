@@ -118,10 +118,11 @@ impl GpuiChartInput {
     /// Returns whether the chart consumed the wheel.
     pub fn scroll_wheel(&self, engine: &mut ChartEngine, event: &ScrollWheelEvent) -> bool {
         let (x, y) = self.pane_point(engine, event.position);
-        // GPUI deltas move content: positive scrolls toward the start (up or left) on every
-        // platform, the negation of the DOM's `deltaY` and `deltaX` (GPUI's own web backend builds
-        // its events from `-deltaX`/`-deltaY`). Wheel-up positive is already the engine's
-        // normalized vertical sign, so only x flips to the browser's `+deltaX`. Lines convert with
+        // GPUI reports content motion on every platform (macOS `scrollingDeltaX/Y`, Windows'
+        // negated wheel messages, X11's valuator difference): wheel-up and a swipe that reveals
+        // what lies to the left are positive. The engine takes browser-normalized deltas, where
+        // wheel-up is positive but `deltaX` is positive toward the right, so the vertical axis
+        // passes through and the horizontal axis flips, as a browser flips it. Lines convert with
         // the browser's 32 px adjustment.
         let delta = event.delta.pixel_delta(px(WHEEL_LINE_HEIGHT));
         let delta_x: f32 = delta.x.into();

@@ -2,15 +2,20 @@
 //!
 //! This is the GPUI half of `examples/web_demo/tests/gpui-webgpu-matrix.spec.mjs`.
 //! It builds the same checked-in D1 fixture used by the browser, paints only the engine-owned pane
-//! frame, captures the presented client area through DWM, writes metadata, and exits.
+//! frame, captures the presented client area, writes metadata, and exits. The capture reads the
+//! window through DWM on Windows (`tools/capture_window.ps1`) and from the X server on Linux
+//! (`support/x11_capture.rs`, run under `xvfb-run` with `GPUI_X11_SCALE_FACTOR=1.5` and a virtual
+//! screen larger than the 1851x1047 pane, for example `-screen 0 2560x1600x24`).
 //!
 //! Environment:
 //! - `AERIS_CHARTS_GPUI_CAPTURE_OUT` — required output PNG path.
 //! - `AERIS_CHARTS_GPUI_CAPTURE_METADATA` — optional metadata JSON path (defaults beside the PNG).
 
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+#[cfg(not(target_os = "linux"))]
 use std::time::{Duration, Instant};
 
 use aeris_charts_engine::{
@@ -24,8 +29,13 @@ use gpui::{
 };
 use gpui_platform::application;
 
+#[cfg(target_os = "linux")]
+#[path = "support/x11_capture.rs"]
+mod x11_capture;
+
 const WINDOW_TITLE_PREFIX: &str = "aeris_charts-gpui-webgpu-pane-capture";
 const WARMUP_FRAMES: u64 = 12;
+#[cfg(not(target_os = "linux"))]
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -65,10 +75,11 @@ impl Capture {
         if feature != "footprint" {
             assert!(
                 (scale_factor as f64 - fixture.pixel_ratio).abs() <= 1e-4,
-                "the shared D1 pixel gate requires physical GPUI DPR {}, but this monitor reports {}; run it on a Windows display configured to {}%",
+                "the shared D1 pixel gate requires physical GPUI DPR {}, but this monitor reports {}; run it on a Windows display configured to {}%, or on Linux/X11 with GPUI_X11_SCALE_FACTOR={}",
                 fixture.pixel_ratio,
                 scale_factor,
-                (fixture.pixel_ratio * 100.0).round()
+                (fixture.pixel_ratio * 100.0).round(),
+                fixture.pixel_ratio
             );
         }
 
@@ -180,9 +191,10 @@ impl Capture {
             |value| Some(value.to_string().replace('.', "_")),
         );
         let spacing_label = spacing_label.as_deref().unwrap_or("fit");
+        // The names the browser matrix spec selects and asserts, such as `dpr-1_5-spacing-fit-light-base`.
         let case_name = format!(
-            "dpr-{}_spacing-{}-{}-{}",
-            (scale_factor * 100.0).round() as u32,
+            "dpr-{}-spacing-{}-{}-{}",
+            scale_factor.to_string().replace('.', "_"),
             spacing_label,
             theme,
             feature
@@ -206,11 +218,35 @@ impl Capture {
         }
     }
 
-    fn spawn_capture(&self) -> Receiver<Result<String, String>> {
+    fn spawn_capture(
+        &self,
+        #[cfg(target_os = "linux")] window: &Window,
+    ) -> Receiver<Result<String, String>> {
         let (tx, rx) = mpsc::channel();
+        #[cfg(target_os = "linux")]
+        {
+            // The window id is only reachable from the UI thread; the X11 read itself is not.
+            let window_id = x11_capture::window_id(window);
+            let expected = (
+                (self.frame.width * self.frame.pixel_ratio).round() as u32,
+                (self.frame.height * self.frame.pixel_ratio).round() as u32,
+            );
+            let output = self.output.clone();
+            let window_title = self.window_title.clone();
+            std::thread::spawn(move || {
+                let result = window_id
+                    .and_then(|id| x11_capture::capture(id, expected, &output))
+                    .map_err(|error| format!("capture of window {window_title:?} failed: {error}"));
+                let _ = tx.send(result);
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/capture_window.ps1");
+        #[cfg(not(target_os = "linux"))]
         let output = self.output.clone();
+        #[cfg(not(target_os = "linux"))]
         let window_title = self.window_title.clone();
+        #[cfg(not(target_os = "linux"))]
         std::thread::spawn(move || {
             let result = Command::new("powershell")
                 .args([
@@ -444,7 +480,10 @@ impl Render for Capture {
 
                         match &capture.phase {
                             Phase::Warmup(frames) if *frames >= WARMUP_FRAMES => {
-                                capture.phase = Phase::Capturing(capture.spawn_capture());
+                                capture.phase = Phase::Capturing(capture.spawn_capture(
+                                    #[cfg(target_os = "linux")]
+                                    window,
+                                ));
                             }
                             Phase::Warmup(frames) => capture.phase = Phase::Warmup(frames + 1),
                             Phase::Capturing(receiver) => {

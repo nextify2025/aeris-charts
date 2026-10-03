@@ -1894,35 +1894,14 @@ impl ChartEngine {
         } else {
             position.stop_y + label_offset
         };
-        self.push_stat_label_block(
-            drawing.pane_index,
-            out,
-            (center_x, target_label_y),
-            &[target_text],
-            reward,
-            vpr,
-        );
-        self.push_stat_label_block(
-            drawing.pane_index,
-            out,
-            (center_x, stop_label_y),
-            &[stop_text],
-            risk,
-            vpr,
-        );
+        self.push_stat_label_block(out, (center_x, target_label_y), &[target_text], reward, vpr);
+        self.push_stat_label_block(out, (center_x, stop_label_y), &[stop_text], risk, vpr);
         let pnl_color = if pnl.is_some_and(|value| value < 0.0) {
             risk
         } else {
             reward
         };
-        self.push_stat_label_block(
-            drawing.pane_index,
-            out,
-            (center_x, position.entry_y),
-            &middle,
-            pnl_color,
-            vpr,
-        );
+        self.push_stat_label_block(out, (center_x, position.entry_y), &middle, pnl_color, vpr);
     }
 
     /// Dynamic position progress belongs to pane chrome rather than retained drawing geometry:
@@ -2320,7 +2299,6 @@ impl ChartEngine {
 
     fn push_stat_label_block(
         &self,
-        pane_index: usize,
         out: &mut Vec<Prim>,
         center: (f64, f64),
         lines: &[String],
@@ -2348,24 +2326,8 @@ impl ChartEngine {
             w: width.round().max(1.0) as i32,
             h: height.round().max(1.0) as i32,
         };
-        let fallback = aeris_charts_core::style::DEFAULT_SURFACE_RGB;
-        let mut surface = Color::parse_css(&layout.background.color)
-            .unwrap_or(Color::rgb(fallback.0, fallback.1, fallback.2));
-        if matches!(
-            layout.background.kind.as_str(),
-            "gradient" | "vertical_gradient"
-        ) {
-            let pane = &self.panes[pane_index];
-            let mix = ((y / vpr - pane.top) / pane.height.max(1.0)).clamp(0.0, 1.0);
-            let top = Color::parse_css(&layout.background.top_color).unwrap_or(surface);
-            let bottom = Color::parse_css(&layout.background.bottom_color).unwrap_or(surface);
-            let blend = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * mix).round() as u8;
-            surface = Color::rgb(
-                blend(top.r(), bottom.r()),
-                blend(top.g(), bottom.g()),
-                blend(top.b(), bottom.b()),
-            );
-        }
+        // The solid semantic fill under contrast text already separates the label from the
+        // chart, so it carries no outline.
         out.push(Prim::RoundRect {
             x: rect.x as f32,
             y: rect.y as f32,
@@ -2373,8 +2335,8 @@ impl ChartEngine {
             h: rect.h as f32,
             radii: [(3.0 * vpr).round().max(1.0) as f32; 4],
             fill: background.solid(),
-            border_width: vpr.round().max(1.0) as f32,
-            border_color: surface.contrast_srgb(),
+            border_width: 0.0,
+            border_color: background.solid(),
         });
         let text_color = background.contrast_text();
         let first_y = y - ((lines.len() as f64 - 1.0) * line_height) / 2.0;

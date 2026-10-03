@@ -177,9 +177,8 @@ pub fn text_measurer(window: &Window) -> impl Fn(&str, f64, &str, u16, bool) -> 
 }
 
 /// A live engine glyph metric (`ChartEngine::set_text_cap_center`) backed by the window's native
-/// font metrics, the counterpart of the browser host's `measureText` ink bounds. `paint_text`
-/// places the baseline `(ascent - descent) / 2` below the middle anchor, so capitals and figures
-/// center on the anchor once it moves by `cap_height / 2` minus that distance.
+/// font metrics, the counterpart of the browser host's `measureText` ink bounds. GPUI font
+/// metrics report `descent` negative below the baseline, the convention `paint_text` places with.
 pub fn text_cap_centerer(window: &Window) -> impl Fn(f64, &str, u16, bool) -> f64 + 'static {
     let text_system = window.text_system().clone();
     move |size, family, weight, italic| {
@@ -203,7 +202,7 @@ pub fn text_cap_centerer(window: &Window) -> impl Fn(f64, &str, u16, bool) -> f6
         let ascent: f32 = text_system.ascent(font_id, font_size).into();
         let descent: f32 = text_system.descent(font_id, font_size).into();
         let cap_height: f32 = text_system.cap_height(font_id, font_size).into();
-        f64::from(cap_height / 2.0 - (ascent - descent) / 2.0)
+        f64::from(text::cap_center_offset(ascent, descent, cap_height))
     }
 }
 
@@ -755,7 +754,7 @@ fn paint_rotated_text(
     text_cache.measure_with(TextKey::for_run(run), || TextMetrics {
         width: f32::from(cached.line.width) * logical_to_device,
         ascent: cached.ascent * logical_to_device,
-        descent: -cached.descent * logical_to_device,
+        descent: cached.descent * logical_to_device,
     });
 
     let width = f32::from(cached.line.width).max(1.0);
@@ -942,12 +941,13 @@ fn build_path(
 ///
 /// Placement reproduces the Canvas2D contract the other backends implement: `x` is the aligned
 /// edge, `y` is the run's vertical center, and the baseline is
-/// `y + (ascent + descent) / 2` in `ab_glyph` sign convention. GPUI reports descent as positive
-/// below the baseline, so it is negated on the way into [`crate::text::middle_baseline`].
+/// `y + (ascent + descent) / 2` in `ab_glyph` sign convention, which GPUI font metrics share
+/// (`descent` negative below the baseline).
 ///
 /// `ShapedLine::paint` positions glyphs at `offset.y + (line_height - ascent - descent) / 2 +
-/// ascent`. Passing `line_height = ascent + descent` zeroes that padding term, so the baseline is
-/// exactly `offset.y + ascent` and the offset follows directly from the target baseline.
+/// ascent` with its layout's positive descent. Passing `line_height = ascent - descent` (the full
+/// line box) zeroes that padding term, so the baseline is exactly `offset.y + ascent` and the
+/// offset follows directly from the target baseline.
 fn paint_text(
     run: &TextRun,
     transform: Transform,
@@ -994,7 +994,7 @@ fn paint_text(
     let measured = TextMetrics {
         width: f32::from(cached.line.width) * logical_to_device,
         ascent: cached.ascent * logical_to_device,
-        descent: -cached.descent * logical_to_device,
+        descent: cached.descent * logical_to_device,
     };
     text_cache.measure_with(TextKey::for_run(run), || measured);
 
@@ -1003,8 +1003,8 @@ fn paint_text(
     let anchor_x: f32 = transform.x(run.x).into();
     let anchor_y: f32 = transform.y(run.y).into();
     let left = text::aligned_left(anchor_x, width, run.align);
-    let baseline = text::middle_baseline(anchor_y, cached.ascent, -cached.descent);
-    let line_height = px(cached.ascent + cached.descent);
+    let baseline = text::middle_baseline(anchor_y, cached.ascent, cached.descent);
+    let line_height = px(cached.ascent - cached.descent);
     let offset = point(px(left), px(baseline - cached.ascent));
 
     if cached

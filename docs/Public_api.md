@@ -58,6 +58,8 @@ The supported root surface is:
   or persisted object;
 - visible-range volume profiles through `chart.add_volume_profile(prices, volume, options)`,
   returning a distribution handle with `options()`, `apply_options()`, `snapshot()` and `remove()`;
+- KLineChart's 27 indicator templates through `chart.add_klinechart_indicator(source, indicator,
+  volume_source?, options?)`, described under [KLineChart indicators](#klinechart-indicators);
 - first-class tick-driven footprint / numbers-bar series through `chart.add_series("footprint")`,
   including object and typed-column trade ingestion, explicit/quote/tick-rule aggressor handling,
   per-level Bid × Ask/total/delta, POC, final/Max/Min/session delta, configurable diagonal and
@@ -377,6 +379,107 @@ bars shows one short segment per bar. Ordinary line, area, and baseline series c
 unless `break_on_trading_day: true` asks them to break at each exchange trading day (on a non-time
 bar axis such as Renko or tick bars, the day of each bar's open time); whitespace rows never break
 a line.
+
+### KLineChart indicators
+
+`chart.add_klinechart_indicator(source, indicator, volume_source?, options?)` adds one of KLineChart's
+27 indicator templates, with KLineChart's formulas and presentation, and returns one `series_api` per
+output in output order. `indicator` is a `klinechart_indicator`: the template name in `indicator` plus
+that template's parameters, all spelled out (nothing is defaulted, so a missing field is rejected):
+
+```ts
+const [dif, dea, histogram] = chart.add_klinechart_indicator(candles, { indicator: "macd", short: 12, long: 26, signal: 9 });
+const [volume_bars, ma5, ma10] = chart.add_klinechart_indicator(candles, { indicator: "vol", periods: [5, 10] }, volume);
+const [average_price] = chart.add_klinechart_indicator(turnover, { indicator: "avp" }, volume);
+```
+
+`options` (the last argument, after `volume_source`, as in `add_vwap`) is a `Partial<series_options>` applied to every output; style one output
+through its returned handle. The 27 names are the `klinechart_indicator_name` union, price overlays first:
+`ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`, `vol`, `macd`, `kdj`, `rsi`, `bias`, `brar`, `cci`, `dmi`,
+`cr`, `psy`, `dma`, `trix`, `obv`, `vr`, `wr`, `mtm`, `emv`, `roc`, `pvt`, `ao`. Each row below gives the
+parameters at KLineChart's defaults, the outputs (`key`, drawn as a line unless noted), and what the
+template needs:
+
+| `indicator` | Parameters (KLineChart default) | Outputs | Needs |
+| --- | --- | --- | --- |
+| `ma` | `periods` `[5, 10, 30, 60]` | `ma1`..`ma4`, one per period | |
+| `ema` | `periods` `[6, 12, 20]` | `ema1`..`ema3` | |
+| `sma` | `period` 12, `weight` 2 | `sma` | |
+| `boll` | `period` 20, `multiplier` 2 | `up`, `mid`, `dn` | |
+| `sar` | `start` 2, `step` 2, `max` 20 (percent) | `sar` (dots) | |
+| `bbi` | `periods` `[3, 6, 12, 24]`, exactly four | `bbi` | |
+| `avp` | none | `avp` | a scalar source series holding turnover, and volume |
+| `vol` | `periods` `[5, 10, 20]`, at most four | `volume` (bars), `ma1`..`ma3` | volume |
+| `macd` | `short` 12, `long` 26, `signal` 9 | `dif`, `dea`, `macd` (bars) | |
+| `kdj` | `period` 9, `k_smoothing` 3, `d_smoothing` 3 | `k`, `d`, `j` | |
+| `rsi` | `periods` `[6, 12, 24]` | `rsi1`..`rsi3` | |
+| `bias` | `periods` `[6, 12, 24]` | `bias1`..`bias3` | |
+| `brar` | `period` 26 | `br`, `ar` | |
+| `cci` | `period` 20 | `cci` | |
+| `dmi` | `period` 14, `adxr_period` 6 | `pdi`, `mdi`, `adx`, `adxr` | |
+| `cr` | `period` 26, `ma_periods` `[10, 20, 40, 60]`, exactly four | `cr`, `ma1`..`ma4` | |
+| `psy` | `period` 12, `ma_period` 6 | `psy`, `maPsy` | |
+| `dma` | `short` 10, `long` 50, `signal` 10 | `dma`, `ama` | |
+| `trix` | `period` 12, `ma_period` 9 | `trix`, `maTrix` | |
+| `obv` | `ma_period` 30 | `obv`, `maObv` | volume |
+| `vr` | `period` 26, `ma_period` 6 | `vr`, `maVr` | volume |
+| `wr` | `periods` `[6, 10, 14]` | `wr1`..`wr3` | |
+| `mtm` | `period` 12, `ma_period` 6 | `mtm`, `maMtm` | |
+| `emv` | `period` 14 | `emv`, `maEmv` | volume |
+| `roc` | `period` 12, `ma_period` 6 | `roc`, `maRoc` | |
+| `pvt` | none | `pvt` | volume |
+| `ao` | `short` 5, `long` 34 | `ao` (bars) | |
+
+A list of periods (`periods`) holds one to five entries, and one output line per entry (`vol`: one to
+four, because the volume bars take the first output). Periods are whole numbers from 1 to 1,000,000;
+the `sma` weight and the `sar` factors are positive and the `boll` multiplier is not negative.
+`indicator_schema("klinechart_<name>")` reports the same defaults (a list as `period_1`, `period_2`,
+...) and output names from the engine, so a settings editor can read them instead of copying this table.
+KLineChart lists a second `emv` parameter, 9, that its formula never reads; it is not part of the
+definition.
+
+**Sources.** `source` is the OHLC series the formulas read. `avp` is the exception: its source is a
+scalar series holding the traded value (turnover) per bar, typically hidden, and it divides the running
+sum of that series by the running volume. A scalar series (a line, area, baseline, or histogram) is also
+accepted as the source of every other template and is read as open = high = low = close = its value, so
+`macd` over a line series computes the MACD of that line. The templates marked "volume" need a scalar `volume_source`
+(a scalar series such as a histogram or a line, never the source itself); volume pairs with source rows by exact timestamp,
+and a bar without a volume uses KLineChart's own default (1 for `pvt`, 0 for the others). Every other
+template must not be given a volume series. `add_klinechart_indicator` has no `amount_source`: the
+engine accepts a turnover series only for VWAP, so a KLineChart binding carries turnover in `avp`'s
+source instead.
+
+**Invalid input.** An unknown template name (the name is case-sensitive and lower case), a missing,
+non-whole, out-of-range, or non-numeric parameter, too many or too few periods, a source series that
+no longer exists, an OHLC source given to `avp`, or a volume series that is missing, extra, equal to the
+source, or not scalar throws `AerisChartsError` with code `invalid_options` and leaves the chart
+unchanged. The engine decides every one of these, and the message names the template that was passed. Nothing is rounded: `{ short: 2.5 }` is rejected
+instead of floored, unlike the period arguments of the other `add_*` methods.
+
+**Presentation.** The engine owns the look, as KLineChart draws it. Line outputs are 1px lines in
+KLineChart's five-color palette in output order, with no title chip, last-value label, or price line.
+`vol`, `macd`, and `ao` draw their bar output as a histogram, and `sar` draws marker-only dots. Bars and
+dots are colored per row by the engine, from the source candles' up and down colors: `vol` bars by
+candle direction (grey when flat), `macd` bars by sign and by whether they are rising, `ao` bars by
+whether they are rising, and `sar` dots by their position against the candle's midpoint. KLineChart
+outlines a rising `macd` or `ao` column; Aeris histograms have no outline style, so those columns are
+filled at a lighter alpha instead. Price templates (`ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`)
+draw over the candles on the main pane, and every other template in a pane of its own below it.
+
+**Lineage, warm-up, and persistence.** Every output's `indicator_info()` has `kind:
+"klinechart_<name>"` (a member of `indicator_kind`), the whole definition in `parameters.klinechart`,
+`period` set to the first period (0 for `avp`, `pvt`, and `sar`), `deviation: null`, and the bound
+`volume_source`. Rows before an output's `warmup_bars` hold no value and are not returned by `data()`;
+`convergence_bars` is `null` for `ema`, `sma`, `macd`, `kdj`, `rsi`, `dmi`, `trix`, `obv`, `pvt`, `avp`,
+and `sar`, whose values depend on the whole loaded history (recursive smoothing, running totals, or a
+path state). A binding steps each formula one row at a time from checkpointed state, so a live
+tick costs the formula's window rather than the history, and publishes the changed suffix. A
+whitespace row (a missing bar, or a pre-installed session slot) emits no value and never enters a
+window: every value equals the one computed on the chart without that row. V3 chart state stores the definition as `{"kind": "klinechart",
+"indicator": "macd", "short": 12, "long": 26, "signal": 9 }` with the source, volume-source, and
+per-output style references, and restores into a fresh chart like every other study. The formulas are
+translated from KLineChart v10.0.3 and match its output bit for bit (see `docs/Architecture.md` and
+`NOTICE`).
 
 ## Coordinates and panes
 
@@ -1737,13 +1840,34 @@ may change in any revision, so a host reviews the notes below when it moves its 
 same `gpui` (a host on another GPUI build, such as a Zed Git revision, holds two incompatible copies
 of its types). GPUI upgrades are explicit manifest and lockfile changes.
 
+On macOS a host must build its GPUI platform crate (`gpui-pre-platform`, or `gpui-pre-macos`
+directly) with the `font-kit` feature, which is GPUI's macOS text system. Without it GPUI substitutes
+a no-op text system: the chart paints no text (axes, labels, legends, drawing text) and measures
+every string as zero width, and the only signal is a `log::warn!` at startup. Linux and Windows are
+unaffected.
+
+A host that binds wheel events through `GpuiChartInput::scroll_wheel` gets browser-equivalent
+scrolling. Hosts that pinned an earlier revision panned the time scale the wrong way on a horizontal
+wheel or trackpad swipe: the adapter passed GPUI's horizontal delta through unflipped, though GPUI
+reports content motion (positive reveals the left) and the engine, like a browser, takes positive
+as a move to the right. The adapter now flips the horizontal axis; a host that compensated for the
+old sign itself must remove its compensation.
+
 ### Moving the pinned revision
 
 These notes list the host-visible changes a pinned-revision move carries, so call sites can be
 reviewed once. Each group names the revision-level change and the call sites it affects.
 
-**Sub-pane coordinates** (see [Coordinates and panes](#coordinates-and-panes)). Three behaviours
-changed:
+Each group is keyed to the commit that carries its change. A group applies to a pin that does not
+contain that commit (`git merge-base --is-ancestor <commit> <pin>` exits non-zero); a pin that
+already contains it has taken the change. Hashes are this repository's. "Upstream" marks commits
+that came from `AerisTerminal/aeris-charts` main and keep their hashes here, because upstream was
+merged and never rebased; "own line" marks commits that exist only in this repository. The two
+histories part at `ed2910d`, and a group whose old spelling lived on one side only says which side.
+
+**Sub-pane coordinates** (own line, from `84b85e6 fix(engine): sub-pane crosshair sync,
+chart-level pane selection, coordinate contract`; see [Coordinates and panes](#coordinates-and-panes)).
+Three behaviours changed:
 
 - The chart-level `price_to_coordinate` and `coordinate_to_price` no longer follow the first visible
   series in creation order. The price converts on pane 0's default scale and the coordinate on the
@@ -1758,8 +1882,9 @@ changed:
   above for a separator and pane 0 for a `y` above the content, where both used to resolve to the
   last pane. GPUI hosts that pick a pane for price-axis hit-testing pick up the corrected mapping.
 
-**Trade-stream-derived series** (see [Ticks to candles](#ticks-to-candles)). Two reviews, and the
-first cannot be checked from this repository:
+**Trade-stream-derived series** (own line, from `a51242c fix(engine): guard trade-stream-derived
+series against host writes`; see [Ticks to candles](#ticks-to-candles)). Two reviews, and the first
+cannot be checked from this repository:
 
 - Terminal must not write to a candle bound with `bind_trade_bar_series_to_stream` or to a CVD,
   delta, or trade-volume series (`add_cvd_series`, `add_delta_series`, `add_trade_volume_series`).
@@ -1775,9 +1900,10 @@ first cannot be checked from this repository:
   write. Resampling targets and synthetic-bar series refuse a trade-bound candle
   (`ResampleError::UnsupportedTarget`, `SyntheticBarError::UnsupportedSeries`).
 
-**Batched period-reset study lines.** This is a compile-time break for Rust code that matches
-`aeris_charts_render::draw_list::Prim` exhaustively (a custom executor, a frame inspector, a
-point-pool rebase):
+**Batched period-reset study lines** (own line, from `fafecda perf(render): batch period-reset
+study segments into one Segments primitive`). This is a compile-time break for Rust code that
+matches `aeris_charts_render::draw_list::Prim` exhaustively (a custom executor, a frame inspector,
+a point-pool rebase):
 
 - `Prim` gains `Segments { first_point, segment_count, width, color }`, a batch of `segment_count`
   independent two-point strokes over `points[first_point .. first_point + 2 * segment_count]`, each
@@ -1789,13 +1915,28 @@ point-pool rebase):
   Canvas2D, WebGPU, GPUI, and native executors in this repository already handle it. Because hosts
   take the change by moving their pin, it is breaking for exhaustive matchers.
 
-**Named time zones** (see [Time, exchange time zone, and trading sessions](#time-exchange-time-zone-and-trading-sessions)).
-Four behaviours to review:
+**Named time zones** (both lines, from the merge `2e7d19f merge: sync with
+AerisTerminal/aeris-charts main`, which took upstream's `f796529 feat(time): add selectable IANA
+chart time zones` onto the own line's exchange-time clock; see
+[Time, exchange time zone, and trading sessions](#time-exchange-time-zone-and-trading-sessions)).
+Behaviours to review:
 
 - `ChartEngine::set_time_zone` takes an IANA id from `TRADINGVIEW_TIME_ZONES`
   (`Result<bool, String>`; `Ok(false)` when it is already installed). The setter that takes a
   `UtcOffsetSchedule` is `set_exchange_offsets`, so a call site written against a revision where
-  `set_time_zone` took a schedule must use the new name.
+  `set_time_zone` took a schedule must use the new name. Only an own-line pin before the merge took
+  a schedule; an upstream pin from `f796529` on already passes an id.
+- An upstream pin from `f796529` on has zone-aware helpers in `aeris_charts_core`, each of which
+  takes a `ChartTimeZone`: `format_tick_label_with_time_zone`, `format_date_pattern_with_time_zone`,
+  `format_crosshair_time_with_time_zone`, `weight_by_time_in_time_zone`, and
+  `fill_weights_for_points_in_time_zone`. The merge deleted them and kept the own line's
+  `ExchangeTime` forms as the one clock (an own-line pin already has these); they take
+  `&ExchangeTime` instead of a zone: `format_tick_label_in`, `format_crosshair_time_in`,
+  `weight_by_time_in`, and `fill_weights_for_points_in`. Read the engine's own clock with
+  `ChartEngine::exchange_time()`, or build one with `ExchangeTime::new(zone.offset_schedule()?, 0)?`.
+  There is no `ExchangeTime` form of `format_date_pattern`: shift the timestamp with
+  `ExchangeTime::local_seconds` and format that, as `format_crosshair_time_in` does. Only an
+  upstream pin from `f796529` on had the removed helpers; an own-line pin never did.
 - A named zone is resolved once into the explicit schedule, so tick weights, labels, VWAP and pivot
   period keys, sessions, and the countdown follow it exactly like `set_exchange_offsets`. The name
   also localizes the general temporal axes and `time_zone_clock_text`; an explicit schedule does
@@ -1813,33 +1954,292 @@ Four behaviours to review:
   this repository's `.cargo/config.toml`, so it compiles the complete tz tables rather than the 98
   parity zones the repository's artifacts keep.
 
-**Drawing text editing** (see [Drawing anchors, magnet, and price basis](#drawing-anchors-magnet-and-price-basis)).
-Three call-site reviews:
+**Drawing text editing** (both lines, from the merge `2e7d19f merge: sync with
+AerisTerminal/aeris-charts main`, which made upstream's `7518e7e feat(drawings): engine-owned text
+typing session for every host` the one session and kept the own line's layout, hit testing, and
+editable tools; see
+[Drawing anchors, magnet, and price basis](#drawing-anchors-magnet-and-price-basis)).
+Each item says which pins it applies to:
 
-- One engine session replaces the former pair of flags. `ChartEngine::set_editing_drawing` is gone;
-  `editing_drawing()` reads the open session. Open it with `begin_drawing_text_edit(id,
-  paint_caret)`; mirror a host's editable surface with `set_drawing_text_edit(text, caret)` and end it
-  with `commit_drawing_text_edit()` or `cancel_drawing_text_edit()` (native hosts use
-  `drawing_text_edit_insert`, `drawing_text_edit_key`, `drawing_text_edit_select_all`, and
-  `drawing_text_edit_caret_at`). Live text records no undo step; a commit records one.
-- `begin_drawing_text_edit` accepts every drawing that paints its own text, not only the text tool
-  and trend lines, and refuses (leaving an open session alone) a locked, hidden, interval-hidden, or
-  non-text drawing, or one whose anchors cannot convert yet. A chart that has not been laid out has
-  no price scale to convert them, so a host that begins a session before its first frame sees `false`.
-- Text is bounded by `MAX_DRAWING_TEXT_BYTES` (65,536 bytes) instead of 256: an insert that would
-  exceed it is refused whole, and a mirrored value is clamped at a character boundary. A run label
-  stays on one line; family text boxes (`comment`, `callout`, `note`, `signpost`, `anchored_text`)
-  keep line breaks. Native hosts get click-to-caret placement and typing in a box but not Up/Down
-  line navigation yet.
+- On main one engine session is the only text-editing state. Open it with
+  `begin_drawing_text_edit(id, paint_caret)` (`false` for a host that paints its own caret, as the
+  browser does); mirror a host's editable surface with `set_drawing_text_edit(text, caret)`; end it
+  with `commit_drawing_text_edit()` or `cancel_drawing_text_edit()`; `editing_drawing()` reads the
+  open session. Native hosts use `drawing_text_edit_insert`, `drawing_text_edit_key`,
+  `drawing_text_edit_select_all`, and `drawing_text_edit_caret_at`. Live text records no undo step;
+  a commit records one. A GPUI host that forwards its key events to `GpuiChartInput::key_down` does
+  not need to call these: the adapter routes the keys, with the platform's word and line motion and
+  the clipboard shortcuts (see the engine input controller below).
+- `ChartEngine::set_editing_drawing` is gone. Upstream pins have it (alongside the session), and so
+  do own-line pins before `36c9f09`; an own-line pin from `36c9f09` on does not.
+- An own-line pin from `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded
+  ticks, tick-built candles, and resampling` up to the merge used a three-call session of its own,
+  which the merge removed: `begin_drawing_text_edit(id)`, `set_drawing_edit_text(text)`, and
+  `end_drawing_text_edit(commit)`. The new calls are `begin_drawing_text_edit(id, paint_caret)`,
+  `set_drawing_text_edit(text, caret)` (the mirrored value now carries the caret), and
+  `commit_drawing_text_edit()` or `cancel_drawing_text_edit()` for `commit` true or false. It is not
+  a plain rename: the old call neither trimmed the text nor removed a text tool, while a commit now
+  trims the text and removes a text tool left empty, and a cancel removes a text tool that began
+  empty. An upstream pin never had the three-call form.
+- An upstream pin that contains `7518e7e` but not `b75f092 feat(drawings): text-field selection in
+  the drawing typing session` had `drawing_text_edit_key(key)`. That commit changed it to
+  `drawing_text_edit_key(key, extend_selection)` (Shift extends the selection) and gave
+  `DrawingTextEditKey` the variants `DeleteWordBackward`, `DeleteWordForward`, `WordLeft`, and
+  `WordRight`, so such a pin adds the argument and, for an exhaustive `match` on the key, the arms.
+  An own-line pin never had the one-argument form.
+- `begin_drawing_text_edit` accepts every drawing that paints its own text, and refuses (leaving an
+  open session alone) a locked, hidden, interval-hidden, or non-text drawing, or one whose anchors
+  cannot convert yet. Upstream's session opened only the text tool and trend lines, and closed an
+  open session even when it refused; an own-line pin before `d438dab` stopped at those and the
+  family drawings. A chart that has not been laid out has no price scale to convert the anchors, so
+  a host that begins a session before its first frame sees `false`.
+- An upstream pin bounded text at 256 bytes; main bounds it by `MAX_DRAWING_TEXT_BYTES` (65,536
+  bytes): an insert that would exceed it is refused whole, and a mirrored value is clamped at a
+  character boundary. A run label stays on one line; family text boxes (`comment`, `callout`,
+  `note`, `signpost`, `anchored_text`) keep line breaks. Native hosts get click-to-caret placement
+  and typing in a box but not Up/Down line navigation yet.
 - `drawing_text_hit_at` answers for the label of every tool that paints a text run (lines,
-  channels, Fibonacci, shapes), not only the trend line, and arbitrates against higher drawing bodies.
-  Which click starts typing is one rule for every host: the first click opens it only for the text
+  channels, Fibonacci, shapes), not only the trend line, and arbitrates against higher drawing
+  bodies; upstream pins and own-line pins before `d438dab` answered for the trend line only. Which
+  click starts typing is one rule for every host: the first click opens it only for the text
   tool's two-step click and a trend label, and placing a tool that requests an editor opens it on
   placement; a double-click on the selected drawing, Enter, or F2 opens the editor of every
   text-bearing drawing. The browser gesture layer and the native input controller both apply it; a
   host that drives the engine API directly applies it itself.
-- Rectangles now default to no border (`border_visible: false`). A saved document that omits the key
-  imports with the border visible, so earlier documents keep their look.
+- Upstream's `3527136 Default rectangle borders off and EMA strokes to one pixel` (an own-line pin
+  before the merge `2e7d19f` and an upstream pin before `3527136` lack it) makes rectangles default
+  to no border (`border_visible: false`). A saved document that omits the key imports with the
+  border visible, so earlier documents keep their look.
+
+**Engine input controller** (upstream, from `17a591f feat(input): engine-owned interaction
+controller for every native host`, which the own line took with the merge `3eef45e`; the design is
+in [Architecture.md](Architecture.md#aeris_charts_engine)). The engine now owns pointer, wheel, and
+key routing: a host translates platform events into `PointerInput`, `WheelSample`, and `ChartKey` and
+calls `ChartEngine::input_*`. Press arbitration, drag lifecycles, click and double-click, key
+bindings, hover, cursor choice, and kinetic motion belong to the engine. Review these call sites:
+
+- Which pins had the removed gesture API. `begin_financial_drag`, `update_financial_drag`,
+  `update_financial_crosshair`, `end_financial_drag`, `apply_financial_wheel`,
+  `apply_financial_navigation`, `financial_drag`, and the types `FinancialDrag` and
+  `FinancialNavigation` existed only on upstream's side, from `f9b052f refactor(engine): own native
+  financial gestures` (`apply_financial_navigation` and `FinancialNavigation` from `4aaaf78
+  refactor(engine): own financial scale commands`), and on own-line revisions from the merge
+  `2e7d19f` until the merge `3eef45e` took `17a591f`, which removed them with no compatibility shim.
+  An own-line pin before `2e7d19f` never had them, so it has no host gesture API to delete: it adopts
+  the `input_*` calls, and the table below only says what each call now does. Coordinates are
+  unchanged (pane space: x from the plot's left edge, y from the chart's top).
+
+  | Removed | Now |
+  | --- | --- |
+  | `begin_financial_drag(x, y, click_count, radius)` | `input_pointer_down(PointerInput, click_count)`; `click_count` is `u32` (it was `usize`); the 4 px separator radius is the constant `PANE_SEPARATOR_HIT`; a double-click axis reset follows `InteractionOptions::axis_double_click_reset_time` and `axis_double_click_reset_price` |
+  | `update_financial_drag(x, y)`, `update_financial_crosshair(x, y, radius)` | `input_pointer_move(PointerInput, primary_pressed)`, which also promotes drawing, series, and trading hover and keeps the crosshair tracking (clamped into the plot) while a press is captured; `input_pointer_leave()` clears the crosshair while no press is open |
+  | `end_financial_drag()` | `input_pointer_up(PointerInput)` to finish, `input_cancel()` to abandon |
+  | `apply_financial_wheel(x, y, normalized_x, normalized_y)` | `input_wheel(WheelSample)`, which returns whether the chart consumed the wheel. With the default `WheelBehavior::Auto`, `delta_y` goes through `wheel_zoom_scale` as `normalized_y` did and `delta_x` through `WHEEL_SCROLL_PX_PER_DELTA` as `normalized_x` did, so the values passed as `normalized_x` and `normalized_y` go to `delta_x` and `delta_y` unchanged. It is not behaviour-equivalent: see the differences below |
+  | `apply_financial_navigation(action, accelerated)` and `FinancialNavigation` | `input_key_down(ChartKey, InputModifiers, repeat, now_ms)` and `input_key_up(ChartKey)`: `PageUp`/`PageDown` are `PreviousPage`/`NextPage`, `ZoomIn`/`ZoomOut` keep their names, and `accelerated` is Control or Shift in `InputModifiers`. `PreviousBar`/`NextBar` map to `ChartKey::ArrowLeft`/`ArrowRight` in direction only: see the differences below |
+  | `financial_drag()` and `FinancialDrag` | none: the open gesture is engine-private, and the pointer feedback is `input_cursor()` |
+
+- Where a replacement does not behave like the call it replaces. These were compared in the code,
+  not by signature, and none of the removed functions changed between its introduction and
+  `17a591f`:
+  - Wheel over a price axis. `apply_financial_wheel` zoomed a price scale whenever the pointer was
+    over that scale's axis strip, whatever the wheel behaviour. `input_wheel` zooms it only when
+    `InteractionOptions::wheel_behavior` is `WheelBehavior::Zoom` or
+    `InteractionOptions::price_axis_wheel_zoom` is `true` (default `false`); with the default
+    `WheelBehavior::Auto`, the same wheel over an axis strip zooms the time scale. To get the old
+    behaviour back, call `set_interaction_options` with `price_axis_wheel_zoom: true`.
+    `WheelBehavior::Zoom` also zooms the price scale there, but it turns every wheel into a zoom, so
+    a horizontal wheel stops panning.
+  - Wheel zoom over the plot. The old call zoomed the time scale around the pointer. A plain wheel
+    now follows `right_bar_stays_on_scroll` (default `true`; see the follow-ups below), so the gap
+    after the newest bar stays and only Ctrl/Cmd zooms around the pointer. `input_wheel` also
+    honours `wheel_zoom` and `wheel_scroll` (both default `true`), and it stops a kinetic coast, a
+    held arrow pan, or an animated scroll that is in progress.
+  - Drag threshold. The old calls acted from the first `update_financial_drag` (a pane pan, an axis
+    scale, or a separator resize). Now pane pans, axis scales, and separator drags begin at the
+    shared 5 px threshold, and an unmoved release is a click. A plain press on a price axis
+    therefore no longer switches that scale to manual: the old `begin_financial_drag` turned
+    autoscale off on the press, and now the first scale step does. A pane drag pans a manual price
+    scale only when it is the scale of the series (or the pane's default) under the press; the old
+    call also fell back to the pane's first manual right or left scale.
+  - Double-click on a price axis. `begin_financial_drag` ran `reset_price_scales()`, every price
+    scale in the chart; `input_pointer_down` resets only the pressed scale (`reset_price_scale(pane,
+    target)`). A host that wants the chart-wide reset keeps `reset_price_scales()` or `reset_view()`
+    for its own command.
+  - Release and cancel. `end_financial_drag` only ended the scale and scroll sessions. An unmoved
+    `input_pointer_up` also selects or activates what is under the pointer, and `input_cancel()` ends
+    the same sessions but also restores an open drawing or trading drag and clears hover, a live
+    measure, and the cursor. `input_pointer_move` with `primary_pressed` false while a press is open
+    abandons that press.
+  - Arrow and zoom keys. The old call jumped 1 bar (10 accelerated) per call; `ArrowLeft` and
+    `ArrowRight` start a velocity-owned pan (see the clock item). `ZoomIn` and `ZoomOut` anchored
+    at the plot centre; with the new `right_bar_stays_on_scroll` default they keep the gap after
+    the newest bar instead. Keys also follow the `InteractionOptions` switches (`pan` or
+    `wheel_scroll` for the scrolling keys, `wheel_zoom` for the zoom keys; all default `true`), and
+    a gated key stays unconsumed.
+- The host supplies the clock. Arrow-key panning is velocity-owned, so deliver `input_key_up`, pass
+  the platform's key-repeat flag, call `input_tick(now_ms)` once per prepared frame, and request
+  another frame only while `input_animating()` holds. `input_wake_deadline_ms()` is the one
+  deferred deadline (the trading-tooltip dwell): schedule a wake for it and repaint.
+  `flush_coalesced_input()` forwards the newest captured drawing sample once per prepaint.
+- The engine hands host-only work back as `ChartInputEvent`s (`ContextMenu`, `DrawingCreated`,
+  `RemoveSeries`); drain them with `take_input_events()` after each input call. Hosts keep event
+  translation, pointer capture, applying `input_cursor()`, timers and frame scheduling, menus,
+  clipboard, and persistence. Persist drawings on `drawing_revision()` instead of tracking
+  gestures. The reference `handleScroll`/`handleScale` switches are `InteractionOptions`
+  (`interaction_options()` and `set_interaction_options`).
+- The lower-level gesture operations (`drawing_tool_pointer_*`, `measure_pointer_*`,
+  `delta_tooltip_mouse_*`, `kinetic_*`, `start_keyboard_scroll`, `keyboard_scroll_tick`,
+  `cancel_keyboard_scroll`, the `time_axis_*` and `price_axis_*` scale and scroll steps,
+  `drag_pane_separator`) are still public engine operations, but the controller now sequences them.
+  A host that keeps driving them beside `input_*` bypasses the controller's press arbitration and
+  cursor, so host routing that sequenced them should be deleted.
+- Frame preparation changed with it: `prepare_financial_frame_with_measure` rebuilds after any
+  layer invalidation or input change and relayouts after a pane-resize drag. A host that cleared its
+  frame to force a rebuild, or forced a layout when `update_financial_drag` reported a pane resize,
+  can stop doing so.
+- GPUI hosts (feature `gpui-backend`) bind through `aeris_charts_render_gpui::input` with one
+  adapter call per listener: `GpuiChartInput::mouse_down`, `mouse_move`, `mouse_up` (bound for
+  releases outside the chart too), `context_menu`, `scroll_wheel`, `pinch`, `modifiers_changed`,
+  `key_down`, and `key_up`. `scroll_wheel` converts GPUI's delta itself (pixels divided by 100,
+  lines at `WHEEL_LINE_HEIGHT`, 32 px). Prepaint calls `set_canvas_bounds(bounds)` and
+  `prepare_frame(&mut engine)`, `wake_delay(&engine)` schedules the deferred wake,
+  `cursor_style(engine.input_cursor())` is the one cursor mapping, and
+  `install_text_metrics(&mut engine, window)` runs before a frame is prepared so drawing labels
+  measure as they paint. The host's own key tables, cursor priority, and text-edit routing are
+  redundant beside the adapter and should be deleted rather than kept.
+- Two follow-ups after `17a591f`. `1869773 feat(input): TradingView wheel zoom anchoring,
+  engine-owned on every host` (upstream) renamed `GpuiChartInput::set_origin(Point<Pixels>)` to
+  `set_canvas_bounds(Bounds<Pixels>)` (only a pin at `17a591f` itself had the old name), added
+  `input_pinch` with `GpuiChartInput::pinch`, and made
+  `TimeScaleOptions::right_bar_stays_on_scroll` default to `true`: a plain wheel or keyboard zoom
+  keeps the gap after the newest bar, and only Ctrl/Cmd wheel and pinch zoom around the pointer.
+  Call `ChartEngine::set_right_bar_stays_on_scroll(false)` for the earlier zoom around the pointer
+  (wheel) or the plot centre (keys). The merge `3eef45e merge: sync with AerisTerminal/aeris-charts
+  main (range tools, input controller)` (own line) added `ChartKey::EditText` (F2), so an upstream
+  pin's exhaustive `match` on `ChartKey` needs an arm.
+
+**GPUI dependency** (own line, from `9ae1c58 gpui: build the executor on gpui-pre 0.3.6, the GPUI
+gpui-kit pins`; see [Rust distribution](#rust-distribution)). `aeris_charts_render_gpui` stopped
+depending on a Zed Git revision:
+
+- Before, it used `gpui` 0.2.2 from `https://github.com/zed-industries/zed` at revision
+  `1057c2cf3d5b4aefd04755e1387c7826a4d7fba6` (its manifest sourced GPUI from Zed to track the
+  current pre-1.0 API and pinned `gpui` and `gpui_platform` to that one reviewed commit). Now the
+  `gpui-backend` feature enables `gpui = { package = "gpui-pre", version = "=0.3.6" }` and the
+  parity harness uses `gpui-pre-platform` at `=0.3.6`. The manifest records this as the `gpui` that
+  gpui-kit 0.6.6 (`gpui-component`) pins, so a host on gpui-kit 0.6.6 should already resolve it;
+  that pin is not checked from this repository.
+- The host must resolve to that same package and version: replace its Zed Git dependency with the
+  `package = "gpui-pre"`, `version = "=0.3.6"` form (and `gpui-pre-platform` where it uses the
+  platform crate). A host left on the Zed revision holds two GPUI copies, and every adapter and
+  executor call that takes or returns a GPUI type (`input.mouse_down(&mut engine, &MouseDownEvent)`,
+  `install_text_metrics(&mut engine, &Window)`, `cursor_style` returning a `CursorStyle`) fails to
+  type-check against the host's copy.
+- Keep the `windows-manifest` feature on Windows: GPUI imports `comctl32!TaskDialogIndirect`, which
+  resolves only under the comctl32 v6 activation context the feature's manifest embeds, so an
+  executable without it fails to load (`STATUS_ENTRYPOINT_NOT_FOUND`) before `main`.
+- `9ae1c58` changes only the manifest, the lockfile, and documentation: the executor and adapter
+  source compiled unchanged against `gpui-pre` 0.3.6, so Aeris's own API did not change. The
+  host's own GPUI code is not checked from this repository: moving to `gpui-pre` 0.3.6 is the
+  host's change to make and verify.
+
+**Measuring tools** (both lines, from the merge `3eef45e merge: sync with
+AerisTerminal/aeris-charts main (range tools, input controller)`). Upstream's `5a2e6e8 feat(drawings): add price/date range
+measuring tools and Shift-click measure` and the own line's `36c9f09 feat(charts): B8 drawing
+catalog, multi-calendar overlays, bounded ticks, tick-built candles, and resampling` had built the
+three range tools independently, and the merge kept the own line's implementation. Which spelling a
+pin has depends on its side:
+
+- An upstream pin from `5a2e6e8` on has `DrawingKind::DatePriceRange`, the kind name
+  `date_price_range`, and the wire ids 13 (`PriceRange`), 14 (`DateRange`), and 15
+  (`DatePriceRange`). An own-line pin from `36c9f09` on (`36c9f09` itself, for example) already has
+  `DrawingKind::DateAndPriceRange`, the name `date_and_price_range`, and the ids 130, 131, and 132,
+  which is what main keeps. For an own-line pin there is no rename and no id remap; only the grid
+  snap below applies. A pin on either side before those commits has no range tools.
+- For an upstream pin, `DrawingKind::DatePriceRange` is now `DrawingKind::DateAndPriceRange`
+  (`PriceRange` and `DateRange` keep their names). The numeric wire ids of `DrawingKind::to_u8` and
+  `from_u8` moved: `PriceRange` is 130, `DateRange` 131, and `DateAndPriceRange` 132, where they
+  were 13, 14, and 15. Ids 13 to 15 are now unassigned and ids 0 to 12 are unchanged, so a host that
+  stored numeric ids from an upstream pin remaps them.
+- The kind name `date_price_range` is still read (a serde alias and `DrawingKind::from_name`) and
+  never written, so documents saved by an upstream pin still load; saved documents, templates, and
+  clipboard payloads write `date_and_price_range`.
+- Grid snap. Creation, anchor drags, body drags, and keyboard nudges of the three range tools and of
+  the long and short position tools snap to whole bars and to the instrument tick or price-band
+  ladder. An own-line pin before the merge has no such snap on these tools, so it takes this change
+  for all five (the position tools' price snapping came earlier, with the merge `2e7d19f`). An
+  upstream pin from `5a2e6e8` on already snapped them to bars and the price tick; it gains the
+  price-band ladder (`SeriesPriceFormat::tick_ladder`).
+- The Shift-click quick measure came with `5a2e6e8` (an own-line pin before the merge never had
+  it). Main drives it from the input controller (a Shift press on the pane), so `measure_pointer_*`
+  need not be called for it.
+
+**Other source-level changes.** Each item names the commit that carries it. None of the public
+enums involved is `#[non_exhaustive]`, so every added variant is a compile-time break for an
+exhaustive `match`, and every added field is one for a struct literal that lists the fields.
+
+- `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming,
+  viewport, price axis, and intraday charts` (own line):
+  - `PriceScaleCore::build_tick_marks` and `price_tick_span_calculator::composite_tick_span` take
+    `min_move: f64`, the price grid every tick lies on, where they took `base: i64`, the formatter
+    base. A base of 100 is a `min_move` of `0.01`, which is also the engine's grid on percentage
+    and indexed scales.
+  - `SessionHighlightingOptions::start_hour_utc` and `end_hour_utc` (`Option<u8>`) are now
+    `start_hour` and `end_hour` (`Option<f64>`): fractional, exchange-local hours (`9.5` is 09:30;
+    `start_hour > end_hour` wraps midnight). `Some(9)` becomes `Some(9.0)` and means the same
+    while the exchange time is UTC.
+  - `IndicatorKind::Ema`, `Dema`, `Tema`, and `Rsi` gain `seed: IndicatorSeed`, `Macd` gains
+    `seed` and `histogram_multiplier: f64`, and `Bollinger` gains `estimator:
+    DeviationEstimator`. `IndicatorSeed::Sma`, `1.0`, and `DeviationEstimator::Population` are the
+    earlier behaviour (and the serde defaults, so saved documents still read); a pattern that lists
+    the fields needs `..`.
+  - `DrawingClipboardItem::points` is `Vec<DrawingAnchor>` instead of `Vec<DrawingPoint>`
+    (`DrawingAnchor { logical: Option<f64>, price, time: Option<f64> }`, and
+    `DrawingAnchor::from(point)` converts).
+  - New variants: `IndicatorKind::Kdj` and `IndicatorParameterType::Choice`. New fields:
+    `TimeScaleOptions::lock_visible_logical_range`, `PriceScaleCoreOptions::{
+    ensure_edge_tick_marks_visible, base_value, autoscale_center, stable_auto_scale}`,
+    `PriceMark::edge`, `IndicatorInput::amount`, `SeriesPriceFormat::tick_ladder`,
+    `SeriesEntry::histogram_updown_rule`, `IndicatorBindingInfo::amount_source`,
+    `IndicatorParameterDescriptor::choices`, and `price_basis` on `DrawingClipboardPayload` and
+    `DrawingSyncPayload`.
+- `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded ticks, tick-built
+  candles, and resampling` (own line): `ChartEngine::copy_drawings_json` returns
+  `Result<String, ChartError>` instead of `Option<String>` (`ErrorCode::InvalidData` when no known
+  drawing could be copied; `ErrorCode::ResourceLimit` past `MAX_DRAWING_CLIPBOARD_POINTS` anchors,
+  checked first, and past `MAX_DRAWING_CLIPBOARD_BYTES` bytes). An upstream pin has the
+  `Option<String>` form too. New variants:
+  `DrawingKind` (the B8 catalog; later own-line commits add `HorizontalSegment`, `VerticalRay`,
+  `VerticalSegment`, `PriceChannel`, `PriceLine`, `SimpleTag`, and `SimpleAnnotation`), ten
+  `DrawingKindOptions` variants, `DrawingDragPart::Handle(usize)`,
+  `FootprintError::InvalidSessions`, `ResampleError::{InvalidSessions, TimeAxisRequired}`,
+  `TradeStudyKind::Volume`, and
+  `aeris_charts_core::model::plot_list::PlotValues::AsOf`. New fields: `Drawing::tool_options`,
+  `SeriesEntry::break_on_trading_day`, and `TradeStreamStats::{dependent_rows_computed,
+  bar_rows_projected, bubble_trades_scanned, bubble_markers_sized}`.
+- Later own-line additions: `ExchangeTimeError::BarTimeLabelWindows` (`78d7d59 feat(time):
+  close-time display labels for open-stamped bars`), `IndicatorKind::KLineChart` (`c2d837e engine:
+  bind KLineChart indicators as chart studies`), and `angle` and `multiline` on
+  `DrawingTextEditLayout`, a type the own line has had since `36c9f09` (`d438dab feat(drawings):
+  edit the text of every text-bearing tool and open the editor on placement`).
+- `960e011 feat(drawings): add complete position statistics and adaptive borders` (upstream):
+  `DrawingKindOptions::Position` gains `account_size: f64` and `risk_percent: f64`, and `Drawing`
+  gains `position_account_size` and `position_risk_percent`.
+- `5c62071 feat(engine): own native workspace identity` (upstream):
+  `prepare_financial_frame_with_measure` takes one `FinancialFrameRequest { width, height, dpr,
+  force_layout, fit_content, frame, axis_primitives }` followed by `measure` and
+  `countdown_measure`, where it took nine positional arguments (`width`, `height`, `dpr`,
+  `force_layout`, `fit_content`, `measure`, `countdown_measure`, `frame`, `axis_primitives`); it
+  still returns `FinancialFramePreparation`.
+- Upstream commits between the parting point `ed2910d` and `1869773` also changed these existing
+  public types, so a pin that does not contain them diffs the declarations it matches or
+  constructs: `TradingHitKind` gains `TakeProfitButton` and `StopLossButton` (`24e8e2d fix(trading):
+  dedicated TP/SL buttons with pixel-exact, optically centered controls`), and `TradingStyle` and
+  `TradingStyleOptions` gain `execution_buy` and `execution_sell`, while `ExecutionMarkerShape`'s
+  default is `Arrow` where it was `Circle` (`6f56736 fix(trading): bar-anchored execution arrows
+  with stacked multi-fill marks`). The range kinds and the `Position` fields are covered above. A
+  pin older than `ed2910d` also diffs the types changed before it, which this section does not
+  list.
 
 ## Release policy
 

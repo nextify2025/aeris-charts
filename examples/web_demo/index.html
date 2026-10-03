@@ -297,7 +297,7 @@
     <div class="group" id="overlays_group" data-caption="Indicators">
       <h2>Indicators</h2>
       <label>Find an indicator <input type="search" id="indicator_search" placeholder="Name or abbreviation"></label>
-      <span class="hint">11 built-in indicators · select to add, clear to remove</span>
+      <span class="hint">12 built-in indicators and KLineChart's 27 templates · select to add, clear to remove</span>
       <div id="indicator_catalog" style="display:grid;gap:8px;width:100%"></div>
       <span id="indicator_empty" class="hint" hidden>No matching indicators</span>
       <span id="indicator_error" role="alert"></span>
@@ -1677,6 +1677,55 @@ const indicator_definitions = [
   ["vwap", "VWAP · Session volume-weighted price", (volume) => chart.add_vwap(main, volume)],
   ["volume_profile", "Volume Profile · Visible range / POC / 70%", (volume) => chart.add_volume_profile(main, volume)],
 ];
+// KLineChart's 27 templates at KLineChart's default parameters, one catalog entry each through
+// add_klinechart_indicator. VOL, OBV, PVT, EMV, VR, and AVP bind the demo volume as a hidden series;
+// AVP additionally reads a hidden turnover series (volume x typical price) as its source.
+const klinechart_definitions = [
+  { indicator: "ma", periods: [5, 10, 30, 60] },
+  { indicator: "ema", periods: [6, 12, 20] },
+  { indicator: "sma", period: 12, weight: 2 },
+  { indicator: "boll", period: 20, multiplier: 2 },
+  { indicator: "sar", start: 2, step: 2, max: 20 },
+  { indicator: "bbi", periods: [3, 6, 12, 24] },
+  { indicator: "avp" },
+  { indicator: "vol", periods: [5, 10, 20] },
+  { indicator: "macd", short: 12, long: 26, signal: 9 },
+  { indicator: "kdj", period: 9, k_smoothing: 3, d_smoothing: 3 },
+  { indicator: "rsi", periods: [6, 12, 24] },
+  { indicator: "bias", periods: [6, 12, 24] },
+  { indicator: "brar", period: 26 },
+  { indicator: "cci", period: 20 },
+  { indicator: "dmi", period: 14, adxr_period: 6 },
+  { indicator: "cr", period: 26, ma_periods: [10, 20, 40, 60] },
+  { indicator: "psy", period: 12, ma_period: 6 },
+  { indicator: "dma", short: 10, long: 50, signal: 10 },
+  { indicator: "trix", period: 12, ma_period: 9 },
+  { indicator: "obv", ma_period: 30 },
+  { indicator: "vr", period: 26, ma_period: 6 },
+  { indicator: "wr", periods: [6, 10, 14] },
+  { indicator: "mtm", period: 12, ma_period: 6 },
+  { indicator: "emv", period: 14 },
+  { indicator: "roc", period: 12, ma_period: 6 },
+  { indicator: "pvt" },
+  { indicator: "ao", short: 5, long: 34 },
+];
+// Catalog entries that bind a hidden volume series.
+const volume_indicator_ids = new Set(["vwap", "volume_profile"]);
+const turnover_data = volume_data.map((row, index) => ({
+  time: row.time,
+  value: row.value * (data[index].high + data[index].low + data[index].close) / 3,
+}));
+for (const definition of klinechart_definitions) {
+  const { indicator, ...parameters } = definition;
+  const values = Object.values(parameters).flat().join(" / ");
+  const id = `klinechart_${indicator}`;
+  if (["vol", "obv", "pvt", "emv", "vr", "avp"].includes(indicator)) volume_indicator_ids.add(id);
+  indicator_definitions.push([
+    id,
+    `KLineChart ${indicator.toUpperCase()}${values === "" ? "" : ` · ${values}`}`,
+    (volume, turnover) => chart.add_klinechart_indicator(indicator === "avp" ? turnover : main, definition, volume),
+  ]);
+}
 const indicator_catalog = document.getElementById("indicator_catalog");
 const indicator_handles = new Map();
 window.__demo_indicators = indicator_handles;
@@ -1697,12 +1746,17 @@ for (const [id, title, create] of indicator_definitions) {
       return;
     }
     let volume;
+    let turnover;
     try {
-      if (id === "vwap" || id === "volume_profile") {
+      if (volume_indicator_ids.has(id)) {
         volume = chart.add_series("histogram", { visible: false, title: "Synthetic demo volume" });
         volume.set_data(volume_data);
       }
-      const result = create(volume);
+      if (id === "klinechart_avp") {
+        turnover = chart.add_series("line", { visible: false, title: "Synthetic demo turnover" });
+        turnover.set_data(turnover_data);
+      }
+      const result = create(volume, turnover);
       const outputs = Array.isArray(result) ? result : [result];
       indicator_handles.set(id, {
         outputs,
@@ -1710,11 +1764,13 @@ for (const [id, title, create] of indicator_definitions) {
           if (id === "volume_profile") result.remove();
           else for (const output of outputs) chart.remove_series(output);
           if (volume) chart.remove_series(volume);
+          if (turnover) chart.remove_series(turnover);
         },
       });
       if (id === "rsi") window.__rsi = result;
     } catch (cause) {
       if (volume) chart.remove_series(volume);
+      if (turnover) chart.remove_series(turnover);
       checkbox.checked = false;
       error.textContent = cause.message;
     }

@@ -3444,6 +3444,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn execution_arrows_anchor_to_the_primary_bar_not_overlays_on_its_scale() {
+        // Bar 1 paints high 103 / low 99. A host overlay on the same scale (an EMA ribbon output
+        // or a compare line) runs far above and below it; the arrows must still hug the candle.
+        let executions = vec![
+            fill("buy", OrderSide::Buy, 20, 100.0, 1.0),
+            fill("sell", OrderSide::Sell, 20, 102.5, 1.0),
+        ];
+        let expected = chart_with_fills(executions.clone())
+            .trading_execution_layout(0)
+            .marks;
+        let mut chart = chart_with_market();
+        for closes in [[110.0, 111.0, 112.0], [90.0, 89.0, 88.0]] {
+            let overlay = chart.add_series(crate::SeriesKind::Line);
+            chart
+                .set_series_data(
+                    overlay,
+                    &[10.0, 20.0, 30.0],
+                    &closes,
+                    &closes,
+                    &closes,
+                    &closes,
+                )
+                .unwrap();
+        }
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                executions,
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        chart.build_frame();
+        let marks = chart.trading_execution_layout(0).marks;
+        assert_eq!(marks.len(), expected.len());
+        for (mark, expected) in marks.iter().zip(&expected) {
+            assert_eq!(mark.side, expected.side);
+            // The overlays widen the autoscaled range, so compare against the candle itself.
+            match mark.side {
+                OrderSide::Buy => {
+                    let gap = mark.y - mark.height / 2.0 - price_y(&chart, 99.0);
+                    assert!(gap > 0.0 && gap < mark.size, "buy gap {gap}");
+                }
+                OrderSide::Sell => {
+                    let gap = price_y(&chart, 103.0) - (mark.y + mark.height / 2.0);
+                    assert!(gap > 0.0 && gap < mark.size, "sell gap {gap}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn executions_land_on_the_bar_that_contains_their_time() {
         // Bars open at 10, 20, 30. A fill at 29 belongs to the bar opened at 20, never the next.
         let chart = chart_with_fills(vec![fill("f", OrderSide::Buy, 29, 100.0, 1.0)]);
@@ -3504,9 +3554,10 @@ pub(crate) mod tests {
             p,
             Prim::Text { text, .. } if text == "Buy 4 @ 100.75 avg · 2 fills"
         )));
-        // Several fills draw one stacked mark: a shaft plus four chevrons, under the bar's low.
+        // Two fills draw one stacked mark: one shaft plus one chevron per fill, under the low.
         let mark = &chart.trading_execution_layout(0).marks[0];
-        assert!(mark.height > mark.size * 2.0);
+        assert_eq!(mark.chevrons, 2);
+        assert!((mark.height - mark.size * 94.0 / 70.0).abs() < 1e-9);
         assert!(mark.y - mark.height / 2.0 > price_y(chart, 99.0));
         let execution_buy = chart.trading_style().execution_buy;
         assert_eq!(
@@ -3514,8 +3565,51 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|p| matches!(p, Prim::Polyline { color, .. } if *color == execution_buy))
                 .count(),
-            5
+            3
         );
+    }
+
+    #[test]
+    fn stacked_execution_marks_draw_one_single_sized_chevron_per_fill_with_one_tail() {
+        let single = chart_with_fills(vec![fill("a", OrderSide::Buy, 20, 100.0, 1.0)]);
+        let single_mark = &single.trading_execution_layout(0).marks[0];
+        let strokes = |chart: &ChartEngine| {
+            let mut regions = Vec::new();
+            let mut lines = Vec::new();
+            chart.build_trading_frame_for_test(0, 1.0, 1.0, &mut regions, &mut lines);
+            let color = chart.trading_style().execution_buy;
+            lines
+                .into_iter()
+                .filter_map(|p| match p {
+                    Prim::Polyline {
+                        color: c,
+                        point_count,
+                        width,
+                        ..
+                    } if c == color => Some((point_count, width)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let single_strokes = strokes(&single);
+        for count in 2..=7 {
+            let fills = (0..count)
+                .map(|i| fill(&format!("f{i}"), OrderSide::Buy, 20, 100.0, 1.0))
+                .collect();
+            let chart = chart_with_fills(fills);
+            let mark = &chart.trading_execution_layout(0).marks[0];
+            let chevrons = count.min(5);
+            assert_eq!(mark.chevrons, chevrons);
+            // Same arrow size as one fill; only the stack height grows, one pitch per chevron.
+            assert_eq!(mark.size, single_mark.size);
+            let expected = mark.size * (70.0 + 24.0 * (chevrons - 1) as f64) / 70.0;
+            assert!((mark.height - expected).abs() < 1e-9);
+            let strokes = strokes(&chart);
+            // Exactly one two-point shaft; every chevron is the single arrow's three-point stroke.
+            assert_eq!(strokes.iter().filter(|(n, _)| *n == 2).count(), 1);
+            assert_eq!(strokes.iter().filter(|(n, _)| *n == 3).count(), chevrons);
+            assert!(strokes.iter().all(|(_, w)| *w == single_strokes[0].1));
+        }
     }
 
     #[test]

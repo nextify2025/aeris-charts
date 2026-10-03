@@ -16,6 +16,14 @@
 //! figure unset. KLineChart does not validate periods; here a zero period yields an all-`None`
 //! output instead of dividing by zero.
 //!
+//! All 27 formulas are row steppers: each is one `State` (`Copy`, scalars and fixed-size arrays
+//! only) and one `step` over a single non-whitespace row. The public functions are folds of those
+//! steps, over columns the caller guarantees finite; they do no whitespace handling. The chart
+//! runtime ([`crate::IncrementalState::klinechart`]) replays the same steps from checkpointed
+//! state one row at a time and skips whitespace rows in place (NaN output, no state change), so
+//! each row that carries a sample gets the value the whole-series function gives that row of the
+//! series with the whitespace rows removed (see `stepper`).
+//!
 //! [`Indicator`] bundles a template with its parameters. It is the form a chart binds
 //! ([`crate::IncrementalState::klinechart`]) and persists, and it carries the presentation
 //! metadata a host needs to draw the outputs the way KLineChart does.
@@ -46,12 +54,15 @@ mod psychological_line;
 mod rate_of_change;
 mod relative_strength_index;
 mod simple_moving_average;
+mod stepper;
 mod stoch;
 mod stop_and_reverse;
 mod triple_exponentially_smoothed_average;
 mod volume;
 mod volume_ratio;
 mod williams_r;
+
+pub(crate) use stepper::KlRuntime;
 
 pub use average_price::avp;
 pub use awesome_oscillator::ao;
@@ -84,30 +95,6 @@ pub use williams_r::wr;
 
 /// One indicator output figure: a value per input row, `None` where KLineChart leaves it unset.
 pub type Column = Vec<Option<f64>>;
-
-/// An all-`None` column, used for warm-up rows and invalid periods.
-fn empty(len: usize) -> Column {
-    vec![None; len]
-}
-
-/// KLineChart's rolling mean: add the new value, divide the running sum by `period`, then remove
-/// the value leaving the window. Keeping this exact order reproduces its rounding bit for bit.
-fn rolling_mean(values: &[f64], period: usize) -> Column {
-    let mut out = empty(values.len());
-    if period == 0 {
-        return out;
-    }
-    let divisor = period as f64;
-    let mut sum = 0.0;
-    for (i, &value) in values.iter().enumerate() {
-        sum += value;
-        if i + 1 >= period {
-            out[i] = Some(sum / divisor);
-            sum -= values[i + 1 - period];
-        }
-    }
-    out
-}
 
 /// KLineChart's `getMaxMin(slice, 'high', 'low')`: the highest high and lowest low of a window.
 fn highest_high_lowest_low(high: &[f64], low: &[f64]) -> (f64, f64) {

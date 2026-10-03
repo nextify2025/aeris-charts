@@ -17,7 +17,9 @@
 //!   Target K — 100x replay clock advance, shared projections, frame work, and flat retained memory
 //!   Target L — sustained depth updates, bounded heatmap frame work, and live-edge upload size
 //!   Target M — per-tick cost of every built-in indicator bound to a 1M-row source, and the
-//!              bounded capacity of the aggregate price columns composite-input studies retain
+//!              bounded capacity of the aggregate price columns composite-input studies retain;
+//!              the same per-tick cost, work rows, runtime bytes and a historical repair for
+//!              all 27 KLineChart templates bound to a 1M-row source
 //!   Target N — live ticks plus frame construction with regression trends anchored across a
 //!              1M-row source (data-reading drawings follow ticks by the changed rows)
 //!   Target O — daily-reset studies on daily bars: report-only frame, Canvas2D call, rasterizer,
@@ -34,7 +36,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use aeris_charts_core::model::data_layer::DataLayer;
+use aeris_charts_core::model::data_layer::{DataLayer, SeriesId};
 use aeris_charts_engine::{
     AggressorSide, AxisDimension, ChartEngine, ChartFrame, ContinuousScaleType,
     DepthHeatmapOptions, DepthLevel, DepthOptions, DepthSide, DepthSnapshot, DepthUpdate,
@@ -216,6 +218,26 @@ struct IndicatorTickCost {
     first_append_growth_bytes: usize,
     /// Largest `last_indicator_work_rows` any measured tick reported.
     max_work_rows: usize,
+    /// Indicator runtime bytes after the install and every measured tick.
+    runtime_bytes: usize,
+    /// `(mean, median, max)` milliseconds to revise a bar [`REPAIR_DEPTH`] rows before the newest
+    /// on every series the studies read, measured for the KLineChart set only.
+    repair_ms: Option<(f64, f64, f64)>,
+}
+
+/// Rows between the newest bar and the historical correction Target M (KLineChart) times.
+const REPAIR_DEPTH: usize = 500;
+/// Corrections timed for that sample.
+const REPAIR_SAMPLES: usize = 20;
+
+/// The studies one Target M measurement binds to its source.
+#[derive(Clone, Copy, PartialEq)]
+enum StudySet {
+    /// Every built-in study kind plus the aggregate-input studies.
+    BuiltIn,
+    /// All 27 KLineChart templates with KLineChart's default parameters, the volume-reading ones
+    /// on a volume series and AVP on a turnover series.
+    KLineChart,
 }
 
 /// Deterministic `[open, high, low, close]` for `row`; `revision` moves the close so a tick
@@ -227,53 +249,14 @@ fn indicator_bar(row: usize, revision: usize) -> [f64; 4] {
     [open, open.max(close) + 0.35, open.min(close) - 0.3, close]
 }
 
-/// Target M: bind every built-in study kind (plus aggregate-input studies) to one `rows`-row
-/// minute candle source and its volume series, then time live ticks through the public engine
-/// path: current-bar replacements, and appends in the usual candle-then-volume order.
-fn indicator_tick_cost(
-    rows: usize,
-    slots: usize,
-    replaces_per_append: usize,
-    appends: usize,
-) -> IndicatorTickCost {
+/// Binds every built-in study kind, and the aggregate-input studies, to the candle series 0 (the
+/// volume-reading kinds to `volume`). Returns the number of bindings.
+fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
     use aeris_charts_engine::{
         DeviationEstimator, IndicatorInputSource, IndicatorKind, IndicatorSeed, KdjSeed, PivotKind,
         VwapReset,
     };
 
-    let volume_at = |row: usize, revision: usize| ((row * 37 + revision) % 900 + 100) as f64;
-    // `slots` trailing whitespace rows model a pre-installed session: ticks then fill them in
-    // place instead of appending.
-    let mut times = Vec::with_capacity(rows + slots);
-    let mut columns: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows + slots));
-    let mut volumes = Vec::with_capacity(rows + slots);
-    for row in 0..rows + slots {
-        times.push(row as f64 * 60.0);
-        let (values, volume_value) = if row < rows {
-            (indicator_bar(row, 0), volume_at(row, 0))
-        } else {
-            ([f64::NAN; 4], f64::NAN)
-        };
-        for (column, value) in columns.iter_mut().zip(values) {
-            column.push(value);
-        }
-        volumes.push(volume_value);
-    }
-    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
-    chart
-        .set_series_data(
-            0,
-            &times,
-            &columns[0],
-            &columns[1],
-            &columns[2],
-            &columns[3],
-        )
-        .expect("valid indicator source");
-    let volume = chart.add_series(SeriesKind::Histogram);
-    chart
-        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
-        .expect("valid indicator volume");
     let kinds = [
         IndicatorKind::Sma { period: 20 },
         IndicatorKind::Ema {
@@ -402,6 +385,117 @@ fn indicator_tick_cost(
             .is_empty());
         bindings += 1;
     }
+    bindings
+}
+
+/// Binds the 27 KLineChart templates with KLineChart's default parameters to the candle series 0:
+/// the templates that read volume on `volume`, and AVP on the `turnover` series. Returns the
+/// number of bindings.
+fn bind_klinechart_templates(
+    chart: &mut ChartEngine,
+    volume: SeriesId,
+    turnover: SeriesId,
+) -> usize {
+    use aeris_charts_engine::klinechart::{Indicator, NAMES};
+
+    for name in NAMES {
+        let indicator = Indicator::from_name(name).expect("every listed name is a template");
+        let source = if matches!(indicator, Indicator::Avp) {
+            turnover
+        } else {
+            0
+        };
+        let volume_source = indicator.needs_volume().then_some(volume);
+        let outputs = chart.add_klinechart_indicator(source, indicator, volume_source);
+        assert!(!outputs.is_empty(), "{name} binds");
+    }
+    NAMES.len()
+}
+
+/// Target M: bind a set of studies (every built-in study kind plus aggregate-input studies, or the
+/// 27 KLineChart templates) to one `rows`-row minute candle source and its volume series (and, for
+/// the KLineChart set, a turnover series), then time live ticks through the public engine path:
+/// current-bar replacements, and appends in the usual candle-then-volume order. `whitespace_row`
+/// makes one row of the history whitespace on every series.
+fn indicator_tick_cost(
+    studies: StudySet,
+    rows: usize,
+    slots: usize,
+    whitespace_row: Option<usize>,
+    replaces_per_append: usize,
+    appends: usize,
+) -> IndicatorTickCost {
+    let volume_at = |row: usize, revision: usize| ((row * 37 + revision) % 900 + 100) as f64;
+    // The turnover of a bar: its volume at its close.
+    let turnover_at =
+        |row: usize, revision: usize| volume_at(row, revision) * indicator_bar(row, revision)[3];
+    // `slots` trailing whitespace rows model a pre-installed session: ticks then fill them in
+    // place instead of appending.
+    let mut times = Vec::with_capacity(rows + slots);
+    let mut columns: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows + slots));
+    let mut volumes = Vec::with_capacity(rows + slots);
+    let mut turnovers = Vec::with_capacity(rows + slots);
+    for row in 0..rows + slots {
+        times.push(row as f64 * 60.0);
+        let (values, volume_value, turnover_value) = if row < rows && whitespace_row != Some(row) {
+            (
+                indicator_bar(row, 0),
+                volume_at(row, 0),
+                turnover_at(row, 0),
+            )
+        } else {
+            ([f64::NAN; 4], f64::NAN, f64::NAN)
+        };
+        for (column, value) in columns.iter_mut().zip(values) {
+            column.push(value);
+        }
+        volumes.push(volume_value);
+        turnovers.push(turnover_value);
+    }
+    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+    chart
+        .set_series_data(
+            0,
+            &times,
+            &columns[0],
+            &columns[1],
+            &columns[2],
+            &columns[3],
+        )
+        .expect("valid indicator source");
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .expect("valid indicator volume");
+    // AVP reads turnover as the value of a scalar source series.
+    let turnover = (studies == StudySet::KLineChart).then(|| {
+        let turnover = chart.add_series(SeriesKind::Line);
+        chart
+            .set_series_data(
+                turnover, &times, &turnovers, &turnovers, &turnovers, &turnovers,
+            )
+            .expect("valid indicator turnover");
+        turnover
+    });
+    let bindings = match studies {
+        StudySet::BuiltIn => bind_builtin_studies(&mut chart, volume),
+        StudySet::KLineChart => bind_klinechart_templates(
+            &mut chart,
+            volume,
+            turnover.expect("the KLineChart set has a turnover series"),
+        ),
+    };
+
+    // Writes `row` at `revision` to every series the studies read, in the usual live order: the
+    // candle, then the volume, then (KLineChart set) the turnover.
+    let write_row = |chart: &mut ChartEngine, row: usize, revision: usize| {
+        let time = row as f64 * 60.0;
+        chart.update_series_bar(0, time, indicator_bar(row, revision));
+        chart.update_series_bar(volume, time, [volume_at(row, revision); 4]);
+        if let Some(turnover) = turnover {
+            chart.update_series_bar(turnover, time, [turnover_at(row, revision); 4]);
+        }
+    };
 
     // The first append after a bulk install grows every exact-capacity column the install created
     // (source, volume, and each study output) once. That amortized capacity growth is not per-tick
@@ -409,8 +503,7 @@ fn indicator_tick_cost(
     let mut last = rows;
     let before = chart.memory_usage();
     let started = Instant::now();
-    chart.update_series_bar(0, last as f64 * 60.0, indicator_bar(last, 0));
-    chart.update_series_bar(volume, last as f64 * 60.0, [volume_at(last, 0); 4]);
+    write_row(&mut chart, last, 0);
     let first_append_ms = started.elapsed().as_secs_f64() * 1000.0;
     let after = chart.memory_usage();
     let first_append_growth_bytes = (after.data.allocated_capacity_bytes
@@ -422,27 +515,36 @@ fn indicator_tick_cost(
     let mut max_work_rows = 0;
     for _ in 0..appends {
         for revision in 1..=replaces_per_append {
-            let time = last as f64 * 60.0;
             let started = Instant::now();
-            chart.update_series_bar(0, time, indicator_bar(last, revision));
-            let volume_value = volume_at(last, revision);
-            chart.update_series_bar(volume, time, [volume_value; 4]);
+            write_row(&mut chart, last, revision);
             replace_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
         }
         last += 1;
-        let time = last as f64 * 60.0;
         let started = Instant::now();
-        chart.update_series_bar(0, time, indicator_bar(last, 0));
-        chart.update_series_bar(volume, time, [volume_at(last, 0); 4]);
+        write_row(&mut chart, last, 0);
         append_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
     }
+    let runtime_bytes = chart.memory_usage().indicator_runtime_bytes;
     let summary = |mut samples: Vec<f64>| {
         samples.sort_by(f64::total_cmp);
         let mean = samples.iter().sum::<f64>() / samples.len() as f64;
         (mean, samples[samples.len() / 2], samples[samples.len() - 1])
     };
+    // A correction `REPAIR_DEPTH` rows back replays from the nearest checkpoint to the newest row.
+    let repair_ms = (studies == StudySet::KLineChart).then(|| {
+        let row = last - REPAIR_DEPTH;
+        summary(
+            (1..=REPAIR_SAMPLES)
+                .map(|revision| {
+                    let started = Instant::now();
+                    write_row(&mut chart, row, revision + replaces_per_append);
+                    started.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect(),
+        )
+    });
     IndicatorTickCost {
         bindings,
         replace_ms: summary(replace_ms),
@@ -450,6 +552,8 @@ fn indicator_tick_cost(
         first_append_ms,
         first_append_growth_bytes,
         max_work_rows,
+        runtime_bytes,
+        repair_ms,
     }
 }
 
@@ -1022,6 +1126,11 @@ fn main() -> ExitCode {
     const INDICATOR_TICK_ROWS: usize = 1_000_000;
     const INDICATOR_TICK_APPENDS: usize = 60;
     const INDICATOR_TICK_BUDGET_MS: f64 = 1.0;
+    // Target M (KLineChart): a tick evaluates one row per binding (two when a weight column is
+    // realigned), so four per binding leaves headroom without admitting a replayed window.
+    const KLINECHART_WORK_ROWS_PER_BINDING: usize = 4;
+    const KLINECHART_RUNTIME_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+    const KLINECHART_REPAIR_BUDGET_MS: f64 = 5.0;
 
     println!("aeris_charts perf gate (release build recommended)\n");
 
@@ -2039,7 +2148,14 @@ fn main() -> ExitCode {
     // series. Bounded rolling state makes a tick O(period) per binding, independent of history;
     // the budget keeps a tick (candle + volume update) under 1 ms, so a 60 fps host absorbs a
     // burst of ticks inside one frame with most of its 16.67 ms left for frame construction.
-    let tick_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 0, 4, INDICATOR_TICK_APPENDS);
+    let tick_cost = indicator_tick_cost(
+        StudySet::BuiltIn,
+        INDICATOR_TICK_ROWS,
+        0,
+        None,
+        4,
+        INDICATOR_TICK_APPENDS,
+    );
     println!(
         "Target M — per-tick indicator cost, {} bindings over {INDICATOR_TICK_ROWS} rows (max {} work rows per tick; first append after install {:.2} ms, growing {:.2} MiB of column capacity):",
         tick_cost.bindings,
@@ -2064,7 +2180,14 @@ fn main() -> ExitCode {
 
     // The same studies with a pre-installed one-second session (23,400 whitespace slots) after
     // the source: filling and revising the forming slot must cost the same bounded window.
-    let slot_cost = indicator_tick_cost(INDICATOR_TICK_ROWS, 23_400, 4, INDICATOR_TICK_APPENDS);
+    let slot_cost = indicator_tick_cost(
+        StudySet::BuiltIn,
+        INDICATOR_TICK_ROWS,
+        23_400,
+        None,
+        4,
+        INDICATOR_TICK_APPENDS,
+    );
     println!(
         "Target M (slots) — the same ticks filling 23,400 pre-installed session slots (max {} work rows per tick; first fill after install {:.2} ms, growing {:.2} MiB of column capacity):",
         slot_cost.max_work_rows,
@@ -2147,6 +2270,136 @@ fn main() -> ExitCode {
         "composite new-bar append mean",
         composite.append_mean_ms,
         INDICATOR_TICK_BUDGET_MS,
+    );
+
+    // ---- Target M (KLineChart): the 27 KLineChart templates over a 1M-row source ------------
+    // Each template advances one row at a time from a checkpointed state, so a tick costs the
+    // template's window however long the history is. The set is measured in its own block with the
+    // same 1 ms per-tick budget, so its 27 bindings do not spend the headroom of the 38 built-in
+    // bindings above, which already read close to theirs.
+    let kline_cost = indicator_tick_cost(
+        StudySet::KLineChart,
+        INDICATOR_TICK_ROWS,
+        0,
+        None,
+        4,
+        INDICATOR_TICK_APPENDS,
+    );
+    println!(
+        "Target M (KLineChart) — per-tick indicator cost, {} bindings over {INDICATOR_TICK_ROWS} rows (max {} work rows per tick; first append after install {:.2} ms, growing {:.2} MiB of column capacity):",
+        kline_cost.bindings,
+        kline_cost.max_work_rows,
+        kline_cost.first_append_ms,
+        kline_cost.first_append_growth_bytes as f64 / (1024.0 * 1024.0),
+    );
+    let (kline_replace_mean, kline_replace_median, kline_replace_max) = kline_cost.replace_ms;
+    let m_kline_replace = report(
+        &format!(
+            "current-bar replace mean (median {kline_replace_median:.3} ms, max {kline_replace_max:.2} ms)"
+        ),
+        kline_replace_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+    let (kline_append_mean, kline_append_median, kline_append_max) = kline_cost.append_ms;
+    let m_kline_append = report(
+        &format!(
+            "new-bar append mean (median {kline_append_median:.3} ms, max {kline_append_max:.2} ms)"
+        ),
+        kline_append_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+    // The work-row count is exact, so this bound is not noise-sensitive.
+    let kline_work_bound = KLINECHART_WORK_ROWS_PER_BINDING * kline_cost.bindings;
+    let m_kline_work = report_check(
+        "rows evaluated per tick across all bindings",
+        kline_cost.max_work_rows <= kline_work_bound,
+        &format!(
+            "{} (bound {kline_work_bound}: {KLINECHART_WORK_ROWS_PER_BINDING} per binding)",
+            kline_cost.max_work_rows
+        ),
+    );
+    let m_kline_bytes = report_bytes(
+        "indicator runtime bytes after install and ticks",
+        kline_cost.runtime_bytes,
+        KLINECHART_RUNTIME_BUDGET_BYTES,
+    );
+    let (kline_repair_mean, kline_repair_median, kline_repair_max) = kline_cost
+        .repair_ms
+        .expect("the KLineChart set samples a historical repair");
+    let m_kline_repair = report(
+        &format!(
+            "historical repair {REPAIR_DEPTH} rows back, all series, mean of {REPAIR_SAMPLES} (median {kline_repair_median:.3} ms, max {kline_repair_max:.2} ms)"
+        ),
+        kline_repair_mean,
+        KLINECHART_REPAIR_BUDGET_MS,
+    );
+
+    // The same templates on a pre-installed one-second session (23,400 whitespace slots).
+    let kline_slot_cost = indicator_tick_cost(
+        StudySet::KLineChart,
+        INDICATOR_TICK_ROWS,
+        23_400,
+        None,
+        4,
+        INDICATOR_TICK_APPENDS,
+    );
+    println!(
+        "Target M (KLineChart, slots) — the same ticks filling 23,400 pre-installed session slots (max {} work rows per tick; first fill after install {:.2} ms):",
+        kline_slot_cost.max_work_rows, kline_slot_cost.first_append_ms,
+    );
+    let (kline_slot_replace_mean, kline_slot_replace_median, kline_slot_replace_max) =
+        kline_slot_cost.replace_ms;
+    let m_kline_slot_replace = report(
+        &format!(
+            "forming-slot replace mean (median {kline_slot_replace_median:.3} ms, max {kline_slot_replace_max:.2} ms)"
+        ),
+        kline_slot_replace_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+    let (kline_slot_fill_mean, kline_slot_fill_median, kline_slot_fill_max) =
+        kline_slot_cost.append_ms;
+    let m_kline_slot_fill = report(
+        &format!(
+            "next-slot fill mean (median {kline_slot_fill_median:.3} ms, max {kline_slot_fill_max:.2} ms)"
+        ),
+        kline_slot_fill_mean,
+        INDICATOR_TICK_BUDGET_MS,
+    );
+    // Exact like the plain block's bound: the runtime evaluates the window of a tick, never the
+    // whitespace slots after it, and the engine recolors only the rows the runtime rewrote.
+    let m_kline_slot_work = report_check(
+        "slots: rows evaluated per tick across all bindings",
+        kline_slot_cost.max_work_rows <= kline_work_bound,
+        &format!(
+            "{} (bound {kline_work_bound}: {KLINECHART_WORK_ROWS_PER_BINDING} per binding)",
+            kline_slot_cost.max_work_rows
+        ),
+    );
+
+    // One whitespace row in the history (report-only): every later tick also re-reads the rows
+    // its window spans, so a tick costs the window instead of one row, still not the history.
+    let kline_gap_cost = indicator_tick_cost(
+        StudySet::KLineChart,
+        INDICATOR_TICK_ROWS,
+        0,
+        Some(INDICATOR_TICK_ROWS / 2),
+        4,
+        INDICATOR_TICK_APPENDS,
+    );
+    println!(
+        "Target M (KLineChart, whitespace in history; report-only) — one whitespace row at row {}:",
+        INDICATOR_TICK_ROWS / 2
+    );
+    println!(
+        "  current-bar replace mean {:.3} ms (median {:.3}, max {:.2}), new-bar append mean {:.3} ms (median {:.3}, max {:.2}), max {} work rows per tick, historical repair mean {:.3} ms",
+        kline_gap_cost.replace_ms.0,
+        kline_gap_cost.replace_ms.1,
+        kline_gap_cost.replace_ms.2,
+        kline_gap_cost.append_ms.0,
+        kline_gap_cost.append_ms.1,
+        kline_gap_cost.append_ms.2,
+        kline_gap_cost.max_work_rows,
+        kline_gap_cost.repair_ms.map_or(f64::NAN, |repair| repair.0),
     );
 
     // ---- Target N: regression trends across a 1M-row source under live ticks ----------------
@@ -2240,6 +2493,14 @@ fn main() -> ExitCode {
         && m_composite_first
         && m_composite_final
         && m_composite_append
+        && m_kline_replace
+        && m_kline_append
+        && m_kline_work
+        && m_kline_bytes
+        && m_kline_repair
+        && m_kline_slot_replace
+        && m_kline_slot_fill
+        && m_kline_slot_work
         && n_tick;
     println!(
         "\n{}",
