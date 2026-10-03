@@ -10,7 +10,8 @@ export default defineConfig({
   timeout: process.env.CI ? 60_000 : 30_000,
   fullyParallel: false,
   workers: 1,
-  reporter: [["list"], ["html", { open: "never" }]],
+  // CI also annotates each failed test on the check run, so a failure is named without the job log.
+  reporter: [["list"], ["html", { open: "never" }], ...(process.env.CI ? [["github"]] : [])],
   outputDir: "test-results",
   use: {
     baseURL: `http://127.0.0.1:${port}`,

@@ -45,7 +45,14 @@ jobs:
       - name: tests (includes golden-image regression)
         run: cargo test --workspace --locked
       - name: perf gate (hard configured budgets)
-        run: cargo run -p aeris_charts_native --example perf_gate --release
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run -p aeris_charts_native --example perf_gate --release | tee perf_gate.log || status=$?
+          # Raw job logs are not always readable (API clients, redirects): name each failed target
+          # as an annotation so the failing budget is visible on the check run itself.
+          grep '\[FAIL\]' perf_gate.log | sed 's/^ *//; s/^/::error title=perf gate::/' || true
+          exit "${status:-0}"
         env:
           AERIS_CHARTS_PERF_STRICT: "1"
 
