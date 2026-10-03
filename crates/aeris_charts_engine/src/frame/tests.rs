@@ -9692,6 +9692,33 @@ fn countdown_text_tracks_the_pinned_host_clock() {
 }
 
 #[test]
+fn closed_market_hides_the_countdown_without_touching_the_preference() {
+    let mut chart = countdown_chart();
+    chart.series[0].countdown_visible = true;
+    chart.set_now_seconds(250.0);
+    assert_eq!(boxed_labels(&mut chart).len(), 2, "price + countdown rows");
+
+    chart.set_bar_countdown_active(false);
+    assert_eq!(chart.series_countdown_text(0), None);
+    assert_eq!(
+        boxed_labels(&mut chart).len(),
+        1,
+        "a closed session paints only the price label"
+    );
+    chart.set_now_seconds(251.0);
+    assert_eq!(
+        chart.series_countdown_text(0),
+        None,
+        "the clock keeps ticking"
+    );
+    assert!(chart.series[0].countdown_visible, "user preference is kept");
+
+    chart.set_bar_countdown_active(true);
+    assert_eq!(chart.series_countdown_text(0).as_deref(), Some("00:49"));
+    assert_eq!(boxed_labels(&mut chart).len(), 2);
+}
+
+#[test]
 fn last_value_cluster_chips_stay_solid_when_the_series_color_is_translucent() {
     let mut chart = countdown_chart();
     chart.now_override = Some(250.0);

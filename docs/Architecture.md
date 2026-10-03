@@ -465,7 +465,9 @@ strips on each side while keeping every pane and the shared time scale aligned. 
 last-value and crosshair labels, primitives, coordinates, and gestures resolve through the exact
 owning scale. Width negotiation measures every axis-side row in a live-value cluster, including the
 scaled countdown row; the pane-side title chip is fitted to the available pane instead of inflating
-the strip. The horizontal grid uses only the innermost visible populated scale, preferring the right
+the strip. The countdown row exists only while the host has pinned a clock and the market is trading;
+a host reports a closed session with `set_bar_countdown_active(false)`, which hides every countdown row
+without changing any series' `countdown_visible` preference. The horizontal grid uses only the innermost visible populated scale, preferring the right
 side when equal orders meet. Hidden and empty named scales retain state without consuming layout or
 receiving labels and input.
 
