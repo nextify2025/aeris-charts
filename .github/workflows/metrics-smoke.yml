@@ -18,28 +18,31 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.15.0
-      - run: npm ci
+      - run: bun install --frozen-lockfile
         working-directory: packages/charts
-      - run: npm ci
+      - run: bun install --frozen-lockfile
         working-directory: examples/web_demo
-      - run: npx playwright install --with-deps chromium
+      - run: bunx playwright install --with-deps chromium
         working-directory: examples/web_demo
       - name: Harness tests
         run: node benchmarks/benchmark.mjs test
       - name: Production size and browser smoke
         run: node benchmarks/benchmark.mjs smoke
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: metrics-smoke

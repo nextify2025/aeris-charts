@@ -1936,6 +1936,9 @@ pub struct ChartEngine {
     /// hidden until a host supplies the time — the wasm render path feeds the browser's system
     /// time every frame unless a value is pinned; tests pin one here for determinism.
     pub now_override: Option<f64>,
+    /// `false` while the market is not trading (session closed): no bar will close, so the
+    /// candle-close countdown rows hide even with a host clock pinned.
+    bar_countdown_active: bool,
     /// Host-owned replay clock. Canonical rows remain retained while the data layer and canonical
     /// trade streams expose only facts at or before this microsecond boundary.
     replay_clock_micros: Option<i64>,
@@ -2186,6 +2189,7 @@ impl ChartEngine {
             css_height,
             dpr,
             now_override: None,
+            bar_countdown_active: true,
             replay_clock_micros: None,
             crosshair: None,
             comparison_anchor: None,
@@ -2591,6 +2595,24 @@ impl ChartEngine {
             } else {
                 self.now_override = Some(now);
             }
+        }
+    }
+
+    /// Whether the instrument's market is trading, so its bars can close. While inactive (the
+    /// session is closed) every candle-close countdown row hides, independent of each series'
+    /// `countdown_visible` preference and of the host clock; reactivating restores them.
+    pub fn set_bar_countdown_active(&mut self, active: bool) {
+        if self.bar_countdown_active == active {
+            return;
+        }
+        self.bar_countdown_active = active;
+        if self
+            .series
+            .iter()
+            .any(|series| series.visible && series.countdown_visible)
+        {
+            // The countdown row contributes to the price-axis width.
+            self.invalidate_frame_layout_and_axis();
         }
     }
 

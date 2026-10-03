@@ -465,7 +465,9 @@ strips on each side while keeping every pane and the shared time scale aligned. 
 last-value and crosshair labels, primitives, coordinates, and gestures resolve through the exact
 owning scale. Width negotiation measures every axis-side row in a live-value cluster, including the
 scaled countdown row; the pane-side title chip is fitted to the available pane instead of inflating
-the strip. The horizontal grid uses only the innermost visible populated scale, preferring the right
+the strip. The countdown row exists only while the host has pinned a clock and the market is trading;
+a host reports a closed session with `set_bar_countdown_active(false)`, which hides every countdown row
+without changing any series' `countdown_visible` preference. The horizontal grid uses only the innermost visible populated scale, preferring the right
 side when equal orders meet. Hidden and empty named scales retain state without consuming layout or
 receiving labels and input.
 
@@ -1389,7 +1391,7 @@ Recipe for a family:
 4. Add the TypeScript union members, wire ids, kind-option and option types, the demo toolbar
    buttons, and the `Public_api.md` entry in their blocks; `impl.ts` derives its reverse wire map.
    `packages/charts/api/public-api-v1.json` is a generated hash that every stream changes;
-   regenerate it (`npm run update:api`) after merging instead of merging it.
+   regenerate it (`bun run update:api`) after merging instead of merging it.
 5. Tests: the wire-range table entry; family engine tests for defaults, armed placement, frame
    parts at DPR 1 and 2 and at a fractional DPR whose bitmap ratios differ, hit testing including indexed against brute force with more than 20
    drawings, anchor and body drags with straighten and magnet, keyboard handle count and nudge, time
@@ -1808,7 +1810,11 @@ Markdown documentation may live at the root or beside the component it explains 
 
 ## Verification
 
-The standard gates mirror CI (`.github/workflows/ci.yml`, in its order):
+The standard gates mirror CI (`.github/workflows/ci.yml`, in its order). Bun 1.4.2 installs the npm
+dependencies (`bun.lock` in `packages/charts` and `examples/web_demo`) and runs the package scripts
+and Playwright; Node 24 stays installed because Playwright and the repository's `node` scripts run
+on it. npm is used only where it defines the shipped artifact: `npm pack` for the size budgets and
+the pack smoke test, and `npm publish` in `publish.yml`.
 
 ```text
 node packages/charts/scripts/namespace_guard.mjs
@@ -1819,26 +1825,26 @@ cargo test --workspace --locked
 AERIS_CHARTS_PERF_STRICT=1 cargo run -p aeris_charts_native --example perf_gate --release
 
 cd packages/charts
-npm ci
-npm run lint
-npm run build
+bun install --frozen-lockfile
+bun run lint
+bun run build
 node ../../benchmarks/benchmark.mjs size   # CI runs it from the repository root
-npm run typecheck
-npm run check:api
-npm run check:release-gates
-npm run test:pack
+bun run typecheck
+bun run check:api
+bun run check:release-gates
+bun run test:pack
 ```
 
-An intentional public-API change regenerates the snapshot with `npm run update:api` (a write
+An intentional public-API change regenerates the snapshot with `bun run update:api` (a write
 step, not a gate) before `check:api`. CI also requires the portable browser suite
-(`AERIS_CHARTS_PORTABLE_BROWSER=1 npx playwright test` in `examples/web_demo` after
-`npm ci && npm run build` there) and the native GPUI tests
+(`AERIS_CHARTS_PORTABLE_BROWSER=1 bunx playwright test` in `examples/web_demo` after
+`bun install --frozen-lockfile && bun run build` there) and the native GPUI tests
 (`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`), with
 the GPUI backend and its tests linted on Linux
 (`cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings`).
 
-Local browser runs need the browser build Playwright pins (Chrome for Testing 151 for the pinned
-Playwright 1.62). How Chromium is hosted matters as much as its version for the WebGPU specs. With the
+Local browser runs need the browser build Playwright pins (Chrome for Testing 153 for the pinned
+Playwright 1.63). How Chromium is hosted matters as much as its version for the WebGPU specs. With the
 repository's launch flags (the SwiftShader WebGPU adapter) on a Linux box without a GPU, measured with
 Chromium 141.0.7390.37: headless Chromium obtains an adapter and a device but cannot present WebGPU
 frames (`chrome://gpu` reports `gpu_compositing` as `disabled_software` and `webgpu` as
@@ -1858,7 +1864,7 @@ To run the repository's WebGPU specs on a Linux box without a GPU, host Chromium
 display, from `examples/web_demo`, with the browser build Playwright pins installed:
 
 ```text
-xvfb-run -a -s "-screen 0 1920x1080x24" npx playwright test --headed <specs>
+xvfb-run -a -s "-screen 0 1920x1080x24" bunx playwright test --headed <specs>
 ```
 
 Measured this way, the WebGPU-versus-Canvas2D pixel-identical specs of lines
@@ -1892,13 +1898,13 @@ resolves.
 
 CI, the tag-publish workflow and the benchmark workflows install `wasm-pack` 0.15.0 with
 `cargo install wasm-pack --locked --version 0.15.0`: its bundled `wasm-opt` shapes the shipped WASM
-bytes and therefore the package size budgets. `npm run check:release-gates` fails when any of those workflows installs it
+bytes and therefore the package size budgets. `bun run check:release-gates` fails when any of those workflows installs it
 unpinned or at another version.
 
 The Rust toolchain is an exact release as well: `rust-toolchain.toml` names it (1.99.0) and every
 workflow installs that release through its `toolchain:` input, so a new stable Rust cannot change
 what CI compiles or lints with (a floating `stable` once added a Clippy lint to an unchanged tree).
-`npm run check:release-gates` fails when a workflow and the file disagree. Moving the pin is a
+`bun run check:release-gates` fails when a workflow and the file disagree. Moving the pin is a
 deliberate commit that moves both and re-runs the size and performance budgets.
 
 `perf_gate` prints PASS/FAIL per target and exits non-zero on a failure only when
@@ -1930,7 +1936,7 @@ The Linux gates (`GATES` and `ALIGNED` in `examples/pixel_parity.rs`, whose doc 
 
 A pass proves that the Prim stream's coordinates, colours, paint order and blend arithmetic reach a real GPUI window unchanged, and that antialiased edges stay within the measured envelope. It does not prove clipping: the harness paints each fixture through `GpuiChartRenderer::paint_prims`, a bare Prim layer with no frame and no clip, so only the frame-level pane matrix below (`gpui_pane_capture`, which paints through `paint_frame`) compares clipping. It does not prove hardware behaviour either: lavapipe's rasterization rules, its resolve of GPUI's path-pass MSAA (the largest of 4, 2 or 1 samples the surface format supports), gamma, the LCD subpixel text GPUI draws on this stack, and glyph rasterization can all differ from DWM/WARP and from real GPUs. CI runs the harness as the non-blocking `gpui-pixel-parity` job on `ubuntu-latest` and uploads `results.json` and the PNGs. The job is non-blocking through `continue-on-error` on the job and on the harness step, and the step has a 10-minute timeout, so a gate failure, a hang, a job timeout or an apt flake cannot turn the `ci.yml` run red (the tag-publish workflow requires a green `ci.yml` run for a release commit). It becomes a required check when five consecutive runner runs pass every gate with identical `gpui_adapter` and `*_rgba_sha256` values for the same commit, and the runner's Mesa build either matches the calibration build or the limits are re-derived from the runner's own measurements and the Mesa version is pinned or its drift watched. Promotion removes both `continue-on-error` flags and adds the job to the tag-publish requirements.
 
-The GPUI-versus-WebGPU matrix (`examples/web_demo/tests/gpui-webgpu-matrix.spec.mjs`, opt-in with `AERIS_CHARTS_RUN_GPUI_WEBGPU_MATRIX=1`, normally through `npm run test:gpui-webgpu`) also runs on Linux for its four light base cases, headed under `xvfb-run -a -s "-screen 0 2560x1600x24"` with the same `VK_ICD_FILENAMES` as above: `gpui_pane_capture` reads GPUI's X11 window (the spec sets `GPUI_X11_SCALE_FACTOR` to the fixture's pixel ratio, 1.5, and the virtual screen must exceed the 1851x1047 pane) and Playwright screenshots the presented WebGPU frame. Measured with Chromium 141.0.7390.37 (not the pinned build) on its SwiftShader WebGPU adapter against lavapipe, with the dev-profile `gpui_pane_capture` standing in for the spec's `cargo run --release`, three consecutive runs gave byte-exact output (0 differing pixels) for all four cases with stable hashes on both sides. The approved WebGPU hashes are Windows hashes and none of the seven matched on Linux, so Linux records its WebGPU hash in the report and asserts it only on Windows. The dark case cannot be exact until the demo's dark fixture (#131722) is aligned with the canonical dark surface (#1f1f1f), and the marker and trading cases (1,653 and 5,227 differing pixels, maximum channel delta 247) are bounded by Windows limits that depend on the host's fonts, so Linux does not run them. CI's browser job stays on Windows; the Linux matrix is local evidence.
+The GPUI-versus-WebGPU matrix (`examples/web_demo/tests/gpui-webgpu-matrix.spec.mjs`, opt-in with `AERIS_CHARTS_RUN_GPUI_WEBGPU_MATRIX=1`, normally through `bun run test:gpui-webgpu`) also runs on Linux for its four light base cases, headed under `xvfb-run -a -s "-screen 0 2560x1600x24"` with the same `VK_ICD_FILENAMES` as above: `gpui_pane_capture` reads GPUI's X11 window (the spec sets `GPUI_X11_SCALE_FACTOR` to the fixture's pixel ratio, 1.5, and the virtual screen must exceed the 1851x1047 pane) and Playwright screenshots the presented WebGPU frame. Measured with Chromium 141.0.7390.37 (not the pinned build) on its SwiftShader WebGPU adapter against lavapipe, with the dev-profile `gpui_pane_capture` standing in for the spec's `cargo run --release`, three consecutive runs gave byte-exact output (0 differing pixels) for all four cases with stable hashes on both sides. The approved WebGPU hashes are Windows hashes and none of the seven matched on Linux, so Linux records its WebGPU hash in the report and asserts it only on Windows. The dark case cannot be exact until the demo's dark fixture (#131722) is aligned with the canonical dark surface (#1f1f1f), and the marker and trading cases (1,653 and 5,227 differing pixels, maximum channel delta 247) are bounded by Windows limits that depend on the host's fonts, so Linux does not run them. CI's browser job stays on Windows; the Linux matrix is local evidence.
 
 The evidence harness has one entry point:
 
@@ -1946,7 +1952,7 @@ checks. Configured `perf_gate` budgets run strictly. Machine-calibrated screensh
 heap sampling, and wall-clock evidence stay in separate non-blocking diagnostic steps (the
 `gpui-pixel-parity` job is one); approved hashes are never changed merely to satisfy a different host.
 
-The published WASM module is produced only by `npm run build:wasm` in `packages/charts`: `wasm-pack build --target web` on the shared `release` profile (opt-level 3 workspace crates, `opt-level = "z"` dependencies, fat LTO, one codegen unit, `panic = abort`, `+simd128` from `.cargo/config.toml`), then `wasm-opt` with the flags declared in `crates/aeris_charts_wasm/Cargo.toml`. wasm-pack is pinned to 0.15.0 in every workflow that builds the package, and the release-gate guard enforces that. It runs a `wasm-opt` found on `PATH` and otherwise downloads its own binaryen, so a locally installed `wasm-opt` changes the artifact: every benchmark result records the Cargo profile, the wasm-opt flags read from the crate metadata, and the wasm-opt version, and `node benchmarks/benchmark.mjs size` fails when the build log shows that wasm-opt did not run. The package-size ceilings in `benchmarks/budgets.json` block `ci.yml`, `metrics-smoke.yml`, and the nightly and release benchmark workflows; `node benchmarks/benchmark.mjs rebudget` derives replacement ceilings and their rationale from a measured result, and `benchmarks/README.md` ("WASM size levers and re-baselining") records which size levers were measured and why the release profile keeps workspace crates at opt-level 3. The embedded time-zone database is a priced dependency of that artifact: measured in an isolated wasm32 module with these flags, `chrono-tz` filtered to the parity zones adds about 350 KB raw and 41 KB brotli, against about 914 KB and 84 KB for the complete database with `strftime` abbreviations as first merged; zone abbreviations therefore come from the offset's `Display` (+2 KB) instead of `%Z` (+25 KB). Re-measure with the real package whenever the zone list or the filter changes.
+The published WASM module is produced only by `bun run build:wasm` in `packages/charts`: `wasm-pack build --target web` on the shared `release` profile (opt-level 3 workspace crates, `opt-level = "z"` dependencies, fat LTO, one codegen unit, `panic = abort`, `+simd128` from `.cargo/config.toml`), then `wasm-opt` with the flags declared in `crates/aeris_charts_wasm/Cargo.toml`. wasm-pack is pinned to 0.15.0 in every workflow that builds the package, and the release-gate guard enforces that. It runs a `wasm-opt` found on `PATH` and otherwise downloads its own binaryen, so a locally installed `wasm-opt` changes the artifact: every benchmark result records the Cargo profile, the wasm-opt flags read from the crate metadata, and the wasm-opt version, and `node benchmarks/benchmark.mjs size` fails when the build log shows that wasm-opt did not run. The package-size ceilings in `benchmarks/budgets.json` block `ci.yml`, `metrics-smoke.yml`, and the nightly and release benchmark workflows; `node benchmarks/benchmark.mjs rebudget` derives replacement ceilings and their rationale from a measured result, and `benchmarks/README.md` ("WASM size levers and re-baselining") records which size levers were measured and why the release profile keeps workspace crates at opt-level 3. The embedded time-zone database is a priced dependency of that artifact: measured in an isolated wasm32 module with these flags, `chrono-tz` filtered to the parity zones adds about 350 KB raw and 41 KB brotli, against about 914 KB and 84 KB for the complete database with `strftime` abbreviations as first merged; zone abbreviations therefore come from the offset's `Display` (+2 KB) instead of `%Z` (+25 KB). Re-measure with the real package whenever the zone list or the filter changes.
 
 Indicator multi-input validation is engine-owned: VWAP and VWAP-band bindings require a distinct
 live scalar volume series, while missing volume remains the explicit unit-weight fallback. An

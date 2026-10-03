@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   base_environment,
@@ -22,7 +22,6 @@ import {
 } from "./core.mjs";
 import { measure_size, prepare_browser_artifacts } from "./size.mjs";
 
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const command = process.argv[2] ?? "help";
 const args = process.argv.slice(3);
 
@@ -32,15 +31,15 @@ function run(file, file_args, cwd) {
 }
 
 async function exists(filename) {
-  try { await readFile(filename); return true; } catch { return false; }
+  try { await stat(filename); return true; } catch { return false; }
 }
 
 async function ensure_dependencies(browser) {
   const package_modules = path.join(repository_root, "packages", "charts", "node_modules");
-  if (!(await exists(path.join(package_modules, ".package-lock.json")))) run(npm, ["ci"], path.join(repository_root, "packages", "charts"));
+  if (!(await exists(path.join(package_modules, ".bin")))) run("bun", ["install", "--frozen-lockfile"], path.join(repository_root, "packages", "charts"));
   if (browser) {
     const demo_modules = path.join(repository_root, "examples", "web_demo", "node_modules");
-    if (!(await exists(path.join(demo_modules, ".package-lock.json")))) run(npm, ["ci"], path.join(repository_root, "examples", "web_demo"));
+    if (!(await exists(path.join(demo_modules, ".bin")))) run("bun", ["install", "--frozen-lockfile"], path.join(repository_root, "examples", "web_demo"));
   }
 }
 

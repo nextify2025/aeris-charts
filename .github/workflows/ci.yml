@@ -18,14 +18,14 @@ jobs:
     name: Namespace guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: node packages/charts/scripts/namespace_guard.mjs
 
   rust:
     name: Rust (fmt, clippy, tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
@@ -57,7 +57,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
@@ -89,7 +89,7 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
@@ -117,7 +117,7 @@ jobs:
           # The virtual screen must be larger than the harness window or GetImage cannot read it.
           xvfb-run -a -s "-screen 0 2560x1600x24" \
             cargo run -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: gpui-pixel-parity-linux
@@ -131,89 +131,95 @@ jobs:
     name: TypeScript package (lint, typecheck, build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.15.0
       - name: Install package deps
         working-directory: packages/charts
-        run: npm ci
+        run: bun install --frozen-lockfile
       - name: Lint
         working-directory: packages/charts
-        run: npm run lint
+        run: bun run lint
       - name: Build (wasm + bundle + types)
         working-directory: packages/charts
-        run: npm run build
+        run: bun run build
       - name: Enforce production artifact size budgets
         run: node benchmarks/benchmark.mjs size
       - name: Typecheck
         working-directory: packages/charts
-        run: npm run typecheck
+        run: bun run typecheck
       - name: Public API compatibility snapshot
         working-directory: packages/charts
-        run: npm run check:api
+        run: bun run check:api
       - name: Release gate policy simulation
         working-directory: packages/charts
-        run: npm run check:release-gates
+        run: bun run check:release-gates
       - name: Pack smoke test (tarball installs and imports)
         working-directory: packages/charts
-        run: npm run test:pack
+        run: bun run test:pack
 
   browser:
     name: Browser runtime & parity (Playwright)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.15.0
       - name: Install package deps
         working-directory: packages/charts
-        run: npm ci
+        run: bun install --frozen-lockfile
       - name: Install demo deps
         working-directory: examples/web_demo
-        run: npm ci
+        run: bun install --frozen-lockfile
       - name: Build package and demo assets
         working-directory: examples/web_demo
-        run: npm run build
+        run: bun run build
       - name: Install Playwright browsers
         working-directory: examples/web_demo
-        run: npx playwright install --with-deps
+        run: bunx playwright install --with-deps
       - name: Run required portable browser suite
         id: portable-browser-suite
         working-directory: examples/web_demo
-        run: npx playwright test
+        run: bunx playwright test
         env:
           AERIS_CHARTS_PORTABLE_BROWSER: "1"
       - name: Run machine-sensitive pixel/GPU/performance evidence
         id: machine-evidence
         continue-on-error: true
         working-directory: examples/web_demo
-        run: npx playwright test tests/backend-parity.spec.mjs tests/engine-bench.spec.mjs tests/frame-stats.spec.mjs tests/gpui-webgpu-matrix.spec.mjs tests/perf-gate.spec.mjs --project=chromium
+        run: bunx playwright test tests/backend-parity.spec.mjs tests/engine-bench.spec.mjs tests/frame-stats.spec.mjs tests/gpui-webgpu-matrix.spec.mjs tests/perf-gate.spec.mjs --project=chromium
       - name: Run machine-sensitive retention-memory evidence
         id: machine-retention-evidence
         continue-on-error: true
         working-directory: examples/web_demo
-        # bash, not the runner's default PowerShell: the npx shim re-parses its arguments there, and
+        # bash, not the runner's default PowerShell: the bunx shim re-parses its arguments there, and
         # PowerShell reads a bare @machine as a splatted variable, so this step failed on every run
         # before Playwright started.
         shell: bash
-        run: npx playwright test tests/retention.spec.mjs --project=chromium --grep "@machine"
-      - uses: actions/upload-artifact@v4
+        run: bunx playwright test tests/retention.spec.mjs --project=chromium --grep "@machine"
+      - uses: actions/upload-artifact@v7
         if: failure() || steps.machine-evidence.outcome == 'failure' || steps.machine-retention-evidence.outcome == 'failure'
         with:
           name: playwright-report

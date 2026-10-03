@@ -2745,10 +2745,11 @@ impl ChartEngine {
     /// interval)`; outside it — a lunch break, overnight, a weekend, or after an early close —
     /// the row hides instead of cycling through intervals the market never trades. Calendar-date
     /// bars form during their exchange trading day(s), or through the end of their calendar
-    /// month(s) for monthly and longer bars. `None` (the row hides) with fewer than two bars or no
-    /// installed host clock (`now_override`).
+    /// month(s) for monthly and longer bars. `None` (the row hides) with fewer than two bars, no
+    /// installed host clock (`now_override`), or while the market is not trading
+    /// (`set_bar_countdown_active(false)`).
     fn series_countdown_remaining_at(&self, id: SeriesId, now: f64) -> Option<f64> {
-        if self.sequence_points().is_some() {
+        if !self.bar_countdown_active || self.sequence_points().is_some() {
             return None;
         }
         let plot = self.data.plot(id);

@@ -8,7 +8,7 @@ if (process.platform !== "win32" && process.platform !== "linux") {
 // docs/Architecture.md (Verification) records that headless Chromium cannot present WebGPU frames
 // on a Linux box without a GPU, and the GPUI window is read from an X server, so the Linux run is
 // headed under a virtual display:
-//   xvfb-run -a -s "-screen 0 2560x1600x24" npm run test:gpui-webgpu
+//   xvfb-run -a -s "-screen 0 2560x1600x24" bun run test:gpui-webgpu
 if (process.platform === "linux" && !process.env.DISPLAY) {
   console.error("The Linux GPUI/WebGPU pixel matrix needs an X display; run it under `xvfb-run -a -s \"-screen 0 2560x1600x24\"`.");
   process.exit(1);

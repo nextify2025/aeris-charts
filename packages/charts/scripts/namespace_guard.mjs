@@ -22,9 +22,11 @@ const generatedAllowed = [
   new RegExp(`__wbg_set_${retired}_[0-9a-f]+`, "gi"),
   new RegExp(`\\.${retired}\\b`, "gi"),
   new RegExp(`${retired}al error`, "gi"),
-  // React DOM's generated SVG property table contains standards-defined coordinate
-  // attribute names that include the retired token; keep those web-platform spellings exempt.
+  // React DOM's generated SVG property table contains standards-defined attribute names that
+  // include the retired token (the font coordinates, and the CSS transform property since
+  // React 19); keep those web-platform spellings exempt.
   new RegExp(`(?:horiz|vert)-${retired}-[xy]`, "gi"),
+  new RegExp(`transform-${retired}`, "gi"),
   new RegExp(`${retired}:\\s*["']${retired}["']`, "gi"),
 ];
 const generated = ["packages/charts/pkg", "packages/charts/dist", "examples/web_demo/pkg", "examples/web_demo/dist"];

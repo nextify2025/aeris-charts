@@ -248,17 +248,18 @@ version policy.
 
 ## Development
 
-Prerequisites: stable Rust, the `wasm32-unknown-unknown` target, `wasm-pack`, and Node.js 18 or newer.
+Prerequisites: stable Rust, the `wasm32-unknown-unknown` target, `wasm-pack`, Bun, and Node.js 18 or newer
+(the `node` scripts and Playwright run on Node).
 
 ```sh
 cargo test --workspace
 
 cd packages/charts
-npm ci
-npm run build
-npm run lint
-npm run typecheck
-npm run test:pack
+bun install --frozen-lockfile
+bun run build
+bun run lint
+bun run typecheck
+bun run test:pack
 ```
 
 The complete verification gates are documented in [AGENTS.md](AGENTS.md) and enforced by CI.

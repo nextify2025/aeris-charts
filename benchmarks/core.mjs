@@ -76,7 +76,7 @@ function wasm_pack_cache_root() {
 }
 
 export async function build_provenance(kind = "package") {
-  const lock = await readFile(path.join(repository_root, "packages", "charts", "package-lock.json"));
+  const lock = await readFile(path.join(repository_root, "packages", "charts", "bun.lock"));
   const cargo_lock = await readFile(path.join(repository_root, "Cargo.lock"));
   const esbuild = await read_json(path.join(repository_root, "packages", "charts", "node_modules", "esbuild", "package.json")).catch(() => null);
   const native = kind === "native";
@@ -85,11 +85,12 @@ export async function build_provenance(kind = "package") {
   return {
     profile: "release",
     logging: "default-no-verbose-debug",
-    build_command: native ? "cargo run --quiet --release -p aeris_charts_native --example evidence_bench" : "npm run build",
+    build_command: native ? "cargo run --quiet --release -p aeris_charts_native --example evidence_bench" : "bun run build",
     rustc_version: command("rustc", ["--version"]),
     wasm_pack_version: command("wasm-pack", ["--version"]),
     node_version: process.version,
     npm_version: command(process.platform === "win32" ? "npm.cmd" : "npm", ["--version"]),
+    bun_version: command("bun", ["--version"]),
     esbuild_version: esbuild?.version ?? null,
     package_lock_sha256: createHash("sha256").update(lock).digest("hex"),
     cargo_lock_sha256: createHash("sha256").update(cargo_lock).digest("hex"),

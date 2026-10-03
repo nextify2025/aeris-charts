@@ -44,7 +44,7 @@ function assertWasmPackPinned(source, workflow) {
 }
 
 function verify(ciSource, publishSource, benchmarkSources = benchmarkWorkflows) {
-  assert.match(ciSource, /Run required portable browser suite[\s\S]*npx playwright test/,
+  assert.match(ciSource, /Run required portable browser suite[\s\S]*bunx playwright test/,
     "portable Playwright must remain a required browser step");
   assert.doesNotMatch(ciSource, /Run required portable browser suite[\s\S]{0,180}continue-on-error: true/,
     "portable Playwright cannot continue on error");

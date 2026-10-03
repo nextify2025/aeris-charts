@@ -7,7 +7,9 @@ import { repository_root } from "./core.mjs";
 import { dataset_metadata, metric } from "./shared.mjs";
 
 const package_root = path.join(repository_root, "packages", "charts");
-const executable = process.platform === "win32" ? "npm.cmd" : "npm";
+// Bun installs, builds and runs the package scripts; npm stays only for `npm pack`, whose tarball is the
+// publishable artifact the size budgets are defined on.
+const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 
 function run(file, args, cwd) {
   const command = process.platform === "win32" && file.endsWith(".cmd") ? ["cmd.exe", ["/d", "/s", "/c", file, ...args]] : [file, args];
@@ -34,7 +36,7 @@ function run_logged(file, args, cwd) {
 }
 
 async function build_package() {
-  assert_wasm_opt_ran(await run_logged(executable, ["run", "build"], package_root));
+  assert_wasm_opt_ran(await run_logged("bun", ["run", "build"], package_root));
 }
 
 async function compressed_metrics(prefix, filename, visibility = "public_candidate") {
@@ -60,7 +62,7 @@ async function consumer_bundle(kind, source, temporary) {
   const entry = path.join(temporary, `${kind}.mjs`);
   const output = path.join(temporary, `${kind}.js`);
   await writeFile(entry, source);
-  run(executable, ["exec", "--", "esbuild", entry, "--bundle", "--minify", "--format=esm", `--outfile=${output}`], package_root);
+  run("bunx", ["esbuild", entry, "--bundle", "--minify", "--format=esm", `--outfile=${output}`], package_root);
   return compressed_metrics(`consumer_${kind}_js_bundle`, output);
 }
 
@@ -84,7 +86,7 @@ export function parse_pack_manifest(output) {
 export async function measure_size({ build = true } = {}) {
   const started = performance.now();
   if (build) await build_package();
-  const pack = parse_pack_manifest(run(executable, ["pack", "--json", "--dry-run"], package_root));
+  const pack = parse_pack_manifest(run(npm, ["pack", "--json", "--dry-run"], package_root));
   const dist = path.join(package_root, "dist");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "aeris_charts-bundle-"));
   try {

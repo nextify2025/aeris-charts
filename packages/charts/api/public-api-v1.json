@@ -58,8 +58,8 @@
     },
     {
       "path": "react.d.ts",
-      "bytes": 77633,
-      "sha256": "842d688adf81e771b0a1d4bbfc4b39bde06f19ab9e57e1106d68ddcc2ce41208"
+      "bytes": 77626,
+      "sha256": "2f9e2b8ee551c602824daacb5545262ccdb042d86b605ba6c85796642cff5c1b"
     },
     {
       "path": "shortcuts.d.ts",

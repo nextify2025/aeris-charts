@@ -5,11 +5,11 @@ This subsystem is the source of truth for Aeris Charts performance, artifact-siz
 ## Requirements
 
 - The repository's configured Rust toolchain and `wasm-pack` 0.15.0 for the production WASM build. Every workflow installs exactly that version (`release_gate_guard.mjs` enforces it for `ci.yml`, `publish.yml`, and the three benchmark workflows). wasm-pack runs a `wasm-opt` found on `PATH` and otherwise downloads its own binaryen `version_117`, so a locally installed `wasm-opt` silently changes the artifact; the provenance below records which one ran.
-- Node.js 18 or newer.
-- Chromium installed for Playwright (`cd examples/web_demo && npx playwright install chromium`).
+- Node.js 18 or newer, and Bun 1.4.2 (installs dependencies and runs the package build); npm only for `npm pack`.
+- Chromium installed for Playwright (`cd examples/web_demo && bunx playwright install chromium`).
 - For official release results, a clean checkout on a controlled runner with `AERIS_CHARTS_BENCH_ENV_CLASS=official-benchmark-runner` and a stable `AERIS_CHARTS_BENCH_ENV_ID`.
 
-The CLI runs `npm ci` when the package or demo dependencies are absent. Browser scenarios reuse the existing demo server and Playwright dependency. No benchmark package is shipped to consumers.
+The CLI runs `bun install --frozen-lockfile` when the package or demo dependencies are absent. Browser scenarios reuse the existing demo server and Playwright dependency. No benchmark package is shipped to consumers.
 
 ## Commands
 
@@ -77,7 +77,7 @@ Soak sampling performs continuous current-candle updates, periodic appends, time
 
 ## Artifact sizes
 
-The size scenario runs the same production `npm run build` used before publication and reads `npm pack --json --dry-run`. Metrics are unambiguous:
+The size scenario runs the same production `bun run build` used before publication and reads `npm pack --json --dry-run`. Metrics are unambiguous:
 
 - npm tarball and unpacked bytes for exactly the files npm would publish;
 - production JavaScript raw/gzip-9/Brotli bytes;
