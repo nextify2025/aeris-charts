@@ -62,10 +62,10 @@ impl ChartEngine {
         drawing.resolved_text_size(self.options.get().layout.font_size)
     }
 
-    /// Glyph size of measurement boxes in CSS px: the Long/Short Position label chips' size,
-    /// shared by every family stats box.
+    /// Glyph size of measurement boxes in CSS px: the chart font size, at least 11, shared by
+    /// the Long/Short Position label chips and every family stats box.
     pub(crate) fn drawing_stats_size(&self) -> f64 {
-        (self.options.get().layout.font_size * 0.92).max(10.0)
+        self.options.get().layout.font_size.max(11.0)
     }
 
     /// A price or price difference in the drawing's own price format: the host formatter, then

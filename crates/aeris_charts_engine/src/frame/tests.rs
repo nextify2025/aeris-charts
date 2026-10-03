@@ -12651,16 +12651,10 @@ fn position_progress_re_evaluates_after_a_price_basis_rescale() {
 }
 
 #[test]
-fn position_stats_have_opaque_rounded_fills_and_srgb_surface_borders() {
+fn position_stats_have_opaque_rounded_borderless_fills() {
     use crate::drawings::{DrawingKind, DrawingPoint};
     for dpr in [1.0, 1.5, 2.0] {
-        for (surface, border) in [
-            ("#089981", Color::rgb(0, 0, 0)),
-            ("#f7525f", Color::rgb(0, 0, 0)),
-            ("#0000ff", Color::rgb(255, 255, 255)),
-            ("#000000", Color::rgb(255, 255, 255)),
-            ("#ffffff", Color::rgb(0, 0, 0)),
-        ] {
+        for surface in ["#089981", "#f7525f", "#0000ff", "#000000", "#ffffff"] {
             let mut chart = countdown_chart();
             chart.dpr = dpr;
             chart
@@ -12696,21 +12690,18 @@ fn position_stats_have_opaque_rounded_fills_and_srgb_surface_borders() {
                 .filter_map(|prim| match prim {
                     Prim::RoundRect {
                         fill,
-                        border_color,
                         border_width,
                         radii,
                         ..
-                    } if fill.r() == 8 || fill.r() == 247 => {
-                        Some((fill, border_color, border_width, radii))
-                    }
+                    } if fill.r() == 8 || fill.r() == 247 => Some((fill, border_width, radii)),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(stats.len(), 3, "target, stop and two-line PnL block");
-            for (fill, stroke, width, radii) in stats {
+            for (fill, width, radii) in stats {
                 assert_eq!(fill.a(), 255);
-                assert_eq!(*stroke, border);
-                assert_eq!(*width, dpr.round().max(1.0) as f32);
+                // The solid fill under contrast text needs no outline on any background.
+                assert_eq!(*width, 0.0);
                 assert!(radii.iter().all(|radius| *radius > 0.0));
             }
         }
