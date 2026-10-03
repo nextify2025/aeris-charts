@@ -1399,13 +1399,26 @@ impl ChartEngine {
     }
 }
 
+// Interactive scenarios that drive the controller only through its public `input_*` API, grouped
+// by the behavior they pin. They share the fixtures in `tests`.
+#[cfg(test)]
+mod chrome_tests;
+#[cfg(test)]
+mod drawing_tests;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod motion_tests;
+#[cfg(test)]
+mod trading_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const BARS: usize = 60;
+    pub(super) const BARS: usize = 60;
 
-    fn chart() -> ChartEngine {
+    pub(super) fn chart() -> ChartEngine {
         let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
         let times: Vec<f64> = (0..BARS).map(|i| 1_000.0 + i as f64 * 60.0).collect();
         let open: Vec<f64> = (0..BARS).map(|i| 100.0 + (i % 7) as f64).collect();
@@ -1421,11 +1434,11 @@ mod tests {
         chart
     }
 
-    fn relayout(chart: &mut ChartEngine) {
+    pub(super) fn relayout(chart: &mut ChartEngine) {
         chart.recompute_layout_with_measure(true, |_, _| 48.0, |_, _| 48.0);
     }
 
-    fn at(x: f64, y: f64) -> PointerInput {
+    pub(super) fn at(x: f64, y: f64) -> PointerInput {
         PointerInput {
             x,
             y,
@@ -1433,7 +1446,7 @@ mod tests {
         }
     }
 
-    fn shifted(x: f64, y: f64) -> PointerInput {
+    pub(super) fn shifted(x: f64, y: f64) -> PointerInput {
         PointerInput {
             modifiers: InputModifiers {
                 shift: true,
@@ -1443,12 +1456,12 @@ mod tests {
         }
     }
 
-    fn click(chart: &mut ChartEngine, x: f64, y: f64) {
+    pub(super) fn click(chart: &mut ChartEngine, x: f64, y: f64) {
         chart.input_pointer_down(at(x, y), 1);
         chart.input_pointer_up(at(x, y));
     }
 
-    fn drag(chart: &mut ChartEngine, from: (f64, f64), to: (f64, f64)) {
+    pub(super) fn drag(chart: &mut ChartEngine, from: (f64, f64), to: (f64, f64)) {
         chart.input_pointer_down(at(from.0, from.1), 1);
         for step in 1..=4 {
             let t = f64::from(step) / 4.0;
@@ -1459,7 +1472,7 @@ mod tests {
         chart.input_pointer_up(at(to.0, to.1));
     }
 
-    fn empty_pane_point(chart: &ChartEngine) -> (f64, f64) {
+    pub(super) fn empty_pane_point(chart: &ChartEngine) -> (f64, f64) {
         (40..chart.pane_w as i32)
             .step_by(17)
             .flat_map(|x| (20..chart.pane_h as i32).step_by(13).map(move |y| (x, y)))
@@ -1470,7 +1483,7 @@ mod tests {
             .expect("the pane has empty space")
     }
 
-    fn series_point(chart: &ChartEngine) -> (f64, f64) {
+    pub(super) fn series_point(chart: &ChartEngine) -> (f64, f64) {
         let x = chart.time_scale.index_to_coordinate(30);
         let y = chart.series_price_to_coordinate(0, 101.0).unwrap();
         assert_eq!(chart.hit_test_series(x, y), Some(0));
@@ -1903,7 +1916,7 @@ mod tests {
     }
 
     /// A trend line from bar 10 to bar 40 and the point halfway along its body.
-    fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
+    pub(super) fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
         let id = chart
             .add_drawing(
                 DrawingKind::TrendLine,
@@ -1927,7 +1940,7 @@ mod tests {
         (id, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
     }
 
-    fn double_click(chart: &mut ChartEngine, x: f64, y: f64) {
+    pub(super) fn double_click(chart: &mut ChartEngine, x: f64, y: f64) {
         chart.input_pointer_down(at(x, y), 2);
         chart.input_pointer_up(at(x, y));
     }

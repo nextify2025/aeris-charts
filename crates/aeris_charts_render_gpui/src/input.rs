@@ -20,6 +20,9 @@ use gpui::{
 
 use crate::backend::{text_cap_centerer, text_measurer};
 
+#[cfg(test)]
+mod tests;
+
 /// Browser-equivalent pixels per wheel line (the reference `DOM_DELTA_LINE` adjustment).
 pub const WHEEL_LINE_HEIGHT: f32 = 32.0;
 
