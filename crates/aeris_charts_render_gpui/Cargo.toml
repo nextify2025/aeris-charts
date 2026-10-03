@@ -39,8 +39,14 @@ image = { version = "0.25", optional = true, default-features = false }
 smallvec = { version = "1", optional = true }
 
 # The pixel-parity harness diffs GPUI's real output against Aeris's existing native rasterizer.
+#
+# `font-kit` is GPUI's macOS text system. Without it `gpui-pre-macos` falls back to
+# `NoopTextSystem`, so on macOS the examples paint no text at all (chart labels, axes, and the
+# probe's own controls) and measure every string as zero width; its only signal is a `log::warn!`
+# that nothing here prints. It does nothing on Linux and Windows, whose text systems are not gated.
 [dev-dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", default-features = false, features = [
+    "font-kit",
     "wayland",
     "x11",
 ] }
@@ -54,6 +60,13 @@ aeris_charts_native = { path = "../aeris_charts_native" }
 serde_json = "1"
 sha2 = "0.11"
 tiny-skia = "0.12"
+
+# The Linux window capture (`examples/support/x11_capture.rs`) reads GPUI's own X11 window: the id
+# comes from GPUI's raw-window-handle support and the pixels from the X server. Both crates are
+# already in GPUI's Linux dependency graph (same versions), so this adds dependency edges only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+raw-window-handle = "0.6"
+x11rb = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true

@@ -2784,13 +2784,13 @@ impl ChartEngine {
                 std::array::from_fn(|output_index| klinechart_color_rule(indicator, output_index));
             for (output_index, rule) in rules.into_iter().enumerate() {
                 if let (Some(rule), Some(output)) = (rule, outputs[output_index]) {
-                    self.color_klinechart_output(
-                        rule,
-                        source,
-                        output,
-                        changed_rows[output_index],
-                        full_replace,
-                    );
+                    // The runtime rewrote this many rows from the first changed one; a tick over
+                    // pre-installed session slots must not recolor the slots after them.
+                    let changed = (!full_replace).then(|| {
+                        let from = changed_rows[output_index];
+                        from..from + self.indicators[index].runtime.output(output_index).len()
+                    });
+                    self.color_klinechart_output(rule, source, output, changed);
                 }
             }
         }

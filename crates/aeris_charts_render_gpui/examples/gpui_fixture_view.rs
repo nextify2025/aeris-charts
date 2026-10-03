@@ -1,6 +1,7 @@
-//! Linux diagnostic companion to `pixel_parity` (whose window capture is Windows-only): paints ONE
-//! fixture through the real GPUI pipeline and holds it on screen so an external Wayland capture
-//! (`grim`) can read exactly what GPUI rasterized.
+//! Single-fixture companion to `pixel_parity` (which captures all fixtures headlessly on Linux
+//! under X11 and on Windows through DWM): paints ONE fixture through the real GPUI pipeline and
+//! holds it on screen so a person, or an external Wayland capture (`grim`), can look at exactly
+//! what GPUI rasterized.
 //!
 //! ```text
 //! AERIS_CHARTS_FIXTURE=curved_brushes cargo run -p aeris_charts_render_gpui \

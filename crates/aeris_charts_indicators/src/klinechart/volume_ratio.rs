@@ -1,6 +1,7 @@
 //! `VR` (成交量变异率). Ported from KLineChart `src/extension/indicator/volumeRatio.ts`.
 
-use super::{empty, Column};
+use super::stepper::{fold, Out, Window};
+use super::Column;
 
 /// VR outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]
@@ -12,59 +13,117 @@ pub struct Vr {
     pub ma_vr: Column,
 }
 
-/// KLineChart default: `period = 26`, `ma_period = 6`. The first row counts as unchanged.
-pub fn vr(close: &[f64], volume: &[f64], period: usize, ma_period: usize) -> Vr {
-    let len = close.len();
-    let mut out = Vr {
-        vr: empty(len),
-        ma_vr: empty(len),
-    };
+/// The three volume sums of one VR window: up, down and unchanged closes.
+#[derive(Clone, Copy, Debug, Default)]
+struct Stage {
+    uvs: f64,
+    dvs: f64,
+    pvs: f64,
+}
+
+/// The VR recursion, its lagging copy and the sum the moving average divides.
+///
+/// `MAVR` subtracts the VR value that leaves its window `M - 1` rows back. VR is a recursion of the
+/// input rows, so a second set of sums advanced over the rows `M - 1` behind the current one
+/// yields exactly that value, bit for bit, without a ring and in a size independent of `N` and `M`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct State {
+    lead: Stage,
+    shadow: Stage,
+    sum: f64,
+}
+
+/// The lagging recursion at row `i + 1 - M` reads the previous close of the row `N` before it.
+pub(super) fn lookback(period: usize, ma_period: usize) -> usize {
     if period == 0 || ma_period == 0 {
-        return out;
+        0
+    } else {
+        period + ma_period - 1
     }
-    let mut uvs = 0.0;
-    let mut dvs = 0.0;
-    let mut pvs = 0.0;
-    let mut sum = 0.0;
-    for i in 0..len {
-        let prev_close = close[i.saturating_sub(1)];
-        if close[i] > prev_close {
-            uvs += volume[i];
-        } else if close[i] < prev_close {
-            dvs += volume[i];
-        } else {
-            pvs += volume[i];
-        }
-        if i + 1 < period {
-            continue;
-        }
-        let half_pvs = pvs / 2.0;
-        let value = if dvs + half_pvs == 0.0 {
-            0.0
-        } else {
-            ((uvs + half_pvs) / (dvs + half_pvs)) * 100.0
-        };
-        out.vr[i] = Some(value);
-        sum += value;
-        if i + 2 >= period + ma_period {
-            out.ma_vr[i] = Some(sum / ma_period as f64);
-            sum -= out.vr[i + 1 - ma_period].unwrap_or(0.0);
-        }
-        let ago = i + 1 - period;
-        // KLineChart reads `dataList[i - N] ?? dataList[i - (N - 1)]` for the leaving row's
-        // previous close.
-        let ago_prev_close = if i >= period {
-            close[i - period]
-        } else {
-            close[ago]
-        };
-        if close[ago] > ago_prev_close {
-            uvs -= volume[ago];
-        } else if close[ago] < ago_prev_close {
-            dvs -= volume[ago];
-        } else {
-            pvs -= volume[ago];
-        }
+}
+
+/// One row of the VR recursion: adds row `j` to the sum of its direction and, once the window is
+/// full, returns VR and drops the row leaving the window.
+fn vr_stage(stage: &mut Stage, w: &Window<'_>, j: usize, period: usize) -> Option<f64> {
+    let prev_close = w.c(j.saturating_sub(1));
+    if w.c(j) > prev_close {
+        stage.uvs += w.v(j);
+    } else if w.c(j) < prev_close {
+        stage.dvs += w.v(j);
+    } else {
+        stage.pvs += w.v(j);
     }
-    out
+    if j + 1 < period {
+        return None;
+    }
+    let half_pvs = stage.pvs / 2.0;
+    let value = if stage.dvs + half_pvs == 0.0 {
+        0.0
+    } else {
+        ((stage.uvs + half_pvs) / (stage.dvs + half_pvs)) * 100.0
+    };
+    let ago = j + 1 - period;
+    // KLineChart reads `dataList[i - N] ?? dataList[i - (N - 1)]` for the leaving row's
+    // previous close.
+    let ago_prev_close = if j >= period {
+        w.c(j - period)
+    } else {
+        w.c(ago)
+    };
+    if w.c(ago) > ago_prev_close {
+        stage.uvs -= w.v(ago);
+    } else if w.c(ago) < ago_prev_close {
+        stage.dvs -= w.v(ago);
+    } else {
+        stage.pvs -= w.v(ago);
+    }
+    Some(value)
+}
+
+/// Advances VR and its moving average by the valid row `i`. A zero period leaves both unset.
+pub(super) fn step(
+    period: usize,
+    ma_period: usize,
+    st: &mut State,
+    w: &Window<'_>,
+    i: usize,
+    out: &mut Out,
+) {
+    if period == 0 || ma_period == 0 {
+        return;
+    }
+    let value = vr_stage(&mut st.lead, w, i, period);
+    // The row `i + 1 - M` is the first the average drops; the copy consumes every row from it,
+    // whether or not this row reads its value.
+    let leaving = if i + 1 >= ma_period {
+        vr_stage(&mut st.shadow, w, i + 1 - ma_period, period)
+    } else {
+        None
+    };
+    let Some(value) = value else {
+        return;
+    };
+    out[0] = Some(value);
+    st.sum += value;
+    if i + 2 >= period + ma_period {
+        out[1] = Some(st.sum / ma_period as f64);
+        st.sum -= leaving.unwrap_or(0.0);
+    }
+}
+
+/// KLineChart default: `period = 26`, `ma_period = 6`. The first row counts as unchanged.
+///
+/// A fold of the same `step` the chart runtime executes; it assumes finite input.
+pub fn vr(close: &[f64], volume: &[f64], period: usize, ma_period: usize) -> Vr {
+    let window = Window {
+        close,
+        volume,
+        ..Window::EMPTY
+    };
+    let [vr, ma_vr]: [Column; 2] = fold::<State>(close.len(), 2, |st, i, out| {
+        step(period, ma_period, st, &window, i, out);
+    })
+    .try_into()
+    .expect("VR has two outputs");
+    Vr { vr, ma_vr }
 }
