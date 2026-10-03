@@ -932,6 +932,15 @@ fn main() {
 
     let harness_evidence = Arc::clone(&evidence);
     application().run(move |cx: &mut App| {
+        // A GPUI platform built without its text system (macOS `font-kit`) quietly substitutes a
+        // no-op one, so the text fixture would compare an empty window. Fail before capturing.
+        if cx.text_system().all_font_names().is_empty() {
+            eprintln!(
+                "pixel_parity: GPUI has no text system, so no text would render \
+                 (on macOS the GPUI platform needs its `font-kit` feature)"
+            );
+            std::process::exit(1);
+        }
         // The window's client area must be exactly the fixture's logical size, so the captured
         // pixels are exactly the surface the adapter painted.
         let bounds = Bounds::centered(

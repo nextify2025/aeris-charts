@@ -39,8 +39,14 @@ image = { version = "0.25", optional = true, default-features = false }
 smallvec = { version = "1", optional = true }
 
 # The pixel-parity harness diffs GPUI's real output against Aeris's existing native rasterizer.
+#
+# `font-kit` is GPUI's macOS text system. Without it `gpui-pre-macos` falls back to
+# `NoopTextSystem`, so on macOS the examples paint no text at all (chart labels, axes, and the
+# probe's own controls) and measure every string as zero width; its only signal is a `log::warn!`
+# that nothing here prints. It does nothing on Linux and Windows, whose text systems are not gated.
 [dev-dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", default-features = false, features = [
+    "font-kit",
     "wayland",
     "x11",
 ] }

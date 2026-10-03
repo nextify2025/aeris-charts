@@ -115,15 +115,19 @@ impl GpuiChartInput {
     /// Returns whether the chart consumed the wheel.
     pub fn scroll_wheel(&self, engine: &mut ChartEngine, event: &ScrollWheelEvent) -> bool {
         let (x, y) = self.pane_point(engine, event.position);
-        // GPUI reports wheel-up as a positive delta, which is already the engine's normalized
-        // sign; lines convert with the browser's 32 px adjustment.
+        // GPUI reports content motion on every platform (macOS `scrollingDeltaX/Y`, Windows'
+        // negated wheel messages, X11's valuator difference): wheel-up and a swipe that reveals
+        // what lies to the left are positive. The engine takes browser-normalized deltas, where
+        // wheel-up is positive but `deltaX` is positive toward the right, so the vertical axis
+        // passes through and the horizontal axis flips, as a browser flips it. Lines convert with
+        // the browser's 32 px adjustment.
         let delta = event.delta.pixel_delta(px(WHEEL_LINE_HEIGHT));
         let delta_x: f32 = delta.x.into();
         let delta_y: f32 = delta.y.into();
         engine.input_wheel(WheelSample {
             x,
             y,
-            delta_x: f64::from(delta_x) / 100.0,
+            delta_x: -f64::from(delta_x) / 100.0,
             delta_y: f64::from(delta_y) / 100.0,
             delta_mode: match event.delta {
                 ScrollDelta::Pixels(_) => WheelDeltaMode::Pixel,
@@ -312,5 +316,80 @@ pub fn text_edit_key(engine: &mut ChartEngine, event: &KeyDownEvent) {
         engine.drawing_text_edit_insert(text);
     } else if typed && keystroke.key == "space" {
         engine.drawing_text_edit_insert(" ");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TouchPhase;
+
+    fn engine() -> ChartEngine {
+        let mut engine = ChartEngine::new(800.0, 400.0, 2.0);
+        let bars = 600;
+        let times: Vec<f64> = (0..bars)
+            .map(|i| 1_600_000_000.0 + i as f64 * 60.0)
+            .collect();
+        let close: Vec<f64> = (0..bars)
+            .map(|i| 100.0 + (i as f64 * 0.05).sin() * 12.0)
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 1.0).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 1.0).collect();
+        engine
+            .set_series_data(0, &times, &close, &high, &low, &close)
+            .expect("series loads");
+        let content_h = (400.0 - engine.time_axis_height()).max(1.0);
+        engine.layout_panes(content_h);
+        engine.time_scale.set_width(800.0);
+        // Mid-history, so a wheel can move the view either way.
+        engine.set_visible_logical_range(300.0, 400.0);
+        engine
+    }
+
+    /// One swipe must move a GPUI chart exactly as it moves the same chart in a browser, which
+    /// receives it as a `WheelEvent` with both signs reversed (`deltaX = -scrollingDeltaX`) and
+    /// normalizes it to `(deltaX / 100, -deltaY / 100)`. A swipe that reveals the left must show
+    /// earlier bars, as it shows the left of every native scroll view.
+    #[test]
+    fn a_wheel_or_swipe_moves_the_chart_as_the_browser_does() {
+        let input = GpuiChartInput::default();
+        let position = point(px(300.0), px(200.0));
+        for (dx, dy) in [(40.0, 0.0), (-40.0, 0.0), (0.0, 40.0), (0.0, -40.0)] {
+            let mut gpui = engine();
+            let mut browser = engine();
+            let start = gpui.visible_logical_range().expect("visible range");
+            let event = ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            };
+            assert!(
+                input.scroll_wheel(&mut gpui, &event),
+                "({dx}, {dy}) consumed"
+            );
+            let (x, y) = input.pane_point(&browser, position);
+            let (dom_x, dom_y) = (-f64::from(dx), -f64::from(dy));
+            assert!(browser.input_wheel(WheelSample {
+                x,
+                y,
+                delta_x: dom_x / 100.0,
+                delta_y: -dom_y / 100.0,
+                delta_mode: WheelDeltaMode::Pixel,
+                ..WheelSample::default()
+            }));
+            let moved = gpui.visible_logical_range().expect("visible range");
+            assert_eq!(
+                moved,
+                browser.visible_logical_range().expect("visible range"),
+                "({dx}, {dy})"
+            );
+            if dx > 0.0 {
+                assert!(
+                    moved.0 < start.0,
+                    "revealing the left shows earlier bars: {start:?} -> {moved:?}"
+                );
+            }
+        }
     }
 }

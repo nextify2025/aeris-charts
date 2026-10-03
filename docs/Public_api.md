@@ -1840,6 +1840,19 @@ may change in any revision, so a host reviews the notes below when it moves its 
 same `gpui` (a host on another GPUI build, such as a Zed Git revision, holds two incompatible copies
 of its types). GPUI upgrades are explicit manifest and lockfile changes.
 
+On macOS a host must build its GPUI platform crate (`gpui-pre-platform`, or `gpui-pre-macos`
+directly) with the `font-kit` feature, which is GPUI's macOS text system. Without it GPUI substitutes
+a no-op text system: the chart paints no text (axes, labels, legends, drawing text) and measures
+every string as zero width, and the only signal is a `log::warn!` at startup. Linux and Windows are
+unaffected.
+
+A host that binds wheel events through `GpuiChartInput::scroll_wheel` gets browser-equivalent
+scrolling. Hosts that pinned an earlier revision panned the time scale the wrong way on a horizontal
+wheel or trackpad swipe: the adapter passed GPUI's horizontal delta through unflipped, though GPUI
+reports content motion (positive reveals the left) and the engine, like a browser, takes positive
+as a move to the right. The adapter now flips the horizontal axis; a host that compensated for the
+old sign itself must remove its compensation.
+
 ### Moving the pinned revision
 
 These notes list the host-visible changes a pinned-revision move carries, so call sites can be
