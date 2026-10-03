@@ -388,11 +388,13 @@ impl ChartEngine {
     /// Primary-button press. `click_count` is the platform's multi-click count.
     pub fn input_pointer_down(&mut self, input: PointerInput, click_count: u32) {
         let (x, y) = (input.x, input.y);
+        // Abandoning a press whose release never arrived resets the pointer, so it runs before
+        // this press records its own position.
+        self.end_press_without_commit();
         self.input.pointer = Some((x, y));
         self.input.modifiers = input.modifiers;
         self.input.tooltip_deadline_ms = None;
         self.input.frame_dirty = true;
-        self.end_press_without_commit();
         self.stop_input_motion();
 
         let text_press_selected = self.selected_drawing();
@@ -1444,6 +1446,24 @@ mod tests {
             y,
             ..PointerInput::default()
         }
+    }
+
+    /// A pointer sample with an explicit timestamp, for timing-sensitive gestures.
+    pub(super) fn at_ms(x: f64, y: f64, timestamp_ms: f64) -> PointerInput {
+        PointerInput {
+            timestamp_ms,
+            ..at(x, y)
+        }
+    }
+
+    /// The fixture chart with kinetic coasting after a mouse pan switched on.
+    pub(super) fn kinetic_chart() -> ChartEngine {
+        let mut chart = chart();
+        chart.set_interaction_options(InteractionOptions {
+            kinetic_mouse: true,
+            ..InteractionOptions::default()
+        });
+        chart
     }
 
     pub(super) fn shifted(x: f64, y: f64) -> PointerInput {

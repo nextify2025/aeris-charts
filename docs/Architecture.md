@@ -1426,7 +1426,7 @@ Backend-neutral drawing primitives, colors, geometry, bar-width rules, and the o
 
 The native GPUI executor. It converts the prepared primitive stream into GPUI scene operations and owns GPUI-specific text, image caches, geometry conversion, backend metrics, and fixtures. It must not fork chart behavior or recalculate engine geometry.
 
-Its `input` module is the one GPUI adapter for the engine input controller, shared by every GPUI host (the `gpui_probe` example and Aeris Terminal). `GpuiChartInput` converts GPUI mouse, wheel (32 px per line), trackpad pinch, modifier, and key events (F2 maps to `ChartKey::EditText`) into engine input against the chart canvas's top-left window position (`set_canvas_bounds`) and a monotonic clock; `cursor_style` is the single `ChartCursor` → `CursorStyle` mapping (on Windows, whose GPUI backend draws hand cursors as the arrow, vertically dragged trading lines use the vertical-resize cursor); `text_edit_key` applies platform text-editing conventions to the engine typing session, with clipboard shortcuts layered on in `key_down`; and `install_text_metrics` installs the native text measurer and cap-height metric. A host binds each GPUI listener with one adapter call and never routes chart input itself. The repository's interactive Linux probes enable GPUI's Wayland and X11 platforms; macOS and Windows continue through GPUI's native platform selection. CI compiles and tests the GPUI backend on all three operating systems.
+Its `input` module is the one GPUI adapter for the engine input controller, shared by every GPUI host (the `gpui_probe` example and Aeris Terminal). `GpuiChartInput` converts GPUI mouse, wheel (32 px per line), trackpad pinch, modifier, and key events (F2 maps to `ChartKey::EditText`) into engine input against the chart canvas's top-left window position (`set_canvas_bounds`) and a monotonic clock. GPUI wheel deltas are content-offset deltas, the negation of DOM `deltaX`/`deltaY` on every GPUI platform, so the vertical delta already carries the engine's wheel-up-positive sign and the horizontal delta is negated: a native trackpad swipe, tilt wheel, or Shift+wheel pans in the browser's `+deltaX` direction. `cursor_style` is the single `ChartCursor` → `CursorStyle` mapping (on Windows, whose GPUI backend draws hand cursors as the arrow, vertically dragged trading lines use the vertical-resize cursor); `text_edit_key` applies platform text-editing conventions to the engine typing session, with clipboard shortcuts layered on in `key_down`; and `install_text_metrics` installs the native text measurer and cap-height metric. A host binds each GPUI listener with one adapter call and never routes chart input itself. The repository's interactive Linux probes enable GPUI's Wayland and X11 platforms; macOS and Windows continue through GPUI's native platform selection. CI compiles and tests the GPUI backend on all three operating systems and lints it on Linux.
 
 GPUI's path pass cannot rely on MSAA — its sample count is picked from the surface and can fall back to 1x on Linux — so stroke, disc, and ring meshes carry a per-vertex Loop-Blinn signed-distance encoding in the path shader's `st` coordinates. Polyline geometry comes from the shared `line::stroke_aa` stroker; GPUI only maps its signed distances onto `st`. Polyline strokes keep `s` constant and encode signed device-pixel distance in `t`, which is compatible with GPUI's Windows solid-triangle branch; their one-pixel coverage transition is centered on the nominal edge so integrated coverage remains the requested width. Ring strokes use the same constant-s, centered coverage encoding as polylines, preventing Windows from treating the antialiasing fringe as solid stroke. Filled discs retain their shape-specific exterior encoding. A mesh larger than a bounded chunk is split into multiple GPUI paths so one stroke cannot overflow GPUI's fixed path instance buffer and trigger its grow-and-redraw retry loop; the mesh is a triangle soup, so coverage and paint order are unchanged.
 
@@ -1768,6 +1768,20 @@ reject exhausted `u32` cell identities before mutation so browser handles remain
 
 Changes to geometry, snapping, scales, interactions, or execution require the narrowest relevant combination of unit tests, frame-contract tests, golden images, draw-stream parity, replay stability, browser tests, and release performance evidence. A backend-specific screenshot alone is not proof of shared-engine correctness.
 
+Interactive behavior is verified through each real input path, not through the mechanisms beneath
+it. The controller's scenario modules (`chart_input/{chrome,drawing,lifecycle,motion,trading}_tests.rs`
+beside its own `tests`) drive each behavior through `ChartEngine::input_*` with explicit
+timestamps (setup and host replies such as `resolve_trading_intent` use the public API), so
+kinetic coasting and the trading-tooltip dwell are deterministic without a clock. The GPUI adapter's tests
+(`aeris_charts_render_gpui/src/input/tests.rs`) feed GPUI event values to `GpuiChartInput` and
+compare its wheel normalization with the browser's on a twin engine. The `gpui_probe` example's
+`window_input_tests` open the real probe host on GPUI's headless `TestPlatform` (the `test-support`
+feature of the dev-only `gpui` dependency) and dispatch simulated mouse, wheel, and key events through
+its listener table, the adapter, the engine, prepaint, and paint; they run in the native GPUI job on
+all three operating systems. Browser interaction is covered by Playwright specs that drive real
+`page.mouse`/`page.keyboard` input and CDP touch (`gesture-cancellation`, `interaction-gates`,
+`touch-input`, and the per-feature specs) against the published package build.
+
 ## Dependency direction
 
 Lower layers never import a host API to bypass their boundary. The headless path is `aeris_charts_core` and `aeris_charts_indicators` into `aeris_charts_engine`, then `aeris_charts_render`; GPUI, WebGPU, native, and WASM/browser code sit at execution boundaries. Avoid new crates, traits, and feature flags unless they enforce a real current dependency or platform boundary.
@@ -1803,7 +1817,9 @@ An intentional public-API change regenerates the snapshot with `npm run update:a
 step, not a gate) before `check:api`. CI also requires the portable browser suite
 (`AERIS_CHARTS_PORTABLE_BROWSER=1 npx playwright test` in `examples/web_demo` after
 `npm ci && npm run build` there) and the native GPUI tests
-(`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`).
+(`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`), with
+the GPUI backend and its tests linted on Linux
+(`cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings`).
 
 Local browser runs need the browser build Playwright pins (Chrome for Testing 151 for the pinned
 Playwright 1.62). The WebGPU device is lost at startup on older Chromium builds (observed with

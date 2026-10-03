@@ -4279,3 +4279,712 @@ mod semantic_regressions {
         assert_eq!(workspace.cell_ids(), [1, third]);
     }
 }
+
+/// Interactive tests through GPUI's own event dispatch. A headless test window lays out and paints
+/// the reference host, and simulated platform input reaches the chart only through the probe's
+/// listener table and the shared adapter, exactly as a user's pointer and keyboard do.
+#[cfg(test)]
+mod window_input_tests {
+    use super::*;
+    use aeris_charts_engine::{
+        pinch_zoom_scale, wheel_zoom_scale, ChartCursor, ChartRegion, DrawingId, InteractionOptions,
+    };
+    use gpui::{
+        point, ClipboardItem, Keystroke, Modifiers, Pixels, Point, ScrollDelta, TestAppContext,
+        VisualTestContext,
+    };
+
+    const BARS: usize = 400;
+    const WINDOW_W: f32 = 1000.0;
+    const WINDOW_H: f32 = 640.0;
+    /// Host margin around the chart element, so the pointer can press, release, and hover outside
+    /// the chart.
+    const INSET: f32 = 40.0;
+    const IDLE_LEGEND: &str = "O —  H —  L —  C —";
+    /// An empty plot point above the candles (the price scale keeps a top margin).
+    const EMPTY: (f64, f64) = (240.0, 12.0);
+
+    /// A minimal parent view. The probe keeps its real listener table; the host records what
+    /// bubbles past the chart, as a scrolling container or shell shortcuts would receive it.
+    struct ChartHost {
+        chart: Entity<Probe>,
+        wheel_reached_host: usize,
+        keys_reached_host: Vec<String>,
+    }
+
+    impl Render for ChartHost {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .p(px(INSET))
+                .on_scroll_wheel(cx.listener(|host, _: &ScrollWheelEvent, _, _| {
+                    host.wheel_reached_host += 1;
+                }))
+                .on_key_down(cx.listener(|host, event: &KeyDownEvent, _, _| {
+                    host.keys_reached_host.push(event.keystroke.key.clone());
+                }))
+                .child(self.chart.clone())
+        }
+    }
+
+    /// Open the interactive chart in a test window and let GPUI lay it out and paint it.
+    fn open_chart(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Probe>, Entity<ChartHost>, VisualTestContext) {
+        let window = cx.open_window(size(px(WINDOW_W), px(WINDOW_H)), |_, cx| {
+            let chart = cx.new(|cx| {
+                let mut probe = Probe::new_interactive(BARS);
+                probe.focus_handle = Some(cx.focus_handle());
+                probe
+            });
+            ChartHost {
+                chart,
+                wheel_reached_host: 0,
+                keys_reached_host: Vec::new(),
+            }
+        });
+        let host = window.root(cx).expect("the chart window is open");
+        let chart = host.read_with(cx, |host, _| host.chart.clone());
+        let cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        (chart, host, cx)
+    }
+
+    /// The window position of a pane-space point: the chart element fills the host's inset box.
+    fn at(probe: &Probe, x: f64, y: f64) -> Point<Pixels> {
+        point(
+            px((x + probe.engine.pane_left) as f32 + INSET),
+            px(y as f32 + INSET),
+        )
+    }
+
+    fn offset(position: Point<Pixels>, dx: f32, dy: f32) -> Point<Pixels> {
+        point(position.x + px(dx), position.y + px(dy))
+    }
+
+    fn engine<R>(
+        cx: &VisualTestContext,
+        chart: &Entity<Probe>,
+        read: impl FnOnce(&ChartEngine) -> R,
+    ) -> R {
+        chart.read_with(cx, |probe, _| read(&probe.engine))
+    }
+
+    fn press(cx: &mut VisualTestContext, position: Point<Pixels>, click_count: usize) {
+        cx.simulate_event(MouseDownEvent {
+            position,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count,
+            first_mouse: false,
+        });
+    }
+
+    fn release(cx: &mut VisualTestContext, position: Point<Pixels>, click_count: usize) {
+        cx.simulate_event(MouseUpEvent {
+            position,
+            modifiers: Modifiers::none(),
+            button: MouseButton::Left,
+            click_count,
+        });
+    }
+
+    fn click(cx: &mut VisualTestContext, position: Point<Pixels>) {
+        press(cx, position, 1);
+        release(cx, position, 1);
+    }
+
+    fn double_click(cx: &mut VisualTestContext, position: Point<Pixels>) {
+        click(cx, position);
+        press(cx, position, 2);
+        release(cx, position, 2);
+    }
+
+    fn drag_to(cx: &mut VisualTestContext, position: Point<Pixels>) {
+        cx.simulate_mouse_move(position, MouseButton::Left, Modifiers::none());
+    }
+
+    fn hover(cx: &mut VisualTestContext, position: Point<Pixels>) {
+        cx.simulate_mouse_move(position, None::<MouseButton>, Modifiers::none());
+    }
+
+    /// A pane point on a visible candle of the main series, found through the engine's hit test.
+    fn series_point(probe: &Probe) -> (f64, f64) {
+        let engine = &probe.engine;
+        let id = engine.series[0].id;
+        let bars = &probe.source_bars;
+        let (from, to) = engine
+            .visible_logical_range()
+            .expect("the chart shows bars");
+        let middle = ((from + to) / 2.0).round() as usize;
+        (middle..bars.close.len())
+            .find_map(|index| {
+                let x = engine
+                    .time_scale
+                    .logical_to_coordinate(index as f64)
+                    .round();
+                let price = (bars.open[index] + bars.close[index]) / 2.0;
+                let y = engine.series_price_to_coordinate(id, price)?.round();
+                (engine.hit_test_series(x, y) == Some(id)).then_some((x, y))
+            })
+            .expect("a visible candle is hittable")
+    }
+
+    /// Add a Text drawing in the plot of an already painted chart, then repaint.
+    fn add_text_drawing(
+        cx: &mut VisualTestContext,
+        chart: &Entity<Probe>,
+        text: &str,
+    ) -> DrawingId {
+        let id = chart.update(cx, |probe, cx| {
+            let engine = &mut probe.engine;
+            let (x, y) = ((engine.pane_w * 0.4).round(), (engine.pane_h * 0.5).round());
+            let logical = engine
+                .coordinate_to_logical(x)
+                .expect("the plot has a time scale");
+            let price = engine
+                .chart_context_at(x, y)
+                .expect("the plot has a price scale")
+                .price;
+            let options = serde_json::json!({ "text": text }).to_string();
+            let id = engine
+                .add_drawing(
+                    DrawingKind::Text,
+                    0,
+                    vec![DrawingPoint { logical, price }],
+                    Some(&options),
+                )
+                .expect("the text drawing is valid");
+            probe.dirty = true;
+            cx.notify();
+            id
+        });
+        cx.run_until_parked();
+        id
+    }
+
+    /// A pane point inside a text drawing's painted run, checked against the engine's hit test.
+    fn text_point(engine: &ChartEngine, id: DrawingId) -> (f64, f64) {
+        let (x, y, _) = engine
+            .drawing_text_transform(id)
+            .expect("the text drawing paints its run");
+        let target = (x.round() + 6.0, y.round());
+        assert_eq!(engine.drawing_at(target.0, target.1), Some(id));
+        target
+    }
+
+    fn edit_text(
+        cx: &VisualTestContext,
+        chart: &Entity<Probe>,
+    ) -> Option<(DrawingId, String, usize)> {
+        engine(cx, chart, |engine| {
+            engine
+                .drawing_text_edit()
+                .map(|(id, text, caret)| (id, text.to_string(), caret))
+        })
+    }
+
+    fn clipboard_text(cx: &VisualTestContext) -> Option<String> {
+        cx.read_from_clipboard().and_then(|item| item.text())
+    }
+
+    #[gpui::test]
+    fn hovering_and_clicking_a_candle_selects_the_series_and_a_drag_pans_past_the_slop(
+        cx: &mut TestAppContext,
+    ) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let (empty, candle, series) = chart.read_with(&cx, |probe, _| {
+            let engine = &probe.engine;
+            assert!(probe.painted > 0, "the test window paints the chart");
+            assert_eq!(
+                probe.input.pane_point(engine, at(probe, EMPTY.0, EMPTY.1)),
+                EMPTY,
+                "prepaint records the chart canvas where GPUI laid it out"
+            );
+            assert_eq!(engine.hit_test_series(EMPTY.0, EMPTY.1), None);
+            let candle = series_point(probe);
+            (
+                at(probe, EMPTY.0, EMPTY.1),
+                at(probe, candle.0, candle.1),
+                engine.series[0].id,
+            )
+        });
+
+        hover(&mut cx, candle);
+        engine(&cx, &chart, |engine| {
+            assert!(engine.crosshair.is_some());
+            assert_eq!(engine.hovered_series(), Some(series));
+            assert_eq!(engine.input_cursor(), ChartCursor::Pointer);
+        });
+        click(&mut cx, candle);
+        assert_eq!(
+            engine(&cx, &chart, ChartEngine::selected_series),
+            Some(series)
+        );
+
+        let (spacing, scroll) = engine(&cx, &chart, |engine| {
+            (engine.bar_spacing(), engine.scroll_position())
+        });
+        press(&mut cx, empty, 1);
+        drag_to(&mut cx, offset(empty, 3.0, 0.0));
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.scroll_position(), scroll, "inside the 5 px slop");
+            assert_eq!(engine.input_cursor(), ChartCursor::Crosshair);
+        });
+        // The threshold sample opens the pan; the view moves from the next sample on.
+        drag_to(&mut cx, offset(empty, 10.0, 0.0));
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.scroll_position(), scroll);
+            assert_eq!(engine.input_cursor(), ChartCursor::Grabbing);
+        });
+        drag_to(&mut cx, offset(empty, 130.0, 0.0));
+        let panned = engine(&cx, &chart, ChartEngine::scroll_position);
+        assert!(
+            (panned - (scroll - 120.0 / spacing)).abs() < 1e-9,
+            "a 120 px drag right reveals 120 / bar spacing older bars: {scroll} -> {panned}"
+        );
+        release(&mut cx, offset(empty, 130.0, 0.0), 1);
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.scroll_position(), panned);
+            assert_eq!(engine.input_cursor(), ChartCursor::Crosshair);
+            assert_eq!(
+                engine.selected_series(),
+                Some(series),
+                "a pan never clicks, so the selection survives"
+            );
+        });
+
+        // A click on empty plot space clears the selection.
+        click(&mut cx, empty);
+        assert_eq!(engine(&cx, &chart, ChartEngine::selected_series), None);
+    }
+
+    #[gpui::test]
+    fn double_clicking_an_axis_restores_price_autoscale_and_the_default_time_scale(
+        cx: &mut TestAppContext,
+    ) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let price_axis = chart.read_with(&cx, |probe, _| {
+            let engine = &probe.engine;
+            let (x, y) = (
+                (engine.pane_w + engine.axis_w / 2.0).round(),
+                (engine.pane_h / 2.0).round(),
+            );
+            assert_eq!(
+                engine.region_at(x, y),
+                ChartRegion::PriceAxis {
+                    pane: 0,
+                    target: PriceScaleTarget::Right
+                }
+            );
+            at(probe, x, y)
+        });
+        let auto = |cx: &VisualTestContext| {
+            engine(cx, &chart, |engine| {
+                engine.price_scale_auto_scale_for(0, PriceScaleTarget::Right)
+            })
+        };
+        assert_eq!(auto(&cx), Some(true));
+        press(&mut cx, price_axis, 1);
+        drag_to(&mut cx, offset(price_axis, 0.0, 40.0));
+        release(&mut cx, offset(price_axis, 0.0, 40.0), 1);
+        assert_eq!(
+            auto(&cx),
+            Some(false),
+            "an axis drag makes the range manual"
+        );
+        click(&mut cx, price_axis);
+        assert_eq!(auto(&cx), Some(false), "a single click keeps it manual");
+        press(&mut cx, price_axis, 2);
+        release(&mut cx, price_axis, 2);
+        assert_eq!(auto(&cx), Some(true));
+
+        let (time_axis, x, time_scale) = chart.read_with(&cx, |probe, _| {
+            let engine = &probe.engine;
+            let (x, y) = (
+                (engine.pane_w / 2.0).round(),
+                (engine.pane_h + engine.time_axis_height() / 2.0).round(),
+            );
+            assert_eq!(engine.region_at(x, y), ChartRegion::TimeAxis);
+            (at(probe, x, y), x, engine.time_scale.clone())
+        });
+        press(&mut cx, time_axis, 1);
+        drag_to(&mut cx, offset(time_axis, -30.0, 0.0));
+        drag_to(&mut cx, offset(time_axis, -60.0, 0.0));
+        release(&mut cx, offset(time_axis, -60.0, 0.0), 1);
+        let mut scaled = time_scale.clone();
+        scaled.start_scale(x);
+        scaled.scale_to(x - 60.0);
+        let spacing = engine(&cx, &chart, ChartEngine::bar_spacing);
+        assert_eq!(
+            spacing,
+            scaled.bar_spacing(),
+            "dragging the time axis left widens the bars"
+        );
+        assert!(spacing > time_scale.bar_spacing());
+
+        let mut restored = engine(&cx, &chart, |engine| engine.time_scale.clone());
+        restored.restore_default();
+        assert_ne!(spacing, restored.bar_spacing());
+        double_click(&mut cx, time_axis);
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.bar_spacing(), restored.bar_spacing());
+            assert_eq!(engine.scroll_position(), restored.right_offset());
+        });
+    }
+
+    #[gpui::test]
+    fn wheel_and_pinch_zoom_the_time_scale_and_only_a_declined_wheel_reaches_the_host(
+        cx: &mut TestAppContext,
+    ) {
+        let (chart, host, mut cx) = open_chart(cx);
+        let (x, y) = (300.0, 200.0);
+        let position = chart.read_with(&cx, |probe, _| at(probe, x, y));
+        let wheel = |delta| ScrollWheelEvent {
+            position,
+            delta,
+            ..ScrollWheelEvent::default()
+        };
+        let time_scale =
+            |cx: &VisualTestContext| engine(cx, &chart, |engine| engine.time_scale.clone());
+        let reached_host =
+            |cx: &VisualTestContext| host.read_with(cx, |host, _| host.wheel_reached_host);
+
+        // Wheel up zooms in with the right edge pinned (the default right-bar policy).
+        let before = time_scale(&cx);
+        let mut expected = before.clone();
+        cx.simulate_event(wheel(ScrollDelta::Pixels(point(px(0.0), px(100.0)))));
+        expected.zoom(x, wheel_zoom_scale(1.0));
+        let zoomed = time_scale(&cx);
+        assert_eq!(zoomed.bar_spacing(), expected.bar_spacing());
+        assert_eq!(zoomed.right_offset(), expected.right_offset());
+        assert!(zoomed.bar_spacing() > before.bar_spacing());
+
+        // One line down is 32 px before the shared normalization, and zooms out.
+        let mut expected = zoomed.clone();
+        cx.simulate_event(wheel(ScrollDelta::Lines(point(0.0, -1.0))));
+        expected.zoom(x, wheel_zoom_scale(-32.0 / 100.0));
+        assert_eq!(
+            engine(&cx, &chart, ChartEngine::bar_spacing),
+            expected.bar_spacing()
+        );
+        assert!(expected.bar_spacing() < zoomed.bar_spacing());
+
+        // A trackpad pinch zooms around the pinch point.
+        let mut expected = time_scale(&cx);
+        cx.simulate_event(PinchEvent {
+            position,
+            delta: 0.25,
+            ..PinchEvent::default()
+        });
+        expected.zoom_focused(x, pinch_zoom_scale(0.25));
+        let pinched = time_scale(&cx);
+        assert_eq!(pinched.bar_spacing(), expected.bar_spacing());
+        assert_eq!(pinched.right_offset(), expected.right_offset());
+        assert_eq!(
+            reached_host(&cx),
+            0,
+            "the chart stops every wheel it consumes"
+        );
+
+        // With wheel gestures off the chart declines the wheel, so the host may scroll instead.
+        chart.update(&mut cx, |probe, _| {
+            probe.engine.set_interaction_options(InteractionOptions {
+                wheel_scroll: false,
+                wheel_zoom: false,
+                ..InteractionOptions::default()
+            });
+        });
+        cx.simulate_event(wheel(ScrollDelta::Pixels(point(px(0.0), px(100.0)))));
+        assert_eq!(reached_host(&cx), 1);
+        assert_eq!(
+            engine(&cx, &chart, ChartEngine::bar_spacing),
+            pinched.bar_spacing()
+        );
+    }
+
+    #[gpui::test]
+    fn a_release_outside_the_chart_element_still_ends_the_pan(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let empty = chart.read_with(&cx, |probe, _| at(probe, EMPTY.0, EMPTY.1));
+        let scroll = engine(&cx, &chart, ChartEngine::scroll_position);
+        press(&mut cx, empty, 1);
+        drag_to(&mut cx, offset(empty, 10.0, 0.0));
+        drag_to(&mut cx, offset(empty, 70.0, 0.0));
+        let panned = engine(&cx, &chart, ChartEngine::scroll_position);
+        assert_ne!(panned, scroll);
+        assert_eq!(
+            engine(&cx, &chart, ChartEngine::input_cursor),
+            ChartCursor::Grabbing
+        );
+
+        // Release over the host margin. GPUI delivers it through the chart's mouse-up-out
+        // listener, so the pan ends there instead of lingering until the pointer returns.
+        release(&mut cx, point(px(INSET / 2.0), empty.y), 1);
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.scroll_position(), panned);
+            assert_eq!(engine.input_cursor(), ChartCursor::Crosshair);
+            assert_eq!(
+                engine.crosshair, None,
+                "with the press over, the pointer outside clears the crosshair"
+            );
+        });
+        hover(&mut cx, offset(empty, 150.0, 0.0));
+        engine(&cx, &chart, |engine| {
+            assert!(
+                engine.crosshair.is_some(),
+                "hover resumes after the press ended outside"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn moving_the_pointer_off_the_chart_clears_the_crosshair_and_the_legend(
+        cx: &mut TestAppContext,
+    ) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let candle = chart.read_with(&cx, |probe, _| {
+            let (x, y) = series_point(probe);
+            at(probe, x, y)
+        });
+        hover(&mut cx, candle);
+        chart.read_with(&cx, |probe, _| {
+            assert!(probe.engine.crosshair.is_some());
+            assert!(probe.engine.hovered_series().is_some());
+            assert_ne!(
+                probe.legend, IDLE_LEGEND,
+                "the legend follows the crosshair"
+            );
+        });
+
+        hover(&mut cx, point(px(INSET / 2.0), px(INSET / 2.0)));
+        chart.read_with(&cx, |probe, _| {
+            assert_eq!(probe.engine.crosshair, None);
+            assert_eq!(probe.engine.hovered_series(), None);
+            assert_eq!(probe.engine.input_cursor(), ChartCursor::Crosshair);
+            assert_eq!(probe.legend, IDLE_LEGEND);
+        });
+    }
+
+    #[gpui::test]
+    fn right_clicks_request_context_menus_for_the_plot_and_the_price_axis(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let (plot, context, price_axis) = chart.read_with(&cx, |probe, _| {
+            let engine = &probe.engine;
+            let (x, y) = (300.0, 200.0);
+            let context = engine
+                .chart_context_at(x, y)
+                .expect("the plot resolves a price under the pointer");
+            let axis_x = (engine.pane_w + engine.axis_w / 2.0).round();
+            (at(probe, x, y), context, at(probe, axis_x, y))
+        });
+        let status =
+            |cx: &VisualTestContext| chart.read_with(cx, |probe, _| probe.click_status.clone());
+
+        cx.simulate_mouse_down(plot, MouseButton::Right, Modifiers::none());
+        assert_eq!(
+            status(&cx),
+            format!(
+                "context: pane {} price {:.2}",
+                context.pane_index, context.price
+            )
+        );
+        cx.simulate_mouse_down(price_axis, MouseButton::Right, Modifiers::none());
+        assert_eq!(
+            status(&cx),
+            format!(
+                "context: {:?}",
+                ChartRegion::PriceAxis {
+                    pane: 0,
+                    target: PriceScaleTarget::Right
+                }
+            )
+        );
+    }
+
+    /// The keyboard reaches the chart through GPUI focus: a click focuses it, F2 opens the selected
+    /// text drawing's editor, and from then on the typing session owns every key, including the
+    /// platform clipboard shortcuts and Delete, until Escape restores the original text.
+    #[gpui::test]
+    fn f2_typing_clipboard_and_escape_edit_a_selected_text_drawing(cx: &mut TestAppContext) {
+        let (chart, host, mut cx) = open_chart(cx);
+        let id = add_text_drawing(&mut cx, &chart, "Note");
+        let target = chart.read_with(&cx, |probe, _| {
+            let (x, y) = text_point(&probe.engine, id);
+            at(probe, x, y)
+        });
+
+        click(&mut cx, target);
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.selected_drawing(), Some(id));
+            assert_eq!(
+                engine.editing_drawing(),
+                None,
+                "the first click only selects"
+            );
+        });
+        cx.simulate_keystrokes("f2");
+        assert_eq!(edit_text(&cx, &chart), Some((id, "Note".into(), 4)));
+
+        cx.simulate_input("Ab");
+        assert_eq!(edit_text(&cx, &chart), Some((id, "NoteAb".into(), 6)));
+        cx.simulate_keystrokes("left delete");
+        assert_eq!(edit_text(&cx, &chart), Some((id, "NoteA".into(), 5)));
+        assert!(
+            engine(&cx, &chart, |engine| engine.drawing(id).is_some()),
+            "Delete edits the text and never deletes the drawing being typed"
+        );
+
+        cx.simulate_keystrokes("secondary-a secondary-c");
+        assert_eq!(clipboard_text(&cx).as_deref(), Some("NoteA"));
+        assert_eq!(edit_text(&cx, &chart), Some((id, "NoteA".into(), 5)));
+        cx.write_to_clipboard(ClipboardItem::new_string("stale".into()));
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(clipboard_text(&cx).as_deref(), Some("NoteA"));
+        assert_eq!(edit_text(&cx, &chart), Some((id, String::new(), 0)));
+        cx.write_to_clipboard(ClipboardItem::new_string("Pasted".into()));
+        cx.simulate_keystrokes("secondary-v");
+        assert_eq!(edit_text(&cx, &chart), Some((id, "Pasted".into(), 6)));
+
+        cx.simulate_keystrokes("escape");
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.editing_drawing(), None);
+            assert_eq!(
+                engine.drawing(id).map(|drawing| drawing.text.as_str()),
+                Some("Note")
+            );
+        });
+        assert!(
+            host.read_with(&cx, |host, _| host.keys_reached_host.is_empty()),
+            "the typing session consumes every key it receives"
+        );
+    }
+
+    #[gpui::test]
+    fn focused_view_keys_page_zoom_and_pan_and_unbound_keys_reach_the_host(
+        cx: &mut TestAppContext,
+    ) {
+        let (chart, host, mut cx) = open_chart(cx);
+        let empty = chart.read_with(&cx, |probe, _| at(probe, EMPTY.0, EMPTY.1));
+        // A click focuses the chart.
+        click(&mut cx, empty);
+
+        let (scroll, spacing, pane_w) = engine(&cx, &chart, |engine| {
+            (
+                engine.scroll_position(),
+                engine.bar_spacing(),
+                engine.pane_w,
+            )
+        });
+        cx.simulate_keystrokes("pageup");
+        // PageUp scrolls 80% of the plot width into history.
+        let paged = engine(&cx, &chart, ChartEngine::scroll_position);
+        assert!((paged - (scroll - pane_w / spacing * 0.8)).abs() < 1e-9);
+        cx.simulate_keystrokes("end");
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.scroll_position(), engine.real_time_scroll_position());
+        });
+
+        let time_scale =
+            |cx: &VisualTestContext| engine(cx, &chart, |engine| engine.time_scale.clone());
+        let mut expected = time_scale(&cx);
+        cx.simulate_keystrokes("+");
+        expected.zoom(pane_w / 2.0, 0.5);
+        assert_eq!(time_scale(&cx).bar_spacing(), expected.bar_spacing());
+        assert!(expected.bar_spacing() > spacing);
+        cx.simulate_keystrokes("-");
+        expected.zoom(pane_w / 2.0, -0.5);
+        assert_eq!(time_scale(&cx).bar_spacing(), expected.bar_spacing());
+
+        // A held arrow pans while the key is down and stops on its release.
+        cx.simulate_keystrokes("right");
+        assert!(engine(&cx, &chart, ChartEngine::input_animating));
+        cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse("right").expect("a valid keystroke"),
+        });
+        assert!(!engine(&cx, &chart, ChartEngine::input_animating));
+
+        assert!(host.read_with(&cx, |host, _| host.keys_reached_host.is_empty()));
+        let spacing = engine(&cx, &chart, ChartEngine::bar_spacing);
+        cx.simulate_keystrokes("q");
+        assert_eq!(
+            host.read_with(&cx, |host, _| host.keys_reached_host.clone()),
+            ["q"],
+            "the chart leaves keys it does not bind to its parent"
+        );
+        assert_eq!(engine(&cx, &chart, ChartEngine::bar_spacing), spacing);
+    }
+
+    #[gpui::test]
+    fn the_magnet_modifier_reaches_an_armed_tool_through_the_focused_chart(
+        cx: &mut TestAppContext,
+    ) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        chart.update(&mut cx, |probe, cx| {
+            probe.arm_drawing(DrawingKind::TrendLine);
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let focus = chart
+                .read(cx)
+                .focus_handle
+                .clone()
+                .expect("the probe has a focus handle");
+            window.focus(&focus, cx);
+        });
+        let plot = chart.read_with(&cx, |probe, _| at(probe, 300.0, 200.0));
+        hover(&mut cx, plot);
+        let magnet =
+            |cx: &VisualTestContext| engine(cx, &chart, |engine| engine.crosshair_ohlc_magnet);
+        assert!(!magnet(&cx));
+        // Ctrl on Linux and Windows, Cmd on macOS.
+        cx.simulate_modifiers_change(Modifiers::secondary_key());
+        assert!(magnet(&cx));
+        cx.simulate_modifiers_change(Modifiers::none());
+        assert!(!magnet(&cx));
+    }
+
+    /// The real application shell binds Ctrl/Cmd+V to a workspace split. While a drawing label is
+    /// being typed, the chart's typing session owns the keyboard, so the same keys paste; once
+    /// the session closes, the shortcut reaches the shell again.
+    #[gpui::test]
+    fn the_demo_shell_split_shortcut_yields_to_an_open_typing_session(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(1280.0), px(820.0)), |_, cx| {
+            InteractiveDemo::new(BARS, cx)
+        });
+        let demo = window.root(cx).expect("the demo window is open");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let chart = demo.read_with(&cx, |demo, _| {
+            demo.root_chart().expect("cell 1 hosts the root chart")
+        });
+        let id = add_text_drawing(&mut cx, &chart, "Note");
+        let target = chart.read_with(&cx, |probe, _| {
+            let (x, y) = text_point(&probe.engine, id);
+            // The shell lays the chart out among its controls; map through the canvas corner the
+            // adapter recorded at prepaint.
+            let (left, top) = probe.input.pane_point(&probe.engine, Point::default());
+            point(px((x - left) as f32), px((y - top) as f32))
+        });
+        let charts =
+            |cx: &VisualTestContext| demo.read_with(cx, |demo, _| demo.workspace.chart_count());
+
+        click(&mut cx, target);
+        cx.simulate_keystrokes("f2");
+        cx.write_to_clipboard(ClipboardItem::new_string("!".into()));
+        cx.simulate_keystrokes("secondary-v");
+        assert_eq!(edit_text(&cx, &chart), Some((id, "Note!".into(), 5)));
+        assert_eq!(charts(&cx), 1, "the paste never splits the workspace");
+
+        cx.simulate_keystrokes("enter");
+        engine(&cx, &chart, |engine| {
+            assert_eq!(engine.editing_drawing(), None);
+            assert_eq!(
+                engine.drawing(id).map(|drawing| drawing.text.as_str()),
+                Some("Note!")
+            );
+        });
+        cx.simulate_keystrokes("secondary-v");
+        assert_eq!(charts(&cx), 2);
+    }
+}

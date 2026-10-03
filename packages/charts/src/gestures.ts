@@ -256,6 +256,10 @@ export function install_gestures(chart: chart_impl): () => void {
       default: return InputTargetCode.Pane;
     }
   };
+  /** Axis and separator presses never pan, even while their own drag is switched off. */
+  const chrome_target = (target: InputTargetCode | undefined): boolean =>
+    target === InputTargetCode.PriceAxis || target === InputTargetCode.TimeAxis
+      || target === InputTargetCode.Separator;
   const read_input_update = (): input_update => ({
     kind: input_scratch[0] as GestureUpdateCode,
     pointer_id: input_scratch[2]!,
@@ -775,7 +779,10 @@ export function install_gestures(chart: chart_impl): () => void {
       wasm.drawing_drag_to(p.x, p.y, e.ctrlKey || e.metaKey, e.shiftKey);
     } else if (delta_tooltip_dragging) {
       // The native comparison interaction explicitly owns this pane drag.
-    } else if (update.kind === GestureUpdateCode.DragStarted && chart.gesture_config().pan) {
+    } else if (
+      update.kind === GestureUpdateCode.DragStarted && chart.gesture_config().pan
+      && !chrome_target(pointer_targets.get(e.pointerId))
+    ) {
       // Pane panning opens on the threshold sample; like the public reference, movement begins on
       // the following sample. Kinetic sampling starts only after this transition.
       begin_scroll(p.x, "mouse");

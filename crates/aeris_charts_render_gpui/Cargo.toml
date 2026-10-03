@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 description = "Optional GPUI executor for the Prim IR: lowers Aeris's backend-neutral frame into GPUI scene primitives"
 
-# GPUI itself is OPTIONAL and off by default, so `cargo build/test --workspace` never compiles it
-# Normal non-GPUI builds do not compile GPUI. Everything except the thin
+# GPUI itself is OPTIONAL and off by default, so the library never compiles it without the feature;
+# only the dev-dependencies below build GPUI for tests. Everything except the thin
 # `backend` module — the whole Prim lowering, snapping, cache, and metrics layer — is
 # GPUI-free and unit-testable without a window or a GPU.
 [features]
@@ -46,9 +46,15 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", default-fea
 ] }
 # `gpui-pre-linux`'s `x11` feature does not turn on `gpui/x11`, which `guess_compositor` needs to
 # pick X11 from `DISPLAY`; without it an X11 session silently opens headless windows.
+# `test-support` exposes GPUI's headless `TestAppContext`, so the probe's window tests dispatch
+# real input through the listener table. The library never enables it, but Cargo unifies
+# dev-dependency features into this crate's examples too, so the probe, parity, and capture
+# binaries link GPUI with its leak detection (handle bookkeeping, and a panic at exit if an entity
+# handle leaks); keep that in mind before taking feel or timing readings from them.
 gpui = { package = "gpui-pre", version = "=0.3.6", default-features = false, features = [
     "x11",
     "wayland",
+    "test-support",
 ] }
 aeris_charts_native = { path = "../aeris_charts_native" }
 serde_json = "1"
