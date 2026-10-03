@@ -193,7 +193,6 @@ impl ChartInner {
         }
         self.destroy_all_custom_series();
         self.rings.clear();
-        self.primitive_texts.clear();
     }
 
     /// Adds a series and returns its id. `kind`: 0 candles, 1 bars, 2 line, 3 area, 4 histogram.
@@ -2309,14 +2308,6 @@ impl ChartInner {
         self.engine.set_calendar_date_axis(calendar_dates);
     }
 
-    /// Label flags for package-owned time text: bit 0 `timeVisible`, bit 1 `secondsVisible`,
-    /// bit 2 calendar-date axis.
-    pub fn time_label_flags(&self) -> u32 {
-        u32::from(self.engine.time_visible)
-            | (u32::from(self.engine.seconds_visible) << 1)
-            | (u32::from(self.engine.exchange_time().calendar_dates()) << 2)
-    }
-
     /// Exchange-local wall-clock seconds for a UTC timestamp (identity for calendar dates).
     pub fn exchange_local_seconds(&self, time: f64) -> f64 {
         if !time.is_finite() {
@@ -2439,8 +2430,21 @@ impl ChartInner {
         let font_family = layout.font_family;
         let axis_size = self.engine.axis_font_size();
         let countdown_size = self.engine.countdown_font_size();
-        self.engine.recompute_layout_with_measure(
-            allow_axis_shrink,
+        self.engine.prepare_financial_frame_with_measure(
+            aeris_charts_engine::FinancialFrameRequest {
+                width: self.css_width,
+                height: self.css_height,
+                dpr,
+                force_layout: true,
+                allow_axis_shrink,
+                force_frame: false,
+                force_axis: false,
+                layout_only: true,
+                fit_content: false,
+                frame: &mut self.frame,
+                axis_frame: None,
+                axis_primitives: None,
+            },
             |text, bold| measure_text_ctx(&axis_ctx, dpr, &font_family, axis_size, bold, text),
             |text, bold| measure_text_ctx(&axis_ctx, dpr, &font_family, countdown_size, bold, text),
         );
@@ -2448,138 +2452,8 @@ impl ChartInner {
 
     // --- gestures ---
 
-    pub fn zoom(&mut self, x_css: f64, scale: f64) {
-        let x = x_css.max(1.0).min(self.time_scale.width());
-        self.time_scale_zoom(x, scale);
-    }
-    pub fn zoom_focused(&mut self, x_css: f64, scale: f64) {
-        let x = x_css.max(1.0).min(self.time_scale.width());
-        self.time_scale_zoom_focused(x, scale);
-    }
-    pub fn wheel_zoom_time(&mut self, x_css: f64, scale: f64, control: bool, meta: bool) {
-        // The engine clamps the anchor into the plot.
-        self.wheel_zoom_time_scale(
-            x_css,
-            scale,
-            aeris_charts_engine::InputModifiers {
-                control,
-                meta,
-                ..Default::default()
-            },
-        );
-    }
-    pub fn scroll_start(&mut self, x_css: f64) {
-        self.time_scale_start_scroll(x_css);
-    }
-    pub fn scroll_move(&mut self, x_css: f64) {
-        self.time_scale_scroll_to(x_css);
-    }
-    pub fn scroll_end(&mut self) {
-        self.time_scale_end_scroll();
-    }
-
-    // --- engine-owned interaction models (kinetic, axis drag-to-scale, price pan, eased
-    // scroll): the TS recognizer forwards normalized samples and schedules frames; every
-    // formula lives in the engine so the headless harness runs the same code. ---
-
-    /// reference wheel zoom increment: `sign(deltaY) * min(1, |deltaY|)`.
-    pub fn wheel_zoom_scale(&self, delta_y: f64) -> f64 {
-        aeris_charts_engine::wheel_zoom_scale(delta_y)
-    }
-    /// reference pinch zoom increment: the scale-ratio delta ×5.
-    pub fn pinch_zoom_scale(&self, scale_delta: f64) -> f64 {
-        aeris_charts_engine::pinch_zoom_scale(scale_delta)
-    }
-    /// reference wheel scroll: `deltaX * -80` px ("made-up coefficient").
-    pub fn wheel_scroll_delta(&self, delta_x: f64) -> f64 {
-        delta_x * aeris_charts_engine::WHEEL_SCROLL_PX_PER_DELTA
-    }
-
-    /// Open a kinetic sampling session alongside the drag, seeded with logical rightOffset.
-    pub fn kinetic_begin_sampling(&mut self, enabled: bool, position: f64, now_ms: f64) {
-        self.engine
-            .kinetic_begin_sampling(enabled, position, now_ms);
-    }
-    pub fn kinetic_add_sample(&mut self, position: f64, now_ms: f64) {
-        self.engine.kinetic_add_sample(position, now_ms);
-    }
-    /// The drag was released: returns whether a momentum coast engaged (the host then drives
-    /// `kinetic_position` per frame instead of ending the scroll session).
-    pub fn kinetic_release(&mut self, position: f64, now_ms: f64) -> bool {
-        self.engine.kinetic_release(position, now_ms)
-    }
-    /// The coast's logical rightOffset at `now_ms` (NaN when no coast runs).
-    pub fn kinetic_position(&self, now_ms: f64) -> f64 {
-        self.engine.kinetic_position(now_ms).unwrap_or(f64::NAN)
-    }
-    pub fn kinetic_finished(&self, now_ms: f64) -> bool {
-        self.engine.kinetic_finished(now_ms)
-    }
-    pub fn kinetic_stop(&mut self) {
-        self.engine.kinetic_stop();
-    }
-
-    pub fn start_keyboard_scroll(&mut self, delta_bars: f64, now_ms: f64) {
-        self.engine.start_keyboard_scroll(delta_bars, now_ms);
-    }
-    pub fn keyboard_scroll_tick(&mut self, now_ms: f64) -> f64 {
-        self.engine.keyboard_scroll_tick(now_ms).unwrap_or(f64::NAN)
-    }
     pub fn cancel_keyboard_scroll(&mut self) {
         self.engine.cancel_keyboard_scroll();
-    }
-
-    /// Axis drag-to-scale arms/applies (reference `TimeAxisWidget`/`PriceAxisWidget`
-    /// pressedMouseMove): y is chart-content CSS px for price axes, x pane-relative for time.
-    pub fn time_axis_start_scale(&mut self, x_css: f64) {
-        self.engine.time_axis_start_scale(x_css);
-    }
-    pub fn time_axis_scale_to(&mut self, x_css: f64) {
-        self.engine.time_axis_scale_to(x_css);
-    }
-    pub fn time_axis_end_scale(&mut self) {
-        self.engine.time_axis_end_scale();
-    }
-    /// Whether a price-axis drag can scale this scale (false in percentage/indexed-to-100
-    /// modes or with no range — reference `PriceScale.scaleTo` no-ops there).
-    pub fn price_axis_scalable(&self, pane: usize, target: u32) -> bool {
-        self.engine
-            .price_axis_scalable(pane, price_scale_target_from_u32(target))
-    }
-    pub fn price_axis_start_scale(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.engine
-            .price_axis_start_scale(pane, price_scale_target_from_u32(target), y_css);
-    }
-    pub fn price_axis_scale_to(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.engine
-            .price_axis_scale_to(pane, price_scale_target_from_u32(target), y_css);
-    }
-    pub fn price_axis_end_scale(&mut self, pane: usize, target: u32) {
-        self.engine
-            .price_axis_end_scale(pane, price_scale_target_from_u32(target));
-    }
-    /// Vertical price pan (reference `startScrollPrice`/`scrollPriceTo`); autoscale remains locked.
-    pub fn price_axis_start_scroll(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.engine
-            .price_axis_start_scroll(pane, price_scale_target_from_u32(target), y_css);
-    }
-    pub fn price_axis_scroll_to(&mut self, pane: usize, target: u32, y_css: f64) {
-        self.engine
-            .price_axis_scroll_to(pane, price_scale_target_from_u32(target), y_css);
-    }
-    pub fn price_axis_end_scroll(&mut self, pane: usize, target: u32) {
-        self.engine
-            .price_axis_end_scroll(pane, price_scale_target_from_u32(target));
-    }
-    pub fn begin_price_pan_at(&mut self, pane: usize, x_css: f64, y_css: f64) -> Option<u32> {
-        self.engine
-            .begin_price_pan_at(pane, x_css, y_css)
-            .map(price_scale_target_to_u32)
-    }
-    pub fn price_pan_target_at(&self, pane: usize, x_css: f64, y_css: f64) -> Option<u32> {
-        self.engine
-            .price_pan_target_at(pane, x_css, y_css)
-            .map(price_scale_target_to_u32)
     }
 
     /// Eased scroll-to-position (cubic ease-out): the engine owns the easing and applies each

@@ -1,6 +1,6 @@
 /** Primitive and compatibility helpers built on Aeris's existing engine and extension boundaries. */
 
-import { chart_impl, chart_time_text, time_to_utc_seconds } from "./impl.js";
+import { chart_impl, time_to_utc_seconds } from "./impl.js";
 import { AerisChartsError } from "./errors.js";
 import {
   attach_native_bands_indicator,
@@ -709,7 +709,6 @@ function tooltip_row_text(row: HTMLDivElement, value: HTMLSpanElement, text: str
   row.hidden = text.length === 0;
 }
 
-
 /** Structured OHLC market-data tooltip; source lookup and its vertical guide are engine-owned. */
 export function create_tooltip(chart: chart_api, options: tooltip_options = {}): tooltip_handle {
   let current: Required<Omit<tooltip_options, "series" | "volume_series" | "format" | "line_color">>
@@ -809,8 +808,9 @@ export function create_tooltip(chart: chart_api, options: tooltip_options = {}):
       return;
     }
     tooltip_text(title, current.title);
-    // Chart time zone, localization.locale, and the host time_formatter — never the browser zone.
-    tooltip_text(timestamp, Number.isFinite(snapshot.time) ? chart_time_text(chart, snapshot.time) : "");
+    // The chart's own crosshair label: exchange time zone, localization.date_format and locale,
+    // and the host time_formatter — never the browser zone.
+    tooltip_text(timestamp, Number.isFinite(snapshot.time) ? chart.format_time_label(snapshot.time) : "");
     tooltip_row_text(close.row, close.value, Number.isFinite(snapshot.close) ? format_price(event, snapshot.close) : "");
     tooltip_row_text(open.row, open.value, Number.isFinite(snapshot.open) ? format_price(event, snapshot.open) : "");
     tooltip_row_text(high.row, high.value, Number.isFinite(snapshot.high) ? format_price(event, snapshot.high) : "");

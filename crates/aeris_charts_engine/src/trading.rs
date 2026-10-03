@@ -2859,7 +2859,9 @@ impl ChartEngine {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{ChartEngine, CrosshairSyncPosition, DrawingPoint, TradingPriceScale};
+    use crate::{
+        ChartEngine, CrosshairSyncPosition, DrawingPoint, PointerInput, TradingPriceScale,
+    };
     use aeris_charts_render::draw_list::Prim;
 
     pub(crate) fn id<T>(
@@ -3227,7 +3229,7 @@ pub(crate) mod tests {
                 .any(|label| label.text == price && label.border == Some((1.0, color))));
         }
         let mut axis_primitives = Vec::new();
-        chart.build_axis_primitives_into(&axis, &mut axis_primitives, |_| 0.0);
+        chart.build_axis_primitives_into(&axis, &mut axis_primitives);
         for (name, color) in [
             ("SL", chart.trading_style().stop_loss),
             ("TP", chart.trading_style().take_profit),
@@ -5394,6 +5396,85 @@ pub(crate) mod tests {
         let pressed_fill = close_fill(&marker(&mut chart)).expect("pressed surface");
         assert_ne!(pressed_fill, hover_fill);
         assert!(chart.clear_trading_pressed());
+    }
+
+    #[test]
+    fn close_control_requires_the_press_to_start_on_that_control() {
+        let mut chart = chart_with_market();
+        chart
+            .update_trading_position(position(PositionSide::Long))
+            .unwrap();
+        chart.build_frame();
+        let y = chart
+            .trading_price_coordinate(0, TradingPriceScale::Right, 101.0)
+            .unwrap();
+        let (start_x, end_x) = (0..=(chart.pane_w * 2.0) as usize)
+            .map(|step| step as f64 / 2.0)
+            .find_map(|x| {
+                let before = chart.trading_hit_at(x, y)?;
+                let after = chart.trading_hit_at(x + 1.0, y)?;
+                (before.object == after.object
+                    && before.kind != TradingHitKind::CancelButton
+                    && after.kind == TradingHitKind::CancelButton)
+                    .then_some((x, x + 1.0))
+            })
+            .expect("close control has an adjacent press surface");
+        chart.input_pointer_down(
+            PointerInput {
+                x: start_x,
+                y,
+                ..PointerInput::default()
+            },
+            1,
+        );
+        chart.input_pointer_up(PointerInput {
+            x: end_x,
+            y,
+            ..PointerInput::default()
+        });
+        assert_eq!(chart.trading_snapshot().positions.len(), 1);
+        assert!(chart.take_trading_intents().is_empty());
+    }
+
+    #[test]
+    fn trading_tooltip_dwell_does_not_restart_during_a_held_drag() {
+        let mut chart = chart_with_market();
+        chart
+            .update_trading_position(position(PositionSide::Long))
+            .unwrap();
+        chart.build_frame();
+        let (close_x, y) = cancel_center(
+            &mut chart,
+            TradingObjectId::Position(id("position-1", PositionId::new)),
+        );
+        let start_x = (0..=(close_x * 2.0) as usize)
+            .map(|step| step as f64 / 2.0)
+            .rev()
+            .find(|&x| {
+                chart.trading_hit_at(x, y).is_some_and(|hit| {
+                    hit.kind != TradingHitKind::CancelButton
+                        && hit.object
+                            == TradingObjectId::Position(id("position-1", PositionId::new))
+                })
+            })
+            .expect("adjacent marker press surface");
+        let pointer = |x, timestamp_ms| PointerInput {
+            x,
+            y,
+            timestamp_ms,
+            ..PointerInput::default()
+        };
+        chart.input_pointer_move(pointer(close_x, 100.0), false);
+        assert_eq!(
+            chart.input_wake_deadline_ms(),
+            Some(100.0 + crate::chart_input::TRADING_TOOLTIP_DWELL_MS)
+        );
+        chart.input_pointer_down(pointer(start_x, 200.0), 1);
+        assert_eq!(chart.input_wake_deadline_ms(), None);
+        chart.input_pointer_move(pointer(close_x, 210.0), true);
+        assert_eq!(chart.input_wake_deadline_ms(), None);
+        chart.input_tick(1_000.0);
+        assert!(!chart.trading_state.tooltip_armed);
     }
 
     #[test]

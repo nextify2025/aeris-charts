@@ -10,7 +10,7 @@ use aeris_charts_engine::{
     TradingPriceScale, TradingSnapshot, WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
 };
 use aeris_charts_render::draw_list::Prim;
-use gpui::{bounds, size, Keystroke, MouseButton, TouchPhase};
+use gpui::{bounds, px, size, Keystroke, MouseButton};
 
 use super::*;
 
@@ -354,21 +354,22 @@ fn click_count_two_resets_the_price_axis_and_the_time_axis() {
     assert_eq!(chart.scroll_position(), reset.scroll_position());
 }
 
-/// The browser host normalizes a DOM wheel as `delta_y = -(speed * deltaY) / 100` with a 32 px
-/// line speed (`packages/charts/src/gestures.ts` `route_wheel`), so a DOM wheel-up is positive.
+/// The engine scale both hosts share is browser notches: a DOM wheel normalizes to `deltaY / 100`
+/// pixels with a 32 px DOM line, and a DOM wheel-up is positive. GPUI's native lines are DOM lines
+/// scaled by 25/24, so one native line is a third of a notch and the default three-line notch is
+/// one. The expected notches are written out so the test cannot share a scale error with the
+/// adapter.
 #[test]
 fn vertical_wheel_lines_and_pixels_match_the_browser_normalization() {
     let input = input();
-    for (delta, dom_delta_y, speed, delta_mode) in [
+    for (delta, browser_notches, delta_mode) in [
         (
             ScrollDelta::Lines(point(0.0, 1.0)),
-            -1.0,
-            32.0,
+            1.0 / 3.0,
             WheelDeltaMode::Line,
         ),
         (
             ScrollDelta::Pixels(point(px(0.0), px(100.0))),
-            -100.0,
             1.0,
             WheelDeltaMode::Pixel,
         ),
@@ -383,12 +384,14 @@ fn vertical_wheel_lines_and_pixels_match_the_browser_normalization() {
         assert!(twin.input_wheel(WheelSample {
             x,
             y,
-            delta_y: -(speed * dom_delta_y) / 100.0,
+            delta_y: browser_notches,
             delta_mode,
             ..WheelSample::default()
         }));
-        assert_eq!(chart.bar_spacing(), twin.bar_spacing(), "{delta:?}");
-        assert_eq!(chart.scroll_position(), twin.scroll_position(), "{delta:?}");
+        assert_near(
+            (chart.bar_spacing(), chart.scroll_position()),
+            (twin.bar_spacing(), twin.scroll_position()),
+        );
         assert!(
             chart.bar_spacing() > spacing,
             "wheel-up zooms in: {delta:?}"
@@ -397,21 +400,20 @@ fn vertical_wheel_lines_and_pixels_match_the_browser_normalization() {
 }
 
 /// GPUI's horizontal delta is the negation of the DOM's `deltaX` (a swipe the DOM reports as
-/// scrolling right arrives negative), while the browser host passes `+(speed * deltaX) / 100`.
+/// scrolling right arrives negative), and the browser host passes `deltaX` through, so an unshifted
+/// GPUI swipe of -100 px or one native line left pans as +1 or +1/3 browser notch.
 #[test]
 fn horizontal_wheel_pans_in_the_browser_direction() {
     let input = input();
-    for (delta, dom_delta_x, speed, delta_mode) in [
+    for (delta, browser_notches, delta_mode) in [
         (
             ScrollDelta::Pixels(point(px(-100.0), px(0.0))),
-            100.0,
             1.0,
             WheelDeltaMode::Pixel,
         ),
         (
             ScrollDelta::Lines(point(-1.0, 0.0)),
-            1.0,
-            32.0,
+            1.0 / 3.0,
             WheelDeltaMode::Line,
         ),
     ] {
@@ -425,13 +427,15 @@ fn horizontal_wheel_pans_in_the_browser_direction() {
         assert!(twin.input_wheel(WheelSample {
             x,
             y,
-            delta_x: speed * dom_delta_x / 100.0,
+            delta_x: browser_notches,
             delta_mode,
             ..WheelSample::default()
         }));
         assert_ne!(chart.scroll_position(), start, "{delta:?}");
-        assert_eq!(chart.scroll_position(), twin.scroll_position(), "{delta:?}");
-        assert_eq!(chart.bar_spacing(), twin.bar_spacing(), "{delta:?}");
+        assert_near(
+            (chart.scroll_position(), chart.bar_spacing()),
+            (twin.scroll_position(), twin.bar_spacing()),
+        );
     }
 }
 
@@ -935,74 +939,4 @@ fn text_edit_deletes_forward_selects_with_shift_and_types_only_characters() {
 
     text_edit_key(&mut chart, &key("down", None, none));
     assert_eq!(chart.drawing_text_edit(), Some((id, " lo world", 9)));
-}
-
-/// A 600-bar chart viewed mid-history, so a wheel can move the view either way.
-fn mid_history_chart() -> ChartEngine {
-    let mut engine = ChartEngine::new(800.0, 400.0, 2.0);
-    let bars = 600;
-    let times: Vec<f64> = (0..bars)
-        .map(|i| 1_600_000_000.0 + i as f64 * 60.0)
-        .collect();
-    let close: Vec<f64> = (0..bars)
-        .map(|i| 100.0 + (i as f64 * 0.05).sin() * 12.0)
-        .collect();
-    let high: Vec<f64> = close.iter().map(|c| c + 1.0).collect();
-    let low: Vec<f64> = close.iter().map(|c| c - 1.0).collect();
-    engine
-        .set_series_data(0, &times, &close, &high, &low, &close)
-        .expect("series loads");
-    let content_h = (400.0 - engine.time_axis_height()).max(1.0);
-    engine.layout_panes(content_h);
-    engine.time_scale.set_width(800.0);
-    // Mid-history, so a wheel can move the view either way.
-    engine.set_visible_logical_range(300.0, 400.0);
-    engine
-}
-
-/// One swipe must move a GPUI chart exactly as it moves the same chart in a browser, which
-/// receives it as a `WheelEvent` with both signs reversed (`deltaX = -scrollingDeltaX`) and
-/// normalizes it to `(deltaX / 100, -deltaY / 100)`. A swipe that reveals the left must show
-/// earlier bars, as it shows the left of every native scroll view.
-#[test]
-fn a_wheel_or_swipe_moves_the_chart_as_the_browser_does() {
-    let input = GpuiChartInput::default();
-    let position = point(px(300.0), px(200.0));
-    for (dx, dy) in [(40.0, 0.0), (-40.0, 0.0), (0.0, 40.0), (0.0, -40.0)] {
-        let mut gpui = mid_history_chart();
-        let mut browser = mid_history_chart();
-        let start = gpui.visible_logical_range().expect("visible range");
-        let event = ScrollWheelEvent {
-            position,
-            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
-            modifiers: Modifiers::default(),
-            touch_phase: TouchPhase::Moved,
-        };
-        assert!(
-            input.scroll_wheel(&mut gpui, &event),
-            "({dx}, {dy}) consumed"
-        );
-        let (x, y) = input.pane_point(&browser, position);
-        let (dom_x, dom_y) = (-f64::from(dx), -f64::from(dy));
-        assert!(browser.input_wheel(WheelSample {
-            x,
-            y,
-            delta_x: dom_x / 100.0,
-            delta_y: -dom_y / 100.0,
-            delta_mode: WheelDeltaMode::Pixel,
-            ..WheelSample::default()
-        }));
-        let moved = gpui.visible_logical_range().expect("visible range");
-        assert_eq!(
-            moved,
-            browser.visible_logical_range().expect("visible range"),
-            "({dx}, {dy})"
-        );
-        if dx > 0.0 {
-            assert!(
-                moved.0 < start.0,
-                "revealing the left shows earlier bars: {start:?} -> {moved:?}"
-            );
-        }
-    }
 }

@@ -42,15 +42,18 @@ struct RectRecorder {
     rects: Vec<(f32, f32, f32, f32, Paint)>,
     path_fills: usize,
     path_strokes: usize,
-    text_runs: Vec<(String, f32, f32, String)>,
+    text_runs: Vec<(String, f32, f32, String, Color, TextAlign)>,
+    images: Vec<([f32; 4], f32, u32, u32)>,
+    gradient_extents: Vec<(f32, f32, Color, Color)>,
 }
 
 impl Canvas2d for RectRecorder {
     fn set_fill_solid(&mut self, color: Color) {
         self.fill = Some(Paint::Solid(color));
     }
-    fn set_fill_vgradient(&mut self, _y_top: f32, _y_bottom: f32, top: Color, bottom: Color) {
+    fn set_fill_vgradient(&mut self, y_top: f32, y_bottom: f32, top: Color, bottom: Color) {
         self.fill = Some(Paint::VGradient { top, bottom });
+        self.gradient_extents.push((y_top, y_bottom, top, bottom));
     }
     fn set_stroke(&mut self, _color: Color) {}
     fn set_line_width(&mut self, _width: f32) {}
@@ -78,10 +81,11 @@ impl Canvas2d for RectRecorder {
         x: f32,
         y: f32,
         font: &str,
-        _color: Color,
-        _align: TextAlign,
+        color: Color,
+        align: TextAlign,
     ) {
-        self.text_runs.push((text.into(), x, y, font.into()));
+        self.text_runs
+            .push((text.into(), x, y, font.into(), color, align));
     }
     fn fill_rotated_text(
         &mut self,
@@ -89,12 +93,20 @@ impl Canvas2d for RectRecorder {
         x: f32,
         y: f32,
         font: &str,
-        _color: Color,
-        _align: TextAlign,
+        color: Color,
+        align: TextAlign,
         angle: f32,
     ) {
         self.text_runs
-            .push((format!("{text}@{angle}"), x, y, font.into()));
+            .push((format!("{text}@{angle}"), x, y, font.into(), color, align));
+    }
+    fn draw_raster_image(
+        &mut self,
+        image: &aeris_charts_render::draw_list::RasterImage,
+        rect: [f32; 4],
+        opacity: f32,
+    ) {
+        self.images.push((rect, opacity, image.width, image.height));
     }
 }
 
@@ -478,6 +490,28 @@ fn tessellated_prims_take_the_path_route_on_both_backends() {
             },
         ),
         (
+            "Dashed Polyline",
+            Prim::Polyline {
+                first_point: 0,
+                point_count: 3,
+                width: 2.0,
+                style: LineStyle::Dashed,
+                line_type: LineType::Simple,
+                color: c,
+            },
+        ),
+        (
+            "Dotted stepped Polyline",
+            Prim::Polyline {
+                first_point: 0,
+                point_count: 3,
+                width: 2.0,
+                style: LineStyle::Dotted,
+                line_type: LineType::WithSteps,
+                color: c,
+            },
+        ),
+        (
             "AreaFill",
             Prim::AreaFill {
                 first_point: 0,
@@ -512,6 +546,17 @@ fn tessellated_prims_take_the_path_route_on_both_backends() {
             },
         ),
         (
+            "Stroked Circle",
+            Prim::Circle {
+                cx: 10.0,
+                cy: 10.0,
+                radius: 4.0,
+                fill: c,
+                stroke_width: 2.0,
+                stroke: Color::rgb(220, 30, 20),
+            },
+        ),
+        (
             "Triangle",
             Prim::Triangle {
                 a: [0.0, 0.0],
@@ -531,6 +576,19 @@ fn tessellated_prims_take_the_path_route_on_both_backends() {
                 fill: c,
                 border_width: 0.0,
                 border_color: c,
+            },
+        ),
+        (
+            "Bordered RoundRect",
+            Prim::RoundRect {
+                x: 1.0,
+                y: 1.0,
+                w: 20.0,
+                h: 10.0,
+                radii: [2.0; 4],
+                fill: c,
+                border_width: 2.0,
+                border_color: Color::rgb(220, 30, 20),
             },
         ),
     ];
@@ -556,6 +614,123 @@ fn tessellated_prims_take_the_path_route_on_both_backends() {
             if let SceneOp::Mesh { vertex_count, .. } = op {
                 assert_eq!(vertex_count % 3, 0, "{name}: partial triangle in the mesh");
             }
+        }
+    }
+}
+
+#[test]
+fn gpui_meshes_contain_the_webgpu_contract_vertices_for_each_shape() {
+    let points = [
+        [2.0, 8.0],
+        [18.0, 4.0],
+        [34.0, 12.0],
+        [2.0, 22.0],
+        [18.0, 20.0],
+        [34.0, 27.0],
+    ];
+    let c = Color::rgb(30, 90, 150);
+    let cases = [
+        (
+            "Polyline",
+            Prim::Polyline {
+                first_point: 0,
+                point_count: 3,
+                width: 2.0,
+                style: LineStyle::Solid,
+                line_type: LineType::WithSteps,
+                color: c,
+            },
+        ),
+        (
+            "AreaFill",
+            Prim::AreaFill {
+                first_point: 0,
+                point_count: 3,
+                base_y: 35.0,
+                line_type: LineType::Simple,
+                gradient: Gradient { top: c, bottom: c },
+            },
+        ),
+        (
+            "BandFill",
+            Prim::BandFill {
+                upper_first: 0,
+                lower_first: 3,
+                point_count: 3,
+                line_type: LineType::Simple,
+                fill: c,
+            },
+        ),
+        (
+            "RoundRect",
+            Prim::RoundRect {
+                x: 4.0,
+                y: 5.0,
+                w: 30.0,
+                h: 20.0,
+                radii: [4.0; 4],
+                fill: c,
+                border_width: 2.0,
+                border_color: Color::rgb(80, 20, 20),
+            },
+        ),
+        (
+            "Circle",
+            Prim::Circle {
+                cx: 20.0,
+                cy: 20.0,
+                radius: 8.0,
+                fill: c,
+                stroke_width: 2.0,
+                stroke: Color::rgb(80, 20, 20),
+            },
+        ),
+        (
+            "Triangle",
+            Prim::Triangle {
+                a: [3.0, 4.0],
+                b: [20.0, 6.0],
+                c: [12.0, 25.0],
+                color: c,
+            },
+        ),
+    ];
+    for (name, prim) in cases {
+        let (plan, _) = gpui_plan(std::slice::from_ref(&prim), &points);
+        let mut gpu = Vec::new();
+        aeris_charts_render_wgpu::geom_prim_to_tris(&prim, &points, &mut gpu);
+        assert!(!gpu.is_empty(), "{name}: WebGPU emitted no vertices");
+        if name == "Circle" {
+            // GPUI's explicit one-pixel coverage fringe straddles the WebGPU/MSAA nominal
+            // radius, so those AA vertices intentionally differ by half a pixel.
+            let has_x = |x: f32| {
+                plan.vertices
+                    .iter()
+                    .any(|v| (v.x - x).abs() <= 1e-3 && (v.y - 20.0).abs() <= 1e-3)
+            };
+            assert!(gpu.iter().any(|v| (v.pos[0] - 28.0).abs() <= 1e-3));
+            assert!(
+                has_x(27.5) && has_x(28.5),
+                "GPUI coverage must straddle the 8 px nominal radius"
+            );
+            continue;
+        }
+        let mut available: Vec<_> = plan
+            .vertices
+            .iter()
+            .map(|vertex| [vertex.x, vertex.y])
+            .collect();
+        for expected in &gpu {
+            let Some(index) = available.iter().position(|actual| {
+                (actual[0] - expected.pos[0]).abs() <= 1e-3
+                    && (actual[1] - expected.pos[1]).abs() <= 1e-3
+            }) else {
+                panic!(
+                    "{name}: WebGPU vertex {:?} has no GPUI counterpart",
+                    expected.pos
+                );
+            };
+            available.swap_remove(index);
         }
     }
 }
@@ -677,6 +852,65 @@ fn area_fill_gradient_extent_matches_the_canvas2d_ramp() {
 }
 
 #[test]
+fn image_and_background_fixture_preserve_rects_pixels_and_gradient_extent() {
+    let image = fixtures::colored_image(1.0);
+    let canvas = canvas_rects(&image.prims, &image.points);
+    let (plan, _) = gpui_plan(&image.prims, &image.points);
+    assert_eq!(canvas.images.len(), 1);
+    let image_ops: Vec<_> = plan
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            SceneOp::Image {
+                image,
+                rect,
+                opacity,
+            } => Some((image, rect, opacity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(image_ops.len(), 1);
+    let (gpui_image, rect, opacity) = image_ops[0];
+    let (canvas_rect, canvas_opacity, width, height) = canvas.images[0];
+    assert_eq!([rect.x, rect.y, rect.w, rect.h], canvas_rect);
+    assert_eq!(*opacity, canvas_opacity);
+    assert_eq!((gpui_image.width, gpui_image.height), (width, height));
+    let Prim::Image { image: source, .. } = &image.prims[0] else {
+        panic!("colored image fixture starts with the image");
+    };
+    assert_eq!(gpui_image.pixels, source.pixels);
+
+    let gradients = fixtures::gradients(1.0);
+    let background = &gradients.prims[..1];
+    let canvas = canvas_rects(background, &[]);
+    let (plan, _) = gpui_plan(background, &[]);
+    let SceneOp::Quad { rect, fill, .. } = plan.ops[0] else {
+        panic!("background must become a gradient quad");
+    };
+    let (top_y, bottom_y, top, bottom) = canvas.gradient_extents[0];
+    assert_eq!((rect.y, rect.y + rect.h), (top_y, bottom_y));
+    assert_eq!(fill, Paint::VGradient { top, bottom });
+}
+
+#[test]
+fn native_golden_scene_reaches_canvas_and_gpui_with_no_dropped_primitives() {
+    let scene = aeris_charts_native::scene::demo_scene();
+    let canvas = canvas_rects(&scene.prims, &scene.points);
+    let (plan, metrics) = gpui_plan(&scene.prims, &scene.points);
+    assert_eq!(metrics.dropped_prims, 0);
+    assert!(!canvas.rects.is_empty() && !canvas.gradient_extents.is_empty());
+    assert!(canvas.path_fills > 0 && canvas.path_strokes > 0);
+    assert_eq!(canvas.images.len(), 1);
+    assert_eq!(canvas.text_runs.len(), 1);
+    assert!(plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, SceneOp::Image { .. })));
+    assert!(plan.ops.iter().any(|op| matches!(op, SceneOp::Text(_))));
+    assert!(plan.ops.iter().any(|op| matches!(op, SceneOp::Mesh { .. })));
+}
+
+#[test]
 fn text_runs_reach_both_backends_with_the_same_font_and_anchor() {
     let prims = [Prim::Text {
         x: 100.5,
@@ -694,13 +928,15 @@ fn text_runs_reach_both_backends_with_the_same_font_and_anchor() {
     assert_eq!(canvas.text_runs.len(), 1);
     assert_eq!(metrics.text_runs, 1);
 
-    let (text, x, y, font) = &canvas.text_runs[0];
+    let (text, x, y, font, color, align) = &canvas.text_runs[0];
     let SceneOp::Text(run) = &plan.ops[0] else {
         panic!("expected a text op");
     };
     assert_eq!(run.text, *text);
     assert_eq!(run.x, *x);
     assert_eq!(run.y, *y);
+    assert_eq!(run.color, *color);
+    assert_eq!(run.align, *align);
     // The GPUI adapter derives the same CSS shorthand Canvas2D is given.
     assert_eq!(
         aeris_charts_render::draw_list::text_font_spec(
@@ -736,6 +972,8 @@ fn rotated_text_reaches_canvas_and_gpui_with_the_same_transform() {
         panic!("expected a text op");
     };
     assert_eq!((run.x, run.y, run.angle), (100.5, 30.0, -0.625));
+    assert_eq!(run.color, canvas.text_runs[0].4);
+    assert_eq!(run.align, canvas.text_runs[0].5);
 }
 
 /// A real multi-series, multi-pane engine frame — not a synthetic prim list.
@@ -2090,7 +2328,7 @@ fn measure_tools_reach_canvas_and_gpui_with_identical_quads_strokes_and_text() {
         let canvas_text = canvas
             .text_runs
             .iter()
-            .map(|(text, x, y, _)| (text.clone(), *x, *y))
+            .map(|(text, x, y, ..)| (text.clone(), *x, *y))
             .collect::<Vec<_>>();
         assert_eq!(
             gpui_text, canvas_text,

@@ -680,6 +680,7 @@ test("tooltip presents themed OHLC market data with explicit volume", async ({ p
       x: bounds.left + pane.left + chart.time_scale().logical_to_coordinate(logical),
       y: bounds.top + pane.top + pane.height * 0.5,
       expected: {
+        time: chart.format_time_label(price.time),
         close: window.__main.price_formatter()(price.close),
         open: window.__main.price_formatter()(price.open),
         high: window.__main.price_formatter()(price.high),
@@ -710,7 +711,7 @@ test("tooltip presents themed OHLC market data with explicit volume", async ({ p
       return { left: rect.left, top: rect.top, offset: rect.top - pane_top, dpr: window.devicePixelRatio };
     })(),
   }));
-  expect(content.timestamp).toMatch(/\w{3} \d{1,2}.*\d{1,2}:\d{2}/);
+  expect(content.timestamp).toBe(target.expected.time);
   expect(content.title).toBe("AAPL");
   expect(content.rows).toEqual([
     { label: "Close", value: target.expected.close },
@@ -743,6 +744,40 @@ test("tooltip presents themed OHLC market data with explicit volume", async ({ p
   expect(after.equals(before)).toBe(false);
   await page.evaluate(() => window.__official_tooltip.detach());
   await expect(page.locator(".aeris_charts-tooltip")).toHaveCount(0);
+});
+
+test("tooltip and accessibility dates follow the chart time zone and date format", async ({ page }) => {
+  await open_chart(page);
+  const target = await page.evaluate(async () => {
+    const api = await import("/dist/aeris_charts_financial.js");
+    const chart = window.__chart;
+    const start = Date.UTC(2026, 0, 1, 0, 30) / 1000;
+    const bars = [0, 1, 2].map((index) => ({
+      time: start + index * 1800,
+      open: 100 + index, high: 103 + index, low: 99 + index, close: 102 + index,
+    }));
+    window.__main.set_data(bars);
+    chart.apply_options({ localization: { date_format: "yyyy-MM-dd" } });
+    chart.wasm.set_time_zone("America/New_York");
+    chart.time_scale().fit_content();
+    window.__zoned_tooltip = api.create_tooltip(chart, { series: window.__main });
+    const accessibility = api.enable_accessibility(chart, { data_scope: "all" });
+    accessibility.focus(0);
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    const bounds = chart.chart_element().getBoundingClientRect();
+    const pane = chart.panes()[0].get_geometry();
+    return {
+      x: bounds.left + pane.left + chart.time_scale().time_to_coordinate(bars[1].time),
+      y: bounds.top + pane.top + pane.height / 2,
+      summary: chart.chart_element().querySelector(".aeris_charts-a11y-live-region")?.textContent ?? "",
+    };
+  });
+  await page.mouse.move(target.x, target.y);
+  await expect.poll(() => page.locator(".aeris_charts-tooltip").evaluate((element) => element.style.opacity)).toBe("1");
+  const timestamp = await page.locator(".aeris_charts-tooltip__timestamp").textContent();
+  expect(timestamp).toContain("2025-12-31");
+  expect(target.summary).toContain("2025-12-31");
 });
 
 test("tooltip preserves OHLC inspection on area and line presentations", async ({ page }) => {

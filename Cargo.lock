@@ -171,6 +171,7 @@ dependencies = [
  "aeris_charts_engine",
  "aeris_charts_native",
  "aeris_charts_render",
+ "aeris_charts_render_wgpu",
  "gpui-pre",
  "gpui-pre-platform",
  "image",
@@ -187,6 +188,7 @@ name = "aeris_charts_render_wgpu"
 version = "0.3.0"
 dependencies = [
  "aeris_charts_engine",
+ "aeris_charts_native",
  "aeris_charts_render",
  "bytemuck",
  "wgpu 30.0.1",

@@ -63,13 +63,15 @@ gpui = { package = "gpui-pre", version = "=0.3.7", default-features = false, fea
     "test-support",
 ] }
 aeris_charts_native = { path = "../aeris_charts_native" }
+aeris_charts_render_wgpu = { path = "../aeris_charts_render_wgpu" }
 serde_json = "1"
 sha2 = "0.11"
 tiny-skia = "0.12"
 
 # The Linux window capture (`examples/support/x11_capture.rs`) reads GPUI's own X11 window: the id
-# comes from GPUI's raw-window-handle support and the pixels from the X server. Both crates are
-# already in GPUI's Linux dependency graph (same versions), so this adds dependency edges only.
+# comes from GPUI's raw-window-handle support and the pixels from the X server. `raw-window-handle`
+# is already in GPUI's Linux dependency graph; `x11rb` is a second copy (GPUI's Linux platform uses
+# 0.13), which only these examples link.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 raw-window-handle = "0.6"
 x11rb = { version = "0.14", default-features = false }

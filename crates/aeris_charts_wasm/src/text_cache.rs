@@ -174,12 +174,6 @@ pub fn left_edge(x: f32, align: TextAlign, width: f32) -> f32 {
     }
 }
 
-/// Convert bitmap-space browser ink metrics to the logical correction consumed by the shared
-/// axis primitive builder. The builder applies DPR exactly once when it encodes the text prim.
-pub fn logical_midpoint_correction(ascent: f64, descent: f64, dpr: f64) -> f64 {
-    (ascent - descent) / (2.0 * dpr)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,12 +233,6 @@ mod tests {
         // New inserts bind to the new epoch.
         cache.insert(key("hello", 0), run(5), 1);
         assert_eq!(cache.get(&key("hello", 0), 1), Some(run(5)));
-    }
-
-    #[test]
-    fn bitmap_metrics_are_normalized_before_axis_placement() {
-        assert_eq!(logical_midpoint_correction(11.0, 3.0, 1.25), 3.2);
-        assert_eq!(logical_midpoint_correction(18.0, 6.0, 2.0), 3.0);
     }
 
     #[test]

@@ -87,12 +87,14 @@ test("custom series paints identically on both backends with the plugin active",
   // Shared axis text uses identical geometry and bounded backend-specific AA at fractional DPR.
   const backend_diff = count_different(gpu_active, canvas_active);
   const backend_max_delta = max_channel_delta(gpu_active, canvas_active);
-  if (backend_diff > 5_000 || backend_max_delta > 64) {
+  console.log(`custom-series full-frame residual: ${backend_diff} px, max delta ${backend_max_delta}`);
+  if (backend_diff > 2_700 || backend_max_delta > 48) {
     await test_info.attach("webgpu.png", { body: PNG.sync.write(gpu_active), contentType: "image/png" });
     await test_info.attach("canvas2d.png", { body: PNG.sync.write(canvas_active), contentType: "image/png" });
   }
-  expect(backend_diff, "full-frame differences must stay confined to bounded AA edges").toBeLessThanOrEqual(5_000);
-  expect(backend_max_delta).toBeLessThanOrEqual(64);
+  // Windows SwiftShader measurement: 2,387 pixels, max delta 40.
+  expect(backend_diff, "full-frame differences must stay confined to bounded AA edges").toBeLessThanOrEqual(2_700);
+  expect(backend_max_delta).toBeLessThanOrEqual(48);
 });
 
 // (b) Autoscale: the custom series' `price_value_builder` values drive its price scale through
@@ -278,9 +280,8 @@ test("remove_series cleans the custom series up (destroy fires) and re-adding wo
 
 // (f) The second decoder call site. A custom series' `render(ctx)` records the same `polyline`
 // commands as a pane primitive, and its decoded prims splice into the pane's `main` layer. The
-// WebGPU stroker has no dash concept and ignores `Polyline.style`, so the decoder lowers dashed
-// and dotted polylines to solid dash runs clipped to the owning pane on this path too; without
-// that WebGPU paints them solid while Canvas2D dashes them. The plugin draws a horizontal dashed
+// decoder lowers dashed and dotted polylines to solid dash runs clipped to the owning pane on
+// this path too, so the dash count follows the visible length. The plugin draws a horizontal dashed
 // polyline, a dotted diagonal that starts left of the pane and leaves past its right edge (clip
 // and phase), and a solid control.
 test("custom series dashed polylines paint identical dashes on WebGPU and Canvas2D", async ({ page }, test_info) => {

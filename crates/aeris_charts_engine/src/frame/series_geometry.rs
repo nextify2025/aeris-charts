@@ -1924,10 +1924,54 @@ impl ChartEngine {
         const ANCHOR_RADIUS: f64 = 3.0;
         const ANCHOR_BORDER_WIDTH: f64 = 1.0;
         const ANCHOR_BORDER: Color = PRIMARY;
+        let pane = &self.panes[pane_index];
+        let anchor_fill = || {
+            let fallback = aeris_charts_core::style::DEFAULT_SURFACE_RGB;
+            let background = css_color(
+                &self.options.get().layout.background.color,
+                Color::rgb(fallback.0, fallback.1, fallback.2),
+            );
+            if background.luminance() > 160.0 {
+                Color::rgb(0xff, 0xff, 0xff)
+            } else {
+                Color::rgb(0, 0, 0)
+            }
+        };
+        let push_anchor = |out: &mut Vec<Prim>, cx: f32, cy: f32, fill: Color| {
+            // The crosshair-marks disc idiom: the border is a larger filled disc underneath.
+            out.push(Prim::Circle {
+                cx,
+                cy,
+                radius: ((ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr) as f32,
+                fill: ANCHOR_BORDER,
+                stroke_width: 0.0,
+                stroke: ANCHOR_BORDER,
+            });
+            out.push(Prim::Circle {
+                cx,
+                cy,
+                radius: (ANCHOR_RADIUS * vpr) as f32,
+                fill,
+                stroke_width: 0.0,
+                stroke: fill,
+            });
+        };
+        let profile_points = self.volume_profile_selection_anchor_points(pane_index);
+        if !profile_points.is_empty() {
+            let fill = anchor_fill();
+            for (x, y) in profile_points {
+                if x.is_finite()
+                    && y.is_finite()
+                    && (0.0..=self.pane_w).contains(&x)
+                    && (pane.top..=pane.top + pane.height).contains(&y)
+                {
+                    push_anchor(out, (x * hpr) as f32, (y * vpr) as f32, fill);
+                }
+            }
+        }
         let Some(selection) = self.selection.as_ref() else {
             return;
         };
-        let pane = &self.panes[pane_index];
         for series in &self.series {
             let Some(member) = selection
                 .members
@@ -1947,16 +1991,7 @@ impl ChartEngine {
                 continue;
             };
             let plot = self.data.plot(series.id);
-            let fallback = aeris_charts_core::style::DEFAULT_SURFACE_RGB;
-            let background = css_color(
-                &self.options.get().layout.background.color,
-                Color::rgb(fallback.0, fallback.1, fallback.2),
-            );
-            let fill = if background.luminance() > 160.0 {
-                Color::rgb(0xff, 0xff, 0xff)
-            } else {
-                Color::rgb(0, 0, 0)
-            };
+            let fill = anchor_fill();
             let Some((times, _)) = self.data.series_data(series.id) else {
                 continue;
             };
@@ -1993,23 +2028,7 @@ impl ChartEngine {
                 {
                     continue;
                 }
-                // The crosshair-marks disc idiom: the border is a larger filled disc underneath.
-                out.push(Prim::Circle {
-                    cx,
-                    cy,
-                    radius: ((ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr) as f32,
-                    fill: ANCHOR_BORDER,
-                    stroke_width: 0.0,
-                    stroke: ANCHOR_BORDER,
-                });
-                out.push(Prim::Circle {
-                    cx,
-                    cy,
-                    radius: (ANCHOR_RADIUS * vpr) as f32,
-                    fill,
-                    stroke_width: 0.0,
-                    stroke: fill,
-                });
+                push_anchor(out, cx, cy, fill);
             }
         }
     }

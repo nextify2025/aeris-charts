@@ -197,6 +197,10 @@ fn a_context_menu_commits_the_open_text_edit() {
     let original = chart.drawing(id).unwrap().text.clone();
     chart.set_selected_drawing(Some(id));
     assert!(chart.input_key_down(ChartKey::EditText, InputModifiers::default(), false, 0.0));
+    assert_eq!(
+        chart.take_input_events(),
+        vec![ChartInputEvent::TextEditorOpened(id)]
+    );
     assert!(chart.drawing_text_edit_insert("note"));
 
     chart.input_context_menu(body.0, body.1);
@@ -283,4 +287,120 @@ fn leaving_from_a_pane_separator_clears_its_highlight() {
     chart.input_pointer_leave();
     assert_eq!(chart.separator_hover(), None);
     assert_eq!(chart.input_cursor(), ChartCursor::Crosshair);
+}
+
+/// A finger has no hover: it pans the chart, and the crosshair appears only once a long press
+/// starts tracking (the reference's `touchStartEvent` and `touchMoveEvent` against its
+/// `longTapEvent`).
+#[test]
+fn a_finger_shows_the_crosshair_only_once_a_long_press_starts_tracking() {
+    let mut chart = chart();
+    let (x, y) = empty_pane_point(&chart);
+    let touch = |x, timestamp_ms| PointerInput {
+        device: InputDevice::Touch,
+        timestamp_ms,
+        ..at(x, y)
+    };
+
+    chart.input_pointer_down(touch(x, 100.0), 1);
+    assert_eq!(chart.crosshair, None, "a touch-down shows no crosshair");
+    assert!(!chart.input_tick(339.0));
+    assert_eq!(chart.crosshair, None);
+    assert!(chart.input_tick(340.0));
+    assert_eq!(
+        chart.crosshair,
+        Some((x, y)),
+        "the long press starts tracking"
+    );
+    chart.input_pointer_up(touch(x, 350.0));
+    // The next tap ends tracking.
+    chart.input_pointer_down(touch(x, 400.0), 1);
+    chart.input_pointer_up(touch(x, 410.0));
+    assert_eq!(chart.crosshair, None);
+
+    // A finger drag pans and never carries a crosshair along.
+    let scroll = chart.scroll_position();
+    chart.input_pointer_down(touch(x, 1_000.0), 1);
+    for step in 1..=4 {
+        let step = f64::from(step);
+        chart.input_pointer_move(touch(x + 20.0 * step, 1_000.0 + 10.0 * step), true);
+        assert_eq!(chart.crosshair, None, "step {step}");
+    }
+    chart.input_pointer_up(touch(x + 80.0, 1_050.0));
+    assert_ne!(chart.scroll_position(), scroll);
+    assert_eq!(chart.crosshair, None);
+}
+
+/// A finger dragging a drawing shows the crosshair at the drop point, as a mouse drag does; the
+/// touch-down that starts the drag shows none, and the lift clears it.
+#[test]
+fn a_finger_dragging_a_drawing_shows_the_crosshair_at_the_drop_point() {
+    let mut chart = chart();
+    let (id, body) = trend_line_body(&mut chart);
+    chart.set_selected_drawing(Some(id));
+    let touch = |x: f64, timestamp_ms| PointerInput {
+        device: InputDevice::Touch,
+        timestamp_ms,
+        ..at(x, body.1)
+    };
+    let before = chart.drawing(id).unwrap().points.clone();
+
+    chart.input_pointer_down(touch(body.0, 100.0), 1);
+    assert_eq!(chart.crosshair, None, "the touch-down shows no crosshair");
+    for step in 1..=4 {
+        let x = body.0 + 10.0 * f64::from(step);
+        chart.input_pointer_move(touch(x, 100.0 + 10.0 * f64::from(step)), true);
+        assert_eq!(chart.crosshair, Some((x, body.1)), "step {step}");
+    }
+    chart.input_pointer_up(touch(body.0 + 40.0, 150.0));
+    assert_ne!(
+        chart.drawing(id).unwrap().points,
+        before,
+        "the drawing moved"
+    );
+    assert_eq!(chart.crosshair, None, "the lift clears the crosshair");
+}
+
+/// A double tap tolerates a finger's wobble: its taps may land up to 30 px apart (the
+/// reference's `DoubleTapManhattanDistance`), while a double-click keeps the mouse's 5 px.
+#[test]
+fn a_double_tap_tolerates_a_finger_wobble_that_a_double_click_does_not() {
+    for (device, apart, doubled) in [
+        (InputDevice::Touch, 10.0, true),
+        (InputDevice::Touch, 30.0, false),
+        (InputDevice::Mouse, 4.0, true),
+        (InputDevice::Mouse, 10.0, false),
+    ] {
+        let mut chart = chart();
+        let (x, y) = (40..chart.pane_w as i32 - 40)
+            .step_by(7)
+            .flat_map(|x| (20..chart.pane_h as i32).step_by(13).map(move |y| (x, y)))
+            .map(|(x, y)| (f64::from(x), f64::from(y)))
+            .find(|&(x, y)| {
+                [x, x + apart].iter().all(|&x| {
+                    chart.hit_test_series(x, y).is_none()
+                        && chart.region_at(x, y) == ChartRegion::Pane
+                })
+            })
+            .expect("the pane has empty space");
+        let sample = |x, timestamp_ms| PointerInput {
+            device,
+            timestamp_ms,
+            ..at(x, y)
+        };
+        chart.input_pointer_down(sample(x, 100.0), 1);
+        chart.input_pointer_up(sample(x, 110.0));
+        chart.input_pointer_down(sample(x + apart, 200.0), 1);
+        chart.input_pointer_up(sample(x + apart, 210.0));
+        let second = if doubled {
+            ChartInputEvent::DoubleClick { x: x + apart, y }
+        } else {
+            ChartInputEvent::Click { x: x + apart, y }
+        };
+        assert_eq!(
+            chart.take_input_events(),
+            vec![ChartInputEvent::Click { x, y }, second],
+            "{device:?} taps {apart} px apart"
+        );
+    }
 }

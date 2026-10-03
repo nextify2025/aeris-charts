@@ -83,8 +83,8 @@ impl TextRunStore {
     }
 
     /// Resolve one prim to its atlas quad, rasterizing on a cache miss. `None` for non-text
-    /// prims, empty/inkless runs, measurement failures, and runs larger than the atlas — the
-    /// prim then collapses out of the frame without splitting the surrounding draw runs.
+    /// prims, empty/inkless runs, measurement failures, and runs larger than the atlas. The
+    /// render owner switches the whole frame to Canvas2D when a non-empty text run fails.
     pub(super) fn resolve(
         &mut self,
         atlas: &mut LabelAtlas,
@@ -183,13 +183,6 @@ impl TextRunStore {
     ) -> Option<CachedRun> {
         let placement = place_run(x, y, bbox)?;
         if placement.w > ATLAS_SIZE || placement.h > ATLAS_SIZE {
-            web_sys::console::warn_1(
-                &format!(
-                    "aeris_charts: text run {:?} is {}x{} — larger than the label atlas; skipped",
-                    key.text, placement.w, placement.h
-                )
-                .into(),
-            );
             return None;
         }
         // Resizing resets all context state — re-establish the exact draw state.

@@ -14,7 +14,8 @@
 
 use crate::color::Color;
 use crate::draw_list::{
-    segment_points, text_font_spec, IRect, LineStyle, LineType, Prim, RasterImage, TextAlign,
+    positive_finite_extent, segment_points, text_font_spec, IRect, LineStyle, LineType, Prim,
+    RasterImage, TextAlign,
 };
 use crate::line::{expand_band, expand_line, LinePoint};
 
@@ -268,7 +269,7 @@ pub fn execute(
                 color,
             } => {
                 let pts = pool_slice(points, *first_point, *point_count);
-                if pts.len() < 2 {
+                if pts.len() < 2 || !positive_finite_extent(*width) {
                     continue;
                 }
                 target.set_stroke(*color);
@@ -357,11 +358,14 @@ pub fn execute(
                 stroke_width,
                 stroke,
             } => {
+                if !positive_finite_extent(*radius) {
+                    continue;
+                }
                 target.set_fill_solid(*fill);
                 target.begin_path();
                 target.arc(*cx, *cy, *radius, 0.0, std::f32::consts::TAU);
                 target.fill();
-                if *stroke_width > 0.0 {
+                if positive_finite_extent(*stroke_width) {
                     target.set_stroke(*stroke);
                     target.set_line_width(*stroke_width);
                     target.stroke();
@@ -393,6 +397,7 @@ pub fn execute(
                 // the fill covers only the inner rect and the stroke is centred half a border
                 // inside the edge. A stroke centred on the edge would spill half outside the
                 // shape and, on whole-pixel geometry, smear a hairline across two pixel rows.
+                let radii = crate::line::normalized_round_rect_radii(*w, *h, *radii);
                 let inset = border_width.max(0.0).min(*w / 2.0).min(*h / 2.0);
                 let inner = |by: f32| radii.map(|r| (r - by).max(0.0));
                 round_rect_path(
@@ -477,13 +482,10 @@ pub fn execute(
                 rect,
                 opacity,
             } => {
-                if image.width > 0
-                    && image.height > 0
-                    && rect[2] > 0.0
-                    && rect[3] > 0.0
-                    && *opacity > 0.0
-                {
-                    target.draw_raster_image(image, *rect, opacity.clamp(0.0, 1.0));
+                if image.width > 0 && image.height > 0 && *opacity > 0.0 {
+                    if let Some(rect) = crate::draw_list::snap_image_rect(*rect) {
+                        target.draw_raster_image(image, rect, opacity.clamp(0.0, 1.0));
+                    }
                 }
             }
         }
@@ -513,7 +515,7 @@ fn area_extent(pts: &[LinePoint], base_y: f32) -> (f32, f32, f32, f32) {
 /// Build a rounded-rect path (left-top, right-top, right-bottom, left-bottom radii).
 fn round_rect_path(target: &mut impl Canvas2d, x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) {
     use std::f32::consts::PI;
-    let [lt, rt, rb, lb] = radii;
+    let [lt, rt, rb, lb] = crate::line::normalized_round_rect_radii(w, h, radii);
     target.begin_path();
     target.move_to(x + lt, y);
     target.line_to(x + w - rt, y);
@@ -531,6 +533,32 @@ fn round_rect_path(target: &mut impl Canvas2d, x: f32, y: f32, w: f32, h: f32, r
 mod tests {
     use super::*;
     use crate::draw_list::Gradient;
+
+    #[test]
+    fn oversized_round_rect_radii_match_the_shared_polygon() {
+        let radii = [30.0, 30.0, 5.0, 5.0];
+        let mut target = Recorder::default();
+        round_rect_path(&mut target, 0.0, 0.0, 40.0, 20.0, radii);
+        let top_left = 30.0 * 4.0 / 7.0;
+        let lower_left = 5.0 * 4.0 / 7.0;
+        let polygon = crate::line::round_rect_polygon(0.0, 0.0, 40.0, 20.0, radii);
+        assert!((polygon[0][0] - top_left).abs() < 1e-4);
+        assert!((polygon[1][0] - (40.0 - top_left)).abs() < 1e-4);
+        let arc_radii: Vec<f32> = target
+            .ops
+            .iter()
+            .filter_map(|op| {
+                let words: Vec<&str> = op.split_whitespace().collect();
+                (words.first() == Some(&"arc")).then(|| words[3].parse().unwrap())
+            })
+            .collect();
+        for (actual, expected) in arc_radii
+            .into_iter()
+            .zip([top_left, lower_left, lower_left, top_left])
+        {
+            assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        }
+    }
 
     const C: Color = Color::rgb(0x10, 0x20, 0x30);
 
@@ -916,6 +944,45 @@ mod tests {
             &[],
         );
         assert_eq!(with_stroke.iter().filter(|o| *o == "stroke").count(), 1);
+    }
+
+    #[test]
+    fn degenerate_circles_and_polyline_widths_emit_no_canvas_commands() {
+        for radius in [-3.0, 0.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                run(
+                    &[Prim::Circle {
+                        cx: 5.0,
+                        cy: 6.0,
+                        radius,
+                        fill: C,
+                        stroke_width: 2.0,
+                        stroke: C,
+                    }],
+                    &[]
+                )
+                .is_empty(),
+                "radius {radius}"
+            );
+        }
+        let points = [[0.0, 0.0], [10.0, 10.0]];
+        for width in [-2.0, 0.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                run(
+                    &[Prim::Polyline {
+                        first_point: 0,
+                        point_count: 2,
+                        width,
+                        style: LineStyle::Solid,
+                        line_type: LineType::Simple,
+                        color: C,
+                    }],
+                    &points
+                )
+                .is_empty(),
+                "width {width}"
+            );
+        }
     }
 
     #[test]

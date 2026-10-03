@@ -376,18 +376,42 @@ impl RasterImageCache {
         source: &aeris_charts_render::draw_list::RasterImage,
         opacity: f32,
     ) -> Option<Arc<RenderImage>> {
+        let expected_len = usize::try_from(source.width)
+            .ok()?
+            .checked_mul(usize::try_from(source.height).ok()?)?
+            .checked_mul(4)?;
+        if source.width == 0 || source.height == 0 || source.pixels.len() != expected_len {
+            return None;
+        }
         self.tick = self.tick.wrapping_add(1);
         let key = (source.key, opacity.to_bits());
         if let Some((image, stamp)) = self.entries.get_mut(&key) {
             *stamp = self.tick;
             return Some(Arc::clone(image));
         }
-        let mut pixels = source.pixels.to_vec();
-        let (rgba_pixels, _) = pixels.as_chunks_mut::<4>();
-        for rgba in rgba_pixels {
-            rgba[3] = (f32::from(rgba[3]) * opacity.clamp(0.0, 1.0)).round() as u8;
+        let padded_width = source.width.checked_add(2)?;
+        let padded_height = source.height.checked_add(2)?;
+        let row_bytes = (padded_width as usize).checked_mul(4)?;
+        let mut pixels = vec![0; row_bytes.checked_mul(padded_height as usize)?];
+        for y in 0..source.height as usize {
+            for x in 0..source.width as usize {
+                let src = (y * source.width as usize + x) * 4;
+                let dst = ((y + 1) * padded_width as usize + x + 1) * 4;
+                pixels[dst] = source.pixels[src + 2];
+                pixels[dst + 1] = source.pixels[src + 1];
+                pixels[dst + 2] = source.pixels[src];
+                pixels[dst + 3] =
+                    (f32::from(source.pixels[src + 3]) * opacity.clamp(0.0, 1.0)).round() as u8;
+            }
+            let row = (y + 1) * row_bytes;
+            pixels.copy_within(row + 4..row + 8, row);
+            let last = row + source.width as usize * 4;
+            pixels.copy_within(last..last + 4, last + 4);
         }
-        let buffer = RgbaImage::from_raw(source.width, source.height, pixels)?;
+        pixels.copy_within(row_bytes..row_bytes * 2, 0);
+        let last_row = source.height as usize * row_bytes;
+        pixels.copy_within(last_row..last_row + row_bytes, last_row + row_bytes);
+        let buffer = RgbaImage::from_raw(padded_width, padded_height, pixels)?;
         let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
         if self.entries.len() == 16 {
             if let Some(oldest) = self
@@ -401,6 +425,22 @@ impl RasterImageCache {
         }
         self.entries.insert(key, (Arc::clone(&image), self.tick));
         Some(image)
+    }
+}
+
+/// Position the padded GPUI sprite so the visible destination maps only to its inner pixels.
+fn padded_image_bounds(bounds: Bounds<Pixels>, width: u32, height: u32) -> Bounds<Pixels> {
+    let pixel_width = f32::from(bounds.size.width) / width as f32;
+    let pixel_height = f32::from(bounds.size.height) / height as f32;
+    Bounds {
+        origin: point(
+            bounds.origin.x - px(pixel_width),
+            bounds.origin.y - px(pixel_height),
+        ),
+        size: size(
+            bounds.size.width + px(pixel_width * 2.0),
+            bounds.size.height + px(pixel_height * 2.0),
+        ),
     }
 }
 
@@ -662,9 +702,10 @@ fn paint_range(
             } => {
                 if let Some(data) = images.resolve(image, *opacity) {
                     let bounds = transform.bounds(*rect);
+                    let image_bounds = padded_image_bounds(bounds, image.width, image.height);
                     match window.paint_image(
                         bounds,
-                        bounds,
+                        image_bounds,
                         gpui::Corners::default(),
                         data,
                         0,
@@ -704,6 +745,63 @@ fn rotated_text_sprite_bounds(
     Bounds {
         origin: point(px(left - pad), px(top - pad)),
         size: size(px(width + 2.0 * pad), px(height + 2.0 * pad)),
+    }
+}
+
+/// The `ShapedLine::paint` offset that puts a run's baseline on the shared Canvas2D contract,
+/// in logical px. Painting with `line_height = ascent - descent` places the baseline at exactly
+/// `offset.y + ascent` (see [`paint_text`]).
+fn text_paint_offset(
+    run: &TextRun,
+    transform: Transform,
+    width: f32,
+    ascent: f32,
+    descent: f32,
+) -> gpui::Point<Pixels> {
+    let anchor_x: f32 = transform.x(run.x).into();
+    let anchor_y: f32 = transform.y(run.y).into();
+    let left = text::aligned_left(anchor_x, width, run.align);
+    let baseline = text::middle_baseline(anchor_y, ascent, descent);
+    point(px(left), px(baseline - ascent))
+}
+
+/// Unrotated layout of a rotated run's SVG sprite, in logical px.
+struct RotatedTextSprite {
+    bounds: Bounds<Pixels>,
+    /// Sprite viewport size, including the ink margin on every side.
+    width: f32,
+    height: f32,
+    /// The SVG `<text>` anchor (left edge, baseline) inside the sprite.
+    text_x: f32,
+    text_y: f32,
+}
+
+/// The sprite reuses the plain-text paint offset, so at zero degrees its glyph anchor is the
+/// one [`paint_text`] uses for the same run and metrics.
+fn rotated_text_sprite(
+    run: &TextRun,
+    transform: Transform,
+    width: f32,
+    ascent: f32,
+    descent: f32,
+) -> RotatedTextSprite {
+    let width = width.max(1.0);
+    let offset = text_paint_offset(run, transform, width, ascent, descent);
+    let height = (ascent - descent).max(f32::from(transform.len(run.size)));
+    // Use a whole device-pixel margin so GPUI's bounds snapping does not shift the glyphs.
+    let pad = run.size.ceil().max(1.0) * transform.inv_scale;
+    RotatedTextSprite {
+        bounds: rotated_text_sprite_bounds(
+            f32::from(offset.x),
+            f32::from(offset.y),
+            width,
+            height,
+            pad,
+        ),
+        width: width + 2.0 * pad,
+        height: height + 2.0 * pad,
+        text_x: pad,
+        text_y: pad + ascent,
     }
 }
 
@@ -757,24 +855,30 @@ fn paint_rotated_text(
         descent: cached.descent * logical_to_device,
     });
 
-    let width = f32::from(cached.line.width).max(1.0);
     let font_size_value = f32::from(font_size);
-    let height = (cached.ascent + cached.descent).max(font_size_value);
     let anchor_x = f32::from(transform.x(run.x));
     let anchor_y = f32::from(transform.y(run.y));
-    let left = text::aligned_left(anchor_x, width, run.align);
-    let top = anchor_y - height / 2.0;
-    // Use a whole device-pixel margin so GPUI's bounds snapping does not shift the glyphs.
-    let pad = run.size.ceil().max(1.0) * transform.inv_scale;
-    let bounds = rotated_text_sprite_bounds(left, top, width, height, pad);
-    let sprite_width = width + 2.0 * pad;
-    let sprite_height = height + 2.0 * pad;
+    let RotatedTextSprite {
+        bounds,
+        width: sprite_width,
+        height: sprite_height,
+        text_x,
+        text_y,
+    } = rotated_text_sprite(
+        run,
+        transform,
+        f32::from(cached.line.width),
+        cached.ascent,
+        cached.descent,
+    );
+    // SVG resolves the requested CSS family independently of GPUI's font resolver. A missing
+    // family can therefore fall back to a different face; the shared baseline still uses GPUI's
+    // measured metrics, but glyph shapes/advances are only guaranteed when both resolve that face.
     let family = escape_svg_text(&run.family);
     let value = escape_svg_text(&run.text);
     let style = if run.italic { "italic" } else { "normal" };
     let svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{sprite_width}" height="{sprite_height}" viewBox="0 0 {sprite_width} {sprite_height}"><text x="{pad}" y="{baseline}" font-family="{family}" font-size="{font_size_value}" font-weight="{weight}" font-style="{style}" fill="white">{value}</text></svg>"#,
-        baseline = pad + cached.ascent,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{sprite_width}" height="{sprite_height}" viewBox="0 0 {sprite_width} {sprite_height}"><text x="{text_x}" y="{text_y}" font-family="{family}" font-size="{font_size_value}" font-weight="{weight}" font-style="{style}" fill="white">{value}</text></svg>"#,
         weight = run.weight,
     );
     let scale_factor = 1.0 / transform.inv_scale;
@@ -999,13 +1103,14 @@ fn paint_text(
     text_cache.measure_with(TextKey::for_run(run), || measured);
 
     // Placement in logical px, from the cached GPUI metrics.
-    let width: f32 = cached.line.width.into();
-    let anchor_x: f32 = transform.x(run.x).into();
-    let anchor_y: f32 = transform.y(run.y).into();
-    let left = text::aligned_left(anchor_x, width, run.align);
-    let baseline = text::middle_baseline(anchor_y, cached.ascent, cached.descent);
+    let offset = text_paint_offset(
+        run,
+        transform,
+        cached.line.width.into(),
+        cached.ascent,
+        cached.descent,
+    );
     let line_height = px(cached.ascent - cached.descent);
-    let offset = point(px(left), px(baseline - cached.ascent));
 
     if cached
         .line
@@ -1022,6 +1127,80 @@ fn paint_text(
 mod tests {
     use super::*;
     use aeris_charts_render::draw_list::TextAlign;
+
+    #[test]
+    fn zero_degree_rotated_text_paints_its_glyph_origin_where_plain_text_does() {
+        // Logical-px GPUI metrics for one shaped run at a fractional window scale.
+        let (width, ascent, descent) = (47.6f32, 11.2f32, -2.9f32);
+        for scale in [1.0f32, 1.5, 2.0] {
+            let transform = Transform::new(AerisViewport::new(12.0, 34.0, 800.0, 600.0), scale);
+            for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+                let mut text_run = run("Inter");
+                text_run.x = 101.3;
+                text_run.y = 57.8;
+                text_run.size = 13.0;
+                text_run.text = "Trend 42".into();
+                text_run.align = align;
+                // `paint_text` puts the baseline at `offset.y + ascent`.
+                let offset = text_paint_offset(&text_run, transform, width, ascent, descent);
+                let (plain_left, plain_baseline) =
+                    (f32::from(offset.x), f32::from(offset.y) + ascent);
+                let sprite = rotated_text_sprite(&text_run, transform, width, ascent, descent);
+                let glyph_left = f32::from(sprite.bounds.origin.x) + sprite.text_x;
+                let glyph_baseline = f32::from(sprite.bounds.origin.y) + sprite.text_y;
+                // GPUI snaps both paint origins to device pixels; the computed placements must
+                // agree well inside that rounding.
+                let tolerance = 1e-3 / scale;
+                assert!(
+                    (glyph_left - plain_left).abs() < tolerance,
+                    "scale {scale} {align:?}: left {glyph_left} vs {plain_left}"
+                );
+                assert!(
+                    (glyph_baseline - plain_baseline).abs() < tolerance,
+                    "scale {scale} {align:?}: baseline {glyph_baseline} vs {plain_baseline}"
+                );
+                // The sprite keeps a whole-device-pixel ink margin on every side.
+                let pad_device = sprite.text_x * scale;
+                assert!((pad_device - pad_device.round()).abs() < 1e-4 && pad_device >= 1.0);
+                assert!(sprite.width > width && sprite.height > ascent - descent);
+            }
+        }
+    }
+
+    #[test]
+    fn raster_image_cache_passes_bgra_pixels_to_gpui() {
+        let source = aeris_charts_render::draw_list::RasterImage {
+            key: 1,
+            width: 2,
+            height: 1,
+            pixels: Arc::from([255, 0, 0, 255, 0, 0, 255, 128]),
+        };
+        let image = RasterImageCache::default()
+            .resolve(&source, 1.0)
+            .expect("valid image");
+        let expected_row = [
+            0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 128, 255, 0, 0, 128,
+        ];
+        let bytes = image.as_bytes(0).expect("GPUI image payload");
+        assert_eq!(bytes.len(), expected_row.len() * 3);
+        assert!(bytes
+            .chunks_exact(expected_row.len())
+            .all(|row| row == expected_row));
+        assert_eq!(source.pixels.as_ref(), &[255, 0, 0, 255, 0, 0, 255, 128]);
+    }
+
+    #[test]
+    fn padded_image_maps_its_inner_texels_to_the_visible_rect() {
+        let visible = Bounds {
+            origin: point(px(40.0), px(40.0)),
+            size: size(px(20.0), px(20.0)),
+        };
+        let bounds = padded_image_bounds(visible, 2, 2);
+        assert_eq!(f32::from(bounds.origin.x), 30.0);
+        assert_eq!(f32::from(bounds.origin.y), 30.0);
+        assert_eq!(f32::from(bounds.size.width), 40.0);
+        assert_eq!(f32::from(bounds.size.height), 40.0);
+    }
 
     fn run(family: &str) -> TextRun {
         TextRun {

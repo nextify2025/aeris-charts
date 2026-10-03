@@ -95,9 +95,8 @@ test("a one-finger horizontal swipe pans the time scale by exactly the dragged d
   expect(after.offset - before.offset).toBeCloseTo(100 / before.spacing, 6);
   expect(await page.evaluate(() => window.__touchmoves)).toEqual(Array(6).fill(true));
   expect(await page.evaluate(() => window.__clicks)).toBe(0);
-  const crosshair = await page.evaluate(() => window.__crosshair);
-  expect(crosshair.length).toBeGreaterThan(0);
-  expect(crosshair.at(-1), "a lifted pan finger leaves no crosshair").toBeNull();
+  // A finger has no hover: outside long-press tracking it pans and never shows a crosshair.
+  expect(await page.evaluate(() => window.__crosshair), "a panning finger moves no crosshair").toEqual([]);
 });
 
 test("touch direction arbitration leaves a gated swipe direction to the page", async ({ page }) => {

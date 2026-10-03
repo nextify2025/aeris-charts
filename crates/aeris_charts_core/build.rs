@@ -126,15 +126,21 @@ fn main() {
             );
         }
     }
-    // Crosshair chrome deliberately uses the dark-theme semantic roles in both chart modes. Keep
-    // these as generated aliases so every Rust backend and host stays attached to dark border and
-    // dark secondary-surface (`muted`) instead of maintaining duplicate color values.
+    // Crosshair chrome is theme-independent: the lines use the one `crosshair_line` token and the
+    // labels the dark-theme secondary surface (`muted`) in both chart modes. Keep these as
+    // generated aliases so every Rust backend and host stays attached to those tokens instead of
+    // maintaining duplicate color values.
+    emit_color(
+        &mut output,
+        "CROSSHAIR_LINE",
+        required_string(&tokens, &["crosshair_line"]),
+    );
     for prefix in ["LIGHT", "DARK"] {
         output.push_str(&format!(
-            "pub const {prefix}_CROSSHAIR_LINE_CSS: &str = DARK_BORDER_CSS;\n"
+            "pub const {prefix}_CROSSHAIR_LINE_CSS: &str = CROSSHAIR_LINE_CSS;\n"
         ));
         output.push_str(&format!(
-            "pub const {prefix}_CROSSHAIR_LINE_RGB: (u8, u8, u8) = DARK_BORDER_RGB;\n"
+            "pub const {prefix}_CROSSHAIR_LINE_RGB: (u8, u8, u8) = CROSSHAIR_LINE_RGB;\n"
         ));
         output.push_str(&format!(
             "pub const {prefix}_CROSSHAIR_LABEL_CSS: &str = DARK_MUTED_CSS;\n"

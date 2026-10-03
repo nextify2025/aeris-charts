@@ -145,7 +145,7 @@ export async function create_chart(
     // `handle_scroll`, `handle_scale`, `kinetic_scroll`, `tracking_mode`, backend selection/test
     // flags, and `layout.panes.enableResize` are package-level keys and are not forwarded to the
     // engine's options store (gestures/backend ownership live entirely in TS/WASM host code).
-    const { theme, initialPane, handle_scroll, handle_scale, kinetic_scroll, wheel_behavior, tracking_mode, localization, accessibility, ...rest } =
+    const { theme, initialPane, handle_scroll, handle_scale, kinetic_scroll, wheel_behavior, price_axis_wheel_zoom, tracking_mode, localization, accessibility, ...rest } =
       (options ?? {}) as deep_partial<chart_options> & {
         tracking_mode?: tracking_mode_options;
       };
@@ -194,6 +194,7 @@ export async function create_chart(
       chart.apply_exchange_time(exchange.zone, exchange.session_start, exchange.tick_marks, exchange.bar_time_label);
     }
     if (wheel_behavior !== undefined) chart.apply_options({ wheel_behavior });
+    if (price_axis_wheel_zoom !== undefined) chart.apply_options({ price_axis_wheel_zoom });
     if (panes_resize !== undefined) {
       chart.apply_panes_resize(panes_resize);
     }

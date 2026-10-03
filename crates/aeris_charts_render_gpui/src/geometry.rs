@@ -4,11 +4,9 @@
 //! - the integer-rect subset copies the exact expansion the wgpu quad executor and the Canvas2D
 //!   executor already agree on (`fillRectInnerBorder`, half-width line centering, dash phase);
 //! - the anti-aliased subset reuses `aeris_charts_render::line`'s shared curve expansion and area
-//!   tessellation, and extrudes strokes/discs/rings itself with a per-vertex Loop-Blinn coverage
-//!   encoding ([`edge_st`]): GPUI's path pass cannot rely on MSAA (its sample count can fall back
-//!   to 1x on Linux), so the same geometry the WebGPU backend's 4x MSAA target smooths carries its
-//!   own coverage fade here. Polyline transitions straddle their nominal edges and keep integrated
-//!   width exact; rings share that centered encoding, while filled discs retain their exterior encoding (see [`edge_st`]).
+//!   tessellation, and adds per-vertex signed-distance coverage to strokes and fill boundaries:
+//!   GPUI's path pass can fall back to 1x MSAA on Linux. Polyline, ring, and disc transitions
+//!   straddle their nominal edges; filled meshes fade outside their nominal boundary.
 //!
 //! Uses Aeris's coordinate, bar-width, and snapping calculations.
 
@@ -16,7 +14,8 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{segment_points, IRect, LineStyle, LineType};
 pub(crate) use aeris_charts_render::line::round_rect_polygon;
 use aeris_charts_render::line::{
-    build_area_fill, expand_line_into, stroke_aa, AreaMesh, LineParams, LinePoint, STROKE_AA_SOLID,
+    build_area_fill, expand_line_into, stroke_aa, AreaMesh, LineParams, LinePoint, RoundRectBorder,
+    STROKE_AA_SOLID,
 };
 
 use crate::scene::{DeviceRect, MeshVertex, Paint, SOLID_ST};
@@ -161,30 +160,87 @@ fn push_tri_st(
     ]);
 }
 
+/// Add a one-device-pixel coverage fringe outside a filled polygon. The solid triangles remain
+/// unchanged; only boundary edges get extra geometry, so interior seams cannot darken a fill.
+fn push_polygon_fringe(pool: &mut Vec<MeshVertex>, polygon: &[[f32; 2]]) {
+    let count = if polygon.len() > 1 && polygon.first() == polygon.last() {
+        polygon.len() - 1
+    } else {
+        polygon.len()
+    };
+    if count < 3 {
+        return;
+    }
+    let polygon = &polygon[..count];
+    let signed_area = polygon.iter().enumerate().fold(0.0, |sum, (index, p)| {
+        let next = polygon[(index + 1) % count];
+        sum + p[0] * next[1] - next[0] * p[1]
+    });
+    if signed_area.abs() < 1e-6 {
+        return;
+    }
+    let side = signed_area.signum();
+    let normal = |a: [f32; 2], b: [f32; 2]| {
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let length = dx.hypot(dy);
+        if length <= 1e-6 {
+            [0.0, 0.0]
+        } else {
+            [side * dy / length, -side * dx / length]
+        }
+    };
+    let offset = |index: usize| {
+        let previous = polygon[(index + count - 1) % count];
+        let current = polygon[index];
+        let next = polygon[(index + 1) % count];
+        let a = normal(previous, current);
+        let b = normal(current, next);
+        let sum = [a[0] + b[0], a[1] + b[1]];
+        let denominator = sum[0] * b[0] + sum[1] * b[1];
+        if denominator <= 1e-4 {
+            b
+        } else {
+            let scale = (FADE_PX / denominator).min(2.0);
+            [sum[0] * scale, sum[1] * scale]
+        }
+    };
+    for index in 0..count {
+        let p0 = polygon[index];
+        let p1 = polygon[(index + 1) % count];
+        if (p1[0] - p0[0]).hypot(p1[1] - p0[1]) <= 1e-6 {
+            continue;
+        }
+        let o0 = offset(index);
+        let o1 = offset((index + 1) % count);
+        let q0 = [p0[0] + o0[0], p0[1] + o0[1]];
+        let q1 = [p1[0] + o1[0], p1[1] + o1[1]];
+        let inner_st = stroke_distance_st(0.0);
+        let outer_st = stroke_distance_st(FADE_PX);
+        push_tri_st(pool, p0, inner_st, q0, outer_st, q1, outer_st);
+        push_tri_st(pool, p0, inner_st, q1, outer_st, p1, inner_st);
+    }
+}
+
+/// Keep the shared inside-ring triangles intact and fade both exposed boundaries. The fringes
+/// follow the shared outer and inner contours, which are the ring's own edge vertices.
+pub(crate) fn round_rect_ring_mesh(
+    pool: &mut Vec<MeshVertex>,
+    geometry: &RoundRectBorder,
+) -> (u32, u32) {
+    let first = pool.len() as u32;
+    push_vertices(pool, geometry.ring.iter().copied());
+    push_polygon_fringe(pool, &geometry.outer);
+    if !geometry.inner.is_empty() {
+        push_polygon_fringe(pool, &geometry.inner);
+    }
+    (first, pool.len() as u32 - first)
+}
+
 /// Coverage fade width in device px: the band outside every nominal edge whose alpha ramps
 /// linearly to zero, matching the 1 px ramp GPUI's path shader applies (`alpha = saturate(0.5 -
 /// distance)`).
 const FADE_PX: f32 = 1.0;
-
-/// `st` for a vertex at signed device-px distance `d` (positive outside) from the nearest
-/// exterior edge. GPUI's path shader computes coverage from `f = s² - t` and its screen-space
-/// gradient; choosing `s = d`, `t = d² - d` makes `f == d` at the vertex.
-///
-/// The encoding is only *exact* across a triangle when `t` interpolates linearly to the same
-/// value `s²` would have — i.e. when the triangle spans `d ∈ [0, 1]`, where `t ≡ 0` at both ends
-/// so `f = s²` is the exact quadratic and the shader's distance estimate `f / |∇f|` is `d / 2`,
-/// a perfect linear ramp over the band. A triangle spanning a wider `d` range interpolates `t`
-/// along the secant of the quadratic, collapsing the ramp toward a hard edge displaced outward —
-/// so wide geometry must be solid ([`crate::scene::SOLID_ST`]) out to the nominal edge and only
-/// the exterior 1 px band may carry this encoding.
-const fn edge_st(d: f32) -> [f32; 2] {
-    [d, d * d - d]
-}
-
-/// `st` at a nominal exterior edge: exact zero of the shader's coverage field.
-const FADE_IN_ST: [f32; 2] = edge_st(0.0);
-/// `st` one device px outside a nominal exterior edge: coverage reaches zero exactly here.
-const FADE_OUT_ST: [f32; 2] = edge_st(FADE_PX);
 
 /// Polyline coverage is centered on the nominal stroke edge. Keeping `s` constant is required by
 /// GPUI's Windows path shader: that backend takes any triangle with a varying `s` derivative down
@@ -218,6 +274,8 @@ pub struct Scratch {
     area: AreaMesh,
     /// `[f32; 2]` staging for polygons, discs, rings and band fills.
     verts: Vec<[f32; 2]>,
+    /// Exterior contour of a fill, reused for its coverage fringe.
+    contour: Vec<[f32; 2]>,
     /// Mesh ranges produced by a dashed polyline, read back by the executor.
     pub(crate) ranges: Vec<(u32, u32)>,
 }
@@ -231,7 +289,9 @@ impl Scratch {
             + self.band_lower.capacity() * std::mem::size_of::<LinePoint>()
             + self.area.vertices.capacity()
                 * std::mem::size_of::<aeris_charts_render::line::LineVertex>()
+            + self.area.crossings.capacity() * std::mem::size_of::<usize>()
             + self.verts.capacity() * std::mem::size_of::<[f32; 2]>()
+            + self.contour.capacity() * std::mem::size_of::<[f32; 2]>()
             + self.ranges.capacity() * std::mem::size_of::<(u32, u32)>()
     }
 }
@@ -371,6 +431,7 @@ pub(crate) fn area_fill_mesh(
     let Scratch {
         points: window,
         area,
+        contour,
         ..
     } = scratch;
     slice_into(window, points, first, count);
@@ -378,6 +439,7 @@ pub(crate) fn area_fill_mesh(
         return ((pool.len() as u32, 0), Paint::VGradient { top, bottom });
     }
     area.vertices.clear();
+    area.crossings.clear();
     build_area_fill(
         window,
         base_y as f64,
@@ -386,9 +448,44 @@ pub(crate) fn area_fill_mesh(
         &identity_params(0.0, line_type),
         area,
     );
-    let range = push_vertices(pool, area.vertices.iter().map(|v| [v.x, v.y]));
-    let paint = area_gradient(pool, range, top, bottom);
-    (range, paint)
+    let core = push_vertices(pool, area.vertices.iter().map(|v| [v.x, v.y]));
+    let paint = area_gradient(pool, core, top, bottom);
+    // Each base crossing splits the fill into two simple lobes. Trace their exteriors
+    // independently: a fringe around a self-intersecting bow-tie would paint the empty wedge.
+    // The shared tessellator reports which segments cross, so lobe splits never depend on
+    // comparing vertex coordinates.
+    let segments = area.vertices.as_chunks::<6>().0;
+    let mut crossings = area.crossings.iter().map(|&offset| offset / 6).peekable();
+    if let Some(first_segment) = segments.first() {
+        contour.clear();
+        contour.push([first_segment[0].x, first_segment[0].y]);
+        let mut start_x = first_segment[0].x;
+        let finish_lobe =
+            |contour: &mut Vec<[f32; 2]>, start_x: f32, pool: &mut Vec<MeshVertex>| {
+                if let Some(&end) = contour.last() {
+                    if end[1] != base_y {
+                        contour.push([end[0], base_y]);
+                    }
+                    if contour.first().is_some_and(|first| first[1] != base_y) {
+                        contour.push([start_x, base_y]);
+                    }
+                    push_polygon_fringe(pool, contour);
+                }
+            };
+        for (index, segment) in segments.iter().enumerate() {
+            let next = [segment[1].x, segment[1].y];
+            contour.push(next);
+            if crossings.next_if_eq(&index).is_some() {
+                finish_lobe(contour, start_x, pool);
+                contour.clear();
+                contour.push(next);
+                contour.push([segment[4].x, segment[4].y]);
+                start_x = next[0];
+            }
+        }
+        finish_lobe(contour, start_x, pool);
+    }
+    (core, paint)
 }
 
 /// Rescale an area fill's gradient stops onto the mesh's own bounds (see [`area_fill_mesh`]).
@@ -420,6 +517,56 @@ fn area_gradient(
     }
 }
 
+/// A fringe is painted as a separate GPUI path so its expanded bounds cannot restretch the
+/// core area's exact gradient. Adjust its stops to sample the same vertical ramp in device space.
+pub(crate) fn area_fringe_gradient(
+    pool: &[MeshVertex],
+    core: (u32, u32),
+    fringe: (u32, u32),
+    paint: Paint,
+) -> Paint {
+    let Paint::VGradient { top, bottom } = paint else {
+        return paint;
+    };
+    let bounds = |(first, count): (u32, u32)| {
+        pool.get(first as usize..(first + count) as usize)
+            .map(|vertices| {
+                vertices
+                    .iter()
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+                        (lo.min(v.y), hi.max(v.y))
+                    })
+            })
+    };
+    let (Some((core_top, core_bottom)), Some((fringe_top, fringe_bottom))) =
+        (bounds(core), bounds(fringe))
+    else {
+        return paint;
+    };
+    let span = core_bottom - core_top;
+    if span <= 0.0 {
+        return paint;
+    }
+    let sample = |y: f32| {
+        let t = (y - core_top) / span;
+        let channel = |a: u8, b: u8| {
+            (a as f32 + (b as f32 - a as f32) * t)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        Color::rgba(
+            channel(top.r(), bottom.r()),
+            channel(top.g(), bottom.g()),
+            channel(top.b(), bottom.b()),
+            channel(top.a(), bottom.a()),
+        )
+    };
+    Paint::VGradient {
+        top: sample(fringe_top),
+        bottom: sample(fringe_bottom),
+    }
+}
+
 /// Channel-wise linear interpolation, rounding the way `build_area_fill`'s f32 shading does once
 /// the GPU quantizes it back to 8 bits.
 pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
@@ -442,24 +589,28 @@ pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     )
 }
 
-/// Tessellate a filled disc into `pool` (24 segments, matching `build_disc`): solid out to the
-/// nominal radius, then the exact 1 px coverage fade outside it.
+/// Tessellate a filled disc into `pool` with the shared `circle_segments` density for its outer
+/// rim. The one-pixel coverage transition straddles the nominal radius and keeps `s` constant for
+/// GPUI on Windows.
 pub(crate) fn disc_mesh(pool: &mut Vec<MeshVertex>, cx: f32, cy: f32, radius: f32) -> (u32, u32) {
-    const SEGMENTS: usize = 24;
     let first = pool.len() as u32;
-    let rim = radius + FADE_PX;
-    for i in 0..SEGMENTS {
-        let a0 = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
-        let a1 = (i + 1) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+    let core = (radius - STROKE_AA_HALF_PX).max(0.0);
+    let rim = radius + STROKE_AA_HALF_PX;
+    let segments = aeris_charts_render::line::circle_segments(rim);
+    let core_st = stroke_distance_st(core - radius);
+    let rim_st = stroke_distance_st(STROKE_AA_HALF_PX);
+    for i in 0..segments {
+        let a0 = i as f32 / segments as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / segments as f32 * std::f32::consts::TAU;
         let (c0, s0) = (a0.cos(), a0.sin());
         let (c1, s1) = (a1.cos(), a1.sin());
-        let p0 = [cx + radius * c0, cy + radius * s0];
-        let p1 = [cx + radius * c1, cy + radius * s1];
+        let p0 = [cx + core * c0, cy + core * s0];
+        let p1 = [cx + core * c1, cy + core * s1];
         push_tri_st(pool, [cx, cy], SOLID_ST, p0, SOLID_ST, p1, SOLID_ST);
         let o0 = [cx + rim * c0, cy + rim * s0];
         let o1 = [cx + rim * c1, cy + rim * s1];
-        push_tri_st(pool, p0, FADE_IN_ST, o0, FADE_OUT_ST, o1, FADE_OUT_ST);
-        push_tri_st(pool, p0, FADE_IN_ST, o1, FADE_OUT_ST, p1, FADE_IN_ST);
+        push_tri_st(pool, p0, core_st, o0, rim_st, o1, rim_st);
+        push_tri_st(pool, p0, core_st, o1, rim_st, p1, core_st);
     }
     (first, pool.len() as u32 - first)
 }
@@ -469,20 +620,20 @@ pub(crate) fn disc_mesh(pool: &mut Vec<MeshVertex>, cx: f32, cy: f32, radius: f3
 /// at full coverage.
 fn annulus_st(
     pool: &mut Vec<MeshVertex>,
-    cx: f32,
-    cy: f32,
+    center: [f32; 2],
     r0: f32,
     st0: [f32; 2],
     r1: f32,
     st1: [f32; 2],
+    segments: usize,
 ) {
-    const SEGMENTS: usize = 24;
+    let [cx, cy] = center;
     if r1 - r0 <= 0.0 {
         return;
     }
-    for i in 0..SEGMENTS {
-        let a0 = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
-        let a1 = (i + 1) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+    for i in 0..segments {
+        let a0 = i as f32 / segments as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / segments as f32 * std::f32::consts::TAU;
         let (c0, s0) = (a0.cos(), a0.sin());
         let (c1, s1) = (a1.cos(), a1.sin());
         let o0 = [cx + r1 * c0, cy + r1 * s0];
@@ -509,31 +660,48 @@ pub(crate) fn ring_mesh(
     if outer <= 0.0 || stroke_width <= 0.0 {
         return (first, 0);
     }
+    let segments = aeris_charts_render::line::circle_segments(outer + STROKE_AA_HALF_PX);
     let middle = (inner + outer) / 2.0;
     let core_outer = (outer - STROKE_AA_HALF_PX).max(middle);
     let core_inner = (inner + STROKE_AA_HALF_PX).min(middle);
     annulus_st(
         pool,
-        cx,
-        cy,
+        [cx, cy],
         core_outer,
         stroke_distance_st(core_outer - outer),
         outer + STROKE_AA_HALF_PX,
         stroke_distance_st(STROKE_AA_HALF_PX),
+        segments,
     );
     if inner == 0.0 {
-        annulus_st(pool, cx, cy, 0.0, SOLID_ST, core_outer, SOLID_ST);
+        annulus_st(
+            pool,
+            [cx, cy],
+            0.0,
+            SOLID_ST,
+            core_outer,
+            SOLID_ST,
+            segments,
+        );
     } else {
-        annulus_st(pool, cx, cy, core_inner, SOLID_ST, core_outer, SOLID_ST);
+        annulus_st(
+            pool,
+            [cx, cy],
+            core_inner,
+            SOLID_ST,
+            core_outer,
+            SOLID_ST,
+            segments,
+        );
         let hole = (inner - STROKE_AA_HALF_PX).max(0.0);
         annulus_st(
             pool,
-            cx,
-            cy,
+            [cx, cy],
             hole,
             stroke_distance_st(inner - hole),
             core_inner,
             stroke_distance_st(inner - core_inner),
+            segments,
         );
     }
     (first, pool.len() as u32 - first)
@@ -555,7 +723,9 @@ pub(crate) fn fill_polygon(pool: &mut Vec<MeshVertex>, poly: &[[f32; 2]]) -> (u3
         verts.extend([center, pair[0], pair[1]]);
     }
     verts.extend([center, poly[poly.len() - 1], poly[0]]);
-    push_vertices(pool, verts)
+    let (first, _) = push_vertices(pool, verts);
+    push_polygon_fringe(pool, poly);
+    (first, pool.len() as u32 - first)
 }
 
 /// A band fill between two polylines over the same x sequence: two triangles per segment, in the
@@ -616,15 +786,209 @@ pub(crate) fn band_fill_mesh(
         let u1 = [next_upper.x as f32, next_upper.y as f32];
         let l0 = [lower.x as f32, lower.y as f32];
         let l1 = [next_lower.x as f32, next_lower.y as f32];
-        scratch.verts.extend([u0, l0, l1, u0, l1, u1]);
+        scratch
+            .verts
+            .extend(aeris_charts_render::line::band_segment_triangles(
+                u0, u1, l0, l1,
+            ));
     }
-    push_vertices(pool, scratch.verts.iter().copied())
+    let (first, _) = push_vertices(pool, scratch.verts.iter().copied());
+    scratch.verts.clear();
+    scratch.contour.clear();
+    let point = |p: &LinePoint| [p.x as f32, p.y as f32];
+    scratch.verts.push(point(&scratch.band_upper[0]));
+    scratch.contour.push(point(&scratch.band_lower[0]));
+    let finish_lobe =
+        |upper: &mut Vec<[f32; 2]>, lower: &[[f32; 2]], pool: &mut Vec<MeshVertex>| {
+            let skip_end = usize::from(upper.last() == lower.last());
+            for p in lower.iter().rev().skip(skip_end) {
+                if Some(p) != upper.first() {
+                    upper.push(*p);
+                }
+            }
+            push_polygon_fringe(pool, upper);
+        };
+    for i in 0..expanded_count - 1 {
+        let (u0, u1) = (
+            point(&scratch.band_upper[i]),
+            point(&scratch.band_upper[i + 1]),
+        );
+        let (l0, l1) = (
+            point(&scratch.band_lower[i]),
+            point(&scratch.band_lower[i + 1]),
+        );
+        if let Some(crossing) = aeris_charts_render::line::band_crossing(u0, u1, l0, l1) {
+            scratch.verts.push(crossing);
+            scratch.contour.push(crossing);
+            finish_lobe(&mut scratch.verts, &scratch.contour, pool);
+            scratch.verts.clear();
+            scratch.contour.clear();
+            scratch.verts.push(crossing);
+            scratch.contour.push(crossing);
+        }
+        scratch.verts.push(u1);
+        scratch.contour.push(l1);
+    }
+    finish_lobe(&mut scratch.verts, &scratch.contour, pool);
+    (first, pool.len() as u32 - first)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scene::SOLID_ST;
+
+    #[test]
+    fn crossed_area_and_band_keep_their_solid_cores_in_the_exact_lobes() {
+        let mut area = Vec::new();
+        let (core, _) = area_fill_mesh(
+            &mut Scratch::default(),
+            &mut area,
+            &[[0.0, 0.0], [10.0, 10.0]],
+            0,
+            2,
+            5.0,
+            LineType::Simple,
+            Color::rgb(1, 2, 3),
+            Color::rgb(1, 2, 3),
+        );
+        let mut band = Vec::new();
+        let (first, band_count) = band_fill_mesh(
+            &mut Scratch::default(),
+            &mut band,
+            &[[0.0, 0.0], [10.0, 10.0], [0.0, 5.0], [10.0, 5.0]],
+            0,
+            2,
+            2,
+            LineType::Simple,
+        );
+        for (name, vertices, first, count) in
+            [("area", &area, core.0, core.1), ("band", &band, first, 6)]
+        {
+            assert!(
+                covered(vertices, first, count, 3.0, 4.0),
+                "{name} left lobe"
+            );
+            assert!(
+                covered(vertices, first, count, 7.0, 6.0),
+                "{name} right lobe"
+            );
+            assert!(
+                !covered(vertices, first, count, 3.0, 6.0),
+                "{name} left void"
+            );
+            assert!(
+                !covered(vertices, first, count, 7.0, 4.0),
+                "{name} right void"
+            );
+        }
+        assert!(!covered(&area, core.0, area.len() as u32, 7.0, 3.5));
+        assert!(!covered(&band, first, band_count, 7.0, 3.5));
+    }
+
+    #[test]
+    fn crossed_area_fringes_each_lobe_separately() {
+        let mut pool = Vec::new();
+        // A base that is not exactly representable, crossed twice.
+        let base = 0.1f32 + 0.2;
+        let (core, _) = area_fill_mesh(
+            &mut Scratch::default(),
+            &mut pool,
+            &[[0.0, -9.7], [10.0, 10.3], [20.0, -9.7]],
+            0,
+            3,
+            base,
+            LineType::Simple,
+            Color::rgb(1, 2, 3),
+            Color::rgb(1, 2, 3),
+        );
+        let fringe = (core.0 + core.1, pool.len() as u32 - core.0 - core.1);
+        // Three triangular lobes, each traced alone: three edges of two triangles each.
+        assert_eq!(fringe.1, 3 * 3 * 6, "one fringe per lobe");
+        let probes = [
+            // Just outside an exposed edge of each lobe.
+            ([-0.3, -4.0], true),
+            ([2.5, base + 0.3], true),
+            ([7.5, 5.6], true),
+            ([10.0, base - 0.3], true),
+            ([12.5, 5.6], true),
+            ([17.5, base + 0.3], true),
+            ([20.3, -4.0], true),
+            // The fringe fades outward, never across a lobe's own interior.
+            ([10.0, 5.0], false),
+            // The empty wedges between the lobes stay empty.
+            ([5.0, 4.0], false),
+            ([15.0, 4.0], false),
+        ];
+        for (point, expected) in probes {
+            assert_eq!(
+                covered(&pool, fringe.0, fringe.1, point[0], point[1]),
+                expected,
+                "fringe at {point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn polygon_fringe_fades_one_pixel_outside_each_edge() {
+        let mut pool = Vec::new();
+        let (first, count) = fill_polygon(
+            &mut pool,
+            &[[10.0, 10.0], [30.0, 10.0], [30.0, 30.0], [10.0, 30.0]],
+        );
+        let vertices = &pool[first as usize..(first + count) as usize];
+        assert!(vertices
+            .iter()
+            .any(|v| v.y == 10.0 && v.st == stroke_distance_st(0.0)));
+        assert!(vertices
+            .iter()
+            .any(|v| v.y == 9.0 && v.st == stroke_distance_st(1.0)));
+        assert!(vertices
+            .iter()
+            .any(|v| v.x == 31.0 && v.st == stroke_distance_st(1.0)));
+        assert!(vertices
+            .iter()
+            .any(|v| v.y == 31.0 && v.st == stroke_distance_st(1.0)));
+        assert!(vertices
+            .iter()
+            .any(|v| v.x == 9.0 && v.st == stroke_distance_st(1.0)));
+    }
+
+    #[test]
+    fn disc_mesh_integrated_coverage_matches_nominal_area() {
+        for radius in [5.0_f32, 10.0, 20.0] {
+            let mut pool = Vec::new();
+            let (first, count) = disc_mesh(&mut pool, 0.0, 0.0, radius);
+            let mut covered_area = 0.0;
+            for triangle in pool[first as usize..(first + count) as usize]
+                .as_chunks::<3>()
+                .0
+            {
+                let [a, b, c] = triangle;
+                let area = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() * 0.5;
+                // The pinned GPUI Windows path shader takes a varying `s` down its solid branch.
+                // For constant `s`, its one-pixel signed-distance ramp is linear over this strip.
+                let coverage = if a.st[0] != b.st[0]
+                    || b.st[0] != c.st[0]
+                    || (a.st == SOLID_ST && b.st == SOLID_ST && c.st == SOLID_ST)
+                {
+                    1.0
+                } else {
+                    [a, b, c]
+                        .iter()
+                        .map(|v| (0.5 + v.st[1]).clamp(0.0, 1.0))
+                        .sum::<f32>()
+                        / 3.0
+                };
+                covered_area += area * coverage;
+            }
+            let target = std::f32::consts::PI * radius * radius;
+            assert!(
+                (covered_area - target).abs() / target < 0.02,
+                "radius {radius}: coverage area {covered_area} vs {target}"
+            );
+        }
+    }
 
     /// Point-in-mesh test over the triangle coverage (ignoring `st`), for coverage-gap checks.
     fn covered(pool: &[MeshVertex], first: u32, count: u32, qx: f32, qy: f32) -> bool {
@@ -676,7 +1040,7 @@ mod tests {
         let mut expanded = Vec::new();
         expand_line_into(&window, LineType::Curved, 1.0, 1.0, &mut expanded);
         let half = 3.0f32;
-        for pair in expanded.windows(2) {
+        for (index, pair) in expanded.windows(2).enumerate() {
             let (a, b) = (pair[0], pair[1]);
             let (dx, dy) = ((b.x - a.x) as f32, (b.y - a.y) as f32);
             let len = (dx * dx + dy * dy).sqrt();
@@ -694,7 +1058,7 @@ mod tests {
                     );
                     assert!(
                         covered(&pool, first, count, ix, iy),
-                        "gap inside the nominal band at ({ix}, {iy})"
+                        "gap inside the nominal band at ({ix}, {iy}), segment {index}, t={t}, side={side}, a={a:?}, b={b:?}"
                     );
                     // Past the fade band: never covered.
                     let (ox, oy) = (
@@ -888,9 +1252,14 @@ mod tests {
             Color::rgba(0, 0, 0xff, 0),
         );
         let verts = &pool[first as usize..(first + count) as usize];
-        let y0 = verts.iter().map(|v| v.y).fold(f32::INFINITY, f32::min);
-        let y1 = verts.iter().map(|v| v.y).fold(f32::NEG_INFINITY, f32::max);
+        let solid = verts.iter().filter(|v| v.st == SOLID_ST);
+        let (y0, y1) = solid.fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v.y), hi.max(v.y))
+        });
         assert_eq!((y0, y1), (4.0, 40.0));
+        assert!(pool[(first + count) as usize..]
+            .iter()
+            .any(|v| v.st != SOLID_ST));
     }
 
     #[test]
@@ -918,7 +1287,15 @@ mod tests {
             4,
             LineType::Simple,
         );
-        assert_eq!(count, 3 * 6, "3 segments x 2 triangles x 3 vertices");
+        assert_eq!(
+            pool[..count as usize]
+                .iter()
+                .filter(|v| v.st == SOLID_ST)
+                .count(),
+            3 * 6,
+            "3 segments x 2 solid triangles x 3 vertices"
+        );
+        assert!(count > 3 * 6, "outer edges carry coverage triangles");
     }
 
     #[test]

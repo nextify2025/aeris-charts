@@ -13,7 +13,10 @@
 //! antialiased triangle edges, which is separable from gradients, which is separable from glyphs.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim, TextAlign};
+use aeris_charts_render::draw_list::{
+    Gradient, IRect, LineStyle, LineType, Prim, RasterImage, TextAlign,
+};
+use std::sync::Arc;
 
 /// One fixture: a prim layer, its point pool, and the device-pixel size it covers.
 pub struct Fixture {
@@ -247,6 +250,16 @@ pub fn tessellated(dpr: f32) -> Fixture {
         radii: [4.0 * dpr; 4],
         fill: Color::rgb(0xe8, 0xec, 0xf2),
         border_width: 0.0,
+        border_color: INK,
+    });
+    prims.push(Prim::RoundRect {
+        x: 255.0 * dpr,
+        y: 250.0 * dpr,
+        w: 90.0 * dpr,
+        h: 34.0 * dpr,
+        radii: [6.0 * dpr; 4],
+        fill: Color::rgb(0xe8, 0xec, 0xf2),
+        border_width: 2.0 * dpr,
         border_color: INK,
     });
 
@@ -492,9 +505,8 @@ pub fn translucent_rects(dpr: f32) -> Fixture {
 /// **Opaque antialiased geometry.** The mirror of [`translucent_rects`]: isolates *antialiasing* from
 /// alpha compositing. Every prim is fully opaque, but all are non-axis-aligned shapes whose edges a
 /// coverage-based rasterizer antialiases. GPUI strokes/discs/rings carry their own 1 px Loop-Blinn
-/// coverage transition (see `geometry::edge_st`), so both sides antialias; the residual difference is
-/// the two rasterizers' edge-coverage ramps, not a missing AA pass. Plain triangles stay
-/// hard-edged on both sides.
+/// coverage transition, so both sides antialias; the residual difference is the two rasterizers'
+/// edge-coverage ramps. Filled triangles carry a GPUI fringe for the 1x MSAA path.
 pub fn opaque_aa(dpr: f32) -> Fixture {
     let (w, h) = dims(dpr);
     let mut prims = vec![Prim::Rect {
@@ -568,7 +580,7 @@ pub fn crosshair_action(dpr: f32) -> Fixture {
         ..AxisFrame::default()
     };
     let mut prims = Vec::new();
-    engine.build_axis_primitives_into(&axis, &mut prims, |_| 0.0);
+    engine.build_axis_primitives_into(&axis, &mut prims);
     // The icon paints last above axis chrome.
     let mut icon = prims.split_off(prims.len() - 1);
     icon.insert(
@@ -594,6 +606,135 @@ pub fn crosshair_action(dpr: f32) -> Fixture {
     }
 }
 
+/// Asymmetric red/blue image pixels reveal an RGBA/BGRA executor mismatch.
+pub fn colored_image(dpr: f32) -> Fixture {
+    let (width, height) = dims(dpr);
+    let image = RasterImage {
+        key: 0x00c0_10a1,
+        width: 2,
+        height: 2,
+        pixels: Arc::from([
+            255, 0, 0, 255, 0, 0, 255, 255, 0, 128, 128, 255, 255, 128, 0, 255,
+        ]),
+    };
+    Fixture {
+        name: "colored_image",
+        attribution: "image RGBA-to-BGRA channel conversion",
+        prims: vec![Prim::Image {
+            image,
+            rect: [40.0 * dpr, 40.0 * dpr, 2.0, 2.0],
+            opacity: 1.0,
+        }],
+        points: Vec::new(),
+        width,
+        height,
+        background: BG,
+    }
+}
+
+/// Upscaled image checks GPUI's sprite filter and opacity against native bilinear rendering.
+pub fn scaled_colored_image(dpr: f32) -> Fixture {
+    let (width, height) = dims(dpr);
+    Fixture {
+        name: "scaled_colored_image",
+        attribution: "bilinear image sampling and opacity",
+        prims: vec![Prim::Image {
+            image: RasterImage {
+                key: 0x00c0_10a2,
+                width: 2,
+                height: 2,
+                pixels: Arc::from([
+                    255, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 255, 255, 255,
+                ]),
+            },
+            rect: [40.25 * dpr, 40.75 * dpr, 20.0 * dpr, 20.0 * dpr],
+            opacity: 0.72,
+        }],
+        points: Vec::new(),
+        width,
+        height,
+        background: BG,
+    }
+}
+
+/// Engine-produced bid/ask heatmap pixels, drawn at source resolution to isolate channel order.
+pub fn depth_heatmap_colors(dpr: f32) -> Fixture {
+    use aeris_charts_engine::{
+        ChartEngine, DepthHeatmapOptions, DepthLevel, DepthOptions, DepthSnapshot,
+    };
+    let (width, height) = dims(dpr);
+    let mut engine = ChartEngine::new(LOGICAL_W as f64, LOGICAL_H as f64, dpr as f64);
+    let times = [0.0, 1.0, 2.0];
+    let prices = [100.0; 3];
+    engine
+        .set_series_data(0, &times, &prices, &prices, &prices, &prices)
+        .expect("valid heatmap time axis");
+    let stream = engine
+        .add_depth_stream("parity-depth", DepthOptions::default())
+        .expect("valid depth stream");
+    engine
+        .set_depth_snapshot(
+            stream,
+            DepthSnapshot {
+                timestamp_micros: 0,
+                sequence: 1,
+                bids: vec![DepthLevel {
+                    price: 99.0,
+                    size: 500.0,
+                    order_count: Some(1),
+                }],
+                asks: vec![DepthLevel {
+                    price: 101.0,
+                    size: 750.0,
+                    order_count: Some(1),
+                }],
+            },
+        )
+        .expect("valid depth snapshot");
+    engine
+        .add_depth_heatmap(
+            stream,
+            DepthHeatmapOptions {
+                price_min: 99.0,
+                price_max: 101.0,
+                ..DepthHeatmapOptions::default()
+            },
+        )
+        .expect("valid depth heatmap");
+    let content_height = (f64::from(LOGICAL_H) - engine.time_axis_height()).max(1.0);
+    engine.layout_panes(content_height);
+    engine.time_scale.set_width(f64::from(LOGICAL_W));
+    engine.fit_content();
+    let frame = engine.build_frame();
+    let image = frame
+        .panes
+        .iter()
+        .flat_map(|pane| pane.under.iter())
+        .find_map(|prim| match prim {
+            Prim::Image { image, .. } => Some(image.clone()),
+            _ => None,
+        })
+        .expect("engine must emit a depth heatmap image");
+    Fixture {
+        name: "depth_heatmap_colors",
+        attribution: "engine bid/ask heatmap color channels",
+        prims: vec![Prim::Image {
+            rect: [
+                60.0 * dpr,
+                60.0 * dpr,
+                image.width as f32,
+                image.height as f32,
+            ],
+            image,
+            opacity: 1.0,
+        }],
+        points: Vec::new(),
+        width,
+        height,
+        background: BG,
+    }
+}
+
 /// Every fixture, in attribution order.
 ///
 /// `translucent` and `opaque_aa` sit between the exact fixture and the mixed ones deliberately: they
@@ -603,13 +744,46 @@ pub fn all(dpr: f32) -> Vec<Fixture> {
     vec![
         crisp_rects(dpr),
         translucent_rects(dpr),
+        translucent_joins(dpr),
         opaque_aa(dpr),
         tessellated(dpr),
         curved_brushes(dpr),
         gradients(dpr),
         text(dpr),
         crosshair_action(dpr),
+        colored_image(dpr),
+        scaled_colored_image(dpr),
+        depth_heatmap_colors(dpr),
     ]
+}
+
+/// A half-alpha stroke with alternating sharp turns, exercising GPUI's shared join tessellation.
+pub fn translucent_joins(dpr: f32) -> Fixture {
+    let (width, height) = dims(dpr);
+    let points = [
+        (80.0, 220.0),
+        (160.0, 80.0),
+        (240.0, 220.0),
+        (320.0, 80.0),
+        (400.0, 220.0),
+    ]
+    .map(|(x, y)| [x * dpr, y * dpr]);
+    Fixture {
+        name: "translucent_joins",
+        attribution: "half-alpha stroke coverage at sharp joins",
+        prims: vec![Prim::Polyline {
+            first_point: 0,
+            point_count: points.len() as u32,
+            width: 8.0 * dpr,
+            style: LineStyle::Solid,
+            line_type: LineType::Simple,
+            color: Color::rgba(0, 0, 0, 128),
+        }],
+        points: points.to_vec(),
+        width,
+        height,
+        background: BG,
+    }
 }
 
 #[cfg(test)]

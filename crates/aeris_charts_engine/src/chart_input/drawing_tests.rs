@@ -200,12 +200,23 @@ fn escape_discards_a_pending_path_and_disarms_the_tool() {
     assert!(key(&mut chart, ChartKey::Escape));
     assert!(!chart.drawing_create_active());
     assert_eq!(chart.active_drawing_tool(), None);
+    // The vertex clicks notify nothing; the keyboard cancel clears the hover crosshair.
+    assert_eq!(
+        chart.take_input_events(),
+        vec![ChartInputEvent::CrosshairLeft]
+    );
 
     // Later clicks, a double-click included, are ordinary clicks again.
     click(&mut chart, 320.0, 160.0);
     double_click(&mut chart, 320.0, 160.0);
     assert!(chart.drawings().is_empty());
-    assert!(chart.take_input_events().is_empty());
+    assert_eq!(
+        chart.take_input_events(),
+        vec![
+            ChartInputEvent::Click { x: 320.0, y: 160.0 },
+            ChartInputEvent::DoubleClick { x: 320.0, y: 160.0 },
+        ]
+    );
     assert_eq!(chart.drawing_revision(), revision);
 }
 
@@ -409,6 +420,8 @@ fn backspace_deletes_the_clicked_drawing_as_one_undoable_step() {
     let (id, body) = trend_line_body(&mut chart);
     click(&mut chart, body.0, body.1);
     assert_eq!(chart.selected_drawing(), Some(id));
+    // The selecting click notifies pane click subscribers; only the key's requests matter below.
+    chart.take_input_events();
     let revision = chart.drawing_revision();
 
     assert!(key(&mut chart, ChartKey::Backspace));
@@ -433,6 +446,7 @@ fn delete_on_a_clicked_indicator_line_removes_its_binding_without_a_host_request
 
     click(&mut chart, on_line.0, on_line.1);
     assert_eq!(chart.selected_series(), Some(sma));
+    chart.take_input_events();
     assert!(key(&mut chart, ChartKey::Delete));
     assert!(!chart.has_indicator_bindings());
     assert!(chart.series_entry(sma).is_none());
@@ -450,6 +464,7 @@ fn delete_on_a_clicked_host_series_asks_the_host_to_remove_it() {
     let (x, y) = series_point(&chart);
     click(&mut chart, x, y);
     assert_eq!(chart.selected_series(), Some(0));
+    chart.take_input_events();
 
     assert!(key(&mut chart, ChartKey::Delete));
     assert_eq!(

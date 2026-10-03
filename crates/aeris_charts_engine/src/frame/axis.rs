@@ -559,7 +559,7 @@ impl ChartEngine {
     /// Crosshair time label, honoring a host `timeFormatter` when installed. Otherwise the
     /// engine's `localization.dateFormat` pattern with the locale month-name table (reference
     /// chart-options-defaults.ts:34-37), in exchange wall-clock time.
-    pub(crate) fn format_crosshair_ts(&self, ts: i64) -> String {
+    pub fn format_crosshair_ts(&self, ts: i64) -> String {
         // `ts` is a bar's identity time; the text prints its label time.
         let ts = self.bar_label_time(ts);
         if let Some(s) = self.host_time_label(ts) {
@@ -657,7 +657,7 @@ impl ChartEngine {
     /// `include_transient` gates the crosshair labels: they paint per frame, but the axis-width
     /// negotiation must never see them — a wide hovered price would inflate the strip and the
     /// grow-fast/shrink-lazy policy would pin that width forever.
-    fn build_axis_frame_impl<F, G>(
+    pub(crate) fn build_axis_frame_impl<F, G>(
         &mut self,
         max_label_width: f64,
         measure: F,

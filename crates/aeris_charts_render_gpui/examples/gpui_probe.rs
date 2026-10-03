@@ -26,10 +26,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_engine::{
     crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, ChartEngine, ChartFrame,
-    ChartInputEvent, DeltaTooltipOptions, DrawingKind, DrawingPoint, FootprintAggregationOptions,
-    FootprintBarAggregation, FootprintImbalanceOptions, FootprintSeriesOptions, FootprintTrade,
-    Marker, PriceLineExtent, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
-    SplitDirection, TradeStudyOptions, Workspace, WorkspaceLayout,
+    ChartInputEvent, DeltaTooltipOptions, DrawingKind, DrawingPoint, FinancialFrameRequest,
+    FootprintAggregationOptions, FootprintBarAggregation, FootprintImbalanceOptions,
+    FootprintSeriesOptions, FootprintTrade, Marker, PriceLineExtent, PriceScaleTarget,
+    PrimitiveAutoscaleContribution, SeriesKind, SplitDirection, TradeStudyOptions, Workspace,
+    WorkspaceLayout,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, LineStyle, Prim, TextAlign};
@@ -121,10 +122,16 @@ impl DemoTheme {
         let border = theme_border(self);
         let text = theme_text(self);
         let crosshair = self.crosshair();
+        let label = crosshair_label_background();
         format!(
-            r#"{{"layout":{{"background":{{"type":"solid","color":"{surface}"}},"textColor":"{text}","panes":{{"separatorColor":"{border}"}}}},"leftPriceScale":{{"borderColor":"{border}"}},"rightPriceScale":{{"borderColor":"{border}"}},"timeScale":{{"borderColor":"{border}"}},"grid":{{"vertLines":{{"color":"{border}"}},"horzLines":{{"color":"{border}"}}}},"crosshair":{{"vertLine":{{"color":"{crosshair}","labelBackgroundColor":"{crosshair}"}},"horzLine":{{"color":"{crosshair}","labelBackgroundColor":"{crosshair}"}}}}}}"#
+            r#"{{"layout":{{"background":{{"type":"solid","color":"{surface}"}},"textColor":"{text}","panes":{{"separatorColor":"{border}"}}}},"leftPriceScale":{{"borderColor":"{border}"}},"rightPriceScale":{{"borderColor":"{border}"}},"timeScale":{{"borderColor":"{border}"}},"grid":{{"vertLines":{{"color":"{border}"}},"horzLines":{{"color":"{border}"}}}},"crosshair":{{"vertLine":{{"color":"{crosshair}","labelBackgroundColor":"{label}"}},"horzLine":{{"color":"{crosshair}","labelBackgroundColor":"{label}"}}}}}}"#
         )
     }
+}
+
+/// The probe's crosshair label surface, in both themes.
+fn crosshair_label_background() -> &'static str {
+    aeris_charts_core::style::DARK_BORDER_CSS
 }
 
 fn apply_package_theme(engine: &mut ChartEngine, theme: DemoTheme) {
@@ -1260,14 +1267,12 @@ impl Probe {
         if !resized && !self.dirty && !self.frame.panes.is_empty() {
             return;
         }
+        let force_frame = self.dirty;
         if self.built_for.2 != 0.0 && self.built_for.2 != scale_factor {
             self.renderer.invalidate_caches();
         }
         self.built_for = key;
         self.dirty = false;
-        self.engine.css_width = f64::from(width);
-        self.engine.css_height = f64::from(height);
-        self.engine.dpr = f64::from(scale_factor);
 
         self.engine.clear_autoscale_contributions();
         if self.frame_budget.is_none() && self.engine.series[0].countdown_visible {
@@ -1299,37 +1304,26 @@ impl Probe {
                     max,
                 });
         }
-        self.engine.recompute_layout_with_measure(
-            resized,
+        self.engine.prepare_financial_frame_with_measure(
+            FinancialFrameRequest {
+                width: f64::from(width),
+                height: f64::from(height),
+                dpr: f64::from(scale_factor),
+                force_layout: resized,
+                allow_axis_shrink: resized,
+                force_frame,
+                force_axis: false,
+                layout_only: false,
+                fit_content: !self.fitted && self.fit_on_first_frame,
+                frame: &mut self.frame,
+                axis_frame: None,
+                axis_primitives: Some(&mut self.axis),
+            },
             |text, bold| measure(text, bold),
             |text, bold| countdown_measure(text, bold),
         );
-        if !self.fitted {
-            if self.fit_on_first_frame {
-                self.engine.fit_content();
-            }
-            self.fitted = true;
-            if self.fit_on_first_frame {
-                self.engine.recompute_layout_with_measure(
-                    true,
-                    |text, bold| measure(text, bold),
-                    |text, bold| countdown_measure(text, bold),
-                );
-            }
-        }
-        let max_label_width = (self.engine.axis_font_size() + 4.0) * 5.0 / 8.0
-            * f64::from(self.engine.tick_mark_max_character_length.max(1));
-        let axis_frame = self.engine.build_axis_frame(
-            max_label_width,
-            |text, bold| measure(text, bold),
-            |text, bold| countdown_measure(text, bold),
-        );
-        self.engine.build_frame_into(&mut self.frame);
+        self.fitted = true;
         self.inject_native_equivalents();
-        // GPUI's Prim text executor already converts a vertical center into a baseline from native
-        // ascent/descent. The browser needs a Canvas ink-box correction; GPUI correctly supplies 0.
-        self.engine
-            .build_axis_primitives_into(&axis_frame, &mut self.axis, |_| 0.0);
         self.plan_dirty = true;
 
         let content_h = self.engine.pane_h;
@@ -1420,9 +1414,12 @@ impl Probe {
 
     /// Common tail of every input listener: report engine requests in the status line, follow the
     /// crosshair in the OHLC legend, schedule deferred engine work, and repaint.
-    fn after_input(&mut self, cx: &mut Context<Self>) {
+    fn consume_input_events(&mut self) {
         for event in self.engine.take_input_events() {
             self.click_status = match event {
+                ChartInputEvent::Click { x, y } => format!("click at {x:.0}, {y:.0}"),
+                ChartInputEvent::DoubleClick { x, y } => format!("double click at {x:.0}, {y:.0}"),
+                ChartInputEvent::TextEditorOpened(id) => format!("editing drawing #{id}"),
                 ChartInputEvent::DrawingCreated(id) => format!("created drawing #{id}"),
                 ChartInputEvent::ContextMenu(menu) => match menu.context {
                     Some(context) => format!(
@@ -1431,9 +1428,21 @@ impl Probe {
                     ),
                     None => format!("context: {:?}", menu.region),
                 },
-                ChartInputEvent::RemoveSeries(series) => format!("remove series #{series}"),
+                ChartInputEvent::RemoveSeries(series) => {
+                    if self.engine.remove_series(series) {
+                        format!("removed series #{series}")
+                    } else {
+                        format!("series #{series} was already removed")
+                    }
+                }
+                ChartInputEvent::CrosshairLeft => "crosshair left".into(),
+                ChartInputEvent::DeltaTooltipChanged => "delta tooltip changed".into(),
             };
         }
+    }
+
+    fn after_input(&mut self, cx: &mut Context<Self>) {
+        self.consume_input_events();
         for request in self.engine.take_alert_create_requests() {
             self.click_status = format!(
                 "action requested: pane {} price {}",
@@ -1650,6 +1659,7 @@ impl Render for Probe {
                         let w: f32 = bounds.size.width.into();
                         let h: f32 = bounds.size.height.into();
                         let scale_factor = window.scale_factor();
+                        let reduced_motion = cx.reduce_motion();
                         prepaint_entity.update(cx, |probe: &mut Probe, _| {
                             if probe
                                 .frame_budget
@@ -1658,7 +1668,9 @@ impl Render for Probe {
                                 return;
                             }
                             probe.input.set_canvas_bounds(bounds);
-                            probe.dirty |= probe.input.prepare_frame(&mut probe.engine);
+                            probe.dirty |= probe
+                                .input
+                                .prepare_frame_with_motion(&mut probe.engine, reduced_motion);
                             probe.rebuild(w, h, scale_factor, window);
                         });
                         bounds
@@ -2226,10 +2238,10 @@ impl InteractiveDemo {
             }),
             DemoAction::CrosshairLabelBackground => self.update_root(cx, |p| {
                 let current = &p.engine.options.get().crosshair.vert_line.label_background_color;
-                let color = if current == aeris_charts_core::style::DEFAULT_CROSSHAIR_CSS {
+                let color = if current == crosshair_label_background() {
                     "#2962ff"
                 } else {
-                    aeris_charts_core::style::DEFAULT_CROSSHAIR_CSS
+                    crosshair_label_background()
                 };
                 p.engine.options.apply_str(&format!(r#"{{"crosshair":{{"vertLine":{{"labelBackgroundColor":"{color}"}},"horzLine":{{"labelBackgroundColor":"{color}"}}}}}}"#)).unwrap();
             }),
@@ -3539,6 +3551,33 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_browser_axis_fixture_uses_the_shared_frame_preparation() {
+        let mut probe = Probe::new(2, Some(1));
+        probe.engine.options = Default::default();
+        probe.engine.series[0].price_lines.clear();
+        probe.engine.clear_drawings();
+        probe
+            .engine
+            .set_series_data(
+                0,
+                &[1.0, 2.0],
+                &[101.0, 102.0],
+                &[102.0, 103.0],
+                &[100.0, 101.0],
+                &[101.0, 102.0],
+            )
+            .unwrap();
+        probe.rebuild_with_measure(
+            800.0,
+            500.0,
+            1.0,
+            |text, _| text.len() as f64 * 7.0,
+            |text, _| text.len() as f64 * 7.0,
+        );
+        assert_eq!(probe.engine.axis_w, 54.0);
+    }
+
+    #[test]
     fn action_chip_hover_uses_click_cursor_and_control_input_target() {
         let mut probe = Probe::new(64, Some(1));
         probe.rebuild_with_measure(
@@ -3571,6 +3610,22 @@ mod tests {
         probe.engine.input_pointer_down(pointer(x, y), 1);
         probe.engine.input_pointer_up(pointer(x, y));
         assert!(probe.engine.take_alert_create_requests().is_empty());
+    }
+
+    #[test]
+    fn delete_key_removes_a_host_series_after_draining_controller_events() {
+        let mut probe = Probe::new_interactive(32);
+        probe.engine.set_selected_drawing(None);
+        probe.engine.set_selected_series(Some(0));
+        assert!(probe.engine.input_key_down(
+            ChartKey::Delete,
+            InputModifiers::default(),
+            false,
+            0.0
+        ));
+        probe.consume_input_events();
+        assert!(probe.engine.series[0].removed);
+        assert_eq!(probe.click_status, "removed series #0");
     }
 
     #[test]
@@ -3648,7 +3703,7 @@ mod tests {
         assert_eq!(options.crosshair.vert_line.color, theme.crosshair());
         assert_eq!(
             options.crosshair.horz_line.label_background_color,
-            theme.crosshair()
+            crosshair_label_background()
         );
     }
 
@@ -4669,12 +4724,15 @@ mod window_input_tests {
         assert_eq!(zoomed.right_offset(), expected.right_offset());
         assert!(zoomed.bar_spacing() > before.bar_spacing());
 
-        // One line down is 32 px before the shared normalization, and zooms out.
+        // One native line down is a third of a browser notch (three make the default notch), and
+        // zooms out. The adapter scales lines in `f32`, so compare within that precision.
         let mut expected = zoomed.clone();
         cx.simulate_event(wheel(ScrollDelta::Lines(point(0.0, -1.0))));
-        expected.zoom(x, wheel_zoom_scale(-32.0 / 100.0));
-        assert_eq!(
-            engine(&cx, &chart, ChartEngine::bar_spacing),
+        expected.zoom(x, wheel_zoom_scale(-1.0 / 3.0));
+        let spacing = engine(&cx, &chart, ChartEngine::bar_spacing);
+        assert!(
+            (spacing - expected.bar_spacing()).abs() < 1e-6,
+            "{spacing} != {}",
             expected.bar_spacing()
         );
         assert!(expected.bar_spacing() < zoomed.bar_spacing());

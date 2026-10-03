@@ -52,9 +52,11 @@ mod tests {
         assert_eq!(DARK_PRIMARY_HOVER_CSS, "#0077fa");
         assert_eq!(DARK_DANGER_CSS, LIGHT_DANGER_CSS);
         assert_eq!(DARK_BORDER_CSS, "#333333");
-        assert_eq!(DARK_CROSSHAIR_CSS, DARK_BORDER_CSS);
+        assert_eq!(CROSSHAIR_LINE_CSS, "#4a4a4a");
+        assert_eq!(CROSSHAIR_LINE_RGB, (0x4a, 0x4a, 0x4a));
+        assert_eq!(DARK_CROSSHAIR_CSS, CROSSHAIR_LINE_CSS);
         assert_eq!(DARK_CROSSHAIR_LABEL_CSS, DARK_MUTED_CSS);
-        assert_eq!(LIGHT_CROSSHAIR_CSS, DARK_BORDER_CSS);
+        assert_eq!(LIGHT_CROSSHAIR_CSS, CROSSHAIR_LINE_CSS);
         assert_eq!(LIGHT_CROSSHAIR_LABEL_CSS, DARK_MUTED_CSS);
         assert_eq!(DARK_SEPARATOR_HOVER_CSS, DARK_ACCENT_CSS);
         assert_eq!(LIGHT_MARKET_UP_CSS, "#089981");

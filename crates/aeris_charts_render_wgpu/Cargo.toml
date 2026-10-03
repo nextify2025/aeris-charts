@@ -15,6 +15,7 @@ bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 aeris_charts_engine = { path = "../aeris_charts_engine" }
+aeris_charts_native = { path = "../aeris_charts_native" }
 
 [lints]
 workspace = true

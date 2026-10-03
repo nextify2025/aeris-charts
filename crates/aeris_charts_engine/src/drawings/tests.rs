@@ -1001,10 +1001,9 @@ fn frame_polylines(chart: &mut ChartEngine, color: Color) -> Vec<FramePolyline> 
 }
 
 /// Core drawings' dashed and dotted strokes (trend line, path, the curved brush) reach every
-/// executor as solid dash runs lowered in the frame, like family strokes and series lines: the
-/// WebGPU stroker ignores `Polyline.style`, so a styled polyline would paint solid there while
-/// Canvas2D dashes it. Solid strokes keep their single polyline, and a dashed line reaching far
-/// past the pane is clipped before it is split, so its frame work stays bounded.
+/// executor as solid dash runs lowered in the frame, like family strokes and series lines.
+/// Solid strokes keep their single polyline, and a dashed line reaching far past the pane is
+/// clipped before it is split, so its frame work stays bounded.
 #[test]
 fn dashed_core_drawing_strokes_reach_executors_as_solid_dash_runs() {
     let mut chart = settled_chart();
@@ -2582,7 +2581,7 @@ fn official_rectangle_preview_commit_and_axis_views_are_engine_owned() {
         .iter()
         .all(|band| band.color == Color::rgba(200, 50, 100, 96)));
     let mut axis_primitives = Vec::new();
-    chart.build_axis_primitives_into(&committed_axis, &mut axis_primitives, |_| 0.0);
+    chart.build_axis_primitives_into(&committed_axis, &mut axis_primitives);
     assert!(axis_primitives.iter().any(|primitive| {
         matches!(primitive, Prim::Rect { color, .. }
             if *color == Color::rgba(200, 50, 100, 96))

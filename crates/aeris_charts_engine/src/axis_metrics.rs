@@ -137,6 +137,12 @@ impl crate::ChartEngine {
         self.axis_metrics().axis
     }
 
+    /// Reference cap for a time-axis label, measured at the font size actually painted.
+    pub fn axis_label_width_cap(&self) -> f64 {
+        (self.axis_font_size() + 4.0) * 5.0 / 8.0
+            * f64::from(self.tick_mark_max_character_length.max(1))
+    }
+
     /// Resolved countdown text size in CSS px (10 at the default). Hosts measure countdown
     /// strings at this size; countdown advances are never derived by shrinking axis-size
     /// measurements.
