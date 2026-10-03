@@ -14,8 +14,12 @@ struct TradingChipLayout {
     vpr: f64,
 }
 
-/// Design-unit height of the stacked multi-fill mark (the single arrow is 70 units tall).
-const STACKED_EXECUTION_HEIGHT: f64 = 152.0;
+/// Design-unit envelope of one execution arrow (`size` CSS px is 70 units).
+const EXECUTION_ARROW_UNITS: f64 = 70.0;
+/// Design-unit pitch between the chevrons of a multi-fill mark.
+const EXECUTION_CHEVRON_PITCH: f64 = 24.0;
+/// Most chevrons one mark draws, so a busy bar cannot grow its mark without limit.
+const MAX_EXECUTION_CHEVRONS: usize = 5;
 
 /// One execution arrow: every visible fill of one side on one bar.
 pub(crate) struct TradingExecutionMark {
@@ -27,8 +31,10 @@ pub(crate) struct TradingExecutionMark {
     pub y: f64,
     /// Arrow width envelope in CSS px; one design unit is `size / 70`.
     pub size: f64,
-    /// Vertical extent in CSS px: `size` for one fill, taller for the stacked-chevron mark.
+    /// Vertical extent in CSS px: `size` for one chevron, one pitch taller per extra chevron.
     pub height: f64,
+    /// Chevrons drawn: one per fill up to [`MAX_EXECUTION_CHEVRONS`]; 1 for non-arrow shapes.
+    pub chevrons: usize,
 }
 
 #[derive(Default)]
@@ -213,12 +219,14 @@ impl ChartEngine {
         self.runtime_price_coordinate(pane_index, target, price)
     }
 
-    /// Vertical extent `(top, bottom)` in CSS px of what the pane paints within `half_width` of
-    /// bar `index` for `target`: the wick for OHLC series (Heikin-Ashi when shown), the column
-    /// top for histograms, and for line, area, and baseline series the stroked line itself across
-    /// the mark's width (the slope toward each neighbor, or a stepped line's riser) padded by half
-    /// the line width. Execution marks sit outside this extent, so they clear the rendered shape
-    /// on every series type instead of touching a sloped line.
+    /// Vertical extent `(top, bottom)` in CSS px of what the primary series of `target` paints
+    /// within `half_width` of bar `index`: the wick for OHLC series (Heikin-Ashi when shown), the
+    /// column top for histograms, and for line, area, and baseline series the stroked line itself
+    /// across the mark's width (the slope toward each neighbor, or a stepped line's riser) padded
+    /// by half the line width. Execution marks sit outside this extent, so they clear the rendered
+    /// shape on every series type instead of touching a sloped line. Only the primary series
+    /// anchors them: fills belong to the traded instrument's bars, so overlays on the same scale
+    /// (moving averages, host studies, compare lines) must not push them away from their bar.
     fn trading_bar_extent(
         &self,
         pane_index: usize,
@@ -232,6 +240,20 @@ impl ChartEngine {
         if scale.is_empty() {
             return None;
         }
+        let anchor = self
+            .primary_series_on_price_scale(pane_index, target)?
+            .series_id;
+        let series = self.series.iter().find(|series| series.id == anchor)?;
+        let render_end = self.series_render_end(series.id, i64::MAX);
+        if !series.visible || self.indicator_binding_id(series.id).is_some() || index > render_end {
+            return None;
+        }
+        let plot = self.data.plot(series.id);
+        let row = plot.search(index, MismatchDirection::None)?;
+        if plot.is_whitespace_row(row) {
+            return None;
+        }
+        let base_value = self.series_base_value(series.id, from)?;
         let bar_spacing = self.time_scale.bar_spacing();
         let mut extent: Option<(f64, f64)> = None;
         let mut include = |y: f64, pad: f64| {
@@ -241,91 +263,69 @@ impl ChartEngine {
                 }));
             }
         };
-        for series in &self.series {
-            let render_end = self.series_render_end(series.id, i64::MAX);
-            if !series.visible
-                || series.removed
-                || series.pane_index != pane_index
-                || series_scale_target(series) != target
-                || self.indicator_binding_id(series.id).is_some()
-                || index > render_end
-            {
-                continue;
+        let y_of = |price: f64| {
+            if price.is_finite() {
+                scale.price_to_coordinate(price, base_value)
+            } else {
+                f64::NAN
             }
-            let plot = self.data.plot(series.id);
-            let Some(row) = plot.search(index, MismatchDirection::None) else {
-                continue;
-            };
-            if plot.is_whitespace_row(row) {
-                continue;
+        };
+        match series.kind {
+            SeriesKind::Candlestick | SeriesKind::Bar | SeriesKind::Footprint => {
+                let [high, low] = self
+                    .heikin_ashi_row(series.id, row)
+                    .map(|values| [values[1], values[2]])
+                    .unwrap_or_else(|| {
+                        [
+                            plot.value_at(row, PlotValueIndex::High),
+                            plot.value_at(row, PlotValueIndex::Low),
+                        ]
+                    });
+                include(y_of(high), 0.0);
+                include(y_of(low), 0.0);
             }
-            let Some(base_value) = self.series_base_value(series.id, from) else {
-                continue;
-            };
-            let y_of = |price: f64| {
-                if price.is_finite() {
-                    scale.price_to_coordinate(price, base_value)
-                } else {
-                    f64::NAN
-                }
-            };
-            match series.kind {
-                SeriesKind::Candlestick | SeriesKind::Bar | SeriesKind::Footprint => {
-                    let [high, low] = self
-                        .heikin_ashi_row(series.id, row)
-                        .map(|values| [values[1], values[2]])
-                        .unwrap_or_else(|| {
-                            [
-                                plot.value_at(row, PlotValueIndex::High),
-                                plot.value_at(row, PlotValueIndex::Low),
-                            ]
-                        });
-                    include(y_of(high), 0.0);
-                    include(y_of(low), 0.0);
-                }
-                SeriesKind::Histogram => {
-                    include(y_of(plot.value_at(row, PlotValueIndex::Close)), 0.0);
-                }
-                SeriesKind::Line | SeriesKind::Area | SeriesKind::Baseline => {
-                    // Baseline quadrants may override the width; clear the widest stroke.
-                    let width = [series.top_line_width, series.bottom_line_width]
-                        .into_iter()
-                        .flatten()
-                        .fold(series.line_width.unwrap_or(LINE_WIDTH), f64::max);
-                    let pad = width / 2.0;
-                    let y = y_of(plot.value_at(row, PlotValueIndex::Close));
-                    include(y, pad);
-                    for step in [-1_isize, 1] {
-                        let Some(neighbor) = row.checked_add_signed(step) else {
-                            continue;
-                        };
-                        let Some(neighbor_index) = plot.index_at(neighbor) else {
-                            continue;
-                        };
-                        if neighbor_index > render_end || plot.is_whitespace_row(neighbor) {
-                            continue;
-                        }
-                        let neighbor_y = y_of(plot.value_at(neighbor, PlotValueIndex::Close));
-                        let gap = (neighbor_index - index).abs() as f64 * bar_spacing;
-                        match series.line_type {
-                            // A stepped line runs flat at its own value, then turns at the next
-                            // bar: the previous bar's riser stands exactly on this bar's x.
-                            LineType::WithSteps => {
-                                if step < 0 {
-                                    include(neighbor_y, pad);
-                                }
+            SeriesKind::Histogram => {
+                include(y_of(plot.value_at(row, PlotValueIndex::Close)), 0.0);
+            }
+            SeriesKind::Line | SeriesKind::Area | SeriesKind::Baseline => {
+                // Baseline quadrants may override the width; clear the widest stroke.
+                let width = [series.top_line_width, series.bottom_line_width]
+                    .into_iter()
+                    .flatten()
+                    .fold(series.line_width.unwrap_or(LINE_WIDTH), f64::max);
+                let pad = width / 2.0;
+                let y = y_of(plot.value_at(row, PlotValueIndex::Close));
+                include(y, pad);
+                for step in [-1_isize, 1] {
+                    let Some(neighbor) = row.checked_add_signed(step) else {
+                        continue;
+                    };
+                    let Some(neighbor_index) = plot.index_at(neighbor) else {
+                        continue;
+                    };
+                    if neighbor_index > render_end || plot.is_whitespace_row(neighbor) {
+                        continue;
+                    }
+                    let neighbor_y = y_of(plot.value_at(neighbor, PlotValueIndex::Close));
+                    let gap = (neighbor_index - index).abs() as f64 * bar_spacing;
+                    match series.line_type {
+                        // A stepped line runs flat at its own value, then turns at the next
+                        // bar: the previous bar's riser stands exactly on this bar's x.
+                        LineType::WithSteps => {
+                            if step < 0 {
+                                include(neighbor_y, pad);
                             }
-                            LineType::Simple | LineType::Curved => {
-                                if gap > 0.0 {
-                                    let t = (half_width / gap).min(1.0);
-                                    include(y + (neighbor_y - y) * t, pad);
-                                }
+                        }
+                        LineType::Simple | LineType::Curved => {
+                            if gap > 0.0 {
+                                let t = (half_width / gap).min(1.0);
+                                include(y + (neighbor_y - y) * t, pad);
                             }
                         }
                     }
                 }
-                SeriesKind::Custom | SeriesKind::Feature => {}
             }
+            SeriesKind::Custom | SeriesKind::Feature => {}
         }
         extent
     }
@@ -383,15 +383,17 @@ impl ChartEngine {
             } else {
                 1.0
             };
-            let size = envelope.clamp(16.0, 22.0) * scale;
-            let stacked = fills.len() > 1
-                && executions[fills[fills.len() - 1]].marker_shape
-                    == crate::ExecutionMarkerShape::Arrow;
-            let height = if stacked {
-                size * STACKED_EXECUTION_HEIGHT / 70.0
+            let size = envelope.clamp(13.0, 18.0) * scale;
+            let chevrons = if executions[fills[fills.len() - 1]].marker_shape
+                == crate::ExecutionMarkerShape::Arrow
+            {
+                fills.len().min(MAX_EXECUTION_CHEVRONS)
             } else {
-                size
+                1
             };
+            let height = size
+                * (EXECUTION_ARROW_UNITS + EXECUTION_CHEVRON_PITCH * (chevrons - 1) as f64)
+                / EXECUTION_ARROW_UNITS;
             let target = PriceScaleTarget::from(executions[fills[0]].price_scale);
             let extent = self
                 .trading_bar_extent(pane_index, target, index, from, size / 2.0)
@@ -426,6 +428,7 @@ impl ChartEngine {
                     y,
                     size,
                     height,
+                    chevrons,
                 });
             }
             start = end;
@@ -1289,9 +1292,9 @@ impl ChartEngine {
     /// One execution mark centered on `(x_device, mark.y)`, drawn as open strokes with
     /// `Polyline`, the stroke primitive every executor antialiases identically. In design units
     /// (`size / 70`): a single fill is a 60-unit shaft with one chevron (wings 22 out and back
-    /// from the tip, stroke 10); several fills on one side of one bar become a 72-unit shaft
-    /// leading into four stacked chevrons 24 apart (wings 28 out and back, stroke 11), so a busy
-    /// bar reads as one mark rather than a pile of arrows.
+    /// from the tip, stroke 10). Each further fill on one side of one bar stacks one identical,
+    /// tailless chevron 24 units nearer the bar (up to [`MAX_EXECUTION_CHEVRONS`]), so the mark
+    /// counts the fills while only the outermost chevron carries the shaft.
     fn push_trading_execution_arrow(
         out: &mut Vec<Prim>,
         points: &mut Vec<[f32; 2]>,
@@ -1333,24 +1336,18 @@ impl ChartEngine {
                         color,
                     });
                 };
-                if mark.height > mark.size {
-                    // Centered on the 152-unit stacked extent: shaft from -76, tips at -4 + 24k.
-                    stroke(&[point(0.0, -76.0), point(0.0, -4.0)], 11.0);
-                    for k in 0..4 {
-                        let tip = -4.0 + 24.0 * f64::from(k);
-                        stroke(
-                            &[
-                                point(-28.0, tip - 28.0),
-                                point(0.0, tip),
-                                point(28.0, tip - 28.0),
-                            ],
-                            11.0,
-                        );
-                    }
-                } else {
-                    stroke(&[point(0.0, -30.0), point(0.0, 30.0)], 10.0);
+                // The outermost chevron (the newest fill) keeps the single arrow's shaft; every
+                // earlier fill adds one tailless chevron of the same size, one pitch nearer the bar.
+                let outer_tip = 30.0 - EXECUTION_CHEVRON_PITCH * (mark.chevrons - 1) as f64 / 2.0;
+                stroke(&[point(0.0, outer_tip - 60.0), point(0.0, outer_tip)], 10.0);
+                for k in 0..mark.chevrons {
+                    let tip = outer_tip + EXECUTION_CHEVRON_PITCH * k as f64;
                     stroke(
-                        &[point(-22.0, 8.0), point(0.0, 30.0), point(22.0, 8.0)],
+                        &[
+                            point(-22.0, tip - 22.0),
+                            point(0.0, tip),
+                            point(22.0, tip - 22.0),
+                        ],
                         10.0,
                     );
                 }

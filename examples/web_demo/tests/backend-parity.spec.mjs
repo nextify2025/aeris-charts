@@ -1113,7 +1113,7 @@ for (const kind of ["long_position", "short_position"]) {
 }
 
 for (const kind of ["long_position", "short_position"]) {
-  test(`${kind} stats render amounts, quantity and adaptive borders on both backends`, async ({ page }) => {
+  test(`${kind} stats render amounts, quantity and borderless labels on both backends`, async ({ page }) => {
     await page.addInitScript(() => {
       const original = CanvasRenderingContext2D.prototype.fillText;
       window.__position_stats_text = [];
@@ -1153,7 +1153,8 @@ for (const kind of ["long_position", "short_position"]) {
       const quantity = String(Number(stats.quantity.toFixed(3)));
       expect(stats.text.some((text) => text.includes(`, Qty: ${quantity}`))).toBe(true);
       expect(stats.text).toContain("Risk/reward ratio: 2");
-      for (const [color, border] of [["#089981", 0], ["#f7525f", 0], ["#0000ff", 255], ["#000000", 255], ["#ffffff", 0]]) {
+      // A contrast outline would read white on these surfaces; the solid label carries none.
+      for (const color of ["#0000ff", "#000000"]) {
         const label = await page.evaluate((color) => {
           window.__chart.apply_options({ layout: { background: { type: "solid", color } } });
           const [entry, target] = window.__chart.drawings().at(-1).points();
@@ -1163,7 +1164,7 @@ for (const kind of ["long_position", "short_position"]) {
           const target_y = window.__main.price_to_coordinate(target.price);
           const entry_y = window.__main.price_to_coordinate(entry.price);
           const y = target_y + (target_y < entry_y ? -14 : 14);
-          const size = Math.max(window.__chart.options().layout.fontSize * 0.92, 10);
+          const size = Math.max(window.__chart.options().layout.fontSize, 11);
           return { x: box.left + x, top: box.top + y - (size * 1.25 + 6) / 2, dpr: window.devicePixelRatio };
         }, color);
         await settle_page(page);
@@ -1175,11 +1176,11 @@ for (const kind of ["long_position", "short_position"]) {
           for (let dx = -15; dx <= 15; dx += 1) {
             const x = Math.round(label.x * label.dpr) + dx;
             const offset = (y * png.width + x) * 4;
-            if ([0, 1, 2].every((channel) => Math.abs(png.data[offset + channel] - border) < 16)) pixels += 1;
+            if ([0, 1, 2].every((channel) => png.data[offset + channel] > 239)) pixels += 1;
           }
           best = Math.max(best, pixels);
         }
-        expect(best, `${backend} border remains visible on ${color}`).toBeGreaterThan(25);
+        expect(best, `${backend} label has no white outline on ${color}`).toBeLessThan(3);
       }
       await page.locator("#position_account_size").fill("2000");
       await page.locator("#position_account_size").press("Tab");
