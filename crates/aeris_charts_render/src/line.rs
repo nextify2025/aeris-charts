@@ -1149,6 +1149,39 @@ pub fn build_area_fill(
     }
 }
 
+/// Where the band's upper segment `upper0 -> upper1` properly crosses its lower segment
+/// `lower0 -> lower1`, if it does. For a band whose two lines share their x positions this is the
+/// sign change of `upper - lower`; a general ribbon (a fan from one repeated point, an outline
+/// that doubles back) crosses only where the two segments really intersect, so a degenerate upper
+/// segment never does.
+pub fn band_crossing(
+    upper0: [f32; 2],
+    upper1: [f32; 2],
+    lower0: [f32; 2],
+    lower1: [f32; 2],
+) -> Option<[f32; 2]> {
+    let orient = |a: [f32; 2], b: [f32; 2], p: [f32; 2]| {
+        (f64::from(b[0]) - f64::from(a[0])) * (f64::from(p[1]) - f64::from(a[1]))
+            - (f64::from(b[1]) - f64::from(a[1])) * (f64::from(p[0]) - f64::from(a[0]))
+    };
+    let (lower_start, lower_end) = (
+        orient(upper0, upper1, lower0),
+        orient(upper0, upper1, lower1),
+    );
+    let (upper_start, upper_end) = (
+        orient(lower0, lower1, upper0),
+        orient(lower0, lower1, upper1),
+    );
+    if lower_start * lower_end >= 0.0 || upper_start * upper_end >= 0.0 {
+        return None;
+    }
+    let t = upper_start / (upper_start - upper_end);
+    Some([
+        (f64::from(upper0[0]) + (f64::from(upper1[0]) - f64::from(upper0[0])) * t) as f32,
+        (f64::from(upper0[1]) + (f64::from(upper1[1]) - f64::from(upper0[1])) * t) as f32,
+    ])
+}
+
 /// Two triangles for one band segment. At a boundary crossing, split at the intersection so
 /// the two filled lobes meet at one point instead of making an overlapping bow-tie quad.
 pub fn band_segment_triangles(
@@ -1157,22 +1190,9 @@ pub fn band_segment_triangles(
     lower0: [f32; 2],
     lower1: [f32; 2],
 ) -> [[f32; 2]; 6] {
-    let d0 = upper0[1] - lower0[1];
-    let d1 = upper1[1] - lower1[1];
-    if d0 * d1 < 0.0 {
-        let t = d0 / (d0 - d1);
-        let upper = [
-            upper0[0] + (upper1[0] - upper0[0]) * t,
-            upper0[1] + (upper1[1] - upper0[1]) * t,
-        ];
-        let lower = [
-            lower0[0] + (lower1[0] - lower0[0]) * t,
-            lower0[1] + (lower1[1] - lower0[1]) * t,
-        ];
-        let crossing = [(upper[0] + lower[0]) * 0.5, (upper[1] + lower[1]) * 0.5];
-        [upper0, lower0, crossing, crossing, lower1, upper1]
-    } else {
-        [upper0, lower0, lower1, upper0, lower1, upper1]
+    match band_crossing(upper0, upper1, lower0, lower1) {
+        Some(crossing) => [upper0, lower0, crossing, crossing, lower1, upper1],
+        None => [upper0, lower0, lower1, upper0, lower1, upper1],
     }
 }
 
@@ -2574,6 +2594,23 @@ mod tests {
         assert!(
             at_lowest.color[3] < 0.1,
             "lowest line point fades to the bottom color"
+        );
+    }
+    /// A ribbon that is not a pair of x-aligned lines (a fan from one repeated hub, an outline
+    /// that doubles back) is filled as plain quads: only a real intersection of the two boundary
+    /// segments splits one, never a sign change of `upper - lower`.
+    #[test]
+    fn band_segments_split_only_where_their_boundaries_intersect() {
+        let crossed = band_segment_triangles([0.0, 0.0], [10.0, 10.0], [0.0, 5.0], [10.0, 5.0]);
+        assert_eq!(crossed[2], [5.0, 5.0]);
+        assert_eq!(crossed[3], [5.0, 5.0]);
+
+        let hub = [0.0, 0.0];
+        let (a, b) = ([-3.0, 4.0], [5.0, -4.0]);
+        assert_eq!(
+            band_segment_triangles(hub, hub, a, b),
+            [hub, a, b, hub, b, hub],
+            "a fan wedge whose outline passes the hub's level stays whole"
         );
     }
 }

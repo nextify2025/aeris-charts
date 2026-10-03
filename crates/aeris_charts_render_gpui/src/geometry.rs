@@ -817,8 +817,7 @@ pub(crate) fn band_fill_mesh(
             point(&scratch.band_lower[i]),
             point(&scratch.band_lower[i + 1]),
         );
-        if (u0[1] - l0[1]) * (u1[1] - l1[1]) < 0.0 {
-            let crossing = aeris_charts_render::line::band_segment_triangles(u0, u1, l0, l1)[2];
+        if let Some(crossing) = aeris_charts_render::line::band_crossing(u0, u1, l0, l1) {
             scratch.verts.push(crossing);
             scratch.contour.push(crossing);
             finish_lobe(&mut scratch.verts, &scratch.contour, pool);

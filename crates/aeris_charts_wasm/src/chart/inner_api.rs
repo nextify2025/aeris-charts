@@ -2308,14 +2308,6 @@ impl ChartInner {
         self.engine.set_calendar_date_axis(calendar_dates);
     }
 
-    /// Label flags for package-owned time text: bit 0 `timeVisible`, bit 1 `secondsVisible`,
-    /// bit 2 calendar-date axis.
-    pub fn time_label_flags(&self) -> u32 {
-        u32::from(self.engine.time_visible)
-            | (u32::from(self.engine.seconds_visible) << 1)
-            | (u32::from(self.engine.exchange_time().calendar_dates()) << 2)
-    }
-
     /// Exchange-local wall-clock seconds for a UTC timestamp (identity for calendar dates).
     pub fn exchange_local_seconds(&self, time: f64) -> f64 {
         if !time.is_finite() {

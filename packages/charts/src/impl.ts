@@ -63,7 +63,7 @@ import {
 } from "./types.js";
 import { default_theme_name, theme_options, theme_palette, type theme_name } from "./theme.js";
 import {
-  exchange_time_json, format_exchange_seconds, resolve_time_zone, split_exchange_time_options,
+  exchange_time_json, resolve_time_zone, split_exchange_time_options,
   time_label_context_for, type engine_time_tick_marks,
 } from "./time_zone.js";
 
@@ -2993,12 +2993,6 @@ export function attach_native_accessibility_focus(
   };
 }
 
-/** Exchange-time text for a chart timestamp (package-owned DOM surfaces). */
-export function chart_time_text(chart: chart_api, seconds: number): string {
-  if (chart instanceof chart_impl) return chart.format_time_text(seconds);
-  return format_exchange_seconds(seconds, undefined, seconds % 86_400 !== 0, false);
-}
-
 export function attach_native_session_highlighting(
   series: series_api,
   options_json: string,
@@ -5201,31 +5195,6 @@ export class chart_impl implements chart_api {
       ? null
       : (time: number, tick_mark_type: number) =>
         formatter(time, tick_mark_type, this.formatter_locale(), this.time_label_context(time)));
-  }
-
-  /**
-   * Time text for package-owned surfaces (tooltip, accessibility): the host `time_formatter`
-   * when installed, else a locale date — plus time of day for intraday rows — in the chart's
-   * exchange time. `identity_seconds` is a bar's open time; the text prints its label time (the
-   * close under `time_scale.bar_time_label`). Calendar-date rows always show their own date.
-   */
-  format_time_text(identity_seconds: number): string {
-    const seconds = this.wasm.bar_label_time(identity_seconds);
-    const formatter = this.host_time_formatter;
-    if (formatter !== undefined) {
-      try {
-        const text = formatter(seconds, this.time_label_context(seconds));
-        if (typeof text === "string") return text;
-      } catch (error) {
-        console.error("aeris_charts: localization.time_formatter threw", error);
-      }
-    }
-    const flags = this.wasm.time_label_flags();
-    const local = this.wasm.exchange_local_seconds(seconds);
-    const calendar = (flags & 4) !== 0;
-    const with_time = !calendar && ((flags & 1) !== 0 || local % 86_400 !== 0);
-    const with_seconds = with_time && ((flags & 2) !== 0 || local % 60 !== 0);
-    return format_exchange_seconds(local, this.locale_setting, with_time, with_seconds);
   }
 
   private stop_countdown_timer(): void {
@@ -7610,6 +7579,11 @@ export class chart_impl implements chart_api {
     this.consume_input_events();
     if (this.wasm.frame_pending()) this.repaint();
     return true;
+  }
+
+  /** Keyboard-reachable handle count of a drawing (0 when unknown or not placeable). */
+  drawing_handle_count(id: number): number {
+    return Math.max(0, this.wasm.drawing_handle_count(id));
   }
 
   /** The open keyboard drawing edit: the drawing and its focused anchor (`null` moves it all). */

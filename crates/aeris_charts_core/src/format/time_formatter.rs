@@ -285,7 +285,8 @@ pub fn format_crosshair_time_with(
 }
 
 /// [`format_crosshair_time_with`] in exchange time: the instant's exchange wall-clock date and
-/// time. Calendar-date rows keep their own date.
+/// time. Calendar-date rows keep their own date and print no time of day, whatever `time_visible`
+/// says: a trading day has no clock time to show.
 pub fn format_crosshair_time_in(
     ts: i64,
     time_visible: bool,
@@ -296,7 +297,7 @@ pub fn format_crosshair_time_in(
 ) -> String {
     let ts = time.local_seconds(ts);
     let date = format_date_pattern(ts, date_format, months);
-    if !time_visible {
+    if !time_visible || time.calendar_dates() {
         return date;
     }
     let (h, m, s) = hms(ts);
@@ -350,6 +351,32 @@ mod tests {
         assert_eq!(
             format_crosshair_time_in(ts, true, false, "dd MMM yyyy", english_months(), &new_york),
             "01 Jan 2026   23:30"
+        );
+    }
+
+    #[test]
+    fn calendar_date_rows_print_no_time_of_day() {
+        use crate::time_zone::ChartTimeZone;
+        let mut exchange = ExchangeTime::new(
+            ChartTimeZone::parse("America/New_York")
+                .unwrap()
+                .offset_schedule()
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        // 2024-01-08 at UTC midnight: a business day, not an instant.
+        let ts = 1_704_672_000;
+        assert_eq!(
+            format_crosshair_time_in(ts, true, true, "dd MMM yyyy", english_months(), &exchange),
+            "07 Jan 2024   19:00:00",
+            "an instant is shifted to exchange time and prints its clock time"
+        );
+        exchange.set_calendar_dates(true);
+        assert_eq!(
+            format_crosshair_time_in(ts, true, true, "dd MMM yyyy", english_months(), &exchange),
+            "08 Jan 2024",
+            "a calendar date keeps its own date and prints no time"
         );
     }
 

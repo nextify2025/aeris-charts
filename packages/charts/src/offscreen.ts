@@ -8,7 +8,7 @@ import {
   apply_series_time_alignment, assert_live_series, ensure_init, normalize_time_tick_marks, time_to_utc_seconds,
   validate_series_time_alignment,
 } from "./impl.js";
-import { controller_pointer_flags } from "./gestures.js";
+import { controller_pointer_flags, wheel_pixel_ratio } from "./gestures.js";
 import { AerisChartsError } from "./errors.js";
 import { default_theme_name, theme_options, theme_palette, type theme_name } from "./theme.js";
 import { exchange_time_json, split_exchange_time_options } from "./time_zone.js";
@@ -725,7 +725,7 @@ export class offscreen_chart {
       event.delta_x,
       event.delta_y,
       event.delta_mode ?? 0,
-      event.pixel_ratio ?? 1,
+      event.pixel_ratio ?? wheel_pixel_ratio(this.dpr),
       modifiers,
       behavior,
       true,

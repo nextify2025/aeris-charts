@@ -589,7 +589,8 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points()).toEqual(start_points);
 
-  // Keyboard: Enter edits, Tab cycles to the box handle, and each arrow is one undo step.
+  // Keyboard: Enter edits, Tab cycles to the box handle, the arrows move it live, and Enter
+  // commits the whole session as one undo step.
   const handles = await page.evaluate((id) => {
     const chart = window.__chart;
     chart.accessibility().focus_target(`drawing:${id}`);
@@ -610,7 +611,7 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   expect(keyed[1].x).toBeCloseTo(start[1].x + 1, 2);
   expect(keyed[1].y).toBeCloseTo(start[1].y - 10, 2);
   expect((await points())[0]).toEqual(start_points[0]);
-  expect(await page.evaluate(() => window.__chart.undo_drawing() && window.__chart.undo_drawing())).toBe(true);
+  expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points()).toEqual(start_points);
 
   // Hidden: no paint and no hover target; the drawing stays in the list.

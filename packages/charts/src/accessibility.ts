@@ -2,7 +2,6 @@
 
 import {
   attach_native_accessibility_focus,
-  chart_time_text,
   time_to_utc_seconds,
 } from "./impl.js";
 import type { native_accessibility_focus_handle } from "./impl.js";
@@ -822,9 +821,9 @@ class PaneAccessibility {
 
   private format_time(value: time): string {
     if (this.controller.options.time_formatter !== undefined) return this.controller.options.time_formatter(value);
-    // The chart's host `localization.time_formatter`, else a locale date in the chart's exchange
-    // time zone with the time of day for intraday rows (calendar dates keep their own date).
-    return chart_time_text(this.controller.chart, time_to_utc_seconds(value));
+    // The chart's own crosshair label: host `localization.time_formatter`, else its date_format in
+    // the chart's exchange time zone, with the time of day for intraday rows.
+    return this.controller.chart.format_time_label(value);
   }
 
   private describe_values(point: series_data, series = this.active_series()): string {

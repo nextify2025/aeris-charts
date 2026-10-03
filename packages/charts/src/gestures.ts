@@ -8,6 +8,29 @@ export function controller_pointer_flags(device: number, modifiers: number, opti
   return (((options & 0xffff) << 16) | ((modifiers & 0xff) << 8) | (device & 0xff)) >>> 0;
 }
 
+// reference `windowsChrome` = isChromiumBased() && isWindows(), resolved lazily so non-browser runs
+// and workers (which have `navigator` but no `window`) share it.
+let windows_chrome: boolean | null = null;
+function is_windows_chromium(): boolean {
+  if (windows_chrome === null) {
+    const nav = (typeof navigator === "undefined" ? undefined : navigator) as
+      | (Navigator & { userAgentData?: { platform?: string; brands?: { brand: string }[] } })
+      | undefined;
+    const chromium = nav?.userAgentData?.brands?.some((brand) => brand.brand.includes("Chromium")) === true;
+    const windows = nav?.userAgentData?.platform
+      ? nav.userAgentData.platform === "Windows"
+      : nav?.userAgent.toLowerCase().includes("win") === true;
+    windows_chrome = chromium && windows;
+  }
+  return windows_chrome;
+}
+
+/** The pixel ratio the engine divides pixel-mode wheel deltas by: Windows Chromium reports them in
+ *  device pixels, every other browser in CSS pixels. The worker passes its chart's ratio. */
+export function wheel_pixel_ratio(device_pixel_ratio: number): number {
+  return is_windows_chromium() && device_pixel_ratio > 0 ? device_pixel_ratio : 1;
+}
+
 type modifier_sample = { shiftKey: boolean; ctrlKey: boolean; altKey: boolean; metaKey: boolean };
 type point = { x: number; y: number };
 const enum InputDeviceCode { Mouse = 0, Touch = 1, Pen = 2 }
@@ -27,7 +50,6 @@ export function install_gestures(chart: chart_impl): () => void {
   let input_wake_timer: ReturnType<typeof setTimeout> | null = null;
   let input_wake_deadline: number | null = null;
   let scroll_anim: number | null = null;
-  let windows_chrome: boolean | null = null;
 
   const local_xy = (event: { clientX: number; clientY: number }): point => {
     const bounds = overlay.getBoundingClientRect();
@@ -152,6 +174,9 @@ export function install_gestures(chart: chart_impl): () => void {
     wasm.controller_pointer_move(event.pointerId, position.x, position.y,
       event.timeStamp || performance.now(), (event.buttons & 1) !== 0,
       flags(device_code(event.pointerType), event));
+    // The browser already delivers one move per display frame, so a captured stroke takes this
+    // sample now instead of waiting for a prepaint flush that DOM hosts do not have.
+    wasm.controller_flush_coalesced_input();
     sync_controller_pointer();
   };
   const on_up = (event: PointerEvent) => {
@@ -237,6 +262,7 @@ export function install_gestures(chart: chart_impl): () => void {
       const position = local_xy(touch);
       wasm.controller_pointer_move(touch.identifier, position.x, position.y,
         event.timeStamp || performance.now(), true, packed);
+      wasm.controller_flush_coalesced_input();
     }
     sync_controller_pointer();
   };
@@ -263,17 +289,7 @@ export function install_gestures(chart: chart_impl): () => void {
   const on_wheel = (event: WheelEvent) => {
     const cfg = chart.gesture_config();
     const position = local_xy(event);
-    if (windows_chrome === null) {
-      const nav = navigator as Navigator & {
-        userAgentData?: { platform?: string; brands?: { brand: string }[] };
-      };
-      const chromium = nav.userAgentData?.brands?.some((brand) => brand.brand.includes("Chromium")) === true;
-      const windows = nav.userAgentData?.platform
-        ? nav.userAgentData.platform === "Windows"
-        : navigator.userAgent.toLowerCase().includes("win");
-      windows_chrome = chromium && windows;
-    }
-    const pixel_ratio = windows_chrome ? window.devicePixelRatio : 1;
+    const pixel_ratio = wheel_pixel_ratio(window.devicePixelRatio);
     const behavior = cfg.wheel_behavior === "pan" ? 1 : cfg.wheel_behavior === "zoom" ? 2 : 0;
     const consumed = wasm.input_wheel(position.x, position.y, event.deltaX, event.deltaY,
       event.deltaMode, pixel_ratio, modifiers(event), behavior, cfg.wheel_scroll, cfg.wheel_zoom,

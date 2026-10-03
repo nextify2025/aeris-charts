@@ -4710,11 +4710,6 @@ impl AerisChart {
         self.inner.borrow().bar_label_time(time)
     }
 
-    /// Bit 0 `timeVisible`, bit 1 `secondsVisible`, bit 2 calendar-date axis.
-    pub fn time_label_flags(&self) -> u32 {
-        self.inner.borrow().time_label_flags()
-    }
-
     /// 0 = normal, 1 = magnet (reference default), 2 = hidden, 3 = magnet OHLC.
     pub fn set_crosshair_mode(&mut self, mode: u8) {
         self.inner.borrow_mut().set_crosshair_mode(mode);
