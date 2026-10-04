@@ -499,6 +499,10 @@ export function install_general_dashboard({ root, backend = "auto", theme = "dar
         series_kinds: state.entry.series.map((handle) => handle.kind),
       }]);
     },
+    // Test handle: the mounted cards' live chart, pane, and series handles.
+    active_entries() {
+      return states.flatMap((state) => state.entry === null ? [] : [state.entry]);
+    },
     set_active,
     set_theme,
     dispose() {
