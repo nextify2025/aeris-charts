@@ -4178,7 +4178,7 @@ export interface timeline_mark_hit {
 
 export type timeline_mark_click_handler = (hit: timeline_mark_hit) => void;
 
-/** The engine-owned timeline-mark lane; see `docs/Public_api.md` "Timeline marks". */
+/** The engine-owned timeline-mark lane; see `docs/api/presentation.md` (时间线标记). */
 export interface timeline_marks_api {
   /** Replace marks and groups atomically; throws `invalid_data`/`resource_limit`. */
   set(snapshot: timeline_marks_snapshot): void;
