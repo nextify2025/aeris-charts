@@ -14,6 +14,7 @@
 | 成交聚合与 OHLCV 重采样 | [聚合](aggregation.md) |
 | 绘图锚点、磁吸、复权与工具目录 | [绘图](drawings.md) |
 | 通用系列、坐标轴与类型化数据 | [通用图表](general-charts.md) |
+| 十字光标遮罩、基线参考线、实时柱缓动、时间线标记 | [呈现扩展](presentation.md) |
 | 错误、生命周期、持久化与版本策略 | [兼容性](compatibility.md) |
 | Rust/GPUI 接入与固定修订升级 | [Rust 接入](rust.md) |
 
@@ -49,6 +50,10 @@
 - 新增的 `wheel_behavior` 图表选项（`auto`、`pan` 或 `zoom`）；现有的手势选项名称保持兼容；
 - 时间比例尺视口契约：数据更新（历史前插、乱序插入、缺口回填、保留期修剪）绝不会移动已向后滚动的视图，而实时边缘按 `shift_visible_range_on_new_bar` 跟随新柱；`set_visible_logical_range()` 保留小数边界；`scroll_to_real_time()` 以动画滚动到已配置的 `right_offset`；键盘时间比例尺移动遵循 `handle_scroll`/`handle_scale`；在处理函数同步修改数据之后，可见范围订阅者始终以最终范围收尾；
 - 新增的 `lock_visible_logical_range` 时间比例尺选项（默认 `false`），用于固定的整交易时段视图，例如分时图：将每个交易时段槽位安装为空白数据，调用 `set_visible_logical_range({ from: 0, to: slots - 1 })`，该范围从开盘前状态直到收盘，在数据更新和尺寸调整期间始终保持精确；
+- 新增的 `crosshair.shadeRight` 图表选项（`{ visible, color }`，默认关闭）：悬停柱右侧窗格区域上的半透明遮罩，见[十字光标右侧遮罩](presentation.md#十字光标右侧遮罩)；
+- 新增的基线系列选项 `baseline_mode`（`"visible_midpoint"` 或 `"close_before_visible_range"`）、`baseline_line_visible`、`baseline_line_color`、`baseline_line_width`、`baseline_line_style`，以及只读查询 `series.baseline_price()`（`baselinePrice()`），见[基线参考线与基线模式](presentation.md#基线参考线与基线模式)；
+- 新增的按系列选项 `live_bar_easing_ms`（默认 `0`，即关闭）：对已绘制最后一根柱的同一时间替换会让其显示的最高/最低/收盘价向新值滑动，而每个查询都保持真实值，见[实时柱缓动](presentation.md#实时柱缓动)；
+- 由引擎拥有的时间线标记带，通过 `chart.timeline_marks()`（`set`、`state`、`set_visible`、`set_group_hidden`、`hidden_groups`、`hit_at`）暴露，以及携带已解析命中的 `subscribe_timeline_mark_click` 结果，见[时间线标记](presentation.md#时间线标记)；隐藏分组作为可选的 V1/V2/V3 字段 `hidden_mark_groups` 持久化；
 - `AerisChartsError` 及其机器可读的错误码；
 - 通过 `chart.export_state()` 和 `chart.import_state()` 实现的版本化图表状态持久化：V1 金融布局、V2 通用状态与 V3 金融研究，详见[持久化契约](compatibility.md#持久化-v1)。
 - 面向常见 JavaScript 生命周期的驼峰命名别名（`createChart`、`initWasm`、图表/系列/比例尺创建与数据方法），同时每个现有的蛇形命名入口在相同句柄上仍受支持；
