@@ -82,7 +82,7 @@ impl FibonacciLabelVAlign {
 }
 
 /// Fibonacci-family options (`tool_options.fibonacci`); absent fields keep their defaults.
-/// Each tool reads the fields its schema lists (see `docs/Public_api.md`).
+/// 每个工具读取其 schema 列出的字段，参见 `docs/api/drawings.md`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FibonacciToolOptions {

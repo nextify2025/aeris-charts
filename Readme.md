@@ -4,6 +4,8 @@ Aeris Charts 是面向 [Aeris Terminal](https://aeristerminal.com) 和浏览器�
 
 该项目包含专业的图表交互、绘图、技术指标、多窗格与多比例尺、自定义系列、图元、共享内存行情数据输入，以及后端一致性工具。
 
+[文档导航](docs/README.md) · [架构总览](docs/Architecture.md) · [公共 API](docs/api/README.md) · [开发验证](docs/development/validation.md)
+
 ## Rust crate
 
 Rust 宿主通过 Git 或路径依赖，从本仓库依赖 `aeris_charts_*` crate；这些 crate 不会发布到 crates.io。`aeris_charts_engine` 拥有图表状态、交互、绘图、指标和帧构建，宿主将其与渲染器（例如 `aeris_charts_render_wgpu` 或 `aeris_charts_native`）搭配使用（参见[仓库结构](#仓库结构)）。
@@ -129,15 +131,14 @@ const profile = create_volume_profile(candles, {
 
 Aeris 已经拥有的功能——绘图（包括 Long Position 和 Short Position 工具、价格区间、日期区间以及日期与价格区间测量工具，还有 Shift 点击快速测量）、价格带、价格线、叠加比例尺、局部最新价格线、交易时段着色、高亮柱槽位以及按时间锚定的成交量分布——都是这些引擎 API 之上的薄辅助层。无障碍默认启用；`chart.accessibility()` 返回其单例控制器，`enable_accessibility(chart, options)` 为保持兼容而配置同一个实例。键盘/ARIA 节点和播报仍属于浏览器 DOM 外壳，而有界的数据查询、焦点几何、绘图编辑和渲染图元则使用共享引擎。除非启用 `announce_data_updates`，流式行情更新保持静默。每个带有 `detach()` 的返回功能句柄都会释放其引擎状态和宿主状态。
 
-浏览器输入对鼠标和触控笔使用 Pointer Events，并对动态页面滚动仲裁使用可取消的 Touch Events。引擎拥有有界的手势状态、5 px 拖动阈值、固定起始质心的累计捏合行为、主触点延续、取消，以及感知设备的命中容差。滚轮策略可通过 `wheel_behavior: "auto" | "pan" | "zoom"` 配置；参考固定的公共参考实现夹具中测得的行为，auto 在窗格或任一坐标轴上独立地根据垂直增量缩放时间、根据水平增量平移时间，没有 Ctrl/Shift 特例。显式的 `pan` 和 `zoom` 值保留 Aeris 的扩展路由。
+浏览器输入对鼠标和触控笔使用 Pointer Events，并对动态页面滚动仲裁使用可取消的 Touch Events。引擎拥有有界的手势状态、5 px 拖动阈值、固定起始质心的累计捏合行为、主触点延续、取消，以及感知设备的命中容差。滚轮策略可通过 `wheel_behavior: "auto" | "pan" | "zoom"` 配置；参考固定的公共参考实现夹具中测得的行为，auto 默认根据垂直增量缩放时间、根据水平增量平移时间。普通滚轮遵循 `right_bar_stays_on_scroll`，Ctrl/Cmd + 滚轮围绕指针缩放；价格轴滚轮缩放可通过 `price_axis_wheel_zoom` 显式启用。显式的 `pan` 和 `zoom` 值保留 Aeris 的扩展路由。
 
 ## 交易与订单管理
 
-交易对象是独立的自有引擎领域。应用提供权威的持仓、挂单、括号/OCO 关系、成交以及品种元数据；Aeris 拥有它们的确定性可视化、原生坐标轴标签、命中测试、风险/回报区域以及本地交互预览。拖动绝不会改写已确认的券商状态。即时模式在释放时发出一个类型化的、与券商无关的意图；手动模式则将预览保留在内联的 Confirm 和 Discard 控件之后。宿主用已接受的状态更新来协调已确认的预览，或显式拒绝它。风险/回报填充仅属于活动预览，绝不属于已确认的订单。
+交易对象是独立的自有引擎领域。应用提供权威的持仓、挂单、括号/OCO 关系、成交以及品种元数据；Aeris 拥有它们的确定性可视化、原生坐标轴标签、命中测试、风险/回报区域以及本地交互预览。拖动只产生本地预览；释放时发出一个类型化的、与券商无关的意图，并在图表内应用现有对象的变更，同时保留回滚信息。确认流程由宿主围绕意图执行，不是图表内的 Confirm/Discard 模式。宿主接受意图后推送权威更新，拒绝则恢复对象原状。风险/回报填充仅属于活动预览，绝不属于已确认的订单。
 
 ```ts
 const trading = chart.trading();
-trading.set_confirmation_mode("manual"); // Optional; the default is "instant".
 trading.apply_snapshot({
   instrument: { tick_size: 0.25, price_precision: 2, point_value: 50, currency: "USD" },
   positions: [{ id: "position-1", side: "long", average_price: 5230, quantity: 2 }],
@@ -188,11 +189,11 @@ import "@aeristerminal/aeris-charts/design.css";
 - `docs`——架构、公共 API、领域模型和贡献文档。
 - `plan`——现行的产品与扩展计划。
 
-有关所有权、数据流和后端边界，参见 [Architecture.md](docs/Architecture.md)。有关受支持/实验性接口、持久化、错误和版本策略，参见 [Public_api.md](docs/Public_api.md)。
+完整入口见[文档导航](docs/README.md)。架构按数据基础、引擎领域、渲染与宿主边界分目录维护，详见[架构总览](docs/Architecture.md)；接入与兼容性契约见[公共 API](docs/api/README.md)。
 
 ## 开发
 
-前置条件：稳定版 Rust、`wasm32-unknown-unknown` 目标、`wasm-pack`、Bun，以及 Node.js 18 或更新版本（`node` 脚本和 Playwright 在 Node 上运行）。
+开发工具链与 CI 对齐：Rust 版本由 `rust-toolchain.toml` 固定，另需 `wasm32-unknown-unknown` 目标、`wasm-pack` 0.15.0、Bun 1.4.2 和 Node.js 24。完整环境与平台要求见[验证门禁](docs/development/validation.md)。
 
 ```sh
 cargo test --workspace
@@ -205,7 +206,7 @@ bun run typecheck
 bun run test:pack
 ```
 
-完整的验证门禁记录在 [AGENTS.md](AGENTS.md) 中，并由 CI 强制执行。贡献要求记录在 [CONTRIBUTING.md](docs/CONTRIBUTING.md) 中。
+上面是常用检查，不代替[完整验证门禁](docs/development/validation.md)。工作流程见 [AGENTS.md](AGENTS.md)，贡献要求见[贡献指南](docs/development/contributing.md)。
 
 ## 性能证据
 
@@ -215,7 +216,7 @@ bun run test:pack
 
 Aeris Charts 是开源软件，依据 [GNU Affero General Public License v3.0](LICENSE) 授权，其 SPDX 表达式为 `AGPL-3.0-only`。AGPL 允许商业使用、修改和再分发，但须遵守其 copyleft 与对应源代码要求，包括其中关于网络交互的条款。
 
-无法遵守 AGPL 的组织，可以获取单独的 Aeris Terminal Commercial License，用于专有集成、再分发、OEM/嵌入式使用、白标使用、支持和定制工程。商业选项是一份单独的协议；它不会为公开的 AGPL 授权增加任何限制。参见 [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)。
+无法遵守 AGPL 的组织，可以获取单独的 Aeris Terminal Commercial License，用于专有集成、再分发、OEM/嵌入式使用、白标使用、支持和定制工程。商业选项是一份单独的协议；它不会为公开的 AGPL 授权增加任何限制。商业许可条款需另行与 Aeris Terminal 确认。
 
 ## 独立开发与第三方参考
 
@@ -223,4 +224,4 @@ Aeris Charts 是独立设计和实现的。公开文档、公开示例以及对�
 
 KLineChart 指标移植是例外：其公式转译自 [KLineChart](https://github.com/klinecharts/KLineChart) v10.0.3（Apache-2.0），并在 [NOTICE](NOTICE) 和模块文档中注明出处。
 
-开发测试通过 Lightweight Charts 的公共 API，将其作为固定版本的 Apache-2.0 依赖使用。该依赖不包含在已发布的 `@aeristerminal/aeris-charts` 包中。TradingView 和 Lightweight Charts 是其各自所有者的商标；Aeris Charts 与 TradingView 没有隶属关系，也未获得 TradingView 的认可。参见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+开发测试通过 Lightweight Charts 的公共 API，将其作为固定版本的 Apache-2.0 依赖使用。该依赖不包含在已发布的 `@aeristerminal/aeris-charts` 包中。TradingView 和 Lightweight Charts 是其各自所有者的商标；Aeris Charts 与 TradingView 没有隶属关系，也未获得 TradingView 的认可。仓库中的第三方实现归属见 [NOTICE](NOTICE)。

@@ -19,7 +19,7 @@ rustflags = ["-C", "target-feature=+simd128"]
 # `chrono-tz`. Its `filter-by-regex` feature generates the tz tables at build time and keeps only the zones
 # this expression matches (the parity ids plus `Asia/Almaty`, whose rules `Asia/Astana` uses). That cuts the
 # wasm module by about 540 KB raw / 35 KB brotli against the complete database (isolated wasm32 build; see
-# docs/Architecture.md). Like the simd flag above it lives here so local builds, `wasm-pack` and CI agree.
+# docs/development/performance.md). Like the simd flag above it lives here so local builds, `wasm-pack` and CI agree.
 # Consumers that depend on the repository by Git do not read this file and compile the complete database,
 # which costs nothing but native binary size. An unset or empty value means "no filtering"; an invalid
 # regex fails the build. `time_zone::tests::every_tradingview_zone_parses` fails if a zone of

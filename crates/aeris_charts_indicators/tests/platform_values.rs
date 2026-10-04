@@ -2,9 +2,9 @@
 //!
 //! Rule sources: 通达信's official formula help, https://help.tdx.com.cn/gspt/ (the page
 //! "通达信指标公式算法释疑" and its function reference: `EMA`, `SMA(X,N,M)` started at its first
-//! input, `HHV`/`LLV` over the bars available). The rules were cross-checked on 2026-09-28 against
-//! a public provider's server-computed values for real A-share bars; that data is not committed
-//! here (the evidence is summarised in `docs/Public_api.md`). The rules this file pins:
+//! input, `HHV`/`LLV` over the bars available).
+//! 这些规则于 2026-09-28 与公开提供方基于真实 A 股柱的服务端计算值交叉验证；
+//! 该数据不提交到仓库，证据摘要见 `docs/api/indicators.md`。本文件固定以下规则：
 //!
 //! - MACD(12,26,9), China convention: `EMA(X,N)` is `Y = (2X + (N-1)Y') / (N+1)` started at
 //!   `Y0 = X0`, `DIF = EMA(C,12) - EMA(C,26)`, `DEA = EMA(DIF,9)` (so DIF = DEA = 0 on the first

@@ -113,7 +113,7 @@ Aeris Charts 将成为完整的**无头**专业交易图表引擎：订单流、
 - [x] 完整门禁通过；基准测试门禁的变更已提交并推送；里程碑证据已记录。
 - [x] 里程碑证据：订单流的截图、无障碍评审和已记录的基准测试。
 
-目前的实现证据：`chart_trade_stream_is_shared_by_bound_footprint_dependents`、`cvd_and_delta_dependents_follow_late_corrections_and_report_rebuilds`、`trade_bubbles_are_bounded_and_rebuilt_from_the_shared_tape` 和 `footprint_retention_evicts_shared_studies_with_the_same_bar_boundary` 覆盖共享修订号、派生研究更新、有界标记和保留。Rust、WASM 和 TypeScript API 暴露相同的流/依赖方契约。原生 release `perf_gate` 现在会演练共享研究成交带、末端/更正路径、保留以及依赖方的增量工作。release 版 `aeris_charts_render_gpui/examples/plan_bench` 还包含一个确定性的详细 LOD 足迹图夹具，并报告图元/文本数量以及 p50/p95/p99 场景转换开销。该基准测试止于 GPUI 场景构建，而原生 `perf_gate` Target J 覆盖 WebGPU 的 CPU 侧帧编码，并验证每个已解析的密集文本段都已被调度。两个基准测试均不覆盖原生窗口的文本整形或实际的 GPU 呈现时间；`gpui_probe` 现在接受 `AERIS_CHARTS_PROBE_FEATURE=footprint` 用于该真实窗口捕获（它不打印帧数据）。截图与无障碍里程碑记录在 `docs/Footprint.md` 中。截图工具接受 `AERIS_CHARTS_GPUI_FEATURE=footprint`，并为密集的 12 柱夹具输出感知 DPR 的 PNG 及元数据；在修复该工具、使其通过 GPUI 准备帧传递已配置的帧背景之后，该捕获已在当前 Windows 显示器上演练过。观察到的 30 帧足迹图探测运行记录在 `docs/Footprint.md` 中；它仍然只是特定机器上的证据，而非可移植的预算。当前 release 门禁也验证 WebGPU 执行器路径：Target J 调度全部 120 个已解析的密集文本段，并测得 CPU 侧帧编码 p99 为 0.00 ms，对照 2.00 ms 的预算；浏览器足迹图测试套件通过其六个 Chromium 用例，包括 WebGPU 共享帧用例。GPUI 探测仍是特定机器上的证据，而可移植的 release 预算现在已覆盖两侧执行器。
+目前的实现证据：`chart_trade_stream_is_shared_by_bound_footprint_dependents`、`cvd_and_delta_dependents_follow_late_corrections_and_report_rebuilds`、`trade_bubbles_are_bounded_and_rebuilt_from_the_shared_tape` 和 `footprint_retention_evicts_shared_studies_with_the_same_bar_boundary` 覆盖共享修订号、派生研究更新、有界标记和保留。Rust、WASM 和 TypeScript API 暴露相同的流/依赖方契约。原生 release `perf_gate` 现在会演练共享研究成交带、末端/更正路径、保留以及依赖方的增量工作。release 版 `aeris_charts_render_gpui/examples/plan_bench` 还包含一个确定性的详细 LOD 足迹图夹具，并报告图元/文本数量以及 p50/p95/p99 场景转换开销。该基准测试止于 GPUI 场景构建，而原生 `perf_gate` Target J 覆盖 WebGPU 的 CPU 侧帧编码，并验证每个已解析的密集文本段都已被调度。两个基准测试均不覆盖原生窗口的文本整形或实际的 GPU 呈现时间；`gpui_probe` 现在接受 `AERIS_CHARTS_PROBE_FEATURE=footprint` 用于该真实窗口捕获（它不打印帧数据）。截图与无障碍里程碑记录在 `docs/features/footprint.md` 中。截图工具接受 `AERIS_CHARTS_GPUI_FEATURE=footprint`，并为密集的 12 柱夹具输出感知 DPR 的 PNG 及元数据；在修复该工具、使其通过 GPUI 准备帧传递已配置的帧背景之后，该捕获已在当前 Windows 显示器上演练过。观察到的 30 帧足迹图探测运行记录在 `docs/features/footprint.md` 中；它仍然只是特定机器上的证据，而非可移植的预算。当前 release 门禁也验证 WebGPU 执行器路径：Target J 调度全部 120 个已解析的密集文本段，并测得 CPU 侧帧编码 p99 为 0.00 ms，对照 2.00 ms 的预算；浏览器足迹图测试套件通过其六个 Chromium 用例，包括 WebGPU 共享帧用例。GPUI 探测仍是特定机器上的证据，而可移植的 release 预算现在已覆盖两侧执行器。
 
 **退出标准：** F2 的退出标准通过（足迹图与 CVD 共享同一成交带，迟到的成交会同时更新二者，保留策略会同时淘汰二者），且 PD10 预算在 GPUI 上成立。
 
@@ -197,7 +197,7 @@ Aeris Charts 将成为完整的**无头**专业交易图表引擎：订单流、
 
 热力图在上传前应用阈值和颜色缩放，将已定稿的历史打包为稳定的绝对 32 列图像，并在订单簿更新时仅替换其单列实时边缘。共享的底层图像图元和顶层事件图元在 Canvas2D、WebGPU、原生和 GPUI 中原样执行；普通成交系列仍位于热力图之上。回放会恢复最近的、带上限的 1,024 事件检查点，遮蔽未来的价位梯/研究/热力图/标记状态而不丢弃实时输入，并报告后缀工作量。
 
-最终的 release Target L 运行了两轮、每轮 120 万次更新：最差的 100,000 行批量耗时 10.05 ms，帧构建为 0.34 ms，512 桶视图使用了 17 张图像，其实时边缘载荷为 512 字节，保留的深度内存持平于 66.03 MiB。GPUI release 适配器门禁对同一密集热力图的 17 个图像段执行转换，p99 为 0.053 ms，对比 2 ms。针对性的浏览器夹具截取了 WebGPU 热力图/标记视图，统一的无障碍契约保持通过，因为深度功能不新增 DOM 焦点目标或实时播报。`docs/Depth.md` 记录了可复现的里程碑细节。已完成的门禁通过了 Rust fmt/clippy/测试、WASM lint、包的构建/类型/API/命名空间/发布/打包检查、GPUI 一致性/回放、302 个 Chromium 测试（含三项有意保留的、仅限特定机器的跳过），以及两个 release 性能门禁。
+最终的 release Target L 运行了两轮、每轮 120 万次更新：最差的 100,000 行批量耗时 10.05 ms，帧构建为 0.34 ms，512 桶视图使用了 17 张图像，其实时边缘载荷为 512 字节，保留的深度内存持平于 66.03 MiB。GPUI release 适配器门禁对同一密集热力图的 17 个图像段执行转换，p99 为 0.053 ms，对比 2 ms。针对性的浏览器夹具截取了 WebGPU 热力图/标记视图，统一的无障碍契约保持通过，因为深度功能不新增 DOM 焦点目标或实时播报。`docs/features/depth.md` 记录了可复现的里程碑细节。已完成的门禁通过了 Rust fmt/clippy/测试、WASM lint、包的构建/类型/API/命名空间/发布/打包检查、GPUI 一致性/回放、302 个 Chromium 测试（含三项有意保留的、仅限特定机器的跳过），以及两个 release 性能门禁。
 
 **退出标准**：F3、PD8 与 PD9 的退出标准通过：确定性的订单簿回放，间隙夹具会请求重新同步，浸泡测试下内存持平，热力图在 GPUI 上保持目标刷新率，且处于与矩形参考实现的一致性容差之内。
 
@@ -282,8 +282,8 @@ Aeris Terminal 的 `market_runtime` 是订单簿、成交和逐笔委托级（ma
 
 | 领域 | 现状 | 证据 |
 | --- | --- | --- |
-| 足迹图 | 每个系列一条成交带；主动方分类（宿主侧 → 报价 → Tick 规则）；每档买/卖/未知/合计；Bid×Ask、Total 和 Delta 单元格模式；POC；对角与堆叠失衡；最终/最大/最小 delta；每根柱的交易时段累计 delta；三档细节层级（LOD）；迟到事件与更正重建 | `engine/src/footprint.rs`, `frame/footprint_geometry.rs`, [Footprint.md](../docs/Footprint.md) |
-| 足迹图柱策略 | Rust 中的时间、成交笔数和成交量聚合；仅整秒时间柱已纳入图表集成 | `FootprintBarAggregation`, Footprint.md §3 |
+| 足迹图 | 每个系列一条成交带；主动方分类（宿主侧 → 报价 → Tick 规则）；每档买/卖/未知/合计；Bid×Ask、Total 和 Delta 单元格模式；POC；对角与堆叠失衡；最终/最大/最小 delta；每根柱的交易时段累计 delta；三档细节层级（LOD）；迟到事件与更正重建 | `engine/src/footprint.rs`, `frame/footprint_geometry.rs`, [足迹图](../docs/features/footprint.md) |
+| 足迹图柱策略 | Rust 中的时间、成交笔数和成交量聚合；仅整秒时间柱已纳入图表集成 | `FootprintBarAggregation`、[聚合与记账](../docs/features/footprint.md#3-聚合与记账) |
 | 成交量分布 | 基于 OHLCV K 线计算的可见范围分布；行、价值区域、POC；每个图表至多 16 个；仅运行时 | `engine/src/volume_profile.rs`, `indicators/src/volume_profile.rs` |
 | 系列类型 | K 线、柱、折线、面积、直方图、基线、自定义、feature（分组/堆叠柱、热力图、HLC 面积、美化直方图、背景底纹、堆叠面积、须箱）、足迹图 | `SeriesKind`, `FeatureSeriesKind` |
 | 指标 | SMA、EMA、DEMA、TEMA、SMMA/RMA、HMA、VWMA、标准差、Donchian Channels、Keltner Channels、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、EMA ribbon、WMA、Bollinger、RSI、MACD、Stochastic、ATR、VWAP；增量状态；输出是普通系列，因此指标叠指标的链式使用已可用 | `engine/src/indicators.rs`, `indicators/src/lib.rs` |
@@ -302,7 +302,7 @@ Aeris Terminal 的 `market_runtime` 是订单簿、成交和逐笔委托级（ma
 | 遥测 | WASM `frame_stats`（CPU/GPU ms、绘制调用、重建计数器、缓冲区流量）；`ChartEngine::memory_usage` 结构化归因 | `wasm/src/telemetry.rs`, `EngineMemoryUsage` |
 | 图像导出 | 仅有浏览器的 `take_screenshot`；没有原生或 GPUI 图像导出 | `packages/charts/src/types.ts` |
 | 订单簿 / 深度 | **缺失**。没有 Level 2 模型、DOM 或流动性热力图。feature 热力图仅接受宿主预先计算的单元格，并将每个单元格转换为各自独立的矩形图元 | `FeatureSeriesKind::Heatmap`, `HeatmapCell` |
-| 非时间柱 | **图表上缺失**。共享时间轴每个 UTC 秒对应一个逻辑行 | Footprint.md §3 |
+| 非时间柱 | **图表上缺失**。共享时间轴每个 UTC 秒对应一个逻辑行 | [聚合与记账](../docs/features/footprint.md#3-聚合与记账) |
 | 跨图表同步 | 带修订号的绘图载荷导出/导入，含来源标识和稳定的绘图 ID；宿主在单元格之间路由载荷，且不回显 | `drawing_contract.rs`, `drawings.rs` |
 | 回放 | **缺失**。没有回放游标或未来数据遮蔽；宿主只能替换和追加数据 | — |
 
@@ -322,7 +322,7 @@ Aeris Terminal 的 `market_runtime` 是订单簿、成交和逐笔委托级（ma
 
 #### F1 — 非时间柱的逻辑柱标识
 
-**问题**。时间轴把一个逻辑行映射到一个 UTC 秒。Tick、成交量、区间、Renko、Kagi、Point & Figure 与 Line Break 柱可能在一秒内产生多根柱，或者产生位置根本不是时间函数的柱。Footprint.md 已经禁止伪造时间戳。
+**问题**。时间轴把一个逻辑行映射到一个 UTC 秒。Tick、成交量、区间、Renko、Kagi、Point & Figure 与 Line Break 柱可能在一秒内产生多根柱，或者产生位置根本不是时间函数的柱。[足迹图契约](../docs/features/footprint.md#3-聚合与记账)已经禁止伪造时间戳。
 
 **必需结果**。
 
