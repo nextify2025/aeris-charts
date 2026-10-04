@@ -2,20 +2,26 @@
 //!
 //! The engine owns every interaction decision (`ChartEngine::input_*`). This module only
 //! translates GPUI events into the engine's normalized vocabulary, applies GPUI's platform
-//! conventions (wheel line height, text-editing keys, clipboard), and maps the engine's semantic
-//! [`ChartCursor`] onto one GPUI cursor. Every GPUI chart host uses it unchanged, so a host binds
-//! listeners with one call each and never re-implements chart routing.
+//! conventions (wheel line height, text-editing keys, clipboard), maps the engine's semantic
+//! [`ChartCursor`] onto one GPUI cursor, and owns the GPUI plumbing that keeps the chart's view
+//! drawn: the clocks, the deferred wake, animation frames, and the notify after every change (see
+//! [`GpuiChartInput`]'s refresh contract). Every GPUI chart host uses it unchanged, so a host binds
+//! each listener with one translation call and a shared tail that ends in `refresh`, and never
+//! re-implements chart routing or frame scheduling.
 
-use std::time::{Duration, Instant};
+use std::cell::Cell;
+use std::fmt;
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aeris_charts_engine::{
     ChartCursor, ChartEngine, ChartKey, DrawingTextEditKey, InputModifiers, PointerInput,
     WheelDeltaMode, WheelSample,
 };
 use gpui::{
-    point, App, Bounds, ClipboardItem, CursorStyle, KeyDownEvent, KeyUpEvent, Modifiers,
-    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, Window,
+    point, App, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle, EntityId, KeyDownEvent,
+    KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PinchEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Task, WeakFocusHandle, Window,
 };
 
 use crate::backend::{text_cap_centerer, text_measurer};
@@ -23,67 +29,342 @@ use crate::backend::{text_cap_centerer, text_measurer};
 #[cfg(test)]
 mod tests;
 
-/// Per-chart GPUI input state: the chart canvas's top-left window position and a monotonic
-/// clock. Everything else lives in the engine.
-#[derive(Clone, Copy, Debug)]
+/// Per-chart GPUI adapter state: the chart canvas's top-left window position, the clock shared by
+/// every input timestamp and engine tick, the view that draws the chart, and the one pending wake
+/// for deferred engine work. Every interaction decision lives in the engine.
+///
+/// # Refresh contract
+///
+/// GPUI draws a view again only after it is notified. In gpui-fast's retained mode, and for
+/// gpui-pre views embedded with `.cached()`, an un-notified view replays its last frame. Plain
+/// gpui-pre hides a missing notify only while something else in the window redraws. The adapter
+/// therefore owns every notify, timer and animation frame the chart needs, and a host makes
+/// exactly two calls:
+///
+/// - [`Self::prepare_frame`], once per prepaint of the chart canvas. It ticks time-driven engine
+///   state, pins the countdown clock, and keeps frames coming while the engine animates.
+/// - [`Self::refresh`], after every engine change made outside drawing:
+///   - at the end of each input listener, after the host has drained the engine queues it uses;
+///   - after every host update to data, options, theme, drawings, trading state or interaction
+///     options, or a host-started animation.
+///
+/// `prepare_frame` runs only during prepaint. Never call `refresh`, or notify the chart's view,
+/// from render, prepaint or paint:
+/// - gpui-pre only marks a view dirty when it is notified during drawing, and schedules no frame;
+/// - gpui-fast counts such a notify as a change on every frame, so the view is never retained.
+///
+/// [`Self::prepare_frame`] covers changes made while drawing. A prepaint step that changes chart
+/// state requests one more frame, so the chart's view renders once more after it and chrome the
+/// host derives in render shows the result. Engine events such a step produces wait in the
+/// engine's queue (at most 32) for the host's next drain. Under gpui-fast, run with
+/// `GPUI_VIEW_RETENTION=0` to tell a missing `refresh` apart from a retention bug.
 pub struct GpuiChartInput {
     canvas_corner: Point<Pixels>,
+    /// GPUI's executor clock for [`Self::new`]; `None` (the std monotonic clock) for `Default`.
+    clock: Option<BackgroundExecutor>,
     epoch: Instant,
+    /// The view that drew the chart canvas at the last prepaint. `refresh` and the wake notify it.
+    view: Option<EntityId>,
+    /// The single scheduled wake for the engine's next deadline or the countdown's next second.
+    wake: Option<Wake>,
+    /// A refresh happened since the last prepaint, so the next frame must be rebuilt.
+    refreshed: bool,
+    /// Where the running held-arrow pan's key-up can arrive, recorded at the first prepaint that
+    /// drew the pan.
+    held_pan: Option<HeldPan>,
+    /// A candle-close countdown row showed at the last prepaint, so the wake also fires on each
+    /// whole second of the adapter clock.
+    countdown: bool,
 }
 
+/// The window's keyboard focus and activation at the first prepaint of a held-arrow pan.
+struct HeldPan {
+    focus: Option<WeakFocusHandle>,
+    window_active: bool,
+}
+
+/// One scheduled wake: the deadline (adapter-clock ms) and view it was armed for, whether its
+/// timer has elapsed, and the task, whose drop cancels the timer.
+struct Wake {
+    deadline: f64,
+    view: EntityId,
+    /// Set by the task once the timer has elapsed, before it notifies the view. The prepaint that
+    /// follows treats the deadline as reached even if the clock reads a hair before it (platform
+    /// timer slack, `f64` rounding of the adapter clock, or a test scheduler drawing inside the
+    /// task's own poll).
+    elapsed: Rc<Cell<bool>>,
+    _task: Task<()>,
+}
+
+/// The std monotonic clock, with no view and no wake. Meant for engine-only use such as the
+/// adapter's unit tests. A GPUI host constructs the adapter with [`GpuiChartInput::new`].
 impl Default for GpuiChartInput {
     fn default() -> Self {
         Self {
             canvas_corner: Point::default(),
+            clock: None,
             epoch: Instant::now(),
+            view: None,
+            wake: None,
+            refreshed: false,
+            held_pan: None,
+            countdown: false,
         }
     }
 }
 
+/// Shows the canvas corner, the recorded view, the armed deadline, the refresh flag and whether a
+/// countdown showed. (`BackgroundExecutor` and `Task` are not `Debug`.)
+impl fmt::Debug for GpuiChartInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuiChartInput")
+            .field("canvas_corner", &self.canvas_corner)
+            .field("view", &self.view)
+            .field(
+                "wake_deadline_ms",
+                &self.wake.as_ref().map(|wake| wake.deadline),
+            )
+            .field("refreshed", &self.refreshed)
+            .field("countdown", &self.countdown)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GpuiChartInput {
-    /// Record the chart canvas position from its prepaint bounds.
+    /// An adapter on GPUI's executor clock (`BackgroundExecutor::now`), the clock GPUI's timers
+    /// fire on.
+    /// - A wake armed for an engine deadline therefore elapses on the same clock the engine ticks.
+    /// - `TestAppContext::advance_clock` drives the dwell and every animation deterministically.
+    /// - In production that clock is `Instant::now`, so real timing is unchanged.
+    pub fn new(cx: &App) -> Self {
+        let clock = cx.background_executor().clone();
+        Self {
+            epoch: clock.now(),
+            clock: Some(clock),
+            ..Self::default()
+        }
+    }
+
+    /// Record the chart canvas position from its prepaint bounds. [`Self::prepare_frame`] calls
+    /// this; it stays public for engine-only callers.
     pub fn set_canvas_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.canvas_corner = point(bounds.origin.x, bounds.origin.y);
     }
 
-    /// Milliseconds on the clock every input timestamp and [`ChartEngine::input_tick`] share.
+    /// Milliseconds on the clock shared by every input timestamp, [`ChartEngine::input_tick`], the
+    /// last-price pulse and the wake. Pass it to engine animations the host starts, such as
+    /// `start_real_time_scroll_animation`.
     pub fn now_ms(&self) -> f64 {
-        self.epoch.elapsed().as_secs_f64() * 1_000.0
+        let now = self
+            .clock
+            .as_ref()
+            .map_or_else(Instant::now, BackgroundExecutor::now);
+        now.saturating_duration_since(self.epoch).as_secs_f64() * 1_000.0
     }
 
-    /// Prepaint step: advance input animations and forward the newest coalesced capture sample.
-    /// Returns whether chart state changed.
-    pub fn prepare_frame(&self, engine: &mut ChartEngine) -> bool {
-        let ticked = engine.input_tick(self.now_ms());
-        engine.flush_coalesced_input() || ticked
-    }
-
-    /// Prepaint step with GPUI's current application motion preference.
-    pub fn prepare_frame_with_motion(
-        &self,
+    /// The prepaint step. Call it once per prepaint of the chart canvas, with the canvas bounds,
+    /// before the frame is prepared. In order, it:
+    /// - records `bounds`, and the view drawing the canvas (`Window::current_view`), which
+    ///   [`Self::refresh`] and the wake notify;
+    /// - ends a held-arrow pan whose key-up can no longer reach the chart: GPUI delivers a key-up
+    ///   only along the focused element's dispatch path and none once the window deactivates, so
+    ///   the pan ends (`input_cancel_motion`) when keyboard focus moves, or the window deactivates,
+    ///   after the prepaint that first drew it, as the browser host ends motion on window blur;
+    /// - applies `App::reduce_motion` to the engine's interaction options, which also removes the
+    ///   last-price pulse;
+    /// - advances input animations and due deadlines (`input_tick`). A deadline whose wake has
+    ///   fired counts as reached even if the clock reads a hair before it;
+    /// - forwards the newest coalesced capture sample;
+    /// - sets `engine.animation_time` while `last_price_pulse_active()` holds;
+    /// - pins the candle-close countdown clock to the system clock (`set_now_seconds`, UTC
+    ///   seconds), as the browser render path does. A host that shows another clock pins it after
+    ///   this call;
+    /// - re-arms the wake if the tick moved the deadline, and on each whole second of the adapter
+    ///   clock while a countdown row shows (`countdown_shown`), as the browser package's
+    ///   one-second countdown timer repaints;
+    /// - calls `Window::request_animation_frame` while `input_animating()` or
+    ///   `last_price_pulse_active()` holds, and once more after a step that changed chart state,
+    ///   so the view renders that state again. GPUI then notifies the view on the next frame,
+    ///   outside drawing; an idle chart schedules nothing.
+    ///
+    /// Returns whether the frame must be rebuilt, that is, a refresh happened since the last
+    /// prepaint or this step changed chart state. Pass it as `FinancialFrameRequest::force_frame`,
+    /// or OR it into the host's own rebuild flag. Call it only during prepaint, as the refresh
+    /// contract says; `Window::current_view` debug-asserts that it runs while the window draws.
+    #[must_use = "a refresh, an animation step, the pulse or the countdown needs the frame rebuilt"]
+    pub fn prepare_frame(
+        &mut self,
         engine: &mut ChartEngine,
-        reduced_motion: bool,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
     ) -> bool {
-        Self::sync_motion_policy(engine, reduced_motion);
-        self.prepare_frame(engine)
+        self.set_canvas_bounds(bounds);
+        self.view = Some(window.current_view());
+        let refreshed = std::mem::take(&mut self.refreshed);
+        let released = self.release_stranded_pan(engine, window, cx);
+        let stepped = Self::advance(engine, self.tick_ms(), cx.reduce_motion()) | released;
+        let countdown = self.sync_countdown(engine, refreshed);
+        self.arm_wake(engine, cx);
+        // Decided after the step: frames continue while the engine animates, and one more follows
+        // a step that changed chart state so the view renders it again (render runs before
+        // prepaint). That frame changes nothing, so the end of an animation, or a fired deadline,
+        // costs exactly one extra frame and an idle chart schedules nothing.
+        if stepped || engine.input_animating() {
+            window.request_animation_frame();
+        }
+        refreshed | stepped | countdown
     }
 
-    /// Apply the host's current motion preference before processing an input frame.
-    /// GPUI exposes this through `App::reduce_motion()`; chart policy remains engine-owned.
-    fn sync_motion_policy(engine: &mut ChartEngine, reduced_motion: bool) {
+    /// The one call after the engine changed outside drawing. Call it last, after the host has
+    /// drained the engine queues it uses (`take_input_events`, `take_alert_create_requests`),
+    /// because draining can change the engine (`RemoveSeries`). It:
+    /// - notifies the view that drew the chart at the last prepaint. Before the first prepaint it
+    ///   notifies nothing, because the first draw paints everything;
+    /// - marks the next frame for rebuild;
+    /// - re-arms the single wake for `ChartEngine::input_wake_deadline_ms`, or the countdown's
+    ///   next whole second if that comes first: an unchanged deadline keeps the pending wake, a
+    ///   moved one replaces and cancels it, and no deadline drops it.
+    ///
+    /// When a wake fires it only notifies the view by id; the prepaint that follows ticks the
+    /// engine. `refresh` never calls `Window::refresh`.
+    pub fn refresh(&mut self, engine: &ChartEngine, cx: &mut App) {
+        self.refreshed = true;
+        if let Some(view) = self.view {
+            cx.notify(view);
+        }
+        self.arm_wake(engine, cx);
+    }
+
+    /// Motion policy, then `input_tick(now_ms)`, then `flush_coalesced_input`, then the pulse
+    /// clock. Returns whether chart state changed.
+    fn advance(engine: &mut ChartEngine, now_ms: f64, reduced_motion: bool) -> bool {
+        // A changed preference adds or removes the pulse, so it is a change too.
+        let mut changed = Self::sync_motion_policy(engine, reduced_motion);
+        changed |= engine.input_tick(now_ms);
+        changed |= engine.flush_coalesced_input();
+        // The pulse moves on every frame. Its clock is part of the engine's overlay key, so a
+        // forced frame rebuilds only the overlay layer; the engine's own skip test does not track
+        // `animation_time`, which is why this reports a change.
+        if engine.last_price_pulse_active() {
+            engine.animation_time = now_ms;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Apply the host's current motion preference before processing an input frame, and return
+    /// whether it changed. GPUI exposes this through `App::reduce_motion()`; chart policy remains
+    /// engine-owned.
+    fn sync_motion_policy(engine: &mut ChartEngine, reduced_motion: bool) -> bool {
         let mut options = engine.interaction_options();
-        if options.reduced_motion != reduced_motion {
-            options.reduced_motion = reduced_motion;
-            engine.set_interaction_options(options);
+        if options.reduced_motion == reduced_motion {
+            return false;
+        }
+        options.reduced_motion = reduced_motion;
+        engine.set_interaction_options(options);
+        true
+    }
+
+    /// End a held-arrow pan whose key-up can no longer reach the chart (see
+    /// [`Self::prepare_frame`]). Returns whether it ended one.
+    fn release_stranded_pan(
+        &mut self,
+        engine: &mut ChartEngine,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        if !engine.keyboard_scroll_active() {
+            self.held_pan = None;
+            return false;
+        }
+        let now = HeldPan {
+            focus: window.focused(cx).map(|focus| focus.downgrade()),
+            window_active: window.is_window_active(),
+        };
+        let Some(held) = &self.held_pan else {
+            self.held_pan = Some(now);
+            return false;
+        };
+        // A window that was never seen active (a headless or unmanaged one) cannot deactivate.
+        if held.focus == now.focus && (now.window_active || !held.window_active) {
+            return false;
+        }
+        engine.input_cancel_motion();
+        self.held_pan = None;
+        true
+    }
+
+    /// Pin the countdown clock to the system clock and keep `countdown` current. The row can
+    /// appear or go only when the second changes or after a refresh, so `countdown_shown` runs
+    /// only then. Returns whether the shown countdown changed.
+    fn sync_countdown(&mut self, engine: &mut ChartEngine, refreshed: bool) -> bool {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return false;
+        };
+        let now = now.as_secs_f64();
+        let second_changed = engine.now_override.map(f64::floor) != Some(now.floor());
+        engine.set_now_seconds(now);
+        if !second_changed && !refreshed {
+            return false;
+        }
+        let shown = engine.countdown_shown();
+        let changed = second_changed && (self.countdown || shown);
+        self.countdown = shown;
+        changed
+    }
+
+    /// `now_ms()`, or `now_ms().max(deadline)` once the armed wake's timer has elapsed. The timer
+    /// elapsing is the evidence that the deadline was reached.
+    fn tick_ms(&self) -> f64 {
+        let now = self.now_ms();
+        match &self.wake {
+            Some(wake) if wake.elapsed.get() => now.max(wake.deadline),
+            _ => now,
         }
     }
 
-    /// Delay until the engine's next deferred input work (the trading-tooltip dwell). Hosts
-    /// schedule one wake and then call [`Self::prepare_frame`] by repainting.
-    pub fn wake_delay(&self, engine: &ChartEngine) -> Option<Duration> {
-        engine
+    /// Arm the one wake for the earlier of the engine's deadline and, while a countdown row
+    /// shows, the adapter clock's next whole second. Keep the wake when the deadline's bits and
+    /// the view are unchanged; otherwise replace it, or drop it when there is no deadline or no
+    /// recorded view. Non-finite engine deadlines are ignored, as the browser host ignores them.
+    fn arm_wake(&mut self, engine: &ChartEngine, cx: &App) {
+        let input = engine
             .input_wake_deadline_ms()
-            .map(|deadline| Duration::from_secs_f64((deadline - self.now_ms()).max(0.0) / 1_000.0))
+            .filter(|deadline| deadline.is_finite());
+        // From `tick_ms`, so a fired countdown wake moves on to the following second even when
+        // the clock reads a hair before the one it fired for.
+        let countdown = self
+            .countdown
+            .then(|| (self.tick_ms() / 1_000.0).floor() * 1_000.0 + 1_000.0);
+        let deadline = match (input, countdown) {
+            (Some(input), Some(countdown)) => Some(input.min(countdown)),
+            (input, countdown) => input.or(countdown),
+        };
+        if let (Some(deadline), Some(wake)) = (deadline, &self.wake) {
+            if wake.deadline.to_bits() == deadline.to_bits() && Some(wake.view) == self.view {
+                return;
+            }
+        }
+        // Dropping the previous wake cancels its task and the timer it owns.
+        self.wake = deadline.zip(self.view).map(|(deadline, view)| {
+            let delay = Duration::from_secs_f64((deadline - self.now_ms()).max(0.0) / 1_000.0);
+            let timer = cx.background_executor().timer(delay);
+            let elapsed = Rc::new(Cell::new(false));
+            let flag = elapsed.clone();
+            // The task holds only the view's id: no entity handle, so it keeps nothing alive.
+            let task = cx.spawn(async move |cx| {
+                timer.await;
+                flag.set(true);
+                cx.update(|cx| cx.notify(view));
+            });
+            Wake {
+                deadline,
+                view,
+                elapsed,
+                _task: task,
+            }
+        });
     }
 
     /// A window position in the engine's pane space.
@@ -407,7 +688,7 @@ mod wheel_tests {
             adapter.now_ms(),
         ));
         assert!(chart.input_animating());
-        adapter.prepare_frame_with_motion(&mut chart, true);
+        GpuiChartInput::advance(&mut chart, adapter.now_ms(), true);
         assert!(chart.interaction_options().reduced_motion);
         assert!(!chart.input_animating());
         let start = chart.scroll_position();
@@ -419,7 +700,7 @@ mod wheel_tests {
         ));
         assert_eq!(chart.scroll_position(), start + 1.0);
         assert!(!chart.input_animating());
-        adapter.prepare_frame_with_motion(&mut chart, false);
+        GpuiChartInput::advance(&mut chart, adapter.now_ms(), false);
         assert!(!chart.interaction_options().reduced_motion);
     }
 

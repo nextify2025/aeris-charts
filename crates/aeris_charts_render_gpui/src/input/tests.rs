@@ -2,16 +2,18 @@
 //! into a live engine, and where the browser host normalizes the same gesture, a twin engine fed
 //! the browser's formula must end in the same state.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use aeris_charts_engine::{
     ChartInputEvent, ChartRegion, DrawingId, DrawingKind, DrawingPoint, InstrumentMetadata,
     InteractionOptions, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PriceScaleTarget,
-    TradingHitKind, TradingIntentAction, TradingPriceScale, TradingSnapshot, WorkingOrder,
-    TRADING_TOOLTIP_DWELL_MS,
+    SeriesKind, TradingHitKind, TradingIntentAction, TradingPriceScale, TradingSnapshot,
+    WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
 };
 use aeris_charts_render::draw_list::Prim;
-use gpui::{bounds, px, size, Keystroke, MouseButton};
+use gpui::{bounds, px, size, AppContext, Entity, Keystroke, MouseButton, TestAppContext};
 
 use super::*;
 
@@ -46,6 +48,73 @@ fn input() -> GpuiChartInput {
         size(px(800.0), px(500.0)),
     ));
     input
+}
+
+/// [`input`] on the test app's executor clock, as a GPUI host constructs it.
+fn input_on(cx: &mut TestAppContext) -> GpuiChartInput {
+    let mut input = cx.update(|cx| GpuiChartInput::new(cx));
+    input.set_canvas_bounds(bounds(
+        point(px(CANVAS.0), px(CANVAS.1)),
+        size(px(800.0), px(500.0)),
+    ));
+    input
+}
+
+/// A stand-in for the view that drew the chart, and a count of the notifies it receives.
+fn chart_view(cx: &mut TestAppContext) -> (Entity<()>, Rc<Cell<usize>>, gpui::Subscription) {
+    let view = cx.new(|_| ());
+    let notifies = Rc::new(Cell::new(0));
+    let count = notifies.clone();
+    let observer = cx.update(|cx| cx.observe(&view, move |_, _| count.set(count.get() + 1)));
+    (view, notifies, observer)
+}
+
+/// Move the executor clock and run whatever became due.
+fn advance_ms(cx: &mut TestAppContext, ms: u64) {
+    cx.executor().advance_clock(Duration::from_millis(ms));
+    cx.run_until_parked();
+}
+
+/// [`chart`] with one working sell order, and the pane point of its close button.
+fn trading_chart() -> (ChartEngine, (f64, f64)) {
+    let mut chart = chart();
+    let price = 106.0;
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            orders: vec![working_order(price)],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    chart.build_frame();
+    let y = chart.series_price_to_coordinate(0, price).unwrap();
+    let close_x = (0..=(chart.pane_w * 2.0) as usize)
+        .map(|step| step as f64 / 2.0)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+        })
+        .expect("the order shows a close button");
+    (chart, (close_x, y))
+}
+
+/// A hover listener's tail: the adapter call, then the refresh.
+fn hover_and_refresh(
+    cx: &mut TestAppContext,
+    input: &mut GpuiChartInput,
+    chart: &mut ChartEngine,
+    at: Point<Pixels>,
+) {
+    input.mouse_move(chart, &hover(at));
+    cx.update(|cx| input.refresh(chart, cx));
+}
+
+fn tooltip_shown(chart: &mut ChartEngine) -> bool {
+    chart.build_frame().panes.iter().any(|pane| {
+        pane.main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "Cancel order"))
+    })
 }
 
 /// The window position of pane point `(x, y)` for a canvas at [`CANVAS`].
@@ -532,7 +601,7 @@ fn an_order_change_awaiting_the_host_reads_inert_until_the_host_answers() {
     let on_close = window(&chart, close_x, moved_y);
     input.mouse_move(&mut chart, &hover(on_close));
     assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
-    assert_eq!(input.wake_delay(&chart), None, "no tooltip dwell");
+    assert_eq!(chart.input_wake_deadline_ms(), None, "no tooltip dwell");
     click(&input, &mut chart, (close_x, moved_y), 1);
     assert!(chart.take_trading_intents().is_empty());
     assert_eq!(chart.trading_snapshot().orders.len(), 1);
@@ -976,11 +1045,11 @@ fn prepare_frame_forwards_one_coalesced_brush_knot_per_prepaint() {
             input.mouse_move(&mut chart, &pressed(position));
         }
         assert!(
-            input.prepare_frame(&mut chart),
+            GpuiChartInput::advance(&mut chart, input.now_ms(), false),
             "the newest sample is a knot"
         );
         assert!(
-            !input.prepare_frame(&mut chart),
+            !GpuiChartInput::advance(&mut chart, input.now_ms(), false),
             "an idle prepaint adds nothing"
         );
         knots.push(input.pane_point(&chart, window(&chart, at.0, at.1)));
@@ -1003,97 +1072,280 @@ fn prepare_frame_forwards_one_coalesced_brush_knot_per_prepaint() {
     }
 }
 
-#[test]
-fn wake_delay_schedules_the_close_button_tooltip_dwell() {
-    let mut chart = chart();
-    let mut input = input();
-    assert_eq!(input.wake_delay(&chart), None);
+/// A GPUI host's adapter reads GPUI's executor clock, the clock its timers fire on, so the
+/// tooltip dwell deadline and the wake armed for it share one time base, and
+/// `TestAppContext::advance_clock` moves both.
+#[gpui::test]
+fn the_adapter_clock_is_the_gpui_executor_clock(cx: &mut TestAppContext) {
+    let input = input_on(cx);
+    let start = input.now_ms();
+    advance_ms(cx, 250);
+    assert_eq!(input.now_ms() - start, 250.0);
 
-    let price = 106.0;
-    chart
-        .set_trading_snapshot(TradingSnapshot {
-            orders: vec![working_order(price)],
-            ..TradingSnapshot::default()
-        })
-        .unwrap();
-    chart.build_frame();
-    let y = chart.series_price_to_coordinate(0, price).unwrap();
-    let close_x = (0..=(chart.pane_w * 2.0) as usize)
-        .map(|step| step as f64 / 2.0)
-        .find(|&x| {
-            chart
-                .trading_hit_at(x, y)
-                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
-        })
-        .expect("the order shows a close button");
-    let tooltip_shown = |chart: &mut ChartEngine| {
-        chart.build_frame().panes.iter().any(|pane| {
-            pane.main
-                .iter()
-                .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "Cancel order"))
-        })
-    };
+    let (mut chart, close) = trading_chart();
+    let now = input.now_ms();
+    let on_close = window(&chart, close.0, close.1);
+    input.mouse_move(&mut chart, &hover(on_close));
+    assert_eq!(
+        chart.input_wake_deadline_ms(),
+        Some(now + TRADING_TOOLTIP_DWELL_MS),
+        "hovering the close button starts the dwell on the adapter clock"
+    );
 
-    let close = window(&chart, close_x, y);
-    let before = input.now_ms();
-    input.mouse_move(&mut chart, &hover(close));
-    let after = input.now_ms();
+    // The dwell belongs to the hovered control: a wobble inside the button, later on the same
+    // clock, keeps the deadline it already started.
+    advance_ms(cx, 100);
+    for dy in [1.0, -2.0] {
+        let wobble = window(&chart, close.0, close.1 + dy);
+        input.mouse_move(&mut chart, &hover(wobble));
+        assert_eq!(
+            chart.input_wake_deadline_ms(),
+            Some(now + TRADING_TOOLTIP_DWELL_MS),
+            "{dy}"
+        );
+    }
+}
+
+/// `refresh` notifies the view that drew the chart and keeps exactly one wake for the engine's
+/// deadline: an unchanged deadline keeps the armed wake, a moved or cleared one replaces or drops
+/// it, and a fired wake notifies the view once.
+#[gpui::test]
+fn refresh_notifies_the_chart_view_and_keeps_one_wake_per_deadline(cx: &mut TestAppContext) {
+    let (view, notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    let on_close = window(&chart, close.0, close.1);
+    let away = window(&chart, close.0, close.1 + 60.0);
+
+    // Before a prepaint records the view there is nothing to notify and nothing to wake: the
+    // first draw paints everything.
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert!(input.wake.is_none());
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 0);
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+
+    input.view = Some(view.entity_id());
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(
+        notifies.get(),
+        1,
+        "refresh notifies the view that drew the chart"
+    );
+    let first = chart
+        .input_wake_deadline_ms()
+        .expect("hovering the close button starts the dwell");
+    assert_eq!(input.wake.as_ref().map(|wake| wake.deadline), Some(first));
+
+    // Holding still over the button keeps the deadline, and the refresh keeps the armed wake, so
+    // the dwell still ends 450 ms after the hover rather than 450 ms after the last motion.
+    advance_ms(cx, 300);
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(chart.input_wake_deadline_ms(), Some(first));
+    assert_eq!(notifies.get(), 2);
+    advance_ms(cx, 149);
+    assert_eq!(notifies.get(), 2, "the dwell has not elapsed");
+    advance_ms(cx, 1);
+    assert_eq!(
+        notifies.get(),
+        3,
+        "the wake notifies the view at the deadline"
+    );
+
+    // A refresh after the wake fired, before a prepaint ticked the engine past the deadline,
+    // keeps the fired wake instead of arming a second timer for the same deadline.
+    cx.update(|cx| input.refresh(&chart, cx));
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 4, "only the refresh notified");
+
+    // Leaving the button drops the wake; a dropped wake never fires.
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+    assert!(input.wake.is_none());
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    let second = chart
+        .input_wake_deadline_ms()
+        .expect("re-entering restarts the dwell");
+    assert!(second > first);
+    assert_eq!(input.wake.as_ref().map(|wake| wake.deadline), Some(second));
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+    assert!(input.wake.is_none());
+    assert_eq!(notifies.get(), 7);
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 7, "the replaced wakes never fire");
+
+    // Re-entering arms one wake, and exactly one notify follows its deadline.
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(notifies.get(), 8);
+    advance_ms(cx, 449);
+    assert_eq!(notifies.get(), 8);
+    advance_ms(cx, 1);
+    assert_eq!(notifies.get(), 9);
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 9);
+
+    // A press on the button clears the deadline, and the refresh drops the pending wake.
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert!(input.wake.is_some());
+    input.mouse_down(&mut chart, &down(on_close, 1));
+    cx.update(|cx| input.refresh(&chart, cx));
+    assert_eq!(chart.input_wake_deadline_ms(), None);
+    assert!(input.wake.is_none());
+}
+
+/// A timer can elapse a hair before the `f64` deadline it was armed for (platform timer slack,
+/// Windows' 100 ns timer truncation, or `f64` rounding of the adapter clock). The prepaint after a
+/// fired wake still reaches the deadline, so the tooltip cannot stall until the next input.
+#[gpui::test]
+fn a_fired_wake_reaches_its_deadline_even_when_the_clock_reads_just_before_it(
+    cx: &mut TestAppContext,
+) {
+    let (view, _notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    input.view = Some(view.entity_id());
+    let on_close = window(&chart, close.0, close.1);
+    input.mouse_move(&mut chart, &hover(on_close));
     let deadline = chart
         .input_wake_deadline_ms()
         .expect("hovering the close button starts the dwell");
-    assert!(
-        (before + TRADING_TOOLTIP_DWELL_MS..=after + TRADING_TOOLTIP_DWELL_MS).contains(&deadline),
-        "the dwell runs on the adapter clock: {before}..{after} -> {deadline}"
-    );
-    let delay = input.wake_delay(&chart).expect("the host schedules a wake");
-    assert!(delay <= Duration::from_millis(450));
+    cx.update(|cx| input.refresh(&chart, cx));
+    cx.executor()
+        .advance_clock(Duration::from_nanos(449_999_500));
+    assert!(input.now_ms() < deadline, "half a microsecond early");
+
+    // While the wake is pending the deadline is still ahead.
+    let elapsed = input
+        .wake
+        .as_ref()
+        .expect("the dwell is armed")
+        .elapsed
+        .clone();
+    assert!(!elapsed.get());
+    assert!(!GpuiChartInput::advance(&mut chart, input.tick_ms(), false));
     assert!(!tooltip_shown(&mut chart));
+    assert_eq!(chart.input_wake_deadline_ms(), Some(deadline));
 
-    // A wobble inside the button keeps the dwell it already started.
-    for dy in [1.0, -2.0] {
-        let wobble = window(&chart, close_x, y + dy);
-        input.mouse_move(&mut chart, &hover(wobble));
-        assert_eq!(chart.input_wake_deadline_ms(), Some(deadline), "{dy}");
-    }
-
-    // Leaving the button before the dwell elapses cancels the pending wake.
-    let away = window(&chart, close_x, y + 60.0);
-    input.mouse_move(&mut chart, &hover(away));
-    assert_eq!(input.wake_delay(&chart), None);
-    input.mouse_move(&mut chart, &hover(close));
+    // The timer elapsing is the evidence that the deadline was reached.
+    elapsed.set(true);
+    assert_eq!(input.tick_ms(), deadline);
     assert!(
-        input.wake_delay(&chart).is_some(),
-        "re-entering restarts the dwell"
-    );
-
-    // The host's wake repaints once the deadline passes, and that prepaint tick reveals the
-    // tooltip. Back-dating the adapter clock by the dwell stands in for the wait.
-    input.epoch = input
-        .epoch
-        .checked_sub(Duration::from_millis(TRADING_TOOLTIP_DWELL_MS as u64))
-        .expect("the monotonic clock can be back-dated by the dwell");
-    assert_eq!(
-        input.wake_delay(&chart),
-        Some(Duration::ZERO),
-        "the wake is due"
-    );
-    assert!(
-        input.prepare_frame(&mut chart),
-        "the prepaint tick arms the tooltip"
+        GpuiChartInput::advance(&mut chart, input.tick_ms(), false),
+        "the tick at the deadline arms the tooltip"
     );
     assert!(tooltip_shown(&mut chart));
-    assert_eq!(input.wake_delay(&chart), None);
-    assert!(
-        !input.prepare_frame(&mut chart),
-        "an idle prepaint changes nothing"
-    );
+    assert_eq!(chart.input_wake_deadline_ms(), None);
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert!(input.wake.is_none(), "the spent wake is dropped");
+}
 
-    // A press on the button drops a pending wake.
-    input.mouse_move(&mut chart, &hover(away));
-    input.mouse_move(&mut chart, &hover(close));
-    assert!(input.wake_delay(&chart).is_some());
-    input.mouse_down(&mut chart, &down(close, 1));
-    assert_eq!(input.wake_delay(&chart), None);
+/// The wake task holds only the view's id and belongs to the adapter: dropping the adapter (with
+/// the view that owns it) cancels the timer, so nothing is notified afterwards.
+#[gpui::test]
+fn dropping_the_adapter_cancels_its_wake(cx: &mut TestAppContext) {
+    let (view, notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    input.view = Some(view.entity_id());
+    let on_close = window(&chart, close.0, close.1);
+    input.mouse_move(&mut chart, &hover(on_close));
+    cx.update(|cx| input.refresh(&chart, cx));
+    assert_eq!(notifies.get(), 1);
+    assert!(input.wake.is_some());
+    drop(input);
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 1, "the cancelled wake never fires");
+}
+
+/// The last-price pulse runs on the adapter clock for line and area series (browser parity), and
+/// every pulse step reports a change so the host rebuilds the overlay.
+#[test]
+fn the_pulse_clock_follows_the_tick_on_line_and_area_series_only() {
+    let mut chart = chart();
+    let id = chart.series[0].id;
+    assert!(!chart.last_price_pulse_active(), "candles have no pulse");
+    assert!(!GpuiChartInput::advance(&mut chart, 100.0, false));
+    assert_eq!(chart.animation_time, 0.0);
+
+    chart.convert_series_kind(id, SeriesKind::Line);
+    assert!(chart.last_price_pulse_active());
+    assert!(GpuiChartInput::advance(&mut chart, 250.0, false));
+    assert_eq!(chart.animation_time, 250.0);
+    chart.convert_series_kind(id, SeriesKind::Area);
+    assert!(GpuiChartInput::advance(&mut chart, 300.0, false));
+    assert_eq!(chart.animation_time, 300.0);
+
+    assert!(chart.set_series_last_price_animation(id, false));
+    assert!(
+        !GpuiChartInput::advance(&mut chart, 400.0, false),
+        "a host opt-out stops the pulse"
+    );
+    assert_eq!(chart.animation_time, 300.0);
+}
+
+/// `App::reduce_motion` removes the pulse (GPUI asks decorative motion to stop under it): the
+/// changed preference is one change, so the host redraws without the ring, and later prepaints
+/// leave the pulse clock alone until the preference clears.
+#[test]
+fn reduced_motion_stops_the_pulse_clock() {
+    let mut chart = chart();
+    let id = chart.series[0].id;
+    chart.convert_series_kind(id, SeriesKind::Line);
+    assert!(GpuiChartInput::advance(&mut chart, 100.0, false));
+    assert!(
+        GpuiChartInput::advance(&mut chart, 200.0, true),
+        "the changed preference is a change"
+    );
+    assert!(!chart.last_price_pulse_active());
+    assert_eq!(chart.animation_time, 100.0);
+    assert!(!GpuiChartInput::advance(&mut chart, 300.0, true));
+    assert_eq!(chart.animation_time, 100.0);
+    assert!(GpuiChartInput::advance(&mut chart, 400.0, false));
+    assert_eq!(chart.animation_time, 400.0);
+}
+
+/// While a countdown row shows, the one wake also fires on each whole second of the adapter
+/// clock; an earlier engine deadline takes the wake first, and it stays a single wake.
+#[gpui::test]
+fn the_countdown_second_shares_the_one_wake_with_the_engine_deadline(cx: &mut TestAppContext) {
+    let (view, notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    input.view = Some(view.entity_id());
+    input.countdown = true;
+    let deadline = |input: &GpuiChartInput| input.wake.as_ref().map(|wake| wake.deadline);
+
+    advance_ms(cx, 250);
+    cx.update(|cx| input.refresh(&chart, cx));
+    assert_eq!(deadline(&input), Some(1_000.0), "the next whole second");
+    let on_close = window(&chart, close.0, close.1);
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(
+        deadline(&input),
+        Some(250.0 + TRADING_TOOLTIP_DWELL_MS),
+        "the earlier dwell takes the wake"
+    );
+    let notified = notifies.get();
+    advance_ms(cx, TRADING_TOOLTIP_DWELL_MS as u64);
+    assert_eq!(notifies.get(), notified + 1, "the dwell fires");
+
+    // The prepaint that follows ticks the dwell away and re-arms for the countdown second.
+    assert!(GpuiChartInput::advance(&mut chart, input.tick_ms(), false));
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert_eq!(deadline(&input), Some(1_000.0));
+    advance_ms(cx, 300);
+    assert_eq!(notifies.get(), notified + 2, "the countdown second fires");
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert_eq!(deadline(&input), Some(2_000.0), "a fired second moves on");
+
+    input.countdown = false;
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert!(
+        input.wake.is_none(),
+        "no countdown and no deadline, no wake"
+    );
+    advance_ms(cx, 5_000);
+    assert_eq!(notifies.get(), notified + 2);
 }
 
 #[test]
