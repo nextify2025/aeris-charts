@@ -488,7 +488,7 @@ pub(crate) struct RetainedFrame {
     axis_generation: u64,
     coordinate_generation: u64,
     last_layout_key: Option<[u64; 9]>,
-    last_overlay_key: Option<[u64; 6]>,
+    last_overlay_key: Option<[u64; 7]>,
     /// The hovered and the selected drawing when their family paints parts only while focused
     /// (`DrawingFamily::reveals_on_focus`).
     last_focus_key: [Option<crate::DrawingId>; 2],
@@ -1373,6 +1373,8 @@ impl ChartEngine {
             u64::from(self.crosshair_ohlc_magnet),
             self.animation_time.to_bits(),
             self.separator_hover.map_or(u64::MAX, |index| index as u64),
+            // Reduced motion removes the last-price pulse from the overlay layer.
+            u64::from(self.interaction_options().reduced_motion),
         ];
         let options_generation = self.options.generation();
         let series_revision = self.series.revision();

@@ -669,7 +669,10 @@ futures, Friday 17:00 Central for a Sunday-open market such as CME Globex), and 
 days apart run to the end of their calendar month(s). `chart.set_clock(() => utc_seconds)` and
 `offscreen_chart.set_clock(...)`
 replace `Date.now()` for countdown ticks; `null` (or a clock that throws or returns a non-finite
-value) falls back to the system clock.
+value) falls back to the system clock. Rust hosts pin the clock with
+`ChartEngine::set_now_seconds`, and `ChartEngine::countdown_shown()` reports whether a countdown
+row shows at the pinned clock; the GPUI adapter pins the system clock at each prepaint and repaints
+once a second while it holds (see **GPUI refresh contract**).
 
 **Session highlighting.** `create_session_highlighting(series, { start_hour, end_hour })` accepts
 fractional exchange-local hours (`9.5` is 09:30; `start_hour > end_hour` wraps midnight); both or
@@ -1848,6 +1851,68 @@ a no-op text system: the chart paints no text (axes, labels, legends, drawing te
 every string as zero width, and the only signal is a `log::warn!` at startup. Linux and Windows are
 unaffected.
 
+**GPUI refresh contract.** GPUI draws a view again only after it is notified. gpui-fast's retained
+mode replays every view that was not notified, as gpui-pre does for a view embedded with
+`.cached()`; plain gpui-pre redraws more than it must and hides a missing notify only while
+something else in the window redraws. `GpuiChartInput` therefore owns every notify, timer and
+animation frame the chart needs, and a GPUI host makes exactly these calls:
+
+- Construct the adapter with `GpuiChartInput::new(cx)`. It reads GPUI's executor clock
+  (`BackgroundExecutor::now`, `Instant::now` in production and virtual under
+  `TestAppContext::advance_clock`), which every input timestamp, `input_tick`, the last-price pulse
+  and the wake share. `GpuiChartInput::default()` keeps the std clock with no view and no wake, for
+  engine-only use such as unit tests.
+- Once per prepaint of the chart canvas, before preparing the frame, call
+  `prepare_frame(&mut engine, bounds, window, cx)` and pass its result as
+  `FinancialFrameRequest::force_frame` (or OR it into the host's own rebuild flag). Its result is
+  `#[must_use]`. In order, it:
+  - records the canvas bounds and the view drawing the canvas;
+  - ends a held-arrow pan whose key-up can no longer reach the chart. GPUI delivers a key-up only
+    along the focused element's dispatch path and none once the window deactivates, so the pan
+    ends (`input_cancel_motion`) when keyboard focus moves or the window deactivates after the
+    prepaint that first drew it, as the browser ends motion on window blur;
+  - applies `App::reduce_motion`, which also removes the last-price pulse;
+  - advances input animations and due deadlines, forwards the newest coalesced capture sample, and
+    sets `engine.animation_time` while `last_price_pulse_active()` holds;
+  - pins the candle-close countdown clock to the system clock (`set_now_seconds`, UTC seconds), as
+    the browser render path does. A host that shows another clock pins it after this call;
+  - re-arms the wake;
+  - calls `Window::request_animation_frame` while `input_animating()` or the pulse holds, and once
+    more after a step that changed chart state, because render runs before prepaint: that frame
+    lets chrome the host derives in render show the step's result, and it changes nothing, so the
+    end of an animation or a fired deadline costs exactly one extra frame.
+- Call `refresh(&engine, cx)` after every engine change made outside drawing:
+  - last in each input listener, after draining the engine queues the host uses
+    (`take_input_events`, `take_alert_create_requests`), because draining can change the engine
+    (`RemoveSeries`);
+  - after every host update to data, options, theme, drawings, trading state or interaction
+    options, and after starting an engine animation (pass `now_ms()` to calls such as
+    `start_real_time_scroll_animation`).
+
+  It notifies the view that drew the chart at the last prepaint (nothing before the first one),
+  marks the next frame for rebuild, and keeps at most one wake task for the earlier of
+  `input_wake_deadline_ms()` and, while `countdown_shown()` holds, the adapter clock's next whole
+  second (the GPUI counterpart of the browser package's one-second countdown timer): an unchanged
+  deadline keeps it, a moved one replaces and cancels it, no deadline drops it. The wake only
+  notifies the view by id; the prepaint that follows ticks the engine. Dropping the adapter cancels
+  its wake, and the task holds no entity handle.
+- `prepare_frame` runs only during prepaint. Never call `refresh`, or notify the chart's view, from
+  render, prepaint or paint: gpui-pre schedules no frame for a notify made while drawing, and
+  gpui-fast counts it as a change on every frame, so the view is never retained.
+
+The library never owns the host's view type, so this works for a chart view of its own, a canvas
+embedded in a parent view, a view embedded with `.cached()`, and an engine kept in a model entity:
+the notify reaches whichever view drew the canvas. Engine events that a prepaint step produces wait
+in the engine's queue (at most 32) for the host's next drain, which the probe does in its listener
+tail. Under gpui-fast, a parent view that observes the chart entity or reads it in render is rebuilt
+on every chart frame, because prepaint writes that entity. To tell a missing `refresh` apart from a
+retention bug under gpui-fast, run with `GPUI_VIEW_RETENTION=0`.
+
+The library's GPUI dependency stays `gpui-pre =0.3.7`. CI also builds and tests the backend against
+gpui-fast at the revision pinned in `.cargo/gpui-fast.toml` as evidence, not as a release gate
+(docs/Architecture.md, Verification); a host that patches its own graph the same way runs the
+configuration that lane checks.
+
 A host that binds wheel events through `GpuiChartInput::scroll_wheel` gets browser-equivalent
 scrolling. Hosts that pinned an earlier revision panned the time scale the wrong way on a horizontal
 wheel or trackpad swipe: the adapter passed GPUI's horizontal delta through unflipped, though GPUI
@@ -2082,13 +2147,15 @@ bindings, hover, cursor choice, and kinetic motion belong to the engine. Review 
   the platform's key-repeat flag, call `input_tick(now_ms)` once per prepared frame, and request
   another frame only while `input_animating()` holds. `input_wake_deadline_ms()` is the one
   deferred deadline (the trading-tooltip dwell): schedule a wake for it and repaint.
-  `flush_coalesced_input()` forwards the newest captured drawing sample once per prepaint.
+  `flush_coalesced_input()` forwards the newest captured drawing sample once per prepaint. A GPUI
+  host now gets the clock, the tick, the wake and frame scheduling from the adapter's
+  `prepare_frame` and `refresh` (see **GPUI refresh contract** below).
 - The engine hands host-only work back as `ChartInputEvent`s (`ContextMenu`, `DrawingCreated`,
   `RemoveSeries`); drain them with `take_input_events()` after each input call. Hosts keep event
-  translation, pointer capture, applying `input_cursor()`, timers and frame scheduling, menus,
-  clipboard, and persistence. Persist drawings on `drawing_revision()` instead of tracking
-  gestures. The reference `handleScroll`/`handleScale` switches are `InteractionOptions`
-  (`interaction_options()` and `set_interaction_options`).
+  translation, pointer capture, applying `input_cursor()`, timers and frame scheduling (a GPUI host
+  leaves those to the adapter), menus, clipboard, and persistence. Persist drawings on
+  `drawing_revision()` instead of tracking gestures. The reference `handleScroll`/`handleScale`
+  switches are `InteractionOptions` (`interaction_options()` and `set_interaction_options`).
 - The lower-level gesture operations (`drawing_tool_pointer_*`, `measure_pointer_*`,
   `delta_tooltip_mouse_*`, `kinetic_*`, `start_keyboard_scroll`, `keyboard_scroll_tick`,
   `cancel_keyboard_scroll`, the `time_axis_*` and `price_axis_*` scale and scroll steps,
@@ -2100,11 +2167,17 @@ bindings, hover, cursor choice, and kinetic motion belong to the engine. Review 
   frame to force a rebuild, or forced a layout when `update_financial_drag` reported a pane resize,
   can stop doing so.
 - GPUI hosts (feature `gpui-backend`) bind through `aeris_charts_render_gpui::input` with one
-  adapter call per listener: `GpuiChartInput::mouse_down`, `mouse_move`, `mouse_up` (bound for
-  releases outside the chart too), `context_menu`, `scroll_wheel`, `pinch`, `modifiers_changed`,
-  `key_down`, and `key_up`. `scroll_wheel` converts GPUI's delta itself (pixels divided by 100,
-  lines at `WHEEL_LINE_HEIGHT`, 32 px). Prepaint calls `set_canvas_bounds(bounds)` and
-  `prepare_frame(&mut engine)`, `wake_delay(&engine)` schedules the deferred wake,
+  translation call per listener: `GpuiChartInput::mouse_down`, `mouse_move`, `mouse_up` (bound
+  for releases outside the chart too), `context_menu`, `scroll_wheel`, `pinch`,
+  `modifiers_changed`, `key_down`, and `key_up`. On main each listener then runs the host's shared
+  tail, which drains the engine queues the host uses and ends with `refresh` (see the **GPUI
+  refresh contract** group below); a listener without it is stale under retained mode.
+  `scroll_wheel` converts GPUI's delta itself: at `17a591f` pixels divided by 100 and lines at
+  `WHEEL_LINE_HEIGHT`, 32 px; main divides pixels by 100 and scales native lines by 25/24 into DOM
+  lines, so the default three-line notch is one browser notch. At `17a591f` prepaint called
+  `set_origin` and `prepare_frame(&mut engine)` and `wake_delay(&engine)` scheduled the deferred
+  wake; main replaces all three with `prepare_frame(&mut engine, bounds, window, cx)` and
+  `refresh(&engine, cx)` (see the **GPUI refresh contract** group below).
   `cursor_style(engine.input_cursor())` is the one cursor mapping, and
   `install_text_metrics(&mut engine, window)` runs before a frame is prepared so drawing labels
   measure as they paint. The host's own key tables, cursor priority, and text-edit routing are
@@ -2162,6 +2235,66 @@ and `gpui-pre-sum-tree` at the same version:
 - The parity harness's X11 capture moved to `x11rb` 0.14 (a Linux dev-dependency of the examples
   only). GPUI's Linux platform still depends on `x11rb` 0.13, so the example build holds both;
   nothing a host links is affected.
+
+**GPUI refresh contract** (own line, the commit that adds `GpuiChartInput::refresh`; find it with
+`git log -S'pub fn refresh' -- crates/aeris_charts_render_gpui/src/input.rs`). The adapter now owns
+the GPUI refresh mechanism that each host wrote by hand: the wake, the countdown clock and its
+one-second repaint, the animation-frame request and the notify after every engine change (see
+[Rust distribution](#rust-distribution) for the contract). Under gpui-fast's retained mode, and for
+a gpui-pre view embedded with `.cached()`, a chart whose view is not notified keeps showing its last
+frame, so a host that kept the old sequence would go stale there. The compiler flags only part of
+the migration: the old prepaint calls, `wake_delay` and any `Clone` or `Copy` of the adapter no
+longer compile. Two kinds of site still compile unchanged and need a manual audit: every engine
+change made outside drawing that lacks `refresh`, which in a real host are the most numerous sites
+and the ones that go stale, and every `GpuiChartInput::default()` in a windowed host, which keeps
+the std clock and never wakes. To find a site the audit missed, embed the chart with `.cached()`
+on gpui-pre, or run under gpui-fast with and without `GPUI_VIEW_RETENTION=0`: a chart that updates
+only with retention off is missing a `refresh`.
+
+- Construct the adapter with `GpuiChartInput::new(cx)` instead of `GpuiChartInput::default()`. It
+  reads GPUI's executor clock, so `now_ms()` is virtual under `TestAppContext::advance_clock` and
+  unchanged in production (`Instant::now`).
+- Replace the prepaint sequence (`set_canvas_bounds(bounds)`, the `cx.reduce_motion()` capture and
+  `prepare_frame_with_motion(&mut engine, reduced)` or `prepare_frame(&mut engine)`) with one
+  `prepare_frame(&mut engine, bounds, window, cx)` call, and pass its result as `force_frame` or OR
+  it into the host's rebuild flag.
+- Delete the host's wake task (`wake_delay` is removed: `refresh` arms and replaces the one wake)
+  and the render-time `window.request_animation_frame()` while `input_animating()` (`prepare_frame`
+  requests frames). Keep a frame request only for a finite measurement run of the host's own.
+- Delete the host's own countdown clock feed (`set_now_seconds` from the system clock before each
+  rebuild) and any countdown timer: `prepare_frame` pins the system clock and the wake repaints a
+  shown countdown once a second. A host that shows another clock pins it after `prepare_frame`.
+- End each listener's shared tail with `refresh(&engine, cx)` after draining the engine queues, in
+  place of `dirty = true` and `cx.notify()`, and end every `update` that changes the engine (data,
+  options, theme, drawings, trading state, interaction options, a started animation) with the same
+  call. The compiler does not find these sites.
+- `GpuiChartInput` is no longer `Clone` or `Copy`, because it holds the wake task; it is still
+  `Debug` and `Default`.
+
+Behaviour changes a host should know before moving the pin:
+
+- GPUI line and area series now pulse their last price, as they do in the browser: while
+  `last_price_pulse_active()` holds, the adapter advances `animation_time` and requests a frame per
+  display refresh. Before, the adapter did not drive the pulse clock, so a GPUI host that did not
+  set `animation_time` itself showed a still ring. Opt a series out with
+  `set_series_last_price_animation(id, false)`, and measure CPU on a gpui-pre host before a release
+  that shows such a series.
+- The pulse is decorative motion, so the engine removes it under
+  `InteractionOptions::reduced_motion`: `last_price_pulse_active()` turns false and the frame drops
+  the ring, on every host. GPUI feeds `App::reduce_motion` at every prepaint, so a GPUI chart never
+  pulses under it. The browser feeds `prefers-reduced-motion` with each pointer and key event, so a
+  browser chart pulses until its first input under that preference.
+- A shown candle-close countdown now ticks on an idle GPUI chart: `prepare_frame` pins the system
+  clock (UTC) and the wake repaints once a second while `countdown_shown()` holds, as the browser
+  package's timer does. A GPUI host that never fed the clock now shows the countdown on series
+  with `countdown_visible`, which is on by default for the main series, as in the browser.
+- A held arrow now ends when keyboard focus leaves the chart or the window deactivates before its
+  key-up, instead of panning and requesting frames until the next key-up reaches the chart.
+- After a prepaint step that changed chart state (the end of an animation, a fired deadline, a
+  forwarded capture sample) the adapter requests exactly one more frame, so chrome derived in
+  render shows the result.
+- Under gpui-fast, a parent view that observes the chart entity (`cx.observe`) or reads it in render
+  is rebuilt on every chart frame, because prepaint writes the entity.
 
 **Measuring tools** (both lines, from the merge `3eef45e merge: sync with
 AerisTerminal/aeris-charts main (range tools, input controller)`). Upstream's `5a2e6e8 feat(drawings): add price/date range

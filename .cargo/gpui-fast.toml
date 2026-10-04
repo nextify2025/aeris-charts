@@ -1,0 +1,27 @@
+# The gpui-fast evidence pin: the GPUI build that CI's `gpui-fast` lane builds and tests the GPUI
+# backend against (.github/workflows/ci.yml; docs/Architecture.md, Verification).
+#
+# This is a Cargo config fragment that Cargo never loads by itself (it reads only
+# `.cargo/config.toml`). The library keeps depending on `gpui-pre =0.3.7`, so hosts are unaffected;
+# only a command given `--config .cargo/gpui-fast.toml` builds against gpui-fast. gpui-fast's compat
+# crates carry the `gpui-pre` names and version and re-export gpui-fast, so they are drop-in patches
+# (see compat/README.md in gpui-fast). Patch exactly the `gpui-pre` crates that Aeris depends on:
+# the rest of the snapshot's crates leave the graph with them, and Cargo warns about a patch the
+# graph does not use.
+#
+# gpui-fast pins crates the committed lockfile holds at other versions (its `gpui_web` requires
+# `unicode-properties =0.1.3`; Aeris locks 0.1.4), so apply the patch with a lockfile update and
+# build without `--locked`:
+#
+#   cargo update --config .cargo/gpui-fast.toml -p gpui-pre -p gpui-pre-platform
+#   cargo test --config .cargo/gpui-fast.toml -p aeris_charts_render_gpui --features gpui-backend --all-targets
+#
+# Then restore the committed lockfile (`git checkout -- Cargo.lock`): no gpui-fast change belongs in
+# it. CI appends this file to Cargo's home config instead of passing `--config`, so every cargo call
+# in the job, its cache's cleanup included, sees the patch.
+#
+# To move the pin, replace the revision: the one hash below, on both patch lines. Two revisions
+# would resolve two copies of GPUI, so the lane stops with an error naming this file if they differ.
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "2e2c73a75b6edb9c68077153f72e74ccaba229ae" }
+gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "2e2c73a75b6edb9c68077153f72e74ccaba229ae" }
