@@ -1,5 +1,5 @@
 # The gpui-fast evidence pin: the GPUI build that CI's `gpui-fast` lane builds and tests the GPUI
-# backend against (.github/workflows/ci.yml; docs/Architecture.md, Verification).
+# backend against (.github/workflows/ci.yml; docs/development/validation.md, gpui-fast 证据线).
 #
 # This is a Cargo config fragment that Cargo never loads by itself (it reads only
 # `.cargo/config.toml`). The library keeps depending on `gpui-pre =0.3.7`, so hosts are unaffected;
