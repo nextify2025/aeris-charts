@@ -538,8 +538,11 @@ continuation. The browser keeps only DOM touch capture and page-scroll direction
 yielding to page scroll cancels the controller press immediately.
 The controller also schedules a stationary pane touch at 240 ms through its wake deadline.
 On that wake it enters crosshair tracking, keeps the crosshair anchored through one-finger
-motion without panning, and applies the configured next-tap or touch-end exit rule. Browser and
-worker hosts schedule this engine deadline and call `input_tick` when it arrives.
+motion without panning, and applies the configured next-tap or touch-end exit rule. Outside that
+tracking a finger has no hover: a touch press, pan, axis drag, or the finger left after a pinch
+shows no crosshair, as in the reference; only a finger dragging a trading line or a drawing shows
+it, at the drop point. Browser and worker hosts schedule this engine deadline and call
+`input_tick` when it arrives.
 For consumed wheel input, the controller uses the wheel event's position to promote hover and
 resolve the cursor; the browser applies that cursor after the event even without pointer motion.
 The hosts supply CSS-logical coordinates, pointer identity and device, and configured interaction
@@ -548,7 +551,8 @@ which the browser also reads for page-scroll direction arbitration), click recog
 axis gestures, hover, and cursor priority. A foreign pointer cannot move, release, or cancel the
 captured press. Browser and worker touch membership and continuation follow this controller rule.
 The controller recognizes a repeated press by native click count or its bounded 500 ms/5 px
-history. It commits double-click on a stationary second release; motion instead retains the
+history; the taps of a touch double-tap may land 30 px apart (the reference's
+`DoubleTapManhattanDistance`). It commits double-click on a stationary second release; motion instead retains the
 gesture, so selecting a drawing anchor and immediately dragging it works on every host.
 The browser and worker pointer adapters pack device, modifier, and configured option bits into
 one allocation-free WASM argument. After a controller press completes, the browser dispatches
@@ -1512,7 +1516,7 @@ Backend-neutral drawing primitives, colors, geometry, bar-width rules, and the o
 
 The native GPUI executor. It converts the prepared primitive stream into GPUI scene operations and owns GPUI-specific text, image caches, geometry conversion, backend metrics, and fixtures. It must not fork chart behavior or recalculate engine geometry.
 
-Its `input` module is the one GPUI adapter for the engine input controller, shared by every GPUI host (the `gpui_probe` example and Aeris Terminal). `GpuiChartInput` converts GPUI mouse, wheel (native line units mapped to the shared DOM-equivalent wheel scale), trackpad pinch, modifier, and key events (F2 maps to `ChartKey::EditText`) into engine input against the chart canvas's top-left window position (`set_canvas_bounds`) and a monotonic clock; `cursor_style` is the single `ChartCursor` → `CursorStyle` mapping (on Windows, whose GPUI backend draws hand cursors as the arrow, vertically dragged trading lines use the vertical-resize cursor); `text_edit_key` applies platform text-editing conventions to the engine typing session, with clipboard shortcuts layered on in `key_down`; and `install_text_metrics` installs the native text measurer and cap-height metric. A host binds each GPUI listener with one adapter call and never routes chart input itself. The repository's interactive Linux probes enable GPUI's Wayland and X11 platforms; macOS and Windows continue through GPUI's native platform selection. On macOS GPUI's text system is its `font-kit` feature: the examples enable it, and a macOS host must as well, because without it GPUI substitutes a no-op text system and the chart paints no text and measures every string as zero width. CI compiles and tests the GPUI backend on all three operating systems. The probe and `pixel_parity` exit 1 when GPUI has no text system instead of painting without text.
+Its `input` module is the one GPUI adapter for the engine input controller, shared by every GPUI host (the `gpui_probe` example and Aeris Terminal). `GpuiChartInput` converts GPUI mouse, wheel (native line units mapped to the shared DOM-equivalent wheel scale), trackpad pinch, modifier, and key events (F2 maps to `ChartKey::EditText`) into engine input against the chart canvas's top-left window position (`set_canvas_bounds`) and a monotonic clock; `cursor_style` is the single `ChartCursor` → `CursorStyle` mapping (on Windows, whose GPUI backend draws hand cursors as the arrow, vertically dragged trading lines use the vertical-resize cursor); `text_edit_key` applies platform text-editing conventions to the engine typing session, with clipboard shortcuts layered on in `key_down`; and `install_text_metrics` installs the native text measurer and cap-height metric. A host binds each GPUI listener with one adapter call and never routes chart input itself. The repository's interactive Linux probes enable GPUI's Wayland and X11 platforms; macOS and Windows continue through GPUI's native platform selection. On macOS GPUI's text system is its `font-kit` feature: the examples enable it, and a macOS host must as well, because without it GPUI substitutes a no-op text system and the chart paints no text and measures every string as zero width. CI compiles and tests the GPUI backend on all three operating systems and lints it on Linux. The probe and `pixel_parity` exit 1 when GPUI has no text system instead of painting without text.
 
 The `pixel_parity` example is the real-window parity harness for this executor. It paints each deterministic fixture (`fixtures.rs`, one per cause: crisp rects, translucent rects, opaque and tessellated antialiasing, curved brushes, gradients, text, the crosshair icon, colored and scaled images, the depth-heatmap colors, translucent stroke joins) through `GpuiChartRenderer` in a window whose client area equals the fixture's device size, and diffs the presented window against `aeris_charts_native`'s tiny-skia rendering of the identical Prim list. GPUI has no framebuffer readback, so the window is read from outside GPUI: on Windows through DWM (`tools/capture_window.ps1`), on Linux from the X server (`examples/support/x11_capture.rs`: the X11 window id from GPUI's raw-window-handle support, one `GetImage`, the client-area size verified against the fixture and any mismatch reported instead of compared). The Linux capture is shared with `gpui_pane_capture`, the GPUI half of the browser matrix, and is a dev-dependency edge on `x11rb` and `raw-window-handle` (both already in GPUI's Linux graph). Headless Linux runs it under `xvfb-run` with Mesa lavapipe, a software Vulkan driver; the verification section lists the command, the gates and what a software result does and does not establish.
 
@@ -1891,6 +1895,20 @@ reject exhausted `u32` cell identities before mutation so browser handles remain
 
 Changes to geometry, snapping, scales, interactions, or execution require the narrowest relevant combination of unit tests, frame-contract tests, golden images, draw-stream parity, replay stability, browser tests, and release performance evidence. A backend-specific screenshot alone is not proof of shared-engine correctness.
 
+Interactive behavior is verified through each real input path, not through the mechanisms beneath
+it. The controller's scenario modules (`chart_input/{chrome,drawing,lifecycle,motion,trading}_tests.rs`
+beside its own `tests`) drive each behavior through `ChartEngine::input_*` with explicit
+timestamps (setup and host replies such as `resolve_trading_intent` use the public API), so
+kinetic coasting and the trading-tooltip dwell are deterministic without a clock. The GPUI adapter's tests
+(`aeris_charts_render_gpui/src/input/tests.rs`) feed GPUI event values to `GpuiChartInput` and
+compare its wheel normalization with the browser's on a twin engine. The `gpui_probe` example's
+`window_input_tests` open the real probe host on GPUI's headless `TestPlatform` (the `test-support`
+feature of the dev-only `gpui` dependency) and dispatch simulated mouse, wheel, and key events through
+its listener table, the adapter, the engine, prepaint, and paint; they run in the native GPUI job on
+all three operating systems. Browser interaction is covered by Playwright specs that drive real
+`page.mouse`/`page.keyboard` input and CDP touch (`gesture-cancellation`, `interaction-gates`,
+`touch-input`, and the per-feature specs) against the published package build.
+
 ## Dependency direction
 
 Lower layers never import a host API to bypass their boundary. The headless path is `aeris_charts_core` and `aeris_charts_indicators` into `aeris_charts_engine`, then `aeris_charts_render`; GPUI, WebGPU, native, and WASM/browser code sit at execution boundaries. Avoid new crates, traits, and feature flags unless they enforce a real current dependency or platform boundary.
@@ -1930,7 +1948,9 @@ An intentional public-API change regenerates the snapshot with `bun run update:a
 step, not a gate) before `check:api`. CI also requires the portable browser suite
 (`AERIS_CHARTS_PORTABLE_BROWSER=1 bunx playwright test` in `examples/web_demo` after
 `bun install --frozen-lockfile && bun run build` there) and the native GPUI tests
-(`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`).
+(`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`), with
+the GPUI backend and its tests linted on Linux
+(`cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings`).
 
 Local browser runs need the browser build Playwright pins (Chrome for Testing 153 for the pinned
 Playwright 1.63). How Chromium is hosted matters as much as its version for the WebGPU specs. With the

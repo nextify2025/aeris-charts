@@ -16,6 +16,9 @@ use super::*;
 /// Manhattan distance before a press becomes a drag (reference CancelClickManhattanDistance).
 /// Hosts that arbitrate page scrolling before the engine sees a gesture wait for this distance.
 pub const CLICK_SLOP_MANHATTAN: f64 = 5.0;
+/// The taps of a touch double-tap may land this far apart (reference `DoubleTapManhattanDistance`):
+/// a finger lands less precisely than a mouse, whose double-click keeps `CLICK_SLOP_MANHATTAN`.
+const DOUBLE_TAP_MANHATTAN: f64 = 30.0;
 const DOUBLE_CLICK_WINDOW_MS: f64 = 500.0;
 /// A stationary pane touch enters crosshair inspection after this host-clock interval.
 pub const TOUCH_LONG_PRESS_MS: f64 = 240.0;
@@ -721,11 +724,13 @@ impl ChartEngine {
         } else {
             self.input.touch_tracking = None;
         }
+        // Abandoning a press whose release never arrived resets the pointer, so it runs before
+        // this press records its own position.
+        self.end_press_without_commit();
         self.input.pointer = Some((x, y));
         self.input.modifiers = input.modifiers;
         self.input.tooltip_deadline_ms = None;
         self.input.frame_dirty = true;
-        self.end_press_without_commit();
         self.stop_input_motion();
         self.commit_drawing_edit_session();
 
@@ -755,6 +760,11 @@ impl ChartEngine {
         let region = self.region_at_with_profile(x, y, HitProfile::for_device(input.device));
         let sequence_or_idle =
             self.active_drawing_tool().is_none() || self.drawing_tool_sequence_active();
+        let double_slop = if input.device == InputDevice::Touch {
+            DOUBLE_TAP_MANHATTAN
+        } else {
+            CLICK_SLOP_MANHATTAN
+        };
         let repeated = self
             .input
             .last_click
@@ -762,7 +772,7 @@ impl ChartEngine {
                 input.timestamp_ms > 0.0
                     && last_ms > 0.0
                     && (0.0..=DOUBLE_CLICK_WINDOW_MS).contains(&(input.timestamp_ms - last_ms))
-                    && (x - last_x).abs() + (y - last_y).abs() < CLICK_SLOP_MANHATTAN
+                    && (x - last_x).abs() + (y - last_y).abs() < double_slop
             });
         if click_count >= 2 || repeated {
             self.input.last_click = None;
@@ -782,7 +792,7 @@ impl ChartEngine {
         if matches!(mode, PressMode::Separator { .. }) {
             self.clear_pointer_hover();
         } else {
-            self.refresh_pointer_hover(x, y, input.timestamp_ms);
+            self.refresh_sample_hover(input.device, x, y, input.timestamp_ms);
         }
         self.refresh_input_cursor();
     }
@@ -948,7 +958,7 @@ impl ChartEngine {
             }
             _ => {}
         }
-        self.refresh_pointer_hover(x, y, input.timestamp_ms);
+        self.refresh_sample_hover(input.device, x, y, input.timestamp_ms);
         self.refresh_input_cursor();
     }
 
@@ -989,7 +999,7 @@ impl ChartEngine {
                     control_pair: false,
                 });
                 self.input.pointer = Some((rebased.x, rebased.y));
-                self.refresh_pointer_hover(rebased.x, rebased.y, input.timestamp_ms);
+                self.refresh_sample_hover(input.device, rebased.x, rebased.y, input.timestamp_ms);
                 self.refresh_input_cursor();
             } else {
                 self.input.pointer = None;
@@ -2171,6 +2181,26 @@ impl ChartEngine {
         self.clear_hover();
     }
 
+    /// Hover under a pointer sample. A finger has no hover: it shows the crosshair only while it
+    /// drags a trading line or a drawing, where the crosshair marks the drop point, and in
+    /// long-press tracking, which moves the crosshair itself. A touch press, pan, or axis drag
+    /// shows none (the reference's `touchStartEvent` and `touchMoveEvent`, against its
+    /// `longTapEvent`).
+    fn refresh_sample_hover(&mut self, device: InputDevice, x: f64, y: f64, now_ms: f64) {
+        let drags_an_object = self.input.press.is_some_and(|press| {
+            press.moved
+                && matches!(
+                    press.mode,
+                    PressMode::Trading { dragging: true } | PressMode::DrawingDrag
+                )
+        });
+        if device == InputDevice::Touch && !drags_an_object {
+            self.clear_pointer_hover();
+        } else {
+            self.refresh_pointer_hover(x, y, now_ms);
+        }
+    }
+
     /// Hover arbitration, topmost owner first (reference `hitTestPane`): a `Top` host primitive,
     /// a drawing, then series in paint order where a series' own non-bottom primitive blocks it
     /// and every series below; then a `Normal` pane primitive, a general-series item, and finally
@@ -2374,13 +2404,26 @@ impl ChartEngine {
     }
 }
 
+// Interactive scenarios that drive the controller only through its public `input_*` API, grouped
+// by the behavior they pin. They share the fixtures in `tests`.
+#[cfg(test)]
+mod chrome_tests;
+#[cfg(test)]
+mod drawing_tests;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod motion_tests;
+#[cfg(test)]
+mod trading_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const BARS: usize = 60;
+    pub(super) const BARS: usize = 60;
 
-    fn chart() -> ChartEngine {
+    pub(super) fn chart() -> ChartEngine {
         let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
         let times: Vec<f64> = (0..BARS).map(|i| 1_000.0 + i as f64 * 60.0).collect();
         let open: Vec<f64> = (0..BARS).map(|i| 100.0 + (i % 7) as f64).collect();
@@ -2396,11 +2439,11 @@ mod tests {
         chart
     }
 
-    fn relayout(chart: &mut ChartEngine) {
+    pub(super) fn relayout(chart: &mut ChartEngine) {
         chart.recompute_layout_with_measure(true, |_, _| 48.0, |_, _| 48.0);
     }
 
-    fn at(x: f64, y: f64) -> PointerInput {
+    pub(super) fn at(x: f64, y: f64) -> PointerInput {
         PointerInput {
             x,
             y,
@@ -2408,7 +2451,25 @@ mod tests {
         }
     }
 
-    fn shifted(x: f64, y: f64) -> PointerInput {
+    /// A pointer sample with an explicit timestamp, for timing-sensitive gestures.
+    pub(super) fn at_ms(x: f64, y: f64, timestamp_ms: f64) -> PointerInput {
+        PointerInput {
+            timestamp_ms,
+            ..at(x, y)
+        }
+    }
+
+    /// The fixture chart with kinetic coasting after a mouse pan switched on.
+    pub(super) fn kinetic_chart() -> ChartEngine {
+        let mut chart = chart();
+        chart.set_interaction_options(InteractionOptions {
+            kinetic_mouse: true,
+            ..InteractionOptions::default()
+        });
+        chart
+    }
+
+    pub(super) fn shifted(x: f64, y: f64) -> PointerInput {
         PointerInput {
             modifiers: InputModifiers {
                 shift: true,
@@ -2418,12 +2479,12 @@ mod tests {
         }
     }
 
-    fn click(chart: &mut ChartEngine, x: f64, y: f64) {
+    pub(super) fn click(chart: &mut ChartEngine, x: f64, y: f64) {
         chart.input_pointer_down(at(x, y), 1);
         chart.input_pointer_up(at(x, y));
     }
 
-    fn drag(chart: &mut ChartEngine, from: (f64, f64), to: (f64, f64)) {
+    pub(super) fn drag(chart: &mut ChartEngine, from: (f64, f64), to: (f64, f64)) {
         chart.input_pointer_down(at(from.0, from.1), 1);
         for step in 1..=4 {
             let t = f64::from(step) / 4.0;
@@ -2434,7 +2495,7 @@ mod tests {
         chart.input_pointer_up(at(to.0, to.1));
     }
 
-    fn empty_pane_point(chart: &ChartEngine) -> (f64, f64) {
+    pub(super) fn empty_pane_point(chart: &ChartEngine) -> (f64, f64) {
         (40..chart.pane_w as i32)
             .step_by(17)
             .flat_map(|x| (20..chart.pane_h as i32).step_by(13).map(move |y| (x, y)))
@@ -2445,7 +2506,7 @@ mod tests {
             .expect("the pane has empty space")
     }
 
-    fn series_point(chart: &ChartEngine) -> (f64, f64) {
+    pub(super) fn series_point(chart: &ChartEngine) -> (f64, f64) {
         let x = chart.time_scale.index_to_coordinate(30);
         let y = chart.series_price_to_coordinate(0, 101.0).unwrap();
         assert_eq!(chart.hit_test_series(x, y), Some(0));
@@ -3732,7 +3793,7 @@ mod tests {
     }
 
     /// A trend line from bar 10 to bar 40 and the point halfway along its body.
-    fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
+    pub(super) fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
         let id = chart
             .add_drawing(
                 DrawingKind::TrendLine,
@@ -3756,7 +3817,7 @@ mod tests {
         (id, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
     }
 
-    fn double_click(chart: &mut ChartEngine, x: f64, y: f64) {
+    pub(super) fn double_click(chart: &mut ChartEngine, x: f64, y: f64) {
         chart.input_pointer_down(at(x, y), 2);
         chart.input_pointer_up(at(x, y));
     }

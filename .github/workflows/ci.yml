@@ -74,6 +74,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev
       - uses: Swatinem/rust-cache@v2
+      - name: Clippy native GPUI backend (all targets)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings
       - name: Test native GPUI backend
         run: cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked
       - name: Assert official GPUI pixel parity against tiny-skia

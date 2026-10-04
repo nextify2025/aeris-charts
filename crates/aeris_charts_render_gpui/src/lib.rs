@@ -13,7 +13,8 @@
 //!
 //! Nothing below this crate knows GPUI exists. `aeris_charts_core`, `aeris_charts_engine` and `aeris_charts_render`
 //! contain no GPUI import, type, or `#[cfg]` branch, and GPUI is an **optional** dependency here:
-//! without the `gpui-backend` feature, `cargo build`/`cargo test` never compile it.
+//! without the `gpui-backend` feature the library never compiles it. Only this crate's
+//! dev-dependencies (the probe's window tests and the pixel-parity harness) build GPUI for tests.
 //!
 //! # Two halves
 //!
