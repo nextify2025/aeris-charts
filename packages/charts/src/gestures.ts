@@ -107,6 +107,20 @@ export function install_gestures(chart: chart_impl): () => void {
       else schedule_input_wake();
     }, Math.max(0, deadline - performance.now()));
   };
+  // The engine resolves the cursor for pointer input and for every host call that changes what the
+  // pointer rests on (a trading answer, snapshot, or update, a drawing tool change), so the chart
+  // also presents it after each repaint, without waiting for the next pointer motion.
+  const present_cursor = () => {
+    const cursor_code = wasm.controller_input_cursor();
+    const cursor = cursor_code === HOST_PRIMITIVE_CURSOR
+      ? (chart.hover_cursor() ?? "crosshair")
+      : (cursor_names[cursor_code] ?? "crosshair");
+    if (cursor !== applied_cursor) {
+      overlay.style.cursor = cursor;
+      applied_cursor = cursor;
+    }
+  };
+  chart.set_input_cursor_presenter(present_cursor);
   const sync_controller_pointer = (complete_press = false) => {
     wasm.controller_crosshair_into(controller_crosshair);
     const x = controller_crosshair[0]!;
@@ -120,15 +134,9 @@ export function install_gestures(chart: chart_impl): () => void {
       chart.emit_crosshair_left();
       controller_crosshair_visible = false;
     }
-    const cursor_code = wasm.controller_input_cursor();
-    const cursor = cursor_code === HOST_PRIMITIVE_CURSOR
-      ? (chart.hover_cursor() ?? "crosshair")
-      : (cursor_names[cursor_code] ?? "crosshair");
-    if (cursor !== applied_cursor) {
-      overlay.style.cursor = cursor;
-      applied_cursor = cursor;
-    }
+    // Intent handlers run inside and may answer the host request at once; the cursor follows.
     chart.consume_input_events(complete_press);
+    present_cursor();
     if (wasm.frame_pending()) chart.repaint();
     schedule_input_wake();
     if (wasm.input_animating()) ensure_input_frames();
@@ -364,6 +372,7 @@ export function install_gestures(chart: chart_impl): () => void {
   document.addEventListener("visibilitychange", on_visibility_change);
 
   return () => {
+    chart.set_input_cursor_presenter(null);
     stop_scroll_anim();
     clear_input_wake();
     overlay.removeEventListener("wheel", on_wheel);

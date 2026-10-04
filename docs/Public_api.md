@@ -1306,6 +1306,60 @@ body, or one of its handles. A pair whose first click landed on a trading object
 widget acts on no drawing, and neither does a double-click elsewhere while a drawing stays
 selected.
 
+An armed drawing tool places its points by click, where the button comes up: one click for a
+one-point tool or a `long_position`/`short_position` preset, one click per point for the other
+fixed-count tools, and repeated clicks for a `path` or `polyline` until double-click or Enter. A
+press that moves 5 px or more (Manhattan) before its release is a drag, not a click. It places
+nothing and does not pan the chart, and the tool stays armed. After the first point, a drag only
+moves the preview, as hovering does. This is by design: press-drag-release does not create these
+drawings. The `brush` and `highlighter` draw by press-drag, and the text tool places on press.
+
+While a drawing tool is armed it owns order and position lines. A press on a line, on an order
+marker's quantity and readout area (which otherwise drags a `TP`/`SL` order), or on an annotation
+chip belongs to the tool: a click there places the tool's anchor, and no press there moves an order
+or emits a trading intent. Over them the cursor is the tool's crosshair, the line takes no hover
+highlight, and the crosshair stays visible. The marker's buttons keep working with the pointer
+cursor: the close cell and the `TP` and `SL` buttons (whose press-drag still creates a protection).
+Execution arrows and the crosshair's alert button do too. Once the one-shot tool disarms after its commit, or Escape or
+`set_drawing_tool(null)` cancels it, the lines drag again. Arming, disarming, and the commit that
+disarms the tool update the engine's `input_cursor()` and the line's hover under a resting pointer
+at once.
+
+Once the first point of a drawing being placed is down, or while a freehand stroke is drawn,
+Backspace and Delete belong to that drawing. Each removes its latest placed point: a `path` or
+`polyline` vertex, or a fixed-count tool's click, such as a `trend_line`'s first point or an
+`xabcd_pattern`'s third. The preview keeps following the pointer, and the next clicks finish the
+drawing as if the removed point had never been placed. With no point left the keys do nothing until
+Escape or the next click, so a held key never deletes another drawing, removes an indicator, or asks
+the host to remove a series, and the crosshair shows again to aim that click. Before the first click
+they act on the selected drawing, indicator, or series as usual, and the tool stays armed. Undo (Ctrl/Cmd+Z) during placement is unchanged. A key on
+a drawing's own accessibility focus target still acts on that drawing, because focusing it chose it.
+
+Trading controls read exactly as they act. A control that cannot act now shows the plain arrow
+cursor, takes no hover highlight, press surface, or tooltip, and a press on it does nothing: the
+chart does not pan, and no drag or intent starts. That is every protection (`TP`/`SL`) order line,
+close cell, and `TP`/`SL` button on the chart while a request the chart emitted awaits the host, and
+otherwise the close cell of an order that is not working or partially filled and the line of a
+protection order in any other status. Execution arrows keep revealing their fills. A click on a
+close cell acts only on the order or position its press began on, and only when that cell could act
+at the press. A drag the host's state rules out while it is held (the order filled or went pending,
+or the entry or position gained that protection) ends with no intent.
+
+Answer every intent, either with `trading().resolve_intent()` or with the host's own state. State
+answers a request only when it shows the broker acted on it, through `apply_snapshot()` or an
+update or removal of the request's object: for a cancel or a move, the order's removal, a status
+other than `working` or `partially_filled` (`pending_cancel` and `pending_modify` included), or a
+`revision` past the one in the intent, and for a move also the order at the requested price; for a
+close, the position's removal or its side flipping; for a `TP`/`SL` request, a protection of that
+role linked to the entry or position by `parent_order_id`, `position_id`, or `bracket_id`, or the
+entry's removal, cancellation, rejection, or expiry; for a bracket, a new order at one of its legs.
+A plain re-report does not answer: a P&L tick on the position being closed, an order update still at
+the intent's revision, or a stale snapshot. The chart shows the object as reported and keeps every
+control inert, so the trader cannot send a second close before the first is done. Refuse a request
+with `resolve_intent(sequence, false)`; a rejection keeps the copy you re-reported rather than
+adding a second. A later `resolve_intent()` for a settled request returns `false`. The cursor and
+highlight follow these calls at once, without pointer motion.
+
 Host `dbl_click` subscribers still run after a double-click opened the editor. A host that binds
 double-click to its own settings panel therefore sees both: the editor is open when the handler
 runs, and calling `focus()` on a panel control closes it (the editor commits its text unchanged,
@@ -1714,7 +1768,7 @@ overrides their contrasting default); they are body targets.
   pointer show as a polyline in the drawing's stroke until every anchor but the last is placed; the
   shape itself then previews through the pointer until the last click commits it.
 - `polyline` places vertices like `path`: click to add, double-click or Enter to finish, Backspace
-  removes the latest vertex, Escape cancels. Once three vertices are placed, clicking the first
+  or Delete removes the latest vertex, Escape cancels. Once three are placed, clicking the first
   vertex again finishes the polyline closed (the preview snaps shut while the pointer is over it).
   `tool_options.shape.closed` (default `false`) joins the last vertex to the first and fills the
   enclosed region by the nonzero rule. The fill is bounded work: a closed polyline of more than
@@ -2062,7 +2116,13 @@ bindings, hover, cursor choice, and kinetic motion belong to the engine. Review 
     therefore no longer switches that scale to manual: the old `begin_financial_drag` turned
     autoscale off on the press, and now the first scale step does. A pane drag pans a manual price
     scale only when it is the scale of the series (or the pane's default) under the press; the old
-    call also fell back to the pane's first manual right or left scale.
+    call also fell back to the pane's first manual right or left scale. Pointer drags of chart
+    objects follow the same threshold: a drawing's body, anchor, or handle, an order line, and a
+    `TP`/`SL` protection handle stay where they are until the press has moved 5 px, so a shorter
+    press is a click that moves nothing, records no undo step or revision, and emits no trading
+    intent. Past the threshold the object jumps to the pointer and follows it exactly, and the
+    release position is the drag's last sample. Only `input_*` pointer input is gated: direct calls
+    such as `drawing_drag_to` and `trading_drag_to`, and keyboard nudges, move objects at once.
   - Double-click on a price axis. `begin_financial_drag` ran `reset_price_scales()`, every price
     scale in the chart; `input_pointer_down` resets only the pressed scale (`reset_price_scale(pane,
     target)`). A host that wants the chart-wide reset keeps `reset_price_scales()` or `reset_view()`
@@ -2071,7 +2131,9 @@ bindings, hover, cursor choice, and kinetic motion belong to the engine. Review 
     `input_pointer_up` also selects or activates what is under the pointer, and `input_cancel()` ends
     the same sessions but also restores an open drawing or trading drag and clears hover, a live
     measure, and the cursor. `input_pointer_move` with `primary_pressed` false while a press is open
-    abandons that press.
+    abandons that press. Ending a session never rewinds it: a pan, axis scale, or separator resize
+    abandoned by any cancel (`input_cancel()`, Escape, a context menu, a lost release) keeps the
+    partial change it had made, and a price axis it took out of autoscale stays manual.
   - Arrow and zoom keys. The old call jumped 1 bar (10 accelerated) per call; `ArrowLeft` and
     `ArrowRight` start a velocity-owned pan (see the clock item). `ZoomIn` and `ZoomOut` anchored
     at the plot centre; with the new `right_bar_stays_on_scroll` default they keep the gap after
@@ -2083,6 +2145,30 @@ bindings, hover, cursor choice, and kinetic motion belong to the engine. Review 
   another frame only while `input_animating()` holds. `input_wake_deadline_ms()` is the one
   deferred deadline (the trading-tooltip dwell): schedule a wake for it and repaint.
   `flush_coalesced_input()` forwards the newest captured drawing sample once per prepaint.
+- Trading requests lock the chart's trading controls until the host answers. While an emitted
+  `TradingIntent` awaits the host, every trading control is inert (`ChartCursor::Default`, no hover,
+  tooltip, or press), so answer every intent: `resolve_trading_intent`, or host state that shows
+  the broker acted on it, which settles it as an acceptance does. `set_trading_snapshot`,
+  `update_working_order`, `remove_working_order`, `update_trading_position`, and
+  `remove_trading_position` answer only with the order's removal, a non-working status, a
+  `revision` past the intent's, or (for a move) the requested price; the position's removal or a
+  side flip; a linked protection order of the requested role, or the end of its entry; or a new
+  order at one of a bracket's legs. A plain re-report (a P&L tick, an update at the intent's
+  revision, a stale snapshot) leaves the request waiting, so refuse one with
+  `resolve_trading_intent(sequence, false)`. Those calls refresh `input_cursor()` under a resting
+  pointer, so a host that re-reads it when it repaints after them shows the right cursor without
+  pointer motion. Repaint after `remove_working_order` and `remove_trading_position` whatever they
+  return: `false` only says the chart no longer showed the object, and the removal can still answer
+  a close the chart already applied. `trading_cursor_at` answers `None` for a control that cannot
+  act now, and `set_trading_hover` returns `true` only when the hovered control (object, part, and
+  annotation) changes: motion inside one control returns `false` and keeps a shown tooltip.
+  `set_trading_visible_account` no longer ends a request awaiting the host.
+- Backspace and Delete belong to the drawing being placed. Once a placement has begun
+  (`drawing_create_active()`, also after it is stepped back to no points) or a freehand stroke is
+  captured, `input_key_down` consumes both and only steps back the latest placed point; it never
+  removes the selection or emits `RemoveSeries`. `drawing_create_pop_anchor` and
+  `drawing_tool_pop_anchor` now step back a fixed-count tool's clicks (a trend line's first point)
+  as well as path and polyline vertices.
 - The engine hands host-only work back as `ChartInputEvent`s (`ContextMenu`, `DrawingCreated`,
   `RemoveSeries`); drain them with `take_input_events()` after each input call. Hosts keep event
   translation, pointer capture, applying `input_cursor()`, timers and frame scheduling, menus,

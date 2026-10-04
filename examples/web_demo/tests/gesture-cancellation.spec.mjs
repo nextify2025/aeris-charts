@@ -10,9 +10,11 @@ import { test, expect } from "@playwright/test";
 // recognizer ready for the next real gesture.
 //
 // Every case crosses the 5 px click slop before it cancels, so its release is a drag release.
-// Whether a cancel before the slop should also swallow the release's click, and whether a
-// cancelled pan, axis scale, or separator resize keeps or restores its partial offset, are open
-// product decisions; those cases assert only that the gesture stopped.
+// Whether a cancel before the slop should also swallow the release's click is an open product
+// decision. A cancelled pan, price-axis scale, or separator resize keeps its partial change: that
+// is decided (docs/Architecture.md, the input controller's cancellation rule), so those cases
+// assert that the gesture stopped where the cancel found it and that the change made before the
+// cancel survives; a price axis the drag took out of autoscale stays manual.
 
 const OVERLAY = "#chart_container canvas:last-of-type";
 
@@ -95,8 +97,9 @@ const gestures = [
     started(start, mid) {
       expect(mid.offset).not.toBeCloseTo(start.offset, 3);
     },
-    cancelled(_start, at_cancel, after) {
+    cancelled(start, at_cancel, after) {
       expect(after.offset).toBeCloseTo(at_cancel.offset, 9);
+      expect(after.offset).not.toBeCloseTo(start.offset, 3);
     },
     async fresh(page) {
       const g = await geometry(page);
@@ -126,9 +129,11 @@ const gestures = [
       expect(mid.auto_scale).toBe(false);
       expect(mid.range.to - mid.range.from).not.toBeCloseTo(start.range.to - start.range.from, 3);
     },
-    cancelled(_start, at_cancel, after) {
+    cancelled(start, at_cancel, after) {
       expect(after.range.from).toBeCloseTo(at_cancel.range.from, 9);
       expect(after.range.to).toBeCloseTo(at_cancel.range.to, 9);
+      expect(after.range.to - after.range.from).not.toBeCloseTo(start.range.to - start.range.from, 3);
+      expect(after.auto_scale).toBe(false);
     },
     async fresh(page) {
       // A scale session that was never ended would make the engine ignore this new start.
@@ -304,8 +309,9 @@ const gestures = [
     started(start, mid) {
       expect(mid.separator).toBeGreaterThan(start.separator + 10);
     },
-    cancelled(_start, at_cancel, after) {
+    cancelled(start, at_cancel, after) {
       expect(after.separator).toBeCloseTo(at_cancel.separator, 9);
+      expect(after.separator).toBeGreaterThan(start.separator + 10);
     },
     async fresh(page) {
       const before = await this.read(page);

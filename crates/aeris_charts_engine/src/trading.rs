@@ -547,6 +547,9 @@ pub(crate) enum TradingInteractionState {
     /// The chart already applied the change and emitted the intent. It keeps only what it needs
     /// to put things back if the host rejects — there is no shadow copy of the object and no
     /// pending chrome, because closing means the object is gone and moving means it has moved.
+    /// Every trading control is inert until the host answers, through
+    /// [`ChartEngine::resolve_trading_intent`] or its own state
+    /// ([`ChartEngine::trading_request_answered`]).
     PendingHostAck {
         sequence: u32,
         rollback: TradingRollback,
@@ -555,8 +558,21 @@ pub(crate) enum TradingInteractionState {
 
 #[derive(Clone, Debug)]
 pub(crate) enum TradingRollback {
-    CreatedBracketOrder,
-    CreatedProtection,
+    /// A bracket requested from a position drawing. Nothing exists to put back; its legs (entry,
+    /// take-profit, and stop-loss prices on the drawing's pane and scale) identify the host
+    /// orders that answer the request.
+    CreatedBracketOrder {
+        pane_index: usize,
+        price_scale: TradingPriceScale,
+        side: OrderSide,
+        prices: [f64; 3],
+    },
+    /// A protection of `role` requested for an entry order or position. Nothing exists to put
+    /// back; the parent and role identify the host order that answers the request.
+    CreatedProtection {
+        parent: TradingObjectId,
+        role: OrderRole,
+    },
     RemovedOrder {
         index: usize,
         order: Box<WorkingOrder>,
@@ -565,10 +581,46 @@ pub(crate) enum TradingRollback {
         index: usize,
         position: Box<TradingPosition>,
     },
+    /// An order moved from `price` to `requested`, based on the order at `base_revision`.
     MovedOrder {
         id: OrderId,
         price: f64,
+        requested: f64,
+        base_revision: u32,
     },
+}
+
+/// One piece of the host's own trading state, which can answer the request awaiting it (see
+/// [`ChartEngine::trading_request_answered`]).
+#[derive(Clone, Copy)]
+enum TradingHostUpdate<'a> {
+    /// A whole snapshot, and the orders the chart held before it.
+    Snapshot { prior_orders: &'a [WorkingOrder] },
+    /// An order the host updated, added (`added`), or removed.
+    Order { id: &'a OrderId, added: bool },
+    /// A position the host updated, added, or removed.
+    Position(&'a PositionId),
+}
+
+impl TradingHostUpdate<'_> {
+    /// Whether this is the host's word on the order `id`: its whole state, or that order's own
+    /// update or removal.
+    fn reports_order(self, id: &OrderId) -> bool {
+        match self {
+            Self::Snapshot { .. } => true,
+            Self::Order { id: reported, .. } => reported == id,
+            Self::Position(_) => false,
+        }
+    }
+
+    /// Whether this is the host's word on the position `id`.
+    fn reports_position(self, id: &PositionId) -> bool {
+        match self {
+            Self::Snapshot { .. } => true,
+            Self::Position(reported) => reported == id,
+            Self::Order { .. } => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -777,11 +829,28 @@ pub enum TradingHitKind {
 }
 
 /// Pointer affordance for a trading object: `Grab` over a draggable line, `Pointer` over a
-/// close control or TP/SL protection button.
+/// close control, TP/SL protection button, or execution arrow, each only while it acts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TradingCursor {
     Grab,
     Pointer,
+}
+
+/// What pointer input on a trading control does right now; see
+/// [`ChartEngine::trading_hit_action`].
+#[derive(Clone, Debug)]
+pub(crate) enum TradingHitAction {
+    /// A press-drag places a price: a protection order's line moves, or a `TP`/`SL` button
+    /// creates a protection.
+    Drag(TradingPreview),
+    /// A click closes the position or cancels the order's unfilled remainder.
+    Close,
+    /// Hovering or clicking reveals the exact fills on the execution's bar; nothing financial.
+    RevealFills,
+    /// A control that cannot act now: a drag is live or a released change still awaits the host,
+    /// or the order's status rules the action out. It reads as inert chrome (the arrow cursor, no
+    /// hover or press feedback, no tooltip) and absorbs its press.
+    Inert,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -799,6 +868,24 @@ impl TradingHit {
             TradingObjectId::Order(id) => id.heap_bytes(),
             TradingObjectId::Execution(id) => id.heap_bytes(),
         }
+    }
+
+    /// Whether two hits address the same control: object, part, and annotation. The pointer's
+    /// distance is not identity, so motion inside one control is never a different target, for
+    /// hover (and its tooltip dwell) as for click activation.
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        self.object == other.object
+            && self.kind == other.kind
+            && self.annotation_id == other.annotation_id
+    }
+}
+
+/// [`TradingHit::same_target`] over optional hits: no hit matches only no hit.
+fn same_trading_target(a: Option<&TradingHit>, b: Option<&TradingHit>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_target(b),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -1125,66 +1212,145 @@ impl ChartEngine {
     }
 
     /// Pointer affordance for the trading object under the cursor, shared by every host so a
-    /// line reads as draggable exactly when a drag would start there.
+    /// control reads as actionable exactly when it acts: a line reads as draggable exactly when a
+    /// drag would start there. A control that cannot act now (see
+    /// [`Self::trading_hit_action`]) and a readout both answer `None`.
     pub fn trading_cursor_at(&self, x_css: f64, y_css: f64) -> Option<TradingCursor> {
-        let hit = self.trading_hit_at(x_css, y_css)?;
-        match (&hit.object, hit.kind) {
-            // An execution arrow is clickable detail: it reveals the exact fill on its bar.
-            (_, TradingHitKind::CancelButton | TradingHitKind::ExecutionMarker) => {
-                Some(TradingCursor::Pointer)
+        self.trading_cursor_for(&self.trading_hit_at(x_css, y_css)?)
+    }
+
+    /// [`Self::trading_cursor_at`] for a hit the caller already resolved.
+    pub(crate) fn trading_cursor_for(&self, hit: &TradingHit) -> Option<TradingCursor> {
+        match self.trading_hit_action(hit)? {
+            TradingHitAction::Drag(_) if hit.kind == TradingHitKind::OrderLine => {
+                Some(TradingCursor::Grab)
             }
             // A protection button reads as a button: it answers with the click affordance even
-            // though pressing and dragging it also places the protection price.
-            (TradingObjectId::Order(id), TradingHitKind::TakeProfitButton) => self
-                .trading_state
-                .orders
-                .iter()
-                .find(|order| &order.id == id)
-                .and_then(|order| {
-                    self.trading_order_protection_preview(order, OrderRole::TakeProfit)
-                })
-                .map(|_| TradingCursor::Pointer),
-            (TradingObjectId::Order(id), TradingHitKind::StopLossButton) => self
-                .trading_state
-                .orders
-                .iter()
-                .find(|order| &order.id == id)
-                .and_then(|order| self.trading_order_protection_preview(order, OrderRole::StopLoss))
-                .map(|_| TradingCursor::Pointer),
-            (TradingObjectId::Position(id), TradingHitKind::TakeProfitButton) => self
-                .trading_state
-                .positions
-                .iter()
-                .find(|position| &position.id == id)
-                .and_then(|position| {
-                    self.trading_position_protection_preview(position, OrderRole::TakeProfit)
-                })
-                .map(|_| TradingCursor::Pointer),
-            (TradingObjectId::Position(id), TradingHitKind::StopLossButton) => self
-                .trading_state
-                .positions
-                .iter()
-                .find(|position| &position.id == id)
-                .and_then(|position| {
-                    self.trading_position_protection_preview(position, OrderRole::StopLoss)
-                })
-                .map(|_| TradingCursor::Pointer),
-            (TradingObjectId::Order(id), TradingHitKind::OrderLine) => self
-                .trading_state
-                .orders
-                .iter()
-                .find(|order| &order.id == id)
-                .and_then(|order| self.trading_order_drag_preview(order))
-                .map(|_| TradingCursor::Grab),
-            _ => None,
+            // though pressing and dragging it also places the protection price. An execution
+            // arrow is clickable detail: it reveals the exact fill on its bar.
+            TradingHitAction::Drag(_) | TradingHitAction::Close | TradingHitAction::RevealFills => {
+                Some(TradingCursor::Pointer)
+            }
+            TradingHitAction::Inert => None,
         }
     }
 
+    /// The one "actionable now" check for trading controls. Drag start, close activation, the
+    /// cursor, the hover and press feedback the frame draws, and the close tooltip all read it,
+    /// so a control looks and answers exactly as it acts. `None` is a readout that never acts: a
+    /// position or entry line body, or an annotation.
+    pub(crate) fn trading_hit_action(&self, hit: &TradingHit) -> Option<TradingHitAction> {
+        let order = |id: &OrderId| {
+            self.trading_state
+                .orders
+                .iter()
+                .find(|order| &order.id == id)
+        };
+        let position = |id: &PositionId| {
+            self.trading_state
+                .positions
+                .iter()
+                .find(|position| &position.id == id)
+        };
+        let button_role = |kind| {
+            if kind == TradingHitKind::TakeProfitButton {
+                OrderRole::TakeProfit
+            } else {
+                OrderRole::StopLoss
+            }
+        };
+        let available = match (&hit.object, hit.kind) {
+            // Revealing a fill requests nothing, so neither a request in flight nor a status
+            // holds it back.
+            (_, TradingHitKind::ExecutionMarker) => return Some(TradingHitAction::RevealFills),
+            (TradingObjectId::Order(id), TradingHitKind::OrderLine) => {
+                let order = order(id)?;
+                // An entry's line is a readout: its protection comes from its buttons.
+                if order.role == OrderRole::Working {
+                    return None;
+                }
+                self.trading_order_drag_preview(order)
+                    .map(TradingHitAction::Drag)
+            }
+            (
+                TradingObjectId::Order(id),
+                kind @ (TradingHitKind::TakeProfitButton | TradingHitKind::StopLossButton),
+            ) => self
+                .trading_order_protection_preview(order(id)?, button_role(kind))
+                .map(TradingHitAction::Drag),
+            (
+                TradingObjectId::Position(id),
+                kind @ (TradingHitKind::TakeProfitButton | TradingHitKind::StopLossButton),
+            ) => self
+                .trading_position_protection_preview(position(id)?, button_role(kind))
+                .map(TradingHitAction::Drag),
+            // An order's close control cancels its live remainder, so it acts only on live orders.
+            (TradingObjectId::Order(id), TradingHitKind::CancelButton) => matches!(
+                order(id)?.status,
+                OrderStatus::Working | OrderStatus::PartiallyFilled
+            )
+            .then_some(TradingHitAction::Close),
+            (TradingObjectId::Position(id), TradingHitKind::CancelButton) => {
+                position(id).map(|_| TradingHitAction::Close)
+            }
+            _ => return None,
+        };
+        // One request at a time: while a drag is live or a released change awaits the host,
+        // every control on the chart waits with it.
+        Some(match available {
+            Some(action) if self.trading_state.interaction.is_idle_or_hovering() => action,
+            _ => TradingHitAction::Inert,
+        })
+    }
+
+    /// The hovered or pressed hit the frame draws feedback for. A control lights up only while
+    /// [`Self::trading_hit_action`] lets it act; the live drag keeps its own control's feedback
+    /// from the press, because the drag itself is what makes every control wait.
+    pub(crate) fn trading_feedback<'a>(
+        &self,
+        hit: Option<&'a TradingHit>,
+    ) -> Option<&'a TradingHit> {
+        hit.filter(|hit| {
+            !matches!(self.trading_hit_action(hit), Some(TradingHitAction::Inert))
+                || self.trading_drag_source(&hit.object)
+        })
+    }
+
+    /// Whether the live drag (pointer or keyboard) is changing or protecting `object`.
+    fn trading_drag_source(&self, object: &TradingObjectId) -> bool {
+        let Some(preview) = self.trading_state.interaction.preview() else {
+            return false;
+        };
+        match (&preview.source, object) {
+            (
+                TradingPreviewSource::Order { order_id }
+                | TradingPreviewSource::OrderStopLoss { order_id }
+                | TradingPreviewSource::OrderTakeProfit { order_id },
+                TradingObjectId::Order(id),
+            ) => order_id == id,
+            (
+                TradingPreviewSource::StopLoss { position_id }
+                | TradingPreviewSource::TakeProfit { position_id },
+                TradingObjectId::Position(id),
+            ) => position_id == id,
+            _ => false,
+        }
+    }
+
+    /// Hover the trading target under a pointer position. Returns whether the hovered target
+    /// changed: motion inside the same control (see [`TradingHit::same_target`]) is no change, so
+    /// it neither hides a shown tooltip nor rebuilds the trading layer.
     pub fn set_trading_hover(&mut self, x_css: f64, y_css: f64) -> bool {
-        let next = self.trading_hit_at(x_css, y_css);
-        let feedback_changed = self.trading_state.feedback_hover.as_ref() != next.as_ref();
+        self.set_trading_hover_hit(self.trading_hit_at(x_css, y_css))
+    }
+
+    /// [`Self::set_trading_hover`] for a hit the caller already resolved: the input controller
+    /// passes the control pointer input acts on, which an armed drawing tool narrows.
+    pub(crate) fn set_trading_hover_hit(&mut self, next: Option<TradingHit>) -> bool {
+        let feedback_changed =
+            !same_trading_target(self.trading_state.feedback_hover.as_ref(), next.as_ref());
         let interaction_changed = self.trading_state.interaction.is_idle_or_hovering()
-            && self.trading_state.interaction.hover() != next.as_ref();
+            && !same_trading_target(self.trading_state.interaction.hover(), next.as_ref());
         if !feedback_changed && !interaction_changed {
             return false;
         }
@@ -1201,16 +1367,26 @@ impl ChartEngine {
         true
     }
 
+    /// Whether the hovered target carries an action tooltip that is not shown yet: a close control
+    /// that acts now. The hover dwell runs only while this holds, and only then can it arm the
+    /// tooltip, so a close control that cannot act never dwells or shows one.
+    pub(crate) fn trading_tooltip_pending(&self) -> bool {
+        !self.trading_state.tooltip_armed
+            && self
+                .trading_state
+                .feedback_hover
+                .as_ref()
+                .is_some_and(|hit| {
+                    hit.kind == TradingHitKind::CancelButton
+                        && matches!(self.trading_hit_action(hit), Some(TradingHitAction::Close))
+                })
+    }
+
     /// Reveal the hovered control's action tooltip. The host calls this once its hover dwell
     /// elapses — the engine is headless and owns no timer of its own. Returns whether the frame
     /// changed, so the host can skip a repaint when the hover already moved on.
     pub fn arm_trading_tooltip(&mut self) -> bool {
-        let hovering_control = self
-            .trading_state
-            .feedback_hover
-            .as_ref()
-            .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton);
-        if !hovering_control || self.trading_state.tooltip_armed {
+        if !self.trading_tooltip_pending() {
             return false;
         }
         self.trading_state.tooltip_armed = true;
@@ -1542,7 +1718,8 @@ impl ChartEngine {
 
     /// Commit a dragged protection line as a modification, or a dragged entry as a new protection
     /// request. Existing lines move immediately with a rollback; creation remains host-owned
-    /// because the broker supplies the new order identity.
+    /// because the broker supplies the new order identity. The caller has checked that the source
+    /// still allows the change ([`Self::trading_preview_source_acts`]).
     fn commit_trading_preview(&mut self) -> Option<TradingIntent> {
         let preview = self.trading_state.interaction.preview()?.clone();
         if !matches!(
@@ -1563,6 +1740,8 @@ impl ChartEngine {
                     let rollback = TradingRollback::MovedOrder {
                         id: order.id.clone(),
                         price: order.price,
+                        requested: preview.price,
+                        base_revision: order.revision,
                     };
                     order.price = preview.price;
                     (
@@ -1583,12 +1762,6 @@ impl ChartEngine {
                         .orders
                         .iter()
                         .find(|order| &order.id == order_id)?;
-                    if self.trading_state.orders.iter().any(|child| {
-                        child.parent_order_id.as_ref() == Some(order_id)
-                            && child.role == preview.role
-                    }) {
-                        return None;
-                    }
                     (
                         if preview.role == OrderRole::StopLoss {
                             TradingIntentAction::CreateStopLoss
@@ -1602,39 +1775,37 @@ impl ChartEngine {
                         } else {
                             OrderKind::Limit
                         }),
-                        TradingRollback::CreatedProtection,
+                        TradingRollback::CreatedProtection {
+                            parent: TradingObjectId::Order(order.id.clone()),
+                            role: preview.role,
+                        },
                         order.bracket_id.clone(),
                         order.oco_group_id.clone(),
                         None,
                     )
                 }
                 TradingPreviewSource::StopLoss { position_id }
-                | TradingPreviewSource::TakeProfit { position_id } => {
-                    if self.trading_state.orders.iter().any(|order| {
-                        order.position_id.as_ref() == Some(position_id)
-                            && order.role == preview.role
-                    }) {
-                        return None;
-                    }
-                    (
-                        if preview.role == OrderRole::StopLoss {
-                            TradingIntentAction::CreateStopLoss
-                        } else {
-                            TradingIntentAction::CreateTakeProfit
-                        },
-                        None,
-                        Some(position_id.clone()),
-                        Some(if preview.role == OrderRole::StopLoss {
-                            OrderKind::Stop
-                        } else {
-                            OrderKind::Limit
-                        }),
-                        TradingRollback::CreatedProtection,
-                        None,
-                        None,
-                        None,
-                    )
-                }
+                | TradingPreviewSource::TakeProfit { position_id } => (
+                    if preview.role == OrderRole::StopLoss {
+                        TradingIntentAction::CreateStopLoss
+                    } else {
+                        TradingIntentAction::CreateTakeProfit
+                    },
+                    None,
+                    Some(position_id.clone()),
+                    Some(if preview.role == OrderRole::StopLoss {
+                        OrderKind::Stop
+                    } else {
+                        OrderKind::Limit
+                    }),
+                    TradingRollback::CreatedProtection {
+                        parent: TradingObjectId::Position(position_id.clone()),
+                        role: preview.role,
+                    },
+                    None,
+                    None,
+                    None,
+                ),
             };
         let intent = TradingIntent {
             sequence,
@@ -1726,6 +1897,7 @@ impl ChartEngine {
         };
         self.invalidate_frame_trading();
         self.invalidate_frame_overlay();
+        self.refresh_resting_pointer_affordance();
         true
     }
 
@@ -1788,7 +1960,9 @@ impl ChartEngine {
     /// Commit the keyboard preview. Like a pointer release, this emits the intent directly — a
     /// host that wants a confirmation step runs it around the intent, not inside the chart.
     pub fn trading_keyboard_commit(&mut self) -> Option<TradingIntent> {
-        self.trading_drag_end()
+        let intent = self.trading_drag_end();
+        self.refresh_resting_pointer_affordance();
+        intent
     }
 
     pub fn trading_drag_start_at_with_profile(
@@ -1797,54 +1971,10 @@ impl ChartEngine {
         y_css: f64,
         profile: HitProfile,
     ) -> bool {
-        if !self.trading_state.interaction.is_idle_or_hovering() {
-            return false;
-        }
         let Some(hit) = self.trading_hit_at_with_profile(x_css, y_css, profile) else {
             return false;
         };
-        let preview = match (&hit.object, hit.kind) {
-            (TradingObjectId::Order(id), TradingHitKind::OrderLine) => self
-                .trading_state
-                .orders
-                .iter()
-                .find(|order| &order.id == id)
-                .and_then(|order| self.trading_order_drag_preview(order)),
-            (TradingObjectId::Order(id), TradingHitKind::TakeProfitButton) => self
-                .trading_state
-                .orders
-                .iter()
-                .find(|order| &order.id == id)
-                .and_then(|order| {
-                    self.trading_order_protection_preview(order, OrderRole::TakeProfit)
-                }),
-            (TradingObjectId::Order(id), TradingHitKind::StopLossButton) => self
-                .trading_state
-                .orders
-                .iter()
-                .find(|order| &order.id == id)
-                .and_then(|order| {
-                    self.trading_order_protection_preview(order, OrderRole::StopLoss)
-                }),
-            (TradingObjectId::Position(id), TradingHitKind::TakeProfitButton) => self
-                .trading_state
-                .positions
-                .iter()
-                .find(|position| &position.id == id)
-                .and_then(|position| {
-                    self.trading_position_protection_preview(position, OrderRole::TakeProfit)
-                }),
-            (TradingObjectId::Position(id), TradingHitKind::StopLossButton) => self
-                .trading_state
-                .positions
-                .iter()
-                .find(|position| &position.id == id)
-                .and_then(|position| {
-                    self.trading_position_protection_preview(position, OrderRole::StopLoss)
-                }),
-            _ => None,
-        };
-        let Some(preview) = preview else {
+        let Some(TradingHitAction::Drag(preview)) = self.trading_hit_action(&hit) else {
             return false;
         };
         self.trading_state.interaction = TradingInteractionState::DraggingOrder {
@@ -1896,6 +2026,11 @@ impl ChartEngine {
             } => *authoritative_price,
             _ => return None,
         };
+        // The host may have filled, cancelled, or protected the source while the drag was held.
+        if !self.trading_preview_source_acts(&preview) {
+            self.cancel_trading_drag();
+            return None;
+        }
         let tolerance =
             self.trading_half_tick_on(preview.pane_index, preview.price_scale, start_price);
         if (start_price - preview.price).abs() <= tolerance {
@@ -2052,28 +2187,37 @@ impl ChartEngine {
         });
         self.trading_state.interaction = TradingInteractionState::PendingHostAck {
             sequence,
-            rollback: TradingRollback::CreatedBracketOrder,
+            rollback: TradingRollback::CreatedBracketOrder {
+                pane_index,
+                price_scale,
+                side,
+                prices: [entry_price, take_profit_price, stop_loss_price],
+            },
         };
         self.invalidate_frame_trading();
+        self.refresh_resting_pointer_affordance();
         Ok(())
     }
 
-    /// Activate the close control under the pointer. Closing REMOVES the object and emits the
-    /// intent: there is no pending tint and no second gate, because "close" means the order or
-    /// position is gone. A host that gates closes runs its confirmation around the intent and
-    /// rejects it to put the object back.
+    /// Activate the close control under the pointer, when it acts now (see
+    /// [`Self::trading_hit_action`]). Closing REMOVES the object and emits the intent: there is no
+    /// pending tint and no second gate, because "close" means the order or position is gone. A
+    /// host that gates closes runs its confirmation around the intent and rejects it to put the
+    /// object back.
     pub fn trading_activate_at(&mut self, x_css: f64, y_css: f64) -> bool {
-        let Some(hit) = self.trading_hit_at(x_css, y_css) else {
-            return false;
-        };
-        if !self.trading_state.interaction.is_idle_or_hovering() {
-            return false;
-        }
-        if hit.kind != TradingHitKind::CancelButton {
+        self.trading_hit_at(x_css, y_css)
+            .is_some_and(|hit| self.trading_activate_hit(&hit))
+    }
+
+    /// [`Self::trading_activate_at`] for a control the caller already resolved: the input
+    /// controller passes the close control its press began on, so a release acts on exactly that
+    /// object, never on whatever the host has moved under the pointer since.
+    pub(crate) fn trading_activate_hit(&mut self, hit: &TradingHit) -> bool {
+        if !matches!(self.trading_hit_action(hit), Some(TradingHitAction::Close)) {
             return false;
         }
         let sequence = self.trading_state.next_sequence();
-        let (intent, rollback) = match hit.object {
+        let (intent, rollback) = match hit.object.clone() {
             TradingObjectId::Order(order_id) => {
                 let Some(index) = self
                     .trading_state
@@ -2084,12 +2228,6 @@ impl ChartEngine {
                     return false;
                 };
                 let order = &self.trading_state.orders[index];
-                if !matches!(
-                    order.status,
-                    OrderStatus::Working | OrderStatus::PartiallyFilled
-                ) {
-                    return false;
-                }
                 let remaining = (order.quantity - order.filled_quantity).max(0.0);
                 let intent = TradingIntent {
                     sequence,
@@ -2182,7 +2320,9 @@ impl ChartEngine {
     }
 
     /// Answer an emitted intent. Acceptance simply releases the rollback — the chart already shows
-    /// the change. Rejection puts the object back exactly where it was.
+    /// the change. Rejection puts the object back exactly where it was, unless the host has
+    /// already reported it again while the request waited: the host's state is the last word, so
+    /// the chart keeps that one copy.
     pub fn resolve_trading_intent(&mut self, sequence: u32, accepted: bool) -> bool {
         let TradingInteractionState::PendingHostAck {
             sequence: pending,
@@ -2197,14 +2337,28 @@ impl ChartEngine {
         if !accepted {
             match rollback.clone() {
                 TradingRollback::RemovedOrder { index, order } => {
-                    let index = index.min(self.trading_state.orders.len());
-                    self.trading_state.orders.insert(index, *order);
+                    if !self
+                        .trading_state
+                        .orders
+                        .iter()
+                        .any(|value| value.id == order.id)
+                    {
+                        let index = index.min(self.trading_state.orders.len());
+                        self.trading_state.orders.insert(index, *order);
+                    }
                 }
                 TradingRollback::RemovedPosition { index, position } => {
-                    let index = index.min(self.trading_state.positions.len());
-                    self.trading_state.positions.insert(index, *position);
+                    if !self
+                        .trading_state
+                        .positions
+                        .iter()
+                        .any(|value| value.id == position.id)
+                    {
+                        let index = index.min(self.trading_state.positions.len());
+                        self.trading_state.positions.insert(index, *position);
+                    }
                 }
-                TradingRollback::MovedOrder { id, price } => {
+                TradingRollback::MovedOrder { id, price, .. } => {
                     if let Some(order) = self
                         .trading_state
                         .orders
@@ -2214,14 +2368,140 @@ impl ChartEngine {
                         order.price = price;
                     }
                 }
-                TradingRollback::CreatedBracketOrder | TradingRollback::CreatedProtection => {}
+                TradingRollback::CreatedBracketOrder { .. }
+                | TradingRollback::CreatedProtection { .. } => {}
             }
             self.invalidate_frame_scene();
         }
+        self.release_trading_request();
+        self.refresh_resting_pointer_affordance();
+        true
+    }
+
+    /// End the request awaiting the host as an acceptance does: drop the rollback, free every
+    /// control, and clear the group visual the change asserted.
+    fn release_trading_request(&mut self) {
         self.trading_state.interaction = TradingInteractionState::Idle;
         self.trading_state.group_visual = TradingGroupVisualState::Inactive;
         self.invalidate_frame_trading();
-        true
+    }
+
+    /// Whether the host's own word answers the request awaiting it, as the contract promises (the
+    /// host's snapshot remains the last word) even for a host that never calls
+    /// [`Self::resolve_trading_intent`]. Only state that shows the host ACTED on the request
+    /// answers it, read from a snapshot or from the update or removal of the request's object:
+    ///
+    /// - a cancel or move: the order's removal, a status other than working or partially filled
+    ///   (pending cancel or modify included), or a revision past the one the request saw; for a
+    ///   move also the order at the requested price;
+    /// - a close: the position's removal, or its side flipping;
+    /// - a protection request: a protection of that role linked to the entry or position, the
+    ///   parent's removal, or an entry cancelled, rejected, or expired (a transient pending
+    ///   status keeps waiting);
+    /// - a bracket: a newly added order at one of its legs (entry, take profit, or stop loss).
+    ///
+    /// A plain re-report is no answer: a P&L tick on a position being closed, an in-flight update
+    /// of an order at the revision the request saw, or a stale snapshot. The request keeps
+    /// waiting and every control stays inert, so the trader cannot send a duplicate close,
+    /// cancel, or protection while the first is still in flight.
+    fn trading_request_answered(&self, update: TradingHostUpdate<'_>) -> bool {
+        let TradingInteractionState::PendingHostAck { rollback, .. } =
+            &self.trading_state.interaction
+        else {
+            return false;
+        };
+        let order = |id: &OrderId| {
+            self.trading_state
+                .orders
+                .iter()
+                .find(|order| &order.id == id)
+        };
+        let position = |id: &PositionId| {
+            self.trading_state
+                .positions
+                .iter()
+                .find(|position| &position.id == id)
+        };
+        // An order the broker still works at the revision the request saw has not acted on it.
+        let acted_on = |order: &WorkingOrder, base_revision: u32| {
+            !matches!(
+                order.status,
+                OrderStatus::Working | OrderStatus::PartiallyFilled
+            ) || order.revision > base_revision
+        };
+        match rollback {
+            TradingRollback::MovedOrder {
+                id,
+                requested,
+                base_revision,
+                ..
+            } => {
+                update.reports_order(id)
+                    && order(id).is_none_or(|order| {
+                        acted_on(order, *base_revision)
+                            || (order.price - requested).abs()
+                                <= self.trading_half_tick_on(
+                                    order.pane_index,
+                                    order.price_scale,
+                                    *requested,
+                                )
+                    })
+            }
+            TradingRollback::RemovedOrder { order: closed, .. } => {
+                update.reports_order(&closed.id)
+                    && order(&closed.id).is_none_or(|order| acted_on(order, closed.revision))
+            }
+            TradingRollback::RemovedPosition {
+                position: closed, ..
+            } => {
+                update.reports_position(&closed.id)
+                    && position(&closed.id).is_none_or(|position| position.side != closed.side)
+            }
+            TradingRollback::CreatedProtection { parent, role } => match parent {
+                TradingObjectId::Order(id) => order(id).is_none_or(|order| {
+                    matches!(
+                        order.status,
+                        OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Expired
+                    ) || self.trading_order_has_protection(order, *role)
+                }),
+                TradingObjectId::Position(id) => position(id).is_none_or(|_| {
+                    self.trading_state
+                        .orders
+                        .iter()
+                        .any(|order| order.position_id.as_ref() == Some(id) && order.role == *role)
+                }),
+                TradingObjectId::Execution(_) => true,
+            },
+            TradingRollback::CreatedBracketOrder {
+                pane_index,
+                price_scale,
+                side,
+                prices: [entry, take_profit, stop_loss],
+            } => {
+                let near = |price: f64, leg: f64| {
+                    (price - leg).abs() <= self.trading_half_tick_on(*pane_index, *price_scale, leg)
+                };
+                let leg = |order: &WorkingOrder| {
+                    order.pane_index == *pane_index
+                        && order.price_scale == *price_scale
+                        && match order.role {
+                            OrderRole::Working => order.side == *side && near(order.price, *entry),
+                            OrderRole::TakeProfit => near(order.price, *take_profit),
+                            OrderRole::StopLoss => near(order.price, *stop_loss),
+                        }
+                };
+                match update {
+                    TradingHostUpdate::Order { id, added: true } => order(id).is_some_and(leg),
+                    TradingHostUpdate::Snapshot { prior_orders } => {
+                        self.trading_state.orders.iter().any(|order| {
+                            leg(order) && !prior_orders.iter().any(|prior| prior.id == order.id)
+                        })
+                    }
+                    TradingHostUpdate::Order { added: false, .. }
+                    | TradingHostUpdate::Position(_) => false,
+                }
+            }
+        }
     }
 
     pub fn trading_preview(&self) -> Option<&TradingPreview> {
@@ -2238,6 +2518,7 @@ impl ChartEngine {
         self.trading_state.interaction = TradingInteractionState::Idle;
         self.trading_state.group_visual = TradingGroupVisualState::Inactive;
         self.invalidate_frame_trading();
+        self.refresh_resting_pointer_affordance();
         true
     }
 
@@ -2309,15 +2590,24 @@ impl ChartEngine {
     }
 
     /// Selects the account whose trading objects are visible in chart geometry and hit-testing.
-    /// `None` shows every account in the host projection.
+    /// `None` shows every account in the host projection. A hover or drag ends; a request
+    /// awaiting the host keeps waiting with its rollback, because only the host's answer ends it
+    /// and the one-request-at-a-time lock is chart-wide, not per account.
     pub fn set_trading_visible_account(&mut self, account_id: Option<AccountId>) {
         self.trading_state.visible_account_id = account_id;
         self.trading_state.feedback_hover = None;
         self.trading_state.feedback_pressed = None;
         self.trading_state.tooltip_armed = false;
-        self.trading_state.interaction = TradingInteractionState::Idle;
-        self.trading_state.group_visual = TradingGroupVisualState::Inactive;
+        if !matches!(
+            self.trading_state.interaction,
+            TradingInteractionState::PendingHostAck { .. }
+        ) {
+            self.trading_state.interaction = TradingInteractionState::Idle;
+            self.trading_state.group_visual = TradingGroupVisualState::Inactive;
+        }
         self.invalidate_frame_trading();
+        self.invalidate_frame_overlay();
+        self.refresh_resting_pointer_affordance();
     }
 
     /// Returns the host-selected visible account, if one is configured.
@@ -2388,37 +2678,58 @@ impl ChartEngine {
             intents: prior.intents,
             next_intent_sequence: prior.next_intent_sequence,
         };
+        if self.trading_request_answered(TradingHostUpdate::Snapshot {
+            prior_orders: &prior.orders,
+        }) {
+            self.release_trading_request();
+        }
         self.reconcile_trading_interaction();
         self.reconcile_trading_group_visual();
         self.invalidate_frame_trading();
         if instrument_changed {
             self.invalidate_frame_drawings();
         }
+        self.refresh_resting_pointer_affordance();
         Ok(())
     }
 
     pub fn update_trading_position(&mut self, position: TradingPosition) -> Result<(), ChartError> {
         validate_position(&position)?;
-        if let Some(index) = self
+        let index = if let Some(index) = self
             .trading_state
             .positions
             .iter()
             .position(|value| value.id == position.id)
         {
             self.trading_state.positions[index] = position;
+            index
         } else {
             self.ensure_trading_capacity(1)?;
             self.trading_state.positions.push(position);
+            self.trading_state.positions.len() - 1
+        };
+        if self.trading_request_answered(TradingHostUpdate::Position(
+            &self.trading_state.positions[index].id,
+        )) {
+            self.release_trading_request();
         }
         self.reconcile_trading_interaction();
         self.invalidate_frame_trading();
+        self.refresh_resting_pointer_affordance();
         Ok(())
     }
 
+    /// Remove a position. Returns whether the chart showed it. The host's removal answers a close
+    /// request for it even when the chart already removed the position itself, which frees every
+    /// control, so the result does not say whether to repaint: repaint after the call.
     pub fn remove_trading_position(&mut self, id: &PositionId) -> bool {
         let before = self.trading_state.positions.len();
         self.trading_state.positions.retain(|value| &value.id != id);
         let changed = before != self.trading_state.positions.len();
+        let answered = self.trading_request_answered(TradingHostUpdate::Position(id));
+        if answered {
+            self.release_trading_request();
+        }
         if changed {
             if self.trading_state.interaction.references_position(id) {
                 self.trading_state.interaction = TradingInteractionState::Idle;
@@ -2426,37 +2737,59 @@ impl ChartEngine {
             self.reconcile_trading_group_visual();
             self.invalidate_frame_trading();
         }
+        if changed || answered {
+            self.refresh_resting_pointer_affordance();
+        }
         changed
     }
 
     pub fn update_working_order(&mut self, order: WorkingOrder) -> Result<(), ChartError> {
         validate_order(&order)?;
-        if let Some(index) = self
+        let (index, added) = if let Some(index) = self
             .trading_state
             .orders
             .iter()
             .position(|value| value.id == order.id)
         {
             self.trading_state.orders[index] = order;
+            (index, false)
         } else {
             self.ensure_trading_capacity(1)?;
             self.trading_state.orders.push(order);
+            (self.trading_state.orders.len() - 1, true)
+        };
+        if self.trading_request_answered(TradingHostUpdate::Order {
+            id: &self.trading_state.orders[index].id,
+            added,
+        }) {
+            self.release_trading_request();
         }
         self.reconcile_trading_interaction();
         self.invalidate_frame_trading();
+        self.refresh_resting_pointer_affordance();
         Ok(())
     }
 
+    /// Remove an order. Returns whether the chart showed it. The host's removal answers a cancel
+    /// request for it even when the chart already removed the order itself, which frees every
+    /// control, so the result does not say whether to repaint: repaint after the call.
     pub fn remove_working_order(&mut self, id: &OrderId) -> bool {
         let before = self.trading_state.orders.len();
         self.trading_state.orders.retain(|value| &value.id != id);
         let changed = before != self.trading_state.orders.len();
+        let answered = self.trading_request_answered(TradingHostUpdate::Order { id, added: false });
+        if answered {
+            self.release_trading_request();
+        }
         if changed {
             if self.trading_state.interaction.references_order(id) {
                 self.trading_state.interaction = TradingInteractionState::Idle;
             }
             self.reconcile_trading_group_visual();
             self.invalidate_frame_trading();
+        }
+        if changed || answered {
+            self.refresh_resting_pointer_affordance();
         }
         changed
     }
@@ -2478,6 +2811,7 @@ impl ChartEngine {
             self.trading_state.executions.push(execution);
         }
         self.invalidate_frame_trading();
+        self.refresh_resting_pointer_affordance();
         Ok(())
     }
 
@@ -2492,6 +2826,7 @@ impl ChartEngine {
                 self.trading_state.interaction = TradingInteractionState::Idle;
             }
             self.invalidate_frame_trading();
+            self.refresh_resting_pointer_affordance();
         }
         changed
     }
@@ -2665,21 +3000,35 @@ impl ChartEngine {
         Ok(())
     }
 
-    fn trading_preview_source_exists(&self, preview: &TradingPreview) -> bool {
-        match &preview.source {
-            TradingPreviewSource::Order { order_id }
-            | TradingPreviewSource::OrderStopLoss { order_id }
-            | TradingPreviewSource::OrderTakeProfit { order_id } => self
-                .trading_state
+    /// Whether the live drag's source still allows the change it previews: the order is still a
+    /// protection order the broker is working, or the entry or position still lacks the
+    /// protection being placed (however the host links one to it). The host can change either
+    /// while the drag is held; a drag it rules out ends with nothing emitted, like a cancel.
+    fn trading_preview_source_acts(&self, preview: &TradingPreview) -> bool {
+        let order = |id: &OrderId| {
+            self.trading_state
                 .orders
                 .iter()
-                .any(|order| &order.id == order_id),
+                .find(|order| &order.id == id)
+        };
+        match &preview.source {
+            TradingPreviewSource::Order { order_id } => order(order_id)
+                .and_then(|order| self.trading_order_drag_preview(order))
+                .is_some(),
+            TradingPreviewSource::OrderStopLoss { order_id }
+            | TradingPreviewSource::OrderTakeProfit { order_id } => order(order_id)
+                .and_then(|order| self.trading_order_protection_preview(order, preview.role))
+                .is_some(),
             TradingPreviewSource::StopLoss { position_id }
             | TradingPreviewSource::TakeProfit { position_id } => self
                 .trading_state
                 .positions
                 .iter()
-                .any(|position| &position.id == position_id),
+                .find(|position| &position.id == position_id)
+                .and_then(|position| {
+                    self.trading_position_protection_preview(position, preview.role)
+                })
+                .is_some(),
         }
     }
 
@@ -2821,8 +3170,10 @@ impl ChartEngine {
     }
 
     /// Keep interaction state honest when the host replaces the snapshot underneath it. There is
-    /// no pending object to reconcile any more: a released change is already applied, so this only
-    /// drops feedback and drags whose object the host removed.
+    /// no pending object to reconcile: a released change is already applied, and the host's own
+    /// answer settles its request before this runs (see [`Self::trading_request_answered`]), so
+    /// this only drops feedback whose object the host removed, and a drag whose change the host's
+    /// state now rules out (see [`Self::trading_preview_source_acts`]), which ends as a cancel.
     fn reconcile_trading_interaction(&mut self) {
         if self
             .trading_state
@@ -2841,17 +3192,18 @@ impl ChartEngine {
         {
             self.trading_state.feedback_pressed = None;
         }
-        let source_exists = match &self.trading_state.interaction {
-            TradingInteractionState::Idle | TradingInteractionState::PendingHostAck { .. } => {
-                return
+        match &self.trading_state.interaction {
+            TradingInteractionState::Idle | TradingInteractionState::PendingHostAck { .. } => {}
+            TradingInteractionState::Hovering { hit } => {
+                if !self.trading_hit_source_exists(hit) {
+                    self.trading_state.interaction = TradingInteractionState::Idle;
+                }
             }
-            TradingInteractionState::Hovering { hit } => self.trading_hit_source_exists(hit),
             TradingInteractionState::DraggingOrder { preview, .. } => {
-                self.trading_preview_source_exists(preview)
+                if !self.trading_preview_source_acts(preview) {
+                    self.cancel_trading_drag();
+                }
             }
-        };
-        if !source_exists {
-            self.trading_state.interaction = TradingInteractionState::Idle;
         }
     }
 }
@@ -2998,6 +3350,78 @@ pub(crate) mod tests {
         assert_eq!(short.price, Some(101.0));
         assert_eq!(short.take_profit_price, Some(98.0));
         assert_eq!(short.stop_loss_price, Some(104.25));
+    }
+
+    /// A bracket request is answered by an order the host adds at one of its legs, not by any
+    /// order the host adds: an unrelated order (another device's, at another price), by update or
+    /// by snapshot, leaves it waiting, so a second bracket cannot go out before the first one
+    /// materializes. Its take profit by update, or its entry by snapshot, answers it.
+    #[test]
+    fn a_bracket_request_waits_for_one_of_its_legs() {
+        let mut chart = chart_with_market();
+        chart
+            .set_instrument_metadata(InstrumentMetadata {
+                tick_size: Some(0.25),
+                ..InstrumentMetadata::default()
+            })
+            .unwrap();
+        let drawing_id = chart
+            .add_drawing(
+                DrawingKind::LongPosition,
+                0,
+                vec![
+                    DrawingPoint {
+                        logical: 1.0,
+                        price: 101.12,
+                    },
+                    DrawingPoint {
+                        logical: 2.0,
+                        price: 104.13,
+                    },
+                    DrawingPoint {
+                        logical: 1.0,
+                        price: 98.11,
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+        let busy = |chart: &mut ChartEngine| {
+            chart
+                .place_bracket_order_from_drawing(drawing_id, 3.0)
+                .is_err_and(|error| error.code() == ErrorCode::UnsupportedOperation)
+        };
+        chart
+            .place_bracket_order_from_drawing(drawing_id, 3.0)
+            .unwrap();
+        let intent = chart.take_trading_intents().pop().unwrap();
+
+        let mut unrelated = order("other-1", OrderRole::Working, 102.5);
+        unrelated.side = OrderSide::Buy;
+        chart.update_working_order(unrelated).unwrap();
+        let mut snapshot = chart.trading_snapshot();
+        snapshot
+            .orders
+            .push(order("other-2", OrderRole::StopLoss, 97.0));
+        chart.set_trading_snapshot(snapshot).unwrap();
+        assert!(busy(&mut chart), "unrelated orders are no answer");
+
+        chart
+            .update_working_order(order("target-1", OrderRole::TakeProfit, 104.25))
+            .unwrap();
+        assert!(!chart.resolve_trading_intent(intent.sequence, true));
+
+        chart
+            .place_bracket_order_from_drawing(drawing_id, 3.0)
+            .unwrap();
+        let intent = chart.take_trading_intents().pop().unwrap();
+        let mut snapshot = chart.trading_snapshot();
+        let mut entry = order("entry-2", OrderRole::Working, 101.0);
+        entry.side = OrderSide::Buy;
+        snapshot.orders.push(entry);
+        chart.set_trading_snapshot(snapshot).unwrap();
+        assert!(!chart.resolve_trading_intent(intent.sequence, true));
+        assert!(!busy(&mut chart));
     }
 
     /// Center of the close cell that terminates the object's control cluster.
@@ -4065,6 +4489,25 @@ pub(crate) mod tests {
         // A stale answer for an already-settled intent changes nothing.
         assert!(!chart.resolve_trading_intent(accepted.sequence, false));
         assert!(chart.trading_snapshot().orders.is_empty());
+
+        // The host's own update of the order settles a cancel it never answers: the order is
+        // shown as the host reports it, and a late rejection inserts no second copy.
+        chart
+            .update_working_order(order("order-1", OrderRole::Working, 102.0))
+            .unwrap();
+        assert!(chart.trading_activate_at(cancel_x, cancel_y));
+        let unanswered = chart.take_trading_intents().pop().unwrap();
+        let mut cancelling = order("order-1", OrderRole::Working, 102.0);
+        cancelling.status = OrderStatus::PendingCancel;
+        chart.update_working_order(cancelling).unwrap();
+        assert!(matches!(
+            chart.trading_state.interaction,
+            TradingInteractionState::Idle
+        ));
+        assert!(!chart.resolve_trading_intent(unanswered.sequence, false));
+        let orders = chart.trading_snapshot().orders;
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].status, OrderStatus::PendingCancel);
     }
 
     #[test]
@@ -5108,6 +5551,9 @@ pub(crate) mod tests {
         assert!(!tooltip_shown(&mut chart));
         assert!(chart.arm_trading_tooltip());
         assert!(!chart.arm_trading_tooltip(), "arming twice is a no-op");
+        // Motion inside the same control is no new hover target, so the shown tooltip stays.
+        assert!(!chart.set_trading_hover(cancel_x, cancel_y + 1.0));
+        assert!(!chart.set_trading_hover(cancel_x + 1.0, cancel_y - 3.0));
         let hovered = chart.build_frame();
         let pane_segments = chart.frame_pane_segments(0).unwrap();
         let trading = &hovered.panes[0].main[pane_segments.drawings_end..pane_segments.trading_end];
