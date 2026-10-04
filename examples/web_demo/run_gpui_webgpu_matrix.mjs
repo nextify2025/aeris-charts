@@ -5,7 +5,7 @@ if (process.platform !== "win32" && process.platform !== "linux") {
   console.error("The GPUI/WebGPU pixel matrix reads the GPUI window through Windows DWM or the Linux X server and cannot run on this platform.");
   process.exit(1);
 }
-// docs/Architecture.md (Verification) records that headless Chromium cannot present WebGPU frames
+// docs/Architecture.md (验证) records that headless Chromium cannot present WebGPU frames
 // on a Linux box without a GPU, and the GPUI window is read from an X server, so the Linux run is
 // headed under a virtual display:
 //   xvfb-run -a -s "-screen 0 2560x1600x24" bun run test:gpui-webgpu

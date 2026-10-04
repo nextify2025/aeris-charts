@@ -93,7 +93,7 @@ jobs:
   # Evidence, not yet a required check: what the GPUI executor actually presents in a real window,
   # diffed against the native (tiny-skia) reference. It runs on a virtual X server with Mesa
   # lavapipe (software Vulkan), so it says nothing about hardware GPUs, and its Prim-layer fixtures
-  # say nothing about clipping (docs/Architecture.md, Verification, lists what a pass does and does
+  # say nothing about clipping (docs/Architecture.md, 验证, lists what a pass does and does
   # not prove, the calibration build and the criteria for promoting this job).
   #
   # Neither a gate failure, a hang, the job timeout nor an apt flake may turn this run red:

@@ -1,141 +1,44 @@
-# Public API and compatibility policy
+# 公共 API 与兼容性策略
 
-## Supported product surface
+## 受支持的产品接口面
 
-The supported product is the pre-1.0 browser package `@aeristerminal/aeris-charts`. Its framework-neutral
-root ESM entry point, optional `./react` adapter, `./wasm` asset, and `./design.css` stylesheet are the
-supported npm export paths. React is an optional peer dependency and is not loaded by root consumers.
-The supported root surface is:
+受支持的产品是 1.0 之前的浏览器包 `@aeristerminal/aeris-charts`。其与框架无关的根 ESM 入口、可选的 `./react` 适配器、`./wasm` 资源和 `./design.css` 样式表是受支持的 npm 导出路径。React 是可选的 peer 依赖，根入口的使用者不会加载它。受支持的根接口面如下：
 
-- chart creation and initialization;
-- chart, series, time-scale, pane, price-scale, price-line, and drawing handles declared in
-  `packages/charts/src/types.ts`;
-- pane-local named price scales through `chart.add_price_scale()`, `chart.price_scales()`,
-  `chart.move_price_scale()`, `chart.remove_price_scale()`, arbitrary string IDs in
-  `chart.price_scale()`/`pane.price_scale()`, and series scale identity/rebinding;
-- price-axis semantics: tick labels always lie on the series `min_move` grid; a built-in
-  `price_format` naming `min_move` without `precision` derives the precision (reference
-  `precisionByMinMove`); `price_format.tick_ladder` price bands (exchange spread tables such as the
-  HKEX table) round every label to its band tick with per-band precision, keep axis ticks on the
-  common grid of the visible bands, and drive trading snapping on that series' scale; the series
-  option `autoscale_info_provider` (reference `autoscaleInfoProvider`) replaces a series' autoscale
-  info (it runs during rendering: a chart API called from inside it throws `unsupported_operation`
-  without touching the chart, and a provider that throws is ignored for that pass); price-scale
-  options `tick_mark_density` and `ensure_edge_tick_marks_visible` follow the
-  reference, and the Aeris extensions `base_value` (explicit percentage/indexed base shared with
-  drawings), `autoscale_center` (symmetric autoscale), and `stable_auto_scale` (opt-in hysteresis;
-  the default stays reference-exact) are ordinary `price_scale_options`; malformed ladders and
-  extension values throw `invalid_options` and leave the price format or scale unchanged. Indexed-to-100 labels use
-  the reference fixed two-decimal formatter;
-- the intraday (分时) building blocks described under [Intraday (分时) charts](#intraday-分时-charts):
-  `session_slot_times()`, explicit time-axis `tick_marks`, the `histogram_updown_rule`
-  previous-close volume tint with host `up_color`/`down_color`, a baseline series that shows
-  its first traded bar, the additive `break_on_trading_day` line/area/baseline option (default
-  `false`), and VWAP/pivot lines that restart at every reset; the close-time display label
-  `time_scale_options.bar_time_label` prints bars by their close while they stay open-stamped
-  (see [Close-time labels](#close-time-labels));
-- multi-calendar overlays through the series options `time_alignment: "as_of"` and
-  `as_of_max_staleness` (see [Multi-calendar overlays](#time-exchange-time-zone-and-trading-sessions));
-- built-in series, indicators, drawing kinds, options, themes, data ingestion, interactions,
-  subscriptions, screenshots, and lifecycle operations declared by those handles;
-- Long Position and Short Position drawings through the canonical `drawing_kind` values
-  `"long_position"` and `"short_position"`; each stores three editable anchors in entry, target,
-  stop order, paints target/entry/stop information, projects all three prices onto the owning Y-axis,
-  and uses the shared drawing history, persistence, hit testing, and backend frame path. The
-  statistics use two persisted drawing options, `position_account_size` (a hypothetical balance,
-  default 1,000) and `position_risk_percent` (the share of it risked at the stop, 0–100, default 25),
-  independent of broker orders;
-- measuring drawings through the canonical `drawing_kind` values `"price_range"`, `"date_range"`,
-  and `"date_and_price_range"` (the earlier spelling `"date_price_range"` is still read on import,
-  templates, clipboard, and sync, and never written); each stores an editable start and end anchor
-  snapped to whole bars and price ticks, labels the signed price change, percentage, ticks (counted
-  on the instrument tick or price-band ladder), bar count, and elapsed time (the `labels` option
-  chooses the metrics), and paints in the drawing color;
-- the Shift-click quick measure in the built-in pointer handling: Shift + press on empty chart
-  space starts a transient date-and-price measurement that follows the pointer (drawing default
-  color for a rise, market-down color for a fall), freezes on release after a drag or on the next
-  click, and is dismissed by the following click or Escape. It is never a drawing, history entry,
-  or persisted object;
-- visible-range volume profiles through `chart.add_volume_profile(prices, volume, options)`,
-  returning a distribution handle with `options()`, `apply_options()`, `snapshot()` and `remove()`;
-- KLineChart's 27 indicator templates through `chart.add_klinechart_indicator(source, indicator,
-  volume_source?, options?)`, described under [KLineChart indicators](#klinechart-indicators);
-- first-class tick-driven footprint / numbers-bar series through `chart.add_series("footprint")`,
-  including object and typed-column trade ingestion, explicit/quote/tick-rule aggressor handling,
-  per-level Bid × Ask/total/delta, POC, final/Max/Min/session delta, configurable diagonal and
-  stacked imbalances, density LOD, and derived bar/level queries; generic OHLC setters are rejected
-  because they cannot supply order-flow truth;
-- one chart-level replay clock plus shared canonical trade streams, typed batch ingestion, ordinary
-  candle/bar bindings, exact seek-work telemetry, live-tip dependent work counters in
-  `chart.trade_stream_stats()` (`dependent_rows_computed`, `bar_rows_projected`,
-  `bubble_trades_scanned`, `bubble_markers_sized`), and fixed/ATR Renko, Line Break, Kagi, and Point &
-  Figure transforms through `configure_synthetic_bar_series`, `set_synthetic_bar_source[_typed]`,
-  and `update_synthetic_bar_source`; synthetic source/history remains host-owned and is not part of
-  chart-state persistence;
-- ordinary candles built from ticks and OHLCV resampling as described under
-  [Ticks to candles and resampling](#ticks-to-candles-and-resampling): exchange-session anchored
-  trade-stream time bars (`chart.set_trade_stream_sessions()`), the stream volume histogram
-  (`chart.add_trade_volume_series()`), and engine resampling through
-  `chart.configure_resampled_series()`, `chart.resampled_bars()`, `chart.resample_stats()`, and the
-  session-derived `resample_boundaries()` helper; resampling configuration is runtime-only;
-- engine-resolved secondary-click context through `chart.subscribe_chart_context()`, including
-  pane, time, logical index, coordinates, hit series, and the exact price on its scale; hosts own
-  menus, clipboard operations, and order actions;
-- chart-wide engine value queries through `chart.value_snapshot(logical_index?)`, including every
-  live series' handle/ID, current kind, pane/scale placement, engine-owned exact or independently
-  latest values, predecessor value, and formatted fields; `mouse_event_params.value_snapshot`
-  carries the same records and restores latest values on crosshair leave while legacy `series_data`
-  remains valued-only;
-- additive complete indicator lineage metadata: stable binding ID, structured parameters, source and
-  optional VWAP volume source, and stable output name/index/count, while legacy fields remain;
-- indicator calculation conventions, KDJ, whitespace-safe indicator sources, the warm-up query, and
-  the amount-weighted average price described under [Indicator conventions](#indicator-conventions);
-- the five-output EMA ribbon through `chart.add_ema_ribbon()`, defaulting to periods
-  `5/10/20/50/200` and colors `#335cff/#FF9800/#7d52f4/#fb4ba3/#fb3748`, plus atomic in-place
-  period changes through `chart.set_ema_ribbon_periods()`;
-- first-party broker-neutral trading state, instant/manual confirmation, previews, hit testing,
-  semantic style, and typed intent subscriptions exposed by `chart.trading()`;
-- host-authoritative alert-line indicators and crosshair plus-chip creation requests exposed by
-  `chart.alerts()`; conditions/frequencies are retained configuration metadata while the host owns
-  dialogs, evaluation, persistence, limits, expiration, background delivery, and notifications;
-- default chart accessibility, its additive `chart.accessibility()` singleton handle, compatibility
-  `enable_accessibility()`, accessibility options, and keyboard data/drawing operation;
-- the additive `wheel_behavior` chart option (`auto`, `pan`, or `zoom`); existing gesture option
-  names remain compatible;
-- the time-scale viewport contract: data updates (history prepends, out-of-order inserts, gap
-  backfills, retention trims) never move a scrolled-back view while the live edge follows new bars
-  per `shift_visible_range_on_new_bar`; `set_visible_logical_range()` keeps fractional borders;
-  `scroll_to_real_time()` animates to the configured `right_offset`; keyboard time-scale motion
-  honors `handle_scroll`/`handle_scale`; and visible-range subscribers always end on the final range
-  after a handler mutates data synchronously;
-- the additive `lock_visible_logical_range` time-scale option (default `false`) for fixed
-  full-session views such as intraday time-sharing charts: install every session slot as whitespace,
-  call `set_visible_logical_range({ from: 0, to: slots - 1 })`, and the range stays exact from the
-  pre-open state through the close, across data updates and resizes;
-- `AerisChartsError` and its machine-readable error codes;
-- chart-state persistence V1 through `chart.export_state()` and `chart.import_state()`.
-- camel-case aliases for the common JavaScript lifecycle (`createChart`, `initWasm`, chart/series/scale
-  creation and data methods) while every existing snake-case entry remains supported on the same handles;
-- canonical presentation reset through `chart.reset_style_to_defaults()`. It restores Aeris-owned
-  chart and series visual defaults for the chart's selected theme, including semantic unset/follow
-  states, while preserving data, panes, drawings, indicators, series visibility/metadata, price
-  formatting, scale bindings and scale/view state. It is deliberately separate from
-  `chart.reset_view()`, which changes time/price scale view state.
-- read-only backend diagnostics through `chart.backend_status()`, including the requested and active
-  backend, stable fallback stage/reason, secure-context and `navigator.gpu` exposure, and optional
-  unstable platform detail. `chart.backend()` retains its existing active-backend return value.
+- 图表的创建与初始化；
+- `packages/charts/src/types.ts` 中声明的图表、系列、时间比例尺、窗格、价格比例尺、价格线和绘图句柄；
+- 窗格本地的命名价格比例尺，通过 `chart.add_price_scale()`、`chart.price_scales()`、`chart.move_price_scale()`、`chart.remove_price_scale()`、`chart.price_scale()`/`pane.price_scale()` 中的任意字符串 ID，以及系列的比例尺标识与重新绑定来提供；
+- 价格轴语义：刻度标签始终落在系列的 `min_move` 网格上；内置的 `price_format` 若指定了 `min_move` 而未指定 `precision`，则自动推导精度（参考实现 `precisionByMinMove`）；`price_format.tick_ladder` 价格区间（交易所价差表，例如 HKEX 表）将每个标签舍入到所属区间的价位刻度并按区间设置精度，使坐标轴刻度保持在可见区间的公共网格上，并驱动该系列所在比例尺上的交易磁吸；系列选项 `autoscale_info_provider`（参考实现 `autoscaleInfoProvider`）替换系列的自动缩放信息（它在渲染期间运行：在其内部调用图表 API 会抛出 `unsupported_operation` 且不改动图表，抛出异常的 provider 在该次渲染 pass 中被忽略）；比例尺选项 `tick_mark_density` 和 `ensure_edge_tick_marks_visible` 遵循参考实现，Aeris 扩展项 `base_value`（与绘图共享的显式百分比/指数化基准）、`autoscale_center`（对称自动缩放）和 `stable_auto_scale`（可选启用的迟滞；默认保持与参考实现完全一致）都是普通的 `price_scale_options`；格式错误的价位梯和扩展值会抛出 `invalid_options`，并使价格格式或比例尺保持不变。指数化到 100 的标签使用参考实现的固定两位小数格式化器；
+- [分时图](#分时图)一节所述的分时构建模块：`session_slot_times()`、显式的时间轴 `tick_marks`、`histogram_updown_rule` 的前收盘价成交量着色（配合宿主提供的 `up_color`/`down_color`）、显示其首根有成交的柱的基线系列、新增的 `break_on_trading_day` 线/面积/基线选项（默认 `false`），以及在每次重置时重新开始的 VWAP/枢轴线；收盘时间显示标签 `time_scale_options.bar_time_label` 按柱的收盘时间显示柱，而柱本身仍保持开盘时间戳（参见 [收盘时间标签](#收盘时间标签)）；
+- 通过系列选项 `time_alignment: "as_of"` 和 `as_of_max_staleness` 实现的多日历叠加层（参见 [多日历叠加层](#时间交易所时区与交易时段)）；
+- 这些句柄所声明的内置系列、指标、绘图类型、选项、主题、数据写入、交互、订阅、截图和生命周期操作；
+- 通过规范的 `drawing_kind` 值 `"long_position"` 和 `"short_position"` 提供的多头头寸与空头头寸绘图；每个绘图按入场、目标、止损的顺序存储三个可编辑锚点，绘制目标/入场/止损信息，将三个价格都投影到所属 Y 轴，并使用共享的绘图历史、持久化、命中测试和后端帧路径。统计数据使用两个持久化的绘图选项：`position_account_size`（假设的余额，默认 1,000）和 `position_risk_percent`（在止损处承担风险的占比，0–100，默认 25），与券商订单无关；
+- 通过规范的 `drawing_kind` 值 `"price_range"`、`"date_range"` 和 `"date_and_price_range"` 提供的测量绘图（早先的拼写 `"date_price_range"` 在导入、模板、剪贴板和同步时仍会被读取，但绝不会写出）；每个绘图存储一个可编辑的起始锚点和结束锚点，吸附到整根柱和价格刻度，标注带符号的价格变化、百分比、刻度数（按品种刻度或价格区间价位梯计数）、柱数和经过的时间（`labels` 选项决定显示哪些度量项），并以绘图颜色绘制；
+- 内置指针处理中的 Shift 点击快速测量：在图表空白区域 Shift + 按下，会启动一次临时的日期与价格测量，该测量跟随指针（上涨使用绘图默认颜色，下跌使用市场下跌颜色），在拖动后松开时或下一次点击时冻结，并由随后的点击或 Escape 取消。它绝不是绘图、历史条目或持久化对象；
+- 通过 `chart.add_volume_profile(prices, volume, options)` 提供的可见范围成交量分布，返回带有 `options()`、`apply_options()`、`snapshot()` 和 `remove()` 的分布句柄；
+- KLineChart 的 27 个指标模板，通过 `chart.add_klinechart_indicator(source, indicator, volume_source?, options?)` 提供，详见 [KLineChart 指标](#klinechart-指标)；
+- 一等的、由 Tick 驱动的足迹图 / Numbers Bars 系列，通过 `chart.add_series("footprint")` 提供，包括对象与类型化列的成交写入、显式、报价和 tick 规则的主动方处理、每价位的 Bid × Ask/总量/delta、控制点（POC）、最终/最大/最小/交易时段 delta、可配置的对角失衡与堆叠失衡、密度细节层级（LOD），以及派生的柱/价位查询；通用 OHLC setter 会被拒绝，因为它们无法提供订单流真值；
+- 一个图表级回放时钟，加上共享的规范成交流、类型化批量写入、普通的 K 线/柱绑定、精确的 seek 工作量遥测、`chart.trade_stream_stats()` 中的实时末端依赖工作计数器（`dependent_rows_computed`、`bar_rows_projected`、`bubble_trades_scanned`、`bubble_markers_sized`），以及通过 `configure_synthetic_bar_series`、`set_synthetic_bar_source[_typed]` 和 `update_synthetic_bar_source` 提供的固定/ATR Renko、Line Break、Kagi 和 Point & Figure 变换；合成数据源/历史仍归宿主所有，不属于图表状态持久化的一部分；
+- [Tick 转 K 线与重采样](#tick-转-k-线与重采样)一节所述的由 Tick 构建的普通 K 线与 OHLCV 重采样：以交易所交易时段为锚点的成交流时间柱（`chart.set_trade_stream_sessions()`）、成交流成交量直方图（`chart.add_trade_volume_series()`），以及通过 `chart.configure_resampled_series()`、`chart.resampled_bars()`、`chart.resample_stats()` 和由交易时段派生的 `resample_boundaries()` 辅助函数提供的引擎重采样；重采样配置仅在运行时存在；
+- 由引擎解析的辅助点击上下文，通过 `chart.subscribe_chart_context()` 提供，包括窗格、时间、逻辑索引、坐标、命中的系列，以及其比例尺上的精确价格；菜单、剪贴板操作和订单操作由宿主拥有；
+- 图表范围的引擎值查询，通过 `chart.value_snapshot(logical_index?)` 提供，包括每个存活系列的句柄/ID、当前类型、窗格/比例尺归属位置、由引擎拥有的精确值或各系列独立的最新值、前驱值，以及格式化字段；`mouse_event_params.value_snapshot` 携带相同的记录，并在十字光标离开时恢复最新值，而旧版 `series_data` 仍只包含有值的系列；
+- 新增的完整指标谱系元数据：稳定的绑定 ID、结构化参数、数据源与可选的 VWAP 成交量数据源，以及稳定的输出名称/索引/数量，同时保留旧字段；
+- [指标约定](#指标约定)一节所述的指标计算约定、KDJ、对空白数据安全的指标数据源、预热查询和成交额加权平均价；
+- 五输出 EMA 色带，通过 `chart.add_ema_ribbon()` 提供，默认周期为 `5/10/20/50/200`，默认颜色为 `#335cff/#FF9800/#7d52f4/#fb4ba3/#fb3748`，以及通过 `chart.set_ema_ribbon_periods()` 进行的原子的就地周期修改；
+- 自有的、与券商无关的交易状态、即时/手动确认、预览、命中测试、语义样式，以及类型化的意图订阅，均通过 `chart.trading()` 暴露；
+- 以宿主为权威的警报线指标，以及十字光标加号徽标创建请求，通过 `chart.alerts()` 暴露；条件/频率作为配置元数据被保留，而对话框、评估、持久化、限额、过期、后台投递和通知由宿主拥有；
+- 默认的图表无障碍、其新增的 `chart.accessibility()` 单例句柄、用于兼容的 `enable_accessibility()`、无障碍选项，以及键盘数据/绘图操作；
+- 新增的 `wheel_behavior` 图表选项（`auto`、`pan` 或 `zoom`）；现有的手势选项名称保持兼容；
+- 时间比例尺视口契约：数据更新（历史前插、乱序插入、缺口回填、保留期修剪）绝不会移动已向后滚动的视图，而实时边缘按 `shift_visible_range_on_new_bar` 跟随新柱；`set_visible_logical_range()` 保留小数边界；`scroll_to_real_time()` 以动画滚动到已配置的 `right_offset`；键盘时间比例尺移动遵循 `handle_scroll`/`handle_scale`；在处理函数同步修改数据之后，可见范围订阅者始终以最终范围收尾；
+- 新增的 `lock_visible_logical_range` 时间比例尺选项（默认 `false`），用于固定的整交易时段视图，例如分时图：将每个交易时段槽位安装为空白数据，调用 `set_visible_logical_range({ from: 0, to: slots - 1 })`，该范围从开盘前状态直到收盘，在数据更新和尺寸调整期间始终保持精确；
+- `AerisChartsError` 及其机器可读的错误码；
+- 通过 `chart.export_state()` 和 `chart.import_state()` 实现的图表状态持久化 V1。
+- 面向常见 JavaScript 生命周期的驼峰命名别名（`createChart`、`initWasm`、图表/系列/比例尺创建与数据方法），同时每个现有的蛇形命名入口在相同句柄上仍受支持；
+- 通过 `chart.reset_style_to_defaults()` 实现的规范展示重置。它为图表所选主题恢复由 Aeris 拥有的图表与系列视觉默认值，包括语义上的未设置/跟随状态，同时保留数据、窗格、绘图、指标、系列可见性/元数据、价格格式、比例尺绑定以及比例尺/视图状态。它有意与 `chart.reset_view()` 分离，后者会更改时间/价格比例尺的视图状态。
+- 通过 `chart.backend_status()` 提供的只读后端诊断，包括请求的后端和活动后端、稳定的回退阶段/原因、安全上下文与 `navigator.gpu` 的暴露情况，以及可选的不稳定平台细节。`chart.backend()` 保留其现有的活动后端返回值。
 
-The `./react` entry exports `AerisChart`, `FinancialSeries`, `GeneralPane`, and `useAerisChart` plus
-their configuration types. It is an authoring adapter over the root imperative API: ordinary rerenders
-retain chart/series identities, data changes mutate those existing handles, structural general-axis or
-series changes replace only the affected engine objects, and unmount uses the canonical disposal path.
-It does not define chart semantics independently of the Rust engine. Importing the module is SSR-safe;
-DOM/WASM chart creation starts from the mounted component effect. `FinancialSeries` streams: a new
-`data` array that differs from the previously applied one only by a replaced last point and/or
-ascending appended points (recognized by identity or shallow equality, at most 1,024 changed points)
-is applied through `series.update()`; any other change is one `setData`.
+`./react` 入口导出 `AerisChart`、`FinancialSeries`、`GeneralPane` 和 `useAerisChart`，以及它们的配置类型。它是位于根命令式 API 之上的编写适配器：普通的重新渲染会保留图表/系列的标识，数据变化会修改这些已有句柄，结构性的通用坐标轴或系列变化只替换受影响的引擎对象，卸载则使用规范的销毁路径。它不会独立于 Rust 引擎定义图表语义。导入该模块在 SSR 下是安全的；DOM/WASM 图表创建从已挂载组件的 effect 开始。`FinancialSeries` 以流式方式更新：新的 `data` 数组若与先前已应用的数组相比仅有被替换的最后一个点和/或按升序追加的点（通过标识或浅相等识别，至多 1,024 个变化点），则通过 `series.update()` 应用；其他任何变化均为一次 `setData`。
 
-### Volume profile
+### 成交量分布
 
 ```ts
 const volume = chart.add_series("histogram", { visible: false });
@@ -149,130 +52,54 @@ profile.apply_options({ show_poc: true, show_value_area: true });
 // profile.remove(); // idempotent; does not remove either source
 ```
 
-The price source must initially be a candlestick/bar series and volume a scalar series from the
-same chart. Volume is matched by exact timestamp; missing, whitespace, nonfinite, zero and negative
-volume contribute nothing. Each valid bar's volume is distributed uniformly over its high/low
-interval and classified as bullish when close is at or above open, otherwise bearish. Each row
-stacks the green bullish and red bearish shares and ends flush at the pane's right edge. Flat bars
-contribute to one bin. This OHLCV estimate is not exact traded volume at each price, buy/sell volume,
-profit/loss, or order flow. Demo volume is synthetic.
+价格数据源最初必须是 K 线/柱系列，成交量数据源则必须是标量系列，二者均来自同一图表。成交量按精确时间戳匹配；缺失、空白、非有限、零和负的成交量不产生任何贡献。每根有效柱的成交量在其最高价/最低价区间内均匀分布，当收盘价不低于开盘价时归为看涨，否则归为看跌。每一行堆叠绿色的看涨份额和红色的看跌份额，并紧贴窗格右边缘终止。平坦柱只计入一个桶。该 OHLCV 估算并不是每个价位的精确成交量、买卖量、盈亏或订单流。演示用的成交量是合成的。
 
-POC is the center of the largest-volume bin (lowest price wins ties) and uses one solid marker. The
-contiguous value area expands from POC toward the larger adjacent bin, choosing the lower bin on ties,
-until it reaches the requested fraction; stronger row colors show membership without boundary lines.
-Rows are limited to 1–512, area to >0–100%, width to >0–50% of the pane, and
-live profiles to 16 per chart. `snapshot().error` reports unrepresentable arithmetic; empty/missing
-volume produces empty rows and null levels. Invalid option updates leave the prior options intact.
+POC 是成交量最大的桶的中心（并列时取价格最低者），使用一个实心标记。连续的价值区域从 POC 出发向相邻的较大桶扩展，并列时选择较低的桶，直到达到所请求的比例；更浓的行颜色表示成员归属，不绘制边界线。行数限制为 1–512，价值区域限制为 >0–100%，宽度限制为窗格的 >0–50%，每个图表的存活成交量分布至多 16 个。`snapshot().error` 报告无法表示的算术结果；空的/缺失的成交量会产生空行和 null 价位。无效的选项更新会保持先前的选项不变。
 
-Profiles follow the source pane/scale and current visible time range. Source data updates and range
-changes recompute bins; color/width changes and pointer movement reuse them. Removing either source
-invalidates the handle. Profiles are runtime-only distributions, not scalar output series, and are
-not included in V1 state exports; recreate their bindings after restoring the source data.
-The older `create_volume_profile()` helper remains a drawing of caller-supplied bins.
+成交量分布跟随数据源所在的窗格/比例尺以及当前可见的时间范围。数据源更新和范围变化会重新计算桶；颜色/宽度变化和指针移动则复用这些桶。移除任一数据源都会使该句柄失效。成交量分布是仅限运行时的分布，不是标量输出系列，也不包含在 V1 状态导出中；恢复数据源数据之后需要重新创建其绑定。较早的 `create_volume_profile()` 辅助函数仍然是由调用方提供桶的绘图。
 
-Generated `wasm-bindgen` classes, methods reachable only through implementation objects, telemetry,
-benchmark counters, demo globals, fixtures, and test hooks are internal even when JavaScript can
-inspect them at runtime. `drawings_json()` is an internal inspection shape, not persistence.
+生成的 `wasm-bindgen` 类、仅能通过实现对象访问的方法、遥测、基准测试计数器、演示全局变量、夹具和测试钩子均属内部接口，即使 JavaScript 在运行时能够检查到它们。`drawings_json()` 是内部检查用的结构，不是持久化。
 
-`value_snapshot()` performs no history export. With no argument it resolves each engine-owned
-series' own latest non-whitespace logical index/time. With an integer argument it performs exact
-merged-logical lookup; every live series remains in the array, and a missing or whitespace value has
-null data rather than borrowing a neighbor. OHLC series populate `open`, `high`, `low`, and `close`;
-scalar series populate `value`; `previous_value` is the prior same-series non-whitespace close/value.
-Matching formatted fields use that series' current formatter. Host applications remain responsible
-for symbol/exchange metadata, volume-series association outside a VWAP binding, bar/day changes,
-session calendars, visibility settings, and legend DOM.
+`value_snapshot()` 不执行历史导出。不带参数时，它为每个由引擎拥有的系列解析其自身最新的非空白数据所在的逻辑索引/时间。带整数参数时，它执行精确的合并逻辑索引查找；每个存活系列都保留在数组中，缺失值或空白值的数据为 null，而不会借用相邻值。OHLC 系列填充 `open`、`high`、`low` 和 `close`；标量系列填充 `value`；`previous_value` 是同一系列中此前一个非空白数据的收盘价/值。对应的格式化字段使用该系列当前的格式化器。宿主应用仍需负责品种/交易所元数据、VWAP 绑定之外的成交量系列关联、柱/日变化、交易时段日历、可见性设置以及图例 DOM。
 
-Engine-owned advanced feature series expose their documented scalar price projection through
-`value`, preserving the legacy scalar `series_data` shape. Experimental custom-series values are
-computed by arbitrary host callbacks during rendering rather than stored as canonical engine data.
-Their snapshot record is therefore null for exact-index queries and until a frame records a value;
-latest mode exposes only the most recently recorded visible-frame value and may remain stale while
-the series is not rendered.
+由引擎拥有的高级功能系列通过 `value` 暴露其文档中说明的标量价格投影，保持旧版标量 `series_data` 的形状。实验性自定义系列的值由任意宿主回调在渲染期间计算，而不是作为规范的引擎数据存储。因此，它们的快照记录在精确索引查询中为 null，并且在某一帧记录下值之前也为 null；最新值模式只暴露最近一次记录的可见帧的值，并且在该系列未被渲染期间可能保持陈旧。
 
-The declaration manifest at `packages/charts/api/public-api-v1.json` records every supported
-declaration file. CI runs `bun run check:api`; after deliberate review, update it with
-`bun run update:api`.
+位于 `packages/charts/api/public-api-v1.json` 的声明清单记录了每个受支持的声明文件。CI 运行 `bun run check:api`；经过审慎评审之后，使用 `bun run update:api` 更新它。
 
-Grid lines are engine-owned and default to visible dashed lines. Demo hosts may hide grid
-visibility without replacing the canonical grid style/color; that presentation choice is not a
-library default.
+网格线由引擎拥有，默认可见且为虚线。演示宿主可以关闭网格可见性而不替换规范的网格样式/颜色；这种展示选择不是库的默认值。
 
-`chart.reset_style_to_defaults()` is the canonical host action for returning presentation to shipped
-Aeris defaults. It does not reconstruct defaults from `options()` output: the engine restores
-semantic follow states such as unpinned series colors and price-scale text. Watermark content and
-visibility, scale modes/ranges/margins/layout constraints, viewport zoom/scroll, and indicator/data
-semantics survive the reset; only their engine-owned visual styling is restored.
+`chart.reset_style_to_defaults()` 是宿主将展示恢复为随产品发布的 Aeris 默认值的规范操作。它不会根据 `options()` 的输出重建默认值：引擎会恢复语义上的跟随状态，例如未固定的系列颜色和价格比例尺文字。水印内容与可见性、比例尺模式/范围/边距/布局约束、视口缩放/滚动，以及指标/数据语义在重置后保持不变；只有它们由引擎拥有的视觉样式会被恢复。
 
-Default mouse-wheel zoom follows measurements of TradingView: a saturated vertical step changes bar
-spacing by exactly 10% (smaller trackpad deltas stay proportional) and keeps the right edge pinned,
-because `right_bar_stays_on_scroll` defaults to `true`: the gap after the latest bar stays constant
-while history compresses or expands. Ctrl/Cmd + wheel, macOS trackpad pinch (delivered as Ctrl +
-wheel), and touch pinch zoom around the pointer instead. Setting `right_bar_stays_on_scroll: false`
-restores cursor-anchored ordinary zoom. Vertical and horizontal deltas independently zoom and pan
-the time scale on the pane, time axis, or price axis; Shift does not change routing.
-`wheel_behavior: "pan"` and `"zoom"` are explicit Aeris extensions; explicit zoom retains
-price-axis wheel zoom.
+默认的鼠标滚轮缩放遵循对 TradingView 的测量结果：一次饱和的垂直滚动步长恰好使柱间距变化 10%（较小的触控板增量保持成比例），并保持右边缘固定，因为 `right_bar_stays_on_scroll` 默认为 `true`：在历史数据被压缩或展开时，最新一根柱之后的间隙保持不变。Ctrl/Cmd + 滚轮、macOS 触控板捏合（以 Ctrl + 滚轮的形式送达）以及触摸捏合则改为围绕指针缩放。设置 `right_bar_stays_on_scroll: false` 会恢复以光标为锚点的普通缩放。垂直和水平增量分别独立地缩放和平移窗格、时间轴或价格轴上的时间比例尺；Shift 不改变路由。`wheel_behavior: "pan"` 和 `"zoom"` 是明确的 Aeris 扩展；显式缩放模式仍保留价格轴上的滚轮缩放。
 
-The built-in series live-price line is engine-owned. `price_line_extent` defaults to `"partial"`
-(tracked bar/value to the pane's right edge); `"full"` preserves the conventional pane-wide line.
-Both extents use the same `price_line_source`, color, width, and line-style options, including solid,
-dotted, and dashed modes. Indicator outputs inherit the same default because they are ordinary engine
-series. `create_partial_price_line()` remains only as a compatibility controller over these canonical
-series options, not a separate primitive or rendering implementation.
+内置的系列实时价格线由引擎拥有。`price_line_extent` 默认为 `"partial"`（从被跟踪的柱/值延伸到窗格右边缘）；`"full"` 保留传统的贯穿整个窗格的线。两种延伸范围使用相同的 `price_line_source`、颜色、宽度和线型选项，包括实线、点线和虚线模式。指标输出继承相同的默认值，因为它们是普通的引擎系列。`create_partial_price_line()` 仅作为这些规范系列选项之上的兼容性控制器保留，不是单独的图元或渲染实现。
 
-Chart surfaces do not inject product attribution or branding. `layout` contains only visual chart
-configuration; there is no attribution-logo option in the public chart contract.
+图表界面不会注入产品署名或品牌标识。`layout` 只包含图表的视觉配置；公共图表契约中没有署名标志选项。
 
-`create_chart(container, { initialPane: { horizontal_domain } })` constructs the canonical first
-pane with continuous, temporal, category, or polar semantics. General-first charts contain no hidden
-financial series and need no add-then-remove cleanup. Omitting `initialPane` retains the compatible
-financial-time pane and primary candlestick series. Invalid creation options remove every canvas the
-attempt installed before rejecting.
+`create_chart(container, { initialPane: { horizontal_domain } })` 会构建具有连续、时间、类别或极坐标语义的规范首个窗格。通用优先的图表不包含隐藏的金融系列，也无需先添加再移除的清理。省略 `initialPane` 则保留兼容的金融时间窗格和主 K 线系列。无效的创建选项会在拒绝之前移除该次尝试所安装的每一个画布。
 
-General axis and series handles expose `set_visible(boolean)` and `setVisible(boolean)`. Visibility
-changes preserve the handle and its data while the engine updates domains, interaction snapshots,
-legends, persistence, and the next rendered frame.
+通用坐标轴和系列句柄暴露 `set_visible(boolean)` 和 `setVisible(boolean)`。可见性变化会保留句柄及其数据，同时引擎会更新定义域、交互快照、图例、持久化以及下一次渲染的帧。
 
-Numeric and temporal general-axis handles expose `pan`, `zoom`, and `reset_view`/`resetView`.
-Temporal anchors use whole JavaScript-safe epoch milliseconds, and temporal ticks are selected and
-formatted as bounded UTC intervals by the engine.
+数值和时间类通用坐标轴句柄暴露 `pan`、`zoom` 和 `reset_view`/`resetView`。时间锚点使用 JavaScript 安全的整数 epoch 毫秒，时间刻度由引擎按有界的 UTC 间隔选取并格式化。
 
-Category general-axis handles use the same view lifecycle. `zoom` anchors on a visible category
-identity, `pan` shifts by a fraction of the visible category window, and `reset_view` restores the
-configured or automatic category registry. Automatic registry changes clamp the retained index
-window instead of keeping stale category strings.
+类别通用坐标轴句柄使用相同的视图生命周期。`zoom` 以可见的类别标识为锚点，`pan` 按可见类别窗口的一个比例进行平移，`reset_view` 恢复已配置的或自动的类别注册表。自动注册表发生变化时，会钳制保留的索引窗口，而不是保留过期的类别字符串。
 
-Executable Cartesian general axes accept bounded typed explicit ticks with optional portable labels. Explicit numeric,
-temporal, and category values drive the same labels and grid coordinates in Canvas2D, WebGPU, GPUI,
-native frames, persistence, and screenshots; omitted labels use the built-in formatter. Explicit
-ticks outside the current view are clipped, and combining `ticks` with `tick_count` is rejected.
+可执行的笛卡尔通用坐标轴接受有界的、类型化的显式刻度，并可附带可选的可移植标签。显式的数值、时间和类别值在 Canvas2D、WebGPU、GPUI、原生帧、持久化和截图中驱动相同的标签与网格坐标；省略标签时使用内置格式化器。当前视图之外的显式刻度会被裁剪，同时指定 `ticks` 与 `tick_count` 会被拒绝。
 
-General-axis `grid_visible` projects tick rules into the clipped pane underlay and respects the
-chart-wide horizontal or vertical grid setting. Numeric `zero_line` draws an independent solid rule
-when zero is visible; shared pixel coordinates are deduplicated across multiple axes.
+通用坐标轴的 `grid_visible` 会把刻度线投影到被裁剪的窗格底层，并遵循图表范围的水平或垂直网格设置。数值型 `zero_line` 在零可见时绘制一条独立的实线；多个坐标轴之间共享的像素坐标会被去重。
 
-The same handles expose atomic `apply_options` / `applyOptions` methods for mutable axis configuration,
-series presentation, and compatible general-series pane/axis rebinding. Invalid colors, tick policies,
-grouping, stacking, or bindings leave the complete prior object unchanged. General series expose
-`general_series_order(pane?)` and exact-permutation `set_general_series_order(...)`; this engine order is
-shared by rendering, legends, hit testing, React keyed arrays, and persistence. React `GeneralPane` applies
-these ordinary prop and order changes to existing handles and rolls back a newly acquired pane or series
-when initial installation or a readiness callback fails. Removing an owned empty final pane retires its
-stable identity and leaves one fresh default layout slot, so React cleanup does not create a temporary pane.
+相同的句柄暴露原子的 `apply_options` / `applyOptions` 方法，用于可变的坐标轴配置、系列呈现，以及兼容的通用系列窗格/坐标轴重新绑定。无效的颜色、刻度策略、分组、堆叠或绑定会使整个先前对象保持不变。通用系列暴露 `general_series_order(pane?)` 和要求传入精确排列的 `set_general_series_order(...)`；这一引擎顺序由渲染、图例、命中测试、React 带 key 的数组和持久化共享。React 的 `GeneralPane` 把这些普通的属性与顺序变化应用到已有句柄上，并在初始安装或就绪回调失败时回滚新获取的窗格或系列。移除自有的空的最后一个窗格会使其稳定标识退役，并留下一个全新的默认布局槽位，因此 React 清理过程不会创建临时窗格。
 
-### Indicator conventions
+### 指标约定
 
-Built-in studies default to the TradingView/TA-Lib definitions. The optional last `parameters`
-argument of `add_ema`, `add_dema`, `add_tema`, `add_rsi`, `add_rsi_with_source`, `add_macd`,
-`add_bollinger`, and `add_bollinger_with_source` selects the other widespread convention:
+内置的指标研究默认采用 TradingView/TA-Lib 的定义。`add_ema`、`add_dema`、`add_tema`、`add_rsi`、`add_rsi_with_source`、`add_macd`、`add_bollinger` 和 `add_bollinger_with_source` 的可选最后一个 `parameters` 参数用于选择另一种广泛使用的约定：
 
-| Parameter | Default (`convention: "tradingview"`) | `convention: "china"` (通达信/同花顺 formula language) |
+| 参数 | 默认（`convention: "tradingview"`） | `convention: "china"`（通达信/同花顺公式语言） |
 | --- | --- | --- |
-| `seed` (EMA, DEMA, TEMA, MACD, RSI) | `"sma"`: mean of the first N samples; EMA N starts at bar N-1, RSI N at bar N, MACD 12/26/9 at bar 25/33 | `"first_value"`: `Y0 = X0`, so values start at bar 0 (RSI at bar 1) |
-| `histogram_multiplier` (MACD) | `1`: `MACD - signal` | `2`: `(DIF - DEA) * 2` |
-| `estimator` (Bollinger) | `"population"` (divide by N) | `"sample"` (`STD`, divide by N-1) |
-| `seed` (KDJ) | `"fifty"`: a full RSV window, then K and D start from the textbook 50 (first value at bar N-1) | `"first_value"`: RSV over the bars available while fewer than N exist, and `SMA(X,N,1)` starts at its first input, so K = D = J = RSV at bar 0 |
+| `seed`（EMA、DEMA、TEMA、MACD、RSI） | `"sma"`：前 N 个样本的均值；EMA N 从柱 N-1 开始，RSI N 从柱 N 开始，MACD 12/26/9 从柱 25/33 开始 | `"first_value"`：`Y0 = X0`，因此数值从柱 0 开始（RSI 从柱 1 开始） |
+| `histogram_multiplier`（MACD） | `1`：`MACD - signal` | `2`：`(DIF - DEA) * 2` |
+| `estimator`（Bollinger） | `"population"`（除以 N） | `"sample"`（`STD`，除以 N-1） |
+| `seed`（KDJ） | `"fifty"`：需要完整的 RSV 窗口，之后 K 和 D 从教科书上的 50 起步（首个值位于柱 N-1） | `"first_value"`：在不足 N 根柱时，对已有的柱计算 RSV，且 `SMA(X,N,1)` 从其第一个输入开始，因此在柱 0 处 K = D = J = RSV |
 
 ```ts
 const [dif, dea, bars] = chart.add_macd(candles, 12, 26, 9, undefined, { convention: "china" });
@@ -281,73 +108,34 @@ const boll = chart.add_bollinger(candles, 20, 2, undefined, { convention: "china
 const [k, d, j] = chart.add_kdj(candles, 9, 3, 3);
 ```
 
-The preset only fills parameters; explicit fields override it, `indicator_info().parameters` reports
-the expanded `seed`/`histogram_multiplier`/`estimator` values, and chart-state persistence stores those
-explicit values, never the preset name. Documents written before these parameters existed restore the
-TradingView defaults. Rust hosts use `IndicatorKind::with_convention(IndicatorConvention::China)`.
+预设仅填充参数；显式字段会覆盖预设，`indicator_info().parameters` 报告展开后的 `seed`/`histogram_multiplier`/`estimator` 值，图表状态持久化存储的是这些显式值，绝不存储预设名称。这些参数出现之前写入的文档会恢复为 TradingView 默认值。Rust 宿主使用 `IndicatorKind::with_convention(IndicatorConvention::China)`。
 
-`add_kdj(source, period = 9, k_smoothing = 3, d_smoothing = 3, options?, parameters?)` adds K, D,
-and J in one oscillator pane: `RSV = (C - LLV(L, N)) / (HHV(H, N) - LLV(L, N)) * 100`,
-`K = SMA(RSV, M1, 1)`, `D = SMA(K, M2, 1)`, `J = 3K - 2D`, where `SMA(X, N, 1)` is
-`Y = (X + (N-1) * Y') / N`. J is not clipped to 0–100. A flat window (`HHV == LLV`) repeats the
-previous RSV (50 before the first) instead of producing NaN. `seed` chooses how the study starts:
+`add_kdj(source, period = 9, k_smoothing = 3, d_smoothing = 3, options?, parameters?)` 在同一个振荡指标窗格中添加 K、D 和 J：`RSV = (C - LLV(L, N)) / (HHV(H, N) - LLV(L, N)) * 100`，`K = SMA(RSV, M1, 1)`，`D = SMA(K, M2, 1)`，`J = 3K - 2D`，其中 `SMA(X, N, 1)` 为 `Y = (X + (N-1) * Y') / N`。J 不会被裁剪到 0–100。平坦窗口（`HHV == LLV`）会重复上一个 RSV（第一个之前为 50），而不是产生 NaN。`seed` 决定该研究如何起始：
 
-- `"fifty"` (default): the textbook KDJ, which 通达信's own help calls "KDJ传统版": the first value
-  waits for a full N-bar RSV window (bar N-1) and uses 50 for the missing previous K and D ("若无前一日
-  K值与D值，则可分别用50来代替"; also 百度百科/东方财富百科).
-- `"first_value"` (`{ convention: "china" }` selects it): the formula-language KDJ, which 通达信's help
-  calls "KDJ普通版" (`RSV:=...; K:SMA(RSV,M1,1); D:SMA(K,M2,1); J:3*K-2*D`). While fewer than N bars
-  exist, `HHV`/`LLV` take the bars available, so RSV exists from the first bar, and `SMA(X,N,M)`
-  starts at its first input (`Y0 = X0`). K, D, and J all equal the first bar's RSV, and every bar
-  has a value (`warmup_bars` 0).
+- `"fifty"`（默认）：教科书式 KDJ，通达信自带的帮助称之为“KDJ传统版”：第一个值要等待完整的 N 柱 RSV 窗口（柱 N-1），并以 50 代替缺失的前一个 K 和 D（“若无前一日K值与D值，则可分别用50来代替”；亦见百度百科/东方财富百科）。
+- `"first_value"`（`{ convention: "china" }` 会选择它）：公式语言的 KDJ，通达信帮助称之为“KDJ普通版”（`RSV:=...; K:SMA(RSV,M1,1); D:SMA(K,M2,1); J:3*K-2*D`）。当存在的柱少于 N 根时，`HHV`/`LLV` 取现有的柱，因此 RSV 从第一根柱起就存在，且 `SMA(X,N,M)` 从其第一个输入开始（`Y0 = X0`）。K、D 和 J 都等于第一根柱的 RSV，并且每根柱都有值（`warmup_bars` 为 0）。
 
-The two differ only near the start of the loaded history. They agree after `convergence_bars` (26
-bars for K and 44 for D/J at 9/3/3, the same for both seeds), so load that much history before the
-first visible bar when the exact terminal value matters. For a newly listed instrument whose whole
-history is loaded, `"first_value"` follows the formula from the first session, as 东方财富's and
-新浪's web charts compute it (apart from flat windows, see below). Retention trims and prepended
-history restart the partial window at the new first bar, exactly as if that history had been loaded.
-`indicator_info().parameters.kdj_seed` reports the choice, and V3 persistence stores it (documents
-without it restore `"fifty"`). A document saved with `"first_value"` before this rule was verified
-restores the same parameter and now also shows values on the first N-1 bars.
+两者仅在已加载历史数据的起始附近有所不同。经过 `convergence_bars` 之后二者一致（在 9/3/3 下，K 为 26 根柱，D/J 为 44 根柱，两种 seed 相同），因此当需要精确的终端数值时，应在第一根可见柱之前加载相应数量的历史数据。对于已加载全部历史数据的新上市品种，`"first_value"` 从第一个交易时段起即遵循该公式，东方财富和新浪的网页图表即按此方式计算（平坦窗口除外，见下文）。保留裁剪与前置的历史数据会在新的第一根柱处重新开始局部窗口，与该历史数据一开始就已加载时完全一致。`indicator_info().parameters.kdj_seed` 报告该选择，V3 持久化会存储它（没有该字段的文档恢复为 `"fifty"`）。在该规则被验证之前以 `"first_value"` 保存的文档会恢复相同的参数，现在在前 N-1 根柱上也会显示数值。
 
-**How the conventions were checked (2026-09-28).** No live 通达信, 同花顺, 东方财富, or 富途
-terminal was available, so these results come from published definitions, the platforms' own web
-chart code, and one platform's published values. The published values were compared outside the
-repository and are not committed; `crates/aeris_charts_indicators/tests/platform_values.rs` pins the
-verified rules on a deterministic synthetic series instead:
+**约定的核查方式（2026-09-28）**。没有可用的通达信、同花顺、东方财富或富途真实终端，因此这些结果来自已公布的定义、各平台自身的网页图表代码，以及一个平台公布的数值。已公布的数值是在仓库之外进行比较的，未提交到仓库；`crates/aeris_charts_indicators/tests/platform_values.rs` 转而在一条确定性的合成序列上固定了已验证的规则：
 
-| Study | Evidence | Result |
+| 研究 | 证据 | 结果 |
 | --- | --- | --- |
-| KDJ `"fifty"` | 通达信 help "通达信指标公式算法释疑" (help.tdx.com.cn/gspt) describes KDJ传统版 with the 50 rule; textbook encyclopedias | Documentation only |
-| KDJ `"first_value"` | 通达信 help: KDJ普通版 formula; function reference: `EMA` returns values before N bars (unlike `EXPMEMA`), and `TMA`/`AMA` start at X. Web chart code: 东方财富 (emcharts 3.18.1, quotekchart 1.0.6) computes RSV over `min(9, i + 1)` bars with K = D = J = RSV at bar 0; 新浪财经's formula runtime computes `HHV`/`LLV` over the bars available and starts `SMA` at `Y0 = X0`. Values: 雪球's server-computed KDJ for two A-shares from their listing day and the full histories of four older listings, compared out of tree | 雪球's RSV equals the available-bar RSV exactly from the third session, and the same rule reproduced all six histories to 5e-5. 雪球 starts K and D from 100 and clips J to 0–100, which no terminal formula does, so its first sessions differ; after `convergence_bars` they agree |
-| MACD `{ convention: "china" }` | Same out-of-tree 雪球 comparison; 东方财富, 同花顺, and 新浪 web chart code | Exact from the first session: `EMA` from the first close, DIF = DEA = 0 on bar 0, `(DIF-DEA)*2` |
-| BOLL `estimator` | Same out-of-tree 雪球 comparison; web chart code; 通达信 help: `BOLL` is `MA(C,M) ± 2*STD(C,M)`, and the function reference defines `STD` as the estimated (sample) σ and `STDP` as the population σ | Conflicting. 雪球, 东方财富 web, and 同花顺 web use the population σ (`"population"`, exact match with 雪球). `{ convention: "china" }` selects the sample σ of 通达信's `STD` definition, as 新浪's web chart does, but 通达信's own BOLL help page illustrates σ with 1/N, and published user comparisons disagree (a 2008 test found population, a 2018 formula with N-1 matched). Pass `estimator: "population"` to match 雪球 or 东方财富; the terminal estimator needs a live 通达信/同花顺 check |
-| RSI `"first_value"` | Same out-of-tree 雪球 comparison; 东方财富 and 新浪 web chart code | Not matched near the start: those sources start `SMA` from 0, and 雪球 also measures the listing day's change from the issue price, while `"first_value"` starts at the first change. The gap shrinks as history grows (RSI6 on one listing: 0.65 at bar 39). Unchanged pending a terminal check |
+| KDJ `"fifty"` | 通达信帮助“通达信指标公式算法释疑”（help.tdx.com.cn/gspt）描述了采用 50 规则的 KDJ传统版；教科书类百科 | 仅有文档依据 |
+| KDJ `"first_value"` | 通达信帮助：KDJ普通版公式；函数参考：`EMA` 在不足 N 根柱时即返回值（与 `EXPMEMA` 不同），`TMA`/`AMA` 从 X 起始。网页图表代码：东方财富（emcharts 3.18.1，quotekchart 1.0.6）在 `min(9, i + 1)` 根柱上计算 RSV，并在柱 0 处令 K = D = J = RSV；新浪财经的公式运行时在现有的柱上计算 `HHV`/`LLV`，并使 `SMA` 从 `Y0 = X0` 起始。数值：雪球服务端计算的两只 A 股自上市日起的 KDJ，以及四只较早上市股票的完整历史数据，均在仓库之外比较 | 雪球的 RSV 自第三个交易时段起与现有柱 RSV 完全一致，同一规则以 5e-5 的精度复现了全部六段历史数据。雪球令 K 和 D 从 100 起始，并将 J 裁剪到 0–100，而任何终端公式都不这样做，因此其最初几个交易时段存在差异；经过 `convergence_bars` 之后二者一致 |
+| MACD `{ convention: "china" }` | 同样的仓库外雪球比较；东方财富、同花顺和新浪的网页图表代码 | 自第一个交易时段起完全一致：`EMA` 从第一个收盘价起始，柱 0 处 DIF = DEA = 0，`(DIF-DEA)*2` |
+| BOLL `estimator` | 同样的仓库外雪球比较；网页图表代码；通达信帮助：`BOLL` 为 `MA(C,M) ± 2*STD(C,M)`，函数参考将 `STD` 定义为估计的（样本）σ，将 `STDP` 定义为总体 σ | 相互矛盾。雪球、东方财富网页版和同花顺网页版使用总体 σ（`"population"`，与雪球完全一致）。`{ convention: "china" }` 选择通达信 `STD` 定义的样本 σ，新浪的网页图表也是如此，但通达信自带的 BOLL 帮助页以 1/N 说明 σ，且已公布的用户对比结论不一（2008 年的一次测试得出总体 σ，2018 年使用 N-1 的公式则与之吻合）。传入 `estimator: "population"` 可与雪球或东方财富一致；终端的估计量尚需在真实的通达信/同花顺上核查 |
+| RSI `"first_value"` | 同样的仓库外雪球比较；东方财富与新浪的网页图表代码 | 起始附近不一致：这些来源令 `SMA` 从 0 起始，雪球还以发行价计算上市首日的涨跌，而 `"first_value"` 从第一次变化起始。差距随历史数据增长而缩小（某只上市品种的 RSI6：柱 39 处为 0.65）。在终端核查之前保持不变 |
 
-Not verified: exact 通达信/同花顺/富途 terminal output (so the China preset is not claimed to match
-富途), how terminals treat a flat window (东方财富's and 新浪's web charts use RSV 0 instead of
-repeating the previous RSV; 通达信's formula help does not document division by zero), and 富途's web
-chart, whose page is behind a bot challenge. 同花顺's legacy web charts use other KDJ starts (100 with
-clipping, or a running mean for the first N bars) and are not treated as the terminal definition.
+未验证：通达信/同花顺/富途终端的确切输出（因此不声称 China 预设与富途一致），终端如何处理平坦窗口（东方财富和新浪的网页图表使用 RSV 0，而不是重复上一个 RSV；通达信的公式帮助未记载除以零的处理），以及富途的网页图表（其页面处于机器人验证之后）。同花顺的旧版网页图表使用其他的 KDJ 起始方式（以 100 起始并裁剪，或对前 N 根柱使用滚动均值），不被视为终端定义。
 
-`indicator_schema(kind)` has revision 2: convention parameters appear as `"choice"` parameters with a
-`choices` list, and VWAP lists an optional `amount_source` series.
+`indicator_schema(kind)` 为修订 2：约定参数以带有 `choices` 列表的 `"choice"` 参数形式出现，VWAP 会列出一个可选的 `amount_source` 系列。
 
-**Whitespace sources.** A whitespace row (`{ time }`) in an indicator source keeps its time slot but
-never enters calculation state. Every study emits a whitespace output row there and continues exactly
-as if the row did not exist: a suspended session or a pre-filled future slot does not reset or poison
-EMA/RSI/MACD recursion, and window studies use the last N real bars. Filling a whitespace slot later
-recalculates from that row.
+**空白数据源**。指标源中的空白数据行（`{ time }`）保留其时间槽位，但绝不进入计算状态。每个研究都在该处输出一条空白数据输出行，并完全按该行不存在的方式继续计算：暂停的交易时段或预先填充的未来槽位不会重置或污染 EMA/RSI/MACD 递推，窗口类研究使用最近 N 根真实柱。之后填充某个空白槽位时，会从该行起重新计算。
 
-**Warm-up query and history loading.** `indicator_info()` reports, for each output, `warmup_bars` (bars
-of the root price source before the first value) and `convergence_bars` (bars of history after which
-the value no longer depends on where loaded history begins: the warm-up for window studies, plus the
-bars for every recursive seed's weight to fall below 0.1%). Both include chained sources, so an SMA of
-an RSI reports the sum. `convergence_bars` is `null` when no bar count suffices: session VWAP and
-pivots depend on a time anchor, OBV, Parabolic SAR, SuperTrend, and ZigZag on the whole path.
+**预热查询与历史数据加载**。`indicator_info()` 为每个输出报告 `warmup_bars`（第一个值之前根价格源的柱数）和 `convergence_bars`（经过这么多柱的历史数据后，数值不再取决于已加载历史数据从何处开始：窗口类研究为预热柱数，再加上使每个递归种子的权重降到 0.1% 以下所需的柱数）。两者都包含链式源，因此 RSI 之上的 SMA 报告的是二者之和。当任何柱数都不足以满足时，`convergence_bars` 为 `null`：交易时段 VWAP 和枢轴点取决于时间锚点，OBV、Parabolic SAR、SuperTrend 和 ZigZag 则取决于整条路径。
 
-To show converged values from the first visible bar, request history before it:
+若要从第一根可见柱起就显示已收敛的值，请求其之前的历史数据：
 
 ```ts
 const studies = [...chart.add_macd(candles, 12, 26, 9), chart.add_rsi(candles, 14)];
@@ -358,34 +146,15 @@ candles.set_data(history); // indicators rebuild from the new first bar
 chart.time_scale().set_visible_logical_range({ from: needed, to: needed + visible_bars - 1 });
 ```
 
-MACD 12/26/9 reports warm-up 33 and convergence 154 with the default seed; RSI 14 reports 14 and 108.
-Series retention (`max_points`) must also keep at least that many bars, because trimming re-seeds
-recursive studies at the new first bar.
+在默认 seed 下，MACD 12/26/9 报告预热为 33、收敛为 154；RSI 14 报告 14 和 108。系列保留（`max_points`）也必须至少保留这么多柱，因为裁剪会在新的第一根柱处重新为递归研究设置种子。
 
-**Average price (分时 均价).** `add_vwap(price, volume, options, { amount_source: turnover })` reports
-`sum(amount) / sum(volume)` per VWAP reset period instead of weighting the typical price. Volume and
-turnover align to the price rows by timestamp; minutes without positive volume or finite turnover, and
-whitespace price rows, contribute nothing, and the line is blank until the period's first trade.
-`indicator_info().amount_source` identifies the turnover series; removing it removes the study. The
-reset period follows the VWAP session key.
+**均价（分时均价）**。`add_vwap(price, volume, options, { amount_source: turnover })` 按每个 VWAP 重置周期报告 `sum(amount) / sum(volume)`，而不是对典型价格加权。成交量与成交额按时间戳与价格行对齐；没有正成交量或有限成交额的分钟，以及空白数据价格行，均不贡献任何内容，且在该周期的第一笔成交之前线条为空白。`indicator_info().amount_source` 标识成交额系列；移除它会移除该研究。重置周期遵循 VWAP 的交易时段键。
 
-**Lines restart at resets.** Every VWAP line (typical-price or amount-weighted), each VWAP band
-output, and each pivot level ends its line where its period resets: the first drawn row of a new
-session (or week or month for VWAP bands) starts a new run, with no segment, fill, or hit area joining
-it to the previous period. Periods follow the chart's exchange trading day (`time_zone`,
-`session_start`), exactly as the values reset, after full installs and live updates alike. A period
-whose only drawn row is its first draws a one-bar horizontal segment, so a session VWAP on daily
-bars shows one short segment per bar. Ordinary line, area, and baseline series connect across days
-unless `break_on_trading_day: true` asks them to break at each exchange trading day (on a non-time
-bar axis such as Renko or tick bars, the day of each bar's open time); whitespace rows never break
-a line.
+**线条在重置处重新开始**。每条 VWAP 线（典型价格或按成交额加权）、每个 VWAP 带输出以及每个枢轴水平位，都在其周期重置处结束线条：新交易时段（VWAP 带则为新的一周或一月）中第一条被绘制的行开始新的一段连续线，没有任何线段、填充或命中区域将其与上一周期相连。周期遵循图表的交易所交易日（`time_zone`、`session_start`），与数值重置的方式完全一致，无论是完整安装之后还是实时更新之后均如此。某个周期中唯一被绘制的行就是其第一行时，会绘制一条一根柱宽的水平线段，因此日线柱上的交易时段 VWAP 每根柱显示一条短线段。普通的折线、面积和基线系列会跨日连接，除非 `break_on_trading_day: true` 要求它们在每个交易所交易日处断开（在 Renko 或 Tick 柱等非时间柱轴上，取每根柱开盘时间所在的日）；空白数据行绝不会使线断开。
 
-### KLineChart indicators
+### KLineChart 指标
 
-`chart.add_klinechart_indicator(source, indicator, volume_source?, options?)` adds one of KLineChart's
-27 indicator templates, with KLineChart's formulas and presentation, and returns one `series_api` per
-output in output order. `indicator` is a `klinechart_indicator`: the template name in `indicator` plus
-that template's parameters, all spelled out (nothing is defaulted, so a missing field is rejected):
+`chart.add_klinechart_indicator(source, indicator, volume_source?, options?)` 添加 KLineChart 的 27 个指标模板之一，采用 KLineChart 的公式与呈现方式，并按输出顺序为每个输出返回一个 `series_api`。`indicator` 是一个 `klinechart_indicator`：即 `indicator` 中的模板名称加上该模板的参数，全部显式写出（不设任何默认值，因此缺少字段会被拒绝）：
 
 ```ts
 const [dif, dea, histogram] = chart.add_klinechart_indicator(candles, { indicator: "macd", short: 12, long: 26, signal: 9 });
@@ -393,108 +162,53 @@ const [volume_bars, ma5, ma10] = chart.add_klinechart_indicator(candles, { indic
 const [average_price] = chart.add_klinechart_indicator(turnover, { indicator: "avp" }, volume);
 ```
 
-`options` (the last argument, after `volume_source`, as in `add_vwap`) is a `Partial<series_options>` applied to every output; style one output
-through its returned handle. The 27 names are the `klinechart_indicator_name` union, price overlays first:
-`ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`, `vol`, `macd`, `kdj`, `rsi`, `bias`, `brar`, `cci`, `dmi`,
-`cr`, `psy`, `dma`, `trix`, `obv`, `vr`, `wr`, `mtm`, `emv`, `roc`, `pvt`, `ao`. Each row below gives the
-parameters at KLineChart's defaults, the outputs (`key`, drawn as a line unless noted), and what the
-template needs:
+`options`（最后一个参数，位于 `volume_source` 之后，与 `add_vwap` 相同）是应用于每个输出的 `Partial<series_options>`；如需为单个输出设置样式，请通过其返回的句柄。这 27 个名称即 `klinechart_indicator_name` 联合类型，价格叠加层在前：`ma`、`ema`、`sma`、`boll`、`sar`、`bbi`、`avp`、`vol`、`macd`、`kdj`、`rsi`、`bias`、`brar`、`cci`、`dmi`、`cr`、`psy`、`dma`、`trix`、`obv`、`vr`、`wr`、`mtm`、`emv`、`roc`、`pvt`、`ao`。下表每行给出使用 KLineChart 默认值时的参数、输出（`key`，除非另有说明均绘制为线），以及该模板所需的内容：
 
-| `indicator` | Parameters (KLineChart default) | Outputs | Needs |
+| `indicator` | 参数（KLineChart 默认值） | 输出 | 需要 |
 | --- | --- | --- | --- |
-| `ma` | `periods` `[5, 10, 30, 60]` | `ma1`..`ma4`, one per period | |
+| `ma` | `periods` `[5, 10, 30, 60]` | `ma1`..`ma4`，每个周期一个 | |
 | `ema` | `periods` `[6, 12, 20]` | `ema1`..`ema3` | |
 | `sma` | `period` 12, `weight` 2 | `sma` | |
 | `boll` | `period` 20, `multiplier` 2 | `up`, `mid`, `dn` | |
-| `sar` | `start` 2, `step` 2, `max` 20 (percent) | `sar` (dots) | |
-| `bbi` | `periods` `[3, 6, 12, 24]`, exactly four | `bbi` | |
-| `avp` | none | `avp` | a scalar source series holding turnover, and volume |
-| `vol` | `periods` `[5, 10, 20]`, at most four | `volume` (bars), `ma1`..`ma3` | volume |
-| `macd` | `short` 12, `long` 26, `signal` 9 | `dif`, `dea`, `macd` (bars) | |
+| `sar` | `start` 2, `step` 2, `max` 20（百分比） | `sar`（圆点） | |
+| `bbi` | `periods` `[3, 6, 12, 24]`，恰好四项 | `bbi` | |
+| `avp` | 无 | `avp` | 一个保存成交额的标量源系列，以及成交量 |
+| `vol` | `periods` `[5, 10, 20]`，至多四项 | `volume`（柱），`ma1`..`ma3` | 成交量 |
+| `macd` | `short` 12, `long` 26, `signal` 9 | `dif`, `dea`, `macd`（柱） | |
 | `kdj` | `period` 9, `k_smoothing` 3, `d_smoothing` 3 | `k`, `d`, `j` | |
 | `rsi` | `periods` `[6, 12, 24]` | `rsi1`..`rsi3` | |
 | `bias` | `periods` `[6, 12, 24]` | `bias1`..`bias3` | |
 | `brar` | `period` 26 | `br`, `ar` | |
 | `cci` | `period` 20 | `cci` | |
 | `dmi` | `period` 14, `adxr_period` 6 | `pdi`, `mdi`, `adx`, `adxr` | |
-| `cr` | `period` 26, `ma_periods` `[10, 20, 40, 60]`, exactly four | `cr`, `ma1`..`ma4` | |
+| `cr` | `period` 26, `ma_periods` `[10, 20, 40, 60]`，恰好四项 | `cr`, `ma1`..`ma4` | |
 | `psy` | `period` 12, `ma_period` 6 | `psy`, `maPsy` | |
 | `dma` | `short` 10, `long` 50, `signal` 10 | `dma`, `ama` | |
 | `trix` | `period` 12, `ma_period` 9 | `trix`, `maTrix` | |
-| `obv` | `ma_period` 30 | `obv`, `maObv` | volume |
-| `vr` | `period` 26, `ma_period` 6 | `vr`, `maVr` | volume |
+| `obv` | `ma_period` 30 | `obv`, `maObv` | 成交量 |
+| `vr` | `period` 26, `ma_period` 6 | `vr`, `maVr` | 成交量 |
 | `wr` | `periods` `[6, 10, 14]` | `wr1`..`wr3` | |
 | `mtm` | `period` 12, `ma_period` 6 | `mtm`, `maMtm` | |
-| `emv` | `period` 14 | `emv`, `maEmv` | volume |
+| `emv` | `period` 14 | `emv`, `maEmv` | 成交量 |
 | `roc` | `period` 12, `ma_period` 6 | `roc`, `maRoc` | |
-| `pvt` | none | `pvt` | volume |
-| `ao` | `short` 5, `long` 34 | `ao` (bars) | |
+| `pvt` | 无 | `pvt` | 成交量 |
+| `ao` | `short` 5, `long` 34 | `ao`（柱） | |
 
-A list of periods (`periods`) holds one to five entries, and one output line per entry (`vol`: one to
-four, because the volume bars take the first output). Periods are whole numbers from 1 to 1,000,000;
-the `sma` weight and the `sar` factors are positive and the `boll` multiplier is not negative.
-`indicator_schema("klinechart_<name>")` reports the same defaults (a list as `period_1`, `period_2`,
-...) and output names from the engine, so a settings editor can read them instead of copying this table.
-KLineChart lists a second `emv` parameter, 9, that its formula never reads; it is not part of the
-definition.
+周期列表（`periods`）包含一到五项，每项对应一条输出线（`vol`：一到四项，因为成交量柱占用第一个输出）。周期为 1 到 1,000,000 的整数；`sma` 的权重和 `sar` 的系数为正数，`boll` 的倍数不为负。`indicator_schema("klinechart_<name>")` 从引擎报告相同的默认值（列表为 `period_1`、`period_2`……）和输出名称，因此设置编辑器可以直接读取它们，而无需抄录此表。KLineChart 列出了第二个 `emv` 参数 9，其公式从不读取它；它不属于该定义。
 
-**Sources.** `source` is the OHLC series the formulas read. `avp` is the exception: its source is a
-scalar series holding the traded value (turnover) per bar, typically hidden, and it divides the running
-sum of that series by the running volume. A scalar series (a line, area, baseline, or histogram) is also
-accepted as the source of every other template and is read as open = high = low = close = its value, so
-`macd` over a line series computes the MACD of that line. The templates marked "volume" need a scalar `volume_source`
-(a scalar series such as a histogram or a line, never the source itself); volume pairs with source rows by exact timestamp,
-and a bar without a volume uses KLineChart's own default (1 for `pvt`, 0 for the others). Every other
-template must not be given a volume series. `add_klinechart_indicator` has no `amount_source`: the
-engine accepts a turnover series only for VWAP, so a KLineChart binding carries turnover in `avp`'s
-source instead.
+**源**。`source` 是公式读取的 OHLC 系列。`avp` 是例外：其源是一个标量系列，保存每根柱的成交值（成交额），通常处于隐藏状态，它将该系列的累计和除以累计成交量。标量系列（折线、面积、基线或直方图）也可以作为其他所有模板的源，并按开盘价 = 最高价 = 最低价 = 收盘价 = 该值来读取，因此对折线系列使用 `macd` 会计算该线的 MACD。标注为“成交量”的模板需要一个标量 `volume_source`（诸如直方图或折线之类的标量系列，绝不能是源本身）；成交量按精确时间戳与源行配对，没有成交量的柱使用 KLineChart 自己的默认值（`pvt` 为 1，其余为 0）。其他所有模板不得提供成交量系列。`add_klinechart_indicator` 没有 `amount_source`：引擎仅为 VWAP 接受成交额系列，因此 KLineChart 绑定改为在 `avp` 的源中携带成交额。
 
-**Invalid input.** An unknown template name (the name is case-sensitive and lower case), a missing,
-non-whole, out-of-range, or non-numeric parameter, too many or too few periods, a source series that
-no longer exists, an OHLC source given to `avp`, or a volume series that is missing, extra, equal to the
-source, or not scalar throws `AerisChartsError` with code `invalid_options` and leaves the chart
-unchanged. The engine decides every one of these, and the message names the template that was passed. Nothing is rounded: `{ short: 2.5 }` is rejected
-instead of floored, unlike the period arguments of the other `add_*` methods.
+**无效输入**。未知的模板名称（名称区分大小写，且为小写）、缺失、非整数、超出范围或非数值的参数、周期数过多或过少、已不存在的源系列、传给 `avp` 的 OHLC 源，或缺失、多余、等于源或非标量的成交量系列，都会抛出代码为 `invalid_options` 的 `AerisChartsError`，并使图表保持不变。这些情形全部由引擎判定，错误消息会指明所传入的模板名称。不做任何取整：`{ short: 2.5 }` 会被拒绝而不是向下取整，这与其他 `add_*` 方法的周期参数不同。
 
-**Presentation.** The engine owns the look, as KLineChart draws it. Line outputs are 1px lines in
-KLineChart's five-color palette in output order, with no title chip, last-value label, or price line.
-`vol`, `macd`, and `ao` draw their bar output as a histogram, and `sar` draws marker-only dots. Bars and
-dots are colored per row by the engine, from the source candles' up and down colors: `vol` bars by
-candle direction (grey when flat), `macd` bars by sign and by whether they are rising, `ao` bars by
-whether they are rising, and `sar` dots by their position against the candle's midpoint. KLineChart
-outlines a rising `macd` or `ao` column; Aeris histograms have no outline style, so those columns are
-filled at a lighter alpha instead. Price templates (`ma`, `ema`, `sma`, `boll`, `sar`, `bbi`, `avp`)
-draw over the candles on the main pane, and every other template in a pane of its own below it.
+**呈现**。外观由引擎拥有，与 KLineChart 的绘制方式一致。线输出为 1px 的线，按输出顺序使用 KLineChart 的五色调色板，不带标题徽标、最新值标签或价格线。`vol`、`macd` 和 `ao` 将其柱输出绘制为直方图，`sar` 绘制仅含标记的圆点。柱和圆点由引擎根据源 K 线的涨跌颜色逐行着色：`vol` 柱按 K 线方向着色（平盘时为灰色），`macd` 柱按符号以及是否上升着色，`ao` 柱按是否上升着色，`sar` 圆点按其相对 K 线中点的位置着色。KLineChart 会为上升的 `macd` 或 `ao` 柱描边；Aeris 直方图没有描边样式，因此这些柱改为以较浅的 alpha 填充。价格类模板（`ma`、`ema`、`sma`、`boll`、`sar`、`bbi`、`avp`）绘制在主窗格的 K 线之上，其他所有模板都绘制在主窗格下方各自独立的窗格中。
 
-**Lineage, warm-up, and persistence.** Every output's `indicator_info()` has `kind:
-"klinechart_<name>"` (a member of `indicator_kind`), the whole definition in `parameters.klinechart`,
-`period` set to the first period (0 for `avp`, `pvt`, and `sar`), `deviation: null`, and the bound
-`volume_source`. Rows before an output's `warmup_bars` hold no value and are not returned by `data()`;
-`convergence_bars` is `null` for `ema`, `sma`, `macd`, `kdj`, `rsi`, `dmi`, `trix`, `obv`, `pvt`, `avp`,
-and `sar`, whose values depend on the whole loaded history (recursive smoothing, running totals, or a
-path state). A binding steps each formula one row at a time from checkpointed state, so a live
-tick costs the formula's window rather than the history, and publishes the changed suffix. A
-whitespace row (a missing bar, or a pre-installed session slot) emits no value and never enters a
-window: every value equals the one computed on the chart without that row. V3 chart state stores the definition as `{"kind": "klinechart",
-"indicator": "macd", "short": 12, "long": 26, "signal": 9 }` with the source, volume-source, and
-per-output style references, and restores into a fresh chart like every other study. The formulas are
-translated from KLineChart v10.0.3 and match its output bit for bit (see `docs/Architecture.md` and
-`NOTICE`).
+**溯源、预热与持久化**。每个输出的 `indicator_info()` 都具有 `kind: "klinechart_<name>"`（`indicator_kind` 的成员）、位于 `parameters.klinechart` 中的完整定义、设为第一个周期的 `period`（`avp`、`pvt` 和 `sar` 为 0）、`deviation: null`，以及所绑定的 `volume_source`。输出的 `warmup_bars` 之前的行没有值，也不会由 `data()` 返回；`ema`、`sma`、`macd`、`kdj`、`rsi`、`dmi`、`trix`、`obv`、`pvt`、`avp` 和 `sar` 的 `convergence_bars` 为 `null`，因为它们的值取决于整个已加载的历史数据（递归平滑、累计总和或路径状态）。绑定从检查点状态出发，每次一行地推进每个公式，因此一次实时 Tick 的开销是公式的窗口而不是整个历史数据，并发布发生变化的后缀。空白数据行（缺失的柱，或预先安装的交易时段槽位）不产生值，也绝不进入窗口：每个值都等于在没有该行的图表上计算出的值。V3 图表状态将该定义存储为 `{"kind": "klinechart", "indicator": "macd", "short": 12, "long": 26, "signal": 9 }`，并附带源、成交量源以及每个输出的样式引用，并像其他所有研究一样恢复到全新的图表中。这些公式移植自 KLineChart v10.0.3，其输出与之逐位一致（参见 `docs/Architecture.md` 与 `NOTICE`）。
 
-## Coordinates and panes
+## 坐标与窗格
 
-Every public coordinate lives in one chart-content space, and it is never pane-local. `x` is CSS px
-from the plot-area left edge (right of the left price strip), so the container `x` is
-`pane.get_geometry().left + x`. `y` is CSS px from the top of the stacked pane area, which is pane 0's
-top. A pane spans `[geometry.top, geometry.top + geometry.height]` in that `y`; its pane-local `y` is
-`y - geometry.top`. The same space carries `series.price_to_coordinate`/`coordinate_to_price`,
-`chart.price_to_coordinate`/`coordinate_to_price`, `time_scale()` conversions,
-`mouse_event_params.point`, the crosshair, hit tests, drawings, and trading geometry, so a `y` from one
-API can be handed to any other. All values reflect the last layout pass: after `pane.set_height`, a
-separator drag, or a pane move, read them again once the chart has laid out.
+每个公共坐标都位于同一个图表内容空间中，绝不是窗格局部坐标。`x` 是自绘图区左边缘（左侧价格栏的右侧）起算的 CSS px，因此容器中的 `x` 为 `pane.get_geometry().left + x`。`y` 是自堆叠窗格区域顶部（即窗格 0 的顶部）起算的 CSS px。在该 `y` 中，窗格跨越 `[geometry.top, geometry.top + geometry.height]`；其窗格局部 `y` 为 `y - geometry.top`。同一空间也承载 `series.price_to_coordinate`/`coordinate_to_price`、`chart.price_to_coordinate`/`coordinate_to_price`、`time_scale()` 转换、`mouse_event_params.point`、十字光标、命中测试、绘图以及交易几何，因此某个 API 得到的 `y` 可以直接交给任何其他 API。所有值都反映最近一次布局 pass：在 `pane.set_height`、分隔条拖动或窗格移动之后，请在图表完成布局后再次读取它们。
 
-**Choosing a pane.** A series handle converts on its own pane and price scale, in that scale's mode and
-base. A host that needs a lower pane's coordinates keeps a handle to a series in that pane:
+**选择窗格**。系列句柄在其自身所在的窗格和价格比例尺上进行转换，采用该比例尺的模式和基准。需要较下方窗格坐标的宿主，会持有该窗格中某个系列的句柄：
 
 ```ts
 // `rsi` is a series handle in pane 1, for example from `chart.add_rsi(candles, 14)`.
@@ -504,236 +218,49 @@ const paneLocalY = y! - pane.top;      // pane-relative chrome subtracts the pan
 rsi.coordinate_to_price(y!);           // 70
 ```
 
-`chart.price_to_coordinate(price)` converts on pane 0's default scale (the first visible non-overlay
-series' scale, else the right scale), and `chart.coordinate_to_price(y)` uses the default scale of the
-pane containing `y`: a separator belongs to the pane above and a `y` below the panes to the last pane.
-That is the scale the crosshair label reads in that pane, so the two never disagree. Neither follows
-series creation order or an overlay's scale. Time, logical, and `x` conversions are the same for every
-pane.
+`chart.price_to_coordinate(price)` 在窗格 0 的默认比例尺上转换（即第一个可见的非叠加层系列的比例尺，否则为右侧比例尺），`chart.coordinate_to_price(y)` 使用包含 `y` 的窗格的默认比例尺：分隔条归属于其上方的窗格，位于所有窗格下方的 `y` 归属于最后一个窗格。这就是十字光标标签在该窗格中读取的比例尺，因此二者绝不会不一致。两者都不遵循系列创建顺序或某个叠加层的比例尺。时间、逻辑和 `x` 的转换对每个窗格都相同。
 
-**Two other spaces.** Plugin draw-context converters (`price_to_y`, `time_to_x`, `logical_to_x`) return
-bitmap px of the whole chart with `x` including `pane_left`, the space the plugin canvas draws in;
-subtract `pane_left` and divide by `dpr` to compare them with the CSS-px converters above. A plugin
-axis-label descriptor's `coordinate` is pane-local (price: px from the pane top; time: px from the
-plot-area left) unless a series primitive supplies `price`, which is converted on the series' scale.
+**另外两个空间**。插件绘制上下文的转换器（`price_to_y`、`time_to_x`、`logical_to_x`）返回整个图表的位图 px，其中 `x` 包含 `pane_left`，这正是插件画布绘制所在的空间；减去 `pane_left` 并除以 `dpr`，即可与上文的 CSS px 转换器比较。插件坐标轴标签描述符的 `coordinate` 是窗格局部坐标（价格：距窗格顶部的 px；时间：距绘图区左侧的 px），除非系列图元提供了 `price`，此时它会在该系列的比例尺上转换。
 
-**Linked crosshairs.** `crosshair_sync_position()` and the `crosshair` events from `take_sync_events()`
-carry `pane_index` and a `price` on that pane's default scale, with the pane picked from the crosshair
-`y` (a separator counts as the pane above). `set_crosshair_position(price, time, series)` places the
-line through the given series' scale; the emitted price is the raw `price` when that series is on the
-pane's default scale (and, in percentage and indexed modes, shares its base), otherwise it is
-re-expressed on the default scale so a linked chart lands on the same line. `apply_external_crosshair`
-converts the price on the requested pane's default scale and holds the line inside that pane: a price
-outside the pane's visible range sits on the pane's edge instead of drawing in a neighbouring pane.
+**联动十字光标**。`crosshair_sync_position()` 以及 `take_sync_events()` 返回的 `crosshair` 事件携带 `pane_index` 和位于该窗格默认比例尺上的 `price`，窗格由十字光标的 `y` 确定（分隔条算作其上方的窗格）。`set_crosshair_position(price, time, series)` 通过给定系列的比例尺放置该线；当该系列位于窗格的默认比例尺上（并且在百分比和指数化模式下共享其基准）时，发出的价格即原始 `price`，否则会在默认比例尺上重新表达，使联动的图表落在同一条线上。`apply_external_crosshair` 在所请求窗格的默认比例尺上转换价格，并将该线限定在该窗格内：位于窗格可见范围之外的价格会停在窗格边缘，而不会绘制到相邻窗格中。
 
-## Time, exchange time zone, and trading sessions
+## 时间、交易所时区与交易时段
 
-Canonical chart time is whole UTC seconds. `business_day` values and strict `"YYYY-MM-DD"` strings
-are taken at UTC midnight; values returned by the chart are always numeric UTC seconds. The
-financial time axis is ordinal: bars are spaced by index, so weekends, holidays, lunch breaks, and
-half days take no width. Hosts own exchange calendars and send only the bars that exist; holiday
-calendars are not an engine feature. By default every series' timestamps join the axis, so an
-overlay from another market calendar adds its own bars as slots; opt it into `time_alignment:
-"as_of"` instead (see **Multi-calendar overlays**).
+规范的图表时间为整数 UTC 秒。`business_day` 值和严格的 `"YYYY-MM-DD"` 字符串按 UTC 零点处理；图表返回的值始终是数值型 UTC 秒。金融时间轴是序数式的：柱按索引等距排列，因此周末、节假日、午休和半日市都不占宽度。宿主拥有交易所日历，并且只发送实际存在的柱；节假日日历不属于引擎功能。默认情况下，每个系列的时间戳都会加入时间轴，因此来自另一个市场日历的叠加层会把它自己的柱作为槽位加入；请改为让它选用 `time_alignment: "as_of"`（参见 **多日历叠加层**）。
 
-**Multi-calendar overlays.** `series_options.time_alignment` is `"union"` (the default, reference
-behavior) or `"as_of"`. An as-of series (an index over a stock from another exchange, crypto over
-equities, a futures night session over its underlying) adds no time point, so the other series keep
-a gapless axis. Each point, up to the last real bar of the other series, shows the overlay's last
-row at or before that point's time: rows between two points collapse into the later one, a point
-with no newer row repeats the previous row, and rows after the last point wait until the other
-series reach them (a pre-installed intraday session never shows the overlay in its future slots).
-`as_of_max_staleness` (whole seconds, `null` by default) leaves a point empty instead of repeating
-a row older than that; `0` shows only rows exactly at a point. The points come from the union
-series, so an as-of series alone on a chart shows nothing. Everything reading the series follows
-the same points: rendering, hit testing, crosshair and legend values, `value_snapshot` (which
-reports the point's time), comparison anchors and percentage bases, autoscale, markers (placed at
-the first point at or after their time; a marker newer than every point waits with its row, and a
-point the staleness bound leaves empty hides it), session highlighting (each point is colored as
-the row it shows), the accessibility focus ring (on the first point showing the focused row), and
-last-value chrome. `data()`, `data_by_index`, and `last_value_data` return the overlay's own rows
-with their own times. Studies bound to an as-of series compute on its own rows and are shown the
-same way; their `time_alignment` reads back as the source's and cannot be set. Live ticks on
-either side stay proportional to the points they change. Only line, area, baseline, histogram, bar,
-and candlestick series that own their rows accept it: custom, advanced, footprint, trade-bound,
-trade-study, and synthetic series, and every series on a non-time (tick, volume, range, or
-synthetic) bar axis, throw `unsupported_operation`. Converting an as-of series to a custom,
-advanced, or footprint series, binding it to a trade stream, or configuring it as a synthetic
-transform returns it to the union. A bad value or a staleness without `"as_of"` throws
-`invalid_options` before the call's other options apply; `add_series` checks both keys before it
-creates (or adopts) the series, and a refusal leaves no series behind on the main thread or in a
-worker. Re-applying the current alignment is a no-op that notifies no `subscribe_data_changed`
-handler; a change notifies each once with `"full"`. Worker charts take both keys in
-`add_series` options and change them later with `offscreen_chart.apply_series_options(patch,
-series_id)`; `offscreen_chart.series_options(series_id)` reads the options back. A worker chart
-addresses series by the numeric id `add_series` returned (`0` is the primary). The patch follows the
-same rules and throws the same codes as `apply_options` (an omitted key keeps its value, switching
-to `"union"` clears the staleness bound, an unchanged request is a no-op) and applies nothing when
-it throws. It accepts only `time_alignment` and `as_of_max_staleness`: any other key with a value
-throws `unsupported_operation` naming it, and a non-object patch throws `invalid_options`. An id
-that is not a whole number in `0..=4294967295` or names no live series throws `invalid_handle`
-(`stale_handle` for a series that was removed), even for an empty patch, and a removed chart throws
-`disposed`. A call that succeeds repaints the worker canvas before it returns, like the other
-worker mutations (an unchanged request too); a call that throws paints nothing. Worker charts have no
-series handle, so no `subscribe_data_changed` notification; read `visible_logical_range()` after the
-call. Rust hosts call
-`ChartEngine::set_series_time_alignment(id, TimeAlignment::AsOf { max_staleness })`. Like other
-financial series options, the setting is host-owned and not persisted.
+**多日历叠加层**。`series_options.time_alignment` 为 `"union"`（默认值，参考实现的行为）或 `"as_of"`。as-of 系列（例如叠加在另一交易所股票之上的指数、叠加在股票之上的加密货币、叠加在其标的之上的期货夜盘）不会增加时间点，因此其他系列的时间轴保持无间断。每个时间点——直到其他系列的最后一根真实柱为止——显示该叠加层在不晚于该时间点的时间处的最后一行：位于两个时间点之间的行会合并到后一个时间点，没有更新行的时间点重复上一行，最后一个时间点之后的行则等待其他系列到达它们（预先安装的日内交易时段绝不会在其未来槽位中显示叠加层）。`as_of_max_staleness`（整数秒，默认 `null`）会让时间点留空，而不是重复比该值更旧的行；`0` 只显示恰好位于某个时间点上的行。时间点来自 union 系列，因此图表上单独存在的 as-of 系列不显示任何内容。所有读取该系列的功能都遵循同样的时间点：渲染、命中测试、十字光标和图例的值、`value_snapshot`（报告该时间点的时间）、比较锚点和百分比基准、自动缩放、标记（放置在不早于其时间的第一个时间点上；比所有时间点都新的标记随其行一同等待，被陈旧度上限留空的时间点会隐藏它）、交易时段高亮（每个时间点按其所显示的行着色）、无障碍焦点环（位于显示该焦点行的第一个时间点上），以及最新值界面元素。`data()`、`data_by_index` 和 `last_value_data` 返回叠加层自身的行及其自身的时间。绑定到 as-of 系列的研究在其自身的行上计算，并以同样方式显示；它们的 `time_alignment` 读回的是源的值，且无法设置。任一侧的实时 Tick 仍与其所改变的时间点成比例。仅拥有自身行数据的折线、面积、基线、直方图、柱和 K 线系列接受它：自定义、高级、足迹图、成交绑定、成交研究和合成系列，以及非时间（Tick、成交量、区间或合成）柱轴上的每个系列，都会抛出 `unsupported_operation`。把 as-of 系列转换为自定义、高级或足迹图系列、将其绑定到成交流，或将其配置为合成变换，会使它回到 union。错误的值，或在没有 `"as_of"` 时给出陈旧度上限，会在该调用的其他选项生效之前抛出 `invalid_options`；`add_series` 在创建（或接管）该系列之前检查这两个键，被拒绝时不会在主线程或 worker 中留下任何系列。重复应用当前的对齐方式是空操作，不会通知任何 `subscribe_data_changed` 处理器；发生变化时会以 `"full"` 通知每个处理器一次。worker 图表在 `add_series` 选项中接受这两个键，之后可通过 `offscreen_chart.apply_series_options(patch, series_id)` 更改它们；`offscreen_chart.series_options(series_id)` 读回这些选项。worker 图表通过 `add_series` 返回的数值 id 来定位系列（`0` 为主系列）。该补丁遵循与 `apply_options` 相同的规则并抛出相同的错误码（省略的键保持其值，切换到 `"union"` 会清除陈旧度上限，未变化的请求是空操作），抛出错误时不应用任何内容。它只接受 `time_alignment` 和 `as_of_max_staleness`：任何其他带值的键都会抛出点名该键的 `unsupported_operation`，非对象补丁则抛出 `invalid_options`。不是 `0..=4294967295` 范围内整数的 id，或指向没有存活系列的 id，会抛出 `invalid_handle`（对于已被移除的系列则抛出 `stale_handle`），即使补丁为空也是如此；已被移除的图表则抛出 `disposed`。调用成功时，会在返回之前重绘 worker 画布，与其他 worker 变更一致（未变化的请求也是如此）；抛出错误的调用不会绘制任何内容。worker 图表没有系列句柄，因此没有 `subscribe_data_changed` 通知；请在调用之后读取 `visible_logical_range()`。Rust 宿主调用 `ChartEngine::set_series_time_alignment(id, TimeAlignment::AsOf { max_staleness })`。与其他金融系列选项一样，该设置由宿主拥有，且不被持久化。
 
-**Exchange time zone.** `chart.time_scale().apply_options({ time_zone, session_start })` or the
-declarative chart option `timeScale: { timeZone, sessionStart }` (also accepted by worker charts)
-sets how instants are grouped and labelled. `time_zone` is `"UTC"` (the default), an IANA name such
-as `"Asia/Shanghai"` or `"America/New_York"`, or an explicit schedule of
-`{ from_utc_seconds, offset_seconds }` transitions (strictly ascending, at most 1024, offsets within
-±18 h; the first offset also applies before its entry). The package resolves an IANA name once per
-zone with `Intl.DateTimeFormat` over 1970–2100 (at most ~262 DST transitions) and keeps at most 32
-resolved zones; outside that span the nearest offset applies. The engine itself never reads the
-browser's time zone: `timeScale.timeZone` takes only `"UTC"` or an explicit schedule. A zone from the
-TradingView parity list (`TRADINGVIEW_TIME_ZONES`; WASM `supported_time_zones_json()`) can instead be
-named to the engine with `ChartEngine::set_time_zone(&str)` (`Ok(true)` when it changed; WASM
-`set_time_zone`) or the top-level engine option `timezone`; it is resolved once into the same schedule
-(1970–2100, about 4 ms natively), so grouping and labels match the explicit schedule, and the name
-also localizes the general (non-financial) temporal axes and
-`ChartEngine::time_zone_clock_text(utc_seconds, show_seconds)`. `ChartEngine::time_zone_id()` (WASM
-`time_zone()`) returns the named zone, `Etc/UTC` by default, or `custom` while an explicit schedule is
-installed. An unknown zone, malformed schedule, out-of-range session start, or session start that the
-windows of an installed close-time label do not fit ([Close-time labels](#close-time-labels)) throws
-`invalid_options` before any other key in the same call is applied; an unsupported or non-string
-`timezone` rejects the patch the same way. `time_scale().options()` reports the IANA name (or the
-schedule) and `session_start`. Rust hosts call `ChartEngine::set_exchange_offsets(UtcOffsetSchedule)`
-for an explicit schedule and `set_session_start_seconds(i32)`; the engine JSON options accept
-`timeScale.timeZone` (`"UTC"` or a transition array), `timeScale.sessionStart`, and `timezone`. V2
-persistence round-trips them: the schedule always, and the `timezone` name while a named zone is
-installed (an explicit schedule clears it). When one patch carries both a schedule and a name, the
-schedule drives grouping and labels and the name the general axes and the clock. Importing a document
-that predates these keys keeps the chart's installed zone and session start.
+**交易所时区**。`chart.time_scale().apply_options({ time_zone, session_start })`，或声明式图表选项 `timeScale: { timeZone, sessionStart }`（worker 图表同样接受），用于设定时刻如何分组和标注。`time_zone` 可以是 `"UTC"`（默认值）、IANA 名称（如 `"Asia/Shanghai"` 或 `"America/New_York"`），或由 `{ from_utc_seconds, offset_seconds }` 转换点构成的显式时间表（严格升序，至多 1024 个，偏移量在 ±18 h 以内；第一个偏移量也适用于其条目之前的时间）。该包对每个时区仅用 `Intl.DateTimeFormat` 在 1970–2100 年间解析一次 IANA 名称（至多约 262 次 DST 转换），并至多保留 32 个已解析的时区；超出该区间时采用最近的偏移量。引擎本身绝不读取浏览器的时区：`timeScale.timeZone` 只接受 `"UTC"` 或显式时间表。TradingView 对标列表中的时区（`TRADINGVIEW_TIME_ZONES`；WASM 的 `supported_time_zones_json()`）则可以通过 `ChartEngine::set_time_zone(&str)`（发生变化时返回 `Ok(true)`；WASM 的 `set_time_zone`）或顶层引擎选项 `timezone` 以名称传给引擎；它会被一次性解析为同一种时间表（1970–2100 年，原生约 4 ms），因此分组和标签与显式时间表一致，并且该名称还会本地化通用（非金融）时间坐标轴以及 `ChartEngine::time_zone_clock_text(utc_seconds, show_seconds)`。`ChartEngine::time_zone_id()`（WASM 的 `time_zone()`）返回已命名的时区，默认为 `Etc/UTC`，在安装了显式时间表期间返回 `custom`。未知时区、格式错误的时间表、超出范围的交易时段起点，或与已安装收盘时间标签（[收盘时间标签](#收盘时间标签)）的窗口不适配的交易时段起点，会在同一次调用中应用任何其他键之前抛出 `invalid_options`；不受支持或非字符串的 `timezone` 以同样方式拒绝该补丁。`time_scale().options()` 报告 IANA 名称（或时间表）和 `session_start`。Rust 宿主通过 `ChartEngine::set_exchange_offsets(UtcOffsetSchedule)` 设置显式时间表，通过 `set_session_start_seconds(i32)` 设置交易时段起点；引擎 JSON 选项接受 `timeScale.timeZone`（`"UTC"` 或转换数组）、`timeScale.sessionStart` 和 `timezone`。V2 持久化会往返保存它们：时间表始终保存，而 `timezone` 名称仅在已安装命名时区期间保存（显式时间表会将其清除）。当同一个补丁同时带有时间表和名称时，时间表决定分组和标签，名称决定通用坐标轴和时钟。导入早于这些键的文档时，会保留图表已安装的时区和交易时段起点。
 
-Display-only time projection: `ChartEngine::set_future_time_projection(cadence_seconds, points)` and
-`set_past_time_projection(cadence_seconds, points)` (each bounded at 4,096 points; `None` or zero points
-clears it; `has_future_time_projection` / `has_past_time_projection` read it back) label the whitespace
-after the last and before the first bar of a time axis. Projected points are labels only (no data rows,
-base index or point count) and are not persisted.
+仅显示的时间投影：`ChartEngine::set_future_time_projection(cadence_seconds, points)` 和 `set_past_time_projection(cadence_seconds, points)`（各自上限为 4,096 个点；传入 `None` 或 0 个点会将其清除；`has_future_time_projection` / `has_past_time_projection` 可读回）为时间轴上最后一根柱之后和第一根柱之前的空白区域标注标签。投影点仅是标签（没有数据行、基础索引或点数），且不会被持久化。
 
-**Trading day.** `session_start` is the offset in seconds from exchange-local midnight at which a
-trading day begins (default `0`, range ±86 399). A negative value assigns an evening session to the
-next trading day, e.g. `-3 * 3600` makes a 21:00 China futures night session start the next day;
-with a negative start a day that would fall on Saturday or Sunday rolls forward to Monday, so a
-Friday-night session belongs to Monday. Day/Month/Year tick marks, VWAP `session`/`weekly`/`monthly`
-resets, and pivot sessions use trading days. Weekly periods start on Monday.
+**交易日**。`session_start` 是交易日开始时刻相对交易所本地午夜的偏移秒数（默认 `0`，范围 ±86 399）。负值会把夜盘时段归入下一个交易日，例如 `-3 * 3600` 使 21:00 的中国期货夜盘从次日开始；起点为负时，本应落在周六或周日的交易日会顺延到周一，因此周五夜盘属于周一。Day/Month/Year 刻度标记、VWAP 的 `session`/`weekly`/`monthly` 重置以及枢轴点交易时段均使用交易日。每周周期从周一开始。
 
-A market whose week opens on Sunday evening (CME Globex, 17:00 Central) sets `session_start:
--25200`: Sunday 17:00 belongs to Monday's trading day and Monday 17:00 to Tuesday's, so Day marks,
-session and weekly VWAP resets, and pivots align with the session. With `0` the Sunday evening is its
-own trading day: a Day mark and a session VWAP reset appear at midnight in the middle of the
-session, and the weekly VWAP keeps the Sunday evening bars in the previous week and resets at that
-midnight. With a negative start every Saturday or Sunday instant belongs to Monday, and window
-placement (`session_slot_times`, `resample_boundaries`, `set_trade_stream_sessions`)
-assumes the week opens on Friday evening: right for China futures, but a Sunday-open market places
-its evening windows with a per-call `session_start` of `0` (see *Intraday (分时) charts* and *Ticks
-to candles and resampling*).
+周日晚间开盘的市场（CME Globex，美国中部时间 17:00）将 `session_start: -25200`：周日 17:00 属于周一的交易日，周一 17:00 属于周二的交易日，因此 Day 标记、交易时段 VWAP 与每周 VWAP 重置以及枢轴点都与交易时段对齐。取 `0` 时，周日晚间自成一个交易日：在交易时段中间的午夜会出现 Day 标记和交易时段 VWAP 重置，而每周 VWAP 把周日晚间的柱留在上一周，并在该午夜重置。起点为负时，每个周六或周日的时刻都属于周一，而窗口放置（`session_slot_times`、`resample_boundaries`、`set_trade_stream_sessions`）假定一周在周五晚间开盘：这对中国期货是正确的，但周日开盘的市场应在每次调用中以 `session_start` 为 `0` 来放置其晚间窗口（参见 *“分时图”* 和 *“Tick 转 K 线与重采样”*）。
 
-**What follows exchange time.** Tick boundaries (Day/Month/Year from trading days; hour and minute
-marks on exchange wall-clock time, so they stay on exchange hours across DST and non-hour offsets),
-built-in labels on every surface (axis ticks, crosshair, rectangle drawing axis tags, the delta
-tooltip, `create_tooltip`, and accessibility text), VWAP and pivot resets, the session-highlighting
-hour gate and weekend test, and the countdown window. Day-mark tick labels name the trading date;
-crosshair and tooltip text show the instant's exchange wall-clock date and time.
+**遵循交易所时间的内容**。刻度边界（Day/Month/Year 来自交易日；小时和分钟标记基于交易所墙上时钟时间，因此在 DST 和非整点偏移下仍保持在交易所交易时间内）、每个界面上的内置标签（坐标轴刻度、十字光标、矩形绘图的坐标轴标签、delta 提示框、`create_tooltip` 以及无障碍文本）、VWAP 和枢轴点重置、交易时段高亮的小时门限与周末判断，以及倒计时窗口。Day 标记刻度标签标注交易日期；十字光标和提示框文本显示该时刻的交易所墙上时钟日期和时间。
 
-**Calendar-date data.** When every financial series with data was given `business_day` or
-`"YYYY-MM-DD"` times, the chart treats its time points as calendar dates: they keep their own date
-in every zone and are never shifted by the time zone or `session_start`. One numeric time on any
-financial series makes the time points instants again. Send daily and longer bars as calendar dates;
-numeric UTC-midnight daily bars are instants and show the previous evening in zones west of UTC.
-Typed column input is always numeric instants. Rust hosts declare the same state with
-`ChartEngine::set_calendar_date_axis(bool)`.
+**日历日期数据**。当每个有数据的金融系列都以 `business_day` 或 `"YYYY-MM-DD"` 时间给出时，图表将其时间点视为日历日期：它们在每个时区中保持自己的日期，绝不会被时区或 `session_start` 移位。任一金融系列中只要有一个数值时间，时间点就重新成为时刻。日线及更长周期的柱应以日历日期发送；以 UTC 午夜为时间的数值日线柱是时刻，在 UTC 以西的时区会显示为前一天晚上。类型化列输入始终是数值时刻。Rust 宿主通过 `ChartEngine::set_calendar_date_axis(bool)` 声明相同状态。
 
-**Formatter hooks.** `time_scale_options.tick_mark_formatter(time, tick_mark_type, locale, context)`
-and `localization.time_formatter(time, context)` receive UTC seconds plus a `time_label_context`
-whose `business_day` is the calendar date for calendar-date rows and `null` for instants. The host
-`time_formatter` overrides every surface that prints a point in time: crosshair label, rectangle
-axis tags, delta tooltip, `create_tooltip`, and accessibility (unless the accessibility options set
-their own `time_formatter`). Without it, `create_tooltip` and accessibility print the crosshair label
-(`chart.format_time_label()`): `localization.date_format` and `localization.locale` in the chart time
-zone, adding the time of day for intraday rows and none for calendar-date rows. Rust `TickMarkFormatterFn`
-and `TimeFormatterFn` signatures are unchanged. With a close-time label configured
-([Close-time labels](#close-time-labels)) both callbacks receive the LABEL instant (the bar's
-close), not the bar's open time; a host that adds one interval inside its formatter must drop that
-addition when it adopts the option.
+**格式化钩子**。`time_scale_options.tick_mark_formatter(time, tick_mark_type, locale, context)` 和 `localization.time_formatter(time, context)` 接收 UTC 秒数以及一个 `time_label_context`，其 `business_day` 对日历日期行为该日历日期，对时刻则为 `null`。宿主的 `time_formatter` 会覆盖所有输出时间点的界面：十字光标标签、矩形坐标轴标签、delta 提示框、`create_tooltip` 以及无障碍（除非无障碍选项设置了自己的 `time_formatter`）。没有它时，`create_tooltip` 和无障碍会输出十字光标标签（`chart.format_time_label()`）：按图表时区使用 `localization.date_format` 和 `localization.locale`，日内行附加当日时间，日历日期行则不附加。Rust 的 `TickMarkFormatterFn` 和 `TimeFormatterFn` 签名保持不变。配置了收盘时间标签（[收盘时间标签](#收盘时间标签)）时，两个回调收到的都是标签时刻（柱的收盘时间），而不是柱的开盘时间；在自己的格式化函数中加上一个周期的宿主，在采用该选项时必须去掉这一加法。
 
-**Countdown clock.** The candle-close countdown shows only while the clock is inside the forming
-bar's interval `[last_bar_time, last_bar_time + bar_interval)`; outside it — lunch breaks,
-overnight, weekends, after an early close — it hides instead of cycling. Calendar-date bars form
-during the exchange trading day(s) of their date (with a negative `session_start`, Monday's bar
-starts on Friday evening at the session-start time of day: Friday's night session for China
-futures, Friday 17:00 Central for a Sunday-open market such as CME Globex), and bars 28 or more
-days apart run to the end of their calendar month(s). `chart.set_clock(() => utc_seconds)` and
-`offscreen_chart.set_clock(...)`
-replace `Date.now()` for countdown ticks; `null` (or a clock that throws or returns a non-finite
-value) falls back to the system clock.
+**倒计时时钟**。K 线收盘倒计时仅在时钟处于正在形成的柱的区间 `[last_bar_time, last_bar_time + bar_interval)` 内时显示；在区间之外——午休、隔夜、周末、提前收盘之后——它会隐藏而不是循环。日历日期柱在其日期对应的交易所交易日内形成（`session_start` 为负时，周一的柱从周五晚间的交易时段起始时刻开始：中国期货为周五的夜盘，CME Globex 这类周日开盘的市场为美国中部时间周五 17:00），而相隔 28 天或更多天的柱持续到各自所在日历月的月末。`chart.set_clock(() => utc_seconds)` 和 `offscreen_chart.set_clock(...)` 替换 `Date.now()` 用于倒计时跳动；`null`（或抛出异常或返回非有限值的时钟）回退到系统时钟。
 
-**Session highlighting.** `create_session_highlighting(series, { start_hour, end_hour })` accepts
-fractional exchange-local hours (`9.5` is 09:30; `start_hour > end_hour` wraps midnight); both or
-neither must be set. `start_hour_utc`/`end_hour_utc` remain deprecated aliases (identical on the
-default UTC chart). The callback overload evaluates only rows appended by a live `update` (also
-when `max_points` retention evicts the oldest rows) and re-evaluates the whole series only on full
-replacement or when history changed underneath. The Rust `SessionHighlightingOptions` fields are
-`start_hour`/`end_hour: Option<f64>`.
+**交易时段高亮**。`create_session_highlighting(series, { start_hour, end_hour })` 接受交易所本地时间的小数小时（`9.5` 即 09:30；`start_hour > end_hour` 时跨越午夜）；两者必须同时设置或同时不设置。`start_hour_utc`/`end_hour_utc` 仍是已弃用的别名（在默认 UTC 图表上结果相同）。回调重载仅对由实时 `update` 追加的行求值（`max_points` 保留策略淘汰最旧行时同样如此），并且仅在整体替换或历史在底层发生变化时才对整个系列重新求值。Rust 的 `SessionHighlightingOptions` 字段为 `start_hour`/`end_hour: Option<f64>`。
 
-## Intraday (分时) charts
+## 分时图
 
-A time-sharing chart shows one trading session (or several) at fixed width from the open: every
-minute of the session has a slot before it trades, the price is drawn against the previous close,
-the average price is turnover over volume, and the view never scrolls. It is composed from ordinary
-series and options; `examples/web_demo/intraday.html` is the complete reference host (one A-share
-day in Asia/Shanghai, and a five-day variant with `?days=5`).
+分时图在从开盘起的固定宽度内显示一个（或多个）交易时段：交易时段内的每一分钟在成交之前就有一个槽位，价格相对前收盘价绘制，均价为成交额除以成交量，并且视图从不滚动。它由普通系列和选项组合而成；`examples/web_demo/intraday.html` 是完整的参考宿主（一个 Asia/Shanghai 的 A 股交易日，以及通过 `?days=5` 得到的五日变体）。
 
-**1. Session slots.** `session_slot_times({ date, windows, interval_seconds, time_zone,
-session_start?, convention? })` returns the UTC seconds of every bar of one trading date. `windows`
-are exchange-local `["HH:MM", "HH:MM"]` pairs in chronological order (at most 32; an end at or before
-its start crosses midnight, `"24:00"` ends at midnight), `time_zone` is an IANA name or an explicit
-schedule, and the result is bounded to 100 000 slots and validated (`invalid_options`). Each window
-converts with the offset in force on that date, so the same windows stay on exchange hours across
-DST. `session_start` is this call's own and defaults to `0`; it is not read from the chart, so a
-China futures host must pass `session_start: -10800` explicitly (omitted, a 21:00 night window is
-placed on the calendar date, Monday 21:00, instead of Friday 21:00, and nothing reports it). With a
-negative `session_start`, windows starting at or after the session-start time of day belong to the
-evening before (Friday evening for Monday), matching the chart's trading days and the night
-sessions of Chinese futures. That placement assumes the week opens on Friday evening.
+**1. 交易时段槽位**。`session_slot_times({ date, windows, interval_seconds, time_zone, session_start?, convention? })` 返回某一个交易日期每根柱的 UTC 秒数。`windows` 是交易所本地的 `["HH:MM", "HH:MM"]` 数对，按时间顺序排列（至多 32 个；结束时间等于或早于开始时间表示跨越午夜，`"24:00"` 表示结束于午夜），`time_zone` 是 IANA 名称或显式时间表，结果上限为 100 000 个槽位并经过校验（`invalid_options`）。每个窗口使用该日期当日生效的偏移量进行转换，因此同一组窗口在跨越 DST 后仍保持在交易所交易时间内。`session_start` 是本次调用自带的，默认为 `0`；它不会从图表读取，因此中国期货宿主必须显式传入 `session_start: -10800`（若省略，21:00 的夜盘窗口会被放在日历日期（周一 21:00）而不是周五 21:00，且没有任何提示）。`session_start` 为负时，开始于交易时段起始时刻或其之后的窗口属于前一晚（周一对应周五晚间），与图表的交易日和中国期货夜盘一致。该放置方式假定一周在周五晚间开盘。
 
-A market whose week reopens on Sunday evening (CME Globex) passes `session_start: 0` and makes one
-call per evening date with `windows: [["17:00", "16:00"]]`. The date is the evening the session
-opens: the Sunday date places Monday's trading day (1380 one-minute slots, Sunday 17:00 to Monday
-16:00), the Monday date places Tuesday's, and so on, so with `0` every call is keyed by the
-evening's calendar date rather than by trading date. Two calls give the same slots: the Sunday date
-with `[["17:00", "24:00"]]` and `session_start: 0`, then the Monday date with `[["00:00", "16:00"]]`.
-Do not give the Monday date a window that starts at or after 17:00 under a negative `session_start`:
-that places Friday 17:00 to Saturday 16:00. Which dates trade, holidays, and early closes are host
-calendar data; pass the windows that apply to each date (a date without a night session is a
-window list without it). It needs the engine module: call it after `init_wasm()` or
-`create_chart()`. Rust hosts call
-`aeris_charts_engine::session_slot_times(day, &windows, interval, chart.exchange_time(), convention)`.
+周日晚间重新开盘的市场（CME Globex）传入 `session_start: 0`，并对每个晚间日期各调用一次，使用 `windows: [["17:00", "16:00"]]`。该日期是时段开盘的那个晚上：周日日期放置周一的交易日（1380 个一分钟槽位，周日 17:00 至周一 16:00），周一日期放置周二的交易日，依此类推，因此在 `0` 下每次调用都以晚间的日历日期而不是交易日期为键。两次调用可得到相同的槽位：周日日期搭配 `[["17:00", "24:00"]]` 与 `session_start: 0`，然后周一日期搭配 `[["00:00", "16:00"]]`。在负的 `session_start` 下，不要给周一日期一个开始于 17:00 或之后的窗口：那会放置周五 17:00 至周六 16:00。哪些日期交易、节假日和提前收盘都是宿主的日历数据；为每个日期传入适用的窗口（没有夜盘的日期，其窗口列表中不含夜盘窗口）。它需要引擎模块：在 `init_wasm()` 或 `create_chart()` 之后调用。Rust 宿主调用 `aeris_charts_engine::session_slot_times(day, &windows, interval, chart.exchange_time(), convention)`。
 
-`convention` decides which instant names a slot. Aeris bars are stamped with their open time, so
-the default `"bar_open"` gives 240 one-minute slots for an A-share day (09:30..11:29, 13:00..14:59).
-同花顺 and 富途 instead label a minute by its close and show the opening-auction print as its own
-first point: `"bar_close_with_open"` reproduces their 241 points (09:30, 09:31..11:30, 13:01..15:00);
-`"bar_close"` is the close-labelled form without the opening point. Use the convention your data
-provider stamps its minutes with. The lunch break takes no width either way: the last morning slot
-and the first afternoon slot are neighbours.
+`convention` 决定由哪个时刻来命名一个槽位。Aeris 的柱以开盘时间作为时间戳，因此默认的 `"bar_open"` 为 A 股交易日给出 240 个一分钟槽位（09:30..11:29、13:00..14:59）。同花顺和富途则以收盘时间标注一分钟，并把开盘集合竞价成交显示为其自己的第一个点：`"bar_close_with_open"` 复现它们的 241 个点（09:30、09:31..11:30、13:01..15:00）；`"bar_close"` 是不含开盘点的收盘标注形式。请使用数据提供方给分钟打时间戳所采用的约定。无论哪种方式，午休都不占宽度：上午最后一个槽位与下午第一个槽位相邻。
 
-The two families of chart use the conventions differently. An instant-sampled line (the classic
-time-sharing price line, one price per minute end) uses close-stamped slots: its points ARE those
-instants, and 241 points are a property of the line. Interval bars (candles built from ticks or
-resampled minutes) use `"bar_open"` slots and open-stamped rows, and print their close time through
-the `bar_time_label` option ([Close-time labels](#close-time-labels)); they do not grow a separate
-241st auction bar, because the 09:25 auction print folds into the first bar.
+两类图表对这些约定的用法不同。按时刻采样的折线（经典分时价格线，每分钟末一个价格）使用以收盘为时间戳的槽位：其点就是那些时刻，241 个点是该折线自身的属性。区间柱（由 Tick 构建的 K 线或重采样的分钟）使用 `"bar_open"` 槽位和以开盘为时间戳的行，并通过 `bar_time_label` 选项（[收盘时间标签](#收盘时间标签)）输出其收盘时间；它们不会多出单独的第 241 根集合竞价柱，因为 09:25 的集合竞价成交并入第一根柱。
 
-**2. Reserve the session.** Install every slot, traded or not; untraded minutes are whitespace rows
-(`{ time }`). Lock the whole session in view and disable gestures (keyboard motion follows the same
-switches). Hold the range half a bar beyond the first and last slots: slot centres then sit half a
-bar in from the pane edges, so the opening and closing columns stay inside the pane on narrow
-screens instead of straddling its left edge, where the reference coordinate mapping puts an
-unpadded first slot:
+**2. 预留交易时段**。安装每一个槽位，无论是否有成交；未成交的分钟是空白数据行（`{ time }`）。将整个交易时段锁定在视图内并禁用手势（键盘移动遵循同样的开关）。将范围在第一个和最后一个槽位之外各保留半根柱：这样槽位中心距窗格边缘半根柱，使开盘和收盘的列在窄屏幕上仍位于窗格内，而不是跨在窗格左边缘上——参考实现的坐标映射会把未加内边距的第一个槽位放在那里：
 
 ```ts
 const chart = await create_chart(container, {
@@ -751,10 +278,7 @@ chart.time_scale().apply_options({
 chart.time_scale().set_visible_logical_range({ from: -0.5, to: slots.length - 0.5 });
 ```
 
-**3. Price against the previous close.** A baseline series with `baseline_value: prev_close` is red
-above and green below (set `top_*`/`bottom_*` colors); with only the first minute traded it draws a
-bar-wide segment. Center its scale on the previous close, and put the same prices on a second scale
-in percentage mode based on the previous close:
+**3. 价格相对前收盘价**。`baseline_value: prev_close` 的基线系列在其上方为红色、下方为绿色（设置 `top_*`/`bottom_*` 颜色）；仅第一分钟有成交时，它绘制一段与柱同宽的线段。让其比例尺以前收盘价为中心，并把同样的价格放到第二个比例尺上，该比例尺为以前收盘价为基准的百分比模式：
 
 ```ts
 const price = chart.add_series("baseline", {
@@ -771,10 +295,9 @@ percent.set_data(slots.map((time, i) => row(time, closes[i])));
 price.create_price_line({ price: prev_close, line_style: "dashed" });
 ```
 
-Equal top and bottom margins put the previous close in the middle of the pane on both axes.
+上下边距相等时，前收盘价在两个坐标轴上都位于窗格正中。
 
-**4. Average price (均价).** Volume and turnover are separate series aligned by time; the average is
-VWAP with a turnover source, reset each trading session (`session_start` defines the session):
+**4. 均价**。成交量和成交额是按时间对齐的独立系列；均价是以成交额为来源的 VWAP，在每个交易时段重置（`session_start` 定义交易时段）：
 
 ```ts
 const volume = chart.add_series("histogram", {
@@ -788,22 +311,11 @@ amount.set_data(slots.map((time, i) => row(time, turnover[i])));  // currency
 const average = chart.add_vwap(price, volume, { price_scale_id: "left", color: "#f59e0a" }, { amount_source: amount });
 ```
 
-Keep units consistent: with turnover in yuan, volume must be in shares (multiply lots by 100).
-The average line restarts at every session reset, so on a multi-day chart no segment joins one
-day's last average to the next day's first. To separate the days' price lines the same way, give
-the price series (and a percentage mirror) `break_on_trading_day: true`; the five-day demo does.
+保持单位一致：成交额以元计时，成交量必须以股计（将手数乘以 100）。均价线在每次交易时段重置时重新开始，因此在多日图表上，没有线段把某一天的最后一个均价连到下一天的第一个均价。若要以同样方式分隔各天的价格线，请给价格系列（及其百分比镜像）设置 `break_on_trading_day: true`；五日演示就是这样做的。
 
-**5. Volume colors.** `histogram_updown_rule: "previous_close"` colors each column by the primary
-price series' close against the previous traded close (an unchanged close counts as up); the first
-traded minute compares with the previous close given as the primary's `baseline_value` (or its
-scale's `base_value`). The primary is the first series added to the chart. `up_color`/`down_color`
-replace the translucent market palette; the default `"open_close"` rule keeps the reference
-behavior. As in the reference, a histogram's autoscale range always includes its `base` (0), so
-column heights stay proportional to volume, the opening minute included.
+**5. 成交量颜色**。`histogram_updown_rule: "previous_close"` 按主价格系列的收盘价相对前一个有成交的收盘价为每根柱状列着色（收盘价不变算作上涨）；第一个有成交的分钟与作为主系列 `baseline_value`（或其比例尺的 `base_value`）给出的前收盘价比较。主系列是添加到图表的第一个系列。`up_color`/`down_color` 取代半透明的市场调色板；默认的 `"open_close"` 规则保持参考实现的行为。与参考实现一致，直方图的自动缩放范围始终包含其 `base`（0），因此柱状列的高度与成交量成比例，开盘分钟也不例外。
 
-**6. Session anchors on the time axis.** `tick_marks` replaces the automatic tick selection for the
-axis labels and the vertical grid; marks on future whitespace slots work, `null` restores automatic
-ticks, and labels default to the exchange-time label of their slot:
+**6. 时间轴上的交易时段锚点**。`tick_marks` 取代坐标轴标签和垂直网格的自动刻度选择；位于未来空白槽位上的标记同样有效，`null` 恢复自动刻度，标签默认为其槽位的交易所时间标签：
 
 ```ts
 // slot("10:30"): the slot whose exchange wall-clock time is 10:30.
@@ -814,18 +326,9 @@ chart.time_scale().apply_options({ tick_marks: [
 ] });
 ```
 
-A mark whose time is not a slot (13:00 under the 241-point convention) draws nothing, so label the
-junction explicitly. For several days, mark each day's first slot with a date label and install the
-days' slots back to back; the marks' grid lines separate the days. Without labels, day-open marks
-show the trading date in bold, the chart's first slot included once the chart spans several
-trading days (a single-day chart's first mark shows its time). Explicit marks are at most 512,
-strictly ascending, with labels of at most 64 bytes; labels stay inside the axis and a label that
-would overlap its left neighbour is skipped (its grid line stays). Worker charts accept the same
-list as `timeScale.tickMarks`, and V2 persistence carries it.
+时间不是槽位的标记（241 点约定下的 13:00）不绘制任何内容，因此应显式标注衔接点。对于多日图表，用日期标签标记每一天的第一个槽位，并将各天的槽位首尾相接地安装；标记的网格线将各天分隔开。没有标签时，每日开盘标记以粗体显示交易日期，一旦图表跨越多个交易日，图表的第一个槽位也包括在内（单日图表的第一个标记显示其时间）。显式标记至多 512 个，严格升序，标签至多 64 字节；标签保持在坐标轴内，会与其左侧相邻标签重叠的标签将被跳过（其网格线保留）。worker 图表以 `timeScale.tickMarks` 接受同样的列表，V2 持久化也会携带它。
 
-**7. Live minutes.** Fill the next slot with `update()` and refine the forming minute with `merge()`;
-a `{ sequence }` makes each delivery idempotent (a stale or replayed one is rejected with
-`stale_sequence`). Filling a whitespace slot never moves the locked view:
+**7. 实时分钟**。用 `update()` 填充下一个槽位，用 `merge()` 细化正在形成的分钟；`{ sequence }` 使每次投递幂等（过期或重放的投递会被以 `stale_sequence` 拒绝）。填充空白槽位绝不会移动已锁定的视图：
 
 ```ts
 // The minute's first trade fills its whitespace slot (each series keeps its own sequence guard).
@@ -840,23 +343,15 @@ volume.merge({ time, value: minute_shares }, { sequence });
 amount.merge({ time, value: minute_turnover }, { sequence });
 ```
 
-Before the first trade the time axis, its anchors, and the vertical grid already show the session,
-while the price axes stay empty: as in the reference, a series without data does not autoscale.
-The opening trade then draws at once (a baseline series with one traded row paints a bar-wide
-segment). Open `intraday.html?traded=0` to see that state.
+在第一笔成交之前，时间轴、其锚点和垂直网格已经显示整个交易时段，而价格坐标轴保持为空：与参考实现一致，没有数据的系列不会自动缩放。开盘成交随即立刻绘出（只有一个成交行的基线系列会画出一段与柱同宽的线段）。打开 `intraday.html?traded=0` 即可查看该状态。
 
-## Ticks to candles and resampling
+## Tick 转 K 线与重采样
 
-Both recipes build ordinary candles on the time axis in the chart's exchange time, so set the
-exchange time zone (and `session_start` for night sessions) first. Candles are stamped with their
-open time, the canonical Aeris bar time. To print each candle's close time (09:31 … 15:00 for A-share
-minutes) instead, set `bar_time_label` ([Close-time labels](#close-time-labels)): the candles, their
-volume, replay, countdown, and every time your host passes in or reads back stay open-stamped.
+两种做法都在图表的交易所时间中构建普通 K 线，因此应先设置交易所时区（夜盘还需设置 `session_start`）。K 线以其开盘时间作为时间戳，即 Aeris 的规范柱时间。若要改为输出每根 K 线的收盘时间（A 股分钟线的 09:31 … 15:00），请设置 `bar_time_label`（[收盘时间标签](#收盘时间标签)）：K 线、其成交量、回放、倒计时以及宿主传入或读回的所有时间仍保持以开盘时间为时间戳。
 
-### Ticks to candles
+### Tick 转 K 线
 
-A chart-level trade stream owns the tick tape; an ordinary candlestick (or bar) series bound to it
-presents the stream's time bars, and a volume histogram is derived from the same bars:
+图表级成交流拥有 Tick 成交带；绑定到它的普通 K 线（或柱状）系列呈现该流的时间柱，成交量直方图由同一批柱派生：
 
 ```ts
 chart.time_scale().apply_options({ time_zone: "Asia/Shanghai" });
@@ -872,74 +367,23 @@ chart.set_trade_stream_trades(stream, history);           // footprint_trade[]; 
 chart.update_trade_stream_trades_typed(stream, live_columns); // "tip" for in-order prints
 ```
 
-**Session anchoring.** Without sessions, time bars align to the `anchor_seconds` grid (default 0,
-the UTC grid), which suits 24-hour markets. `set_trade_stream_sessions()` places the exchange-local
-windows on every trading day in the chart's `time_zone` and `session_start` (the offset in force on
-that date, so DST is respected), and each window restarts the bar grid at its open: A-share
-60-minute bars open at 09:30, 10:30, 13:00 and 14:00, US 60-minute bars at 09:30 … 15:30 Eastern on
-both sides of a DST change, and the lunch break takes no width. An `interval_seconds` of 86 400 gives
-one bar per trading day, opening at its first window. Changing the chart's time zone or session start
-re-places the windows; `null` restores the plain grid. Only whole-second time bars accept sessions;
-invalid windows or other bar types throw `invalid_options` and change nothing.
+**交易时段锚定**。没有交易时段时，时间柱对齐到 `anchor_seconds` 网格（默认 0，即 UTC 网格），适用于 24 小时市场。`set_trade_stream_sessions()` 按图表的 `time_zone` 和 `session_start` 把交易所本地窗口放置到每个交易日上（采用该日期当日生效的偏移量，因此遵循 DST），并且每个窗口在其开盘处重启柱网格：A 股 60 分钟柱在 09:30、10:30、13:00 和 14:00 开盘，US 60 分钟柱在 DST 变更前后均于美东时间 09:30 … 15:30 开盘，并且午休不占宽度。`interval_seconds` 为 86 400 时每个交易日一根柱，在其第一个窗口开盘。更改图表的时区或交易时段起点会重新放置窗口；`null` 恢复普通网格。只有整秒时间柱接受交易时段；无效窗口或其他柱类型会抛出 `invalid_options` 且不做任何更改。
 
-`set_trade_stream_sessions()` always uses the chart's own `session_start` (there is no per-call
-override) and takes one window list for all dates, so a date after a break cannot drop its night
-window. For a Sunday-open market (CME Globex) keep the chart's `session_start` at `0` and pass one
-crossing window, `[["17:00", "16:00"]]`: the previous-day lookup places the Sunday evening, at the
-cost of midnight trading-day semantics for Day marks and VWAP resets. A chart at `-25200` places
-Monday's window on Friday evening, so Sunday and Monday prints fall after it: `fold` sends them to
-that window's last bar (Saturday 15:xx) and `exclude` drops them.
+`set_trade_stream_sessions()` 始终使用图表自身的 `session_start`（没有逐次调用的覆盖项），并且对所有日期使用同一个窗口列表，因此休市之后的日期无法去掉其夜盘窗口。对于周日开盘的市场（CME Globex），请将图表的 `session_start` 保持为 `0`，并传入一个跨越午夜的窗口 `[["17:00", "16:00"]]`：前一日查找会放置周日晚间，代价是 Day 标记和 VWAP 重置采用午夜交易日语义。`-25200` 的图表会把周一的窗口放在周五晚间，因此周日和周一的成交落在其后：`fold` 会把它们送入该窗口的最后一根柱（周六 15:xx），而 `exclude` 会丢弃它们。
 
-**Prints outside the windows.** `outside: "fold"` (the default) keeps every print: the 09:25
-opening auction opens the 09:30 bar, and the 11:30:00 and 15:00:00 closing prints close the last bar
-of their window, as Chinese platforms show them. `outside: "exclude"` leaves pre-market and
-after-hours prints out of every bar (a US regular-hours chart) but keeps prints stamped in a window's
-closing second, such as the 16:00:00 closing cross. A print that is folded or excluded still takes
-part in aggressor classification. A trade `session_id` change always starts a new bar and resets
-session delta; the windows already split the morning and afternoon, so a per-date id is enough.
+**窗口外的成交。** `outside: "fold"`（默认值）保留每一笔成交：09:25 的开盘集合竞价成交开启 09:30 这根柱，11:30:00 与 15:00:00 的收盘成交则关闭其所在窗口的最后一根柱，与中国平台的显示方式一致。`outside: "exclude"` 则将盘前和盘后成交排除在所有柱之外（US 常规交易时段图表），但保留时间戳落在窗口收盘那一秒的成交，例如 16:00:00 的收盘撮合（closing cross）。被并入或被排除的成交仍然参与主动方分类。成交的 `session_id` 变化总是开启新的一根柱并重置交易时段 delta；窗口已经将上午和下午分开，因此每个日期一个 id 就足够了。
 
-**Engine-owned series.** A bound candle or bar and the volume, CVD, and delta studies are written
-only by their trade stream, and one series has one engine writer: `bind_trade_bar_series_to_stream`
-throws `invalid_options` for a series that is not a candlestick or bar, carries a `max_points`
-cap, or is already a footprint, a study, a resampled target, or a synthetic-bar series (rebinding a
-bound candle to another stream stays allowed), and a footprint, resampled target, or synthetic
-series cannot be created from a series that a stream writes. Their `set_data`, `set_data_typed`,
-`update`, `update_typed`, `merge`, `merge_typed` (with or without `{ sequence }`), `pop`, and
-`set_ring_source` are rejected: the data calls record `last_ingestion_diagnostics()` as
-`{ status: "rejected", code: "derived_series" }`, warn, and change nothing, `pop` records the same
-rejection without repainting or firing `data_changed`, and `set_ring_source` throws
-`unsupported_operation` (unbinding with `null` still works, and a ring bound before the series
-became derived keeps draining into `frame_stats().ring_dropped_rows` until unbound). Styling, pane
-moves, visibility, `histogram_updown_rule`, and a study's own `max_points` still apply; a bound
-candle refuses `max_points` because it follows the stream's retention. Feed the stream instead.
+**引擎持有的系列。** 已绑定的 K 线或柱，以及成交量、CVD 和 delta 研究，仅由其成交流写入，且一个系列只有一个引擎写入方：对于不是 K 线或柱系列、带有 `max_points` 上限、或已经是足迹图、研究、重采样目标或合成柱系列的系列，`bind_trade_bar_series_to_stream` 会抛出 `invalid_options`（将已绑定的 K 线重新绑定到另一个成交流仍然允许）；并且不能基于由成交流写入的系列创建足迹图、重采样目标或合成系列。它们的 `set_data`、`set_data_typed`、`update`、`update_typed`、`merge`、`merge_typed`（无论是否带 `{ sequence }`）、`pop` 和 `set_ring_source` 均被拒绝：数据调用会将 `last_ingestion_diagnostics()` 记录为 `{ status: "rejected", code: "derived_series" }`，发出警告，且不做任何更改；`pop` 记录同样的拒绝，但不重绘也不触发 `data_changed`；`set_ring_source` 会抛出 `unsupported_operation`（使用 `null` 解除绑定仍然有效；在系列变为派生系列之前已绑定的环形缓冲区，会一直向 `frame_stats().ring_dropped_rows` 排空，直到解除绑定）。样式、窗格移动、可见性、`histogram_updown_rule` 以及研究自身的 `max_points` 仍然适用；已绑定的 K 线拒绝 `max_points`，因为它遵循成交流的保留策略。应改为向成交流写入数据。
 
-Rust hosts get the same refusals from the ordinary write entries (`false`, `0`, `None`,
-`Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`), which also mean an unknown id or
-invalid data, so `ChartEngine::series_is_source_owned(id)` tells an engine-owned series apart, and
-`ChartEngine::apply_momentum_histogram_colors` returns `false` for the delta and volume studies.
-`FootprintError::SeriesOwned` is what `bind_trade_bar_series_to_stream` returns for a candlestick
-or bar that a resampler, synthetic bars, or a study (converted to a candle) already writes, and what
-`configure_footprint_series` returns for any series a stream, study, resampler, or synthetic bars
-write. `bind_trade_bar_series_to_stream` checks the series kind and `max_points` first, so a
-footprint or a scalar study gets `UnsupportedTradeBarSeries` or `InvalidAggregation` instead.
+Rust 宿主通过常规写入入口得到相同的拒绝（`false`、`0`、`None`、`Err(UnsupportedSeriesData)` 或 `Rejected(UnsupportedSeries)`），这些结果同样可能表示未知 id 或无效数据，因此可用 `ChartEngine::series_is_source_owned(id)` 区分引擎持有的系列，而 `ChartEngine::apply_momentum_histogram_colors` 对 delta 与成交量研究返回 `false`。`FootprintError::SeriesOwned` 是 `bind_trade_bar_series_to_stream` 在 K 线或柱已被重采样器、合成柱或研究（已转换为 K 线）写入时返回的错误，也是 `configure_footprint_series` 在任何系列由成交流、研究、重采样器或合成柱写入时返回的错误。`bind_trade_bar_series_to_stream` 先检查系列种类和 `max_points`，因此足迹图或标量研究会得到 `UnsupportedTradeBarSeries` 或 `InvalidAggregation`。
 
-**Live, corrections, and replay.** In-order prints update the forming bar in place and the first
-print at or after a bar boundary opens the next bar (`"tip"`); late or corrected prints rebuild the
-stream once (`"historical"`). The volume histogram, CVD/delta studies, and footprints on the same
-stream follow every change. `chart.set_replay_clock_micros(clock)` shows exactly the bars of the tape
-up to the clock; a bar that a folded pre-open print opens ahead of the clock appears when the clock
-reaches its open. The volume columns take the up/down tint of the chart's primary (first) price
-series (`histogram_updown`); restyle them like any histogram.
+**实时、更正与回放。** 按序到达的成交就地更新正在形成的柱，位于柱边界或其之后的第一笔成交开启下一根柱（`"tip"`）；迟到或被更正的成交会使成交流重建一次（`"historical"`）。同一成交流上的成交量直方图、CVD/delta 研究和足迹图跟随每一次变化。`chart.set_replay_clock_micros(clock)` 恰好显示成交带中截至该时钟的柱；一根由被并入的开盘前成交开启、且领先于时钟的柱，会在时钟到达其开盘时间时出现。成交量柱取图表主（第一个）价格系列的涨跌色调（`histogram_updown`）；可像任何直方图一样重设其样式。
 
-Rust hosts call `ChartEngine::set_trade_stream_sessions(stream, Some(TradeSessionOptions { windows,
-outside: OutOfSessionPolicy::Fold }))` and `add_trade_volume_series(stream, pane)`;
-`SessionBarGrid` exposes the same placement for other tick consumers.
+Rust 宿主调用 `ChartEngine::set_trade_stream_sessions(stream, Some(TradeSessionOptions { windows, outside: OutOfSessionPolicy::Fold }))` 和 `add_trade_volume_series(stream, pane)`；`SessionBarGrid` 为其他 Tick 消费方提供相同的放置方式。
 
-### Resampling
+### 重采样
 
-`configure_resampled_series(target, options)` derives a candlestick or bar `target` (and an optional
-volume histogram) from a source series in the engine. `resample_boundaries()` derives the periods
-from the session windows, the exchange time zone, and the host's trading dates:
+`configure_resampled_series(target, options)` 在引擎内从源系列派生出 K 线或柱 `target`（以及可选的成交量直方图）。`resample_boundaries()` 根据交易时段窗口、交易所时区和宿主的交易日期推导出各周期：
 
 ```ts
 import { resample_boundaries } from "@aeristerminal/aeris-charts";
@@ -961,84 +405,21 @@ chart.configure_resampled_series(hour, {
 });
 ```
 
-**Periods.** `span: "window"` (the default) returns one boundary per session window, so 5-, 15-,
-30- and 60-minute bars restart at every window open (A-share 60-minute bars at 09:30, 10:30, 13:00,
-14:00; a window whose length is not a multiple of the interval ends with a shorter bar).
-`span: "day"` returns one boundary per trading date from its first open to its last close; with
-`interval_seconds: 86400` that is one daily bar per date, stamped at the session open, so US daily
-bars built from extended-hours minutes (04:00–20:00 Eastern) stay one bar per day across DST even
-though winter sessions run past UTC midnight. Every boundary carries the requested date as
-`session_id` (`YYYYMMDD`): the trading date for a market whose sessions start on it, the evening
-date for a Sunday-open market (below). Dates are strictly ascending and use `session_slot_times`
-placement (night sessions with a negative `session_start` included); at most 20 000 boundaries and
-32 resampled series per chart. Hosts may also pass their own `{ start_time, end_time, session_id }`
-periods (for weeks or months, for example).
+**周期。** `span: "window"`（默认值）为每个交易时段窗口返回一个边界，因此 5、15、30 和 60 分钟的柱在每个窗口开盘时重新开始（A 股 60 分钟柱位于 09:30、10:30、13:00、14:00；长度不是间隔整数倍的窗口，以一根更短的柱结束）。`span: "day"` 为每个交易日期返回一个边界，从其第一次开盘到最后一次收盘；配合 `interval_seconds: 86400`，则每个日期一根日线柱，时间戳为交易时段开盘时间，因此由延长交易时段分钟数据（美东时间 04:00–20:00）构建的 US 日线柱，在 DST 前后仍保持每天一根，尽管冬季的交易时段会越过 UTC 午夜。每个边界都以所请求的日期作为 `session_id`（`YYYYMMDD`）：对于交易时段在该日开始的市场，是交易日期；对于周日开盘的市场（见下文），是晚间日期。日期严格递增，并使用 `session_slot_times` 的放置方式（包括 `session_start` 为负的夜盘交易时段）；每个图表至多 20 000 个边界和 32 个重采样系列。宿主也可以传入自己的 `{ start_time, end_time, session_id }` 周期（例如用于周或月）。
 
-`resample_boundaries` has its own `session_start`, default `0` and independent of the chart's, so
-China futures pass `-10800` explicitly. For a Sunday-open market (CME Globex) pass `session_start:
-0`, the evening dates, and `windows: [["17:00", "16:00"]]`; the `session_id` of each boundary is then
-the requested evening date (`20240107` for the session that opens Sunday 2024-01-07 and is Monday's
-trading day), or build the `{ start_time, end_time, session_id }` periods yourself. Never pass
-`-25200` with the Monday date: it places that session on Friday 17:00 to Saturday 16:00, so Sunday
-and Monday rows fall outside every boundary and are omitted.
+`resample_boundaries` 有自己的 `session_start`，默认值为 `0`，独立于图表自身的值，因此中国期货需显式传入 `-10800`。对于周日开盘的市场（CME Globex），请传入 `session_start: 0`、晚间日期以及 `windows: [["17:00", "16:00"]]`；此时每个边界的 `session_id` 即所请求的晚间日期（对于 2024-01-07 周日开启、属于周一交易日的交易时段，为 `20240107`）；或者自行构建 `{ start_time, end_time, session_id }` 周期。切勿将 `-25200` 与周一日期一起传入：它会把该交易时段放在周五 17:00 至周六 16:00，导致周日和周一的行落在所有边界之外而被省略。
 
-The window list applies to every date of a call. Hosts with a calendar call `resample_boundaries`
-once per window set and concatenate the arrays, which only need to be ordered and disjoint: night
-and day windows for normal dates, day windows only for a date whose night session does not trade,
-such as the first trading day after a break. With `span: "day"` the bar is stamped at the first
-window's open, so a shared night-plus-day list would stamp that date's daily bar on the night
-session that never traded.
+窗口列表适用于一次调用中的每个日期。拥有日历的宿主对每组窗口调用一次 `resample_boundaries` 并拼接各数组，这些数组只需有序且互不相交：正常日期使用夜盘与日盘窗口，夜盘不交易的日期（例如休市后的第一个交易日）仅使用日盘窗口。使用 `span: "day"` 时，柱的时间戳取第一个窗口的开盘时间，因此共用的夜盘加日盘列表，会把该日期的日线柱打上从未交易的夜盘交易时段的时间戳。
 
-**Source rows.** Source rows must be stamped with bar-open times; rows outside every boundary are
-omitted, so the host still converts provider close stamps (09:31 … 15:00) to open stamps by
-subtracting one interval before resampling. A feed that also carries a separate opening-auction
-minute (241-bar feeds stamp it 09:30 beside the close-stamped 09:31) must merge that row into the
-first minute before RESAMPLING: shifted, it falls before the first window and is omitted with its
-volume. A 241-bar feed that is drawn directly and not resampled may instead shift the auction row
-back too: it lands at 09:29, outside every window, and `bar_time_label` prints it 09:30 (see
-[Close-time labels](#close-time-labels)). Whitespace rows (`session_slot_times` reservations)
-reserve their bucket without prices: an untraded bucket is a whitespace bar, and the forming bucket
-closes at its last traded row. Resampling needs a time axis: it is rejected on a chart whose axis is
-a non-time bar sequence (trade-count, volume, or range streams, synthetic bars), and such a sequence
-cannot join a chart that has resampled series.
+**源行。** 源行必须以柱开盘时间作为时间戳；位于所有边界之外的行会被省略，因此宿主在重采样之前，仍须通过减去一个间隔，将数据提供方的收盘时间戳（09:31 … 15:00）转换为开盘时间戳。若数据同时带有单独的开盘集合竞价分钟（241 根柱的数据把它标为 09:30，与收盘时间戳 09:31 并存），则必须在重采样之前将该行合并进第一分钟：若对其做平移，它会落在第一个窗口之前，并连同其成交量一起被省略。直接绘制而不做重采样的 241 根柱数据，则可以改为同样将集合竞价行前移：它落在 09:29，位于所有窗口之外，而 `bar_time_label` 将其打印为 09:30（参见 [收盘时间标签](#收盘时间标签)）。空白数据行（`session_slot_times` 预留）为其桶预留位置但不含价格：未成交的桶是空白柱，正在形成的桶截止于其最后一个已成交行。重采样需要时间轴：在坐标轴为非时间柱序列（成交笔数流、成交量流或区间流，合成柱）的图表上会被拒绝，并且这类序列不能加入已有重采样系列的图表。
 
-**Live updates.** `update`, `merge`, and typed batches on the source or its volume refresh only the
-affected tail: the unchanged prefix of derived bars is kept and the tail is rebuilt from the first
-bucket that can hold a changed row, so a live minute re-reads one bucket, never the history, and
-boundaries past the last source row (dates configured ahead) cost nothing. A `pop`, a
-retention-cap trim of the source's head, a backward replay that loses a derived bar, and a complete
-`set_data` rebuild once.
-`chart.resample_stats(target)` reports `rebuilds`, `tail_refreshes`, and `rows_scanned`. Under the
-replay clock the forming bar aggregates only rows at or before the clock. To reach a date past the
-configured boundaries, call `configure_resampled_series` again (one rebuild); new dates can also be
-included ahead of time because dates without data produce no bars. A reconfigure keeps the
-binding's source (another source throws `invalid_options`). Bindings never chain, in either
-configuration order: a target (or volume target) may not be another binding's source (or volume
-source) or output, and a binding's volume source may not be its own volume target; each throws
-`invalid_options` ("resampling dependencies may not be chained or cyclic") and changes nothing.
+**实时更新。** 对源系列或其成交量调用 `update`、`merge` 以及类型化批量，仅刷新受影响的尾部：派生柱中未变化的前缀被保留，尾部从第一个可能含有变化行的桶开始重建，因此实时的一分钟只会重读一个桶，绝不会重读历史，并且超出最后一个源行的边界（提前配置的日期）不产生任何开销。`pop`、源系列头部的保留上限裁剪、会丢失某根派生柱的向后回放，以及完整的 `set_data`，都会触发一次重建。`chart.resample_stats(target)` 报告 `rebuilds`、`tail_refreshes` 和 `rows_scanned`。在回放时钟下，正在形成的柱仅聚合时钟当时或之前的行。要到达已配置边界之后的日期，请再次调用 `configure_resampled_series`（一次重建）；也可以提前包含新日期，因为没有数据的日期不会产生柱。重新配置会保留绑定的源（换用其他源会抛出 `invalid_options`）。无论配置顺序如何，绑定都绝不链式连接：目标（或成交量目标）不得是另一个绑定的源（或成交量源）或输出，且绑定的成交量源不得是其自身的成交量目标；每种情况都会抛出 `invalid_options`（"resampling dependencies may not be chained or cyclic"）且不做任何更改。
 
-The targets are engine-owned: `set_data`, `update`, `update_typed`, `merge`, and `merge_typed` on
-them are rejected (`last_ingestion_diagnostics()` reports `status: "rejected"` with
-`code: "derived_series"`) and change nothing, and `pop` records the same rejection. A target must
-not be a footprint, a trade-bound candle, a trade study, or a synthetic-bar series (`invalid_options`);
-a trade-bound candle or the trade volume study may be the binding's source, however.
-Removing any series of a binding (source, volume source, or a target) removes the binding together
-with its target series, like indicator outputs. `chart.resampled_bars(target)` returns the derived
-bars with their `session_id` and aggregated source-row count. Rust hosts call
-`ChartEngine::configure_resampled_series(source, volume_source, target, volume_target,
-ResampleOptions { interval_seconds, boundaries })` and
-`aeris_charts_engine::resample_boundaries(&days, &windows, chart.exchange_time(),
-ResampleSpan::Window)`.
+目标由引擎持有：对其调用 `set_data`、`update`、`update_typed`、`merge` 和 `merge_typed` 会被拒绝（`last_ingestion_diagnostics()` 报告 `status: "rejected"` 及 `code: "derived_series"`）且不做任何更改，`pop` 记录同样的拒绝。目标不得是足迹图、绑定到成交流的 K 线、成交研究或合成柱系列（`invalid_options`）；不过，绑定到成交流的 K 线或成交量研究可以作为该绑定的源。移除绑定中的任一系列（源、成交量源或目标），会连同其目标系列一并移除该绑定，与指标输出相同。`chart.resampled_bars(target)` 返回派生柱，附带其 `session_id` 以及聚合的源行数量。Rust 宿主调用 `ChartEngine::configure_resampled_series(source, volume_source, target, volume_target, ResampleOptions { interval_seconds, boundaries })` 和 `aeris_charts_engine::resample_boundaries(&days, &windows, chart.exchange_time(), ResampleSpan::Window)`。
 
-## Close-time labels
+## 收盘时间标签
 
-Every bar is stamped with its OPEN time, the canonical Aeris bar time, and keeps that stamp as its
-identity: rows, series data, crosshair events, snapshots, the countdown, replay, sessions, trading
-days, drawings, markers, alerts, resampling, and every time a host passes in or reads back are
-open-stamped. An A-share minute chart therefore holds 09:30 … 14:59. A user who reads bars by the
-time they close expects 09:31 … 15:00. `time_scale_options.bar_time_label` (declaratively
-`timeScale.barTimeLabel`, also accepted by worker charts) changes only the TEXT the chart prints for
-a bar:
+每根柱都以其开盘时间（Aeris 的规范柱时间）作为时间戳，并以该时间戳作为其标识：行、系列数据、十字光标事件、快照、倒计时、回放、交易时段、交易日、绘图、标记、提醒、重采样，以及宿主传入或读回的每一个时间，均为开盘时间戳。因此 A 股分钟图保存的是 09:30 … 14:59。而按柱收盘时间读取柱的用户则期望看到 09:31 … 15:00。`time_scale_options.bar_time_label`（声明式写法为 `timeScale.barTimeLabel`，worker 图表也接受）仅改变图表为柱打印的文本：
 
 ```ts
 chart.time_scale().apply_options({
@@ -1050,1225 +431,393 @@ chart.time_scale().apply_options({
 });
 ```
 
-The default `"open"` changes nothing. With `{ anchor: "close", … }` the printed time of a bar is its
-open plus `interval_seconds` (1 to 86 399), or the end of the session window that contains its open
-when the bar is that window's short last bar. Set `"open"` to restore the open text. `time_scale().options().bar_time_label` reports `"open"` or `{ anchor,
-interval_seconds, windows }`. An invalid label (an interval outside 1..86 399, more than 32,
-unordered, or zero-length windows for the chart's `session_start`, unknown keys) throws
-`invalid_options` and changes nothing; the label is validated together with `time_zone`,
-`session_start`, and `tick_marks` of the same call, against the session start that call installs.
+默认值 `"open"` 不改变任何内容。使用 `{ anchor: "close", … }` 时，柱的打印时间是其开盘时间加上 `interval_seconds`（1 至 86 399），或者当该柱是其所在窗口较短的最后一根柱时，为包含其开盘时间的交易时段窗口的结束时间。设为 `"open"` 可恢复开盘文本。`time_scale().options().bar_time_label` 报告 `"open"` 或 `{ anchor, interval_seconds, windows }`。无效标签（间隔超出 1..86 399、超过 32 个、无序，或对图表的 `session_start` 而言长度为零的窗口、未知键）会抛出 `invalid_options` 且不做任何更改；标签与同一次调用中的 `time_zone`、`session_start` 和 `tick_marks` 一起，依据该次调用所安装的交易时段起点进行校验。
 
-**What prints the label.** The crosshair time label, automatic tick labels, the default text of
-explicit `tick_marks`, drawing axis tags, drawing statistics (`date_time_range`) and the forecast
-target time, the delta tooltip's time line, `create_tooltip`, and accessibility text. The host
-`tick_mark_formatter` and `localization.time_formatter` receive the label instant. Hour and minute
-tick weights follow the printed time, so the "10:00" tick sits on the bar that closes on the hour
-(the bar opened 09:59) and never on the bar opened 10:00; Day, Month, and Year weights and every
-trading-day reset keep following the bar's own trading day, so the last bar of a window that ends
-at midnight prints 00:00 of the next date and still belongs to its own trading day. Worker charts
-print the label on every engine-drawn surface; the package-owned tooltip and accessibility text are
-main-thread surfaces. Labels are ordinary text: nothing in the frame contract, the draw list, or any
-backend changes.
+**打印标签的位置。** 十字光标时间标签、自动刻度标签、显式 `tick_marks` 的默认文本、绘图坐标轴标签、绘图统计（`date_time_range`）与预测目标时间、delta 提示框的时间行、`create_tooltip`，以及无障碍文本。宿主的 `tick_mark_formatter` 和 `localization.time_formatter` 接收标签时刻。小时与分钟的刻度权重跟随打印时间，因此“10:00”刻度位于整点收盘的柱上（即 09:59 开盘的那根柱），绝不会位于 10:00 开盘的柱上；日、月、年权重以及每一次交易日重置仍然跟随柱自身的交易日，因此在午夜结束的窗口的最后一根柱，打印的是次日的 00:00，但仍属于它自己的交易日。worker 图表在每个由引擎绘制的界面上打印该标签；由包持有的提示框与无障碍文本属于主线程界面。标签是普通文本：帧契约、绘制列表以及任何后端均不发生变化。
 
-**What stays open-stamped.** All times in and out: `series_data`, `bars_in_logical_range`,
-crosshair and click events, series snapshots, `coordinate_to_time`, visible ranges, the crosshair
-sync position, markers, executions, alerts, drawing anchors, `tick_marks[].time`, the countdown,
-the replay clock, session highlighting, and resampling. A host whose provider stamps bars by close
-still converts them to open stamps on the way in (subtract one interval) and reads open stamps on the
-way out. Native vertical-line labels keep their host text. The `time_formatter` of the
-accessibility options receives the host's own data time, not the label. An explicit tick mark
-names its bar by identity: to label the bar opened 11:29 (printing 11:30) pass `11:29`; a mark at
-the label-only instant 11:30 matches no bar and draws nothing.
+**仍保持开盘时间戳的内容。** 所有传入与传出的时间：`series_data`、`bars_in_logical_range`、十字光标与点击事件、系列快照、`coordinate_to_time`、可见范围、十字光标同步位置、标记、成交、提醒、绘图锚点、`tick_marks[].time`、倒计时、回放时钟、交易时段高亮以及重采样。数据提供方按收盘时间给柱打时间戳的宿主，仍须在传入时将其转换为开盘时间戳（减去一个间隔），并在传出时读取开盘时间戳。原生竖线标签保留其宿主文本。无障碍选项的 `time_formatter` 接收宿主自己的数据时间，而不是标签。显式刻度标记按标识指明其柱：要为 11:29 开盘（打印 11:30）的柱添加标签，请传入 `11:29`；位于仅作为标签存在的时刻 11:30 的标记不匹配任何柱，也不绘制任何内容。
 
-**One interval per chart.** `interval_seconds` is the chart's primary bar interval. A resampled
-target and its source share one time axis, so a one-minute source with an hourly target cannot be
-labelled per series: pick the interval of the bars the user reads, and update the option in the same
-step as the timeframe switch (until then the labels use the old interval).
+**每个图表一个间隔。** `interval_seconds` 是图表的主柱间隔。重采样目标与其源共用一条时间轴，因此无法为一分钟源与小时目标逐系列打标签：请选择用户所读柱的间隔，并在切换时间周期的同一步骤中更新该选项（在此之前标签使用旧间隔）。
 
-**Windows and short last bars.** `windows` are exchange-local `["HH:MM", "HH:MM"]` pairs placed in
-the chart's `time_zone` and `session_start` exactly like `session_slot_times` (at most 32; an end at
-or before its start crosses midnight, `"24:00"` ends at midnight). They end a window's last bar
-exactly: a US hourly session 09:30–16:00 has a short 15:30 bar that prints 16:00 on both sides of a
-DST change, and an HK morning window 09:30–12:00 prints 12:00 for its 11:30 bar. Without windows a
-short last bar prints its open plus the interval (16:30). A bar whose open lies in no window prints
-its open plus the interval as well, which is how a host-fed 241-bar feed that shifts the auction row
-back one interval (09:29) prints 09:30, 09:31 … 15:00 with no engine-built auction bar. The windows
-and the `session_start` must fit each other: while a label with windows is installed, a
-`session_start` (through `apply_options`, `timeScale.sessionStart`, a V2 import, or
-`set_session_start_seconds`) that the windows cannot be placed on throws `invalid_options`
-(`ExchangeTimeError::BarTimeLabelWindows` in Rust) and changes nothing, so a saved document always
-imports again. To move both, send them in one `apply_options` call (the label is checked against the
-start of that call) or set the label to `"open"` first. A `time_zone` change never conflicts with the
-windows; only an instant whose windows a DST transition collapses prints open plus the interval.
-How 同花顺 and 富途 label a short last hourly bar could not be verified (no live terminal was
-available), so compare the printed window end with your reference terminal before relying on it.
+**窗口与较短的最后一根柱。** `windows` 是交易所本地的 `["HH:MM", "HH:MM"]` 对，按图表的 `time_zone` 和 `session_start` 放置，与 `session_slot_times` 完全一致（至多 32 个；结束时间不晚于开始时间表示跨越午夜，`"24:00"` 表示在午夜结束）。它们使窗口的最后一根柱精确结束：US 09:30–16:00 的小时线交易时段有一根较短的 15:30 柱，在 DST 变更前后都打印 16:00，HK 09:30–12:00 的上午窗口，其 11:30 的柱打印 12:00。没有 windows 时，较短的最后一根柱打印其开盘时间加间隔（16:30）。开盘时间不在任何窗口内的柱同样打印其开盘时间加间隔，这就是宿主提供的 241 根柱数据（将集合竞价行前移一个间隔至 09:29）在没有引擎构建的集合竞价柱的情况下，打印为 09:30、09:31 … 15:00 的原因。windows 与 `session_start` 必须相互匹配：当安装了带 windows 的标签时，若某个 `session_start`（通过 `apply_options`、`timeScale.sessionStart`、V2 导入或 `set_session_start_seconds`）使这些窗口无法被放置，则会抛出 `invalid_options`（Rust 中为 `ExchangeTimeError::BarTimeLabelWindows`）且不做任何更改，因此已保存的文档始终可以再次导入。要同时移动两者，请在一次 `apply_options` 调用中一并发送（标签依据该次调用的起点校验），或先将标签设为 `"open"`。`time_zone` 变更绝不会与 windows 冲突；仅当某个时刻的窗口被 DST 切换折叠时，该时刻才打印开盘时间加间隔。同花顺和富途如何标注较短的最后一根小时线柱，未能验证（没有可用的实时终端），因此在依赖它之前，请将打印出的窗口结束时间与你的参考终端比对。
 
-**Where it does not apply.** Calendar-date axes and non-time bar sequences (trade-count, volume,
-and range streams, synthetic bars) print their own times and ignore the option. Interval bars do not
-grow a separate 241st auction bar: engine-built candles fold the 09:25 auction print into the first
-bar, as tick-built candles already do, and the 241 points of a time-sharing LINE remain a property
-of close-stamped instant slots (`session_slot_times` with `"bar_close_with_open"`).
+**不适用的场景。** 日历日期坐标轴和非时间柱序列（成交笔数流、成交量流和区间流，合成柱）打印它们自己的时间，并忽略该选项。间隔柱不会多出单独的第 241 根集合竞价柱：引擎构建的 K 线将 09:25 的集合竞价成交并入第一根柱，正如由 Tick 构建的 K 线已经做的那样；而分时折线的 241 个点仍然是按收盘时间戳标注的时刻槽位的属性（`session_slot_times` 与 `"bar_close_with_open"`）。
 
-The label lives in the options store, so V2 persistence carries it while it is not `"open"`;
-importing a document without the key keeps the installed label (a document whose `sessionStart` the
-installed windows do not fit is rejected whole), and a default chart's document is unchanged. Rust
-hosts call `ChartEngine::set_bar_time_label(BarTimeLabel::Close { interval_seconds, windows })`,
-`bar_time_label()`, and `bar_label_time(open_time)` (the instant a bar prints); the engine JSON
-option is `timeScale.barTimeLabel`, and the WASM export `bar_label_time(seconds)`.
+标签存放在选项存储中，因此只要它不是 `"open"`，V2 持久化就会携带它；导入不带该键的文档会保留已安装的标签（若文档的 `sessionStart` 与已安装的 windows 不匹配，则整份文档被拒绝），而默认图表的文档保持不变。Rust 宿主调用 `ChartEngine::set_bar_time_label(BarTimeLabel::Close { interval_seconds, windows })`、`bar_time_label()` 和 `bar_label_time(open_time)`（柱所打印的时刻）；引擎 JSON 选项为 `timeScale.barTimeLabel`，WASM 导出为 `bar_label_time(seconds)`。
 
-## Experimental surfaces
+## 实验性接口
 
-Custom series, pane/series/canvas primitives, the exported custom-series/primitive feature packs,
-built-in plugin helpers, offscreen-worker charts, split-grid helpers, and shortcut helpers are
-public experimental APIs. Their current lifecycle and containment behavior is tested, but their
-exact types may change in a pre-1.0 minor release.
-`create_delta_tooltip()` is intentionally unavailable on candlestick series; candles use the normal
-hover `create_tooltip()` instead. Delta Tooltip remains available on non-candlestick series such as
-area/line/bar and is composed directly into the brushable-area interaction. Brushable Area is a
-composition over the ordinary `area` series rather than a separate data-bearing series kind; the
-legacy `brushable_area` input spelling remains a compatibility alias that normalizes to `area`.
-The helper reserves primary mouse/pen pane-drag for the comparison brush while it is attached; axis
-drags keep their ordinary auto/manual-scale behavior and the helper does not globally disable chart
-scroll or scale options. Removing the helper restores the ordinary Area pane-drag path immediately.
-The normal `create_tooltip()` is the canonical structured market-data inspector. Its engine snapshot
-retains Open/High/Low/Close for every ordinary series presentation, including area and line; scalar
-rows naturally report the same value in all four fields, while area/line series fed retained OHLC
-rows can render Close and still inspect the full bar. Hosts may bind an explicit `volume_series` to
-add a timestamp-aligned Volume row; the chart never guesses which histogram represents volume.
-Convenience helpers such as `create_rectangle_drawing()` and `create_rectangle_drawing_tool()` are
-controllers over the canonical engine-owned drawing kind; they do not define a separate rectangle
-feature or persistence identity. Likewise, primitive helpers whose visual shape resembles a drawing
-remain primitives and should be presented as such by demos and hosts.
-Extensions run at host render time, must not re-enter a chart mutation from a render callback, own
-their external objects and persistence, and receive teardown exactly once. Callback failures are
-contained at the host boundary so one extension cannot prevent other teardown. Arbitrary extension
-objects or executable callbacks are never reconstructed from persisted JSON.
+自定义系列、窗格/系列/画布图元、导出的自定义系列/图元功能包、内置插件辅助函数、离屏 worker 图表、拆分网格辅助函数和快捷键辅助函数均为公共实验性 API。其当前的生命周期与隔离行为已有测试，但其确切类型可能在 1.0 之前的次版本发布中变化。`create_delta_tooltip()` 在 K 线系列上被有意设为不可用；K 线改用常规的悬停 `create_tooltip()`。delta 提示框仍可用于面积、折线、柱等非 K 线系列，并直接组合进可刷选面积交互中。可刷选面积是基于普通 `area` 系列的组合，而不是一种单独的承载数据的系列类型；旧的 `brushable_area` 输入写法仍作为兼容别名保留，并规范化为 `area`。该辅助函数在挂载期间，将鼠标/触控笔的主键窗格拖动保留给对比刷选；坐标轴拖动保持其普通的自动/手动比例尺行为，且该辅助函数不会全局禁用图表的滚动或比例尺选项。移除该辅助函数会立即恢复普通面积图的窗格拖动路径。常规的 `create_tooltip()` 是规范的结构化行情数据检视器。其引擎快照为每种普通系列呈现方式（包括面积和折线）保留 Open/High/Low/Close；标量行自然在四个字段中报告相同的值，而被馈入保留的 OHLC 行的面积/折线系列可以渲染 Close，同时仍能检视完整的柱。宿主可以绑定显式的 `volume_series`，以添加与时间戳对齐的 Volume 行；图表绝不会猜测哪个直方图代表成交量。诸如 `create_rectangle_drawing()` 和 `create_rectangle_drawing_tool()` 之类的便捷辅助函数，是针对引擎持有的规范绘图类型的控制器；它们不定义单独的矩形功能或持久化标识。同样，视觉形状类似绘图的图元辅助函数仍然是图元，演示与宿主应当如此呈现。扩展在宿主渲染时运行，不得从渲染回调中重入图表变更，拥有其外部对象和持久化，并且恰好收到一次拆除通知。回调失败在宿主边界处被隔离，因此一个扩展不会妨碍其他扩展的拆除。任意扩展对象或可执行回调绝不会从持久化的 JSON 中重建。
 
-## Errors and lifecycle
+## 错误与生命周期
 
-Predictable failures throw `AerisChartsError`, an `Error` subclass with one of these stable
-codes: `disposed`, `invalid_handle`, `stale_handle`, `invalid_data`, `invalid_options`,
-`unsupported_operation`, `serialization_error`, `persistence_version_error`, `extension_error`,
-`renderer_platform_error`, or `resource_limit`.
+可预期的失败会抛出 `AerisChartsError`，它是 `Error` 的子类，带有以下稳定错误码之一：`disposed`、`invalid_handle`、`stale_handle`、`invalid_data`、`invalid_options`、`unsupported_operation`、`serialization_error`、`persistence_version_error`、`extension_error`、`renderer_platform_error` 或 `resource_limit`。
 
-## Brand rename
+## 品牌更名
 
-The browser package is `@aeristerminal/aeris-charts` (with `@aeristerminal/aeris-charts/react`). The former branded error
-exports were renamed to `AerisChartsError` and `AerisChartsErrorCode`; update imports and
-`instanceof` checks when migrating. Rust consumers use the repository-only `aeris_charts_*` crates.
+浏览器包为 `@aeristerminal/aeris-charts`（含 `@aeristerminal/aeris-charts/react`）。原先带有品牌名的错误导出已重命名为 `AerisChartsError` 和 `AerisChartsErrorCode`；迁移时请更新导入与 `instanceof` 检查。Rust 使用方使用仅限仓库的 `aeris_charts_*` crate。
 
-Every former brand-bearing public identifier was hard renamed:
+每一个原先带有品牌名的公共标识符都已被彻底重命名：
 
-| Public surface | New identifier |
+| 公共接口面 | 新标识符 |
 | --- | --- |
-| Browser error class | `AerisChartsError` |
-| Browser error-code type | `AerisChartsErrorCode` |
-| React chart component | `AerisChart` |
-| React chart props | `AerisChartProps` |
-| React chart hook | `useAerisChart` |
-| WebAssembly chart class | `AerisChart` |
-| WebAssembly workspace class | `AerisWorkspace` |
-| GPUI prepared-frame type | `PreparedAerisFrame` |
-| GPUI viewport type | `AerisViewport` |
+| 浏览器错误类 | `AerisChartsError` |
+| 浏览器错误码类型 | `AerisChartsErrorCode` |
+| React 图表组件 | `AerisChart` |
+| React 图表 props | `AerisChartProps` |
+| React 图表 hook | `useAerisChart` |
+| WebAssembly 图表类 | `AerisChart` |
+| WebAssembly 工作区类 | `AerisWorkspace` |
+| GPUI 已准备帧类型 | `PreparedAerisFrame` |
+| GPUI 视口类型 | `AerisViewport` |
 
-Persisted chart and workspace schema identifiers, browser event names, generated WebAssembly
-asset names, DOM IDs/classes, CSS selectors, and benchmark environment variables now use the
-`aeris_charts` prefix. There are no compatibility aliases for the retired brand.
+持久化的图表与工作区 schema 标识符、浏览器事件名称、生成的 WebAssembly 资源名称、DOM ID/类名、CSS 选择器以及基准测试环境变量，现在均使用 `aeris_charts` 前缀。已停用的品牌没有任何兼容别名。
 
-`chart.remove()` is idempotent. Every operation that needs live chart state throws `disposed`
-after removal. Identity fields already held by the caller may still be read. Removed series,
-drawings, panes, and price scales throw `stale_handle`; a stale handle never targets a replacement.
-Extension cleanup exceptions remain contained and are reported as development warnings.
+`chart.remove()` 是幂等的。移除之后，每个需要有效图表状态的操作都会抛出 `disposed`。调用方已持有的标识字段仍然可以读取。已移除的系列、绘图、窗格和价格比例尺会抛出 `stale_handle`；过期的句柄绝不会指向替代对象。扩展清理异常仍被隔离，并作为开发警告报告。
 
-Named price-scale creation rejects empty/reserved/duplicate/overlong IDs, missing panes, and the
-per-pane resource limit without partial mutation. Rebinding to an unknown scale throws
-`invalid_options`; removing a built-in or populated scale throws `unsupported_operation`. Named
-scale IDs are case-sensitive, pane-local UTF-8 strings of 1-128 bytes, with at most 16 per pane.
+创建具名价格比例尺时，会拒绝空的、保留的、重复的或过长的 ID、不存在的窗格，以及每个窗格的资源上限，且不产生部分变更。重新绑定到未知比例尺会抛出 `invalid_options`；移除内置比例尺或非空的比例尺会抛出 `unsupported_operation`。具名比例尺 ID 区分大小写，是窗格内局部的、长度为 1-128 字节的 UTF-8 字符串，每个窗格至多 16 个。
 
-Clean batch/current-bar ingestion retains its allocation-free/null diagnostic path. Repaired,
-dropped, reordered, deduplicated, rejected, or semantically anomalous input is available through
-`series.last_ingestion_diagnostics()`; OHLC anomalies are reported without rewriting values.
-Numeric times must be finite whole UTC seconds in the inclusive range
-`-62167219200..253402300799` (years 0000..9999) and are never auto-converted. Rejection reasons
-suggest milliseconds, microseconds, or nanoseconds when scaling would produce an in-range value.
-Any invalid timestamp rejects a direct set/update batch atomically, and an invalid single update
-leaves the current series unchanged and warns on the console, as `update_typed` does. Shared-ring
-drains reject malformed rows individually and count them in `frame_stats().ring_dropped_rows`.
-Worker charts expose the most recent result through `offscreen_chart.last_ingestion_diagnostics()`.
+干净的批量/当前柱写入保留其无分配/null 诊断路径。被修复、丢弃、重排、去重、拒绝或语义异常的输入，可通过 `series.last_ingestion_diagnostics()` 获取；OHLC 异常只报告，不改写数值。数值时间必须是有限的整数 UTC 秒，且位于闭区间 `-62167219200..253402300799`（年份 0000..9999）内，并且绝不自动转换。当缩放后会得到范围内的值时，拒绝原因会提示毫秒、微秒或纳秒。任何无效时间戳都会使直接的 set/update 批量被原子地拒绝；无效的单次 update 会使当前系列保持不变并在控制台发出警告，`update_typed` 亦如此。共享环形缓冲区的排空会逐行拒绝格式错误的行，并将其计入 `frame_stats().ring_dropped_rows`。worker 图表通过 `offscreen_chart.last_ingestion_diagnostics()` 暴露最近一次结果。
 
-Streaming ingestion keeps reference `series.update` semantics: a point replaces the whole bar at its
-time. `update()` reports the payloads that silently rewrite a bar with a machine-readable
-diagnostics `code` pointing to `merge()`: `value_on_ohlc_series` (`{ time, value }` flattens a
-candlestick/bar), `price_less_payload` (for example `{ time, volume }` becomes whitespace), and the
-rejected `partial_ohlc`. A write to an engine-owned series (a trade-bound candle or study,
-resampled or synthetic bars) is rejected with `derived_series` on every data path; a footprint
-handle throws `unsupported_operation` instead. `series.merge(point, options?)` is the engine-owned
-partial path: present open/high/low/close/value fields overwrite, absent fields keep the existing
-bar, and candlestick/bar results are normalized so `high >= max(open, close)` and
-`low <= min(open, close)` (a close-only tick for a new time creates O=H=L=C; scalar series take
-`value`). A merge without a price field is
-rejected with `empty_merge`; volume and turnover merge into their own series. `series.merge_typed(columns,
-options?)` is the columnar form: row `i` merges like `merge()` with `NaN` entries and omitted columns
-absent, rows apply in input order with one engine synchronization, and one invalid row rejects the
-batch (`offscreen_chart.merge_typed` is the worker form). Custom, advanced, and footprint series throw
-`unsupported_operation`. A streamed point's explicit `color`/`wick_color`/`border_color` colors that bar
-even when no earlier point carried a color, exactly as the same item does in `set_data`.
+流式写入保持参考实现的 `series.update` 语义：一个数据点会替换其时间处的整根柱。`update()` 会对那些会静默改写柱的载荷报告机器可读的诊断 `code`，并指向 `merge()`：`value_on_ohlc_series`（`{ time, value }` 会压平 K 线/柱）、`price_less_payload`（例如 `{ time, volume }` 会变成空白数据），以及被拒绝的 `partial_ohlc`。对引擎拥有的系列（与成交绑定的 K 线或研究、重采样或合成的柱）的写入，在每条数据路径上都会以 `derived_series` 被拒绝；足迹图句柄则改为抛出 `unsupported_operation`。`series.merge(point, options?)` 是由引擎拥有的部分更新路径：存在的 open/high/low/close/value 字段会覆盖，缺失的字段保留现有柱的值，K 线/柱的结果会被规范化，使 `high >= max(open, close)` 且 `low <= min(open, close)`（针对新时间的仅含收盘价的 Tick 会创建 O=H=L=C；标量系列取 `value`）。不含价格字段的合并会以 `empty_merge` 被拒绝；成交量和成交额会合并到各自的系列中。`series.merge_typed(columns, options?)` 是列式形式：第 `i` 行的合并方式与 `merge()` 相同，其中 `NaN` 条目和省略的列视为缺失；各行按输入顺序应用，仅触发一次引擎同步；只要有一行无效，整个批量即被拒绝（`offscreen_chart.merge_typed` 是 worker 形式）。自定义、高级和足迹图系列会抛出 `unsupported_operation`。流式写入的数据点若显式给出 `color`/`wick_color`/`border_color`，即使此前没有任何数据点带有颜色，也会为该柱着色，与 `set_data` 中同一项的行为完全一致。
 
-`update`, `merge`, `update_typed`, and `merge_typed` (including the `offscreen_chart` typed forms) accept
-`{ sequence }`, a non-negative safe integer; an invalid value is rejected and warned like invalid data. When present, a sequence not greater than the last one
-applied to that series is rejected as stale (`code: "stale_sequence"`, `last_sequence`) without
-changing data or emitting `data_changed`; calls without a sequence always apply. A full
-`set_data`/`set_data_typed` clears the guard or installs its `{ sequence }` as the baseline. The
-guard is O(1) per series, runtime-only, and not persisted. Custom and advanced series throw
-`unsupported_operation` when given a sequence. Rust hosts use `ChartEngine::merge_series_bar`,
-`merge_series_bars`, `update_series_bar_sequenced`, `update_series_bars_sanitized_sequenced`, and
-`set_series_update_sequence`.
+`update`、`merge`、`update_typed` 和 `merge_typed`（包括 `offscreen_chart` 的类型化形式）接受 `{ sequence }`，其值为非负安全整数；无效值会被拒绝，并像无效数据一样发出警告。若提供了 sequence，且其不大于该系列上已应用的最后一个 sequence，则会被判为过期而拒绝（`code: "stale_sequence"`、`last_sequence`），不会改变数据，也不会触发 `data_changed`；不带 sequence 的调用始终会应用。完整的 `set_data`/`set_data_typed` 会清除该防护，或将其 `{ sequence }` 作为基线写入。该防护对每个系列为 O(1)，仅存在于运行时，不会持久化。自定义和高级系列在传入 sequence 时会抛出 `unsupported_operation`。Rust 宿主使用 `ChartEngine::merge_series_bar`、`merge_series_bars`、`update_series_bar_sequenced`、`update_series_bars_sanitized_sequenced` 和 `set_series_update_sequence`。
 
-## Drawing anchors, magnet, and price basis
+## 绘图锚点、磁吸与价格基准
 
-Every drawing anchor has a time identity. `drawing.points()` returns `{logical, price, time}`,
-where `time` is UTC seconds: fractional positions interpolate between the neighbouring bar times
-and positions beyond the data extrapolate with the prevailing bar interval (the future-area
-rectangle time tag shows that extrapolated date). `chart.add_drawing()` and `drawing.set_points()`
-accept `{logical, price}`, `{time, price}`, or both; `time` wins when both are present and disagree,
-and `points()` output round-trips exactly. A time anchor added before the chart has data stays
-pending and resolves when data arrives. Non-time bar charts report no `time`.
+每个绘图锚点都具有时间标识。`drawing.points()` 返回 `{logical, price, time}`，其中 `time` 为 UTC 秒数：小数位置在相邻柱的时间之间插值，超出数据范围的位置则按当前柱间隔外推（未来区域矩形的时间标签显示的就是这个外推出的日期）。`chart.add_drawing()` 和 `drawing.set_points()` 接受 `{logical, price}`、`{time, price}` 或两者同时给出；两者同时存在且不一致时，以 `time` 为准，`points()` 的输出可以精确往返。在图表尚无数据时添加的时间锚点保持待定状态，数据到达后再解析。非时间柱图表不报告 `time`。
 
-When data changes, anchors follow the merged time axis. Timestamps shared by the old and new data
-keep the exact mapping, and a same-interval retention trim or window shift keeps its bar-count
-extrapolation. Prepended history re-places anchors left of the old data by their time, so a drawing
-older than a short intraday history keeps its date while the host pages in more bars. When the
-data shares no timestamps, or the interval changes (1m to 1h to 1D, a clear-then-set, a symbol
-reload), each anchor resolves from its time on the new axis: 10:37
-lands 37/60 of the way from the 10:00 hourly bar to the next one, and inside that day's bar on
-daily data. Undo/redo history and in-flight creation or drag state follow the same rules. Sync
-payloads (`drawing_sync_payload`) and clipboard payloads (`copy_drawings`) carry anchor times, so the
-receiving chart resolves them on its own interval and history window. Every committed drawing change
-(an API call, a placement, a freehand stroke, a pointer drag or keyboard edit that moved something,
-a text edit) advances the sync revision, so an already synced cell accepts the next payload.
-Clipboard payloads are bounded like a persisted drawing document (at most 10,000 drawings, 250,000
-anchors, and 8 MiB): `copy_drawings` throws `resource_limit` past them and `invalid_data` when no
-listed drawing exists, and `clone_drawing` copies any drawing the chart holds. Named templates
-(`drawing_template`, `apply_drawing_template`) carry style only (plus a position tool's
-`position_account_size` and `position_risk_percent`): never a drawing's name, group,
-revision, visibility, lock, z-order, interval visibility, price scale, or text, so applying one
-restyles the target and keeps its identity and its own text.
+数据变化时，锚点跟随合并后的时间轴。新旧数据共有的时间戳保持精确映射，同间隔的保留裁剪或窗口平移则保持其按柱数的外推。前置追加的历史数据会按时间重新放置位于旧数据左侧的锚点，因此比较短的分时历史更早的绘图，在宿主分页载入更多柱的同时仍保持其日期。当数据没有共有的时间戳，或间隔发生变化（1m 到 1h 到 1D、先清空再设置、品种重新加载）时，每个锚点都根据其时间在新坐标轴上解析：10:37 落在从 10:00 的小时柱到下一根柱的 37/60 处，在日线数据上则落在当天的那根柱内。撤销/重做历史以及进行中的创建或拖动状态遵循相同的规则。同步载荷（`drawing_sync_payload`）和剪贴板载荷（`copy_drawings`）携带锚点时间，因此接收端图表会在自己的间隔和历史窗口上解析它们。每一次已提交的绘图变更（API 调用、放置、手绘笔画、移动了内容的指针拖动或键盘编辑、文本编辑）都会推进同步修订，因此已同步的单元格会接受下一个载荷。剪贴板载荷与持久化的绘图文档一样有界（至多 10,000 个绘图、250,000 个锚点和 8 MiB）：超出这些上限时 `copy_drawings` 抛出 `resource_limit`，所列绘图均不存在时抛出 `invalid_data`；`clone_drawing` 可复制图表持有的任意绘图。命名模板（`drawing_template`、`apply_drawing_template`）仅携带样式（外加仓位工具的 `position_account_size` 和 `position_risk_percent`）：绝不携带绘图的名称、分组、修订、可见性、锁定、z 序、周期可见性、价格比例尺或文本，因此应用模板只会重设目标的样式，并保留其标识和自身的文本。
 
-`chart.set_drawing_magnet_mode("off" | "weak" | "strong")` is the persistent toolbar magnet
-(default `"off"`, which keeps the historical Ctrl/Cmd-only magnet). `"strong"` always snaps a placed
-or edited anchor to the nearest rendered OHLC value of the bar under the pointer; `"weak"` snaps only
-within 12 CSS px (`DRAWING_WEAK_MAGNET_DISTANCE`). A drawing's own `magnet` option raises the mode for
-that drawing. Holding Ctrl/Cmd toggles the effective magnet (inactive becomes strong, active becomes
-off). Touch input has no modifier and uses the chart mode. Keyboard nudges never snap.
+`chart.set_drawing_magnet_mode("off" | "weak" | "strong")` 设置持久的工具栏磁吸（默认 `"off"`，即保留历史行为：仅在按住 Ctrl/Cmd 时启用磁吸）。`"strong"` 始终会把放置或编辑中的锚点吸附到指针下方那根柱上最近的已渲染 OHLC 值；`"weak"` 仅在 12 CSS px 范围内吸附（`DRAWING_WEAK_MAGNET_DISTANCE`）。绘图自身的 `magnet` 选项会为该绘图提升模式。按住 Ctrl/Cmd 会切换实际生效的磁吸（未启用时变为 strong，已启用时变为 off）。触控输入没有修饰键，使用图表的模式。键盘微移绝不吸附。
 
-`chart.add_drawing()` throws `invalid_options` for a malformed or out-of-range options patch instead of
-dropping the options. Undo/redo during an active drag cancels the drag first. Keyboard editing
-(`Enter`, `Tab`, arrows) cycles the drawing's editable handles (every anchor, a rectangle's eight
-bounds handles, a Long/Short Position's target, entry, width, and stop controls, or the handles a
-drawing family places on its geometry, listed with each family below) and moves the focused
-handle by the nudge distance. `drawing_handle_count()` counts them. Every nudge applies live; `Enter`
-commits the whole keyboard edit as one undo step and `Escape` restores the drawing as it was when the
-edit began. A nudge that moves nothing (a locked drawing, an axis the drawing cannot move along, a
-clamp at the pane edge) changes nothing and is announced as such.
+对于格式错误或超出范围的选项补丁，`chart.add_drawing()` 会抛出 `invalid_options`，而不是丢弃这些选项。在拖动进行中执行撤销/重做，会先取消该拖动。键盘编辑（`Enter`、`Tab`、方向键）会循环切换绘图的可编辑手柄（每个锚点、矩形的八个边界手柄、Long/Short Position 的目标、入场、宽度和止损控件，或绘图族放置在其几何上的手柄，见下文各族的说明），并按微移距离移动当前聚焦的手柄。`drawing_handle_count()` 统计这些手柄的数量。每次微移都会实时应用；`Enter` 会把整个键盘编辑作为一个撤销步骤提交，`Escape` 则把绘图恢复为编辑开始时的样子。未移动任何内容的微移（绘图已锁定、绘图无法沿该轴移动、被窗格边缘钳位）不会改变任何内容，并会据此播报。
 
-A drawing's own text is edited in place in the chart's inline editor, for every drawing that paints
-it: the text tool, a trend line's label, the text of every line, channel, Fibonacci, pitchfork,
-pattern, and shape tool (one line, rotated along the stroke when the label follows a segment), and
-the text boxes of the Projection & Annotations tools listed below (several lines). Level, point,
-and wave labels, ratios, and stats are engine-formatted text and stay options-only. Nine tools
-accept `text` but never paint or edit it on the chart: `forecast`, `bars_pattern`, `price_range`,
-`date_range`, `date_and_price_range`, `projection`, `flag_mark`, `icon`, and `simple_tag` (whose
-`text` is its price-axis tag). A double-click on a selected
-drawing, or on the text of an unselected one (its first click selects it), or Enter or F2 while
-the chart has focus and the drawing is selected (F2 on its accessibility drawing target, where
-Enter keeps geometry editing), opens the editor; locked, hidden, and interval-hidden drawings do
-not open it, nor does a drawing whose text lies wholly outside its pane's plot (the engine applies
-this on every host and path: double-click, Enter, F2, placement, and a direct begin). The engine
-decides which text is edited and where it sits, so an unselected drawing with no text has no label to
-double-click: select it and double-click it, press Enter or F2, or use its options to add the first
-label (only a trend line prompts `+ Add text` on hover). An unselected drawing's text answers hover
-with the text cursor and a click with a selection, unless a higher drawing or the selected
-drawing's anchor handle is at that point.
-Typing repaints live, Enter or leaving the editor commits, and Escape restores the text. The whole
-edit is one undo step and reaches `drawing_sync_payload` once, on commit. Text is bounded by
-`MAX_DRAWING_TEXT_BYTES` (65,536 bytes: longer `text` in options is rejected without applying
-the rest of the patch, and typing stops at the bound); the text tool, trend labels, and every
-other run label stay on one line (line breaks become one space), while family text boxes take
-several lines (Shift+Enter adds one, paste inserts plain text). The editor is a labeled text box
-that announces opening and closing through the accessibility live region and returns focus to
-where it was opened from. Placing the text tool, `anchored_text`, `note`, `callout`, `comment`,
-`signpost`, or `simple_annotation` opens the editor at once with the caret after the default text; committing or Escape
-keeps the drawing, even emptied (only the text tool removes itself when left empty). Placing a
-`price_note`, `price_label`, or arrow mark, which start with no text of their own, opens nothing.
+绘图自身的文本会在图表的内联编辑器中就地编辑，适用于每一种会绘制文本的绘图：文本工具、趋势线的标签、每种线条、通道、斐波那契、叉形线、形态和形状工具的文本（单行；当标签沿线段排布时，文本沿描边旋转），以及下文列出的“投影与标注”工具的文本框（多行）。档位、点和波浪标签、比率与统计信息均为引擎格式化的文本，仍仅可通过选项设置。有九个工具接受 `text`，但从不在图表上绘制或编辑它：`forecast`、`bars_pattern`、`price_range`、`date_range`、`date_and_price_range`、`projection`、`flag_mark`、`icon` 和 `simple_tag`（其 `text` 即价格坐标轴标签）。双击已选中的绘图，或双击未选中绘图的文本（其第一次点击会选中它），或在图表拥有焦点且绘图已选中时按 Enter 或 F2（在其无障碍绘图目标上按 F2，此时 Enter 仍用于几何编辑），即可打开编辑器；已锁定、已隐藏以及按周期隐藏的绘图不会打开它，文本完全位于其窗格绘图区之外的绘图同样不会（引擎在每个宿主和每条路径上都采用这一规则：双击、Enter、F2、放置以及直接开始编辑）。引擎决定编辑哪段文本以及它所在的位置，因此没有文本的未选中绘图没有可供双击的标签：请先选中它再双击，或按 Enter 或 F2，或通过其选项添加第一个标签（只有趋势线会在悬停时提示 `+ Add text`）。未选中绘图的文本在悬停时响应文本光标，在点击时响应选择，除非该处有位于更上层的绘图或已选中绘图的锚点手柄。输入时实时重绘，按 Enter 或离开编辑器即提交，按 Escape 则恢复原文本。整次编辑为一个撤销步骤，并仅在提交时一次性反映到 `drawing_sync_payload` 中。文本长度以 `MAX_DRAWING_TEXT_BYTES` 为上限（65,536 字节：选项中更长的 `text` 会被拒绝，且不会应用补丁的其余部分，输入则在上限处停止）；文本工具、趋势线标签以及其余所有沿线标签都保持为单行（换行符会变成一个空格），而各族的文本框可容纳多行（Shift+Enter 添加一行，粘贴时插入纯文本）。编辑器是带标签的文本框，通过无障碍 live region 播报其打开和关闭，并把焦点归还到打开它的位置。放置文本工具、`anchored_text`、`note`、`callout`、`comment`、`signpost` 或 `simple_annotation` 时会立即打开编辑器，插入符位于默认文本之后；提交或按 Escape 都会保留该绘图，即使文本已被清空（只有文本工具在文本为空时会自行移除）。放置 `price_note`、`price_label` 或箭头标记（它们一开始没有自己的文本）不会打开编辑器。
 
-A double-click acts on the selected drawing only where a click would select it: on its text, its
-body, or one of its handles. A pair whose first click landed on a trading object or the alert
-widget acts on no drawing, and neither does a double-click elsewhere while a drawing stays
-selected.
+双击仅在点击能够选中该绘图的位置对已选中的绘图生效：其文本、其主体或其某个手柄。第一次点击落在交易对象或警报控件上的一对点击不作用于任何绘图，在绘图保持选中的状态下于其他位置双击同样不作用于任何绘图。
 
-Host `dbl_click` subscribers still run after a double-click opened the editor. A host that binds
-double-click to its own settings panel therefore sees both: the editor is open when the handler
-runs, and calling `focus()` on a panel control closes it (the editor commits its text unchanged,
-which records no undo step and no sync revision) and leaves focus on that control, so the drawing
-is exactly as it was. A click on a host control while an editor is open closes it the same way and
-leaves focus on that control; only Enter and Escape return focus to where the editor opened from
-inside the chart.
+在双击打开编辑器之后，宿主的 `dbl_click` 订阅者仍会运行。因此，把双击绑定到自己设置面板的宿主会同时看到两者：处理程序运行时编辑器已经打开，而在面板控件上调用 `focus()` 会将其关闭（编辑器按原文本提交，不记录撤销步骤，也不产生同步修订），并让焦点停留在该控件上，因此绘图与之前完全一致。编辑器打开期间点击宿主控件会以同样方式将其关闭，并让焦点停留在该控件上；只有 Enter 和 Escape 会把焦点归还到图表内编辑器打开时所在的位置。
 
-A drawing's dashed or dotted `style` paints the same dashes on WebGPU, Canvas2D, GPUI, and native
-rendering, and so does a general series' `line_style`: the engine splits those strokes into dash
-runs before any backend draws them.
+绘图的虚线或点线 `style` 在 WebGPU、Canvas2D、GPUI 和原生渲染上绘制出相同的虚线，通用系列的 `line_style` 亦然：引擎会在任何后端绘制之前，把这些描边拆分为虚线段。
 
-### Price-basis (复权) switches
+### 价格基准（复权）切换
 
-The engine has no adjustment-factor model; the host computes adjusted OHLC. Drawings follow a basis
-switch through three calls:
+引擎没有复权因子模型；调整后的 OHLC 由宿主计算。绘图通过三次调用跟随基准切换：
 
-1. Replace the series data in the new basis (`series.set_data()`); indicators recompute.
-2. Call `chart.rescale_drawing_prices(segments, basis_label)`. Each segment is
-   `{from_time?, to_time?, factor}` (UTC seconds, `[from, to)`, non-overlapping, factor 1e-6..1e6).
-   Each anchor price whose time falls in a segment is multiplied by that factor (on tick, volume,
-   or range bar charts an anchor's time is the open time of the bar it sits on); Long/Short
-   Position levels use the entry anchor's segment, and a Gann fan's or fixed square's
-   `scale_ratio` (price per bar) scales with its first anchor's segment. This is a data-basis
-   change, not an edit: it
-   also applies to locked drawings, rewrites the undo/redo history in the new basis, and records no
-   undo step, so undo never restores old-basis prices. The rescale is atomic: invalid segments, or
-   a factor that would move any price outside the supported value range, change nothing. The
-   label argument sets the basis in the same step. Position progress re-evaluates against the new
-   candles.
-3. Keep `chart.drawing_price_basis()` in sync (`set_drawing_price_basis()` also sets it on its own).
-   The label is persisted and carried by sync and clipboard payloads. After a restore or sync, compare
-   it with the data basis and rescale when they differ.
+1. 以新基准替换系列数据（`series.set_data()`）；指标会重新计算。
+2. 调用 `chart.rescale_drawing_prices(segments, basis_label)`。每个分段为 `{from_time?, to_time?, factor}`（UTC 秒数，`[from, to)`，互不重叠，factor 取 1e-6..1e6）。时间落在某分段内的每个锚点价格都会乘以该因子（在 Tick 柱、成交量柱或区间柱图表上，锚点的时间是其所在柱的开盘时间）；Long/Short Position 的各价位使用入场锚点所在的分段，江恩扇形线或固定方格的 `scale_ratio`（每根柱的价格）随其第一个锚点所在的分段缩放。这是数据基准的变更，而非编辑：它同样适用于已锁定的绘图，会以新基准重写撤销/重做历史，并且不记录撤销步骤，因此撤销绝不会恢复旧基准的价格。重新缩放是原子的：分段无效，或因子会使任何价格超出受支持的数值范围，则不会改变任何内容。标签参数会在同一步骤中设置基准。仓位进度会针对新的 K 线重新评估。
+3. 保持 `chart.drawing_price_basis()` 同步（`set_drawing_price_basis()` 也可单独设置它）。该标签会被持久化，并随同步和剪贴板载荷携带。在恢复或同步之后，将其与数据基准比较，两者不一致时进行重新缩放。
 
-For a 前复权 ↔ 不复权 switch, the segments are the ex-date intervals with the cumulative factor of
-each interval (for example `{to_time: ex_date, factor: 0.5}` after a 2-for-1 split).
-`chart.set_drawings_points([{drawing, points}])` rewrites the anchors of many drawings atomically as
-one undo step, for host-computed edits. Price lines, alerts, markers, and trading objects stay
-host-owned; the host rewrites them itself. Trading intents emitted from the chart (bracket orders from
-Long/Short Positions, order drags) carry display-basis prices, so under a non-raw basis the host must
-convert them to raw prices before it submits them to a broker.
+对于前复权 ↔ 不复权的切换，分段即除权日区间，取每个区间的累计因子（例如 1 拆 2 的拆股之后为 `{to_time: ex_date, factor: 0.5}`）。`chart.set_drawings_points([{drawing, points}])` 会以一个撤销步骤原子地改写多个绘图的锚点，用于宿主计算出的编辑。价格线、警报、标记和交易对象仍归宿主所有；宿主自行改写它们。图表发出的交易意图（来自 Long/Short Position 的括号订单、订单拖动）携带的是显示基准价格，因此在非原始基准下，宿主必须先把它们转换为原始价格，再提交给券商。
 
-## Drawing families
+## 绘图族
 
-B8 drawing families extend the `drawing_kind` catalog. Their tools use the same placement,
-selection, handles, drags, magnet, keyboard editing, anchor time identity, history, persistence,
-clipboard, sync, and schema APIs as every other drawing. Some tools add handles on their geometry
-beyond their anchors (listed with each family); those drag, magnet-snap, and keyboard-nudge like
-anchor handles, and each drag, and each keyboard edit session, is one undo step, including any option it edits. Family-specific options live in one block
-per family under `options.tool_options`; a patch deep-merges it (absent keys keep their values,
-`null` resets a block, an invalid block rejects the whole patch with `invalid_options`). Schema
-descriptors name those options with dotted paths such as `tool_options.line.stats_position`, and
-`drawing_kind_options()` returns the resolved block. Kind defaults (for example a ray's
-`extend_right`) are the schema defaults and are omitted from persistence.
+B8 绘图族扩展了 `drawing_kind` 目录。其工具与其他所有绘图使用相同的放置、选择、手柄、拖动、磁吸、键盘编辑、锚点时间标识、历史、持久化、剪贴板、同步和 schema API。部分工具会在其几何上、锚点之外增加手柄（在各族中分别列出）；这些手柄的拖动、磁吸和键盘微移与锚点手柄相同，每次拖动以及每个键盘编辑会话都是一个撤销步骤，其中包括它所编辑的任何选项。各族专属的选项按族各占 `options.tool_options` 下的一个块；补丁会对其进行深度合并（缺失的键保留其值，`null` 会重置一个块，无效的块会以 `invalid_options` 拒绝整个补丁）。schema 描述符使用 `tool_options.line.stats_position` 这样的点分路径命名这些选项，`drawing_kind_options()` 返回解析后的块。种类默认值（例如射线的 `extend_right`）即 schema 默认值，不会写入持久化。
 
 <!-- B8: lines — begin -->
-### Lines
+### 线条
 
-- `ray`, `extended_line`, `info_line`, `trend_angle`, and `arrow_line` place two anchors. On these
-  tools `extend_left` extends beyond the first anchor and `extend_right` beyond the second, each to
-  the pane edge in the line's own direction; a ray defaults to `extend_right`, an extended line to
-  both. End caps (`stroke_start`, `stroke_end`) paint only on ends that are not extended; the arrow
-  line defaults `stroke_end` to `"arrow"`. The `text` label follows the segment like a trend
-  line's and edits in place the same way; only a trend line prompts `+ Add text` on hover.
-- Visible `labels` render as one stats box: price, price change, percent change, and ticks on one
-  line; bar count, time range, and duration on the next; screen angle and CSS-px distance last.
-  Values use the drawing scale's price formatter and the anchors' time identity. `info_line`
-  enables price change, percent change, bar count, duration, and angle by default.
-  `tool_options.line.stats_position` (`"start"`, `"middle"`, `"end"`; default `"end"`) places the
-  box beyond the first anchor, below the midpoint, or beyond the second anchor. The box is a body
-  target for selection and drags. `volume_in_range` renders nothing because drawings carry no
-  volume source.
-- `trend_angle` adds a dashed horizontal reference toward the second anchor, the arc to the
-  segment, and the screen angle in degrees (rising positive, -90 to 90).
-- `cross_line` places one anchor and paints full-span horizontal and vertical lines through it,
-  with the horizontal line's price tag on the axis. Its body drags on both axes.
-- `horizontal_segment` keeps both anchors on one price, and `vertical_ray` and `vertical_segment`
-  keep both on one bar. Placing, dragging, or supplying an anchor moves the shared coordinate on the
-  other, taken from the anchor placed or dragged last, so a supplied or imported pair that
-  disagrees is repaired the same way. The vertical ray defaults to `extend_right`, which runs it
-  from the first anchor through the second to the pane edge on the second anchor's side.
-- `price_line` places one anchor and paints a crisp line from it to the right pane edge, with the
-  anchor's price printed above the line's start and tagged on the price axis (KLineChart's price
-  line). Its body is the ray. A `text` of its own is the generic line label, placed like a
-  horizontal ray's, and does not replace the price.
-- `drawing_kind_options()` returns `{ kind: "line", stats_position }` for every Lines tool.
+- `ray`、`extended_line`、`info_line`、`trend_angle` 和 `arrow_line` 放置两个锚点。在这些工具上，`extend_left` 向第一个锚点之外延伸，`extend_right` 向第二个锚点之外延伸，均沿直线自身方向延伸至窗格边缘；射线默认为 `extend_right`，延长线默认为两者都启用。端帽（`stroke_start`、`stroke_end`）仅绘制在未延伸的端点上；箭头线将 `stroke_end` 默认为 `"arrow"`。`text` 标签像趋势线的标签一样沿线段排布，并以同样方式就地编辑；只有趋势线会在悬停时提示 `+ Add text`。
+- 可见的 `labels` 渲染为一个统计框：第一行为价格、价格变化、百分比变化和 tick 数；下一行为柱数、时间范围和持续时间；最后一行为屏幕角度和 CSS px 距离。数值使用绘图比例尺的价格格式化器和锚点的时间标识。`info_line` 默认启用价格变化、百分比变化、柱数、持续时间和角度。`tool_options.line.stats_position`（`"start"`、`"middle"`、`"end"`；默认 `"end"`）把该框放置在第一个锚点之外、中点下方或第二个锚点之外。该框是选择和拖动的主体目标。`volume_in_range` 不渲染任何内容，因为绘图不携带成交量来源。
+- `trend_angle` 会增加一条指向第二个锚点的水平虚线参考线、连接到线段的圆弧，以及以度为单位的屏幕角度（上升为正，-90 至 90）。
+- `cross_line` 放置一个锚点，并绘制穿过该锚点的全幅水平线和垂直线，水平线的价格标签显示在坐标轴上。其主体可沿两个坐标轴拖动。
+- `horizontal_segment` 使两个锚点保持在同一价格上，`vertical_ray` 和 `vertical_segment` 则使两个锚点保持在同一根柱上。放置、拖动或提供某个锚点时，会把共享坐标移动到另一个锚点上，该坐标取自最后放置或拖动的那个锚点，因此提供或导入的不一致锚点对会以同样方式被修复。垂直射线默认为 `extend_right`，使其从第一个锚点穿过第二个锚点，延伸到第二个锚点一侧的窗格边缘。
+- `price_line` 放置一个锚点，并绘制一条从该锚点到窗格右边缘的清晰线条，锚点价格印在线条起点上方，并标注在价格坐标轴上（KLineChart 的价格线）。其主体即射线。它自身的 `text` 是通用线条标签，放置方式与水平射线的相同，不会取代价格。
+- `drawing_kind_options()` 对每个线条工具返回 `{ kind: "line", stats_position }`。
 <!-- B8: lines — end -->
 <!-- B8: channels — begin -->
-### Channels
+### 通道
 
-- `parallel_channel`, `flat_top_bottom`, and `disjoint_channel` place three anchors. The first two
-  define the base line. The second line spans the same bars and lies on the line through the third
-  anchor, whichever bar that anchor sits on: the base line moved vertically on screen for the
-  parallel channel (parallel on every scale mode), a horizontal line at the third anchor's price for
-  flat top/bottom, and the base line's slope mirrored for the disjoint channel. `extend_left` and
-  `extend_right` extend both lines and the fill to the pane edge beyond the first and second
-  anchor. Placement previews the base line after the first click and the whole channel after the
-  second.
-- `price_channel` is KLineChart's price channel: the base line through the first two anchors is the
-  centre, the second line passes through the third anchor parallel to it, and the third line mirrors
-  the second on the other side of the base. It defaults to `extend_left` and `extend_right` with no
-  fill (`fill_enabled: true` shades the whole band), and has no middle line.
-- The fill between the lines is on by default (`fill_enabled`); `fill_color` defaults to the stroke
-  color at 20% alpha. Where the lines cross (flat top/bottom, disjoint channel) the fill meets at
-  the crossing. Lines are body targets; the fill is a drag surface only while the drawing is
-  selected, like the rectangle's. The `text` label follows the base line like a trend line's.
-  Channel lines ignore `stroke_start` and `stroke_end`.
-- `tool_options.channel.middle_line` paints a dashed 1 px line halfway between the two lines (default
-  on for the parallel channel, off for the others) in `middle_color` (`""` follows `color`).
-- `regression_trend` places two anchors that choose a bar range (rounded positions, inclusive); its
-  body and handles move along time only. The engine fits a least-squares line to the source series
-  over those bars — the first ordinary series added to the drawing's pane and price scale that is
-  still live (indicator outputs and custom series never qualify, footprint and feature series do
-  through their OHLC projection; reordering or hiding a series does not change the source, and
-  neither does removing and re-adding other series) — and paints it dashed (`middle_line`, `middle_color`) with lines `upper_deviation` (default 2) and
-  `lower_deviation` (default -2) residual standard deviations away (sample deviation, `n − 1`),
-  each toggled by `use_upper_deviation` and `use_lower_deviation`, the zones between them filled,
-  and Pearson's R (the signed correlation of bar position and value, four decimals) below the start
-  unless `show_pearsons` is false. `source` selects the bar value (`indicator_input_source`, default
-  `"close"`). The lines follow streaming updates of the source; replacing the latest bar or appending
-  bars costs the changed rows, not the anchored range. On an as-of (`time_alignment: "as_of"`)
-  source the fit reads each of the source's own bars in the range once, not the repeated axis
-  points. A range without source bars paints
-  the dashed anchor segment. The anchors' prices are stored but do not shape the lines, and the
-  `text` label sits in the anchors' box. Default width 1; the other channels default to 2.
-- Handles sit on the painted lines, one per anchor in anchor order (`drawing_handle_count` 3 or
-  2): the base line's two ends, the second line's midpoint for the third anchor (dragging or
-  nudging it moves the second line), and the regression line's two ends, which follow the fit
-  (while placing too). Shift-dragging a base-line end straightens the base line like a trend
-  line's.
-- A template from `drawing_template()` replaces the drawing's `tool_options.channel` when applied,
-  so options the template leaves at their defaults reset as well.
-- `drawing_kind_options()` returns `{ kind: "channel", middle_line, middle_color }` for the three
-  click-placed channels and `{ kind: "regression_trend", ... }` with every resolved regression
-  option. `tool_options.channel` stores only the fields that were set.
+- `parallel_channel`、`flat_top_bottom` 和 `disjoint_channel` 放置三个锚点。前两个锚点定义基线。第二条线跨越相同的柱，并位于经过第三个锚点的那条线上，无论该锚点位于哪根柱上：平行通道为基线在屏幕上垂直移动后的线（在每种比例尺模式下都平行），平顶/平底通道为位于第三个锚点价格处的水平线，不相交通道为基线斜率取镜像后的线。`extend_left` 和 `extend_right` 分别把两条线及填充延伸到第一个和第二个锚点之外的窗格边缘。放置时，第一次点击后预览基线，第二次点击后预览整个通道。
+- `price_channel` 是 KLineChart 的价格通道：经过前两个锚点的基线为中心线，第二条线平行于它并经过第三个锚点，第三条线则在基线另一侧与第二条线镜像对称。它默认启用 `extend_left` 和 `extend_right` 且无填充（`fill_enabled: true` 会为整个带状区域着色），并且没有中间线。
+- 线条之间的填充默认开启（`fill_enabled`）；`fill_color` 默认为描边颜色，alpha 为 20%。线条相交处（平顶/平底、不相交通道），填充在交点处汇合。线条是主体目标；填充仅在绘图被选中时才是可拖动表面，与矩形相同。`text` 标签像趋势线的标签一样沿基线排布。通道线忽略 `stroke_start` 和 `stroke_end`。
+- `tool_options.channel.middle_line` 在两条线正中间绘制一条 1 px 的虚线（平行通道默认开启，其他通道默认关闭），颜色为 `middle_color`（`""` 表示跟随 `color`）。
+- `regression_trend` 放置两个用于选定柱范围的锚点（位置取整，含两端）；其主体和手柄仅沿时间方向移动。引擎对这些柱上的源系列拟合一条最小二乘直线——源系列是添加到该绘图所在窗格和价格比例尺上、仍然有效的第一个普通系列（指标输出和自定义系列绝不符合条件，足迹图系列和 feature 系列则通过其 OHLC 投影符合条件；重新排序或隐藏系列不会改变源，移除并重新添加其他系列也不会）——并以虚线绘制该直线（`middle_line`、`middle_color`），在其上下分别绘制与之相距 `upper_deviation`（默认 2）和 `lower_deviation`（默认 -2）个残差标准差的线（样本标准差，`n − 1`），二者分别由 `use_upper_deviation` 和 `use_lower_deviation` 开关控制，两线之间的区域被填充；除非 `show_pearsons` 为 false，否则在起点下方显示 Pearson's R（柱位置与数值之间的带符号相关系数，四位小数）。`source` 选择柱的取值（`indicator_input_source`，默认 `"close"`）。这些线跟随源的流式更新；替换最新一根柱或追加柱，其开销只与发生变化的行相关，而与锚定的范围无关。在 as-of（`time_alignment: "as_of"`）源上，拟合对范围内源自身的每根柱只读取一次，而不是重复的坐标轴点。没有源柱的范围会绘制锚点之间的虚线段。锚点的价格会被存储，但不会影响这些线的形状，`text` 标签位于锚点的框内。默认宽度为 1；其他通道默认为 2。
+- 手柄位于已绘制的线条上，按锚点顺序每个锚点一个（`drawing_handle_count` 为 3 或 2）：基线的两个端点，对应第三个锚点的第二条线的中点（拖动或微移它会移动第二条线），以及回归线的两个端点，二者跟随拟合结果（放置过程中同样如此）。按住 Shift 拖动基线端点会像趋势线那样把基线拉直。
+- 来自 `drawing_template()` 的模板在应用时会替换绘图的 `tool_options.channel`，因此模板中保持默认值的选项也会被重置。
+- `drawing_kind_options()` 对三种通过点击放置的通道返回 `{ kind: "channel", middle_line, middle_color }`，并返回带有所有解析后回归选项的 `{ kind: "regression_trend", ... }`。`tool_options.channel` 仅存储已设置的字段。
 <!-- B8: channels — end -->
 <!-- B8: fibonacci — begin -->
-### Fibonacci
+### 斐波那契
 
-| Tool | Anchors | Geometry |
+| 工具 | 锚点 | 几何 |
 | --- | --- | --- |
-| `fib_retracement` | 2 | Horizontal levels between the anchors' prices: level 0 on the second anchor, 1 on the first, extensions beyond. Levels span the anchors' times. |
-| `trend_based_fib_extension` | 3 | The first leg's move projected from the third anchor (level 0 at the third anchor, 1 one full move away), spanning the first leg's width from the third anchor. |
-| `fib_channel` | 3 | Lines parallel to the first leg; level 1 passes through the third anchor. |
-| `fib_time_zone` | 2 | Full-height lines at 0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89 times the anchors' time distance from the first anchor. |
-| `trend_based_fib_time` | 3 | Full-height lines at ratio multiples of the first leg's duration from the third anchor. |
-| `fib_speed_resistance_fan` | 2 | Rays from the first anchor through the second anchor's time at each price ratio and through its price at each time ratio, to the pane edge, plus the ratio grid inside the anchors' box. |
-| `fib_speed_resistance_arcs` | 2 | Arcs around the first anchor, radius ratio × the anchors' screen distance, on the second anchor's side (full circles optional). |
-| `fib_circles` | 2 | Circles around the anchors' midpoint; level 1 passes through both anchors. |
-| `fib_spiral` | 2 | A golden spiral around the first anchor through the second, growing by φ every quarter turn, clockwise on screen. |
-| `fib_wedge` | 3 | Ratio arcs around the first anchor between the edges toward the second and third anchors; level 1 at the second anchor's distance. |
+| `fib_retracement` | 2 | 锚点价格之间的水平档位：0 档在第二个锚点上，1 档在第一个锚点上，其外为延伸档位。档位横跨锚点的时间。 |
+| `trend_based_fib_extension` | 3 | 第一段走势的幅度从第三个锚点起投影（0 档在第三个锚点上，1 档距其一整段走势幅度），宽度为第一段的宽度，自第三个锚点起算。 |
+| `fib_channel` | 3 | 与第一段平行的线；1 档经过第三个锚点。 |
+| `fib_time_zone` | 2 | 全高线条，位于距第一个锚点为锚点时间间距 0、1、2、3、5、8、13、21、34、55、89 倍的位置。 |
+| `trend_based_fib_time` | 3 | 全高线条，位于距第三个锚点为第一段持续时间的各比率倍数处。 |
+| `fib_speed_resistance_fan` | 2 | 从第一个锚点出发的射线：按每个价格比率穿过第二个锚点的时间，按每个时间比率穿过其价格，延伸至窗格边缘，另加锚点框内的比率网格。 |
+| `fib_speed_resistance_arcs` | 2 | 以第一个锚点为中心的圆弧，半径为比率 × 锚点间的屏幕距离，位于第二个锚点一侧（可选完整圆）。 |
+| `fib_circles` | 2 | 以锚点中点为圆心的圆；1 档经过两个锚点。 |
+| `fib_spiral` | 2 | 以第一个锚点为中心、经过第二个锚点的黄金螺旋线，每四分之一圈按 φ 倍增长，在屏幕上呈顺时针。 |
+| `fib_wedge` | 3 | 以第一个锚点为中心、位于指向第二个和第三个锚点的两条边之间的比率圆弧；1 档位于第二个锚点的距离处。 |
 
-- The level list is the common `levels` option: `value`, `color`, `visible`, `style`
-  (`"solid"`, `"dotted"`, `"dashed"`), `fill_between`, optional `fill_color`, and
-  `label_visible`, at most 64 levels. Retracement, extension, and channel default to
-  TradingView's visible retracement levels 0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618, 2.618,
-  3.618, 4.236 and its palette (0 and 1 gray, 0.236 red, 0.382 orange, 0.5 green, 0.618 teal,
-  0.786 cyan, 1.618 blue, 2.618 red, 3.618 purple, 4.236 pink). The other tools use the
-  conventional tables: trend-based time 0, 0.382, 0.5, 0.618, 1, 1.382, 1.618, 2, 2.382, 2.618, 3;
-  the fan 0, 0.25, 0.382, 0.5, 0.618, 0.75, 1; arcs and circles 0.236 through 4.236; the wedge
-  0.236 through 1. Values from the retracement table keep its colors; other values take the
-  palette in list order. The spiral has no levels.
-- Visible levels sort by value. `fill_enabled` is the background switch (on by default except
-  for time zones and the spiral); the band between two neighbouring levels takes the upper
-  level's `fill_color`, or its color at 20% opacity, when that level's `fill_between` is on. Bands
-  select and drag the drawing only while it is selected; level lines, the trend line, and labels
-  always do.
-- The drawing's own `color`, `width`, and `style` (default `#787b86`, 1 px, dashed) are the
-  trend line through the anchors, the fan's grid, and the wedge's edges (solid); the spiral is
-  drawn in them. Level lines use each level's color and style at the drawing's width.
-- `extend_left` and `extend_right` extend the retracement's, extension's, and channel's levels to
-  the pane's left and right edges.
-- Level labels show the value and, for the retracement and extension, the price through the
-  drawing scale's formatter, for example `0.618 (102.53)`, in the level's color.
-- `tool_options.fibonacci` (`fibonacci_tool_options`): `reverse` (swap the ends levels 0 and 1
-  sit at; time zones project backward; the spiral turns counterclockwise), `show_levels`,
-  `show_prices`, `levels_as_percent` (`61.8%`), `log_scale` (price levels interpolate in log
-  space), `trend_line`, `grid` (fan), `full_circles` (arcs), `label_h_align` and `label_v_align`
-  (price levels default to `"left"`/`"middle"`: beyond the left end, centered on the line; time
-  levels to `"right"`/`"bottom"`). Each tool's schema lists only the fields it reads, with its
-  resolved defaults. `drawing_kind_options()` returns `{ kind: "fibonacci", ... }` with every field
-  resolved.
-- Culling follows the painted levels: price and time levels beyond the anchors keep a drawing
-  visible and hittable while its anchors are scrolled away. The fan, arcs, circles, spiral, and
-  wedge depend on the screen distance between their anchors, so they are culled by the pane only.
+- 档位列表是通用的 `levels` 选项：`value`、`color`、`visible`、`style`（`"solid"`、`"dotted"`、`"dashed"`）、`fill_between`、可选的 `fill_color` 以及 `label_visible`，至多 64 个档位。回撤、延伸和通道默认使用 TradingView 可见的回撤档位 0、0.236、0.382、0.5、0.618、0.786、1、1.618、2.618、3.618、4.236 及其调色板（0 和 1 为灰色，0.236 为红色，0.382 为橙色，0.5 为绿色，0.618 为青绿色，0.786 为青色，1.618 为蓝色，2.618 为红色，3.618 为紫色，4.236 为粉色）。其他工具使用惯例表：基于趋势的时间为 0、0.382、0.5、0.618、1、1.382、1.618、2、2.382、2.618、3；扇形线为 0、0.25、0.382、0.5、0.618、0.75、1；圆弧和圆为 0.236 至 4.236；楔形为 0.236 至 1。取自回撤表的值保留其颜色；其他值按列表顺序取用调色板。螺旋线没有档位。
+- 可见档位按值排序。`fill_enabled` 是背景开关（除时间区和螺旋线外默认开启）；当上方档位的 `fill_between` 开启时，两个相邻档位之间的带取上方档位的 `fill_color`，或其颜色的 20% 不透明度。带仅在绘图处于选中状态时才能选中并拖动该绘图；档位线、趋势线和标签则始终可以。
+- 绘图自身的 `color`、`width` 和 `style`（默认 `#787b86`、1 px、虚线）用于穿过锚点的趋势线、扇形线的网格以及楔形的边（实线）；螺旋线也用它们绘制。档位线使用各档位自己的颜色和样式，宽度取绘图的宽度。
+- `extend_left` 和 `extend_right` 把回撤、延伸和通道的档位延伸到窗格的左右边缘。
+- 档位标签显示值，对于回撤和延伸还显示经绘图比例尺格式化器格式化后的价格，例如 `0.618 (102.53)`，颜色与该档位相同。
+- `tool_options.fibonacci`（`fibonacci_tool_options`）：`reverse`（交换 0 档和 1 档所在的两端；时间区向后投影；螺旋线逆时针旋转）、`show_levels`、`show_prices`、`levels_as_percent`（`61.8%`）、`log_scale`（价格档位在对数空间中插值）、`trend_line`、`grid`（扇形线）、`full_circles`（圆弧）、`label_h_align` 和 `label_v_align`（价格档位默认为 `"left"`/`"middle"`：位于左端之外、在线上居中；时间档位默认为 `"right"`/`"bottom"`）。每个工具的 schema 只列出它读取的字段及其解析后的默认值。`drawing_kind_options()` 返回 `{ kind: "fibonacci", ... }`，其中每个字段均已解析。
+- 剔除遵循已绘制的档位：当锚点被滚动到视口之外时，位于锚点之外的价格档位和时间档位仍使绘图保持可见且可命中。扇形线、圆弧、圆、螺旋线和楔形取决于其锚点之间的屏幕距离，因此仅按窗格进行剔除。
 <!-- B8: fibonacci — end -->
 <!-- B8: pitchforks_gann — begin -->
-### Pitchforks and Gann
+### 叉形线与江恩
 
-- `andrews_pitchfork`, `schiff_pitchfork`, `modified_schiff_pitchfork`, and `inside_pitchfork`
-  place three anchors: the pivot, then the two ends of the handle. The median starts at the pivot
-  (Schiff: at the pivot's time, halfway between the first two anchors' prices; modified Schiff and
-  inside: at the midpoint of the first two anchors). It runs through the handle's midpoint, or for
-  the inside pitchfork through the third anchor, whose tines pass through the second anchor and
-  its reflection about the third. Between clicks a guide joins the placed anchors and the pointer.
-  Besides one handle per anchor, the pitchforks and the pitchfan have a fourth handle on the
-  midpoint between the second and third anchors, which moves both together
-  (`drawing_handle_count` 4).
-- A pitchfork's `levels` are median offsets in half-handle widths: level `v` is a tine on each
-  side of the median, and level 1 passes through the handle's ends. Defaults: 0.25, 0.382, 0.5,
-  0.618, 0.75, 1, 1.5, 1.75, and 2, with 0.5 and 1 visible; `fill_between` zones filled at 20% of
-  the level color (`fill_enabled`); level labels off; median `color` `#f23645`; width 1.
-  Unextended lines reach one median length past the handle; `extend_left` and `extend_right` run
-  every line to the pane edge. The shifted-pivot variants add a dashed guide between the first two
-  anchors. Like a rectangle's interior, the zone fills of every tool in this family (pitchfork and
-  fan zones, Gann box zones, square arcs) are drag targets only while the drawing is selected.
-- `pitchfan` places three anchors and draws the same levels as rays from the first anchor through
-  the level points on the handle between the other two.
-- `gann_box` places two corners. Its `levels` are horizontal price levels and
-  `tool_options.gann.time_levels` vertical time levels, both as fractions of the box from the first
-  corner (defaults 0, 0.25, 0.382, 0.5, 0.618, 0.75, and 1, filled and labeled on all four sides).
-  `show_angles` adds the `angles` fan from the pivot corner. It has eight bounds handles, and
-  Shift squares it on screen.
-- `gann_square` places two corners and draws the `levels` grid (default fifths of each side), the
-  `angles` fan (1×8 through 8×1, the 1×1 on the diagonal), quarter `arcs` around the pivot corner
-  (fifths of the side, filled), and a box with the price range, bar count, and price per bar. Like
-  the box, it has eight bounds handles and Shift squares it on screen.
-  `gann_square_fixed` places one anchor: the square is `size_bars` wide and `size_bars ×
-  scale_ratio` tall in price, or square on screen without a ratio. Its second handle, the far
-  corner, resizes it: the corner's bar sets `size_bars` in whole bars (at least 1), dragging it
-  below the anchor sets `reverse`, and with a `scale_ratio` the corner's price sets the ratio
-  (Shift keeps it); without one the square stays square on screen and follows the corner's larger
-  distance from the anchor. A keyboard nudge of the corner moves the side at least one whole bar
-  the way the arrow points (without a ratio, sized by the arrow's axis), so repeated presses keep
-  resizing however wide a bar is.
-- `gann_fan` places two anchors. Its `levels` are multiples of the 1×1 slope (defaults 1/8, 1/4,
-  1/3, 1/2, 1, 2, 3, 4, and 8, labeled `8x1` through `1x8`, zones filled). The 1×1 passes through
-  the second anchor, or with `scale_ratio` rises that many price units per bar. Lines are rays by
-  default (`extend_right`); unextended, they stop at the anchors' box. Shift straightens the
-  second anchor to 45°.
-- `tool_options.gann` (absent fields keep their defaults):
+- `andrews_pitchfork`、`schiff_pitchfork`、`modified_schiff_pitchfork` 与 `inside_pitchfork` 放置三个锚点：枢轴点，然后是叉柄的两端。中线从枢轴点出发（Schiff：位于枢轴点的时间，价格取前两个锚点价格的中间；modified Schiff 与 inside：位于前两个锚点的中点）。它穿过叉柄的中点；对 inside 叉形线则穿过第三个锚点，其叉齿穿过第二个锚点及其关于第三个锚点的反射点。点击之间，一条引导线连接已放置的锚点与指针。除每个锚点各有一个手柄外，叉形线与叉形扇在第二与第三个锚点之间的中点还有第四个手柄，它同时移动这两个锚点（`drawing_handle_count` 4）。
+- 叉形线的 `levels` 是以半叉柄宽度为单位的中线偏移：层级 `v` 是中线每一侧的一条叉齿，层级 1 穿过叉柄的两端。默认值：0.25、0.382、0.5、0.618、0.75、1、1.5、1.75 与 2，其中 0.5 与 1 可见；`fill_between` 区域按层级颜色的 20% 填充（`fill_enabled`）；层级标签关闭；中线 `color` 为 `#f23645`；宽度 1。未延伸的线越过叉柄延伸一个中线长度；`extend_left` 与 `extend_right` 使每条线延伸到窗格边缘。枢轴偏移变体在前两个锚点之间增加一条虚线引导线。与矩形内部一样，本族中每个工具的区域填充（叉形线与扇形区域、江恩框区域、方图弧线）仅在绘图被选中时才是拖动目标。
+- `pitchfan` 放置三个锚点，绘制相同的层级，表现为从第一个锚点出发、穿过另外两个锚点之间叉柄上各层级点的射线。
+- `gann_box` 放置两个角点。其 `levels` 是水平价格层级，`tool_options.gann.time_levels` 是垂直时间层级，二者均表示为相对于从第一个角点起算的框的分数（默认 0、0.25、0.382、0.5、0.618、0.75 与 1，四条边上均填充并标注）。`show_angles` 添加从枢轴角点出发的 `angles` 扇形。它有八个边界手柄，Shift 使其在屏幕上成为正方形。
+- `gann_square` 放置两个角点，并绘制 `levels` 网格（默认为每边的五等分）、`angles` 扇形（1×8 到 8×1，1×1 位于对角线上）、围绕枢轴角点的四分之一 `arcs` 弧线（边长的五等分，已填充），以及一个显示价格范围、柱数与每柱价格的框。与江恩框一样，它有八个边界手柄，Shift 使其在屏幕上成为正方形。`gann_square_fixed` 放置一个锚点：方形宽 `size_bars`、价格方向高 `size_bars × scale_ratio`，没有比例时则在屏幕上为正方形。它的第二个手柄，即远端角点，用于调整其大小：角点所在的柱以整柱数设置 `size_bars`（至少为 1），将其拖到锚点下方会设置 `reverse`，有 `scale_ratio` 时角点的价格设置该比例（Shift 保持比例不变）；没有比例时，方形在屏幕上保持正方形，并跟随角点到锚点的较大距离。用键盘微调该角点时，边沿箭头所指方向至少移动一整柱（没有比例时，按箭头所在的轴确定大小），因此无论一根柱有多宽，反复按键都会持续调整大小。
+- `gann_fan` 放置两个锚点。其 `levels` 是 1×1 斜率的倍数（默认 1/8、1/4、1/3、1/2、1、2、3、4 与 8，标注为 `8x1` 到 `1x8`，区域已填充）。1×1 线穿过第二个锚点，或在设置 `scale_ratio` 时每柱上升相应数量的价格单位。线默认为射线（`extend_right`）；未延伸时，它们止于锚点所围的框。Shift 将第二个锚点校正为 45°。
+- `tool_options.gann`（缺省字段保持其默认值）：
 
-  | Field | Tools | Default |
+  | 字段 | 工具 | 默认值 |
   | --- | --- | --- |
-  | `time_levels` | Gann box | 0 … 1 as above |
-  | `angles` | Gann box (with `show_angles`), squares | 1/8 … 8, positive values |
-  | `arcs` | squares | 0.2, 0.4, 0.6, 0.8, 1, positive values |
-  | `reverse` | Gann box, squares | `false`; `true` measures from the second anchor's price (the box also counts time from it) and grows the fixed square down |
-  | `show_angles` | Gann box | `false` |
-  | `show_stats` | squares | `true` |
-  | `scale_ratio` | Gann fan, fixed square | `null`: price per bar of the 1×1, positive |
-  | `size_bars` | fixed square | 20, from 1 to 100000 |
+  | `time_levels` | 江恩框 | 如上，0 … 1 |
+  | `angles` | 江恩框（配合 `show_angles`）、江恩方图 | 1/8 … 8，正值 |
+  | `arcs` | 江恩方图 | 0.2、0.4、0.6、0.8、1，正值 |
+  | `reverse` | 江恩框、江恩方图 | `false`；`true` 从第二个锚点的价格起量（江恩框也从它起计时间），并使固定方形向下增长 |
+  | `show_angles` | 江恩框 | `false` |
+  | `show_stats` | 江恩方图 | `true` |
+  | `scale_ratio` | 江恩扇形、固定方形 | `null`：1×1 的每柱价格，正值 |
+  | `size_bars` | 固定方形 | 20，范围 1 到 100000 |
 
-  Each tool's schema lists only the fields it uses. `drawing_kind_options()` returns
-  `{ kind: "pitchfork", levels }` for the pitchforks and the pitchfan, and `{ kind: "gann", levels,
-  time_levels, angles, arcs, reverse, show_angles, show_stats, scale_ratio, size_bars }` for the
-  Gann tools.
+  每个工具的 schema 仅列出它使用的字段。`drawing_kind_options()` 为叉形线与叉形扇返回 `{ kind: "pitchfork", levels }`，为江恩工具返回 `{ kind: "gann", levels, time_levels, angles, arcs, reverse, show_angles, show_stats, scale_ratio, size_bars }`。
 <!-- B8: pitchforks_gann — end -->
 <!-- B8: projection_annotations — begin -->
-### Projection and annotations
+### 投影与标注
 
-Defaults follow the conventional professional-platform look: the drawing `color` (the canonical
-primary unless noted) paints markers, leaders, and box backgrounds; box text is `text_color` or
-black/white contrast against the box; `box_border_color` frames annotation boxes; text uses the
-chart font size unless `text_size` is set. Every tool owns its `text` (it does not follow the
-3×3 box label of other tools) and renders any visible `labels` as engine-formatted stats. Eight of
-the tools paint no text: their `text` is accepted and kept, never shown or edited in place.
+默认值遵循专业平台的常规外观：绘图的 `color`（除非另有说明，即规范主色）绘制标记、引线与框背景；框内文字为 `text_color`，或与框形成黑/白对比；`box_border_color` 为标注框描边；文字使用图表字号，除非设置了 `text_size`。每个工具各自拥有其 `text`（它不遵循其他工具的 3×3 框标签），并将任何可见的 `labels` 渲染为引擎格式化的统计信息。其中八个工具不绘制文字：其 `text` 会被接受并保留，但从不显示，也不能就地编辑。
 
-- `forecast` (source, target): a segment with end caps from `stroke_start`/`stroke_end`, a source
-  dot and a source-price box on the far side, and a target box with the change and percent, the
-  target time, and the outcome. The outcome comes from the drawing's source series (the regression
-  trend's rule: the first live ordinary series added to its pane and price scale) and follows its
-  streaming updates: `Success` (market-up box) once a bar after the source bar reaches the target
-  price (a high for a rising target, a low for a falling one) by the target bar (an as-of source's
-  own bars, including those that collapse between two axis points; a point that repeats the source
-  bar is not a later bar), `Failure`
-  (market-down box) once a traded bar after the target bar exists without that (a target on the
-  latest, possibly still-forming bar stays pending, and whitespace rows such as future session
-  slots are not bars), and no outcome (the drawing color) while pending.
-- `bars_pattern` (two anchors): when placed with the armed tool (which previews the copy in place)
-  or created by `add_drawing` without `bars`, it copies the bars between its anchors' bar indexes
-  (at most 128; a longer range aggregates into 128 OHLC buckets) into
-  `tool_options.projection_annotation.bars` and pins its anchors on the copy's box — the first
-  copied bar at the copy's highest value and the last at its lowest — so the ghost starts exactly
-  over its source. The ghost always fills the box between its anchors: moving it moves the copy,
-  and the anchors stretch it in time and scale it in proportion to the copy's full range (a price
-  basis rescale scales it exactly). `bars_mode` is `"hl_bars"` (default), `"oc_bars"`,
-  `"line_open"`, `"line_high"`, `"line_low"`, or `"line_close"`; `mirrored` reverses the copy in
-  time and `flipped` turns it upside down within the box. Paste, sync, and persistence carry the
-  copied bars; a named template keeps only the style, so applying one never replaces a pattern's
-  copy and the armed tool always copies its own range. On an as-of source it copies the source's
-  own bars, each once. A pattern created before any data has no
-  copy and paints a dashed box.
-- `price_range`, `date_range`, `date_and_price_range` (two anchors): a fill between the anchors
-  (`fill_enabled` defaults on; `fill_color` or the drawing color at 20%), the edge lines of the
-  measured axis, arrowed measures through the middle toward the second anchor (`stroke_end`
-  defaults to `"arrow"`), and a stats box beyond the measured end (below a date range). Default
-  `labels`: price change, percent change, and ticks; bar count and duration; or all five. Anchors
-  snap to whole bars and price ticks (also while dragging, nudging with the keyboard, or moving the
-  body); ticks count on the instrument tick or price-band ladder, falling back to the scale's
-  `min_move`. `"date_price_range"`, the spelling of earlier builds, is read as
-  `"date_and_price_range"` and never written. The Shift-click quick measure draws a transient
-  date-and-price range.
-- `projection` (apex, radius point, price point): the circular sector around the apex from
-  the ray through the radius point to the ray through the price point (the shorter turn), filled
-  (`fill_enabled` defaults on) and outlined. Visible `labels` measure from the apex to the price
-  point. While placing, the first click shows the apex as a handle with a provisional line to the
-  pointer; after the second click the sector previews through the pointer, and the third click
-  commits it.
-- `anchored_text` (one anchor): text pinned to a pane position. Its anchor is a pane fraction —
-  `logical` is x / pane width and `price` is y / pane height from the pane top — so it stays put
-  while the chart scrolls, zooms, rescales, or changes interval. Its anchors carry no `time`
-  (`time` inputs are ignored and a time-only anchor is rejected), fractions clamp into `0..=1`
-  (in `add_drawing`, `set_points`, paste, sync, and drags, so it always stays reachable) while an
-  `import_state` document with a fraction outside `0..=1` is `invalid_data`, and magnets and paste
-  offsets and group moves do not apply. Default text `"Text"`, aligned left/top on the
-  anchor; `box_color`/`box_border_color` box it like the text tool.
-- `note` (one anchor): a pin whose tip is the anchor, with the text (default `"Note"`) in a box
-  beside the head. The box shows while the note is hovered, selected, or being edited;
-  `tool_options.projection_annotation.always_show_text` (default `false`) keeps it visible.
-- `price_note` (two anchors): a leader from the priced point to a box with its price (and any
-  text) at the second anchor.
-- `callout` (tip, box): a text box (default `"Callout"`) placed on the second anchor by
-  `text_h_align`/`text_v_align` (default centered), with a pointer to the first anchor.
-- `comment` and `price_label` (one anchor): a speech bubble whose tail tip is the anchor; the
-  comment shows its text (default `"Comment"`), the price label the anchor's price and any text.
-- `signpost` (one anchor): a pole from the anchor up to a text plate (default `"Signpost"`).
-- `flag_mark` (one anchor): a flag standing on the anchor.
-- `arrow_mark_up`, `arrow_mark_down`, `arrow_mark_left`, `arrow_mark_right` (one anchor): a block
-  arrow whose tip is the anchor, with any text past its tail in `text_color` or the arrow color.
-  Up defaults to the market-up color and down to the market-down color.
-- `simple_tag` (one anchor): KLineChart's simple tag: a dashed line across the whole pane at the
-  anchor's price, tagged on the price axis. The tag shows the drawing's `text` when it has any
-  and the price otherwise; the text is not painted on the chart, so it has no inline editor (set
-  it through `text` in the options).
-- `simple_annotation` (one anchor): KLineChart's simple annotation: a dashed stem rising from the
-  anchor to a small head, with the `text` in a box above the head (it starts empty). Placing it
-  opens the editor.
-- `icon` (one anchor): `tool_options.projection_annotation.icon` — `"star"` (default), `"heart"`,
-  `"check"`, `"cross"`, `"circle"`, `"square"`, `"diamond"`, `"triangle_up"`, or
-  `"triangle_down"` — centered on the anchor, `icon_size` CSS px across (8..128, default 24), in
-  the drawing color.
-- Kind defaults (fills, arrows, stats, default texts, arrow colors) are schema defaults and are
-  omitted from persistence; a cleared default text persists as `""`.
-- The text of `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
-  `signpost`, `simple_annotation`, and the arrow marks edits in place (see inline text editing
-  above); the price note and price label keep their price line above it. An emptied box keeps one
-  caret line while it is edited. Placing `anchored_text`, `note`, `callout`, `comment`, `signpost`,
-  or `simple_annotation` opens the editor (on the default text, where the tool has one); placing
-  `price_note`, `price_label`, or an arrow mark does not.
-- `drawing_kind_options()` returns `{ kind: "projection_annotation", bars_mode, mirrored, flipped,
-  pattern_bars, icon, icon_size, always_show_text }` for every tool of the family.
+- `forecast`（源点、目标点）：一条线段，端帽取自 `stroke_start`/`stroke_end`，在远侧有一个源点圆点和一个源价格框，另有一个目标框，显示变化量与百分比、目标时间和结果。结果取自该绘图的源系列（与回归趋势的规则相同：添加到其窗格与价格比例尺上的第一个有效的普通系列），并跟随其流式更新：当源柱之后的某根柱不晚于目标柱到达目标价格（上升目标取最高价，下降目标取最低价）时，结果为 `Success`（上涨色框）——此处的柱指 as-of 源自身的柱，包括在两个坐标轴点之间折叠的柱；重复源柱的点不是后续柱；当目标柱之后已存在已成交的柱而仍未满足上述条件时，结果为 `Failure`（下跌色框）（位于最新的、可能仍在形成中的柱上的目标保持待定，空白数据行（例如未来的交易时段槽位）不是柱）；待定期间没有结果（使用绘图颜色）。
+- `bars_pattern`（两个锚点）：用已激活的工具放置时（该工具会就地预览副本），或由不带 `bars` 的 `add_drawing` 创建时，它会把其锚点柱索引之间的柱（至多 128 根；更长的范围聚合为 128 个 OHLC 桶）复制到 `tool_options.projection_annotation.bars`，并把其锚点固定在副本的框上——第一根被复制的柱位于副本的最高值，最后一根位于最低值——使幽灵图形恰好从其源的位置开始。幽灵图形始终填满其锚点之间的框：移动它会移动副本，锚点则在时间上拉伸它，并按副本完整范围的比例缩放它（价格基准重新缩放会精确地缩放它）。`bars_mode` 为 `"hl_bars"`（默认）、`"oc_bars"`、`"line_open"`、`"line_high"`、`"line_low"` 或 `"line_close"`；`mirrored` 在时间上反转副本，`flipped` 使其在框内上下翻转。粘贴、同步与持久化都会携带被复制的柱；命名模板只保留样式，因此应用模板绝不会替换形态的副本，已激活的工具始终复制其自身的范围。对于 as-of 源，它复制该源自身的柱，每根一次。在任何数据存在之前创建的形态没有副本，绘制一个虚线框。
+- `price_range`、`date_range`、`date_and_price_range`（两个锚点）：锚点之间的填充（`fill_enabled` 默认开启；`fill_color`，或绘图颜色的 20%），被测量坐标轴的边缘线，穿过中部、指向第二个锚点的带箭头测量线（`stroke_end` 默认为 `"arrow"`），以及位于被测量一端之外的统计框（日期范围则在其下方）。默认 `labels`：价格变化、百分比变化与 tick 数；柱数与持续时间；或全部五项。锚点吸附到整柱与价格 tick（拖动、键盘微调或移动主体时同样如此）；tick 按品种 tick 或价格带阶梯计数，回退到比例尺的 `min_move`。`"date_price_range"`，即早期构建的写法，会被读作 `"date_and_price_range"`，且从不写出。Shift 点击的快速测量会绘制一个临时的日期与价格范围。
+- `projection`（顶点、半径点、价格点）：以顶点为中心的圆形扇区，从穿过半径点的射线到穿过价格点的射线（取较短的转向），已填充（`fill_enabled` 默认开启）并描边。可见的 `labels` 度量从顶点到价格点。放置时，第一次点击将顶点显示为一个手柄，并带一条指向指针的临时线；第二次点击后，扇区通过指针预览，第三次点击提交它。
+- `anchored_text`（一个锚点）：固定在窗格位置上的文字。其锚点是窗格分数——`logical` 为 x / 窗格宽度，`price` 为从窗格顶部起的 y / 窗格高度——因此在图表滚动、缩放、重新缩放或切换周期时它保持不动。其锚点不带 `time`（`time` 输入被忽略，仅含时间的锚点被拒绝），分数被钳制到 `0..=1`（在 `add_drawing`、`set_points`、粘贴、同步与拖动中，因此它始终可触及），而含有 `0..=1` 之外分数的 `import_state` 文档则为 `invalid_data`，并且磁吸、粘贴偏移与成组移动均不适用。默认文字为 `"Text"`，在锚点处按左/上对齐；`box_color`/`box_border_color` 如同文字工具一样为其加框。
+- `note`（一个锚点）：一枚图钉，其尖端即锚点，文字（默认 `"Note"`）显示在钉头旁的框中。该框在备注被悬停、被选中或正在编辑时显示；`tool_options.projection_annotation.always_show_text`（默认 `false`）使其保持可见。
+- `price_note`（两个锚点）：一条从定价点引向第二个锚点处的框的引线，框内显示其价格（以及任何文字）。
+- `callout`（尖端、框）：一个文本框（默认 `"Callout"`），按 `text_h_align`/`text_v_align`（默认居中）放置在第二个锚点上，带有指向第一个锚点的指针。
+- `comment` 与 `price_label`（一个锚点）：一个对话气泡，其尾部尖端即锚点；评论显示其文字（默认 `"Comment"`），价格标签显示锚点的价格及任何文字。
+- `signpost`（一个锚点）：一根从锚点向上伸出的杆，顶端是文字牌（默认 `"Signpost"`）。
+- `flag_mark`（一个锚点）：一面立在锚点上的旗帜。
+- `arrow_mark_up`、`arrow_mark_down`、`arrow_mark_left`、`arrow_mark_right`（一个锚点）：一个块状箭头，其尖端即锚点，任何文字位于箭尾之后，使用 `text_color` 或箭头颜色。向上默认为上涨色，向下默认为下跌色。
+- `simple_tag`（一个锚点）：KLineChart 的 simple tag：一条在锚点价格处横贯整个窗格的虚线，并在价格轴上加标签。绘图有 `text` 时标签显示该文字，否则显示价格；文字不绘制在图表上，因此没有就地编辑器（通过选项中的 `text` 设置）。
+- `simple_annotation`（一个锚点）：KLineChart 的 simple annotation：一根虚线杆从锚点升起至一个小头部，`text` 位于头部上方的框中（初始为空）。放置它会打开编辑器。
+- `icon`（一个锚点）：`tool_options.projection_annotation.icon`——`"star"`（默认）、`"heart"`、`"check"`、`"cross"`、`"circle"`、`"square"`、`"diamond"`、`"triangle_up"` 或 `"triangle_down"`——以锚点为中心，`icon_size` 为宽度（单位 CSS px，8..128，默认 24），使用绘图颜色。
+- 各类默认值（填充、箭头、统计、默认文字、箭头颜色）是 schema 默认值，持久化时省略；被清空的默认文字持久化为 `""`。
+- `anchored_text`、`note`、`price_note`、`callout`、`comment`、`price_label`、`signpost`、`simple_annotation` 与箭头标记的文字可就地编辑（参见上文的就地文字编辑）；价格备注与价格标签将其价格行保留在文字上方。被清空的框在编辑期间保留一个插入符行。放置 `anchored_text`、`note`、`callout`、`comment`、`signpost` 或 `simple_annotation` 会打开编辑器（在工具带有默认文字时，对默认文字进行编辑）；放置 `price_note`、`price_label` 或箭头标记则不会。
+- `drawing_kind_options()` 为本族的每个工具返回 `{ kind: "projection_annotation", bars_mode, mirrored, flipped, pattern_bars, icon, icon_size, always_show_text }`。
 <!-- B8: projection_annotations — end -->
 <!-- B8: patterns_elliott_cycles — begin -->
-### Patterns, Elliott waves, and cycles
+### 形态、艾略特波浪与周期
 
-Every tool places a fixed number of anchors by clicking, previews the legs placed so far while it is
-being placed, and exposes one handle per anchor. Defaults follow TradingView's: colors per tool,
-width 2 (1 for cyclic lines), and region fills at 15% of the drawing color when `fill_color` is
-empty. Point and ratio labels use the drawing's text size, weight, and italic (`text_color`
-overrides their contrasting default); they are body targets.
+每个工具通过点击放置固定数量的锚点，在放置过程中预览已放置的各段，并为每个锚点提供一个手柄。默认值遵循 TradingView：各工具各有颜色，宽度为 2（循环线为 1），且在 `fill_color` 为空时，区域填充为绘图颜色的 15%。点标签与比例标签使用绘图的字号、字重与斜体（`text_color` 会覆盖其对比色默认值）；它们是主体目标。
 
-| Tool | Anchors | Default color | Paints |
+| 工具 | 锚点 | 默认颜色 | 绘制内容 |
 | --- | --- | --- | --- |
-| `xabcd_pattern` | X, A, B, C, D | `#2962FF` | Legs, shaded XAB and BCD, ratios AB/XA, BC/AB, CD/BC, AD/XA |
-| `cypher_pattern` | X, A, B, C, D | `#2962FF` | Legs, shaded XAB and BCD, ratios AB/XA, XC/XA, CD/XC |
-| `abcd_pattern` | A, B, C, D | `#089981` | Legs, ratios BC/AB and CD/BC |
-| `head_and_shoulders` | base, left shoulder, neck, head, neck, right shoulder, base | `#089981` | Legs, neckline between the outer legs, shaded shoulders and head, part labels |
-| `triangle_pattern` | A, B, C, D (alternating highs and lows) | `#673AB7` | Legs, A–C and B–D sides extended to their apex when it lies ahead within one pattern width, shaded triangle |
-| `three_drives_pattern` | start, drive 1, retracement, drive 2, retracement, drive 3, end | `#673AB7` | Legs, drives labeled 1–3, each leg's ratio to the leg before it |
-| `elliott_impulse_wave` | 0, 1, 2, 3, 4, 5 | `#3D85C6` | Waves labeled 1–5 |
-| `elliott_correction_wave` | 0, A, B, C | `#3D85C6` | Waves labeled A–C |
-| `elliott_triangle_wave` | 0, A, B, C, D, E | `#FF9800` | Waves labeled A–E |
-| `elliott_double_combo` | 0, W, X, Y | `#6AA84F` | Waves labeled W, X, Y |
-| `elliott_triple_combo` | 0, W, X, Y, X, Z | `#6AA84F` | Waves labeled W, X, Y, X, Z |
-| `cyclic_lines` | cycle start, cycle end | `#80CCDB` | Dashed connector and full-height vertical lines every interval from the earlier anchor to the right edge |
-| `time_cycles` | cycle start (base), cycle end (sets the arch height) | `#159980` | Half-ellipse arches of the anchors' width and height, repeated both ways, shaded |
-| `sine_line` | a peak or trough, the next opposite extreme | `#159980` | A sine through both anchors across the pane |
+| `xabcd_pattern` | X, A, B, C, D | `#2962FF` | 各段、带阴影的 XAB 与 BCD、比例 AB/XA、BC/AB、CD/BC、AD/XA |
+| `cypher_pattern` | X, A, B, C, D | `#2962FF` | 各段、带阴影的 XAB 与 BCD、比例 AB/XA、XC/XA、CD/XC |
+| `abcd_pattern` | A, B, C, D | `#089981` | 各段、比例 BC/AB 与 CD/BC |
+| `head_and_shoulders` | 基点、左肩、颈点、头部、颈点、右肩、基点 | `#089981` | 各段、位于外侧两段之间的颈线、带阴影的双肩与头部、各部位标签 |
+| `triangle_pattern` | A、B、C、D（高点与低点交替） | `#673AB7` | 各段、A–C 与 B–D 两边（当其顶点位于前方且在一个形态宽度之内时延伸至顶点）、带阴影的三角形 |
+| `three_drives_pattern` | 起点、驱动 1、回撤、驱动 2、回撤、驱动 3、终点 | `#673AB7` | 各段、标注为 1–3 的驱动段、每段相对于其前一段的比例 |
+| `elliott_impulse_wave` | 0, 1, 2, 3, 4, 5 | `#3D85C6` | 各浪标注为 1–5 |
+| `elliott_correction_wave` | 0, A, B, C | `#3D85C6` | 各浪标注为 A–C |
+| `elliott_triangle_wave` | 0, A, B, C, D, E | `#FF9800` | 各浪标注为 A–E |
+| `elliott_double_combo` | 0, W, X, Y | `#6AA84F` | 各浪标注为 W、X、Y |
+| `elliott_triple_combo` | 0, W, X, Y, X, Z | `#6AA84F` | 各浪标注为 W、X、Y、X、Z |
+| `cyclic_lines` | 周期起点、周期终点 | `#80CCDB` | 虚线连接线，以及从较早的锚点起至右边缘、每隔一个间隔绘制一条的全高垂直线 |
+| `time_cycles` | 周期起点（底边）、周期终点（决定拱高） | `#159980` | 宽度与高度同锚点的半椭圆拱，向两侧重复，带阴影 |
+| `sine_line` | 一个波峰或波谷、下一个相反的极值 | `#159980` | 穿过两个锚点并贯穿窗格的正弦曲线 |
 
-- Ratios are price ratios printed with three decimals on dashed connectors;
-  `tool_options.pattern.show_ratios: false` hides connectors and ratios.
-- `tool_options.pattern.degree` selects the Elliott wave degree: `"supermillennium"`,
-  `"millennium"`, `"submillennium"`, `"grand_supercycle"`, `"supercycle"`, `"cycle"`,
-  `"primary"`, `"intermediate"` (default), `"minor"`, `"minute"`, `"minuette"`, or
-  `"subminuette"`. Wave 3 and wave C read `{III}`/`{c}`, `[III]`/`[c]`, `<III>`/`<c>`, ringed
-  `III`/`c`, `(III)`/`(c)`, `III`/`c`, ringed `3`/`C`, `(3)`/`(C)`, `3`/`C`, ringed `iii`/`c`,
-  `(iii)`/`(c)`, and `iii`/`c` in that order. `tool_options.pattern.show_wave: false` leaves only
-  the labels.
-- Cycle repeats closer than 3 CSS px collapse to the defining cycle.
-- `fill_enabled` and `fill_color` shade XABCD, cypher, head and shoulders, triangle pattern, and
-  time cycles; region fills are a body target only while the drawing is selected. `extend_left`,
-  `extend_right`, `stroke_start`, and `stroke_end` do not apply to these tools, and fill does not
-  apply to the other tools. The `text` label is placed against the anchors' box.
-- `drawing_kind_options()` returns `{ kind: "pattern", show_ratios }` for XABCD, cypher, ABCD, and
-  three drives, `{ kind: "elliott_wave", degree, show_wave }` for the Elliott tools, and
-  `{ kind: "generic" }` for head and shoulders, the triangle pattern, and the cycle tools.
+- 比例为价格比例，以三位小数印在虚线连接线上；`tool_options.pattern.show_ratios: false` 隐藏连接线与比例。
+- `tool_options.pattern.degree` 选择艾略特波浪级别：`"supermillennium"`、`"millennium"`、`"submillennium"`、`"grand_supercycle"`、`"supercycle"`、`"cycle"`、`"primary"`、`"intermediate"`（默认）、`"minor"`、`"minute"`、`"minuette"` 或 `"subminuette"`。第 3 浪与 C 浪依次显示为 `{III}`/`{c}`、`[III]`/`[c]`、`<III>`/`<c>`、带圈的 `III`/`c`、`(III)`/`(c)`、`III`/`c`、带圈的 `3`/`C`、`(3)`/`(C)`、`3`/`C`、带圈的 `iii`/`c`、`(iii)`/`(c)` 与 `iii`/`c`。`tool_options.pattern.show_wave: false` 则只保留标签。
+- 间隔小于 3 CSS px 的周期重复会折叠为定义周期。
+- `fill_enabled` 与 `fill_color` 为 XABCD、cypher、头肩形、三角形形态与时间周期着色；区域填充仅在绘图被选中时才是主体目标。`extend_left`、`extend_right`、`stroke_start` 与 `stroke_end` 不适用于这些工具，而填充不适用于其他工具。`text` 标签相对于锚点所围的框放置。
+- `drawing_kind_options()` 为 XABCD、cypher、ABCD 与三驱动返回 `{ kind: "pattern", show_ratios }`，为艾略特工具返回 `{ kind: "elliott_wave", degree, show_wave }`，为头肩形、三角形形态与周期工具返回 `{ kind: "generic" }`。
 <!-- B8: patterns_elliott_cycles — end -->
 <!-- B8: shapes — begin -->
-### Shapes
+### 形状
 
-- `rotated_rectangle` places three anchors: the midpoints of the two short sides, then a point on a
-  long side, whose distance from that axis sets the width. It stays right-angled on screen at any
-  zoom. Its handles are the two axis ends and a width handle at the midpoint of each long side
-  (`drawing_handle_count` 4); the third anchor has no handle of its own. A width handle sets the
-  width to its distance from the axis, and dragging an axis end keeps the width on screen, so
-  turning the rectangle never flattens it. After a width drag the third anchor sits at its long
-  side's midpoint.
-- `ellipse` places two box corners and is inscribed in their box; it edits with the rectangle's
-  eight handles, and Shift keeps the box square (a circle). `circle` places its center and a point
-  on its rim. `triangle` places three vertices.
-- `arc` places its start, its end, and a point it passes through (collinear points give the
-  straight chord). `curve` places its start, its end, and the point it passes at its middle;
-  `double_curve` places its start, its end, and the points it passes at one and two thirds. Every
-  handle sits on the curve, and `extend_left`/`extend_right` continue a curve's end tangents to the
-  pane edge. While a three- or four-anchor shape is placed, the anchors clicked so far and the
-  pointer show as a polyline in the drawing's stroke until every anchor but the last is placed; the
-  shape itself then previews through the pointer until the last click commits it.
-- `polyline` places vertices like `path`: click to add, double-click or Enter to finish, Backspace
-  removes the latest vertex, Escape cancels. Once three vertices are placed, clicking the first
-  vertex again finishes the polyline closed (the preview snaps shut while the pointer is over it).
-  `tool_options.shape.closed` (default `false`) joins the last vertex to the first and fills the
-  enclosed region by the nonzero rule. The fill is bounded work: a closed polyline of more than
-  2,048 vertices, or one so heavily self-intersecting that its fill exceeds the tessellation
-  bounds, paints its outline only, with no fill and no interior selection target (its stroke still
-  selects it). This is not an error, every vertex is kept, and it is identical on every backend; a
-  region that follows thousands of bars of chart data belongs in a series rather than in a
-  drawing polyline.
-- `highlighter` is a freehand drag like `brush`: a 20 px marker stroke in 40% amber with round
-  ends. It keeps one opacity where it overlaps itself on every backend, and ignores `style`, end
-  caps, and fill.
-- Strokes default to 2 px. The rotated rectangle, ellipse, circle, triangle, arc, and polyline
-  default `fill_enabled` to `true` and fill with `fill_color`, or the stroke color at 20% opacity
-  when unset; the arc fills the segment between the arc and its chord, curves fill the region
-  between the curve and its chord once enabled, and an open polyline never fills. A shape's fill
-  selects and drags it only while it is selected, so an unselected shape's interior keeps panning
-  the chart. End caps (`stroke_start`, `stroke_end`) apply to the open shapes: arc, curves, and the
-  open polyline.
-- Box text (`text`) aligns against the shape's own box, such as a circle's rather than the box of
-  its center and rim anchors.
-- `drawing_kind_options()` returns `{ kind: "shape", closed }` for every Shapes tool; the
-  `tool_options.shape.closed` schema descriptor is listed for `polyline` only.
+- `rotated_rectangle` 放置三个锚点：两条短边的中点，然后是长边上的一点，其到该轴的距离决定宽度。它在任何缩放下在屏幕上都保持直角。其手柄是两个轴端点，以及位于每条长边中点的宽度手柄（`drawing_handle_count` 4）；第三个锚点没有自己的手柄。宽度手柄将宽度设置为其到轴的距离，拖动轴端点则在屏幕上保持宽度不变，因此旋转矩形绝不会将其压扁。宽度拖动之后，第三个锚点位于其所在长边的中点。
+- `ellipse` 放置两个框角点，内接于它们的框；它用矩形的八个手柄编辑，Shift 使框保持正方形（即圆）。`circle` 放置其圆心与圆周上的一点。`triangle` 放置三个顶点。
+- `arc` 放置其起点、终点与它经过的一点（共线的点得到直线弦）。`curve` 放置其起点、终点与它在中间经过的点；`double_curve` 放置其起点、终点与它在三分之一和三分之二处经过的点。每个手柄都位于曲线上，`extend_left`/`extend_right` 将曲线端点的切线延续到窗格边缘。放置三锚点或四锚点形状时，到目前为止已点击的锚点与指针以绘图描边的折线显示，直到除最后一个之外的所有锚点都已放置；之后形状本身通过指针预览，直到最后一次点击提交它。
+- `polyline` 像 `path` 一样放置顶点：点击添加，双击或 Enter 结束，Backspace 删除最新的顶点，Escape 取消。放置三个顶点后，再次点击第一个顶点会以闭合方式结束折线（指针位于其上方时，预览会合拢）。`tool_options.shape.closed`（默认 `false`）将最后一个顶点与第一个顶点相连，并按非零规则填充所围区域。填充是有界工作：顶点数超过 2,048 的闭合折线，或自交程度严重到其填充超出三角剖分界限的闭合折线，只绘制其轮廓，不填充，也没有内部选择目标（其描边仍可选中它）。这不是错误，所有顶点都会保留，并且在每个后端上完全一致；跟随数千根图表数据柱的区域应属于系列，而不是绘图折线。
+- `highlighter` 与 `brush` 一样是自由手绘拖动：一条 20 px 的记号笔笔画，40% 琥珀色，圆形端点。在每个后端上，它在自身重叠处都保持单一不透明度，并忽略 `style`、端帽与填充。
+- 描边默认为 2 px。旋转矩形、椭圆、圆、三角形、圆弧与折线将 `fill_enabled` 默认为 `true`，并以 `fill_color` 填充，未设置时使用描边颜色的 20% 不透明度；圆弧填充圆弧与其弦之间的弓形，曲线一旦启用即填充曲线与其弦之间的区域，开放折线从不填充。形状的填充仅在其被选中时才可选中并拖动它，因此未选中形状的内部仍会平移图表。端帽（`stroke_start`、`stroke_end`）适用于开放形状：圆弧、曲线与开放折线。
+- 框文字（`text`）相对于形状自身的框对齐，例如圆自身的框，而不是其圆心与圆周锚点所围的框。
+- `drawing_kind_options()` 为形状族的每个工具返回 `{ kind: "shape", closed }`；`tool_options.shape.closed` schema 描述符仅为 `polyline` 列出。
 <!-- B8: shapes — end -->
 
-### Equivalents of KLineChart's overlays
+### KLineChart overlay 的等价项
 
-A host moving from KLineChart finds each of its drawing overlays here. Seven are tools of their own
-(wire ids 38..=41, 52, 147, and 148); the others are an existing tool with options, and the table
-says how.
+从 KLineChart 迁移的宿主可在此找到其每个绘图 overlay。其中七个是独立的工具（wire id 38..=41、52、147 与 148）；其余则是带选项的现有工具，表格说明了具体做法。
 
-| KLineChart overlay | Aeris tool |
+| KLineChart overlay | Aeris 工具 |
 |---|---|
 | `straightLine` | `extended_line` |
 | `rayLine` | `ray` |
 | `horizontalSegment` | `horizontal_segment` |
 | `verticalRayLine` | `vertical_ray` |
 | `verticalSegment` | `vertical_segment` |
-| `parallelStraightLine` | `parallel_channel` with `extend_left` and `extend_right`, `fill_enabled: false`, and `tool_options.channel.middle_line: false` |
+| `parallelStraightLine` | `parallel_channel`，设置 `extend_left` 与 `extend_right`、`fill_enabled: false` 以及 `tool_options.channel.middle_line: false` |
 | `priceChannelLine` | `price_channel` |
-| `fibonacciLine` | `fib_retracement` with `extend_left` and `extend_right` (levels span the pane) |
+| `fibonacciLine` | `fib_retracement`，设置 `extend_left` 与 `extend_right`（层级横跨窗格） |
 | `priceLine` | `price_line` |
 | `simpleTag` | `simple_tag` |
 | `simpleAnnotation` | `simple_annotation` |
 
-## Persistence V1
+## 持久化 V1
 
-Persistence schema versioning is independent of the npm package version. V1 contains only:
+持久化 schema 的版本控制独立于 npm 包版本。V1 仅包含：
 
-- ordered pane identities, stretch factors, and preserve-empty flags;
-- ordered built-in drawings with persistent ID, kind, pane reference, semantic anchors
-  (`{logical, price, time?}`, plus the `anchor_times_micros` sidecar on non-time bar charts), and
-  style;
-- the optional top-level `drawing_price_basis` label (the host-defined price basis of the drawing
-  prices).
+- 有序的窗格标识、拉伸系数与空窗格保留标志；
+- 有序的内置绘图，包含持久 ID、种类、窗格引用、语义锚点（`{logical, price, time?}`，在非时间柱图表上另加 `anchor_times_micros` 附带数据）以及样式；
+- 可选的顶层 `drawing_price_basis` 标签（宿主定义的绘图价格的价格基准）。
 
-Host market history, series and indicator definitions, chart options, trading positions/orders/
-executions/previews/intents, alert lines/create requests, custom extensions, callbacks,
-subscriptions, selections, interaction sessions, generations, LOD, drawing bounds/indexes,
-retained frames, and GPU resources are not persisted. Hosts restore V1 into a fresh chart, then
-reinstall host-owned data, series/indicator configuration, trading state, alert state, options, and
-extensions.
+宿主的行情历史、系列与指标定义、图表选项、交易持仓/订单/成交/预览/意图、预警线/创建请求、自定义扩展、回调、订阅、选择、交互会话、代次、细节层级（LOD）、绘图边界/索引、保留的帧以及 GPU 资源均不持久化。宿主将 V1 恢复到一个全新的图表中，然后重新安装宿主拥有的数据、系列/指标配置、交易状态、预警状态、选项与扩展。
 
-Named price-scale descriptors and series-to-scale bindings are also host-owned. Hosts recreate
-named scales in each pane before restoring comparison-series bindings; chart-state V1 is unchanged.
+命名价格比例尺描述符与系列到比例尺的绑定同样由宿主拥有。宿主在恢复对比系列绑定之前，先在每个窗格中重建命名比例尺；图表状态 V1 保持不变。
 
-Import checks the whole document before mutation and installs it as one transaction. Imported panes
-receive fresh live handle IDs while retaining separate persistent pane IDs; pre-import pane and
-price-scale handles therefore become stale. Import is accepted only before drawing IDs have been
-issued and while the chart still has its initial pane topology. This prevents an old drawing handle
-from retargeting a restored drawing with the same persistent ID.
+导入会在变更之前检查整个文档，并作为一个事务安装。被导入的窗格获得全新的实时句柄 ID，同时保留各自独立的持久窗格 ID；因此导入前的窗格句柄与价格比例尺句柄会变为过期。仅当绘图 ID 尚未发放，且图表仍保持其初始窗格拓扑时，才接受导入。这可防止旧的绘图句柄重新指向具有相同持久 ID 的已恢复绘图。
 
-Drawing anchors are stored as `{logical, price, time?}` plus the optional top-level
-`drawing_price_basis` label; both fields are optional and need no schema version change. On an
-ordinary time chart `time` is authoritative on restore: importing after data resolves each anchor
-by its time on the loaded window, and importing before data (the grid workspace order) keeps the
-anchors pending by time until the host installs data. Documents without anchor times keep their
-logical anchors. Non-time (tick/volume/range) charts keep using `anchor_times_micros`.
+绘图锚点以 `{logical, price, time?}` 的形式存储，另有可选的顶层 `drawing_price_basis` 标签；这两个字段均为可选，无需变更 schema 版本。在普通时间图表上，恢复时以 `time` 为准：在数据之后导入时，按每个锚点的时间在已加载窗口上解析锚点；在数据之前导入（网格工作区的顺序）时，锚点按时间保持待定状态，直到宿主安装数据。没有锚点时间的文档保留其逻辑锚点。非时间（tick/成交量/range）图表继续使用 `anchor_times_micros`。
 
-Drawing style fields are optional and restore the kind's own defaults when omitted; the export
-writes a field only when it differs from them. B8 family options travel in the optional
-`style.tool_options` object (at most 16 KiB serialized), so older documents need no migration.
+绘图样式字段均为可选，省略时恢复该类型自身的默认值；导出仅在字段与默认值不同时才写入该字段。B8 绘图族选项存放在可选的 `style.tool_options` 对象中（序列化后至多 16 KiB），因此旧文档无需迁移。
 
-Limits for untrusted input are 8 MiB per document, 64 panes, 10,000 drawings, 100,000 anchors per
-drawing, 250,000 total anchors, 64 KiB text per drawing, and 1 MiB total drawing text. Unknown
-optional V1 fields are ignored. Unknown schema versions, drawing kinds, pane references, duplicate
-IDs, invalid anchor counts, non-finite/unsafe numbers, and limit violations fail structurally and
-leave the chart unchanged. V1 fixtures are compatibility inputs; future versions must retain an
-explicit V1 migration path for the documented compatibility window.
+不受信任输入的限制为：每个文档 8 MiB、64 个窗格、10,000 个绘图、每个绘图 100,000 个锚点、总计 250,000 个锚点、每个绘图 64 KiB 文本，以及绘图文本总计 1 MiB。未知的可选 V1 字段会被忽略。未知的 schema 版本、绘图类型、窗格引用、重复 ID、无效的锚点数量、非有限/不安全的数字以及超出限制的情况，均会在结构层面失败，并使图表保持不变。V1 夹具是兼容性输入；未来版本必须为文档中记载的兼容窗口保留明确的 V1 迁移路径。
 
-## Persistence V3 studies
+## 持久化 V3 研究
 
-Financial charts with engine-owned indicators export schema version 3. V3 keeps market history and
-ordinary series data host-owned, but persists ordered study bindings, scalar input selection, typed
-indicator parameters (including explicit seed, histogram, and estimator values), timestamp-aligned
-volume- and turnover-source references, and per-output styles. Chained
-sources are encoded as references to an earlier study output so restore does not depend on old live
-series identities. Hosts must recreate the source series and their data before importing V3; import
-validates every dependency, parameter, output-style count, and resource limit before mutation.
-V1 and V2 documents remain accepted unchanged, and a V3 document restores into a fresh financial
-chart only.
+带有引擎持有指标的金融图表导出 schema 版本 3。V3 仍由宿主持有市场历史与普通系列数据，但会持久化有序的研究绑定、标量输入选择、类型化指标参数（包括显式的 seed、histogram 与 estimator 取值）、按时间戳对齐的成交量与成交额来源引用，以及各输出的样式。链式来源被编码为对较早研究输出的引用，因此恢复不依赖旧的实时系列标识。宿主必须在导入 V3 之前重新创建来源系列及其数据；导入会在变更之前校验每一项依赖、参数、输出样式数量和资源限制。V1 和 V2 文档仍被原样接受，且 V3 文档只能恢复到全新的金融图表中。
 
-## Version policy
+## 版本策略
 
-While the browser package is below 1.0:
+浏览器包版本低于 1.0 期间：
 
-- patch: compatible correctness, security, performance, documentation, and packaging fixes;
-- minor: additive stable API, explicitly reviewed experimental API changes, or compatible behavior
-  additions;
-- major (including the eventual 1.0 boundary): removal/rename/signature change to stable API,
-  incompatible stable behavior, or ending a documented persistence compatibility window.
+- patch：兼容的正确性、安全、性能、文档与打包修复；
+- minor：新增稳定 API、经明确评审的实验性 API 变更，或兼容的行为新增；
+- major（包括最终的 1.0 边界）：移除/重命名/更改稳定 API 的签名、不兼容的稳定行为，或终止文档中记载的持久化兼容窗口。
 
-Adding a drawing/series kind is normally a minor package feature, but changing the meaning of an
-existing kind is incompatible. Adding a new persistence schema does not invalidate V1; removing V1
-support follows the separately documented persistence window and is a major compatibility event.
+新增绘图/系列类型通常属于 minor 级别的包功能，但改变既有类型的含义则不兼容。新增持久化 schema 不会使 V1 失效；移除 V1 支持遵循另行记载的持久化窗口，属于 major 级别的兼容性事件。
 
-## Rust distribution
+## Rust 分发
 
-The Rust crates are repository-only (`publish = false`); nothing is published to crates.io, and the
-browser package is the only published artifact. Hosts such as Aeris Terminal consume the
-`aeris_charts_*` crates through pinned Git revisions or local paths. The Rust API is below 1.0 and
-may change in any revision, so a host reviews the notes below when it moves its pin.
+Rust crate 仅限仓库内使用（`publish = false`）；不会向 crates.io 发布任何内容，浏览器包是唯一发布的产物。Aeris Terminal 等宿主通过固定的 Git 修订版本或本地路径使用 `aeris_charts_*` crate。Rust API 低于 1.0，可能在任何修订中变更，因此宿主在更换其固定修订时应查阅下面的说明。
 
-`aeris_charts_render_gpui` is experimental. It pins `gpui-pre` 0.3.7, the GPUI snapshot gpui-kit
-0.7.0 depends on, with an exact version requirement, so a host that draws the chart must use that
-same `gpui` (a host on another GPUI build, such as a Zed Git revision, holds two incompatible copies
-of its types). GPUI upgrades are explicit manifest and lockfile changes.
+`aeris_charts_render_gpui` 是实验性的。它以精确版本要求固定 `gpui-pre` 0.3.7，即 gpui-kit 0.7.0 所依赖的 GPUI 快照，因此绘制图表的宿主必须使用同一个 `gpui`（宿主若使用其他 GPUI 构建，例如 Zed 的某个 Git 修订版本，就会持有其类型的两份不兼容副本）。GPUI 升级是显式的 manifest 与 lockfile 变更。
 
-On macOS a host must build its GPUI platform crate (`gpui-pre-platform`, or `gpui-pre-macos`
-directly) with the `font-kit` feature, which is GPUI's macOS text system. Without it GPUI substitutes
-a no-op text system: the chart paints no text (axes, labels, legends, drawing text) and measures
-every string as zero width, and the only signal is a `log::warn!` at startup. Linux and Windows are
-unaffected.
+在 macOS 上，宿主必须启用 `font-kit` feature 来构建其 GPUI 平台 crate（`gpui-pre-platform`，或直接构建 `gpui-pre-macos`），该 feature 即 GPUI 的 macOS 文本系统。否则 GPUI 会改用空操作的文本系统：图表不绘制任何文本（坐标轴、标签、图例、绘图文本），并将每个字符串的宽度度量为零，唯一的信号是启动时的一条 `log::warn!`。Linux 和 Windows 不受影响。
 
-A host that binds wheel events through `GpuiChartInput::scroll_wheel` gets browser-equivalent
-scrolling. Hosts that pinned an earlier revision panned the time scale the wrong way on a horizontal
-wheel or trackpad swipe: the adapter passed GPUI's horizontal delta through unflipped, though GPUI
-reports content motion (positive reveals the left) and the engine, like a browser, takes positive
-as a move to the right. The adapter now flips the horizontal axis; a host that compensated for the
-old sign itself must remove its compensation.
+通过 `GpuiChartInput::scroll_wheel` 绑定滚轮事件的宿主可获得与浏览器等效的滚动。固定在较早修订的宿主在水平滚轮或触控板横扫时，平移时间比例尺的方向相反：适配器未翻转就透传了 GPUI 的水平增量，而 GPUI 报告的是内容运动（正值表示露出左侧），引擎则与浏览器一样，将正值视为向右移动。适配器现在会翻转水平轴；自行补偿了旧符号的宿主必须移除其补偿。
 
-### Moving the pinned revision
+### 更换固定修订
 
-These notes list the host-visible changes a pinned-revision move carries, so call sites can be
-reviewed once. Each group names the revision-level change and the call sites it affects.
+以下说明列出了更换固定修订所带来的宿主可见变更，以便调用点只需评审一次。每个分组都会指明修订级别的变更及其影响的调用点。
 
-Each group is keyed to the commit that carries its change. A group applies to a pin that does not
-contain that commit (`git merge-base --is-ancestor <commit> <pin>` exits non-zero); a pin that
-already contains it has taken the change. Hashes are this repository's. "Upstream" marks commits
-that came from `AerisTerminal/aeris-charts` main and keep their hashes here, because upstream was
-merged and never rebased; "own line" marks commits that exist only in this repository. The two
-histories part at `ed2910d`, and a group whose old spelling lived on one side only says which side.
+每个分组都以承载其变更的提交为键。分组适用于不包含该提交的固定修订（`git merge-base --is-ancestor <commit> <pin>` 以非零状态退出）；已包含该提交的固定修订已经采纳了该变更。哈希为本仓库的哈希。“上游”标记来自 `AerisTerminal/aeris-charts` main 并在此保留其哈希的提交，因为上游是通过合并引入的，从未变基；“自有线”标记仅存在于本仓库的提交。两条历史在 `ed2910d` 处分叉，旧写法仅存在于某一侧的分组会注明是哪一侧。
 
-**Sub-pane coordinates** (own line, from `84b85e6 fix(engine): sub-pane crosshair sync,
-chart-level pane selection, coordinate contract`; see [Coordinates and panes](#coordinates-and-panes)).
-Three behaviours changed:
+**子窗格坐标**（自有线，来自 `84b85e6 fix(engine): sub-pane crosshair sync, chart-level pane selection, coordinate contract`；参见[坐标与窗格](#坐标与窗格)）。三项行为发生了变更：
 
-- The chart-level `price_to_coordinate` and `coordinate_to_price` no longer follow the first visible
-  series in creation order. The price converts on pane 0's default scale and the coordinate on the
-  default scale of the pane containing `y`, so a call that relied on an overlay-first or hidden main
-  series must use that series' own handle instead. Single-pane charts whose main series is created
-  first are unchanged, and series-handle conversions never changed.
-- Linked crosshairs on a lower pane (`pane_index` of 1 or more) now round-trip. Earlier revisions
-  applied the pane offset twice and read the wrong scale, so `crosshair_sync_position` and
-  `apply_external_crosshair` disagreed on any pane but the first. A synced price is now a price on
-  the pane's default scale, and an off-range price holds the line inside its pane.
-- `ChartEngine::pane_index_at_y` (and the browser package's `pane_index_at_y`) now returns the pane
-  above for a separator and pane 0 for a `y` above the content, where both used to resolve to the
-  last pane. GPUI hosts that pick a pane for price-axis hit-testing pick up the corrected mapping.
+- 图表级的 `price_to_coordinate` 和 `coordinate_to_price` 不再跟随按创建顺序排列的第一个可见系列。价格在窗格 0 的默认比例尺上换算，坐标则在包含 `y` 的窗格的默认比例尺上换算，因此依赖于叠加系列先创建、或主系列被隐藏的调用必须改用该系列自己的句柄。主系列最先创建的单窗格图表不受影响，系列句柄的换算从未改变。
+- 下方窗格（`pane_index` 为 1 或更大）上的联动十字光标现在可以往返一致。较早的修订将窗格偏移量应用了两次并读取了错误的比例尺，因此 `crosshair_sync_position` 与 `apply_external_crosshair` 在第一个窗格之外的任何窗格上结果都不一致。同步的价格现在是窗格默认比例尺上的价格，超出范围的价格会把该线保持在其窗格内。
+- `ChartEngine::pane_index_at_y`（以及浏览器包中的 `pane_index_at_y`）现在对分隔条返回其上方的窗格，对位于内容上方的 `y` 返回窗格 0，而这两种情况过去都解析为最后一个窗格。为价格坐标轴命中测试选取窗格的 GPUI 宿主会获得修正后的映射。
 
-**Trade-stream-derived series** (own line, from `a51242c fix(engine): guard trade-stream-derived
-series against host writes`; see [Ticks to candles](#ticks-to-candles)). Two reviews, and the first
-cannot be checked from this repository:
+**成交流派生系列**（自有线，来自 `a51242c fix(engine): guard trade-stream-derived series against host writes`；参见 [Tick 转 K 线](#tick-转-k-线)）。需要评审两项，其中第一项无法在本仓库中检查：
 
-- Terminal must not write to a candle bound with `bind_trade_bar_series_to_stream` or to a CVD,
-  delta, or trade-volume series (`add_cvd_series`, `add_delta_series`, `add_trade_volume_series`).
-  Every host data write to them is now refused like a footprint's (`false`, `0`, `None`,
-  `Err(UnsupportedSeriesData)`, or `Rejected(UnsupportedSeries)`; `series_is_source_owned(id)` tells
-  the refusal from an unknown id), and `apply_momentum_histogram_colors` returns `false` for the
-  delta and volume studies. The browser package rejects them with `code: "derived_series"`.
-- `FootprintError` gains the `SeriesOwned(SeriesId)` variant, so an exhaustive `match` on it needs
-  an arm. `bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler,
-  synthetic bars, or a study converted to a candle already writes (a footprint or scalar study still
-  gets `UnsupportedTradeBarSeries`, because the candle-kind check runs first), and
-  `configure_footprint_series` returns it for a series a stream, study, resampler, or synthetic bars
-  write. Resampling targets and synthetic-bar series refuse a trade-bound candle
-  (`ResampleError::UnsupportedTarget`, `SyntheticBarError::UnsupportedSeries`).
+- Terminal 不得向通过 `bind_trade_bar_series_to_stream` 绑定的 K 线，或向 CVD、delta 或成交量系列（`add_cvd_series`、`add_delta_series`、`add_trade_volume_series`）写入。宿主对它们的每一次数据写入现在都会像对足迹图的写入那样被拒绝（`false`、`0`、`None`、`Err(UnsupportedSeriesData)` 或 `Rejected(UnsupportedSeries)`；`series_is_source_owned(id)` 可将该拒绝与未知 id 区分开），且 `apply_momentum_histogram_colors` 对 delta 与成交量研究返回 `false`。浏览器包以 `code: "derived_series"` 拒绝这些写入。
+- `FootprintError` 新增 `SeriesOwned(SeriesId)` 变体，因此对它做穷尽 `match` 的代码需要补一个分支。对于已被重采样器、合成柱或某个被转换为 K 线的研究写入的 K 线或柱系列，`bind_trade_bar_series_to_stream` 会返回它（足迹图或标量研究仍得到 `UnsupportedTradeBarSeries`，因为 K 线类型检查先运行）；对于已被成交流、研究、重采样器或合成柱写入的系列，`configure_footprint_series` 会返回它。重采样目标和合成柱系列会拒绝已绑定成交流的 K 线（`ResampleError::UnsupportedTarget`、`SyntheticBarError::UnsupportedSeries`）。
 
-**Batched period-reset study lines** (own line, from `fafecda perf(render): batch period-reset
-study segments into one Segments primitive`). This is a compile-time break for Rust code that
-matches `aeris_charts_render::draw_list::Prim` exhaustively (a custom executor, a frame inspector,
-a point-pool rebase):
+**批量化的周期重置研究线**（自有线，来自 `fafecda perf(render): batch period-reset study segments into one Segments primitive`）。这对穷尽匹配 `aeris_charts_render::draw_list::Prim` 的 Rust 代码（自定义执行器、帧检查器、点池重新定基）构成编译期破坏性变更：
 
-- `Prim` gains `Segments { first_point, segment_count, width, color }`, a batch of `segment_count`
-  independent two-point strokes over `points[first_point .. first_point + 2 * segment_count]`, each
-  stroked like a solid simple two-point `Polyline` (dashes already expanded into one pair per dash).
-  The engine emits it in place of one two-point `Polyline` per bar for session VWAP, VWAP bands, and
-  pivot lines on bars of a day or longer, so a `_ => {}` arm that compiles silently stops drawing
-  those studies. Take the pair window from `draw_list::segment_points` (a range outside the pool is
-  a dropped prim), and move `first_point` with every other pool index when rebasing a layer. The
-  Canvas2D, WebGPU, GPUI, and native executors in this repository already handle it. Because hosts
-  take the change by moving their pin, it is breaking for exhaustive matchers.
+- `Prim` 新增 `Segments { first_point, segment_count, width, color }`，它是对 `points[first_point .. first_point + 2 * segment_count]` 的 `segment_count` 条相互独立的两点描边的批量，每条的描边方式与实线的简单两点 `Polyline` 相同（虚线已展开为每段虚线一对点）。对于日线或更长周期柱上的交易时段 VWAP、VWAP 带和枢轴线，引擎会发出它来取代每根柱一条的两点 `Polyline`，因此能通过编译的 `_ => {}` 分支会悄悄停止绘制这些研究。请从 `draw_list::segment_points` 获取点对窗口（超出点池的范围会使该图元被丢弃），并在重新定基某一层时，将 `first_point` 与其他所有点池索引一并移动。本仓库中的 Canvas2D、WebGPU、GPUI 和原生执行器已经处理了它。由于宿主通过更换固定修订来采纳该变更，因此对穷尽匹配的代码而言它是破坏性的。
 
-**Named time zones** (both lines, from the merge `2e7d19f merge: sync with
-AerisTerminal/aeris-charts main`, which took upstream's `f796529 feat(time): add selectable IANA
-chart time zones` onto the own line's exchange-time clock; see
-[Time, exchange time zone, and trading sessions](#time-exchange-time-zone-and-trading-sessions)).
-Behaviours to review:
+**命名时区**（两条线，来自合并 `2e7d19f merge: sync with AerisTerminal/aeris-charts main`，该合并将上游的 `f796529 feat(time): add selectable IANA chart time zones` 引入自有线的交易所时间时钟；参见[时间、交易所时区与交易时段](#时间交易所时区与交易时段)）。需要评审的行为：
 
-- `ChartEngine::set_time_zone` takes an IANA id from `TRADINGVIEW_TIME_ZONES`
-  (`Result<bool, String>`; `Ok(false)` when it is already installed). The setter that takes a
-  `UtcOffsetSchedule` is `set_exchange_offsets`, so a call site written against a revision where
-  `set_time_zone` took a schedule must use the new name. Only an own-line pin before the merge took
-  a schedule; an upstream pin from `f796529` on already passes an id.
-- An upstream pin from `f796529` on has zone-aware helpers in `aeris_charts_core`, each of which
-  takes a `ChartTimeZone`: `format_tick_label_with_time_zone`, `format_date_pattern_with_time_zone`,
-  `format_crosshair_time_with_time_zone`, `weight_by_time_in_time_zone`, and
-  `fill_weights_for_points_in_time_zone`. The merge deleted them and kept the own line's
-  `ExchangeTime` forms as the one clock (an own-line pin already has these); they take
-  `&ExchangeTime` instead of a zone: `format_tick_label_in`, `format_crosshair_time_in`,
-  `weight_by_time_in`, and `fill_weights_for_points_in`. Read the engine's own clock with
-  `ChartEngine::exchange_time()`, or build one with `ExchangeTime::new(zone.offset_schedule()?, 0)?`.
-  There is no `ExchangeTime` form of `format_date_pattern`: shift the timestamp with
-  `ExchangeTime::local_seconds` and format that, as `format_crosshair_time_in` does. Only an
-  upstream pin from `f796529` on had the removed helpers; an own-line pin never did.
-- A named zone is resolved once into the explicit schedule, so tick weights, labels, VWAP and pivot
-  period keys, sessions, and the countdown follow it exactly like `set_exchange_offsets`. The name
-  also localizes the general temporal axes and `time_zone_clock_text`; an explicit schedule does
-  not, and `time_zone_id()` then returns `custom` instead of a TradingView id.
-- A top-level `timezone` option that is not a string, or names an id outside the parity list, now
-  rejects the whole options patch (earlier revisions ignored it silently). A host that forwards a
-  TradingView placeholder such as `exchange` must filter it before the patch. Importing a saved V2
-  document is the exception: an unresolvable or non-string `timezone` in its options (a raw value an
-  earlier build stored) is dropped so the rest of the layout still restores.
-- `time_scale_options_json()["time_zone"]` reports the exchange schedule (`"UTC"` or the transition
-  array), not the TradingView id an earlier revision printed there; read the named zone through
-  `time_zone_id()`.
-- A V2 document can carry an additive `timezone` string beside `timeScale.timeZone`, written only
-  while a named zone is installed. A consumer that takes `aeris_charts_core` by Git does not read
-  this repository's `.cargo/config.toml`, so it compiles the complete tz tables rather than the 98
-  parity zones the repository's artifacts keep.
+- `ChartEngine::set_time_zone` 接受来自 `TRADINGVIEW_TIME_ZONES` 的 IANA id（`Result<bool, String>`；已安装时返回 `Ok(false)`）。接受 `UtcOffsetSchedule` 的设置方法是 `set_exchange_offsets`，因此针对 `set_time_zone` 接受 schedule 的修订所编写的调用点必须改用新名称。只有合并之前的自有线固定修订接受 schedule；从 `f796529` 起的上游固定修订已经传入 id。
+- 从 `f796529` 起的上游固定修订在 `aeris_charts_core` 中带有感知时区的辅助函数，每个都接受 `ChartTimeZone`：`format_tick_label_with_time_zone`、`format_date_pattern_with_time_zone`、`format_crosshair_time_with_time_zone`、`weight_by_time_in_time_zone` 和 `fill_weights_for_points_in_time_zone`。该合并删除了它们，并保留自有线的 `ExchangeTime` 形式作为唯一的时钟（自有线固定修订已具备这些形式）；它们接受 `&ExchangeTime` 而非时区：`format_tick_label_in`、`format_crosshair_time_in`、`weight_by_time_in` 和 `fill_weights_for_points_in`。用 `ChartEngine::exchange_time()` 读取引擎自己的时钟，或用 `ExchangeTime::new(zone.offset_schedule()?, 0)?` 构建一个。`format_date_pattern` 没有 `ExchangeTime` 形式：请用 `ExchangeTime::local_seconds` 平移时间戳并对结果格式化，`format_crosshair_time_in` 即是如此。只有从 `f796529` 起的上游固定修订具有被删除的辅助函数；自有线固定修订从未具有。
+- 命名时区会一次性解析为显式 schedule，因此刻度权重、标签、VWAP 与枢轴的周期键、交易时段和倒计时都与 `set_exchange_offsets` 完全一样地遵循它。该名称还会本地化通用时间轴和 `time_zone_clock_text`；显式 schedule 则不会，此时 `time_zone_id()` 返回 `custom`，而不是 TradingView id。
+- 顶层 `timezone` 选项若不是字符串，或其 id 不在一致性列表之内，现在会拒绝整个选项补丁（较早的修订会静默忽略它）。转发 TradingView 占位符（例如 `exchange`）的宿主必须在打补丁之前将其过滤掉。导入已保存的 V2 文档是例外：其选项中无法解析或非字符串的 `timezone`（较早的构建所存储的原始值）会被丢弃，以便布局的其余部分仍能恢复。
+- `time_scale_options_json()["time_zone"]` 报告交易所 schedule（`"UTC"` 或转换数组），而不是较早修订在此处输出的 TradingView id；请通过 `time_zone_id()` 读取命名时区。
+- V2 文档可以在 `timeScale.timeZone` 旁携带一个新增的 `timezone` 字符串，仅在安装了命名时区时写入。通过 Git 依赖 `aeris_charts_core` 的使用方不会读取本仓库的 `.cargo/config.toml`，因此它会编译完整的 tz 表，而不是本仓库产物所保留的 98 个一致性时区。
 
-**Drawing text editing** (both lines, from the merge `2e7d19f merge: sync with
-AerisTerminal/aeris-charts main`, which made upstream's `7518e7e feat(drawings): engine-owned text
-typing session for every host` the one session and kept the own line's layout, hit testing, and
-editable tools; see
-[Drawing anchors, magnet, and price basis](#drawing-anchors-magnet-and-price-basis)).
-Each item says which pins it applies to:
+**绘图文本编辑**（两条线，来自合并 `2e7d19f merge: sync with AerisTerminal/aeris-charts main`，该合并使上游的 `7518e7e feat(drawings): engine-owned text typing session for every host` 成为唯一的会话，并保留了自有线的布局、命中测试和可编辑工具；参见[绘图锚点、磁吸与价格基准](#绘图锚点磁吸与价格基准)）。每一项都会说明它适用于哪些固定修订：
 
-- On main one engine session is the only text-editing state. Open it with
-  `begin_drawing_text_edit(id, paint_caret)` (`false` for a host that paints its own caret, as the
-  browser does); mirror a host's editable surface with `set_drawing_text_edit(text, caret)`; end it
-  with `commit_drawing_text_edit()` or `cancel_drawing_text_edit()`; `editing_drawing()` reads the
-  open session. Native hosts use `drawing_text_edit_insert`, `drawing_text_edit_key`,
-  `drawing_text_edit_select_all`, and `drawing_text_edit_caret_at`. Live text records no undo step;
-  a commit records one. A GPUI host that forwards its key events to `GpuiChartInput::key_down` does
-  not need to call these: the adapter routes the keys, with the platform's word and line motion and
-  the clipboard shortcuts (see the engine input controller below).
-- `ChartEngine::set_editing_drawing` is gone. Upstream pins have it (alongside the session), and so
-  do own-line pins before `36c9f09`; an own-line pin from `36c9f09` on does not.
-- An own-line pin from `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded
-  ticks, tick-built candles, and resampling` up to the merge used a three-call session of its own,
-  which the merge removed: `begin_drawing_text_edit(id)`, `set_drawing_edit_text(text)`, and
-  `end_drawing_text_edit(commit)`. The new calls are `begin_drawing_text_edit(id, paint_caret)`,
-  `set_drawing_text_edit(text, caret)` (the mirrored value now carries the caret), and
-  `commit_drawing_text_edit()` or `cancel_drawing_text_edit()` for `commit` true or false. It is not
-  a plain rename: the old call neither trimmed the text nor removed a text tool, while a commit now
-  trims the text and removes a text tool left empty, and a cancel removes a text tool that began
-  empty. An upstream pin never had the three-call form.
-- An upstream pin that contains `7518e7e` but not `b75f092 feat(drawings): text-field selection in
-  the drawing typing session` had `drawing_text_edit_key(key)`. That commit changed it to
-  `drawing_text_edit_key(key, extend_selection)` (Shift extends the selection) and gave
-  `DrawingTextEditKey` the variants `DeleteWordBackward`, `DeleteWordForward`, `WordLeft`, and
-  `WordRight`, so such a pin adds the argument and, for an exhaustive `match` on the key, the arms.
-  An own-line pin never had the one-argument form.
-- `begin_drawing_text_edit` accepts every drawing that paints its own text, and refuses (leaving an
-  open session alone) a locked, hidden, interval-hidden, or non-text drawing, or one whose anchors
-  cannot convert yet. Upstream's session opened only the text tool and trend lines, and closed an
-  open session even when it refused; an own-line pin before `d438dab` stopped at those and the
-  family drawings. A chart that has not been laid out has no price scale to convert the anchors, so
-  a host that begins a session before its first frame sees `false`.
-- An upstream pin bounded text at 256 bytes; main bounds it by `MAX_DRAWING_TEXT_BYTES` (65,536
-  bytes): an insert that would exceed it is refused whole, and a mirrored value is clamped at a
-  character boundary. A run label stays on one line; family text boxes (`comment`, `callout`,
-  `note`, `signpost`, `anchored_text`) keep line breaks. Native hosts get click-to-caret placement
-  and typing in a box but not Up/Down line navigation yet.
-- `drawing_text_hit_at` answers for the label of every tool that paints a text run (lines,
-  channels, Fibonacci, shapes), not only the trend line, and arbitrates against higher drawing
-  bodies; upstream pins and own-line pins before `d438dab` answered for the trend line only. Which
-  click starts typing is one rule for every host: the first click opens it only for the text
-  tool's two-step click and a trend label, and placing a tool that requests an editor opens it on
-  placement; a double-click on the selected drawing, Enter, or F2 opens the editor of every
-  text-bearing drawing. The browser gesture layer and the native input controller both apply it; a
-  host that drives the engine API directly applies it itself.
-- Upstream's `3527136 Default rectangle borders off and EMA strokes to one pixel` (an own-line pin
-  before the merge `2e7d19f` and an upstream pin before `3527136` lack it) makes rectangles default
-  to no border (`border_visible: false`). A saved document that omits the key imports with the
-  border visible, so earlier documents keep their look.
+- 在 main 上，一个引擎会话是唯一的文本编辑状态。用 `begin_drawing_text_edit(id, paint_caret)` 打开它（自行绘制插入符的宿主传 `false`，浏览器即如此）；用 `set_drawing_text_edit(text, caret)` 镜像宿主的可编辑表面；用 `commit_drawing_text_edit()` 或 `cancel_drawing_text_edit()` 结束它；`editing_drawing()` 读取已打开的会话。原生宿主使用 `drawing_text_edit_insert`、`drawing_text_edit_key`、`drawing_text_edit_select_all` 和 `drawing_text_edit_caret_at`。实时文本不记录撤销步骤；提交会记录一步。将键盘事件转发给 `GpuiChartInput::key_down` 的 GPUI 宿主无需调用这些方法：适配器会路由按键，包括平台的按词和按行移动以及剪贴板快捷键（参见下文的引擎输入控制器）。
+- `ChartEngine::set_editing_drawing` 已被移除。上游固定修订具有它（与该会话并存），`36c9f09` 之前的自有线固定修订也具有；从 `36c9f09` 起的自有线固定修订则没有。
+- 从 `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded ticks, tick-built candles, and resampling` 起直到该合并为止的自有线固定修订使用其自己的三调用会话，该合并已将其移除：`begin_drawing_text_edit(id)`、`set_drawing_edit_text(text)` 和 `end_drawing_text_edit(commit)`。新的调用为 `begin_drawing_text_edit(id, paint_caret)`、`set_drawing_text_edit(text, caret)`（镜像值现在携带插入符），以及分别对应 `commit` 为 true 或 false 的 `commit_drawing_text_edit()` 或 `cancel_drawing_text_edit()`。这不是单纯的重命名：旧调用既不修剪文本，也不移除文本工具，而现在提交会修剪文本并移除留空的文本工具，取消则会移除一开始就为空的文本工具。上游固定修订从未有过三调用形式。
+- 包含 `7518e7e` 但不包含 `b75f092 feat(drawings): text-field selection in the drawing typing session` 的上游固定修订具有 `drawing_text_edit_key(key)`。该提交将其改为 `drawing_text_edit_key(key, extend_selection)`（Shift 扩展选择），并为 `DrawingTextEditKey` 增加了变体 `DeleteWordBackward`、`DeleteWordForward`、`WordLeft` 和 `WordRight`，因此这样的固定修订需要加上该参数，并且对按键做穷尽 `match` 的代码还需补上这些分支。自有线固定修订从未有过单参数形式。
+- `begin_drawing_text_edit` 接受每一种自行绘制文本的绘图，并拒绝（不影响已打开的会话）已锁定、已隐藏、按周期隐藏或非文本的绘图，以及锚点尚无法换算的绘图。上游的会话只打开文本工具和趋势线，并且即使拒绝也会关闭已打开的会话；`d438dab` 之前的自有线固定修订止步于这些以及绘图族中的绘图。尚未布局的图表没有可用于换算锚点的价格比例尺，因此在第一帧之前就开始会话的宿主会得到 `false`。
+- 上游固定修订将文本限制在 256 字节；main 以 `MAX_DRAWING_TEXT_BYTES`（65,536 字节）为界：会超出该界限的插入整体被拒绝，镜像值则在字符边界处被钳制。文本 run 标签保持在一行内；绘图族文本框（`comment`、`callout`、`note`、`signpost`、`anchored_text`）保留换行。原生宿主目前支持点击定位插入符和在文本框中输入，但尚不支持上下行导航。
+- `drawing_text_hit_at` 会对每一种绘制文本 run 的工具（线条、通道、斐波那契、形状）的标签作答，而不仅限于趋势线，并会与更上层的绘图主体进行仲裁；上游固定修订和 `d438dab` 之前的自有线固定修订只对趋势线作答。哪一次点击开始输入，对所有宿主是同一条规则：第一次点击仅对文本工具的两步点击和趋势线标签打开输入，而放置会请求编辑器的工具时则在放置时打开；对已选中绘图的双击、Enter 或 F2 会打开每个带文本的绘图的编辑器。浏览器手势层和原生输入控制器都应用该规则；直接驱动引擎 API 的宿主需自行应用。
+- 上游的 `3527136 Default rectangle borders off and EMA strokes to one pixel`（合并 `2e7d19f` 之前的自有线固定修订和 `3527136` 之前的上游固定修订都不具备它）使矩形默认无边框（`border_visible: false`）。省略该键的已保存文档导入时边框可见，因此较早的文档保持其外观。
 
-**Engine input controller** (upstream, from `17a591f feat(input): engine-owned interaction
-controller for every native host`, which the own line took with the merge `3eef45e`; the design is
-in [Architecture.md](Architecture.md#aeris_charts_engine)). The engine now owns pointer, wheel, and
-key routing: a host translates platform events into `PointerInput`, `WheelSample`, and `ChartKey` and
-calls `ChartEngine::input_*`. Press arbitration, drag lifecycles, click and double-click, key
-bindings, hover, cursor choice, and kinetic motion belong to the engine. Review these call sites:
+**引擎输入控制器**（上游，来自 `17a591f feat(input): engine-owned interaction controller for every native host`，自有线通过合并 `3eef45e` 引入；设计见 [Architecture.md](Architecture.md#aeris_charts_engine)）。引擎现在拥有指针、滚轮和按键的路由：宿主将平台事件转换为 `PointerInput`、`WheelSample` 和 `ChartKey`，并调用 `ChartEngine::input_*`。按下仲裁、拖动生命周期、点击与双击、键盘绑定、悬停、光标选择和惯性运动都归引擎所有。请评审以下调用点：
 
-- Which pins had the removed gesture API. `begin_financial_drag`, `update_financial_drag`,
-  `update_financial_crosshair`, `end_financial_drag`, `apply_financial_wheel`,
-  `apply_financial_navigation`, `financial_drag`, and the types `FinancialDrag` and
-  `FinancialNavigation` existed only on upstream's side, from `f9b052f refactor(engine): own native
-  financial gestures` (`apply_financial_navigation` and `FinancialNavigation` from `4aaaf78
-  refactor(engine): own financial scale commands`), and on own-line revisions from the merge
-  `2e7d19f` until the merge `3eef45e` took `17a591f`, which removed them with no compatibility shim.
-  An own-line pin before `2e7d19f` never had them, so it has no host gesture API to delete: it adopts
-  the `input_*` calls, and the table below only says what each call now does. Coordinates are
-  unchanged (pane space: x from the plot's left edge, y from the chart's top).
+- 哪些固定修订具有已移除的手势 API。`begin_financial_drag`、`update_financial_drag`、`update_financial_crosshair`、`end_financial_drag`、`apply_financial_wheel`、`apply_financial_navigation`、`financial_drag` 以及类型 `FinancialDrag` 和 `FinancialNavigation` 仅存在于上游一侧，来自 `f9b052f refactor(engine): own native financial gestures`（`apply_financial_navigation` 和 `FinancialNavigation` 来自 `4aaaf78 refactor(engine): own financial scale commands`），并存在于自有线从合并 `2e7d19f` 起、直到合并 `3eef45e` 引入 `17a591f` 为止的修订上，该提交移除了它们，且没有提供兼容层。`2e7d19f` 之前的自有线固定修订从未有过它们，因此没有需要删除的宿主手势 API：它直接采用 `input_*` 调用，下表只说明每个调用现在的行为。坐标未变（窗格空间：x 自 plot 区域左边缘起，y 自图表顶部起）。
 
-  | Removed | Now |
+  | 已移除 | 现在 |
   | --- | --- |
-  | `begin_financial_drag(x, y, click_count, radius)` | `input_pointer_down(PointerInput, click_count)`; `click_count` is `u32` (it was `usize`); the 4 px separator radius is the constant `PANE_SEPARATOR_HIT`; a double-click axis reset follows `InteractionOptions::axis_double_click_reset_time` and `axis_double_click_reset_price` |
-  | `update_financial_drag(x, y)`, `update_financial_crosshair(x, y, radius)` | `input_pointer_move(PointerInput, primary_pressed)`, which also promotes drawing, series, and trading hover and keeps the crosshair tracking (clamped into the plot) while a press is captured; `input_pointer_leave()` clears the crosshair while no press is open |
-  | `end_financial_drag()` | `input_pointer_up(PointerInput)` to finish, `input_cancel()` to abandon |
-  | `apply_financial_wheel(x, y, normalized_x, normalized_y)` | `input_wheel(WheelSample)`, which returns whether the chart consumed the wheel. With the default `WheelBehavior::Auto`, `delta_y` goes through `wheel_zoom_scale` as `normalized_y` did and `delta_x` through `WHEEL_SCROLL_PX_PER_DELTA` as `normalized_x` did, so the values passed as `normalized_x` and `normalized_y` go to `delta_x` and `delta_y` unchanged. It is not behaviour-equivalent: see the differences below |
-  | `apply_financial_navigation(action, accelerated)` and `FinancialNavigation` | `input_key_down(ChartKey, InputModifiers, repeat, now_ms)` and `input_key_up(ChartKey)`: `PageUp`/`PageDown` are `PreviousPage`/`NextPage`, `ZoomIn`/`ZoomOut` keep their names, and `accelerated` is Control or Shift in `InputModifiers`. `PreviousBar`/`NextBar` map to `ChartKey::ArrowLeft`/`ArrowRight` in direction only: see the differences below |
-  | `financial_drag()` and `FinancialDrag` | none: the open gesture is engine-private, and the pointer feedback is `input_cursor()` |
+  | `begin_financial_drag(x, y, click_count, radius)` | `input_pointer_down(PointerInput, click_count)`；`click_count` 为 `u32`（原为 `usize`）；4 px 的分隔条半径是常量 `PANE_SEPARATOR_HIT`；双击坐标轴重置遵循 `InteractionOptions::axis_double_click_reset_time` 和 `axis_double_click_reset_price` |
+  | `update_financial_drag(x, y)`、`update_financial_crosshair(x, y, radius)` | `input_pointer_move(PointerInput, primary_pressed)`，它还会对绘图、系列和交易执行悬停提升，并在按下被捕获期间保持十字光标跟踪（限制在 plot 区域内）；`input_pointer_leave()` 在没有处于打开状态的按下时清除十字光标 |
+  | `end_financial_drag()` | `input_pointer_up(PointerInput)` 用于完成，`input_cancel()` 用于放弃 |
+  | `apply_financial_wheel(x, y, normalized_x, normalized_y)` | `input_wheel(WheelSample)`，返回图表是否消费了该滚轮事件。在默认的 `WheelBehavior::Auto` 下，`delta_y` 像 `normalized_y` 那样经过 `wheel_zoom_scale`，`delta_x` 像 `normalized_x` 那样经过 `WHEEL_SCROLL_PX_PER_DELTA`，因此作为 `normalized_x` 和 `normalized_y` 传入的值原样传给 `delta_x` 和 `delta_y`。它在行为上并不等价：参见下文的差异 |
+  | `apply_financial_navigation(action, accelerated)` 和 `FinancialNavigation` | `input_key_down(ChartKey, InputModifiers, repeat, now_ms)` 和 `input_key_up(ChartKey)`：`PageUp`/`PageDown` 对应 `PreviousPage`/`NextPage`，`ZoomIn`/`ZoomOut` 保持原名，`accelerated` 即 `InputModifiers` 中的 Control 或 Shift。`PreviousBar`/`NextBar` 仅在方向上映射到 `ChartKey::ArrowLeft`/`ArrowRight`：参见下文的差异 |
+  | `financial_drag()` 和 `FinancialDrag` | 无：已打开的手势是引擎私有的，指针反馈为 `input_cursor()` |
 
-- Where a replacement does not behave like the call it replaces. These were compared in the code,
-  not by signature, and none of the removed functions changed between its introduction and
-  `17a591f`:
-  - Wheel over a price axis. `apply_financial_wheel` zoomed a price scale whenever the pointer was
-    over that scale's axis strip, whatever the wheel behaviour. `input_wheel` zooms it only when
-    `InteractionOptions::wheel_behavior` is `WheelBehavior::Zoom` or
-    `InteractionOptions::price_axis_wheel_zoom` is `true` (default `false`); with the default
-    `WheelBehavior::Auto`, the same wheel over an axis strip zooms the time scale. To get the old
-    behaviour back, call `set_interaction_options` with `price_axis_wheel_zoom: true`.
-    `WheelBehavior::Zoom` also zooms the price scale there, but it turns every wheel into a zoom, so
-    a horizontal wheel stops panning.
-  - Wheel zoom over the plot. The old call zoomed the time scale around the pointer. A plain wheel
-    now follows `right_bar_stays_on_scroll` (default `true`; see the follow-ups below), so the gap
-    after the newest bar stays and only Ctrl/Cmd zooms around the pointer. `input_wheel` also
-    honours `wheel_zoom` and `wheel_scroll` (both default `true`), and it stops a kinetic coast, a
-    held arrow pan, or an animated scroll that is in progress.
-  - Drag threshold. The old calls acted from the first `update_financial_drag` (a pane pan, an axis
-    scale, or a separator resize). Now pane pans, axis scales, and separator drags begin at the
-    shared 5 px threshold, and an unmoved release is a click. A plain press on a price axis
-    therefore no longer switches that scale to manual: the old `begin_financial_drag` turned
-    autoscale off on the press, and now the first scale step does. A pane drag pans a manual price
-    scale only when it is the scale of the series (or the pane's default) under the press; the old
-    call also fell back to the pane's first manual right or left scale.
-  - Double-click on a price axis. `begin_financial_drag` ran `reset_price_scales()`, every price
-    scale in the chart; `input_pointer_down` resets only the pressed scale (`reset_price_scale(pane,
-    target)`). A host that wants the chart-wide reset keeps `reset_price_scales()` or `reset_view()`
-    for its own command.
-  - Release and cancel. `end_financial_drag` only ended the scale and scroll sessions. An unmoved
-    `input_pointer_up` also selects or activates what is under the pointer, and `input_cancel()` ends
-    the same sessions but also restores an open drawing or trading drag and clears hover, a live
-    measure, and the cursor. `input_pointer_move` with `primary_pressed` false while a press is open
-    abandons that press.
-  - Arrow and zoom keys. The old call jumped 1 bar (10 accelerated) per call; `ArrowLeft` and
-    `ArrowRight` start a velocity-owned pan (see the clock item). `ZoomIn` and `ZoomOut` anchored
-    at the plot centre; with the new `right_bar_stays_on_scroll` default they keep the gap after
-    the newest bar instead. Keys also follow the `InteractionOptions` switches (`pan` or
-    `wheel_scroll` for the scrolling keys, `wheel_zoom` for the zoom keys; all default `true`), and
-    a gated key stays unconsumed.
-- The host supplies the clock. Arrow-key panning is velocity-owned, so deliver `input_key_up`, pass
-  the platform's key-repeat flag, call `input_tick(now_ms)` once per prepared frame, and request
-  another frame only while `input_animating()` holds. `input_wake_deadline_ms()` is the one
-  deferred deadline (the trading-tooltip dwell): schedule a wake for it and repaint.
-  `flush_coalesced_input()` forwards the newest captured drawing sample once per prepaint.
-- The engine hands host-only work back as `ChartInputEvent`s (`ContextMenu`, `DrawingCreated`,
-  `RemoveSeries`); drain them with `take_input_events()` after each input call. Hosts keep event
-  translation, pointer capture, applying `input_cursor()`, timers and frame scheduling, menus,
-  clipboard, and persistence. Persist drawings on `drawing_revision()` instead of tracking
-  gestures. The reference `handleScroll`/`handleScale` switches are `InteractionOptions`
-  (`interaction_options()` and `set_interaction_options`).
-- The lower-level gesture operations (`drawing_tool_pointer_*`, `measure_pointer_*`,
-  `delta_tooltip_mouse_*`, `kinetic_*`, `start_keyboard_scroll`, `keyboard_scroll_tick`,
-  `cancel_keyboard_scroll`, the `time_axis_*` and `price_axis_*` scale and scroll steps,
-  `drag_pane_separator`) are still public engine operations, but the controller now sequences them.
-  A host that keeps driving them beside `input_*` bypasses the controller's press arbitration and
-  cursor, so host routing that sequenced them should be deleted.
-- Frame preparation changed with it: `prepare_financial_frame_with_measure` rebuilds after any
-  layer invalidation or input change and relayouts after a pane-resize drag. A host that cleared its
-  frame to force a rebuild, or forced a layout when `update_financial_drag` reported a pane resize,
-  can stop doing so.
-- GPUI hosts (feature `gpui-backend`) bind through `aeris_charts_render_gpui::input` with one
-  adapter call per listener: `GpuiChartInput::mouse_down`, `mouse_move`, `mouse_up` (bound for
-  releases outside the chart too), `context_menu`, `scroll_wheel`, `pinch`, `modifiers_changed`,
-  `key_down`, and `key_up`. `scroll_wheel` converts GPUI's delta itself (pixels divided by 100,
-  lines at `WHEEL_LINE_HEIGHT`, 32 px). Prepaint calls `set_canvas_bounds(bounds)` and
-  `prepare_frame(&mut engine)`, `wake_delay(&engine)` schedules the deferred wake,
-  `cursor_style(engine.input_cursor())` is the one cursor mapping, and
-  `install_text_metrics(&mut engine, window)` runs before a frame is prepared so drawing labels
-  measure as they paint. The host's own key tables, cursor priority, and text-edit routing are
-  redundant beside the adapter and should be deleted rather than kept.
-- Two follow-ups after `17a591f`. `1869773 feat(input): TradingView wheel zoom anchoring,
-  engine-owned on every host` (upstream) renamed `GpuiChartInput::set_origin(Point<Pixels>)` to
-  `set_canvas_bounds(Bounds<Pixels>)` (only a pin at `17a591f` itself had the old name), added
-  `input_pinch` with `GpuiChartInput::pinch`, and made
-  `TimeScaleOptions::right_bar_stays_on_scroll` default to `true`: a plain wheel or keyboard zoom
-  keeps the gap after the newest bar, and only Ctrl/Cmd wheel and pinch zoom around the pointer.
-  Call `ChartEngine::set_right_bar_stays_on_scroll(false)` for the earlier zoom around the pointer
-  (wheel) or the plot centre (keys). The merge `3eef45e merge: sync with AerisTerminal/aeris-charts
-  main (range tools, input controller)` (own line) added `ChartKey::EditText` (F2), so an upstream
-  pin's exhaustive `match` on `ChartKey` needs an arm.
+- 替代项与其所替代的调用行为不一致之处。这些是在代码中比对的，而非仅比对签名，且被移除的函数自引入起到 `17a591f` 之间都没有变化：
+  - 价格坐标轴上的滚轮。无论滚轮行为如何，只要指针位于某个价格比例尺的坐标轴条带上，`apply_financial_wheel` 就会缩放该价格比例尺。`input_wheel` 仅在 `InteractionOptions::wheel_behavior` 为 `WheelBehavior::Zoom` 或 `InteractionOptions::price_axis_wheel_zoom` 为 `true`（默认 `false`）时才缩放它；在默认的 `WheelBehavior::Auto` 下，同样的滚轮在坐标轴条带上缩放的是时间比例尺。要恢复旧行为，请以 `price_axis_wheel_zoom: true` 调用 `set_interaction_options`。`WheelBehavior::Zoom` 在那里同样缩放价格比例尺，但它会把每一次滚轮都变成缩放，因此水平滚轮不再平移。
+  - plot 区域上的滚轮缩放。旧调用围绕指针缩放时间比例尺。普通滚轮现在遵循 `right_bar_stays_on_scroll`（默认 `true`；参见下文的后续变更），因此最新柱之后的间隙得以保留，只有 Ctrl/Cmd 才会围绕指针缩放。`input_wheel` 还遵循 `wheel_zoom` 和 `wheel_scroll`（两者默认均为 `true`），并会停止正在进行的惯性滑行、按住方向键的平移或动画滚动。
+  - 拖动阈值。旧调用从第一次 `update_financial_drag` 起就生效（窗格平移、坐标轴缩放或分隔条调整大小）。现在窗格平移、坐标轴缩放和分隔条拖动都在共享的 5 px 阈值处开始，未移动的释放是一次点击。因此在价格坐标轴上的普通按下不再将该比例尺切换为手动：旧的 `begin_financial_drag` 在按下时就关闭自动缩放，现在则由第一个缩放步骤来关闭。窗格拖动仅在手动价格比例尺是按下位置下方系列（或窗格默认）的比例尺时才平移它；旧调用还会回退到窗格的第一个手动右侧或左侧比例尺。
+  - 价格坐标轴上的双击。`begin_financial_drag` 会运行 `reset_price_scales()`，即图表中的每个价格比例尺；`input_pointer_down` 只重置被按下的比例尺（`reset_price_scale(pane, target)`）。需要图表范围重置的宿主应为其自己的命令保留 `reset_price_scales()` 或 `reset_view()`。
+  - 释放与取消。`end_financial_drag` 只结束缩放和滚动会话。未移动的 `input_pointer_up` 还会选择或激活指针下方的对象，`input_cancel()` 结束同样的会话，但还会还原已打开的绘图或交易拖动，并清除悬停、实时测量和光标。在按下处于打开状态时，`primary_pressed` 为 false 的 `input_pointer_move` 会放弃该次按下。
+  - 方向键与缩放键。旧调用每次调用跳转 1 根柱（加速时 10 根）；`ArrowLeft` 和 `ArrowRight` 启动由速度持有的平移（参见关于时钟的一项）。`ZoomIn` 和 `ZoomOut` 锚定在 plot 区域中心；在新的 `right_bar_stays_on_scroll` 默认值下，它们改为保留最新柱之后的间隙。按键还遵循 `InteractionOptions` 的开关（滚动键使用 `pan` 或 `wheel_scroll`，缩放键使用 `wheel_zoom`；默认均为 `true`），被开关拦住的按键保持未被消费。
+- 宿主提供时钟。方向键平移由速度持有，因此需要调用 `input_key_up`，传入平台的按键重复标志，每准备一帧调用一次 `input_tick(now_ms)`，并且仅在 `input_animating()` 成立期间请求下一帧。`input_wake_deadline_ms()` 是唯一的延迟截止时间（交易提示框的停留时间）：为它安排一次唤醒并重绘。`flush_coalesced_input()` 每次 prepaint 转发一次最新捕获的绘图采样。
+- 引擎将仅宿主可做的工作以 `ChartInputEvent` 事件的形式交还（`ContextMenu`、`DrawingCreated`、`RemoveSeries`）；每次输入调用之后用 `take_input_events()` 取出它们。宿主保留事件转换、指针捕获、应用 `input_cursor()`、定时器与帧调度、菜单、剪贴板和持久化。应在 `drawing_revision()` 变化时持久化绘图，而不是跟踪手势。参考实现的 `handleScroll`/`handleScale` 开关即 `InteractionOptions`（`interaction_options()` 和 `set_interaction_options`）。
+- 较低层的手势操作（`drawing_tool_pointer_*`、`measure_pointer_*`、`delta_tooltip_mouse_*`、`kinetic_*`、`start_keyboard_scroll`、`keyboard_scroll_tick`、`cancel_keyboard_scroll`、`time_axis_*` 和 `price_axis_*` 的缩放与滚动步骤、`drag_pane_separator`）仍然是公开的引擎操作，但现在由控制器对它们排序。仍在 `input_*` 之外继续驱动它们的宿主会绕过控制器的按下仲裁和光标，因此对它们排序的宿主路由应当删除。
+- 帧准备随之变化：`prepare_financial_frame_with_measure` 在任何图层失效或输入变化之后重建，并在窗格调整大小的拖动之后重新布局。曾清空其帧以强制重建、或在 `update_financial_drag` 报告窗格调整大小时强制布局的宿主，可以停止这样做。
+- GPUI 宿主（feature `gpui-backend`）通过 `aeris_charts_render_gpui::input` 绑定，每个监听器一次适配器调用：`GpuiChartInput::mouse_down`、`mouse_move`、`mouse_up`（图表之外的释放也要绑定）、`context_menu`、`scroll_wheel`、`pinch`、`modifiers_changed`、`key_down` 和 `key_up`。`scroll_wheel` 自行转换 GPUI 的增量（像素除以 100，行按 `WHEEL_LINE_HEIGHT`（32 px）计）。prepaint 调用 `set_canvas_bounds(bounds)` 和 `prepare_frame(&mut engine)`，`wake_delay(&engine)` 安排延迟唤醒，`cursor_style(engine.input_cursor())` 是唯一的光标映射，`install_text_metrics(&mut engine, window)` 在准备帧之前运行，使绘图标签的度量与其绘制一致。宿主自己的按键表、光标优先级和文本编辑路由在适配器之外是多余的，应当删除而不是保留。
+- `17a591f` 之后的两项后续变更。`1869773 feat(input): TradingView wheel zoom anchoring, engine-owned on every host`（上游）将 `GpuiChartInput::set_origin(Point<Pixels>)` 重命名为 `set_canvas_bounds(Bounds<Pixels>)`（只有恰好位于 `17a591f` 的固定修订具有旧名称），新增了带有 `GpuiChartInput::pinch` 的 `input_pinch`，并使 `TimeScaleOptions::right_bar_stays_on_scroll` 默认为 `true`：普通滚轮或键盘缩放会保留最新柱之后的间隙，只有 Ctrl/Cmd 滚轮和捏合缩放才围绕指针缩放。如需较早的围绕指针（滚轮）或 plot 区域中心（按键）缩放，请调用 `ChartEngine::set_right_bar_stays_on_scroll(false)`。合并 `3eef45e merge: sync with AerisTerminal/aeris-charts main (range tools, input controller)`（自有线）新增了 `ChartKey::EditText`（F2），因此上游固定修订上对 `ChartKey` 的穷尽 `match` 需要补一个分支。
 
-**GPUI dependency** (own line, from `9ae1c58 gpui: build the executor on gpui-pre 0.3.6, the GPUI
-gpui-kit pins`; see [Rust distribution](#rust-distribution)). `aeris_charts_render_gpui` stopped
-depending on a Zed Git revision:
+**GPUI 依赖**（自有线，来自 `9ae1c58 gpui: build the executor on gpui-pre 0.3.6, the GPUI gpui-kit pins`；参见 [Rust 分发](#rust-分发)）。`aeris_charts_render_gpui` 不再依赖 Zed 的 Git 修订：
 
-- Before, it used `gpui` 0.2.2 from `https://github.com/zed-industries/zed` at revision
-  `1057c2cf3d5b4aefd04755e1387c7826a4d7fba6` (its manifest sourced GPUI from Zed to track the
-  current pre-1.0 API and pinned `gpui` and `gpui_platform` to that one reviewed commit). Now the
-  `gpui-backend` feature enables `gpui = { package = "gpui-pre", version = "=0.3.6" }` and the
-  parity harness uses `gpui-pre-platform` at `=0.3.6`. The manifest records this as the `gpui` that
-  gpui-kit 0.6.6 (`gpui-component`) pins, so a host on gpui-kit 0.6.6 should already resolve it;
-  that pin is not checked from this repository.
-- The host must resolve to that same package and version: replace its Zed Git dependency with the
-  `package = "gpui-pre"`, `version = "=0.3.6"` form (and `gpui-pre-platform` where it uses the
-  platform crate). A host left on the Zed revision holds two GPUI copies, and every adapter and
-  executor call that takes or returns a GPUI type (`input.mouse_down(&mut engine, &MouseDownEvent)`,
-  `install_text_metrics(&mut engine, &Window)`, `cursor_style` returning a `CursorStyle`) fails to
-  type-check against the host's copy.
-- Keep the `windows-manifest` feature on Windows: GPUI imports `comctl32!TaskDialogIndirect`, which
-  resolves only under the comctl32 v6 activation context the feature's manifest embeds, so an
-  executable without it fails to load (`STATUS_ENTRYPOINT_NOT_FOUND`) before `main`.
-- `9ae1c58` changes only the manifest, the lockfile, and documentation: the executor and adapter
-  source compiled unchanged against `gpui-pre` 0.3.6, so Aeris's own API did not change. The
-  host's own GPUI code is not checked from this repository: moving to `gpui-pre` 0.3.6 is the
-  host's change to make and verify.
+- 此前，它使用来自 `https://github.com/zed-industries/zed` 的 `gpui` 0.2.2，修订为 `1057c2cf3d5b4aefd04755e1387c7826a4d7fba6`（其清单从 Zed 获取 GPUI，以跟进当前 1.0 之前的 API，并把 `gpui` 与 `gpui_platform` 固定在那一个经过评审的提交上）。现在，`gpui-backend` feature 启用 `gpui = { package = "gpui-pre", version = "=0.3.6" }`，一致性测试框架则使用 `=0.3.6` 的 `gpui-pre-platform`。清单把它记录为 gpui-kit 0.6.6（`gpui-component`）所固定的 `gpui`，因此使用 gpui-kit 0.6.6 的宿主应当已经解析到它；该固定不在本仓库中检查。
+- 宿主必须解析到同一个包和同一版本：把其 Zed Git 依赖替换为 `package = "gpui-pre"`、`version = "=0.3.6"` 的形式（若使用平台 crate，则同时替换为 `gpui-pre-platform`）。仍停留在 Zed 修订上的宿主会同时持有两份 GPUI，每一个接收或返回 GPUI 类型的适配器与执行器调用（`input.mouse_down(&mut engine, &MouseDownEvent)`、`install_text_metrics(&mut engine, &Window)`、返回 `CursorStyle` 的 `cursor_style`）都无法针对宿主的那一份通过类型检查。
+- 在 Windows 上保持启用 `windows-manifest` feature：GPUI 导入 `comctl32!TaskDialogIndirect`，它只有在该 feature 的清单所嵌入的 comctl32 v6 激活上下文下才能解析，因此没有它的可执行文件会在 `main` 之前加载失败（`STATUS_ENTRYPOINT_NOT_FOUND`）。
+- `9ae1c58` 只改动清单、锁文件和文档：执行器与适配器源码未经修改即可针对 `gpui-pre` 0.3.6 编译，因此 Aeris 自身的 API 没有变化。宿主自己的 GPUI 代码不在本仓库中检查：迁移到 `gpui-pre` 0.3.6 是宿主需要自行完成并验证的变更。
 
-**GPUI snapshot 0.3.7** (own line, the commit that moves `gpui-pre` to 0.3.7 and every other
-dependency to its latest release; find it with `git log -S'=0.3.7' --
-crates/aeris_charts_render_gpui/Cargo.toml`). It follows gpui-kit, which moved from 0.6.6 to 0.7.0
-and pins `gpui-pre =0.3.7` together with `gpui-pre-platform`, `gpui-pre-web`, `gpui-pre-macros`
-and `gpui-pre-sum-tree` at the same version:
+**GPUI 快照 0.3.7**（自有线，即把 `gpui-pre` 升到 0.3.7、并把其余所有依赖升到最新发布版本的那个提交；可用 `git log -S'=0.3.7' -- crates/aeris_charts_render_gpui/Cargo.toml` 找到它）。它跟随 gpui-kit，后者已从 0.6.6 升到 0.7.0，并把 `gpui-pre =0.3.7` 与 `gpui-pre-platform`、`gpui-pre-web`、`gpui-pre-macros` 和 `gpui-pre-sum-tree` 固定在同一版本：
 
-- A host that consumes this executor must be on one `gpui-pre` version, so a host still on
-  gpui-kit 0.6.6 (`gpui-pre =0.3.6`) moves to gpui-kit 0.7.0 in the same change as the Aeris pin;
-  with one on each side Cargo resolves two incompatible `gpui` copies and every adapter and
-  executor call that takes or returns a GPUI type fails to type-check, as with the earlier Zed
-  revision above.
-- Aeris's own API did not change: the executor and adapter source compiled unchanged against
-  0.3.7 and the complete GPUI test suite passed unchanged. The host's own GPUI code is not checked
-  from this repository.
-- The parity harness's X11 capture moved to `x11rb` 0.14 (a Linux dev-dependency of the examples
-  only). GPUI's Linux platform still depends on `x11rb` 0.13, so the example build holds both;
-  nothing a host links is affected.
+- 使用此执行器的宿主必须只使用一个 `gpui-pre` 版本，因此仍在 gpui-kit 0.6.6（`gpui-pre =0.3.6`）上的宿主，要在升级 Aeris 固定修订的同一次变更中迁移到 gpui-kit 0.7.0；两侧版本各异时，Cargo 会解析出两份互不兼容的 `gpui`，每一个接收或返回 GPUI 类型的适配器与执行器调用都无法通过类型检查，与上文较早的 Zed 修订的情形相同。
+- Aeris 自身的 API 没有变化：执行器与适配器源码未经修改即可针对 0.3.7 编译，完整的 GPUI 测试套件也未经修改即通过。宿主自己的 GPUI 代码不在本仓库中检查。
+- 一致性测试框架的 X11 捕获已迁移到 `x11rb` 0.14（仅为示例的 Linux 开发依赖）。GPUI 的 Linux 平台仍依赖 `x11rb` 0.13，因此示例构建同时包含两者；宿主所链接的内容不受影响。
 
-**Measuring tools** (both lines, from the merge `3eef45e merge: sync with
-AerisTerminal/aeris-charts main (range tools, input controller)`). Upstream's `5a2e6e8 feat(drawings): add price/date range
-measuring tools and Shift-click measure` and the own line's `36c9f09 feat(charts): B8 drawing
-catalog, multi-calendar overlays, bounded ticks, tick-built candles, and resampling` had built the
-three range tools independently, and the merge kept the own line's implementation. Which spelling a
-pin has depends on its side:
+**测量工具**（两条线，来自合并提交 `3eef45e merge: sync with AerisTerminal/aeris-charts main (range tools, input controller)`）。上游的 `5a2e6e8 feat(drawings): add price/date range measuring tools and Shift-click measure` 与自有线的 `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded ticks, tick-built candles, and resampling` 各自独立地构建了这三个范围工具，合并保留了自有线的实现。固定修订采用哪种写法，取决于它属于哪一侧：
 
-- An upstream pin from `5a2e6e8` on has `DrawingKind::DatePriceRange`, the kind name
-  `date_price_range`, and the wire ids 13 (`PriceRange`), 14 (`DateRange`), and 15
-  (`DatePriceRange`). An own-line pin from `36c9f09` on (`36c9f09` itself, for example) already has
-  `DrawingKind::DateAndPriceRange`, the name `date_and_price_range`, and the ids 130, 131, and 132,
-  which is what main keeps. For an own-line pin there is no rename and no id remap; only the grid
-  snap below applies. A pin on either side before those commits has no range tools.
-- For an upstream pin, `DrawingKind::DatePriceRange` is now `DrawingKind::DateAndPriceRange`
-  (`PriceRange` and `DateRange` keep their names). The numeric wire ids of `DrawingKind::to_u8` and
-  `from_u8` moved: `PriceRange` is 130, `DateRange` 131, and `DateAndPriceRange` 132, where they
-  were 13, 14, and 15. Ids 13 to 15 are now unassigned and ids 0 to 12 are unchanged, so a host that
-  stored numeric ids from an upstream pin remaps them.
-- The kind name `date_price_range` is still read (a serde alias and `DrawingKind::from_name`) and
-  never written, so documents saved by an upstream pin still load; saved documents, templates, and
-  clipboard payloads write `date_and_price_range`.
-- Grid snap. Creation, anchor drags, body drags, and keyboard nudges of the three range tools and of
-  the long and short position tools snap to whole bars and to the instrument tick or price-band
-  ladder. An own-line pin before the merge has no such snap on these tools, so it takes this change
-  for all five (the position tools' price snapping came earlier, with the merge `2e7d19f`). An
-  upstream pin from `5a2e6e8` on already snapped them to bars and the price tick; it gains the
-  price-band ladder (`SeriesPriceFormat::tick_ladder`).
-- The Shift-click quick measure came with `5a2e6e8` (an own-line pin before the merge never had
-  it). Main drives it from the input controller (a Shift press on the pane), so `measure_pointer_*`
-  need not be called for it.
+- 上游自 `5a2e6e8` 起的固定修订具有 `DrawingKind::DatePriceRange`、种类名称 `date_price_range`，以及线上 id 13（`PriceRange`）、14（`DateRange`）和 15（`DatePriceRange`）。自有线自 `36c9f09` 起的固定修订（例如 `36c9f09` 本身）已经具有 `DrawingKind::DateAndPriceRange`、名称 `date_and_price_range` 以及 id 130、131 和 132，这也是 main 所保留的。对自有线的固定修订而言，没有重命名，也没有 id 重映射；只适用下文的网格吸附。任一侧早于这些提交的固定修订都没有范围工具。
+- 对上游的固定修订而言，`DrawingKind::DatePriceRange` 现在是 `DrawingKind::DateAndPriceRange`（`PriceRange` 与 `DateRange` 保持原名）。`DrawingKind::to_u8` 与 `from_u8` 的数值线上 id 已变动：`PriceRange` 为 130，`DateRange` 为 131，`DateAndPriceRange` 为 132，此前分别为 13、14 和 15。id 13 至 15 现为未分配，id 0 至 12 不变，因此存储了上游固定修订数值 id 的宿主需要重映射这些 id。
+- 种类名称 `date_price_range` 仍会被读取（serde 别名和 `DrawingKind::from_name`），但绝不会被写出，因此由上游固定修订保存的文档仍可加载；保存的文档、模板和剪贴板载荷写出的是 `date_and_price_range`。
+- 网格吸附。三个范围工具以及多头和空头仓位工具的创建、锚点拖动、主体拖动和键盘微调，都会吸附到整根柱以及品种 tick 或价格带价位梯。合并之前的自有线固定修订在这些工具上没有这种吸附，因此这五个工具都会获得这一变更（仓位工具的价格吸附更早，随合并 `2e7d19f` 引入）。上游自 `5a2e6e8` 起的固定修订已经让它们吸附到柱和价格 tick；它新增了价格带价位梯（`SeriesPriceFormat::tick_ladder`）。
+- Shift 点击快速测量随 `5a2e6e8` 引入（合并之前的自有线固定修订从未具有它）。main 由输入控制器驱动它（在窗格上按下 Shift），因此无需为此调用 `measure_pointer_*`。
 
-**Other source-level changes.** Each item names the commit that carries it. None of the public
-enums involved is `#[non_exhaustive]`, so every added variant is a compile-time break for an
-exhaustive `match`, and every added field is one for a struct literal that lists the fields.
+**其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
-- `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming,
-  viewport, price axis, and intraday charts` (own line):
-  - `PriceScaleCore::build_tick_marks` and `price_tick_span_calculator::composite_tick_span` take
-    `min_move: f64`, the price grid every tick lies on, where they took `base: i64`, the formatter
-    base. A base of 100 is a `min_move` of `0.01`, which is also the engine's grid on percentage
-    and indexed scales.
-  - `SessionHighlightingOptions::start_hour_utc` and `end_hour_utc` (`Option<u8>`) are now
-    `start_hour` and `end_hour` (`Option<f64>`): fractional, exchange-local hours (`9.5` is 09:30;
-    `start_hour > end_hour` wraps midnight). `Some(9)` becomes `Some(9.0)` and means the same
-    while the exchange time is UTC.
-  - `IndicatorKind::Ema`, `Dema`, `Tema`, and `Rsi` gain `seed: IndicatorSeed`, `Macd` gains
-    `seed` and `histogram_multiplier: f64`, and `Bollinger` gains `estimator:
-    DeviationEstimator`. `IndicatorSeed::Sma`, `1.0`, and `DeviationEstimator::Population` are the
-    earlier behaviour (and the serde defaults, so saved documents still read); a pattern that lists
-    the fields needs `..`.
-  - `DrawingClipboardItem::points` is `Vec<DrawingAnchor>` instead of `Vec<DrawingPoint>`
-    (`DrawingAnchor { logical: Option<f64>, price, time: Option<f64> }`, and
-    `DrawingAnchor::from(point)` converts).
-  - New variants: `IndicatorKind::Kdj` and `IndicatorParameterType::Choice`. New fields:
-    `TimeScaleOptions::lock_visible_logical_range`, `PriceScaleCoreOptions::{
-    ensure_edge_tick_marks_visible, base_value, autoscale_center, stable_auto_scale}`,
-    `PriceMark::edge`, `IndicatorInput::amount`, `SeriesPriceFormat::tick_ladder`,
-    `SeriesEntry::histogram_updown_rule`, `IndicatorBindingInfo::amount_source`,
-    `IndicatorParameterDescriptor::choices`, and `price_basis` on `DrawingClipboardPayload` and
-    `DrawingSyncPayload`.
-- `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded ticks, tick-built
-  candles, and resampling` (own line): `ChartEngine::copy_drawings_json` returns
-  `Result<String, ChartError>` instead of `Option<String>` (`ErrorCode::InvalidData` when no known
-  drawing could be copied; `ErrorCode::ResourceLimit` past `MAX_DRAWING_CLIPBOARD_POINTS` anchors,
-  checked first, and past `MAX_DRAWING_CLIPBOARD_BYTES` bytes). An upstream pin has the
-  `Option<String>` form too. New variants:
-  `DrawingKind` (the B8 catalog; later own-line commits add `HorizontalSegment`, `VerticalRay`,
-  `VerticalSegment`, `PriceChannel`, `PriceLine`, `SimpleTag`, and `SimpleAnnotation`), ten
-  `DrawingKindOptions` variants, `DrawingDragPart::Handle(usize)`,
-  `FootprintError::InvalidSessions`, `ResampleError::{InvalidSessions, TimeAxisRequired}`,
-  `TradeStudyKind::Volume`, and
-  `aeris_charts_core::model::plot_list::PlotValues::AsOf`. New fields: `Drawing::tool_options`,
-  `SeriesEntry::break_on_trading_day`, and `TradeStreamStats::{dependent_rows_computed,
-  bar_rows_projected, bubble_trades_scanned, bubble_markers_sized}`.
-- Later own-line additions: `ExchangeTimeError::BarTimeLabelWindows` (`78d7d59 feat(time):
-  close-time display labels for open-stamped bars`), `IndicatorKind::KLineChart` (`c2d837e engine:
-  bind KLineChart indicators as chart studies`), and `angle` and `multiline` on
-  `DrawingTextEditLayout`, a type the own line has had since `36c9f09` (`d438dab feat(drawings):
-  edit the text of every text-bearing tool and open the editor on placement`).
-- `960e011 feat(drawings): add complete position statistics and adaptive borders` (upstream):
-  `DrawingKindOptions::Position` gains `account_size: f64` and `risk_percent: f64`, and `Drawing`
-  gains `position_account_size` and `position_risk_percent`.
-- `5c62071 feat(engine): own native workspace identity` (upstream):
-  `prepare_financial_frame_with_measure` takes one `FinancialFrameRequest { width, height, dpr,
-  force_layout, fit_content, frame, axis_primitives }` followed by `measure` and
-  `countdown_measure`, where it took nine positional arguments (`width`, `height`, `dpr`,
-  `force_layout`, `fit_content`, `measure`, `countdown_measure`, `frame`, `axis_primitives`); it
-  still returns `FinancialFramePreparation`.
-- Upstream commits between the parting point `ed2910d` and `1869773` also changed these existing
-  public types, so a pin that does not contain them diffs the declarations it matches or
-  constructs: `TradingHitKind` gains `TakeProfitButton` and `StopLossButton` (`24e8e2d fix(trading):
-  dedicated TP/SL buttons with pixel-exact, optically centered controls`), and `TradingStyle` and
-  `TradingStyleOptions` gain `execution_buy` and `execution_sell`, while `ExecutionMarkerShape`'s
-  default is `Arrow` where it was `Circle` (`6f56736 fix(trading): bar-anchored execution arrows
-  with stacked multi-fill marks`). The range kinds and the `Position` fields are covered above. A
-  pin older than `ed2910d` also diffs the types changed before it, which this section does not
-  list.
+- `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming, viewport, price axis, and intraday charts`（自有线）：
+  - `PriceScaleCore::build_tick_marks` 与 `price_tick_span_calculator::composite_tick_span` 现在接收 `min_move: f64`（每个刻度所在的价格网格），此前接收的是 `base: i64`（格式化器的基数）。base 为 100 即 `min_move` 为 `0.01`，这也是引擎在百分比与指数化比例尺上的网格。
+  - `SessionHighlightingOptions::start_hour_utc` 与 `end_hour_utc`（`Option<u8>`）现在是 `start_hour` 与 `end_hour`（`Option<f64>`）：带小数的交易所本地小时数（`9.5` 即 09:30；`start_hour > end_hour` 时跨越午夜）。`Some(9)` 变为 `Some(9.0)`，在交易所时间为 UTC 时含义相同。
+  - `IndicatorKind::Ema`、`Dema`、`Tema` 与 `Rsi` 新增 `seed: IndicatorSeed`，`Macd` 新增 `seed` 与 `histogram_multiplier: f64`，`Bollinger` 新增 `estimator: DeviationEstimator`。`IndicatorSeed::Sma`、`1.0` 与 `DeviationEstimator::Population` 即此前的行为（同时也是 serde 默认值，因此已保存的文档仍可读取）；列出这些字段的模式需要加上 `..`。
+  - `DrawingClipboardItem::points` 现在是 `Vec<DrawingAnchor>`，而不再是 `Vec<DrawingPoint>`（`DrawingAnchor { logical: Option<f64>, price, time: Option<f64> }`，可用 `DrawingAnchor::from(point)` 转换）。
+  - 新增变体：`IndicatorKind::Kdj` 与 `IndicatorParameterType::Choice`。新增字段：`TimeScaleOptions::lock_visible_logical_range`、`PriceScaleCoreOptions::{ ensure_edge_tick_marks_visible, base_value, autoscale_center, stable_auto_scale}`、`PriceMark::edge`、`IndicatorInput::amount`、`SeriesPriceFormat::tick_ladder`、`SeriesEntry::histogram_updown_rule`、`IndicatorBindingInfo::amount_source`、`IndicatorParameterDescriptor::choices`，以及 `DrawingClipboardPayload` 和 `DrawingSyncPayload` 上的 `price_basis`。
+- `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded ticks, tick-built candles, and resampling`（自有线）：`ChartEngine::copy_drawings_json` 返回 `Result<String, ChartError>`，而不再返回 `Option<String>`（没有任何已知绘图可复制时返回 `ErrorCode::InvalidData`；超过 `MAX_DRAWING_CLIPBOARD_POINTS` 个锚点（最先检查）以及超过 `MAX_DRAWING_CLIPBOARD_BYTES` 字节时返回 `ErrorCode::ResourceLimit`）。上游的固定修订同样是 `Option<String>` 形式。新增变体：`DrawingKind`（B8 目录；自有线的后续提交又加入 `HorizontalSegment`、`VerticalRay`、`VerticalSegment`、`PriceChannel`、`PriceLine`、`SimpleTag` 和 `SimpleAnnotation`）、十个 `DrawingKindOptions` 变体、`DrawingDragPart::Handle(usize)`、`FootprintError::InvalidSessions`、`ResampleError::{InvalidSessions, TimeAxisRequired}`、`TradeStudyKind::Volume`，以及 `aeris_charts_core::model::plot_list::PlotValues::AsOf`。新增字段：`Drawing::tool_options`、`SeriesEntry::break_on_trading_day`，以及 `TradeStreamStats::{dependent_rows_computed, bar_rows_projected, bubble_trades_scanned, bubble_markers_sized}`。
+- 自有线的后续新增：`ExchangeTimeError::BarTimeLabelWindows`（`78d7d59 feat(time): close-time display labels for open-stamped bars`）、`IndicatorKind::KLineChart`（`c2d837e engine: bind KLineChart indicators as chart studies`），以及 `DrawingTextEditLayout` 上的 `angle` 与 `multiline`；自有线自 `36c9f09` 起就有该类型（`d438dab feat(drawings): edit the text of every text-bearing tool and open the editor on placement`）。
+- `960e011 feat(drawings): add complete position statistics and adaptive borders`（上游）：`DrawingKindOptions::Position` 新增 `account_size: f64` 与 `risk_percent: f64`，`Drawing` 新增 `position_account_size` 与 `position_risk_percent`。
+- `5c62071 feat(engine): own native workspace identity`（上游）：`prepare_financial_frame_with_measure` 现在接收一个 `FinancialFrameRequest { width, height, dpr, force_layout, fit_content, frame, axis_primitives }`，其后是 `measure` 与 `countdown_measure`；此前它接收九个位置参数（`width`、`height`、`dpr`、`force_layout`、`fit_content`、`measure`、`countdown_measure`、`frame`、`axis_primitives`）；它仍返回 `FinancialFramePreparation`。
+- 上游在分叉点 `ed2910d` 与 `1869773` 之间的提交还修改了这些既有的公共类型，因此不包含这些提交的固定修订，在其所匹配或构造的声明上会与此处存在差异：`TradingHitKind` 新增 `TakeProfitButton` 与 `StopLossButton`（`24e8e2d fix(trading): dedicated TP/SL buttons with pixel-exact, optically centered controls`），`TradingStyle` 与 `TradingStyleOptions` 新增 `execution_buy` 与 `execution_sell`，而 `ExecutionMarkerShape` 的默认值由 `Circle` 变为 `Arrow`（`6f56736 fix(trading): bar-anchored execution arrows with stacked multi-fill marks`）。范围种类与 `Position` 字段已在上文涵盖。早于 `ed2910d` 的固定修订还会与此前变更的类型存在差异，本节未列出这些类型。
 
-## Release policy
+## 发布策略
 
-Tag publication depends on required Rust, package, and portable Chromium/Firefox/WebKit jobs. It also
-checks persistence fixtures, public declarations, Node/SSR import, package contents, and configured
-performance budgets. `continue-on-error` is forbidden for portable correctness.
+标签发布依赖必需的 Rust、包以及可移植的 Chromium/Firefox/WebKit 作业。它还会检查持久化夹具、公共声明、Node/SSR 导入、包内容以及已配置的性能预算。可移植正确性禁止使用 `continue-on-error`。
 
-Hardware- and machine-sensitive screenshot hashes, GPU timing, heap sampling, and wall-clock evidence
-are calibration diagnostics. They remain non-authoritative and may not be approved merely to make one
-runner green. Shared draw-stream parity, clipping/order/frame-contract tests, replay determinism, and
-portable browser behavior are the authoritative gates. Scenarios without a configured benchmark
-budget remain explicitly report-only.
+对硬件和机器敏感的截图哈希、GPU 计时、堆采样和挂钟时间证据属于校准诊断。它们仍然不具权威性，不得仅为让某个 runner 通过而予以批准。共享绘制流一致性、裁剪/顺序/帧契约测试、回放确定性以及可移植的浏览器行为才是具有权威性的门禁。没有配置基准预算的场景仍明确为仅报告。

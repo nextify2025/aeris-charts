@@ -1,7 +1,7 @@
 // Intraday time-sharing (分时) chart: one A-share trading day, or five with day separators,
 // composed from public Aeris APIs only. Market data is generated deterministically (no network).
 //
-// Recipe (docs/Public_api.md, "Intraday (分时) charts"):
+// Recipe (docs/Public_api.md, "分时图"):
 //   1. `session_slot_times` reserves every minute of the session as a whitespace slot.
 //   2. A baseline series relative to the previous close (red above, green below) carries price;
 //      the left axis is autoscaled symmetrically around the previous close and a mirror series

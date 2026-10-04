@@ -1,302 +1,116 @@
-# Footprint / Numbers Bars Design
+# Footprint / Numbers Bars 设计
 
-This document is the durable design contract for GitHub issue #23. It describes the tick-truth
-model that Aeris Charts uses for professional footprint series. `Architecture.md` remains the
-authority for crate ownership and dependency direction.
+本文档是 GitHub issue #23 的长期设计契约。它描述了 Aeris Charts 用于专业足迹图系列的 tick 真值（tick-truth）模型。`Architecture.md` 仍是 crate 归属与依赖方向的权威文档。
 
-## 1. Trade event and ordering model
+## 1. 成交事件与排序模型
 
-A footprint series ingests trades, never synthetic OHLC clusters. Each event carries:
+足迹图系列摄入的是成交，绝不是合成的 OHLC 聚簇。每个事件携带：
 
-- a signed Unix timestamp at microsecond resolution;
-- tick-aligned price and positive volume;
-- host-provided aggressor side (`buy`, `sell`, or `unknown`);
-- optional contemporaneous bid and ask;
-- optional provider sequence and stable trade ID;
-- opaque condition bits for later microstructure extensions; and
-- an optional host-defined session ID.
+- 带符号的 Unix 时间戳，微秒精度；
+- 与 tick 对齐的价格和正的成交量；
+- 宿主提供的主动方（`buy`、`sell` 或 `unknown`）；
+- 可选的同时刻买价（bid）和卖价（ask）；
+- 可选的提供方序列号和稳定的成交 ID；
+- 为日后的微观结构扩展保留的不透明条件位；以及
+- 可选的宿主自定义交易时段 ID。
 
-Microseconds preserve exchange ordering while remaining exactly representable for contemporary
-dates in JavaScript numbers. The browser boundary rejects unsafe integers. Equal timestamps sort by
-provider sequence, then stable input order. A trade ID makes replay idempotent and permits a provider
-correction to replace the prior event. A batch containing the same trade ID twice is rejected
-atomically rather than choosing an undocumented winner.
+微秒既保留了交易所的排序，又使当代日期能在 JavaScript 数字中被精确表示。浏览器边界拒绝不安全整数。时间戳相同的事件先按提供方序列号排序，再按稳定的输入顺序排序。成交 ID 使回放具有幂等性，并允许提供方的更正替换先前的事件。同一批量中若两次出现同一成交 ID，则整体原子地拒绝，而不是选择一个未文档化的胜出者。
 
-The retained trade tape is authoritative. Derived bars may be discarded and rebuilt. Tip events use
-an incremental path. A late event or correction is inserted in canonical order; the shipped path
-rebuilds the complete retained series once and reports that work. It never patches final bar totals
-while leaving the Max/Min Delta path stale. A measured suffix-checkpoint path may replace that full
-reconstruction later without changing the public result.
+保留的成交带是权威来源。派生的柱可以被丢弃并重建。末端事件走增量路径。迟到事件或更正按规范顺序插入；已交付的路径会对完整的保留系列重建一次，并报告这部分工作量。它绝不会在修补柱最终合计的同时让 Max/Min Delta 路径保持过期。经过测量的后缀检查点路径日后可以取代这种完整重建，而不改变公共结果。
 
-Prices must lie on the configured integer tick grid. Aeris rejects off-grid data rather than
-rounding financial truth silently. Volume is finite and positive. A session-ID change closes the
-current bar and resets session cumulative delta.
+价格必须落在配置的整数 tick 网格上。Aeris 拒绝离网数据，而不是悄悄舍入金融真值。成交量是有限的正数。交易时段 ID 变化会关闭当前柱，并重置交易时段累计 delta。
 
-## 2. Aggressor-side classification
+## 2. 主动方分类
 
-Classification is deterministic and ordered by authority:
+分类是确定性的，并按权威性排序：
 
-1. A host-provided `buy` or `sell` side is accepted as authoritative.
-2. For `unknown`, a trade at or above the supplied ask is a buy; at or below the supplied bid it is
-   a sell.
-3. Otherwise the tick rule compares with the previous canonical trade: higher is buy, lower is
-   sell, and an unchanged price carries the previous classified side.
-4. If none of those rules resolves the event, it remains unknown.
+1. 宿主提供的 `buy` 或 `sell` 方向被视为权威。
+2. 对于 `unknown`，成交价大于或等于所提供的卖价（ask）则为买；小于或等于所提供的买价（bid）则为卖。
+3. 否则按 tick 规则与前一笔规范成交比较：更高为买，更低为卖，价格不变则沿用前一次已分类的方向。
+4. 如果以上规则都无法判定该事件，则其保持 unknown。
 
-Unknown volume contributes to price-level, bar, and POC total volume, but not bid volume, ask volume,
-delta, imbalance, or cumulative delta. Aeris never guesses a side merely to make a cluster look
-complete. Historical reconstruction reruns classification in canonical event order, so inserting a
-late event can correctly change the classification of later ambiguous events.
+未知方向的成交量计入价位、柱和 POC 的总成交量，但不计入 bid 量、ask 量、delta、失衡或累计 delta。Aeris 绝不会仅为了让聚簇看起来完整而猜测方向。历史重建按规范事件顺序重新运行分类，因此插入一个迟到事件可以正确地改变其后含糊事件的分类。
 
-## 3. Aggregation and accounting
+## 3. 聚合与记账
 
-The aggregation model supports aligned time bars, fixed trade-count bars, whole-trade volume bars,
-and tick-grid range bars. A trade is never split to hit an exact volume or range threshold. A new session always starts a new
-bar. Time bars align to the configured anchor, or, once the host anchors the stream to exchange
-session windows, restart at every window open in the chart's exchange time with out-of-window
-prints folded into the nearest bar of their trading day or excluded (see `Public_api.md`, "Ticks to
-candles"). Time bars retain their whole-second display projection; trade-count, volume, and range bars
-are chart-integrated through a chart-local logical row key and an engine-owned sequence sidecar.
-That sidecar carries each bar's full-resolution open/close microsecond bounds for labels, crosshair,
-and visible-range lookup, so several bars in one second are never assigned false timestamps.
-`BarSequenceMapping` provides deterministic anchor rebasing when a sequence is prepended or rebuilt.
-The chart retires the sidecar when its last non-time footprint and dependent are removed, so a
-later time-only series cannot inherit stale logical labels.
-Non-time tip updates replace only the affected suffix and keep derived delta studies on the same
-logical row keys, including capped series: retention drops row keys from the front without re-keying,
-so later tips, studies, and bubble markers continue from the projection's first retained key, and a
-footprint, candle/bar, or study bound after a trim installs from that same key. Trade
-bubbles also use logical bar indices while their aggregation windows retain microsecond comparison
-precision.
-Chart value snapshots and series queries expose the corresponding UTC-second label instead of the
-internal row key.
-Incremental replay and release performance evidence remain part of the B5 performance exit.
+聚合模型支持对齐的时间柱、固定成交笔数柱、整笔成交的成交量柱，以及 tick 网格范围柱。成交绝不会被拆分以恰好达到成交量或范围阈值。新的交易时段总是开启新柱。时间柱按配置的锚点对齐；一旦宿主把数据流锚定到交易所交易时段窗口，则在图表的交易所时间下于每个窗口开盘时重新开始，窗口外的成交要么并入其交易日最近的柱，要么被排除（参见 `Public_api.md` 的“Tick 转 K 线”一节）。时间柱保留其整秒的显示投影；成交笔数柱、成交量柱和范围柱通过图表本地的逻辑行键和引擎拥有的序列 sidecar 集成到图表中。该 sidecar 携带每根柱完整分辨率的开盘/收盘微秒边界，用于标签、十字光标和可见范围查找，因此同一秒内的多根柱绝不会被赋予虚假的时间戳。`BarSequenceMapping` 在序列被前置追加或重建时提供确定性的锚点重新定基。当图表中最后一个非时间足迹图及其依赖项都被移除时，图表会撤销该 sidecar，因此之后的纯时间系列不会继承过期的逻辑标签。非时间柱的末端更新只替换受影响的后缀，并使派生的 delta 研究保持在相同的逻辑行键上，包括设有上限的系列：保留策略从前端丢弃行键而不重新分配键，因此之后的末端更新、研究和气泡标记继续从投影中第一个保留的键开始，而在修剪之后绑定的足迹图、K 线/柱或研究也从同一个键开始安装。成交气泡同样使用逻辑柱索引，而其聚合窗口保留微秒级的比较精度。图表值快照和系列查询暴露对应的 UTC 秒级标签，而不是内部行键。增量回放与 release 性能证据仍属于 B5 的性能退出条件。
 
-Each bar retains OHLC, bid/ask/unknown/total volume, trade count, final delta, delta percentage,
-session cumulative delta, and sorted price levels. Each level retains bid, ask, unknown, total, and delta. Trades are
-validated against the instrument `tick_size`; integer row identity is
-`floor(round(price / tick_size) / ticks_per_row)`, avoiding repeated floating-point price comparisons.
-`ticks_per_row` (default 1) groups adjacent ticks into one row so dense instruments stay legible; a
-level's `price` is the lowest tick of its row, and bar OHLC keeps exact trade prices.
+每根柱保留 OHLC、bid/ask/unknown/总成交量、成交笔数、最终 delta、delta 百分比、交易时段累计 delta 以及已排序的价位。每个价位保留 bid、ask、unknown、总量和 delta。成交按品种的 `tick_size` 校验；整数行标识为 `floor(round(price / tick_size) / ticks_per_row)`，以避免重复的浮点价格比较。`ticks_per_row`（默认 1）把相邻 tick 归并为一行，使密集品种保持可读；价位的 `price` 是其所在行的最低 tick，而柱的 OHLC 保留精确的成交价。
 
-Running bar delta begins at zero. Each classified buy adds volume and each classified sell subtracts
-volume. Max Delta is the highest running value observed after each event (including initial zero);
-Min Delta is the lowest. They are retained during live aggregation and recomputed from the tape after
-historical mutation. Final delta is not used to approximate either extreme.
+运行中的柱 delta 从零开始。每笔被分类为买的成交加上其成交量，每笔被分类为卖的成交减去其成交量。Max Delta 是每个事件之后观测到的最高运行值（包括初始的零）；Min Delta 是最低值。它们在实时聚合期间被保留，并在历史变更之后从成交带重新计算。最终 delta 不用于近似任一极值。
 
-POC is the level with maximum total volume. Ties select the level nearest the bar close, then the
-lower level. This rule is stable across live and historical construction.
+POC 是总成交量最大的价位。并列时，选择最接近柱收盘价的价位，其次选择较低的价位。该规则在实时构建和历史构建中都是稳定的。
 
-The professional diagonal imbalance rule compares:
+专业的对角失衡规则比较：
 
-- ask at level `p` against bid at `p - 1 tick`; and
-- bid at level `p` against ask at `p + 1 tick`.
+- 价位 `p` 的 ask 对比 `p - 1 tick` 的 bid；以及
+- 价位 `p` 的 bid 对比 `p + 1 tick` 的 ask。
 
-The dominant side must meet the configured minimum volume and the configured ratio. Zero opposite
-volume qualifies once the minimum is met. Missing intermediate levels break a stack. Every member of
-an adjacent run at least `consecutive_levels` long is marked as a stacked bid or ask imbalance.
-Horizontal and alternative imbalance modes are visual projections only; they cannot alter the stored
-bid/ask truth.
+占优的一方必须达到配置的最小成交量和配置的比例。只要满足最小成交量，对侧成交量为零即符合条件。缺失的中间价位会打断堆叠。长度至少为 `consecutive_levels` 的相邻连续段中，每个成员都被标记为堆叠 bid 或 ask 失衡。水平失衡和其他失衡模式仅是视觉投影；它们不能改变所存储的 bid/ask 真值。
 
-The visual aggregation mode is independent of bar construction: hosts can request Bid × Ask, Total,
-Delta, profile-in-bar, volume-ladder, horizontal-imbalance, or bid/ask-histogram cells from the same
-data without rebuilding the tape.
+视觉聚合模式独立于柱的构建：宿主可以基于同一份数据请求 Bid × Ask、Total、Delta、柱内分布（profile-in-bar）、成交量价位梯（volume-ladder）、水平失衡（horizontal-imbalance）或 bid/ask 直方图（bid/ask-histogram）单元格，而无需重建成交带。
 
-### Shared chart tape and derived studies
+### 共享图表成交带与派生研究
 
-`ChartEngine::add_trade_stream` creates one bounded stream keyed by a host instrument identity.
-The stream owns classification, canonical ordering, corrections, retention, and a monotonic revision;
-footprints, CVD, delta histograms, and bubble markers bind to that identity rather than retaining a
-second provider-event tape. CVD supports session, continuous, and anchored resets. Retention never
-rewrites the CVD values of retained bars: the stream carries the evicted bars' session and continuous
-cumulative delta as seeds, and an anchored CVD keeps the base its evicted bars established (a CVD
-created after its anchor bar was evicted anchors at the first retained bar). Delta dependents
-read final delta, Max/Min Delta, delta percentage, and bid/ask/unknown volumes from the same bars,
-and the volume dependent reads each bar's total volume for ordinary tick-built candles.
+`ChartEngine::add_trade_stream` 创建一个以宿主品种标识为键的有界流。该流拥有分类、规范排序、更正、保留策略和单调递增的修订号；足迹图、CVD、delta 直方图和气泡标记绑定到该标识，而不是再保留第二份提供方事件成交带。CVD 支持交易时段、连续和锚定三种重置。保留策略绝不会改写保留柱的 CVD 值：该流把被淘汰柱的交易时段累计 delta 和连续累计 delta 作为种子携带，而锚定 CVD 保留其被淘汰柱所建立的基值（在锚点柱被淘汰之后才创建的 CVD 锚定在第一根保留的柱上）。Delta 依赖项从同一批柱读取最终 delta、Max/Min Delta、delta 百分比和 bid/ask/unknown 成交量，而成交量依赖项为普通的由 tick 构建的 K 线读取每根柱的总成交量。
 
-A stream is the only writer of its dependents. A trade-bound candle or bar and the CVD, delta, and
-volume studies refuse every host data write (set, install, update, batch, merge, sequenced update,
-per-point colors, pop), exactly like a footprint, so a stray write can no longer rewrite the row
-keys that every other presentation of a non-time stream continues from. One series has one engine
-writer: `configure_footprint_series` returns `FootprintError::SeriesOwned` for a series that a
-stream, a study, a resampler, or synthetic bars already write, and
-`bind_trade_bar_series_to_stream` returns it for a candlestick or bar that a resampler, synthetic
-bars, or a study converted to a candle writes (a footprint or scalar study fails the candle-kind
-check first, with `UnsupportedTradeBarSeries`; a bound candle rebinds to another stream freely).
-Resampling and synthetic-bar configuration refuse such a series as their target. The tip and
-rebuild paths write through the engine's internal installers, not the host entry points, so the
-guard costs a tip nothing. Retention still follows the stream: a bound candle refuses a `max_points`
-cap, while a study keeps its own.
+流是其依赖项的唯一写入者。与足迹图一样，绑定成交的 K 线或柱，以及 CVD、delta 和成交量研究，都拒绝一切宿主数据写入（set、install、update、batch、merge、带序列的更新、逐点颜色、pop），因此误写不会再改写非时间流的其他所有呈现所沿用的行键。一个系列只有一个引擎写入者：对于已被流、研究、重采样器或合成柱写入的系列，`configure_footprint_series` 返回 `FootprintError::SeriesOwned`；对于已被重采样器、合成柱或转换为 K 线的研究所写入的 K 线或柱，`bind_trade_bar_series_to_stream` 同样返回该错误（足迹图或标量研究会先因 K 线类型检查失败而返回 `UnsupportedTradeBarSeries`；已绑定的 K 线可以自由地重新绑定到另一个流）。重采样和合成柱配置拒绝把这样的系列作为目标。末端更新和重建路径通过引擎内部的安装器写入，而不是宿主入口，因此该守卫不会给末端更新增加任何开销。保留策略仍跟随该流：已绑定的 K 线拒绝 `max_points` 上限，而研究保留其自身的上限。
 
-Large-trade bubbles are bounded marker dependents: translucent circles centred on the traded price,
-colored by aggressor side, with area proportional to volume relative to the largest retained bubble.
-They support minimum-volume filtering, optional same-side same-price consecutive-print aggregation
-within one bar (merged volume sets the size), and a hard marker cap that retains the newest prints.
-On time bars a bubble carries the open of the bar holding its print, so it paints on that bar even
-when session anchoring folds an auction or lunch print into it; an excluded print has no bubble, and
-an id-less marker is named by its print's own second. Rebuilds and live tips run the same resumable
-fold, so both place, merge, and size bubbles identically. Late events refresh all dependents after
-one canonical rebuild; stream telemetry reports revision, retained capacity, dependent count,
-dependent rebuilds and incremental updates, and lifetime work counters for study rows computed, bar
-rows projected, bubble trades folded, and bubble marker sizes computed.
+大额成交气泡是有界的标记依赖项：以成交价为圆心的半透明圆，按主动方着色，面积与成交量成正比，并相对于保留气泡中最大者而定。它们支持最小成交量过滤、可选的在同一根柱内对同方向同价位的连续成交做聚合（合并后的成交量决定大小），以及保留最新成交的硬性标记数量上限。在时间柱上，气泡携带容纳其成交的那根柱的开盘时间，因此即使交易时段锚定把集合竞价或午间的成交并入该柱，气泡仍绘制在该柱上；被排除的成交没有气泡，没有 ID 的标记以其成交自身所在的秒来命名。重建和实时末端更新运行相同的可续接折叠，因此二者放置、合并和确定气泡大小的方式完全一致。迟到事件在一次规范重建之后刷新所有依赖项；流遥测报告修订号、保留容量、依赖项数量、依赖项重建次数和增量更新次数，以及生命周期累计的工作计数器：已计算的研究行数、已投影的柱行数、已折叠的气泡成交数和已计算的气泡标记大小数。
 
-## 4. Rendering and LOD
+## 4. 渲染与细节层级（LOD）
 
-Footprint geometry is constructed in `aeris_charts_engine` as ordinary backend-neutral primitives.
-Backends preserve the resulting order, clipping, alpha, text alignment, and pixel coordinates; no
-executor recalculates POC, delta, or imbalance.
+足迹图几何在 `aeris_charts_engine` 中构建为普通的、与后端无关的图元。后端保留所得的顺序、裁剪、alpha、文本对齐和像素坐标；没有任何执行器会重新计算 POC、delta 或失衡。
 
-At readable density, each visible bar paints:
+在可读密度下，每根可见柱依次绘制：
 
-1. optional delta-tinted bar background;
-2. per-level bid and ask cells (or the selected Total/Delta layout);
-3. POC emphasis;
-4. bid/ask imbalance and stacked-imbalance emphasis;
-5. aligned volume text; and
-6. a bounded two-line bar summary containing final, Max, and Min Delta plus total, bid, and ask
-   volume.
+1. 可选的按 delta 着色的柱背景；
+2. 每个价位的 bid 和 ask 单元格（或所选的 Total/Delta 布局）；
+3. POC 强调；
+4. bid/ask 失衡和堆叠失衡强调；
+5. 对齐的成交量文本；以及
+6. 有界的两行柱摘要，包含最终 delta、Max Delta 和 Min Delta，以及总成交量、bid 成交量和 ask 成交量。
 
-Text uses the chart's resolved font family and centered columns. Colors are resolved before frame
-execution, and the default text color follows live chart-theme changes. Max/Min Delta are visible in
-the summary and queryable even when LOD hides text.
+文本使用图表已解析的字体族和居中的列。颜色在帧执行之前解析，默认文本颜色跟随实时的图表主题变更。即使 LOD 隐藏了文本，Max/Min Delta 在摘要中仍然可见，并且可以查询。
 
-LOD is selected from horizontal bar width and vertical tick-row height:
+LOD 依据水平方向的柱宽和垂直方向的 tick 行高选择：
 
-- **Detailed:** bid/ask (or selected mode) text, cells, POC, imbalance, and summary.
-  The two-line summary is omitted while the bar is too narrow to fit it without
-  overprinting neighboring bars (`bar_spacing < 9 × font_size`).
-- **Cells:** colored level cells and POC/stacked emphasis, without glyphs.
-- **Summary:** one delta/volume body plus POC marker per bar.
-Frame work is bounded to the visible logical range. At the densest zoom, Summary mode is already one
-body and one POC marker per visible bar; hidden text does not enter the draw list or text atlas.
-Every backend therefore receives exactly the same chosen LOD.
+- **详细（Detailed）：** bid/ask（或所选模式）文本、单元格、POC、失衡和摘要。当柱过窄、无法在不与相邻柱的文字重叠的情况下容纳两行摘要时（`bar_spacing < 9 × font_size`），省略该摘要。
+- **单元格（Cells）：** 彩色的价位单元格以及 POC/堆叠强调，不绘制字形。
+- **摘要（Summary）：** 每根柱一个 delta/成交量柱体加一个 POC 标记。帧工作量以可见逻辑范围为界。在最密集的缩放下，摘要模式已经是每根可见柱一个柱体和一个 POC 标记；被隐藏的文本不会进入绘制列表或文本图集。因此每个后端接收到的 LOD 选择完全相同。
 
-## 5. Storage, invalidation, and recovery
+## 5. 存储、失效与恢复
 
-One chart-level stream owns one canonical trade tape and one derived bar vector. A footprint series
-owns only visual options and a stream handle; CVD, delta, volume, and bubble dependents own no
-provider tape.
-A bar owns sorted price levels;
-there is no renderer-side cluster cache. Tip append mutates only the active bar or appends one bar,
-projects only that changed suffix into the footprint and any bound candles/bars (also under a
-retention ceiling), and invalidates those series. CVD/delta/volume studies recompute only that suffix
-(CVD from a cached running fold), and bubble markers fold only the appended trades (no work without bubble
-dependents): they size only new or merged bubbles and rescale every retained marker only when the
-peak bubble volume changes. `trade_stream_stats` reports each as a work counter, and every tip
-result equals a clean rebuild of that dependent. The tip that crosses a retention ceiling (once per
-hysteresis margin, 1/32 of the cap) evicts the leading bars, exactly the trades they aggregated, and
-the bubbles made only of those trades in place: it reconstructs nothing and never scans the
-retained tape, so its work is proportional to the evicted trades plus the retained rows (renumbering
-the retained bars and the data layer's own trim of the affected rows). Every presentation of the
-stream leaves the data layer in one transaction: the timestamp union merges and every plot
-reindexes once, however many presentations the stream has.
-Closed bars are immutable on the
-live path. Historical insertion/correction reconstructs canonical state once after the final tape is
-known and replaces the projection once. The current reconstruction is intentionally full-series;
-work statistics expose that cost so suffix checkpoints can be added when measurements justify them.
+一个图表级的流拥有一份规范成交带和一个派生柱向量。足迹图系列只拥有视觉选项和一个流句柄；CVD、delta、成交量和气泡依赖项不拥有提供方成交带。一根柱拥有已排序的价位；不存在渲染器侧的聚簇缓存。末端追加只修改活跃柱或追加一根柱，只把变化的后缀投影到足迹图和任何已绑定的 K 线/柱（在保留上限下同样如此），并使这些系列失效。CVD/delta/成交量研究只重新计算该后缀（CVD 从缓存的累计折叠状态继续），气泡标记只折叠新追加的成交（没有气泡依赖项时不做任何工作）：它们只为新增或合并的气泡确定大小，并且仅当峰值气泡成交量变化时才重新缩放每个保留的标记。`trade_stream_stats` 把每一项作为工作计数器报告，并且每次末端更新的结果都等于对该依赖项做一次干净重建的结果。跨过保留上限的末端更新（每经过一个滞后余量触发一次，余量为上限的 1/32）会原地淘汰最前面的柱、它们所聚合的恰好那些成交，以及仅由这些成交构成的气泡：它不重建任何内容，也从不扫描保留的成交带，因此其工作量与被淘汰的成交加上保留的行数成正比（对保留的柱重新编号，以及数据层自身对受影响行的修剪）。该流的所有呈现都在一次事务中离开数据层：时间戳并集只合并一次，每个 plot 只重新索引一次，无论该流有多少种呈现。已关闭的柱在实时路径上是不可变的。历史插入/更正在最终成交带确定之后一次性重建规范状态，并一次性替换投影。当前的重建有意采用全系列方式；工作统计暴露这一成本，以便在测量证明有必要时加入后缀检查点。
 
-Vectors, the tape deque, and the trade-ID index reuse their allocated capacity. Series retention
-evicts complete old bars and the trades they aggregated together (counted per bar, so a trade sharing
-its microsecond with the next bar's open stays with its own bar, and a session-anchored bar's folded
-opening-auction print, stamped before the bar's open, leaves with that bar; prints the session policy
-excludes join no bar, so eviction steps over them and takes those stamped before the first retained
-bar's first print) while preserving the
-classification/session/cumulative-delta seed needed by the remaining tape; no orphan tape or derived
-history survives. The ID index keeps absolute tape positions, so eviction removes only the evicted
-IDs, and replay checkpoints inside the retained suffix are re-addressed rather than rebuilt. Every
-footprint bound to the stream drops the same rows, since footprint geometry reads stream bar `i` for
-row `i`. Bubble folds materialize markers only for retained bubbles, so a refold over a long tape
-holds at most `max_markers` markers. Engine memory telemetry includes tape, levels, the ID index,
-bubble folds, and retained capacities.
+向量、成交带双端队列和成交 ID 索引复用其已分配的容量。系列保留策略把完整的旧柱与它们所聚合的成交一并淘汰（按柱计数，因此与下一根柱的开盘共享同一微秒的成交仍留在其自身的柱中；交易时段锚定柱中被并入的开盘集合竞价成交，其时间戳早于该柱的开盘，随该柱一起被淘汰；被交易时段策略排除的成交不属于任何柱，因此淘汰会跳过它们，并只带走时间戳早于第一根保留柱首笔成交的那些成交），同时保留其余成交带所需的分类/交易时段/累计 delta 种子；不会残留孤立的成交带或派生历史。ID 索引保存成交带的绝对位置，因此淘汰只移除被淘汰的 ID，保留后缀内的回放检查点被重新寻址而不是重建。绑定到该流的每个足迹图都丢弃相同的行，因为足迹图几何对第 `i` 行读取流的第 `i` 根柱。气泡折叠只为保留的气泡物化标记，因此对长成交带重新折叠时至多持有 `max_markers` 个标记。引擎内存遥测包括成交带、价位、ID 索引、气泡折叠和保留容量。
 
-Device loss is irrelevant to this model: the headless tape and derived bars remain intact while the
-browser executor falls back. Renderer caches are rebuilt from the same frame contract.
+设备丢失与该模型无关：无头的成交带和派生柱保持完好，而浏览器执行器回退。渲染器缓存由同一帧契约重建。
 
-## 6. API surface
+## 6. API 接口面
 
-The Rust engine owns typed commands to create/configure a footprint series, atomically replace a
-trade tape, append/correct one trade, ingest an ordered batch, query a bar and price level, and read
-work/memory statistics. The WebAssembly boundary accepts typed columns for historical and live batch
-ingest; object conversion is reserved for the low-frequency single-event API.
+Rust 引擎拥有以下类型化命令：创建/配置足迹图系列、原子地替换成交带、追加/更正单笔成交、摄入有序批量、查询柱和价位，以及读取工作量/内存统计。WebAssembly 边界接受用于历史和实时批量摄入的类型化列；对象转换仅保留给低频的单事件 API。
 
-The TypeScript package exposes a dedicated `footprint_series_api` from
-`chart.add_series("footprint", options)`. Its input is `footprint_trade`, not `series_data`; generic
-OHLC `set_data` is rejected for this kind. Queries expose bar OHLC, price levels, POC, final/Max/Min
-Delta, delta percentage, bid/ask/unknown/total volume, session delta, and stacked flags. Chart-level
-methods create CVD, delta, and bounded bubble dependents and query stream revision/telemetry. Data-change notifications use
-`full` for replacement/historical reconstruction and `update` for a true tip update.
+TypeScript 包通过 `chart.add_series("footprint", options)` 暴露专用的 `footprint_series_api`。其输入是 `footprint_trade`，而不是 `series_data`；通用 OHLC `set_data` 对该类型被拒绝。查询暴露柱 OHLC、价位、POC、最终/Max/Min Delta、delta 百分比、bid/ask/unknown/总成交量、交易时段 delta 和堆叠标志。图表级方法创建 CVD、delta 和有界的气泡依赖项，并查询流修订号/遥测。数据变更通知对替换/历史重建使用 `full`，对真正的末端更新使用 `update`。
 
-Options cover tick size, ticks per row, time-bar interval/anchor or trade-count/volume/range construction, imbalance
-ratio/minimum/consecutive count, visual cell modes, colors, text size, summaries, and generic series
-retention. Changing tick size, ticks per row, or time aggregation rebuilds from the tape atomically, keeping
-prints the replay clock hides, the retention seed, and session anchoring; bound candles/bars follow. Visual-only
-options invalidate only the series frame layer.
+选项涵盖 tick 大小、每行 tick 数、时间柱间隔/锚点或成交笔数/成交量/范围构建方式、失衡比例/最小值/连续个数、视觉单元格模式、颜色、文本大小、摘要，以及通用系列保留策略。更改 tick 大小、每行 tick 数或时间聚合会从成交带原子地重建，同时保留回放时钟所隐藏的成交、保留种子和交易时段锚定；已绑定的 K 线/柱随之更新。仅视觉相关的选项只使系列帧层失效。
 
-Host callbacks receive derived snapshots only through ordinary chart query/event paths. Aeris Terminal
-and other hosts remain authoritative for feed subscription, exchange calendars, and choosing
-session IDs; none of those concerns enter the renderer.
+宿主回调仅通过普通的图表查询/事件路径接收派生快照。Aeris Terminal 和其他宿主仍是行情订阅、交易所日历以及选择交易时段 ID 的权威；这些关注点都不会进入渲染器。
 
-## 7. Verification and performance evidence
+## 7. 验证与性能证据
 
-### Reference fixture and release baseline
+### 参考夹具与发布基线
 
-The dense order-flow reference view is deterministic: 20 one-minute bars, 11 price levels per
-bar, a 0.25 tick size, and paired buy/sell prints at every level. It is used by the GPUI
-`plan_bench` fixture at 1600×900 CSS pixels, DPR 1.5, and 72 px bar spacing, where detailed LOD
-must emit the cell text runs. The WebGPU `perf_gate` Target J consumes the same frame contract
-with a resolved atlas quad for every text primitive and guards a 2 ms p99 CPU-side encoding
-budget; this measures scheduling and upload preparation, not device present time.
+密集订单流参考视图是确定性的：20 根一分钟柱，每根柱 11 个价位，tick 大小为 0.25，且每个价位都有成对的买/卖成交。它被 GPUI `plan_bench` 夹具用于 1600×900 CSS 像素、DPR 1.5、72 px 柱间距的场景，其中详细 LOD 必须输出单元格文本 run。WebGPU `perf_gate` Target J 使用同一帧契约，并为每个文本图元提供已解析的图集 quad，同时守护 2 ms 的 p99 CPU 侧编码预算；这衡量的是调度和上传准备，而不是设备呈现（present）时间。
 
-The sustained native release baseline remains Target D: 2,500 retained one-minute bars with 100
-trades per bar, a 100-bar live batch, and a 10-bar correction batch. Its budgets are 300 ms for
-historical load, 50 ms for the live batch, 300 ms for correction, and 16.67 ms for frame
-construction, with retention bounded to the configured history. It then streams 9,000 single-trade
-live tips (crossing the retention ceiling once) into the chart with bound candles, CVD, delta, and
-bubbles, requires every tip's work counters to stay within the changed bar suffix and the new
-trade with no tape reconstruction, budgets the tip p99 at 0.25 ms, and budgets the slowest tip (the
-one crossing the ceiling) at one 16.67 ms frame. The trim tip also runs exactly one union merge
-and one reindex for the whole data layer, which `perf_gate` requires alongside the work counters.
-Commands and thresholds are kept in the release examples so a clean `--release` run can be
-compared without importing machine-specific timings into the repository; `perf_gate` prints the
-measured tip p99 and slowest tip against these budgets. Its report-only Target D2 prints the
-data layer's retention trim across series counts (1, 4, 8) and retained rows (2,500 to 40,000),
-one `trim_fronts` against one `trim_front` per series, because the trim scales with both. It has no
-threshold: the trim stays proportional to the retained rows, and a cost independent of the cap
-(absolute row identity in the summary pyramid and plot indices, and a lazy head offset on the
-series columns) is deferred for a product decision on whether trim latency must not grow with the
-cap; Target D2 at 28,800 rows and four or more series, against a bar of about 2 ms, is its measure.
+持续的原生 release 基线仍是 Target D：保留 2,500 根一分钟柱、每根柱 100 笔成交，外加 100 根柱的实时批量和 10 根柱的更正批量。其预算为：历史加载 300 ms，实时批量 50 ms，更正 300 ms，帧构建 16.67 ms，且保留量以配置的历史长度为界。随后它把 9,000 次单笔成交的实时末端更新（跨过保留上限一次）流入带有已绑定 K 线、CVD、delta 和气泡的图表，要求每次末端更新的工作计数器都保持在变化的柱后缀和新成交之内、不发生成交带重建，把末端更新的 p99 预算定为 0.25 ms，并把最慢的末端更新（即跨过上限的那一次）的预算定为一个 16.67 ms 帧。触发修剪的末端更新还会对整个数据层恰好运行一次并集合并和一次重新索引，`perf_gate` 要求其与工作计数器一并满足。命令和阈值保存在 release 示例中，因此可以对干净的 `--release` 运行进行比较，而无需把特定机器的计时数据引入仓库；`perf_gate` 会对照这些预算打印测得的末端更新 p99 和最慢的末端更新。其仅作报告的 Target D2 会打印数据层的保留修剪在不同系列数（1、4、8）和保留行数（2,500 到 40,000）下的耗时，对每个系列各做一次 `trim_fronts` 对比一次 `trim_front`，因为修剪成本同时随二者增长。它没有阈值：修剪保持与保留行数成正比，而与上限无关的成本（汇总金字塔和 plot 索引中的绝对行标识，以及系列列上的惰性头部偏移）则被推迟，待产品就修剪延迟是否必须不随上限增长作出决定；其度量是 Target D2 在 28,800 行和四个或更多系列下，对照约 2 ms 的标准。
 
-The finite GPUI real-window probe was also exercised on the current Windows display with the
-footprint fixture: 30 frames at DPR 1.25 and 500 source bars produced 24 cached text runs (zero
-misses), with adapter p50/p99 of 2.005/4.508 ms and GPUI paint p50/p95/p99 of 2.005/2.369/4.341 ms.
-These numbers are an observed host run, not a portable release budget; the probe does not expose
-native WebGPU device-present timing.
+有限帧数的 GPUI 真实窗口探针也已在当前 Windows 显示器上用足迹图夹具运行：在 DPR 1.25 和 500 根源柱下的 30 帧产生了 24 个缓存的文本 run（零次未命中），适配器 p50/p99 为 2.005/4.508 ms，GPUI 绘制 p50/p95/p99 为 2.005/2.369/4.341 ms。这些数字是一次被观测的宿主运行结果，不是可移植的 release 预算；该探针不暴露原生 WebGPU 设备呈现计时。
 
-The 2026-09-26 release gate measured the same dense fixture through the native WebGPU CPU-side
-encoding path: 120 resolved text primitives produced 120 atlas instances, with a 0.00 ms p99
-encoding sample against the 2.00 ms Target J budget. The Chromium footprint suite also passed all
-six cases, including the WebGPU shared-frame path. These checks cover executor scheduling and
-browser integration; native device-present timing and the GPUI display-specific numbers above
-remain diagnostic rather than portable budgets.
+2026-09-26 的 release 门禁通过原生 WebGPU CPU 侧编码路径测量了同一密集夹具：120 个已解析的文本图元产生 120 个图集实例，p99 编码样本为 0.00 ms，对照 2.00 ms 的 Target J 预算。Chromium 足迹图套件也通过了全部六个用例，包括 WebGPU 共享帧路径。这些检查覆盖执行器调度和浏览器集成；原生设备呈现计时以及上文各 GPUI 显示器相关数字仍属诊断性质，而非可移植预算。
 
-Order-flow milestone evidence was captured on 2026-09-26. The GPUI pane capture used
-`AERIS_CHARTS_GPUI_FEATURE=footprint` at DPR 1.25 and produced a 1543×873 image for the dense
-12-bar fixture; the image was visually inspected for readable cell text, stable column alignment,
-and unclipped pane content. The browser accessibility review passed the focused
-`unified-interaction-accessibility.spec.mjs` contract: one bounded application surface, hidden
-canvas pixels, a silent live region during streaming, and keyboard drawing edits that roll back.
-The capture image remains a transient milestone artifact; the command and metadata are recorded
-here so the evidence can be reproduced without adding binary fixtures to the repository.
+订单流里程碑证据采集于 2026-09-26。GPUI 窗格截图在 DPR 1.25 下使用 `AERIS_CHARTS_GPUI_FEATURE=footprint`，为密集的 12 根柱夹具生成了一张 1543×873 的图像；该图像经目视检查，单元格文本可读、列对齐稳定、窗格内容未被裁剪。浏览器无障碍审查通过了聚焦的 `unified-interaction-accessibility.spec.mjs` 契约：一个有界的应用表面、隐藏的 canvas 像素、流式更新期间静默的 live region，以及可回滚的键盘绘图编辑。该截图仍是临时的里程碑产物；命令和元数据记录在此，因此无需向仓库添加二进制夹具即可复现该证据。
 
-Deterministic synthetic tapes cover grid boundaries, unknown-side handling, quote/tick-rule
-classification, equal timestamps and sequences, late events, corrections, session resets,
-session-anchored time bars through live tips and retention, all bar modes, bid/ask/total/delta levels, POC ties, mean-reverting Max/Min Delta paths, both imbalance sides,
-and stacked-run breaks. Frame tests cover every shipped LOD and primitive ordering. Browser tests
-exercise the same engine-built frame through Canvas2D and WebGPU as well as typed ingest and public
-queries; GPUI and native consume those existing backend-neutral primitive kinds without footprint
-math or footprint-specific executor branches.
+确定性的合成成交带覆盖：网格边界、未知方向处理、报价/tick 规则分类、相同的时间戳和序列、迟到事件、更正、交易时段重置、贯穿实时末端更新和保留策略的交易时段锚定时间柱、所有柱模式、bid/ask/总量/delta 价位、POC 并列、均值回归的 Max/Min Delta 路径、失衡的两侧，以及堆叠连续段的中断。帧测试覆盖每一种已交付的 LOD 和图元顺序。浏览器测试通过 Canvas2D 和 WebGPU 执行同一份由引擎构建的帧，以及类型化摄入和公共查询；GPUI 和原生消费这些已有的、与后端无关的图元种类，不含足迹图数学运算，也没有足迹图专用的执行器分支。
 
-The release evidence fixture measures a large historical tape plus sustained live append. It records
-aggregation/rebuild work, frame CPU, draw count, upload bytes, retained memory, and allocations.
-Acceptance requires tip updates not to rebuild prior bars, stable memory under configured retention,
-and bounded visible-frame work as history grows.
+release 证据夹具测量一份大型历史成交带加上持续的实时追加。它记录聚合/重建工作量、帧 CPU、绘制次数、上传字节数、保留内存和分配。验收要求末端更新不重建先前的柱、在配置的保留策略下内存稳定，并且随着历史增长可见帧的工作量保持有界。

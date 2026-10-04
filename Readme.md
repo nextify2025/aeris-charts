@@ -1,21 +1,16 @@
 # Aeris Charts
 
-Aeris Charts is the Rust chart engine for [Aeris Terminal](https://aeristerminal.com) and browser
-hosts. One deterministic chart model powers WebGPU, Canvas2D, GPUI, and native rendering.
+Aeris Charts 是面向 [Aeris Terminal](https://aeristerminal.com) 和浏览器宿主的 Rust 图表引擎。同一个确定性图表模型驱动 WebGPU、Canvas2D、GPUI 和原生渲染。
 
-The project includes professional chart interactions, drawings, technical indicators, multiple panes and scales, custom series, primitives, shared-memory market-data input, and backend parity tooling.
+该项目包含专业的图表交互、绘图、技术指标、多窗格与多比例尺、自定义系列、图元、共享内存行情数据输入，以及后端一致性工具。
 
-## Rust crates
+## Rust crate
 
-Rust hosts depend on the `aeris_charts_*` crates from this repository through Git or path
-dependencies; they are not published to crates.io. `aeris_charts_engine` owns chart state,
-interactions, drawings, indicators, and frame construction, and hosts pair it with a renderer such
-as `aeris_charts_render_wgpu` or `aeris_charts_native` (see [Repository layout](#repository-layout)).
+Rust 宿主通过 Git 或路径依赖，从本仓库依赖 `aeris_charts_*` crate；这些 crate 不会发布到 crates.io。`aeris_charts_engine` 拥有图表状态、交互、绘图、指标和帧构建，宿主将其与渲染器（例如 `aeris_charts_render_wgpu` 或 `aeris_charts_native`）搭配使用（参见[仓库结构](#仓库结构)）。
 
-## Browser package
+## 浏览器包
 
-The browser SDK is published through GitHub Packages as `@aeristerminal/aeris-charts`. Configure
-the Aeris Terminal scope before installing:
+浏览器 SDK 通过 GitHub Packages 以 `@aeristerminal/aeris-charts` 发布。安装前请先配置 Aeris Terminal 作用域：
 
 ```text
 @aeristerminal:registry=https://npm.pkg.github.com
@@ -25,11 +20,9 @@ the Aeris Terminal scope before installing:
 npm install @aeristerminal/aeris-charts
 ```
 
-Version tags publish automatically after release credentials are configured and the tag matches
-`packages/charts/package.json` exactly
-(for example, package version `0.9.0` is released from tag `v0.9.0`).
+在配置好发布凭据且标签与 `packages/charts/package.json` 完全一致后，版本标签会自动发布（例如，包版本 `0.9.0` 由标签 `v0.9.0` 发布）。
 
-Create a chart with the asynchronous camel-case API:
+使用异步的驼峰式 API 创建图表：
 
 ```ts
 import { createChart } from "@aeristerminal/aeris-charts";
@@ -48,11 +41,9 @@ candles.setData([
 chart.timeScale().fitContent();
 ```
 
-The original snake-case names remain available on the same chart and series handles. Options and
-data fields retain their documented names; the camel-case aliases apply to the common method calls.
+原有的蛇形命名在同一个图表和系列句柄上仍然可用。选项和数据字段保留其文档中记载的名称；驼峰式别名适用于常用的方法调用。
 
-Financial and general series can share one chart lifecycle while occupying panes with compatible
-coordinate domains:
+金融系列和通用系列可以共享同一个图表生命周期，同时分别占用坐标域兼容的窗格：
 
 ```ts
 const summary = chart.addPane({
@@ -71,9 +62,7 @@ revenue.setData([{ id: "jan", x: "Jan", y: 42 }, { id: "feb", x: "Feb", y: 57 }]
 chart.render();
 ```
 
-The same engine is available as an optional React authoring layer. Install React in applications that
-use it, then import the adapter from the package subpath; framework-neutral applications do not load
-or depend on React:
+同一引擎还提供可选的 React 编写层。使用它的应用需安装 React，然后从包子路径导入适配器；与框架无关的应用不会加载 React，也不依赖 React：
 
 ```sh
 npm install @aeristerminal/aeris-charts react
@@ -106,27 +95,15 @@ export function Dashboard({ candles, revenue }) {
 }
 ```
 
-The adapter creates the ordinary imperative chart once, reconciles data/configuration onto retained
-engine handles, and calls the same `chart.remove()` lifecycle on unmount. Its module is safe to import
-during SSR because chart creation and DOM access begin only after the component mounts. Complete
-framework-neutral and React combined examples live in `examples/all_in_one/`.
+适配器只创建一次普通的命令式图表，将数据与配置协调到保留的引擎句柄上，并在卸载时调用相同的 `chart.remove()` 生命周期。其模块可在 SSR 期间安全导入，因为图表创建和 DOM 访问仅在组件挂载之后才开始。完整的框架无关与 React 组合示例位于 `examples/all_in_one/`。
 
-The optimized WASM binary is shipped beside the ESM entry and resolves there automatically. Bundlers
-that require an explicit asset URL may import `@aeristerminal/aeris-charts/wasm` (or their normal URL-loader
-form of that export) and pass the resulting URL to `initWasm()` before creating a chart; no `pkg/`,
-`crates/`, demo, or repository path is part of the consumer contract.
+优化后的 WASM 二进制文件与 ESM 入口一同分发，并自动在该位置解析。需要显式资源 URL 的打包器可以导入 `@aeristerminal/aeris-charts/wasm`（或该导出对应的常规 URL 加载器形式），并在创建图表之前将得到的 URL 传给 `initWasm()`；`pkg/`、`crates/`、演示或仓库路径均不属于使用方契约。
 
-Numeric times are finite whole UTC seconds in the exact inclusive range
-`-62167219200..253402300799` (years 0000..9999). Aeris never auto-converts numeric timestamps;
-rejections include a likely milliseconds, microseconds, or nanoseconds hint when applicable.
-Direct set/update batches reject atomically on any invalid timestamp, and invalid single updates
-leave existing data unchanged. Inspect `series.last_ingestion_diagnostics()` for the reason.
+数值时间是有限的整数 UTC 秒，取值范围为闭区间 `-62167219200..253402300799`（年份 0000..9999）。Aeris 绝不自动转换数值时间戳；拒绝时会在适用的情况下附带可能是毫秒、微秒或纳秒的提示。直接的 set/update 批量写入在出现任何无效时间戳时会原子地整体拒绝，无效的单条更新则保持现有数据不变。原因请检查 `series.last_ingestion_diagnostics()`。
 
-## Advanced chart features
+## 高级图表功能
 
-The advanced financial series are first-class Rust-engine series. Their data, autoscale projection,
-geometry, lifecycle, and rendering are shared by every backend; the browser package only translates
-public data and options at the WASM boundary:
+高级金融系列是一等的 Rust 引擎系列。它们的数据、自动缩放投影、几何、生命周期和渲染由每个后端共享；浏览器包仅在 WASM 边界处转换公共数据和选项：
 
 ```ts
 import { create_volume_profile } from "@aeristerminal/aeris-charts";
@@ -146,42 +123,17 @@ const profile = create_volume_profile(candles, {
 // profile.set_data(next_time_anchored_profile); profile.detach();
 ```
 
-The engine-owned feature set includes brushable area, grouped bars, heatmap, HLC area,
-pretty histogram, shaded background, stacked area,
-stacked bars, and box-and-whisker series. Primitive helpers include accessibility, anchored text,
-official ±10% price bands, delta and ordinary tooltips, highlighted-bar
-crosshair, image watermark, overlay price scale, partial price line, rectangle/trend/vertical
-drawings, session highlighting, volume profile, and user-defined price lines.
+引擎拥有的功能集包括可刷选面积图、分组柱、热力图、HLC 面积图、美化直方图、阴影背景、堆叠面积图、堆叠柱以及箱线图系列。图元辅助函数包括无障碍、锚定文本、官方 ±10% 价格带、差值提示框与普通提示框、高亮柱十字光标、图像水印、叠加价格比例尺、局部价格线、矩形/趋势线/垂直线绘图、交易时段高亮、成交量分布以及用户自定义价格线。
 
-Heatmap-around-line and shaded-background examples are composed beneath a normal line series.
+线周围热力图与阴影背景示例叠放在普通折线系列下方。
 
-Features that Aeris already owns—drawings (including Long Position and Short Position tools, the price range, date range, and date-and-price range measuring tools, and the Shift-click quick measure), bands, price lines, overlay scales, partial-last-price
-lines, session shading, highlighted bar slots, and time-anchored volume profiles—are thin helpers
-over those engine APIs. Accessibility is enabled by default; `chart.accessibility()` returns its
-singleton controller and `enable_accessibility(chart, options)` configures the same instance for
-compatibility. Keyboard/ARIA nodes and announcements remain browser DOM chrome, while bounded data
-queries, focus geometry, drawing edits, and rendering primitives use the shared engine. Streaming
-market updates are silent unless `announce_data_updates` is enabled. Every returned feature handle
-with `detach()` releases its engine and host state.
+Aeris 已经拥有的功能——绘图（包括 Long Position 和 Short Position 工具、价格区间、日期区间以及日期与价格区间测量工具，还有 Shift 点击快速测量）、价格带、价格线、叠加比例尺、局部最新价格线、交易时段着色、高亮柱槽位以及按时间锚定的成交量分布——都是这些引擎 API 之上的薄辅助层。无障碍默认启用；`chart.accessibility()` 返回其单例控制器，`enable_accessibility(chart, options)` 为保持兼容而配置同一个实例。键盘/ARIA 节点和播报仍属于浏览器 DOM 外壳，而有界的数据查询、焦点几何、绘图编辑和渲染图元则使用共享引擎。除非启用 `announce_data_updates`，流式行情更新保持静默。每个带有 `detach()` 的返回功能句柄都会释放其引擎状态和宿主状态。
 
-Browser input uses Pointer Events for mouse and pen, plus cancellable Touch Events for dynamic
-page-scroll arbitration. The engine owns the bounded gesture state, 5 px drag threshold,
-fixed-start-centroid cumulative pinch behavior, primary-touch continuation, cancellation, and
-device-aware hit tolerances. Wheel policy is configurable with
-`wheel_behavior: "auto" | "pan" | "zoom"`; informed by measured behavior from the pinned public
-reference fixture, auto zooms time from
-vertical deltas and pans time from horizontal deltas independently on the pane or either axis, with
-no Ctrl/Shift special case. The explicit `pan` and `zoom` values retain Aeris extension routing.
+浏览器输入对鼠标和触控笔使用 Pointer Events，并对动态页面滚动仲裁使用可取消的 Touch Events。引擎拥有有界的手势状态、5 px 拖动阈值、固定起始质心的累计捏合行为、主触点延续、取消，以及感知设备的命中容差。滚轮策略可通过 `wheel_behavior: "auto" | "pan" | "zoom"` 配置；参考固定的公共参考实现夹具中测得的行为，auto 在窗格或任一坐标轴上独立地根据垂直增量缩放时间、根据水平增量平移时间，没有 Ctrl/Shift 特例。显式的 `pan` 和 `zoom` 值保留 Aeris 的扩展路由。
 
-## Trading and order management
+## 交易与订单管理
 
-Trading objects are a separate first-party engine domain. The application supplies authoritative
-positions, working orders, bracket/OCO relationships, executions, and instrument metadata; Aeris
-owns their deterministic visualization, native axis labels, hit testing, risk/reward regions, and
-local interaction previews. A drag never rewrites confirmed broker state. Instant mode emits one
-typed, broker-neutral intent on release; manual mode holds the preview behind inline Confirm and
-Discard controls. The host reconciles a confirmed preview with an accepted state update or rejects
-it explicitly. Risk/reward fills belong only to active previews, never confirmed orders.
+交易对象是独立的自有引擎领域。应用提供权威的持仓、挂单、括号/OCO 关系、成交以及品种元数据；Aeris 拥有它们的确定性可视化、原生坐标轴标签、命中测试、风险/回报区域以及本地交互预览。拖动绝不会改写已确认的券商状态。即时模式在释放时发出一个类型化的、与券商无关的意图；手动模式则将预览保留在内联的 Confirm 和 Discard 控件之后。宿主用已接受的状态更新来协调已确认的预览，或显式拒绝它。风险/回报填充仅属于活动预览，绝不属于已确认的订单。
 
 ```ts
 const trading = chart.trading();
@@ -209,48 +161,38 @@ if (plan && (plan.kind() === "long_position" || plan.kind() === "short_position"
 }
 ```
 
-Live trading objects, previews, and intent queues are chart-local runtime state and are deliberately
-excluded from `chart.export_state()`.
+实时交易对象、预览和意图队列是图表本地的运行时状态，并且有意不包含在 `chart.export_state()` 中。
 
-Give the container an explicit size; the chart canvases fill it.
+请为容器指定明确的尺寸；图表画布会填满该容器。
 
-Import the portable design system once in browser hosts:
+在浏览器宿主中导入一次可移植的设计系统：
 
 ```ts
 import "@aeristerminal/aeris-charts/design.css";
 ```
 
-Light is the CSS default. Set `data-theme="dark"` (or class `dark`) on a root element for dark
-mode, and apply `theme_options("dark")` to the chart. Host chrome and chart labels default to the
-system UI font stack. Chart font remains an explicit layout option so a host webfont cannot shift
-financial labels until the host sets it.
-Chart defaults use the same semantic roles directly: foreground for axes and value text, and muted
-for crosshair-label surfaces. Crosshair lines use the theme-independent `crosshair_line` token
-(`#4a4a4a`) in both themes.
+浅色是 CSS 的默认主题。在根元素上设置 `data-theme="dark"`（或类 `dark`）即可启用深色模式，并对图表应用 `theme_options("dark")`。宿主外壳和图表标签默认使用系统 UI 字体栈。图表字体仍是显式的布局选项，因此在宿主设置它之前，宿主的网页字体不会使金融标签发生偏移。图表默认值直接使用相同的语义角色：坐标轴和数值文本使用 foreground，十字光标标签表面使用 muted。十字光标线在两种主题中均使用与主题无关的 `crosshair_line` 令牌（`#4a4a4a`）。
 
-## Repository layout
+## 仓库结构
 
-- `crates/aeris_charts_core` — validated data, scales, options, formatting, and shared math.
-- `crates/aeris_charts_indicators` — platform-free indicator calculations.
-- `crates/aeris_charts_engine` — chart state, interactions, drawings, panes, and frame construction.
-- `crates/aeris_charts_render` — backend-neutral primitives and the ordered draw list.
-- `crates/aeris_charts_render_wgpu` — WebGPU executor.
-- `crates/aeris_charts_render_gpui` — GPUI executor.
-- `crates/aeris_charts_wasm` — browser and WebAssembly boundary.
-- `crates/aeris_charts_native` — deterministic native rendering and performance verification.
-- `packages/charts` — TypeScript browser package.
-- `examples/web_demo` — browser integration and parity test host; it is not a published package.
-- `docs` — architecture, public API, domain-model, and contribution documentation.
-- `plan` — active product and expansion plans.
+- `crates/aeris_charts_core`——已验证的数据、比例尺、选项、格式化和共享数学运算。
+- `crates/aeris_charts_indicators`——与平台无关的指标计算。
+- `crates/aeris_charts_engine`——图表状态、交互、绘图、窗格和帧构建。
+- `crates/aeris_charts_render`——后端中立的图元和有序绘制列表。
+- `crates/aeris_charts_render_wgpu`——WebGPU 执行器。
+- `crates/aeris_charts_render_gpui`——GPUI 执行器。
+- `crates/aeris_charts_wasm`——浏览器与 WebAssembly 边界。
+- `crates/aeris_charts_native`——确定性原生渲染与性能验证。
+- `packages/charts`——TypeScript 浏览器包。
+- `examples/web_demo`——浏览器集成与一致性测试宿主；它不是已发布的包。
+- `docs`——架构、公共 API、领域模型和贡献文档。
+- `plan`——现行的产品与扩展计划。
 
-See [Architecture.md](docs/Architecture.md) for ownership, data flow, and backend boundaries.
-See [Public_api.md](docs/Public_api.md) for supported/experimental surfaces, persistence, errors, and
-version policy.
+有关所有权、数据流和后端边界，参见 [Architecture.md](docs/Architecture.md)。有关受支持/实验性接口、持久化、错误和版本策略，参见 [Public_api.md](docs/Public_api.md)。
 
-## Development
+## 开发
 
-Prerequisites: stable Rust, the `wasm32-unknown-unknown` target, `wasm-pack`, Bun, and Node.js 18 or newer
-(the `node` scripts and Playwright run on Node).
+前置条件：稳定版 Rust、`wasm32-unknown-unknown` 目标、`wasm-pack`、Bun，以及 Node.js 18 或更新版本（`node` 脚本和 Playwright 在 Node 上运行）。
 
 ```sh
 cargo test --workspace
@@ -263,37 +205,22 @@ bun run typecheck
 bun run test:pack
 ```
 
-The complete verification gates are documented in [AGENTS.md](AGENTS.md) and enforced by CI.
-Contribution requirements are documented in [CONTRIBUTING.md](docs/CONTRIBUTING.md).
+完整的验证门禁记录在 [AGENTS.md](AGENTS.md) 中，并由 CI 强制执行。贡献要求记录在 [CONTRIBUTING.md](docs/CONTRIBUTING.md) 中。
 
-## Performance evidence
+## 性能证据
 
-Reproducible release-package benchmarks live in [`benchmarks/`](benchmarks/README.md). The harness records deterministic workloads, raw samples, statistical summaries, build and machine provenance, capability limits, package sizes, browser CPU/GPU timing, memory, lifecycle, scaling, and soak behavior. Shared CI results are diagnostics; only clean runs from the controlled benchmark environment may produce public claims or release baselines.
+可复现的 release 包基准测试位于 [`benchmarks/`](benchmarks/README.md)。该测试框架记录确定性工作负载、原始样本、统计汇总、构建与机器来源信息、能力限制、包体积、浏览器 CPU/GPU 耗时、内存、生命周期、伸缩性以及长时间运行行为。共享 CI 的结果仅作诊断之用；只有受控基准测试环境中的干净运行才可以产出公开声明或发布基线。
 
-## License
+## 许可证
 
-Aeris Charts is open-source software licensed under the
-[GNU Affero General Public License v3.0](LICENSE), identified by the SPDX expression
-`AGPL-3.0-only`. The AGPL permits commercial use, modification, and redistribution subject to its
-copyleft and corresponding-source requirements, including its network-interaction provisions.
+Aeris Charts 是开源软件，依据 [GNU Affero General Public License v3.0](LICENSE) 授权，其 SPDX 表达式为 `AGPL-3.0-only`。AGPL 允许商业使用、修改和再分发，但须遵守其 copyleft 与对应源代码要求，包括其中关于网络交互的条款。
 
-Organizations that cannot comply with the AGPL may obtain a separate Aeris Terminal Commercial License
-for proprietary integration, redistribution, OEM/embedded use, white-label use, support, and custom
-engineering. The commercial option is a separate agreement; it does not add restrictions to the
-public AGPL grant. See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
+无法遵守 AGPL 的组织，可以获取单独的 Aeris Terminal Commercial License，用于专有集成、再分发、OEM/嵌入式使用、白标使用、支持和定制工程。商业选项是一份单独的协议；它不会为公开的 AGPL 授权增加任何限制。参见 [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)。
 
-## Independent development and third-party references
+## 独立开发与第三方参考
 
-Aeris Charts is independently designed and implemented. Public documentation, public examples,
-and observed behavior from established charting products are used to learn common user expectations
-and to build development-only compatibility comparisons. Those references do not share Aeris's
-engine, rendering, or state-management implementation.
+Aeris Charts 是独立设计和实现的。公开文档、公开示例以及对成熟图表产品的行为观察，仅用于了解常见的用户期望，并构建仅限开发用途的兼容性对比。这些参考资料不与 Aeris 共享引擎、渲染或状态管理实现。
 
-The KLineChart indicator port is the exception: its formulas are translated from
-[KLineChart](https://github.com/klinecharts/KLineChart) v10.0.3 (Apache-2.0) and credited in
-[NOTICE](NOTICE) and the module documentation.
+KLineChart 指标移植是例外：其公式转译自 [KLineChart](https://github.com/klinecharts/KLineChart) v10.0.3（Apache-2.0），并在 [NOTICE](NOTICE) 和模块文档中注明出处。
 
-Development tests use Lightweight Charts as a pinned Apache-2.0 dependency through its public API.
-That dependency is not included in the published `@aeristerminal/aeris-charts` package. TradingView and
-Lightweight Charts are trademarks of their respective owners; Aeris Charts is not affiliated with
-or endorsed by TradingView. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+开发测试通过 Lightweight Charts 的公共 API，将其作为固定版本的 Apache-2.0 依赖使用。该依赖不包含在已发布的 `@aeristerminal/aeris-charts` 包中。TradingView 和 Lightweight Charts 是其各自所有者的商标；Aeris Charts 与 TradingView 没有隶属关系，也未获得 TradingView 的认可。参见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

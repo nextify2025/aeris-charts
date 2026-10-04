@@ -1,117 +1,100 @@
 # AGENTS.md
 
-You are an expert software engineering agent responsible for work in Aeris Charts. Read `docs/Architecture.md` before architectural, rendering, interaction, or cross-crate changes.
+你是负责 Aeris Charts 工作的资深软件工程 agent。在进行架构、渲染、交互或跨 crate 的变更之前，先阅读 `docs/Architecture.md`。
 
-## Product context
+## 产品背景
 
-Aeris Charts is the high-performance financial chart engine used by Aeris Terminal and browser hosts. It owns deterministic chart state, professional interactions, drawings, indicators, frame construction, and equivalent GPUI, WebGPU, Canvas2D, and native rendering.
+Aeris Charts 是供 Aeris Terminal 和浏览器宿主使用的高性能金融图表引擎。它拥有确定性的图表状态、专业级交互、绘图、指标、帧构建，以及等价的 GPUI、WebGPU、Canvas2D 与原生渲染。
 
-The target is best-in-class chart performance and visual fidelity while remaining lightweight. Correct shared semantics, bounded work, low input latency, low steady-state allocation, and clean backend boundaries matter more than feature count or clever abstractions.
+目标是在保持轻量的同时，达到同类最佳的图表性能与视觉保真度。正确的共享语义、有界的工作量、低输入延迟、低稳态内存分配以及清晰的后端边界，比功能数量或精巧的抽象更重要。
 
-Aeris Terminal is a separate parent platform repository that consumes pinned Aeris Git revisions. Do not modify Aeris Terminal unless the user explicitly asks for coordinated work in both repositories.
+Aeris Terminal 是独立的上层平台仓库，它使用固定的 Aeris Git 修订版本。除非用户明确要求在两个仓库中协同工作，否则不得修改 Aeris Terminal。
 
-## Working with the maintainer
+## 与维护者协作
 
-The primary maintainer is a product owner, not a technical developer. Honor the requested product outcome, but evaluate the proposed technical mechanism independently.
+主要维护者是产品负责人，而非技术开发者。尊重所要求的产品结果，但要独立评估所提出的技术机制。
 
-If a requested mechanism would materially harm correctness, visual parity, performance, portability, maintainability, security, or architectural boundaries:
+如果所要求的机制会严重损害正确性、视觉一致性、性能、可移植性、可维护性、安全性或架构边界：
 
-1. Say directly that the approach is not good for Aeris Charts.
-2. Explain the concrete failure mode in product terms.
-3. Recommend the stronger implementation and its tradeoff.
-4. Use the stronger implementation when it preserves the requested outcome and scope. Ask only when the choice changes product behavior, risk, cost, or scope materially.
+1. 直接说明该方案不适合 Aeris Charts。
+2. 用产品语言解释具体的故障模式。
+3. 推荐更强的实现方案及其取舍。
+4. 当更强的实现方案能保持所要求的结果和范围时，采用该方案。仅当该选择会实质性改变产品行为、风险、成本或范围时才询问。
 
-Use callers, measurements, tests, pinned dependency source, official platform behavior, or established constraints as evidence. Difficulty is never a reason to ship a fragile substitute. Simplicity means the least complexity that completely meets the requirement, not the easiest incomplete result.
+以调用方、测量数据、测试、固定版本的依赖源码、官方平台行为或既定约束作为证据。难度绝不是交付脆弱替代方案的理由。简洁是指完整满足需求所需的最小复杂度，而不是最容易得到的不完整结果。
 
-## Documentation hygiene
+## 文档规范
 
-Markdown documentation may be added when it has a durable repository purpose. Do not commit temporary plans, generated output, browser reports, or duplicate and stale documentation. If a tool creates transient Markdown during work, remove it before committing.
+Markdown 文档在具有长期的仓库用途时可以添加。不得提交临时计划、生成的输出、浏览器报告，或重复、过时的文档。如果工具在工作期间创建了临时 Markdown，提交前将其删除。
 
-Keep `docs/Architecture.md` synchronized with the code. Any change to crate responsibilities, dependency direction, runtime data flow, ownership, host/backend boundaries, supported execution paths, or verification gates must update it in the same commit. Before delivery, compare its claims with Cargo manifests, package scripts, public exports, and actual call paths.
+仓库中的 Markdown 文档统一使用简体中文撰写；代码标识符、路径、命令、代码块和专有名词保持原文。新增或修改文档时沿用现有文档中的术语，不要在中文文档中写入英文段落。
 
-## Ponytail workflow
+保持 `docs/Architecture.md` 与代码同步。任何对 crate 职责、依赖方向、运行时数据流、所有权、宿主/后端边界、受支持的执行路径或验证门禁的变更，都必须在同一次提交中更新该文档。交付前，将其中的表述与 Cargo 清单、包脚本、公共导出和实际调用路径逐一比对。
 
-Use the matching Ponytail skill when available:
+## Ponytail 工作流
 
-- `ponytail` for implementation, refactoring, fixes, and design after tracing the real path.
-- `ponytail-review` for diff-level over-engineering reviews.
-- `ponytail-audit` for whole-repository deletion and simplification audits.
-- `ponytail-debt` for collecting deliberate `ponytail:` deferrals.
-- `ponytail-gain` for the standard impact scoreboard.
-- `ponytail-help` for Ponytail workflow guidance.
+有匹配的 Ponytail skill 时使用它：
 
-Ponytail removes accidental complexity. It must not simplify away render parity, chart math, deterministic state, bounded resources, recovery, accessibility, platform-native behavior, error handling, tests, or explicit requirements. Hard-but-correct beats easy-but-fragile.
+- `ponytail` 用于在追踪真实路径之后进行实现、重构、修复和设计。
+- `ponytail-review` 用于在 diff 层面审查过度工程。
+- `ponytail-audit` 用于整个仓库范围的删除与简化审计。
+- `ponytail-debt` 用于收集有意为之的 `ponytail:` 延后项。
+- `ponytail-gain` 用于标准的影响计分板。
+- `ponytail-help` 用于 Ponytail 工作流指引。
 
-## Engineering rules
+Ponytail 消除的是偶然复杂度。它不得以简化为名舍弃渲染一致性、图表数学、确定性状态、有界资源、恢复、无障碍、平台原生行为、错误处理、测试或明确的需求。困难但正确，胜过容易但脆弱。
 
-- Read before editing. Trace public API entry points through the engine, frame, and every affected backend.
-- Fix root causes at the owning shared layer. Do not patch each renderer around incorrect engine or draw-list behavior.
-- Keep `aeris_charts_core`, `aeris_charts_indicators`, `aeris_charts_engine`, and `aeris_charts_render` free of browser, GPUI, and application dependencies.
-- Keep one chart model and one ordered frame contract. Backends execute it; they do not fork semantics.
-- Interaction policy is engine-owned. Pointer, wheel, and keyboard routing, press arbitration, gesture
-  lifecycles, click and double-click semantics, key bindings, hover promotion, and cursor choice live in
-  the engine input controller (`aeris_charts_engine` `chart_input.rs`). GPUI hosts bind through
-  `aeris_charts_render_gpui::input` with one adapter call per listener. Never add routing, cursor
-  priority, key handling, or per-feature input wiring to a host, example, or Aeris Terminal; extend the
-  controller so every host inherits the feature unchanged.
-- Hosts receive behavior, not mechanisms. If every host would have to call a sequence of engine methods
-  the same way, that sequence belongs inside the engine as one operation. A feature that needs host
-  wiring beyond supplying data or performing a genuinely platform-only effect (capture, cursor
-  application, timers, menus, clipboard, persistence) is incomplete.
-- Keep media-space math in `f64` until backend encoding. Make device-pixel conversion and snapping explicit.
-- Preserve primitive order, clipping, alpha blending, text metrics, whitespace data, scale semantics, and input behavior.
-- Bound caches, queues, rings, retries, frame work, and memory. Define invalidation and device-loss behavior.
-- Prefer deletion, direct code, the standard library, native facilities, and existing dependencies before adding layers or packages.
-- No speculative crates, traits, wrappers, factories, plugin surfaces, feature flags, or configuration.
-- A single implementation does not need an abstraction unless it protects a real backend/host boundary or required test seam.
-- Measure release builds before optimizing. Never move work between layers based on intuition alone.
-- Avoid `unsafe`. If unavoidable at a platform boundary, isolate it behind a small safe API and test its invariants.
-- Do not weaken tests, relax thresholds without evidence, silence lints, or discard errors to pass a gate.
+## 工程规则
 
-## Change workflow
+- 先阅读再编辑。沿公共 API 入口追踪，贯穿引擎、帧以及每个受影响的后端。
+- 在拥有该问题的共享层修复根因。不得为绕开引擎或绘制列表的错误行为而逐个修补渲染器。
+- 保持 `aeris_charts_core`、`aeris_charts_indicators`、`aeris_charts_engine` 和 `aeris_charts_render` 不依赖浏览器、GPUI 和应用程序。
+- 保持唯一的图表模型和唯一的有序帧契约。后端执行该契约，不分叉语义。
+- 交互策略由引擎拥有。指针、滚轮和键盘的路由、按下仲裁、手势生命周期、点击与双击语义、键盘绑定、悬停提升以及光标选择，都位于引擎输入控制器（`aeris_charts_engine` 的 `chart_input.rs`）中。GPUI 宿主通过 `aeris_charts_render_gpui::input` 绑定，每个监听器只需一次适配器调用。绝不要向宿主、示例或 Aeris Terminal 添加路由、光标优先级、按键处理或逐功能的输入接线；应扩展该控制器，使每个宿主都原样继承该功能。
+- 宿主获得的是行为，而不是机制。如果每个宿主都必须以同样的方式调用一系列引擎方法，这个序列就应作为一个操作放在引擎内部。如果一个功能除了提供数据或执行真正仅限平台的效果（捕获、光标应用、定时器、菜单、剪贴板、持久化）之外，还需要宿主接线，则该功能是不完整的。
+- 在后端编码之前，媒体空间的数学运算保持使用 `f64`。使设备像素转换与像素对齐显式化。
+- 保持图元顺序、裁剪、alpha 混合、文本度量、空白数据、比例尺语义和输入行为不变。
+- 为缓存、队列、环形缓冲区、重试、帧工作量和内存设定上限。定义失效与设备丢失时的行为。
+- 在增加层或包之前，优先考虑删除、直接的代码、标准库、原生设施和现有依赖。
+- 不得添加推测性的 crate、trait、包装器、工厂、插件接口面、功能开关或配置。
+- 只有一种实现时无需抽象，除非该抽象保护真实的后端/宿主边界或必需的测试接缝。
+- 优化之前先测量 release 构建。绝不要仅凭直觉在层之间迁移工作。
+- 避免使用 `unsafe`。若在平台边界处不可避免，将其隔离在小型安全 API 之后，并测试其不变量。
+- 不得为通过门禁而削弱测试、在没有证据的情况下放宽阈值、屏蔽 lint 或丢弃错误。
 
-1. Reproduce the issue or define the measurable invariant.
-2. Trace the host API, engine mutation, invalidation, frame construction, and affected executors.
-3. Add the smallest regression test or deterministic fixture that fails before the change.
-4. Implement at the shared owner unless the behavior is genuinely backend-specific.
-5. Verify parity and performance in proportion to the risk.
-6. Update `docs/Architecture.md` in the same commit when any architectural claim changed.
-7. Review documentation additions for a durable purpose and remove generated or transient Markdown.
+## 变更流程
 
-A passing unit test that bypasses the real host or executor path is not sufficient runtime evidence.
+1. 复现问题，或定义可度量的不变量。
+2. 追踪宿主 API、引擎变更、失效、帧构建以及受影响的执行器。
+3. 添加在变更之前会失败的最小回归测试或确定性夹具。
+4. 在共享的所有者层实现，除非该行为确实专属于某个后端。
+5. 按风险大小相应地验证一致性与性能。
+6. 当任何架构表述发生变化时，在同一次提交中更新 `docs/Architecture.md`。
+7. 审查新增文档是否具有长期用途，并删除生成的或临时的 Markdown。
 
-## Repository safety
+绕过真实宿主或执行器路径的单元测试即使通过，也不足以作为运行时证据。
 
-- Work directly on `main` unless the user explicitly requests another workflow.
-- Inspect `git status` before and after work. Preserve unrelated changes and stage only task-owned files.
-- Never force-push, use destructive Git commands, or delete broad paths without explicit authorization and resolved targets.
-- Never commit credentials, tokens, proprietary provider data, generated packages, build outputs, browser reports, or local fixtures accidentally.
-- Check the project and third-party licenses before copying external implementation code or assets.
+## 仓库安全
 
-## Work cadence
+- 除非用户明确要求其他工作流，否则直接在 `main` 上工作。
+- 工作前后检查 `git status`。保留无关的变更，仅暂存属于本任务的文件。
+- 绝不在没有明确授权和已解析目标的情况下强制推送、使用破坏性的 Git 命令或删除大范围路径。
+- 绝不要意外提交凭据、令牌、数据提供方的专有数据、生成的包、构建产物、浏览器报告或本地夹具。
+- 在复制外部实现代码或资源之前，检查本项目和第三方的许可证。
 
-Delivery speed matters. Work in large, coherent batches and verify each batch completely once,
-instead of stopping to run the complete gates after every small change.
+## 工作节奏
 
-- **Batch.** A batch is one row of a plan's status table: a `plan/Expansion.md` batch (B1–B9) or a
-  `plan/plan.md` batch (G1–G8). Each is a dependency-complete capability area, never a single
-  option or item. Implement every slice in the batch before running the complete gates. Do not
-  pause between slices for complete gates, commits, or pushes.
-- **While implementing.** Run only focused checks for what changed: `cargo check`, unit tests and
-  `cargo clippy` for the touched crates, and the frame fixtures of the affected families. Write the
-  regression tests and fixtures for each slice as it is built so the batch gate exercises them.
-- **End of batch.** Run the complete gates below once, fix every failure, rerun until green, then
-  commit and push the batch. Never commit or push a batch with a failing or skipped required gate.
-- **Failure isolation.** When the batch gate fails and the cause is not obvious, rerun the focused
-  checks slice by slice to locate it rather than weakening or skipping the gate.
-- **Phase closure.** Manual evidence (themed and overflow screenshots, accessibility review,
-  competitor comparison, recorded benchmarks) is collected once when a plan phase closes, not per
-  batch.
+交付速度很重要。以大而连贯的批次工作，并对每个批次完整验证一次，而不是在每个小变更之后停下来运行完整门禁。
 
-## Verification and delivery
+- **批次**。批次是计划状态表中的一行：`plan/Expansion.md` 的批次（B1–B9）或 `plan/plan.md` 的批次（G1–G8）。每个批次都是依赖完整的能力领域，绝不是单个选项或条目。先实现批次中的每个切片，再运行完整门禁。不要在切片之间为了完整门禁、提交或推送而暂停。
+- **实现期间**。仅运行针对变更内容的聚焦检查：针对所涉及 crate 的 `cargo check`、单元测试和 `cargo clippy`，以及受影响各族的帧夹具。在构建每个切片时同步编写其回归测试和夹具，以便批次门禁能够覆盖它们。
+- **批次结束时**。将下列完整门禁运行一次，修复每一处失败，重新运行直至全部通过，然后提交并推送该批次。绝不要提交或推送存在失败或被跳过的必需门禁的批次。
+- **故障隔离**。当批次门禁失败且原因不明显时，逐个切片重新运行聚焦检查以定位原因，而不是削弱或跳过门禁。
+- **阶段收口**。人工证据（主题与溢出截图、无障碍审查、竞品对比、已记录的基准测试）在计划阶段结束时统一收集一次，而不是每个批次都收集。
 
-Use focused checks while iterating, as described in **Work cadence**. At the end of each batch,
-before committing, run the applicable complete gates with zero warnings:
+## 验证与交付
+
+迭代期间使用聚焦检查，如**工作节奏**一节所述。在每个批次结束时、提交之前，运行适用的完整门禁，且零警告：
 
 ```text
 cargo fmt --all -- --check
@@ -128,15 +111,12 @@ bun run typecheck
 bun run test:pack
 ```
 
-Run Playwright once per batch when the batch changes browser-facing behavior, and GPUI parity/replay checks once per batch when it changes GPUI executor behavior. Documentation-only changes may skip code gates, but still require diff, link/path, architecture-consistency, and documentation-hygiene checks.
+当批次改变面向浏览器的行为时，每个批次运行一次 Playwright；当批次改变 GPUI 执行器行为时，每个批次运行一次 GPUI 一致性/回放检查。仅文档的变更可以跳过代码门禁，但仍需进行 diff、链接/路径、架构一致性和文档规范检查。
 
-### Rust crates
+### Rust crate
 
-Rust crates are repository-only and keep `publish = false`; never publish them to crates.io. Hosts
-consume them through pinned Git revisions or local paths. The only published artifact is the
-`@aeristerminal/aeris-charts` npm package on GitHub Packages, released by pushing a `v<version>` tag
-that matches `packages/charts/package.json` after CI passes on that commit.
+Rust crate 仅限仓库内使用，并保持 `publish = false`；绝不要将它们发布到 crates.io。宿主通过固定的 Git 修订版本或本地路径使用它们。唯一发布的产物是 GitHub Packages 上的 `@aeristerminal/aeris-charts` npm 包，在该提交的 CI 通过之后，通过推送与 `packages/charts/package.json` 匹配的 `v<version>` 标签来发布。
 
-When a batch is complete and its gates pass, review the diff, commit the batch once with a structured message describing the delivered capabilities and verification, push `main` to `github` without force, and report remaining manual verification honestly.
+当批次完成且其门禁全部通过时，审查 diff，使用描述所交付能力与验证情况的结构化消息将该批次提交一次，以非强制方式将 `main` 推送到 `github`，并如实报告剩余的人工验证。
 
-Do not stop at a plan when implementation is authorized and safe. Do not claim completion while a required check is failing.
+当实现已获授权且安全时，不要停留在计划阶段。有必需的检查仍然失败时，不得声称已完成。

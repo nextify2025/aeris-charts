@@ -5,7 +5,7 @@
 //! family never edits the frame lowering, the hit tester, or another family.
 //!
 //! The recipe (what to add where, wire-id ranges, test checklist) lives in
-//! `docs/Architecture.md` under "Drawing families (B8)". Shared single-list registries carry one
+//! `docs/Architecture.md` under "绘图族（B8）". Shared single-list registries carry one
 //! `// B8: <family> — begin/end` block per family; a family stream edits only inside its own.
 
 use aeris_charts_render::shape::Point;

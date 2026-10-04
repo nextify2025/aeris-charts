@@ -1,93 +1,45 @@
-# Depth, liquidity, and tape views
+# 深度、流动性与成交带视图
 
-## Ownership
+## 归属
 
-A depth stream is a bounded chart-side projection of a host publication. The host owns provider
-sessions, market-by-order assembly, recovery, and the authoritative market book. Aeris Charts owns
-only the validated state needed to render and query one chart consistently. Reusing a host key
-returns the existing stream only when its options match; dependents hold the stream identity and do
-not copy the book.
+深度流是宿主所发布数据在图表侧的有界投影。宿主拥有数据提供方会话、逐笔委托（market-by-order）组装、恢复以及权威的市场订单簿。Aeris Charts 仅拥有一致地渲染和查询单个图表所需的、经过校验的状态。复用宿主键仅在选项一致时才返回已有的流；依赖方持有流标识，不复制订单簿。
 
-The same rule applies to time and sales: it is a newest-first filtered view of the existing shared
-classified trade tape. It does not retain a second trade list or classify events again at query
-time.
+同样的规则适用于成交明细：它是对现有共享的已分类成交带按最新优先排列的过滤视图。它不会保留第二份成交列表，也不会在查询时重新对事件分类。
 
-## Book contract
+## 订单簿契约
 
-A full snapshot supplies a signed microsecond timestamp, exact `u64` sequence, bid and ask levels,
-and optional order counts. Prices must be finite and exactly aligned to `tick_size`; sizes and
-counts are validated together; duplicate levels and crossed or locked snapshots are rejected
-atomically. Incremental rows additionally carry their previous sequence. A mismatch returns a
-typed `DepthResyncRequest`, marks the stream stale, and rejects every later delta until a valid new
-snapshot replaces the state. The engine never fills a missing sequence.
+完整快照提供带符号的微秒时间戳、精确的 `u64` 序列号、买盘与卖盘档位，以及可选的委托笔数。价格必须是有限值且与 `tick_size` 精确对齐；数量与笔数一并校验；重复档位以及交叉或锁定的快照会被原子地拒绝。增量行另外携带其前一序列号。不匹配时返回类型化的 `DepthResyncRequest`，将该流标记为过期，并拒绝其后的每一个增量，直到有效的新快照替换该状态。引擎绝不补全缺失的序列。
 
-Each side, batch, history bucket ring, total retained history cells, event list, replay tape,
-checkpoint set, heatmap count, and event layer has an explicit cap. History rolls at the configured
-microsecond interval and evicts the oldest buckets until both the bucket and cell ceilings hold.
-Memory telemetry includes current levels, history vectors, event labels, replay state, checkpoint
-snapshots, and retained heatmap pixels.
+每一侧、每个批量、历史桶环形缓冲区、保留的历史单元格总数、事件列表、回放成交带、检查点集合、热力图数量以及事件层都有明确的上限。历史按配置的微秒间隔滚动，并淘汰最旧的桶，直到桶数与单元格数的上限都得到满足。内存遥测包含当前档位、历史向量、事件标签、回放状态、检查点快照以及保留的热力图像素。
 
-Queries read one canonical view:
+查询读取同一个规范视图：
 
-- best bid/ask and size at an exact price;
-- cumulative depth and imbalance over N levels;
-- a touch-centered ladder with minimum-size and maximum-distance filters;
-- filtered cumulative bid/ask curves derived from the ladder;
-- newest-first time and sales with minimum-volume, side, and row-count filters.
+- 最优买价/卖价，以及某一精确价格上的数量；
+- 前 N 档的累计深度与失衡；
+- 以盘口最优价为中心的价位梯，支持最小数量与最大距离过滤；
+- 由价位梯派生的、经过过滤的累计买盘/卖盘曲线；
+- 按最新优先排列的成交明细，支持最小成交量、方向与行数过滤。
 
-## Rendering
+## 渲染
 
-The heatmap maps the configured fixed price extent into RGBA rows. Minimum and maximum size define
-the intensity scale before upload; bid/ask colors and opacity remain engine options. Finalized
-history is packed into absolute 32-bucket chunks with stable image keys. Only the incomplete edge
-chunk changes when a bucket closes, and every live update replaces one one-pixel-wide image. A
-512-bucket view therefore emits at most 17 finalized images plus its live edge instead of one draw
-per cell or bucket. Ordinary series paint after the underlay, so host trade series overlay the
-liquidity image without a renderer-specific path.
+热力图将配置的固定价格范围映射为 RGBA 行。最小与最大数量在上传之前定义强度比例尺；买盘/卖盘颜色与不透明度仍然是引擎选项。已定稿的历史被打包为绝对的、每块 32 个桶的分块，并带有稳定的图像键。桶关闭时只有未完成的边缘分块会变化，每次实时更新都只替换一张宽 1 像素的图像。因此，包含 512 个桶的视图至多输出 17 张已定稿图像外加其实时边缘，而不是每个单元格或每个桶一次绘制。普通系列在底层之后绘制，因此宿主的成交系列无需渲染器专属路径即可叠加在流动性图像之上。
 
-Microstructure markers are host facts. Iceberg refill, pulled liquidity, size cluster, and sweep
-events carry time, price, size, optional side, and a label capped at 256 bytes. Charts validates,
-retains, replay-masks, LOD-collapses, and renders them through an explicitly pane-bound event layer;
-it does not detect them. DOM and time-and-sales list presentation remains host UI.
+微观结构标记是宿主事实。冰山单补充、流动性撤回、数量聚集和扫单事件携带时间、价格、数量、可选的方向，以及上限为 256 字节的标签。Charts 会对其进行校验、保留、回放屏蔽、按 LOD 折叠，并通过显式绑定到窗格的事件层渲染；但它不负责检测这些事件。DOM 与成交明细列表的呈现仍属宿主 UI。
 
-All executors consume the same `Prim::Image` and marker primitives. Canvas2D, WebGPU, native, and
-GPUI do not reconstruct book state, color scaling, LOD, or replay semantics.
+所有执行器消费相同的 `Prim::Image` 与标记图元。Canvas2D、WebGPU、原生和 GPUI 都不会重建订单簿状态、颜色缩放、LOD 或回放语义。
 
-## Browser boundary
+## 浏览器边界
 
-Snapshots and updates cross WASM as parallel typed arrays. Timestamps must be exact JavaScript-safe
-integer microseconds. Provider sequences use high/low `Uint32Array` words so the boundary never
-rounds a `u64`; returned sequences and trade IDs are decimal strings. Optional order-count arrays
-use `0xffffffff` for unavailable values. Event numeric fields remain columnar, with an optional
-aligned JSON label vector because JavaScript has no typed string array.
+快照与更新以并行类型化数组的形式穿过 WASM 边界。时间戳必须是精确的、处于 JavaScript 安全范围内的整数微秒。数据提供方序列号使用高/低 `Uint32Array` 字，使边界永远不会对 `u64` 做舍入；返回的序列号与成交 ID 为十进制字符串。可选的委托笔数数组以 `0xffffffff` 表示不可用的值。事件的数值字段保持列式，并带有一个可选的、与之对齐的 JSON 标签向量，因为 JavaScript 没有类型化字符串数组。
 
-## Replay and recovery
+## 回放与恢复
 
-The host replay clock never deletes future source truth. Depth queries switch to a projection built
-from the newest eligible snapshot/checkpoint and apply only events at or before the clock. A seek
-backward restores the nearest checkpoint, recorded every 1,024 events and capped at 64, then reports
-the suffix work. Heatmap finalized buckets and the active edge use the same cutoff; event layers omit
-future markers. Clearing the clock immediately returns every query and frame to the canonical live
-view.
+宿主回放时钟绝不会删除未来的源数据真值。深度查询切换到一个由最新的合格快照/检查点构建的投影，并且只应用时间不晚于时钟的事件。向后定位会恢复最近的检查点（每 1,024 个事件记录一次，至多保留 64 个），然后报告后缀部分的工作量。热力图的已定稿桶与活动边缘使用相同的截止点；事件层省略未来的标记。清除时钟会立即使每个查询和每一帧回到规范的实时视图。
 
-## Verification evidence
+## 验证证据
 
-Deterministic engine fixtures cover snapshot validation, negative and fixed-grid prices, optional
-counts, atomic batches, gaps and resync fencing, bounded history, ladder/study filters, event caps
-and LOD, backward checkpoint seeks, future ingest during replay, stable heatmap chunk keys, and
-live-edge replacement. Browser fixtures cover Canvas2D and WebGPU typed ingest, gap recovery,
-replay masking, heatmap/marker rendering, exact sequence strings, and classified time-and-sales.
+确定性的引擎夹具覆盖：快照校验、负价格与固定网格价格、可选笔数、原子批量、缺口与重同步围栏、有界历史、价位梯/研究过滤、事件上限与 LOD、向后检查点定位、回放期间的未来数据写入、稳定的热力图分块键，以及实时边缘替换。浏览器夹具覆盖 Canvas2D 与 WebGPU 的类型化写入、缺口恢复、回放屏蔽、热力图/标记渲染、精确的序列号字符串，以及已分类成交明细。
 
-The 2026-09-27 release `perf_gate` Target L ran two 1.2-million-update passes. Its worst 100,000-row
-batch was 10.05 ms, heatmap frame construction was 0.34 ms, the dense 512-bucket view used 17 image
-primitives, live-edge upload was 512 bytes, and retained depth memory stayed flat at 66.03 MiB. The
-GPUI scene-construction gate rendered the same dense 512-bucket/128-row heatmap as 17 image runs at
-0.053 ms p99 against the shared 2 ms budget. These are observed measurements on the milestone
-machine, not claims about device-present time.
+2026-09-27 的 release `perf_gate` Target L 运行了两轮、每轮 120 万次更新的测试。其最差的 100,000 行批量耗时 10.05 ms，热力图帧构建耗时 0.34 ms，密集的 512 桶视图使用了 17 个图像图元，实时边缘上传为 512 字节，保留的深度内存持平于 66.03 MiB。GPUI 场景构建门禁将同一个密集的 512 桶/128 行热力图渲染为 17 个图像段，p99 为 0.053 ms，对照共享的 2 ms 预算。这些是在里程碑机器上观测到的测量值，而不是关于设备呈现时间的论断。
 
-The WebGPU focused fixture produced and inspected a transient chart screenshot with the heatmap and
-host marker visible. The accessibility review uses the existing unified chart contract: one bounded
-application surface, canvas pixels hidden from the accessibility tree, silent streaming updates,
-and keyboard interaction owned by the host surface. Depth adds no focusable DOM, announcements, or
-parallel interaction model. Binary screenshots remain transient; their deterministic setup is kept
-in `examples/web_demo/tests/depth.spec.mjs`.
+WebGPU 专项夹具生成并检查了一张临时图表截图，其中热力图与宿主标记均可见。无障碍评审采用现有的统一图表契约：一个有界的应用表面，canvas 像素对无障碍树隐藏，流式更新保持静默，键盘交互由宿主表面拥有。深度不新增可聚焦的 DOM、播报或并行的交互模型。二进制截图保持临时性；其确定性的设置保存在 `examples/web_demo/tests/depth.spec.mjs` 中。

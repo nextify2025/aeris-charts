@@ -1,13 +1,7 @@
-# Contributing
+# 贡献指南
 
-Issue reports, reproducible test cases, design discussion, and documentation corrections are
-welcome through the project repository.
+问题报告、可复现的测试用例、设计讨论和文档勘误，欢迎通过项目仓库提交。
 
-Aeris Charts uses an AGPL and commercial dual-license model. To preserve Aeris Terminal's ability to
-offer both licenses, external code contributions require a separate contributor agreement before
-they can be accepted. Open an issue before preparing a code contribution so the agreement and the
-intended change can be reviewed first.
+Aeris Charts 采用 AGPL 与商业双许可模式。为保证 Aeris Terminal 能够同时提供这两种许可，外部代码贡献在被接受之前，需要先签署单独的贡献者协议。准备代码贡献之前，请先提交一个 issue，以便先行审阅该协议和拟议的变更。
 
-Do not submit code or assets copied from another project unless their provenance and license have
-been disclosed and confirmed compatible. By submitting a contribution, you represent that you have
-the right to submit it under the agreed contribution terms.
+除非已披露其来源和许可证并确认兼容，否则不得提交从其他项目复制的代码或资源。提交贡献即表示你声明自己有权依据约定的贡献条款提交该内容。

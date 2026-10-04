@@ -1,390 +1,289 @@
-# Aeris Charts All-in-One Architecture and Competitive Delivery Plan
+# Aeris Charts 一体化架构与竞品对标交付计划
 
-Aeris will be a complete financial and general visualization library. Lightweight Charts is the
-financial competitive reference; Recharts is the general charting competitive reference. This plan
-covers the **general (non-financial) charting program** toward full Recharts parity and beyond.
-Trading and order-flow work lives in [Expansion.md](Expansion.md); both plans share one
-`ChartEngine` and one frame contract.
+Aeris 将成为一个完整的金融与通用可视化库。Lightweight Charts 是金融方向的竞品参考，Recharts 是通用图表方向的竞品参考。本计划涵盖**通用（非金融）图表专项**，目标是全面对标 Recharts 并超越。交易与订单流工作见 [Expansion.md](Expansion.md)；两份计划共用同一个 `ChartEngine` 和同一份帧契约。
 
-How to read this file:
+阅读本文件的方式：
 
-1. **Status at a glance** — where every phase and batch stands today.
-2. **How work is delivered** — the batch, gate and commit rules.
-3. **Delivered work** — what is implemented, with evidence.
-4. **Known gaps** — source-confirmed problems and the phase that fixes each.
-5. **Phases R0–R8** — remaining work as checklists, with exit criteria.
-6. **Parity coverage matrix** — the capability rows that define parity.
-7. **Scope, architecture rules, verification and completion** — the standing rules.
+1. **状态总览**：每个阶段和批次目前所处的位置。
+2. **工作交付方式**：批次、门禁与提交规则。
+3. **已交付工作**：已实现的内容及其证据。
+4. **已知缺口**：经源码确认的问题，以及修复每个问题的阶段。
+5. **阶段 R0–R8**：以检查清单形式列出的剩余工作，附退出标准。
+6. **对标覆盖矩阵**：界定对标的各项能力行。
+7. **范围、架构规则、验证与完成**：长期有效的规则。
 
-Keep this file current: when a batch lands, tick its checklist items, add it to **Delivered work**
-with its commit, and update the status table in the same commit. A phase or matrix row changes to
-**Verified** only with the evidence required in **Verification and evidence policy**.
+保持本文件最新：批次落地时，勾选其检查清单条目，将其连同提交一并加入**已交付工作**，并在同一次提交中更新状态表。只有具备**验证与证据策略**所要求的证据，阶段或矩阵行才可改为**已验证**。
 
-## Status at a glance
+## 状态总览
 
-Updated 2026-09-25. Plan baseline dated 2026-09-23.
+更新于 2026-09-25。计划基线日期为 2026-09-23。
 
-> **Paused 2026-09-25.** General-chart work is paused after the R3 range-bar batch (`3fe3b22`,
-> recorded in `e063e9c`) so trading and order-flow work in [Expansion.md](Expansion.md) proceeds
-> first. Do not start new G1–G8 batches during the pause. Fixes to delivered general-chart behavior,
-> and shared work required by Expansion.md (cross-chart sync PD5 and image export PD6, which R4
-> later extends), remain allowed. Resume with G1 (R0 and R1) when the maintainer lifts the pause,
-> because the trading journal will need the general charts, then continue in dependency order.
+> **暂停于 2026-09-25**。通用图表工作在 R3 范围柱批次（`3fe3b22`，记录于
+> `e063e9c`）之后暂停，以便 [Expansion.md](Expansion.md) 中的交易与订单流工作优先推进。
+> 暂停期间不得启动新的 G1–G8 批次。对已交付通用图表行为的修复，
+> 以及 Expansion.md 所需的共享工作（跨图表同步 PD5 和图像导出 PD6，R4 随后会对其进行扩展），
+> 仍然允许。维护者解除暂停后，从 G1（R0 和 R1）恢复，
+> 因为交易日志将需要通用图表，然后按依赖顺序继续。
 
-| Batch | Phase | Scope | Status | Done so far | Next |
+| 批次 | 阶段 | 范围 | 状态 | 目前进展 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| G1 | R0 + R1 | Competitive baseline, lifecycle and mutable object foundations | **Open (paused)** | — | Resume point: pin Recharts version, map the matrix, standalone creation, in-place mutations, failure cleanup |
-| G2 | R2 | Scales, axes and responsive layout | **Open** | — | Temporal ticks and views, grid and zero lines, multiple axes |
-| G3 | R3 | Cartesian visual and data semantics (remainder) | **In progress (paused)** | 9 delivered R3 slices (see **Delivered work**) | Bars and stacks, gradients, error bars, composition, per-item styling |
-| G4 | R4 | Components and interaction | **Open** | — | Legend, tooltip, brush, selection, sync (extends Expansion.md PD5), export (PD6) |
-| G5 | R5 | React and framework-neutral authoring | **Open** | — | Composable components over complete mutations |
-| G6 | R6 | Polar families and transitions | **Open** | — | Polar transforms, pie/donut, radar, radial bar, polar area, animation |
-| G7 | R7 | Hierarchy and flow families | **Open** | — | Funnel, treemap, Sankey, sunburst |
-| G8 | R8 | Parity closure and release readiness | **Open** | — | Full matrix verification against the pinned competitor |
+| G1 | R0 + R1 | 竞品基线、生命周期与可变对象基础 | **待交付（暂停）** | — | 恢复起点：固定 Recharts 版本、映射矩阵、独立创建、原地变更、失败清理 |
+| G2 | R2 | 比例尺、坐标轴与响应式布局 | **待交付** | — | 时间型刻度与视图、网格线与零线、多坐标轴 |
+| G3 | R3 | 笛卡尔坐标系视觉与数据语义（其余部分） | **进行中（暂停）** | 9 个已交付的 R3 切片（见**已交付工作**） | 柱与堆叠、渐变、误差棒、组合、逐项样式 |
+| G4 | R4 | 组件与交互 | **待交付** | — | 图例、提示框、刷选、选择、同步（扩展 Expansion.md PD5）、导出（PD6） |
+| G5 | R5 | React 与框架无关的编写方式 | **待交付** | — | 基于完整变更的可组合组件 |
+| G6 | R6 | 极坐标图族与过渡 | **待交付** | — | 极坐标变换、饼图/环形图、雷达图、径向柱图、极区图、动画 |
+| G7 | R7 | 层级与流向图族 | **待交付** | — | 漏斗图、矩形树图、桑基图、旭日图 |
+| G8 | R8 | 对标收口与发布就绪 | **待交付** | — | 针对固定版本的竞品完成完整矩阵验证 |
 
-Notes:
+说明：
 
-- R3 slices were delivered ahead of R0–R2. They count toward R3 only; R3 closes after R1–R2 land
-  and its exit criteria pass.
-- No phase and no coverage-matrix row is verified yet. No competitive parity or release-completion
-  claim should be inferred from delivered slices.
+- R3 切片先于 R0–R2 交付。它们仅计入 R3；R3 在 R1–R2 落地且其退出标准通过之后才关闭。
+- 目前尚无任何阶段和任何覆盖矩阵行已验证。不应根据已交付的切片推断出任何竞品对标或发布完成的结论。
 
-## How work is delivered
+## 工作交付方式
 
-Work proceeds in **large batches**, as defined in **Work cadence** in [AGENTS.md](../AGENTS.md).
-Each batch is one row of the status table: a whole phase (R0 and R1 ship together as G1), not one
-option or one series family at a time. Delivered items 1–9 were single-option slices; that cadence
-is retired.
+工作以**大批次**推进，其定义见**工作节奏**一节，位于 [AGENTS.md](../AGENTS.md) 中。每个批次是状态表的完整一行：整个阶段（R0 和 R1 作为 G1 一起交付），而不是一次一个选项或一个系列族。已交付的第 1–9 项是单选项切片；该节奏已废止。
 
-- **Implement the whole batch first.** Build every checklist item in the phase, with its regression
-  tests and fixtures written as each item is built. Do not stop between items for full gates,
-  commits or pushes.
-- **Focused checks while implementing.** `cargo check`, unit tests and `cargo clippy` for touched
-  crates, and frame fixtures for the affected families. Nothing broader.
-- **One full gate at the end.** Run the complete gates in **Verification and evidence policy** once,
-  plus Playwright when the batch changes browser-facing behavior and GPUI parity/replay when it
-  changes GPUI execution. Fix every failure and rerun until green. If the cause is unclear, rerun
-  focused checks item by item.
-- **One commit and push per batch.** Commit with a structured message listing delivered checklist
-  items and verification, then push `main`. Never commit a batch with a failing or skipped required
-  gate.
-- **Update this file in the same commit.** Tick the checklist, update **Delivered work** and the
-  status table, and update `docs/Architecture.md` when ownership or execution paths changed.
-- **Manual evidence at phase closure, not per batch.** Screenshots, accessibility review,
-  competitor comparisons and recorded benchmarks are collected once, when the phase closes.
+- **先实现整个批次。** 构建阶段内的每一个检查清单条目，并在构建每个条目时一并编写其回归测试和夹具。不要在条目之间停下来运行完整门禁、提交或推送。
+- **实现过程中的聚焦检查。** 针对所改动的 crate 的 `cargo check`、单元测试和 `cargo clippy`，以及受影响图族的帧夹具。不做更宽泛的检查。
+- **结束时只运行一次完整门禁。** 将**验证与证据策略**中的完整门禁运行一次；当批次改变面向浏览器的行为时，另外运行 Playwright；当批次改变 GPUI 执行时，另外运行 GPUI 一致性/回放检查。修复每一项失败并重新运行，直至全部通过。如果原因不明，则逐条目重新运行聚焦检查。
+- **每个批次一次提交并推送。** 使用结构化提交信息，列出已交付的检查清单条目及验证情况，然后推送 `main`。绝不提交存在失败或被跳过的必需门禁的批次。
+- **在同一次提交中更新本文件。** 勾选检查清单，更新**已交付工作**和状态表，并在所有权或执行路径发生变化时更新 `docs/Architecture.md`。
+- **手动证据在阶段收口时收集，而非每个批次收集。** 截图、无障碍评审、竞品对比和记录的基准测试，在阶段关闭时统一收集一次。
 
-A batch may be split into two commits only when it is too large to review as one, and each part
-must pass the full gate on its own.
+仅当批次过大、无法作为一个整体评审时，才可拆分为两次提交，且每一部分都必须各自通过完整门禁。
 
-## Delivered work
+## 已交付工作
 
-All items below are implemented and pushed to `github/main`. They belong to R3.
+以下所有条目均已实现并推送到 `github/main`。它们属于 R3。
 
-| # | Capability | Commit | Evidence |
+| # | 能力 | 提交 | 证据 |
 | --- | --- | --- | --- |
-| 1 | General-series `line_width` configurable through engine, WASM, TypeScript, persistence and public browser API | `d17a39f` | Slice gates below |
-| 2 | General path `line_style`: portable `solid`, `dotted`, `dashed` through the shared frame contract | `819bcbb` | Slice gates below |
-| 3 | `xy_area` explicit finite `baseline_value` with shared fill geometry, hit-testing, persistence, WASM/TypeScript and browser coverage | `6a5684b` | Slice gates below |
-| 4 | Opt-in `point_markers` with configurable radius on line, area, stacked-area and range-area; shared geometry, matching hit targets, atomic live mutation, V2 persistence, WASM/TypeScript, browser coverage. Also repairs live mutation of items 1–3 | — | Slice gates below |
-| 5 | Persisted marker symbols `circle`, `square`, `diamond`, `triangle` for scatter and path markers, with symbol-matched exact hit geometry. Bubble marks remain area-scaled circles | — | Slice gates below |
-| 6 | Persisted `linear`, `step`, `curved` interpolation on line, area, stacked-area and range-area; shared path and coupled-band expansion on every renderer with matching exact/nearest hits; stacked areas reject mixed interpolation | — | Slice gates below |
-| 7 | Opt-in persisted `connect_missing` on the same families. Missing rows stay queryable but no longer split runs; transform-invalid coordinates remain hard gaps; stacked members share one policy | — | Slice gates below |
-| 8 | Bounded persisted `fill_opacity` on area and range-area fills (ordinary, stacked, coupled-band), preserving the gradient relationship; Rust persistence, WASM serialization, TypeScript options, Chromium/Firefox/WebKit round-trip coverage | `1db0dfe` | Workspace tests, workspace and WASM clippy, package lint/build/typecheck/smoke test, general-chart browser matrix (88 passed, 2 skipped) |
-| 9 | Category `range_bar` series with low/high bounds, shared rectangle geometry and exact hits, typed/object browser ingestion, persistence-compatible kind mapping, accessibility text, and browser/native regression coverage | `3fe3b22` | Engine tests (including logarithmic Y geometry), workspace tests/clippy/WASM clippy, package lint/build/typecheck/pack smoke, native release perf gate, and the full Chromium/Firefox/WebKit browser suite (363 passed, 15 skipped) |
+| 1 | 通用系列的 `line_width` 可通过引擎、WASM、TypeScript、持久化和公共浏览器 API 配置 | `d17a39f` | 见下方切片门禁 |
+| 2 | 通用路径的 `line_style`：通过共享帧契约提供可移植的 `solid`、`dotted`、`dashed` | `819bcbb` | 见下方切片门禁 |
+| 3 | `xy_area` 显式有限的 `baseline_value`，配有共享的填充几何、命中测试、持久化、WASM/TypeScript 及浏览器覆盖 | `6a5684b` | 见下方切片门禁 |
+| 4 | 可选启用的 `point_markers`，半径可配置，适用于折线、面积、堆叠面积和范围面积；共享几何、匹配的命中目标、原子实时变更、V2 持久化、WASM/TypeScript、浏览器覆盖。同时修复第 1–3 项的实时变更 | — | 见下方切片门禁 |
+| 5 | 为散点和路径标记提供持久化的标记符号 `circle`、`square`、`diamond`、`triangle`，并带有与符号匹配的精确命中几何。气泡标记仍为按面积缩放的圆 | — | 见下方切片门禁 |
+| 6 | 在折线、面积、堆叠面积和范围面积上提供持久化的 `linear`、`step`、`curved` 插值；每个渲染器上共享的路径与耦合带展开，并具有一致的精确/最近命中；堆叠面积拒绝混用插值 | — | 见下方切片门禁 |
+| 7 | 在相同图族上提供可选启用的持久化 `connect_missing`。缺失行仍可查询，但不再分割连续段；变换无效的坐标仍为硬性断口；堆叠成员共用同一策略 | — | 见下方切片门禁 |
+| 8 | 面积与范围面积填充（普通、堆叠、耦合带）上有界的持久化 `fill_opacity`，保持渐变关系；Rust 持久化、WASM 序列化、TypeScript 选项、Chromium/Firefox/WebKit 往返覆盖 | `1db0dfe` | 工作区测试、工作区与 WASM clippy、包的 lint/build/typecheck 及包冒烟测试、通用图表浏览器矩阵（88 项通过，2 项跳过） |
+| 9 | 类别 `range_bar` 系列，带有低/高边界、共享的矩形几何与精确命中、类型化/对象式浏览器数据写入、与持久化兼容的种类映射、无障碍文本，以及浏览器/原生回归测试覆盖 | `3fe3b22` | 引擎测试（含对数 Y 几何）、工作区测试/clippy/WASM clippy、包的 lint/build/typecheck/pack 冒烟测试、原生 release 性能门禁，以及完整的 Chromium/Firefox/WebKit 浏览器套件（363 项通过，15 项跳过） |
 
-Slice gates for delivered R3 items (historical; remaining work uses batch gates): applicable Rust tests, clippy (including the WASM target), package
-lint/build/typecheck/package smoke test, Chromium browser tests, formatting checks and the native
-release performance gate.
+已交付 R3 条目的切片门禁（历史做法；剩余工作使用批次门禁）：适用的 Rust 测试、clippy（含 WASM 目标）、包的 lint/build/typecheck 及包冒烟测试、Chromium 浏览器测试、格式检查以及原生 release 性能门禁。
 
-These slices do not close R3. The phase still requires the rest of the Cartesian visual and data
-matrix and its complete acceptance evidence.
+这些切片并不能关闭 R3。该阶段仍需完成笛卡尔坐标系视觉与数据矩阵的其余部分及其完整的验收证据。
 
-## Known gaps
+## 已知缺口
 
-Source-confirmed gaps and review risks from the 2026-09-23 review. Each is owned by a phase. The
-earlier Phase 1–3 completion statements described narrower slices and are superseded: Cartesian
-completeness and the all-in-one authoring experience are **open**. Earlier test counts and timings
-are historical observations in Git history, not proof of current completion. Existing code and tests
-remain valuable and must be preserved.
+经源码确认的缺口与评审风险，来自 2026-09-23 的评审。每一项都归属于某个阶段。此前关于第 1–3 阶段已完成的表述描述的是范围更窄的切片，现已被取代：笛卡尔坐标系的完整性和一体化编写体验均为**开放**状态。此前的测试数量和耗时是 Git 历史中的历史观察结果，不能证明当前已完成。现有代码和测试仍然有价值，必须予以保留。
 
-| Gap | Evidence | Required correction | Phase |
+| 缺口 | 证据 | 所需修正 | 阶段 |
 | --- | --- | --- | --- |
-| Standalone creation | `examples/web_demo/general_dashboard.js` creates a general pane then removes pane 0 | Explicit initial general domain through the canonical constructor, without a transient financial pane or host cleanup recipe; financial default stays compatible | R1 |
-| Mutable public objects | `packages/charts/src/types.ts::general_series_api` and `general_axis_api` | Handles lack option mutation; Rust has visibility mutation but the browser handle lacks it. Add atomic mutations that preserve identity and invalidate affected state | R1 |
-| Failed React installation | `GeneralPane` creates a handle, calls `setData`, then records ownership | A failed initial data install can leave an untracked series. Add rollback and failure-path lifecycle tests; review callback exceptions and cleanup ordering | R1, R5 |
-| Temporal axes | `general_axes.rs::axis_ticks`, `tick_labels_for_domain`, `pan_general_axis`, `zoom_general_axis` | Temporal data and geometry exist, but temporal ticks fall through to empty output and pan/zoom reject nonnumeric domains. Complete the temporal coordinate contract | R2 |
-| Grid and zero lines | `GeneralAxis` stores policies; `persistence.rs` serializes them | Accepted options have no general grid execution. Implement shared frame output and observable toggle tests | R2 |
-| Visual configuration | `GeneralSeriesOptions`, `frame/general_series_geometry.rs` | Surface is narrow. Audit and implement documented styles and geometry choices end to end (the delivered slices above began this) | R3 |
-| Shared components | Legend, shared-tooltip, brush and reference snapshots in `general_series.rs` | Snapshots alone do not establish a complete interactive legend, tooltip, brush or export experience | R4 |
-| React reconciliation | `packages/charts/src/react.ts::GeneralPane` | Changed series options recreate series; changed axes recreate dependent series; configuration arrays instead of component composition. Complete engine mutation and declarative authoring | R5 |
-| Chart breadth | `GeneralSeriesKind` has Cartesian variants only | Polar and hierarchy/flow families are open. Funnel, treemap, Sankey and sunburst are in the competitive target, not an indefinite backlog | R6, R7 |
-| Documentation | Prior plan examples and `Architecture.md` | Prior scatter example omitted required axis bindings. Architecture places engine-owned general behavior under the core heading and overgeneralizes retained React updates. Correct wording without presenting future code as current | R0 |
-| API docs mix | [General_charts_api.md](../docs/General_charts_api.md) | Mixes implemented contracts with proposals | R0 |
+| 独立创建 | `examples/web_demo/general_dashboard.js` 先创建通用窗格，再移除窗格 0 | 通过规范构造函数显式指定初始通用域，无需临时金融窗格或宿主清理步骤；金融默认行为保持兼容 | R1 |
+| 可变的公共对象 | `packages/charts/src/types.ts::general_series_api` 和 `general_axis_api` | 句柄缺少选项变更；Rust 具备可见性变更，但浏览器句柄缺少该能力。新增保持标识且使受影响状态失效的原子变更 | R1 |
+| React 安装失败 | `GeneralPane` 先创建句柄，调用 `setData`，然后才记录所有权 | 初始数据安装失败可能遗留未被跟踪的系列。新增回滚和失败路径的生命周期测试；审查回调异常和清理顺序 | R1、R5 |
+| 时间型坐标轴 | `general_axes.rs::axis_ticks`、`tick_labels_for_domain`、`pan_general_axis`、`zoom_general_axis` | 时间型数据与几何已存在，但时间型刻度会落空并输出为空，且平移/缩放拒绝非数值域。补全时间型坐标契约 | R2 |
+| 网格线与零线 | `GeneralAxis` 存储这些策略；`persistence.rs` 将其序列化 | 已接受的选项没有对应的通用网格线执行。实现共享的帧输出和可观察的开关测试 | R2 |
+| 视觉配置 | `GeneralSeriesOptions`、`frame/general_series_geometry.rs` | 接口面过窄。端到端审计并实现已文档化的样式和几何选项（上方已交付的切片已开了头） | R3 |
+| 共享组件 | `general_series.rs` 中的图例、共享提示框、刷选和参考元素快照 | 仅靠快照无法构成完整的交互式图例、提示框、刷选或导出体验 | R4 |
+| React 协调 | `packages/charts/src/react.ts::GeneralPane` | 系列选项变化会重建系列；坐标轴变化会重建依赖它的系列；使用配置数组而非组件组合。补全引擎变更与声明式编写 | R5 |
+| 图表广度 | `GeneralSeriesKind` 仅有笛卡尔坐标系变体 | 极坐标图族与层级/流向图族仍处于待交付状态。漏斗图、矩形树图、桑基图和旭日图属于竞品对标目标，而不是无限期搁置的待办项 | R6、R7 |
+| 文档 | 此前的计划示例与 `Architecture.md` | 此前的散点图示例遗漏了必需的坐标轴绑定。架构文档把由引擎拥有的通用行为放在 core 标题之下，并过度概括了保留式 React 更新。修正措辞，且不把未来的代码呈现为现状 | R0 |
+| API 文档混杂 | [General_charts_api.md](../docs/General_charts_api.md) | 已实现的契约与提案混在一起 | R0 |
 
-These are not an exhaustive defect audit. Coverage-matrix rows are required coverage to audit, not
-assertions that every listed feature is absent.
+这些并非详尽的缺陷审计。覆盖矩阵的各行是需要审计的必需覆盖范围，而不是断言所列的每项功能都不存在。
 
-## Phases
+## 阶段
 
-All phases are open unless marked otherwise in **Status at a glance**. Existing implementation
-counts toward a phase only after its required behavior is demonstrated. Each phase is delivered as
-one batch (see **How work is delivered**); its last checklist item is the batch gate, commit and
-push. Do not delay fixes until a large framework rewrite, and do not skip foundation work to add a
-demo chart.
+除非在**状态总览**中另有标注，所有阶段均为待交付状态。现有实现只有在其所需行为得到演示之后，才计入某个阶段。每个阶段作为一个批次交付（见**工作交付方式**）；其最后一个检查清单条目是批次门禁、提交与推送。不要把修复推迟到大规模框架重写之后，也不要为了添加演示图表而跳过基础工作。
 
-### R0 — Auditable competitive baseline
+### R0 — 可审计的竞品基线
 
-**Batch:** G1, together with R1. **Depends on:** nothing. **Status:** open, paused.
+**批次：** G1，与 R1 一起。**依赖：** 无。**状态：** 待交付，暂停。
 
-- [ ] Pin the Recharts release and source revision; retain the existing financial competitor
-      baseline.
-- [ ] Inventory public props and components; map every relevant capability to the coverage matrix
-      with supported combinations.
-- [ ] Add reference fixtures for each matrix row and record intentional differences. Executable
-      fixtures stay in existing test infrastructure; transient screenshots and reports stay out of
-      committed documentation.
-- [ ] Reconcile `General_charts_api.md`, `Public_api.md`, examples and architecture claims against
-      exports, manifests, scripts and actual call paths. Separate supported, experimental and
-      proposed behavior.
-- [ ] Capture clean release financial, general and combined baselines and the current enforced
-      budgets.
+- [ ] 固定 Recharts 发布版本与源码修订；保留现有的金融竞品基线。
+- [ ] 清点公共 props 和组件；将每项相关能力映射到覆盖矩阵，并标明受支持的组合。
+- [ ] 为每个矩阵行添加参考夹具并记录有意的差异。可执行夹具保留在现有测试基础设施中；临时截图和报告不进入已提交的文档。
+- [ ] 对照导出项、清单、脚本和实际调用路径，核对 `General_charts_api.md`、`Public_api.md`、示例以及架构文档中的论述。区分受支持、实验性和已提议的行为。
+- [ ] 采集干净 release 构建下的金融、通用与组合基线，以及当前强制执行的预算。
 
-**Exit:** every required capability has a scoped owner, dependency, fixture and honest status; no
-unsupported example or historical PASS substitutes for current evidence. Version, date and evidence
-paths accompany future status changes. Unverified rows stay open.
+**退出标准：** 每项必需能力都有明确范围的归属、依赖、夹具和如实的状态；任何不受支持的示例或历史上的 PASS 都不能替代当前证据。今后的状态变更须附带版本、日期和证据路径。未验证的行保持开放。
 
-### R1 — Lifecycle and mutable object foundations
+### R1 — 生命周期与可变对象基础
 
-**Batch:** G1, together with R0. **Depends on:** R0. **Status:** open.
+**批次：** G1，与 R0 一起。**依赖：** R0。**状态：** 待交付。
 
-- [ ] Initial general-domain creation through the canonical constructor.
-- [ ] Last-pane ownership defined together with adapter ownership.
-- [ ] Atomic in-place axis and series mutations through all public boundaries.
-- [ ] Failed installation and cleanup fixed.
-- [ ] Visibility and ordering affect domains, legends, hits and exports consistently.
-- [ ] G1 full gate green (R0 and R1 items); batch committed and pushed.
+- [ ] 通过规范构造函数创建初始通用域。
+- [ ] 与适配器所有权一并定义最后一个窗格的所有权。
+- [ ] 通过所有公共边界提供原子的原地坐标轴与系列变更。
+- [ ] 修复安装失败与清理问题。
+- [ ] 可见性与顺序对域、图例、命中和导出的影响保持一致。
+- [ ] G1 完整门禁通过（R0 与 R1 条目）；批次已提交并推送。
 
-**Exit:** standalone general and mixed charts can create, update, rebind, reorder, hide, remove and
-restore through actual browser and native paths. Invalid operations leave prior state intact.
-Handles, explicit row focus and selection, and unaffected views survive routine changes; repeated
-mount and dispose release resources.
+**退出标准：** 独立的通用图表和混合图表能够通过实际的浏览器与原生路径完成创建、更新、重新绑定、重新排序、隐藏、移除和恢复。无效操作保持先前状态不变。句柄、显式的行焦点与选择，以及不受影响的视图，在常规变更中得以保留；反复挂载与销毁会释放资源。
 
-### R2 — Scale, axis and responsive layout contracts
+### R2 — 比例尺、坐标轴与响应式布局契约
 
-**Batch:** G2. **Depends on:** R1. **Status:** open.
+**批次：** G2。**依赖：** R1。**状态：** 待交付。
 
-- [ ] Temporal ticks, formatting and view operations.
-- [ ] Category behavior, including zoom/pan and duplicate labels.
-- [ ] Explicit ticks and formatters.
-- [ ] Numeric extremes and degenerate domains.
-- [ ] Grid and zero lines executed in the frame.
-- [ ] Domain padding and clipping.
-- [ ] Multiple axes.
-- [ ] Axis titles.
-- [ ] Small-container behavior.
-- [ ] Every reviewed silent-option gap corrected.
-- [ ] G2 full gate green; batch committed and pushed.
+- [ ] 时间型刻度、格式化与视图操作。
+- [ ] 类别行为，包括缩放/平移与重复标签。
+- [ ] 显式刻度与格式化器。
+- [ ] 数值极值与退化域。
+- [ ] 在帧中执行网格线与零线。
+- [ ] 域留白与裁剪。
+- [ ] 多坐标轴。
+- [ ] 坐标轴标题。
+- [ ] 小容器行为。
+- [ ] 修正每一处经评审的选项被静默忽略的缺口。
+- [ ] G2 完整门禁通过；批次已提交并推送。
 
-**Exit:** deterministic domain and coordinate round trips and frame fixtures cover all supported
-scale and orientation combinations. Browser resize, font, DPR, pointer and keyboard view tests agree
-with native and GPUI output; no accepted option silently does nothing, and layout work has an
-enforced bound.
+**退出标准：** 确定性的域与坐标往返，以及帧夹具，覆盖所有受支持的比例尺与方向组合。浏览器的尺寸调整、字体、DPR、指针和键盘视图测试与原生及 GPUI 输出一致；已接受的选项不会被静默忽略，并且布局工作有强制执行的界限。
 
-### R3 — Cartesian visual and data semantics
+### R3 — 笛卡尔坐标系视觉与数据语义
 
-**Batch:** G3 (all remaining items in one batch). **Depends on:** R1–R2. **Status:** in progress,
-paused (see **Status at a glance**).
+**批次：** G3（全部剩余条目作为一个批次）。**依赖：** R1–R2。**状态：** 进行中，暂停（见**状态总览**）。
 
-- [x] Line width (item 1).
-- [x] Line dash styles (item 2).
-- [x] Area baseline value (item 3).
-- [x] Point markers and marker symbols (items 4–5).
-- [x] Linear, step and curved interpolation (item 6).
-- [x] Missing-value connection policy (item 7).
-- [x] Area fill opacity (item 8).
-- [ ] Remaining curve, gap and baseline policies across every applicable family.
-- [ ] Bars and stacks: both orientations, groups, sizing and gaps, corners, mixed signs, stack order
-      and required offset modes.
-- [x] Range bars (category-band low/high rectangles and exact hits).
-- [ ] Error bars.
-- [ ] Gradients.
-- [ ] Per-item customization (per-point and per-bar styles).
-- [ ] Composition of families on shared axes.
-- [ ] Audit existing box plot, heatmap and bubble behavior rather than rewriting completed storage
-      and geometry.
-- [ ] G3 full gate green; batch committed and pushed.
+- [x] 线宽（第 1 项）。
+- [x] 线条虚线样式（第 2 项）。
+- [x] 面积基线值（第 3 项）。
+- [x] 点标记与标记符号（第 4–5 项）。
+- [x] 线性、阶梯与曲线插值（第 6 项）。
+- [x] 缺失值连接策略（第 7 项）。
+- [x] 面积填充不透明度（第 8 项）。
+- [ ] 在所有适用图族上完成其余的曲线、断口与基线策略。
+- [ ] 柱与堆叠：两种方向、分组、尺寸与间隙、圆角、正负值混合、堆叠顺序以及必需的偏移模式。
+- [x] 范围柱（类别带内的低/高矩形与精确命中）。
+- [ ] 误差棒。
+- [ ] 渐变。
+- [ ] 逐项自定义（逐点与逐柱样式）。
+- [ ] 在共享坐标轴上组合各图族。
+- [ ] 审计现有箱线图、热力图和气泡图的行为，而不是重写已完成的存储与几何。
+- [ ] G3 完整门禁通过；批次已提交并推送。
 
-**Exit:** each family passes object and typed ingestion, atomic updates, missing, duplicate and
-extreme data, visibility and stack changes, exact and nearest hits, labels, accessibility,
-persistence and executor parity. Reference examples demonstrate visual configurability; high-density
-fixtures demonstrate bounded work.
+**退出标准：** 每个图族都通过对象式与类型化写入、原子更新、缺失/重复/极端数据、可见性与堆叠变更、精确与最近命中、标签、无障碍、持久化以及执行器一致性。参考示例展示视觉可配置性；高密度夹具展示有界工作量。
 
-### R4 — Chart components and interaction
+### R4 — 图表组件与交互
 
-**Batch:** G4. **Depends on:** R1–R3. **Status:** open.
+**批次：** G4。**依赖：** R1–R3。**状态：** 待交付。
 
-- [ ] Usable default legends and tooltips.
-- [ ] Titles and labels.
-- [ ] References.
-- [ ] Keyboard and touch brush controls.
-- [ ] Selection.
-- [ ] Linked-chart synchronization, extending the shared contract delivered first for financial
-      charts as [Expansion.md](Expansion.md) PD5.
-- [ ] Frame image export, extending the shared contract delivered first as Expansion.md PD6.
-- [ ] Localization, overflow and focus behavior.
-- [ ] G4 full gate green; batch committed and pushed.
+- [ ] 可用的默认图例与提示框。
+- [ ] 标题与标签。
+- [ ] 参考元素。
+- [ ] 键盘与触摸刷选控件。
+- [ ] 选择。
+- [ ] 联动图表同步，扩展最先为金融图表交付的共享契约，即 [Expansion.md](Expansion.md) PD5。
+- [ ] 帧图像导出，扩展最先交付的共享契约，即 Expansion.md PD6。
+- [ ] 本地化、溢出与焦点行为。
+- [ ] G4 完整门禁通过；批次已提交并推送。
 
-R4 extends the PD5 and PD6 contracts to general domains and chrome; it does not build a second
-synchronization or export path.
+R4 将 PD5 和 PD6 契约扩展到通用域和外围界面；它不会构建第二套同步或导出路径。
 
-**Exit:** consumers build an interactive dashboard from published APIs without demo-owned semantic
-logic. Legend toggles preserve identity, brushing survives resize, synchronization handles unequal
-datasets without loops, and all controls are keyboard and screen-reader usable with bounded
-snapshots.
+**退出标准：** 使用方可基于已发布的 API 构建交互式仪表盘，而无需演示示例自行拥有的语义逻辑。图例切换保持标识，刷选在尺寸调整后依然有效，同步能在不产生循环的情况下处理不一致的数据集，且所有控件都可通过键盘和屏幕阅读器使用，并附有有界的快照。
 
-### R5 — React and framework-neutral authoring
+### R5 — React 与框架无关的编写方式
 
-**Batch:** G5. **Depends on:** R1–R4. **Status:** open.
+**批次：** G5。**依赖：** R1–R4。**状态：** 待交付。
 
-- [ ] Composable components and typed data mapping over canonical handles.
-- [ ] Controlled and uncontrolled behavior where applicable, events and documented defaults.
-- [ ] Migration recipes from Recharts.
-- [ ] Equivalent imperative composition for hosts that do not use React.
-- [ ] G5 full gate green; batch committed and pushed.
+- [ ] 基于规范句柄的可组合组件与类型化数据映射。
+- [ ] 适用时提供受控与非受控行为、事件以及已文档化的默认值。
+- [ ] 从 Recharts 迁移的方案。
+- [ ] 为不使用 React 的宿主提供等价的命令式组合。
+- [ ] G5 完整门禁通过；批次已提交并推送。
 
-**Exit:** packed-consumer examples cover standalone, composed, synchronized and financial/general
-charts. Prop changes retain engine identities; failure, Strict Mode and concurrent lifecycle tests
-pass. SSR import, hydration setup, bundler and WASM asset resolution, and cleanup work without
-repository paths.
+**退出标准：** 基于打包产物的使用方示例覆盖独立、组合、同步以及金融/通用图表。props 变更保留引擎标识；失败、Strict Mode 与并发的生命周期测试通过。SSR 导入、hydration 配置、打包器与 WASM 资源解析以及清理，无需依赖仓库路径即可工作。
 
-### R6 — Polar families and shared transitions
+### R6 — 极坐标图族与共享过渡
 
-**Batch:** G6. **Depends on:** R2–R5. **Status:** open.
+**批次：** G6。**依赖：** R2–R5。**状态：** 待交付。
 
-- [ ] Angular and radial transforms with shared sector and polygon geometry.
-- [ ] Pie and donut.
-- [ ] Radar.
-- [ ] Radial bar.
-- [ ] Polar area.
-- [ ] Shared general transitions for every family, including existing Cartesian families, with
-      interruption and reduced-motion behavior.
-- [ ] G6 full gate green; batch committed and pushed.
+- [ ] 角向与径向变换，配有共享的扇区与多边形几何。
+- [ ] 饼图与环形图。
+- [ ] 雷达图。
+- [ ] 径向柱图。
+- [ ] 极区图。
+- [ ] 面向每个图族的共享通用过渡，包括现有的笛卡尔坐标系图族，并具备中断与减弱动效行为。
+- [ ] G6 完整门禁通过；批次已提交并推送。
 
-**Exit:** all polar variants cover degenerate, zero and missing data, angles and radii, label
-collision, legends, selection, keyboard navigation, persistence and every executor. Fixed-clock
-transition fixtures prove repeatability, correct interaction targets, bounded memory and zero idle
-animation scheduling.
+**退出标准：** 所有极坐标变体均覆盖退化、零值和缺失数据，角度与半径，标签碰撞，图例，选择，键盘导航，持久化以及每个执行器。固定时钟的过渡夹具证明可重复性、正确的交互目标、有界内存，以及空闲时零动画调度。
 
-### R7 — Hierarchy and flow families
+### R7 — 层级与流向图族
 
-**Batch:** G7. **Depends on:** the lifecycle, layout and primitive contracts above. **Status:** open.
+**批次：** G7。**依赖：** 上文的生命周期、布局与图元契约。**状态：** 待交付。
 
-- [ ] Funnel.
-- [ ] Treemap.
-- [ ] Sankey.
-- [ ] Sunburst, using shared polar geometry where appropriate.
-- [ ] G7 full gate green; batch committed and pushed.
+- [ ] 漏斗图。
+- [ ] 矩形树图。
+- [ ] 桑基图。
+- [ ] 旭日图，在适当之处使用共享的极坐标几何。
+- [ ] G7 完整门禁通过；批次已提交并推送。
 
-Each is a dedicated engine layout family with typed validated inputs; do not reuse incompatible XY
-storage merely to avoid a proper owner.
+每一种都是专用的引擎布局图族，具备经类型化校验的输入；不要仅仅为了避免设立合适的所有者而复用不兼容的 XY 存储。
 
-**Exit:** each family has deterministic ordering and layout, declared cycle, depth and size policies,
-bounded work, update and transition behavior, labels and styles, exact hits, tooltip and legend
-behavior where applicable, accessibility, persistence and cross-backend fixtures. These families are
-required for competitive closure.
+**退出标准：** 每个图族都具备确定的排序与布局、已声明的环路、深度和尺寸策略、有界工作量、更新与过渡行为、标签与样式、精确命中、适用时的提示框与图例行为、无障碍、持久化以及跨后端夹具。这些图族是竞品对标收口所必需的。
 
-### R8 — Parity closure and release readiness
+### R8 — 对标收口与发布就绪
 
-**Batch:** G8. **Depends on:** R0–R7. **Status:** open.
+**批次：** G8。**依赖：** R0–R7。**状态：** 待交付。
 
-- [ ] Run the complete matrix against the pinned competitor.
-- [ ] Demonstrate financial-only, general-only and combined workloads.
-- [ ] Finish documentation and customization/migration examples.
-- [ ] Export, backend fallback and device-recovery evidence.
-- [ ] Clean-install evidence.
-- [ ] Recheck upstream scope; record and assess new upstream features explicitly.
-- [ ] G8 full gate green; release evidence committed and pushed.
+- [ ] 针对固定版本的竞品运行完整矩阵。
+- [ ] 演示仅金融、仅通用和组合工作负载。
+- [ ] 完成文档以及自定义/迁移示例。
+- [ ] 导出、后端回退与设备恢复的证据。
+- [ ] 全新安装的证据。
+- [ ] 重新核查上游范围；明确记录并评估上游的新功能。
+- [ ] G8 完整门禁通过；发布证据已提交并推送。
 
-**Exit:** every required matrix row is verified or has a maintainer-approved, clearly documented
-semantic alternative that satisfies the user task. No required family remains demand-deferred.
-Publish capability claims only for verified behavior, with measured startup, size, frame, input and
-memory results and known limits.
+**退出标准：** 每个必需的矩阵行都已验证，或有经维护者批准、清晰记录且满足用户任务的语义替代方案。不得有必需图族仍处于“待有需求再做”的推迟状态。仅对已验证的行为发布能力声明，并附上实测的启动、体积、帧、输入和内存结果以及已知限制。
 
-## Parity coverage matrix
+## 对标覆盖矩阵
 
-Each row must acquire exact versioned reference examples, Aeris API mappings, named automated
-fixtures, manual checks where needed, and recorded differences before it can be marked verified.
-Status is deliberately conservative: **Partial** means code exists but the full row is unverified;
-**Open** means the product contract still needs delivery. These are Aeris requirements, including
-platform capabilities beyond the competitor's browser rendering model.
+每一行在被标记为已验证之前，都必须取得精确且带版本的参考示例、Aeris API 映射、具名的自动化夹具、必要时的手动检查以及已记录的差异。状态刻意保持保守：**部分**表示代码已存在但整行尚未验证；**开放**表示产品契约仍需交付。这些是 Aeris 的要求，包括超出竞品浏览器渲染模型的平台能力。
 
-| Capability | Status | Required outcome | Phase |
+| 能力 | 状态 | 所需结果 | 阶段 |
 | --- | --- | --- | --- |
-| Standalone and composed charts | Partial | General-only, financial-only and mixed panes; compatible overlays, explicit axes, deterministic ordering and lifecycle | R1, R3 |
-| Line, area, range and scatter/bubble | Partial (items 1–8 delivered; range bars are tracked below) | Linear/step/curved interpolation, gap/connection policy, baselines, symbols, active marks, fills/strokes and error bounds | R3 |
-| Bars and stacks | Partial (range bars delivered) | Both orientations, groups, sizing/gaps, corners, per-item styling, mixed signs, range bars, stack order and required offset modes | R3 |
-| Box plots and heatmaps | Partial | Preserve existing extra families; complete color domains, legends, missing values and interaction | R3 |
-| Scales and axes | Partial | Numeric/log/symlog, temporal, category/point, reversed/multiple axes, explicit/auto domains, ticks, formatting, overflow and grid policy | R2 |
-| Pie/donut, radar, radial bar, polar area | Open | Polar layout, start/end angles, inner/outer radii, padding, labels/leaders, angular/radial axes and interactions | R6 |
-| Funnel, treemap, Sankey, sunburst | Open | Purpose-built deterministic bounded layouts, data contracts, styling, labels, hits, accessibility and updates | R7 |
-| Legend and tooltip | Partial | Default usable components, visibility controls, item/shared modes, placement, formatting, ordering, custom content and touch/keyboard behavior | R4 |
-| References, labels, titles and grids | Partial | Engine layout and domain contribution, overlap/overflow policy, background/foreground order, style and export consistency | R2, R4 |
-| Brush, selection and synchronization | Partial | Pointer/touch/keyboard controls, semantic range handles, domain-aware pan/zoom, linked charts and feedback-loop prevention | R4 |
-| Responsive layout | Partial | Zero-size/hidden/revealed containers, constrained/aspect sizing, DPR/font changes, small plots and bounded layout convergence | R1, R2 |
-| React authoring | Partial | Composable axes/series/components, typed data mapping, controlled updates, stable identities, Strict Mode, failure cleanup and SSR-safe import | R5 |
-| Customization | Partial | Per-item styles, symbols, gradients, dash patterns, label/tooltip formatting, bounded custom marks and explicit host-only content boundaries | R3–R5 |
-| Animation | Open for general transitions | Enter/update/exit and interruption with stable identities, bounded retained state, shared timing semantics and reduced motion | R6 |
-| Accessibility/localization | Partial | Keyboard operation of every family/control, meaningful bounded snapshots, focus retention, announcements, contrast, locale and text measurement | Every phase |
-| Persistence, export and recovery | Partial | Complete schema coverage, atomic restore, callback reattachment, equivalent frame exports, backend failover and clean disposal | Every phase, R8 |
-| Packaging and migration | Partial | Packed-consumer examples, framework-neutral and React guides, discoverable API, reproducible competitor comparisons | R0, R5, R8 |
+| 独立与组合图表 | 部分 | 仅通用、仅金融和混合窗格；兼容的叠加层、显式坐标轴、确定性的排序与生命周期 | R1、R3 |
+| 折线、面积、范围与散点/气泡 | 部分（第 1–8 项已交付；范围柱在下方跟踪） | 线性/阶梯/曲线插值、断口/连接策略、基线、符号、活动标记、填充/描边与误差界 | R3 |
+| 柱与堆叠 | 部分（范围柱已交付） | 两种方向、分组、尺寸/间隙、圆角、逐项样式、正负值混合、范围柱、堆叠顺序以及必需的偏移模式 | R3 |
+| 箱线图与热力图 | 部分 | 保留现有的额外图族；补全颜色域、图例、缺失值与交互 | R3 |
+| 比例尺与坐标轴 | 部分 | 数值/对数/对称对数（symlog）、时间型、类别/点（point）、反向/多坐标轴、显式/自动域、刻度、格式化、溢出与网格策略 | R2 |
+| 饼图/环形图、雷达图、径向柱图、极区图 | 待交付 | 极坐标布局、起止角度、内外半径、内边距、标签/引导线、角向/径向坐标轴与交互 | R6 |
+| 漏斗图、矩形树图、桑基图、旭日图 | 待交付 | 专用的、确定性且有界的布局，数据契约，样式，标签，命中，无障碍与更新 | R7 |
+| 图例与提示框 | 部分 | 默认可用的组件、可见性控制、按项/共享模式、位置摆放、格式化、排序、自定义内容以及触摸/键盘行为 | R4 |
+| 参考元素、标签、标题与网格 | 部分 | 引擎布局与对域的贡献、重叠/溢出策略、背景/前景顺序、样式与导出的一致性 | R2、R4 |
+| 刷选、选择与同步 | 部分 | 指针/触摸/键盘控制、语义范围手柄、感知域的平移/缩放、联动图表与反馈循环防护 | R4 |
+| 响应式布局 | 部分 | 零尺寸/隐藏/重新显示的容器、受约束/按宽高比的尺寸、DPR/字体变化、小绘图区与有界的布局收敛 | R1、R2 |
+| React 编写方式 | 部分 | 可组合的坐标轴/系列/组件、类型化数据映射、受控更新、稳定标识、Strict Mode、失败清理以及 SSR 安全的导入 | R5 |
+| 自定义 | 部分 | 逐项样式、符号、渐变、虚线图案、标签/提示框格式化、有界的自定义标记以及明确的仅限宿主的内容边界 | R3–R5 |
+| 动画 | 通用过渡部分待交付 | 进入/更新/退出与中断，保持稳定标识、有界的保留状态、共享的计时语义以及减弱动效 | R6 |
+| 无障碍/本地化 | 部分 | 每个图族/控件的键盘操作、有意义且有界的快照、焦点保持、播报、对比度、区域设置与文本度量 | 每个阶段 |
+| 持久化、导出与恢复 | 部分 | 完整的 schema 覆盖、原子恢复、回调重新挂接、等价的帧导出、后端故障转移与干净的销毁 | 每个阶段、R8 |
+| 打包与迁移 | 部分 | 基于打包产物的使用方示例、框架无关与 React 指南、可发现的 API、可复现的竞品对比 | R0、R5、R8 |
 
-## Scope and parity rules
+## 范围与对标规则
 
-A basic working dashboard, a list of rendered chart types, or a thin React wrapper does not meet
-this goal. Competitive quality includes authoring, visual control, interaction, accessibility,
-lifecycle, responsive layout, documentation, distribution and measured performance.
+一个基本可用的仪表盘、一份已渲染的图表类型清单，或一层薄薄的 React 封装，都不能达成该目标。竞品级质量包括编写方式、视觉控制、交互、无障碍、生命周期、响应式布局、文档、分发以及实测性能。
 
-Keep one public library, one `ChartEngine` and one ordered frame contract. Preserve the specialized
-financial data and coordinate paths while completing general charting as a first-class capability.
-The browser package is `@aeristerminal/aeris-charts` with an optional `/react` entry. Package naming
-or distribution changes require a compatibility decision; this plan does not introduce another
-product. [Architecture.md](../docs/Architecture.md) describes current ownership and execution; this document
-specifies the target and acceptance gates.
+保持一个公共库、一个 `ChartEngine` 和一份有序的帧契约。保留专用的金融数据与坐标路径，同时将通用图表作为一等能力补全。浏览器包为 `@aeristerminal/aeris-charts`，带有可选的 `/react` 入口。包名或分发方式的变更需要做出兼容性决策；本计划不引入另一个产品。[Architecture.md](../docs/Architecture.md) 描述当前的所有权与执行方式；本文档规定目标与验收门禁。
 
-The existing shared-engine direction is sound. Replacing it with a browser-only renderer or making
-financial storage universally generic would harm Aeris: charts would diverge across backends or
-financial updates would pay unnecessary work. Retain the working foundations and finish their
-contracts.
+现有的共享引擎方向是合理的。若将其替换为仅限浏览器的渲染器，或将金融存储改为全面通用化，都会损害 Aeris：图表会在各后端之间出现分歧，或者金融更新会承担不必要的工作量。保留已有效运行的基础，并补全它们的契约。
 
-**Parity definition.** Parity means equivalent user capabilities, predictable behavior and polished
-results. It does not require copying React/SVG internals, identical method names, undocumented
-quirks, or arbitrary DOM execution inside Rust. Record deliberate semantic differences and
-demonstrate the migration path. An omission cannot be renamed a difference merely to close a
-milestone.
+**对标的定义**。对标指用户能力等价、行为可预期、结果精致。它不要求复制 React/SVG 内部实现、方法名完全相同、未文档化的怪异行为，或在 Rust 内部执行任意 DOM。须记录有意为之的语义差异，并演示迁移路径。不能仅为了关闭里程碑，就把遗漏重命名为差异。
 
-**Out of scope for this baseline.** Gauge, arbitrary graph/network, geographic and 3D visualization.
-They may be added later without postponing any required row. Full competitiveness is a release gate,
-not a promise to implement every conceivable visualization.
+**本基线的范围之外**。仪表图、任意图/网络、地理与 3D 可视化。它们可以在之后添加，而不会推迟任何必需行。完全具备竞争力是发布门禁，而不是承诺实现所有可想到的可视化。
 
-**References.** Reviewed on 2026-09-23. R0 must pin the exact released Recharts version or source
-revision used by executable comparisons; a moving documentation site is insufficient as a permanent
-test baseline.
+**参考资料**。于 2026-09-23 审阅。R0 必须固定可执行对比所使用的已发布 Recharts 的确切版本或源码修订；持续变动的文档站点不足以作为永久的测试基线。
 
-- [Recharts API catalog](https://recharts.github.io/en-US/api/) establishes Cartesian, polar, composed,
-  funnel, treemap, Sankey and sunburst families plus shared components and synchronization.
-- [Line API](https://recharts.github.io/en-US/api/Line/) supplies reference behavior for data mapping,
-  dots, missing-point connections, styling and animation.
-- [XAxis API](https://recharts.github.io/en-US/api/XAxis/) supplies axis/domain/tick configuration coverage.
-- [Tooltip API](https://recharts.github.io/en-US/api/Tooltip/) supplies tooltip presentation and behavior coverage.
-- [ResponsiveContainer API](https://recharts.github.io/en-US/api/ResponsiveContainer/) supplies sizing coverage.
-- [FunnelChart API](https://recharts.github.io/en-US/api/FunnelChart/) documents stacking offsets and synchronization.
-- [Sankey API](https://recharts.github.io/en-US/api/Sankey/),
-  [Treemap API](https://recharts.github.io/api/Treemap/) and
-  [Sunburst API](https://recharts.github.io/en-US/api/SunburstChart/) establish distinct flow/hierarchy contracts.
-- [Accessibility guidance](https://github.com/recharts/recharts/wiki/Recharts-and-accessibility)
-  informs keyboard and screen-reader comparisons.
+- [Recharts API 目录](https://recharts.github.io/en-US/api/) 确立了笛卡尔图、极坐标图、组合图、漏斗图、矩形树图、Sankey 图与旭日图这些图族，以及共享组件与同步。
+- [Line API](https://recharts.github.io/en-US/api/Line/) 提供数据映射、圆点、缺失点连接、样式与动画方面的参考行为。
+- [XAxis API](https://recharts.github.io/en-US/api/XAxis/) 提供坐标轴/数据域/刻度配置方面的覆盖范围。
+- [Tooltip API](https://recharts.github.io/en-US/api/Tooltip/) 提供提示框呈现与行为方面的覆盖范围。
+- [ResponsiveContainer API](https://recharts.github.io/en-US/api/ResponsiveContainer/) 提供尺寸方面的覆盖范围。
+- [FunnelChart API](https://recharts.github.io/en-US/api/FunnelChart/) 记载了堆叠偏移与同步。
+- [Sankey API](https://recharts.github.io/en-US/api/Sankey/)、[Treemap API](https://recharts.github.io/api/Treemap/) 与 [Sunburst API](https://recharts.github.io/en-US/api/SunburstChart/) 确立了各自不同的流向/层级契约。
+- [无障碍指南](https://github.com/recharts/recharts/wiki/Recharts-and-accessibility) 为键盘与屏幕阅读器方面的对比提供参考。
 
-## Architecture rules
+## 架构规则
 
 ```text
 Framework-neutral API / React authoring / native host
@@ -397,138 +296,72 @@ Framework-neutral API / React authoring / native host
     -> Canvas2D | WebGPU | GPUI | native
 ```
 
-### Ownership and dependency direction
+### 归属与依赖方向
 
-| Owner | Responsibility |
+| 拥有者 | 职责 |
 | --- | --- |
-| `aeris_charts_core` | Platform-free scale math, validation fundamentals, financial storage and shared option/value types; f64 media-space math |
-| `aeris_charts_engine` | General datasets, axes, domain resolution, series/layout algorithms, mutations, interaction, transitions, persistence and frame construction |
-| `aeris_charts_render` | Ordered primitives and shared lowering/tessellation math; no host or chart-family policy |
-| Executors | Execute prepared primitives with equivalent clipping/blending/text; own bounded device/font/image resources and recovery |
-| WASM and TypeScript | Bulk conversion, platform input, resource initialization, typed handles, host callbacks, DOM presentation and accessibility |
-| React | Declarative ownership and reconciliation through the public imperative API; no duplicate data/geometry/interaction model |
+| `aeris_charts_core` | 与平台无关的比例尺数学、校验基础、金融存储以及共享的选项/值类型；f64 媒体空间数学 |
+| `aeris_charts_engine` | 通用数据集、坐标轴、数据域解析、系列/布局算法、变更、交互、过渡、持久化与帧构建 |
+| `aeris_charts_render` | 有序图元以及共享的降阶转换/细分数学；不含宿主或图表族策略 |
+| 执行器 | 以等价的裁剪、混合与文本执行已准备好的图元；拥有有界的设备/字体/图像资源及其恢复 |
+| WASM 与 TypeScript | 批量转换、平台输入、资源初始化、类型化句柄、宿主回调、DOM 呈现与无障碍 |
+| React | 通过公共命令式 API 进行声明式所有权管理与协调；不设重复的数据/几何/交互模型 |
 
-Do not add crates, generic scene graphs, plugin registries, trait layers or speculative feature flags
-just to accommodate the roadmap. Extract cohesive internal modules when their actual responsibilities
-justify it. Do not turn growing `general_series.rs` into a universal layout abstraction: hierarchy
-and flow need appropriate typed input and algorithms, while sharing lifecycle and frame output.
+不得仅为迎合路线图而新增 crate、通用场景图、插件注册表、trait 层或臆测性的功能开关。当其实际职责足以支撑时，再抽取内聚的内部模块。不得把不断膨胀的 `general_series.rs` 变成通用的布局抽象：层级与流向需要合适的类型化输入与算法，同时共享生命周期与帧输出。
 
-### Financial isolation and first-class general creation
+### 金融隔离与一等公民的通用图表创建
 
-Keep financial time union, compact OHLC/scalar columns, LOD, indicators, drawings, trading, price
-scales and streaming updates authoritative. General work must add no per-row dispatch to those loops
-and retain zero general dataset/cache capacity in a financial-only chart. Protect existing public
-APIs, V1 restore, input behavior, whitespace and financial golden fixtures.
+金融时间并集、紧凑的 OHLC/标量列、细节层级（LOD）、指标、绘图、交易、价格比例尺与流式更新必须保持其权威地位。通用图表工作不得在这些循环中增加逐行分派，并且在纯金融图表中必须保持通用数据集/缓存容量为零。保护现有公共 API、V1 恢复、输入行为、空白数据与金融 golden 夹具。
 
-Add an explicit creation-time domain/topology contract at the engine owner and expose it consistently
-through WASM, TypeScript and React. Defaults remain financial. General-only charts must reserve only
-the chrome they use. Stable pane IDs must survive reorder; disposal must not require callers to seed
-a temporary financial keeper pane. Define the engine's last-pane invariant and adapter ownership
-together.
+在引擎这一拥有者处新增显式的创建时领域/拓扑契约，并通过 WASM、TypeScript 与 React 一致地暴露。默认仍为金融。纯通用图表必须只预留其所用的界面元素。稳定的窗格 ID 必须在重新排序后保持不变；销毁时不得要求调用方预置一个临时的金融保留窗格。须一并定义引擎的最后窗格不变量与适配器的所有权。
 
-### Data, identity and atomic mutations
+### 数据、标识与原子变更
 
-Retain typed general columns, explicit validity and stable row IDs. Distinguish financial UTC
-seconds, continuous epoch milliseconds, category identity and display text without unit guessing.
-Specify ordering, duplicate-X/category policy, missing values and generated-versus-explicit identity
-per family.
+保留类型化的通用列、显式的有效性与稳定的行 ID。区分金融 UTC 秒、连续的 epoch 毫秒、类别标识与显示文本，不得靠猜测单位。按图族规定排序、重复 X/类别策略、缺失值，以及生成标识与显式标识的选用。
 
-Provide in-place axis/series option updates and visibility, order and compatible binding changes.
-Validate dependent datasets, stacks, references and axes before mutation. Invalid updates must
-preserve the entire prior state. A style change retains data, handles, focus/selection and runtime
-view unless its documented semantics require otherwise. Structural domain/type changes must be
-explicit.
+提供就地的坐标轴/系列选项更新，以及可见性、顺序和兼容绑定的变更。变更之前须校验依赖的数据集、堆叠、引用与坐标轴。无效更新必须完整保留此前的全部状态。样式变更保留数据、句柄、焦点/选择与运行时视图，除非其文档化语义另有要求。结构性的数据域/类型变更必须显式进行。
 
-Chart-level object data and React data keys normalize once per changed input; typed streaming
-remains a bulk path. Decide shared-column ownership from real composed-chart callers and measurements
-before adding public dataset machinery. Host accessors never run inside frame or hit-test loops.
-Hierarchy and flow input require stable node/link identities, validation of references/cycles as
-applicable, defined ordering and depth/size/work caps; they must not be forced into XY rows.
+图表级对象数据与 React 数据键在每个发生变化的输入上仅规范化一次；类型化流式写入仍是批量路径。在新增公共数据集机制之前，应依据真实的组合图调用方与测量结果决定共享列的所有权。宿主访问器绝不在帧循环或命中测试循环内运行。层级与流向输入需要稳定的节点/链接标识、视情况对引用/环进行校验、明确的排序，以及深度/大小/工作量上限；不得将它们强行塞入 XY 行。
 
-### Layout, scales and shared geometry
+### 布局、比例尺与共享几何
 
-Resolve data domains and runtime views separately. The same transform must drive ticks, grids,
-geometry, hits, brushes, references and accessibility. Complete temporal interval selection and
-formatting with an explicit deterministic timezone policy; never silently use the browser timezone.
-Category zoom/pan and duplicate labels need declared semantics. Test extreme and degenerate domains.
+数据域与运行时视图分别解析。同一变换必须驱动刻度、网格、几何、命中、刷选、参考元素与无障碍。补全时间间隔的选择与格式化，并采用显式且确定的时区策略；绝不静默使用浏览器时区。类别缩放/平移与重复标签需要声明语义。测试极端与退化的数据域。
 
-Layout reserves chart content, titles, legends, axis strips and plot regions through bounded passes.
-Define behavior when text/axes do not fit rather than letting clipping or layout oscillation decide.
-Font, DPR, formatter and locale changes invalidate measurements. Host measurement is permitted;
-host-owned tick selection or autoscale is not.
+布局通过有界的多遍计算，为图表内容、标题、图例、坐标轴条带与绘图区域预留空间。须定义文本/坐标轴放不下时的行为，而不是任由裁剪或布局振荡来决定。字体、DPR、格式化器与区域设置的变化会使度量失效。允许宿主进行度量；不允许由宿主拥有刻度选择或自动缩放。
 
-General grids use resolved general ticks in the ordered background layer. Reference/background
-fills, series, interaction chrome and labels need explicit order and clips. New curves, sectors,
-polygons, symbols, rounded shapes or gradients must have shared geometry/lowering and every executor
-implemented before their public feature is complete. Retain f64 until the documented encoding
-boundary.
+通用网格在有序的背景层中使用已解析的通用刻度。参考/背景填充、系列、交互界面元素与标签需要明确的顺序与裁剪。新增的曲线、扇区、多边形、符号、圆角形状或渐变，必须在其公共功能完成之前，具备共享的几何/降阶转换，并在每个执行器中实现。f64 须保留至文档规定的编码边界。
 
-### Components, interactions and extension boundaries
+### 组件、交互与扩展边界
 
-The engine owns component meaning, content snapshots, anchors, selections and reserved plot space.
-Hosts may present HTML tooltips, semantic controls or accessible DOM. Default legends/tooltips must
-be usable without copying demo code; optional rich HTML does not become the only implementation of
-built-in chart geometry. Define what exports include and provide frame-rendered equivalents for
-built-in chrome. Document host-only custom content limitations.
+引擎拥有组件语义、内容快照、锚点、选择与预留的绘图空间。宿主可以呈现 HTML 提示框、语义化控件或无障碍 DOM。默认的图例/提示框必须无需复制演示代码即可使用；可选的富 HTML 不得成为内置图表几何的唯一实现。须定义导出包含的内容，并为内置界面元素提供由帧渲染的等价实现。须记录仅限宿主的自定义内容的限制。
 
-Unify pointer, touch and keyboard commands for general selection, brushing and view changes. Derive
-axis-versus-item tooltip membership from the correct oriented domain, including horizontal bars,
-duplicate values, missing rows and mixed series. Synchronization uses semantic values or declared
-index matching with explicit mismatch policy. A bounded host coordinator may route events between
-independent charts; each receiving engine resolves its own semantics. Source/revision tracking must
-prevent loops and disposal must remove subscriptions.
+统一通用选择、刷选与视图变更的指针、触摸与键盘命令。按坐标轴与按数据项的提示框成员归属，须由方向正确的数据域推导，涵盖水平条形图、重复值、缺失行与混合系列。同步使用语义值或声明的索引匹配，并带有显式的不匹配策略。有界的宿主协调器可以在相互独立的图表之间路由事件；每个接收方引擎各自解析其语义。来源/修订跟踪必须防止循环，销毁时必须移除订阅。
 
-Customization receives bounded read-only snapshots or returns validated styles/marks through an
-explicit host boundary. Do not promise portable execution of arbitrary SVG/React elements. Built-ins
-must remain available on native and headless paths, with clear migration equivalents for common
-Recharts customization tasks. Review licenses before copying any external code or assets.
+自定义通过显式的宿主边界接收有界的只读快照，或返回经过校验的样式/标记。不得承诺可移植地执行任意 SVG/React 元素。内置功能必须在原生与无头路径上保持可用，并为常见的 Recharts 自定义任务提供清晰的迁移等价方案。复制任何外部代码或资源之前，须审查其许可证。
 
-### React and transitions
+### React 与过渡
 
-Build declarative axes, Cartesian/polar series, legend, tooltip, labels, references and brush over
-complete imperative mutations. Retain GeneralPane compatibility. Stable keys retain identities;
-ordinary options/visibility/data changes do not recreate chart objects. Validate a reconciliation
-batch before destructive operations and roll back newly acquired resources on failure. Test changed
-kinds, invalid data, callback failures, parent/child cleanup, async initialization, stale closures,
-concurrent rerenders and Strict Mode. SSR-safe import and static server-rendered chart output are
-different capabilities; document each accurately.
+在完整的命令式变更之上构建声明式的坐标轴、笛卡尔/极坐标系列、图例、提示框、标签、参考元素与刷选。保持 GeneralPane 兼容性。稳定的 key 保留标识；普通的选项/可见性/数据变更不会重建图表对象。在执行破坏性操作之前校验协调批量，并在失败时回滚新获取的资源。测试种类变化、无效数据、回调失败、父子清理、异步初始化、过期闭包、并发重新渲染与 Strict Mode。SSR 安全的导入与静态的服务端渲染图表输出是不同的能力；须分别准确地记录。
 
-General transitions are engine-owned interpolation sampled with an explicit monotonic clock supplied
-by hosts. Bound duration, retained prior geometry and active transitions; interrupt from the current
-presentation, reconcile hit/focus behavior, and stop scheduling at rest. Reduced motion disables or
-shortens transitions deterministically. Streaming financial updates retain their established policy.
+通用过渡是由引擎拥有的插值，使用宿主提供的显式单调时钟采样。须限定时长、保留的先前几何与活跃过渡的上限；从当前呈现状态中断，协调命中/焦点行为，并在静止时停止调度。减弱动效会以确定性的方式禁用或缩短过渡。流式金融更新保持其既有策略。
 
-### Invalidation, performance and persistence
+### 失效、性能与持久化
 
-Classify mutations by data, domain, layout, geometry, paint and interaction impact. Record generation
-inputs for retained state; remove caches with their owner and rebuild device resources after loss.
-A row cap alone does not prove bounded interactive latency. Measure worst-case dense/overlapping
-hits, stack alignment, category unions, long labels, many axes/series and hierarchy depth. Reuse
-existing LOD/index mechanisms where appropriate; add optimizations only after release measurements.
+按数据、数据域、布局、几何、绘制与交互的影响对变更分类。为保留的状态记录代次输入；缓存随其拥有者一并移除，并在设备丢失后重建设备资源。仅有行数上限并不能证明交互延迟有界。测量最坏情况下的密集/重叠命中、堆叠对齐、类别并集、长标签、多坐标轴/多系列与层级深度。在适当之处复用现有的 LOD/索引机制；仅在 release 测量之后再添加优化。
 
-Persist new semantic configuration with versioned migrations and transactional restore. Preserve V1
-financial compatibility and current V2 contracts; version schema extensions when compatibility
-requires it. Runtime callbacks, DOM, device resources and transient animation/hover/focus are not
-serialized. Restored live handles must not alias stale handles. State exports and image exports are
-separate gates.
+以带版本的迁移与事务性恢复持久化新的语义配置。保持 V1 金融兼容性与当前的 V2 契约；当兼容性需要时，为 schema 扩展编制版本。运行时回调、DOM、设备资源以及瞬态的动画/悬停/焦点不会被序列化。恢复后的活跃句柄不得与过期句柄互为别名。状态导出与图像导出是各自独立的门禁。
 
-## Verification and evidence policy
+## 验证与证据策略
 
-Each implementation starts with a failing regression or measurable invariant through its actual
-public host/executor path. Shared-engine unit tests alone cannot close a browser or rendering
-requirement.
+每项实现都从一个失败的回归测试或可度量的不变量开始，且必须经由其真实的公共宿主/执行器路径。仅靠共享引擎的单元测试不能据此关闭浏览器或渲染方面的需求。
 
-Verification cadence:
+验证节奏：
 
-- **During a batch:** focused checks only (touched-crate check, tests and clippy, and the affected
-  families' frame fixtures).
-- **End of batch:** the complete gates below once, plus Playwright and GPUI parity/replay when the
-  batch affects those paths; then commit and push the batch.
-- **Phase closure:** coverage-matrix verification, manual screenshots, accessibility review,
-  competitor comparisons and recorded benchmarks.
+- **批次进行中**：仅做针对性检查（被改动 crate 的 check、测试与 clippy，以及受影响图族的帧夹具）。
+- **批次结束时**：完整运行下列门禁一次，当该批次影响 Playwright 与 GPUI 一致性/回放相关路径时，一并运行这两项检查；然后提交并推送该批次。
+- **阶段收口**：覆盖矩阵验证、手动截图、无障碍审查、竞品对比与记录在案的基准测试。
 
-Run the complete gates required by [AGENTS.md](../AGENTS.md) at the end of each batch, before
-committing code:
+在每个批次结束、提交代码之前，运行 [AGENTS.md](../AGENTS.md) 要求的完整门禁：
 
 ```text
 cargo fmt --all -- --check
@@ -545,42 +378,16 @@ bun run typecheck
 bun run test:pack
 ```
 
-Also run public API/namespace/release-policy guards, applicable Chromium/Firefox/WebKit Playwright
-coverage, native golden/frame checks, and GPUI parity/replay checks for affected execution. Keep
-portable correctness blocking and calibrated machine-specific visual/performance evidence labeled.
-Run performance thresholds in strict mode as CI does; never relax tests or budgets to conceal
-regressions.
+还须运行公共 API/命名空间/发布策略守卫、适用的 Chromium/Firefox/WebKit Playwright 覆盖、原生 golden/帧检查，以及针对受影响执行路径的 GPUI 一致性/回放检查。可移植的正确性保持为阻断项，经校准的特定机器视觉/性能证据则须加以标注。性能阈值须像 CI 一样在严格模式下运行；绝不为掩盖回归而放宽测试或预算。
 
-Use `benchmarks/benchmark.mjs` and `benchmarks/budgets.json` for versioned release evidence. Current
-policy v3 includes a 2,000 ms general-dashboard startup ceiling and 100,663,296-byte first-frame
-upload ceiling, alongside package-size limits. These limits are existing guards, not a declaration
-that their ceilings are competitive targets. Preserve them until measured evidence supports an
-explicit revision. Add family-specific budgets before closure, including p95 input/frame latency,
-steady-state allocation, retained CPU/GPU memory, upload work, cold startup and repeated disposal.
-Compare equal data, viewport, DPR, interactions and release builds; disclose hardware/browser/font
-versions and unsupported metrics.
+使用 `benchmarks/benchmark.mjs` 与 `benchmarks/budgets.json` 作为带版本的发布证据。当前的策略 v3 包含通用仪表盘启动 2,000 ms 上限与首帧上传 100,663,296 字节上限，以及包体积限制。这些限制是现有守卫，并不意味着其上限就是具有竞争力的目标。在实测证据支持明确修订之前，保持不变。收口之前须添加各图族专属的预算，包括 p95 输入/帧延迟、稳态分配、保留的 CPU/GPU 内存、上传工作量、冷启动与重复销毁。对比相同的数据、视口、DPR、交互与 release 构建；披露硬件/浏览器/字体版本以及不受支持的指标。
 
-A matrix entry can be marked **verified** only with a commit/revision, exact fixture commands and
-results, backend/browser coverage, relevant performance evidence, and recorded manual checks.
-Screenshots must cover small and large containers, light/dark themes, long/Unicode labels, overflow
-and active states. Accessibility requires interaction and assistive-technology review, not just
-snapshot existence.
+矩阵条目只有同时具备提交/修订、确切的夹具命令与结果、后端/浏览器覆盖、相关性能证据以及记录在案的手动检查，才可标记为**已验证**。截图必须覆盖小容器与大容器、浅色/深色主题、长标签/Unicode 标签、溢出与激活状态。无障碍需要交互与辅助技术审查，而不仅仅是存在快照。
 
-Documentation-only revisions may skip runtime gates. Check diffs, links/paths, source consistency and
-documentation hygiene. This plan revision makes no production ownership or execution change; update
-`Architecture.md` in the same commit as future code that changes those contracts, and correct current
-wording discrepancies during R0. Preserve unrelated working-tree changes and stage only task-owned
-files.
+仅文档的修订可以跳过运行时门禁。须检查差异、链接/路径、源码一致性与文档规范。本次计划修订不改变任何生产代码中的所有权或执行方式；未来改变这些契约的代码，须在同一提交中更新 `Architecture.md`，并在 R0 期间纠正当前措辞上的不一致。保留无关的工作树改动，只暂存属于本任务的文件。
 
-## Definition of completion
+## 完成定义
 
-Aeris is competitively complete for this plan when a consumer can build the full required Recharts
-capability matrix through a coherent published API, combine it with the established financial
-product, and rely on equivalent semantic output across supported backends. Routine changes retain
-identity; invalid updates are atomic; controls are accessible; styles and layouts are deliberate;
-resources and work are bounded; installation and migration are documented; and all release gates have
-current evidence.
+当使用方能够通过一套连贯的已发布 API 构建出所要求的完整 Recharts 能力矩阵，将其与既有的金融产品结合，并可依赖各受支持后端上等价的语义输出时，就本计划而言，Aeris 在竞争力上即告完备。常规变更保留标识；无效更新是原子的；控件无障碍可用；样式与布局经过有意设计；资源与工作量有界；安装与迁移均有文档；所有发布门禁都有最新证据。
 
-Until then, report delivered items and remaining gaps precisely against the phase checklists and
-matrix rows above. A working demo or a green subset of tests is progress, not completion of the
-all-in-one library.
+在此之前，须对照上述阶段清单与矩阵行，准确报告已交付项与剩余缺口。一个可运行的演示或一部分通过的测试只是进展，并非一体化库的完成。

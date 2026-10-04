@@ -1,14 +1,14 @@
-# Aeris Charts Architecture
+# Aeris Charts 架构
 
-## Purpose
+## 目的
 
-Aeris Charts is a high-performance financial chart engine. It provides chart state, interaction behavior, drawing tools, indicators, frame construction, and multiple rendering backends for [Aeris Terminal](https://aeristerminal.com) and browser hosts.
+Aeris Charts 是高性能金融图表引擎，为 [Aeris Terminal](https://aeristerminal.com) 和浏览器宿主提供图表状态、交互行为、绘图工具、指标、帧构建以及多个渲染后端。
 
-The engine is backend-neutral and host-neutral. One canonical state must produce equivalent frames across GPUI, WebGPU, Canvas2D, and native test rendering. Performance, visual parity, deterministic behavior, and bounded resource use are product requirements.
+引擎与后端无关，也与宿主无关。同一份规范状态必须在 GPUI、WebGPU、Canvas2D 和原生测试渲染之间生成等价的帧。性能、视觉一致性、确定性行为和有界资源使用都是产品要求。
 
-Source code, tests, and measured release behavior are the implementation truth. This file must change in the same commit whenever the architecture changes.
+源代码、测试和实测的 release 行为是实现的事实依据。每当架构发生变化，本文件必须在同一次提交中同步修改。
 
-## Data flow
+## 数据流
 
 ```text
 Host API and market data
@@ -19,1911 +19,431 @@ Host API and market data
     -> pixels and frame metrics
 ```
 
-Browser hosts enter through `packages/charts`, which translates the supported public TypeScript API into typed arrays and WebAssembly calls. Rust hosts use the `aeris_charts_engine` crate directly and select a renderer crate. Every Rust crate is repository-only (`publish = false`): hosts such as Aeris Terminal consume them through pinned Git revisions or local paths, and nothing is published to crates.io. The GPUI executor builds on `gpui-pre` 0.3.6, the published GPUI snapshot that gpui-kit 0.6.6 pins, so it renders inside gpui-kit applications with the same `gpui` types. Rendering backends consume prepared frame data; they do not own chart semantics.
+浏览器宿主通过 `packages/charts` 接入，该包将受支持的公共 TypeScript API 转换为类型化数组和 WebAssembly 调用。Rust 宿主直接使用 `aeris_charts_engine` crate，并选择一个渲染器 crate。所有 Rust crate 均仅限仓库内使用（`publish = false`）：Aeris Terminal 等宿主通过固定的 Git 修订版本或本地路径使用它们，不会向 crates.io 发布任何内容。GPUI 执行器基于 `gpui-pre` 0.3.6 构建，这是 gpui-kit 0.6.6 所固定的已发布 GPUI 快照，因此它可以在 gpui-kit 应用内使用相同的 `gpui` 类型进行渲染。渲染后端消费已准备好的帧数据；它们不拥有图表语义。
 
-The web demo exposes all built-in calculation APIs in a searchable Indicators catalog. Entries create their engine bindings on demand (the 27 KLineChart templates through the package's `add_klinechart_indicator`) and remove all owned outputs when cleared, together with any synthetic volume and turnover series they depend on. RSI uses the same engine calculation and oscillator pane as package consumers; no separate demo formula is maintained.
+Web 演示在可搜索的指标目录中公开所有内置计算 API。条目按需创建其引擎绑定（27 个 KLineChart 模板通过该包的 `add_klinechart_indicator` 创建），并在被清除时移除其拥有的全部输出，以及它们所依赖的任何合成成交量和成交额系列。RSI 使用与包使用者相同的引擎计算和振荡指标窗格；演示中不另行维护单独的公式。
 
-Canonical series data uses opaque chart-local `u32` identities mapped to reusable storage slots. Identities are never reused, removed identities are classified as stale, and slot-backed vectors remain bounded by peak concurrent series rather than lifetime add/remove count. Each ordinary series owns one timestamp column and either one scalar value column or four OHLC columns. `PlotList` owns only a dense range or sparse logical-index mapping plus its chunked autoscale cache; allocation-free views join that mapping to the canonical values for queries and frame construction. Dense aligned mappings carry no per-row index allocation. Indicator outputs own one scalar value column and alias a contiguous source-time range by identity, so they duplicate neither source timestamps nor plot values. An output still before its warm-up holds no rows, so its range starts at the first value an update computes, also when that update rewrites earlier source rows. The merged timestamp union remains independently owned because ordinary source series are independently mutable and may diverge or carry whitespace. It carries a generation that changes only when its contents change; time weights use that generation, while value-only current-bar updates retain the O(1) fast path.
+规范的系列数据使用不透明的、图表本地的 `u32` 标识，并映射到可复用的存储槽位。标识绝不复用，已移除的标识会被判定为过期，基于槽位的向量始终以并发系列数的峰值为界，而不是以整个生命周期内的添加/移除次数为界。每个普通系列拥有一列时间戳，以及一列标量值或四列 OHLC。`PlotList` 仅拥有一个稠密范围或稀疏逻辑索引映射，以及其分块的自动缩放缓存；无分配的视图将该映射与规范值连接起来，用于查询和帧构建。稠密对齐映射不携带逐行索引分配。指标输出拥有一列标量值，并按标识别名引用一段连续的源时间范围，因此既不复制源时间戳，也不复制绘制值。仍处于预热之前的输出不持有任何行，因此其范围从某次更新计算出的第一个值开始，即使该次更新重写了更早的源行也是如此。合并的时间戳并集仍由其自身独立拥有，因为普通源系列可以独立变更，可能彼此分歧或带有空白数据。它携带一个代次，仅在其内容变化时才变更；时间权重使用该代次，而仅更新值的当前柱更新则保留 O(1) 快速路径。
 
-A multi-calendar overlay opts out of that union per owned series (`TimeAlignment::AsOf`, the browser's `series_options.time_alignment: "as_of"`): it adds no merged time point, so the union-timed series keep a gapless axis. Its `PlotList` holds a dense or sparse logical-index mapping onto the merged points up to the union's data extent (the last point where a host-owned union series holds a real row, so an overlay never runs into host-installed future session slots) plus a non-decreasing plot-row to canonical-row map. Each point shows the last canonical row at or before its time; rows between two points collapse into the later one, a point with no newer row repeats the previous one unless that row is older than the optional `max_staleness`, and rows after the last point wait for it. Values are never copied: `PlotValues::AsOf` resolves every value, whitespace test, autoscale chunk, and per-point color through the map, and the pyramid of a mapped plot summarizes plot rows. Readers that need canonical rows (studies, `data()`, merges, bar times, selection anchors, visible-range volume profiles, Heikin Ashi, session highlighting, the accessibility focus ring, and the data-reading drawings: regression trend, forecast, and bars pattern) translate through `source_row`, `row_for_source`, or `source_range` (the drawings through `ChartEngine::drawing_source_window`, which places each canonical row at the first point at or after its time); markers resolve to the first point at or after their time and wait, like their rows, past the last point. A value tick of an as-of row repairs only the points showing it; a new as-of row rewrites only the points at or after its time; a new union point or a moved data extent appends or truncates only the tail; a historical as-of insert re-derives that series' map; any union rebuild re-derives every map in `O(points + rows)`. Indicator outputs of an as-of source compute on its own rows and alias its map with their row offset, rewriting only the changed tail. A series whose points move because of another series' data (a tail resync or any union reindex, including a reinstall or pop inside pre-installed session slots that leaves the time points unchanged) is reported once through the data layer's realigned list, which time synchronization drains into series-frame invalidation. Only engine-valued time series (line, area, baseline, histogram, bar, candlestick) that own their rows may be as-of; custom, advanced, footprint, trade-bound, trade-study, and synthetic series, indicator outputs, and any series while a non-time sequence axis is installed are refused, and a conversion to a host-valued kind or a footprint, a trade-bound binding, or a synthetic configuration rejoins the union first. An output that is re-aliased after owning its rows gives up its own alignment and follows its source again. The policy is host-owned series configuration and, like every financial series definition, is not persisted. Browser hosts set it through one shared TypeScript function, at creation and afterwards, for main-thread series handles (`apply_options`) and worker charts (`offscreen_chart.add_series` options and `apply_series_options`); the worker path first refuses any series id that is not a live `u32` handle, because the wasm boundary would otherwise wrap `NaN`, a fraction, or `2**32` onto another series.
+多日历叠加层按其拥有的每个系列选择退出该并集（`TimeAlignment::AsOf`，浏览器端为 `series_options.time_alignment: "as_of"`）：它不会增加合并时间点，因此按并集计时的系列保持无间隙的坐标轴。其 `PlotList` 持有一个映射到合并点的稠密或稀疏逻辑索引映射，范围至并集的数据范围为止（即宿主拥有的并集系列持有真实行的最后一个点，因此叠加层绝不会延伸到宿主安装的未来交易时段槽位中），外加一个非递减的绘制行到规范行的映射。每个点显示其时间处或之前的最后一个规范行；两个点之间的行折叠进较晚的那个点；没有更新行的点会重复前一个点所显示的行，除非该行比可选的 `max_staleness` 更旧；最后一个点之后的行则等待新点出现。值绝不复制：`PlotValues::AsOf` 通过该映射解析每个值、空白数据判定、自动缩放分块和逐点颜色，而映射绘制的金字塔汇总的是绘制行。需要规范行的读取方（研究、`data()`、合并、柱时间、选择锚点、可见范围成交量分布、Heikin Ashi、交易时段高亮、无障碍焦点环，以及读取数据的绘图：回归趋势、预测和柱形态）通过 `source_row`、`row_for_source` 或 `source_range` 进行转换（绘图则通过 `ChartEngine::drawing_source_window`，它将每个规范行放置在其时间处或之后的第一个点上）；标记解析到其时间处或之后的第一个点，并与它们的行一样，在最后一个点之后等待。as-of 行的一次值 Tick 只修复显示该行的点；新的 as-of 行只重写其时间处或之后的点；新的并集点或数据范围的移动只对尾部进行追加或截断；历史 as-of 插入会重新推导该系列的映射；任何并集重建都会以 `O(points + rows)` 重新推导每一个映射。as-of 源的指标输出基于其自身的行计算，并带着各自的行偏移别名引用其映射，只重写发生变化的尾部。因其他系列的数据而导致点发生移动的系列（尾部重新同步或任何并集重新索引，包括在预装交易时段槽位内重新安装或弹出而使时间点保持不变的情况）会通过数据层的重新对齐列表上报一次，时间同步再将该列表排空，转入系列帧失效。只有拥有自身行、由引擎取值的时间系列（折线、面积、基线、直方图、柱、K 线）才可以采用 as-of；自定义、高级、足迹图、成交绑定、成交研究和合成系列，指标输出，以及在安装了非时间的序列轴期间的任何系列，都会被拒绝；而转换为由宿主取值的类型，或转换为足迹图、成交绑定或合成配置时，会先重新加入并集。在拥有自身行之后又被重新别名化的输出会放弃自身的对齐，重新跟随其源。该策略是由宿主拥有的系列配置，并且与所有金融系列定义一样，不会被持久化。浏览器宿主通过同一个共享的 TypeScript 函数设置它，无论是在创建时还是之后，适用于主线程系列句柄（`apply_options`）和 worker 图表（`offscreen_chart.add_series` 的选项和 `apply_series_options`）；worker 路径会先拒绝任何不是有效 `u32` 句柄的系列 id，否则 wasm 边界会把 `NaN`、小数或 `2**32` 回绕到另一个系列上。
 
-Each canonical built-in series also owns an eager fanout-16 row-summary pyramid. A summary stores only six `u32` source-row identities: chronological endpoints, OHLC low/high, and close minimum/maximum. Values are always dereferenced from the canonical columns, so the hierarchy adds no second value owner and preserves whitespace. Point and tail mutations repair one node per affected level; typed batches repair the affected range once; historical insertion, replacement, and retention rebuild or repair the exact affected hierarchy before the mutation is visible. The same endpoint summaries bound latest and predecessor lookup to at most fanout work per hierarchy level even across pathological whitespace; no parallel predecessor index or value history is retained. Series removal releases the hierarchy with the canonical storage slot. Custom-series host geometry is not summarized because its semantics are not engine-owned.
+每个规范的内置系列还拥有一个即时构建的、扇出为 16 的行摘要金字塔。摘要只存储六个 `u32` 源行标识：按时间顺序的两个端点、OHLC 的最低/最高价，以及收盘价的最小值/最大值。值始终从规范列中解引用，因此该层级结构不会增加第二个值的所有者，并且会保留空白数据。单点变更和尾部变更在每个受影响的层级上修复一个节点；类型化批量只修复一次受影响的范围；历史插入、替换和数据保留会在变更可见之前重建或修复确切受影响的层级结构。同样的端点摘要将最新值和前驱值的查找限制为每个层级最多 fanout 的工作量，即使在病态的空白数据中也是如此；不保留并行的前驱索引或值历史。系列移除时会随规范存储槽位一并释放该层级结构。自定义系列的宿主几何不做摘要，因为其语义不归引擎所有。
 
-Each canonical series also carries a data generation. An ascending typed batch is sanitized once at the host boundary, merged into its source in one data-layer operation, then synchronizes merged time points, tick weights, dependent indicators, and frame generations once. Tail batches append weights incrementally; historical batches merge in `O(n + k)` and reindex once rather than once per input row. A single update, or a batch whose rows before the series' last bar only correct bars whose timestamps the series already holds (the late N-1/N-2 revision), is applied in place: each corrected row repairs its summary path and autoscale chunk, the batch's tail rows stream through the append/replace path, and nothing merges the timestamp union or reindexes a plot. A new historical row at a time the union already holds reindexes only its own series (and aliased outputs); only a timestamp new to the chart inserts into the union and reindexes every series. A data-layer transaction that actually rebuilds the timestamp union temporarily captures its prior union and emits one old-to-final logical mapping through common timestamps when the engine synchronizes. Current-bar replacements and pure tail appends capture and map nothing, and no second merged timeline survives the synchronization boundary. The union is a linear merge of the union series' already-sorted time columns (up to 16 series; a wider layer sorts the concatenation instead), and a retention that trims several series at once (`DataLayer::trim_fronts`) merges it and reindexes every plot once, not once per trimmed series. On a time axis the synchronization after such a trim keeps the surviving points' tick weights, drops the evicted ones, and re-weighs only the new first point and the appended tail; a non-time axis, whose tick times come from the bar sidecar, re-weighs every point.
+每个规范系列还携带一个数据代次。升序的类型化批量在宿主边界处只清洗一次，在一次数据层操作中合并进其源，然后只同步一次合并时间点、刻度权重、依赖的指标和帧代次。尾部批量以增量方式追加权重；历史批量以 `O(n + k)` 合并，并且只重新索引一次，而不是每个输入行重新索引一次。单次更新，或者其位于系列最后一根柱之前的行只修正系列已持有时间戳的柱的批量（迟到的 N-1/N-2 修订），会就地应用：每个被修正的行修复其摘要路径和自动缩放分块，批量的尾部行经由追加/替换路径流式写入，并且不会合并时间戳并集，也不会重新索引任何绘制序列。位于并集已持有的时间处的新历史行只会重新索引其自身所属的系列（以及别名输出）；只有对图表而言全新的时间戳才会插入并集并重新索引每个系列。真正重建时间戳并集的数据层事务会临时捕获其先前的并集，并在引擎同步时通过共同时间戳产出一份从旧状态到最终状态的逻辑映射。当前柱替换和纯尾部追加不捕获也不映射任何内容，并且不会有第二条合并时间线在同步边界之后留存。并集是参与并集的各系列已排序时间列的线性合并（至多 16 个系列；系列数更多的层则改为对拼接结果排序），而一次同时裁剪多个系列的数据保留操作（`DataLayer::trim_fronts`）只合并一次并集，并只重新索引每个绘制序列一次，而不是每个被裁剪的系列各做一次。在时间轴上，此类裁剪之后的同步会保留幸存点的刻度权重，丢弃被逐出点的刻度权重，并且只对新的第一个点和追加的尾部重新计算权重；非时间轴的刻度时间来自柱的 sidecar，会对每个点重新计算权重。
 
-Streaming keeps reference `series.update` semantics (the point replaces the whole bar). Two real-time policies are engine-owned rather than host-rebuilt: `ChartEngine::merge_series_bars` (and its single-row form `merge_series_bar`) merges partial bars field-wise into the stored bars in input order (absent fields keep their values and color overrides; candlestick/bar results are normalized so high/low envelope open and close; scalar series take the value), validates the whole batch before mutating, applies each row through the streaming data-layer path, and synchronizes time state and indicators once. An optional per-series monotonic sequence (`SeriesEntry::update_sequence`, O(1), runtime-only, cleared by a full data install) rejects stale deliveries for sequenced updates, merges, and typed batches before any mutation; custom and advanced series, whose payloads bypass this path, refuse a sequence instead of ignoring it. A streamed row's explicit color creates that series' color channel on first use, so streaming and full installs color bars identically. Volume and turnover stay independent series; the engine never infers them from a price series. The browser package only encodes absent fields and the optional sequence at the WASM boundary and reports diagnostics; it keeps no bar cache or sequence state of its own.
+流式更新沿用参考实现 `series.update` 的语义（该点会替换整根柱）。有两项实时策略由引擎拥有，而不是由宿主重新构建：`ChartEngine::merge_series_bars`（及其单行形式 `merge_series_bar`）按输入顺序将部分柱按字段合并进已存储的柱（缺失的字段保留其值和颜色覆盖；K 线/柱结果会被规范化，使最高价/最低价包住开盘价和收盘价；标量系列取该值），在变更之前校验整个批量，通过流式数据层路径应用每一行，并只同步一次时间状态和指标。可选的逐系列单调序号（`SeriesEntry::update_sequence`，O(1)，仅运行时，会被完整数据安装清除）会在任何变更之前，拒绝带序号的更新、合并和类型化批量中的过期投递；自定义系列和高级系列的负载绕过该路径，因此会拒绝序号，而不是忽略它。流式行的显式颜色会在首次使用时创建该系列的颜色通道，因此流式更新与完整安装对柱的着色完全一致。成交量和成交额仍是独立的系列；引擎绝不会从价格系列推断它们。浏览器包只在 WASM 边界编码缺失的字段和可选的序号，并上报诊断信息；它自身不保留柱缓存或序号状态。
 
-One core validator defines canonical numeric time: a finite, integral count of whole UTC seconds in
-the inclusive range `-62167219200..253402300799` (years 0000..9999). Hosts do not auto-convert
-numeric timestamps. Out-of-range errors include a likely milliseconds, microseconds, or nanoseconds
-hint when dividing by that unit would enter the supported range. Direct set/update batches validate
-all timestamps before repair or mutation and reject atomically; single updates likewise preserve
-state. Shared-ring drains may reject individual rows because producer drains cannot be rolled back.
+由一个核心校验器定义规范的数值时间：位于闭区间 `-62167219200..253402300799`（年份 0000..9999）内的、有限的整数个完整 UTC 秒。宿主不会自动转换数值时间戳。当除以某个单位后会进入受支持范围时，超出范围的错误会包含可能是毫秒、微秒或纳秒的提示。直接的设置/更新批量会在修复或变更之前校验所有时间戳，并以原子方式整体拒绝；单次更新同样会保持状态不变。共享环形缓冲区的排空可能会拒绝个别行，因为生产者的排空无法回滚。
 
-Presentation and grouping of those instants use one chart-level `ExchangeTime`
-(`aeris_charts_core::scale::exchange_time`): a validated, bounded (≤1024 transitions) UTC-offset
-schedule, a trading-day session start relative to local midnight (negative starts assign evening
-sessions to the next trading day and roll weekend days forward to Monday; window placement assumes
-the week opens on Friday evening), and a calendar-date flag
-for business-day input, whose rows are never shifted. The default is UTC with a midnight start, which
-reproduces the historical behavior exactly. Tick weights (trading days for Day/Month/Year, exchange
-wall clock for intraday boundaries, including the non-time sequence axis), built-in labels, VWAP and
-pivot period keys, session highlighting, and the countdown window all read it. The engine never
-consults a platform time zone. It takes an explicit schedule (`ChartEngine::set_exchange_offsets`,
-`timeScale.timeZone`; the browser package resolves IANA names with `Intl` and derives the
-calendar-date flag from its series' input forms, while Rust hosts pass both) or a zone named from the
-TradingView parity list (`ChartEngine::set_time_zone`, the top-level `timezone` option). A named zone is
-resolved once by `ChartTimeZone` (`aeris_charts_core::time_zone`: the embedded `chrono-tz` database, no
-system clock) into the same bounded 1970–2100 schedule, so it moves tick weights, labels, period
-resets, sessions and the countdown exactly like the equivalent explicit schedule; the name additionally
-localizes the general (non-financial) temporal axes and `time_zone_clock_text`, which an explicit
-schedule does not (`time_zone_id` then reports `custom`). Changing it rebuilds tick weights and
-period-keyed indicator bindings once (the calendar-date flag alone is a no-op on the UTC identity). The
-schedule and session start live in the options store, and a named zone also writes its `timezone` key
-(cleared when an explicit schedule replaces it, so a persisted name is never stale), so V2 persistence
-carries them; importing a document without them keeps the installed exchange time. A V2 import validates
-the document's options against that live exchange time and installed bar time label
-(`prepare_options_patch`) before it replaces any state, then applies the prepared patch with no failure
-path, so a rejected document leaves the chart unchanged.
+这些时刻的呈现与分组使用一个图表级的 `ExchangeTime`（`aeris_charts_core::scale::exchange_time`）：一份经过校验的、有界的（≤1024 个转换点）UTC 偏移时间表，一个相对于本地午夜的交易日时段起点（负的起点会把夜间时段归入下一个交易日，并把周末日顺延到周一；窗口的放置假定一周在周五晚间开盘），以及一个用于营业日输入的日历日期标志，其行绝不会被移位。默认值是起点为午夜的 UTC，可完全复现历史行为。刻度权重（日/月/年使用交易日，日内边界使用交易所挂钟时间，包括非时间的序列轴）、内置标签、VWAP 和枢轴点的周期键、交易时段高亮以及倒计时窗口都读取它。引擎绝不查询平台时区。它接受一份显式时间表（`ChartEngine::set_exchange_offsets`、`timeScale.timeZone`；浏览器包用 `Intl` 解析 IANA 名称，并根据其系列的输入形式推导日历日期标志，而 Rust 宿主则两者都需传入），或一个取自 TradingView 对标列表的具名时区（`ChartEngine::set_time_zone`、顶层的 `timezone` 选项）。具名时区由 `ChartTimeZone`（`aeris_charts_core::time_zone`：内嵌的 `chrono-tz` 数据库，不使用系统时钟）一次性解析为同样有界的 1970–2100 时间表，因此它移动刻度权重、标签、周期重置、交易时段和倒计时的方式与等价的显式时间表完全相同；此外，该名称还会本地化通用（非金融）的时间坐标轴以及 `time_zone_clock_text`，而显式时间表不会这样做（此时 `time_zone_id` 报告 `custom`）。更改它会重建一次刻度权重和以周期为键的指标绑定（仅改变日历日期标志，在 UTC 恒等时间表上是空操作）。时间表和交易时段起点保存在选项存储中，具名时区还会写入其 `timezone` 键（当显式时间表取而代之时会被清除，因此持久化的名称绝不会过期），所以 V2 持久化会携带它们；导入不含它们的文档会保留已安装的交易所时间。V2 导入会先根据当前的交易所时间和已安装的柱时间标签（`prepare_options_patch`）校验文档的选项，之后才替换任何状态，然后在没有失败路径的情况下应用已准备好的补丁，因此被拒绝的文档不会改变图表。
 
-A bar's identity is its OPEN second: the data layer, merged times, countdown window, replay cutoff,
-trading-day keys, session highlighting, drawing and marker identities, resampling buckets, and every
-time that crosses the host boundary key on it. The one exception to "identity is what is printed" is
-the chart-level display label (`timeScale.barTimeLabel`, engine `bar_time_label_api`): `Open` (the
-default) prints identity, `Close { interval_seconds, windows }` prints the bar's close. The engine
-holds the configuration plus one derived `SessionBarGrid` for the optional windows (at most 32,
-validated against the session start in force after the patch and rebuilt whenever the exchange time
-changes). The label and the session start are always a valid pair: a session start the installed
-windows cannot be placed on is rejected atomically (`ExchangeTimeError::BarTimeLabelWindows`, and
-`invalid_options` through an options patch, which judges the label the same patch installs), so an
-exported document always imports again. Window placement is structural and independent of the
-offset schedule, so a zone change never orphans windows; only an instant whose windows a DST
-transition collapses falls back to open plus interval. `bar_label_time(time)` is
-total and allocation-free (stack window buffers): identity for `Open`, on calendar-date axes, and on
-non-time sequence axes; otherwise `SessionBarGrid::bar_close` for an open strictly inside a window
-(the window end for a short last bar) and open plus interval for everything else, DST-collapsed
-windows included. It is applied to the TEXT surfaces only, before the host formatter or the built-in
-format (crosshair, automatic and default explicit tick text, drawing axis tags and statistics, the
-forecast target time, the delta tooltip, and the package's tooltip and accessibility text); every
-readback, event, snapshot, explicit mark time, and native vertical-line label stays identity.
-Hour and minute tick weights compare the printed times (`weight_by_time_shifted` with a shift of one
-interval, constant even for a short last bar) while Day/Month/Year compare the identity trading days;
-the shift is zero on non-time sequence axes and independent of the calendar-date flag, so no axis
-transition leaves stale weights. Backends never see the option: it only changes `AxisLabel` text.
+柱的标识是其开盘（OPEN）秒：数据层、合并时间、倒计时窗口、回放截止点、交易日键、交易时段高亮、绘图与标记的标识、重采样桶，以及所有跨越宿主边界的时间，都以它为键。“标识即所打印内容”这一规则的唯一例外是图表级显示标签（`timeScale.barTimeLabel`，引擎中的 `bar_time_label_api`）：`Open`（默认）打印标识，`Close { interval_seconds, windows }` 打印柱的收盘时间。引擎持有该配置，以及为可选窗口派生的一个 `SessionBarGrid`（至多 32 个，根据补丁生效后的交易时段起点校验，并在交易所时间每次变化时重建）。标签与交易时段起点始终是有效的组合：已安装的窗口无法据以放置的交易时段起点会被原子地拒绝（`ExchangeTimeError::BarTimeLabelWindows`；通过选项补丁时则为 `invalid_options`，此时会连同该补丁所安装的标签一并判定），因此导出的文档总能再次导入。窗口的放置是结构性的，与偏移时间表无关，因此时区变更绝不会使窗口成为孤儿；只有其窗口被 DST 转换折叠的时刻，才会回退为开盘加间隔。`bar_label_time(time)` 对所有输入都有定义且无分配（使用栈上的窗口缓冲区）：对 `Open`、日历日期坐标轴和非时间的序列轴返回标识；否则，对严格位于某个窗口内部的开盘时间返回 `SessionBarGrid::bar_close`（对较短的最后一根柱返回窗口结束时间），其余情况返回开盘加间隔，包括被 DST 折叠的窗口。它仅应用于文本（TEXT）表面，且在宿主格式化器或内置格式之前（十字光标、自动和默认的显式刻度文本、绘图的坐标轴标签和统计、预测目标时间、差值提示框，以及该包的提示框和无障碍文本）；所有读回、事件、快照、显式标记时间和原生垂直线标签保持为标识。小时和分钟的刻度权重比较的是所打印的时间（`weight_by_time_shifted`，偏移一个间隔，即使对较短的最后一根柱也保持恒定），而日/月/年比较的是标识的交易日；在非时间的序列轴上该偏移为零，并且与日历日期标志无关，因此任何坐标轴转换都不会留下过期的权重。后端永远看不到该选项：它只改变 `AxisLabel` 文本。
 
-Session slots for intraday (time-sharing) charts are generated by one platform-free core function,
-`aeris_charts_core::scale::session_slots::session_slot_times` (re-exported by the engine): a trading
-date, chronological exchange-local windows (which may cross midnight), a bar interval, and an
-`ExchangeTime` produce the UTC bar times, each window converted with the offset in force on that
-date and placed inside the trading day the session start of the `ExchangeTime` it is given defines
-(the chart's for trade-stream sessions, the call's own for the free function and its WASM request,
-which defaults to 0; weekend roll included, so a Sunday-open market places its evening windows under
-a per-call start of 0). Input is validated and the slot count is checked against a 100 000 bound
-before allocation. The browser package resolves the IANA zone and calls it through a free WASM
-function; which dates trade remains host-owned calendar data. Hosts install the slots as
-whitespace rows.
+分时图的交易时段槽位由一个与平台无关的核心函数 `aeris_charts_core::scale::session_slots::session_slot_times`（由引擎重新导出）生成：给定一个交易日期、按时间顺序排列的交易所本地窗口（可跨越午夜）、一个柱间隔和一个 `ExchangeTime`，即可产出 UTC 柱时间；每个窗口使用该日期当天生效的偏移量进行转换，并放置在由所给 `ExchangeTime` 的交易时段起点所界定的交易日内（成交流交易时段使用图表自身的，独立函数及其 WASM 请求使用调用自带的，其默认值为 0；包含周末顺延，因此周日开盘的市场在调用自带的起点为 0 时放置其夜间窗口）。输入会被校验，并且在分配之前会对照 100 000 的上限检查槽位数量。浏览器包解析 IANA 时区，并通过一个独立的 WASM 函数调用它；哪些日期交易仍是宿主拥有的日历数据。宿主将这些槽位安装为空白数据行。
 
-The same placement (`session_window_bounds`, the UTC `(open, close)` of each window of one trading
-date) drives session-anchored bars. Core `SessionBarGrid` maps an instant to the open of its bar:
-the windows of the instant's trading day (or a previous-day window that reaches past the session
-start) each restart the bar grid at their open, the last bar of a window ends at its close, and a
-one-day interval spans the whole trading day. Prints outside every window either fold (before the
-day's first window into its first bar, later into the preceding window's last bar) or are excluded
-except in a window's closing second. A lookup places at most two trading days on stack buffers and
-allocates nothing. Trade streams opt into it per stream (below) in the chart's exchange time, and
-`resample_boundaries` turns host trading dates plus the same windows into resampling boundaries.
-`SessionBarGrid::bar_close` (the open plus the interval, or the end of the window that contains the
-open) shares the window placement of `bar_open` and backs the chart's close-time display label.
+同样的放置方式（`session_window_bounds`，即某一个交易日各窗口的 UTC `(open, close)`）驱动以交易时段为锚的柱。核心的 `SessionBarGrid` 将一个时刻映射到其所在柱的开盘时间：该时刻所在交易日的窗口（或越过交易时段起点的前一天窗口）各自在其开盘处重新开始柱网格，窗口的最后一根柱在其收盘处结束，一日间隔则覆盖整个交易日。落在所有窗口之外的成交要么被折叠（在当天第一个窗口之前的并入其第一根柱，之后的并入前一个窗口的最后一根柱），要么被排除，窗口收盘那一秒内的除外。一次查找最多在栈缓冲区上放置两个交易日，并且不进行任何分配。成交流按每条流选择启用它（见下文），使用图表的交易所时间；`resample_boundaries` 则把宿主的交易日期加上同样的窗口转换为重采样边界。`SessionBarGrid::bar_close`（开盘时间加间隔，或包含该开盘时间的窗口的结束时间）与 `bar_open` 共用同一套窗口放置，并支撑图表的收盘时间显示标签。
 
-Explicit time-axis marks (`timeScale.tickMarks`) are engine state beside the automatic tick
-weights: at most 512 strictly ascending UTC times with optional labels of at most 64 bytes. While
-set, `ChartEngine::time_marks` resolves them to exact time points (whitespace slots included; marks
-without a point are skipped), so the vertical grid and the axis labels, which both read that one
-owner, follow the anchors; labels default to the exchange-time label of their point's weight, are
-edge-aligned inside the axis strip, and a label overlapping its predecessor is dropped while its grid
-line stays. A mark on the chart's first point is weighed like the automatic first mark (against
-one average spacing), except that on a chart spanning several trading days it weighs at least a
-day, so every day-open mark shares one label style. The list is validated with the exchange-time
-keys of the same patch, mirrored into the options store (so V2 persistence and worker option
-patches carry it), and attributed to tick memory.
+显式时间轴标记（`timeScale.tickMarks`）是与自动刻度权重并列的引擎状态：至多 512 个严格升序的 UTC 时间，可附带至多 64 字节的可选标签。设置之后，`ChartEngine::time_marks` 会将它们解析为精确的时间点（包含空白数据槽位；没有对应点的标记会被跳过），因此垂直网格和坐标轴标签（二者读取的是同一个所有者）都会跟随这些锚点；标签默认为其所在点权重对应的交易所时间标签，在坐标轴条带内按边缘对齐，与前一个标签重叠的标签会被丢弃，但其网格线保留。图表第一个点上的标记按与自动的第一个标记相同的方式计权（相对于一个平均间距），区别在于：在跨越多个交易日的图表上，它至少按一天计权，因此每个日开盘标记共用同一种标签样式。该列表与同一补丁中的交易所时间键一起校验，镜像到选项存储中（因此 V2 持久化和 worker 选项补丁会携带它），并归入刻度内存的统计。
 
-Display-only time projection (`ChartEngine::set_future_time_projection` and `set_past_time_projection`:
-a cadence in seconds and a point count, each bounded at 4,096) adds axis and crosshair labels in the
-whitespace beyond the last and before the first bar of a time axis. Projected points are labels only:
-they never enter the data layer, the base index, or the time scale's point count (fit-content, scroll
-clamps and whitespace data stay canonical). Past labels take negative logical indices
-(`TimeTickMarks::set_weights_from`), and `axis_time_key_at` / `axis_time_key_at_logical` resolve their
-identity times (`last + k × cadence`, `first − k × cadence`), which the close-time label and the
-exchange time then print like real bars. While a projection is configured the weight column is rebuilt
-whole from the projected axis times, so the O(1) live-tip append and the retention front trim serve only
-the unprojected case; a non-time sequence axis never projects. The projection is runtime state: it is
-neither persisted nor part of the options store.
+仅用于显示的时间投影（`ChartEngine::set_future_time_projection` 和 `set_past_time_projection`：以秒计的步长和点数，二者各以 4,096 为上限）会在时间轴的最后一根柱之后和第一根柱之前的空白区域中添加坐标轴标签和十字光标标签。投影点只是标签：它们绝不会进入数据层、基准索引或时间比例尺的点数（fit-content、滚动钳制和空白数据保持规范）。过去侧的标签使用负的逻辑索引（`TimeTickMarks::set_weights_from`），`axis_time_key_at` / `axis_time_key_at_logical` 解析它们的标识时间（`last + k × cadence`、`first − k × cadence`），随后收盘时间标签和交易所时间会像对待真实柱一样打印它们。配置了投影时，权重列会根据投影后的坐标轴时间整体重建，因此 O(1) 的实时末端追加和数据保留的前端裁剪只适用于未投影的情形；非时间的序列轴绝不投影。该投影是运行时状态：既不持久化，也不属于选项存储。
 
-## Crate boundaries
+## Crate 边界
 
 ### `aeris_charts_core`
 
-Platform-free chart fundamentals: validated canonical columnar data, compact plot index/view storage, ranges, options, formatting, price scales, time scales, tick marks, and shared math. It also exposes structure-level payload and capacity attribution for memory evidence; these counters are not allocator, WASM-page, or browser-memory measurements. Media-space calculations remain `f64`; conversion to backend coordinate formats happens at rendering boundaries.
+与平台无关的图表基础：经过校验的规范列式数据、紧凑的绘制序列索引/视图存储、范围、选项、格式化、价格比例尺、时间比例尺、刻度标记和共享数学。它还公开结构级的负载与容量归因，用作内存证据；这些计数器不是分配器、WASM 页或浏览器内存的度量。媒体空间计算保持为 `f64`；向后端坐标格式的转换发生在渲染边界处。
 
-The `time_zone` module (`ChartTimeZone`, `TRADINGVIEW_TIME_ZONES`) maps the 98 TradingView parity zone ids
-onto the embedded `chrono-tz` database (chrono without its `clock` feature, so no system zone is ever read)
-and resolves a zone into a bounded `UtcOffsetSchedule` (`ChartTimeZone::offset_schedule`, 2.6–5.9 ms per
-zone natively, paid once per zone change). `.cargo/config.toml` sets `CHRONO_TZ_TIMEZONE_FILTER` so the
-tables compiled into this repository's artifacts hold only the parity zones; a consumer that takes the
-crate by Git does not read that file and compiles the complete database, which costs only native size.
+`time_zone` 模块（`ChartTimeZone`、`TRADINGVIEW_TIME_ZONES`）将 98 个 TradingView 对标时区 id 映射到内嵌的 `chrono-tz` 数据库（不带 `clock` 特性的 chrono，因此绝不会读取系统时区），并把时区解析为有界的 `UtcOffsetSchedule`（`ChartTimeZone::offset_schedule`，原生环境下每个时区 2.6–5.9 ms，每次时区变更仅付出一次）。`.cargo/config.toml` 设置了 `CHRONO_TZ_TIMEZONE_FILTER`，使编译进本仓库产物的表只包含这些对标时区；通过 Git 引入该 crate 的使用者不会读取该文件，会编译完整的数据库，这只会增加原生体积。
 
-Price tick marks are built on the caller's price grid. The reference span search runs unchanged and
-its result is then widened to the smallest nice span (`{1, 2, 2.5, 4, 5} × 10^k`, else
-`min_move × {1, 2, 5} × 10^k`) that is an integer multiple of `min_move`, so every tick is a
-tradable price; decimal and binary minimum moves already satisfy this and keep reference output.
-The grid may depend on the price interval (a tick ladder): the view's grid picks the first span, and
-a log scale re-derives each following span from the grid of the interval below the last mark, so
-low-priced regions keep their own finer ticks.
-`PriceTickLadder` (at most 64 validated ascending bands whose bounds lie on both adjacent grids)
-owns band lookup, snapping, per-band precision and labels, cumulative tick indices, and the grid of
-a price span (the LCM of the touched bands' ticks). `PriceScaleCore` owns the autoscale shaping that
-follows source merging: an optional symmetric center, the opt-in stable mode (grow immediately,
-shrink only when data one bar beyond the visible edges leaves more than 20% of the range unused;
-reset by mode/base/center changes and autoscale re-enable; the engine also resets it when a source
-changes structurally: full data replacement, including indicator outputs rebuilt from it, and
-series visibility, removal, or pane/scale rebinding), degenerate
-padding, and log refit. `ensureEdgeTickMarksVisible` boundary marks and their half-font padding
-apply only while autoscaled, as in the reference.
+价格刻度标记建立在调用方的价格网格之上。参考实现的跨度搜索原样运行，其结果随后被放宽到最小的规整跨度（`{1, 2, 2.5, 4, 5} × 10^k`，否则为 `min_move × {1, 2, 5} × 10^k`），该跨度是 `min_move` 的整数倍，因此每个刻度都是可交易的价格；十进制和二进制的最小变动单位本就满足这一点，并保持参考实现的输出。网格可以依赖于价格区间（刻度阶梯）：视图的网格选出第一个跨度，对数比例尺则根据最后一个标记下方区间的网格重新推导后续每个跨度，因此低价区域保留各自更细的刻度。`PriceTickLadder`（至多 64 个经过校验的升序价格带，其边界位于相邻两侧的网格上）拥有价格带查找、吸附、各价格带的精度与标签、累计刻度索引，以及价格跨度的网格（所涉价格带刻度的最小公倍数（LCM））。`PriceScaleCore` 拥有源合并之后的自动缩放整形：可选的对称中心；需主动启用的稳定模式（立即扩张，仅当可见边缘之外一根柱处的数据使范围中有超过 20% 未被占用时才收缩；由模式/基准/中心的变更和自动缩放的重新启用重置；当源发生结构性变化时引擎也会重置它：完整数据替换（包括由其重建的指标输出），以及系列的可见性、移除或窗格/比例尺的重新绑定）、退化情形的内边距和对数重新拟合。`ensureEdgeTickMarksVisible` 的边界标记及其半个字号的内边距仅在自动缩放时生效，与参考实现一致。
 
-General Cartesian scale foundations live beside, rather than inside, the financial scales. `LinearScale`,
-`LogScale`, and `SymLogScale` map continuous numeric domains and emit bounded deterministic ticks;
-`BandScale` and `PointScale` map caller-owned category indices without retaining labels or allocating
-category state. All five keep their math in `f64`, accept reversed ranges, and have no host or renderer
-dependency. Linear normalization, interpolation, and tick selection remain finite for every pair of
-distinct finite domain endpoints, including spans whose direct subtraction overflows. General axes with
-explicit numeric, temporal, band, or point domains use these scales during
-shared layout and axis-frame construction; temporal coordinates reuse the linear transform over validated
-JavaScript-safe epoch milliseconds while the engine owns UTC calendar interval selection and formatting.
-The financial coordinate path does not dispatch through them.
-Existing financial charts therefore continue to instantiate only `TimeScaleCore` and `PriceScaleCore`
-and pay no retained-memory cost for these foundations.
+通用笛卡尔比例尺基础设施与金融比例尺并列存在，而不是位于金融比例尺之内。`LinearScale`、`LogScale` 和 `SymLogScale` 映射连续数值域并产生有界的确定性刻度；`BandScale` 和 `PointScale` 映射由调用方拥有的类别索引，不保留标签，也不分配类别状态。这五者都以 `f64` 进行数学运算，接受反向区间，且不依赖任何宿主或渲染器。对于任意一对不同的有限域端点，线性归一化、插值与刻度选择的结果都保持有限，包括直接相减会溢出的跨度。具有显式数值、时间、band 或 point 域的通用坐标轴，在共享布局与坐标轴帧构建期间使用这些比例尺；时间坐标在经过校验、符合 JavaScript 安全范围的 epoch 毫秒值上复用线性变换，而 UTC 日历区间的选择与格式化由引擎拥有。金融坐标路径不会经由它们分发。因此，现有金融图表仍然只实例化 `TimeScaleCore` 和 `PriceScaleCore`，不为这些基础设施付出任何保留内存开销。
 
-Each pane has one immutable horizontal-domain binding. Absence of a general binding means
-`financial_time` and continues to use the chart's established `TimeScaleCore`; this is the initial
-pane and every legacy `add_pane` call. Non-financial continuous, temporal, category, and polar
-declarations live in a chart-owned registry that allocates only on first use, is capped at 64 live
-entries, uses monotonic internal identities, and releases entries with their panes. Pane moves and
-swaps carry the binding. Until compatible general series and axes are installed, financial series
-cannot move into a general pane, and V1 persistence rejects rather than silently reinterprets a
-general pane. The existing financial frame path never dispatches through the registry.
+每个窗格有且仅有一个不可变的水平域绑定。没有通用绑定即表示 `financial_time`，并继续使用图表既有的 `TimeScaleCore`；初始窗格以及每一次旧版 `add_pane` 调用都属于这种情况。非金融的连续、时间、类别和极坐标声明保存在图表拥有的注册表中，该注册表仅在首次使用时分配，上限为 64 个活动条目，使用单调递增的内部标识，并随窗格一起释放条目。窗格移动与交换会携带该绑定。在兼容的通用系列和坐标轴安装之前，金融系列不能移入通用窗格；V1 持久化会拒绝通用窗格，而不会静默地重新解释它。既有的金融帧路径绝不经由该注册表分发。
 
-General axes are chart-owned objects with unique case-sensitive UTF-8 IDs and monotonic internal
-handles. Their options retain dimension, resolved placement, scale type, automatic or explicit
-domain, direction, visibility, title, bounded tick policy, band padding, zero-line policy, and grid
-policy. Validation is atomic: Cartesian X axes must match the pane domain; Cartesian Y axes are
-numeric; polar panes accept only angular-category and radial-linear axes; explicit domains must
-match the scale and category labels must be unique. Axis count, identity/title bytes, tick count,
-category count, and category bytes are bounded and included in engine memory attribution. Pane
-moves preserve axis ownership through stable pane IDs. Explicit temporal bounds are ascending epoch
-milliseconds within JavaScript's exactly representable integer range. Pane removal releases its
-axes. Visible Cartesian axes reserve engine-owned top/bottom plot space and measured left/right strips;
-multiple axes stack in insertion order, vertical widths use the existing grow-fast/shrink-on-full-layout
-policy, and the resulting rules, titles, and collision-filtered ticks are emitted through the common
-`AxisFrame`. Each side may reserve at most 45% of the space remaining after financial axes; complete
-strips that do not fit are omitted, preserving a nonzero plot and keeping unscissored axis chrome inside
-the chart. Category selection and numeric tick generation are capped at 512 candidates. Explicit
-Cartesian numeric, temporal, and category ticks share that cap, reject duplicate or scale-incompatible values,
-and retain optional preformatted labels as portable engine state; out-of-view ticks are clipped by
-the same transform that places generated ticks and grid rules. Automatic band
-and numeric domains now resolve from visible bound general series without rewriting configured axis
-options; hidden series stop contributing immediately. Each series' O(rows) numeric scan is memoized in
-the general-series registry per axis dimension and scale, keyed by dataset identity and generation, series
-kind, and stacking, bounded per series and dropped with the series, so hit tests and frames resolve auto
-domains without rescanning unchanged data. A single extreme numeric value expands inward
-when outward padding would overflow; logarithmic domains use the adjacent positive value when a
-percentage expansion rounds back to the same endpoint. Continuous X/Y axes execute linear, logarithmic,
-or symmetric-log transforms consistently for ticks, geometry, hit testing, and runtime pan/zoom; a
-runtime view is independent of the configured/automatic base domain and can be reset without rewriting
-axis options. Temporal axes use that same runtime-view contract with whole epoch-millisecond anchors and
-emit bounded UTC millisecond-through-calendar-year ticks through the shared `AxisFrame`; locale injection
-supplies month names without moving date math into a host or backend. Polar tick execution remains deferred
-until its owning transform slice is implemented. Cartesian grid and numeric zero-line policies execute
-from the same effective domains into the retained pane underlay, below references and series. Axis-local
-grid visibility combines with the chart-wide direction style, coincident device-pixel rules are deduplicated,
-and an enabled zero line replaces a coincident ordinary grid rule. Financial panes allocate no general
-axis storage and retain their established price/time axis output unchanged.
+通用坐标轴是图表拥有的对象，具有唯一且区分大小写的 UTF-8 ID 和单调递增的内部句柄。其选项保留维度、解析后的位置、比例尺类型、自动或显式域、方向、可见性、标题、有界的刻度策略、band 内边距、零线策略和网格策略。校验是原子的：笛卡尔 X 轴必须与窗格域匹配；笛卡尔 Y 轴为数值轴；极坐标窗格仅接受角度类别轴与径向线性轴；显式域必须与比例尺匹配，类别标签必须唯一。坐标轴数量、标识/标题字节数、刻度数量、类别数量和类别字节数均有界，并计入引擎内存归因。窗格移动时通过稳定的窗格 ID 保持坐标轴的所有权。显式时间边界为升序的 epoch 毫秒值，且处于 JavaScript 可精确表示的整数范围内。移除窗格会释放其坐标轴。可见的笛卡尔坐标轴预留由引擎拥有的上/下绘图空间以及经过度量的左/右条带；多个坐标轴按插入顺序堆叠，纵向宽度沿用既有的“快速增长、完整布局时收缩”策略，由此得到的轴线、标题和经碰撞过滤的刻度通过通用的 `AxisFrame` 输出。每一侧至多可预留金融坐标轴之后剩余空间的 45%；放不下的完整条带会被省略，以保证绘图区非零，并使未经裁剪的坐标轴界面元素保持在图表之内。类别选择与数值刻度生成都以 512 个候选项为上限。显式的笛卡尔数值、时间和类别刻度共用该上限，拒绝重复值或与比例尺不兼容的值，并把可选的预格式化标签作为可移植的引擎状态保留；视图之外的刻度由与放置生成刻度和网格线相同的变换裁剪。自动的 band 域和数值域现在根据可见的已绑定通用系列解析，而不会改写已配置的坐标轴选项；隐藏的系列立即停止贡献。每个系列 O(rows) 的数值扫描结果，按坐标轴维度和比例尺在通用系列注册表中做记忆化，以数据集标识与代次、系列种类和堆叠方式为键，按系列设定上限，并随系列一起丢弃，因此命中测试与帧构建在解析自动域时不会重新扫描未变化的数据。当向外填充会溢出时，单个极端数值会向内扩展；当百分比扩展经舍入后回到同一端点时，对数域使用相邻的正值。连续的 X/Y 轴对刻度、几何、命中测试以及运行时平移/缩放一致地执行线性、对数或对称对数变换；运行时视图独立于已配置的或自动的基础域，且无需改写坐标轴选项即可重置。时间坐标轴使用同一运行时视图契约，锚点为整数 epoch 毫秒，并通过共享的 `AxisFrame` 输出有界的、从 UTC 毫秒直至日历年的刻度；通过注入 locale 来提供月份名称，从而不必把日期运算移入宿主或后端。极坐标刻度的执行仍然延后，直到其所属的变换切片实现为止。笛卡尔网格与数值零线策略基于相同的有效域，执行到保留式窗格底层中，位于参考元素与系列之下。坐标轴本地的网格可见性与图表级的方向样式合并，重合的设备像素线会被去重，启用的零线会取代与之重合的普通网格线。金融窗格不分配通用坐标轴存储，其既有的价格/时间坐标轴输出保持不变。
 
-Category runtime views are bounded index windows over the current configured or automatic registry.
-Zoom anchors use a category identity in the visible window, pan advances by a rounded visible-window
-fraction, and registry changes clamp the window without retaining stale category strings.
+类别运行时视图是建立在当前已配置或自动注册表之上的有界索引窗口。缩放锚点使用可见窗口内的某个类别标识，平移按取整后的可见窗口比例推进，注册表变化时会对窗口进行钳制，而不保留过期的类别字符串。
 
-General Cartesian data has a separate engine-owned typed-column store beside `DataLayer`. The first
-storage slice accepts numeric, epoch-millisecond temporal, and interned-category X columns plus numeric Y
-values, explicit validity, and stable generated or caller-provided row identities. Installation and
-replacement validate the complete batch before mutation; NaN/infinity, duplicate explicit IDs, invalid
-category indices, mismatched columns, and over-limit dictionaries are rejected atomically. Dataset and
-row counts, category bytes, and ID bytes are bounded, and retained capacity is attributed separately in
-engine memory evidence. A financial-only chart keeps the store absent and therefore retains zero general
-dataset capacity.
+通用笛卡尔数据在 `DataLayer` 之外拥有一个独立的、由引擎拥有的类型化列存储。第一个存储切片接受数值、epoch 毫秒时间以及经驻留的类别 X 列，外加数值 Y 值、显式有效性标记，以及稳定的、由系统生成或由调用方提供的行标识。安装与替换在变更之前会校验完整批量；NaN/无穷大、重复的显式 ID、无效的类别索引、不匹配的列以及超限的字典，都会被原子地拒绝。数据集数量、行数、类别字节数和 ID 字节数均有界，保留的容量在引擎内存证据中单独归因。仅含金融数据的图表不会创建该存储，因此不保留任何通用数据集容量。
 
-The released Phase 2 Cartesian bindings are category-band columns, horizontal bars, box plots, category/category
-plus numeric/numeric and temporal/numeric heatmaps, numeric XY scatter/bubble marks, numeric/temporal/category
-error bars, and `xy_line`, `xy_area`, `range_area`, and category-band `range_bar`. General
-series have monotonic chart-local identities, stable pane/axis/dataset ownership, bounded title/color
-state, and lazy registry allocation. Populated axes and datasets cannot be removed out from under a
-series, and a pane containing a general series cannot be removed until that series is detached. Visible
-column series contribute their category union and finite valid Y values to automatic domains; the zero baseline participates in the Y
-domain. Horizontal bars reuse the same category/value dataset but bind the numeric value scale to X and the
-category band scale to Y; category Y autoscale is engine-owned and the numeric X zero baseline participates in
-autoscale. Phase 2 bar layout options add bounded `group_id`/`stack_id` state without creating renderer-specific
-primitives. Visible members of one group subdivide each category band, while one stack consumes one group
-slot. Normal stacks accumulate positive and negative values independently from zero and contribute their
-summed category extents to the oriented numeric-axis autoscale; percent stacks normalize each category independently to `+1` and
-`-1`. Horizontal stacks apply the same rules on numeric X; vertical stacks apply them on numeric Y.
-Stack membership requires the same pane, group, axes, orientation, and stack mode. Missing rows remain queryable
-and accessible but emit no mark or stack contribution. Bar geometry is computed once
-in shared CSS-space semantics, reused by frame painting and exact/nearest hit testing, then lowered to
-ordinary ordered `Rect` primitives. Bounded tooltip and accessibility snapshots come from the same rows.
-Scatter binds independent continuous numeric axes, validates logarithmic positivity, clips geometry to
-the runtime view, and lowers persisted circle, square, diamond, or triangle symbols to existing ordered
-primitives. Path point markers share the same symbol contract; bubbles remain area-scaled circles. Exact
-hits follow each symbol boundary. The lazily rebuilt scatter screen-space grid is keyed by dataset
-generation, plot geometry, axis domains/transforms, direction, and point radius; grid
-cell count is capped, retained capacity is attributed to engine memory, and exact/nearest hits inspect
-only intersecting cells while preserving stable series/row tie-breaking. Bubble reuses that point/index
-contract with a required typed size channel, square-root area-to-radius mapping clamped to the shared
-point-radius bound, and queryable zero/missing sizes that emit no mark. The size channel participates in
-atomic replacement, explicit-ID updates, bounded retention, accessibility, tooltip snapshots, memory
-accounting, and V2 persistence. `xy_line` and `xy_area` reuse the same
-general dataset/axis ownership across continuous numeric, temporal epoch-millisecond, and category
-band/point X domains. Missing rows split path runs by default, while persisted `connect_missing`
-can bridge them without removing their queryable identity. Transform-invalid rows always remain hard gaps.
-Their persisted `linear`, horizontal-then-vertical `step`, and Catmull-Rom `curved` interpolation policy
-travels on the ordered frame primitive and drives both shared lowering and exact/nearest hit geometry.
-`xy_line` lowers each run to the shared point pool plus ordered `Polyline` primitives. `xy_area` adds an
-ordered `AreaFill` before the matching stroke; its zero baseline is clamped into linear/symlog plots and
-falls back to the lower-domain plot edge when a logarithmic Y axis has no zero coordinate. A persisted,
-bounded fill opacity preserves the shared 3:1 top-to-baseline gradient and scales stacked/range bands from
-the same value. Line hits use
-segment distance, while area hits include the filled trapezoid and both preserve the closest endpoint row
-identity. When `xy_area` has a `stack_id`, visible members with the same pane, X/Y axes, stack ID, and stack
-mode, interpolation, and missing-row connection policy align by exact numeric, epoch-millisecond, or
-category X identity rather than row position. Positive and negative values accumulate independently;
-percent mode normalizes each sign independently to `+1`/`-1`.
-Cumulative extents participate in Y autoscale, and each layer becomes a variable-bound `BandFill` between
-the preceding stack boundary and the new cumulative boundary while retaining the upper area stroke and row
-interaction identity. `range_area` adds bounded typed low/high columns beside the same X domains, rejects inverted
-complete bounds atomically, treats either missing or transform-invalid bound as a run break, and emits one
-ordered `BandFill` plus its two boundary polylines from shared geometry. Band hit testing returns the nearest
-contributing row, while tooltip/accessibility snapshots expose both bounds. Replacement, explicit-ID updates,
-retention, memory accounting, and V2 persistence keep both channels aligned. `BandFill` carries the same
-interpolation policy as its boundary strokes; shared coupled expansion chooses one bounded subdivision sequence
-for both edges so Canvas2D, WebGPU, GPUI, native painting, and band hit testing cannot open seams or disagree.
-Numeric and temporal
-`error_bar` support four independent optional bound channels around center XY values; temporal X
-centers and bounds are validated whole JavaScript-safe epoch milliseconds and contribute to temporal
-autoscale. Category band/point error bars center on a category and keep only the two Y-bound channels.
-The engine validates bound ordering atomically, excludes absent-center rows from marks and bound autoscale,
-and computes stems, caps, center circles, hits, labels, snapshots, and accessibility from one shared geometry
-path. Ordered `HLine`, `VLine`, and `Circle` frame primitives keep executor semantics identical; bound
-validity, explicit-ID updates, retention, memory accounting, and V2 persistence remain aligned.
-Category-band `box_plot` reuses the aligned general dataset with five ordered numeric statistics:
-`min`, `q1`, `median`, `q3`, and `max`. Complete rows validate that order atomically; incomplete rows
-remain queryable/accessibility-visible but emit no mark and do not affect autoscale. The outer whiskers drive
-numeric-Y autoscale, including logarithmic positivity checks across all present statistics. One shared CSS-space
-geometry path computes the IQR rectangle, median, whiskers, caps, labels, and exact/nearest hits, then lowers them
-to existing `Rect`, `HLine`, and `VLine` primitives for every backend. Tooltip/accessibility snapshots expose
-quartiles separately, explicit-ID updates and bounded retention preserve aligned statistics, and V2 persistence
-round-trips the complete five-number summary without reinterpretation.
-`heatmap_grid` keeps one aligned dataset across all supported Cartesian coordinate variants. Category/category
-heatmaps add a second engine-owned category dictionary/index column for Y; the existing category X column remains
-the X registry and the ordinary numeric value/validity column remains cell intensity data. Continuous numeric and
-temporal X heatmaps instead add one aligned numeric Y-coordinate column while reusing the ordinary numeric/temporal
-X column. Category registries validate, merge, remap, trim, and compact inside the same atomic update transaction.
-Automatic domains union category registries or numeric/temporal coordinate extents as appropriate. One shared cell
-geometry path maps band grids directly and infers numeric/temporal cell boundaries from neighboring coordinate
-centers, derives deterministic normalized value intensity from visible valid cells, drives exact/nearest rectangle
-hits and labels, and lowers every cell to the ordered `Rect` primitive. Missing values remain queryable and
-accessible but emit no cell. Tooltip/accessibility snapshots expose both X and Y labels, explicit-ID updates and
-retention keep coordinate/value channels aligned, and V2 persistence round-trips every heatmap coordinate shape.
+已发布的第 2 阶段笛卡尔绑定包括：类别 band 柱形图、水平条形图、箱线图、类别/类别以及数值/数值和时间/数值热力图、数值 XY 散点/气泡标记、数值/时间/类别误差线，以及 `xy_line`、`xy_area`、`range_area` 和类别 band 的 `range_bar`。通用系列具有单调递增的图表内标识、稳定的窗格/坐标轴/数据集所有权、有界的标题/颜色状态，以及惰性的注册表分配。已填充的坐标轴和数据集不能在系列仍依赖它们时被移除，包含通用系列的窗格在该系列分离之前也不能被移除。可见的柱形系列将其类别并集和有限的有效 Y 值贡献给自动域；零基线参与 Y 域。水平条形图复用同一个类别/数值数据集，但把数值比例尺绑定到 X、类别 band 比例尺绑定到 Y；类别 Y 自动缩放由引擎拥有，数值 X 的零基线参与自动缩放。第 2 阶段的条形布局选项增加了有界的 `group_id`/`stack_id` 状态，且不会创建渲染器特定的图元。同一分组中的可见成员会细分每个类别 band，而一个堆叠只占用一个分组槽位。普通堆叠从零开始分别累加正值和负值，并把它们按类别求和后的范围贡献给对应方向数值轴的自动缩放；百分比堆叠把每个类别独立归一化到 `+1` 和 `-1`。水平堆叠在数值 X 上应用相同的规则；垂直堆叠则在数值 Y 上应用。堆叠成员资格要求窗格、分组、坐标轴、方向和堆叠模式均相同。缺失行仍可查询、可通过无障碍访问，但不产生标记，也不产生堆叠贡献。条形几何在共享的 CSS 空间语义下只计算一次，由帧绘制和精确/最近命中测试复用，然后转换为普通的有序 `Rect` 图元。有界的提示框与无障碍快照来自同一批行。散点图绑定相互独立的连续数值坐标轴，校验对数坐标的正值性，把几何裁剪到运行时视图，并将持久化的圆形、方形、菱形或三角形符号转换为既有的有序图元。路径点标记共用同一符号契约；气泡仍然是按面积缩放的圆。精确命中遵循每个符号的边界。惰性重建的散点屏幕空间网格以数据集代次、绘图几何、坐标轴域/变换、方向和点半径为键；网格单元数量有上限，保留的容量计入引擎内存归因，精确/最近命中只检查相交的单元，同时保持稳定的系列/行决胜次序。气泡图复用该点/索引契约，并带有一个必需的类型化尺寸通道、面积到半径的平方根映射（钳制在共享的点半径上限内），以及可查询但不产生标记的零尺寸/缺失尺寸。尺寸通道参与原子替换、显式 ID 更新、有界保留、无障碍、提示框快照、内存核算和 V2 持久化。`xy_line` 和 `xy_area` 在连续数值、时间 epoch 毫秒以及类别 band/point 的 X 域上，复用同一套通用数据集/坐标轴所有权。缺失行默认会把路径拆分为多段，而持久化的 `connect_missing` 可以把它们桥接起来，且不会移除其可查询的标识。变换无效的行始终保持为硬间断。它们持久化的插值策略——`linear`、先水平后垂直的 `step` 和 Catmull-Rom `curved`——随有序帧图元一起传递，并同时驱动共享的转换逻辑和精确/最近命中几何。`xy_line` 把每一段转换为共享点池加上有序的 `Polyline` 图元。`xy_area` 在对应描边之前加入一个有序的 `AreaFill`；其零基线被钳制在线性/对称对数绘图区之内，而当对数 Y 轴不存在零坐标时，则回退到域下界一侧的绘图区边缘。持久化且有界的填充不透明度保持共享的 3:1 自顶向基线渐变，并以同一数值缩放堆叠/范围带。折线命中使用线段距离，而面积命中则包含被填充的梯形，二者都保留最近端点的行标识。当 `xy_area` 带有 `stack_id` 时，窗格、X/Y 轴、堆叠 ID 与堆叠模式、插值以及缺失行连接策略均相同的可见成员，按精确的数值、epoch 毫秒或类别 X 标识对齐，而不是按行位置对齐。正值与负值各自独立累加；百分比模式把每种符号独立归一化到 `+1`/`-1`。累计范围参与 Y 自动缩放，每一层成为位于前一个堆叠边界与新的累计边界之间、边界可变的 `BandFill`，同时保留上缘面积描边和行交互标识。`range_area` 在相同的 X 域旁增加有界的类型化 low/high 列，原子地拒绝完整但上下颠倒的边界，把任一缺失或变换无效的边界视为路径段中断，并基于共享几何输出一个有序的 `BandFill` 及其两条边界折线。Band 命中测试返回最近的参与行，而提示框/无障碍快照同时暴露两个边界。替换、显式 ID 更新、保留、内存核算和 V2 持久化都使两个通道保持对齐。`BandFill` 携带与其边界描边相同的插值策略；共享的耦合展开为两条边选取同一个有界细分序列，因此 Canvas2D、WebGPU、GPUI、原生绘制与 band 命中测试不会出现缝隙，也不会彼此不一致。数值和时间类 `error_bar` 围绕中心 XY 值支持四个相互独立的可选边界通道；时间 X 的中心与边界经校验为整数的、JavaScript 安全的 epoch 毫秒值，并参与时间自动缩放。类别 band/point 误差线以某个类别为中心，只保留两个 Y 边界通道。引擎原子地校验边界顺序，把缺少中心的行排除在标记和边界自动缩放之外，并通过同一条共享几何路径计算杆、端帽、中心圆、命中、标签、快照与无障碍。有序的 `HLine`、`VLine` 和 `Circle` 帧图元使各执行器的语义保持一致；边界有效性、显式 ID 更新、保留、内存核算和 V2 持久化保持对齐。类别 band 的 `box_plot` 复用对齐的通用数据集，带有五个有序的数值统计量：`min`、`q1`、`median`、`q3` 和 `max`。完整的行会原子地校验该顺序；不完整的行仍可查询、对无障碍可见，但不产生标记，也不影响自动缩放。外侧须线驱动数值 Y 自动缩放，其中包括对所有已存在统计量的对数正值性检查。同一条共享的 CSS 空间几何路径计算 IQR 矩形、中位数、须线、端帽、标签以及精确/最近命中，然后把它们转换为供每个后端使用的既有 `Rect`、`HLine` 和 `VLine` 图元。提示框/无障碍快照分别暴露各四分位数，显式 ID 更新和有界保留保持统计量对齐，V2 持久化可完整往返五数概括而不重新解释。`heatmap_grid` 在所有受支持的笛卡尔坐标变体上都保持同一个对齐的数据集。类别/类别热力图为 Y 增加第二个由引擎拥有的类别字典/索引列；既有的类别 X 列仍然是 X 注册表，普通的数值/有效性列仍然是单元强度数据。连续数值和时间 X 热力图则改为增加一个对齐的数值 Y 坐标列，同时复用普通的数值/时间 X 列。类别注册表在同一个原子更新事务内完成校验、合并、重映射、裁减和压缩。自动域会视情况对类别注册表或数值/时间坐标范围取并集。同一条共享的单元几何路径直接映射 band 网格，根据相邻坐标中心推断数值/时间单元边界，从可见的有效单元推导出确定性的归一化数值强度，驱动精确/最近的矩形命中和标签，并把每个单元转换为有序的 `Rect` 图元。缺失值仍可查询、可通过无障碍访问，但不产生单元。提示框/无障碍快照同时暴露 X 和 Y 标签，显式 ID 更新与保留使坐标/数值通道保持对齐，V2 持久化可往返每一种热力图坐标形态。
 
-General interaction/configuration state stays in the same engine registry. Shared tooltip snapshots group visible
-rows by the anchor row's exact horizontal datum in stable series/row order, including duplicate-X heatmap cells.
-The transient general brush converts host CSS-pixel endpoints immediately into semantic numeric, temporal, or
-category ranges, returns bounded selected row identities, and reprojects from semantic values after view changes.
-General reference lines, dots, and regions bind explicit axes and lower into existing shared primitives; each
-reference independently declares whether its values extend automatic domains. Reference lifecycle and V2
-persistence are engine-owned, while brush/hover/selection remain transient and are not serialized.
-The release perf harness
-includes a 100k-point general-only line target with a 16.67 ms frame budget and 8 ms nearest-hit budget.
-It also keeps the current line, area, range, scatter, and bubble paths in one 100k-row mixed-general
-target with the same frame/hit budgets and a 12 MiB retained-memory ceiling, then measures one engine
-containing 50k financial bars plus a 50k-point general range pane against the frame budget and a 16 MiB
-retained-memory ceiling. A separate 100k-row numeric error-bar target enforces the same frame/hit budgets
-and a 16 MiB retained-memory ceiling. Financial-only, general-only, and combined execution therefore have separate
-enforced evidence rather than unbudgeted performance claims. The official release browser benchmark also includes
-a five-series/100k-row representative Phase 2 general dashboard. Its first-frame host startup has an absolute
-2,000 ms p50 ceiling and its first-frame WebGPU vertex upload volume has a 96 MiB p50 ceiling; the release workflow
-evaluates these through the same versioned `budgets.json` policy as artifact-size ceilings.
-Dataset replacement remains atomic against every bound series and cannot change a bound path/scatter/bubble
-X kind or drop a bound bubble size or range low channel. Canvas2D, retained
-WebGPU, GPUI, and the native tiny-skia rasterizer consume the same frame contract; grouped/stacked columns
-reuse the already-covered ordered `Rect` executor path, bubble reuses scatter's already-covered ordered
-`Circle` executor path with per-row radii, stacked area reuses the range-band `BandFill` path, and column,
-scatter, line/area, and range-band paths have direct executor
-coverage.
+通用交互/配置状态保存在同一个引擎注册表中。共享的提示框快照按锚点行的精确水平数据值对可见行分组，顺序为稳定的系列/行顺序，其中包括重复 X 的热力图单元。瞬态的通用刷选会立即把宿主的 CSS 像素端点转换为语义上的数值、时间或类别范围，返回有界的已选行标识，并在视图变化后基于语义值重新投影。通用参考线、参考点和参考区域绑定显式坐标轴，并转换为既有的共享图元；每个参考元素独立声明其数值是否扩展自动域。参考元素的生命周期和 V2 持久化由引擎拥有，而刷选/悬停/选择保持瞬态，不会被序列化。release 性能测试框架包含一个 100k 点的纯通用折线目标，帧预算为 16.67 ms，最近命中预算为 8 ms。它还把当前的折线、面积、范围、散点和气泡路径放入同一个 100k 行的混合通用目标中，使用相同的帧/命中预算以及 12 MiB 的保留内存上限；随后针对帧预算和 16 MiB 的保留内存上限，测量一个同时包含 50k 根金融柱和一个 50k 点通用范围窗格的引擎。另有一个独立的 100k 行数值误差线目标，强制执行相同的帧/命中预算以及 16 MiB 的保留内存上限。因此，仅金融、仅通用以及两者组合的执行，都有各自受强制约束的证据，而不是没有预算的性能声明。官方 release 浏览器基准测试还包含一个五系列/100k 行、具有代表性的第 2 阶段通用仪表盘。其首帧宿主启动有 2,000 ms 的绝对 p50 上限，首帧 WebGPU 顶点上传量有 96 MiB 的 p50 上限；release 工作流通过与产物体积上限相同的、带版本的 `budgets.json` 策略来评估这些指标。数据集替换对每个已绑定系列仍然是原子的，且不能改变已绑定的路径/散点/气泡的 X 种类，也不能丢弃已绑定的气泡尺寸通道或范围 low 通道。Canvas2D、保留式 WebGPU、GPUI 和原生 tiny-skia 光栅化器消费同一份帧契约；分组/堆叠柱形图复用已有测试覆盖的有序 `Rect` 执行器路径，气泡图复用散点图已有测试覆盖的有序 `Circle` 执行器路径（带逐行半径），堆叠面积图复用范围带的 `BandFill` 路径，而柱形、散点、折线/面积和范围带路径都有直接的执行器测试覆盖。
 
-The browser package exposes these general slices through the common chart lifecycle. Domain-aware pane and
-axis handles remain thin mutations over engine state. General-axis browser handles carry the engine's
-monotonic handle token as well as the user-visible axis ID, so removing and recreating an axis with the
-same ID stales the old handle instead of retargeting it; V2 restore likewise rejects charts that already
-issued a general-axis handle rather than recycling that identity. Object rows are normalized once into numeric or
-epoch-millisecond temporal, or interned-category columns; typed input crosses the WASM boundary as bulk arrays, while optional string or
-numeric identities cross as one bounded JSON vector. A general-series handle owns one engine dataset and
-removes it transactionally after detaching the series. Pane enumeration and chart series-lifecycle events
-include general handles without making financial primitive helpers reinterpret them. Tooltip, shared-tooltip,
-bounded accessibility, exact/nearest hit, brush, reference-component, and legend state come back from Rust. The legend snapshot is derived
-directly from the live series registry in stable engine order, optionally filtered by pane, and retains hidden
-series with their visibility state rather than maintaining a parallel host registry. Shared tooltip grouping,
-semantic brush selection, and reference domain extension likewise do not create browser-owned semantic mirrors.
-Axis and series handles mutate visibility in place through the engine registry, preserving handle, data, view,
-selection, and ordering identity while shared invalidation updates domains, hits, legends, persistence, and frames.
-Their browser `apply_options` transactions also update mutable axis configuration and series presentation in
-place after validating the complete candidate. General-series rebinding commits through that same engine
-transaction only when the target pane has equivalent horizontal-domain semantics and its X/Y scale types match;
-kind and dataset identity remain structural. Invalid candidates leave the live object unchanged. The general
-registry is also the single ordering owner: exact global or pane-local permutations update paint, legend,
-hit-test, React keyed-array, and persistence order while leaving other panes' relative order intact. React uses
-these mutations for ordinary prop and order changes and releases a new pane or series if initial data installation
-or a readiness callback throws.
-The browser structured tooltip and accessibility date strings call the chart's shared crosshair
-time formatter. That engine path owns the configured IANA time zone, date pattern, locale month
-names, and optional host formatter callback; the tooltip's data lookup remains engine-owned.
-Financial accessibility summaries still traverse their host series data for min/max and
-change, while general series use bounded engine accessibility snapshots.
-The shared browser accessibility
-controller recognizes financial and general handles but keeps their navigation math separate: financial
-series continue to query the time scale, while general series page through at most 512 Rust-owned
-accessibility rows at a time. General keyboard focus is a distinct engine interaction target rather than
-an alias for hover or primary selection; explicit row identities follow reordered replacement batches,
-generated batch-local identities clear, and the shared frame paints the same focus chrome for every
-executor. Scatter and continuous-numeric `xy_line`/`xy_area` keyboard zoom mutate their bound general X
-axis rather than the financial time scale; category/temporal path navigation remains row-oriented without
-inventing an unsupported axis zoom.
-Generated row
-identities are encoded as decimal strings at the JavaScript boundary so their full `u64` identity is not
-rounded. The ordinary browser pointer path feeds exact general hits back into engine-owned transient
-hover and primary selection. Interaction targets retain row identity rather than formatted coordinates:
-explicit identities follow reordered replacement batches, while generated batch-local identities clear.
-Explicit-ID incremental batches update existing rows and append new rows in the shared dataset store;
-an optional per-call row limit trims the oldest rows and prunes unused category labels. Validation
-precedes mutation, and interaction targets reconcile against the retained identities.
-The shared frame emits the corresponding mark chrome, so Canvas2D, WebGPU, GPUI, and native executors
-receive the same presentation without host overlays. Opt-in numeric value labels are placed in
-the shared frame with deterministic collision rejection and per-pane emission/work ceilings; executors
-receive ordinary ordered text primitives. Sparse, bounded custom row labels live in the dataset
-store and participate in the same validated replacement/upsert/retention transaction as X/Y data;
-tooltip and accessibility snapshots expose their text without replacing raw numeric values. General
-chart persistence uses schema V2 for pane domains, axes, datasets, labels, series bindings, and chart
-options while financial-only exports remain V1-compatible; restore rehydrates browser general-series
-handles without persisting transient hover, selection, or keyboard focus.
+浏览器包通过通用的图表生命周期暴露这些通用切片。域感知的窗格和坐标轴句柄仍然只是对引擎状态的薄层变更。通用坐标轴的浏览器句柄既携带用户可见的坐标轴 ID，也携带引擎单调递增的句柄令牌，因此移除后以相同 ID 重新创建坐标轴，会使旧句柄过期，而不是把旧句柄重新指向新坐标轴；V2 恢复同样会拒绝已经签发过通用坐标轴句柄的图表，而不是回收该标识。对象行只会被归一化一次，转为数值列、epoch 毫秒时间列或经驻留的类别列；类型化输入以批量数组形式跨越 WASM 边界，而可选的字符串或数值标识则作为一个有界的 JSON 向量跨越边界。通用系列句柄拥有一个引擎数据集，并在分离系列之后以事务方式移除该数据集。窗格枚举和图表的系列生命周期事件包含通用句柄，而不会让金融图元辅助函数重新解释它们。提示框、共享提示框、有界无障碍、精确/最近命中、刷选、参考元素和图例状态都从 Rust 返回。图例快照直接由实时系列注册表按稳定的引擎顺序派生，可按窗格过滤，并连同可见性状态一起保留隐藏系列，而不是另行维护一份并行的宿主注册表。共享提示框分组、语义刷选和参考元素的域扩展同样不会产生由浏览器拥有的语义镜像。坐标轴和系列句柄通过引擎注册表就地修改可见性，保持句柄、数据、视图、选择和顺序的标识不变，同时由共享失效机制更新域、命中、图例、持久化和帧。它们在浏览器端的 `apply_options` 事务同样会在校验完整候选值之后，就地更新可变的坐标轴配置和系列呈现。仅当目标窗格具有等价的水平域语义且其 X/Y 比例尺类型匹配时，通用系列的重新绑定才会通过同一个引擎事务提交；种类和数据集标识仍属于结构性属性。无效的候选值不会改动现有对象。通用注册表同时是顺序的唯一拥有者：精确的全局或窗格内排列会更新绘制、图例、命中测试、React 带 key 数组和持久化的顺序，同时保持其他窗格的相对顺序不变。React 在普通的 prop 和顺序变化中使用这些变更，并且当初始数据安装或就绪回调抛出异常时，会释放新建的窗格或系列。浏览器的结构化提示框和无障碍日期字符串会调用图表共享的十字光标时间格式化器。该引擎路径拥有已配置的 IANA 时区、日期模式、locale 月份名称和可选的宿主格式化回调；提示框的数据查找仍由引擎拥有。金融无障碍摘要仍然遍历其宿主系列数据来计算最小/最大值与变化量，而通用系列使用有界的引擎无障碍快照。共享的浏览器无障碍控制器同时识别金融句柄和通用句柄，但把它们的导航运算分开：金融系列继续查询时间比例尺，而通用系列每次至多翻阅 512 个由 Rust 拥有的无障碍行。通用键盘焦点是独立的引擎交互目标，而不是悬停或主选择的别名；显式行标识会跟随重新排序的替换批量，生成的批内局部标识则会被清除，共享帧为每个执行器绘制相同的焦点外观。散点图以及连续数值 `xy_line`/`xy_area` 的键盘缩放会修改其绑定的通用 X 轴，而不是金融时间比例尺；类别/时间路径导航仍然以行为单位，不会凭空发明不受支持的坐标轴缩放。生成的行标识在 JavaScript 边界处编码为十进制字符串，使其完整的 `u64` 标识不会被舍入。普通的浏览器指针路径会把精确的通用命中回馈给由引擎拥有的瞬态悬停和主选择。交互目标保留的是行标识，而不是格式化后的坐标：显式标识会跟随重新排序的替换批量，而生成的批内局部标识则会被清除。显式 ID 的增量批量会在共享数据集存储中更新既有行并追加新行；可选的每次调用行数上限会裁掉最旧的行，并清理不再使用的类别标签。校验先于变更，交互目标会与保留的标识重新对齐。共享帧输出相应的标记界面元素，因此 Canvas2D、WebGPU、GPUI 和原生执行器接收到相同的呈现，无需宿主叠加层。可选启用的数值标签在共享帧中放置，采用确定性的碰撞剔除，并带有每个窗格的输出/工作量上限；执行器接收到的是普通的有序文本图元。稀疏、有界的自定义行标签存放在数据集存储中，并与 X/Y 数据一起参与同一个经过校验的替换/更新插入/保留事务；提示框和无障碍快照会暴露其文本，但不会替换原始数值。通用图表持久化对窗格域、坐标轴、数据集、标签、系列绑定和图表选项使用 V2 schema，而仅含金融数据的导出仍保持 V1 兼容；恢复时会重新构建浏览器的通用系列句柄，但不会持久化瞬态的悬停、选择或键盘焦点。
 
-`ChartOptionsStore` keeps typed options canonical for engine and frame reads and retains the raw JSON
-object only for boundary-compatible deep merges and serialization. An option patch is merged and
-validated once at mutation time; frame construction borrows the typed value without cloning or
-deserializing JSON.
+`ChartOptionsStore` 将类型化选项保持为引擎和帧读取所用的规范形式，仅为与边界兼容的深度合并和序列化保留原始 JSON 对象。选项补丁在变更时合并并校验一次；帧构建借用类型化值，不克隆也不反序列化 JSON。
 
-Style reset is also owned at this shared boundary. `ChartEngine::reset_style_to_defaults()` restores
-canonical chart and live-series presentation in place, including semantic unset/follow values, while
-preserving data, pane/scale topology, drawings, indicator bindings, price formatting, and all
-time/price view state. Price-scale mode, ranges, margins and layout constraints are not style reset.
-Advanced-series semantic geometry and footprint aggregation/representation likewise survive while
-their colors, strokes, fills and other visual styling return to Aeris defaults. The browser passes
-its selected light/dark theme through the WASM boundary because theme selection is package state.
+样式重置同样归属于这一共享边界。`ChartEngine::reset_style_to_defaults()` 原地恢复规范的图表与实时系列呈现，包括语义上的未设置/跟随值，同时保留数据、窗格/比例尺拓扑、绘图、指标绑定、价格格式化，以及全部时间/价格视图状态。价格比例尺模式、范围、边距和布局约束不属于样式重置。高级系列的语义几何以及足迹图的聚合/表示方式同样得以保留，而它们的颜色、描边、填充和其他视觉样式则恢复为 Aeris 默认值。浏览器将其所选的浅色/深色主题经由 WASM 边界传入，因为主题选择属于包的状态。
 
-`aeris_charts_core` must not depend on a window system, browser, GPU, or host application.
+`aeris_charts_core` 不得依赖窗口系统、浏览器、GPU 或宿主应用。
 
 ### `aeris_charts_indicators`
 
-Pure technical-indicator calculations over numeric slices. Warm-up gaps are explicit. Convention-dependent formulas take typed parameters owned here: an EMA-family/RSI seed (`Sma`, the TradingView/TA-Lib default, or `FirstValue`, the 通达信/同花顺 `EMA(X,N)`/`SMA(X,N,M)` convention), the MACD histogram multiplier (1, or 2 for `(DIF-DEA)*2`), and the Bollinger deviation estimator (population or sample); `IndicatorConvention` only maps a preset to those values. KDJ uses windowed RSV with `SMA(X,N,1)` K/D smoothing started from a typed `KdjSeed`: the textbook 50 after a full N-row window (default), or the formula-language start, which the China preset selects: RSV over the rows available while fewer than N exist and `Y0 = X0`, so values start at row 0. `tests/platform_values.rs` pins the verified platform rules (China MACD, population-σ Bollinger, the formula-language KDJ start, and the textbook start's convergence after `convergence_rows`) on a deterministic synthetic series with independently computed expected values; the comparison with a platform's published values for real bars was done out of tree, and that data is not committed. Each runtime also reports, per output, its warm-up rows and a convergence horizon (rows until every recursive seed's weight is below 0.1%, or none for time-anchored and path-dependent formulas); the engine sums them along indicator chains. Whitespace source rows (NaN close/high/low) never enter formula state: recursive runtimes (the KLineChart runtime included) skip them in place and emit NaN, while stateless window formulas that meet whitespace in the rows they read evaluate over a bounded compacted window (their lookback plus the changed suffix) and scatter NaN back to the whitespace rows, so every value equals the value computed without those rows. Alongside clean full-recomputation functions, it owns the explicit per-formula rolling state used for append, current-bar replacement, and rebuild-from-index. Bounded-window formulas retain no source-length state; recursive formulas retain tail state and one checkpoint per 1,024 source rows, then recompute from the nearest prior checkpoint after a historical correction. The retained state before the last row resumes a replacement of that row whether or not the same rebuild also appends rows, so closing the current bar and opening the next in one batch never falls back to a checkpoint. Every built-in kind therefore bounds a current-bar replacement, an append, or both in one rebuild by its window rather than the history: window formulas (moving averages, standard deviation, CCI, Williams %R, momentum, rate of change, Donchian, Ichimoku, CMF, MFI, volume) evaluate only the changed output rows, each over its own period, while Stochastic RSI (Wilder RSI state plus a retained tail window of its last RSI values, like Stochastic `%D`), pivots (the running and previous trading-day sessions), and ZigZag (its anchor, direction, and provisional extreme) are recursive states that skip whitespace in place. ZigZag writes turning points back to earlier rows, so a tail rebuild re-emits rows back to its one open turning point (the provisional endpoint it moves or restores, or the first-direction anchor it writes or clears) only when it changes that point's value, which bounds it by the rows since the last confirmed turning point; a tail revision that leaves that point alone touches only the forming bar, and a historical repair re-emits from the open turning point of the state it resumes. `last_work_rows` reports the rows each rebuild actually evaluated. Volume and turnover columns may be shorter than the source rows; rows past their end take each formula's missing-weight fallback (unit weight for VWAP, VWAP bands and VWMA, zero for OBV, CMF, MFI and volume, no trade for amount-weighted VWAP), which equals the engine's timestamp-alignment fallback. Sparse checkpoint vectors are copy-on-write so hosts can transactionally clone recursive state without deep-copying retained history during ordinary tail work. Host-neutral indexed EMA, ATR, session-VWAP, RSI, MACD, and Stochastic states accept callback-provided optional samples so non-chart Rust hosts can lazily convert only the canonical rows replayed for a dirty suffix. `None` is a hard reset; recursive replay may begin at an earlier sparse checkpoint while writers receive only the requested suffix. Stochastic additionally retains only bounded tail `%K` windows needed for `%D` tail replacement (Stochastic RSI likewise retains its last RSI values), and a rebuild that cannot resume from them, a truncation included, replays enough earlier rows to refill the window a later replacement of the new last row reads; its windowed high/low scan remains bounded by the configured `%K` period rather than source-history length. Derived values use short-lived transfer buffers that move into or update the engine's canonical output series and are capped after partial repairs. This crate does not know about charts, panes, rendering, WebAssembly, or GPUI.
+基于数值切片的纯技术指标计算。预热缺口是显式的。依赖约定的公式采用此处拥有的类型化参数：EMA 族/RSI 的种子（`Sma`，即 TradingView/TA-Lib 的默认值；或 `FirstValue`，即 通达信/同花顺 的 `EMA(X,N)`/`SMA(X,N,M)` 约定）、MACD 柱状图乘数（1，或用于 `(DIF-DEA)*2` 的 2），以及布林带偏差估计量（总体或样本）；`IndicatorConvention` 只负责把预设映射到这些值。KDJ 使用带窗口的 RSV，其 K/D 平滑采用 `SMA(X,N,1)`，起始于类型化的 `KdjSeed`：教科书式的 50（在完整的 N 行窗口之后，默认），或公式语言式起始（China 预设选用此项）：在行数不足 N 时对可用行计算 RSV，且 `Y0 = X0`，因此数值自第 0 行起即有。`tests/platform_values.rs` 固定了已验证的平台规则（中国式 MACD、总体 σ 布林带、公式语言式 KDJ 起始，以及教科书式起始在 `convergence_rows` 之后的收敛），所用为确定性的合成序列，预期值独立计算得出；与平台针对真实柱发布数值的对比是在仓库之外完成的，该数据未提交。每个运行时还按输出报告其预热行数和收敛跨度（直到每个递归种子的权重低于 0.1% 所需的行数；对时间锚定和路径依赖的公式则为无）；引擎沿指标链对它们求和。空白数据源行（收盘/最高/最低为 NaN）绝不进入公式状态：递归运行时（包括 KLineChart 运行时）就地跳过它们并输出 NaN；而无状态窗口公式若在其读取的行中遇到空白数据，则在有界的压缩窗口（其回看长度加上变更的尾部）上求值，并把 NaN 散回空白数据行，因此每个值都等于不含这些行时计算出的值。除干净的全量重算函数外，它还拥有用于追加、当前柱替换和从某索引重建的显式逐公式滚动状态。有界窗口公式不保留与源长度相关的状态；递归公式保留尾部状态，并每 1,024 个源行保留一个检查点，在历史修正之后从最近的前一个检查点重新计算。在最后一行之前保留的状态，无论同一次重建是否还追加行，都可用于恢复对该行的替换，因此在一个批量中收盘当前柱并开启下一根柱时，绝不会退回到检查点。因此，每种内置指标对当前柱替换、追加，或在一次重建中两者兼有的开销，都以其窗口而非历史长度为界：窗口公式（移动平均、标准差、CCI、Williams %R、动量、变动率、Donchian、Ichimoku、CMF、MFI、成交量）只对变更的输出行求值，每行各自按其周期计算；而 Stochastic RSI（Wilder RSI 状态加上保留的最近若干 RSI 值的尾部窗口，与 Stochastic `%D` 相同）、枢轴点（当前进行中与前一个交易日的交易时段）和 ZigZag（其锚点、方向和临时极值）则是就地跳过空白数据的递归状态。ZigZag 会把转折点回写到更早的行，因此尾部重建只有在改变其唯一的开放转折点（它移动或恢复的临时端点，或它写入或清除的首方向锚点）的值时，才会重新输出回溯到该点的各行，这使其以自上一个已确认转折点以来的行数为界；未触及该点的尾部修订只会触及正在形成的柱，而历史修复则从其所恢复状态的开放转折点起重新输出。`last_work_rows` 报告每次重建实际求值的行数。成交量和成交额列可以比源行短；越过其末尾的行采用各公式的缺失权重回退值（VWAP、VWAP 带和 VWMA 为单位权重，OBV、CMF、MFI 和成交量为零，按成交额加权的 VWAP 为无成交），这与引擎的时间戳对齐回退值相等。稀疏检查点向量为写时复制，因此宿主可以事务性地克隆递归状态，而无需在常规尾部工作期间深拷贝保留的历史。与宿主无关的带索引的 EMA、ATR、交易时段 VWAP、RSI、MACD 和 Stochastic 状态接受由回调提供的可选样本，使非图表的 Rust 宿主只需惰性地转换为脏后缀而重放的规范行。`None` 是硬重置；递归重放可以从更早的稀疏检查点开始，而写入方只接收所请求的后缀。Stochastic 另外只保留 `%D` 尾部替换所需的有界尾部 `%K` 窗口（Stochastic RSI 同样保留其最近的 RSI 值），而无法从中恢复的重建（包括截断）会重放足够多的更早的行，以重新填满窗口，供之后对新的最后一行的替换读取；其带窗口的最高/最低扫描仍以配置的 `%K` 周期为界，而非源历史长度。派生值使用短生命周期的传输缓冲区，这些缓冲区移入或更新引擎的规范输出系列，并在部分修复之后限定其容量上限。本 crate 不了解图表、窗格、渲染、WebAssembly 或 GPUI。
 
-Calendar periods (VWAP session/weekly/monthly resets and pivot sessions) key on a caller-supplied
-trading-day mapping; the crate knows no time zones, and weekly periods start on Monday. The chart
-runtime passes the engine's exchange trading day, while the full-recomputation functions keep UTC days.
-`VwapReset::period_key` exposes the reset key itself, so chart geometry breaks lines exactly where
-the values reset.
+日历周期（VWAP 的交易时段/每周/每月重置以及枢轴点的交易时段）以调用方提供的交易日映射为键；本 crate 不了解时区，且每周周期从周一开始。图表运行时传入引擎的交易所交易日，而全量重算函数则沿用 UTC 日。`VwapReset::period_key` 暴露重置键本身，因此图表几何会恰好在数值重置处断开线条。
 
-`klinechart` holds the 27 built-in KLineChart indicators, translated from KLineChart v10.0.3 (credited
-in `NOTICE`) with bit-for-bit parity against fixtures generated by KLineChart's own code
-(`tools/klinechart_parity`). Outputs are columns with `None` where KLineChart leaves a value unset;
-`Indicator` is the bindable form (template plus calcParams, output keys and titles, figure kinds,
-placement, value format, volume needs, and each output's warm-up row). Its incremental runtime
-steps each formula one valid row at a time from a checkpointed `Copy` state held in the same sparse
-`RecursiveHistory` the built-in studies use (one checkpoint per 1,024 rows plus the two tail states),
-so a current-bar replacement or append costs the formula's window rather than the history, and a
-historical repair replays at most 1,023 rows before the changed one. Running sums keep KLineChart's
-add, divide, then subtract order, so every value stays bit for bit; a moving average of a formula's
-own output takes the value leaving its window from a lagging copy of the producing stage held in the
-same state (OBV, PSY, TRIX, DMA, DMI, VR, CR), or recomputes it from the window where that output is
-a pure function of two input rows (MTM, ROC, EMV). Whitespace source rows (NaN close, high or low)
-are skipped in place, with a NaN output and no state change, through a bounded compacted window
-replayed in chunks of 4,096 source rows (one chunk plus the formula's lookback per column, trimmed
-back after a partial repair), so windows and lags count the rows that carry a sample and every value
-equals the value computed without the whitespace rows. The whole-series functions assume finite input
-and are folds of the same steppers, so the arithmetic the runtime executes is the arithmetic the
-parity fixtures pin. The checkpoints and the whitespace window count toward the indicator runtime
-bytes. `Indicator::extra_convergence_rows` reports how much history each
-indicator reads: none past warm-up for windowed formulas, one row for windows whose terms read the
-bar before them, and `None` for recursive smoothing, running totals and the path-dependent SAR; a
-test measures it by dropping the oldest rows.
+`klinechart` 包含 27 个内置 KLineChart 指标，移植自 KLineChart v10.0.3（在 `NOTICE` 中注明来源），与由 KLineChart 自身代码生成的夹具（`tools/klinechart_parity`）逐位一致。输出为列，KLineChart 未设值之处为 `None`；`Indicator` 是可绑定形式（模板加 calcParams、输出键与标题、图形类型、放置位置、值格式、成交量需求，以及每个输出的预热行）。其增量运行时每次对每个公式推进一个有效行，状态为由检查点保存的 `Copy` 状态，存放在内置研究所用的同一个稀疏 `RecursiveHistory` 中（每 1,024 行一个检查点，外加两个尾部状态），因此当前柱替换或追加的开销取决于公式的窗口而非历史长度，而历史修复至多重放变更行之前的 1,023 行。运行和保持 KLineChart 先加、再除、后减的顺序，因此每个值都保持逐位一致；对公式自身输出取移动平均时，离开窗口的值取自同一状态中保存的产生该输出的阶段的滞后副本（OBV、PSY、TRIX、DMA、DMI、VR、CR），或者在该输出是两个输入行的纯函数时从窗口重新计算（MTM、ROC、EMV）。空白数据源行（收盘、最高或最低为 NaN）通过一个有界的压缩窗口被就地跳过，输出为 NaN 且状态不变；该窗口以每块 4,096 个源行为单位重放（每列为一块加上公式的回看长度，在部分修复后收缩回去），因此窗口与滞后只计入带有样本的行，每个值都等于不含空白数据行时计算出的值。全序列函数假定输入有限，并且是同一批步进器的折叠，因此运行时执行的算术就是一致性夹具所固定的算术。检查点和空白数据窗口计入指标运行时的字节数。`Indicator::extra_convergence_rows` 报告每个指标读取多少历史：带窗口的公式在预热之外为无，各项会读取前一根柱的窗口为一行，递归平滑、运行总计和路径依赖的 SAR 则为 `None`；一项测试通过丢弃最旧的行来度量它。
 
-The `klinechart` module ports KLineChart v10.0.3's 27 built-in indicators (MA, EMA, SMA, BBI, VOL, MACD, BOLL, KDJ, RSI, BIAS, BRAR, CCI, CR, DMA, DMI, EMV, MTM, OBV, PVT, PSY, ROC, SAR, TRIX, VR, WR, AO, AVP) with the conventions of mainland-China and Hong Kong charting software: a doubled MACD histogram, SMA-seeded EMAs, the weighted `SMA(X, N, M)`, and KDJ seeded at 50. Each port repeats KLineChart's arithmetic in the same order, so `tests/klinechart_parity.rs` compares every value bit for bit against KLineChart's own `calc` output (`tools/klinechart_parity` regenerates the fixture). `klinechart::Indicator` is the bindable form: template plus `calcParams`, output keys and titles, figure kinds, default placement, value format, volume needs, and the parameter-only warm-up row of every output. Its runtime steps one valid row at a time from checkpointed state, as described above; outputs are causal, so only the requested suffix is emitted, and rows left unset after warm-up become NaN whitespace. The formulas and their tests are Apache-2.0 KLineChart derivatives, credited in the module documentation.
+`klinechart` 模块移植了 KLineChart v10.0.3 的 27 个内置指标（MA, EMA, SMA, BBI, VOL, MACD, BOLL, KDJ, RSI, BIAS, BRAR, CCI, CR, DMA, DMI, EMV, MTM, OBV, PVT, PSY, ROC, SAR, TRIX, VR, WR, AO, AVP），遵循中国大陆和香港图表软件的约定：加倍的 MACD 柱状图、以 SMA 为种子的 EMA、加权的 `SMA(X, N, M)`，以及以 50 为种子的 KDJ。每个移植都以相同的顺序重复 KLineChart 的算术，因此 `tests/klinechart_parity.rs` 将每个值与 KLineChart 自身的 `calc` 输出逐位比较（`tools/klinechart_parity` 重新生成该夹具）。`klinechart::Indicator` 是可绑定形式：模板加 `calcParams`、输出键与标题、图形类型、默认放置位置、值格式、成交量需求，以及每个输出仅由参数决定的预热行。其运行时如上所述从检查点状态每次推进一个有效行；输出是因果的，因此只输出所请求的后缀，预热之后仍未设值的行变为 NaN 空白数据。这些公式及其测试是 Apache-2.0 的 KLineChart 衍生物，已在模块文档中注明来源。
 
-Visible-range volume profiles use a pure two-pass OHLCV bin calculation in this crate: uniform high/low overlap, bullish/bearish volume split by candle direction, deterministic point of control and contiguous value area, `O(visible bars + rows)` work and at most 512 rows. It does not claim tick-at-price accuracy.
+可见范围成交量分布在本 crate 中使用纯粹的两遍 OHLCV 分箱计算：均匀的最高/最低价区间重叠、按蜡烛方向拆分的看涨/看跌成交量、确定性的控制点（POC）与连续价值区域，工作量为 `O(visible bars + rows)`，且至多 512 行。它不声称达到逐价位 Tick 的精度。
 
 ### `aeris_charts_engine`
 
-The headless owner of chart behavior and mutable chart state. It owns series, panes, scales, workspace layout, drawings, hit testing, interaction models, indicator bindings, price lines, and frame construction.
+图表行为和可变图表状态的无头所有者。它拥有系列、窗格、比例尺、工作区布局、绘图、命中测试、交互模型、指标绑定、价格线以及帧构建。
 
-Volume-profile indicators bind an OHLC price series to a separate scalar volume series by exact timestamp. The engine owns at most 16 distribution handles, their options and bounded bin caches in native primitive state. Before frame construction (or an explicit snapshot read), it refreshes only profiles whose source generations, visible source-row interval, bin parameters or minimum price move changed. Removing either dependency removes the handle. Shared frame geometry stacks bullish and bearish volume within each row, anchors every row flush to the source pane's right edge, uses stronger row colors for the value area, and draws only the solid POC marker without extending autoscale; every executor consumes those same ordered primitives. These price distributions have no synthetic time-series output and are runtime-only, outside V1 scalar-indicator workspace persistence. Hosts recreate them after restoring data.
+成交量分布指标将一个 OHLC 价格系列按精确时间戳绑定到一个独立的标量成交量系列。引擎在原生图元状态中拥有至多 16 个分布句柄、它们的选项以及有界的分箱缓存。在帧构建之前（或显式快照读取之前），它只刷新那些源代次、可见源行区间、分箱参数或最小价格变动发生了变化的分布。移除任一依赖项就会移除该句柄。共享的帧几何在每一行内堆叠看涨与看跌成交量，使每一行紧贴源窗格的右边缘，对价值区域使用更强的行颜色，并且只绘制实线 POC 标记，且不扩展自动缩放范围；每个执行器消费的都是这同一组有序图元。这些价格分布没有合成的时间序列输出，且仅限运行时，不在 V1 标量指标工作区持久化范围之内。宿主在恢复数据后重新创建它们。
 
-Each pane owns one unified price-scale collection: reserved `left`, `right`, and overlay (`""`)
-scales plus at most sixteen host-created named scales. Named IDs are case-sensitive and pane-local;
-each visible side scale retains its own options, range, formatter source, autoscale, inversion,
-dense plot-outward order, measured width, and gesture state. Layout reserves the sum of visible
-strips on each side while keeping every pane and the shared time scale aligned. Axis ticks,
-last-value and crosshair labels, primitives, coordinates, and gestures resolve through the exact
-owning scale. Width negotiation measures every axis-side row in a live-value cluster, including the
-scaled countdown row; the pane-side title chip is fitted to the available pane instead of inflating
-the strip. The countdown row exists only while the host has pinned a clock and the market is trading;
-a host reports a closed session with `set_bar_countdown_active(false)`, which hides every countdown row
-without changing any series' `countdown_visible` preference. The horizontal grid uses only the innermost visible populated scale, preferring the right
-side when equal orders meet. Hidden and empty named scales retain state without consuming layout or
-receiving labels and input.
+每个窗格拥有一个统一的价格比例尺集合：保留的 `left`、`right` 和叠加层（`""`）比例尺，外加至多十六个由宿主创建的具名比例尺。具名 ID 区分大小写且为窗格局部；每个可见的侧边比例尺保留自己的选项、范围、格式化器来源、自动缩放、反转、由绘图区向外的紧凑排列顺序、测得的宽度和手势状态。布局为每一侧预留所有可见条带之和，同时保持每个窗格与共享时间比例尺对齐。坐标轴刻度、最新值与十字光标标签、图元、坐标和手势都通过确切的所属比例尺解析。宽度协商会测量实时值标签组中的每个坐标轴侧行，包括按比例缩放的倒计时行；窗格侧的标题徽标会适配可用窗格，而不会撑大条带。倒计时行仅在宿主已固定时钟且市场处于交易状态时存在；宿主通过 `set_bar_countdown_active(false)` 报告交易时段已关闭，这会隐藏每个倒计时行，而不改变任何系列的 `countdown_visible` 偏好。水平网格只使用最内侧的可见且有数据的比例尺，在序相同时优先选择右侧。隐藏的和空的具名比例尺保留状态，但不占用布局，也不接收标签和输入。
 
-Axis chrome is engine-owned and compact: axis-attached text resolves to 11/12 of `layout.fontSize`
-(11 CSS px at the 12 px default) with the configured family, countdown text to 10/12 of layout
-(10 px), scaling proportionally with larger fonts. The price strip keeps a stable 1 px border slot,
-3 px tick, and 4 px padding on each side while the visible border inside that slot uses the canonical
-design-system width; the time strip likewise keeps its existing border slot, text, tick, and vertical
-padding, snapped to an even CSS-pixel height (22 px by default). Price tags are
-axis text plus 2 px padding above and below (15 px), while the crosshair Y-axis tag alone adds 2 px
-per side (19 px); countdown rows are countdown text plus 2 px padding per side (14 px), and time tags
-fit the strip height with 6 px horizontal padding per side. Axis-attached price, time, drawing,
-alert, and live-value chips share a 1 CSS-pixel corner radius. Tick
-density, collision spacing, drag bounds, and crosshair placement derive from the same metrics, and
-hosts measure axis strings at the axis size and countdown strings at the countdown size with matching
-weight. Font, DPR, formatter, and minimum-dimension changes invalidate measurements, retained labels,
-and layout together.
+坐标轴外观由引擎拥有且紧凑：附着于坐标轴的文本解析为 `layout.fontSize` 的 11/12（默认 12 px 时为 11 CSS px），字体族为所配置的字体族；倒计时文本为布局字号的 10/12（10 px），并随更大的字体按比例缩放。价格条带在每一侧保持稳定的 1 px 边框槽、3 px 刻度和 4 px 内边距，而该槽内可见的边框使用规范的设计系统宽度；时间条带同样保持其现有的边框槽、文本、刻度和垂直内边距，并对齐到偶数 CSS 像素高度（默认 22 px）。价格标签为坐标轴文本加上下各 2 px 内边距（15 px），而仅十字光标 Y 轴标签每侧额外增加 2 px（19 px）；倒计时行为倒计时文本加每侧 2 px 内边距（14 px），时间标签适配条带高度，每侧水平内边距为 6 px。附着于坐标轴的价格、时间、绘图、提醒和实时值徽标共用 1 CSS 像素的圆角半径。刻度密度、碰撞间距、拖动边界和十字光标位置均由同一组度量派生，宿主按坐标轴字号度量坐标轴字符串，并按倒计时字号以相同字重度量倒计时字符串。字体、DPR、格式化器和最小尺寸的变化会使度量、保留的标签和布局一并失效。
 
-Pane scale geometry is pane-local. Every scale a pane owns is laid out against that pane's own slot
-height and carries the pane's top edge as its single explicit transform into chart-content space, so
-autoscale, margins, internal height, tick marks, hit testing, and axis gestures resolve inside the
-owning pane alone and never against the stacked content height. Resizing one pane therefore cannot
-move another pane's range or coordinates. The pane divider is structural rather than plot chrome: its
-resting line, hover band, hit test, and drag geometry all describe the same boundary spanning the
-full chart width, including every visible left and right price-scale strip. Tick labels reserve their full line-box height plus clearance at internal pane edges even when `entireTextOnly` is disabled; an off-edge label is omitted rather than allowed to paint into its neighbor.
+窗格比例尺几何是窗格局部的。窗格拥有的每个比例尺都依据该窗格自己的槽位高度进行布局，并携带该窗格的上边缘，作为其进入图表内容空间的唯一显式变换，因此自动缩放、边距、内部高度、刻度线、命中测试和坐标轴手势都只在所属窗格内部解析，绝不依据堆叠后的内容高度。因此调整一个窗格的大小不会移动另一个窗格的范围或坐标。窗格分隔线是结构性的，而非绘图区装饰：其静止线、悬停带、命中测试和拖动几何描述的都是同一条横跨整个图表宽度的边界，包括每个可见的左侧和右侧价格比例尺条带。即使 `entireTextOnly` 被禁用，刻度标签也会在窗格内部边缘处预留其完整的行框高度加间隙；越出边缘的标签会被省略，而不会任其绘制到相邻内容中。
 
-Public coordinates are chart-content space, never pane-local: `x` is CSS px from the plot-area left edge and `y` is CSS px from the top of the stacked pane area, so a lower pane's scale returns a `y` inside that pane's `[top, top + height]` and every conversion, pointer position, crosshair, drawing, and trading round trip shares that one space. Two plugin surfaces differ deliberately and are documented as such: the draw-context converters return bitmap px of the whole chart, and an axis-label descriptor's `coordinate` is pane-local. Series conversions use the series' own pane and scale. The chart-level pair is a shared engine query on the pane default scale (the scale the crosshair label reads): a price converts on pane 0, and a coordinate converts on the pane containing `y` (a separator belongs to the pane above, a `y` below the panes to the last pane); neither follows series creation order. All of it reflects the last layout pass.
+公开坐标是图表内容空间，绝非窗格局部：`x` 是距绘图区左边缘的 CSS px，`y` 是距堆叠窗格区域顶部的 CSS px，因此较低窗格的比例尺返回的 `y` 位于该窗格的 `[top, top + height]` 之内，每一次转换、指针位置、十字光标、绘图和交易往返都共享这同一个空间。两个插件接口有意地不同，并已如此记录：绘制上下文转换器返回整个图表的位图 px，而坐标轴标签描述符的 `coordinate` 是窗格局部的。系列转换使用该系列自己的窗格和比例尺。图表级的这一对转换是针对窗格默认比例尺（十字光标标签读取的比例尺）的共享引擎查询：价格在窗格 0 上转换，坐标则在包含 `y` 的窗格上转换（分隔线属于其上方的窗格，位于所有窗格之下的 `y` 属于最后一个窗格）；两者都不遵循系列创建顺序。以上全部反映的是最近一次布局过程。
 
-Series pane/scale rebinding is one validated engine mutation. An unknown destination leaves pane,
-scale, data, type, style, visibility, streaming state, and handle identity unchanged. Percentage
-and indexed geometry uses each series' own first visible value by default; a chart-level comparison
-anchor may replace that base for every overlay without copying rows. A scale-level explicit
-`base_value` (for example a host-supplied previous close) replaces both for every source, label,
-primitive, trading line, and drawing on that scale, so horizontal panning never re-bases it. The same anchor resolution
-feeds the bounded engine-owned comparison legend snapshot, so browser and native hosts present
-per-symbol values from one canonical time identity.
+系列的窗格/比例尺重新绑定是一次经过校验的引擎变更。未知的目标会使窗格、比例尺、数据、类型、样式、可见性、流式状态和句柄标识保持不变。百分比与指数化几何默认使用每个系列自己的第一个可见值；图表级的比较锚点可以替换所有叠加层的这一基准，而无需复制行。比例尺级的显式 `base_value`（例如宿主提供的前收盘价）会替换这两者，作用于该比例尺上的每个来源、标签、图元、交易线和绘图，因此水平平移绝不会使其重新取基。同一锚点解析还为有界的、由引擎拥有的比较图例快照提供数据，因此浏览器和原生宿主从同一规范时间标识出发呈现各标的的数值。
 
-Autoscale is one engine pass per invalidated frame. Each visible series contributes its own raw
-range over the strict visible bars (data with Heikin-Ashi/footprint bounds and, for histograms,
-their `base` as in the reference, engine-owned native primitives while data is visible, host
-series-primitive contributions) plus marker margins. A series `autoscale_info_provider`
-(reference `autoscaleInfoProvider`) receives that info and its
-answer replaces the series' range and margins; hosts record no state for it and it runs during the
-pass. The browser package runs it inside a render-callback guard at its single WASM boundary, so a
-chart API called from the provider throws `unsupported_operation` instead of re-entering the
-borrowed engine (which would otherwise abort the WebAssembly instance from resize-observer frames),
-and a throwing provider leaves the series' own info for that pass. Stable scales additionally merge each series' range one bar beyond both visible edges. The
-merged logical ranges, the scale's center converted through its base, and the formatter source's
-`min_move` then go to `PriceScaleCore`. Axis ticks, the horizontal grid, and axis-width negotiation
-share one tick-mark set built by `ChartEngine::scale_tick_marks`: the formatter source's
-`min_move`, or its tick ladder's grid (the LCM of the band ticks) over each price interval the
-builder spans, with the reference's fixed `0.01` grid on percentage/indexed scales. Tick,
-crosshair, last-value, and price-line labels of a laddered series round to each price's band tick;
-trading snapping, keyboard steps, and tick indices on that scale use the same ladder in place of
-the scalar instrument tick, so an intent's `price_tick_index` then counts cumulative band ticks
-from zero. Indexed-to-100 labels use the reference fixed two-decimal formatter.
+自动缩放是每个失效帧一次引擎过程。每个可见系列在严格可见的柱上贡献其自身的原始范围（带有 Heikin-Ashi/足迹图边界的数据，对于直方图则为其 `base`，与参考实现一致，数据可见时由引擎拥有的原生图元，以及宿主系列图元的贡献），外加标记边距。系列的 `autoscale_info_provider`（参考实现中的 `autoscaleInfoProvider`）接收该信息，其返回值会替换该系列的范围和边距；宿主不为其记录任何状态，它在该过程期间运行。浏览器包在其唯一的 WASM 边界处于渲染回调保护内运行它，因此从该提供者内部调用图表 API 会抛出 `unsupported_operation`，而不是重入被借用的引擎（否则会在 resize-observer 帧中中止 WebAssembly 实例），而抛出异常的提供者会让该系列在这一过程中保留其自身的信息。稳定比例尺还会合并每个系列在两侧可见边缘之外各多一根柱的范围。合并后的逻辑范围、经其基准转换后的比例尺中心，以及格式化器来源的 `min_move`，随后交给 `PriceScaleCore`。坐标轴刻度、水平网格和坐标轴宽度协商共享由 `ChartEngine::scale_tick_marks` 构建的同一组刻度线：格式化器来源的 `min_move`，或在构建器所跨越的每个价格区间上其刻度阶梯的网格（价格带刻度的 LCM），而在百分比/指数化比例尺上采用参考实现固定的 `0.01` 网格。采用阶梯的系列的刻度、十字光标、最新值和价格线标签会舍入到各价格所在价格带的刻度；该比例尺上的交易磁吸、键盘步进和刻度索引使用同一阶梯，取代标量的品种刻度，因此意图的 `price_tick_index` 此时从零开始累计价格带刻度数。指数化至 100 的标签使用参考实现固定的两位小数格式化器。
 
-Hosts send input and data to the engine. The engine returns query results and a prepared `ChartFrame`. Browser and GPUI adapters normalize native events into CSS-logical pointer and wheel samples. Browser, worker, and GPUI pointer and wheel samples feed the engine input controller. The resolver owns pointer membership, the 5 px Manhattan drag threshold, explicit gesture state, fixed starting pinch centroid/distance, cumulative pinch scale, primary-touch continuation/termination, and cancellation; it retains at most two pointers and performs no move-sample allocation. Pinch moves zoom only around the starting centroid and cannot begin after a one-finger move or long press. Hosts still own platform capture, cursor application, event-default policy, and frame/timer scheduling. GPUI reverses its horizontal wheel delta at the adapter so `WheelSample` uses the browser deltaX pan direction and wheel-up positive y on every host. The engine normalizes raw wheel axes once: pixel deltas use the source pixel ratio, DOM line units retain the reference 32 px rule, and page units retain the 120 px convention. GPUI converts its native line units at the adapter so the default three-line notch resolves to the same 100 px browser notch. Browser and offscreen wheel events enter `ChartEngine::input_wheel` through one WASM operation with their raw axes, mode, platform pixel ratio, resolved wheel options, modifiers, and timestamp; the controller owns zoom/pan routing, motion cancellation, hover, and cursor refresh. GPUI feeds the same controller from its adapter. Normalization includes pointer cadence: browsers already coalesce pointer motion to display frames, and a native host must do the same for brush capture — Wayland delivers per-HID-report motion (~1000 Hz, often one axis per event), and feeding every sample to `brush_create_add` records that axis-alternating staircase as stroke knots. The engine input controller therefore retains only the newest captured sample; native hosts call `flush_coalesced_input` once per prepaint (pointer-up flushes before commit), so stroke knots sample the drag trajectory at display cadence on every host. Horizontal kinetic scroll follows the reference domain exactly: drag samples are the time scale's logical `rightOffset`, while the reference 0.2/7 px-per-ms speed limits and 15 px minimum move are divided by the bar spacing captured when the drag starts. The resulting coast is therefore zoom-invariant instead of being tuned in raw pointer pixels. Browser and offscreen keyboard events enter the engine controller through WASM; Left/Right pan is velocity-owned rather than destination-owned: key-down gives an immediate bounded velocity kick, the engine adds further low-friction kicks at a fixed cadence while the key remains held, and host key-repeat is ignored except when it changes the requested Ctrl/Shift speed. Key-up cancels the kinetic state immediately. A worker key event without an explicit down/up phase is a discrete press. With host-requested reduced motion, each arrow event applies one discrete step and mouse-pan release never coasts. Ctrl/Shift retain the existing 10x strength relationship to plain arrows. The controller exposes drawing undo and redo through the engine history; GPUI binds those shortcuts here, and browser and offscreen adapters now route those shortcuts through the same controller. Escape queues a bounded host event so browser crosshair subscribers receive their cursor-left callback after the engine clears hover. Zoom, scroll, kinetic motion, snapping, selection, drawing/trading preview semantics, and rollback belong here.
+宿主向引擎发送输入和数据。引擎返回查询结果和准备好的 `ChartFrame`。浏览器和 GPUI 适配器将原生事件归一化为 CSS 逻辑像素的指针和滚轮样本。浏览器、worker 和 GPUI 的指针与滚轮样本都送入引擎输入控制器。解析器拥有指针成员关系、5 px 曼哈顿距离拖动阈值、显式手势状态、固定的起始捏合质心/距离、累计捏合比例、主触点的延续/终止以及取消；它至多保留两个指针，且不对移动样本做分配。捏合移动只围绕起始质心缩放，并且不能在单指移动或长按之后开始。宿主仍拥有平台捕获、光标应用、事件默认行为策略以及帧/定时器调度。GPUI 在适配器处反转其水平滚轮增量，使 `WheelSample` 在每个宿主上都采用浏览器 deltaX 的平移方向和滚轮向上为正的 y。引擎只一次性地归一化原始滚轮轴：像素增量使用源像素比，DOM 行单位保留参考实现的 32 px 规则，页单位保留 120 px 约定。GPUI 在适配器处转换其原生行单位，使默认的三行一档解析为与浏览器相同的 100 px 一档。浏览器和离屏滚轮事件通过一次 WASM 操作进入 `ChartEngine::input_wheel`，携带其原始轴、模式、平台像素比、已解析的滚轮选项、修饰键和时间戳；控制器拥有缩放/平移路由、运动取消、悬停和光标刷新。GPUI 通过其适配器向同一控制器输入。归一化也包括指针节奏：浏览器已经把指针运动合并到显示帧，原生宿主在笔刷捕获时也必须这样做——Wayland 按每个 HID 报告投递运动（约 1000 Hz，通常每个事件只有一个轴），而把每个样本都送入 `brush_create_add` 会把这种轴交替的阶梯形记录为笔画节点。因此引擎输入控制器只保留最新捕获的样本；原生宿主在每次 prepaint 调用一次 `flush_coalesced_input`（指针抬起时在提交之前刷新），使笔画节点在每个宿主上都按显示节奏采样拖动轨迹。水平惯性滚动与参考实现的域完全一致：拖动样本是时间比例尺的逻辑 `rightOffset`，而参考实现的 0.2/7 px-per-ms 速度限制和 15 px 最小移动量，都除以拖动开始时捕获的柱间距。因此所得的滑行与缩放无关，而不是按原始指针像素调校。浏览器和离屏键盘事件通过 WASM 进入引擎控制器；左/右平移由速度主导，而非由目标位置主导：按下键给出一次立即的有界速度冲量，只要按键保持按下，引擎就以固定节奏追加低摩擦的冲量，并且宿主的按键重复会被忽略，除非它改变了所请求的 Ctrl/Shift 速度。抬起键立即取消惯性状态。没有显式按下/抬起阶段的 worker 键事件是一次离散按键。在宿主请求减弱动效时，每个方向键事件应用一次离散步进，且鼠标平移松开后绝不滑行。Ctrl/Shift 与普通方向键保持现有的 10x 强度关系。控制器通过引擎历史暴露绘图撤销和重做；GPUI 在此绑定这些快捷键，而浏览器和离屏适配器现在也通过同一控制器路由这些快捷键。Escape 会排入一个有界的宿主事件，使浏览器十字光标订阅者在引擎清除悬停之后收到其光标离开回调。缩放、滚动、惯性运动、磁吸、选择、绘图/交易预览语义以及回滚都归属于此。
 
-Browser and worker mouse, pen, and touch samples enter the engine input controller through WASM.
-Both adapters use the same touch pinch membership, zoom, cancellation, and primary-finger
-continuation. The browser keeps only DOM touch capture and page-scroll direction arbitration;
-yielding to page scroll cancels the controller press immediately.
-The controller also schedules a stationary pane touch at 240 ms through its wake deadline.
-On that wake it enters crosshair tracking, keeps the crosshair anchored through one-finger
-motion without panning, and applies the configured next-tap or touch-end exit rule. Outside that
-tracking a finger has no hover: a touch press, pan, axis drag, or the finger left after a pinch
-shows no crosshair, as in the reference; only a finger dragging a trading line or a drawing shows
-it, at the drop point. Browser and worker hosts schedule this engine deadline and call
-`input_tick` when it arrives.
-For consumed wheel input, the controller uses the wheel event's position to promote hover and
-resolve the cursor; the browser applies that cursor after the event even without pointer motion.
-The hosts supply CSS-logical coordinates, pointer identity and device, and configured interaction
-switches; the controller owns capture identity, the 5 px press threshold (`CLICK_SLOP_MANHATTAN`,
-which the browser also reads for page-scroll direction arbitration), click recognition, pan,
-axis gestures, hover, and cursor priority. A foreign pointer cannot move, release, or cancel the
-captured press. Browser and worker touch membership and continuation follow this controller rule.
-The controller recognizes a repeated press by native click count or its bounded 500 ms/5 px
-history; the taps of a touch double-tap may land 30 px apart (the reference's
-`DoubleTapManhattanDistance`). It commits double-click on a stationary second release; motion instead retains the
-gesture, so selecting a drawing anchor and immediately dragging it works on every host.
-The browser and worker pointer adapters pack device, modifier, and configured option bits into
-one allocation-free WASM argument. After a controller press completes, the browser dispatches
-engine trading intents and alert requests to host subscribers. Window modifier events reach the
-controller even when the chart canvas lacks keyboard focus. The engine owns trading tooltip dwell
-deadlines; the browser schedules a timer for the exposed deadline and calls `input_tick` when it
-expires for mouse, pen, and touch input.
+浏览器和 worker 的鼠标、笔和触摸样本通过 WASM 进入引擎输入控制器。两个适配器使用相同的触摸捏合成员关系、缩放、取消以及主手指延续。浏览器只保留 DOM 触摸捕获和页面滚动方向仲裁；让位于页面滚动会立即取消控制器的按下。控制器还通过其唤醒截止时间，在静止的窗格触摸 240 ms 时进行调度。在该唤醒时刻，它进入十字光标跟踪，使十字光标在单指移动期间保持锚定而不平移，并应用所配置的下一次轻触或触摸结束退出规则。在该跟踪之外，手指没有悬停：触摸按下、平移、坐标轴拖动，或捏合之后剩下的手指，都不显示十字光标，与参考实现一致；只有拖动交易线或绘图的手指才会显示它，且显示在放下点。浏览器和 worker 宿主调度该引擎截止时间，并在其到达时调用 `input_tick`。对于被消费的滚轮输入，控制器使用滚轮事件的位置来提升悬停并解析光标；浏览器在事件之后应用该光标，即使没有指针运动。宿主提供 CSS 逻辑坐标、指针标识和设备，以及已配置的交互开关；控制器拥有捕获标识、5 px 按下阈值（`CLICK_SLOP_MANHATTAN`，浏览器也读取它用于页面滚动方向仲裁）、点击识别、平移、坐标轴手势、悬停和光标优先级。外来指针不能移动、释放或取消被捕获的按下。浏览器和 worker 的触摸成员关系与延续遵循该控制器规则。控制器通过原生点击计数或其有界的 500 ms/5 px 历史识别重复按下；触摸双击的两次轻触可以相距 30 px（参考实现的 `DoubleTapManhattanDistance`）。它在静止的第二次松开时提交双击；若有移动则保留该手势，因此选择绘图锚点并立即拖动在每个宿主上都可行。浏览器和 worker 指针适配器把设备、修饰键和已配置的选项位打包进一个无分配的 WASM 参数。控制器按下完成之后，浏览器把引擎交易意图和提醒请求分发给宿主订阅者。窗口修饰键事件即使在图表画布没有键盘焦点时也会到达控制器。引擎拥有交易提示框停留截止时间；浏览器为所暴露的截止时间调度一个定时器，并在其到期时对鼠标、笔和触摸输入调用 `input_tick`。
 
-The optional browser brushable Area helper installs one engine-owned composition of an ordinary
-Area series and its Delta Tooltip. It sends only explicit style overrides through WASM; the
-engine retains the selected range, applies its default and overridden brush styles to the frame,
-and clears the range on Escape or double-click through the shared input controller. Mouse and
-touch comparison gestures (one touch previews, two touches commit a range) run inside the
-controller; each change queues one `DeltaTooltipChanged` event per drain, which the browser turns
-into its range-listener notification. The helper queries the active range and detaches the
-composition without adding host input listeners.
-GPUI's input adapter can take `App::reduce_motion()` at prepaint and forward that preference to
-the engine's motion policy before advancing input animations. GPUI has no four-way move cursor, so
-its adapter maps `ChartCursor::Move` to the open hand (the pointing hand on Windows, where GPUI
-draws hand cursors as the arrow).
-Hover arbitration is engine-owned (`ChartEngine::resolve_pointer_hover`, read back through
-`input_hover`): browser plugin primitives are JS objects, so WASM gathers their best hit as a
-`HostPrimitiveHit` (series, z layer, whether it supplied a cursor) and the engine ranks it against
-drawings, series, and general-series items with the reference `hitTestPane` order. The controller
-decides whether a primitive cursor wins against active presses, chart tools, and built-in objects;
-the browser applies the callback's CSS cursor only when the controller selects it, writes the
-cursor only when it changes, and repaints after input only while `frame_pending()` reports a
-stale prepared frame, so identical hover samples do no frame work.
-Volume-profile indicators are native series primitives rather than output series, so the
-controller hit-tests their painted rows itself (after drawings, before series). Hovering a row
-shows the pointer cursor and reports `volume_profile:{id}` as the hover object; a click selects the
-profile (clearing series, drawing, and general selection) and paints selection anchors on its
-first and last rows, point of control, and value-area bounds. Escape deselects it and Delete
-removes it, exactly like an indicator series.
-Keyboard focus targets exposed by the browser accessibility layer (price axis, time axis, pane
-separator, drawing) route through `input_target_key_down` with a `ChartFocusTarget`. The engine
-owns their bindings: price-axis Home/ArrowUp/ArrowDown, time-axis Home/ArrowLeft/ArrowRight,
-separator Home/ArrowUp/ArrowDown, and the keyboard drawing edit session (Enter opens or commits,
-arrows nudge, Tab cycles anchors, Escape restores the start, Delete removes). A committed
-keyboard drawing edit is one undo entry; the browser only announces the outcome.
+可选的浏览器可刷选 Area 辅助函数会安装一个由引擎拥有的组合，由一个普通 Area 系列及其 Delta Tooltip 构成。它仅通过 WASM 发送显式的样式覆盖；引擎保留所选范围，将其默认刷选样式与被覆盖的刷选样式应用到帧上，并通过共享的输入控制器在 Escape 或双击时清除范围。鼠标与触摸的对比手势（单点触摸为预览，双点触摸提交范围）在控制器内部运行；每次变化会在每次排空时排入一个 `DeltaTooltipChanged` 事件，浏览器将其转换为范围监听器通知。该辅助函数查询活动范围并解除该组合，而不添加宿主输入监听器。GPUI 的输入适配器可以在 prepaint 时读取 `App::reduce_motion()`，并在推进输入动画之前把该偏好转发给引擎的动效策略。GPUI 没有四向移动光标，因此其适配器将 `ChartCursor::Move` 映射为张开的手形（在 Windows 上为指向手形；GPUI 在 Windows 上将手形光标绘制为箭头）。悬停仲裁由引擎拥有（`ChartEngine::resolve_pointer_hover`，通过 `input_hover` 读回）：浏览器插件图元是 JS 对象，因此 WASM 将其最佳命中收集为 `HostPrimitiveHit`（系列、z 层、是否提供了光标），引擎按照参考实现的 `hitTestPane` 顺序，将其与绘图、系列和通用系列项进行排序。控制器决定图元光标能否胜过活动按下、图表工具和内置对象；浏览器仅在控制器选中时才应用回调的 CSS 光标，仅在光标变化时才写入光标，并且仅当 `frame_pending()` 报告存在过期的已准备帧时才在输入后重绘，因此相同的悬停采样不会产生帧工作。成交量分布指标是原生系列图元而不是输出系列，因此控制器自行对其已绘制的行做命中测试（在绘图之后、系列之前）。悬停在某一行上会显示 pointer 光标，并把 `volume_profile:{id}` 报告为悬停对象；点击会选中该分布（同时清除系列选择、绘图选择与通用选择），并在其首行与末行、控制点（POC）以及价值区边界上绘制选择锚点。Escape 取消选中，Delete 将其移除，与指标系列完全一致。浏览器无障碍层暴露的键盘焦点目标（价格坐标轴、时间轴、窗格分隔条、绘图）通过 `input_target_key_down` 并携带 `ChartFocusTarget` 路由。引擎拥有它们的绑定：价格坐标轴的 Home/ArrowUp/ArrowDown、时间轴的 Home/ArrowLeft/ArrowRight、分隔条的 Home/ArrowUp/ArrowDown，以及键盘绘图编辑会话（Enter 打开或提交，方向键微调，Tab 循环切换锚点，Escape 恢复起始状态，Delete 删除）。一次已提交的键盘绘图编辑是一条撤销记录；浏览器只负责播报结果。
 
-Browser, worker, and GPUI hosts route all pointer, wheel, and keyboard input through one engine input controller
-(`chart_input.rs`). A host translates platform events into `PointerInput`, `WheelSample`, and
-`ChartKey` values and calls `ChartEngine::input_*`; the controller owns the complete interaction
-policy: chart-region resolution, press arbitration (live measure, trading controls, crosshair action
-chip, armed drawing tool, drawing drag, delta tooltip, Shift measure, pan), the shared 5 px threshold
-through the `GestureResolver`, axis and separator drags, kinetic coasting, click-to-select and
-text-edit activation, double-click resets, keyboard bindings, wheel routing, hover promotion, the
-trading-tooltip dwell deadline, and a semantic `ChartCursor`. Motion that arrives with the primary
-button already up (a release the host never saw), Escape, and `input_cancel` abandon the open gesture
-without committing it, exactly like browser pointer-capture loss. Host-configurable switches live in
-`InteractionOptions` (the reference `handleScroll`/`handleScale` family plus Aeris's
-`price_axis_wheel_zoom`). Work only a host can perform arrives as a bounded queue of
-`ChartInputEvent`s (context menu, click and double-click notification, text-editor opening, created
-drawing, removal of a host-owned series, crosshair leave, and Delta Tooltip range change). A
-double-click ends whatever press it lands in (measure, trading drag, pan, price pan, capture
-creation) before applying its reset. Browser and offscreen adapters, and
-the GPUI probe, drain host-owned series removals after controller input; the browser also forwards
-click, double-click, and crosshair events to subscribers and opens the DOM editor for engine-owned
-editing sessions. Hosts keep event
-translation, pointer capture, applying the cursor, timer and frame scheduling, menus, clipboard, and
-product persistence; they never re-implement routing, cursor priority, or key bindings. A new
-interaction is therefore added to the controller once and every native host inherits it. A
-double-click acts only on the drawing under the pointer (a trading control or the alert chip keeps
-its click) and opens the editor of every text-bearing drawing; Enter (when no sequence is being
-finished) and F2 open the selected drawing's editor; keyboard bindings honour `InteractionOptions`
-(scroll keys need pan or wheel scroll, +/- need wheel zoom, Home refits the time axis only and
-needs the time-axis reset switch, and a gated key stays unconsumed); wheel and pinch anchors are clamped into the plot. Typed scale
-commands resolve the effective series, propagate price format across a scale, toggle series/axis
-chrome, and move every attached series between price axes as one operation; hosts do not walk engine
-series to reproduce these transactions. Committed drawing edits, undo and redo, price-basis changes,
-and accepted sync payloads advance `drawing_revision()` (the drawing sync revision the sync payload
-carries), so hosts persist on that revision instead of tracking gestures.
-The temporary Ctrl/Cmd OHLC magnet affects a Normal-mode crosshair only while a drawing tool is
-armed and its effective drawing magnet (the chart or tool mode, with Ctrl/Cmd as the temporary
-toggle) is Strong, or while an existing drawing is being dragged with the modifier held. Free
-browsing retains the raw cursor price even if a host has not yet cleared the modifier flag;
-explicitly configured Magnet and MagnetOhlc crosshair modes remain independent of this drawing
-interaction.
+浏览器、worker 与 GPUI 宿主通过同一个引擎输入控制器（`chart_input.rs`）路由所有指针、滚轮与键盘输入。宿主将平台事件转换为 `PointerInput`、`WheelSample` 与 `ChartKey` 值并调用 `ChartEngine::input_*`；控制器拥有完整的交互策略：图表区域解析、按下仲裁（实时测量、交易控件、十字光标操作徽标、已激活的绘图工具、绘图拖动、Delta Tooltip、Shift 测量、平移）、通过 `GestureResolver` 的共享 5 px 阈值、坐标轴与分隔条拖动、惯性滑行、点击选择与文本编辑激活、双击重置、键盘绑定、滚轮路由、悬停提升、交易提示框停留截止时间，以及语义化的 `ChartCursor`。到达时主按键已处于抬起状态的移动事件（宿主从未见到的释放）、Escape 与 `input_cancel` 会放弃进行中的手势而不提交，与浏览器指针捕获丢失完全一致。宿主可配置的开关位于 `InteractionOptions` 中（参考实现的 `handleScroll`/`handleScale` 系列开关，以及 Aeris 自有的 `price_axis_wheel_zoom`）。只有宿主才能执行的工作以有界的 `ChartInputEvent` 队列形式到达（上下文菜单、点击与双击通知、文本编辑器打开、已创建的绘图、宿主拥有系列的移除、十字光标离开，以及 Delta Tooltip 范围变更）。双击会先结束其所落入的任何按下操作（测量、交易拖动、平移、价格平移、捕获创建），再应用其重置。浏览器与离屏适配器以及 GPUI 探针会在控制器输入之后排空宿主拥有系列的移除；浏览器还会把点击、双击与十字光标事件转发给订阅者，并为引擎拥有的编辑会话打开 DOM 编辑器。宿主保留事件转换、指针捕获、光标应用、定时器与帧调度、菜单、剪贴板以及产品持久化；它们绝不重新实现路由、光标优先级或按键绑定。因此，新的交互只需在控制器中添加一次，所有原生宿主即可继承。双击只作用于指针下方的绘图（交易控件或提醒徽标保留其点击），并会打开每个带文本的绘图的编辑器；Enter（当没有正在完成的序列时）与 F2 打开所选绘图的编辑器；键盘绑定遵循 `InteractionOptions`（滚动键需要平移或滚轮滚动，+/- 需要滚轮缩放，Home 仅重新适配时间轴并需要时间轴重置开关，被开关拦截的按键保持未被消费）；滚轮与捏合锚点被限制在 plot 区域内。类型化比例尺命令会解析生效的系列、在比例尺范围内传播价格格式、切换系列/坐标轴装饰，并把所有已挂接的系列作为一次操作在价格坐标轴之间移动；宿主不会遍历引擎系列来复现这些事务。已提交的绘图编辑、撤销与重做、价格基准变更以及被接受的同步载荷都会推进 `drawing_revision()`（同步载荷所携带的绘图同步修订号），因此宿主依据该修订号持久化，而无需追踪手势。临时的 Ctrl/Cmd OHLC 磁吸仅在以下情况下影响 Normal 模式的十字光标：绘图工具处于激活状态且其生效的绘图磁吸（图表或工具的模式，以 Ctrl/Cmd 作为临时切换）为 Strong，或者在按住修饰键的情况下拖动已有绘图。自由浏览时保留原始光标价格，即使宿主尚未清除修饰键标志；显式配置的 Magnet 与 MagnetOhlc 十字光标模式独立于该绘图交互。
 
-Native financial-frame preparation is also one engine operation. A host supplies the viewport and
-native glyph measurement callbacks; the engine installs CSS dimensions and DPR, decides whether
-layout/axis work is required, performs optional initial fit, negotiates axes, owns maximum-label
-policy, and builds the chart frame plus axis primitives. It rebuilds whenever any frame layer was
-invalidated (one invalidation clock covers every layer, including hover-promotion assembly order) or
-input changed state since the last prepared frame, and relayouts after an input-driven pane resize.
-The host retains renderer-cache invalidation and paint scheduling, but neither reproduces the
-preparation sequence nor clears frames by hand to force a rebuild.
+原生金融帧准备同样是一次引擎操作。宿主提供视口与原生字形度量回调；引擎安装 CSS 尺寸与 DPR，判断是否需要布局/坐标轴工作，执行可选的初始适配，协商坐标轴，拥有最大标签策略，并构建图表帧以及坐标轴图元。每当任何帧层失效（一个失效时钟覆盖每一层，包括悬停提升的装配顺序），或输入自上一次已准备帧以来改变了状态时，它都会重建，并在输入驱动的窗格尺寸调整之后重新布局。宿主保留渲染器缓存失效与绘制调度，但既不重现该准备序列，也不手动清除帧来强制重建。
 
-Linked-chart ingress is source-aware. Local mutations publish into the bounded synchronization queue;
-`apply_external_sync_event` applies host-supplied crosshair and visible-range state without
-echoing it and without draining unrelated local events already awaiting delivery. Hosts coordinate
-chart groups and transport events, but they never clear the engine queue to manufacture no-echo
-behavior.
+联动图表的入口是来源感知的。本地变更发布到有界的同步队列；`apply_external_sync_event` 应用宿主提供的十字光标与可见范围状态，不会回显，也不会排空尚在等待投递的无关本地事件。宿主协调图表组并传输事件，但绝不清空引擎队列来制造无回显行为。
 
-Secondary clicks use the engine-owned Chart Context query. It resolves chart-space coordinates,
-pane, time, logical index, hit series, and price on that series' exact scale (or the pane's canonical
-default scale on empty space) without running primary-click selection or activation. Browser and
-native hosts may use the payload to build menus, clipboard actions, or order UI, but those side
-effects remain outside the engine.
+次键点击使用引擎拥有的 Chart Context 查询。它解析图表空间坐标、窗格、时间、逻辑索引、命中的系列，以及该系列精确比例尺上的价格（在空白区域则使用窗格的规范默认比例尺），而不执行主点击的选择或激活。浏览器与原生宿主可以使用该载荷构建菜单、剪贴板操作或订单 UI，但这些副作用仍在引擎之外。
 
-Chart-wide value snapshots are assembled once by the engine from canonical plots, current series kind, pane/scale placement, and each series formatter. Exact logical mode retains every live series and leaves gaps or whitespace null; latest mode independently selects each series' own last non-whitespace logical index and time. The snapshot also carries the previous same-series non-whitespace close/value. WASM only serializes this bounded result, while the TypeScript package maps opaque series IDs to existing handles. Crosshair compatibility `series_data` is filtered from the same snapshot, and crosshair leave exposes a rich latest snapshot while retaining an empty compatibility map.
+图表级数值快照由引擎根据规范 plot、当前系列类型、窗格/比例尺位置以及每个系列的格式化器一次性组装。精确逻辑模式保留每个存活系列，并将缺口或空白数据置为 null；最新模式为每个系列独立选取其自身最后一个非空白数据的逻辑索引与时间。该快照还携带同一系列上前一个非空白数据的收盘价/数值。WASM 只序列化这一有界结果，而 TypeScript 包将不透明的系列 ID 映射到现有句柄。十字光标的兼容性 `series_data` 由同一快照过滤得出，十字光标离开时暴露一个完整的最新快照，同时保留一个空的兼容映射。
 
-Sparse host fundamentals use the existing general-series contract: temporal release rows remain sparse, `GeneralInterpolation::Step` lowers to `LineType::WithSteps` (step-after at the release timestamp), and `GeneralSeriesKind::Column` provides the independent-pane histogram form. Row labels are host-supplied as-of release text; the engine neither fetches nor interprets fundamentals, and no value is projected before its release row. The same timestamp/label rows are retained through history gaps and resampling, so replay can mask future releases without a second fundamental-data model.
+稀疏的宿主基本面数据使用现有的通用系列契约：时间维度的发布行保持稀疏，`GeneralInterpolation::Step` 转换为 `LineType::WithSteps`（在发布时间戳处阶梯后置，即 step-after），`GeneralSeriesKind::Column` 提供独立窗格的直方图形式。行标签是宿主提供的按发布时点（as-of）文本；引擎既不获取也不解释基本面数据，并且在发布行之前不会投射任何值。相同的时间戳/标签行会在历史缺口与重采样中被保留，因此回放可以屏蔽未来的发布，而无需第二套基本面数据模型。
 
-All interaction hit tests use an engine `HitProfile`. Mouse and pen retain precision tolerances; touch expands semantic anchors and actionable trading controls to an effective 44 CSS-pixel target without changing visual geometry. Cancellation from pointer cancellation/capture loss, host focus or visibility loss, resize, backend loss, or disposal closes scale/scroll sessions without inertia and restores drawing/trading previews rather than committing them.
+所有交互命中测试都使用引擎的 `HitProfile`。鼠标与触控笔保持精确容差；触摸将语义锚点和可操作的交易控件扩展到有效的 44 CSS 像素目标，而不改变视觉几何。由指针取消/捕获丢失、宿主焦点或可见性丢失、尺寸调整、后端丢失或销毁引起的取消，会无惯性地关闭比例尺/滚动会话，并恢复绘图/交易预览而不是提交它们。
 
-Built-in frame geometry and series hit testing share one viewport-density query. Resolvable spacing uses the raw rows unchanged. Below one physical pixel per row, the query chooses the deepest summary level whose group fits the average pixel density, uses aligned summary nodes for pixel-bucket interiors, and refines partial boundaries through lower levels or raw rows. The existing per-kind conflation then preserves chronological line endpoints and close extrema, candle first-open/high/low/last-close semantics, and histogram greatest absolute value. The resulting ordered `ChartFrame` remains the only backend contract. Crosshair and trading data lookup remain exact raw/cached canonical queries rather than LOD approximations. Heikin Ashi candlesticks use a generation-keyed engine presentation cache over canonical OHLC: frame geometry, autoscale, and candle chrome may consume the derived values, while `series_data`, crosshair, and trading paths continue to expose raw OHLC.
+内置的帧几何与系列命中测试共用一个视口密度查询。可分辨的间距使用原始行，不做改动。当每行不足一个物理像素时，该查询选择其分组符合平均像素密度的最深汇总层级，对像素桶内部使用对齐的汇总节点，并通过更低层级或原始行细化部分边界。随后，现有的按类型合并（conflation）保留折线按时间顺序的端点与收盘极值、蜡烛的首开/最高/最低/末收语义，以及直方图的最大绝对值。最终有序的 `ChartFrame` 仍是唯一的后端契约。十字光标与交易数据查找仍然是精确的原始/缓存规范查询，而不是细节层级（LOD）近似。Heikin Ashi 蜡烛图在规范 OHLC 之上使用以代次为键的引擎展示缓存：帧几何、自动缩放与蜡烛外观可以使用派生值，而 `series_data`、十字光标与交易路径继续暴露原始 OHLC。
 
-Line runs break at period boundaries, not at whitespace (whitespace rows connect, as in the reference). Line, area, and baseline geometry, built-in series and indicator line outputs alike, starts a new run wherever two consecutive drawn rows have different period keys: a series with the host `break_on_trading_day` option keys the exchange trading day; VWAP (typical-price and amount-weighted) and pivot outputs key their trading-day session, and VWAP bands their session/weekly/monthly reset, through `VwapReset::period_key`, the same function over the same `ExchangeTime` trading day the runtime resets on. Keys are derived during frame construction and hit testing, so no break state is stored. An indicator output keys each drawn row's canonical timestamp, the time its runtime resets on; the host option keys the time axis's own bar time, which on a non-time sequence axis is the bar's open time rather than the data layer's row key. Full rebuilds, incremental tail updates, historical corrections, retention trims, and conflated row selections (keys are monotonic in time) break identically, and an exchange-time change, which invalidates every layer, moves them. Each run emits its own stroke, color runs, area fill (keeping its slice of the unbroken gradient), baseline quadrant runs, and Bollinger band fill; a run of one visible row draws the reference's one-bar horizontal segment, while a lone edge neighbour beyond the pane draws nothing (its real segments are off-screen). On bars of a day or longer every bar is its own period, so a plain stroke (the only arm an indicator output reaches) gathers its consecutive lone runs into one `Prim::Segments` per stretch instead of one two-point `Polyline` per bar (dashes are expanded into one pair per dash, the pattern restarting per bar); the batch flushes before any other primitive of the series, so primitive order stays exactly the run order. Per-point-color, area, and baseline strokes keep their two-point polylines. Hit testing evaluates each run alone, so the omitted connector is not hittable. The breaks are ordinary ordered primitives, identical on every executor, and a series without a period keeps its single-run geometry primitive for primitive.
+折线连续段在周期边界处断开，而不是在空白数据处断开（空白数据行会连接，与参考实现一致）。折线、面积与基线几何（内置系列与指标线输出同样如此）在任意两个相邻已绘制行的周期键不同处开启新的连续段：带有宿主 `break_on_trading_day` 选项的系列以交易所交易日为键；VWAP（典型价格与成交额加权）与枢轴点输出以其交易日的交易时段为键，VWAP 带则以其交易时段/每周/每月重置为键，均通过 `VwapReset::period_key`，即运行时用于重置的、基于同一 `ExchangeTime` 交易日的同一个函数。键在帧构建与命中测试期间派生，因此不存储任何断开状态。指标输出以每个已绘制行的规范时间戳为键，即其运行时重置所依据的时间；宿主选项以时间轴自身的柱时间为键，在非时间的序列轴上，该时间是柱的开盘时间，而不是数据层的行键。完整重建、增量尾部更新、历史修正、保留裁剪以及合并后的行选择（键随时间单调）以相同方式断开，而交易所时间变更会使每一层失效，并使这些断点随之移动。每个连续段都输出自己的描边、颜色连续段、面积填充（保留其在未断开渐变中的那一段）、基线象限连续段以及布林带填充；仅含一个可见行的连续段会绘制参考实现的单柱水平线段，而位于窗格之外的孤立边缘邻居则不绘制任何内容（其真实线段位于屏幕之外）。在日线及更长周期的柱上，每根柱自成一个周期，因此普通描边（指标输出唯一会走到的分支）会把其连续的孤立连续段汇集为每一段区间一个 `Prim::Segments`，而不是每根柱一个两点 `Polyline`（虚线被展开为每个虚线段一对点，图案在每根柱处重新开始）；该批量会在该系列的任何其他图元之前刷出，因此图元顺序严格保持为连续段的顺序。逐点颜色、面积与基线的描边保留其两点折线。命中测试对每个连续段单独求值，因此被省略的连接线不可命中。这些断点是普通的有序图元，在每个执行器上完全一致；没有周期的系列则逐图元地保持其单连续段几何。
 
-The official advanced-series examples are engine-owned feature series, not browser drawing callbacks. Each retains its complete validated payload beside an OHLC-shaped canonical projection used by the shared time/price-scale and query machinery. Grouped bars, heatmap, HLC area, pretty histogram, background shade, stacked area/bars, and whisker boxes construct backend-neutral primitives in the same ordered series layer as built-in geometry. Their official defaults, visible-range rules, pixel snapping, autoscale semantics, and source-data lifecycle are therefore identical in browser and native hosts. Brushable Area is deliberately not an advanced-series data type: it is an ordinary built-in Area series plus transient engine-owned range styling, so data ingestion, retention, LOD, hit testing, price-scale ownership, and all ordinary Area APIs remain on the canonical Area path. The legacy browser input name `brushable_area` is only a compatibility alias and normalizes to `area` immediately. Area-like fills share one design token (`market.area_fill_strong_alpha` → `area_fill_faint_alpha`): an unset Area fill, both unset baseline halves, and the brushable range defaults all derive their gradient from their own stroke color at that strength, strong at the series extreme and faint at its base. Brush default styles are engine-owned (`area_brush_defaults`); hosts send only the fields they override plus each range's positive/negative tone. Native hosts compose the whole interaction with one call, `set_brushable_area(series, Some(options))`: the engine attaches the Delta Tooltip, restyles the area from its active range with those defaults after every gesture, clears the range on pane double-click and Escape, and drops the composition when the series stops being an Area series.
+官方高级系列示例是由引擎拥有的特性系列，而不是浏览器绘制回调。每个系列在保留其完整的已验证载荷的同时，还保留一份 OHLC 形态的规范投影，供共享的时间/价格比例尺与查询机制使用。分组柱、热力图、HLC 面积图、美化直方图、背景着色、堆叠面积/柱以及须线箱，在与内置几何相同的有序系列层中构建与后端无关的图元。因此，它们的官方默认值、可见范围规则、像素对齐、自动缩放语义以及源数据生命周期在浏览器与原生宿主中完全一致。可刷选 Area 刻意不是高级系列的数据类型：它是一个普通的内置 Area 系列加上由引擎拥有的临时范围样式，因此数据写入、保留策略、细节层级（LOD）、命中测试、价格比例尺归属以及所有普通 Area API 仍走规范的 Area 路径。旧版浏览器输入名称 `brushable_area` 仅是兼容性别名，并会立即规范化为 `area`。类 Area 填充共用一个设计令牌（`market.area_fill_strong_alpha` → `area_fill_faint_alpha`）：未设置的 Area 填充、两个未设置的基线半区，以及可刷选范围的默认值，都按该强度从各自的描边颜色派生渐变，在系列极值处为强、在其基底处为弱。刷选默认样式由引擎拥有（`area_brush_defaults`）；宿主只发送其覆盖的字段，以及每个范围的正/负色调。原生宿主通过一次调用 `set_brushable_area(series, Some(options))` 组合出整个交互：引擎挂接 Delta Tooltip，在每次手势之后依据其活动范围用这些默认值重新设置面积样式，在窗格双击与 Escape 时清除范围，并在该系列不再是 Area 系列时撤销该组合。
 
-Professional footprint / numbers-bar data has a chart-level tick-truth owner described in
-`Footprint.md`. `ChartEngine::add_trade_stream` retains one bounded keyed canonical microsecond tape;
-footprints, CVD, delta and volume histograms, and bounded large-trade bubble markers hold dependent
-handles, not provider-event copies. The stream derives integer tick-grid levels, bid/ask/unknown/total volume, POC,
-final/session delta, delta percentage, running Max/Min Delta, and diagonal stacked imbalances. CVD
-supports session, continuous, and anchored resets, and every dependent carries the stream revision
-through tip, correction, and retention updates. Stream telemetry attributes retained tape capacity
-and dependent rebuild work. The stream is the only writer of its dependents: a trade-bound
-candle/bar and the CVD, delta, and volume studies are source-owned like a footprint, so every host
-data write (install, update, batch, merge, sequenced update, per-point colors, pop) is refused at
-the shared engine layer and reaches wasm, TypeScript, native, and GPUI unchanged. The stream's own
-tip and rebuild paths write through the unguarded `install_series_data_inner` and
-`update_series_bars_sanitized_inner` internals. A series has one engine writer
-(`ChartEngine::series_owner`, computed from the footprint, synthetic, resampling, trade-bar, and
-trade-study registries, so removal never leaves a stale answer), and every attach path
-(`bind_trade_bar_series_to_stream`, `configure_footprint_series`, `configure_resampled_series`
-targets, `configure_synthetic_bar_series`) checks it before mutating anything; without that check
-the unguarded internals would let two writers share one series.
-Time bars align to the stream's `anchor_micros` grid unless the host anchors the stream to
-exchange sessions (`set_trade_stream_sessions`): the stream then owns a `SessionBarGrid` in the
-chart's exchange time (calendar-date flag cleared), so ordinary trade-bound candles open at every
-window open (A-share 60-minute bars at 09:30, 10:30, 13:00, 14:00) and on exchange hours across
-DST. Configuring sessions validates and rebuilds a candidate stream once; a chart exchange-time
-change re-places every session-anchored stream once. Changing a footprint's aggregation
-(`apply_footprint_series_options`) re-aggregates its stream in place, keeping the retained tape
-(hidden prints included), replay clock, retention seed, and session anchoring, re-placed on the new
-interval; bound candles/bars follow it, and a switch onto the sequence axis is refused while
-resampling or synthetic bars share the chart. Excluded prints still feed aggressor
-classification but no bar or session delta. The chart clock also masks time-domain rows after it,
-so a bar opened ahead of the clock by a folded pre-open print appears when the clock reaches its
-open. A volume trade study (`add_trade_volume_series`) projects each derived bar's total volume
-into a `histogram_updown` histogram with the same tip, correction, replay, and retention lifecycle
-as the delta histogram, so hosts need no second volume source for tick-built candles. On time bars
-a large-trade bubble carries the open of the bar holding its print
-(`FootprintAggregator::print_bar_time`: markers snap an off-grid time to the next bar, and folded
-auction or lunch prints are stamped outside their bar) while an id-less marker keeps its print's
-own second as its name; a print the session policy excludes has no bubble. Non-time bubbles sit on
-their bar's row key. Rebuilds and live tips run the same fold, so both place bubbles identically.
-Live tip events update only the active derived bar. The footprint projection advances first and
-writes only the changed bar suffix straight from the stream, also under a `max_points` ceiling;
-trade-bound candles/bars project the same suffix, CVD/delta/volume studies recompute only that
-suffix (CVD resumes a cached running fold that steps exactly like a clean rebuild), and bubble
-markers advance a resumable fold over the newly appended trades only. The fold sizes only new or
-merged bubbles, rescales every retained marker only when the peak bubble volume changes (a
-sliding-window maximum tracks it), and does no work at all when the stream has no bubble
-dependents. Nothing on the tip path clones the retained bars or tape, and a tip's result equals a
-clean rebuild of every dependent, on session-anchored bars too. The tip that crosses a retention
-ceiling (once per hysteresis margin) evicts complete bars from the stream front together with
-exactly the trades they aggregated, counted per bar, and reconstructs nothing. Counting subsumes a
-bar-key cutoff on session-anchored bars: a bar counts the prints it folds, so a folded
-opening-auction print stamped before the bar's open leaves with its bar, and the walk steps over
-excluded prints (which join no bar), evicting those stamped before the first retained bar's first
-print with the evicted history. The tape is a deque, the trade-ID index keeps absolute positions so
-only evicted IDs leave it, replay checkpoints inside the retained suffix are re-addressed, and each
-bubble fold drops only the bubbles made of evicted trades (refolding once only if a merged bubble
-straddled the boundary). Every presentation, including every other footprint bound to the stream,
-then drops exactly the rows keyed before the footprint's first retained row, all of them (the
-footprint's own rows included) in one data-layer transaction, so the timestamp union merges and
-every plot reindexes once however many presentations the stream has. The indicators and
-resampled series reading a trimmed presentation recompute from its retained rows, as after a
-retention trim of that series itself. Beyond work
-proportional to the evicted trades, only that data-layer trim and renumbering the retained bars
-scale with the retained rows; nothing scans the retained tape. The stream carries the evicted bars'
-cumulative delta, and an anchored CVD the base its evicted bars established, so evicting history
-never rewrites retained CVD values. Stream stats expose `dependent_rows_computed`,
-`bar_rows_projected`, `bubble_trades_scanned`, and `bubble_markers_sized` as lifetime work
-counters. Tape replacement, session changes, late-event, correction, and replay-seek paths rebuild
-each dependent once; a bubble refold materializes markers only for the retained bubbles, so it
-never holds more than `max_markers` markers. A late-event or provider-correction batch merges
-atomically into the final canonical tape, validates its final session/bar projection, and reconstructs
-exactly once. Time-bar rows are keyed by bar open (a close-time display label prints their closes without touching the keys), so every tape path (replacement, tip, correction,
-session or aggregation change) rejects a tape on which a session change falls inside one bar
-interval (`ProjectionTimeCollision`) before anything changes. The check covers prints the replay
-clock still hides, so no clock move has to refuse a reveal; a tip checks only its batch against the
-tape's last bar key.
-Each derived bar also carries an engine-owned logical index plus its full-resolution open and close
-microsecond times. `FootprintAggregator::bar_sequence` exposes those bounds without collapsing them
-to whole-second labels, so several non-time bars in one second and long gaps remain distinct.
-Chart-integrated trade-count, volume, and range footprint projections use chart-local row keys plus
-an engine-owned sequence sidecar; axis labels, crosshair lookup, and visible ranges resolve against
-the sidecar's full-resolution open times, never synthetic UTC timestamps. `BarSequenceMapping`
-matches ordered full-resolution bounds and rebases logical anchors across prepend/rebuild operations
-without collapsing duplicate second labels. Ordinary candlestick and OHLC-bar presentations bind
-to that same chart-level stream and consume the aggregator's canonical OHLC bars; stream-identity
-replacement and live batches update footprint, ordinary bars, studies, and bubbles together without
-copying or reclassifying the tape. Bound ordinary bars reject independent retention caps because all
-presentations in a non-time domain must retain the same logical rows. Non-time tip updates
-replace only the affected suffix, also under retention: the sidecar changes in place before the rows,
-so a trim inside the update drains the matching prefix. The shared time sync reads the sidecar's open times in place instead of materializing a
-tick-time column, and extends tick weights incrementally only for a pure tail append. Derived delta studies and trade-bubble markers use the same logical row keys, continuing from the projection's first retained key after a trim, and a footprint, candle/bar, or study bound after a trim installs from that key too. Bubble aggregation windows compare
-the original microsecond trade times; value snapshots and series queries resolve their time labels
-through the same sidecar. Trading executions, host events, and round-trip geometry resolve their
-timestamp anchors through the same index helper. The sidecar is retired when the last live
-non-time footprint, candle/bar, or study dependent leaves the chart,
-preventing stale sequence labels from affecting later time series.
+专业的足迹图 / Numbers Bar 数据拥有一个图表级的 Tick 真值拥有者，详见 `Footprint.md`。`ChartEngine::add_trade_stream` 保留一条有界的、带键的规范微秒成交带；足迹图、CVD、delta 与成交量直方图，以及有界的大额成交气泡标记持有依赖句柄，而不是数据提供方事件的副本。该流派生整数刻度网格价位、买/卖/未知/总成交量、POC、最终/交易时段 delta、delta 百分比、滚动的 Max/Min Delta，以及对角堆叠失衡。CVD 支持交易时段重置、连续重置与锚定重置，并且每个依赖项在尾部更新、修正与保留更新中都携带该流的修订号。流遥测会归属记录所保留的成交带容量与依赖项重建工作。流是其依赖项的唯一写入者：绑定到成交流的蜡烛/柱，以及 CVD、delta 和成交量研究，与足迹图一样由数据源拥有，因此宿主的每一种数据写入（安装、更新、批量、合并、带序列号的更新、逐点颜色、弹出）都在共享的引擎层被拒绝，并且这一行为原样传递到 wasm、TypeScript、原生与 GPUI。流自身的尾部更新与重建路径通过不设防护的内部函数 `install_series_data_inner` 与 `update_series_bars_sanitized_inner` 写入。一个系列只有一个引擎写入者（`ChartEngine::series_owner`，由足迹图、合成、重采样、成交柱与成交研究的注册表计算得出，因此移除操作永远不会留下过期的答案），并且每条挂接路径（`bind_trade_bar_series_to_stream`、`configure_footprint_series`、`configure_resampled_series` 的目标、`configure_synthetic_bar_series`）都会在修改任何内容之前检查它；如果没有这项检查，不设防护的内部函数会让两个写入者共享同一个系列。时间柱对齐到流的 `anchor_micros` 网格，除非宿主将该流锚定到交易所交易时段（`set_trade_stream_sessions`）：此时该流在图表的交易所时间内拥有一个 `SessionBarGrid`（日历日标志已清除），因此普通的成交绑定蜡烛在每个窗口开盘处开启（A 股 60 分钟柱在 09:30、10:30、13:00、14:00），并且跨夏令时（DST）时仍按交易所时段开盘。配置交易时段会验证并重建一次候选流；图表交易所时间的变更会对每个按交易时段锚定的流重新放置一次。更改足迹图的聚合方式（`apply_footprint_series_options`）会就地重新聚合其流，保留所保留的成交带（含被隐藏的成交）、回放时钟、保留种子与交易时段锚定，并在新的周期上重新放置；绑定的蜡烛/柱随之变化，当重采样或合成柱共用该图表时，切换到序列轴会被拒绝。被排除的成交仍参与主动方分类，但不计入任何柱或交易时段 delta。图表时钟也会屏蔽其之后的时间域行，因此，因被折叠的开盘前成交而使开盘时间领先于时钟的柱，会在时钟到达其开盘时间时出现。基于成交的成交量研究（`add_trade_volume_series`）把每根派生柱的总成交量投射到 `histogram_updown` 直方图中，其尾部、修正、回放与保留生命周期与 delta 直方图相同，因此宿主无需为由 Tick 构建的蜡烛提供第二个成交量来源。在时间柱上，大额成交气泡携带包含其成交的那根柱的开盘时间（`FootprintAggregator::print_bar_time`：标记会把不在网格上的时间对齐到下一根柱，被折叠的集合竞价或午休成交的时间戳落在其所属柱之外），而无 ID 的标记以其成交自身所在的秒作为名称；被交易时段策略排除的成交没有气泡。非时间气泡位于其所属柱的行键上。重建与实时尾部运行同一个折叠，因此两者放置气泡的方式完全一致。实时尾部事件只更新活动的派生柱。足迹图投影最先推进，只把发生变化的柱后缀直接从流写入，在存在 `max_points` 上限时同样如此；绑定成交的蜡烛/柱投射相同的后缀，CVD/delta/成交量研究只重新计算该后缀（CVD 从缓存的滚动折叠恢复，其步进方式与干净重建完全一致），气泡标记仅对新追加的成交推进可恢复的折叠。该折叠只为新增或合并的气泡确定尺寸，仅在峰值气泡成交量变化时才重新缩放每个保留的标记（由滑动窗口最大值跟踪它），并且在流没有气泡依赖项时完全不做任何工作。尾部路径上的任何环节都不会克隆保留的柱或成交带，并且在按交易时段锚定的柱上，尾部更新的结果同样等于对每个依赖项做一次干净重建的结果。跨越保留上限的那次尾部更新（每个滞回余量一次）会从流的前端逐出完整的柱，连同它们所聚合的恰好那些成交（按柱计数），并且不重建任何内容。在按交易时段锚定的柱上，计数的方式取代了按柱键截断：一根柱计入其折叠的成交，因此时间戳早于该柱开盘的、被折叠的开盘集合竞价成交会随其所属柱一起离开；遍历会跳过被排除的成交（它们不属于任何柱），并把时间戳早于首根保留柱首笔成交的那些成交随被逐出的历史一并逐出。成交带是一个双端队列，成交 ID 索引保存绝对位置，因此只有被逐出的 ID 会离开索引；位于保留后缀内的回放检查点会被重新寻址；每次气泡折叠只丢弃由被逐出成交构成的气泡（仅当某个合并气泡跨越边界时才重新折叠一次）。随后，每种展示（包括绑定到该流的其他所有足迹图）恰好丢弃键早于该足迹图首个保留行的那些行，所有这些展示（含该足迹图自身的行）在一次数据层事务中完成，因此无论该流有多少种展示，时间戳并集只合并一次，每个 plot 也只重新索引一次。读取被裁剪展示的指标与重采样系列会基于其保留的行重新计算，与该系列自身被保留裁剪后的情形相同。除与被逐出成交成正比的工作之外，只有该数据层裁剪以及对保留柱的重新编号会随保留行数增长；没有任何环节会扫描保留的成交带。流携带被逐出柱的累计 delta，锚定 CVD 则携带其被逐出柱所建立的基值，因此逐出历史绝不会改写保留的 CVD 值。流统计暴露 `dependent_rows_computed`、`bar_rows_projected`、`bubble_trades_scanned` 与 `bubble_markers_sized`，作为生命周期累计的工作计数器。成交带替换、交易时段变更、迟到事件、修正与回放定位路径会对每个依赖项各重建一次；气泡重新折叠只为保留的气泡物化标记，因此它持有的标记数绝不会超过 `max_markers`。迟到事件或数据提供方修正的批量会原子地合并进最终的规范成交带，验证其最终的交易时段/柱投影，并且恰好重建一次。时间柱的行以柱开盘时间为键（收盘时间显示标签会显示它们的收盘时间而不触及键），因此每条成交带路径（替换、尾部更新、修正、交易时段或聚合变更）都会在任何内容改变之前，拒绝交易时段变更落在同一个柱区间内的成交带（`ProjectionTimeCollision`）。该检查涵盖回放时钟仍然隐藏的成交，因此任何时钟移动都不必拒绝一次显现；尾部更新只对照成交带的最后一个柱键检查其自身批量。每根派生柱还携带一个由引擎拥有的逻辑索引，以及其全分辨率的开盘与收盘微秒时间。`FootprintAggregator::bar_sequence` 暴露这些边界，而不会将它们压缩为整秒标签，因此同一秒内的多根非时间柱以及长间隔仍然可以区分。图表集成的成交笔数、成交量与区间足迹图投影使用图表本地行键，外加一个由引擎拥有的序列 sidecar；坐标轴标签、十字光标查找与可见范围均对照 sidecar 的全分辨率开盘时间解析，绝不使用合成的 UTC 时间戳。`BarSequenceMapping` 匹配有序的全分辨率边界，并在前置追加/重建操作之间重新定基逻辑锚点，而不会合并重复的秒标签。普通蜡烛图与 OHLC 柱展示绑定到同一个图表级流，并消费聚合器的规范 OHLC 柱；流标识替换与实时批量会同时更新足迹图、普通柱、研究与气泡，而无需复制成交带或重新对其分类。绑定的普通柱拒绝独立的保留上限，因为非时间域中的所有展示都必须保留相同的逻辑行。非时间尾部更新只替换受影响的后缀，在存在保留策略时同样如此：sidecar 在行之前就地变更，因此更新内部发生的裁剪会排空相应的前缀。共享的时间同步就地读取 sidecar 的开盘时间，而不是物化一个 Tick 时间列，并且仅在纯尾部追加时才增量扩展 Tick 权重。派生的 delta 研究与成交气泡标记使用相同的逻辑行键，在裁剪之后从投影的首个保留键继续；在裁剪之后才绑定的足迹图、蜡烛/柱或研究，同样从该键开始安装。气泡聚合窗口比较原始的微秒成交时间；数值快照与系列查询通过同一个 sidecar 解析其时间标签。交易成交、宿主事件与往返交易几何通过同一个索引辅助函数解析其时间戳锚点。当最后一个仍存活的非时间足迹图、蜡烛/柱或研究依赖项离开图表时，该 sidecar 会被退役，从而防止过期的序列标签影响之后的时间序列。
 
-Level-two depth uses the parallel chart-side projection boundary documented in `Depth.md`.
-`ChartEngine::add_depth_stream` owns one keyed, bounded book per host instrument publication. A
-validated full snapshot establishes sequence and tick-grid identity; incremental updates are
-atomic, and a gap fences all later deltas behind a typed resync request until the host supplies a
-new snapshot. The current bid/ask maps, optional per-level order counts, time-bucketed history,
-host-detected microstructure events, replay tape, and checkpoints have explicit independent caps.
-DOM ladder rows, cumulative curves, imbalance, and time-and-sales are disposable read models over
-the canonical depth or classified trade stream, never additional mutable books or tapes.
+二级深度使用 `Depth.md` 中记载的并行的图表侧投影边界。`ChartEngine::add_depth_stream` 为每个宿主标的发布拥有一个带键的有界订单簿。经过校验的完整快照确立序号与 tick 网格标识；增量更新是原子的，出现间隙时，所有后续增量都会被拦在一个类型化的重新同步请求之后，直至宿主提供新的快照。当前买卖盘映射、可选的逐档订单数、按时间分桶的历史、宿主检测到的微观结构事件、回放成交带与检查点，各自拥有显式且相互独立的上限。DOM 价位梯行、累计曲线、失衡与成交明细都是基于规范深度流或已分类成交流的可丢弃读模型，绝不是额外的可变订单簿或成交带。
 
-Liquidity heatmaps retain immutable 32-column RGBA chunks plus one replaceable one-column live
-edge. Fixed absolute bucket alignment lets history eviction rebuild only affected edge chunks while
-stable image keys preserve executor caches. The ordered frame emits the same `Prim::Image` contract
-to Canvas2D, WebGPU, native, and GPUI, followed by ordinary trade/series geometry and explicitly
-bound, capped microstructure markers. Hosts own provider decoding, recovery, event detection,
-tooltips/panels, and the Terminal's authoritative market book; this engine state is a bounded chart
-projection of those publications. The typed WASM boundary uses parallel numeric arrays, split
-high/low words for exact `u64` sequences, an optional aligned label vector, and decimal strings for
-exact sequence/trade identifiers returned to JavaScript.
+流动性热力图保留不可变的 32 列 RGBA 块，外加一个可替换的单列实时边缘。固定的绝对桶对齐使历史淘汰只需重建受影响的边缘块，而稳定的图像键则使执行器缓存得以保留。有序帧向 Canvas2D、WebGPU、原生和 GPUI 发出相同的 `Prim::Image` 契约，随后是普通的成交/系列几何，以及显式绑定、有上限的微观结构标记。宿主拥有数据提供方解码、恢复、事件检测、提示框/面板，以及 Terminal 的权威市场订单簿；该引擎状态是这些发布内容的有界图表投影。类型化 WASM 边界使用并行数值数组、用于精确 `u64` 序号的高/低字拆分、可选的对齐标签向量，以及用于返回给 JavaScript 的精确序号/成交标识符的十进制字符串。
 
-The chart owns one host-supplied replay clock in microseconds and applies it to every canonical
-trade stream, depth projection, and the ordinary time-domain data layer. Source rows and future
-events remain retained once while series queries, studies, footprint cells, heatmap buckets,
-depth markers, sparse stepped releases, trading
-executions, round trips, and host-event geometry expose only the eligible prefix. A host window
-crossing the clock is clipped; a wholly future window is omitted. The ordered frame draws one
-engine-owned dashed replay cursor in every pane, so Canvas2D, WebGPU, native, and GPUI executors do
-not reconstruct replay state. Non-time dependents use their shared sequence projection rather than
-interpreting logical row keys as UTC seconds; arbitrary independently timed series are not valid on
-that domain.
+图表拥有一个由宿主提供的、以微秒为单位的回放时钟，并将其应用于每个规范成交流、深度投影以及普通的时间域数据层。源行和未来事件仍只保留一份，而系列查询、研究、足迹图单元格、热力图桶、深度标记、稀疏阶梯式发布、交易成交、往返交易和宿主事件几何只暴露符合条件的前缀。跨越时钟的宿主窗口会被裁剪；完全处于未来的窗口则被省略。有序帧在每个窗格中绘制一条由引擎拥有的虚线回放游标，因此 Canvas2D、WebGPU、原生和 GPUI 执行器无需重建回放状态。非时间依赖项使用其共享的序列投影，而不是把逻辑行键解释为 UTC 秒；任意独立计时的系列在该域上无效。
 
-Moving the clock forward applies newly revealed canonical events through the ordinary live path,
-classifying each at reveal time against its canonical predecessor, so an unknown-side trade ingested
-or reconstructed behind the clock uses the same tick rule as a fresh load. Backward trade seeks restore the nearest retained aggregation checkpoint, replay only the reported
-suffix, and produce the same bars as a fresh load to that clock. Checkpoints are recorded every
-1,024 eligible trades and capped at 64 per stream; an older seek starts from the retained tape's
-rebuild seed. Depth uses the same 1,024-event interval and 64-checkpoint cap, restores the nearest
-book snapshot, and replays only the reported suffix; its ladder, studies, heatmap, and marker
-queries all read the replay projection. Retention keeps the checkpoints inside the surviving suffix, re-addressed to it. A seek exposes the new clock's ordinary rows before trade-stream projections reinstall, so their retention ceilings count the rows a clean rebuild counts. An ordinary series' `max_points` likewise counts and evicts only the rows up to the clock, so it holds what a clean load to that clock holds, and a seek trims revealed rows the same way; rows ingested past the clock are pending source truth, retained uncounted until the clock reveals them, so hidden rows never push revealed ones out. A clock move refreshes each indicator from its dependencies' previous visible length (a forward move costs the revealed rows, like a tail append) and rebuilds it after a backward move; a dependency its owner rewrote during the move (a trade-derived or resampled series) already refreshed its bindings. Ingest wholly beyond
-the clock changes only source truth and performs no dependent work; a correction that moves a
-revealed print past the clock hides it and refreshes every dependent. The existing columnar
-`update_typed` path is the bulk ordered bar boundary, while trade batches cross as parallel typed
-arrays and update all stream dependents once. The release `perf_gate` advances a shared
-footprint/candle chart through 6,000 recorded seconds at 100×, builds every frame, and requires
-steady-state retained memory not to grow across complete passes. Its Target D also streams 9,000
-single-trade tips into a retained 250,000-trade footprint with bound candles, CVD, delta, and
-bubbles, requires the work counters to stay within the changed suffix and the new trade with no
-tape reconstruction, and budgets the tip p99 and the slowest (retention-crossing) tip, which must
-run one union merge and one reindex for every presentation. Its report-only Target D2 prints the
-data-layer retention trim across series counts and retained rows.
+时钟前移时，新揭示的规范事件经由普通实时路径应用，并在揭示时依据其规范前驱逐一分类，因此在时钟已经越过的位置写入或重建的主动方未知的成交，与全新加载使用相同的 tick 规则。向后的成交跳转会恢复最近的已保留聚合检查点，仅回放所报告的后缀，并产生与全新加载到该时钟位置相同的柱。检查点每 1,024 笔符合条件的成交记录一次，每个流至多 64 个；更早的跳转则从所保留成交带的重建种子开始。深度使用相同的 1,024 个事件间隔和 64 个检查点上限，恢复最近的订单簿快照，仅回放所报告的后缀；其价位梯、研究、热力图和标记查询都读取回放投影。留存策略会保留位于存活后缀内的检查点，并将其重新寻址到该后缀。跳转会在成交流投影重新安装之前先暴露新时钟下的普通行，因此它们的留存上限所计的行与干净重建所计的行一致。普通系列的 `max_points` 同样只对时钟之前的行计数和淘汰，因此它所持有的与干净加载到该时钟所持有的相同，跳转也以同样方式修剪已揭示的行；在时钟之后写入的行属于待定的源真值，保留但不计数，直到时钟将其揭示，因此被隐藏的行绝不会把已揭示的行挤出。时钟移动时，每个指标从其依赖项先前的可见长度起刷新（前移的代价是被揭示的行，如同尾部追加），向后移动后则重建指标；其所有者在移动期间已重写过的依赖项（由成交派生或重采样得到的系列）已经刷新过自己的绑定。完全位于时钟之后的写入只改变源真值，不执行任何依赖项工作；把已揭示的成交笔移到时钟之后的更正会将其隐藏，并刷新每个依赖项。现有的列式 `update_typed` 路径是批量有序柱的边界，而成交批量以并行类型化数组的形式跨越边界，并一次性更新所有流依赖项。release 版 `perf_gate` 以 100× 的速度将一个共享的足迹图/K 线图表推进 6,000 个记录秒，构建每一帧，并要求稳态保留内存在完整的各轮次之间不增长。其 Target D 还将 9,000 个单笔成交 tip 流入一个保留 250,000 笔成交的足迹图，其上绑定了 K 线、CVD、delta 和气泡，要求工作计数器保持在变化的后缀与新成交范围内且不重建成交带，并为 tip 的 p99 与最慢（跨越留存界限）的 tip 设定预算，后者必须对每种呈现各执行一次并集合并和一次重新索引。其仅报告的 Target D2 打印不同系列数量与保留行数下的数据层留存修剪。
 
-Renko, Line Break, Kagi, and Point & Figure are engine-owned price-action transforms over one
-canonical host OHLC source. Fixed-box Renko requires a two-box reversal; ATR Renko uses Wilder true
-range and begins only after its configured warm-up; Line Break compares a source close with the
-high/low of the last configured lines; Kagi reverses only by its configured absolute amount; Point
-& Figure uses fixed boxes and a configured reversal count. Ordered tip input updates only the
-active transform state, while current-source replacement rebuilds deterministically and is tested
-against the incremental result. Source and output are each capped at 1,000,000 rows/bars and reject
-overflow atomically. Their output installs through the same full-resolution bar-sequence sidecar as
-trade-count/volume/range charts, so replay, labels, crosshair lookup, drawing rebasing, indicators,
-and every backend share one logical identity. A chart permits only one independent non-time source;
-derived indicators may share it, but another synthetic transform, arbitrary independently timed
-series, or a non-time trade stream must use another chart. Renko and Line Break use canonical candle
-or OHLC-bar geometry, Kagi lowers to shared horizontal/vertical line primitives, and Point & Figure
-lowers bounded X/O text (with a dense-column line fallback), so executors contain no transform math.
-Synthetic market source remains host-owned and is intentionally excluded from chart-state
-persistence, consistent with every financial series definition and market-history payload.
-The configured tick size owns the series min-move/formatter and the shared autoscale, frame, and hit
-paths use complete row bounds (whole `ticks_per_row` rows padded half a tick) on the series' ordinary
-pane-local price scale. Any series may carry a `render_before_time` cutoff: rows at or after it keep
-their data, scale participation, and last-value chrome but are not drawn, so a host can hand a
-price series' tail to a live footprint without a second price model.
-Footprint bars ultimately emit the same ordered `ChartFrame` as every other series, and no backend
-may infer order flow from OHLC or recalculate footprint math.
+Renko、Line Break、Kagi 和 Point & Figure 是由引擎拥有的、基于同一个规范宿主 OHLC 源的价格行为变换。固定砖块 Renko 要求两个砖块的反转；ATR Renko 使用 Wilder 真实波幅，且仅在其配置的预热结束后才开始；Line Break 将源收盘价与最近若干条配置线的最高/最低价比较；Kagi 仅在达到其配置的绝对幅度时反转；Point & Figure 使用固定格子与配置的反转计数。有序的 tip 输入只更新活动的变换状态，而当前源的替换会确定性地重建，并与增量结果对照测试。源与输出各自以 1,000,000 行/柱为上限，溢出时原子地拒绝。其输出通过与成交笔数/成交量/区间图表相同的全分辨率柱序列附带数据安装，因此回放、标签、十字光标查找、绘图重新定基、指标和每个后端共享同一个逻辑标识。一个图表只允许一个独立的非时间源；派生指标可以共享它，但另一个合成变换、任意独立计时的系列或非时间成交流必须使用另一个图表。Renko 与 Line Break 使用规范的 K 线或 OHLC 柱几何，Kagi 转换为共享的水平/垂直线图元，Point & Figure 转换为有界的 X/O 文本（带密集列的线条回退），因此执行器中不含变换数学。合成行情源仍归宿主所有，并有意排除在图表状态持久化之外，这与所有金融系列定义和行情历史载荷一致。所配置的 tick 大小拥有系列的最小变动/格式化器，共享的自动缩放、帧与命中路径在系列的普通窗格本地价格比例尺上使用完整的行边界（完整的 `ticks_per_row` 行，外扩半个 tick）。任何系列都可以携带 `render_before_time` 截止时间：处于或晚于该时间的行保留其数据、对比例尺的参与和最新值界面元素，但不被绘制，因此宿主可以把价格系列的尾部交给实时足迹图，而无需第二个价格模型。足迹柱最终发出与其他所有系列相同的有序 `ChartFrame`，任何后端都不得从 OHLC 推断订单流或重新计算足迹图数学。
 
-OHLCV resampling (`configure_resampled_series`) derives one candlestick/bar target and an optional
-volume histogram from a candlestick/bar source and its volume histogram over ordered, disjoint UTC
-boundaries (at most 32 bindings and 20 000 boundaries; hosts pass their own or derive them with
-`resample_boundaries`). Buckets restart at each boundary, rows outside every boundary are omitted,
-and whitespace rows reserve their bucket without prices (an all-whitespace bucket is a whitespace
-bar). Targets are source-owned, like trade-bound candles and bars, trade studies, and synthetic
-bars: every host write path (install, update, typed batches, and merges) is rejected, and a
-footprint, trade-bound, trade-study, or synthetic series cannot be a target. Resampling buckets UTC
-seconds, so it and a non-time bar sequence (trade-count, volume, or range streams, synthetic bars)
-never share a chart axis; whichever arrives second is rejected. Bars stay open-stamped; the
-chart-level close-time label has one interval, so a resampled target and its source, which share the
-axis, cannot be labelled per series. A
-source or volume mutation reports its first changed row like an indicator change; bars whose bucket
-closes by the last unchanged row's time plus one second are kept, the rest is rebuilt from the first
-affected bucket and reaches the target through the ordinary tail-update path, so a live minute costs
-one bucket of rows, and the scan stops at the last source row rather than visiting boundaries
-configured ahead. With the source's row count unchanged (a tick filling a pre-installed session
-slot), rows after the last priced row before and after the change are whitespace both times, so
-the scan also stops at the bucket holding that row and the reserved whitespace buckets after it
-are kept rather than rebuilt and rewritten. Resampling configuration refuses chained bindings in
-either configuration order (a target may not be another binding's source or output) and a binding
-whose volume source is its own volume target; a reconfigure keeps its source and may name its own
-targets again. A pop, a retention trim of the source head, a tail that loses a bar (backward
-replay), and a complete source replacement rebuild once. Replay-clock moves refresh from the earlier
-cutoff, so a forming bar never aggregates rows after the clock.
-`resample_stats` reports rebuilds, tail refreshes, and rows scanned. Resampling configuration, like
-every series definition, is runtime-only and outside chart-state persistence.
+OHLCV 重采样（`configure_resampled_series`）在有序且互不相交的 UTC 边界上，由一个 K 线/柱源及其成交量直方图派生出一个 K 线/柱目标和一个可选的成交量直方图（至多 32 个绑定和 20 000 个边界；宿主可自行传入，或用 `resample_boundaries` 派生）。桶在每个边界处重新开始，位于所有边界之外的行被省略，空白数据行为其桶保留位置但不带价格（全空白的桶是一个空白柱）。目标由源拥有，与绑定成交的 K 线和柱、成交研究以及合成柱相同：每一条宿主写入路径（安装、更新、类型化批量和合并）都会被拒绝，足迹图、绑定成交、成交研究或合成系列不能作为目标。重采样按 UTC 秒分桶，因此它与非时间柱序列（成交笔数流、成交量流或区间流，合成柱）绝不共用图表坐标轴；后到者被拒绝。柱保持以开盘时间标记；图表级收盘时间标签只有一个周期，因此共用坐标轴的重采样目标与其源不能按系列分别标注。源或成交量的变更像指标变更一样报告其第一个发生变化的行；其桶在最后一个未变化行的时间加一秒之前已收盘的柱会被保留，其余部分从第一个受影响的桶起重建，并通过普通的尾部更新路径到达目标，因此一个实时分钟的代价是一个桶的行，且扫描止于最后一个源行，而不会遍历提前配置的边界。当源的行数不变时（一个 Tick 填充预先安装的交易时段槽位），在变更前和变更后，最后一个有价格的行之后的行两次都是空白数据，因此扫描也止于容纳该行的桶，其后预留的空白桶被保留，而不是被重建和重写。重采样配置会拒绝以任一配置顺序形成的链式绑定（目标不得是另一个绑定的源或输出），也拒绝成交量源就是其自身成交量目标的绑定；重新配置会保留其源，并且可以再次指定其自身的目标。一次弹出、对源头部的留存修剪、丢失一根柱的尾部（向后回放）以及完整的源替换，都只重建一次。回放时钟的移动从较早的截止点开始刷新，因此正在形成的柱绝不会聚合时钟之后的行。`resample_stats` 报告重建次数、尾部刷新次数和已扫描行数。与所有系列定义一样，重采样配置仅存在于运行时，不在图表状态持久化范围内。
 
-The upstream heatmap-around-line and background-shade examples are compositions: the specialized engine series is ordered beneath an ordinary line series rather than duplicating that base-series geometry. Heatmap `cell_shader` callbacks are the one styling boundary in this group; the browser evaluates the callback while normalizing input, and Rust retains the resolved color with each bounded cell so every renderer executes the same prepared frame.
+上游的线周围热力图和背景着色示例属于组合：专用引擎系列按顺序排在普通折线系列之下，而不是重复该基础系列的几何。热力图 `cell_shader` 回调是这一组中唯一的样式边界；浏览器在规范化输入时求值该回调，Rust 则随每个有界单元格保留解析后的颜色，因此每个渲染器执行的都是同一份预备好的帧。
 
-Trading is a first-party engine domain, not a drawing, series, primitive, or plugin. Each chart owns host-supplied typed position, order, group, and execution identities; broker relationships and instrument metadata; semantic trading style; dedicated hit state; and a bounded intent queue. The host remains authoritative for broker state. Pointer movement changes only a chart-local snapped preview. Release emits one broker-neutral typed intent directly, and the chart offers no inline confirmation step of its own: a host that gates modifications runs its own confirmation around the intent before answering it, which keeps that policy where the host's instant-order-placement setting already lives. The chart also APPLIES the change as it emits — a closed order or position leaves the chart, a dragged line stays where it was dropped — and keeps only a rollback, so rejecting the intent restores the object exactly as it was. Nothing is parked in a pending tint waiting on an answer, because closing means the object is gone and moving means it has moved. Confirmed objects change only through a subsequent host snapshot or incremental update. Accepted previews remain visibly dotted and pending until that authoritative update arrives; rejected or discarded previews disappear without mutating the confirmed object. Trading state, previews, intents, and executions are runtime-only and never enter drawing persistence.
+交易是引擎自有的领域，而不是绘图、系列、图元或插件。每个图表拥有宿主提供的类型化持仓、订单、分组和成交标识；券商关系与标的元数据；语义化交易样式；专用命中状态；以及有界意图队列。宿主仍是券商状态的权威来源。指针移动只改变图表本地的、已吸附的预览。指针松开会直接发出一个与券商无关的类型化意图，图表自身不提供内联确认步骤：对修改设置门控的宿主会在回应该意图之前围绕它运行自己的确认流程，使该策略保留在宿主的即时下单设置原本所在之处。图表在发出意图的同时也会应用该变更——关闭的订单或持仓会离开图表，被拖动的线停留在放下的位置——并且只保留一份回滚信息，因此拒绝该意图会将对象精确恢复原状。不会有任何东西停放在“待定”着色状态中等待回应，因为关闭意味着对象已消失，移动意味着对象已移动。已确认对象只会通过后续的宿主快照或增量更新而改变。已接受的预览在该权威更新到达之前保持可见的点状和待定状态；被拒绝或丢弃的预览会消失，且不会改动已确认对象。交易状态、预览、意图和成交仅存在于运行时，绝不进入绘图持久化。
 
-The trading contract is explicitly multi-account and host-authoritative: every runtime object may carry a bounded validated account ID, and one engine-owned visible-account filter gates both rendering and hit-testing without removing hidden objects from the snapshot. Host annotations on positions and orders are capped, validated atomically, and rendered as shared chip geometry with deterministic overflow; their tone and tooltip are presentation metadata only. Trailing and break-even trigger lines use host-supplied prices, while price-bearing intents also carry an exact integer tick index when instrument tick metadata permits it. Execution markers resolve each fill to the bar that contains its time (the last bar opening at or before it, shared with host events and the comparison anchor), and every visible fill of one side on one bar shares one mark placed outside what the scale's primary series (`primary_series_on_price_scale`) paints there, so overlays on the same scale such as host studies or compare lines never displace it: buys below the bar's rendered low, sells above its rendered high, using the Heikin-Ashi wick when shown, the column top for histograms, and for line, area, and baseline series the stroked line across the mark's full width (its slope toward each neighbor, or a stepped line's riser, padded by half the line width), so a mark never floats off the series or touches its line. One engine layout (`trading_execution_layout`, bounded to visible bars) feeds both the frame and hit testing; hovering or pressing a mark draws a tick at every fill's exact price on the bar, a dotted lead, and a fill tooltip on the mark's outer side. The default mark is an open `Polyline` stroke in its own themable `execution_buy`/`execution_sell` colors, kept apart from the green/red order chrome: one fill draws a shaft with one chevron, and each further fill on one side of one bar stacks one identical tailless chevron nearer the bar (at most five), so the mark counts the fills, only the outermost (newest) chevron keeps the shaft, and the hit box and outward placement follow that height. Hovering over a mark answers with the pointer cursor. Exact-fill ticks mark the true fill price on every series type, even where a line-type series draws nothing at that price. Marks also accept circle/triangle and quantity sizing. Bounded host round trips add outcome-colored connectors and labels. Host event markers and risk windows use a separate transient overlay layer with bounded IDs, deterministic pixel-column LOD collapse, and dedicated host hit results; they never enter drawings, undo history, or persistence. Linked charts use semantic crosshair and visible-time-range events carrying source and monotonic revision; external application resolves values against local data without re-emitting, preventing echo loops. A crosshair event carries the pane picked from the chart-content `y` and a price on that pane's default scale (a series on another scale, or on another percentage/indexed base, is re-expressed from the crosshair `y`), and applying it converts on the same scale and holds the line inside the requested pane.
+交易契约明确是多账户且以宿主为权威的：每个运行时对象都可以携带一个有界且经过校验的账户 ID，由引擎拥有的一个可见账户过滤器同时控制渲染和命中测试，而不会把被隐藏的对象从快照中移除。持仓与订单上的宿主标注有上限、原子地校验，并渲染为带确定性溢出处理的共享徽标几何；其色调和提示框仅是呈现元数据。追踪止损与保本触发线使用宿主提供的价格，而携带价格的意图在标的 tick 元数据允许时，还会携带精确的整数 tick 索引。成交标记将每笔成交解析到包含其时间的柱（即开盘时间不晚于该时间的最后一根柱，与宿主事件和对比锚点共用该规则），同一根柱上同一方向的所有可见成交共用一个标记，该标记被放置在该比例尺的主系列（`primary_series_on_price_scale`）在此处所绘内容之外，因此同一比例尺上的叠加层（例如宿主研究或对比线）绝不会将其挤开：买入标记位于柱的渲染最低价之下，卖出标记位于其渲染最高价之上，显示 Heikin-Ashi 时使用其影线，直方图使用柱形顶部，折线、面积和基线系列则使用横跨标记全宽的描边线（其朝向每个相邻点的斜率，或阶梯线的竖直段，外扩半个线宽），因此标记绝不会脱离系列悬空，也不会碰到其线。一个引擎布局（`trading_execution_layout`，以可见柱为界）同时为帧和命中测试提供数据；悬停或按下标记会在该柱上每笔成交的精确价格处绘制刻度线、一条点状引线，并在标记外侧显示成交提示框。默认标记是一个开口的 `Polyline` 描边，使用其自有的、可主题化的 `execution_buy`/`execution_sell` 颜色，与绿/红订单界面元素区分开：一笔成交绘制一根杆和一个 V 形箭头，同一根柱同一方向的每多一笔成交，就在更靠近柱的位置叠加一个相同的无杆 V 形箭头（至多五个），因此标记会为成交计数，只有最外侧（最新）的 V 形箭头保留杆，命中框和向外的放置位置随该高度而定。悬停在标记上会得到 pointer 光标。精确成交刻度线在每种系列类型上都标出真实成交价格，即使折线类系列在该价格处没有绘制任何内容。标记还支持圆形/三角形以及按数量确定大小。有界的宿主往返交易会添加按结果着色的连接线与标签。宿主事件标记与风险窗口使用独立的瞬态叠加层，具有有界 ID、确定性的像素列细节层级（LOD）折叠和专用的宿主命中结果；它们绝不进入绘图、撤销历史或持久化。联动图表使用语义化的十字光标与可见时间范围事件，事件携带来源和单调递增的修订号；外部应用会依据本地数据解析数值，且不再重新发出事件，从而避免回声循环。十字光标事件携带根据图表内容 `y` 坐标拾取的窗格，以及该窗格默认比例尺上的价格（位于另一比例尺或另一百分比/指数化基准上的系列，则根据十字光标 `y` 重新表达），应用该事件时在同一比例尺上换算，并把该线保持在所请求的窗格之内。
 
-Price alerts use the same host-authoritative boundary. The engine retains at most 4,096 typed alert-line indicators and paints them through the canonical pane/axis frame; it does not evaluate conditions, persist alerts, enforce account limits, run background timers, or deliver notifications. An alert line's price tag always shows its formatted price, exactly like every other axis tag; an optional host label remains metadata and never replaces that price. What names the line visually is a badge chip attached to the tag's pane-facing edge, carrying a bell drawn from prims rather than a font glyph, rounded on its outer edge and square against the tag so the pair reads as one control. Active alert chrome derives from the theme-aware muted-text token rather than the primary blue accent; triggered and expired states retain warning and darker-neutral colors. The crosshair price label exposes one engine-rendered multipurpose action chip on its primary price scale: an attached button, rounded on its outer edge and square against the tag with no radius on the tag side, carrying the original circular-plus SVG from `packages/charts/src/assets/icons/add.svg`. Its alpha masks for integer sizes 1 through 96 are generated by the pinned browser rasterizer (`node examples/web_demo/build_crosshair_icon.mjs`, with `--check` for verification) and embedded in `aeris_charts_render` as a bounded run-length asset. Each engine retains only the current size as immutable RGBA pixels; an axis frame shares those pixels and the shared converter emits an integer-aligned image primitive for every backend, including workers. Font/DPR changes select the matching mask; device recovery reuses the retained image. No runtime SVG parser or renderer-specific icon shape is involved. The chip stays visible whenever the crosshair is; hovering it lifts the fill a step with no blue fill. Activating that exact hit zone emits a bounded chart-level action request carrying pane, scale, and price; the browser package forwards it to host subscribers so the host can offer alert, limit-order, horizontal-line, or other context-appropriate actions. The request does not choose an action or carry alert defaults. Alert metadata represents the regular-price `crossing`, directional crossing, greater/less operators and the `only_once`/`every_time` frequencies, plus interval-dependent per-bar, bar-close, and per-minute frequencies. These values are display/configuration metadata only until the host returns an authoritative line snapshot or update. Alert lines and pending action requests are runtime-only and never enter chart persistence.
+价格警报使用同样以宿主为权威的边界。引擎至多保留 4,096 个类型化的警报线指示器，并通过规范的窗格/坐标轴帧绘制它们；它不会评估条件、持久化警报、强制执行账户限额、运行后台定时器或发送通知。警报线的价格标签始终显示其格式化后的价格，与其他所有坐标轴标签完全一致；可选的宿主标签仍是元数据，绝不会取代该价格。在视觉上为该线命名的是一个附着在标签朝向窗格一侧边缘的徽标，其上带有一个由图元绘制而非字体字形的铃铛，外侧边缘为圆角，与标签相接处为方角，使二者看起来是同一个控件。活动警报的界面元素源自随主题变化的弱化文本令牌，而不是主蓝色强调色；已触发和已过期状态保留警告色和更深的中性色。十字光标价格标签在其主价格比例尺上提供一个由引擎渲染的多用途操作徽标：它是一个附着的按钮，外侧边缘为圆角，与标签相接处为方角，标签一侧无圆角半径，带有来自 `packages/charts/src/assets/icons/add.svg` 的原始圆形加号 SVG。其整数尺寸 1 至 96 的 alpha 蒙版由固定版本的浏览器光栅化器生成（`node examples/web_demo/build_crosshair_icon.mjs`，用 `--check` 进行验证），并作为有界的游程编码资源嵌入 `aeris_charts_render`。每个引擎只保留当前尺寸的不可变 RGBA 像素；坐标轴帧共享这些像素，共享转换器为每个后端（包括 worker）发出整数对齐的图像图元。字体/DPR 变化会选择匹配的蒙版；设备恢复会复用已保留的图像。运行时不涉及 SVG 解析器，也不涉及特定渲染器的图标形状。只要十字光标可见，该徽标就保持可见；悬停时填充抬升一级，且不使用蓝色填充。激活该精确命中区域会发出一个有界的图表级操作请求，携带窗格、比例尺和价格；浏览器包将其转发给宿主订阅者，使宿主可以提供警报、限价单、水平线或其他适合当前上下文的操作。该请求既不选择操作，也不携带警报默认值。警报元数据表示常规价格的 `crossing`、方向性穿越、大于/小于运算符以及 `only_once`/`every_time` 频率，外加取决于周期的逐柱、柱收盘和逐分钟频率。在宿主返回权威的线快照或更新之前，这些值仅是显示/配置元数据。警报线和待处理的操作请求仅存在于运行时，绝不进入图表持久化。
 
-Official primitives with chart semantics are likewise retained by the engine. Series primitives follow the source across panes and own their bounded data, hit state, autoscale contribution, and pane/axis views; pane-only primitives retain a stable `PaneId`. Delta Tooltip is a non-candlestick interaction: the engine rejects attachment to candlestick series and removes an attached Delta Tooltip if a convertible built-in series later becomes candlesticks, while the ordinary Tooltip remains available for candle inspection. The ordinary Tooltip snapshot is a structured bar inspector rather than a one-value DOM guess: Rust resolves the exact hovered source row and returns its retained Open/High/Low/Close for candlestick, bar, area, line, baseline, histogram, and other ordinary presentations. Scalar host rows already normalize the same value through all four canonical columns, so scalar area/line data has coherent OHLC while an area/line presentation over retained OHLC can inspect the complete bar even though it paints Close. Optional volume is explicitly host-associated through a timestamp-aligned `volume_series`; the engine never guesses which independent histogram means volume. Tooltip chrome reads the chart's resolved surface, foreground, muted text, border, and font at the browser boundary so light/dark theme changes cannot drift from the chart. Brushable Area composes an ordinary Area series with Delta Tooltip and transient `SeriesEntry.area_brush` presentation state. While that helper is attached, primary mouse/pen pane-drag belongs to the comparison gesture instead of starting a competing canvas pan; price/time-axis drags and manual scale unlocks remain the ordinary Area behavior, and the helper never globally changes `handle_scroll`, `handle_scale`, or chart crosshair options. One-finger touch can still pan normally, while the Delta Tooltip's existing two-point touch interaction remains available. Delta Tooltip owns its own comparison guides, and clearing/detaching the interaction simply drops the transient brush state so the untouched Area renderer is restored. Setting or clearing brush state invalidates only that series' retained geometry; it does not advance the series-store revision, so a drag step never rebuilds layout, autoscale, grid, axes, drawings, overlays, or other series. A browser may decode an image or evaluate a user-supplied color/format callback at the platform boundary, but it sends the bounded result back to Rust. The engine stores image watermarks as RGBA8 `RasterImage` values and emits one shared `Image` primitive; Canvas2D, WebGPU, GPUI, and native executors only upload/cache and paint that prepared image. The image contract snaps each destination edge to a device pixel and requests bilinear sampling; ordinary text keeps its separate nearest/rotated sampling rules. Canvas2D requests low-quality smoothing because the HTML standard leaves the exact smoothing algorithm to the browser. WebGPU clamps its image-atlas sampling to the image slot and uploads premultiplied colors. GPUI pads its cached image with repeated edge pixels to prevent its fixed sprite sampler from reading neighboring tiles. GPUI's public image call accepts only byte alpha, so opacity is quantized at cache insertion; the scaled-image pixel gate allows at most one channel value of resulting rounding difference.
+具有图表语义的官方图元同样由引擎保留。系列图元跟随源跨窗格移动，并拥有其有界数据、命中状态、自动缩放贡献以及窗格/坐标轴视图；仅窗格图元保留稳定的 `PaneId`。Delta Tooltip 是非 K 线的交互：引擎拒绝将其附加到 K 线系列，并且当可转换的内置系列后来变为 K 线时，会移除已附加的 Delta Tooltip，而普通 Tooltip 仍可用于检视 K 线。普通 Tooltip 快照是结构化的柱检视器，而不是对单一数值的 DOM 猜测：Rust 解析被悬停的精确源行，并为 K 线、柱状、面积、折线、基线、直方图及其他普通呈现返回其保留的 Open/High/Low/Close。标量宿主行已经把同一个值规范化到全部四个规范列，因此标量面积/折线数据具有一致的 OHLC，而基于保留 OHLC 的面积/折线呈现即使只绘制 Close，也能检视完整的柱。可选的成交量通过时间戳对齐的 `volume_series` 显式地由宿主关联；引擎绝不猜测哪个独立直方图代表成交量。Tooltip 界面元素在浏览器边界读取图表已解析的表面色、前景色、弱化文本、边框和字体，使亮/暗主题切换不会与图表脱节。Brushable Area 将普通 Area 系列与 Delta Tooltip 以及瞬态的 `SeriesEntry.area_brush` 呈现状态组合在一起。该辅助工具附加期间，鼠标/触控笔的主键窗格拖动归比较手势所有，而不会启动与之竞争的画布平移；价格/时间轴拖动和手动比例尺解锁仍保持普通 Area 的行为，且该辅助工具绝不会全局更改 `handle_scroll`、`handle_scale` 或图表十字光标选项。单指触摸仍可正常平移，而 Delta Tooltip 现有的双点触摸交互仍然可用。Delta Tooltip 拥有自己的比较参考线，清除/分离该交互只会丢弃瞬态刷选状态，从而恢复未被改动的 Area 渲染器。设置或清除刷选状态只会使该系列已保留的几何失效；它不会推进系列存储的修订号，因此一次拖动步骤绝不会重建布局、自动缩放、网格、坐标轴、绘图、叠加层或其他系列。浏览器可以在平台边界解码图像或求值用户提供的颜色/格式回调，但它会把有界的结果送回 Rust。引擎把图像水印存储为 RGBA8 `RasterImage` 值，并发出一个共享的 `Image` 图元；Canvas2D、WebGPU、GPUI 和原生执行器只负责上传/缓存并绘制该预备好的图像。图像契约把每条目标边缘对齐到设备像素，并请求双线性采样；普通文本保持其独立的最近邻/旋转采样规则。Canvas2D 请求低质量平滑，因为 HTML 标准把具体的平滑算法留给浏览器决定。WebGPU 把其图像图集采样限制在图像槽位内，并上传预乘颜色。GPUI 用重复的边缘像素填充其缓存图像，以防止其固定的精灵采样器读取相邻图块。GPUI 的公开图像调用只接受字节 alpha，因此不透明度在缓存插入时被量化；缩放图像的像素门禁至多允许由此产生一个通道值的舍入差异。
 
-Session highlighting evaluates its optional fractional-hour gate and weekend test in exchange wall-clock time. Its callback records are merged at the tail: a live update sends only appended rows, the engine drops records for rows that retention evicted from the source's head, and it accepts the merge only while the record count and both endpoints still align with the source, otherwise the host re-sends the full aligned set once. The candle-close countdown shows only while the host clock lies inside the last bar's interval (for calendar-date bars, the exchange trading days of its date, or its calendar months for monthly and longer bars) and hides outside it; hosts supply the clock, and the engine never reads one.
+交易时段高亮在交易所挂钟时间中评估其可选的小数小时门控和周末判断。其回调记录在尾部合并：实时更新只发送追加的行，引擎会丢弃那些已被留存策略从源头部淘汰的行所对应的记录，并且仅当记录数和两个端点仍与源对齐时才接受该合并，否则宿主需重新发送一次完整的对齐集合。K 线收盘倒计时仅在宿主时钟位于最后一根柱的时间区间内时显示（对于日历日期柱，是其日期对应的交易所交易日；对于月线及更长周期的柱，则是其日历月），超出该区间则隐藏；时钟由宿主提供，引擎绝不自行读取时钟。
 
-An indicator binding keeps its public definition, compact private runtime, and ordinary canonical output series separate. Its runtime covers the source through the data end (one past the last real row, kept at least as far as the previous rebuild's), so trailing whitespace rows such as pre-installed session slots are neither evaluated nor rewritten: their outputs stay whitespace, recursive states resume from the retained tail state when the forming slot fills or changes, and `DataLayer::update_single_aligned_within` writes only the changed rows of an aligned output, so filling or revising a slot costs the window like an append. Sparse runtime checkpoints are tied to source row positions and to the source and optional volume/turnover-series generations. Volume and turnover columns pair with source rows by timestamp, so a change to one of them resumes at the first source row after its last unchanged timestamp rather than at its own row index. A tail mutation advances only bindings that depend on that source and installs only changed output rows; a historical mutation resumes from the nearest valid checkpoint and replaces the affected output suffix, while truncation or complete replacement performs a clean rebuild. The five-output EMA ribbon is one binding with one independently checkpointed recursive EMA state per configured period. Its atomic period update retains all output identities and presentation, rebuilds the five value columns once, and propagates the resulting changes through dependent indicators. Removed source/output series drop the binding and its runtime state together. VWAP bands use the same sparse checkpoint boundary for weighted basis, population deviation, and percentage bands, with an engine-owned session/weekly/monthly reset key derived from the chart's exchange trading day. A VWAP binding may also carry a timestamp-aligned turnover (amount) series; it then reports the 分时 average price `sum(amount) / sum(volume)` over the same reset key, skipping rows without positive volume or finite turnover. Convention presets are expanded into explicit `IndicatorKind` parameters at the host boundary, so bindings, metadata, and persistence never hold a preset name.
+指标绑定把其公开定义、紧凑的私有运行时和普通规范输出系列彼此分离。其运行时覆盖源直至数据末端（最后一个真实行之后一位，且至少保持到上一次重建的数据末端），因此尾部的空白数据行（例如预先安装的交易时段槽位）既不会被评估也不会被重写：它们的输出保持空白，递归状态在正在形成的槽位被填充或变化时从保留的尾部状态恢复，而 `DataLayer::update_single_aligned_within` 只写入对齐输出中发生变化的行，因此填充或修订一个槽位的代价如同追加，只是一个窗口的代价。稀疏的运行时检查点与源行位置以及源和可选成交量/成交额系列的代次绑定。成交量与成交额列按时间戳与源行配对，因此其中一列的变化会从其最后一个未变化时间戳之后的第一个源行恢复，而不是从它自己的行索引恢复。尾部变更只推进依赖该源的绑定，并只安装发生变化的输出行；历史变更从最近的有效检查点恢复并替换受影响的输出后缀，而截断或完整替换则执行干净重建。五输出的 EMA 彩带是一个绑定，每个配置的周期各有一个独立设置检查点的递归 EMA 状态。其原子的周期更新保留所有输出标识和呈现，只重建一次五个数值列，并将由此产生的变化传播到依赖的指标。被移除的源/输出系列会同时丢弃该绑定及其运行时状态。VWAP 带对加权基准、总体偏差和百分比带使用相同的稀疏检查点边界，并使用由图表的交易所交易日派生、由引擎拥有的交易时段/每周/每月重置键。VWAP 绑定还可以携带时间戳对齐的成交额（amount）系列；此时它会在相同的重置键上报告分时均价 `sum(amount) / sum(volume)`，并跳过没有正成交量或有限成交额的行。约定预设在宿主边界处被展开为显式的 `IndicatorKind` 参数，因此绑定、元数据和持久化绝不保存预设名称。
 
-KLineChart bindings (`IndicatorKind::KLineChart`, persisted as `{"kind": "klinechart", "indicator": ...}`) reuse the same binding, alias, persistence, and schema paths. Their presentation is engine-owned: 1px lines in KLineChart's five-color palette, `VOL`/`MACD`/`AO` columns as histograms and `SAR` as marker-only dots with per-row colors recomputed for the rows the runtime rewrote (never the whitespace slots a pre-installed session keeps after its data end), price templates on the source pane and every other template in its own oscillator pane, and no price-axis value labels. KLineChart outlines rising MACD and AO columns; Aeris histograms have no outline style, so those columns are filled at a lighter alpha instead. `VOL`, `OBV`, `PVT`, `EMV`, and `VR` require a distinct scalar volume series (missing timestamps use KLineChart's own default, 1 for PVT and 0 otherwise); `AVP` reads turnover as the value of a scalar source series and volume from its volume series. Browser hosts create them through the package's `add_klinechart_indicator`, which sends the typed definition through the same generic `add_indicator` WebAssembly entry as the other studies and keeps no copy of the template list: the template name, defaults, formulas, validation of parameters and sources, and presentation all stay in the engine, which rejects an invalid or unknown definition with no outputs (surfaced as `invalid_options`). The package's `indicator_kind` includes the `klinechart_*` kinds and `indicator_info().parameters.klinechart` returns the definition.
+KLineChart 绑定（`IndicatorKind::KLineChart`，持久化为 `{"kind": "klinechart", "indicator": ...}`）复用同一套绑定、别名、持久化与 schema 路径。其呈现由引擎拥有：采用 KLineChart 五色调色板的 1px 线条，`VOL`/`MACD`/`AO` 的柱体以直方图呈现，`SAR` 以仅含标记的圆点呈现，并对运行时重写的行重新计算逐行颜色（绝不涉及预先安装的交易时段在其数据末尾之后保留的空白数据槽位），价格类模板位于源窗格，其余每个模板位于各自的振荡器窗格，且不显示价格轴数值标签。KLineChart 会为上涨的 MACD 与 AO 柱体描边；Aeris 直方图没有描边样式，因此这些柱体改为以较浅的 alpha 填充。`VOL`、`OBV`、`PVT`、`EMV` 与 `VR` 需要一个独立的标量成交量系列（缺失的时间戳使用 KLineChart 自身的默认值，PVT 为 1，其余为 0）；`AVP` 将成交额读取为某个标量源系列的值，并从其成交量系列读取成交量。浏览器宿主通过包中的 `add_klinechart_indicator` 创建它们；该函数通过与其他研究相同的通用 `add_indicator` WebAssembly 入口发送类型化定义，且不保留模板列表的副本：模板名称、默认值、公式、参数与源的校验以及呈现全部保留在引擎中，引擎会拒绝无效或未知的定义且不产生任何输出（表现为 `invalid_options`）。包的 `indicator_kind` 包含 `klinechart_*` 种类，`indicator_info().parameters.klinechart` 返回该定义。
 
-Indicator output metadata is additive and binding-complete: the first output's monotonic series identity is the stable binding identity; every output reports the full structured parameters, source, optional VWAP/VWMA volume source and VWAP turnover source, stable output name, index, and count, plus its warm-up and convergence rows measured on the root price source through any chained indicator sources. Native hosts may also enumerate one typed definition per live binding in deterministic creation/dependency order and recreate it through the generic `IndicatorKind` entry point (`add_indicator_kind_with_sources`), remapping source, volume-source, turnover-source, and ordered output identities as they go. This definition snapshot excludes runtime calculation state. Scalar series can also carry renderer-neutral semantic presentation owned by the engine: fixed threshold regions lower into the canonical translucent oscillator channel plus dotted boundary lines, and momentum histograms reuse the canonical four-state market palette while treating whitespace as a reset. Hosts declare those semantics but never receive or retain render primitives or palette logic. The host groups and renders legends from binding metadata; indicator values still come through the ordinary chart value snapshot. Study bindings additionally carry a typed scalar input (`open`, `high`, `low`, `close`, `hl2`, `hlc3`, `ohlc4`, or `hlcc4`) selected at the engine boundary; aggregate inputs never become canonical series: each binding keeps its aggregate column as private runtime state (counted in indicator runtime memory) and re-derives it only from the rebuild's first changed row, so a tick derives one row rather than the history. The aggregate column belongs to one binding and is never shared between bindings. It is sized to its rows plus bounded spare tail capacity (one eighth of the rows plus a fixed floor), so the first append after a bulk install does not reallocate it and later growth stays within that bound; a rebuild from row 0 releases it when its capacity exceeds twice that size, and runtime memory counts its capacity rather than its length. The volume and turnover aligned columns below are outside this capacity policy, and so are the study output columns: their runtime reserves exactly the rows it produces, so the first append past the source after a bulk install still grows each output once (a recorded deferral at that reserve, pending a decision on the spare capacity it would keep per output). Multi-input bindings pair volume and turnover inputs with source rows by exact timestamp rather than row position. While one timeline is a prefix of the other (identical timelines, or a candle and its volume streaming a new bar in either order) the weight column is borrowed as is and only the newly shared rows are compared; a diverging timeline keeps a binding-owned aligned column with the documented fallback for missing timestamps (unit weight for VWAP, VWAP bands and VWMA, zero for OBV, CMF, MFI and volume, no trade for turnover), also re-derived only from the first changed row. `last_indicator_work_rows` sums, per binding, the formula rows and the derived input rows of its latest rebuild. Each output also exposes a compact engine-owned style snapshot (visibility, line, marker, area, and directional colors) and accepts an atomic validated style replacement, so per-output styling survives host persistence without kind-specific reconstruction. WASM hosts can query the same bounded parameter/output schema by indicator kind, so property panels do not duplicate engine definitions.
+指标输出元数据是增量式的，且对绑定而言是完整的：第一个输出的单调系列标识即为稳定的绑定标识；每个输出都报告完整的结构化参数、源、可选的 VWAP/VWMA 成交量源与 VWAP 成交额源、稳定的输出名称、索引与数量，以及其预热行数与收敛行数（这两者均以根价格源为基准度量，并穿过所有链式指标源）。原生宿主还可以按确定性的创建/依赖顺序为每个存活绑定枚举一个类型化定义，并通过通用 `IndicatorKind` 入口（`add_indicator_kind_with_sources`）重建它，同时在此过程中重映射源、成交量源、成交额源及有序输出的标识。该定义快照不包含运行时计算状态。标量系列还可以携带由引擎拥有的、与渲染器无关的语义呈现：固定阈值区域会转换为规范的半透明振荡器通道加点状边界线，动量直方图复用规范的四态市场调色板，并将空白数据视为重置。宿主声明这些语义，但绝不接收或保留渲染图元或调色板逻辑。宿主根据绑定元数据对图例分组并渲染；指标值仍通过普通的图表值快照获得。研究绑定还额外携带一个在引擎边界处选定的类型化标量输入（`open`、`high`、`low`、`close`、`hl2`、`hlc3`、`ohlc4` 或 `hlcc4`）；聚合输入绝不会成为规范系列：每个绑定将其聚合列保存为私有运行时状态（计入指标运行时内存），并且仅从重建的第一个变更行起重新派生，因此一个 Tick 只派生一行，而不是整段历史。聚合列只属于一个绑定，绝不在绑定之间共享。其大小为行数加上有界的尾部备用容量（行数的八分之一再加一个固定下限），因此批量安装后的首次追加不会使其重新分配，之后的增长也保持在该界限内；当其容量超过该大小的两倍时，从第 0 行开始的重建会将其释放，运行时内存统计的是其容量而不是其长度。下文的成交量与成交额对齐列不在该容量策略之内，研究输出列同样如此：它们的运行时恰好为其产生的行数预留空间，因此批量安装后在源之后的首次追加仍会让每个输出各增长一次（这是该预留处已记录的延后事项，待决定每个输出要保留多少备用容量）。多输入绑定按精确时间戳而非行位置，将成交量与成交额输入同源行配对。当一条时间线是另一条的前缀时（时间线相同，或 K 线与其成交量以任一顺序推送一根新柱），权重列按原样借用，仅比较新增的共享行；时间线发生分叉时，则保留由绑定拥有的对齐列，并对缺失时间戳采用文档所述的回退值（VWAP、VWAP 带与 VWMA 为单位权重，OBV、CMF、MFI 与成交量为零，成交额为无成交），该列同样仅从第一个变更行起重新派生。`last_indicator_work_rows` 按绑定汇总其最近一次重建的公式行数与派生输入行数。每个输出还会暴露一个紧凑的、由引擎拥有的样式快照（可见性、线条、标记、面积与方向颜色），并接受经过校验的原子样式替换，因此逐输出的样式可在宿主持久化后保留，而无需按种类专门重建。WASM 宿主可以按指标种类查询同一份有界的参数/输出 schema，因此属性面板无需重复引擎定义。
 
-Drawing anchors, kinds, styles, pane association, stable z-order, and metadata remain the only authoritative committed drawing state (temporary hover/selection/drag/edit promotion never rewrites it). Built-in tool semantics are described by one compile-time engine catalog: stable wire/name identity, placement class, point-count rule, handle policy, movement-axis restriction, grid snapping, straighten behavior, semantic bounds extent, defaults, and platform-edit requests. Trend-line labels resolve their 3×3 left/center/right and top/middle/bottom positions against the actual segment rather than its bounding box; an inline middle label splits the shared stroke around its measured text extent so no backend paints through the glyphs. The catalog includes Long Position and Short Position as single-click preset tools whose committed semantic points are entry, target/width, and stop. Target and stop are normalized to opposite sides of entry, stop shares the origin edge, and editing uses four dedicated controls (target, entry/origin, width, stop) rather than generic anchor behavior. Their one-click presets open asymmetrically at 2:1 reward/risk, with fill-only entry→target profit and entry→stop loss zones, a thin neutral-gray center entry line, target/stop statistic labels, a central P&L/Qty and risk/reward summary, and filled neutral/green/red owning-scale Y-axis price tags. Position run progress is a derived three-state model bounded by the position's horizontal lifetime. Pending positions emit no progress until the first post-placement candle reaches or crosses entry; that candle becomes the progress origin at the exact entry price. While filled and active, the endpoint is the latest in-box candle's Close/current value, so the active reward/risk side follows current position state rather than a historical or current wick extreme. The first candle after fill to touch target or stop completes the run: target-first freezes at the exact target price and stop-first at the exact stop price; a same-candle target+stop touch is conservatively stop-first because OHLC cannot determine intrabar ordering. The stronger opacity covers only the traveled x/y rectangle from first-fill entry to current/terminal price, never the whole TP/SL zone or untouched empty area, and neither overlay nor connector projects beyond the position rectangle. Reward and risk use the same explicit progress-emphasis opacity, stronger than the untouched base-zone opacity, so an SL run is emphasized exactly like a TP run rather than depending on subtle repeated alpha compositing. The connector remains dashed neutral gray. LOD extrema summaries plus prefix binary search keep entry-cross and first-boundary discovery bounded for long-lived positions; an OHLC gap across entry is deterministically treated as a cross and drawn at the semantic entry level because no exact intrabar path is available. The run overlay lowers through pane chrome so series updates do not rebuild retained drawing geometry, and all statistic labels are emitted after it so the dashed trend never paints over their text. The catalog is not a runtime plugin registry; adding a built-in tool extends this deterministic engine-owned definition rather than teaching each host or renderer how the tool behaves. One chart-local `DrawingController` owns the armed tool/template plus pending anchored placement, captured freehand state, and the transient Shift-click measure. Browser and GPUI hosts forward generic press/move/release/activation/finish/cancel actions and retain only platform duties such as pointer capture, event coalescing, editor surfaces, and repaint scheduling; hosts do not branch on concrete drawing kinds to decide creation behavior.
+绘图锚点、种类、样式、窗格关联、稳定的 z-order 与元数据仍是唯一权威的已提交绘图状态（临时的悬停/选择/拖动/编辑提升绝不会改写它）。内置工具语义由一份编译期引擎目录描述：稳定的传输标识与名称标识、放置类别、点数规则、手柄策略、移动轴限制、网格吸附、拉直行为、语义边界范围、默认值以及平台编辑请求。趋势线标签相对于实际线段而非其包围盒解析其 3×3 的左/中/右与上/中/下位置；行内居中标签会围绕其度量出的文本范围拆分共享描边，因此没有后端会穿过字形绘制。该目录包含作为单击预设工具的 Long Position 与 Short Position，其已提交的语义点为入场、目标/宽度与止损。目标与止损被规范化到入场价的相对两侧，止损共用起点边，编辑使用四个专用控件（目标、入场/起点、宽度、止损），而不是通用锚点行为。它们的一键预设以 2:1 的回报/风险比非对称地展开，包含仅填充的入场→目标盈利区与入场→止损亏损区、一条细的中性灰色中心入场线、目标/止损统计标签、居中的 P&L/Qty 与风险/回报摘要，以及填充为中性/绿色/红色、位于所属比例尺 Y 轴上的价格标签。仓位运行进度是一个派生的三态模型，以仓位在水平方向上的存续期为界。待成交仓位在放置后的第一根 K 线触及或穿越入场价之前不产生进度；该 K 线成为进度起点，位于精确的入场价格。在已成交且活动期间，终点为框内最新 K 线的收盘价/当前值，因此活动的回报/风险一侧跟随当前仓位状态，而不是历史或当前的影线极值。成交后第一根触及目标或止损的 K 线完成该运行：先触目标则冻结在精确的目标价，先触止损则冻结在精确的止损价；同一根 K 线同时触及目标与止损时，保守地按先触止损处理，因为 OHLC 无法确定 K 线内部的先后顺序。较强的不透明度只覆盖从首次成交入场到当前/终点价格所经过的 x/y 矩形，绝不覆盖整个 TP/SL 区域或未触及的空白区域，并且叠加层与连接线都不会超出仓位矩形。回报与风险使用同一个显式的进度强调不透明度，强于未触及的基础区域不透明度，因此 SL 运行与 TP 运行得到完全相同的强调，而不依赖细微的重复 alpha 混合。连接线仍为虚线的中性灰色。LOD 极值摘要加前缀二分查找，使长期存续仓位的入场穿越与首次边界触及的发现保持有界；跨越入场价的 OHLC 跳空被确定性地视为一次穿越，并绘制在语义入场价位上，因为没有可用的精确 K 线内部路径。运行叠加层经由窗格 chrome 转换，因此系列更新不会重建保留的绘图几何；所有统计标签都在它之后发出，因此虚线趋势绝不会盖在其文字上方。该目录不是运行时插件注册表；添加内置工具是扩展这份确定性的、由引擎拥有的定义，而不是教每个宿主或渲染器如何处理该工具的行为。每个图表本地的 `DrawingController` 拥有已启用的工具/模板，以及待定的锚点放置、已捕获的手绘状态和临时的 Shift 点击测量。浏览器与 GPUI 宿主转发通用的按下/移动/释放/激活/完成/取消动作，仅保留平台职责，例如指针捕获、事件合并、编辑器界面与重绘调度；宿主不会根据具体的绘图种类分支来决定创建行为。
 
-A chart-local derived runtime maps the existing monotonic `DrawingId` values to conservative logical/price bounds, coordinate-keyed media-space anchor geometry, and pane-local z-ordered candidate lists. Candidate queries first reject drawings in semantic space, then test cached conservative screen bounds; only viewport or pointer candidates rebuild coordinate geometry and reach canonical primitive emission or precise hit testing. Tool anchors resolve into one backend-neutral drawing-geometry vocabulary before either body hit-testing or `Prim` emission, so the interactive body and the rendered body share the same segment/ray/full-line/rectangle/polyline geometry and terminal decorations (core tools through `drawings/geometry.rs`, B8 family tools through the shared part vocabulary described under "Drawing families (B8)"). Frame construction alone lowers that resolved geometry into the shared render IR; Canvas2D, WebGPU, GPUI, and native/headless executors never receive a drawing kind and cannot fork tool semantics. A dashed or dotted core stroke (trend lines, the path, the curved brush) reaches executors as solid dash runs through `push_styled_stroke` (`aeris_charts_render::line`, beside the series lines' `push_line_stroke`): the run is expanded with its line type first, then clipped to the pane grown by the stroke's reach and split, so every executor paints the same dashes from the same runs and a line reaching far past the pane splits only its visible reach; a solid stroke stays one polyline. General-series lines lower their dashes the same way. Full-span horizontal lines, full-height vertical lines, and half-infinite horizontal rays retain explicit unbounded dimensions rather than fake finite extents. The multi-click Path stores two to 100,000 vertices, emits one straight polyline with an open terminal chevron, exposes every vertex for editing, treats the two arrowhead wings as body-movement targets, and commits one history command only when double-click or Enter finishes it; Backspace removes the latest pending vertex and Escape discards the pending path. Brush remains a press-drag freehand placement class: its bounds are computed once on semantic mutation, padded for curved interpolation, and remain conservatively unbounded during an active capture before one exact pointer-up rebuild. Capture decimates pointer samples by distance and leaves the frame untouched when a sample is rejected, so rapid input invalidates the drawings layer only per accepted point. Runtime bounds, resolved geometry, controller state, counters, and index entries are never serialized.
+图表本地的派生运行时将既有的单调 `DrawingId` 值映射到保守的逻辑/价格边界、以坐标为键的媒体空间锚点几何，以及窗格本地按 z-order 排序的候选列表。候选查询先在语义空间中排除绘图，再测试缓存的保守屏幕边界；只有视口或指针候选才会重建坐标几何，并进入规范图元发出或精确命中测试。工具锚点在进行本体命中测试或 `Prim` 发出之前，先解析为一套与后端无关的绘图几何词汇，因此交互本体与渲染本体共享相同的线段/射线/整线/矩形/折线几何与端点装饰（核心工具通过 `drawings/geometry.rs`，B8 族工具通过“绘图族（B8）”一节所述的共享部件词汇）。只有帧构建会将该已解析几何转换为共享渲染 IR；Canvas2D、WebGPU、GPUI 与原生/无头执行器绝不会接收绘图种类，也就无法分叉工具语义。核心的虚线或点线描边（趋势线、路径、曲线画笔）通过 `push_styled_stroke`（`aeris_charts_render::line`，与系列线的 `push_line_stroke` 并列）以实线虚线段的形式到达执行器：虚线段先按其线型展开，再裁剪到按描边延伸范围外扩后的窗格并拆分，因此每个执行器都依据相同的虚线段绘制出相同的虚线，延伸到窗格之外很远的线只会拆分其可见延伸部分；实线描边仍为一条折线。通用系列线以同样的方式转换其虚线。全幅水平线、全高垂直线与半无限水平射线保留显式的无界维度，而不是伪造的有限范围。多次点击的路径存储两个至 100,000 个顶点，发出一条带开放式终端人字箭头的直折线，暴露每个顶点以供编辑，将两个箭头翼视为本体移动目标，并且仅在双击或 Enter 结束它时才提交一条历史命令；Backspace 移除最近一个待定顶点，Escape 丢弃待定路径。画笔仍属于按下拖动的手绘放置类别：其边界在语义变更时计算一次，并为曲线插值留出填充，在活动捕获期间保持保守的无界，直到指针抬起时做一次精确重建。捕获按距离对指针采样进行抽稀，样本被拒绝时帧保持不变，因此快速输入仅按每个被接受的点使绘图层失效。运行时边界、已解析几何、控制器状态、计数器与索引条目绝不序列化。
 
-When a historical insertion, removal, series replacement, or retention trim changes merged logical indices, the engine rebases every drawing-semantic logical snapshot through the data layer's common-timestamp mapping: committed anchors, pending creation anchors and preview, active brush points, active drag start and current snapshots, and both drawing-history stacks. Non-time footprint rebuilds use the bar sequence's full-resolution open/close microsecond identity mapping instead of row keys or truncated seconds, including fractional anchors between bars. Common timestamps map exactly and fractional positions interpolate between them. The core mapping also reports its common extent, whether it is a pure index translation, and the old merged union it was built from. A translation (same-interval prepend, retention trim, or window shift) keeps slope-one bar-count extrapolation outside the common extent so live drawings never jump across session gaps while retention trims stream; the one exception is prepended history, where anchors left of the old data resolve their extrapolated time on the new bars, so an anchor an interval switch placed before a short history keeps its moment when the host pages in more. Otherwise (an interval switch, or a replacement with no common timestamp) every anchor outside the exact extent resolves its time on the old axis onto the new axis (`drawings/time_anchor.rs`). Derived times and logical positions outside the persisted value range are reported as unplaceable, and a pending time that already matches its placeholder keeps that logical bit-exact, so export and import round-trip deterministically. On ordinary time axes an anchor's time identity is derived, not stored: logical `i` sits at merged time `i`, fractional positions interpolate between neighbouring bar times, and positions beyond the data extrapolate with the prevailing bar interval (the most frequent of the last 16 spacings, so session and weekend gaps are never the step). Only an anchor that cannot be placed keeps an explicit pending time on its `Drawing` snapshot: a clear-then-set parks every committed and history anchor's time (cancelling in-flight creation and drag state), and time anchors supplied by the API, a restored document, or a sync/clipboard payload before data exists stay pending until the next time-point change resolves them. A bounded flag skips that walk in steady state, and row keys of non-time bar sequences are never read as times. The transient mapping compresses its common-timestamp breakpoints to slope changes and carries the moved-out old merged union only for the one synchronization in `sync_time_points`; both are dropped there, so no second merged timeline outlives the synchronization boundary. Pixel drag/brush baselines refresh immediately for input continuity and once more after the next frame settles layout and autoscale. This maintenance mutation creates no drawing-history command. Non-time drawings persist an optional bounded anchor-time sidecar (open/close microseconds) alongside their logical/price anchors; legacy documents omit it and retain their existing behavior, while restored sidecars resolve when the host installs the matching sequence. Ordinary time charts persist each anchor's time inline (`{logical, price, time}`), and that time is authoritative on import: it resolves immediately against loaded data or stays pending until the host installs data, so restoring into a shifted history window, another interval, or the grid workspace (which imports before data) lands on the saved moments.
+当历史插入、移除、系列替换或保留裁剪改变了合并后的逻辑索引时，引擎会通过数据层的公共时间戳映射，对每一个绘图语义的逻辑快照做重新定基：已提交的锚点、待定的创建锚点与预览、活动的画笔点、活动拖动的起始与当前快照，以及两个绘图历史栈。非时间足迹图的重建使用柱序列的全分辨率开/收盘微秒标识映射，而不是行键或截断的秒，包括位于柱之间的小数锚点。公共时间戳精确映射，小数位置在它们之间插值。核心映射还会报告其公共范围、它是否为纯索引平移，以及构建它所依据的旧合并并集。平移（同周期前插、保留裁剪或窗口移位）在公共范围之外保持斜率为一的柱数外推，因此在保留裁剪持续流入时，现有的绘图绝不会跨越交易时段间隙跳动；唯一的例外是前插的历史，其中位于旧数据左侧的锚点会在新柱上解析其外推时间，因此周期切换时放在短历史之前的锚点，在宿主分页载入更多数据时会保持其所处时刻。否则（周期切换，或没有任何公共时间戳的替换），每个位于精确范围之外的锚点会将其在旧坐标轴上的时间解析到新坐标轴上（`drawings/time_anchor.rs`）。超出持久化取值范围的派生时间与逻辑位置会被报告为无法放置，而已与其占位值一致的待定时间会使该逻辑值保持逐位精确，因此导出与导入的往返是确定性的。在普通时间轴上，锚点的时间标识是派生的而非存储的：逻辑位置 `i` 位于合并时间 `i`，小数位置在相邻柱时间之间插值，超出数据的位置按主导的柱周期外推（取最近 16 个间距中出现最频繁者，因此交易时段与周末间隙绝不会成为步长）。只有无法放置的锚点才会在其 `Drawing` 快照上保留显式的待定时间：先清空再设置会暂存每个已提交锚点与历史锚点的时间（并取消进行中的创建与拖动状态），而在数据存在之前由 API、恢复的文档或同步/剪贴板负载提供的时间锚点，会保持待定，直到下一次时间点变更将其解析。一个有界标志位在稳态下跳过该遍历，非时间柱序列的行键绝不会被读作时间。临时映射把其公共时间戳断点压缩为斜率变化点，并且仅为 `sync_time_points` 中的那一次同步携带移出的旧合并并集；两者都在那里被丢弃，因此不会有第二条合并时间线存活到同步边界之外。像素拖动/画笔基线会为保持输入连续性而立即刷新，并在下一帧完成布局与自动缩放后再刷新一次。该维护性变更不会创建绘图历史命令。非时间绘图会在其逻辑/价格锚点之外持久化一个可选的、有界的锚点时间附带数据（开/收盘微秒）；旧版文档省略它并保留其既有行为，而恢复出的附带数据会在宿主安装匹配序列时解析。普通时间图表会将每个锚点的时间内联持久化（`{logical, price, time}`），并且该时间在导入时具有权威性：它会立即依据已加载的数据解析，或保持待定直到宿主安装数据，因此恢复到发生偏移的历史窗口、另一个周期或网格工作区（在数据之前导入）时，都会落在已保存的时刻上。
 
-The time-scale view follows the same mappings. Before new points land, the engine maps the view's right border through the transaction's common-timestamp mapping (or, on a non-time axis, the bar-identity mapping) and lands the point count, base index, and right offset atomically, so a scrolled-back view keeps the same bars across out-of-order inserts, gap backfills, prepend-plus-append replacements, and retention trims. An active drag snapshot, kinetic coast, held keyboard pan, and animated scroll shift by the same rebase instead of overwriting it. The reference follow-latest rule is unchanged: while the latest bar is visible and `shift_visible_range_on_new_bar` is on (for a whitespace replacement only with `allow_shift_visible_range_on_whitespace_replacement`), the offset stays relative to the newest bar. A transaction without any common timestamp or bar identity keeps the reference first-time heuristic, compared in data-layer row units on every axis. Non-time retention computes its identity mapping against the rows that survive the cap. `set_visible_logical_range` keeps fractional borders like the reference. The opt-in `lock_visible_logical_range` time-scale option holds the visible logical range exactly across data synchronization and resizes (in-flight drag, coast, and animated motion rebase with it) and applies a range passed to `set_visible_logical_range` without the reference scroll clamps; the reference `maxRightOffset` rule would otherwise shift a full `[0, N - 1]` session one bar left while fewer than two bars have traded. Scroll, zoom, fit, and option mutations still apply their ordinary clamps and become the held range. This is the fixed full-session (intraday time-sharing) view contract; session slots are host-installed whitespace rows, generated with the engine's session-slot function. The base index (the last real bar across the union series) is found through each series' LOD pyramid, so the trailing slots add no work to a tick's time synchronization.
+时间比例尺视图遵循相同的映射。在新数据点落地之前，引擎会通过事务的公共时间戳映射（在非时间轴上则为柱标识映射）映射视图的右边界，并以原子方式落定点数、基准索引与右侧偏移，因此向历史方向滚动的视图在乱序插入、间隙回填、前插加追加的替换以及保留裁剪之间始终保持相同的柱。活动的拖动快照、惯性滑行、按住键盘键的平移与动画滚动，会按同一次重新定基而移位，而不是覆盖它。参考实现的跟随最新规则保持不变：当最新柱可见且 `shift_visible_range_on_new_bar` 开启时（对于空白数据替换，仅当同时开启 `allow_shift_visible_range_on_whitespace_replacement` 时），偏移保持相对于最新柱。没有任何公共时间戳或柱标识的事务保持参考实现的首次启发式规则，在所有坐标轴上均以数据层行为单位比较。非时间保留针对在上限裁剪后幸存的行计算其标识映射。`set_visible_logical_range` 与参考实现一样保留小数边界。可选启用的 `lock_visible_logical_range` 时间比例尺选项会在数据同步与尺寸调整期间精确保持可见逻辑范围（进行中的拖动、滑行与动画运动随之重新定基），并在应用传给 `set_visible_logical_range` 的范围时不使用参考实现的滚动钳制；否则，参考实现的 `maxRightOffset` 规则会在已有成交的柱不足两根时，把完整的 `[0, N - 1]` 交易时段向左移动一根柱。滚动、缩放、适配与选项变更仍应用其常规钳制，并成为被保持的范围。这就是固定的全交易时段（分时）视图契约；交易时段槽位是由宿主安装的空白数据行，由引擎的交易时段槽位函数生成。基准索引（并集系列中最后一根真实柱）通过每个系列的 LOD 金字塔查找，因此尾部槽位不会给一次 Tick 的时间同步增加工作量。
 
-Each chart also owns a bounded runtime-only drawing history of the last 100 committed semantic
-create, delete, anchor, style, and clear operations. Pointer-move samples mutate the active drag
-snapshot without adding commands; pointer-up records one start-to-end update. Undo/redo cancels an
-active drag first, rebuilds only the affected drawing runtime state, a new mutation clears the redo
-branch, and persistence never contains either history stack. A host batch anchor rewrite records one
-`BatchUpdate` command. Every committed history step (an API mutation, an interactive placement
-or freehand stroke, a drag or committed keyboard edit that changed something, a text-edit commit) advances
-the chart's drawing sync revision once (`drawing_revision()` reads it), as undo, redo, and price-basis changes do; a drag that ends
-where it started records nothing and advances nothing. A price-basis rescale (multiplicative
-factors over anchor-time segments, non-time bars dated by their open time, Long/Short Position
-levels on the entry's segment, and tool options measured in price units, such as a Gann fan's or
-fixed square's `scale_ratio`, on the first anchor's segment through the family's
-`rescale_price_options` hook) is a data-basis change like the time rebase: it applies to locked
-drawings, rewrites both history stacks and in-flight creation/drag state in the new basis, records
-no command, and is rejected as a whole when any rescaled price or price-unit option would leave
-its valid range. The chart-level price-basis label is metadata carried by persistence and
-sync/clipboard payloads.
+每个图表还拥有一份有界的、仅存在于运行时的绘图历史，记录最近 100 个已提交的语义创建、删除、锚点、样式与清除操作。指针移动采样会改变活动拖动快照而不增加命令；指针抬起时记录一次从起点到终点的更新。撤销/重做会先取消活动的拖动，仅重建受影响的绘图运行时状态；新的变更会清除重做分支；持久化绝不包含任何一个历史栈。宿主的批量锚点改写会记录一条 `BatchUpdate` 命令。每个已提交的历史步骤（API 变更、交互式放置或手绘笔画、确实改变了内容的拖动或已提交的键盘编辑、文本编辑提交）都会使图表的绘图同步修订号递增一次（可通过 `drawing_revision()` 读取），撤销、重做与价格基准变更也是如此；结束于起点位置的拖动既不记录任何内容，也不递增修订号。价格基准重新缩放（对锚点时间区段施加乘性因子，非时间柱按其开盘时间确定所属时间，Long/Short Position 的价位按入场所在区段处理，而以价格为单位度量的工具选项——例如江恩扇形线或固定正方形的 `scale_ratio`——则通过该族的 `rescale_price_options` 钩子按第一个锚点所在区段处理）与时间重新定基一样，属于数据基准变更：它适用于已锁定的绘图，以新基准重写两个历史栈以及进行中的创建/拖动状态，不记录命令，并且当任何被重新缩放的价格或价格单位选项会超出其有效范围时整体被拒绝。图表级的价格基准标签是由持久化与同步/剪贴板负载携带的元数据。
 
-B2 extends that owner boundary with a versioned typed drawing contract. `drawing_contract.rs`
-defines bounded property descriptors, interval visibility, line caps, magnet modes, labels,
-levels, templates, clipboard payloads (with anchor times and the price-basis label, bounded like a
-persisted drawing document: at most `MAX_DRAWING_OBJECTS` drawings, `MAX_DRAWING_CLIPBOARD_POINTS`
-anchors, and `MAX_DRAWING_CLIPBOARD_BYTES` bytes, the byte bound checked before a paste parses;
-clone stages from the live drawing, so any drawing the chart holds can be cloned), and revisioned
-sync payloads. Magnet snapping resolves one effective mode from the stronger of the drawing's own
-mode and the chart's persistent mode, with the Ctrl/Cmd modifier as a temporary toggle; weak snaps
-only within a fixed vertical CSS-pixel distance, and keyboard nudges start at the focused handle's
-own position and never magnet-snap (a position's levels and width still land on the tick and slot
-grid described with the position tools). The live `Drawing` remains
-the sole source of truth; its common snapshot and discriminated kind-option projection are
-computed views, so a property panel cannot create a second state model. Patches validate all
-bounded contract fields on a clone before installation and record one undo entry per semantic
-change. The shared resolved-geometry path applies line extensions and is consumed by both frame
-emission and hit testing. Hidden or interval-ineligible drawings remain in persistence and the
-object tree but are excluded from rendering and hit testing; locked drawings remain selectable
-but cannot be edited. Selection, clone/copy/paste, z-order, group operations, bulk removal, and
-sync are chart-owned and bounded, with sync IDs/revisions preventing stale or echoed updates.
-Named templates are validated style data rather than host-side drawing copies: a template never
-carries identity (name, group, revision, z-order), placement (price scale), visibility (visible,
-locked, interval visibility), or text content, neither when exported nor when applied (a
-host-written template's such keys are dropped, in either spelling), and a profile template keeps
-the target's own series source. V1/V2 persistence keeps
-these fields optional for lossless migration of existing layouts, while browser/WASM exposes the
-same schema, template, object-tree, and payload operations as the native engine.
+B2 以带版本的类型化绘图契约扩展了该所有权边界。`drawing_contract.rs` 定义了有界的属性描述符、周期可见性、线端帽、磁吸模式、标签、层级、模板、剪贴板负载（携带锚点时间与价格基准标签，其界限与持久化的绘图文档一致：至多 `MAX_DRAWING_OBJECTS` 个绘图、`MAX_DRAWING_CLIPBOARD_POINTS` 个锚点与 `MAX_DRAWING_CLIPBOARD_BYTES` 字节，字节界限在粘贴解析之前检查；克隆从现有的实时绘图暂存，因此图表持有的任何绘图都可以被克隆），以及带修订号的同步负载。磁吸会从绘图自身模式与图表持久模式中取较强者，解析出一个有效模式，并以 Ctrl/Cmd 修饰键作为临时开关；弱磁吸仅在固定的垂直 CSS 像素距离内生效，键盘微调从获得焦点的手柄自身位置开始，并且绝不磁吸（仓位的价位与宽度仍落在仓位工具部分所述的 tick 与槽位网格上）。实时的 `Drawing` 仍是唯一的事实来源；其通用快照与带判别标签的种类选项投影都是计算出的视图，因此属性面板无法创建第二套状态模型。补丁会在安装之前，在克隆体上校验所有有界的契约字段，并为每次语义变更记录一个撤销条目。共享的已解析几何路径会应用线段延伸，并同时被帧发出与命中测试使用。隐藏或不符合周期可见性的绘图仍保留在持久化与对象树中，但被排除在渲染与命中测试之外；锁定的绘图仍可选择，但不能编辑。选择、克隆/复制/粘贴、z-order、分组操作、批量移除与同步均由图表拥有且有界，同步 ID/修订号可防止过期或回显的更新。具名模板是经过校验的样式数据，而不是宿主侧的绘图副本：模板无论在导出时还是应用时，都绝不携带标识（名称、分组、修订号、z-order）、放置（价格比例尺）、可见性（visible、locked、周期可见性）或文本内容（宿主写入的模板中此类键会被丢弃，两种写法均如此），并且分布模板保留目标自身的系列源。V1/V2 持久化保持这些字段为可选，以便无损迁移既有布局；而浏览器/WASM 暴露与原生引擎相同的 schema、模板、对象树与负载操作。
 
-#### Drawing families (B8)
+#### 绘图族（B8）
 
-B8 tools live in drawing families. The core tools (trend, horizontal, and vertical lines, horizontal
-ray, rectangle, text, brush, path, Long/Short Position, and the profile drawings) keep
-`family: None` in their catalog spec and resolve through `drawings/geometry.rs` rather than the
-family part vocabulary; their dashed and dotted strokes lower to solid dash runs through
-`push_styled_stroke`, as described with the drawing-geometry vocabulary above. Each family owns one module, `drawings/kinds/<family>.rs`, holding its tool specs, one
-`static FAMILY: DrawingFamily` hook table that every spec references, its typed option block, and
-its tests (`kinds/<family>/tests.rs`). The hook table is a closed compile-time table, not a plugin
-registry. `DrawingFamily::new` takes the two required hooks, `build_parts` and `kind_options`, and
-starts every optional hook at a neutral default that the family overrides by assignment in its
-`static` initializer: `apply_defaults` (kind defaults applied by `Drawing::new`, so creation,
-templates, restore, paste, and schema defaults agree), `decoration_extent` (conservative CSS-px
-culling pad for boxes and labels beyond the anchors), `extend_schema` (`tool_options.*`
-descriptors appended after the common ones, whose defaults the engine already takes from the
-kind's template drawing), and `owns_labels` (the family renders the common `labels` itself). A
-hook added later gets its default in `DrawingFamily::new`, so the other families compile
-unchanged; a hook more than one family sets, or one the foundation adds for every family, sits
-outside the family blocks. Those shared hooks are `paint_bounds`, `reads_series_data`,
-`partial_preview`, `handles`, `drag`, and `close_placement` (a foundation hook; today only the
-shapes polyline sets it). `paint_bounds` is the
-one family culling hook: a conservative media-px box of everything a drawing paints except text,
-computed from its anchors' media px whenever its coordinate key changes. A tool whose reach is
-screen-derived (pitchfork tines and levels, a circle through its rim anchor, a fixed-size square)
-declares `Full` logical and price extents, so no semantic box culls it, and while its bounds stay
-unbounded in both dimensions this box replaces the whole pane as its screen culling and
-hit-candidate box (`None`, or an extended drawing, keeps the pane). `reads_series_data` marks a
-drawing whose geometry reads series data (a regression's fit, a forecast's outcome): every such
-drawing measures `ChartEngine::drawing_source_series`, the first live ordinary series in creation
-order (the smallest live `SeriesId`; identities are monotonic, storage slots are reused) on its
-pane and price scale (indicator outputs and custom series never qualify, footprint and feature
-series do through their OHLC projection, and neither paint order nor visibility moves it), and
-`invalidate_frame_series` rebuilds the retained drawings layer only when the changed series is
-such a drawing's source (a scan of the drawing list per data mutation; structural source changes
-invalidate the whole scene). These readers work in the source's canonical rows: an as-of
-source's plot points repeat and skip canonical rows, so a regression, a forecast, and a bars
-pattern read each canonical row once, at the first axis point at or after its time (see
-`ChartEngine::drawing_source_window`). `partial_preview` lets a placement preview resolve parts from the second
-anchor on. `handles` and `drag` are the derived-handle foundation: `handles` edits the handle
-set `drawings/handles.rs` builds in media px from the spec's handle mode (moving a handle onto
-derived geometry, dropping one, or appending handles that drive `DrawingDragPart::Handle(index)`),
-and selected-handle painting, placement previews (the placed anchors' handles only), handle hit
-testing, keyboard handle cycling, and drag starts all read that one set. Every drag sample, pointer
-drag or keyboard nudge, then runs the generic part drag (an anchor re-anchored with time snap,
-magnet, and straighten; a body translated; a derived handle's baseline media px moved by the
-delta along the movement axis, time- and magnet-snapped like an anchor) and hands the result to
-`drag` as a `HandleDrag` sample (baseline anchors and px, the dragged point as an anchor and in
-px, Shift, and a keyboard nudge's step, so a hook that quantizes its target, such as the fixed
-Gann square's whole bars, moves at least one unit per key press). A nudge reports success only
-when it recorded an undoable change. The hook rewrites the anchors from that baseline alone and may return replacement
-tool options, which the drag session's history snapshot restores on cancel and records in the
-same undo step; a data-driven rebaseline also rebases a derived handle's baseline onto its
-current position. `close_placement` lets a multi-click tool close on its first vertex: with at
-least three vertices placed, a click within the precision anchor hit radius of the first calls
-the hook (a polyline sets `closed`) and commits without adding a vertex, and hovering there snaps
-the preview onto that vertex; Enter, double-click, and Escape keep finishing open and cancelling.
-Hooks run while the drawing runtime cache is borrowed during frame construction and hit
-testing, so they read the engine but never call candidate queries or cached anchor-geometry
-accessors. Spec fields replace per-kind checks in shared code: `text_layout` (`Box`, or
-`Segment`: the label follows, rotates with, and takes the stroke color of the first two anchors
-and a middle label splits the stroke), `axis_price_label` (the horizontal-line axis tag), and
-`axis_tag_text` (that tag shows the drawing's `text` instead of the price when it has any, and the
-text is not painted on the chart, as the simple tag does).
+B8 工具归属于绘图族。核心工具（趋势线、水平线与垂直线、水平射线、矩形、文本、画笔、路径、Long/Short Position 以及分布绘图）在其目录规格中保持 `family: None`，并通过 `drawings/geometry.rs` 解析，而不是通过族部件词汇；它们的虚线与点线描边通过 `push_styled_stroke` 转换为实线虚线段，如上文绘图几何词汇部分所述。每个族拥有一个模块 `drawings/kinds/<family>.rs`，其中包含该族的工具规格、一份被每个规格引用的 `static FAMILY: DrawingFamily` 钩子表、其类型化选项块及其测试（`kinds/<family>/tests.rs`）。钩子表是封闭的编译期表，而不是插件注册表。`DrawingFamily::new` 接收两个必需的钩子 `build_parts` 与 `kind_options`，并让每个可选钩子都从一个中性默认值开始，族在其 `static` 初始化器中通过赋值覆盖它：`apply_defaults`（由 `Drawing::new` 应用的种类默认值，因此创建、模板、恢复、粘贴与 schema 默认值保持一致）、`decoration_extent`（为锚点之外的框与标签提供的保守 CSS-px 剔除余量）、`extend_schema`（追加在通用描述符之后的 `tool_options.*` 描述符，其默认值引擎已取自该种类的模板绘图），以及 `owns_labels`（该族自行渲染通用的 `labels`）。之后新增的钩子会在 `DrawingFamily::new` 中获得其默认值，因此其他族无需改动即可编译；被多个族设置的钩子，或基础层为每个族新增的钩子，位于族块之外。这些共享钩子是 `paint_bounds`、`reads_series_data`、`partial_preview`、`handles`、`drag` 与 `close_placement`（基础层钩子；目前只有形状折线设置它）。`paint_bounds` 是唯一的族剔除钩子：它是绘图所绘制的除文本之外的一切内容的保守媒体像素包围盒，每当其坐标键变化时，依据其锚点的媒体像素重新计算。范围由屏幕推导的工具（叉形线的叉齿与层级、经过边缘锚点的圆、固定尺寸的正方形）声明 `Full` 逻辑与价格范围，因此没有任何语义包围盒会剔除它；当其边界在两个维度上都保持无界时，该包围盒会取代整个窗格，作为其屏幕剔除与命中候选包围盒（`None` 或带延伸的绘图则保留窗格）。`reads_series_data` 标记其几何会读取系列数据的绘图（回归的拟合、预测的结果）：每个此类绘图都针对 `ChartEngine::drawing_source_series` 进行度量，即其窗格与价格比例尺上按创建顺序的第一个存活的普通系列（最小的存活 `SeriesId`；标识单调，存储槽位会被复用）（指标输出与自定义系列绝不符合条件，足迹图系列与 feature 系列则通过其 OHLC 投影符合条件，绘制顺序与可见性都不会改变它），并且 `invalidate_frame_series` 仅在发生变化的系列是此类绘图的源时，才重建保留的绘图层（每次数据变更会扫描一遍绘图列表；结构性的源变更会使整个场景失效）。这些读取方在源的规范行上工作：as-of 源的绘制点会重复并跳过规范行，因此回归、预测与柱形态会对每个规范行只读取一次，取其时间处或其后的第一个坐标轴点（参见 `ChartEngine::drawing_source_window`）。`partial_preview` 让放置预览从第二个锚点起即可解析部件。`handles` 与 `drag` 是派生手柄的基础：`handles` 编辑 `drawings/handles.rs` 依据规格的手柄模式以媒体像素构建的手柄集合（把某个手柄移到派生几何上、删除某个手柄，或追加驱动 `DrawingDragPart::Handle(index)` 的手柄），而选中手柄的绘制、放置预览（仅限已放置锚点的手柄）、手柄命中测试、键盘手柄循环与拖动起始，全都读取这同一个集合。随后每个拖动采样（无论是指针拖动还是键盘微调）都会运行通用的部件拖动（锚点经时间吸附、磁吸与拉直后重新锚定；本体平移；派生手柄的基线媒体像素沿移动轴按增量移动，并像锚点一样进行时间吸附与磁吸），并把结果作为 `HandleDrag` 采样交给 `drag`（基线锚点与像素、以锚点形式及像素形式表示的被拖动点、Shift，以及键盘微调的步长，因此对其目标做量化的钩子，例如固定江恩正方形的整根柱，每次按键至少移动一个单位）。微调仅在记录了可撤销的变更时才报告成功。钩子仅依据该基线改写锚点，并可返回替换用的工具选项，拖动会话的历史快照会在取消时恢复这些选项，并在同一个撤销步骤中记录它们；由数据驱动的基线重设也会把派生手柄的基线重新定基到其当前位置。`close_placement` 让多次点击的工具可在其第一个顶点处闭合：已放置至少三个顶点时，在第一个顶点的精确锚点命中半径内点击会调用该钩子（折线会设置 `closed`）并在不添加顶点的情况下提交，并且悬停在那里时预览会吸附到该顶点；Enter、双击与 Escape 仍保持以开放形式完成与取消的行为。钩子在帧构建与命中测试期间、绘图运行时缓存处于借用状态时运行，因此它们只读取引擎，绝不调用候选查询或缓存的锚点几何访问器。规格字段取代共享代码中逐种类的检查：`text_layout`（`Box`，或 `Segment`：标签跟随前两个锚点、随之旋转并取其描边颜色，居中标签会拆分描边）、`axis_price_label`（水平线的坐标轴标签）以及 `axis_tag_text`（当绘图带有文本时，该标签显示该绘图的 `text` 而非价格，且该文本不会绘制在图表上，与简单标签的做法一致）。
 
-A family resolves one drawing into the shared part vocabulary of `drawings/parts.rs` in the
-caller's space (bitmap px at render, media px at hit test): anti-aliased strokes, crisp full-pixel
-horizontal and vertical lines, ribbon fills between paired chains (convex polygons via
-`fill_convex`, any polygon by the nonzero rule via `fill_polygon`), discs, wide strokes painted
-once per pixel (`Tube`, lowered to one band fill), and boxed text blocks laid out by one
-`PartLabel::layout`. Derived
-logical/price points (level lines, time zones, data-driven points) map into that space through
-`PartContext::point_px`, which applies the frame's separate horizontal and vertical bitmap ratios;
-frame construction debug-asserts that it reproduces every anchor. Frame construction lowers
-parts into existing `Prim`s in `frame/drawings.rs` (`build_family_prims`; every stroke run goes
-through `push_clipped_stroke`, which clips it to the pane grown by the stroke's reach with
-`shape::clip_polyline_to_rect`, so work and coordinates stay bounded however far the geometry reaches,
-and splits a dashed or dotted run into solid dash runs through `push_line_stroke`, like every
-engine-owned path stroke, because the WebGPU tessellator has no dash concept; clipped parts keep the
-unclipped run's dash phase, so dashes never shift while panning) and precise hit testing tests
-the same parts (`DrawingParts::hit`, where a dashed stroke stays one continuous body), so family
-tools cannot fork executor behavior and the painted and interactive shapes cannot drift. While a
-tool is being placed, the frame's pending path builds the tool's own parts once every anchor is
-placed or previewed (with `partial_preview`, from the second anchor on); before that, a tool of
-three or more anchors joins the placed anchors and the pointer in one guide polyline in the
-drawing's stroke, lowered through `push_clipped_stroke`, with handles on the placed anchors, so
-every click leaves visible ink. Shared helpers sit at their owners: pure geometry (segment
-extension, midpoints, and clipping to the pane, ray clipping, parallel offsets, arc/ellipse
-tessellation and clip-aware curve flattening, nonzero polygon ribbons, polyline/polygon/ribbon
-hit predicates, and `Rect` inflation, intersection, and bounding boxes) in
-`aeris_charts_render::shape`; line caps (`capped_segment` is the two-point `capped_polyline`, and
-`cap_radius` sizes every disc and arrowhead), arrow trimming, label layout, the stats box
-(`PartContext::stats_label` with the shared `STATS_*` gap, padding, and alpha and `text_on`'s
-black-or-white text), and the fill convention (`PartContext::fills_hit`: region fills are body
-targets only while the drawing is selected, like the rectangle's interior) in `parts.rs`; color
-resolution on the contract types (`Drawing::stroke_color` with the canonical primary fallback,
-`Drawing::fill_or_wash`, and `DrawingLevel::stroke_color`, `zone_fill`, and `line_style`, whose
-style names fold through `line_style_from_name` like a drawing's own `style`); the property
-descriptor builder `drawing_contract::descriptor`; engine-formatted measurement text (price
-through the drawing scale's formatter, percent, ticks, bars, time range, duration, screen angle,
-distance) and the text and stats glyph sizes (`drawing_text_size`, `drawing_stats_size`) in
-`drawings/stats.rs`; the one editable handle set used by painting, handle hit
-testing, keyboard cycling, and drags, with the `HandleDrag` sample and the `drawing_anchor_at`
-conversion family drags use, in `drawings/handles.rs`; the media-px `PartContext::media` of hit
-testing and handle hooks in `parts.rs`; and level lists as contract data
-(`FIBONACCI_RATIOS`, `FIBONACCI_TIME_ZONES`, `drawing_levels_from_ratios`,
-`DrawingLevel::price_between`, `DrawingLevel::label`). A drawing with `extend_left` or
-`extend_right` uses unbounded semantic bounds, so extensions stay visible and hittable when the
-anchors scroll away, while a ray or extended line whose extensions are switched off culls like any
-finite segment.
+一个绘图族会在调用方的空间（渲染时为位图 px，命中测试时为媒体 px）中，把一个绘图解析为 `drawings/parts.rs` 中共享的部件词汇：抗锯齿描边、清晰的整像素水平线与垂直线、成对链之间的带状填充（凸多边形通过 `fill_convex`，任意多边形按非零规则通过 `fill_polygon`）、圆盘、每个像素只绘制一次的宽描边（`Tube`，转换为一次区带填充），以及由同一个 `PartLabel::layout` 排版的带框文本块。派生的逻辑/价格点（层级线、时间区、数据驱动的点）通过 `PartContext::point_px` 映射到该空间，该函数应用帧各自独立的水平与垂直位图比例；帧构建会以 debug 断言确认它能复现每一个锚点。帧构建在 `frame/drawings.rs` 中把部件转换为现有的 `Prim`（`build_family_prims`；每一段描边都经过 `push_clipped_stroke`，它用 `shape::clip_polyline_to_rect` 把描边裁剪到按描边延伸量外扩后的窗格范围内，因此无论几何延伸多远，工作量与坐标都保持有界，并且和引擎拥有的所有路径描边一样，通过 `push_line_stroke` 把虚线或点线描边段拆分为实线的短划段，因为 WebGPU 细分器没有虚线概念；被裁剪的部件保留未裁剪描边段的虚线相位，因此平移时虚线绝不会偏移），而精确命中测试检测的是同样的部件（`DrawingParts::hit`，其中虚线描边仍是一个连续的主体），所以各族工具不能分叉执行器行为，绘制出的形状与可交互的形状也不会漂移。工具放置期间，一旦每个锚点都已放置或处于预览中（设置 `partial_preview` 时，从第二个锚点起），帧的待定路径就会构建该工具自身的部件；在此之前，具有三个或更多锚点的工具会把已放置的锚点与指针连成一条以绘图描边绘制的引导折线，该折线经 `push_clipped_stroke` 转换，并在已放置的锚点上显示手柄，因此每次点击都会留下可见的笔迹。共享辅助函数位于各自的所有者处：纯几何（线段延长、中点以及到窗格的裁剪、射线裁剪、平行偏移、弧/椭圆细分与感知裁剪的曲线展平、非零规则多边形带、折线/多边形/带状命中判定，以及 `Rect` 的外扩、求交与包围盒）位于 `aeris_charts_render::shape`；线帽（`capped_segment` 就是两点的 `capped_polyline`，`cap_radius` 决定每个圆盘与箭头的尺寸）、箭头修剪、标签排版、统计框（`PartContext::stats_label`，使用共享的 `STATS_*` 间距、内边距与 alpha，以及 `text_on` 选出的黑色或白色文字）以及填充约定（`PartContext::fills_hit`：区域填充仅在绘图被选中时才是主体目标，与矩形内部相同）位于 `parts.rs`；颜色解析位于契约类型上（`Drawing::stroke_color` 带规范的主色回退，`Drawing::fill_or_wash`，以及 `DrawingLevel::stroke_color`、`zone_fill` 和 `line_style`，其样式名与绘图自身的 `style` 一样经由 `line_style_from_name` 归并）；属性描述符构建器 `drawing_contract::descriptor`；引擎格式化的测量文本（价格经绘图比例尺的格式化器、百分比、tick 数、柱数、时间范围、时长、屏幕角度、距离）以及文本与统计字形大小（`drawing_text_size`、`drawing_stats_size`）位于 `drawings/stats.rs`；绘制、手柄命中测试、键盘循环切换与拖动共用的唯一可编辑手柄集合，连同拖动所用的 `HandleDrag` 采样与 `drawing_anchor_at` 转换族，位于 `drawings/handles.rs`；命中测试与手柄钩子使用的媒体 px 版 `PartContext::media` 位于 `parts.rs`；以及作为契约数据的层级列表（`FIBONACCI_RATIOS`、`FIBONACCI_TIME_ZONES`、`drawing_levels_from_ratios`、`DrawingLevel::price_between`、`DrawingLevel::label`）。设置了 `extend_left` 或 `extend_right` 的绘图使用无界的语义边界，因此锚点滚出视野时，延长线仍保持可见且可命中；而关闭了延长的射线或延长线，则与任何有限线段一样被剔除。
 
-Inline text editing is one engine session and one layout for every drawing that paints its own
-text, the text tool and trend labels included. The session (`drawing_text_edit.rs`,
-`DrawingTextEditSession`) is opened by `ChartEngine::begin_drawing_text_edit(id, paint_caret)`:
-refused for a locked, hidden, or interval-hidden drawing or one that is not
-`drawing_text_editable` (a refusal leaves any open session alone), idempotent for the drawing
-already being edited, and otherwise committing a session open on another drawing first. It
-records the text and revision it began from and owns the live text, a char-based caret, and a
-selection. `set_drawing_text_edit` mirrors a host's editable surface (the browser's value and
-caret), and `drawing_text_edit_insert`, `drawing_text_edit_key`, `drawing_text_edit_select_all`,
-`drawing_text_edit_selection`, and `drawing_text_edit_caret_at` are the native typing API; each
-replaces the drawing's text live (repainting and relaying out, with no undo step and no sync
-revision). `commit_drawing_text_edit` trims the text and commits the edit as one `Update` undo
-step and one sync revision (when the text changed); `cancel_drawing_text_edit` restores the text
-and revision it began from without a history entry. Only the text tool is removed when a session
-ends empty (a commit of blank text, or a cancel of a fresh placement). Undo and redo commit an
-open session first (the browser editor's order); removal, clearing, a sync payload, and a
-restore end it. The session is runtime-only. The engine owns the text rules: every text is
-bounded by `MAX_DRAWING_TEXT_BYTES` (a patch that carries a longer one is refused before it
-applies anything, an insert that would exceed it is refused whole, and a mirrored value clamps at
-a character boundary), a run label stays on one line (a run of line breaks becomes one space),
-and a family text box keeps its line breaks (every other control character becomes a space).
-Persistence bounds each drawing's text by the same constant; its document-wide text total, the
-clipboard, and sync payloads are bounded separately. The input layer decides when a session opens
-(the engine input controller on native hosts, the gesture layer in the browser): placement of a
-tool the engine marks `requests_text_editor` (`drawing_requests_text_edit`), a double-click, Enter,
-or F2 on a drawing the engine reports `drawing_text_editable`, and a click on a trend label.
+行内文本编辑对每个自行绘制文本的绘图（包括文本工具与趋势线标签）而言，都是同一个引擎会话与同一套布局。该会话（`drawing_text_edit.rs`、`DrawingTextEditSession`）由 `ChartEngine::begin_drawing_text_edit(id, paint_caret)` 打开：对已锁定、已隐藏或在当前周期被隐藏的绘图，或不满足 `drawing_text_editable` 的绘图会被拒绝（拒绝不会影响任何已打开的会话）；对已处于编辑状态的绘图是幂等的；其余情况下，会先提交在另一个绘图上已打开的会话。它记录开始编辑时的文本与修订号，并拥有实时文本、基于字符的插入符与一个选区。`set_drawing_text_edit` 镜像宿主的可编辑界面（浏览器的值与插入符），而 `drawing_text_edit_insert`、`drawing_text_edit_key`、`drawing_text_edit_select_all`、`drawing_text_edit_selection` 与 `drawing_text_edit_caret_at` 是原生输入 API；每个都会实时替换绘图的文本（重绘并重新布局，不产生撤销步骤，也不产生同步修订号）。`commit_drawing_text_edit` 会修剪文本，并把编辑作为一个 `Update` 撤销步骤与一个同步修订号提交（文本发生变化时）；`cancel_drawing_text_edit` 恢复开始编辑时的文本与修订号，不产生历史记录条目。会话以空文本结束时（提交空白文本，或取消一次新放置），只有文本工具会被移除。撤销与重做会先提交已打开的会话（浏览器编辑器的顺序）；删除、清空、同步载荷与恢复会结束该会话。该会话仅存在于运行时。文本规则由引擎拥有：每段文本都以 `MAX_DRAWING_TEXT_BYTES` 为上限（携带更长文本的补丁会在应用任何内容之前被拒绝，会超出上限的插入会被整体拒绝，镜像的值则在字符边界处截断），文本段标签保持单行（连续的换行符变为一个空格），族文本框保留其换行（其他所有控制字符变为空格）。持久化以同一个常量限定每个绘图的文本；其文档范围内的文本总量、剪贴板与同步载荷则另行限定。会话何时打开由输入层决定（原生宿主上为引擎输入控制器，浏览器中为手势层）：放置被引擎标记为 `requests_text_editor` 的工具（`drawing_requests_text_edit`）、在引擎报告为 `drawing_text_editable` 的绘图上双击、按 Enter 或 F2，以及点击趋势线标签。
 
-A drawing paints its text in one of two ways, and `ChartEngine::drawing_text_edit_layout` returns
-the matching layout in media px from the same geometry the frame and the hit test use, so the
-host's caret overlay cannot drift from the painted text. `DrawingTextEditLayout::multiline` names
-the mode; the presence of a layout only means the drawing paints text.
+绘图绘制文本的方式有两种，`ChartEngine::drawing_text_edit_layout` 会基于帧与命中测试所用的同一几何，返回以媒体 px 表示的对应布局，因此宿主的插入符叠加层不会与已绘制的文本发生漂移。`DrawingTextEditLayout::multiline` 标明模式；布局的存在只表示该绘图会绘制文本。
 
-- A family that owns its text (`DrawingFamily::owns_text`: the projection and annotation tools)
-  marks the label that holds the drawing's own `text` with `DrawingParts::text_label` (lines from
-  `first_line` on; earlier lines are engine text such as a formatted price), filled from
-  `PartContext::text_lines`, which keeps one empty caret line while `PartContext::text_editing`
-  is set, so an emptied box keeps its place. It is a box that may span lines (`multiline`,
-  `angle` 0): the lines' left edge, the first text line's center, the line advance, glyph size,
-  weight, italics, and painted color, from the same `PartLabel::layout` as painting and hit
-  testing, so the box may grow in any direction. Eight annotation tools add no such label (the
-  forecast, bars pattern, price range, date range, date and price range, projection, flag, and
-  icon): their `text` is accepted but never painted, and they are not editable.
-- Every other tool (`DrawingKind::paints_generic_text`: the text tool, the trend line and every
-  line, channel, Fibonacci, pitchfork, pattern, and shape tool) paints one generic run through
-  `build_drawing_text`, placed against its geometry by `text_box` (or along its first two anchors
-  for a segment layout). `ChartEngine::drawing_text_run` resolves that run once in media px
-  (returning `None`, and so no caret, when the geometry does not resolve), and the caret
-  transform, the editor layout, and the label hit test all read it; the frame keeps resolving the
-  same placement in bitmap px, and a test pins the two to each other at more than one pixel ratio.
-  The layout is one run (`multiline` false): `x`, `y` are its start point (left edge, vertical
-  center) after rotation, `angle` its clockwise rotation about that point, and an empty label
-  opens one em wide (nothing paints, so the caret needs a slot). Level names, ratios, point and
-  wave labels, and stats are engine text and stay options-only.
+- 拥有自身文本的族（`DrawingFamily::owns_text`：投影与标注工具）用 `DrawingParts::text_label` 标记承载该绘图自身 `text` 的标签（从 `first_line` 起的各行；更早的行是引擎文本，例如格式化后的价格），由 `PartContext::text_lines` 填充，该函数在设置了 `PartContext::text_editing` 时保留一行空的插入符行，因此被清空的框仍保持其位置。它是可以跨多行的框（`multiline`，`angle` 为 0）：各行的左边缘、第一行文本的中心、行距、字形大小、字重、斜体与实际绘制的颜色，均来自与绘制和命中测试相同的 `PartLabel::layout`，因此该框可以向任意方向增长。八个标注工具不添加这样的标签（预测、柱形态、价格区间、日期区间、日期与价格区间、投影、旗标与图标）：它们的 `text` 会被接受但从不绘制，也不可编辑。
+- 其他所有工具（`DrawingKind::paints_generic_text`：文本工具、趋势线，以及每个线条、通道、斐波那契、叉形线、形态与形状工具）通过 `build_drawing_text` 绘制一段通用文本，由 `text_box` 相对其几何放置（线段布局则沿其前两个锚点放置）。`ChartEngine::drawing_text_run` 以媒体 px 一次性解析该文本段（几何无法解析时返回 `None`，因此没有插入符），插入符变换、编辑器布局与标签命中测试都读取它；帧仍以位图 px 解析同样的放置，并有一个测试在不止一种像素比例下把二者钉在一起。该布局是一个文本段（`multiline` 为 false）：`x`、`y` 是其旋转后的起点（左边缘、垂直中心），`angle` 是绕该点的顺时针旋转角，空标签会展开为一个 em 宽（不绘制任何内容，因此插入符需要一个位置）。层级名称、比例、点与波浪标签以及统计信息都是引擎文本，仅能通过选项设置。
 
-`drawing_text_editable` is exactly "unlocked, visible, shown on the interval, and has a layout",
-so a drawing whose anchors cannot convert has no caret. The label region of a run drawing is
-`drawing_text_hit_at`: the padded run box in the run's local frame, only for a non-empty text
-(a trend line answers over its `+ Add text` prompt when empty), never for the text tool or a
-family text box, whose bodies are ordinary hits (`DrawingParts::hit`, or the text tool's chrome
-box). The topmost label wins, unless a higher drawing's body or the selected drawing's anchor
-handle is at the point, so a label never steals a click from what paints above it; the extra
-work runs only when a label is under the pointer. It walks the same culled candidates as
-`hit_test_drawing`, from the runtime position index and the candidate pass's cached anchors and
-text widths (no per-candidate scan or measure callback), and a randomized parity test pins it to a
-brute-force reference. A segment-layout label reaches past its anchors along the stroke, so its
-culling pad counts the run's whole length on both axes, and an open editor counts an empty label
-as one em. Only the text tool and trend lines have hover chrome (`set_hovered_text` ignores
-other ids); a label hit elsewhere still shows the text cursor and promotes its drawing.
+`drawing_text_editable` 恰好等于“未锁定、可见、在当前周期显示且存在布局”，因此锚点无法转换的绘图没有插入符。文本段绘图的标签区域由 `drawing_text_hit_at` 给出：即文本段局部坐标系中带内边距的文本段框，仅在文本非空时有效（趋势线在文本为空时，在其 `+ Add text` 提示上响应），文本工具或族文本框从不使用，它们的主体是普通命中（`DrawingParts::hit`，或文本工具的装饰框）。最上层的标签优先，除非更高层绘图的主体或被选中绘图的锚点手柄位于该点，因此标签绝不会抢走本应属于其上方绘制内容的点击；额外的工作仅在指针位于某个标签之下时才执行。它遍历与 `hit_test_drawing` 相同的已剔除候选集，数据来自运行时位置索引以及候选遍历阶段缓存的锚点与文本宽度（无需逐候选扫描或度量回调），并有随机化一致性测试把它与暴力参考实现钉在一起。线段布局的标签沿描边延伸到其锚点之外，因此其剔除内边距把文本段的整个长度计入两个轴向，而处于打开状态的编辑器把空标签按一个 em 计。只有文本工具与趋势线具有悬停装饰（`set_hovered_text` 忽略其他 id）；在其他位置命中的标签仍会显示文本光标并提升其绘图。
 
-Family-specific options live in `Drawing.tool_options: DrawingToolOptions`, one optional block per
-family carried under `tool_options` by options JSON, templates, clipboard and sync payloads, and V1
-persistence. Patches deep-merge (absent keys keep their values, `null` resets a block) on a copy
-that is validated and size-bounded before one undoable install. A template that carries
-`tool_options` replaces the drawing's family style instead (`DrawingToolOptions::replacement_patch`
-against the drawing's `template_style`), so applying it also resets the family options it leaves
-at their defaults, while data the drawing captured (a bars pattern's copy) is not style and
-stays. Persistence writes each optional style field only when it differs from the kind's own
-defaults, so a restored ray keeps `extend_right` and a user-cleared one stays cleared.
+各族专属选项位于 `Drawing.tool_options: DrawingToolOptions` 中，每个族对应一个可选块，由选项 JSON、模板、剪贴板与同步载荷以及 V1 持久化放在 `tool_options` 之下携带。补丁采用深度合并（缺失的键保留其值，`null` 重置一个块），作用于一份副本，该副本经过校验并限定大小后，再一次性完成可撤销的安装。携带 `tool_options` 的模板转而替换绘图的族样式（`DrawingToolOptions::replacement_patch` 针对绘图的 `template_style`），因此应用它时，也会把它保留为默认值的那些族选项重置，而绘图所捕获的数据（柱形态的副本）不属于样式，因此保留。持久化仅在每个可选样式字段与该类型自身的默认值不同时才写入，因此恢复后的射线保留 `extend_right`，而用户清除过它的射线仍保持清除。
 
-Each family documents its semantics in its own block below.
+各族的语义在下面各自的块中说明。
 
 <!-- B8: lines — begin -->
-The Lines family (`kinds/lines.rs`, wire ids 32..=47) delivers `ray`, `extended_line`,
-`info_line`, `trend_angle`, `cross_line`, and `arrow_line`. The five segment tools share one
-geometry: the first two anchors extended beyond the first by `extend_left` and beyond the second by
-`extend_right` (a ray and an extended line are these defaults), clipped to the pane in their own
-direction, with end caps on the ends that are not extended. Visible `labels` render as one stats
-box whose position is `tool_options.line.stats_position`; the info line enables price change,
-percent change, bar count, duration, and angle by default. The trend angle adds a dashed horizontal
-reference, the arc to the segment, and the screen angle. The cross line is full-span crisp
-horizontal and vertical lines with the horizontal line's axis price tag. `horizontal_segment`,
-`vertical_ray`, and `vertical_segment` (wire ids 38..=40, translated from KLineChart's overlays) are
-the same segment geometry with a catalog `anchor_link` (`DrawingToolSpec::anchor_link`): every
-anchor shares the first's price (`SamePrice`) or bar (`SameLogical`), taken from the anchor placed or
-dragged last. The link is applied where a point list enters the model (`Drawing::normalize_points`:
-construction, import, programmatic anchors, and committing a placement) and while an anchor is
-dragged or previewed, so a locked tool cannot leave its axis; Shift has nothing to straighten on
-them. A vertical ray defaults to `extend_right`, which runs it through its second anchor to the
-pane edge. `price_line` (wire id 41, one anchor) is a crisp `hline` from the anchor to the pane's
-right edge plus a part label with the anchor's price above its start; it takes the horizontal
-line's `axis_price_label` tag and is hit as the ray.
+线条族（`kinds/lines.rs`，wire id 32..=47）提供 `ray`、`extended_line`、`info_line`、`trend_angle`、`cross_line` 与 `arrow_line`。五个线段工具共用同一几何：前两个锚点所成的线，在第一个锚点之外按 `extend_left` 延长，在第二个锚点之外按 `extend_right` 延长（射线与延长线即取这些默认值），沿各自方向裁剪到窗格，未延长的端点带有端帽。可见的 `labels` 渲染为一个统计框，其位置由 `tool_options.line.stats_position` 决定；信息线默认启用价格变化、百分比变化、柱数、时长与角度。趋势角度线增加一条虚线水平参考线、通向线段的圆弧以及屏幕角度。十字线是贯穿整个跨度的清晰水平线与垂直线，并带有水平线的坐标轴价格标签。`horizontal_segment`、`vertical_ray` 与 `vertical_segment`（wire id 38..=40，转译自 KLineChart 的 overlay）使用相同的线段几何，并带有目录项 `anchor_link`（`DrawingToolSpec::anchor_link`）：每个锚点共享第一个锚点的价格（`SamePrice`）或柱（`SameLogical`），该值取自最后放置或拖动的锚点。该联动在点列表进入模型处（`Drawing::normalize_points`：构造、导入、程序化锚点以及提交一次放置）以及拖动或预览锚点期间生效，因此被锁定的工具不会离开其轴线；Shift 对它们没有可拉直之处。垂直射线默认使用 `extend_right`，使其穿过第二个锚点延伸到窗格边缘。`price_line`（wire id 41，一个锚点）是一条从锚点到窗格右边缘的清晰 `hline`，外加一个位于其起点上方、显示锚点价格的部件标签；它采用水平线的 `axis_price_label` 标签，并按射线方式命中。
 <!-- B8: lines — end -->
 <!-- B8: channels — begin -->
-The Channels family (`kinds/channels.rs`, wire ids 48..=52) delivers `parallel_channel`,
-`regression_trend`, `flat_top_bottom`, `disjoint_channel`, and `price_channel` (KLineChart's price
-channel: the base line is the centre, with its parallel through the third anchor and the mirror of
-that parallel on the other side; it defaults to extending both ways with no fill, and a fill covers
-the whole band). The three-anchor channels share one
-construction: the first two anchors are the base line, and the second line spans the same bars
-(vertical sides) on the line through the third anchor — translated vertically in px (parallel on
-every scale mode), horizontal at the third anchor's price, or with the base slope mirrored. Their
-price extent is `Full` except flat top/bottom's, because the second line's ends can leave the
-anchors' price box. Fills run between two lines over a common parameter span, split at the one
-crossing so each piece is convex, and are clipped to the pane with `shape::clip_polygon_to_rect`;
-they are body targets only while the drawing is selected. The family's shared `handles` hook
-moves the anchor handles onto the painted lines (the third anchor's handle to the second line's
-midpoint, the regression's to its fitted line's ends), so handle painting (placement previews
-included), handle hit testing, and keyboard nudges read them there, and each handle still drives
-its own anchor by pointer deltas.
-Shift straightens a dragged base-line end against the other like a trend line's (the anchor drag
-straightens the first two anchors of any tool with a straighten mode). With `partial_preview`
-set, placement previews the base line while the second anchor is placed, then the whole channel
-through the pointer.
+通道族（`kinds/channels.rs`，wire id 48..=52）提供 `parallel_channel`、`regression_trend`、`flat_top_bottom`、`disjoint_channel` 与 `price_channel`（KLineChart 的价格通道：基准线为中心线，其平行线穿过第三个锚点，该平行线的镜像位于另一侧；默认向两端延伸且不填充，填充会覆盖整个区带）。三锚点通道共用同一种构造：前两个锚点构成基准线，第二条线在穿过第三个锚点的直线上跨越相同的柱（两侧为垂直边）——在 px 上垂直平移（在每种比例尺模式下都平行）、在第三个锚点的价格处保持水平，或取基准斜率的镜像。除平顶/平底通道外，它们的价格范围均为 `Full`，因为第二条线的端点可能离开锚点的价格框。填充在两条线之间沿公共参数跨度展开，在唯一的交叉点处拆分，使每一块都是凸的，并用 `shape::clip_polygon_to_rect` 裁剪到窗格；它们仅在绘图被选中时才是主体目标。该族共享的 `handles` 钩子把锚点手柄移到已绘制的线上（第三个锚点的手柄移到第二条线的中点，回归线的手柄移到其拟合线的两端），因此手柄绘制（包括放置预览）、手柄命中测试与键盘微调都在那里读取它们，而每个手柄仍按指针增量驱动各自的锚点。Shift 会把被拖动的基准线端点相对另一端拉直，与趋势线相同（锚点拖动会拉直任何具有拉直模式的工具的前两个锚点）。设置 `partial_preview` 后，放置时在放置第二个锚点期间预览基准线，之后预览穿过指针的整个通道。
 
-`regression_trend` fits its source series (`drawing_source_series`) over its canonical rows
-between its rounded anchor bars in one allocation-free pass of shifted sums
-(least-squares slope, sample residual deviation, Pearson's R). `RegressionMemo`
-(`DrawingChartSettings::regression_memo`) keeps each drawing's latest fit keyed by the series, the
-merged points' positions (`time_index_generation`; an as-of source also keys every time point),
-the replay clock, the bar range, and the source, together with the source data generation it read
-and the sums of every fitted row but the last. The engine reports each series data change it
-routes to indicators (`update_indicators_after_change`) to the memo with its first changed row, so
-a change that leaves every row before a fit's last row untouched (a live replacement of the latest
-bar, or appended bars) extends the fit by the changed rows, adding them in order so the result is
-bitwise identical to a full pass; a change at an earlier row, an unreported change, a moved point,
-or an as-of source pays the pass proportional to the anchored range. Panning, zooming, and pointer
-hit tests reuse the fit however many regressions the chart holds, and the release `perf_gate`
-Target N times live ticks plus frames with five regressions across a 1,000,000-row source. Fits of
-removed drawings are dropped once the memo exceeds the drawing count by 16 entries. Its anchors
-move along time only, and it sets the shared `reads_series_data` hook. The optional `tool_options.channel` block stores only fields that
-were set; per-tool defaults resolve at use.
+`regression_trend` 在其取整后的锚点柱之间，对其规范行上的源系列（`drawing_source_series`）做拟合，通过一次无内存分配的平移求和遍历完成（最小二乘斜率、样本残差偏差、Pearson R）。`RegressionMemo`（`DrawingChartSettings::regression_memo`）保存每个绘图最近一次的拟合结果，以系列、合并点的位置（`time_index_generation`；as-of 源还会以每个时间点为键）、回放时钟、柱范围与源作为键，并附带它所读取的源数据代次，以及除最后一行外所有已拟合行的和。引擎会把它路由给指标的每一次系列数据变更（`update_indicators_after_change`）连同其首个变更行一并报告给该备忘缓存，因此，若某次变更使拟合最后一行之前的每一行都保持不变（对最新柱的实时替换，或追加柱），则只需用变更的行扩展该拟合，按顺序加入这些行，使结果与完整遍历逐位相同；发生在更早行的变更、未报告的变更、已移动的点或 as-of 源，则需要承担一次与锚定范围成正比的遍历。平移、缩放与指针命中测试复用该拟合，无论图表持有多少条回归线，且 release 构建的 `perf_gate` 中的 Target N 会在 1,000,000 行的源上，对带有五条回归线的实时 tick 加帧进行计时。当该备忘缓存的条目数超出绘图数量 16 项时，已删除绘图的拟合结果会被丢弃。它的锚点只沿时间方向移动，并设置共享的 `reads_series_data` 钩子。可选的 `tool_options.channel` 块仅存储已设置的字段；各工具的默认值在使用时解析。
 <!-- B8: channels — end -->
 <!-- B8: fibonacci — begin -->
-The Fibonacci family (`kinds/fibonacci.rs`, wire ids 64..=73 of 64..=95) delivers
-`fib_retracement`, `trend_based_fib_extension`, `fib_channel`, `fib_time_zone`,
-`trend_based_fib_time`, `fib_speed_resistance_fan`, `fib_speed_resistance_arcs`, `fib_circles`,
-`fib_spiral`, and `fib_wedge`. Every tool but the spiral paints the common level list
-(`Drawing::levels`, defaults set by `apply_defaults`): visible levels sort by value, bands between
-neighbours take the upper level's fill under the `fill_enabled` switch, and labels take the level
-color. The drawing's own stroke is the auxiliary line (trend line, fan grid, wedge edges, or the
-spiral). Price levels (retracement, extension, channel) are computed in price space, or log space
-with `tool_options.fibonacci.log_scale`, and mapped through `PartContext::point_px`, so they sit on
-exact prices on every scale mode; time levels interpolate the anchors' px because the time axis is
-affine in logical position; the fan, arcs, circles, spiral, and wedge are screen-space geometry
-from the anchors' px. Band fills are body targets only while the drawing is selected.
+斐波那契族（`kinds/fibonacci.rs`，wire id 64..=73，位于 64..=95 范围内）提供 `fib_retracement`、`trend_based_fib_extension`、`fib_channel`、`fib_time_zone`、`trend_based_fib_time`、`fib_speed_resistance_fan`、`fib_speed_resistance_arcs`、`fib_circles`、`fib_spiral` 与 `fib_wedge`。除螺旋线外，每个工具都绘制通用的层级列表（`Drawing::levels`，默认值由 `apply_defaults` 设置）：可见层级按值排序，相邻层级之间的区带在 `fill_enabled` 开关下采用较高层级的填充，标签采用层级颜色。绘图自身的描边是辅助线（趋势线、扇形网格、楔形边缘或螺旋线）。价格层级（回撤、扩展、通道）在价格空间中计算，设置 `tool_options.fibonacci.log_scale` 时在对数空间中计算，并通过 `PartContext::point_px` 映射，因此在每种比例尺模式下都落在精确的价格上；时间层级对锚点的 px 做插值，因为时间轴相对逻辑位置是仿射的；扇形、弧、圆、螺旋线与楔形是由锚点 px 得出的屏幕空间几何。区带填充仅在绘图被选中时才是主体目标。
 
-The family adds the `bounds` hook (default in its block of `DrawingFamily::new`), which returns a
-drawing's complete semantic reach (`FamilyBounds`: logical and price ranges,
-`None` when unbounded) and replaces the anchor-derived culling bounds in
-`DrawingBounds::for_drawing`, so levels beyond the anchors stay visible and hittable while the
-anchors scroll away; screen-space tools keep unbounded spec extents and skip curves outside the
-pane. Arcs, circles, and the wedge set the shared `paint_bounds` to the anchors plus the square
-around their center reaching the largest visible level's radius (at least the unit), and their
-`decoration_extent` pads it by the level labels, so a ring tool far from the pane culls and skips
-hit testing like any finite drawing; the fan's rays and the spiral reach the pane edge and keep the
-pane. It sets the shared `partial_preview`, so a three-anchor tool shows its first leg before its
-second click. Level lists persist only when they
-differ from the kind's defaults, so a user-cleared list stays cleared.
+该族新增 `bounds` 钩子（在 `DrawingFamily::new` 中属于该族的块里取默认值），它返回绘图完整的语义范围（`FamilyBounds`：逻辑与价格范围，无界时为 `None`），并取代 `DrawingBounds::for_drawing` 中由锚点推导出的剔除边界，因此锚点滚出视野时，锚点之外的层级仍保持可见且可命中；屏幕空间工具保持无界的规格范围，并跳过窗格之外的曲线。弧、圆与楔形把共享的 `paint_bounds` 设为锚点加上以其中心为中心、触及最大可见层级半径的正方形（至少为单位大小），其 `decoration_extent` 再按层级标签对它外扩，因此远离窗格的环形工具与任何有限绘图一样被剔除并跳过命中测试；扇形的射线与螺旋线延伸到窗格边缘，保持为整个窗格。它设置共享的 `partial_preview`，因此三锚点工具在第二次点击之前就会显示其第一段。层级列表仅在与该类型的默认值不同时才持久化，因此用户清空的列表保持清空。
 
-Every emitted coordinate stays within the pane's reach whatever the level values: fan rays end at
-the pane edge, channel lines that miss the pane are skipped, and ring radii beyond the farthest
-pane point close bands and wedge edges at that distance. Fan wedges and channel bands clip the
-pane polygon by half-planes (`aeris_charts_render::shape::clip_to_half_plane`), so an extended
-channel band covers the pane corner its lines leave through. Labels are culled by their own box
-(one glyph size per character), not by their level line, so a label whose line sits just outside
-the pane still paints. The spiral grows by φ per quarter turn from a sub-pixel radius until its
-radius passes the farthest pane point, at most 128 quarter turns. Arcs, circles, wedge arcs, and
-spiral turns skip what cannot reach the pane and, when their center lies outside it, tessellate
-only the angular window the pane subtends, so curves far beyond the pane stay within the curve
-tolerance at the capped segment count; one tool's arcs share a single table of unit angles, which
-also pairs its band chains. A windowed dashed or dotted curve starts at the last dash-period
-boundary before the window (arc length from the curve's own start, off the pane), and a full
-circle restarts its pattern where the whole circle does, so dashes stay put while the pane
-scrolls.
+无论层级取值如何，每个输出的坐标都保持在窗格的可达范围内：扇形射线止于窗格边缘，不与窗格相交的通道线会被跳过，超出最远窗格点的圆环半径会在该距离处闭合区带与楔形边缘。扇形区与通道区带用半平面裁剪窗格多边形（`aeris_charts_render::shape::clip_to_half_plane`），因此延长的通道区带会覆盖其线条离开窗格所经过的窗格角。标签按其自身的框剔除（每个字符按一个字形大小计），而不是按其层级线剔除，因此即使标签所属的线刚好位于窗格之外，该标签仍会绘制。螺旋线从亚像素半径起，每四分之一圈增长 φ，直到其半径超过最远窗格点为止，至多 128 个四分之一圈。弧、圆、楔形弧与螺旋圈会跳过无法到达窗格的部分，并且在其圆心位于窗格之外时，只对窗格所对的角度窗口做细分，因此远在窗格之外的曲线，在受上限约束的线段数下仍保持在曲线容差之内；同一工具的弧共用一张单位角度表，该表也用于配对它的区带链。带窗口的虚线或点线曲线从窗口之前最后一个虚线周期边界开始（弧长从曲线自身的起点算起，位于窗格之外），完整的圆则在整圆本身重启的位置重启其图案，因此窗格滚动时虚线保持不动。
 <!-- B8: fibonacci — end -->
 <!-- B8: pitchforks_gann — begin -->
-The Pitchforks & Gann family (`kinds/pitchforks_gann.rs`, wire ids 96..=127) delivers
-`andrews_pitchfork`, `schiff_pitchfork`, `modified_schiff_pitchfork`, `inside_pitchfork`,
-`pitchfan`, `gann_box`, `gann_square`, `gann_square_fixed`, and `gann_fan`. A pitchfork resolves
-one frame from its anchors A, B, C: the median pivot (A; Schiff: A's time at the midpoint of A's
-and B's prices; modified Schiff and inside: the midpoint of A and B), the base center (the
-midpoint of B and C; inside: C), and the half handle (toward C; inside: back to B). Level `v` of
-the drawing's `levels` is the pair of tines parallel to the median through `center ± v · half`,
-so level 1 passes through the handle ends. Unextended lines reach one median length past the
-base; `extend_left`/`extend_right` run every line to the pane edge, and extended zone fills clip
-to the pane through `shape::clip_polygon_to_rect`. The shifted-pivot variants add a dashed A–B
-guide, and the pitchfan draws the levels as rays from A through the Andrews base. The Gann box
-divides its corners' box by the price `levels` and `tool_options.gann.time_levels`, with zone
-fills, ratio labels on all four sides, and optional `angles` from the pivot corner. Like the
-rectangle's interior, every zone fill of the family (pitchfork strips, fan sectors, Gann box
-zones, square arcs) is a drag target only while its drawing is selected. The Gann square draws
-the `levels` grid, the `angles` fan, and quarter-ellipse `arcs` around its pivot corner, plus an
-engine-formatted price range, bar count, and price-per-bar box. The fixed square is one anchor
-plus `size_bars` and an optional `scale_ratio` (without one it is square on screen). The Gann fan's
-`levels` are multiples of the 1×1 slope, which passes through the second anchor or rises
-`scale_ratio` price per bar. Its lines are rays by default, labeled `8x1` through `1x8`. Every
-tool of the family reaches past its anchors by a viewport-dependent amount, so the specs declare
-`Full` extents and the family's `paint_bounds` resolves the same corners and line ends in media
-px (an extended drawing keeps the pane). Crisp horizontal and vertical lines clamp to the pane
-with the dash-phase rule of `push_clipped_stroke` (`line::crisp_span`; executors dash them from their start pixel by
-pixel), and label boxes off the pane emit nothing, so an extreme level, size, or zoom never grows
-frame work with the geometry's length or leaves non-finite coordinates. Through the shared
-`handles` and `drag` hooks, the pitchforks and the pitchfan add a fourth handle on the base
-midpoint of B and C, which translates both by the midpoint's (magnet-snapped) move, and the fixed
-square adds its far corner, which resizes it: the corner's time sets `size_bars` in whole bars
-(1 at least) and its side of the anchor sets `reverse`; with a `scale_ratio` its price sets the
-ratio (Shift keeps it), and without one the square stays square on screen, sized by the corner's
-larger distance from the anchor. A pointer rounds the side to the nearest bar; a keyboard step
-moves it at least one whole bar the way the key moved (sized by the moved axis without a ratio), so
-sub-bar key presses accumulate. The option edit is part of the drag's single undo step. The
-fan's and the fixed square's `scale_ratio` is price per bar, so the family's
-`rescale_price_options` scales it with a price-basis rescale of the pivot anchor.
+叉形线与江恩族（`kinds/pitchforks_gann.rs`，wire id 96..=127）提供 `andrews_pitchfork`、`schiff_pitchfork`、`modified_schiff_pitchfork`、`inside_pitchfork`、`pitchfan`、`gann_box`、`gann_square`、`gann_square_fixed` 与 `gann_fan`。叉形线根据其锚点 A、B、C 解析出一套几何框架：中线枢轴（A；Schiff：取 A 的时间与 A、B 价格的中点；修正 Schiff 与内部叉形线：A 与 B 的中点）、基线中心（B 与 C 的中点；内部叉形线：C）以及半手柄（指向 C；内部叉形线：回指 B）。绘图 `levels` 的层级 `v` 是一对平行于中线、穿过 `center ± v · half` 的叉齿，因此层级 1 穿过手柄端点。未延长的线越过基线延伸一个中线的长度；`extend_left`/`extend_right` 把每条线都延伸到窗格边缘，而延长的区域填充通过 `shape::clip_polygon_to_rect` 裁剪到窗格。移位枢轴变体增加一条虚线 A–B 引导线，而 pitchfan 把各层级绘制为从 A 出发、穿过 Andrews 基线的射线。江恩框用价格 `levels` 与 `tool_options.gann.time_levels` 划分其角点所围的框，带有区域填充、四边的比例标签，以及从枢轴角点出发的可选 `angles`。与矩形内部一样，该族的每一种区域填充（叉形线条带、扇区、江恩框区域、方形弧）仅在其绘图被选中时才是拖动目标。江恩方形绘制 `levels` 网格、`angles` 扇形，以及围绕其枢轴角点的四分之一椭圆 `arcs`，外加一个由引擎格式化的价格范围、柱数与每柱价格框。固定方形由一个锚点、`size_bars` 与可选的 `scale_ratio` 构成（没有它时，它在屏幕上是正方形）。江恩扇形的 `levels` 是 1×1 斜率的倍数，该斜率穿过第二个锚点，或每柱上升 `scale_ratio` 个价格。它的线默认是射线，标签为 `8x1` 到 `1x8`。该族的每个工具都会越过其锚点延伸一个与视口相关的量，因此各规格声明 `Full` 范围，而该族的 `paint_bounds` 在媒体 px 中解析相同的角点与线端（延长的绘图保持整个窗格）。清晰的水平与垂直线按 `push_clipped_stroke` 的虚线相位规则钳制到窗格（`line::crisp_span`；执行器从其起始像素起逐像素绘制其虚线），窗格之外的标签框不输出任何内容，因此极端的层级、大小或缩放绝不会使帧工作量随几何长度增长，也不会留下非有限坐标。通过共享的 `handles` 与 `drag` 钩子，叉形线与 pitchfan 在 B 与 C 的基线中点上增加第四个手柄，它按该中点（经磁吸）的移动量同时平移 B 与 C；固定方形则增加其远端角点，用于调整其大小：角点的时间以整柱设置 `size_bars`（至少为 1），角点位于锚点的哪一侧则设置 `reverse`；有 `scale_ratio` 时，角点的价格设置该比例（Shift 保持比例不变），没有时方形在屏幕上保持正方形，其大小由角点到锚点的较大距离决定。指针会把边长取整到最近的柱；键盘步进至少沿按键移动的方向移动一整根柱（没有比例时按移动的那根轴确定大小），因此不足一柱的按键会累积。选项的编辑属于该次拖动的同一个撤销步骤。扇形与固定方形的 `scale_ratio` 是每柱的价格，因此该族的 `rescale_price_options` 会在枢轴锚点发生价格基准重新缩放时缩放它。
 <!-- B8: pitchforks_gann — end -->
 <!-- B8: projection_annotations — begin -->
-The Projection & Annotations family (`kinds/projection_annotations.rs`, wire ids 128..=159)
-delivers `forecast`, `bars_pattern`, `price_range`, `date_range`, `date_and_price_range`,
-`projection`, `anchored_text`, `note`, `price_note`, `callout`, `comment`, `price_label`,
-`signpost`, `flag_mark`, `arrow_mark_up`/`down`/`left`/`right`, `icon`, and KLineChart's
-`simple_tag` and `simple_annotation` (wire ids 147 and 148). Its options live in
-`tool_options.projection_annotation` (bars-pattern mode, mirror, flip, and copied bars; icon and
-icon size). It adds four hooks to `DrawingFamily`, each neutral by default: `on_create` (called
-before a new drawing is stored, by the armed tool's placement commit, which always captures since
-its options come from a tool template, and by `add_drawing`, which paste also uses and which keeps
-state its options already carry; sync and restore never call it), `owns_text` (the generic text
-pass skips the family's tools; they lay the common `text` out in their own parts),
-`pane_anchored` (per kind), and `reveals_on_focus` (a drawing that paints some parts only while
-hovered, selected, or edited; see the note below). A pane-anchored kind (`anchored_text`) stores its anchor as pane
-fractions (`logical` = x / pane width, `price` = y / pane height): every anchor conversion goes
-through `ChartEngine::drawing_anchor_px`/`drawing_anchor_from_px` (and `drawing_point_px`), so
-frames, hit tests, handles, drags, nudges, creation, stats, and `PartContext::point_px` agree. Its
-anchors carry no time (`set_pending_times` drops them, `resolve_drawing_anchors` ignores `time`,
-and restore ignores a non-time anchor-time sidecar), anchor resolution and drags clamp its
-fractions into `0..=1` (restore rejects a document outside that range), and it is never rebased
-on data changes, price-rescaled, magnet-snapped, or offset by paste or group moves. Culling uses
-full extents for it; the projection sector (a screen-px circle) declares full extents too, and the
-family's `paint_bounds` bounds it by the square around its apex reaching the radius point, padded
-by its stats box through `decoration_extent`.
+投影与标注族（`kinds/projection_annotations.rs`，wire id 128..=159）提供 `forecast`、`bars_pattern`、`price_range`、`date_range`、`date_and_price_range`、`projection`、`anchored_text`、`note`、`price_note`、`callout`、`comment`、`price_label`、`signpost`、`flag_mark`、`arrow_mark_up`/`down`/`left`/`right`、`icon`，以及 KLineChart 的 `simple_tag` 与 `simple_annotation`（wire id 147 与 148）。它的选项位于 `tool_options.projection_annotation` 中（柱形态模式、镜像、翻转与已复制的柱；图标与图标大小）。它向 `DrawingFamily` 添加四个钩子，默认均为中性：`on_create`（在新绘图被存储之前调用，由已激活工具的放置提交调用——该提交始终会进行捕获，因为其选项来自工具模板——以及由 `add_drawing` 调用，粘贴同样使用它，且它会保留其选项中已携带的状态；同步与恢复从不调用它）、`owns_text`（通用文本遍历会跳过该族的工具；它们把通用 `text` 布局在各自的部件中）、`pane_anchored`（按类型）与 `reveals_on_focus`（仅在悬停、选中或编辑时才绘制部分部件的绘图；见下方说明）。窗格锚定的类型（`anchored_text`）把其锚点存储为窗格比例（`logical` = x / 窗格宽度，`price` = y / 窗格高度）：每一次锚点转换都经过 `ChartEngine::drawing_anchor_px`/`drawing_anchor_from_px`（以及 `drawing_point_px`），因此帧、命中测试、手柄、拖动、微调、创建、统计与 `PartContext::point_px` 保持一致。它的锚点不携带时间（`set_pending_times` 会丢弃它们，`resolve_drawing_anchors` 忽略 `time`，恢复时忽略非时间锚点的锚点时间附带数据），锚点解析与拖动把其比例钳制到 `0..=1`（恢复会拒绝超出该范围的文档），并且它绝不会因数据变更而被重新定基、做价格重新缩放、磁吸，或被粘贴或成组移动所偏移。剔除对它使用完整范围；投影扇区（屏幕 px 的圆）也声明完整范围，该族的 `paint_bounds` 以包含其顶点并触及半径点的正方形为其界，并通过 `decoration_extent` 按其统计框外扩。
 
-`forecast` evaluates its outcome from its source series (`drawing_source_series`, followed
-through the shared `reads_series_data` hook, so a tick of that series that moves no scale still
-updates it) through the LOD extrema and latest-bar queries (logarithmic in the range): success once
-a bar after the source bar reaches the target by the target bar, failure once a traded bar after
-the target bar exists (whitespace rows such as future session slots are not bars). An as-of source
-has no canonical-row pyramid (its LOD summarizes plot points), so its outcome scans its canonical
-rows in the window once per data, axis, clock, or anchor change and is memoized per drawing like
-the regression fit.
-`bars_pattern` copies at most 128 OHLC bars once at creation (a longer range aggregates into 128
-buckets, each read from its LOD summary rows, so the capture and the placement preview that
-repeats it per frame stay logarithmic in the range; an as-of source's buckets scan its canonical
-rows, bounded by the capture window), pins its anchors on the copy's box (the first
-bar at the highest value, the last bar at the lowest), fits the copy into the anchors' box
-(divided by the copy's full range, so small anchor drags scale it proportionally and a price-basis
-rescale scales it exactly; flip turns it upside down within the box, mirror reverses time), and
-converts only the columns inside the pane each frame. The ghost never leaves the anchors' box, so
-it culls like any finite drawing. After its first click the projection shows the shared placement
-guide; after its second it previews the sector through the pointer. Named templates carry
-style only: `DrawingToolOptions::template_style` drops the copied bars, so applying a template
-restyles a pattern without replacing its copy, and like every template it never carries identity,
-placement, visibility, or text content (see the drawing contract above). Filled markers are single
-regions: convex polygons, paired-chain outlines (arrow marks), or triangle fans around a kernel
-for star-shaped outlines (star and heart icons), so paint and hit test cover exactly the same
-area. Persistence compares `text` against the kind default, so a cleared default label stays
-cleared. The text boxes of anchored text, the note, price note, callout, comment, price label,
-signpost, and arrow marks are shared text labels (`DrawingParts::text_label`; the price note's and
-price label's text follows their price line), so the host's inline editor edits them in place.
-Placing the anchored text, note, callout, comment, signpost, or simple annotation opens that editor at once
-(`DrawingToolSpec::requests_text_editor`, reported as `request_text_edit`), because each starts
-from a default text the user replaces or extends; the price note, the price label, and the arrow
-marks start with no text of their own and do not. That flag only requests the editor: the text
-focus border of the text tool follows `DrawingHandleMode::None`, so a placed note or callout
-keeps its anchor handles. The flag, the icon, the simple tag (its text is the axis tag), and the
-projection and measuring tools paint no text of their own on the chart. The note paints only its pin until
-it is hovered, selected, or edited, like the reference platform's note, unless
-`tool_options.projection_annotation.always_show_text` is set (serialized only when set); the
-family's `reveals_on_focus` hook names such a drawing, so frame construction rebuilds the retained
-drawings layer when it gains or loses hover or selection, while every other hover and selection
-change still only reassembles retained geometry. The culling pad counts an empty text as one line,
-the caret line its editor keeps.
+`forecast` 从其源系列（`drawing_source_series`，经共享的 `reads_series_data` 钩子跟踪，因此该系列中即使没有移动任何比例尺的 Tick 也会更新它）出发，通过 LOD 极值与最新柱查询（对范围为对数复杂度）来评估其结果：当源柱之后的某根柱至迟在目标柱处到达目标，即为成功；当目标柱之后存在有成交的柱，即为失败（空白数据行，例如未来的交易时段槽位，不算柱）。as-of 源没有规范行金字塔（其 LOD 汇总的是绘制点），因此其结果会在每次数据、坐标轴、时钟或锚点变化时对窗口内的规范行扫描一次，并像回归拟合一样按绘图记忆化。`bars_pattern` 在创建时一次性复制至多 128 根 OHLC 柱（更长的范围会聚合为 128 个桶，每个桶读取自其 LOD 汇总行，因此捕获以及每帧重复它的放置预览对范围保持对数复杂度；as-of 源的桶扫描其规范行，受捕获窗口限制），将其锚点固定在副本的外框上（第一根柱位于最高值，最后一根柱位于最低值），把副本拟合进锚点所围的框（以副本的完整范围为除数，因此小幅拖动锚点会按比例缩放它，价格基准重新缩放则会精确缩放它；flip 使其在框内上下颠倒，mirror 使时间反向），并且每帧只转换窗格内的列。虚影从不超出锚点所围的框，因此它像任何有限绘图一样被剔除。第一次点击后，投影显示共享的放置引导；第二次点击后，它通过指针预览扇区。具名模板只携带样式：`DrawingToolOptions::template_style` 会丢弃复制的柱，因此应用模板只会重新设置形态的样式而不替换其副本，并且与所有模板一样，它从不携带标识、放置、可见性或文本内容（见上文的绘图契约）。填充标记是单一区域：凸多边形、成对链轮廓（箭头标记），或围绕核的三角扇（用于星形轮廓，即星形与心形图标），因此绘制与命中测试覆盖完全相同的区域。持久化会将 `text` 与该种类的默认值比较，因此被清除的默认标签保持为已清除。锚定文本、便签、价格便签、标注框、评论、价格标签、路标和箭头标记的文本框都是共享文本标签（`DrawingParts::text_label`；价格便签与价格标签的文本跟随其价格线），因此宿主的内联编辑器可以就地编辑它们。放置锚定文本、便签、标注框、评论、路标或简单标注会立即打开该编辑器（`DrawingToolSpec::requests_text_editor`，以 `request_text_edit` 上报），因为它们各自都从一段默认文本开始，用户会替换或扩展该文本；价格便签、价格标签和箭头标记起初没有自己的文本，因此不会打开。该标志位只请求打开编辑器：文本工具的文本焦点边框遵循 `DrawingHandleMode::None`，因此已放置的便签或标注框保留其锚点手柄。旗标、图标、简单标签（其文本即坐标轴标签），以及投影与测量工具，都不会在图表上绘制自己的文本。便签在被悬停、选中或编辑之前只绘制其图钉，与参考平台的便签一致，除非设置了 `tool_options.projection_annotation.always_show_text`（仅在设置时序列化）；该族的 `reveals_on_focus` 钩子会指明这样的绘图，因此当它获得或失去悬停或选择时，帧构建会重建保留的绘图层，而其他所有悬停与选择变化仍只会重新组装保留的几何。剔除边距把空文本计为一行，即其编辑器保留的插入符行。
 <!-- B8: projection_annotations — end -->
 <!-- B8: patterns_elliott_cycles — begin -->
-The Patterns, Elliott waves, and cycles family (`kinds/patterns_elliott_cycles.rs`, wire ids
-160..=191) delivers `xabcd_pattern`, `cypher_pattern`, `abcd_pattern`, `head_and_shoulders`,
-`triangle_pattern`, `three_drives_pattern`, `elliott_impulse_wave`, `elliott_correction_wave`,
-`elliott_triangle_wave`, `elliott_double_combo`, `elliott_triple_combo`, `cyclic_lines`,
-`time_cycles`, and `sine_line`, all `ClickAnchors` tools with one handle per anchor. Patterns are a
-zigzag through the anchors with boxed point labels placed above highs and below lows; XABCD, cypher,
-ABCD, and three drives add dashed connectors labeled with the conventional price ratios of their
-legs (`tool_options.pattern.show_ratios`), every connector painted beneath every label, and the
-culling pad measures the drawing's actual point, ratio, and wave labels; XABCD and cypher shade
-their two triangles, head and shoulders draws the neckline between the outer legs and shades the
-shoulders and head against it, and the triangle pattern extends its A–C and B–D sides to their apex
-when it lies ahead within one pattern width (its spec pads the logical bounds by that width and
-never culls on price). Elliott waves label each wave in the notation of
-`tool_options.pattern.degree`; ringed degrees draw the ring as stroke geometry instead of a circled
-glyph, so no executor depends on font coverage. Cycles resolve repeats only across the visible pane:
-cyclic lines from the earlier anchor rightward, time-cycle arches and the sine wave in both
-directions; repeats closer than 3 CSS px collapse to the defining cycle, and the arches and the wave
-each stay within a 16,384-point tessellation budget. Fills are body targets only while the drawing
-is selected (the rectangle convention). Every part resolves from any anchor prefix, so the family
-sets the shared `partial_preview` and previews multi-anchor placement from the second anchor on.
-It also adds the generic `aeris_charts_render::shape::line_intersection`.
+“形态、艾略特波浪与周期”族（`kinds/patterns_elliott_cycles.rs`，wire id 160..=191）提供 `xabcd_pattern`、`cypher_pattern`、`abcd_pattern`、`head_and_shoulders`、`triangle_pattern`、`three_drives_pattern`、`elliott_impulse_wave`、`elliott_correction_wave`、`elliott_triangle_wave`、`elliott_double_combo`、`elliott_triple_combo`、`cyclic_lines`、`time_cycles` 和 `sine_line`，它们都是 `ClickAnchors` 工具，每个锚点对应一个手柄。形态是穿过各锚点的之字形折线，带框的点标签放置在高点上方和低点下方；XABCD、cypher、ABCD 和 three drives 还会添加虚线连接线，并标注其各段的惯用价格比率（`tool_options.pattern.show_ratios`），每条连接线都绘制在所有标签之下，剔除边距则按该绘图实际的点、比率和波浪标签来度量；XABCD 与 cypher 为各自的两个三角形着色，头肩形态在外侧两腿之间绘制颈线，并相对于颈线为双肩与头部着色，三角形态在顶点位于前方一个形态宽度以内时，将其 A–C 与 B–D 边延伸至顶点（其规格把逻辑边界按该宽度外扩，且绝不按价格剔除）。艾略特波浪按 `tool_options.pattern.degree` 的记法标注每一浪；带圆圈的级别把圆圈绘制为描边几何，而不是带圈字形，因此没有任何执行器依赖字体覆盖。周期仅在可见窗格范围内解析重复：周期线自较早的锚点向右，时间周期弧与正弦波向两个方向；间距小于 3 CSS px 的重复会合并为定义周期，弧与波各自保持在 16,384 点的网格化预算之内。填充仅在绘图被选中时才是主体目标（矩形的约定）。每个部件都能由任意锚点前缀解析，因此该族设置共享的 `partial_preview`，并从第二个锚点起预览多锚点放置。该族还新增了通用的 `aeris_charts_render::shape::line_intersection`。
 <!-- B8: patterns_elliott_cycles — end -->
 <!-- B8: shapes — begin -->
-The Shapes family (`kinds/shapes.rs`, wire ids 192..=223) delivers `rotated_rectangle`, `ellipse`,
-`circle`, `triangle`, `arc`, `curve`, `double_curve`, `polyline`, and `highlighter`. Every shape
-resolves in caller px from its anchors, so a circle stays round and a rotated rectangle keeps its
-right angles at any zoom and bitmap ratio. The rotated rectangle's first two anchors are its short
-sides' midpoints and the third lies on a long side; the ellipse is inscribed in its two corners and
-edits with the rectangle's eight bounds handles; the circle is its center and a rim point; the arc
-runs from the first anchor to the second through the third (their chord when collinear); the curve
-and double curve pass through every anchor (the quadratic's third at t = 1/2, the cubic's third and
-fourth at 1/3 and 2/3), and `extend_left`/`extend_right` continue their end tangents to the pane
-edge. Closed outlines start mid-edge so their butt ends meet collinearly; open strokes (arc, curves,
-open polyline) carry end caps through the shared `capped_polyline`, pointing along the exact end
-tangents. Fills use `fill_color` or the stroke color at 20% (the rectangle's wash), are body targets
-only while the drawing is selected, and never overlap themselves: convex regions through
-`fill_convex`, concave or self-crossing ones (a closed polyline, a cubic's chord region) through the
-shared `fill_polygon` over `shape::nonzero_ribbon`. That tessellation is bounded work with no
-coarsening fallback (unlike the highlighter's tube below): more than `shape::MAX_FILL_VERTICES`
-(2,048) vertices, more than 4,096 proper edge crossings, or more than 8,192 output rungs yield no
-fill part, so the drawing paints its outline only and has no interior body target. Hit testing
-rebuilds the same parts, so paint and hit agree, and every backend executes the same frame. Nothing
-reports it: drawings have no diagnostics channel, and `closed` can be toggled after creation, so
-add-time validation could not cover the vertex bound. The vertex bound is also the only limit on the
-pairwise edge scan of a polygon without crossings, and all three values are safety limits, not
-tuned ones. The decision covers the whole unclipped polygon, so a 3,000-vertex polygon with 50
-vertices on screen loses its whole fill; on a linear price scale it does not change while panning,
-and on a log scale the crossing count can change with zoom. A curve's chord region flattens to at
-most 1,024 points, so in practice only a closed polyline, whose vertex count the host controls,
-reaches the bounds. Lifting them means coarsening like `shape::tube_ribbon` or clipping to the pane
-before filling, at a parity risk: do it for a demonstrated host need with a release benchmark, and
-never by raising the constant alone. Curves and circles flatten through clip-aware
-helpers (`shape::flatten_quadratic`/`flatten_cubic`, `EllipseArc::append_clipped_points`) that
-refine only where the curve can be visible and spend at most 1,024 points, so a zoomed-in circle
-thousands of px wide stays within 0.25 px on screen (a wholly visible arc takes the cheaper uniform
-chords). The rotated rectangle, circle, and arc reach screen-derived distances that no semantic box
-bounds and keep full extents; the curves pad their logical span by the interpolation overshoot. One
-shape box serves two hooks: the family's own `text_box` gives box-layout text the shape's box (a
-circle's rather than its center-to-rim anchors'), and the shared `paint_bounds` makes it the exact
-screen culling box of those full-extent tools, so they reach part building and precise hit testing only
-near the viewport or pointer. The highlighter is a freehand
-capture painted as the shared `Tube` part: the region within half its width of the path with round
-joins and caps, built by `shape::tube_ribbon` from the runs that can reach the pane, simplified
-within the chord tolerance in one pass, outlined so the nonzero rule yields exactly the union, and
-tessellated into non-overlapping strips. Its 40% amber therefore blends once per pixel on every
-executor instead of darkening where GPU stroke triangles overlap; the tolerance doubles when a
-stroke exceeds the fill bounds, and only past the coarsest attempt does it fall back to a plain
-stroke. Its hit test is the stroke distance. The multi-anchor shapes show the shared placement
-guide until every anchor but the last is placed, then preview their own parts through the pointer. Through the shared `handles` and `drag` hooks, the rotated rectangle's
-handles are its axis ends plus derived width handles at its long sides' midpoints (the third anchor
-has no handle of its own): a width handle sets the half width to its target's distance from the
-axis, and an axis-end drag re-places the third anchor at the baseline width about the new axis, so
-rotating the axis never collapses it; the width point is stored on its long side's midpoint
-without time snapping. The polyline sets the shared `close_placement`: clicking its first vertex
-once three are placed closes and commits it.
+“形状”族（`kinds/shapes.rs`，wire id 192..=223）提供 `rotated_rectangle`、`ellipse`、`circle`、`triangle`、`arc`、`curve`、`double_curve`、`polyline` 和 `highlighter`。每个形状都从其锚点以调用方 px 解析，因此圆始终是圆形，旋转矩形在任何缩放和位图比例下都保持直角。旋转矩形的前两个锚点是其两条短边的中点，第三个锚点位于一条长边上；椭圆内接于其两个角点，并使用矩形的八个边界手柄进行编辑；圆由其圆心和一个圆周点确定；圆弧从第一个锚点到第二个锚点，并经过第三个锚点（共线时为它们的弦）；曲线和双曲线经过每个锚点（二次曲线的第三个点位于 t = 1/2，三次曲线的第三和第四个点位于 1/3 与 2/3），`extend_left`/`extend_right` 将它们的端点切线延伸到窗格边缘。闭合轮廓从边的中点起笔，使其平头端相接时共线；开放描边（圆弧、曲线、开放折线）通过共享的 `capped_polyline` 携带端帽，端帽沿精确的端点切线方向。填充使用 `fill_color`，或使用 20% 的描边颜色（矩形的淡色底），仅在绘图被选中时才是主体目标，并且绝不自身重叠：凸区域通过 `fill_convex`，凹区域或自相交区域（闭合折线、三次曲线的弦区域）通过基于 `shape::nonzero_ribbon` 的共享 `fill_polygon`。该网格化是有界工作，没有粗化回退（与下文荧光笔的 tube 不同）：顶点数超过 `shape::MAX_FILL_VERTICES`（2,048）、边的真交叉超过 4,096 次，或输出梯级超过 8,192 个时，都不会产生填充部件，因此该绘图只绘制其轮廓，也没有内部主体目标。命中测试会重建相同的部件，因此绘制与命中一致，且每个后端执行的是同一帧。不会对此做任何上报：绘图没有诊断通道，且 `closed` 可以在创建后切换，因此添加时的校验无法覆盖顶点上限。对于没有交叉的多边形，顶点上限同时也是成对边扫描的唯一限制，且这三个值都是安全限制，而非调优得出的值。该判定针对的是未裁剪的整个多边形，因此一个 3,000 顶点的多边形即使只有 50 个顶点在屏幕上，也会失去其全部填充；在线性价格比例尺上，平移时判定不会改变，而在对数比例尺上，交叉计数可能随缩放变化。曲线的弦区域至多展平为 1,024 个点，因此实际上只有闭合折线（其顶点数由宿主控制）才会触及这些上限。解除这些上限意味着像 `shape::tube_ribbon` 那样粗化，或在填充前裁剪到窗格，并伴随一致性风险：应针对已被证实的宿主需求并配合 release 基准测试来做，绝不能仅靠调高常量来实现。曲线和圆通过感知裁剪的辅助函数（`shape::flatten_quadratic`/`flatten_cubic`、`EllipseArc::append_clipped_points`）展平，这些函数仅在曲线可能可见之处细化，且至多花费 1,024 个点，因此放大后宽达数千 px 的圆在屏幕上的误差仍在 0.25 px 以内（完全可见的圆弧采用更廉价的均匀弦）。旋转矩形、圆和圆弧会达到由屏幕推导出的距离，没有任何语义框能界定它们，因此保持完整范围；曲线则按插值过冲来外扩其逻辑跨度。同一个形状框服务于两个钩子：该族自己的 `text_box` 为框布局文本提供形状的框（圆用其自身的框，而不是由圆心到圆周的锚点所定的框），共享的 `paint_bounds` 则使其成为这些完整范围工具精确的屏幕剔除框，因此它们只有在靠近视口或指针时才会进入部件构建和精确命中测试。荧光笔是一次手绘捕获，以共享的 `Tube` 部件绘制：即与路径的距离在其宽度一半以内的区域，带圆角连接与圆形端帽，由 `shape::tube_ribbon` 根据能够到达窗格的各段构建，在单次遍历中按弦容差简化，勾勒轮廓使非零规则恰好得到并集，并网格化为互不重叠的条带。因此它的 40% 琥珀色在每个执行器上每个像素只混合一次，而不会在 GPU 描边三角形重叠处变暗；当一笔描边超出填充上限时，容差翻倍，仅当最粗的尝试也失败之后才回退为普通描边。其命中测试采用到描边的距离。多锚点形状在除最后一个锚点之外的所有锚点都放置完成之前显示共享的放置引导，之后通过指针预览它们自己的部件。通过共享的 `handles` 与 `drag` 钩子，旋转矩形的手柄是其轴线两端，外加位于其长边中点的派生宽度手柄（第三个锚点没有自己的手柄）：宽度手柄把半宽设为其目标到轴线的距离，拖动轴线端点则会按基线宽度围绕新的轴线重新放置第三个锚点，因此旋转轴线绝不会使其塌缩；宽度点存储在其长边的中点上，不做时间磁吸。折线设置共享的 `close_placement`：放置三个顶点后，点击其第一个顶点即可将其闭合并提交。
 <!-- B8: shapes — end -->
 
-Wire ids are reserved per family: core 0..=31, lines 32..=47, channels 48..=63, fibonacci 64..=95,
-pitchforks_gann 96..=127, projection_annotations 128..=159, patterns_elliott_cycles 160..=191,
-shapes 192..=223; 224..=255 are unassigned. A test asserts every spec sits in its family's range
-with a unique wire id and name, and that the serde and catalog names agree.
+Wire id 按族预留：core 0..=31、lines 32..=47、channels 48..=63、fibonacci 64..=95、pitchforks_gann 96..=127、projection_annotations 128..=159、patterns_elliott_cycles 160..=191、shapes 192..=223；224..=255 尚未分配。一项测试断言每个规格都位于其所属族的范围内，且具有唯一的 wire id 与名称，并且 serde 名称与目录名称一致。
 
-Single-list registries carry one `// B8: <family> — begin/end` block per family (`<!-- -->` in
-HTML). A family edits only inside its own blocks, so parallel family work merges additively:
+单一列表的注册表为每个族携带一个 `// B8: <family> — begin/end` 块（在 HTML 中为 `<!-- -->`）。每个族只在其自己的块内编辑，因此并行的族工作可以以累加方式合并：
 
-| File | Blocks |
+| 文件 | 块 |
 | --- | --- |
-| `drawings.rs` | `DrawingKind` variants |
-| `drawings/tools.rs` | `DRAWING_TOOL_SPECS` entries; `DrawingKind::spec()` arms |
-| `drawings/kinds/mod.rs` | `mod` declaration; new family-specific `DrawingFamily` hooks and their defaults in `DrawingFamily::new` (a hook a second family needs, or one the foundation adds for every family, moves out of the blocks); wire-range test table |
-| `drawing_contract.rs` | `DrawingKindOptions` variants; `DrawingToolOptions` fields, `validate` checks, and `template_style` clears of captured data |
-| `lib.rs` | public re-exports of family option types |
-| `packages/charts/src/types.ts` | `drawing_kind` union; `DRAWING_KIND_TO_U8`; `drawing_kind_options`; family option types; `drawing_tool_options` |
-| `examples/web_demo/index.html` | drawing toolbar buttons |
-| `docs/Public_api.md` | drawing family catalog |
-| `docs/Architecture.md` | family semantics paragraph (above) |
+| `drawings.rs` | `DrawingKind` 变体 |
+| `drawings/tools.rs` | `DRAWING_TOOL_SPECS` 条目；`DrawingKind::spec()` 分支 |
+| `drawings/kinds/mod.rs` | `mod` 声明；新增的族专属 `DrawingFamily` 钩子及其在 `DrawingFamily::new` 中的默认值（第二个族也需要的钩子，或基础层为每个族新增的钩子，会移出这些块）；wire 范围测试表 |
+| `drawing_contract.rs` | `DrawingKindOptions` 变体；`DrawingToolOptions` 字段、`validate` 检查，以及对所捕获数据的 `template_style` 清除 |
+| `lib.rs` | 族选项类型的公共再导出 |
+| `packages/charts/src/types.ts` | `drawing_kind` 联合类型；`DRAWING_KIND_TO_U8`；`drawing_kind_options`；族选项类型；`drawing_tool_options` |
+| `examples/web_demo/index.html` | 绘图工具栏按钮 |
+| `docs/Public_api.md` | 绘图族目录 |
+| `docs/Architecture.md` | 族语义段落（见上文） |
 
-The `drawing_perf` native example measures every tool with a wire id of 32 or more in its
-`families` mix and places each with its catalog anchor count, so family work never edits it.
+`drawing_perf` 原生示例会在其 `families` 组合中测量每个 wire id 为 32 或更大的工具，并按目录中的锚点数放置每个工具，因此族的工作绝不需要编辑它。
 
-Recipe for a family:
+族的实现步骤：
 
-1. Add the `DrawingKind` variants (the serde name is the spec name) and, in
-   `kinds/<family>.rs`, the specs with wire ids inside the family's range plus
-   `pub(crate) static FAMILY`, built with `DrawingFamily::new(build_parts, kind_options)` and
-   assigning the optional hooks it needs. Declare the module and list the specs and `spec()` arms
-   in their blocks.
-2. Resolve geometry only through `DrawingParts` using the shared helpers; add pure geometry to
-   `aeris_charts_render::shape` when it is generic. Never emit `Prim`s or branch on kinds in the
-   frame, hit tester, executors, WASM, or hosts. Map derived points with `PartContext::point_px`
-   and size strokes, glyphs, and gaps by the `PartContext.scale` ratio. Use the existing placement
-   classes and the `Anchors`, `Endpoints`, `RectangleBounds`, or `Position` handle modes. Derived
-   (non-anchor) handles and their drags go through the shared `handles` and `drag` hooks, and a
-   multi-click close through `close_placement`, never through per-family drag or placement code.
-   Paint a drawing's own `text` as `DrawingParts::text_label` over `PartContext::text_lines`, which
-   makes it editable in place with no host or WASM code; such a family sets `owns_text` so the
-   generic text pass does not paint the same `text` again. `owns_text` still lives in the
-   projection_annotations block of `kinds/mod.rs`, so the second family to set it first moves the
-   field and its default out of those blocks to the shared hooks (and its description from the
-   projection paragraph to the shared hook list).
-3. Put family options in one serde-default struct in the module, add its field to
-   `DrawingToolOptions` (plus an `&& ...` check in `validate` for lists, strings, or numbers), a
-   `DrawingKindOptions` variant, a `lib.rs` re-export, and schema descriptors named
-   `tool_options.<block>.<field>`. Persistence, clipboard, sync, templates, and WASM need no
-   family code, except that data a drawing captures (not style) is cleared for named templates
-   in `template_style`.
-4. Add the TypeScript union members, wire ids, kind-option and option types, the demo toolbar
-   buttons, and the `Public_api.md` entry in their blocks; `impl.ts` derives its reverse wire map.
-   `packages/charts/api/public-api-v1.json` is a generated hash that every stream changes;
-   regenerate it (`bun run update:api`) after merging instead of merging it.
-5. Tests: the wire-range table entry; family engine tests for defaults, armed placement, frame
-   parts at DPR 1 and 2 and at a fractional DPR whose bitmap ratios differ, hit testing including indexed against brute force with more than 20
-   drawings, anchor and body drags with straighten and magnet, keyboard handle count and nudge, time
-   identity across an interval switch, schema and kind options, atomic and undoable option
-   patches, persistence round trip with default omission, clipboard, and sync, and that the
-   drawing's own text paints exactly once; and a Playwright
-   spec (`drawings-<family>.spec.mjs`) for armed placement, hover and hit, options, persistence,
-   clipboard and sync, the toolbar, and WebGPU against Canvas2D parity.
+1. 添加 `DrawingKind` 变体（serde 名称即规格名称），并在 `kinds/<family>.rs` 中添加 wire id 位于该族范围内的规格，以及 `pub(crate) static FAMILY`，它由 `DrawingFamily::new(build_parts, kind_options)` 构建，并为其赋值所需的可选钩子。在各自的块中声明该模块，并列出规格与 `spec()` 分支。
+2. 只通过 `DrawingParts` 并使用共享辅助函数来解析几何；当纯几何具有通用性时，将其添加到 `aeris_charts_render::shape`。绝不在帧、命中测试器、执行器、WASM 或宿主中发出 `Prim`，也不得在这些位置按种类分支。用 `PartContext::point_px` 映射派生点，并按 `PartContext.scale` 比例确定描边、字形和间隙的尺寸。使用现有的放置类别以及 `Anchors`、`Endpoints`、`RectangleBounds` 或 `Position` 手柄模式。派生（非锚点）手柄及其拖动通过共享的 `handles` 与 `drag` 钩子完成，多次点击闭合则通过 `close_placement` 完成，绝不通过各族自己的拖动或放置代码。将绘图自身的 `text` 以 `DrawingParts::text_label` 绘制，基于 `PartContext::text_lines`，这使其无需任何宿主或 WASM 代码即可就地编辑；这样的族会设置 `owns_text`，使通用文本 pass 不会再次绘制同一份 `text`。`owns_text` 目前仍位于 `kinds/mod.rs` 的 projection_annotations 块中，因此第二个设置它的族须先把该字段及其默认值从这些块移到共享钩子（并把其说明从投影段落移到共享钩子列表）。
+3. 将族选项放入该模块中的一个带 serde 默认值的结构体，把它的字段添加到 `DrawingToolOptions`（对列表、字符串或数字，还要在 `validate` 中增加 `&& ...` 检查），再添加一个 `DrawingKindOptions` 变体、一个 `lib.rs` 再导出，以及名为 `tool_options.<block>.<field>` 的 schema 描述符。持久化、剪贴板、同步、模板和 WASM 不需要任何族专属代码，唯一的例外是绘图捕获的数据（而非样式）在具名模板中会由 `template_style` 清除。
+4. 在各自的块中添加 TypeScript 联合类型成员、wire id、种类选项与选项类型、演示工具栏按钮，以及 `Public_api.md` 条目；`impl.ts` 会派生其反向 wire 映射。`packages/charts/api/public-api-v1.json` 是一个生成的哈希，每个并行工作流都会修改它；应在合并之后重新生成它（`bun run update:api`），而不是合并它。
+5. 测试：wire 范围表条目；族引擎测试，覆盖默认值、已激活工具的放置、DPR 为 1 和 2 以及位图比例互不相同的小数 DPR 下的帧部件、命中测试（包括在超过 20 个绘图时将索引化结果与暴力遍历对照）、带拉直与磁吸的锚点拖动与主体拖动、键盘手柄数量与微调、跨周期切换的时间标识、schema 与种类选项、原子且可撤销的选项补丁、省略默认值的持久化往返、剪贴板与同步，以及绘图自身的文本恰好只绘制一次；以及一个 Playwright 规格（`drawings-<family>.spec.mjs`），覆盖已激活工具的放置、悬停与命中、选项、持久化、剪贴板与同步、工具栏，以及 WebGPU 与 Canvas2D 的一致性。
 
-Versioned persistence is an engine-owned semantic DTO boundary, never serialization of live engine
-structs. Financial-only charts continue to export V1 with ordered pane topology, built-in
-drawings (with optional inline anchor times), and the optional drawing price-basis label. V2 adds pane horizontal domains, general axes, typed general datasets (including
-row identities and labels), general series bindings, and chart options. V1 restoration and its
-fixtures remain unchanged; V2 validates on a detached engine before committing general state and
-rebuilds browser series handles from an engine catalog. Pane persistence identity is
-separate from live `PaneId`: import preserves document references while issuing fresh monotonic live
-IDs, so pre-import pane and price-scale handles become stale. The complete document is size-bounded,
-parsed, and validated before one transactional install; drawing bounds, candidates, and geometry are
-rebuilt once from anchors. Financial market history and series/indicator definitions, extensions,
-callbacks, and every runtime cache remain host-owned or derived. Unknown versions and semantic kinds
-fail structurally without mutation.
+版本化持久化是由引擎拥有的语义 DTO 边界，绝不是对运行中引擎结构体的序列化。纯金融图表继续导出 V1，其中包含有序的窗格拓扑、内置绘图（可带内联锚点时间）以及可选的绘图价格基准标签。V2 增加了窗格水平定义域、通用坐标轴、类型化通用数据集（包括行标识与标签）、通用系列绑定以及图表选项。V1 的恢复及其夹具保持不变；V2 会在分离的引擎上先校验，再提交通用状态，并根据引擎目录重建浏览器系列句柄。窗格持久化标识与运行时的 `PaneId` 相互独立：导入会保留文档引用，同时签发新的单调递增的运行时 ID，因此导入前的窗格与价格比例尺句柄会变为过期。完整文档在一次事务性安装之前先受大小限制、解析并校验；绘图边界、候选项与几何会由锚点一次性重建。金融行情历史与系列/指标定义、扩展、回调以及所有运行时缓存仍由宿主拥有或为派生数据。未知版本与未知语义种类会在结构层面失败，且不产生任何变更。
 
-Named price-scale descriptors and series bindings remain host-owned configuration and are not added
-to chart-state V1. A restoring host recreates pane-local named scales before reinstalling or rebinding
-its series.
+具名价格比例尺描述符与系列绑定仍是宿主拥有的配置，不会加入图表状态 V1。执行恢复的宿主会在重新安装或重新绑定其系列之前，重建窗格本地的具名比例尺。
 
-The browser split grid is the active-chart router. Its stable workspace cell ID decides which
-independent chart receives a global drawing tool, document shortcut, or view reset; the receiving
-chart retains all drawing selection, hit testing, mutation semantics, and history. An armed toolbar
-tool migrates between active cells, but drawing selection never does. The grid's host-facing
-workspace state is a small composition of the validated generic split layout, optional active/stable
-cell identity, and one unchanged chart persistence V1 document per cell. Optional instrument identities are opaque
-host strings. The host stores this composition and restores market history, subscriptions, and
-host-owned series/indicator definitions after the grid restores each Aeris chart document; the
-restored drawings' anchor times resolve when that data arrives.
-Native and browser hosts restore that generic layout through the same typed workspace transaction.
-Hosts may issue nonzero stable `u64` cell identities when creating or splitting a workspace; the
-engine validates uniqueness and overflow before mutation, owns boundary lookup and absolute resize,
-and projects normalized legacy basis-point weights. A host must not replay splits or maintain a
-parallel engine-cell-to-host-pane identity map.
+浏览器分屏网格是活动图表的路由器。其稳定的工作区单元格 ID 决定哪个独立图表接收全局绘图工具、文档快捷键或视图重置；接收的图表保留全部绘图选择、命中测试、变更语义与历史。已激活的工具栏工具会在各活动单元格之间迁移，但绘图选择绝不会迁移。该网格面向宿主的工作区状态是一个小型组合，由经过校验的通用分屏布局、可选的活动/稳定单元格标识，以及每个单元格一份未经改动的图表持久化 V1 文档组成。可选的品种标识是不透明的宿主字符串。宿主存储这一组合，并在网格恢复每个 Aeris 图表文档之后，恢复行情历史、订阅以及宿主拥有的系列/指标定义；已恢复绘图的锚点时间在这些数据到达时解析。原生与浏览器宿主通过同一个类型化工作区事务来恢复该通用布局。宿主在创建或拆分工作区时，可以签发非零的稳定 `u64` 单元格标识；引擎会在变更之前校验唯一性与溢出，拥有边界查找与绝对尺寸调整，并映射出归一化后的旧版基点权重。宿主不得重放拆分，也不得维护一份并行的引擎单元格到宿主窗格的标识映射。
 
 ### `aeris_charts_render`
 
-Backend-neutral drawing primitives, colors, geometry, bar-width rules, and the ordered `DrawList`. This is the contract shared by every renderer. The `shape` module holds the pure `f64` drawing-tool geometry that engine drawing families share: segment extension, line/segment clipping, polyline clipping (`clip_polyline_to_rect`), polygon clipping (`clip_polygon_to_rect`, `clip_to_half_plane`), parallel offsets, uniform arc/ellipse tessellation bounded to 256 chords (`EllipseArc::append_points`), clip-aware curve flattening that refines only where the curve can be visible under a 1,024-point budget (`EllipseArc::append_clipped_points`, `flatten_quadratic`, `flatten_cubic`), nonzero-winding ribbon fills (`nonzero_ribbon`), tube outlines and ribbons, polyline simplification, and polyline/polygon/ribbon hit predicates. It never snaps to pixels. Pixel snapping, primitive ordering, clipping intent, and geometry must be decided before backend execution whenever possible. Curved polylines expand their Catmull-Rom spline adaptively by device-px interval length — intervals already a few pixels long render as their chord (dense freehand brush samples), long sparse intervals keep up to 16 segments — and round joins are emitted only where a turn opens a visible wedge, so tessellation volume stays proportional to what the pixels can show on every backend. Polyline strokes for the GPU backends come from one shared anti-aliased stroker (`line::stroke_aa`): a solid core ending half a device pixel inside the nominal edge, a centered one-pixel coverage transition, faded butt caps, and round joins that fill only the outer wedge of a turn. Neighboring segment triangles are clipped at each joint bisector so translucent inner turns cannot blend twice. A joint clips only when both neighbors extend past the inner geometry each must cover for the other, decided from a fixed four-segment window without allocation; sharp turns between short segments (dense zig-zags, wide strokes) keep both segments whole, accepting a doubly blended inner turn instead of an uncovered notch. It emits each vertex with a signed edge distance, and each executor chooses the encoding — WebGPU multiplies vertex alpha by coverage on top of MSAA, GPUI writes the path shader `st` channel — so both backends tessellate identical geometry. Area fills split segments where their line crosses the base, and band fills use shared crossing triangles where their upper and lower lines swap; neither GPU paints overlapping bow-tie triangles. `line::build_area_fill` records which segments cross, and GPUI traces each resulting lobe separately for its edge fringe from that list rather than by comparing coordinates. Line points are never snapped to the pixel grid: sub-pixel positions plus coverage are what keep diagonals smooth. The shared draw-list admission rule drops circles with non-finite or non-positive radii and polylines with non-finite or non-positive widths before any executor changes paint state. The Canvas2D contract strokes with round joins and butt caps, matching the reference line renderer. `line::round_rect_polygon` is likewise the single rounded-rectangle tessellation for WebGPU and GPUI, with corner chords scaled to the device radius. For an inside border, `line::round_rect_border` returns the ring triangles together with the outer and inner contours; both executors fan the inner fill over exactly the ring's inner vertices, so fill and ring share their boundary at rounded corners. Shared `line::circle_segments` bounds full-circle chord error to 0.1 device pixel through radius 200, with a 256-segment work cap, and supplies disc, ring, and native arc tessellation. Every executor honors `Prim::Polyline.style`: Canvas2D and native through their dash APIs, GPUI and WebGPU by splitting the expanded simple, stepped, or curved path with the shared `line::dash_split` and stroking each run solid, so no backend invents its own phase rule; that walk is capped at `MAX_DASH_STEPS` (a pattern too fine for the path strokes solid and a non-finite path length strokes nothing), so host-supplied widths and coordinates cannot stall a frame. Producers still lower their own dashes before the executors see them, because the executor walk covers the whole path while a producer can restrict it to what the pane shows: this crate owns that dash lowering in `line` (`dash_split`, `dash_runs`, `push_line_stroke`, `push_clipped_stroke`, `push_styled_stroke`, and `crisp_span` for crisp horizontal and vertical lines). Clipping bounds only how far a stroke reaches past the pane; the dash count inside it follows the path's visible length, so `dash_run_bound` reports an upper bound on the runs `push_styled_stroke` would emit, for producers fed by untrusted geometry. Engine frame construction lowers series lines through `push_line_stroke` and drawings and general series through `push_styled_stroke`/`push_clipped_stroke`, and the browser host lowers decoded JS primitive commands through the same functions (see `aeris_charts_wasm`), so engine and browser strokes reach every executor as the same solid dash runs whoever produced them, with the dash count and phase decided over the visible reach instead of the whole path. `Prim::Segments` is the one batch primitive: `segment_count` independent two-point pairs over the point pool, each stroked exactly like a solid simple two-point `Polyline` (butt caps, no joins, dashes already expanded by the shared `line::dash_runs`). The engine emits pairs ascending in x, each spanning at most one bar, and neighbours touch at their endpoints (overlapping by float rounding). An executor may stroke the batch as one path or one mesh, and the only visible difference from separate strokes is at those shared boundary pixels: Canvas2D and the native rasterizer stroke one path, so coverage unions there (seam-free), while WebGPU and GPUI tessellate each pair with the shared stroker, vertex for vertex like separate polylines, and composite twice. Every executor drops a batch whose range leaves the pool (`draw_list::segment_points`, checked `usize` math because `usize` is 32 bits on wasm32). `Prim` is a public enum without `#[non_exhaustive]`, so the variant is a breaking change for downstream exhaustive matches: a host that consumes a pinned revision (Aeris Terminal) adds the arm when it moves the pin. Frame assembly rebases pool indices through `shift_point_indices` (the native image export does not, because it executes each pane's draw list against that pane's own pool), and it and the WebGPU tessellator match every variant explicitly, so a future pool-indexed primitive fails to compile until each handles it.
+与后端无关的绘制图元、颜色、几何、柱宽规则，以及有序的 `DrawList`。这是所有渲染器共享的契约。`shape` 模块包含引擎各绘图族共享的纯 `f64` 绘图工具几何：线段延伸、直线/线段裁剪、折线裁剪（`clip_polyline_to_rect`）、多边形裁剪（`clip_polygon_to_rect`、`clip_to_half_plane`）、平行偏移、上限为 256 条弦的均匀圆弧/椭圆网格化（`EllipseArc::append_points`）、仅在曲线可能可见之处细化且受 1,024 点预算约束的感知裁剪曲线展平（`EllipseArc::append_clipped_points`、`flatten_quadratic`、`flatten_cubic`）、非零缠绕的带状填充（`nonzero_ribbon`）、tube 轮廓与带状体、折线简化，以及折线/多边形/带状体的命中谓词。它从不对齐到像素。像素对齐、图元顺序、裁剪意图和几何必须尽可能在后端执行之前确定。曲线折线按设备 px 区间长度自适应地展开其 Catmull-Rom 样条——已经只有几个像素长的区间按其弦渲染（密集的手绘笔刷采样点），较长而稀疏的区间最多保留 16 段——并且仅在转角张开可见楔形之处才发出圆角连接，因此在每个后端上，网格化的量都与像素所能显示的内容成正比。GPU 后端的折线描边来自同一个共享的抗锯齿描边器（`line::stroke_aa`）：实心内核止于名义边缘内侧半个设备像素处，居中的一像素覆盖度过渡，渐隐的平头端帽，以及只填充转角外侧楔形的圆角连接。相邻线段的三角形会在每个连接点的角平分线处被裁剪，使半透明的内侧转角不会混合两次。仅当两个相邻线段都延伸越过各自必须为对方覆盖的内侧几何时，连接点才会裁剪，该判定基于固定的四线段窗口，且无需分配；短线段之间的急转弯（密集锯齿、宽描边）则保持两个线段完整，宁可接受内侧转角被混合两次，也不留下未覆盖的缺口。它为每个顶点发出带符号的边缘距离，由各执行器选择编码方式——WebGPU 在 MSAA 之上将顶点 alpha 乘以覆盖度，GPUI 写入路径着色器的 `st` 通道——因此两个后端网格化出的几何完全一致。区域填充会在其线条与基线交叉处拆分线段，区间带填充会在上下两条线互换位置处使用共享的交叉三角形；两个 GPU 后端都不会绘制重叠的蝶形三角形。`line::build_area_fill` 会记录哪些线段发生交叉，GPUI 则依据该列表（而不是通过比较坐标）为每个由此产生的瓣区分别描摹其边缘过渡带。线条的点绝不对齐到像素网格：正是亚像素位置加上覆盖度，才使斜线保持平滑。共享的绘制列表准入规则会在任何执行器更改绘制状态之前，丢弃半径非有限或非正的圆，以及宽度非有限或非正的折线。Canvas2D 契约使用圆角连接和平头端帽描边，与参考实现的线条渲染器一致。`line::round_rect_polygon` 同样是 WebGPU 与 GPUI 共用的唯一圆角矩形网格化，其圆角弦按设备半径缩放。对于内侧边框，`line::round_rect_border` 返回环形三角形以及外轮廓与内轮廓；两个执行器都恰好在该环的内侧顶点上以三角扇铺设内部填充，因此填充与环在圆角处共用同一边界。共享的 `line::circle_segments` 在半径不超过 200 时将整圆的弦误差限制在 0.1 设备像素以内，并设有 256 段的工作量上限，同时为圆盘、圆环和原生圆弧提供网格化。每个执行器都遵循 `Prim::Polyline.style`：Canvas2D 与原生通过各自的虚线 API，GPUI 与 WebGPU 则用共享的 `line::dash_split` 拆分展开后的简单、阶梯式或曲线路径，并将每一段按实线描边，因此没有任何后端自创相位规则；该遍历以 `MAX_DASH_STEPS` 为上限（对该路径而言过细的图案按实线描边，路径长度非有限则不描边），因此宿主提供的宽度与坐标不会使一帧停滞。生产方仍会在执行器看到虚线之前自行将其转换，因为执行器的遍历覆盖整条路径，而生产方可以把它限制在窗格所显示的范围内：本 crate 在 `line` 中拥有这一虚线转换（`dash_split`、`dash_runs`、`push_line_stroke`、`push_clipped_stroke`、`push_styled_stroke`，以及用于清晰水平线和垂直线的 `crisp_span`）。裁剪只限定描边越过窗格延伸多远；其内部的虚线数量取决于路径的可见长度，因此 `dash_run_bound` 会报告 `push_styled_stroke` 将发出的段数上界，供以不可信几何为输入的生产方使用。引擎帧构建通过 `push_line_stroke` 转换系列线，并通过 `push_styled_stroke`/`push_clipped_stroke` 转换绘图与通用系列，浏览器宿主则通过同样的函数转换已解码的 JS 图元命令（见 `aeris_charts_wasm`），因此无论由谁产生，引擎与浏览器的描边都以相同的实心虚线段到达每个执行器，且虚线数量与相位是在可见范围而非整条路径上决定的。`Prim::Segments` 是唯一的批量图元：在点池上取 `segment_count` 对相互独立的两点对，每一对的描边方式与实线的简单两点 `Polyline` 完全相同（平头端帽、无连接、虚线已由共享的 `line::dash_runs` 展开）。引擎按 x 升序发出点对，每一对至多跨越一根柱，相邻点对在端点处相接（因浮点舍入而略有重叠）。执行器可以把该批量作为一条路径或一个网格来描边，与分别描边相比，唯一可见的差异出现在那些共用的边界像素处：Canvas2D 与原生光栅化器按一条路径描边，因此覆盖度在该处取并集（无接缝），而 WebGPU 与 GPUI 用共享描边器对每一对做网格化，逐顶点与独立折线相同，并合成两次。每个执行器都会丢弃范围超出点池的批量（`draw_list::segment_points`，使用带检查的 `usize` 运算，因为在 wasm32 上 `usize` 为 32 位）。`Prim` 是一个没有 `#[non_exhaustive]` 的公共枚举，因此该变体对下游的穷尽匹配是破坏性变更：消费固定修订的宿主（Aeris Terminal）在更换固定修订时需要添加相应分支。帧组装通过 `shift_point_indices` 对点池索引重新定基（原生图像导出不这样做，因为它针对每个窗格自己的点池执行该窗格的绘制列表），并且它与 WebGPU 网格化器都显式匹配每个变体，因此未来任何按点池索引的图元，在两者各自处理它之前都无法通过编译。
 
-`Prim::Image` carries immutable straight-alpha RGBA8 pixels. Its destination edges snap with the shared device-pixel rule and scaled pixels use bilinear sampling. GPUI converts cached RGBA bytes to its BGRA image-upload order once, while WebGPU and native/Canvas2D keep their respective platform encodings behind the same frame contract.
+`Prim::Image` 承载不可变的非预乘 alpha RGBA8 像素。其目标边缘按共享的设备像素规则对齐，缩放后的像素使用双线性采样。GPUI 将缓存的 RGBA 字节一次性转换为其 BGRA 图像上传顺序，而 WebGPU 与原生/Canvas2D 则在同一帧契约之后保留各自的平台编码。
 
 ### `aeris_charts_render_gpui`
 
-The native GPUI executor. It converts the prepared primitive stream into GPUI scene operations and owns GPUI-specific text, image caches, geometry conversion, backend metrics, and fixtures. It must not fork chart behavior or recalculate engine geometry.
+原生 GPUI 执行器。它将准备好的图元流转换为 GPUI 场景操作，并拥有 GPUI 专属的文本、图像缓存、几何转换、后端指标和夹具。它不得分叉图表行为，也不得重新计算引擎几何。
 
-Its `input` module is the one GPUI adapter for the engine input controller, shared by every GPUI host (the `gpui_probe` example and Aeris Terminal). `GpuiChartInput` converts GPUI mouse, wheel (native line units mapped to the shared DOM-equivalent wheel scale), trackpad pinch, modifier, and key events (F2 maps to `ChartKey::EditText`) into engine input against the chart canvas's top-left window position (`set_canvas_bounds`) and a monotonic clock; `cursor_style` is the single `ChartCursor` → `CursorStyle` mapping (on Windows, whose GPUI backend draws hand cursors as the arrow, vertically dragged trading lines use the vertical-resize cursor); `text_edit_key` applies platform text-editing conventions to the engine typing session, with clipboard shortcuts layered on in `key_down`; and `install_text_metrics` installs the native text measurer and cap-height metric. A host binds each GPUI listener with one adapter call and never routes chart input itself. The repository's interactive Linux probes enable GPUI's Wayland and X11 platforms; macOS and Windows continue through GPUI's native platform selection. On macOS GPUI's text system is its `font-kit` feature: the examples enable it, and a macOS host must as well, because without it GPUI substitutes a no-op text system and the chart paints no text and measures every string as zero width. CI compiles and tests the GPUI backend on all three operating systems and lints it on Linux. The probe and `pixel_parity` exit 1 when GPUI has no text system instead of painting without text.
+其 `input` 模块是引擎输入控制器唯一的 GPUI 适配器，由所有 GPUI 宿主共用（`gpui_probe` 示例与 Aeris Terminal）。`GpuiChartInput` 将 GPUI 的鼠标、滚轮（原生行单位映射到共享的、与 DOM 等价的滚轮刻度）、触控板捏合、修饰键和按键事件（F2 映射为 `ChartKey::EditText`）转换为引擎输入，坐标相对于图表画布左上角的窗口位置（`set_canvas_bounds`），并使用单调时钟；`cursor_style` 是唯一的 `ChartCursor` → `CursorStyle` 映射（在 Windows 上，其 GPUI 后端把手形光标绘制为箭头，因此垂直拖动的交易线使用垂直调整大小光标）；`text_edit_key` 把平台文本编辑约定应用于引擎文本输入会话，剪贴板快捷键在 `key_down` 中叠加；`install_text_metrics` 安装原生文本测量器和大写字母高度度量。宿主以一次适配器调用绑定每个 GPUI 监听器，绝不自行路由图表输入。仓库中的交互式 Linux 探针启用 GPUI 的 Wayland 与 X11 平台；macOS 与 Windows 仍沿用 GPUI 的原生平台选择。在 macOS 上，GPUI 的文本系统即其 `font-kit` 特性：示例已启用该特性，macOS 宿主也必须启用，否则 GPUI 会换用空操作的文本系统，图表将不绘制任何文本，并把每个字符串的宽度度量为零。CI 在三个操作系统上编译并测试 GPUI 后端，并在 Linux 上对其执行 lint。当 GPUI 没有文本系统时，探针与 `pixel_parity` 以退出码 1 退出，而不是在没有文本的情况下绘制。
 
-The `pixel_parity` example is the real-window parity harness for this executor. It paints each deterministic fixture (`fixtures.rs`, one per cause: crisp rects, translucent rects, opaque and tessellated antialiasing, curved brushes, gradients, text, the crosshair icon, colored and scaled images, the depth-heatmap colors, translucent stroke joins) through `GpuiChartRenderer` in a window whose client area equals the fixture's device size, and diffs the presented window against `aeris_charts_native`'s tiny-skia rendering of the identical Prim list. GPUI has no framebuffer readback, so the window is read from outside GPUI: on Windows through DWM (`tools/capture_window.ps1`), on Linux from the X server (`examples/support/x11_capture.rs`: the X11 window id from GPUI's raw-window-handle support, one `GetImage`, the client-area size verified against the fixture and any mismatch reported instead of compared). The Linux capture is shared with `gpui_pane_capture`, the GPUI half of the browser matrix, and is a dev-dependency edge on `x11rb` and `raw-window-handle` (both already in GPUI's Linux graph). Headless Linux runs it under `xvfb-run` with Mesa lavapipe, a software Vulkan driver; the verification section lists the command, the gates and what a software result does and does not establish.
+`pixel_parity` 示例是该执行器的真实窗口一致性测试框架。它将每个确定性夹具（`fixtures.rs`，每个成因一个：清晰矩形、半透明矩形、不透明与网格化的抗锯齿、曲线画刷、渐变、文本、十字光标图标、着色与缩放图像、深度热力图颜色、半透明描边连接）通过 `GpuiChartRenderer` 绘制到一个客户区等于该夹具设备尺寸的窗口中，并将所呈现的窗口与 `aeris_charts_native` 对同一 Prim 列表的 tiny-skia 渲染结果作差异比较。GPUI 没有帧缓冲回读，因此窗口是在 GPUI 之外读取的：在 Windows 上通过 DWM（`tools/capture_window.ps1`），在 Linux 上从 X 服务器读取（`examples/support/x11_capture.rs`：X11 窗口 id 取自 GPUI 的 raw-window-handle 支持，执行一次 `GetImage`，并对照夹具校验客户区尺寸，尺寸不符时报告该不符而不进行比较）。Linux 捕获与 `gpui_pane_capture`（浏览器矩阵中的 GPUI 一半）共用，并对 `x11rb` 与 `raw-window-handle` 构成一条开发依赖边（二者均已在 GPUI 的 Linux 依赖图中）。无头 Linux 在 `xvfb-run` 下配合 Mesa lavapipe（一种软件 Vulkan 驱动）运行它；“验证”一节列出了命令、门禁，以及软件结果能证明和不能证明的内容。
 
-GPUI's path pass cannot rely on MSAA — its sample count is picked from the surface and can fall back to 1x on Linux — so stroke, disc, ring, and filled-mesh boundary geometry, including both edges of inside rounded-rectangle borders, carry a per-vertex Loop-Blinn signed-distance encoding in the path shader's `st` coordinates. Area fills paint their exact-bounds gradient core followed immediately by a separate coverage fringe with remapped stops; this keeps GPUI's bounds-relative gradient from shifting when the edge expands by one device pixel. Polyline geometry comes from the shared `line::stroke_aa` stroker; GPUI only maps its signed distances onto `st`. Polyline strokes keep `s` constant and encode signed device-pixel distance in `t`, which is compatible with GPUI's Windows solid-triangle branch; their one-pixel coverage transition is centered on the nominal edge so integrated coverage remains the requested width. Ring strokes use the same constant-s, centered coverage encoding as polylines, preventing Windows from treating the antialiasing fringe as solid stroke. Filled discs use the same constant-s, centered coverage transition, so their integrated area matches the requested radius even when path MSAA is unavailable. A mesh larger than a bounded chunk is split into multiple GPUI paths so one stroke cannot overflow GPUI's fixed path instance buffer and trigger its grow-and-redraw retry loop; the mesh is a triangle soup, so coverage and paint order are unchanged.
+GPUI 的路径 pass 不能依赖 MSAA——其采样数由表面选取，在 Linux 上可能回退到 1x——因此描边、圆盘、圆环以及填充网格的边界几何，包括内侧圆角矩形边框的两条边，都在路径着色器的 `st` 坐标中携带逐顶点的 Loop-Blinn 有符号距离编码。面积填充先绘制其精确边界的渐变核心，紧接着绘制一个单独的覆盖边缘带，其色标经过重映射；这样可避免当边缘向外扩展一个设备像素时，GPUI 相对于边界的渐变发生偏移。折线几何来自共享的 `line::stroke_aa` 描边器；GPUI 只是把其有符号距离映射到 `st` 上。折线描边保持 `s` 为常量，并把有符号的设备像素距离编码在 `t` 中，这与 GPUI 的 Windows 实心三角形分支兼容；其一像素的覆盖过渡以名义边缘为中心，因此积分覆盖率仍等于所请求的宽度。圆环描边使用与折线相同的常量 s、居中覆盖编码，防止 Windows 把抗锯齿边缘带当作实心描边。填充圆盘使用同样的常量 s、居中覆盖过渡，因此即便路径 MSAA 不可用，其积分面积也与所请求的半径一致。大于有界分块的网格会被拆分为多条 GPUI 路径，使一次描边不会溢出 GPUI 固定的路径实例缓冲区而触发其扩容并重绘的重试循环；该网格是三角形汤，因此覆盖率与绘制顺序不变。
 
-An interactive GPUI host requests another animation frame only for active engine animation or an explicit finite measurement run. Idle charts stop scheduling frames. The executor retains its lowered `ScenePlan`; a host presentation that does not change the canonical engine frame can repaint that plan without lowering every primitive again.
-The `gpui_probe` and browser render paths prepare their viewport, base axis labels, and retained
-pane frame through `ChartEngine::prepare_financial_frame_with_measure`; each supplies native glyph
-widths. The engine caps time-axis labels using the resolved painted axis font size. GPUI lowers the
-axis primitives in that operation; the browser inserts host plugin labels into the returned base
-axis frame first, then lowers the final axis layer. Browser public API mutations use that same
-operation's layout-only phase when synchronous getters need settled geometry before render;
-incremental render layout grows axes without shrinking them.
-Axis label text and trading readouts share the engine's `set_text_cap_center` metric. The engine
-requests it at each painted run's exact size, family, and weight and applies the correction before
-device-pixel encoding. Browser Canvas2D supplies alphabetic font bounds and cap ink; GPUI supplies
-the native shaper's ascent, descent, and cap height. Neither host selects a separate per-label
-baseline correction.
+交互式 GPUI 宿主仅在存在活动的引擎动画或明确的有限测量运行时才请求下一个动画帧。空闲的图表不再调度帧。执行器保留其已转换（lowering）的 `ScenePlan`；若宿主的呈现未改变规范引擎帧，则可以重绘该计划，而无需再次转换每个图元。`gpui_probe` 与浏览器渲染路径通过 `ChartEngine::prepare_financial_frame_with_measure` 准备其视口、基础坐标轴标签和保留的窗格帧；两者各自提供原生字形宽度。引擎以解析后的实际绘制坐标轴字号为时间轴标签设定上限。GPUI 在该操作中转换坐标轴图元；浏览器则先把宿主插件标签插入返回的基础坐标轴帧，再转换最终的坐标轴层。当同步 getter 需要在渲染之前获得已确定的几何时，浏览器公共 API 变更使用同一操作的仅布局阶段；增量渲染布局只会增大坐标轴，不会缩小。坐标轴标签文本与交易读数共用引擎的 `set_text_cap_center` 度量。引擎按每个已绘制文本段的精确字号、字体族和字重来请求该度量，并在设备像素编码之前应用修正。浏览器 Canvas2D 提供字母基线（alphabetic）字体边界与大写字母笔迹范围；GPUI 提供原生排版器的上升部、下降部与大写字母高度。两种宿主都不会选用单独的逐标签基线修正。
 
-The interactive `gpui_probe` example and `examples/web_demo` keep demo controls in a separate,
-scrolling inspector so adding control groups does not reduce chart height. Section navigation,
-inspector visibility, and responsive shell layout belong to these example hosts. GPUI uses its
-native scroll and keyboard-focus facilities; the browser uses semantic headings, labeled controls,
-and a dismissible compact inspector. These shells retain the existing engine/API action paths;
-the finite GPUI probe and browser runtime fixtures keep their dedicated measurement layouts.
-GPUI paints rotated text through transformed SVG sprites because its shaped-line painter has no
-rotation parameter. Each sprite leaves a one-em transparent margin around the measured run while
-keeping the same anchor to accommodate font fallback and glyph overhang without clipping the
-trend-label ink.
+交互式 `gpui_probe` 示例与 `examples/web_demo` 将演示控件保留在独立的、可滚动的检查器中，因此增加控件组不会降低图表高度。分节导航、检查器可见性和响应式外壳布局归这些示例宿主所有。GPUI 使用其原生的滚动与键盘焦点设施；浏览器使用语义化标题、带标签的控件和可关闭的紧凑检查器。这些外壳沿用现有的引擎/API 操作路径；有限的 GPUI 探针与浏览器运行时夹具保留其专用的测量布局。GPUI 通过变换后的 SVG 精灵绘制旋转文本，因为其已排版行的绘制器没有旋转参数。每个精灵在被测量文本段周围留出一个 em 的透明边距，同时保持相同的锚点，以容纳字体回退与字形外延而不裁剪趋势标签的笔迹。
 
 ### `aeris_charts_render_wgpu`
 
-The WebGPU executor. It owns quad, triangle, textured-label, atlas, blend, multisample, scissor, and GPU timing resources. GPU objects are reused across frames and rebuilt only when their actual invalidation inputs change.
+WebGPU 执行器。它拥有四边形、三角形、纹理化标签、图集、混合、多重采样、scissor 和 GPU 计时资源。GPU 对象跨帧复用，仅当其实际失效输入发生变化时才重建。
 
 ### `aeris_charts_wasm`
 
-The browser boundary. It exposes the engine through `wasm-bindgen`, decodes typed input, selects WebGPU or Canvas2D policy, executes browser frames, handles shared ring input, text measurement, workspace APIs, and browser telemetry.
+浏览器边界。它通过 `wasm-bindgen` 暴露引擎，解码类型化输入，选择 WebGPU 或 Canvas2D 策略，执行浏览器帧，处理共享环形缓冲区输入、文本度量、工作区 API 和浏览器遥测。
 
-The browser boundary translates data and platform events and serializes engine-owned value snapshots. It must not become a second chart engine. Exchange-session requests (session slots, trade-stream sessions, resampling boundaries and configuration) are parsed in the host-testable `session_slots` module into engine types; a host write to an engine-owned series (footprint, synthetic, or resampled) through `set_data`, `update`, `update_typed`, or a merge returns rejected ingestion diagnostics instead of a silent no-op (the engine itself rejects merges into those series).
+浏览器边界转换数据与平台事件，并序列化引擎拥有的值快照。它不得成为第二个图表引擎。交易所交易时段请求（时段槽、成交流交易时段、重采样边界与配置）在可于宿主机上测试的 `session_slots` 模块中解析为引擎类型；宿主通过 `set_data`、`update`、`update_typed` 或合并对引擎拥有的系列（足迹图、合成或重采样系列）写入时，会返回写入被拒绝的诊断信息，而不是静默的空操作（引擎本身会拒绝对这些系列的合并）。
 
-JS pane-primitive and custom-series command buffers are decoded in the host-testable `prim_decode` module, which is a frame producer like the engine: a dashed or dotted `polyline` is lowered to solid dash runs through `aeris_charts_render::line::push_styled_stroke`, and a dashed `hline`/`vline` is clamped with `line::crisp_span`, both clipped to the owning pane's absolute bitmap-px scissor (`pane_clip`, not the engine's pane-local rect) with the unclipped dash phase. Decoded plugin strokes never rely on executor dashing: the shared `line::dash_split` strokes a path too fine for its `MAX_DASH_STEPS` cap solid, which would replace the plugin's dashes, so lowering here fixes the dash count over the visible length and bounds how far a plugin stroke reaches past the pane. Inside the pane the dash count follows the path's visible length, not the pane, so two guards bound it: a dashed polyline narrower than 0.5 bitmap px is skipped with a warning (a vanishing width would make the dash rate unbounded per px), and a dashed polyline whose `dash_run_bound` exceeds 4096 runs (a dense zigzag winding through the pane) is drawn as one solid polyline with a warning, which keeps its ink for its own point count instead of hundreds of thousands of runs and strokes per frame. The budget is per command; how many commands a buffer holds is the plugin's own cost, as for every command kind. A lowered dash run is one Canvas2D stroke, so the browser Canvas2D target (`canvas2d_target`) applies stroke color, width, dash pattern, and join/cap only when they differ from what it last applied (`stroke_state`, forgotten on `restore`), so a lowered dash costs its path and one stroke rather than a JS round trip per setter, without changing a pixel.
+JS 窗格图元与自定义系列的命令缓冲区在可于宿主机上测试的 `prim_decode` 模块中解码，该模块与引擎一样是帧生产者：虚线或点线 `polyline` 通过 `aeris_charts_render::line::push_styled_stroke` 转换为实线形式的虚线段，虚线 `hline`/`vline` 则以 `line::crisp_span` 钳制，二者都按所属窗格的绝对位图像素 scissor（`pane_clip`，而非引擎的窗格局部矩形）裁剪，并保持未裁剪时的虚线相位。解码后的插件描边绝不依赖执行器的虚线绘制：共享的 `line::dash_split` 会把对其 `MAX_DASH_STEPS` 上限而言过细的路径按实线描边，这会取代插件的虚线，因此此处的转换在可见长度上固定虚线数量，并限定插件描边越出窗格的距离。在窗格内部，虚线数量取决于路径的可见长度而非窗格大小，因此有两道护栏对其设限：窄于 0.5 位图像素的虚线折线会被跳过并给出警告（趋于消失的宽度会使每像素的虚线速率没有上界），而 `dash_run_bound` 超过 4096 段的虚线折线（蜿蜒穿过窗格的密集锯齿线）则作为一条实线折线绘制并给出警告，这样它以自身点数的代价保留笔迹，而不是每帧产生数十万个虚线段和描边。该预算按命令计；缓冲区包含多少条命令是插件自身的成本，所有命令类型皆然。一个转换后的虚线段就是一次 Canvas2D 描边，因此浏览器 Canvas2D 目标（`canvas2d_target`）仅当描边颜色、宽度、虚线样式和连接/端点样式与其上次应用的不同（`stroke_state`，在 `restore` 时被清除）才会应用它们，这样一个转换后的虚线段只需付出其路径和一次描边的代价，而不是每个 setter 一次 JS 往返，且不改变任何像素。
 
 ### `aeris_charts_native`
 
-The headless native executor and verification support. It uses tiny-skia for deterministic raster output, golden comparisons, examples, and release performance gates. Native rendering executes each pane's under/main/top layers against that pane's own point pool, inside its integer frame scissor; its `TinySkiaCanvas` applies the same clip to paths, rectangles, images, and glyph coverage. No flattened cross-pane point remapping is needed. Native rendering resolves the requested family, weight, and italic style from installed system fonts plus any faces a host registers with `register_font_data` (so a host with bundled fonts exports with the faces it shows on screen), falling back to sans-serif, then a fixed list of common sans-serif families, then the closest installed face ordered by style, weight, and name rather than OS enumeration order; painting, engine label hit geometry, and the public `measure_text` share the selected face and glyph advances. With no face at all, text is skipped and image export returns an error rather than panicking. Image export goes through the engine's `capture_export_frame`, which builds the pane frame and the axis/top layer directly at the requested output DPR and dimensions (a full measured layout only when the size differs from the live view), restores the live viewport and layout through a drop guard (so a panicking host measure callback cannot leave the chart at the export viewport), and invalidates the retained frame so the live host rebuilds with its own measurements; native export executes the frame background including gradients and paints the axis layer above the panes. Export is split in two: `prepare_engine_image` captures the selected frame layers on the thread that owns the chart, and `PreparedChartImage::render` (or `render_png` for encoded file bytes) rasterizes that owned data, plus host decoration prims drawn in image pixels above every pane, on any thread; `render_engine_rgba` runs both with no decoration. Host decorations such as a product legend or branding are host presentation and stay out of the engine frame. Output is bounded to 32 million pixels. It is evidence infrastructure and the native image-export path, not a competing product model.
+无头原生执行器与验证支持。它使用 tiny-skia 生成确定性的光栅输出、golden 比较、示例以及 release 性能门禁。原生渲染针对每个窗格自有的点池，在其整数帧 scissor 内执行该窗格的 under/main/top 层；其 `TinySkiaCanvas` 对路径、矩形、图像和字形覆盖率应用同样的裁剪。无需进行跨窗格的扁平化点重映射。原生渲染从已安装的系统字体以及宿主通过 `register_font_data` 注册的任何字体面中解析所请求的字体族、字重和斜体样式（因此带有内置字体的宿主导出时使用的字体面与其屏幕上显示的一致），回退依次为 sans-serif、一份固定的常见 sans-serif 字体族列表，再到按样式、字重和名称排序（而非按 OS 枚举顺序）的最接近的已安装字体面；绘制、引擎标签命中几何以及公共的 `measure_text` 共用所选字体面与字形步进宽度。若完全没有字体面，则跳过文本，图像导出返回错误而不是 panic。图像导出经由引擎的 `capture_export_frame`，它直接以所请求的输出 DPR 和尺寸构建窗格帧与坐标轴/顶层（仅当尺寸不同于实时视图时才进行完整的测量布局），通过 drop 守卫恢复实时视口和布局（因此发生 panic 的宿主测量回调不会使图表停留在导出视口），并使保留帧失效，以便实时宿主用其自身的测量重新构建；原生导出执行包括渐变在内的帧背景，并在窗格之上绘制坐标轴层。导出分为两步：`prepare_engine_image` 在拥有图表的线程上捕获所选帧层，`PreparedChartImage::render`（或用于编码文件字节的 `render_png`）则在任意线程上光栅化该已拥有的数据，外加在图像像素中绘制于所有窗格之上的宿主装饰图元；`render_engine_rgba` 不带装饰地运行这两步。诸如产品图例或品牌标识之类的宿主装饰属于宿主呈现，不进入引擎帧。输出上限为 3200 万像素。它是证据基础设施和原生图像导出路径，而不是一个相互竞争的产品模型。
 
-## TypeScript package
+## TypeScript 包
 
-`packages/charts` publishes the `@aeristerminal/aeris-charts` browser API through GitHub Packages. It owns WebAssembly initialization, TypeScript chart handles, DOM canvas lifecycle, resize observation, Pointer Event translation for mouse/pen, cancellable Touch Event translation for direction-dependent page-scroll arbitration, platform capture/default policy, host callbacks, themes, shortcuts, offscreen support, and grid helpers. The root entry remains framework-neutral. The optional `@aeristerminal/aeris-charts/react` entry is a thin lifecycle/reconciliation adapter over those same public chart handles: React mounts one ordinary chart, applies option/data changes to retained engine objects (a `FinancialSeries` data change that only replaces the last point and/or appends later points streams through `series.update()`; anything else is one `setData`), and disposes through `chart.remove()`; it owns no scale, geometry, hit-test, persistence, or rendering semantics. Its module performs no DOM work at import time, so SSR can import it without constructing a browser chart. Drawing-tool arming and pointer events cross the browser boundary through the generic engine drawing controller; the package does not classify a tool as single-point, multi-point, sequence, or freehand, nor duplicate tool-specific placement state. Touch Events normalize into the same engine resolver rather than a parallel gesture state machine; static `touch-action` stays `auto`, and the host applies the reference-informed vertical-priority direction rule after the shared slop. Wheel samples retain floating-point deltas; `wheel_behavior: "auto"` independently maps vertical deltas to time zoom and horizontal deltas to time pan on every chart surface. The zoom anchor is engine-owned (`ChartEngine::wheel_zoom_time_scale`, reached through the input controller by GPUI, browser DOM, and offscreen wheel events): measured against TradingView, an ordinary notch changes bar spacing by exactly 10% and, because `right_bar_stays_on_scroll` defaults to `true`, preserves the right offset in bars so the latest bars stay put; Ctrl/Cmd + wheel (including macOS trackpad pinch) zooms around the pointer. Two-touch pinch in browser and offscreen workers is recognized by the controller's touch resolver from ordinary pointer input, and native trackpad pinch calls `ChartEngine::input_pinch`; both are direct manipulation and always zoom around the fixed starting centroid. Pinch enablement is independent of wheel zoom. Explicit `"pan"`/`"zoom"` modes remain host overrides. Auto mode zooms the time scale over a price axis by default; `price_axis_wheel_zoom` opts both browser and offscreen hosts into axis zoom through the same engine controller.
+`packages/charts` 通过 GitHub Packages 发布 `@aeristerminal/aeris-charts` 浏览器 API。它拥有 WebAssembly 初始化、TypeScript 图表句柄、DOM canvas 生命周期、尺寸变化观察、面向鼠标/触控笔的 Pointer Event 转换、用于依方向仲裁页面滚动的可取消 Touch Event 转换、平台捕获/默认行为策略、宿主回调、主题、快捷键、离屏支持以及网格辅助工具。根入口保持框架无关。可选的 `@aeristerminal/aeris-charts/react` 入口是建立在这些相同公共图表句柄之上的轻量生命周期/协调适配器：React 挂载一个普通图表，把选项/数据变更应用到保留的引擎对象上（仅替换最后一个点和/或追加后续点的 `FinancialSeries` 数据变更通过 `series.update()` 流式写入；其余情况都是一次 `setData`），并通过 `chart.remove()` 销毁；它不拥有任何比例尺、几何、命中测试、持久化或渲染语义。其模块在导入时不执行任何 DOM 操作，因此 SSR 可以导入它而无需构造浏览器图表。绘图工具的激活与指针事件通过通用的引擎绘图控制器跨越浏览器边界；该包不会把某个工具归类为单点、多点、序列或手绘，也不会重复实现工具专属的放置状态。Touch Event 归一化到同一个引擎解析器，而不是另设并行的手势状态机；静态 `touch-action` 保持为 `auto`，宿主在共享的 slop 阈值之后应用参考实现所启发的垂直优先方向规则。滚轮采样保留浮点增量；`wheel_behavior: "auto"` 在每个图表表面上分别将垂直增量映射为时间缩放、将水平增量映射为时间平移。缩放锚点由引擎拥有（`ChartEngine::wheel_zoom_time_scale`，由 GPUI、浏览器 DOM 和离屏滚轮事件通过输入控制器调用）：对照 TradingView 的实测，普通的一格滚轮恰好使柱间距改变 10%，并且由于 `right_bar_stays_on_scroll` 默认为 `true`，会保持以柱数计的右侧偏移，因此最新的柱保持原位；Ctrl/Cmd + 滚轮（包括 macOS 触控板捏合）围绕指针缩放。浏览器与离屏 worker 中的双指捏合由控制器的触控解析器根据普通指针输入识别，原生触控板捏合调用 `ChartEngine::input_pinch`；二者都是直接操作，并且始终围绕固定的起始质心缩放。捏合的启用独立于滚轮缩放。显式的 `"pan"`/`"zoom"` 模式仍然是宿主覆盖项。自动模式默认在价格坐标轴之上缩放时间比例尺；`price_axis_wheel_zoom` 使浏览器与离屏宿主都通过同一个引擎控制器改为选用坐标轴缩放。
 
-The package resolves IANA time-zone names to explicit offset schedules with `Intl.DateTimeFormat` over a bounded 1970–2100 span (cached per page for at most 32 zones), on the main thread and in workers, and never passes the browser's own zone to the engine; the free `session_slot_times()` and `resample_boundaries()` helpers pass their resolved schedule, while trade-stream sessions use the chart's installed zone. It derives the engine's calendar-date flag from the input form of its financial series (business days versus numeric instants), wraps host time formatters with a calendar-date context without re-entering WebAssembly during frame construction, prints package-owned tooltip and accessibility time text through the engine's crosshair label (`format_time_label`: exchange time zone, `localization.date_format`, locale, and the host `time_formatter`, so every surface shows the same text), and lets hosts inject the countdown clock (`set_clock`) instead of `Date.now()`.
+该包用 `Intl.DateTimeFormat` 在 1970–2100 的有界区间内把 IANA 时区名称解析为显式的偏移时间表（每个页面至多缓存 32 个时区），主线程与 worker 中皆然，且绝不把浏览器自身的时区传给引擎；独立的 `session_slot_times()` 与 `resample_boundaries()` 辅助函数传入其已解析的时间表，而成交流交易时段使用图表已设置的时区。它根据其金融系列的输入形式（业务日与数值时刻）推导引擎的日历日期标志，用日历日期上下文包装宿主时间格式化器，且在帧构建期间不会重新进入 WebAssembly；通过引擎的十字光标标签（`format_time_label`：交易所时区、`localization.date_format`、区域设置以及宿主 `time_formatter`，因此每个表面显示相同文本）输出包自有的提示框与无障碍时间文本；并让宿主注入倒计时时钟（`set_clock`）以取代 `Date.now()`。
 
-Wheel routing is engine-owned: the DOM recognizer and the OffscreenCanvas worker façade both pass the raw deltas, the delta mode, the pixel ratio (the device-pixel speed correction Windows Chromium needs, `1` elsewhere), the modifiers, and the host's wheel switches to `ChartEngine::input_wheel` through one WASM call, and the engine normalizes the sample, applies the reference delta-mode rules, and resolves every time-scale zoom through its anchor operation (`wheel_zoom_time_scale`); worker charts expose no `handle_scroll`/`handle_scale` options, so both wheel gestures stay enabled there. Keyboard time-scale motion is engine-owned in the same way: the controller's key handler, reached from the input overlay, the accessibility surface, and GPUI, honors the host gesture switches (arrow panning needs a horizontal scroll gesture, +/- zoom follows wheel zoom, and Home resets the whole view only when the time-axis reset gesture is enabled), so a view fixed with `handle_scroll: false` and `handle_scale: false` cannot be moved from the keyboard, and a gated key stays unconsumed so the browser keeps its default action. Visible-range and size subscriptions never dispatch re-entrantly: a handler that mutates the chart marks the diff dirty, the current value finishes delivery, and a bounded re-read (eight passes, then the next frame) delivers the final range to every handler. `time_scale().scroll_to_real_time()` animates through the engine scroll animation to the configured `right_offset` over the reference 400 ms (with the engine's cubic ease-out rather than the reference's linear curve), immediately under reduced motion; the headless engine call applies the same target at once.
+滚轮路由归引擎所有：DOM 识别器与 OffscreenCanvas worker 门面都通过一次 WASM 调用，把原始增量、增量模式、像素比（Windows Chromium 所需的设备像素速度修正，其他平台为 `1`）、修饰键以及宿主的滚轮开关传给 `ChartEngine::input_wheel`，由引擎对采样做归一化，应用参考实现的增量模式规则，并通过其锚点操作（`wheel_zoom_time_scale`）解析每一次时间比例尺缩放；worker 图表不暴露 `handle_scroll`/`handle_scale` 选项，因此两种滚轮手势在其中始终启用。键盘驱动的时间比例尺移动同样归引擎所有：控制器的按键处理器（由输入叠加层、无障碍表面和 GPUI 触达）遵从宿主的手势开关（方向键平移需要水平滚动手势，+/- 缩放跟随滚轮缩放，Home 仅在启用时间轴重置手势时才重置整个视图），因此用 `handle_scroll: false` 与 `handle_scale: false` 固定的视图无法通过键盘移动，被门控的按键保持未消费状态，使浏览器保留其默认行为。可见范围与尺寸订阅绝不重入分发：修改图表的处理器会将差异标记为脏，当前值完成投递，随后进行有界的重读（八轮，之后顺延到下一帧），把最终范围交付给每个处理器。`time_scale().scroll_to_real_time()` 通过引擎滚动动画，以参考实现的 400 ms（使用引擎的三次缓出曲线而非参考实现的线性曲线）动画到已配置的 `right_offset`，在减弱动效设置下则立即完成；无头引擎调用则立即应用同一目标。
 
-Browser accessibility is chart-owned, enabled by default, and represented by one singleton controller exposed through `chart.accessibility()`. `enable_accessibility(chart, options)` configures that same controller for compatibility. The chart container is a named group; canvases are hidden from assistive technology and each pane has one complete application-style keyboard surface. Default streaming announcements are off, user-driven navigation/actions remain announced, visible data queries are capped at 512 on-demand logical points, and only the active series owns one engine-rendered focus primitive. Accessibility focus/edit state is runtime-only and is never persisted. Pointer interaction updates ordinary chart selection and hover without moving DOM focus into the application surface; keyboard traversal and explicit accessibility API calls own its visible focus. Forced colors, higher contrast, reduced motion, locale, host names, and visible focus are resolved at the host boundary; the shared engine retains exact focus geometry and keyboard drawing mutations use the same drawing history/rollback path as pointer input.
+浏览器无障碍由图表拥有，默认启用，并由一个通过 `chart.accessibility()` 暴露的单例控制器表示。`enable_accessibility(chart, options)` 为兼容起见配置同一个控制器。图表容器是一个具名分组；canvas 对辅助技术隐藏，每个窗格各有一个完整的应用式键盘表面。默认关闭流式播报，用户驱动的导航/操作仍会播报，可见数据查询上限为按需的 512 个逻辑点，并且只有活动系列拥有一个由引擎渲染的焦点图元。无障碍焦点/编辑状态仅限运行时，绝不持久化。指针交互更新普通的图表选择与悬停，而不会把 DOM 焦点移入应用表面；键盘遍历与显式的无障碍 API 调用拥有其可见焦点。强制颜色、更高对比度、减弱动效、区域设置、宿主名称和可见焦点都在宿主边界解析；共享引擎保留精确的焦点几何，键盘绘图变更使用与指针输入相同的绘图历史/回滚路径。
 
-Auto-size keeps `ResizeObserver`'s exact device-pixel path. A resolution media-query watcher plus orientation/fullscreen fallbacks re-run sizing when DPR changes without a CSS-bounds change; resize reprojects semantic state and does not create new object identities. While auto-size is active, manual `resize` calls are ignored. Disabling it disconnects the engine-owned observer and returns authority to manual sizing; re-enabling immediately adopts the current container. Hidden or detached containers retain the last usable size and adopt their new bounds when revealed.
-
-The package also ships `aeris_charts.css` as the portable host design system. Its complete brand token contract remains intact even when a token is currently consumed only by Terminal or the website; Charts consumes the applicable surface, border, text, status, control, interaction, icon, action, focus, radius, shadow, and market roles without renaming them. Host chrome uses the system UI font stack and may use `color-mix`. The published package does not include a webfont. Native CPU text selects installed faces for the requested family, weight, and italic style; the native golden scene masks its text region for the exact bitmap comparison and separately requires visible glyph ink across system fonts. Backend-facing roles — the primary surface for chart panes, primary text for axes, border for axis rules and pane separators, canonical border width, muted text, separator interaction, focus/primary interaction, positive/negative market semantics, and shared radii — have deterministic opaque-sRGB projections in `crates/aeris_charts_core/style_tokens.json`. `aeris_charts_core` owns and compiles that file into the defaults used by every engine and backend. Axis borders project the shared border-width token (1 CSS px) onto the device-pixel grid in the engine, and visible pane separators fill the 2 CSS px `PANE_SEPARATOR` layout slot on that grid; the separator hover target stays independently expanded for interaction. The TypeScript package imports the same source at build time for host theming and workspace divider projection. The core crate therefore remains independently packageable without reaching into a browser-package directory, and the tokens resolve before frame construction rather than through demo or renderer overrides. Canonical engine grid lines retain their dashed style and border color but ship disabled; hosts and deterministic parity fixtures may opt either family in explicitly. A `v*` tag matching the package version publishes the verified artifact to GitHub Packages.
-
-The package preserves its complete `snake_case` surface and adds camel-case aliases for the common JavaScript chart/series/scale lifecycle without creating parallel state or handles. Financial and general series use the same chart object and ordered frame. Data crosses into WebAssembly in typed columns or bounded shared-ring layouts rather than per-point object calls on hot paths. Typed update batches transfer their sanitized owned columns to the engine's batch entry point; the browser wrapper never loops through the single-row engine API. The published artifact exports the optimized WASM asset explicitly and the generated glue also resolves that sibling asset by `import.meta.url`; source-tree `pkg/`, crate, benchmark, and demo paths are not runtime dependencies. `examples/web_demo` remains an integration and parity test host, while `examples/all_in_one` contains consumer-facing framework-neutral and React compositions.
-
-Financial appearance keeps theme provenance typed in the engine. Grid, crosshair, bullish, bearish,
-wick, and border colors are either semantic theme followers or explicit custom colors; theme changes
-retokenize only followers. Native hosts consume and apply the typed financial appearance transaction
-and must not infer provenance by comparing resolved CSS strings, create dummy engines for defaults,
-or send empty-string color sentinels to clear series overrides.
-
-The engine also projects the ordered financial legend model from its canonical value snapshot. It
-owns primary OHLC formatting and tone, native indicator output grouping, external-study grouping,
-visibility, pane placement, output labels and colors. Hosts may describe a bounded set of genuinely
-product-owned series roles (for example Terminal's reusable volume series) and then map the returned
-typed identities to their UI controls; they must not rebuild engine-owned groups by walking series.
-
-`chart.value_snapshot(logical_index?)` crosses WebAssembly once and returns all live series. The package adds live handles to the engine records and derives legacy crosshair `series_data` by retaining only valued entries. Engine-owned feature series expose their scalar scale projection and retain the legacy scalar event shape. Arbitrary custom-series callbacks remain host-owned: exact snapshots are null, while latest snapshots can expose only the last value recorded during a visible frame and are explicitly render-state-dependent. Symbol/exchange metadata, volume association outside VWAP bindings, bar/day change math, session calendars, visibility settings, and legend DOM remain host-owned.
-
-The supported, experimental, internal-but-exposed, and legacy surfaces are classified in
-`Public_api.md`. Predictable browser failures use `AerisChartsError` with stable category codes;
-clean ingestion retains a null diagnostics fast path. The generated WASM surface and benchmark/test
-hooks are internal even when visible to developer tools. A deterministic declaration manifest makes
-supported TypeScript surface changes explicit in CI.
-
-`chart.remove()` is the single public browser lifecycle operation. It is idempotent and transitions the retained TypeScript handle to a disposed state after cancelling scheduling, detaching browser resources and extensions, releasing per-chart GPU state, explicitly disposing the Rust object, and calling the generated `free()`. Later operations fail with a stable disposed-state error. Offscreen charts use the same explicit dispose-then-free ordering.
-
-## State and frame ownership
-
-Each chart has one engine owner. Mutations invalidate only the state that changed. A frame is a deterministic snapshot of engine state for a viewport and device scale.
-
-Coordinate-authoritative scale objects advance canonical revisions inside their mutating methods. Browser and GPUI hosts express gestures through `ChartEngine` commands; legacy direct Rust access remains coherent because it cannot bypass the scale-owned revision. `SeriesStore` likewise advances its canonical presentation revision whenever a Rust host takes mutable access, replacing read-side hashing of every style field. Retained coordinate-dependent layers are derived caches stamped with the engine's current coordinate revision. Frame assembly asserts that the grid, visible series, chrome, drawings, and interaction overlay all carry that same revision, so a frame cannot mix transforms.
-
-On every host the engine input controller owns the complete pane/time-axis/price-axis/separator
-drag state machine, separator and axis target resolution, crosshair exclusion at dividers, and wheel
-pan/zoom routing. A platform adapter translates OS events and maps `ChartCursor` to one platform
-cursor, and schedules repaint; it must not reproduce the gesture lifecycle or retain parallel press,
-drag, hover, or cursor state.
-
-Frame invalidation is an engine-owned generation graph. Layout, coordinates/autoscale, grid and underlay, each series, drawings (with per-drawing prim/point segments plus a trailing controller-owned creation-preview block), and interaction overlays have independent generations. Coordinate-range changes fan out to coordinate-dependent layers; a value-only current-bar update stays on its source series when autoscale bounds do not change. A `histogram_updown` histogram layer is also keyed by the primary price series' generation, because its column tint reads the primary's rows (open versus close, or the previous traded close for time-sharing volume, whose first row compares with the primary's explicit baseline or percentage base) and takes host `up_color`/`down_color`. Ordering-only promotion (hover/selection/drag/edit) reassembles retained series layers and drawing segments without rebuilding geometry; drawing drag rebuilds the drawings layer with fresh segments while reusing the runtime per-entry cache. Public option and series-style mutation are included in the generation inputs, so direct native callers cannot bypass retention accidentally.
-
-Series and indicator selection owns one transient engine snapshot with a single primary command target and at most 64 related output members. Engine-owned indicator bindings expand automatically; hosts may supply the bounded member identities for study groups they author outside the built-in indicator registry. Each member retains at most 128 canonical output timestamps sampled from its own full canonical start-to-end extent only on the unselected-to-selected transition. Selection-time projection determines sparse density, while endpoint-inclusive logical spacing prevents a partial-series selection treatment. Overlay rebuilds resolve every member's identities against its current canonical values and coordinates, place candlestick handles at the current body midpoint, clip offscreen handles without replacement, and discard the snapshot on deselection; LOD geometry, screen coordinates, and persistence never own selection-anchor membership.
-
-Drawing semantic mutations reuse this graph: add/remove/style/anchor changes invalidate the drawing layer and update only the affected derived entry, while selection/hover/drag/edit promotion reassembles retained drawing segments without rebuilding geometry and selection changes additionally invalidate the overlay and axis frame for handles. The one exception is a family drawing that paints some parts only while focused (a note's text, `DrawingFamily::reveals_on_focus`): frame construction keys the hovered and selected drawing among those and rebuilds the drawings layer when that key changes; opening or closing a text-edit session rebuilds it too. Drawing selection handles are assembled at the beginning of the overlay, preserving their prior canonical order immediately after drawing bodies and before crosshair/series overlays without rebuilding unrelated drawing geometry. Temporary promotion (dragging/editing → hovered → selected → idle, hover gated by `hoveredSeriesOnTop`) never rewrites saved drawing z-order; deselection, hover leave, cancellation, or removal restores it. A selected price-spanning rectangle also emits primary-colored extent tags and a territory band on its bound price scale; those axis views follow creation, drag, and resize coordinates and disappear on deselection unless the drawing explicitly requests persistent axis views. The text tool is an exception: it emits no anchor discs — selection and hover paint the same focus border box (hover at reduced opacity), empty text paints nothing on the chart, and leaving the editor without typed text removes the drawing. Typing is one engine-owned session (`drawing_text_edit.rs`) for every drawing that paints its own text: it holds the live text, the char-based caret and the selection, applies live text without history (a commit records one `Update` undo step and one sync revision; a cancel restores the text and records nothing), and owns Enter/blur commit, Escape restore, and the empty lifecycle (only the text tool is removed when left empty). Hosts only forward input. The browser keeps a borderless content-editable surface with transparent glyphs for IME, clipboard, and accessibility, mirrors its value and caret into the session (`set_drawing_text_edit`), and paints its own caret; native hosts forward committed characters and editing keys, and the session paints the caret in the drawing's own frame segment (a label-rotated polyline for a run label, a 1 CSS px bar on the caret line of a family text box). Either way the engine keeps painting both the label and the focus border, so edit entry cannot lift the text or shift the outline. Crosshair movement and unchanged-coordinate market-data updates do not invalidate drawing geometry. Pane add/remove/swap/move rebuilds pane membership because pane ownership itself changed; ordinary drawing drag updates one entry, and structural removal repairs the canonical vector's id-to-position map.
-
-The browser text editor reads its resolved font, aligned run edge, rotated anchor, measured
-advance, and caret position from ChartEngine::drawing_text_edit_layout through WASM. Its
-transparent content-editable element supplies IME, selection, and clipboard input; it does not
-measure the run or derive a separate baseline. The engine layout query uses the same text
-placement and measurement functions as the drawing frame.
-
-The engine-owned crosshair overlay can paint the same configurable hover marker for every visible line, area, baseline, and line-shaped indicator output at the snapped logical index. Markers ship disabled and hosts opt in per series or indicator output; when enabled, marker coordinates, per-series colors, borders, pane ownership, and scale conversion are resolved before the shared frame reaches any backend. Crosshair and drawing magnets share one pixel-space candidate path: candle, bar, and footprint series expose their rendered OHLC fields, while line, area, histogram, baseline, and other scalar projections expose only the close/value they paint, so hidden storage columns cannot attract an anchor. An empty hovered trend line emits a low-opacity, borderless `+ Add text` run at its configured segment-relative slot; the engine owns its measured hit box, exact caret anchor, and middle-slot stroke gap, and the shared typing session above owns the edit itself. Clicking either this affordance or existing trend text enters inline editing, and leaving an empty trend edit preserves the drawing. Bar-slot highlights and tooltip guides resolve their default tint from the current chart surface, using a light lift on dark surfaces and a dark tint on light surfaces; overlay price-scale text follows the current layout foreground. Explicit host colors remain authoritative, while implicit colors retokenize with chart options. Chrome that stands for a bar itself — the built-in live price line, its last-value axis chip, and the crosshair marker — follows one shared bar-color resolution. The built-in live price line is one canonical series feature: its default `partial` extent starts at the tracked bar/value and reaches the pane's right edge, while `full` is an explicit per-series option. Both extents use the same source, color, width, and solid/dotted/dashed line-style state, so ordinary series and engine indicator outputs cannot drift in thickness or dash semantics. Explicit user-created horizontal price-line objects remain full-width independent chart objects. For candlesticks that resolution walks the parts in paint order, body then border then wick, skipping any part that is transparent or switched off, so a hollow candle (a transparent body over a visible border frame, industry-standard) keeps its bullish or bearish color instead of resolving to an invisible fill. Bar presentation remains engine-owned as well: OHLC bars keep one vertical high/low body and independently gate the open and close ticks, so setting both visibility flags false produces an explicit high-low bar without a host-side geometry fork.
-
-The engine retains semantic pane layers and their ordered primitive/point ranges, then assembles the same canonical `ChartFrame` contract from clean and rebuilt layers. The retained boundaries are underlay/grid, individual series, per-drawing segments plus a trailing creation-preview block, pane chrome, transient trading risk/reward preview regions, financial-action lines/controls (trading and alerts), and overlay. Frame assembly is the single pane-local ordering owner: grid/background → idle indicators → idle drawings → ordinary price series → active objects (dragging/editing → hovered → selected, series before drawings within a tier, previews trailing active) → chrome → trading regions → trading/alerts → overlay → top. Indicator outputs move as one visual group with internal ordering preserved (bindings own grouping, never series type or title); explicit `set_series_order` overrides default idle series grouping while idle drawings stay below price series and indicator-only panes keep stable internal order. Axes, crosshair, and financial-action controls keep their protected layers above all chart content; active chart content stays clipped to its owning pane. No public z-index API or renderer-specific policy exists. Preview regions sit above chart content with financially actionable lines, alert indicators, and exact control hit zones above them and below crosshair transients. A series' live-price cluster stays filled while its value is live, and is outlined — chart-surface fill, semantic color as an inside border and text — once the series' final bar scrolls out of view, so a stale value never reads as the current one. Colliding series clusters are spaced by the overlap pass using each cluster's full height rather than restyled. Boxed price-line and drawing tags take the nearest free vertical slot around those clusters and earlier tags on the same axis. Placement starts from each tag's price coordinate every frame, so it returns when the obstruction clears; a tag with no free slot is omitted until space returns. Otherwise-solid trading tags that meet the primary cluster's raw axis region take that same outlined treatment, but financial-action tags stay at their exact price coordinate instead of being collision-shifted away from the line they identify. They emit before the primary cluster so the live price remains visually authoritative if exact coordinates overlap. Confirmed orders never manufacture persistent risk/reward fills. Positions and orders use a 304 CSS-pixel bounded marker beside the price scale. Each order and position rule extends by default from the pane's left edge to the marker end and passes beneath the opaque marker container. Working entries and positions expose separate compact `TP` and `SL` drag handles immediately before the marker for each missing protection; their visible rule is a readout, not an implicit protection handle. Keyboard adjustment of a working entry has no handle to aim at, so the protection it creates takes its role from the side of the entry it moves to (toward profit is `TP`, toward loss `SL`); pointer drags from the dedicated handles keep their fixed role. Confirmed TP/SL order rules remain directly draggable at line tolerance, while every dedicated action and close cell retains its larger control-height target. Each marker is a taller readout chip — a solid quantity cell and then P&L or order type inside ONE outline, with no inner border or divider, so the quantity block's own edge is the seam — followed immediately by an integrated close/cancel cell on the P&L/readout's right. The single main container and its edge cells use the shared large `999px` radius token, which the engine resolves with CSS clamping semantics to form one pill. Outline and quantity fill carry the object's semantic color, so the marker reads as one color from the line to the price tag; only the P&L text keeps its own profit/loss tint. Every close icon uses its marker's semantic line color in idle, hover, and pressed states, so line, outline, quantity fill, and close icon read as one color. The close icon is two anti-aliased `Polyline` diagonal strokes from the trading layer's own point pool rather than a rotated font glyph, skewed filled bars, or triangles with cap discs: a host `font_family` is not guaranteed to carry a suitable symbol, and `Polyline` is the one stroke primitive every executor antialiases identically. Protection role takes precedence over broker side and kind: TP is positive green and SL is warning yellow. Every ordinary buy order, including a resting buy limit, uses the positive token; every ordinary sell order, including a sell limit, uses the negative token. Positive and negative P&L text uses those same semantic roles. Rejected, cancelled, and expired markers use the rejected color, while pending broker operations use the pending color. A price tag is solid only once its order is actually filled — a resting order stays outlined, so a working intention never reads as an executed one. Every main marker pill uses a solid semantic outline at the design-system `--border-width`, snapped like a browser border and emitted as the container's `RoundRect` border — every executor (WebGPU, GPUI, and the shared Canvas2D executor behind browser Canvas2D and native CPU output) paints `RoundRect` borders inside the rect, never centred across its edge — with a deliberate chip-surface gap between it and the edge cell fills, while the integrated close cell keeps its full-height hit target but paints no resting surface of its own; its icon sits directly on the container surface. Hover and press fill the addressed control (for the close cell, a smaller inset, fully rounded pill) with the brand `--hover-bg` / `--active-bg` surfaces rather than the order color, and the close cell answers hits across the pill's full height rather than the line tolerance. `ChartEngine::trading_cursor_at` is the one grab/pointer affordance every host uses: a draggable line reads as draggable exactly when a drag would start there, while the close cell and the `TP`/`SL` protection buttons read as buttons with the click cursor even though a protection button also accepts a press-and-drag. Those fills stay OPAQUE: a control sits on top of its own marker line, and a translucent fill would let that line read through the button the pointer is on. For the same reason the engine suppresses the crosshair lines while the pointer is over a trading control — the control is not a price to read. Action tooltips are host-timed: the engine owns no clock, so it reveals one only once the host arms it after a hover dwell, and a changed hover disarms it. Sweeping across stacked markers therefore never flashes a tooltip per marker. An action tooltip is chart chrome rather than part of the object it describes: it takes the active theme's surface, border, text, and radius tokens, never the order's buy/sell color, so it reads identically on every line and in both themes. Because `RoundRect` borders paint inside the box, every bordered chrome box (action tooltips, annotation chips, the Delta Tooltip and its delta band) snaps each edge independently to whole device pixels through the frame's one `DeviceBox` rule; a fractional edge would smear the one-pixel border across two rows on some sides only. The browser's DOM bar-inspector tooltip applies the same rule by translating to device-pixel-snapped coordinates against its containing block instead of a `-50%` translate. Confirmed TP and SL orders remain ordinary host-authoritative order markers with quantity and projected P&L, endpoint nodes, and action tooltips. Trading, alerts, and axis labels share the canonical pane price transforms; WebGPU, Canvas2D, GPUI, screenshots, and native/headless consumers receive no separate financial-action geometry. Retention never gives a backend permission to change ordering or semantics. Host/plugin primitive callbacks use the canonical frame but conservatively rebuild the affected pane stream because their output is not engine-owned. Incremental frames are tested against forced clean rebuilds across data, interaction, scale, drawing, theme, and resize mutations.
-
-Trading interaction is one engine-owned state machine: idle, hovering, dragging through a local preview, or awaiting a host answer while holding that change's rollback. These states are mutually exclusive. Bounded hover and pressed hits are retained separately as visual feedback, so actionable buttons continue to respond while the semantic state is awaiting confirmation without those visuals becoming broker state. A working entry or position starts protection creation only from its dedicated missing-role `TP` or `SL` handle. The chosen role stays fixed for the drag, and validity is checked against the entry side on release (buy/long: lower SL and higher TP; sell/short: higher SL and lower TP); the engine emits `create_stop_loss` or `create_take_profit` and leaves identity assignment and the authoritative child order to the host. Limit and market entries share this behavior, including filled market entries. Once supplied by the host, an SL or TP is an ordinary protection order whose role stays fixed even when dragged across its entry; its modify intent preserves the authoritative kind and stop-limit trigger price. Pointer movement changes only the local preview; release applies an existing-order move or emits a protection creation intent and holds the appropriate rollback until the host answers. A position or entry that already carries one protection omits that role's handle, and one carrying both exposes neither. Escape discards a live drag. Rejecting an emitted intent runs its rollback — reinserting a closed order or position, moving a modified order back, or doing nothing for an unmaterialized protection request — while acceptance releases it and the host's snapshot remains the last word. The vertical entry-to-preview connector exists only during the active placement transaction. Host acknowledgement clears the group visual, so confirmed entry, TP, and SL objects never leave persistent connector chrome behind.
-
-Trading quantity cells use the host's canonical text measurement plus bounded horizontal padding, so the visible cell and close-control hit geometry respond to the formatted quantity without a fixed empty allotment. Every trading control's text (TP/SL buttons, quantity, P&L or order type, annotations, and tooltips) is optically centered in its box rather than left on the `Prim::Text` em-box middle, which sits capitals and figures visibly high in a padded control. The host supplies one vertical glyph metric through `ChartEngine::set_text_cap_center`: the browser host derives it from `measureText` ink bounds of a figure, and the GPUI host installs `text_cap_centerer`, which derives it from the font's cap height. Every cell of a marker shares that one offset so adjacent readouts keep one baseline, and marker text anchors on the snapped pill's own center. A host without the metric keeps the geometric center.
-
-Panes expose opaque, monotonic chart-local identities at the browser boundary. A live pane or
-price-scale handle resolves its current index after moves or swaps; removal permanently invalidates
-that handle, so later index reuse cannot retarget it to another pane or scale. Persistence uses a
-separate stable pane identity and intentionally issues fresh live IDs during restore.
-
-The ordered frame contract contains pane backgrounds and grids, idle indicator geometry, idle drawings, ordinary series geometry, active series/drawings/previews, custom-series contributions spliced at their paint marks, pane chrome, trading regions, trading/alerts, crosshair overlays, axes, labels, and text, plus per-series and per-drawing segment ranges for retained backend groups. `series_order`/`drawings` stay the stable saved orders; the frame derives the effective paint order without rewriting them, and series/drawing hit tests tie-break on stable order so promotion cannot oscillate hover. Backends preserve ordering, clipping, blending, and coordinate conversion. A backend may batch compatible adjacent primitives only when visible output is unchanged.
-
-Trend-line labels are owned by the trend-line feature rather than by `DrawingKind::Text`: the
-engine owns their text state, dedicated hover affordance, edit-session identity, and the
-segment-local transform and middle-stroke cutout that every segment-layout tool shares (the same
-hit region, run layout, and cutout serve the rays, channels, and other run labels; only the trend
-line has the hover prompt). New trend labels default to the top-right slot;
-their 3×3 slots resolve along and perpendicular to the actual segment. The direction is normalized
-into the readable half-plane, including a
-deterministic vertical orientation, so endpoint crossing preserves visual left/right and never
-turns glyphs upside down. Top and bottom slots clear the stroke by the 1.2em line box's half-height
-plus the text padding. Pointer hits are inverse-transformed into the measured local text
-rectangle. An unset trend-label text color follows the drawing stroke dynamically; an explicit text
-color remains independent. Empty labels use that same resolved RGB at reduced alpha for
-`+ Add text`; entering or
-leaving the dedicated trend-label editor never converts or deletes the trend line. Middle labels
-split the stroke in segment-parameter space using measured advance plus padding. Hover reserves the
-prompt advance; editing starts with a compact one-em caret opening and expands from shaped text
-advance as the user types. Top and bottom slots never cut the stroke. The browser uses a fully
-transparent borderless editing surface (including native caret and IME composition paint) plus one
-explicit colored caret at the engine's exact run start and angle, leaving the frame as the sole glyph
-owner. Its selection pseudo-element is transparent as well, preventing browser selection/IME paint
-from leaking theme-colored duplicate glyphs during live transforms.
-Standalone Text retains its separate create/remove lifecycle and explicit toolbar text input; it
-is the only drawing the engine session removes when its editor closes empty. The host keeps a
-tool-kind check only in the text tool's two-step click and in a trend line's open-on-click; which
-drawings are editable, where their text sits, which tools start in the editor, and the empty
-lifecycle are engine answers. Run labels (the text tool, trend labels, and the text of every
-line, channel, Fibonacci, pitchfork, pattern, and shape tool) open the same transparent surface
-as one content-editable line, positioned from the engine's `drawing_text_edit_layout`: its
-left-middle sits on the run's start point and rotates about it by the layout's angle, in the
-layout's font size, weight, italics, and ink, and the host reads the layout again after every
-keystroke instead of measuring or aligning text itself. Family text boxes open it as a native
-`textarea` because their text may span lines (Shift+Enter inserts a line; paste inserts plain
-text), laid out from the same call: lines left-aligned at the box's text edge and a caret
-positioned by line and column; the box can grow upward (a comment) or both ways (a centered
-callout). Both modes share the engine text-edit session, so a whole edit is one undo step and
-Escape restores the text without a history entry. A double-click on a selected drawing (or on
-the text of an unselected one, whose first click selects it), or Enter or F2 on the chart or its
-accessibility drawing target (the target keeps Enter for geometry editing), opens the editor on
-whatever the engine reports `drawing_text_editable`, which includes refusing a drawing whose whole
-text lies outside its pane's plot (one engine rule for every host and path, so no invisible editor
-captures the keys).
-The double-click is ownership-checked by the engine input controller before it acts: it skips the
-drawing when either press of the pair was taken by a trading object or the alert widget (whose
-presses never reach the drawing pipeline, so the selection they leave behind is stale). The
-controller carries that fact from the first release to the second press, so a control the host has
-already removed, such as a cancelled order's line, still keeps the pair. It acts only when
-`drawing_at` (the drawing a click at the point would select: `drawing_text_hit_at`, then
-`hit_test_drawing`, read-only) is the drawing that was selected when the press began, and it
-reports `TextEditorOpened` for the host's DOM editor. Placing a tool the engine marks `requests_text_editor` opens the editor too.
-A commit or Escape keeps such a drawing even when its text was emptied, except the text tool,
-which is removed when it is left empty (Escape on a fresh placement included). Host `dbl_click`
-subscribers still run after the editor opens. The editor is a labeled `textbox`, announces
-opening and closing through the accessibility live region, and returns focus to the element it
-was opened from inside the chart after Enter or Escape; when it closes because focus moved to
-another element (a host panel that calls `focus()` from its `dbl_click` handler, a click on a
-host control), it commits and leaves focus there, since pulling it back from inside a blur
-handler would cancel the host's own `focus()` call. The GPUI and native hover paths call
-`update_drawing_hover` (or the pure `drawing_hover_at`), which arbitrates a drawing's own label first, with the text cursor, and then the body or handle,
-exactly as the browser does. On native hosts the engine input controller performs the click
-side: a press resolves a drawing's label first (`drawing_text_hit_at`), selects an unselected shape
-by its label, and opens typing with `begin_drawing_text_edit(id, true)` so the engine paints the
-caret: for a run label a bar rotated with the label, for a family text box a bar on the caret
-line.
-
-Segment-following text is an explicit `RotatedText` frame primitive carrying the final aligned
-anchor, clockwise angle, font, weight, italics, size, color, and text; no executor reconstructs
-trend geometry or silently ignores the angle. Canvas2D translates and rotates around the anchor
-before `fillText`; WebGPU sends only rotated runs through a dedicated vertex pipeline that rotates
-and bilinearly reconstructs premultiplied coverage from the cached glyph-atlas quad while
-preserving the ordinary-text instance/shader contract;
-tiny-skia resamples a local glyph-coverage raster around the same pivot; GPUI uses its transformed
-monochrome-sprite path backed by its atlas. Browser and GPUI caches key glyph-dependent inputs and
-subpixel phase but deliberately exclude angle, so endpoint motion reuses glyph coverage. Their
-fixed-capacity/LRU or atlas budgets bound retained entries, and font, DPR, device, or atlas-generation
-invalidation drops stale resources.
-The browser WebGPU presentation surface uses premultiplied alpha, and the chart background clear
-premultiplies its configured color so translucent backgrounds composite with the same host surface
-as Canvas2D. A non-empty text run that cannot enter the WebGPU atlas, including an oversized run or
-an unavailable text rasterizer, routes the complete ordered frame through the warm Canvas2D pane
-for that presentation. The failed GPU group is rebuilt on the next frame, allowing WebGPU to resume
-after the run is removed; no executor silently omits its glyphs.
-GPUI's rotated sprite uses the same measured middle baseline as ordinary GPUI text. The SVG
-rasterizer resolves the requested CSS font family independently of GPUI's text shaper, so a missing
-family may produce different glyph shapes or advances even though the baseline aligns.
-
-One-click bracket placement crosses the drawing/trading boundary only through an explicit engine command. A host passes a Long/Short Position drawing identity plus its own quantity; the engine reads the drawing's semantic entry, target, stop, pane, and price scale, snaps all prices to instrument ticks, and emits one atomic `place_bracket_order` intent. It creates no speculative order or position. The broker host owns submission, venue-specific entry interpretation, generated order/bracket/OCO identities, acceptance or rejection, and the authoritative snapshot that materializes the resulting lines. The web demo's quantity input and intent handler are an example host, not account-sizing or broker policy inside Aeris.
-
-Long/Short Position creation, body movement, and entry/target/stop handle drags resolve prices to
-the instrument `tick_size`, falling back to the bound price scale's display `min_move`; a scale that
-carries a `PriceTickLadder` uses its band ticks instead, so a laddered instrument's levels stay on
-its orderable grid and the price-ticks statistic counts cumulative band ticks. The engine
-converts the original `f64` pointer coordinates directly to price before rounding to ticks, so
-ticks smaller than one device pixel remain reachable. Horizontal creation and entry/extent handles
-use the vertical crosshair's shared time-slot resolver, including its visible-range and hidden-series
-rules. Body movement applies the difference between the pointer's starting and current crosshair
-slots to every anchor, preserving width and grab offset while holding between slot changes. Future
-empty slots remain editable unless an explicit data-time constraint applies. Keyboard nudges of a
-position handle land on the same grid (a level on its tick, the width on whole bar slots), and a
-nudge that would round back to where it started steps one tick or slot the way the key points. Square position controls
-emit one opaque, theme-filled `RoundRect` with rounded corners and a device-snapped inside border;
-all executors receive that same fill and border geometry.
-
-Position statistics are engine-owned pane chrome: target/stop distance, percentage, price ticks,
-projected account Amount, and a two-line Open/Closed P&L, Qty, and risk/reward block. Persisted,
-validated drawing options `position_account_size` (default 1,000) and `position_risk_percent`
-(default 25) define a hypothetical risk budget. Qty divides that budget by stop distance and the
-instrument point value; quantity display uses instrument precision (default three decimals).
-These estimates do not submit orders or change host-authoritative broker quantities. Closed P&L
-uses the same first-boundary, stop-first-on-ambiguous-OHLC run resolver as the progress overlay;
-open/unfilled/future drawings use the right-edge or latest available close. Zero-risk or unavailable
-values render as an em dash. Statistics emit opaque rounded borderless containers: the solid
-semantic fill under contrast text already separates the label from the chart, so no outline is
-drawn on any background. Text contrast is resolved against the opaque container. Every executor
-consumes those same shapes.
-
-Measuring tools are catalog entries of the Projection & Annotations family
-(`kinds/projection_annotations.rs`, wire ids 130-132), not a separate subsystem. Price range, date
-range, and date-and-price range are two-anchor `ClickAnchors` tools whose anchors, like Long/Short
-Position, carry the catalog's `grid_snap` flag: creation, anchor drags, and body moves (pointer and
-keyboard) resolve x to the crosshair's time slot and price to the instrument tick or price-band
-ladder (falling back to the bound scale's `min_move`), so statistics read whole bars and ticks. A
-magnet that finds a candle chooses that bar and price; a magnet that is on but chooses nothing (weak
-and too far from every price, or no bar under the pointer, as beyond the last bar) leaves the slot
-and tick to the grid, so an anchor never sits off a bar. The
-earlier spelling `date_price_range` is read as `date_and_price_range` wherever kind names are
-parsed (persistence import, templates, clipboard and sync payloads) and is never written. They
-lower through the shared drawing parts like every family tool: a translucent fill, crisp `HLine`
-price-level or `VLine` time-boundary rules, crisp one-pixel arrow shafts through the area center
-ended by the drawing's own caps (`stroke_end` defaults to an arrow), and an engine-formatted
-opaque, borderless statistics box beyond the end level (below the area for the date tool). The box shows the drawing's
-visible `labels` (price change, percent change, and ticks; bar count and duration; or all five),
-with ticks counted on the grid the anchors snap to and elapsed time taken from the anchors' time
-identity (extrapolated with the prevailing bar interval beyond the data), so it never depends on a
-display projection. Every price a drawing prints goes through one chain (host formatter,
-instrument precision on the tick grid, the bound scale's series format, the default), and a change
-that rounds to zero prints unsigned. A committed range paints in the drawing's own color in both
-directions. While selected or being placed they project their endpoints onto the axes as price
-tags on the bound scale and time tags in the drawing color (an anchor beyond the data shows its
-extrapolated time, the one the statistics use). The family's `decoration_extent` keeps a visible label's
-drawing in the viewport candidates when its area is off-screen.
-
-The Shift-click quick measure is transient state owned by the `DrawingController`: a
-date-and-price range bound to the pressed pane's default price scale, lowered through the same
-family parts as a committed one (default labels and caps) with anchors snapped by the same
-`grid_snap` rule. Having no user style, its color follows the pull: the drawing default for a rise,
-the market-down token for a fall (the active axis tags follow). A live measure consumes the
-next pane press before object hit tests (freezing a following measure, dismissing a frozen one);
-otherwise the engine input controller starts it from a Shift press after trading, alert,
-armed-tool, drawing-drag, and Delta Tooltip arbitration declines the press. The end anchor follows pointer
-movement with or without a held button, clamped into the pane; a release beyond the shared 5 px
-click slop freezes a press-drag measure, while a click leaves it following until the next press.
-Arming a tool, Escape (`cancel_drawing_tool`), host cancellation, and persistence restore clear it.
-It is painted after creation previews in the trailing drawing preview block, keeps the crosshair
-visible and its cursor while following, rebases with drawing logicals, and never enters drawings,
-history, sync, or persistence. Browser and GPUI adapters forward normalized input to that
-controller, so all hosts share one measuring state machine.
-
-## Plugins and host extensions
-
-User-defined custom series and primitives remain explicit host boundaries. The engine owns their identity, layout participation, hit-test context, autoscale contribution, and built-in chrome integration. A host may execute an arbitrary user callback, then records the values the engine needs for the next canonical frame. The official plugin implementations above do not use that callback path.
-
-Extensions must not receive unrestricted engine internals or create a second scene graph. Add extension surfaces only for current consumers with a stable semantic need.
-
-Browser pane and series primitive `text_views` lower into ordered `Prim::Text` commands in each
-owning pane's top layer. The shared pane scissor clips them before the axis layer, and Canvas2D,
-WebGPU, GPUI, and native executors consume the same font, color, baseline-adjusted anchor, and
-paint order. The transparent browser overlay is reserved for input and DOM effects.
-
-Disposal invokes every registered extension teardown exactly once; one failing JavaScript cleanup hook cannot prevent the remaining hooks from running. The WASM chart releases its retained resources synchronously; the browser frees its wasm-bindgen wrapper in the next microtask, after any device-loss or frame callback borrow unwinds.
-
-Extension rendering is host-timed, non-reentrant with chart mutation, and error-contained at the
-host boundary. Extension runtime objects and callbacks are never persisted by the engine; hosts own
-their configuration and restoration. The current custom-series and primitive APIs are experimental,
-not a second plugin framework. Primitive and custom-series draw commands decode into the same ordered
-`Prim` contract as engine geometry, and the decoder lowers plugin dashes and clamps them to the
-owning pane, so WebGPU and Canvas2D paint identical plugin dashes and a plugin line reaching far
-past the pane costs only its visible part. A dashed polyline winding through the pane
-many times is capped at 4096 dash runs per command and drawn solid beyond that, so a plugin
-renderer that re-runs every frame cannot make one command's cost grow with its path length.
-
-The browser package's official-feature modules are thin lifecycle and platform adapters over these
-engine owners. They normalize public data/options, translate pointer or keyboard events, decode
-browser images, and create optional DOM chrome; they do not simulate financial geometry. Tooltip
-guides/value lookup, accessibility focus geometry, drawings, bands, price lines, overlay
-labels, image placement, and every specialized series frame are constructed in Rust. The engine and
-its browser/native hosts do not inject product attribution or branding into chart surfaces. Feature
-handles release their engine primitive
-plus any host subscription,
-timer, or DOM node exactly once; none of that runtime state enters engine persistence.
-
-The engine input controller owns the crosshair-action chip as a press target: hovering it resolves the pointer cursor, its press prevents chart pan and selection underneath, and an unmoved release within the hit area emits the shared action request. Pointer cancellation discards the pending press. The GPUI demo shows the request's pane and price in its status line.
-
-Interactive chart objects own pointer feedback: the shared frame suppresses the complete visual crosshair (lines, markers, and axis labels) while any trading object or drawing is hovered, created, or dragged. A following Shift-click measure is the exception: it reads the pointer through the crosshair, so the crosshair stays visible even over other objects. The engine retains the crosshair position for snapping and host callbacks, while each host continues to show the object's pointer, click, grab, or drag cursor.
-
-## Performance contract
-
-Performance comes from avoiding work:
-
-1. Recompute only invalidated state.
-2. Keep hot data columnar and transfers bounded.
-3. Reuse GPU, text, image, and geometry resources.
-4. Conflate replaceable frame requests while preserving the newest state.
-5. Keep rendering and input queues bounded.
-6. Measure release builds before changing algorithms or adding caches.
-
-Large-history geometry and hit testing are bounded by physical viewport density plus hierarchy-boundary refinement rather than visible source-row count. The hierarchy is a compact canonical-data auxiliary index, not a renderer cache: GPUI, WebGPU, Canvas2D, native rendering, retained rebuilds, and forced clean rebuilds all consume the same selected geometry. Native evidence records selected level, summary-node operations, raw boundary rows, and candidate rows; browser evidence records the resulting frame CPU, backend work, allocations, and upload bytes without exposing LOD controls through the public chart API.
-
-Drawing work is independently bounded before frame emission. Charts with at most twenty drawings use the direct stable z-ordered render path to avoid index overhead. Larger charts scan only the hovered pane's compact bounds entries, use semantic-domain rejection before coordinate work, preserve canonical pane stable z-order in the candidate list, and run exact per-tool hit tests only for pointer candidates. Retained per-drawing segments reassemble idle-below / active-above without rebuilding geometry on promotion; hit tests stay on stable order so promotion cannot oscillate hover. This intentionally small local structure has no spatial-tree dependency: its cheap bounds pass is linear in drawings owned by the pane; text extents are measured once per semantic/font generation; and coordinate conversion, brush traversal, primitive emission, and precise hit testing follow the candidate count. Pathological complete overlap therefore remains an explicit linear candidate worst case. Cache memory is bounded by live drawing entries, retained path-point capacity, pane membership, and one reusable candidate scratch vector; removal releases the entry and no historical geometry is retained.
-
-Trading state is capped at 4,096 live positions, orders, and executions per chart, and pending intent delivery is capped at 256 entries. Expected terminal workloads (10, 50, 100, and 500 trading objects) use a direct topmost-first pane scan for hits and one retained trading rebuild per semantic/preview mutation; unchanged frames reuse both trading layers. This deliberately avoids a spatial tree until measurements justify one. Engine memory telemetry includes trading vector, intent-queue, and retained string capacity.
-
-Track CPU frame time, GPU time where available, draw calls, dropped and presented frames, memory, ring overruns and dropped invalid ring rows, interaction latency, and steady-state allocation. Device loss or unavailable WebGPU must fail over without losing headless chart state.
-
-Each browser chart owns reusable WebGPU vertex buffers for its retained semantic draw groups. Buffers grow geometrically to a high-water capacity, upload only when the corresponding group revision changes, never shrink during the chart lifetime, and are released with the chart's GPU state. The public last-frame telemetry also reports buffer allocations, buffer writes, uploaded bytes, and retained-layer rebuild counts so stable and localized-update behavior is directly testable.
-
-The shared text atlas treats one render as a transaction: slots referenced or inserted in the current frame cannot be recycled until that frame completes. Atlas pressure after the frame has accepted text defers the reset to the next frame; the browser renders the pressured frame through Canvas2D rather than submit stale UVs. A reset increments the atlas epoch, invalidating retained textured groups and text-cache entries before the next WebGPU submission. A visible text run that cannot enter the atlas at all (larger than the atlas, or unmeasurable) marks only the retained group that holds it. While that group's source revision is unchanged, later frames go straight to Canvas2D without WebGPU tessellation; every other retained group keeps its geometry, so the first WebGPU frame after the run changes or disappears rebuilds only what changed.
-
-Browser WebGPU shares one page-wide adapter/device/queue and atlas while retaining per-chart surfaces. Device loss is therefore a shared generation event, not ownership of the chart that first created the device: every live chart listener wakes and falls back, while disposed charts have no listener. Headless chart data is preserved through fallback.
-
-The browser package's default `auto` backend prefers WebGPU but keeps Canvas2D available when the browser exposes no usable adapter; `navigator.gpu` alone is not proof of adapter availability. A failed adapter request is cached for that page session so independently mounted charts and viewport remounts do not repeatedly probe an unavailable adapter. Device-initialization failures remain retryable, explicit fallback-adapter diagnostics are isolated from the ordinary adapter result, and a reload permits a new adapter probe after browser or driver settings change. The General dashboard reports the actual backend and fallback reason rather than rejecting charts when WebGPU is unavailable.
-
-Chart construction accepts an explicit first-pane horizontal domain. The engine creates either the
-compatible financial pane plus primary candlestick series or one preserved general pane with no
-financial series; browser hosts do not add a temporary financial pane and remove it afterward.
-Rejected construction removes the canvases installed by that attempt before control returns to the
-caller. The engine retains one layout slot at all times. Explicit removal of an empty preserved final
-pane retires its stable and persistence identities, releases its general-domain/axis state, and installs
-a fresh unpreserved financial-time pane in the same slot. The removed handle therefore stales normally,
-and declarative cleanup never needs a temporary keeper pane.
-
-## Evidence benchmark subsystem
-
-`benchmarks/` is development and release evidence infrastructure outside every production crate and the published package. Its single Node entry point builds the actual release package, drives the public browser API through the existing Playwright demo host, generates deterministic versioned OHLCV data, validates versioned JSON results, compares explicit baselines, applies centralized budgets, and emits human- and website-readable artifacts. The browser page is served by `examples/web_demo/test_server.mjs` only for automation; it is not part of the npm package.
-
-The subsystem reuses `chart_api.frame_stats()` for bounded CPU, real capability-detected WebGPU timestamp, draw, presentation, dropped-frame, ring-overrun, and WASM-linear-memory observations. It does not add production instrumentation, dependencies, imports, feature flags, logging, or runtime branches. Browser page/heap memory is labeled as whole-page memory, and unsupported presentation or GPU measurements remain unsupported rather than inferred.
-
-Raw local results are ignored and CI results are artifacts. Public summaries and committed release baselines require a clean `release` profile result classified as `official-benchmark-runner`; shared CI timings are smoke/trend evidence only. Scenario, dataset-generator, schema, and baseline versions preserve historical comparability.
-
-Benchmark comparisons enforce only explicitly configured budgets. An empty policy is reported as `NO ENFORCED BUDGET`, and configured keys must match comparable metrics so a typo cannot silently disable a hard threshold. Publication requires the portable browser runtime/parity suite, including deterministic SwiftShader WebGPU/Canvas2D and tiny-skia/Canvas2D pixel comparisons. Reference fidelity reports, GPU measurements, and wall-clock evidence remain separate non-blocking results.
-
-## Correctness and parity
-
-Chart math must be deterministic for the same state, viewport, and device scale. Validate malformed data at the input boundary. Preserve whitespace rows, time ordering, logical ranges, primitive order, and explicit warm-up gaps.
-
-OHLC ingestion preserves structurally valid numeric input rather than silently rewriting financial values. Impossible relationships are accepted for compatibility but counted in structured diagnostics alongside accepted, dropped, deduplicated, reordered, non-finite, and out-of-range rows. Invalid timestamps reject a direct transaction before value-row repair; accepted batches retain the existing value repair semantics. Clean ingestion returns no diagnostic object on the browser hot path. Predictable boundary failures carry stable error categories rather than relying on console text.
-
-The generic `Workspace` engine type owns only split-tree topology, stable cell identities, ratios,
-and bounded validation of a restored layout. Subscription caps, billing-tier vetoes, cumulative
-split usage, storage, provider identity, and cell-age metering live in the browser grid host; the
-shared engine has no commercial-policy or account knowledge.
-Workspace divider mutations reject non-finite deltas without changing the layout, and splits
-reject exhausted `u32` cell identities before mutation so browser handles remain addressable.
-
-Changes to geometry, snapping, scales, interactions, or execution require the narrowest relevant combination of unit tests, frame-contract tests, golden images, draw-stream parity, replay stability, browser tests, and release performance evidence. A backend-specific screenshot alone is not proof of shared-engine correctness.
-
-Interactive behavior is verified through each real input path, not through the mechanisms beneath
-it. The controller's scenario modules (`chart_input/{chrome,drawing,lifecycle,motion,trading}_tests.rs`
-beside its own `tests`) drive each behavior through `ChartEngine::input_*` with explicit
-timestamps (setup and host replies such as `resolve_trading_intent` use the public API), so
-kinetic coasting and the trading-tooltip dwell are deterministic without a clock. The GPUI adapter's tests
-(`aeris_charts_render_gpui/src/input/tests.rs`) feed GPUI event values to `GpuiChartInput` and
-compare its wheel normalization with the browser's on a twin engine. The `gpui_probe` example's
-`window_input_tests` open the real probe host on GPUI's headless `TestPlatform` (the `test-support`
-feature of the dev-only `gpui` dependency) and dispatch simulated mouse, wheel, and key events through
-its listener table, the adapter, the engine, prepaint, and paint; they run in the native GPUI job on
-all three operating systems. Browser interaction is covered by Playwright specs that drive real
-`page.mouse`/`page.keyboard` input and CDP touch (`gesture-cancellation`, `interaction-gates`,
-`touch-input`, and the per-feature specs) against the published package build.
-
-## Dependency direction
-
-Lower layers never import a host API to bypass their boundary. The headless path is `aeris_charts_core` and `aeris_charts_indicators` into `aeris_charts_engine`, then `aeris_charts_render`; GPUI, WebGPU, native, and WASM/browser code sit at execution boundaries. Avoid new crates, traits, and feature flags unless they enforce a real current dependency or platform boundary.
-
-## Repository documentation
-
-Markdown documentation may live at the root or beside the component it explains when it has a durable repository purpose. Keep the root README focused on product orientation and contributor setup, and keep architectural ownership and data flow in this file. Do not commit transient work notes, generated reports, or duplicate documentation.
-
-## Verification
-
-The standard gates mirror CI (`.github/workflows/ci.yml`, in its order). Bun 1.4.2 installs the npm
-dependencies (`bun.lock` in `packages/charts` and `examples/web_demo`) and runs the package scripts
-and Playwright; Node 24 stays installed because Playwright and the repository's `node` scripts run
-on it. npm is used only where it defines the shipped artifact: `npm pack` for the size budgets and
-the pack smoke test, and `npm publish` in `publish.yml`.
+自动尺寸保持 `ResizeObserver` 的精确设备像素路径。分辨率媒体查询监视器加上方向/全屏回退，会在 DPR 变化而 CSS 边界未变时重新执行尺寸计算；调整大小会重新投影语义状态，并不会创建新的对象标识。自动尺寸处于活动状态时，手动 `resize` 调用会被忽略。禁用它会断开引擎拥有的观察器，并把控制权交还给手动尺寸调整；重新启用后立即采用当前容器。隐藏或已分离的容器保留最后一次可用的尺寸，并在重新显示时采用其新边界。
+
+该包还随附 `aeris_charts.css`，作为可移植的宿主设计系统。即便某个令牌目前仅由 Terminal 或网站使用，其完整的品牌令牌契约仍保持完整；Charts 使用适用的表面、边框、文本、状态、控件、交互、图标、操作、焦点、圆角、阴影和市场角色，而不对其重命名。宿主外壳使用系统 UI 字体栈，并且可以使用 `color-mix`。发布的包不包含网络字体。原生 CPU 文本为所请求的字体族、字重和斜体样式选择已安装字体面；原生 golden 场景为精确位图比较屏蔽其文本区域，并另行要求在各系统字体下都有可见的字形笔迹。面向后端的角色——图表窗格的主表面、坐标轴的主文本、坐标轴线和窗格分隔线的边框、规范边框宽度、弱化文本、分隔线交互、焦点/主交互、正/负市场语义和共享圆角半径——在 `crates/aeris_charts_core/style_tokens.json` 中具有确定的不透明 sRGB 投影。`aeris_charts_core` 拥有并把该文件编译为每个引擎与后端所用的默认值。坐标轴边框在引擎中把共享的边框宽度令牌（1 CSS px）投影到设备像素网格上，可见的窗格分隔线在该网格上填满 2 CSS px 的 `PANE_SEPARATOR` 布局槽；分隔线悬停目标仍独立扩大以便交互。TypeScript 包在构建时导入同一来源，用于宿主主题与工作区分隔线投影。因此核心 crate 仍可独立打包，而不必伸入浏览器包目录，并且令牌在帧构建之前就已解析，而不是通过演示或渲染器覆盖。规范的引擎网格线保留其虚线样式与边框颜色，但默认禁用；宿主与确定性一致性夹具可以显式启用任一类网格线。与包版本匹配的 `v*` 标签会把已验证的产物发布到 GitHub Packages。
+
+该包保留其完整的 `snake_case` 接口面，并为常见的 JavaScript 图表/系列/比例尺生命周期添加驼峰别名，而不创建并行的状态或句柄。金融系列与通用系列使用同一个图表对象和有序帧。数据以类型化列或有界共享环形缓冲区布局进入 WebAssembly，热路径上不做逐点对象调用。类型化更新批量把其经过清理、拥有所有权的列转移给引擎的批量入口；浏览器封装绝不会循环调用单行引擎 API。发布的产物显式导出优化后的 WASM 资源，生成的胶水代码也按 `import.meta.url` 解析其同级资源；源码树中的 `pkg/`、crate、基准测试与演示路径都不是运行时依赖。`examples/web_demo` 仍是集成与一致性测试宿主，而 `examples/all_in_one` 包含面向使用方的、框架无关的及 React 的组合示例。
+
+金融外观在引擎中保留类型化的主题来源。网格、十字光标、看涨、看跌、影线与边框颜色要么是语义化的主题跟随色，要么是显式的自定义颜色；主题变化只会让跟随色重新令牌化。原生宿主消费并应用类型化的金融外观事务，不得通过比较已解析的 CSS 字符串来推断来源，不得为取得默认值而创建哑引擎，也不得发送空字符串颜色哨兵值来清除系列覆盖。
+
+引擎还会从其规范值快照中投影出有序的金融图例模型。它拥有主 OHLC 的格式化与色调、原生指标输出分组、外部研究分组、可见性、窗格位置、输出标签与颜色。宿主可以描述一组有界的、真正归产品所有的系列角色（例如 Terminal 可复用的成交量系列），再将返回的类型化标识映射到其 UI 控件；不得通过遍历系列来重建由引擎拥有的分组。
+
+`chart.value_snapshot(logical_index?)` 仅跨越一次 WebAssembly 边界，并返回所有存活系列。该包在引擎记录上添加存活句柄，并通过只保留有值的条目来派生旧版十字光标 `series_data`。引擎拥有的特性系列暴露其标量比例尺投影，并保留旧版标量事件形态。任意自定义系列回调仍归宿主所有：精确快照为 null，而最新快照只能暴露在可见帧期间记录的最后一个值，并明确依赖渲染状态。品种/交易所元数据、VWAP 绑定之外的成交量关联、柱/日涨跌幅计算、交易时段日历、可见性设置以及图例 DOM 仍归宿主所有。
+
+受支持、实验性、内部但已暴露以及旧版的接口面在 `Public_api.md` 中分类。可预期的浏览器端失败使用带有稳定类别码的 `AerisChartsError`；干净写入保留空诊断的快速路径。生成的 WASM 接口面与基准测试/测试钩子是内部的，即使在开发者工具中可见也是如此。确定性的声明清单使受支持的 TypeScript 接口面变更在 CI 中显式可见。
+
+`chart.remove()` 是唯一的公共浏览器生命周期操作。它是幂等的，并在取消调度、分离浏览器资源与扩展、释放每图表的 GPU 状态、显式销毁 Rust 对象并调用生成的 `free()` 之后，将保留的 TypeScript 句柄转换为已销毁状态。之后的操作会以稳定的已销毁状态错误失败。离屏图表使用相同的先显式销毁、后 free 的顺序。
+
+## 状态与帧的所有权
+
+每个图表有且仅有一个引擎所有者。变更仅使发生变化的状态失效。帧是引擎状态针对某个视口和设备缩放比例的确定性快照。
+
+坐标权威的比例尺对象在其变更方法内部推进规范修订号。浏览器与 GPUI 宿主通过 `ChartEngine` 命令表达手势；旧版的直接 Rust 访问依然保持一致，因为它无法绕过由比例尺拥有的修订号。`SeriesStore` 同样在 Rust 宿主获取可变访问时推进其规范呈现修订号，取代了对每个样式字段做读取侧哈希的做法。保留的依赖坐标的图层是派生缓存，并标有引擎当前的坐标修订号。帧组装会断言网格、可见系列、界面元素、绘图与交互叠加层都带有同一修订号，因此一帧不会混用多种变换。
+
+在每个宿主上，引擎输入控制器拥有完整的窗格/时间轴/价格轴/分隔条拖动状态机、分隔条与坐标轴目标解析、分隔线处的十字光标排除，以及滚轮平移/缩放路由。平台适配器负责转换 OS 事件，将 `ChartCursor` 映射为一个平台光标，并调度重绘；它不得重现手势生命周期，也不得保留并行的按下、拖动、悬停或光标状态。
+
+帧失效是由引擎拥有的代次图。布局、坐标/自动缩放、网格与底层、每个系列、绘图（含每个绘图各自的图元/点分段，外加末尾一个由控制器拥有的创建预览块），以及交互叠加层，都有各自独立的代次。坐标范围变化会扩散到依赖坐标的图层；当自动缩放边界不变时，仅数值变化的当前柱更新只停留在其源系列上。`histogram_updown` 直方图图层同样以主价格系列的代次作为键，因为其柱体着色会读取主系列的行（开盘价与收盘价对比，或者对分时成交量而言与前一个成交收盘价对比，其首行与主系列显式的基线或百分比基准比较），并采用宿主的 `up_color`/`down_color`。仅涉及顺序的提升（悬停/选择/拖动/编辑）会重新组装保留的系列图层与绘图分段，而不重建几何；绘图拖动会用全新分段重建绘图图层，同时复用运行时的逐条目缓存。公共选项与系列样式的变更被纳入代次输入，因此直接的原生调用方不会意外绕过保留机制。
+
+系列与指标选择拥有一份瞬态引擎快照，其中含单一主命令目标，以及至多 64 个相关输出成员。引擎拥有的指标绑定会自动展开；宿主可以为其在内置指标注册表之外编写的研究组提供有界的成员标识。每个成员至多保留 128 个规范输出时间戳，这些时间戳仅在“未选择到已选择”的转换时，从该成员自身完整的规范起止范围内采样。选择时的投影决定稀疏密度，而包含端点的逻辑间距可避免出现仅覆盖系列局部的选择呈现。叠加层重建时，会依据每个成员当前的规范值与坐标解析其标识，将 K 线手柄置于当前实体中点，对屏幕外的手柄进行裁剪且不予替换，并在取消选择时丢弃该快照；LOD 几何、屏幕坐标与持久化绝不拥有选择锚点的成员关系。
+
+绘图的语义变更复用此图：添加/移除/样式/锚点变更会使绘图图层失效，并仅更新受影响的派生条目；而选择/悬停/拖动/编辑提升会重新组装保留的绘图分段而不重建几何，选择变更还会因手柄而额外使叠加层与坐标轴帧失效。唯一的例外是仅在获得焦点时才绘制某些部分的族绘图（例如便笺的文字，`DrawingFamily::reveals_on_focus`）：帧构建会在这些绘图中以悬停和选中的绘图为键，并在该键变化时重建绘图图层；打开或关闭文本编辑会话同样会重建它。绘图选择手柄在叠加层开头组装，保持其既有的规范顺序：紧随绘图主体之后、位于十字光标/系列叠加层之前，且不会重建无关的绘图几何。临时提升（拖动/编辑 → 悬停 → 选中 → 空闲，悬停由 `hoveredSeriesOnTop` 控制）绝不改写已保存的绘图 z 序；取消选择、悬停离开、取消操作或移除都会恢复该顺序。选中的跨价格矩形还会在其绑定的价格比例尺上输出主色的范围标签与区域色带；这些坐标轴视图跟随创建、拖动与调整大小时的坐标，并在取消选择时消失，除非该绘图显式请求持久的坐标轴视图。文本工具是一个例外：它不输出锚点圆盘——选择与悬停绘制相同的焦点边框框（悬停时降低不透明度），空文本不在图表上绘制任何内容，离开编辑器而未输入文字则移除该绘图。对于每个自行绘制文字的绘图，输入是一个由引擎拥有的会话（`drawing_text_edit.rs`）：它保存实时文本、基于字符的插入符与选区，在不写入历史的情况下应用实时文本（提交会记录一个 `Update` 撤销步骤与一个同步修订号；取消则恢复文本且不记录任何内容），并拥有 Enter/失焦提交、Escape 恢复，以及空文本生命周期（仅文本工具在留空时被移除）。宿主只转发输入。浏览器保留一个无边框、字形透明的 content-editable 表面，用于输入法（IME）、剪贴板与无障碍，将其值与插入符镜像到会话中（`set_drawing_text_edit`），并自行绘制插入符；原生宿主转发已提交的字符与编辑按键，由会话在该绘图自身的帧分段中绘制插入符（对文本段标签使用随标签旋转的折线，对族文本框则在插入符所在行上使用 1 CSS px 的竖条）。无论哪种方式，引擎都会继续绘制标签和焦点边框，因此进入编辑状态不会使文字浮起或使轮廓偏移。十字光标移动以及坐标不变的行情数据更新不会使绘图几何失效。窗格的添加/移除/交换/移动会重建窗格成员关系，因为窗格所有权本身已发生变化；普通的绘图拖动只更新一个条目，而结构性移除会修复规范向量中从 id 到位置的映射。
+
+浏览器文本编辑器通过 WASM 从 ChartEngine::drawing_text_edit_layout 读取其解析后的字体、对齐的文本段边缘、旋转锚点、测得的前进宽度以及插入符位置。其透明的 content-editable 元素提供输入法（IME）、选择与剪贴板输入；它不会度量文本段，也不会另行推导基线。引擎的布局查询与绘图帧使用相同的文本放置与度量函数。
+
+引擎拥有的十字光标叠加层可以在吸附后的逻辑索引处，为每个可见的折线、面积、基线以及线形指标输出绘制同一种可配置的悬停标记。标记默认禁用，宿主按系列或指标输出选择启用；启用后，标记坐标、各系列颜色、边框、窗格归属与比例尺转换都在共享帧到达任何后端之前解析完成。十字光标与绘图磁吸共用同一条像素空间候选路径：K 线、柱与足迹图系列暴露其所渲染的 OHLC 字段，而折线、面积、直方图、基线及其他标量投影仅暴露其所绘制的收盘价/值，因此隐藏的存储列无法吸引锚点。悬停中的空趋势线会在其配置的相对于线段的槽位处输出一个低不透明度、无边框的 `+ Add text` 文本段；引擎拥有其度量得到的命中框、精确的插入符锚点以及中间槽位的描边间隙，而编辑本身由上文所述的共享输入会话拥有。点击此交互提示或已有的趋势线文字都会进入行内编辑，而退出空的趋势线编辑时会保留该绘图。柱槽高亮与提示框参考线从当前图表表面解析其默认色调：深色表面上使用浅色提亮，浅色表面上使用深色着色；叠加式价格比例尺文字跟随当前布局前景色。宿主显式指定的颜色仍具权威性，而隐式颜色则随图表选项重新令牌化。代表柱本身的界面元素——内置的实时价格线、其最新值坐标轴徽标以及十字光标标记——遵循同一套柱颜色解析。内置实时价格线是一项规范的系列特性：其默认的 `partial` 范围从被跟踪的柱/值开始，延伸到窗格右边缘，而 `full` 是按系列显式指定的选项。两种范围使用相同的来源、颜色、宽度以及实线/点线/虚线线型状态，因此普通系列与引擎指标输出不会在粗细或虚线语义上出现偏差。用户显式创建的水平价格线对象仍是全宽的独立图表对象。对于 K 线，该解析按绘制顺序依次检查各部分，即实体、边框、影线，并跳过任何透明或已关闭的部分，因此空心 K 线（透明实体加可见边框，业界标准做法）会保留其看涨或看跌颜色，而不是解析为不可见的填充。柱的呈现同样由引擎拥有：OHLC 柱保留一条垂直的最高/最低主体，并独立控制开盘与收盘刻度线的显示，因此将两个可见性标志都设为 false 会产生明确的高低柱，而无需宿主侧分叉几何。
+
+引擎保留语义窗格图层及其有序的图元/点范围，再由未变动与已重建的图层组装出同一份规范的 `ChartFrame` 契约。保留的边界包括：底层/网格、各个系列、每个绘图的分段外加末尾的创建预览块、窗格界面元素、瞬态的交易风险/回报预览区域、金融操作线/控件（交易与提醒），以及叠加层。帧组装是窗格内顺序的唯一拥有者：网格/背景 → 空闲指标 → 空闲绘图 → 普通价格系列 → 活动对象（拖动/编辑 → 悬停 → 选中，同一层级内系列在绘图之前，预览紧随活动对象之后）→ 界面元素 → 交易区域 → 交易/提醒 → 叠加层 → 顶层。指标输出作为一个视觉分组整体移动，并保持内部顺序（分组由绑定拥有，绝不由系列类型或标题决定）；显式的 `set_series_order` 会覆盖默认的空闲系列分组，而空闲绘图仍位于价格系列之下，仅含指标的窗格保持稳定的内部顺序。坐标轴、十字光标与金融操作控件的受保护图层始终位于所有图表内容之上；活动的图表内容保持裁剪在其所属窗格内。不存在公共的 z-index API，也不存在特定于渲染器的策略。预览区域位于图表内容之上，而具有金融可操作性的线、提醒指示器与精确的控件命中区域位于预览区域之上、十字光标瞬态元素之下。系列的实时价格簇在其值为实时时保持填充；一旦该系列的最后一根柱滚出视野，它就改为描边样式——以图表表面色填充，语义色作为内侧边框与文字——因此过时的值绝不会被误读为当前值。相互碰撞的系列簇由重叠处理 pass 按每个簇的完整高度拉开间距，而不是改变样式。带框的价格线与绘图标签会在这些簇以及同一坐标轴上先前的标签周围，取最近的空闲垂直位置。每一帧的放置都从各标签的价格坐标重新开始，因此障碍消失后标签会回到原位；没有空闲位置的标签会被省略，直到空间恢复。原本为实心的交易标签若与主簇的原始坐标轴区域相遇，也采用同样的描边样式，但金融操作标签保持在其精确的价格坐标上，而不会因碰撞而偏移、远离其所标识的线。它们先于主簇输出，因此在精确坐标重叠时，实时价格在视觉上仍占主导。已确认的订单绝不会生成持久的风险/回报填充。持仓与订单在价格比例尺旁使用一个宽度上限为 304 CSS 像素的标记。每条订单与持仓规则线默认从窗格左边缘延伸到标记末端，并从不透明的标记容器下方穿过。挂单入场单与持仓会在标记之前紧邻处，为每个缺失的保护单分别暴露独立的紧凑 `TP` 与 `SL` 拖动手柄；其可见的规则线只是读数，而不是隐式的保护手柄。对挂单入场单的键盘调整没有可以瞄准的手柄，因此它所创建的保护单会根据其移动到入场价的哪一侧来确定角色（朝盈利方向为 `TP`，朝亏损方向为 `SL`）；从专用手柄发起的指针拖动则保持其固定角色。已确认的 TP/SL 订单规则线仍可在线容差范围内直接拖动，而每个专用的操作单元与关闭单元都保留其更大的控件高度命中目标。每个标记是一个更高的读数徽标——一个实心的数量单元，随后是 P&L 或订单类型，二者位于同一个轮廓之内，没有内部边框或分隔线，因此数量块自身的边缘就是接缝——并在 P&L/读数右侧紧接一个一体化的关闭/取消单元。单一的主容器及其边缘单元使用共享的大圆角 `999px` 半径令牌，引擎按 CSS 的钳制语义解析该令牌，从而形成一个整体的胶囊形。轮廓与数量填充携带对象的语义色，因此标记从线到价格标签呈现为同一种颜色；只有 P&L 文字保留其自身的盈利/亏损着色。每个关闭图标在空闲、悬停与按下状态下都使用其标记的语义线条色，因此线、轮廓、数量填充与关闭图标呈现为同一种颜色。关闭图标由交易层自己的点池提供，是两条抗锯齿的 `Polyline` 对角描边，而不是旋转的字体字形、倾斜的填充条，或带端帽圆盘的三角形：宿主的 `font_family` 不保证包含合适的符号，而 `Polyline` 是每个执行器都以相同方式抗锯齿的唯一描边图元。保护角色优先于经纪商买卖方向与订单类型：TP 为正向绿色，SL 为警示黄色。每个普通买入订单（包括挂着的限价买单）都使用正向令牌；每个普通卖出订单（包括限价卖单）都使用负向令牌。正、负 P&L 文字使用同样的语义角色。已拒绝、已取消与已过期的标记使用拒绝色，而待处理的经纪商操作使用待处理色。价格标签只有在其订单实际成交后才为实心——挂着的订单保持描边样式，因此尚在挂单中的意图绝不会被误读为已执行。每个主标记胶囊都使用设计系统 `--border-width` 宽度的实心语义轮廓，像浏览器边框一样做吸附，并作为容器的 `RoundRect` 边框输出——每个执行器（WebGPU、GPUI，以及浏览器 Canvas2D 与原生 CPU 输出背后共用的 Canvas2D 执行器）都将 `RoundRect` 边框绘制在矩形内部，绝不以矩形边缘为中心跨边绘制——轮廓与边缘单元填充之间保留刻意设置的徽标表面间隙，而一体化的关闭单元保留其全高命中目标，但自身不绘制静止状态的表面；其图标直接位于容器表面之上。悬停与按下会用品牌的 `--hover-bg` / `--active-bg` 表面填充被指向的控件（对关闭单元而言，是一个更小的内缩、完全圆角的胶囊），而不是订单颜色；并且关闭单元在胶囊的整个高度范围内响应命中，而不是按线容差响应。`ChartEngine::trading_cursor_at` 是每个宿主都使用的唯一抓取/指针交互提示：可拖动的线恰好在此处会开始拖动时才显示为可拖动，而关闭单元与 `TP`/`SL` 保护按钮则以点击光标显示为按钮，即使保护按钮同时也接受按下并拖动。这些填充保持不透明：控件位于其自身标记线之上，半透明填充会让该线透过指针所在的按钮显现出来。出于同样的原因，当指针位于交易控件上方时，引擎会抑制十字光标线——控件并不是一个要读取的价格。操作提示框由宿主计时：引擎不拥有时钟，因此只有在宿主于悬停停留后将其启用时，引擎才会显示提示框，而悬停对象变化会使其停用。因此扫过堆叠的标记时，绝不会为每个标记闪现一次提示框。操作提示框是图表界面元素，而不是其所描述对象的一部分：它采用当前主题的表面、边框、文字与圆角令牌，绝不采用订单的买/卖颜色，因此在每条线上以及两种主题下呈现完全一致。由于 `RoundRect` 边框绘制在框内部，每个带边框的界面元素框（操作提示框、标注徽标、Delta 提示框及其 delta 色带）都通过帧唯一的 `DeviceBox` 规则，将各条边独立吸附到整数设备像素；带小数的边会使一像素边框仅在某些边上被抹散到两行像素。浏览器的 DOM 柱检查器提示框通过相对于其包含块平移到吸附后的设备像素坐标来应用同一规则，而不是使用 `-50%` 平移。已确认的 TP 与 SL 订单仍是普通的、以宿主为准的订单标记，带有数量与预计 P&L、端点节点以及操作提示框。交易、提醒与坐标轴标签共用规范的窗格价格变换；WebGPU、Canvas2D、GPUI、截图以及原生/无头消费方不会收到单独的金融操作几何。保留机制绝不赋予后端更改顺序或语义的许可。宿主/插件的图元回调使用规范帧，但会保守地重建受影响的窗格流，因为其输出并非由引擎拥有。增量帧会在数据、交互、比例尺、绘图、主题与尺寸调整等变更下，与强制全量重建进行对比测试。
+
+交易交互是一个由引擎拥有的状态机：空闲、悬停、通过本地预览进行拖动，或在持有该变更回滚信息的同时等待宿主答复。这些状态互斥。有界的悬停与按下命中被单独保留作为视觉反馈，因此在语义状态处于等待确认时，可操作的按钮仍能继续响应，而这些视觉状态不会变成经纪商状态。挂单入场单或持仓仅能从其专用的缺失角色 `TP` 或 `SL` 手柄开始创建保护单。所选角色在整个拖动过程中保持固定，并在释放时依据入场方向检查有效性（买入/做多：SL 更低且 TP 更高；卖出/做空：SL 更高且 TP 更低）；引擎发出 `create_stop_loss` 或 `create_take_profit`，并将标识分配以及具权威性的子订单交由宿主处理。限价与市价入场单共用此行为，包括已成交的市价入场单。一旦由宿主提供，SL 或 TP 就是普通的保护订单，即使被拖过其入场价，其角色也保持固定；其修改意图保留具权威性的订单类型与止损限价触发价。指针移动只改变本地预览；释放时会应用对现有订单的移动，或发出保护单创建意图，并持有相应的回滚信息，直至宿主答复。已带有一个保护单的持仓或入场单会省略该角色的手柄，而同时带有两个保护单的则两个手柄都不暴露。Escape 会放弃进行中的拖动。拒绝已发出的意图会执行其回滚——重新插入已关闭的订单或持仓，把被修改的订单移回原处，或对尚未实体化的保护单请求不做任何事——而接受则会释放该回滚，宿主的快照仍是最终依据。从入场价到预览的垂直连接线仅在进行中的下单事务期间存在。宿主确认会清除该分组的视觉元素，因此已确认的入场、TP 与 SL 对象绝不会留下持久的连接线界面元素。
+
+交易数量单元格使用宿主的规范文本度量加上有界的水平内边距，因此可见单元格与关闭控件的命中几何会随格式化后的数量而变化，而不会保留固定的空白份额。每个交易控件的文本（TP/SL 按钮、数量、P&L 或订单类型、标注与提示框）都在其框内做视觉居中，而不是停留在 `Prim::Text` 的 em-box 中线上——后者会使大写字母和数字在带内边距的控件中明显偏高。宿主通过 `ChartEngine::set_text_cap_center` 提供一个垂直字形度量：浏览器宿主从数字的 `measureText` 墨迹边界推导该值，GPUI 宿主则安装 `text_cap_centerer`，由字体的大写字母高度推导。标记的每个单元格共用这一偏移，使相邻读数保持同一基线，标记文本锚定在吸附后的药丸形标签自身的中心。没有该度量的宿主保持几何中心。
+
+窗格在浏览器边界处暴露不透明、单调的图表本地标识。存活窗格或价格比例尺句柄在移动或交换之后会解析出其当前索引；移除会使该句柄永久失效，因此之后索引被复用时也不会使其重新指向另一个窗格或比例尺。持久化使用单独的稳定窗格标识，并在恢复时有意签发新的存活 ID。
+
+有序帧契约包含：窗格背景与网格、空闲指标几何、空闲绘图、普通系列几何、活动的系列/绘图/预览、在各自绘制标记处拼接的自定义系列贡献、窗格 chrome、交易区域、交易/警报、十字光标叠加层、坐标轴、标签与文本，以及供保留式后端分组使用的逐系列、逐绘图的分段范围。`series_order`/`drawings` 仍是稳定的已保存顺序；帧在不改写它们的前提下推导出有效绘制顺序，系列/绘图命中测试以稳定顺序打破平局，因此提升不会使悬停来回振荡。后端保持顺序、裁剪、混合与坐标转换。仅当可见输出不变时，后端才可以把相邻的兼容图元合并为一批。
+
+趋势线标签归趋势线功能所有，而不归 `DrawingKind::Text` 所有：引擎拥有它们的文本状态、专用的悬停交互提示、编辑会话标识，以及每个线段布局工具共用的线段局部变换和中段描边镂空（同一命中区域、文本段布局和镂空同时服务于射线、通道及其他文本段标签；只有趋势线具有悬停提示）。新建的趋势线标签默认位于右上槽位；其 3×3 槽位沿实际线段方向及其垂直方向解析。方向被归一化到可读半平面内，包括确定的垂直朝向，因此端点交叉时会保持视觉上的左/右，且绝不会让字形倒置。顶部和底部槽位与描边的间距为 1.2em 行框的半高加文本内边距。指针命中点会被逆变换到已测量的局部文本矩形中。未设置的趋势线标签文本颜色动态跟随绘图描边；显式设置的文本颜色保持独立。空标签以降低后的 alpha 使用同一个已解析的 RGB 显示 `+ Add text`；进入或离开专用的趋势线标签编辑器绝不会转换或删除趋势线。中部标签在线段参数空间中按已测量的前进宽度加内边距切分描边。悬停时预留提示文字的前进宽度；编辑开始时先留出紧凑的一 em 插入符开口，并随用户输入按排版后文本的前进宽度扩展。顶部和底部槽位绝不会切断描边。浏览器使用完全透明、无边框的编辑表面（包括原生插入符与 IME 组合输入的绘制），并在引擎给出的精确文本段起点和角度处放置一个显式着色的插入符，使帧成为字形的唯一拥有者。其选区伪元素同样是透明的，以防止在实时变换期间浏览器的选区/IME 绘制泄漏出主题色的重复字形。独立的 Text 保留其单独的创建/移除生命周期和显式的工具栏文本输入；它是唯一一个在编辑器以空内容关闭时由引擎会话移除的绘图。宿主仅在文本工具的两步点击和趋势线的点击即打开中保留工具类型检查；哪些绘图可编辑、其文本位于何处、哪些工具以编辑器启动，以及空内容生命周期，都由引擎给出答案。文本段标签（文本工具、趋势线标签，以及每个线条、通道、斐波那契、叉形线、形态和形状工具的文本）以单行 content-editable 的形式打开同一个透明表面，其位置由引擎的 `drawing_text_edit_layout` 给出：它的左中点位于文本段的起点，并按布局给出的角度绕该点旋转，使用布局给出的字号、字重、斜体与文字颜色，宿主在每次按键后重新读取该布局，而不是自行测量或对齐文本。绘图族的文本框以原生 `textarea` 打开它，因为其文本可能跨行（Shift+Enter 插入一行；粘贴时插入纯文本），布局取自同一调用：各行在文本框的文本边缘左对齐，插入符按行列定位；文本框可以向上生长（评论），也可以向两个方向生长（居中的标注）。两种模式共用引擎的文本编辑会话，因此一次完整编辑只算一个撤销步骤，按 Escape 会恢复文本且不产生历史记录条目。在已选中的绘图上双击（或在未选中绘图的文本上双击，其第一次点击会选中该绘图），或在图表或其无障碍绘图目标上按 Enter 或 F2（该目标保留 Enter 用于几何编辑），会对引擎报告为 `drawing_text_editable` 的任意绘图打开编辑器，其中包括拒绝整段文本都位于其窗格 plot 区域之外的绘图（这是适用于所有宿主和路径的同一条引擎规则，因此不会有不可见的编辑器捕获按键）。双击在执行前会由引擎输入控制器做所有权检查：当这一对按下中的任何一次被交易对象或警报控件占用时，它会跳过该绘图（这些按下从不进入绘图管线，因此它们留下的选择状态是过期的）。控制器会把这一事实从第一次释放带到第二次按下，因此宿主已经移除的控件（例如已取消订单的线）仍会使这一对点击保持归该控件所有。仅当 `drawing_at`（在该点点击时会选中的绘图：先 `drawing_text_hit_at`，再 `hit_test_drawing`，只读）就是按下开始时已被选中的那个绘图时，它才会执行，并为宿主的 DOM 编辑器上报 `TextEditorOpened`。放置引擎标记为 `requests_text_editor` 的工具时同样会打开编辑器。提交或按 Escape 都会保留此类绘图，即使其文本已被清空；文本工具除外，它在被留空时会被移除（包括对刚放置的绘图按 Escape）。宿主的 `dbl_click` 订阅者在编辑器打开后仍会运行。编辑器是带标签的 `textbox`，通过无障碍 live region 播报打开和关闭，并在按 Enter 或 Escape 后把焦点返回到图表内打开它的那个元素；当它因焦点移到其他元素（宿主面板在其 `dbl_click` 处理函数中调用 `focus()`，或点击宿主控件）而关闭时，它会提交并把焦点留在那里，因为在 blur 处理函数内部把焦点拉回会取消宿主自己的 `focus()` 调用。GPUI 和原生的悬停路径调用 `update_drawing_hover`（或纯函数 `drawing_hover_at`），它先裁决绘图自身的标签并给出文本光标，然后裁决主体或手柄，与浏览器的做法完全一致。在原生宿主上，由引擎输入控制器执行点击一侧：按下时先解析绘图的标签（`drawing_text_hit_at`），通过标签选中未选中的形状，并用 `begin_drawing_text_edit(id, true)` 开始输入，使引擎绘制插入符：文本段标签的插入符是随标签旋转的竖条，绘图族文本框的插入符是位于插入符所在行上的竖条。
+
+跟随线段的文本是一个显式的 `RotatedText` 帧图元，携带最终对齐后的锚点、顺时针角度、字体、字重、斜体、字号、颜色和文本；没有任何执行器会重建趋势线几何，也不会悄悄忽略角度。Canvas2D 在 `fillText` 之前围绕锚点平移并旋转；WebGPU 仅让旋转的文本段经过专用的顶点管线，该管线对缓存字形图集四边形中的预乘覆盖率做旋转和双线性重建，同时保持普通文本的实例/着色器契约；tiny-skia 围绕同一枢轴对局部字形覆盖率光栅进行重采样；GPUI 使用其由图集支撑的变换单色精灵路径。浏览器和 GPUI 的缓存以依赖字形的输入和子像素相位为键，但有意不包含角度，因此端点移动时会复用字形覆盖率。它们的固定容量/LRU 或图集预算限制了保留的条目，字体、DPR、设备或图集代次的失效会丢弃过期资源。浏览器 WebGPU 呈现表面使用预乘 alpha，图表背景清除会对其配置的颜色做预乘，使半透明背景与 Canvas2D 一样与同一宿主表面合成。无法进入 WebGPU 图集的非空文本段（包括超大的文本段或不可用的文本光栅化器）会使该次呈现把完整的有序帧交由已预热的 Canvas2D 窗格处理。失败的 GPU 分组会在下一帧重建，使 WebGPU 能在该文本段被移除后恢复；没有任何执行器会悄悄省略其字形。GPUI 的旋转精灵使用与普通 GPUI 文本相同的已测量中线基线。SVG 光栅化器独立于 GPUI 的文本整形器解析所请求的 CSS 字体族，因此字体族缺失时，即使基线对齐，也可能产生不同的字形形状或前进宽度。
+
+一键括号单放置只通过一条显式的引擎命令跨越绘图/交易边界。宿主传入 Long/Short Position 绘图的标识及其自己的数量；引擎读取该绘图的语义入场价、目标价、止损价、窗格和价格比例尺，把所有价格吸附到品种的 tick，并发出一个原子的 `place_bracket_order` 意图。它不会创建任何推测性的订单或持仓。券商宿主拥有提交、特定交易场所对入场价的解释、生成的订单/括号单/OCO 标识、接受或拒绝，以及使所得线条得以呈现的权威快照。Web 演示中的数量输入与意图处理函数只是示例宿主，并非 Aeris 内部的账户仓位规模或券商策略。
+
+Long/Short Position 的创建、主体移动以及入场/目标/止损手柄拖动，会把价格解析到品种的 `tick_size`，若无则回退到所绑定价格比例尺的显示 `min_move`；带有 `PriceTickLadder` 的比例尺则改用其价位带的 tick，因此阶梯式品种的价位保持在其可下单的网格上，价格 tick 数统计按累计的价位带 tick 计数。引擎先把原始的 `f64` 指针坐标直接转换为价格，再舍入到 tick，因此小于一个设备像素的 tick 仍然可以到达。水平方向的创建以及入场/延伸手柄使用垂直十字光标线共用的时间槽解析器，包括其可见范围和隐藏系列规则。主体移动会把指针起始十字光标槽与当前十字光标槽之间的差值应用到每个锚点，保持宽度和抓取偏移，并在槽位变化之间保持不动。未来的空槽位仍可编辑，除非适用显式的数据时间约束。对仓位手柄的键盘微调落在同一网格上（价位落在其 tick 上，宽度落在整数个柱槽位上），而若某次微调会舍入回起始位置，则按按键所指方向前进一个 tick 或一个槽位。方形仓位控件发出一个不透明、以主题色填充的 `RoundRect`，带圆角和吸附到设备像素的内侧边框；所有执行器都接收同一份填充与边框几何。
+
+仓位统计是引擎拥有的窗格 chrome：目标/止损距离、百分比、价格 tick 数、预计账户 Amount，以及由 Open/Closed P&L、Qty 和风险回报比组成的两行块。经持久化并校验的绘图选项 `position_account_size`（默认 1,000）和 `position_risk_percent`（默认 25）定义一个假设的风险预算。Qty 为该预算除以止损距离和品种点值；数量显示使用品种精度（默认三位小数）。这些估算值不会提交订单，也不会改变以宿主为权威的券商数量。已平仓 P&L 使用与进度叠加层相同的“先触及边界、OHLC 有歧义时止损优先”的区段解析器；未平仓/未成交/未来的绘图使用右边缘处或最近可用的收盘价。零风险或不可用的值显示为长破折号。统计发出不透明、圆角、无边框的容器：对比文本之下的纯色语义填充已经把标签与图表分隔开，因此在任何背景上都不绘制轮廓。文本对比度相对于不透明容器解析。每个执行器都使用这些相同的形状。
+
+测量工具是“投影与标注”绘图族（Projection & Annotations，`kinds/projection_annotations.rs`，wire id 130-132）的目录条目，而不是一个单独的子系统。价格范围、日期范围以及日期与价格范围是双锚点的 `ClickAnchors` 工具，其锚点与 Long/Short Position 一样带有目录的 `grid_snap` 标志：创建、锚点拖动和主体移动（指针与键盘）会把 x 解析到十字光标的时间槽，把价格解析到品种 tick 或价格带阶梯（回退到所绑定比例尺的 `min_move`），因此统计值以整根柱和整数个 tick 读出。磁吸命中一根 K 线时，会选择该柱及其价格；磁吸已开启但没有选中任何对象时（弱磁吸且离每个价格都太远，或指针下没有柱，例如在最后一根柱之外），则把槽位和 tick 交给网格，因此锚点绝不会脱离柱位。较早的拼写 `date_price_range` 在任何解析 kind 名称的地方（持久化导入、模板、剪贴板与同步载荷）都会被读作 `date_and_price_range`，并且绝不会被写出。它们与每个族工具一样，经共享的绘图部件转换为图元：半透明填充、清晰的 `HLine` 价格水平线或 `VLine` 时间边界线、穿过区域中心的清晰一像素箭杆（以绘图自己的端帽收尾，`stroke_end` 默认为箭头），以及位于终点价位之外的、由引擎格式化的不透明无边框统计框（日期工具则位于区域下方）。该框显示绘图的可见 `labels`（价格变化、百分比变化和 tick 数；柱数与时长；或全部五项），其中 tick 数按锚点所吸附的网格计数，经过的时间取自锚点的时间标识（在数据之外用当前通行的柱间隔外推），因此它绝不依赖显示投影。绘图输出的每个价格都经过同一条链（宿主格式化器、tick 网格上的品种精度、所绑定比例尺的系列格式、默认值），舍入为零的变化不带符号输出。已提交的范围在两个方向上都以绘图自己的颜色绘制。选中或放置期间，它们会把端点投影到坐标轴上，在所绑定比例尺上显示为价格标签，在时间轴上显示为绘图颜色的时间标签（数据之外的锚点显示其外推时间，即统计所使用的那个时间）。当带有可见标签的绘图其区域位于屏幕外时，该族的 `decoration_extent` 使其仍保留在视口候选中。
+
+Shift 点击快速测量是由 `DrawingController` 拥有的瞬态状态：一个绑定到被按下窗格的默认价格比例尺的日期与价格范围，经与已提交范围相同的族部件转换为图元（默认标签与端帽），其锚点按同一条 `grid_snap` 规则吸附。由于没有用户样式，其颜色跟随价格走向：上涨时用绘图默认色，下跌时用市场下跌色 token（活动的坐标轴标签随之变化）。存活的测量会在对象命中测试之前消费下一次窗格按下（使跟随中的测量冻结，使已冻结的测量关闭）；否则，在交易、警报、已激活工具、绘图拖动和 Delta Tooltip 的裁决都放弃该次按下之后，引擎输入控制器会由 Shift 按下启动它。终点锚点无论是否按住按钮都跟随指针移动，并被限制在窗格内；超出共享的 5 px 点击容差的释放会冻结按下拖动式测量，而一次点击则使其继续跟随，直到下一次按下。激活工具、按 Escape（`cancel_drawing_tool`）、宿主取消以及持久化恢复都会将其清除。它在末尾的绘图预览块中、于创建预览之后绘制，跟随期间保持十字光标可见并保持其光标，随绘图的逻辑坐标一并重新定基，并且绝不进入绘图列表、历史、同步或持久化。浏览器和 GPUI 适配器把归一化后的输入转发给该控制器，因此所有宿主共用同一个测量状态机。
+
+## 插件与宿主扩展
+
+用户定义的自定义系列与图元仍然是显式的宿主边界。引擎拥有它们的标识、布局参与、命中测试上下文、自动缩放贡献和内置 chrome 集成。宿主可以执行任意用户回调，然后记录引擎在下一规范帧中所需的值。上文的官方插件实现不使用该回调路径。
+
+扩展不得获得不受限制的引擎内部状态，也不得创建第二个场景图。仅为当前有稳定语义需求的使用方添加扩展接口面。
+
+浏览器窗格和系列图元的 `text_views` 转换为各自所属窗格顶层中有序的 `Prim::Text` 命令。共享的窗格裁剪区（scissor）会在坐标轴层之前对它们进行裁剪，Canvas2D、WebGPU、GPUI 和原生执行器都使用相同的字体、颜色、经基线调整的锚点以及绘制顺序。透明的浏览器叠加层仅保留给输入和 DOM 效果使用。
+
+销毁会对每个已注册的扩展清理函数恰好调用一次；某一个 JavaScript 清理钩子失败不会妨碍其余钩子运行。WASM 图表同步释放其保留的资源；浏览器在下一个微任务中释放其 wasm-bindgen 包装器，此时任何设备丢失或帧回调的借用都已解除。
+
+扩展渲染由宿主定时，与图表变更互不重入，并且错误在宿主边界处被隔离。扩展运行时对象和回调绝不会由引擎持久化；宿主拥有它们的配置与恢复。当前的自定义系列和图元 API 是实验性的，而不是第二套插件框架。图元和自定义系列的绘制命令解码为与引擎几何相同的有序 `Prim` 契约，解码器会把插件虚线转换为图元并将其限制在所属窗格范围内，因此 WebGPU 和 Canvas2D 绘制出完全相同的插件虚线，而远远延伸出窗格之外的插件线只消耗其可见部分的开销。在窗格内来回缠绕许多次的虚线折线，每条命令至多 4096 段虚线，超出后改为实线绘制，因此每帧重新运行的插件渲染器不会使单条命令的开销随其路径长度增长。
+
+浏览器包的官方功能模块是位于这些引擎所有者之上的轻量生命周期与平台适配器。它们归一化公共数据/选项，转换指针或键盘事件，解码浏览器图像，并创建可选的 DOM chrome；它们不模拟金融几何。提示框引导线/取值查询、无障碍焦点几何、绘图、带状区域、价格线、叠加层标签、图像放置以及每一种专用系列帧都在 Rust 中构建。引擎及其浏览器/原生宿主不会向图表表面注入产品署名或品牌标识。功能句柄恰好一次地释放其引擎图元，以及任何宿主订阅、定时器或 DOM 节点；这些运行时状态均不会进入引擎持久化。
+
+引擎输入控制器拥有作为按下目标的十字光标操作徽标：悬停其上会解析出指针光标，按下它会阻止其下方的图表平移和选择，在命中区域内未发生移动的释放会发出共享的操作请求。指针取消会丢弃待处理的按下。GPUI 演示在其状态栏中显示该请求的窗格和价格。
+
+可交互的图表对象拥有指针反馈：当任何交易对象或绘图处于悬停、创建或拖动状态时，共享帧会抑制完整的可视十字光标（线条、标记和坐标轴标签）。跟随中的 Shift 点击测量是例外：它通过十字光标读取指针，因此即使在其他对象之上，十字光标也保持可见。引擎保留十字光标位置用于吸附和宿主回调，而每个宿主继续显示该对象的指针、点击、抓取或拖动光标。
+
+## 性能契约
+
+性能来自避免工作：
+
+1. 只重新计算已失效的状态。
+2. 保持热数据为列式，并使传输有界。
+3. 复用 GPU、文本、图像和几何资源。
+4. 合并可替代的帧请求，同时保留最新状态。
+5. 保持渲染和输入队列有界。
+6. 在修改算法或增加缓存之前，先测量 release 构建。
+
+大历史数据的几何与命中测试，其工作量由物理视口密度加层级边界细化所界定，而不是由可见源数据行数界定。该层级是紧凑的规范数据辅助索引，而不是渲染器缓存：GPUI、WebGPU、Canvas2D、原生渲染、保留式重建以及强制的干净重建都使用同一份被选中的几何。原生证据记录所选层级、摘要节点操作数、原始边界行和候选行；浏览器证据记录由此产生的帧 CPU、后端工作量、分配次数和上传字节数，而不通过公共图表 API 暴露细节层级（LOD）控制。
+
+绘图工作在帧发出之前就被独立地限定了上界。至多二十个绘图的图表使用直接的、按稳定 z 序的渲染路径，以避免索引开销。更大的图表只扫描被悬停窗格的紧凑边界条目，在坐标计算之前先用语义域排除，在候选列表中保持窗格的规范稳定 z 序，并且只对指针候选执行精确的逐工具命中测试。保留的逐绘图分段按“空闲在下、活动在上”重新组装，提升时无需重建几何；命中测试保持按稳定顺序，因此提升不会使悬停来回振荡。这个有意保持小巧的局部结构不依赖空间树：其廉价的边界遍历与该窗格所拥有的绘图数成线性关系；文本范围每个语义/字体代次只测量一次；坐标转换、笔刷遍历、图元发出和精确命中测试则随候选数量而变化。因此，病态的完全重叠仍然明确地是候选数线性增长的最坏情况。缓存内存受以下各项限定：存活的绘图条目、保留的路径点容量、窗格成员关系，以及一个可复用的候选临时向量；移除会释放该条目，且不保留任何历史几何。
+
+每个图表的交易状态上限为 4,096 个活动持仓、订单和成交，待处理的意图投递上限为 256 条。预期的终端工作负载（10、50、100 和 500 个交易对象）使用最上层优先的窗格直接扫描来做命中检测，并对每次语义/预览变更执行一次保留式交易重建；未变化的帧复用两个交易层。这是有意避免使用空间树，直到测量结果证明有必要为止。引擎内存遥测包含交易向量、意图队列和保留字符串的容量。
+
+跟踪 CPU 帧时间、可用时的 GPU 时间、draw call、丢弃帧与已呈现帧、内存、环形缓冲区溢出与被丢弃的无效环形缓冲区行、交互延迟以及稳态分配。设备丢失或 WebGPU 不可用时，必须故障转移，且不得丢失无头图表状态。
+
+每个浏览器图表拥有可复用的 WebGPU 顶点缓冲区，供其保留的语义绘制组使用。缓冲区按几何级数增长至高水位容量，仅在对应绘制组的修订号变化时上传，在图表生命周期内绝不收缩，并随图表的 GPU 状态一起释放。公开的最近一帧遥测还报告缓冲区分配次数、缓冲区写入次数、上传字节数以及保留层重建次数，使稳定行为与局部更新行为可以被直接测试。
+
+共享文本图集将一次渲染视为一个事务：当前帧中被引用或插入的槽位，在该帧完成之前不能被回收。帧已接受文本之后出现的图集压力会将重置推迟到下一帧；浏览器通过 Canvas2D 渲染受压的那一帧，而不是提交过期的 UV。一次重置会使图集 epoch 递增，在下一次 WebGPU 提交之前使保留的带纹理绘制组和文本缓存条目失效。完全无法进入图集的可见文本段（大于图集，或无法度量）只标记持有它的那个保留组。只要该组的源修订号不变，后续帧就直接走 Canvas2D，而不进行 WebGPU 网格化；其他所有保留组都保留各自的几何，因此在该文本段变化或消失后的第一个 WebGPU 帧只重建发生变化的部分。
+
+浏览器 WebGPU 共享一个页面级的 adapter/device/queue 和图集，同时保留每个图表各自的 surface。因此，设备丢失是一次共享的代次事件，而不由最先创建该设备的图表所拥有：每个存活图表的监听器都会被唤醒并回退，而已销毁的图表没有监听器。无头图表数据在回退过程中得到保留。
+
+浏览器包默认的 `auto` 后端优先使用 WebGPU，但当浏览器没有暴露可用的 adapter 时仍保持 Canvas2D 可用；仅有 `navigator.gpu` 并不能证明 adapter 可用。失败的 adapter 请求会在该页面会话内被缓存，因此独立挂载的图表和视口重新挂载不会反复探测一个不可用的 adapter。设备初始化失败仍可重试，显式的回退 adapter 诊断与普通 adapter 结果相互隔离，并且在浏览器或驱动设置变更后，重新加载页面允许进行一次新的 adapter 探测。General 仪表盘报告实际使用的后端和回退原因，而不是在 WebGPU 不可用时拒绝图表。
+
+图表构造接受显式指定的首个窗格水平域。引擎创建的要么是兼容的金融窗格加主 K 线系列，要么是一个不含金融系列的、被保留的通用窗格；浏览器宿主不会先添加临时金融窗格、再将其移除。被拒绝的构造会在控制权返回调用方之前，移除该次尝试所安装的画布。引擎始终保留一个布局槽位。显式移除一个为空的、被保留的最后窗格时，会注销其稳定标识与持久化标识，释放其通用域/坐标轴状态，并在同一槽位中安装一个全新的、未保留的金融时间窗格。因此，被移除的句柄会照常失效，声明式清理也不再需要临时保活窗格。
+
+## 证据基准测试子系统
+
+`benchmarks/` 是开发与发布证据基础设施，位于所有生产 crate 和已发布包之外。它唯一的 Node 入口会构建实际的 release 包，通过现有的 Playwright 演示宿主驱动公共浏览器 API，生成确定性的、带版本的 OHLCV 数据，校验带版本的 JSON 结果，与显式基线比较，应用集中管理的预算，并输出供人和网站阅读的产物。该浏览器页面由 `examples/web_demo/test_server.mjs` 提供，仅用于自动化；它不属于 npm 包的一部分。
+
+该子系统复用 `chart_api.frame_stats()` 获取有界的 CPU、经真实能力检测的 WebGPU 时间戳、绘制、呈现、丢帧、环形缓冲区溢出以及 WASM 线性内存观测值。它不会添加生产环境插桩、依赖、导入、功能开关、日志或运行时分支。浏览器页面/堆内存被标注为整页内存，不受支持的呈现或 GPU 测量保持为不支持，而不是被推断。
+
+本地原始结果会被忽略，CI 结果则作为产物保存。公开摘要和已提交的 release 基线要求提供一份干净的、被分类为 `official-benchmark-runner` 的 `release` 配置档结果；共享 CI 的计时仅作为冒烟/趋势证据。场景、数据集生成器、schema 和基线的版本保持历史可比性。
+
+基准测试比较仅强制执行显式配置的预算。空策略会被报告为 `NO ENFORCED BUDGET`，并且配置的键必须与可比较的指标相匹配，使拼写错误无法悄悄禁用硬性阈值。发布要求通过可移植的浏览器运行时/一致性套件，其中包括确定性的 SwiftShader WebGPU/Canvas2D 以及 tiny-skia/Canvas2D 像素比较。参考实现保真度报告、GPU 测量和墙钟证据仍是各自独立的非阻塞结果。
+
+## 正确性与一致性
+
+对于相同的状态、视口和设备缩放比例，图表数学计算必须是确定的。在输入边界校验格式错误的数据。保留空白数据行、时间顺序、逻辑范围、图元顺序和显式的预热间隙。
+
+OHLC 写入会保留结构上有效的数值输入，而不是悄悄改写金融数值。不可能成立的关系出于兼容性被接受，但会与已接受、被丢弃、已去重、已重排、非有限值和超出范围的行一起，计入结构化诊断。无效时间戳会在数值行修复之前拒绝直接事务；被接受的批量保留现有的数值修复语义。干净的写入在浏览器热路径上不返回诊断对象。可预期的边界失败携带稳定的错误类别，而不依赖控制台文本。
+
+通用的 `Workspace` 引擎类型只拥有分割树拓扑、稳定的单元格标识、比例，以及对已恢复布局的有界校验。订阅上限、计费档位否决、累计分割用量、存储、提供方标识和单元格存续时间计量都位于浏览器网格宿主中；共享引擎不含商业策略或账户方面的任何知识。Workspace 分隔条变更会拒绝非有限的增量且不改变布局，分割操作会在变更之前拒绝已耗尽的 `u32` 单元格标识，使浏览器句柄保持可寻址。
+
+对几何、磁吸、比例尺、交互或执行的变更，要求提供单元测试、帧契约测试、黄金图像、绘制流一致性、回放稳定性、浏览器测试和 release 性能证据中范围最窄的相关组合。仅凭特定后端的截图，不能证明共享引擎的正确性。
+
+交互行为通过每条真实的输入路径来验证，而不是通过其下层的机制。控制器的场景模块（`chart_input/{chrome,drawing,lifecycle,motion,trading}_tests.rs`，与其自身的 `tests` 并列）通过 `ChartEngine::input_*` 并配合显式时间戳来驱动每个行为（准备工作以及诸如 `resolve_trading_intent` 之类的宿主答复使用公共 API），因此动能滑行和交易提示框停留在没有时钟的情况下也是确定的。GPUI 适配器的测试（`aeris_charts_render_gpui/src/input/tests.rs`）把 GPUI 事件值送入 `GpuiChartInput`，并在孪生引擎上将其滚轮归一化与浏览器的滚轮归一化进行比较。`gpui_probe` 示例的 `window_input_tests` 在 GPUI 的无头 `TestPlatform`（仅用于开发的 `gpui` 依赖的 `test-support` 特性）上打开真实的探针宿主，并把模拟的鼠标、滚轮和按键事件依次派发经过其监听器表、适配器、引擎、prepaint 和 paint；它们在全部三种操作系统上的原生 GPUI 作业中运行。浏览器交互由 Playwright spec 覆盖，这些 spec 针对已发布的包构建，驱动真实的 `page.mouse`/`page.keyboard` 输入和 CDP 触摸（`gesture-cancellation`、`interaction-gates`、`touch-input` 以及各功能专属的 spec）。
+
+## 依赖方向
+
+下层绝不导入宿主 API 来绕过其边界。无头路径是 `aeris_charts_core` 和 `aeris_charts_indicators` 进入 `aeris_charts_engine`，再到 `aeris_charts_render`；GPUI、WebGPU、原生以及 WASM/浏览器代码位于执行边界。避免新增 crate、trait 和功能开关，除非它们强制维护某条当前真实存在的依赖边界或平台边界。
+
+## 仓库文档
+
+只要具有长期的仓库用途，Markdown 文档可以放在根目录，或放在其所说明的组件旁边。让根目录 README 聚焦于产品导览和贡献者环境搭建，并将架构所有权与数据流保留在本文件中。不得提交临时工作笔记、生成的报告或重复的文档。文档统一使用简体中文撰写；代码标识符、路径、命令、代码块和专有名词保持原文。
+
+## 验证
+
+标准门禁与 CI 一致（`.github/workflows/ci.yml`，顺序相同）。Bun 1.4.2 安装 npm 依赖（`packages/charts` 和 `examples/web_demo` 中的 `bun.lock`），并运行包脚本和 Playwright；仍安装 Node 24，因为 Playwright 和仓库的 `node` 脚本运行在它之上。npm 仅用于其定义了已发布产物的场合：用于体积预算和打包冒烟测试的 `npm pack`，以及 `publish.yml` 中的 `npm publish`。
 
 ```text
 node packages/charts/scripts/namespace_guard.mjs
@@ -1944,95 +464,33 @@ bun run check:release-gates
 bun run test:pack
 ```
 
-An intentional public-API change regenerates the snapshot with `bun run update:api` (a write
-step, not a gate) before `check:api`. CI also requires the portable browser suite
-(`AERIS_CHARTS_PORTABLE_BROWSER=1 bunx playwright test` in `examples/web_demo` after
-`bun install --frozen-lockfile && bun run build` there) and the native GPUI tests
-(`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`), with
-the GPUI backend and its tests linted on Linux
-(`cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings`).
+有意为之的公共 API 变更，会先用 `bun run update:api` 重新生成快照（这是写入步骤，不是门禁），再运行 `check:api`。CI 还要求通过可移植浏览器套件（在 `examples/web_demo` 中，先在该目录执行 `bun install --frozen-lockfile && bun run build`，再执行 `AERIS_CHARTS_PORTABLE_BROWSER=1 bunx playwright test`）和原生 GPUI 测试（`cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked`），并在 Linux 上对 GPUI 后端及其测试做 lint（`cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings`）。
 
-Local browser runs need the browser build Playwright pins (Chrome for Testing 153 for the pinned
-Playwright 1.63). How Chromium is hosted matters as much as its version for the WebGPU specs. With the
-repository's launch flags (the SwiftShader WebGPU adapter) on a Linux box without a GPU, measured with
-Chromium 141.0.7390.37: headless Chromium obtains an adapter and a device but cannot present WebGPU
-frames (`chrome://gpu` reports `gpu_compositing` as `disabled_software` and `webgpu` as
-`unavailable_software`, the device is lost on the first presented frame, and the demo logs `WebGPU
-fallback ... reason=device_lost` and runs on Canvas2D), so every WebGPU-versus-Canvas2D spec fails at its
-backend assertion before a pixel is compared. Headed Chromium under a virtual display presents correctly
-(`gpu_compositing` and `webgpu` enabled, through ANGLE over the system Mesa llvmpipe GL), and the demo
-reports backend `webgpu` with a full chart. With some other flag sets a headless run reports backend
-`webgpu` over a blank canvas, so a WebGPU check must also look at pixels, not only at the reported
-backend. The pixel-parity specs therefore run headed under a virtual display (`xvfb-run`).
-In that setup `prim-text`, `drawings`, `primitives`, `series-primitives`,
-`custom-series`, `builtin-plugins` and `canvas-primitives` pass with the default font stack, a bundled
-Roboto, and unhinted rendering alike, and the seven drawing-family parity specs pass with the default
-stack, so the demo fixtures do not pin a font.
+本地浏览器运行需要 Playwright 固定的浏览器构建（对于固定的 Playwright 1.63，为 Chrome for Testing 153）。对于 WebGPU spec，Chromium 的托管方式与其版本同样重要。在使用仓库启动参数（SwiftShader WebGPU adapter）、无 GPU 的 Linux 机器上，以 Chromium 141.0.7390.37 测得：无头 Chromium 能获得 adapter 和 device，但无法呈现 WebGPU 帧（`chrome://gpu` 将 `gpu_compositing` 报告为 `disabled_software`，将 `webgpu` 报告为 `unavailable_software`，device 在第一个呈现的帧上丢失，演示页记录 `WebGPU fallback ... reason=device_lost` 并在 Canvas2D 上运行），因此每个 WebGPU 对 Canvas2D 的 spec 都在比较像素之前，就在后端断言处失败。在虚拟显示器下使用有头 Chromium 可以正确呈现（`gpu_compositing` 和 `webgpu` 均已启用，通过系统 Mesa llvmpipe GL 之上的 ANGLE），并且演示页报告后端为 `webgpu`，图表完整。在另外一些参数组合下，无头运行会报告后端为 `webgpu`，但画布是空白的，因此 WebGPU 检查还必须查看像素，而不能只看所报告的后端。因此，像素一致性 spec 在虚拟显示器下以有头模式运行（`xvfb-run`）。在该环境下，`prim-text`、`drawings`、`primitives`、`series-primitives`、`custom-series`、`builtin-plugins` 和 `canvas-primitives` 在默认字体栈、随附的 Roboto 和未启用 hinting 的渲染下均能通过，七个绘图族一致性 spec 在默认字体栈下通过，因此演示夹具不固定字体。
 
-To run the repository's WebGPU specs on a Linux box without a GPU, host Chromium headed on a virtual
-display, from `examples/web_demo`, with the browser build Playwright pins installed:
+要在没有 GPU 的 Linux 机器上运行仓库的 WebGPU spec，在已安装 Playwright 固定的浏览器构建的情况下，从 `examples/web_demo` 在虚拟显示器上以有头模式托管 Chromium：
 
 ```text
 xvfb-run -a -s "-screen 0 1920x1080x24" bunx playwright test --headed <specs>
 ```
 
-Measured this way, the WebGPU-versus-Canvas2D pixel-identical specs of lines
-(`drawings-lines.spec.mjs`), projection (`drawings-projection-annotations.spec.mjs`) and channels
-(`drawings-channels.spec.mjs`), and the WebGPU test of `indicators.spec.mjs`, pass. Two groups of
-`backend-parity.spec.mjs` tests are environment-sensitive on such a box: the three `reference ...`
-tests exceed their time-axis ceilings headed, because those ceilings were calibrated on Windows and the
-box has only DejaVu fonts, and the two `measure areas are pixel-identical` tests are flaky (they passed
-in some runs and failed in others). (The measurements used Chromium 141 because it was the build
-installed there, through a local Playwright config that set `executablePath` and otherwise reused
-`playwright.config.mjs`.)
+以这种方式测得，线条（`drawings-lines.spec.mjs`）、投影（`drawings-projection-annotations.spec.mjs`）和通道（`drawings-channels.spec.mjs`）的 WebGPU 对 Canvas2D 像素完全一致的 spec，以及 `indicators.spec.mjs` 的 WebGPU 测试均通过。`backend-parity.spec.mjs` 中有两组测试在这类机器上对环境敏感：三个 `reference ...` 测试在有头模式下超出其时间轴上限，因为这些上限是在 Windows 上校准的，而该机器只有 DejaVu 字体；两个 `measure areas are pixel-identical` 测试不稳定（有的运行通过，有的运行失败）。（这些测量使用 Chromium 141，因为那是该机器上已安装的构建，通过一份设置了 `executablePath`、其余部分复用 `playwright.config.mjs` 的本地 Playwright 配置来运行。）
 
-The one pixel spec that failed on Linux, `last-value-cluster` ("crosshair price and time glyphs stay
-centered"), failed because of its probe, not the label placement. The shared axis builder positions
-the crosshair time text by the host's ink metric of the stable `Apr0` sample (cap top to descender
-bottom), never by the label's own glyphs; the engine test
-`crosshair_time_text_is_placed_by_the_stable_sample_not_its_own_ink` pins that contract, so the text
-sits at the same strip offset for every month name and font. Painted `Apr0` ink lands within 0.65 px
-of the strip's text center on DejaVu Serif, Liberation Sans, Liberation Serif and FreeSans at DPR 1,
-1.25 and 2, on WebGPU and Canvas2D alike. The earlier probe measured the calendar label's ink at pure
-white, so its result depended on the month name (only some names carry a descender) and on whether
-thin descender strokes reach pure white on the host's rasterizer: it read 0 to 1 px for each of six
-month names on Linux against the required 1.5-4 px, and no font or hinting choice changed that. The spec now
-draws `Apr0` through `localization.time_formatter`, measures ink at half coverage on both backends,
-requires it within one device pixel of the strip's text center, and still checks that the calendar
-label keeps its tick space and padding. The one-device-pixel tolerance covers raster rounding of the
-half-coverage ink box, not a font calibration: the host's correction is the sample's own measured
-ink (`logical_midpoint_correction`, `(ascent - descent) / (2 * dpr)` against a `middle` baseline), so
-the sample's ink is centered on the strip's text center by construction for whichever font the host
-resolves.
+在 Linux 上失败的那个像素 spec，`last-value-cluster`（“crosshair price and time glyphs stay centered”），失败的原因在于它的探针，而不是标签位置。共享的坐标轴构建器依据宿主对稳定样本 `Apr0` 的墨迹度量（从大写字母顶部到下伸部底部）来定位十字光标时间文本，绝不依据标签自身的字形；引擎测试 `crosshair_time_text_is_placed_by_the_stable_sample_not_its_own_ink` 固定了这一契约，因此对每个月份名称和每种字体，文本都位于条带内相同的偏移处。在 DPR 为 1、1.25 和 2 时，对 DejaVu Serif、Liberation Sans、Liberation Serif 和 FreeSans，绘制出的 `Apr0` 墨迹落在条带文本中心的 0.65 px 之内，WebGPU 与 Canvas2D 均如此。先前的探针以纯白来度量日历标签的墨迹，因此其结果取决于月份名称（只有部分名称带有下伸部），也取决于细的下伸部笔画在宿主的光栅化器上能否达到纯白：在 Linux 上，六个月份名称的读数各为 0 到 1 px，而要求为 1.5-4 px，且无论怎样选择字体或 hinting 都无法改变这一点。该 spec 现在通过 `localization.time_formatter` 绘制 `Apr0`，在两个后端上以半覆盖度度量墨迹，要求其落在条带文本中心的一个设备像素之内，并且仍然检查日历标签保留其刻度空间和内边距。一个设备像素的容差涵盖的是半覆盖度墨迹框的光栅取整，而不是字体校准：宿主的修正量就是样本自身测得的墨迹（`logical_midpoint_correction`，相对于 `middle` 基线的 `(ascent - descent) / (2 * dpr)`），因此无论宿主解析出哪种字体，样本的墨迹按构造都居中于条带文本中心。
 
-CI, the tag-publish workflow and the benchmark workflows install `wasm-pack` 0.15.0 with
-`cargo install wasm-pack --locked --version 0.15.0`: its bundled `wasm-opt` shapes the shipped WASM
-bytes and therefore the package size budgets. `bun run check:release-gates` fails when any of those workflows installs it
-unpinned or at another version.
+CI、标签发布工作流和基准测试工作流使用 `cargo install wasm-pack --locked --version 0.15.0` 安装 `wasm-pack` 0.15.0：其捆绑的 `wasm-opt` 决定了发布的 WASM 字节，进而决定包体积预算。当其中任何一个工作流未固定版本或使用其他版本安装它时，`bun run check:release-gates` 会失败。
 
-The Rust toolchain is an exact release as well: `rust-toolchain.toml` names it (1.99.0) and every
-workflow installs that release through its `toolchain:` input, so a new stable Rust cannot change
-what CI compiles or lints with (a floating `stable` once added a Clippy lint to an unchanged tree).
-`bun run check:release-gates` fails when a workflow and the file disagree. Moving the pin is a
-deliberate commit that moves both and re-runs the size and performance budgets.
+Rust 工具链同样是确切的发布版本：`rust-toolchain.toml` 指定了它（1.99.0），每个工作流都通过其 `toolchain:` 输入安装该版本，因此新的 stable Rust 无法改变 CI 编译或 lint 所用的内容（浮动的 `stable` 曾在一棵未改动的代码树上新增了一条 Clippy lint）。当某个工作流与该文件不一致时，`bun run check:release-gates` 会失败。更换该固定版本是一次有意为之的提交，它同时更改两处，并重新运行体积和性能预算。
 
-`perf_gate` prints PASS/FAIL per target and exits non-zero on a failure only when
-`AERIS_CHARTS_PERF_STRICT=1` (exactly `1`, the parse the browser perf specs use; unset or `0`
-stays report-only), so the local gate line above keeps the variable to mirror CI. The per-frame
-targets are single-window means after one warm-up frame, so run the gate on an otherwise idle
-machine: a concurrent build or browser run can fail a budget that an idle run passes.
+`perf_gate` 会针对每个目标输出 PASS/FAIL，并且仅当 `AERIS_CHARTS_PERF_STRICT=1` 时（必须恰为 `1`，这与浏览器性能 spec 采用的解析方式相同；未设置或为 `0` 时仍仅作报告）才会在失败时以非零状态退出，因此上方的本地门禁命令行保留该变量以与 CI 保持一致。逐帧目标是在一个预热帧之后取单窗口均值，因此应在其他方面空闲的机器上运行该门禁：并发的构建或浏览器运行可能使一个在空闲运行下能通过的预算失败。
 
-Known exception to the non-blocking wall-clock policy below: two `ring-source.spec.mjs` assertions
-measure wall-clock behaviour (the achieved producer rates and the 8 ms median frame cost of "frame
-cost includes a sustained 50,000 rows/s drain") and run in the required portable suite. The
-deterministic ring contracts (zero per-tick engine calls, drain per frame, overrun reporting) are
-blocking either way.
+对下文非阻塞墙钟策略的已知例外：两个 `ring-source.spec.mjs` 断言度量墙钟行为（达到的生产者速率，以及“frame cost includes a sustained 50,000 rows/s drain”所测的 8 ms 帧成本中位数），并在必需的可移植套件中运行。确定性的环形缓冲区契约（每个 Tick 零次引擎调用、每帧排空、溢出报告）无论如何都是阻塞的。
 
-The release performance gate also measures a 100,000-visible-bar volume-profile refresh through frame construction and verifies that unchanged frames retain the calculation revision. Its Target M binds every built-in indicator kind plus aggregate-input studies to one 1,000,000-row candle source and its volume series and times current-bar replacements and candle-then-volume appends through the public engine path against a 1 ms per-tick budget, and reports the capacity the first append after that install grows across the engine's data and indicator columns, which the study output columns dominate. The same studies over a pre-installed session (whitespace slots after the source) report the capacity the first slot fill grows and require it to be zero, because that fill extends only columns the install already sized. A composite-input check of Target M builds four studies once on `close` and once on the four aggregate inputs and compares their indicator runtime memory, so the difference is exactly the aggregate price columns: they must be resident after install, stay within one eighth of the rows plus a fixed floor of spare capacity after install and after further appends, and not grow on the first append. Target M also binds all 27 KLineChart templates with their default parameters (the volume-reading ones to the volume series, AVP to a turnover series) to the same 1,000,000-row source in a block of their own, so their bindings do not spend the headroom of the built-in ones: current-bar replacements and candle-then-volume-then-turnover appends are timed through the public engine path against the same 1 ms per-tick budget, once on the plain source and once over the pre-installed session; the rows a tick evaluates across all bindings must stay within four per binding (a window, not the history), the indicator runtime bytes within 8 MiB, and a correction of the bar 500 rows back on every series within 5 ms. A report-only line repeats the ticks with one whitespace row in the history, where every tick also re-reads the rows its window spans. Its Target N times the same live ticks, each followed by one frame, with five regression trends anchored across a 1,000,000-row source against the same budget. Its report-only Target O builds 2,520 and 25,200 daily candles (the latter at a 0.01 minimum bar spacing, so conflation caps the rows) with session VWAP, its bands, and standard pivots (11 study outputs, every bar its own period), each beside the same chart without studies, and reports prim and pool counts, a full series rebuild and a crosshair-only frame, the Canvas2D call and stroke counts with their execution time against a counting canvas and the tiny-skia rasterizer, `prims_to_group`, and one `hit_test_series`, so the study-attributable cost is the difference. The structural guarantees (one batch per output, order, pool windows, bounds) are asserted by the engine tests, not by this report.
+release 性能门禁还会度量一次经由帧构建的、含 100,000 根可见柱的成交量分布刷新，并验证未变化的帧保留计算修订号。其 Target M 将每一种内置指标种类以及聚合输入研究，绑定到一个 1,000,000 行的 K 线数据源及其成交量系列上，并通过公共引擎路径，对照每个 Tick 1 ms 的预算，对当前柱替换以及先追加 K 线、再追加成交量的追加进行计时，并报告在该次安装之后的首次追加在引擎的数据列和指标列上增长的容量，其中研究输出列占主导。对一个预先安装的交易时段（数据源之后留有空白数据槽位）运行的同样那些研究，报告首次槽位填充所增长的容量，并要求其为零，因为该填充只扩展安装时已经定好大小的那些列。Target M 的复合输入检查会构建四个研究，一次基于 `close`，一次基于四个聚合输入，并比较它们的指标运行时内存，因此差值恰好就是聚合价格列：这些列必须在安装后常驻，在安装后以及后续追加之后，其备用容量保持在行数的八分之一加一个固定下限之内，并且在首次追加时不增长。Target M 还会在一个独立的块中，使用默认参数把全部 27 个 KLineChart 模板绑定到同一个 1,000,000 行的数据源上（读取成交量的模板绑定到成交量系列，AVP 绑定到成交额系列），使它们的绑定不占用内置指标的余量：当前柱替换以及先追加 K 线、再追加成交量、再追加成交额的追加，通过公共引擎路径对照同样的每个 Tick 1 ms 预算计时，分别在普通数据源上和预先安装的交易时段上各计时一次；一个 Tick 在所有绑定上所评估的行数必须保持在每个绑定至多四行以内（是一个窗口，而不是整个历史），指标运行时字节数在 8 MiB 以内，并且对每个系列修正 500 行之前的那根柱须在 5 ms 以内。一条仅作报告的输出行会在历史中含一个空白数据行的情况下重复这些 Tick，此时每个 Tick 还会重新读取其窗口所跨越的行。其 Target N 对同样的实时 Tick 计时，每个 Tick 之后跟随一帧，并带有跨越 1,000,000 行数据源而锚定的五条回归趋势，对照同样的预算。其仅作报告的 Target O 构建 2,520 根和 25,200 根日 K 线（后者采用 0.01 的最小柱间距，因此合并会限制行数），配以交易时段 VWAP、其带线以及标准枢轴点（11 个研究输出，每根柱自成一个周期），每种都与不含研究的同一图表并排对照，并报告图元和池的数量、一次完整的系列重建和一次仅十字光标的帧、针对计数画布和 tiny-skia 光栅化器的 Canvas2D 调用次数与描边次数及其执行时间、`prims_to_group` 以及一次 `hit_test_series`，因此可归因于研究的开销就是两者之差。结构性保证（每个输出一个批量、顺序、池窗口、边界）由引擎测试断言，而不是由本报告断言。
 
-Run Playwright for browser behavior, rendering, interaction, packaging, or parity changes. Run GPUI parity and replay checks for GPUI executor changes. The `pixel_parity` harness writes `results.json` and the images first and then exits non-zero when a gate fails, a capture does not come back at the fixture size, `results.json` cannot be written, or the run exceeds its wall-clock deadline (`DEADLINE` in the example, 120 s against the 13.7 to 13.9 s a normal Linux run takes; without an X display GPUI paints once and never again, so the deadline is what ends that run). A fixture's images are deleted before its capture and a row whose capture failed carries no GPUI or diff hash, so `results.json` never holds an earlier run's evidence. On Windows (the `native-gpui` CI job runs it there as a blocking step, with the capture taken from the DWM window) its gates are the official-window limits: filled integer rectangles and the colored-image fixtures match native rendering exactly, the crosshair icon image and the scaled colored image differ by at most one channel value of blending rounding, and no channel within 7 CSS px of a translucent stroke join differs from the reference by more than 32 (a neighbourhood maximum, not a share of pixels, so `check_joins` holds it); the other fixtures are reported. Changes to the icon source or masks also run `node examples/web_demo/build_crosshair_icon.mjs --check`.
+对于浏览器行为、渲染、交互、打包或一致性方面的变更，运行 Playwright。对于 GPUI 执行器变更，运行 GPUI 一致性与回放检查。`pixel_parity` 测试框架会先写入 `results.json` 和图像，然后在以下情形退出且状态非零：某个门禁失败、某次捕获返回的尺寸与夹具尺寸不符、`results.json` 无法写入，或运行超过其墙钟截止时间（示例中的 `DEADLINE`，为 120 s，而正常的 Linux 运行耗时 13.7 到 13.9 s；没有 X 显示时 GPUI 只绘制一次，此后不再绘制，因此是该截止时间终止那次运行）。某个夹具的图像在其捕获之前被删除，捕获失败的行不携带 GPUI 或差异哈希，因此 `results.json` 绝不会保留更早一次运行的证据。在 Windows 上（`native-gpui` CI 作业在该平台上将其作为阻塞步骤运行，捕获取自 DWM 窗口），其门禁是官方窗口限值：填充的整数矩形和彩色图像夹具与原生渲染完全一致，十字光标图标图像和缩放后的彩色图像至多相差一个通道值的混合舍入，并且在半透明描边连接处 7 CSS px 范围内，没有任何通道与参考结果相差超过 32（这是邻域最大值，而不是像素占比，因此由 `check_joins` 来约束）；其他夹具仅作报告。对图标源或掩码的变更还要运行 `node examples/web_demo/build_crosshair_icon.mjs --check`。
 
-The headless Linux run is one command from the repository root. It needs `xvfb` and `mesa-vulkan-drivers`, and the virtual screen must be larger than the harness window because the X server clamps a window to its screen:
+在仓库根目录下，无头 Linux 运行只需一条命令。它需要 `xvfb` 和 `mesa-vulkan-drivers`，并且虚拟屏幕必须大于测试框架的窗口，因为 X 服务器会把窗口限制在其屏幕范围内：
 
 ```text
 env -u WAYLAND_DISPLAY GPUI_X11_SCALE_FACTOR=1 \
@@ -2041,13 +499,13 @@ env -u WAYLAND_DISPLAY GPUI_X11_SCALE_FACTOR=1 \
   cargo run -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity
 ```
 
-The Linux gates (`GATES` and `ALIGNED` in `examples/pixel_parity.rs`, whose doc comments hold every per-fixture measurement and limit) are calibrated for Mesa lavapipe 25.2.8 with LLVM 20.1.2 in the dev profile, where three consecutive runs at each of the scale factors 1.0 and 1.5 gave identical counts and identical GPUI image hashes (a run at 1.0 with `LP_NUM_THREADS=1` matched as well). Each gate bounds the share of a fixture's pixels that differ from the native reference by more than a channel delta: exact where the cause allows it, otherwise the scale-1.0 measurement plus 25% headroom for a different Mesa or LLVM build, not a noise allowance, because there was no run-to-run noise to allow. A pixel share is a weak test of position, so the antialiased fixtures must also be aligned: GPUI's image must be closer to the reference at no shift than to the reference shifted by one pixel in x or in y, in either direction. Deliberately injected regressions fail the gates: shifting the whole GPUI layer by one pixel fails the crisp, icon, translucent, join and image gates, and a one-pixel shift in any direction fails the alignment check of every antialiased fixture; it no longer fails the gradients gate, whose residual is dominated by the area fill's edge fringe. Those filled-edge gates (gradients, `opaque_aa`, `tessellated`) were re-measured after the coverage fringe merged from upstream: the fringe is built for a 1x path pass, lavapipe resolves 4x MSAA, and a boundary pixel receives both, so filled edges come out about half a pixel heavier than the reference and the three limits are several times looser than before, with a smaller alignment margin (the `GATES` and `ALIGNED` doc comments hold the numbers). A surface with MSAA therefore paints filled edges heavier than the native reference by that margin. The harness paints each fixture's declared background under its primitives, because the fixtures added from upstream paint none and a Linux X11 window captures unpainted pixels as transparent black. The text fixture is reported but its residual is not bounded, because GPUI and the native reference draw different font faces (fontconfig versus `fontdb` resolution of "sans-serif"), so it measures the host's fonts.
+Linux 门禁（`examples/pixel_parity.rs` 中的 `GATES` 与 `ALIGNED`，其文档注释记录了每个夹具的全部测量值与限值）是针对 dev profile 下的 Mesa lavapipe 25.2.8（LLVM 20.1.2）校准的：在缩放系数 1.0 与 1.5 下各连续运行三次，所得计数与 GPUI 图像哈希均完全相同（在 1.0 下以 `LP_NUM_THREADS=1` 运行一次，结果同样一致）。每个门禁限定一个夹具中与原生参考相差超过某一通道差值的像素所占的比例：在成因允许时要求精确一致，否则取缩放系数 1.0 的测量值再加 25% 的余量，以适应不同的 Mesa 或 LLVM 构建，这不是噪声容限，因为不存在需要容纳的运行间噪声。像素占比对位置而言是较弱的检验，因此抗锯齿夹具还必须满足对齐要求：GPUI 的图像与未平移的参考之间的距离，必须小于它与沿 x 或 y 方向（任一方向）平移一个像素的参考之间的距离。故意注入的回归会使门禁失败：将整个 GPUI 层平移一个像素，会使 crisp、icon、translucent、join 与 image 门禁失败，沿任一方向平移一个像素，会使每个抗锯齿夹具的对齐检查失败；但它不再使 gradients 门禁失败，该门禁的残差主要来自面积填充的边缘毛边。这些填充边缘门禁（gradients、`opaque_aa`、`tessellated`）在覆盖毛边从上游合并之后重新做了测量：该毛边是为 1x 路径 pass 构建的，而 lavapipe 会解析 4x MSAA，边界像素会同时受到两者的作用，因此填充边缘比参考重约半个像素，三个限值比之前宽松数倍，对齐余量也更小（具体数值见 `GATES` 与 `ALIGNED` 的文档注释）。因此，带 MSAA 的 surface 绘制出的填充边缘会比原生参考重出该幅度。测试框架会在每个夹具的图元之下绘制该夹具声明的背景，因为从上游加入的夹具没有绘制背景，而 Linux X11 窗口会把未绘制的像素捕获为透明黑色。text 夹具会被报告，但其残差不设上限，因为 GPUI 与原生参考绘制的是不同的字体（fontconfig 与 `fontdb` 对“sans-serif”的解析结果不同），所以它度量的是宿主的字体。
 
-A pass proves that the Prim stream's coordinates, colours, paint order and blend arithmetic reach a real GPUI window unchanged, and that antialiased edges stay within the measured envelope. It does not prove clipping: the harness paints each fixture through `GpuiChartRenderer::paint_prims`, a bare Prim layer with no frame and no clip, so only the frame-level pane matrix below (`gpui_pane_capture`, which paints through `paint_frame`) compares clipping. It does not prove hardware behaviour either: lavapipe's rasterization rules, its resolve of GPUI's path-pass MSAA (the largest of 4, 2 or 1 samples the surface format supports), gamma, the LCD subpixel text GPUI draws on this stack, and glyph rasterization can all differ from DWM/WARP and from real GPUs. CI runs the harness as the non-blocking `gpui-pixel-parity` job on `ubuntu-latest` and uploads `results.json` and the PNGs. The job is non-blocking through `continue-on-error` on the job and on the harness step, and the step has a 10-minute timeout, so a gate failure, a hang, a job timeout or an apt flake cannot turn the `ci.yml` run red (the tag-publish workflow requires a green `ci.yml` run for a release commit). It becomes a required check when five consecutive runner runs pass every gate with identical `gpui_adapter` and `*_rgba_sha256` values for the same commit, and the runner's Mesa build either matches the calibration build or the limits are re-derived from the runner's own measurements and the Mesa version is pinned or its drift watched. Promotion removes both `continue-on-error` flags and adds the job to the tag-publish requirements.
+一次通过证明：Prim 流的坐标、颜色、绘制顺序与混合运算原样到达了真实的 GPUI 窗口，并且抗锯齿边缘保持在已测得的范围之内。它不证明裁剪：测试框架通过 `GpuiChartRenderer::paint_prims` 绘制每个夹具，这是一个没有帧、也没有裁剪的裸 Prim 层，因此只有下文帧级的窗格矩阵（`gpui_pane_capture`，它通过 `paint_frame` 绘制）才会比较裁剪。它同样不证明硬件行为：lavapipe 的光栅化规则、它对 GPUI 路径 pass MSAA 的解析（取 surface 格式所支持的 4、2 或 1 个采样中的最大值）、gamma、GPUI 在此技术栈上绘制的 LCD 子像素文本，以及字形光栅化，都可能与 DWM/WARP 及真实 GPU 不同。CI 在 `ubuntu-latest` 上以非阻塞的 `gpui-pixel-parity` 作业运行该测试框架，并上传 `results.json` 与 PNG 文件。该作业的非阻塞性来自作业与测试框架步骤上的 `continue-on-error`，并且该步骤设有 10 分钟超时，因此门禁失败、挂起、作业超时或 apt 偶发失败都不会让 `ci.yml` 的运行变红（标签发布工作流要求发布提交对应的 `ci.yml` 运行为绿色）。当同一提交上连续五次 runner 运行都通过每一道门禁、且 `gpui_adapter` 与 `*_rgba_sha256` 的值保持一致，并且 runner 的 Mesa 构建要么与校准构建一致、要么限值已根据 runner 自身的测量重新推导且 Mesa 版本已被固定或其漂移受到监控时，它才会成为必需检查。升级为必需检查后，会移除两处 `continue-on-error` 标志，并把该作业加入标签发布的要求。
 
-The GPUI-versus-WebGPU matrix (`examples/web_demo/tests/gpui-webgpu-matrix.spec.mjs`, opt-in with `AERIS_CHARTS_RUN_GPUI_WEBGPU_MATRIX=1`, normally through `bun run test:gpui-webgpu`) also runs on Linux for its four light base cases, headed under `xvfb-run -a -s "-screen 0 2560x1600x24"` with the same `VK_ICD_FILENAMES` as above: `gpui_pane_capture` reads GPUI's X11 window (the spec sets `GPUI_X11_SCALE_FACTOR` to the fixture's pixel ratio, 1.5, and the virtual screen must exceed the 1851x1047 pane) and Playwright screenshots the presented WebGPU frame. Measured with Chromium 141.0.7390.37 (not the pinned build) on its SwiftShader WebGPU adapter against lavapipe, with the dev-profile `gpui_pane_capture` standing in for the spec's `cargo run --release`, three consecutive runs gave byte-exact output (0 differing pixels) for all four cases with stable hashes on both sides. The approved WebGPU hashes are Windows hashes and none of the seven matched on Linux, so Linux records its WebGPU hash in the report and asserts it only on Windows. The dark case cannot be exact until the demo's dark fixture (#131722) is aligned with the canonical dark surface (#1f1f1f), and the marker and trading cases (1,653 and 5,227 differing pixels, maximum channel delta 247) are bounded by Windows limits that depend on the host's fonts, so Linux does not run them. CI's browser job stays on Windows; the Linux matrix is local evidence.
+GPUI 与 WebGPU 对比矩阵（`examples/web_demo/tests/gpui-webgpu-matrix.spec.mjs`，通过 `AERIS_CHARTS_RUN_GPUI_WEBGPU_MATRIX=1` 选择启用，通常经由 `bun run test:gpui-webgpu` 运行）在 Linux 上也会运行其四个浅色基础用例，以有头模式在 `xvfb-run -a -s "-screen 0 2560x1600x24"` 下运行，并使用与上文相同的 `VK_ICD_FILENAMES`：`gpui_pane_capture` 读取 GPUI 的 X11 窗口（该 spec 会把 `GPUI_X11_SCALE_FACTOR` 设为夹具的像素比 1.5，且虚拟屏幕必须大于 1851x1047 的窗格），Playwright 则对已呈现的 WebGPU 帧截图。测量使用 Chromium 141.0.7390.37（并非固定版本的构建）及其 SwiftShader WebGPU 适配器，对照 lavapipe，并以 dev profile 的 `gpui_pane_capture` 代替该 spec 中的 `cargo run --release`；连续三次运行对全部四个用例都给出了逐字节一致的输出（0 个像素不同），且两侧的哈希都保持稳定。已批准的 WebGPU 哈希是 Windows 哈希，七个哈希在 Linux 上均未匹配，因此 Linux 在报告中记录其 WebGPU 哈希，仅在 Windows 上对其做断言。在演示的深色夹具（#131722）与规范的深色表面（#1f1f1f）对齐之前，dark 用例无法做到精确一致；marker 与 trading 用例（分别有 1,653 与 5,227 个像素不同，最大通道差值 247）受取决于宿主字体的 Windows 限值约束，因此 Linux 不运行它们。CI 的浏览器作业仍在 Windows 上运行；Linux 矩阵是本地证据。
 
-The evidence harness has one entry point:
+证据测试框架只有一个入口：
 
 ```text
 node benchmarks/benchmark.mjs test
@@ -2055,45 +513,8 @@ node benchmarks/benchmark.mjs smoke
 node benchmarks/benchmark.mjs release
 ```
 
-Tag publication requires the Rust, package, and portable Chromium/Firefox/WebKit jobs. Public
-declaration and release-policy guards, V1 fixtures, Node import, and pack smoke are portable blocking
-checks. Deterministic browser/backend pixel comparisons and the native/browser fixture are blocking
-portable Chromium checks. Configured `perf_gate` budgets run strictly. Machine-calibrated screenshots, GPU
-timings, heap sampling, and wall-clock evidence stay in separate non-blocking diagnostic steps (the
-`gpui-pixel-parity` job is one); approved hashes are never changed merely to satisfy a different host.
+标签发布需要 Rust、包以及可移植的 Chromium/Firefox/WebKit 作业。公共声明与发布策略守卫、V1 夹具、Node 导入以及 pack 冒烟测试是可移植的阻塞检查。确定性的浏览器/后端像素对比以及原生/浏览器夹具是阻塞的可移植 Chromium 检查。已配置的 `perf_gate` 预算严格执行。按机器校准的截图、GPU 计时、堆采样与墙钟时间证据保留在独立的非阻塞诊断步骤中（`gpui-pixel-parity` 作业即其中之一）；已批准的哈希绝不会仅为迁就另一台宿主而更改。
 
-The published WASM module is produced only by `bun run build:wasm` in `packages/charts`: `wasm-pack build --target web` on the shared `release` profile (opt-level 3 workspace crates, `opt-level = "z"` dependencies, fat LTO, one codegen unit, `panic = abort`, `+simd128` from `.cargo/config.toml`), then `wasm-opt` with the flags declared in `crates/aeris_charts_wasm/Cargo.toml`. wasm-pack is pinned to 0.15.0 in every workflow that builds the package, and the release-gate guard enforces that. It runs a `wasm-opt` found on `PATH` and otherwise downloads its own binaryen, so a locally installed `wasm-opt` changes the artifact: every benchmark result records the Cargo profile, the wasm-opt flags read from the crate metadata, and the wasm-opt version, and `node benchmarks/benchmark.mjs size` fails when the build log shows that wasm-opt did not run. The package-size ceilings in `benchmarks/budgets.json` block `ci.yml`, `metrics-smoke.yml`, and the nightly and release benchmark workflows; `node benchmarks/benchmark.mjs rebudget` derives replacement ceilings and their rationale from a measured result, and `benchmarks/README.md` ("WASM size levers and re-baselining") records which size levers were measured and why the release profile keeps workspace crates at opt-level 3. The embedded time-zone database is a priced dependency of that artifact: measured in an isolated wasm32 module with these flags, `chrono-tz` filtered to the parity zones adds about 350 KB raw and 41 KB brotli, against about 914 KB and 84 KB for the complete database with `strftime` abbreviations as first merged; zone abbreviations therefore come from the offset's `Display` (+2 KB) instead of `%Z` (+25 KB). Re-measure with the real package whenever the zone list or the filter changes.
+发布的 WASM 模块只由 `packages/charts` 中的 `bun run build:wasm` 生成：在共享的 `release` profile 上执行 `wasm-pack build --target web`（工作区 crate 使用 opt-level 3，依赖使用 `opt-level = "z"`，fat LTO，单个代码生成单元，`panic = abort`，以及来自 `.cargo/config.toml` 的 `+simd128`），然后使用 `crates/aeris_charts_wasm/Cargo.toml` 中声明的标志运行 `wasm-opt`。wasm-pack 在每个构建该包的工作流中都固定为 0.15.0，发布门禁守卫会强制检查这一点。它会运行在 `PATH` 中找到的 `wasm-opt`，找不到时才下载自带的 binaryen，因此本地安装的 `wasm-opt` 会改变产物：每个基准测试结果都会记录 Cargo profile、从 crate 元数据中读取的 wasm-opt 标志以及 wasm-opt 版本，并且当构建日志显示 wasm-opt 没有运行时，`node benchmarks/benchmark.mjs size` 会失败。`benchmarks/budgets.json` 中的包体积上限会阻塞 `ci.yml`、`metrics-smoke.yml` 以及每夜与发布基准测试工作流；`node benchmarks/benchmark.mjs rebudget` 根据一次实测结果推导替代上限及其依据，`benchmarks/README.md` 的“WASM 体积杠杆与重新基线”一节记录了测量过哪些体积杠杆，以及 release profile 为何让工作区 crate 保持在 opt-level 3。内嵌的时区数据库是该产物中有明确代价的依赖：在使用这些标志的隔离 wasm32 模块中测量，过滤到一致性时区的 `chrono-tz` 约增加 350 KB 原始大小和 41 KB brotli 压缩后大小，而最初合并时带有 `strftime` 缩写的完整数据库约为 914 KB 和 84 KB；因此时区缩写取自偏移量的 `Display`（+2 KB），而不是 `%Z`（+25 KB）。每当时区列表或过滤条件发生变化时，都应使用真实的包重新测量。
 
-Indicator multi-input validation is engine-owned: VWAP and VWAP-band bindings require a distinct
-live scalar volume series, while missing volume remains the explicit unit-weight fallback. An
-amount-weighted VWAP additionally requires a volume series and a distinct live scalar turnover series.
-Financial indicator bindings are also the visibility, removal, and chrome ownership unit. One engine operation
-shows, hides, or removes every output in a binding, and the retained chart-wide indicator chrome
-policy applies name labels, value labels, and price lines to current and later outputs. Hosts choose
-that policy and render controls; they do not walk output series or predict output counts.
-The engine gives each newly created dedicated indicator pane the same 0.3 stretch, including
-financial oscillators, external studies, CVD, and delta (the trade-volume study still opens its
-pane at stretch 1.0). A study placed into an explicitly selected existing pane keeps that pane's
-user-selected height; every backend renders the shared layout.
-Host-computed scalar studies cross the same boundary through the external-study transaction. The
-host supplies a stable study/output identity, generation, semantic presentation, stream requirement
-metadata, timestamps, and nullable values. The engine validates the complete publication before
-mutation and owns its bounded output registry, generation fence, series and dedicated-pane lifecycle,
-price-format inheritance, retained chrome, group visibility, and group removal. Provider sessions and
-the computation of those values remain host-runtime responsibilities.
-Order-flow presentation is likewise installed and removed as one engine transaction. The engine
-owns the shared trade-stream graph, footprint/CVD/delta series and panes, candle-to-footprint
-cutover, retained indicator chrome, bounded adaptive bubble threshold, and automatic 1-2-5 row-size
-policy. A product host supplies instrument/provider generation fencing, canonical bounded trades,
-bar aggregation intent, current price metadata, and presentation preferences; it does not assemble
-or tear down the dependent chart graph itself.
-Financial study persistence V3 stores binding definitions (including explicit seed, histogram, and
-estimator parameters, which default to the TradingView convention when absent), dependency references,
-scalar inputs, volume and turnover inputs, and output styles while leaving market history and ordinary
-series data host-owned. Trade, quote, and
-depth study inputs remain owned by the host market runtime: it supplies typed stream requirements and
-generation-fenced borrowed views, while Charts receives only bounded scalar study output publications.
-Charts must not retain a second tape/book or infer provider stream state from a rendered series. The
-Terminal bridge now carries the transitive stream requirements as bounded output metadata and persists
-only the validated host binding; this keeps the runtime-to-chart boundary explicit while allowing
-downstream output presentation to retain its typed input contract.
+指标的多输入校验由引擎拥有：VWAP 与 VWAP 带绑定需要一个独立的、存活的标量成交量系列，而缺失成交量时仍保留明确的单位权重回退。按成交额加权的 VWAP 额外需要一个成交量系列和一个独立的、存活的标量成交额系列。金融指标绑定同时也是可见性、移除与 chrome 所有权的单位。一次引擎操作即可显示、隐藏或移除绑定中的每个输出，并且保留的图表级指标 chrome 策略会把名称标签、数值标签与价格线应用到当前及之后的输出上。宿主选择该策略并渲染控件；它们不会遍历输出系列，也不会预测输出数量。引擎为每个新创建的专用指标窗格赋予相同的 0.3 拉伸系数，包括金融振荡指标、外部研究、CVD 和 delta（成交量研究仍以 1.0 的拉伸系数打开其窗格）。放入显式选择的已有窗格的研究会保持该窗格由用户选定的高度；每个后端都渲染共享布局。宿主计算的标量研究通过外部研究事务跨越同一边界。宿主提供稳定的研究/输出标识、代次、语义呈现、流需求元数据、时间戳以及可为空的值。引擎在变更之前先校验完整的发布，并拥有其有界输出注册表、代次栅栏、系列与专用窗格的生命周期、价格格式继承、保留的 chrome、分组可见性以及分组移除。提供方会话与这些值的计算仍由宿主运行时负责。订单流呈现同样作为一次引擎事务安装与移除。引擎拥有共享的成交流图、足迹图/CVD/delta 系列与窗格、从 K 线到足迹图的切换、保留的指标 chrome、有界的自适应气泡阈值，以及自动 1-2-5 行大小策略。产品宿主提供标的/提供方的代次栅栏、规范的有界成交、柱聚合意图、当前价格元数据以及呈现偏好；它自己不会组装或拆除图表依赖图。金融研究持久化 V3 存储绑定定义（包括显式的种子、直方图与估计器参数，缺省时默认采用 TradingView 的约定）、依赖引用、标量输入、成交量与成交额输入以及输出样式，而行情历史与普通系列数据仍由宿主拥有。成交、报价与深度研究输入仍归宿主行情运行时所有：它提供类型化的流需求以及带代次栅栏的借用视图，而 Charts 只接收有界的标量研究输出发布。Charts 不得保留第二份成交带/订单簿，也不得从已渲染的系列推断提供方流状态。Terminal 桥接层现在把传递性的流需求作为有界输出元数据携带，并且只持久化经过校验的宿主绑定；这样既保持了运行时到图表的边界清晰明确，又允许下游输出呈现保留其类型化输入契约。
