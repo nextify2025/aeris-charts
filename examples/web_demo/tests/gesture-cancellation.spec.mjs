@@ -12,7 +12,7 @@ import { test, expect } from "@playwright/test";
 // Every case crosses the 5 px click slop before it cancels, so its release is a drag release.
 // Whether a cancel before the slop should also swallow the release's click is an open product
 // decision. A cancelled pan, price-axis scale, or separator resize keeps its partial change: that
-// is decided (docs/Architecture.md, the input controller's cancellation rule), so those cases
+// is decided (docs/architecture/engine/input.md, 唯一的交互所有者), so those cases
 // assert that the gesture stopped where the cancel found it and that the change made before the
 // cancel survives; a price axis the drag took out of autoscale stays manual.
 
