@@ -532,6 +532,15 @@ impl ChartEngine {
         self.input.kinetic_active || self.keyboard_scroll_active() || self.scroll_animation_active()
     }
 
+    /// Whether a pointer press is open: a mouse or pen press that has not been released or
+    /// abandoned, or a finger the touch controller still tracks. While this holds the press owns
+    /// the pointer (browser pointer capture): a host keeps delivering its moves and its release
+    /// wherever the pointer goes, and abandons it with [`Self::input_cancel`] when the window
+    /// loses focus.
+    pub fn input_pointer_captured(&self) -> bool {
+        self.input.press.is_some() || self.input.touch_tracking.is_some()
+    }
+
     /// Earliest host-clock time at which [`Self::input_tick`] has deferred work, if any.
     pub fn input_wake_deadline_ms(&self) -> Option<f64> {
         match (
@@ -1238,7 +1247,7 @@ impl ChartEngine {
     /// The pointer left the chart without a held button. Captured gestures are unaffected; a live
     /// measure stays on screen.
     pub fn input_pointer_leave(&mut self) {
-        if self.input.press.is_some() || self.input.touch_tracking.is_some() {
+        if self.input_pointer_captured() {
             return;
         }
         self.input.pointer = None;

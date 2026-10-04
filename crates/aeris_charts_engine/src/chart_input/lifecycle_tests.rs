@@ -548,3 +548,43 @@ fn a_double_tap_tolerates_a_finger_wobble_that_a_double_click_does_not() {
         );
     }
 }
+
+/// A press owns the pointer from its press until it ends: hosts keep feeding it the pointer's
+/// moves outside the chart (pointer capture) exactly while `input_pointer_captured` holds, and a
+/// leave never ends it. A release, a lost release, `input_cancel` and Escape each end it.
+#[test]
+fn a_press_captures_the_pointer_until_it_ends() {
+    let mut chart = chart();
+    let (x, y) = empty_pane_point(&chart);
+    let none = InputModifiers::default();
+    assert!(!chart.input_pointer_captured());
+
+    chart.input_pointer_down(at(x, y), 1);
+    assert!(
+        chart.input_pointer_captured(),
+        "a press captures before it moves"
+    );
+    chart.input_pointer_move(at(x + 20.0, y), true);
+    chart.input_pointer_leave();
+    let outside = (x - chart.pane_w, y - 400.0);
+    chart.input_pointer_move(at(outside.0, outside.1), true);
+    assert!(
+        chart.input_pointer_captured(),
+        "a pan keeps the pointer outside the chart"
+    );
+    chart.input_pointer_up(at(outside.0, outside.1));
+    assert!(!chart.input_pointer_captured(), "the release ends it");
+
+    chart.input_pointer_down(at(x, y), 1);
+    chart.input_pointer_move(at(x + 20.0, y), false);
+    assert!(!chart.input_pointer_captured(), "a lost release ends it");
+
+    chart.input_pointer_down(at(x, y), 1);
+    chart.input_cancel();
+    assert!(!chart.input_pointer_captured(), "a cancel ends it");
+
+    chart.input_pointer_down(at(x, y), 1);
+    chart.input_pointer_move(at(x + 20.0, y), true);
+    assert!(chart.input_key_down(ChartKey::Escape, none, false, 0.0));
+    assert!(!chart.input_pointer_captured(), "Escape ends it");
+}
