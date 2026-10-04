@@ -506,9 +506,8 @@ pub enum IndicatorConvention {
     /// SMA seeds, `MACD - signal` histogram, population deviation (TradingView/TA-Lib).
     #[default]
     TradingView,
-    /// First-value seeds (and KDJ's formula-language start), `(DIF - DEA) * 2` histogram, sample
-    /// deviation: the 通达信/同花顺 formula language. See `docs/Public_api.md` for what each choice
-    /// was verified against.
+    /// 首值种子（含 KDJ 的公式语言式起始）、`(DIF - DEA) * 2` 柱状图与样本偏差，
+    /// 对应通达信/同花顺公式语言；各项的验证依据见 `docs/api/indicators.md`。
     China,
 }
 

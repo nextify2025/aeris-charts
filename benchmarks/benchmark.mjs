@@ -168,6 +168,10 @@ async function claims() {
       || relative.startsWith("benchmarks/")
       || relative === "AGENTS.md"
       || relative === "docs/Architecture.md"
+      // 架构拆分后的内部契约与证据页延续原总览的排除范围；公共 API 文档仍参与扫描。
+      || relative.startsWith("docs/architecture/")
+      || relative === "docs/development/performance.md"
+      || relative === "docs/development/validation.md"
       || relative.includes("/tests/")
       || relative.endsWith("/examples/perf_gate.rs")) continue;
     const text = await readFile(path.join(repository_root, relative), "utf8").catch(() => "");
