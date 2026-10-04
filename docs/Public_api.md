@@ -102,6 +102,21 @@ The supported root surface is:
   `enable_accessibility()`, accessibility options, and keyboard data/drawing operation;
 - the additive `wheel_behavior` chart option (`auto`, `pan`, or `zoom`); existing gesture option
   names remain compatible;
+- the additive `crosshair.shadeRight` chart option (`{ visible, color }`, default off): a
+  translucent veil over the pane region right of the hovered bar, described under
+  [Crosshair shade](#crosshair-shade);
+- the additive baseline-series options `baseline_mode` (`"visible_midpoint"` or
+  `"close_before_visible_range"`), `baseline_line_visible`, `baseline_line_color`,
+  `baseline_line_width`, `baseline_line_style`, and the read-only `series.baseline_price()`
+  (`baselinePrice()`) query, described under [Baseline reference line](#baseline-reference-line);
+- the additive per-series `live_bar_easing_ms` option (default `0` = off): a same-time replacement
+  of the drawn last bar glides its displayed high/low/close toward the new values while every
+  query keeps the real ones, described under [Live-bar easing](#live-bar-easing);
+- the engine-owned timeline-mark lane exposed by `chart.timeline_marks()` (`set`, `state`,
+  `set_visible`, `set_group_hidden`, `hidden_groups`, `hit_at`) and the
+  `subscribe_timeline_mark_click` outcome carrying the resolved hit, described under
+  [Timeline marks](#timeline-marks); hidden groups persist as the optional V1/V2/V3
+  `hidden_mark_groups` field;
 - the time-scale viewport contract: data updates (history prepends, out-of-order inserts, gap
   backfills, retention trims) never move a scrolled-back view while the live edge follows new bars
   per `shift_visible_range_on_new_bar`; `set_visible_logical_range()` keeps fractional borders;
@@ -481,6 +496,230 @@ per-output style references, and restores into a fresh chart like every other st
 translated from KLineChart v10.0.3 and match its output bit for bit (see `docs/Architecture.md` and
 `NOTICE`).
 
+## Crosshair shade
+
+```ts
+chart.apply_options({
+  crosshair: { shadeRight: { visible: true, color: "rgba(74, 74, 74, 0.12)" } },
+});
+```
+
+**What it paints.** With `crosshair.shadeRight.visible` the engine veils the pane region to the
+right of the hovered bar: one filled rectangle per stacked pane, from the snapped bar's right edge
+to the pane's right edge and over the pane's full height. The edge is the same device-pixel bar
+rule the `HighlightBarCrosshair` primitive uses, so a highlight and the veil abut exactly; the veil
+follows the vertical line onto the empty right-offset slots, and when the bar's right edge rounds
+onto the pane edge (the last bar at right offset 0 with an odd device bar width) nothing is drawn.
+The veil is painted in every pane like the vertical line, not only in the pane under the pointer,
+and it is independent of `vertLine.visible`. It sits in the crosshair overlay above series,
+drawings, chrome, and trading objects and below the crosshair lines, and it follows the crosshair's
+own gates: hidden mode, and the suppression while an interactive object (drawing, trading control)
+is hovered or dragged. Moving the pointer rebuilds only the crosshair overlay, as without the veil.
+
+**Color.** `color` is a CSS color whose alpha carries the opacity; the default
+`rgba(74, 74, 74, 0.12)` is the crosshair line token at 12% alpha and is the same in both themes.
+An unparsable value (a named color, `hsl()`) falls back to that default instead of dropping the
+veil. The veil is an ordinary translucent `Rect`, so it inherits each executor's existing alpha
+compositing with no shade-specific path. The WebGPU executor's Canvas2D-exact source-over
+(`crates/aeris_charts_render_wgpu/src/blend.rs`) documents a ±1/255 residual only for tints so faint
+that a channel's premultiplied 8-bit value rounds to 0, `(c * a + 127) / 255 == 0` with `a` the
+8-bit alpha; the default tint (`a = 31`, premultiplied channel 9) does not reach it. GPUI
+translucent fills are covered by the reported, not gated, translucent-rects parity fixture.
+
+**Persistence and reset.** The option lives in the chart options store, so a V2 document (general
+panes) carries it with `vertLine`/`horzLine`; V1 and V3 documents carry no chart options.
+`chart.reset_style_to_defaults()` restores `color` and keeps `visible`, the same split the
+watermark uses. Rust hosts read `CrosshairOptions::shade_right` (`CrosshairShadeOptions { visible,
+color }`); there is no separate setter, the option flows through `apply_options` like every other
+crosshair key.
+
+## Baseline reference line
+
+```ts
+const price = chart.add_series("baseline", {
+  baseline_mode: "close_before_visible_range",
+  baseline_line_visible: true,                 // dashed #4a4a4a, 1 CSS px by default
+  baseline_line_color: "#4a4a4a", baseline_line_width: 1, baseline_line_style: LINE_STYLE_TO_U8.dashed,
+});
+price.baseline_price();                        // the price the quadrants compare against, or null
+```
+
+**Which price is the baseline.** A baseline series without a pinned `baseline_value` resolves its
+baseline from the visible window per `baseline_mode`. `"visible_midpoint"` (the default, today's
+behavior) is the midpoint of the minimum and maximum visible close. `"close_before_visible_range"`
+is the last finite close strictly before the first visible bar, so the window reads as change
+against where it started; whitespace rows before the window are skipped, and when no finite row
+precedes it the first visible finite close stands in, so the first bar reads as unchanged and the
+series never disappears. Both modes follow the visible window and change while scrolling or
+zooming; a host that knows the true prior-session close pins `baseline_value`, which wins over every
+mode. One resolution feeds everything: the quadrant fills and strokes, the reference line, the
+live price line color, the last-value axis chip, the crosshair marker, and `baseline_price()`. The
+mode does not change the `histogram_updown_rule: "previous_close"` first-bar reference, which still
+reads only a pinned `baseline_value` (or the scale's `base_value`). `"previous_close"` is not a
+`baseline_mode` value (it is reserved for a future session-anchored mode); a bad value throws
+`invalid_options` before any option of the call is applied, like `histogram_updown_rule`.
+
+**The line.** `baseline_line_visible` (default `false`) draws the resolved baseline as one
+full-pane-width horizontal line painted between the quadrant fills and the quadrant strokes, so
+the strokes stay on top of it and it stays above the fills. `baseline_line_color` is a CSS string
+stored verbatim; unset or `""` follows the neutral chrome tint `#4a4a4a` (the crosshair line token,
+the same in both themes), and an unparsable value falls back to that tint instead of dropping the
+line. `baseline_line_width` is CSS px (default `1`, positive; floored to whole device pixels with
+the vertical ratio, at least one) and `baseline_line_style` a `LINE_STYLE_TO_U8` value (default
+`2`, dashed). The line is drawn only while the series itself reaches the pane: a bar in view, or
+a segment bridging a window between two off-screen bars; once the series has scrolled entirely
+off one side, the line goes with its fills and strokes. It replaces
+the `create_price_line({ price: prev_close, line_style: "dashed" })` workaround of the intraday
+example when the previous close is pinned, and needs no host bookkeeping when it is not.
+
+**The query.** `series.baseline_price()` (`baselinePrice()`) returns the resolved baseline of a
+baseline series as a number, or `null` for every other series type, a removed series, a chart
+without a visible range yet, and a `"visible_midpoint"` series none of whose bars is in the
+visible window (another series keeps the window). `"close_before_visible_range"` is still defined
+then and reports the last close before the window, which is the series' own last close once it
+has scrolled entirely off to the left. Rust hosts call `ChartEngine::series_baseline_price(id)`;
+the wasm export is `AerisChart.series_baseline_price(id)`.
+
+**Reset, persistence, workers.** The line options are style: `chart.reset_style_to_defaults()`
+restores them. `baseline_mode` is semantic and survives the reset, like `break_on_trading_day`.
+Like every other financial series style option none of them is persisted. Worker (offscreen)
+charts cannot set them: `apply_series_options` on a worker chart accepts only the alignment keys
+after creation, so they are main-thread options (see [Intraday (分时) charts](#intraday-分时-charts)).
+
+## Live-bar easing
+
+```ts
+const price = chart.add_series("candlestick", { live_bar_easing_ms: 120 });
+price.update({ time: last.time, open, high, low, close });   // same time: the drawn bar glides
+price.data().at(-1).close === close;                         // true at once: queries read real values
+```
+
+**What glides.** `live_bar_easing_ms` is the time constant `tau` in milliseconds (`0`, the
+default, is off; values above `1000` clamp to it; a negative or non-finite value throws
+`invalid_options` before any option of the call is applied). When `update()`, `update_typed()`,
+`merge()` or a merge batch replaces the drawn last bar in place — the same canonical row and the
+same time — the displayed high, low and close move toward the new values on every presented frame
+with `x += (target - x) * (1 - exp(-dt / tau))`, where `dt` is the host clock delta capped at
+100 ms per frame, so a tab that stopped presenting resumes with a glide instead of a jump. The
+open never eases. The glide settles exactly on the target when every channel is within
+`max(1e-9, |target| * 1e-7)` of it or six time constants after the last change, and the
+animation loop stops; a feed that keeps moving the target keeps gliding without ever freezing.
+A brand-new bar, `set_data()`/`setData()` with the same times, `pop()`, a moved replay clock, a
+retention trim and the `reduced_motion` interaction option snap to the real values at once. A
+write to another bar while the drawn bar glides (a historical correction, a replay bar past the
+clock) leaves the glide running, since the drawn bar did not change. A last bar hidden by
+`render_before_time` never eases. The first frame after a tick still shows the previous values
+(it stamps the clock), so the glide becomes visible on the second presented frame.
+
+**What reads the eased values.** Only what is drawn for that bar: the candle, bar, histogram
+column, line, area or baseline geometry (a `histogram_updown` volume column takes its tint from
+the primary's drawn direction, so it flips when the eased close crosses the open), the series'
+last-value line and axis chip, the pulse, the crosshair marker on that bar (so it sits on the
+drawn line) and the series hit test (so the drawn wick is hittable). Heikin Ashi candles
+recompute their last row from the eased raw values with the previous canonical row, so they
+glide too. Everything else reads the real values throughout: `data()`, `data_by_index()`,
+`last_value_data()`, `bars_in_logical_range()`, the value snapshot behind the legend, tooltip
+and data window, the crosshair magnet (in magnet mode the horizontal line snaps to the real close
+and therefore sits apart from the marker by the glide while it runs — a documented one-bar
+divergence), trading geometry, the percentage/indexed base value, `baseline_price()` and
+autoscale, which follows the real range at once.
+
+**Hosts.** Browser charts need no host code: `wants_animation` now covers the glide and the
+package's rAF loop, which restarts after every repaint, runs until it settles. Worker (offscreen)
+charts cannot set the option after creation and run no animation loop, so they never ease (see
+[Intraday (分时) charts](#intraday-分时-charts)). Rust hosts drive `ChartEngine` directly:
+`set_animation_time(ms)` advances every glide and the pulse clock (browser loop),
+`advance_live_bar_easing(now_ms) -> bool` advances only the glides (what the GPUI adapter calls
+from `GpuiChartInput::prepare_frame`), `animation_active()` is the browser loop predicate and
+`animation_frame_requested()` the Rust-host frame-request predicate (an input animation or a
+glide; the pulse is browser-only). `live_bar_easing_active()` answers whether any glide is
+unsettled.
+
+**Reset, persistence, parity.** The option is style, like `last_price_animation`:
+`chart.reset_style_to_defaults()` turns it off and it is not persisted. A settled frame is
+bit-identical to a clean rebuild and a frame built from the real values alone; mid-glide frames
+depend on the host clock, so pixel-parity fixtures keep the option off.
+
+## Timeline marks
+
+```ts
+chart.timeline_marks().set({
+  groups: [{ id: "earnings", label: "Earnings" }],
+  marks: [
+    { id: "q3", time: 1_700_000_000, group: "earnings", glyph: { shape: "circle", color: "#2962ff", letter: "E" }, title: "Q3 report" },
+    { id: "call", time: 1_700_000_000, group: "earnings", title: "Call" },      // same bar: one token with the count 2
+    { id: "up", time: 1_700_300_000, group: "news", glyph: { shape: "diamond", color: "#f7525f" } }, // a group missing from `groups` labels as its id
+  ],
+});
+chart.subscribe_timeline_mark_click((hit) => open_popup(hit.mark_ids, hit.label, hit.title));
+chart.timeline_marks().set_group_hidden("news", true);  // persists with export_state()
+```
+
+**What the lane is.** A row of glyph tokens along the bottom of the primary series' pane: one
+token per bar slot (or per cluster of near slots), separate from series markers and from the
+trading host overlay. A mark has a unique `id` (1..=128 bytes), a unix-second `time`, a `group`
+id, a glyph (`shape`: `circle` (default), `square`, `diamond` or `pin`; a CSS `color`; a
+`letter` of at most two characters) and a `title` (at most 128 bytes). Groups carry a `label`
+(at most 64 bytes) shown in the tooltip; a mark may name a group missing from `groups`, which
+then labels as its id. `set()` replaces marks and groups atomically and throws `resource_limit`
+above 4096 marks or 64 distinct groups and `invalid_data` on duplicate ids, over-long strings or
+an unparsable color, leaving the lane unchanged. `set_visible(false)` hides the whole lane
+(runtime, default shown).
+
+**Where a mark lands.** The engine resolves the bar slot: the bar whose span `open .. open +
+min(step, next_open - open)` holds the time, where `step` is the installed session bar grid's
+interval (close-time labels), else the `set_future_time_projection` cadence, else the prevailing
+bar interval. A time inside a gap — an overnight or a weekend — lands on the next bar, never on
+the bar before the gap; a time past the last bar projects into the right-side whitespace by
+whole steps and draws only while the scale shows that whitespace; a time before the first bar,
+or after the replay clock, draws nothing. Tick, volume and range bars map by the bar's
+open..close span without projection. Tokens whose centers come within 20 CSS px of a cluster's
+earliest slot fold into one token: a single-group cluster keeps that group's glyph with the
+count in place of the letter, a mixed cluster paints a neutral bordered square with the count
+(`99+` from a hundred). Clustering is computed in CSS px, so it is identical at every device
+pixel ratio, and token geometry derives from constants, never from measured text, so the lane is
+pixel-identical on every backend. The lane hides on panes shorter than 96 CSS px and shows again
+above 108 CSS px (hysteresis), and while shown with any mark it reserves 27 CSS px below the data
+on every auto-scaled scale of its pane — independent of the view and of hidden groups, so
+panning or toggling never moves the scale; a manual scale can overlap the lane like series
+markers, and a bottom-pinned volume overlay lifts with it.
+
+**Interaction.** Hovering a token answers the pointer cursor and draws a 1 px ring; after the
+same 450 ms dwell as trading controls the engine draws a title tooltip (`label · title` for one
+mark, `label · N` for a single-group cluster, `N marks` for a mixed one) in the theme's surface,
+border and text tokens. A click (press and release on the same token without a drag) fires
+`subscribe_timeline_mark_click` once with a `timeline_mark_hit` — the anchor `logical` slot and
+`projected` flag, the earliest `time` and `title`, the `count`, the distinct `groups`, every
+`mark_ids` entry and the `label` — and never selects, pans or reaches a drawing under it; a
+double-click on a token never opens a drawing editor. `hit_at(x, y)` answers the same precision hit
+for any chart-content point: a token answers across its own box (16 CSS px, 18 for a cluster) and
+the rest of the lane belongs to the pane. Only a touch press on the chart widens that box by the
+touch hit tolerance, inside the engine input controller; `hit_at` itself always uses the precision
+box. The rich click popup stays host UI. Accessibility exposes one `mark:` focus target per mark of a shown group, on the
+pane the engine shows the lane on (the primary series' pane while the lane is enabled, non-empty
+and tall enough) and none while the lane is hidden, with the tooltip text as its label; Enter
+activates the token through the same click subscription when the mark is in view.
+
+**Hidden groups and persistence.** `set_group_hidden(group, hidden)` hides or shows one group's
+marks (at most 64 hidden groups, 128-byte ids; throws `resource_limit`/`invalid_data`). The set
+is independent of the snapshot, so a host may import a document first and set marks later, and a
+new `set()` never prunes it. Hidden groups are the only persisted part of the lane: the optional
+`hidden_mark_groups: string[]` field on V1, V2 and V3 documents (omitted when empty, no schema
+bump; documents with more than 64 entries or over-long ids fail structurally and atomically).
+Marks never persist.
+
+**Hosts.** Rust hosts call `ChartEngine::set_timeline_marks`, `timeline_marks`,
+`set_timeline_marks_visible`, `timeline_marks_visible`, `set_timeline_group_hidden -> Result<bool,
+ChartError>`, `hidden_timeline_groups`, `timeline_mark_hit_at`, `timeline_mark_hit_at_with_profile(x,
+y, HitProfile)` (touch tolerance), `timeline_mark_hit_for_id`, `timeline_lane_pane -> Option<usize>`
+(the pane showing the lane now; keyboard targets for marks follow it) and read a click's
+`ChartInputEvent::TimelineMarkActivated(seq)` back through `timeline_mark_activation(seq)` (a
+32-entry ring). The wasm exports are `set_timeline_marks_json`, `timeline_marks_json`,
+`set_timeline_marks_visible`, `set_timeline_group_hidden`, `hidden_timeline_groups_json`,
+`timeline_mark_hit_json`, `timeline_mark_hit_for_id_json` and `timeline_lane_pane`; the controller
+event `timeline_mark_activated` carries the resolved `hit`. Worker (offscreen) charts do not proxy
+the lane handle in this revision.
+
 ## Coordinates and panes
 
 Every public coordinate lives in one chart-content space, and it is never pane-local. `x` is CSS px
@@ -753,12 +992,13 @@ chart.time_scale().set_visible_logical_range({ from: -0.5, to: slots.length - 0.
 
 **3. Price against the previous close.** A baseline series with `baseline_value: prev_close` is red
 above and green below (set `top_*`/`bottom_*` colors); with only the first minute traded it draws a
-bar-wide segment. Center its scale on the previous close, and put the same prices on a second scale
-in percentage mode based on the previous close:
+bar-wide segment, and `baseline_line_visible` draws the previous close as a dashed reference line
+(see [Baseline reference line](#baseline-reference-line)). Center its scale on the previous close,
+and put the same prices on a second scale in percentage mode based on the previous close:
 
 ```ts
 const price = chart.add_series("baseline", {
-  price_scale_id: "left", baseline_value: prev_close,
+  price_scale_id: "left", baseline_value: prev_close, baseline_line_visible: true,
   top_line_color: "#f7525f", bottom_line_color: "#089981",
 });
 const percent = chart.add_series("line", { price_scale_id: "right", line_visible: false });
@@ -768,7 +1008,6 @@ chart.price_scale("right").apply_options({
 });
 price.set_data(slots.map((time, i) => row(time, closes[i])));   // closes[i] undefined for future minutes
 percent.set_data(slots.map((time, i) => row(time, closes[i])));
-price.create_price_line({ price: prev_close, line_style: "dashed" });
 ```
 
 Equal top and bottom margins put the previous close in the middle of the pane on both axes.
@@ -1768,12 +2007,16 @@ Persistence schema versioning is independent of the npm package version. V1 cont
   (`{logical, price, time?}`, plus the `anchor_times_micros` sidecar on non-time bar charts), and
   style;
 - the optional top-level `drawing_price_basis` label (the host-defined price basis of the drawing
-  prices).
+  prices);
+- the optional top-level `hidden_mark_groups` list (hidden timeline-mark groups, at most 64 ids of
+  at most 128 bytes; omitted when empty). Timeline marks themselves are never persisted.
 
 Host market history, series and indicator definitions, chart options, trading positions/orders/
 executions/previews/intents, alert lines/create requests, custom extensions, callbacks,
 subscriptions, selections, interaction sessions, generations, LOD, drawing bounds/indexes,
-retained frames, and GPU resources are not persisted. Hosts restore V1 into a fresh chart, then
+retained frames, and GPU resources are not persisted. (V2 documents, written for charts with
+general panes, additionally carry the chart options store — crosshair `vertLine`, `horzLine`, and
+`shadeRight` included; V3 documents, like V1, carry no chart options.) Hosts restore V1 into a fresh chart, then
 reinstall host-owned data, series/indicator configuration, trading state, alert state, options, and
 extensions.
 
@@ -2193,6 +2436,58 @@ pin has depends on its side:
 - The Shift-click quick measure came with `5a2e6e8` (an own-line pin before the merge never had
   it). Main drives it from the input controller (a Shift press on the pane), so `measure_pointer_*`
   need not be called for it.
+
+**Crosshair shade, baseline mode, live-bar easing, and timeline marks** (own line, the commit that
+adds `live_bar_easing_ms`; find it with `git log -S'live_bar_easing_ms' --
+crates/aeris_charts_engine/src/lib.rs`; see [Crosshair shade](#crosshair-shade), [Baseline reference
+line](#baseline-reference-line), [Live-bar easing](#live-bar-easing), and [Timeline
+marks](#timeline-marks)). Every addition is off or empty by default, so a host that adopts nothing
+renders as before; the review points are the frame-request predicate and the added enum variants and
+struct fields:
+
+- Animation clock. `ChartEngine::set_animation_time(ms)` is new on the engine (the browser shell used
+  to stamp a clock of its own): it advances every live-bar glide and writes the `pub animation_time`
+  field only when a last-price pulse is drawn or a glide advanced, so a stamp-only tick changes no
+  frame key. `advance_live_bar_easing(now_ms) -> bool` advances only the glides;
+  `live_bar_easing_active()`, `animation_active()` (pulse or glide, what the browser `wants_animation`
+  returns), and `animation_frame_requested()` (`input_animating() || live_bar_easing_active()`, the
+  Rust-host frame-request predicate) are new. A host that requests another frame only while
+  `input_animating()` holds, as the input-controller group above described, moves to
+  `animation_frame_requested()` or `GpuiChartInput::animating(&engine)`; otherwise a glide shows its
+  first frame and stalls, because no further frame is requested. `GpuiChartInput::prepare_frame` now
+  also calls `advance_live_bar_easing` on the adapter clock and returns `true` when a glide moved;
+  the adapter still never runs the pulse clock.
+- Baseline. `ChartEngine::series_baseline_price(id) -> Option<f64>` and the public enum
+  `BaselineMode` (`VisibleMidpoint`, `CloseBeforeVisibleRange`, with `as_str` and `parse`) are new.
+  `SeriesEntry` gains the `pub` fields `baseline_mode`, `baseline_line_visible`,
+  `baseline_line_color: Option<String>`, `baseline_line_width`, `baseline_line_style`, and
+  `live_bar_easing_ms`; a struct literal that lists the fields adds them, and the defaults keep
+  today's rendering. A host that writes `live_bar_easing_ms` directly gets the JSON path's semantics:
+  a non-finite or non-positive value is off and larger values clamp to `MAX_LIVE_BAR_EASING_MS`
+  (1000).
+- Crosshair. `aeris_charts_core::options::CrosshairOptions` gains `shade_right:
+  CrosshairShadeOptions { visible, color }` (wire key `shadeRight`, `#[serde(default)]`, so V2
+  documents saved before it still read); a struct literal that lists the fields adds it.
+- Timeline marks. New `ChartEngine` methods: `set_timeline_marks(snapshot) -> Result<(),
+  ChartError>`, `timeline_marks()`, `set_timeline_marks_visible(bool) -> bool`,
+  `timeline_marks_visible()`, `set_timeline_group_hidden(group, hidden) -> Result<bool, ChartError>`,
+  `hidden_timeline_groups()`, `timeline_mark_hit_at(x, y)`, `timeline_mark_hit_at_with_profile(x, y,
+  HitProfile)`, `timeline_mark_hit_for_id(id)`, `timeline_lane_pane()`, and
+  `timeline_mark_activation(seq)`; new public types `TimelineMark`, `TimelineMarkGlyph`,
+  `TimelineGlyphShape`, `TimelineMarkGroup`, `TimelineMarksSnapshot`, and `TimelineMarkHit`, and the
+  caps `MAX_TIMELINE_MARKS` (4,096) and `MAX_TIMELINE_GROUPS` (64). New variants, each a compile-time
+  break for an exhaustive `match`: `ChartInputEvent::TimelineMarkActivated(u32)` (drain it with the
+  other events and read the hit through `timeline_mark_activation(seq)`), `ChartHover::TimelineMark`,
+  and `InputTarget::TimelineMark`. `EngineMemoryUsage` gains `timeline_marks_capacity_bytes`.
+- Persistence. V1, V2, and V3 documents gain the optional `hidden_mark_groups` list (omitted when
+  empty; no schema bump). The document structs ignore unknown fields, so a document written by this
+  revision with hidden groups still loads on an older pin, which drops the list.
+- Core. `PlotListView::with_row_override(source_row, [open, high, low, close])` and
+  `overridden_values(row)` are new, and `value_at` and `is_whitespace_row` honor the override; no
+  existing signature changed. The browser package's additions are additive `.d.ts` members (the
+  `crosshair.shadeRight` and baseline/easing series options, `series_api.baseline_price`,
+  `chart_api.timeline_marks`, and the `subscribe_timeline_mark_click` pair) and the npm version is
+  unchanged in that commit.
 
 **Other source-level changes.** Each item names the commit that carries it. None of the public
 enums involved is `#[non_exhaustive]`, so every added variant is a compile-time break for an

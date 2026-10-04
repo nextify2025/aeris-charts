@@ -171,7 +171,34 @@ product decision; the evidence is recorded in `budgets.json`'s `rationale`.
 | WASM raw | 5,041,592 | 5,400,000 |
 | WASM Brotli | 1,237,844 | 1,330,000 |
 
-Future growth is blocked at the v5 ceilings.
+Until policy v6 below, future growth was blocked at the v5 ceilings.
+
+Budget policy v6 is the reset after the Vela-informed engine batch (live-bar easing with its display
+override of the drawn last row, the baseline reference line and `baseline_mode`, the crosshair
+`shadeRight` veil, and the timeline-mark lane with its slot mapping, clustering, dwell tooltip, input
+outcome, persistence of hidden groups and WASM/TypeScript surface). The module grew by 92,557 raw
+bytes (+1.7%) and 24,284 Brotli bytes (+1.9%) against the batch base `de7d571`, measured with the same
+wasm-pack 0.15.0 and its bundled `wasm-opt` 117; the base already sat 20,453 raw bytes under the v5
+ceiling because upstream's later work had consumed the v5 headroom. The growth is compiled engine
+code for the four capabilities (the timeline-mark types and their JSON surface, the per-series option
+emitters, the easing state and display projection) with no single reducible hotspot; the lossless
+levers priced below were re-checked and none applies to this batch, and every remaining reduction is
+an opt-level change that costs frame time. Only the two ceilings the run exceeded move (WASM raw and
+npm unpacked), to the observed p50 plus 7% rounded up to 10,000 bytes; JavaScript and WASM Brotli
+stay inside their unchanged ceilings. The npm tarball sits 2,421 bytes under its unchanged ceiling,
+so a different compressor on the release runner may push it over; that would be a measurement to
+rebudget deliberately, not a defect. The evidence is recorded in `budgets.json`'s `rationale`.
+
+| Phase 5 metric | Observed bytes | Blocking maximum |
+| --- | ---: | ---: |
+| npm tarball | 2,107,579 | 2,110,000 |
+| npm unpacked | 6,392,809 | 6,850,000 |
+| JavaScript raw | 408,085 | 620,000 |
+| JavaScript Brotli | 71,326 | 95,000 |
+| WASM raw | 5,472,104 | 5,860,000 |
+| WASM Brotli | 1,320,160 | 1,330,000 |
+
+Future growth is blocked at the v6 ceilings.
 
 ### WASM size levers and re-baselining
 

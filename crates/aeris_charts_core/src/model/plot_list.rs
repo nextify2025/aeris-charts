@@ -161,6 +161,11 @@ pub struct PlotListView<'a> {
     list: &'a PlotList,
     values: PlotValues<'a>,
     lod: Option<&'a LodPyramid>,
+    /// A display-only replacement of one canonical row's `[open, high, low, close]`, keyed by
+    /// source row so an as-of series' repeated plot rows all show it. Honored by [`Self::value_at`]
+    /// and [`Self::is_whitespace_row`] only; the LOD pyramid, autoscale chunks, and the canonical
+    /// columns never see it.
+    row_override: Option<(usize, [f64; 4])>,
 }
 
 impl<'a> PlotListView<'a> {
@@ -170,6 +175,7 @@ impl<'a> PlotListView<'a> {
             list,
             values: values.with_rows(list.source_rows()),
             lod: None,
+            row_override: None,
         }
     }
 
@@ -182,6 +188,26 @@ impl<'a> PlotListView<'a> {
             list,
             values: values.with_rows(list.source_rows()),
             lod: Some(lod),
+            row_override: None,
+        }
+    }
+
+    /// The same view with canonical row `source_row` displayed as `values` (`[open, high, low,
+    /// close]`). Everything else, including every other row, reads the canonical columns.
+    pub fn with_row_override(self, source_row: usize, values: [f64; 4]) -> Self {
+        Self {
+            row_override: Some((source_row, values)),
+            ..self
+        }
+    }
+
+    /// The override values when plot row `row` shows the overridden canonical row.
+    pub fn overridden_values(self, row: usize) -> Option<[f64; 4]> {
+        match &self.row_override {
+            Some((source_row, values)) if self.values.source_row(row) == *source_row => {
+                Some(*values)
+            }
+            _ => None,
         }
     }
 
@@ -262,10 +288,20 @@ impl<'a> PlotListView<'a> {
     }
 
     pub fn value_at(self, row: usize, plot: PlotValueIndex) -> f64 {
+        if let Some((source_row, values)) = &self.row_override {
+            if self.values.source_row(row) == *source_row {
+                return values[plot as usize];
+            }
+        }
         self.values.value_at(row, plot)
     }
 
     pub fn is_whitespace_row(self, row: usize) -> bool {
+        if let Some((source_row, values)) = &self.row_override {
+            if self.values.source_row(row) == *source_row {
+                return values.iter().all(|value| value.is_nan());
+            }
+        }
         self.values.is_whitespace_row(row)
     }
 
@@ -1145,6 +1181,38 @@ mod tests {
         let mm = pl.min_max(0, 3, &[PlotValueIndex::Close]).unwrap();
         assert_eq!(mm.min, 1.0);
         assert_eq!(mm.max, 4.0);
+    }
+
+    #[test]
+    fn a_row_override_replaces_one_canonical_row_for_display_only() {
+        let mut pl = TestPlot::new(
+            vec![0, 1, 2],
+            [
+                vec![1.0, 2.0, 3.0],
+                vec![1.5, 2.5, 3.5],
+                vec![0.5, 1.5, 2.5],
+                vec![1.2, 2.2, 3.2],
+            ],
+        );
+        let display = pl.view().with_row_override(2, [3.0, 9.0, 0.25, 8.0]);
+        // The overridden row reads the display values, every other row the canonical columns.
+        assert_eq!(display.value_at(2, PlotValueIndex::Open), 3.0);
+        assert_eq!(display.value_at(2, PlotValueIndex::High), 9.0);
+        assert_eq!(display.value_at(2, PlotValueIndex::Low), 0.25);
+        assert_eq!(display.value_at(2, PlotValueIndex::Close), 8.0);
+        assert_eq!(display.value_at(1, PlotValueIndex::Close), 2.2);
+        assert_eq!(display.overridden_values(2), Some([3.0, 9.0, 0.25, 8.0]));
+        assert_eq!(display.overridden_values(1), None);
+        assert!(!display.is_whitespace_row(2));
+        // The canonical view and the chunk cache never see it.
+        assert_eq!(pl.view().value_at(2, PlotValueIndex::High), 3.5);
+        assert_eq!(pl.view().overridden_values(2), None);
+        let mm = pl.min_max(0, 2, &[PlotValueIndex::High]).unwrap();
+        assert_eq!(mm.max, 3.5);
+        // An all-NaN override reads as whitespace on that row only.
+        let blank = pl.view().with_row_override(2, [f64::NAN; 4]);
+        assert!(blank.is_whitespace_row(2));
+        assert!(!blank.is_whitespace_row(1));
     }
 
     #[test]

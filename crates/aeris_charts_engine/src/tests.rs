@@ -5108,6 +5108,57 @@ fn crosshair_line_style_and_width_flow_from_options() {
 }
 
 #[test]
+fn crosshair_shade_right_round_trips_and_resets_only_its_color() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let defaults = &chart.options.get().crosshair.shade_right;
+    assert!(!defaults.visible);
+    assert_eq!(defaults.color, "rgba(74, 74, 74, 0.12)");
+
+    chart
+        .apply_options(r##"{"crosshair":{"shadeRight":{"visible":true,"color":"#ff000040"}}}"##)
+        .unwrap();
+    let shade = &chart.options.get().crosshair.shade_right;
+    assert!(shade.visible);
+    assert_eq!(shade.color, "#ff000040");
+    let raw = chart.options.value();
+    assert_eq!(raw["crosshair"]["shadeRight"]["visible"], true);
+    assert_eq!(raw["crosshair"]["shadeRight"]["color"], "#ff000040");
+
+    // The tint is style; whether the veil is on is host state (the watermark precedent).
+    chart.reset_style_to_defaults();
+    let shade = &chart.options.get().crosshair.shade_right;
+    assert!(shade.visible);
+    assert_eq!(shade.color, "rgba(74, 74, 74, 0.12)");
+}
+
+#[test]
+fn v2_persistence_carries_the_crosshair_shade() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart
+        .add_pane_with_domain(true, HorizontalDomain::Temporal)
+        .unwrap();
+    chart
+        .apply_options(
+            r##"{"crosshair":{"shadeRight":{"visible":true,"color":"rgba(1, 2, 3, 0.5)"}}}"##,
+        )
+        .unwrap();
+    let document = chart.export_state_json().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(
+        value["chart_options"]["crosshair"]["shadeRight"]["visible"],
+        true
+    );
+
+    let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+    restored.import_state_json(&document).unwrap();
+    let shade = &restored.options.get().crosshair.shade_right;
+    assert!(shade.visible);
+    assert_eq!(shade.color, "rgba(1, 2, 3, 0.5)");
+    assert_eq!(restored.export_state_json().unwrap(), document);
+}
+
+#[test]
 fn crosshair_label_visibility_and_background_flow_from_options() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Line;
@@ -5540,6 +5591,11 @@ fn series_options_json_covers_the_ts_field_set() {
         "area_bottom_color",
         "histogram_updown",
         "baseline_value",
+        "baseline_mode",
+        "baseline_line_visible",
+        "baseline_line_color",
+        "baseline_line_width",
+        "baseline_line_style",
         "point_markers",
         "last_price_animation",
         "visible",
@@ -5566,6 +5622,11 @@ fn series_options_json_covers_the_ts_field_set() {
     assert_eq!(options["line_type"], "simple");
     assert_eq!(options["histogram_updown"], false);
     assert_eq!(options["baseline_value"], serde_json::Value::Null);
+    assert_eq!(options["baseline_mode"], "visible_midpoint");
+    assert_eq!(options["baseline_line_visible"], false);
+    assert_eq!(options["baseline_line_color"], "");
+    assert_eq!(options["baseline_line_width"], 1.0);
+    assert_eq!(options["baseline_line_style"], 2);
     assert_eq!(options["point_markers"], false);
     assert_eq!(options["last_price_animation"], false);
     assert_eq!(options["visible"], true);
@@ -5754,6 +5815,11 @@ fn series_apply_options_json_round_trips_all_new_fields() {
         "bottom_line_color": "#101112",
         "bottom_line_width": 6,
         "bottom_line_style": 3,
+        "baseline_mode": "close_before_visible_range",
+        "baseline_line_visible": true,
+        "baseline_line_color": "#131415",
+        "baseline_line_width": 2.5,
+        "baseline_line_style": 0,
         "base": 42.5,
         "invert_filled_area": true,
         "open_visible": false,
@@ -5792,6 +5858,11 @@ fn series_apply_options_json_round_trips_all_new_fields() {
     assert_eq!(options["bottom_line_color"], "#101112");
     assert_eq!(options["bottom_line_width"], 6.0);
     assert_eq!(options["bottom_line_style"], 3);
+    assert_eq!(options["baseline_mode"], "close_before_visible_range");
+    assert_eq!(options["baseline_line_visible"], true);
+    assert_eq!(options["baseline_line_color"], "#131415");
+    assert_eq!(options["baseline_line_width"], 2.5);
+    assert_eq!(options["baseline_line_style"], 0);
     assert_eq!(options["base"], 42.5);
     assert_eq!(options["invert_filled_area"], true);
     assert_eq!(options["open_visible"], false);
@@ -5810,13 +5881,110 @@ fn series_apply_options_json_round_trips_all_new_fields() {
     // "" clears a pinned color, null restores an auto/follow numeric slot.
     assert!(chart.series_apply_options_json(
         0,
-        r#"{"price_line_color": "", "point_markers_radius": null, "top_line_width": null}"#
+        r#"{"price_line_color": "", "point_markers_radius": null, "top_line_width": null,
+            "baseline_line_color": null}"#
     ));
     let options: serde_json::Value =
         serde_json::from_str(&chart.series_options_json(0).unwrap()).unwrap();
     assert_eq!(options["price_line_color"], "");
     assert_eq!(options["point_markers_radius"], serde_json::Value::Null);
     assert_eq!(options["top_line_width"], serde_json::Value::Null);
+    assert_eq!(options["baseline_line_color"], "");
+
+    // Wrong types and out-of-range values leave the baseline line keys untouched.
+    assert!(chart.series_apply_options_json(
+        0,
+        r#"{"baseline_mode": "previous_close", "baseline_line_visible": 1,
+            "baseline_line_width": 0, "baseline_line_style": 9, "baseline_line_color": 7}"#
+    ));
+    let options: serde_json::Value =
+        serde_json::from_str(&chart.series_options_json(0).unwrap()).unwrap();
+    assert_eq!(options["baseline_mode"], "close_before_visible_range");
+    assert_eq!(options["baseline_line_visible"], true);
+    assert_eq!(options["baseline_line_width"], 2.5);
+    assert_eq!(options["baseline_line_style"], 0);
+    assert_eq!(options["baseline_line_color"], "");
+}
+
+#[test]
+fn style_reset_restores_the_baseline_line_and_keeps_the_baseline_mode() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Baseline;
+    assert!(chart.series_apply_options_json(
+        0,
+        r##"{"baseline_mode": "close_before_visible_range", "baseline_line_visible": true,
+            "baseline_line_color": "#131415", "baseline_line_width": 3, "baseline_line_style": 1}"##
+    ));
+    chart.reset_style_to_defaults();
+    let series = &chart.series[0];
+    assert_eq!(series.baseline_mode, BaselineMode::CloseBeforeVisibleRange);
+    assert!(!series.baseline_line_visible);
+    assert_eq!(series.baseline_line_color, None);
+    assert_eq!(series.baseline_line_width, 1.0);
+    assert_eq!(series.baseline_line_style, 2);
+}
+
+#[test]
+fn series_baseline_price_reports_the_pinned_or_resolved_baseline_of_baseline_series_only() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = [1.0, 2.0, 3.0, 4.0];
+    let values = [10.0, 20.0, 25.0, 30.0];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+
+    // Not a Baseline series, unknown id, removed id: None.
+    assert_eq!(chart.series_baseline_price(0), None);
+    assert_eq!(chart.series_baseline_price(99), None);
+    let extra = chart.add_series(SeriesKind::Baseline);
+    chart
+        .set_series_data(extra, &times, &values, &values, &values, &values)
+        .unwrap();
+    assert_eq!(chart.series_baseline_price(extra), Some(20.0));
+    chart.remove_series(extra);
+    assert_eq!(chart.series_baseline_price(extra), None);
+
+    // Auto midpoint, then the mode, then the pin; the pin wins over every mode.
+    chart.series[0].kind = SeriesKind::Baseline;
+    assert_eq!(chart.series_baseline_price(0), Some(20.0));
+    assert!(
+        chart.series_apply_options_json(0, r#"{"baseline_mode": "close_before_visible_range"}"#)
+    );
+    assert_eq!(chart.series_baseline_price(0), Some(10.0));
+    chart.set_lock_visible_logical_range(true);
+    chart.set_visible_logical_range(2.0, 3.0);
+    assert_eq!(chart.series_baseline_price(0), Some(20.0));
+    chart.series[0].baseline = Some(9.5);
+    assert_eq!(chart.series_baseline_price(0), Some(9.5));
+
+    // A shorter Baseline series with no row in a window another series keeps visible: the
+    // midpoint has nothing to average, the close before the window is its last close, and a pin
+    // reads back as set.
+    let short = chart.add_series(SeriesKind::Baseline);
+    chart
+        .set_series_data(
+            short,
+            &times[..2],
+            &values[..2],
+            &values[..2],
+            &values[..2],
+            &values[..2],
+        )
+        .unwrap();
+    chart.set_visible_logical_range(2.0, 3.0);
+    assert_eq!(chart.visible_range(), Some((2, 3)));
+    assert_eq!(chart.series_baseline_price(short), None);
+    assert!(chart
+        .series_apply_options_json(short, r#"{"baseline_mode": "close_before_visible_range"}"#));
+    assert_eq!(chart.series_baseline_price(short), Some(20.0));
+    chart.series[1].baseline = Some(7.0);
+    assert_eq!(chart.series_baseline_price(short), Some(7.0));
+
+    // No visible range yet: None.
+    let chart = ChartEngine::new(800.0, 500.0, 1.0);
+    assert_eq!(chart.series_baseline_price(0), None);
 }
 
 #[test]
@@ -6902,6 +7070,689 @@ fn pulse_advances_on_every_clock_tick_without_rebuilding_series_or_chrome() {
     // Rest phase: only the center point remains.
     chart.animation_time = 2000.0;
     assert_eq!(ring(&mut chart), None);
+}
+
+// ---- live-bar easing ----
+
+/// Ten candles (open 100 + i, high +2, low -2, close +1 at times 1..=10) with live-bar easing on.
+fn eased_candles(tau_ms: f64) -> ChartEngine {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.time_scale.set_width(800.0);
+    let times: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+    let open: Vec<f64> = (0..10).map(|i| 100.0 + i as f64).collect();
+    let high: Vec<f64> = open.iter().map(|v| v + 2.0).collect();
+    let low: Vec<f64> = open.iter().map(|v| v - 2.0).collect();
+    let close: Vec<f64> = open.iter().map(|v| v + 1.0).collect();
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    assert!(chart.series_apply_options_json(0, &format!(r#"{{"live_bar_easing_ms":{tau_ms}}}"#)));
+    chart.fit_content();
+    chart
+}
+
+/// The last bar as the frame draws it (`[open, high, low, close]`).
+fn displayed(chart: &ChartEngine, id: SeriesId) -> [f64; 4] {
+    let plot = chart.display_plot(id);
+    let row = plot.size() - 1;
+    [
+        PlotValueIndex::Open,
+        PlotValueIndex::High,
+        PlotValueIndex::Low,
+        PlotValueIndex::Close,
+    ]
+    .map(|index| plot.value_at(row, index))
+}
+
+const OLD_LAST: [f64; 4] = [109.0, 111.0, 107.0, 110.0];
+const NEW_LAST: [f64; 4] = [109.0, 115.0, 105.0, 114.0];
+
+fn between(value: f64, a: f64, b: f64) -> bool {
+    (a.min(b) < value) && (value < a.max(b))
+}
+
+#[test]
+fn live_bar_easing_option_round_trips_clamps_and_resets() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let options = |chart: &ChartEngine| -> serde_json::Value {
+        serde_json::from_str(&chart.series_options_json(0).unwrap()).unwrap()
+    };
+    assert_eq!(options(&chart)["live_bar_easing_ms"], 0.0);
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":250}"#));
+    assert_eq!(options(&chart)["live_bar_easing_ms"], 250.0);
+    // Clamped to the cap; negative, non-finite and non-numeric values are ignored.
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":5000}"#));
+    assert_eq!(
+        options(&chart)["live_bar_easing_ms"],
+        MAX_LIVE_BAR_EASING_MS
+    );
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":-1}"#));
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":"fast"}"#));
+    assert_eq!(
+        options(&chart)["live_bar_easing_ms"],
+        MAX_LIVE_BAR_EASING_MS
+    );
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":0}"#));
+    assert_eq!(options(&chart)["live_bar_easing_ms"], 0.0);
+    // Style class: a style reset turns it off.
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":80}"#));
+    chart.reset_style_to_defaults();
+    assert_eq!(options(&chart)["live_bar_easing_ms"], 0.0);
+}
+
+#[test]
+fn a_same_time_replace_glides_toward_the_new_values_on_pinned_clocks() {
+    let mut chart = eased_candles(100.0);
+    assert_eq!(displayed(&chart, 0), OLD_LAST);
+    assert!(!chart.live_bar_easing_active());
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    // Unsettled, but no clock has advanced: the frame still shows the old values.
+    assert!(chart.live_bar_easing_active());
+    assert!(chart.animation_active());
+    assert_eq!(displayed(&chart, 0), OLD_LAST);
+    // The first clock after the transition only stamps the base.
+    chart.set_animation_time(0.0);
+    assert_eq!(displayed(&chart, 0), OLD_LAST);
+    chart.set_animation_time(50.0);
+    let first = displayed(&chart, 0);
+    assert_eq!(first[0], NEW_LAST[0], "open never eases");
+    for channel in 1..4 {
+        assert!(
+            between(first[channel], OLD_LAST[channel], NEW_LAST[channel]),
+            "channel {channel}: {first:?}"
+        );
+    }
+    chart.set_animation_time(100.0);
+    let second = displayed(&chart, 0);
+    for channel in 1..4 {
+        assert!(
+            between(second[channel], first[channel], NEW_LAST[channel]),
+            "monotone toward the target: {first:?} -> {second:?}"
+        );
+    }
+    // Exact exponential approach: x += (target - x) * (1 - exp(-dt / tau)).
+    let expected = OLD_LAST[3] + (NEW_LAST[3] - OLD_LAST[3]) * (1.0 - (-50.0f64 / 100.0).exp());
+    assert!(
+        (first[3] - expected).abs() < 1e-12,
+        "{first:?} vs {expected}"
+    );
+    // Queries, snapshots and the data API read the real values throughout.
+    assert_eq!(chart.series_data(0).last().unwrap().close, NEW_LAST[3]);
+    let snapshot = chart.value_snapshot(None);
+    assert_eq!(snapshot[0].close, Some(NEW_LAST[3]));
+    assert_eq!(snapshot[0].high, Some(NEW_LAST[1]));
+    assert_eq!(
+        chart.data.plot(0).value_at(9, PlotValueIndex::Close),
+        NEW_LAST[3]
+    );
+}
+
+#[test]
+fn a_new_bar_snaps_the_live_bar() {
+    let mut chart = eased_candles(100.0);
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(30.0);
+    assert!(chart.live_bar_easing_active());
+    let next = [114.0, 116.0, 113.0, 115.0];
+    assert!(chart.update_series_bar(0, 11.0, next));
+    assert_eq!(displayed(&chart, 0), next);
+    assert!(!chart.live_bar_easing_active());
+    // The previous bar reads its final real values (no override lingers on row 9).
+    assert_eq!(
+        chart.display_plot(0).value_at(9, PlotValueIndex::Close),
+        NEW_LAST[3]
+    );
+}
+
+#[test]
+fn reduced_motion_snaps_instead_of_gliding() {
+    let mut chart = eased_candles(100.0);
+    let mut options = chart.interaction_options();
+    options.reduced_motion = true;
+    chart.set_interaction_options(options);
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    assert!(!chart.live_bar_easing_active());
+    assert!(!advance_changes_display(&mut chart));
+}
+
+/// Whether an advance at a fresh clock moved any series' display.
+fn advance_changes_display(chart: &mut ChartEngine) -> bool {
+    let shown = |chart: &ChartEngine| -> Vec<[f64; 4]> {
+        chart
+            .series
+            .iter()
+            .map(|s| displayed(chart, s.id))
+            .collect()
+    };
+    let before = shown(chart);
+    let advanced = chart.advance_live_bar_easing(chart.animation_time + 16.0);
+    advanced || before != shown(chart)
+}
+
+#[test]
+fn an_idle_gap_resumes_with_a_glide_instead_of_a_jump() {
+    let mut chart = eased_candles(100.0);
+    chart.set_animation_time(0.0);
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    // No frames for five seconds, then two frames at 60 Hz.
+    chart.set_animation_time(5016.0);
+    assert_eq!(displayed(&chart, 0), OLD_LAST);
+    chart.set_animation_time(5032.0);
+    let shown = displayed(&chart, 0);
+    for channel in 1..4 {
+        assert!(between(
+            shown[channel],
+            OLD_LAST[channel],
+            NEW_LAST[channel]
+        ));
+    }
+    let expected = OLD_LAST[3] + (NEW_LAST[3] - OLD_LAST[3]) * (1.0 - (-16.0f64 / 100.0).exp());
+    assert!((shown[3] - expected).abs() < 1e-12);
+    // One frame integrates at most 100 ms: a 200 ms stall inside the settle window takes one
+    // capped step instead of jumping.
+    chart.set_animation_time(5232.0);
+    let capped = displayed(&chart, 0);
+    let expected = shown[3] + (NEW_LAST[3] - shown[3]) * (1.0 - (-100.0f64 / 100.0).exp());
+    assert!((capped[3] - expected).abs() < 1e-12, "dt capped at 100 ms");
+    // Past six time constants since the last change the glide snaps, so a long stall after the
+    // last tick never leaves a stale bar on screen.
+    chart.set_animation_time(9000.0);
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    assert!(!chart.live_bar_easing_active());
+}
+
+#[test]
+fn a_sixty_hertz_feed_never_freezes_the_glide() {
+    let mut chart = eased_candles(100.0);
+    chart.set_animation_time(0.0);
+    let mut clock = 0.0;
+    let mut previous = OLD_LAST[3];
+    for tick in 1..=60 {
+        let close = 110.0 + tick as f64 * 0.1;
+        assert!(chart.update_series_bar(0, 10.0, [109.0, close + 1.0, 107.0, close]));
+        clock += 1000.0 / 60.0;
+        chart.set_animation_time(clock);
+        let shown = displayed(&chart, 0)[3];
+        if tick >= 2 {
+            assert!(
+                shown > previous && shown < close,
+                "frame {tick}: {previous} -> {shown} (target {close})"
+            );
+        }
+        previous = shown;
+    }
+    assert!(chart.live_bar_easing_active());
+}
+
+#[test]
+fn the_glide_settles_by_six_tau_and_by_epsilon() {
+    // By time: six time constants after the first stamped clock.
+    let mut chart = eased_candles(100.0);
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    chart.set_animation_time(1000.0);
+    let mut clock = 1000.0;
+    while clock < 1500.0 {
+        clock += 100.0;
+        chart.set_animation_time(clock);
+        assert!(chart.live_bar_easing_active(), "clock {clock}");
+        assert_ne!(displayed(&chart, 0), NEW_LAST);
+    }
+    chart.set_animation_time(1600.0);
+    assert_eq!(displayed(&chart, 0), NEW_LAST, "snaps exactly at 6 tau");
+    assert!(!chart.live_bar_easing_active());
+    assert!(!chart.animation_active());
+    // By epsilon: a tiny change settles on the first advance.
+    let mut chart = eased_candles(100.0);
+    let tiny = [109.0, 111.0, 107.0, 110.0 + 1e-9];
+    assert!(chart.update_series_bar(0, 10.0, tiny));
+    chart.set_animation_time(0.0);
+    assert!(chart.live_bar_easing_active());
+    chart.set_animation_time(16.0);
+    assert_eq!(displayed(&chart, 0), tiny);
+    assert!(!chart.live_bar_easing_active());
+}
+
+#[test]
+fn a_rust_host_advancing_only_the_easing_clock_leaves_the_pulse_at_phase_zero() {
+    let mut chart = eased_candles(100.0);
+    chart.convert_series_kind(0, SeriesKind::Line);
+    assert!(chart.last_price_pulse_active());
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert!(
+        !chart.advance_live_bar_easing(10.0),
+        "the first clock only stamps"
+    );
+    assert!(chart.advance_live_bar_easing(26.0));
+    assert_eq!(
+        chart.animation_time, 0.0,
+        "GPUI never moves the pulse clock"
+    );
+    assert!(chart.animation_frame_requested());
+    // A settled chart requests no frame; an advance with nothing unsettled changes nothing.
+    chart.advance_live_bar_easing(5000.0);
+    assert!(!chart.live_bar_easing_active());
+    assert!(!chart.animation_frame_requested());
+    assert!(!chart.advance_live_bar_easing(5016.0));
+}
+
+#[test]
+fn a_stamp_only_tick_builds_nothing_and_an_advance_skips_autoscale() {
+    let mut chart = eased_candles(100.0);
+    chart.build_frame();
+    // Nothing unsettled and no pulse: the clock is not even written.
+    chart.set_animation_time(10.0);
+    assert_eq!(chart.animation_time, 0.0);
+    chart.build_frame();
+    assert_eq!(
+        chart.frame_build_stats(),
+        crate::frame::FrameBuildStats::default()
+    );
+
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    chart.build_frame();
+    let tick = chart.frame_build_stats();
+    assert_eq!(tick.autoscale_runs, 1, "the tick re-runs autoscale once");
+    assert_eq!(tick.series_rebuilds, 1);
+    // The stamp frame: no display change, nothing rebuilt.
+    chart.set_animation_time(100.0);
+    chart.build_frame();
+    assert_eq!(
+        chart.frame_build_stats(),
+        crate::frame::FrameBuildStats::default()
+    );
+    // Advance frames rebuild the eased series layer and chrome, never autoscale or the grid.
+    for clock in [116.0, 132.0, 148.0, 164.0] {
+        chart.set_animation_time(clock);
+        chart.build_frame();
+        let stats = chart.frame_build_stats();
+        assert_eq!(stats.autoscale_runs, 0, "clock {clock}");
+        assert_eq!(stats.grid_rebuilds, 0);
+        assert_eq!(stats.layout_rebuilds, 0);
+        assert_eq!(stats.drawing_rebuilds, 0);
+        assert_eq!(stats.series_rebuilds, 1);
+        assert_eq!(stats.overlay_rebuilds, 1);
+    }
+}
+
+#[test]
+fn a_replay_cutoff_keys_the_glide_on_the_drawn_bar() {
+    let mut chart = eased_candles(100.0);
+    let clock = |seconds: i64| Some(seconds * 1_000_000);
+    chart.set_replay_clock_micros(clock(5)).unwrap();
+    assert_eq!(chart.display_plot(0).size(), 5);
+    // A tick on the canonical tail past the clock never unsettles the drawn bar (row 4, time 5).
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert!(!chart.live_bar_easing_active());
+    // A same-time replace of the drawn bar glides.
+    let drawn = [104.0, 108.0, 100.0, 107.0];
+    assert!(chart.update_series_bar(0, 5.0, drawn));
+    assert!(chart.live_bar_easing_active());
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(40.0);
+    let shown = displayed(&chart, 0);
+    assert!(between(shown[3], 105.0, drawn[3]));
+    assert_eq!(
+        chart.display_plot(0).value_at(4, PlotValueIndex::Close),
+        shown[3]
+    );
+    // Advancing the clock changes the drawn row: snap, nothing left gliding.
+    chart.set_replay_clock_micros(clock(6)).unwrap();
+    assert_eq!(chart.display_plot(0).size(), 6);
+    assert!(!chart.live_bar_easing_active());
+    assert_eq!(
+        chart.display_plot(0).value_at(4, PlotValueIndex::Close),
+        drawn[3]
+    );
+    assert_eq!(displayed(&chart, 0), [105.0, 107.0, 103.0, 106.0]);
+}
+
+#[test]
+fn an_as_of_overlay_glides_on_a_same_row_replace_and_snaps_on_a_new_row() {
+    const DAY: f64 = 86_400.0;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.time_scale.set_width(800.0);
+    let hk_times: Vec<f64> = [1.0, 2.0, 3.0, 5.0, 6.0].map(|d| d * DAY).to_vec();
+    let hk = [100.0, 101.0, 102.0, 103.0, 104.0];
+    chart
+        .set_series_data(0, &hk_times, &hk, &hk, &hk, &hk)
+        .unwrap();
+    let us = chart.add_series(SeriesKind::Line);
+    let us_times: Vec<f64> = [1.0, 2.0, 4.0].map(|d| d * DAY).to_vec();
+    let us_close = [4000.0, 4040.0, 4100.0];
+    chart
+        .set_series_data(us, &us_times, &us_close, &us_close, &us_close, &us_close)
+        .unwrap();
+    chart
+        .set_series_time_alignment(
+            us,
+            TimeAlignment::AsOf {
+                max_staleness: None,
+            },
+        )
+        .unwrap();
+    assert!(chart.series_apply_options_json(us, r#"{"live_bar_easing_ms":100}"#));
+    chart.fit_content();
+    // US d4 backs HK d5 and d6: both plot rows show canonical row 2.
+    let plot = chart.display_plot(us);
+    assert_eq!(plot.size(), 5);
+    assert_eq!(plot.source_row(3), 2);
+    assert_eq!(plot.source_row(4), 2);
+    // A same-row replace glides on every plot row showing that canonical row.
+    assert!(chart.update_series_bar(us, 4.0 * DAY, [4200.0; 4]));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(50.0);
+    let plot = chart.display_plot(us);
+    let shown = plot.value_at(4, PlotValueIndex::Close);
+    assert!(between(shown, 4100.0, 4200.0));
+    assert_eq!(plot.value_at(3, PlotValueIndex::Close), shown);
+    assert_eq!(plot.value_at(2, PlotValueIndex::Close), 4040.0);
+    assert_eq!(
+        chart.data.plot(us).value_at(4, PlotValueIndex::Close),
+        4200.0,
+        "the canonical view is untouched"
+    );
+    // A new US row (d6) adds no time point but changes the drawn canonical row: snap.
+    assert!(chart.update_series_bar(us, 6.0 * DAY, [4300.0; 4]));
+    assert!(!chart.live_bar_easing_active());
+    let plot = chart.display_plot(us);
+    assert_eq!(plot.value_at(4, PlotValueIndex::Close), 4300.0);
+    assert_eq!(plot.value_at(3, PlotValueIndex::Close), 4200.0);
+}
+
+#[test]
+fn a_same_time_reinstall_and_a_pop_snap_the_live_bar() {
+    let mut chart = eased_candles(100.0);
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(30.0);
+    assert!(chart.live_bar_easing_active());
+    // The same ten times again with the final values: no glide from stale values.
+    let times: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+    let open: Vec<f64> = (0..10).map(|i| 100.0 + i as f64).collect();
+    let mut high: Vec<f64> = open.iter().map(|v| v + 2.0).collect();
+    let mut low: Vec<f64> = open.iter().map(|v| v - 2.0).collect();
+    let mut close: Vec<f64> = open.iter().map(|v| v + 1.0).collect();
+    high[9] = NEW_LAST[1];
+    low[9] = NEW_LAST[2];
+    close[9] = NEW_LAST[3];
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    assert!(!chart.live_bar_easing_active());
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    // A tick after the reinstall glides from the reinstalled values, not from older ones.
+    assert!(chart.update_series_bar(0, 10.0, [109.0, 120.0, 105.0, 118.0]));
+    chart.set_animation_time(100.0);
+    chart.set_animation_time(150.0);
+    let shown = displayed(&chart, 0);
+    assert!(between(shown[3], NEW_LAST[3], 118.0));
+    // Popping the drawn bar snaps onto the new last row.
+    assert_eq!(chart.series_pop(0, 1), Some(9));
+    assert!(!chart.live_bar_easing_active());
+    assert_eq!(displayed(&chart, 0), [108.0, 110.0, 106.0, 109.0]);
+}
+
+#[test]
+fn heikin_ashi_easing_keeps_autoscale_and_the_base_value_canonical() {
+    let mut chart = eased_candles(100.0);
+    chart.series[0].heikin_ashi = true;
+    chart.build_frame();
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    chart.build_frame();
+    let canonical_last = chart.heikin_ashi_row(0, 9).unwrap();
+    let base = chart.series_base_value(0, 0).unwrap();
+    chart.set_animation_time(0.0);
+    chart.build_frame();
+    for clock in [16.0, 32.0, 48.0] {
+        chart.set_animation_time(clock);
+        chart.build_frame();
+        let stats = chart.frame_build_stats();
+        assert_eq!(stats.autoscale_runs, 0, "clock {clock}");
+        assert_eq!(stats.series_rebuilds, 1);
+        // The drawn Heikin Ashi row follows the eased raw values; the cache stays canonical.
+        let plot = chart.display_plot(0);
+        let drawn = chart.display_heikin_ashi_row(0, plot, 9).unwrap();
+        assert_ne!(drawn, canonical_last);
+        assert_eq!(chart.heikin_ashi_row(0, 9), Some(canonical_last));
+        let raw = displayed(&chart, 0);
+        assert_eq!(drawn[3], (raw[0] + raw[1] + raw[2] + raw[3]) / 4.0);
+        let previous = chart.heikin_ashi_row(0, 8).unwrap();
+        assert_eq!(drawn[0], (previous[0] + previous[3]) / 2.0);
+        assert_eq!(chart.series_base_value(0, 0), Some(base));
+    }
+    chart.set_animation_time(5000.0);
+    assert_eq!(
+        chart.display_heikin_ashi_row(0, chart.display_plot(0), 9),
+        Some(canonical_last),
+        "settled: the display row equals the cached row"
+    );
+}
+
+#[test]
+fn heikin_ashi_easing_carries_the_previous_row_across_whitespace() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.time_scale.set_width(800.0);
+    let nan = f64::NAN;
+    chart
+        .set_series_data(
+            0,
+            &[1.0, 2.0, 3.0],
+            &[10.0, nan, 14.0],
+            &[14.0, nan, 18.0],
+            &[8.0, nan, 12.0],
+            &[12.0, nan, 16.0],
+        )
+        .unwrap();
+    chart.series[0].heikin_ashi = true;
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":100}"#));
+    assert!(chart.update_series_bar(0, 3.0, [14.0, 20.0, 12.0, 18.0]));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(50.0);
+    let plot = chart.display_plot(0);
+    let drawn = chart.display_heikin_ashi_row(0, plot, 2).unwrap();
+    let first = chart.heikin_ashi_row(0, 0).unwrap();
+    assert_eq!(drawn[0], (first[0] + first[3]) / 2.0, "row 1 is whitespace");
+    let raw = displayed(&chart, 0);
+    assert_eq!(drawn[3], (raw[0] + raw[1] + raw[2] + raw[3]) / 4.0);
+    assert!(chart
+        .heikin_ashi_row(0, 1)
+        .unwrap()
+        .iter()
+        .all(|v| v.is_nan()));
+}
+
+#[test]
+fn heikin_ashi_easing_skips_a_partially_nan_row_like_the_cached_rebuild() {
+    // A row that is not whitespace but not finite either projects to NaN and is skipped by the
+    // cached rebuild; the display path must step over it the same way, or the drawn open jumps
+    // when the glide settles. Only the pre-validated installer can land such a row.
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.time_scale.set_width(800.0);
+    let nan = f64::NAN;
+    assert!(chart.install_series_data(
+        0,
+        vec![1, 2, 3],
+        vec![10.0, 10.0, 14.0],
+        vec![14.0, nan, 18.0],
+        vec![8.0, 8.0, 12.0],
+        vec![12.0, 12.0, 16.0],
+    ));
+    chart.series[0].heikin_ashi = true;
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":100}"#));
+    assert!(chart.update_series_bar(0, 3.0, [14.0, 20.0, 12.0, 18.0]));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(50.0);
+    assert!(chart.live_bar_easing_active());
+    let first = chart.heikin_ashi_row(0, 0).unwrap();
+    let drawn = chart
+        .display_heikin_ashi_row(0, chart.display_plot(0), 2)
+        .unwrap();
+    assert_eq!(
+        drawn[0],
+        (first[0] + first[3]) / 2.0,
+        "the partially NaN row 1 is skipped, as the rebuild skips it"
+    );
+    chart.set_animation_time(5000.0);
+    assert!(!chart.live_bar_easing_active());
+    let settled = chart.heikin_ashi_row(0, 2).unwrap();
+    assert_eq!(
+        chart.display_heikin_ashi_row(0, chart.display_plot(0), 2),
+        Some(settled)
+    );
+    assert_eq!(settled[0], drawn[0], "the open does not jump on settle");
+}
+
+#[test]
+fn a_backwards_host_clock_restarts_the_glide_epoch_instead_of_pinning_it() {
+    // An adapter whose clock restarts below the stored base (a new adapter instance, a switched
+    // clock source) must not leave the glide unsettled forever with frames requested.
+    let mut chart = eased_candles(100.0);
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert!(!chart.advance_live_bar_easing(1000.0), "stamp only");
+    assert!(chart.advance_live_bar_easing(1016.0));
+    let before = displayed(&chart, 0);
+    assert!(
+        !chart.advance_live_bar_easing(5.0),
+        "a backwards clock never advances"
+    );
+    assert_eq!(displayed(&chart, 0), before);
+    assert!(chart.live_bar_easing_active());
+    assert!(
+        chart.advance_live_bar_easing(21.0),
+        "the new epoch glides again"
+    );
+    let after = displayed(&chart, 0);
+    for channel in 1..4 {
+        assert!(
+            between(after[channel], before[channel], NEW_LAST[channel]),
+            "channel {channel}: {before:?} -> {after:?}"
+        );
+    }
+    assert!(chart.advance_live_bar_easing(7000.0));
+    assert_eq!(
+        displayed(&chart, 0),
+        NEW_LAST,
+        "settles six tau into the new epoch"
+    );
+    assert!(!chart.live_bar_easing_active());
+    assert!(!chart.animation_frame_requested());
+}
+
+#[test]
+fn a_render_cutoff_hiding_the_last_bar_never_eases_it() {
+    let mut chart = eased_candles(100.0);
+    chart.set_series_render_before_time(0, Some(10));
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert!(
+        !chart.live_bar_easing_active(),
+        "an undrawn bar never glides"
+    );
+    assert!(!chart.animation_frame_requested());
+    assert!(!chart.animation_active());
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    assert!(!chart.advance_live_bar_easing(16.0));
+    // Revealing the bar again shows its real values; the next same-time tick glides from them.
+    chart.set_series_render_before_time(0, None);
+    assert!(!chart.live_bar_easing_active());
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    let next = [109.0, 120.0, 105.0, 118.0];
+    assert!(chart.update_series_bar(0, 10.0, next));
+    chart.set_animation_time(100.0);
+    chart.set_animation_time(150.0);
+    assert!(between(displayed(&chart, 0)[3], NEW_LAST[3], next[3]));
+}
+
+#[test]
+fn a_reinstall_trimmed_to_the_retention_cap_keeps_the_next_tick_gliding() {
+    let mut chart = eased_candles(100.0);
+    assert!(chart.set_series_max_points(0, Some(8)));
+    // Ten rows land, the cap trims the front: the easing state must key to the trimmed row set.
+    let times: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+    let open: Vec<f64> = (0..10).map(|i| 100.0 + i as f64).collect();
+    let high: Vec<f64> = open.iter().map(|v| v + 2.0).collect();
+    let low: Vec<f64> = open.iter().map(|v| v - 2.0).collect();
+    let close: Vec<f64> = open.iter().map(|v| v + 1.0).collect();
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    assert!(
+        chart.series_data(0).len() < 10,
+        "the cap trimmed the install"
+    );
+    // The tick lands before any frame re-reads the drawn row (a `setData` + `update` in one task).
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert!(
+        chart.live_bar_easing_active(),
+        "a same-time tick after the trimmed install glides"
+    );
+    assert_eq!(displayed(&chart, 0), OLD_LAST);
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(50.0);
+    let shown = displayed(&chart, 0);
+    for channel in 1..4 {
+        assert!(
+            between(shown[channel], OLD_LAST[channel], NEW_LAST[channel]),
+            "{shown:?}"
+        );
+    }
+}
+
+#[test]
+fn a_historical_correction_during_a_glide_leaves_the_drawn_bar_gliding() {
+    let mut chart = eased_candles(100.0);
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(30.0);
+    let mid = displayed(&chart, 0);
+    assert!(between(mid[3], OLD_LAST[3], NEW_LAST[3]));
+    // Correcting a bar far back changes nothing about the drawn row: no jump.
+    assert!(chart.update_series_bar(0, 2.0, [101.0, 104.0, 98.0, 102.5]));
+    assert_eq!(displayed(&chart, 0), mid);
+    assert!(chart.live_bar_easing_active());
+    chart.set_animation_time(60.0);
+    let later = displayed(&chart, 0);
+    assert!(
+        between(later[3], mid[3], NEW_LAST[3]),
+        "{mid:?} -> {later:?}"
+    );
+    assert_eq!(chart.series_data(0)[1].close, 102.5);
+    // Settled, a correction keeps the display on the real drawn row.
+    chart.set_animation_time(5000.0);
+    assert!(!chart.live_bar_easing_active());
+    assert!(chart.update_series_bar(0, 3.0, [102.0, 105.0, 99.0, 103.5]));
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    assert!(!chart.live_bar_easing_active());
+}
+
+#[test]
+fn a_non_finite_time_constant_written_by_a_rust_host_is_off() {
+    let mut chart = eased_candles(100.0);
+    chart.series[0].live_bar_easing_ms = f64::NAN;
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert!(!chart.live_bar_easing_active());
+    assert!(!chart.animation_frame_requested());
+    assert!(!chart.advance_live_bar_easing(16.0));
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    chart.series[0].live_bar_easing_ms = f64::INFINITY;
+    assert!(chart.update_series_bar(0, 10.0, OLD_LAST));
+    assert!(!chart.live_bar_easing_active());
+    assert_eq!(displayed(&chart, 0), OLD_LAST);
+    // Above the bound a Rust host glides with the bound's time constant, like the JSON path. The
+    // first tick after enabling keys the state to the drawn row (writes while off never tracked
+    // it), so the glide starts with the second same-time tick.
+    chart.series[0].live_bar_easing_ms = 5000.0;
+    assert!(chart.update_series_bar(0, 10.0, NEW_LAST));
+    assert!(!chart.live_bar_easing_active());
+    assert_eq!(displayed(&chart, 0), NEW_LAST);
+    let next = [109.0, 120.0, 105.0, 118.0];
+    assert!(chart.update_series_bar(0, 10.0, next));
+    assert!(chart.live_bar_easing_active());
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(100.0);
+    let expected = NEW_LAST[3] + (next[3] - NEW_LAST[3]) * (1.0 - (-100.0f64 / 1000.0).exp());
+    assert!((displayed(&chart, 0)[3] - expected).abs() < 1e-12);
 }
 
 // ---- primary-series removal + series ordering ----
@@ -8454,21 +9305,21 @@ fn unpinned_candles_follow_engine_theme_while_explicit_colors_stay_pinned() {
 
     chart.set_theme(ChartTheme::Light);
     assert_eq!(
-        chart.series_bar_color(&chart.series[0], 0, None),
+        chart.series_bar_color(&chart.series[0], chart.data.plot(0), 0, None),
         Color::parse_css(aeris_charts_core::style::LIGHT_MARKET_UP_CSS).unwrap()
     );
     assert_eq!(
-        chart.series_bar_color(&chart.series[0], 1, None),
+        chart.series_bar_color(&chart.series[0], chart.data.plot(0), 1, None),
         Color::parse_css(aeris_charts_core::style::LIGHT_MARKET_DOWN_CSS).unwrap()
     );
 
     chart.set_theme(ChartTheme::Dark);
     assert_eq!(
-        chart.series_bar_color(&chart.series[0], 0, None),
+        chart.series_bar_color(&chart.series[0], chart.data.plot(0), 0, None),
         Color::parse_css(aeris_charts_core::style::DARK_MARKET_UP_CSS).unwrap()
     );
     assert_eq!(
-        chart.series_bar_color(&chart.series[0], 1, None),
+        chart.series_bar_color(&chart.series[0], chart.data.plot(0), 1, None),
         Color::parse_css(aeris_charts_core::style::DARK_MARKET_DOWN_CSS).unwrap()
     );
 
@@ -8476,11 +9327,11 @@ fn unpinned_candles_follow_engine_theme_while_explicit_colors_stay_pinned() {
     chart.series[0].down_color = Some("#040506".into());
     chart.set_theme(ChartTheme::Light);
     assert_eq!(
-        chart.series_bar_color(&chart.series[0], 0, None),
+        chart.series_bar_color(&chart.series[0], chart.data.plot(0), 0, None),
         Color::rgb(1, 2, 3)
     );
     assert_eq!(
-        chart.series_bar_color(&chart.series[0], 1, None),
+        chart.series_bar_color(&chart.series[0], chart.data.plot(0), 1, None),
         Color::rgb(4, 5, 6)
     );
 }

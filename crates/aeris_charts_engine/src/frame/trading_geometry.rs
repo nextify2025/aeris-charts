@@ -1240,12 +1240,12 @@ impl ChartEngine {
         self.push_trading_tooltip_box(out, text, layout.x, y, layout.hpr, layout.vpr);
     }
 
-    fn trading_tooltip_height(font_size: f64) -> f64 {
+    pub(super) fn trading_tooltip_height(font_size: f64) -> f64 {
         font_size + 7.0
     }
 
     /// Tooltip chrome centered on `center_x` with its top edge at `y` (CSS px).
-    fn push_trading_tooltip_box(
+    pub(super) fn push_trading_tooltip_box(
         &self,
         out: &mut Vec<Prim>,
         text: &str,

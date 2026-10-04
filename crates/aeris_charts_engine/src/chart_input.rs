@@ -257,6 +257,8 @@ pub enum ChartHover {
     VolumeProfile(NativePrimitiveId),
     /// A general-series item; read it through [`ChartEngine::general_hovered_hit`].
     General,
+    /// A timeline-mark lane token; read it through [`ChartEngine::timeline_mark_hit_at`].
+    TimelineMark,
 }
 
 /// A secondary click resolved by the engine. Menus, clipboard, and order UI stay host-owned.
@@ -294,6 +296,9 @@ pub enum ChartInputEvent {
     RemoveSeries(SeriesId),
     /// Delta-tooltip comparison state changed; the host notifies its range subscribers.
     DeltaTooltipChanged,
+    /// A timeline-mark token was clicked. The resolved hit is retained under this sequence
+    /// number in a bounded ring: [`ChartEngine::timeline_mark_activation`].
+    TimelineMarkActivated(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -317,6 +322,8 @@ enum PressMode {
         dragging: bool,
     },
     Alert,
+    /// A press on a timeline-mark token; releasing in place activates it.
+    TimelineMark,
     DrawingCreation {
         capture: bool,
         committed_on_press: bool,
@@ -338,6 +345,7 @@ impl PressMode {
             Self::Separator { .. } => InputTarget::Separator,
             Self::Trading { .. } => InputTarget::Trading,
             Self::Alert => InputTarget::Alert,
+            Self::TimelineMark => InputTarget::TimelineMark,
             Self::Measure | Self::DrawingCreation { .. } | Self::DrawingDrag | Self::TextEditor => {
                 InputTarget::Drawing
             }
@@ -464,6 +472,7 @@ impl ChartEngine {
         self.set_hovered_text(None);
         self.set_hovered_drawing(None);
         self.clear_general_hover();
+        self.clear_timeline_hover();
         self.refresh_input_cursor();
     }
 
@@ -569,6 +578,7 @@ impl ChartEngine {
         {
             self.input.tooltip_deadline_ms = None;
             changed |= self.arm_trading_tooltip();
+            changed |= self.arm_timeline_tooltip();
         }
         if self
             .input
@@ -744,7 +754,11 @@ impl ChartEngine {
             moved: false,
             text_press_selected,
             control_pair: double_candidate
-                && (control_click || matches!(mode, PressMode::Trading { .. } | PressMode::Alert)),
+                && (control_click
+                    || matches!(
+                        mode,
+                        PressMode::Trading { .. } | PressMode::Alert | PressMode::TimelineMark
+                    )),
         };
         if self.drawing_text_edit().is_some() {
             if self.point_on_edited_text(x, y) {
@@ -1088,6 +1102,7 @@ impl ChartEngine {
                 PressMode::DrawingCreation { capture: false, .. }
                 | PressMode::Trading { dragging: false }
                 | PressMode::Alert
+                | PressMode::TimelineMark
                 | PressMode::Separator { .. }
                 | PressMode::TouchTracking
                 | PressMode::DeltaTooltip
@@ -1116,8 +1131,11 @@ impl ChartEngine {
             && input.timestamp_ms > 0.0
             && input.timestamp_ms.is_finite())
         .then_some((x, y, input.timestamp_ms));
-        self.input.control_click =
-            !moved && matches!(press.mode, PressMode::Trading { .. } | PressMode::Alert);
+        self.input.control_click = !moved
+            && matches!(
+                press.mode,
+                PressMode::Trading { .. } | PressMode::Alert | PressMode::TimelineMark
+            );
         let modifiers = drawing_modifiers(input.modifiers);
         let mut created_on_release = false;
         match press.mode {
@@ -1167,6 +1185,26 @@ impl ChartEngine {
             PressMode::Alert => {
                 if !moved && self.alert_create_hit_at(x, y) {
                     self.activate_alert_create_at(x, y);
+                }
+            }
+            PressMode::TimelineMark => {
+                // One outcome per click, and only when the same token is under the press and
+                // the release; the host reads the resolved hit by its sequence number.
+                if !moved {
+                    let profile = HitProfile::for_device(input.device);
+                    let start = self.timeline_mark_hit_at_with_profile(
+                        press.start.0,
+                        press.start.1,
+                        profile,
+                    );
+                    let end = self.timeline_mark_hit_at_with_profile(x, y, profile);
+                    if let Some((_, end)) = start
+                        .zip(end)
+                        .filter(|(start, end)| start.logical == end.logical)
+                    {
+                        let seq = self.push_timeline_activation(end);
+                        self.push_input_event(ChartInputEvent::TimelineMarkActivated(seq));
+                    }
                 }
             }
             PressMode::DrawingDrag => {
@@ -1915,6 +1953,14 @@ impl ChartEngine {
         if self.alert_create_hit_at(x, y) {
             return PressMode::Alert;
         }
+        // A mark token is an engine control like the chip above: it never clears the active
+        // order group and never reaches the drawing or pan arbitration below.
+        if self
+            .timeline_token_at(x, y, HitProfile::for_device(input.device))
+            .is_some()
+        {
+            return PressMode::TimelineMark;
+        }
         self.deactivate_trading_group();
         if self.active_drawing_tool().is_some() {
             let update = self.drawing_tool_pointer_down(x, y, modifiers);
@@ -1984,6 +2030,7 @@ impl ChartEngine {
                     && !control_pair
                     && self.trading_hit_at(x, y).is_none()
                     && !self.alert_create_hit_at(x, y)
+                    && !self.timeline_token_under(x, y)
                     && self.drawing_at(x, y) == selected;
                 match selected.filter(|_| owned) {
                     None => self.clear_brushable_ranges(),
@@ -2219,6 +2266,14 @@ impl ChartEngine {
             self.clear_general_hover();
             return ChartHover::None;
         };
+        // Lane tokens are pane chrome above every series and drawing.
+        if self.timeline_token_under(x, y) {
+            self.clear_general_hover();
+            self.set_hovered_series(None);
+            self.set_hovered_text(None);
+            self.set_hovered_drawing(None);
+            return ChartHover::TimelineMark;
+        }
         let general = self.update_general_hover(pane, x, y).is_some();
         if let Some(hit) = primitive.filter(|hit| hit.layer == HostPrimitiveLayer::Top) {
             self.clear_general_hover();
@@ -2317,12 +2372,33 @@ impl ChartEngine {
         // `resolve_pointer_hover`; the built-in candidates resolve here.
         self.input.host_primitive_cursor = false;
         self.input.hover = self.arbitrate_hover(x, y, None);
-        // Only a changed trading hover restarts the dwell; holding still lets it elapse.
+        // Only a changed trading hover restarts the dwell; holding still lets it elapse. A
+        // trading change under a still-hovered lane token (an order line crossing the lane)
+        // leaves the token's pending dwell alone; the token block below re-arms or clears it
+        // when the token itself changes.
         if !captured && self.set_trading_hover(x, y) {
             let on_close = self
                 .trading_hit_at(x, y)
                 .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton);
-            self.input.tooltip_deadline_ms = on_close.then_some(now_ms + TRADING_TOOLTIP_DWELL_MS);
+            self.input.tooltip_deadline_ms = if on_close {
+                Some(now_ms + TRADING_TOOLTIP_DWELL_MS)
+            } else if self.timeline_marks.hovered().is_some() {
+                self.input.tooltip_deadline_ms
+            } else {
+                None
+            };
+        }
+        // The timeline-mark title tooltip shares the dwell: a changed token restarts it, leaving
+        // a token clears it unless a close control still waits for its own.
+        if !captured && self.set_timeline_hover(x, y) {
+            if self.timeline_marks.hovered().is_some() {
+                self.input.tooltip_deadline_ms = Some(now_ms + TRADING_TOOLTIP_DWELL_MS);
+            } else if !self
+                .trading_hit_at(x, y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+            {
+                self.input.tooltip_deadline_ms = None;
+            }
         }
     }
 
@@ -2344,7 +2420,9 @@ impl ChartEngine {
                 PressMode::PriceAxis { .. } => return ChartCursor::ResizeVertical,
                 PressMode::Separator { .. } => return ChartCursor::ResizeRow,
                 PressMode::Trading { dragging: true } => return ChartCursor::VerticalGrabbing,
-                PressMode::Trading { dragging: false } | PressMode::Alert => {
+                PressMode::Trading { dragging: false }
+                | PressMode::Alert
+                | PressMode::TimelineMark => {
                     return ChartCursor::Pointer;
                 }
                 PressMode::TextEditor => return ChartCursor::Text,
@@ -2391,6 +2469,9 @@ impl ChartEngine {
         if self.alert_create_hit_at(x, y) {
             return ChartCursor::Pointer;
         }
+        if self.timeline_token_under(x, y) {
+            return ChartCursor::Pointer;
+        }
         if self.input.host_primitive_cursor {
             return ChartCursor::HostPrimitive;
         }
@@ -2414,6 +2495,8 @@ mod drawing_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod motion_tests;
+#[cfg(test)]
+mod timeline_tests;
 #[cfg(test)]
 mod trading_tests;
 

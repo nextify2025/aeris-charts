@@ -1409,7 +1409,7 @@ impl Probe {
     }
 
     fn needs_animation_frame(&self) -> bool {
-        self.frame_budget.is_some() || self.engine.input_animating()
+        self.frame_budget.is_some() || GpuiChartInput::animating(&self.engine)
     }
 
     /// Common tail of every input listener: report engine requests in the status line, follow the
@@ -1437,6 +1437,12 @@ impl Probe {
                 }
                 ChartInputEvent::CrosshairLeft => "crosshair left".into(),
                 ChartInputEvent::DeltaTooltipChanged => "delta tooltip changed".into(),
+                ChartInputEvent::TimelineMarkActivated(seq) => {
+                    self.engine.timeline_mark_activation(seq).map_or_else(
+                        || "timeline mark activated".into(),
+                        |hit| format!("timeline mark: {}", hit.tooltip_text()),
+                    )
+                }
             };
         }
     }
@@ -4174,6 +4180,27 @@ mod semantic_regressions {
         interactive.engine.start_scroll_animation(3.0, 160.0, 0.0);
         assert!(interactive.needs_animation_frame());
         assert!(Probe::new(8, Some(2)).needs_animation_frame());
+
+        // A gliding live bar requests frames until it settles; a settled one is idle again.
+        let mut eased = Probe::new(8, None);
+        assert!(eased
+            .engine
+            .series_apply_options_json(0, r#"{"live_bar_easing_ms":100}"#));
+        assert!(!eased.needs_animation_frame());
+        let last = eased.source_bars.times.len() - 1;
+        let bar = [
+            eased.source_bars.open[last],
+            eased.source_bars.high[last] + 1.0,
+            eased.source_bars.low[last],
+            eased.source_bars.close[last] + 0.5,
+        ];
+        assert!(eased
+            .engine
+            .update_series_bar(0, eased.source_bars.times[last], bar));
+        assert!(eased.needs_animation_frame());
+        eased.engine.advance_live_bar_easing(0.0);
+        eased.engine.advance_live_bar_easing(5_000.0);
+        assert!(!eased.needs_animation_frame());
     }
 
     #[test]
@@ -4980,6 +5007,108 @@ mod window_input_tests {
             "the chart leaves keys it does not bind to its parent"
         );
         assert_eq!(engine(&cx, &chart, ChartEngine::bar_spacing), spacing);
+    }
+
+    /// Top device y of the rightmost candle body in the probe's frame: the drawn close while the
+    /// bar closes above its open.
+    fn last_body_top(probe: &Probe) -> i32 {
+        probe.frame.panes[0]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::Rect { rect, .. } | Prim::RectFrame { rect, .. } => {
+                    Some((rect.x + rect.w, rect.y))
+                }
+                _ => None,
+            })
+            .max_by_key(|&(right, _)| right)
+            .map(|(_, top)| top)
+            .expect("the frame draws candle bodies")
+    }
+
+    /// Repaint the chart the way a host does after it changed engine state.
+    fn present(cx: &mut VisualTestContext, chart: &Entity<Probe>) {
+        chart.update(cx, |probe, cx| cx.notify());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn an_eased_live_bar_moves_between_requested_frames_and_then_stops(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        // Scroll the live edge into view, enable easing on the main series, then replace its last
+        // bar in place with one that closes above its open, so the body top is the drawn close.
+        let close = chart.update(&mut cx, |probe, cx| {
+            let last = probe.source_bars.times.len() - 1;
+            probe
+                .engine
+                .set_visible_logical_range(last as f64 - 100.0, last as f64 + 1.0);
+            assert!(probe
+                .engine
+                .series_apply_options_json(0, r#"{"live_bar_easing_ms":500}"#));
+            let open = probe.source_bars.open[last];
+            let close = open.max(probe.source_bars.close[last]) + 8.0;
+            assert!(probe.engine.update_series_bar(
+                0,
+                probe.source_bars.times[last],
+                [open, close + 2.0, probe.source_bars.low[last], close]
+            ));
+            probe.dirty = true;
+            cx.notify();
+            close
+        });
+        cx.run_until_parked();
+        // The tick frame stamps the clock and still shows the old bar; the engine asks for more.
+        let stamped = chart.read_with(&cx, |probe, _| {
+            assert!(probe.needs_animation_frame());
+            last_body_top(probe)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        present(&mut cx, &chart);
+        let first = chart.read_with(&cx, |probe, _| {
+            assert!(probe.needs_animation_frame());
+            last_body_top(probe)
+        });
+        assert_ne!(
+            stamped, first,
+            "the drawn close moved between two requested frames"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        present(&mut cx, &chart);
+        let second = chart.read_with(&cx, |probe, _| last_body_top(probe));
+        assert_ne!(
+            first, second,
+            "and keeps moving while the glide is unsettled"
+        );
+        assert!(
+            (second < first) == (first < stamped),
+            "monotone toward the new close: {stamped} -> {first} -> {second}"
+        );
+        // Six time constants after the tick the glide settles and the chart goes idle. The time
+        // constant is long (500 ms, so a slow machine cannot settle the glide between the two
+        // presents above); settle by advancing the engine on the adapter's clock instead of
+        // sleeping six of them.
+        chart.update(&mut cx, |probe, cx| {
+            let settled_at = probe.input.now_ms() + 6.0 * 500.0;
+            assert!(probe.engine.advance_live_bar_easing(settled_at));
+            probe.dirty = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        present(&mut cx, &chart);
+        chart.read_with(&cx, |probe, _| {
+            assert!(!probe.engine.live_bar_easing_active());
+            assert!(!probe.needs_animation_frame());
+            let settled_y = probe
+                .engine
+                .series_price_to_coordinate(0, close)
+                .expect("the close is on the scale");
+            let expected = (settled_y * f64::from(probe.engine.dpr)).round() as i32;
+            assert!(
+                (last_body_top(probe) - expected).abs() <= 1,
+                "settled: the body top is the real close ({} vs {expected})",
+                last_body_top(probe)
+            );
+        });
     }
 
     #[gpui::test]

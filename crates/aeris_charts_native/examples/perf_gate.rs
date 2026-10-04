@@ -25,6 +25,13 @@
 //!   Target O — daily-reset studies on daily bars: report-only frame, Canvas2D call, rasterizer,
 //!              WebGPU scheduling, and hover cost of the per-bar segments a session-reset study
 //!              draws when every bar is its own period
+//!   Target P — live-bar easing on the Target A chart plus a `histogram_updown` volume: a
+//!              same-time tick of every series, one easing advance and the frame it rebuilds
+//!              (eased layers, the dependent volume layer, chrome, overlay and axis; never
+//!              autoscale) per 60 Hz iteration, median under 16.67 ms
+//!   Target Q — a full 4,096-mark timeline lane on the Target A chart: a one-bar pan plus the
+//!              frame it rebuilds under 16.67 ms, and the lane hit query (every pointer move runs
+//!              it for hover and cursor) in the sub-0.01 ms class
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
@@ -1133,6 +1140,7 @@ fn main() -> ExitCode {
     const KLINECHART_REPAIR_BUDGET_MS: f64 = 5.0;
 
     println!("aeris_charts perf gate (release build recommended)\n");
+    let (q_frame, q_hit);
 
     // ---- Target A: 60fps @ 10 series x 50k bars ---------------------------------------------
     let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
@@ -1159,6 +1167,150 @@ fn main() -> ExitCode {
     let per_frame_ms = start.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
     println!("Target A — 60fps @ {SERIES} series x {FRAME_BARS} bars:");
     let a_pass = report("build_frame", per_frame_ms, FRAME_BUDGET_MS);
+
+    // ---- Target P: live-bar easing frames on the same chart plus an up/down volume -----------
+    let volume = chart.add_series(SeriesKind::Histogram);
+    {
+        let (t, _, _, _, c) = gen_series(FRAME_BARS, 0.0);
+        let volumes: Vec<f64> = c.iter().map(|close| close * 1_000.0).collect();
+        chart
+            .set_series_data(volume, &t, &volumes, &volumes, &volumes, &volumes)
+            .expect("valid volume fixture");
+        chart.set_series_price_scale(volume, aeris_charts_engine::PriceScaleTarget::Overlay);
+        assert!(chart.series_apply_options_json(volume, r#"{"histogram_updown":true}"#));
+        for &id in &ids {
+            assert!(chart.series_apply_options_json(id, r#"{"live_bar_easing_ms":120}"#));
+        }
+    }
+    let last_bar: Vec<(f64, [f64; 4])> = ids
+        .iter()
+        .map(|&id| {
+            let point = chart.series_data(id).pop().expect("series has bars");
+            (
+                point.time as f64,
+                [point.open, point.high, point.low, point.close],
+            )
+        })
+        .collect();
+    chart.build_frame_into(&mut frame);
+    let mut samples = Vec::with_capacity(FRAMES);
+    let mut clock = 0.0;
+    chart.advance_live_bar_easing(clock);
+    // `frame_build_stats` describes the most recent build only, so sum it per iteration.
+    let (mut tick_autoscale_runs, mut tick_series_rebuilds) = (0, 0);
+    for iteration in 0..FRAMES {
+        let drift = (iteration as f64 + 1.0) * 0.05;
+        let started = Instant::now();
+        for (&id, &(time, [open, high, low, close])) in ids.iter().zip(&last_bar) {
+            chart.update_series_bar(id, time, [open, high + drift, low, close + drift]);
+        }
+        clock += 1000.0 / 60.0;
+        chart.advance_live_bar_easing(clock);
+        chart.build_frame_into(&mut frame);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        let stats = chart.frame_build_stats();
+        tick_autoscale_runs += stats.autoscale_runs;
+        tick_series_rebuilds += stats.series_rebuilds;
+    }
+    samples.sort_by(f64::total_cmp);
+    let p_median_ms = samples[samples.len() / 2];
+    // Advance-only frames (no tick): the glides are still unsettled (the target moved 16.67 ms
+    // ago, far inside six time constants), so every eased layer and the dependent up/down volume
+    // layer rebuild while autoscale never runs.
+    const ADVANCE_FRAMES: u64 = 4;
+    let (mut advance_autoscale_runs, mut advance_series_rebuilds) = (0, 0);
+    for _ in 0..ADVANCE_FRAMES {
+        clock += 1000.0 / 60.0;
+        assert!(
+            chart.advance_live_bar_easing(clock),
+            "the glides are unsettled after the feed"
+        );
+        chart.build_frame_into(&mut frame);
+        let stats = chart.frame_build_stats();
+        advance_autoscale_runs += stats.autoscale_runs;
+        advance_series_rebuilds += stats.series_rebuilds;
+    }
+    println!(
+        "Target P — live-bar easing @ {SERIES} series x {FRAME_BARS} bars + up/down volume, {FRAMES} ticks:"
+    );
+    let p_frame = report(
+        "tick + advance + build_frame (median)",
+        p_median_ms,
+        FRAME_BUDGET_MS,
+    );
+    let eased_layers = (SERIES as u64 + 1) * ADVANCE_FRAMES;
+    let p_no_autoscale = report_check(
+        "advance frames skip autoscale",
+        tick_autoscale_runs == FRAMES as u64
+            && advance_autoscale_runs == 0
+            && advance_series_rebuilds == eased_layers,
+        &format!(
+            "tick frames: autoscale_runs {tick_autoscale_runs} (one per tick), series_rebuilds \
+             {tick_series_rebuilds}; {ADVANCE_FRAMES} advance-only frames: autoscale_runs \
+             {advance_autoscale_runs}, series_rebuilds {advance_series_rebuilds} ({eased_layers} = \
+             eased layers + up/down volume)"
+        ),
+    );
+    println!("    Target A build_frame for comparison: {per_frame_ms:.2} ms");
+
+    // ---- Target Q: a full timeline-mark lane on the same chart -------------------------------
+    // The lane layout is rebuilt lazily per view change over the visible marks only; the hit query
+    // is a binary search over the laid-out tokens, never a walk over every mark.
+    {
+        use aeris_charts_engine::{
+            TimelineMark, TimelineMarkGlyph, TimelineMarkGroup, TimelineMarksSnapshot,
+            MAX_TIMELINE_MARKS,
+        };
+        let stride = FRAME_BARS / MAX_TIMELINE_MARKS;
+        let marks = (0..MAX_TIMELINE_MARKS)
+            .map(|index| TimelineMark {
+                id: format!("mark-{index}"),
+                time: (index * stride) as i64,
+                group: format!("group-{}", index % 8),
+                glyph: TimelineMarkGlyph {
+                    letter: "E".into(),
+                    ..TimelineMarkGlyph::default()
+                },
+                title: format!("Event {index}"),
+            })
+            .collect();
+        let groups = (0..8)
+            .map(|index| TimelineMarkGroup {
+                id: format!("group-{index}"),
+                label: format!("Group {index}"),
+            })
+            .collect();
+        chart
+            .set_timeline_marks(TimelineMarksSnapshot { marks, groups })
+            .expect("a full lane fits the caps");
+        chart.build_frame_into(&mut frame);
+        let mut samples = Vec::with_capacity(FRAMES);
+        for iteration in 0..FRAMES {
+            let started = Instant::now();
+            chart.set_right_offset(1.0 + iteration as f64);
+            chart.build_frame_into(&mut frame);
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        let q_median_ms = samples[samples.len() / 2];
+        const LANE_HOVERS: usize = 100;
+        let lane_y = chart.panes[0].top + chart.panes[0].height - 15.0;
+        let started = Instant::now();
+        for index in 0..LANE_HOVERS {
+            let x = 20.0 + index as f64 * (1500.0 / LANE_HOVERS as f64);
+            std::hint::black_box(chart.timeline_mark_hit_at(x, lane_y));
+        }
+        let q_hit_ms = started.elapsed().as_secs_f64() * 1000.0 / LANE_HOVERS as f64;
+        println!(
+            "Target Q — {MAX_TIMELINE_MARKS} timeline marks on the Target A chart, {FRAMES} one-bar pans:"
+        );
+        q_frame = report("pan + build_frame (median)", q_median_ms, FRAME_BUDGET_MS);
+        q_hit = report("timeline_mark_hit_at", q_hit_ms, INPUT_SAMPLE_BUDGET_MS);
+        chart
+            .set_timeline_marks(TimelineMarksSnapshot::default())
+            .expect("an empty lane is valid");
+    }
+    chart.remove_series(volume);
 
     // ---- Target B: 1M-bar load under 300 ms -------------------------------------------------
     let (t, o, h, l, c) = gen_series(LOAD_BARS, 0.0);
@@ -2460,6 +2612,10 @@ fn main() -> ExitCode {
     }
 
     let all_pass = a_pass
+        && p_frame
+        && p_no_autoscale
+        && q_frame
+        && q_hit
         && b_pass
         && c_pass
         && d_pass

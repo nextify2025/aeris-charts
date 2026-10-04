@@ -69,6 +69,7 @@ pub struct ValidatedStateV1 {
     drawings: Vec<Drawing>,
     drawing_anchor_times: HashMap<u32, Vec<Option<DrawingAnchorTime>>>,
     drawing_price_basis: Option<String>,
+    hidden_mark_groups: Vec<String>,
     max_drawing_id: u32,
     max_persistent_pane_id: u32,
     points: usize,
@@ -90,6 +91,9 @@ struct StateV1 {
     /// Host-defined price basis of the drawing prices (optional; no schema bump).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drawing_price_basis: Option<String>,
+    /// Hidden timeline-mark groups (optional; no schema bump). Marks themselves never persist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden_mark_groups: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -106,6 +110,8 @@ struct StateV2 {
     chart_options: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drawing_price_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden_mark_groups: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -118,6 +124,8 @@ struct StateV3 {
     indicators: Vec<IndicatorV3>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drawing_price_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden_mark_groups: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -660,6 +668,7 @@ impl ChartEngine {
             drawings: base.drawings,
             indicators,
             drawing_price_basis: base.drawing_price_basis,
+            hidden_mark_groups: base.hidden_mark_groups,
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
         if document.len() > PERSISTENCE_MAX_DOCUMENT_BYTES {
@@ -809,6 +818,7 @@ impl ChartEngine {
             panes,
             drawings,
             drawing_price_basis: self.drawing_price_basis().map(str::to_string),
+            hidden_mark_groups: self.hidden_timeline_groups(),
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))
     }
@@ -1187,6 +1197,7 @@ impl ChartEngine {
             references,
             chart_options: self.options.value().clone(),
             drawing_price_basis: base.drawing_price_basis,
+            hidden_mark_groups: base.hidden_mark_groups,
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
         if document.len() > PERSISTENCE_MAX_GENERAL_DOCUMENT_BYTES {
@@ -1604,11 +1615,13 @@ impl ChartEngine {
         {
             return Err(resource("drawing price basis is too large"));
         }
+        crate::timeline_marks::validate_hidden_groups(&state.hidden_mark_groups)?;
         Ok(ValidatedStateV1 {
             panes,
             drawings,
             drawing_anchor_times,
             drawing_price_basis,
+            hidden_mark_groups: state.hidden_mark_groups,
             max_drawing_id,
             max_persistent_pane_id,
             points: total_points,
@@ -1672,6 +1685,8 @@ impl ChartEngine {
         self.drawings = state.drawings;
         self.drawing_anchor_times = state.drawing_anchor_times;
         self.restore_drawing_time_identity(state.drawing_price_basis);
+        self.timeline_marks
+            .install_hidden_groups(state.hidden_mark_groups);
         self.next_pane_id = next_runtime;
         self.next_persistent_pane_id = state.max_persistent_pane_id + 1;
         self.next_drawing_id = state.max_drawing_id + 1;
@@ -1808,6 +1823,7 @@ impl ChartEngine {
             panes: state.panes,
             drawings: state.drawings,
             drawing_price_basis: state.drawing_price_basis.clone(),
+            hidden_mark_groups: state.hidden_mark_groups,
         })?;
         let mut resolved = Vec::with_capacity(state.indicators.len());
         let mut expected_outputs = Vec::with_capacity(state.indicators.len());
@@ -1971,6 +1987,7 @@ impl ChartEngine {
             panes: state.panes.into_iter().map(|pane| pane.pane).collect(),
             drawings: state.drawings,
             drawing_price_basis: state.drawing_price_basis,
+            hidden_mark_groups: state.hidden_mark_groups,
         })?;
         let mut staged = ChartEngine::new(self.css_width, self.css_height, self.dpr);
         staged.next_pane_id = self.next_pane_id;
@@ -2052,6 +2069,8 @@ impl ChartEngine {
         self.next_persistent_pane_id = staged.next_persistent_pane_id;
         self.next_drawing_id = staged.next_drawing_id;
         self.options = staged.options;
+        self.timeline_marks
+            .install_hidden_groups(std::mem::take(&mut staged.timeline_marks.hidden_groups));
         self.apply_prepared_options(&chart_options, prepared_options);
         // A document without exchange-time keys keeps the chart's installed zone and session
         // start; mirror a non-default one so the replaced options store still describes the live
@@ -4065,5 +4084,104 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn hidden_mark_groups_round_trip_v1_before_marks_exist() {
+        let mut source = ChartEngine::new(800.0, 500.0, 1.0);
+        source.set_timeline_group_hidden("news", true).unwrap();
+        source.set_timeline_group_hidden("dividends", true).unwrap();
+        let document = source.export_state_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["hidden_mark_groups"],
+            serde_json::json!(["dividends", "news"])
+        );
+        // A chart without hidden groups writes no key (byte-stable default documents).
+        assert!(!ChartEngine::new(800.0, 500.0, 1.0)
+            .export_state_json()
+            .unwrap()
+            .contains("hidden_mark_groups"));
+
+        // Hosts import first and set marks later: the hidden set is live before any mark.
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(restored.hidden_timeline_groups(), ["dividends", "news"]);
+        assert!(restored.timeline_marks().marks.is_empty());
+        restored
+            .set_timeline_marks(crate::TimelineMarksSnapshot {
+                marks: vec![crate::TimelineMark {
+                    id: "n".into(),
+                    time: 3_600,
+                    group: "news".into(),
+                    glyph: crate::TimelineMarkGlyph::default(),
+                    title: String::new(),
+                }],
+                groups: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(restored.hidden_timeline_groups(), ["dividends", "news"]);
+        assert_eq!(restored.export_state_json().unwrap(), document);
+    }
+
+    #[test]
+    fn hidden_mark_groups_round_trip_v2_and_v3_documents() {
+        // V2: a general pane makes the chart export schema 2 through the staged importer.
+        let mut general = ChartEngine::new(800.0, 500.0, 1.0);
+        general
+            .add_pane_with_domain(true, crate::HorizontalDomain::Temporal)
+            .unwrap();
+        general.set_timeline_group_hidden("news", true).unwrap();
+        let document = general.export_state_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["hidden_mark_groups"], serde_json::json!(["news"]));
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(restored.hidden_timeline_groups(), ["news"]);
+        assert_eq!(restored.export_state_json().unwrap(), document);
+
+        // V3: an engine indicator makes the chart export schema 3.
+        let mut studies = settled_chart();
+        studies.add_indicator_kind(0, crate::IndicatorKind::Sma { period: 2 }, None);
+        studies.set_timeline_group_hidden("earnings", true).unwrap();
+        let document = studies.export_state_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["hidden_mark_groups"], serde_json::json!(["earnings"]));
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(restored.hidden_timeline_groups(), ["earnings"]);
+        assert_eq!(restored.export_state_json().unwrap(), document);
+    }
+
+    #[test]
+    fn invalid_hidden_mark_groups_fail_structurally_and_atomically() {
+        let too_many: Vec<String> = (0..=crate::MAX_TIMELINE_GROUPS)
+            .map(|i| format!("g{i}"))
+            .collect();
+        let too_long = "x".repeat(129);
+        for (groups, code) in [
+            (serde_json::json!(too_many), ErrorCode::ResourceLimit),
+            (serde_json::json!([too_long]), ErrorCode::InvalidData),
+            (serde_json::json!([""]), ErrorCode::InvalidData),
+            (serde_json::json!("news"), ErrorCode::SerializationError),
+        ] {
+            let document = serde_json::json!({
+                "schema": "aeris_charts-state",
+                "schema_version": 1,
+                "panes": [{"id": "pane-1"}],
+                "drawings": [],
+                "hidden_mark_groups": groups,
+            })
+            .to_string();
+            let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+            let before = chart.export_state_json().unwrap();
+            let error = chart.import_state_json(&document).unwrap_err();
+            assert_eq!(error.code(), code, "{document}");
+            assert_eq!(chart.export_state_json().unwrap(), before);
+            assert!(chart.hidden_timeline_groups().is_empty());
+        }
     }
 }

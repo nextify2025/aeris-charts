@@ -1850,6 +1850,23 @@ export interface crosshair_line_options {
   /** Crosshair label background color (reference `labelBackgroundColor`). */
   labelBackgroundColor?: string;
 }
+
+/**
+ * `crosshair.shadeRight` (Aeris extension): a translucent veil over the pane region to the right
+ * of the hovered bar. It starts at the snapped bar's right edge, reaches the pane's right edge, and
+ * paints in every stacked pane like the vertical line, independently of `vertLine.visible`. It
+ * follows the crosshair gates (hidden mode, and suppression while an interactive object is hovered
+ * or dragged). Part of the chart options store, so V2 persistence carries it.
+ */
+export interface crosshair_shade_options {
+  /** Default `false`. */
+  visible?: boolean;
+  /**
+   * CSS color; opacity travels in its alpha. Default `rgba(74, 74, 74, 0.12)` (the crosshair line
+   * token at 12% alpha, both themes). An unparsable value falls back to that default.
+   */
+  color?: string;
+}
 /** Custom label formatters (reference `localization`). Each receives numbers and returns a string. */
 export interface localization_options {
   /**
@@ -1987,7 +2004,13 @@ export interface chart_options {
     };
   };
   grid: { vertLines: grid_line_options; horzLines: grid_line_options };
-  crosshair: { vertLine: crosshair_line_options; horzLine: crosshair_line_options; mode: number };
+  crosshair: {
+    vertLine: crosshair_line_options;
+    horzLine: crosshair_line_options;
+    /** Veil right of the hovered bar; see `crosshair_shade_options`. */
+    shadeRight: crosshair_shade_options;
+    mode: number;
+  };
   leftPriceScale: chart_price_scale_options;
   rightPriceScale: chart_price_scale_options;
   /**
@@ -2069,6 +2092,12 @@ export interface chart_options {
 
 /** Direction rule of a `histogram_updown` volume histogram. */
 export type histogram_updown_rule = "open_close" | "previous_close";
+
+/**
+ * How a baseline series without a pinned `baseline_value` resolves its baseline price (see
+ * `series_options.baseline_mode`).
+ */
+export type baseline_mode = "visible_midpoint" | "close_before_visible_range";
 
 /** How a series' timestamps land on the shared time axis (see `series_options.time_alignment`). */
 export type time_alignment = "union" | "as_of";
@@ -2192,8 +2221,33 @@ export interface series_options {
   line_type: "simple" | "stepped" | "curved";
   /** Draw a disc at each data point (shown when bars are spaced enough), roadmap Phase B3. */
   point_markers: boolean;
-  /** Baseline price for a baseline series (omit for auto = visible-range midpoint). */
+  /** Baseline price for a baseline series (omit for auto, resolved per `baseline_mode`). */
   baseline_value: number;
+  /**
+   * Baseline: how the baseline price resolves while `baseline_value` is unset (default
+   * `"visible_midpoint"`, the midpoint of the visible closes). `"close_before_visible_range"`
+   * uses the last finite close before the first visible bar, so the view reads as change against
+   * where it started; when nothing precedes the window the first visible close stands in (the
+   * first bar reads as unchanged). Both values follow the visible window and change while
+   * scrolling; a host that knows the true prior-session close pins `baseline_value` instead.
+   * Semantic state: survives `reset_style_to_defaults()`. Does not change the
+   * `histogram_updown_rule: "previous_close"` first-bar reference, which stays pinned-only.
+   */
+  baseline_mode?: baseline_mode;
+  /**
+   * Baseline: draw the resolved baseline price as a full-pane-width horizontal reference line
+   * between the quadrant fills and the quadrant strokes (default `false`).
+   */
+  baseline_line_visible?: boolean;
+  /**
+   * Baseline: reference line color (CSS). `""` or omitted follows the neutral chrome tint
+   * `#4a4a4a` (the crosshair line token, identical in both themes).
+   */
+  baseline_line_color?: string;
+  /** Baseline: reference line width in CSS px (default `1`; positive). */
+  baseline_line_width?: number;
+  /** Baseline: reference line style, a `LINE_STYLE_TO_U8` value (default `2`, dashed). */
+  baseline_line_style?: number;
   /**
    * Pulse an expanding ring at the last value (drives an rAF loop while visible). Default `true`
    * for line and area series and `false` for every other type; set `false` to disable. A value
@@ -2201,6 +2255,19 @@ export interface series_options {
    * changes; a value that differs from it (an opt-out on a line, an opt-in on candles) is kept.
    */
   last_price_animation: boolean;
+  /**
+   * Live-bar easing time constant in milliseconds (default `0` = off; values above `1000` clamp).
+   * When a `series.update()` / `merge()` replaces the drawn last bar in place (same time), the
+   * displayed high, low and close glide toward the new values with
+   * `x += (target - x) * (1 - exp(-dt / tau))`; the open never eases. A brand-new bar, a reinstall
+   * and `reduced_motion` snap. Only the drawn geometry, its last-value line and axis chip, the
+   * pulse and the crosshair marker on that bar follow the glide: `data()`, `options()`, the
+   * value snapshot (legend, tooltip, data window), the magnet, autoscale and `baseline_price()`
+   * read the real values throughout. Negative or non-finite values throw `invalid_options`.
+   * Style class like `last_price_animation`: reset by `reset_style_to_defaults()`, not persisted,
+   * not available on worker (offscreen) charts.
+   */
+  live_bar_easing_ms?: number;
   /** Keep the series in the engine while toggling its visibility. */
   visible: boolean;
   /** Show the last-value badge on the price scale (reference `lastValueVisible`, default `true`). */
@@ -3327,6 +3394,8 @@ export interface chart_state_v1 {
   drawings: persisted_drawing_v1[];
   /** Host-defined price basis of the drawing prices (see {@link chart_api.set_drawing_price_basis}). */
   drawing_price_basis?: string;
+  /** Hidden timeline-mark groups (see {@link timeline_marks_api.set_group_hidden}); marks never persist. */
+  hidden_mark_groups?: string[];
 }
 
 export interface trade_stream_stats {
@@ -3402,6 +3471,7 @@ export interface chart_state_v2 {
   }[];
   chart_options: Record<string, unknown>;
   drawing_price_basis?: string;
+  hidden_mark_groups?: string[];
 }
 
 /** Indicator source reference persisted by schema V3: a host series or an earlier study output. */
@@ -3429,6 +3499,7 @@ export interface chart_state_v3 {
     styles: indicator_output_style[];
   }[];
   drawing_price_basis?: string;
+  hidden_mark_groups?: string[];
 }
 
 export type chart_state = chart_state_v1 | chart_state_v2 | chart_state_v3;
@@ -3475,6 +3546,7 @@ export interface series_api {
   applyOptions: series_api["apply_options"];
   moveToPane: series_api["move_to_pane"];
   priceScale: series_api["price_scale"];
+  baselinePrice: series_api["baseline_price"];
   /**
    * Replace the series' data. Accepts OHLC or single-value points; packed to typed arrays here.
    * A full replace clears the series' sequence guard, or installs `options.sequence` as the new
@@ -3678,6 +3750,14 @@ export interface series_api {
   price_to_coordinate(price: number): number | null;
   /** Inverse of {@link series_api.price_to_coordinate}: price on this series' scale at chart-content `y`. */
   coordinate_to_price(coordinate: number): number | null;
+  /**
+   * The baseline price a baseline series currently compares against: its pinned `baseline_value`,
+   * else its `baseline_mode` resolved over the visible range (the same value the fills, quadrant
+   * strokes, reference line, live price line, axis chip and crosshair marker share). It moves
+   * with the visible window unless pinned. `null` for every other series type and before the
+   * chart has a visible range.
+   */
+  baseline_price(): number | null;
   bars_in_logical_range(range: logical_range): bars_info | null;
   data_by_index(logical_index: number, mismatch_direction?: mismatch_direction): series_data | null;
   data(): readonly series_data[];
@@ -4039,6 +4119,79 @@ export interface host_event_hit {
   window: boolean;
 }
 
+/** Token shape of a timeline mark (default `"circle"`). */
+export type timeline_glyph_shape = "circle" | "square" | "diamond" | "pin";
+
+export interface timeline_mark_glyph {
+  shape?: timeline_glyph_shape;
+  /** CSS color of the token fill (default: the primary brand color). */
+  color?: string;
+  /** At most two characters printed inside a single-mark token; may be empty. */
+  letter?: string;
+}
+
+/**
+ * One engine-owned timeline mark: a glyph token in the lane along the bottom of the primary
+ * series' pane at the bar slot that holds `time` (a time inside a gap lands on the next bar; a
+ * future time projects into the right-side whitespace by whole bar steps).
+ */
+export interface timeline_mark {
+  /** Unique id, 1..=128 UTF-8 bytes. */
+  id: string;
+  /** Unix seconds, like bar times. */
+  time: number;
+  /** Group id (1..=128 bytes); it may name a group missing from `groups` (label = id). */
+  group: string;
+  glyph?: timeline_mark_glyph;
+  /** Tooltip title (at most 128 bytes). */
+  title?: string;
+}
+
+export interface timeline_mark_group {
+  id: string;
+  /** Tooltip label (at most 64 bytes); the id when empty. */
+  label?: string;
+}
+
+/** At most 4096 marks and 64 distinct groups; ids unique; letters at most two characters. */
+export interface timeline_marks_snapshot {
+  marks?: timeline_mark[];
+  groups?: timeline_mark_group[];
+}
+
+/** The lane token under a point or behind a click: its anchor slot and every mark it folds. */
+export interface timeline_mark_hit {
+  /** Anchor bar slot (logical index; past the last bar when `projected`). */
+  logical: number;
+  /** Time of the earliest mark in the token. */
+  time: number;
+  projected: boolean;
+  count: number;
+  /** Distinct group ids in mark order. */
+  groups: string[];
+  mark_ids: string[];
+  /** Title of the earliest mark. */
+  title: string;
+  /** Group label of a single-group token, or `"N marks"` for a mixed one. */
+  label: string;
+}
+
+export type timeline_mark_click_handler = (hit: timeline_mark_hit) => void;
+
+/** The engine-owned timeline-mark lane; see `docs/Public_api.md` "Timeline marks". */
+export interface timeline_marks_api {
+  /** Replace marks and groups atomically; throws `invalid_data`/`resource_limit`. */
+  set(snapshot: timeline_marks_snapshot): void;
+  state(): Required<timeline_marks_snapshot>;
+  /** Show or hide the whole lane (default shown). */
+  set_visible(visible: boolean): void;
+  /** Hide or show one group's marks; persists with the chart state. Returns whether it changed. */
+  set_group_hidden(group: string, hidden: boolean): boolean;
+  hidden_groups(): string[];
+  /** The token under chart-content CSS px `(x, y)` or `null`. */
+  hit_at(x: number, y: number): timeline_mark_hit | null;
+}
+
 /**
  * A linked-chart crosshair position. `pane_index` selects the pane and `price` is a price on that
  * pane's default price scale (the scale its crosshair label reads: the first visible non-overlay
@@ -4275,6 +4428,11 @@ export interface chart_api {
   frame_stats(): frame_stats;
   /** The chart-local first-party trading domain. Broker state remains host-authoritative. */
   trading(): trading_api;
+  /** The engine-owned timeline-mark lane along the bottom of the primary series' pane. */
+  timeline_marks(): timeline_marks_api;
+  /** Fire once per click on a lane token with the resolved hit; the popup is host UI. */
+  subscribe_timeline_mark_click(handler: timeline_mark_click_handler): void;
+  unsubscribe_timeline_mark_click(handler: timeline_mark_click_handler): void;
   /** Host-authoritative price-alert indicators. */
   alerts(): alert_api;
   /** Show or hide the neutral crosshair action button. */

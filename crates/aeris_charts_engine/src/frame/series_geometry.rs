@@ -485,7 +485,7 @@ impl ChartEngine {
         if self.build_price_action_frame(rs, from, to, hpr, vpr, out, scale) {
             return;
         }
-        let plot = self.data.plot(rs.id);
+        let plot = self.display_plot(rs.id);
         let mut work = conflation::DensityWork::default();
         let visible = if rs.heikin_ashi {
             visible_ohlc_with_values(
@@ -497,7 +497,7 @@ impl ChartEngine {
                 |index| self.time_scale.index_to_coordinate(index) * hpr,
                 &mut work,
                 true,
-                |row| self.heikin_ashi_row(rs.id, row),
+                |row| self.display_heikin_ashi_row(rs.id, plot, row),
             )
         } else {
             visible_ohlc_with_work(
@@ -579,7 +579,7 @@ impl ChartEngine {
         if self.build_price_action_frame(rs, from, to, hpr, vpr, out, scale) {
             return;
         }
-        let plot = self.data.plot(rs.id);
+        let plot = self.display_plot(rs.id);
         let mut work = conflation::DensityWork::default();
         let visible = visible_ohlc_with_work(
             plot,
@@ -642,7 +642,7 @@ impl ChartEngine {
         out: &mut Vec<Prim>,
         scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
     ) {
-        let plot = self.data.plot(rs.id);
+        let plot = self.display_plot(rs.id);
         let c = |row: usize| plot.value_at(row, PlotValueIndex::Close);
         // reference HistogramStyleOptions.base (histogram-renderer.ts): columns grow from this price
         // level (default 0).
@@ -655,7 +655,7 @@ impl ChartEngine {
         // the public reference volume tint: the primary series' up/down direction per bar. The primary
         // is the first visible, non-removed series (id 0 may be tombstoned).
         let primary = self.primary_series();
-        let main = primary.map(|s| self.data.plot(s.id));
+        let main = primary.map(|s| self.display_plot(s.id));
         let point_colors = self.data.point_colors(rs.id);
         let (histogram_updown, rule, volume_up, volume_down) = self.series_entry(rs.id).map_or(
             (
@@ -789,7 +789,7 @@ impl ChartEngine {
         points: &mut Vec<[f32; 2]>,
         scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
     ) {
-        let plot = self.data.plot(rs.id);
+        let plot = self.display_plot(rs.id);
         let c = |row: usize| plot.value_at(row, PlotValueIndex::Close);
         let mut work = conflation::DensityWork::default();
         let rows = visible_line_rows_with_work(
@@ -1252,11 +1252,12 @@ impl ChartEngine {
         to: i64,
         hpr: f64,
         vpr: f64,
+        pane_w_px: i32,
         out: &mut Vec<Prim>,
         points: &mut Vec<[f32; 2]>,
         scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
     ) {
-        let plot = self.data.plot(rs.id);
+        let plot = self.display_plot(rs.id);
         let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
         let rows = visible_line_rows(
             plot,
@@ -1269,7 +1270,7 @@ impl ChartEngine {
         if rows.is_empty() {
             return;
         }
-        let Some(baseline_price) = self.resolved_baseline_price(rs.id, from, to) else {
+        let Some(baseline_price) = self.resolved_baseline_price(plot, rs.id, from, to) else {
             return;
         };
         let baseline_y = scale.price_to_coordinate(baseline_price, rs.base_value);
@@ -1277,7 +1278,15 @@ impl ChartEngine {
         let mut bottom_runs: Vec<Vec<[f32; 2]>> = Vec::new();
         // Period breaks split the rows into independent runs (see `build_line_frame`): each run's
         // first segment opens new quadrant runs, so no stroke or fill joins two runs.
-        for run in self.line_run_ranges(rs.id, plot, &rows, from, to) {
+        let runs = self.line_run_ranges(rs.id, plot, &rows, from, to);
+        // `rows` carries the nearest real row beyond each pane edge so an edge segment keeps
+        // running to the pane; when the series has scrolled entirely off one side, that lone
+        // neighbour is all that is left and its one-bar segment and fill lie outside the pane.
+        // The reference line follows what the pane shows: a row inside the window, or a run that
+        // bridges it between two off-screen rows.
+        let reaches_pane =
+            !plot.visible_rows(from, to).is_empty() || runs.iter().any(|run| run.len() > 1);
+        for run in runs {
             let rows = &rows[run];
             if let [row] = rows[..] {
                 // reference walkLine: a single visible item draws a horizontal segment one bar
@@ -1369,6 +1378,21 @@ impl ChartEngine {
                 });
             }
         }
+        // The reference line sits between the fills and the quadrant strokes: a full-pane-width
+        // `HLine` with the price-line rounding and the live-line width rule (vertical ratio, a
+        // horizontal line's thickness), dashed by every executor's own `HLine` arm. The fills'
+        // unrounded `base_y` may sit up to half a device pixel off the line, as threshold lines
+        // do today; the fill is not snapped.
+        if rs.baseline_line_visible && reaches_pane {
+            out.push(Prim::HLine {
+                y: (baseline_y * vpr).round() as i32,
+                x0: 0,
+                x1: pane_w_px,
+                width: 1f64.max((rs.baseline_line_width * vpr).floor()) as i32,
+                style: rs.baseline_line_style,
+                color: rs.baseline_line,
+            });
+        }
         if rs.line_visible {
             for run in &top_runs {
                 push_line_stroke(
@@ -1458,7 +1482,7 @@ impl ChartEngine {
         let Some(base_value) = self.series_base_value(series.id, from) else {
             return;
         };
-        let plot = self.data.plot(series.id);
+        let plot = self.display_plot(series.id);
         let Some(first_data_index) = plot.first_index() else {
             return;
         };
@@ -1513,7 +1537,7 @@ impl ChartEngine {
             let high = plot.value_at(row, PlotValueIndex::High);
             let low = plot.value_at(row, PlotValueIndex::Low);
             let close = self
-                .heikin_ashi_row(series.id, row)
+                .display_heikin_ashi_row(series.id, plot, row)
                 .map(|values| values[3])
                 .unwrap_or_else(|| plot.value_at(row, PlotValueIndex::Close));
             let exact_price = matches!(
@@ -1712,7 +1736,7 @@ impl ChartEngine {
                 });
                 continue;
             }
-            let plot = self.data.plot(series.id);
+            let plot = self.display_plot(series.id);
             if plot.is_empty() || scale.is_empty() {
                 continue;
             }
@@ -1728,7 +1752,7 @@ impl ChartEngine {
                 continue;
             };
             let close = self
-                .heikin_ashi_row(series.id, row)
+                .display_heikin_ashi_row(series.id, plot, row)
                 .map(|values| values[3])
                 .unwrap_or_else(|| plot.value_at(row, PlotValueIndex::Close));
             if !close.is_finite() {
@@ -1738,14 +1762,16 @@ impl ChartEngine {
                 continue;
             };
             let baseline = if series.kind == SeriesKind::Baseline {
-                self.resolved_baseline_price(series.id, from, to)
+                self.resolved_baseline_price(plot, series.id, from, to)
             } else {
                 None
             };
             // reference `priceLineColor` default '' (series.ts priceLineColor): follow the bar color.
             // The pinned CSS string parses here; an unparseable string falls back to ''.
-            let color = self
-                .effective_series_live_color(series, self.series_bar_color(series, row, baseline));
+            let color = self.effective_series_live_color(
+                series,
+                self.series_bar_color(series, plot, row, baseline),
+            );
             let x0 = match series.price_line_extent {
                 crate::PriceLineExtent::Full => 0,
                 crate::PriceLineExtent::Partial => {
@@ -1828,7 +1854,7 @@ impl ChartEngine {
         let series_id = series.id;
         let series_kind = series.kind;
         let scale = pane_scale(&self.panes[0], series_scale_target(series));
-        let plot = self.data.plot(series_id);
+        let plot = self.display_plot(series_id);
         if plot.is_empty() || scale.is_empty() {
             return;
         }
@@ -1838,7 +1864,7 @@ impl ChartEngine {
         };
         let index = plot.index_at(last).expect("last series row index");
         let close = self
-            .heikin_ashi_row(series_id, last)
+            .display_heikin_ashi_row(series_id, plot, last)
             .map(|values| values[3])
             .unwrap_or_else(|| plot.value_at(last, PlotValueIndex::Close));
         let Some(base_value) = self.visible_series_base_value(series_id) else {
@@ -1857,7 +1883,7 @@ impl ChartEngine {
             SeriesKind::Histogram => HISTOGRAM,
             _ => {
                 let open = self
-                    .heikin_ashi_row(series_id, last)
+                    .display_heikin_ashi_row(series_id, plot, last)
                     .map(|values| values[0])
                     .unwrap_or_else(|| plot.value_at(last, PlotValueIndex::Open));
                 if close >= open {

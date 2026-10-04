@@ -302,7 +302,8 @@ impl ChartEngine {
         if scale.is_empty() {
             return None;
         }
-        let plot = self.data.plot(id);
+        // The drawn geometry is what is hittable: an eased last bar tests its display values.
+        let plot = self.display_plot(id);
         let bar_spacing = self.time_scale.bar_spacing();
         // The frame build's horizontal ratio (frame/mod.rs): conflation buckets in physical
         // pixels, so the tested items must be selected with the same ratio they were drawn.

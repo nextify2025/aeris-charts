@@ -50,10 +50,11 @@ import type {
   chart_sync_event, crosshair_sync_position,
   trading_intent, trading_intent_handler, trading_position, trading_preview, trading_snapshot,
   trading_style_options, instrument_metadata, working_order, host_overlay_snapshot, host_event_hit,
+  timeline_marks_api, timeline_marks_snapshot, timeline_mark_hit, timeline_mark_click_handler,
   visible_logical_range_handler, visible_time_range_handler,
   volume_profile_indicator_api, volume_profile_indicator_options, volume_profile_indicator_snapshot,
   time_label_context, time_zone,
-  histogram_updown_rule, kdj_parameters, session_slot_options, time_tick_mark, time_alignment,
+  baseline_mode, histogram_updown_rule, kdj_parameters, session_slot_options, time_tick_mark, time_alignment,
   resample_boundary, resample_boundary_options, resample_series_options, resample_stats, resampled_bar,
   trade_session_options, business_day,
 } from "./types.js";
@@ -221,6 +222,24 @@ export function normalize_time_tick_marks(marks: unknown): engine_time_tick_mark
 
 /** Accepted `histogram_updown_rule` values. */
 const HISTOGRAM_UPDOWN_RULES: readonly histogram_updown_rule[] = ["open_close", "previous_close"];
+/** Accepted `baseline_mode` values. */
+const BASELINE_MODES: readonly baseline_mode[] = ["visible_midpoint", "close_before_visible_range"];
+
+/** Reject a malformed string-enum series option before any option of the call is applied. */
+function validate_series_enum_options(options: Partial<series_options>): void {
+  const rule = options.histogram_updown_rule;
+  if (rule !== undefined && !HISTOGRAM_UPDOWN_RULES.includes(rule)) {
+    throw new AerisChartsError("invalid_options", `histogram_updown_rule must be "open_close" or "previous_close"`);
+  }
+  const mode = options.baseline_mode;
+  if (mode !== undefined && !BASELINE_MODES.includes(mode)) {
+    throw new AerisChartsError("invalid_options", `baseline_mode must be "visible_midpoint" or "close_before_visible_range"`);
+  }
+  const easing = options.live_bar_easing_ms;
+  if (easing !== undefined && !(Number.isFinite(easing) && easing >= 0)) {
+    throw new AerisChartsError("invalid_options", "live_bar_easing_ms must be a finite number of milliseconds, 0 or more");
+  }
+}
 
 /** Accepted `time_alignment` values. */
 const TIME_ALIGNMENTS: readonly time_alignment[] = ["union", "as_of"];
@@ -331,6 +350,7 @@ function countdown_timer_needed(
  */
 const SERIES_JSON_OPTION_KEYS = [
   "last_value_visible",
+  "live_bar_easing_ms",
   "title",
   "title_visible",
   "countdown_visible",
@@ -371,6 +391,11 @@ const SERIES_JSON_OPTION_KEYS = [
   "thin_bars",
   "heikin_ashi",
   "histogram_updown_rule",
+  "baseline_mode",
+  "baseline_line_visible",
+  "baseline_line_color",
+  "baseline_line_width",
+  "baseline_line_style",
 ] as const;
 
 /** Reject malformed Aeris price-scale extension values before any option is applied. */
@@ -1850,6 +1875,7 @@ class series_impl implements series_api {
   applyOptions(...args: Parameters<series_api["apply_options"]>): void { this.apply_options(...args); }
   moveToPane(...args: Parameters<series_api["move_to_pane"]>): void { this.move_to_pane(...args); }
   priceScale(): price_scale_api { return this.price_scale(); }
+  baselinePrice(): number | null { return this.baseline_price(); }
   protected readonly data_changed_subs = new Set<data_changed_handler>();
   private removed = false;
   private last_ingestion: ingestion_diagnostics | null = null;
@@ -2262,10 +2288,7 @@ class series_impl implements series_api {
 
   apply_options(options: Partial<any_series_options>): void {
     this.assert_live();
-    const rule = (options as Partial<series_options>).histogram_updown_rule;
-    if (rule !== undefined && !HISTOGRAM_UPDOWN_RULES.includes(rule)) {
-      throw new AerisChartsError("invalid_options", `histogram_updown_rule must be "open_close" or "previous_close"`);
-    }
+    validate_series_enum_options(options as Partial<series_options>);
     // First, so a rejected alignment leaves every other option of the call unapplied. A changed
     // alignment may change the chart's time points, which is a full-range change for handlers;
     // re-applying the current alignment (a React re-render) notifies nothing.
@@ -2549,6 +2572,9 @@ class series_impl implements series_api {
   }
   coordinate_to_price(coordinate: number): number | null {
     return undef_to_null(this.chart.wasm.series_coordinate_to_price(this.id, coordinate));
+  }
+  baseline_price(): number | null {
+    return undef_to_null(this.chart.wasm.series_baseline_price(this.id));
   }
   bars_in_logical_range(range: logical_range): bars_info | null {
     const info = this.chart.wasm.series_bars_in_logical_range(this.id, range.from, range.to);
@@ -4213,6 +4239,40 @@ function apply_tracking(v: tracking_mode_options, cfg: resolved_gestures): void 
   cfg.tracking_exit_mode = v.exit_mode ?? cfg.tracking_exit_mode;
 }
 
+/** The engine-owned timeline-mark lane handle: JSON pass-through plus repaint. */
+class timeline_marks_impl implements timeline_marks_api {
+  constructor(private readonly chart: chart_impl) {}
+
+  set(snapshot: timeline_marks_snapshot): void {
+    assert_trading_result(this.chart.wasm.set_timeline_marks_json(JSON.stringify(snapshot)));
+    this.chart.repaint();
+  }
+
+  state(): Required<timeline_marks_snapshot> {
+    return JSON.parse(this.chart.wasm.timeline_marks_json()) as Required<timeline_marks_snapshot>;
+  }
+
+  set_visible(visible: boolean): void {
+    if (this.chart.wasm.set_timeline_marks_visible(visible)) this.chart.repaint();
+  }
+
+  set_group_hidden(group: string, hidden: boolean): boolean {
+    const result = parse_engine_result<{ changed: boolean }>(
+      this.chart.wasm.set_timeline_group_hidden(group, hidden),
+    );
+    if (result.changed) this.chart.repaint();
+    return result.changed;
+  }
+
+  hidden_groups(): string[] {
+    return JSON.parse(this.chart.wasm.hidden_timeline_groups_json()) as string[];
+  }
+
+  hit_at(x: number, y: number): timeline_mark_hit | null {
+    return JSON.parse(this.chart.wasm.timeline_mark_hit_json(x, y)) as timeline_mark_hit | null;
+  }
+}
+
 class trading_impl implements trading_api {
   private readonly intent_handlers = new Set<trading_intent_handler>();
 
@@ -4405,6 +4465,8 @@ export class chart_impl implements chart_api {
   private pixel_ratio = window.devicePixelRatio || 1;
   private readonly ts = new time_scale_impl(this);
   private readonly trading_handle = new trading_impl(this);
+  private readonly timeline_marks_handle = new timeline_marks_impl(this);
+  private readonly timeline_mark_click_subs = new Set<timeline_mark_click_handler>();
   private readonly alert_handle = new alert_impl(this);
   private readonly crosshair_action_handlers = new Set<crosshair_action_request_handler>();
   private observer: ResizeObserver | null = null;
@@ -4494,6 +4556,35 @@ export class chart_impl implements chart_api {
 
   trading(): trading_api {
     return this.trading_handle;
+  }
+
+  timeline_marks(): timeline_marks_api {
+    return this.timeline_marks_handle;
+  }
+
+  subscribe_timeline_mark_click(handler: timeline_mark_click_handler): void {
+    this.timeline_mark_click_subs.add(handler);
+  }
+
+  unsubscribe_timeline_mark_click(handler: timeline_mark_click_handler): void {
+    this.timeline_mark_click_subs.delete(handler);
+  }
+
+  /** Deliver a resolved lane hit to the click subscribers (pointer release or keyboard Enter). */
+  emit_timeline_mark_click(hit: timeline_mark_hit): void {
+    for (const handler of this.timeline_mark_click_subs) handler(hit);
+  }
+
+  /** The pane the engine shows the lane on now, or `null` while the lane is off, empty or too short. */
+  timeline_lane_pane(): number | null {
+    return this.wasm.timeline_lane_pane() ?? null;
+  }
+
+  /** Keyboard activation of one mark: resolve its in-view token through the engine and deliver it. */
+  activate_timeline_mark(id: string): timeline_mark_hit | null {
+    const hit = JSON.parse(this.wasm.timeline_mark_hit_for_id_json(id)) as timeline_mark_hit | null;
+    if (hit) this.emit_timeline_mark_click(hit);
+    return hit;
   }
 
   alerts(): alert_api {
@@ -5751,10 +5842,7 @@ export class chart_impl implements chart_api {
     // Option values that need no engine state are checked before the series exists, so a bad
     // value creates or adopts nothing.
     if (options) {
-      const rule = (options as Partial<series_options>).histogram_updown_rule;
-      if (rule !== undefined && !HISTOGRAM_UPDOWN_RULES.includes(rule)) {
-        throw new AerisChartsError("invalid_options", `histogram_updown_rule must be "open_close" or "previous_close"`);
-      }
+      validate_series_enum_options(options as Partial<series_options>);
       validate_series_time_alignment(options as Partial<series_options>);
     }
     // Series 0 is created by the engine at construction; the first add_series adopts it so the
@@ -7742,7 +7830,8 @@ export class chart_impl implements chart_api {
       | { kind: "remove_series"; id: number }
       | { kind: "crosshair_left" }
       | { kind: "context_menu"; x: number; y: number }
-      | { kind: "delta_tooltip_changed" };
+      | { kind: "delta_tooltip_changed" }
+      | { kind: "timeline_mark_activated"; hit: timeline_mark_hit | null };
     const events = JSON.parse(this.wasm.take_input_events_json()) as controller_event[];
     for (const event of events) {
       switch (event.kind) {
@@ -7771,6 +7860,9 @@ export class chart_impl implements chart_api {
           break;
         case "delta_tooltip_changed":
           this.notify_delta_tooltip_ranges();
+          break;
+        case "timeline_mark_activated":
+          if (event.hit) this.emit_timeline_mark_click(event.hit);
           break;
       }
     }
@@ -8212,6 +8304,7 @@ export class chart_impl implements chart_api {
     this.general_series_by_id.clear();
     this.crosshair_subs.clear();
     this.click_subs.clear();
+    this.timeline_mark_click_subs.clear();
     this.chart_context_subs.clear();
     this.dbl_click_subs.clear();
     this.visible_logical_range_subs.clear();

@@ -331,6 +331,12 @@ impl ChartInner {
                 (None, Some(format!("volume_profile:{id}")), None, None)
             }
             ChartHover::General => (None, None, None, self.engine.general_hovered_hit()),
+            ChartHover::TimelineMark => (
+                None,
+                Some("timeline_mark".to_string()),
+                Some("pointer".to_string()),
+                None,
+            ),
         };
         serde_json::json!({
             "series_id": series_id,

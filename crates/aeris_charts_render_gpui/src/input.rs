@@ -51,11 +51,22 @@ impl GpuiChartInput {
         self.epoch.elapsed().as_secs_f64() * 1_000.0
     }
 
-    /// Prepaint step: advance input animations and forward the newest coalesced capture sample.
-    /// Returns whether chart state changed.
+    /// Prepaint step: advance input animations and live-bar easing on the adapter clock, then
+    /// forward the newest coalesced capture sample. Returns whether chart state changed, so the
+    /// host rebuilds its frame exactly when the engine moved something. GPUI hosts never run the
+    /// pulse clock (`ChartEngine::set_animation_time`); the pulse stays a browser feature.
     pub fn prepare_frame(&self, engine: &mut ChartEngine) -> bool {
-        let ticked = engine.input_tick(self.now_ms());
-        engine.flush_coalesced_input() || ticked
+        let now_ms = self.now_ms();
+        let ticked = engine.input_tick(now_ms);
+        let eased = engine.advance_live_bar_easing(now_ms);
+        engine.flush_coalesced_input() || ticked || eased
+    }
+
+    /// Whether the host must request another frame after this one: the engine's frame-request
+    /// predicate (an input animation or a live-bar glide). An idle chart returns `false` and must
+    /// stay idle.
+    pub fn animating(engine: &ChartEngine) -> bool {
+        engine.animation_frame_requested()
     }
 
     /// Prepaint step with GPUI's current application motion preference.
