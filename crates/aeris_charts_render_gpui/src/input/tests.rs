@@ -677,7 +677,14 @@ fn cursor_style_maps_every_chart_cursor() {
         (ChartCursor::Default, CursorStyle::Arrow),
         (ChartCursor::Pointer, CursorStyle::PointingHand),
         (ChartCursor::Text, CursorStyle::IBeam),
-        (ChartCursor::Move, CursorStyle::OpenHand),
+        (
+            ChartCursor::Move,
+            if windows {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::OpenHand
+            },
+        ),
         (ChartCursor::Grabbing, CursorStyle::ClosedHand),
         (
             ChartCursor::VerticalGrab,
@@ -700,6 +707,7 @@ fn cursor_style_maps_every_chart_cursor() {
         (ChartCursor::ResizeNwse, CursorStyle::ResizeUpLeftDownRight),
         (ChartCursor::ResizeNesw, CursorStyle::ResizeUpRightDownLeft),
         (ChartCursor::ResizeRow, CursorStyle::ResizeRow),
+        (ChartCursor::HostPrimitive, CursorStyle::Crosshair),
     ] {
         assert_eq!(cursor_style(cursor), expected, "{cursor:?}");
     }
