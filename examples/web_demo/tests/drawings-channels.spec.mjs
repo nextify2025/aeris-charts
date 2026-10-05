@@ -160,8 +160,10 @@ test("every Channels tool places through the armed-tool flow and paints", async 
   const s = await anchor_spots(page);
   const clean = await capture(page);
   for (const [index, kind] of CHANNELS.entries()) {
+    // 2 px strokes: upstream's channels default to 1 px, whose antialiased diagonal has too few
+    // fully pink pixels for the preview-extent probe below on every rasterizer.
     await page.evaluate((kind) => {
-      window.__chart.set_drawing_tool(kind, { color: "#e91e63" });
+      window.__chart.set_drawing_tool(kind, { color: "#e91e63", width: 2 });
       if (window.__chart.active_drawing_tool() !== kind) throw new Error(`${kind} not armed`);
     }, kind);
     const clicks = {
