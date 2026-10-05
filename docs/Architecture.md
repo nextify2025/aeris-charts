@@ -71,7 +71,7 @@ wasm        → core + engine + render + render_wgpu
 | 金融窗格、命名比例尺、坐标、自动缩放与选项 | [窗格与比例尺](architecture/engine/panes-and-scales.md) |
 | 非金融域、坐标轴、类型化数据集、通用系列与交互 | [通用图表](architecture/engine/general-charts.md) |
 | 指针、触摸、滚轮、键盘、悬停、取消与动效 | [共享输入控制器](architecture/engine/input.md) |
-| 金融系列几何、值快照、官方图元与图例 | [系列与图元](architecture/engine/series.md) |
+| 金融系列几何、基线解析、实时柱缓动、时间线标记带、值快照、官方图元与图例 | [系列与图元](architecture/engine/series.md) |
 | 成交流、深度、回放、非时间柱与重采样 | [行情投影](architecture/engine/market-data.md) |
 | 持仓、订单、成交、警报、意图与回滚 | [交易与警报](architecture/engine/trading.md) |
 | 绘图状态、时间锚点、历史、复权与测量 | [绘图](architecture/engine/drawings.md) |

@@ -35,6 +35,8 @@ mod host_layout;
 mod indicators;
 mod interaction;
 mod klinechart_indicators;
+mod live_bar_easing;
+pub use live_bar_easing::MAX_LIVE_BAR_EASING_MS;
 mod native_primitives;
 mod synthetic_bars;
 mod volume_profile;
@@ -57,6 +59,11 @@ mod tests;
 mod tick_bar_tests;
 mod time_alignment_api;
 mod time_tick_marks_api;
+mod timeline_marks;
+pub use timeline_marks::{
+    TimelineGlyphShape, TimelineMark, TimelineMarkGlyph, TimelineMarkGroup, TimelineMarkHit,
+    TimelineMarksSnapshot, MAX_TIMELINE_GROUPS, MAX_TIMELINE_MARKS,
+};
 mod trading;
 mod viewport;
 mod workspace;
@@ -345,6 +352,7 @@ pub struct EngineMemoryUsage {
     pub native_primitive_capacity_bytes: usize,
     pub trading_capacity_bytes: usize,
     pub alert_capacity_bytes: usize,
+    pub timeline_marks_capacity_bytes: usize,
     pub general_domain_capacity_bytes: usize,
     pub general_axis_bytes: usize,
     pub general_data_capacity_bytes: usize,
@@ -374,6 +382,7 @@ impl EngineMemoryUsage {
             + self.native_primitive_capacity_bytes
             + self.trading_capacity_bytes
             + self.alert_capacity_bytes
+            + self.timeline_marks_capacity_bytes
             + self.general_domain_capacity_bytes
             + self.general_axis_bytes
             + self.general_data_capacity_bytes
@@ -669,6 +678,40 @@ impl HistogramUpDownRule {
         match value {
             "open_close" => Some(Self::OpenClose),
             "previous_close" => Some(Self::PreviousClose),
+            _ => None,
+        }
+    }
+}
+
+/// How a Baseline series without a pinned `baseline_value` resolves its baseline price.
+///
+/// Both modes depend on the visible window, so the resolved price moves while the host scrolls
+/// or zooms; a host that knows the true prior-session close pins `baseline_value` instead. The
+/// `previous_close` wire value stays reserved for a future session-anchored mode
+/// (`histogram_updown_rule: previous_close` already means a per-bar comparison).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BaselineMode {
+    /// Midpoint of the minimum and maximum finite visible close (the default).
+    #[default]
+    VisibleMidpoint,
+    /// The last finite close strictly before the first visible row, so the visible window reads
+    /// as change against where it started. When no finite row precedes the window the first
+    /// visible finite close stands in (the first bar reads as unchanged; the series never vanishes).
+    CloseBeforeVisibleRange,
+}
+
+impl BaselineMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VisibleMidpoint => "visible_midpoint",
+            Self::CloseBeforeVisibleRange => "close_before_visible_range",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "visible_midpoint" => Some(Self::VisibleMidpoint),
+            "close_before_visible_range" => Some(Self::CloseBeforeVisibleRange),
             _ => None,
         }
     }
@@ -1114,10 +1157,31 @@ pub struct SeriesEntry {
     pub point_markers: bool,
     pub visible: bool,
     pub baseline: Option<f64>,
+    /// How the baseline price resolves while `baseline` is unset. Semantic state: survives
+    /// `reset_style_to_defaults`, like `break_on_trading_day`.
+    pub baseline_mode: BaselineMode,
+    /// Draw the resolved baseline price as a full-pane-width horizontal reference line between
+    /// the quadrant fills and the quadrant strokes (default false).
+    pub baseline_line_visible: bool,
+    /// Reference line color; `None` follows the neutral chrome tint (`#4a4a4a`, the crosshair line
+    /// token, identical in both themes). Stored verbatim as a CSS string; parsed at render time.
+    pub baseline_line_color: Option<String>,
+    /// Reference line width in CSS px (default 1; positive).
+    pub baseline_line_width: f64,
+    /// Reference line style (default 2 = Dashed; the numeric `LINE_STYLE_TO_U8` convention).
+    pub baseline_line_style: u8,
     pub last_price_animation: bool,
     /// Set once a host chooses the pulse explicitly; a kind change then keeps that choice instead
     /// of adopting the new kind's default.
     pub(crate) last_price_animation_explicit: bool,
+    /// Live-bar easing time constant in ms (`0` = off, default; at most
+    /// [`MAX_LIVE_BAR_EASING_MS`]): a same-time replacement of the drawn last bar glides its
+    /// displayed high/low/close toward the new values (`live_bar_easing.rs`). Style class like
+    /// `last_price_animation`: reset by a style reset, not persisted.
+    pub live_bar_easing_ms: f64,
+    /// Display state of the eased live bar; written only through shared references (never via
+    /// `DerefMut for SeriesStore`), so a per-frame advance cannot bump the store revision.
+    pub(crate) live_bar_ease: Cell<live_bar_easing::LiveBarEase>,
     /// reference `SeriesOptionsCommon.lastValueVisible` (series-options-defaults.ts: true): draw this
     /// series' last-value label on its price scale.
     pub last_value_visible: bool,
@@ -1297,10 +1361,17 @@ impl SeriesEntry {
             point_markers: false,
             visible: true,
             baseline: None,
+            baseline_mode: BaselineMode::VisibleMidpoint,
+            baseline_line_visible: false,
+            baseline_line_color: None,
+            baseline_line_width: 1.0,
+            baseline_line_style: 2,
             // Aeris product default: line and area series pulse their last price. Hosts opt out
             // per series; every other kind stays static unless a host opts in.
             last_price_animation: Self::default_last_price_animation(kind),
             last_price_animation_explicit: false,
+            live_bar_easing_ms: 0.0,
+            live_bar_ease: Cell::new(live_bar_easing::LiveBarEase::default()),
             // Reference-compatible defaults except for explicit Aeris product choices: the live
             // price line defaults to partial extent, and crosshair markers stay disabled until the
             // host opts in per series or indicator output.
@@ -1391,6 +1462,8 @@ impl SeriesEntry {
         self.point_markers = defaults.point_markers;
         self.last_price_animation = defaults.last_price_animation;
         self.last_price_animation_explicit = false;
+        self.live_bar_easing_ms = defaults.live_bar_easing_ms;
+        self.live_bar_ease = Cell::new(live_bar_easing::LiveBarEase::default());
         self.last_value_visible = defaults.last_value_visible;
         self.title_visible = defaults.title_visible;
         // Countdown ownership is semantic, not visual styling. A theme/style reset must never
@@ -1424,6 +1497,11 @@ impl SeriesEntry {
         self.bottom_line_color = defaults.bottom_line_color;
         self.bottom_line_width = defaults.bottom_line_width;
         self.bottom_line_style = defaults.bottom_line_style;
+        // `baseline_mode` is semantic (which price the chart compares against) and stays.
+        self.baseline_line_visible = defaults.baseline_line_visible;
+        self.baseline_line_color = defaults.baseline_line_color;
+        self.baseline_line_width = defaults.baseline_line_width;
+        self.baseline_line_style = defaults.baseline_line_style;
         self.invert_filled_area = defaults.invert_filled_area;
         self.open_visible = defaults.open_visible;
         self.close_visible = defaults.close_visible;
@@ -1961,6 +2039,8 @@ pub struct ChartEngine {
     native_pane_primitives: Vec<native_primitives::NativePanePrimitive>,
     trading_state: trading::TradingState,
     alert_state: alerts::AlertState,
+    /// The engine-owned timeline-mark lane (`timeline_marks.rs`): never inside `TradingState`.
+    timeline_marks: timeline_marks::TimelineMarksState,
     /// reference `timeScale.timeVisible` — label semantics only: whether axis/crosshair time labels
     /// include the time of day. Strip reservation is [`Self::time_axis_visible`].
     pub time_visible: bool,
@@ -2243,6 +2323,7 @@ impl ChartEngine {
             native_pane_primitives: Vec::new(),
             trading_state: trading::TradingState::default(),
             alert_state: alerts::AlertState::default(),
+            timeline_marks: timeline_marks::TimelineMarksState::default(),
             time_visible: true,
             time_axis_visible: true,
             time_ticks_visible: false,
@@ -2473,6 +2554,7 @@ impl ChartEngine {
             native_primitive_capacity_bytes: self.native_primitive_capacity_bytes(),
             trading_capacity_bytes: self.trading_state.estimated_bytes(),
             alert_capacity_bytes: self.alert_state.estimated_bytes(),
+            timeline_marks_capacity_bytes: self.timeline_marks.capacity_bytes(),
             general_domain_capacity_bytes: self.general_horizontal_domains.capacity_bytes(),
             general_axis_bytes: self.general_axes.estimated_bytes(),
             general_data_capacity_bytes: self
@@ -3571,6 +3653,8 @@ impl ChartEngine {
             }
             series.render_before_time = time;
             self.invalidate_frame_scene();
+            // A hidden last bar never eases; a revealed one shows its real values first.
+            self.snap_live_bar(id);
         }
     }
 
@@ -3725,6 +3809,7 @@ impl ChartEngine {
         let len = self.data.pop(id, count)?;
         self.truncate_feature_rows(id, len);
         self.sync_time_points();
+        self.snap_live_bar(id);
         self.update_indicators_after_change(
             id,
             IndicatorChange {
@@ -3786,6 +3871,7 @@ impl ChartEngine {
         let previous_generation = self.data.series_generation(id).unwrap_or(0);
         let mut from = usize::MAX;
         let mut accepted = 0;
+        let mut written_time = 0;
         for (time, values) in rows {
             let Some((time, values)) = sanitize_point(time, values) else {
                 continue;
@@ -3801,6 +3887,7 @@ impl ChartEngine {
                 .unwrap_or_default();
             from = from.min(row);
             self.data.update_styled(id, time, values, [None; 3]);
+            written_time = time;
             accepted += 1;
         }
         if accepted == 0 {
@@ -3808,6 +3895,7 @@ impl ChartEngine {
         }
         let trimmed = self.enforce_series_cap(id);
         self.sync_time_points();
+        self.note_live_bar_target(id, written_time);
         self.update_indicators_after_change(
             id,
             IndicatorChange {
@@ -3864,8 +3952,10 @@ impl ChartEngine {
             return 0;
         };
         let accepted = times.len();
+        let written_time = times[times.len() - 1];
         let trimmed = self.enforce_series_cap(id);
         self.sync_time_points();
+        self.note_live_bar_target(id, written_time);
         self.update_indicators_after_change(
             id,
             IndicatorChange {
@@ -3919,6 +4009,7 @@ impl ChartEngine {
         // `margin` appends. Runs before `sync_time_points` so the scale sees the final row set.
         if self.enforce_series_cap(id) {
             self.sync_time_points();
+            self.note_live_bar_target(id, time);
             self.update_indicators_after_change(
                 id,
                 IndicatorChange {
@@ -3930,6 +4021,7 @@ impl ChartEngine {
             return true;
         }
         self.sync_time_points();
+        self.note_live_bar_target(id, time);
         self.update_indicators_after_change(
             id,
             IndicatorChange {
@@ -4035,10 +4127,7 @@ impl ChartEngine {
         debug_assert!(installed, "sanitized channels are aligned by construction");
         // Retention (`max_points`): trim after the colors land so the eviction shifts rows and
         // color channels together.
-        self.enforce_series_cap(id);
-        self.sync_time_points();
-        self.recompute_indicators_for(id);
-        self.restart_selection_anchor_snapshot_after_replacement(id);
+        self.finish_series_install(id);
         Ok(report)
     }
 
@@ -4075,10 +4164,7 @@ impl ChartEngine {
         );
         // Retention (`max_points`): a full install can exceed the ceiling; trim before the scale
         // and the indicators index the rows. The report still describes the caller's input.
-        self.enforce_series_cap(id);
-        self.sync_time_points();
-        self.recompute_indicators_for(id);
-        self.restart_selection_anchor_snapshot_after_replacement(id);
+        self.finish_series_install(id);
         Ok(report)
     }
 
@@ -4115,11 +4201,19 @@ impl ChartEngine {
         }
         // A full install can land more rows than the retention ceiling allows; trim before the
         // scale and the indicators see the row set, so nothing downstream indexes evicted rows.
+        self.finish_series_install(id);
+        true
+    }
+
+    /// The shared tail of every full install: retention trim, one time sync, then the live-bar
+    /// display snaps onto the final row set (after the trim shifted rows, so the next same-time
+    /// tick keys to the drawn row and glides), indicators and the selection anchor.
+    fn finish_series_install(&mut self, id: SeriesId) {
         self.enforce_series_cap(id);
         self.sync_time_points();
+        self.snap_live_bar(id);
         self.recompute_indicators_for(id);
         self.restart_selection_anchor_snapshot_after_replacement(id);
-        true
     }
 
     fn is_footprint_series(&self, id: SeriesId) -> bool {

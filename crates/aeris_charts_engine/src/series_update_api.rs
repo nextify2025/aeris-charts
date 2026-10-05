@@ -192,6 +192,7 @@ impl ChartEngine {
         // one indicator pass from the earliest merged row.
         let trimmed = self.enforce_series_cap(id);
         self.sync_time_points();
+        self.note_live_bar_target(id, timestamps[timestamps.len() - 1]);
         self.update_indicators_after_change(
             id,
             IndicatorChange {

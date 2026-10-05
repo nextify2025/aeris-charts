@@ -189,17 +189,20 @@ impl GpuiChartInput {
     /// - advances input animations and due deadlines (`input_tick`). A deadline whose wake has
     ///   fired counts as reached even if the clock reads a hair before it;
     /// - forwards the newest coalesced capture sample;
-    /// - sets `engine.animation_time` while `last_price_pulse_active()` holds;
+    /// - advances every live-bar glide and the pulse clock on the adapter clock
+    ///   (`set_animation_time`): a glide's first tick only stamps its clock, later ticks move the
+    ///   drawn bar, and `animation_time` moves while a pulse is drawn or a glide advanced;
     /// - pins the candle-close countdown clock to the system clock (`set_now_seconds`, UTC
     ///   seconds), as the browser render path does. A host that shows another clock pins it after
     ///   this call;
     /// - re-arms the wake if the tick moved the deadline, and on each whole second of the adapter
     ///   clock while a countdown row shows (`countdown_shown`), as the browser package's
     ///   one-second countdown timer repaints;
-    /// - calls `Window::request_animation_frame` while `input_animating()` or
-    ///   `last_price_pulse_active()` holds, and once more after a step that changed chart state,
-    ///   so the view renders that state again. GPUI then notifies the view on the next frame,
-    ///   outside drawing; an idle chart schedules nothing.
+    /// - calls `Window::request_animation_frame` while `animation_frame_requested()` holds (an
+    ///   input animation or an unsettled live-bar glide), and once more after a step that changed
+    ///   chart state, so the view renders that state again; a drawn pulse is such a change on
+    ///   every frame. GPUI then notifies the view on the next frame, outside drawing; an idle
+    ///   chart schedules nothing.
     ///
     /// Returns whether the frame must be rebuilt, that is, a refresh happened since the last
     /// prepaint or this step changed chart state. Pass it as `FinancialFrameRequest::force_frame`,
@@ -220,11 +223,12 @@ impl GpuiChartInput {
         let stepped = Self::advance(engine, self.tick_ms(), cx.reduce_motion()) | released;
         let countdown = self.sync_countdown(engine, refreshed);
         self.arm_wake(engine, cx);
-        // Decided after the step: frames continue while the engine animates, and one more follows
-        // a step that changed chart state so the view renders it again (render runs before
+        // Decided after the step: frames continue while the engine animates (an input animation,
+        // or a live-bar glide whose first tick only stamped its clock), and one more follows a
+        // step that changed chart state so the view renders it again (render runs before
         // prepaint). That frame changes nothing, so the end of an animation, or a fired deadline,
         // costs exactly one extra frame and an idle chart schedules nothing.
-        if stepped || engine.input_animating() {
+        if stepped || engine.animation_frame_requested() {
             window.request_animation_frame();
         }
         self.captured.set(engine.input_pointer_captured());
@@ -284,20 +288,19 @@ impl GpuiChartInput {
         self.arm_wake(engine, cx);
     }
 
-    /// Motion policy, then `input_tick(now_ms)`, then `flush_coalesced_input`, then the pulse
-    /// clock. Returns whether chart state changed.
+    /// Motion policy, then `input_tick(now_ms)`, then `flush_coalesced_input`, then the animation
+    /// clock (`set_animation_time`: every live-bar glide, and the pulse clock while a pulse is
+    /// drawn). Returns whether chart state changed.
     fn advance(engine: &mut ChartEngine, now_ms: f64, reduced_motion: bool) -> bool {
         // A changed preference adds or removes the pulse, so it is a change too.
         let mut changed = Self::sync_motion_policy(engine, reduced_motion);
         changed |= engine.input_tick(now_ms);
         changed |= engine.flush_coalesced_input();
-        // The pulse moves on every frame. Its clock is part of the engine's overlay key, so a
-        // forced frame rebuilds only the overlay layer; the engine's own skip test does not track
-        // `animation_time`, which is why this reports a change.
-        if engine.last_price_pulse_active() {
-            engine.animation_time = now_ms;
-            changed = true;
-        }
+        // The pulse moves on every frame and a glide on every tick that integrates. The pulse
+        // clock is part of the engine's overlay key, so a forced frame rebuilds only the overlay
+        // layer; the engine's own skip test does not track `animation_time`, which is why the
+        // clock step reports the change itself.
+        changed |= engine.set_animation_time(now_ms);
         changed
     }
 

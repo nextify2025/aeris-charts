@@ -29,7 +29,7 @@ pub(crate) mod handles;
 pub(crate) mod kinds;
 mod parts;
 mod stats;
-mod time_anchor;
+pub(crate) mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{

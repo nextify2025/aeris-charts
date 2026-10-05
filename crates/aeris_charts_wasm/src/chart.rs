@@ -1139,6 +1139,82 @@ impl AerisChart {
             .unwrap_or_else(|_| "null".to_string())
     }
 
+    /// Replace the engine-owned timeline-mark lane atomically (`{marks, groups}`); the result is
+    /// the `{ok}` / `{ok:false,error}` envelope. Hidden groups are untouched.
+    pub fn set_timeline_marks_json(&mut self, snapshot_json: &str) -> String {
+        let snapshot =
+            match serde_json::from_str::<aeris_charts_engine::TimelineMarksSnapshot>(snapshot_json)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return trading_result_json(Err(aeris_charts_engine::ChartError::new(
+                        aeris_charts_engine::ErrorCode::InvalidData,
+                        error.to_string(),
+                    )))
+                }
+            };
+        trading_result_json(self.inner.borrow_mut().engine.set_timeline_marks(snapshot))
+    }
+
+    pub fn timeline_marks_json(&self) -> String {
+        serde_json::to_string(self.inner.borrow().engine.timeline_marks())
+            .unwrap_or_else(|_| r#"{"marks":[],"groups":[]}"#.to_string())
+    }
+
+    /// Show or hide the whole lane; returns whether the frame changed.
+    pub fn set_timeline_marks_visible(&mut self, visible: bool) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .set_timeline_marks_visible(visible)
+    }
+
+    /// Hide or show one group's marks: `{ok:true,changed}` or the error envelope.
+    pub fn set_timeline_group_hidden(&mut self, group: &str, hidden: bool) -> String {
+        match self
+            .inner
+            .borrow_mut()
+            .engine
+            .set_timeline_group_hidden(group, hidden)
+        {
+            Ok(changed) => serde_json::json!({"ok": true, "changed": changed}).to_string(),
+            Err(error) => trading_result_json(Err(error)),
+        }
+    }
+
+    pub fn hidden_timeline_groups_json(&self) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.hidden_timeline_groups())
+            .unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// The lane token under chart-content CSS px `(x, y)` or `null`.
+    pub fn timeline_mark_hit_json(&self, x_css: f64, y_css: f64) -> String {
+        serde_json::to_string(
+            &self
+                .inner
+                .borrow()
+                .engine
+                .timeline_mark_hit_at(x_css, y_css),
+        )
+        .unwrap_or_else(|_| "null".to_string())
+    }
+
+    /// The lane token that folds mark `id` while it is in view, or `null` (keyboard activation).
+    pub fn timeline_mark_hit_for_id_json(&self, id: &str) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.timeline_mark_hit_for_id(id))
+            .unwrap_or_else(|_| "null".to_string())
+    }
+
+    /// The pane showing the lane now (the primary series' pane while the lane is enabled,
+    /// non-empty and tall enough), or `undefined`; keyboard focus targets for marks follow it.
+    pub fn timeline_lane_pane(&self) -> Option<u32> {
+        self.inner
+            .borrow()
+            .engine
+            .timeline_lane_pane()
+            .and_then(|pane| u32::try_from(pane).ok())
+    }
+
     pub fn update_trading_position_json(&mut self, position_json: &str) -> String {
         let position = match serde_json::from_str::<TradingPosition>(position_json) {
             Ok(position) => position,
@@ -3275,11 +3351,13 @@ impl AerisChart {
             .borrow_mut()
             .set_series_markers_z_order(series_id, z_order)
     }
-    /// Whether any series wants the last-price pulse (host uses this to run/stop its rAF loop).
+    /// Whether the host must run its rAF loop: a series draws the last-price pulse or a live bar
+    /// is gliding (`live_bar_easing_ms`). The package calls this after every repaint.
     pub fn wants_animation(&self) -> bool {
         self.inner.borrow().wants_animation()
     }
-    /// Set the host animation clock (ms). Call before `render()` in the rAF loop (Phase B3).
+    /// Set the host animation clock (ms): advances live-bar easing and the pulse. Call before
+    /// `render()` in the rAF loop (Phase B3).
     pub fn set_animation_time(&mut self, t_ms: f64) {
         self.inner.borrow_mut().set_animation_time(t_ms);
     }
@@ -5028,10 +5106,15 @@ impl AerisChart {
     /// Drain the bounded controller event queue for platform-only effects.
     pub fn take_input_events_json(&mut self) -> String {
         use aeris_charts_engine::{ChartInputEvent, ChartRegion};
-        let events = self.inner.borrow_mut().engine.take_input_events();
+        let mut inner = self.inner.borrow_mut();
+        let events = inner.engine.take_input_events();
         let values: Vec<_> = events
             .into_iter()
             .map(|event| match event {
+                ChartInputEvent::TimelineMarkActivated(seq) => serde_json::json!({
+                    "kind": "timeline_mark_activated",
+                    "hit": inner.engine.timeline_mark_activation(seq),
+                }),
                 ChartInputEvent::Click { x, y } => {
                     serde_json::json!({"kind":"click","x":x,"y":y})
                 }
@@ -5889,6 +5972,12 @@ impl AerisChart {
         self.inner
             .borrow()
             .series_coordinate_to_price(id, coordinate)
+    }
+    /// The baseline price a Baseline series currently compares against (pinned `baseline_value`
+    /// or its `baseline_mode` over the visible range); `undefined` for other kinds or before the
+    /// chart has a visible range.
+    pub fn series_baseline_price(&self, id: u32) -> Option<f64> {
+        self.inner.borrow().series_baseline_price(id)
     }
     pub fn series_kind(&self, id: u32) -> Option<u8> {
         self.inner.borrow().series_kind(id)

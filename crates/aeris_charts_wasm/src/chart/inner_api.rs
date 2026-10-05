@@ -1476,14 +1476,16 @@ impl ChartInner {
             .set_series_last_price_animation(id as SeriesId, enabled);
     }
 
-    /// Whether the frame draws the last-price pulse (so the host can start/stop its rAF loop).
+    /// Whether the host must keep its rAF loop running: a last-price pulse is drawn or a live bar
+    /// is still gliding (`ChartEngine::animation_active`).
     pub fn wants_animation(&self) -> bool {
-        self.engine.last_price_pulse_active()
+        self.engine.animation_active()
     }
 
-    /// Set the host animation clock (ms). The shell's rAF loop calls this then `render()`.
+    /// Set the host animation clock (ms): advances every live-bar glide and the pulse clock
+    /// (`ChartEngine::set_animation_time`). The shell's rAF loop calls this then `render()`.
     pub fn set_animation_time(&mut self, t_ms: f64) {
-        self.animation_time = t_ms;
+        self.engine.set_animation_time(t_ms);
     }
 
     /// Move a series onto its pane's bottom-band overlay scale (volume-style) and set that band's
@@ -2644,6 +2646,9 @@ impl ChartInner {
     pub fn series_coordinate_to_price(&self, id: u32, coordinate: f64) -> Option<f64> {
         self.engine
             .series_coordinate_to_price(id as SeriesId, coordinate)
+    }
+    pub fn series_baseline_price(&self, id: u32) -> Option<f64> {
+        self.engine.series_baseline_price(id as SeriesId)
     }
     pub fn series_kind(&self, id: u32) -> Option<u8> {
         self.engine

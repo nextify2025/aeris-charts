@@ -28,10 +28,11 @@ use crate::style::{
     DARK_ACCENT_CSS, DARK_BORDER_CSS, DARK_CROSSHAIR_LABEL_CSS, DARK_CROSSHAIR_LINE_CSS,
     DARK_FOREGROUND_CSS, DARK_MARKET_DOWN_CSS, DARK_MARKET_UP_CSS, DARK_MUTED_FOREGROUND_CSS,
     DARK_SURFACE_CSS, DEFAULT_ACCENT_CSS, DEFAULT_BORDER_CSS, DEFAULT_CROSSHAIR_LABEL_CSS,
-    DEFAULT_CROSSHAIR_LINE_CSS, DEFAULT_FOREGROUND_CSS, DEFAULT_MARKET_DOWN_CSS,
-    DEFAULT_MARKET_UP_CSS, DEFAULT_MUTED_FOREGROUND_CSS, DEFAULT_SURFACE_CSS, LIGHT_ACCENT_CSS,
-    LIGHT_BORDER_CSS, LIGHT_CROSSHAIR_LABEL_CSS, LIGHT_CROSSHAIR_LINE_CSS, LIGHT_FOREGROUND_CSS,
-    LIGHT_MARKET_DOWN_CSS, LIGHT_MARKET_UP_CSS, LIGHT_MUTED_FOREGROUND_CSS, LIGHT_SURFACE_CSS,
+    DEFAULT_CROSSHAIR_LINE_CSS, DEFAULT_CROSSHAIR_LINE_RGB, DEFAULT_FOREGROUND_CSS,
+    DEFAULT_MARKET_DOWN_CSS, DEFAULT_MARKET_UP_CSS, DEFAULT_MUTED_FOREGROUND_CSS,
+    DEFAULT_SURFACE_CSS, LIGHT_ACCENT_CSS, LIGHT_BORDER_CSS, LIGHT_CROSSHAIR_LABEL_CSS,
+    LIGHT_CROSSHAIR_LINE_CSS, LIGHT_FOREGROUND_CSS, LIGHT_MARKET_DOWN_CSS, LIGHT_MARKET_UP_CSS,
+    LIGHT_MUTED_FOREGROUND_CSS, LIGHT_SURFACE_CSS,
 };
 
 /// Aeris-owned application color mode. Hosts select a mode; Aeris resolves every chart color
@@ -149,6 +150,11 @@ fn grid_color() -> String {
 }
 fn crosshair_color() -> String {
     DEFAULT_CROSSHAIR_LINE_CSS.into()
+}
+/// `crosshair.shadeRight` default tint: the theme-independent crosshair line token at 12% alpha.
+fn crosshair_shade_color() -> String {
+    let (r, g, b) = DEFAULT_CROSSHAIR_LINE_RGB;
+    format!("rgba({r}, {g}, {b}, 0.12)")
 }
 fn crosshair_label_bg() -> String {
     DEFAULT_CROSSHAIR_LABEL_CSS.into()
@@ -308,6 +314,28 @@ impl Default for CrosshairLineOptions {
     }
 }
 
+/// `crosshair.shadeRight` — a translucent veil over the pane region to the right of the hovered
+/// bar (Aeris extension). It starts at the snapped bar's right edge, reaches the pane's right edge,
+/// and is painted in every stacked pane like the vertical line. Opacity travels in the CSS alpha of
+/// `color`; an unparsable color falls back to the default tint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrosshairShadeOptions {
+    /// Off by default.
+    pub visible: bool,
+    /// CSS color; the default is the crosshair line token at 12% alpha.
+    pub color: String,
+}
+
+impl Default for CrosshairShadeOptions {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            color: crosshair_shade_color(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CrosshairOptions {
@@ -315,6 +343,9 @@ pub struct CrosshairOptions {
     pub vert_line: CrosshairLineOptions,
     #[serde(rename = "horzLine")]
     pub horz_line: CrosshairLineOptions,
+    /// Veil right of the hovered bar; see [`CrosshairShadeOptions`].
+    #[serde(rename = "shadeRight")]
+    pub shade_right: CrosshairShadeOptions,
     /// [`crosshair_mode`] value (default Magnet, matching reference).
     pub mode: u8,
     /// reference `doNotSnapToHiddenSeriesIndices` (default false): when true, the crosshair's snapped
@@ -402,6 +433,7 @@ impl Default for CrosshairOptions {
         Self {
             vert_line: CrosshairLineOptions::default(),
             horz_line: CrosshairLineOptions::default(),
+            shade_right: CrosshairShadeOptions::default(),
             mode: crosshair_mode::NORMAL, // deliberate divergence from the reference's Magnet default
             do_not_snap_to_hidden_series_indices: false,
         }
@@ -647,6 +679,8 @@ impl ChartOptionsStore {
         }
 
         // Crosshair mode/snapping are interaction behavior; only the two visual line groups reset.
+        // The right-of-cursor veil follows the watermark rule: its tint is style, whether it is
+        // shown is host state.
         if let (Some(current), Some(default)) = (
             self.value
                 .get_mut("crosshair")
@@ -661,6 +695,20 @@ impl ChartOptionsStore {
                             current.insert(key.to_string(), default_line.clone());
                         }
                     }
+                }
+            }
+            if let Some(default_tint) = default
+                .get("shadeRight")
+                .and_then(|shade| shade.get("color"))
+            {
+                let shade = current
+                    .entry("shadeRight")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if !shade.is_object() {
+                    *shade = Value::Object(Map::new());
+                }
+                if let Some(shade) = shade.as_object_mut() {
+                    shade.insert("color".into(), default_tint.clone());
                 }
             }
         }
@@ -701,6 +749,9 @@ mod tests {
             o.crosshair.horz_line.label_background_color,
             DEFAULT_CROSSHAIR_LABEL_CSS
         );
+        // The right-of-cursor veil ships off, tinted with the crosshair line token at 12% alpha.
+        assert!(!o.crosshair.shade_right.visible);
+        assert_eq!(o.crosshair.shade_right.color, "rgba(74, 74, 74, 0.12)");
         assert!(o.hovered_series_on_top);
         assert!(!o.auto_size);
         // Axis border cosmetics use the canonical border everywhere.
@@ -775,7 +826,8 @@ mod tests {
             "crosshair": {
                 "mode": crosshair_mode::HIDDEN,
                 "doNotSnapToHiddenSeriesIndices": true,
-                "vertLine": { "color": "#abcdef", "width": 4 }
+                "vertLine": { "color": "#abcdef", "width": 4 },
+                "shadeRight": { "visible": true, "color": "#abcdef" }
             },
             "rightPriceScale": {
                 "visible": false,
@@ -813,6 +865,12 @@ mod tests {
         assert_eq!(options.crosshair.vert_line.width, 1.0);
         assert_eq!(options.crosshair.mode, crosshair_mode::HIDDEN);
         assert!(options.crosshair.do_not_snap_to_hidden_series_indices);
+        // The veil's tint is style; whether it is shown is state (watermark precedent).
+        assert!(options.crosshair.shade_right.visible);
+        assert_eq!(
+            options.crosshair.shade_right.color,
+            "rgba(74, 74, 74, 0.12)"
+        );
         assert_eq!(options.right_price_scale.border_color, LIGHT_BORDER_CSS);
         assert_eq!(options.right_price_scale.text_color, None);
         assert!(!options.right_price_scale.visible);
@@ -834,6 +892,30 @@ mod tests {
         assert_eq!(raw["rightPriceScale"]["ticksVisible"], false);
         assert_eq!(raw["rightPriceScale"]["boldRoundLabels"], true);
         assert_eq!(raw["hostExtension"]["keep"], 42);
+    }
+
+    #[test]
+    fn crosshair_shade_patch_merges_camelcase_keys() {
+        let mut store = ChartOptionsStore::new();
+        store.apply(&json!({ "crosshair": { "shadeRight": { "visible": true } } }));
+        let o = store.get();
+        assert!(o.crosshair.shade_right.visible);
+        assert_eq!(o.crosshair.shade_right.color, "rgba(74, 74, 74, 0.12)");
+        // untouched siblings keep their defaults
+        assert!(o.crosshair.vert_line.visible);
+        assert_eq!(o.crosshair.mode, crosshair_mode::NORMAL);
+        // The wire key is the reference-style camelCase group name.
+        let serialized = serde_json::to_value(o).unwrap();
+        assert_eq!(serialized["crosshair"]["shadeRight"]["visible"], true);
+        assert!(serialized["crosshair"].get("shade_right").is_none());
+
+        // A style reset on a store that never named the group still restores the tint.
+        let mut store = ChartOptionsStore::new();
+        store.apply(&json!({ "crosshair": { "vertLine": { "width": 3 } } }));
+        store.reset_style_to_defaults(ChartTheme::Dark);
+        let o = store.get();
+        assert!(!o.crosshair.shade_right.visible);
+        assert_eq!(o.crosshair.shade_right.color, "rgba(74, 74, 74, 0.12)");
     }
 
     #[test]

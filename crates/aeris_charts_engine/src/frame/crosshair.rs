@@ -1,6 +1,16 @@
 //! Crosshair geometry: pane hit, index snap, magnet price snap, crosshair prims.
 
+use super::feature_geometry::positions_line;
 use super::*;
+
+/// Fallback for an unparsable `crosshair.shadeRight.color`: the default tint, the crosshair line
+/// token at 12% alpha (`CrosshairShadeOptions::default().color`, alpha 0.12 * 255 rounds to 31).
+const CROSSHAIR_SHADE_COLOR: Color = Color::rgba(
+    DEFAULT_CROSSHAIR_LINE_RGB.0,
+    DEFAULT_CROSSHAIR_LINE_RGB.1,
+    DEFAULT_CROSSHAIR_LINE_RGB.2,
+    31,
+);
 
 impl ChartEngine {
     /// Interactive chart objects own pointer feedback while they are hovered or manipulated.
@@ -61,11 +71,35 @@ impl ChartEngine {
         let vert_style = crate::line_style_from_u8(ch.vert_line.style);
         let horz_style = crate::line_style_from_u8(ch.horz_line.style);
         let pane = &self.panes[pane_index];
+        let y0 = (pane.top * vpr).round() as i32;
+        let y1 = ((pane.top + pane.height) * vpr).round() as i32;
+        // `shadeRight`: a veil from the snapped bar's right edge to the pane edge, in every
+        // stacked pane like the vertical line (time-aligned, not gated on the hovered pane) and
+        // independent of the line's own visibility. The edge comes from the same device-pixel
+        // bar rule as the `HighlightBarCrosshair` primitive so the two abut exactly; when that
+        // edge rounds onto or past the pane edge there is nothing to veil and no zero-width quad
+        // reaches an executor. It paints before the lines so they stay untinted.
+        if ch.shade_right.visible {
+            let (left, width) = positions_line(snapped_x, hpr, self.time_scale.bar_spacing());
+            let x0 = left + width;
+            let w = pane_w_px - x0;
+            if w > 0 {
+                out.push(Prim::Rect {
+                    rect: IRect {
+                        x: x0,
+                        y: y0,
+                        w,
+                        h: y1 - y0,
+                    },
+                    color: css_color(&ch.shade_right.color, CROSSHAIR_SHADE_COLOR),
+                });
+            }
+        }
         if ch.vert_line.visible {
             out.push(Prim::VLine {
                 x: (snapped_x * hpr).round() as i32,
-                y0: (pane.top * vpr).round() as i32,
-                y1: ((pane.top + pane.height) * vpr).round() as i32,
+                y0,
+                y1,
                 width: vert_width,
                 style: vert_style,
                 color: vert_color,
@@ -103,7 +137,9 @@ impl ChartEngine {
             {
                 continue;
             }
-            let plot = self.data.plot(series.id);
+            // The marker sits on the drawn line: an eased last bar reads its display values here
+            // while the magnet snap above keeps the real ones.
+            let plot = self.display_plot(series.id);
             let Some(row) = plot.search(index, MismatchDirection::None) else {
                 continue;
             };
@@ -119,7 +155,7 @@ impl ChartEngine {
                 continue;
             };
             let baseline = if series.kind == SeriesKind::Baseline {
-                self.resolved_baseline_price(series.id, from, to)
+                self.resolved_baseline_price(plot, series.id, from, to)
             } else {
                 None
             };
@@ -127,7 +163,7 @@ impl ChartEngine {
                 .crosshair_marker_background_color
                 .as_deref()
                 .and_then(Color::parse_css)
-                .unwrap_or_else(|| self.series_bar_color(series, row, baseline));
+                .unwrap_or_else(|| self.series_bar_color(series, plot, row, baseline));
             let border = series
                 .crosshair_marker_border_color
                 .as_deref()

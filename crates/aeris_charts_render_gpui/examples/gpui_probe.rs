@@ -1427,6 +1427,12 @@ impl Probe {
                 }
                 ChartInputEvent::CrosshairLeft => "crosshair left".into(),
                 ChartInputEvent::DeltaTooltipChanged => "delta tooltip changed".into(),
+                ChartInputEvent::TimelineMarkActivated(seq) => {
+                    self.engine.timeline_mark_activation(seq).map_or_else(
+                        || "timeline mark activated".into(),
+                        |hit| format!("timeline mark: {}", hit.tooltip_text()),
+                    )
+                }
             };
         }
     }
@@ -5148,6 +5154,101 @@ mod window_input_tests {
             "the chart leaves keys it does not bind to its parent"
         );
         assert_eq!(engine(&cx, &chart, ChartEngine::bar_spacing), spacing);
+    }
+
+    /// Top device y of the rightmost candle body in the probe's frame: the drawn close while the
+    /// bar closes above its open.
+    fn last_body_top(probe: &Probe) -> i32 {
+        probe.frame.panes[0]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::Rect { rect, .. } | Prim::RectFrame { rect, .. } => {
+                    Some((rect.x + rect.w, rect.y))
+                }
+                _ => None,
+            })
+            .max_by_key(|&(right, _)| right)
+            .map(|(_, top)| top)
+            .expect("the frame draws candle bodies")
+    }
+
+    /// A live-bar glide animates a cached chart frame by frame on the adapter clock: the frame
+    /// that ticks the glide first only stamps its clock and still draws the old bar, later frames
+    /// move the drawn close toward the new one, and the chart goes idle once the glide settles.
+    #[gpui::test]
+    fn an_eased_live_bar_moves_between_requested_frames_and_then_stops(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        assert_eq!(next_frame(&mut cx), 0, "an idle chart requests nothing");
+        // Scroll the live edge into view, enable easing on the main series, then replace its last
+        // bar in place with one that closes above its open, so the body top is the drawn close.
+        let close = chart.update(&mut cx, |probe, cx| {
+            let last = probe.source_bars.times.len() - 1;
+            probe
+                .engine
+                .set_visible_logical_range(last as f64 - 100.0, last as f64 + 1.0);
+            assert!(probe
+                .engine
+                .series_apply_options_json(0, r#"{"live_bar_easing_ms":500}"#));
+            let open = probe.source_bars.open[last];
+            let close = open.max(probe.source_bars.close[last]) + 8.0;
+            assert!(probe.engine.update_series_bar(
+                0,
+                probe.source_bars.times[last],
+                [open, close + 2.0, probe.source_bars.low[last], close]
+            ));
+            probe.input.refresh(&probe.engine, cx);
+            close
+        });
+        cx.run_until_parked();
+        // The refresh frame stamps the glide's clock and still shows the old bar; the unsettled
+        // glide queues the next frame.
+        let stamped = chart.read_with(&cx, |probe, _| {
+            assert!(probe.engine.live_bar_easing_active());
+            last_body_top(probe)
+        });
+        advance(&mut cx, Duration::from_millis(40));
+        assert_eq!(next_frame(&mut cx), 1, "the glide keeps frames coming");
+        let first = chart.read_with(&cx, |probe, _| last_body_top(probe));
+        assert_ne!(
+            stamped, first,
+            "the drawn close moved between two requested frames"
+        );
+        advance(&mut cx, Duration::from_millis(40));
+        assert_eq!(next_frame(&mut cx), 1);
+        let second = chart.read_with(&cx, |probe, _| last_body_top(probe));
+        assert_ne!(
+            first, second,
+            "and keeps moving while the glide is unsettled"
+        );
+        assert!(
+            (second < first) == (first < stamped),
+            "monotone toward the new close: {stamped} -> {first} -> {second}"
+        );
+        // Six time constants after the tick the glide settles exactly on the real close. The
+        // frame that settles it changed chart state, so it queues one more; that frame changes
+        // nothing and the chart is idle again.
+        advance(&mut cx, Duration::from_millis(6 * 500));
+        assert_eq!(next_frame(&mut cx), 1, "the frame that settles the glide");
+        assert!(!engine(&cx, &chart, ChartEngine::live_bar_easing_active));
+        assert_eq!(
+            next_frame(&mut cx),
+            1,
+            "the one frame after the settling step"
+        );
+        assert_eq!(next_frame(&mut cx), 0, "a settled glide stops the frames");
+        chart.read_with(&cx, |probe, _| {
+            let settled_y = probe
+                .engine
+                .series_price_to_coordinate(0, close)
+                .expect("the close is on the scale");
+            let expected = (settled_y * f64::from(probe.engine.dpr)).round() as i32;
+            assert!(
+                (last_body_top(probe) - expected).abs() <= 1,
+                "settled: the body top is the real close ({} vs {expected})",
+                last_body_top(probe)
+            );
+        });
     }
 
     #[gpui::test]

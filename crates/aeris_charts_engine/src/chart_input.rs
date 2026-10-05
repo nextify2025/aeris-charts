@@ -258,6 +258,8 @@ pub enum ChartHover {
     VolumeProfile(NativePrimitiveId),
     /// A general-series item; read it through [`ChartEngine::general_hovered_hit`].
     General,
+    /// A timeline-mark lane token; read it through [`ChartEngine::timeline_mark_hit_at`].
+    TimelineMark,
 }
 
 /// A secondary click resolved by the engine. Menus, clipboard, and order UI stay host-owned.
@@ -295,6 +297,9 @@ pub enum ChartInputEvent {
     RemoveSeries(SeriesId),
     /// Delta-tooltip comparison state changed; the host notifies its range subscribers.
     DeltaTooltipChanged,
+    /// A timeline-mark token was clicked. The resolved hit is retained under this sequence
+    /// number in a bounded ring: [`ChartEngine::timeline_mark_activation`].
+    TimelineMarkActivated(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -318,6 +323,8 @@ enum PressMode {
         dragging: bool,
     },
     Alert,
+    /// A press on a timeline-mark token; releasing in place activates it.
+    TimelineMark,
     DrawingCreation {
         capture: bool,
         committed_on_press: bool,
@@ -339,6 +346,7 @@ impl PressMode {
             Self::Separator { .. } => InputTarget::Separator,
             Self::Trading { .. } => InputTarget::Trading,
             Self::Alert => InputTarget::Alert,
+            Self::TimelineMark => InputTarget::TimelineMark,
             Self::Measure | Self::DrawingCreation { .. } | Self::DrawingDrag | Self::TextEditor => {
                 InputTarget::Drawing
             }
@@ -468,6 +476,7 @@ impl ChartEngine {
         self.set_hovered_text(None);
         self.set_hovered_drawing(None);
         self.clear_general_hover();
+        self.clear_timeline_hover();
         self.refresh_input_cursor();
     }
 
@@ -527,7 +536,8 @@ impl ChartEngine {
     }
 
     /// Whether an input-owned animation (kinetic coast, held keyboard pan, animated scroll) needs
-    /// another frame. Hosts request animation frames only while this holds.
+    /// another frame. Hosts request frames through `animation_frame_requested`, which also covers
+    /// an unsettled live-bar glide.
     pub fn input_animating(&self) -> bool {
         self.input.kinetic_active || self.keyboard_scroll_active() || self.scroll_animation_active()
     }
@@ -582,6 +592,7 @@ impl ChartEngine {
         {
             self.input.tooltip_deadline_ms = None;
             changed |= self.arm_trading_tooltip();
+            changed |= self.arm_timeline_tooltip();
         }
         if self
             .input
@@ -757,7 +768,11 @@ impl ChartEngine {
             moved: false,
             text_press_selected,
             control_pair: double_candidate
-                && (control_click || matches!(mode, PressMode::Trading { .. } | PressMode::Alert)),
+                && (control_click
+                    || matches!(
+                        mode,
+                        PressMode::Trading { .. } | PressMode::Alert | PressMode::TimelineMark
+                    )),
         };
         if self.drawing_text_edit().is_some() {
             if self.point_on_edited_text(x, y) {
@@ -1111,6 +1126,7 @@ impl ChartEngine {
                 PressMode::DrawingCreation { capture: false, .. }
                 | PressMode::Trading { dragging: false }
                 | PressMode::Alert
+                | PressMode::TimelineMark
                 | PressMode::Separator { .. }
                 | PressMode::TouchTracking
                 | PressMode::DeltaTooltip
@@ -1139,8 +1155,11 @@ impl ChartEngine {
             && input.timestamp_ms > 0.0
             && input.timestamp_ms.is_finite())
         .then_some((x, y, input.timestamp_ms));
-        self.input.control_click =
-            !moved && matches!(press.mode, PressMode::Trading { .. } | PressMode::Alert);
+        self.input.control_click = !moved
+            && matches!(
+                press.mode,
+                PressMode::Trading { .. } | PressMode::Alert | PressMode::TimelineMark
+            );
         let modifiers = drawing_modifiers(input.modifiers);
         let mut created_on_release = false;
         match press.mode {
@@ -1200,6 +1219,26 @@ impl ChartEngine {
             PressMode::Alert => {
                 if !moved && self.alert_create_hit_at(x, y) {
                     self.activate_alert_create_at(x, y);
+                }
+            }
+            PressMode::TimelineMark => {
+                // One outcome per click, and only when the same token is under the press and
+                // the release; the host reads the resolved hit by its sequence number.
+                if !moved {
+                    let profile = HitProfile::for_device(input.device);
+                    let start = self.timeline_mark_hit_at_with_profile(
+                        press.start.0,
+                        press.start.1,
+                        profile,
+                    );
+                    let end = self.timeline_mark_hit_at_with_profile(x, y, profile);
+                    if let Some((_, end)) = start
+                        .zip(end)
+                        .filter(|(start, end)| start.logical == end.logical)
+                    {
+                        let seq = self.push_timeline_activation(end);
+                        self.push_input_event(ChartInputEvent::TimelineMarkActivated(seq));
+                    }
                 }
             }
             PressMode::DrawingDrag => {
@@ -1971,7 +2010,13 @@ impl ChartEngine {
         if let Some((x, y)) = self.input.pointer.filter(|_| resting) {
             if matches!(self.region_at(x, y), ChartRegion::Pane) {
                 let changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
-                if changed || !self.trading_tooltip_pending() {
+                // A control that appeared under the resting pointer waits for the next motion to
+                // start its dwell. Otherwise a lane token whose dwell is still running keeps it
+                // (`refresh_pointer_hover`), and nothing pending clears the deadline.
+                let trading_pending = self.trading_tooltip_pending();
+                if (changed && trading_pending)
+                    || (!trading_pending && !self.timeline_tooltip_pending())
+                {
                     self.input.tooltip_deadline_ms = None;
                 }
             }
@@ -2004,6 +2049,14 @@ impl ChartEngine {
         }
         if self.alert_create_hit_at(x, y) {
             return PressMode::Alert;
+        }
+        // A mark token is an engine control like the chip above: it never clears the active
+        // order group and never reaches the drawing or pan arbitration below.
+        if self
+            .timeline_token_at(x, y, HitProfile::for_device(input.device))
+            .is_some()
+        {
+            return PressMode::TimelineMark;
         }
         self.deactivate_trading_group();
         if self.active_drawing_tool().is_some() {
@@ -2074,6 +2127,7 @@ impl ChartEngine {
                     && !control_pair
                     && self.trading_hit_at(x, y).is_none()
                     && !self.alert_create_hit_at(x, y)
+                    && !self.timeline_token_under(x, y)
                     && self.drawing_at(x, y) == selected;
                 match selected.filter(|_| owned) {
                     None => self.clear_brushable_ranges(),
@@ -2309,6 +2363,14 @@ impl ChartEngine {
             self.clear_general_hover();
             return ChartHover::None;
         };
+        // Lane tokens are pane chrome above every series and drawing.
+        if self.timeline_token_under(x, y) {
+            self.clear_general_hover();
+            self.set_hovered_series(None);
+            self.set_hovered_text(None);
+            self.set_hovered_drawing(None);
+            return ChartHover::TimelineMark;
+        }
         let general = self.update_general_hover(pane, x, y).is_some();
         if let Some(hit) = primitive.filter(|hit| hit.layer == HostPrimitiveLayer::Top) {
             self.clear_general_hover();
@@ -2409,12 +2471,21 @@ impl ChartEngine {
         self.input.hover = self.arbitrate_hover(x, y, None);
         // The dwell belongs to the hovered control: a new target restarts it, while motion inside
         // the same control lets it elapse and keeps a shown tooltip. A close control whose tooltip
-        // a press or host snapshot hid dwells again on the next motion.
+        // a press or host snapshot hid dwells again on the next motion. The timeline-mark title
+        // tooltip shares the dwell on the same terms: a changed token restarts it, a trading change
+        // under a still-hovered token restarts it only when the new control dwells itself, and
+        // leaving every dwelling control clears it.
         if !captured {
             let target_changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
-            if !self.trading_tooltip_pending() {
+            let token_changed = self.set_timeline_hover(x, y);
+            let trading_pending = self.trading_tooltip_pending();
+            let token_pending = self.timeline_tooltip_pending();
+            if !trading_pending && !token_pending {
                 self.input.tooltip_deadline_ms = None;
-            } else if target_changed || self.input.tooltip_deadline_ms.is_none() {
+            } else if (target_changed && trading_pending)
+                || (token_changed && token_pending)
+                || self.input.tooltip_deadline_ms.is_none()
+            {
                 self.input.tooltip_deadline_ms = Some(now_ms + TRADING_TOOLTIP_DWELL_MS);
             }
         }
@@ -2482,7 +2553,7 @@ impl ChartEngine {
                 PressMode::Trading { dragging: false } => {
                     return self.trading_press_cursor(press.start);
                 }
-                PressMode::Alert => return ChartCursor::Pointer,
+                PressMode::Alert | PressMode::TimelineMark => return ChartCursor::Pointer,
                 PressMode::TextEditor => return ChartCursor::Text,
                 PressMode::Measure
                 | PressMode::DrawingCreation { .. }
@@ -2513,7 +2584,8 @@ impl ChartEngine {
         }
         // The cursor follows pane-press arbitration. A live measure takes every press, so it
         // keeps the crosshair over every chart object. An armed tool shows its crosshair over
-        // everything except the trading controls and the alert chip that still win a press.
+        // everything except the trading controls, the alert chip and the lane tokens that still
+        // win a press.
         if self.measure_active() {
             return ChartCursor::Crosshair;
         }
@@ -2528,6 +2600,9 @@ impl ChartEngine {
             return cursor;
         }
         if self.alert_create_hit_at(x, y) {
+            return ChartCursor::Pointer;
+        }
+        if self.timeline_token_under(x, y) {
             return ChartCursor::Pointer;
         }
         if armed {
@@ -2556,6 +2631,8 @@ mod drawing_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod motion_tests;
+#[cfg(test)]
+mod timeline_tests;
 #[cfg(test)]
 mod trading_tests;
 

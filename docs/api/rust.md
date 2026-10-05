@@ -20,15 +20,15 @@ Rust crate 仅限仓库内使用（`publish = false`）；不会向 crates.io �
 
 GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式会重放每个未被 notify 的视图，gpui-pre 对以 `.cached()` 嵌入的视图也是如此；纯 gpui-pre 的重绘多于必要，只在窗口中有其他内容重绘时才掩盖缺失的 notify。因此 `GpuiChartInput` 拥有图表所需的每个 notify、定时器和动画帧，GPUI 宿主恰好进行以下调用：
 
-- 用 `GpuiChartInput::new(cx)` 构造适配器。它读取 GPUI 的执行器时钟（`BackgroundExecutor::now`，生产环境中为 `Instant::now`，在 `TestAppContext::advance_clock` 下为虚拟时钟），每个输入时间戳、`input_tick`、最新价脉冲与唤醒都共享该时钟。`GpuiChartInput::default()` 保留标准库时钟，没有视图也没有唤醒，供单元测试等仅引擎的用途使用。
+- 用 `GpuiChartInput::new(cx)` 构造适配器。它读取 GPUI 的执行器时钟（`BackgroundExecutor::now`，生产环境中为 `Instant::now`，在 `TestAppContext::advance_clock` 下为虚拟时钟），每个输入时间戳、`input_tick`、最新价脉冲、实时柱滑动与唤醒都共享该时钟。`GpuiChartInput::default()` 保留标准库时钟，没有视图也没有唤醒，供单元测试等仅引擎的用途使用。
 - 在图表画布的每次 prepaint 中、准备帧之前，调用一次 `prepare_frame(&mut engine, bounds, window, cx)`，并把其结果作为 `FinancialFrameRequest::force_frame` 传入（或并入宿主自己的重建标志）。其结果带有 `#[must_use]`。它依次：
   - 记录画布边界和绘制该画布的视图；
   - 结束窗口无法完成的输入。窗口自上一次 prepaint 以来失活时，它像浏览器在窗口失焦时那样，用 `input_cancel` 放弃进行中的按下，否则停止运动（`input_cancel_motion`），因为失活的窗口得不到释放或按键抬起；GPUI 只沿获得焦点的元素的派发路径投递按键抬起，因此当键盘焦点在首次绘制方向键平移的 prepaint 之后移开时，平移也会结束；
   - 应用 `App::reduce_motion`，这也会移除最新价脉冲；
-  - 推进输入动画与到期的截止时间，转发最新的合并捕获样本，并在 `last_price_pulse_active()` 成立期间设置 `engine.animation_time`；
+  - 推进输入动画与到期的截止时间，转发最新的合并捕获样本，并在适配器时钟上调用 `set_animation_time`：它推进每一个实时柱滑动（滑动的第一次 Tick 只记录时钟，之后每次推进都移动已绘制的柱），并仅在绘制了脉冲或某个滑动推进时才移动 `animation_time`；
   - 像浏览器渲染路径一样把 K 线收盘倒计时时钟固定为系统时钟（`set_now_seconds`，UTC 秒）。显示其他时钟的宿主在此调用之后再固定自己的时钟；
   - 重新设定唤醒；
-  - 在 `input_animating()` 或脉冲成立期间调用 `Window::request_animation_frame`，并在改变了图表状态的步骤之后再请求一次：render 在 prepaint 之前运行，这一帧让宿主在 render 中派生的界面元素显示该步骤的结果；它不改变任何东西，因此动画结束或截止时间触发恰好只多花一帧。
+  - 在 `animation_frame_requested()`（输入动画，或尚未落定的实时柱滑动）成立期间调用 `Window::request_animation_frame`，并在改变了图表状态的步骤之后再请求一次（绘制中的脉冲每帧都是这样的变更，因此脉冲经由时钟步保持帧）：render 在 prepaint 之前运行，这一帧让宿主在 render 中派生的界面元素显示该步骤的结果；它不改变任何东西，因此动画结束或截止时间触发恰好只多花一帧。
 - 在每个绘制之外的引擎变更之后调用 `refresh(&engine, cx)`：
   - 作为每个输入监听器的最后一步，在排空宿主使用的引擎队列（`take_input_events`、`take_alert_create_requests`）之后，因为排空可能改变引擎（`RemoveSeries`）；
   - 在宿主对数据、选项、主题、绘图、交易状态或交互选项的每次更新之后，以及启动引擎动画之后（向 `start_real_time_scroll_animation` 等调用传入 `now_ms()`）。
@@ -139,7 +139,7 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 
 更换固定修订之前，宿主应当了解的行为变化：
 
-- GPUI 的折线与面积系列现在会像在浏览器中一样让最新价脉冲：在 `last_price_pulse_active()` 成立期间，适配器推进 `animation_time`，并在每次显示刷新时请求一帧。此前适配器不驱动脉冲时钟，因此自己不设置 `animation_time` 的 GPUI 宿主显示的是静止的圆环。用 `set_series_last_price_animation(id, false)` 让系列退出，并在发布显示此类系列的版本之前，在 gpui-pre 宿主上测量 CPU。
+- GPUI 的折线与面积系列现在会像在浏览器中一样让最新价脉冲：在 `last_price_pulse_active()` 成立期间，适配器通过其时钟步 `set_animation_time` 推进脉冲时钟，该步每帧报告变更，因此在每次显示刷新时都会再请求一帧。此前适配器不驱动脉冲时钟，因此自己不设置 `animation_time` 的 GPUI 宿主显示的是静止的圆环。用 `set_series_last_price_animation(id, false)` 让系列退出，并在发布显示此类系列的版本之前，在 gpui-pre 宿主上测量 CPU。
 - 脉冲是装饰性动效，因此引擎在 `InteractionOptions::reduced_motion` 下移除它：`last_price_pulse_active()` 变为 false，帧中不再有该圆环，每个宿主上都是如此。GPUI 在每次 prepaint 时传入 `App::reduce_motion`，因此在该偏好下 GPUI 图表从不脉冲。浏览器随每个指针和按键事件传入 `prefers-reduced-motion`，因此在该偏好下，浏览器图表在第一次输入之前仍会脉冲。
 - 显示中的 K 线收盘倒计时现在会在空闲的 GPUI 图表上跳动：`prepare_frame` 固定系统时钟（UTC），并在 `countdown_shown()` 成立期间由唤醒每秒重绘一次，与浏览器包的定时器一致。从未输入时钟的 GPUI 宿主现在会在开启 `countdown_visible` 的系列上显示倒计时；与浏览器一样，主系列默认开启该选项。
 - 按住的方向键现在会在其按键抬起之前、键盘焦点离开图表或窗口失活时结束，而不再一直平移并请求帧，直到下一次按键抬起到达图表。
@@ -160,6 +160,15 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - 种类名称 `date_price_range` 仍会被读取（serde 别名和 `DrawingKind::from_name`），但绝不会被写出，因此由上游固定修订保存的文档仍可加载；保存的文档、模板和剪贴板载荷写出的是 `date_and_price_range`。
 - 网格吸附。三个范围工具以及多头和空头仓位工具的创建、锚点拖动、主体拖动和键盘微调，都会吸附到整根柱以及品种 tick 或价格带价位梯。合并之前的自有线固定修订在这些工具上没有这种吸附，因此这五个工具都会获得这一变更（仓位工具的价格吸附更早，随合并 `2e7d19f` 引入）。上游自 `5a2e6e8` 起的固定修订已经让它们吸附到柱和价格 tick；它新增了价格带价位梯（`SeriesPriceFormat::tick_ladder`）。
 - Shift 点击快速测量随 `5a2e6e8` 引入（合并之前的自有线固定修订从未具有它）。main 由输入控制器驱动它（在窗格上按下 Shift），因此无需为此调用 `measure_pointer_*`。
+
+**十字光标遮罩、基线模式、实时柱缓动与时间线标记**（自有线，来自 `4f8a621 feat: live-bar easing, baseline reference line and mode, crosshair shade, timeline-mark lane`，即新增 `live_bar_easing_ms` 的提交，可用 `git log -S'live_bar_easing_ms' -- crates/aeris_charts_engine/src/lib.rs` 找到；参见[呈现扩展](presentation.md)）。每一项新增默认都关闭或为空，因此不采用任何一项的宿主渲染结果与之前相同；评审点是帧请求谓词，以及新增的枚举变体与结构体字段：
+
+- 动画时钟。`ChartEngine::set_animation_time(ms)` 是引擎上的新方法（此前浏览器外壳自行记录一个时钟）：它推进每一个实时柱滑动，并仅在绘制了最新价脉冲或某个滑动推进时写入 `pub animation_time` 字段，因此仅打时间戳的 Tick 不改变任何帧键。`advance_live_bar_easing(now_ms) -> bool` 只推进滑动；`live_bar_easing_active()`、`animation_active()`（脉冲或滑动，即浏览器 `wants_animation` 的返回值）与 `animation_frame_requested()`（`input_animating() || live_bar_easing_active()`，Rust 宿主的帧请求谓词）都是新增的。`set_animation_time` 返回该时钟步是否改变了图表所绘内容（某个滑动推进或落定，或绘制中的脉冲前移）。按上文引擎输入控制器分组所述、仅在 `input_animating()` 成立期间请求下一帧的 Rust 宿主，应改为 `animation_frame_requested()`，否则滑动只显示第一帧便停滞，因为没有再请求帧；GPUI 宿主无需迁移：`GpuiChartInput::prepare_frame` 在其时钟步中调用 `set_animation_time`，在滑动落定之前持续请求帧，并在滑动推进时返回 `true`（见上文 GPUI 刷新契约）。
+- 基线。`ChartEngine::series_baseline_price(id) -> Option<f64>` 与公共枚举 `BaselineMode`（`VisibleMidpoint`、`CloseBeforeVisibleRange`，带 `as_str` 与 `parse`）是新增的。`SeriesEntry` 新增 `pub` 字段 `baseline_mode`、`baseline_line_visible`、`baseline_line_color: Option<String>`、`baseline_line_width`、`baseline_line_style` 与 `live_bar_easing_ms`；列出全部字段的结构体字面量需要加上它们，默认值保持此前的渲染。直接写入 `live_bar_easing_ms` 的宿主得到 JSON 路径的语义：非有限或非正值为关闭，更大的值钳制到 `MAX_LIVE_BAR_EASING_MS`（1000）。
+- 十字光标。`aeris_charts_core::options::CrosshairOptions` 新增 `shade_right: CrosshairShadeOptions { visible, color }`（线上键 `shadeRight`，`#[serde(default)]`，因此在它之前保存的 V2 文档仍可读取）；列出全部字段的结构体字面量需要加上它。
+- 时间线标记。新增 `ChartEngine` 方法：`set_timeline_marks(snapshot) -> Result<(), ChartError>`、`timeline_marks()`、`set_timeline_marks_visible(bool) -> bool`、`timeline_marks_visible()`、`set_timeline_group_hidden(group, hidden) -> Result<bool, ChartError>`、`hidden_timeline_groups()`、`timeline_mark_hit_at(x, y)`、`timeline_mark_hit_at_with_profile(x, y, HitProfile)`、`timeline_mark_hit_for_id(id)`、`timeline_lane_pane()` 与 `timeline_mark_activation(seq)`；新增公共类型 `TimelineMark`、`TimelineMarkGlyph`、`TimelineGlyphShape`、`TimelineMarkGroup`、`TimelineMarksSnapshot` 与 `TimelineMarkHit`，以及上限 `MAX_TIMELINE_MARKS`（4,096）与 `MAX_TIMELINE_GROUPS`（64）。新增变体，每个都是穷尽 `match` 的编译期破坏性变更：`ChartInputEvent::TimelineMarkActivated(u32)`（与其他事件一起排空，并通过 `timeline_mark_activation(seq)` 读取命中）、`ChartHover::TimelineMark` 与 `InputTarget::TimelineMark`。`EngineMemoryUsage` 新增 `timeline_marks_capacity_bytes`。
+- 持久化。V1、V2 与 V3 文档新增可选的 `hidden_mark_groups` 列表（为空时省略；无 schema 版本变更）。文档结构体忽略未知字段，因此本修订写出的带隐藏分组的文档在更早的固定修订上仍可加载，只是该列表被丢弃。
+- Core。`PlotListView::with_row_override(source_row, [open, high, low, close])` 与 `overridden_values(row)` 是新增的，`value_at` 与 `is_whitespace_row` 遵循该覆盖；没有既有签名发生变化。浏览器包的新增均为增量的 `.d.ts` 成员（`crosshair.shadeRight`、基线/缓动系列选项、`series_api.baseline_price`、`chart_api.timeline_marks` 以及 `subscribe_timeline_mark_click` 一对），该提交中 npm 版本未变。
 
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 

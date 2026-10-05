@@ -357,6 +357,8 @@ fn fixture_with_line_style(line_style: u8) -> ChartEngine {
     chart
         .set_series_data(baseline, &times, &open, &high, &low, &close)
         .unwrap();
+    // The dashed baseline reference line crosses both adapters as an ordinary `HLine`.
+    assert!(chart.series_apply_options_json(baseline, r#"{"baseline_line_visible": true}"#));
     let candles = chart.add_series(SeriesKind::Candlestick);
     chart
         .set_series_data(candles, &times, &open, &high, &low, &close)
