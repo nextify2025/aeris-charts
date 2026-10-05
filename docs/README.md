@@ -39,6 +39,7 @@ docs/
 - [分时图](api/intraday.md)
 - [成交构柱与重采样](api/aggregation.md)
 - [绘图锚点、磁吸、复权与工具目录](api/drawings.md)
+- [交易控件与意图答复](api/trading.md)
 - [通用图表：已实现契约与后续提案](api/general-charts.md)
 - [兼容性、错误、生命周期与持久化](api/compatibility.md)
 - [Rust 接入与固定修订升级](api/rust.md)

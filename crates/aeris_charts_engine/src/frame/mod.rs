@@ -488,7 +488,7 @@ pub(crate) struct RetainedFrame {
     axis_generation: u64,
     coordinate_generation: u64,
     last_layout_key: Option<[u64; 9]>,
-    last_overlay_key: Option<[u64; 6]>,
+    last_overlay_key: Option<[u64; 7]>,
     last_options_generation: u64,
     last_series_revision: u64,
     last_time_scale_revision: u64,
@@ -1370,6 +1370,8 @@ impl ChartEngine {
             u64::from(self.crosshair_ohlc_magnet),
             self.animation_time.to_bits(),
             self.separator_hover.map_or(u64::MAX, |index| index as u64),
+            // Reduced motion removes the last-price pulse from the overlay layer.
+            u64::from(self.interaction_options().reduced_motion),
         ];
         let options_generation = self.options.generation();
         let series_revision = self.series.revision();

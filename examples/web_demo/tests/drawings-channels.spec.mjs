@@ -399,9 +399,12 @@ test("a regression trend drags as one body, edits its window by its anchors, and
   await settle_frames(page);
   await page.mouse.move(start.x, start.y);
   await expect.poll(() => overlay_cursor(page)).toBe("pointer");
+  // Horizontal only, so the price stays; at least 12 px, so the press crosses the 5 px click slop
+  // however narrow the bars are.
+  const reach = Math.max(bar * 3, 12);
   await page.mouse.down();
-  await page.mouse.move(start.x + bar, start.y, { steps: 3 });
-  await page.mouse.move(start.x + bar * 3, start.y, { steps: 3 });
+  await page.mouse.move(start.x + reach / 3, start.y, { steps: 3 });
+  await page.mouse.move(start.x + reach, start.y, { steps: 3 });
   await page.mouse.up();
   await settle_frames(page);
   const shortened = await points_of(page, id);
