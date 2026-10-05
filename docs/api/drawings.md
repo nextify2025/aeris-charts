@@ -153,7 +153,7 @@ B8 绘图目录以 AerisTerminal 上游的工具外加自有线的七个工具�
 
 ### 形状
 
-`rotated_rectangle`（一条边与一个深度点）、`ellipse`（两个角点）、`circle`（圆心与圆周点）、`triangle`（三个顶点）、`arc`（三个锚点）、`curve`（起点、控制点、终点）与 `double_curve`（起点、两个控制点、终点）解析为共享的屏幕几何，用于绘制与命中测试；旋转矩形、椭圆、圆与三角形默认填充。`polyline` 像 `path` 一样放置顶点（点击添加，双击或 Enter 结束，Backspace 或 Delete 删除最新的顶点，Escape 取消）。`highlighter` 与 `brush` 一样是自由手绘拖动，是一条半透明的 12 px 笔画，在自身重叠处每个像素只绘制一次（作为其覆盖的区域）。
+`rotated_rectangle`（一条边与一个深度点）、`ellipse`（两个角点）、`circle`（圆心与圆周点）、`triangle`（三个顶点）、`arc`（三个锚点）、`curve`（起点、控制点、终点）与 `double_curve`（起点、两个控制点、终点）解析为共享的屏幕几何，用于绘制与命中测试；旋转矩形、椭圆、圆与三角形默认填充。椭圆、圆、圆弧、曲线与双曲线在任意缩放下都与真实曲线相差不超过 0.25 设备像素，每条曲线的点数有界，窗格之外的部分几乎不产生工作量；虚线或点线外框与其他形状一样以实线虚线段到达每个执行器。`polyline` 像 `path` 一样放置顶点（点击添加，双击或 Enter 结束，Backspace 或 Delete 删除最新的顶点，Escape 取消）。`highlighter` 与 `brush` 一样是自由手绘拖动，是一条半透明的 12 px 笔画，在自身重叠处每个像素只绘制一次（作为其覆盖的区域）。
 
 ### KLineChart overlay 的等价项
 

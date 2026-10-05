@@ -1102,3 +1102,35 @@ fn a_price_lines_own_text_does_not_cover_its_price() {
         "the two runs sit apart: price ({price_x}, {price_y}), text ({text_x}, {text_y})"
     );
 }
+
+/// The stats box's culling reach is measured text: installing the host's text measurer (GPUI and
+/// the browser do so after the drawings exist) re-measures it, so a box that the real glyphs
+/// widen into the pane paints and hits although its anchors lie left of the pane.
+#[test]
+fn installing_a_text_measurer_re_measures_the_stats_box_reach() {
+    let mut chart = chart();
+    crowd(&mut chart);
+    let first = chart.coordinate_to_logical(-400.0).unwrap();
+    let second = chart.coordinate_to_logical(-200.0).unwrap();
+    let id = add(
+        &mut chart,
+        DrawingKind::HorizontalSegment,
+        vec![p(first, 104.0), p(second, 104.0)],
+        r##"{"color":"#123456","labels":[{"metric":"bar_count","visible":true,"position":"on","text":"MMMMMMMMMMMM"}]}"##,
+    );
+    let painted =
+        |chart: &mut ChartEngine| texts(chart).iter().any(|(text, ..)| text == "MMMMMMMMMMMM");
+    // Measured by the fallback estimate, the box ends left of the pane.
+    assert!(!painted(&mut chart));
+    // The host's glyphs are much wider: the box now reaches across the left half of the pane.
+    chart.set_text_measure(Some(Box::new(|text, size, _family, _weight, _italic| {
+        text.chars().count() as f64 * size * 4.0
+    })));
+    assert!(painted(&mut chart), "the re-measured box paints");
+    let y = anchor(&chart, id, 1).1;
+    assert_eq!(chart.hit_test_drawing(100.0, y).map(|hit| hit.id), Some(id));
+    assert_eq!(
+        chart.hit_test_drawing(100.0, y),
+        chart.hit_test_drawing_bruteforce(100.0, y)
+    );
+}

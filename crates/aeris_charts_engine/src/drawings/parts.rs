@@ -400,32 +400,13 @@ impl DrawingParts {
         toward: Point,
         width: f64,
     ) {
-        let dx = toward.0 - endpoint.0;
-        let dy = toward.1 - endpoint.1;
-        let distance = dx.hypot(dy);
-        if cap == crate::DrawingLineCap::None || distance <= f64::EPSILON {
+        // A cap needs a direction: none on a degenerate end.
+        let Some(arrow) = arrow_cap_triangle(endpoint, toward, width) else {
             return;
-        }
-        let (ux, uy) = (dx / distance, dy / distance);
-        let radius = cap_radius(width);
+        };
         match cap {
-            crate::DrawingLineCap::Circle => self.disc(endpoint, radius, None),
-            crate::DrawingLineCap::Arrow => {
-                let base = (
-                    endpoint.0 + ux * radius * 2.0,
-                    endpoint.1 + uy * radius * 2.0,
-                );
-                let side = (-uy * radius, ux * radius);
-                self.fill_convex(
-                    &[
-                        endpoint,
-                        (base.0 + side.0, base.1 + side.1),
-                        (base.0 - side.0, base.1 - side.1),
-                    ],
-                    None,
-                    true,
-                );
-            }
+            crate::DrawingLineCap::Circle => self.disc(endpoint, cap_radius(width), None),
+            crate::DrawingLineCap::Arrow => self.fill_convex(&arrow, None, true),
             crate::DrawingLineCap::None => {}
         }
     }
@@ -559,6 +540,31 @@ pub(crate) fn text_on(background: Color) -> Color {
 /// arrowhead's half-width, the arrowhead twice as long (the core tools' cap geometry).
 pub(crate) fn cap_radius(width: f64) -> f64 {
     (width * 1.75).max(3.0)
+}
+
+/// The arrowhead of a line cap at `endpoint` pointing away from `toward`, for a stroke `width`
+/// wide (caller px): its tip on the endpoint and its base two [`cap_radius`] back, one radius to
+/// either side. `None` when `toward` coincides with the endpoint (no direction). The frame's core
+/// line caps and the parts layer share it, so every cap has one geometry.
+pub(crate) fn arrow_cap_triangle(endpoint: Point, toward: Point, width: f64) -> Option<[Point; 3]> {
+    let dx = toward.0 - endpoint.0;
+    let dy = toward.1 - endpoint.1;
+    let distance = dx.hypot(dy);
+    if distance <= f64::EPSILON {
+        return None;
+    }
+    let (ux, uy) = (dx / distance, dy / distance);
+    let radius = cap_radius(width);
+    let base = (
+        endpoint.0 + ux * radius * 2.0,
+        endpoint.1 + uy * radius * 2.0,
+    );
+    let side = (-uy * radius, ux * radius);
+    Some([
+        endpoint,
+        (base.0 + side.0, base.1 + side.1),
+        (base.0 - side.0, base.1 - side.1),
+    ])
 }
 
 /// The point a cap at `end` points away from: the hint when it is off the end, else the first

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use aeris_charts_core::model::data_validation::MAX_SAFE_VALUE;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType, RasterImage};
+use aeris_charts_render::shape;
 
 use super::*;
 
@@ -34,10 +35,10 @@ pub(crate) mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{
-    resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, FibonacciGeometry,
-    MeasureAxes, PositionGeometry, PositionZone,
+    curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry, DrawingBodyGeometry,
+    DrawingGeometryOptions, FibonacciGeometry, MeasureAxes, PositionGeometry, PositionZone,
 };
-pub(crate) use parts::{cap_radius, DrawingPart, DrawingParts, PartContext};
+pub(crate) use parts::{arrow_cap_triangle, cap_radius, DrawingPart, DrawingParts, PartContext};
 pub(crate) use tools::{
     DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement, DrawingPriceExtent,
     DrawingStraightenMode, DrawingTextLayout, DRAWING_TOOL_SPECS,
@@ -4408,7 +4409,7 @@ impl ChartEngine {
                     self.pane_w,
                     pane.top,
                     pane.height,
-                    DrawingGeometryOptions::default(),
+                    DrawingGeometryOptions::for_drawing(drawing, 1.0),
                 ) else {
                     return false;
                 };
@@ -4783,22 +4784,25 @@ impl ChartEngine {
     /// offset (0 for pane-local bitmap x media y are both chart-top-relative — see hit_test.rs).
     /// `None` when the geometry does not resolve: a zero box would put a caret at (0, 0).
     pub(crate) fn text_box(
-        kind: DrawingKind,
+        drawing: &Drawing,
         px: &[(f64, f64)],
         pane_w: f64,
         pane_top: f64,
         pane_h: f64,
     ) -> Option<TextBox> {
         resolve_drawing_geometry(
-            kind,
+            drawing.kind,
             px,
             pane_w,
             pane_top,
             pane_h,
+            // The reference is the anchors' own geometry at unit scale: extensions and the icon
+            // size do not move a label.
             DrawingGeometryOptions {
-                line_width: 1.0,
-                device_scale: 1.0,
-                ..Default::default()
+                icon_size: 0.0,
+                extend_left: false,
+                extend_right: false,
+                ..DrawingGeometryOptions::for_drawing(drawing, 1.0)
             },
         )
         .map(|geometry| geometry.text_box)
@@ -4889,7 +4893,7 @@ impl ChartEngine {
                 return Some((x, y, drawing.text_h_align, dy.atan2(dx)));
             }
         }
-        let reference = Self::text_box(drawing.kind, px, pane_w, pane_top, pane_h)?;
+        let reference = Self::text_box(drawing, px, pane_w, pane_top, pane_h)?;
         Some(Self::text_placement(drawing, &reference, size, pad))
     }
 
@@ -4926,6 +4930,13 @@ impl ChartEngine {
         }
     }
 
+    /// One line of a parts label measured in its glyph size, weight and slant in the layout
+    /// font: the measure every parts hit test and editor layout uses, so both match the paint.
+    fn measure_part_label(&self, label: &parts::PartLabel, line: &str) -> f64 {
+        let family = &self.options.get().layout.font_family;
+        self.measure_text_run(line, label.size, family, label.weight, label.italic)
+    }
+
     /// Install (or clear with `None`) the host text-measure callback for drawing-label hit
     /// boxes (see [`TextMeasureFn`]).
     pub fn set_text_measure(&mut self, f: Option<TextMeasureFn>) {
@@ -4933,6 +4944,8 @@ impl ChartEngine {
         for entry in self.drawing_runtime.borrow_mut().entries.values_mut() {
             entry.screen_valid = false;
             entry.text_key = u64::MAX;
+            // A family decoration (stats box, angle label) is measured text: re-measure it.
+            entry.decoration_key = u64::MAX;
         }
         self.invalidate_frame_drawings();
         // Trading marker cells size themselves from measured quantity text.
@@ -6147,9 +6160,7 @@ impl ChartEngine {
         let text = parts.text?;
         let label = parts.labels.get(text.label)?;
         let font_family = &self.options.get().layout.font_family;
-        let layout = label.layout(|line| {
-            self.measure_text_run(line, label.size, font_family, label.weight, label.italic)
-        });
+        let layout = label.layout(|line| self.measure_part_label(label, line));
         Some(DrawingTextEditLayout {
             x: layout.text_x,
             y: layout.first_y + text.first_line as f64 * layout.line_height,
@@ -6756,9 +6767,8 @@ impl ChartEngine {
             };
             let mut parts = DrawingParts::default();
             (family.build_parts)(&context, &mut parts);
-            let font_family = &self.options.get().layout.font_family;
             return parts.hit(drawing, (x, y), hit_tolerance, |label, line| {
-                self.measure_text_run(line, label.size, font_family, label.weight, label.italic)
+                self.measure_part_label(label, line)
             });
         }
         let Some(geometry) = resolve_drawing_geometry(
@@ -6767,15 +6777,22 @@ impl ChartEngine {
             self.pane_w,
             pane.top,
             pane.height,
-            DrawingGeometryOptions {
-                line_width: drawing.width,
-                device_scale: 1.0,
-                extend_left: drawing.extend_left,
-                icon_size: drawing.icon_size,
-                extend_right: drawing.extend_right,
-            },
+            DrawingGeometryOptions::for_drawing(drawing, 1.0),
         ) else {
             return false;
+        };
+        // Curves flatten against the pane as the frame does (media px), so paint and hit agree.
+        let curve_clip = || {
+            curve_clip(
+                shape::Rect {
+                    left: 0.0,
+                    top: pane.top,
+                    right: self.pane_w,
+                    bottom: pane.top + pane.height,
+                },
+                drawing.width,
+                1.0,
+            )
         };
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
@@ -7011,13 +7028,9 @@ impl ChartEngine {
                 {
                     true
                 } else {
-                    (0..64).any(|step| {
-                        let theta0 = std::f64::consts::TAU * step as f64 / 64.0;
-                        let theta1 = std::f64::consts::TAU * (step + 1) as f64 / 64.0;
-                        let a = (center.0 + rx * theta0.cos(), center.1 + ry * theta0.sin());
-                        let b = (center.0 + rx * theta1.cos(), center.1 + ry * theta1.sin());
-                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                    })
+                    let mut outline = Vec::new();
+                    ellipse_outline(center, rx, ry, curve_clip(), &mut outline);
+                    shape::distance_to_polyline((x, y), &outline) <= tolerance
                 }
             }
             DrawingBodyGeometry::Circle { center, radius } => {
@@ -7037,16 +7050,16 @@ impl ChartEngine {
                         distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
                     })
             }
-            DrawingBodyGeometry::Arc(arc) => (0..64).any(|step| {
-                let a = arc.point(step as f64 / 64.0);
-                let b = arc.point((step + 1) as f64 / 64.0);
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
-            DrawingBodyGeometry::Curve(curve) => (0..64).any(|step| {
-                let a = curve.point(step as f64 / 64.0);
-                let b = curve.point((step + 1) as f64 / 64.0);
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
+            DrawingBodyGeometry::Arc(arc) => {
+                let mut line = Vec::new();
+                arc.flatten(curve_clip(), &mut line);
+                shape::distance_to_polyline((x, y), &line) <= tolerance
+            }
+            DrawingBodyGeometry::Curve(curve) => {
+                let mut line = Vec::new();
+                curve.flatten(curve_clip(), &mut line);
+                shape::distance_to_polyline((x, y), &line) <= tolerance
+            }
             DrawingBodyGeometry::Rectangle {
                 left,
                 right,

@@ -47,15 +47,18 @@
 // source and target boxes (absolute change, Success/Failure on market colors, the box as a hit
 // target; the target time stays, one line above upstream's outcome label). Shapes:
 // rotated-rectangle width handles, ellipse bounds handles, on-curve anchors with tangent extension
-// and chord fills, closed polylines, clip-aware flattening, end caps on arc, curve and double_curve
-// from `stroke_start`/`stroke_end`, and the rotated rectangle's and triangle's outline as one
-// seamless stroke. Re-applied on upstream's lowering instead: channel `extend_*`, the callout's tip
-// and box handles, the highlighter's once-filled tube, and the regression trend's dashed anchor
-// segment while it has no fit. Not restored, by owner decision (they would change upstream's anchor
-// or option contracts): a ray turned into a segment and the extended line's `extend_*` toggles, the
-// projection's independent sector radius (its third anchor), the price note's leader and label
-// offset (its second anchor), the bars pattern's box fit, the symmetric rotated rectangle placed
-// around its center axis, and a numeric fixed-square size. Also kept as upstream draws them
+// and chord fills, closed polylines, end caps on arc, curve and double_curve from
+// `stroke_start`/`stroke_end`, and the rotated rectangle's and triangle's outline as one seamless
+// stroke. Re-applied on upstream's lowering instead: channel `extend_*`, the callout's tip and box
+// handles, the highlighter's once-filled tube, the regression trend's dashed anchor segment while it
+// has no fit, and the clip-aware flattening of the ellipse, circle, arc, curve and double curve
+// (`geometry.rs`: within 0.25 px of the true curve at any zoom, bounded points, paint and hit
+// flattened by the same rule, dashed outlines as solid dash runs). Not restored, by owner decision
+// (they would change upstream's anchor or option contracts): a ray turned into a segment and the
+// extended line's `extend_*` toggles, the projection's independent sector radius (its third
+// anchor), the price note's leader and label offset (its second anchor), the bars pattern's box
+// fit, the symmetric rotated rectangle placed around its center axis, and a numeric fixed-square
+// size. Also kept as upstream draws them
 // (docs/api/compatibility.md): the fork's boxed pattern point labels above highs and below lows,
 // the speed fan's time rays, ring, arc and wedge label placement, exact log-scale fib prices, the
 // pitchfork's A-B swing and B-C handle guides and always-red median, the Gann box's four-side

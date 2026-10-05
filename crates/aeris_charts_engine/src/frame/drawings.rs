@@ -20,7 +20,8 @@ use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
 use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
 use crate::drawings::{
-    cap_radius, resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
+    arrow_cap_triangle, cap_radius, curve_clip, ellipse_outline, level_band_pairs,
+    resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
     DrawingHandleMode, DrawingId, DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign,
     DrawingTextLayout, PartContext, PositionGeometry, PositionZone, TEXT_CHROME_PAD, TEXT_PAD,
     TREND_TEXT_PLACEHOLDER,
@@ -68,6 +69,32 @@ fn push_segment(
     push_styled_stroke(out, points, &[a, b], LineType::Simple, stroke, pane);
 }
 
+/// Whether the box `center ± (rx, ry)` meets `clip` (a closed curve inside that box can paint).
+fn box_meets(center: (f64, f64), rx: f64, ry: f64, clip: aeris_charts_render::shape::Rect) -> bool {
+    clip.intersects(&aeris_charts_render::shape::Rect {
+        left: center.0 - rx,
+        top: center.1 - ry,
+        right: center.0 + rx,
+        bottom: center.1 + ry,
+    })
+}
+
+/// A flattened open curve's stroke ([`push_segment`]'s styling); nothing when its points miss
+/// `clip`, so an off-screen arc or curve paints nothing.
+fn push_curve_stroke(
+    line: &[(f64, f64)],
+    clip: aeris_charts_render::shape::Rect,
+    (stroke, pane): ((f32, LineStyle, Color), aeris_charts_render::shape::Rect),
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+) {
+    if aeris_charts_render::shape::Rect::bounding(line)
+        .is_some_and(|bounds| bounds.intersects(&clip))
+    {
+        push_styled_stroke(out, points, line, LineType::Simple, stroke, pane);
+    }
+}
+
 fn push_drawing_cap(
     cap: crate::DrawingLineCap,
     endpoint: (f64, f64),
@@ -76,39 +103,25 @@ fn push_drawing_cap(
     color: Color,
     out: &mut Vec<Prim>,
 ) {
-    if cap == crate::DrawingLineCap::None {
+    // A cap needs a direction: none on a degenerate end.
+    let Some([tip, left, right]) = arrow_cap_triangle(endpoint, toward, width) else {
         return;
-    }
-    let dx = toward.0 - endpoint.0;
-    let dy = toward.1 - endpoint.1;
-    let distance = dx.hypot(dy);
-    if distance <= f64::EPSILON {
-        return;
-    }
-    let ux = dx / distance;
-    let uy = dy / distance;
-    let radius = cap_radius(width);
+    };
     match cap {
         crate::DrawingLineCap::Circle => out.push(Prim::Circle {
             cx: endpoint.0 as f32,
             cy: endpoint.1 as f32,
-            radius: radius as f32,
+            radius: cap_radius(width) as f32,
             fill: color,
             stroke_width: 0.0,
             stroke: color,
         }),
-        crate::DrawingLineCap::Arrow => {
-            let base_x = endpoint.0 + ux * radius * 2.0;
-            let base_y = endpoint.1 + uy * radius * 2.0;
-            let side_x = -uy * radius;
-            let side_y = ux * radius;
-            out.push(Prim::Triangle {
-                a: [endpoint.0 as f32, endpoint.1 as f32],
-                b: [(base_x + side_x) as f32, (base_y + side_y) as f32],
-                c: [(base_x - side_x) as f32, (base_y - side_y) as f32],
-                color,
-            });
-        }
+        crate::DrawingLineCap::Arrow => out.push(Prim::Triangle {
+            a: [tip.0 as f32, tip.1 as f32],
+            b: [left.0 as f32, left.1 as f32],
+            c: [right.0 as f32, right.1 as f32],
+            color,
+        }),
         crate::DrawingLineCap::None => {}
     }
 }
@@ -804,13 +817,7 @@ impl ChartEngine {
             f64::from(pane_w_px),
             pane.top * vpr,
             pane.height * vpr,
-            DrawingGeometryOptions {
-                line_width: drawing.width,
-                device_scale: vpr,
-                extend_left: drawing.extend_left,
-                icon_size: drawing.icon_size,
-                extend_right: drawing.extend_right,
-            },
+            DrawingGeometryOptions::for_drawing(drawing, vpr),
         ) else {
             return;
         };
@@ -947,56 +954,38 @@ impl ChartEngine {
                 push_segment(a, b, ((width, LineStyle::Dashed, color), pane), out, points);
             }
             DrawingBodyGeometry::Fibonacci(fib) => {
-                let mut previous: Option<((f64, f64), (f64, f64))> = None;
-                for level in &drawing.levels {
-                    if !level.visible {
-                        previous = None;
-                        continue;
-                    }
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, false) {
+                    let (prior_a, prior_b) =
+                        self.drawing_fibonacci_level_segment(drawing, fib, prior, vpr);
                     let ((x0, y0), (x1, y1)) =
                         self.drawing_fibonacci_level_segment(drawing, fib, level.value, vpr);
-                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some((prior_a, prior_b)) = previous {
-                            let fill = level
-                                .fill_color
-                                .as_deref()
-                                .and_then(Color::parse_css)
-                                .unwrap_or(Color::rgba(
-                                    level_color.r(),
-                                    level_color.g(),
-                                    level_color.b(),
-                                    35,
-                                ));
-                            if (y0 - y1).abs() <= f64::EPSILON {
-                                out.push(Prim::Rect {
-                                    rect: IRect {
-                                        x: x0.min(x1).round() as i32,
-                                        y: y0.min(prior_a.1).round() as i32,
-                                        w: (x1 - x0).abs().round().max(1.0) as i32,
-                                        h: (y0 - prior_a.1).abs().round().max(1.0) as i32,
-                                    },
-                                    color: fill,
-                                });
-                            } else {
-                                let upper_first = points.len() as u32;
-                                points.extend([
-                                    [prior_a.0 as f32, prior_a.1 as f32],
-                                    [prior_b.0 as f32, prior_b.1 as f32],
-                                ]);
-                                let lower_first = points.len() as u32;
-                                points.extend([[x0 as f32, y0 as f32], [x1 as f32, y1 as f32]]);
-                                out.push(Prim::BandFill {
-                                    upper_first,
-                                    lower_first,
-                                    point_count: 2,
-                                    line_type: LineType::Simple,
-                                    fill,
-                                });
-                            }
-                        }
+                    let fill = Self::drawing_level_fill(level, color);
+                    if (y0 - y1).abs() <= f64::EPSILON {
+                        out.push(Prim::Rect {
+                            rect: IRect {
+                                x: x0.min(x1).round() as i32,
+                                y: y0.min(prior_a.1).round() as i32,
+                                w: (x1 - x0).abs().round().max(1.0) as i32,
+                                h: (y0 - prior_a.1).abs().round().max(1.0) as i32,
+                            },
+                            color: fill,
+                        });
+                    } else {
+                        let upper_first = points.len() as u32;
+                        points.extend([
+                            [prior_a.0 as f32, prior_a.1 as f32],
+                            [prior_b.0 as f32, prior_b.1 as f32],
+                        ]);
+                        let lower_first = points.len() as u32;
+                        points.extend([[x0 as f32, y0 as f32], [x1 as f32, y1 as f32]]);
+                        out.push(Prim::BandFill {
+                            upper_first,
+                            lower_first,
+                            point_count: 2,
+                            line_type: LineType::Simple,
+                            fill,
+                        });
                     }
-                    previous = Some(((x0, y0), (x1, y1)));
                 }
                 for level in &drawing.levels {
                     if !level.visible {
@@ -1055,43 +1044,22 @@ impl ChartEngine {
                 }
             }
             DrawingBodyGeometry::TimeLevels(time) => {
-                let mut previous_x = None;
-                for level in &drawing.levels {
-                    if !level.visible {
-                        previous_x = None;
-                        continue;
-                    }
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, false) {
+                    let prior_x = time.x(drawing.level_value(prior));
                     let x = time.x(drawing.level_value(level.value));
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some(prior_x) = previous_x {
-                            let left = x.min(prior_x).max(0.0);
-                            let right = x.max(prior_x).min(f64::from(pane_w_px));
-                            if right > left {
-                                let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                                let fill = level
-                                    .fill_color
-                                    .as_deref()
-                                    .and_then(Color::parse_css)
-                                    .unwrap_or(Color::rgba(
-                                        level_color.r(),
-                                        level_color.g(),
-                                        level_color.b(),
-                                        35,
-                                    ));
-                                out.push(Prim::Rect {
-                                    rect: IRect {
-                                        x: left.round() as i32,
-                                        y: time.pane_top.round().max(0.0) as i32,
-                                        w: (right - left).round().max(1.0) as i32,
-                                        h: (time.pane_bottom - time.pane_top).round().max(1.0)
-                                            as i32,
-                                    },
-                                    color: fill,
-                                });
-                            }
-                        }
+                    let left = x.min(prior_x).max(0.0);
+                    let right = x.max(prior_x).min(f64::from(pane_w_px));
+                    if right > left {
+                        out.push(Prim::Rect {
+                            rect: IRect {
+                                x: left.round() as i32,
+                                y: time.pane_top.round().max(0.0) as i32,
+                                w: (right - left).round().max(1.0) as i32,
+                                h: (time.pane_bottom - time.pane_top).round().max(1.0) as i32,
+                            },
+                            color: Self::drawing_level_fill(level, color),
+                        });
                     }
-                    previous_x = Some(x);
                 }
                 for level in &drawing.levels {
                     if !level.visible {
@@ -1145,49 +1113,24 @@ impl ChartEngine {
                     }
                 }
                 let segments = arcs.segments();
-                let mut previous = None;
-                for level in &drawing.levels {
-                    if !level.visible || drawing.level_value(level.value) <= 0.0 {
-                        previous = None;
-                        continue;
-                    }
-                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some(prior_value) = previous {
-                            let fill = level
-                                .fill_color
-                                .as_deref()
-                                .and_then(Color::parse_css)
-                                .unwrap_or(Color::rgba(
-                                    level_color.r(),
-                                    level_color.g(),
-                                    level_color.b(),
-                                    35,
-                                ));
-                            let upper_first = points.len() as u32;
-                            for step in 0..=segments {
-                                let (x, y) =
-                                    arcs.point(prior_value, step as f64 / f64::from(segments));
-                                points.push([x as f32, y as f32]);
-                            }
-                            let lower_first = points.len() as u32;
-                            for step in 0..=segments {
-                                let (x, y) = arcs.point(
-                                    drawing.level_value(level.value),
-                                    step as f64 / f64::from(segments),
-                                );
-                                points.push([x as f32, y as f32]);
-                            }
-                            out.push(Prim::BandFill {
-                                upper_first,
-                                lower_first,
-                                point_count: segments + 1,
-                                line_type: LineType::Simple,
-                                fill,
-                            });
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, true) {
+                    let upper_first = points.len() as u32;
+                    for value in [prior, level.value] {
+                        for step in 0..=segments {
+                            let (x, y) = arcs.point(
+                                drawing.level_value(value),
+                                step as f64 / f64::from(segments),
+                            );
+                            points.push([x as f32, y as f32]);
                         }
                     }
-                    previous = Some(drawing.level_value(level.value));
+                    out.push(Prim::BandFill {
+                        upper_first,
+                        lower_first: upper_first + segments + 1,
+                        point_count: segments + 1,
+                        line_type: LineType::Simple,
+                        fill: Self::drawing_level_fill(level, color),
+                    });
                 }
                 for level in &drawing.levels {
                     if !level.visible || drawing.level_value(level.value) <= 0.0 {
@@ -1235,46 +1178,19 @@ impl ChartEngine {
                 }
             }
             DrawingBodyGeometry::Pitchfork(fork) => {
-                let mut previous: Option<((f64, f64), (f64, f64))> = None;
-                for level in &drawing.levels {
-                    if !level.visible {
-                        previous = None;
-                        continue;
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, false) {
+                    let upper_first = points.len() as u32;
+                    for value in [prior, level.value] {
+                        let (a, b) = fork.segment(drawing.level_value(value));
+                        points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
                     }
-                    let segment = fork.segment(drawing.level_value(level.value));
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some((prior_a, prior_b)) = previous {
-                            let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                            let fill = level
-                                .fill_color
-                                .as_deref()
-                                .and_then(Color::parse_css)
-                                .unwrap_or(Color::rgba(
-                                    level_color.r(),
-                                    level_color.g(),
-                                    level_color.b(),
-                                    35,
-                                ));
-                            let upper_first = points.len() as u32;
-                            points.extend([
-                                [prior_a.0 as f32, prior_a.1 as f32],
-                                [prior_b.0 as f32, prior_b.1 as f32],
-                            ]);
-                            let lower_first = points.len() as u32;
-                            points.extend([
-                                [segment.0 .0 as f32, segment.0 .1 as f32],
-                                [segment.1 .0 as f32, segment.1 .1 as f32],
-                            ]);
-                            out.push(Prim::BandFill {
-                                upper_first,
-                                lower_first,
-                                point_count: 2,
-                                line_type: LineType::Simple,
-                                fill,
-                            });
-                        }
-                    }
-                    previous = Some(segment);
+                    out.push(Prim::BandFill {
+                        upper_first,
+                        lower_first: upper_first + 2,
+                        point_count: 2,
+                        line_type: LineType::Simple,
+                        fill: Self::drawing_level_fill(level, color),
+                    });
                 }
                 for level in &drawing.levels {
                     if !level.visible {
@@ -1701,91 +1617,59 @@ impl ChartEngine {
                 }
             }
             DrawingBodyGeometry::Ellipse { center, rx, ry } => {
-                if rx > 0.0 && ry > 0.0 {
+                let clip = curve_clip(stroke.1, drawing.width, vpr);
+                if rx > 0.0 && ry > 0.0 && box_meets(center, rx, ry, clip) {
+                    let mut outline = Vec::new();
+                    ellipse_outline(center, rx, ry, clip, &mut outline);
                     if drawing.fill_enabled {
                         let fill = drawing
                             .fill_color
                             .as_deref()
                             .and_then(Color::parse_css)
                             .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51));
-                        let upper_first = points.len() as u32;
-                        for step in 0..=32 {
-                            let theta = std::f64::consts::PI * step as f64 / 32.0;
-                            points.push([
-                                (center.0 - rx * theta.cos()) as f32,
-                                (center.1 - ry * theta.sin()) as f32,
-                            ]);
+                        // The closing point repeats the first; the fill polygon needs it once.
+                        let mut ribbon = Vec::new();
+                        let count = aeris_charts_render::shape::convex_ribbon(
+                            &outline[..outline.len().saturating_sub(1)],
+                            &mut ribbon,
+                        ) as u32;
+                        if count > 0 {
+                            let upper_first = points.len() as u32;
+                            points.extend(ribbon.iter().map(|&(x, y)| [x as f32, y as f32]));
+                            out.push(Prim::BandFill {
+                                upper_first,
+                                lower_first: upper_first + count,
+                                point_count: count,
+                                line_type: LineType::Simple,
+                                fill,
+                            });
                         }
-                        let lower_first = points.len() as u32;
-                        for step in 0..=32 {
-                            let theta = std::f64::consts::PI * step as f64 / 32.0;
-                            points.push([
-                                (center.0 - rx * theta.cos()) as f32,
-                                (center.1 + ry * theta.sin()) as f32,
-                            ]);
-                        }
-                        out.push(Prim::BandFill {
-                            upper_first,
-                            lower_first,
-                            point_count: 33,
-                            line_type: LineType::Simple,
-                            fill,
-                        });
                     }
-                    let first_point = points.len() as u32;
-                    for step in 0..=64 {
-                        let theta = std::f64::consts::TAU * step as f64 / 64.0;
-                        points.push([
-                            (center.0 + rx * theta.cos()) as f32,
-                            (center.1 + ry * theta.sin()) as f32,
-                        ]);
-                    }
-                    out.push(Prim::Polyline {
-                        first_point,
-                        point_count: 65,
-                        width: (drawing.width * vpr) as f32,
-                        style: drawing.style,
-                        line_type: LineType::Simple,
-                        color,
-                    });
+                    push_styled_stroke(out, points, &outline, LineType::Simple, stroke.0, stroke.1);
                 }
             }
             DrawingBodyGeometry::Circle { center, radius } => {
-                let fill = if drawing.fill_enabled {
-                    drawing
-                        .fill_color
-                        .as_deref()
-                        .and_then(Color::parse_css)
-                        .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51))
-                } else {
-                    Color::rgba(0, 0, 0, 0)
-                };
-                if drawing.fill_enabled {
-                    out.push(Prim::Circle {
-                        cx: center.0 as f32,
-                        cy: center.1 as f32,
-                        radius: radius as f32,
-                        fill,
-                        stroke_width: 0.0,
-                        stroke: color,
-                    });
+                let clip = curve_clip(stroke.1, drawing.width, vpr);
+                if box_meets(center, radius, radius, clip) {
+                    if drawing.fill_enabled {
+                        let fill = drawing
+                            .fill_color
+                            .as_deref()
+                            .and_then(Color::parse_css)
+                            .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51));
+                        out.push(Prim::Circle {
+                            cx: center.0 as f32,
+                            cy: center.1 as f32,
+                            radius: radius as f32,
+                            fill,
+                            stroke_width: 0.0,
+                            stroke: color,
+                        });
+                    }
+                    let mut outline = Vec::new();
+                    ellipse_outline(center, radius, radius, clip, &mut outline);
+                    push_styled_stroke(out, points, &outline, LineType::Simple, stroke.0, stroke.1);
                 }
-                let first_point = points.len() as u32;
-                for step in 0..=64 {
-                    let theta = std::f64::consts::TAU * step as f64 / 64.0;
-                    points.push([
-                        (center.0 + radius * theta.cos()) as f32,
-                        (center.1 + radius * theta.sin()) as f32,
-                    ]);
-                }
-                out.push(Prim::Polyline {
-                    first_point,
-                    point_count: 65,
-                    width: (drawing.width * vpr) as f32,
-                    style: drawing.style,
-                    line_type: LineType::Simple,
-                    color,
-                });
             }
             DrawingBodyGeometry::Triangle { corners } => {
                 if drawing.fill_enabled {
@@ -1812,34 +1696,16 @@ impl ChartEngine {
                 }
             }
             DrawingBodyGeometry::Arc(arc) => {
-                let first_point = points.len() as u32;
-                for step in 0..=64 {
-                    let (x, y) = arc.point(step as f64 / 64.0);
-                    points.push([x as f32, y as f32]);
-                }
-                out.push(Prim::Polyline {
-                    first_point,
-                    point_count: 65,
-                    width: (drawing.width * vpr) as f32,
-                    style: drawing.style,
-                    line_type: LineType::Simple,
-                    color,
-                });
+                let clip = curve_clip(stroke.1, drawing.width, vpr);
+                let mut line = Vec::new();
+                arc.flatten(clip, &mut line);
+                push_curve_stroke(&line, clip, stroke, out, points);
             }
             DrawingBodyGeometry::Curve(curve) => {
-                let first_point = points.len() as u32;
-                for step in 0..=64 {
-                    let (x, y) = curve.point(step as f64 / 64.0);
-                    points.push([x as f32, y as f32]);
-                }
-                out.push(Prim::Polyline {
-                    first_point,
-                    point_count: 65,
-                    width: (drawing.width * vpr) as f32,
-                    style: drawing.style,
-                    line_type: LineType::Simple,
-                    color,
-                });
+                let clip = curve_clip(stroke.1, drawing.width, vpr);
+                let mut line = Vec::new();
+                curve.flatten(clip, &mut line);
+                push_curve_stroke(&line, clip, stroke, out, points);
             }
             DrawingBodyGeometry::Rectangle {
                 left,
@@ -3264,13 +3130,7 @@ impl ChartEngine {
                 self.pane_w * hpr,
                 self.panes[pane_index].top * vpr,
                 self.panes[pane_index].height * vpr,
-                DrawingGeometryOptions {
-                    line_width: drawing.width,
-                    device_scale: vpr,
-                    extend_left: drawing.extend_left,
-                    icon_size: drawing.icon_size,
-                    extend_right: drawing.extend_right,
-                },
+                DrawingGeometryOptions::for_drawing(drawing, vpr),
             ) else {
                 continue;
             };
@@ -3598,13 +3458,7 @@ impl ChartEngine {
                 self.pane_w * hpr,
                 self.panes[pane_index].top * vpr,
                 self.panes[pane_index].height * vpr,
-                DrawingGeometryOptions {
-                    line_width: drawing.width,
-                    device_scale: vpr,
-                    extend_left: drawing.extend_left,
-                    icon_size: drawing.icon_size,
-                    extend_right: drawing.extend_right,
-                },
+                DrawingGeometryOptions::for_drawing(drawing, vpr),
             ) else {
                 continue;
             };

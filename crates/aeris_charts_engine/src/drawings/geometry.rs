@@ -5,8 +5,62 @@
 //! and the interactive shape from drifting as more drawing kinds are added.
 
 use aeris_charts_render::draw_list::LineType;
+use aeris_charts_render::shape::{self, EllipseArc, Point, Rect};
 
-use super::{path_arrow_points, DrawingKind, TextBox};
+use super::{path_arrow_points, Drawing, DrawingKind, TextBox};
+use crate::DrawingLevel;
+
+/// Chord tolerance of a flattened curve (ellipse, circle, arc, Bézier): device px in the frame,
+/// media px in hit testing, so paint and hit stay within a quarter pixel of the true curve.
+const CURVE_TOLERANCE: f64 = 0.25;
+/// Reach in CSS px beyond a stroke's half width past which a curve piece can neither paint nor
+/// hit inside the pane (it covers the touch hit tolerance).
+const CURVE_CLIP_MARGIN: f64 = 16.0;
+
+/// The clip a curve flattens against: `pane` (in the caller's px) grown by the stroke's half
+/// width plus [`CURVE_CLIP_MARGIN`], `scale` caller px per CSS px. Pieces outside it become single
+/// chords, so a huge zoomed-in curve costs bounded work.
+pub(crate) fn curve_clip(pane: Rect, line_width: f64, scale: f64) -> Rect {
+    pane.inflate((line_width / 2.0 + CURVE_CLIP_MARGIN) * scale)
+}
+
+/// The outline of the axis-aligned ellipse around `center` with radii `rx`/`ry`, flattened against
+/// `clip` (see [`EllipseArc::append_clipped_points`]): starts at angle 0 and repeats its first
+/// point last.
+pub(crate) fn ellipse_outline(center: Point, rx: f64, ry: f64, clip: Rect, out: &mut Vec<Point>) {
+    EllipseArc {
+        center,
+        rx,
+        ry,
+        rotation: 0.0,
+        start: 0.0,
+        sweep: std::f64::consts::TAU,
+    }
+    .append_clipped_points(CURVE_TOLERANCE, clip, out);
+}
+
+/// The bands `drawing` fills between its `levels` (its own or another level list it owns), in
+/// list order, as `(previous level's raw value, level)`: visible levels chain in list order, a
+/// hidden level (or, with `positive_only`, one whose effective value is not positive) breaks the
+/// chain, and a level fills toward its predecessor while the drawing's fill is on and the level's
+/// `fill_between` is set. The Fibonacci, time-level, Fibonacci-arc and pitchfork band loops follow
+/// this rule; the Gann box's grid, fan and arc band loops still chain across a hidden level.
+pub(crate) fn level_band_pairs<'a>(
+    drawing: &'a Drawing,
+    levels: &'a [DrawingLevel],
+    positive_only: bool,
+) -> impl Iterator<Item = (f64, &'a DrawingLevel)> {
+    let levels = if drawing.fill_enabled { levels } else { &[] };
+    let mut previous = None;
+    levels.iter().filter_map(move |level| {
+        if !level.visible || (positive_only && drawing.level_value(level.value) <= 0.0) {
+            previous = None;
+            return None;
+        }
+        let prior = previous.replace(level.value)?;
+        level.fill_between.then_some((prior, level))
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DrawingBodyGeometry<'a> {
@@ -384,12 +438,24 @@ pub(crate) struct ArcGeometry {
 }
 
 impl ArcGeometry {
+    /// The exact arc point at `t` in `[0, 1]` (the reference its flattening approximates).
+    #[cfg(test)]
     pub(crate) fn point(self, t: f64) -> (f64, f64) {
         let angle = self.start + self.sweep * t;
         (
             self.center.0 + self.radius * angle.cos(),
             self.center.1 + self.radius * angle.sin(),
         )
+    }
+
+    /// The arc flattened against `clip` within [`CURVE_TOLERANCE`], both ends included, at most
+    /// [`shape::MAX_FLATTEN_POINTS`] + 1 points (the same parametrisation as `point`).
+    pub(crate) fn flatten(self, clip: Rect, out: &mut Vec<Point>) {
+        EllipseArc::circle(self.center, self.radius, self.start, self.sweep).append_clipped_points(
+            CURVE_TOLERANCE,
+            clip,
+            out,
+        );
     }
 }
 
@@ -400,6 +466,8 @@ pub(crate) struct CurveGeometry {
 }
 
 impl CurveGeometry {
+    /// The exact Bézier point at `t` in `[0, 1]` (the reference its flattening approximates).
+    #[cfg(test)]
     pub(crate) fn point(self, t: f64) -> (f64, f64) {
         let u = 1.0 - t;
         let weights = if self.cubic {
@@ -414,6 +482,17 @@ impl CurveGeometry {
             y += point.1 * weight;
         }
         (x, y)
+    }
+
+    /// The curve flattened against `clip` within [`CURVE_TOLERANCE`], both ends included, at most
+    /// [`shape::MAX_FLATTEN_POINTS`] + 1 points.
+    pub(crate) fn flatten(self, clip: Rect, out: &mut Vec<Point>) {
+        let [p0, p1, p2, p3] = self.points;
+        if self.cubic {
+            shape::flatten_cubic(p0, p1, p2, p3, CURVE_TOLERANCE, clip, out);
+        } else {
+            shape::flatten_quadratic(p0, p1, p2, CURVE_TOLERANCE, clip, out);
+        }
     }
 }
 
@@ -493,6 +572,22 @@ pub(crate) struct DrawingGeometryOptions {
     pub(crate) icon_size: f64,
     pub(crate) extend_left: bool,
     pub(crate) extend_right: bool,
+}
+
+impl DrawingGeometryOptions {
+    /// The resolver options of `drawing`'s stored style, `device_scale` caller px per CSS px (the
+    /// vertical pixel ratio in the frame, 1 in media px). Every site that resolves a stored
+    /// drawing builds its options here, so a new stored option reaches paint, hit testing,
+    /// culling and text placement together.
+    pub(crate) fn for_drawing(drawing: &Drawing, device_scale: f64) -> Self {
+        Self {
+            line_width: drawing.width,
+            device_scale,
+            icon_size: drawing.icon_size,
+            extend_left: drawing.extend_left,
+            extend_right: drawing.extend_right,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1252,6 +1347,36 @@ pub(crate) fn resolve_drawing_geometry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_bands_chain_visible_levels_in_list_order() {
+        let mut drawing = Drawing::new(1, DrawingKind::FibonacciSpeedArcs, 0, Vec::new());
+        drawing.fill_enabled = true;
+        drawing.levels = [0.0, 0.5, 0.618, 1.0, 1.272, 1.618, -0.5, 2.0]
+            .into_iter()
+            .map(|value| DrawingLevel {
+                visible: value != 0.618,
+                fill_between: value != 1.272,
+                ..DrawingLevel::at(value, "#123456")
+            })
+            .collect();
+        let pairs = |drawing: &Drawing, positive_only| {
+            level_band_pairs(drawing, &drawing.levels, positive_only)
+                .map(|(prior, level)| (prior, level.value))
+                .collect::<Vec<_>>()
+        };
+        // A hidden level breaks the chain; a level without `fill_between` still links it.
+        assert_eq!(
+            pairs(&drawing, false),
+            [(0.0, 0.5), (1.272, 1.618), (1.618, -0.5), (-0.5, 2.0)]
+        );
+        // Radial levels also break on a non-positive effective value.
+        assert_eq!(pairs(&drawing, true), [(1.272, 1.618)]);
+        drawing.level_reverse = true;
+        assert_eq!(pairs(&drawing, true), [(0.0, 0.5)]);
+        drawing.fill_enabled = false;
+        assert!(pairs(&drawing, false).is_empty());
+    }
 
     #[test]
     fn gann_square_fans_and_arcs_share_bounded_geometry() {
