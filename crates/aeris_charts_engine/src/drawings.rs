@@ -5681,7 +5681,10 @@ impl ChartEngine {
             } else if item.bars_pattern.is_some() {
                 return None;
             }
-            let patch = serde_json::from_value::<DrawingPatch>(item.options.clone()).ok()?;
+            // Validate the exact text the drawing is created from; every patch input then shares one
+            // deserializer (a second, `Value`-based one cost the wasm module about 13 KB).
+            let options = serde_json::to_string(&item.options).ok()?;
+            let patch = serde_json::from_str::<DrawingPatch>(&options).ok()?;
             if !Drawing::new(0, item.kind, pane_index, Vec::new()).apply_patch(patch) {
                 return None;
             }
@@ -5694,7 +5697,6 @@ impl ChartEngine {
                     time: pending.get(index).copied().flatten(),
                 })
                 .collect::<Vec<_>>();
-            let options = serde_json::to_string(&item.options).ok()?;
             staged.push((item.kind, anchors, options, item.bars_pattern));
         }
         // The whole paste fits the identity space before anything is created.
