@@ -2638,6 +2638,13 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * clicking an empty pane starts a transient date-and-price range (the quick measure; it is never
  * a drawing, history entry, or persisted object).
  *
+ * A `ray` always reaches past its second anchor to the pane edge, and `extend_left` also runs it
+ * back through its first anchor (`extend_right: false` does not make a segment of it; the
+ * `extended_line` always reaches both edges). `trend_line`, `info_line`, `trend_angle`, and
+ * `arrow_line` extend by `extend_left`/`extend_right`; a vertical `info_line`, `trend_angle`, or
+ * `arrow_line` reaches the pane's top or bottom edge on the ends those flags select, and one whose
+ * two anchors coincide stays at its anchor.
+ *
  * Own-line kinds (not in the AerisTerminal upstream catalog): `horizontal_segment` keeps both
  * anchors on one price, and `vertical_ray` and `vertical_segment` keep both on one bar (the
  * shared coordinate follows the anchor placed or dragged last; the vertical ray defaults to
@@ -3023,14 +3030,19 @@ export type drawing_stats_position = "start" | "middle" | "end";
 /**
  * Line-family options (`tool_options.line`); absent fields keep their defaults. The own-line
  * line tools (`horizontal_segment`, `vertical_ray`, `vertical_segment`, `price_line`) read them.
- * The line tools of the shared catalog (`info_line` and the others) store them but do not render
- * them. Documents an earlier fork build wrote restore `ray`, `extended_line`, `info_line`,
- * `trend_angle`, `cross_line`, and `arrow_line` with the block (`{"stats_position": "end"}` once
- * exported), as does a fork-era clipboard or sync `info_line` with that build's five default
- * stats; new drawings have none.
+ * On the line tools of the shared catalog (`ray`, `extended_line`, `info_line`, `trend_angle`,
+ * `cross_line`, `arrow_line`) the block's presence selects the earlier fork look, layered on the
+ * shared rendering: the visible `labels` as one engine-formatted stats box (hoverable and
+ * selectable) instead of one text per label, the trend angle's dashed horizontal reference, arc,
+ * and screen angle folded into [-90°, 90°], and end caps only on the ends that do not reach the
+ * pane edge, with the stroke trimmed under an arrowhead and the caps as hit targets. Without the
+ * block these tools render as the shared catalog does; `null` removes it, and writing any key
+ * (`{}` included) creates it. New drawings have none. Documents an earlier fork build wrote restore
+ * these six tools with the block (`{"stats_position": "end"}` once exported), as does a fork-era
+ * clipboard or sync `info_line` with that build's five default stats.
  */
 export interface line_tool_options {
-  /** Stats box position along the anchor segment (default `"end"`). */
+  /** Stats box position along the anchor segment (default `"end"` while the block exists). */
   stats_position?: drawing_stats_position;
 }
 /**
@@ -3207,8 +3219,10 @@ export interface shape_tool_options {
 /**
  * Fork extension blocks, one optional block per legacy drawing family. Fields that upstream
  * models as flat drawing options are deprecated input aliases (mapped on patch and restore, never
- * written back); the own-line tools still read their own blocks. Patches deep-merge: absent keys
- * keep their values and `null` resets a block to its defaults.
+ * written back); the own-line tools still read their own blocks, and the shared catalog's line
+ * tools read `line`, whose presence selects their earlier fork look ({@link line_tool_options}).
+ * Patches deep-merge: absent keys keep their values and `null` resets a block to its defaults
+ * (on `line`, `null` removes the block).
  */
 export interface drawing_tool_options {
   line?: line_tool_options | null;
@@ -3340,7 +3354,9 @@ export interface drawing_options {
    * Fork extension blocks ({@link drawing_tool_options}); fields upstream models as flat options
    * above are deprecated input aliases, mapped on patch and restore and never written back. The
    * own-line tools read their own blocks (`tool_options.line.stats_position` places the stats box
-   * of the `labels` list on the own-line line tools).
+   * of the `labels` list on the own-line line tools), and `tool_options.line` on the shared
+   * catalog's line tools selects their stats box, trend-angle decorations, and arrowheads
+   * ({@link line_tool_options}).
    */
   tool_options: drawing_tool_options;
 }

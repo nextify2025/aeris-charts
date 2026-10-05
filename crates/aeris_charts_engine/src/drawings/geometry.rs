@@ -12,7 +12,7 @@ use crate::DrawingLevel;
 
 /// Chord tolerance of a flattened curve (ellipse, circle, arc, Bézier): device px in the frame,
 /// media px in hit testing, so paint and hit stay within a quarter pixel of the true curve.
-const CURVE_TOLERANCE: f64 = 0.25;
+pub(crate) const CURVE_TOLERANCE: f64 = 0.25;
 /// Reach in CSS px beyond a stroke's half width past which a curve piece can neither paint nor
 /// hit inside the pane (it covers the touch hit tolerance).
 const CURVE_CLIP_MARGIN: f64 = 16.0;
@@ -734,6 +734,39 @@ fn extend_channel_line(
     [a, b]
 }
 
+/// Which ends of a segment-body tool's anchor segment reach the pane edge: `(beyond the first
+/// anchor, beyond the second)`, for anchors at `a` and `b`. The extended line always reaches both,
+/// a ray always reaches past its second anchor and past its first by `extend_left`, and the other
+/// segment tools follow `extend_left` and `extend_right`. A vertical segment extends to the pane's
+/// top or bottom edge the same way, except the trend line and the forecast, which stay their anchor
+/// segment. Coincident anchors have no direction: only upstream's ray (past its second anchor) and
+/// extended line keep their vertical reach, and every other segment tool stays its empty segment.
+/// Every reader of the resolved ends (the frame, hit testing, the line tools' end caps) takes them
+/// from here.
+pub(crate) fn segment_extension(
+    kind: DrawingKind,
+    options: DrawingGeometryOptions,
+    a: Point,
+    b: Point,
+) -> (bool, bool) {
+    let flags = (
+        kind == DrawingKind::ExtendedLine || options.extend_left,
+        matches!(kind, DrawingKind::Ray | DrawingKind::ExtendedLine) || options.extend_right,
+    );
+    if (b.0 - a.0).abs() > f64::EPSILON {
+        return flags;
+    }
+    let coincident = (b.1 - a.1).abs() <= f64::EPSILON;
+    match kind {
+        DrawingKind::TrendLine | DrawingKind::Forecast => (false, false),
+        DrawingKind::Ray | DrawingKind::ExtendedLine if coincident => {
+            (kind == DrawingKind::ExtendedLine, true)
+        }
+        _ if coincident => (false, false),
+        _ => flags,
+    }
+}
+
 pub(crate) fn resolve_drawing_geometry<'a>(
     kind: DrawingKind,
     px: &'a [(f64, f64)],
@@ -757,35 +790,36 @@ pub(crate) fn resolve_drawing_geometry<'a>(
             let mut b = *px.get(1)?;
             let dx = b.0 - a.0;
             let dy = b.1 - a.1;
+            let (extend_a, extend_b) = segment_extension(kind, options, a, b);
             if dx.abs() > f64::EPSILON {
                 let slope = dy / dx;
-                if kind == DrawingKind::ExtendedLine
-                    || (kind != DrawingKind::Ray && options.extend_left)
-                {
+                if extend_a {
                     let edge = if dx > 0.0 { 0.0 } else { pane_w };
                     a.1 += (edge - a.0) * slope;
                     a.0 = edge;
                 }
-                if matches!(kind, DrawingKind::Ray | DrawingKind::ExtendedLine)
-                    || options.extend_right
-                {
+                if extend_b {
                     let edge = if dx > 0.0 { pane_w } else { 0.0 };
                     b.1 += (edge - b.0) * slope;
                     b.0 = edge;
                 }
-            } else if matches!(kind, DrawingKind::Ray | DrawingKind::ExtendedLine) {
-                if kind == DrawingKind::ExtendedLine {
+            } else {
+                // A vertical segment extends to the pane's top or bottom edge on the ends
+                // `segment_extension` selects.
+                if extend_a {
                     a.1 = if dy > 0.0 {
                         pane_top
                     } else {
                         pane_top + pane_h
                     };
                 }
-                b.1 = if dy > 0.0 {
-                    pane_top + pane_h
-                } else {
-                    pane_top
-                };
+                if extend_b {
+                    b.1 = if dy > 0.0 {
+                        pane_top + pane_h
+                    } else {
+                        pane_top
+                    };
+                }
             }
             DrawingBodyGeometry::Segment { a, b }
         }

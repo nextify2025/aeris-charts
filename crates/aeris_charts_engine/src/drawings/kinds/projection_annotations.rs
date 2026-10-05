@@ -23,7 +23,7 @@ use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::Point;
 
 use super::super::parts::{
-    text_lines, DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_PADDING,
+    text_lines, DrawingParts, PartContext, PartLabel, PartStroke, STATS_PADDING,
 };
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
@@ -420,10 +420,6 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
 
 // --- shared styling ---------------------------------------------------------------------------
 
-fn with_alpha(color: Color, alpha: u8) -> Color {
-    Color::rgba(color.r(), color.g(), color.b(), alpha)
-}
-
 /// Text on a box: `text_color`, else black or white against the box.
 fn box_text_color(drawing: &Drawing, background: Color) -> Color {
     drawing
@@ -470,18 +466,6 @@ fn text_box(
         padding: (BOX_PADDING.0 * ctx.scale, BOX_PADDING.1 * ctx.scale),
         hit: true,
     }
-}
-
-/// A measurement box (the Lines stats-box style) on `background`.
-fn stats_box(
-    ctx: &PartContext<'_>,
-    anchor: Point,
-    (h_align, v_align): (DrawingTextHAlign, DrawingTextVAlign),
-    lines: Vec<String>,
-    background: Color,
-) -> PartLabel {
-    let text = box_text_color(ctx.drawing, background);
-    ctx.stats_label(anchor, (h_align, v_align), lines, background, text)
 }
 
 /// Widest of `lines` in CSS px at `size` in the drawing's font.
@@ -681,12 +665,12 @@ fn range(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     } else {
         DrawingTextVAlign::Bottom
     };
-    parts.label(stats_box(
-        ctx,
+    parts.label(ctx.stats_box(
         anchor,
         (DrawingTextHAlign::Center, v_align),
         lines,
-        with_alpha(drawing.stroke_color(), STATS_ALPHA),
+        None,
+        |background| box_text_color(drawing, background),
     ));
 }
 

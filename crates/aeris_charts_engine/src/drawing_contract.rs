@@ -499,9 +499,11 @@ pub enum DrawingKindOptions {
 /// paste, and persistence move it onto the field through [`take_legacy_flat_options`], and the
 /// flat key wins when both are given. Every other key (a regression trend's per-side `channel`
 /// deviations included) is stored and persisted, and read by the family kinds (the own-line tools
-/// and the ranges); the upstream-rendered kinds do not read it yet. Each block's defaults are
-/// upstream's look, and documents and payloads the fork wrote carry the fork's unstored defaults
-/// explicitly (`drawings::kinds::legacy_fork_tool_options`).
+/// and the ranges); of the upstream-rendered kinds, the six line tools read `line` (its presence
+/// layers the fork's stats box, trend-angle decorations and arrowheads on their upstream arms) and
+/// the others do not read their keys yet. Each block's defaults are upstream's look, and documents
+/// and payloads the fork wrote carry the fork's unstored defaults explicitly
+/// (`drawings::kinds::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DrawingToolOptions {
@@ -1276,12 +1278,16 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
                 .collect();
         }
     }
+    let template = crate::Drawing::new(0, kind, 0, Vec::new());
     if let Some(family) = kind.spec().family {
-        // Family kinds report their own resolved defaults (a ray's `extend_right`, an info
-        // line's stats) before appending their `tool_options.*` descriptors.
-        let template = crate::Drawing::new(0, kind, 0, Vec::new());
+        // Family kinds report their own resolved defaults (a vertical ray's `extend_right`)
+        // before appending their `tool_options.*` descriptors.
         crate::drawings::kinds::apply_template_defaults(&template, &mut properties);
         (family.extend_schema)(&template, &mut properties);
+    } else {
+        // Upstream kinds list the stored options their layered parts read (an upstream line
+        // tool's `tool_options.line.stats_position`).
+        crate::drawings::kinds::extend_upstream_schema(kind, &template, &mut properties);
     }
     DrawingPropertySchema {
         revision: DRAWING_CONTRACT_REVISION,

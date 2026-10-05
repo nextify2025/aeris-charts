@@ -1,11 +1,14 @@
 //! B8 drawing families. Exactly one renderer owns each catalog kind, chosen by `spec().family`:
 //! upstream's catalog (wire ids `0..=12` and `16..=84`) carries no family and is rendered by the
-//! upstream implementation (`geometry.rs` body resolver, frame arm, hit code); the own-line tools
-//! (`240..=246`) and the three measuring ranges (`13..=15`) carry a family whose module owns their
-//! tool specs, kind defaults, geometry (resolved into shared [`DrawingParts`]), typed options,
-//! schema additions, and tests. The engine reaches a family only through the [`DrawingFamily`]
-//! hook table its specs reference: a closed, compile-time table rather than a plugin registry, so
-//! adding a family never edits the frame lowering, the hit tester, or another family.
+//! upstream implementation (`geometry.rs` body resolver, frame arm, hit code), over which a stored
+//! option may layer shared parts (the frame's `push_parts` and the hit tester's `parts_hit`, which
+//! a family's parts share, with [`upstream_decoration_extent`] and [`extend_upstream_schema`]
+//! dispatching per family); the own-line tools (`240..=246`) and the three measuring ranges
+//! (`13..=15`) carry a family whose module owns their tool specs, kind defaults, geometry (resolved
+//! into shared [`DrawingParts`]), typed options, schema additions, and tests. The engine reaches a
+//! family only through the [`DrawingFamily`] hook table its specs reference: a closed, compile-time
+//! table rather than a plugin registry, so adding a family never edits the frame lowering, the hit
+//! tester, or another family.
 //!
 //! The modules of the retired fork families (Fibonacci, pitchforks and Gann, patterns, shapes)
 //! keep only their public option types and the fork's pre-merge kind defaults, which
@@ -112,6 +115,31 @@ impl DrawingFamily {
             // B8: projection_annotations — end
         }
     }
+}
+
+/// The CSS-px reach beyond its anchors' box of the parts an upstream-rendered kind (no family)
+/// layers on its upstream arm by a stored option (`push_parts` in the frame, `parts_hit` in hit
+/// testing): the culling pad its family would declare in `decoration_extent`. Must be cheap;
+/// cached like a family's. 0 for a kind that layers none.
+pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
+    let mut extent: f64 = 0.0;
+    // B8: lines — begin
+    extent = extent.max(lines::upstream_decoration_extent(engine, drawing));
+    // B8: lines — end
+    extent
+}
+
+/// Append the `tool_options.*` descriptors an upstream-rendered kind (no family) reads through
+/// its layered parts, after the common ones (the family path's `extend_schema`; `template` is the
+/// kind's `Drawing::new`).
+pub(crate) fn extend_upstream_schema(
+    kind: DrawingKind,
+    template: &Drawing,
+    properties: &mut Vec<DrawingPropertyDescriptor>,
+) {
+    // B8: lines — begin
+    lines::extend_upstream_schema(kind, template, properties);
+    // B8: lines — end
 }
 
 /// Replace the common schema defaults with the template drawing's resolved values (a family's

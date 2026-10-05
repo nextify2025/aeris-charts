@@ -4432,6 +4432,19 @@ impl ChartEngine {
                     box_bottom = geometry.text_box.bottom;
                 }
             }
+            if kinds::lines::draws_angle_reference(drawing) {
+                // A trend angle's dashed reference runs from its first anchor as far as the
+                // segment is long on screen, which follows the viewport: bound it per key.
+                let anchor =
+                    |point| self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, point);
+                let (Some(a), Some(b)) = (anchor(drawing.points[0]), anchor(drawing.points[1]))
+                else {
+                    return false;
+                };
+                let end = kinds::lines::angle_reference_end(a, b);
+                box_left = box_left.min(end);
+                box_right = box_right.max(end);
+            }
             (left, right, top, bottom) = (box_left, box_right, box_top, box_bottom);
         }
         let mut extra_x = drawing.width / 2.0 + HitProfile::TOUCH.drawing_stroke_tolerance;
@@ -4466,7 +4479,19 @@ impl ChartEngine {
         let extra_x = base_extra.max(label_pad.0).max(kind_pad.0);
         let extra_y = base_extra.max(label_pad.1).max(kind_pad.1);
         let logical_pad = extra_x / self.time_scale.bar_spacing().max(f64::MIN_POSITIVE);
-        let logical_intersects = match bounds.logical {
+        // A trend angle's dashed reference reaches as far as its segment is long on screen,
+        // which no logical box bounds: only its side of the first anchor is known here, and the
+        // screen box bounds the rest (`refresh_drawing_screen_bounds`).
+        let logical = match bounds.logical {
+            LogicalBounds::Finite { .. } if kinds::lines::draws_angle_reference(drawing) => {
+                LogicalBounds::Ray {
+                    start: drawing.points[0].logical,
+                    towards_right: drawing.points[1].logical >= drawing.points[0].logical,
+                }
+            }
+            logical => logical,
+        };
+        let logical_intersects = match logical {
             LogicalBounds::Full => true,
             // A labeled ray can anchor its right-aligned label at the pane edge even when its
             // start sits beyond that edge, so keep it conservative.
@@ -4608,19 +4633,21 @@ impl ChartEngine {
         (x.max(decoration), y.max(decoration))
     }
 
-    /// A family tool's decoration reach (stats boxes, angle labels) beyond its anchors in CSS
-    /// px, cached with the text metrics and refreshed on drawing or options changes.
+    /// A tool's decoration reach (stats boxes, angle labels) beyond its anchors in CSS px: a
+    /// family's `decoration_extent`, or the parts an upstream kind layers on its arm
+    /// ([`kinds::upstream_decoration_extent`]); cached with the text metrics and refreshed on
+    /// drawing or options changes.
     fn cached_drawing_decoration(
         &self,
         drawing: &Drawing,
         entry: &mut DrawingCache,
         key: u64,
     ) -> f64 {
-        let Some(family) = drawing.kind.spec().family else {
-            return 0.0;
-        };
         if entry.decoration_key != key {
-            entry.decoration = (family.decoration_extent)(self, drawing);
+            entry.decoration = match drawing.kind.spec().family {
+                Some(family) => (family.decoration_extent)(self, drawing),
+                None => kinds::upstream_decoration_extent(self, drawing),
+            };
             entry.decoration_key = key;
         }
         entry.decoration
@@ -6676,6 +6703,28 @@ impl ChartEngine {
         hit
     }
 
+    /// Precise hit of the parts `build` resolves for `drawing` (a family's whole drawing, or the
+    /// parts an upstream-rendered drawing layers over its arm) at media px `point` against its
+    /// converted anchors `px`: the hit side of the frame's `push_parts`, measured like the paint
+    /// ([`Self::measure_part_label`]).
+    fn parts_hit(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        point: (f64, f64),
+        tolerance: f64,
+        build: impl FnOnce(&PartContext<'_>, &mut DrawingParts),
+    ) -> bool {
+        let Some(context) = PartContext::media(self, drawing, px) else {
+            return false;
+        };
+        let mut parts = DrawingParts::default();
+        build(&context, &mut parts);
+        parts.hit(drawing, point, tolerance, |label, line| {
+            self.measure_part_label(label, line)
+        })
+    }
+
     /// The per-kind body test at media px `(x, y)` against the converted anchors `px`.
     fn drawing_body_hit(
         &self,
@@ -6762,14 +6811,7 @@ impl ChartEngine {
             return false;
         };
         if let Some(family) = drawing.kind.spec().family {
-            let Some(context) = PartContext::media(self, drawing, px) else {
-                return false;
-            };
-            let mut parts = DrawingParts::default();
-            (family.build_parts)(&context, &mut parts);
-            return parts.hit(drawing, (x, y), hit_tolerance, |label, line| {
-                self.measure_part_label(label, line)
-            });
+            return self.parts_hit(drawing, px, (x, y), hit_tolerance, family.build_parts);
         }
         let Some(geometry) = resolve_drawing_geometry(
             drawing.kind,
@@ -6794,9 +6836,18 @@ impl ChartEngine {
                 1.0,
             )
         };
+        // The parts an upstream line tool's `line` block layers on its arm (caps, the trend
+        // angle's reference and arc, the stats box) hit like the frame paints them.
+        let line_parts_hit = |segment| {
+            kinds::lines::fork_presentation(drawing)
+                && self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                    kinds::lines::upstream_line_parts(context, segment, parts);
+                })
+        };
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    || line_parts_hit(Some((a, b)))
             }
             DrawingBodyGeometry::Horizontal { y: line_y, x0, x1 } => {
                 (y - line_y).abs() <= tolerance
@@ -6822,6 +6873,7 @@ impl ChartEngine {
                     || ((x - line_x).abs() <= tolerance
                         && y >= pane_top - hit_tolerance
                         && y <= pane_bottom + hit_tolerance)
+                    || line_parts_hit(None)
             }
             DrawingBodyGeometry::Channel { first, second } => {
                 (drawing.fill_enabled

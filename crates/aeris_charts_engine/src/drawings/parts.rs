@@ -239,6 +239,25 @@ impl<'a> PartContext<'a> {
         }
     }
 
+    /// A drawing's stats box: [`Self::stats_label`] on `background`, by default the drawing's
+    /// stroke color at [`STATS_ALPHA`], in the text color `text` picks against that box (the
+    /// line tools' black or white by [`text_on`]; the ranges' `text_color`, else their contrast
+    /// rule). The measurement boxes a tool paints beside its geometry share this look.
+    pub(crate) fn stats_box(
+        &self,
+        anchor: Point,
+        align: (DrawingTextHAlign, DrawingTextVAlign),
+        lines: Vec<String>,
+        background: Option<Color>,
+        text: impl FnOnce(Color) -> Color,
+    ) -> PartLabel {
+        let background = background.unwrap_or_else(|| {
+            let base = self.drawing.stroke_color();
+            Color::rgba(base.r(), base.g(), base.b(), STATS_ALPHA)
+        });
+        self.stats_label(anchor, align, lines, background, text(background))
+    }
+
     /// The drawing's own `text` as label lines ([`text_lines`]), with one empty line while the
     /// host's inline editor edits an empty text, so the box and the caret stay in place as the
     /// last character is deleted.

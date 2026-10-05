@@ -18,6 +18,7 @@ use std::fmt::Write;
 
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
+use crate::drawings::kinds::lines;
 use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
 use crate::drawings::{
     arrow_cap_triangle, cap_radius, curve_clip, ellipse_outline, level_band_pairs,
@@ -823,15 +824,26 @@ impl ChartEngine {
         };
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
-                let label_gap = self.segment_label_gap(drawing, px, pane_w_px, vpr, a, b);
-                if let Some((gap_start, gap_end)) = label_gap {
-                    push_segment(a, point_on_segment(a, b, gap_start), stroke, out, points);
-                    push_segment(point_on_segment(a, b, gap_end), b, stroke, out, points);
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| lines::fork_presentation(drawing))
+                {
+                    // The `line` block's presentation strokes and caps the resolved segment
+                    // through the parts layer, then adds its decorations and stats box.
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        lines::upstream_line_parts(c, Some((a, b)), parts);
+                    });
                 } else {
-                    push_segment(a, b, stroke, out, points);
+                    let label_gap = self.segment_label_gap(drawing, px, pane_w_px, vpr, a, b);
+                    if let Some((gap_start, gap_end)) = label_gap {
+                        push_segment(a, point_on_segment(a, b, gap_start), stroke, out, points);
+                        push_segment(point_on_segment(a, b, gap_end), b, stroke, out, points);
+                    } else {
+                        push_segment(a, b, stroke, out, points);
+                    }
+                    push_drawing_cap(drawing.stroke_start, a, b, drawing.width * vpr, color, out);
+                    push_drawing_cap(drawing.stroke_end, b, a, drawing.width * vpr, color, out);
                 }
-                push_drawing_cap(drawing.stroke_start, a, b, drawing.width * vpr, color, out);
-                push_drawing_cap(drawing.stroke_end, b, a, drawing.width * vpr, color, out);
             }
             DrawingBodyGeometry::Horizontal { y, x0, x1 } => {
                 let x0 = (x0.round() as i32).clamp(0, pane_w_px);
@@ -880,6 +892,14 @@ impl ChartEngine {
                     style: drawing.style,
                     color,
                 });
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| lines::fork_presentation(drawing))
+                {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        lines::upstream_line_parts(c, None, parts);
+                    });
+                }
             }
             DrawingBodyGeometry::Channel { first, second } => {
                 if drawing.fill_enabled {
@@ -1376,9 +1396,9 @@ impl ChartEngine {
                 {
                     // A built-in icon name with no registered raster paints its vector glyph,
                     // so documents and hosts without icon assets keep rendering.
-                    let mut parts = DrawingParts::default();
-                    built_in_icon_parts(&context, icon, center, size, &mut parts);
-                    self.push_drawing_parts(&context, &parts, pane_w_px, vpr, out, points);
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        built_in_icon_parts(c, icon, center, size, parts);
+                    });
                 } else {
                     out.push(Prim::Rect {
                         rect: IRect {
@@ -2181,9 +2201,7 @@ impl ChartEngine {
                 }),
             "derived family points share the anchors' caller-px space"
         );
-        let mut parts = DrawingParts::default();
-        (family.build_parts)(&context, &mut parts);
-        self.push_drawing_parts(&context, &parts, pane_w_px, vpr, out, points);
+        self.push_parts(&context, pane_w_px, vpr, out, points, family.build_parts);
     }
 
     /// The bitmap-px part context of `drawing` with anchors at `px`; `None` for a stale pane.
@@ -2211,6 +2229,26 @@ impl ChartEngine {
             x_scale: hpr,
             text_editing: self.editing_drawing() == Some(drawing.id),
         })
+    }
+
+    /// Resolve the parts `build` describes for `context` (from [`Self::frame_part_context`]) and
+    /// lower them with [`Self::push_drawing_parts`]: a family's whole drawing, or the parts an
+    /// upstream-rendered drawing layers over its arm (the vector glyph of an icon stamp, the
+    /// presentation an upstream line tool's `line` block selects). Hit testing resolves the same
+    /// parts (`parts_hit`), and the culling pad covers their reach (a family's
+    /// `decoration_extent`, `kinds::upstream_decoration_extent`).
+    fn push_parts(
+        &self,
+        context: &PartContext<'_>,
+        pane_w_px: i32,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
+        build: impl FnOnce(&PartContext<'_>, &mut DrawingParts),
+    ) {
+        let mut parts = DrawingParts::default();
+        build(context, &mut parts);
+        self.push_drawing_parts(context, &parts, pane_w_px, vpr, out, points);
     }
 
     /// Lower `parts` resolved for `context` into frame primitives: dashed strokes as solid dash
@@ -2862,6 +2900,7 @@ impl ChartEngine {
                 .spec()
                 .family
                 .is_some_and(|family| family.owns_labels)
+            || lines::fork_presentation(drawing)
         {
             return;
         }
