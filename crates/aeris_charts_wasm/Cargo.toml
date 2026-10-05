@@ -61,7 +61,7 @@ workspace = true
 # without the matching feature flag.
 #
 # Optimization level: `-Oz` stays because package size is a product metric. Measured on the same module
-# (benchmarks/README.md, "WASM size levers"): binaryen 132 instead of 117 saves 0.5%, and `--converge` saves
+# (benchmarks/README.md, "WASM 体积杠杆与重新基线"): binaryen 132 instead of 117 saves 0.5%, and `--converge` saves
 # under 0.02%, so neither is worth a second wasm-opt source. The larger lever is the Cargo profile; evaluate
 # changes with the versioned release artifact and the browser scenarios under `benchmarks/`, preserving the
 # tradeoff as raw evidence instead of a handwritten performance claim.

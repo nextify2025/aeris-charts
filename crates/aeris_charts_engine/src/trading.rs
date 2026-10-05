@@ -2857,18 +2857,21 @@ impl ChartEngine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         ChartEngine, CrosshairSyncPosition, DrawingPoint, PointerInput, TradingPriceScale,
     };
     use aeris_charts_render::draw_list::Prim;
 
-    fn id<T>(value: &str, constructor: impl FnOnce(String) -> Result<T, ChartError>) -> T {
+    pub(crate) fn id<T>(
+        value: &str,
+        constructor: impl FnOnce(String) -> Result<T, ChartError>,
+    ) -> T {
         constructor(value.to_string()).unwrap()
     }
 
-    fn chart_with_market() -> ChartEngine {
+    pub(crate) fn chart_with_market() -> ChartEngine {
         let mut chart = ChartEngine::new(400.0, 240.0, 1.0);
         chart
             .set_series_data(
@@ -2884,7 +2887,11 @@ mod tests {
         chart
     }
 
-    fn protection_button_x(chart: &ChartEngine, y: f64, expected: TradingHitKind) -> f64 {
+    pub(crate) fn protection_button_x(
+        chart: &ChartEngine,
+        y: f64,
+        expected: TradingHitKind,
+    ) -> f64 {
         (0..=(chart.pane_w * 2.0) as usize)
             .map(|step| step as f64 / 2.0)
             .find(|x| {
@@ -2994,7 +3001,7 @@ mod tests {
     }
 
     /// Center of the close cell that terminates the object's control cluster.
-    fn cancel_center(chart: &mut ChartEngine, object: TradingObjectId) -> (f64, f64) {
+    pub(crate) fn cancel_center(chart: &mut ChartEngine, object: TradingObjectId) -> (f64, f64) {
         chart.build_frame();
         let (price, price_scale, pane_index, width) = match &object {
             TradingObjectId::Position(id) => {
@@ -3034,7 +3041,7 @@ mod tests {
         (end - chart.trading_close_width() / 2.0, y)
     }
 
-    fn position(side: PositionSide) -> TradingPosition {
+    pub(crate) fn position(side: PositionSide) -> TradingPosition {
         TradingPosition {
             id: id("position-1", PositionId::new),
             account_id: None,
@@ -3049,7 +3056,7 @@ mod tests {
         }
     }
 
-    fn order(id_value: &str, role: OrderRole, price: f64) -> WorkingOrder {
+    pub(crate) fn order(id_value: &str, role: OrderRole, price: f64) -> WorkingOrder {
         WorkingOrder {
             id: id(id_value, OrderId::new),
             account_id: None,

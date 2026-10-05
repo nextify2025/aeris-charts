@@ -20,6 +20,9 @@ use gpui::{
 
 use crate::backend::{text_cap_centerer, text_measurer};
 
+#[cfg(test)]
+mod tests;
+
 /// Per-chart GPUI input state: the chart canvas's top-left window position and a monotonic
 /// clock. Everything else lives in the engine.
 #[derive(Clone, Copy, Debug)]

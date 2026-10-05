@@ -74,6 +74,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev
       - uses: Swatinem/rust-cache@v2
+      - name: Clippy native GPUI backend (all targets)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings
       - name: Test native GPUI backend
         run: cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked
       - name: Assert official GPUI pixel parity against tiny-skia
@@ -90,8 +93,8 @@ jobs:
   # Evidence, not yet a required check: what the GPUI executor actually presents in a real window,
   # diffed against the native (tiny-skia) reference. It runs on a virtual X server with Mesa
   # lavapipe (software Vulkan), so it says nothing about hardware GPUs, and its Prim-layer fixtures
-  # say nothing about clipping (docs/Architecture.md, Verification, lists what a pass does and does
-  # not prove, the calibration build and the criteria for promoting this job).
+  # say nothing about clipping.
+  # docs/development/validation.md 记录了通过结果的证据边界、校准构建与升级为必需作业的条件。
   #
   # Neither a gate failure, a hang, the job timeout nor an apt flake may turn this run red:
   # publish.yml requires a green ci.yml run for a release commit. Hence `continue-on-error` on the

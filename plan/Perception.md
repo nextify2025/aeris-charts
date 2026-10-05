@@ -1,183 +1,104 @@
-# Aeris Charts Agent Perception Plan
+# Aeris Charts Agent 感知计划
 
-Aeris Charts will give AI agents the same reading of a chart that a skilled discretionary trader
-has: swings, structure, levels, lines, patterns, order-flow behavior and context. Each item will be
-expressed as exact, point-in-time, auditable facts rather than pixels or raw numbers. On top of that
-perception, an agent can turn a plain-language strategy into a typed rule. The engine then evaluates
-the rule deterministically, measures its historical evidence honestly, and shows every decision on
-the human's chart.
+Aeris Charts 将让 AI agent 获得与熟练的主观交易员相同的图表读法：摆动、结构、价位、线条、形态、订单流行为与上下文。每一项都将以精确的、时点的、可审计的事实来表达，而不是像素或原始数字。在这种感知之上，agent 可以把一段自然语言策略转换为类型化规则。随后引擎以确定性方式评估该规则，如实度量其历史证据，并在人类的图表上展示每一项决策。
 
-The program's thesis is one sentence: **the engine that draws the human's chart is the only place
-that can tell an agent exactly what the human is looking at, as of any moment, without guessing.**
+本计划的论点只有一句话：**绘制人类图表的引擎，是唯一能够在任意时刻、不靠猜测地准确告诉 agent 人类正在看什么的地方**。
 
-How to read this file:
+阅读本文件的方式：
 
-1. **Status and decisions**: where the program stands and what the maintainer must decide.
-2. **Why this program**: the evidence behind the approach and the gap it fills.
-3. **The perception contract**: the core concepts every batch builds on.
-4. **Batches P1–P6**: the work, as checklists with exit criteria.
-5. **Evaluation program**: how we prove that it works, not just that it runs.
-6. **Scope, ownership and architecture rules**.
-7. **Risks and non-goals**.
+1. **状态与决策**：本计划当前所处的位置，以及维护者必须决策的事项。
+2. **为什么要做这个计划**：该方法背后的证据，以及它所填补的差距。
+3. **感知契约**：每个批次都建立在其上的核心概念。
+4. **批次 P1–P6**：工作内容，以带有退出标准的清单形式给出。
+5. **评估计划**：我们如何证明它真正有效，而不只是能够运行。
+6. **范围、归属与架构规则**。
+7. **风险与非目标**。
 
-Item IDs (PC, PF, PS, PE, PX) are stable once the plan is accepted. Batches group items; they do not
-renumber them.
+条目 ID（PC、PF、PS、PE、PX）在计划被接受后保持稳定。批次对条目分组，但不会重新编号。
 
-## Status and decisions
+## 状态与决策
 
-Created 2026-10-02. **Status: proposed. No batch may start until D1–D4 are decided.**
+创建于 2026-10-02。**状态：已提议。在 D1–D4 决定之前，不得启动任何批次**。
 
-| Batch | Scope | Depends on | Status |
+| 批次 | 范围 | 依赖 | 状态 |
 | --- | --- | --- | --- |
-| P1 | Perception foundation: fact model, point-in-time semantics, bar vocabulary, multi-scale swings, structure, swing zones, Chart Brief v1, perception drawing layer | Replay (B5), drawing contract (B2) | Proposed |
-| P2 | Geometry and patterns: trendlines, channels, clause-scored patterns, triggers, relation graph, confluence, drill-down | P1 | Proposed |
-| P3 | Order flow, liquidity and multi-timeframe perception | P1; tape (B3), depth (B6), profiles and resampling (B7) | Proposed |
-| P4 | Setup contract: typed strategy rules, validation, live evaluation, events, trading intents | P2 | Proposed |
-| P5 | Evidence: point-in-time historical evaluation, outcomes in R, honest statistics, trial ledger, holdout lock, decision snapshots | P4; image export (PD6) | Proposed |
-| P6 | Agent benchmark, documentation and program closure | P5 | Proposed |
+| P1 | 感知基础：事实模型、时点语义、柱词汇、多尺度摆动、结构、摆动区、Chart Brief v1、感知绘图层 | 回放（B5）、绘图契约（B2） | 已提议 |
+| P2 | 几何与形态：趋势线、通道、按子句评分的形态、触发器、关系图、共振、下钻 | P1 | 已提议 |
+| P3 | 订单流、流动性与多周期感知 | P1；成交带（B3）、深度（B6）、分布与重采样（B7） | 已提议 |
+| P4 | Setup 契约：类型化策略规则、校验、实时评估、事件、交易意图 | P2 | 已提议 |
+| P5 | 证据：时点历史评估、以 R 计的结果、如实的统计、试验台账、留出集锁定、决策快照 | P4；图像导出（PD6） | 已提议 |
+| P6 | Agent 基准、文档与计划收尾 | P5 | 已提议 |
 
-### Maintainer decisions required
+### 需要维护者决策的事项
 
-- **D1 — Priority.** Expansion B7–B9 are open. Recommendation: finish B7 (P3 needs its resampling
-  and profiles), then run P1–P2 before B8 and B9. Fold Expansion's I3 structure tier (swing
-  points, structure breaks, fair value gaps, order blocks, period levels, opening range) into
-  P1–P3 so that structure is built once, as perception facts that also render as studies, rather
-  than twice.
-- **D2 — Typed strategy rules.** Expansion lists "a Pine-style scripting language" as out of scope,
-  and says alert conditions on study outputs are host-evaluated. P4 adds a typed, bounded rule
-  specification that the engine evaluates. It is data (a validated tree of conditions over named
-  facts), not a language: no loops, variables, functions or interpreter. Recommendation: accept
-  it and amend those two Expansion lines in the same commit that starts P4. Without engine-side
-  evaluation, each host re-implements rule semantics and the discipline guarantee disappears.
-- **D3 — Where evidence lives.** Recommendation: single-chart evidence (every occurrence of a setup
-  on the retained history of one chart, with outcomes and summary statistics) is engine work,
-  because only the engine can guarantee point-in-time correctness. Cross-symbol scans, portfolio
-  statistics and trial ledgers spanning many charts belong to Aeris Terminal.
-- **D4 — Agent connectivity.** Recommendation: the engine exposes typed Rust, WASM and TypeScript
-  APIs plus canonical JSON. The agent-facing tool server (for example an MCP server), model choice,
-  prompts and broker execution belong to Aeris Terminal. The engine never calls a model.
+- **D1 — 优先级**。Expansion 的 B7–B9 仍未完成。建议：先完成 B7（P3 需要其重采样与分布），然后在 B8 和 B9 之前执行 P1–P2。将 Expansion 的 I3 结构层级（摆动点、结构突破、公允价值缺口、订单块、周期价位、开盘区间）并入 P1–P3，使结构只构建一次——作为同时渲染为研究的感知事实——而不是构建两次。
+- **D2 — 类型化策略规则**。Expansion 将“Pine 风格的脚本语言”列为范围之外，并指出针对研究输出的告警条件由宿主评估。P4 新增一种由引擎评估的、类型化且有界的规则规格。它是数据（一棵基于具名事实、经过校验的条件树），而不是一门语言：没有循环、变量、函数或解释器。建议：接受该方案，并在启动 P4 的同一次提交中修订 Expansion 的这两行。如果没有引擎侧评估，每个宿主都要各自重新实现规则语义，纪律保证随之消失。
+- **D3 — 证据存放在哪里**。建议：单图表证据（某个 setup 在一张图表所保留历史上的每一次出现，附带结果与汇总统计）属于引擎的工作，因为只有引擎能够保证时点正确性。跨标的扫描、组合统计，以及跨越多张图表的试验台账，属于 Aeris Terminal。
+- **D4 — Agent 连接方式**。建议：引擎提供类型化的 Rust、WASM 和 TypeScript API，以及规范 JSON。面向 agent 的工具服务器（例如 MCP 服务器）、模型选择、提示词和券商执行属于 Aeris Terminal。引擎绝不调用模型。
 
-When D1–D4 are accepted: set this file's status to active, add the P batches to **Work cadence**
-in [AGENTS.md](../AGENTS.md), and record the D1 and D2 amendments in [Expansion.md](Expansion.md).
+D1–D4 被接受后：将本文件的状态设为进行中，把 P 批次加入**工作节奏**一节（位于 [AGENTS.md](../AGENTS.md)），并在 [Expansion.md](Expansion.md) 中记录 D1 和 D2 的修订。
 
-## Why this program
+## 为什么要做这个计划
 
-### What the evidence says
+### 证据说明了什么
 
-- **Vision models do not read trading charts reliably.** MME-Finance (2024) found that frontier
-  multimodal models perform poorly on candlestick and indicator charts. A 2026 benchmark, "Do
-  VLMs Truly Read Candlesticks?", found useful prediction only in persistent trends, along with
-  strong directional bias and weak temporal precision. An April 2026 practitioner audit tested
-  four frontier models on 40 real signals. Direction calls were statistically indistinguishable
-  from a coin flip, one of 215 pattern identifications was correct, and stated confidence was
-  uncorrelated with correctness. Sending screenshots to an agent is therefore not a strategy.
-- **Raw numbers are the wrong shape.** Serializing thousands of OHLCV rows costs on the order of
-  100k+ tokens and leaves the model to re-derive swings, levels and patterns in its head. That is
-  exactly the step where it hallucinates. The time-series tokenization literature (LLMTime and
-  later comparisons) shows the result depends heavily on representation, and no raw encoding is
-  universally good.
-- **Visual patterns are computable, and some carry information.** Lo, Mamaysky and Wang (2000)
-  detected classical patterns algorithmically with kernel regression and found that several add
-  incremental information. Jiang, Kelly and Xiu (2023) showed that chart-shaped price information
-  predicts returns. Their headline Sharpe ratios are gross, equal-weighted long-short and
-  small-cap-heavy, so they are not a promise of tradable profit. Perceptually Important Points
-  (Chung and Fu, 2001) give a principled way to compress a series into the few points humans
-  notice.
-- **Pattern edges decay and fail often.** Bulkowski's long-running statistics show failure rates
-  for classical patterns roughly doubling, from about 14% in the 1990s to about 28% in 2003–2007.
-  Any honest system must measure each rule's evidence on current data rather than assert it.
-- **Most reported LLM trading gains are memorization.** "Profit Mirage" (2025) and several 2026
-  papers show that agents recall prices and post-hoc narratives from training data. Their
-  backtests look predictive inside the training window and fall to random after it.
-  Anonymization ("blindfolded" inputs) is the main proposed defense.
-- **Backtests overfit by default.** The Deflated Sharpe Ratio and the Probability of Backtest
-  Overfitting (Bailey and López de Prado) quantify how much of a "best" result is selection from
-  many trials. Neither works unless every trial is counted.
+- **视觉模型无法可靠地读懂交易图表**。MME-Finance（2024）发现，前沿多模态模型在 K 线图和指标图上表现不佳。2026 年的一项基准测试“Do VLMs Truly Read Candlesticks?”发现，仅在持续趋势中才有可用的预测，同时存在强烈的方向偏差和较弱的时间精度。2026 年 4 月的一项从业者审计，在 40 个真实信号上测试了四个前沿模型。方向判断在统计上与抛硬币无法区分，215 次形态识别中只有一次正确，所声称的置信度与正确性不相关。因此，向 agent 发送截图并不是一种策略。
+- **原始数字的形式不对**。序列化数千行 OHLCV 数据大约要消耗 100k+ 个 token，并让模型在脑中重新推导摆动、价位和形态。而这恰恰是它产生幻觉的步骤。时间序列 tokenization 方面的文献（LLMTime 及后来的对比研究）表明，结果在很大程度上取决于表示方式，且没有任何一种原始编码是普遍适用的。
+- **视觉形态是可计算的，其中一部分携带信息**。Lo、Mamaysky 和 Wang（2000）用核回归以算法方式检测经典形态，发现其中若干形态提供了增量信息。Jiang、Kelly 和 Xiu（2023）表明，图表形状的价格信息能够预测收益。他们给出的头条夏普比率是未扣成本的毛值、等权多空组合，且偏重小盘股，因此并不保证可交易的利润。感知重要点（Perceptually Important Points，Chung 和 Fu，2001）提供了一种有原则的方法，把一个序列压缩为人类会注意到的少数几个点。
+- **形态优势会衰减，且经常失效**。Bulkowski 长期积累的统计显示，经典形态的失败率大约翻了一倍，从 1990 年代的约 14% 升至 2003–2007 年的约 28%。任何诚实的系统都必须基于当前数据度量每条规则的证据，而不是直接断言。
+- **大多数已报告的 LLM 交易收益来自记忆**。“Profit Mirage”（2025）和 2026 年的若干论文表明，agent 会从训练数据中回忆价格和事后叙事。它们的回测在训练窗口内看起来具有预测力，在窗口之后则降为随机水平。匿名化（“蒙眼”输入）是目前主要提出的防御手段。
+- **回测默认就会过拟合**。Bailey 和 López de Prado 提出的紧缩夏普比率（Deflated Sharpe Ratio）与回测过拟合概率（Probability of Backtest Overfitting）量化了“最佳”结果中有多大部分只是从大量试验中挑选出来的。除非计入每一次试验，否则两者都不起作用。
 
-### What already exists, and the gap
+### 现有基础与差距
 
-| Category | Examples | What it gives an agent | What it cannot give |
+| 类别 | 示例 | 能给 agent 什么 | 不能给什么 |
 | --- | --- | --- | --- |
-| Market-data MCP and APIs | TradingView MCP (public beta, Sept 2026), Alpha Vantage MCP, EODHD, Tradier | Quotes, bars, precomputed indicators, screeners | Any perception: the agent still sees numbers, not structure |
-| Automated chart analysis | TrendSpider, TradingView auto patterns, Autochartist | Labels and drawings made for human eyes | Point-in-time guarantees, clause-level evidence, a machine contract, a link to the exact chart a human sees |
-| Vision on screenshots | FinVision-style multi-agent frameworks | Images | Precision; benchmarks show near-random reliability |
-| Natural language to backtest code | QuantConnect Mia, Composer, BacktestBench agents | Generated Python or strategy code | Correctness by construction: the agent writes the code that grades the agent, and look-ahead bugs are easy to introduce |
-| Validation tools | VARRD-style statistics engines | Multiple-testing corrections, out-of-sample locks | Perception; they test rules someone else had to express |
+| 行情数据 MCP 与 API | TradingView MCP（公测版，2026 年 9 月）、Alpha Vantage MCP、EODHD、Tradier | 报价、柱、预先计算的指标、筛选器 | 任何感知：agent 看到的仍是数字，而不是结构 |
+| 自动化图表分析 | TrendSpider、TradingView 自动形态、Autochartist | 为人眼制作的标签和绘图 | 时点保证、子句级证据、机器契约、与人类所见的那张确切图表的关联 |
+| 基于截图的视觉 | FinVision 式多 agent 框架 | 图像 | 精度；基准测试显示可靠性接近随机 |
+| 自然语言到回测代码 | QuantConnect Mia、Composer、BacktestBench agent | 生成的 Python 或策略代码 | 按构造保证的正确性：agent 编写用来给 agent 评分的代码，而且很容易引入前视缺陷 |
+| 验证工具 | VARRD 式统计引擎 | 多重检验校正、样本外锁定 | 感知；它们检验的是别人必须先表达出来的规则 |
 
-Nobody unifies perception, rules, evidence and the human's chart in one deterministic engine. The
-gap is a **perception contract** with these properties:
+没有人把感知、规则、证据和人类的图表统一到同一个确定性引擎中。这一差距需要一份具备以下性质的**感知契约**：
 
-1. **Point-in-time.** Every fact records when it became knowable. Asking "what did the chart show
-   at 10:42?" returns exactly what a trader could have seen at 10:42. This reuses the PD2 replay
-   clock, which already masks every series, study, footprint cell and marker.
-2. **Same geometry as the human's chart.** A fact is not a description of a drawing; it is the
-   drawing's source. What the agent reasons about and what the human audits cannot diverge.
-3. **Compressed for reasoning.** A ranked, budgeted Chart Brief with stable IDs gives the agent a
-   few thousand tokens of structure instead of a hundred thousand of rows, and the agent can expand
-   any fact on demand.
-4. **Portable and memorization-resistant.** A normalized frame expresses facts in volatility units
-   and bars-ago, with optional anonymization. Rules transfer across symbols, and training-data
-   recall cannot substitute for reasoning.
-5. **Referee, not author.** The agent expresses a strategy as a typed rule. The engine evaluates
-   it, emits signals, and measures historical outcomes with every trial counted. The agent's
-   confidence is grounded in measured base rates, never in its own feeling.
-6. **Order-flow perception.** Absorption, delta divergence, stacked imbalance at a level, and
-   liquidity walls being pulled are things traders only see visually today. Aeris already
-   owns the tape, footprint and depth stores (B3, B6), so it can perceive them; few competitors can.
+1. **时点**。每个事实都记录它在何时变得可知。询问“10:42 时图表显示了什么？”会准确返回交易员在 10:42 本可以看到的内容。这复用了 PD2 的回放时钟，它已经会屏蔽每个系列、研究、足迹图单元格和标记。
+2. **与人类图表相同的几何**。事实不是对某个绘图的描述，而是该绘图的来源。agent 推理的对象与人类审计的对象不可能出现分歧。
+3. **为推理而压缩**。一份带有稳定 ID、经过排序且有预算的 Chart Brief，为 agent 提供几千个 token 的结构，而不是十万个 token 的数据行，并且 agent 可以按需展开任何事实。
+4. **可移植且抗记忆**。归一化帧以波动率单位和距今柱数（bars-ago）表达事实，并可选择启用匿名化。规则可以跨标的迁移，训练数据的记忆回溯无法替代推理。
+5. **担任裁判，而非作者**。agent 把策略表达为类型化规则。引擎对其进行评估、发出信号，并在计入每一次试验的前提下度量历史结果。agent 的置信度以实测的基础比率为依据，绝不以其自身的感觉为依据。
+6. **订单流感知**。吸收、delta 背离、某一价位上的堆叠失衡，以及流动性墙被撤走，这些都是交易员目前只能靠肉眼看到的东西。Aeris 已经拥有成交带、足迹图和深度存储（B3、B6），因此能够感知它们；能做到这一点的竞品很少。
 
-### What this does and does not solve
+### 能解决与不能解决的问题
 
-The user's goal is an agent that trades a defined strategy with perfect discipline. Perception
-solves *seeing*. The setup contract solves *following the rule* (no skipped stops, no revenge
-trades, no hesitation). Evidence solves *knowing whether the rule deserves trust*. None of these
-creates an edge where the rule has none. Many discretionary setups owe part of their results to
-judgment that does not survive formalization, and the program must report that honestly rather
-than hide it. Aeris Charts provides perception and evidence; trade decisions and execution remain
-with the host and its user.
+用户的目标是一个能以完美纪律执行既定策略的 agent。感知解决的是*看见*。Setup 契约解决的是*遵守规则*（不跳过止损、不报复性交易、不犹豫）。证据解决的是*知道规则是否值得信任*。这些都不能在规则本身没有优势的地方创造出优势。许多主观 setup 的部分结果要归功于无法经受形式化的判断，本计划必须如实报告这一点，而不是隐瞒。Aeris Charts 提供感知和证据；交易决策与执行仍归宿主及其用户。
 
-## The perception contract
+## 感知契约
 
-### PC1 — Fact
+### PC1 — 事实
 
-A fact is one typed perception record:
+事实是一条类型化的感知记录：
 
-- **Identity:** stable `FactId`, kind, scale, the source series or stream, the parameters used, and
-  an algorithm version.
-- **Geometry:** anchors as logical bar plus full-resolution time plus price, reusing the F1 anchor
-  model so that facts survive prepend and rebuild exactly as drawings do.
-- **Lifecycle:** `formed_at` (the first bar on which it existed as a candidate), `confirmed_at`
-  (the bar on which its defining condition was satisfied), and `ended_at` with an end reason
-  (invalidated, completed, expired, superseded). Facts are provisional until confirmed. For
-  example, the existing ZigZag emits its current extreme as a provisional endpoint. Perception must
-  expose that provisional state explicitly, never as a confirmed swing.
-- **Measures:** kind-specific numbers (touch count, reaction size, duration, slope), each in both
-  absolute units and the normalized frame (PC4).
-- **Clauses:** for compound facts (patterns, setups), each defining condition and whether it held,
-  with its measured value and tolerance. There is never a single opaque "confidence".
-- **Triggers:** the exact prices or times at which the fact would change state (PC5).
-- **Projection:** the drawing it renders as, through the existing drawing contract.
+- **标识**：稳定的 `FactId`、种类、尺度、来源系列或数据流、所用参数，以及算法版本。
+- **几何**：锚点由逻辑柱、全分辨率时间和价格组成，复用 F1 的锚点模型，使事实能够和绘图完全一样，经受住历史数据的前置追加与重建。
+- **生命周期**：`formed_at`（它作为候选首次存在的那根柱）、`confirmed_at`（其定义条件被满足的那根柱），以及带有结束原因的 `ended_at`（已失效、已完成、已过期、已被取代）。事实在确认之前都是暂定的。例如，现有的 ZigZag 会把其当前极值作为暂定端点输出。感知必须显式暴露这种暂定状态，绝不能把它当作已确认的摆动。
+- **度量**：因种类而异的数值（触及次数、反应幅度、持续时间、斜率），每一项都同时以绝对单位和归一化帧（PC4）给出。
+- **子句**：对于复合事实（形态、setup），给出每一个定义条件及其是否成立，连同其测得值和容差。绝不会只有一个不透明的单一“置信度”。
+- **触发器**：该事实将改变状态的精确价格或时间（PC5）。
+- **投影**：它通过现有绘图契约所渲染成的绘图。
 
-### PC2 — Point-in-time semantics
+### PC2 — 时点语义
 
-Every perception query takes an optional as-of clock. With the replay clock set, perception output
-must equal the output computed from data truncated at that clock. Detection algorithms may only
-use information available at the bar on which they publish. Confirmation delay is part of the
-fact, not hidden. This is the property that makes evidence (P5) trustworthy, and it is tested
-directly (PX4).
+每个感知查询都接受一个可选的 as-of 时钟。设置了回放时钟时，感知输出必须与基于在该时钟处截断的数据所计算出的输出相等。检测算法只能使用其发布所在那根柱上已可获得的信息。确认延迟是事实的一部分，而不是被隐藏的。这一性质使证据（P5）值得信赖，并且会被直接测试（PX4）。
 
-### PC3 — Chart Brief
+### PC3 — 图表简报（Chart Brief）
 
-The brief is a deterministic, budgeted summary of the chart, available as canonical JSON and as a
-canonical compact text form:
+简报是图表的一份确定性的、有预算的摘要，提供规范 JSON 和规范紧凑文本两种形式：
 
-- Facts are ranked by salience: scale, recency, proximity to current price in volatility units,
-  strength, and confluence. The brief is cut to a caller-supplied fact or byte budget.
-- Stable IDs let the agent ask follow-up questions (`expand(id)`, `facts_near(price)`,
-  `facts_between(t0, t1)`, `as_of(clock)`).
-- The text form uses fixed vocabulary, fixed field order and fixed precision, so the same chart
-  produces the same text byte-for-byte. Agents and tests can diff it.
+- 事实按显著性排序：尺度、新近度、以波动率单位计与当前价格的接近程度、强度和共振。简报会被截断到调用方提供的事实数量或字节预算。
+- 稳定的 ID 让 agent 能够提出后续问题（`expand(id)`、`facts_near(price)`、`facts_between(t0, t1)`、`as_of(clock)`）。
+- 文本形式使用固定的词汇、固定的字段顺序和固定的精度，因此同一张图表会逐字节产生相同的文本。agent 和测试都可以对其做 diff。
 
-Illustrative text form (format to be finalized in P1):
+示意文本形式（格式将在 P1 中最终确定）：
 
 ```text
 BRIEF v1  as_of=bar 4812  frame=normalized  atr14=1.00u
@@ -191,268 +112,166 @@ P2  pattern bull_flag minor  clauses 5/6 (pole=4.2u ok; retrace=38% ok; vol.cont
 REL Z7~P2.breakout (0.0u)  T5~Z3 (0.4u)  CONFLUENCE Z3+T5 at -1.6u..-1.8u
 ```
 
-### PC4 — Normalized frame and anonymization
+### PC4 — 归一化帧与匿名化
 
-- Prices are expressed as distance from the current price in units of a declared volatility
-  measure (default ATR(14), host-overridable). Times are expressed as bars-ago, and volume as
-  z-scores or percentiles.
-- Absolute values remain available alongside. The frame changes the presentation, not the facts.
-- Anonymized mode omits symbol, absolute dates and absolute prices from the brief, so the agent
-  cannot match the chart to memorized history. The host decides when to use it; the engine
-  guarantees that no identifying field leaks in that mode.
+- 价格表示为与当前价格的距离，以所声明的波动率度量为单位（默认 ATR(14)，宿主可覆盖）。时间以距今柱数（bars-ago）表示，成交量以 z 分数或百分位表示。
+- 绝对值仍然并列可用。该帧改变的是呈现方式，而不是事实。
+- 匿名化模式会从简报中省略标的、绝对日期和绝对价格，使 agent 无法把图表与记忆中的历史对应起来。何时使用由宿主决定；引擎保证在该模式下不会泄露任何可识别字段。
 
-### PC5 — Triggers and sensitivities
+### PC5 — 触发器与敏感度
 
-For each fact, the engine computes the state-change thresholds. Examples: "structure breaks on a
-close below X", "the trendline's value at the next bar is Y", "the pattern confirms on a close above
-Z". These are exact, engine-owned numbers. Agents set alerts and orders from them instead of
-recomputing geometry. They map directly onto existing alert lines and trading objects.
+对于每个事实，引擎都会计算其状态变化的阈值。例如：“收盘价低于 X 时结构被突破”、“趋势线在下一根柱上的值为 Y”、“收盘价高于 Z 时形态得到确认”。这些都是精确的、由引擎拥有的数字。agent 依据它们设置告警和订单，而不是重新计算几何。它们可以直接映射到现有的告警线和交易对象上。
 
-### PC6 — Relations and confluence
+### PC6 — 关系与共振
 
-Facts form a bounded relation graph: tests (a swing tested a zone), breaks, aligns-with (two facts
-within a tolerance in volatility units), part-of (swings inside a pattern), and diverges-from (a
-price swing against a delta swing). Confluence, meaning several independent facts agreeing at one
-price, is what experienced traders look for. It becomes an explicit, queryable fact rather than an
-intuition.
+事实构成一张有界的关系图：测试（一次摆动测试了某个区域）、突破、对齐（两个事实在以波动率单位计的容差之内）、隶属（形态内部的摆动），以及背离（价格摆动与 delta 摆动相反）。共振，即多个相互独立的事实在同一价格上相互印证，是经验丰富的交易员所寻找的东西。它将成为一个明确的、可查询的事实，而不再是一种直觉。
 
-### PC7 — Perception layer
+### PC7 — 感知层
 
-A read-only, engine-owned drawing layer projects facts, setups and occurrences onto the chart
-through the existing drawing contract and ordered frame, identically on every executor. Hosts can
-toggle it, filter it by kind or scale, and highlight the facts an agent cited in a decision. The
-human sees exactly what the agent saw.
+一个只读的、由引擎拥有的绘图层，通过现有的绘图契约和有序帧，将事实、setup 和出现记录投影到图表上，并在每个执行器上保持一致。宿主可以开关它、按种类或尺度过滤它，并高亮 agent 在某次决策中引用的事实。人类看到的，正是 agent 所看到的。
 
-## Batches
+## 批次
 
-Work cadence follows [AGENTS.md](../AGENTS.md): implement a whole batch, use focused checks while
-building, run the complete gate once, then commit and push once per batch, with
-`docs/Architecture.md` updated in the same commit.
+工作节奏遵循 [AGENTS.md](../AGENTS.md)：实现完整的一个批次，构建过程中使用有针对性的检查，只运行一次完整门禁，然后每个批次提交并推送一次，并在同一次提交中更新 `docs/Architecture.md`。
 
-### P1 — Perception foundation
+### P1 — 感知基础
 
-**Scope:** PC1–PC4, PC7, PF1–PF4. **Depends on:** B2, B5. **Status:** proposed.
+**范围**：PC1–PC4、PC7、PF1–PF4。**依赖**：B2、B5。**状态**：已提议。
 
-- [ ] **PC1** Fact model with lifecycle, measures, clauses, provenance and drawing projection;
-      bounded fact store per bound source with explicit caps, eviction and memory telemetry.
-- [ ] **PC2** As-of queries on the replay clock. Incremental tip updates; historical corrections
-      rebuild from the nearest checkpoint and report the work done.
-- [ ] **PF1 Bar vocabulary.** Per-bar normalized descriptors: body and wick ratios, range
-      percentile, gap, close location, volume percentile, inside, outside and engulfing
-      relations. Pure functions in `aeris_charts_indicators`.
-- [ ] **PF2 Multi-scale swings.** Volatility-scaled pivots at three scales (micro, minor, major)
-      with explicit confirmation lag and provisional endpoints, plus Perceptually Important
-      Points for shape compression. This builds on the existing ZigZag rather than duplicating
-      it.
-- [ ] **PF3 Structure.** Per-scale trend state (higher highs and higher lows, or lower highs and
-      lower lows), structure breaks and changes of character, ranges and compression boxes, and
-      leg statistics (size, duration, slope, overlap, impulse or corrective). Absorbs the I3
-      swing and structure-break items.
-- [ ] **PF4 Swing zones.** Support and resistance zones clustered from confirmed swing prices,
-      with touch count, reaction strength, age, last test and role flips; prior-period highs and
-      lows and the opening range from host-supplied boundaries. Absorbs the matching I3 items.
-- [ ] **PC3** Chart Brief v1 (JSON and canonical text) with salience ranking and budgets.
-- [ ] **PC4** Normalized frame and anonymized mode.
-- [ ] **PC7** Perception drawing layer on every executor.
-- [ ] Rust, WASM and TypeScript APIs (`chart.perception()`), typed schemas for every parameter,
-      and persistence of perception settings (never of derived facts).
-- [ ] Fixtures: point-in-time equivalence (PX4), cross-executor parity of the layer, and
-      deterministic brief bytes for versioned datasets. `perf_gate` budgets for tip update and
-      brief generation.
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [ ] **PC1** 带有生命周期、度量、子句、出处和绘图投影的事实模型；为每个已绑定的来源提供有界的事实存储，带有明确的上限、淘汰和内存遥测。
+- [ ] **PC2** 基于回放时钟的 as-of 查询。增量式末端更新；历史修正从最近的检查点重建，并报告所做的工作量。
+- [ ] **PF1 柱词汇**。逐柱的归一化描述符：实体与影线比例、波幅百分位、跳空、收盘位置、成交量百分位，以及内包、外包和吞没关系。纯函数，位于 `aeris_charts_indicators`。
+- [ ] **PF2 多尺度摆动**。按波动率缩放的枢轴点，分三个尺度（micro、minor、major），带有明确的确认滞后和暂定端点，另有用于形状压缩的感知重要点（Perceptually Important Points）。它建立在现有的 ZigZag 之上，而不是重复实现。
+- [ ] **PF3 结构**。每个尺度的趋势状态（更高的高点与更高的低点，或更低的高点与更低的低点）、结构突破与性质转变、区间与压缩箱体，以及腿段统计（幅度、持续时间、斜率、重叠度、推动或修正）。承接 I3 中的摆动与结构突破条目。
+- [ ] **PF4 摆动区**。由已确认的摆动价格聚类而成的支撑与阻力区，带有触及次数、反应强度、存续时间、最近一次测试和角色翻转；以及来自宿主提供的边界的前一周期高低点和开盘区间。承接对应的 I3 条目。
+- [ ] **PC3** Chart Brief v1（JSON 和规范文本），带有显著性排序和预算。
+- [ ] **PC4** 归一化帧与匿名化模式。
+- [ ] **PC7** 每个执行器上的感知绘图层。
+- [ ] Rust、WASM 和 TypeScript API（`chart.perception()`），每个参数的类型化 schema，以及感知设置的持久化（绝不持久化派生事实）。
+- [ ] 夹具：时点等价性（PX4）、该层的跨执行器一致性，以及针对带版本数据集的确定性简报字节。用于末端更新和简报生成的 `perf_gate` 预算。
+- [ ] 已更新 `docs/Architecture.md`；完整门禁全部通过；批次已提交并推送。
 
-**Exit:** for every fact kind, perception at any replay clock equals perception on truncated data.
-Briefs are byte-identical across native and browser builds, and the layer renders identically on
-every executor within the existing parity tolerances.
+**退出标准**：对每一种事实，在任意回放时钟下的感知都等于在截断数据上的感知。简报在原生构建与浏览器构建之间逐字节一致，并且该层在每个执行器上的渲染在现有一致性容差范围内完全一致。
 
-### P2 — Geometry and patterns
+### P2 — 几何与形态
 
-**Scope:** PC5, PC6, PF5, PF6. **Depends on:** P1. **Status:** proposed.
+**范围**：PC5、PC6、PF5、PF6。**依赖**：P1。**状态**：已提议。
 
-- [ ] **PF5 Lines and channels.** Trendlines fitted through three or more confirmed swings within
-      a volatility-scaled tolerance, parallel and regression channels, touch quality, and breaks.
-- [ ] **PF6 Patterns.** Double and triple tops and bottoms, head and shoulders (regular and
-      inverse), ascending, descending and symmetric triangles, wedges, flags and pennants,
-      rectangles, and cup with handle. Each is defined as published clauses with tolerances and
-      carries a neckline or breakout level, an invalidation level and a measured target. Patterns
-      reuse the same geometry as the B8 pattern drawing tools.
-- [ ] **PC5** Triggers and sensitivities for every fact kind.
-- [ ] **PC6** Relation graph and confluence facts, bounded per chart.
-- [ ] Drill-down queries: `expand`, `facts_near`, `facts_between`, `as_of`.
-- [ ] Fair value gaps and order blocks as facts (absorbs the remaining I3 items), with documented,
-      parameterized and deterministic rules.
-- [ ] Perception agreement study started (PX1) on a fixed annotated set.
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [ ] **PF5 线条与通道**。在按波动率缩放的容差内穿过三个或更多已确认摆动拟合的趋势线、平行通道与回归通道、触及质量，以及突破。
+- [ ] **PF6 形态**。双顶、三重顶、双底与三重底，头肩形态（常规与倒置），上升三角形、下降三角形与对称三角形，楔形，旗形与三角旗形，矩形，以及杯柄形态。每种形态都被定义为附带容差的已公布子句，并带有颈线或突破价位、失效价位和测算目标。形态复用与 B8 形态绘图工具相同的几何。
+- [ ] **PC5** 针对每种事实的触发器与敏感度。
+- [ ] **PC6** 关系图与共振事实，按图表设有上限。
+- [ ] 下钻查询：`expand`、`facts_near`、`facts_between`、`as_of`。
+- [ ] 将公允价值缺口和订单块作为事实（承接 I3 的其余条目），规则有文档说明、可参数化且具有确定性。
+- [ ] 在固定的标注集上启动感知一致性研究（PX1）。
+- [ ] 已更新 `docs/Architecture.md`；完整门禁全部通过；批次已提交并推送。
 
-**Exit:** every pattern's clauses are documented and fixture-tested on synthetic charts that pass
-and fail each clause. Triggers match the bar on which state actually changes in replay.
+**退出标准**：每种形态的子句都有文档说明，并在合成图表上用夹具测试过，这些图表分别满足和不满足每一条子句。触发器与回放中状态实际发生变化的那根柱相吻合。
 
-### P3 — Order flow, liquidity and multi-timeframe perception
+### P3 — 订单流、流动性与多周期感知
 
-**Scope:** PF7–PF9. **Depends on:** P1, B3, B6, B7. **Status:** proposed.
+**范围**：PF7–PF9。**依赖**：P1、B3、B6、B7。**状态**：已提议。
 
-- [ ] **PF7 Order-flow facts.** Price and cumulative-delta divergence across swings, absorption
-      (high volume at a level without price progress), exhaustion, stacked imbalances at zones,
-      and large-trade clusters, all derived from the canonical tape. Shares rules with OF13
-      rather than duplicating them.
-- [ ] **PF8 Liquidity facts.** Persistent resting-liquidity walls, pulled and replenished
-      liquidity, and level tests against walls, derived from the B6 depth store with its existing
-      bounds. Unknowns stay unknown; nothing infers hidden liquidity.
-- [ ] **PF9 Context and multi-timeframe.** Volatility regime percentile, session position from host
-      boundaries, profile levels (POC, value area, naked POCs from B7), VWAP and anchored-VWAP
-      distance, and higher-timeframe structure and zones via F6 resampling, all aligned without
-      look-ahead.
-- [ ] Brief sections for order flow, liquidity and context. Every order-flow fact is labeled with
-      its data source (tape or candle approximation).
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [ ] **PF7 订单流事实**。跨摆动的价格与累计 delta 背离、吸收（某一价位上成交量很大但价格没有推进）、衰竭、区域内的堆叠失衡，以及大额成交聚集，均派生自规范成交带。与 OF13 共享规则，而不是重复实现。
+- [ ] **PF8 流动性事实**。持续存在的挂单流动性墙、被撤走与被补充的流动性，以及针对流动性墙的价位测试，派生自 B6 的深度存储及其现有上限。未知的保持未知；不对隐藏流动性做任何推断。
+- [ ] **PF9 上下文与多周期**。波动率状态百分位、基于宿主边界的交易时段位置、分布价位（控制点（POC）、价值区域、来自 B7 的裸控制点）、与 VWAP 及锚定 VWAP 的距离，以及通过 F6 重采样得到的更高周期结构与区域，全部在没有前视的前提下对齐。
+- [ ] 针对订单流、流动性和上下文的简报分节。每个订单流事实都标注其数据来源（成交带或 K 线近似）。
+- [ ] 已更新 `docs/Architecture.md`；完整门禁全部通过；批次已提交并推送。
 
-**Exit:** order-flow and liquidity facts are point-in-time equivalent in replay. Higher-timeframe
-facts never reveal an unfinished higher-timeframe bar's future values.
+**退出标准**：订单流与流动性事实在回放中具有时点等价性。更高周期的事实绝不会暴露尚未完成的更高周期柱的未来值。
 
-### P4 — Setup contract
+### P4 — Setup 契约
 
-**Scope:** PS1–PS4. **Depends on:** P2, decision D2. **Status:** proposed.
+**范围**：PS1–PS4。**依赖**：P2、决策 D2。**状态**：已提议。
 
-- [ ] **PS1 Setup specification.** A typed, versioned, bounded tree with:
-      - entry conditions over facts, measures and relations: and/or/not, comparisons, sequence
-        ("A then B within N bars"), and scale and kind filters;
-      - invalidation conditions;
-      - stop and target placement referencing facts (for example "stop below the zone's lower edge
-        by 0.2 volatility units");
-      - risk sizing in R, a time stop, and session filters from host boundaries.
-      No loops, variables, user functions or code.
-- [ ] **PS2 Validation that refuses to guess.** Schema validation reports ambiguous, unsupported or
-      contradictory clauses back to the agent by path. A strategy the engine cannot express
-      exactly is rejected with reasons, never silently approximated.
-- [ ] **PS3 Live evaluation.** Bounded incremental evaluation on each update, emitting setup events
-      (armed, triggered, invalidated, stopped, target, timed out). Every event cites the fact IDs
-      and clause values behind it.
-- [ ] **PS4 Discipline path.** Triggered setups produce trading intents through the existing
-      trading-intent path, with stops and targets attached. The host and its user decide whether
-      intents are executed. Events and intents project onto the perception layer.
-- [ ] Persistence and migration for setup specifications; replay equivalence for events.
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [ ] **PS1 Setup 规格**。一棵类型化、带版本、有界的树，包含：
+      - 针对事实、度量和关系的入场条件：与/或/非、比较、序列（“A 之后 N 根柱内出现 B”），以及尺度和种类过滤器；
+      - 失效条件；
+      - 引用事实的止损与目标位设置（例如“止损设在该区域下沿之下 0.2 个波动率单位处”）；
+      - 以 R 计的风险规模、时间止损，以及来自宿主边界的交易时段过滤器。没有循环、变量、用户函数或代码。
+- [ ] **PS2 拒绝猜测的校验**。schema 校验会按路径把含糊、不受支持或相互矛盾的子句报告回 agent。引擎无法精确表达的策略会被拒绝并给出理由，绝不会被悄悄近似。
+- [ ] **PS3 实时评估**。每次更新时进行有界的增量评估，发出 setup 事件（已就绪、已触发、已失效、已止损、已达目标、已超时）。每个事件都会引用其背后的事实 ID 和子句取值。
+- [ ] **PS4 纪律路径**。已触发的 setup 通过现有的交易意图路径产生交易意图，并附带止损和目标位。是否执行这些意图由宿主及其用户决定。事件和意图会投影到感知层上。
+- [ ] setup 规格的持久化与迁移；事件的回放等价性。
+- [ ] 已更新 `docs/Architecture.md`；完整门禁全部通过；批次已提交并推送。
 
-**Exit:** a fixed suite of plain-language strategies has reference specifications whose events
-match hand-verified bars in replay, and unsupported phrasing is rejected with actionable paths.
+**退出标准：** 一组固定的自然语言策略拥有参考规格，其事件在回放中与人工核实的柱相符，且不受支持的表述会被拒绝并给出可操作的路径。
 
-### P5 — Evidence
+### P5 — 证据
 
-**Scope:** PE1–PE4. **Depends on:** P4, PD6, decision D3. **Status:** proposed.
+**范围：** PE1–PE4。**依赖：** P4、PD6、决策 D3。**状态：** 拟议。
 
-- [ ] **PE1 Historical occurrences.** Evaluate a setup over the retained history with
-      point-in-time semantics. List every occurrence with entry, exit and reason, outcome in R,
-      maximum favorable and adverse excursion, bars held, and the facts cited. Costs and slippage
-      are host inputs, never defaults.
-- [ ] **PE2 Honest statistics.** Occurrence count, win rate with a Wilson interval, expectancy in R
-      with a confidence interval, profit factor, maximum drawdown in R, and outcome distribution.
-      Small samples are flagged rather than summarized as confident. Deflated metrics use the
-      trial ledger.
-- [ ] **PE3 Trial ledger and holdout lock.** Every specification variant evaluated on a chart is
-      counted, so selection bias is measurable. An optional holdout window is evaluated once per
-      specification hash and then locked.
-- [ ] **PE4 Decision snapshots.** Each setup event can render a "what the agent saw" image through
-      PD6, with the perception layer and cited facts highlighted, for the host's journal.
-- [ ] Bounded work: evaluation cost is reported and capped, and it never disturbs live frame
-      pacing.
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [ ] **PE1 历史出现记录。** 以时点语义在保留的历史数据上评估 setup。列出每一次出现，包括入场、出场及原因、以 R 计的结果、最大有利偏移与最大不利偏移、持有柱数，以及所引用的事实。成本与滑点是宿主输入，绝不设默认值。
+- [ ] **PE2 诚实的统计。** 出现次数、带 Wilson 区间的胜率、带置信区间的以 R 计的期望值、盈利因子、以 R 计的最大回撤，以及结果分布。小样本会被标记，而不是被概括为可信的结论。通缩（deflated）指标使用试验账本。
+- [ ] **PE3 试验账本与留出集锁定。** 在某个图表上评估过的每一个规格变体都会被计数，使选择偏差可度量。可选的留出窗口对每个规格哈希仅评估一次，随后锁定。
+- [ ] **PE4 决策快照。** 每个 setup 事件都可以通过 PD6 渲染一张“agent 所见”图像，突出显示感知层与所引用的事实，供宿主的交易日志使用。
+- [ ] 有界工作：评估开销会被报告并设上限，且绝不干扰实时帧节奏。
+- [ ] `docs/Architecture.md` 已更新；完整门禁通过；批次已提交并推送。
 
-**Exit:** evidence for a setup equals the result of stepping the replay clock bar by bar and
-recording live events. A deliberately look-ahead-contaminated specification is impossible to
-express, and the ledger reports every trial.
+**退出标准：** 某个 setup 的证据等同于逐柱推进回放时钟并记录实时事件所得的结果。刻意被前视偏差污染的规格无法被表达，且账本会报告每一次试验。
 
-### P6 — Agent benchmark and program closure
+### P6 — Agent 基准与计划收尾
 
-**Scope:** PX1–PX5. **Depends on:** P5. **Status:** proposed.
+**范围：** PX1–PX5。**依赖：** P5。**状态：** 拟议。
 
-- [ ] Agent comprehension benchmark (PX2) and rule-translation fidelity benchmark (PX3) added to
-      the evidence benchmark subsystem with versioned datasets and question sets.
-- [ ] [Public_api.md](../docs/Public_api.md) classifies the perception, setup and evidence surfaces.
-- [ ] Milestone evidence: perception-layer screenshots on every executor, the PX1 agreement
-      report, PX2 and PX3 results, and recorded performance budgets.
+- [ ] Agent 理解力基准（PX2）与规则翻译保真度基准（PX3）已加入证据基准测试子系统，并附带带版本的数据集与问题集。
+- [ ] [公共 API](../docs/api/README.md) 对感知、setup 与证据接口面进行归类。
+- [ ] 里程碑证据：每个执行器上的感知层截图、PX1 一致性报告、PX2 与 PX3 结果，以及已记录的性能预算。
 
-**Exit:** all evaluation targets in the next section are met, or the plan records the measured
-shortfall and the decision taken.
+**退出标准：** 下一节中的全部评估目标均已达成，或计划记录了实测差距及所作决策。
 
-## Evaluation program
+## 评估计划
 
-The program succeeds only when it measurably improves an agent's understanding. Running is not
-enough.
+仅当本计划可度量地提升 agent 的理解能力时，才算成功。仅仅运行起来是不够的。
 
-- **PX1 — Perception agreement.** Experienced traders annotate a fixed, versioned set of charts
-  (swings, zones, trendlines, patterns). Report precision and recall per fact kind and scale.
-  Disagreements become documented parameter decisions, never silent tuning against the test set.
-- **PX2 — Agent comprehension.** Ask the same factual questions about the same charts in three
-  conditions: raw OHLCV, chart image, and Chart Brief with drill-down. Example questions: "nearest
-  resistance above price", "major trend direction", "is this a valid flag and why not". Measure
-  accuracy, tokens and latency. The hypothesis to prove is that the brief beats both alternatives
-  on accuracy at a fraction of the raw-data tokens. Run anonymized and named variants to measure
-  memorization effects.
-- **PX3 — Rule translation fidelity.** A fixed suite of plain-language strategies. Measure how
-  often an agent's specification matches the reference specification, and how often the engine
-  correctly rejects ambiguous phrasing.
-- **PX4 — Point-in-time correctness.** For every fact kind and setup, outputs at replay clock *t*
-  equal outputs computed on data truncated at *t*. This is a required fixture, not a sample.
-- **PX5 — Performance.** Release `perf_gate` budgets for tip-update perception cost, brief
-  generation, drill-down queries, live setup evaluation, and historical evaluation throughput,
-  all with flat retained memory.
+- **PX1 — 感知一致性。** 经验丰富的交易员对一组固定的、带版本的图表（摆动点、区域、趋势线、形态）进行标注。按事实种类与尺度报告精确率与召回率。分歧会成为有文档记录的参数决策，绝不针对测试集进行静默调参。
+- **PX2 — Agent 理解力。** 在三种条件下，就同一批图表提出相同的事实性问题：原始 OHLCV、图表图像，以及带下钻的 Chart Brief。示例问题：“价格上方最近的阻力位”、“主要趋势方向”、“这是否为有效旗形，以及为何不是”。度量准确率、token 数与延迟。需要证明的假设是：简报在准确率上优于另外两种方案，而所用 token 仅为原始数据 token 的一小部分。分别运行匿名化与具名两种变体，以度量记忆效应。
+- **PX3 — 规则翻译保真度。** 一组固定的自然语言策略。度量 agent 给出的规格与参考规格相符的频率，以及引擎正确拒绝有歧义的表述的频率。
+- **PX4 — 时点正确性。** 对每一种事实种类与 setup，回放时钟 *t* 处的输出等于在截断于 *t* 的数据上计算得到的输出。这是必需的夹具，而非抽样。
+- **PX5 — 性能。** tip 更新感知开销、简报生成、下钻查询、实时 setup 评估与历史评估吞吐量的 release `perf_gate` 预算，且全部保持保留内存平稳。
 
-## Scope, ownership and architecture rules
+## 范围、归属与架构规则
 
-| Aeris Charts owns | Hosts own (Aeris Terminal for the platform) |
+| Aeris Charts 拥有 | 宿主拥有（平台侧为 Aeris Terminal） |
 | --- | --- |
-| Pure detection math (`aeris_charts_indicators`) | Agent tool server (for example MCP), model selection and prompts |
-| Fact stores, as-of queries, brief, relations, triggers (`aeris_charts_engine`) | Which agent sees which chart, anonymization policy, rate limits |
-| Setup specification, validation, live evaluation, events, single-chart evidence | Executing or rejecting trading intents, risk limits, broker connectivity |
-| Perception layer projection on every executor | Journals, storage of decision snapshots, cross-symbol scans and portfolio statistics |
-| Typed schemas, persistence of settings and specifications | User consent, account policy, and how agent output is presented |
-| — | Paper trading, live-versus-evidence drift monitoring, and stopping a strategy when it drifts |
+| 纯检测数学（`aeris_charts_indicators`） | Agent 工具服务器（例如 MCP）、模型选择与提示词 |
+| 事实存储、as-of 查询、简报、关系、触发器（`aeris_charts_engine`） | 哪个 agent 看到哪张图表、匿名化策略、速率限制 |
+| Setup 规格、校验、实时评估、事件、单图表证据 | 执行或拒绝交易意图、风险限额、券商连接 |
+| 在每个执行器上的感知层投影 | 交易日志、决策快照的存储、跨品种扫描与投资组合统计 |
+| 类型化 schema、设置与规格的持久化 | 用户同意、账户策略，以及 agent 输出的呈现方式 |
+| — | 模拟交易、实盘与证据之间的漂移监控，以及策略发生漂移时停止该策略 |
 
-Architecture rules for every batch:
+适用于每个批次的架构规则：
 
-- **No model inside the engine.** Perception is deterministic computation. Nothing calls a model,
-  samples randomness or depends on wall-clock time.
-- **One owner per fact.** Studies that render structure (swings, zones, fair value gaps) are views of
-  perception facts, not parallel implementations.
-- **Nothing invented.** Facts state their source and approximations (for example candle-based order
-  flow). Unknown aggressor sides and missing depth stay unknown.
-- **Bounded everything.** Fact stores, relation graphs, briefs, setups, occurrences and ledgers
-  have explicit caps, eviction rules and memory telemetry.
-- **Point-in-time by construction.** Detection code receives only data up to the bar it publishes
-  for. Equivalence fixtures guard every kind.
-- **Shared geometry.** Facts render through the existing drawing contract and ordered frame. No
-  executor-specific perception code.
-- **Hosts receive behavior.** "Describe this chart", "evaluate this setup" and "show the evidence"
-  are single engine operations, not sequences each host must repeat.
-- **No new crates** unless a real dependency boundary requires one. Detection math belongs in
-  `aeris_charts_indicators`, and perception, setups and evidence in `aeris_charts_engine` modules.
+- **引擎内不含模型。** 感知是确定性计算。任何部分都不调用模型、不采样随机数，也不依赖挂钟时间。
+- **每个事实只有一个所有者。** 渲染结构的研究（摆动点、区域、公允价值缺口）是感知事实的视图，而非并行实现。
+- **不凭空捏造。** 事实会声明其来源与近似之处（例如基于 K 线的订单流）。未知的主动方与缺失的深度保持未知。
+- **一切有界。** 事实存储、关系图、简报、setup、出现记录与账本都具有明确的上限、淘汰规则与内存遥测。
+- **构造即时点正确。** 检测代码只接收截至其所发布的那根柱为止的数据。等价夹具覆盖每一种事实种类。
+- **共享几何。** 事实通过现有的绘图契约与有序帧渲染。没有执行器专属的感知代码。
+- **宿主获得行为。** “描述此图表”“评估此 setup”和“展示证据”都是单一的引擎操作，而非每个宿主都必须重复的调用序列。
+- **不新增 crate**，除非真实的依赖边界需要。检测数学归属于 `aeris_charts_indicators`，感知、setup 与证据归属于 `aeris_charts_engine` 模块。
 
-## Risks and non-goals
+## 风险与非目标
 
-- **Edge is not guaranteed.** Perception and discipline do not make an unprofitable rule
-  profitable. Evidence exists to say "no" as clearly as "yes".
-- **Definition risk.** Classical patterns have no single agreed definition. Clause-level output
-  and published tolerances make every definition inspectable and debatable, rather than hidden
-  behind a confidence number.
-- **Overfitting risk moves to the agent.** An agent can iterate specifications quickly. The trial
-  ledger and holdout lock make that selection visible. They cannot prevent a host from ignoring
-  them.
-- **Non-goals:** a scripting language or interpreter, price prediction, an in-engine model, broker
-  execution, cross-symbol research infrastructure, and investment advice.
+- **不保证存在交易优势。** 感知与纪律不会让一条不盈利的规则变得盈利。证据的作用在于能像说“是”一样清楚地说“否”。
+- **定义风险。** 经典形态没有统一公认的定义。子句级输出与公开的容差使每一种定义都可被检视和争论，而不是隐藏在置信度数字之后。
+- **过拟合风险转移到 agent 一侧。** agent 可以快速迭代规格。试验账本与留出集锁定使这种选择变得可见，但无法阻止宿主忽略它们。
+- **非目标：** 脚本语言或解释器、价格预测、引擎内模型、券商执行、跨品种研究基础设施，以及投资建议。
 
-## Sources
+## 来源
 
 - MME-Finance: <https://arxiv.org/abs/2411.03314>
 - Do VLMs Truly "Read" Candlesticks? <https://arxiv.org/abs/2604.12659>
-- Vision LLM chart audit (April 2026): <https://gist.github.com/roman-rr/c1cd675f7c35b68ae5ac281c30080166>
+- Vision LLM 图表审计（2026 年 4 月）：<https://gist.github.com/roman-rr/c1cd675f7c35b68ae5ac281c30080166>
 - Lo, Mamaysky and Wang, Foundations of Technical Analysis: <https://www.nber.org/papers/w7613>
 - Jiang, Kelly and Xiu, (Re-)Imag(in)ing Price Trends: <https://economics.yale.edu/sites/default/files/2023-11/The%20Journal%20of%20Finance%20-%202023%20-%20JIANG%20-%20Re%25E2%2580%2590%20Imag%20in%20ing%20Price%20Trends_0.pdf>
 - Perceptually Important Points: <https://research.polyu.edu.hk/en/publications/improvement-algorithms-of-perceptually-important-point-identifica/>
-- Bulkowski failure rates: <https://thepatternsite.com/FailureRates.html>
-- LLM time-series representation survey: <https://arxiv.org/pdf/2402.01801>
-- Profit Mirage (information leakage in LLM agents): <https://arxiv.org/html/2510.07920v1>
+- Bulkowski 失败率：<https://thepatternsite.com/FailureRates.html>
+- LLM 时间序列表示综述：<https://arxiv.org/pdf/2402.01801>
+- Profit Mirage（LLM agent 中的信息泄漏）：<https://arxiv.org/html/2510.07920v1>
 - Anonymization-first LLM trading: <https://arxiv.org/pdf/2603.17692>
 - Deflated Sharpe Ratio: <https://papers.ssrn.com/abstract=2460551>
-- TradingView MCP public beta: <https://cryptobriefing.com/tradingview-mcp-server-ai-agents-beta/>
-- QuantConnect Mia: <https://www.quantconnect.com/docs/v2/ai-assistance/predefined-agents/mia>
+- TradingView MCP 公开测试版：<https://cryptobriefing.com/tradingview-mcp-server-ai-agents-beta/>
+- QuantConnect 的 Mia：<https://www.quantconnect.com/docs/v2/ai-assistance/predefined-agents/mia>
 - BacktestBench: <https://arxiv.org/pdf/2605.17937>

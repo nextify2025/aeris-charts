@@ -1,17 +1,17 @@
-# Aeris Charts evidence benchmarks
+# Aeris Charts 证据基准测试
 
-This subsystem is the source of truth for Aeris Charts performance, artifact-size, and memory claims. It measures the production `@aeristerminal/aeris-charts` package through its public browser API and keeps every number tied to source, environment, scenario, dataset, and raw samples. It does not optimize the product and it does not manufacture unsupported values.
+该子系统是 Aeris Charts 性能、产物体积与内存声明的事实来源。它通过公共浏览器 API 测量生产版 `@aeristerminal/aeris-charts` 包，并让每个数字都与源码、环境、场景、数据集和原始样本绑定。它不负责优化产品，也不会凭空生成缺乏依据的数值。
 
-## Requirements
+## 环境要求
 
-- The repository's configured Rust toolchain and `wasm-pack` 0.15.0 for the production WASM build. Every workflow installs exactly that version (`release_gate_guard.mjs` enforces it for `ci.yml`, `publish.yml`, and the three benchmark workflows). wasm-pack runs a `wasm-opt` found on `PATH` and otherwise downloads its own binaryen `version_117`, so a locally installed `wasm-opt` silently changes the artifact; the provenance below records which one ran.
-- Node.js 18 or newer, and Bun 1.4.2 (installs dependencies and runs the package build); npm only for `npm pack`.
-- Chromium installed for Playwright (`cd examples/web_demo && bunx playwright install chromium`).
-- For official release results, a clean checkout on a controlled runner with `AERIS_CHARTS_BENCH_ENV_CLASS=official-benchmark-runner` and a stable `AERIS_CHARTS_BENCH_ENV_ID`.
+- 仓库所配置的 Rust 工具链，以及用于生产 WASM 构建的 `wasm-pack` 0.15.0。每个工作流都精确安装该版本（`release_gate_guard.mjs` 对 `ci.yml`、`publish.yml` 和三个基准测试工作流强制执行这一点）。wasm-pack 会运行在 `PATH` 中找到的 `wasm-opt`，否则下载其自带的 binaryen `version_117`，因此本地安装的 `wasm-opt` 会悄然改变产物；下文的溯源信息记录了实际运行的是哪一个。
+- Node.js 18 或更新版本，以及 Bun 1.4.2（安装依赖并运行包构建）；npm 仅用于 `npm pack`。
+- 为 Playwright 安装的 Chromium（`cd examples/web_demo && bunx playwright install chromium`）。
+- 对于正式 release 结果，需要在受控 runner 上使用干净检出，并设置 `AERIS_CHARTS_BENCH_ENV_CLASS=official-benchmark-runner` 与稳定的 `AERIS_CHARTS_BENCH_ENV_ID`。
 
-The CLI runs `bun install --frozen-lockfile` when the package or demo dependencies are absent. Browser scenarios reuse the existing demo server and Playwright dependency. No benchmark package is shipped to consumers.
+当包或演示的依赖项缺失时，CLI 会运行 `bun install --frozen-lockfile`。浏览器场景复用现有的演示服务器与 Playwright 依赖。不会向使用方发布任何基准测试包。
 
-## Commands
+## 命令
 
 ```text
 node benchmarks/benchmark.mjs test
@@ -30,223 +30,187 @@ node benchmarks/benchmark.mjs baseline <official-release-result.json>
 node benchmarks/benchmark.mjs claims
 ```
 
-`release` includes the configured 60-minute soak and refuses a dirty worktree. `--duration-ms` may shorten a local validation run, but a changed duration is part of the scenario configuration and must not be compared as if it were the canonical release run.
+`release` 包含已配置的 60 分钟 soak，并拒绝在不干净的工作树上运行。`--duration-ms` 可以缩短本地验证运行，但更改后的时长属于场景配置的一部分，不得当作规范的 release 运行来比较。
 
-## Profiles and authority
+## 配置档与权威性
 
-- `smoke` is fast shared-CI validation. It detects broken scenarios and gross regressions but is never public evidence.
-- `nightly` collects broader shared-runner trends. Its absolute timings are non-authoritative.
-- `release` is the full clean-worktree suite for a controlled machine. Only this profile on an `official-benchmark-runner` can generate `benchmark-public.json` or become a baseline.
-- `soak` runs the long-lived workload alone. The canonical release duration is 60 minutes; a 10-minute smoke or 30-minute engineering run is selected explicitly with `--duration-ms`.
+- `smoke` 是共享 CI 上的快速验证。它能发现损坏的场景和明显的回归，但绝不作为公开证据。
+- `nightly` 在共享 runner 上收集更广泛的趋势。其绝对耗时不具权威性。
+- `release` 是面向受控机器的完整套件，要求工作树干净。只有在 `official-benchmark-runner` 上运行的该配置档才能生成 `benchmark-public.json` 或成为基线。
+- `soak` 单独运行长时间负载。规范的 release 时长为 60 分钟；10 分钟的 smoke 或 30 分钟的工程运行需通过 `--duration-ms` 显式选择。
 
-Environment classification defaults to `local`; shared workflows set `shared-ci`. Set a stable environment ID, for example `official-win-nvidia-01`. The result captures OS, architecture, CPU, logical cores, total RAM, runtime/browser, viewport, DPR, and GPU information where applicable. Viewport and DPR are `null` for size-only and native runs; unknown GPU driver, physical-core, and refresh-rate values also remain `null`. Build provenance records the exact package or native build command, Rust, wasm-pack, Node, npm, and esbuild versions, Cargo/package lock hashes, and applicable wasm-opt arguments. Hostname, username, home directory, IP addresses, environment variables, and local repository paths are never serialized.
+环境分类默认为 `local`；共享工作流设置为 `shared-ci`。请设置稳定的环境 ID，例如 `official-win-nvidia-01`。结果会在适用时捕获 OS、架构、CPU、逻辑核心数、总 RAM、运行时/浏览器、视口、DPR 和 GPU 信息。对于仅体积运行和原生运行，视口与 DPR 为 `null`；未知的 GPU 驱动、物理核心数和刷新率取值同样保持为 `null`。构建溯源信息记录精确的包构建命令或原生构建命令，Rust、wasm-pack、Node、npm 和 esbuild 的版本，Cargo/包锁文件的哈希，以及适用的 wasm-opt 参数。主机名、用户名、主目录、IP 地址、环境变量和本地仓库路径绝不会被序列化。
 
-## Deterministic data and scenarios
+## 确定性数据与场景
 
-`shared.mjs` uses a versioned xorshift32 generator. A generator version, unsigned seed, start time, interval, start price, volatility, point count, series count, and pane count identify the dataset. Generated rows always satisfy `high >= open/close`, `low <= open/close`, and `high >= low`. Core sizes are 1K, 10K, 100K, 500K, and 1M candlesticks. Dataset creation occurs before timed installs.
+`shared.mjs` 使用带版本的 xorshift32 生成器。生成器版本、无符号种子、起始时间、间隔、起始价格、波动率、点数、系列数和窗格数共同标识一个数据集。生成的行始终满足 `high >= open/close`、`low <= open/close` 以及 `high >= low`。核心规模为 1K、10K、100K、500K 和 1M 根 K 线。数据集的创建发生在计时安装之前。
 
-Canonical scenario definitions live in `scenarios.json`; this is intentionally a small manifest rather than a benchmark DSL. Scenario IDs and versions make methodology changes explicit. A material change creates a new scenario version instead of silently rewriting history. Workloads cover startup, historical loading, current-candle and append streaming, pan/zoom/crosshair input, lifecycle retention, multi-chart, multi-series/multi-pane scaling, a five-series/100K-row Phase 2 general dashboard, retained current-candle updates across 1/2/4/8/16 series and one/four panes, and soak stability. Retained scenarios record semantic rebuild counts plus WebGPU allocation, write, and upload volume alongside frame CPU percentiles. Native evidence additionally measures every representative indicator on 10K/100K/1M histories, typed-equivalent batches of 1/10/100/1K/10K rows, 1/4/8/16 mixed indicators on one source, and one active source across 1/2/4/8/16 source/indicator-pane pairs. `crosshair-reset-studies-daily-2520` (Canvas2D forced, release profile) loads 2,520 daily candles with session VWAP, VWAP bands, and standard pivots, eleven outputs that each draw one bar-wide segment per bar because every bar is its own period, and traces the crosshair across them. It records the interval and study set in the dataset configuration, isolates the executor cost of period-reset studies, and its `canvas2d_ops`, `frame_cpu_ms`, and long-task samples are the evidence for the batched `Segments` primitive.
+规范的场景定义位于 `scenarios.json`；它有意保持为一份小型清单，而不是基准测试 DSL。场景 ID 与版本使方法学的变更显式可见。实质性变更会创建新的场景版本，而不是悄悄改写历史。工作负载涵盖启动、历史数据加载、当前 K 线与追加的流式更新、平移/缩放/十字光标输入、生命周期保留、多图表、多系列/多窗格扩展、包含五个系列/100K 行的 Phase 2 通用仪表盘、跨 1/2/4/8/16 个系列及一个/四个窗格的保留式当前 K 线更新，以及 soak 稳定性。保留式场景在记录帧 CPU 百分位数的同时，还记录语义重建次数以及 WebGPU 的分配、写入和上传量。原生证据还会测量：在 10K/100K/1M 根历史数据上的每个代表性指标，与类型化批量等价的 1/10/100/1K/10K 行批量，单一数据源上的 1/4/8/16 个混合指标，以及一个活动数据源在 1/2/4/8/16 个数据源/指标窗格对上的表现。`crosshair-reset-studies-daily-2520`（强制 Canvas2D，release 配置档）加载 2,520 根日 K 线，并带有交易时段 VWAP、VWAP 带和标准枢轴点，共十一个输出，由于每根柱本身就是一个周期，每个输出在每根柱上各绘制一段柱宽的线段，并让十字光标在其上移动。它在数据集配置中记录间隔与研究集合，隔离出周期重置研究的执行器开销，其 `canvas2d_ops`、`frame_cpu_ms` 和长任务样本是批处理 `Segments` 图元的证据。
 
-## Timing and statistics
+## 计时与统计
 
-Short durations use `performance.now()` in the browser and Node's monotonic timing facilities outside it. Wall time is metadata only. Cold startup uses a fresh browser context per sample. Steady-state scenarios declare warm-up and measured runs independently.
+短时长在浏览器中使用 `performance.now()`，在浏览器之外使用 Node 的单调计时设施。墙钟时间仅作为元数据。冷启动每个样本使用全新的浏览器上下文。稳态场景分别独立声明预热运行与测量运行。
 
-Raw samples are retained. `shared.mjs` is the sole statistical implementation: min, max, arithmetic mean, p50, p90, p95, p99, population standard deviation, and count. Percentiles use nearest rank: sort ascending and select `ceil(p * n)`, clamped to the first element. No outliers are removed.
+原始样本均予保留。`shared.mjs` 是唯一的统计实现：最小值、最大值、算术平均值、p50、p90、p95、p99、总体标准差与样本数。百分位数采用最近秩法：升序排序后选取第 `ceil(p * n)` 个，并以第一个元素为下限。不剔除任何离群值。
 
-`set_data_api_ms` measures the public synchronous typed-data call, which includes validation, engine install, frame construction, command encoding/submission, and the backend present call. `first_raf_after_*` ends at the next browser animation-frame callback and is labeled as a compositor opportunity, not photon-visible proof. The system records actual presentation counters exposed by the engine but reports visible presentation latency as unsupported because the browser supplies no reliable completion timestamp here.
+`set_data_api_ms` 测量公共的同步类型化数据调用，其中包含校验、引擎安装、帧构建、命令编码/提交以及后端 present 调用。`first_raf_after_*` 结束于下一次浏览器动画帧回调，并被标注为合成器机会，而非光子可见的证明。系统会记录引擎暴露的实际呈现计数器，但由于浏览器在此处不提供可靠的完成时间戳，可见呈现延迟被报告为不受支持。
 
-Interaction traces use Playwright pointer and wheel input on the package's top overlay canvas. `raf_frame_interval_ms` includes display cadence and browser scheduling; `frame_cpu_ms` is the existing engine-to-command-encoding measurement. Effective FPS is derived from observed rAF callbacks and is always presented with frame durations and refresh-rate limitations.
+交互轨迹在该包最上层的叠加层 canvas 上使用 Playwright 的指针与滚轮输入。`raf_frame_interval_ms` 包含显示节奏与浏览器调度；`frame_cpu_ms` 是现有的从引擎到命令编码的测量值。有效 FPS 由观察到的 rAF 回调推导而来，并且始终连同帧时长和刷新率的限制一并给出。
 
-## GPU and CPU methodology
+## GPU 与 CPU 测量方法
 
-On WebGPU, `gpu_render_pass_ms` is accepted only when the existing `frame_stats().gpu_ms` produces a resolved hardware timestamp-query sample. The value spans the WebGPU render pass and is asynchronously read back. On Canvas2D or an adapter without `timestamp-query`, it is `unsupported`, never zero and never replaced with CPU submission time.
+在 WebGPU 上，仅当现有的 `frame_stats().gpu_ms` 产生已解析的硬件 timestamp-query 样本时，才接受 `gpu_render_pass_ms`。该值覆盖 WebGPU 渲染 pass，并通过异步回读获得。在 Canvas2D 或不具备 `timestamp-query` 的适配器上，它为 `unsupported`，绝不为零，也绝不以 CPU 提交时间代替。
 
-Browser CPU is the Chromium DevTools `Performance.TaskDuration` delta across a scenario. It is a page main-thread task measurement, not whole-system CPU and not solely attributable to Aeris Charts. Frame CPU comes from the existing bounded WASM telemetry record.
+浏览器 CPU 是一个场景期间 Chromium DevTools `Performance.TaskDuration` 的增量。它是对页面主线程任务的测量，不是整机 CPU，也不能完全归因于 Aeris Charts。帧 CPU 来自现有的有界 WASM 遥测记录。
 
-## Memory and lifecycle methodology
+## 内存与生命周期测量方法
 
-Memory labels stay distinct:
+内存标签保持区分：
 
-- `wasm_linear_memory_bytes` is reserved WASM linear memory. It is global to the module, grows in 64 KiB pages, does not shrink, and is not total RAM.
-- `browser_js_heap_used_bytes` is Chromium's whole-page JavaScript heap after a documented DevTools GC.
-- `browser_page_memory_*` uses `measureUserAgentSpecificMemory` when available and is whole-page memory, not exact Aeris ownership.
+- `wasm_linear_memory_bytes` 是已预留的 WASM 线性内存。它对整个模块是全局的，以 64 KiB 页为单位增长，不会收缩，也不是总 RAM。
+- `browser_js_heap_used_bytes` 是经过文档化的 DevTools GC 之后 Chromium 整个页面的 JavaScript 堆。
+- `browser_page_memory_*` 在可用时使用 `measureUserAgentSpecificMemory`，是整个页面的内存，并非 Aeris 所拥有内存的精确值。
 
-Lifecycle scenarios first complete and discard one create/load/render/destroy warm-up so WASM initialization and initial allocator growth precede the baseline. They then repeat the same deterministic fixture, recording WASM linear memory on every loaded cycle. Because whole-page memory collection is disruptive, smoke takes one loaded sample while 50- and 100-cycle profiles take five and ten evenly spaced loaded samples; initial and final samples bracket every run. Results record whether GC was forced. Retained delta is final whole-page memory minus the warmed initial baseline; retained delta per cycle divides that value by completed cycles. Unsupported page-memory APIs remain explicit. Multi-chart and multi-series scaling load every configuration in a fresh page realm so non-shrinking WASM linear-memory high-water marks remain comparable; fixture creation and disruptive page-memory collection stay outside startup timing.
+生命周期场景首先完成并丢弃一次创建/加载/渲染/销毁的预热，使 WASM 初始化和分配器的初始增长发生在基线之前。随后它们重复同一个确定性夹具，在每个已加载的周期记录 WASM 线性内存。由于整页内存采集具有干扰性，smoke 只取一个已加载样本，而 50 周期和 100 周期的配置档分别取五个和十个均匀分布的已加载样本；初始样本和最终样本括住每次运行。结果会记录是否强制了 GC。保留增量是最终整页内存减去预热后的初始基线；每周期保留增量是该值除以已完成的周期数。不受支持的页面内存 API 仍显式标明。多图表与多系列扩展在全新的页面 realm 中加载每一种配置，使不会收缩的 WASM 线性内存高水位线保持可比；夹具创建与具有干扰性的页面内存采集不计入启动计时。
 
-Soak sampling performs continuous current-candle updates, periodic appends, time-scale movement, crosshair movement, and periodic sampling without per-frame file writes. Lightweight frame, update-latency, and WASM-memory samples are taken every second. The more disruptive whole-page memory API is sampled once per minute so it does not dominate the workload. The result reports first-to-last memory growth normalized per hour and second-half versus first-half frame CPU degradation when enough observations exist; otherwise that derived metric is explicitly unsupported. Raw periodic samples remain in the result.
+soak 采样会持续更新当前 K 线、周期性追加、移动时间比例尺、移动十字光标，并周期性采样，且不在每帧写文件。轻量的帧、更新延迟和 WASM 内存样本每秒采集一次。干扰性更强的整页内存 API 每分钟采样一次，以免其主导工作负载。当观测数据足够时，结果会报告按每小时归一化的首尾内存增长，以及后半段相对前半段的帧 CPU 退化；否则该派生指标显式标为不受支持。原始的周期性样本保留在结果中。
 
-## Artifact sizes
+## 产物体积
 
-The size scenario runs the same production `bun run build` used before publication and reads `npm pack --json --dry-run`. Metrics are unambiguous:
+体积场景运行发布前使用的同一个生产构建 `bun run build`，并读取 `npm pack --json --dry-run`。各项指标含义明确：
 
-- npm tarball and unpacked bytes for exactly the files npm would publish;
-- production JavaScript raw/gzip-9/Brotli bytes;
-- production optimized WASM raw/gzip-9/Brotli bytes;
-- total TypeScript declaration bytes;
-- minimal, typical, and full minified consumer JavaScript bundles built by the package's existing esbuild dependency.
+- 仅针对 npm 将要发布的那些文件的 npm tarball 与解包后字节数；
+- 生产 JavaScript 的原始/gzip-9/Brotli 字节数；
+- 生产优化后 WASM 的原始/gzip-9/Brotli 字节数；
+- TypeScript 声明文件的总字节数；
+- 由该包现有的 esbuild 依赖构建的最小、典型和完整的压缩（minified）使用方 JavaScript bundle。
 
-Consumer JavaScript bundle metrics explicitly exclude the separately shipped WASM asset, whose sizes are reported independently.
+使用方 JavaScript bundle 指标明确不包含单独发布的 WASM 资源，其体积单独报告。
 
-A size result is only meaningful if the optimized module was measured, so the step fails when the build log shows that wasm-opt did not run (wasm-pack prints `Skipping wasm-opt` on a platform it cannot fetch binaryen for). Every result records `build.cargo_profile`, `build.wasm_opt_args` (read from the crate metadata wasm-pack itself reads, not a copy) and `build.wasm_opt_version` (the `wasm-opt` on `PATH`, else the newest one in the wasm-pack cache, else `null`) next to the rustc and wasm-pack versions. `build.profile` stays `release`, the evidence channel, and `compare` treats a result with different build metadata as incompatible.
+只有测量的是经过优化的模块，体积结果才有意义，因此当构建日志显示 wasm-opt 未运行时（在 wasm-pack 无法获取 binaryen 的平台上，它会打印 `Skipping wasm-opt`），该步骤会失败。每条结果都会在 rustc 与 wasm-pack 版本旁记录 `build.cargo_profile`、`build.wasm_opt_args`（读取自 wasm-pack 自身读取的 crate 元数据，而非副本）以及 `build.wasm_opt_version`（`PATH` 上的 `wasm-opt`，否则为 wasm-pack 缓存中最新的一个，再否则为 `null`）。`build.profile` 保持为 `release`，即证据通道，`compare` 会将构建元数据不同的结果视为不兼容。
 
-## Results, baselines, budgets, and reports
+## 结果、基线、预算与报告
 
-The versioned JSON contract is `schema/result-v1.schema.json`. Runtime validation rejects missing metadata, failed scenarios disguised as success, non-finite samples, and impossible negative durations. Scenario failures carry `status: failed` and an error; public summaries exclude them.
+带版本的 JSON 契约是 `schema/result-v1.schema.json`。运行时校验会拒绝缺失的元数据、伪装成成功的失败场景、非有限样本以及不可能出现的负时长。场景失败带有 `status: failed` 与一条错误；公开摘要会排除它们。
 
-Local raw results are immutable files under `benchmarks/results/v<version>/<environment-id>/` and are gitignored. CI uploads them as artifacts. Release results should be attached immutably to the matching release. `baseline` copies only a clean official release result into `benchmarks/baselines/v<version>/<environment-id>.json` and refuses overwrite. The selected policy is an explicit previous-release baseline; it never rolls silently.
+本地原始结果是位于 `benchmarks/results/v<version>/<environment-id>/` 之下的不可变文件，并已被 git 忽略。CI 将它们作为产物上传。release 结果应以不可变方式附加到对应的发布版本。`baseline` 仅将干净的正式 release 结果复制到 `benchmarks/baselines/v<version>/<environment-id>.json`，并拒绝覆盖。所选策略是显式的上一个发布版本基线；它绝不会悄悄滚动更新。
 
-Comparison requires the same scenario version, generator version, seed, dataset configuration, point/series/pane counts, stable environment ID, OS, architecture, CPU, runtime/browser version, GPU identity, viewport, DPR, and refresh-rate metadata. Output includes baseline, current, absolute difference, percentage difference, direction, scenario/environment compatibility, and status. Budgets live only in `budgets.json`. Relative timing thresholds remain empty until controlled baseline evidence exists; adding one requires both warning and failure percentages keyed as `<scenario>.<metric>.p50`.
+比较要求场景版本、生成器版本、种子、数据集配置、点数/系列数/窗格数、稳定的环境 ID、OS、架构、CPU、运行时/浏览器版本、GPU 标识、视口、DPR 以及刷新率元数据全部相同。输出包含基线、当前值、绝对差、百分比差、方向、场景/环境兼容性与状态。预算仅存在于 `budgets.json`。在存在受控基线证据之前，相对耗时阈值保持为空；添加阈值需要同时给出警告与失败百分比，键为 `<scenario>.<metric>.p50`。
 
-Blocking `absolute_maximums` use the same key convention. Deterministic artifact ceilings do not require a
-machine baseline; the machine-sensitive general-dashboard startup/upload ceilings are evaluated only on the
-official release benchmark runner, whose stable environment identity is part of the release evidence. Every
-benchmark run containing a named scenario evaluates its configured maxima; an exceeded, unavailable, or failed
-metric exits non-zero. The initial package ceilings were set
-from a clean production build at commit `813230b` and rounded above its measured output:
+阻断性的 `absolute_maximums` 使用相同的键约定。确定性的产物上限不需要机器基线；对机器敏感的通用仪表盘启动/上传上限仅在正式 release 基准测试 runner 上评估，其稳定的环境标识是 release 证据的一部分。每次包含具名场景的基准测试运行都会评估其已配置的最大值；超出、不可用或失败的指标会使进程以非零状态退出。初始的包上限依据提交 `813230b` 上一次干净的生产构建设定，并在其实测输出之上向上取整：
 
-| Metric | Observed bytes | Blocking maximum |
+| 指标 | 观测字节数 | 阻断上限 |
 | --- | ---: | ---: |
 | npm tarball | 960,989 | 1,050,000 |
-| npm unpacked | 2,811,610 | 3,000,000 |
-| JavaScript raw | 577,227 | 620,000 |
+| npm 解包后 | 2,811,610 | 3,000,000 |
+| JavaScript 原始 | 577,227 | 620,000 |
 | JavaScript Brotli | 87,948 | 95,000 |
-| WASM raw | 1,975,672 | 2,100,000 |
+| WASM 原始 | 1,975,672 | 2,100,000 |
 | WASM Brotli | 583,569 | 625,000 |
 
-Budget policy v3 records the deliberate Phase 2 package-size reset after the complete Cartesian API landed.
-Before changing ceilings, the published ESM build was switched to minification; that reduced JavaScript raw
-from 697,316 bytes to 343,161 and Brotli from 96,233 bytes to 64,038, so both original JavaScript ceilings remain
-unchanged. The irreducible optimized WASM and package-container growth is captured with modest release headroom:
+预算策略 v3 记录了在完整的笛卡尔坐标系 API 落地之后，有意进行的 Phase 2 包体积重置。在调整上限之前，已发布的 ESM 构建改为启用压缩；这使 JavaScript 原始体积从 697,316 字节降至 343,161 字节，Brotli 体积从 96,233 字节降至 64,038 字节，因此 JavaScript 的两个原有上限均保持不变。无法再缩减的优化后 WASM 与包容器增长，则以适度的 release 余量纳入：
 
-| Phase 2 metric | Observed bytes | Blocking maximum |
+| Phase 2 指标 | 观测字节数 | 阻断上限 |
 | --- | ---: | ---: |
 | npm tarball | 1,197,880 | 1,300,000 |
-| npm unpacked | 3,435,987 | 3,700,000 |
-| JavaScript raw | 343,161 | 620,000 |
+| npm 解包后 | 3,435,987 | 3,700,000 |
+| JavaScript 原始 | 343,161 | 620,000 |
 | JavaScript Brotli | 64,038 | 95,000 |
-| WASM raw | 2,812,727 | 3,000,000 |
+| WASM 原始 | 2,812,727 | 3,000,000 |
 | WASM Brotli | 761,514 | 810,000 |
 
-This reset is tied to the Phase 2 engine-owned Cartesian surface (additional data channels, reference/brush/
-shared-tooltip APIs, heatmap variants, persistence, and WASM bindings). Future growth is again blocked at the v3
-ceilings rather than inheriting an open-ended exception.
+这次重置与 Phase 2 由引擎拥有的笛卡尔坐标系接口面相关联（额外的数据通道、参考/刷选/共享提示框 API、热力图变体、持久化以及 WASM 绑定）。未来的增长再次在 v3 上限处被阻断，而不是继承一个没有边界的例外。
 
-Budget policy v4 records the Phase 3 package-size reset after the trading-workstation surface landed: order-flow
-footprints and trade streams, depth heatmaps and liquidity replay, session replay with non-time bars, profile
-workflows, the expanded indicator catalog, and additional chart types. Before changing ceilings, the release
-`wasm-opt -Oz` output was re-run with `--converge` and with producer/debug stripping; neither reduced the module
-(3,826,918 and 3,833,897 bytes). JavaScript stays well inside its unchanged ceilings. Remaining growth is
-compiled engine code, so the WASM and package-container ceilings take the same ~7% release headroom as v3:
+预算策略 v4 记录了在交易工作站接口面落地之后的 Phase 3 包体积重置：订单流足迹图与成交流、深度热力图与流动性回放、含非时间柱的交易时段回放、分布工作流、扩充后的指标目录以及新增的图表类型。在调整上限之前，已使用 `--converge` 以及剥离 producer/调试信息重新运行 release 的 `wasm-opt -Oz` 输出；二者均未缩小该模块（分别为 3,826,918 与 3,833,897 字节）。JavaScript 仍远在其未变的上限之内。剩余的增长来自已编译的引擎代码，因此 WASM 与包容器的上限沿用与 v3 相同的约 7% release 余量：
 
-| Phase 3 metric | Observed bytes | Blocking maximum |
+| Phase 3 指标 | 观测字节数 | 阻断上限 |
 | --- | ---: | ---: |
 | npm tarball | 1,549,907 | 1,650,000 |
-| npm unpacked | 4,628,626 | 4,950,000 |
-| JavaScript raw | 372,974 | 620,000 |
+| npm 解包后 | 4,628,626 | 4,950,000 |
+| JavaScript 原始 | 372,974 | 620,000 |
 | JavaScript Brotli | 66,155 | 95,000 |
-| WASM raw | 3,827,699 | 4,100,000 |
+| WASM 原始 | 3,827,699 | 4,100,000 |
 | WASM Brotli | 977,494 | 1,050,000 |
 
-The largest reducible share measured in the unstripped module is serde JSON (de)serialization
-monomorphization (about a fifth of pre-optimization code), led by the internally tagged `IndicatorKind`
-enum (its deserializer now ships out of line, see below). Until policy v5 below, future growth was blocked at the
-v4 ceilings.
+在未剥离的模块中测得的最大可缩减份额是 serde JSON（反）序列化的单态化（约占优化前代码的五分之一），其中以内部带标签的 `IndicatorKind` 枚举为首（其反序列化器现已改为非内联，见下文）。在下文的策略 v5 之前，未来的增长一直在 v4 上限处被阻断。
 
-Budget policy v5 is the reset after the B1-B8 K-line capabilities (exchange time and session slots, the price tick
-ladder, the B8 drawing catalog with text editing for every text-bearing tool, multi-calendar overlays, tick-built
-candles and resampling, close-time labels) and the merge of upstream's later work, whose IANA time-zone tables add
-about 350 KB raw and 41 KB Brotli after being filtered to the 98 TradingView zones (about 914 KB and 84 KB for the
-complete database). The bytes were measured on the GitHub runner with the pinned wasm-pack 0.15.0 and its bundled
-`wasm-opt`, the one lossless lever found (the `IndicatorKind` deserializer) was shipped first, and the ceilings that
-the module still exceeded took the same 7% release headroom, rounded up to 10,000 bytes. JavaScript stays inside its
-unchanged ceilings. Every remaining reduction is an opt-level change that costs frame time (priced below) and awaits a
-product decision; the evidence is recorded in `budgets.json`'s `rationale`.
+预算策略 v5 是在 B1-B8 K 线能力（交易所时间与交易时段槽位、价格刻度阶梯、为每个带文本的工具提供文本编辑的 B8 绘图目录、多日历叠加层、由 Tick 构建的 K 线与重采样、收盘时间标签）以及合入上游后续工作之后的重置，其中 IANA 时区表在过滤到 98 个 TradingView 时区后，增加约 350 KB 原始体积与 41 KB Brotli 体积（完整数据库约为 914 KB 与 84 KB）。这些字节数是在 GitHub runner 上使用固定的 wasm-pack 0.15.0 及其自带的 `wasm-opt` 测得的；所发现的唯一无损杠杆（`IndicatorKind` 反序列化器）已先行发布，而模块仍然超出的那些上限，采用相同的 7% release 余量，并向上取整到 10,000 字节。JavaScript 仍在其未变的上限之内。其余每一项缩减都属于 opt-level 变更，会以帧时间为代价（下文给出其代价），并等待产品决策；证据记录在 `budgets.json` 的 `rationale` 中。
 
-| Phase 4 metric | Observed bytes | Blocking maximum |
+| Phase 4 指标 | 观测字节数 | 阻断上限 |
 | --- | ---: | ---: |
 | npm tarball | 1,969,915 | 2,110,000 |
-| npm unpacked | 5,953,058 | 6,370,000 |
-| JavaScript raw | 415,362 | 620,000 |
+| npm 解包后 | 5,953,058 | 6,370,000 |
+| JavaScript 原始 | 415,362 | 620,000 |
 | JavaScript Brotli | 74,089 | 95,000 |
-| WASM raw | 5,041,592 | 5,400,000 |
+| WASM 原始 | 5,041,592 | 5,400,000 |
 | WASM Brotli | 1,237,844 | 1,330,000 |
 
-Future growth is blocked at the v5 ceilings.
+未来的增长在 v5 上限处被阻断。
 
-### WASM size levers and re-baselining
+### WASM 体积杠杆与重新基线
 
-Once B1-B8 landed, the optimized WASM no longer fit the v4 ceilings. Before any ceiling moves, the bytes were measured and the lossless levers were priced. All numbers below come from one machine (rustc 1.98.1, wasm-pack 0.15.0, wasm-bindgen 0.2.127, `wasm-opt` version_117 from the `binaryen@117.0.0` npm package on `PATH`, Chromium 141 headless, Canvas2D forced, a shared four-core sandbox) at base commit `78d7d59`. The build route was also run by hand (`cargo build -p aeris_charts_wasm --release --target wasm32-unknown-unknown`, `wasm-bindgen --target web --out-name aeris_charts_wasm`, `wasm-opt` with the crate-metadata flags) and produced a module byte-identical to `wasm-pack build`. They are engineering evidence, not CI-runner or public performance claims.
+B1-B8 落地之后，优化后的 WASM 不再满足 v4 上限。在移动任何上限之前，已先测量字节数，并量化了各无损杠杆的代价。下文所有数字均来自同一台机器（rustc 1.98.1、wasm-pack 0.15.0、wasm-bindgen 0.2.127、`PATH` 上来自 `binaryen@117.0.0` npm 包的 `wasm-opt` version_117、Chromium 141 无头模式、强制 Canvas2D、一个共享的四核沙箱），基于基础提交 `78d7d59`。构建路径也曾手动运行（`cargo build -p aeris_charts_wasm --release --target wasm32-unknown-unknown`、`wasm-bindgen --target web --out-name aeris_charts_wasm`、带 crate 元数据标志的 `wasm-opt`），产出的模块与 `wasm-pack build` 字节完全一致。它们是工程证据，既不是 CI runner 上的性能声明，也不是公开的性能声明。
 
-| Package metric | `78d7d59` | With `IndicatorKind` serde out of line | v4 ceiling |
+| 包指标 | `78d7d59` | `IndicatorKind` serde 非内联后 | v4 上限 |
 | --- | ---: | ---: | ---: |
 | npm tarball | 1,876,748 | 1,860,741 | 1,650,000 |
-| npm unpacked | 5,636,275 | 5,503,213 | 4,950,000 |
-| JavaScript raw | 412,622 | 412,622 | 620,000 |
+| npm 解包后 | 5,636,275 | 5,503,213 | 4,950,000 |
+| JavaScript 原始 | 412,622 | 412,622 | 620,000 |
 | JavaScript Brotli | 73,630 | 73,635 | 95,000 |
-| WASM raw | 4,739,804 | 4,606,742 | 4,100,000 |
+| WASM 原始 | 4,739,804 | 4,606,742 | 4,100,000 |
 | WASM gzip-9 | 1,663,479 | 1,647,743 | - |
 | WASM Brotli | 1,175,083 | 1,172,054 | 1,050,000 |
 
-(Both tarball and unpacked columns already exclude `dist/react.js.map`, which the same change stops shipping: 8,165 tarball and 27,149 unpacked bytes. Ceilings are not changed by measuring: derive them with `rebudget` below on the final code.)
+（tarball 与解包后两列均已排除 `dist/react.js.map`，同一变更不再发布该文件：对应 8,165 字节 tarball 与 27,149 字节解包后体积。测量本身不会改变上限：请在最终代码上使用下文的 `rebudget` 推导。）
 
-The module is 93% code (4.40 MB), 6% data (0.28 MB, of which the crosshair mask is 100,368 bytes) and under 1% imports and exports. The code is a long tail, not one hotspot. Twiggy on a names-preserving `-Oz -g` build of the same module attributes it (percent of code) to `aeris_charts_engine` 31%, the wasm crate 11% plus its wasm-bindgen export shims, libcore and alloc generics instantiated for those crates 25% (`slice::sort` alone 6%, across about fifteen element types), serde-derived deserialization about 25% across the engine and wasm crates (`serde_json` itself 3%), `aeris_charts_core` 3%, indicators 2%, render, render_wgpu and wgpu about 1% each. The largest function, the per-frame `ChartInner::render_inner`, is 6.6% of code; the ten largest are 20%. Dependencies were already at `opt-level = "z"`.
+该模块 93% 为代码（4.40 MB），6% 为数据（0.28 MB，其中十字光标蒙版为 100,368 字节），导入与导出不足 1%。代码是长尾分布，而非单一热点。对同一模块保留名称的 `-Oz -g` 构建运行 Twiggy，其归因（占代码的百分比）为：`aeris_charts_engine` 31%，wasm crate 11% 外加其 wasm-bindgen 导出垫片，为这些 crate 实例化的 libcore 与 alloc 泛型 25%（仅 `slice::sort` 就占 6%，涉及约十五种元素类型），由 serde 派生的反序列化在 engine 与 wasm crate 中约占 25%（`serde_json` 本身 3%），`aeris_charts_core` 3%，indicators 2%，render、render_wgpu 与 wgpu 各约 1%。最大的函数，即每帧运行的 `ChartInner::render_inner`，占代码的 6.6%；最大的十个函数占 20%。依赖项原本就已处于 `opt-level = "z"`。
 
-| Lever (workspace crates not listed stay at `opt-level` 3) | WASM raw | Brotli | raw vs current | pan / stream frame CPU p50, paired ratio vs current |
+| 杠杆（未列出的工作区 crate 保持 `opt-level` 3） | WASM 原始 | Brotli | 原始体积相对当前 | 平移 / 流式 帧 CPU p50，相对当前的配对比值 |
 | --- | ---: | ---: | ---: | --- |
-| current | 4,739,804 | 1,175,083 | - | 1.00 / 1.00 |
-| `IndicatorKind` serde out of line (shipped) | 4,606,742 | 1,172,054 | -2.8% | 1.00 / 1.06 (pan 3 of 7 rounds slower, stream 6 of 7: the stream figure is this machine's noise floor on a change that is off the frame path) |
-| `wasm-opt` binaryen 132 instead of 117 | 4,717,722 | 1,174,150 | -0.5% | not timed |
-| `wasm-opt --converge` | 4,738,993 | 1,173,017 | -0.02% | not timed |
-| without `+simd128` | 4,803,949 | 1,179,862 | +1.4% | not timed (SIMD costs no bytes) |
+| 当前 | 4,739,804 | 1,175,083 | - | 1.00 / 1.00 |
+| `IndicatorKind` serde 非内联（已发布） | 4,606,742 | 1,172,054 | -2.8% | 1.00 / 1.06（平移在 7 轮中有 3 轮更慢，流式在 7 轮中有 6 轮更慢：对于一项不在帧路径上的变更，该流式数字属于这台机器的噪声下限） |
+| `wasm-opt` 使用 binaryen 132 而非 117 | 4,717,722 | 1,174,150 | -0.5% | 未计时 |
+| `wasm-opt --converge` | 4,738,993 | 1,173,017 | -0.02% | 未计时 |
+| 不使用 `+simd128` | 4,803,949 | 1,179,862 | +1.4% | 未计时（SIMD 不带来字节开销） |
 | engine `s` | 4,268,389 | 1,115,992 | -10.0% | 0.99-1.03 / 1.01-1.06 |
-| engine `z` | 3,895,650 | 1,057,463 | -17.8% | 1.06-1.08 / 1.00-1.07; zoom 1.18, crosshair 1.11 |
+| engine `z` | 3,895,650 | 1,057,463 | -17.8% | 1.06-1.08 / 1.00-1.07；缩放 1.18，十字光标 1.11 |
 | wasm crate `z` | 4,515,650 | 1,172,435 | -4.7% | 0.99 / 1.17 |
-| `aeris_charts_core` `z` | 4,656,252 | 1,170,339 | -1.8% | not timed alone |
-| indicators `z` | 4,707,715 | 1,171,271 | -0.7% | not timed alone |
-| render and render_wgpu `z` | 4,718,680 | 1,172,342 | -0.4% | not timed alone |
+| `aeris_charts_core` `z` | 4,656,252 | 1,170,339 | -1.8% | 未单独计时 |
+| indicators `z` | 4,707,715 | 1,171,271 | -0.7% | 未单独计时 |
+| render 与 render_wgpu `z` | 4,718,680 | 1,172,342 | -0.4% | 未单独计时 |
 | engine + wasm crate `z` | 3,464,533 | 987,566 | -26.9% | 1.09 / 1.18 |
 | engine + wasm + core + indicators `z` | 3,292,048 | 944,719 | -30.5% | 1.42 / 1.19 |
-| every workspace crate `s` | 3,741,299 | 1,025,898 | -21.1% | one screening round: 1.09 / 1.14 |
-| every workspace crate `z` | 3,250,690 | 933,355 | -31.4% | 1.49 / 1.30 |
+| 每个工作区 crate `s` | 3,741,299 | 1,025,898 | -21.1% | 一轮筛选：1.09 / 1.14 |
+| 每个工作区 crate `z` | 3,250,690 | 933,355 | -31.4% | 1.49 / 1.30 |
 
-Only the first row is shipped: it is the one lever whose effect is pure code volume (the roughly 110 KB internally tagged `IndicatorKind` deserializer existed twice, once for `from_value` and once for struct fields, and Brotli already hid most of the duplicate), on a cold path, with byte-identical rendered frames. Every `opt-level` row trades frame time for bytes and stays unshipped pending a product decision.
+只有第一行已发布：它是唯一一个效果纯粹体现为代码体积的杠杆（约 110 KB 的内部带标签 `IndicatorKind` 反序列化器存在两份，一份用于 `from_value`，一份用于结构体字段，而 Brotli 已经掩盖了其中大部分重复），位于冷路径上，且渲染出的帧字节完全一致。每个 `opt-level` 行都是以帧时间换取字节数，并在产品决策作出之前保持未发布。
 
-Timing rows are medians of per-round paired ratios from interleaved A/B runs (at least seven alternating runs per variant, a fresh browser per run, `pan-candlestick-100k`, `stream-current-candle-60hz`, `zoom-candlestick-100k`, `crosshair-candlestick-100k`); the range is across independent sets. The noise floor on this machine is large: the current build's own run-to-run p50 spread is about 15-22% for pan and 16-54% for stream, and the 100k dashboard p50 (five samples per run) varies by about 30%, so no dashboard difference in any row is distinguishable. Fifteen interleaved pan and stream rounds of engine `s` gave p50 ratios 1.03 (pan, 10 of 15 rounds slower) and 1.01 (stream, 9 of 15), pooled p95 +5% and -3%: a cost of up to a few percent on pan cannot be excluded, which is why the release profile was not changed. Rendered frames of the current and engine-`s` builds were byte-identical for five deterministic Canvas2D demo captures. Adding `aeris_charts_core` and indicators at `z` to the engine and wasm-crate build raised pan from 1.09 to 1.42; the split between those two crates was not timed, so which of them carries the per-frame loops is not established; the wasm crate at `z` showed +17% on stream with a wide spread (0.76-1.37 per round).
+计时行是交错 A/B 运行中各轮配对比值的中位数（每个变体至少七次交替运行，每次运行使用全新的浏览器，场景为 `pan-candlestick-100k`、`stream-current-candle-60hz`、`zoom-candlestick-100k`、`crosshair-candlestick-100k`）；区间为各独立组之间的范围。这台机器上的噪声下限很大：当前构建自身运行间的 p50 离散度，平移约为 15-22%，流式约为 16-54%，而 100k 仪表盘的 p50（每次运行五个样本）波动约 30%，因此任何一行中的仪表盘差异都无法区分。engine `s` 的十五轮交错平移与流式运行给出的 p50 比值分别为 1.03（平移，15 轮中有 10 轮更慢）和 1.01（流式，15 轮中有 9 轮），合并后的 p95 为 +5% 与 -3%：不能排除平移上最多几个百分点的代价，这正是未更改 release 配置档的原因。当前构建与 engine `s` 构建渲染出的帧，在五次确定性的 Canvas2D 演示画面捕获中字节完全一致。在 engine 与 wasm crate 构建的基础上，再将 `aeris_charts_core` 与 indicators 设为 `z`，使平移从 1.09 升至 1.42；这两个 crate 之间的占比划分未单独计时，因此无法确定其中哪一个承载每帧循环；`z` 级别的 wasm crate 在流式上显示 +17%，且离散范围很宽（每轮 0.76-1.37）。
 
-Reproduce a variant without editing the release profile: build with `--config 'profile.release.package.<crate>.opt-level="z"'` (Cargo environment variables cannot express per-package overrides), run `wasm-bindgen` and `wasm-opt` as above, and rebundle `dist/index.js` from that variant's `aeris_charts_wasm.js` (the glue names closure shims by per-build index, so a glue file from another build does not match).
+若要在不编辑 release 配置档的情况下复现某个变体：使用 `--config 'profile.release.package.<crate>.opt-level="z"'` 构建（Cargo 环境变量无法表达按包的覆盖），如上所述运行 `wasm-bindgen` 与 `wasm-opt`，并用该变体的 `aeris_charts_wasm.js` 重新打包 `dist/index.js`（胶水代码按每次构建的索引为闭包垫片命名，因此来自其他构建的胶水文件不匹配）。
 
-To re-baseline after a deliberate size increase, run `node benchmarks/benchmark.mjs size` on the final code (it writes the result JSON under `benchmarks/results/` and exits non-zero while a ceiling is exceeded), then
+在有意的体积增长之后重新基线时，在最终代码上运行 `node benchmarks/benchmark.mjs size`（它会将结果 JSON 写入 `benchmarks/results/` 之下，并在上限被超出时以非零状态退出），然后执行
 
 ```text
 node benchmarks/benchmark.mjs rebudget <that result.json> --tradeoff "<the product capability that added the bytes>" --lever "<lever applied and its measured effect>"
 ```
 
-It prints the proposed `budgets.json` without writing it: only ceilings the run exceeds move, to the observed p50 plus 7% rounded up to 10,000 bytes (the Phase 2 reset carried 6.4-8.5%), `policy_version` increments, and a `rationale` entry is appended holding the commit, observed bytes, raised ceilings, toolchain (rustc, wasm-pack, wasm-opt version, Cargo profile, wasm-opt flags), levers and tradeoff. `budgets.json` ignores keys it does not evaluate, so the evidence stays beside the numbers. Review the diff, commit it with the code that caused the growth, and confirm `ci.yml`, `metrics-smoke.yml` and the nightly and release workflows pass against it.
+它会打印拟议的 `budgets.json` 而不写入文件：只有本次运行所超出的上限才会移动，移到观测 p50 加 7% 再向上取整到 10,000 字节（Phase 2 重置的余量为 6.4-8.5%），`policy_version` 递增，并追加一条 `rationale` 条目，其中包含提交、观测字节数、被提高的上限、工具链（rustc、wasm-pack、wasm-opt 版本、Cargo profile、wasm-opt 标志）、所用杠杆与权衡。`budgets.json` 会忽略其不评估的键，因此证据与数字并存。审阅 diff，将其与导致增长的代码一并提交，并确认 `ci.yml`、`metrics-smoke.yml` 以及 nightly 和 release 工作流在此之下均能通过。
 
-Phase 2 adds release-blocking maxima for `general-dashboard-100k`: p50 startup through the first following rAF
-must stay at or below 2,000 ms, and first-frame WebGPU vertex uploads must stay at or below 96 MiB. These are
-guardrails for catastrophic host regressions, not cross-machine performance claims.
+Phase 2 为 `general-dashboard-100k` 增加了阻断 release 的最大值：从启动到其后第一个 rAF 的 p50 必须不超过 2,000 ms，首帧 WebGPU 顶点上传量必须不超过 96 MiB。这些是针对宿主灾难性回归的护栏，而不是跨机器的性能声明。
 
-`crosshair-reset-studies-daily-2520` adds a release-blocking maximum of 4,500 Canvas2D paint operations per crosshair
-frame (p50). Before the period-reset studies' one-bar segments were batched into one `Segments` primitive per output,
-the scenario painted 31,116 operations per frame in headless Chromium 141 (Canvas2D forced, 1280x720, software
-raster); the same chart without studies paints 3,822 and with batching 3,884. The ceiling sits just above the batched
-count, leaving room for platform label differences, and far below the unbatched one, so a return to one stroke per bar
-fails the gate. It bounds operation count only: the measured frame CPU (`frame_cpu_ms` p50 63.8 ms before, 11.8 ms
-after, 5.0 ms without studies) is machine-dependent and stays report-only.
+`crosshair-reset-studies-daily-2520` 增加了一个阻断 release 的最大值：每个十字光标帧 4,500 次 Canvas2D 绘制操作（p50）。在周期重置研究的单柱线段被批处理为每个输出一个 `Segments` 图元之前，该场景在无头 Chromium 141 中（强制 Canvas2D，1280x720，软件光栅化）每帧绘制 31,116 次操作；不含研究的同一图表绘制 3,822 次，启用批处理后为 3,884 次。该上限略高于批处理后的计数，为平台标签差异留出余地，并远低于未批处理的计数，因此一旦回到每根柱一次描边，就会使门禁失败。它只约束操作数量：测得的帧 CPU（`frame_cpu_ms` p50 在此前为 63.8 ms，此后为 11.8 ms，不含研究时为 5.0 ms）依赖机器，仍仅作报告。
 
-These byte counts are reproducible filesystem/compression evidence, not an official wall-clock
-benchmark or a public performance claim. A deliberate size increase must explain the product
-tradeoff and update the central ceiling; it must not bypass the evaluator.
+这些字节数是可复现的文件系统/压缩证据，不是正式的墙钟基准测试，也不是公开的性能声明。有意的体积增长必须说明产品上的权衡并更新中央上限；不得绕过评估器。
 
-`report` generates a human-readable Markdown artifact beside the raw result. `public` generates a stable `benchmark-public.json` containing only measured `public_candidate` metrics from a clean official release. The trace is: website field → public summary → immutable raw result → raw samples → versioned scenario → deterministic dataset/environment → commit.
+`report` 在原始结果旁生成一份人类可读的 Markdown 产物。`public` 生成稳定的 `benchmark-public.json`，其中仅包含来自干净的正式 release 的、实测的 `public_candidate` 指标。追溯链路是：网站字段 → 公开摘要 → 不可变的原始结果 → 原始样本 → 带版本的场景 → 确定性数据集/环境 → 提交。
 
-## CI and limitations
+## CI 与局限
 
-PR smoke runs harness tests, production artifact sizes, and a short browser workload on shared CI. Nightly runs broader non-authoritative scenarios. The release workflow targets a future self-hosted Windows runner labeled `benchmark` and produces raw JSON, a readable report, and the public summary. Credentials and runner provisioning are deliberately outside this repository.
+PR 的 smoke 在共享 CI 上运行 harness 测试、生产产物体积以及一个简短的浏览器工作负载。Nightly 运行范围更广、但不具权威性的场景。release 工作流面向未来的自托管 Windows runner（标签为 `benchmark`），产出原始 JSON、可读报告与公开摘要。凭据与 runner 的配置有意放在本仓库之外。
 
-The `native` command writes a separate result for headless Rust ingestion, retained frame construction, and current-candle replacement. Native diagnostics are never mixed with browser product results or public summaries.
+`native` 命令为无头的 Rust 数据写入、保留式帧构建以及当前 K 线替换单独写出一份结果。原生诊断结果绝不会与浏览器产品结果或公开摘要混在一起。
 
-Competitor comparisons are deliberately not implemented here. A future comparison must use a separate result namespace, pin every library and browser version, disclose backend and feature configuration, use equivalent visible chart features and datasets, apply the same warm-up/statistics/environment rules, and publish methodology beside the numbers. Existing demo dependencies are not treated as benchmark competitors.
+竞品比较在此有意不予实现。未来的比较必须使用独立的结果命名空间，固定每个库和浏览器的版本，披露后端与功能配置，使用等价的可见图表功能和数据集，应用相同的预热/统计/环境规则，并将方法学与数字一并发布。现有的演示依赖项不被视为基准测试的竞品。
 
-Not currently measurable with trustworthy semantics: photon-visible presentation completion, a separate first-`queue.submit` timestamp, GPU upload-only duration, GPU resource byte attribution, browser GPU driver version, physical core count, and native process RSS. They remain unsupported or `null`; no substitute number is inferred. Existing interaction and GPUI scene-plan examples remain useful internal diagnostics.
+目前无法以可信的语义测量：光子可见的呈现完成、单独的首次 `queue.submit` 时间戳、仅 GPU 上传的时长、GPU 资源字节归因、浏览器 GPU 驱动版本、物理核心数以及原生进程 RSS。它们保持为不受支持或 `null`；不会推断任何替代数字。现有的交互与 GPUI 场景计划示例仍然是有用的内部诊断。

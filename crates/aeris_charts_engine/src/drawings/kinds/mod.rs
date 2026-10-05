@@ -10,7 +10,7 @@
 //! The modules of the retired fork families (Fibonacci, pitchforks and Gann, patterns, shapes)
 //! keep only their public option types and the fork's pre-merge kind defaults, which
 //! [`apply_legacy_fork_defaults`] applies to documents the fork wrote. The recipe (what to add
-//! where, wire ids, test checklist) lives in `docs/Architecture.md` under "Drawing families (B8)".
+//! where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
 //! Shared single-list registries carry one `// B8: <family> — begin/end` block per surviving
 //! family (lines, channels, projection_annotations).
 
