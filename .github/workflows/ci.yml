@@ -74,6 +74,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev
       - uses: Swatinem/rust-cache@v2
+      - name: Clippy native GPUI backend (all targets)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked -- -D warnings
       - name: Test native GPUI backend
         run: cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets --locked
       - name: Assert official GPUI pixel parity against tiny-skia
@@ -90,13 +93,13 @@ jobs:
   # Evidence, not yet a required check: what the GPUI executor actually presents in a real window,
   # diffed against the native (tiny-skia) reference. It runs on a virtual X server with Mesa
   # lavapipe (software Vulkan), so it says nothing about hardware GPUs, and its Prim-layer fixtures
-  # say nothing about clipping (docs/Architecture.md, Verification, lists what a pass does and does
-  # not prove, the calibration build and the criteria for promoting this job).
+  # say nothing about clipping.
+  # docs/development/validation.md 记录了通过结果的证据边界、校准构建与升级为必需作业的条件。
   #
   # Neither a gate failure, a hang, the job timeout nor an apt flake may turn this run red:
   # publish.yml requires a green ci.yml run for a release commit. Hence `continue-on-error` on the
-  # job and on the harness step. When the job becomes a required check, remove both flags and add
-  # the job to the tag-publish requirements.
+  # job and on the harness step. When the job becomes a required check, remove both flags; nothing
+  # else changes, because publish.yml requires the whole ci.yml run to succeed.
   gpui-pixel-parity:
     name: GPUI pixel parity (Linux, xvfb + lavapipe)
     runs-on: ubuntu-latest
@@ -140,6 +143,119 @@ jobs:
       - name: Surface an evidence failure
         if: steps.pixel-parity.outcome == 'failure'
         run: echo "::warning title=GPUI pixel parity::a gate failed or the harness did not run; see results.json in the gpui-pixel-parity-linux artifact"
+
+  # Evidence, not a release gate: the GPUI backend built and tested against gpui-fast
+  # (longbridge/gpui-fast), a GPUI that retains every view it does not see change. The library keeps
+  # `gpui-pre =0.3.7`, so hosts are unaffected; this lane patches the snapshot with gpui-fast's
+  # drop-in compat crates at the revision pinned in .cargo/gpui-fast.toml, the one file a bump
+  # edits. A pass shows the chart keeps building, passing its GPUI tests (including the retained
+  # host tests of the refresh contract) and matching the pixel references on that GPUI; it gates
+  # nothing that ships (docs/development/validation.md, gpui-fast 证据线).
+  #
+  # gpui-fast pins crates the committed lockfile holds at other versions, so the lane updates the
+  # lockfile under the patch and builds without `--locked`; the crates gpui-fast brings in resolve
+  # to their newest compatible releases on every run. A gpui-fast regression, a third-party release
+  # or a runner flake must not turn this run red: publish.yml requires the whole ci.yml run to
+  # succeed for a release commit. Hence `continue-on-error` on the job, like gpui-pixel-parity
+  # above; a failing step still marks this job failed. Every step has its own timeout, so a hang
+  # fails that step instead of running into the job timeout. Removing the flag is the whole
+  # promotion as far as publish.yml is concerned; a reproducible gate also needs a committed lane
+  # lockfile, copied over Cargo.lock in place of the update and then built with `--locked`.
+  gpui-fast:
+    name: GPUI on gpui-fast (${{ matrix.os }}, evidence)
+    runs-on: ${{ matrix.os }}
+    # Above the sum of the step timeouts below (120 minutes on Linux) plus setup.
+    timeout-minutes: 135
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - name: Install GPUI dependencies, a virtual X server and software Vulkan
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            xvfb mesa-vulkan-drivers libvulkan1 fonts-dejavu-core
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The pin is part of the key, so a bump starts a new cache, and a red evidence run still
+          # saves what it built.
+          key: ${{ hashFiles('.cargo/gpui-fast.toml') }}
+          cache-on-failure: true
+      - name: Patch gpui-pre with the pinned gpui-fast
+        id: patch
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          # Both patch entries must name one revision: two would resolve two copies of GPUI.
+          revisions=$(grep -o 'rev = "[0-9a-f]*"' .cargo/gpui-fast.toml | sort -u | wc -l)
+          if [ "$revisions" -ne 1 ]; then
+            echo "::error file=.cargo/gpui-fast.toml::every patch entry must pin the same gpui-fast revision"
+            exit 1
+          fi
+          # Installed in Cargo's home config, not passed with --config, so every cargo call in this
+          # job sees the patch, rust-cache's save step included: its `cargo metadata` would otherwise
+          # see no gpui-fast and prune its git checkouts and build outputs from the cache.
+          { echo; cat .cargo/gpui-fast.toml; } >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          cargo update -p gpui-pre -p gpui-pre-platform
+      # `gpui` is gpui-fast's core crate: this prints its source and revision, and fails as an
+      # ambiguous spec if two revisions resolved.
+      - name: Show the GPUI source under test
+        timeout-minutes: 5
+        run: cargo tree -p aeris_charts_render_gpui --features gpui-backend -i gpui --depth 0
+      # Each check below runs whenever the patch applied, so one failure does not hide the others.
+      - name: Clippy native GPUI backend on gpui-fast (all targets)
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 30
+        run: cargo clippy -p aeris_charts_render_gpui --features gpui-backend --all-targets -- -D warnings
+      - name: Test native GPUI backend on gpui-fast
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' }}
+        timeout-minutes: 40
+        run: cargo test -p aeris_charts_render_gpui --features gpui-backend --all-targets
+      - name: Assert gpui-fast pixel parity against tiny-skia (Windows)
+        id: pixel-parity-windows
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' && runner.os == 'Windows' }}
+        timeout-minutes: 20
+        run: cargo run -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.pixel-parity-windows.outcome == 'failure' }}
+        with:
+          name: gpui-fast-pixel-parity-windows
+          path: target/pixel_parity/
+          retention-days: 7
+      # Built apart from the run so the harness step's timeout bounds a hang, not a cold GPUI build.
+      - name: Build the pixel-parity harness on gpui-fast (Linux)
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 15
+        run: cargo build -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity
+      - name: Run the pixel-parity harness on gpui-fast (Linux, xvfb + lavapipe)
+        id: pixel-parity-linux
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 10
+        env:
+          AERIS_CHARTS_PARITY_OUT: ${{ runner.temp }}/pixel_parity
+          GPUI_X11_SCALE_FACTOR: "1"
+        run: |
+          # GPUI picks Wayland over X11 when WAYLAND_DISPLAY is set; the harness reads an X11 window.
+          unset WAYLAND_DISPLAY
+          # Force Mesa's software Vulkan driver (lavapipe); the file name varies with the Mesa version.
+          export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)"
+          # The virtual screen must be larger than the harness window or GetImage cannot read it.
+          xvfb-run -a -s "-screen 0 2560x1600x24" \
+            cargo run -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.pixel-parity-linux.outcome != 'skipped' }}
+        with:
+          name: gpui-fast-pixel-parity-linux
+          path: ${{ runner.temp }}/pixel_parity/
+          retention-days: 7
 
   package:
     name: TypeScript package (lint, typecheck, build)

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,6 +27,34 @@ function fixture() {
     }],
   };
 }
+
+test("claims scan excludes split architecture evidence but still scans public documentation", async () => {
+  const sandbox = await mkdtemp(path.join(os.tmpdir(), "aeris_charts-claims-"));
+  try {
+    const tools = path.join(sandbox, "benchmarks");
+    await mkdir(tools);
+    for (const file of ["benchmark.mjs", "core.mjs", "shared.mjs", "size.mjs"]) {
+      await copyFile(path.join(benchmark_root, file), path.join(tools, file));
+    }
+    const public_docs = ["Readme.md", "docs/api/README.md", "docs/features/depth.md", "docs/development/contributing.md"];
+    const internal_docs = [
+      "docs/Architecture.md", "docs/architecture/data/storage.md", "docs/architecture/engine/input.md",
+      "docs/architecture/rendering/frame.md", "docs/architecture/hosts/browser.md",
+      "docs/development/performance.md", "docs/development/validation.md",
+    ];
+    for (const file of [...public_docs, ...internal_docs]) {
+      await mkdir(path.dirname(path.join(sandbox, file)), { recursive: true });
+      await writeFile(path.join(sandbox, file), "Measured frame cost 5 ms\n");
+    }
+    execFileSync("git", ["init", "--quiet"], { cwd: sandbox });
+    execFileSync("git", ["add", "Readme.md", "docs"], { cwd: sandbox });
+    execFileSync(process.execPath, [path.join(tools, "benchmark.mjs"), "claims"], { cwd: sandbox });
+    const report = JSON.parse(await readFile(path.join(tools, "results", "unsupported-claims.json"), "utf8"));
+    assert.deepEqual(report.findings.map(({ file }) => file).sort(), public_docs.sort());
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
+});
 
 test("dataset generation is deterministic and preserves OHLC invariants", () => {
   const first = generate_ohlcv(100, 42);

@@ -4168,7 +4168,15 @@ export interface trading_api {
   preview(): trading_preview | null;
   take_intents(): trading_intent[];
   /** Answer an emitted intent. Accepting releases the rollback the chart kept; rejecting undoes
-   * the change — restoring a closed order or position, or moving a dragged line back. */
+   * the change — restoring a closed order or position (unless you already re-reported it), or
+   * moving a dragged line back. Until the request is answered, every trading control on the chart
+   * is inert. Host state that shows the broker acted on the request also answers it, through
+   * `apply_snapshot` or an update or removal of the request's object: the order's removal, a
+   * non-working status, a `revision` past the intent's, or (for a move) the requested price; the
+   * position's removal or a side flip; a linked protection order of the requested role; or a new
+   * order at one of a bracket's legs. A plain re-report such as a P&L tick leaves the request
+   * waiting, so refuse a request here. A later `resolve_intent` for a settled one returns
+   * `false`. */
   resolve_intent(sequence: number, accepted: boolean): boolean;
   subscribe_intents(handler: trading_intent_handler): void;
   unsubscribe_intents(handler: trading_intent_handler): void;
@@ -4785,10 +4793,13 @@ export interface chart_api {
    * Arm an interactive drawing tool (industry-standard), or disarm with `null`. While armed,
    * pane clicks place the tool's anchors through the engine's creation flow — one click for the
    * single-anchor kinds, two for `trend_line`/`rectangle`, and repeated clicks for `path` until
-   * double-click or Enter — the mouse previews the pending anchor, Backspace removes the latest
-   * path vertex, and Escape cancels. `options` templates the drawing created this way. One-shot:
+   * double-click or Enter — the mouse previews the pending anchor, Backspace or Delete removes the
+   * latest placed point (never another drawing, indicator, or series once the first point is
+   * down), and Escape cancels. `options` templates the drawing created this way. One-shot:
    * the tool disarms after each commit (listen with {@link chart_api.set_drawing_tool_listener}
-   * to sync a toolbar).
+   * to sync a toolbar). While armed the tool also owns order and position lines: a click there
+   * places an anchor and no press there drags an order, while the markers' close, `TP`/`SL`, and
+   * other buttons keep working.
    */
   set_drawing_tool(
     tool: drawing_kind | null,
@@ -4805,7 +4816,10 @@ export interface chart_api {
   /** Fire after an engine-owned interactive drawing is committed. */
   subscribe_drawing_created(handler: drawing_created_handler): void;
   unsubscribe_drawing_created(handler: drawing_created_handler): void;
-  /** The currently selected drawing (click-to-select; Delete/Backspace removes it), or `null`. */
+  /**
+   * The currently selected drawing (click-to-select; Delete/Backspace removes it unless another
+   * drawing is being placed), or `null`.
+   */
   selected_drawing(): drawing_api | null;
   /** Fire after the visible logical range changes. */
   subscribe_visible_logical_range_change(handler: visible_logical_range_handler): void;

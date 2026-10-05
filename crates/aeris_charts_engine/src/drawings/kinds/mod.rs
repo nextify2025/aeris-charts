@@ -4,9 +4,9 @@
 //! its specs reference: a closed, compile-time table rather than a plugin registry, so adding a
 //! family never edits the frame lowering, the hit tester, or another family.
 //!
-//! The recipe (what to add where, wire-id ranges, test checklist) lives in
-//! `docs/Architecture.md` under "Drawing families (B8)". Shared single-list registries carry one
-//! `// B8: <family> — begin/end` block per family; a family stream edits only inside its own.
+//! 扩展流程、wire id 范围与测试清单见 `docs/architecture/engine/drawing-families.md`。
+//! 共享的单一列表注册表为每个族保留一个 `// B8: <family> — begin/end` 块，
+//! 各族仅修改自己的块。
 
 use aeris_charts_render::shape::Point;
 

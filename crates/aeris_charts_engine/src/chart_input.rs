@@ -12,10 +12,14 @@
 //! here once and every native host inherits it without wiring.
 
 use super::*;
+use crate::trading::TradingHitAction;
 
 /// Manhattan distance before a press becomes a drag (reference CancelClickManhattanDistance).
 /// Hosts that arbitrate page scrolling before the engine sees a gesture wait for this distance.
 pub const CLICK_SLOP_MANHATTAN: f64 = 5.0;
+/// The taps of a touch double-tap may land this far apart (reference `DoubleTapManhattanDistance`):
+/// a finger lands less precisely than a mouse, whose double-click keeps `CLICK_SLOP_MANHATTAN`.
+const DOUBLE_TAP_MANHATTAN: f64 = 30.0;
 const DOUBLE_CLICK_WINDOW_MS: f64 = 500.0;
 /// A stationary pane touch enters crosshair inspection after this host-clock interval.
 pub const TOUCH_LONG_PRESS_MS: f64 = 240.0;
@@ -391,6 +395,9 @@ pub(crate) struct InputController {
     options: InteractionOptions,
     resolver: GestureResolver,
     press: Option<Press>,
+    /// The close control the open press began on, recorded only when it could act at the press.
+    /// Its release activates exactly that control (see [`ChartEngine::input_pointer_up`]).
+    press_close: Option<TradingHit>,
     last_click: Option<(f64, f64, f64)>,
     /// The last completed click was a trading-control or alert-chip press (see
     /// [`Press::control_pair`]); the next press reads it when it pairs into a double-click.
@@ -523,6 +530,15 @@ impl ChartEngine {
     /// another frame. Hosts request animation frames only while this holds.
     pub fn input_animating(&self) -> bool {
         self.input.kinetic_active || self.keyboard_scroll_active() || self.scroll_animation_active()
+    }
+
+    /// Whether a pointer press is open: a mouse or pen press that has not been released or
+    /// abandoned, or a finger the touch controller still tracks. While this holds the press owns
+    /// the pointer (browser pointer capture): a host keeps delivering its moves and its release
+    /// wherever the pointer goes, and abandons it with [`Self::input_cancel`] when the window
+    /// loses focus.
+    pub fn input_pointer_captured(&self) -> bool {
+        self.input.press.is_some() || self.input.touch_tracking.is_some()
     }
 
     /// Earliest host-clock time at which [`Self::input_tick`] has deferred work, if any.
@@ -721,11 +737,13 @@ impl ChartEngine {
         } else {
             self.input.touch_tracking = None;
         }
+        // Abandoning a press whose release never arrived resets the pointer, so it runs before
+        // this press records its own position.
+        self.end_press_without_commit();
         self.input.pointer = Some((x, y));
         self.input.modifiers = input.modifiers;
         self.input.tooltip_deadline_ms = None;
         self.input.frame_dirty = true;
-        self.end_press_without_commit();
         self.stop_input_motion();
         self.commit_drawing_edit_session();
 
@@ -755,6 +773,11 @@ impl ChartEngine {
         let region = self.region_at_with_profile(x, y, HitProfile::for_device(input.device));
         let sequence_or_idle =
             self.active_drawing_tool().is_none() || self.drawing_tool_sequence_active();
+        let double_slop = if input.device == InputDevice::Touch {
+            DOUBLE_TAP_MANHATTAN
+        } else {
+            CLICK_SLOP_MANHATTAN
+        };
         let repeated = self
             .input
             .last_click
@@ -762,7 +785,7 @@ impl ChartEngine {
                 input.timestamp_ms > 0.0
                     && last_ms > 0.0
                     && (0.0..=DOUBLE_CLICK_WINDOW_MS).contains(&(input.timestamp_ms - last_ms))
-                    && (x - last_x).abs() + (y - last_y).abs() < CLICK_SLOP_MANHATTAN
+                    && (x - last_x).abs() + (y - last_y).abs() < double_slop
             });
         if click_count >= 2 || repeated {
             self.input.last_click = None;
@@ -782,7 +805,7 @@ impl ChartEngine {
         if matches!(mode, PressMode::Separator { .. }) {
             self.clear_pointer_hover();
         } else {
-            self.refresh_pointer_hover(x, y, input.timestamp_ms);
+            self.refresh_sample_hover(input.device, x, y, input.timestamp_ms);
         }
         self.refresh_input_cursor();
     }
@@ -883,6 +906,15 @@ impl ChartEngine {
             update.kind,
             GestureUpdateKind::DragStarted | GestureUpdateKind::DragMoved
         );
+        // Object drags (drawings, order lines, protection handles) open their session on press
+        // and move nothing until this press has crossed the shared threshold: below it the press
+        // is still a click. The latch is the controller's own, so a press the resolver refused
+        // still drags. The sessions recompute from their start (drawings by the pointer's offset
+        // from the press, orders at the pointer's price), so the crossing sample catches the
+        // object up to the pointer and later samples track it exactly, back near the press too.
+        // The gate stays out of the session methods, which keyboard nudges and hosts call
+        // directly.
+        let object_drag = self.input.press.is_some_and(|press| press.moved);
         match self.input.press.map(|press| press.mode) {
             // Axis sessions snapshot on press but mutate only once the shared threshold is crossed.
             Some(PressMode::TimeAxis) => {
@@ -915,7 +947,7 @@ impl ChartEngine {
                 self.refresh_input_cursor();
                 return;
             }
-            Some(PressMode::Trading { dragging: true }) => {
+            Some(PressMode::Trading { dragging: true }) if object_drag => {
                 self.trading_drag_to(y);
             }
             Some(PressMode::DrawingCreation { capture: true, .. }) => {
@@ -926,7 +958,7 @@ impl ChartEngine {
             Some(PressMode::DrawingCreation { capture: false, .. }) => {
                 self.drawing_tool_pointer_move(x, y, modifiers, primary_pressed);
             }
-            Some(PressMode::DrawingDrag) if primary_pressed => {
+            Some(PressMode::DrawingDrag) if primary_pressed && object_drag => {
                 self.drawing_drag_to(x, y, modifiers);
             }
             Some(PressMode::Pane { price_pan, panning }) if primary_pressed => {
@@ -948,7 +980,7 @@ impl ChartEngine {
             }
             _ => {}
         }
-        self.refresh_pointer_hover(x, y, input.timestamp_ms);
+        self.refresh_sample_hover(input.device, x, y, input.timestamp_ms);
         self.refresh_input_cursor();
     }
 
@@ -989,7 +1021,7 @@ impl ChartEngine {
                     control_pair: false,
                 });
                 self.input.pointer = Some((rebased.x, rebased.y));
-                self.refresh_pointer_hover(rebased.x, rebased.y, input.timestamp_ms);
+                self.refresh_sample_hover(input.device, rebased.x, rebased.y, input.timestamp_ms);
                 self.refresh_input_cursor();
             } else {
                 self.input.pointer = None;
@@ -1015,6 +1047,7 @@ impl ChartEngine {
             .resolver
             .pointer_up(Self::mouse_sample(input, InputTarget::Pane));
         self.clear_trading_pressed();
+        let press_close = self.input.press_close.take();
         let Some(press) = self.input.press.take() else {
             if input.device == InputDevice::Touch && self.input.touch_tracking.is_none() {
                 self.input.pointer = None;
@@ -1131,6 +1164,9 @@ impl ChartEngine {
                 let update = self.drawing_tool_pointer_up(x, y, modifiers);
                 created_on_release = committed_on_press || update.created.is_some();
                 self.note_drawing_created(update.created);
+                // Click placement (a decided product rule): a click-placed tool places an anchor
+                // only for a click, at the release. A press past the slop is a drag that places
+                // nothing; with a first anchor down it only moved the live preview.
                 if !capture && !moved && !committed_on_press && update.created.is_none() {
                     let update = self.drawing_tool_activate(x, y, modifiers);
                     created_on_release |= update.created.is_some();
@@ -1139,19 +1175,26 @@ impl ChartEngine {
             }
             PressMode::Trading { dragging } => {
                 if dragging {
+                    // When the release is the first sample past the threshold, the drag lands
+                    // where the pointer lets go. Otherwise the last motion sample, which the
+                    // preview shows, is what commits. An unmoved press never changed the preview,
+                    // so its end emits nothing.
+                    if moved && !press.moved {
+                        self.trading_drag_to(y);
+                    }
                     self.trading_drag_end();
                 }
-                if !moved
-                    && self
-                        .trading_hit_at(press.start.0, press.start.1)
-                        .zip(self.trading_hit_at(x, y))
-                        .is_some_and(|(start, end)| {
-                            start.object == end.object
-                                && start.kind == end.kind
-                                && start.annotation_id == end.annotation_id
-                        })
-                {
-                    self.trading_activate_at(x, y);
+                // A click activates the close control the press began on, and only that one: it
+                // must still be under the release and still act. A press the control could not
+                // act on stays absorbed, and an order the host moved or put under the pointer
+                // during the click (a twin at the same price) is never the one cancelled.
+                if let Some(pressed) = press_close.filter(|_| !moved) {
+                    if self
+                        .pointer_trading_hit_at(x, y)
+                        .is_some_and(|end| end.same_target(&pressed))
+                    {
+                        self.trading_activate_hit(&pressed);
+                    }
                 }
             }
             PressMode::Alert => {
@@ -1160,6 +1203,13 @@ impl ChartEngine {
                 }
             }
             PressMode::DrawingDrag => {
+                // As for an order: a release that is the first sample past the threshold is the
+                // drag's last sample. Once motion has dragged, the drawing commits as last shown,
+                // so a magnet or straighten key let go before the button changes nothing. An
+                // unmoved press commits no change, undo step, or revision.
+                if moved && !press.moved {
+                    self.drawing_drag_to(x, y, modifiers);
+                }
                 self.drawing_drag_end();
                 if !moved {
                     self.input_primary_click(x, y, press.text_press_selected);
@@ -1197,7 +1247,7 @@ impl ChartEngine {
     /// The pointer left the chart without a held button. Captured gestures are unaffected; a live
     /// measure stays on screen.
     pub fn input_pointer_leave(&mut self) {
-        if self.input.press.is_some() || self.input.touch_tracking.is_some() {
+        if self.input_pointer_captured() {
             return;
         }
         self.input.pointer = None;
@@ -1214,7 +1264,8 @@ impl ChartEngine {
     }
 
     /// Abandon every in-flight gesture without committing it: capture loss, focus loss, a host
-    /// modal occluding the chart, resize, or disposal.
+    /// modal occluding the chart, resize, or disposal. Drawing and order drags roll back; a pan,
+    /// axis scale, or separator resize stops where it is and keeps its partial change.
     pub fn input_cancel(&mut self) {
         self.abandon_press();
         self.input.touch_longpress_deadline_ms = None;
@@ -1432,10 +1483,14 @@ impl ChartEngine {
                 update.created.is_some() || self.edit_selected_drawing_text()
             }
             ChartKey::EditText => self.edit_selected_drawing_text(),
-            ChartKey::Backspace
-                if self.drawing_tool_sequence_active() && self.drawing_create_active() =>
-            {
-                self.drawing_tool_pop_anchor()
+            // Once its first point is placed, the drawing being placed owns Backspace and Delete:
+            // each steps back its latest placed point, and with none left the key does nothing
+            // until Escape or the next click. A held key therefore never falls through to
+            // another drawing, an indicator, or a series. Before the first click the keys act on
+            // the visible selection.
+            ChartKey::Backspace | ChartKey::Delete if self.drawing_placement_under_way() => {
+                self.drawing_create_pop_anchor();
+                true
             }
             ChartKey::Backspace | ChartKey::Delete => self.delete_selection(),
             ChartKey::Escape => {
@@ -1775,8 +1830,10 @@ impl ChartEngine {
         }
     }
 
-    /// Close the open press without committing it: drags restore their start, captures and
-    /// previews are discarded, scale sessions end, and a delta-tooltip gesture settles.
+    /// Close the open press without committing it: drawing drags restore their start, captures
+    /// and previews are discarded, and a delta-tooltip gesture settles. Abandoning is not undoing
+    /// for view gestures: a pan, axis scale, or separator resize ends where it is and keeps its
+    /// partial change on every cancel path, Escape included (the decided product rule).
     fn abandon_press(&mut self) {
         self.input.resolver.cancel();
         self.abandon_press_state();
@@ -1784,6 +1841,7 @@ impl ChartEngine {
 
     fn abandon_press_state(&mut self) {
         self.input.pending_capture = None;
+        self.input.press_close = None;
         if let Some(press) = self.input.press.take() {
             match press.mode {
                 PressMode::Pane { price_pan, panning } => {
@@ -1884,7 +1942,45 @@ impl ChartEngine {
         }
     }
 
-    /// Pane-press arbitration, topmost owner first: a live measure, trading controls, the
+    /// The trading control pointer input acts on at a pane point. While a drawing tool is armed
+    /// the tool owns order and position line bodies and their readouts, an order chip's drag area
+    /// and annotation chips included: a press there belongs to the tool, the line neither
+    /// highlights nor reads as draggable, and nothing financial moves while drawing. Marker
+    /// buttons (close, `TP`/`SL`) and execution arrows keep their press. Once the tool disarms,
+    /// the lines answer again.
+    fn pointer_trading_hit_at(&self, x: f64, y: f64) -> Option<TradingHit> {
+        let hit = self.trading_hit_at(x, y)?;
+        let tool_owned = matches!(
+            hit.kind,
+            TradingHitKind::OrderLine | TradingHitKind::PositionLine | TradingHitKind::Annotation
+        );
+        (!tool_owned || self.active_drawing_tool().is_none()).then_some(hit)
+    }
+
+    /// Re-resolve the trading hover and the cached cursor after something other than pointer
+    /// input changed what the pointer rests on, so the control under it reads right before the
+    /// next motion and a host presenting `input_cursor()` after its own call needs no motion.
+    /// Every arm and disarm of a drawing tool runs it (the host API, Escape, and the commit that
+    /// disarms the one-shot tool), and so does every trading change from outside pointer input:
+    /// a host snapshot, update, or removal, a resolved or settled request, the visible account,
+    /// a bracket request, and keyboard order adjustment. An open press keeps its hover until
+    /// release, and only its cursor is re-read. A new hover target waits for the next motion to
+    /// start its tooltip dwell, since the engine has no clock of its own.
+    pub(crate) fn refresh_resting_pointer_affordance(&mut self) {
+        let resting = self.input.press.is_none() && self.input.touch_tracking.is_none();
+        if let Some((x, y)) = self.input.pointer.filter(|_| resting) {
+            if matches!(self.region_at(x, y), ChartRegion::Pane) {
+                let changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
+                if changed || !self.trading_tooltip_pending() {
+                    self.input.tooltip_deadline_ms = None;
+                }
+            }
+        }
+        self.refresh_input_cursor();
+    }
+
+    /// Pane-press arbitration, topmost owner first: a live measure, trading controls (only the
+    /// marker buttons while a drawing tool is armed, see [`Self::pointer_trading_hit_at`]), the
     /// crosshair action chip, an armed drawing tool, an existing drawing, the delta tooltip, a
     /// Shift measure, then pan.
     fn begin_pane_press(&mut self, input: PointerInput) -> PressMode {
@@ -1894,12 +1990,16 @@ impl ChartEngine {
             magnet: modifiers.magnet,
             straighten: false,
         };
+        self.input.press_close = None;
         if self.measure_active() && self.measure_pointer_down(x, y, false, magnet_only) {
             return PressMode::Measure;
         }
-        if self.trading_hit_at(x, y).is_some() {
+        if let Some(hit) = self.pointer_trading_hit_at(x, y) {
             self.set_trading_pressed(x, y);
             let dragging = self.trading_drag_start_at(x, y);
+            self.input.press_close =
+                matches!(self.trading_hit_action(&hit), Some(TradingHitAction::Close))
+                    .then_some(hit);
             return PressMode::Trading { dragging };
         }
         if self.alert_create_hit_at(x, y) {
@@ -2171,6 +2271,26 @@ impl ChartEngine {
         self.clear_hover();
     }
 
+    /// Hover under a pointer sample. A finger has no hover: it shows the crosshair only while it
+    /// drags a trading line or a drawing, where the crosshair marks the drop point, and in
+    /// long-press tracking, which moves the crosshair itself. A touch press, pan, or axis drag
+    /// shows none (the reference's `touchStartEvent` and `touchMoveEvent`, against its
+    /// `longTapEvent`).
+    fn refresh_sample_hover(&mut self, device: InputDevice, x: f64, y: f64, now_ms: f64) {
+        let drags_an_object = self.input.press.is_some_and(|press| {
+            press.moved
+                && matches!(
+                    press.mode,
+                    PressMode::Trading { dragging: true } | PressMode::DrawingDrag
+                )
+        });
+        if device == InputDevice::Touch && !drags_an_object {
+            self.clear_pointer_hover();
+        } else {
+            self.refresh_pointer_hover(x, y, now_ms);
+        }
+    }
+
     /// Hover arbitration, topmost owner first (reference `hitTestPane`): a `Top` host primitive,
     /// a drawing, then series in paint order where a series' own non-bottom primitive blocks it
     /// and every series below; then a `Normal` pane primitive, a general-series item, and finally
@@ -2287,17 +2407,62 @@ impl ChartEngine {
         // `resolve_pointer_hover`; the built-in candidates resolve here.
         self.input.host_primitive_cursor = false;
         self.input.hover = self.arbitrate_hover(x, y, None);
-        // Only a changed trading hover restarts the dwell; holding still lets it elapse.
-        if !captured && self.set_trading_hover(x, y) {
-            let on_close = self
-                .trading_hit_at(x, y)
-                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton);
-            self.input.tooltip_deadline_ms = on_close.then_some(now_ms + TRADING_TOOLTIP_DWELL_MS);
+        // The dwell belongs to the hovered control: a new target restarts it, while motion inside
+        // the same control lets it elapse and keeps a shown tooltip. A close control whose tooltip
+        // a press or host snapshot hid dwells again on the next motion.
+        if !captured {
+            let target_changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
+            if !self.trading_tooltip_pending() {
+                self.input.tooltip_deadline_ms = None;
+            } else if target_changed || self.input.tooltip_deadline_ms.is_none() {
+                self.input.tooltip_deadline_ms = Some(now_ms + TRADING_TOOLTIP_DWELL_MS);
+            }
         }
     }
 
     fn refresh_input_cursor(&mut self) {
         self.input.cursor = self.resolve_input_cursor();
+    }
+
+    /// The cursor over a trading control, from the one "actionable now" check
+    /// ([`Self::trading_hit_action`]): the vertical grab over a line a drag would start on, the
+    /// click cursor over a button that acts, and the inert arrow over a control that cannot act
+    /// now (a request awaits the host, or the order's status rules the action out), as over an
+    /// axis whose scaling is off. `None` over a readout, which keeps the pane's own cursor.
+    fn trading_control_cursor(&self, hit: &TradingHit) -> Option<ChartCursor> {
+        if let Some(cursor) = self.trading_cursor_for(hit) {
+            return Some(match cursor {
+                TradingCursor::Grab => ChartCursor::VerticalGrab,
+                TradingCursor::Pointer => ChartCursor::Pointer,
+            });
+        }
+        matches!(self.trading_hit_action(hit), Some(TradingHitAction::Inert))
+            .then_some(ChartCursor::Default)
+    }
+
+    /// The cursor of a trading press that opened no drag, read where the press began: the click
+    /// cursor on a button its release acts on, the inert arrow on a control that cannot act (a
+    /// drag it could not start included), and the crosshair on a readout, whose press only keeps
+    /// the chart from panning. A close cell's release acts only on the control recorded at the
+    /// press (see [`Self::input_pointer_up`]), so its cursor follows that record: the arrow when
+    /// the cell could not act at the press, or no longer can.
+    fn trading_press_cursor(&self, (x, y): (f64, f64)) -> ChartCursor {
+        if let Some(pressed) = &self.input.press_close {
+            return match self.trading_hit_action(pressed) {
+                Some(TradingHitAction::Close) => ChartCursor::Pointer,
+                _ => ChartCursor::Default,
+            };
+        }
+        match self
+            .pointer_trading_hit_at(x, y)
+            .and_then(|hit| self.trading_hit_action(&hit))
+        {
+            Some(TradingHitAction::RevealFills) => ChartCursor::Pointer,
+            Some(TradingHitAction::Close | TradingHitAction::Drag(_) | TradingHitAction::Inert) => {
+                ChartCursor::Default
+            }
+            None => ChartCursor::Crosshair,
+        }
     }
 
     fn resolve_input_cursor(&self) -> ChartCursor {
@@ -2314,9 +2479,10 @@ impl ChartEngine {
                 PressMode::PriceAxis { .. } => return ChartCursor::ResizeVertical,
                 PressMode::Separator { .. } => return ChartCursor::ResizeRow,
                 PressMode::Trading { dragging: true } => return ChartCursor::VerticalGrabbing,
-                PressMode::Trading { dragging: false } | PressMode::Alert => {
-                    return ChartCursor::Pointer;
+                PressMode::Trading { dragging: false } => {
+                    return self.trading_press_cursor(press.start);
                 }
+                PressMode::Alert => return ChartCursor::Pointer,
                 PressMode::TextEditor => return ChartCursor::Text,
                 PressMode::Measure
                 | PressMode::DrawingCreation { .. }
@@ -2345,21 +2511,27 @@ impl ChartEngine {
                 };
             }
         }
-        // A live measure or an armed tool keeps the crosshair over every chart object.
-        if self.measure_active() || self.active_drawing_tool().is_some() {
+        // The cursor follows pane-press arbitration. A live measure takes every press, so it
+        // keeps the crosshair over every chart object. An armed tool shows its crosshair over
+        // everything except the trading controls and the alert chip that still win a press.
+        if self.measure_active() {
             return ChartCursor::Crosshair;
         }
-        if self.trading_preview().is_some() {
+        let armed = self.active_drawing_tool().is_some();
+        if !armed && self.trading_preview().is_some() {
             return ChartCursor::VerticalGrabbing;
         }
-        if let Some(cursor) = self.trading_cursor_at(x, y) {
-            return match cursor {
-                TradingCursor::Grab => ChartCursor::VerticalGrab,
-                TradingCursor::Pointer => ChartCursor::Pointer,
-            };
+        if let Some(cursor) = self
+            .pointer_trading_hit_at(x, y)
+            .and_then(|hit| self.trading_control_cursor(&hit))
+        {
+            return cursor;
         }
         if self.alert_create_hit_at(x, y) {
             return ChartCursor::Pointer;
+        }
+        if armed {
+            return ChartCursor::Crosshair;
         }
         if self.input.host_primitive_cursor {
             return ChartCursor::HostPrimitive;
@@ -2374,13 +2546,26 @@ impl ChartEngine {
     }
 }
 
+// Interactive scenarios that drive the controller only through its public `input_*` API, grouped
+// by the behavior they pin. They share the fixtures in `tests`.
+#[cfg(test)]
+mod chrome_tests;
+#[cfg(test)]
+mod drawing_tests;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod motion_tests;
+#[cfg(test)]
+mod trading_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const BARS: usize = 60;
+    pub(super) const BARS: usize = 60;
 
-    fn chart() -> ChartEngine {
+    pub(super) fn chart() -> ChartEngine {
         let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
         let times: Vec<f64> = (0..BARS).map(|i| 1_000.0 + i as f64 * 60.0).collect();
         let open: Vec<f64> = (0..BARS).map(|i| 100.0 + (i % 7) as f64).collect();
@@ -2396,11 +2581,11 @@ mod tests {
         chart
     }
 
-    fn relayout(chart: &mut ChartEngine) {
+    pub(super) fn relayout(chart: &mut ChartEngine) {
         chart.recompute_layout_with_measure(true, |_, _| 48.0, |_, _| 48.0);
     }
 
-    fn at(x: f64, y: f64) -> PointerInput {
+    pub(super) fn at(x: f64, y: f64) -> PointerInput {
         PointerInput {
             x,
             y,
@@ -2408,7 +2593,25 @@ mod tests {
         }
     }
 
-    fn shifted(x: f64, y: f64) -> PointerInput {
+    /// A pointer sample with an explicit timestamp, for timing-sensitive gestures.
+    pub(super) fn at_ms(x: f64, y: f64, timestamp_ms: f64) -> PointerInput {
+        PointerInput {
+            timestamp_ms,
+            ..at(x, y)
+        }
+    }
+
+    /// The fixture chart with kinetic coasting after a mouse pan switched on.
+    pub(super) fn kinetic_chart() -> ChartEngine {
+        let mut chart = chart();
+        chart.set_interaction_options(InteractionOptions {
+            kinetic_mouse: true,
+            ..InteractionOptions::default()
+        });
+        chart
+    }
+
+    pub(super) fn shifted(x: f64, y: f64) -> PointerInput {
         PointerInput {
             modifiers: InputModifiers {
                 shift: true,
@@ -2418,12 +2621,12 @@ mod tests {
         }
     }
 
-    fn click(chart: &mut ChartEngine, x: f64, y: f64) {
+    pub(super) fn click(chart: &mut ChartEngine, x: f64, y: f64) {
         chart.input_pointer_down(at(x, y), 1);
         chart.input_pointer_up(at(x, y));
     }
 
-    fn drag(chart: &mut ChartEngine, from: (f64, f64), to: (f64, f64)) {
+    pub(super) fn drag(chart: &mut ChartEngine, from: (f64, f64), to: (f64, f64)) {
         chart.input_pointer_down(at(from.0, from.1), 1);
         for step in 1..=4 {
             let t = f64::from(step) / 4.0;
@@ -2434,7 +2637,7 @@ mod tests {
         chart.input_pointer_up(at(to.0, to.1));
     }
 
-    fn empty_pane_point(chart: &ChartEngine) -> (f64, f64) {
+    pub(super) fn empty_pane_point(chart: &ChartEngine) -> (f64, f64) {
         (40..chart.pane_w as i32)
             .step_by(17)
             .flat_map(|x| (20..chart.pane_h as i32).step_by(13).map(move |y| (x, y)))
@@ -2445,7 +2648,7 @@ mod tests {
             .expect("the pane has empty space")
     }
 
-    fn series_point(chart: &ChartEngine) -> (f64, f64) {
+    pub(super) fn series_point(chart: &ChartEngine) -> (f64, f64) {
         let x = chart.time_scale.index_to_coordinate(30);
         let y = chart.series_price_to_coordinate(0, 101.0).unwrap();
         assert_eq!(chart.hit_test_series(x, y), Some(0));
@@ -3732,7 +3935,7 @@ mod tests {
     }
 
     /// A trend line from bar 10 to bar 40 and the point halfway along its body.
-    fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
+    pub(super) fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
         let id = chart
             .add_drawing(
                 DrawingKind::TrendLine,
@@ -3756,7 +3959,7 @@ mod tests {
         (id, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
     }
 
-    fn double_click(chart: &mut ChartEngine, x: f64, y: f64) {
+    pub(super) fn double_click(chart: &mut ChartEngine, x: f64, y: f64) {
         chart.input_pointer_down(at(x, y), 2);
         chart.input_pointer_up(at(x, y));
     }

@@ -5700,7 +5700,8 @@ impl AerisChart {
     pub fn drawing_create_finish(&mut self) -> u32 {
         self.inner.borrow_mut().drawing_create_finish()
     }
-    /// Remove the latest placed vertex from an active multi-click path.
+    /// Remove the latest placed anchor of the drawing being placed: a path vertex or a fixed-count
+    /// tool's click.
     pub fn drawing_create_pop_anchor(&mut self) -> bool {
         self.inner.borrow_mut().drawing_create_pop_anchor()
     }

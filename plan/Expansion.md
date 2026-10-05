@@ -1,1061 +1,664 @@
-# Aeris Charts Trading Expansion Plan
+# Aeris Charts 交易扩展计划
 
-Aeris Charts will become a complete **headless** professional trading chart engine: order flow,
-market depth, non-time bars, a professional indicator catalog, and a drawing system whose every
-tool is as configurable as the tools in mature trading platforms. The primary consumer is the
-Aeris Terminal GPUI platform; browser hosts consume the same engine through WASM.
+Aeris Charts 将成为完整的**无头**专业交易图表引擎：订单流、市场深度、非时间柱、专业指标目录，以及一套绘图系统，其中每个工具的可配置程度都与成熟交易平台中的工具相当。主要使用方是 Aeris Terminal GPUI 平台；浏览器宿主通过 WASM 使用同一引擎。
 
-This is the **active program** (since 2026-09-25). [plan.md](plan.md) covers general
-(non-financial) chart families and is paused. Both plans share one `ChartEngine` and one frame
-contract.
+这是**活跃计划**（自 2026-09-25 起）。[plan.md](plan.md) 涵盖通用（非金融）图表族，目前已暂停。两份计划共用同一个 `ChartEngine` 和同一份帧契约。
 
-How to read this file:
+阅读本文件的方式：
 
-1. **Status at a glance**: where every batch stands.
-2. **How work is delivered**: the batch, gate and commit rules.
-3. **Batches B1–B9**: the work itself, as checklists with exit criteria.
-4. **Scope and ownership**: what the engine owns, what hosts own, what is out of scope.
-5. **Current baseline**: what exists today.
-6. **Architecture principles**: standing rules for every batch.
-7. **Specifications**: detailed requirements for foundations F1–F6 and platform contracts PD1–PD11.
-8. **Catalogs**: order-flow (OF), chart-type (CT), indicator (I) and drawing items.
-9. **Verification and completion**: evidence required per item and for the whole plan.
+1. **状态总览**：每个批次目前进展到哪一步。
+2. **工作交付方式**：批次、门禁与提交规则。
+3. **批次 B1–B9**：工作本身，以带有退出标准的检查清单呈现。
+4. **范围与归属**：引擎拥有什么、宿主拥有什么、哪些不在范围内。
+5. **当前基线**：目前已存在的内容。
+6. **架构原则**：适用于每个批次的常设规则。
+7. **规格**：基础 F1–F6 与平台契约 PD1–PD11 的详细要求。
+8. **目录**：订单流（OF）、图表类型（CT）、指标（I）与绘图条目。
+9. **验证与完成**：每个条目以及整个计划所需的证据。
 
-Item IDs (F, OF, CT, I, PD) are stable and referenced by the platform roadmap
-(`plan/trading_platform_feature_roadmap.md` in the Aeris Terminal repository). Batches group those
-items; they do not renumber them.
+条目 ID（F、OF、CT、I、PD）保持稳定，并被平台路线图（Aeris Terminal 仓库中的 `plan/trading_platform_feature_roadmap.md`）引用。批次对这些条目进行分组，不会对其重新编号。
 
-## Status at a glance
+## 状态总览
 
-Updated 2026-09-27. Baseline source-confirmed 2026-09-24.
+更新于 2026-09-27。基线经源码确认于 2026-09-24。
 
-| Batch | Scope | Unblocks on the platform | Status |
+| 批次 | 范围 | 在平台侧解锁 | 状态 |
 | --- | --- | --- | --- |
-| B1 | Platform chart contracts: PD11, PD1, PD3, PD4, PD5, PD6, PD7 | Multi-account chart trading, trailing and break-even stops, risk warnings on order lines, economic events and risk windows, trade review markers, linked charts, journal images, fundamentals | **Complete** |
-| B2 | Drawing model and customization: F5, schema conventions, existing tools | Configurable drawings, templates, drawing sync across cells | **Complete** |
-| B3 | Shared tape and order flow: F2, OF1, OF2, OF11, OF12, PD10 | Footprint, CVD, delta, big-trade bubbles | **Complete** |
-| B4 | Study inputs and core indicators: F4, OF9, CT1, CT2, CT6, I1 | Professional indicator set, VWAP bands, Heikin Ashi, comparisons | **Complete** |
-| B5 | Non-time bars and replay: F1, OF14, CT3, CT4, PD2 | Tick/volume/range charts, session replay, trade review playback | **Complete** |
-| B6 | Depth: F3, OF15–OF18, PD8, PD9 | Liquidity heatmap, order-level markers, depth studies | **Complete** |
-| B7 | Profiles and resampling: F6, OF3–OF8, OF10, CT5 | Session/composite profiles, TPO, anchored VWAP, multi-timeframe studies | Open |
-| B8 | Drawing catalog expansion | Full professional drawing toolset | Open |
-| B9 | Breadth and extension: I2, I3, I4, OF13 | Remaining indicators, custom studies, auction markers | Open |
+| B1 | 平台图表契约：PD11、PD1、PD3、PD4、PD5、PD6、PD7 | 多账户图表交易、追踪止损与保本止损、订单线上的风险警告、经济事件与风险窗口、交易复盘标记、联动图表、日志图像、基本面 | **已完成** |
+| B2 | 绘图模型与自定义：F5、schema 约定、现有工具 | 可配置绘图、模板、跨单元格的绘图同步 | **已完成** |
+| B3 | 共享成交带与订单流：F2、OF1、OF2、OF11、OF12、PD10 | 足迹图、CVD、delta、大额成交气泡 | **已完成** |
+| B4 | 研究输入与核心指标：F4、OF9、CT1、CT2、CT6、I1 | 专业指标集、VWAP 带、Heikin Ashi、对比 | **已完成** |
+| B5 | 非时间柱与回放：F1、OF14、CT3、CT4、PD2 | Tick/成交量/区间图表、交易时段回放、交易复盘回放 | **已完成** |
+| B6 | 深度：F3、OF15–OF18、PD8、PD9 | 流动性热力图、逐笔委托级标记、深度研究 | **已完成** |
+| B7 | 分布与重采样：F6、OF3–OF8、OF10、CT5 | 交易时段/复合分布、TPO、锚定 VWAP、多周期研究 | 待交付 |
+| B8 | 绘图目录扩展 | 完整的专业绘图工具集 | 待交付 |
+| B9 | 广度与扩展：I2、I3、I4、OF13 | 其余指标、自定义研究、拍卖标记 | 待交付 |
 
-Ordering: B1–B3 serve the platform's first phase and are independent of each other. B4 must land
-before B7 (OF10 needs F4), B2 before B7 and B8 (they need F5), B3 before B5 and B6 (replay and the
-heatmap reuse the shared tape), and B5 before B6 (depth extends the replay checkpoints). Change the
-order only when platform priorities change, and record it here.
+顺序：B1–B3 服务于平台的第一阶段，彼此独立。B4 必须先于 B7 落地（OF10 需要 F4），B2 必须先于 B7 和 B8（它们需要 F5），B3 必须先于 B5 和 B6（回放与热力图复用共享成交带），B5 必须先于 B6（深度扩展回放检查点）。仅当平台优先级变化时才调整顺序，并在此处记录。
 
-## How work is delivered
+## 工作交付方式
 
-Work proceeds in **large batches**, as defined in **Work cadence** in [AGENTS.md](../AGENTS.md). A
-batch is one whole row of the status table, not one item or option.
+工作以**大批次**推进，其定义见**工作节奏**一节，位于 [AGENTS.md](../AGENTS.md) 中。批次是状态表的完整一行，而不是单个条目或选项。
 
-- **Implement the whole batch first.** Build every checklist item in the batch, with its regression
-  tests and fixtures written as each item is built. Do not stop between items for full gates,
-  commits or pushes.
-- **Focused checks while implementing.** `cargo check`, unit tests and `cargo clippy` for touched
-  crates, and frame fixtures for the affected families. Nothing broader.
-- **One full gate at the end.** Run the complete gates from AGENTS.md once, plus Playwright when the
-  batch changes browser-facing behavior and GPUI parity/replay when it changes GPUI execution. Fix
-  every failure and rerun until green. If the cause is unclear, rerun focused checks item by item.
-- **One commit and push per batch.** Commit with a structured message listing delivered item IDs and
-  verification, then push `main`. Never commit a batch with a failing or skipped required gate.
-- **Update this file in the same commit.** Tick the batch's checklist, set its status, and update
-  `docs/Architecture.md` when ownership, data flow or execution paths changed.
-- **Manual evidence at milestones, not per batch.** Themed and overflow screenshots, accessibility
-  review, competitor comparisons and recorded benchmarks are collected when B3, B6 and B9 close.
+- **先实现整个批次。** 构建批次中的每个检查清单条目，并在构建每个条目时同时编写其回归测试和夹具。不要在条目之间停下来运行完整门禁、提交或推送。
+- **实现过程中的聚焦检查。** 对涉及的 crate 运行 `cargo check`、单元测试和 `cargo clippy`，并运行受影响图族的帧夹具。不做范围更大的检查。
+- **结束时只做一次完整门禁。** 运行一次 AGENTS.md 中的完整门禁；当批次改变面向浏览器的行为时加跑 Playwright，当批次改变 GPUI 执行时加跑 GPUI 一致性/回放检查。修复每个失败并重跑，直至通过。若原因不明，则逐个条目重跑聚焦检查。
+- **每个批次一次提交与推送。** 提交时使用结构化消息，列出已交付的条目 ID 与验证情况，然后推送 `main`。绝不提交存在失败或被跳过的必需门禁的批次。
+- **在同一次提交中更新本文件。** 勾选批次的检查清单，设置其状态，并在所有权、数据流或执行路径发生变化时更新 `docs/Architecture.md`。
+- **手动证据在里程碑收集，而非每个批次。** 主题截图与溢出截图、无障碍评审、竞品对比和已记录的基准测试，在 B3、B6 和 B9 收尾时收集。
 
-A batch may be split into two commits only when it is too large to review as one, and each part
-must pass the full gate on its own.
+仅当批次过大、无法作为一次提交评审时，才可拆分为两次提交，且每一部分都必须独立通过完整门禁。
 
-## Batches
+## 批次
 
-Each checklist item refers to its specification or catalog entry for the detailed requirement.
-An item is ticked only when it works through the real host and executor paths (Rust, WASM and
-TypeScript, and the GPUI host), not when engine unit tests alone pass.
+每个检查清单条目都指向其规格或目录条目，以获取详细要求。只有当条目通过真实的宿主与执行器路径（Rust、WASM 和 TypeScript，以及 GPUI 宿主）运行正常时才可勾选，仅引擎单元测试通过不算。
 
-### B1 — Platform chart contracts
+### B1 — 平台图表契约
 
-**Scope:** PD11, PD1, PD3, PD4, PD5, PD6, PD7. **Depends on:** the existing trading layer,
-workspace and series paths. **Status:** next.
+**范围：** PD11、PD1、PD3、PD4、PD5、PD6、PD7。**依赖：** 现有交易层、工作区与系列路径。**状态：** 下一个。
 
-These extend existing layers without new foundations, and the platform needs them first. The
-trading layer (`trading.rs`, `frame/trading_geometry.rs`) already renders positions, working
-orders and executions, supports drag and keyboard modify, brackets from drawings, and
-      host-resolved intents. Aeris Terminal can wire basic chart trading against it today; B1 corrects
-      it for the platform's multi-account runtime rather than rebuilding it. **Status: complete.**
+这些条目在不引入新基础的前提下扩展现有各层，且平台最先需要它们。交易层（`trading.rs`、`frame/trading_geometry.rs`）已能渲染持仓、挂单和成交，支持拖动与键盘修改、基于绘图的括号订单，以及由宿主解析的意图。Aeris Terminal 如今即可基于它接入基础的图表交易；B1 针对平台的多账户运行时对其进行修正，而不是重建。**状态：已完成。**
 
-- [x] **PD11** Trading layer alignment: optional account identifier on trading objects and
-      intents with a host-set visible-account filter, trailing-stop and break-even presentation
-      from host-supplied trigger prices, exact tick-index prices on intents, and a documented
-      order-state contract with fixtures.
-- [x] **PD1** Host annotations on working orders and positions: bounded list, semantic tones,
-      tooltip text, shared layout with the existing chips, deterministic overflow collapse, exact
-      hit-testing, caps and atomic rejection of invalid annotations.
-- [x] **PD4** Execution marker variants (circle, arrow, triangle, optional size by quantity) and
-      round-trip connectors with host result labels colored by outcome, identifier hit-testing and
-      caps.
-- [x] **PD3** Host event layer: typed event markers and shaded time windows on price and study
-      panes, LOD collapse, hit-testing to host identifiers, caps, and exclusion from drawing
-      persistence and undo history.
-- [x] **PD7** Sparse fundamental series: confirm or extend `LineType::WithSteps` step-after
-      semantics, add column/histogram presentation in its own pane, and add as-of release labels.
-      Replay no-look-ahead is verified in B5.
-- [x] **PD5** Cross-chart synchronization: read and set external crosshair and visible time range,
-      semantic events with source and revision, echo-loop prevention, and subscription removal on
-      disposal. Built once so plan.md R4 can reuse it for general charts.
-- [x] **PD6** Native and GPUI image export: RGBA output at a requested size and scale, optional
-      crosshair and trading layer, the same composition rules as the browser `take_screenshot`, and
-      no disturbance to live state or frame pacing. Works for financial and general panes.
-- [x] `docs/Architecture.md` updated for the new host contracts.
-- [x] Full gate green; batch committed and pushed.
+- [x] **PD11** 交易层对齐：交易对象与意图上的可选账户标识符及由宿主设置的可见账户过滤器、基于宿主提供的触发价格的追踪止损与保本止损呈现、意图上的精确 tick 索引价格，以及附带夹具的已文档化订单状态契约。
+- [x] **PD1** 挂单与持仓上的宿主标注：有界列表、语义色调、提示框文本、与现有徽标共享布局、确定性的溢出折叠、精确命中测试、上限，以及对无效标注的原子拒绝。
+- [x] **PD4** 成交标记变体（圆形、箭头、三角形、可选按数量调整大小）与往返交易连接线，附带按结果着色的宿主结果标签、标识符命中测试和上限。
+- [x] **PD3** 宿主事件层：价格窗格与研究窗格上的类型化事件标记和带阴影的时间窗口、LOD 折叠、命中测试到宿主标识符、上限，以及不进入绘图持久化与撤销历史。
+- [x] **PD7** 稀疏基本面系列：确认或扩展 `LineType::WithSteps` 的 step-after 语义，在其自身窗格中添加柱状图/直方图呈现，并添加 as-of 发布标签。回放的无前视在 B5 中验证。
+- [x] **PD5** 跨图表同步：读取并设置外部十字光标与可见时间范围、带来源与修订号的语义事件、回声循环防护，以及销毁时移除订阅。仅构建一次，以便 plan.md R4 可将其复用于通用图表。
+- [x] **PD6** 原生与 GPUI 图像导出：按请求的尺寸与缩放输出 RGBA、可选的十字光标与交易层、与浏览器 `take_screenshot` 相同的合成规则，且不干扰实时状态或帧节奏。适用于金融窗格与通用窗格。
+- [x] 已为新的宿主契约更新 `docs/Architecture.md`。
+- [x] 完整门禁通过；批次已提交并推送。
 
-**Exit:** every PD exit criterion above passes on GPUI and in the browser, and live-rate updates to
-annotations do not rebuild unrelated trading geometry.
+**退出标准：** 上述每项 PD 的退出标准均在 GPUI 和浏览器中通过，且对标注的实时频率更新不会重建无关的交易几何。
 
-### B2 — Drawing model and customization
+### B2 — 绘图模型与自定义
 
-**Scope:** F5 and the typed schema conventions shared with F4. **Depends on:** nothing new.
-**Status:** complete (2026-09-25).
+**范围：** F5 以及与 F4 共享的类型化 schema 约定。**依赖：** 无新增依赖。**状态：** 已完成（2026-09-25）。
 
-This fixes the biggest customization gap before new tools are added, so B8 builds on the final
-model.
+这在添加新工具之前先修复最大的自定义缺口，因此 B8 建立在最终模型之上。
 
-- [x] Record reference behavior for the drawing family and a release performance baseline for
-      drawings.
-- [x] Typed schema conventions (parameter and property descriptors: name, type, range, default)
-      shared by drawings and studies.
-- [x] Drawing split into a common core plus a typed per-kind option block; property exceptions
-      recorded per tool in the catalog.
-- [x] Identity and state: stable ID, name, group, revision, visible, locked, z-order operations,
-      per-interval visibility.
-- [x] Stroke, line ends, extension and fill properties from the F5 contract.
-- [x] One shared text layout path (measurement, alignment, placement, box, clipping, wrap) used by
-      every tool; the existing trend-line text becomes one instance of it.
-- [x] Toggleable labels and statistics per tool, with label positions.
-- [x] Numeric anchor read/write, scale and pane binding, and magnet modes (off, weak, strong).
-- [x] Level-list contract (values, colors, visibility, styles, fills between levels) ready for B8
-      level tools.
-- [x] Atomic property patches validated against the schema; each property change is one undo/redo
-      entry.
-- [x] Style templates as data: per-tool default overrides, named templates, validation,
-      export/import.
-- [x] Management: object tree snapshot, multi-select, group move/lock/hide, clone, copy/paste
-      payloads, bulk remove, and cross-cell sync through revisioned payloads without echo loops.
-- [x] All ten existing tools migrated to the contract.
-- [x] Lossless persistence migration from V1/V2 drawings.
-- [x] Executor parity fixtures for text on lines, shapes and level tools.
-- [x] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [x] 记录绘图族的参考行为，以及绘图的 release 性能基线。
+- [x] 类型化 schema 约定（参数与属性描述符：名称、类型、范围、默认值），由绘图与研究共享。
+- [x] 绘图拆分为公共核心加类型化的按种类选项块；属性例外按工具记录在目录中。
+- [x] 标识与状态：稳定 ID、名称、分组、修订号、可见、锁定、z 序操作、按周期可见性。
+- [x] F5 契约中的描边、线端、延伸与填充属性。
+- [x] 一条共享的文本布局路径（度量、对齐、放置、文本框、裁剪、换行），由每个工具使用；现有趋势线文本成为它的一个实例。
+- [x] 每个工具可开关的标签与统计信息，并带有标签位置。
+- [x] 数值锚点读写、比例尺与窗格绑定，以及磁吸模式（关闭、弱、强）。
+- [x] 价位列表契约（数值、颜色、可见性、样式、价位之间的填充），为 B8 的价位工具做好准备。
+- [x] 经 schema 校验的原子属性补丁；每次属性变更对应一条撤销/重做记录。
+- [x] 作为数据的样式模板：按工具的默认值覆盖、命名模板、校验、导出/导入。
+- [x] 管理：对象树快照、多选、分组移动/锁定/隐藏、克隆、复制/粘贴载荷、批量移除，以及通过带修订号的载荷实现的跨单元格同步（无回声循环）。
+- [x] 全部十个现有工具均已迁移到该契约。
+- [x] 从 V1/V2 绘图进行的无损持久化迁移。
+- [x] 针对线上文本、形状和价位工具的执行器一致性夹具。
+- [x] 已更新 `docs/Architecture.md`；完整门禁通过；批次已提交并推送。
 
-Evidence: the bounded `thousand_mostly_offscreen_drawings_bound_frame_and_hit_work` fixture is
-the release drawing-work baseline; typed schema/state, clipboard/z-order, persistence, label and
-frame parity fixtures are in the engine test suite. Native and WASM builds expose the same typed
-schema, templates, object tree and sync payload operations.
+证据：有界的 `thousand_mostly_offscreen_drawings_bound_frame_and_hit_work` 夹具是 release 绘图工作量基线；类型化 schema/状态、剪贴板/z 序、持久化、标签与帧一致性夹具位于引擎测试套件中。原生与 WASM 构建暴露相同的类型化 schema、模板、对象树和同步载荷操作。
 
-**Exit:** the F5 exit criterion passes: every existing tool supports the common contract, a host
-builds a generic property panel from schemas alone, and old layouts migrate.
+**退出标准：** F5 的退出标准通过：每个现有工具均支持公共契约，宿主仅凭 schema 即可构建通用属性面板，且旧布局可迁移。
 
-### B3 — Shared tape and order flow
+### B3 — 共享成交带与订单流
 
-**Scope:** F2, OF1, OF2, OF11, OF12, PD10. **Depends on:** the existing footprint.
-**Status:** complete (2026-09-26).
+**范围：** F2、OF1、OF2、OF11、OF12、PD10。**依赖：** 现有足迹图。**状态：** 已完成（2026-09-26）。
 
-- [x] Record reference behavior and release baselines for footprint and tape-derived studies.
-- [x] **F2** Chart-level trade stream handle keyed by host instrument stream; footprint rebound to
-      it; classification once per event; revisions; per-dependent incremental state with a rebuild
-      path; memory telemetry per stream and per dependent. Checkpoints are designed so F1 bars and
-      PD2 seeks can use them.
-- [x] **OF1** Cumulative volume delta pane (candles or line; session, continuous and anchored
-      reset).
-- [x] **OF2** Bar delta histogram, delta %, max/min delta and buy/sell/unknown volume split.
-- [x] **OF11** Large-trade bubbles and volume dots with size by volume, color by side, threshold
-      filters and consecutive-print aggregation, on a bounded marker primitive path.
-- [x] **OF12** Footprint variants: profile-in-bar, volume ladder, horizontal imbalance, delta-only
-      and bid/ask histogram cells.
-- [x] **PD10** Release benchmarks for dense footprint text on GPUI and WebGPU; shared caching of
-      repeated numeric runs where measurement shows shaping dominates; budgets added to `perf_gate`.
-- [x] Early F1 design note in `docs/Architecture.md` so later work does not assume the second-based
-      axis.
-- [x] Full gate green; benchmark gate changes committed and pushed; milestone evidence recorded.
-- [x] Milestone evidence: screenshots, accessibility review and recorded benchmarks for order flow.
+- [x] 记录足迹图与成交带派生研究的参考行为和 release 基线。
+- [x] **F2** 以宿主品种流为键的图表级成交流句柄；足迹图重新绑定到该句柄；每个事件仅分类一次；修订号；每个依赖方的增量状态并带重建路径；按流和按依赖方的内存遥测。检查点的设计使 F1 柱和 PD2 定位可以使用它们。
+- [x] **OF1** 累计成交量 delta 窗格（K 线或折线；按交易时段重置、连续重置和锚定重置）。
+- [x] **OF2** 每柱 delta 直方图、delta %、最大/最小 delta，以及买入/卖出/未知成交量拆分。
+- [x] **OF11** 大额成交气泡与成交量圆点：按成交量决定大小、按方向决定颜色，带阈值过滤与连续成交聚合，运行在有界的标记图元路径上。
+- [x] **OF12** 足迹图变体：柱内分布、成交量价位梯、水平失衡、仅 delta 以及 bid/ask 直方图单元。
+- [x] **PD10** GPUI 与 WebGPU 上密集足迹图文字的 release 基准测试；在测量表明文本整形占主导时，对重复数字文本段进行共享缓存；预算已加入 `perf_gate`。
+- [x] 在 `docs/Architecture.md` 中提前加入 F1 设计说明，使后续工作不会假定基于秒的坐标轴。
+- [x] 完整门禁通过；基准测试门禁的变更已提交并推送；里程碑证据已记录。
+- [x] 里程碑证据：订单流的截图、无障碍评审和已记录的基准测试。
 
-Implementation evidence so far: `chart_trade_stream_is_shared_by_bound_footprint_dependents`,
-`cvd_and_delta_dependents_follow_late_corrections_and_report_rebuilds`,
-`trade_bubbles_are_bounded_and_rebuilt_from_the_shared_tape`, and
-`footprint_retention_evicts_shared_studies_with_the_same_bar_boundary` cover shared revisions,
-derived-study updates, bounded markers, and retention. Rust, WASM, and TypeScript APIs expose the
-same stream/dependent contracts. The native release `perf_gate` now exercises the shared-study tape,
-tip/correction paths, retention, and dependent incremental work. The release
-`aeris_charts_render_gpui/examples/plan_bench` also includes a deterministic detailed-LOD footprint
-fixture and reports primitive/text counts plus p50/p95/p99 scene-lowering cost. That benchmark
-stops at GPUI scene construction, while native `perf_gate` Target J covers WebGPU CPU-side
-frame encoding and verifies every resolved dense text run is scheduled. Neither benchmark covers
-native window shaping or actual GPU present time; `gpui_probe` now accepts
-`AERIS_CHARTS_PROBE_FEATURE=footprint` for that real-window capture (it prints no frame data). The screenshot and accessibility milestone is recorded in `docs/Footprint.md`. The
-screenshot harness accepts
-`AERIS_CHARTS_GPUI_FEATURE=footprint` and emits a DPR-aware PNG plus metadata for the dense
-12-bar fixture; the capture has been exercised on the current Windows display after fixing the
-harness to pass the configured frame background through the GPUI prepared frame. The observed
-30-frame footprint probe run is recorded in `docs/Footprint.md`; it remains machine-specific
-evidence, not a portable budget. The current release gate also verifies the WebGPU executor path:
-Target J schedules all 120 resolved dense text runs and measures 0.00 ms p99 CPU-side frame
-encoding against the 2.00 ms budget; the browser footprint suite passes its six Chromium cases,
-including the WebGPU shared-frame case. The GPUI probe remains machine-specific evidence, while
-the portable release budget is now covered for both executor sides.
+目前的实现证据：`chart_trade_stream_is_shared_by_bound_footprint_dependents`、`cvd_and_delta_dependents_follow_late_corrections_and_report_rebuilds`、`trade_bubbles_are_bounded_and_rebuilt_from_the_shared_tape` 和 `footprint_retention_evicts_shared_studies_with_the_same_bar_boundary` 覆盖共享修订号、派生研究更新、有界标记和保留。Rust、WASM 和 TypeScript API 暴露相同的流/依赖方契约。原生 release `perf_gate` 现在会演练共享研究成交带、末端/更正路径、保留以及依赖方的增量工作。release 版 `aeris_charts_render_gpui/examples/plan_bench` 还包含一个确定性的详细 LOD 足迹图夹具，并报告图元/文本数量以及 p50/p95/p99 场景转换开销。该基准测试止于 GPUI 场景构建，而原生 `perf_gate` Target J 覆盖 WebGPU 的 CPU 侧帧编码，并验证每个已解析的密集文本段都已被调度。两个基准测试均不覆盖原生窗口的文本整形或实际的 GPU 呈现时间；`gpui_probe` 现在接受 `AERIS_CHARTS_PROBE_FEATURE=footprint` 用于该真实窗口捕获（它不打印帧数据）。截图与无障碍里程碑记录在 `docs/features/footprint.md` 中。截图工具接受 `AERIS_CHARTS_GPUI_FEATURE=footprint`，并为密集的 12 柱夹具输出感知 DPR 的 PNG 及元数据；在修复该工具、使其通过 GPUI 准备帧传递已配置的帧背景之后，该捕获已在当前 Windows 显示器上演练过。观察到的 30 帧足迹图探测运行记录在 `docs/features/footprint.md` 中；它仍然只是特定机器上的证据，而非可移植的预算。当前 release 门禁也验证 WebGPU 执行器路径：Target J 调度全部 120 个已解析的密集文本段，并测得 CPU 侧帧编码 p99 为 0.00 ms，对照 2.00 ms 的预算；浏览器足迹图测试套件通过其六个 Chromium 用例，包括 WebGPU 共享帧用例。GPUI 探测仍是特定机器上的证据，而可移植的 release 预算现在已覆盖两侧执行器。
 
-**Exit:** the F2 exit criterion passes (footprint and CVD share one tape, a late trade updates both,
-retention evicts both), and PD10 budgets hold on GPUI.
+**退出标准：** F2 的退出标准通过（足迹图与 CVD 共享同一成交带，迟到的成交会同时更新二者，保留策略会同时淘汰二者），且 PD10 预算在 GPUI 上成立。
 
-### B4 — Study inputs and core indicators
+### B4 — 研究输入与核心指标
 
-**Scope:** F4, OF9, CT1, CT2, CT6, indicator tier I1. **Depends on:** B2 schema conventions.
-**Status:** complete (2026-09-26).
+**范围：** F4、OF9、CT1、CT2、CT6，以及指标梯队 I1。**依赖：** B2 的 schema 约定。**状态：** 已完成（2026-09-26）。
 
-- [x] **F4** `IndicatorInput` gains open; selectable sources (open, high, low, close, hl2, hlc3,
-      ohlc4, hlcc4, any indicator output); multi-input bindings with typed validation; typed
-      parameter schemas and output descriptors; per-output style persisted; study bindings in the
-      next persistence schema version.
-- [x] **F4 exit fixture slice:** RSI of hlc3, SMA of RSI and Bollinger fill values/styles and the
-      resulting engine frame round-trip through persistence; Canvas2D/WebGPU and Canvas2D/GPUI
-      draw-stream parity fixtures cover the chain, while full render parity remains part of the
-      aggregate F4 exit.
-- [x] **OF9** VWAP standard-deviation and percent bands with session, weekly and monthly reset.
-- [x] **CT1** Hollow candles, columns, high-low bars, step line, line with markers.
-- [x] **CT2** Heikin Ashi with real OHLC exposed separately for trading and crosshair.
-- [x] **CT6** Symbol comparison overlays with a shared comparison anchor and per-symbol legend
-      values.
-- [x] **I1 moving-average catalog:** HMA, VWMA, DEMA, TEMA, SMMA/RMA.
-- [x] **I1 Hull moving-average slice:** HMA with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 moving average slice:** DEMA with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 Wilder moving-average slice:** SMMA/RMA with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 trend:** Ichimoku.
-- [x] **I1 trend slice:** ADX/DMI with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 trend slice:** Parabolic SAR with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 trend slice:** SuperTrend with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 trend slice:** Ichimoku with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 channels and volatility:** Keltner Channels.
-- [x] **I1 volatility slice:** population standard deviation with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 channel slice:** Donchian Channels with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 channel slice:** Keltner Channels with EMA/ATR pure, incremental, schema, persistence and package coverage.
-- [x] **I1 oscillator slice:** CCI with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 oscillator slice:** Williams %R with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 oscillator slice:** Stochastic RSI with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 oscillator slice:** ROC and Momentum with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 volume slice:** OBV with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 volume slice:** CMF with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 volume slice:** MFI with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 oscillators:** CCI, Williams %R, Stochastic RSI, ROC/Momentum, MFI.
-- [x] **I1 volume:** Volume study with MA.
-- [x] **I1 levels slice:** daily UTC previous-session pivot points (standard, Fibonacci, Camarilla,
-      Woodie, DeMark) with pure, incremental, schema, persistence and package coverage.
-- [x] **I1 levels slice:** ZigZag with percentage-deviation turning points, pure, incremental,
-      schema, persistence and package coverage.
-- [x] **I1 levels:** pivot points (standard, Fibonacci, Camarilla, Woodie, DeMark), ZigZag.
-- [x] Every indicator has incremental state, rebuild equivalence, a typed schema, persistence and an
-      independently computed reference fixture.
-- [x] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [x] **F4** `IndicatorInput` 新增 open；可选来源（open、high、low、close、hl2、hlc3、ohlc4、hlcc4、任意指标输出）；带类型化校验的多输入绑定；类型化参数 schema 与输出描述符；按输出持久化的样式；研究绑定写入下一个持久化 schema 版本。
+- [x] **F4 退出夹具切片：** hlc3 的 RSI、RSI 的 SMA 以及 Bollinger 填充的值/样式，连同所得的引擎帧，均可经持久化往返；Canvas2D/WebGPU 与 Canvas2D/GPUI 的绘制流一致性夹具覆盖该链路，而完整的渲染一致性仍属于 F4 总体退出标准的一部分。
+- [x] **OF9** VWAP 标准差带与百分比带，支持按交易时段、每周和每月重置。
+- [x] **CT1** 空心蜡烛、柱状图、高低柱、阶梯线、带标记的折线。
+- [x] **CT2** Heikin Ashi，真实 OHLC 单独暴露给交易与十字光标使用。
+- [x] **CT6** 品种对比叠加层，带共享的对比锚点和按品种的图例值。
+- [x] **I1 移动平均目录：** HMA、VWMA、DEMA、TEMA、SMMA/RMA。
+- [x] **I1 Hull 移动平均切片：** HMA，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 移动平均切片：** DEMA，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 Wilder 移动平均切片：** SMMA/RMA，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 趋势：** Ichimoku。
+- [x] **I1 趋势切片：** ADX/DMI，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 趋势切片：** Parabolic SAR，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 趋势切片：** SuperTrend，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 趋势切片：** Ichimoku，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 通道与波动率：** Keltner Channels。
+- [x] **I1 波动率切片：** 总体标准差，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 通道切片：** Donchian Channels，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 通道切片：** 基于 EMA/ATR 的 Keltner Channels，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 振荡器切片：** CCI，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 振荡器切片：** Williams %R，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 振荡器切片：** Stochastic RSI，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 振荡器切片：** ROC 与 Momentum，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 成交量切片：** OBV，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 成交量切片：** CMF，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 成交量切片：** MFI，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 振荡器：** CCI、Williams %R、Stochastic RSI、ROC/Momentum、MFI。
+- [x] **I1 成交量：** 带 MA 的成交量研究。
+- [x] **I1 价位切片：** 每日 UTC 前一交易时段枢轴点（标准、斐波那契、Camarilla、Woodie、DeMark），具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 价位切片：** ZigZag，带百分比偏差转折点，具备纯计算、增量、schema、持久化与包覆盖。
+- [x] **I1 价位：** 枢轴点（标准、斐波那契、Camarilla、Woodie、DeMark）、ZigZag。
+- [x] 每个指标都具备增量状态、重建等价性、类型化 schema、持久化，以及独立计算的参考夹具。
+- [x] 已更新 `docs/Architecture.md`；完整门禁通过；批次已提交并推送。
 
-**Exit:** the F4 exit criterion passes (RSI of hlc3, SMA of that RSI and a Bollinger band fill
-round-trip through persistence and render identically on every executor) and every I1 fixture
-matches its reference.
+**退出标准：** F4 的退出标准通过（hlc3 的 RSI、该 RSI 的 SMA 以及 Bollinger 带填充可经持久化往返，并在每个执行器上渲染一致），且每个 I1 夹具都与其参考值一致。
 
-Implementation evidence so far: the F4 foundation now carries the open OHLC column through
-`IndicatorInput`, exposes close/open/high/low plus hl2/hlc3/ohlc4/hlcc4 scalar sources, retains
-output identities when a binding is rebound, and publishes typed parameter/output schemas. VWAP
-multi-input bindings reject missing, duplicate, non-scalar, and stale volume sources before any
-state is created. The engine, WASM shell and TypeScript package expose the explicit-source path and
-bounded schema query; existing convenience methods remain close-based. Indicator outputs now also expose and atomically
-replace a compact engine-owned style snapshot, preserving per-output presentation independently
-of binding kind. VWAP's optional volume input now aligns by exact timestamp and keeps missing rows
-on the documented unit-weight fallback. OF9 now adds five engine-owned VWAP-band outputs with
-session, weekly and monthly reset keys, weighted population-deviation bands and percentage bands;
-pure-math and incremental rebuild tests cover the monthly reference path. Typed multi-input
-validation now rejects invalid VWAP volume bindings atomically. Financial persistence V3 now
-round-trips ordered study dependencies, scalar inputs, volume references and per-output styles while
-leaving market data host-owned. The Terminal host bridge carries each
-runtime study's transitive typed trade/quote/depth stream requirements beside
-the bounded scalar publication, so downstream chart presentation can retain
-binding metadata without a second tape or book. The final B4 docs/full-gate
-closure is now verified. DEMA, TEMA, SMMA/RMA, HMA, VWMA,
-standard deviation, CCI, Williams %R, Stochastic RSI, ROC, Momentum, Donchian Channels, Keltner Channels, ADX/DMI, Parabolic SAR, SuperTrend, Ichimoku are
-OBV, CMF, MFI, the volume/MA study, daily previous-session pivot points and percentage-deviation
-ZigZag are now exposed through the engine, WASM and TypeScript APIs, with pure and incremental
-rebuild coverage. The all-runtime-mutation fixture exercises every current indicator state,
-including pivot, ZigZag and VWAP bands, and the fixed-value reference fixture covers every output
-family and pivot variant. Engine persistence and full-recompute fixtures cover the same catalog;
-the completed B4 closure includes the host-owned F4 trade/depth binding bridge. CT6 now
-uses one bounded chart-level comparison anchor for percentage/indexed geometry and exposes an
-engine-owned per-series legend snapshot; the Rust fixture and browser public API path cover exact
-anchor values, latest values, and percent changes without duplicating canonical rows. CT1's
-histogram columns, transparent-body hollow candles, stepped lines, point markers, and high-low
-bars are covered by shared frame fixtures plus the browser package path; the bar path exposes a
-typed `close_visible` style flag through Rust, WASM and TypeScript so disabling both OHLC ticks
-produces a high-low bar while retaining its vertical range body. Browser compatibility coverage
-round-trips the high-low, stepped-line, and point-marker options; existing backend parity and GPUI
-matrix fixtures cover marker execution across Canvas2D, WebGPU, and GPUI.
-CT2 keeps raw OHLC canonical for `series_data`, crosshair, and trading while an engine-owned,
-generation-keyed Heikin Ashi projection feeds candlestick geometry, autoscale, last-value chrome,
-and candle direction colors; engine and browser fixtures verify the projection and raw-data split.
+目前的实现证据：F4 基础现在通过 `IndicatorInput` 携带 open OHLC 列，暴露 close/open/high/low 以及 hl2/hlc3/ohlc4/hlcc4 标量来源，在绑定被重新绑定时保留输出标识，并发布类型化的参数/输出 schema。VWAP 多输入绑定会在创建任何状态之前，拒绝缺失、重复、非标量以及过期的成交量来源。引擎、WASM 外壳和 TypeScript 包暴露显式来源路径和有界 schema 查询；现有的便捷方法仍基于 close。指标输出现在还暴露并可原子替换一份由引擎拥有的紧凑样式快照，使按输出的呈现独立于绑定类型而保留。VWAP 的可选成交量输入现在按精确时间戳对齐，并对缺失的行沿用已文档化的单位权重回退。OF9 现在新增五个由引擎拥有的 VWAP 带输出，带有交易时段、每周和每月重置键，以及加权总体偏差带和百分比带；纯数学与增量重建测试覆盖每月参考路径。类型化多输入校验现在会原子地拒绝无效的 VWAP 成交量绑定。金融持久化 V3 现可往返有序的研究依赖、标量输入、成交量引用以及按输出的样式，同时市场数据仍由宿主拥有。Terminal 宿主桥在有界标量发布之外，还携带每个运行时研究的传递性类型化成交/报价/深度流需求，因此下游图表呈现无需第二份成交带或订单簿即可保留绑定元数据。B4 最终的文档/完整门禁收尾现已验证。DEMA、TEMA、SMMA/RMA、HMA、VWMA、标准差、CCI、Williams %R、Stochastic RSI、ROC、Momentum、Donchian Channels、Keltner Channels、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、OBV、CMF、MFI、成交量/MA 研究、每日前一交易时段枢轴点和百分比偏差 ZigZag 现已通过引擎、WASM 和 TypeScript API 暴露，并具备纯计算与增量重建覆盖。全运行时变更夹具会演练当前每一种指标状态，包括枢轴点、ZigZag 和 VWAP 带，而固定值参考夹具覆盖每个输出族和每种枢轴点变体。引擎持久化与全量重算夹具覆盖相同的目录；已完成的 B4 收尾包含由宿主拥有的 F4 成交/深度绑定桥。CT6 现在为百分比/指数化几何使用一个有界的图表级对比锚点，并暴露由引擎拥有的按系列图例快照；Rust 夹具与浏览器公共 API 路径覆盖精确的锚点值、最新值和百分比变化，且不复制规范行。CT1 的直方图柱状图、透明主体空心蜡烛、阶梯线、点标记和高低柱由共享帧夹具及浏览器包路径覆盖；柱路径通过 Rust、WASM 和 TypeScript 暴露类型化的 `close_visible` 样式标志，因此同时关闭两个 OHLC 刻线会得到高低柱，同时保留其垂直范围主体。浏览器兼容性覆盖对高低柱、阶梯线和点标记选项进行往返验证；现有的后端一致性夹具与 GPUI 矩阵夹具覆盖 Canvas2D、WebGPU 和 GPUI 上的标记执行。CT2 让原始 OHLC 保持为 `series_data`、十字光标和交易的规范数据，同时由引擎拥有、以代次为键的 Heikin Ashi 投影为蜡烛几何、自动缩放、最新值界面元素和蜡烛方向颜色提供数据；引擎与浏览器夹具验证该投影与原始数据的分离。
 
-### B5 — Non-time bars and replay
+### B5 — 非时间柱与回放
 
-**Scope:** F1, OF14, CT3, CT4, PD2 for bars and tape. **Depends on:** B3. **Status:** complete (2026-09-27).
+**范围：** F1、OF14、CT3、CT4，以及针对柱与成交带的 PD2。**依赖：** B3。**状态：** 已完成（2026-09-27）。
 
-This is the largest architectural change in the plan.
+这是本计划中最大的一项架构变更。
 
-- [x] **F1** Bar-sequence domain: each logical index is a bar with open and close time in
-      microseconds; labels, crosshair, ticks and gaps derive from bar times; drawings, alerts,
-      trading lines and markers store bar plus time and rebase on prepend and rebuild; declared
-      rules for which series may share a non-time pane.
-- [x] One shared tick, volume and range aggregator used by candles and footprint; footprint
-      trade-count and volume policies become chart-integrated.
-- [x] **OF14 / CT3** Tick, volume and range candles, with footprint on the same bars.
-- [x] **CT4** Renko (fixed box or ATR), Line Break, Kagi, Point & Figure.
-- [x] **PD2** Replay clock supplied by the host; replay cursor; masking of everything after the
-      clock in every series, study, footprint cell and marker; checkpoint-based seek backward with
-      reported cost; bulk ordered ingest for trades and bars; live and replay share code paths.
-- [x] PD7 no-look-ahead verified in replay fixtures.
-- [x] `perf_gate` covers tip append without rebuilding closed bars and 100× replay with flat memory.
-- [x] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [x] **F1** 柱序列域：每个逻辑索引对应一根柱，带有以微秒表示的开盘时间和收盘时间；标签、十字光标、刻度和间隙均由柱时间派生；绘图、告警、交易线和标记同时存储柱与时间，并在前置插入与重建时重新定基；声明哪些系列可以共用非时间窗格的规则。
+- [x] 由 K 线和足迹图共用的同一个 Tick、成交量和区间聚合器；足迹图的成交笔数与成交量策略纳入图表集成。
+- [x] **OF14 / CT3** Tick、成交量和区间 K 线，足迹图位于同一批柱上。
+- [x] **CT4** Renko（固定砖块或 ATR）、Line Break、Kagi、Point & Figure。
+- [x] **PD2** 由宿主提供的回放时钟；回放游标；在每个系列、研究、足迹图单元格和标记中遮蔽时钟之后的全部内容；基于检查点的向后定位，并报告其开销；面向成交和柱的批量有序写入；实时与回放共用代码路径。
+- [x] PD7 无前视已在回放夹具中验证。
+- [x] `perf_gate` 覆盖不重建已收盘柱的末端追加，以及内存持平的 100× 回放。
+- [x] `docs/Architecture.md` 已更新；完整门禁通过；批次已提交并推送。
 
-Current F1 slice (2026-09-26): the existing engine-owned footprint aggregator now publishes a
-logical bar index with each bar's full-resolution open/close microsecond bounds through a
-read-only `bar_sequence` view. `BarSequenceMapping` now rebases anchors across ordered
-prepend/rebuild sequences without collapsing duplicate second labels. This records the identity
-boundary for the non-time axis, and the shared footprint aggregator now validates tick-grid range
-bar boundaries. The chart engine now projects trade-count, volume, and range footprint bars through
-chart-local logical row keys with a full-resolution sequence sidecar; the WASM and TypeScript APIs
-round-trip those policies, and native/browser fixtures cover labels, crosshair lookup, and logical
-keys. Non-time tip updates now replace only the affected suffix (with a full path when retention
-can shift the prefix), and derived delta studies and trade-bubble markers use the same logical keys.
-Value queries and transient trading/event overlays now resolve timestamp labels through the same
-sidecar. Non-time sequence rebuilds also rebase committed, pending, drag, brush, and drawing-history
-logical anchors through the full-resolution bar mapping, and persistence now carries an optional
-bounded open/close-microsecond sidecar for those drawing anchors. Ordinary candlestick and OHLC-bar
-series can now bind to the same chart-level stream as footprint and studies; stream-identity bulk
-replacement and live batches classify and aggregate once, then update every dependent through the
-same full or incremental path. The binding rejects scalar presentations and independent retention
-caps that would misalign the shared logical domain. Engine and packaged-browser fixtures cover
-trade-count and volume candles, stream-only ingestion, logical-axis growth, and dependent telemetry.
-The same sequence owner now builds fixed-box and Wilder-ATR Renko, N-line Break, Kagi, and
-Point & Figure projections from bounded canonical OHLC source rows. Ordered source updates replace
-only the affected projection suffix, replay rebuilds from the eligible source prefix, and Kagi and
-Point & Figure lower to the shared draw-list contract without backend-specific state.
-The chart-wide PD2 clock now masks ordinary host rows, indicators, every shared-tape dependent,
-sparse stepped releases, and transient host/trading events without discarding canonical future
-input. One shared replay cursor is emitted through the ordered frame. Forward movement uses the
-ordinary live update path; backward seeks restore the nearest 1,024-trade checkpoint from a bounded
-64-checkpoint set and report only replayed suffix work. Columnar `update_typed` and typed trade
-batches are the bulk replay boundaries. Engine and packaged-browser fixtures verify no-look-ahead,
-checkpoint equivalence, future-ingest isolation, and clipped host windows. The release `perf_gate`
-passes 100× replay at 1.25 ms per clock-advance/frame on the measured machine with flat
-steady-state retained memory. The final B5 run passed the complete Rust, WASM/package, GPUI
-parity/replay, Chromium, and release-performance gates.
+当前 F1 切片（2026-09-26）：现有的由引擎拥有的足迹图聚合器，现通过只读的 `bar_sequence` 视图发布逻辑柱索引，以及每根柱的全分辨率开盘/收盘微秒边界。`BarSequenceMapping` 现可在有序的前置插入/重建序列中重新定基锚点，且不会合并重复的秒级标签。这确立了非时间轴的标识边界，且共享的足迹图聚合器现会校验刻度网格上的区间柱边界。图表引擎现通过图表本地的逻辑行键及全分辨率序列附带数据投影成交笔数、成交量和区间足迹柱；WASM 与 TypeScript API 可往返传递这些策略，原生/浏览器夹具覆盖标签、十字光标查找和逻辑键。非时间末端更新现仅替换受影响的后缀（当保留策略可能移动前缀时走完整路径），派生的 delta 研究和成交气泡标记使用同样的逻辑键。取值查询和临时的交易/事件叠加层现通过同一份附带数据解析时间戳标签。非时间序列重建还会通过全分辨率柱映射，对已提交、待定、拖动、画笔和绘图历史中的逻辑锚点重新定基，持久化现也为这些绘图锚点携带可选的、有界的开盘/收盘微秒附带数据。普通 K 线和 OHLC 柱系列现可绑定到与足迹图和研究相同的图表级流；按流标识的批量替换和实时批量只分类、聚合一次，然后通过相同的完整或增量路径更新每个依赖项。该绑定会拒绝会使共享逻辑域错位的标量呈现形式和独立的保留上限。引擎与打包浏览器夹具覆盖成交笔数和成交量 K 线、仅流写入、逻辑坐标轴增长以及依赖项遥测。同一个序列拥有者现可基于有界的规范 OHLC 源数据行，构建固定砖块和 Wilder-ATR 的 Renko、N-line Break、Kagi 以及 Point & Figure 投影。有序的源更新只替换受影响的投影后缀，回放从符合条件的源前缀重建，Kagi 与 Point & Figure 转换为共享的绘制列表契约，不带后端专属状态。图表范围的 PD2 时钟现会遮蔽普通宿主数据行、指标、每个共享成交带依赖项、稀疏的阶梯式发布数据以及临时的宿主/交易事件，且不丢弃规范的未来输入。一个共享的回放游标通过有序帧输出。向前移动使用普通的实时更新路径；向后定位会从有界的 64 个检查点集合中恢复最近的 1,024 笔成交检查点，并只报告回放过的后缀工作量。列式 `update_typed` 和类型化成交批量是批量回放的边界。引擎与打包浏览器夹具验证无前视、检查点等价、未来写入隔离以及被裁剪的宿主窗口。release 版 `perf_gate` 在测量机器上以每次时钟推进/帧 1.25 ms 通过 100× 回放，稳态保留内存持平。B5 的最终运行通过了完整的 Rust、WASM/包、GPUI 一致性/回放、Chromium 以及 release 性能门禁。
 
-**Exit:** the F1 and PD2 exit criteria pass: many-bars-per-second and gap fixtures render on every
-executor, drawings survive prepend and rebuild, and seek-back equals a fresh load to the same
-clock.
+**退出标准**：F1 与 PD2 的退出标准通过：每秒多柱和间隙夹具在每个执行器上渲染，绘图在前置插入和重建后得以保留，向后定位的结果等同于重新加载到同一时钟。
 
-### B6 — Depth
+### B6 — 深度
 
-**Scope:** F3, OF15, OF16, OF17, OF18, PD8, PD9, PD2 for depth. **Depends on:** B3 and B5.
-**Status:** complete (2026-09-27).
+**范围**：F3、OF15、OF16、OF17、OF18、PD8、PD9，以及深度相关的 PD2。**依赖**：B3 与 B5。**状态**：已完成（2026-09-27）。
 
-- [x] **F3** Order-book model: snapshot and incremental level ingest with tick-grid validation,
-      sequence-gap detection with typed resync requests, bounded live book, time-bucketed history
-      ring, queries (best bid/ask, size at price, cumulative depth, imbalance), and typed columnar
-      WASM ingest.
-- [x] **PD8** Optional per-level order counts in depth ingest; typed microstructure event markers
-      (iceberg refill, pulled liquidity, size cluster, sweep) with caps and LOD collapse. Detection
-      stays in the platform.
-- [x] **OF15 / PD9** Liquidity heatmap with color scaling, thresholds and trades overlaid, lowered to
-      a texture/image primitive with incremental live-edge column updates on every executor.
-- [x] **OF16** DOM ladder data model for non-Aeris hosts.
-- [x] **OF17** Depth studies: book imbalance, cumulative depth curve, minimum-size and
-      distance-from-touch filters.
-- [x] **OF18** Time-and-sales view model for non-Aeris hosts.
-- [x] **PD2** Replay extended to depth checkpoints and heatmap buckets.
-- [x] `perf_gate` covers depth-update soak, heatmap frame and upload budgets.
-- [x] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
-- [x] Milestone evidence: screenshots, accessibility review and recorded benchmarks for depth.
+- [x] **F3** 订单簿模型：带刻度网格校验的快照与增量档位写入，带类型化重新同步请求的序列间隙检测，有界的实时订单簿，按时间分桶的历史环形缓冲区，查询（最优买价/卖价、指定价位的数量、累计深度、失衡），以及类型化列式 WASM 写入。
+- [x] **PD8** 深度写入中可选的逐档订单数；类型化微观结构事件标记（冰山单补充、撤出的流动性、数量聚集、扫单），带上限及细节层级（LOD）折叠。检测仍留在平台中。
+- [x] **OF15 / PD9** 流动性热力图，带颜色缩放、阈值并叠加成交，转换为纹理/图像图元，在每个执行器上支持增量的实时边缘列更新。
+- [x] **OF16** 面向非 Aeris 宿主的 DOM 价位梯数据模型。
+- [x] **OF17** 深度研究：订单簿失衡、累计深度曲线、最小数量与距盘口距离过滤器。
+- [x] **OF18** 面向非 Aeris 宿主的成交明细视图模型。
+- [x] **PD2** 回放扩展到深度检查点和热力图桶。
+- [x] `perf_gate` 覆盖深度更新浸泡测试、热力图帧预算与上传预算。
+- [x] `docs/Architecture.md` 已更新；完整门禁通过；批次已提交并推送。
+- [x] 里程碑证据：深度相关的截图、无障碍审查和已记录的基准测试。
 
-Implementation evidence: one keyed `DepthBook` owns fixed-grid bid/ask levels, exact provider
-sequence continuity, optional order counts, bounded near-touch retention, a bucket/cell-capped
-history ring, typed resync fencing, host event markers, replay tape and checkpoints. Ladder,
-cumulative-depth and imbalance queries derive from that owner; time and sales derives newest-first
-from the existing classified trade tape. The browser boundary ingests snapshots and batches through
-parallel typed arrays with split `u64` words and returns exact identities as decimal strings.
+实现证据：一个带键的 `DepthBook` 拥有固定网格的买/卖档位、精确的数据提供方序列连续性、可选的订单数、有界的近盘口保留、受桶/单元格上限约束的历史环形缓冲区、类型化重新同步围栏、宿主事件标记、回放成交带和检查点。价位梯、累计深度和失衡查询均派生自该拥有者；成交明细由现有的已分类成交带按最新优先派生。浏览器边界通过带有拆分 `u64` 字的并行类型化数组写入快照和批量数据，并以十进制字符串返回精确标识。
 
-The heatmap applies thresholds and color scaling before upload, packs finalized history into stable
-absolute 32-column images, and replaces only its one-column live edge on book updates. The shared
-underlay image and top-layer event primitives execute unchanged through Canvas2D, WebGPU, native,
-and GPUI; ordinary trade series remain above the heatmap. Replay restores the nearest capped
-1,024-event checkpoint, masks future ladder/study/heatmap/marker state without discarding live
-input, and reports suffix work.
+热力图在上传前应用阈值和颜色缩放，将已定稿的历史打包为稳定的绝对 32 列图像，并在订单簿更新时仅替换其单列实时边缘。共享的底层图像图元和顶层事件图元在 Canvas2D、WebGPU、原生和 GPUI 中原样执行；普通成交系列仍位于热力图之上。回放会恢复最近的、带上限的 1,024 事件检查点，遮蔽未来的价位梯/研究/热力图/标记状态而不丢弃实时输入，并报告后缀工作量。
 
-The final release Target L ran two 1.2-million-update passes: the worst 100,000-row batch was
-10.05 ms, frame construction was 0.34 ms, the 512-bucket view used 17 images, its live-edge payload
-was 512 bytes, and retained depth memory stayed flat at 66.03 MiB. The GPUI release adapter gate
-lowered the same dense heatmap's 17 image runs at 0.053 ms p99 against 2 ms. The focused browser
-fixture captured the WebGPU heatmap/marker view, and the unified accessibility contract remained
-green because depth adds no DOM focus target or live announcement. `docs/Depth.md` records the
-reproducible milestone details. The completed gate passed Rust fmt/clippy/tests, WASM lint,
-package build/type/API/namespace/release/pack checks, GPUI parity/replay, 302 Chromium tests with
-three intentional machine-only skips, and both release performance gates.
+最终的 release Target L 运行了两轮、每轮 120 万次更新：最差的 100,000 行批量耗时 10.05 ms，帧构建为 0.34 ms，512 桶视图使用了 17 张图像，其实时边缘载荷为 512 字节，保留的深度内存持平于 66.03 MiB。GPUI release 适配器门禁对同一密集热力图的 17 个图像段执行转换，p99 为 0.053 ms，对比 2 ms。针对性的浏览器夹具截取了 WebGPU 热力图/标记视图，统一的无障碍契约保持通过，因为深度功能不新增 DOM 焦点目标或实时播报。`docs/features/depth.md` 记录了可复现的里程碑细节。已完成的门禁通过了 Rust fmt/clippy/测试、WASM lint、包的构建/类型/API/命名空间/发布/打包检查、GPUI 一致性/回放、302 个 Chromium 测试（含三项有意保留的、仅限特定机器的跳过），以及两个 release 性能门禁。
 
-**Exit:** the F3, PD8 and PD9 exit criteria pass: deterministic book replay, gap fixtures request
-resync, flat memory under soak, and the heatmap holds the target refresh rate on GPUI within parity
-tolerance of the rectangle reference.
+**退出标准**：F3、PD8 与 PD9 的退出标准通过：确定性的订单簿回放，间隙夹具会请求重新同步，浸泡测试下内存持平，热力图在 GPUI 上保持目标刷新率，且处于与矩形参考实现的一致性容差之内。
 
-### B7 — Profiles and resampling
+### B7 — 分布与重采样
 
-**Scope:** F6, OF3–OF8, OF10, CT5. **Depends on:** B2, B3 and B4. **Status:** open.
+**范围**：F6、OF3–OF8、OF10、CT5。**依赖**：B2、B3 与 B4。**状态**：待交付。
 
-- [ ] **F6** Engine-owned OHLCV resampling with host-supplied session boundaries and explicit
-      timezone policy.
-- [ ] **OF3** Session, daily, weekly and composite volume profiles with developing POC/VAH/VAL.
-- [ ] **OF4** Fixed-range volume profile drawing.
-- [ ] **OF5** Anchored volume profile drawing.
-- [ ] **OF6** Naked POC and value-area extension until touched.
-- [ ] **OF7** Delta profile and bid/ask split profile.
-- [ ] **OF8** TPO / Market Profile: letters or blocks, initial balance, single prints, POC, value
-      area, split/merge sessions.
-- [ ] **OF10** Anchored VWAP drawing with bands.
-- [ ] **CT5** Higher-timeframe overlay candles.
-- [ ] Multi-timeframe study inputs (for example a daily RSI on a 5-minute chart).
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [ ] **F6** 引擎持有的 OHLCV 重采样，交易时段边界由宿主提供，并带有显式的时区策略。
+- [ ] **OF3** 交易时段、日、周及组合成交量分布，带动态演变的 POC/VAH/VAL。
+- [ ] **OF4** 固定区间成交量分布绘图。
+- [ ] **OF5** 锚定成交量分布绘图。
+- [ ] **OF6** 裸 POC 与价值区域延伸，直至被触及。
+- [ ] **OF7** Delta 分布与买/卖拆分分布。
+- [ ] **OF8** TPO / Market Profile：字母或色块、初始平衡区、单一印记、POC、价值区域、拆分/合并交易时段。
+- [ ] **OF10** 带有区带的锚定 VWAP 绘图。
+- [ ] **CT5** 更高周期叠加 K 线。
+- [ ] 多周期研究输入（例如在 5 分钟图表上使用日线 RSI）。
+- [ ] `docs/Architecture.md` 已更新；完整门禁通过；批次已提交并推送。
 
-**Exit:** tape and candle-mode profiles match reference fixtures, session boundaries come only from
-the host, and multi-timeframe studies rebuild deterministically.
+**退出标准**：成交带模式与 K 线模式的分布与参考夹具一致，交易时段边界仅来自宿主，多周期研究可确定性地重建。
 
-### B8 — Drawing catalog expansion
+### B8 — 绘图目录扩展
 
-**Scope:** every tool in the drawing catalog not yet delivered. **Depends on:** B2.
-**Status:** open.
+**范围**：绘图目录中尚未交付的每一个工具。**依赖**：B2。**状态**：待交付。
 
-Every tool implements the F5 contract with schema, persistence, hit-testing and executor parity.
+每个工具都按 F5 契约实现，包含 schema、持久化、命中测试和执行器一致性。
 
-- [ ] Lines: ray, extended line, info line, trend angle, cross line, arrow line.
-- [ ] Channels: parallel, regression trend, flat top/bottom, disjoint.
-- [ ] Fibonacci: retracement, trend-based extension, channel, time zones, trend-based time, speed
-      resistance fan and arcs, circles, spiral, wedge.
-- [ ] Pitchforks: Andrews, Schiff, modified Schiff, inside, pitchfan.
-- [ ] Projection and measuring: forecast, bars pattern, price range, date range, date and price
-      range, projection.
-- [ ] Annotations: anchored text, note, price note, callout, comment, price label, signpost, flag,
-      arrow markers, bounded icon stamps.
-- [ ] Gann: box, square, square fixed, fan.
-- [ ] Patterns: XABCD, cypher, ABCD, head and shoulders, triangle, three drives.
-- [ ] Elliott waves: impulse, correction, triangle, double and triple combinations with degree
-      labels.
-- [ ] Cycles: cyclic lines, time cycles, sine line.
-- [ ] Shapes: rotated rectangle, ellipse, circle, triangle, arc, curve, double curve, polyline,
-      highlighter, with shared geometry on every executor.
-- [ ] Full gate green; batch committed and pushed.
+- [ ] 线条：射线、延长线、信息线、趋势角度、十字线、箭头线。
+- [ ] 通道：平行、回归趋势、平顶/平底、分离。
+- [ ] 斐波那契：回撤、基于趋势的扩展、通道、时间区、基于趋势的时间、速度阻力扇形线与弧线、圆、螺旋、楔形。
+- [ ] 叉形线：Andrews、Schiff、修正 Schiff、内部、pitchfan。
+- [ ] 投影与测量：预测、柱形态、价格区间、日期区间、日期与价格区间、投影。
+- [ ] 标注：锚定文本、注释、价格注释、标注框、评论、价格标签、路标、旗标、箭头标记、有界图标印章。
+- [ ] 江恩：箱体、方形、固定方形、扇形。
+- [ ] 形态：XABCD、cypher、ABCD、头肩形、三角形、三驱动。
+- [ ] 艾略特波浪：推动浪、调整浪、三角形、双重与三重组合，带级别标签。
+- [ ] 周期：周期线、时间周期、正弦线。
+- [ ] 形状：旋转矩形、椭圆、圆、三角形、弧线、曲线、双重曲线、折线、荧光笔，在每个执行器上共享同一几何。
+- [ ] 完整门禁通过；批次已提交并推送。
 
-**Exit:** every catalog tool is placeable, editable through its schema, persisted and identical on
-every executor.
+**退出标准**：目录中的每个工具都可放置，可通过其 schema 编辑，可持久化，并且在每个执行器上表现一致。
 
-### B9 — Breadth and extension
+### B9 — 广度与扩展
 
-**Scope:** I2, I3, I4, OF13. **Depends on:** B3 and B4. **Status:** open.
+**范围**：I2、I3、I4、OF13。**依赖**：B3 与 B4。**状态**：待交付。
 
-- [ ] **I2** Breadth indicator tier (see Indicator catalog).
-- [ ] **I3** Structure tier: swing points, structure breaks, fair value gaps, order blocks,
-      session and previous-period levels, opening range.
-- [ ] **I4** Typed custom study API in Rust and TypeScript: inputs, parameters, outputs,
-      incremental update and rebuild; the engine owns scheduling, bounds, styles, persistence and
-      rendering.
-- [ ] **OF13** Unfinished auctions, absorption and exhaustion markers with documented,
-      parameterized, deterministic rules.
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
-- [ ] Milestone evidence: screenshots, accessibility review, competitor comparison and recorded
-      benchmarks for the whole plan.
+- [ ] **I2** 广度指标层级（见“指标目录”）。
+- [ ] **I3** 结构层级：摆动点、结构突破、公允价值缺口、订单块、交易时段与前一周期价位、开盘区间。
+- [ ] **I4** Rust 与 TypeScript 中的类型化自定义研究 API：输入、参数、输出、增量更新与重建；引擎拥有调度、界限、样式、持久化和渲染。
+- [ ] **OF13** 未完成拍卖、吸收与衰竭标记，规则有文档记录、参数化且确定。
+- [ ] `docs/Architecture.md` 已更新；完整门禁通过；批次已提交并推送。
+- [ ] 里程碑证据：整个计划的截图、无障碍审查、竞品对比和已记录的基准测试。
 
-**Exit:** the Definition of completion below is met.
+**退出标准**：满足下文的“完成定义”。
 
-## Scope and ownership
+## 范围与归属
 
-Headless means Aeris Charts owns semantics and pixels inside the chart, never application chrome:
+“无头”意味着 Aeris Charts 拥有图表内部的语义与像素，绝不拥有应用外壳：
 
-| Aeris Charts owns | Hosts own |
+| Aeris Charts 拥有 | 宿主拥有 |
 | --- | --- |
-| Validated data models (trades, depth, bars), aggregation, classification and derived studies | Market-data subscriptions, provider normalization, reconnection and resync requests |
-| Indicator and order-flow math, incremental updates, bounded caches | Symbol search, watchlists, exchange calendars and session definitions |
-| Drawing geometry, placement, handles, hit testing, snapping, text layout, undo/redo | Toolbars, settings dialogs, property panels, color pickers, context menus |
-| Typed option schemas, defaults, validation and style templates as data | Where templates are stored and how users pick them |
-| Persistence schemas and migrations for everything above | Account/cloud storage, cross-device sync, sharing |
-| Ordered backend-neutral frame output for every executor | Window, DOM or GPUI layout around the chart |
+| 经过校验的数据模型（成交、深度、柱）、聚合、分类和派生研究 | 行情订阅、数据提供方归一化、重连与重新同步请求 |
+| 指标与订单流的计算、增量更新、有界缓存 | 标的搜索、自选列表、交易所日历和交易时段定义 |
+| 绘图几何、放置、手柄、命中测试、磁吸、文本布局、撤销/重做 | 工具栏、设置对话框、属性面板、取色器、上下文菜单 |
+| 以数据形式提供的类型化选项 schema、默认值、校验和样式模板 | 模板存放位置及用户选取方式 |
+| 上述所有内容的持久化 schema 与迁移 | 账户/云存储、跨设备同步、分享 |
+| 面向每个执行器的有序、后端中立的帧输出 | 图表周围的窗口、DOM 或 GPUI 布局 |
 
-A feature is not delivered until a host can build its complete UI from typed engine APIs without
-reimplementing chart math, and every executor (GPUI, WebGPU, Canvas2D, native) renders it from the
-same ordered frame. [Architecture.md](../docs/Architecture.md) remains the authority for current
-ownership.
+在宿主能够基于类型化的引擎 API 构建其完整 UI、且无需重新实现图表计算，并且每个执行器（GPUI、WebGPU、Canvas2D、原生）都从同一有序帧渲染该功能之前，该功能不算已交付。[Architecture.md](../docs/Architecture.md) 仍是当前归属的权威依据。
 
-Aeris Terminal's `market_runtime` is the canonical owner of order books, trades and order-level
-(market-by-order) state. Engine stores such as F2 and F3 are chart-side projections of the
-platform's publications, never a second canonical market model. Aeris Terminal also owns these
-outside the chart, so they are not engine work for that host:
+Aeris Terminal 的 `market_runtime` 是订单簿、成交和逐笔委托级（market-by-order）状态的规范拥有者。F2 和 F3 这类引擎存储是图表侧对平台发布内容的投影，绝不是第二套规范行情模型。Aeris Terminal 在图表之外还拥有以下内容，因此它们不属于该宿主的引擎工作：
 
-- **DOM ladder.** A GPUI widget fed by the platform's canonical order book. OF16 remains for other
-  hosts, such as browser consumers.
-- **Time and sales.** Rendered by the platform from its own trade tape. OF18 remains for other
-  hosts.
-- **Trading lock for risk lockouts.** The host stops forwarding trading gestures
-  (`trading_drag_start_at` and related calls), rejects drained `take_trading_intents`, and shows the
-  lock in its own chrome. No engine state is required.
+- **DOM 价位梯**。由平台的规范订单簿驱动的 GPUI 控件。OF16 仍保留给其他宿主，例如浏览器使用方。
+- **成交明细**。由平台基于其自有成交带渲染。OF18 仍保留给其他宿主。
+- **用于风控锁定的交易锁**。宿主停止转发交易手势（`trading_drag_start_at` 及相关调用），拒绝已取出的 `take_trading_intents`，并在自己的应用外壳中显示该锁定。无需任何引擎状态。
 
-Out of scope: a Pine-style scripting language, a bundled UI kit, broker connectivity, datafeed
-adapters, and news/fundamental data fetching. Custom studies are covered by the typed extension
-API (I4) rather than an interpreter.
+范围之外：Pine 风格的脚本语言、捆绑的 UI 套件、券商连接、数据源适配器，以及新闻/基本面数据获取。自定义研究由类型化扩展 API（I4）覆盖，而不是解释器。
 
-## Current baseline
+## 当前基线
 
-Source-confirmed on 2026-09-24. This is the starting point, not a claim of completeness.
+已于 2026-09-24 经源码确认。这是起点，并不声称已完整。
 
-| Area | Present today | Evidence |
+| 领域 | 现状 | 证据 |
 | --- | --- | --- |
-| Footprint | Trade tape per series; aggressor classification (host side → quote → tick rule); bid/ask/unknown/total per level; Bid×Ask, Total and Delta cell modes; POC; diagonal and stacked imbalances; final/max/min delta; session cumulative delta per bar; three LODs; late-event and correction rebuild | `engine/src/footprint.rs`, `frame/footprint_geometry.rs`, [Footprint.md](../docs/Footprint.md) |
-| Footprint bar policies | Time, trade-count and volume aggregation in Rust; only whole-second time bars are chart-integrated | `FootprintBarAggregation`, Footprint.md §3 |
-| Volume profile | Visible-range profile computed from OHLCV candles; rows, value area, POC; at most 16 per chart; runtime-only | `engine/src/volume_profile.rs`, `indicators/src/volume_profile.rs` |
-| Series types | Candlestick, bar, line, area, histogram, baseline, custom, feature (grouped/stacked bars, heatmap, HLC area, pretty histogram, background shade, stacked area, whisker box), footprint | `SeriesKind`, `FeatureSeriesKind` |
-| Indicators | SMA, EMA, DEMA, TEMA, SMMA/RMA, HMA, VWMA, standard deviation, Donchian Channels, Keltner Channels, ADX/DMI, Parabolic SAR, SuperTrend, Ichimoku, EMA ribbon, WMA, Bollinger, RSI, MACD, Stochastic, ATR, VWAP; incremental state; outputs are ordinary series, so indicator-on-indicator chaining already works | `engine/src/indicators.rs`, `indicators/src/lib.rs` |
-| Indicator input | `IndicatorInput` carries times, high, low, close and volume only; no open, no selectable price source (hl2, hlc3, ohlc4) | `IndicatorInput` |
-| Drawing tools | Trend line, horizontal line, horizontal ray, vertical line, rectangle, text, brush, path, long position, short position; static tool catalog; magnet; straighten; bounded undo/redo | `drawings/tools.rs`, `drawings.rs` |
-| Drawing styling | Common drawing contract with typed kind-option projections, stroke caps/extensions/fill, shared text/label layout, interval visibility, magnet modes and bounded level lists | `drawing_contract.rs`, `Drawing`, `frame/drawings.rs` |
-| Drawing management | Selection, multi-select, lock/hide, z-order/group operations, naming, templates, clone/copy/paste, bulk removal, bounded undo/redo and revisioned sync payloads | `drawings.rs`, `drawing_contract.rs` |
-| Trading and alerts | Positions, orders, brackets/OCO, drag intents, bracket from position drawing; alert lines (host evaluates) | `trading.rs`, `alerts.rs` |
-| Trading labels | Order and position chips are engine-formatted (quantity, kind, PnL); no host-supplied label or badge text | `trading_geometry.rs` |
-| Markers and executions | Series markers (circle, square, arrow up/down with optional text, size and price); point markers on line/area; trading executions drawn as B/S circles | `Marker`, `set_series_markers`, `frame/series_geometry.rs`, `TradingExecution`, `frame/trading_geometry.rs` |
-| Line and scale variants | Stepped lines (`LineType::WithSteps`); hollow candles through transparent body colors; percentage and indexed-to-100 price scales; price lines with host titles | `draw_list.rs`, `price_scale_core.rs`, `PriceLine` |
-| Native primitives | Series-attached vertical line, text and image watermarks, volume-profile handle | `native_primitives.rs` |
-| General charts | Step interpolation, bubble, heatmap grid, column, axis-bound reference regions (general panes only, not the financial time axis) | `general_series.rs` |
-| Workspace | Split-grid of chart cells with stable identities | `workspace.rs` |
-| Persistence | V1 panes/drawings, V2 general datasets/series, V3 financial study bindings/styles; profiles remain host-recreated | `persistence.rs` |
-| Telemetry | WASM `frame_stats` (CPU/GPU ms, draw calls, rebuild counters, buffer traffic); `ChartEngine::memory_usage` structural attribution | `wasm/src/telemetry.rs`, `EngineMemoryUsage` |
-| Image export | Browser `take_screenshot` only; no native or GPUI image export | `packages/charts/src/types.ts` |
-| Order book / depth | **Absent.** No Level 2 model, DOM, or liquidity heatmap. The feature heatmap accepts only host-precomputed cells and lowers each cell to its own rectangle primitive | `FeatureSeriesKind::Heatmap`, `HeatmapCell` |
-| Non-time bars | **Absent on chart.** The shared time axis has one logical row per UTC second | Footprint.md §3 |
-| Cross-chart sync | Revisioned drawing payload export/import with source identity and stable drawing IDs; host routes payloads between cells without echoing | `drawing_contract.rs`, `drawings.rs` |
-| Replay | **Absent.** No playback cursor or future masking; hosts can only replace and append data | — |
+| 足迹图 | 每个系列一条成交带；主动方分类（宿主侧 → 报价 → Tick 规则）；每档买/卖/未知/合计；Bid×Ask、Total 和 Delta 单元格模式；POC；对角与堆叠失衡；最终/最大/最小 delta；每根柱的交易时段累计 delta；三档细节层级（LOD）；迟到事件与更正重建 | `engine/src/footprint.rs`, `frame/footprint_geometry.rs`, [足迹图](../docs/features/footprint.md) |
+| 足迹图柱策略 | Rust 中的时间、成交笔数和成交量聚合；仅整秒时间柱已纳入图表集成 | `FootprintBarAggregation`、[聚合与记账](../docs/features/footprint.md#3-聚合与记账) |
+| 成交量分布 | 基于 OHLCV K 线计算的可见范围分布；行、价值区域、POC；每个图表至多 16 个；仅运行时 | `engine/src/volume_profile.rs`, `indicators/src/volume_profile.rs` |
+| 系列类型 | K 线、柱、折线、面积、直方图、基线、自定义、feature（分组/堆叠柱、热力图、HLC 面积、美化直方图、背景底纹、堆叠面积、须箱）、足迹图 | `SeriesKind`, `FeatureSeriesKind` |
+| 指标 | SMA、EMA、DEMA、TEMA、SMMA/RMA、HMA、VWMA、标准差、Donchian Channels、Keltner Channels、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、EMA ribbon、WMA、Bollinger、RSI、MACD、Stochastic、ATR、VWAP；增量状态；输出是普通系列，因此指标叠指标的链式使用已可用 | `engine/src/indicators.rs`, `indicators/src/lib.rs` |
+| 指标输入 | `IndicatorInput` 仅携带时间、最高价、最低价、收盘价和成交量；没有开盘价，也没有可选的价格来源（hl2、hlc3、ohlc4） | `IndicatorInput` |
+| 绘图工具 | 趋势线、水平线、水平射线、垂直线、矩形、文本、画笔、路径、多头仓位、空头仓位；静态工具目录；磁吸；拉直；有界撤销/重做 | `drawings/tools.rs`, `drawings.rs` |
+| 绘图样式 | 通用绘图契约，含类型化的按绘图类型选项投影、描边端点/延伸/填充、共享的文本/标签布局、按周期可见性、磁吸模式以及有界的档位列表 | `drawing_contract.rs`, `Drawing`, `frame/drawings.rs` |
+| 绘图管理 | 选择、多选、锁定/隐藏、z 序/分组操作、命名、模板、克隆/复制/粘贴、批量移除、有界撤销/重做以及带修订号的同步载荷 | `drawings.rs`, `drawing_contract.rs` |
+| 交易与告警 | 仓位、订单、括号单/OCO、拖动意图、由仓位绘图创建括号单；告警线（由宿主评估） | `trading.rs`, `alerts.rs` |
+| 交易标签 | 订单与仓位徽标由引擎格式化（数量、类型、PnL）；不支持宿主提供的标签或徽章文本 | `trading_geometry.rs` |
+| 标记与成交 | 系列标记（圆形、方形、上/下箭头，可带可选文本、大小和价格）；折线/面积上的点标记；交易成交绘制为 B/S 圆圈 | `Marker`, `set_series_markers`, `frame/series_geometry.rs`, `TradingExecution`, `frame/trading_geometry.rs` |
+| 线型与比例尺变体 | 阶梯线（`LineType::WithSteps`）；通过透明实体颜色实现的空心 K 线；百分比与指数化为 100 的价格比例尺；带宿主标题的价格线 | `draw_list.rs`, `price_scale_core.rs`, `PriceLine` |
+| 原生图元 | 附着于系列的垂直线、文本与图像水印、成交量分布手柄 | `native_primitives.rs` |
+| 通用图表 | 阶梯插值、气泡、热力图网格、柱形、绑定坐标轴的参考区域（仅限通用窗格，不含金融时间轴） | `general_series.rs` |
+| 工作区 | 由具有稳定标识的图表单元格组成的分割网格 | `workspace.rs` |
+| 持久化 | V1 窗格/绘图，V2 通用数据集/系列，V3 金融研究绑定/样式；分布仍由宿主重建 | `persistence.rs` |
+| 遥测 | WASM `frame_stats`（CPU/GPU ms、绘制调用、重建计数器、缓冲区流量）；`ChartEngine::memory_usage` 结构化归因 | `wasm/src/telemetry.rs`, `EngineMemoryUsage` |
+| 图像导出 | 仅有浏览器的 `take_screenshot`；没有原生或 GPUI 图像导出 | `packages/charts/src/types.ts` |
+| 订单簿 / 深度 | **缺失**。没有 Level 2 模型、DOM 或流动性热力图。feature 热力图仅接受宿主预先计算的单元格，并将每个单元格转换为各自独立的矩形图元 | `FeatureSeriesKind::Heatmap`, `HeatmapCell` |
+| 非时间柱 | **图表上缺失**。共享时间轴每个 UTC 秒对应一个逻辑行 | [聚合与记账](../docs/features/footprint.md#3-聚合与记账) |
+| 跨图表同步 | 带修订号的绘图载荷导出/导入，含来源标识和稳定的绘图 ID；宿主在单元格之间路由载荷，且不回显 | `drawing_contract.rs`, `drawings.rs` |
+| 回放 | **缺失**。没有回放游标或未来数据遮蔽；宿主只能替换和追加数据 | — |
 
-## Architecture principles
+## 架构原则
 
-- **One source of truth per market fact.** A trade tape or depth book is stored once per
-  instrument stream and shared by every study and series derived from it. No study copies raw
-  trades.
-- **Derived state is disposable.** Bars, profiles, delta series and heatmap buckets can always be
-  rebuilt from the retained source. Tip updates use incremental paths; historical corrections
-  rebuild from a documented checkpoint and report the work done.
-- **Bounded everything.** Every tape, ring, profile, level list, cache and drawing collection has an
-  explicit cap, eviction rule and memory telemetry. Frame work is bounded by what is visible.
-- **Typed, not stringly.** Each study and drawing kind has a typed option struct with validation and
-  defaults. Hosts receive typed schemas (name, type, range, default) to generate their property
-  panels; the engine never renders dialogs.
-- **Shared geometry, not per-backend features.** New shapes (ellipses, arcs, arrows, level fills,
-  bubbles) are lowered to existing or new backend-neutral primitives implemented by every executor
-  before a feature is complete.
-- **No invented data.** Nothing guesses aggressor sides, fabricates timestamps for non-time bars, or
-  rounds off-grid prices. Unknowns stay unknown and are reported.
-- Follow [AGENTS.md](../AGENTS.md): no speculative crates, traits, plugin registries or feature
-  flags. Extract modules only when a real responsibility justifies it.
+- **每个行情事实只有一个真相来源**。成交带或深度订单簿在每个标的流中只存储一份，并由所有派生自它的研究和系列共享。任何研究都不得复制原始成交。
+- **派生状态可随时丢弃**。柱、分布、delta 系列和热力图桶始终可以从保留的源数据重建。末端更新使用增量路径；历史更正从有文档记录的检查点重建，并报告所做的工作量。
+- **一切有界**。每条成交带、环形缓冲区、分布、档位列表、缓存和绘图集合都有明确的上限、淘汰规则和内存遥测。帧工作量以可见内容为界。
+- **类型化，而非字符串化**。每种研究和绘图类型都有带校验和默认值的类型化选项结构体。宿主接收类型化 schema（名称、类型、范围、默认值）来生成自己的属性面板；引擎从不渲染对话框。
+- **共享几何，而非按后端实现功能**。新形状（椭圆、弧线、箭头、档位填充、气泡）会先被转换为由每个执行器实现的现有或新增后端中立图元，功能才算完成。
+- **不捏造数据**。任何地方都不会猜测主动方、不会为非时间柱伪造时间戳，也不会对偏离网格的价格取整。未知保持未知，并予以报告。
+- 遵循 [AGENTS.md](../AGENTS.md)：不引入臆测性的 crate、trait、插件注册表或功能开关。仅当存在真实职责时才提取模块。
 
-## Specifications
+## 规格
 
-### Foundations
+### 基础
 
-#### F1 — Logical bar identity for non-time bars
+#### F1 — 非时间柱的逻辑柱标识
 
-**Problem.** The time axis maps one logical row to one UTC second. Tick, volume, range, Renko,
-Kagi, Point & Figure and Line Break bars can produce several bars within one second, or bars
-whose position is not a function of time at all. Footprint.md already forbids faking timestamps.
+**问题**。时间轴把一个逻辑行映射到一个 UTC 秒。Tick、成交量、区间、Renko、Kagi、Point & Figure 与 Line Break 柱可能在一秒内产生多根柱，或者产生位置根本不是时间函数的柱。[足迹图契约](../docs/features/footprint.md#3-聚合与记账)已经禁止伪造时间戳。
 
-**Required outcome.**
+**必需结果**。
 
-- A bar-sequence domain where each logical index is a bar with its own open and close time
-  (microseconds), independent of whole-second alignment.
-- Time labels, crosshair time, tick marks and gaps derive from bar open/close times, including
-  many bars in one second and long gaps between bars.
-- Drawings, alerts, trading lines and markers anchored to a non-time chart store both the logical
-  bar and the time, and rebase deterministically when history is prepended or rebuilt.
-- Define which series can share a pane with a non-time primary series. Recommended rule: series in a
-  non-time pane must be derived from the same bar sequence (studies, footprint, delta), not
-  independent time series. Mixing arbitrary time series requires an explicit mapping and is not
-  silently aligned.
-- Bar construction for tick, volume and range bars moves into one shared aggregator used by
-  candles and footprint alike; footprint's existing trade-count and volume policies become
-  chart-integrated.
+- 一个柱序列域，其中每个逻辑索引对应一根柱，具有各自的开盘时间和收盘时间（微秒），与整秒对齐无关。
+- 时间标签、十字光标时间、刻度线和间隙均由柱的开盘/收盘时间派生，包括一秒内有多根柱以及柱之间存在长间隙的情形。
+- 锚定在非时间图表上的绘图、告警、交易线和标记同时存储逻辑柱与时间，并在历史数据被前置插入或重建时确定性地重新定基。
+- 定义哪些系列可以与非时间主系列共用一个窗格。推荐规则：非时间窗格中的系列必须派生自同一柱序列（研究、足迹图、delta），而不是独立的时间序列。混用任意时间序列需要显式映射，不会被静默对齐。
+- Tick 柱、成交量柱和区间柱的构建移入由 K 线和足迹图共用的同一个共享聚合器；足迹图现有的成交笔数与成交量策略纳入图表集成。
 
-**Exit.** Tick/volume/range candles and footprint render on every executor; many-bars-per-second
-and gap fixtures pass; drawings survive history prepend and rebuild; performance gate shows tip
-append without rebuilding closed bars.
+**退出标准**。Tick/成交量/区间 K 线和足迹图在每个执行器上渲染；每秒多柱和间隙夹具通过；绘图在历史前置插入和重建后得以保留；性能门禁表明末端追加不会重建已收盘柱。
 
-#### F2 — Shared trade tape and tape-derived studies
+#### F2 — 共享成交带与成交带派生研究
 
-**Problem.** The footprint series owns its tape. CVD, delta histograms, trade bubbles, tape-based
-volume profiles and VWAP-from-trades must read the same classified trades without duplicating them.
+**问题：** 足迹图系列拥有自己的成交带。CVD、delta 直方图、成交气泡、基于成交带的成交量分布以及基于成交的 VWAP 必须读取同一份已分类的成交，而不得复制它们。
 
-**Required outcome.**
+**必需结果：**
 
-- A chart-level trade stream handle, keyed by host-defined instrument stream, retaining the
-  canonical classified tape with the existing ordering, correction and retention rules.
-- Footprint, candles built from trades (F1), and every order-flow study bind to the stream by
-  identity. Removing the stream removes or invalidates dependents explicitly.
-- Classification runs once per event; dependents receive the classified event and a revision.
-- Per-dependent incremental state plus a documented rebuild path on historical mutation.
-- Memory telemetry per stream and per dependent.
+- 图表级的成交流句柄，以宿主定义的品种流为键，按现有的排序、更正与保留规则保留规范的已分类成交带。
+- 足迹图、由成交构建的 K 线（F1）以及每个订单流研究都按标识绑定到该流。移除该流时，会显式地移除其依赖方或使其失效。
+- 每个事件只分类一次；依赖方接收已分类的事件和一个修订号。
+- 每个依赖方各自的增量状态，并在历史数据发生变更时提供有文档记录的重建路径。
+- 按流和按依赖方的内存遥测。
 
-**Exit.** A footprint series and a CVD study share one tape (verified by memory telemetry), a late
-trade updates both consistently, and retention evicts tape and derived state together.
+**退出标准：** 一个足迹图系列和一个 CVD 研究共享同一份成交带（通过内存遥测验证），一笔迟到的成交会一致地更新两者，保留策略会同时淘汰成交带与派生状态。
 
-#### F3 — Order-book (Level 2) depth model
+#### F3 — 订单簿（Level 2）深度模型
 
-**Problem.** A liquidity heatmap and DOM ladder need historical and live resting liquidity per
-price level. No such model exists; the current heatmap series only accepts precomputed cells.
+**问题：** 流动性热力图和 DOM 价位梯需要每个价位上的历史与实时挂单流动性。目前不存在这样的模型；现有的热力图系列只接受预先计算好的单元格。
 
-**Required outcome.**
+**必需结果：**
 
-- Ingest a full book snapshot and incremental level updates (price, side, size, sequence,
-  timestamp). Prices validated against the tick grid.
-- Sequence-gap detection that marks the book stale and emits a typed resync request to the host;
-  the engine never invents missing levels.
-- Live book state (bounded by a configurable number of levels around the touch) plus a
-  time-bucketed history ring for heatmap rendering, with explicit bucket interval and caps.
-- Queries: best bid/ask, size at price, cumulative depth, book imbalance over N levels.
-- Typed columnar ingest at the WASM boundary; no per-update object conversion on the hot path.
+- 写入完整的订单簿快照和增量档位更新（价格、方向、数量、序号、时间戳）。价格按 tick 网格校验。
+- 序号缺口检测：将订单簿标记为过期，并向宿主发出类型化的重新同步请求；引擎绝不会臆造缺失的档位。
+- 实时订单簿状态（以盘口附近可配置的档位数为界）加上用于热力图渲染的按时间分桶的历史环形缓冲区，并带有明确的桶间隔与上限。
+- 查询：最优买卖价、指定价位的数量、累计深度、N 个档位上的订单簿失衡。
+- WASM 边界处采用类型化列式写入；热路径上不做逐更新的对象转换。
 
-**Exit.** Deterministic replay of a recorded snapshot-plus-update stream yields identical book
-states; gap fixtures request resync; memory stays flat under a sustained update soak.
+**退出标准：** 对已录制的“快照加更新”流做确定性回放，会得到完全相同的订单簿状态；缺口夹具会请求重新同步；在持续更新的浸泡测试下，内存保持平稳。
 
-#### F4 — Study input model
+#### F4 — 研究输入模型
 
-**Problem.** Indicators only receive high, low, close and volume, and always use close as the price
-source. Professional studies need open, selectable sources and multi-input bindings.
+**问题：** 指标只接收最高价、最低价、收盘价和成交量，并且始终以收盘价作为价格源。专业的研究需要开盘价、可选择的来源以及多输入绑定。
 
-**Required outcome.**
+**必需结果：**
 
-- `IndicatorInput` gains open; bindings select a source: open, high, low, close, hl2, hlc3, ohlc4,
-  hlcc4, or any existing indicator output (chaining already works through series identity).
-- Studies may bind several inputs (price series, volume series, trade stream, depth book) with
-  typed validation.
-- Every study exposes a typed parameter schema and typed output descriptors (name, kind: line,
-  histogram, band fill, markers, levels) so hosts generate settings UI and legends without
-  hard-coded knowledge.
-- Per-output style (color, width, line style, visibility, histogram colors, band fill) remains
-  engine state and persists.
-- Study bindings join the persistence schema (next version) instead of being host-recreated.
+- `IndicatorInput` 新增开盘价；绑定可选择来源：开盘价、最高价、最低价、收盘价、hl2、hlc3、ohlc4、hlcc4，或任一现有指标输出（通过系列标识即可实现链式组合，这一点目前已经可用）。
+- 研究可以绑定多个输入（价格系列、成交量系列、成交流、深度订单簿），并带有类型化校验。
+- 每个研究都暴露类型化的参数 schema 和类型化的输出描述符（名称、种类：线、直方图、带状填充、标记、水平位），使宿主无需硬编码知识即可生成设置 UI 和图例。
+- 每个输出的样式（颜色、宽度、线型、可见性、直方图颜色、带状填充）仍是引擎状态并会被持久化。
+- 研究绑定纳入持久化 schema（下一版本），而不是由宿主重新创建。
 
-**Exit.** An RSI of hlc3, an SMA of that RSI, and a Bollinger band fill round-trip through
-persistence and render identically on every executor.
+**退出标准：** 基于 hlc3 的 RSI、该 RSI 的 SMA，以及布林带填充，可以经持久化往返还原，并在每个执行器上渲染结果一致。
 
-#### F5 — Drawing model and customization contract
+#### F5 — 绘图模型与自定义契约
 
-**Problem.** One flat struct serves every tool; fill, border, labels and bands are
-rectangle-specific; text layout is hard-coded to the trend line and text tool. This cannot scale to
-~80 tools with per-tool customization.
+**问题：** 同一个扁平结构体服务于所有工具；填充、边框、标签和色带是矩形专用的；文本布局被硬编码到趋势线与文本工具上。这无法扩展到~80 个带有逐工具自定义的工具。
 
-**Required outcome.** A drawing becomes a common core plus a typed per-kind option block. The
-common contract applies to **every** tool unless a property is meaningless for its geometry, and
-that exception is recorded in the tool's catalog entry.
+**必需结果：** 绘图变为公共核心加上按种类划分的类型化选项块。公共契约适用于**每一个**工具，除非某个属性对其几何形状没有意义，该例外会记录在该工具的目录条目中。
 
-| Group | Properties |
+| 分组 | 属性 |
 | --- | --- |
-| Identity | Stable ID, user name, optional group ID, creation/modification revision |
-| State | Visible, locked (no drag/edit, still selectable), z-order within the drawing layer (bring forward/backward/front/back) |
-| Interval visibility | Show on selected interval ranges (seconds, minutes, hours, days, weeks, months, ticks, ranges), using host-supplied interval metadata |
-| Stroke | Color with alpha, width, line style (solid, dotted, dashed, large dashed, sparse dotted), line cap/end style per end (none, arrow, circle) where the geometry has ends |
-| Extension | Extend left/right for line-like tools; extend levels for level tools |
-| Fill | Background enabled, color with alpha; per-zone fills for multi-zone tools |
-| Text | Content (multi-line), font size, bold, italic, color, horizontal alignment, vertical alignment, placement relative to the geometry (above/below/on line, inside/outside shape), optional background box with border color/width and padding, wrap width |
-| Labels and stats | Per tool: price, price change, percent change, ticks/pips, bar count, date/time range, duration, angle, distance, volume in range; each individually toggleable with label position |
-| Coordinates | Numeric read/write of every anchor (time or bar plus price) through the typed API, so hosts can offer coordinate editors |
-| Scale binding | Price scale (left/right/overlay), pane, magnet mode (off, weak, strong) |
-
-Level-based tools (Fibonacci, Gann, pitchfork, position) add a level list: value, color, visible,
-line style, fill-between-levels toggle and color, plus tool options such as reverse, log-scale
-levels, show prices, show level values or percents, and label alignment.
-
-Engine responsibilities around the contract:
-
-- Text layout for every tool uses one shared layout path (measurement hook, alignment, placement,
-  box, clipping) so hit boxes, editing caret anchors and rendering never disagree. The existing
-  trend-line text behavior becomes one instance of it.
-- Hosts receive a typed property schema per tool and read/write properties through
-  `drawing_apply_options`-style atomic patches; invalid patches leave the drawing unchanged.
-- Style templates are data: per-tool default overrides and named templates that the engine
-  validates, applies at creation, and exports/imports. The host decides where templates live.
-- Multi-select, clone, copy/paste as a serialized drawing payload, group move/lock/hide, and
-  undo/redo of every property change as one history entry.
-- Cross-chart sync (same symbol in several workspace cells) uses export/import of drawing payloads
-  with revision tracking; the host coordinator routes changes and the engine prevents echo loops.
-- Persistence migrates existing V1/V2 drawings into the new model losslessly.
-
-**Exit.** Every existing tool supports the common text, stroke, state and label contract; a host
-builds a generic property panel from schemas alone; persistence migrates old layouts; executor
-parity fixtures cover text placement on lines, shapes and level tools.
-
-#### F6 — Engine-owned OHLCV resampling
-
-Hosts own feeds, but higher-timeframe views and multi-timeframe studies need deterministic
-aggregation of a lower-timeframe source into higher-timeframe bars with host-supplied session
-boundaries. This powers multi-timeframe study inputs, session and weekly profiles, and derived
-chart types without host-side re-aggregation. Timezone and session policy come from the host
-explicitly; the engine never uses the browser timezone.
-
-### Platform contracts
-
-The Aeris Terminal roadmap adds risk controls, session replay, trade review, order-level analytics
-and fundamentals context. Rule evaluation, recording storage, data fetching and every panel or
-dialog stay in the platform. These items are what the engine must provide so the platform renders
-those features from typed APIs without reimplementing chart math.
-
-#### PD1 — Host annotations on trading objects
-
-**Problem.** Order and position chips show only engine-formatted quantity, kind and PnL. The
-platform needs to show estimated queue position, fill likelihood, rule warnings ("breaks daily loss
-limit at stop") and copier status on the same objects.
-
-**Required outcome.**
+| 标识 | 稳定 ID、用户名称、可选的分组 ID、创建/修改修订号 |
+| 状态 | 可见、锁定（不可拖动/编辑，但仍可选择）、在绘图层内的 z 序（上移一层/下移一层/置于顶层/置于底层） |
+| 周期可见性 | 在选定的周期范围内显示（秒、分钟、小时、日、周、月、tick、区间），使用宿主提供的周期元数据 |
+| 描边 | 带 alpha 的颜色、宽度、线型（实线、点线、虚线、大虚线、稀疏点线）、每一端的线帽/端点样式（无、箭头、圆形），适用于几何形状具有端点的工具 |
+| 延伸 | 线类工具向左/向右延伸；水平位类工具延伸水平位 |
+| 填充 | 是否启用背景、带 alpha 的颜色；多区域工具的逐区域填充 |
+| 文本 | 内容（多行）、字号、粗体、斜体、颜色、水平对齐、垂直对齐、相对几何形状的位置（线上方/线下方/线上、形状内/形状外）、可选的带边框颜色/宽度与内边距的背景框、换行宽度 |
+| 标签与统计 | 按工具而定：价格、价格变化、百分比变化、tick/pip 数、柱数、日期/时间范围、持续时间、角度、距离、范围内成交量；每项均可单独开关，并带有标签位置 |
+| 坐标 | 通过类型化 API 对每个锚点（时间或柱加价格）进行数值读写，使宿主可以提供坐标编辑器 |
+| 比例尺绑定 | 价格比例尺（左/右/叠加层）、窗格、磁吸模式（关闭、弱、强） |
 
-- `WorkingOrder` and `TradingPosition` accept a bounded list of host annotations: short text,
-  semantic tone (neutral, info, warning, danger), optional tooltip text and placement.
-- Annotations are laid out with the existing chips by the shared trading geometry, clipped and
-  hit-tested consistently; overflow collapses deterministically.
-- Explicit caps on annotation count and text bytes per object; invalid annotations are rejected
-  without changing the object.
-- Annotations are presentation only. The engine never computes queue position or rule state.
-
-**Exit.** An order line with two annotations renders identically on every executor, hit-tests to
-the right annotation, and updates at live tick rates without rebuilding unrelated trading geometry.
-
-#### PD2 — Replay playback contract
-
-**Problem.** Session replay feeds recorded trades, depth and bars into charts at 1× to 100× speed,
-seeks backward, and must never show data from after the replay clock.
+基于水平位的工具（斐波那契、江恩、叉形线、仓位）额外带有水平位列表：数值、颜色、是否可见、线型、水平位之间填充的开关与颜色，以及工具选项，例如反转、对数比例尺水平位、显示价格、显示水平位数值或百分比、标签对齐。
 
-**Required outcome.**
+围绕该契约的引擎职责：
 
-- A replay clock supplied by the host (microseconds). The engine draws a replay cursor and masks
-  or omits everything after it in every series, study, footprint cell, heatmap bucket and marker.
-- Seek backward resets derived state from the nearest documented checkpoint (F2, F3 and indicator
-  checkpoints) rather than rebuilding full history; seek cost is reported.
-- Bulk ordered ingest paths for trades, depth and bars sized for high-speed replay without
-  per-event object conversion at the WASM or GPUI boundary.
-- Live and replay charts use the same series and study code paths; replay is a data-source mode,
-  not a forked renderer.
-
-**Exit.** A recorded session replays at 100× with bounded frame work and flat memory in
-`perf_gate`, seek-back equals a fresh load to the same clock, and no fixture shows post-clock data.
+- 每个工具的文本布局都使用同一条共享布局路径（度量钩子、对齐、位置、文本框、裁剪），使命中框、编辑插入符锚点与渲染绝不会彼此不一致。现有的趋势线文本行为成为它的一个实例。
+- 宿主为每个工具获得类型化的属性 schema，并通过 `drawing_apply_options` 风格的原子补丁读写属性；无效补丁不会改变该绘图。
+- 样式模板即数据：逐工具的默认值覆盖项，以及命名模板；引擎会校验这些模板、在创建时应用它们，并负责导出/导入。模板存放在哪里由宿主决定。
+- 多选、克隆、以序列化绘图载荷形式的复制/粘贴、分组移动/锁定/隐藏，以及每次属性变更的撤销/重做都对应一条历史记录。
+- 跨图表同步（同一品种位于多个工作区单元格中）使用带修订追踪的绘图载荷导出/导入；宿主协调器负责路由变更，引擎负责防止回声循环。
+- 持久化会把现有的 V1/V2 绘图无损迁移到新模型中。
 
-#### PD3 — Host event layer on the time axis
+**退出标准：** 每个现有工具都支持公共的文本、描边、状态与标签契约；宿主仅凭 schema 即可构建通用属性面板；持久化会迁移旧布局；执行器一致性夹具覆盖线条、形状和水平位类工具上的文本位置。
 
-**Problem.** Economic releases, platform risk windows (no trading two minutes around a release),
-session opens and contract roll dates must appear on charts. Drawings are user-editable and
-persisted, so they are the wrong owner for host-generated context.
+#### F6 — 引擎持有的 OHLCV 重采样
 
-**Required outcome.**
+宿主拥有数据源，但更高周期视图和多周期研究需要把较低周期的源确定性地聚合为更高周期的柱，并使用宿主提供的交易时段边界。这为多周期研究输入、交易时段与每周的分布以及派生图表类型提供支持，而无需宿主侧重新聚合。时区与交易时段策略由宿主显式提供；引擎绝不使用浏览器时区。
 
-- A non-persisted, non-editable host overlay layer with typed event markers (time, importance,
-  short label, optional icon from a bounded host image set) and shaded time windows.
-- Markers and windows render on price and study panes, collapse by LOD when dense, and hit-test to
-  a host event identifier for tooltips.
-- Explicit caps on markers and windows per chart.
-
-**Exit.** Event markers and windows render identically on every executor, survive history prepend
-and resampling, and never enter drawing persistence or undo history.
+### 平台契约
 
-#### PD4 — Execution markers and round trips
+Aeris Terminal 路线图新增了风险控制、交易时段回放、交易复盘、委托级分析和基本面上下文。规则评估、录制存储、数据获取以及每一个面板或对话框仍留在平台中。这些条目是引擎必须提供的内容，使平台能通过类型化 API 渲染这些功能，而无需重新实现图表数学。
 
-**Problem.** Trade review needs every fill, grouped into entry-to-exit round trips with their result,
-directly on the chart.
+#### PD1 — 交易对象上的宿主标注
 
-**Required outcome.**
+**问题：** 订单与仓位徽标只显示由引擎格式化的数量、类型和 PnL。平台需要在同一批对象上显示预估的排队位置、成交概率、规则警告（“触及止损时将突破日亏损上限”）以及跟单状态。
 
-- Execution marker variants: circle (current), arrow and triangle, optional size by quantity.
-- Round-trip connectors from entry executions to exit executions with a host-supplied result label
-  (for example "+3.25 pts, +$162.50"), colored by outcome.
-- Hit-testing returns the execution or round-trip identifier; caps on executions and connectors
-  per chart.
+**必需结果：**
 
-**Exit.** A day with many round trips renders at every LOD without overlapping labels beyond the
-documented collapse rule, and hit-testing selects the correct round trip on every executor.
+- `WorkingOrder` 与 `TradingPosition` 接受一个有界的宿主标注列表：简短文本、语义色调（中性、信息、警告、危险）、可选的提示框文本与位置。
+- 标注由共享的交易几何与现有徽标一起布局，并一致地进行裁剪和命中测试；溢出时确定性地折叠。
+- 对每个对象的标注数量和文本字节数设有明确上限；无效标注会被拒绝，且不改变该对象。
+- 标注仅用于展示。引擎绝不计算排队位置或规则状态。
 
-#### PD5 — Cross-chart synchronization
+**退出标准：** 带有两条标注的订单线在每个执行器上渲染一致，命中测试能命中正确的标注，并且能以实时 tick 速率更新，而无需重建不相关的交易几何。
 
-**Problem.** Linked charts (same symbol at several timeframes, or linked symbol groups) must share
-crosshair position and optionally visible time range. `workspace.rs` deliberately shares no state.
+#### PD2 — 回放播放契约
 
-**Shared contract.** This is the same capability as linked-chart synchronization in
-[plan.md](plan.md) R4. It is built once in the shared engine layer, delivered here first for
-financial charts, and later extended by R4 to general domains rather than duplicated.
+**问题：** 交易时段回放以 1× 到 100× 的速度把已录制的成交、深度和柱送入图表，可向后跳转，并且绝不能显示回放时钟之后的数据。
 
-**Required outcome.**
+**必需结果：**
 
-- APIs to read the local crosshair (time, price, pane) and to set an external crosshair that
-  renders without being treated as local pointer input.
-- APIs to read and set the visible time range.
-- Synchronization events carry semantic values (financial time and price here; general domain
-  values or declared index matching in plan.md R4) with an explicit mismatch policy, plus a source
-  and revision so a bounded host coordinator can route events between independent charts without
-  echo loops. Each receiving engine resolves the values against its own data, and disposal removes
-  its subscriptions.
-- Symbol linking remains host-owned; the engine exposes only crosshair and range primitives.
+- 由宿主提供的回放时钟（微秒）。引擎绘制回放游标，并在每个系列、研究、足迹图单元格、热力图桶和标记中遮蔽或省略其后的一切内容。
+- 向后跳转时，从最近的有文档记录的检查点（F2、F3 与指标检查点）重置派生状态，而不是重建完整历史；并报告跳转开销。
+- 为成交、深度和柱提供批量有序写入路径，其规模适配高速回放，并且在 WASM 或 GPUI 边界处不做逐事件的对象转换。
+- 实时图表与回放图表使用相同的系列和研究代码路径；回放是一种数据源模式，而不是分叉出来的渲染器。
 
-**Exit.** Two charts with different timeframes track one crosshair and one time range with no
-feedback oscillation, on GPUI and in the browser. The contract needs no financial-only fields that
-would block its reuse in plan.md R4.
+**退出标准：** 一段已录制的交易时段在 `perf_gate` 中以 100× 回放，帧工作有界且内存平稳；向后跳转的结果等同于全新加载到同一时钟的结果；没有任何夹具显示时钟之后的数据。
 
-#### PD6 — Native and GPUI image export
+#### PD3 — 时间轴上的宿主事件层
 
-**Problem.** The platform journal attaches chart images to trades. Only the browser package can
-export images today.
+**问题：** 经济数据发布、平台风险窗口（数据发布前后各两分钟内不得交易）、交易时段开盘以及合约展期日必须显示在图表上。绘图可由用户编辑且会被持久化，因此由它们拥有宿主生成的上下文并不合适。
 
-**Shared contract.** Image export is one frame-level capability for every chart kind and also
-serves plan.md's frame-rendered export (R4 and the "equivalent frame exports" coverage row). State
-exports (persistence) remain a separate gate.
+**必需结果：**
 
-**Required outcome.**
+- 一个不持久化、不可编辑的宿主叠加层，包含类型化的事件标记（时间、重要性、简短标签、可选的来自有界宿主图像集的图标）和带阴影的时间窗口。
+- 标记和窗口渲染在价格窗格和研究窗格上，密集时按细节层级（LOD）折叠，并通过命中测试得到宿主事件标识符，用于提示框。
+- 对每个图表的标记和窗口数量设有明确上限。
 
-- Render a chart frame to an RGBA buffer at a requested size and scale on the native and GPUI
-  paths, including or excluding the crosshair and trading layer, with the same composition rules as
-  the browser `take_screenshot`.
-- The export works from the ordered frame regardless of whether panes are financial or general,
-  and documents which built-in chrome is included.
-- Export never disturbs the live chart's state or frame pacing.
+**退出标准：** 事件标记和窗口在每个执行器上渲染一致，能在历史数据前插和重采样后保留，并且绝不会进入绘图持久化或撤销历史。
 
-**Exit.** Exported images match on-screen output within the existing parity tolerances for a
-financial chart and a general Cartesian chart.
+#### PD4 — 成交标记与往返交易
 
-#### PD7 — Sparse fundamental series on intraday charts
+**问题：** 交易复盘需要把每一笔成交直接显示在图表上，并按从入场到出场的往返交易分组，同时给出其结果。
 
-**Problem.** Weekly and monthly context (EIA inventories, CFTC Commitments of Traders, USDA
-reports) must be shown beside intraday prices without look-ahead: a value becomes visible only from
-its release time.
+**必需结果：**
 
-**Required outcome.**
+- 成交标记变体：圆形（当前）、箭头和三角形，可选按数量设置大小。
+- 从入场成交到出场成交的往返交易连接线，带有宿主提供的结果标签（例如“+3.25 pts, +$162.50”），并按结果着色。
+- 命中测试返回成交或往返交易的标识符；对每个图表的成交数和连接线数设有上限。
 
-- Step-after rendering from host-supplied release timestamps, with documented behavior for sparse
-  points on second-based axes and across history gaps. Confirm whether `LineType::WithSteps`
-  already provides these semantics and extend it only if it does not.
-- Column or histogram presentation of the same series in its own pane, and value labels that show
-  the as-of release.
-- The engine never fetches or interprets fundamental data; it renders host series.
+**退出标准：** 包含大量往返交易的一天在每个细节层级（LOD）下渲染时，标签重叠都不会超出文档规定的折叠规则，并且命中测试在每个执行器上都能选中正确的往返交易。
 
-**Exit.** A weekly series on a one-minute chart changes value exactly at each release bar, with no
-interpolation and no look-ahead in fixtures and replay (PD2).
+#### PD5 — 跨图表同步
 
-#### PD8 — Order-level depth inputs and microstructure events on the chart
+**问题：** 联动图表（同一品种的多个周期，或联动的品种组）必须共享十字光标位置，并可选择性地共享可见时间范围。`workspace.rs` 刻意不共享任何状态。
 
-**Problem.** Rithmic supplies CME market-by-order data. Aeris Terminal's adapter already assembles
-an order-level book but publishes aggregated levels. Queue position, iceberg detection, pulled
-liquidity and order-size clustering are computed platform-side. The DOM shows them in the
-platform's own widget; the chart must show them on price panes and the liquidity heatmap.
+**共享契约：** 这与 [plan.md](plan.md) R4 中的联动图表同步是同一项能力。它在共享引擎层中只构建一次，在此处先交付给金融图表，之后由 R4 扩展到通用领域，而不是重复实现。
 
-**Required outcome.**
+**必需结果：**
 
-- F3 depth ingest accepts the optional per-level order count the platform already carries, so
-  heatmap cells and tooltips can show order counts beside size.
-- A typed microstructure event marker (kind: iceberg refill, pulled liquidity, size cluster, sweep;
-  price, time, size and host label) rendered in price panes and on the heatmap (OF15), with caps and
-  LOD collapse.
-- The engine does not implement detection rules. Deterministic detection lives in the platform,
-  consistent with the OF13 rule that detections are never heuristic black boxes. Queue position on
-  the chart is shown through PD1 order-line annotations.
+- 读取本地十字光标（时间、价格、窗格）以及设置外部十字光标的 API；外部十字光标会被渲染，但不会被当作本地指针输入。
+- 读取和设置可见时间范围的 API。
+- 同步事件携带语义值（此处为金融时间与价格；plan.md R4 中为通用领域值或声明式的索引匹配），并附带显式的不匹配策略，以及来源和修订号，使有界的宿主协调器能够在相互独立的图表之间路由事件而不产生回声循环。每个接收方引擎都依据自身数据解析这些值，销毁时会移除其订阅。
+- 品种联动仍由宿主拥有；引擎只暴露十字光标与范围的基础接口。
 
-**Exit.** A recorded order-level stream renders heatmap order counts and event markers identically
-on every executor, and markers stay aligned with heatmap buckets after replay seeks.
+**退出标准：** 两个周期不同的图表在 GPUI 和浏览器中跟踪同一个十字光标和同一个时间范围，且无反馈振荡。该契约不需要任何会阻碍其在 plan.md R4 中复用的金融专用字段。
 
-#### PD9 — Depth heatmap rendering budget
+#### PD6 — 原生与 GPUI 图像导出
 
-**Problem.** OF15 at full resolution means thousands of price rows by hundreds of time buckets.
-Lowering each cell to a rectangle, as the feature heatmap does today, will not hold high refresh
-rates on dense books.
+**问题：** 平台交易日志会把图表图像附加到交易上。目前只有浏览器包能够导出图像。
 
-**Required outcome.**
+**共享契约：** 图像导出是适用于每种图表类型的帧级能力，同时也服务于 plan.md 中的帧渲染导出（R4 以及“等价的帧导出”覆盖行）。状态导出（持久化）仍是单独的门禁。
 
-- OF15 lowers visible buckets to a texture or image primitive (`Prim::Image`, the WebGPU
-  textured-quad pipeline and its GPUI and Canvas2D equivalents), with incremental column updates
-  for the live edge.
-- Color scaling, thresholds and minimum-size filters remain engine semantics applied before
-  upload.
-- Frame and upload budgets are measured in release builds and added to `perf_gate`.
+**必需结果：**
 
-**Exit.** A dense recorded book renders at the target refresh rate on GPUI with bounded upload per
-frame, and results match the rectangle-based reference within parity tolerance.
+- 在原生与 GPUI 路径上，按请求的尺寸和缩放比例把图表帧渲染到 RGBA 缓冲区，可包含或不包含十字光标与交易层，并采用与浏览器 `take_screenshot` 相同的合成规则。
+- 导出基于有序帧进行，无论窗格是金融窗格还是通用窗格都适用，并以文档说明包含哪些内置界面元素。
+- 导出绝不干扰实时图表的状态或帧节奏。
 
-#### PD10 — Dense footprint text budget
+**退出标准：** 对于金融图表和通用笛卡尔坐标系图表，导出的图像在现有一致性容差范围内与屏幕输出相符。
 
-**Problem.** Detailed footprint cells update many numeric text runs per frame during fast markets.
-GPUI glyph shaping and atlas cost at that density is unmeasured. (The Aeris Terminal DOM ladder is
-a platform widget, so its text performance is platform work.)
+#### PD7 — 分时图上的稀疏基本面系列
 
-**Required outcome.**
+**问题：** 周度和月度上下文（EIA 库存、CFTC Commitments of Traders、USDA 报告）必须显示在日内价格旁边，且不得前视：数值仅从其发布时间起才可见。
 
-- Measured release benchmarks for footprint text density on GPUI and WebGPU.
-- Shared caching of repeated numeric runs where measurement shows shaping dominates, without
-  changing text metrics or parity.
+**必需结果：**
 
-**Exit.** Documented frame budgets for a reference footprint view are met on GPUI and guarded by
-`perf_gate`.
+- 基于宿主提供的发布时间戳进行 step-after 渲染，并记录稀疏点在秒级坐标轴上以及跨越历史缺口时的行为。确认 `LineType::WithSteps` 是否已提供这些语义，仅在未提供时才扩展它。
+- 同一系列在其独立窗格中以柱形图或直方图形式呈现，并提供显示截至该时点所对应发布的值标签。
+- 引擎绝不获取或解释基本面数据；它只渲染宿主系列。
 
-#### PD11 — Trading layer alignment with the platform runtime
+**退出标准：** 一分钟图表上的周度系列恰好在每个发布柱处改变数值，在夹具和回放（PD2）中既无插值也无前视。
 
-**Problem.** The existing trading layer was built for a single implicit account with four order
-kinds. Aeris Terminal's trading runtime has several simulated and live accounts, a trade copier,
-fixed-point prices, and bracket templates with trailing and break-even stops. Without these
-corrections the host must encode accounts in identifiers and approximate trailing stops as plain
-stops.
+#### PD8 — 图表上的逐笔委托级深度输入与微观结构事件
 
-**Required outcome.**
+**问题：** Rithmic 提供 CME 的逐笔委托（market-by-order）数据。Aeris Terminal 的适配器已经组装出委托级订单簿，但只发布聚合后的档位。排队位置、冰山单检测、撤走的流动性和委托数量聚集均在平台侧计算。DOM 在平台自己的组件中显示这些内容；图表必须在价格窗格和流动性热力图上显示它们。
 
-- `WorkingOrder`, `TradingPosition`, `TradingExecution` and `TradingIntent` carry an optional
-  host account identifier (bounded, validated like other identifiers). The host sets a visible
-  account filter (one, several or all); hidden objects are neither rendered nor hit-tested.
-  Intents created from drawings or empty space carry the host-set active account; intents on an
-  existing object carry that object's account.
-- Trailing stops and break-even-armed stops are presentation variants of stop orders: the host
-  supplies the current trigger price and the trail offset or arm state; the engine renders the
-  variant and never computes trailing or arming itself. Local-versus-server management is shown
-  through PD1 annotations.
-- Price-bearing intents also report the price as an integer tick index from the instrument tick
-  size, so fixed-point hosts convert without floating-point rounding. Behavior without a tick size
-  is unchanged.
-- The order-state contract is documented: pending modify shows the requested price until the host
-  resolves the intent, rejected intents return to the last host-confirmed price, and partially
-  filled and pending-cancel states render distinctly. Fixtures cover each transition.
-- All additions are optional fields with serde defaults; existing snapshots and hosts keep
-  working unchanged.
+**必需结果：**
 
-**Exit.** A chart showing two accounts' orders filters to one account, hit-tests only visible
-objects, renders a trailing stop from host-supplied trigger updates, and emits drag intents whose
-tick index round-trips exactly to the host's fixed-point price on every executor.
+- F3 深度写入接受平台已携带的可选的每档委托数，使热力图单元格和提示框能在数量旁显示委托数。
+- 一种类型化的微观结构事件标记（种类：冰山补单、撤走的流动性、数量聚集、扫单；价格、时间、数量与宿主标签），渲染在价格窗格和热力图（OF15）上，并设有上限和细节层级（LOD）折叠。
+- 引擎不实现检测规则。确定性的检测位于平台中，这与 OF13 中“检测绝不是启发式黑箱”的规则一致。图表上的排队位置通过 PD1 订单线标注来显示。
 
-#### Platform feature to engine prerequisite map
+**退出标准：** 已录制的委托级数据流在每个执行器上渲染热力图委托数和事件标记的结果一致，且在回放跳转后标记仍与热力图桶保持对齐。
 
-| Platform feature | Engine prerequisites | Batch |
+#### PD9 — 深度热力图渲染预算
+
+**问题：** 全分辨率的 OF15 意味着数千个价格行乘以数百个时间桶。像现有的特征热力图那样把每个单元格转换为一个矩形，无法在密集订单簿上维持高刷新率。
+
+**必需结果：**
+
+- OF15 把可见桶转换为纹理或图像图元（`Prim::Image`、WebGPU 带纹理四边形管线及其 GPUI 与 Canvas2D 等价实现），并对实时边缘做增量列更新。
+- 颜色缩放、阈值和最小数量过滤仍是引擎语义，并在上传之前应用。
+- 帧预算和上传预算在 release 构建中测量，并加入 `perf_gate`。
+
+**退出标准：** 密集的已录制订单簿在 GPUI 上以目标刷新率渲染，每帧上传量有界，且结果在一致性容差内与基于矩形的参考实现相符。
+
+#### PD10 — 密集足迹图文字预算
+
+**问题：** 详细的足迹图单元格在快速行情中每帧都会更新大量数字文本段。在这种密度下，GPUI 字形整形和图集的开销尚未测量。（Aeris Terminal 的 DOM 价位梯是平台组件，因此其文本性能属于平台工作。）
+
+**必需结果：**
+
+- GPUI 与 WebGPU 上足迹图文字密度的 release 基准测试测量结果。
+- 在测量表明整形开销占主导时，对重复出现的数字片段进行共享缓存，且不改变文本度量或一致性。
+
+**退出标准：** 参考足迹图视图的有文档记录的帧预算在 GPUI 上得到满足，并由 `perf_gate` 守护。
+
+#### PD11 — 交易层与平台运行时对齐
+
+**问题：** 现有交易层是为单个隐式账户和四种订单类型构建的。Aeris Terminal 的交易运行时有多个模拟账户和实盘账户、跟单器、定点数价格，以及带有跟踪止损和保本止损的括号单模板。若没有这些修正，宿主就必须把账户编码进标识符，并把跟踪止损近似成普通止损。
+
+**必需结果：**
+
+- `WorkingOrder`、`TradingPosition`、`TradingExecution` 和 `TradingIntent` 携带一个可选的宿主账户标识符（有界，并与其他标识符一样进行校验）。宿主设置可见账户过滤器（一个、多个或全部）；被隐藏的对象既不渲染也不参与命中测试。由绘图或图表空白处创建的意图携带宿主设置的活动账户；针对现有对象的意图携带该对象的账户。
+- 跟踪止损和已激活保本的止损是止损订单的展示变体：宿主提供当前触发价和跟踪偏移量或激活状态；引擎渲染该变体，自身绝不计算跟踪或激活。本地管理与服务器管理的区别通过 PD1 标注显示。
+- 携带价格的意图还会以整数 tick 索引的形式报告该价格（由品种的 tick 大小得出），使定点数宿主无需浮点舍入即可完成转换。没有 tick 大小时行为保持不变。
+- 订单状态契约有文档记录：待修改状态在宿主处理完毕该意图之前显示请求的价格，被拒绝的意图回到宿主最近一次确认的价格，部分成交与待撤销状态则以不同方式渲染。夹具覆盖每一次状态转换。
+- 所有新增项都是带 serde 默认值的可选字段；现有快照和宿主无需改动即可继续工作。
+
+**退出标准：** 显示两个账户订单的图表可过滤到单个账户，只对可见对象做命中测试，根据宿主提供的触发价更新渲染跟踪止损，并发出拖动意图，其 tick 索引在每个执行器上都能精确往返还原为宿主的定点数价格。
+
+#### 平台功能到引擎前置条件映射
+
+| 平台功能 | 引擎前置条件 | 批次 |
 | --- | --- | --- |
-| Basic chart trading (orders, positions, drag to modify, brackets from drawings) | Existing trading layer; host wiring only | — |
-| Multi-account chart trading, copier, trailing and break-even stops | PD11 | B1 |
-| Prop-firm rules, pre-trade checks, lockouts | PD1 for warnings on order lines; the lock itself is host-owned | B1 |
-| Economic calendar and risk windows | PD3 | B1 |
-| Fundamentals dashboards on charts | PD7; existing panes, histogram and stepped lines | B1 |
-| Linked charts and symbol groups | PD5 | B1 |
-| Footprint, volume profile and CVD panels | Existing footprint and profile; F2, OF1–OF3, OF12, PD10 | B3, B7 |
-| Big-trade bubbles and sweeps | F2, OF11; PD8 for sweep markers | B3, B6 |
-| Custom studies and study scene objects | I4, F4; platform study roadmap Phases F–G | B4, B9 |
-| Tick, volume and range charts | F1, OF14, CT3 | B5 |
-| Session replay and trade review | PD2, PD4, PD6; F1 for sub-second tape display | B1, B5 |
-| Liquidity heatmap | F3, OF15, PD8, PD9 | B6 |
-| Queue position, icebergs, pulled liquidity on charts | PD8; PD1 for queue position on the order line | B1, B6 |
-| DOM ladder and time and sales | None; Aeris Terminal platform widgets | — |
+| 基础图表交易（订单、仓位、拖动修改、由绘图生成的括号单） | 现有交易层；仅需宿主接线 | — |
+| 多账户图表交易、跟单器、跟踪止损与保本止损 | PD11 | B1 |
+| 自营交易公司规则、交易前检查、交易锁定 | 订单线上的警告使用 PD1；锁定本身由宿主拥有 | B1 |
+| 经济日历与风险窗口 | PD3 | B1 |
+| 图表上的基本面仪表盘 | PD7；现有窗格、直方图与阶梯线 | B1 |
+| 联动图表与品种组 | PD5 | B1 |
+| 足迹图、成交量分布与 CVD 面板 | 现有足迹图与分布；F2, OF1–OF3, OF12, PD10 | B3, B7 |
+| 大额成交气泡与扫单 | F2, OF11；扫单标记使用 PD8 | B3, B6 |
+| 自定义研究与研究场景对象 | I4, F4；平台研究路线图的阶段 F–G | B4, B9 |
+| Tick、成交量与区间图表 | F1, OF14, CT3 | B5 |
+| 交易时段回放与交易复盘 | PD2, PD4, PD6；亚秒级成交带显示使用 F1 | B1, B5 |
+| 流动性热力图 | F3, OF15, PD8, PD9 | B6 |
+| 图表上的排队位置、冰山单、撤走的流动性 | PD8；订单线上的排队位置使用 PD1 | B1, B6 |
+| DOM 价位梯与成交明细 | 无；Aeris Terminal 平台组件 | — |
 
-## Catalogs
+## 目录
 
-### Order-flow catalog
+### 订单流目录
 
-Each item names its data source and dependency. "Candle" means the item also works in a
-candle-only approximation mode that is clearly labeled as such; tape items never silently fall back.
+每个条目都注明其数据源和依赖项。“K 线”表示该条目也能以仅基于 K 线的近似模式工作，且该模式有明确标示；成交带条目绝不会静默回退。
 
-| ID | Item | Source | Depends on | Batch | Notes |
+| ID | 条目 | 数据源 | 依赖 | 批次 | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| OF1 | Cumulative volume delta (CVD) pane: candles or line, session/continuous/anchored reset | Tape | F2 | B3 | Session delta already exists inside footprint bars; expose it as a proper series |
-| OF2 | Bar delta histogram, delta %, max/min delta, volume split (buy/sell/unknown) histogram | Tape | F2 | B3 | |
-| OF3 | Session, daily, weekly, composite volume profiles with developing POC/VAH/VAL lines | Tape (candle mode available) | F2, F6 | B7 | Replaces candle-only approximation for tape users |
-| OF4 | Fixed-range volume profile drawing | Tape or candle | F2, F5 | B7 | Drawing whose statistics come from the engine |
-| OF5 | Anchored volume profile drawing | Tape or candle | F2, F5 | B7 | |
-| OF6 | Naked (virgin) POC and value-area level extension until touched | Tape | OF3 | B7 | |
-| OF7 | Delta profile and bid/ask split profile | Tape | OF3 | B7 | |
-| OF8 | TPO / Market Profile: letters or blocks, initial balance, single prints, POC, value area, split/merge sessions | Candle or tape | F6 | B7 | Period and session boundaries are host-supplied |
-| OF9 | VWAP standard-deviation and percent bands; session/weekly/monthly reset | Candle or tape | F4 | B4 | Extends existing VWAP |
-| OF10 | Anchored VWAP drawing with bands | Candle or tape | F4, F5 | B7 | |
-| OF11 | Large-trade bubbles and volume dots: size by volume, color by side, threshold filters, aggregation of consecutive prints | Tape | F2 | B3 | New bounded marker primitive path |
-| OF12 | Footprint variants: profile-in-bar, volume ladder, horizontal imbalance mode, delta-only, bid/ask histogram cells | Tape | F2 | B3 | Extends existing footprint LOD |
-| OF13 | Unfinished auctions, absorption and exhaustion markers with explicit documented rules | Tape | OF12 | B9 | Rules must be deterministic and parameterized, never heuristic black boxes |
-| OF14 | Tick, volume and range candles; footprint on the same bars | Tape | F1 | B5 | Trade-count and volume aggregators already exist |
-| OF15 | Liquidity heatmap (resting depth over time) with color scaling, thresholds, and trades overlaid | Depth + tape | F3, OF11 | B6 | Bounded by visible time buckets × visible price rows |
-| OF16 | DOM ladder data model: price ladder, bid/ask size, recent volume at price, own orders | Depth + trading | F3 | B6 | For non-Aeris hosts; chart-side panel primitive |
-| OF17 | Depth-derived studies: book imbalance, cumulative depth curve, minimum-size and distance-from-touch filters | Depth | F3 | B6 | |
-| OF18 | Time and sales data view model (bounded recent prints with filters) | Tape | F2 | B6 | For non-Aeris hosts; host renders the list |
+| OF1 | 累计成交量 delta（CVD）窗格：K 线或折线，按交易时段/连续/锚定重置 | 成交带 | F2 | B3 | 交易时段 delta 已存在于足迹图柱内；将其作为正式系列暴露 |
+| OF2 | 柱 delta 直方图、delta %、最大/最小 delta、成交量拆分（买/卖/未知）直方图 | 成交带 | F2 | B3 | |
+| OF3 | 交易时段、日、周、复合成交量分布，带动态形成的 POC/VAH/VAL 线 | 成交带（可用 K 线模式） | F2, F6 | B7 | 为使用成交带的用户取代仅基于 K 线的近似 |
+| OF4 | 固定范围成交量分布绘图 | 成交带或 K 线 | F2, F5 | B7 | 统计数据来自引擎的绘图 |
+| OF5 | 锚定成交量分布绘图 | 成交带或 K 线 | F2, F5 | B7 | |
+| OF6 | 裸（virgin）POC 与价值区水平位的延伸，直至被触及 | 成交带 | OF3 | B7 | |
+| OF7 | Delta 分布与买/卖拆分分布 | 成交带 | OF3 | B7 | |
+| OF8 | TPO / Market Profile：字母或色块、初始平衡区、单一印记、POC、价值区、拆分/合并交易时段 | K 线或成交带 | F6 | B7 | 周期与交易时段边界由宿主提供 |
+| OF9 | VWAP 标准差带与百分比带；按交易时段/每周/每月重置 | K 线或成交带 | F4 | B4 | 扩展现有的 VWAP |
+| OF10 | 带有带状线的锚定 VWAP 绘图 | K 线或成交带 | F4, F5 | B7 | |
+| OF11 | 大额成交气泡与成交量圆点：按成交量定大小、按买卖方向着色、阈值过滤、连续成交的聚合 | 成交带 | F2 | B3 | 新的有界标记图元路径 |
+| OF12 | 足迹图变体：柱内分布、成交量价位梯、水平失衡模式、仅 delta、买/卖直方图单元格 | 成交带 | F2 | B3 | 扩展现有的足迹图细节层级（LOD） |
+| OF13 | 未完成拍卖、吸收与衰竭标记，规则明确且有文档记录 | 成交带 | OF12 | B9 | 规则必须是确定性且参数化的，绝不能是启发式黑箱 |
+| OF14 | Tick K 线、成交量 K 线与区间 K 线；同一批柱上的足迹图 | 成交带 | F1 | B5 | 成交笔数聚合器和成交量聚合器已存在 |
+| OF15 | 流动性热力图（随时间变化的挂单深度），带颜色缩放、阈值，并叠加成交 | 深度 + 成交带 | F3, OF11 | B6 | 以可见时间桶 × 可见价格行为界 |
+| OF16 | DOM 价位梯数据模型：价格阶梯、买/卖数量、各价位近期成交量、自有订单 | 深度 + 交易 | F3 | B6 | 面向非 Aeris 宿主；图表侧的面板图元 |
+| OF17 | 深度派生研究：订单簿失衡、累计深度曲线、最小数量与距盘口距离过滤器 | 深度 | F3 | B6 | |
+| OF18 | 成交明细数据视图模型（带过滤器的有界近期成交） | 成交带 | F2 | B6 | 面向非 Aeris 宿主；由宿主渲染列表 |
 
-### Chart types
+### 图表类型
 
-| ID | Type | Depends on | Batch |
+| ID | 类型 | 依赖 | 批次 |
 | --- | --- | --- | --- |
-| CT1 | Hollow candles, columns, high-low bars, step line, line with markers | — | B4 |
-| CT2 | Heikin Ashi (derived series with real OHLC exposed separately for trading and crosshair) | F4 | B4 |
-| CT3 | Tick, volume and range bars | F1 | B5 |
-| CT4 | Renko (box size fixed or ATR), Line Break, Kagi, Point & Figure | F1 | B5 |
-| CT5 | Higher-timeframe overlay candles on a lower-timeframe chart | F6 | B7 |
-| CT6 | Symbol comparison overlays: several instruments on one pane, shared comparison anchor bar, per-symbol legend values | — (percentage and indexed-to-100 scale modes already exist in `price_scale_core.rs`) | B4 |
+| CT1 | 空心 K 线、柱状图、高低柱、阶梯线、带标记的折线 | — | B4 |
+| CT2 | Heikin Ashi（派生系列，真实 OHLC 单独暴露，供交易与十字光标使用） | F4 | B4 |
+| CT3 | Tick 柱、成交量柱与区间柱 | F1 | B5 |
+| CT4 | Renko（箱体大小固定或按 ATR）、Line Break、Kagi、Point & Figure | F1 | B5 |
+| CT5 | 低周期图表上的高周期叠加 K 线 | F6 | B7 |
+| CT6 | 品种对比叠加层：同一窗格内多个品种、共享的对比锚点柱、按品种显示的图例值 | —（百分比与指数化至 100 的比例尺模式已存在于 `price_scale_core.rs`） | B4 |
 
-### Indicator catalog
+### 指标目录
 
-Current: SMA, EMA, DEMA, TEMA, SMMA/RMA, HMA, VWMA, standard deviation, CCI, Williams %R, Stochastic RSI, ROC, Momentum, OBV, CMF, MFI, Volume/MA, Donchian Channels, Keltner Channels, ADX/DMI, Parabolic SAR, SuperTrend, Ichimoku, EMA ribbon, WMA, Bollinger, RSI, MACD, Stochastic, ATR, VWAP. Each new indicator
-ships with incremental state, rebuild tests, typed schema, persistence and an independently
-computed reference-value fixture.
+当前已有：SMA、EMA、DEMA、TEMA、SMMA/RMA、HMA、VWMA、标准差、CCI、Williams %R、Stochastic RSI、ROC、Momentum、OBV、CMF、MFI、Volume/MA、Donchian Channels、Keltner Channels、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、EMA 彩带、WMA、Bollinger、RSI、MACD、Stochastic、ATR、VWAP。每个新指标都随附增量状态、重建测试、类型化 schema、持久化，以及一个独立计算的参考值夹具。
 
-| Tier | Batch | Indicators |
+| 层级 | 批次 | 指标 |
 | --- | --- | --- |
-| I1 — core professional set | B4 | Volume (as a study with MA), OBV, ADX/DMI, Parabolic SAR, SuperTrend, Ichimoku, Keltner Channels, Donchian Channels, CCI, Williams %R, Stochastic RSI, ROC/Momentum, MFI, CMF, HMA, VWMA, DEMA, TEMA, SMMA/RMA, standard deviation, pivot points (standard, Fibonacci, Camarilla, Woodie, DeMark), ZigZag |
-| I2 — breadth | B9 | Aroon, Awesome Oscillator, Chande Momentum, Chaikin Oscillator, Coppock, DPO, Elder Force, Ease of Movement, Fisher Transform, Historical Volatility, KST, Klinger, Linear Regression channel/curve, Mass Index, Ultimate Oscillator, TRIX, TSI, Vortex, Envelopes, ALMA, KAMA, McGinley Dynamic, Chop Zone/Choppiness, Bollinger %B and Bandwidth, ATR bands, Accumulation/Distribution, Price Volume Trend, Volume Oscillator, Relative Volume |
-| I3 — structure | B9 | Swing highs/lows, market structure breaks, fair value gaps, order blocks, session highs/lows, previous day/week/month levels, opening range |
-| I4 — extension API | B9 | Typed custom study API in Rust and TypeScript: declare inputs, parameters and outputs; provide incremental update and rebuild functions; engine owns scheduling, bounds, styles, persistence and rendering |
+| I1 — 核心专业指标集 | B4 | 成交量（作为带 MA 的研究）、OBV、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、Keltner Channels、Donchian Channels、CCI、Williams %R、Stochastic RSI、ROC/Momentum、MFI、CMF、HMA、VWMA、DEMA、TEMA、SMMA/RMA、标准差、枢轴点（标准、斐波那契、Camarilla、Woodie、DeMark）、ZigZag |
+| I2 — 广度 | B9 | Aroon、Awesome Oscillator、Chande Momentum、Chaikin Oscillator、Coppock、DPO、Elder Force、Ease of Movement、Fisher Transform、Historical Volatility、KST、Klinger、线性回归通道/曲线、Mass Index、Ultimate Oscillator、TRIX、TSI、Vortex、Envelopes、ALMA、KAMA、McGinley Dynamic、Chop Zone/Choppiness、Bollinger %B 与 Bandwidth、ATR 带、Accumulation/Distribution、Price Volume Trend、Volume Oscillator、Relative Volume |
+| I3 — 结构 | B9 | 摆动高点/低点、市场结构突破、公允价值缺口、订单块、交易时段高点/低点、前一日/前一周/前一月价位、开盘区间 |
+| I4 — 扩展 API | B9 | Rust 与 TypeScript 中的类型化自定义研究 API：声明输入、参数与输出；提供增量更新与重建函数；引擎拥有调度、界限、样式、持久化与渲染 |
 
-Multi-timeframe inputs (a daily RSI on a 5-minute chart) depend on F6 (B7). Alert conditions on
-study outputs remain host-evaluated; the engine exposes the values and crossing snapshots.
+多周期输入（5 分钟图表上的日线 RSI）依赖 F6（B7）。研究输出上的告警条件仍由宿主评估；引擎暴露这些值以及穿越快照。
 
-### Drawing tool catalog
+### 绘图工具目录
 
-Every tool implements the F5 common contract. Placement types refer to `DrawingPlacement` in
-`drawings/tools.rs`; new placement kinds are added only when a tool genuinely needs one. ✓ marks
-tools that exist today and are migrated in B2; everything else is delivered in B8, except the
-volume-based tools, which are delivered in B7.
+每个工具都实现 F5 通用契约。放置类型指 `drawings/tools.rs` 中的 `DrawingPlacement`；仅当某个工具确实需要时，才新增放置种类。✓ 标记当前已存在、并在 B2 中迁移的工具；其余全部在 B8 交付，基于成交量的工具除外，它们在 B7 交付。
 
-| Family | Tools |
+| 族 | 工具 |
 | --- | --- |
-| Lines | Trend line ✓, ray, extended line, info line (price/bars/percent/angle), trend angle, horizontal line ✓, horizontal ray ✓, vertical line ✓, cross line, arrow line |
-| Channels | Parallel channel, regression trend (with deviation settings), flat top/bottom, disjoint channel |
-| Pitchforks | Andrews, Schiff, modified Schiff, inside pitchfork, pitchfan |
-| Fibonacci | Retracement, trend-based extension, channel, time zones, trend-based time, speed resistance fan, speed resistance arcs, circles, spiral, wedge |
-| Gann | Gann box, square, square fixed, fan |
-| Patterns | XABCD, cypher, ABCD, head and shoulders, triangle pattern, three drives |
-| Elliott waves | Impulse (12345), correction (ABC), triangle (ABCDE), double and triple combination, with degree labels |
-| Cycles | Cyclic lines, time cycles, sine line |
-| Projection and measuring | Long position ✓, short position ✓, forecast, bars pattern (ghost copy), price range ✓, date range ✓, date and price range ✓ (plus the Shift-click quick measure), projection |
-| Volume-based | Fixed-range volume profile (OF4), anchored volume profile (OF5), anchored VWAP (OF10) |
-| Shapes | Rectangle ✓, rotated rectangle, ellipse, circle, triangle, arc, curve, double curve, polyline, path ✓, brush ✓, highlighter |
-| Annotations | Text ✓, anchored text (screen-anchored), note, price note, callout, comment, price label, signpost, flag mark, arrow markers (up/down/left/right), icon/emoji stamp from a host-provided bounded image set |
+| 线条 | 趋势线 ✓、射线、延长线、信息线（价格/柱数/百分比/角度）、趋势角度、水平线 ✓、水平射线 ✓、垂直线 ✓、十字线、箭头线 |
+| 通道 | 平行通道、回归趋势（含偏差设置）、平顶/平底、分离通道 |
+| 叉形线 | Andrews、Schiff、修正 Schiff、内部叉形线、叉形扇 |
+| 斐波那契 | 回撤、基于趋势的扩展、通道、时间区、基于趋势的时间、速度阻力扇形线、速度阻力弧线、圆、螺旋、楔形 |
+| 江恩 | 江恩箱、方格、固定方格、扇形线 |
+| 形态 | XABCD、Cypher、ABCD、头肩形、三角形形态、三驱动 |
+| 艾略特波浪 | 推动浪（12345）、调整浪（ABC）、三角形（ABCDE）、双重与三重组合，带级别标签 |
+| 周期 | 周期线、时间周期、正弦线 |
+| 投影与测量 | 多头仓位 ✓、空头仓位 ✓、预测、柱形态（幽灵副本）、价格区间 ✓、日期区间 ✓、日期与价格区间 ✓（另含 Shift 点击快速测量）、投影 |
+| 基于成交量 | 固定范围成交量分布（OF4）、锚定成交量分布（OF5）、锚定 VWAP（OF10） |
+| 形状 | 矩形 ✓、旋转矩形、椭圆、圆、三角形、弧线、曲线、双重曲线、多段线、路径 ✓、画笔 ✓、荧光笔 |
+| 标注 | 文本 ✓、锚定文本（屏幕锚定）、笔记、价格笔记、引出框、评论、价格标签、指示牌、旗标、箭头标记（上/下/左/右）、来自宿主提供的有界图像集的图标/emoji 印章 |
 
-Management features (object tree, multi-select, group operations, clone, copy/paste, templates,
-cross-cell sync, bulk remove) belong to F5 and ship in B2, not per tool.
+管理功能（对象树、多选、分组操作、克隆、复制/粘贴、模板、跨单元格同步、批量移除）属于 F5，在 B2 中交付，而不是按工具逐个交付。
 
-## Verification and evidence
+## 验证与证据
 
-Every checklist item needs, before its batch closes:
+每个检查清单项在其批次关闭前都需要：
 
-- Deterministic engine tests for math, including an independently computed reference fixture,
-  edge cases (empty, one bar, gaps, unknown sides, off-grid rejections, corrections) and rebuild
-  equivalence (incremental result equals full rebuild).
-- Frame fixtures for ordering, clipping and LOD; parity across GPUI, WebGPU, Canvas2D and native;
-  GPUI replay for executor changes.
-- Browser Playwright tests through the published package for browser-facing APIs.
-- Persistence round trip and migration from the previous schema version.
-- Performance evidence in release builds added to `perf_gate`: tip update cost independent of
-  history length, frame work bounded by visible bars/levels/buckets, steady-state allocation,
-  retained memory under retention caps, and depth-update soak for F3.
+- 针对数学计算的确定性引擎测试，包括独立计算的参考夹具、边缘情况（空数据、单根柱、缺口、未知方向、偏离网格的拒绝、更正）以及重建等价性（增量结果等于完整重建）。
+- 针对排序、裁剪与细节层级（LOD）的帧夹具；GPUI、WebGPU、Canvas2D 与原生之间的一致性；针对执行器变更的 GPUI 回放。
+- 针对面向浏览器的 API，通过已发布的包运行的浏览器 Playwright 测试。
+- 持久化往返，以及从上一个 schema 版本的迁移。
+- 在 release 构建中取得并加入 `perf_gate` 的性能证据：末端更新成本与历史长度无关，帧工作量以可见柱/价位/桶为界，稳态分配，保留上限内的留存内存，以及针对 F3 的深度更新浸泡测试。
 
-The complete gates in [AGENTS.md](../AGENTS.md) run once at the end of each batch, before its commit.
-`docs/Architecture.md` is updated in the same commit as any ownership or data-flow change.
-Reference behavior comes from public documentation and observed behavior only; no copied
-implementation code or assets (see the licensing rule in AGENTS.md).
+[AGENTS.md](../AGENTS.md) 中的完整门禁在每个批次结束、提交之前运行一次。任何所有权或数据流变更都在同一次提交中更新 `docs/Architecture.md`。参考行为仅来自公开文档和观察到的行为；不得复制实现代码或资源（参见 AGENTS.md 中的许可规则）。
 
-## Definition of completion
+## 完成定义
 
-Aeris Charts is a complete headless trading chart engine for this plan when a host can build a
-professional order-flow and technical-analysis workstation using only typed engine APIs. That means
-footprint, CVD, profiles, TPO, liquidity heatmap, DOM, non-time bars, the I1–I3 indicator catalog,
-the full drawing catalog with per-tool customization, and the platform contracts PD1–PD11, with
-identical results across every backend, bounded resources, deterministic persistence, and measured
-performance evidence. Until then, report delivered items and remaining gaps precisely against the
-batch checklists and catalog IDs above.
+对于本计划而言，当宿主仅使用类型化的引擎 API 就能构建专业的订单流与技术分析工作站时，Aeris Charts 即是一个完整的无头交易图表引擎。这意味着具备：足迹图、CVD、分布、TPO、流动性热力图、DOM、非时间柱、I1–I3 指标目录、带逐工具自定义的完整绘图目录，以及平台契约 PD1–PD11，并且所有后端结果一致、资源有界、持久化确定、性能证据经过实测。在此之前，应对照上文的批次清单和目录 ID，精确报告已交付项与剩余缺口。

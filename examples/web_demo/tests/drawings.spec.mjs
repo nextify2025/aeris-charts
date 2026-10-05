@@ -2296,17 +2296,20 @@ test("rectangle: middle pans unselected, drags selected, 8 anchors from the firs
   await settle_frames(page);
   expect(count_color(await capture(page), BLUE), "8 anchors once selected").toBeGreaterThan(40);
 
-  // Selected: the middle now drags the whole rectangle.
+  // Selected: the middle now drags the whole rectangle. A drag must clear the shared 5 px click
+  // slop (a shorter press is a click that moves nothing), and the fixture's bars are ~1.2 px
+  // apart, so the drag spans 12 bars.
   const spacing = await bar_spacing(page);
+  const bars = 12;
   const center2 = await center_of(before.points);
   await page.mouse.move(center2.x, center2.y);
   await page.mouse.down();
-  await page.mouse.move(center2.x + 4 * spacing, center2.y, { steps: 5 });
+  await page.mouse.move(center2.x + bars * spacing, center2.y, { steps: 5 });
   await page.mouse.up();
   await settle_frames(page);
   const moved = (await drawings(page))[0];
-  expect(moved.points[0].logical).toBeCloseTo(before.points[0].logical + 4, 1);
-  expect(moved.points[1].logical).toBeCloseTo(before.points[1].logical + 4, 1);
+  expect(moved.points[0].logical).toBeCloseTo(before.points[0].logical + bars, 1);
+  expect(moved.points[1].logical).toBeCloseTo(before.points[1].logical + bars, 1);
 
   // Creation: the 8 anchors show from the first click (before the second commits).
   await page.keyboard.press("Delete");
