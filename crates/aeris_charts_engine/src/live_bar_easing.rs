@@ -347,12 +347,17 @@ impl ChartEngine {
 
     /// The host animation clock (milliseconds): advances every live-bar glide, then moves the
     /// pulse clock only when a pulse is drawn or a glide advanced, so a stamp-only tick changes no
-    /// overlay key and builds nothing. Browser hosts call this from the rAF loop before `render`.
-    pub fn set_animation_time(&mut self, ms: f64) {
+    /// overlay key and builds nothing. Browser hosts call this from the rAF loop before `render`;
+    /// the GPUI adapter calls it from its prepaint step. Returns whether the step changed what the
+    /// chart draws: a glide advanced or settled, or a drawn pulse moved on (a pulse is a change on
+    /// every frame).
+    pub fn set_animation_time(&mut self, ms: f64) -> bool {
         let eased = self.advance_live_bar_easing(ms);
-        if self.last_price_pulse_active() || eased {
+        let pulsing = self.last_price_pulse_active();
+        if pulsing || eased {
             self.animation_time = ms;
         }
+        pulsing || eased
     }
 
     /// Whether any series' live bar is still gliding toward its real values.
@@ -372,8 +377,10 @@ impl ChartEngine {
     }
 
     /// Whether a Rust host must request another frame: an input animation (kinetic scroll, held
-    /// key) or a live-bar glide is in progress. GPUI hosts do not run the pulse clock, so the
-    /// pulse does not join this predicate.
+    /// key) or a live-bar glide is in progress (its first tick only stamps the clock, so the glide
+    /// itself asks for the frame that integrates). A drawn pulse keeps frames coming through the
+    /// clock step instead: [`Self::set_animation_time`] reports a change on every frame while it
+    /// is drawn, and a host requests one more frame after any step that changed chart state.
     pub fn animation_frame_requested(&self) -> bool {
         self.input_animating() || self.live_bar_easing_active()
     }

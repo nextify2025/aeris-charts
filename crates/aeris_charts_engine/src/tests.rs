@@ -7327,7 +7327,7 @@ fn a_rust_host_advancing_only_the_easing_clock_leaves_the_pulse_at_phase_zero() 
     assert!(chart.advance_live_bar_easing(26.0));
     assert_eq!(
         chart.animation_time, 0.0,
-        "GPUI never moves the pulse clock"
+        "advancing only the easing clock leaves the pulse clock alone"
     );
     assert!(chart.animation_frame_requested());
     // A settled chart requests no frame; an advance with nothing unsettled changes nothing.
@@ -7753,6 +7753,83 @@ fn a_non_finite_time_constant_written_by_a_rust_host_is_off() {
     chart.set_animation_time(100.0);
     let expected = NEW_LAST[3] + (next[3] - NEW_LAST[3]) * (1.0 - (-100.0f64 / 1000.0).exp());
     assert!((displayed(&chart, 0)[3] - expected).abs() < 1e-12);
+}
+
+/// The pulse is decorative motion: under reduced motion the host's animation loop stops and the
+/// next frame drops the pulse, whichever host fed the preference.
+#[test]
+fn reduced_motion_removes_the_pulse_and_stops_its_clock() {
+    use aeris_charts_render::draw_list::Prim;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.convert_series_kind(0, SeriesKind::Line);
+    install_bars(&mut chart, 20);
+    chart.fit_content();
+    let circles = |chart: &mut ChartEngine| {
+        chart.build_frame().panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::Circle { .. }))
+            .count()
+    };
+    chart.animation_time = 100.0;
+    let pulse = circles(&mut chart);
+    assert!(pulse > 0, "a line pulses its last price");
+    assert!(chart.last_price_pulse_active());
+
+    let mut options = chart.interaction_options();
+    options.reduced_motion = true;
+    chart.set_interaction_options(options);
+    assert!(
+        !chart.last_price_pulse_active(),
+        "the host's animation loop stops"
+    );
+    assert_eq!(circles(&mut chart), 0, "the next frame drops the pulse");
+    assert_eq!(chart.frame_build_stats().series_rebuilds, 0);
+
+    options.reduced_motion = false;
+    chart.set_interaction_options(options);
+    assert!(chart.last_price_pulse_active());
+    assert_eq!(circles(&mut chart), pulse);
+}
+
+/// `countdown_shown` holds exactly while a countdown row shows at the pinned clock, so a host
+/// re-pins the clock each second only while the row can change.
+#[test]
+fn countdown_shown_follows_the_pinned_clock_and_the_forming_bar() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.time_scale.set_width(800.0);
+    let times: Vec<f64> = (0..20).map(|i| 1_000.0 + i as f64 * 60.0).collect();
+    let values = vec![100.0; times.len()];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    let forming = times[times.len() - 1];
+    assert!(chart.series[0].countdown_visible);
+    assert!(!chart.countdown_shown(), "no clock pinned, no countdown");
+
+    chart.set_now_seconds(forming + 15.0);
+    assert!(chart.countdown_shown());
+    chart.set_now_seconds(forming + 60.0);
+    assert!(!chart.countdown_shown(), "the forming bar closed");
+    chart.set_now_seconds(forming - 5.0);
+    assert!(
+        !chart.countdown_shown(),
+        "the clock is before the bar opens"
+    );
+
+    chart.set_now_seconds(forming + 15.0);
+    chart.set_bar_countdown_active(false);
+    assert!(!chart.countdown_shown(), "the session is closed");
+    chart.set_bar_countdown_active(true);
+    chart.series[0].countdown_visible = false;
+    assert!(!chart.countdown_shown(), "the series hides its countdown");
+    chart.series[0].countdown_visible = true;
+    assert!(chart.countdown_shown());
+    chart.set_series_visible(0, false);
+    assert!(
+        !chart.countdown_shown(),
+        "a hidden series shows no countdown"
+    );
 }
 
 // ---- primary-series removal + series ordering ----

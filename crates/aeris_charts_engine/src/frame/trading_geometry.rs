@@ -1652,6 +1652,10 @@ impl ChartEngine {
             }
         }
 
+        // A control lights up only while it can act; a locked or status-inert one shows no hover
+        // or press feedback and no tooltip (`trading_feedback`).
+        let feedback_hover = self.trading_feedback(self.trading_state.feedback_hover.as_ref());
+        let feedback_pressed = self.trading_feedback(self.trading_state.feedback_pressed.as_ref());
         for position in &self.trading_state.positions {
             if !self
                 .trading_state
@@ -1669,10 +1673,10 @@ impl ChartEngine {
             ) else {
                 continue;
             };
-            let hovered = self.trading_state.feedback_hover.as_ref().filter(|hit| {
+            let hovered = feedback_hover.filter(|hit| {
                 matches!(&hit.object, crate::TradingObjectId::Position(id) if id == &position.id)
             });
-            let pressed = self.trading_state.feedback_pressed.as_ref().filter(|hit| {
+            let pressed = feedback_pressed.filter(|hit| {
                 matches!(&hit.object, crate::TradingObjectId::Position(id) if id == &position.id)
             });
             let position_color = self.trading_position_color(position.side);
@@ -1818,10 +1822,10 @@ impl ChartEngine {
             } else {
                 base_color
             };
-            let hovered = self.trading_state.feedback_hover.as_ref().filter(
+            let hovered = feedback_hover.filter(
                 |hit| matches!(&hit.object, crate::TradingObjectId::Order(id) if id == &order.id),
             );
-            let pressed = self.trading_state.feedback_pressed.as_ref().filter(
+            let pressed = feedback_pressed.filter(
                 |hit| matches!(&hit.object, crate::TradingObjectId::Order(id) if id == &order.id),
             );
             lines.push(Prim::HLine {

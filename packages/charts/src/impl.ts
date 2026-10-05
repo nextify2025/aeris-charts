@@ -4310,9 +4310,12 @@ class trading_impl implements trading_api {
     this.chart.repaint();
   }
 
+  /** Returns whether the chart showed the position. The removal can also answer the close
+   *  request awaiting the host for a position the chart already removed, which frees every
+   *  control, so the chart repaints whenever the engine's frame changed, not only on `true`. */
   remove_position(id: string): boolean {
     const changed = this.chart.wasm.remove_trading_position(id);
-    if (changed) this.chart.repaint();
+    this.chart.repaint_if_pending();
     return changed;
   }
 
@@ -4321,9 +4324,11 @@ class trading_impl implements trading_api {
     this.chart.repaint();
   }
 
+  /** Returns whether the chart showed the order; like `remove_position`, the chart repaints
+   *  whenever the removal changed the engine's frame (an answered cancel request included). */
   remove_order(id: string): boolean {
     const changed = this.chart.wasm.remove_working_order(id);
-    if (changed) this.chart.repaint();
+    this.chart.repaint_if_pending();
     return changed;
   }
 
@@ -4351,6 +4356,8 @@ class trading_impl implements trading_api {
   place_bracket_order(drawing_id: number, quantity: number): void {
     assert_trading_result(this.chart.wasm.place_bracket_order_from_drawing(drawing_id, quantity));
     this.dispatch_pending_intents();
+    // The request locks every trading control until the host answers; show that at once.
+    this.chart.repaint_if_pending();
   }
 
   hit_at(x: number, y: number): trading_hit | null {
@@ -4471,6 +4478,7 @@ export class chart_impl implements chart_api {
   private readonly crosshair_action_handlers = new Set<crosshair_action_request_handler>();
   private observer: ResizeObserver | null = null;
   private detach_gestures: (() => void) | null = null;
+  private input_cursor_presenter: (() => void) | null = null;
   private removed = false;
   private readonly series_by_id = new Map<number, series_impl>();
   private readonly general_series_by_id = new Map<number, general_series_impl>();
@@ -4954,6 +4962,26 @@ export class chart_impl implements chart_api {
     this.ring_raf = requestAnimationFrame(this.ring_tick);
   };
 
+  /** The gesture recognizer's cursor presenter, or `null` once it detaches. */
+  set_input_cursor_presenter(presenter: (() => void) | null): void {
+    this.input_cursor_presenter = presenter;
+  }
+
+  /** Present the engine's current cursor on the overlay. Host calls that change what a resting
+   *  pointer is over (a trading answer, snapshot, or update, a drawing tool change, a key) update
+   *  the engine's cursor at once, so the overlay follows without waiting for pointer motion. */
+  present_input_cursor(): void {
+    this.input_cursor_presenter?.();
+  }
+
+  /** Repaint when a host call changed the engine's frame, else present the cursor it may have
+   *  changed. Host calls that alter what a resting pointer is over (a trading answer, a tool
+   *  change) update the hover highlight and cursor inside the engine; this shows both at once. */
+  repaint_if_pending(): void {
+    if (this.wasm.frame_pending()) this.repaint();
+    else this.present_input_cursor();
+  }
+
   /** Repaint unless torn down. Named distinctly from the public `render` for internal use. */
   repaint(): void {
     if (this.repaint_raf !== null) {
@@ -4962,6 +4990,7 @@ export class chart_impl implements chart_api {
     }
     if (!this.removed) {
       this.wasm.render();
+      this.present_input_cursor();
       // The text editor tracks its anchor through the change that drove this repaint
       // (wheel zoom/scroll, pinch, resize, data update) — before plugin passes composite.
       this.text_editor_reposition?.();
@@ -6934,6 +6963,7 @@ export class chart_impl implements chart_api {
       this.tool_listener?.(tool);
       for (const handler of this.tool_change_subs) handler(tool);
     }
+    this.repaint_if_pending();
   }
 
   active_drawing_tool(): drawing_kind | null {
@@ -6968,24 +6998,9 @@ export class chart_impl implements chart_api {
     return info ? new drawing_impl(this, info.id, info.kind, info.pane_index) : null;
   }
 
-  /** Whether an interactive drawing tool is armed (the recognizer routes pane clicks to creation). */
-  creation_armed(): boolean {
-    return this.active_drawing_tool() !== null;
-  }
-
   /** Whether an interactive creation is mid-placement/capture in the engine controller. */
   creation_active(): boolean {
     return this.wasm.drawing_create_active() || this.wasm.drawing_tool_capture_active();
-  }
-
-  /** Whether the current creation owns a captured pointer stream (freehand today, extensible). */
-  creation_capture_active(): boolean {
-    return this.wasm.drawing_tool_capture_active();
-  }
-
-  /** Whether the armed placement is a variable sequence requiring explicit finish. */
-  creation_sequence_active(): boolean {
-    return this.wasm.drawing_tool_sequence_active();
   }
 
   private drawing_created(created_id: number, controller_owned = false): boolean {
@@ -7003,55 +7018,6 @@ export class chart_impl implements chart_api {
     return true;
   }
 
-  /** Forward an armed-tool pointer press. Returns true only when placement committed on press. */
-  creation_pointer_down(x: number, y: number, magnet = false, straighten = false): boolean {
-    if (!this.creation_armed() || this.pane_index_at(x, y) === null) return false;
-    return this.drawing_created(Number(this.wasm.drawing_tool_pointer_down(x, y, magnet, straighten)));
-  }
-
-  /** Forward an armed-tool pointer move; `pressed` identifies an active captured drag stream. */
-  creation_pointer_move(
-    x: number,
-    y: number,
-    magnet = false,
-    straighten = false,
-    pressed = false,
-  ): boolean {
-    if (!this.creation_armed()) return false;
-    return this.wasm.drawing_tool_pointer_move(x, y, magnet, straighten, pressed);
-  }
-
-  /** Forward pointer release; returns true when the release committed a drawing. */
-  creation_pointer_up(x: number, y: number, magnet = false, straighten = false): boolean {
-    if (!this.creation_armed()) return false;
-    return this.drawing_created(Number(this.wasm.drawing_tool_pointer_up(x, y, magnet, straighten)));
-  }
-
-  /** Route one click/tap activation into the canonical placement state machine. */
-  creation_click(x: number, y: number, magnet = false, straighten = false): boolean {
-    const pane = this.pane_index_at(x, y);
-    if (!this.creation_armed() || pane === null) return false;
-    const pinned_pane = Number(this.wasm.active_drawing_tool_pane());
-    if (pinned_pane >= 0 && pane !== pinned_pane) return false;
-    this.drawing_created(Number(this.wasm.drawing_tool_activate(x, y, magnet, straighten)));
-    return true;
-  }
-
-  /** Commit any active variable-sequence drawing (double-click/Enter). */
-  creation_finish(): boolean {
-    return this.drawing_created(Number(this.wasm.drawing_tool_finish()));
-  }
-
-  /** Remove the latest placed vertex from an active variable-sequence drawing. */
-  creation_pop_anchor(): boolean {
-    return this.wasm.drawing_tool_pop_anchor();
-  }
-
-  /** Abort an interrupted pointer capture while leaving the selected tool armed. */
-  cancel_active_drawing_creation(): void {
-    this.wasm.cancel_drawing_creation();
-  }
-
   /** Escape: disarm the tool (cancelling any pending creation) and deselect any drawing. */
   cancel_drawing_interaction(): void {
     const changed = this.active_drawing_tool() !== null;
@@ -7061,6 +7027,7 @@ export class chart_impl implements chart_api {
       for (const handler of this.tool_change_subs) handler(null);
     }
     this.wasm.set_selected_drawing(undefined);
+    this.repaint_if_pending();
   }
 
   // ---------------------------------------------------------------------------------------------

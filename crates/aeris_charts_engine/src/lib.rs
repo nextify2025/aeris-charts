@@ -2754,6 +2754,22 @@ impl ChartEngine {
         }
     }
 
+    /// Whether a candle-close countdown row shows at the pinned clock (`now_override`): a
+    /// visible series with `countdown_visible` has an open forming bar while the market trades.
+    /// The row changes every second while this holds, so a host that pins the clock re-pins it
+    /// and repaints once a second until it stops holding.
+    pub fn countdown_shown(&self) -> bool {
+        self.now_override.is_some_and(|now| {
+            self.series
+                .iter()
+                .filter(|series| series.visible && series.countdown_visible)
+                .any(|series| {
+                    self.series_countdown_layout_key_at(series.id, Some(now))
+                        .is_some()
+                })
+        })
+    }
+
     /// Whether the instrument's market is trading, so its bars can close. While inactive (the
     /// session is closed) every candle-close countdown row hides, independent of each series'
     /// `countdown_visible` preference and of the host clock; reactivating restores them.
@@ -3730,11 +3746,13 @@ impl ChartEngine {
 
     /// Whether the frame draws a last-price pulse, which is exactly when a host must keep its
     /// animation clock running. Mirrors `build_last_pulse_frame`: the primary series owns the
-    /// pulse and needs data, so an empty or opted-out chart never runs an animation loop.
+    /// pulse and needs data, so an empty or opted-out chart never runs an animation loop. The
+    /// pulse is decorative motion, so `InteractionOptions::reduced_motion` removes it.
     pub fn last_price_pulse_active(&self) -> bool {
-        self.primary_series().is_some_and(|series| {
-            series.last_price_animation && !self.data.plot(series.id).is_empty()
-        })
+        !self.interaction_options().reduced_motion
+            && self.primary_series().is_some_and(|series| {
+                series.last_price_animation && !self.data.plot(series.id).is_empty()
+            })
     }
 
     /// Series ids in stable saved order (bottom to top; topmost LAST), live series only.

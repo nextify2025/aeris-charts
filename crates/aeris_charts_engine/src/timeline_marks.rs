@@ -554,6 +554,12 @@ impl ChartEngine {
         true
     }
 
+    /// Whether the hovered token's title tooltip is not shown yet. The shared hover dwell runs
+    /// while this (or the trading counterpart) holds, and only then can it arm the tooltip.
+    pub(crate) fn timeline_tooltip_pending(&self) -> bool {
+        self.timeline_marks.hovered().is_some() && !self.timeline_marks.tooltip_armed
+    }
+
     pub(crate) fn clear_timeline_hover(&mut self) -> bool {
         if self.timeline_marks.hovered.is_none() && !self.timeline_marks.tooltip_armed {
             return false;

@@ -1848,7 +1848,8 @@ impl ChartEngine {
         let Some(series) = self.primary_series() else {
             return;
         };
-        if !series.last_price_animation {
+        // Reduced motion removes the decorative pulse, as `last_price_pulse_active` reports.
+        if !series.last_price_animation || self.interaction_options().reduced_motion {
             return;
         }
         let series_id = series.id;

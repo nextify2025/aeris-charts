@@ -6200,6 +6200,8 @@ impl ChartEngine {
             }),
             _ => None,
         };
+        // An armed tool owns order and position line bodies; a resting pointer reads the change.
+        self.refresh_resting_pointer_affordance();
         true
     }
 
@@ -6224,8 +6226,8 @@ impl ChartEngine {
         self.drawing_controller.brush.is_some()
     }
 
-    /// Whether the armed tool is an explicitly finished variable sequence. Hosts use this for
-    /// generic double-activation and Backspace routing without naming a concrete tool kind.
+    /// Whether the armed tool is an explicitly finished variable sequence. The input controller
+    /// uses this for double-activation routing without naming a concrete tool kind.
     pub fn drawing_tool_sequence_active(&self) -> bool {
         self.active_drawing_tool()
             .is_some_and(|kind| kind.spec().placement.is_sequence())
@@ -6290,6 +6292,9 @@ impl ChartEngine {
             };
         }
         self.drawing_controller.armed = None;
+        // One-shot: the disarmed tool hands order and position lines back to trading, also under
+        // a resting pointer (Enter finishing a path, or a host's direct tool calls).
+        self.refresh_resting_pointer_affordance();
         DrawingCreationUpdate {
             consumed: true,
             changed: true,
@@ -6384,8 +6389,11 @@ impl ChartEngine {
         }
     }
 
-    /// Forward pointer release. Freehand commits here; other placement classes wait for the
-    /// platform's click/tap activation so click-cancellation rules remain host-native.
+    /// Forward pointer release. Freehand commits here, and Text already placed on press. The
+    /// click-placed classes (fixed-count, multi-click, single-click preset) place anchors only
+    /// through [`Self::drawing_tool_activate`], which the input controller calls for a click (a
+    /// release within the shared 5 px slop of its press), so their press-drag-release places
+    /// nothing.
     pub fn drawing_tool_pointer_up(
         &mut self,
         x: f64,
@@ -6474,10 +6482,11 @@ impl ChartEngine {
         self.creation_update_for_commit(kind, id, false)
     }
 
+    /// Step back the armed tool's placement by its latest placed anchor (see
+    /// [`ChartEngine::drawing_create_pop_anchor`]), the step the chart's Backspace and Delete take
+    /// once a placement is under way.
     pub fn drawing_tool_pop_anchor(&mut self) -> bool {
-        self.active_drawing_tool()
-            .is_some_and(|kind| kind.spec().placement.is_sequence())
-            && self.drawing_create_pop_anchor()
+        self.active_drawing_tool().is_some() && self.drawing_create_pop_anchor()
     }
 
     /// Cancel creation and disarm the tool as one atomic controller operation. Escape routes
@@ -6489,6 +6498,7 @@ impl ChartEngine {
         self.drawing_controller.pending = None;
         self.drawing_controller.brush = None;
         self.drawing_controller.measure = None;
+        self.refresh_resting_pointer_affordance();
     }
 
     // --- transient Shift-click measure ------------------------------------------------------
@@ -6973,19 +6983,27 @@ impl ChartEngine {
         self.commit_pending_drawing(pending)
     }
 
-    /// Remove the latest committed vertex from an active multi-click path. The live preview is
-    /// retained so the next segment continues following the pointer.
+    /// Remove the latest placed anchor of the drawing being placed: a multi-click path's vertex
+    /// or a fixed-count tool's click (a trend line's first point, an XABCD pattern's third). The
+    /// live preview is retained so the drawing keeps following the pointer, and a placement
+    /// stepped back to no points stays under way: its next click places afresh and may bind
+    /// another pane. Returns false when no anchor was removed.
     pub fn drawing_create_pop_anchor(&mut self) -> bool {
         let Some(pending) = self.drawing_controller.pending.as_mut() else {
             return false;
         };
-        if !pending.drawing.kind.spec().placement.is_sequence()
-            || pending.drawing.points.pop().is_none()
-        {
+        if pending.drawing.points.pop().is_none() {
             return false;
         }
         self.invalidate_frame_drawings();
         true
+    }
+
+    /// Whether a drawing is being placed: an anchored placement after its first click (also one
+    /// stepped back to no points) or a freehand stroke in progress. That drawing then owns the
+    /// chart's Backspace and Delete.
+    pub(crate) fn drawing_placement_under_way(&self) -> bool {
+        self.drawing_controller.pending.is_some() || self.drawing_controller.brush.is_some()
     }
 
     /// Update the creation preview point from a mouse move (no-op while unarmed or off the data).

@@ -2,15 +2,18 @@
 //! into a live engine, and where the browser host normalizes the same gesture, a twin engine fed
 //! the browser's formula must end in the same state.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use aeris_charts_engine::{
-    ChartInputEvent, ChartRegion, DrawingId, DrawingKind, DrawingPoint, InteractionOptions,
-    OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PriceScaleTarget, TradingHitKind,
-    TradingPriceScale, TradingSnapshot, WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
+    ChartInputEvent, ChartRegion, DrawingId, DrawingKind, DrawingPoint, InstrumentMetadata,
+    InteractionOptions, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PriceScaleTarget,
+    SeriesKind, TradingHitKind, TradingIntentAction, TradingPriceScale, TradingSnapshot,
+    WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
 };
 use aeris_charts_render::draw_list::Prim;
-use gpui::{bounds, px, size, Keystroke, MouseButton};
+use gpui::{bounds, px, size, AppContext, Entity, Keystroke, MouseButton, TestAppContext};
 
 use super::*;
 
@@ -45,6 +48,73 @@ fn input() -> GpuiChartInput {
         size(px(800.0), px(500.0)),
     ));
     input
+}
+
+/// [`input`] on the test app's executor clock, as a GPUI host constructs it.
+fn input_on(cx: &mut TestAppContext) -> GpuiChartInput {
+    let mut input = cx.update(|cx| GpuiChartInput::new(cx));
+    input.set_canvas_bounds(bounds(
+        point(px(CANVAS.0), px(CANVAS.1)),
+        size(px(800.0), px(500.0)),
+    ));
+    input
+}
+
+/// A stand-in for the view that drew the chart, and a count of the notifies it receives.
+fn chart_view(cx: &mut TestAppContext) -> (Entity<()>, Rc<Cell<usize>>, gpui::Subscription) {
+    let view = cx.new(|_| ());
+    let notifies = Rc::new(Cell::new(0));
+    let count = notifies.clone();
+    let observer = cx.update(|cx| cx.observe(&view, move |_, _| count.set(count.get() + 1)));
+    (view, notifies, observer)
+}
+
+/// Move the executor clock and run whatever became due.
+fn advance_ms(cx: &mut TestAppContext, ms: u64) {
+    cx.executor().advance_clock(Duration::from_millis(ms));
+    cx.run_until_parked();
+}
+
+/// [`chart`] with one working sell order, and the pane point of its close button.
+fn trading_chart() -> (ChartEngine, (f64, f64)) {
+    let mut chart = chart();
+    let price = 106.0;
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            orders: vec![working_order(price)],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    chart.build_frame();
+    let y = chart.series_price_to_coordinate(0, price).unwrap();
+    let close_x = (0..=(chart.pane_w * 2.0) as usize)
+        .map(|step| step as f64 / 2.0)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+        })
+        .expect("the order shows a close button");
+    (chart, (close_x, y))
+}
+
+/// A hover listener's tail: the adapter call, then the refresh.
+fn hover_and_refresh(
+    cx: &mut TestAppContext,
+    input: &mut GpuiChartInput,
+    chart: &mut ChartEngine,
+    at: Point<Pixels>,
+) {
+    input.mouse_move(chart, &hover(at));
+    cx.update(|cx| input.refresh(chart, cx));
+}
+
+fn tooltip_shown(chart: &mut ChartEngine) -> bool {
+    chart.build_frame().panes.iter().any(|pane| {
+        pane.main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "Cancel order"))
+    })
 }
 
 /// The window position of pane point `(x, y)` for a canvas at [`CANVAS`].
@@ -181,6 +251,32 @@ fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
     (id, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
 }
 
+/// A one-lot working sell limit at `price` on the right scale of pane 0.
+fn working_order(price: f64) -> WorkingOrder {
+    WorkingOrder {
+        id: OrderId::new("order-1".to_string()).unwrap(),
+        account_id: None,
+        pane_index: 0,
+        price_scale: TradingPriceScale::Right,
+        side: OrderSide::Sell,
+        kind: OrderKind::Limit,
+        role: OrderRole::Working,
+        status: OrderStatus::Working,
+        price,
+        stop_price: None,
+        trailing_trigger_price: None,
+        break_even_trigger_price: None,
+        quantity: 1.0,
+        filled_quantity: 0.0,
+        position_id: None,
+        parent_order_id: None,
+        bracket_id: None,
+        oco_group_id: None,
+        revision: 1,
+        annotations: Vec::new(),
+    }
+}
+
 /// An open typing session on a text drawing that reads `text`, with the caret at its end.
 fn text_session(chart: &mut ChartEngine, text: &str) -> DrawingId {
     let options = format!(r#"{{"text":"{text}"}}"#);
@@ -313,6 +409,219 @@ fn mouse_events_pan_past_the_slop_select_on_click_and_abandon_a_lost_release() {
     assert!(!chart.drawing_drag_active());
     assert_near(chart.crosshair.unwrap(), (400.0, 300.0));
     assert_ne!(cursor_style(chart.input_cursor()), CursorStyle::ClosedHand);
+}
+
+/// A press that wobbles under the shared 5 px slop on a drawing or an order line is a click: it
+/// moves nothing and asks the host for nothing. A drag past the slop moves either object.
+#[test]
+fn a_wobbling_click_moves_no_drawing_or_order_and_a_drag_past_the_slop_does() {
+    let mut chart = chart();
+    let input = input();
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            // Finer than a pixel, so any pointer offset from the line is another price.
+            instrument: InstrumentMetadata {
+                tick_size: Some(0.01),
+                ..InstrumentMetadata::default()
+            },
+            // A protection order: its line is a drag target (an entry's line is a readout).
+            orders: vec![WorkingOrder {
+                role: OrderRole::TakeProfit,
+                ..working_order(106.0)
+            }],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    let (id, body) = trend_line_body(&mut chart);
+    let points = chart.drawing(id).unwrap().points.clone();
+    let anchors = [0, 1].map(|index| chart.drawing_point_to_coordinate(id, index).unwrap());
+    let revision = chart.drawing_revision();
+
+    let press = window(&chart, body.0, body.1);
+    input.mouse_down(&mut chart, &down(press, 1));
+    for (dx, dy) in [(2.0, -1.0), (1.0, 3.0)] {
+        let wobble = window(&chart, body.0 + dx, body.1 + dy);
+        input.mouse_move(&mut chart, &pressed(wobble));
+        assert_eq!(chart.drawing(id).unwrap().points, points, "{dx},{dy}");
+    }
+    let release = window(&chart, body.0 + 1.0, body.1 + 3.0);
+    input.mouse_up(&mut chart, &up(release));
+    assert_eq!(chart.drawing(id).unwrap().points, points);
+    assert_eq!(chart.drawing_revision(), revision);
+    assert_eq!(chart.selected_drawing(), Some(id), "the press is a click");
+
+    drag(&input, &mut chart, body, (body.0 + 30.0, body.1 - 20.0));
+    for (index, before) in anchors.into_iter().enumerate() {
+        assert_near(
+            chart.drawing_point_to_coordinate(id, index).unwrap(),
+            (before.0 + 30.0, before.1 - 20.0),
+        );
+    }
+    assert_eq!(chart.drawing_revision(), revision + 1);
+
+    let line_y = chart.series_price_to_coordinate(0, 106.0).unwrap();
+    let y = line_y + 4.0;
+    let x = (80..chart.pane_w as usize)
+        .map(|x| x as f64)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::OrderLine)
+        })
+        .expect("the order line is a drag target 4 px off its price");
+    let press = window(&chart, x, y);
+    input.mouse_down(&mut chart, &down(press, 1));
+    for (dx, dy) in [(1.0, 1.0), (-1.0, 3.0)] {
+        let wobble = window(&chart, x + dx, y + dy);
+        input.mouse_move(&mut chart, &pressed(wobble));
+    }
+    let release = window(&chart, x - 1.0, y + 3.0);
+    input.mouse_up(&mut chart, &up(release));
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders[0].price, 106.0);
+
+    drag(&input, &mut chart, (x, line_y), (x, line_y - 30.0));
+    let intents = chart.take_trading_intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(intents[0].action, TradingIntentAction::ModifyOrder);
+}
+
+/// Through real GPUI events, an armed drawing tool owns an order line: the pointer reads as the
+/// tool's crosshair there, a drag along it moves no order, and two clicks place a trend line from
+/// it. The order's close button keeps its pointer cursor and its click while a tool is armed.
+#[test]
+fn an_armed_tool_owns_order_lines_and_leaves_the_close_button_its_click() {
+    let mut chart = chart();
+    let input = input();
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            // A protection order: its line drags whenever no tool is armed.
+            orders: vec![WorkingOrder {
+                role: OrderRole::TakeProfit,
+                ..working_order(106.0)
+            }],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    chart.build_frame();
+    let line_y = chart.series_price_to_coordinate(0, 106.0).unwrap();
+    let x = 80.0;
+    assert_eq!(
+        chart.trading_hit_at(x, line_y).map(|hit| hit.kind),
+        Some(TradingHitKind::OrderLine)
+    );
+    let close_x = (0..=(chart.pane_w * 2.0) as usize)
+        .map(|step| step as f64 / 2.0)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, line_y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+        })
+        .expect("the order shows a close button");
+
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    let on_line = window(&chart, x, line_y);
+    input.mouse_move(&mut chart, &hover(on_line));
+    assert_eq!(chart.input_cursor(), ChartCursor::Crosshair);
+    drag(&input, &mut chart, (x, line_y), (x, line_y - 30.0));
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders[0].price, 106.0);
+
+    click(&input, &mut chart, (x, line_y), 1);
+    click(&input, &mut chart, (x + 150.0, line_y + 40.0), 1);
+    let created = chart
+        .take_input_events()
+        .into_iter()
+        .filter(|event| matches!(event, ChartInputEvent::DrawingCreated(_)))
+        .count();
+    assert_eq!(created, 1, "the second click places the trend line");
+    assert_eq!(chart.active_drawing_tool(), None, "one-shot tools disarm");
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders[0].price, 106.0);
+    input.mouse_move(&mut chart, &hover(on_line));
+    assert_eq!(chart.input_cursor(), ChartCursor::VerticalGrab);
+
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    let on_close = window(&chart, close_x, line_y);
+    input.mouse_move(&mut chart, &hover(on_close));
+    assert_eq!(chart.input_cursor(), ChartCursor::Pointer);
+    click(&input, &mut chart, (close_x, line_y), 1);
+    let intents = chart.take_trading_intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(intents[0].action, TradingIntentAction::CancelOrder);
+    assert_eq!(chart.active_drawing_tool(), Some(DrawingKind::TrendLine));
+}
+
+/// Through real GPUI events, an order change awaiting the host leaves the chart's trading controls
+/// inert: the arrow over the moved line and over the close button, no tooltip wake, and a click
+/// that cancels nothing. The host's answer, or its own update of the order when it never answers,
+/// brings the grab cursor back under the resting pointer without another mouse move.
+#[test]
+fn an_order_change_awaiting_the_host_reads_inert_until_the_host_answers() {
+    let mut chart = chart();
+    let input = input();
+    let take_profit = |price: f64, revision: u32| WorkingOrder {
+        role: OrderRole::TakeProfit,
+        revision,
+        ..working_order(price)
+    };
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            orders: vec![take_profit(106.0, 1)],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    chart.build_frame();
+    let line_y = chart.series_price_to_coordinate(0, 106.0).unwrap();
+    let x = 80.0;
+    let close_x = (0..=(chart.pane_w * 2.0) as usize)
+        .map(|step| step as f64 / 2.0)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, line_y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+        })
+        .expect("the order shows a close button");
+    let grab = if cfg!(target_os = "windows") {
+        CursorStyle::ResizeUpDown
+    } else {
+        CursorStyle::OpenHand
+    };
+    let on_line = window(&chart, x, line_y);
+    input.mouse_move(&mut chart, &hover(on_line));
+    assert_eq!(cursor_style(chart.input_cursor()), grab);
+
+    drag(&input, &mut chart, (x, line_y), (x, line_y - 30.0));
+    let intents = chart.take_trading_intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(intents[0].action, TradingIntentAction::ModifyOrder);
+    let moved_y = line_y - 30.0;
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+
+    let on_close = window(&chart, close_x, moved_y);
+    input.mouse_move(&mut chart, &hover(on_close));
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+    assert_eq!(chart.input_wake_deadline_ms(), None, "no tooltip dwell");
+    click(&input, &mut chart, (close_x, moved_y), 1);
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders.len(), 1);
+
+    let on_moved_line = window(&chart, x, moved_y);
+    input.mouse_move(&mut chart, &hover(on_moved_line));
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+    assert!(chart.resolve_trading_intent(intents[0].sequence, true));
+    assert_eq!(cursor_style(chart.input_cursor()), grab);
+
+    // A host that answers with its own order update instead of resolving the intent.
+    drag(&input, &mut chart, (x, moved_y), (x, moved_y - 30.0));
+    let second = chart.take_trading_intents();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+    chart
+        .update_working_order(take_profit(second[0].price.unwrap(), 2))
+        .unwrap();
+    assert_eq!(cursor_style(chart.input_cursor()), grab);
+    assert!(!chart.resolve_trading_intent(second[0].sequence, false));
 }
 
 #[test]
@@ -736,11 +1045,11 @@ fn prepare_frame_forwards_one_coalesced_brush_knot_per_prepaint() {
             input.mouse_move(&mut chart, &pressed(position));
         }
         assert!(
-            input.prepare_frame(&mut chart),
+            GpuiChartInput::advance(&mut chart, input.now_ms(), false),
             "the newest sample is a knot"
         );
         assert!(
-            !input.prepare_frame(&mut chart),
+            !GpuiChartInput::advance(&mut chart, input.now_ms(), false),
             "an idle prepaint adds nothing"
         );
         knots.push(input.pane_point(&chart, window(&chart, at.0, at.1)));
@@ -763,111 +1072,331 @@ fn prepare_frame_forwards_one_coalesced_brush_knot_per_prepaint() {
     }
 }
 
-#[test]
-fn wake_delay_schedules_the_close_button_tooltip_dwell() {
-    let mut chart = chart();
-    let mut input = input();
-    assert_eq!(input.wake_delay(&chart), None);
+/// A GPUI host's adapter reads GPUI's executor clock, the clock its timers fire on, so the
+/// tooltip dwell deadline and the wake armed for it share one time base, and
+/// `TestAppContext::advance_clock` moves both.
+#[gpui::test]
+fn the_adapter_clock_is_the_gpui_executor_clock(cx: &mut TestAppContext) {
+    let input = input_on(cx);
+    let start = input.now_ms();
+    advance_ms(cx, 250);
+    assert_eq!(input.now_ms() - start, 250.0);
 
-    let price = 106.0;
-    chart
-        .set_trading_snapshot(TradingSnapshot {
-            orders: vec![WorkingOrder {
-                id: OrderId::new("order-1".to_string()).unwrap(),
-                account_id: None,
-                pane_index: 0,
-                price_scale: TradingPriceScale::Right,
-                side: OrderSide::Sell,
-                kind: OrderKind::Limit,
-                role: OrderRole::Working,
-                status: OrderStatus::Working,
-                price,
-                stop_price: None,
-                trailing_trigger_price: None,
-                break_even_trigger_price: None,
-                quantity: 1.0,
-                filled_quantity: 0.0,
-                position_id: None,
-                parent_order_id: None,
-                bracket_id: None,
-                oco_group_id: None,
-                revision: 1,
-                annotations: Vec::new(),
-            }],
-            ..TradingSnapshot::default()
-        })
-        .unwrap();
-    chart.build_frame();
-    let y = chart.series_price_to_coordinate(0, price).unwrap();
-    let close_x = (0..=(chart.pane_w * 2.0) as usize)
-        .map(|step| step as f64 / 2.0)
-        .find(|&x| {
-            chart
-                .trading_hit_at(x, y)
-                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
-        })
-        .expect("the order shows a close button");
-    let tooltip_shown = |chart: &mut ChartEngine| {
-        chart.build_frame().panes.iter().any(|pane| {
-            pane.main
-                .iter()
-                .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "Cancel order"))
-        })
-    };
+    let (mut chart, close) = trading_chart();
+    let now = input.now_ms();
+    let on_close = window(&chart, close.0, close.1);
+    input.mouse_move(&mut chart, &hover(on_close));
+    assert_eq!(
+        chart.input_wake_deadline_ms(),
+        Some(now + TRADING_TOOLTIP_DWELL_MS),
+        "hovering the close button starts the dwell on the adapter clock"
+    );
 
-    let close = window(&chart, close_x, y);
-    let before = input.now_ms();
-    input.mouse_move(&mut chart, &hover(close));
-    let after = input.now_ms();
+    // The dwell belongs to the hovered control: a wobble inside the button, later on the same
+    // clock, keeps the deadline it already started.
+    advance_ms(cx, 100);
+    for dy in [1.0, -2.0] {
+        let wobble = window(&chart, close.0, close.1 + dy);
+        input.mouse_move(&mut chart, &hover(wobble));
+        assert_eq!(
+            chart.input_wake_deadline_ms(),
+            Some(now + TRADING_TOOLTIP_DWELL_MS),
+            "{dy}"
+        );
+    }
+}
+
+/// `refresh` notifies the view that drew the chart and keeps exactly one wake for the engine's
+/// deadline: an unchanged deadline keeps the armed wake, a moved or cleared one replaces or drops
+/// it, and a fired wake notifies the view once.
+#[gpui::test]
+fn refresh_notifies_the_chart_view_and_keeps_one_wake_per_deadline(cx: &mut TestAppContext) {
+    let (view, notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    let on_close = window(&chart, close.0, close.1);
+    let away = window(&chart, close.0, close.1 + 60.0);
+
+    // Before a prepaint records the view there is nothing to notify and nothing to wake: the
+    // first draw paints everything.
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert!(input.wake.is_none());
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 0);
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+
+    input.view = Some(view.entity_id());
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(
+        notifies.get(),
+        1,
+        "refresh notifies the view that drew the chart"
+    );
+    let first = chart
+        .input_wake_deadline_ms()
+        .expect("hovering the close button starts the dwell");
+    assert_eq!(input.wake.as_ref().map(|wake| wake.deadline), Some(first));
+
+    // Holding still over the button keeps the deadline, and the refresh keeps the armed wake, so
+    // the dwell still ends 450 ms after the hover rather than 450 ms after the last motion.
+    advance_ms(cx, 300);
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(chart.input_wake_deadline_ms(), Some(first));
+    assert_eq!(notifies.get(), 2);
+    advance_ms(cx, 149);
+    assert_eq!(notifies.get(), 2, "the dwell has not elapsed");
+    advance_ms(cx, 1);
+    assert_eq!(
+        notifies.get(),
+        3,
+        "the wake notifies the view at the deadline"
+    );
+
+    // A refresh after the wake fired, before a prepaint ticked the engine past the deadline,
+    // keeps the fired wake instead of arming a second timer for the same deadline.
+    cx.update(|cx| input.refresh(&chart, cx));
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 4, "only the refresh notified");
+
+    // Leaving the button drops the wake; a dropped wake never fires.
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+    assert!(input.wake.is_none());
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    let second = chart
+        .input_wake_deadline_ms()
+        .expect("re-entering restarts the dwell");
+    assert!(second > first);
+    assert_eq!(input.wake.as_ref().map(|wake| wake.deadline), Some(second));
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+    assert!(input.wake.is_none());
+    assert_eq!(notifies.get(), 7);
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 7, "the replaced wakes never fire");
+
+    // Re-entering arms one wake, and exactly one notify follows its deadline.
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(notifies.get(), 8);
+    advance_ms(cx, 449);
+    assert_eq!(notifies.get(), 8);
+    advance_ms(cx, 1);
+    assert_eq!(notifies.get(), 9);
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 9);
+
+    // A press on the button clears the deadline, and the refresh drops the pending wake.
+    hover_and_refresh(cx, &mut input, &mut chart, away);
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert!(input.wake.is_some());
+    input.mouse_down(&mut chart, &down(on_close, 1));
+    cx.update(|cx| input.refresh(&chart, cx));
+    assert_eq!(chart.input_wake_deadline_ms(), None);
+    assert!(input.wake.is_none());
+}
+
+/// A timer can elapse a hair before the `f64` deadline it was armed for (platform timer slack,
+/// Windows' 100 ns timer truncation, or `f64` rounding of the adapter clock). The prepaint after a
+/// fired wake still reaches the deadline, so the tooltip cannot stall until the next input.
+#[gpui::test]
+fn a_fired_wake_reaches_its_deadline_even_when_the_clock_reads_just_before_it(
+    cx: &mut TestAppContext,
+) {
+    let (view, _notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    input.view = Some(view.entity_id());
+    let on_close = window(&chart, close.0, close.1);
+    input.mouse_move(&mut chart, &hover(on_close));
     let deadline = chart
         .input_wake_deadline_ms()
         .expect("hovering the close button starts the dwell");
-    assert!(
-        (before + TRADING_TOOLTIP_DWELL_MS..=after + TRADING_TOOLTIP_DWELL_MS).contains(&deadline),
-        "the dwell runs on the adapter clock: {before}..{after} -> {deadline}"
-    );
-    let delay = input.wake_delay(&chart).expect("the host schedules a wake");
-    assert!(delay <= Duration::from_millis(450));
+    cx.update(|cx| input.refresh(&chart, cx));
+    cx.executor()
+        .advance_clock(Duration::from_nanos(449_999_500));
+    assert!(input.now_ms() < deadline, "half a microsecond early");
+
+    // While the wake is pending the deadline is still ahead.
+    let elapsed = input
+        .wake
+        .as_ref()
+        .expect("the dwell is armed")
+        .elapsed
+        .clone();
+    assert!(!elapsed.get());
+    assert!(!GpuiChartInput::advance(&mut chart, input.tick_ms(), false));
     assert!(!tooltip_shown(&mut chart));
+    assert_eq!(chart.input_wake_deadline_ms(), Some(deadline));
 
-    // Leaving the button before the dwell elapses cancels the pending wake.
-    let away = window(&chart, close_x, y + 60.0);
-    input.mouse_move(&mut chart, &hover(away));
-    assert_eq!(input.wake_delay(&chart), None);
-    input.mouse_move(&mut chart, &hover(close));
+    // The timer elapsing is the evidence that the deadline was reached.
+    elapsed.set(true);
+    assert_eq!(input.tick_ms(), deadline);
     assert!(
-        input.wake_delay(&chart).is_some(),
-        "re-entering restarts the dwell"
-    );
-
-    // The host's wake repaints once the deadline passes, and that prepaint tick reveals the
-    // tooltip. Back-dating the adapter clock by the dwell stands in for the wait.
-    input.epoch = input
-        .epoch
-        .checked_sub(Duration::from_millis(TRADING_TOOLTIP_DWELL_MS as u64))
-        .expect("the monotonic clock can be back-dated by the dwell");
-    assert_eq!(
-        input.wake_delay(&chart),
-        Some(Duration::ZERO),
-        "the wake is due"
-    );
-    assert!(
-        input.prepare_frame(&mut chart),
-        "the prepaint tick arms the tooltip"
+        GpuiChartInput::advance(&mut chart, input.tick_ms(), false),
+        "the tick at the deadline arms the tooltip"
     );
     assert!(tooltip_shown(&mut chart));
-    assert_eq!(input.wake_delay(&chart), None);
-    assert!(
-        !input.prepare_frame(&mut chart),
-        "an idle prepaint changes nothing"
-    );
+    assert_eq!(chart.input_wake_deadline_ms(), None);
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert!(input.wake.is_none(), "the spent wake is dropped");
+}
 
-    // A press on the button drops a pending wake.
-    input.mouse_move(&mut chart, &hover(away));
-    input.mouse_move(&mut chart, &hover(close));
-    assert!(input.wake_delay(&chart).is_some());
-    input.mouse_down(&mut chart, &down(close, 1));
-    assert_eq!(input.wake_delay(&chart), None);
+/// The wake task holds only the view's id and belongs to the adapter: dropping the adapter (with
+/// the view that owns it) cancels the timer, so nothing is notified afterwards.
+#[gpui::test]
+fn dropping_the_adapter_cancels_its_wake(cx: &mut TestAppContext) {
+    let (view, notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    input.view = Some(view.entity_id());
+    let on_close = window(&chart, close.0, close.1);
+    input.mouse_move(&mut chart, &hover(on_close));
+    cx.update(|cx| input.refresh(&chart, cx));
+    assert_eq!(notifies.get(), 1);
+    assert!(input.wake.is_some());
+    drop(input);
+    advance_ms(cx, 1_000);
+    assert_eq!(notifies.get(), 1, "the cancelled wake never fires");
+}
+
+/// The last-price pulse runs on the adapter clock for line and area series (browser parity), and
+/// every pulse step reports a change so the host rebuilds the overlay.
+#[test]
+fn the_pulse_clock_follows_the_tick_on_line_and_area_series_only() {
+    let mut chart = chart();
+    let id = chart.series[0].id;
+    assert!(!chart.last_price_pulse_active(), "candles have no pulse");
+    assert!(!GpuiChartInput::advance(&mut chart, 100.0, false));
+    assert_eq!(chart.animation_time, 0.0);
+
+    chart.convert_series_kind(id, SeriesKind::Line);
+    assert!(chart.last_price_pulse_active());
+    assert!(GpuiChartInput::advance(&mut chart, 250.0, false));
+    assert_eq!(chart.animation_time, 250.0);
+    chart.convert_series_kind(id, SeriesKind::Area);
+    assert!(GpuiChartInput::advance(&mut chart, 300.0, false));
+    assert_eq!(chart.animation_time, 300.0);
+
+    assert!(chart.set_series_last_price_animation(id, false));
+    assert!(
+        !GpuiChartInput::advance(&mut chart, 400.0, false),
+        "a host opt-out stops the pulse"
+    );
+    assert_eq!(chart.animation_time, 300.0);
+}
+
+/// `App::reduce_motion` removes the pulse (GPUI asks decorative motion to stop under it): the
+/// changed preference is one change, so the host redraws without the ring, and later prepaints
+/// leave the pulse clock alone until the preference clears.
+#[test]
+fn reduced_motion_stops_the_pulse_clock() {
+    let mut chart = chart();
+    let id = chart.series[0].id;
+    chart.convert_series_kind(id, SeriesKind::Line);
+    assert!(GpuiChartInput::advance(&mut chart, 100.0, false));
+    assert!(
+        GpuiChartInput::advance(&mut chart, 200.0, true),
+        "the changed preference is a change"
+    );
+    assert!(!chart.last_price_pulse_active());
+    assert_eq!(chart.animation_time, 100.0);
+    assert!(!GpuiChartInput::advance(&mut chart, 300.0, true));
+    assert_eq!(chart.animation_time, 100.0);
+    assert!(GpuiChartInput::advance(&mut chart, 400.0, false));
+    assert_eq!(chart.animation_time, 400.0);
+}
+
+/// A live-bar glide advances through the same clock step as the pulse: the first tick after the
+/// in-place replace only stamps the glide's clock and changes nothing, later ticks move the drawn
+/// close and report the change, and the frame predicate holds until the glide settles.
+#[test]
+fn the_live_bar_glide_advances_on_the_tick_and_keeps_frames_until_it_settles() {
+    let mut chart = chart();
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":200}"#));
+    assert!(
+        !chart.animation_frame_requested(),
+        "an idle chart requests nothing"
+    );
+    let last = BARS - 1;
+    let time = 1_000.0 + last as f64 * 60.0;
+    let open = 100.0 + (last % 7) as f64;
+    assert!(chart.update_series_bar(0, time, [open, open + 9.0, open - 3.0, open + 8.0]));
+    assert!(chart.live_bar_easing_active());
+    assert!(
+        chart.animation_frame_requested(),
+        "an unsettled glide keeps frames coming"
+    );
+    assert!(
+        !GpuiChartInput::advance(&mut chart, 100.0, false),
+        "the first tick only stamps the glide's clock"
+    );
+    assert_eq!(
+        chart.animation_time, 0.0,
+        "candles have no pulse, a stamp moves no clock"
+    );
+    assert!(chart.animation_frame_requested());
+    assert!(
+        GpuiChartInput::advance(&mut chart, 150.0, false),
+        "a later tick moves the drawn close"
+    );
+    assert_eq!(
+        chart.animation_time, 150.0,
+        "a glide that advanced moves the animation clock"
+    );
+    assert!(chart.animation_frame_requested());
+    assert!(
+        GpuiChartInput::advance(&mut chart, 150.0 + 6.0 * 200.0, false),
+        "the tick that settles the glide is a change"
+    );
+    assert!(!chart.live_bar_easing_active());
+    assert!(
+        !chart.animation_frame_requested(),
+        "a settled glide requests nothing"
+    );
+    assert!(!GpuiChartInput::advance(&mut chart, 2_000.0, false));
+    assert_eq!(chart.animation_time, 150.0 + 6.0 * 200.0);
+}
+
+/// While a countdown row shows, the one wake also fires on each whole second of the adapter
+/// clock; an earlier engine deadline takes the wake first, and it stays a single wake.
+#[gpui::test]
+fn the_countdown_second_shares_the_one_wake_with_the_engine_deadline(cx: &mut TestAppContext) {
+    let (view, notifies, _observer) = chart_view(cx);
+    let (mut chart, close) = trading_chart();
+    let mut input = input_on(cx);
+    input.view = Some(view.entity_id());
+    input.countdown = true;
+    let deadline = |input: &GpuiChartInput| input.wake.as_ref().map(|wake| wake.deadline);
+
+    advance_ms(cx, 250);
+    cx.update(|cx| input.refresh(&chart, cx));
+    assert_eq!(deadline(&input), Some(1_000.0), "the next whole second");
+    let on_close = window(&chart, close.0, close.1);
+    hover_and_refresh(cx, &mut input, &mut chart, on_close);
+    assert_eq!(
+        deadline(&input),
+        Some(250.0 + TRADING_TOOLTIP_DWELL_MS),
+        "the earlier dwell takes the wake"
+    );
+    let notified = notifies.get();
+    advance_ms(cx, TRADING_TOOLTIP_DWELL_MS as u64);
+    assert_eq!(notifies.get(), notified + 1, "the dwell fires");
+
+    // The prepaint that follows ticks the dwell away and re-arms for the countdown second.
+    assert!(GpuiChartInput::advance(&mut chart, input.tick_ms(), false));
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert_eq!(deadline(&input), Some(1_000.0));
+    advance_ms(cx, 300);
+    assert_eq!(notifies.get(), notified + 2, "the countdown second fires");
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert_eq!(deadline(&input), Some(2_000.0), "a fired second moves on");
+
+    input.countdown = false;
+    cx.update(|cx| input.arm_wake(&chart, cx));
+    assert!(
+        input.wake.is_none(),
+        "no countdown and no deadline, no wake"
+    );
+    advance_ms(cx, 5_000);
+    assert_eq!(notifies.get(), notified + 2);
 }
 
 #[test]
@@ -947,4 +1476,93 @@ fn text_edit_deletes_forward_selects_with_shift_and_types_only_characters() {
 
     text_edit_key(&mut chart, &key("down", None, none));
     assert_eq!(chart.drawing_text_edit(), Some((id, " lo world", 9)));
+}
+
+/// Through real GPUI events, the drawing being placed owns Delete and Backspace: after a trend
+/// line's first click they step back that click, and the drawing selected before the tool was
+/// picked survives every press, key auto-repeat included. Two more clicks then place the line.
+#[test]
+fn delete_and_backspace_mid_placement_step_back_only_the_drawing_being_placed() {
+    let mut chart = chart();
+    let input = input();
+    let (old, body) = trend_line_body(&mut chart);
+    click(&input, &mut chart, body, 1);
+    assert_eq!(chart.selected_drawing(), Some(old));
+    chart.take_input_events();
+    // `GpuiChartInput::key_down` with no typing session open, minus the `App` it needs only for
+    // the clipboard.
+    let press = |chart: &mut ChartEngine, name: &str, is_held: bool| {
+        let event = KeyDownEvent {
+            is_held,
+            ..key(name, None, Modifiers::default())
+        };
+        let key = chart_key_down(&event).expect("a bound chart key");
+        chart.input_key_down(
+            key,
+            input_modifiers(&event.keystroke.modifiers),
+            event.is_held,
+            input.now_ms(),
+        )
+    };
+
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    click(&input, &mut chart, (200.0, 300.0), 1);
+    assert!(chart.drawing_create_active());
+    assert!(press(&mut chart, "delete", false));
+    assert!(press(&mut chart, "backspace", false));
+    assert!(press(&mut chart, "backspace", true));
+    assert!(
+        chart.drawing(old).is_some(),
+        "the selected drawing survives"
+    );
+    assert_eq!(chart.selected_drawing(), Some(old));
+    assert!(chart.take_input_events().is_empty());
+    assert_eq!(chart.active_drawing_tool(), Some(DrawingKind::TrendLine));
+
+    for at in [(300.0, 120.0), (450.0, 200.0)] {
+        click(&input, &mut chart, at, 1);
+    }
+    let [ChartInputEvent::DrawingCreated(id)] = chart.take_input_events()[..] else {
+        panic!("the second click after the step back places the line");
+    };
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 0).unwrap(),
+        (300.0, 120.0),
+    );
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 1).unwrap(),
+        (450.0, 200.0),
+    );
+    assert!(chart.drawing(old).is_some());
+}
+
+/// Through real GPUI events, an armed click-placed tool places by click only: a press-drag-release
+/// places nothing, pans nothing, and leaves the tool armed, and two clicks then place the line.
+#[test]
+fn an_armed_trend_line_places_by_click_and_a_drag_places_nothing() {
+    let mut chart = chart();
+    let input = input();
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    let scroll = chart.scroll_position();
+
+    drag(&input, &mut chart, (150.0, 150.0), (450.0, 300.0));
+    assert!(!chart.drawing_create_active(), "no anchor was placed");
+    assert!(chart.drawings().is_empty());
+    assert!(chart.take_input_events().is_empty());
+    assert_eq!(chart.scroll_position(), scroll, "the drag did not pan");
+    assert_eq!(chart.active_drawing_tool(), Some(DrawingKind::TrendLine));
+
+    click(&input, &mut chart, (150.0, 150.0), 1);
+    click(&input, &mut chart, (450.0, 300.0), 1);
+    let [ChartInputEvent::DrawingCreated(id)] = chart.take_input_events()[..] else {
+        panic!("two clicks place the line");
+    };
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 0).unwrap(),
+        (150.0, 150.0),
+    );
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 1).unwrap(),
+        (450.0, 300.0),
+    );
 }

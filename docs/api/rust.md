@@ -5,6 +5,7 @@
 Rust crate 不发布到 crates.io。当前依赖与历史迁移说明分开阅读：迁移段落中的旧版本只适用于对应固定修订，不代表当前清单。
 
 - [Rust 分发](#rust-分发)
+  - [GPUI 刷新契约](#gpui-刷新契约)
 - [更换固定修订](#更换固定修订)
 
 ## Rust 分发
@@ -14,6 +15,33 @@ Rust crate 仅限仓库内使用（`publish = false`）；不会向 crates.io �
 `aeris_charts_render_gpui` 是实验性的。它以精确版本要求固定 `gpui-pre` 0.3.7，即 gpui-kit 0.7.0 所依赖的 GPUI 快照，因此绘制图表的宿主必须使用同一个 `gpui`（宿主若使用其他 GPUI 构建，例如 Zed 的某个 Git 修订版本，就会持有其类型的两份不兼容副本）。GPUI 升级是显式的 manifest 与 lockfile 变更。
 
 在 macOS 上，宿主必须启用 `font-kit` feature 来构建其 GPUI 平台 crate（`gpui-pre-platform`，或直接构建 `gpui-pre-macos`），该 feature 即 GPUI 的 macOS 文本系统。否则 GPUI 会改用空操作的文本系统：图表不绘制任何文本（坐标轴、标签、图例、绘图文本），并将每个字符串的宽度度量为零，唯一的信号是启动时的一条 `log::warn!`。Linux 和 Windows 不受影响。
+
+### GPUI 刷新契约
+
+GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式会重放每个未被 notify 的视图，gpui-pre 对以 `.cached()` 嵌入的视图也是如此；纯 gpui-pre 的重绘多于必要，只在窗口中有其他内容重绘时才掩盖缺失的 notify。因此 `GpuiChartInput` 拥有图表所需的每个 notify、定时器和动画帧，GPUI 宿主恰好进行以下调用：
+
+- 用 `GpuiChartInput::new(cx)` 构造适配器。它读取 GPUI 的执行器时钟（`BackgroundExecutor::now`，生产环境中为 `Instant::now`，在 `TestAppContext::advance_clock` 下为虚拟时钟），每个输入时间戳、`input_tick`、最新价脉冲、实时柱滑动与唤醒都共享该时钟。`GpuiChartInput::default()` 保留标准库时钟，没有视图也没有唤醒，供单元测试等仅引擎的用途使用。
+- 在图表画布的每次 prepaint 中、准备帧之前，调用一次 `prepare_frame(&mut engine, bounds, window, cx)`，并把其结果作为 `FinancialFrameRequest::force_frame` 传入（或并入宿主自己的重建标志）。其结果带有 `#[must_use]`。它依次：
+  - 记录画布边界和绘制该画布的视图；
+  - 结束窗口无法完成的输入。窗口自上一次 prepaint 以来失活时，它像浏览器在窗口失焦时那样，用 `input_cancel` 放弃进行中的按下，否则停止运动（`input_cancel_motion`），因为失活的窗口得不到释放或按键抬起；GPUI 只沿获得焦点的元素的派发路径投递按键抬起，因此当键盘焦点在首次绘制方向键平移的 prepaint 之后移开时，平移也会结束；
+  - 应用 `App::reduce_motion`，这也会移除最新价脉冲；
+  - 推进输入动画与到期的截止时间，转发最新的合并捕获样本，并在适配器时钟上调用 `set_animation_time`：它推进每一个实时柱滑动（滑动的第一次 Tick 只记录时钟，之后每次推进都移动已绘制的柱），并仅在绘制了脉冲或某个滑动推进时才移动 `animation_time`；
+  - 像浏览器渲染路径一样把 K 线收盘倒计时时钟固定为系统时钟（`set_now_seconds`，UTC 秒）。显示其他时钟的宿主在此调用之后再固定自己的时钟；
+  - 重新设定唤醒；
+  - 在 `animation_frame_requested()`（输入动画，或尚未落定的实时柱滑动）成立期间调用 `Window::request_animation_frame`，并在改变了图表状态的步骤之后再请求一次（绘制中的脉冲每帧都是这样的变更，因此脉冲经由时钟步保持帧）：render 在 prepaint 之前运行，这一帧让宿主在 render 中派生的界面元素显示该步骤的结果；它不改变任何东西，因此动画结束或截止时间触发恰好只多花一帧。
+- 在每个绘制之外的引擎变更之后调用 `refresh(&engine, cx)`：
+  - 作为每个输入监听器的最后一步，在排空宿主使用的引擎队列（`take_input_events`、`take_alert_create_requests`）之后，因为排空可能改变引擎（`RemoveSeries`）；
+  - 在宿主对数据、选项、主题、绘图、交易状态或交互选项的每次更新之后，以及启动引擎动画之后（向 `start_real_time_scroll_animation` 等调用传入 `now_ms()`）。
+
+  它 notify 上一次 prepaint 中绘制图表的视图（第一次 prepaint 之前不做任何事），标记下一帧需要重建，并至多保留一个唤醒任务，时间取 `input_wake_deadline_ms()` 与（`countdown_shown()` 成立期间）适配器时钟下一个整秒中较早者，相当于浏览器包每秒一次的倒计时定时器：截止时间不变则保留任务，移动则替换并取消旧任务，没有截止时间则丢弃任务。唤醒只按 id notify 该视图；随后的 prepaint 推进引擎。丢弃适配器会取消其唤醒，且该任务不持有实体句柄。
+- 在图表画布的每次 paint 中调用一次 `capture_pointer(window, &view, on_move)`，传入图表的视图和宿主自己的移动监听器（其转换调用 `mouse_move` 与共享尾部）。在引擎持有按下期间，它让窗口内的每个移动先到达图表并停止其传播，与浏览器的指针捕获一致，因此拖动在指针离开图表元素后仍会跟随；图表之外的释放仍需绑定 `on_mouse_up_out`。
+- 图表元素的 `on_hover` 调用 `hover(&mut engine, hovered)`，并以 `.hover_listener_mode(HoverListenerMode::InputModalityIndependent)` 绑定；GPUI 的默认模式会把按键当作指针离开，隐藏十字光标。
+- 窗口失活由 `prepare_frame` 处理，宿主无需接线：它像浏览器在窗口失焦时那样放弃进行中的按下，否则停止运动。
+- `prepare_frame` 只在 prepaint 中运行，`capture_pointer` 只在 paint 中运行。绝不要在 render、prepaint 或 paint 中调用 `refresh` 或 notify 图表的视图：gpui-pre 不会为绘制期间的 notify 调度帧，gpui-fast 则会在每一帧都把它计为变更，因此该视图永远不会被保留。
+
+库从不拥有宿主的视图类型，因此这适用于图表自己的视图、嵌入父视图的画布、以 `.cached()` 嵌入的视图，以及保存在模型实体中的引擎：notify 会到达绘制该画布的视图。prepaint 步骤产生的引擎事件在引擎队列（至多 32 个）中等待宿主的下一次排空，探针在其监听器尾部完成排空。在 gpui-fast 下，观察图表实体或在 render 中读取它的父视图会在每个图表帧都重建，因为 prepaint 写入该实体。要在 gpui-fast 下区分缺失的 `refresh` 与保留机制的缺陷，请以 `GPUI_VIEW_RETENTION=0` 运行。
+
+库的 GPUI 依赖保持 `gpui-pre =0.3.7`。CI 还以 `.cargo/gpui-fast.toml` 固定的修订针对 gpui-fast 构建并测试该后端，作为证据而非发布门禁（[gpui-fast 证据线](../development/validation.md#gpui-fast-证据线)）；以同样方式修补自身依赖图的宿主，运行的正是该证据线所检查的配置。
 
 通过 `GpuiChartInput::scroll_wheel` 绑定滚轮事件的宿主可获得与浏览器等效的滚动。固定在较早修订的宿主在水平滚轮或触控板横扫时，平移时间比例尺的方向相反：适配器未翻转就透传了 GPUI 的水平增量，而 GPUI 报告的是内容运动（正值表示露出左侧），引擎则与浏览器一样，将正值视为向右移动。适配器现在会翻转水平轴；自行补偿了旧符号的宿主必须移除其补偿。
 
@@ -74,15 +102,17 @@ Rust crate 仅限仓库内使用（`publish = false`）；不会向 crates.io �
 - 替代项与其所替代的调用行为不一致之处。这些是在代码中比对的，而非仅比对签名，且被移除的函数自引入起到 `17a591f` 之间都没有变化：
   - 价格坐标轴上的滚轮。无论滚轮行为如何，只要指针位于某个价格比例尺的坐标轴条带上，`apply_financial_wheel` 就会缩放该价格比例尺。`input_wheel` 仅在 `InteractionOptions::wheel_behavior` 为 `WheelBehavior::Zoom` 或 `InteractionOptions::price_axis_wheel_zoom` 为 `true`（默认 `false`）时才缩放它；在默认的 `WheelBehavior::Auto` 下，同样的滚轮在坐标轴条带上缩放的是时间比例尺。要恢复旧行为，请以 `price_axis_wheel_zoom: true` 调用 `set_interaction_options`。`WheelBehavior::Zoom` 在那里同样缩放价格比例尺，但它会把每一次滚轮都变成缩放，因此水平滚轮不再平移。
   - plot 区域上的滚轮缩放。旧调用围绕指针缩放时间比例尺。普通滚轮现在遵循 `right_bar_stays_on_scroll`（默认 `true`；参见下文的后续变更），因此最新柱之后的间隙得以保留，只有 Ctrl/Cmd 才会围绕指针缩放。`input_wheel` 还遵循 `wheel_zoom` 和 `wheel_scroll`（两者默认均为 `true`），并会停止正在进行的惯性滑行、按住方向键的平移或动画滚动。
-  - 拖动阈值。旧调用从第一次 `update_financial_drag` 起就生效（窗格平移、坐标轴缩放或分隔条调整大小）。现在窗格平移、坐标轴缩放和分隔条拖动都在共享的 5 px 阈值处开始，未移动的释放是一次点击。因此在价格坐标轴上的普通按下不再将该比例尺切换为手动：旧的 `begin_financial_drag` 在按下时就关闭自动缩放，现在则由第一个缩放步骤来关闭。窗格拖动仅在手动价格比例尺是按下位置下方系列（或窗格默认）的比例尺时才平移它；旧调用还会回退到窗格的第一个手动右侧或左侧比例尺。
+  - 拖动阈值。旧调用从第一次 `update_financial_drag` 起就生效（窗格平移、坐标轴缩放或分隔条调整大小）。现在窗格平移、坐标轴缩放和分隔条拖动都在共享的 5 px 阈值处开始，未移动的释放是一次点击。因此在价格坐标轴上的普通按下不再将该比例尺切换为手动：旧的 `begin_financial_drag` 在按下时就关闭自动缩放，现在则由第一个缩放步骤来关闭。窗格拖动仅在手动价格比例尺是按下位置下方系列（或窗格默认）的比例尺时才平移它；旧调用还会回退到窗格的第一个手动右侧或左侧比例尺。图表对象的指针拖动遵循同一阈值：绘图的主体、锚点或手柄，订单线，以及 `TP`/`SL` 保护手柄在按下移动 5 px 之前保持原位，因此更短的按下是一次点击，不移动任何东西，不记录撤销步骤或修订，也不发出交易意图。越过阈值后，对象跳到指针处并精确跟随，释放位置是该拖动的最后一个样本。只有 `input_*` 指针输入受此约束：`drawing_drag_to` 与 `trading_drag_to` 等直接调用以及键盘微调会立即移动对象。
   - 价格坐标轴上的双击。`begin_financial_drag` 会运行 `reset_price_scales()`，即图表中的每个价格比例尺；`input_pointer_down` 只重置被按下的比例尺（`reset_price_scale(pane, target)`）。需要图表范围重置的宿主应为其自己的命令保留 `reset_price_scales()` 或 `reset_view()`。
-  - 释放与取消。`end_financial_drag` 只结束缩放和滚动会话。未移动的 `input_pointer_up` 还会选择或激活指针下方的对象，`input_cancel()` 结束同样的会话，但还会还原已打开的绘图或交易拖动，并清除悬停、实时测量和光标。在按下处于打开状态时，`primary_pressed` 为 false 的 `input_pointer_move` 会放弃该次按下。
+  - 释放与取消。`end_financial_drag` 只结束缩放和滚动会话。未移动的 `input_pointer_up` 还会选择或激活指针下方的对象，`input_cancel()` 结束同样的会话，但还会还原已打开的绘图或交易拖动，并清除悬停、实时测量和光标。在按下处于打开状态时，`primary_pressed` 为 false 的 `input_pointer_move` 会放弃该次按下。结束会话绝不会回退它：被任何取消（`input_cancel()`、Escape、上下文菜单、丢失的释放）放弃的平移、坐标轴缩放或分隔条调整保留其已做出的部分变更，被其拖出自动缩放的价格轴保持手动。
   - 方向键与缩放键。旧调用每次调用跳转 1 根柱（加速时 10 根）；`ArrowLeft` 和 `ArrowRight` 启动由速度持有的平移（参见关于时钟的一项）。`ZoomIn` 和 `ZoomOut` 锚定在 plot 区域中心；在新的 `right_bar_stays_on_scroll` 默认值下，它们改为保留最新柱之后的间隙。按键还遵循 `InteractionOptions` 的开关（滚动键使用 `pan` 或 `wheel_scroll`，缩放键使用 `wheel_zoom`；默认均为 `true`），被开关拦住的按键保持未被消费。
-- 宿主提供时钟。方向键平移由速度持有，因此需要调用 `input_key_up`，传入平台的按键重复标志，每准备一帧调用一次 `input_tick(now_ms)`，并且仅在 `input_animating()` 成立期间请求下一帧。`input_wake_deadline_ms()` 是唯一的延迟截止时间（交易提示框的停留时间）：为它安排一次唤醒并重绘。`flush_coalesced_input()` 每次 prepaint 转发一次最新捕获的绘图采样。
-- 引擎将仅宿主可做的工作以 `ChartInputEvent` 事件的形式交还（`ContextMenu`、`DrawingCreated`、`RemoveSeries`）；每次输入调用之后用 `take_input_events()` 取出它们。宿主保留事件转换、指针捕获、应用 `input_cursor()`、定时器与帧调度、菜单、剪贴板和持久化。应在 `drawing_revision()` 变化时持久化绘图，而不是跟踪手势。参考实现的 `handleScroll`/`handleScale` 开关即 `InteractionOptions`（`interaction_options()` 和 `set_interaction_options`）。
+- 宿主提供时钟。方向键平移由速度持有，因此需要调用 `input_key_up`，传入平台的按键重复标志，每准备一帧调用一次 `input_tick(now_ms)`，并且仅在 `input_animating()` 成立期间请求下一帧。`input_wake_deadline_ms()` 是唯一的延迟截止时间（交易提示框的停留时间）：为它安排一次唤醒并重绘。`flush_coalesced_input()` 每次 prepaint 转发一次最新捕获的绘图采样。GPUI 宿主现在从适配器的 `prepare_frame` 与 `refresh` 获得时钟、推进、唤醒与帧调度（见 [GPUI 刷新契约](#gpui-刷新契约)）。
+- 交易请求在宿主答复之前锁定图表的交易控件。已发出的 `TradingIntent` 等待宿主期间，每个交易控件都是惰性的（`ChartCursor::Default`，没有悬停、提示框或按下），因此要答复每一个意图：调用 `resolve_trading_intent`，或提供表明券商已处理该请求的宿主状态，后者像接受一样结算请求。`set_trading_snapshot`、`update_working_order`、`remove_working_order`、`update_trading_position` 与 `remove_trading_position` 只在以下情况下构成答复：订单被移除、进入非 working 状态、`revision` 超过意图中的修订，或（对于移动）位于所请求的价格；持仓被移除或方向翻转；出现所请求角色的已关联保护订单，或其入场单结束；或在括号单某一腿处出现新订单。单纯的重新上报（P&L 跳动、处于意图修订的更新、过时的快照）会让请求继续等待，因此请用 `resolve_trading_intent(sequence, false)` 拒绝请求。这些调用会刷新静止指针下的 `input_cursor()`，因此在其后重绘时重新读取光标的宿主无需指针运动就能显示正确的光标。无论 `remove_working_order` 与 `remove_trading_position` 返回什么，都要在其后重绘：`false` 只说明图表已不再显示该对象，而该移除仍可能答复图表已经应用的平仓。对于此刻不能操作的控件，`trading_cursor_at` 返回 `None`；`set_trading_hover` 只在被悬停的控件（对象、部件与标注）变化时才返回 `true`：在同一控件内运动返回 `false`，并保留已显示的提示框。`set_trading_visible_account` 不再结束等待宿主的请求。
+- Backspace 与 Delete 属于正在放置的绘图。放置一旦开始（`drawing_create_active()`，退回到没有任何点之后亦然），或正在捕获手绘笔画，`input_key_down` 就消费这两个键，并且只退回最近放置的点；它绝不移除选择，也不发出 `RemoveSeries`。`drawing_create_pop_anchor` 与 `drawing_tool_pop_anchor` 现在除了路径与折线的顶点，也会退回固定点数工具的点击（例如趋势线的第一个点）。
+- 引擎将仅宿主可做的工作以 `ChartInputEvent` 事件的形式交还（`ContextMenu`、`DrawingCreated`、`RemoveSeries`）；每次输入调用之后用 `take_input_events()` 取出它们。宿主保留事件转换、指针捕获、应用 `input_cursor()`、定时器与帧调度（GPUI 宿主把这些交给适配器）、菜单、剪贴板和持久化。应在 `drawing_revision()` 变化时持久化绘图，而不是跟踪手势。参考实现的 `handleScroll`/`handleScale` 开关即 `InteractionOptions`（`interaction_options()` 和 `set_interaction_options`）。
 - 较低层的手势操作（`drawing_tool_pointer_*`、`measure_pointer_*`、`delta_tooltip_mouse_*`、`kinetic_*`、`start_keyboard_scroll`、`keyboard_scroll_tick`、`cancel_keyboard_scroll`、`time_axis_*` 和 `price_axis_*` 的缩放与滚动步骤、`drag_pane_separator`）仍然是公开的引擎操作，但现在由控制器对它们排序。仍在 `input_*` 之外继续驱动它们的宿主会绕过控制器的按下仲裁和光标，因此对它们排序的宿主路由应当删除。
 - 帧准备随之变化：`prepare_financial_frame_with_measure` 在任何图层失效或输入变化之后重建，并在窗格调整大小的拖动之后重新布局。曾清空其帧以强制重建、或在 `update_financial_drag` 报告窗格调整大小时强制布局的宿主，可以停止这样做。
-- GPUI 宿主（feature `gpui-backend`）通过 `aeris_charts_render_gpui::input` 绑定，每个监听器一次适配器调用：`GpuiChartInput::mouse_down`、`mouse_move`、`mouse_up`（图表之外的释放也要绑定）、`context_menu`、`scroll_wheel`、`pinch`、`modifiers_changed`、`key_down` 和 `key_up`。`scroll_wheel` 自行转换 GPUI 的增量（像素除以 100，行按 `WHEEL_LINE_HEIGHT`（32 px）计）。prepaint 调用 `set_canvas_bounds(bounds)` 和 `prepare_frame(&mut engine)`，`wake_delay(&engine)` 安排延迟唤醒，`cursor_style(engine.input_cursor())` 是唯一的光标映射，`install_text_metrics(&mut engine, window)` 在准备帧之前运行，使绘图标签的度量与其绘制一致。宿主自己的按键表、光标优先级和文本编辑路由在适配器之外是多余的，应当删除而不是保留。
+- GPUI 宿主（feature `gpui-backend`）通过 `aeris_charts_render_gpui::input` 绑定，每个监听器一次转换调用：`GpuiChartInput::mouse_down`、`mouse_move`、`mouse_up`（图表之外的释放也要绑定）、`context_menu`、`scroll_wheel`、`pinch`、`modifiers_changed`、`key_down` 和 `key_up`；main 还为 `on_hover` 提供 `hover`，并在 paint 中调用 `capture_pointer`（见 [GPUI 刷新契约](#gpui-刷新契约)）。在 main 上，每个监听器随后运行宿主共享的尾部，它排空宿主使用的引擎队列并以 `refresh` 结束（见 [GPUI 刷新契约](#gpui-刷新契约)）；没有该尾部的监听器在保留模式下会过时。`scroll_wheel` 自行转换 GPUI 的增量：在 `17a591f` 上像素除以 100，行按 `WHEEL_LINE_HEIGHT`（32 px）计；main 把像素除以 100，并把原生行按 25/24 换算为 DOM 行，因此默认的三行一档就是浏览器的一档。在 `17a591f` 上，prepaint 调用 `set_origin` 和 `prepare_frame(&mut engine)`，`wake_delay(&engine)` 安排延迟唤醒；main 用 `prepare_frame(&mut engine, bounds, window, cx)` 与 `refresh(&engine, cx)` 取代这三者（见 [GPUI 刷新契约](#gpui-刷新契约)）。`cursor_style(engine.input_cursor())` 是唯一的光标映射，`install_text_metrics(&mut engine, window)` 在准备帧之前运行，使绘图标签的度量与其绘制一致。宿主自己的按键表、光标优先级和文本编辑路由在适配器之外是多余的，应当删除而不是保留。
 - `17a591f` 之后的两项后续变更。`1869773 feat(input): TradingView wheel zoom anchoring, engine-owned on every host`（上游）将 `GpuiChartInput::set_origin(Point<Pixels>)` 重命名为 `set_canvas_bounds(Bounds<Pixels>)`（只有恰好位于 `17a591f` 的固定修订具有旧名称），新增了带有 `GpuiChartInput::pinch` 的 `input_pinch`，并使 `TimeScaleOptions::right_bar_stays_on_scroll` 默认为 `true`：普通滚轮或键盘缩放会保留最新柱之后的间隙，只有 Ctrl/Cmd 滚轮和捏合缩放才围绕指针缩放。如需较早的围绕指针（滚轮）或 plot 区域中心（按键）缩放，请调用 `ChartEngine::set_right_bar_stays_on_scroll(false)`。合并 `3eef45e merge: sync with AerisTerminal/aeris-charts main (range tools, input controller)`（自有线）新增了 `ChartKey::EditText`（F2），因此上游固定修订上对 `ChartKey` 的穷尽 `match` 需要补一个分支。
 
 **GPUI 依赖**（自有线，来自 `9ae1c58 gpui: build the executor on gpui-pre 0.3.6, the GPUI gpui-kit pins`；参见 [Rust 分发](#rust-分发)）。`aeris_charts_render_gpui` 不再依赖 Zed 的 Git 修订：
@@ -98,6 +128,31 @@ Rust crate 仅限仓库内使用（`publish = false`）；不会向 crates.io �
 - Aeris 自身的 API 没有变化：执行器与适配器源码未经修改即可针对 0.3.7 编译，完整的 GPUI 测试套件也未经修改即通过。宿主自己的 GPUI 代码不在本仓库中检查。
 - 一致性测试框架的 X11 捕获已迁移到 `x11rb` 0.14（仅为示例的 Linux 开发依赖）。GPUI 的 Linux 平台仍依赖 `x11rb` 0.13，因此示例构建同时包含两者；宿主所链接的内容不受影响。
 
+**GPUI 刷新契约**（自有线，即新增 `GpuiChartInput::refresh` 的提交；可用 `git log -S'pub fn refresh' -- crates/aeris_charts_render_gpui/src/input.rs` 找到它）。适配器现在拥有此前每个宿主手写的 GPUI 刷新机制：唤醒、倒计时时钟及其每秒一次的重绘、动画帧请求，以及每次引擎变更之后的 notify（契约见 [GPUI 刷新契约](#gpui-刷新契约)）。在 gpui-fast 的保留模式下，以及对于以 `.cached()` 嵌入的 gpui-pre 视图，未被 notify 的图表会一直显示其最后一帧，因此保留旧调用序列的宿主在那里会过时。编译器只能发现部分迁移点：旧的 prepaint 调用、`wake_delay` 以及对适配器的任何 `Clone` 或 `Copy` 都不再能编译。有两类调用点仍能原样编译，需要人工审查：每个缺少 `refresh` 的绘制之外的引擎变更——在真实宿主中这类调用点最多，也正是会过时的那些——以及窗口化宿主中的每个 `GpuiChartInput::default()`，它保留标准库时钟且从不唤醒。要找出审查遗漏的调用点，可在 gpui-pre 上以 `.cached()` 嵌入图表，或在 gpui-fast 下分别以及不以 `GPUI_VIEW_RETENTION=0` 运行：只在关闭保留时才更新的图表缺少一次 `refresh`。
+
+- 用 `GpuiChartInput::new(cx)` 代替 `GpuiChartInput::default()` 构造适配器。它读取 GPUI 的执行器时钟，因此 `now_ms()` 在 `TestAppContext::advance_clock` 下是虚拟的，在生产环境中不变（`Instant::now`）。
+- 把 prepaint 序列（`set_canvas_bounds(bounds)`、对 `cx.reduce_motion()` 的读取，以及 `prepare_frame_with_motion(&mut engine, reduced)` 或 `prepare_frame(&mut engine)`）替换为一次 `prepare_frame(&mut engine, bounds, window, cx)` 调用，并把其结果作为 `force_frame` 传入，或并入宿主的重建标志。
+- 删除宿主的唤醒任务（`wake_delay` 已移除：`refresh` 设定并替换唯一的唤醒），以及 `input_animating()` 期间在 render 中调用的 `window.request_animation_frame()`（`prepare_frame` 会请求帧）。只为宿主自己的有限测量运行保留帧请求。
+- 删除宿主自己的倒计时时钟输入（每次重建之前从系统时钟调用 `set_now_seconds`）以及任何倒计时定时器：`prepare_frame` 固定系统时钟，唤醒每秒重绘一次显示中的倒计时。显示其他时钟的宿主在 `prepare_frame` 之后固定自己的时钟。
+- 在排空引擎队列之后，以 `refresh(&engine, cx)` 结束每个监听器的共享尾部，取代 `dirty = true` 与 `cx.notify()`，并以同一调用结束每个改变引擎的 `update`（数据、选项、主题、绘图、交易状态、交互选项、启动的动画）。编译器发现不了这些调用点。
+- `GpuiChartInput` 不再是 `Clone` 或 `Copy`，因为它持有唤醒任务；它仍然是 `Debug` 与 `Default`。
+
+更换固定修订之前，宿主应当了解的行为变化：
+
+- GPUI 的折线与面积系列现在会像在浏览器中一样让最新价脉冲：在 `last_price_pulse_active()` 成立期间，适配器通过其时钟步 `set_animation_time` 推进脉冲时钟，该步每帧报告变更，因此在每次显示刷新时都会再请求一帧。此前适配器不驱动脉冲时钟，因此自己不设置 `animation_time` 的 GPUI 宿主显示的是静止的圆环。用 `set_series_last_price_animation(id, false)` 让系列退出，并在发布显示此类系列的版本之前，在 gpui-pre 宿主上测量 CPU。
+- 脉冲是装饰性动效，因此引擎在 `InteractionOptions::reduced_motion` 下移除它：`last_price_pulse_active()` 变为 false，帧中不再有该圆环，每个宿主上都是如此。GPUI 在每次 prepaint 时传入 `App::reduce_motion`，因此在该偏好下 GPUI 图表从不脉冲。浏览器随每个指针和按键事件传入 `prefers-reduced-motion`，因此在该偏好下，浏览器图表在第一次输入之前仍会脉冲。
+- 显示中的 K 线收盘倒计时现在会在空闲的 GPUI 图表上跳动：`prepare_frame` 固定系统时钟（UTC），并在 `countdown_shown()` 成立期间由唤醒每秒重绘一次，与浏览器包的定时器一致。从未输入时钟的 GPUI 宿主现在会在开启 `countdown_visible` 的系列上显示倒计时；与浏览器一样，主系列默认开启该选项。
+- 按住的方向键现在会在其按键抬起之前、键盘焦点离开图表或窗口失活时结束，而不再一直平移并请求帧，直到下一次按键抬起到达图表。
+- 在改变了图表状态的 prepaint 步骤（动画结束、截止时间触发、转发的捕获样本）之后，适配器恰好再请求一帧，使 render 中派生的界面元素显示其结果。
+- 在 gpui-fast 下，观察图表实体（`cx.observe`）或在 render 中读取它的父视图会在每个图表帧都重建，因为 prepaint 写入该实体。
+
+**GPUI 指针捕获、悬停与窗口失活**（自有线，即新增 `GpuiChartInput::capture_pointer` 的提交；可用 `git log -S'pub fn capture_pointer' -- crates/aeris_charts_render_gpui/src/input.rs` 找到它）。此前 GPUI 宿主有三处与浏览器不同：拖动在指针离开图表元素时停止跟随；任何按键都会清除十字光标与悬停；窗口失活不会结束进行中的手势。编译器发现不了前两项的迁移点：
+
+- 在图表画布的 paint 闭包中调用一次 `input.capture_pointer(window, &view, Host::on_mouse_move)`，其中 `view` 是图表的视图（`cx.entity()`），`on_move` 是宿主现有的移动监听器。保留 `on_mouse_up_out` 对 `mouse_up` 的绑定。
+- 在图表元素上加入 `.hover_listener_mode(HoverListenerMode::InputModalityIndependent)`，并让 `on_hover` 调用 `input.hover(&mut engine, hovered)`，取代直接调用 `input_pointer_leave()`。
+- 窗口失活无需迁移：`prepare_frame` 现在像浏览器在窗口失焦时那样放弃进行中的按下（绘图或订单拖动回滚，平移停在原处）。依赖拖动在窗口失活后继续的宿主行为会改变。
+- 引擎新增 `ChartEngine::input_pointer_captured()`，报告是否有按下处于打开状态。
+
 **测量工具**（两条线，来自合并提交 `3eef45e merge: sync with AerisTerminal/aeris-charts main (range tools, input controller)`）。上游的 `5a2e6e8 feat(drawings): add price/date range measuring tools and Shift-click measure` 与自有线的 `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded ticks, tick-built candles, and resampling` 各自独立地构建了这三个范围工具，合并保留了自有线的实现。固定修订采用哪种写法，取决于它属于哪一侧：
 
 - 上游自 `5a2e6e8` 起的固定修订具有 `DrawingKind::DatePriceRange`、种类名称 `date_price_range`，以及线上 id 13（`PriceRange`）、14（`DateRange`）和 15（`DatePriceRange`）。自有线自 `36c9f09` 起的固定修订（例如 `36c9f09` 本身）已经具有 `DrawingKind::DateAndPriceRange`、名称 `date_and_price_range` 以及 id 130、131 和 132，这也是 main 所保留的。对自有线的固定修订而言，没有重命名，也没有 id 重映射；只适用下文的网格吸附。任一侧早于这些提交的固定修订都没有范围工具。
@@ -108,7 +163,7 @@ Rust crate 仅限仓库内使用（`publish = false`）；不会向 crates.io �
 
 **十字光标遮罩、基线模式、实时柱缓动与时间线标记**（自有线，来自 `4f8a621 feat: live-bar easing, baseline reference line and mode, crosshair shade, timeline-mark lane`，即新增 `live_bar_easing_ms` 的提交，可用 `git log -S'live_bar_easing_ms' -- crates/aeris_charts_engine/src/lib.rs` 找到；参见[呈现扩展](presentation.md)）。每一项新增默认都关闭或为空，因此不采用任何一项的宿主渲染结果与之前相同；评审点是帧请求谓词，以及新增的枚举变体与结构体字段：
 
-- 动画时钟。`ChartEngine::set_animation_time(ms)` 是引擎上的新方法（此前浏览器外壳自行记录一个时钟）：它推进每一个实时柱滑动，并仅在绘制了最新价脉冲或某个滑动推进时写入 `pub animation_time` 字段，因此仅打时间戳的 Tick 不改变任何帧键。`advance_live_bar_easing(now_ms) -> bool` 只推进滑动；`live_bar_easing_active()`、`animation_active()`（脉冲或滑动，即浏览器 `wants_animation` 的返回值）与 `animation_frame_requested()`（`input_animating() || live_bar_easing_active()`，Rust 宿主的帧请求谓词）都是新增的。按上文引擎输入控制器分组所述、仅在 `input_animating()` 成立期间请求下一帧的宿主，应改为 `animation_frame_requested()` 或 `GpuiChartInput::animating(&engine)`；否则滑动只显示第一帧便停滞，因为没有再请求帧。`GpuiChartInput::prepare_frame` 现在还会在适配器时钟上调用 `advance_live_bar_easing`，并在滑动移动时返回 `true`；适配器仍不运行脉冲时钟。
+- 动画时钟。`ChartEngine::set_animation_time(ms)` 是引擎上的新方法（此前浏览器外壳自行记录一个时钟）：它推进每一个实时柱滑动，并仅在绘制了最新价脉冲或某个滑动推进时写入 `pub animation_time` 字段，因此仅打时间戳的 Tick 不改变任何帧键。`advance_live_bar_easing(now_ms) -> bool` 只推进滑动；`live_bar_easing_active()`、`animation_active()`（脉冲或滑动，即浏览器 `wants_animation` 的返回值）与 `animation_frame_requested()`（`input_animating() || live_bar_easing_active()`，Rust 宿主的帧请求谓词）都是新增的。`set_animation_time` 返回该时钟步是否改变了图表所绘内容（某个滑动推进或落定，或绘制中的脉冲前移）。按上文引擎输入控制器分组所述、仅在 `input_animating()` 成立期间请求下一帧的 Rust 宿主，应改为 `animation_frame_requested()`，否则滑动只显示第一帧便停滞，因为没有再请求帧；GPUI 宿主无需迁移：`GpuiChartInput::prepare_frame` 在其时钟步中调用 `set_animation_time`，在滑动落定之前持续请求帧，并在滑动推进时返回 `true`（见上文 GPUI 刷新契约）。
 - 基线。`ChartEngine::series_baseline_price(id) -> Option<f64>` 与公共枚举 `BaselineMode`（`VisibleMidpoint`、`CloseBeforeVisibleRange`，带 `as_str` 与 `parse`）是新增的。`SeriesEntry` 新增 `pub` 字段 `baseline_mode`、`baseline_line_visible`、`baseline_line_color: Option<String>`、`baseline_line_width`、`baseline_line_style` 与 `live_bar_easing_ms`；列出全部字段的结构体字面量需要加上它们，默认值保持此前的渲染。直接写入 `live_bar_easing_ms` 的宿主得到 JSON 路径的语义：非有限或非正值为关闭，更大的值钳制到 `MAX_LIVE_BAR_EASING_MS`（1000）。
 - 十字光标。`aeris_charts_core::options::CrosshairOptions` 新增 `shade_right: CrosshairShadeOptions { visible, color }`（线上键 `shadeRight`，`#[serde(default)]`，因此在它之前保存的 V2 文档仍可读取）；列出全部字段的结构体字面量需要加上它。
 - 时间线标记。新增 `ChartEngine` 方法：`set_timeline_marks(snapshot) -> Result<(), ChartError>`、`timeline_marks()`、`set_timeline_marks_visible(bool) -> bool`、`timeline_marks_visible()`、`set_timeline_group_hidden(group, hidden) -> Result<bool, ChartError>`、`hidden_timeline_groups()`、`timeline_mark_hit_at(x, y)`、`timeline_mark_hit_at_with_profile(x, y, HitProfile)`、`timeline_mark_hit_for_id(id)`、`timeline_lane_pane()` 与 `timeline_mark_activation(seq)`；新增公共类型 `TimelineMark`、`TimelineMarkGlyph`、`TimelineGlyphShape`、`TimelineMarkGroup`、`TimelineMarksSnapshot` 与 `TimelineMarkHit`，以及上限 `MAX_TIMELINE_MARKS`（4,096）与 `MAX_TIMELINE_GROUPS`（64）。新增变体，每个都是穷尽 `match` 的编译期破坏性变更：`ChartInputEvent::TimelineMarkActivated(u32)`（与其他事件一起排空，并通过 `timeline_mark_activation(seq)` 读取命中）、`ChartHover::TimelineMark` 与 `InputTarget::TimelineMark`。`EngineMemoryUsage` 新增 `timeline_marks_capacity_bytes`。

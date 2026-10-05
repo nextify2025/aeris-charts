@@ -83,6 +83,150 @@ fn cancel_mid_price_axis_drag_ends_the_scale_session() {
     );
 }
 
+/// Abandons the open press with the pointer at `(x, y)`.
+type CancelSource = fn(&mut ChartEngine, (f64, f64));
+
+/// Every way the controller abandons an open press: host cancellation (capture, focus, or
+/// visibility loss, resize, backend loss), Escape, a secondary click, and the two lost-release
+/// paths.
+fn cancel_sources() -> [(&'static str, CancelSource); 5] {
+    [
+        ("input_cancel", |chart, _| chart.input_cancel()),
+        ("Escape", |chart, _| {
+            let none = InputModifiers::default();
+            assert!(chart.input_key_down(ChartKey::Escape, none, false, 0.0));
+        }),
+        ("a context menu", |chart, (x, y)| {
+            chart.input_context_menu(x, y)
+        }),
+        ("motion with the button already up", |chart, (x, y)| {
+            chart.input_pointer_move(at(x, y), false);
+        }),
+        ("a press after a lost release", |chart, (x, y)| {
+            chart.input_pointer_down(at(x, y), 1);
+            chart.input_pointer_up(at(x, y));
+        }),
+    ]
+}
+
+/// The decided cancellation rule for view gestures: abandoning a pan, an axis scale, or a
+/// separator resize is not an undo. Each cancel source stops the gesture where it is, so `read`
+/// still reports the partial change made before the cancel, and the still-held button moving on
+/// and releasing changes nothing more. Returns the state the cancels kept.
+fn assert_every_cancel_keeps_the_partial_change<T: PartialEq + std::fmt::Debug>(
+    gesture: &str,
+    setup: impl Fn() -> ChartEngine,
+    from: (f64, f64),
+    to: (f64, f64),
+    read: impl Fn(&mut ChartEngine) -> T,
+) -> T {
+    let mut kept = None;
+    for (source, cancel) in cancel_sources() {
+        let mut chart = setup();
+        let start = read(&mut chart);
+        chart.input_pointer_down(at(from.0, from.1), 1);
+        for step in 1..=4 {
+            let t = f64::from(step) / 4.0;
+            let sample = at(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            chart.input_pointer_move(sample, true);
+        }
+        let at_cancel = read(&mut chart);
+        assert_ne!(at_cancel, start, "the {gesture} moved before {source}");
+
+        cancel(&mut chart, to);
+        assert_eq!(
+            read(&mut chart),
+            at_cancel,
+            "{source} keeps the partial {gesture}"
+        );
+        let beyond = (2.0 * to.0 - from.0, 2.0 * to.1 - from.1);
+        chart.input_pointer_move(at(beyond.0, beyond.1), true);
+        chart.input_pointer_up(at(beyond.0, beyond.1));
+        assert_eq!(
+            read(&mut chart),
+            at_cancel,
+            "the {gesture} stays where {source} left it"
+        );
+        kept = Some(at_cancel);
+    }
+    kept.expect("at least one cancel source")
+}
+
+/// A cancelled pan keeps its offset, the manual price pan included.
+#[test]
+fn every_cancel_mid_pan_keeps_the_partial_pan() {
+    let setup = || {
+        let mut chart = chart();
+        let (low, high) = price_range(&chart);
+        let pad = (high - low) * 0.1;
+        chart.set_price_scale_visible_range_for(0, PriceScaleTarget::Right, low - pad, high + pad);
+        chart
+    };
+    let from = empty_pane_point(&setup());
+    let to = (from.0 + 60.0, from.1 + 40.0);
+    let (_, kept_range) =
+        assert_every_cancel_keeps_the_partial_change("pan", setup, from, to, |chart| {
+            (chart.scroll_position(), price_range(chart))
+        });
+    assert_ne!(
+        kept_range,
+        price_range(&setup()),
+        "the pan moved the price range too"
+    );
+}
+
+/// A cancelled time-axis or price-axis scale keeps its scale, and a price axis that the drag
+/// took out of autoscale stays manual, as after a completed drag.
+#[test]
+fn every_cancel_mid_axis_scale_keeps_the_partial_scale() {
+    let probe = chart();
+    let time_y = probe.pane_h + 4.0;
+    assert_every_cancel_keeps_the_partial_change(
+        "time-axis scale",
+        chart,
+        (200.0, time_y),
+        (120.0, time_y),
+        |chart| (chart.bar_spacing(), chart.scroll_position()),
+    );
+
+    let axis_x = probe.pane_w + 10.0;
+    let (_, auto_scale) = assert_every_cancel_keeps_the_partial_change(
+        "price-axis scale",
+        chart,
+        (axis_x, 100.0),
+        (axis_x, 160.0),
+        |chart| {
+            let auto_scale = chart.price_scale_auto_scale_for(0, PriceScaleTarget::Right);
+            (price_range(chart), auto_scale)
+        },
+    );
+    assert_eq!(auto_scale, Some(false), "the cancelled scale stays manual");
+}
+
+/// A cancelled separator resize keeps its partial split, which a saved layout then records like a
+/// completed resize.
+#[test]
+fn every_cancel_mid_separator_drag_keeps_the_partial_split() {
+    let setup = || {
+        let mut chart = chart();
+        chart.add_pane(true).unwrap();
+        relayout(&mut chart);
+        chart
+    };
+    let separator = setup().panes[1].top;
+    assert_every_cancel_keeps_the_partial_change(
+        "separator resize",
+        setup,
+        (200.0, separator),
+        (200.0, separator + 40.0),
+        |chart| {
+            relayout(chart);
+            let stretch: Vec<f64> = chart.panes.iter().map(|pane| pane.stretch_factor).collect();
+            (stretch, chart.panes[1].top)
+        },
+    );
+}
+
 #[test]
 fn cancel_mid_freehand_stroke_discards_it_and_keeps_the_brush_armed() {
     let mut chart = chart();
@@ -403,4 +547,44 @@ fn a_double_tap_tolerates_a_finger_wobble_that_a_double_click_does_not() {
             "{device:?} taps {apart} px apart"
         );
     }
+}
+
+/// A press owns the pointer from its press until it ends: hosts keep feeding it the pointer's
+/// moves outside the chart (pointer capture) exactly while `input_pointer_captured` holds, and a
+/// leave never ends it. A release, a lost release, `input_cancel` and Escape each end it.
+#[test]
+fn a_press_captures_the_pointer_until_it_ends() {
+    let mut chart = chart();
+    let (x, y) = empty_pane_point(&chart);
+    let none = InputModifiers::default();
+    assert!(!chart.input_pointer_captured());
+
+    chart.input_pointer_down(at(x, y), 1);
+    assert!(
+        chart.input_pointer_captured(),
+        "a press captures before it moves"
+    );
+    chart.input_pointer_move(at(x + 20.0, y), true);
+    chart.input_pointer_leave();
+    let outside = (x - chart.pane_w, y - 400.0);
+    chart.input_pointer_move(at(outside.0, outside.1), true);
+    assert!(
+        chart.input_pointer_captured(),
+        "a pan keeps the pointer outside the chart"
+    );
+    chart.input_pointer_up(at(outside.0, outside.1));
+    assert!(!chart.input_pointer_captured(), "the release ends it");
+
+    chart.input_pointer_down(at(x, y), 1);
+    chart.input_pointer_move(at(x + 20.0, y), false);
+    assert!(!chart.input_pointer_captured(), "a lost release ends it");
+
+    chart.input_pointer_down(at(x, y), 1);
+    chart.input_cancel();
+    assert!(!chart.input_pointer_captured(), "a cancel ends it");
+
+    chart.input_pointer_down(at(x, y), 1);
+    chart.input_pointer_move(at(x + 20.0, y), true);
+    assert!(chart.input_key_down(ChartKey::Escape, none, false, 0.0));
+    assert!(!chart.input_pointer_captured(), "Escape ends it");
 }
