@@ -21,8 +21,6 @@
 //! - `AERIS_CHARTS_PROBE_FEATURE=footprint` — finite probes start in the deterministic detailed-LOD
 //!   footprint fixture instead of the default candlestick fixture.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_engine::{
     crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, ChartEngine, ChartFrame,
@@ -43,7 +41,7 @@ use gpui::{
     canvas, div, prelude::*, px, relative, rgb, size, AnyElement, App, Bounds, Context,
     CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Render, ScrollHandle,
-    ScrollWheelEvent, Subscription, Task, Window, WindowBounds, WindowOptions,
+    ScrollWheelEvent, Subscription, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -535,10 +533,9 @@ struct Probe {
     plan_dirty: bool,
     fitted: bool,
     fit_on_first_frame: bool,
-    /// GPUI event translation; every interaction decision lives in the engine controller.
+    /// GPUI event translation, clock, wake, and refresh; every interaction decision lives in the
+    /// engine controller.
     input: GpuiChartInput,
-    /// The single scheduled wake for deferred engine input work (trading-tooltip dwell).
-    input_wake: Option<Task<()>>,
     footprint: Option<FootprintDemoState>,
     source_bars: Bars,
     drawing_template: DrawingTemplate,
@@ -553,6 +550,8 @@ struct Probe {
     click_status: String,
     bars: usize,
     painted: u64,
+    /// Frames rebuilt (not reused from the frame cache), so tests can count forced rebuilds.
+    rebuilt: u64,
     frame_budget: Option<u64>,
     last: GpuiFrameMetrics,
     /// Distinct scale factors and sizes observed, to prove the propagation actually happened.
@@ -607,7 +606,6 @@ impl Probe {
             fitted: false,
             fit_on_first_frame: true,
             input: GpuiChartInput::default(),
-            input_wake: None,
             footprint: None,
             source_bars: b,
             drawing_template: DrawingTemplate::default(),
@@ -622,6 +620,7 @@ impl Probe {
             click_status: "ready".to_string(),
             bars,
             painted: 0,
+            rebuilt: 0,
             frame_budget,
             last: GpuiFrameMetrics::default(),
             seen_scales: Vec::new(),
@@ -1273,13 +1272,9 @@ impl Probe {
         }
         self.built_for = key;
         self.dirty = false;
+        self.rebuilt += 1;
 
         self.engine.clear_autoscale_contributions();
-        if self.frame_budget.is_none() && self.engine.series[0].countdown_visible {
-            if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                self.engine.set_now_seconds(now.as_secs_f64());
-            }
-        }
         if self.fixtures.autoscale_band && !self.source_bars.low.is_empty() {
             let min = self
                 .source_bars
@@ -1408,12 +1403,7 @@ impl Probe {
         self.painted += 1;
     }
 
-    fn needs_animation_frame(&self) -> bool {
-        self.frame_budget.is_some() || self.engine.input_animating()
-    }
-
-    /// Common tail of every input listener: report engine requests in the status line, follow the
-    /// crosshair in the OHLC legend, schedule deferred engine work, and repaint.
+    /// Drain the engine's input events into the status line; `after_input` and its refresh follow.
     fn consume_input_events(&mut self) {
         for event in self.engine.take_input_events() {
             self.click_status = match event {
@@ -1441,6 +1431,9 @@ impl Probe {
         }
     }
 
+    /// Common tail of every input listener: report engine requests in the status line, follow the
+    /// crosshair in the OHLC legend, then refresh, which notifies the chart, schedules its rebuild,
+    /// and re-arms the engine's deferred wake.
     fn after_input(&mut self, cx: &mut Context<Self>) {
         self.consume_input_events();
         for request in self.engine.take_alert_create_requests() {
@@ -1453,18 +1446,7 @@ impl Probe {
             Some((x, _)) => self.update_legend(x),
             None => self.legend = "O —  H —  L —  C —".to_string(),
         }
-        self.input_wake = self.input.wake_delay(&self.engine).map(|delay| {
-            cx.spawn(async move |probe, cx| {
-                cx.background_executor().timer(delay).await;
-                let _ = probe.update(cx, |probe, cx| {
-                    probe.input_wake = None;
-                    probe.dirty = true;
-                    cx.notify();
-                });
-            })
-        });
-        self.dirty = true;
-        cx.notify();
+        self.input.refresh(&self.engine, cx);
     }
 
     fn on_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1610,15 +1592,15 @@ impl Render for Probe {
         let entity: Entity<Probe> = cx.entity();
         let prepaint_entity = entity.clone();
 
-        // Finite probes deliberately sample consecutive frames. Interactive charts request a
-        // follow-up only while an engine-owned animation is active; ordinary input/resize/data
-        // mutations already notify GPUI and an idle chart must stay idle.
+        // Finite probes deliberately sample consecutive frames. Interactive charts leave frame
+        // scheduling to the adapter: `prepare_frame` requests a follow-up only while an
+        // engine-owned animation or the last-price pulse runs, so an idle chart stays idle.
         let done = self
             .frame_budget
             .is_some_and(|budget| self.painted >= budget);
         if done {
             cx.quit();
-        } else if self.needs_animation_frame() {
+        } else if self.frame_budget.is_some() {
             window.request_animation_frame();
         }
 
@@ -1659,18 +1641,17 @@ impl Render for Probe {
                         let w: f32 = bounds.size.width.into();
                         let h: f32 = bounds.size.height.into();
                         let scale_factor = window.scale_factor();
-                        let reduced_motion = cx.reduce_motion();
-                        prepaint_entity.update(cx, |probe: &mut Probe, _| {
+                        prepaint_entity.update(cx, |probe: &mut Probe, cx| {
                             if probe
                                 .frame_budget
                                 .is_some_and(|budget| probe.painted >= budget)
                             {
                                 return;
                             }
-                            probe.input.set_canvas_bounds(bounds);
-                            probe.dirty |= probe
-                                .input
-                                .prepare_frame_with_motion(&mut probe.engine, reduced_motion);
+                            probe.dirty |=
+                                probe
+                                    .input
+                                    .prepare_frame(&mut probe.engine, bounds, window, cx);
                             probe.rebuild(w, h, scale_factor, window);
                         });
                         bounds
@@ -1883,6 +1864,7 @@ impl InteractiveDemo {
         let chart = cx.new(|cx| {
             let mut probe = Probe::new_interactive(bars);
             probe.focus_handle = Some(cx.focus_handle());
+            probe.input = GpuiChartInput::new(cx);
             probe
         });
         let root_observer = cx.observe(&chart, |_, _, cx| cx.notify());
@@ -1930,8 +1912,7 @@ impl InteractiveDemo {
         if let Some(chart) = chart {
             chart.update(cx, |probe, child_cx| {
                 f(probe);
-                probe.dirty = true;
-                child_cx.notify();
+                probe.input.refresh(&probe.engine, child_cx);
             });
         }
     }
@@ -1972,6 +1953,7 @@ impl InteractiveDemo {
                     let mut probe = Probe::new_interactive(300);
                     probe.replace_source_bars(split_bars);
                     probe.focus_handle = Some(cx.focus_handle());
+                    probe.input = GpuiChartInput::new(cx);
                     probe
                 });
                 self.cells.push(DemoCell { id, chart });
@@ -2253,7 +2235,7 @@ impl InteractiveDemo {
                 self.theme = if self.theme == DemoTheme::Light { DemoTheme::Dark } else { DemoTheme::Light };
                 for cell in &self.cells {
                     let theme = self.theme;
-                    cell.chart.update(cx, |p, child| { p.apply_theme(theme); child.notify(); });
+                    cell.chart.update(cx, |p, child| { p.apply_theme(theme); p.input.refresh(&p.engine, child); });
                 }
             }
             DemoAction::Grid => self.update_root(cx, |p| {
@@ -3385,6 +3367,7 @@ fn main() {
                             probe.enable_footprint();
                         }
                         probe.focus_handle = Some(cx.focus_handle());
+                        probe.input = GpuiChartInput::new(cx);
                         probe
                     }))
                 };
@@ -4160,23 +4143,6 @@ mod semantic_regressions {
     }
 
     #[test]
-    fn idle_interactive_probe_stops_requesting_frames() {
-        use aeris_charts_engine::{ChartKey, InputModifiers};
-        let mut interactive = Probe::new(8, None);
-        assert!(!interactive.needs_animation_frame());
-        let none = InputModifiers::default();
-        assert!(interactive
-            .engine
-            .input_key_down(ChartKey::ArrowLeft, none, false, 1_000.0));
-        assert!(interactive.needs_animation_frame());
-        assert!(interactive.engine.input_key_up(ChartKey::ArrowLeft));
-        assert!(!interactive.needs_animation_frame());
-        interactive.engine.start_scroll_animation(3.0, 160.0, 0.0);
-        assert!(interactive.needs_animation_frame());
-        assert!(Probe::new(8, Some(2)).needs_animation_frame());
-    }
-
-    #[test]
     fn brushable_area_uses_the_native_area_and_delta_tooltip_paths() {
         use aeris_charts_engine::PointerInput;
         let mut probe = Probe::new(32, None);
@@ -4351,12 +4317,15 @@ mod semantic_regressions {
 mod window_input_tests {
     use super::*;
     use aeris_charts_engine::{
-        pinch_zoom_scale, wheel_zoom_scale, ChartCursor, ChartRegion, DrawingId, InteractionOptions,
+        pinch_zoom_scale, wheel_zoom_scale, ChartCursor, ChartKey, ChartRegion, DrawingId,
+        InputModifiers, InteractionOptions, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus,
+        TradingHitKind, TradingPriceScale, TradingSnapshot, WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
     };
     use gpui::{
-        point, ClipboardItem, Keystroke, Modifiers, Pixels, Point, ScrollDelta, TestAppContext,
-        VisualTestContext,
+        point, ClipboardItem, Keystroke, Modifiers, Pixels, Point, ScrollDelta, StyleRefinement,
+        TestAppContext, VisualTestContext,
     };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const BARS: usize = 400;
     const WINDOW_W: f32 = 1000.0;
@@ -4370,14 +4339,31 @@ mod window_input_tests {
 
     /// A minimal parent view. The probe keeps its real listener table; the host records what
     /// bubbles past the chart, as a scrolling container or shell shortcuts would receive it.
+    ///
+    /// With `cached` the chart is embedded with `.cached()`, so GPUI replays its last frame
+    /// unless the chart's view is notified, as gpui-fast's retained mode does for every view. A
+    /// test that asserts a repaint on that host therefore fails when a listener's `refresh`, a
+    /// wake, or an animation frame does not notify the chart. `sibling` is a view beside the
+    /// chart that a test notifies to draw the window without notifying the chart or its host, or
+    /// focuses to take keyboard focus from the chart.
     struct ChartHost {
         chart: Entity<Probe>,
+        sibling: Entity<Sibling>,
+        cached: bool,
         wheel_reached_host: usize,
         keys_reached_host: Vec<String>,
     }
 
     impl Render for ChartHost {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let chart = if self.cached {
+                self.chart
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element()
+            } else {
+                self.chart.clone().into_any_element()
+            };
             div()
                 .size_full()
                 .p(px(INSET))
@@ -4387,22 +4373,53 @@ mod window_input_tests {
                 .on_key_down(cx.listener(|host, event: &KeyDownEvent, _, _| {
                     host.keys_reached_host.push(event.keystroke.key.clone());
                 }))
-                .child(self.chart.clone())
+                .child(chart)
+                .child(self.sibling.clone())
         }
     }
 
-    /// Open the interactive chart in a test window and let GPUI lay it out and paint it.
+    /// A one-pixel focusable view in the host's top-left margin, outside the chart.
+    struct Sibling {
+        focus: FocusHandle,
+    }
+
+    impl Render for Sibling {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size(px(1.0))
+                .track_focus(&self.focus)
+        }
+    }
+
+    /// Open the interactive chart, embedded with `.cached()`, in a test window and let GPUI lay
+    /// it out and paint it.
     fn open_chart(
         cx: &mut TestAppContext,
+    ) -> (Entity<Probe>, Entity<ChartHost>, VisualTestContext) {
+        open_chart_in(cx, true)
+    }
+
+    /// [`open_chart`], or with `cached` false the chart embedded as a plain child view.
+    fn open_chart_in(
+        cx: &mut TestAppContext,
+        cached: bool,
     ) -> (Entity<Probe>, Entity<ChartHost>, VisualTestContext) {
         let window = cx.open_window(size(px(WINDOW_W), px(WINDOW_H)), |_, cx| {
             let chart = cx.new(|cx| {
                 let mut probe = Probe::new_interactive(BARS);
                 probe.focus_handle = Some(cx.focus_handle());
+                probe.input = GpuiChartInput::new(cx);
                 probe
             });
             ChartHost {
                 chart,
+                sibling: cx.new(|cx| Sibling {
+                    focus: cx.focus_handle(),
+                }),
+                cached,
                 wheel_reached_host: 0,
                 keys_reached_host: Vec::new(),
             }
@@ -4519,8 +4536,7 @@ mod window_input_tests {
                     Some(&options),
                 )
                 .expect("the text drawing is valid");
-            probe.dirty = true;
-            cx.notify();
+            probe.input.refresh(&probe.engine, cx);
             id
         });
         cx.run_until_parked();
@@ -4755,12 +4771,13 @@ mod window_input_tests {
         );
 
         // With wheel gestures off the chart declines the wheel, so the host may scroll instead.
-        chart.update(&mut cx, |probe, _| {
+        chart.update(&mut cx, |probe, cx| {
             probe.engine.set_interaction_options(InteractionOptions {
                 wheel_scroll: false,
                 wheel_zoom: false,
                 ..InteractionOptions::default()
             });
+            probe.input.refresh(&probe.engine, cx);
         });
         cx.simulate_event(wheel(ScrollDelta::Pixels(point(px(0.0), px(100.0)))));
         assert_eq!(reached_host(&cx), 1);
@@ -4989,7 +5006,7 @@ mod window_input_tests {
         let (chart, _host, mut cx) = open_chart(cx);
         chart.update(&mut cx, |probe, cx| {
             probe.arm_drawing(DrawingKind::TrendLine);
-            cx.notify();
+            probe.input.refresh(&probe.engine, cx);
         });
         cx.update(|window, cx| {
             let focus = chart
@@ -5053,5 +5070,544 @@ mod window_input_tests {
         });
         cx.simulate_keystrokes("secondary-v");
         assert_eq!(charts(&cx), 2);
+    }
+
+    /// Deliver the next platform frame: run the callbacks GPUI queued for it (each notifies the
+    /// view that asked), let the window draw, and return how many were queued.
+    fn next_frame(cx: &mut VisualTestContext) -> usize {
+        let queued = cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        queued
+    }
+
+    /// Move GPUI's executor clock and run whatever became due, such as the adapter's wake.
+    fn advance(cx: &mut VisualTestContext, by: Duration) {
+        cx.executor().advance_clock(by);
+        cx.run_until_parked();
+    }
+
+    fn painted(cx: &VisualTestContext, chart: &Entity<Probe>) -> u64 {
+        chart.read_with(cx, |probe, _| probe.painted)
+    }
+
+    /// Whether the chart's last built frame paints `text`.
+    fn frame_shows(cx: &VisualTestContext, chart: &Entity<Probe>, text: &str) -> bool {
+        chart.read_with(cx, |probe, _| {
+            probe.frame.panes.iter().any(|pane| {
+                pane.under
+                    .iter()
+                    .chain(&pane.main)
+                    .chain(&pane.top_prims)
+                    .any(|prim| matches!(prim, Prim::Text { text: painted, .. } if painted == text))
+            })
+        })
+    }
+
+    /// A working sell order at the plot's middle price, shown through a host update and its
+    /// refresh. Returns the window positions of the order's close button and of a plot point
+    /// below it.
+    fn show_working_order(
+        cx: &mut VisualTestContext,
+        chart: &Entity<Probe>,
+    ) -> (Point<Pixels>, Point<Pixels>) {
+        chart.update(cx, |probe, cx| {
+            let engine = &mut probe.engine;
+            let price = engine
+                .chart_context_at(engine.pane_w / 2.0, engine.pane_h / 2.0)
+                .expect("the plot has a price scale")
+                .price;
+            engine
+                .set_trading_snapshot(TradingSnapshot {
+                    orders: vec![WorkingOrder {
+                        id: OrderId::new("order-1".to_string()).expect("a valid order id"),
+                        account_id: None,
+                        pane_index: 0,
+                        price_scale: TradingPriceScale::Right,
+                        side: OrderSide::Sell,
+                        kind: OrderKind::Limit,
+                        role: OrderRole::Working,
+                        status: OrderStatus::Working,
+                        price,
+                        stop_price: None,
+                        trailing_trigger_price: None,
+                        break_even_trigger_price: None,
+                        quantity: 1.0,
+                        filled_quantity: 0.0,
+                        position_id: None,
+                        parent_order_id: None,
+                        bracket_id: None,
+                        oco_group_id: None,
+                        revision: 1,
+                        annotations: Vec::new(),
+                    }],
+                    ..TradingSnapshot::default()
+                })
+                .expect("the order is valid");
+            probe.input.refresh(&probe.engine, cx);
+        });
+        cx.run_until_parked();
+        chart.read_with(cx, |probe, _| {
+            let engine = &probe.engine;
+            let y = (engine.pane_h / 2.0).round();
+            let x = (0..engine.pane_w as usize)
+                .map(|x| x as f64)
+                .find(|&x| {
+                    engine
+                        .trading_hit_at(x, y)
+                        .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+                })
+                .expect("the order shows a close button");
+            (at(probe, x, y), at(probe, x, y + 60.0))
+        })
+    }
+
+    /// The chart redraws only when its view is notified. A host change without `refresh`
+    /// leaves a cached chart showing its last frame even while the window draws; `refresh`
+    /// draws it once with a rebuilt frame, however often it was called, and a later draw with no
+    /// refresh pending reuses that frame.
+    #[gpui::test]
+    fn a_refresh_rebuilds_the_chart_once_and_a_missing_refresh_replays_it(cx: &mut TestAppContext) {
+        for cached in [true, false] {
+            let (chart, host, mut cx) = open_chart_in(cx, cached);
+            let sibling = host.read_with(&cx, |host, _| host.sibling.clone());
+            let rebuilt = |cx: &VisualTestContext| chart.read_with(cx, |probe, _| probe.rebuilt);
+            let frame =
+                |cx: &VisualTestContext| chart.read_with(cx, |probe, _| probe.frame.clone());
+            let (painted_before, rebuilt_before, frame_before) =
+                (painted(&cx, &chart), rebuilt(&cx), frame(&cx));
+
+            // A host update that forgets `refresh`, then a draw of the window for another view.
+            chart.update(&mut cx, |probe, _| {
+                let position = probe.engine.scroll_position();
+                probe.engine.scroll_to_position(position - 20.0);
+            });
+            sibling.update(&mut cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert_eq!(rebuilt(&cx), rebuilt_before, "cached: {cached}");
+            assert_eq!(
+                frame(&cx),
+                frame_before,
+                "the chart still shows the old view"
+            );
+            if cached {
+                assert_eq!(
+                    painted(&cx, &chart),
+                    painted_before,
+                    "the cached chart replays its last frame"
+                );
+            }
+
+            let painted_before = painted(&cx, &chart);
+            chart.update(&mut cx, |probe, cx| {
+                probe.input.refresh(&probe.engine, cx);
+                probe.input.refresh(&probe.engine, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(painted(&cx, &chart), painted_before + 1, "cached: {cached}");
+            assert_eq!(rebuilt(&cx), rebuilt_before + 1, "one rebuild per refresh");
+            assert_ne!(
+                frame(&cx),
+                frame_before,
+                "the rebuilt frame shows the change"
+            );
+
+            sibling.update(&mut cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert_eq!(
+                rebuilt(&cx),
+                rebuilt_before + 1,
+                "a draw with no refresh pending reuses the frame"
+            );
+        }
+    }
+
+    /// Every input listener ends with `refresh`, so pointer motion, a wheel and a key each draw
+    /// the cached chart exactly once with a rebuilt frame. GPUI itself redraws the window for
+    /// none of them: motion inside one element changes no hover state.
+    #[gpui::test]
+    fn each_input_listener_repaints_the_cached_chart_once(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let rebuilt = |cx: &VisualTestContext| chart.read_with(cx, |probe, _| probe.rebuilt);
+        let (first, second) = chart.read_with(&cx, |probe, _| {
+            (at(probe, 300.0, 200.0), at(probe, 360.0, 220.0))
+        });
+        hover(&mut cx, first);
+        click(&mut cx, first);
+        let expect_one_draw =
+            |cx: &mut VisualTestContext, input: &str, act: &dyn Fn(&mut VisualTestContext)| {
+                let (painted_before, rebuilt_before) = (painted(cx, &chart), rebuilt(cx));
+                act(cx);
+                assert_eq!(painted(cx, &chart), painted_before + 1, "{input}");
+                assert_eq!(rebuilt(cx), rebuilt_before + 1, "{input}");
+            };
+        expect_one_draw(&mut cx, "pointer motion", &|cx| hover(cx, second));
+        assert_eq!(
+            engine(&cx, &chart, |engine| engine.crosshair),
+            Some((360.0, 220.0))
+        );
+        expect_one_draw(&mut cx, "wheel", &|cx| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: second,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(100.0))),
+                ..ScrollWheelEvent::default()
+            })
+        });
+        // GPUI redraws the whole window when input switches from pointer to keyboard (its
+        // input-modality refresh), so the measured key follows a first one.
+        cx.simulate_keystrokes("end");
+        expect_one_draw(&mut cx, "key", &|cx| cx.simulate_keystrokes("pageup"));
+    }
+
+    /// The trading tooltip appears after its dwell with no further input: the adapter's wake
+    /// fires on GPUI's executor clock and notifies the chart, whose prepaint ticks the engine
+    /// past the deadline and requests one more frame, so the view renders the revealed state.
+    /// A wake replaced by newer hover never fires.
+    #[gpui::test]
+    fn the_tooltip_dwell_repaints_the_chart_with_no_further_input(cx: &mut TestAppContext) {
+        let dwell = TRADING_TOOLTIP_DWELL_MS as u64;
+        for cached in [true, false] {
+            let (chart, _host, mut cx) = open_chart_in(cx, cached);
+            let (on_close, away) = show_working_order(&mut cx, &chart);
+
+            hover(&mut cx, on_close);
+            let before = painted(&cx, &chart);
+            advance(&mut cx, Duration::from_millis(dwell - 1));
+            assert_eq!(painted(&cx, &chart), before, "cached: {cached}");
+            assert!(!frame_shows(&cx, &chart, "Cancel order"));
+            advance(&mut cx, Duration::from_millis(1));
+            assert!(painted(&cx, &chart) > before, "cached: {cached}");
+            assert!(
+                frame_shows(&cx, &chart, "Cancel order"),
+                "cached: {cached}: the dwell revealed the tooltip"
+            );
+            // gpui-fast may queue a frame of its own beside the adapter's (a retained subtree
+            // whose layout changed is laid out again on the next frame), so this counts at
+            // least one; gpui-pre queues exactly the adapter's.
+            let before = painted(&cx, &chart);
+            assert!(
+                next_frame(&mut cx) >= 1,
+                "the revealing tick asks for one more frame"
+            );
+            assert_eq!(painted(&cx, &chart), before + 1, "cached: {cached}");
+            assert_eq!(next_frame(&mut cx), 0, "that frame changes nothing");
+
+            // Leaving and re-entering restarts the dwell; the first wake is dropped.
+            hover(&mut cx, away);
+            assert!(!frame_shows(&cx, &chart, "Cancel order"));
+            hover(&mut cx, on_close);
+            advance(&mut cx, Duration::from_millis(200));
+            hover(&mut cx, away);
+            hover(&mut cx, on_close);
+            let before = painted(&cx, &chart);
+            advance(&mut cx, Duration::from_millis(dwell - 200));
+            assert_eq!(
+                painted(&cx, &chart),
+                before,
+                "cached: {cached}: the replaced wake does not fire"
+            );
+            assert!(!frame_shows(&cx, &chart, "Cancel order"));
+            advance(&mut cx, Duration::from_millis(200));
+            assert!(painted(&cx, &chart) > before, "cached: {cached}");
+            assert!(frame_shows(&cx, &chart, "Cancel order"), "cached: {cached}");
+        }
+    }
+
+    /// A held arrow pans through animation frames that the adapter requests while the engine
+    /// animates, one per drawn frame, on GPUI's executor clock; the release stops them.
+    #[gpui::test]
+    fn a_held_arrow_requests_frames_on_the_gpui_clock_until_its_release(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let empty = chart.read_with(&cx, |probe, _| at(probe, EMPTY.0, EMPTY.1));
+        click(&mut cx, empty);
+        assert_eq!(next_frame(&mut cx), 0, "an idle chart schedules nothing");
+
+        let (time_scale, pressed_at) = chart.read_with(&cx, |probe, _| {
+            (probe.engine.time_scale.clone(), probe.input.now_ms())
+        });
+        cx.simulate_keystrokes("left");
+        assert!(engine(&cx, &chart, ChartEngine::input_animating));
+        for _ in 0..3 {
+            assert_eq!(
+                next_frame(&mut cx),
+                1,
+                "each drawn frame queues exactly one more"
+            );
+        }
+        advance(&mut cx, Duration::from_millis(100));
+        let before = painted(&cx, &chart);
+        assert_eq!(next_frame(&mut cx), 1);
+        assert_eq!(painted(&cx, &chart), before + 1);
+
+        // The same press and ticks on the engine alone, 100 ms apart on the press clock.
+        let mut twin = ChartEngine::new(f64::from(WINDOW_W), f64::from(WINDOW_H), 1.0);
+        twin.time_scale = time_scale;
+        let none = InputModifiers::default();
+        assert!(twin.input_key_down(ChartKey::ArrowLeft, none, false, pressed_at));
+        twin.input_tick(pressed_at);
+        twin.input_tick(pressed_at + 100.0);
+        assert_eq!(
+            engine(&cx, &chart, ChartEngine::scroll_position),
+            twin.scroll_position()
+        );
+
+        cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse("left").expect("a valid keystroke"),
+        });
+        assert!(!engine(&cx, &chart, ChartEngine::input_animating));
+        assert_eq!(
+            next_frame(&mut cx),
+            1,
+            "the frame queued while the key was held"
+        );
+        assert_eq!(next_frame(&mut cx), 0, "the release stops the frames");
+    }
+
+    /// A kinetic coast after a flick keeps requesting frames and moves on GPUI's executor clock;
+    /// the frame that ends it requests exactly one more, so the view renders the end, and that
+    /// frame requests none.
+    #[gpui::test]
+    fn a_kinetic_coast_requests_frames_until_it_ends(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        chart.update(&mut cx, |probe, cx| {
+            let mut options = probe.engine.interaction_options();
+            options.kinetic_mouse = true;
+            probe.engine.set_interaction_options(options);
+            probe.input.refresh(&probe.engine, cx);
+        });
+        let empty = chart.read_with(&cx, |probe, _| at(probe, EMPTY.0, EMPTY.1));
+        press(&mut cx, empty, 1);
+        for dx in [10.0, 50.0, 90.0, 130.0] {
+            advance(&mut cx, Duration::from_millis(16));
+            drag_to(&mut cx, offset(empty, dx, 0.0));
+        }
+        release(&mut cx, offset(empty, 130.0, 0.0), 1);
+        assert!(
+            engine(&cx, &chart, ChartEngine::input_animating),
+            "a 2.5 px/ms flick coasts"
+        );
+
+        let released = engine(&cx, &chart, ChartEngine::scroll_position);
+        assert_eq!(next_frame(&mut cx), 1);
+        advance(&mut cx, Duration::from_millis(100));
+        assert_eq!(next_frame(&mut cx), 1);
+        assert_ne!(
+            engine(&cx, &chart, ChartEngine::scroll_position),
+            released,
+            "the coast moves with the executor clock"
+        );
+        advance(&mut cx, Duration::from_secs(10));
+        assert_eq!(next_frame(&mut cx), 1, "the queued frame ends the coast");
+        assert!(!engine(&cx, &chart, ChartEngine::input_animating));
+        let ended = engine(&cx, &chart, ChartEngine::scroll_position);
+        let before = painted(&cx, &chart);
+        assert_eq!(
+            next_frame(&mut cx),
+            1,
+            "the frame that ends the coast requests one more"
+        );
+        assert_eq!(painted(&cx, &chart), before + 1, "the view renders the end");
+        assert_eq!(engine(&cx, &chart, ChartEngine::scroll_position), ended);
+        assert_eq!(next_frame(&mut cx), 0, "that frame requests no more");
+    }
+
+    /// The last-price pulse of a line series animates a cached chart frame by frame on the
+    /// adapter clock, and stops once the series is candles again.
+    #[gpui::test]
+    fn the_last_price_pulse_animates_a_cached_chart_and_stops_for_candles(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        assert_eq!(next_frame(&mut cx), 0, "candles have no pulse");
+        let id = engine(&cx, &chart, |engine| engine.series[0].id);
+        chart.update(&mut cx, |probe, cx| {
+            probe.engine.convert_series_kind(id, SeriesKind::Line);
+            probe.input.refresh(&probe.engine, cx);
+        });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            advance(&mut cx, Duration::from_millis(100));
+            let before = painted(&cx, &chart);
+            assert_eq!(next_frame(&mut cx), 1, "every pulse frame queues the next");
+            assert_eq!(painted(&cx, &chart), before + 1);
+            chart.read_with(&cx, |probe, _| {
+                assert_eq!(probe.engine.animation_time, probe.input.now_ms());
+            });
+        }
+
+        chart.update(&mut cx, |probe, cx| {
+            probe
+                .engine
+                .convert_series_kind(id, SeriesKind::Candlestick);
+            probe.input.refresh(&probe.engine, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            next_frame(&mut cx),
+            1,
+            "the frame the last pulse frame queued"
+        );
+        assert_eq!(next_frame(&mut cx), 0, "candles stop the pulse");
+    }
+
+    /// Under GPUI's reduce-motion setting the decorative pulse is removed: the chart draws no
+    /// ring and requests no frames for it, and the pulse returns when the setting clears.
+    #[gpui::test]
+    fn reduce_motion_removes_the_pulse_and_its_frames(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let id = engine(&cx, &chart, |engine| engine.series[0].id);
+        chart.update(&mut cx, |probe, cx| {
+            probe.engine.convert_series_kind(id, SeriesKind::Line);
+            probe.input.refresh(&probe.engine, cx);
+        });
+        cx.run_until_parked();
+        let rings = |cx: &VisualTestContext| {
+            chart.read_with(cx, |probe, _| {
+                probe.frame.panes[0]
+                    .main
+                    .iter()
+                    .filter(|prim| matches!(prim, Prim::Circle { .. }))
+                    .count()
+            })
+        };
+        assert!(rings(&cx) > 0, "a line pulses its last price");
+        assert_eq!(next_frame(&mut cx), 1, "the pulse animates");
+
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        cx.run_until_parked();
+        assert!(engine(&cx, &chart, |engine| engine
+            .interaction_options()
+            .reduced_motion));
+        assert!(!engine(&cx, &chart, ChartEngine::last_price_pulse_active));
+        assert_eq!(rings(&cx), 0, "the redrawn chart has no pulse");
+        // The frame the pulse queued, then the one the changed preference asks for.
+        assert!(next_frame(&mut cx) > 0);
+        assert_eq!(
+            next_frame(&mut cx),
+            0,
+            "nothing animates under reduced motion"
+        );
+        let before = painted(&cx, &chart);
+        advance(&mut cx, Duration::from_secs(1));
+        assert_eq!(painted(&cx, &chart), before);
+
+        cx.update(|_, cx| cx.set_reduce_motion(false));
+        cx.run_until_parked();
+        assert!(rings(&cx) > 0, "the pulse returns");
+        assert_eq!(next_frame(&mut cx), 1);
+    }
+
+    /// GPUI delivers a key-up only along the focused element's dispatch path, and none once the
+    /// window deactivates. A held arrow whose release can no longer reach the chart therefore
+    /// ends at the next prepaint, instead of panning and requesting frames forever.
+    #[gpui::test]
+    fn a_held_arrow_ends_when_focus_or_the_window_moves_away(cx: &mut TestAppContext) {
+        for deactivate in [false, true] {
+            let (chart, host, mut cx) = open_chart(cx);
+            if deactivate {
+                cx.update(|window, _| window.activate_window());
+                cx.run_until_parked();
+                assert!(cx.update(|window, _| window.is_window_active()));
+            }
+            let empty = chart.read_with(&cx, |probe, _| at(probe, EMPTY.0, EMPTY.1));
+            click(&mut cx, empty);
+            cx.simulate_keystrokes("left");
+            assert!(engine(&cx, &chart, ChartEngine::input_animating));
+            assert_eq!(next_frame(&mut cx), 1, "deactivate: {deactivate}");
+
+            if deactivate {
+                // No key-up follows: the platform sends none to an inactive window.
+                cx.deactivate_window();
+            } else {
+                let focus = host.read_with(&cx, |host, cx| host.sibling.read(cx).focus.clone());
+                cx.update(|window, cx| window.focus(&focus, cx));
+                cx.run_until_parked();
+                // The release reaches the newly focused sibling, not the chart.
+                cx.simulate_event(KeyUpEvent {
+                    keystroke: Keystroke::parse("left").expect("a valid keystroke"),
+                });
+            }
+            assert!(
+                !engine(&cx, &chart, ChartEngine::input_animating),
+                "deactivate: {deactivate}: the stranded pan ended"
+            );
+            assert!(next_frame(&mut cx) > 0, "the frames queued before it ended");
+            assert_eq!(next_frame(&mut cx), 0, "deactivate: {deactivate}");
+            let position = engine(&cx, &chart, ChartEngine::scroll_position);
+            advance(&mut cx, Duration::from_secs(1));
+            assert_eq!(next_frame(&mut cx), 0);
+            assert_eq!(engine(&cx, &chart, ChartEngine::scroll_position), position);
+        }
+    }
+
+    /// A shown candle-close countdown repaints a cached chart once a second with no input: the
+    /// adapter pins the system clock and wakes on each whole second of its own clock, with no
+    /// animation frames, and the chart goes idle once no countdown row shows.
+    #[gpui::test]
+    fn a_shown_countdown_repaints_the_cached_chart_once_a_second(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let wall = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the system clock is after 1970")
+                .as_secs_f64()
+        };
+        // Hourly bars whose forming bar opened half an hour ago, so it stays open for the test.
+        chart.update(&mut cx, |probe, cx| {
+            let last = wall().floor() - 1_800.0;
+            let times: Vec<f64> = (0..BARS)
+                .rev()
+                .map(|bar| last - bar as f64 * 3_600.0)
+                .collect();
+            let values = vec![100.0; BARS];
+            probe
+                .engine
+                .set_series_data(0, &times, &values, &values, &values, &values)
+                .expect("the bars are valid");
+            probe.input.refresh(&probe.engine, cx);
+        });
+        cx.run_until_parked();
+        assert!(engine(&cx, &chart, ChartEngine::countdown_shown));
+        let pinned = engine(&cx, &chart, |engine| engine.now_override);
+        assert!(pinned.is_some_and(|now| (wall() - now).abs() < 60.0));
+
+        for _ in 0..3 {
+            let before = painted(&cx, &chart);
+            advance(&mut cx, Duration::from_secs(1));
+            assert_eq!(painted(&cx, &chart), before + 1, "one repaint per second");
+            assert_eq!(
+                next_frame(&mut cx),
+                0,
+                "the countdown needs no animation frames"
+            );
+        }
+
+        // A closed session hides every countdown row, so nothing wakes the chart any more.
+        chart.update(&mut cx, |probe, cx| {
+            probe.engine.set_bar_countdown_active(false);
+            probe.input.refresh(&probe.engine, cx);
+        });
+        cx.run_until_parked();
+        assert!(!engine(&cx, &chart, ChartEngine::countdown_shown));
+        let before = painted(&cx, &chart);
+        advance(&mut cx, Duration::from_secs(3));
+        assert_eq!(painted(&cx, &chart), before);
+    }
+
+    /// A finite probe samples consecutive frames: its render queues exactly one per draw, and
+    /// the adapter adds none for an idle candlestick chart.
+    #[gpui::test]
+    fn a_finite_probe_queues_one_frame_per_draw(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(WINDOW_W), px(WINDOW_H)), |_, cx| {
+            let mut probe = Probe::new(8, Some(4));
+            probe.focus_handle = Some(cx.focus_handle());
+            probe.input = GpuiChartInput::new(cx);
+            probe
+        });
+        let chart = window.root(cx).expect("the probe window is open");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        for _ in 0..2 {
+            let before = painted(&cx, &chart);
+            assert_eq!(next_frame(&mut cx), 1);
+            assert_eq!(painted(&cx, &chart), before + 1);
+        }
     }
 }

@@ -9,6 +9,7 @@
 - [固定工具链与严格预算](#固定工具链与严格预算)
 - [浏览器与 Linux 呈现](#浏览器与-linux-呈现)
 - [GPUI 一致性与回放](#gpui-一致性与回放)
+  - [gpui-fast 证据线](#gpui-fast-证据线)
 - [发布与诊断的边界](#发布与诊断的边界)
 
 ## 正确性与真实调用路径
@@ -17,7 +18,7 @@
 
 对几何、磁吸、比例尺、交互或执行的变更，要求提供单元测试、帧契约测试、黄金图像、绘制流一致性、回放稳定性、浏览器测试和 release 性能证据中范围最窄的相关组合。仅凭特定后端的截图，不能证明共享引擎的正确性。
 
-交互行为通过每条真实的输入路径来验证，而不是通过其下层的机制。控制器的场景模块（`chart_input/{chrome,drawing,lifecycle,motion,trading}_tests.rs`，与其自身的 `tests` 并列）通过 `ChartEngine::input_*` 并配合显式时间戳来驱动每个行为（准备工作以及诸如 `resolve_trading_intent` 之类的宿主答复使用公共 API），因此动能滑行和交易提示框停留在没有时钟的情况下也是确定的。GPUI 适配器的测试（`aeris_charts_render_gpui/src/input/tests.rs`）把 GPUI 事件值送入 `GpuiChartInput`，并在孪生引擎上将其滚轮归一化与浏览器的滚轮归一化进行比较。`gpui_probe` 示例的 `window_input_tests` 在 GPUI 的无头 `TestPlatform`（仅用于开发的 `gpui` 依赖的 `test-support` 特性）上打开真实的探针宿主，并把模拟的鼠标、滚轮和按键事件依次派发经过其监听器表、适配器、引擎、prepaint 和 paint；它们在全部三种操作系统上的原生 GPUI 作业中运行。浏览器交互由 Playwright spec 覆盖，这些 spec 针对已发布的包构建，驱动真实的 `page.mouse`/`page.keyboard` 输入和 CDP 触摸（`gesture-cancellation`、`interaction-gates`、`touch-input` 以及各功能专属的 spec）。
+交互行为通过每条真实的输入路径来验证，而不是通过其下层的机制。控制器的场景模块（`chart_input/{chrome,drawing,lifecycle,motion,trading}_tests.rs`，与其自身的 `tests` 并列）通过 `ChartEngine::input_*` 并配合显式时间戳来驱动每个行为（准备工作以及诸如 `resolve_trading_intent` 之类的宿主答复使用公共 API），因此动能滑行和交易提示框停留在没有时钟的情况下也是确定的。GPUI 适配器的测试（`aeris_charts_render_gpui/src/input/tests.rs`）把 GPUI 事件值送入 `GpuiChartInput`，并在孪生引擎上将其滚轮归一化与浏览器的滚轮归一化进行比较；在 GPUI 的测试执行器上，它们还覆盖刷新契约：执行器时钟、notify、每个截止时间一个唤醒（保留、替换、丢弃、随适配器取消）、触发的唤醒到达其截止时间、与该唤醒共享的倒计时整秒，以及减弱动效会停止的脉冲时钟。`gpui_probe` 示例的 `window_input_tests` 在 GPUI 的无头 `TestPlatform`（仅用于开发的 `gpui` 依赖的 `test-support` 特性）上打开真实的探针宿主，并把模拟的鼠标、滚轮和按键事件依次派发经过其监听器表、适配器、引擎、prepaint 和 paint；它们在全部三种操作系统上的原生 GPUI 作业中运行。它们的宿主以 `.cached()` 嵌入图表，因此未被 notify 的图表会像在 gpui-fast 的保留模式下那样重放其最后一帧。在该宿主上（注明之处也在未缓存的宿主上），它们断言：指针运动、滚轮和按键各自让图表以重建的帧绘制一次；没有 `refresh` 的变更保持未绘制；执行器时钟越过截止时间后，提示框停留无需进一步输入即会重绘（被替换的唤醒绝不触发）；按住的按键、惯性滑行和脉冲在执行器时钟上每绘制一帧请求一帧，并在结束时停止，若最后一步改变了状态则恰好再多一帧；按住的按键在其按键抬起之前若键盘焦点移开或窗口失活则结束；减弱动效移除脉冲及其帧；显示中的倒计时无需输入即每秒重绘一次，并在没有倒计时行显示时停止；有限探针每次绘制排入一帧。同一套件也在 [gpui-fast 证据线](#gpui-fast-证据线)中针对 gpui-fast 运行。浏览器交互由 Playwright spec 覆盖，这些 spec 针对已发布的包构建，驱动真实的 `page.mouse`/`page.keyboard` 输入和 CDP 触摸（`gesture-cancellation`、`interaction-gates`、`touch-input` 以及各功能专属的 spec）。
 
 ## 标准门禁
 
@@ -89,11 +90,24 @@ Linux 门禁（`examples/pixel_parity.rs` 中的 `GATES` 与 `ALIGNED`，其文�
 
 这些填充边缘门禁（gradients、`opaque_aa`、`tessellated`）在覆盖毛边从上游合并之后重新做了测量：该毛边是为 1x 路径 pass 构建的，而 lavapipe 会解析 4x MSAA，边界像素会同时受到两者的作用，因此填充边缘比参考重约半个像素，三个限值比之前宽松数倍，对齐余量也更小（具体数值见 `GATES` 与 `ALIGNED` 的文档注释）。因此，带 MSAA 的 surface 绘制出的填充边缘会比原生参考重出该幅度。测试框架会在每个夹具的图元之下绘制该夹具声明的背景，因为从上游加入的夹具没有绘制背景，而 Linux X11 窗口会把未绘制的像素捕获为透明黑色。text 夹具会被报告，但其残差不设上限，因为 GPUI 与原生参考绘制的是不同的字体（fontconfig 与 `fontdb` 对“sans-serif”的解析结果不同），所以它度量的是宿主的字体。
 
-一次通过证明：Prim 流的坐标、颜色、绘制顺序与混合运算原样到达了真实的 GPUI 窗口，并且抗锯齿边缘保持在已测得的范围之内。它不证明裁剪：测试框架通过 `GpuiChartRenderer::paint_prims` 绘制每个夹具，这是一个没有帧、也没有裁剪的裸 Prim 层，因此只有下文帧级的窗格矩阵（`gpui_pane_capture`，它通过 `paint_frame` 绘制）才会比较裁剪。它同样不证明硬件行为：lavapipe 的光栅化规则、它对 GPUI 路径 pass MSAA 的解析（取 surface 格式所支持的 4、2 或 1 个采样中的最大值）、gamma、GPUI 在此技术栈上绘制的 LCD 子像素文本，以及字形光栅化，都可能与 DWM/WARP 及真实 GPU 不同。CI 在 `ubuntu-latest` 上以非阻塞的 `gpui-pixel-parity` 作业运行该测试框架，并上传 `results.json` 与 PNG 文件。该作业的非阻塞性来自作业与测试框架步骤上的 `continue-on-error`，并且该步骤设有 10 分钟超时，因此门禁失败、挂起、作业超时或 apt 偶发失败都不会让 `ci.yml` 的运行变红（标签发布工作流要求发布提交对应的 `ci.yml` 运行为绿色）。当同一提交上连续五次 runner 运行都通过每一道门禁、且 `gpui_adapter` 与 `*_rgba_sha256` 的值保持一致，并且 runner 的 Mesa 构建要么与校准构建一致、要么限值已根据 runner 自身的测量重新推导且 Mesa 版本已被固定或其漂移受到监控时，它才会成为必需检查。升级为必需检查后，会移除两处 `continue-on-error` 标志，并把该作业加入标签发布的要求。
+一次通过证明：Prim 流的坐标、颜色、绘制顺序与混合运算原样到达了真实的 GPUI 窗口，并且抗锯齿边缘保持在已测得的范围之内。它不证明裁剪：测试框架通过 `GpuiChartRenderer::paint_prims` 绘制每个夹具，这是一个没有帧、也没有裁剪的裸 Prim 层，因此只有下文帧级的窗格矩阵（`gpui_pane_capture`，它通过 `paint_frame` 绘制）才会比较裁剪。它同样不证明硬件行为：lavapipe 的光栅化规则、它对 GPUI 路径 pass MSAA 的解析（取 surface 格式所支持的 4、2 或 1 个采样中的最大值）、gamma、GPUI 在此技术栈上绘制的 LCD 子像素文本，以及字形光栅化，都可能与 DWM/WARP 及真实 GPU 不同。CI 在 `ubuntu-latest` 上以非阻塞的 `gpui-pixel-parity` 作业运行该测试框架，并上传 `results.json` 与 PNG 文件。该作业的非阻塞性来自作业与测试框架步骤上的 `continue-on-error`，并且该步骤设有 10 分钟超时，因此门禁失败、挂起、作业超时或 apt 偶发失败都不会让 `ci.yml` 的运行变红（标签发布工作流要求发布提交对应的 `ci.yml` 运行为绿色）。当同一提交上连续五次 runner 运行都通过每一道门禁、且 `gpui_adapter` 与 `*_rgba_sha256` 的值保持一致，并且 runner 的 Mesa 构建要么与校准构建一致、要么限值已根据 runner 自身的测量重新推导且 Mesa 版本已被固定或其漂移受到监控时，它才会成为必需检查。升级为必需检查时移除两处 `continue-on-error` 标志即可；其他无需改变，因为标签发布工作流要求整个 `ci.yml` 运行成功。
 
 GPUI 与 WebGPU 对比矩阵（`examples/web_demo/tests/gpui-webgpu-matrix.spec.mjs`，通过 `AERIS_CHARTS_RUN_GPUI_WEBGPU_MATRIX=1` 选择启用，通常经由 `bun run test:gpui-webgpu` 运行）在 Linux 上也会运行其四个浅色基础用例，以有头模式在 `xvfb-run -a -s "-screen 0 2560x1600x24"` 下运行，并使用与上文相同的 `VK_ICD_FILENAMES`：`gpui_pane_capture` 读取 GPUI 的 X11 窗口（该 spec 会把 `GPUI_X11_SCALE_FACTOR` 设为夹具的像素比 1.5，且虚拟屏幕必须大于 1851x1047 的窗格），Playwright 则对已呈现的 WebGPU 帧截图。测量使用 Chromium 141.0.7390.37（并非固定版本的构建）及其 SwiftShader WebGPU 适配器，对照 lavapipe，并以 dev profile 的 `gpui_pane_capture` 代替该 spec 中的 `cargo run --release`；连续三次运行对全部四个用例都给出了逐字节一致的输出（0 个像素不同），且两侧的哈希都保持稳定。
 
 已批准的 WebGPU 哈希是 Windows 哈希，七个哈希在 Linux 上均未匹配，因此 Linux 在报告中记录其 WebGPU 哈希，仅在 Windows 上对其做断言。在演示的深色夹具（#131722）与规范的深色表面（#1f1f1f）对齐之前，dark 用例无法做到精确一致；marker 与 trading 用例（分别有 1,653 与 5,227 个像素不同，最大通道差值 247）受取决于宿主字体的 Windows 限值约束，因此 Linux 不运行它们。CI 的浏览器作业仍在 Windows 上运行；Linux 矩阵是本地证据。
+
+### gpui-fast 证据线
+
+`gpui-fast` CI 作业是证据，而不是门禁：它在 Linux、macOS 与 Windows 上针对 gpui-fast（`longbridge/gpui-fast`，一个保留每个它未察觉变化的视图的 GPUI）构建并测试 GPUI 后端，而库仍依赖 `gpui-pre =0.3.7`，因此宿主不受影响。修订固定在一个文件 `.cargo/gpui-fast.toml` 中；它是 Cargo 从不自行加载的 Cargo 配置片段，用 gpui-fast 的即插即用兼容 crate 修补 `gpui-pre` 与 `gpui-pre-platform`（依赖图中不再保留其他 `gpui-pre` crate）。升级时替换该文件中唯一的修订哈希，它出现在两条修补行上；两者不一致时作业会报错并指明该文件，因为两个修订会解析出两份 GPUI。gpui-fast 固定了一些版本与已提交锁文件不同的 crate（`unicode-properties =0.1.3`，锁文件为 0.1.4），因此作业先在修补下更新锁文件，再不带 `--locked` 构建。本地命令：
+
+```text
+cargo update --config .cargo/gpui-fast.toml -p gpui-pre -p gpui-pre-platform
+cargo clippy --config .cargo/gpui-fast.toml -p aeris_charts_render_gpui --features gpui-backend --all-targets -- -D warnings   # Linux
+cargo test --config .cargo/gpui-fast.toml -p aeris_charts_render_gpui --features gpui-backend --all-targets
+cargo run --config .cargo/gpui-fast.toml -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity            # Windows，以及 xvfb + lavapipe 下的 Linux
+```
+
+CI 运行同样的命令但不带 `--config`：它把该片段追加到 Cargo 的 home 配置中，因此作业中的每次 cargo 调用都能看到修补，包括缓存的保存步骤——否则其 `cargo metadata` 会剪除 gpui-fast 的 git 检出与构建产物。缓存键包含固定文件的哈希，因此升级会开始新的缓存，并且证据失败时缓存也会保存。Windows 与 Linux 测试框架运行使用 `native-gpui` 与 `gpui-pixel-parity` 作业的门禁。作业上的 `continue-on-error` 使 gpui-fast 的回归、新的第三方发布或 runner 偶发失败不会让 `ci.yml` 变红，因为标签发布工作流要求整个 `ci.yml` 运行成功；失败的步骤仍会把该作业标记为失败，并且每个步骤都有自己的超时，因此挂起只会让该步骤失败，而不会拖到作业超时。就标签发布工作流而言，移除该标志就是全部的升级步骤，但该证据线目前还不可复现：它的更新每次运行都会把 gpui-fast 的传递依赖解析到最新的兼容发布版本，因此可复现的门禁还需要一份已提交的证据线锁文件，用它代替更新覆盖 `Cargo.lock`，再以 `--locked` 构建。在本地运行上述命令之后要恢复已提交的锁文件（`git checkout -- Cargo.lock`）；`GPUI_VIEW_RETENTION=0` 会关闭 gpui-fast 的保留机制，用以区分缺失的 `refresh` 与保留机制的缺陷。
 
 ## 发布与诊断的边界
 
