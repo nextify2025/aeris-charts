@@ -1228,7 +1228,9 @@ pub struct Drawing {
     pub position_risk_percent: f64,
     /// Optional explicit source for regression trend; `None` follows the pane's primary series.
     pub regression_source_id: Option<u32>,
-    /// Number of residual standard deviations on each side of the regression center.
+    /// Number of population residual standard deviations on each side of the regression center,
+    /// except a side that `tool_options.channel.upper_deviation` / `lower_deviation` overrides; an
+    /// override survives a change to this value.
     pub regression_deviations: f64,
     /// Line/border color CSS string (default [`DRAWING_DEFAULT_COLOR`]).
     pub color: String,
@@ -4221,12 +4223,15 @@ impl ChartEngine {
         (!bars.is_empty()).then_some(bars)
     }
 
-    /// Least-squares center and residual-deviation boundaries over the source's closes between
-    /// the two anchors (the memoized `kinds::channels::regression_stats` fit, which follows the
-    /// replay clock and as-of sources and extends incrementally on live bars). The band is
-    /// `regression_deviations` population residual deviations on each side; the two defining
-    /// anchors select the window and remain editable independently of computed prices. `None`
-    /// (no fit) with fewer than two finite closes on distinct bars in the window.
+    /// Least-squares center and residual-deviation boundaries over the source's values between
+    /// the two anchors (the memoized `kinds::channels::regression_stats` fit of the band's
+    /// `source`, default close, which follows the replay clock and as-of sources and extends
+    /// incrementally on live bars): the centre's ends, then the upper and the lower line's, each
+    /// at its anchor's bar. Each side lies its signed offset in population residual deviations
+    /// from the centre (`regression_deviations` on each side unless a per-side override sets
+    /// it, [`kinds::channels::regression_band`]); a side that is switched off lies on the centre.
+    /// The two defining anchors select the window; their prices only shape the placeholder. `None`
+    /// (no fit) with fewer than two finite values on distinct bars in the window.
     pub(crate) fn regression_points(&self, drawing: &Drawing) -> Option<[DrawingPoint; 6]> {
         if drawing.kind != DrawingKind::RegressionTrend {
             return None;
@@ -4234,15 +4239,17 @@ impl ChartEngine {
         let [start, end] = drawing.points.as_slice() else {
             return None;
         };
-        let stats = kinds::channels::regression_stats(self, drawing, IndicatorInputSource::Close)?;
+        let band = kinds::channels::regression_band(drawing);
+        let stats = kinds::channels::regression_stats(self, drawing, band.source)?;
         // Upstream's rule: no fit without two finite values on distinct bars.
         if stats.count < 2 || stats.spread <= 0.0 {
             return None;
         }
         let count = stats.count as f64;
         // The fit's sample deviation, rescaled to the population form.
-        let deviation =
-            drawing.regression_deviations * stats.deviation * ((count - 1.0) / count).sqrt();
+        let rescale = ((count - 1.0) / count).sqrt();
+        let offset = |side: Option<f64>| side.unwrap_or(0.0) * stats.deviation * rescale;
+        let (upper, lower) = (offset(band.upper), offset(band.lower));
         let make = |logical: f64, offset: f64| DrawingPoint {
             logical,
             price: stats.price_at(logical) + offset,
@@ -4250,10 +4257,10 @@ impl ChartEngine {
         Some([
             make(start.logical, 0.0),
             make(end.logical, 0.0),
-            make(start.logical, deviation),
-            make(end.logical, deviation),
-            make(start.logical, -deviation),
-            make(end.logical, -deviation),
+            make(start.logical, upper),
+            make(end.logical, upper),
+            make(start.logical, lower),
+            make(end.logical, lower),
         ])
     }
 
@@ -6725,6 +6732,20 @@ impl ChartEngine {
         })
     }
 
+    /// Whether media px `point` lies in the band fill between the paired chains `upper` and
+    /// `lower` (the region `Prim::BandFill` paints, two lobes where the chains cross) of
+    /// `drawing`, which is a drag surface only while the drawing is selected (the rectangle's
+    /// convention), so an unselected tool never swallows chart drags inside its shading.
+    fn band_fill_hit(
+        &self,
+        drawing: &Drawing,
+        upper: &[(f64, f64)],
+        lower: &[(f64, f64)],
+        point: (f64, f64),
+    ) -> bool {
+        self.selected_drawing == Some(drawing.id) && shape::point_in_ribbon(point, upper, lower)
+    }
+
     /// The per-kind body test at media px `(x, y)` against the converted anchors `px`.
     fn drawing_body_hit(
         &self,
@@ -6876,22 +6897,50 @@ impl ChartEngine {
                     || line_parts_hit(None)
             }
             DrawingBodyGeometry::Channel { first, second } => {
-                (drawing.fill_enabled
-                    && self.selected_drawing == Some(drawing.id)
-                    && point_in_polygon((x, y), &[first[0], first[1], second[1], second[0]]))
-                    || distance_to_segment(x, y, first[0].0, first[0].1, first[1].0, first[1].1)
-                        <= tolerance
-                    || distance_to_segment(x, y, second[0].0, second[0].1, second[1].0, second[1].1)
-                        <= tolerance
+                // The fill and the middle line pair the lines' ends by side, as the frame does.
+                let paired = kinds::channels::paired_second(first, second);
+                let near = |[a, b]: [(f64, f64); 2], tolerance: f64| {
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                };
+                let fill_hit = || match kinds::channels::channel_fill_ribbon(first, paired) {
+                    Some(ribbon) => {
+                        let (upper, lower) = ribbon.split_at(ribbon.len() / 2);
+                        self.band_fill_hit(drawing, upper, lower, (x, y))
+                    }
+                    None => self.band_fill_hit(drawing, &first, &paired, (x, y)),
+                };
+                (drawing.fill_enabled && fill_hit())
+                    || near(first, tolerance)
+                    || near(second, tolerance)
+                    || kinds::channels::channel_middle(drawing, first, paired).is_some_and(
+                        |(middle, _)| {
+                            near(middle, kinds::channels::MIDDLE_WIDTH / 2.0 + hit_tolerance)
+                        },
+                    )
             }
             DrawingBodyGeometry::Regression {
                 center,
                 upper,
                 lower,
-            } => [center, upper, lower].into_iter().any(|segment| {
-                distance_to_segment(x, y, segment[0].0, segment[0].1, segment[1].0, segment[1].1)
-                    <= tolerance
-            }),
+            } => {
+                let band = kinds::channels::regression_band(drawing);
+                let near = |[a, b]: [(f64, f64); 2], tolerance: f64| {
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                };
+                // A dashed centre line is as thin as a channel's middle line.
+                let center_tolerance = if kinds::channels::middle_line(drawing).is_some() {
+                    kinds::channels::MIDDLE_WIDTH / 2.0 + hit_tolerance
+                } else {
+                    tolerance
+                };
+                (drawing.fill_enabled
+                    && kinds::channels::regression_zone(band, center, upper, lower).is_some_and(
+                        |(first, second)| self.band_fill_hit(drawing, &first, &second, (x, y)),
+                    ))
+                    || near(center, center_tolerance)
+                    || (band.upper.is_some() && near(upper, tolerance))
+                    || (band.lower.is_some() && near(lower, tolerance))
+            }
             DrawingBodyGeometry::RegressionWindow { a, b } => {
                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
             }

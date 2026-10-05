@@ -3047,33 +3047,36 @@ export interface line_tool_options {
 }
 /**
  * Channel options (`tool_options.channel`). Absent fields take the tool's own default and `null`
- * resets one field. The own-line `price_channel` reads `middle_line` and `middle_color`. For
- * `regression_trend`, which the shared catalog renders from the flat `regression_deviations` and
- * `regression_source_id`, the deviation fields and their switches are per-side overrides of
- * `regression_deviations` (an absent side follows it; patching one never changes the flat
- * value); they and the other regression fields are stored but not rendered yet. The shared
- * catalog's other channels store the block without rendering it. Every default is the shared
+ * resets one field. Every channel reads `middle_line` and `middle_color`: the own-line
+ * `price_channel`, the shared catalog's `parallel_channel`, `flat_top_channel`,
+ * `flat_bottom_channel` and `disjoint_channel` (a 1 px dashed line joining the midpoints of the two
+ * lines' ends, paired by side: halfway between the lines wherever their ends share bars), and
+ * `regression_trend` (its centre line drawn 1 px dashed in `middle_color` instead of solid).
+ * `regression_trend` also reads the rest: the deviation fields and their switches are per-side
+ * overrides of the flat `regression_deviations` (an absent side follows it; patching one never
+ * changes the flat value, and changing the flat value keeps an overridden side), `source` picks the
+ * bar value it fits, and `show_pearsons` labels its correlation. Every default is the shared
  * catalog's look; documents an earlier fork build wrote restore its parallel channels with
  * `middle_line: true` and its regression trends with `middle_line` and `show_pearsons` on, and
  * keep their asymmetric or one-sided deviations (their `regression_deviations` takes the wider
- * enabled side).
+ * enabled side, for readers of the flat field).
  */
 export interface channel_tool_options {
-  /** Dashed middle line (`price_channel`; default off). Stored but not rendered for the shared catalog's channels. */
+  /** Dashed middle line (every channel; on `regression_trend`, its dashed centre line). Default off. */
   middle_line?: boolean | null;
   /** Middle-line CSS color; `""` follows the stroke color (default). */
   middle_color?: string | null;
-  /** Upper line offset in residual standard deviations (`regression_trend`); absent follows `regression_deviations`. Stored but not rendered. */
+  /** Upper line offset in population residual standard deviations (`regression_trend`, signed, -100 to 100); absent follows `regression_deviations`. */
   upper_deviation?: number | null;
-  /** Lower line offset in residual standard deviations (`regression_trend`, negative below the fit); absent follows `-regression_deviations`. Stored but not rendered. */
+  /** Lower line offset in population residual standard deviations (`regression_trend`, signed, negative below the fit); absent follows `-regression_deviations`. When both sides lie on one side of the fit, the zone runs from the fit to the farther one. */
   lower_deviation?: number | null;
-  /** Paint the upper deviation line and its zone. Stored but not rendered. */
+  /** Paint the upper deviation line and its zone (`regression_trend`; default true). */
   use_upper_deviation?: boolean | null;
-  /** Paint the lower deviation line and its zone. Stored but not rendered. */
+  /** Paint the lower deviation line and its zone (`regression_trend`; default true). */
   use_lower_deviation?: boolean | null;
-  /** Bar value the regression fits. Stored but not rendered (the regression fits closes). */
+  /** Bar value the regression fits (`regression_trend`; default `"close"`). */
   source?: indicator_input_source | null;
-  /** Paint Pearson's R below the regression's start (default off). Stored but not rendered. */
+  /** Paint Pearson's R below the regression's start (`regression_trend`; default off). Not a hit target. */
   show_pearsons?: boolean | null;
 }
 /**
@@ -3259,7 +3262,10 @@ export interface drawing_options {
    * pane's first ordinary series (custom series and indicator outputs excluded).
    */
   regression_source_id: number | null;
-  /** Residual standard deviations on each side of the Regression Trend center, from 0 to 10. */
+  /**
+   * Residual standard deviations on each side of the Regression Trend center, from 0 to 10; a side
+   * that `tool_options.channel.upper_deviation` / `lower_deviation` overrides keeps its override.
+   */
   regression_deviations: number;
   name: string;
   group_id: string;

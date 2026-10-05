@@ -18,8 +18,8 @@ use std::fmt::Write;
 
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
-use crate::drawings::kinds::lines;
 use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
+use crate::drawings::kinds::{channels, lines};
 use crate::drawings::{
     arrow_cap_triangle, cap_radius, curve_clip, ellipse_outline, level_band_pairs,
     resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
@@ -812,6 +812,17 @@ impl ChartEngine {
                 bottom: (pane.top + pane.height) * vpr,
             },
         );
+        // A channel's 1 CSS px dashed middle line, in its `middle_color` or the stroke color.
+        let channel_middle_stroke = |middle_color: Option<Color>| {
+            (
+                (
+                    (channels::MIDDLE_WIDTH * vpr) as f32,
+                    LineStyle::Dashed,
+                    middle_color.unwrap_or(color),
+                ),
+                stroke.1,
+            )
+        };
         let Some(geometry) = resolve_drawing_geometry(
             drawing.kind,
             px,
@@ -902,42 +913,44 @@ impl ChartEngine {
                 }
             }
             DrawingBodyGeometry::Channel { first, second } => {
+                // The fill and the middle line pair the lines' ends by side, so a disjoint whose
+                // second line runs opposite to its first fills its whole quad, and lines that
+                // cross fill two lobes meeting at the crossing on every executor; a concave
+                // disjoint quad fills through its exact ribbon instead.
+                let paired = channels::paired_second(first, second);
                 if drawing.fill_enabled {
                     let fill = drawing
                         .fill_color
                         .as_deref()
                         .and_then(Color::parse_css)
                         .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51));
-                    if drawing.kind == DrawingKind::DisjointChannel {
-                        let a = [first[0].0 as f32, first[0].1 as f32];
-                        let b = [first[1].0 as f32, first[1].1 as f32];
-                        let c = [second[1].0 as f32, second[1].1 as f32];
-                        let d = [second[0].0 as f32, second[0].1 as f32];
-                        out.push(Prim::Triangle {
-                            a,
-                            b,
-                            c,
-                            color: fill,
-                        });
-                        out.push(Prim::Triangle {
-                            a,
-                            b: c,
-                            c: d,
-                            color: fill,
-                        });
-                    } else {
-                        let upper_first = points.len() as u32;
-                        points.extend(first.map(|(x, y)| [x as f32, y as f32]));
-                        let lower_first = points.len() as u32;
-                        points.extend(second.map(|(x, y)| [x as f32, y as f32]));
+                    let upper_first = points.len() as u32;
+                    let point_count = match channels::channel_fill_ribbon(first, paired) {
+                        Some(ribbon) => {
+                            points.extend(ribbon.iter().map(|&(x, y)| [x as f32, y as f32]));
+                            (ribbon.len() / 2) as u32
+                        }
+                        None => {
+                            points.extend(first.map(|(x, y)| [x as f32, y as f32]));
+                            points.extend(paired.map(|(x, y)| [x as f32, y as f32]));
+                            2
+                        }
+                    };
+                    if point_count >= 2 {
                         out.push(Prim::BandFill {
                             upper_first,
-                            lower_first,
-                            point_count: 2,
+                            lower_first: upper_first + point_count,
+                            point_count,
                             line_type: LineType::Simple,
                             fill,
                         });
                     }
+                }
+                if let Some((middle, middle_color)) =
+                    channels::channel_middle(drawing, first, paired)
+                {
+                    let middle_stroke = channel_middle_stroke(middle_color);
+                    push_segment(middle[0], middle[1], middle_stroke, out, points);
                 }
                 push_segment(first[0], first[1], stroke, out, points);
                 push_segment(second[0], second[1], stroke, out, points);
@@ -947,16 +960,19 @@ impl ChartEngine {
                 upper,
                 lower,
             } => {
-                if drawing.fill_enabled {
+                let band = channels::regression_band(drawing);
+                if let Some((first, second)) = channels::regression_zone(band, center, upper, lower)
+                    .filter(|_| drawing.fill_enabled)
+                {
                     let fill = drawing
                         .fill_color
                         .as_deref()
                         .and_then(Color::parse_css)
                         .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 35));
                     let upper_first = points.len() as u32;
-                    points.extend(upper.map(|(x, y)| [x as f32, y as f32]));
+                    points.extend(first.map(|(x, y)| [x as f32, y as f32]));
                     let lower_first = points.len() as u32;
-                    points.extend(lower.map(|(x, y)| [x as f32, y as f32]));
+                    points.extend(second.map(|(x, y)| [x as f32, y as f32]));
                     out.push(Prim::BandFill {
                         upper_first,
                         lower_first,
@@ -965,8 +981,23 @@ impl ChartEngine {
                         fill,
                     });
                 }
-                for segment in [lower, upper, center] {
-                    push_segment(segment[0], segment[1], stroke, out, points);
+                // A side that is switched off has no line.
+                for (enabled, segment) in [(band.lower, lower), (band.upper, upper)] {
+                    if enabled.is_some() {
+                        push_segment(segment[0], segment[1], stroke, out, points);
+                    }
+                }
+                // `middle_line` draws the centre as the thin dashed middle line.
+                let center_stroke =
+                    channels::middle_line(drawing).map_or(stroke, channel_middle_stroke);
+                push_segment(center[0], center[1], center_stroke, out, points);
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| band.show_pearsons)
+                {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        channels::regression_parts(c, parts);
+                    });
                 }
             }
             DrawingBodyGeometry::RegressionWindow { a, b } => {

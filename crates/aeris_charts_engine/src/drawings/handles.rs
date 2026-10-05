@@ -1,10 +1,10 @@
 //! The one editable-handle set of a drawing. Selected-handle painting, handle hit testing, and
 //! keyboard handle cycling all iterate this set, so a handle can never be painted without being
 //! draggable, or reachable by keyboard without being painted. A family's `handles` hook edits
-//! the set (derived handles); pointer drags, keyboard nudges, and magnet snapping share the
-//! engine's one drag path.
+//! the set (derived handles), as `kinds::upstream_derived_handles` does for upstream-rendered
+//! kinds; pointer drags, keyboard nudges, and magnet snapping share the engine's one drag path.
 
-use super::{ChartEngine, Drawing, DrawingDragPart, DrawingHandleMode};
+use super::{kinds, ChartEngine, Drawing, DrawingDragPart, DrawingHandleMode};
 
 /// Painted form of a handle (sizes are the frame's shared anchor radius and border).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,16 +83,18 @@ pub(crate) fn handle_set(mode: DrawingHandleMode, px: &[(f64, f64)]) -> Vec<Draw
 
 impl ChartEngine {
     /// The editable handles of `drawing` whose anchors sit at media px `px`: the spec's handle
-    /// mode, edited by the family's `handles` hook (derived handles). Callers scale the points
-    /// for painting; every mode's handle placement is affine in the anchors.
+    /// mode, edited by the family's `handles` hook or, for an upstream-rendered kind,
+    /// [`kinds::upstream_derived_handles`] (derived handles, such as a regression trend's on its
+    /// fitted line). Every caller passes media px and scales the points afterwards for painting.
     pub(crate) fn drawing_handle_set(
         &self,
         drawing: &Drawing,
         px: &[(f64, f64)],
     ) -> Vec<DrawingHandle> {
         let mut handles = handle_set(drawing.kind.spec().handles, px);
-        if let Some(family) = drawing.kind.spec().family {
-            (family.handles)(self, drawing, px, &mut handles);
+        match drawing.kind.spec().family {
+            Some(family) => (family.handles)(self, drawing, px, &mut handles),
+            None => kinds::upstream_derived_handles(self, drawing, px, &mut handles),
         }
         handles
     }

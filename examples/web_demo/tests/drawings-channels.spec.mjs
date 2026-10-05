@@ -6,8 +6,9 @@ import { PNG } from "pngjs";
 // B8 Channels family (parallel channel, regression trend, flat top and flat bottom channels,
 // disjoint channel, price channel) through the public API and real pointer input: armed placement
 // (three clicks, two for the regression, four for the disjoint channel), the parallel line through
-// the third anchor as a hover and drag target, the selection-only fill surface, the engine's
-// regression fit and its flat options, persistence, clipboard and sync round trips, the demo
+// the third anchor as a hover and drag target, the selection-only fill surface, the stored middle
+// line, the disjoint's band fill, the engine's regression fit with its flat and per-side options,
+// time-only moves and handles on the fit, persistence, clipboard and sync round trips, the demo
 // toolbar entries, and WebGPU == Canvas2D parity. Every geometry and statistics decision is
 // engine-owned; these specs only drive the package API and pointer.
 
@@ -325,13 +326,30 @@ test("a regression trend paints its fit with flat, atomic options", async ({ pag
   }, info.id);
   expect(legacy.deviations).toBe(0.5);
   expect(legacy.tool_options).toEqual({ channel: { upper_deviation: 1.5, lower_deviation: -1 } });
+  // Each side paints at its own offset: wider than the 0.5 band, narrower than the 2 band.
+  await settle_frames(page);
+  const sided = color_extent(await capture(page), PINK);
+  expect(sided.max_y - sided.min_y).toBeGreaterThan(narrow.max_y - narrow.min_y);
+  expect(sided.max_y - sided.min_y).toBeLessThan(wide.max_y - wide.min_y);
 
   const schema = await page.evaluate((id) => window.__chart.drawing_property_schema(
     window.__chart.drawings().find((drawing) => drawing.id === id),
   ), info.id);
   const deviations = schema.properties.find((property) => property.name === "regression_deviations");
   expect(deviations.default).toBe(2);
-  expect(schema.properties.some((property) => property.name.startsWith("tool_options.channel."))).toBe(false);
+  const channel = Object.fromEntries(schema.properties
+    .filter((property) => property.name.startsWith("tool_options.channel."))
+    .map((property) => [property.name.slice("tool_options.channel.".length), property.default]));
+  expect(channel).toEqual({
+    middle_line: false,
+    middle_color: "",
+    upper_deviation: null,
+    lower_deviation: null,
+    use_upper_deviation: true,
+    use_lower_deviation: true,
+    source: "close",
+    show_pearsons: false,
+  });
 
   // An invalid value is rejected atomically.
   const rejected = await page.evaluate((id) => {
@@ -347,18 +365,21 @@ test("a regression trend paints its fit with flat, atomic options", async ({ pag
   expect(rejected.width).toBe(1);
 });
 
-test("a regression trend drags as one body, edits its window by its anchors, and follows a streaming update", async ({ page }) => {
+test("a regression trend drags along time, edits its window by handles on its fit, and follows a streaming update", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const last = await page.evaluate(() => {
     const data = window.__main.data();
     return { index: data.length - 1, bar: data[data.length - 1] };
   });
-  // Zero deviations and no fill: the fitted center line is the only pink.
-  const id = await page.evaluate(({ s, last }) => window.__chart.add_drawing("regression_trend", [
-    { logical: s.l0, price: s.p_mid },
+  // Zero deviations and no fill: the fitted center line is the only pink. The start's click
+  // sits at the pane's top, well away from the fit (the prices only pick bars), so the handle
+  // checks below tell a handle on the fit from one on the click.
+  const far = await page.evaluate(() => window.__main.coordinate_to_price(10));
+  const id = await page.evaluate(({ s, last, far }) => window.__chart.add_drawing("regression_trend", [
+    { logical: s.l0, price: far },
     { logical: last.index, price: s.p_mid },
-  ], { color: "#e91e63", regression_deviations: 0, fill_enabled: false }).id, { s, last });
+  ], { color: "#e91e63", regression_deviations: 0, fill_enabled: false }).id, { s, last, far });
   await settle_frames(page);
   const before = await points_of(page, id);
   const png = await capture(page);
@@ -377,7 +398,8 @@ test("a regression trend drags as one body, edits its window by its anchors, and
     const scale = window.__chart.time_scale();
     return scale.logical_to_coordinate(1) - scale.logical_to_coordinate(0);
   });
-  // A body drag moves both anchors on both axes (upstream's free anchors), as one undo step.
+  // A body drag moves both anchors along time only (the prices come from the data), as one
+  // undo step.
   await page.mouse.down();
   await page.mouse.move(grab.x - bar * 2, grab.y - 40, { steps: 4 });
   await page.mouse.move(grab.x - bar * 4, grab.y - 80, { steps: 4 });
@@ -386,19 +408,24 @@ test("a regression trend drags as one body, edits its window by its anchors, and
   const moved = await points_of(page, id);
   for (const [index, point] of moved.entries()) {
     expect(point.logical).toBeLessThan(before[index].logical);
-    expect(point.price).toBeGreaterThan(before[index].price);
+    expect(point.price).toBe(before[index].price);
   }
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points_of(page, id)).toEqual(before);
   await settle_frames(page);
 
-  // Selected, its handles sit on its anchors; dragging the start handle shortens the window.
-  const start = await spot(page, s.l0, s.p_mid);
+  // Selected, its handles sit on the fitted line's ends, not at its clicks; dragging the start
+  // handle shortens the window.
+  const click = await spot(page, s.l0, far);
+  const start = { x: click.x, y: pink_line_y(png, click.x) };
+  expect(Math.abs(click.y - start.y)).toBeGreaterThan(12);
   await page.evaluate((id) => {
     window.__chart.wasm.set_selected_drawing(id);
     window.__chart.render();
   }, id);
   await settle_frames(page);
+  await page.mouse.move(click.x, click.y);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("pointer");
   await page.mouse.move(start.x, start.y);
   await expect.poll(() => overlay_cursor(page)).toBe("pointer");
   // Horizontal only, so the price stays; at least 12 px, so the press crosses the 5 px click slop
@@ -430,6 +457,59 @@ test("a regression trend drags as one body, edits its window by its anchors, and
   await settle_frames(page);
   const refit = color_extent(await capture(page), PINK);
   expect(refit).not.toEqual(fitted);
+});
+
+test("upstream channels paint their stored middle line, and a disjoint fills between its lines", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  const id = await page.evaluate(({ s }) => window.__chart.add_drawing("parallel_channel", [
+    { logical: s.l0, price: s.p_lo },
+    { logical: s.l1, price: s.p_mid },
+    { logical: s.lm, price: s.p_hi },
+  ], { color: "#2962ff", fill_enabled: false }).id, { s });
+  await settle_frames(page);
+  expect(color_extent(await capture(page), PINK)).toBeNull();
+  await page.evaluate((id) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id)
+      .apply_options({ tool_options: { channel: { middle_line: true, middle_color: "#e91e63" } } });
+  }, id);
+  await settle_frames(page);
+  // The dashed middle line runs halfway between the base line and its parallel.
+  const a = await spot(page, s.l0, s.p_lo);
+  const b = await spot(page, s.l1, s.p_mid);
+  const c = await spot(page, s.lm, s.p_hi);
+  const slope = (b.y - a.y) / (b.x - a.x);
+  const offset = c.y - (a.y + slope * (c.x - a.x));
+  const x = a.x + (b.x - a.x) * 0.4;
+  expect(Math.abs(pink_line_y(await capture(page), x) - (a.y + slope * (x - a.x) + offset / 2))).toBeLessThan(2);
+  await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).remove(), id);
+
+  // A disjoint channel whose second line runs backward fills its whole quad, the right-hand
+  // wedge included.
+  await page.evaluate(({ s }) => window.__chart.add_drawing("disjoint_channel", [
+    { logical: s.l0, price: s.p_lo },
+    { logical: s.l1, price: s.p_lo },
+    { logical: s.l1, price: s.p_hi },
+    { logical: s.l0, price: s.p_hi },
+  ], { color: "#2962ff", fill_color: "#e91e63" }), { s });
+  await settle_frames(page);
+  const low = await spot(page, s.l1, s.p_lo);
+  const high = await spot(page, s.l1, s.p_hi);
+  const png = await capture(page);
+  // Candles paint over drawings here, so each quarter is probed as a window that must be
+  // mostly fill (the former two triangles left the right-hand wedge without any).
+  for (const [fx, fy] of [[0.1, 0.5], [0.9, 0.5], [0.5, 0.1], [0.5, 0.9]]) {
+    const cx = Math.round((a.x + (low.x - a.x) * fx) * PR);
+    const cy = Math.round((high.y + (low.y - high.y) * fy) * PR);
+    let filled = 0;
+    for (let y = cy - 5; y <= cy + 5; y += 1) {
+      for (let x = cx - 5; x <= cx + 5; x += 1) {
+        const o = (y * png.width + x) * 4;
+        if (PINK.every((channel, index) => Math.abs(png.data[o + index] - channel) <= 12)) filled += 1;
+      }
+    }
+    expect(filled, `${fx},${fy}`).toBeGreaterThan(60);
+  }
 });
 
 test("Channels round-trip through persistence, clipboard, and sync with their options", async ({ page }) => {

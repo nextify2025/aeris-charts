@@ -5657,13 +5657,17 @@ fn channel_catalog_renders_shared_band_and_keeps_editable_anchors() {
         assert!(chart.drawing(id).unwrap().fill_enabled);
         assert_eq!(chart.drawing(id).unwrap().points.len(), count);
         let frame = chart.build_frame();
-        assert!(frame.panes[0].main.iter().any(|prim| {
-            if kind == DrawingKind::DisjointChannel {
-                matches!(prim, Prim::Triangle { .. })
-            } else {
-                matches!(prim, Prim::BandFill { point_count: 2, .. })
-            }
-        }));
+        // Every channel, the disjoint one included, fills with one band between its lines
+        // (owner decision C3: the disjoint's two triangles left a quarter of a reversed channel
+        // unpainted).
+        assert!(frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::BandFill { point_count: 2, .. })));
+        assert!(!frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Triangle { .. })));
         assert!(chart.remove_drawing(id));
     }
 }

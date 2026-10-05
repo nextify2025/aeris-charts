@@ -2,13 +2,13 @@
 //! upstream's catalog (wire ids `0..=12` and `16..=84`) carries no family and is rendered by the
 //! upstream implementation (`geometry.rs` body resolver, frame arm, hit code), over which a stored
 //! option may layer shared parts (the frame's `push_parts` and the hit tester's `parts_hit`, which
-//! a family's parts share, with [`upstream_decoration_extent`] and [`extend_upstream_schema`]
-//! dispatching per family); the own-line tools (`240..=246`) and the three measuring ranges
-//! (`13..=15`) carry a family whose module owns their tool specs, kind defaults, geometry (resolved
-//! into shared [`DrawingParts`]), typed options, schema additions, and tests. The engine reaches a
-//! family only through the [`DrawingFamily`] hook table its specs reference: a closed, compile-time
-//! table rather than a plugin registry, so adding a family never edits the frame lowering, the hit
-//! tester, or another family.
+//! a family's parts share, with [`upstream_decoration_extent`], [`extend_upstream_schema`] and
+//! [`upstream_derived_handles`] dispatching per family); the own-line tools (`240..=246`) and the
+//! three measuring ranges (`13..=15`) carry a family whose module owns their tool specs, kind
+//! defaults, geometry (resolved into shared [`DrawingParts`]), typed options, schema additions, and
+//! tests. The engine reaches a family only through the [`DrawingFamily`] hook table its specs
+//! reference: a closed, compile-time table rather than a plugin registry, so adding a family never
+//! edits the frame lowering, the hit tester, or another family.
 //!
 //! The modules of the retired fork families (Fibonacci, pitchforks and Gann, patterns, shapes)
 //! keep only their public option types and the fork's pre-merge kind defaults, which
@@ -126,6 +126,9 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
     // B8: lines — begin
     extent = extent.max(lines::upstream_decoration_extent(engine, drawing));
     // B8: lines — end
+    // B8: channels — begin
+    extent = extent.max(channels::upstream_decoration_extent(engine, drawing));
+    // B8: channels — end
     extent
 }
 
@@ -140,6 +143,24 @@ pub(crate) fn extend_upstream_schema(
     // B8: lines — begin
     lines::extend_upstream_schema(kind, template, properties);
     // B8: lines — end
+    // B8: channels — begin
+    channels::extend_upstream_schema(kind, template, properties);
+    // B8: channels — end
+}
+
+/// Move the handles of an upstream-rendered kind (no family) onto derived geometry, the
+/// upstream side of a family's `handles` hook: `handles.rs` builds the spec's set at the media-px
+/// anchors `px` and every reader of the set (painting, previews, hit testing, keyboard cycling,
+/// drag starts) sees the edited set. Must be cheap.
+pub(crate) fn upstream_derived_handles(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    px: &[Point],
+    handles: &mut [DrawingHandle],
+) {
+    // B8: channels — begin
+    channels::regression_fit_handles(engine, drawing, px, handles);
+    // B8: channels — end
 }
 
 /// Replace the common schema defaults with the template drawing's resolved values (a family's

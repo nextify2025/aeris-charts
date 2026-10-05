@@ -1,5 +1,5 @@
 //! B8 Channels family, own-line tool (wire id 244): the KLineChart price channel, plus the
-//! regression memo that upstream's regression trend reads.
+//! channel and regression presentation layered on upstream's channel and regression arms.
 //!
 //! The price channel's first two anchors define its centre line; the line through the third
 //! anchor parallel to it (translated vertically on screen, so it stays parallel on every
@@ -15,13 +15,26 @@
 //! Every line is a body target; a fill is a drag surface only while the drawing is selected,
 //! like the rectangle's. The third anchor's handle sits on its line's midpoint.
 //!
+//! Upstream's parallel, flat, and disjoint channels (resolved by `geometry.rs`) read the same
+//! `middle_line`/`middle_color` ([`channel_middle`]): a 1 CSS px dashed line between the two
+//! lines' endpoints paired by direction ([`paired_second`]; for a disjoint whose ends sit on
+//! different bars, the line through the midpoints of its paired ends). Their one band fill runs
+//! between the paired lines, so a disjoint whose second line runs opposite to its first fills its
+//! whole quad, and a crossing fills two lobes that meet at the crossing; a concave disjoint quad
+//! fills through its exact ribbon ([`channel_fill_ribbon`]).
+//!
 //! Upstream's regression trend fits its line through [`regression_stats`]: a least-squares fit
 //! of the source series' bars between its two anchors (upstream's window, `ceil` of the earlier
 //! anchor through `floor` of the later one), one
 //! allocation-free pass over the source's canonical rows in the range, memoized by everything it
 //! reads, so frames and pointer hit tests repeat it only after the range, the source, or the axis
 //! positions change; a live replacement of the latest bar or appended bars extend it by the
-//! changed rows.
+//! changed rows. Its options resolve in [`regression_band`]: the bar value it fits
+//! (`source`), each side's offset (an `upper_deviation`/`lower_deviation` override, else
+//! `±regression_deviations`, in population residual deviations) and switch, the dashed centre
+//! line in `middle_color` (`middle_line`), and Pearson's R below its start (`show_pearsons`,
+//! [`regression_parts`]). The anchors choose bars only: a regression moves along time, and its
+//! handles sit on the fitted line's ends ([`regression_fit_handles`]).
 
 use std::collections::HashMap;
 
@@ -31,13 +44,13 @@ use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point, Rect};
 
 use super::super::handles::DrawingHandle;
-use super::super::parts::{DrawingParts, PartContext, PartStroke};
+use super::super::parts::{DrawingParts, PartContext, PartLabel, PartStroke};
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
     DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
     DrawingToolSpec,
 };
-use super::super::{Drawing, DrawingSourceRows};
+use super::super::{Drawing, DrawingSourceRows, DrawingTextHAlign, DrawingTextVAlign};
 use super::DrawingFamily;
 use crate::{
     ChartEngine, DrawingDragPart, DrawingId, DrawingKind, DrawingKindOptions,
@@ -46,18 +59,19 @@ use crate::{
 
 /// Channels-family options (`tool_options.channel`). Every field is optional: an absent field
 /// takes the tool's own default, so deep-merged patches, templates, and `null` resets never
-/// depend on which channel tool a block came from. The price channel reads `middle_line` and
+/// depend on which channel tool a block came from. Every channel kind reads `middle_line` and
 /// `middle_color`. On upstream's regression trend the deviation fields and their switches are
 /// per-side overrides of the flat `regression_deviations` (an absent side follows it; see
-/// `drawing_contract::take_legacy_flat_options`); they, the source, and the Pearson field are
-/// stored, and the upstream-rendered kinds do not read the block yet. Every default is
-/// upstream's look; documents the fork wrote carry the fork's on-by-default middle line and
-/// Pearson's R explicitly (`super::legacy_fork_tool_options`).
+/// `drawing_contract::take_legacy_flat_options`), and it also reads the source and the Pearson
+/// field (`regression_band`). Every default is upstream's look; documents the fork wrote carry
+/// the fork's on-by-default middle line and Pearson's R explicitly
+/// (`super::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ChannelToolOptions {
-    /// Paint the dashed middle line (the regression line on a regression trend). Default off;
-    /// the fork's parallel channels and regression trends carry it on.
+    /// Paint the dashed middle line (on a regression trend, its centre line dashed in
+    /// `middle_color` instead of upstream's solid stroke). Default off; the fork's parallel
+    /// channels and regression trends carry it on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub middle_line: Option<bool>,
     /// Middle-line CSS color; absent or `""` follows the stroke color.
@@ -136,7 +150,11 @@ fn options(drawing: &Drawing) -> Resolved<'_> {
 }
 
 /// Middle-line width in CSS px (dashed).
-const MIDDLE_WIDTH: f64 = 1.0;
+pub(crate) const MIDDLE_WIDTH: f64 = 1.0;
+/// Gap between the lowest regression line's start and the top of Pearson's R, in CSS px.
+const PEARSON_GAP: f64 = 4.0;
+/// The widest Pearson's R text, measured for the culling pad.
+const PEARSON_SAMPLE: &str = "-0.0000";
 /// Default fill alpha over the stroke color (20%, the rectangle's wash).
 const FILL_ALPHA: u8 = 51;
 
@@ -340,6 +358,231 @@ fn fill_between(
         let quad = [at(first, t0), at(first, t1), at(second, t1), at(second, t0)];
         shape::clip_polygon_to_rect(&quad, ctx.pane, &mut clipped);
         parts.fill_convex(&clipped, Some(color), hit);
+    }
+}
+
+/// The middle-line color override of `drawing` while its `middle_line` is on: `Some(None)`
+/// follows the stroke color, `Some(Some(color))` is a parsed `middle_color`; `None` while off.
+pub(crate) fn middle_line(drawing: &Drawing) -> Option<Option<Color>> {
+    let resolved = options(drawing);
+    resolved
+        .middle_line
+        .then(|| resolved.middle_color.and_then(Color::parse_css))
+}
+
+/// `second` with its ends ordered like `first`'s (reversed when the two lines run opposite ways
+/// in x), so a channel's ends pair up by side: the band fill's paired chains, its selected-fill
+/// hit, and the middle line. Lines that already run the same way (every parallel and flat
+/// channel) come back unchanged.
+pub(crate) fn paired_second(first: [Point; 2], second: [Point; 2]) -> [Point; 2] {
+    if (first[1].0 - first[0].0) * (second[1].0 - second[0].0) < 0.0 {
+        [second[1], second[0]]
+    } else {
+        second
+    }
+}
+
+/// The exact ribbon of an upstream channel's band fill between `first` and `paired`
+/// ([`paired_second`]) when the 2-point band between them would not paint exactly the quad
+/// `(first[0], paired[0], paired[1], first[1])`: its upper then lower chains of equal length.
+/// `None` keeps the 2-point band, which every executor fills exactly while the quad is convex
+/// (every parallel and flat channel) or its lines properly cross (two lobes meeting at the
+/// crossing, split the way the triangle executors split it). A disjoint's four free ends can also
+/// make a concave quad, or one whose paired ends' sides cross, where the triangle executors'
+/// fixed fan would paint outside the quad; it becomes [`shape::nonzero_ribbon`]'s tessellation,
+/// which every executor and [`shape::point_in_ribbon`] cover exactly (empty without area).
+pub(crate) fn channel_fill_ribbon(first: [Point; 2], paired: [Point; 2]) -> Option<Vec<Point>> {
+    let quad = [first[0], paired[0], paired[1], first[1]];
+    let turn = |index: usize| {
+        let (a, b, c) = (quad[index], quad[(index + 1) % 4], quad[(index + 2) % 4]);
+        (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0)
+    };
+    let turns = [turn(0), turn(1), turn(2), turn(3)];
+    let convex = turns.iter().all(|turn| *turn >= 0.0) || turns.iter().all(|turn| *turn <= 0.0);
+    // The executors receive f32 points, so the crossing test runs on them as theirs does.
+    let encode = |(x, y): Point| [x as f32, y as f32];
+    if convex
+        || aeris_charts_render::line::band_crossing(
+            encode(first[0]),
+            encode(first[1]),
+            encode(paired[0]),
+            encode(paired[1]),
+        )
+        .is_some()
+    {
+        return None;
+    }
+    let mut chains = Vec::new();
+    let count = shape::nonzero_ribbon(&quad, &mut chains);
+    chains.truncate(count * 2);
+    Some(chains)
+}
+
+/// An upstream channel's dashed middle line between its resolved (extended) lines `first` and
+/// `paired` ([`paired_second`]), with its color override ([`middle_line`]); `None` while
+/// `middle_line` is off. It joins the midpoints of the paired ends: halfway between the lines
+/// wherever they share their ends' x positions (every parallel and flat channel, and a disjoint
+/// whose second line spans the first's bars).
+pub(crate) fn channel_middle(
+    drawing: &Drawing,
+    first: [Point; 2],
+    paired: [Point; 2],
+) -> Option<([Point; 2], Option<Color>)> {
+    let color = middle_line(drawing)?;
+    Some((
+        [
+            shape::midpoint(first[0], paired[0]),
+            shape::midpoint(first[1], paired[1]),
+        ],
+        color,
+    ))
+}
+
+/// A regression trend's band and presentation, resolved from its `tool_options.channel` block
+/// against the flat `regression_deviations`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RegressionBand {
+    /// The upper line's signed offset in population residual deviations
+    /// (`upper_deviation`, else `regression_deviations`); `None` while `use_upper_deviation` is
+    /// off.
+    pub(crate) upper: Option<f64>,
+    /// The lower line's signed offset (`lower_deviation`, else `-regression_deviations`); `None`
+    /// while `use_lower_deviation` is off.
+    pub(crate) lower: Option<f64>,
+    /// The bar value the fit reads (default close).
+    pub(crate) source: IndicatorInputSource,
+    /// Paint Pearson's R below the start (default off).
+    pub(crate) show_pearsons: bool,
+}
+
+/// The band of regression trend `drawing` ([`RegressionBand`]). Without a block it is upstream's
+/// symmetric band of closes.
+pub(crate) fn regression_band(drawing: &Drawing) -> RegressionBand {
+    let symmetric = drawing.regression_deviations;
+    let block = drawing.tool_options.channel.as_ref();
+    let side = |offset: Option<f64>, switch: Option<bool>, default: f64| {
+        switch.unwrap_or(true).then(|| offset.unwrap_or(default))
+    };
+    RegressionBand {
+        upper: side(
+            block.and_then(|block| block.upper_deviation),
+            block.and_then(|block| block.use_upper_deviation),
+            symmetric,
+        ),
+        lower: side(
+            block.and_then(|block| block.lower_deviation),
+            block.and_then(|block| block.use_lower_deviation),
+            -symmetric,
+        ),
+        source: block
+            .and_then(|block| block.source)
+            .unwrap_or(IndicatorInputSource::Close),
+        show_pearsons: block.and_then(|block| block.show_pearsons).unwrap_or(false),
+    }
+}
+
+/// The region a regression trend fills between its resolved lines, as the paired chains of one
+/// band fill: from the upper line to the lower (the zones from the centre to each side; a side
+/// that is off lies on the centre line), or, when both sides sit on the same side of the centre,
+/// from the centre to the farther one. `None` with both sides off. The frame paints it and a
+/// selected regression's hit test reads it, so the two agree.
+pub(crate) fn regression_zone(
+    band: RegressionBand,
+    center: [Point; 2],
+    upper: [Point; 2],
+    lower: [Point; 2],
+) -> Option<([Point; 2], [Point; 2])> {
+    match (band.upper, band.lower) {
+        (None, None) => None,
+        (Some(up), Some(down)) if up * down > 0.0 => Some(if up.abs() >= down.abs() {
+            (upper, center)
+        } else {
+            (center, lower)
+        }),
+        _ => Some((upper, lower)),
+    }
+}
+
+/// The parts a regression trend layers on upstream's regression arm (`ctx.px`: its anchors,
+/// then the fitted centre, upper, and lower lines' unextended ends): Pearson's R, left-aligned
+/// at the start (right-aligned when the end lies left of it), its top [`PEARSON_GAP`] below the
+/// lowest drawn line's start, in the drawing's label size and color. Not a hit target.
+pub(crate) fn regression_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
+    let drawing = ctx.drawing;
+    let band = regression_band(drawing);
+    let [a, b, center, _, upper, _, lower, _] = ctx.px else {
+        return;
+    };
+    if !band.show_pearsons {
+        return;
+    }
+    let Some(pearson) =
+        regression_stats(ctx.engine, drawing, band.source).and_then(|stats| stats.pearson)
+    else {
+        return;
+    };
+    // A side that is off lies on the centre line, so the lowest start is the lowest drawn one.
+    let bottom = center.1.max(upper.1).max(lower.1);
+    parts.label(PartLabel {
+        anchor: (center.0, bottom + PEARSON_GAP * ctx.scale),
+        h_align: if b.0 >= a.0 {
+            DrawingTextHAlign::Left
+        } else {
+            DrawingTextHAlign::Right
+        },
+        v_align: DrawingTextVAlign::Top,
+        lines: vec![format!("{pearson:.4}")],
+        size: ctx.engine.drawing_text_size(drawing) * ctx.scale,
+        weight: drawing.text_weight.unwrap_or(400),
+        italic: drawing.text_italic,
+        color: None,
+        background: None,
+        border: None,
+        padding: (0.0, 0.0),
+        hit: false,
+    });
+}
+
+/// The CSS-px reach of Pearson's R beyond a regression trend's anchors (see
+/// [`super::upstream_decoration_extent`]); 0 for every other kind and while it is off.
+pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
+    if drawing.kind != DrawingKind::RegressionTrend || !regression_band(drawing).show_pearsons {
+        return 0.0;
+    }
+    let size = engine.drawing_text_size(drawing);
+    let width = engine.measure_text_run(
+        PEARSON_SAMPLE,
+        size,
+        &engine.options.get().layout.font_family,
+        drawing.text_weight.unwrap_or(400),
+        drawing.text_italic,
+    );
+    PEARSON_GAP + width + size
+}
+
+/// A regression trend's handles on its fitted line (see [`super::upstream_derived_handles`]):
+/// each anchor's handle sits where the fit crosses that anchor's bar, so it is grabbed where it
+/// is painted; the anchors' own prices only shape the dashed placeholder while there is no fit,
+/// and the handles stay on the anchors then. Each still drives its own anchor by pointer deltas,
+/// along time only.
+pub(crate) fn regression_fit_handles(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    px: &[Point],
+    handles: &mut [DrawingHandle],
+) {
+    if drawing.kind != DrawingKind::RegressionTrend || px.is_empty() {
+        return;
+    }
+    let Some(derived) = engine.regression_points(drawing) else {
+        return;
+    };
+    for handle in handles {
+        if let DrawingDragPart::Anchor(index @ (0 | 1)) = handle.part {
+            if let Some(point) = engine.drawing_point_px(drawing, derived[index]) {
+                handle.point = point;
+            }
+        }
     }
 }
 
@@ -658,6 +901,70 @@ fn extend_schema(template: &Drawing, properties: &mut Vec<DrawingPropertyDescrip
         "middle_color",
         DrawingPropertyType::Color,
         serde_json::json!(resolved.middle_color.unwrap_or_default()),
+    ));
+}
+
+/// The `tool_options.channel` descriptors upstream's channel kinds read (see
+/// [`super::extend_upstream_schema`]): the middle line on every channel, and on the regression
+/// trend its side overrides (`null` follows `regression_deviations`), side switches, source, and
+/// Pearson's R. Defaults follow `template` (a kind's `Drawing::new`, which has no block).
+pub(crate) fn extend_upstream_schema(
+    kind: DrawingKind,
+    template: &Drawing,
+    properties: &mut Vec<DrawingPropertyDescriptor>,
+) {
+    if !matches!(
+        kind,
+        DrawingKind::ParallelChannel
+            | DrawingKind::FlatTopChannel
+            | DrawingKind::FlatBottomChannel
+            | DrawingKind::DisjointChannel
+            | DrawingKind::RegressionTrend
+    ) {
+        return;
+    }
+    extend_schema(template, properties);
+    if kind != DrawingKind::RegressionTrend {
+        return;
+    }
+    let block = template.tool_options.channel.clone().unwrap_or_default();
+    let band = regression_band(template);
+    for (name, value) in [
+        ("upper_deviation", block.upper_deviation),
+        ("lower_deviation", block.lower_deviation),
+    ] {
+        properties.push(DrawingPropertyDescriptor {
+            min: Some(-MAX_DEVIATION),
+            max: Some(MAX_DEVIATION),
+            ..descriptor(name, DrawingPropertyType::Number, serde_json::json!(value))
+        });
+    }
+    for (name, value) in [
+        ("use_upper_deviation", band.upper.is_some()),
+        ("use_lower_deviation", band.lower.is_some()),
+    ] {
+        properties.push(descriptor(
+            name,
+            DrawingPropertyType::Boolean,
+            serde_json::json!(value),
+        ));
+    }
+    properties.push(DrawingPropertyDescriptor {
+        enum_values: IndicatorInputSource::ALL
+            .iter()
+            .filter_map(|source| serde_json::to_value(source).ok())
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        ..descriptor(
+            "source",
+            DrawingPropertyType::Enum,
+            serde_json::json!(band.source),
+        )
+    });
+    properties.push(descriptor(
+        "show_pearsons",
+        DrawingPropertyType::Boolean,
+        serde_json::json!(band.show_pearsons),
     ));
 }
 

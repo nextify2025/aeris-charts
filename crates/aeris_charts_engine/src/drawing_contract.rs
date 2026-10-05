@@ -465,7 +465,8 @@ pub enum DrawingKindOptions {
     // B8: lines — end
     // B8: channels — begin
     /// The own-line price channel (`tool_options.channel`, resolved against the tool's
-    /// defaults).
+    /// defaults). Upstream's channels keep [`Self::Generic`] and its regression trend keeps
+    /// [`Self::RegressionTrend`]; their `channel` block reaches hosts through `options_json`.
     Channel {
         middle_line: bool,
         middle_color: Option<String>,
@@ -500,10 +501,12 @@ pub enum DrawingKindOptions {
 /// flat key wins when both are given. Every other key (a regression trend's per-side `channel`
 /// deviations included) is stored and persisted, and read by the family kinds (the own-line tools
 /// and the ranges); of the upstream-rendered kinds, the six line tools read `line` (its presence
-/// layers the fork's stats box, trend-angle decorations and arrowheads on their upstream arms) and
-/// the others do not read their keys yet. Each block's defaults are upstream's look, and documents
-/// and payloads the fork wrote carry the fork's unstored defaults explicitly
-/// (`drawings::kinds::legacy_fork_tool_options`).
+/// layers the fork's stats box, trend-angle decorations and arrowheads on their upstream arms),
+/// the parallel, flat and disjoint channels read `channel`'s middle line, the regression trend
+/// reads all of `channel` (middle line as its dashed centre, per-side deviations and switches,
+/// source, Pearson's R), and the others do not read their keys yet. Each block's defaults are
+/// upstream's look, and documents and payloads the fork wrote carry the fork's unstored defaults
+/// explicitly (`drawings::kinds::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DrawingToolOptions {
@@ -718,7 +721,9 @@ pub(crate) fn legacy_bars_pattern(bars: &[[f64; 4]]) -> Vec<crate::drawings::Bar
 /// Move the fork `tool_options` keys of `kind` that overlap an upstream flat field out of
 /// `tool_options` and return them as that field's normalized value. It works by key presence: a
 /// patch that sends part of a block maps exactly the keys it sends. A block left empty is removed;
-/// every other key stays (inert for upstream-rendered kinds, read by the own-line families).
+/// every other key stays stored: the own-line families read theirs, and so do the upstream kinds
+/// that layer a presentation on their arms (the line tools' `line`, the channels' and the
+/// regression trend's `channel`), while the other upstream-rendered kinds do not read them yet.
 ///
 /// With `absent_block_is_default` (a document the fork wrote, which omitted values equal to its
 /// defaults) the fork block's defaults stand in for absent keys, including a block that is absent

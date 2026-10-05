@@ -892,10 +892,15 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                     b: *px.get(1)?,
                 }
             } else {
+                // `extend_left`/`extend_right` run the fitted lines (and so the zones) to the
+                // pane edges beyond the first and second anchor's bar, like a channel's.
+                let extend = |line| {
+                    extend_channel_line(line, options.extend_left, options.extend_right, pane_w)
+                };
                 DrawingBodyGeometry::Regression {
-                    center: [px[2], px[3]],
-                    upper: [px[4], px[5]],
-                    lower: [px[6], px[7]],
+                    center: extend([px[2], px[3]]),
+                    upper: extend([px[4], px[5]]),
+                    lower: extend([px[6], px[7]]),
                 }
             }
         }

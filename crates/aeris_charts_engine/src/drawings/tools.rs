@@ -20,24 +20,17 @@
 // upstream's lowering (their options stay stored but inert). Documents the fork wrote, and the
 // fork-era clipboard and sync items that prove where they came from, already carry each one's fork
 // default (`kinds::legacy_fork_tool_options` and the legacy defaults), so they regain the fork look
-// as each is re-applied. Channels: the parallel channel's middle line, the crossing fill of a fork
-// `flat_top_bottom` whose level crosses its base (it restores as the disjoint channel with that
-// level as its second line), regression asymmetric and toggled deviations (stored per-side
-// overrides; a fork document's band also folds into `regression_deviations` at the wider enabled
-// side), OHLC source selection, Pearson's R, fit-line handles, time-only regression moves
-// (upstream's anchors are free handles, so a regression moves on both axes), the regression's
-// dashed centre line in `middle_color` (a fork document's trend already carries `middle_line`), its
-// `extend_*`, and its zones as drag surfaces while selected. Fibonacci: per-level palette lines,
-// dashed trend line, fan grid, full circles, vertical label alignment, phi spiral, level labels and
-// selected bands as hit targets, the fib channel's `extend_*`, and 0.25 px ring and arc
-// tessellation. Pitchforks and Gann: zone fills as selected hit targets, base-midpoint handle, Gann
-// box time levels and angles, square stats box, fan scale ratio, fixed-square size ratio and corner
-// handle, price-basis rescale. Patterns: harmonic ratio connectors and labels, point labels as hit
-// targets, shaded XABCD triangles, head-and-shoulders neckline, triangle apex extension, 12-degree
-// Elliott notation, show_wave, progressive previews. Annotations: projection sector, note pin and
-// reveal-on-focus, the price note's boxed price, speech bubbles, the default texts of new fork-form
-// annotations ("Note", "Callout", ...), signpost pole and its editor on placement (upstream's
-// signpost is a two-anchor marker that opens none), arrow-mark text, multi-line family boxes for
+// as each is re-applied. Fibonacci: per-level palette lines, dashed trend line, fan grid, full
+// circles, vertical label alignment, phi spiral, level labels and selected bands as hit targets,
+// the fib channel's `extend_*`, and 0.25 px ring and arc tessellation. Pitchforks and Gann: zone
+// fills as selected hit targets, base-midpoint handle, Gann box time levels and angles, square
+// stats box, fan scale ratio, fixed-square size ratio and corner handle, price-basis rescale.
+// Patterns: harmonic ratio connectors and labels, point labels as hit targets, shaded XABCD
+// triangles, head-and-shoulders neckline, triangle apex extension, 12-degree Elliott notation,
+// show_wave, progressive previews. Annotations: projection sector, note pin and reveal-on-focus,
+// the price note's boxed price, speech bubbles, the default texts of new fork-form annotations
+// ("Note", "Callout", ...), signpost pole and its editor on placement (upstream's signpost is a
+// two-anchor marker that opens none), arrow-mark text, multi-line family boxes for
 // note/comment/callout/price_note/anchored_text, bars-pattern LOD aggregation, the forecast's
 // source and target boxes (absolute change, Success/Failure on market colors, the box as a hit
 // target; the target time stays, one line above upstream's outcome label). Shapes:
@@ -51,22 +44,33 @@
 // box for fork documents), TrendAngle's dashed reference, arc and folded angle, and the five
 // segment tools' fork arrowhead (stroke trimmed under the head, no cap on an end that reaches the
 // pane edge, caps as hit targets); a ray's `extend_left` and the vertical extension of info_line,
-// trend_angle and arrow_line by `extend_*` (`geometry::segment_extension`); channel `extend_*`, the
-// callout's tip and box handles, the highlighter's once-filled tube, the regression trend's dashed
-// anchor segment while it has no fit, and the clip-aware flattening of the ellipse, circle, arc,
-// curve and double curve (`geometry.rs`: within 0.25 px of the true curve at any zoom, bounded
-// points, paint and hit flattened by the same rule, dashed outlines as solid dash runs). Not
-// restored, by owner decision (they would change upstream's anchor or option contracts): a ray
-// turned into a segment and the extended line's `extend_*` toggles (upstream payloads carry them as
-// `false`), the five-stat default of new info lines (they keep upstream's four; fork documents keep
-// five), the projection's independent sector radius (its third anchor), the price note's leader and
-// label offset (its second anchor), the bars pattern's box fit, the symmetric rotated rectangle
-// placed around its center axis, and a numeric fixed-square size. Also kept as upstream draws them
-// (docs/api/compatibility.md): the fork's boxed pattern point labels above highs and below lows,
-// the speed fan's time rays, ring, arc and wedge label placement, exact log-scale fib prices, the
-// pitchfork's A-B swing and B-C handle guides and always-red median, the Gann box's four-side
-// labels, the straighten modes, the fork's band and zone alphas, and the regression's sample
-// deviation.
+// trend_angle and arrow_line by `extend_*` (`geometry::segment_extension`); the channels'
+// presentation, read from the stored `tool_options.channel` block on upstream's channel and
+// regression arms (`kinds::channels`): the dashed middle line of every parallel, flat and disjoint
+// channel, the regression's dashed centre in `middle_color`, its per-side deviation overrides and
+// switches (both sides on one side of the centre fill from the centre to the farther one), its OHLC
+// source and Pearson's R; upstream behaviour changed by owner decision: one band fill between a
+// channel's lines paired by side, so a disjoint whose second line runs backward fills its whole
+// quad and a crossing (a fork `flat_top_bottom` whose level crosses its base restores as that
+// disjoint) fills two lobes, paint and selected-fill hit alike (C3); regression handles on the
+// fitted line's ends and time-only regression moves (C1); the regression's `extend_*` and its zones
+// as drag surfaces while selected (T1); channel `extend_*`, the callout's tip and box handles, the
+// highlighter's once-filled tube, the regression trend's dashed anchor segment while it has no fit,
+// and the clip-aware flattening of the ellipse, circle, arc, curve and double curve (`geometry.rs`:
+// within 0.25 px of the true curve at any zoom, bounded points, paint and hit flattened by the same
+// rule, dashed outlines as solid dash runs). Not restored, by owner decision (they would change
+// upstream's anchor or option contracts): a ray turned into a segment and the extended line's
+// `extend_*` toggles (upstream payloads carry them as `false`), the five-stat default of new info
+// lines (they keep upstream's four; fork documents keep five), the projection's independent sector
+// radius (its third anchor), the price note's leader and label offset (its second anchor), the bars
+// pattern's box fit, the symmetric rotated rectangle placed around its center axis, and a numeric
+// fixed-square size. Also kept as upstream draws them (docs/api/compatibility.md): the fork's boxed
+// pattern point labels above highs and below lows, the speed fan's time rays, ring, arc and wedge
+// label placement, exact log-scale fib prices, the pitchfork's A-B swing and B-C handle guides and
+// always-red median, the Gann box's four-side labels, the straighten modes, the fork's band and
+// zone alphas, the regression's sample deviation, a fork regression whose `middle_line` is off
+// (upstream's solid centre, not none), and the third handle of the parallel, flat and disjoint
+// channels (on the free third anchor, not the second line's midpoint).
 
 use super::kinds::DrawingFamily;
 use super::DrawingKind;
@@ -585,8 +589,11 @@ const fn channel_spec(
 
 const PARALLEL_CHANNEL: DrawingToolSpec =
     channel_spec(DrawingKind::ParallelChannel, 22, "parallel_channel", 3);
+// The anchors choose the fitted bars and the prices come from the data, so a regression moves
+// along time only (its handles sit on the fitted line, `kinds::channels::regression_fit_handles`).
 const REGRESSION_TREND: DrawingToolSpec = DrawingToolSpec {
     price_extent: DrawingPriceExtent::Full,
+    movement_axis: DrawingMovementAxis::HorizontalOnly,
     ..shape_spec(DrawingKind::RegressionTrend, 23, "regression_trend", 2)
 };
 const FLAT_TOP_CHANNEL: DrawingToolSpec =
