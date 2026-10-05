@@ -1,5 +1,5 @@
 {
-  "policy_version": 7,
+  "policy_version": 8,
   "baseline": "explicit_previous_release",
   "thresholds": {},
   "absolute_maximums": {
@@ -8,7 +8,7 @@
     "package-release-artifacts.javascript_raw_bytes.p50": 620000,
     "package-release-artifacts.javascript_brotli_bytes.p50": 95000,
     "package-release-artifacts.wasm_raw_bytes.p50": 5860000,
-    "package-release-artifacts.wasm_brotli_bytes.p50": 1330000,
+    "package-release-artifacts.wasm_brotli_bytes.p50": 1430000,
     "general-dashboard-100k.startup_ms.p50": 2000,
     "general-dashboard-100k.gpu_uploaded_bytes.p50": 100663296,
     "crosshair-reset-studies-daily-2520.canvas2d_ops.p50": 4500
@@ -146,6 +146,45 @@
         "The v6 lossless levers (IndicatorKind serde out of line, filtered chrono-tz, wasm-opt --converge, binaryen 132) were re-checked and none applies to the merged code; opt-level changes stay priced in benchmarks/README.md and not shipped because they cost frame time"
       ],
       "product_tradeoff": "Merging main's GPUI refresh contract (#17) and interaction fixes (#16: the shared 5 px drag threshold for objects, armed tools owning order-line bodies, inert awaiting controls with the press record, the control-based tooltip dwell, Backspace/Delete during placement, GPUI pointer capture and window deactivation) into the v6 engine batch. Each line alone sat inside the v6 ceilings (the v6 batch at 5f0b0c9 measured a 2,107,579-byte tarball, 2,421 bytes under); the merged tree at 3c0efbe measures 2,114,122 bytes, 4,122 bytes (0.2%) over, with the same wasm-pack 0.15.0 and its bundled wasm-opt 117. The growth is the merged engine code and its WASM exports with no reducible hotspot; only the tarball ceiling moves."
+    },
+    {
+      "policy_version": 8,
+      "commit": "2c9ee9a12b984ea0a8d4c81544af678b64b5a884",
+      "dirty_worktree": false,
+      "headroom_percent": 7,
+      "observed": {
+        "package-release-artifacts.npm_tarball_bytes.p50": 2128564,
+        "package-release-artifacts.npm_unpacked_bytes.p50": 6427650,
+        "package-release-artifacts.javascript_raw_bytes.p50": 414633,
+        "package-release-artifacts.javascript_brotli_bytes.p50": 72134,
+        "package-release-artifacts.wasm_raw_bytes.p50": 5484958,
+        "package-release-artifacts.wasm_brotli_bytes.p50": 1334731
+      },
+      "raised": {
+        "package-release-artifacts.wasm_brotli_bytes.p50": {
+          "from": 1330000,
+          "to": 1430000
+        }
+      },
+      "toolchain": {
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+        "wasm_pack": "wasm-pack 0.15.0",
+        "wasm_opt": "wasm-opt version 117 (version_117)",
+        "cargo_profile": "release",
+        "wasm_opt_args": [
+          "-Oz",
+          "--enable-mutable-globals",
+          "--enable-nontrapping-float-to-int",
+          "--enable-bulk-memory",
+          "--enable-sign-ext",
+          "--enable-simd"
+        ]
+      },
+      "levers": [
+        "Clipboard paste validates its options text with the shared DrawingPatch deserializer instead of a second serde_json::Value-based copy (abc13a9, shipped): -31,239 bytes of code on a named build, -30,662 raw and -5,159 Brotli bytes in the package",
+        "The v6 lossless levers (IndicatorKind serde out of line, filtered chrono-tz, wasm-opt --converge, binaryen 132) were re-checked and none applies to the merged code; opt-level changes stay priced in benchmarks/README.md and not shipped because they cost frame time"
+      ],
+      "product_tradeoff": "Merging AerisTerminal upstream 57e00de and 1b81852 into the fork (owner decision 2026-10-05: upstream's B8 renderers are the one implementation for the 62 drawing tools both lines built). The module gains upstream's B7 capabilities (volume and session profiles, periodic and developing profiles, profile drawings, naked levels, anchored VWAP points, resampling with boundaries and stats) and upstream's B8 catalog lowering, and keeps the fork's own-line tools, measuring ranges and data readers plus the conversion of fork-written documents, clipboard items and sync payloads (legacy names, anchor contracts, flat options). The fork's per-family B8 renderers leave the module, so raw bytes stay level with main: the merged tree at 2c9ee9a measures 5,484,958 raw bytes (main 3c0efbe: 5,481,942) and 1,334,731 Brotli bytes, 4,731 bytes (0.36%) over the unchanged 1,330,000 ceiling (main: 1,324,197). Upstream's code compresses less well than the fork code it replaces; only the Brotli ceiling moves."
     }
   ]
 }
