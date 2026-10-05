@@ -116,15 +116,21 @@ const DEFAULT_ICON_SIZE: f64 = 24.0;
 /// their defaults. For upstream's bars pattern and icon stamp, `bars_mode`, `mirrored`,
 /// `flipped`, `bars`, `icon`, and `icon_size` are input aliases of the flat `bars_pattern_*`,
 /// `icon_name`, and `icon_size` fields (see `drawing_contract::take_legacy_flat_options`);
-/// `always_show_text` is stored but not rendered.
+/// `always_show_text` is stored but not rendered. Every field is serialized only when it differs
+/// from its default, so a block at its defaults is written as `{}`: the marker documents the fork
+/// wrote carry on their annotations (see `kinds::legacy_fork_tool_options`), with no alias key
+/// written back.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ProjectionAnnotationToolOptions {
     /// Bars pattern: how the copied bars paint.
+    #[serde(skip_serializing_if = "is_default")]
     pub bars_mode: BarsPatternMode,
     /// Bars pattern: reverse the copied bars in time.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub mirrored: bool,
     /// Bars pattern: turn the copied bars upside down within the box between the two anchors.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub flipped: bool,
     /// Bars pattern: the fork's copied `[open, high, low, close]` bars, oldest first (an input
     /// alias of upstream's `bars_pattern` snapshot). Named templates keep only the style. At most
@@ -132,8 +138,10 @@ pub struct ProjectionAnnotationToolOptions {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bars: Vec<[f64; 4]>,
     /// Icon: the stamped icon.
+    #[serde(skip_serializing_if = "is_default")]
     pub icon: DrawingIcon,
     /// Icon: the icon's size in CSS px (8..=128).
+    #[serde(skip_serializing_if = "is_default_icon_size")]
     pub icon_size: f64,
     /// Note: paint the text box while the note is neither hovered, selected, nor edited (by
     /// default only the pin shows then, like the reference platform's note). Serialized only
@@ -156,6 +164,14 @@ impl Default for ProjectionAnnotationToolOptions {
     fn default() -> Self {
         DEFAULT_OPTIONS.clone()
     }
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+fn is_default_icon_size(size: &f64) -> bool {
+    *size == DEFAULT_ICON_SIZE
 }
 
 impl ProjectionAnnotationToolOptions {
@@ -345,6 +361,29 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
         }
         _ => {}
     }
+}
+
+/// The fork-form marker (see `kinds::legacy_fork_tool_options`): an empty
+/// `tool_options.projection_annotation` block on the annotations whose fork look (projection
+/// sector, note pin, speech bubbles, boxed price note, signpost plate and pole editor, arrow-mark
+/// text, forecast boxes) upstream does not draw. The block's presence selects that look on
+/// upstream's lowering, so documents the fork wrote keep it and new drawings keep upstream's.
+pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, serde_json::Value)> {
+    matches!(
+        kind,
+        DrawingKind::Projection
+            | DrawingKind::Note
+            | DrawingKind::Comment
+            | DrawingKind::PriceNote
+            | DrawingKind::PriceLabel
+            | DrawingKind::Signpost
+            | DrawingKind::ArrowMarkerUp
+            | DrawingKind::ArrowMarkerDown
+            | DrawingKind::ArrowMarkerLeft
+            | DrawingKind::ArrowMarkerRight
+            | DrawingKind::Forecast
+    )
+    .then(|| ("projection_annotation", serde_json::json!({})))
 }
 
 fn options(drawing: &Drawing) -> &ProjectionAnnotationToolOptions {

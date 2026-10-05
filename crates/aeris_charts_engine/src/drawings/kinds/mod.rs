@@ -9,7 +9,8 @@
 //!
 //! The modules of the retired fork families (Fibonacci, pitchforks and Gann, patterns, shapes)
 //! keep only their public option types and the fork's pre-merge kind defaults, which
-//! [`apply_legacy_fork_defaults`] applies to documents the fork wrote. The recipe (what to add
+//! [`apply_legacy_fork_defaults`] applies to documents the fork wrote, together with the fork's
+//! unstored `tool_options` defaults ([`legacy_fork_tool_options`]). The recipe (what to add
 //! where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
 //! Shared single-list registries carry one `// B8: <family> — begin/end` block per surviving
 //! family (lines, channels, projection_annotations).
@@ -137,8 +138,9 @@ pub(crate) fn apply_template_defaults(
 /// to those defaults, so restore applies this between `Drawing::new` and the document's own style
 /// (see `persistence.rs`). Flat fields the fork did not have (`gann_fans`, `level_*`,
 /// `wave_degree`, icons, bars patterns, regression deviations) keep upstream's defaults; the fork's
-/// `tool_options` defaults reach them through `drawing_contract::take_legacy_flat_options`. A
-/// no-op for core tools, the own-line tools, and the ranges, whose defaults did not change.
+/// `tool_options` defaults reach them through `drawing_contract::take_legacy_flat_options`, and
+/// its option blocks through [`merge_legacy_fork_tool_options`]. A no-op for core tools, the
+/// own-line tools, and the ranges, whose defaults did not change.
 pub(crate) fn apply_legacy_fork_defaults(drawing: &mut Drawing) {
     let kind = drawing.kind;
     if !matches!(kind.spec().wire_id, 16..=84) {
@@ -170,6 +172,49 @@ pub(crate) fn apply_legacy_fork_defaults(drawing: &mut Drawing) {
     projection_annotations::legacy_defaults(drawing);
     patterns_elliott_cycles::legacy_defaults(drawing);
     shapes::legacy_defaults(drawing);
+}
+
+/// The fork's `tool_options` default of a tool of the upstream catalog's B8 range, as the block
+/// name and the keys it fills in, where the fork's default differs from the upstream-neutral
+/// default of the option type: the line tools' stats box (`line`), the channels' middle line and
+/// Pearson's R (`channel`), the Fibonacci trend line, fan grid, and vertical label placement
+/// (`fibonacci`), the Gann box's time levels and the squares' stats box (`gann`), and the
+/// fork-form marker of the annotations (`projection_annotation`). The fork skipped option values
+/// that were unset or at its defaults when writing, so its documents carry none of these;
+/// [`merge_legacy_fork_tool_options`] puts them under what such a document stored. `None` for a
+/// tool without one (the triangle pattern's apex sides are flat fields and come with
+/// [`apply_legacy_fork_defaults`]).
+pub(crate) fn legacy_fork_tool_options(
+    kind: DrawingKind,
+) -> Option<(&'static str, serde_json::Value)> {
+    lines::legacy_tool_options(kind)
+        .or_else(|| channels::legacy_tool_options(kind))
+        .or_else(|| fibonacci::legacy_tool_options(kind))
+        .or_else(|| pitchforks_gann::legacy_tool_options(kind))
+        .or_else(|| projection_annotations::legacy_tool_options(kind))
+}
+
+/// Merge [`legacy_fork_tool_options`] of `kind` under `tool_options` (a `tool_options` object the
+/// fork wrote, or what is left of one after `drawing_contract::take_legacy_flat_options`): a
+/// missing block is added, and a stored block keeps every key it has and gains the missing ones.
+/// A stored `null` or malformed block is left for the caller's validation.
+pub(crate) fn merge_legacy_fork_tool_options(
+    kind: DrawingKind,
+    tool_options: &mut serde_json::Value,
+) {
+    let (Some((name, serde_json::Value::Object(defaults))), Some(stored)) =
+        (legacy_fork_tool_options(kind), tool_options.as_object_mut())
+    else {
+        return;
+    };
+    let block = stored
+        .entry(name)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(block) = block.as_object_mut() {
+        for (key, value) in defaults {
+            block.entry(key).or_insert(value);
+        }
+    }
 }
 
 /// The fork tool's default stroke width (its family spec's `default_width`).
@@ -337,6 +382,31 @@ mod tests {
             assert_eq!(legacy.wave_degree, fresh.wave_degree);
             assert_eq!(legacy.icon_size, fresh.icon_size);
             assert_eq!(legacy.regression_deviations, fresh.regression_deviations);
+            // The fork's unstored option defaults: only for the tools it rendered, each a valid
+            // block that differs from the option type's (upstream-neutral) defaults, merged
+            // under a document's own keys idempotently.
+            let Some((name, block)) = super::legacy_fork_tool_options(spec.kind) else {
+                continue;
+            };
+            assert!((16..=84).contains(&spec.wire_id), "{}", spec.name);
+            let mut merged = serde_json::json!({});
+            super::merge_legacy_fork_tool_options(spec.kind, &mut merged);
+            assert_eq!(merged, serde_json::json!({ name: block }), "{}", spec.name);
+            let mut twice = merged.clone();
+            super::merge_legacy_fork_tool_options(spec.kind, &mut twice);
+            assert_eq!(twice, merged, "{}", spec.name);
+            let options = serde_json::from_value::<crate::DrawingToolOptions>(merged).unwrap();
+            assert!(options.validate(), "{}", spec.name);
+            assert_ne!(
+                options,
+                crate::DrawingToolOptions::default(),
+                "{}",
+                spec.name
+            );
+            // A block the document stored keeps its keys; a reset stays a reset.
+            let mut reset = serde_json::json!({ name: null });
+            super::merge_legacy_fork_tool_options(spec.kind, &mut reset);
+            assert_eq!(reset, serde_json::json!({ name: null }), "{}", spec.name);
         }
     }
 }

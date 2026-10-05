@@ -141,8 +141,19 @@ fn catalog_defaults_follow_each_tool() {
             (color, fill, width),
             "{kind:?}"
         );
-        assert!(!drawing.extend_left && !drawing.extend_right);
+        // The fork drew a triangle pattern's apex sides; the extend flags select them.
+        let apex = kind == DrawingKind::PatternTriangle;
+        assert_eq!(
+            (drawing.extend_left, drawing.extend_right),
+            (apex, apex),
+            "{kind:?}"
+        );
         assert!(drawing.labels.is_empty() && drawing.tool_options.is_empty());
+        assert_eq!(
+            super::super::legacy_fork_tool_options(kind),
+            None,
+            "{kind:?}"
+        );
     }
 }
 

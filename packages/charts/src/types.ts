@@ -3024,7 +3024,10 @@ export type drawing_stats_position = "start" | "middle" | "end";
  * Line-family options (`tool_options.line`); absent fields keep their defaults. The own-line
  * line tools (`horizontal_segment`, `vertical_ray`, `vertical_segment`, `price_line`) read them.
  * The line tools of the shared catalog (`info_line` and the others) store them but do not render
- * them.
+ * them. Documents an earlier fork build wrote restore `ray`, `extended_line`, `info_line`,
+ * `trend_angle`, `cross_line`, and `arrow_line` with the block (`{"stats_position": "end"}` once
+ * exported), as does a fork-era clipboard or sync `info_line` with that build's five default
+ * stats; new drawings have none.
  */
 export interface line_tool_options {
   /** Stats box position along the anchor segment (default `"end"`). */
@@ -3034,19 +3037,23 @@ export interface line_tool_options {
  * Channel options (`tool_options.channel`). Absent fields take the tool's own default and `null`
  * resets one field. The own-line `price_channel` reads `middle_line` and `middle_color`. For
  * `regression_trend`, which the shared catalog renders from the flat `regression_deviations` and
- * `regression_source_id`, the deviation fields are input aliases mapped onto
- * `regression_deviations` on patch and restore (never written back), and the other regression
- * fields are stored but not rendered. The shared catalog's other channels store the block
- * without rendering it.
+ * `regression_source_id`, the deviation fields and their switches are per-side overrides of
+ * `regression_deviations` (an absent side follows it; patching one never changes the flat
+ * value); they and the other regression fields are stored but not rendered yet. The shared
+ * catalog's other channels store the block without rendering it. Every default is the shared
+ * catalog's look; documents an earlier fork build wrote restore its parallel channels with
+ * `middle_line: true` and its regression trends with `middle_line` and `show_pearsons` on, and
+ * keep their asymmetric or one-sided deviations (their `regression_deviations` takes the wider
+ * enabled side).
  */
 export interface channel_tool_options {
   /** Dashed middle line (`price_channel`; default off). Stored but not rendered for the shared catalog's channels. */
   middle_line?: boolean | null;
   /** Middle-line CSS color; `""` follows the stroke color (default). */
   middle_color?: string | null;
-  /** @deprecated Input alias of `regression_deviations` (upper line offset in residual standard deviations). */
+  /** Upper line offset in residual standard deviations (`regression_trend`); absent follows `regression_deviations`. Stored but not rendered. */
   upper_deviation?: number | null;
-  /** @deprecated Input alias of `regression_deviations` (lower line offset in residual standard deviations). */
+  /** Lower line offset in residual standard deviations (`regression_trend`, negative below the fit); absent follows `-regression_deviations`. Stored but not rendered. */
   lower_deviation?: number | null;
   /** Paint the upper deviation line and its zone. Stored but not rendered. */
   use_upper_deviation?: boolean | null;
@@ -3054,14 +3061,18 @@ export interface channel_tool_options {
   use_lower_deviation?: boolean | null;
   /** Bar value the regression fits. Stored but not rendered (the regression fits closes). */
   source?: indicator_input_source | null;
-  /** Paint Pearson's R below the regression's start. Stored but not rendered. */
+  /** Paint Pearson's R below the regression's start (default off). Stored but not rendered. */
   show_pearsons?: boolean | null;
 }
 /**
  * Legacy Fibonacci options (`tool_options.fibonacci`). The shared catalog renders the Fibonacci
  * tools from the flat `levels` and `level_*` options: the deprecated fields are input aliases
  * mapped onto those flat fields on patch and restore and never written back, and the other
- * fields are stored but not rendered.
+ * fields are stored but not rendered. Their defaults are the shared catalog's look; documents an
+ * earlier fork build wrote restore with that build's unstored defaults written out (`trend_line`
+ * on the retracement, extension, time zones, trend time, speed arcs, circles, and spiral, `grid`
+ * on the speed fan, `label_v_align` `"middle"` on the price tools and `"bottom"` on the time
+ * tools).
  */
 export interface fibonacci_tool_options {
   /** @deprecated Input alias of `level_reverse`. */
@@ -3074,13 +3085,18 @@ export interface fibonacci_tool_options {
   levels_as_percent?: boolean;
   /** @deprecated Input alias of `level_log_scale`. */
   log_scale?: boolean;
-  /** Dashed trend line through the anchors. Stored but not rendered. */
+  /** Dashed trend line through the anchors (default off). Stored but not rendered. */
   trend_line?: boolean;
-  /** Speed resistance fan grid. Stored but not rendered. */
+  /** Speed resistance fan grid (default off). Stored but not rendered. */
   grid?: boolean;
   /** Speed resistance arcs as full circles. Stored but not rendered. */
   full_circles?: boolean;
-  /** @deprecated Input alias of `level_label_align`. */
+  /**
+   * @deprecated Input alias of `level_label_align`. On `fibonacci_time_zones` and
+   * `fibonacci_trend_time`, `"left"` and `"right"` map to the other side: this option names the
+   * side of the line the label sits on, `level_label_align` the edge of the text anchored at the
+   * line (`"left"` puts the label right of the line).
+   */
   label_h_align?: drawing_text_h_align;
   /** Vertical level label placement. Stored but not rendered. */
   label_v_align?: drawing_text_v_align;
@@ -3089,10 +3105,12 @@ export interface fibonacci_tool_options {
  * Legacy Gann options (`tool_options.gann`). The shared catalog renders the pitchforks and the
  * Gann tools from the flat `levels`, `gann_fans`, `gann_arcs`, and `level_*` options: the
  * deprecated fields are input aliases mapped onto those flat fields on patch and restore and
- * never written back, and the other fields are stored but not rendered.
+ * never written back, and the other fields are stored but not rendered. Their defaults are the
+ * shared catalog's look; documents an earlier fork build wrote restore a Gann box with that
+ * build's seven `time_levels` and the squares with `show_stats: true`.
  */
 export interface gann_tool_options {
-  /** Gann box vertical levels as fractions of the box width. Stored but not rendered. */
+  /** Gann box vertical levels as fractions of the box width; empty (the default) follows `levels`. Stored but not rendered. */
   time_levels?: drawing_level[];
   /** @deprecated Input alias of `gann_fans` (angle lines as multiples of the 1×1 slope). */
   angles?: drawing_level[];
@@ -3102,7 +3120,7 @@ export interface gann_tool_options {
   reverse?: boolean;
   /** Gann box angle lines from the pivot corner. Stored but not rendered. */
   show_angles?: boolean;
-  /** Gann square stats box. Stored but not rendered. */
+  /** Gann square stats box (default off). Stored but not rendered. */
   show_stats?: boolean;
   /**
    * Price units per bar of the 1×1 angle (fan and fixed square). Stored but not rendered;
@@ -3140,7 +3158,11 @@ export type drawing_icon =
  * Legacy Projection & Annotations options (`tool_options.projection_annotation`). The shared
  * catalog renders `bars_pattern`, `icon_stamp`, and `note`: the deprecated fields are input
  * aliases mapped onto flat drawing options on patch and restore and never written back, and the
- * other fields are stored but not rendered.
+ * other fields are stored but not rendered. A field is written only when it differs from its
+ * default, so a block at its defaults reads back as `{}`: documents an earlier fork build wrote
+ * (and that build's clipboard and sync items with its anchor counts) restore their projections,
+ * notes, comments, price notes, price labels, signposts, arrow markers, and forecasts with that
+ * empty block, which marks the fork's look of those tools; new drawings have none.
  */
 export interface projection_annotation_tool_options {
   /** @deprecated Input alias of `bars_pattern_mode` (`"hl_bars"` becomes `"bars"`). */

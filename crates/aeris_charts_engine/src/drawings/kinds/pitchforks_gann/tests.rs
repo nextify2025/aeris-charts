@@ -156,14 +156,106 @@ fn catalog_defaults_follow_each_tool() {
             }
         }
         assert_eq!(drawing.width, 1.0);
+        // The fork's option defaults its documents never stored: the box's time levels and the
+        // squares' stats box, merged under what a document stored when it is restored.
+        let mut stored = serde_json::json!({"gann": {"show_stats": false}});
+        super::super::merge_legacy_fork_tool_options(kind, &mut stored);
+        let restored = serde_json::from_value::<crate::DrawingToolOptions>(stored)
+            .unwrap()
+            .gann
+            .unwrap();
+        assert!(!restored.show_stats, "{kind:?}: a stored key wins");
+        let mut blank = serde_json::json!({});
+        super::super::merge_legacy_fork_tool_options(kind, &mut blank);
+        let fork = serde_json::from_value::<crate::DrawingToolOptions>(blank)
+            .unwrap()
+            .gann
+            .unwrap_or_default();
+        assert!(fork.validate());
+        match kind {
+            DrawingKind::GannBox => assert_eq!(fork.time_levels.len(), 7),
+            DrawingKind::GannSquare | DrawingKind::GannSquareFixed => assert!(fork.show_stats),
+            _ => assert_eq!(fork, GannToolOptions::default(), "{kind:?}"),
+        }
     }
+    // The option type's own defaults are upstream's look, so a block a patch creates for one key
+    // switches nothing else on.
     let options = GannToolOptions::default();
     assert!(options.validate());
-    assert_eq!(options.time_levels.len(), 7);
+    assert!(options.time_levels.is_empty());
+    assert!(!options.show_stats);
     assert_eq!(options.angles.len(), 9);
     assert_eq!(options.arcs.len(), 5);
     assert_eq!(options.size_bars, 20.0);
     assert_eq!(options.scale_ratio, None);
+}
+
+/// A pitchfork the fork wrote converts its levels to upstream's meaning: upstream's renderer then
+/// draws the fork's tines (each fork level on both sides of the median) and band fills (each
+/// band in the fill of the fork level outside it, mirrored on both sides).
+#[test]
+fn fork_pitchfork_levels_keep_their_tines_and_band_fills() {
+    for kind in [
+        DrawingKind::AndrewsPitchfork,
+        DrawingKind::SchiffPitchfork,
+        DrawingKind::InsidePitchfork,
+        DrawingKind::Pitchfan,
+    ] {
+        let mut chart = chart();
+        let id = add(&mut chart, kind, anchors(kind), "{}");
+        let mut fork = crate::Drawing::new(0, kind, 0, Vec::new());
+        super::super::apply_legacy_fork_defaults(&mut fork);
+        super::legacy_levels_to_upstream(&mut fork);
+        let options = serde_json::json!({"levels": fork.levels, "color": MEDIAN_COLOR});
+        assert!(chart.drawing_apply_options(id, &options.to_string()));
+        let frame = chart.build_frame();
+        let fills = frame.panes[0]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::BandFill { fill, .. } => Some(*fill),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // The fork's defaults: the 0.5 tines' band in green inside, the 1 tines' in blue
+        // outside, on both sides of the median.
+        let (green, blue) = (
+            Color::rgba(0x08, 0x99, 0x81, 35),
+            Color::rgba(0x29, 0x62, 0xff, 35),
+        );
+        assert_eq!(fills, [blue, green, green, blue], "{kind:?}");
+        // The median and the four tines, in the drawing's and the levels' colors.
+        assert_eq!(polylines(&mut chart, MEDIAN_COLOR).len(), 1, "{kind:?}");
+        assert_eq!(polylines(&mut chart, "#089981").len(), 2, "{kind:?}");
+        assert_eq!(polylines(&mut chart, "#2962ff").len(), 2, "{kind:?}");
+    }
+    // Other kinds keep their levels.
+    let mut gann = crate::Drawing::new(0, DrawingKind::GannBox, 0, Vec::new());
+    let levels = gann.levels.clone();
+    super::legacy_levels_to_upstream(&mut gann);
+    assert_eq!(gann.levels, levels);
+}
+
+/// Past the level cap, a fork pitchfork keeps its visible tines before any hidden level.
+#[test]
+fn fork_pitchfork_level_cap_keeps_the_visible_tines() {
+    let mut fork = crate::Drawing::new(0, DrawingKind::AndrewsPitchfork, 0, Vec::new());
+    fork.levels = (1..=35)
+        .map(|index| crate::DrawingLevel {
+            visible: false,
+            ..crate::DrawingLevel::at(f64::from(index) / 100.0, "#787b86")
+        })
+        .chain([0.5, 1.0].map(|value| crate::DrawingLevel::at(value, "#2962ff")))
+        .collect();
+    super::legacy_levels_to_upstream(&mut fork);
+    assert!(fork.levels.len() <= crate::MAX_DRAWING_LEVELS);
+    let visible = fork
+        .levels
+        .iter()
+        .filter(|level| level.visible)
+        .map(|level| level.value)
+        .collect::<Vec<_>>();
+    assert_eq!(visible, [0.0, 0.25, 0.5, 0.75, 1.0]);
 }
 
 #[test]

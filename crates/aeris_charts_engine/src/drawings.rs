@@ -2964,6 +2964,18 @@ impl Drawing {
         true
     }
 
+    /// [`Self::options_json`] for a clipboard or sync item. An info line without its stats box
+    /// writes the absent `tool_options.line` as `null`, which a fork build never wrote: a fork
+    /// item carrying the fork's default stats takes the block
+    /// ([`crate::persistence::migrate_fork_payload_item`]), and this one keeps it removed.
+    fn payload_options_json(&self) -> serde_json::Value {
+        let mut options = self.options_json();
+        if self.kind == DrawingKind::InfoLine && self.tool_options.line.is_none() {
+            options["tool_options"]["line"] = serde_json::Value::Null;
+        }
+        options
+    }
+
     fn options_json(&self) -> serde_json::Value {
         let mut options = serde_json::json!({
             "name": self.name,
@@ -5600,7 +5612,7 @@ impl ChartEngine {
                 kind: drawing.kind,
                 pane_index: drawing.pane_index,
                 points: self.drawing_anchors_of(drawing),
-                options: drawing.options_json(),
+                options: drawing.payload_options_json(),
                 bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
                     .then(|| drawing.bars_pattern.clone()),
             })
@@ -5942,7 +5954,7 @@ impl ChartEngine {
                 kind: drawing.kind,
                 pane_index: drawing.pane_index,
                 points: self.drawing_anchors_of(drawing),
-                options: drawing.options_json(),
+                options: drawing.payload_options_json(),
                 bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
                     .then(|| drawing.bars_pattern.clone()),
             })

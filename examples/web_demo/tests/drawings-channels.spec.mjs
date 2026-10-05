@@ -317,14 +317,14 @@ test("a regression trend paints its fit with flat, atomic options", async ({ pag
   expect(options.options.regression_deviations).toBe(0.5);
   expect(options.kind_options.deviations).toBe(0.5);
 
-  // Earlier builds' deviation keys fold into the flat option (the wider side).
+  // The per-side deviation keys are stored overrides of their own side: the flat option stays.
   const legacy = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
     drawing.apply_options({ tool_options: { channel: { upper_deviation: 1.5, lower_deviation: -1 } } });
     return { deviations: window.__chart.drawing_kind_options(drawing).deviations, tool_options: drawing.options().tool_options };
   }, info.id);
-  expect(legacy.deviations).toBe(1.5);
-  expect(legacy.tool_options).toEqual({});
+  expect(legacy.deviations).toBe(0.5);
+  expect(legacy.tool_options).toEqual({ channel: { upper_deviation: 1.5, lower_deviation: -1 } });
 
   const schema = await page.evaluate((id) => window.__chart.drawing_property_schema(
     window.__chart.drawings().find((drawing) => drawing.id === id),

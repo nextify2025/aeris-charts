@@ -168,6 +168,28 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
     }
 }
 
+/// The fork's unstored `tool_options` default of the upstream line tools it rendered (see
+/// [`super::legacy_fork_tool_options`]): every one drew its visible `labels` as one stats box,
+/// which the presence of the `line` block selects on upstream's lowering.
+pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, serde_json::Value)> {
+    matches!(
+        kind,
+        DrawingKind::Ray
+            | DrawingKind::ExtendedLine
+            | DrawingKind::InfoLine
+            | DrawingKind::TrendAngle
+            | DrawingKind::CrossLine
+            | DrawingKind::ArrowLine
+    )
+    .then(|| ("line", serde_json::json!({})))
+}
+
+/// Whether `labels` (a clipboard or sync item's) are the fork's info-line default, which no
+/// upstream drawing carries: upstream's info line starts with four `above` stats.
+pub(crate) fn is_legacy_info_stats(labels: &[DrawingLabelOptions]) -> bool {
+    labels == default_info_stats()
+}
+
 fn options(drawing: &Drawing) -> LineToolOptions {
     drawing.tool_options.line.unwrap_or_default()
 }

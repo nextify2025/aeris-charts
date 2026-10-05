@@ -74,7 +74,7 @@ impl Default for PatternToolOptions {
 
 /// The fork's pre-merge defaults of the pattern, Elliott, and cycle tools (see
 /// [`super::apply_legacy_fork_defaults`]): TradingView's color per tool, the region tools with
-/// their fill on.
+/// their fill on, and the triangle pattern's apex sides.
 pub(super) fn legacy_defaults(drawing: &mut Drawing) {
     let (color, fill) = match drawing.kind {
         DrawingKind::PatternXabcd | DrawingKind::PatternCypher => ("#2962FF", true),
@@ -94,6 +94,12 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
     };
     drawing.color = color.to_string();
     drawing.fill_enabled = fill;
+    // The fork always drew a triangle pattern's sides on to their apex; on upstream's lowering
+    // `extend_left`/`extend_right` select them (on the side the apex lies on).
+    if drawing.kind == DrawingKind::PatternTriangle {
+        drawing.extend_left = true;
+        drawing.extend_right = true;
+    }
 }
 
 #[cfg(test)]

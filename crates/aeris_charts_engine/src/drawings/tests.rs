@@ -6464,6 +6464,134 @@ fn fork_era_clipboard_and_sync_items_convert_to_upstream_anchor_contracts() {
 }
 
 #[test]
+fn fork_era_payload_items_take_the_fork_option_defaults() {
+    let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+    let stats = [
+        "price_change",
+        "percent_change",
+        "bar_count",
+        "duration",
+        "angle",
+    ]
+    .map(|metric| serde_json::json!({"metric": metric, "visible": true, "position": "on"}));
+    // An anchor count upstream never stores, or the fork's default info-line stats, prove a fork
+    // build wrote the item; the same tools on upstream's contracts carry no such proof.
+    let items = serde_json::json!([
+        {"id": 1, "kind": "info_line", "pane_index": 0,
+         "options": {"labels": stats, "tool_options": {}},
+         "points": [at(1.0, 10.0), at(4.0, 12.0)]},
+        {"id": 2, "kind": "projection", "pane_index": 0, "options": {"tool_options": {}},
+         "points": [at(2.0, 10.0), at(5.0, 12.0), at(4.0, 13.0)]},
+        {"id": 3, "kind": "signpost", "pane_index": 0, "options": {},
+         "points": [at(7.0, 12.0)]},
+        {"id": 4, "kind": "price_note", "pane_index": 0, "options": {},
+         "points": [at(5.0, 11.0), at(8.0, 13.0)]},
+        {"id": 5, "kind": "gann_square_fixed", "pane_index": 0,
+         "options": {"tool_options": {"gann": {"size_bars": 4.0, "reverse": true}}},
+         "points": [at(3.0, 12.0)]},
+        {"id": 6, "kind": "triangle_pattern", "pane_index": 0,
+         "options": {"extend_left": false, "extend_right": false},
+         "points": [at(0.0, 10.0), at(2.0, 14.0), at(4.0, 11.0), at(6.0, 13.0)]},
+        {"id": 7, "kind": "info_line", "pane_index": 0, "options": {},
+         "points": [at(1.0, 10.0), at(4.0, 12.0)]},
+        {"id": 8, "kind": "projection", "pane_index": 0, "options": {},
+         "points": [at(2.0, 10.0), at(4.0, 13.0)]},
+        {"id": 9, "kind": "gann_square", "pane_index": 0,
+         "options": {"tool_options": {"gann": {"reverse": true}}},
+         "points": [at(3.0, 10.0), at(7.0, 12.0)]}
+    ]);
+    let check = |chart: &ChartEngine, ids: &[DrawingId]| {
+        let drawing = |index: usize| chart.drawing(ids[index]).unwrap();
+        assert_eq!(drawing(0).tool_options.line, Some(Default::default()));
+        for index in 1..=3 {
+            assert_eq!(
+                drawing(index).tool_options.projection_annotation,
+                Some(Default::default()),
+                "{:?} carries the fork-form marker",
+                drawing(index).kind
+            );
+        }
+        // The fixed square's `reverse` is its downward corner, not a reversed pivot; it shows
+        // the fork's stats box.
+        let square = drawing(4);
+        assert!(!square.level_reverse);
+        assert!(square.points[1].price < square.points[0].price);
+        let gann = square.tool_options.gann.as_ref().unwrap();
+        assert!(gann.show_stats);
+        assert_eq!(gann.size_bars, 4.0);
+        let triangle = drawing(5);
+        assert!(triangle.extend_left && triangle.extend_right);
+        // Items on upstream's contracts keep upstream's options.
+        assert_eq!(drawing(6).tool_options, Default::default());
+        assert_eq!(drawing(7).tool_options, Default::default());
+        assert!(
+            drawing(8).level_reverse,
+            "a patch keeps the documented alias"
+        );
+        assert_eq!(drawing(8).tool_options.gann, None);
+    };
+    let clipboard = serde_json::json!({
+        "schema": "aeris_charts-drawings",
+        "revision": 1,
+        "drawings": items,
+    })
+    .to_string();
+    let mut chart = settled_chart();
+    let pasted = chart.paste_drawings_json(&clipboard, 0, 0.0, 0.0).unwrap();
+    check(&chart, &pasted);
+    let sync = serde_json::json!({
+        "schema": "aeris_charts-drawing-sync",
+        "source": "fork-peer",
+        "revision": 3,
+        "drawings": items,
+    })
+    .to_string();
+    let mut peer = settled_chart();
+    assert!(peer.apply_drawing_sync_payload_json(&sync));
+    check(&peer, &(1..=9).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_removed_fork_info_line_stats_box_stays_removed_through_payloads() {
+    let stats = [
+        "price_change",
+        "percent_change",
+        "bar_count",
+        "duration",
+        "angle",
+    ]
+    .map(|metric| serde_json::json!({"metric": metric, "visible": true, "position": "on"}));
+    let fork = serde_json::json!({
+        "schema": "aeris_charts-drawings",
+        "revision": 1,
+        "drawings": [{"kind": "info_line", "pane_index": 0,
+            "options": {"labels": stats, "tool_options": {}},
+            "points": [{"logical": 1.0, "price": 10.0}, {"logical": 4.0, "price": 12.0}]}],
+    })
+    .to_string();
+    let mut chart = settled_chart();
+    let id = chart.paste_drawings_json(&fork, 0, 0.0, 0.0).unwrap()[0];
+    assert!(chart.drawing(id).unwrap().tool_options.line.is_some());
+    // The user removes the box; the drawing keeps the fork's five stats.
+    assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"line":null}}"#));
+    let drawing = chart.drawing(id).unwrap();
+    assert_eq!(drawing.tool_options.line, None);
+    assert!(crate::drawings::kinds::lines::is_legacy_info_stats(
+        &drawing.labels
+    ));
+
+    let copied = chart.copy_drawings_json(&[id]).unwrap();
+    let pasted = chart.paste_drawings_json(&copied, 0, 2.0, 0.0).unwrap()[0];
+    assert_eq!(chart.drawing(pasted).unwrap().tool_options.line, None);
+    let sync = chart.drawing_sync_payload_json("cell-a").unwrap();
+    let mut peer = settled_chart();
+    assert!(peer.apply_drawing_sync_payload_json(&sync));
+    for drawing in &peer.drawings {
+        assert_eq!(drawing.tool_options.line, None, "{}", drawing.id);
+    }
+}
+
+#[test]
 fn a_callout_moves_its_tip_and_its_box_by_their_own_handles() {
     let mut chart = settled_chart();
     let id = chart

@@ -17,32 +17,50 @@
 //! their `kinds/<family>.rs` module.
 
 // ponytail: fork renderer extras retired by the upstream B8 sync and not yet re-applied on
-// upstream's lowering (their options stay stored but inert). Lines: the one engine-formatted stats
-// box every line tool's `labels` rendered as (InfoLine's five-stat box and stats_position included;
-// each visible label now prints on its own line through upstream's label path, with the date range
-// and duration still engine-formatted), TrendAngle's arc and reference line, the fork arrowhead
-// geometry, and a ray's `extend_*` toggles (upstream's ray is always a ray). Channels: the parallel
-// channel's middle line, flat_top_bottom's crossing split, regression asymmetric and toggled
-// deviations (folded into one symmetric `regression_deviations` at the wider enabled side, a lossy
-// conversion), OHLC source selection, Pearson's R, fit-line handles, and time-only regression
-// moves (upstream's anchors are free handles, so a regression moves on both axes). Fibonacci:
-// per-level palette lines, dashed trend line, fan grid, full circles, vertical label alignment,
-// phi spiral, and level labels and selected bands as hit targets. Pitchforks and Gann: zone fills
-// as selected hit targets, base-midpoint handle, Gann box time levels and angles, square stats box,
-// fan scale ratio, fixed-square size and corner handle, price-basis rescale. Patterns: harmonic
-// ratio connectors and labels, point labels as hit targets, shaded XABCD triangles,
-// head-and-shoulders neckline, triangle apex extension, 12-degree Elliott notation, show_wave,
-// progressive previews. Annotations: projection sector, note pin and reveal-on-focus, price-note
-// leader, speech bubbles, the default texts of new annotations ("Note", "Callout", ...), signpost
-// pole and its editor on placement (upstream's signpost is a two-anchor marker that opens none),
-// arrow-mark text, multi-line family boxes for note/comment/callout/price_note/anchored_text,
-// bars-pattern box fit and LOD aggregation, the forecast's source and target boxes (absolute
-// change, Success/Failure on market colors, the box as a hit target; the target time stays, one
-// line above upstream's outcome label). Shapes: symmetric rotated rectangle and width handles,
-// ellipse bounds handles, on-curve anchors with tangent extension and chord fills, closed
-// polylines, clip-aware flattening. Re-applied on upstream's lowering instead: channel
-// `extend_*`, the callout's tip and box handles, the highlighter's once-filled tube, and the
-// regression trend's dashed anchor segment while it has no fit.
+// upstream's lowering (their options stay stored but inert). Documents the fork wrote, and the
+// fork-era clipboard and sync items that prove where they came from, already carry each one's fork
+// default (`kinds::legacy_fork_tool_options` and the legacy defaults), so they regain the fork look
+// as each is re-applied. Lines: the one engine-formatted stats box every line tool's `labels`
+// rendered as (InfoLine's five-stat box and stats_position included; each visible label now prints
+// on its own line through upstream's label path, with the date range and duration still
+// engine-formatted), TrendAngle's arc and reference line, the fork arrowhead geometry, a ray's
+// `extend_left`, and the vertical extension of info_line, trend_angle and arrow_line by `extend_*`.
+// Channels: the parallel channel's middle line, the crossing fill of a fork `flat_top_bottom` whose
+// level crosses its base (it restores as the disjoint channel with that level as its second line),
+// regression asymmetric and toggled deviations (stored per-side overrides; a fork document's band
+// also folds into `regression_deviations` at the wider enabled side), OHLC source selection,
+// Pearson's R, fit-line handles, time-only regression moves (upstream's anchors are free handles,
+// so a regression moves on both axes), the regression's dashed centre line in `middle_color` (a
+// fork document's trend already carries `middle_line`), its `extend_*`, and its zones as drag
+// surfaces while selected. Fibonacci: per-level palette lines, dashed trend line, fan grid, full
+// circles, vertical label alignment, phi spiral, level labels and selected bands as hit targets,
+// the fib channel's `extend_*`, and 0.25 px ring and arc tessellation. Pitchforks and Gann: zone
+// fills as selected hit targets, base-midpoint handle, Gann box time levels and angles, square
+// stats box, fan scale ratio, fixed-square size ratio and corner handle, price-basis rescale.
+// Patterns: harmonic ratio connectors and labels, point labels as hit targets, shaded XABCD
+// triangles, head-and-shoulders neckline, triangle apex extension, 12-degree Elliott notation,
+// show_wave, progressive previews. Annotations: projection sector, note pin and reveal-on-focus,
+// the price note's boxed price, speech bubbles, the default texts of new fork-form annotations
+// ("Note", "Callout", ...), signpost pole and its editor on placement (upstream's signpost is a
+// two-anchor marker that opens none), arrow-mark text, multi-line family boxes for
+// note/comment/callout/price_note/anchored_text, bars-pattern LOD aggregation, the forecast's
+// source and target boxes (absolute change, Success/Failure on market colors, the box as a hit
+// target; the target time stays, one line above upstream's outcome label). Shapes:
+// rotated-rectangle width handles, ellipse bounds handles, on-curve anchors with tangent extension
+// and chord fills, closed polylines, clip-aware flattening, end caps on arc, curve and double_curve
+// from `stroke_start`/`stroke_end`, and the rotated rectangle's and triangle's outline as one
+// seamless stroke. Re-applied on upstream's lowering instead: channel `extend_*`, the callout's tip
+// and box handles, the highlighter's once-filled tube, and the regression trend's dashed anchor
+// segment while it has no fit. Not restored, by owner decision (they would change upstream's anchor
+// or option contracts): a ray turned into a segment and the extended line's `extend_*` toggles, the
+// projection's independent sector radius (its third anchor), the price note's leader and label
+// offset (its second anchor), the bars pattern's box fit, the symmetric rotated rectangle placed
+// around its center axis, and a numeric fixed-square size. Also kept as upstream draws them
+// (docs/api/compatibility.md): the fork's boxed pattern point labels above highs and below lows,
+// the speed fan's time rays, ring, arc and wedge label placement, exact log-scale fib prices, the
+// pitchfork's A-B swing and B-C handle guides and always-red median, the Gann box's four-side
+// labels, the straighten modes, the fork's band and zone alphas, and the regression's sample
+// deviation.
 
 use super::kinds::DrawingFamily;
 use super::DrawingKind;

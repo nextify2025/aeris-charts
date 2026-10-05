@@ -47,23 +47,26 @@ use crate::{
 /// Channels-family options (`tool_options.channel`). Every field is optional: an absent field
 /// takes the tool's own default, so deep-merged patches, templates, and `null` resets never
 /// depend on which channel tool a block came from. The price channel reads `middle_line` and
-/// `middle_color`. The deviation fields are input aliases of upstream's regression trend
-/// `regression_deviations` (see `drawing_contract::take_legacy_flat_options`); the source and
-/// Pearson fields are stored but no longer rendered.
+/// `middle_color`. On upstream's regression trend the deviation fields and their switches are
+/// per-side overrides of the flat `regression_deviations` (an absent side follows it; see
+/// `drawing_contract::take_legacy_flat_options`); they, the source, and the Pearson field are
+/// stored, and the upstream-rendered kinds do not read the block yet. Every default is
+/// upstream's look; documents the fork wrote carry the fork's on-by-default middle line and
+/// Pearson's R explicitly (`super::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ChannelToolOptions {
-    /// Paint the dashed middle line (the regression line on a regression trend). Default: on
-    /// for the parallel channel and the regression trend, off for the others.
+    /// Paint the dashed middle line (the regression line on a regression trend). Default off;
+    /// the fork's parallel channels and regression trends carry it on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub middle_line: Option<bool>,
     /// Middle-line CSS color; absent or `""` follows the stroke color.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub middle_color: Option<String>,
-    /// Upper line offset in residual standard deviations (default 2).
+    /// Upper line offset in residual standard deviations; absent follows `regression_deviations`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upper_deviation: Option<f64>,
-    /// Lower line offset in residual standard deviations (default -2).
+    /// Lower line offset in residual standard deviations; absent follows `-regression_deviations`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lower_deviation: Option<f64>,
     /// Paint the upper deviation line and its zone (default true).
@@ -75,7 +78,8 @@ pub struct ChannelToolOptions {
     /// Source value of each bar (default close).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<IndicatorInputSource>,
-    /// Paint Pearson's R below the regression's start (default true).
+    /// Paint Pearson's R below the regression's start. Default off; the fork's regression trends
+    /// carry it on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_pearsons: Option<bool>,
 }
@@ -189,6 +193,21 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
             | DrawingKind::DisjointChannel
     ) {
         drawing.fill_enabled = true;
+    }
+}
+
+/// The fork's unstored `tool_options` defaults of the upstream channel tools it rendered (see
+/// [`super::legacy_fork_tool_options`]): the parallel channel's dashed middle line, and the
+/// regression trend's dashed centre line and Pearson's R. The fork skipped these unset options
+/// when writing, so its documents carry none of them.
+pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, serde_json::Value)> {
+    match kind {
+        DrawingKind::ParallelChannel => Some(("channel", serde_json::json!({"middle_line": true}))),
+        DrawingKind::RegressionTrend => Some((
+            "channel",
+            serde_json::json!({"middle_line": true, "show_pearsons": true}),
+        )),
+        _ => None,
     }
 }
 

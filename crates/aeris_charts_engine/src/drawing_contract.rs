@@ -495,11 +495,13 @@ pub enum DrawingKindOptions {
 /// The upstream catalog's flat [`Drawing`](crate::Drawing) fields are canonical. A block key that
 /// overlaps one of them (a Fibonacci tool's `fibonacci.reverse`, a Gann square's `gann.angles`,
 /// an Elliott wave's `pattern.degree`, a bars pattern's `projection_annotation.bars`, an icon
-/// stamp's `projection_annotation.icon`, a regression trend's `channel` deviations) is an input
-/// alias of that field: patches, templates, paste, and persistence move it onto the field through
-/// [`take_legacy_flat_options`], and the flat key wins when both are given. Every other key is
-/// stored and persisted, and read only by the family kinds (the own-line tools and the ranges);
-/// upstream-rendered kinds keep it inert.
+/// stamp's `projection_annotation.icon`) is an input alias of that field: patches, templates,
+/// paste, and persistence move it onto the field through [`take_legacy_flat_options`], and the
+/// flat key wins when both are given. Every other key (a regression trend's per-side `channel`
+/// deviations included) is stored and persisted, and read by the family kinds (the own-line tools
+/// and the ranges); the upstream-rendered kinds do not read it yet. Each block's defaults are
+/// upstream's look, and documents and payloads the fork wrote carry the fork's unstored defaults
+/// explicitly (`drawings::kinds::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DrawingToolOptions {
@@ -733,17 +735,22 @@ pub(crate) fn legacy_bars_pattern(bars: &[[f64; 4]]) -> Vec<crate::drawings::Bar
 ///   `log_scale` to `level_log_scale` (retracement, extension, channel); `show_prices` to
 ///   `level_show_prices`;
 ///   `show_levels` and `levels_as_percent` to `level_show_values` and `level_show_percents`;
-///   `label_h_align` to `level_label_align`.
-/// - Gann box, squares, and fan, block `gann`: `reverse` to `level_reverse`; on the squares,
-///   `angles` and `arcs` to `gann_fans` and `gann_arcs`.
+///   `label_h_align` to `level_label_align`, with `left` and `right` swapped on the time zones
+///   and trend time (the fork named the side of the line its label sat on; upstream names the
+///   edge of the text anchored at the line, so its `left` puts the label right of the line).
+/// - Gann box, squares, and fan, block `gann`: `reverse` to `level_reverse` (a fork document's
+///   fan drops it: the fork's fan never read it); on the squares, `angles` and `arcs` to
+///   `gann_fans` and `gann_arcs`.
 /// - Elliott waves, block `pattern`: `degree` to `wave_degree`.
 /// - Bars pattern, block `projection_annotation`: `bars_mode` to `bars_pattern_mode`, `mirrored`
 ///   and `flipped` to `bars_pattern_mirror_x` and `bars_pattern_mirror_y`, `bars` to
 ///   `bars_pattern`.
 /// - Icon stamp, block `projection_annotation`: `icon` and `icon_size` to `icon_name` and
 ///   `icon_size`.
-/// - Regression trend, block `channel`: the two deviation sides and their switches to
-///   `regression_deviations`.
+/// - Regression trend, block `channel`: nothing is taken. The two deviation sides and their
+///   switches are per-side overrides of `regression_deviations` and stay in the block; for a
+///   fork document they also fold into `regression_deviations` (the wider enabled side), and a
+///   symmetric band with both sides on leaves no key behind (it is that flat value alone).
 pub(crate) fn take_legacy_flat_options(
     kind: DrawingKind,
     tool_options: &mut serde_json::Value,
@@ -801,8 +808,16 @@ pub(crate) fn take_legacy_flat_options(
             "fibonacci" => serde_json::to_value(crate::FibonacciToolOptions::default()),
             "gann" => serde_json::to_value(crate::GannToolOptions::default()),
             "pattern" => serde_json::to_value(crate::PatternToolOptions::default()),
+            // Written out: the block serializes nothing at its defaults.
             "projection_annotation" => {
-                serde_json::to_value(crate::ProjectionAnnotationToolOptions::default())
+                let defaults = crate::ProjectionAnnotationToolOptions::default();
+                Ok(serde_json::json!({
+                    "bars_mode": defaults.bars_mode,
+                    "mirrored": defaults.mirrored,
+                    "flipped": defaults.flipped,
+                    "icon": defaults.icon,
+                    "icon_size": defaults.icon_size,
+                }))
             }
             _ => serde_json::to_value(crate::ChannelToolOptions::default()),
         };
@@ -840,21 +855,30 @@ pub(crate) fn take_legacy_flat_options(
             legacy.level_show_values = Some(show_levels && !as_percent);
             legacy.level_show_percents = Some(show_levels && as_percent);
         }
-        legacy.level_label_align = block.take("label_h_align", text).or_else(|| {
+        let time = matches!(
+            kind,
+            DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
+        );
+        legacy.level_label_align = block
+            .take("label_h_align", text)
             // The fork's unset alignment is the tool's own: time levels label their right.
-            absent_block_is_default.then(|| {
-                if matches!(
-                    kind,
-                    DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
-                ) {
-                    "right".to_string()
-                } else {
-                    "left".to_string()
-                }
+            .or_else(|| {
+                absent_block_is_default.then(|| (if time { "right" } else { "left" }).into())
             })
-        });
+            // The fork put a time level's label on the named side of its line; upstream's `left`
+            // and `right` name the edge of the text anchored at the line, so the label sits on
+            // the other side (`left` puts it right of the line).
+            .map(|align| match align.as_str() {
+                "left" if time => "right".to_string(),
+                "right" if time => "left".to_string(),
+                _ => align,
+            });
     } else if gann {
-        legacy.level_reverse = block.take("reverse", boolean);
+        // The fork's fan never read `reverse` (only a block's generic serialization carried it),
+        // so a document's is dropped; a patch keeps the documented alias.
+        let reverse = block.take("reverse", boolean);
+        legacy.level_reverse =
+            reverse.filter(|_| !(absent_block_is_default && kind == DrawingKind::GannFan));
         if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
             legacy.gann_fans = block.take("angles", |value| legacy_gann_family(value, true));
             legacy.gann_arcs = block.take("arcs", |value| legacy_gann_family(value, false));
@@ -882,29 +906,48 @@ pub(crate) fn take_legacy_flat_options(
             .take("icon_size", number)
             .map(|size| size.clamp(8.0, 96.0));
     } else {
-        // Regression trend: the fork's two deviation sides fold into one symmetric band at the
-        // wider enabled side. Every key is taken so none is left behind half-mapped.
-        let upper = block.take("upper_deviation", number);
-        let lower = block.take("lower_deviation", number);
-        let use_upper = block.take("use_upper_deviation", boolean);
-        let use_lower = block.take("use_lower_deviation", boolean);
-        if absent_block_is_default
-            || upper.is_some()
-            || lower.is_some()
-            || use_upper.is_some()
-            || use_lower.is_some()
-        {
-            let upper = if use_upper.unwrap_or(true) {
-                upper.unwrap_or(2.0).abs()
-            } else {
-                0.0
+        // Regression trend: the fork's deviation sides and their switches are per-side overrides
+        // of `regression_deviations` and stay in the block. A fork document's band also folds
+        // into that flat field (the wider enabled side), so readers of upstream's contract see
+        // the nearest symmetric band; a symmetric band with both sides on is nothing but that,
+        // and leaves no key behind, while any other band keeps its sides, an omitted side
+        // written as the fork's default, so it no longer depends on the fold.
+        if absent_block_is_default {
+            let read = |key: &str, read: fn(&serde_json::Value) -> Option<f64>, default: f64| {
+                block.stored.get(key).and_then(read).unwrap_or(default)
             };
-            let lower = if use_lower.unwrap_or(true) {
-                lower.unwrap_or(-2.0).abs()
+            let switch = |key: &str| block.stored.get(key).and_then(boolean).unwrap_or(true);
+            let (upper, lower) = (
+                read("upper_deviation", number, 2.0),
+                read("lower_deviation", number, -2.0),
+            );
+            let (use_upper, use_lower) =
+                (switch("use_upper_deviation"), switch("use_lower_deviation"));
+            let side = |enabled: bool, value: f64| if enabled { value.abs() } else { 0.0 };
+            legacy.regression_deviations = Some(
+                side(use_upper, upper)
+                    .max(side(use_lower, lower))
+                    .clamp(0.0, 10.0),
+            );
+            if use_upper && use_lower && upper == -lower && upper.abs() <= 10.0 {
+                for key in [
+                    "upper_deviation",
+                    "lower_deviation",
+                    "use_upper_deviation",
+                    "use_lower_deviation",
+                ] {
+                    block.stored.remove(key);
+                }
             } else {
-                0.0
-            };
-            legacy.regression_deviations = Some(upper.max(lower).clamp(0.0, 10.0));
+                block
+                    .stored
+                    .entry("upper_deviation")
+                    .or_insert(serde_json::json!(upper));
+                block
+                    .stored
+                    .entry("lower_deviation")
+                    .or_insert(serde_json::json!(lower));
+            }
         }
     }
     if !block.stored.is_empty() {
@@ -1323,20 +1366,86 @@ mod tests {
     }
 
     #[test]
+    fn legacy_tool_option_keys_keep_the_meaning_the_fork_gave_them() {
+        // The fork named the side of a time level its label sat on; upstream names the edge of
+        // the text anchored at the line (`left` puts the label right of it). Price levels mean
+        // the same in both.
+        for (kind, sent, mapped) in [
+            (DrawingKind::FibonacciTimeZones, "right", "left"),
+            (DrawingKind::FibonacciTrendTime, "left", "right"),
+            (DrawingKind::FibonacciTimeZones, "center", "center"),
+            (DrawingKind::FibonacciRetracement, "right", "right"),
+        ] {
+            let mut options = serde_json::json!({"fibonacci": {"label_h_align": sent}});
+            let legacy = take_legacy_flat_options(kind, &mut options, false);
+            assert_eq!(
+                legacy.level_label_align.as_deref(),
+                Some(mapped),
+                "{kind:?}"
+            );
+        }
+        // The fork's fan never read `reverse`: a document's is dropped, a patch's maps.
+        let mut options = serde_json::json!({"gann": {"reverse": true, "scale_ratio": 0.5}});
+        let legacy = take_legacy_flat_options(DrawingKind::GannFan, &mut options, true);
+        assert_eq!(legacy.level_reverse, None);
+        assert_eq!(options, serde_json::json!({"gann": {"scale_ratio": 0.5}}));
+        let mut options = serde_json::json!({"gann": {"reverse": true}});
+        let legacy = take_legacy_flat_options(DrawingKind::GannFan, &mut options, false);
+        assert_eq!(legacy.level_reverse, Some(true));
+        let mut options = serde_json::json!({"gann": {"reverse": true}});
+        let legacy = take_legacy_flat_options(DrawingKind::GannBox, &mut options, true);
+        assert_eq!(legacy.level_reverse, Some(true));
+        // The annotation block serializes nothing at its defaults, yet a fork document's absent
+        // keys still read as the fork's defaults.
+        assert_eq!(
+            serde_json::to_value(crate::ProjectionAnnotationToolOptions::default()).unwrap(),
+            serde_json::json!({})
+        );
+        let mut options = serde_json::json!({});
+        let legacy = take_legacy_flat_options(DrawingKind::IconStamp, &mut options, true);
+        assert_eq!(legacy.icon_name.as_deref(), Some("star"));
+        assert_eq!(legacy.icon_size, Some(24.0));
+        let legacy = take_legacy_flat_options(DrawingKind::BarsPattern, &mut options, true);
+        assert_eq!(legacy.bars_pattern_mode.as_deref(), Some("bars"));
+        assert_eq!(legacy.bars_pattern_mirror_x, Some(false));
+        assert_eq!(options, serde_json::json!({}));
+    }
+
+    #[test]
     fn legacy_tool_option_blocks_fold_into_upstream_values() {
-        // The regression's two sides fold into one band at the wider enabled side.
-        let mut options = serde_json::json!({"channel": {
+        // The regression's sides and switches are per-side overrides: a patch keeps them all and
+        // leaves `regression_deviations` alone.
+        let sides = serde_json::json!({"channel": {
             "upper_deviation": 3.0,
             "lower_deviation": -4.5,
             "use_lower_deviation": false,
             "middle_line": true
         }});
+        let mut options = sides.clone();
         let legacy = take_legacy_flat_options(DrawingKind::RegressionTrend, &mut options, false);
+        assert_eq!(legacy.regression_deviations, None);
+        assert_eq!(options, sides);
+        // A fork document's band also folds into one band at the wider enabled side, for
+        // upstream's readers, and keeps its sides.
+        let mut options = sides.clone();
+        let legacy = take_legacy_flat_options(DrawingKind::RegressionTrend, &mut options, true);
+        assert_eq!(legacy.regression_deviations, Some(3.0));
+        assert_eq!(options, sides);
+        // An omitted side is written as the fork's default, so the band no longer depends on the
+        // fold; a symmetric band with both sides on is the fold alone.
+        let mut options = serde_json::json!({"channel": {"upper_deviation": 3.0}});
+        let legacy = take_legacy_flat_options(DrawingKind::RegressionTrend, &mut options, true);
         assert_eq!(legacy.regression_deviations, Some(3.0));
         assert_eq!(
             options,
-            serde_json::json!({"channel": {"middle_line": true}})
+            serde_json::json!({"channel": {"upper_deviation": 3.0, "lower_deviation": -2.0}})
         );
+        let mut options = serde_json::json!({"channel": {
+            "upper_deviation": 1.5, "lower_deviation": -1.5, "use_upper_deviation": true
+        }});
+        let legacy = take_legacy_flat_options(DrawingKind::RegressionTrend, &mut options, true);
+        assert_eq!(legacy.regression_deviations, Some(1.5));
+        assert_eq!(options, serde_json::json!({}));
         // Bars keep their list position as their offset; invalid bars drop out.
         let mut options = serde_json::json!({"projection_annotation": {
             "bars_mode": "hl_bars",
@@ -1370,7 +1479,8 @@ mod tests {
         assert_eq!(legacy.level_reverse, Some(false));
         assert_eq!(legacy.level_show_values, Some(true));
         assert_eq!(legacy.level_show_percents, Some(false));
-        assert_eq!(legacy.level_label_align.as_deref(), Some("right"));
+        // The fork labelled time levels right of their lines: upstream's `left`.
+        assert_eq!(legacy.level_label_align.as_deref(), Some("left"));
         assert_eq!(
             legacy.level_log_scale, None,
             "time zones have no log levels"

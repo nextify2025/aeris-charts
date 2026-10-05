@@ -36,6 +36,9 @@ pub enum FibonacciLabelVAlign {
 /// `level_reverse`, `level_show_prices`, `level_log_scale`, `level_show_values`/
 /// `level_show_percents`, and `level_label_align` (see
 /// `drawing_contract::take_legacy_flat_options`); the other fields are stored but not rendered.
+/// Their defaults are upstream's look (no trend line, no fan grid), so a block a patch creates
+/// for one key switches nothing else on; documents the fork wrote get the fork's values through
+/// `kinds::legacy_fork_tool_options`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FibonacciToolOptions {
@@ -50,9 +53,11 @@ pub struct FibonacciToolOptions {
     pub levels_as_percent: bool,
     /// Interpolate price levels in log space (retracement, extension, channel). Default false.
     pub log_scale: bool,
-    /// Show the dashed trend line through the anchors. Default true.
+    /// Show the dashed trend line through the anchors. Default false (the fork's default, true,
+    /// reaches documents it wrote).
     pub trend_line: bool,
-    /// Show the speed resistance fan's grid. Default true.
+    /// Show the speed resistance fan's grid. Default false (the fork's default, true, reaches
+    /// documents it wrote).
     pub grid: bool,
     /// Draw speed resistance arcs as full circles. Default false.
     pub full_circles: bool,
@@ -74,8 +79,8 @@ impl Default for FibonacciToolOptions {
             show_prices: true,
             levels_as_percent: false,
             log_scale: false,
-            trend_line: true,
-            grid: true,
+            trend_line: false,
+            grid: false,
             full_circles: false,
             label_h_align: None,
             label_v_align: None,
@@ -174,6 +179,28 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
             drawing.style = LineStyle::Dashed;
         }
     }
+}
+
+/// The fork's unstored `tool_options.fibonacci` defaults (see
+/// `kinds::legacy_fork_tool_options`): the dashed trend line on the seven tools that drew one,
+/// the speed resistance fan's grid, and each tool's own vertical label placement (the fork wrote
+/// `label_v_align` only when set: middle on price levels, bottom on time levels).
+pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, serde_json::Value)> {
+    let block = match kind {
+        DrawingKind::FibonacciRetracement | DrawingKind::FibonacciExtension => {
+            serde_json::json!({"trend_line": true, "label_v_align": "middle"})
+        }
+        DrawingKind::FibonacciChannel => serde_json::json!({"label_v_align": "middle"}),
+        DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime => {
+            serde_json::json!({"trend_line": true, "label_v_align": "bottom"})
+        }
+        DrawingKind::FibonacciSpeedFan => serde_json::json!({"grid": true}),
+        DrawingKind::FibonacciSpeedArcs
+        | DrawingKind::FibonacciCircles
+        | DrawingKind::FibonacciSpiral => serde_json::json!({"trend_line": true}),
+        _ => return None,
+    };
+    Some(("fibonacci", block))
 }
 
 #[cfg(test)]
