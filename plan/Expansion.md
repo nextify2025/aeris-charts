@@ -27,7 +27,7 @@ items; they do not renumber them.
 
 ## Status at a glance
 
-Updated 2026-09-27. Baseline source-confirmed 2026-09-24.
+Updated 2026-10-04. Baseline source-confirmed 2026-09-24.
 
 | Batch | Scope | Unblocks on the platform | Status |
 | --- | --- | --- | --- |
@@ -37,8 +37,8 @@ Updated 2026-09-27. Baseline source-confirmed 2026-09-24.
 | B4 | Study inputs and core indicators: F4, OF9, CT1, CT2, CT6, I1 | Professional indicator set, VWAP bands, Heikin Ashi, comparisons | **Complete** |
 | B5 | Non-time bars and replay: F1, OF14, CT3, CT4, PD2 | Tick/volume/range charts, session replay, trade review playback | **Complete** |
 | B6 | Depth: F3, OF15–OF18, PD8, PD9 | Liquidity heatmap, order-level markers, depth studies | **Complete** |
-| B7 | Profiles and resampling: F6, OF3–OF8, OF10, CT5 | Session/composite profiles, TPO, anchored VWAP, multi-timeframe studies | Open |
-| B8 | Drawing catalog expansion | Full professional drawing toolset | Open |
+| B7 | Profiles and resampling: F6, OF3–OF8, OF10, CT5 | Session/composite profiles, TPO, anchored VWAP, multi-timeframe studies | **Complete** |
+| B8 | Drawing catalog expansion | Full professional drawing toolset | **Complete** |
 | B9 | Breadth and extension: I2, I3, I4, OF13 | Remaining indicators, custom studies, auction markers | Open |
 
 Ordering: B1–B3 serve the platform's first phase and are independent of each other. B4 must land
@@ -410,21 +410,30 @@ tolerance of the rectangle reference.
 
 ### B7 — Profiles and resampling
 
-**Scope:** F6, OF3–OF8, OF10, CT5. **Depends on:** B2, B3 and B4. **Status:** open.
+**Scope:** F6, OF3–OF8, OF10, CT5. **Depends on:** B2, B3 and B4. **Status:** complete (2026-10-04).
 
-- [ ] **F6** Engine-owned OHLCV resampling with host-supplied session boundaries and explicit
+- [x] **F6** Engine-owned OHLCV resampling with host-supplied session boundaries and explicit
       timezone policy.
-- [ ] **OF3** Session, daily, weekly and composite volume profiles with developing POC/VAH/VAL.
-- [ ] **OF4** Fixed-range volume profile drawing.
-- [ ] **OF5** Anchored volume profile drawing.
-- [ ] **OF6** Naked POC and value-area extension until touched.
-- [ ] **OF7** Delta profile and bid/ask split profile.
-- [ ] **OF8** TPO / Market Profile: letters or blocks, initial balance, single prints, POC, value
+- [x] **OF3** Session, daily, weekly and composite volume profiles with developing POC/VAH/VAL.
+- [x] **OF4** Fixed-range volume profile drawing.
+- [x] **OF5** Anchored volume profile drawing.
+- [x] **OF6** Naked POC and value-area extension until touched.
+- [x] **OF7** Delta profile and bid/ask split profile.
+- [x] **OF8** TPO / Market Profile: letters or blocks, initial balance, single prints, POC, value
       area, split/merge sessions.
-- [ ] **OF10** Anchored VWAP drawing with bands.
-- [ ] **CT5** Higher-timeframe overlay candles.
-- [ ] Multi-timeframe study inputs (for example a daily RSI on a 5-minute chart).
-- [ ] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+- [x] **OF10** Anchored VWAP drawing with bands.
+- [x] **CT5** Higher-timeframe overlay candles.
+- [x] Multi-timeframe study inputs (for example a daily RSI on a 5-minute chart).
+- [x] `docs/Architecture.md` updated; full gate green; batch committed and pushed.
+
+Host UTC boundaries drive both resampled OHLCV targets and periodic/composite profiles. Tape and
+candle fixtures cover gap exclusion, split/merge identity, developing values, naked-level touches,
+TPO cells, and drawing/frame invalidation. The package exposes typed resampling and profile APIs,
+and the shared frame paints bid/ask, delta, total, developing, naked-level and TPO presentations.
+The B7 gate passed Rust format, workspace and WASM Clippy, workspace tests, package install/lint/
+build/type/pack and release guards, GPUI tests and pixel parity, and 365 Chromium tests with three
+intentional skips. The release 100,000-candle periodic developing profile refreshed in 7.30 ms
+against the 16.67 ms frame budget on the local benchmark runner.
 
 **Exit:** tape and candle-mode profiles match reference fixtures, session boundaries come only from
 the host, and multi-timeframe studies rebuild deterministically.
@@ -432,27 +441,27 @@ the host, and multi-timeframe studies rebuild deterministically.
 ### B8 — Drawing catalog expansion
 
 **Scope:** every tool in the drawing catalog not yet delivered. **Depends on:** B2.
-**Status:** open.
+**Status:** complete.
 
 Every tool implements the F5 contract with schema, persistence, hit-testing and executor parity.
 
-- [ ] Lines: ray, extended line, info line, trend angle, cross line, arrow line.
-- [ ] Channels: parallel, regression trend, flat top/bottom, disjoint.
-- [ ] Fibonacci: retracement, trend-based extension, channel, time zones, trend-based time, speed
+- [x] Lines: ray, extended line, info line, trend angle, cross line, arrow line.
+- [x] Channels: parallel, regression trend, flat top/bottom, disjoint.
+- [x] Fibonacci: retracement, trend-based extension, channel, time zones, trend-based time, speed
       resistance fan and arcs, circles, spiral, wedge.
-- [ ] Pitchforks: Andrews, Schiff, modified Schiff, inside, pitchfan.
-- [ ] Projection and measuring: forecast, bars pattern, price range, date range, date and price
+- [x] Pitchforks: Andrews, Schiff, modified Schiff, inside, pitchfan.
+- [x] Projection and measuring: forecast, bars pattern, price range, date range, date and price
       range, projection.
-- [ ] Annotations: anchored text, note, price note, callout, comment, price label, signpost, flag,
+- [x] Annotations: anchored text, note, price note, callout, comment, price label, signpost, flag,
       arrow markers, bounded icon stamps.
-- [ ] Gann: box, square, square fixed, fan.
-- [ ] Patterns: XABCD, cypher, ABCD, head and shoulders, triangle, three drives.
-- [ ] Elliott waves: impulse, correction, triangle, double and triple combinations with degree
+- [x] Gann: box, square, square fixed, fan.
+- [x] Patterns: XABCD, cypher, ABCD, head and shoulders, triangle, three drives.
+- [x] Elliott waves: impulse, correction, triangle, double and triple combinations with degree
       labels.
-- [ ] Cycles: cyclic lines, time cycles, sine line.
-- [ ] Shapes: rotated rectangle, ellipse, circle, triangle, arc, curve, double curve, polyline,
+- [x] Cycles: cyclic lines, time cycles, sine line.
+- [x] Shapes: rotated rectangle, ellipse, circle, triangle, arc, curve, double curve, polyline,
       highlighter, with shared geometry on every executor.
-- [ ] Full gate green; batch committed and pushed.
+- [x] Full gate green; batch committed and pushed.
 
 **Exit:** every catalog tool is placeable, editable through its schema, persisted and identical on
 every executor.

@@ -397,8 +397,8 @@ fn interactive_placement_and_drag_commits_reach_already_synced_cells() {
     let line = trend(&mut a, point(2.0, 101.0), point(7.0, 103.0));
     assert!(sync(&a, &mut b), "the first payload syncs");
 
-    // Click placement of a family tool.
-    assert!(a.drawing_create_begin(DrawingKind::FibRetracement, None));
+    // Click placement of a two-anchor catalog tool.
+    assert!(a.drawing_create_begin(DrawingKind::FibonacciRetracement, None));
     let (x0, y0) = (x_at(&a, 1.0), y_at(&a, 102.0));
     let (x1, y1) = (x_at(&a, 5.0), y_at(&a, 105.0));
     assert_eq!(a.drawing_create_click(x0, y0, NO_KEYS), -1);
@@ -573,8 +573,8 @@ fn keyboard_nudges_that_move_nothing_report_false_and_record_nothing() {
     let recolored = trend(&mut chart, point(1.0, 101.0), point(4.0, 103.0));
     assert!(chart.drawing_apply_options(recolored, r##"{"color":"#00ff00"}"##));
     let recolor = chart.drawing(recolored).unwrap().clone();
-    // A time-only kind nudged vertically, a regression (time-only body) nudged vertically, and a
-    // pane-anchored text clamped at the pane's left edge.
+    // A time-only kind nudged vertically, an anchored VWAP (time-only body) nudged vertically, and
+    // an anchored text clamped at the pane's left edge.
     let cases = [
         (
             DrawingKind::VerticalLine,
@@ -582,18 +582,27 @@ fn keyboard_nudges_that_move_nothing_report_false_and_record_nothing() {
             (0.0, -1.0),
         ),
         (
-            DrawingKind::RegressionTrend,
-            vec![point(2.0, 101.0), point(8.0, 104.0)],
+            DrawingKind::AnchoredVwap,
+            vec![point(2.0, 101.0)],
             (0.0, -1.0),
         ),
         (
             DrawingKind::AnchoredText,
-            vec![point(0.0, 0.5)],
+            vec![chart
+                .drawing_from_px_for(0, crate::DrawingPriceScale::Right, 0.0, 120.0)
+                .unwrap()],
             (-1.0, 0.0),
         ),
     ];
     for (kind, points, (dx, dy)) in cases {
         let id = chart.add_drawing(kind, 0, points, None).unwrap();
+        if kind == DrawingKind::AnchoredText {
+            assert_eq!(
+                chart.drawing(id).unwrap().screen_x,
+                0.0,
+                "placed on the left edge"
+            );
+        }
         chart.set_selected_drawing(Some(id));
         let before = chart.drawing(id).unwrap().clone();
         let undo_depth = chart.drawing_history.undo.len();

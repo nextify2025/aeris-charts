@@ -9,7 +9,8 @@ use aeris_charts_render::draw_list::{RasterImage, TextAlign};
 use wasm_bindgen::{Clamped, JsCast, JsValue};
 use web_sys::{CanvasRenderingContext2d, ImageData, OffscreenCanvas};
 
-const IMAGE_CACHE_CAPACITY: usize = 16;
+// Accommodate all 32 chart-local drawing stamps alongside other retained raster images.
+const IMAGE_CACHE_CAPACITY: usize = 64;
 
 /// Per-chart decoded Canvas resources. Pixel payloads remain in the shared frame; this cache only
 /// avoids rebuilding an `ImageData`/canvas on every Canvas2D fallback frame.

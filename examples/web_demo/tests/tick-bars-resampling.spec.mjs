@@ -227,8 +227,8 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
     const derived_after = { hour: hour.data(), volume: hour_volume.data() };
     const expected = boundaries.flatMap((boundary) => {
       const bars = [];
-      for (let open = boundary.start_time; open < boundary.end_time; open += 3600) {
-        const inside = rows.filter((row) => row.time >= open && row.time < Math.min(open + 3600, boundary.end_time));
+      for (let open = boundary.startTime; open < boundary.endTime; open += 3600) {
+        const inside = rows.filter((row) => row.time >= open && row.time < Math.min(open + 3600, boundary.endTime));
         if (inside.length === 0) continue;
         bars.push({ time: open, rows: inside.length });
       }
@@ -254,10 +254,10 @@ test("minute bars resample to A-share 60-minute bars and follow live updates", a
 
   expect(errors).toEqual([]);
   expect(result.boundaries).toHaveLength(4);
-  expect(result.boundaries[0].session_id).toBe(20260924);
+  expect(result.boundaries[0].sessionId).toBe(20260924);
   expect(result.local).toEqual(["09:30", "10:30", "13:00", "14:00", "09:30", "10:30", "13:00", "14:00"]);
-  expect(result.bars.map((bar) => ({ time: bar.time, rows: bar.source_rows }))).toEqual(result.expected);
-  expect(result.bars.every((bar) => bar.source_rows === 60)).toBe(true);
+  expect(result.bars.map((bar) => ({ time: bar.timestamp, rows: bar.sourceRows }))).toEqual(result.expected);
+  expect(result.bars.every((bar) => bar.sourceRows === 60)).toBe(true);
   expect(result.volume[0]).toBe(result.first_hour_volume);
   expect(result.configured).toMatchObject({ rebuilds: 1, tail_refreshes: 0 });
   for (const step of result.live) {
@@ -672,9 +672,9 @@ test("US daily bars from extended-hours minutes follow the exchange day across D
   expect(result.minutes).toBe(1920);
   expect(result.bars).toHaveLength(2);
   // 04:00 Eastern opens each day: 09:00 UTC in winter, 08:00 UTC after the change.
-  expect(result.bars[0].time).toBe(Date.UTC(2024, 2, 8, 9) / 1000);
-  expect(result.bars[1].time).toBe(Date.UTC(2024, 2, 11, 8) / 1000);
-  expect(result.bars.map((bar) => bar.source_rows)).toEqual([960, 960]);
+  expect(result.bars[0].timestamp).toBe(Date.UTC(2024, 2, 8, 9) / 1000);
+  expect(result.bars[1].timestamp).toBe(Date.UTC(2024, 2, 11, 8) / 1000);
+  expect(result.bars.map((bar) => bar.sourceRows)).toEqual([960, 960]);
   // Friday's session runs past UTC midnight (19:59 EST is 00:59 UTC Saturday) inside one bar.
   expect(result.friday_last_minute).toBe(Date.UTC(2024, 2, 9, 0, 59) / 1000);
   expect(result.bars[0].close).toBeCloseTo(100.5 + 959 / 100, 10);

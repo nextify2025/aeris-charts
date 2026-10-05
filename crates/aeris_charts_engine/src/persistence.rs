@@ -32,6 +32,22 @@ const MAX_TEXT_BYTES: usize = crate::MAX_DRAWING_TEXT_BYTES;
 const MAX_TOTAL_TEXT_BYTES: usize = 1_048_576;
 const MAX_COLOR_BYTES: usize = 256;
 const MAX_STYLE_NUMBER: f64 = 1_000.0;
+/// Revision of the drawing catalog a document's anchors and kind names follow: 2 is
+/// AerisTerminal's B8 catalog (upstream kind names and anchor contracts). Every export writes it
+/// as `drawing_catalog`; a document without it was written before the fork adopted that catalog
+/// (by the fork, whose B8 tools are converted on load, or by an upstream pin, which loads as is).
+const DRAWING_CATALOG_REVISION: u32 = 2;
+/// The fork's own-line tools, which AerisTerminal's catalog does not have: a document without the
+/// catalog marker that names one was written by the fork.
+const OWN_LINE_KIND_NAMES: [&str; 7] = [
+    "horizontal_segment",
+    "vertical_ray",
+    "vertical_segment",
+    "price_line",
+    "price_channel",
+    "simple_tag",
+    "simple_annotation",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistenceRestoreResult {
@@ -90,6 +106,9 @@ struct StateV1 {
     /// Host-defined price basis of the drawing prices (optional; no schema bump).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drawing_price_basis: Option<String>,
+    /// [`DRAWING_CATALOG_REVISION`] of the drawings; absent in documents written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drawing_catalog: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -106,6 +125,8 @@ struct StateV2 {
     chart_options: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drawing_price_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drawing_catalog: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -118,6 +139,8 @@ struct StateV3 {
     indicators: Vec<IndicatorV3>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drawing_price_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drawing_catalog: Option<u32>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -235,6 +258,28 @@ struct DrawingStyleV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     position_risk_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    regression_source_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regression_deviations: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wave_degree: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screen_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screen_y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bars_pattern: Option<Vec<crate::drawings::BarsPatternBar>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bars_pattern_mirror_x: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bars_pattern_mirror_y: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bars_pattern_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<String>,
@@ -264,6 +309,22 @@ struct DrawingStyleV1 {
     labels: Option<Vec<crate::DrawingLabelOptions>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     levels: Option<Vec<crate::DrawingLevel>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gann_fans: Option<Vec<crate::DrawingLevel>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gann_arcs: Option<Vec<crate::DrawingLevel>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level_reverse: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level_log_scale: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level_show_prices: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level_show_values: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level_show_percents: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level_label_align: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     price_scale_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -308,9 +369,12 @@ struct DrawingStyleV1 {
     box_border_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     box_border_width: Option<f64>,
-    /// B8 family option blocks; omitted when they equal the kind's defaults.
+    /// The fork's B8 option blocks ([`crate::DrawingToolOptions`]); omitted when they equal the
+    /// kind's defaults. Kept as JSON so restore sees which keys a document carried: a key that
+    /// overlaps an upstream flat field moves onto that field (`take_legacy_flat_options`) before
+    /// the rest is parsed, and is never written back.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_options: Option<crate::DrawingToolOptions>,
+    tool_options: Option<serde_json::Value>,
 }
 
 fn pane_wire_id(id: u32) -> String {
@@ -584,6 +648,373 @@ fn remap_indicator_source(
     }
 }
 
+/// Fill a style field the document left out with a value read from elsewhere in the document.
+fn fill_absent<T>(field: &mut Option<T>, value: Option<T>) {
+    if field.is_none() {
+        *field = value;
+    }
+}
+
+/// A drawing's `tool_options` as written: omitted when they equal the kind's defaults, and without
+/// the keys written as an upstream flat field instead (`take_legacy_flat_options`).
+fn exported_tool_options(
+    drawing: &Drawing,
+    defaults: &Drawing,
+) -> Result<Option<serde_json::Value>, ChartError> {
+    if drawing.tool_options == defaults.tool_options {
+        return Ok(None);
+    }
+    let mut value = serde_json::to_value(&drawing.tool_options)
+        .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
+    let taken = crate::drawing_contract::take_legacy_flat_options(drawing.kind, &mut value, false)
+        != crate::drawing_contract::LegacyFlatOptions::default();
+    let emptied = taken && value.as_object().is_some_and(serde_json::Map::is_empty);
+    Ok((!emptied).then_some(value))
+}
+
+/// Whether a document was written by the fork before it adopted AerisTerminal's B8 catalog. Only
+/// a document without the catalog marker can be, and only one that carries something the fork
+/// wrote and no upstream pin does: a fork tool name, an anchor time, a `tool_options` block, a
+/// drawing price basis, an anchored text positioned by its anchor alone, or a B8 drawing without
+/// a field upstream writes for every drawing of its kind ([`lacks_upstream_b8_fields`]). Such a
+/// document gets the anchor conversions whose stored anchor count is the same in both catalogs,
+/// and the fork's defaults for every value it omitted.
+fn written_by_legacy_fork(state: &StateV1) -> bool {
+    state.drawing_catalog.is_none()
+        && (state.drawing_price_basis.is_some()
+            || state.drawings.iter().any(|item| {
+                crate::drawings::LEGACY_DRAWING_KIND_NAMES
+                    .iter()
+                    .any(|(name, _)| *name == item.kind)
+                    || OWN_LINE_KIND_NAMES.contains(&item.kind.as_str())
+                    || item.anchors.iter().any(|anchor| anchor.time.is_some())
+                    || item.style.tool_options.is_some()
+                    || (item.kind == DrawingKind::AnchoredText.name()
+                        && item.style.screen_x.is_none())
+                    || lacks_upstream_b8_fields(item)
+            }))
+}
+
+/// Whether `item` is a B8 drawing stored without a field upstream's exporter writes for every
+/// drawing of its kind: the level flags of a leveled tool, a regression's deviations, an icon
+/// stamp's size, a bars pattern's snapshot, an Elliott wave's degree. Upstream pins before the B8
+/// catalog had none of these kinds, and the fork never wrote these fields (it kept their values
+/// in `tool_options` or left them at its defaults), so this tells a fork document apart even when
+/// nothing else does: on a sequence axis (trade-count, volume, or range bars) the fork wrote no
+/// anchor `time`, and a drawing with default options carried no `tool_options`.
+fn lacks_upstream_b8_fields(item: &DrawingV1) -> bool {
+    let Some(kind) = DrawingKind::from_name(&item.kind) else {
+        return false;
+    };
+    let style = &item.style;
+    (kind.has_levels() && style.level_reverse.is_none())
+        || (kind == DrawingKind::RegressionTrend && style.regression_deviations.is_none())
+        || (kind == DrawingKind::IconStamp && style.icon_size.is_none())
+        || (kind == DrawingKind::BarsPattern && style.bars_pattern.is_none())
+        || (kind.is_elliott() && style.wave_degree.is_none())
+}
+
+/// The kind a stored drawing names. The fork's `flat_top_bottom` was one tool for both upstream
+/// channels: a third anchor on or above the base line through the first two is a flat top, one
+/// below it a flat bottom.
+fn stored_drawing_kind(name: &str, anchors: &[DrawingAnchor]) -> Option<DrawingKind> {
+    if name == "flat_top_bottom" {
+        if let [a, b, c] = anchors {
+            if let (Some(a_logical), Some(b_logical), Some(c_logical)) =
+                (a.logical, b.logical, c.logical)
+            {
+                let base = if a_logical == b_logical {
+                    a.price.max(b.price)
+                } else {
+                    a.price
+                        + (b.price - a.price) * (c_logical - a_logical) / (b_logical - a_logical)
+                };
+                return Some(if c.price >= base {
+                    DrawingKind::FlatTopChannel
+                } else {
+                    DrawingKind::FlatBottomChannel
+                });
+            }
+        }
+    }
+    DrawingKind::from_name(name)
+}
+
+/// One anchor of a fork drawing converted to the upstream anchor contract.
+struct MigratedAnchor {
+    anchor: DrawingAnchor,
+    /// The stored anchor whose time identity (`time` and `anchor_times_micros`) this anchor
+    /// keeps; it sits at that anchor's logical position. `None` for an anchor placed elsewhere.
+    identity: Option<usize>,
+}
+
+/// The upstream anchors of a drawing the fork stored under its own anchor contract, or `None`
+/// when the stored anchors already follow the upstream one. Conversions keyed by an anchor count
+/// that upstream never stores apply to any document; those whose count is the same in both
+/// catalogs apply only to a `legacy_fork` document. A conversion that needs a logical position
+/// the stored anchor lacks (a time-only anchor) does not apply.
+fn migrate_fork_anchors(
+    kind: DrawingKind,
+    anchors: &[DrawingAnchor],
+    tool_options: Option<&serde_json::Value>,
+    legacy_fork: bool,
+) -> Option<Vec<MigratedAnchor>> {
+    let keep = |index: usize| MigratedAnchor {
+        anchor: anchors[index],
+        identity: Some(index),
+    };
+    // At stored anchor `index`'s logical position (and time identity), at another price.
+    let beside = |index: usize, price: f64| MigratedAnchor {
+        anchor: DrawingAnchor {
+            price,
+            ..anchors[index]
+        },
+        identity: Some(index),
+    };
+    let placed = |logical: f64, price: f64, time: Option<f64>| MigratedAnchor {
+        anchor: DrawingAnchor {
+            logical: Some(logical),
+            price,
+            time,
+        },
+        identity: None,
+    };
+    let logicals = || {
+        anchors
+            .iter()
+            .map(|anchor| anchor.logical)
+            .collect::<Option<Vec<f64>>>()
+    };
+    let price = |index: usize| anchors[index].price;
+    // Halfway between the first two stored anchors (times by the same weights).
+    let midpoint = || {
+        let logical = logicals()?;
+        let time = anchors[0]
+            .time
+            .zip(anchors[1].time)
+            .map(|(first, second)| (first + second) / 2.0);
+        Some(placed(
+            (logical[0] + logical[1]) / 2.0,
+            (price(0) + price(1)) / 2.0,
+            time,
+        ))
+    };
+    match (kind, anchors.len()) {
+        // The mirrored-slope second line through the third anchor becomes two explicit anchors.
+        (DrawingKind::DisjointChannel, 3) => {
+            let logical = logicals()?;
+            Some(if logical[0] == logical[1] {
+                vec![keep(0), keep(1), beside(2, price(0)), beside(2, price(1))]
+            } else {
+                let slope = (price(1) - price(0)) / (logical[1] - logical[0]);
+                vec![
+                    keep(0),
+                    keep(1),
+                    beside(0, price(2) - slope * (logical[0] - logical[2])),
+                    beside(1, price(2) - slope * (logical[1] - logical[2])),
+                ]
+            })
+        }
+        // The fixed square's side came from its options; upstream stores the opposite corner.
+        (DrawingKind::GannSquareFixed, 1) => {
+            let logical = anchors[0].logical?;
+            let gann = tool_options.and_then(|options| options.get("gann"));
+            let option = |key: &str| gann.and_then(|gann| gann.get(key));
+            let size = option("size_bars")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(20.0)
+                .clamp(1.0, crate::MAX_GANN_SQUARE_BARS);
+            let direction = if option("reverse").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                -1.0
+            } else {
+                1.0
+            };
+            // Without a scale ratio the fork kept the square square on screen; no price per bar
+            // reproduces that, so the corner takes one the anchor's price magnitude sets.
+            let per_bar = option("scale_ratio")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+                .unwrap_or_else(|| price(0).abs().max(1.0));
+            Some(vec![
+                keep(0),
+                placed(logical + size, price(0) + direction * size * per_bar, None),
+            ])
+        }
+        // Apex and projected price; the time horizon anchor (the sector radius) has no place.
+        (DrawingKind::Projection, 3) => Some(vec![keep(0), keep(2)]),
+        // The priced point; the label offset anchor has no place.
+        (DrawingKind::PriceNote, 2) => Some(vec![keep(0)]),
+        // The pole's top starts at its foot.
+        (DrawingKind::Signpost, 1) => Some(vec![keep(0), keep(0)]),
+        // The box between the two anchors stays; the target places the first copied bar's close
+        // where the fork's box fit drew it.
+        (DrawingKind::BarsPattern, 2) => {
+            let logical = logicals()?;
+            let bars = tool_options
+                .and_then(|options| options.get("projection_annotation"))
+                .and_then(|block| block.get("bars"))
+                .and_then(|bars| serde_json::from_value::<Vec<[f64; 4]>>(bars.clone()).ok())
+                .map(|bars| crate::drawing_contract::legacy_bars_pattern(&bars))
+                .unwrap_or_default();
+            let (box_low, box_high) = (price(0).min(price(1)), price(0).max(price(1)));
+            let source_low = bars.iter().map(|bar| bar.low).fold(f64::INFINITY, f64::min);
+            let source_high = bars
+                .iter()
+                .map(|bar| bar.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let target = match bars.first() {
+                Some(first) if source_high > source_low => {
+                    box_low
+                        + (first.close - source_low) * (box_high - box_low)
+                            / (source_high - source_low)
+                }
+                _ => box_low,
+            };
+            let earlier = usize::from(logical[1] < logical[0]);
+            Some(vec![keep(0), keep(1), beside(earlier, target)])
+        }
+        // E extends the A-C side by the D-C span past D.
+        (DrawingKind::PatternTriangle, 4) => {
+            let logical = logicals()?;
+            let e_logical = logical[3] + (logical[3] - logical[2]);
+            let e_price = if logical[0] == logical[2] {
+                price(2)
+            } else {
+                price(0)
+                    + (price(2) - price(0)) * (e_logical - logical[0]) / (logical[2] - logical[0])
+            };
+            Some(vec![
+                keep(0),
+                keep(1),
+                keep(2),
+                keep(3),
+                placed(e_logical, e_price, None),
+            ])
+        }
+        // Upstream's three drives end at the third drive; the fork's last leg has no place.
+        (DrawingKind::PatternThreeDrives, 7) => Some((0..6).map(keep).collect()),
+        // The fork stored the arc's ends first and its through point last.
+        (DrawingKind::Arc, 3) if legacy_fork => Some(vec![keep(0), keep(2), keep(1)]),
+        // The fork's on-curve midpoint becomes the quadratic Bezier control point.
+        (DrawingKind::Curve, 3) if legacy_fork => {
+            let logical = logicals()?;
+            Some(vec![
+                keep(0),
+                placed(
+                    2.0 * logical[2] - (logical[0] + logical[1]) / 2.0,
+                    2.0 * price(2) - (price(0) + price(1)) / 2.0,
+                    None,
+                ),
+                keep(1),
+            ])
+        }
+        // The fork's on-curve points at a third and two thirds become the cubic Bezier control
+        // points; an affine combination, so times convert by the same weights.
+        (DrawingKind::DoubleCurve, 4) if legacy_fork => {
+            let logical = logicals()?;
+            let prices = [price(0), price(1), price(2), price(3)];
+            let times = anchors
+                .iter()
+                .map(|anchor| anchor.time)
+                .collect::<Option<Vec<f64>>>();
+            // Weights over the stored [a, b, p, q].
+            let combine = |weights: [f64; 4], values: &[f64]| {
+                weights
+                    .iter()
+                    .zip(values)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>()
+            };
+            let control = |weights: [f64; 4]| {
+                placed(
+                    combine(weights, &logical),
+                    combine(weights, &prices),
+                    times.as_deref().map(|times| combine(weights, times)),
+                )
+            };
+            Some(vec![
+                keep(0),
+                control([-5.0 / 6.0, 1.0 / 3.0, 3.0, -1.5]),
+                control([1.0 / 3.0, -5.0 / 6.0, -1.5, 3.0]),
+                keep(1),
+            ])
+        }
+        // The fork's symmetric rectangle (an axis and a half-width point) becomes an edge plus a
+        // depth handle on the opposite edge.
+        (DrawingKind::RotatedRectangle, 3) if legacy_fork => {
+            let logical = logicals()?;
+            Some(if logical[0] != logical[1] {
+                let slope = (price(1) - price(0)) / (logical[1] - logical[0]);
+                let delta = price(2) - (price(0) + slope * (logical[2] - logical[0]));
+                vec![
+                    beside(0, price(0) + delta),
+                    beside(1, price(1) + delta),
+                    beside(0, price(0) - delta),
+                ]
+            } else {
+                let delta = logical[2] - logical[0];
+                vec![
+                    placed(logical[0] + delta, price(0), None),
+                    placed(logical[1] + delta, price(1), None),
+                    placed(logical[0] - delta, price(0), None),
+                ]
+            })
+        }
+        // The fork turned its speed arcs around the first anchor; upstream's center is the
+        // second, so the anchors swap (the half circles now open toward the other anchor rather
+        // than up or down).
+        (DrawingKind::FibonacciSpeedArcs, 2) if legacy_fork => Some(vec![keep(1), keep(0)]),
+        // The fork centered its circles between the anchors with half their distance as the unit
+        // radius; upstream centers them on the second anchor at the full distance, so the second
+        // anchor moves to the midpoint.
+        (DrawingKind::FibonacciCircles, 2) if legacy_fork => Some(vec![keep(0), midpoint()?]),
+        // The fork's sine anchors were opposite extremes half a period apart; upstream's are a
+        // zero crossing and the next extreme a quarter period on. The midpoint is that zero
+        // crossing, so the wave is the same (upstream draws it from there on).
+        (DrawingKind::SineLine, 2) if legacy_fork => Some(vec![midpoint()?, keep(1)]),
+        _ => None,
+    }
+}
+
+/// Convert a clipboard or drawing-sync item a fork build wrote to upstream's contracts: anchors
+/// stored under an anchor count upstream never stores take the same conversions a document gets
+/// (only those; the same-count ones need a document's provenance), a fork bars pattern without a
+/// snapshot takes its `tool_options` bars, and a fork anchored text (its options carry no
+/// `screen_x`; every upstream payload writes one) takes its pane-fraction anchor as its screen
+/// position. Items already on upstream's contracts are left as they are.
+pub(crate) fn migrate_fork_payload_item(item: &mut crate::DrawingClipboardItem) {
+    let tool_options = item.options.get("tool_options");
+    if !item.kind.valid_point_count(item.points.len()) {
+        if let Some(migrated) = migrate_fork_anchors(item.kind, &item.points, tool_options, false) {
+            item.points = migrated.into_iter().map(|anchor| anchor.anchor).collect();
+        }
+    }
+    if item.kind == DrawingKind::BarsPattern && item.bars_pattern.is_none() {
+        item.bars_pattern = tool_options
+            .and_then(|options| options.get("projection_annotation"))
+            .and_then(|block| block.get("bars"))
+            .and_then(|bars| serde_json::from_value::<Vec<[f64; 4]>>(bars.clone()).ok())
+            .map(|bars| crate::drawing_contract::legacy_bars_pattern(&bars))
+            .filter(|bars| !bars.is_empty());
+    }
+    if item.kind == DrawingKind::AnchoredText && item.options.get("screen_x").is_none() {
+        if let (Some(anchor), Some(options)) =
+            (item.points.first_mut(), item.options.as_object_mut())
+        {
+            anchor.time = None;
+            options.insert(
+                "screen_x".to_string(),
+                serde_json::json!(anchor.logical.unwrap_or(0.5).clamp(0.0, 1.0)),
+            );
+            options.insert(
+                "screen_y".to_string(),
+                serde_json::json!(anchor.price.clamp(0.0, 1.0)),
+            );
+        }
+    }
+}
+
 impl ChartEngine {
     /// Deterministic JSON of stable chart state. Financial-only charts retain the V1 wire format.
     pub fn export_state_json(&self) -> Result<String, ChartError> {
@@ -612,9 +1043,7 @@ impl ChartEngine {
         if self.indicators.len() > PERSISTENCE_MAX_INDICATORS {
             return Err(resource("indicator count exceeds the persistence limit"));
         }
-        let base_json = self.export_state_v1_json()?;
-        let base: StateV1 = serde_json::from_str(&base_json)
-            .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
+        let base = self.export_state_v1()?;
         let indicators = self
             .indicators
             .iter()
@@ -660,6 +1089,7 @@ impl ChartEngine {
             drawings: base.drawings,
             indicators,
             drawing_price_basis: base.drawing_price_basis,
+            drawing_catalog: base.drawing_catalog,
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
         if document.len() > PERSISTENCE_MAX_DOCUMENT_BYTES {
@@ -693,6 +1123,14 @@ impl ChartEngine {
     }
 
     fn export_state_v1_json(&self) -> Result<String, ChartError> {
+        serde_json::to_string(&self.export_state_v1()?)
+            .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))
+    }
+
+    /// The V1 state, which the V2 and V3 documents embed as a value. Reparsing the V1 JSON instead
+    /// would deserialize export's own output and compile a second (string-reader) deserializer of
+    /// the whole drawing tree into the module.
+    fn export_state_v1(&self) -> Result<StateV1, ChartError> {
         let panes = self
             .panes
             .iter()
@@ -748,6 +1186,35 @@ impl ChartEngine {
                             DrawingKind::LongPosition | DrawingKind::ShortPosition
                         )
                         .then_some(drawing.position_risk_percent),
+                        regression_source_id: (drawing.kind == DrawingKind::RegressionTrend)
+                            .then_some(drawing.regression_source_id)
+                            .flatten(),
+                        regression_deviations: (drawing.kind == DrawingKind::RegressionTrend)
+                            .then_some(drawing.regression_deviations),
+                        wave_degree: drawing
+                            .kind
+                            .is_elliott()
+                            .then(|| drawing.wave_degree.clone()),
+                        screen_x: (drawing.kind == DrawingKind::AnchoredText)
+                            .then_some(drawing.screen_x),
+                        screen_y: (drawing.kind == DrawingKind::AnchoredText)
+                            .then_some(drawing.screen_y),
+                        icon_name: (drawing.kind == DrawingKind::IconStamp)
+                            .then(|| drawing.icon_name.clone())
+                            .flatten(),
+                        icon_size: (drawing.kind == DrawingKind::IconStamp)
+                            .then_some(drawing.icon_size),
+                        bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
+                            .then(|| drawing.bars_pattern.clone()),
+                        bars_pattern_mirror_x: (drawing.kind == DrawingKind::BarsPattern
+                            && drawing.bars_pattern_mirror_x)
+                            .then_some(true),
+                        bars_pattern_mirror_y: (drawing.kind == DrawingKind::BarsPattern
+                            && drawing.bars_pattern_mirror_y)
+                            .then_some(true),
+                        bars_pattern_mode: (drawing.kind == DrawingKind::BarsPattern
+                            && drawing.bars_pattern_mode != "bars")
+                            .then(|| drawing.bars_pattern_mode.clone()),
                         name: (!drawing.name.is_empty()).then(|| drawing.name.clone()),
                         group_id: drawing.group_id.clone(),
                         revision: (drawing.revision != 1).then_some(drawing.revision),
@@ -772,6 +1239,37 @@ impl ChartEngine {
                             .then_some(drawing.magnet),
                         labels: (drawing.labels != defaults.labels).then(|| drawing.labels.clone()),
                         levels: (drawing.levels != defaults.levels).then(|| drawing.levels.clone()),
+                        gann_fans: matches!(
+                            drawing.kind,
+                            DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+                        )
+                        .then(|| drawing.gann_fans.clone()),
+                        gann_arcs: matches!(
+                            drawing.kind,
+                            DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+                        )
+                        .then(|| drawing.gann_arcs.clone()),
+                        level_reverse: drawing.kind.has_levels().then_some(drawing.level_reverse),
+                        level_log_scale: drawing
+                            .kind
+                            .has_levels()
+                            .then_some(drawing.level_log_scale),
+                        level_show_prices: drawing
+                            .kind
+                            .has_levels()
+                            .then_some(drawing.level_show_prices),
+                        level_show_values: drawing
+                            .kind
+                            .has_levels()
+                            .then_some(drawing.level_show_values),
+                        level_show_percents: drawing
+                            .kind
+                            .has_levels()
+                            .then_some(drawing.level_show_percents),
+                        level_label_align: drawing
+                            .kind
+                            .has_levels()
+                            .then(|| drawing.level_label_align.clone()),
                         price_scale_id: (drawing.price_scale != DrawingPriceScale::Right)
                             .then(|| drawing.price_scale.name().to_string()),
                         color: Some(drawing.color.clone()),
@@ -797,25 +1295,23 @@ impl ChartEngine {
                         box_color: drawing.box_color.clone(),
                         box_border_color: drawing.box_border_color.clone(),
                         box_border_width: Some(drawing.box_border_width),
-                        tool_options: (drawing.tool_options != defaults.tool_options)
-                            .then(|| drawing.tool_options.clone()),
+                        tool_options: exported_tool_options(drawing, &defaults)?,
                     },
                 })
             })
             .collect::<Result<Vec<_>, ChartError>>()?;
-        serde_json::to_string(&StateV1 {
+        Ok(StateV1 {
             schema: "aeris_charts-state".to_string(),
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             panes,
             drawings,
             drawing_price_basis: self.drawing_price_basis().map(str::to_string),
+            drawing_catalog: Some(DRAWING_CATALOG_REVISION),
         })
-        .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))
     }
 
     fn export_state_v2_json(&self) -> Result<String, ChartError> {
-        let base: StateV1 = serde_json::from_str(&self.export_state_v1_json()?)
-            .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
+        let base = self.export_state_v1()?;
         let panes = base
             .panes
             .into_iter()
@@ -1187,6 +1683,7 @@ impl ChartEngine {
             references,
             chart_options: self.options.value().clone(),
             drawing_price_basis: base.drawing_price_basis,
+            drawing_catalog: base.drawing_catalog,
         })
         .map_err(|error| ChartError::new(ErrorCode::SerializationError, error.to_string()))?;
         if document.len() > PERSISTENCE_MAX_GENERAL_DOCUMENT_BYTES {
@@ -1264,6 +1761,8 @@ impl ChartEngine {
             )));
         }
 
+        // Read before the panes move out of the document.
+        let legacy_fork = written_by_legacy_fork(&state);
         let mut pane_ids = HashSet::with_capacity(state.panes.len());
         let mut panes = Vec::with_capacity(state.panes.len());
         let mut max_persistent_pane_id = 0;
@@ -1311,7 +1810,7 @@ impl ChartEngine {
                     item.id
                 )));
             }
-            let kind = DrawingKind::from_name(&item.kind)
+            let kind = stored_drawing_kind(&item.kind, &item.anchors)
                 .ok_or_else(|| invalid(format!("unknown drawing kind {:?}", item.kind)))?;
             if item.anchors.len() > PERSISTENCE_MAX_POINTS_PER_DRAWING {
                 return Err(resource(format!(
@@ -1327,34 +1826,65 @@ impl ChartEngine {
                     item.id
                 )));
             }
+            let mut anchors = item.anchors;
+            let mut anchor_times_micros = item.anchor_times_micros;
+            let mut style = item.style;
+            let mut tool_options = style.tool_options.take();
+            // A drawing the fork stored under its own anchor contract converts to upstream's
+            // before the anchor count is checked: restore is atomic, so one such drawing would
+            // otherwise reject the whole layout.
+            let migrated = migrate_fork_anchors(kind, &anchors, tool_options.as_ref(), legacy_fork);
+            let converted_bars_pattern = migrated.is_some() && kind == DrawingKind::BarsPattern;
+            if let Some(migrated) = migrated {
+                if !anchor_times_micros.is_empty() {
+                    anchor_times_micros = migrated
+                        .iter()
+                        .map(|anchor| anchor.identity.and_then(|index| anchor_times_micros[index]))
+                        .collect();
+                }
+                anchors = migrated.into_iter().map(|anchor| anchor.anchor).collect();
+            }
+            // The fork placed an anchored text by its anchor alone, a pane fraction. Upstream
+            // places it by `screen_x`/`screen_y`; the anchor stays, inert, without time identity.
+            let pane_position = if kind == DrawingKind::AnchoredText && style.screen_x.is_none() {
+                anchors.first_mut().map(|anchor| {
+                    anchor.time = None;
+                    (
+                        anchor.logical.unwrap_or(0.5).clamp(0.0, 1.0),
+                        anchor.price.clamp(0.0, 1.0),
+                    )
+                })
+            } else {
+                None
+            };
+            if pane_position.is_some() {
+                if let Some(time) = anchor_times_micros.first_mut() {
+                    *time = None;
+                }
+            }
             total_points = total_points
-                .checked_add(item.anchors.len())
+                .checked_add(anchors.len())
                 .ok_or_else(|| resource("drawing anchor count overflow"))?;
             if total_points > PERSISTENCE_MAX_TOTAL_POINTS {
                 return Err(resource(format!(
                     "V1 supports at most {PERSISTENCE_MAX_TOTAL_POINTS} total anchors"
                 )));
             }
-            if !kind.valid_point_count(item.anchors.len()) {
+            if !kind.valid_point_count(anchors.len()) {
                 return Err(invalid(format!(
                     "drawing {} has an invalid anchor count",
                     item.id
                 )));
             }
-            // Pane-anchored anchors are pane fractions with no time identity.
-            let pane_anchored = kind.pane_anchored();
-            if !item.anchor_times_micros.is_empty() && !pane_anchored {
-                drawing_anchor_times.insert(item.id, item.anchor_times_micros.clone());
+            if !anchor_times_micros.is_empty() {
+                drawing_anchor_times.insert(item.id, anchor_times_micros);
             }
             let bounded = |value: f64| value.is_finite() && value.abs() <= MAX_SAFE_VALUE;
-            let fraction = |value: f64| (0.0..=1.0).contains(&value);
-            if item.anchors.iter().any(|anchor| {
+            if anchors.iter().any(|anchor| {
                 !bounded(anchor.price)
                     || anchor.logical.is_some_and(|logical| !bounded(logical))
                     || anchor.time.is_some_and(|time| !bounded(time))
                     || (anchor.logical.is_none() && anchor.time.is_none())
-                    || (pane_anchored
-                        && !(anchor.logical.is_some_and(fraction) && fraction(anchor.price)))
             }) {
                 return Err(invalid(format!(
                     "drawing {} has an invalid anchor",
@@ -1363,13 +1893,8 @@ impl ChartEngine {
             }
             // Anchor times are restored as pending identity and resolved against the host's
             // data on install (immediately when data is present, otherwise when it arrives).
-            let pending_times = item
-                .anchors
-                .iter()
-                .map(|anchor| anchor.time)
-                .collect::<Vec<_>>();
-            let anchors = item
-                .anchors
+            let pending_times = anchors.iter().map(|anchor| anchor.time).collect::<Vec<_>>();
+            let anchors = anchors
                 .iter()
                 .map(|anchor| DrawingPoint {
                     logical: anchor.logical.unwrap_or(0.0),
@@ -1387,10 +1912,54 @@ impl ChartEngine {
             })?;
             let mut drawing = Drawing::new(item.id, kind, pane_index, anchors);
             drawing.set_pending_times(pending_times);
-            let style = item.style;
+            if legacy_fork {
+                // The fork omitted every value equal to its own defaults.
+                crate::drawings::kinds::apply_legacy_fork_defaults(&mut drawing);
+            }
+            if let Some((screen_x, screen_y)) = pane_position {
+                drawing.screen_x = screen_x;
+                drawing.screen_y = screen_y;
+            }
             if kind == DrawingKind::Rectangle && style.border_visible.is_none() {
                 // Older documents omitted the then-visible default. Preserve their appearance.
                 drawing.border_visible = true;
+            }
+            // Fork option keys that overlap an upstream flat field stand in for that field where
+            // the document carries no flat key of its own, and pass the same checks below.
+            let stored_tool_options = tool_options.is_some();
+            if stored_tool_options || legacy_fork {
+                let options = tool_options.get_or_insert_with(|| serde_json::json!({}));
+                let legacy =
+                    crate::drawing_contract::take_legacy_flat_options(kind, options, legacy_fork);
+                fill_absent(&mut style.level_reverse, legacy.level_reverse);
+                fill_absent(&mut style.level_log_scale, legacy.level_log_scale);
+                fill_absent(&mut style.level_show_prices, legacy.level_show_prices);
+                fill_absent(&mut style.level_show_values, legacy.level_show_values);
+                fill_absent(&mut style.level_show_percents, legacy.level_show_percents);
+                fill_absent(&mut style.level_label_align, legacy.level_label_align);
+                fill_absent(&mut style.gann_fans, legacy.gann_fans);
+                fill_absent(&mut style.gann_arcs, legacy.gann_arcs);
+                fill_absent(&mut style.wave_degree, legacy.wave_degree);
+                // A fork bars pattern without copied bars has no snapshot to carry.
+                fill_absent(
+                    &mut style.bars_pattern,
+                    legacy.bars_pattern.filter(|bars| !bars.is_empty()),
+                );
+                fill_absent(
+                    &mut style.bars_pattern_mirror_x,
+                    legacy.bars_pattern_mirror_x,
+                );
+                fill_absent(
+                    &mut style.bars_pattern_mirror_y,
+                    legacy.bars_pattern_mirror_y,
+                );
+                fill_absent(&mut style.bars_pattern_mode, legacy.bars_pattern_mode);
+                fill_absent(&mut style.icon_name, legacy.icon_name);
+                fill_absent(&mut style.icon_size, legacy.icon_size);
+                fill_absent(
+                    &mut style.regression_deviations,
+                    legacy.regression_deviations,
+                );
             }
             if let Some(value) = style.position_account_size {
                 if !value.is_finite() || value <= 0.0 || value > 1e15 {
@@ -1409,6 +1978,120 @@ impl ChartEngine {
                     )));
                 }
                 drawing.position_risk_percent = value;
+            }
+            if let Some(source_id) = style.regression_source_id {
+                drawing.regression_source_id = Some(source_id);
+            }
+            if let Some(deviations) = style.regression_deviations {
+                if !deviations.is_finite() || !(0.0..=10.0).contains(&deviations) {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid regression deviations",
+                        item.id
+                    )));
+                }
+                drawing.regression_deviations = deviations;
+            }
+            if let Some(degree) = style.wave_degree {
+                if !drawing.kind.is_elliott() || !DrawingKind::valid_wave_degree(&degree) {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid wave degree",
+                        item.id
+                    )));
+                }
+                drawing.wave_degree = degree;
+            }
+            if let Some(value) = style.screen_x {
+                if drawing.kind != DrawingKind::AnchoredText
+                    || !value.is_finite()
+                    || !(0.0..=1.0).contains(&value)
+                {
+                    return Err(invalid(format!("drawing {} has invalid screen x", item.id)));
+                }
+                drawing.screen_x = value;
+            }
+            if let Some(value) = style.screen_y {
+                if drawing.kind != DrawingKind::AnchoredText
+                    || !value.is_finite()
+                    || !(0.0..=1.0).contains(&value)
+                {
+                    return Err(invalid(format!("drawing {} has invalid screen y", item.id)));
+                }
+                drawing.screen_y = value;
+            }
+            if let Some(name) = style.icon_name {
+                if drawing.kind != DrawingKind::IconStamp
+                    || name.is_empty()
+                    || name.len() > crate::drawings::MAX_DRAWING_ICON_NAME_BYTES
+                {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid icon name",
+                        item.id
+                    )));
+                }
+                drawing.icon_name = Some(name);
+            }
+            if let Some(size) = style.icon_size {
+                if drawing.kind != DrawingKind::IconStamp
+                    || !size.is_finite()
+                    || !(8.0..=96.0).contains(&size)
+                {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid icon size",
+                        item.id
+                    )));
+                }
+                drawing.icon_size = size;
+            }
+            if let Some(bars) = style.bars_pattern {
+                if drawing.kind != DrawingKind::BarsPattern
+                    || bars.is_empty()
+                    || bars.len() > crate::drawings::MAX_BARS_PATTERN_BARS
+                    || bars.iter().any(|bar| !bar.valid())
+                    || bars.windows(2).any(|pair| pair[0].offset >= pair[1].offset)
+                    || bars.last().is_some_and(|bar| {
+                        usize::from(bar.offset) >= crate::drawings::MAX_BARS_PATTERN_BARS
+                    })
+                {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid bars pattern",
+                        item.id
+                    )));
+                }
+                drawing.bars_pattern = bars;
+            }
+            if let Some(value) = style.bars_pattern_mirror_x {
+                if drawing.kind != DrawingKind::BarsPattern {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid bars pattern mirror",
+                        item.id
+                    )));
+                }
+                drawing.bars_pattern_mirror_x = value;
+            }
+            if let Some(value) = style.bars_pattern_mirror_y {
+                if drawing.kind != DrawingKind::BarsPattern {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid bars pattern mirror",
+                        item.id
+                    )));
+                }
+                drawing.bars_pattern_mirror_y = value;
+            }
+            if let Some(mode) = style.bars_pattern_mode {
+                if drawing.kind != DrawingKind::BarsPattern
+                    || !crate::drawings::valid_bars_pattern_mode(&mode)
+                {
+                    return Err(invalid(format!(
+                        "drawing {} has invalid bars pattern mode",
+                        item.id
+                    )));
+                }
+                // `hl_bars` is the fork's spelling of the high-low bars mode.
+                drawing.bars_pattern_mode = if mode == "hl_bars" {
+                    "bars".to_string()
+                } else {
+                    mode
+                };
             }
             if let Some(profile) = style.profile {
                 if !profile.valid() {
@@ -1488,6 +2171,61 @@ impl ChartEngine {
                     return Err(invalid(format!("drawing {} has invalid levels", item.id)));
                 }
                 drawing.levels = levels;
+            }
+            for (family, destination, fan) in [
+                (style.gann_fans, &mut drawing.gann_fans, true),
+                (style.gann_arcs, &mut drawing.gann_arcs, false),
+            ] {
+                if let Some(levels) = family {
+                    if !matches!(
+                        drawing.kind,
+                        DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+                    ) || !crate::drawings::valid_gann_family(&levels, fan)
+                    {
+                        return Err(invalid(format!(
+                            "drawing {} has invalid Gann levels",
+                            item.id
+                        )));
+                    }
+                    *destination = levels;
+                }
+            }
+            let has_level_options = style.level_reverse.is_some()
+                || style.level_log_scale.is_some()
+                || style.level_show_prices.is_some()
+                || style.level_show_values.is_some()
+                || style.level_show_percents.is_some()
+                || style.level_label_align.is_some();
+            if has_level_options
+                && (!drawing.kind.has_levels()
+                    || (style.level_log_scale == Some(true) && !drawing.kind.supports_log_levels())
+                    || style
+                        .level_label_align
+                        .as_deref()
+                        .is_some_and(|align| !matches!(align, "left" | "center" | "right")))
+            {
+                return Err(invalid(format!(
+                    "drawing {} has invalid level options",
+                    item.id
+                )));
+            }
+            if let Some(value) = style.level_reverse {
+                drawing.level_reverse = value;
+            }
+            if let Some(value) = style.level_log_scale {
+                drawing.level_log_scale = value;
+            }
+            if let Some(value) = style.level_show_prices {
+                drawing.level_show_prices = value;
+            }
+            if let Some(value) = style.level_show_values {
+                drawing.level_show_values = value;
+            }
+            if let Some(value) = style.level_show_percents {
+                drawing.level_show_percents = value;
+            }
+            if let Some(value) = style.level_label_align {
+                drawing.level_label_align = value;
             }
             if let Some(scale) = style.price_scale_id {
                 drawing.price_scale = DrawingPriceScale::from_name(&scale)
@@ -1585,16 +2323,29 @@ impl ChartEngine {
                 validate_positive_number(width, "box_border_width")?;
                 drawing.box_border_width = width;
             }
-            if let Some(tool_options) = style.tool_options {
-                if !tool_options.validate() {
-                    return Err(invalid(format!(
-                        "drawing {} has invalid tool options",
-                        item.id
-                    )));
-                }
+            // What remains of the stored blocks after the flat-field keys moved out.
+            if let Some(tool_options) = tool_options.filter(|_| stored_tool_options) {
+                let tool_options =
+                    serde_json::from_value::<crate::DrawingToolOptions>(tool_options)
+                        .ok()
+                        .filter(crate::DrawingToolOptions::validate)
+                        .ok_or_else(|| {
+                            invalid(format!("drawing {} has invalid tool options", item.id))
+                        })?;
                 drawing.tool_options = tool_options;
             }
             max_drawing_id = max_drawing_id.max(item.id);
+            // A bars pattern converted from a fork drawing that had copied no bars restores
+            // without a snapshot: it paints nothing until an edit of its box recaptures one.
+            if drawing.kind == DrawingKind::BarsPattern
+                && drawing.bars_pattern.is_empty()
+                && !converted_bars_pattern
+            {
+                return Err(invalid(format!(
+                    "drawing {} has no bars pattern snapshot",
+                    item.id
+                )));
+            }
             drawings.push(drawing);
         }
         let drawing_price_basis = state.drawing_price_basis.filter(|basis| !basis.is_empty());
@@ -1808,6 +2559,7 @@ impl ChartEngine {
             panes: state.panes,
             drawings: state.drawings,
             drawing_price_basis: state.drawing_price_basis.clone(),
+            drawing_catalog: state.drawing_catalog,
         })?;
         let mut resolved = Vec::with_capacity(state.indicators.len());
         let mut expected_outputs = Vec::with_capacity(state.indicators.len());
@@ -1971,6 +2723,7 @@ impl ChartEngine {
             panes: state.panes.into_iter().map(|pane| pane.pane).collect(),
             drawings: state.drawings,
             drawing_price_basis: state.drawing_price_basis,
+            drawing_catalog: state.drawing_catalog,
         })?;
         let mut staged = ChartEngine::new(self.css_width, self.css_height, self.dpr);
         staged.next_pane_id = self.next_pane_id;
@@ -4065,5 +4818,529 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The `(logical, price)` anchors of drawing `id`.
+    fn anchor_pairs(chart: &ChartEngine, id: u32) -> Vec<(f64, f64)> {
+        chart
+            .drawing(id)
+            .unwrap()
+            .points
+            .iter()
+            .map(|point| (point.logical, point.price))
+            .collect()
+    }
+
+    fn assert_anchors(chart: &ChartEngine, id: u32, expected: &[(f64, f64)]) {
+        let actual = anchor_pairs(chart, id);
+        assert_eq!(actual.len(), expected.len(), "drawing {id}: {actual:?}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual.0 - expected.0).abs() < 1e-9 && (actual.1 - expected.1).abs() < 1e-9,
+                "drawing {id}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    /// The written anchor times of drawing `id` in an exported document.
+    fn exported_times(document: &serde_json::Value, id: u32) -> Vec<Option<f64>> {
+        document["drawings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|drawing| drawing["id"] == id)
+            .unwrap()["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|anchor| anchor["time"].as_f64())
+            .collect()
+    }
+
+    #[test]
+    fn fork_written_documents_convert_to_the_upstream_catalog_on_load() {
+        const T: f64 = 1_700_000_000.0;
+        let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+        let timed = |logical: f64, price: f64| {
+            let mut anchor = at(logical, price);
+            anchor["time"] = serde_json::json!(T + logical * 60.0);
+            anchor
+        };
+        let drawing = |id: u32, kind: &str, anchors: Vec<serde_json::Value>| {
+            let mut drawing = serde_json::json!({"id": id, "kind": kind, "pane_id": "pane-1"});
+            drawing["anchors"] = serde_json::Value::Array(anchors);
+            drawing
+        };
+        let styled =
+            |id: u32, kind: &str, anchors: Vec<serde_json::Value>, style: serde_json::Value| {
+                let mut drawing = drawing(id, kind, anchors);
+                drawing["style"] = style;
+                drawing
+            };
+        // A document the fork wrote: no catalog marker, fork tool names and anchor contracts,
+        // anchor times, and `tool_options` blocks, with values equal to the fork's defaults left
+        // out.
+        let document = serde_json::json!({
+            "schema": "aeris_charts-state",
+            "schema_version": 1,
+            "panes": [{"id": "pane-1"}],
+            "drawings": [
+                styled(1, "fib_retracement", vec![at(1.0, 10.0), at(6.0, 12.0)],
+                    serde_json::json!({"tool_options": {"fibonacci": {
+                        "reverse": true, "levels_as_percent": true
+                    }}})),
+                drawing(2, "flat_top_bottom", vec![at(1.0, 10.0), at(5.0, 12.0), at(3.0, 13.0)]),
+                drawing(3, "flat_top_bottom", vec![at(1.0, 10.0), at(5.0, 12.0), at(3.0, 9.0)]),
+                drawing(4, "disjoint_channel",
+                    vec![timed(2.0, 10.0), timed(6.0, 12.0), at(4.0, 8.0)]),
+                styled(5, "gann_square_fixed", vec![at(3.0, 10.0)],
+                    serde_json::json!({"tool_options": {"gann": {
+                        "size_bars": 10.0, "scale_ratio": 0.5, "reverse": true
+                    }}})),
+                styled(6, "bars_pattern", vec![at(10.0, 20.0), at(14.0, 30.0)],
+                    serde_json::json!({"tool_options": {"projection_annotation": {
+                        "bars_mode": "oc_bars",
+                        "mirrored": true,
+                        "bars": [
+                            [5.0, 6.0, 4.0, 5.5],
+                            [1.0, 0.5, 2.0, 1.0],
+                            [5.5, 8.0, 5.0, 7.0],
+                            [7.0, 7.5, 2.0, 3.0]
+                        ]
+                    }}})),
+                drawing(7, "projection", vec![at(20.0, 10.0), at(25.0, 12.0), at(22.0, 14.0)]),
+                drawing(8, "price_note", vec![at(5.0, 11.0), at(8.0, 13.0)]),
+                drawing(9, "signpost", vec![timed(7.0, 12.0)]),
+                drawing(10, "triangle_pattern",
+                    vec![at(0.0, 10.0), at(2.0, 14.0), at(4.0, 11.0), at(6.0, 13.0)]),
+                drawing(11, "three_drives_pattern", (0..7)
+                    .map(|index| at(f64::from(index), 10.0 + f64::from(index % 2)))
+                    .collect()),
+                drawing(12, "arc", vec![timed(1.0, 10.0), timed(5.0, 10.0), timed(3.0, 12.0)]),
+                drawing(13, "curve", vec![at(0.0, 10.0), at(4.0, 10.0), at(2.0, 12.0)]),
+                drawing(14, "double_curve",
+                    vec![timed(0.0, 10.0), timed(3.0, 10.0), timed(1.0, 11.0), timed(2.0, 11.0)]),
+                drawing(15, "rotated_rectangle", vec![at(0.0, 10.0), at(4.0, 12.0), at(2.0, 14.0)]),
+                styled(16, "anchored_text", vec![timed(0.25, 0.75)],
+                    serde_json::json!({"text": "pinned"})),
+                styled(17, "icon", vec![at(9.0, 11.0)],
+                    serde_json::json!({"tool_options": {"projection_annotation": {
+                        "icon": "heart", "icon_size": 120.0
+                    }}})),
+                drawing(18, "elliott_impulse_wave", (0..6)
+                    .map(|index| at(f64::from(index), 10.0 + f64::from(index % 2)))
+                    .collect()),
+            ]
+        })
+        .to_string();
+
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let restored = chart.import_state_json(&document).unwrap();
+        assert_eq!(restored.drawings, 18);
+        assert_eq!(
+            chart
+                .drawings
+                .iter()
+                .map(|drawing| drawing.kind)
+                .collect::<Vec<_>>(),
+            [
+                DrawingKind::FibonacciRetracement,
+                DrawingKind::FlatTopChannel,
+                DrawingKind::FlatBottomChannel,
+                DrawingKind::DisjointChannel,
+                DrawingKind::GannSquareFixed,
+                DrawingKind::BarsPattern,
+                DrawingKind::Projection,
+                DrawingKind::PriceNote,
+                DrawingKind::Signpost,
+                DrawingKind::PatternTriangle,
+                DrawingKind::PatternThreeDrives,
+                DrawingKind::Arc,
+                DrawingKind::Curve,
+                DrawingKind::DoubleCurve,
+                DrawingKind::RotatedRectangle,
+                DrawingKind::AnchoredText,
+                DrawingKind::IconStamp,
+                DrawingKind::ElliottImpulse,
+            ]
+        );
+
+        // Omitted values keep the fork's defaults; fork option keys map onto the flat fields.
+        let fibonacci = chart.drawing(1).unwrap();
+        assert_eq!(fibonacci.levels.len(), crate::FIBONACCI_RATIOS.len());
+        assert_eq!(fibonacci.color, "#787b86");
+        assert_eq!(fibonacci.style, LineStyle::Dashed);
+        // The fork's reversed retracement put level 0 on its first anchor: upstream's
+        // unreversed one.
+        assert!(!fibonacci.level_reverse);
+        assert!(fibonacci.level_show_percents);
+        assert!(!fibonacci.level_show_values);
+        assert_eq!(fibonacci.level_label_align, "left");
+        assert_eq!(chart.drawing(18).unwrap().wave_degree, "intermediate");
+        let icon = chart.drawing(17).unwrap();
+        assert_eq!(icon.icon_name.as_deref(), Some("heart"));
+        assert_eq!(icon.icon_size, 96.0);
+        assert!(chart.drawing(5).unwrap().level_reverse);
+        let bars = chart.drawing(6).unwrap();
+        assert_eq!(
+            bars.bars_pattern
+                .iter()
+                .map(|bar| bar.offset)
+                .collect::<Vec<_>>(),
+            [0, 2, 3],
+            "invalid bars drop out and the rest keep their positions"
+        );
+        assert_eq!(bars.bars_pattern_mode, "oc_bars");
+        assert!(bars.bars_pattern_mirror_x);
+        let anchored = chart.drawing(16).unwrap();
+        assert_eq!((anchored.screen_x, anchored.screen_y), (0.25, 0.75));
+
+        // Anchors follow the upstream contracts.
+        assert_anchors(
+            &chart,
+            4,
+            &[(2.0, 10.0), (6.0, 12.0), (2.0, 9.0), (6.0, 7.0)],
+        );
+        assert_anchors(&chart, 5, &[(3.0, 10.0), (13.0, 5.0)]);
+        assert_anchors(
+            &chart,
+            6,
+            &[(10.0, 20.0), (14.0, 30.0), (10.0, 20.0 + 3.5 * 10.0 / 6.0)],
+        );
+        assert_anchors(&chart, 7, &[(20.0, 10.0), (22.0, 14.0)]);
+        assert_anchors(&chart, 8, &[(5.0, 11.0)]);
+        assert_anchors(&chart, 9, &[(7.0, 12.0), (7.0, 12.0)]);
+        assert_anchors(
+            &chart,
+            10,
+            &[
+                (0.0, 10.0),
+                (2.0, 14.0),
+                (4.0, 11.0),
+                (6.0, 13.0),
+                (8.0, 12.0),
+            ],
+        );
+        assert_eq!(anchor_pairs(&chart, 11).len(), 6);
+        assert_anchors(&chart, 12, &[(1.0, 10.0), (3.0, 12.0), (5.0, 10.0)]);
+        assert_anchors(&chart, 13, &[(0.0, 10.0), (2.0, 14.0), (4.0, 10.0)]);
+        assert_anchors(
+            &chart,
+            14,
+            &[(0.0, 10.0), (1.0, 11.5), (2.0, 11.5), (3.0, 10.0)],
+        );
+        assert_anchors(&chart, 15, &[(0.0, 13.0), (4.0, 15.0), (0.0, 7.0)]);
+
+        // The export writes upstream names and the catalog marker; derived anchors keep the time
+        // identity of the anchor they sit beside.
+        let exported = chart.export_state_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(value["drawing_catalog"], DRAWING_CATALOG_REVISION);
+        assert_eq!(
+            value["drawings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|drawing| drawing["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "fibonacci_retracement",
+                "flat_top_channel",
+                "flat_bottom_channel",
+                "disjoint_channel",
+                "gann_square_fixed",
+                "bars_pattern",
+                "projection",
+                "price_note",
+                "signpost",
+                "pattern_triangle",
+                "pattern_three_drives",
+                "arc",
+                "curve",
+                "double_curve",
+                "rotated_rectangle",
+                "anchored_text",
+                "icon_stamp",
+                "elliott_impulse",
+            ]
+        );
+        let time = |logical: f64| Some(T + logical * 60.0);
+        assert_eq!(
+            exported_times(&value, 4),
+            [time(2.0), time(6.0), time(2.0), time(6.0)]
+        );
+        assert_eq!(exported_times(&value, 9), [time(7.0), time(7.0)]);
+        assert_eq!(
+            exported_times(&value, 12),
+            [time(1.0), time(3.0), time(5.0)]
+        );
+        let controls = exported_times(&value, 14);
+        assert_eq!(controls[0], time(0.0));
+        assert!(
+            (controls[1].unwrap() - (T + 60.0)).abs() < 1e-3,
+            "{controls:?}"
+        );
+        assert!(
+            (controls[2].unwrap() - (T + 120.0)).abs() < 1e-3,
+            "{controls:?}"
+        );
+        assert_eq!(controls[3], time(3.0));
+        assert_eq!(exported_times(&value, 16), [None]);
+        assert!(!exported.contains("\"levels_as_percent\""));
+        assert!(!exported.contains("\"bars_mode\""));
+
+        // The written document is upstream-format: it restores unchanged.
+        let mut again = ChartEngine::new(800.0, 500.0, 1.0);
+        again.import_state_json(&exported).unwrap();
+        assert_eq!(again.export_state_json().unwrap(), exported);
+    }
+
+    #[test]
+    fn fork_fibonacci_and_sine_drawings_keep_the_geometry_the_fork_drew() {
+        const T: f64 = 1_700_000_000.0;
+        let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+        let timed = |logical: f64, price: f64| {
+            let mut anchor = at(logical, price);
+            anchor["time"] = serde_json::json!(T + logical * 60.0);
+            anchor
+        };
+        let drawing = |id: u32, kind: &str, anchors: Vec<serde_json::Value>| serde_json::json!({"id": id, "kind": kind, "pane_id": "pane-1", "anchors": anchors});
+        let reversed = |id: u32, kind: &str, anchors: Vec<serde_json::Value>| {
+            let mut drawing = drawing(id, kind, anchors);
+            drawing["style"] =
+                serde_json::json!({"tool_options": {"fibonacci": {"reverse": true}}});
+            drawing
+        };
+        let document = serde_json::json!({
+            "schema": "aeris_charts-state",
+            "schema_version": 1,
+            "panes": [{"id": "pane-1"}],
+            "drawings": [
+                drawing(1, "fib_retracement", vec![at(1.0, 10.0), at(6.0, 12.0)]),
+                drawing(2, "fib_speed_resistance_fan", vec![at(1.0, 10.0), at(6.0, 12.0)]),
+                reversed(3, "fib_speed_resistance_fan", vec![at(1.0, 10.0), at(6.0, 12.0)]),
+                reversed(4, "trend_based_fib_extension",
+                    vec![at(1.0, 10.0), at(6.0, 12.0), at(8.0, 11.0)]),
+                reversed(5, "fib_time_zone", vec![at(1.0, 10.0), at(6.0, 12.0)]),
+                reversed(6, "fib_spiral", vec![at(1.0, 10.0), at(6.0, 12.0)]),
+                reversed(7, "fib_circles", vec![at(1.0, 10.0), at(6.0, 12.0)]),
+                drawing(8, "fib_speed_resistance_arcs", vec![timed(1.0, 10.0), timed(6.0, 12.0)]),
+                drawing(9, "fib_circles", vec![timed(2.0, 10.0), timed(6.0, 14.0)]),
+                drawing(10, "sine_line", vec![timed(2.0, 14.0), timed(6.0, 10.0)]),
+            ]
+        })
+        .to_string();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.import_state_json(&document).unwrap();
+        let reverse = |id: u32| chart.drawing(id).unwrap().level_reverse;
+        // The fork's level 0 sat on the retracement's and the fan's second anchor: upstream's
+        // reversed placement, and the fork's `reverse` is upstream's unreversed one.
+        assert!(reverse(1));
+        assert!(reverse(2));
+        assert!(!reverse(3));
+        // The extension and the time zones reversed the way upstream does.
+        assert!(reverse(4));
+        assert!(reverse(5));
+        // The spiral's counterclockwise turn and a `reverse` the circles never read map to
+        // nothing; the key stays stored.
+        assert!(!reverse(6));
+        assert!(!reverse(7));
+        let exported: serde_json::Value =
+            serde_json::from_str(&chart.export_state_json().unwrap()).unwrap();
+        let tool_options = |id: u32| {
+            exported["drawings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|drawing| drawing["id"] == id)
+                .unwrap()["style"]["tool_options"]
+                .clone()
+        };
+        assert_eq!(tool_options(6)["fibonacci"]["reverse"], true);
+        assert_eq!(tool_options(1), serde_json::Value::Null);
+        // Speed arcs turned around the first anchor: upstream's center is the second.
+        assert_anchors(&chart, 8, &[(6.0, 12.0), (1.0, 10.0)]);
+        // Circles centered between the anchors at half their distance: upstream centers them on
+        // the second anchor at the full distance.
+        assert_anchors(&chart, 9, &[(2.0, 10.0), (4.0, 12.0)]);
+        // A sine through two opposite extremes: upstream's zero crossing and extreme.
+        assert_anchors(&chart, 10, &[(4.0, 12.0), (6.0, 10.0)]);
+        let time = |logical: f64| Some(T + logical * 60.0);
+        assert_eq!(exported_times(&exported, 8), [time(6.0), time(1.0)]);
+        assert_eq!(exported_times(&exported, 9), [time(2.0), time(4.0)]);
+        assert_eq!(exported_times(&exported, 10), [time(4.0), time(6.0)]);
+    }
+
+    #[test]
+    fn fork_documents_from_sequence_axes_are_recognized_by_missing_upstream_fields() {
+        // On a trade-count, volume, or range-bar axis the fork wrote no anchor time; with default
+        // options it wrote no `tool_options` either, and it used upstream's names for these
+        // tools. Upstream writes the level flags of every leveled tool, which the fork never did.
+        let document = serde_json::json!({
+            "schema": "aeris_charts-state",
+            "schema_version": 1,
+            "panes": [{"id": "pane-1"}],
+            "drawings": [
+                {"id": 1, "kind": "andrews_pitchfork", "pane_id": "pane-1", "anchors": [
+                    {"logical": 0.0, "price": 10.0},
+                    {"logical": 4.0, "price": 14.0},
+                    {"logical": 6.0, "price": 9.0}
+                ]},
+                {"id": 2, "kind": "arc", "pane_id": "pane-1", "anchors": [
+                    {"logical": 1.0, "price": 10.0},
+                    {"logical": 5.0, "price": 10.0},
+                    {"logical": 3.0, "price": 12.0}
+                ]}
+            ]
+        })
+        .to_string();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.import_state_json(&document).unwrap();
+        let mut fork = Drawing::new(0, DrawingKind::AndrewsPitchfork, 0, Vec::new());
+        crate::drawings::kinds::apply_legacy_fork_defaults(&mut fork);
+        let upstream = Drawing::new(0, DrawingKind::AndrewsPitchfork, 0, Vec::new());
+        assert_ne!(
+            fork.levels, upstream.levels,
+            "the fixture tells the defaults apart"
+        );
+        assert_eq!(chart.drawing(1).unwrap().levels, fork.levels);
+        assert_anchors(&chart, 2, &[(1.0, 10.0), (3.0, 12.0), (5.0, 10.0)]);
+
+        // The same pitchfork from an upstream pin carries its level flags and loads unchanged.
+        let mut upstream_document: serde_json::Value = serde_json::from_str(&document).unwrap();
+        upstream_document["drawings"][0]["style"] = serde_json::json!({"level_reverse": false});
+        let mut pinned = ChartEngine::new(800.0, 500.0, 1.0);
+        pinned
+            .import_state_json(&upstream_document.to_string())
+            .unwrap();
+        assert_eq!(pinned.drawing(1).unwrap().levels, upstream.levels);
+        assert_anchors(&pinned, 2, &[(1.0, 10.0), (5.0, 10.0), (3.0, 12.0)]);
+    }
+
+    /// Shapes whose anchor count is the same in both catalogs but whose anchors meant something
+    /// else to the fork.
+    fn same_count_shapes() -> Vec<serde_json::Value> {
+        let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+        [
+            ("rotated_rectangle", [(0.0, 10.0), (4.0, 12.0), (2.0, 14.0)]),
+            ("arc", [(1.0, 10.0), (5.0, 10.0), (3.0, 12.0)]),
+            ("curve", [(0.0, 10.0), (4.0, 10.0), (2.0, 12.0)]),
+        ]
+        .into_iter()
+        .zip(1u32..)
+        .map(|((kind, anchors), id)| {
+            serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "pane_id": "pane-1",
+                "anchors": anchors
+                    .iter()
+                    .map(|&(logical, price)| at(logical, price))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+    }
+
+    #[test]
+    fn documents_with_the_catalog_marker_are_never_converted() {
+        let mut drawings = same_count_shapes();
+        // An anchor time alone marks a fork document only without the catalog marker.
+        drawings[0]["anchors"][0]["time"] = serde_json::json!(1_700_000_000.0);
+        let document = serde_json::json!({
+            "schema": "aeris_charts-state",
+            "schema_version": 1,
+            "drawing_catalog": DRAWING_CATALOG_REVISION,
+            "panes": [{"id": "pane-1"}],
+            "drawings": drawings,
+        })
+        .to_string();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.import_state_json(&document).unwrap();
+        assert_anchors(&chart, 1, &[(0.0, 10.0), (4.0, 12.0), (2.0, 14.0)]);
+        assert_anchors(&chart, 2, &[(1.0, 10.0), (5.0, 10.0), (3.0, 12.0)]);
+        assert_anchors(&chart, 3, &[(0.0, 10.0), (4.0, 10.0), (2.0, 12.0)]);
+    }
+
+    #[test]
+    fn upstream_pin_documents_load_unconverted() {
+        // An upstream pin writes neither the catalog marker nor anything only the fork wrote.
+        let mut drawings = same_count_shapes();
+        drawings.push(serde_json::json!({
+            "id": 4,
+            "kind": "anchored_text",
+            "pane_id": "pane-1",
+            "anchors": [{"logical": 12.0, "price": 30.0}],
+            "style": {"text": "pinned", "screen_x": 0.2, "screen_y": 0.4}
+        }));
+        drawings.push(serde_json::json!({
+            "id": 5,
+            "kind": "fibonacci_retracement",
+            "pane_id": "pane-1",
+            "anchors": [{"logical": 1.0, "price": 10.0}, {"logical": 6.0, "price": 12.0}],
+            "style": {"level_reverse": false, "level_label_align": "right"}
+        }));
+        let document = serde_json::json!({
+            "schema": "aeris_charts-state",
+            "schema_version": 1,
+            "panes": [{"id": "pane-1"}],
+            "drawings": drawings,
+        })
+        .to_string();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.import_state_json(&document).unwrap();
+        assert_anchors(&chart, 1, &[(0.0, 10.0), (4.0, 12.0), (2.0, 14.0)]);
+        assert_anchors(&chart, 2, &[(1.0, 10.0), (5.0, 10.0), (3.0, 12.0)]);
+        assert_anchors(&chart, 3, &[(0.0, 10.0), (4.0, 10.0), (2.0, 12.0)]);
+        let anchored = chart.drawing(4).unwrap();
+        assert_eq!((anchored.screen_x, anchored.screen_y), (0.2, 0.4));
+        assert_anchors(&chart, 4, &[(12.0, 30.0)]);
+        // Omitted values take upstream's defaults, not the fork's.
+        let fibonacci = chart.drawing(5).unwrap();
+        let defaults = Drawing::new(0, DrawingKind::FibonacciRetracement, 0, Vec::new());
+        assert_eq!(fibonacci.levels, defaults.levels);
+        assert_eq!(fibonacci.color, defaults.color);
+        assert_eq!(fibonacci.level_label_align, "right");
+    }
+
+    #[test]
+    fn emptied_label_and_level_lists_survive_a_round_trip() {
+        let mut chart = settled_chart();
+        let points = vec![
+            DrawingPoint {
+                logical: 1.0,
+                price: 10.0,
+            },
+            DrawingPoint {
+                logical: 6.0,
+                price: 12.0,
+            },
+        ];
+        let info = chart
+            .add_drawing(DrawingKind::InfoLine, 0, points.clone(), None)
+            .unwrap();
+        let fibonacci = chart
+            .add_drawing(DrawingKind::FibonacciRetracement, 0, points, None)
+            .unwrap();
+        assert!(!chart.drawing(info).unwrap().labels.is_empty());
+        assert!(!chart.drawing(fibonacci).unwrap().levels.is_empty());
+        assert!(chart.drawing_apply_options(info, r#"{"labels":[]}"#));
+        assert!(chart.drawing_apply_options(fibonacci, r#"{"levels":[]}"#));
+        let document = chart.export_state_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(
+            value["drawings"][0]["style"]["labels"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            value["drawings"][1]["style"]["levels"],
+            serde_json::json!([])
+        );
+
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        restored.import_state_json(&document).unwrap();
+        assert!(restored.drawing(info).unwrap().labels.is_empty());
+        assert!(restored.drawing(fibonacci).unwrap().levels.is_empty());
+        assert_eq!(restored.export_state_json().unwrap(), document);
     }
 }

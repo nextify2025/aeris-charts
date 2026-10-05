@@ -13,8 +13,6 @@ use aeris_charts_render::shape::{self, Point, Rect};
 use super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use crate::ChartEngine;
 
-/// Chord tolerance for tessellated curves, in device px at render and media px at hit test.
-pub(crate) const CURVE_TOLERANCE: f64 = 0.25;
 /// Gap between a measured anchor or edge and its stats box, in CSS px.
 pub(crate) const STATS_GAP: f64 = 8.0;
 /// Stats box padding (horizontal, vertical) in CSS px: the Long/Short Position chips' padding.
@@ -93,16 +91,6 @@ pub(crate) enum DrawingPart {
     },
     /// Text block `labels[index]`.
     Label { index: usize },
-    /// Wide stroke over the open polyline `points[start..end]` (one point is a dot) painted as
-    /// the region within half its width, round joins and caps included, through
-    /// `shape::tube_ribbon`: every executor blends each pixel once, so a translucent stroke keeps
-    /// one opacity where it overlaps or crosses itself. Hit like a [`DrawingPart::Stroke`]; the
-    /// line style does not apply.
-    Tube {
-        start: usize,
-        end: usize,
-        stroke: PartStroke,
-    },
 }
 
 /// A text block placed through the shared drawing label layout: `anchor` is where the box edge
@@ -260,14 +248,6 @@ impl<'a> PartContext<'a> {
             lines.push(String::new());
         }
         lines
-    }
-
-    /// Whether the drawing is the selected or the hovered one. Parts that read it paint only
-    /// while focused (a note's text), and their family's `reveals_on_focus` makes hover and
-    /// selection changes rebuild the retained drawings layer.
-    pub(crate) fn focused(&self) -> bool {
-        let id = Some(self.drawing.id);
-        self.engine.selected_drawing() == id || self.engine.hovered_drawing() == id
     }
 
     /// Whether region fills are body targets: only while the drawing is selected (the
@@ -450,16 +430,6 @@ impl DrawingParts {
         }
     }
 
-    /// The nonzero-rule region of any closed polygon — concave or self-intersecting, the last
-    /// vertex joining the first — as one fill part (see [`shape::nonzero_ribbon`]; oversized or
-    /// empty polygons add nothing).
-    pub(crate) fn fill_polygon(&mut self, polygon: &[Point], color: Option<Color>, hit: bool) {
-        let mut chains = Vec::new();
-        let count = shape::nonzero_ribbon(polygon, &mut chains);
-        let (upper, lower) = chains.split_at(count);
-        self.fill(upper, lower, color, hit);
-    }
-
     /// Stroke an open polyline (segments, curves, multi-vertex lines) with the drawing's end caps
     /// on the ends `caps` selects: an arrow end trims the stroke back by one stroke width along
     /// the polyline so the butt end cannot poke out of the narrowing arrowhead, and the caps
@@ -525,32 +495,6 @@ impl DrawingParts {
         self.line_cap(end_cap, last, end_toward, width);
     }
 
-    /// A wide stroke painted once per pixel (see [`DrawingPart::Tube`]).
-    pub(crate) fn tube(&mut self, points: &[Point], stroke: PartStroke) {
-        if points.is_empty() {
-            return;
-        }
-        let start = self.points.len();
-        self.points.extend_from_slice(points);
-        self.items.push(DrawingPart::Tube {
-            start,
-            end: self.points.len(),
-            stroke,
-        });
-    }
-
-    /// The painted region of a [`DrawingPart::Tube`] over `line` with a stroke `width` in caller
-    /// px as ribbon chains (see `shape::tube_ribbon`, chords within [`CURVE_TOLERANCE`]); 0 when
-    /// nothing reaches `clip` or the stroke exceeds the fill bounds.
-    pub(crate) fn tube_region(
-        line: &[Point],
-        width: f64,
-        clip: Rect,
-        out: &mut Vec<Point>,
-    ) -> usize {
-        shape::tube_ribbon(line, width / 2.0, CURVE_TOLERANCE, clip, out)
-    }
-
     /// Precise body test of every part at caller point `p`. `tolerance` is the pointer slack
     /// (hit profile) beyond each stroke's half width; `measure` measures one label line at the
     /// label's glyph size.
@@ -597,10 +541,6 @@ impl DrawingParts {
             DrawingPart::Label { index } => {
                 let label = &self.labels[index];
                 label.hit && label.layout(|line| measure(label, line)).rect.contains(p)
-            }
-            DrawingPart::Tube { start, end, stroke } => {
-                shape::distance_to_polyline(p, &self.points[start..end])
-                    <= stroke.width_css(drawing) / 2.0 + tolerance
             }
         })
     }
@@ -763,29 +703,6 @@ mod tests {
         let mut parts = DrawingParts::default();
         parts.capped_segment(&drawing, (0.0, 0.0), (100.0, 0.0), (false, false), 1.0);
         assert_eq!(parts.items.len(), 1, "extended ends carry no caps");
-    }
-
-    #[test]
-    fn polygon_fills_follow_the_nonzero_rule() {
-        let mut parts = DrawingParts::default();
-        // A concave L: its notch is outside.
-        let l_shape = [
-            (0.0, 0.0),
-            (20.0, 0.0),
-            (20.0, 20.0),
-            (40.0, 20.0),
-            (40.0, 40.0),
-            (0.0, 40.0),
-        ];
-        parts.fill_polygon(&l_shape, None, true);
-        assert_eq!(parts.items.len(), 1);
-        let drawing = Drawing::new(1, DrawingKind::TrendLine, 0, Vec::new());
-        let hit = |x, y| parts.hit(&drawing, (x, y), 0.0, |_, _| 0.0);
-        assert!(hit(10.0, 10.0) && hit(30.0, 30.0) && hit(10.0, 30.0));
-        assert!(!hit(30.0, 10.0), "the notch");
-        let mut empty = DrawingParts::default();
-        empty.fill_polygon(&[(0.0, 0.0), (1.0, 1.0)], None, true);
-        assert!(empty.items.is_empty());
     }
 
     #[test]

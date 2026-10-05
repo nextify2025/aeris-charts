@@ -10621,6 +10621,588 @@ fn anchor_chart() -> ChartEngine {
 }
 
 #[test]
+fn profile_and_anchored_vwap_drawings_lower_into_the_shared_frame() {
+    use crate::{DrawingKind, DrawingPoint, ProfileDrawingOptions, ProfileSource, SeriesKind};
+
+    let mut chart = anchor_chart();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart
+        .set_series_data(
+            volume,
+            &[0.0, 60.0, 120.0, 180.0, 240.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+        )
+        .unwrap();
+    chart.set_series_visible(volume, false);
+    let options = ProfileDrawingOptions {
+        source: ProfileSource::Candles {
+            price_series: 0,
+            volume_series: volume,
+        },
+        tick_size: 0.5,
+        row_count: 16,
+        value_area_percent: 70.0,
+        band_multiplier: 1.0,
+        width_percent: 30.0,
+    };
+    let fixed = chart
+        .add_drawing(
+            DrawingKind::FixedRangeVolumeProfile,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 0.0,
+                    price: 10.0,
+                },
+                DrawingPoint {
+                    logical: 4.0,
+                    price: 10.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    chart
+        .configure_profile_drawing(fixed, options.clone())
+        .unwrap();
+    let profile_frame = chart.build_frame();
+    assert!(profile_frame.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::HLine { color, .. } if *color == Color::rgb(245, 166, 35)
+    )));
+
+    let anchored = chart
+        .add_drawing(
+            DrawingKind::AnchoredVwap,
+            0,
+            vec![DrawingPoint {
+                logical: 0.0,
+                price: 10.0,
+            }],
+            None,
+        )
+        .unwrap();
+    chart.configure_profile_drawing(anchored, options).unwrap();
+    let vwap_frame = chart.build_frame();
+    assert!(vwap_frame.panes[0].main.len() > profile_frame.panes[0].main.len());
+    chart.build_frame();
+    assert_eq!(chart.frame_build_stats(), FrameBuildStats::default());
+    assert!(chart.update_series_bar(volume, 240.0, [50.0; 4]));
+    let corrected = chart.build_frame();
+    assert_eq!(chart.frame_build_stats().drawing_rebuilds, 1);
+    assert_ne!(corrected.panes[0].main, vwap_frame.panes[0].main);
+
+    let unrelated = chart.add_series(SeriesKind::Line);
+    chart
+        .set_series_data(
+            unrelated,
+            &[0.0, 60.0, 120.0, 180.0, 240.0],
+            &[10.0; 5],
+            &[10.0; 5],
+            &[10.0; 5],
+            &[10.0; 5],
+        )
+        .unwrap();
+    chart.build_frame();
+    chart.build_frame();
+    assert!(chart.update_series_bar(unrelated, 240.0, [11.0; 4]));
+    chart.build_frame();
+    assert_eq!(chart.frame_build_stats().drawing_rebuilds, 0);
+}
+
+#[test]
+fn periodic_profile_presentation_uses_series_layer_and_rebuilds_on_volume_correction() {
+    use crate::{
+        PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest, ProfileSource,
+        ResampleBoundary, SeriesKind,
+    };
+
+    let mut chart = anchor_chart();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let times = [0.0, 60.0, 120.0, 180.0, 240.0];
+    chart
+        .set_series_data(volume, &times, &[1.0; 5], &[1.0; 5], &[1.0; 5], &[1.0; 5])
+        .unwrap();
+    chart.set_series_visible(volume, false);
+    let request = PeriodicProfilePresentationRequest {
+        source: ProfileSource::Candles {
+            price_series: 0,
+            volume_series: volume,
+        },
+        boundaries: vec![ResampleBoundary {
+            start_time: 0,
+            end_time: 300,
+            session_id: 1,
+        }],
+        tick_size: 0.5,
+        row_count: 16,
+        value_area_percent: 70.0,
+    };
+    let id = chart
+        .add_periodic_profile_presentation(
+            0,
+            request,
+            PeriodicProfilePresentationOptions::default(),
+        )
+        .unwrap();
+    let first = chart.build_frame();
+    assert!(first.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::HLine { color, .. } if *color == Color::rgb(245, 166, 35)
+    )));
+    chart.build_frame();
+    assert_eq!(chart.frame_build_stats(), FrameBuildStats::default());
+    assert!(chart.update_series_bar(volume, 240.0, [20.0; 4]));
+    let corrected = chart.build_frame();
+    assert_eq!(chart.frame_build_stats().drawing_rebuilds, 0);
+    assert_ne!(corrected.panes[0].main, first.panes[0].main);
+    assert!(chart.remove_native_primitive(id));
+    let removed = chart.build_frame();
+    assert!(!removed.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::HLine { color, .. } if *color == Color::rgb(245, 166, 35)
+    )));
+}
+
+#[test]
+fn candle_periodic_profile_traces_developing_value_area() {
+    use crate::{
+        PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest, ProfileRequest,
+        ProfileSource, ResampleBoundary, SeriesKind,
+    };
+
+    let mut chart = anchor_chart();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let times = [0.0, 60.0, 120.0, 180.0, 240.0];
+    chart
+        .set_series_data(volume, &times, &[1.0; 5], &[1.0; 5], &[1.0; 5], &[1.0; 5])
+        .unwrap();
+    chart.set_series_visible(volume, false);
+    let source = ProfileSource::Candles {
+        price_series: 0,
+        volume_series: volume,
+    };
+    let snapshot = chart
+        .volume_profile_snapshot(&ProfileRequest {
+            source,
+            start_timestamp_micros: 0,
+            end_timestamp_micros: 300_000_000,
+            tick_size: 0.5,
+            row_count: 16,
+            value_area_percent: 70.0,
+        })
+        .unwrap();
+    assert_eq!(snapshot.developing.len(), 5);
+    assert_eq!(
+        snapshot.developing.last().unwrap().poc,
+        snapshot.poc.unwrap()
+    );
+    chart
+        .add_periodic_profile_presentation(
+            0,
+            PeriodicProfilePresentationRequest {
+                source,
+                boundaries: vec![ResampleBoundary {
+                    start_time: 0,
+                    end_time: 300,
+                    session_id: 1,
+                }],
+                tick_size: 0.5,
+                row_count: 16,
+                value_area_percent: 70.0,
+            },
+            PeriodicProfilePresentationOptions {
+                show_developing: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let frame = chart.build_frame();
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::Polyline { color, point_count, .. }
+        if *color == Color::rgb(245, 166, 35) && *point_count == 5
+    )));
+}
+
+#[test]
+fn periodic_profile_presentation_reserves_bounded_rows() {
+    use crate::{
+        FootprintAggregationOptions, PeriodicProfilePresentationOptions,
+        PeriodicProfilePresentationRequest, ProfileError, ProfileSource, ResampleBoundary,
+    };
+
+    let mut chart = anchor_chart();
+    let request = PeriodicProfilePresentationRequest {
+        source: ProfileSource::Candles {
+            price_series: 0,
+            volume_series: 0,
+        },
+        boundaries: (0..17)
+            .map(|index| ResampleBoundary {
+                start_time: index * 60,
+                end_time: index * 60 + 60,
+                session_id: index as u64,
+            })
+            .collect(),
+        tick_size: 0.5,
+        row_count: 2_048,
+        value_area_percent: 70.0,
+    };
+    assert_eq!(
+        chart.add_periodic_profile_presentation(
+            0,
+            request,
+            PeriodicProfilePresentationOptions::default()
+        ),
+        Err(ProfileError::LimitExceeded),
+    );
+    let stream_id = chart
+        .add_trade_stream("bounded-tape", FootprintAggregationOptions::default())
+        .unwrap();
+    let mut tape_request = PeriodicProfilePresentationRequest {
+        source: ProfileSource::Tape { stream_id },
+        boundaries: (0..17)
+            .map(|index| ResampleBoundary {
+                start_time: index * 60,
+                end_time: index * 60 + 60,
+                session_id: index as u64,
+            })
+            .collect(),
+        tick_size: 1.0,
+        row_count: 1,
+        value_area_percent: 70.0,
+    };
+    assert_eq!(
+        chart.add_periodic_profile_presentation(
+            0,
+            tape_request.clone(),
+            PeriodicProfilePresentationOptions::default()
+        ),
+        Err(ProfileError::LimitExceeded),
+    );
+    for boundary in &mut tape_request.boundaries {
+        boundary.session_id = 1;
+    }
+    assert!(chart
+        .add_periodic_profile_presentation(
+            0,
+            tape_request,
+            PeriodicProfilePresentationOptions::default(),
+        )
+        .is_ok());
+}
+
+#[test]
+fn removing_periodic_candle_dependency_releases_presentation() {
+    use crate::{
+        PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest, ProfileSource,
+        ResampleBoundary, SeriesKind,
+    };
+
+    let mut chart = anchor_chart();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart
+        .set_series_data(volume, &[0.0], &[1.0], &[1.0], &[1.0], &[1.0])
+        .unwrap();
+    let id = chart
+        .add_periodic_profile_presentation(
+            0,
+            PeriodicProfilePresentationRequest {
+                source: ProfileSource::Candles {
+                    price_series: 0,
+                    volume_series: volume,
+                },
+                boundaries: vec![ResampleBoundary {
+                    start_time: 0,
+                    end_time: 60,
+                    session_id: 1,
+                }],
+                tick_size: 1.0,
+                row_count: 8,
+                value_area_percent: 70.0,
+            },
+            PeriodicProfilePresentationOptions::default(),
+        )
+        .unwrap();
+    assert!(chart.remove_series(volume));
+    assert!(!chart.remove_native_primitive(id));
+}
+
+#[test]
+fn periodic_profile_naked_level_extends_to_first_later_tape_touch() {
+    use crate::{
+        AggressorSide, FootprintAggregationOptions, FootprintTrade,
+        PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest, ProfileSource,
+        ResampleBoundary,
+    };
+
+    let mut chart = anchor_chart();
+    let stream_id = chart
+        .add_trade_stream(
+            "profile-extension",
+            FootprintAggregationOptions {
+                tick_size: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let trade = |timestamp_micros| FootprintTrade {
+        timestamp_micros,
+        price: 10.0,
+        volume: 1.0,
+        aggressor: AggressorSide::Buy,
+        bid: None,
+        ask: None,
+        sequence: None,
+        trade_id: None,
+        conditions: 0,
+        session_id: Some(1),
+    };
+    chart
+        .set_trade_stream_trades(
+            stream_id,
+            vec![trade(0), trade(30_000_000), trade(120_000_000)],
+        )
+        .unwrap();
+    let request = PeriodicProfilePresentationRequest {
+        source: ProfileSource::Tape { stream_id },
+        boundaries: vec![ResampleBoundary {
+            start_time: 0,
+            end_time: 60,
+            session_id: 1,
+        }],
+        tick_size: 1.0,
+        row_count: 8,
+        value_area_percent: 70.0,
+    };
+    chart
+        .add_periodic_profile_presentation(
+            0,
+            request,
+            PeriodicProfilePresentationOptions {
+                extend_naked_levels: true,
+                show_developing: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(chart.remove_trade_stream(stream_id).is_err());
+    let with_touch = chart.build_frame();
+    assert!(with_touch.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::Polyline { color, point_count, .. }
+        if *color == Color::rgb(245, 166, 35) && *point_count == 2
+    )));
+    let poc_lines = |frame: &crate::ChartFrame| {
+        frame.panes[0]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::HLine { x0, x1, color, .. } if *color == Color::rgb(245, 166, 35) => {
+                    Some((*x0, *x1))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let lines = poc_lines(&with_touch);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[1].1 > lines[1].0);
+    chart
+        .set_trade_stream_trades(stream_id, vec![trade(0)])
+        .unwrap();
+    let untouched = chart.build_frame();
+    let extended = poc_lines(&untouched);
+    assert!(extended[1].1 > lines[1].1);
+}
+
+#[test]
+fn tape_profile_drawing_rebuilds_without_a_footprint_series() {
+    use crate::{
+        AggressorSide, DrawingKind, DrawingPoint, FootprintAggregationOptions, FootprintError,
+        FootprintTrade, ProfileDrawingOptions, ProfileSource,
+    };
+
+    let mut chart = anchor_chart();
+    let stream = chart
+        .add_trade_stream(
+            "profile-only",
+            FootprintAggregationOptions {
+                tick_size: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let trade = |timestamp_micros, price, volume| FootprintTrade {
+        timestamp_micros,
+        price,
+        volume,
+        aggressor: AggressorSide::Buy,
+        bid: None,
+        ask: None,
+        sequence: None,
+        trade_id: None,
+        conditions: 0,
+        session_id: Some(1),
+    };
+    chart
+        .set_trade_stream_trades(
+            stream,
+            vec![trade(0, 10.0, 1.0), trade(60_000_000, 11.0, 2.0)],
+        )
+        .unwrap();
+    let drawing = chart
+        .add_drawing(
+            DrawingKind::FixedRangeVolumeProfile,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 0.0,
+                    price: 10.0,
+                },
+                DrawingPoint {
+                    logical: 4.0,
+                    price: 10.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    chart
+        .configure_profile_drawing(
+            drawing,
+            ProfileDrawingOptions {
+                source: ProfileSource::Tape { stream_id: stream },
+                tick_size: 0.5,
+                row_count: 16,
+                value_area_percent: 70.0,
+                band_multiplier: 1.0,
+                width_percent: 30.0,
+            },
+        )
+        .unwrap();
+    let before = chart.build_frame();
+    chart.build_frame();
+    assert_eq!(chart.frame_build_stats(), FrameBuildStats::default());
+    assert!(matches!(
+        chart.remove_trade_stream(stream),
+        Err(FootprintError::TradeStreamInUse(_))
+    ));
+    chart
+        .update_trade_stream_trade(stream, trade(120_000_000, 12.0, 8.0))
+        .unwrap();
+    let after = chart.build_frame();
+    assert_eq!(chart.frame_build_stats().drawing_rebuilds, 1);
+    assert_ne!(after.panes[0].main, before.panes[0].main);
+}
+
+#[test]
+fn tpo_letters_and_blocks_follow_the_source_in_the_shared_frame() {
+    use crate::{ResampleBoundary, TpoCellMode, TpoPresentationOptions, TpoRequest};
+
+    let mut chart = anchor_chart();
+    let request = TpoRequest {
+        price_series: 0,
+        boundaries: vec![ResampleBoundary {
+            start_time: 0,
+            end_time: 300,
+            session_id: 1,
+        }],
+        period_seconds: 60,
+        tick_size: 0.5,
+        value_area_percent: 70.0,
+        initial_balance_periods: 2,
+    };
+    let letters = chart
+        .add_tpo_presentation(request.clone(), TpoPresentationOptions::default())
+        .unwrap();
+    let frame = chart.build_frame();
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::Text { text, .. } if text == "A"
+    )));
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::HLine { color, .. } if *color == Color::rgb(245, 166, 35)
+    )));
+    chart.build_frame();
+    assert_eq!(chart.frame_build_stats(), FrameBuildStats::default());
+    assert!(chart.update_series_bar(0, 240.0, [12.5, 14.0, 12.0, 13.5]));
+    let corrected = chart.build_frame();
+    assert_eq!(chart.frame_build_stats().series_rebuilds, 1);
+    assert_ne!(frame.panes[0].main, corrected.panes[0].main);
+    assert!(chart.remove_native_primitive(letters));
+
+    let blocks = chart
+        .add_tpo_presentation(
+            request,
+            TpoPresentationOptions {
+                mode: TpoCellMode::Blocks,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let frame = chart.build_frame();
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(prim,
+        Prim::Rect { color, .. } if *color == Color::rgb(51, 92, 255)
+    )));
+    assert!(chart.remove_native_primitive(blocks));
+}
+
+#[test]
+fn dense_tpo_collapses_to_viewport_rows_instead_of_emitting_every_cell() {
+    use crate::{ResampleBoundary, TpoPresentationOptions, TpoRequest};
+
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..1_024).map(f64::from).collect::<Vec<_>>();
+    chart
+        .set_series_data(
+            0,
+            &times,
+            &vec![15.0; times.len()],
+            &vec![20.0; times.len()],
+            &vec![10.0; times.len()],
+            &vec![15.0; times.len()],
+        )
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart
+        .add_tpo_presentation(
+            TpoRequest {
+                price_series: 0,
+                boundaries: vec![ResampleBoundary {
+                    start_time: 0,
+                    end_time: 1_024,
+                    session_id: 1,
+                }],
+                period_seconds: 1,
+                tick_size: 1.0,
+                value_area_percent: 70.0,
+                initial_balance_periods: 2,
+            },
+            TpoPresentationOptions {
+                color: "#ff00ff".into(),
+                value_area_color: "#ff00ff".into(),
+                single_print_color: "#ff00ff".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let frame = chart.build_frame();
+    let compact = frame.panes[0]
+        .main
+        .iter()
+        .filter(|prim| {
+            matches!(prim,
+                Prim::Rect { color, .. } if *color == Color::rgb(255, 0, 255)
+            )
+        })
+        .count();
+    assert!(
+        (1..=11).contains(&compact),
+        "dense TPO emitted {compact} blocks"
+    );
+}
+
+#[test]
 fn trend_line_middle_label_follows_the_segment_and_opens_a_gap() {
     use crate::{DrawingKind, DrawingPoint};
 
@@ -10910,7 +11492,8 @@ fn native_text_session_paints_its_caret_on_the_clicked_line_of_a_family_text_box
     })));
     let id = chart
         .add_drawing(
-            DrawingKind::Comment,
+            // The surviving family text box (upstream renders the comment as a run label).
+            DrawingKind::SimpleAnnotation,
             0,
             vec![DrawingPoint {
                 logical: 2.0,
@@ -11181,11 +11764,13 @@ fn a_steep_label_reaching_far_past_its_anchors_paints_on_the_culled_frame_path()
 fn placement_requesting_tools_keep_anchor_handles_and_paint_no_text_chrome() {
     use crate::{DrawingKind, DrawingPoint};
 
+    // Upstream's text annotations (note, comment, price note, anchored text) select like the text
+    // tool; the placement-requesting family tool and the callout keep their anchor handles.
     let is_chrome = |color: Color| color.0 & 0xFFFF_FF00 == PRIMARY.0 & 0xFFFF_FF00;
     let mut chart = anchor_chart();
-    let note = chart
+    let annotation = chart
         .add_drawing(
-            DrawingKind::Note,
+            DrawingKind::SimpleAnnotation,
             0,
             vec![DrawingPoint {
                 logical: 2.0,
@@ -11194,6 +11779,30 @@ fn placement_requesting_tools_keep_anchor_handles_and_paint_no_text_chrome() {
             None,
         )
         .unwrap();
+    {
+        let (id, anchors) = (annotation, 1);
+        assert!(chart.drawing_requests_text_edit(id));
+        chart.set_selected_drawing(None);
+        let unselected = frame_discs(&mut chart).len();
+        chart.set_selected_drawing(Some(id));
+        assert_eq!(
+            frame_discs(&mut chart).len() - unselected,
+            anchors * 2,
+            "each anchor paints a border and a fill disc"
+        );
+        let chrome = chart.build_frame().panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::RectFrame { color, .. } if is_chrome(*color)))
+            .count();
+        assert_eq!(chrome, 0, "only the text tools paint the text focus border");
+    }
+    assert_eq!(
+        DrawingKind::Note.spec().handles,
+        crate::drawings::DrawingHandleMode::None,
+        "a note edits like the text tool"
+    );
+    // The callout keeps a handle on its tip and on its box (the own line's callout editing).
     let callout = chart
         .add_drawing(
             DrawingKind::Callout,
@@ -11211,23 +11820,21 @@ fn placement_requesting_tools_keep_anchor_handles_and_paint_no_text_chrome() {
             None,
         )
         .unwrap();
-    for (id, anchors) in [(note, 1), (callout, 2)] {
-        assert!(chart.drawing_requests_text_edit(id));
-        chart.set_selected_drawing(None);
-        let unselected = frame_discs(&mut chart).len();
-        chart.set_selected_drawing(Some(id));
-        assert_eq!(
-            frame_discs(&mut chart).len() - unselected,
-            anchors * 2,
-            "each anchor paints a border and a fill disc"
-        );
-        let chrome = chart.build_frame().panes[0]
-            .main
-            .iter()
-            .filter(|prim| matches!(prim, Prim::RectFrame { color, .. } if is_chrome(*color)))
-            .count();
-        assert_eq!(chrome, 0, "only the text tool paints the text focus border");
-    }
+    assert!(chart.drawing_requests_text_edit(callout));
+    chart.set_selected_drawing(None);
+    let unselected = frame_discs(&mut chart).len();
+    chart.set_selected_drawing(Some(callout));
+    assert_eq!(
+        frame_discs(&mut chart).len() - unselected,
+        4,
+        "the tip and the box each paint a border and a fill disc"
+    );
+    let chrome = chart.build_frame().panes[0]
+        .main
+        .iter()
+        .filter(|prim| matches!(prim, Prim::RectFrame { color, .. } if is_chrome(*color)))
+        .count();
+    assert_eq!(chrome, 0, "only the text tools paint the text focus border");
 }
 
 /// The circle prims in the primary pane's main layer as `(cx, radius, fill)`. With the

@@ -118,7 +118,7 @@ for (const backend of ["auto", "canvas2d"]) {
 
   test(`price, date, and date-and-price range tools place snapped editable drawings (${backend})`, async ({ page }) => {
     const at = await open_chart(page, backend);
-    for (const [index, kind] of ["price_range", "date_range", "date_and_price_range"].entries()) {
+    for (const [index, kind] of ["price_range", "date_range", "date_price_range"].entries()) {
       await reset_text(page);
       await page.click(`#drawings_group [data-tool="${kind}"]`);
       // Each tool ends at a different point so its labels are new text runs.

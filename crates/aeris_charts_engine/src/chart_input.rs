@@ -1844,9 +1844,9 @@ impl ChartEngine {
         }
         self.hit_test_drawing(x, y).is_some_and(|hit| {
             hit.id == editing
-                && self
-                    .drawing(editing)
-                    .is_some_and(|drawing| drawing.kind == DrawingKind::Text)
+                && self.drawing(editing).is_some_and(|drawing| {
+                    drawing.kind == DrawingKind::Text || drawing.kind.is_text_annotation()
+                })
         })
     }
 
@@ -2042,7 +2042,7 @@ impl ChartEngine {
         let open_editor = if drawing.kind == DrawingKind::TrendLine {
             trend_text_hit == Some(id)
         } else {
-            drawing.kind == DrawingKind::Text
+            (drawing.kind == DrawingKind::Text || drawing.kind.is_text_annotation())
                 && (drawing.text.trim().is_empty() || text_press_selected == Some(id))
         };
         if open_editor {
@@ -3772,7 +3772,7 @@ mod tests {
         assert_eq!(chart.editing_drawing(), Some(id));
         assert!(chart.cancel_drawing_text_edit());
 
-        // A family text box opens it from anywhere on its body too.
+        // An upstream text annotation (the callout's leader and box) opens it from its body too.
         let callout = chart
             .add_drawing(
                 DrawingKind::Callout,
@@ -3800,6 +3800,31 @@ mod tests {
             .expect("the callout has a body target");
         double_click(&mut chart, on_callout.0, on_callout.1);
         assert_eq!(chart.editing_drawing(), Some(callout));
+        assert!(chart.cancel_drawing_text_edit());
+
+        // A family text box (the simple annotation's, which may span lines) opens it from
+        // anywhere on its body too.
+        let annotation = chart
+            .add_drawing(
+                DrawingKind::SimpleAnnotation,
+                0,
+                vec![DrawingPoint {
+                    logical: 20.0,
+                    price: 100.0,
+                }],
+                Some(r#"{"text":"note"}"#),
+            )
+            .unwrap();
+        chart.build_frame();
+        chart.set_selected_drawing(Some(annotation));
+        let on_annotation = (0..80)
+            .flat_map(|gx| {
+                (0..50).map(move |gy| (f64::from(gx) * 10.0 + 2.0, f64::from(gy) * 10.0 + 3.0))
+            })
+            .find(|&(x, y)| chart.drawing_at(x, y) == Some(annotation))
+            .expect("the simple annotation has a body target");
+        double_click(&mut chart, on_annotation.0, on_annotation.1);
+        assert_eq!(chart.editing_drawing(), Some(annotation));
         assert!(chart.cancel_drawing_text_edit());
 
         // The point must belong to the selected drawing: a selection alone is not enough.
@@ -3843,6 +3868,34 @@ mod tests {
         click(&mut chart, x, y);
         assert_eq!(chart.editing_drawing(), Some(callout));
         // A press outside the box still commits it.
+        let (outside_x, outside_y) = empty_pane_point(&chart);
+        assert!(
+            outside_x < rect[0]
+                || outside_x > rect[2]
+                || outside_y < rect[1]
+                || outside_y > rect[3]
+        );
+        click(&mut chart, outside_x, outside_y);
+        assert_eq!(chart.editing_drawing(), None);
+
+        // The same holds for a family text box that spans lines (a simple annotation's).
+        let annotation = chart
+            .add_drawing(
+                DrawingKind::SimpleAnnotation,
+                0,
+                vec![DrawingPoint {
+                    logical: 20.0,
+                    price: 100.0,
+                }],
+                Some(r#"{"text":"a note that spans the box"}"#),
+            )
+            .unwrap();
+        chart.build_frame();
+        assert!(chart.begin_drawing_text_edit(annotation, true));
+        let rect = chart.drawing_text_edit_layout(annotation).unwrap().rect;
+        let (x, y) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+        click(&mut chart, x, y);
+        assert_eq!(chart.editing_drawing(), Some(annotation));
         let (outside_x, outside_y) = empty_pane_point(&chart);
         assert!(
             outside_x < rect[0]
@@ -4235,5 +4288,49 @@ mod tests {
         assert!(chart.input_pinch(axis_x, 100.0, 0.1, 0.0));
         let after = chart.time_scale.coordinate_to_float_index(edge);
         assert!((before - after).abs() < 1e-6, "pinch: {before} -> {after}");
+    }
+
+    #[test]
+    fn text_annotation_creation_and_reedit_use_the_engine_controller() {
+        let mut chart = chart();
+        assert!(chart.set_drawing_tool(Some(DrawingKind::Note), None, None));
+        click(&mut chart, 250.0, 180.0);
+        let events = chart.take_input_events();
+        let [ChartInputEvent::DrawingCreated(id)] = events[..] else {
+            panic!("note creation must notify the host: {events:?}");
+        };
+        assert_eq!(chart.drawing_text_edit().map(|session| session.0), Some(id));
+        assert!(chart.set_drawing_text_edit("Remember", 8));
+        assert!(chart.commit_drawing_text_edit());
+        assert_eq!(chart.drawing(id).unwrap().text, "Remember");
+        click(&mut chart, 250.0, 180.0);
+        assert_eq!(chart.drawing_text_edit().map(|session| session.0), Some(id));
+        assert!(chart.cancel_drawing_text_edit());
+
+        assert!(chart.set_drawing_tool(Some(DrawingKind::Callout), None, None));
+        click(&mut chart, 300.0, 200.0);
+        assert!(!chart
+            .take_input_events()
+            .iter()
+            .any(|event| matches!(event, ChartInputEvent::DrawingCreated(_))));
+        click(&mut chart, 380.0, 170.0);
+        let events = chart.take_input_events();
+        let [ChartInputEvent::DrawingCreated(callout)] = events[..] else {
+            panic!("callout creation must notify the host: {events:?}");
+        };
+        assert_eq!(
+            chart.drawing_text_edit().map(|session| session.0),
+            Some(callout)
+        );
+        chart.commit_drawing_text_edit();
+        assert!(chart.set_drawing_tool(Some(DrawingKind::AnchoredText), None, None));
+        click(&mut chart, 210.0, 145.0);
+        let events = chart.take_input_events();
+        let [ChartInputEvent::DrawingCreated(anchored)] = events[..] else {
+            panic!("anchored text creation must notify the host: {events:?}");
+        };
+        let point = chart.drawing_px(chart.drawing(anchored).unwrap()).unwrap()[0];
+        assert!((point.0 - 210.0).abs() < 1e-4, "{point:?}");
+        assert!((point.1 - 145.0).abs() < 1e-4, "{point:?}");
     }
 }

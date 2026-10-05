@@ -6,7 +6,7 @@ import { PNG } from "pngjs";
 // B8 Lines family (ray, extended line, info line, trend angle, cross line, arrow line, the
 // axis-locked horizontal segment, vertical ray, and vertical segment, and the price line) through the
 // public API and real pointer input: armed placement, edge-reaching extensions and their hit
-// testing, the engine-formatted info stats box and its typed tool options, cross-line body drags,
+// testing, the info line's labels and its stored (inert) line options, cross-line body drags,
 // persistence and clipboard round trips, the demo toolbar entries, and WebGPU == Canvas2D parity.
 // Every geometry decision is engine-owned; these specs only drive the package API and pointer.
 
@@ -157,21 +157,42 @@ test("rays and extended lines reach the pane edges and hit along the extension",
   await page.mouse.click(far.x, far.y);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(ids.ray);
 
-  // Extending beyond the first anchor too makes it an extended line spanning both edges.
-  await page.evaluate((id) => {
-    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ extend_left: true });
-  }, ids.ray);
+  // An extended line spans both edges (the pointer leaves the pane so no hover paints over it).
+  await page.mouse.move(1, 1);
+  const extended = await page.evaluate(({ s, ray }) => {
+    window.__chart.drawings().find((drawing) => drawing.id === ray).remove();
+    return window.__chart.add_drawing("extended_line", [
+      { logical: s.l0, price: s.p_mid },
+      { logical: s.l1, price: s.p_mid },
+    ], { color: "#e91e63" }).id;
+  }, { s, ray: ids.ray });
   await settle_frames(page);
   extent = color_x_extent(await capture(page), PINK);
   expect(extent.min).toBeLessThanOrEqual(2);
   expect(extent.max).toBeGreaterThanOrEqual(Math.floor((width - 2) * PR));
+  expect(await page.evaluate(() => window.__chart.drawing_property_schema(window.__chart.drawings()[0]).kind))
+    .toBe("extended_line");
 
-  // With both extensions off it is the anchor segment: paint stops at the anchors and the old
-  // extension spot no longer hovers the drawing.
+  // A trend line extends by its `extend_*` options, and with both off it is the anchor segment:
+  // paint stops at the anchors and the old extension spot no longer hovers the drawing.
+  const trend = await page.evaluate(({ s, extended }) => {
+    window.__chart.drawings().find((drawing) => drawing.id === extended).remove();
+    return window.__chart.add_drawing("trend_line", [
+      { logical: s.l0, price: s.p_mid },
+      { logical: s.l1, price: s.p_mid },
+    ], { color: "#e91e63", extend_left: true, extend_right: true }).id;
+  }, { s, extended });
+  await settle_frames(page);
+  extent = color_x_extent(await capture(page), PINK);
+  expect(extent.min).toBeLessThanOrEqual(2);
+  expect(extent.max).toBeGreaterThanOrEqual(Math.floor((width - 2) * PR));
+  await page.mouse.move(far.x, far.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  await page.mouse.move(1, 1);
   await page.evaluate((id) => {
     window.__chart.drawings().find((drawing) => drawing.id === id)
       .apply_options({ extend_left: false, extend_right: false });
-  }, ids.ray);
+  }, trend);
   await settle_frames(page);
   extent = color_x_extent(await capture(page), PINK);
   const end = await spot(page, s.l1, s.p_mid);
@@ -179,15 +200,9 @@ test("rays and extended lines reach the pane edges and hit along the extension",
   expect(extent.max).toBeLessThanOrEqual(Math.ceil(end.x * PR) + 4);
   await page.mouse.move(far.x, far.y);
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
-  const schema = await page.evaluate(() => {
-    const list = window.__chart.drawings();
-    return window.__chart.drawing_property_schema(list[list.length - 1]);
-  });
-  expect(schema.kind).toBe("ray");
-  expect(schema.properties.find((property) => property.name === "extend_right").default).toBe(true);
 });
 
-test("the info line shows engine stats in a selectable box with typed tool options", async ({ page }) => {
+test("the info line paints its labels and keeps earlier builds' line options stored but inert", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const info = await page.evaluate(({ s }) => {
@@ -201,34 +216,34 @@ test("the info line shows engine stats in a selectable box with typed tool optio
       kind_options: window.__chart.drawing_kind_options(drawing),
     };
   }, { s });
-  expect(info.labels).toEqual(["price_change", "percent_change", "bar_count", "duration", "angle"]);
-  expect(info.kind_options).toEqual({ kind: "line", stats_position: "end" });
+  expect(info.labels).toEqual(["price_change", "percent_change", "bar_count", "angle"]);
+  expect(info.kind_options).toEqual({ kind: "generic" });
   await settle_frames(page);
 
-  // The stats box sits beyond the second anchor and selects the drawing.
-  const end = await spot(page, s.l1, s.p_hi);
-  await page.mouse.click(end.x + 30, end.y);
+  // The segment selects the drawing.
+  const a = await spot(page, s.l0, s.p_lo);
+  const b = await spot(page, s.l1, s.p_hi);
+  await page.mouse.click((a.x + b.x) / 2, (a.y + b.y) / 2);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
-
-  // Moving the box to the start: the old spot no longer hits, the new one does.
-  await page.evaluate((id) => {
-    window.__chart.drawings().find((drawing) => drawing.id === id)
-      .apply_options({ tool_options: { line: { stats_position: "start" } } });
-  }, info.id);
+  await page.evaluate(() => {
+    window.__chart.wasm.set_selected_drawing(undefined);
+    window.__chart.render();
+  });
+  await page.mouse.move(1, 1);
   await settle_frames(page);
-  const start = await spot(page, s.l0, s.p_lo);
-  // Outside the double-click interval, so the second press is an ordinary selection click.
-  await page.waitForTimeout(700);
-  await page.mouse.click(end.x + 30, end.y);
-  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id ?? null)).toBeNull();
-  await page.mouse.click(start.x - 30, start.y);
-  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
+  const painted = await capture(page);
+
+  // `tool_options.line` of earlier builds stays stored and changes nothing.
   const options = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
+    drawing.apply_options({ tool_options: { line: { stats_position: "start" } } });
     return { tool_options: drawing.options().tool_options, kind_options: window.__chart.drawing_kind_options(drawing) };
   }, info.id);
   expect(options.tool_options).toEqual({ line: { stats_position: "start" } });
-  expect(options.kind_options).toEqual({ kind: "line", stats_position: "start" });
+  expect(options.kind_options).toEqual({ kind: "generic" });
+  await settle_frames(page);
+  const inert = await capture(page);
+  expect(pixelmatch(painted.data, inert.data, null, painted.width, painted.height, { threshold: 0 })).toBe(0);
 
   // An invalid block is rejected atomically.
   const rejected = await page.evaluate((id) => {
@@ -323,8 +338,10 @@ test("Lines tools round-trip through persistence, clipboard, and sync with their
 
   expect(result.canonical).toEqual(result.state);
   const ray_style = result.state.drawings[0].style;
+  // The ray's `extend_*` options persist (a ray is always a ray); `extend_right: false` is its
+  // default, so it is not written.
   expect(ray_style.extend_left).toBe(true);
-  expect(ray_style.extend_right).toBe(false);
+  expect(ray_style.extend_right).toBeUndefined();
   expect(result.state.drawings[1].style.extend_right).toBeUndefined();
   expect(result.state.drawings[2].style.tool_options).toEqual({ line: { stats_position: "middle" } });
   const semantic = (list) => list.map(({ kind, options }) => ({

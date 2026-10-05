@@ -3,12 +3,12 @@ import { readFileSync } from "node:fs";
 import { PNG } from "pngjs";
 
 // Inline editing of drawing text through real pointer and keyboard input: double-click, Enter,
-// and F2 open the caret overlay on the engine-resolved layout, typing is live (multi-line in a
-// family text box, one rotated line in a run label such as a ray's or a rectangle's text), a
-// commit is one undo step and a cancel restores the text, the accessibility surface edits and
-// gets its focus back, the edit persists and syncs, a note shows its text only while focused, and
-// placing an annotation that starts from a default text opens the editor at once. Every layout
-// decision is engine-owned; these specs only drive the package.
+// and F2 open the caret overlay on the engine-resolved layout, typing is live (multi-line in the
+// simple annotation's box, one line in the text annotations, one rotated line in a run label such
+// as a ray's or a rectangle's text), a commit is one undo step and a cancel restores the text, the
+// accessibility surface edits and gets its focus back, the edit persists and syncs, and placing a
+// text annotation opens the editor at once. Every layout decision is engine-owned; these specs
+// only drive the package.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
@@ -76,9 +76,11 @@ async function add_on_bar(page, kind, fraction, options) {
     const range = chart.time_scale().get_visible_logical_range();
     const logical = Math.floor(range.from + (range.to - range.from) * fraction);
     const price = window.__main.data_by_index(logical).high;
-    const anchors = kind === "price_note" || kind === "callout"
+    const anchors = kind === "callout"
       ? [{ logical, price }, { logical: logical + 6, price }]
-      : [{ logical, price }];
+      : kind === "signpost"
+        ? [{ logical, price }, { logical, price: price * 1.01 }]
+        : [{ logical, price }];
     return chart.add_drawing(kind, anchors, { color: "#e91e63", ...options }).id;
   }, { kind, fraction, options });
 }
@@ -160,7 +162,8 @@ async function spot(page, logical, price) {
 
 test("double-click edits a family text box in place: live multi-line typing, one undo step, Escape restores", async ({ page }) => {
   await goto_fixture(page);
-  const id = await add_on_bar(page, "comment", 0.4);
+  // The simple annotation keeps a multi-line box (the text annotations edit one line).
+  const id = await add_on_bar(page, "simple_annotation", 0.4, { text: "Comment" });
   await settle_frames(page);
   const before = await edit_layout(page, id);
   const editor = page.locator("#chart_container #aeris_charts-text-input");
@@ -171,7 +174,7 @@ test("double-click edits a family text box in place: live multi-line typing, one
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(id);
   expect(await page.evaluate(() => window.__chart.wasm.editing_drawing())).toBe(id);
   // A labeled native multi-line text box (the text tool's single-line run is content-editable).
-  await expect(page.getByRole("textbox", { name: "comment text" })).toBeFocused();
+  await expect(page.getByRole("textbox", { name: "simple annotation text" })).toBeFocused();
   expect(await editor.evaluate((el) => el.tagName)).toBe("TEXTAREA");
   expect(await editor.evaluate((el) => getComputedStyle(el).opacity)).toBe("0");
   const wrap_box = await page.locator("#chart_container #aeris_charts-text-editor").boundingBox();
@@ -236,14 +239,12 @@ test("double-click edits a family text box in place: live multi-line typing, one
   expect(await text_of(page, id)).toBe("");
 });
 
-test("every family text box opens the editor; locked drawings and shapes without text do not", async ({ page }) => {
+test("every family text box opens the editor; a locked drawing does not", async ({ page }) => {
   await goto_fixture(page);
   const editor = page.locator("#chart_container #aeris_charts-text-input");
-  const kinds = ["anchored_text", "note", "price_note", "callout", "comment", "price_label", "signpost", "arrow_mark_up"];
+  const kinds = ["anchored_text", "note", "price_note", "callout", "comment", "simple_annotation", "flag_mark"];
   for (const [index, kind] of kinds.entries()) {
-    const id = kind === "anchored_text"
-      ? await page.evaluate(() => window.__chart.add_drawing("anchored_text", [{ logical: 0.3, price: 0.3 }], { color: "#e91e63" }).id)
-      : await add_on_bar(page, kind, 0.1 + index * 0.1);
+    const id = await add_on_bar(page, kind, 0.1 + index * 0.1, { text: "Label" });
     await page.evaluate((id) => { window.__chart.wasm.set_selected_drawing(id); window.__chart.render(); }, id);
     await page.evaluate(() => document.querySelector("#chart_container canvas:last-of-type").focus());
     await page.keyboard.press("Enter");
@@ -255,7 +256,8 @@ test("every family text box opens the editor; locked drawings and shapes without
     expect((await text_of(page, id)).endsWith("!"), kind).toBe(true);
     await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).remove(), id);
   }
-  for (const [kind, options] of [["flag_mark", {}], ["icon", {}], ["comment", { locked: true }]]) {
+  // Every unlocked drawing's label edits in place (an icon stamp's included); a locked one does not.
+  for (const [kind, options] of [["comment", { locked: true }], ["icon_stamp", { locked: true }]]) {
     const id = await add_on_bar(page, kind, 0.5, options);
     await page.evaluate((id) => { window.__chart.wasm.set_selected_drawing(id); window.__chart.render(); }, id);
     await page.evaluate(() => document.querySelector("#chart_container canvas:last-of-type").focus());
@@ -288,7 +290,7 @@ test("F2 on the accessibility drawing target edits the text and returns focus to
 
 test("edited family text persists through export/import and sync", async ({ page }) => {
   await goto_fixture(page);
-  const id = await add_on_bar(page, "signpost", 0.5);
+  const id = await add_on_bar(page, "simple_annotation", 0.5, { text: "Signpost" });
   await page.evaluate((id) => { window.__chart.wasm.set_selected_drawing(id); window.__chart.render(); }, id);
   await page.evaluate(() => document.querySelector("#chart_container canvas:last-of-type").focus());
   await page.keyboard.press("Enter");
@@ -323,48 +325,6 @@ test("edited family text persists through export/import and sync", async ({ page
   expect(result.imported).toEqual(["Signpost A\nB"]);
   expect(result.applied).toBe(true);
   expect(result.synced).toEqual(["Signpost A\nB"]);
-});
-
-test("a note shows its text only while hovered or selected unless it always shows it", async ({ page }) => {
-  await goto_fixture(page);
-  const id = await add_on_bar(page, "note", 0.5);
-  await page.evaluate(() => window.__chart.wasm.set_selected_drawing(undefined));
-  await settle_frames(page);
-  const pin = color_extent(await capture(page), PINK);
-  expect(pin).not.toBeNull();
-  expect((pin.right - pin.left) / PR, "only the pin paints at rest").toBeLessThan(20);
-  const tip = await page.evaluate((id) => {
-    const point = window.__chart.drawings().find((drawing) => drawing.id === id).points()[0];
-    return {
-      x: window.__chart.time_scale().logical_to_coordinate(point.logical),
-      y: window.__main.price_to_coordinate(point.price),
-    };
-  }, id);
-
-  // Hovering the pin head reveals the box beside it; leaving hides it again.
-  await page.mouse.move(tip.x, tip.y - 17);
-  await settle_frames(page);
-  const hovered = color_extent(await capture(page), PINK);
-  expect((hovered.right - hovered.left) / PR).toBeGreaterThan(30);
-  await page.mouse.move(tip.x, tip.y + 150);
-  await settle_frames(page);
-  expect(color_extent(await capture(page), PINK)).toEqual(pin);
-
-  // Selection keeps it; the always-visible option keeps it without focus.
-  await page.mouse.click(tip.x, tip.y - 17);
-  await page.mouse.move(tip.x, tip.y + 150);
-  await settle_frames(page);
-  expect((color_extent(await capture(page), PINK).right - pin.left) / PR).toBeGreaterThan(30);
-  await page.evaluate((id) => {
-    const chart = window.__chart;
-    chart.wasm.set_selected_drawing(undefined);
-    chart.drawings().find((drawing) => drawing.id === id).apply_options({ tool_options: { projection_annotation: { always_show_text: true } } });
-  }, id);
-  await settle_frames(page);
-  const always = color_extent(await capture(page), PINK);
-  expect((always.right - always.left) / PR).toBeGreaterThan(30);
-  expect(await page.evaluate((id) => window.__chart.drawing_kind_options(id), id))
-    .toMatchObject({ kind: "projection_annotation", always_show_text: true });
 });
 
 test("a double-click on a trend line's body opens its editor like every other text tool", async ({ page }) => {
@@ -547,7 +507,7 @@ test("an unselected drawing's label wins the hover and the click only where noth
 test("F2 on the accessibility target of a channel or a Fibonacci tool edits its text and returns focus", async ({ page }) => {
   await goto_fixture(page);
   const editor = page.locator(EDITOR);
-  for (const [kind, anchors] of [["parallel_channel", 3], ["fib_retracement", 2]]) {
+  for (const [kind, anchors] of [["parallel_channel", 3], ["fibonacci_retracement", 2]]) {
     const id = await add_diagonal(page, kind, { text: kind }, anchors);
     await settle_frames(page);
     await page.evaluate((id) => window.__chart.accessibility().focus_target(`drawing:${id}`), id);
@@ -640,7 +600,7 @@ async function place_with_tool(page, kind, tap) {
   const l0 = Math.floor(range.from + (range.to - range.from) * 0.4);
   const b0 = await page.evaluate((logical) => window.__main.data_by_index(logical), l0);
   const b1 = await page.evaluate((logical) => window.__main.data_by_index(logical), l0 + 4);
-  const spots = kind === "callout" || kind === "price_note"
+  const spots = kind === "callout"
     ? [[l0, b0.low], [l0 + 4, b1.high]]
     : [[l0, b0.high]];
   await page.evaluate((kind) => {
@@ -661,7 +621,7 @@ for (const touch of [false, true]) {
     test.use({ hasTouch: touch });
     const tap = (page) => (x, y) => (touch ? page.touchscreen.tap(x, y) : page.mouse.click(x, y));
 
-    test("placing a callout opens its editor on the default text; commit keeps the drawing and its handles", async ({ page }) => {
+    test("placing a callout opens its editor; commit keeps the drawing and its handles", async ({ page }) => {
       await goto_fixture(page);
       const editor = page.locator(EDITOR);
       await place_with_tool(page, "callout", tap(page));
@@ -670,17 +630,17 @@ for (const touch of [false, true]) {
       await expect(editor).toBeFocused();
       await expect(editor).toHaveAttribute("aria-label", "callout text");
       expect(await page.evaluate(() => window.__chart.wasm.editing_drawing())).toBe(id);
-      expect(await text_of(page, id)).toBe("Callout");
+      expect(await text_of(page, id)).toBe("");
       expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
 
-      // The caret sits after the default text: typing extends it, Enter commits one undo step.
-      await page.keyboard.type(" one");
+      // Typing is live and Enter commits the text as one undo step.
+      await page.keyboard.type("Callout one");
       await expect.poll(() => text_of(page, id)).toBe("Callout one");
       await page.keyboard.press("Enter");
       await expect(editor).toHaveCount(0);
       expect(await text_of(page, id)).toBe("Callout one");
       expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
-      expect(await text_of(page, id), "undo returns the default text").toBe("Callout");
+      expect(await text_of(page, id), "undo returns the empty text").toBe("");
       expect(await page.evaluate(() => window.__chart.drawings().length), "the drawing remains").toBe(1);
       expect(await page.evaluate(() => window.__chart.redo_drawing())).toBe(true);
 
@@ -702,32 +662,30 @@ for (const touch of [false, true]) {
       }
     });
 
-    test("placing a note opens its editor; Escape keeps the default text and the drawing", async ({ page }) => {
+    test("placing a note or a price note opens its editor; Escape leaves an empty annotation removed", async ({ page }) => {
       await goto_fixture(page);
       const editor = page.locator(EDITOR);
-      await place_with_tool(page, "note", tap(page));
-      const id = await page.evaluate(() => window.__chart.drawings().at(-1)?.id);
-      await expect(editor).toBeFocused();
-      await expect(editor).toHaveAttribute("aria-label", "note text");
-      await page.keyboard.type(" discarded");
-      await expect.poll(() => text_of(page, id)).toBe("Note discarded");
-      await page.keyboard.press("Escape");
-      await expect(editor).toHaveCount(0);
-      expect(await text_of(page, id)).toBe("Note");
-      expect(await page.evaluate(() => window.__chart.drawings().length)).toBe(1);
-      // Escape recorded no history: the only undo step is the placement itself.
-      expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
-      expect(await page.evaluate(() => window.__chart.drawings().length)).toBe(0);
+      for (const kind of ["note", "price_note"]) {
+        await place_with_tool(page, kind, tap(page));
+        const id = await page.evaluate(() => window.__chart.drawings().at(-1)?.id);
+        await expect(editor, kind).toBeFocused();
+        await expect(editor).toHaveAttribute("aria-label", `${kind.replaceAll("_", " ")} text`);
+        await page.keyboard.type("discarded");
+        await expect.poll(() => text_of(page, id)).toBe("discarded");
+        await page.keyboard.press("Escape");
+        await expect(editor).toHaveCount(0);
+        expect(await page.evaluate(() => window.__chart.drawings().length), kind).toBe(0);
+      }
     });
 
-    test("placing an arrow mark, a price label, or a price note opens no editor", async ({ page }) => {
+    test("placing an arrow marker or a price label opens no editor", async ({ page }) => {
       await goto_fixture(page);
-      for (const kind of ["arrow_mark_up", "price_label", "price_note"]) {
+      for (const kind of ["arrow_marker_up", "price_label"]) {
         await place_with_tool(page, kind, tap(page));
         await expect(page.locator(EDITOR), kind).toHaveCount(0);
         expect(await page.evaluate(() => window.__chart.wasm.editing_drawing()), kind).toBeUndefined();
       }
-      expect(await page.evaluate(() => window.__chart.drawings().length)).toBe(3);
+      expect(await page.evaluate(() => window.__chart.drawings().length)).toBe(2);
     });
   });
 }

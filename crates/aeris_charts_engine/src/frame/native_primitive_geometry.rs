@@ -9,6 +9,7 @@ use aeris_charts_core::format::time_formatter::{
 };
 use aeris_charts_core::scale::exchange_time::ExchangeTime;
 use aeris_charts_render::draw_list::TextAlign;
+use std::collections::BTreeMap;
 
 /// Session color of one source bar: the optional `[start_hour, end_hour)` gate and the weekend
 /// test both use exchange wall-clock time (fractional hours, minute precision and finer).
@@ -1014,6 +1015,405 @@ impl ChartEngine {
                             italic: false,
                         });
                     }
+                }
+                NativeSeriesPrimitiveKind::PeriodicProfile(state) => {
+                    let profiles = if state.show_developing {
+                        self.periodic_volume_profiles_for_frame_developing(
+                            state.request.source,
+                            &state.request.boundaries,
+                            state.request.tick_size,
+                            state.request.row_count,
+                            state.request.value_area_percent,
+                        )
+                    } else {
+                        self.periodic_volume_profiles_for_frame(
+                            state.request.source,
+                            &state.request.boundaries,
+                            state.request.tick_size,
+                            state.request.row_count,
+                            state.request.value_area_percent,
+                        )
+                    };
+                    let Ok(profiles) = profiles else {
+                        continue;
+                    };
+                    let pane = &self.panes[series.pane_index];
+                    let pane_top = (pane.top * vpr).round() as i32;
+                    let pane_bottom = ((pane.top + pane.height) * vpr).round() as i32;
+                    for profile in &profiles {
+                        let Some(start_logical) = self.time_to_index(
+                            profile.start_timestamp_micros.div_euclid(1_000_000) as f64,
+                            true,
+                        ) else {
+                            continue;
+                        };
+                        let Some(end_logical) = self.time_to_index(
+                            profile.end_timestamp_micros.div_euclid(1_000_000) as f64,
+                            true,
+                        ) else {
+                            continue;
+                        };
+                        if end_logical < from || start_logical > to {
+                            continue;
+                        }
+                        let left = self.time_scale.index_to_coordinate(start_logical);
+                        let right = self.time_scale.index_to_coordinate(end_logical)
+                            + self.time_scale.bar_spacing() * 0.5;
+                        let span = (right - left).max(self.time_scale.bar_spacing());
+                        let available = span * state.width_percent / 100.0;
+                        let max_volume = profile
+                            .rows
+                            .iter()
+                            .map(|row| row.total_volume)
+                            .fold(0.0_f64, f64::max);
+                        let max_delta = profile
+                            .rows
+                            .iter()
+                            .map(|row| row.delta.abs())
+                            .fold(0.0_f64, f64::max);
+                        if max_volume <= 0.0 {
+                            continue;
+                        }
+                        for row in &profile.rows {
+                            let (y, h) = positions_box(
+                                scale.price_to_coordinate(row.low, base_value),
+                                scale.price_to_coordinate(row.high, base_value),
+                                vpr,
+                            );
+                            if y + h < pane_top || y > pane_bottom {
+                                continue;
+                            }
+                            let in_area = profile.value_area_low.is_some_and(|low| row.low >= low)
+                                && profile.value_area_high.is_some_and(|high| row.low <= high);
+                            match state.mode {
+                                crate::ProfileDisplayMode::BidAsk => {
+                                    let width = available * row.total_volume / max_volume;
+                                    let mut cursor = right - width;
+                                    for (volume, color) in [
+                                        (row.bid_volume, state.colors[0]),
+                                        (row.unknown_volume, state.colors[2]),
+                                        (row.ask_volume, state.colors[1]),
+                                    ] {
+                                        if volume <= 0.0 {
+                                            continue;
+                                        }
+                                        let next = cursor + width * volume / row.total_volume;
+                                        let (x, w) = positions_box(cursor, next, hpr);
+                                        out.push(Prim::Rect {
+                                            rect: IRect {
+                                                x,
+                                                y,
+                                                w: w.max(1),
+                                                h: h.max(1),
+                                            },
+                                            color,
+                                        });
+                                        cursor = next;
+                                    }
+                                }
+                                crate::ProfileDisplayMode::Delta => {
+                                    if max_delta <= 0.0 || row.delta == 0.0 {
+                                        continue;
+                                    }
+                                    let width = available * 0.5 * row.delta.abs() / max_delta;
+                                    let center = right - available * 0.5;
+                                    let x0 = if row.delta > 0.0 {
+                                        center
+                                    } else {
+                                        center - width
+                                    };
+                                    let (x, w) = positions_box(x0, x0 + width, hpr);
+                                    out.push(Prim::Rect {
+                                        rect: IRect {
+                                            x,
+                                            y,
+                                            w: w.max(1),
+                                            h: h.max(1),
+                                        },
+                                        color: if row.delta > 0.0 {
+                                            state.colors[1]
+                                        } else {
+                                            state.colors[0]
+                                        },
+                                    });
+                                }
+                                crate::ProfileDisplayMode::Total => {
+                                    let width = available * row.total_volume / max_volume;
+                                    let (x, w) = positions_box(right - width, right, hpr);
+                                    out.push(Prim::Rect {
+                                        rect: IRect {
+                                            x,
+                                            y,
+                                            w: w.max(1),
+                                            h: h.max(1),
+                                        },
+                                        color: if in_area {
+                                            state.colors[4]
+                                        } else {
+                                            state.colors[2]
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                        for (price, color) in [
+                            (profile.poc, state.colors[3]),
+                            (profile.value_area_low, state.colors[4]),
+                            (profile.value_area_high, state.colors[4]),
+                        ] {
+                            if let Some(price) = price {
+                                out.push(Prim::HLine {
+                                    y: (scale.price_to_coordinate(price, base_value) * vpr).round()
+                                        as i32,
+                                    x0: ((right - available) * hpr).round() as i32,
+                                    x1: (right * hpr).round() as i32,
+                                    width: vpr.round().max(1.0) as i32,
+                                    style: LineStyle::Solid,
+                                    color,
+                                });
+                            }
+                        }
+                        if state.show_developing {
+                            for (price, color) in [
+                                (0, state.colors[3]),
+                                (1, state.colors[4]),
+                                (2, state.colors[4]),
+                            ] {
+                                let first_point = points.len() as u32;
+                                for value in &profile.developing {
+                                    let Some(logical) = self.time_to_index(
+                                        value.timestamp_micros.div_euclid(1_000_000) as f64,
+                                        true,
+                                    ) else {
+                                        continue;
+                                    };
+                                    if logical < from || logical > to {
+                                        continue;
+                                    }
+                                    let price = match price {
+                                        0 => value.poc,
+                                        1 => value.value_area_low,
+                                        _ => value.value_area_high,
+                                    };
+                                    points.push([
+                                        (self.time_scale.index_to_coordinate(logical) * hpr) as f32,
+                                        (scale.price_to_coordinate(price, base_value) * vpr) as f32,
+                                    ]);
+                                }
+                                let point_count = points.len() as u32 - first_point;
+                                if point_count >= 2 {
+                                    out.push(Prim::Polyline {
+                                        first_point,
+                                        point_count,
+                                        width: vpr.round().max(1.0) as f32,
+                                        style: LineStyle::Solid,
+                                        line_type: LineType::Simple,
+                                        color,
+                                    });
+                                } else {
+                                    points.truncate(first_point as usize);
+                                }
+                            }
+                        }
+                    }
+                    if state.extend_naked_levels {
+                        if let Ok(levels) =
+                            self.naked_profile_levels(state.request.source, &profiles)
+                        {
+                            for level in levels {
+                                let Some(start_logical) = self.time_to_index(
+                                    level.start_timestamp_micros.div_euclid(1_000_000) as f64,
+                                    true,
+                                ) else {
+                                    continue;
+                                };
+                                let end_logical = level.touched_timestamp_micros.and_then(|time| {
+                                    self.time_to_index(time.div_euclid(1_000_000) as f64, true)
+                                });
+                                if end_logical.is_some_and(|end| end < from) || start_logical > to {
+                                    continue;
+                                }
+                                let x0 = self.time_scale.index_to_coordinate(start_logical)
+                                    + self.time_scale.bar_spacing() * 0.5;
+                                let x1 = end_logical.map_or(self.pane_w, |end| {
+                                    self.time_scale.index_to_coordinate(end)
+                                });
+                                if x1 <= x0 {
+                                    continue;
+                                }
+                                out.push(Prim::HLine {
+                                    y: (scale.price_to_coordinate(level.price, base_value) * vpr)
+                                        .round() as i32,
+                                    x0: (x0 * hpr).round() as i32,
+                                    x1: (x1 * hpr).round() as i32,
+                                    width: vpr.round().max(1.0) as i32,
+                                    style: LineStyle::Solid,
+                                    color: if level.kind == crate::NakedProfileLevelKind::Poc {
+                                        state.colors[3]
+                                    } else {
+                                        state.colors[4]
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                NativeSeriesPrimitiveKind::TpoProfile(state) => {
+                    let Ok(profiles) = self.tpo_profiles(&state.request) else {
+                        continue;
+                    };
+                    let visible_cells = profiles
+                        .iter()
+                        .flat_map(|profile| &profile.rows)
+                        .map(|row| row.periods.len())
+                        .sum::<usize>();
+                    let dense = visible_cells > 8_192;
+                    let mut emitted = 0usize;
+                    for profile in &profiles {
+                        let seconds = profile.start_timestamp_micros.div_euclid(1_000_000);
+                        let Some(logical) = self.time_to_index(seconds as f64, true) else {
+                            continue;
+                        };
+                        if logical > to.saturating_add(1) {
+                            continue;
+                        }
+                        let start_x = self.time_scale.index_to_coordinate(logical);
+                        let max_period = profile
+                            .rows
+                            .iter()
+                            .filter_map(|row| row.periods.last().copied())
+                            .max()
+                            .map_or(0, usize::from);
+                        let end_x = start_x + (max_period + 1) as f64 * 8.0;
+                        if end_x < 0.0 || start_x > self.pane_w {
+                            continue;
+                        }
+                        let pane = &self.panes[series.pane_index];
+                        let pane_top = (pane.top * vpr).round() as i32;
+                        let pane_bottom = ((pane.top + pane.height) * vpr).round() as i32;
+                        let mut dense_rows = BTreeMap::<i32, (i32, i32, i32, usize)>::new();
+                        for row in &profile.rows {
+                            let price_y = scale.price_to_coordinate(row.price, base_value);
+                            let next_y = scale.price_to_coordinate(
+                                row.price + state.request.tick_size,
+                                base_value,
+                            );
+                            let (y, row_h) = positions_box(price_y, next_y, vpr);
+                            if y + row_h < pane_top || y > pane_bottom {
+                                continue;
+                            }
+                            if dense {
+                                let Some((&first, &last)) =
+                                    row.periods.first().zip(row.periods.last())
+                                else {
+                                    continue;
+                                };
+                                let x0 = start_x + f64::from(first) * 8.0;
+                                let x1 = start_x + (f64::from(last) + 1.0) * 8.0;
+                                let (x, w) = positions_box(x0, x1, hpr);
+                                let in_area =
+                                    profile.value_area_low.is_some_and(|low| row.price >= low)
+                                        && profile
+                                            .value_area_high
+                                            .is_some_and(|high| row.price <= high);
+                                let color_index = if row.single_print {
+                                    2
+                                } else if in_area {
+                                    1
+                                } else {
+                                    0
+                                };
+                                dense_rows
+                                    .entry(y)
+                                    .and_modify(|entry| {
+                                        entry.0 = entry.0.min(x);
+                                        entry.1 = entry.1.max(x + w);
+                                        entry.2 = entry.2.max(row_h);
+                                        entry.3 = entry.3.max(color_index);
+                                    })
+                                    .or_insert((x, x + w, row_h, color_index));
+                            } else {
+                                let in_area =
+                                    profile.value_area_low.is_some_and(|low| row.price >= low)
+                                        && profile
+                                            .value_area_high
+                                            .is_some_and(|high| row.price <= high);
+                                let color = if row.single_print {
+                                    state.colors[2]
+                                } else if in_area {
+                                    state.colors[1]
+                                } else {
+                                    state.colors[0]
+                                };
+                                for &period in &row.periods {
+                                    let x = start_x + f64::from(period) * 8.0;
+                                    if x + 8.0 < 0.0 || x > self.pane_w {
+                                        continue;
+                                    }
+                                    let letters = state.mode == crate::TpoCellMode::Letters
+                                        && row_h >= (9.0 * vpr).round() as i32;
+                                    if letters {
+                                        let alphabet =
+                                            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+                                        let letter =
+                                            alphabet[usize::from(period) % alphabet.len()] as char;
+                                        out.push(Prim::Text {
+                                            x: ((x + 4.0) * hpr) as f32,
+                                            y: ((price_y + next_y) * 0.5 * vpr) as f32,
+                                            text: letter.to_string(),
+                                            color,
+                                            size: (9.0 * vpr) as f32,
+                                            family: self.options.get().layout.font_family.clone(),
+                                            align: TextAlign::Center,
+                                            weight: 400,
+                                            italic: false,
+                                        });
+                                    } else {
+                                        out.push(Prim::Rect {
+                                            rect: IRect {
+                                                x: (x * hpr).round() as i32,
+                                                y,
+                                                w: (7.0 * hpr).round().max(1.0) as i32,
+                                                h: row_h.max(1),
+                                            },
+                                            color,
+                                        });
+                                    }
+                                    emitted += 1;
+                                }
+                            }
+                        }
+                        for (y, (left, right, height, color_index)) in dense_rows {
+                            out.push(Prim::Rect {
+                                rect: IRect {
+                                    x: left,
+                                    y,
+                                    w: (right - left).max(1),
+                                    h: height.max(1),
+                                },
+                                color: state.colors[color_index],
+                            });
+                            emitted += 1;
+                        }
+                        for (price, color) in [
+                            (profile.poc, state.colors[3]),
+                            (profile.initial_balance_low, state.colors[4]),
+                            (profile.initial_balance_high, state.colors[4]),
+                        ] {
+                            if let Some(price) = price {
+                                out.push(Prim::HLine {
+                                    y: (scale.price_to_coordinate(price, base_value) * vpr).round()
+                                        as i32,
+                                    x0: (start_x * hpr).round() as i32,
+                                    x1: (end_x.min(self.pane_w) * hpr).round() as i32,
+                                    width: vpr.round().max(1.0) as i32,
+                                    style: LineStyle::Solid,
+                                    color,
+                                });
+                            }
+                        }
+                    }
+                    debug_assert!(emitted <= crate::MAX_TPO_TOTAL_CELLS);
                 }
                 NativeSeriesPrimitiveKind::VolumeProfileIndicator(state) => {
                     if !state.options.visible {

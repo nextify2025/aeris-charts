@@ -82,9 +82,10 @@ fn install_drawings(chart: &mut ChartEngine, count: usize, mix: &str, mostly_off
         DrawingKind::HorizontalRay,
         DrawingKind::VerticalLine,
     ];
-    // Every B8 family tool (wire ids 32 and up, reserved per family), read from the engine
-    // catalog so family work never edits this harness.
-    let families = (32..=u8::MAX)
+    // Every B8 tool (the measuring ranges from wire id 13, upstream's catalog from 16, and the
+    // own-line tools at 240 and up), read from the engine catalog so tool work never edits this
+    // harness.
+    let families = (13..=u8::MAX)
         .filter_map(DrawingKind::from_u8)
         .collect::<Vec<_>>();
     for index in 0..count {

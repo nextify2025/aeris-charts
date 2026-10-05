@@ -3,16 +3,24 @@ import { readFileSync, writeFileSync } from "node:fs";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 
-// B8 Channels family (parallel channel, regression trend, flat top/bottom, disjoint channel)
-// through the public API and real pointer input: armed three-click placement, the parallel line
-// through the third anchor as a hover and drag target, the selection-only fill surface, the
-// engine-computed regression statistics and their typed options, persistence, clipboard and sync
-// round trips, the demo toolbar entries, and WebGPU == Canvas2D parity. Every geometry and
-// statistics decision is engine-owned; these specs only drive the package API and pointer.
+// B8 Channels family (parallel channel, regression trend, flat top and flat bottom channels,
+// disjoint channel, price channel) through the public API and real pointer input: armed placement
+// (three clicks, two for the regression, four for the disjoint channel), the parallel line through
+// the third anchor as a hover and drag target, the selection-only fill surface, the engine's
+// regression fit and its flat options, persistence, clipboard and sync round trips, the demo
+// toolbar entries, and WebGPU == Canvas2D parity. Every geometry and statistics decision is
+// engine-owned; these specs only drive the package API and pointer.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
-const CHANNELS = ["parallel_channel", "regression_trend", "flat_top_bottom", "disjoint_channel", "price_channel"];
+const CHANNELS = [
+  "parallel_channel",
+  "regression_trend",
+  "flat_top_channel",
+  "flat_bottom_channel",
+  "disjoint_channel",
+  "price_channel",
+];
 const PINK = [233, 30, 99]; // #e91e63 — collides with no fixture pixel
 
 test.beforeEach(async ({ page }) => {
@@ -156,9 +164,11 @@ test("every Channels tool places through the armed-tool flow and paints", async 
       window.__chart.set_drawing_tool(kind, { color: "#e91e63" });
       if (window.__chart.active_drawing_tool() !== kind) throw new Error(`${kind} not armed`);
     }, kind);
-    const clicks = kind === "regression_trend"
-      ? [[s.l0, s.p_lo], [s.l1, s.p_hi]]
-      : [[s.l0, s.p_lo], [s.l1, s.p_hi], [s.lm, s.p_hi]];
+    const clicks = {
+      regression_trend: [[s.l0, s.p_lo], [s.l1, s.p_hi]],
+      flat_bottom_channel: [[s.l0, s.p_mid], [s.l1, s.p_hi], [s.lm, s.p_lo]],
+      disjoint_channel: [[s.l0, s.p_lo], [s.l1, s.p_mid], [s.l0, s.p_hi], [s.l1, s.p_mid]],
+    }[kind] ?? [[s.l0, s.p_lo], [s.l1, s.p_hi], [s.lm, s.p_hi]];
     for (const [step, [logical, price]] of clicks.entries()) {
       const point = await spot(page, logical, price);
       if (step === 1 && index === 0) {
@@ -192,6 +202,13 @@ test("every Channels tool places through the armed-tool flow and paints", async 
     const diff = pixelmatch(clean.data, pixels.data, null, clean.width, clean.height, { threshold: 0 });
     expect(diff, `${kind} paints`).toBeGreaterThan(20);
   }
+  // Earlier builds' `flat_top_bottom` spelling arms the flat top channel.
+  expect(await page.evaluate(() => {
+    window.__chart.set_drawing_tool("flat_top_channel");
+    const armed = window.__chart.active_drawing_tool();
+    window.__chart.set_drawing_tool(null);
+    return armed;
+  })).toBe("flat_top_channel");
 });
 
 test("a parallel channel hovers and drags by its parallel line and selects its fill only once selected", async ({ page }) => {
@@ -268,7 +285,7 @@ test("a parallel channel hovers and drags by its parallel line and selects its f
   expect(extent.max_x).toBeGreaterThanOrEqual(Math.floor((width - 2) * PR));
 });
 
-test("a regression trend paints engine statistics with typed, atomic options", async ({ page }) => {
+test("a regression trend paints its fit with flat, atomic options", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const info = await page.evaluate(({ s }) => {
@@ -278,17 +295,7 @@ test("a regression trend paints engine statistics with typed, atomic options", a
     ], { color: "#e91e63" });
     return { id: drawing.id, kind_options: window.__chart.drawing_kind_options(drawing) };
   }, { s });
-  expect(info.kind_options).toEqual({
-    kind: "regression_trend",
-    middle_line: true,
-    middle_color: null,
-    upper_deviation: 2,
-    lower_deviation: -2,
-    use_upper_deviation: true,
-    use_lower_deviation: true,
-    source: "close",
-    show_pearsons: true,
-  });
+  expect(info.kind_options).toEqual({ kind: "regression_trend", source_id: null, deviations: 2 });
   await settle_frames(page);
   const wide = color_extent(await capture(page), PINK);
   expect(wide).not.toBeNull();
@@ -296,31 +303,39 @@ test("a regression trend paints engine statistics with typed, atomic options", a
   // Narrower deviations pull the outer lines in; the anchors never move vertically.
   await page.evaluate((id) => {
     window.__chart.drawings().find((drawing) => drawing.id === id)
-      .apply_options({ tool_options: { channel: { upper_deviation: 0.5, lower_deviation: -0.5 } } });
+      .apply_options({ regression_deviations: 0.5 });
   }, info.id);
   await settle_frames(page);
   const narrow = color_extent(await capture(page), PINK);
   expect(narrow.max_y - narrow.min_y).toBeLessThan(wide.max_y - wide.min_y);
   const options = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
-    return { tool_options: drawing.options().tool_options, kind_options: window.__chart.drawing_kind_options(drawing) };
+    return { options: drawing.options(), kind_options: window.__chart.drawing_kind_options(drawing) };
   }, info.id);
-  expect(options.tool_options).toEqual({ channel: { upper_deviation: 0.5, lower_deviation: -0.5 } });
-  expect(options.kind_options.upper_deviation).toBe(0.5);
-  expect(options.kind_options.source).toBe("close");
+  expect(options.options.regression_deviations).toBe(0.5);
+  expect(options.kind_options.deviations).toBe(0.5);
+
+  // Earlier builds' deviation keys fold into the flat option (the wider side).
+  const legacy = await page.evaluate((id) => {
+    const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
+    drawing.apply_options({ tool_options: { channel: { upper_deviation: 1.5, lower_deviation: -1 } } });
+    return { deviations: window.__chart.drawing_kind_options(drawing).deviations, tool_options: drawing.options().tool_options };
+  }, info.id);
+  expect(legacy.deviations).toBe(1.5);
+  expect(legacy.tool_options).toEqual({});
 
   const schema = await page.evaluate((id) => window.__chart.drawing_property_schema(
     window.__chart.drawings().find((drawing) => drawing.id === id),
   ), info.id);
-  const source = schema.properties.find((property) => property.name === "tool_options.channel.source");
-  expect(source.default).toBe("close");
-  expect(source.enum_values).toContain("hlc3");
+  const deviations = schema.properties.find((property) => property.name === "regression_deviations");
+  expect(deviations.default).toBe(2);
+  expect(schema.properties.some((property) => property.name.startsWith("tool_options.channel."))).toBe(false);
 
-  // An invalid block is rejected atomically.
+  // An invalid value is rejected atomically.
   const rejected = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
     try {
-      drawing.apply_options({ width: 7, tool_options: { channel: { upper_deviation: 1000 } } });
+      drawing.apply_options({ width: 7, regression_deviations: 1000 });
     } catch (error) {
       return { code: error.code, width: drawing.options().width };
     }
@@ -330,21 +345,20 @@ test("a regression trend paints engine statistics with typed, atomic options", a
   expect(rejected.width).toBe(1);
 });
 
-test("a regression trend drags along time only and follows a streaming update", async ({ page }) => {
+test("a regression trend drags as one body, edits its window by its anchors, and follows a streaming update", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const last = await page.evaluate(() => {
     const data = window.__main.data();
     return { index: data.length - 1, bar: data[data.length - 1] };
   });
+  // Zero deviations and no fill: the fitted center line is the only pink.
   const id = await page.evaluate(({ s, last }) => window.__chart.add_drawing("regression_trend", [
     { logical: s.l0, price: s.p_mid },
     { logical: last.index, price: s.p_mid },
-  ], { color: "#e91e63", tool_options: { channel: { use_upper_deviation: false, use_lower_deviation: false, show_pearsons: false } } }).id, { s, last });
+  ], { color: "#e91e63", regression_deviations: 0, fill_enabled: false }).id, { s, last });
   await settle_frames(page);
   const before = await points_of(page, id);
-  // The dashed regression line is the only pink: grab a dash between its ends (a dash gap may
-  // sit under one probe column, so walk along the line).
   const png = await capture(page);
   const extent = color_extent(png, PINK);
   expect(extent).not.toBeNull();
@@ -361,6 +375,7 @@ test("a regression trend drags along time only and follows a streaming update", 
     const scale = window.__chart.time_scale();
     return scale.logical_to_coordinate(1) - scale.logical_to_coordinate(0);
   });
+  // A body drag moves both anchors on both axes (upstream's free anchors), as one undo step.
   await page.mouse.down();
   await page.mouse.move(grab.x - bar * 2, grab.y - 40, { steps: 4 });
   await page.mouse.move(grab.x - bar * 4, grab.y - 80, { steps: 4 });
@@ -369,15 +384,14 @@ test("a regression trend drags along time only and follows a streaming update", 
   const moved = await points_of(page, id);
   for (const [index, point] of moved.entries()) {
     expect(point.logical).toBeLessThan(before[index].logical);
-    expect(point.price).toBe(before[index].price);
+    expect(point.price).toBeGreaterThan(before[index].price);
   }
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  expect(await points_of(page, id)).toEqual(before);
   await settle_frames(page);
 
-  // Selected, its handles sit on the regression line's ends (not at the anchors' prices), and the
-  // start handle drags along time only.
-  const start_x = (await spot(page, s.l0, s.p_mid)).x;
-  const start = { x: start_x, y: pink_line_y(png, start_x) };
+  // Selected, its handles sit on its anchors; dragging the start handle shortens the window.
+  const start = await spot(page, s.l0, s.p_mid);
   await page.evaluate((id) => {
     window.__chart.wasm.set_selected_drawing(id);
     window.__chart.render();
@@ -386,13 +400,12 @@ test("a regression trend drags along time only and follows a streaming update", 
   await page.mouse.move(start.x, start.y);
   await expect.poll(() => overlay_cursor(page)).toBe("pointer");
   await page.mouse.down();
-  await page.mouse.move(start.x + bar, start.y - 20, { steps: 3 });
-  await page.mouse.move(start.x + bar * 3, start.y - 40, { steps: 3 });
+  await page.mouse.move(start.x + bar, start.y, { steps: 3 });
+  await page.mouse.move(start.x + bar * 3, start.y, { steps: 3 });
   await page.mouse.up();
   await settle_frames(page);
   const shortened = await points_of(page, id);
   expect(shortened[0].logical).toBeGreaterThan(before[0].logical);
-  expect(shortened[0].price).toBe(before[0].price);
   expect(shortened[1]).toEqual(before[1]);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points_of(page, id)).toEqual(before);
@@ -429,9 +442,9 @@ test("Channels round-trip through persistence, clipboard, and sync with their op
     const first = await create_chart(first_host, { backend: "canvas2d", autoSize: false });
     const additions = [
       ["parallel_channel", [{ logical: 1, price: 10 }, { logical: 5, price: 12 }, { logical: 3, price: 13 }], { extend_right: true, tool_options: { channel: { middle_line: false } } }],
-      ["regression_trend", [{ logical: 0, price: 10 }, { logical: 6, price: 10 }], { tool_options: { channel: { upper_deviation: 1.5, source: "hlc3", show_pearsons: false } } }],
-      ["flat_top_bottom", [{ logical: 2, price: 9 }, { logical: 6, price: 12 }, { logical: 4, price: 8 }], { fill_enabled: false, style: "dashed" }],
-      ["disjoint_channel", [{ logical: 1, price: 11 }, { logical: 4, price: 12 }, { logical: 2, price: 9 }], { fill_color: "#00ff0040", tool_options: { channel: { middle_line: true, middle_color: "#ff9800" } } }],
+      ["regression_trend", [{ logical: 0, price: 10 }, { logical: 6, price: 10 }], { regression_deviations: 1.5, tool_options: { channel: { source: "hlc3", show_pearsons: false } } }],
+      ["flat_bottom_channel", [{ logical: 2, price: 9 }, { logical: 6, price: 12 }, { logical: 4, price: 8 }], { fill_enabled: false, style: "dashed" }],
+      ["disjoint_channel", [{ logical: 1, price: 11 }, { logical: 4, price: 12 }, { logical: 1, price: 9 }, { logical: 4, price: 10 }], { fill_color: "#00ff0040", tool_options: { channel: { middle_line: true, middle_color: "#ff9800" } } }],
     ];
     for (const [kind, anchors, style] of additions) first.add_drawing(kind, anchors, style);
     const state = first.export_state();
@@ -469,7 +482,8 @@ test("Channels round-trip through persistence, clipboard, and sync with their op
   expect(styles[0].extend_right).toBe(true);
   expect(styles[0].fill_enabled).toBeUndefined();
   expect(styles[0].tool_options).toEqual({ channel: { middle_line: false } });
-  expect(styles[1].tool_options).toEqual({ channel: { upper_deviation: 1.5, source: "hlc3", show_pearsons: false } });
+  expect(styles[1].regression_deviations).toBe(1.5);
+  expect(styles[1].tool_options).toEqual({ channel: { source: "hlc3", show_pearsons: false } });
   expect(styles[2].fill_enabled).toBe(false);
   expect(styles[3].tool_options).toEqual({ channel: { middle_line: true, middle_color: "#ff9800" } });
   const semantic = (list) => list.map(({ kind, options }) => ({
@@ -481,6 +495,7 @@ test("Channels round-trip through persistence, clipboard, and sync with their op
     tool_options: options.tool_options,
     style: options.style,
     width: options.width,
+    regression_deviations: options.regression_deviations,
   }));
   expect(semantic(result.restored)).toEqual(semantic(result.expected));
   expect(semantic(result.pasted)).toEqual(semantic(result.expected));
@@ -488,7 +503,7 @@ test("Channels round-trip through persistence, clipboard, and sync with their op
   expect(semantic(result.synced)).toEqual(semantic(result.expected));
 });
 
-test("a named template replaces a regression trend's channel options", async ({ page }) => {
+test("a named template replaces a regression trend's options", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const result = await page.evaluate(({ s }) => {
@@ -496,9 +511,11 @@ test("a named template replaces a regression trend's channel options", async ({ 
     const anchors = [{ logical: s.l0, price: s.p_mid }, { logical: s.l1, price: s.p_mid }];
     const custom = chart.add_drawing("regression_trend", anchors, {
       width: 3,
-      tool_options: { channel: { upper_deviation: 3, source: "hl2" } },
+      regression_deviations: 3,
+      tool_options: { channel: { source: "hl2" } },
     });
     const quiet = chart.add_drawing("regression_trend", anchors, {
+      regression_deviations: 1,
       tool_options: { channel: { show_pearsons: false } },
     });
     const plain = chart.add_drawing("regression_trend", anchors);
@@ -516,8 +533,7 @@ test("a named template replaces a regression trend's channel options", async ({ 
   expect(result.reset.tool_options).toEqual({});
   expect(result.reset.kind_options).toEqual(result.plain.kind_options);
   expect(result.replaced.tool_options).toEqual({ channel: { show_pearsons: false } });
-  expect(result.replaced.kind_options.upper_deviation).toBe(2);
-  expect(result.replaced.kind_options.source).toBe("close");
+  expect(result.replaced.kind_options.deviations).toBe(1);
 });
 
 test("the demo toolbar arms every Channels tool", async ({ page }) => {
@@ -547,8 +563,8 @@ test("Channels render pixel-identical on WebGPU and Canvas2D (AA coverage steps 
       const up = (fraction) => lo + (hi - lo) * fraction;
       chart.add_drawing("parallel_channel", [{ logical: at(0.1), price: up(0.1) }, { logical: at(0.3), price: up(0.4) }, { logical: at(0.2), price: up(0.6) }], { color: "#e91e63", width: 2 });
       chart.add_drawing("regression_trend", [{ logical: at(0.35), price: up(0.5) }, { logical: at(0.6), price: up(0.5) }], { color: "#089981" });
-      chart.add_drawing("flat_top_bottom", [{ logical: at(0.62), price: up(0.2) }, { logical: at(0.8), price: up(0.6) }, { logical: at(0.7), price: up(0.4) }], { color: "#7b1fa2" });
-      chart.add_drawing("disjoint_channel", [{ logical: at(0.82), price: up(0.5) }, { logical: at(0.95), price: up(0.7) }, { logical: at(0.9), price: up(0.3) }], { color: "#ff6d00", style: "dotted", tool_options: { channel: { middle_line: true } } });
+      chart.add_drawing("flat_top_channel", [{ logical: at(0.62), price: up(0.2) }, { logical: at(0.8), price: up(0.6) }, { logical: at(0.7), price: up(0.4) }], { color: "#7b1fa2" });
+      chart.add_drawing("disjoint_channel", [{ logical: at(0.82), price: up(0.5) }, { logical: at(0.95), price: up(0.7) }, { logical: at(0.82), price: up(0.3) }, { logical: at(0.95), price: up(0.35) }], { color: "#ff6d00", style: "dotted" });
       chart.add_drawing("price_channel", [{ logical: at(0.1), price: up(0.55) }, { logical: at(0.3), price: up(0.65) }, { logical: at(0.2), price: up(0.4) }], { color: "#2962ff", width: 2 });
       const first = chart.drawings()[0];
       chart.wasm.set_selected_drawing(first.id);

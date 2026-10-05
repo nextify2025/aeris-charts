@@ -10,6 +10,14 @@
 //! the caller emits through the existing `Prim::Polyline` / `Prim::BandFill` contracts, so every
 //! executor paints the same tessellation.
 
+// ponytail: since the upstream B8 sync retired the own line's family renderers, nothing calls the
+// arc/ellipse tessellation (`EllipseArc`, `arc_segment_count`), the clip-aware flattening
+// (`EllipseArc::append_clipped_points`, `flatten_quadratic`, `flatten_cubic`),
+// `clip_to_half_plane`, `circle_through`, or `nonzero_ribbon` (the highlighter's `tube_ribbon`
+// still uses the tube outline, `nonzero_ribbon_contours`, and `simplify_polyline`). They stay, with
+// their tests, to re-apply clip-aware curve flattening on upstream's lowering (the retired extras
+// listed in the engine's `drawings/tools.rs`); delete them if that is dropped instead.
+
 /// A point `(x, y)` in the caller's coordinate space.
 pub type Point = (f64, f64);
 

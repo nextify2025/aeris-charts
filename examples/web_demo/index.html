@@ -349,7 +349,7 @@
       <!-- B8: lines — begin -->
       <button type="button" data-tool="ray" title="Ray: from the first anchor through the second to the pane edge">ray</button>
       <button type="button" data-tool="extended_line" title="Extended line: through both anchors to both pane edges">ext line</button>
-      <button type="button" data-tool="info_line" title="Info line: segment with price change, percent, bars, duration, and angle stats">info line</button>
+      <button type="button" data-tool="info_line" title="Info line: segment with its measurement labels (price change, percent, bars, duration)">info line</button>
       <button type="button" data-tool="trend_angle" title="Trend angle: segment with its screen angle against the horizontal">trend angle</button>
       <button type="button" data-tool="cross_line" title="Cross line: horizontal and vertical lines through one anchor">cross line</button>
       <button type="button" data-tool="arrow_line" title="Arrow: two-anchor segment ending in an arrowhead">arrow</button>
@@ -360,22 +360,23 @@
       <!-- B8: lines — end -->
       <!-- B8: channels — begin -->
       <button type="button" data-tool="parallel_channel" title="Parallel channel: two clicks for the base line, a third for the parallel line">parallel channel</button>
-      <button type="button" data-tool="regression_trend" title="Regression trend: linear regression of closes between two bars with ±2 standard-deviation lines and Pearson's R">regression</button>
-      <button type="button" data-tool="flat_top_bottom" title="Flat top/bottom: a trend line and a horizontal level at the third click">flat top/bottom</button>
-      <button type="button" data-tool="disjoint_channel" title="Disjoint channel: a trend line and its mirrored-slope line through the third click">disjoint channel</button>
+      <button type="button" data-tool="regression_trend" title="Regression trend: linear regression of closes between two bars with ±2 standard-deviation lines; a dashed anchor segment until two bars are in range">regression</button>
+      <button type="button" data-tool="flat_top_channel" title="Flat top channel: two clicks for the trend line, a third for the horizontal top">flat top</button>
+      <button type="button" data-tool="flat_bottom_channel" title="Flat bottom channel: two clicks for the trend line, a third for the horizontal bottom">flat bottom</button>
+      <button type="button" data-tool="disjoint_channel" title="Disjoint channel: two clicks for the first line, two more for the second">disjoint channel</button>
       <button type="button" data-tool="price_channel" title="Price channel: a base line with its parallel through the third click and the mirror of that parallel">price channel</button>
       <!-- B8: channels — end -->
       <!-- B8: fibonacci — begin -->
-      <button type="button" data-tool="fib_retracement" title="Fib retracement: ratio levels between two anchors (level 0 on the second)">fib retr</button>
-      <button type="button" data-tool="trend_based_fib_extension" title="Trend-based fib extension: the first leg's move projected from a third anchor">fib ext</button>
-      <button type="button" data-tool="fib_channel" title="Fib channel: ratio lines parallel to the first leg, offset toward a third anchor">fib channel</button>
-      <button type="button" data-tool="fib_time_zone" title="Fib time zones: vertical lines at Fibonacci multiples of the anchors' time distance">fib zones</button>
-      <button type="button" data-tool="trend_based_fib_time" title="Trend-based fib time: the first leg's duration projected from a third anchor">fib time</button>
-      <button type="button" data-tool="fib_speed_resistance_fan" title="Fib speed resistance fan: price and time ratio rays from the first anchor">fib fan</button>
-      <button type="button" data-tool="fib_speed_resistance_arcs" title="Fib speed resistance arcs: ratio arcs around the first anchor toward the second">fib arcs</button>
-      <button type="button" data-tool="fib_circles" title="Fib circles: concentric ratio circles around the anchors' midpoint">fib circles</button>
-      <button type="button" data-tool="fib_spiral" title="Fib spiral: golden spiral around the first anchor through the second">fib spiral</button>
-      <button type="button" data-tool="fib_wedge" title="Fib wedge: ratio arcs between two edges from the first anchor">fib wedge</button>
+      <button type="button" data-tool="fibonacci_retracement" title="Fib retracement: ratio levels between two anchors (level 0 on the first)">fib retr</button>
+      <button type="button" data-tool="fibonacci_extension" title="Trend-based fib extension: the first leg's move projected from a third anchor">fib ext</button>
+      <button type="button" data-tool="fibonacci_channel" title="Fib channel: ratio lines parallel to the first leg, offset toward a third anchor">fib channel</button>
+      <button type="button" data-tool="fibonacci_time_zones" title="Fib time zones: vertical lines at Fibonacci multiples of the anchors' time distance">fib zones</button>
+      <button type="button" data-tool="fibonacci_trend_time" title="Trend-based fib time: the first leg's duration projected from a third anchor">fib time</button>
+      <button type="button" data-tool="fibonacci_speed_fan" title="Fib speed resistance fan: price ratio rays from the first anchor">fib fan</button>
+      <button type="button" data-tool="fibonacci_speed_arcs" title="Fib speed resistance arcs: ratio half-arcs around the second anchor, opening toward the first">fib arcs</button>
+      <button type="button" data-tool="fibonacci_circles" title="Fib circles: concentric ratio circles around the second anchor">fib circles</button>
+      <button type="button" data-tool="fibonacci_spiral" title="Fib spiral: spiral around the first anchor through the second">fib spiral</button>
+      <button type="button" data-tool="fibonacci_wedge" title="Fib wedge: ratio arcs between two edges from the first anchor">fib wedge</button>
       <!-- B8: fibonacci — end -->
       <!-- B8: pitchforks_gann — begin -->
       <button type="button" data-tool="andrews_pitchfork" title="Andrews pitchfork: pivot, then the two handle ends; median through the handle midpoint with parallel tines">pitchfork</button>
@@ -385,58 +386,58 @@
       <button type="button" data-tool="pitchfan" title="Pitchfan: rays from the pivot through the pitchfork levels of the handle">pitchfan</button>
       <button type="button" data-tool="gann_box" title="Gann box: price and time levels between two corners with zone fills">gann box</button>
       <button type="button" data-tool="gann_square" title="Gann square: grid, angle fan, and arcs between two corners">gann square</button>
-      <button type="button" data-tool="gann_square_fixed" title="Gann square fixed: one click places a fixed-size square (size and price-per-bar ratio in its options)">gann fixed</button>
+      <button type="button" data-tool="gann_square_fixed" title="Gann square fixed: two clicks size a square on screen">gann fixed</button>
       <button type="button" data-tool="gann_fan" title="Gann fan: 1x8 … 8x1 angles from the first anchor, the 1x1 through the second">gann fan</button>
       <!-- B8: pitchforks_gann — end -->
       <!-- B8: projection_annotations — begin -->
-      <button type="button" data-tool="forecast" title="Forecast: source and target; the target box turns into success or failure as bars arrive">forecast</button>
-      <button type="button" data-tool="bars_pattern" title="Bars pattern: copies the bars between two clicks as a movable ghost">bars pattern</button>
+      <button type="button" data-tool="forecast" title="Forecast: source and target; the label shows the move and turns to target reached or expired as bars arrive">forecast</button>
+      <button type="button" data-tool="bars_pattern" title="Bars pattern: copies the bars between the first two clicks; the third places the movable copy">bars pattern</button>
       <button type="button" data-tool="price_range" title="Price range: price change, percent, and ticks between two prices">price range</button>
       <button type="button" data-tool="date_range" title="Date range: bars and duration between two times">date range</button>
-      <button type="button" data-tool="date_and_price_range" title="Date and price range: click start and end; shows price and time statistics. Shift+click (or Shift+drag) anywhere measures without a tool; click again to finish, then click or Escape to dismiss">date+price</button>
-      <button type="button" data-tool="projection" title="Projection: sector from an apex through a radius point to a price point">projection</button>
+      <button type="button" data-tool="date_price_range" title="Date and price range: click start and end; shows price and time statistics. Shift+click (or Shift+drag) anywhere measures without a tool; click again to finish, then click or Escape to dismiss">date+price</button>
+      <button type="button" data-tool="projection" title="Projection: an apex, then a target whose time and price set the projected triangle">projection</button>
       <button type="button" data-tool="anchored_text" title="Anchored text: text pinned to a pane position that stays put while the chart scrolls">anchored text</button>
-      <button type="button" data-tool="note" title="Note: pin marker with a note">note</button>
-      <button type="button" data-tool="price_note" title="Price note: leader from a price to its label">price note</button>
+      <button type="button" data-tool="note" title="Note: one-line text at a point">note</button>
+      <button type="button" data-tool="price_note" title="Price note: one-line text at a price">price note</button>
       <button type="button" data-tool="callout" title="Callout: text box with a pointer to a point">callout</button>
-      <button type="button" data-tool="comment" title="Comment: speech bubble pointing at a point">comment</button>
+      <button type="button" data-tool="comment" title="Comment: one-line text at a point">comment</button>
       <button type="button" data-tool="price_label" title="Price label: bubble with the point's price">price label</button>
-      <button type="button" data-tool="signpost" title="Signpost: pole with a text plate">signpost</button>
+      <button type="button" data-tool="signpost" title="Signpost: a pole marker from its foot to its top">signpost</button>
       <button type="button" data-tool="flag_mark" title="Flag mark">flag</button>
-      <button type="button" data-tool="arrow_mark_up" title="Arrow mark up">arrow up</button>
-      <button type="button" data-tool="arrow_mark_down" title="Arrow mark down">arrow down</button>
-      <button type="button" data-tool="arrow_mark_left" title="Arrow mark left">arrow left</button>
-      <button type="button" data-tool="arrow_mark_right" title="Arrow mark right">arrow right</button>
-      <button type="button" data-tool="icon" title="Icon stamp from the built-in icon set">icon</button>
+      <button type="button" data-tool="arrow_marker_up" title="Arrow marker up">arrow up</button>
+      <button type="button" data-tool="arrow_marker_down" title="Arrow marker down">arrow down</button>
+      <button type="button" data-tool="arrow_marker_left" title="Arrow marker left">arrow left</button>
+      <button type="button" data-tool="arrow_marker_right" title="Arrow marker right">arrow right</button>
+      <button type="button" data-tool="icon_stamp" title="Icon stamp from the built-in icon set">icon</button>
       <button type="button" data-tool="simple_tag" title="Simple tag: dashed line across the pane; its axis tag shows your text or the price">simple tag</button>
       <button type="button" data-tool="simple_annotation" title="Simple annotation: dashed stem with a head under boxed text">annotation</button>
       <!-- B8: projection_annotations — end -->
       <!-- B8: patterns_elliott_cycles — begin -->
-      <button type="button" data-tool="xabcd_pattern" title="XABCD pattern: five clicks (X, A, B, C, D); shaded XAB/BCD triangles with Fibonacci ratios">XABCD</button>
-      <button type="button" data-tool="cypher_pattern" title="Cypher pattern: five clicks (X, A, B, C, D); ratios AB/XA, XC/XA, CD/XC">cypher</button>
-      <button type="button" data-tool="abcd_pattern" title="ABCD pattern: four clicks with BC/AB and CD/BC ratios">ABCD</button>
-      <button type="button" data-tool="head_and_shoulders" title="Head and shoulders: seven clicks (base, shoulder, neck, head, neck, shoulder, base) with the neckline">H&amp;S</button>
-      <button type="button" data-tool="triangle_pattern" title="Triangle pattern: four clicks (A, B, C, D) on alternating highs and lows; sides extend to their apex">triangle pattern</button>
-      <button type="button" data-tool="three_drives_pattern" title="Three drives: seven clicks with drive and retracement ratios">three drives</button>
-      <button type="button" data-tool="elliott_impulse_wave" title="Elliott impulse wave: six clicks (0, 1, 2, 3, 4, 5) labeled in the selected degree">impulse</button>
-      <button type="button" data-tool="elliott_correction_wave" title="Elliott correction wave: four clicks (0, A, B, C)">correction</button>
-      <button type="button" data-tool="elliott_triangle_wave" title="Elliott triangle wave: six clicks (0, A, B, C, D, E)">EW triangle</button>
-      <button type="button" data-tool="elliott_double_combo" title="Elliott double combination: four clicks (0, W, X, Y)">WXY</button>
-      <button type="button" data-tool="elliott_triple_combo" title="Elliott triple combination: six clicks (0, W, X, Y, X, Z)">WXYXZ</button>
+      <button type="button" data-tool="pattern_xabcd" title="XABCD pattern: five clicks (X, A, B, C, D) with Fibonacci ratios">XABCD</button>
+      <button type="button" data-tool="pattern_cypher" title="Cypher pattern: five clicks (X, A, B, C, D); ratios AB/XA, XC/XA, CD/XC">cypher</button>
+      <button type="button" data-tool="pattern_abcd" title="ABCD pattern: four clicks with BC/AB and CD/BC ratios">ABCD</button>
+      <button type="button" data-tool="pattern_head_shoulders" title="Head and shoulders: seven clicks (base, shoulder, neck, head, neck, shoulder, base)">H&amp;S</button>
+      <button type="button" data-tool="pattern_triangle" title="Triangle pattern: five clicks (A, B, C, D, E) on alternating highs and lows">triangle pattern</button>
+      <button type="button" data-tool="pattern_three_drives" title="Three drives: six clicks with drive and retracement ratios">three drives</button>
+      <button type="button" data-tool="elliott_impulse" title="Elliott impulse wave: six clicks (0, 1, 2, 3, 4, 5), each labeled with the wave degree">impulse</button>
+      <button type="button" data-tool="elliott_correction" title="Elliott correction wave: four clicks (0, A, B, C)">correction</button>
+      <button type="button" data-tool="elliott_triangle" title="Elliott triangle wave: six clicks (0, A, B, C, D, E)">EW triangle</button>
+      <button type="button" data-tool="elliott_double_combination" title="Elliott double combination: four clicks (0, W, X, Y)">WXY</button>
+      <button type="button" data-tool="elliott_triple_combination" title="Elliott triple combination: six clicks (0, W, X, Y, X, Z)">WXYXZ</button>
       <button type="button" data-tool="cyclic_lines" title="Cyclic lines: two clicks set the interval; vertical lines repeat it to the right">cyclic lines</button>
       <button type="button" data-tool="time_cycles" title="Time cycles: two clicks set one arch's width and height; arches repeat both ways">time cycles</button>
-      <button type="button" data-tool="sine_line" title="Sine line: click a peak, then the next trough">sine</button>
+      <button type="button" data-tool="sine_line" title="Sine line: click a zero crossing, then the next peak or trough">sine</button>
       <!-- B8: patterns_elliott_cycles — end -->
       <!-- B8: shapes — begin -->
-      <button type="button" data-tool="rotated_rectangle" title="Rotated rectangle: click the midpoints of the two short sides, then a point on a long side">rot rect</button>
+      <button type="button" data-tool="rotated_rectangle" title="Rotated rectangle: click the two ends of one edge, then a point on the opposite edge">rot rect</button>
       <button type="button" data-tool="ellipse" title="Ellipse inscribed in two corners; Shift makes a circle">ellipse</button>
       <button type="button" data-tool="circle" title="Circle: click the center, then a point on the rim">circle</button>
       <button type="button" data-tool="triangle" title="Triangle: click three vertices">triangle</button>
-      <button type="button" data-tool="arc" title="Arc: click the start, the end, then a point the arc passes through">arc</button>
-      <button type="button" data-tool="curve" title="Curve: click the start, the end, then the point the curve passes at its middle">curve</button>
-      <button type="button" data-tool="double_curve" title="Double curve: click the start, the end, then the points the curve passes at one and two thirds">double curve</button>
+      <button type="button" data-tool="arc" title="Arc: click the start, a point the arc passes through, then the end">arc</button>
+      <button type="button" data-tool="curve" title="Curve: click the start, the control point, then the end">curve</button>
+      <button type="button" data-tool="double_curve" title="Double curve: click the start, two control points, then the end">double curve</button>
       <button type="button" data-tool="polyline" title="Polyline: click vertices; double-click or Enter to finish, Backspace to remove the latest vertex">polyline</button>
-      <button type="button" data-tool="highlighter" title="Highlighter: drag a wide translucent marker stroke">highlighter</button>
+      <button type="button" data-tool="highlighter" title="Highlighter: drag a translucent 12 px marker stroke">highlighter</button>
       <!-- B8: shapes — end -->
       <label title="Hypothetical balance used by position drawing statistics">balance <input type="number" id="position_account_size" min="0.01" max="1000000000000000" step="any" value="1000"></label>
       <label title="Percentage of the hypothetical balance risked at the stop">risk % <input type="number" id="position_risk_percent" min="0" max="100" step="any" value="25"></label>

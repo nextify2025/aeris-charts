@@ -5,25 +5,24 @@ import { PNG } from "pngjs";
 
 // B8 Patterns, Elliott waves, and cycles family through the public API and real pointer input:
 // armed multi-click placement of every tool with its progressive preview, handle and body edits
-// with undo, typed pattern/Elliott options and their effect on paint and hit testing, cycle repeats
-// that span the pane from their anchors, point labels and selected region fills as pointer
-// targets, persistence/clipboard/sync round trips, the demo toolbar, and WebGPU == Canvas2D parity. Every geometry decision is engine-owned; these specs only drive
-// the package API and the pointer.
+// with undo, the flat Elliott degree and its effect on paint, cycle repeats across the pane,
+// persistence/clipboard/sync round trips, the demo toolbar, and WebGPU == Canvas2D parity. Every
+// geometry decision is engine-owned; these specs only drive the package API and the pointer.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
 const ANCHORS = {
-  xabcd_pattern: 5,
-  cypher_pattern: 5,
-  abcd_pattern: 4,
-  head_and_shoulders: 7,
-  triangle_pattern: 4,
-  three_drives_pattern: 7,
-  elliott_impulse_wave: 6,
-  elliott_correction_wave: 4,
-  elliott_triangle_wave: 6,
-  elliott_double_combo: 4,
-  elliott_triple_combo: 6,
+  pattern_xabcd: 5,
+  pattern_cypher: 5,
+  pattern_abcd: 4,
+  pattern_head_shoulders: 7,
+  pattern_triangle: 5,
+  pattern_three_drives: 6,
+  elliott_impulse: 6,
+  elliott_correction: 4,
+  elliott_triangle: 6,
+  elliott_double_combination: 4,
+  elliott_triple_combination: 6,
   cyclic_lines: 2,
   time_cycles: 2,
   sine_line: 2,
@@ -158,7 +157,7 @@ test("every pattern, wave, and cycle tool places through the armed-tool flow and
 test("multi-anchor placement previews progressively and edits by handle and body", async ({ page }) => {
   await goto_fixture(page);
   const anchors = await zigzag(page, 5);
-  await page.evaluate(() => window.__chart.set_drawing_tool("xabcd_pattern", { color: "#e91e63" }));
+  await page.evaluate(() => window.__chart.set_drawing_tool("pattern_xabcd", { color: "#e91e63" }));
   const first = await spot(page, anchors[0].logical, anchors[0].price);
   const second = await spot(page, anchors[1].logical, anchors[1].price);
   const third = await spot(page, anchors[2].logical, anchors[2].price);
@@ -166,10 +165,11 @@ test("multi-anchor placement previews progressively and edits by handle and body
   await page.mouse.click(second.x, second.y);
   await page.mouse.move(third.x, third.y, { steps: 3 });
   await settle_frames(page);
-  // X-A plus the leg to the pointer paint before the pattern exists.
+  // X-A plus the leg to the pointer paint before the pattern exists (the placed X handle may
+  // cover the first few pixels of the leg).
   const preview = color_extent(await capture(page), PINK);
   expect(preview).not.toBeNull();
-  expect(preview.min).toBeLessThanOrEqual(Math.ceil(first.x * PR) + 2);
+  expect(preview.min).toBeLessThanOrEqual(Math.ceil((first.x + 6) * PR));
   expect(preview.max).toBeGreaterThanOrEqual(Math.floor(third.x * PR) - 2);
   expect(await drawings(page)).toHaveLength(0);
   for (const anchor of anchors.slice(2)) {
@@ -178,7 +178,7 @@ test("multi-anchor placement previews progressively and edits by handle and body
   }
   await settle_frames(page);
   const [created] = await drawings(page);
-  expect(created.kind).toBe("xabcd_pattern");
+  expect(created.kind).toBe("pattern_xabcd");
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(created.id);
 
   // Drag the B handle: only that anchor moves, and undo restores it as one step.
@@ -213,88 +213,68 @@ test("multi-anchor placement previews progressively and edits by handle and body
   }
 });
 
-test("Elliott degree and pattern options are typed, atomic, and change paint and hit testing", async ({ page }) => {
+test("the Elliott degree is a flat, atomic option that relabels the wave", async ({ page }) => {
   await goto_fixture(page);
   const anchors = await zigzag(page, 6, 0.2, 0.7);
   const wave = await page.evaluate(({ anchors }) => {
-    const drawing = window.__chart.add_drawing("elliott_impulse_wave", anchors, { color: "#e91e63" });
+    const drawing = window.__chart.add_drawing("elliott_impulse", anchors, { color: "#e91e63" });
     const schema = window.__chart.drawing_property_schema(drawing);
-    const degree = schema.properties.find((property) => property.name === "tool_options.pattern.degree");
+    const degree = schema.properties.find((property) => property.name === "wave_degree");
     return {
       id: drawing.id,
       kind_options: window.__chart.drawing_kind_options(drawing),
       degree_default: degree.default,
       degrees: degree.enum_values,
-      color_default: schema.properties.find((property) => property.name === "color").default,
     };
   }, { anchors });
-  expect(wave.kind_options).toEqual({ kind: "elliott_wave", degree: "intermediate", show_wave: true });
-  expect(wave.degree_default).toBe("intermediate");
-  expect(wave.degrees).toEqual([
-    "supermillennium", "millennium", "submillennium", "grand_supercycle", "supercycle", "cycle",
-    "primary", "intermediate", "minor", "minute", "minuette", "subminuette",
+  expect(wave.kind_options).toEqual({ kind: "elliott", wave_degree: "minor" });
+  expect(wave.degree_default).toBe("minor");
+  expect([...wave.degrees].sort()).toEqual([
+    "cycle", "grand_supercycle", "intermediate", "millennium", "minor", "minuette", "minute",
+    "primary", "submillennium", "subminuette", "supercycle", "supermillennium",
   ]);
-  expect(wave.color_default).toBe("#3D85C6");
   await settle_frames(page);
-  const intermediate = await capture(page);
+  const minor = await capture(page);
 
-  // A ringed degree repaints the labels; the change is typed and persisted in options.
+  // Another degree relabels the wave; the change is a flat option.
   await page.evaluate((id) => {
-    window.__chart.drawings().find((drawing) => drawing.id === id)
-      .apply_options({ tool_options: { pattern: { degree: "primary" } } });
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ wave_degree: "primary" });
   }, wave.id);
   await settle_frames(page);
   const primary = await capture(page);
-  expect(pixelmatch(intermediate.data, primary.data, null, primary.width, primary.height, { threshold: 0 })).toBeGreaterThan(20);
+  expect(pixelmatch(minor.data, primary.data, null, primary.width, primary.height, { threshold: 0 })).toBeGreaterThan(20);
   const options = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
-    return { tool_options: drawing.options().tool_options, kind_options: window.__chart.drawing_kind_options(drawing) };
+    return { wave_degree: drawing.options().wave_degree, kind_options: window.__chart.drawing_kind_options(drawing) };
   }, wave.id);
-  expect(options.tool_options).toEqual({ pattern: { show_ratios: true, degree: "primary", show_wave: true } });
-  expect(options.kind_options).toEqual({ kind: "elliott_wave", degree: "primary", show_wave: true });
+  expect(options).toEqual({ wave_degree: "primary", kind_options: { kind: "elliott", wave_degree: "primary" } });
 
-  // Invalid blocks are rejected atomically.
+  // Earlier builds' `tool_options.pattern.degree` moves onto the flat option.
+  const legacy = await page.evaluate((id) => {
+    const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
+    drawing.apply_options({ tool_options: { pattern: { degree: "minute" } } });
+    return drawing.options().wave_degree;
+  }, wave.id);
+  expect(legacy).toBe("minute");
+
+  // An invalid degree is rejected atomically.
   const rejected = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
+    const width = drawing.options().width;
     try {
-      drawing.apply_options({ width: 7, tool_options: { pattern: { degree: "tiny" } } });
+      drawing.apply_options({ width: width + 5, wave_degree: "tiny" });
     } catch (error) {
-      return { code: error.code, width: drawing.options().width };
+      return { code: error.code, unchanged: drawing.options().width === width };
     }
-    return { code: null, width: drawing.options().width };
+    return { code: null, unchanged: drawing.options().width === width };
   }, wave.id);
-  expect(rejected.code).toBe("invalid_options");
-  expect(rejected.width).toBe(2);
+  expect(rejected).toEqual({ code: "invalid_options", unchanged: true });
 
-  // The wave leg hovers; hiding the wave removes that target.
+  // The wave leg hovers.
   const a = await spot(page, anchors[2].logical, anchors[2].price);
   const b = await spot(page, anchors[3].logical, anchors[3].price);
-  const leg = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-  await page.mouse.move(leg.x, leg.y);
+  await page.mouse.move((a.x + b.x) / 2, (a.y + b.y) / 2);
   await expect.poll(() => overlay_cursor(page)).toBe("move");
-  await page.evaluate((id) => {
-    window.__chart.drawings().find((drawing) => drawing.id === id)
-      .apply_options({ tool_options: { pattern: { show_wave: false } } });
-  }, wave.id);
-  await settle_frames(page);
-  await page.mouse.move(leg.x + 1, leg.y);
-  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
-
-  // Harmonic ratios toggle with their connectors.
-  const xabcd = await page.evaluate(({ anchors }) => {
-    const drawing = window.__chart.add_drawing("xabcd_pattern", anchors.slice(0, 5), { color: "#e91e63" });
-    return { id: drawing.id, kind_options: window.__chart.drawing_kind_options(drawing) };
-  }, { anchors });
-  expect(xabcd.kind_options).toEqual({ kind: "pattern", show_ratios: true });
-  await settle_frames(page);
-  const with_ratios = color_extent(await capture(page), PINK);
-  await page.evaluate((id) => {
-    window.__chart.drawings().find((drawing) => drawing.id === id)
-      .apply_options({ tool_options: { pattern: { show_ratios: false } } });
-  }, xabcd.id);
-  await settle_frames(page);
-  const without_ratios = color_extent(await capture(page), PINK);
-  expect(without_ratios.count).toBeLessThan(with_ratios.count);
 });
 
 test("cycles repeat across the pane from their anchors and hit on a far repeat", async ({ page }) => {
@@ -309,59 +289,43 @@ test("cycles repeat across the pane from their anchors and hit on a far repeat",
   const first = await spot(page, start.logical, start.price);
   const second = await spot(page, end.logical, start.price);
   const spacing = second.x - first.x;
-  expect(extent.min).toBeGreaterThanOrEqual(Math.floor(first.x * PR) - 2);
+  // Cyclic lines repeat both ways across the whole pane.
+  expect(extent.min).toBeLessThanOrEqual(Math.ceil(spacing * PR) + 2);
   expect(extent.max).toBeGreaterThanOrEqual(Math.floor((width - spacing - 2) * PR));
-  // A repeat far right of both anchors is a hover target; the span before the first is not.
+  // A repeat far right of both anchors is a hover target; the gap between two repeats is not.
   const repeat_x = first.x + spacing * Math.floor((width - first.x) / spacing - 1);
   await page.mouse.move(repeat_x, 60);
   await expect.poll(() => overlay_cursor(page)).toBe("move");
-  await page.mouse.move(first.x - spacing / 2, 60);
+  await page.mouse.move(repeat_x - spacing / 2, 60);
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
 
-  // Time cycles and the sine line repeat both ways.
+  // Time cycles and the sine line run from their first anchor to the right edge.
   for (const kind of ["time_cycles", "sine_line"]) {
     await goto_fixture(page);
     await page.evaluate(({ kind, start, end }) => window.__chart.add_drawing(kind, [start, end], { color: "#e91e63" }), { kind, start, end });
     await settle_frames(page);
-    const both = color_extent(await capture(page), PINK);
-    expect(both.min, `${kind} reaches the left edge`).toBeLessThanOrEqual(Math.ceil(spacing * PR) + 2);
-    expect(both.max, `${kind} reaches the right edge`).toBeGreaterThanOrEqual(Math.floor((width - spacing) * PR));
+    const right = color_extent(await capture(page), PINK);
+    expect(right.min, `${kind} starts at its first anchor`).toBeGreaterThanOrEqual(Math.floor(first.x * PR) - 4);
+    expect(right.max, `${kind} reaches the right edge`).toBeGreaterThanOrEqual(Math.floor((width - spacing) * PR));
   }
 });
 
-test("point labels select their pattern and region fills become drag targets once selected", async ({ page }) => {
+test("a time-cycle line selects the drawing and drags it as one body", async ({ page }) => {
   await goto_fixture(page);
-  const anchors = await zigzag(page, 7, 0.2, 0.6);
-  const pattern = await page.evaluate(({ anchors }) => window.__chart.add_drawing("head_and_shoulders", anchors, { color: "#e91e63" }).id, { anchors });
-  await settle_frames(page);
-  // The head (anchor 3, a high) carries its label above it, clear of every leg.
-  const head = await spot(page, anchors[3].logical, anchors[3].price);
-  const label = { x: head.x, y: head.y - 14 };
-  await page.mouse.move(label.x, label.y);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
-  await page.mouse.click(label.x, label.y);
-  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(pattern);
-  await page.evaluate(() => window.__chart.clear_drawings());
-  await page.waitForTimeout(700);
-
-  // Unselected, a time-cycle arch's shading pans the chart; selected, it drags the drawing.
   const [base, top] = await zigzag(page, 2, 0.3, 0.42);
   const cycles = await page.evaluate(({ base, top }) => window.__chart.add_drawing("time_cycles", [base, top], { color: "#e91e63" }).id, { base, top });
   await settle_frames(page);
-  const a = await spot(page, base.logical, base.price);
   const b = await spot(page, top.logical, top.price);
-  const inside = { x: (a.x + b.x) / 2, y: a.y - (a.y - b.y) / 3 };
-  await page.mouse.move(inside.x, inside.y);
-  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
-  // A click on the arch's crown selects it.
-  await page.mouse.click((a.x + b.x) / 2, b.y);
+  // The second cycle line runs through the second anchor's bar, full height.
+  const line = { x: b.x, y: 200 };
+  await page.mouse.click(line.x, line.y);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(cycles);
   await page.waitForTimeout(700);
-  await page.mouse.move(inside.x + 1, inside.y);
+  await page.mouse.move(line.x, line.y + 40);
   await expect.poll(() => overlay_cursor(page)).toBe("move");
   await page.mouse.down();
-  await page.mouse.move(inside.x + 20, inside.y, { steps: 4 });
-  await page.mouse.move(inside.x + 40, inside.y, { steps: 4 });
+  await page.mouse.move(line.x + 20, line.y + 40, { steps: 4 });
+  await page.mouse.move(line.x + 40, line.y + 40, { steps: 4 });
   await page.mouse.up();
   await settle_frames(page);
   const moved = await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).points(), cycles);
@@ -384,11 +348,11 @@ test("family tools round-trip through persistence, clipboard, and sync with thei
     const first_host = host();
     const first = await create_chart(first_host, { backend: "canvas2d", autoSize: false });
     const additions = [
-      ["xabcd_pattern", zig(5), { fill_enabled: false, tool_options: { pattern: { show_ratios: false } } }],
-      ["head_and_shoulders", zig(7), {}],
-      ["triangle_pattern", zig(4), { fill_color: "#ff000033" }],
-      ["elliott_impulse_wave", zig(6), { tool_options: { pattern: { degree: "minute" } } }],
-      ["elliott_triple_combo", zig(6), { tool_options: { pattern: { show_wave: false } }, style: "dashed" }],
+      ["pattern_xabcd", zig(5), { fill_enabled: true, tool_options: { pattern: { show_ratios: false } } }],
+      ["pattern_head_shoulders", zig(7), {}],
+      ["pattern_triangle", zig(5), { fill_color: "#ff000033" }],
+      ["elliott_impulse", zig(6), { wave_degree: "minute" }],
+      ["elliott_triple_combination", zig(6), { tool_options: { pattern: { show_wave: false } }, style: "dashed" }],
       ["cyclic_lines", zig(2), { width: 3 }],
       ["time_cycles", zig(2), { fill_enabled: false }],
       ["sine_line", zig(2), { text: "cycle" }],
@@ -426,11 +390,12 @@ test("family tools round-trip through persistence, clipboard, and sync with thei
 
   expect(result.canonical).toEqual(result.state);
   const styles = result.state.drawings.map((drawing) => drawing.style);
-  expect(styles[0].fill_enabled).toBe(false);
-  expect(styles[0].tool_options).toEqual({ pattern: { show_ratios: false, degree: "intermediate", show_wave: true } });
+  expect(styles[0].fill_enabled).toBe(true);
+  // Earlier builds' pattern options stay stored, inert.
+  expect(styles[0].tool_options.pattern.show_ratios).toBe(false);
   expect(styles[1].fill_enabled).toBeUndefined();
   expect(styles[1].tool_options).toBeUndefined();
-  expect(styles[3].tool_options.pattern.degree).toBe("minute");
+  expect(styles[3].wave_degree).toBe("minute");
   const semantic = (list) => list.map(({ kind, options, points }) => ({
     kind,
     points,
@@ -441,6 +406,7 @@ test("family tools round-trip through persistence, clipboard, and sync with thei
     fill_color: options.fill_color,
     text: options.text,
     tool_options: options.tool_options,
+    wave_degree: options.wave_degree,
   }));
   expect(semantic(result.restored)).toEqual(semantic(result.expected));
   expect(semantic(result.pasted)).toEqual(semantic(result.expected));
@@ -479,14 +445,15 @@ test("patterns, waves, and cycles render pixel-identical on WebGPU and Canvas2D 
         logical: at(from + ((to - from) * index) / (count - 1)),
         price: up(index % 2 ? high : low),
       }));
-      chart.add_drawing("xabcd_pattern", zig(0.05, 0.3, 5, 0.55, 0.85), { color: "#e91e63" });
-      chart.add_drawing("head_and_shoulders", zig(0.35, 0.65, 7, 0.6, 0.8));
-      chart.add_drawing("triangle_pattern", [
+      chart.add_drawing("pattern_xabcd", zig(0.05, 0.3, 5, 0.55, 0.85), { color: "#e91e63" });
+      chart.add_drawing("pattern_head_shoulders", zig(0.35, 0.65, 7, 0.6, 0.8));
+      chart.add_drawing("pattern_triangle", [
         { logical: at(0.7), price: up(0.95) }, { logical: at(0.74), price: up(0.6) },
         { logical: at(0.8), price: up(0.88) }, { logical: at(0.84), price: up(0.68) },
+        { logical: at(0.88), price: up(0.8) },
       ]);
-      chart.add_drawing("elliott_impulse_wave", zig(0.05, 0.4, 6, 0.1, 0.4), { tool_options: { pattern: { degree: "primary" } } });
-      chart.add_drawing("elliott_correction_wave", zig(0.45, 0.6, 4, 0.35, 0.15));
+      chart.add_drawing("elliott_impulse", zig(0.05, 0.4, 6, 0.1, 0.4), { wave_degree: "primary" });
+      chart.add_drawing("elliott_correction", zig(0.45, 0.6, 4, 0.35, 0.15));
       chart.add_drawing("cyclic_lines", [{ logical: at(0.62), price: up(0.2) }, { logical: at(0.68), price: up(0.2) }], { style: "dotted" });
       chart.add_drawing("time_cycles", [{ logical: at(0.5), price: up(0.02) }, { logical: at(0.58), price: up(0.25) }]);
       chart.add_drawing("sine_line", [{ logical: at(0.2), price: up(0.5) }, { logical: at(0.26), price: up(0.42) }], { color: "#ff6d00" });

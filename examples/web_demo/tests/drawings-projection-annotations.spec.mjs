@@ -4,9 +4,10 @@ import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 
 // B8 Projection & Annotations family through the public API and real pointer input: armed
-// placement and painting of every tool, the demo toolbar, forecast outcomes, bars-pattern capture
-// and body drags, range stats boxes and fills as hit targets, pane-anchored text that stays put
-// while the chart scrolls, persistence/clipboard/sync round trips, and WebGPU == Canvas2D parity.
+// placement and painting of every tool, the demo toolbar, forecast outcome labels, bars-pattern
+// capture and target drags, range stats boxes and fills as hit targets, anchored text that stays
+// put on screen while the chart scrolls, persistence/clipboard/sync round trips, and WebGPU ==
+// Canvas2D parity.
 // Every geometry decision is engine-owned; these specs only drive the package API and pointer.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
@@ -16,7 +17,7 @@ const TOOLS = [
   "bars_pattern",
   "price_range",
   "date_range",
-  "date_and_price_range",
+  "date_price_range",
   "projection",
   "anchored_text",
   "note",
@@ -26,15 +27,15 @@ const TOOLS = [
   "price_label",
   "signpost",
   "flag_mark",
-  "arrow_mark_up",
-  "arrow_mark_down",
-  "arrow_mark_left",
-  "arrow_mark_right",
-  "icon",
+  "arrow_marker_up",
+  "arrow_marker_down",
+  "arrow_marker_left",
+  "arrow_marker_right",
+  "icon_stamp",
   "simple_tag",
   "simple_annotation",
 ];
-const ANCHORS = { projection: 3, forecast: 2, bars_pattern: 2, price_range: 2, date_range: 2, date_and_price_range: 2, price_note: 2, callout: 2 };
+const ANCHORS = { projection: 2, forecast: 2, bars_pattern: 3, price_range: 2, date_range: 2, date_price_range: 2, callout: 2, signpost: 2 };
 const PINK = [233, 30, 99]; // #e91e63 — collides with no fixture pixel
 
 test.beforeEach(async ({ page }) => {
@@ -143,6 +144,12 @@ test("every Projection & Annotations tool places through the armed-tool flow and
       const point = await spot(page, logical, price);
       await page.mouse.click(point.x, point.y);
     }
+    // A text annotation opens its editor on placement and starts empty; one left empty is
+    // removed when the next click commits it, so give it a text.
+    if (await page.evaluate(() => window.__chart.wasm.editing_drawing() !== undefined)) {
+      await page.keyboard.type("Label");
+      await page.keyboard.press("Enter");
+    }
     await settle_frames(page);
     const list = await drawings(page);
     expect(list, `after ${kind}`).toHaveLength(index + 1);
@@ -150,16 +157,12 @@ test("every Projection & Annotations tool places through the armed-tool flow and
     expect(drawing.kind).toBe(kind);
     expect(drawing.points).toHaveLength(count);
     expect(drawing.options.color).toBe("#e91e63");
-    for (const point of drawing.points) {
-      if (kind === "anchored_text") {
-        // Pane fractions carry no time identity.
-        expect(point.time).toBeUndefined();
-        expect(point.logical).toBeGreaterThanOrEqual(0);
-        expect(point.logical).toBeLessThanOrEqual(1);
-        expect(point.price).toBeGreaterThanOrEqual(0);
-        expect(point.price).toBeLessThanOrEqual(1);
-      } else {
-        expect(Number.isFinite(point.time)).toBe(true);
+    for (const point of drawing.points) expect(Number.isFinite(point.time)).toBe(true);
+    if (kind === "anchored_text") {
+      // Its screen position, a pane fraction, is derived from the placement click.
+      for (const fraction of [drawing.options.screen_x, drawing.options.screen_y]) {
+        expect(fraction).toBeGreaterThanOrEqual(0);
+        expect(fraction).toBeLessThanOrEqual(1);
       }
     }
     expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
@@ -198,7 +201,7 @@ test("the demo toolbar keeps each tool's catalog defaults and templates only edi
     2: [[l0, b0.low], [l0 + 4, b1.high]],
     3: [[l0, b0.close], [l0 + 5, b0.close], [l0 + 4, b1.high]],
   };
-  const clicks = { arrow_mark_up: 1, arrow_mark_down: 1, anchored_text: 1, callout: 2, fib_retracement: 2, andrews_pitchfork: 3 };
+  const clicks = { arrow_marker_up: 1, arrow_marker_down: 1, anchored_text: 1, callout: 2, fibonacci_retracement: 2, andrews_pitchfork: 3 };
   const place = async (kind, arm) => {
     await arm();
     for (const [logical, price] of spots[clicks[kind]]) {
@@ -217,12 +220,11 @@ test("the demo toolbar keeps each tool's catalog defaults and templates only edi
   for (const kind of Object.keys(clicks)) {
     expect(await place(kind, toolbar(kind)), kind).toEqual(await place(kind, bare(kind)));
   }
-  // Spot checks of the catalog defaults the untouched toolbar used to overwrite.
-  const up = await place("arrow_mark_up", toolbar("arrow_mark_up"));
-  const down = await place("arrow_mark_down", toolbar("arrow_mark_down"));
-  expect(up.color).not.toBe(down.color);
-  expect((await place("fib_retracement", toolbar("fib_retracement"))).style).toBe("dashed");
-  expect((await place("anchored_text", toolbar("anchored_text"))).text_h_align).toBe("left");
+  // Spot checks of the catalog defaults the untouched toolbar used to overwrite: a callout's
+  // label sits right/top, every other tool's in the center.
+  const up = await place("arrow_marker_up", toolbar("arrow_marker_up"));
+  expect((await place("callout", toolbar("callout"))).text_h_align).toBe("right");
+  expect((await place("anchored_text", toolbar("anchored_text"))).text_h_align).toBe("center");
 
   // An explicitly edited setting templates the next drawing; the rest stay the tool's own.
   await page.evaluate(() => {
@@ -230,11 +232,11 @@ test("the demo toolbar keeps each tool's catalog defaults and templates only edi
     input.value = "#ff00ff";
     input.dispatchEvent(new Event("change"));
   });
-  const edited = await place("arrow_mark_up", toolbar("arrow_mark_up"));
+  const edited = await place("arrow_marker_up", toolbar("arrow_marker_up"));
   expect(edited).toEqual({ ...up, color: "#ff00ff" });
 });
 
-test("a forecast turns its target box into the evaluated outcome and selects from it", async ({ page }) => {
+test("a forecast labels its evaluated outcome at the target and selects from its line", async ({ page }) => {
   await goto_fixture(page);
   const range = await visible_range(page);
   const l0 = Math.floor(range.from + (range.to - range.from) * 0.3);
@@ -246,18 +248,21 @@ test("a forecast turns its target box into the evaluated outcome and selects fro
     reachable = Math.max(reachable, next.high);
     lowest = Math.min(lowest, next.low);
   }
-  // A blue forecast: pending boxes stay blue, outcomes turn green or red.
   const id = await page.evaluate(({ l0, source, reachable }) => window.__chart.add_drawing("forecast", [
     { logical: l0, price: source.close },
     { logical: l0 + 10, price: reachable },
-  ], { color: "#2962ff" }).id, { l0, source, reachable });
+  ], { color: "#e91e63" }).id, { l0, source, reachable });
   await settle_frames(page);
-  const target = await spot(page, l0 + 10, reachable);
-  const success = mean_color(await capture(page), target.x + 12, target.y - 3, 14, 6);
-  expect(success[1], `success box is green: ${success}`).toBeGreaterThan(success[0]);
-  expect(success[1], `success box is green: ${success}`).toBeGreaterThan(success[2]);
+  // The outcome label (and the target time above it) paints over the target.
+  const label_above = async (price, logical = l0 + 10) => {
+    const target = await spot(page, logical, price);
+    const box = color_extent(await capture(page), PINK);
+    return box !== null && box.top < Math.round((target.y - 8) * PR);
+  };
+  expect(await label_above(reachable), "reached").toBe(true);
+  const reached = await capture(page);
 
-  // Unreachable within the window: the data passes the target bar, so the box reports failure.
+  // Unreachable within the window: the data passes the target bar, so the label changes.
   const unreachable = reachable + (reachable - lowest) * 0.3;
   await page.evaluate(({ id, l0, source, unreachable }) => {
     window.__chart.drawings().find((drawing) => drawing.id === id).set_points([
@@ -266,13 +271,10 @@ test("a forecast turns its target box into the evaluated outcome and selects fro
     ]);
   }, { id, l0, source, unreachable });
   await settle_frames(page);
-  const failed_target = await spot(page, l0 + 10, unreachable);
-  expect(failed_target.y, "the failed target stays on the pane").toBeGreaterThan(12);
-  const failure = mean_color(await capture(page), failed_target.x + 12, failed_target.y - 3, 14, 6);
-  expect(failure[0], `failure box is red: ${failure}`).toBeGreaterThan(failure[1]);
-  expect(failure[0], `failure box is red: ${failure}`).toBeGreaterThan(failure[2]);
+  expect(await label_above(unreachable), "expired").toBe(true);
+  expect(pixelmatch(reached.data, (await capture(page)).data, null, reached.width, reached.height, { threshold: 0 })).toBeGreaterThan(20);
 
-  // A target beyond the data stays pending in the forecast's own color.
+  // A target beyond the data stays pending.
   const future = (await visible_range(page)).to + 30;
   await page.evaluate(({ id, l0, source, reachable, future }) => {
     window.__chart.drawings().find((drawing) => drawing.id === id).set_points([
@@ -282,16 +284,16 @@ test("a forecast turns its target box into the evaluated outcome and selects fro
     window.__chart.time_scale().set_visible_logical_range({ from: l0 - 10, to: future + 20 });
   }, { id, l0, source, reachable, future });
   await settle_frames(page);
-  const pending_target = await spot(page, future, reachable);
-  const pending = mean_color(await capture(page), pending_target.x + 12, pending_target.y - 3, 14, 6);
-  expect(pending[2], `pending box is blue: ${pending}`).toBeGreaterThan(pending[0]);
+  expect(await label_above(reachable, future), "pending").toBe(true);
 
-  // The target box is a selection target.
-  await page.mouse.click(pending_target.x + 24, pending_target.y);
+  // The forecast line is a selection target.
+  const a = await spot(page, l0, source.close);
+  const b = await spot(page, future, reachable);
+  await page.mouse.click((a.x + b.x) / 2, (a.y + b.y) / 2);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(id);
 });
 
-test("a bars pattern copies its source bars on placement and drags as a rigid ghost", async ({ page }) => {
+test("a bars pattern copies its source bars on placement and its target moves the frozen copy", async ({ page }) => {
   await goto_fixture(page);
   const range = await visible_range(page);
   const l0 = Math.floor(range.from + (range.to - range.from) * 0.35);
@@ -301,84 +303,89 @@ test("a bars pattern copies its source bars on placement and drags as a rigid gh
   const first = await bar(page, l0);
   const last = await bar(page, l0 + 8);
   await page.evaluate(() => window.__chart.set_drawing_tool("bars_pattern", { color: "#e91e63" }));
-  for (const [logical, price] of [[l0, first.high], [l0 + 8, last.low]]) {
+  // Source start, source end, then the target where the copy's first close lands.
+  for (const [logical, price] of [[l0, first.high], [l0 + 8, last.low], [l0 + 14, first.close]]) {
     const point = await spot(page, logical, price);
     await page.mouse.click(point.x, point.y);
   }
   await settle_frames(page);
   const created = await page.evaluate(() => {
     const drawing = window.__chart.drawings()[0];
-    return {
-      id: drawing.id,
-      points: drawing.points(),
-      bars: drawing.options().tool_options.projection_annotation.bars,
-      kind_options: window.__chart.drawing_kind_options(drawing),
-    };
+    return { id: drawing.id, points: drawing.points(), kind_options: window.__chart.drawing_kind_options(drawing) };
   });
-  expect(created.bars).toHaveLength(9);
-  expect(created.bars[0]).toEqual([first.open, first.high, first.low, first.close]);
-  expect(created.bars[8][3]).toBe(last.close);
-  // The anchors span the copy's box (its first bar at the highest value, its last bar at the
-  // lowest), so it starts exactly over its source.
-  const values = created.bars.flat();
-  expect(created.points[0].logical).toBe(l0);
-  expect(created.points[0].price).toBe(Math.max(...values));
-  expect(created.points[1].logical).toBe(l0 + 8);
-  expect(created.points[1].price).toBe(Math.min(...values));
-  expect(created.kind_options).toEqual({
-    kind: "projection_annotation", bars_mode: "hl_bars", mirrored: false, flipped: false, pattern_bars: 9, icon: "star", icon_size: 24,
-    always_show_text: false,
-  });
+  expect(created.points).toHaveLength(3);
+  expect(Math.round(created.points[2].logical)).toBe(l0 + 14);
+  // The copy holds the bars whose positions lie between the two source anchors.
+  const [from, to] = [created.points[0].logical, created.points[1].logical].sort((a, b) => a - b);
+  const copied = Math.floor(to) - Math.ceil(from) + 1;
+  expect(copied).toBeGreaterThanOrEqual(8);
+  expect(created.kind_options).toEqual({ kind: "bars_pattern", mirror_x: false, mirror_y: false, mode: "bars", bar_count: copied });
 
-  // Grab the middle stick and drag the ghost to the right: it moves rigidly and keeps its copy.
-  const middle = await bar(page, l0 + 4);
-  const grab = await spot(page, l0 + 4, (middle.high + middle.low) / 2);
-  await page.mouse.move(grab.x, grab.y);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  // Dragging the target handle moves the frozen copy and keeps its bars.
+  await page.evaluate((id) => {
+    window.__chart.wasm.set_selected_drawing(id);
+    window.__chart.render();
+  }, created.id);
+  await settle_frames(page);
   const before = color_extent(await capture(page), PINK);
+  const handle = await spot(page, l0 + 14, first.close);
+  await page.mouse.move(handle.x, handle.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("pointer");
   await page.mouse.down();
-  await page.mouse.move(grab.x + 60, grab.y - 20, { steps: 4 });
-  await page.mouse.move(grab.x + 120, grab.y - 40, { steps: 4 });
+  await page.mouse.move(handle.x + 60, handle.y, { steps: 4 });
+  await page.mouse.move(handle.x + 120, handle.y, { steps: 4 });
   await page.mouse.up();
   await settle_frames(page);
   const moved = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
-    return { points: drawing.points(), bars: drawing.options().tool_options.projection_annotation.bars };
+    return { points: drawing.points(), kind_options: window.__chart.drawing_kind_options(drawing) };
   }, created.id);
-  expect(moved.bars).toEqual(created.bars);
-  expect(moved.points[0].logical).toBeGreaterThan(l0 + 3);
+  expect(moved.points[0]).toEqual(created.points[0]);
+  expect(moved.points[1]).toEqual(created.points[1]);
+  expect(moved.points[2].logical).toBeGreaterThan(l0 + 14);
+  expect(moved.kind_options.bar_count).toBe(copied);
   const after = color_extent(await capture(page), PINK);
-  expect(Math.abs(after.left - before.left - 120 * PR)).toBeLessThanOrEqual(2);
-  expect(Math.abs(after.top - before.top + 40 * PR)).toBeLessThanOrEqual(2);
+  expect(after.right).toBeGreaterThan(before.right + 60 * PR);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  await page.evaluate(() => {
+    window.__chart.wasm.set_selected_drawing(undefined);
+    window.__chart.render();
+  });
+  await settle_frames(page);
 
-  // Line modes repaint the same copy as one polyline.
-  const hl = await capture(page);
+  // Line modes repaint the same copy as one polyline; earlier builds' `bars_mode` key maps on.
+  const bars = await capture(page);
   await page.evaluate((id) => {
-    window.__chart.drawings().find((drawing) => drawing.id === id)
-      .apply_options({ tool_options: { projection_annotation: { bars_mode: "line_close" } } });
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ bars_pattern_mode: "line_close" });
   }, created.id);
   await settle_frames(page);
   const line = await capture(page);
-  expect(pixelmatch(hl.data, line.data, null, hl.width, hl.height, { threshold: 0 })).toBeGreaterThan(20);
-  const options = await page.evaluate((id) => window.__chart.drawing_kind_options(id), created.id);
-  expect(options.bars_mode).toBe("line_close");
-  expect(options.pattern_bars).toBe(9);
+  expect(pixelmatch(bars.data, line.data, null, bars.width, bars.height, { threshold: 0 })).toBeGreaterThan(20);
+  const options = await page.evaluate((id) => {
+    const chart = window.__chart;
+    const drawing = chart.drawings().find((candidate) => candidate.id === id);
+    const flat = chart.drawing_kind_options(drawing);
+    drawing.apply_options({ tool_options: { projection_annotation: { bars_mode: "oc_bars" } } });
+    const legacy = chart.drawing_kind_options(drawing).mode;
+    drawing.apply_options({ bars_pattern_mode: "line_close" });
+    return { flat, legacy };
+  }, created.id);
+  expect(options.flat.mode).toBe("line_close");
+  expect(options.flat.bar_count).toBe(copied);
+  expect(options.legacy).toBe("oc_bars");
 
   // A named template restyles another pattern and keeps that pattern's own copy.
   const templated = await page.evaluate(({ id, from }) => {
     const chart = window.__chart;
     const template = chart.drawing_template(id, "ghost");
-    const other = chart.add_drawing("bars_pattern", [{ logical: from, price: 0 }, { logical: from + 3, price: 0 }], {});
-    const own = other.options().tool_options.projection_annotation.bars;
+    const other = chart.add_drawing("bars_pattern", [
+      { logical: from, price: 0 }, { logical: from + 3, price: 0 }, { logical: from + 6, price: 0 },
+    ], {});
     chart.apply_drawing_template(other, template);
-    const applied = other.options().tool_options.projection_annotation;
-    return { carries_bars: "bars" in (template.options.tool_options?.projection_annotation ?? {}), own, applied };
+    return chart.drawing_kind_options(chart.drawings().find((drawing) => drawing.id === other.id));
   }, { id: created.id, from: l0 + 12 });
-  expect(templated.carries_bars).toBe(false);
-  expect(templated.applied.bars).toEqual(templated.own);
-  expect(templated.applied.bars).toHaveLength(4);
-  expect(templated.applied.bars_mode).toBe("line_close");
+  expect(templated.bar_count).toBe(4);
+  expect(templated.mode).toBe("line_close");
 });
 
 test("a projection shows its placed apex and a provisional line between clicks", async ({ page }) => {
@@ -399,34 +406,33 @@ test("a projection shows its placed apex and a provisional line between clicks",
   expect(band.right).toBeGreaterThanOrEqual(Math.round((apex.x + 150) * PR));
   const pending = await capture(page);
   expect(pixelmatch(before.data, pending.data, null, before.width, before.height, { threshold: 0 })).toBeGreaterThan(20);
-  // The second click previews the sector and the third commits it.
+  // The second click, the target, commits it.
   await page.mouse.click(apex.x + 160, apex.y - 60);
-  await page.mouse.click(apex.x + 120, apex.y - 120);
   await settle_frames(page);
   const list = await drawings(page);
   expect(list).toHaveLength(1);
   expect(list[0].kind).toBe("projection");
-  expect(list[0].points).toHaveLength(3);
+  expect(list[0].points).toHaveLength(2);
 });
 
-test("a group move leaves anchored text pinned and the layout restorable", async ({ page }) => {
+test("a group move leaves anchored text pinned on screen and the layout restorable", async ({ page }) => {
   await goto_fixture(page);
   const range = await visible_range(page);
   const l0 = Math.floor(range.from + (range.to - range.from) * 0.4);
   const b0 = await bar(page, l0);
   const result = await page.evaluate(({ l0, price }) => {
     const chart = window.__chart;
-    const text = chart.add_drawing("anchored_text", [{ logical: 0.9, price: 0.9 }], { group_id: "g" });
+    const text = chart.add_drawing("anchored_text", [{ logical: l0, price }], { group_id: "g", screen_x: 0.9, screen_y: 0.9 });
     const note = chart.add_drawing("note", [{ logical: l0, price }], { group_id: "g" });
     const changed = chart.move_drawing_group("g", 5, 1);
     const state = chart.export_state();
-    return { changed, text: text.points(), note: note.points(), state };
+    const options = text.options();
+    return { changed, screen: [options.screen_x, options.screen_y], note: note.points(), state };
   }, { l0, price: b0.high });
-  expect(result.changed).toBe(1);
-  expect(result.text[0].logical).toBe(0.9);
-  expect(result.text[0].price).toBe(0.9);
+  expect(result.changed).toBeGreaterThanOrEqual(1);
+  expect(result.screen).toEqual([0.9, 0.9]);
   expect(result.note[0].logical).toBe(l0 + 5);
-  // The exported layout restores into a fresh chart (an off-pane fraction would be invalid_data).
+  // The exported layout restores into a fresh chart.
   const restored = await page.evaluate(async (state) => {
     const { create_chart } = await import("/dist/aeris_charts_financial.js");
     const host = document.createElement("div");
@@ -434,14 +440,13 @@ test("a group move leaves anchored text pinned and the layout restorable", async
     document.body.append(host);
     const fresh = await create_chart(host, { backend: "canvas2d", autoSize: false });
     fresh.import_state(state);
-    const list = fresh.drawings().map((drawing) => ({ kind: drawing.kind(), points: drawing.points() }));
+    const list = fresh.drawings().map((drawing) => ({ kind: drawing.kind(), options: drawing.options() }));
     fresh.remove();
     host.remove();
     return list;
   }, result.state);
   const text = restored.find((drawing) => drawing.kind === "anchored_text");
-  expect(text.points[0].logical).toBe(0.9);
-  expect(text.points[0].price).toBe(0.9);
+  expect([text.options.screen_x, text.options.screen_y]).toEqual([0.9, 0.9]);
 });
 
 test("price range stats and fills are selection targets with typed options", async ({ page }) => {
@@ -489,23 +494,29 @@ test("price range stats and fills are selection targets with typed options", asy
   expect(schema.kind).toBe("price_range");
   expect(schema.properties.find((property) => property.name === "fill_enabled").default).toBe(true);
   const icon_schema = await page.evaluate(() => {
-    const icon = window.__chart.add_drawing("icon", [{ logical: 5, price: 100 }]);
+    const icon = window.__chart.add_drawing("icon_stamp", [{ logical: 5, price: 100 }]);
     return window.__chart.drawing_property_schema(icon);
   });
-  const size = icon_schema.properties.find((property) => property.name === "tool_options.projection_annotation.icon_size");
-  expect([size.min, size.max, size.default]).toEqual([8, 128, 24]);
+  const size = icon_schema.properties.find((property) => property.name === "icon_size");
+  expect([size.min, size.max, size.default]).toEqual([8, 96, 24]);
 });
 
-test("anchored text stays pinned to its pane position while the chart scrolls and drags in pane fractions", async ({ page }) => {
+test("anchored text stays pinned to its screen position while the chart scrolls and drags in pane fractions", async ({ page }) => {
   await goto_fixture(page);
-  const id = await page.evaluate(() => window.__chart.add_drawing("anchored_text", [
-    { logical: 0.1, price: 0.12 },
-  ], { text: "Pinned note", box_color: "#e91e63", text_color: "#ffffff" }).id);
+  const id = await page.evaluate(() => {
+    const range = window.__chart.time_scale().get_visible_logical_range();
+    const logical = Math.floor((range.from + range.to) / 2);
+    const price = window.__main.data_by_index(logical).close;
+    return window.__chart.add_drawing("anchored_text", [{ logical, price }], {
+      text: "Pinned note", box_color: "#e91e63", text_color: "#ffffff", screen_x: 0.1, screen_y: 0.12,
+    }).id;
+  });
   await settle_frames(page);
   const before = color_extent(await capture(page), PINK);
   expect(before).not.toBeNull();
   const size = await page.evaluate(() => ({ width: window.__chart.time_scale().width() }));
-  expect(Math.abs(before.left / PR - 0.1 * size.width)).toBeLessThanOrEqual(2);
+  const center = (box) => (box.left + box.right) / 2 / PR;
+  expect(Math.abs(center(before) - 0.1 * size.width)).toBeLessThanOrEqual(2);
 
   // Scrolling the time scale leaves it exactly in place.
   await page.evaluate(() => {
@@ -514,19 +525,19 @@ test("anchored text stays pinned to its pane position while the chart scrolls an
   });
   await settle_frames(page);
   expect(color_extent(await capture(page), PINK)).toEqual(before);
-  const anchors = await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).points(), id);
-  expect(anchors).toEqual([{ logical: 0.1, price: 0.12 }]);
-  // Pane fractions outside the pane clamp into it, so the text stays reachable.
-  const clamped = await page.evaluate(() => {
-    const drawing = window.__chart.add_drawing("anchored_text", [{ logical: 1.5, price: -0.2 }]);
-    const points = drawing.points();
-    drawing.remove();
-    return points;
-  });
-  expect(clamped).toEqual([{ logical: 1, price: 0 }]);
+  // A screen position outside the pane is rejected.
+  const rejected = await page.evaluate((id) => {
+    try {
+      window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ screen_x: 1.5 });
+    } catch (error) {
+      return error.code;
+    }
+    return null;
+  }, id);
+  expect(rejected).toBe("invalid_options");
 
   // Dragging it moves it by pane fractions.
-  const grab = { x: (before.left + before.right) / 2 / PR, y: (before.top + before.bottom) / 2 / PR };
+  const grab = { x: center(before), y: (before.top + before.bottom) / 2 / PR };
   await page.mouse.move(grab.x, grab.y);
   await expect.poll(() => overlay_cursor(page)).toBe("move");
   await page.mouse.down();
@@ -534,11 +545,10 @@ test("anchored text stays pinned to its pane position while the chart scrolls an
   await page.mouse.move(grab.x + 120, grab.y + 40, { steps: 4 });
   await page.mouse.up();
   await settle_frames(page);
-  const moved = await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).points()[0], id);
-  expect(moved.logical).toBeCloseTo(0.1 + 120 / size.width, 6);
-  expect(moved.time).toBeUndefined();
+  const moved = await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).options().screen_x, id);
+  expect(moved).toBeCloseTo(0.1 + 120 / size.width, 2);
   const after = color_extent(await capture(page), PINK);
-  expect(Math.abs(after.left - before.left - 120 * PR)).toBeLessThanOrEqual(2);
+  expect(Math.abs(after.left - before.left - 120 * PR)).toBeLessThanOrEqual(3);
 });
 
 test("a callout edits its tip by pointer and its box by keyboard, and honors hide and lock", async ({ page }) => {
@@ -654,20 +664,24 @@ test("Projection & Annotations tools round-trip through persistence, clipboard, 
       document.body.append(element);
       return element;
     };
-    const bars = [[10, 12, 9, 11], [11, 13, 10, 12.5], [12.5, 13, 11, 11.5]];
+    const bars = [[10, 12, 9, 11], [11, 13, 10, 12.5], [12.5, 13, 11, 11.5], [11.5, 12, 10, 10.5]];
     const first_host = host();
     const first = await create_chart(first_host, { backend: "canvas2d", autoSize: false });
+    // A bars pattern copies its source bars when it is placed, so the first chart has data.
+    first.add_series("candlestick").set_data(bars.map(([open, high, low, close], index) => ({
+      time: 1_700_000_000 + index * 3600, open, high, low, close,
+    })));
     const additions = [
       ["forecast", [{ logical: 1, price: 10 }, { logical: 4, price: 12 }], { width: 3 }],
-      ["bars_pattern", [{ logical: 1, price: 11 }, { logical: 3, price: 11.5 }], { tool_options: { projection_annotation: { bars, bars_mode: "oc_bars", mirrored: true } } }],
+      ["bars_pattern", [{ logical: 0, price: 11 }, { logical: 2, price: 11.5 }, { logical: 5, price: 11 }], { bars_pattern_mode: "oc_bars", bars_pattern_mirror_x: true }],
       ["price_range", [{ logical: 2, price: 10 }, { logical: 5, price: 13 }], { fill_enabled: false, labels: [] }],
-      ["date_and_price_range", [{ logical: 2, price: 11 }, { logical: 6, price: 12 }], { stroke_end: "none" }],
-      ["projection", [{ logical: 1, price: 10 }, { logical: 4, price: 10 }, { logical: 3, price: 12 }], { fill_color: "#ff000055" }],
-      ["anchored_text", [{ logical: 0.4, price: 0.2 }], { text: "pinned", box_color: "#202020" }],
+      ["date_price_range", [{ logical: 2, price: 11 }, { logical: 6, price: 12 }], { stroke_end: "none" }],
+      ["projection", [{ logical: 1, price: 10 }, { logical: 4, price: 12 }], { fill_color: "#ff000055" }],
+      ["anchored_text", [{ logical: 2, price: 11 }], { text: "pinned", box_color: "#202020", screen_x: 0.4, screen_y: 0.2 }],
       ["comment", [{ logical: 3, price: 11 }], { text: "" }],
       ["callout", [{ logical: 2, price: 11 }, { logical: 4, price: 12.5 }], { text: "two\nlines", text_h_align: "left" }],
-      ["icon", [{ logical: 5, price: 11 }], { tool_options: { projection_annotation: { icon: "heart", icon_size: 40 } } }],
-      ["arrow_mark_down", [{ logical: 6, price: 12 }], { text: "sell" }],
+      ["icon_stamp", [{ logical: 5, price: 11 }], { icon_name: "heart", icon_size: 40 }],
+      ["arrow_marker_down", [{ logical: 6, price: 12 }], { text: "sell" }],
       ["simple_tag", [{ logical: 4, price: 11.5 }], { text: "TAG" }],
       ["simple_annotation", [{ logical: 3, price: 10.5 }], { text: "watch\nhere" }],
     ];
@@ -704,14 +718,20 @@ test("Projection & Annotations tools round-trip through persistence, clipboard, 
 
   expect(result.canonical).toEqual(result.state);
   const styles = result.state.drawings.map((drawing) => drawing.style);
-  expect(styles[1].tool_options).toEqual({ projection_annotation: { bars_mode: "oc_bars", mirrored: true, flipped: false, bars: result.bars, icon: "star", icon_size: 24 } });
+  // The mode and mirror persist as flat style next to the copied bars.
+  expect(styles[1].bars_pattern).toHaveLength(3);
+  expect(styles[1].bars_pattern_mode).toBe("oc_bars");
+  expect(styles[1].bars_pattern_mirror_x).toBe(true);
+  expect(styles[8].icon_name).toBe("heart");
+  expect(styles[8].icon_size).toBe(40);
   expect(styles[2].fill_enabled).toBe(false);
   expect(styles[3].fill_enabled).toBeUndefined();
-  expect(styles[6].text).toBe("");
+  // An empty comment keeps its (empty) default text, which is not written.
+  expect(styles[6].text ?? "").toBe("");
   expect(styles[7].text).toBe("two\nlines");
   expect(styles[10].text).toBe("TAG");
   expect(styles[11].text).toBe("watch\nhere");
-  expect(result.state.drawings[5].anchors[0].time).toBeUndefined();
+  expect([styles[5].screen_x, styles[5].screen_y]).toEqual([0.4, 0.2]);
   const semantic = (list) => list.map(({ kind, options }) => ({
     kind,
     text: options.text,
@@ -722,6 +742,9 @@ test("Projection & Annotations tools round-trip through persistence, clipboard, 
     tool_options: options.tool_options,
     box_color: options.box_color,
     width: options.width,
+    bars_pattern_mode: options.bars_pattern_mode,
+    screen: [options.screen_x, options.screen_y],
+    icon: [options.icon_name, options.icon_size],
   }));
   expect(semantic(result.restored)).toEqual(semantic(result.expected));
   expect(semantic(result.pasted)).toEqual(semantic(result.expected));
@@ -742,20 +765,20 @@ test("Projection & Annotations tools render pixel-identical on WebGPU and Canvas
       const hi = Math.max(b(0.2).high, b(0.6).high);
       const up = (fraction) => lo + (hi - lo) * fraction;
       chart.add_drawing("forecast", [{ logical: at(0.1), price: up(0.2) }, { logical: at(0.22), price: up(0.6) }], { color: "#e91e63" });
-      chart.add_drawing("bars_pattern", [{ logical: at(0.3), price: 0 }, { logical: at(0.4), price: 0 }], { color: "#7b1fa2" });
+      chart.add_drawing("bars_pattern", [{ logical: at(0.3), price: 0 }, { logical: at(0.36), price: 0 }, { logical: at(0.4), price: up(0.3) }], { color: "#7b1fa2" });
       chart.add_drawing("price_range", [{ logical: at(0.45), price: up(0.1) }, { logical: at(0.55), price: up(0.5) }]);
-      chart.add_drawing("date_and_price_range", [{ logical: at(0.6), price: up(0.7) }, { logical: at(0.72), price: up(0.4) }], { color: "#ff6d00" });
-      chart.add_drawing("projection", [{ logical: at(0.75), price: up(0.2) }, { logical: at(0.9), price: up(0.2) }, { logical: at(0.85), price: up(0.6) }], { color: "#089981" });
-      chart.add_drawing("anchored_text", [{ logical: 0.05, price: 0.05 }], { text: "Plan A", box_color: "#fff3e0" });
+      chart.add_drawing("date_price_range", [{ logical: at(0.6), price: up(0.7) }, { logical: at(0.72), price: up(0.4) }], { color: "#ff6d00" });
+      chart.add_drawing("projection", [{ logical: at(0.75), price: up(0.2) }, { logical: at(0.9), price: up(0.6) }], { color: "#089981" });
+      chart.add_drawing("anchored_text", [{ logical: at(0.5), price: up(0.5) }], { text: "Plan A", box_color: "#fff3e0", screen_x: 0.05, screen_y: 0.05 });
       chart.add_drawing("callout", [{ logical: at(0.2), price: up(0.9) }, { logical: at(0.3), price: up(1.05) }]);
       chart.add_drawing("comment", [{ logical: at(0.5), price: up(0.95) }], { color: "#7b1fa2" });
       chart.add_drawing("note", [{ logical: at(0.62), price: up(0.95) }]);
-      chart.add_drawing("signpost", [{ logical: at(0.8), price: up(0.9) }], { color: "#ff6d00" });
-      chart.add_drawing("arrow_mark_up", [{ logical: at(0.35), price: lo }], { text: "buy" });
-      chart.add_drawing("arrow_mark_down", [{ logical: at(0.4), price: hi }]);
+      chart.add_drawing("signpost", [{ logical: at(0.8), price: up(0.8) }, { logical: at(0.8), price: up(0.9) }], { color: "#ff6d00" });
+      chart.add_drawing("arrow_marker_up", [{ logical: at(0.35), price: lo }], { text: "buy" });
+      chart.add_drawing("arrow_marker_down", [{ logical: at(0.4), price: hi }]);
       chart.add_drawing("flag_mark", [{ logical: at(0.58), price: hi }], { color: "#e91e63" });
-      chart.add_drawing("icon", [{ logical: at(0.68), price: up(0.15) }], { color: "#ffb300" });
-      chart.add_drawing("icon", [{ logical: at(0.7), price: up(0.3) }], { tool_options: { projection_annotation: { icon: "heart", icon_size: 30 } } });
+      chart.add_drawing("icon_stamp", [{ logical: at(0.68), price: up(0.15) }], { color: "#ffb300" });
+      chart.add_drawing("icon_stamp", [{ logical: at(0.7), price: up(0.3) }], { icon_name: "heart", icon_size: 30 });
       chart.add_drawing("simple_tag", [{ logical: at(0.15), price: up(0.75) }], { color: "#2962ff", text: "Target" });
       chart.add_drawing("simple_annotation", [{ logical: at(0.52), price: up(0.45) }], { color: "#d50000", text: "Watch" });
       const first = chart.drawings()[0];

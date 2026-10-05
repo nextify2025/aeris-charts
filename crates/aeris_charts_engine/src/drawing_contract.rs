@@ -5,9 +5,6 @@
 //! templates, persistence adapters, and cross-cell synchronization.  Values are deliberately
 //! bounded and deterministic so a host cannot turn a drawing patch into unbounded work.
 
-use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::LineStyle;
-
 use crate::{ChartError, DrawingAnchor, DrawingKind, DrawingPriceScale, ErrorCode};
 
 pub const DRAWING_CONTRACT_REVISION: u32 = 1;
@@ -224,28 +221,6 @@ impl DrawingLevel {
             (false, None) => String::new(),
         }
     }
-
-    /// The level's stroke color, or `drawing`'s when it does not parse.
-    pub(crate) fn stroke_color(&self, drawing: &crate::Drawing) -> Color {
-        Color::parse_css(&self.color).unwrap_or_else(|| drawing.stroke_color())
-    }
-
-    /// The level's line style (the drawing style names, retired ones folded).
-    pub(crate) fn line_style(&self) -> LineStyle {
-        crate::drawings::line_style_from_name(&self.style)
-    }
-
-    /// The level's zone fill: `fill_color`, else its stroke color at 20% of that color's alpha.
-    pub(crate) fn zone_fill(&self, drawing: &crate::Drawing) -> Color {
-        self.fill_color
-            .as_deref()
-            .and_then(Color::parse_css)
-            .unwrap_or_else(|| {
-                let color = self.stroke_color(drawing);
-                let alpha = u16::from(color.a()) * 51 / 255;
-                Color::rgba(color.r(), color.g(), color.b(), alpha as u8)
-            })
-    }
 }
 
 /// Standard Fibonacci retracement/extension ratios, as level values between two anchors.
@@ -274,6 +249,8 @@ pub struct DrawingClipboardItem {
     pub pane_index: usize,
     pub points: Vec<DrawingAnchor>,
     pub options: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bars_pattern: Option<Vec<crate::drawings::BarsPatternBar>>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -430,63 +407,74 @@ pub enum DrawingKindOptions {
         box_border_color: Option<String>,
         box_border_width: f64,
     },
+    AnchoredText {
+        screen_x: f64,
+        screen_y: f64,
+        box_color: Option<String>,
+        box_border_color: Option<String>,
+        box_border_width: f64,
+    },
+    IconStamp {
+        icon_name: Option<String>,
+        icon_size: f64,
+    },
+    BarsPattern {
+        mirror_x: bool,
+        mirror_y: bool,
+        mode: String,
+        bar_count: usize,
+    },
     Position {
         levels: Vec<DrawingLevel>,
         account_size: f64,
         risk_percent: f64,
     },
+    Levels {
+        levels: Vec<DrawingLevel>,
+        reverse: bool,
+        log_scale: bool,
+        show_prices: bool,
+        show_values: bool,
+        show_percents: bool,
+        label_align: String,
+    },
+    GannSquare {
+        levels: Vec<DrawingLevel>,
+        fans: Vec<DrawingLevel>,
+        arcs: Vec<DrawingLevel>,
+        reverse: bool,
+        show_prices: bool,
+        show_values: bool,
+        show_percents: bool,
+        label_align: String,
+    },
+    RegressionTrend {
+        source_id: Option<u32>,
+        deviations: f64,
+    },
+    Elliott {
+        wave_degree: String,
+    },
     Generic,
     // B8: lines — begin
-    /// Every Lines-family tool (`tool_options.line`, resolved).
+    /// The own-line line tools (horizontal segment, vertical ray, vertical segment, price line):
+    /// `tool_options.line`, resolved.
     Line {
         stats_position: crate::DrawingStatsPosition,
     },
     // B8: lines — end
     // B8: channels — begin
-    /// Parallel channel, flat top/bottom, and disjoint channel (`tool_options.channel`,
-    /// resolved against the tool's defaults).
+    /// The own-line price channel (`tool_options.channel`, resolved against the tool's
+    /// defaults).
     Channel {
         middle_line: bool,
         middle_color: Option<String>,
     },
-    /// Regression trend (`tool_options.channel`, resolved against the tool's defaults).
-    RegressionTrend {
-        middle_line: bool,
-        middle_color: Option<String>,
-        upper_deviation: f64,
-        lower_deviation: f64,
-        use_upper_deviation: bool,
-        use_lower_deviation: bool,
-        source: crate::IndicatorInputSource,
-        show_pearsons: bool,
-    },
     // B8: channels — end
-    // B8: fibonacci — begin
-    /// Every Fibonacci-family tool (`tool_options.fibonacci`, resolved with the kind's label
-    /// placement defaults).
-    Fibonacci(crate::FibonacciToolOptions),
-    // B8: fibonacci — end
-    // B8: pitchforks_gann — begin
-    /// Every pitchfork and the pitchfan: the level list (median offsets in half-handle widths).
-    Pitchfork {
-        levels: Vec<DrawingLevel>,
-    },
-    /// Every Gann tool: its level list and the resolved `tool_options.gann` block.
-    Gann {
-        levels: Vec<DrawingLevel>,
-        time_levels: Vec<DrawingLevel>,
-        angles: Vec<DrawingLevel>,
-        arcs: Vec<DrawingLevel>,
-        reverse: bool,
-        show_angles: bool,
-        show_stats: bool,
-        scale_ratio: Option<f64>,
-        size_bars: f64,
-    },
-    // B8: pitchforks_gann — end
     // B8: projection_annotations — begin
-    /// Every Projection & Annotations tool (`tool_options.projection_annotation`, resolved).
-    /// `pattern_bars` is the number of bars a bars pattern captured.
+    /// The own-line annotation tools (simple tag, simple annotation) and the measuring ranges
+    /// (price range, date range, date and price range): `tool_options.projection_annotation`,
+    /// resolved. `pattern_bars` is the number of bars the block's `bars` holds.
     ProjectionAnnotation {
         bars_mode: crate::BarsPatternMode,
         mirrored: bool,
@@ -497,29 +485,21 @@ pub enum DrawingKindOptions {
         always_show_text: bool,
     },
     // B8: projection_annotations — end
-    // B8: patterns_elliott_cycles — begin
-    /// XABCD, cypher, ABCD, and three drives (`tool_options.pattern`, resolved).
-    Pattern {
-        show_ratios: bool,
-    },
-    /// Every Elliott wave tool (`tool_options.pattern`, resolved).
-    ElliottWave {
-        degree: crate::ElliottWaveDegree,
-        show_wave: bool,
-    },
-    // B8: patterns_elliott_cycles — end
-    // B8: shapes — begin
-    /// Every Shapes-family tool (`tool_options.shape`, resolved).
-    Shape {
-        closed: bool,
-    },
-    // B8: shapes — end
 }
 
-/// Family-specific typed option blocks (B8), one optional block per drawing family; `None` means
+/// The fork's typed option blocks (B8), one optional block per fork drawing family; `None` means
 /// that family's defaults. Options JSON, templates, clipboard/sync payloads, and persistence carry
 /// the blocks under `tool_options`. Patches deep-merge: absent keys keep their values and `null`
 /// resets a block.
+///
+/// The upstream catalog's flat [`Drawing`](crate::Drawing) fields are canonical. A block key that
+/// overlaps one of them (a Fibonacci tool's `fibonacci.reverse`, a Gann square's `gann.angles`,
+/// an Elliott wave's `pattern.degree`, a bars pattern's `projection_annotation.bars`, an icon
+/// stamp's `projection_annotation.icon`, a regression trend's `channel` deviations) is an input
+/// alias of that field: patches, templates, paste, and persistence move it onto the field through
+/// [`take_legacy_flat_options`], and the flat key wins when both are given. Every other key is
+/// stored and persisted, and read only by the family kinds (the own-line tools and the ranges);
+/// upstream-rendered kinds keep it inert.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DrawingToolOptions {
@@ -531,26 +511,18 @@ pub struct DrawingToolOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<crate::ChannelToolOptions>,
     // B8: channels — end
-    // B8: fibonacci — begin
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fibonacci: Option<crate::FibonacciToolOptions>,
-    // B8: fibonacci — end
-    // B8: pitchforks_gann — begin
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gann: Option<crate::GannToolOptions>,
-    // B8: pitchforks_gann — end
     // B8: projection_annotations — begin
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection_annotation: Option<crate::ProjectionAnnotationToolOptions>,
     // B8: projection_annotations — end
-    // B8: patterns_elliott_cycles — begin
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<crate::PatternToolOptions>,
-    // B8: patterns_elliott_cycles — end
-    // B8: shapes — begin
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<crate::ShapeToolOptions>,
-    // B8: shapes — end
 }
 
 /// Upper bound on one serialized `tool_options` object, keeping patches and documents bounded.
@@ -574,21 +546,13 @@ impl DrawingToolOptions {
             .as_ref()
             .is_none_or(crate::ChannelToolOptions::validate)
         // B8: channels — end
-        // B8: fibonacci — begin
-        // B8: fibonacci — end
-        // B8: pitchforks_gann — begin
         && self.gann.as_ref().is_none_or(crate::GannToolOptions::validate)
-        // B8: pitchforks_gann — end
         // B8: projection_annotations — begin
             && self
                 .projection_annotation
                 .as_ref()
                 .is_none_or(crate::ProjectionAnnotationToolOptions::validate)
         // B8: projection_annotations — end
-        // B8: patterns_elliott_cycles — begin
-        // B8: patterns_elliott_cycles — end
-        // B8: shapes — begin
-        // B8: shapes — end
     }
 
     /// These options as a named template keeps them: data a drawing captured (not style) stays
@@ -600,20 +564,12 @@ impl DrawingToolOptions {
         // B8: lines — end
         // B8: channels — begin
         // B8: channels — end
-        // B8: fibonacci — begin
-        // B8: fibonacci — end
-        // B8: pitchforks_gann — begin
-        // B8: pitchforks_gann — end
         // B8: projection_annotations — begin
-        // A bars pattern's copied bars.
+        // Copied bars in the fork's block (a bars pattern's legacy `bars` key).
         if let Some(block) = style.projection_annotation.as_mut() {
             block.bars.clear();
         }
         // B8: projection_annotations — end
-        // B8: patterns_elliott_cycles — begin
-        // B8: patterns_elliott_cycles — end
-        // B8: shapes — begin
-        // B8: shapes — end
         style
     }
 
@@ -676,6 +632,287 @@ impl DrawingToolOptions {
     }
 }
 
+/// Upstream flat option values read from fork `tool_options` keys that overlap them (see
+/// [`take_legacy_flat_options`]). A field is `Some` only when its fork key supplied it (or, for a
+/// legacy document, the fork block's default did); the caller applies it where the input carried
+/// no flat key of its own, through that flat key's validation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LegacyFlatOptions {
+    pub(crate) level_reverse: Option<bool>,
+    pub(crate) level_log_scale: Option<bool>,
+    pub(crate) level_show_prices: Option<bool>,
+    pub(crate) level_show_values: Option<bool>,
+    pub(crate) level_show_percents: Option<bool>,
+    pub(crate) level_label_align: Option<String>,
+    pub(crate) gann_fans: Option<Vec<DrawingLevel>>,
+    pub(crate) gann_arcs: Option<Vec<DrawingLevel>>,
+    pub(crate) wave_degree: Option<String>,
+    pub(crate) bars_pattern: Option<Vec<crate::drawings::BarsPatternBar>>,
+    pub(crate) bars_pattern_mirror_x: Option<bool>,
+    pub(crate) bars_pattern_mirror_y: Option<bool>,
+    pub(crate) bars_pattern_mode: Option<String>,
+    pub(crate) icon_name: Option<String>,
+    pub(crate) icon_size: Option<f64>,
+    pub(crate) regression_deviations: Option<f64>,
+}
+
+/// One fork option block being read for [`take_legacy_flat_options`].
+struct LegacyBlock {
+    /// The block's stored keys. Taken keys leave it; the rest goes back into `tool_options`.
+    stored: serde_json::Map<String, serde_json::Value>,
+    /// The fork block's default keys, read under the stored ones for a legacy document (the fork
+    /// deserialized every block with `#[serde(default)]`); empty otherwise.
+    defaults: serde_json::Map<String, serde_json::Value>,
+}
+
+impl LegacyBlock {
+    /// The value of `key`, removed from the stored block. A stored value `read` rejects stays,
+    /// so the block's own deserialization reports it instead of the key vanishing silently.
+    fn take<T>(&mut self, key: &str, read: impl Fn(&serde_json::Value) -> Option<T>) -> Option<T> {
+        if let Some(value) = self.stored.get(key) {
+            let value = read(value)?;
+            self.stored.remove(key);
+            return Some(value);
+        }
+        self.defaults.get(key).and_then(read)
+    }
+}
+
+/// A fork Gann level list (`gann.angles` or `gann.arcs`) as an upstream Gann family: entries the
+/// upstream family rejects are dropped and the list keeps at most [`MAX_DRAWING_LEVELS`].
+fn legacy_gann_family(value: &serde_json::Value, fan: bool) -> Option<Vec<DrawingLevel>> {
+    let levels: Vec<DrawingLevel> = serde_json::from_value(value.clone()).ok()?;
+    Some(
+        levels
+            .into_iter()
+            .filter(|level| crate::drawings::valid_gann_family(std::slice::from_ref(level), fan))
+            .take(MAX_DRAWING_LEVELS)
+            .collect(),
+    )
+}
+
+/// Fork bars (`projection_annotation.bars`, `[open, high, low, close]` oldest first) as an
+/// upstream snapshot: each bar keeps its list position as its offset, invalid bars are dropped,
+/// and offsets stay below [`MAX_BARS_PATTERN_BARS`](crate::drawings::MAX_BARS_PATTERN_BARS).
+pub(crate) fn legacy_bars_pattern(bars: &[[f64; 4]]) -> Vec<crate::drawings::BarsPatternBar> {
+    bars.iter()
+        .take(crate::drawings::MAX_BARS_PATTERN_BARS)
+        .enumerate()
+        .filter_map(|(offset, &[open, high, low, close])| {
+            let bar = crate::drawings::BarsPatternBar {
+                offset: u16::try_from(offset).ok()?,
+                open,
+                high,
+                low,
+                close,
+            };
+            bar.valid().then_some(bar)
+        })
+        .collect()
+}
+
+/// Move the fork `tool_options` keys of `kind` that overlap an upstream flat field out of
+/// `tool_options` and return them as that field's normalized value. It works by key presence: a
+/// patch that sends part of a block maps exactly the keys it sends. A block left empty is removed;
+/// every other key stays (inert for upstream-rendered kinds, read by the own-line families).
+///
+/// With `absent_block_is_default` (a document the fork wrote, which omitted values equal to its
+/// defaults) the fork block's defaults stand in for absent keys, including a block that is absent
+/// altogether: [`FibonacciToolOptions`](crate::FibonacciToolOptions),
+/// [`GannToolOptions`](crate::GannToolOptions), [`PatternToolOptions`](crate::PatternToolOptions),
+/// [`ProjectionAnnotationToolOptions`](crate::ProjectionAnnotationToolOptions), or
+/// [`ChannelToolOptions`](crate::ChannelToolOptions).
+///
+/// The mapping, by kind:
+///
+/// - Fibonacci tools, block `fibonacci`: `reverse` to `level_reverse` where the fork read it with
+///   upstream's meaning: as is on the extension, channel, and time zones, inverted on the
+///   retracement and the speed fan (the fork's level 0 sat on their second anchor, upstream's on the
+///   first). The spiral's `reverse` (a counterclockwise turn) has no flat counterpart, and the
+///   tools the fork never reversed have nothing to map, so their `reverse` stays stored but inert.
+///   `log_scale` to `level_log_scale` (retracement, extension, channel); `show_prices` to
+///   `level_show_prices`;
+///   `show_levels` and `levels_as_percent` to `level_show_values` and `level_show_percents`;
+///   `label_h_align` to `level_label_align`.
+/// - Gann box, squares, and fan, block `gann`: `reverse` to `level_reverse`; on the squares,
+///   `angles` and `arcs` to `gann_fans` and `gann_arcs`.
+/// - Elliott waves, block `pattern`: `degree` to `wave_degree`.
+/// - Bars pattern, block `projection_annotation`: `bars_mode` to `bars_pattern_mode`, `mirrored`
+///   and `flipped` to `bars_pattern_mirror_x` and `bars_pattern_mirror_y`, `bars` to
+///   `bars_pattern`.
+/// - Icon stamp, block `projection_annotation`: `icon` and `icon_size` to `icon_name` and
+///   `icon_size`.
+/// - Regression trend, block `channel`: the two deviation sides and their switches to
+///   `regression_deviations`.
+pub(crate) fn take_legacy_flat_options(
+    kind: DrawingKind,
+    tool_options: &mut serde_json::Value,
+    absent_block_is_default: bool,
+) -> LegacyFlatOptions {
+    let mut legacy = LegacyFlatOptions::default();
+    let fibonacci = matches!(
+        kind,
+        DrawingKind::FibonacciRetracement
+            | DrawingKind::FibonacciExtension
+            | DrawingKind::FibonacciChannel
+            | DrawingKind::FibonacciTimeZones
+            | DrawingKind::FibonacciTrendTime
+            | DrawingKind::FibonacciSpeedFan
+            | DrawingKind::FibonacciSpeedArcs
+            | DrawingKind::FibonacciCircles
+            | DrawingKind::FibonacciSpiral
+            | DrawingKind::FibonacciWedge
+    );
+    let gann = matches!(
+        kind,
+        DrawingKind::GannBox
+            | DrawingKind::GannSquare
+            | DrawingKind::GannSquareFixed
+            | DrawingKind::GannFan
+    );
+    let name = if fibonacci {
+        "fibonacci"
+    } else if gann {
+        "gann"
+    } else if kind.is_elliott() {
+        "pattern"
+    } else if matches!(kind, DrawingKind::BarsPattern | DrawingKind::IconStamp) {
+        "projection_annotation"
+    } else if kind == DrawingKind::RegressionTrend {
+        "channel"
+    } else {
+        return legacy;
+    };
+    let Some(options) = tool_options.as_object_mut() else {
+        return legacy;
+    };
+    let stored = match options.remove(name) {
+        Some(serde_json::Value::Object(stored)) => stored,
+        // A `null` reset or a malformed block stays for the caller's own handling.
+        Some(other) => {
+            options.insert(name.to_string(), other);
+            return legacy;
+        }
+        None if absent_block_is_default => serde_json::Map::new(),
+        None => return legacy,
+    };
+    let defaults = if absent_block_is_default {
+        let defaults = match name {
+            "fibonacci" => serde_json::to_value(crate::FibonacciToolOptions::default()),
+            "gann" => serde_json::to_value(crate::GannToolOptions::default()),
+            "pattern" => serde_json::to_value(crate::PatternToolOptions::default()),
+            "projection_annotation" => {
+                serde_json::to_value(crate::ProjectionAnnotationToolOptions::default())
+            }
+            _ => serde_json::to_value(crate::ChannelToolOptions::default()),
+        };
+        match defaults {
+            Ok(serde_json::Value::Object(defaults)) => defaults,
+            _ => serde_json::Map::new(),
+        }
+    } else {
+        serde_json::Map::new()
+    };
+    let mut block = LegacyBlock { stored, defaults };
+    let boolean = serde_json::Value::as_bool;
+    let number = serde_json::Value::as_f64;
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
+    if fibonacci {
+        legacy.level_reverse = match kind {
+            // The fork's level 0 sat on the second anchor, upstream's sits on the first.
+            DrawingKind::FibonacciRetracement | DrawingKind::FibonacciSpeedFan => {
+                block.take("reverse", boolean).map(|reverse| !reverse)
+            }
+            DrawingKind::FibonacciExtension
+            | DrawingKind::FibonacciChannel
+            | DrawingKind::FibonacciTimeZones => block.take("reverse", boolean),
+            _ => None,
+        };
+        if kind.supports_log_levels() {
+            legacy.level_log_scale = block.take("log_scale", boolean);
+        }
+        legacy.level_show_prices = block.take("show_prices", boolean);
+        let show_levels = block.take("show_levels", boolean);
+        let as_percent = block.take("levels_as_percent", boolean);
+        if show_levels.is_some() || as_percent.is_some() {
+            let show_levels = show_levels.unwrap_or(true);
+            let as_percent = as_percent.unwrap_or(false);
+            legacy.level_show_values = Some(show_levels && !as_percent);
+            legacy.level_show_percents = Some(show_levels && as_percent);
+        }
+        legacy.level_label_align = block.take("label_h_align", text).or_else(|| {
+            // The fork's unset alignment is the tool's own: time levels label their right.
+            absent_block_is_default.then(|| {
+                if matches!(
+                    kind,
+                    DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
+                ) {
+                    "right".to_string()
+                } else {
+                    "left".to_string()
+                }
+            })
+        });
+    } else if gann {
+        legacy.level_reverse = block.take("reverse", boolean);
+        if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
+            legacy.gann_fans = block.take("angles", |value| legacy_gann_family(value, true));
+            legacy.gann_arcs = block.take("arcs", |value| legacy_gann_family(value, false));
+        }
+    } else if kind.is_elliott() {
+        legacy.wave_degree = block.take("degree", text);
+    } else if kind == DrawingKind::BarsPattern {
+        legacy.bars_pattern_mode = block.take("bars_mode", text).map(|mode| {
+            if mode == "hl_bars" {
+                "bars".to_string()
+            } else {
+                mode
+            }
+        });
+        legacy.bars_pattern_mirror_x = block.take("mirrored", boolean);
+        legacy.bars_pattern_mirror_y = block.take("flipped", boolean);
+        legacy.bars_pattern = block.take("bars", |value| {
+            serde_json::from_value::<Vec<[f64; 4]>>(value.clone())
+                .ok()
+                .map(|bars| legacy_bars_pattern(&bars))
+        });
+    } else if kind == DrawingKind::IconStamp {
+        legacy.icon_name = block.take("icon", text);
+        legacy.icon_size = block
+            .take("icon_size", number)
+            .map(|size| size.clamp(8.0, 96.0));
+    } else {
+        // Regression trend: the fork's two deviation sides fold into one symmetric band at the
+        // wider enabled side. Every key is taken so none is left behind half-mapped.
+        let upper = block.take("upper_deviation", number);
+        let lower = block.take("lower_deviation", number);
+        let use_upper = block.take("use_upper_deviation", boolean);
+        let use_lower = block.take("use_lower_deviation", boolean);
+        if absent_block_is_default
+            || upper.is_some()
+            || lower.is_some()
+            || use_upper.is_some()
+            || use_lower.is_some()
+        {
+            let upper = if use_upper.unwrap_or(true) {
+                upper.unwrap_or(2.0).abs()
+            } else {
+                0.0
+            };
+            let lower = if use_lower.unwrap_or(true) {
+                lower.unwrap_or(-2.0).abs()
+            } else {
+                0.0
+            };
+            legacy.regression_deviations = Some(upper.max(lower).clamp(0.0, 10.0));
+        }
+    }
+    if !block.stored.is_empty() {
+        options.insert(name.to_string(), serde_json::Value::Object(block.stored));
+    }
+    legacy
+}
+
 /// A property descriptor without bounds or enum values (the common schema's and each family's
 /// `tool_options.*` rows).
 pub(crate) fn descriptor(
@@ -696,6 +933,7 @@ pub(crate) fn descriptor(
 /// Return the complete generic property schema for one built-in drawing kind.  The schema is
 /// data, so a host can build a property panel without a tool-specific switch statement.
 pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
+    let defaults = crate::drawings::Drawing::new(0, kind, 0, Vec::new());
     let mut properties = vec![
         descriptor("name", DrawingPropertyType::String, serde_json::json!("")),
         descriptor(
@@ -728,7 +966,11 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
             DrawingPropertyType::Color,
             serde_json::json!("#2962ff"),
         ),
-        descriptor("width", DrawingPropertyType::Number, serde_json::json!(2.0)),
+        descriptor(
+            "width",
+            DrawingPropertyType::Number,
+            serde_json::json!(defaults.width),
+        ),
         descriptor(
             "style",
             DrawingPropertyType::Enum,
@@ -742,7 +984,7 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
         descriptor(
             "stroke_end",
             DrawingPropertyType::Enum,
-            serde_json::json!("none"),
+            serde_json::to_value(defaults.stroke_end).unwrap_or_default(),
         ),
         descriptor(
             "extend_left",
@@ -757,7 +999,7 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
         descriptor(
             "fill_enabled",
             DrawingPropertyType::Boolean,
-            serde_json::json!(false),
+            serde_json::json!(defaults.fill_enabled),
         ),
         descriptor(
             "fill_color",
@@ -795,8 +1037,16 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
             DrawingPropertyType::Enum,
             serde_json::json!("middle"),
         ),
-        descriptor("labels", DrawingPropertyType::Levels, serde_json::json!([])),
-        descriptor("levels", DrawingPropertyType::Levels, serde_json::json!([])),
+        descriptor(
+            "labels",
+            DrawingPropertyType::Levels,
+            serde_json::to_value(defaults.labels).unwrap_or_default(),
+        ),
+        descriptor(
+            "levels",
+            DrawingPropertyType::Levels,
+            serde_json::to_value(defaults.levels).unwrap_or_default(),
+        ),
         descriptor(
             "magnet",
             DrawingPropertyType::Enum,
@@ -823,6 +1073,142 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
             property.max = Some(max);
             properties.push(property);
         }
+    }
+    if kind == DrawingKind::RegressionTrend {
+        properties.push(descriptor(
+            "regression_source_id",
+            DrawingPropertyType::Integer,
+            serde_json::Value::Null,
+        ));
+        let mut deviations = descriptor(
+            "regression_deviations",
+            DrawingPropertyType::Number,
+            serde_json::json!(2.0),
+        );
+        deviations.min = Some(0.0);
+        deviations.max = Some(10.0);
+        properties.push(deviations);
+    }
+    if kind.is_elliott() {
+        let mut degree = descriptor(
+            "wave_degree",
+            DrawingPropertyType::Enum,
+            serde_json::json!("minor"),
+        );
+        degree.enum_values = [
+            "subminuette",
+            "minuette",
+            "minute",
+            "minor",
+            "intermediate",
+            "primary",
+            "cycle",
+            "supercycle",
+            "grand_supercycle",
+            "submillennium",
+            "millennium",
+            "supermillennium",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        properties.push(degree);
+    }
+    if kind == DrawingKind::AnchoredText {
+        for name in ["screen_x", "screen_y"] {
+            let mut position =
+                descriptor(name, DrawingPropertyType::Number, serde_json::json!(0.5));
+            position.min = Some(0.0);
+            position.max = Some(1.0);
+            properties.push(position);
+        }
+    }
+    if kind == DrawingKind::IconStamp {
+        properties.push(descriptor(
+            "icon_name",
+            DrawingPropertyType::String,
+            serde_json::json!(""),
+        ));
+        let mut size = descriptor(
+            "icon_size",
+            DrawingPropertyType::Number,
+            serde_json::json!(24.0),
+        );
+        size.min = Some(8.0);
+        size.max = Some(96.0);
+        properties.push(size);
+    }
+    if kind == DrawingKind::BarsPattern {
+        properties.push(descriptor(
+            "bars_pattern_mirror_x",
+            DrawingPropertyType::Boolean,
+            serde_json::json!(false),
+        ));
+        properties.push(descriptor(
+            "bars_pattern_mirror_y",
+            DrawingPropertyType::Boolean,
+            serde_json::json!(false),
+        ));
+        let mut mode = descriptor(
+            "bars_pattern_mode",
+            DrawingPropertyType::Enum,
+            serde_json::json!("bars"),
+        );
+        mode.enum_values = [
+            "bars",
+            "oc_bars",
+            "line_open",
+            "line_high",
+            "line_low",
+            "line_close",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        properties.push(mode);
+    }
+    if kind.has_levels() {
+        for (name, default) in [
+            ("level_reverse", defaults.level_reverse),
+            ("level_show_prices", defaults.level_show_prices),
+            ("level_show_values", defaults.level_show_values),
+            ("level_show_percents", defaults.level_show_percents),
+        ] {
+            properties.push(descriptor(
+                name,
+                DrawingPropertyType::Boolean,
+                serde_json::json!(default),
+            ));
+        }
+        if kind.supports_log_levels() {
+            properties.push(descriptor(
+                "level_log_scale",
+                DrawingPropertyType::Boolean,
+                serde_json::json!(false),
+            ));
+        }
+        let mut align = descriptor(
+            "level_label_align",
+            DrawingPropertyType::Enum,
+            serde_json::json!(defaults.level_label_align),
+        );
+        align.enum_values = ["left", "center", "right"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        properties.push(align);
+    }
+    if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
+        properties.push(descriptor(
+            "gann_fans",
+            DrawingPropertyType::Levels,
+            serde_json::to_value(defaults.gann_fans).unwrap_or_default(),
+        ));
+        properties.push(descriptor(
+            "gann_arcs",
+            DrawingPropertyType::Levels,
+            serde_json::to_value(defaults.gann_arcs).unwrap_or_default(),
+        ));
     }
     for property in &mut properties {
         if property.name == "style" {
@@ -884,5 +1270,113 @@ mod tests {
             .windows(3)
             .skip(1)
             .all(|w| w[2] == w[0] + w[1]));
+    }
+
+    #[test]
+    fn legacy_tool_option_keys_move_onto_flat_fields_by_key_presence() {
+        // A partial patch maps exactly the keys it sends; the rest of the block stays, and a key
+        // whose value is malformed stays for the block's own validation.
+        let mut options = serde_json::json!({
+            "fibonacci": {"reverse": true, "trend_line": false, "show_prices": "yes"},
+            "shape": {"closed": true}
+        });
+        let legacy =
+            take_legacy_flat_options(DrawingKind::FibonacciRetracement, &mut options, false);
+        // The fork's reversed retracement put level 0 on the first anchor: upstream's unreversed
+        // placement.
+        assert_eq!(
+            legacy,
+            LegacyFlatOptions {
+                level_reverse: Some(false),
+                ..LegacyFlatOptions::default()
+            }
+        );
+        assert_eq!(
+            options,
+            serde_json::json!({
+                "fibonacci": {"trend_line": false, "show_prices": "yes"},
+                "shape": {"closed": true}
+            })
+        );
+        // One side of the value/percent pair takes the other's fork default; an emptied block
+        // is removed.
+        let mut options = serde_json::json!({"fibonacci": {"levels_as_percent": true}});
+        let legacy = take_legacy_flat_options(DrawingKind::FibonacciChannel, &mut options, false);
+        assert_eq!(legacy.level_show_values, Some(false));
+        assert_eq!(legacy.level_show_percents, Some(true));
+        assert_eq!(legacy.level_label_align, None);
+        assert_eq!(options, serde_json::json!({}));
+        // The channel reversed the way upstream does; the spiral's counterclockwise `reverse`
+        // has no flat counterpart and stays stored.
+        let mut options = serde_json::json!({"fibonacci": {"reverse": true}});
+        let legacy = take_legacy_flat_options(DrawingKind::FibonacciChannel, &mut options, false);
+        assert_eq!(legacy.level_reverse, Some(true));
+        let mut options = serde_json::json!({"fibonacci": {"reverse": true}});
+        let legacy = take_legacy_flat_options(DrawingKind::FibonacciSpiral, &mut options, false);
+        assert_eq!(legacy, LegacyFlatOptions::default());
+        assert_eq!(options, serde_json::json!({"fibonacci": {"reverse": true}}));
+        // Another kind's block is not this kind's to map.
+        let mut options = serde_json::json!({"fibonacci": {"reverse": true}});
+        let legacy = take_legacy_flat_options(DrawingKind::TrendLine, &mut options, true);
+        assert_eq!(legacy, LegacyFlatOptions::default());
+        assert_eq!(options, serde_json::json!({"fibonacci": {"reverse": true}}));
+    }
+
+    #[test]
+    fn legacy_tool_option_blocks_fold_into_upstream_values() {
+        // The regression's two sides fold into one band at the wider enabled side.
+        let mut options = serde_json::json!({"channel": {
+            "upper_deviation": 3.0,
+            "lower_deviation": -4.5,
+            "use_lower_deviation": false,
+            "middle_line": true
+        }});
+        let legacy = take_legacy_flat_options(DrawingKind::RegressionTrend, &mut options, false);
+        assert_eq!(legacy.regression_deviations, Some(3.0));
+        assert_eq!(
+            options,
+            serde_json::json!({"channel": {"middle_line": true}})
+        );
+        // Bars keep their list position as their offset; invalid bars drop out.
+        let mut options = serde_json::json!({"projection_annotation": {
+            "bars_mode": "hl_bars",
+            "flipped": true,
+            "bars": [[5.0, 6.0, 4.0, 5.5], [1.0, 0.5, 2.0, 1.0], [5.5, 8.0, 5.0, 7.0]]
+        }});
+        let legacy = take_legacy_flat_options(DrawingKind::BarsPattern, &mut options, false);
+        assert_eq!(legacy.bars_pattern_mode.as_deref(), Some("bars"));
+        assert_eq!(legacy.bars_pattern_mirror_x, None);
+        assert_eq!(legacy.bars_pattern_mirror_y, Some(true));
+        let offsets = legacy
+            .bars_pattern
+            .unwrap()
+            .iter()
+            .map(|bar| bar.offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, [0, 2]);
+        assert_eq!(options, serde_json::json!({}));
+        // An icon's size clamps into the upstream range.
+        let mut options =
+            serde_json::json!({"projection_annotation": {"icon": "heart", "icon_size": 120.0}});
+        let legacy = take_legacy_flat_options(DrawingKind::IconStamp, &mut options, false);
+        assert_eq!(legacy.icon_name.as_deref(), Some("heart"));
+        assert_eq!(legacy.icon_size, Some(96.0));
+        // A fork document's absent block reads as the block's defaults, and stays absent.
+        let mut options = serde_json::json!({});
+        let legacy = take_legacy_flat_options(DrawingKind::ElliottImpulse, &mut options, true);
+        assert_eq!(legacy.wave_degree.as_deref(), Some("intermediate"));
+        assert_eq!(options, serde_json::json!({}));
+        let legacy = take_legacy_flat_options(DrawingKind::FibonacciTimeZones, &mut options, true);
+        assert_eq!(legacy.level_reverse, Some(false));
+        assert_eq!(legacy.level_show_values, Some(true));
+        assert_eq!(legacy.level_show_percents, Some(false));
+        assert_eq!(legacy.level_label_align.as_deref(), Some("right"));
+        assert_eq!(
+            legacy.level_log_scale, None,
+            "time zones have no log levels"
+        );
+        let legacy = take_legacy_flat_options(DrawingKind::RegressionTrend, &mut options, true);
+        assert_eq!(legacy.regression_deviations, Some(2.0));
+        assert_eq!(options, serde_json::json!({}));
     }
 }

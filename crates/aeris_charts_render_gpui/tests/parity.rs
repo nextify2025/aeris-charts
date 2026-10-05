@@ -2246,11 +2246,7 @@ fn measure_tools_reach_canvas_and_gpui_with_identical_quads_strokes_and_text() {
         for (kind, from, to) in [
             (DrawingKind::PriceRange, (20.0, 94.0), (45.0, 107.5)),
             (DrawingKind::DateRange, (110.0, 96.0), (80.0, 104.0)),
-            (
-                DrawingKind::DateAndPriceRange,
-                (125.0, 108.0),
-                (160.0, 93.25),
-            ),
+            (DrawingKind::DatePriceRange, (125.0, 108.0), (160.0, 93.25)),
         ] {
             engine
                 .add_drawing(

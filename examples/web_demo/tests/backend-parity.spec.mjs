@@ -1639,7 +1639,7 @@ async function render_measures(page, backend, theme) {
     const specs = [
       ["price_range", 0.1, 0.22, 0.97, 1.04],
       ["date_range", 0.48, 0.3, 1.02, 0.98],
-      ["date_and_price_range", 0.55, 0.75, 1.03, 0.95],
+      ["date_price_range", 0.55, 0.75, 1.03, 0.95],
     ];
     const box = document.getElementById("chart_container").getBoundingClientRect();
     const left = box.left + chart.wasm.pane_left();

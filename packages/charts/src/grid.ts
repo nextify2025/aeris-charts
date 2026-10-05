@@ -12,7 +12,7 @@
 // @ts-ignore -- pkg is a build artifact, present after build:wasm
 import { AerisWorkspace } from "../pkg/aeris_charts_wasm.js";
 import { create_chart } from "./index.js";
-import { ensure_init } from "./impl.js";
+import { canonical_drawing_kind, ensure_init } from "./impl.js";
 import { AerisChartsError } from "./errors.js";
 import { DEFAULT_SHORTCUTS, install_shortcuts } from "./shortcuts.js";
 import type { shortcut_action } from "./shortcuts.js";
@@ -644,7 +644,7 @@ export async function create_chart_grid(
       activate(cell.id);
     },
     set_drawing_tool: (tool, tool_options) => {
-      workspace_tool = tool;
+      workspace_tool = tool === null ? null : canonical_drawing_kind(tool);
       if (tool_options !== undefined) workspace_tool_options = { ...tool_options };
       cells.get(active_id)!.chart.set_drawing_tool(tool, tool_options);
     },
