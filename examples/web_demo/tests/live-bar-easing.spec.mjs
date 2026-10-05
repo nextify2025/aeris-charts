@@ -120,7 +120,11 @@ test("the option round-trips, clamps, and rejects negative values before applyin
 });
 
 test("a same-time update glides over several presented frames while queries read real values", async ({ page }) => {
-  await page.evaluate(() => window.__main.apply_options({ live_bar_easing_ms: 150 }));
+  // The longest time constant, so the glide settles six seconds after the tick: a CI runner that
+  // spends hundreds of milliseconds per screenshot still captures every frame mid-glide, while on
+  // a fast machine the drawn close still moves by several pixels between two captures.
+  const TAU_MS = 1000;
+  await page.evaluate((tau) => window.__main.apply_options({ live_bar_easing_ms: tau }), TAU_MS);
   await wait_frames(page, 3);
   const idle = await presented(page);
   await wait_frames(page, 4);
@@ -133,14 +137,19 @@ test("a same-time update glides over several presented frames while queries read
   await wait_frames(page, 8);
   expect(await presented(page)).toBeGreaterThanOrEqual(start + 3);
 
-  // Consecutive presented frames draw the last bar differently while the glide runs.
+  // Presented frames draw the last bar differently while the glide runs: three captures, four
+  // rAFs apart, and the bar moved between at least one pair of them.
   const band = await last_bar_band(page);
   const frames = [];
   for (let i = 0; i < 3; i += 1) {
     frames.push(await capture(page));
-    await wait_frames(page, 2);
+    await wait_frames(page, 4);
   }
-  const changes = [band_differs(frames[0], frames[1], band), band_differs(frames[1], frames[2], band)];
+  const changes = [
+    band_differs(frames[0], frames[1], band),
+    band_differs(frames[1], frames[2], band),
+    band_differs(frames[0], frames[2], band),
+  ];
   expect(changes.filter(Boolean).length, "the drawn last bar moved across presented frames").toBeGreaterThanOrEqual(1);
 
   // Queries never saw the glide.
@@ -150,8 +159,8 @@ test("a same-time update glides over several presented frames while queries read
   }, tick.close);
   expect(real.matches).toBe(true);
 
-  // Six time constants later the glide has settled and the loop has stopped.
-  await page.waitForTimeout(1200);
+  // Six time constants after the tick the glide has settled and the loop has stopped.
+  await page.waitForTimeout(6 * TAU_MS + 600);
   const settled = await presented(page);
   await wait_frames(page, 6);
   expect(await presented(page), "the rAF loop stops once settled").toBeLessThanOrEqual(settled + 1);
