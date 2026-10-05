@@ -5577,6 +5577,318 @@ fn crosshair_column_contains_the_wick_column_at_any_dpr() {
     }
 }
 
+/// The `crosshair.shadeRight` default tint: the crosshair line token at 12% alpha
+/// (`rgba(74, 74, 74, 0.12)`, alpha 0.12 * 255 rounds to 31).
+const SHADE_TINT: Color = Color::rgba(74, 74, 74, 31);
+
+fn shade_chart(dpr: f64) -> ChartEngine {
+    let mut chart = ChartEngine::new(800.0, 500.0, dpr);
+    chart.series[0].kind = SeriesKind::Line;
+    chart
+        .set_series_data(
+            0,
+            &[1.0, 2.0, 3.0],
+            &[10.0, 11.0, 12.0],
+            &[11.0, 12.0, 13.0],
+            &[9.0, 10.0, 11.0],
+            &[10.5, 11.5, 12.5],
+        )
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart
+        .apply_options(r#"{"crosshair":{"shadeRight":{"visible":true}}}"#)
+        .unwrap();
+    chart
+}
+
+/// The crosshair-level overlay range of one pane (`trading_end..overlay_end`).
+fn overlay_prims<'a>(chart: &ChartEngine, frame: &'a ChartFrame, pane: usize) -> &'a [Prim] {
+    let segments = chart.frame_pane_segments(pane).unwrap();
+    &frame.panes[pane].main[segments.trading_end..segments.overlay_end]
+}
+
+fn shade_rects(chart: &ChartEngine, frame: &ChartFrame, pane: usize) -> Vec<IRect> {
+    overlay_prims(chart, frame, pane)
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Rect { rect, color } if *color == SHADE_TINT => Some(*rect),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The device-pixel geometry the frame uses for `pane` (`frame/mod.rs` ratio rule).
+fn pane_device_geometry(chart: &ChartEngine, pane: usize) -> (f64, i32, i32, i32) {
+    let dpr = chart.dpr.max(0.01);
+    let hpr = (chart.pane_w * dpr).round().max(1.0) / chart.pane_w.max(1.0);
+    let vpr = (chart.pane_h * dpr).round().max(1.0) / chart.pane_h.max(1.0);
+    let pane_w_px = (chart.pane_w * hpr).round().max(1.0) as i32;
+    let pane = &chart.panes[pane];
+    let y0 = (pane.top * vpr).round() as i32;
+    let y1 = ((pane.top + pane.height) * vpr).round() as i32;
+    (hpr, pane_w_px, y0, y1)
+}
+
+#[test]
+fn crosshair_shade_right_is_off_by_default() {
+    let mut chart = crosshair_chart();
+    chart.set_crosshair_at(chart.time_scale.index_to_coordinate(1), 250.0);
+    let frame = chart.build_frame();
+    assert!(overlay_prims(&chart, &frame, 0)
+        .iter()
+        .any(|prim| matches!(prim, Prim::VLine { .. })));
+    assert!(
+        !overlay_prims(&chart, &frame, 0)
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { rect, .. } if rect.w > 2)),
+        "a default chart paints no shade rect in the crosshair overlay"
+    );
+    assert_eq!(
+        Color::parse_css(&aeris_charts_core::options::CrosshairShadeOptions::default().color),
+        Some(SHADE_TINT)
+    );
+}
+
+#[test]
+fn crosshair_shade_right_veils_every_pane_from_the_bar_edge_at_any_dpr() {
+    for dpr in [1.0, 1.5, 2.0] {
+        let mut chart = shade_chart(dpr);
+        let second = chart.add_series(SeriesKind::Line);
+        chart
+            .set_series_data(
+                second,
+                &[1.0, 2.0, 3.0],
+                &[100.0, 101.0, 102.0],
+                &[101.0, 102.0, 103.0],
+                &[99.0, 100.0, 101.0],
+                &[100.5, 101.5, 102.5],
+            )
+            .unwrap();
+        chart.set_series_pane(second, 1, 1.0);
+        chart.build_frame();
+        let snapped_x = chart.time_scale.index_to_coordinate(1);
+        // The pointer sits in the first pane; the shade is time-aligned like the vertical line
+        // and therefore veils every stacked pane, not only the hovered one.
+        chart.set_crosshair_at(snapped_x, chart.panes[0].top + chart.panes[0].height / 2.0);
+        let frame = chart.build_frame();
+        assert_eq!(frame.panes.len(), 2);
+        for pane in 0..2 {
+            let (hpr, pane_w_px, y0, y1) = pane_device_geometry(&chart, pane);
+            let (left, width) = super::feature_geometry::positions_line(
+                snapped_x,
+                hpr,
+                chart.time_scale.bar_spacing(),
+            );
+            let rects = shade_rects(&chart, &frame, pane);
+            assert_eq!(
+                rects.len(),
+                1,
+                "dpr {dpr} pane {pane}: exactly one shade rect"
+            );
+            let rect = rects[0];
+            assert_eq!(
+                rect.x,
+                left + width,
+                "dpr {dpr} pane {pane}: starts at the bar's right edge"
+            );
+            assert_eq!(
+                rect.x + rect.w,
+                pane_w_px,
+                "dpr {dpr} pane {pane}: reaches the pane edge"
+            );
+            assert_eq!(
+                (rect.y, rect.h),
+                (y0, y1 - y0),
+                "dpr {dpr} pane {pane}: spans the pane"
+            );
+            assert!(rect.w > 0);
+            let overlay = overlay_prims(&chart, &frame, pane);
+            let shade_at = overlay
+                .iter()
+                .position(|prim| matches!(prim, Prim::Rect { color, .. } if *color == SHADE_TINT))
+                .unwrap();
+            let line_at = overlay
+                .iter()
+                .position(|prim| matches!(prim, Prim::VLine { .. }))
+                .expect("vertical line in every pane");
+            assert!(
+                shade_at < line_at,
+                "dpr {dpr} pane {pane}: the shade paints under the line"
+            );
+        }
+        assert_retained_frame_matches_clean_rebuild(&mut chart);
+    }
+}
+
+#[test]
+fn crosshair_shade_right_keeps_the_sliver_right_of_an_even_last_bar() {
+    // `positions_line` centers an even device width on the bar, so the last data bar at right
+    // offset 0 leaves exactly `hpr` device pixels between its right edge and the pane edge.
+    for dpr in [1.0, 2.0] {
+        let mut chart = shade_chart(dpr);
+        chart.set_bar_spacing(10.0);
+        chart.set_right_offset(0.0);
+        chart.set_crosshair_at(chart.time_scale.index_to_coordinate(2), 250.0);
+        let frame = chart.build_frame();
+        let (hpr, pane_w_px, ..) = pane_device_geometry(&chart, 0);
+        let rects = shade_rects(&chart, &frame, 0);
+        assert_eq!(rects.len(), 1, "dpr {dpr}");
+        assert_eq!(
+            rects[0].w,
+            hpr.round() as i32,
+            "dpr {dpr}: a one-CSS-pixel sliver"
+        );
+        assert_eq!(rects[0].x + rects[0].w, pane_w_px, "dpr {dpr}");
+    }
+}
+
+#[test]
+fn crosshair_shade_right_skips_a_zero_width_remainder() {
+    // An odd device width rounds the last bar's right edge onto the pane edge: nothing to veil,
+    // and no zero-width quad reaches any executor. The vertical line still paints.
+    let mut chart = shade_chart(1.0);
+    chart.set_bar_spacing(9.0);
+    chart.set_right_offset(0.0);
+    chart.set_crosshair_at(chart.time_scale.index_to_coordinate(2), 250.0);
+    let frame = chart.build_frame();
+    let (hpr, pane_w_px, ..) = pane_device_geometry(&chart, 0);
+    let (left, width) = super::feature_geometry::positions_line(
+        chart.time_scale.index_to_coordinate(2),
+        hpr,
+        chart.time_scale.bar_spacing(),
+    );
+    assert_eq!(
+        left + width,
+        pane_w_px,
+        "fixture: the bar edge lands on the pane edge"
+    );
+    assert!(shade_rects(&chart, &frame, 0).is_empty());
+    assert!(overlay_prims(&chart, &frame, 0)
+        .iter()
+        .any(|prim| matches!(prim, Prim::VLine { .. })));
+}
+
+#[test]
+fn crosshair_shade_right_follows_the_cursor_into_the_whitespace_slots() {
+    let mut chart = shade_chart(1.0);
+    chart.set_bar_spacing(9.0);
+    chart.set_right_offset(2.0);
+    chart.build_frame();
+
+    // The first empty slot: the shade starts at that hypothetical bar's right edge.
+    let empty_x = chart.time_scale.index_to_coordinate(3);
+    chart.set_crosshair_at(empty_x, 250.0);
+    let frame = chart.build_frame();
+    let (hpr, pane_w_px, ..) = pane_device_geometry(&chart, 0);
+    let (left, width) =
+        super::feature_geometry::positions_line(empty_x, hpr, chart.time_scale.bar_spacing());
+    let rects = shade_rects(&chart, &frame, 0);
+    assert_eq!(rects.len(), 1);
+    assert_eq!(rects[0].x, left + width);
+    assert_eq!(rects[0].x + rects[0].w, pane_w_px);
+
+    // The strict-right slot: its right edge rounds onto the pane edge, so nothing is veiled
+    // while the vertical line keeps following the cursor.
+    let strict_right_x = chart.time_scale.index_to_coordinate(4);
+    chart.set_crosshair_at(strict_right_x, 250.0);
+    let frame = chart.build_frame();
+    assert!(shade_rects(&chart, &frame, 0).is_empty());
+    let line_x = (strict_right_x * hpr).round() as i32;
+    assert!(overlay_prims(&chart, &frame, 0)
+        .iter()
+        .any(|prim| matches!(prim, Prim::VLine { x, .. } if *x == line_x)));
+}
+
+#[test]
+fn crosshair_shade_right_obeys_the_crosshair_gates_but_not_the_vertical_line_toggle() {
+    let mut chart = shade_chart(1.0);
+    chart.set_crosshair_at(chart.time_scale.index_to_coordinate(1), 250.0);
+    let frame = chart.build_frame();
+    assert_eq!(shade_rects(&chart, &frame, 0).len(), 1);
+
+    chart.crosshair_mode = CrosshairMode::Hidden;
+    chart.invalidate_frame_overlay();
+    let frame = chart.build_frame();
+    assert!(shade_rects(&chart, &frame, 0).is_empty(), "hidden mode");
+    chart.crosshair_mode = CrosshairMode::Normal;
+    chart.invalidate_frame_overlay();
+
+    let id = chart
+        .add_drawing(
+            crate::DrawingKind::TrendLine,
+            0,
+            vec![
+                crate::DrawingPoint {
+                    logical: 1.0,
+                    price: 10.5,
+                },
+                crate::DrawingPoint {
+                    logical: 2.0,
+                    price: 12.0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    chart.set_hovered_drawing(Some(id));
+    assert!(chart.crosshair_suppressed_by_interaction());
+    let frame = chart.build_frame();
+    assert!(
+        shade_rects(&chart, &frame, 0).is_empty(),
+        "suppressed by a hovered object"
+    );
+    chart.set_hovered_drawing(None);
+
+    chart
+        .apply_options(r#"{"crosshair":{"vertLine":{"visible":false}}}"#)
+        .unwrap();
+    let frame = chart.build_frame();
+    assert_eq!(
+        shade_rects(&chart, &frame, 0).len(),
+        1,
+        "independent of the vertical line"
+    );
+    assert!(!overlay_prims(&chart, &frame, 0)
+        .iter()
+        .any(|prim| matches!(prim, Prim::VLine { .. })));
+
+    // An unparsable tint falls back to the default tint instead of dropping the veil.
+    chart
+        .apply_options(r#"{"crosshair":{"shadeRight":{"color":"hsl(0, 0%, 29%)"}}}"#)
+        .unwrap();
+    let frame = chart.build_frame();
+    assert_eq!(shade_rects(&chart, &frame, 0).len(), 1);
+    chart
+        .apply_options(r#"{"crosshair":{"shadeRight":{"color":"rgba(10, 20, 30, 0.5)"}}}"#)
+        .unwrap();
+    let frame = chart.build_frame();
+    assert!(overlay_prims(&chart, &frame, 0).iter().any(|prim| matches!(
+        prim,
+        Prim::Rect { color, .. } if *color == Color::rgba(10, 20, 30, 128)
+    )));
+}
+
+#[test]
+fn crosshair_shade_right_moves_rebuild_only_the_overlay() {
+    let mut chart = retained_two_series_chart();
+    chart
+        .apply_options(r#"{"crosshair":{"shadeRight":{"visible":true}}}"#)
+        .unwrap();
+    chart.build_frame();
+    chart.set_crosshair_at(300.0, 200.0);
+    chart.build_frame();
+    assert_eq!(
+        chart.frame_build_stats(),
+        FrameBuildStats {
+            overlay_rebuilds: 1,
+            ..FrameBuildStats::default()
+        }
+    );
+    let frame = chart.build_frame();
+    assert_eq!(shade_rects(&chart, &frame, 0).len(), 1);
+}
+
 #[test]
 fn crosshair_clamps_into_pane_instead_of_vanishing() {
     let mut chart = crosshair_chart();
@@ -8413,6 +8725,409 @@ fn baseline_fill_uses_one_continuous_area_per_quadrant_run() {
         [4],
         "a continuous quadrant must not be split into gradient pockets"
     );
+}
+
+/// The Baseline reference `HLine`s of color `color` in a pane, in frame order, as
+/// `(y, x0, x1, width, style)`.
+fn baseline_reference_lines(
+    frame: &ChartFrame,
+    color: Color,
+) -> Vec<(i32, i32, i32, i32, LineStyle)> {
+    frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::HLine {
+                y,
+                x0,
+                x1,
+                width,
+                style,
+                color: c,
+            } if *c == color => Some((*y, *x0, *x1, *width, *style)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn baseline_chart(dpr: f64, values: &[f64]) -> ChartEngine {
+    let mut chart = ChartEngine::new(800.0, 500.0, dpr);
+    chart.series[0].kind = SeriesKind::Baseline;
+    let times: Vec<f64> = (1..=values.len()).map(|i| i as f64).collect();
+    chart
+        .set_series_data(0, &times, values, values, values, values)
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart
+}
+
+#[test]
+fn baseline_reference_line_is_off_by_default() {
+    let mut chart = baseline_chart(1.0, &[10.0, 20.0]);
+    let frame = chart.build_frame();
+    assert!(baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE).is_empty());
+    assert!(frame.panes[0]
+        .main
+        .iter()
+        .any(|p| matches!(p, Prim::AreaFill { .. })));
+}
+
+#[test]
+fn baseline_reference_line_is_one_dashed_full_width_hline_between_fills_and_strokes() {
+    for dpr in [1.0, 2.0] {
+        let mut chart = baseline_chart(dpr, &[10.0, 20.0]);
+        chart.series[0].baseline = Some(12.5);
+        chart.series[0].baseline_line_visible = true;
+        let frame = chart.build_frame();
+
+        let lines = baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE);
+        let expected_y = (chart.series_price_to_coordinate(0, 12.5).unwrap() * dpr).round() as i32;
+        let pane_w_px = (chart.pane_w * dpr).round() as i32;
+        assert_eq!(
+            lines,
+            [(expected_y, 0, pane_w_px, dpr as i32, LineStyle::Dashed)],
+            "dpr {dpr}"
+        );
+
+        // Ordering: after every quadrant fill and before every quadrant stroke of the series.
+        let main = &frame.panes[0].main;
+        let line_at = main
+            .iter()
+            .position(
+                |p| matches!(p, Prim::HLine { color, .. } if *color == BASELINE_REFERENCE_LINE),
+            )
+            .unwrap();
+        let last_fill = main
+            .iter()
+            .rposition(|p| matches!(p, Prim::AreaFill { .. }))
+            .unwrap();
+        let first_stroke = main
+            .iter()
+            .position(|p| matches!(p, Prim::Polyline { .. }))
+            .unwrap();
+        assert!(last_fill < line_at && line_at < first_stroke, "dpr {dpr}");
+        assert_retained_frame_matches_clean_rebuild(&mut chart);
+
+        // Styling: verbatim color, width in CSS px floored at device scale, numeric line style.
+        chart.series[0].baseline_line_color = Some("#ff0000".to_string());
+        chart.series[0].baseline_line_width = 1.5;
+        chart.series[0].baseline_line_style = 0;
+        let frame = chart.build_frame();
+        assert!(baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE).is_empty());
+        let lines = baseline_reference_lines(&frame, Color::rgb(0xff, 0, 0));
+        assert_eq!(
+            lines,
+            [(
+                expected_y,
+                0,
+                pane_w_px,
+                1f64.max((1.5 * dpr).floor()) as i32,
+                LineStyle::Solid
+            )],
+            "dpr {dpr}"
+        );
+        // An unparsable color falls back to the neutral tint instead of dropping the line.
+        chart.series[0].baseline_line_color = Some("not-a-color".to_string());
+        let frame = chart.build_frame();
+        assert_eq!(
+            baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE).len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn close_before_visible_range_uses_the_last_close_before_the_window() {
+    let mut chart = baseline_chart(1.0, &[10.0, 20.0, 25.0, 30.0]);
+    chart.series[0].baseline_line_visible = true;
+    chart.set_lock_visible_logical_range(true);
+    chart.set_visible_logical_range(2.0, 3.0);
+
+    // Default mode: the visible-range midpoint of [25, 30]; 25 sits below it.
+    assert_eq!(chart.series_baseline_price(0), Some(27.5));
+    let frame = chart.build_frame();
+    let midpoint_y = (chart.series_price_to_coordinate(0, 27.5).unwrap()).round() as i32;
+    assert_eq!(
+        baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE)
+            .iter()
+            .map(|line| line.0)
+            .collect::<Vec<_>>(),
+        [midpoint_y]
+    );
+    assert_eq!(
+        chart.series_bar_color(
+            &chart.series[0],
+            chart.data.plot(0),
+            2,
+            chart.series_baseline_price(0)
+        ),
+        BASELINE_BOTTOM_LINE
+    );
+
+    // Close before the window: row 1 (20) precedes the first visible row, so 25 is now above.
+    chart.series[0].baseline_mode = crate::BaselineMode::CloseBeforeVisibleRange;
+    assert_eq!(chart.series_baseline_price(0), Some(20.0));
+    let frame = chart.build_frame();
+    let reference_y = (chart.series_price_to_coordinate(0, 20.0).unwrap()).round() as i32;
+    assert_ne!(reference_y, midpoint_y);
+    assert_eq!(
+        baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE)
+            .iter()
+            .map(|line| line.0)
+            .collect::<Vec<_>>(),
+        [reference_y]
+    );
+    for row in [2, 3] {
+        assert_eq!(
+            chart.series_bar_color(
+                &chart.series[0],
+                chart.data.plot(0),
+                row,
+                chart.series_baseline_price(0)
+            ),
+            BASELINE_TOP_LINE
+        );
+    }
+    assert!(frame.panes[0].main.iter().any(|p| matches!(
+        p,
+        Prim::Polyline { color, .. } if *color == BASELINE_TOP_LINE
+    )));
+    // Every visible close is above the reference, so the fills are top-quadrant gradients only.
+    let (top_strong, top_faint) = area_fill_gradient(BASELINE_TOP_LINE);
+    let fills: Vec<Gradient> = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|p| match p {
+            Prim::AreaFill { gradient, .. } => Some(*gradient),
+            _ => None,
+        })
+        .collect();
+    assert!(fills
+        .iter()
+        .any(|g| g.top == top_strong && g.bottom == top_faint));
+    // A pinned baseline_value still wins over the mode.
+    chart.series[0].baseline = Some(29.0);
+    assert_eq!(chart.series_baseline_price(0), Some(29.0));
+    assert_retained_frame_matches_clean_rebuild(&mut chart);
+}
+
+#[test]
+fn close_before_visible_range_falls_back_to_the_first_visible_close() {
+    // Nothing precedes the window: the first visible close stands in and reads as unchanged.
+    let mut chart = baseline_chart(1.0, &[10.0, 20.0, 30.0]);
+    chart.series[0].baseline_mode = crate::BaselineMode::CloseBeforeVisibleRange;
+    chart.series[0].baseline_line_visible = true;
+    assert_eq!(chart.series_baseline_price(0), Some(10.0));
+    let frame = chart.build_frame();
+    let y = chart.series_price_to_coordinate(0, 10.0).unwrap().round() as i32;
+    assert_eq!(
+        baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE)
+            .iter()
+            .map(|line| line.0)
+            .collect::<Vec<_>>(),
+        [y]
+    );
+    assert_eq!(
+        chart.series_bar_color(
+            &chart.series[0],
+            chart.data.plot(0),
+            0,
+            chart.series_baseline_price(0)
+        ),
+        BASELINE_TOP_LINE
+    );
+
+    // Leading whitespace rows inside the window are skipped by the fallback too.
+    let mut chart = baseline_chart(1.0, &[f64::NAN, f64::NAN, 12.0, 20.0]);
+    chart.series[0].baseline_mode = crate::BaselineMode::CloseBeforeVisibleRange;
+    chart.set_lock_visible_logical_range(true);
+    chart.set_visible_logical_range(0.0, 3.0);
+    assert_eq!(chart.series_baseline_price(0), Some(12.0));
+}
+
+#[test]
+fn close_before_visible_range_skips_whitespace_rows_before_the_window() {
+    let mut chart = baseline_chart(1.0, &[10.0, f64::NAN, f64::NAN, 30.0, 40.0]);
+    chart.series[0].baseline_mode = crate::BaselineMode::CloseBeforeVisibleRange;
+    chart.series[0].baseline_line_visible = true;
+    chart.set_lock_visible_logical_range(true);
+    chart.set_visible_logical_range(3.0, 4.0);
+    assert_eq!(chart.series_baseline_price(0), Some(10.0));
+    let frame = chart.build_frame();
+    let y = chart.series_price_to_coordinate(0, 10.0).unwrap().round() as i32;
+    assert_eq!(
+        baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE)
+            .iter()
+            .map(|line| line.0)
+            .collect::<Vec<_>>(),
+        [y]
+    );
+}
+
+/// Every Baseline `AreaFill` of pane 0 lies entirely left of the pane (device x < 0): the
+/// clipped one-bar geometry of a lone edge-neighbour row, which the pane never shows.
+fn baseline_fills_are_all_off_pane(frame: &ChartFrame) -> bool {
+    let pane = &frame.panes[0];
+    pane.main.iter().all(|prim| match prim {
+        Prim::AreaFill {
+            first_point,
+            point_count,
+            ..
+        } => pane.points[*first_point as usize..(*first_point + *point_count) as usize]
+            .iter()
+            .all(|p| p[0] < 0.0),
+        _ => true,
+    })
+}
+
+#[test]
+fn baseline_reference_line_disappears_with_the_fills_when_no_rows_are_visible() {
+    // A Line series over ten bars keeps the chart's visible range while the Baseline series ends
+    // after three, so a window over the last bars reaches the baseline builder with no row of its
+    // own in view: only the clipped one-bar geometry of its edge-neighbour row is emitted, off the
+    // pane, and the reference line stays away with it while the Line still draws. The midpoint
+    // mode has nothing to report then; the close before the window is the series' last close,
+    // and a pin reads back as set. The same chart with the baseline rows in view draws both.
+    for (mode, pinned, off_screen_price) in [
+        (crate::BaselineMode::VisibleMidpoint, None, None),
+        (
+            crate::BaselineMode::CloseBeforeVisibleRange,
+            None,
+            Some(30.0),
+        ),
+        (crate::BaselineMode::VisibleMidpoint, Some(15.0), Some(15.0)),
+    ] {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.series[0].kind = SeriesKind::Line;
+        let line_times: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+        chart
+            .set_series_data(
+                0,
+                &line_times,
+                &line_times,
+                &line_times,
+                &line_times,
+                &line_times,
+            )
+            .unwrap();
+        let baseline = chart.add_series(SeriesKind::Baseline);
+        let values = [10.0, 20.0, 30.0];
+        chart
+            .set_series_data(
+                baseline,
+                &[1.0, 2.0, 3.0],
+                &values,
+                &values,
+                &values,
+                &values,
+            )
+            .unwrap();
+        chart.series[1].baseline_mode = mode;
+        chart.series[1].baseline = pinned;
+        chart.series[1].baseline_line_visible = true;
+        chart.time_scale.set_width(800.0);
+        chart.set_lock_visible_logical_range(true);
+        for (left, right, baseline_in_view) in [(6.0, 9.0, false), (0.0, 4.0, true)] {
+            chart.set_visible_logical_range(left, right);
+            assert_eq!(chart.visible_range(), Some((left as i64, right as i64)));
+            let frame = chart.build_frame();
+            let context = format!("{mode:?} pinned {pinned:?} view {left}..{right}");
+            assert_eq!(
+                baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE).len(),
+                usize::from(baseline_in_view),
+                "{context}"
+            );
+            assert_eq!(
+                !baseline_fills_are_all_off_pane(&frame),
+                baseline_in_view,
+                "{context}"
+            );
+            assert!(
+                frame.panes[0]
+                    .main
+                    .iter()
+                    .any(|p| matches!(p, Prim::Polyline { .. })),
+                "the Line series draws in every window"
+            );
+            let expected = if baseline_in_view {
+                Some(pinned.unwrap_or(match mode {
+                    crate::BaselineMode::VisibleMidpoint => 20.0,
+                    crate::BaselineMode::CloseBeforeVisibleRange => 10.0,
+                }))
+            } else {
+                off_screen_price
+            };
+            assert_eq!(chart.series_baseline_price(baseline), expected, "{context}");
+            assert_retained_frame_matches_clean_rebuild(&mut chart);
+        }
+    }
+
+    // A view entirely past every series has no visible range at all: nothing draws and the query
+    // is None before the builder is even reached.
+    let mut chart = baseline_chart(1.0, &[10.0, 20.0, 30.0]);
+    chart.series[0].baseline = Some(15.0);
+    chart.series[0].baseline_line_visible = true;
+    chart.set_lock_visible_logical_range(true);
+    chart.set_visible_logical_range(20.0, 25.0);
+    let frame = chart.build_frame();
+    assert_eq!(chart.visible_range(), None);
+    assert!(baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE).is_empty());
+    assert!(!frame.panes[0]
+        .main
+        .iter()
+        .any(|p| matches!(p, Prim::AreaFill { .. })));
+    assert_eq!(chart.series_baseline_price(0), None);
+}
+
+#[test]
+fn close_before_visible_range_keeps_a_baseline_bridging_a_window_between_sparse_rows() {
+    // A sparse Baseline series with rows at the first and last bar of a Line series: a window
+    // strictly between them holds no baseline row, yet the segment between the two off-screen
+    // rows crosses the pane. The close before the window is defined (the first row), so the
+    // bridging fill, its stroke and the reference line all draw and the query reports it.
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Line;
+    let line_times: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+    chart
+        .set_series_data(
+            0,
+            &line_times,
+            &line_times,
+            &line_times,
+            &line_times,
+            &line_times,
+        )
+        .unwrap();
+    let baseline = chart.add_series(SeriesKind::Baseline);
+    let values = [10.0, 30.0];
+    chart
+        .set_series_data(baseline, &[1.0, 10.0], &values, &values, &values, &values)
+        .unwrap();
+    chart.series[1].baseline_mode = crate::BaselineMode::CloseBeforeVisibleRange;
+    chart.series[1].baseline_line_visible = true;
+    chart.time_scale.set_width(800.0);
+    chart.set_lock_visible_logical_range(true);
+    chart.set_visible_logical_range(3.0, 7.0);
+    assert!(chart.data.plot(baseline).visible_rows(3, 7).is_empty());
+    assert_eq!(chart.series_baseline_price(baseline), Some(10.0));
+    let frame = chart.build_frame();
+    let y = chart
+        .series_price_to_coordinate(baseline, 10.0)
+        .unwrap()
+        .round() as i32;
+    assert_eq!(
+        baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE)
+            .iter()
+            .map(|line| line.0)
+            .collect::<Vec<_>>(),
+        [y]
+    );
+    assert!(
+        !baseline_fills_are_all_off_pane(&frame),
+        "the bridging fill crosses the pane"
+    );
+    assert_retained_frame_matches_clean_rebuild(&mut chart);
 }
 
 #[test]
@@ -13614,4 +14329,206 @@ fn position_stats_refresh_instrument_metadata_and_handle_future_zero_risk_and_vi
         .any(|text| text.starts_with("Target:")
             || text.starts_with("Stop:")
             || text.contains("Qty:")));
+}
+
+// ---- live-bar easing: the frame reads the eased last bar, queries read the real one ----
+
+/// Ten candles (open 100 + i, high +2, low -2, close +1 at times 1..=10) with live-bar easing on
+/// and a `histogram_updown` volume series tinted by them.
+fn eased_candles_with_volume(tau_ms: f64) -> (ChartEngine, SeriesId) {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+    let open: Vec<f64> = (0..10).map(|i| 100.0 + i as f64).collect();
+    let high: Vec<f64> = open.iter().map(|v| v + 2.0).collect();
+    let low: Vec<f64> = open.iter().map(|v| v - 2.0).collect();
+    let close: Vec<f64> = open.iter().map(|v| v + 1.0).collect();
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let volumes = vec![1_000.0; 10];
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .unwrap();
+    {
+        let volume = chart.series_entry_mut(volume).unwrap();
+        volume.histogram_updown = true;
+        // Volume-style: the bottom-band overlay scale, so prices keep the pane's main scale.
+        volume.price_scale_target = PriceScaleTarget::Overlay;
+    }
+    assert!(chart.series_apply_options_json(0, &format!(r#"{{"live_bar_easing_ms":{tau_ms}}}"#)));
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    (chart, volume)
+}
+
+/// The close the frame currently draws for series `id`'s last bar.
+fn eased_close(chart: &ChartEngine, id: SeriesId) -> f64 {
+    let plot = chart.display_plot(id);
+    plot.value_at(plot.size() - 1, PlotValueIndex::Close)
+}
+
+#[test]
+fn an_eased_frame_matches_a_clean_rebuild_at_a_pinned_clock() {
+    let (mut chart, _) = eased_candles_with_volume(100.0);
+    let before = chart.build_frame();
+    assert!(chart.update_series_bar(0, 10.0, [109.0, 115.0, 105.0, 114.0]));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(50.0);
+    let shown = eased_close(&chart, 0);
+    assert!(110.0 < shown && shown < 114.0);
+    let gliding = chart.build_frame();
+    assert_ne!(before, gliding, "the glide moved the last bar");
+    assert_retained_frame_matches_clean_rebuild(&mut chart);
+    // Settled: the frame equals one built from the real values alone.
+    chart.set_animation_time(5000.0);
+    assert!(!chart.live_bar_easing_active());
+    let settled = chart.build_frame();
+    assert_ne!(gliding, settled);
+    assert_retained_frame_matches_clean_rebuild(&mut chart);
+    let (mut real, _) = eased_candles_with_volume(0.0);
+    assert!(real.update_series_bar(0, 10.0, [109.0, 115.0, 105.0, 114.0]));
+    assert_eq!(real.build_frame(), settled);
+}
+
+#[test]
+fn the_histogram_updown_last_column_tint_follows_the_eased_primary_close() {
+    let (mut chart, _) = eased_candles_with_volume(100.0);
+    let palette = [VOLUME_UP, VOLUME_DOWN];
+    assert_eq!(
+        histogram_column_colors(&mut chart, &palette).last(),
+        Some(&VOLUME_UP)
+    );
+    // The last bar turns down (close 105 < open 109): the real tint is down at once, the drawn
+    // one follows the eased close through the open.
+    assert!(chart.update_series_bar(0, 10.0, [109.0, 111.0, 104.0, 105.0]));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(16.0);
+    assert!(eased_close(&chart, 0) > 109.0);
+    assert_eq!(
+        histogram_column_colors(&mut chart, &palette).last(),
+        Some(&VOLUME_UP),
+        "the column is tinted by the drawn candle, which is still above its open"
+    );
+    let mut clock = 16.0;
+    while eased_close(&chart, 0) >= 109.0 {
+        clock += 16.0;
+        chart.set_animation_time(clock);
+        assert!(clock < 2000.0, "the glide crosses the open");
+    }
+    assert_eq!(
+        histogram_column_colors(&mut chart, &palette).last(),
+        Some(&VOLUME_DOWN)
+    );
+    let stats = chart.frame_build_stats();
+    assert_eq!(stats.autoscale_runs, 0, "an advance frame never autoscales");
+    assert_eq!(
+        stats.series_rebuilds, 2,
+        "the eased primary and the volume layer keyed on it"
+    );
+    assert_retained_frame_matches_clean_rebuild(&mut chart);
+}
+
+#[test]
+fn the_eased_wick_is_hittable_where_it_is_drawn_mid_glide() {
+    let (mut chart, _) = eased_candles_with_volume(100.0);
+    chart.build_frame();
+    // The high jumps from 111 to 140; autoscale follows the real value immediately.
+    assert!(chart.update_series_bar(0, 10.0, [109.0, 140.0, 107.0, 110.0]));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(50.0);
+    chart.build_frame();
+    let x = chart.logical_to_coordinate(9.0).unwrap();
+    let plot = chart.display_plot(0);
+    let drawn_high = plot.value_at(9, PlotValueIndex::High);
+    assert!(111.0 < drawn_high && drawn_high < 140.0);
+    let real_high_y = chart.series_price_to_coordinate(0, 139.0).unwrap();
+    let drawn_high_y = chart
+        .series_price_to_coordinate(0, drawn_high - 0.5)
+        .unwrap();
+    assert!(real_high_y > 0.0, "the real high is inside the pane");
+    assert_eq!(
+        chart.hit_test_series(x, real_high_y),
+        None,
+        "nothing is drawn at the real high yet"
+    );
+    assert_eq!(chart.hit_test_series(x, drawn_high_y), Some(0));
+    chart.set_animation_time(5000.0);
+    chart.build_frame();
+    assert_eq!(chart.hit_test_series(x, real_high_y), Some(0));
+}
+
+#[test]
+fn the_crosshair_marker_sits_on_the_drawn_line_while_the_magnet_reads_real_values() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart.series[0].kind = SeriesKind::Line;
+    let times = [0.0, 60.0, 120.0, 180.0, 240.0];
+    let values = [10.0, 11.0, 12.0, 11.5, 12.5];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart.series[0].crosshair_marker_visible = true;
+    chart.crosshair_mode = CrosshairMode::Magnet;
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":100}"#));
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart.build_frame();
+    assert!(chart.update_series_bar(0, 240.0, [14.0; 4]));
+    chart.set_animation_time(0.0);
+    chart.set_animation_time(50.0);
+    let x = chart.time_scale.index_to_coordinate(4);
+    chart.set_crosshair_at(x, 100.0);
+    let frame = chart.build_frame();
+    let shown = eased_close(&chart, 0);
+    assert!(12.5 < shown && shown < 14.0);
+    let drawn_y = chart.series_price_to_coordinate(0, shown).unwrap() as f32;
+    let real_y = chart.series_price_to_coordinate(0, 14.0).unwrap();
+    let marker = frame.panes[0]
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Circle { cy, radius, .. } if *radius == 4.0 => Some(*cy),
+            _ => None,
+        })
+        .expect("the crosshair marker is drawn");
+    assert!((marker - drawn_y).abs() < 1e-3, "{marker} vs {drawn_y}");
+    let horizontal = frame.panes[0]
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::HLine { y, color, .. } if *color == CROSSHAIR_COLOR => Some(*y),
+            _ => None,
+        })
+        .expect("the magnet horizontal line is drawn");
+    assert_eq!(
+        horizontal,
+        real_y.round() as i32,
+        "the magnet snaps to the real value"
+    );
+    assert_ne!(horizontal, drawn_y.round() as i32);
+    // The last-value line and its axis chip follow the drawn close.
+    let live_line = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::HLine { y, color, .. } if *color != CROSSHAIR_COLOR => Some(*y),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        live_line.contains(&(drawn_y.round() as i32)),
+        "{live_line:?}"
+    );
+    let axis = chart.build_axis_frame(
+        80.0,
+        |text, _bold| text.len() as f64 * 7.0,
+        |text, _bold| text.len() as f64 * 6.0,
+    );
+    assert!(
+        axis.labels
+            .iter()
+            .any(|label| (label.y - drawn_y as f64).abs() < 1e-3),
+        "the last-value chip anchors at the drawn close"
+    );
+    assert_retained_frame_matches_clean_rebuild(&mut chart);
 }

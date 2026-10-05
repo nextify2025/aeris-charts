@@ -3032,7 +3032,10 @@ impl ChartEngine {
         }
     }
 
-    fn trading_group_key_for_order(&self, order: &WorkingOrder) -> Option<TradingGroupKey> {
+    pub(crate) fn trading_group_key_for_order(
+        &self,
+        order: &WorkingOrder,
+    ) -> Option<TradingGroupKey> {
         order
             .bracket_id
             .clone()

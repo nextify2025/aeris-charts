@@ -54,6 +54,9 @@ mod run_break_tests;
 mod series_geometry;
 #[cfg(test)]
 mod tests;
+pub(crate) mod timeline_geometry;
+#[cfg(test)]
+mod timeline_tests;
 mod trading_geometry;
 
 #[cfg(test)]
@@ -111,6 +114,13 @@ const VOLUME_DOWN: Color = Color::rgba(
 );
 const BASELINE_TOP_LINE: Color = UP;
 const BASELINE_BOTTOM_LINE: Color = DOWN;
+/// Default tint of a Baseline series' reference line: the crosshair line token (`#4a4a4a`, the
+/// same in both themes), the neutral chrome tint the shade-right veil also derives from.
+pub(crate) const BASELINE_REFERENCE_LINE: Color = Color::rgb(
+    DEFAULT_CROSSHAIR_LINE_RGB.0,
+    DEFAULT_CROSSHAIR_LINE_RGB.1,
+    DEFAULT_CROSSHAIR_LINE_RGB.2,
+);
 /// Aeris default stroke for line, area, and baseline series (CSS px), matching indicator lines.
 pub(crate) const LINE_WIDTH: f64 = 2.0;
 const CROSSHAIR_COLOR: Color = Color::rgb(
@@ -373,6 +383,16 @@ impl FrameInvalidation {
         self.axis = generation;
     }
 
+    /// A live-bar easing advance: the series' own geometry (and, through the generation key, a
+    /// dependent `histogram_updown` layer), chrome, overlay and axis rebuild, while autoscale,
+    /// layout and coordinates stay retained — the canonical columns did not change.
+    fn series_live_display(&mut self, id: SeriesId) {
+        let generation = self.series_geometry(id);
+        self.chrome = generation;
+        self.overlay = generation;
+        self.axis = generation;
+    }
+
     /// Only this series' own geometry layer; autoscale, axes, chrome, and overlay stay retained.
     fn series_geometry(&mut self, id: SeriesId) -> u64 {
         let generation = self.tick();
@@ -396,6 +416,29 @@ impl FrameInvalidation {
         self.chrome = generation;
         self.overlay = generation;
         self.axis = generation;
+    }
+
+    /// Pane chrome changed in a way that moves the autoscale reservation (the timeline-mark lane
+    /// appeared, vanished or was hidden): chrome, autoscale, axis and overlay rebuild.
+    fn chrome(&mut self) {
+        let generation = self.tick();
+        self.chrome = generation;
+        self.autoscale = generation;
+        self.axis = generation;
+        self.overlay = generation;
+    }
+
+    /// Pane chrome restyled with the reservation unchanged (a timeline-mark group hidden or
+    /// shown): chrome, axis and overlay rebuild; autoscale stays retained.
+    fn chrome_presentation(&mut self) {
+        let generation = self.tick();
+        self.chrome = generation;
+        self.axis = generation;
+        self.overlay = generation;
+    }
+
+    pub(crate) const fn layout_generation(&self) -> u64 {
+        self.layout
     }
 
     fn trading(&mut self) {
@@ -761,6 +804,10 @@ struct ResolvedSeries {
     bottom_line: Color,
     bottom_line_width: f64,
     bottom_line_style: LineStyle,
+    baseline_line_visible: bool,
+    baseline_line: Color,
+    baseline_line_width: f64,
+    baseline_line_style: LineStyle,
     scale_target: PriceScaleTarget,
     /// The pane this series renders on; `None` when its pane was removed (reference `removePane`
     /// orphans the pane's series) — it draws and scales nowhere until re-assigned.
@@ -844,45 +891,69 @@ impl ChartEngine {
 
 impl ChartEngine {
     /// The Baseline series' effective baseline price: the pinned `baseline_value` option, or
-    /// the visible-range close midpoint (the engine's auto mode when the option is unset).
-    /// Shared by the baseline geometry builder and the bar-color resolution so both agree on
-    /// which side of the baseline a bar sits.
-    pub(crate) fn resolved_baseline_price(&self, id: SeriesId, from: i64, to: i64) -> Option<f64> {
+    /// the series' `baseline_mode` over `plot` and the visible window `[from, to]` (the
+    /// visible-range close midpoint, or the last finite close before the window). The window may
+    /// hold no row of this series while another series keeps it visible: the midpoint then has
+    /// nothing to average and is `None`, while the close before the window is still defined (it
+    /// colors the run that bridges a window between two sparse rows, and is the series' last
+    /// close once it has scrolled off to the left). Shared by the baseline geometry builder, the
+    /// reference line, the bar-color resolution (live line, axis chip, crosshair marker) and the
+    /// public `series_baseline_price` query so all agree on which side of the baseline a bar
+    /// sits. `plot` is passed in so a caller can resolve over the view it draws from.
+    pub(crate) fn resolved_baseline_price(
+        &self,
+        plot: PlotListView<'_>,
+        id: SeriesId,
+        from: i64,
+        to: i64,
+    ) -> Option<f64> {
         let series = self.series_entry(id)?;
         if let Some(price) = series.baseline {
             return Some(price);
         }
-        let plot = self.data.plot(id);
         let close = |row: usize| plot.value_at(row, PlotValueIndex::Close);
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-        let mut any = false;
-        for row in plot.visible_rows(from, to) {
-            let value = close(row);
-            if value.is_finite() {
-                min = min.min(value);
-                max = max.max(value);
-                any = true;
+        let visible = plot.visible_rows(from, to);
+        match series.baseline_mode {
+            crate::BaselineMode::VisibleMidpoint => {
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                let mut any = false;
+                for row in visible {
+                    let value = close(row);
+                    if value.is_finite() {
+                        min = min.min(value);
+                        max = max.max(value);
+                        any = true;
+                    }
+                }
+                any.then_some((min + max) / 2.0)
             }
+            crate::BaselineMode::CloseBeforeVisibleRange => plot
+                .last_non_whitespace_row_before(visible.start)
+                .map(close)
+                .filter(|value| value.is_finite())
+                // Nothing finite precedes the window: the first visible finite close stands in,
+                // so the first bar reads as unchanged instead of the series vanishing.
+                .or_else(|| visible.map(close).find(|value| value.is_finite())),
         }
-        any.then_some((min + max) / 2.0)
     }
 
     /// reference `SeriesBarColorer.barColor` (model/series-bar-colorer.ts) for the series' bar at
-    /// `row`: the color the built-in last-price line, the last-value axis label, and the
-    /// crosshair marker background all follow when their own color option is unset.
+    /// `row` of `plot`: the color the built-in last-price line, the last-value axis label, and the
+    /// crosshair marker background all follow when their own color option is unset. Frame-side
+    /// callers pass the display view (`display_plot`) so chrome follows an eased live bar;
     /// `baseline_price` is the resolved baseline for Baseline series (`None` for other kinds).
     pub(crate) fn series_bar_color(
         &self,
         series: &crate::SeriesEntry,
+        plot: PlotListView<'_>,
         row: usize,
         baseline_price: Option<f64>,
     ) -> Color {
-        let plot = self.data.plot(series.id);
         // A hollow candle has no body to take a color from, so chrome that stands for "this bar"
         // resolves through what is actually painted instead of going invisible.
         if series.kind == SeriesKind::Candlestick {
-            return self.candlestick_chrome_color(series, row);
+            return self.candlestick_chrome_color(series, plot, row);
         }
         // reference data-item colors: a per-point `color` (area reads `lineColor`, mapped onto the
         // body channel here) wins over the series-level resolution for every kind that reads
@@ -972,11 +1043,15 @@ impl ChartEngine {
     /// border, then wick. Each part follows the body color until pinned (reference parity), so
     /// an unpinned part inherits the same transparency and is skipped in turn; if nothing is
     /// visible at all, the body color stands.
-    fn candlestick_chrome_color(&self, series: &crate::SeriesEntry, row: usize) -> Color {
+    fn candlestick_chrome_color(
+        &self,
+        series: &crate::SeriesEntry,
+        plot: PlotListView<'_>,
+        row: usize,
+    ) -> Color {
         let (up, down) = self.themed_candle_colors();
-        let plot = self.data.plot(series.id);
         let (open, close) = self
-            .heikin_ashi_row(series.id, row)
+            .display_heikin_ashi_row(series.id, plot, row)
             .map(|values| (values[0], values[3]))
             .unwrap_or_else(|| {
                 (
@@ -1197,12 +1272,31 @@ impl ChartEngine {
         self.frame_invalidation.series_geometry(id);
     }
 
+    /// The eased live bar moved: see [`FrameInvalidation::series_live_display`].
+    pub(crate) fn invalidate_frame_series_live_display(&mut self, id: SeriesId) {
+        self.frame_invalidation.series_live_display(id);
+    }
+
     pub(crate) fn invalidate_frame_drawings(&mut self) {
         self.frame_invalidation.drawings();
     }
 
     pub(crate) fn invalidate_frame_trading(&mut self) {
         self.frame_invalidation.trading();
+    }
+
+    /// See [`FrameInvalidation::chrome`].
+    pub(crate) fn invalidate_frame_chrome(&mut self) {
+        self.frame_invalidation.chrome();
+    }
+
+    /// See [`FrameInvalidation::chrome_presentation`].
+    pub(crate) fn invalidate_frame_chrome_presentation(&mut self) {
+        self.frame_invalidation.chrome_presentation();
+    }
+
+    pub(crate) fn frame_layout_generation(&self) -> u64 {
+        self.frame_invalidation.layout_generation()
     }
 
     pub(crate) fn invalidate_frame_overlay(&mut self) {
@@ -1531,6 +1625,10 @@ impl ChartEngine {
                 bottom_line,
                 bottom_line_width: s.bottom_line_width.or(s.line_width).unwrap_or(LINE_WIDTH),
                 bottom_line_style: crate::line_style_from_u8(s.bottom_line_style),
+                baseline_line_visible: s.baseline_line_visible,
+                baseline_line: css(&s.baseline_line_color).unwrap_or(BASELINE_REFERENCE_LINE),
+                baseline_line_width: s.baseline_line_width,
+                baseline_line_style: crate::line_style_from_u8(s.baseline_line_style),
                 scale_target: series_scale_target(s),
                 pane: (s.pane_index < pane_count).then_some(s.pane_index),
                 base_value,
@@ -1759,6 +1857,7 @@ impl ChartEngine {
                                 to,
                                 hpr,
                                 vpr,
+                                pane_w_px as i32,
                                 &mut series_layer.layer.prims,
                                 &mut series_layer.layer.points,
                                 scale,
@@ -1906,6 +2005,9 @@ impl ChartEngine {
                         hpr,
                         vpr,
                     );
+                    // The timeline-mark lane is pane chrome below trading and the crosshair; it
+                    // runs only while a bar is visible, so projected marks appear only then.
+                    self.build_timeline_marks_frame(pi, hpr, vpr, &mut cache.chrome.prims);
                 }
                 self.build_native_anchored_text_frame(pi, hpr, vpr, &mut cache.chrome.prims);
                 self.build_native_text_watermark_frame(pi, hpr, vpr, &mut cache.chrome.prims);
@@ -2015,6 +2117,7 @@ impl ChartEngine {
                     &mut cache.overlay.prims,
                 );
                 self.build_native_delta_tooltip_frame(pi, hpr, vpr, &mut cache.overlay.prims);
+                self.build_timeline_hover_frame(pi, hpr, vpr, &mut cache.overlay.prims);
                 if let Some((from, _)) = visible {
                     self.build_selection_anchors_frame(
                         pi,
@@ -2605,6 +2708,18 @@ impl ChartEngine {
             }
             acc.margins.0 = acc.margins.0.max(margins.0);
             acc.margins.1 = acc.margins.1.max(margins.1);
+        }
+        // The timeline-mark lane reserves its height below the data on every scale of the
+        // primary pane while it is shown, independent of which tokens are in view and of hidden
+        // groups, so panning or toggling a group never moves the scale. Only auto-scaled scales
+        // honor margins (like series markers); the bottom-pinned volume overlay lifts with it.
+        if let Some(lane_pane) = self.timeline_lane_pane() {
+            for acc in scales.iter_mut().filter(|acc| acc.pane == lane_pane) {
+                acc.margins.1 = acc
+                    .margins
+                    .1
+                    .max(crate::timeline_marks::TIMELINE_LANE_RESERVATION_CSS);
+            }
         }
         for acc in &scales {
             let pane = &mut self.panes[acc.pane];

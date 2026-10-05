@@ -1304,6 +1304,57 @@ fn reduced_motion_stops_the_pulse_clock() {
     assert_eq!(chart.animation_time, 400.0);
 }
 
+/// A live-bar glide advances through the same clock step as the pulse: the first tick after the
+/// in-place replace only stamps the glide's clock and changes nothing, later ticks move the drawn
+/// close and report the change, and the frame predicate holds until the glide settles.
+#[test]
+fn the_live_bar_glide_advances_on_the_tick_and_keeps_frames_until_it_settles() {
+    let mut chart = chart();
+    assert!(chart.series_apply_options_json(0, r#"{"live_bar_easing_ms":200}"#));
+    assert!(
+        !chart.animation_frame_requested(),
+        "an idle chart requests nothing"
+    );
+    let last = BARS - 1;
+    let time = 1_000.0 + last as f64 * 60.0;
+    let open = 100.0 + (last % 7) as f64;
+    assert!(chart.update_series_bar(0, time, [open, open + 9.0, open - 3.0, open + 8.0]));
+    assert!(chart.live_bar_easing_active());
+    assert!(
+        chart.animation_frame_requested(),
+        "an unsettled glide keeps frames coming"
+    );
+    assert!(
+        !GpuiChartInput::advance(&mut chart, 100.0, false),
+        "the first tick only stamps the glide's clock"
+    );
+    assert_eq!(
+        chart.animation_time, 0.0,
+        "candles have no pulse, a stamp moves no clock"
+    );
+    assert!(chart.animation_frame_requested());
+    assert!(
+        GpuiChartInput::advance(&mut chart, 150.0, false),
+        "a later tick moves the drawn close"
+    );
+    assert_eq!(
+        chart.animation_time, 150.0,
+        "a glide that advanced moves the animation clock"
+    );
+    assert!(chart.animation_frame_requested());
+    assert!(
+        GpuiChartInput::advance(&mut chart, 150.0 + 6.0 * 200.0, false),
+        "the tick that settles the glide is a change"
+    );
+    assert!(!chart.live_bar_easing_active());
+    assert!(
+        !chart.animation_frame_requested(),
+        "a settled glide requests nothing"
+    );
+    assert!(!GpuiChartInput::advance(&mut chart, 2_000.0, false));
+    assert_eq!(chart.animation_time, 150.0 + 6.0 * 200.0);
+}
+
 /// While a countdown row shows, the one wake also fires on each whole second of the adapter
 /// clock; an earlier engine deadline takes the wake first, and it stays a single wake.
 #[gpui::test]

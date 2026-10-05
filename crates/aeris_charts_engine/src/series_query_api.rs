@@ -294,6 +294,22 @@ impl ChartEngine {
             .map(|series| series.kind)
     }
 
+    /// The baseline price a Baseline series currently compares against: its pinned
+    /// `baseline_value`, else its `baseline_mode` resolved over the raw visible range (the same
+    /// resolution the fills, quadrant strokes, reference line, live line, axis chip and crosshair
+    /// marker share). `None` for an unknown or removed id, a series of another kind, a chart
+    /// without a visible range yet, or a `VisibleMidpoint` series none of whose rows is in the
+    /// visible window; `CloseBeforeVisibleRange` still reports the last close before the window
+    /// then (the series' last close once it has scrolled off to the left). The value moves with
+    /// the visible window unless pinned.
+    pub fn series_baseline_price(&self, id: SeriesId) -> Option<f64> {
+        if self.series_kind(id)? != SeriesKind::Baseline {
+            return None;
+        }
+        let (from, to) = self.visible_range()?;
+        self.resolved_baseline_price(self.data.plot(id), id, from, to)
+    }
+
     /// Apply a per-series `priceFormat` JSON patch (reference `series.applyOptions({ priceFormat })`):
     /// `{"type":"price"|"volume"|"percent"|"custom", "precision"?, "min_move"?, "tick_ladder"?}`
     /// (`minMove` accepted as an alias). Absent keys keep their current values (reference merge
@@ -479,6 +495,14 @@ impl ChartEngine {
             "baseline_value",
             s.baseline.map_or(serde_json::Value::Null, Into::into),
         );
+        insert("baseline_mode", s.baseline_mode.as_str().into());
+        insert("baseline_line_visible", s.baseline_line_visible.into());
+        insert(
+            "baseline_line_color",
+            verbatim(&s.baseline_line_color).into(),
+        );
+        insert("baseline_line_width", s.baseline_line_width.into());
+        insert("baseline_line_style", s.baseline_line_style.into());
         insert("top_fill_color1", verbatim(&s.top_fill_color1).into());
         insert("top_fill_color2", verbatim(&s.top_fill_color2).into());
         insert("top_line_color", verbatim(&s.top_line_color).into());
@@ -541,6 +565,7 @@ impl ChartEngine {
         insert("bid", s.bid.map_or(serde_json::Value::Null, Into::into));
         insert("ask", s.ask.map_or(serde_json::Value::Null, Into::into));
         insert("last_price_animation", s.last_price_animation.into());
+        insert("live_bar_easing_ms", s.live_bar_easing_ms.into());
         insert("visible", s.visible.into());
         insert("price_scale_id", price_scale_id.into());
         insert("pane", s.pane_index.into());
@@ -571,6 +596,7 @@ impl ChartEngine {
         let Some(s) = self.series.iter_mut().find(|s| s.id == id && !s.removed) else {
             return false;
         };
+        let mut live_bar_easing_changed = false;
         // Verbatim CSS color slots (reference parity): any non-empty string is stored as-is —
         // including named colors the renderer cannot parse, which fall back to the default
         // at render time — so `options()` returns exactly what was applied. `""` clears.
@@ -738,6 +764,16 @@ impl ChartEngine {
                         }
                     }
                 },
+                // `0` turns easing off; larger values clamp to the cap.
+                "live_bar_easing_ms" => {
+                    if let Some(v) = non_negative(value) {
+                        let v = v.min(crate::MAX_LIVE_BAR_EASING_MS);
+                        if s.live_bar_easing_ms != v {
+                            s.live_bar_easing_ms = v;
+                            live_bar_easing_changed = true;
+                        }
+                    }
+                }
                 "crosshair_marker_visible" => {
                     if let Some(v) = value.as_bool() {
                         s.crosshair_marker_visible = v;
@@ -775,6 +811,31 @@ impl ChartEngine {
                 "bottom_line_style" => {
                     if let Some(v) = u8_bounded(value, 4) {
                         s.bottom_line_style = v;
+                    }
+                }
+                "baseline_mode" => {
+                    if let Some(mode) = value.as_str().and_then(crate::BaselineMode::parse) {
+                        s.baseline_mode = mode;
+                    }
+                }
+                "baseline_line_visible" => {
+                    if let Some(v) = value.as_bool() {
+                        s.baseline_line_visible = v;
+                    }
+                }
+                // Null clears the color back to the neutral default, like `""`.
+                "baseline_line_color" => match value {
+                    serde_json::Value::Null => s.baseline_line_color = None,
+                    value => color_string_slot(&mut s.baseline_line_color, value),
+                },
+                "baseline_line_width" => {
+                    if let Some(v) = positive(value) {
+                        s.baseline_line_width = v;
+                    }
+                }
+                "baseline_line_style" => {
+                    if let Some(v) = u8_bounded(value, 4) {
+                        s.baseline_line_style = v;
                     }
                 }
                 "base" => {
@@ -825,6 +886,11 @@ impl ChartEngine {
                 // Unknown keys are ignored gracefully (reference applyOptions merge semantics).
                 _ => {}
             }
+        }
+        if live_bar_easing_changed {
+            // A changed time constant re-keys the display state to the drawn last bar, so the
+            // next same-time tick glides from the real values and never from stale ones.
+            self.snap_live_bar(id);
         }
         if let Some(value) = patch.get("price_format") {
             // Nested object patch — routed to the dedicated price-format applier so the

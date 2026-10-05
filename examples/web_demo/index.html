@@ -625,7 +625,7 @@
 import { create_chart, create_chart_grid, create_series_markers, default_theme_name } from "./dist/aeris_charts_financial.js";
 import { generate_fixture_data } from "./fixture_data.js";
 import { fixture_theme } from "./fixture_styles.js";
-import { marker_fixture, volume_fixture } from "./fixture_features.js";
+import { marker_fixture, timeline_mark_fixture, volume_fixture } from "./fixture_features.js";
 import { custom_ohlc_pane_view } from "./fixture_custom_series.js";
 import { vert_line_canvas_primitive } from "./fixture_canvas_plugin.js";
 import { install_demo_catalogs } from "./demo_catalogs.js";
@@ -856,6 +856,12 @@ if (requested_feature === "footprint") window.__demo_catalogs.series.activate("f
 // all scale, layout, and rendering behavior remains inside the headless engine.
 if (requested_feature === "markers") {
   main.set_markers(marker_fixture(data));
+} else if (requested_feature === "timeline_marks") {
+  // Engine-owned lane along the pane bottom; the default page stays mark-free so no approved
+  // WebGPU hash or pixel probe moves.
+  chart.timeline_marks().set(timeline_mark_fixture(data));
+  window.__timeline_mark_clicks = [];
+  chart.subscribe_timeline_mark_click((hit) => window.__timeline_mark_clicks.push(hit));
 } else if (requested_feature === "volume") {
   vol_series = chart.add_series("histogram", {
     overlay: true,

@@ -15,7 +15,14 @@ import type {
   series_api,
   series_data,
   time,
+  timeline_mark_hit,
 } from "./types.js";
+
+/** The text the engine's dwell tooltip prints for a lane token (`label · title`, `label · N`, `N marks`). */
+function timeline_mark_text(hit: timeline_mark_hit): string {
+  if (hit.count === 1) return hit.title ? `${hit.label} · ${hit.title}` : hit.label;
+  return hit.groups.length === 1 ? `${hit.label} · ${hit.count}` : hit.label;
+}
 
 const HIDDEN = "position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0";
 const UPDATE_DEBOUNCE_MS = 150;
@@ -483,6 +490,16 @@ class PaneAccessibility {
     } else if (target.startsWith("position:")) {
       if (event.key !== "Enter" && event.key !== " ") return false;
       this.writer.write(event.target instanceof HTMLElement ? event.target.getAttribute("aria-label") ?? "Position" : "Position");
+    } else if (target.startsWith("mark:")) {
+      // Enter activates the mark's lane token exactly like a pointer click (the engine resolves
+      // the token and the click subscription receives the hit); a mark scrolled out of view
+      // announces that instead.
+      if (event.key !== "Enter" && event.key !== " ") return false;
+      const chart = this.controller.chart as chart_api & {
+        activate_timeline_mark(id: string): timeline_mark_hit | null;
+      };
+      const hit = chart.activate_timeline_mark(target.slice("mark:".length));
+      this.writer.write(hit ? `${timeline_mark_text(hit)} activated.` : "Mark is out of view.");
     } else {
       return false;
     }
@@ -520,6 +537,21 @@ class PaneAccessibility {
     }
     for (const position of trading.positions) {
       if (position.pane_index === this.pane_index) add(`position:${position.id}`, `Position ${position.id} at ${position.average_price}`);
+    }
+    // The engine decides which pane shows the timeline-mark lane (the primary series' pane while
+    // the lane is enabled, non-empty and tall enough); each mark of a shown group announces the
+    // same `label · title` text as the engine's dwell tooltip. A hidden lane has no targets.
+    const lane_chart = this.controller.chart as chart_api & { timeline_lane_pane(): number | null };
+    if (lane_chart.timeline_lane_pane() === this.pane_index) {
+      const marks = this.controller.chart.timeline_marks();
+      const hidden = new Set(marks.hidden_groups());
+      const state = marks.state();
+      const labels = new Map(state.groups.map((group) => [group.id, group.label || group.id]));
+      for (const mark of state.marks) {
+        if (hidden.has(mark.group)) continue;
+        const label = labels.get(mark.group) ?? mark.group;
+        add(`mark:${mark.id}`, mark.title ? `${label} · ${mark.title}` : label);
+      }
     }
     add("price-axis", `Pane ${this.pane_index + 1} price axis`);
     if (this.pane_index === this.controller.chart.panes().length - 1) add("time-axis", "Time axis");

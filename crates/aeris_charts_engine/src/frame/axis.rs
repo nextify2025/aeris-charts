@@ -1763,18 +1763,12 @@ impl ChartEngine {
                 let value = if series.kind == SeriesKind::Custom {
                     series.custom_frame.last_visible.map(|last| last.value)
                 } else {
-                    self.data
-                        .plot(series.id)
-                        .last_non_whitespace_row(to)
-                        .map(|row| {
-                            self.heikin_ashi_row(series.id, row)
-                                .map(|values| values[3])
-                                .unwrap_or_else(|| {
-                                    self.data
-                                        .plot(series.id)
-                                        .value_at(row, PlotValueIndex::Close)
-                                })
-                        })
+                    let plot = self.display_plot(series.id);
+                    plot.last_non_whitespace_row(to).map(|row| {
+                        self.display_heikin_ashi_row(series.id, plot, row)
+                            .map(|values| values[3])
+                            .unwrap_or_else(|| plot.value_at(row, PlotValueIndex::Close))
+                    })
                 };
                 if let (Some(value), Some(base)) = (value, self.series_base_value(series.id, from))
                 {
@@ -2229,7 +2223,7 @@ impl ChartEngine {
                 }
                 let target = series_scale_target(series);
                 let scale = pane_scale(pane, target);
-                let plot = self.data.plot(series.id);
+                let plot = self.display_plot(series.id);
                 if plot.is_empty() || scale.is_empty() {
                     continue;
                 }
@@ -2266,7 +2260,7 @@ impl ChartEngine {
                         continue;
                     };
                     let close = self
-                        .heikin_ashi_row(series.id, row)
+                        .display_heikin_ashi_row(series.id, plot, row)
                         .map(|values| values[3])
                         .unwrap_or_else(|| plot.value_at(row, PlotValueIndex::Close));
                     if !close.is_finite() {
@@ -2280,13 +2274,13 @@ impl ChartEngine {
                         continue;
                     }
                     let baseline = if series.kind == SeriesKind::Baseline {
-                        self.resolved_baseline_price(series.id, from, to)
+                        self.resolved_baseline_price(plot, series.id, from, to)
                     } else {
                         None
                     };
                     let color = self.effective_series_live_color(
                         series,
-                        self.series_bar_color(series, row, baseline),
+                        self.series_bar_color(series, plot, row, baseline),
                     );
                     // The series' OWN priceFormat drives its last-value label (reference
                     // series-price-axis-view.ts text, via the scale's series formatter).

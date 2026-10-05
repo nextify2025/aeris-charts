@@ -37,6 +37,7 @@ pub enum InputTarget {
     TimeAxis = 4,
     Separator = 5,
     Alert = 6,
+    TimelineMark = 7,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -422,9 +423,10 @@ impl GestureResolver {
             }
             self.state = match sample.target {
                 InputTarget::Pane => GestureState::Panning,
-                InputTarget::Drawing | InputTarget::Trading | InputTarget::Alert => {
-                    GestureState::DraggingObject
-                }
+                InputTarget::Drawing
+                | InputTarget::Trading
+                | InputTarget::Alert
+                | InputTarget::TimelineMark => GestureState::DraggingObject,
                 InputTarget::PriceAxis | InputTarget::TimeAxis => GestureState::ScalingAxis,
                 InputTarget::Separator => GestureState::ResizingPane,
             };

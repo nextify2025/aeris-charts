@@ -51,7 +51,7 @@ percent.set_data(slots.map((time, i) => row(time, closes[i])));
 price.create_price_line({ price: prev_close, line_style: "dashed" });
 ```
 
-上下边距相等时，前收盘价在两个坐标轴上都位于窗格正中。
+上下边距相等时，前收盘价在两个坐标轴上都位于窗格正中。`baseline_line_visible: true` 让基线系列在其解析出的基线处（固定了 `baseline_value` 时即前收盘价）自行绘制虚线参考线，无需宿主维护单独的价格线；示例保留 `create_price_line`，因为它还在左侧坐标轴上标出该价格。未固定 `baseline_value` 时，`baseline_mode: "close_before_visible_range"` 以窗口之前的最后一个收盘价为基线。两者见[基线参考线与基线模式](presentation.md#基线参考线与基线模式)。
 
 **4. 均价**。成交量和成交额是按时间对齐的独立系列；均价是以成交额为来源的 VWAP，在每个交易时段重置（`session_start` 定义交易时段）：
 
