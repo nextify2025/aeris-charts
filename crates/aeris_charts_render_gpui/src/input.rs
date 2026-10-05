@@ -19,9 +19,10 @@ use aeris_charts_engine::{
     WheelDeltaMode, WheelSample,
 };
 use gpui::{
-    point, App, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle, EntityId, KeyDownEvent,
-    KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PinchEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Task, WeakFocusHandle, Window,
+    point, App, BackgroundExecutor, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase,
+    Entity, EntityId, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Task,
+    WeakFocusHandle, Window,
 };
 
 use crate::backend::{text_cap_centerer, text_measurer};
@@ -39,17 +40,20 @@ mod tests;
 /// gpui-pre views embedded with `.cached()`, an un-notified view replays its last frame. Plain
 /// gpui-pre hides a missing notify only while something else in the window redraws. The adapter
 /// therefore owns every notify, timer and animation frame the chart needs, and a host makes
-/// exactly two calls:
+/// exactly these calls:
 ///
 /// - [`Self::prepare_frame`], once per prepaint of the chart canvas. It ticks time-driven engine
-///   state, pins the countdown clock, and keeps frames coming while the engine animates.
+///   state, pins the countdown clock, keeps frames coming while the engine animates, and ends
+///   input the window can no longer finish.
 /// - [`Self::refresh`], after every engine change made outside drawing:
 ///   - at the end of each input listener, after the host has drained the engine queues it uses;
 ///   - after every host update to data, options, theme, drawings, trading state or interaction
 ///     options, or a host-started animation.
+/// - [`Self::capture_pointer`], once per paint of the chart canvas. It keeps a press following
+///   the pointer outside the chart's element.
 ///
-/// `prepare_frame` runs only during prepaint. Never call `refresh`, or notify the chart's view,
-/// from render, prepaint or paint:
+/// `prepare_frame` runs only during prepaint and `capture_pointer` only during paint. Never call
+/// `refresh`, or notify the chart's view, from render, prepaint or paint:
 /// - gpui-pre only marks a view dirty when it is notified during drawing, and schedules no frame;
 /// - gpui-fast counts such a notify as a change on every frame, so the view is never retained.
 ///
@@ -72,15 +76,19 @@ pub struct GpuiChartInput {
     /// Where the running held-arrow pan's key-up can arrive, recorded at the first prepaint that
     /// drew the pan.
     held_pan: Option<HeldPan>,
+    /// The window was active at the last prepaint.
+    window_active: bool,
+    /// The engine held a pointer press at the last `refresh` or prepaint. The capture listener
+    /// that [`Self::capture_pointer`] registers reads it when a move arrives.
+    captured: Rc<Cell<bool>>,
     /// A candle-close countdown row showed at the last prepaint, so the wake also fires on each
     /// whole second of the adapter clock.
     countdown: bool,
 }
 
-/// The window's keyboard focus and activation at the first prepaint of a held-arrow pan.
+/// The window's keyboard focus at the first prepaint of a held-arrow pan.
 struct HeldPan {
     focus: Option<WeakFocusHandle>,
-    window_active: bool,
 }
 
 /// One scheduled wake: the deadline (adapter-clock ms) and view it was armed for, whether its
@@ -108,6 +116,8 @@ impl Default for GpuiChartInput {
             wake: None,
             refreshed: false,
             held_pan: None,
+            window_active: false,
+            captured: Rc::default(),
             countdown: false,
         }
     }
@@ -166,10 +176,14 @@ impl GpuiChartInput {
     /// before the frame is prepared. In order, it:
     /// - records `bounds`, and the view drawing the canvas (`Window::current_view`), which
     ///   [`Self::refresh`] and the wake notify;
-    /// - ends a held-arrow pan whose key-up can no longer reach the chart: GPUI delivers a key-up
-    ///   only along the focused element's dispatch path and none once the window deactivates, so
-    ///   the pan ends (`input_cancel_motion`) when keyboard focus moves, or the window deactivates,
-    ///   after the prepaint that first drew it, as the browser host ends motion on window blur;
+    /// - ends input the window can no longer finish, as the browser host does on window blur.
+    ///   When the window has deactivated since the last prepaint, an open press is abandoned as by
+    ///   `input_cancel` (a drawing or order drag rolls back, a pan stops where it is), and
+    ///   otherwise motion stops (`input_cancel_motion`): an inactive window gets no release and no
+    ///   key-up. GPUI redraws every view, cached and retained ones included, when the window's
+    ///   activation changes, so this prepaint always runs. A held-arrow pan also ends when
+    ///   keyboard focus moves after the prepaint that first drew it, because GPUI delivers a
+    ///   key-up only along the focused element's dispatch path;
     /// - applies `App::reduce_motion` to the engine's interaction options, which also removes the
     ///   last-price pulse;
     /// - advances input animations and due deadlines (`input_tick`). A deadline whose wake has
@@ -202,7 +216,7 @@ impl GpuiChartInput {
         self.set_canvas_bounds(bounds);
         self.view = Some(window.current_view());
         let refreshed = std::mem::take(&mut self.refreshed);
-        let released = self.release_stranded_pan(engine, window, cx);
+        let released = self.release_stranded_input(engine, window, cx);
         let stepped = Self::advance(engine, self.tick_ms(), cx.reduce_motion()) | released;
         let countdown = self.sync_countdown(engine, refreshed);
         self.arm_wake(engine, cx);
@@ -213,7 +227,39 @@ impl GpuiChartInput {
         if stepped || engine.input_animating() {
             window.request_animation_frame();
         }
+        self.captured.set(engine.input_pointer_captured());
         refreshed | stepped | countdown
+    }
+
+    /// The paint step: pointer capture for a press on the chart. Call it once per paint of the
+    /// chart canvas, with the chart's view and the host's own mouse-move listener (its translation
+    /// call, [`Self::mouse_move`], and its shared tail).
+    ///
+    /// GPUI calls an element's mouse-move listener only while the pointer is over the element, so
+    /// without capture a pan, an axis scale or a drawing or order drag stops following the
+    /// pointer at the chart's edge. While the engine holds a press
+    /// (`ChartEngine::input_pointer_captured` at the last `refresh` or prepaint), the window-level
+    /// listener this registers takes every move in the window before any element, hands it to
+    /// `on_move` and stops its propagation, as browser pointer capture retargets a captured
+    /// pointer's events. The chart keeps following the pointer anywhere in the window, gets each
+    /// move once, and nothing else in the window reacts to those moves. A release outside the
+    /// chart still arrives through the host's `on_mouse_up_out` binding of [`Self::mouse_up`].
+    pub fn capture_pointer<V: 'static>(
+        &self,
+        window: &mut Window,
+        view: &Entity<V>,
+        on_move: impl Fn(&mut V, &MouseMoveEvent, &mut Window, &mut Context<V>) + 'static,
+    ) {
+        let captured = self.captured.clone();
+        let view = view.downgrade();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase != DispatchPhase::Capture || !captured.get() {
+                return;
+            }
+            cx.stop_propagation();
+            // A released view has no press left to follow.
+            let _ = view.update(cx, |view, cx| on_move(view, event, window, cx));
+        });
     }
 
     /// The one call after the engine changed outside drawing. Call it last, after the host has
@@ -222,6 +268,7 @@ impl GpuiChartInput {
     /// - notifies the view that drew the chart at the last prepaint. Before the first prepaint it
     ///   notifies nothing, because the first draw paints everything;
     /// - marks the next frame for rebuild;
+    /// - records whether the engine holds a pointer press, for [`Self::capture_pointer`];
     /// - re-arms the single wake for `ChartEngine::input_wake_deadline_ms`, or the countdown's
     ///   next whole second if that comes first: an unchanged deadline keeps the pending wake, a
     ///   moved one replaces and cancels it, and no deadline drops it.
@@ -230,6 +277,7 @@ impl GpuiChartInput {
     /// engine. `refresh` never calls `Window::refresh`.
     pub fn refresh(&mut self, engine: &ChartEngine, cx: &mut App) {
         self.refreshed = true;
+        self.captured.set(engine.input_pointer_captured());
         if let Some(view) = self.view {
             cx.notify(view);
         }
@@ -266,28 +314,38 @@ impl GpuiChartInput {
         true
     }
 
-    /// End a held-arrow pan whose key-up can no longer reach the chart (see
-    /// [`Self::prepare_frame`]). Returns whether it ended one.
-    fn release_stranded_pan(
+    /// End input the window can no longer finish (see [`Self::prepare_frame`]). Returns whether it
+    /// changed chart state.
+    fn release_stranded_input(
         &mut self,
         engine: &mut ChartEngine,
         window: &Window,
         cx: &App,
     ) -> bool {
+        let active = window.is_window_active();
+        // A window that was never seen active (a headless or unmanaged one) cannot deactivate.
+        if std::mem::replace(&mut self.window_active, active) && !active {
+            self.held_pan = None;
+            if engine.input_pointer_captured() {
+                engine.input_cancel();
+                return true;
+            }
+            if engine.input_animating() {
+                engine.input_cancel_motion();
+                return true;
+            }
+            return false;
+        }
         if !engine.keyboard_scroll_active() {
             self.held_pan = None;
             return false;
         }
-        let now = HeldPan {
-            focus: window.focused(cx).map(|focus| focus.downgrade()),
-            window_active: window.is_window_active(),
-        };
+        let focus = window.focused(cx).map(|focus| focus.downgrade());
         let Some(held) = &self.held_pan else {
-            self.held_pan = Some(now);
+            self.held_pan = Some(HeldPan { focus });
             return false;
         };
-        // A window that was never seen active (a headless or unmanaged one) cannot deactivate.
-        if held.focus == now.focus && (now.window_active || !held.window_active) {
+        if held.focus == focus {
             return false;
         }
         engine.input_cancel_motion();
@@ -388,6 +446,20 @@ impl GpuiChartInput {
             y,
             modifiers: input_modifiers(modifiers),
             timestamp_ms: self.now_ms(),
+        }
+    }
+
+    /// The chart element's hover listener (`on_hover`): the pointer leaving the chart clears its
+    /// hover and crosshair (`input_pointer_leave`), and an open press keeps its capture.
+    ///
+    /// Bind it with `.hover_listener_mode(HoverListenerMode::InputModalityIndependent)`. GPUI's
+    /// default mode reports every key press as the pointer leaving (keyboard input modality), which
+    /// would hide the crosshair on each key the chart handles, such as an arrow pan, a zoom key or
+    /// typing, and would leave GPUI's hover state out of step, so the pointer's real exit could go
+    /// unreported and strand the crosshair.
+    pub fn hover(&self, engine: &mut ChartEngine, hovered: bool) {
+        if !hovered {
+            engine.input_pointer_leave();
         }
     }
 

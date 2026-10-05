@@ -12,9 +12,13 @@ impl ChartEngine {
         if self.measure_following() {
             return false;
         }
+        // An armed tool's placement stepped back to no points draws nothing at the pointer yet, so
+        // it aims with the crosshair, as before its first click.
         self.hovered_drawing.is_some()
             || self.drawing_drag.is_some()
-            || self.pending_drawing().is_some()
+            || self.pending_drawing().is_some_and(|pending| {
+                !pending.drawing.points.is_empty() || self.active_drawing_tool().is_none()
+            })
             || self.brush_capture().is_some()
             || self.trading_state.feedback_hover.is_some()
             || matches!(

@@ -7,9 +7,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use aeris_charts_engine::{
-    ChartInputEvent, ChartRegion, DrawingId, DrawingKind, DrawingPoint, InteractionOptions,
-    OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PriceScaleTarget, SeriesKind,
-    TradingHitKind, TradingPriceScale, TradingSnapshot, WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
+    ChartInputEvent, ChartRegion, DrawingId, DrawingKind, DrawingPoint, InstrumentMetadata,
+    InteractionOptions, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PriceScaleTarget,
+    SeriesKind, TradingHitKind, TradingIntentAction, TradingPriceScale, TradingSnapshot,
+    WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
 };
 use aeris_charts_render::draw_list::Prim;
 use gpui::{bounds, px, size, AppContext, Entity, Keystroke, MouseButton, TestAppContext};
@@ -80,28 +81,7 @@ fn trading_chart() -> (ChartEngine, (f64, f64)) {
     let price = 106.0;
     chart
         .set_trading_snapshot(TradingSnapshot {
-            orders: vec![WorkingOrder {
-                id: OrderId::new("order-1".to_string()).unwrap(),
-                account_id: None,
-                pane_index: 0,
-                price_scale: TradingPriceScale::Right,
-                side: OrderSide::Sell,
-                kind: OrderKind::Limit,
-                role: OrderRole::Working,
-                status: OrderStatus::Working,
-                price,
-                stop_price: None,
-                trailing_trigger_price: None,
-                break_even_trigger_price: None,
-                quantity: 1.0,
-                filled_quantity: 0.0,
-                position_id: None,
-                parent_order_id: None,
-                bracket_id: None,
-                oco_group_id: None,
-                revision: 1,
-                annotations: Vec::new(),
-            }],
+            orders: vec![working_order(price)],
             ..TradingSnapshot::default()
         })
         .unwrap();
@@ -271,6 +251,32 @@ fn trend_line_body(chart: &mut ChartEngine) -> (DrawingId, (f64, f64)) {
     (id, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
 }
 
+/// A one-lot working sell limit at `price` on the right scale of pane 0.
+fn working_order(price: f64) -> WorkingOrder {
+    WorkingOrder {
+        id: OrderId::new("order-1".to_string()).unwrap(),
+        account_id: None,
+        pane_index: 0,
+        price_scale: TradingPriceScale::Right,
+        side: OrderSide::Sell,
+        kind: OrderKind::Limit,
+        role: OrderRole::Working,
+        status: OrderStatus::Working,
+        price,
+        stop_price: None,
+        trailing_trigger_price: None,
+        break_even_trigger_price: None,
+        quantity: 1.0,
+        filled_quantity: 0.0,
+        position_id: None,
+        parent_order_id: None,
+        bracket_id: None,
+        oco_group_id: None,
+        revision: 1,
+        annotations: Vec::new(),
+    }
+}
+
 /// An open typing session on a text drawing that reads `text`, with the caret at its end.
 fn text_session(chart: &mut ChartEngine, text: &str) -> DrawingId {
     let options = format!(r#"{{"text":"{text}"}}"#);
@@ -403,6 +409,219 @@ fn mouse_events_pan_past_the_slop_select_on_click_and_abandon_a_lost_release() {
     assert!(!chart.drawing_drag_active());
     assert_near(chart.crosshair.unwrap(), (400.0, 300.0));
     assert_ne!(cursor_style(chart.input_cursor()), CursorStyle::ClosedHand);
+}
+
+/// A press that wobbles under the shared 5 px slop on a drawing or an order line is a click: it
+/// moves nothing and asks the host for nothing. A drag past the slop moves either object.
+#[test]
+fn a_wobbling_click_moves_no_drawing_or_order_and_a_drag_past_the_slop_does() {
+    let mut chart = chart();
+    let input = input();
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            // Finer than a pixel, so any pointer offset from the line is another price.
+            instrument: InstrumentMetadata {
+                tick_size: Some(0.01),
+                ..InstrumentMetadata::default()
+            },
+            // A protection order: its line is a drag target (an entry's line is a readout).
+            orders: vec![WorkingOrder {
+                role: OrderRole::TakeProfit,
+                ..working_order(106.0)
+            }],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    let (id, body) = trend_line_body(&mut chart);
+    let points = chart.drawing(id).unwrap().points.clone();
+    let anchors = [0, 1].map(|index| chart.drawing_point_to_coordinate(id, index).unwrap());
+    let revision = chart.drawing_revision();
+
+    let press = window(&chart, body.0, body.1);
+    input.mouse_down(&mut chart, &down(press, 1));
+    for (dx, dy) in [(2.0, -1.0), (1.0, 3.0)] {
+        let wobble = window(&chart, body.0 + dx, body.1 + dy);
+        input.mouse_move(&mut chart, &pressed(wobble));
+        assert_eq!(chart.drawing(id).unwrap().points, points, "{dx},{dy}");
+    }
+    let release = window(&chart, body.0 + 1.0, body.1 + 3.0);
+    input.mouse_up(&mut chart, &up(release));
+    assert_eq!(chart.drawing(id).unwrap().points, points);
+    assert_eq!(chart.drawing_revision(), revision);
+    assert_eq!(chart.selected_drawing(), Some(id), "the press is a click");
+
+    drag(&input, &mut chart, body, (body.0 + 30.0, body.1 - 20.0));
+    for (index, before) in anchors.into_iter().enumerate() {
+        assert_near(
+            chart.drawing_point_to_coordinate(id, index).unwrap(),
+            (before.0 + 30.0, before.1 - 20.0),
+        );
+    }
+    assert_eq!(chart.drawing_revision(), revision + 1);
+
+    let line_y = chart.series_price_to_coordinate(0, 106.0).unwrap();
+    let y = line_y + 4.0;
+    let x = (80..chart.pane_w as usize)
+        .map(|x| x as f64)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::OrderLine)
+        })
+        .expect("the order line is a drag target 4 px off its price");
+    let press = window(&chart, x, y);
+    input.mouse_down(&mut chart, &down(press, 1));
+    for (dx, dy) in [(1.0, 1.0), (-1.0, 3.0)] {
+        let wobble = window(&chart, x + dx, y + dy);
+        input.mouse_move(&mut chart, &pressed(wobble));
+    }
+    let release = window(&chart, x - 1.0, y + 3.0);
+    input.mouse_up(&mut chart, &up(release));
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders[0].price, 106.0);
+
+    drag(&input, &mut chart, (x, line_y), (x, line_y - 30.0));
+    let intents = chart.take_trading_intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(intents[0].action, TradingIntentAction::ModifyOrder);
+}
+
+/// Through real GPUI events, an armed drawing tool owns an order line: the pointer reads as the
+/// tool's crosshair there, a drag along it moves no order, and two clicks place a trend line from
+/// it. The order's close button keeps its pointer cursor and its click while a tool is armed.
+#[test]
+fn an_armed_tool_owns_order_lines_and_leaves_the_close_button_its_click() {
+    let mut chart = chart();
+    let input = input();
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            // A protection order: its line drags whenever no tool is armed.
+            orders: vec![WorkingOrder {
+                role: OrderRole::TakeProfit,
+                ..working_order(106.0)
+            }],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    chart.build_frame();
+    let line_y = chart.series_price_to_coordinate(0, 106.0).unwrap();
+    let x = 80.0;
+    assert_eq!(
+        chart.trading_hit_at(x, line_y).map(|hit| hit.kind),
+        Some(TradingHitKind::OrderLine)
+    );
+    let close_x = (0..=(chart.pane_w * 2.0) as usize)
+        .map(|step| step as f64 / 2.0)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, line_y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+        })
+        .expect("the order shows a close button");
+
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    let on_line = window(&chart, x, line_y);
+    input.mouse_move(&mut chart, &hover(on_line));
+    assert_eq!(chart.input_cursor(), ChartCursor::Crosshair);
+    drag(&input, &mut chart, (x, line_y), (x, line_y - 30.0));
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders[0].price, 106.0);
+
+    click(&input, &mut chart, (x, line_y), 1);
+    click(&input, &mut chart, (x + 150.0, line_y + 40.0), 1);
+    let created = chart
+        .take_input_events()
+        .into_iter()
+        .filter(|event| matches!(event, ChartInputEvent::DrawingCreated(_)))
+        .count();
+    assert_eq!(created, 1, "the second click places the trend line");
+    assert_eq!(chart.active_drawing_tool(), None, "one-shot tools disarm");
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders[0].price, 106.0);
+    input.mouse_move(&mut chart, &hover(on_line));
+    assert_eq!(chart.input_cursor(), ChartCursor::VerticalGrab);
+
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    let on_close = window(&chart, close_x, line_y);
+    input.mouse_move(&mut chart, &hover(on_close));
+    assert_eq!(chart.input_cursor(), ChartCursor::Pointer);
+    click(&input, &mut chart, (close_x, line_y), 1);
+    let intents = chart.take_trading_intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(intents[0].action, TradingIntentAction::CancelOrder);
+    assert_eq!(chart.active_drawing_tool(), Some(DrawingKind::TrendLine));
+}
+
+/// Through real GPUI events, an order change awaiting the host leaves the chart's trading controls
+/// inert: the arrow over the moved line and over the close button, no tooltip wake, and a click
+/// that cancels nothing. The host's answer, or its own update of the order when it never answers,
+/// brings the grab cursor back under the resting pointer without another mouse move.
+#[test]
+fn an_order_change_awaiting_the_host_reads_inert_until_the_host_answers() {
+    let mut chart = chart();
+    let input = input();
+    let take_profit = |price: f64, revision: u32| WorkingOrder {
+        role: OrderRole::TakeProfit,
+        revision,
+        ..working_order(price)
+    };
+    chart
+        .set_trading_snapshot(TradingSnapshot {
+            orders: vec![take_profit(106.0, 1)],
+            ..TradingSnapshot::default()
+        })
+        .unwrap();
+    chart.build_frame();
+    let line_y = chart.series_price_to_coordinate(0, 106.0).unwrap();
+    let x = 80.0;
+    let close_x = (0..=(chart.pane_w * 2.0) as usize)
+        .map(|step| step as f64 / 2.0)
+        .find(|&x| {
+            chart
+                .trading_hit_at(x, line_y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::CancelButton)
+        })
+        .expect("the order shows a close button");
+    let grab = if cfg!(target_os = "windows") {
+        CursorStyle::ResizeUpDown
+    } else {
+        CursorStyle::OpenHand
+    };
+    let on_line = window(&chart, x, line_y);
+    input.mouse_move(&mut chart, &hover(on_line));
+    assert_eq!(cursor_style(chart.input_cursor()), grab);
+
+    drag(&input, &mut chart, (x, line_y), (x, line_y - 30.0));
+    let intents = chart.take_trading_intents();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(intents[0].action, TradingIntentAction::ModifyOrder);
+    let moved_y = line_y - 30.0;
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+
+    let on_close = window(&chart, close_x, moved_y);
+    input.mouse_move(&mut chart, &hover(on_close));
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+    assert_eq!(chart.input_wake_deadline_ms(), None, "no tooltip dwell");
+    click(&input, &mut chart, (close_x, moved_y), 1);
+    assert!(chart.take_trading_intents().is_empty());
+    assert_eq!(chart.trading_snapshot().orders.len(), 1);
+
+    let on_moved_line = window(&chart, x, moved_y);
+    input.mouse_move(&mut chart, &hover(on_moved_line));
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+    assert!(chart.resolve_trading_intent(intents[0].sequence, true));
+    assert_eq!(cursor_style(chart.input_cursor()), grab);
+
+    // A host that answers with its own order update instead of resolving the intent.
+    drag(&input, &mut chart, (x, moved_y), (x, moved_y - 30.0));
+    let second = chart.take_trading_intents();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(cursor_style(chart.input_cursor()), CursorStyle::Arrow);
+    chart
+        .update_working_order(take_profit(second[0].price.unwrap(), 2))
+        .unwrap();
+    assert_eq!(cursor_style(chart.input_cursor()), grab);
+    assert!(!chart.resolve_trading_intent(second[0].sequence, false));
 }
 
 #[test]
@@ -872,6 +1091,19 @@ fn the_adapter_clock_is_the_gpui_executor_clock(cx: &mut TestAppContext) {
         Some(now + TRADING_TOOLTIP_DWELL_MS),
         "hovering the close button starts the dwell on the adapter clock"
     );
+
+    // The dwell belongs to the hovered control: a wobble inside the button, later on the same
+    // clock, keeps the deadline it already started.
+    advance_ms(cx, 100);
+    for dy in [1.0, -2.0] {
+        let wobble = window(&chart, close.0, close.1 + dy);
+        input.mouse_move(&mut chart, &hover(wobble));
+        assert_eq!(
+            chart.input_wake_deadline_ms(),
+            Some(now + TRADING_TOOLTIP_DWELL_MS),
+            "{dy}"
+        );
+    }
 }
 
 /// `refresh` notifies the view that drew the chart and keeps exactly one wake for the engine's
@@ -1193,4 +1425,93 @@ fn text_edit_deletes_forward_selects_with_shift_and_types_only_characters() {
 
     text_edit_key(&mut chart, &key("down", None, none));
     assert_eq!(chart.drawing_text_edit(), Some((id, " lo world", 9)));
+}
+
+/// Through real GPUI events, the drawing being placed owns Delete and Backspace: after a trend
+/// line's first click they step back that click, and the drawing selected before the tool was
+/// picked survives every press, key auto-repeat included. Two more clicks then place the line.
+#[test]
+fn delete_and_backspace_mid_placement_step_back_only_the_drawing_being_placed() {
+    let mut chart = chart();
+    let input = input();
+    let (old, body) = trend_line_body(&mut chart);
+    click(&input, &mut chart, body, 1);
+    assert_eq!(chart.selected_drawing(), Some(old));
+    chart.take_input_events();
+    // `GpuiChartInput::key_down` with no typing session open, minus the `App` it needs only for
+    // the clipboard.
+    let press = |chart: &mut ChartEngine, name: &str, is_held: bool| {
+        let event = KeyDownEvent {
+            is_held,
+            ..key(name, None, Modifiers::default())
+        };
+        let key = chart_key_down(&event).expect("a bound chart key");
+        chart.input_key_down(
+            key,
+            input_modifiers(&event.keystroke.modifiers),
+            event.is_held,
+            input.now_ms(),
+        )
+    };
+
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    click(&input, &mut chart, (200.0, 300.0), 1);
+    assert!(chart.drawing_create_active());
+    assert!(press(&mut chart, "delete", false));
+    assert!(press(&mut chart, "backspace", false));
+    assert!(press(&mut chart, "backspace", true));
+    assert!(
+        chart.drawing(old).is_some(),
+        "the selected drawing survives"
+    );
+    assert_eq!(chart.selected_drawing(), Some(old));
+    assert!(chart.take_input_events().is_empty());
+    assert_eq!(chart.active_drawing_tool(), Some(DrawingKind::TrendLine));
+
+    for at in [(300.0, 120.0), (450.0, 200.0)] {
+        click(&input, &mut chart, at, 1);
+    }
+    let [ChartInputEvent::DrawingCreated(id)] = chart.take_input_events()[..] else {
+        panic!("the second click after the step back places the line");
+    };
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 0).unwrap(),
+        (300.0, 120.0),
+    );
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 1).unwrap(),
+        (450.0, 200.0),
+    );
+    assert!(chart.drawing(old).is_some());
+}
+
+/// Through real GPUI events, an armed click-placed tool places by click only: a press-drag-release
+/// places nothing, pans nothing, and leaves the tool armed, and two clicks then place the line.
+#[test]
+fn an_armed_trend_line_places_by_click_and_a_drag_places_nothing() {
+    let mut chart = chart();
+    let input = input();
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    let scroll = chart.scroll_position();
+
+    drag(&input, &mut chart, (150.0, 150.0), (450.0, 300.0));
+    assert!(!chart.drawing_create_active(), "no anchor was placed");
+    assert!(chart.drawings().is_empty());
+    assert!(chart.take_input_events().is_empty());
+    assert_eq!(chart.scroll_position(), scroll, "the drag did not pan");
+    assert_eq!(chart.active_drawing_tool(), Some(DrawingKind::TrendLine));
+
+    click(&input, &mut chart, (150.0, 150.0), 1);
+    click(&input, &mut chart, (450.0, 300.0), 1);
+    let [ChartInputEvent::DrawingCreated(id)] = chart.take_input_events()[..] else {
+        panic!("two clicks place the line");
+    };
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 0).unwrap(),
+        (150.0, 150.0),
+    );
+    assert_near(
+        chart.drawing_point_to_coordinate(id, 1).unwrap(),
+        (450.0, 300.0),
+    );
 }

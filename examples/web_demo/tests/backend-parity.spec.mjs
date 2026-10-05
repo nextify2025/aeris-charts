@@ -1465,6 +1465,9 @@ async function drag_position(page, backend, kind, theme) {
     expect(Math.abs(grab.tick_px) * dpr).toBeLessThan(1);
     await page.mouse.move(grab.x, grab.y);
     await page.mouse.down();
+    // A press moves nothing until it travels the shared 5 px drag threshold; past it the handle
+    // follows the pointer exactly, back to sub-pixel offsets from the press too.
+    await page.mouse.move(grab.x, grab.y + 12);
     for (const [fraction, ticks] of [[0.3, 0], [0.7, 1], [1.3, 1], [1.7, 2]]) {
       await page.mouse.move(grab.x, grab.y + grab.tick_px * fraction);
       const points = await page.evaluate(() => window.__chart.drawings().at(-1).points());
@@ -1498,6 +1501,8 @@ async function drag_position(page, backend, kind, theme) {
     const cursor_start = await page.evaluate(() => window.__position_cursor_logical);
     expect(Number.isInteger(cursor_start)).toBe(true);
     await page.mouse.down();
+    // Cross the shared 5 px drag threshold first, as above; the pull keeps the press's time.
+    await page.mouse.move(grab.x, grab.y + 12);
     for (const fraction of [0.2, 0.3, 0.7, 1.3, 1.7, -0.2, -0.3, -0.7, -1.3, -1.7]) {
       await page.mouse.move(grab.x + grab.spacing * fraction, grab.y);
       const { points, cursor } = await page.evaluate(() => ({

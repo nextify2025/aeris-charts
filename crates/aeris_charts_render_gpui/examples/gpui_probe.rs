@@ -39,9 +39,9 @@ use aeris_charts_render_gpui::{
 };
 use gpui::{
     canvas, div, prelude::*, px, relative, rgb, size, AnyElement, App, Bounds, Context,
-    CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Render, ScrollHandle,
-    ScrollWheelEvent, Subscription, Window, WindowBounds, WindowOptions,
+    CursorStyle, Entity, FocusHandle, Focusable, HoverListenerMode, KeyDownEvent, KeyUpEvent,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent,
+    Render, ScrollHandle, ScrollWheelEvent, Subscription, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -1450,8 +1450,8 @@ impl Probe {
     }
 
     fn on_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.input.hover(&mut self.engine, *hovered);
         if !*hovered {
-            self.engine.input_pointer_leave();
             self.after_input(cx);
         }
     }
@@ -1625,6 +1625,7 @@ impl Render for Probe {
             .track_focus(&focus)
             .key_context("AerisGpuiChart")
             .on_hover(cx.listener(Self::on_hover))
+            .hover_listener_mode(HoverListenerMode::InputModalityIndependent)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1659,6 +1660,10 @@ impl Render for Probe {
                     move |_bounds: Bounds<gpui::Pixels>, prepainted, window, cx| {
                         entity.update(cx, |probe: &mut Probe, cx| {
                             paint_probe(probe, prepainted, window, cx);
+                            let view = cx.entity();
+                            probe
+                                .input
+                                .capture_pointer(window, &view, Self::on_mouse_move);
                         });
                     },
                 )
@@ -4820,6 +4825,152 @@ mod window_input_tests {
                 "hover resumes after the press ended outside"
             );
         });
+    }
+
+    /// GPUI calls an element's move listener only while the pointer is over the element. The
+    /// adapter's capture keeps a pan following the pointer over the host margin, as browser
+    /// pointer capture does, on a cached host and an uncached one.
+    #[gpui::test]
+    fn a_pan_keeps_following_the_pointer_outside_the_chart(cx: &mut TestAppContext) {
+        for cached in [true, false] {
+            let (chart, _host, mut cx) = open_chart_in(cx, cached);
+            let empty = chart.read_with(&cx, |probe, _| at(probe, EMPTY.0, EMPTY.1));
+            press(&mut cx, empty, 1);
+            drag_to(&mut cx, offset(empty, 10.0, 0.0));
+            let started = engine(&cx, &chart, ChartEngine::scroll_position);
+
+            // Up into the host's top margin: the chart element starts at `INSET`.
+            let outside = point(empty.x + px(60.0), px(INSET / 2.0));
+            drag_to(&mut cx, outside);
+            let followed = engine(&cx, &chart, ChartEngine::scroll_position);
+            assert_ne!(
+                followed, started,
+                "cached: {cached}: the pan follows the pointer outside the chart"
+            );
+            // A pan with autoscale on moves time only, so the same x inside gives the same view:
+            // the move outside reached the engine at its true position.
+            drag_to(&mut cx, offset(empty, 60.0, 0.0));
+            assert_eq!(
+                engine(&cx, &chart, ChartEngine::scroll_position),
+                followed,
+                "cached: {cached}"
+            );
+            drag_to(&mut cx, outside);
+            release(&mut cx, outside, 1);
+            engine(&cx, &chart, |engine| {
+                assert!(!engine.input_pointer_captured(), "cached: {cached}");
+                assert_eq!(engine.scroll_position(), followed, "cached: {cached}");
+            });
+
+            // With no press, a move outside is the host's again and the chart ignores it.
+            hover(&mut cx, offset(outside, 80.0, 0.0));
+            assert_eq!(
+                engine(&cx, &chart, ChartEngine::scroll_position),
+                followed,
+                "cached: {cached}"
+            );
+        }
+    }
+
+    /// GPUI's default hover listener reports a key press as the pointer leaving (keyboard input
+    /// modality). The chart binds its hover listener independent of input modality, so a key
+    /// keeps the crosshair under a resting pointer and the pointer's real exit still clears it.
+    #[gpui::test]
+    fn a_key_press_keeps_the_crosshair_under_a_resting_pointer(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        let candle = chart.read_with(&cx, |probe, _| {
+            let (x, y) = series_point(probe);
+            at(probe, x, y)
+        });
+        click(&mut cx, candle);
+        hover(&mut cx, candle);
+        let crosshair = engine(&cx, &chart, |engine| engine.crosshair);
+        assert!(crosshair.is_some());
+
+        // One key the chart ignores and one it handles (a zoom; Escape would clear the crosshair
+        // on purpose, as the engine's key binding).
+        cx.simulate_keystrokes("a");
+        assert_eq!(engine(&cx, &chart, |engine| engine.crosshair), crosshair);
+        let spacing = engine(&cx, &chart, ChartEngine::bar_spacing);
+        cx.simulate_keystrokes("+");
+        cx.run_until_parked();
+        engine(&cx, &chart, |engine| {
+            assert_ne!(engine.bar_spacing(), spacing, "the chart handled the key");
+            assert!(engine.crosshair.is_some());
+        });
+
+        hover(&mut cx, point(px(INSET / 2.0), px(INSET / 2.0)));
+        assert_eq!(
+            engine(&cx, &chart, |engine| engine.crosshair),
+            None,
+            "the pointer's exit after a key press still clears the crosshair"
+        );
+    }
+
+    /// An inactive window gets no release, so the adapter abandons an open press when the window
+    /// deactivates, as the browser host does on window blur: a drawing drag rolls back, a pan
+    /// stops where it is, and moves with the button still down change nothing. The cached host
+    /// replays the chart's frame unless GPUI redraws it, and GPUI does on every activation change.
+    #[gpui::test]
+    fn deactivating_the_window_abandons_an_open_press(cx: &mut TestAppContext) {
+        let (chart, _host, mut cx) = open_chart(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let id = add_text_drawing(&mut cx, &chart, "Note");
+        let (points, grip) = chart.read_with(&cx, |probe, _| {
+            let (x, y) = text_point(&probe.engine, id);
+            (
+                probe.engine.drawing(id).unwrap().points.clone(),
+                at(probe, x, y),
+            )
+        });
+        press(&mut cx, grip, 1);
+        drag_to(&mut cx, offset(grip, 10.0, 0.0));
+        drag_to(&mut cx, offset(grip, 40.0, 30.0));
+        assert_ne!(
+            engine(&cx, &chart, |engine| engine
+                .drawing(id)
+                .unwrap()
+                .points
+                .clone()),
+            points,
+            "the drag moves the drawing"
+        );
+
+        cx.deactivate_window();
+        engine(&cx, &chart, |engine| {
+            assert!(!engine.input_pointer_captured());
+            assert_eq!(
+                engine.drawing(id).unwrap().points,
+                points,
+                "the drag rolls back"
+            );
+        });
+        drag_to(&mut cx, offset(grip, 80.0, 60.0));
+        release(&mut cx, offset(grip, 80.0, 60.0), 1);
+        assert_eq!(
+            engine(&cx, &chart, |engine| engine
+                .drawing(id)
+                .unwrap()
+                .points
+                .clone()),
+            points
+        );
+
+        // A pan stops where it is and keeps its partial change.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let empty = chart.read_with(&cx, |probe, _| at(probe, EMPTY.0, EMPTY.1));
+        let scroll = engine(&cx, &chart, ChartEngine::scroll_position);
+        press(&mut cx, empty, 1);
+        drag_to(&mut cx, offset(empty, 10.0, 0.0));
+        drag_to(&mut cx, offset(empty, 70.0, 0.0));
+        let panned = engine(&cx, &chart, ChartEngine::scroll_position);
+        assert_ne!(panned, scroll);
+        cx.deactivate_window();
+        assert!(!engine(&cx, &chart, ChartEngine::input_pointer_captured));
+        drag_to(&mut cx, offset(empty, 150.0, 0.0));
+        assert_eq!(engine(&cx, &chart, ChartEngine::scroll_position), panned);
     }
 
     #[gpui::test]
