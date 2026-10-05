@@ -1,9 +1,9 @@
 {
-  "policy_version": 6,
+  "policy_version": 7,
   "baseline": "explicit_previous_release",
   "thresholds": {},
   "absolute_maximums": {
-    "package-release-artifacts.npm_tarball_bytes.p50": 2110000,
+    "package-release-artifacts.npm_tarball_bytes.p50": 2270000,
     "package-release-artifacts.npm_unpacked_bytes.p50": 6850000,
     "package-release-artifacts.javascript_raw_bytes.p50": 620000,
     "package-release-artifacts.javascript_brotli_bytes.p50": 95000,
@@ -108,6 +108,44 @@
         "No lossless lever applies to this growth: the IndicatorKind deserializer and the chrono-tz filter from v5 are already shipped, and every remaining reduction is an opt-level change priced in benchmarks/README.md that costs frame time and awaits a product decision."
       ],
       "product_tradeoff": "Compiled engine code for four Vela-informed capabilities: live-bar easing (per-series display override of the drawn last row with its clock and settle rules), the baseline reference line and baseline_mode, the crosshair shadeRight veil, and the timeline-mark lane (slot mapping, clustering, cached lane layout, dwell tooltip, input outcome, persistence of hidden groups and its JSON surface). The optimized module grew 92,557 raw bytes (+1.7%) and 24,284 Brotli bytes against the batch base de7d571, which already sat 20,453 raw bytes under the v5 ceiling after upstream's later work; JavaScript stays inside its unchanged ceilings."
+    },
+    {
+      "policy_version": 7,
+      "commit": "3c0efbe574aa8ef0a297399cbf605e8d99da98e6",
+      "dirty_worktree": false,
+      "headroom_percent": 7,
+      "observed": {
+        "package-release-artifacts.npm_tarball_bytes.p50": 2114122,
+        "package-release-artifacts.npm_unpacked_bytes.p50": 6402347,
+        "package-release-artifacts.javascript_raw_bytes.p50": 407412,
+        "package-release-artifacts.javascript_brotli_bytes.p50": 71186,
+        "package-release-artifacts.wasm_raw_bytes.p50": 5481942,
+        "package-release-artifacts.wasm_brotli_bytes.p50": 1324197
+      },
+      "raised": {
+        "package-release-artifacts.npm_tarball_bytes.p50": {
+          "from": 2110000,
+          "to": 2270000
+        }
+      },
+      "toolchain": {
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+        "wasm_pack": "wasm-pack 0.15.0",
+        "wasm_opt": "wasm-opt version 117 (version_117)",
+        "cargo_profile": "release",
+        "wasm_opt_args": [
+          "-Oz",
+          "--enable-mutable-globals",
+          "--enable-nontrapping-float-to-int",
+          "--enable-bulk-memory",
+          "--enable-sign-ext",
+          "--enable-simd"
+        ]
+      },
+      "levers": [
+        "The v6 lossless levers (IndicatorKind serde out of line, filtered chrono-tz, wasm-opt --converge, binaryen 132) were re-checked and none applies to the merged code; opt-level changes stay priced in benchmarks/README.md and not shipped because they cost frame time"
+      ],
+      "product_tradeoff": "Merging main's GPUI refresh contract (#17) and interaction fixes (#16: the shared 5 px drag threshold for objects, armed tools owning order-line bodies, inert awaiting controls with the press record, the control-based tooltip dwell, Backspace/Delete during placement, GPUI pointer capture and window deactivation) into the v6 engine batch. Each line alone sat inside the v6 ceilings (the v6 batch at 5f0b0c9 measured a 2,107,579-byte tarball, 2,421 bytes under); the merged tree at 3c0efbe measures 2,114,122 bytes, 4,122 bytes (0.2%) over, with the same wasm-pack 0.15.0 and its bundled wasm-opt 117. The growth is the merged engine code and its WASM exports with no reducible hotspot; only the tarball ceiling moves."
     }
   ]
 }
