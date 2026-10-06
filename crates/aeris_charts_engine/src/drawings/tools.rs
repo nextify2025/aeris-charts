@@ -26,11 +26,8 @@
 // signpost is a two-anchor marker that opens none), arrow-mark text, multi-line family boxes for
 // note/comment/callout/price_note/anchored_text, bars-pattern LOD aggregation, the forecast's
 // source and target boxes (absolute change, Success/Failure on market colors, the box as a hit
-// target; the target time stays, one line above upstream's outcome label). Shapes:
-// rotated-rectangle width handles, ellipse bounds handles, on-curve anchors with tangent extension
-// and chord fills, closed polylines, end caps on arc, curve and double_curve from
-// `stroke_start`/`stroke_end`, and the rotated rectangle's and triangle's outline as one seamless
-// stroke. Re-applied on upstream's lowering instead: the line tools' fork presentation, selected by
+// target; the target time stays, one line above upstream's outcome label). Re-applied on
+// upstream's lowering instead: the line tools' fork presentation, selected by
 // the stored `tool_options.line` block and layered on upstream's segment and cross arms
 // (`kinds::lines::upstream_line_parts`; new drawings have no block and render as upstream does):
 // the one engine-formatted stats box of the visible `labels` (stats_position, InfoLine's five-stat
@@ -78,7 +75,20 @@
 // bars (without a ratio its second anchor stays beyond the corner, moved far beyond it when it
 // was not, so the square normally keeps its bars under ordinary price zoom), and the price-basis
 // rescale of the ratios, the derived handles
-// dragging through `kinds::drag_derived_handle`; channel `extend_*`, the callout's tip and box
+// dragging through `kinds::drag_derived_handle`; the shapes' presentation on upstream's arc,
+// curve, polyline, rotated-rectangle and triangle arms (`kinds::shapes`; new drawings keep
+// upstream's defaults): the arc's circular segment and the curves' chord regions filled by
+// `fill_enabled` (a selected body target), the curves' tangent extension by `extend_*`, the closed
+// polyline (`tool_options.shape.closed`, nonzero fill by `fill_enabled`, no caps; fork documents
+// stay filled, new ones keep upstream's unfilled default, S1); upstream behaviour changed by
+// owner decision: clicking a polyline's first vertex once three are placed closes it (S2), the
+// ellipse's eight bounds handles with Shift for a circle (S3), the rotated rectangle's third
+// handle on its far side's midpoint with a near-side width handle and width-keeping edge-corner
+// drags (S4, `kinds::follow_anchor_drag`), curves placed and edited through points on the curve,
+// stored as upstream's control points, with the arc placed ends first
+// (`kinds::shapes::placement_anchors`, S5), end caps on arc, curve and double_curve from
+// `stroke_start`/`stroke_end` (S6), and the rotated rectangle's and triangle's outline as one
+// seamless run from mid-edge (S7); channel `extend_*`, the callout's tip and box
 // handles, the highlighter's once-filled tube,
 // the regression trend's dashed anchor segment while it has no fit, and the clip-aware flattening
 // of the ellipse, circle, arc, curve and double curve (`geometry.rs`: within 0.25 px of the true
@@ -88,7 +98,8 @@
 // payloads carry them as `false`), the five-stat default of new info lines (they keep upstream's
 // four; fork documents keep five), the projection's independent sector radius (its third anchor),
 // the price note's leader and label offset (its second anchor), the bars pattern's box fit, the
-// symmetric rotated rectangle placed around its center axis, a numeric fixed-square size, the three
+// symmetric rotated rectangle placed and edited around its center axis (S4: upstream's edge and
+// depth placement stays; only the width handles are restored), a numeric fixed-square size, the three
 // drives' seventh anchor (its last leg; upstream's contract has six), the triangle pattern's apex
 // sides and the patterns' shading on new drawings (opt-in through `extend_*` and `fill_enabled`;
 // fork documents set them), and the fork's look as the default of new Fibonacci drawings (palette
@@ -675,7 +686,13 @@ const ROTATED_RECTANGLE: DrawingToolSpec = DrawingToolSpec {
     price_extent: DrawingPriceExtent::Full,
     ..shape_spec(DrawingKind::RotatedRectangle, 27, "rotated_rectangle", 3)
 };
-const ELLIPSE: DrawingToolSpec = shape_spec(DrawingKind::Ellipse, 28, "ellipse", 2);
+// The ellipse edits with the rectangle's eight bounds handles of the box it is inscribed in, and
+// Shift squares that box into a circle (owner decision S3).
+const ELLIPSE: DrawingToolSpec = DrawingToolSpec {
+    handles: DrawingHandleMode::RectangleBounds,
+    straighten: DrawingStraightenMode::Square,
+    ..shape_spec(DrawingKind::Ellipse, 28, "ellipse", 2)
+};
 const CIRCLE: DrawingToolSpec = DrawingToolSpec {
     logical_extent: DrawingLogicalExtent::Full,
     price_extent: DrawingPriceExtent::Full,

@@ -35,9 +35,9 @@ pub(crate) mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{
-    curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry, DrawingBodyGeometry,
-    DrawingGeometryOptions, FibonacciArcGeometry, FibonacciGeometry, MeasureAxes, PositionGeometry,
-    PositionZone, TimeLevelGeometry,
+    closed_outline, curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry,
+    DrawingBodyGeometry, DrawingGeometryOptions, FibonacciArcGeometry, FibonacciGeometry,
+    MeasureAxes, PositionGeometry, PositionZone, TimeLevelGeometry,
 };
 pub(crate) use parts::{arrow_cap_triangle, cap_radius, DrawingPart, DrawingParts, PartContext};
 pub(crate) use tools::{
@@ -7515,15 +7515,40 @@ impl ChartEngine {
                         distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
                     })
             }
-            DrawingBodyGeometry::Arc(arc) => {
-                let mut line = Vec::new();
-                arc.flatten(curve_clip(), &mut line);
-                shape::distance_to_polyline((x, y), &line) <= tolerance
+            DrawingBodyGeometry::Arc(_) | DrawingBodyGeometry::Curve(_) => {
+                // The stroke (with its caps and tangent extensions) and, while selected, the
+                // chord region, as the frame paints them.
+                let Some(curve) = kinds::shapes::CurveStroke::resolve(geometry.body, curve_clip())
+                else {
+                    return false;
+                };
+                let run = curve.run();
+                let stroke_hit = if kinds::shapes::capped(drawing) {
+                    self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                        curve.capped_parts(&run, drawing, context.scale, parts);
+                    })
+                } else {
+                    shape::distance_to_polyline((x, y), &run) <= tolerance
+                };
+                stroke_hit
+                    || (drawing.fill_enabled && self.selected_drawing == Some(drawing.id) && {
+                        let mut ribbon = Vec::new();
+                        let count = curve.chord_fill(&mut ribbon);
+                        let (upper, lower) = ribbon.split_at(count);
+                        count > 0 && self.band_fill_hit(drawing, upper, lower, (x, y))
+                    })
             }
-            DrawingBodyGeometry::Curve(curve) => {
-                let mut line = Vec::new();
-                curve.flatten(curve_clip(), &mut line);
-                shape::distance_to_polyline((x, y), &line) <= tolerance
+            DrawingBodyGeometry::Polygon { points: vertices } => {
+                let mut outline = Vec::new();
+                closed_outline(vertices, &mut outline);
+                // The nonzero fill the frame paints, a body target only while selected.
+                shape::distance_to_polyline((x, y), &outline) <= tolerance
+                    || (drawing.fill_enabled && self.selected_drawing == Some(drawing.id) && {
+                        let mut ribbon = Vec::new();
+                        let count = shape::nonzero_ribbon(vertices, &mut ribbon);
+                        let (upper, lower) = ribbon.split_at(count);
+                        count > 0 && self.band_fill_hit(drawing, upper, lower, (x, y))
+                    })
             }
             DrawingBodyGeometry::Rectangle {
                 left,
@@ -8023,6 +8048,11 @@ impl ChartEngine {
                     // A horizontal or vertical segment drags its linked coordinate on every
                     // anchor.
                     kind.spec().anchor_link.apply(&mut points, index);
+                    // Derived geometry follows (a rotated rectangle's width, a curve's
+                    // on-curve points).
+                    if let Some(drawing) = self.drawing(id) {
+                        kinds::follow_anchor_drag(self, drawing, index, &start_px, &mut points);
+                    }
                 }
             }
             DrawingDragPart::Body => {
@@ -9029,6 +9059,16 @@ impl ChartEngine {
         if bound_pane.is_some() && self.pane_at_y(y) != Some(pane) {
             return -1;
         }
+        // A click on a polyline's first vertex, once three are placed, finishes it closed.
+        if self.pending_close_hit(x, y).is_some() {
+            let Some(mut pending) = self.drawing_controller.pending.take() else {
+                return -1;
+            };
+            pending.drawing.tool_options.shape =
+                Some(kinds::shapes::ShapeToolOptions { closed: true });
+            pending.preview = None;
+            return i64::from(self.commit_pending_drawing(pending));
+        }
         let (anchor_count, kind, fixed, snap_time_to_data, own_magnet) = {
             let Some(pending) = &self.drawing_controller.pending else {
                 return 0;
@@ -9112,6 +9152,15 @@ impl ChartEngine {
     fn commit_pending_drawing(&mut self, pending: PendingDrawing) -> DrawingId {
         self.invalidate_frame_overlay();
         let mut drawing = pending.drawing;
+        // Tools placed through points on their geometry store the anchors those clicks define
+        // (an arc ends first, a curve through its on-curve points), as the preview showed.
+        if kinds::shapes::places_through(drawing.kind) {
+            let Some(points) = kinds::shapes::placement_anchors(self, &drawing, &drawing.points)
+            else {
+                return 0;
+            };
+            drawing.points = points;
+        }
         Drawing::normalize_points(drawing.kind, &mut drawing.points);
         // Anchored text starts at its anchor's screen position.
         if drawing.kind == DrawingKind::AnchoredText {
@@ -9143,6 +9192,24 @@ impl ChartEngine {
             index,
         });
         id
+    }
+
+    /// The first vertex of the polyline being placed when media px `(x, y)` lies within the
+    /// precision anchor radius of it and three vertices or more are placed: a click there
+    /// finishes the polyline closed (`tool_options.shape.closed`) instead of adding a vertex, and
+    /// the preview snaps onto it. Only the polyline closes this way; a path keeps its vertices.
+    fn pending_close_hit(&self, x: f64, y: f64) -> Option<DrawingPoint> {
+        let pending = self.drawing_controller.pending.as_ref()?;
+        let drawing = &pending.drawing;
+        if drawing.kind != DrawingKind::Polyline
+            || !drawing.kind.spec().placement.is_sequence()
+            || drawing.points.len() < 3
+        {
+            return None;
+        }
+        let first = *drawing.points.first()?;
+        let (fx, fy) = self.drawing_point_px(drawing, first)?;
+        ((fx - x).hypot(fy - y) <= HitProfile::PRECISION.drawing_anchor_radius).then_some(first)
     }
 
     /// Commit an active multi-click path. Enter and double-click route here after at least two
@@ -9214,6 +9281,13 @@ impl ChartEngine {
             bound_pane
         };
         if self.pane_at_y(y) != Some(pane) {
+            return;
+        }
+        // Over a polyline's first vertex the preview closes onto it, as a click there would.
+        if let Some(first) = self.pending_close_hit(x, y) {
+            if let Some(pending) = self.drawing_controller.pending.as_mut() {
+                pending.preview = Some(first);
+            }
             return;
         }
         let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {

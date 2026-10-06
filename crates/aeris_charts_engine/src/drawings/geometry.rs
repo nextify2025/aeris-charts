@@ -39,6 +39,29 @@ pub(crate) fn ellipse_outline(center: Point, rx: f64, ry: f64, clip: Rect, out: 
     .append_clipped_points(CURVE_TOLERANCE, clip, out);
 }
 
+/// The outline of the closed polygon through `vertices` as one run (a rotated rectangle, a
+/// triangle, a closed polyline): it starts and ends at the midpoint of the first edge of nonzero
+/// length, so the stroke's two butt ends meet collinearly mid-edge instead of notching a corner,
+/// and every corner is a join. Vertices repeating their predecessor are skipped. Nothing when
+/// every vertex coincides.
+pub(crate) fn closed_outline(vertices: &[Point], out: &mut Vec<Point>) {
+    let count = vertices.len();
+    let Some(first) = (0..count).find(|&index| vertices[index] != vertices[(index + 1) % count])
+    else {
+        return;
+    };
+    let start = shape::midpoint(vertices[first], vertices[(first + 1) % count]);
+    out.reserve(count + 2);
+    out.push(start);
+    for step in 1..=count {
+        let vertex = vertices[(first + step) % count];
+        if out.last() != Some(&vertex) {
+            out.push(vertex);
+        }
+    }
+    out.push(start);
+}
+
 /// The bands `drawing` fills between its `levels` (its own or another level list it owns), in
 /// list order, as `(previous level's raw value, level)`: visible levels chain in list order, a
 /// hidden level (or, with `positive_only`, one whose effective value is not positive) breaks the
@@ -136,6 +159,11 @@ pub(crate) enum DrawingBodyGeometry<'a> {
     },
     Arc(ArcGeometry),
     Curve(CurveGeometry),
+    /// A closed polyline (`tool_options.shape.closed`, three vertices or more): the last vertex
+    /// joins the first, and the enclosed region fills by the nonzero rule.
+    Polygon {
+        points: &'a [(f64, f64)],
+    },
     Rectangle {
         left: f64,
         right: f64,
@@ -747,17 +775,61 @@ impl ArcGeometry {
             out,
         );
     }
+
+    /// For each end, the point one caller px from it along the arc's exact tangent, into the arc
+    /// (the direction an end cap points away from).
+    pub(crate) fn end_towards(self) -> [Point; 2] {
+        let travel = self.sweep.signum();
+        let along = |angle: f64, sign: f64| {
+            let (sin, cos) = angle.sin_cos();
+            (
+                self.center.0 + self.radius * cos - sin * travel * sign,
+                self.center.1 + self.radius * sin + cos * travel * sign,
+            )
+        };
+        [along(self.start, 1.0), along(self.start + self.sweep, -1.0)]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurveGeometry {
     pub(crate) points: [(f64, f64); 4],
     pub(crate) cubic: bool,
+    /// Where `extend_left` / `extend_right` continue the start's and the end's tangent to the
+    /// pane edge (`None`: not extended, or the tangent never reaches the pane).
+    pub(crate) extend: [Option<(f64, f64)>; 2],
 }
 
 impl CurveGeometry {
-    /// The exact Bézier point at `t` in `[0, 1]` (the reference its flattening approximates).
-    #[cfg(test)]
+    /// The curve's defining points: start, control(s), end.
+    fn defining(&self) -> &[(f64, f64)] {
+        &self.points[..if self.cubic { 4 } else { 3 }]
+    }
+
+    /// The start and the end point.
+    pub(crate) fn ends(self) -> [Point; 2] {
+        let points = self.defining();
+        [points[0], points[points.len() - 1]]
+    }
+
+    /// For each end, the point its tangent runs toward: the nearest control point distinct from
+    /// it, else the other end (`None` when every point coincides with that end). Tangent
+    /// extensions and end caps follow it.
+    pub(crate) fn end_towards(self) -> [Option<Point>; 2] {
+        let points = self.defining();
+        let [first, last] = self.ends();
+        [
+            points[1..].iter().copied().find(|&point| point != first),
+            points[..points.len() - 1]
+                .iter()
+                .rev()
+                .copied()
+                .find(|&point| point != last),
+        ]
+    }
+
+    /// The exact Bézier point at `t` in `[0, 1]` (the reference its flattening approximates, and
+    /// where the on-curve handles sit).
     pub(crate) fn point(self, t: f64) -> (f64, f64) {
         let u = 1.0 - t;
         let weights = if self.cubic {
@@ -864,6 +936,8 @@ pub(crate) struct DrawingGeometryOptions {
     pub(crate) extend_right: bool,
     /// Speed resistance arcs sweep full circles (`tool_options.fibonacci.full_circles`).
     pub(crate) full_circles: bool,
+    /// A polyline joins its last vertex to its first (`tool_options.shape.closed`).
+    pub(crate) closed: bool,
 }
 
 impl DrawingGeometryOptions {
@@ -879,6 +953,7 @@ impl DrawingGeometryOptions {
             extend_left: drawing.extend_left,
             extend_right: drawing.extend_right,
             full_circles: super::kinds::fibonacci::options(drawing).full_circles,
+            closed: super::kinds::shapes::closed(drawing),
         }
     }
 }
@@ -1076,6 +1151,28 @@ pub(crate) fn segment_extension(
         _ if coincident => (false, false),
         _ => flags,
     }
+}
+
+/// The corners of a rotated rectangle with anchors at `px` (its edge `a → b` and a depth point,
+/// whose distance from the edge's line sets the depth), in order around it: `[a, b, b + o, a + o]`
+/// with `o` the depth offset perpendicular to the edge. `None` for a zero-length edge or fewer
+/// than three anchors.
+pub(crate) fn rotated_rectangle_corners(px: &[Point]) -> Option<[Point; 4]> {
+    let (&a, &b, &handle) = (px.first()?, px.get(1)?, px.get(2)?);
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let norm = dx * dx + dy * dy;
+    if norm <= f64::EPSILON {
+        return None;
+    }
+    let depth = ((handle.0 - a.0) * -dy + (handle.1 - a.1) * dx) / norm;
+    let offset = (-dy * depth, dx * depth);
+    Some([
+        a,
+        b,
+        (b.0 + offset.0, b.1 + offset.1),
+        (a.0 + offset.0, a.1 + offset.1),
+    ])
 }
 
 pub(crate) fn resolve_drawing_geometry<'a>(
@@ -1360,26 +1457,10 @@ pub(crate) fn resolve_drawing_geometry<'a>(
             radius: 7.0 * options.device_scale,
         }),
         DrawingKind::RotatedRectangle => {
-            let a = *px.first()?;
-            let b = *px.get(1)?;
-            let handle = *px.get(2)?;
-            let dx = b.0 - a.0;
-            let dy = b.1 - a.1;
-            let norm = dx * dx + dy * dy;
-            if norm <= f64::EPSILON {
-                DrawingBodyGeometry::Empty
-            } else {
-                let depth = ((handle.0 - a.0) * -dy + (handle.1 - a.1) * dx) / norm;
-                let offset = (-dy * depth, dx * depth);
-                DrawingBodyGeometry::Quad {
-                    corners: [
-                        a,
-                        b,
-                        (b.0 + offset.0, b.1 + offset.1),
-                        (a.0 + offset.0, a.1 + offset.1),
-                    ],
-                }
-            }
+            px.get(2)?;
+            rotated_rectangle_corners(px).map_or(DrawingBodyGeometry::Empty, |corners| {
+                DrawingBodyGeometry::Quad { corners }
+            })
         }
         DrawingKind::Ellipse => {
             let a = *px.first()?;
@@ -1414,7 +1495,7 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         }
         DrawingKind::Curve | DrawingKind::DoubleCurve => {
             let cubic = kind == DrawingKind::DoubleCurve;
-            DrawingBodyGeometry::Curve(CurveGeometry {
+            let mut curve = CurveGeometry {
                 points: [
                     *px.first()?,
                     *px.get(1)?,
@@ -1422,7 +1503,27 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                     if cubic { *px.get(3)? } else { *px.get(2)? },
                 ],
                 cubic,
-            })
+                extend: [None; 2],
+            };
+            // `extend_left`/`extend_right` continue the start's and the end's tangent to the
+            // pane edge.
+            let pane = Rect {
+                left: 0.0,
+                top: pane_top,
+                right: pane_w,
+                bottom: pane_top + pane_h,
+            };
+            let flags = [options.extend_left, options.extend_right];
+            let (towards, ends) = (curve.end_towards(), curve.ends());
+            for (((slot, flag), toward), end) in
+                curve.extend.iter_mut().zip(flags).zip(towards).zip(ends)
+            {
+                if let (true, Some(toward)) = (flag, toward) {
+                    let (_, edge) = shape::extend_segment(toward, end, pane, false, true);
+                    *slot = (edge != end).then_some(edge);
+                }
+            }
+            DrawingBodyGeometry::Curve(curve)
         }
         DrawingKind::Rectangle | DrawingKind::BarsPattern => {
             let (a, b) = (*px.first()?, *px.get(1)?);
@@ -1493,6 +1594,9 @@ pub(crate) fn resolve_drawing_geometry<'a>(
             line_type: LineType::Simple,
             terminal: path_arrow_points(px, options.line_width, options.device_scale),
         },
+        DrawingKind::Polyline if options.closed && px.len() >= 3 => {
+            DrawingBodyGeometry::Polygon { points: px }
+        }
         DrawingKind::Polyline
         | DrawingKind::PatternXabcd
         | DrawingKind::PatternCypher
@@ -1680,7 +1784,8 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 top,
                 bottom,
             },
-            DrawingBodyGeometry::Polyline { points, .. } => points_box(points)?,
+            DrawingBodyGeometry::Polyline { points, .. }
+            | DrawingBodyGeometry::Polygon { points } => points_box(points)?,
             DrawingBodyGeometry::Position(position) => TextBox {
                 left: position.left,
                 right: position.right,

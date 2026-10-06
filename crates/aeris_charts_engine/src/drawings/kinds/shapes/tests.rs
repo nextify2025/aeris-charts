@@ -11,8 +11,8 @@ use super::super::super::DrawingTextLayout;
 use super::ShapeToolOptions;
 use crate::drawings::{resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions};
 use crate::{
-    ChartEngine, DrawingAnchor, DrawingId, DrawingKind, DrawingMagnetMode, DrawingModifiers,
-    DrawingPoint,
+    ChartEngine, DrawingAnchor, DrawingDragPart, DrawingId, DrawingKind, DrawingMagnetMode,
+    DrawingModifiers, DrawingPoint,
 };
 
 const SHAPE_KINDS: [DrawingKind; 9] = [
@@ -945,4 +945,1369 @@ fn dashed_curved_outlines_lower_to_solid_runs() {
             "{kind:?}"
         );
     }
+}
+
+// --- Re-applied fork features (R8): chord fills, tangent extension, caps, closed polylines,
+// --- close-on-click, ellipse bounds handles, rotated-rectangle width handles, on-curve editing,
+// --- and seamless outlines.
+
+fn wash() -> Color {
+    Color::rgba(0x12, 0x34, 0x56, 51)
+}
+
+/// Media px of `point` on the first pane's right price scale.
+fn px(chart: &ChartEngine, point: DrawingPoint) -> Point {
+    chart
+        .drawing_to_px_for(0, crate::DrawingPriceScale::Right, point)
+        .unwrap()
+}
+
+/// The one ink stroke on the first pane.
+fn ink_line(chart: &mut ChartEngine) -> Vec<Point> {
+    let mut lines = polylines(chart, ink());
+    assert_eq!(lines.len(), 1, "one ink stroke");
+    lines.remove(0).0
+}
+
+/// Every band fill of `color` on the first pane as (upper, lower) chains.
+fn fills(chart: &mut ChartEngine, color: Color) -> Vec<(Vec<Point>, Vec<Point>)> {
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    pane.main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::BandFill {
+                upper_first,
+                lower_first,
+                point_count,
+                fill,
+                ..
+            } if *fill == color => Some((
+                pool(&pane.points, *upper_first, *point_count),
+                pool(&pane.points, *lower_first, *point_count),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn close(a: Point, b: Point, tolerance: f64) -> bool {
+    (a.0 - b.0).abs() <= tolerance && (a.1 - b.1).abs() <= tolerance
+}
+
+fn part_at(chart: &ChartEngine, point: Point) -> Option<DrawingDragPart> {
+    chart.hit_test_drawing(point.0, point.1).map(|hit| hit.part)
+}
+
+/// The handle of `id` that drives `part`, in media px.
+fn handle_px(chart: &ChartEngine, id: DrawingId, part: DrawingDragPart) -> Point {
+    chart
+        .drawing_handle_px(chart.drawing(id).unwrap(), part)
+        .unwrap()
+}
+
+/// Anchor handles in the frame: the bordered discs at the handle radius.
+fn handle_centers(chart: &mut ChartEngine) -> Vec<Point> {
+    let frame = chart.build_frame();
+    frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Circle { cx, cy, radius, .. } if (*radius - 5.5).abs() < 1e-3 => {
+                Some((f64::from(*cx), f64::from(*cy)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ink arrowheads (`Prim::BandFill` in the stroke color, a triangle's convex ribbon) on the
+/// first pane, each as its tip (the first point) and its base's midpoint (the second point of
+/// each chain).
+fn arrowheads(chart: &mut ChartEngine) -> Vec<(Point, Point)> {
+    fills(chart, ink())
+        .into_iter()
+        .map(|(upper, lower)| (upper[0], shape::midpoint(upper[1], lower[1])))
+        .collect()
+}
+
+/// An arc fills the circular segment between it and its chord, and a curve the region between it
+/// and its chord (a cubic crossing its chord in both lobes), in the drawing's fill color under the
+/// stroke; the region is a body target only while the drawing is selected.
+#[test]
+fn arcs_and_curves_fill_their_chord_regions() {
+    let mut chart = chart();
+    // Upstream's arc anchors: its start, a point it passes through, its end.
+    let id = add(
+        &mut chart,
+        DrawingKind::Arc,
+        vec![p(10.0, 101.0), p(15.0, 104.0), p(20.0, 101.0)],
+        r##"{"color":"#123456","fill_enabled":true}"##,
+    );
+    let segment = fills(&mut chart, wash());
+    assert_eq!(segment.len(), 1, "the circular segment fills");
+    let (inside, beyond_chord) = (px(&chart, p(15.0, 102.5)), px(&chart, p(15.0, 100.0)));
+    assert!(shape::point_in_ribbon(inside, &segment[0].0, &segment[0].1));
+    assert!(!shape::point_in_ribbon(
+        beyond_chord,
+        &segment[0].0,
+        &segment[0].1
+    ));
+    // The stroke paints over its fill.
+    let frame = chart.build_frame();
+    let position = |wanted: fn(&Prim) -> bool| frame.panes[0].main.iter().position(wanted);
+    let fill_at = position(|prim| matches!(prim, Prim::BandFill { fill, .. } if *fill == wash()));
+    let stroke_at =
+        position(|prim| matches!(prim, Prim::Polyline { color, .. } if *color == ink()));
+    assert!(fill_at.unwrap() < stroke_at.unwrap());
+    assert_eq!(hit(&chart, inside), None, "unselected, the interior pans");
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(hit(&chart, inside), Some(id));
+    assert_eq!(hit(&chart, beyond_chord), None);
+    assert!(chart.drawing_apply_options(id, r#"{"fill_color":"rgba(255, 0, 0, 0.5)"}"#));
+    assert!(fills(&mut chart, wash()).is_empty());
+    assert_eq!(fills(&mut chart, Color::rgba(255, 0, 0, 128)).len(), 1);
+    assert!(chart.drawing_apply_options(id, r#"{"fill_enabled":false}"#));
+    assert!(fills(&mut chart, Color::rgba(255, 0, 0, 128)).is_empty());
+    assert_eq!(hit(&chart, inside), None, "an unfilled interior never hits");
+    chart.remove_drawing(id);
+
+    // A quadratic and its chord bound a convex region.
+    let id = add(
+        &mut chart,
+        DrawingKind::Curve,
+        vec![p(10.0, 101.0), p(15.0, 105.0), p(20.0, 101.0)],
+        r##"{"color":"#123456","fill_enabled":true}"##,
+    );
+    let region = fills(&mut chart, wash());
+    assert_eq!(region.len(), 1);
+    assert!(shape::point_in_ribbon(
+        px(&chart, p(15.0, 102.0)),
+        &region[0].0,
+        &region[0].1
+    ));
+    chart.remove_drawing(id);
+
+    // An S-shaped cubic crosses its chord: both lobes fill (nonzero rule) and hit while selected.
+    let id = add(
+        &mut chart,
+        DrawingKind::DoubleCurve,
+        vec![
+            p(10.0, 102.0),
+            p(14.0, 106.0),
+            p(18.0, 98.0),
+            p(22.0, 102.0),
+        ],
+        r##"{"color":"#123456","fill_enabled":true}"##,
+    );
+    assert_eq!(fills(&mut chart, wash()).len(), 1);
+    let DrawingBodyGeometry::Curve(curve) = body_at(&chart, id, (1.0, 1.0)) else {
+        panic!("a curve body");
+    };
+    let [start, end] = curve.ends();
+    let chord = |t: f64| {
+        (
+            start.0 + (end.0 - start.0) * t,
+            start.1 + (end.1 - start.1) * t,
+        )
+    };
+    let lobe = |t: f64| shape::midpoint(curve.point(t), chord(t));
+    let mirrored = (
+        2.0 * chord(0.25).0 - lobe(0.25).0,
+        2.0 * chord(0.25).1 - lobe(0.25).1,
+    );
+    assert_eq!(hit(&chart, lobe(0.25)), None, "unselected, the lobes pan");
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(hit(&chart, lobe(0.25)), Some(id), "the upper lobe");
+    assert_eq!(hit(&chart, lobe(0.75)), Some(id), "the lower lobe");
+    assert_eq!(hit(&chart, mirrored), None, "beyond the chord");
+}
+
+/// `extend_right` continues a curve's end tangent (toward its control point) to the pane edge
+/// and `extend_left` its start's; the extension is stroke and body target, never fill or cap.
+#[test]
+fn curves_extend_along_their_end_tangents() {
+    let mut chart = chart();
+    let pane = &chart.panes[0];
+    let (pane_top, pane_bottom) = (pane.top, pane.top + pane.height);
+    let on_edge = |point: Point, chart: &ChartEngine| {
+        point.0.abs() < 0.5
+            || (point.0 - chart.pane_w).abs() < 0.5
+            || (point.1 - pane_top).abs() < 0.5
+            || (point.1 - pane_bottom).abs() < 0.5
+    };
+    let collinear = |a: Point, b: Point, c: Point| {
+        let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+        cross.abs() / (c.0 - a.0).hypot(c.1 - a.1) < 1e-2
+    };
+    let id = add(
+        &mut chart,
+        DrawingKind::Curve,
+        vec![p(10.0, 101.0), p(15.0, 105.0), p(20.0, 101.0)],
+        r##"{"color":"#123456","extend_right":true,"fill_enabled":true}"##,
+    );
+    let (a, control, b) = (
+        anchor(&chart, id, 0),
+        anchor(&chart, id, 1),
+        anchor(&chart, id, 2),
+    );
+    let line = ink_line(&mut chart);
+    let edge = *line.last().unwrap();
+    assert!(close(line[0], a, 1e-3), "the start stays");
+    assert!(on_edge(edge, &chart), "{edge:?} on the pane edge");
+    assert!(collinear(control, b, edge));
+    assert!((edge.0 - b.0) * (b.0 - control.0) > 0.0, "beyond the end");
+    // The fill keeps to the curve and its chord.
+    let region = fills(&mut chart, wash());
+    assert!(region[0]
+        .0
+        .iter()
+        .chain(&region[0].1)
+        .all(|point| point.0 <= b.0 + 1e-3));
+    // The extension selects the drawing as its body.
+    let on_extension = shape::midpoint(b, edge);
+    let hit_part = chart.hit_test_drawing(on_extension.0, on_extension.1);
+    assert_eq!(
+        hit_part.map(|hit| (hit.id, hit.part)),
+        Some((id, DrawingDragPart::Body))
+    );
+    // With caps, only the unextended start carries its arrowhead.
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"fill_enabled":false,"stroke_start":"arrow","stroke_end":"arrow"}"#
+    ));
+    let heads = arrowheads(&mut chart);
+    assert_eq!(heads.len(), 1, "only the start carries its arrow");
+    assert!(close(heads[0].0, a, 1e-3));
+    let line = ink_line(&mut chart);
+    assert!(on_edge(*line.last().unwrap(), &chart));
+    chart.remove_drawing(id);
+
+    // A double curve extends from its start away from its first control point.
+    let id = add(
+        &mut chart,
+        DrawingKind::DoubleCurve,
+        vec![
+            p(10.0, 101.0),
+            p(14.0, 105.0),
+            p(18.0, 100.0),
+            p(22.0, 101.0),
+        ],
+        r##"{"color":"#123456","extend_left":true}"##,
+    );
+    let (start, first_control) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+    let line = ink_line(&mut chart);
+    assert!(on_edge(line[0], &chart), "{:?} on the pane edge", line[0]);
+    assert!(close(line[1], start, 1e-3));
+    assert!(collinear(first_control, start, line[0]));
+    assert!(close(*line.last().unwrap(), anchor(&chart, id, 3), 1e-3));
+    // Without the flags nothing reaches past the anchors.
+    assert!(chart.drawing_apply_options(id, r#"{"extend_left":false}"#));
+    assert!(close(ink_line(&mut chart)[0], start, 1e-3));
+}
+
+/// `stroke_start` and `stroke_end` cap an arc's and a curve's ends along their exact end
+/// tangents (owner decision S6): the arrow trims the stroke under it, and the caps are body
+/// targets.
+#[test]
+fn arc_and_curve_end_caps_follow_their_exact_tangents() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::Arc,
+        vec![p(10.0, 101.0), p(15.0, 104.0), p(20.0, 101.0)],
+        r##"{"color":"#123456","width":6,"stroke_start":"circle","stroke_end":"arrow"}"##,
+    );
+    let (start, end) = (anchor(&chart, id, 0), anchor(&chart, id, 2));
+    let DrawingBodyGeometry::Arc(arc) = body_at(&chart, id, (1.0, 1.0)) else {
+        panic!("an arc body");
+    };
+    let heads = arrowheads(&mut chart);
+    assert_eq!(heads.len(), 1);
+    let (tip, base) = heads[0];
+    assert!(close(tip, end, 1e-3), "{tip:?} at {end:?}");
+    // The arrow's axis is the tangent: perpendicular to the radius at the end, into the arc.
+    let axis = (base.0 - tip.0, base.1 - tip.1);
+    let length = axis.0.hypot(axis.1);
+    let radial = (end.0 - arc.center.0, end.1 - arc.center.1);
+    let radial_length = radial.0.hypot(radial.1);
+    assert!((axis.0 * radial.0 + axis.1 * radial.1).abs() / (length * radial_length) < 1e-4);
+    assert!((length - 2.0 * super::super::super::parts::cap_radius(6.0)).abs() < 1e-3);
+    let line = ink_line(&mut chart);
+    let trimmed = shape::distance_to_polyline(end, &line);
+    assert!(
+        (trimmed - 6.0).abs() < 0.05,
+        "trimmed by one width: {trimmed}"
+    );
+    let frame = chart.build_frame();
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(
+        prim,
+        Prim::Circle { cx, cy, fill, .. }
+            if *fill == ink() && close((f64::from(*cx), f64::from(*cy)), start, 1e-3)
+    )));
+    // A point inside the arrowhead but beyond the stroke's reach (outside the circle).
+    let (ux, uy) = (axis.0 / length, axis.1 / length);
+    let (rx, ry) = (radial.0 / radial_length, radial.1 / radial_length);
+    let probe = (tip.0 + ux * 18.0 + rx * 7.5, tip.1 + uy * 18.0 + ry * 7.5);
+    assert!(shape::distance_to_polyline(probe, &line) > 6.0 / 2.0 + 3.0);
+    assert_eq!(
+        hit(&chart, probe),
+        Some(id),
+        "the arrowhead is a body target"
+    );
+    assert!(chart.drawing_apply_options(id, r#"{"stroke_end":"none"}"#));
+    assert_eq!(hit(&chart, probe), None);
+    assert!(arrowheads(&mut chart).is_empty());
+    chart.remove_drawing(id);
+
+    // A curve's end cap points along its control point's tangent.
+    for (kind, points) in [
+        (
+            DrawingKind::Curve,
+            vec![p(10.0, 101.0), p(15.0, 105.0), p(20.0, 101.0)],
+        ),
+        (
+            DrawingKind::DoubleCurve,
+            vec![
+                p(10.0, 101.0),
+                p(14.0, 105.0),
+                p(18.0, 100.0),
+                p(22.0, 101.0),
+            ],
+        ),
+    ] {
+        let last = points.len() - 1;
+        let id = add(
+            &mut chart,
+            kind,
+            points,
+            r##"{"color":"#123456","width":2,"stroke_end":"arrow"}"##,
+        );
+        let (end, control) = (anchor(&chart, id, last), anchor(&chart, id, last - 1));
+        let heads = arrowheads(&mut chart);
+        assert_eq!(heads.len(), 1, "{kind:?}");
+        let (tip, base) = heads[0];
+        assert!(close(tip, end, 1e-3), "{kind:?}");
+        let axis = (base.0 - tip.0, base.1 - tip.1);
+        let toward = (control.0 - end.0, control.1 - end.1);
+        let cross = (axis.0 * toward.1 - axis.1 * toward.0) / toward.0.hypot(toward.1);
+        assert!(cross.abs() < 1e-3, "{kind:?}: {cross}");
+        assert!(axis.0 * toward.0 + axis.1 * toward.1 > 0.0, "{kind:?}");
+        chart.remove_drawing(id);
+    }
+}
+
+/// A closed polyline joins its last vertex to its first as one outline run from mid-edge, fills
+/// the enclosed region by the nonzero rule while `fill_enabled`, and hits inside only while
+/// selected; opening it again removes both, in one undo step.
+#[test]
+fn closed_polylines_fill_by_the_nonzero_rule() {
+    let mut chart = chart();
+    // An L: the notch at the upper right is outside.
+    let l_shape = vec![
+        p(10.0, 101.0),
+        p(20.0, 101.0),
+        p(20.0, 103.0),
+        p(15.0, 103.0),
+        p(15.0, 105.0),
+        p(10.0, 105.0),
+    ];
+    let id = add(
+        &mut chart,
+        DrawingKind::Polyline,
+        l_shape.clone(),
+        r##"{"color":"#123456","fill_enabled":true,"tool_options":{"shape":{"closed":true}}}"##,
+    );
+    let outline = ink_line(&mut chart);
+    assert_eq!(
+        outline.len(),
+        8,
+        "every vertex plus the mid-edge seam twice"
+    );
+    assert_eq!(outline[0], outline[7]);
+    assert!(close(
+        outline[0],
+        shape::midpoint(px(&chart, l_shape[0]), px(&chart, l_shape[1])),
+        1e-3
+    ));
+    assert_eq!(fills(&mut chart, wash()).len(), 1);
+    let (lower_arm, upper_arm, notch) = (
+        px(&chart, p(12.5, 102.0)),
+        px(&chart, p(12.5, 104.0)),
+        px(&chart, p(17.5, 104.0)),
+    );
+    assert_eq!(
+        hit(&chart, lower_arm),
+        None,
+        "unselected, the interior pans"
+    );
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(hit(&chart, lower_arm), Some(id));
+    assert_eq!(hit(&chart, upper_arm), Some(id));
+    assert_eq!(hit(&chart, notch), None, "the notch");
+    // The closing edge is a body target.
+    chart.set_selected_drawing(None);
+    let closing = shape::midpoint(px(&chart, l_shape[5]), px(&chart, l_shape[0]));
+    assert_eq!(hit(&chart, closing), Some(id));
+    // Opening it removes the fill and the closing edge.
+    assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"shape":{"closed":false}}}"#));
+    assert!(fills(&mut chart, wash()).is_empty());
+    assert_eq!(ink_line(&mut chart).len(), 6);
+    assert_eq!(hit(&chart, closing), None);
+    assert!(chart.undo_drawing());
+    assert_eq!(fills(&mut chart, wash()).len(), 1);
+    chart.remove_drawing(id);
+
+    // A new polyline keeps upstream's unfilled default (owner decision S1): closed, it paints its
+    // closed outline only.
+    add(
+        &mut chart,
+        DrawingKind::Polyline,
+        l_shape,
+        r##"{"color":"#123456","tool_options":{"shape":{"closed":true}}}"##,
+    );
+    assert!(fills(&mut chart, wash()).is_empty());
+    assert_eq!(ink_line(&mut chart).len(), 8);
+}
+
+/// `count` anchors of a convex polygon (an ellipse in logical and price space, so a convex one
+/// on screen) around the middle of the test data.
+fn convex_anchors(count: usize) -> Vec<DrawingPoint> {
+    (0..count)
+        .map(|index| {
+            let angle = index as f64 * std::f64::consts::TAU / count as f64;
+            p(20.0 + 8.0 * angle.cos(), 103.0 + 2.0 * angle.sin())
+        })
+        .collect()
+}
+
+/// The fill is bounded work: a closed polyline of more than `MAX_FILL_VERTICES` vertices paints
+/// its outline only and has no interior target, while its stroke still selects it.
+#[test]
+fn closed_polylines_beyond_the_fill_vertex_bound_keep_only_their_outline() {
+    let closed =
+        r##"{"color":"#123456","fill_enabled":true,"tool_options":{"shape":{"closed":true}}}"##;
+    let middle = p(20.0, 103.0);
+
+    let mut within = chart();
+    let count = shape::MAX_FILL_VERTICES;
+    let id = add(
+        &mut within,
+        DrawingKind::Polyline,
+        convex_anchors(count),
+        closed,
+    );
+    assert_eq!(fills(&mut within, wash()).len(), 1);
+    assert_eq!(ink_line(&mut within).len(), count + 2);
+    within.set_selected_drawing(Some(id));
+    assert_eq!(hit(&within, px(&within, middle)), Some(id));
+
+    let mut beyond = chart();
+    let count = shape::MAX_FILL_VERTICES + 1;
+    let id = add(
+        &mut beyond,
+        DrawingKind::Polyline,
+        convex_anchors(count),
+        closed,
+    );
+    assert!(fills(&mut beyond, wash()).is_empty());
+    assert_eq!(ink_line(&mut beyond).len(), count + 2, "the outline stays");
+    beyond.set_selected_drawing(Some(id));
+    assert_eq!(
+        hit(&beyond, px(&beyond, middle)),
+        None,
+        "no interior target"
+    );
+    // Unselected, only the body answers: the stroke at a vertex and mid-edge selects it.
+    let anchors = convex_anchors(count);
+    let vertex = px(&beyond, anchors[0]);
+    let mid_edge = shape::midpoint(px(&beyond, anchors[100]), px(&beyond, anchors[101]));
+    beyond.set_selected_drawing(None);
+    for point in [vertex, mid_edge] {
+        let stroke = beyond
+            .hit_test_drawing(point.0, point.1)
+            .expect("the stroke still selects it");
+        assert_eq!((stroke.id, stroke.part), (id, DrawingDragPart::Body));
+    }
+}
+
+/// A closed polyline paints no caps, and keeps them stored for reopening it.
+#[test]
+fn closed_polylines_paint_no_caps_and_keep_them_stored() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::Polyline,
+        vec![p(10.0, 101.0), p(14.0, 104.0), p(20.0, 102.0)],
+        r##"{"color":"#123456","stroke_end":"arrow","stroke_start":"circle"}"##,
+    );
+    let has_caps = |chart: &mut ChartEngine| {
+        let frame = chart.build_frame();
+        frame.panes[0].main.iter().any(|prim| {
+            matches!(prim, Prim::Circle { fill, .. } if *fill == ink())
+                || matches!(prim, Prim::Triangle { color, .. } if *color == ink())
+        })
+    };
+    assert!(has_caps(&mut chart), "an open polyline caps its ends");
+    assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"shape":{"closed":true}}}"#));
+    assert!(!has_caps(&mut chart));
+    assert_eq!(
+        chart.drawing(id).unwrap().stroke_end,
+        crate::DrawingLineCap::Arrow,
+        "the cap setting is kept for reopening"
+    );
+}
+
+/// The schema lists `tool_options.shape.closed` for the polyline only.
+#[test]
+fn schema_lists_the_closed_flag_for_polylines_only() {
+    let rows = |kind| {
+        crate::drawing_property_schema(kind)
+            .properties
+            .into_iter()
+            .filter(|property| property.name.starts_with("tool_options.shape."))
+            .map(|property| (property.name, property.default))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(DrawingKind::Polyline),
+        [(
+            "tool_options.shape.closed".to_string(),
+            serde_json::json!(false)
+        )]
+    );
+    for kind in SHAPE_KINDS
+        .into_iter()
+        .chain([DrawingKind::Path, DrawingKind::PatternXabcd])
+        .filter(|&kind| kind != DrawingKind::Polyline)
+    {
+        assert!(rows(kind).is_empty(), "{kind:?}");
+    }
+}
+
+/// Clicking the first vertex of a polyline once three are placed commits it closed and disarms
+/// the tool in one undo step (owner decision S2); hovering there closes the preview onto it.
+#[test]
+fn clicking_the_first_vertex_closes_a_polyline() {
+    let mut chart = chart();
+    let modifiers = DrawingModifiers::default();
+    let vertices = [(200.0, 250.0), (300.0, 150.0), (380.0, 260.0)];
+    let place = |chart: &mut ChartEngine, kind: DrawingKind| {
+        assert!(chart.set_drawing_tool(
+            Some(kind),
+            Some(r##"{"color":"#123456","fill_enabled":true}"##),
+            None
+        ));
+        for (x, y) in vertices {
+            assert!(chart
+                .drawing_tool_activate(x, y, modifiers)
+                .created
+                .is_none());
+        }
+    };
+    let near_first = (vertices[0].0 + 3.0, vertices[0].1 - 2.0);
+
+    place(&mut chart, DrawingKind::Polyline);
+    chart.drawing_tool_pointer_move(near_first.0, near_first.1, modifiers, false);
+    let first = chart.pending_drawing().unwrap().drawing.points[0];
+    assert_eq!(chart.pending_drawing().unwrap().preview, Some(first));
+    let id = chart
+        .drawing_tool_activate(near_first.0, near_first.1, modifiers)
+        .created
+        .expect("the closing click commits");
+    let drawing = chart.drawing(id).unwrap();
+    assert_eq!(drawing.points.len(), 3);
+    assert!(drawing.tool_options.shape.unwrap().closed);
+    assert_eq!(chart.active_drawing_tool(), None);
+    assert_eq!(chart.selected_drawing(), Some(id));
+    assert_eq!(fills(&mut chart, wash()).len(), 1);
+    assert!(chart.undo_drawing());
+    assert!(chart.drawings().is_empty());
+
+    // Two vertices enclose nothing: the first vertex is no closing target yet.
+    assert!(chart.set_drawing_tool(Some(DrawingKind::Polyline), None, None));
+    chart.drawing_tool_activate(vertices[0].0, vertices[0].1, modifiers);
+    chart.drawing_tool_activate(vertices[1].0, vertices[1].1, modifiers);
+    chart.drawing_tool_pointer_move(near_first.0, near_first.1, modifiers, false);
+    let first = chart.pending_drawing().unwrap().drawing.points[0];
+    assert_ne!(chart.pending_drawing().unwrap().preview, Some(first));
+    chart.cancel_drawing_tool();
+
+    // Enter still finishes open, and Escape still cancels.
+    place(&mut chart, DrawingKind::Polyline);
+    let id = chart.drawing_tool_finish().created.unwrap();
+    assert!(
+        !chart
+            .drawing(id)
+            .unwrap()
+            .tool_options
+            .shape
+            .unwrap_or_default()
+            .closed
+    );
+    place(&mut chart, DrawingKind::Polyline);
+    chart.cancel_drawing_tool();
+    assert_eq!(chart.drawings().len(), 1);
+
+    // The path has no close: a click on its first vertex places another vertex.
+    place(&mut chart, DrawingKind::Path);
+    assert!(chart
+        .drawing_tool_activate(near_first.0, near_first.1, modifiers)
+        .created
+        .is_none());
+    let id = chart.drawing_tool_finish().created.unwrap();
+    assert_eq!(chart.drawing(id).unwrap().points.len(), 4);
+}
+
+/// A closed polyline template previews its fill while vertices are placed and commits closed.
+#[test]
+fn closed_polyline_templates_preview_their_fill() {
+    let mut chart = chart();
+    let modifiers = DrawingModifiers::default();
+    assert!(chart.set_drawing_tool(
+        Some(DrawingKind::Polyline),
+        Some(
+            r##"{"color":"#123456","fill_enabled":true,"tool_options":{"shape":{"closed":true}}}"##
+        ),
+        None
+    ));
+    chart.drawing_tool_activate(200.0, 250.0, modifiers);
+    chart.drawing_tool_activate(300.0, 150.0, modifiers);
+    chart.drawing_tool_pointer_move(380.0, 260.0, modifiers, false);
+    assert_eq!(fills(&mut chart, wash()).len(), 1);
+    chart.drawing_tool_activate(380.0, 260.0, modifiers);
+    let id = chart.drawing_tool_finish().created.unwrap();
+    let drawing = chart.drawing(id).unwrap();
+    assert_eq!(drawing.points.len(), 3);
+    assert!(drawing.tool_options.shape.unwrap().closed);
+}
+
+/// An ellipse edits with the rectangle's eight bounds handles of its box, and Shift squares the
+/// box into a circle while placing and dragging (owner decision S3).
+#[test]
+fn ellipses_edit_with_the_rectangle_bounds_handles() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::Ellipse,
+        points_for(DrawingKind::Ellipse),
+        "{}",
+    );
+    assert_eq!(chart.drawing_handle_count(id), Some(8));
+    chart.set_selected_drawing(Some(id));
+    let before = chart.drawing(id).unwrap().points.clone();
+    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+    let bottom_right = (a.0.max(b.0), a.1.max(b.1));
+    assert_eq!(
+        part_at(&chart, bottom_right),
+        Some(DrawingDragPart::Anchor(4))
+    );
+    assert!(chart.drawing_drag_start_at(bottom_right.0, bottom_right.1));
+    chart.drawing_drag_to(
+        bottom_right.0 + 30.0,
+        bottom_right.1 + 5.0,
+        DrawingModifiers {
+            magnet: false,
+            straighten: true,
+        },
+    );
+    chart.drawing_drag_end();
+    let (a2, b2) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+    assert!(
+        ((b2.0 - a2.0).abs() - (b2.1 - a2.1).abs()).abs() < 1e-3,
+        "{a2:?} {b2:?}"
+    );
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+    // The top edge's midpoint moves the top edge only.
+    let top = (a.0.min(b.0) + (a.0 - b.0).abs() / 2.0, a.1.min(b.1));
+    assert_eq!(part_at(&chart, top), Some(DrawingDragPart::Anchor(1)));
+    assert!(chart.drawing_drag_start_at(top.0, top.1));
+    chart.drawing_drag_to(top.0 + 17.0, top.1 - 20.0, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    let (a3, b3) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+    assert!(close(
+        (a3.0.min(b3.0), a3.0.max(b3.0)),
+        (a.0.min(b.0), a.0.max(b.0)),
+        1e-6
+    ));
+    assert!((a3.1.min(b3.1) - (top.1 - 20.0)).abs() < 1e-6);
+    assert!((a3.1.max(b3.1) - a.1.max(b.1)).abs() < 1e-6);
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+
+    // Shift on the second placement click squares the box.
+    let modifiers = DrawingModifiers {
+        magnet: false,
+        straighten: true,
+    };
+    assert!(chart.set_drawing_tool(Some(DrawingKind::Ellipse), None, None));
+    chart.drawing_tool_activate(200.0, 250.0, modifiers);
+    let id = chart
+        .drawing_tool_activate(330.0, 290.0, modifiers)
+        .created
+        .unwrap();
+    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+    assert!(((b.0 - a.0).abs() - (b.1 - a.1).abs()).abs() < 1e-3);
+    assert!(((b.0 - a.0).abs() - 130.0).abs() < 1e-3);
+}
+
+/// The rotated rectangle's on-screen depth: its depth point's distance from the edge's line.
+fn depth(chart: &ChartEngine, id: DrawingId) -> f64 {
+    let (a, b, c) = (
+        anchor(chart, id, 0),
+        anchor(chart, id, 1),
+        anchor(chart, id, 2),
+    );
+    let normal = shape::segment_normal(a, b).unwrap();
+    ((c.0 - a.0) * normal.0 + (c.1 - a.1) * normal.1).abs()
+}
+
+/// The rotated rectangle's third handle sits on its far side's midpoint and a width handle on
+/// the near side's; dragging either changes only the width, and an edge corner drag keeps the
+/// on-screen width (owner decision S4, the width handles only).
+#[test]
+fn rotated_rectangle_width_handles_sit_on_its_long_sides() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RotatedRectangle,
+        points_for(DrawingKind::RotatedRectangle),
+        "{}",
+    );
+    let before = chart.drawing(id).unwrap().points.clone();
+    chart.set_selected_drawing(Some(id));
+    let (a, b, c) = (
+        anchor(&chart, id, 0),
+        anchor(&chart, id, 1),
+        anchor(&chart, id, 2),
+    );
+    let normal = shape::segment_normal(a, b).unwrap();
+    let offset = (c.0 - a.0) * normal.0 + (c.1 - a.1) * normal.1;
+    let middle = shape::midpoint(a, b);
+    let far = (middle.0 + normal.0 * offset, middle.1 + normal.1 * offset);
+    assert_eq!(chart.drawing_handle_count(id), Some(4));
+    assert!(
+        !close(c, far, 6.5),
+        "the fixture's depth point is off the midpoint"
+    );
+    assert_eq!(part_at(&chart, far), Some(DrawingDragPart::Anchor(2)));
+    assert_eq!(part_at(&chart, middle), Some(DrawingDragPart::Handle(0)));
+    assert_ne!(part_at(&chart, c), Some(DrawingDragPart::Anchor(2)));
+
+    // Pulling the far handle 15 px outward, with 9 px of jitter along the side, widens it by
+    // exactly 15 px in one undo step, keeping the edge.
+    let out = offset.signum();
+    assert!(chart.drawing_drag_start_at(far.0, far.1));
+    chart.drawing_drag_to(
+        far.0 + normal.0 * 15.0 * out + normal.1 * 9.0,
+        far.1 + normal.1 * 15.0 * out - normal.0 * 9.0,
+        DrawingModifiers::default(),
+    );
+    chart.drawing_drag_end();
+    assert!((depth(&chart, id) - (offset.abs() + 15.0)).abs() < 1e-3);
+    assert!(close(anchor(&chart, id, 0), a, 1e-9) && close(anchor(&chart, id, 1), b, 1e-9));
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+
+    // The near side's handle narrows the rectangle from its side; the far side stays.
+    assert!(chart.drawing_drag_start_at(middle.0, middle.1));
+    chart.drawing_drag_to(
+        middle.0 + normal.0 * 10.0 * out,
+        middle.1 + normal.1 * 10.0 * out,
+        DrawingModifiers::default(),
+    );
+    chart.drawing_drag_end();
+    assert!((depth(&chart, id) - (offset.abs() - 10.0)).abs() < 1e-3);
+    let far_side = |chart: &ChartEngine| {
+        let (a, b, c) = (
+            anchor(chart, id, 0),
+            anchor(chart, id, 1),
+            anchor(chart, id, 2),
+        );
+        let normal = shape::segment_normal(a, b).unwrap();
+        let offset = (c.0 - a.0) * normal.0 + (c.1 - a.1) * normal.1;
+        (a.0 + normal.0 * offset, a.1 + normal.1 * offset)
+    };
+    assert!(close(
+        far_side(&chart),
+        (a.0 + normal.0 * offset, a.1 + normal.1 * offset),
+        1e-3
+    ));
+    assert_eq!(chart.drawing(id).unwrap().points[2], before[2]);
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+
+    // A quarter turn of the edge about its first corner keeps the width, also through a
+    // zero-length edge on the way.
+    let quarter = (a.0 - (b.1 - a.1), a.1 + (b.0 - a.0));
+    assert!(chart.drawing_drag_start_at(b.0, b.1));
+    chart.drawing_drag_to(a.0, a.1, DrawingModifiers::default());
+    chart.drawing_drag_to(quarter.0, quarter.1, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    assert!(close(anchor(&chart, id, 1), quarter, 1e-3));
+    assert!((depth(&chart, id) - offset.abs()).abs() < 1e-3);
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+
+    // Keyboard: the far handle (third) and the width handle (fourth) nudge only the width.
+    assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(2)));
+    let widened = (offset + normal.1 * -10.0).abs();
+    assert!((depth(&chart, id) - widened).abs() < 1e-3);
+    assert!(close(anchor(&chart, id, 0), a, 1e-9));
+    // The same step on the near side moves the edge with it: the width is back.
+    assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(3)));
+    assert!((depth(&chart, id) - offset.abs()).abs() < 1e-3);
+    let shifted = (
+        a.0 - normal.0 * normal.1 * 10.0,
+        a.1 - normal.1 * normal.1 * 10.0,
+    );
+    assert!(close(anchor(&chart, id, 0), shifted, 1e-3));
+    assert!(chart.undo_drawing() && chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+
+    // The magnet snaps the far handle like an anchor: the far side then passes through the bar
+    // value under the pointer.
+    chart.set_drawing_magnet_mode(DrawingMagnetMode::Strong);
+    let to = (far.0 + 4.0, far.1 - 20.0);
+    assert!(chart.drawing_drag_start_at(far.0, far.1));
+    chart.drawing_drag_to(to.0, to.1, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    chart.set_drawing_magnet_mode(DrawingMagnetMode::Off);
+    let bar = chart
+        .drawing_from_px(0, to.0, to.1)
+        .unwrap()
+        .logical
+        .round();
+    let snapped = px(&chart, p(bar, 100.0 + (bar as usize % 7) as f64));
+    let (a, b, c) = (
+        anchor(&chart, id, 0),
+        anchor(&chart, id, 1),
+        anchor(&chart, id, 2),
+    );
+    let normal = shape::segment_normal(a, b).unwrap();
+    let across = |point: Point| (point.0 - a.0) * normal.0 + (point.1 - a.1) * normal.1;
+    assert!(
+        (across(snapped) - across(c)).abs() < 1e-3,
+        "{snapped:?} {c:?}"
+    );
+}
+
+/// Curves are placed and edited through points on the curve (owner decision S5): a curve's
+/// clicks are its start, its end, and its point at t = 1/2 (a double curve's at 1/3 and 2/3),
+/// stored as upstream's control points; its handles sit on the curve. An arc is placed by its
+/// ends first, then a point it passes through.
+#[test]
+fn curves_place_and_edit_through_points_on_the_curve() {
+    let mut chart = chart();
+    let modifiers = DrawingModifiers::default();
+    let place = |chart: &mut ChartEngine, kind, clicks: &[Point]| {
+        assert!(chart.set_drawing_tool(Some(kind), Some(r##"{"color":"#123456"}"##), None));
+        let mut created = None;
+        for &(x, y) in clicks {
+            created = chart.drawing_tool_activate(x, y, modifiers).created;
+        }
+        created.expect("committed")
+    };
+    let cases: [(DrawingKind, &[Point]); 3] = [
+        (
+            DrawingKind::Arc,
+            &[(200.0, 250.0), (420.0, 260.0), (300.0, 150.0)],
+        ),
+        (
+            DrawingKind::Curve,
+            &[(200.0, 250.0), (420.0, 260.0), (300.0, 150.0)],
+        ),
+        (
+            DrawingKind::DoubleCurve,
+            &[
+                (200.0, 250.0),
+                (420.0, 260.0),
+                (270.0, 150.0),
+                (350.0, 320.0),
+            ],
+        ),
+    ];
+    for (kind, clicks) in cases {
+        let id = place(&mut chart, kind, clicks);
+        let line = ink_line(&mut chart);
+        for &click in clicks {
+            let distance = shape::distance_to_polyline(click, &line);
+            assert!(
+                distance <= 0.26,
+                "{kind:?} passes through {click:?} ({distance})"
+            );
+        }
+        let last = clicks.len() - 1;
+        assert!(
+            close(anchor(&chart, id, 0), clicks[0], 1e-6),
+            "{kind:?} starts"
+        );
+        assert!(
+            close(anchor(&chart, id, last), clicks[1], 1e-6),
+            "{kind:?} ends"
+        );
+        if kind == DrawingKind::Arc {
+            assert!(
+                close(anchor(&chart, id, 1), clicks[2], 1e-6),
+                "through the third click"
+            );
+        }
+        if kind == DrawingKind::Curve {
+            let control = super::quadratic_through(clicks[0], clicks[1], clicks[2]);
+            assert!(
+                close(anchor(&chart, id, 1), control, 1e-6),
+                "the control point"
+            );
+        }
+        chart.remove_drawing(id);
+    }
+
+    // A curve's handles: its ends and its point at t = 1/2, never the control point.
+    let id = add(
+        &mut chart,
+        DrawingKind::Curve,
+        vec![p(10.0, 101.0), p(15.0, 105.0), p(20.0, 101.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    chart.set_selected_drawing(Some(id));
+    let before = chart.drawing(id).unwrap().points.clone();
+    let (a, control, b) = (
+        anchor(&chart, id, 0),
+        anchor(&chart, id, 1),
+        anchor(&chart, id, 2),
+    );
+    let middle = (
+        (a.0 + 2.0 * control.0 + b.0) / 4.0,
+        (a.1 + 2.0 * control.1 + b.1) / 4.0,
+    );
+    assert_eq!(chart.drawing_handle_count(id), Some(3));
+    assert_eq!(part_at(&chart, middle), Some(DrawingDragPart::Handle(0)));
+    assert_eq!(
+        part_at(&chart, control),
+        None,
+        "the control point is no handle"
+    );
+    // Dragging it makes the curve pass through the pointer with its ends fixed, in one step.
+    let to = (middle.0 + 25.0, middle.1 - 30.0);
+    assert!(chart.drawing_drag_start_at(middle.0, middle.1));
+    chart.drawing_drag_to(to.0, to.1, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    assert!(close(
+        handle_px(&chart, id, DrawingDragPart::Handle(0)),
+        to,
+        1e-6
+    ));
+    assert!(close(anchor(&chart, id, 0), a, 1e-9) && close(anchor(&chart, id, 2), b, 1e-9));
+    assert!(chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+    // Dragging an end keeps the on-curve point.
+    assert!(chart.drawing_drag_start_at(a.0, a.1));
+    chart.drawing_drag_to(a.0 - 40.0, a.1 + 20.0, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    assert!(close(anchor(&chart, id, 0), (a.0 - 40.0, a.1 + 20.0), 1e-6));
+    assert!(close(
+        handle_px(&chart, id, DrawingDragPart::Handle(0)),
+        middle,
+        1e-6
+    ));
+    assert!(chart.undo_drawing());
+    // Keyboard: the second handle is the on-curve one.
+    assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(1)));
+    assert!(close(
+        handle_px(&chart, id, DrawingDragPart::Handle(0)),
+        (middle.0, middle.1 - 10.0),
+        1e-6
+    ));
+    assert!(chart.undo_drawing());
+    chart.remove_drawing(id);
+
+    // A double curve's handles at t = 1/3 and 2/3; dragging one keeps the other on the curve.
+    let id = add(
+        &mut chart,
+        DrawingKind::DoubleCurve,
+        vec![
+            p(10.0, 101.0),
+            p(14.0, 105.0),
+            p(18.0, 100.0),
+            p(22.0, 101.0),
+        ],
+        r##"{"color":"#123456"}"##,
+    );
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(chart.drawing_handle_count(id), Some(4));
+    let DrawingBodyGeometry::Curve(curve) = body_at(&chart, id, (1.0, 1.0)) else {
+        panic!("a curve body");
+    };
+    let (third, two_thirds) = (curve.point(1.0 / 3.0), curve.point(2.0 / 3.0));
+    assert_eq!(part_at(&chart, third), Some(DrawingDragPart::Handle(0)));
+    assert_eq!(
+        part_at(&chart, two_thirds),
+        Some(DrawingDragPart::Handle(1))
+    );
+    let to = (two_thirds.0 + 10.0, two_thirds.1 + 35.0);
+    assert!(chart.drawing_drag_start_at(two_thirds.0, two_thirds.1));
+    chart.drawing_drag_to(to.0, to.1, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    assert!(close(
+        handle_px(&chart, id, DrawingDragPart::Handle(1)),
+        to,
+        1e-6
+    ));
+    assert!(close(
+        handle_px(&chart, id, DrawingDragPart::Handle(0)),
+        third,
+        1e-6
+    ));
+    assert!(close(anchor(&chart, id, 3), curve.ends()[1], 1e-9));
+    assert!(chart.undo_drawing());
+    // Keyboard: the second and third handles are the on-curve ones, each nudge one undo step.
+    let before = chart.drawing(id).unwrap().points.clone();
+    let ends = (anchor(&chart, id, 0), anchor(&chart, id, 3));
+    for (index, moved, kept) in [
+        (1, DrawingDragPart::Handle(0), DrawingDragPart::Handle(1)),
+        (2, DrawingDragPart::Handle(1), DrawingDragPart::Handle(0)),
+    ] {
+        let (from, other) = (handle_px(&chart, id, moved), handle_px(&chart, id, kept));
+        assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(index)));
+        assert!(close(
+            handle_px(&chart, id, moved),
+            (from.0, from.1 - 10.0),
+            1e-6
+        ));
+        assert!(close(handle_px(&chart, id, kept), other, 1e-6));
+        assert!(close(anchor(&chart, id, 0), ends.0, 1e-9));
+        assert!(close(anchor(&chart, id, 3), ends.1, 1e-9));
+        assert!(chart.undo_drawing());
+        assert_eq!(
+            chart.drawing(id).unwrap().points,
+            before,
+            "keyboard {index}"
+        );
+    }
+}
+
+/// While a through-point tool is placed, the preview resolves the anchors its clicks will store
+/// (the curve bends through the pointer) and paints its handle discs on the clicks placed so far.
+#[test]
+fn through_point_previews_bend_through_the_pointer_with_discs_on_the_clicks() {
+    let mut chart = chart();
+    let modifiers = DrawingModifiers::default();
+    for kind in [
+        DrawingKind::Arc,
+        DrawingKind::Curve,
+        DrawingKind::DoubleCurve,
+    ] {
+        assert!(chart.set_drawing_tool(Some(kind), Some(r##"{"color":"#123456"}"##), None));
+        chart.drawing_tool_activate(200.0, 250.0, modifiers);
+        // Until only the last click remains, a guide runs from the placed clicks to the pointer.
+        chart.drawing_tool_pointer_move(400.0, 250.0, modifiers, false);
+        let guide = ink_line(&mut chart);
+        assert!(close(guide[0], (200.0, 250.0), 1e-3) && close(guide[1], (400.0, 250.0), 1e-3));
+        chart.drawing_tool_activate(400.0, 250.0, modifiers);
+        let mut placed = vec![(200.0, 250.0), (400.0, 250.0)];
+        if kind == DrawingKind::DoubleCurve {
+            chart.drawing_tool_pointer_move(260.0, 180.0, modifiers, false);
+            assert_eq!(
+                ink_line(&mut chart),
+                vec![(200.0, 250.0), (400.0, 250.0), (260.0, 180.0)],
+                "the guide through the ends and the pointer"
+            );
+            chart.drawing_tool_activate(260.0, 180.0, modifiers);
+            placed.push((260.0, 180.0));
+        }
+        let pointer = (330.0, 300.0);
+        chart.drawing_tool_pointer_move(pointer.0, pointer.1, modifiers, false);
+        let preview = ink_line(&mut chart);
+        assert!(preview.len() > 8, "{kind:?} bends");
+        for point in placed.iter().chain([&pointer]) {
+            assert!(
+                shape::distance_to_polyline(*point, &preview) < 0.3,
+                "{kind:?} passes through {point:?}"
+            );
+        }
+        assert_eq!(
+            handle_centers(&mut chart),
+            placed,
+            "{kind:?} discs on the clicks"
+        );
+        assert!(chart.set_drawing_tool(None, None, None));
+        assert!(polylines(&mut chart, ink()).is_empty());
+    }
+}
+
+/// The rotated rectangle's and the triangle's outlines are one seamless run from mid-edge
+/// (owner decision S7); the projection keeps upstream's triangle edges.
+#[test]
+fn rotated_rectangles_and_triangles_outline_as_one_seamless_run() {
+    for (kind, runs, points) in [
+        (DrawingKind::RotatedRectangle, 1, 6),
+        (DrawingKind::Triangle, 1, 5),
+    ] {
+        let mut chart = chart();
+        let id = add(
+            &mut chart,
+            kind,
+            points_for(kind),
+            r##"{"color":"#123456","width":3}"##,
+        );
+        let strokes = polylines(&mut chart, ink());
+        assert_eq!(strokes.len(), runs, "{kind:?}");
+        let outline = &strokes[0].0;
+        assert_eq!(outline.len(), points, "{kind:?}");
+        assert_eq!(outline[0], outline[points - 1]);
+        let corner = anchor(&chart, id, 0);
+        let next = anchor(&chart, id, 1);
+        assert!(
+            close(outline[0], shape::midpoint(corner, next), 1e-3),
+            "{kind:?} starts mid-edge"
+        );
+    }
+    let mut chart = chart();
+    add(
+        &mut chart,
+        DrawingKind::Projection,
+        vec![p(10.0, 101.0), p(20.0, 104.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    assert!(polylines(&mut chart, ink())
+        .iter()
+        .all(|(line, _)| line.len() == 2));
+}
+
+/// The culled hit path agrees with brute force for the re-applied options: caps reaching past the
+/// anchors, tangent extensions to the pane edge, chord fills and closed polylines, selected.
+#[test]
+fn indexed_hit_testing_matches_brute_force_with_the_shape_options() {
+    let mut chart = chart();
+    // Wide caps reach past the anchors' culling pad (the decoration extent covers them); the
+    // other set extends, fills and closes.
+    let option_sets = [
+        r#"{"width":20,"stroke_start":"arrow","stroke_end":"circle"}"#,
+        r#"{"width":5,"fill_enabled":true,"extend_left":true,"extend_right":true,"tool_options":{"shape":{"closed":true}}}"#,
+    ];
+    for copy in 0..3 {
+        let shift = f64::from(copy) * 0.9;
+        for kind in SHAPE_KINDS {
+            let points = points_for(kind)
+                .into_iter()
+                .map(|point| p(point.logical + shift * 3.0, point.price + shift))
+                .collect::<Vec<_>>();
+            for options in option_sets {
+                add(&mut chart, kind, points.clone(), options);
+            }
+        }
+    }
+    crowd(&mut chart);
+    let ids = chart
+        .drawings()
+        .iter()
+        .map(|drawing| drawing.id)
+        .collect::<Vec<_>>();
+    let mut hits = 0;
+    // A fine grid unselected (the caps' reach), a coarser one with each filled arc, curve,
+    // double curve and closed polyline selected.
+    for (selected, step) in [
+        (None, 7.0),
+        (Some(ids[9]), 12.0),
+        (Some(ids[11]), 12.0),
+        (Some(ids[13]), 12.0),
+        (Some(ids[15]), 12.0),
+    ] {
+        chart.set_selected_drawing(selected);
+        chart.build_frame();
+        for gy in 0..(480.0 / step) as u32 {
+            for gx in 0..(780.0 / step) as u32 {
+                let (x, y) = (f64::from(gx) * step + 3.0, f64::from(gy) * step + 4.0);
+                let indexed = chart.hit_test_drawing(x, y);
+                assert_eq!(
+                    indexed,
+                    chart.hit_test_drawing_bruteforce(x, y),
+                    "({x}, {y}) with {selected:?} selected"
+                );
+                hits += usize::from(indexed.is_some());
+            }
+        }
+    }
+    assert!(hits > 400, "the grid meets the shapes ({hits} hits)");
+}
+
+/// The re-applied options resolve in bitmap px at every device-pixel ratio (801 × 1.5 rounds the
+/// bitmap width apart from the height ratio): an arc's arrowhead sits on its end at the scaled
+/// length, a curve's tangent extension reaches the bitmap pane edge, a closed polyline's outline
+/// starts on its first edge's midpoint, and the chord fill stays on the arc's chord.
+#[test]
+fn shape_options_scale_with_the_device_pixel_ratio() {
+    for (width, dpr) in [(800.0, 1.0), (801.0, 1.5), (800.0, 2.0)] {
+        let mut chart = deep_chart(width, dpr);
+        let (hpr, vpr) = ratios(&chart, dpr);
+        let bitmap = |(x, y): Point| (x * hpr, y * vpr);
+
+        let id = add(
+            &mut chart,
+            DrawingKind::Arc,
+            vec![p(10.0, 10_001.0), p(15.0, 10_004.0), p(20.0, 10_001.0)],
+            r##"{"color":"#123456","width":6,"stroke_end":"arrow","fill_enabled":true}"##,
+        );
+        let (start, end) = (bitmap(anchor(&chart, id, 0)), bitmap(anchor(&chart, id, 2)));
+        let heads = arrowheads(&mut chart);
+        assert_eq!(heads.len(), 1, "dpr {dpr}");
+        let (tip, base) = heads[0];
+        assert!(close(tip, end, 1e-3), "dpr {dpr}: {tip:?} at {end:?}");
+        let length = (base.0 - tip.0).hypot(base.1 - tip.1);
+        let expected = 2.0 * super::super::super::parts::cap_radius(6.0 * vpr);
+        assert!((length - expected).abs() < 1e-3, "dpr {dpr}: {length}");
+        let region = fills(&mut chart, wash());
+        assert_eq!(region.len(), 1, "dpr {dpr}");
+        let chord = [start, end];
+        assert!(
+            region[0]
+                .0
+                .iter()
+                .chain(&region[0].1)
+                .any(|&point| shape::distance_to_polyline(point, &chord) < 1e-2),
+            "dpr {dpr}: the fill closes on the chord"
+        );
+        chart.remove_drawing(id);
+
+        let id = add(
+            &mut chart,
+            DrawingKind::Curve,
+            vec![p(10.0, 10_001.0), p(15.0, 10_005.0), p(20.0, 10_001.0)],
+            r##"{"color":"#123456","extend_right":true}"##,
+        );
+        let (control, b) = (bitmap(anchor(&chart, id, 1)), bitmap(anchor(&chart, id, 2)));
+        let edge = *ink_line(&mut chart).last().unwrap();
+        let pane = &chart.panes[0];
+        let (right, top, bottom) = (
+            chart.pane_w * hpr,
+            pane.top * vpr,
+            (pane.top + pane.height) * vpr,
+        );
+        assert!(
+            (edge.0 - right).abs() < 0.5
+                || (edge.1 - top).abs() < 0.5
+                || (edge.1 - bottom).abs() < 0.5,
+            "dpr {dpr}: {edge:?} on the bitmap pane edge"
+        );
+        let cross =
+            (b.0 - control.0) * (edge.1 - control.1) - (b.1 - control.1) * (edge.0 - control.0);
+        assert!(
+            cross.abs() / (edge.0 - control.0).hypot(edge.1 - control.1) < 1e-2,
+            "dpr {dpr}: along the end tangent"
+        );
+        assert!((edge.0 - b.0) * (b.0 - control.0) > 0.0, "dpr {dpr}");
+        chart.remove_drawing(id);
+
+        let id = add(
+            &mut chart,
+            DrawingKind::Polyline,
+            vec![p(10.0, 10_001.0), p(20.0, 10_001.0), p(15.0, 10_005.0)],
+            r##"{"color":"#123456","tool_options":{"shape":{"closed":true}}}"##,
+        );
+        let outline = ink_line(&mut chart);
+        assert_eq!(outline.len(), 5, "dpr {dpr}");
+        assert_eq!(outline[0], outline[4]);
+        let seam = shape::midpoint(bitmap(anchor(&chart, id, 0)), bitmap(anchor(&chart, id, 1)));
+        assert!(close(outline[0], seam, 1e-3), "dpr {dpr}: {:?}", outline[0]);
+    }
+}
+
+/// On an inverted price scale an on-curve handle still drags the curve through the pointer, and
+/// a rotated rectangle's edge corner drag still keeps its on-screen width.
+#[test]
+fn derived_handles_follow_the_pointer_on_an_inverted_scale() {
+    let mut chart = chart();
+    chart.set_price_scale_inverted(0, false, true);
+    chart.build_frame();
+    let id = add(
+        &mut chart,
+        DrawingKind::Curve,
+        vec![p(10.0, 101.0), p(15.0, 105.0), p(20.0, 101.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    chart.set_selected_drawing(Some(id));
+    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 2));
+    let middle = handle_px(&chart, id, DrawingDragPart::Handle(0));
+    assert!(middle.1 > a.1, "the inverted curve bows down");
+    let to = (middle.0 + 25.0, middle.1 + 30.0);
+    assert!(chart.drawing_drag_start_at(middle.0, middle.1));
+    chart.drawing_drag_to(to.0, to.1, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    assert!(close(
+        handle_px(&chart, id, DrawingDragPart::Handle(0)),
+        to,
+        1e-6
+    ));
+    assert!(close(anchor(&chart, id, 0), a, 1e-9) && close(anchor(&chart, id, 2), b, 1e-9));
+    chart.remove_drawing(id);
+
+    let id = add(
+        &mut chart,
+        DrawingKind::RotatedRectangle,
+        points_for(DrawingKind::RotatedRectangle),
+        "{}",
+    );
+    chart.set_selected_drawing(Some(id));
+    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+    let width = depth(&chart, id);
+    let quarter = (a.0 - (b.1 - a.1), a.1 + (b.0 - a.0));
+    assert!(chart.drawing_drag_start_at(b.0, b.1));
+    chart.drawing_drag_to(quarter.0, quarter.1, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    assert!(close(anchor(&chart, id, 1), quarter, 1e-3));
+    assert!(
+        (depth(&chart, id) - width).abs() < 1e-3,
+        "{} vs {width}",
+        depth(&chart, id)
+    );
+}
+
+/// Documents the fork wrote regain its shapes look on upstream's arms: arcs fill their circular
+/// segment and closed polylines their region through the fork's fill defaults, and the caps the
+/// fork painted come back.
+#[test]
+fn fork_documents_regain_the_fork_shapes_look() {
+    let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price, "time": logical * HOUR});
+    let document = serde_json::json!({
+        "schema": "aeris_charts-state",
+        "schema_version": 1,
+        "panes": [{"id": "pane-1"}],
+        "drawings": [
+            // The fork's arc order: start, end, then the point it passes through.
+            {"id": 1, "kind": "arc", "pane_id": "pane-1",
+             "anchors": [at(10.0, 101.0), at(20.0, 101.0), at(15.0, 104.0)],
+             "style": {"color": INK, "stroke_end": "arrow"}},
+            {"id": 2, "kind": "polyline", "pane_id": "pane-1",
+             "anchors": [at(22.0, 101.0), at(30.0, 101.0), at(26.0, 105.0)],
+             "style": {"color": INK, "tool_options": {"shape": {"closed": true}}}},
+        ]
+    })
+    .to_string();
+    let mut chart = chart();
+    chart.import_state_json(&document).unwrap();
+    assert_eq!(
+        chart.drawing(1).unwrap().points,
+        [p(10.0, 101.0), p(15.0, 104.0), p(20.0, 101.0)]
+    );
+    assert!(chart.drawing(1).unwrap().fill_enabled && chart.drawing(2).unwrap().fill_enabled);
+    let regions = fills(&mut chart, Color::rgba(0x12, 0x34, 0x56, 51));
+    assert_eq!(
+        regions.len(),
+        2,
+        "the arc's segment and the polyline's region"
+    );
+    assert!(regions.iter().any(|(upper, lower)| shape::point_in_ribbon(
+        px(&chart, p(15.0, 102.5)),
+        upper,
+        lower
+    )));
+    assert!(regions.iter().any(|(upper, lower)| shape::point_in_ribbon(
+        px(&chart, p(26.0, 102.0)),
+        upper,
+        lower
+    )));
+    let heads = arrowheads(&mut chart);
+    assert_eq!(heads.len(), 1);
+    assert!(close(heads[0].0, px(&chart, p(20.0, 101.0)), 1e-3));
 }

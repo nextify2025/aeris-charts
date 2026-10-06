@@ -2660,6 +2660,18 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * `fill_enabled`. Elliott waves label their waves in the notation of their `wave_degree` and
  * leave the start unlabeled; `tool_options.pattern.show_wave: false` keeps only the labels.
  *
+ * Shapes: an `ellipse` edits with the rectangle's eight bounds handles and Shift makes it a
+ * circle. A `rotated_rectangle` (an edge, then a point setting its depth) shows its third handle
+ * on the far side's midpoint and a width handle on the near side's; dragging an edge corner keeps
+ * the on-screen width. `arc` is placed by its start, its end, then a point it passes through
+ * (stored as start, through point, end); `curve` by its start, its end, then its point at t = 1/2,
+ * and `double_curve` by its start, its end, then its points at t = 1/3 and 2/3 (both stored as
+ * Bézier start, control points, end, with their handles on the curve). An arc, curve, or double
+ * curve fills the region between it and its chord while `fill_enabled` and caps its ends by
+ * `stroke_start`/`stroke_end`; a curve continues its end tangents to the pane edge by
+ * `extend_left`/`extend_right` (an extended end carries no cap). A `polyline` closes by
+ * `tool_options.shape.closed` ({@link shape_tool_options}).
+ *
  * Own-line kinds (not in the AerisTerminal upstream catalog): `horizontal_segment` keeps both
  * anchors on one price, and `vertical_ray` and `vertical_segment` keep both on one bar (the
  * shared coordinate follows the anchor placed or dragged last; the vertical ray defaults to
@@ -3274,9 +3286,14 @@ export interface pattern_tool_options {
   /** Elliott waves: the wave polyline; `false` keeps only the labels (default `true`). */
   show_wave?: boolean;
 }
-/** Legacy shape options (`tool_options.shape`); the shared catalog stores them but does not render them. */
+/** Shape options (`tool_options.shape`), read by the `polyline`. */
 export interface shape_tool_options {
-  /** Polyline: join the last vertex back to the first. Stored but not rendered. */
+  /**
+   * Polyline: join the last vertex back to the first as one outline (no end caps; they stay
+   * stored for reopening it), filling the enclosed region by the nonzero rule while
+   * `fill_enabled` (outline only past 2,048 vertices). Clicking the first vertex while placing,
+   * once three are placed, sets it and finishes the polyline. Default `false`.
+   */
   closed?: boolean;
 }
 
@@ -3285,7 +3302,8 @@ export interface shape_tool_options {
  * models as flat drawing options are deprecated input aliases (mapped on patch and restore, never
  * written back); the own-line tools still read their own blocks, the shared catalog's line
  * tools read `line`, whose presence selects their earlier fork look ({@link line_tool_options}),
- * and its pattern and wave tools read `pattern` ({@link pattern_tool_options}).
+ * its pattern and wave tools read `pattern` ({@link pattern_tool_options}), and its polyline
+ * reads `shape` ({@link shape_tool_options}).
  * Patches deep-merge: absent keys keep their values and `null` resets a block to its defaults
  * (on `line`, `null` removes the block).
  */

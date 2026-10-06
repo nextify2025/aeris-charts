@@ -372,6 +372,22 @@ struct Press {
     /// when the host has already removed the control (a cancelled order's line is gone by the
     /// second click).
     control_pair: bool,
+    /// The click before this press in the same double-click pair finished a sequence tool's
+    /// placement (a polyline closed on its first vertex), so the pair's double-click is the
+    /// finishing gesture: it opens no editor on the new drawing, as a double-click finishing the
+    /// sequence never does.
+    placement_pair: bool,
+}
+
+/// What the last completed click spent, read by the next press when it pairs into a
+/// double-click.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpentClick {
+    /// A trading control, the alert chip or a timeline mark took the click
+    /// ([`Press::control_pair`]).
+    Control,
+    /// The click finished a sequence tool's placement ([`Press::placement_pair`]).
+    Placement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -407,9 +423,9 @@ pub(crate) struct InputController {
     /// Its release activates exactly that control (see [`ChartEngine::input_pointer_up`]).
     press_close: Option<TradingHit>,
     last_click: Option<(f64, f64, f64)>,
-    /// The last completed click was a trading-control or alert-chip press (see
-    /// [`Press::control_pair`]); the next press reads it when it pairs into a double-click.
-    control_click: bool,
+    /// What the last completed click spent; the next press reads it when it pairs into a
+    /// double-click.
+    spent_click: Option<SpentClick>,
     pointer: Option<(f64, f64)>,
     modifiers: InputModifiers,
     cursor: ChartCursor,
@@ -623,7 +639,7 @@ impl ChartEngine {
         press.mode = PressMode::TouchTracking;
         press.moved = true;
         self.input.last_click = None;
-        self.input.control_click = false;
+        self.input.spent_click = None;
         self.input.touch_tracking = Some(TouchTracking {
             anchor,
             base_anchor: anchor,
@@ -701,7 +717,7 @@ impl ChartEngine {
                 self.abandon_press_state();
                 self.input.touch_longpress_deadline_ms = None;
                 self.input.last_click = None;
-                self.input.control_click = false;
+                self.input.spent_click = None;
                 self.input.pointer = Some((update.x, update.y));
                 self.input.frame_dirty = true;
                 self.clear_pointer_hover();
@@ -737,10 +753,11 @@ impl ChartEngine {
                     moved: true,
                     text_press_selected: None,
                     control_pair: false,
+                    placement_pair: false,
                 });
                 self.input.pointer = Some((x, y));
                 self.input.last_click = None;
-                self.input.control_click = false;
+                self.input.spent_click = None;
                 self.input.frame_dirty = true;
                 self.refresh_input_cursor();
                 return;
@@ -759,7 +776,7 @@ impl ChartEngine {
         self.commit_drawing_edit_session();
 
         let text_press_selected = self.selected_drawing();
-        let control_click = self.input.control_click;
+        let spent_click = self.input.spent_click;
         let press = |mode, double_candidate| Press {
             id: input.id,
             mode,
@@ -768,11 +785,12 @@ impl ChartEngine {
             moved: false,
             text_press_selected,
             control_pair: double_candidate
-                && (control_click
+                && (spent_click == Some(SpentClick::Control)
                     || matches!(
                         mode,
                         PressMode::Trading { .. } | PressMode::Alert | PressMode::TimelineMark
                     )),
+            placement_pair: double_candidate && spent_click == Some(SpentClick::Placement),
         };
         if self.drawing_text_edit().is_some() {
             if self.point_on_edited_text(x, y) {
@@ -1034,6 +1052,7 @@ impl ChartEngine {
                     moved: true,
                     text_press_selected: None,
                     control_pair: false,
+                    placement_pair: false,
                 });
                 self.input.pointer = Some((rebased.x, rebased.y));
                 self.refresh_sample_hover(input.device, rebased.x, rebased.y, input.timestamp_ms);
@@ -1134,12 +1153,13 @@ impl ChartEngine {
                 | PressMode::Inert => {}
             }
             self.input.last_click = None;
-            self.input.control_click = false;
+            self.input.spent_click = None;
             self.input_double_click(
                 self.region_at(x, y),
                 input,
                 press.text_press_selected,
                 press.control_pair,
+                press.placement_pair,
             );
             self.apply_input_magnet();
             if input.device == InputDevice::Touch {
@@ -1155,11 +1175,12 @@ impl ChartEngine {
             && input.timestamp_ms > 0.0
             && input.timestamp_ms.is_finite())
         .then_some((x, y, input.timestamp_ms));
-        self.input.control_click = !moved
+        self.input.spent_click = (!moved
             && matches!(
                 press.mode,
                 PressMode::Trading { .. } | PressMode::Alert | PressMode::TimelineMark
-            );
+            ))
+        .then_some(SpentClick::Control);
         let modifiers = drawing_modifiers(input.modifiers);
         let mut created_on_release = false;
         match press.mode {
@@ -1187,8 +1208,14 @@ impl ChartEngine {
                 // only for a click, at the release. A press past the slop is a drag that places
                 // nothing; with a first anchor down it only moved the live preview.
                 if !capture && !moved && !committed_on_press && update.created.is_none() {
+                    let sequence = self.drawing_tool_sequence_active();
                     let update = self.drawing_tool_activate(x, y, modifiers);
                     created_on_release |= update.created.is_some();
+                    // A click that finished a sequence (a polyline closed on its first vertex)
+                    // spends its double-click pair on the placement.
+                    if sequence && update.created.is_some() {
+                        self.input.spent_click = Some(SpentClick::Placement);
+                    }
                     self.note_drawing_created(update.created);
                 }
             }
@@ -1769,7 +1796,7 @@ impl ChartEngine {
             ChartKey::Delete | ChartKey::Backspace => {
                 self.commit_drawing_edit_session();
                 self.input.last_click = None;
-                self.input.control_click = false;
+                self.input.spent_click = None;
                 self.remove_drawing(id)
             }
             // Edit the drawing's own text in the inline editor, which announces itself and
@@ -2099,6 +2126,7 @@ impl ChartEngine {
         input: PointerInput,
         text_press_selected: Option<DrawingId>,
         control_pair: bool,
+        placement_pair: bool,
     ) {
         let (x, y) = (input.x, input.y);
         let options = self.input.options;
@@ -2116,6 +2144,11 @@ impl ChartEngine {
                     self.note_drawing_created(update.created);
                     let update = self.drawing_tool_finish();
                     self.note_drawing_created(update.created);
+                    return;
+                }
+                // The first click of the pair already finished the sequence: the double-click
+                // finishes placement as above and acts on nothing.
+                if placement_pair {
                     return;
                 }
                 // The second click acts on the drawing it landed on, never on a bare selection:
@@ -2300,7 +2333,7 @@ impl ChartEngine {
     fn delete_selection(&mut self) -> bool {
         if self.remove_selected_drawing() {
             self.input.last_click = None;
-            self.input.control_click = false;
+            self.input.spent_click = None;
             return true;
         }
         if let Some(id) = self.selected_volume_profile_indicator() {

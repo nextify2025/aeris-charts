@@ -16,12 +16,14 @@
 //! unstored `tool_options` defaults ([`legacy_fork_tool_options`]); the Fibonacci module also
 //! reads its stored options for upstream's level arms, the patterns module resolves the parts it
 //! layers on upstream's polyline arm, and the pitchforks and Gann module owns what upstream's
-//! pitchfork and Gann arms read from `tool_options.gann` and their derived handles (re-applied
-//! features). The recipe (what to
+//! pitchfork and Gann arms read from `tool_options.gann` and their derived handles, and the
+//! shapes module what upstream's shape arms read from `tool_options.shape` and the caps, the
+//! shapes' derived handles and their through-point placement (re-applied features). The recipe
+//! (what to
 //! add where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
 //! Shared single-list registries carry one `// B8: <family> — begin/end` block per family that
 //! takes part (lines, channels, fibonacci, patterns_elliott_cycles, pitchforks_gann,
-//! projection_annotations).
+//! projection_annotations, shapes).
 
 use aeris_charts_render::shape::Point;
 
@@ -145,6 +147,9 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
     // B8: pitchforks_gann — begin
     extent = extent.max(pitchforks_gann::upstream_decoration_extent(engine, drawing));
     // B8: pitchforks_gann — end
+    // B8: shapes — begin
+    extent = extent.max(shapes::upstream_decoration_extent(engine, drawing));
+    // B8: shapes — end
     extent
 }
 
@@ -171,6 +176,9 @@ pub(crate) fn extend_upstream_schema(
     // B8: pitchforks_gann — begin
     pitchforks_gann::extend_upstream_schema(kind, properties);
     // B8: pitchforks_gann — end
+    // B8: shapes — begin
+    shapes::extend_upstream_schema(kind, properties);
+    // B8: shapes — end
 }
 
 /// Edit the handles of an upstream-rendered kind (no family) for derived geometry, the upstream
@@ -191,6 +199,9 @@ pub(crate) fn upstream_derived_handles(
     // B8: pitchforks_gann — begin
     pitchforks_gann::derived_handles(engine, drawing, px, handles);
     // B8: pitchforks_gann — end
+    // B8: shapes — begin
+    shapes::derived_handles(drawing, px, handles);
+    // B8: shapes — end
 }
 
 /// Resolve one drag sample of a derived `Handle` part of an upstream-rendered kind (the drag side
@@ -205,9 +216,33 @@ pub(crate) fn drag_derived_handle(
     sample: &HandleDrag<'_>,
     points: &mut [crate::DrawingPoint],
 ) -> Option<Option<crate::DrawingToolOptions>> {
-    // B8: pitchforks_gann — begin
-    pitchforks_gann::drag_handle(engine, drawing, sample, points)
-    // B8: pitchforks_gann — end
+    match drawing.kind {
+        // B8: shapes — begin
+        DrawingKind::RotatedRectangle | DrawingKind::Curve | DrawingKind::DoubleCurve => {
+            shapes::drag_handle(engine, drawing, sample, points)
+        }
+        // B8: shapes — end
+        // B8: pitchforks_gann — begin
+        _ => pitchforks_gann::drag_handle(engine, drawing, sample, points),
+        // B8: pitchforks_gann — end
+    }
+}
+
+/// After one anchor drag sample (pointer or keyboard) moved `points[index]` of an
+/// upstream-rendered kind, re-derive the anchors that keep its derived geometry on screen (the
+/// anchor side of [`upstream_derived_handles`]): `start_px` are the baseline anchors' media px.
+/// A rotated rectangle keeps its width while its edge turns, a curve keeps its on-curve points
+/// while an end moves.
+pub(crate) fn follow_anchor_drag(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    index: usize,
+    start_px: &[Point],
+    points: &mut [crate::DrawingPoint],
+) {
+    // B8: shapes — begin
+    shapes::follow_anchor_drag(engine, drawing, index, start_px, points);
+    // B8: shapes — end
 }
 
 /// Replace the common schema defaults with the template drawing's resolved values (a family's

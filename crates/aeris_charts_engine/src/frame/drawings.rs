@@ -20,9 +20,9 @@ use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
 use crate::drawings::kinds::patterns_elliott_cycles::{self, PatternLayer};
 use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
-use crate::drawings::kinds::{channels, fibonacci, lines, pitchforks_gann};
+use crate::drawings::kinds::{channels, fibonacci, lines, pitchforks_gann, shapes};
 use crate::drawings::{
-    arrow_cap_triangle, cap_radius, curve_clip, ellipse_outline, level_band_pairs,
+    arrow_cap_triangle, cap_radius, closed_outline, curve_clip, ellipse_outline, level_band_pairs,
     resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
     DrawingHandleMode, DrawingId, DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign,
     DrawingTextLayout, FibonacciArcGeometry, PartContext, PositionGeometry, PositionZone,
@@ -104,20 +104,41 @@ fn box_meets(center: (f64, f64), rx: f64, ry: f64, clip: aeris_charts_render::sh
     })
 }
 
-/// A flattened open curve's stroke ([`push_segment`]'s styling); nothing when its points miss
-/// `clip`, so an off-screen arc or curve paints nothing.
-fn push_curve_stroke(
-    line: &[(f64, f64)],
-    clip: aeris_charts_render::shape::Rect,
+/// A closed polygon's outline as one run from mid-edge ([`closed_outline`]), in
+/// [`push_segment`]'s styling.
+fn push_closed_outline(
+    vertices: &[(f64, f64)],
     (stroke, pane): ((f32, LineStyle, Color), aeris_charts_render::shape::Rect),
     out: &mut Vec<Prim>,
     points: &mut Vec<[f32; 2]>,
 ) {
-    if aeris_charts_render::shape::Rect::bounding(line)
-        .is_some_and(|bounds| bounds.intersects(&clip))
-    {
-        push_styled_stroke(out, points, line, LineType::Simple, stroke, pane);
+    let mut outline = Vec::new();
+    closed_outline(vertices, &mut outline);
+    if outline.len() >= 3 {
+        push_styled_stroke(out, points, &outline, LineType::Simple, stroke, pane);
     }
+}
+
+/// A region fill: the paired chains `ribbon` (each `count` long) as one `Prim::BandFill`.
+fn push_ribbon(
+    ribbon: &[(f64, f64)],
+    count: usize,
+    fill: Color,
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+) {
+    if count == 0 {
+        return;
+    }
+    let upper_first = points.len() as u32;
+    points.extend(ribbon.iter().map(|&(x, y)| [x as f32, y as f32]));
+    out.push(Prim::BandFill {
+        upper_first,
+        lower_first: upper_first + count as u32,
+        point_count: count as u32,
+        line_type: LineType::Simple,
+        fill,
+    });
 }
 
 fn push_drawing_cap(
@@ -696,6 +717,17 @@ impl ChartEngine {
                     // commit will store it.
                     let mut preview_drawing = pending.drawing.clone();
                     preview_drawing.points.clone_from(&anchors);
+                    // A tool placed through points on its geometry previews the anchors its
+                    // clicks will store (an arc ends first, a curve through its on-curve
+                    // points); its handles stay on the placed clicks.
+                    let through =
+                        shapes::places_through(kind) && anchors.len() == kind.anchor_count();
+                    if through {
+                        // A click without px previews nothing (the commit refuses it too).
+                        preview_drawing.points =
+                            shapes::placement_anchors(self, &preview_drawing, &anchors)
+                                .unwrap_or_default();
+                    }
                     if preview_drawing.kind == DrawingKind::AnchoredText {
                         // Anchored text paints at its screen position, which follows the
                         // pointer while placing exactly as the commit will set it.
@@ -734,6 +766,20 @@ impl ChartEngine {
                             // the commit.
                             let handles = handle_set(DrawingHandleMode::RectangleBounds, &px);
                             build_handles(&handles, vpr, self.anchor_fill(), out);
+                        } else if through {
+                            // Discs on the clicks placed so far, not on the stored anchors
+                            // (control points off the curve).
+                            let placed = pending
+                                .drawing
+                                .points
+                                .iter()
+                                .map(|&point| {
+                                    self.drawing_point_px(&pending.drawing, point)
+                                        .map(|(x, y)| (x * hpr, y * vpr))
+                                })
+                                .collect::<Option<Vec<_>>>()
+                                .unwrap_or_default();
+                            build_anchor_handles(&placed, vpr, self.anchor_fill(), out);
                         } else {
                             // The placed anchors' handles, where the family paints them on the
                             // previewed geometry; derived handles wait for the committed
@@ -1894,15 +1940,8 @@ impl ChartEngine {
                         color: fill,
                     });
                 }
-                for index in 0..4 {
-                    push_segment(
-                        corners[index],
-                        corners[(index + 1) % 4],
-                        stroke,
-                        out,
-                        points,
-                    );
-                }
+                // One seamless outline run (owner decision S7): every corner is a join.
+                push_closed_outline(&corners, stroke, out, points);
             }
             DrawingBodyGeometry::Ellipse { center, rx, ry } => {
                 let clip = curve_clip(stroke.1, drawing.width, vpr);
@@ -1973,27 +2012,65 @@ impl ChartEngine {
                         color: fill,
                     });
                 }
-                for index in 0..3 {
-                    push_segment(
-                        corners[index],
-                        corners[(index + 1) % 3],
-                        stroke,
-                        out,
-                        points,
-                    );
+                if drawing.kind == DrawingKind::Triangle {
+                    // One seamless outline run (owner decision S7): every corner is a join.
+                    push_closed_outline(&corners, stroke, out, points);
+                } else {
+                    for index in 0..3 {
+                        push_segment(
+                            corners[index],
+                            corners[(index + 1) % 3],
+                            stroke,
+                            out,
+                            points,
+                        );
+                    }
                 }
             }
-            DrawingBodyGeometry::Arc(arc) => {
+            DrawingBodyGeometry::Arc(_) | DrawingBodyGeometry::Curve(_) => {
+                // The chord fill under the stroke; with an end cap, the shared capped stroke.
                 let clip = curve_clip(stroke.1, drawing.width, vpr);
-                let mut line = Vec::new();
-                arc.flatten(clip, &mut line);
-                push_curve_stroke(&line, clip, stroke, out, points);
+                if let Some(curve) = shapes::CurveStroke::resolve(geometry.body, clip) {
+                    let run = curve.run();
+                    if curve.meets_clip(&run) {
+                        if drawing.fill_enabled {
+                            let mut ribbon = Vec::new();
+                            let count = curve.chord_fill(&mut ribbon);
+                            push_ribbon(&ribbon, count, drawing.fill_or_wash(51), out, points);
+                        }
+                        match self
+                            .frame_part_context(drawing, px, pane_w_px, vpr)
+                            .filter(|_| shapes::capped(drawing))
+                        {
+                            Some(context) => self.push_parts(
+                                &context,
+                                pane_w_px,
+                                vpr,
+                                out,
+                                points,
+                                |c, parts| curve.capped_parts(&run, c.drawing, c.scale, parts),
+                            ),
+                            None => push_styled_stroke(
+                                out,
+                                points,
+                                &run,
+                                LineType::Simple,
+                                stroke.0,
+                                stroke.1,
+                            ),
+                        }
+                    }
+                }
             }
-            DrawingBodyGeometry::Curve(curve) => {
-                let clip = curve_clip(stroke.1, drawing.width, vpr);
-                let mut line = Vec::new();
-                curve.flatten(clip, &mut line);
-                push_curve_stroke(&line, clip, stroke, out, points);
+            DrawingBodyGeometry::Polygon { points: vertices } => {
+                // A closed polyline: its nonzero fill under one outline run from mid-edge, no
+                // caps (they stay stored for reopening it).
+                if drawing.fill_enabled {
+                    let mut ribbon = Vec::new();
+                    let count = aeris_charts_render::shape::nonzero_ribbon(vertices, &mut ribbon);
+                    push_ribbon(&ribbon, count, drawing.fill_or_wash(51), out, points);
+                }
+                push_closed_outline(vertices, stroke, out, points);
             }
             DrawingBodyGeometry::Rectangle {
                 left,

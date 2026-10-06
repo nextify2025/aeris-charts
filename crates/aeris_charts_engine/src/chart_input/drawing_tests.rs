@@ -190,6 +190,38 @@ fn path_anchors_placed_by_clicks_pop_on_backspace_and_a_double_click_finishes_on
 }
 
 #[test]
+fn a_click_or_double_click_on_a_polylines_first_vertex_finishes_it_closed() {
+    for double in [false, true] {
+        let mut chart = chart();
+        assert!(chart.set_drawing_tool(Some(DrawingKind::Polyline), None, None));
+        let revision = chart.drawing_revision();
+        for (x, y) in [(120.0, 140.0), (220.0, 260.0), (320.0, 160.0)] {
+            click(&mut chart, x, y);
+        }
+        assert!(chart.take_input_events().is_empty(), "a polyline waits");
+        // Near the first vertex: a click there closes the polyline instead of adding a vertex.
+        // The platform double-click's second delivery finishes placement, as a double-click
+        // finishing an open polyline does: it creates nothing more and opens no editor on the
+        // new polyline under it.
+        click(&mut chart, 123.0, 138.0);
+        if double {
+            double_click(&mut chart, 123.0, 138.0);
+        }
+        let events = chart.take_input_events();
+        let [ChartInputEvent::DrawingCreated(id)] = events[..] else {
+            panic!("the closing click finishes one polyline: {events:?}");
+        };
+        assert_eq!(chart.drawing_text_edit(), None, "double-click {double}");
+        assert_eq!(chart.drawings().len(), 1, "double-click {double}");
+        let drawing = chart.drawing(id).unwrap();
+        assert_eq!(drawing.points.len(), 3);
+        assert!(drawing.tool_options.shape.is_some_and(|shape| shape.closed));
+        assert_eq!(chart.active_drawing_tool(), None);
+        assert_eq!(chart.drawing_revision(), revision + 1, "one create step");
+    }
+}
+
+#[test]
 fn escape_discards_a_pending_path_and_disarms_the_tool() {
     let mut chart = chart();
     assert!(chart.set_drawing_tool(Some(DrawingKind::Path), None, None));
