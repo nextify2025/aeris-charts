@@ -2647,6 +2647,19 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * and `fibonacci_channel` levels run to the pane's left and right edges by the same flags (the
  * channel's along their slope).
  *
+ * The patterns and Elliott waves are a polyline through their anchors with a label above each
+ * vertex; labels are body targets, and the tools preview as the drawing they commit from the
+ * second click on. The harmonic patterns (`pattern_xabcd`, `pattern_cypher`, `pattern_abcd`,
+ * `pattern_three_drives`) add dashed ratio connectors with boxed price ratios
+ * (`tool_options.pattern.show_ratios`, on by default); `pattern_xabcd` and `pattern_cypher` shade
+ * their X-A-B and B-C-D triangles with `fill_enabled`; `pattern_head_shoulders` always draws its
+ * neckline through the two neck anchors and shades the shoulders and head with `fill_enabled`;
+ * `pattern_triangle` draws its A-C and B-D sides, on to their apex when it lies ahead within one
+ * pattern width, while the extend flag of that direction is set (`extend_right` when the
+ * pattern runs right, `extend_left` when it runs left), shading the area between them with
+ * `fill_enabled`. Elliott waves label their waves in the notation of their `wave_degree` and
+ * leave the start unlabeled; `tool_options.pattern.show_wave: false` keeps only the labels.
+ *
  * Own-line kinds (not in the AerisTerminal upstream catalog): `horizontal_segment` keeps both
  * anchors on one price, and `vertical_ray` and `vertical_segment` keep both on one bar (the
  * shared coordinate follows the anchor placed or dragged last; the vertical ray defaults to
@@ -2990,7 +3003,13 @@ export type drawing_label_metric = "price" | "price_change" | "percent_change" |
 export type drawing_label_position = "above" | "on" | "below" | "inside" | "outside";
 export interface drawing_label_options { metric: drawing_label_metric; visible: boolean; position: drawing_label_position; text?: string }
 export interface drawing_level { value: number; color: string; visible: boolean; style: string; fill_between: boolean; fill_color?: string; label_visible: boolean }
-/** Elliott wave degree, smallest first; each vertex label reads `<label> (<degree>)`. */
+/**
+ * Elliott wave degree, smallest first. Each labels its waves in its Frost-Prechter notation:
+ * Roman numerals in capitals from `cycle` up and in lower case from `minute` down, Arabic numbers
+ * from `minor` to `primary` (letters in capitals there, lower case elsewhere); each triad cycles
+ * bare, parenthesized, and ringed labels (`minor` "3", `intermediate` "(3)", `primary` a ringed
+ * "3"), and the three millennium degrees wrap upper Roman numerals in `<>`, `[]`, and `{}`.
+ */
 export type drawing_wave_degree = "subminuette" | "minuette" | "minute" | "minor" | "intermediate" | "primary" | "cycle" | "supercycle" | "grand_supercycle" | "submillennium" | "millennium" | "supermillennium";
 export type drawing_property_type = "boolean" | "number" | "integer" | "string" | "color" | "enum" | "points" | "levels" | "interval_set";
 export interface drawing_property_descriptor { name: string; property_type: drawing_property_type; default: unknown; min?: number; max?: number; enum_values: string[] }
@@ -3225,16 +3244,19 @@ export interface projection_annotation_tool_options {
 /** @deprecated The same type as {@link drawing_wave_degree}. */
 export type elliott_wave_degree = drawing_wave_degree;
 /**
- * Legacy pattern and Elliott wave options (`tool_options.pattern`). The shared catalog renders
- * these tools: `degree` is an input alias of the flat `wave_degree` (mapped on patch and restore,
- * never written back), and the other fields are stored but not rendered.
+ * Pattern and Elliott wave options (`tool_options.pattern`), rendered on the shared catalog's
+ * pattern and wave tools; `degree` is an input alias of the flat `wave_degree` (mapped on patch
+ * and restore, never written back).
  */
 export interface pattern_tool_options {
-  /** XABCD, cypher, ABCD, and three drives ratio connectors. Stored but not rendered. */
+  /**
+   * XABCD, cypher, ABCD, and three drives: the dashed ratio connectors and their boxed price
+   * ratios, body targets (default `true`).
+   */
   show_ratios?: boolean;
   /** @deprecated Input alias of `wave_degree`. */
   degree?: elliott_wave_degree;
-  /** Elliott wave polyline visibility. Stored but not rendered. */
+  /** Elliott waves: the wave polyline; `false` keeps only the labels (default `true`). */
   show_wave?: boolean;
 }
 /** Legacy shape options (`tool_options.shape`); the shared catalog stores them but does not render them. */
@@ -3246,8 +3268,9 @@ export interface shape_tool_options {
 /**
  * Fork extension blocks, one optional block per legacy drawing family. Fields that upstream
  * models as flat drawing options are deprecated input aliases (mapped on patch and restore, never
- * written back); the own-line tools still read their own blocks, and the shared catalog's line
- * tools read `line`, whose presence selects their earlier fork look ({@link line_tool_options}).
+ * written back); the own-line tools still read their own blocks, the shared catalog's line
+ * tools read `line`, whose presence selects their earlier fork look ({@link line_tool_options}),
+ * and its pattern and wave tools read `pattern` ({@link pattern_tool_options}).
  * Patches deep-merge: absent keys keep their values and `null` resets a block to its defaults
  * (on `line`, `null` removes the block).
  */
@@ -3314,7 +3337,7 @@ export interface drawing_options {
   level_show_values: boolean;
   level_show_percents: boolean;
   level_label_align: "left" | "center" | "right";
-  /** Elliott wave degree used in the vertex labels (default `"minor"`). */
+  /** Elliott wave degree whose notation labels the waves (default `"minor"`). */
   wave_degree: drawing_wave_degree;
   /** Pane-relative screen position for anchored text, 0 to 1. */
   screen_x: number;

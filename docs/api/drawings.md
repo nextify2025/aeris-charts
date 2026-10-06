@@ -74,13 +74,13 @@ B8 绘图目录以 AerisTerminal 上游的工具外加自有线的七个工具�
 | `level_label_align` | 档位工具 | `"left"`、`"center"`、`"right"`；时间区与趋势时间为 `"left"`，圆弧、圆、螺旋线、楔形、叉形线、叉形扇、江恩框与江恩方图为 `"center"`，其余为 `"right"` |
 | `level_log_scale` | 回撤、延伸、通道 | `false`；按几何方式插值正价格 |
 | `gann_fans`、`gann_arcs` | `gann_square`、`gann_square_fixed` | 档位列表；扇形线为 1/8、1/4、1/2、1、2、4、8，圆弧为 0.25、0.5、0.75、1 |
-| `wave_degree` | 艾略特波浪 | `"subminuette"`、`"minuette"`、`"minute"`、`"minor"`（默认）、`"intermediate"`、`"primary"`、`"cycle"`、`"supercycle"`、`"grand_supercycle"`、`"submillennium"`、`"millennium"`、`"supermillennium"` |
+| `wave_degree` | 艾略特波浪（按该级别的记法标注，见[形态、艾略特波浪与周期](#形态艾略特波浪与周期)） | `"subminuette"`、`"minuette"`、`"minute"`、`"minor"`（默认）、`"intermediate"`、`"primary"`、`"cycle"`、`"supercycle"`、`"grand_supercycle"`、`"submillennium"`、`"millennium"`、`"supermillennium"` |
 | `screen_x`、`screen_y` | `anchored_text` | 窗格分数 0 到 1，默认 0.5 |
 | `icon_name`、`icon_size` | `icon_stamp` | 已注册的图像名称（默认为空）；8 到 96 CSS px，默认 24 |
 | `bars_pattern_mode`、`bars_pattern_mirror_x`、`bars_pattern_mirror_y` | `bars_pattern` | `"bars"`（默认）、`"oc_bars"`、`"line_open"`、`"line_high"`、`"line_low"`、`"line_close"`（`"hl_bars"` 会被读作 `"bars"`）；镜像为 `false` |
 | `regression_source_id`、`regression_deviations` | `regression_trend` | 系列 id 或 `null`（即下文的默认源）；0 到 10，默认 2 |
 
-自有线的工具与测量工具按族各在 `options.tool_options` 下保留一个类型化块（`tool_options.line`、`tool_options.channel`、`tool_options.projection_annotation`）；补丁会对其进行深度合并（缺失的键保留其值，`null` 会重置一个块，无效的块会以 `invalid_options` 拒绝整个补丁），schema 描述符使用 `tool_options.line.stats_position` 这样的点分路径命名这些选项。早期构建的其他块（`tool_options.fibonacci`、`gann`、`pattern`、`shape`，以及回归与柱形态的键）仍会被接受并存储，其中 `tool_options.fibonacci` 由斐波那契工具读取（见[斐波那契](#斐波那契)）。具有扁平对应项的键，无论选项从何处进入（补丁、模板、粘贴以及恢复的文档），都会按键是否存在迁移到该对应项上，而同一补丁中显式给出的扁平选项优先：斐波那契的 `reverse`、`log_scale`、`show_prices`、`show_levels`、`levels_as_percent` 与 `label_h_align` 分别变为 `level_reverse`、`level_log_scale`、`level_show_prices`、`level_show_values`、`level_show_percents` 与 `level_label_align`（`reverse` 保持其含义：在延伸、通道与时间区上按原样映射，在回撤与速度扇形上则取反，因为早期构建把这两者的 0 档放在第二个锚点上；螺旋线的 `reverse` 会被保留，让没有档位的螺旋线（黄金螺旋）逆时针旋转，从未读取它的工具上的 `reverse` 也会被保留，但不改变任何内容；`label_h_align` 在时间区与趋势时间上互换 `left` 与 `right`，因为早期构建以标签位于线条的哪一侧命名，而 `level_label_align` 以贴靠线条的文字边缘命名（`left` 使标签位于线条右侧））；江恩的 `reverse`、`angles` 与 `arcs` 变为 `level_reverse`、`gann_fans` 与 `gann_arcs`；形态的 `degree` 变为 `wave_degree`；柱形态的 `bars_mode`、`mirrored`、`flipped` 与 `bars` 变为 `bars_pattern_mode`、`bars_pattern_mirror_x`、`bars_pattern_mirror_y` 与快照；图标的 `icon` 与 `icon_size` 变为 `icon_name` 与 `icon_size`（钳制到 96）。回归趋势线的 `tool_options.channel.upper_deviation`、`lower_deviation`、`use_upper_deviation` 与 `use_lower_deviation` 不是别名，而是 `regression_deviations` 的逐侧覆盖：它们被保留并持久化（缺失的一侧跟随 `regression_deviations`），补丁不会因它们改变 `regression_deviations`。没有对应项的键（例如 `tool_options.gann.time_levels`）会被保留并持久化，但在上游工具上不改变任何内容，该工具的 schema 也不列出它们；已在上游工具上重新实现的键例外：上游的六个线条工具读取 `tool_options.line`（见[线条](#线条)），其 schema 列出 `tool_options.line.stats_position`；上游的通道与回归趋势线读取 `tool_options.channel`（见[通道](#通道)），其 schema 列出通道的 `middle_line` 与 `middle_color`，回归另列出 `upper_deviation`、`lower_deviation`（默认 `null`，即跟随 `regression_deviations`）、`use_upper_deviation`、`use_lower_deviation`、`source` 与 `show_pearsons`；斐波那契工具读取 `tool_options.fibonacci`（见[斐波那契](#斐波那契)），其 schema 按工具列出 `trend_line`、`grid`、`full_circles`、`label_v_align` 与螺旋线的 `reverse`。这些块的默认值即上游的外观（`tool_options.fibonacci.trend_line` 与 `grid`、`tool_options.gann.time_levels` 与 `show_stats` 默认关闭或为空），因此只发送一个键的补丁不会打开其他内容；`tool_options.projection_annotation` 只写出与默认值不同的字段。早期构建写出的文档恢复时，会把该构建从不写出的默认值显式写入这些块（见[持久化 V1](compatibility.md#持久化-v1)）。
+自有线的工具与测量工具按族各在 `options.tool_options` 下保留一个类型化块（`tool_options.line`、`tool_options.channel`、`tool_options.projection_annotation`）；补丁会对其进行深度合并（缺失的键保留其值，`null` 会重置一个块，无效的块会以 `invalid_options` 拒绝整个补丁），schema 描述符使用 `tool_options.line.stats_position` 这样的点分路径命名这些选项。早期构建的其他块（`tool_options.fibonacci`、`gann`、`pattern`、`shape`，以及回归与柱形态的键）仍会被接受并存储，其中 `tool_options.fibonacci` 由斐波那契工具读取（见[斐波那契](#斐波那契)），`tool_options.pattern` 由形态与艾略特波浪读取（见[形态、艾略特波浪与周期](#形态艾略特波浪与周期)）。具有扁平对应项的键，无论选项从何处进入（补丁、模板、粘贴以及恢复的文档），都会按键是否存在迁移到该对应项上，而同一补丁中显式给出的扁平选项优先：斐波那契的 `reverse`、`log_scale`、`show_prices`、`show_levels`、`levels_as_percent` 与 `label_h_align` 分别变为 `level_reverse`、`level_log_scale`、`level_show_prices`、`level_show_values`、`level_show_percents` 与 `level_label_align`（`reverse` 保持其含义：在延伸、通道与时间区上按原样映射，在回撤与速度扇形上则取反，因为早期构建把这两者的 0 档放在第二个锚点上；螺旋线的 `reverse` 会被保留，让没有档位的螺旋线（黄金螺旋）逆时针旋转，从未读取它的工具上的 `reverse` 也会被保留，但不改变任何内容；`label_h_align` 在时间区与趋势时间上互换 `left` 与 `right`，因为早期构建以标签位于线条的哪一侧命名，而 `level_label_align` 以贴靠线条的文字边缘命名（`left` 使标签位于线条右侧））；江恩的 `reverse`、`angles` 与 `arcs` 变为 `level_reverse`、`gann_fans` 与 `gann_arcs`；形态的 `degree` 变为 `wave_degree`；柱形态的 `bars_mode`、`mirrored`、`flipped` 与 `bars` 变为 `bars_pattern_mode`、`bars_pattern_mirror_x`、`bars_pattern_mirror_y` 与快照；图标的 `icon` 与 `icon_size` 变为 `icon_name` 与 `icon_size`（钳制到 96）。回归趋势线的 `tool_options.channel.upper_deviation`、`lower_deviation`、`use_upper_deviation` 与 `use_lower_deviation` 不是别名，而是 `regression_deviations` 的逐侧覆盖：它们被保留并持久化（缺失的一侧跟随 `regression_deviations`），补丁不会因它们改变 `regression_deviations`。没有对应项的键（例如 `tool_options.gann.time_levels`）会被保留并持久化，但在上游工具上不改变任何内容，该工具的 schema 也不列出它们；已在上游工具上重新实现的键例外：上游的六个线条工具读取 `tool_options.line`（见[线条](#线条)），其 schema 列出 `tool_options.line.stats_position`；上游的通道与回归趋势线读取 `tool_options.channel`（见[通道](#通道)），其 schema 列出通道的 `middle_line` 与 `middle_color`，回归另列出 `upper_deviation`、`lower_deviation`（默认 `null`，即跟随 `regression_deviations`）、`use_upper_deviation`、`use_lower_deviation`、`source` 与 `show_pearsons`；斐波那契工具读取 `tool_options.fibonacci`（见[斐波那契](#斐波那契)），其 schema 按工具列出 `trend_line`、`grid`、`full_circles`、`label_v_align` 与螺旋线的 `reverse`；谐波形态读取 `tool_options.pattern.show_ratios`，艾略特波浪读取 `tool_options.pattern.show_wave`，二者默认 `true`，其 schema 分别列出它们。这些块的默认值即上游的外观（`tool_options.fibonacci.trend_line` 与 `grid`、`tool_options.gann.time_levels` 与 `show_stats` 默认关闭或为空），因此只发送一个键的补丁不会打开其他内容（`tool_options.pattern` 例外：按维护者的决定，谐波比率默认显示，`show_wave` 默认即上游的外观）；`tool_options.projection_annotation` 只写出与默认值不同的字段。早期构建写出的文档恢复时，会把该构建从不写出的默认值显式写入这些块（见[持久化 V1](compatibility.md#持久化-v1)）。
 
 `drawing_kind_options()` 为斐波那契、叉形线、叉形扇、江恩框与江恩扇形工具返回 `{ kind: "levels", levels, reverse, log_scale, show_prices, show_values, show_percents, label_align }`，为两种方图返回 `{ kind: "gann_square", levels, fans, arcs, reverse, show_prices, show_values, show_percents, label_align }`，并返回 `{ kind: "regression_trend", source_id, deviations }`、`{ kind: "elliott", wave_degree }`、`{ kind: "anchored_text", screen_x, screen_y, box_color, box_border_color, box_border_width }`、`{ kind: "icon_stamp", icon_name, icon_size }` 和 `{ kind: "bars_pattern", mirror_x, mirror_y, mode, bar_count }`，为 `note`、`comment`、`callout` 与 `price_note` 返回 `{ kind: "text", ... }`，为自有线的工具与测量工具返回 `{ kind: "line", stats_position }`、`{ kind: "channel", middle_line, middle_color }` 与 `{ kind: "projection_annotation", ... }`，为其余每个工具返回 `{ kind: "generic" }`。
 
@@ -148,21 +148,29 @@ B8 绘图目录以 AerisTerminal 上游的工具外加自有线的七个工具�
 
 ### 形态、艾略特波浪与周期
 
-| 工具 | 锚点（顶点标签） |
+| 工具 | 锚点（顶点标签；艾略特波浪为默认 `minor` 级别的标注） |
 | --- | --- |
 | `pattern_xabcd`、`pattern_cypher` | X, A, B, C, D |
 | `pattern_abcd` | A, B, C, D |
 | `pattern_head_shoulders` | N, LS, N, H, N, RS, N |
 | `pattern_triangle` | A, B, C, D, E |
 | `pattern_three_drives` | 0, 1, A, 2, B, 3 |
-| `elliott_impulse` | 0, 1, 2, 3, 4, 5 |
-| `elliott_correction` | 0, A, B, C |
-| `elliott_triangle` | 0, A, B, C, D, E |
-| `elliott_double_combination` | 0, W, X, Y |
-| `elliott_triple_combination` | 0, W, X, Y, X, Z |
+| `elliott_impulse` | 起点（不标注）, 1, 2, 3, 4, 5 |
+| `elliott_correction` | 起点（不标注）, A, B, C |
+| `elliott_triangle` | 起点（不标注）, A, B, C, D, E |
+| `elliott_double_combination` | 起点（不标注）, W, X, Y |
+| `elliott_triple_combination` | 起点（不标注）, W, X, Y, X, Z |
 | `cyclic_lines`、`time_cycles`、`sine_line` | 2 |
 
-形态与艾略特波浪是有序、可编辑的锚点路径，顶点标签由引擎拥有；艾略特标签按绘图的 `wave_degree` 读作 `label (degree)`。周期线与时间周期从其两个锚点重复绘制垂直标记（可见的至多 256 个），正弦线把可见窗格采样为至多 512 段。
+形态与艾略特波浪是有序、可编辑的锚点路径，顶点标签由引擎拥有，位于各顶点上方 8 px，是主体命中目标（悬停显示移动光标，拖动移动绘图）。放置期间，从第二次点击起，预览就是将要提交的绘图本身：已放置的锚点加指针所成的折线、顶点标签、比率与填充。
+
+- 谐波形态（`pattern_xabcd`、`pattern_cypher`、`pattern_abcd`、`pattern_three_drives`）在折线之后绘制 1 px 虚线比率连线，并在每条连线中点绘制一个以绘图颜色为底、保留三位小数的价格比率框（文字为 `text_color`，未设置时为黑色或白色）：XABCD 为 XB 上的 AB/XA、AC 上的 BC/AB、BD 上的 CD/BC 与 XD 上的 AD/XA；cypher 为 XB 上的 AB/XA、AC 上的 XC/XA 与 XD 上的 CD/XC；ABCD 为 AC 上的 BC/AB 与 BD 上的 CD/BC；三驱形态为每一段对前一段的比率，画在跨越这两段的连线上。参考段水平时不绘制该比率。连线与比率框都是主体命中目标，由 `tool_options.pattern.show_ratios`（默认 `true`）控制，schema 列出该键。
+- `pattern_xabcd` 与 `pattern_cypher` 在 `fill_enabled` 时为 X-A-B 与 B-C-D 两个三角形着色（`fill_color`，未设置时为绘图颜色、alpha 38，即不透明度约 15%（透明度 85%））；填充仅在绘图被选中时是拖动面。
+- `pattern_head_shoulders` 总是绘制其颈线：穿过两个颈部锚点（第三与第五个锚点）的直线，从它与第一段相交处画到它与最后一段相交处（不相交时止于颈部锚点），使用绘图的描边；`fill_enabled` 时为两肩与头部相对于颈线的三个三角形着色。
+- `pattern_triangle` 在其前四个锚点上取 A–C 与 B–D 两边。当图形朝右（C、D 位于 A、B 之右）且 `extend_right`，或朝左且 `extend_left` 时，绘制这两边；两边在图形前方一个图形宽度内汇合时画到顶点，否则停在锚点上。`fill_enabled` 为两边之间的区域着色（有顶点时为 A、顶点、B 三角形，否则为凸四边形 A、C、D、B）。新绘图不设置这两个标志，早期构建写出的三角形形态恢复时两者都为 `true`。设置标志时，绘图的时间剔除边界向两侧各扩展一个图形宽度（价格不剔除）。
+- 艾略特波浪按 `wave_degree` 的 Frost–Prechter 记法标注各浪，起点（第一个锚点）不标注：`cycle` 及以上用大写罗马数字，`minor` 到 `primary` 用阿拉伯数字，`minute` 及以下用小写罗马数字；字母在阿拉伯数字的三个级别上为大写，其余为小写；每三个级别依次为无括号、括号与圆圈（例如 `minor` 为 `3`，`intermediate` 为 `(3)`，`primary` 为带 1 px 圆圈的 `3`，圆圈下缘位于顶点上方 6 px），`submillennium`、`millennium` 与 `supermillennium` 分别以 `<>`、`[]` 与 `{}` 包围大写罗马数字。圆圈内部也是命中目标。`tool_options.pattern.show_wave: false` 不绘制波浪折线（也不再命中它），只保留标签；schema 列出该键（默认 `true`）。
+
+周期线与时间周期从其两个锚点重复绘制垂直标记（可见的至多 256 个），正弦线把可见窗格采样为至多 512 段。
 
 ### 形状
 

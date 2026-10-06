@@ -443,6 +443,20 @@ impl DrawingBounds {
             DrawingPriceExtent::Finite if line_extension => (None, None),
             DrawingPriceExtent::Finite => (Some(min_price), Some(max_price)),
         };
+        // A triangle pattern's sides reach their apex at most one pattern width ahead of its
+        // anchors, at any price: pad the logical bounds by the anchors' span instead of giving up
+        // time culling like the generic extension below.
+        if kinds::patterns_elliott_cycles::extends_to_apex(drawing) {
+            let span = (max_logical - min_logical).abs();
+            return Self {
+                logical: LogicalBounds::Finite {
+                    min: min_logical - span,
+                    max: max_logical + span,
+                },
+                min_price: None,
+                max_price: None,
+            };
+        }
         // An extended body reaches the pane edge in its own direction, which the anchors'
         // box cannot bound; stay conservative instead of culling the visible extension.
         if drawing.extend_left || drawing.extend_right {
@@ -6770,8 +6784,9 @@ impl ChartEngine {
     /// Whether media px `point` lies in the box of the one-line text run `text` painted as a
     /// `Prim::Text` at media px `anchor` (x its `align` edge, y its vertical center) at glyph
     /// `size` CSS px in `drawing`'s text weight and slant: the measured run, one 1.25 × `size`
-    /// line tall (the parts labels' line box). Labels that paint as bare runs (the level arms')
-    /// are body hit targets through it.
+    /// line tall (the parts labels' line box). Labels that paint as bare runs (the level arms'
+    /// labels and the patterns' and Elliott waves' vertex labels,
+    /// `kinds::patterns_elliott_cycles::vertex_labels`) are body hit targets through it.
     fn text_run_hit(
         &self,
         drawing: &Drawing,
@@ -7465,34 +7480,55 @@ impl ChartEngine {
                 line_type,
                 terminal,
             } => {
-                if crate::hit_test::hit_test_line_series(
-                    points,
-                    x,
-                    y,
-                    line_type,
-                    drawing.width,
-                    None,
-                    self.time_scale.bar_spacing(),
-                    hit_tolerance,
-                )
-                .is_some()
+                let line_hit = |points: &[(f64, f64)], line_type| {
+                    crate::hit_test::hit_test_line_series(
+                        points,
+                        x,
+                        y,
+                        line_type,
+                        drawing.width,
+                        None,
+                        self.time_scale.bar_spacing(),
+                        hit_tolerance,
+                    )
+                    .is_some()
+                };
+                // An Elliott wave without `show_wave` is hit only through its labels.
+                if kinds::patterns_elliott_cycles::draws_wave(drawing)
+                    && line_hit(points, line_type)
                 {
                     return true;
                 }
-                let Some(terminal) = terminal else {
-                    return false;
-                };
-                crate::hit_test::hit_test_line_series(
-                    &terminal,
-                    x,
-                    y,
-                    LineType::Simple,
-                    drawing.width,
-                    None,
-                    self.time_scale.bar_spacing(),
-                    hit_tolerance,
-                )
-                .is_some()
+                if terminal.is_some_and(|terminal| line_hit(&terminal, LineType::Simple)) {
+                    return true;
+                }
+                // The parts a pattern layers on the arm (its sides, ratio connectors and labels,
+                // and while selected its fills), then the vertex labels: each label's measured
+                // run, or the inside of its degree ring.
+                if kinds::patterns_elliott_cycles::layers_parts(drawing.kind)
+                    && self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                        use kinds::patterns_elliott_cycles::{pattern_parts, PatternLayer};
+                        pattern_parts(context, PatternLayer::Under, parts);
+                        pattern_parts(context, PatternLayer::Over, parts);
+                    })
+                {
+                    return true;
+                }
+                let (size, labels) =
+                    kinds::patterns_elliott_cycles::vertex_labels(self, drawing, points, 1.0);
+                labels.iter().any(|label| match label.ring {
+                    Some(radius) => {
+                        (x - label.center.0).hypot(y - label.center.1) <= radius + hit_tolerance
+                    }
+                    None => self.text_run_hit(
+                        drawing,
+                        &label.text,
+                        label.center,
+                        TextAlign::Center,
+                        size,
+                        (x, y),
+                    ),
+                })
             }
             DrawingBodyGeometry::Empty => {
                 if drawing.kind != DrawingKind::Text && !drawing.kind.is_text_annotation() {

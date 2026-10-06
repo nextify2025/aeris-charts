@@ -7228,11 +7228,9 @@ fn pattern_and_elliott_paths_render_vertex_labels_hit_and_persist() {
             )
             .unwrap();
         let frame = chart.build_frame();
-        let expected_label = if kind.is_elliott() {
-            format!("{label} (minor)")
-        } else {
-            label.to_string()
-        };
+        // Elliott waves label in the Frost-Prechter notation of their degree (owner decision
+        // P4): the default minor degree writes Arabic numbers and capital letters bare.
+        let expected_label = label.to_string();
         assert!(frame.panes[0].main.iter().any(|prim| {
             matches!(prim, Prim::Polyline { point_count, .. } if *point_count == count as u32)
         }));
@@ -7252,8 +7250,21 @@ fn pattern_and_elliott_paths_render_vertex_labels_hit_and_persist() {
                 }));
             assert!(!chart.drawing_apply_options(id, r#"{"wave_degree":"invalid"}"#));
             assert_eq!(chart.drawing(id).unwrap().wave_degree, "minor");
+            let polylines = |chart: &mut ChartEngine| {
+                chart.build_frame().panes[0]
+                    .main
+                    .iter()
+                    .filter(|prim| matches!(prim, Prim::Polyline { .. }))
+                    .count()
+            };
+            let minor_polylines = polylines(&mut chart);
             assert!(chart.drawing_apply_options(id, r#"{"wave_degree":"primary"}"#));
-            assert!(pane_texts(&mut chart).contains(&"5 (primary)".to_string()));
+            // Primary rings its bare numbers (one ring per labeled wave); the wave start stays
+            // unlabeled.
+            let texts = pane_texts(&mut chart);
+            assert!(texts.contains(&"5".to_string()));
+            assert!(!texts.contains(&"0".to_string()));
+            assert_eq!(polylines(&mut chart), minor_polylines + 5);
         }
         assert_eq!(
             chart

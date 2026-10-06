@@ -18,6 +18,7 @@ use std::fmt::Write;
 
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
+use crate::drawings::kinds::patterns_elliott_cycles::{self, PatternLayer};
 use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
 use crate::drawings::kinds::{channels, fibonacci, lines};
 use crate::drawings::{
@@ -674,14 +675,16 @@ impl ChartEngine {
                             .apply(&mut anchors, last);
                     }
                 }
-                // Families that resolve partial anchors preview from the second anchor on.
+                // Families that resolve partial anchors preview from the second anchor on, and
+                // so do the patterns and Elliott waves: their legs, labels, ratios and fills
+                // resolve from any prefix of their anchors (owner decision P5).
+                let kind = pending.drawing.kind;
                 let partial = anchors.len() >= 2
-                    && pending
-                        .drawing
-                        .kind
+                    && (kind
                         .spec()
                         .family
-                        .is_some_and(|family| family.partial_preview);
+                        .is_some_and(|family| family.partial_preview)
+                        || kind.vertex_labels().is_some());
                 let ready = if is_sequence {
                     anchors.len() >= pending.drawing.kind.anchor_count()
                 } else {
@@ -2058,6 +2061,20 @@ impl ChartEngine {
                 } else {
                     color
                 };
+                // A pattern layers its fills under the zigzag and its sides, ratio connectors
+                // and ratios over it (`kinds::patterns_elliott_cycles`).
+                let pattern = if patterns_elliott_cycles::layers_parts(drawing.kind) {
+                    self.frame_part_context(drawing, px, pane_w_px, vpr)
+                } else {
+                    None
+                };
+                if let Some(context) = &pattern {
+                    self.push_parts(context, pane_w_px, vpr, out, points, |c, parts| {
+                        patterns_elliott_cycles::pattern_parts(c, PatternLayer::Under, parts);
+                    });
+                }
+                // An Elliott wave without `show_wave` paints only its labels.
+                let wave = patterns_elliott_cycles::draws_wave(drawing);
                 // A solid highlighter paints as the region its stroke covers (the tube around
                 // the same expanded path the stroke would take, round joins and caps), filled
                 // once per pixel: where a wide translucent stroke overlaps or crosses itself, the
@@ -2101,7 +2118,7 @@ impl ChartEngine {
                         line_type: LineType::Simple,
                         fill: color,
                     });
-                } else {
+                } else if wave {
                     push_styled_stroke(
                         out,
                         points,
@@ -2112,7 +2129,7 @@ impl ChartEngine {
                     );
                 }
                 if let (Some(first), Some(last)) = (line_points.first(), line_points.last()) {
-                    if line_points.len() >= 2 {
+                    if line_points.len() >= 2 && wave {
                         push_drawing_cap(
                             drawing.stroke_start,
                             *first,
@@ -2145,23 +2162,46 @@ impl ChartEngine {
                         color,
                     });
                 }
-                if let Some(labels) = drawing.kind.vertex_labels() {
+                if let Some(context) = &pattern {
+                    self.push_parts(context, pane_w_px, vpr, out, points, |c, parts| {
+                        patterns_elliott_cycles::pattern_parts(c, PatternLayer::Over, parts);
+                    });
+                }
+                if drawing.kind.vertex_labels().is_some() {
                     let label_color = drawing
                         .text_color
                         .as_deref()
                         .and_then(Color::parse_css)
                         .unwrap_or(color);
-                    let size =
-                        drawing.resolved_text_size(self.options.get().layout.font_size) * vpr;
-                    for (&(x, y), label) in line_points.iter().zip(labels.iter()) {
+                    // Upstream's placement, shared with hit testing and the culling pad; an
+                    // Elliott degree's ring (1 CSS px) paints before its label.
+                    let (size, labels) =
+                        patterns_elliott_cycles::vertex_labels(self, drawing, line_points, vpr);
+                    let clip = aeris_charts_render::shape::Rect {
+                        left: 0.0,
+                        top: pane.top * vpr,
+                        right: f64::from(pane_w_px),
+                        bottom: (pane.top + pane.height) * vpr,
+                    };
+                    let (mut ring, mut scratch) = (Vec::new(), Vec::new());
+                    for label in labels {
+                        patterns_elliott_cycles::ring_points(&label, &mut ring);
+                        push_clipped_stroke(
+                            out,
+                            points,
+                            &ring,
+                            clip,
+                            (
+                                (patterns_elliott_cycles::DECORATION_WIDTH * vpr) as f32,
+                                LineStyle::Solid,
+                                label_color,
+                            ),
+                            &mut scratch,
+                        );
                         out.push(Prim::Text {
-                            x: x as f32,
-                            y: (y - 8.0 * vpr) as f32,
-                            text: if drawing.kind.is_elliott() {
-                                format!("{label} ({})", drawing.wave_degree)
-                            } else {
-                                (*label).to_string()
-                            },
+                            x: label.center.0 as f32,
+                            y: label.center.1 as f32,
+                            text: label.text,
                             color: label_color,
                             size: size as f32,
                             family: self.options.get().layout.font_family.clone(),

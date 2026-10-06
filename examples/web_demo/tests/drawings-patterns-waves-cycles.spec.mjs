@@ -5,9 +5,10 @@ import { PNG } from "pngjs";
 
 // B8 Patterns, Elliott waves, and cycles family through the public API and real pointer input:
 // armed multi-click placement of every tool with its progressive preview, handle and body edits
-// with undo, the flat Elliott degree and its effect on paint, cycle repeats across the pane,
-// persistence/clipboard/sync round trips, the demo toolbar, and WebGPU == Canvas2D parity. Every
-// geometry decision is engine-owned; these specs only drive the package API and the pointer.
+// with undo, the flat Elliott degree and its effect on paint, label and ratio hover targets, cycle
+// repeats across the pane, persistence/clipboard/sync round trips, the demo toolbar, and
+// WebGPU == Canvas2D parity. Every geometry decision is engine-owned; these specs only drive the
+// package API and the pointer.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
@@ -277,6 +278,53 @@ test("the Elliott degree is a flat, atomic option that relabels the wave", async
   await expect.poll(() => overlay_cursor(page)).toBe("move");
 });
 
+test("vertex labels, ratio labels, and labels of a wave without its line hover as the drawing", async ({ page }) => {
+  await goto_fixture(page);
+  const anchors = await zigzag(page, 5, 0.2, 0.6);
+  const id = await page.evaluate(({ anchors }) => window.__chart.add_drawing("pattern_xabcd", anchors, { color: "#e91e63" }).id, { anchors });
+  await settle_frames(page);
+  const point = (index) => spot(page, anchors[index].logical, anchors[index].price);
+  // The A label sits 8 px above its high, clear of both legs below it.
+  const a = await point(1);
+  await page.mouse.move(a.x, a.y - 8);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  await page.mouse.move(a.x, a.y - 60);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+
+  // The X-B ratio label is boxed at the connector's midpoint (ratios are on by default): the
+  // box corner farther from the dashed connector is a body target only while ratios show.
+  const x = await point(0);
+  const b = await point(2);
+  const middle = { x: (x.x + b.x) / 2, y: (x.y + b.y) / 2 };
+  const length = Math.hypot(b.x - x.x, b.y - x.y);
+  const distance = (dx, dy) => Math.abs((dx * (b.y - x.y) - dy * (b.x - x.x)) / length);
+  const corner = distance(12, 6) >= distance(12, -6) ? { x: middle.x + 12, y: middle.y + 6 } : { x: middle.x + 12, y: middle.y - 6 };
+  await page.mouse.move(corner.x, corner.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  await page.mouse.move(10, 10);
+  await page.evaluate((id) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ tool_options: { pattern: { show_ratios: false } } });
+  }, id);
+  await settle_frames(page);
+  await page.mouse.move(corner.x, corner.y);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+
+  // An Elliott wave without its line keeps its labels as the only targets.
+  await goto_fixture(page);
+  const wave = await zigzag(page, 6, 0.2, 0.7);
+  await page.evaluate(({ wave }) => window.__chart.add_drawing("elliott_impulse", wave, {
+    color: "#e91e63", tool_options: { pattern: { show_wave: false } },
+  }), { wave });
+  await settle_frames(page);
+  const one = await spot(page, wave[1].logical, wave[1].price);
+  await page.mouse.move(one.x, one.y - 8);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  const w2 = await spot(page, wave[2].logical, wave[2].price);
+  const w3 = await spot(page, wave[3].logical, wave[3].price);
+  await page.mouse.move((w2.x + w3.x) / 2, (w2.y + w3.y) / 2);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+});
+
 test("cycles repeat across the pane from their anchors and hit on a far repeat", async ({ page }) => {
   await goto_fixture(page);
   const width = await page.evaluate(() => window.__chart.time_scale().width());
@@ -391,8 +439,9 @@ test("family tools round-trip through persistence, clipboard, and sync with thei
   expect(result.canonical).toEqual(result.state);
   const styles = result.state.drawings.map((drawing) => drawing.style);
   expect(styles[0].fill_enabled).toBe(true);
-  // Earlier builds' pattern options stay stored, inert.
+  // The rendered pattern options persist with the drawing.
   expect(styles[0].tool_options.pattern.show_ratios).toBe(false);
+  expect(styles[4].tool_options.pattern.show_wave).toBe(false);
   expect(styles[1].fill_enabled).toBeUndefined();
   expect(styles[1].tool_options).toBeUndefined();
   expect(styles[3].wave_degree).toBe("minute");
@@ -445,13 +494,15 @@ test("patterns, waves, and cycles render pixel-identical on WebGPU and Canvas2D 
         logical: at(from + ((to - from) * index) / (count - 1)),
         price: up(index % 2 ? high : low),
       }));
-      chart.add_drawing("pattern_xabcd", zig(0.05, 0.3, 5, 0.55, 0.85), { color: "#e91e63" });
+      // Ratio connectors and boxes (on by default), shaded triangles, the neckline, the triangle's
+      // sides to its apex, and ringed Elliott labels all reach both executors.
+      chart.add_drawing("pattern_xabcd", zig(0.05, 0.3, 5, 0.55, 0.85), { color: "#e91e63", fill_enabled: true });
       chart.add_drawing("pattern_head_shoulders", zig(0.35, 0.65, 7, 0.6, 0.8));
       chart.add_drawing("pattern_triangle", [
         { logical: at(0.7), price: up(0.95) }, { logical: at(0.74), price: up(0.6) },
         { logical: at(0.8), price: up(0.88) }, { logical: at(0.84), price: up(0.68) },
         { logical: at(0.88), price: up(0.8) },
-      ]);
+      ], { extend_right: true, fill_enabled: true });
       chart.add_drawing("elliott_impulse", zig(0.05, 0.4, 6, 0.1, 0.4), { wave_degree: "primary" });
       chart.add_drawing("elliott_correction", zig(0.45, 0.6, 4, 0.35, 0.15));
       chart.add_drawing("cyclic_lines", [{ logical: at(0.62), price: up(0.2) }, { logical: at(0.68), price: up(0.2) }], { style: "dotted" });

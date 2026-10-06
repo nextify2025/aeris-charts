@@ -14,10 +14,11 @@
 //! keep their public option types and the fork's pre-merge kind defaults, which
 //! [`apply_legacy_fork_defaults`] applies to documents the fork wrote, together with the fork's
 //! unstored `tool_options` defaults ([`legacy_fork_tool_options`]); the Fibonacci module also
-//! reads its stored options for upstream's level arms (re-applied features). The recipe (what to
+//! reads its stored options for upstream's level arms, and the patterns module resolves the parts
+//! it layers on upstream's polyline arm (re-applied features). The recipe (what to
 //! add where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
 //! Shared single-list registries carry one `// B8: <family> — begin/end` block per family that
-//! takes part (lines, channels, fibonacci, projection_annotations).
+//! takes part (lines, channels, fibonacci, patterns_elliott_cycles, projection_annotations).
 
 use aeris_charts_render::shape::Point;
 
@@ -133,6 +134,11 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
     // B8: fibonacci — begin
     extent = extent.max(fibonacci::upstream_decoration_extent(engine, drawing));
     // B8: fibonacci — end
+    // B8: patterns_elliott_cycles — begin
+    extent = extent.max(patterns_elliott_cycles::upstream_decoration_extent(
+        engine, drawing,
+    ));
+    // B8: patterns_elliott_cycles — end
     extent
 }
 
@@ -153,6 +159,9 @@ pub(crate) fn extend_upstream_schema(
     // B8: fibonacci — begin
     fibonacci::extend_upstream_schema(kind, template, properties);
     // B8: fibonacci — end
+    // B8: patterns_elliott_cycles — begin
+    patterns_elliott_cycles::extend_upstream_schema(kind, template, properties);
+    // B8: patterns_elliott_cycles — end
 }
 
 /// Move the handles of an upstream-rendered kind (no family) onto derived geometry, the

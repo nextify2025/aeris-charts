@@ -506,7 +506,8 @@ pub enum DrawingKindOptions {
 /// reads all of `channel` (middle line as its dashed centre, per-side deviations and switches,
 /// source, Pearson's R), the Fibonacci tools read `fibonacci` (trend line, fan grid, full circles,
 /// vertical label placement, the golden spiral's turn; a stored block also selects the ring
-/// tools' precise rings), and the others do not read their keys yet. Each block's defaults are
+/// tools' precise rings), the harmonic patterns read `pattern.show_ratios` and the Elliott waves
+/// `pattern.show_wave`, and the others do not read their keys yet. Each block's defaults are
 /// upstream's look, and documents and payloads the fork wrote carry the fork's unstored defaults
 /// explicitly (`drawings::kinds::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -725,7 +726,8 @@ pub(crate) fn legacy_bars_pattern(bars: &[[f64; 4]]) -> Vec<crate::drawings::Bar
 /// patch that sends part of a block maps exactly the keys it sends. A block left empty is removed;
 /// every other key stays stored: the own-line families read theirs, and so do the upstream kinds
 /// that layer a presentation on their arms (the line tools' `line`, the channels' and the
-/// regression trend's `channel`, the Fibonacci tools' `fibonacci`), while the other
+/// regression trend's `channel`, the Fibonacci tools' `fibonacci`, the harmonic patterns'
+/// `pattern.show_ratios` and the Elliott waves' `pattern.show_wave`), while the other
 /// upstream-rendered kinds do not read them yet.
 ///
 /// With `absent_block_is_default` (a document the fork wrote, which omitted values equal to its
