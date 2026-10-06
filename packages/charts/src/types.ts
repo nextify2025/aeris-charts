@@ -2643,7 +2643,9 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * `extended_line` always reaches both edges). `trend_line`, `info_line`, `trend_angle`, and
  * `arrow_line` extend by `extend_left`/`extend_right`; a vertical `info_line`, `trend_angle`, or
  * `arrow_line` reaches the pane's top or bottom edge on the ends those flags select, and one whose
- * two anchors coincide stays at its anchor.
+ * two anchors coincide stays at its anchor. The `fibonacci_retracement`, `fibonacci_extension`,
+ * and `fibonacci_channel` levels run to the pane's left and right edges by the same flags (the
+ * channel's along their slope).
  *
  * Own-line kinds (not in the AerisTerminal upstream catalog): `horizontal_segment` keeps both
  * anchors on one price, and `vertical_ray` and `vertical_segment` keep both on one bar (the
@@ -3080,17 +3082,25 @@ export interface channel_tool_options {
   show_pearsons?: boolean | null;
 }
 /**
- * Legacy Fibonacci options (`tool_options.fibonacci`). The shared catalog renders the Fibonacci
- * tools from the flat `levels` and `level_*` options: the deprecated fields are input aliases
- * mapped onto those flat fields on patch and restore and never written back, and the other
- * fields are stored but not rendered. Their defaults are the shared catalog's look; documents an
- * earlier fork build wrote restore with that build's unstored defaults written out (`trend_line`
- * on the retracement, extension, time zones, trend time, speed arcs, circles, and spiral, `grid`
- * on the speed fan, `label_v_align` `"middle"` on the price tools and `"bottom"` on the time
- * tools).
+ * Fibonacci options (`tool_options.fibonacci`). The shared catalog renders the Fibonacci tools
+ * from the flat `levels` and `level_*` options: the deprecated fields are input aliases mapped
+ * onto those flat fields on patch and restore and never written back; the other fields are
+ * rendered on top of that. Their defaults are the shared catalog's look; documents an earlier
+ * fork build wrote restore with that build's unstored defaults written out (`trend_line` on the
+ * retracement, extension, time zones, trend time, speed arcs, circles, and spiral, `grid` on the
+ * speed fan, `label_v_align` `"middle"` on the price tools and `"bottom"` on the time tools, and
+ * the block itself on the wedge). A stored block (with any key; an empty patch block is dropped)
+ * also tessellates the rings of `fibonacci_speed_arcs`, `fibonacci_circles`, and
+ * `fibonacci_wedge` within a quarter pixel over the part the pane shows. Level labels on every
+ * Fibonacci tool, and its filled bands while it is selected, are drag surfaces like its lines.
+ * A `fibonacci_spiral` with an empty `levels` list paints the golden spiral (growing by φ every
+ * quarter turn) through its second anchor instead of the level spirals.
  */
 export interface fibonacci_tool_options {
-  /** @deprecated Input alias of `level_reverse`. */
+  /**
+   * @deprecated Input alias of `level_reverse`. On `fibonacci_spiral` it is stored and turns the
+   * golden spiral (an empty spiral's) counterclockwise.
+   */
   reverse?: boolean;
   /** @deprecated Input alias of `level_show_values`. */
   show_levels?: boolean;
@@ -3100,11 +3110,20 @@ export interface fibonacci_tool_options {
   levels_as_percent?: boolean;
   /** @deprecated Input alias of `level_log_scale`. */
   log_scale?: boolean;
-  /** Dashed trend line through the anchors (default off). Stored but not rendered. */
+  /**
+   * Trend line through the anchors in the drawing's own stroke (default off): both legs on the
+   * extension and trend time, the level-1 diameter through both anchors on the circles, a
+   * 1 CSS px dashed line on the spiral. A drag surface. Retracement, extension, time zones,
+   * trend time, speed arcs, circles, spiral.
+   */
   trend_line?: boolean;
-  /** Speed resistance fan grid (default off). Stored but not rendered. */
+  /**
+   * Speed resistance fan grid (default off): each visible level's horizontal and vertical line
+   * at that level's ratio of the anchors' box (past it for levels outside 0..1) in the drawing's
+   * stroke. A drag surface.
+   */
   grid?: boolean;
-  /** Speed resistance arcs as full circles. Stored but not rendered. */
+  /** Speed resistance arcs as full circles around the second anchor (default off). */
   full_circles?: boolean;
   /**
    * @deprecated Input alias of `level_label_align`. On `fibonacci_time_zones` and
@@ -3113,7 +3132,12 @@ export interface fibonacci_tool_options {
    * line (`"left"` puts the label right of the line).
    */
   label_h_align?: drawing_text_h_align;
-  /** Vertical level label placement. Stored but not rendered. */
+  /**
+   * Vertical level label placement (retracement, extension, channel, time zones, trend time;
+   * unset is `"top"`): price labels above their line, centered on it beside the line's end that
+   * `level_label_align` names (inside at an end extended to the pane edge; `"center"` on the
+   * line's midpoint), or below it; time labels at the pane's top, middle, or bottom.
+   */
   label_v_align?: drawing_text_v_align;
 }
 /**

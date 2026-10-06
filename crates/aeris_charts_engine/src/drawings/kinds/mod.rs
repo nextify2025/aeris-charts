@@ -11,12 +11,13 @@
 //! edits the frame lowering, the hit tester, or another family.
 //!
 //! The modules of the retired fork families (Fibonacci, pitchforks and Gann, patterns, shapes)
-//! keep only their public option types and the fork's pre-merge kind defaults, which
+//! keep their public option types and the fork's pre-merge kind defaults, which
 //! [`apply_legacy_fork_defaults`] applies to documents the fork wrote, together with the fork's
-//! unstored `tool_options` defaults ([`legacy_fork_tool_options`]). The recipe (what to add
-//! where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
-//! Shared single-list registries carry one `// B8: <family> — begin/end` block per surviving
-//! family (lines, channels, projection_annotations).
+//! unstored `tool_options` defaults ([`legacy_fork_tool_options`]); the Fibonacci module also
+//! reads its stored options for upstream's level arms (re-applied features). The recipe (what to
+//! add where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
+//! Shared single-list registries carry one `// B8: <family> — begin/end` block per family that
+//! takes part (lines, channels, fibonacci, projection_annotations).
 
 use aeris_charts_render::shape::Point;
 
@@ -129,6 +130,9 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
     // B8: channels — begin
     extent = extent.max(channels::upstream_decoration_extent(engine, drawing));
     // B8: channels — end
+    // B8: fibonacci — begin
+    extent = extent.max(fibonacci::upstream_decoration_extent(engine, drawing));
+    // B8: fibonacci — end
     extent
 }
 
@@ -146,6 +150,9 @@ pub(crate) fn extend_upstream_schema(
     // B8: channels — begin
     channels::extend_upstream_schema(kind, template, properties);
     // B8: channels — end
+    // B8: fibonacci — begin
+    fibonacci::extend_upstream_schema(kind, template, properties);
+    // B8: fibonacci — end
 }
 
 /// Move the handles of an upstream-rendered kind (no family) onto derived geometry, the

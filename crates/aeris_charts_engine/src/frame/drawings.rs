@@ -19,15 +19,15 @@ use std::fmt::Write;
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
 use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
-use crate::drawings::kinds::{channels, lines};
+use crate::drawings::kinds::{channels, fibonacci, lines};
 use crate::drawings::{
     arrow_cap_triangle, cap_radius, curve_clip, ellipse_outline, level_band_pairs,
     resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
     DrawingHandleMode, DrawingId, DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign,
-    DrawingTextLayout, PartContext, PositionGeometry, PositionZone, TEXT_CHROME_PAD, TEXT_PAD,
-    TREND_TEXT_PLACEHOLDER,
+    DrawingTextLayout, FibonacciArcGeometry, PartContext, PositionGeometry, PositionZone,
+    TimeLevelGeometry, TEXT_CHROME_PAD, TEXT_PAD, TREND_TEXT_PLACEHOLDER,
 };
-use crate::ChartEngine;
+use crate::{ChartEngine, FibonacciLabelVAlign};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
 
 /// industry-standard drawing anchor handle: a theme-derived disc with the primary-token border
@@ -68,6 +68,29 @@ fn push_segment(
         return;
     }
     push_styled_stroke(out, points, &[a, b], LineType::Simple, stroke, pane);
+}
+
+/// A Fibonacci tool's trend line through its anchors `px` (`kinds::fibonacci::trend_line`), in
+/// the drawing's color and [`fibonacci::trend_stroke`], lowered like a core segment.
+fn push_fibonacci_trend_line(
+    drawing: &Drawing,
+    px: &[(f64, f64)],
+    vpr: f64,
+    pane: aeris_charts_render::shape::Rect,
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+) {
+    if let Some((path, count)) = fibonacci::trend_line(drawing, px) {
+        let (width, style) = fibonacci::trend_stroke(drawing);
+        push_styled_stroke(
+            out,
+            points,
+            &path[..count],
+            LineType::Simple,
+            ((width * vpr) as f32, style, drawing.stroke_color()),
+            pane,
+        );
+    }
 }
 
 /// Whether the box `center ± (rx, ry)` meets `clip` (a closed curve inside that box can paint).
@@ -303,7 +326,7 @@ impl ChartEngine {
         price.is_finite().then_some(price)
     }
 
-    fn drawing_level_label(
+    pub(crate) fn drawing_level_label(
         &self,
         drawing: &Drawing,
         value: f64,
@@ -336,6 +359,115 @@ impl ChartEngine {
             "center" => TextAlign::Center,
             _ => TextAlign::Right,
         }
+    }
+
+    /// The label of the Fibonacci arm's level `value` whose line runs `(a, b)` (caller px at
+    /// `vpr` caller px per CSS px): upstream's above the line's `level_label_align` point (the
+    /// top row), below it, or beside the line's end (`label_v_align`). Frame and hit testing
+    /// (`vpr` 1) resolve it alike.
+    pub(crate) fn fibonacci_level_label(
+        &self,
+        drawing: &Drawing,
+        (a, b): ((f64, f64), (f64, f64)),
+        value: f64,
+        vpr: f64,
+    ) -> Option<fibonacci::LevelLabel> {
+        let ((x0, _), (x1, y1)) = (a, b);
+        let price = self.drawing_level_price_at(drawing, y1, vpr);
+        let text = self.drawing_level_label(drawing, value, price)?;
+        let label_x = match drawing.level_label_align.as_str() {
+            "left" => x0,
+            "center" => (x0 + x1) / 2.0,
+            _ => x1,
+        };
+        let (x, y, align) = match fibonacci::label_v_align(drawing) {
+            FibonacciLabelVAlign::Top => {
+                (label_x, y1 - 8.0 * vpr, Self::drawing_level_align(drawing))
+            }
+            FibonacciLabelVAlign::Bottom => {
+                (label_x, y1 + 8.0 * vpr, Self::drawing_level_align(drawing))
+            }
+            FibonacciLabelVAlign::Middle => fibonacci::middle_label_anchor(
+                drawing,
+                (a, b),
+                (drawing.extend_left, drawing.extend_right),
+                fibonacci::label_gap(vpr),
+            ),
+        };
+        Some(fibonacci::LevelLabel { x, y, text, align })
+    }
+
+    /// The label of the time-level arm's level `value` on its vertical line at `x` (caller px at
+    /// `vpr`): upstream's 4 CSS px beside the line by `level_label_align`, at the pane's top,
+    /// middle or bottom (`label_v_align`).
+    pub(crate) fn time_level_label(
+        &self,
+        drawing: &Drawing,
+        time: TimeLevelGeometry,
+        x: f64,
+        value: f64,
+        vpr: f64,
+    ) -> Option<fibonacci::LevelLabel> {
+        let text = self.drawing_level_label(drawing, value, None)?;
+        let offset = match drawing.level_label_align.as_str() {
+            "left" => 4.0 * vpr,
+            "right" => -4.0 * vpr,
+            _ => 0.0,
+        };
+        let y = match fibonacci::label_v_align(drawing) {
+            FibonacciLabelVAlign::Top => time.pane_top + 14.0 * vpr,
+            FibonacciLabelVAlign::Middle => (time.pane_top + time.pane_bottom) / 2.0,
+            FibonacciLabelVAlign::Bottom => time.pane_bottom - 14.0 * vpr,
+        };
+        Some(fibonacci::LevelLabel {
+            x: x + offset,
+            y,
+            text,
+            align: Self::drawing_level_align(drawing),
+        })
+    }
+
+    /// The label of the Fibonacci-arc arm's level `value` (caller px at `vpr`): upstream's, above
+    /// the arc's midpoint.
+    pub(crate) fn arc_level_label(
+        &self,
+        drawing: &Drawing,
+        arcs: FibonacciArcGeometry,
+        value: f64,
+        vpr: f64,
+    ) -> Option<fibonacci::LevelLabel> {
+        let (x, y) = arcs.point(drawing.level_value(value), 0.5);
+        let price = self.drawing_level_price_at(drawing, y, vpr);
+        let text = self.drawing_level_label(drawing, value, price)?;
+        Some(fibonacci::LevelLabel {
+            x,
+            y: y - 8.0 * vpr,
+            text,
+            align: Self::drawing_level_align(drawing),
+        })
+    }
+
+    /// Paint a level arm's `label` in `color` at the layout font (`vpr` caller px per CSS px).
+    fn push_level_label(
+        &self,
+        drawing: &Drawing,
+        label: fibonacci::LevelLabel,
+        color: Color,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+    ) {
+        let layout = &self.options.get().layout;
+        out.push(Prim::Text {
+            x: label.x as f32,
+            y: label.y as f32,
+            text: label.text,
+            color,
+            size: (layout.font_size * vpr) as f32,
+            family: layout.font_family.clone(),
+            align: label.align,
+            weight: drawing.text_weight.unwrap_or(400),
+            italic: drawing.text_italic,
+        });
     }
     fn drawing_frame_text<'a>(&self, drawing: &'a Drawing) -> Option<(&'a str, bool)> {
         if drawing.kind == DrawingKind::PriceLabel {
@@ -1038,6 +1170,34 @@ impl ChartEngine {
                         });
                     }
                 }
+                if fibonacci::draws_grid(drawing) {
+                    let (top, bottom) = (stroke.1.top, stroke.1.bottom);
+                    let right = f64::from(pane_w_px);
+                    for level in drawing.levels.iter().filter(|level| level.visible) {
+                        let [(h0, h1), (v0, v1)] = fib.grid_lines(drawing.level_value(level.value));
+                        if (top..=bottom).contains(&h0.1) {
+                            out.push(Prim::HLine {
+                                y: h0.1.round() as i32,
+                                x0: h0.0.min(h1.0).clamp(0.0, right).round() as i32,
+                                x1: h0.0.max(h1.0).clamp(0.0, right).round() as i32,
+                                width: crisp_width,
+                                style: drawing.style,
+                                color,
+                            });
+                        }
+                        if (0.0..=right).contains(&v0.0) {
+                            out.push(Prim::VLine {
+                                x: v0.0.round() as i32,
+                                y0: v0.1.min(v1.1).clamp(top, bottom).round() as i32,
+                                y1: v0.1.max(v1.1).clamp(top, bottom).round() as i32,
+                                width: crisp_width,
+                                style: drawing.style,
+                                color,
+                            });
+                        }
+                    }
+                }
+                push_fibonacci_trend_line(drawing, px, vpr, stroke.1, out, points);
                 for level in &drawing.levels {
                     if !level.visible {
                         continue;
@@ -1072,24 +1232,13 @@ impl ChartEngine {
                         });
                     }
                     if level.label_visible {
-                        let price = self.drawing_level_price_at(drawing, y1, vpr);
-                        if let Some(text) = self.drawing_level_label(drawing, level.value, price) {
-                            let label_x = match drawing.level_label_align.as_str() {
-                                "left" => x0,
-                                "center" => (x0 + x1) / 2.0,
-                                _ => x1,
-                            };
-                            out.push(Prim::Text {
-                                x: label_x as f32,
-                                y: (y1 - 8.0 * vpr) as f32,
-                                text,
-                                color: level_color,
-                                size: (self.options.get().layout.font_size * vpr) as f32,
-                                family: self.options.get().layout.font_family.clone(),
-                                align: Self::drawing_level_align(drawing),
-                                weight: drawing.text_weight.unwrap_or(400),
-                                italic: drawing.text_italic,
-                            });
+                        if let Some(label) = self.fibonacci_level_label(
+                            drawing,
+                            ((x0, y0), (x1, y1)),
+                            level.value,
+                            vpr,
+                        ) {
+                            self.push_level_label(drawing, label, level_color, vpr, out);
                         }
                     }
                 }
@@ -1112,6 +1261,7 @@ impl ChartEngine {
                         });
                     }
                 }
+                push_fibonacci_trend_line(drawing, px, vpr, stroke.1, out, points);
                 for level in &drawing.levels {
                     if !level.visible {
                         continue;
@@ -1135,24 +1285,10 @@ impl ChartEngine {
                         color: level_color,
                     });
                     if level.label_visible {
-                        if let Some(text) = self.drawing_level_label(drawing, level.value, None) {
-                            out.push(Prim::Text {
-                                x: (x + if drawing.level_label_align == "left" {
-                                    4.0 * vpr
-                                } else if drawing.level_label_align == "right" {
-                                    -4.0 * vpr
-                                } else {
-                                    0.0
-                                }) as f32,
-                                y: (time.pane_top + 14.0 * vpr) as f32,
-                                text,
-                                color: level_color,
-                                size: (self.options.get().layout.font_size * vpr) as f32,
-                                family: self.options.get().layout.font_family.clone(),
-                                align: Self::drawing_level_align(drawing),
-                                weight: drawing.text_weight.unwrap_or(400),
-                                italic: drawing.text_italic,
-                            });
+                        if let Some(label) =
+                            self.time_level_label(drawing, time, x, level.value, vpr)
+                        {
+                            self.push_level_label(drawing, label, level_color, vpr, out);
                         }
                     }
                 }
@@ -1164,25 +1300,69 @@ impl ChartEngine {
                     }
                 }
                 let segments = arcs.segments();
+                // The fork's precise rings: every ring and band over the part the pane shows,
+                // within a quarter pixel (`geometry::Rings`); upstream's fixed chords otherwise.
+                let precise = fibonacci::precise_rings(drawing);
+                let rings = precise
+                    .then(|| {
+                        arcs.rings(
+                            stroke.1,
+                            drawing.width * vpr,
+                            arcs.radius * fibonacci::largest_level(drawing),
+                        )
+                    })
+                    .flatten();
+                let (mut chain, mut scratch) = (Vec::new(), Vec::new());
                 for (prior, level) in level_band_pairs(drawing, &drawing.levels, true) {
+                    let fill = Self::drawing_level_fill(level, color);
                     let upper_first = points.len() as u32;
-                    for value in [prior, level.value] {
-                        for step in 0..=segments {
-                            let (x, y) = arcs.point(
-                                drawing.level_value(value),
-                                step as f64 / f64::from(segments),
-                            );
-                            points.push([x as f32, y as f32]);
+                    let count = if precise {
+                        // A ring tool whose arc misses the pane paints no band.
+                        let Some(rings) = rings else {
+                            continue;
+                        };
+                        let radii = [prior, level.value]
+                            .map(|value| arcs.radius * drawing.level_value(value));
+                        if !rings.reaches(radii[0].min(radii[1]), radii[0].max(radii[1])) {
+                            continue;
                         }
-                    }
+                        for radius in radii {
+                            rings.chain(radius, &mut chain);
+                            points.extend(chain.iter().map(|&(x, y)| [x as f32, y as f32]));
+                        }
+                        chain.len() as u32
+                    } else {
+                        for value in [prior, level.value] {
+                            for step in 0..=segments {
+                                let (x, y) = arcs.point(
+                                    drawing.level_value(value),
+                                    step as f64 / f64::from(segments),
+                                );
+                                points.push([x as f32, y as f32]);
+                            }
+                        }
+                        segments + 1
+                    };
                     out.push(Prim::BandFill {
                         upper_first,
-                        lower_first: upper_first + segments + 1,
-                        point_count: segments + 1,
+                        lower_first: upper_first + count,
+                        point_count: count,
                         line_type: LineType::Simple,
-                        fill: Self::drawing_level_fill(level, color),
+                        fill,
                     });
                 }
+                if fibonacci::phi_spiral(drawing) {
+                    let width = drawing.width * vpr;
+                    arcs.phi_spiral(
+                        fibonacci::options(drawing).reverse,
+                        stroke.1,
+                        (width, vpr, fibonacci::dash_period(drawing.style, width)),
+                        |run| {
+                            push_clipped_stroke(out, points, run, stroke.1, stroke.0, &mut scratch)
+                        },
+                    );
+                }
+                push_fibonacci_trend_line(drawing, px, vpr, stroke.1, out, points);
                 for level in &drawing.levels {
                     if !level.visible || drawing.level_value(level.value) <= 0.0 {
                         continue;
@@ -1193,37 +1373,43 @@ impl ChartEngine {
                         "dashed" | "large_dashed" => LineStyle::Dashed,
                         _ => LineStyle::Solid,
                     };
-                    let first_point = points.len() as u32;
-                    for step in 0..=segments {
-                        let (x, y) = arcs.point(
-                            drawing.level_value(level.value),
-                            step as f64 / f64::from(segments),
-                        );
-                        points.push([x as f32, y as f32]);
-                    }
-                    out.push(Prim::Polyline {
-                        first_point,
-                        point_count: segments + 1,
-                        width: (drawing.width * vpr) as f32,
-                        style,
-                        line_type: LineType::Simple,
-                        color: level_color,
-                    });
-                    if level.label_visible {
-                        let (x, y) = arcs.point(drawing.level_value(level.value), 0.5);
-                        let price = self.drawing_level_price_at(drawing, y, vpr);
-                        if let Some(text) = self.drawing_level_label(drawing, level.value, price) {
-                            out.push(Prim::Text {
-                                x: x as f32,
-                                y: (y - 8.0 * vpr) as f32,
-                                text,
-                                color: level_color,
-                                size: (self.options.get().layout.font_size * vpr) as f32,
-                                family: self.options.get().layout.font_family.clone(),
-                                align: Self::drawing_level_align(drawing),
-                                weight: drawing.text_weight.unwrap_or(400),
-                                italic: drawing.text_italic,
+                    let width = drawing.width * vpr;
+                    if precise {
+                        let radius = arcs.radius * drawing.level_value(level.value);
+                        if let Some(rings) = rings.filter(|rings| rings.reaches(radius, radius)) {
+                            let period = fibonacci::dash_period(style, width);
+                            rings.stroke(radius, period, &mut chain, |run| {
+                                push_clipped_stroke(
+                                    out,
+                                    points,
+                                    run,
+                                    stroke.1,
+                                    (width as f32, style, level_color),
+                                    &mut scratch,
+                                );
                             });
+                        }
+                    } else {
+                        let first_point = points.len() as u32;
+                        for step in 0..=segments {
+                            let (x, y) = arcs.point(
+                                drawing.level_value(level.value),
+                                step as f64 / f64::from(segments),
+                            );
+                            points.push([x as f32, y as f32]);
+                        }
+                        out.push(Prim::Polyline {
+                            first_point,
+                            point_count: segments + 1,
+                            width: width as f32,
+                            style,
+                            line_type: LineType::Simple,
+                            color: level_color,
+                        });
+                    }
+                    if level.label_visible {
+                        if let Some(label) = self.arc_level_label(drawing, arcs, level.value, vpr) {
+                            self.push_level_label(drawing, label, level_color, vpr, out);
                         }
                     }
                 }

@@ -210,16 +210,44 @@ impl FibonacciGeometry {
                     self.start.1
                 };
                 let offset = (pivot.1 - base_y) * value;
-                (
+                let mut ends = [
                     (self.start.0, self.start.1 + offset),
                     (self.end.0, self.end.1 + offset),
-                )
+                ];
+                // `extend_left`/`extend_right` moved `x0`/`x1` to the pane's edges: each level
+                // runs along itself to the edge on that side of the screen (unextended, `x0` and
+                // `x1` are the anchors' own span and nothing moves).
+                if dx.abs() > f64::EPSILON {
+                    let slope = (self.end.1 - self.start.1) / dx;
+                    let (left, right) = if dx > 0.0 { (0, 1) } else { (1, 0) };
+                    for (index, x) in [(left, self.x0), (right, self.x1)] {
+                        if x != ends[index].0 {
+                            ends[index] = (x, ends[index].1 + (x - ends[index].0) * slope);
+                        }
+                    }
+                }
+                (ends[0], ends[1])
             }
             _ => {
                 let y = self.start.1 + (self.end.1 - self.start.1) * value;
                 ((self.x0, y), (self.x1, y))
             }
         }
+    }
+}
+
+impl FibonacciGeometry {
+    /// The speed resistance fan's grid lines at the effective level `value` inside the anchors'
+    /// box: the horizontal line through the level's price ray end, from the first anchor's time
+    /// to the second's, and the vertical line at the same ratio of the anchors' time span, from
+    /// the first anchor's price to the second's.
+    pub(crate) fn grid_lines(self, value: f64) -> [((f64, f64), (f64, f64)); 2] {
+        let y = self.start.1 + (self.end.1 - self.start.1) * value;
+        let x = self.start.0 + (self.end.0 - self.start.0) * value;
+        [
+            ((self.start.0, y), (self.end.0, y)),
+            ((x, self.start.1), (x, self.end.1)),
+        ]
     }
 }
 
@@ -273,6 +301,268 @@ impl FibonacciArcGeometry {
             32
         }
     }
+
+    /// The whole arc every level of a ring tool (speed arcs, circles, wedge) follows, as its
+    /// start angle and signed sweep: the parametrisation of [`Self::point`].
+    fn arc(self) -> (f64, f64) {
+        if self.kind == DrawingKind::FibonacciWedge {
+            (self.start_angle, self.sweep)
+        } else {
+            (self.start_angle - self.sweep / 2.0, self.sweep)
+        }
+    }
+
+    /// The precise rings of a ring tool (the fork's tessellation, `kinds::fibonacci::precise_rings`)
+    /// against `pane` (caller px), for strokes of half width `half` and levels up to the radius
+    /// `largest`: only the part of the arc the pane shows is tessellated, within
+    /// [`CURVE_TOLERANCE`] at the largest radius that can show (so at every smaller one), and a
+    /// radius beyond the farthest pane point closes at it. `None` when the arc misses the pane.
+    pub(crate) fn rings(self, pane: Rect, half: f64, largest: f64) -> Option<Rings> {
+        if self.kind == DrawingKind::FibonacciSpiral
+            || self.radius.is_nan()
+            || self.radius <= f64::EPSILON
+        {
+            return None;
+        }
+        let (near, far) = pane_distances(pane, self.center);
+        let cap = far + half + 1.0;
+        let window = visible_arc(pane, self.center, self.arc())?;
+        let segments = shape::arc_segment_count(largest.min(cap), window.1, CURVE_TOLERANCE);
+        Some(Rings {
+            center: self.center,
+            arc: self.arc(),
+            window,
+            segments,
+            near,
+            far,
+            cap,
+            half,
+        })
+    }
+
+    /// The golden spiral (`kinds::fibonacci::phi_spiral`) around the center through the second
+    /// anchor, growing by φ every quarter turn, clockwise on screen (counterclockwise with
+    /// `reverse`), from [`SPIRAL_MIN_RADIUS`] CSS px (`scale` caller px each) until it leaves
+    /// `pane` (caller px) for good, as runs handed to `emit`. Only the part of each quarter turn
+    /// inside the pane's angular window is tessellated (within [`CURVE_TOLERANCE`]), quarter turns
+    /// that cannot reach the pane are skipped, and at most [`MAX_SPIRAL_QUARTERS`] are walked, so
+    /// a spiral centered far off the pane costs bounded work. With a dash `period` (caller px; 0
+    /// when solid) a run starts at the last dash-period boundary before it, in arc length from the
+    /// inner end, so its dashes stay put while the pane scrolls.
+    pub(crate) fn phi_spiral(
+        self,
+        reverse: bool,
+        pane: Rect,
+        (half, scale, period): (f64, f64, f64),
+        mut emit: impl FnMut(&[Point]),
+    ) {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        let (a, r0, theta0) = (self.center, self.radius, self.start_angle);
+        if r0.is_nan() || r0 <= f64::EPSILON || !theta0.is_finite() {
+            return;
+        }
+        let turn = if reverse { -1.0 } else { 1.0 };
+        // r = r0·e^(k·t) after turning `t` radians past the second anchor; k = ln φ / (π/2).
+        let golden = (1.0 + 5.0_f64.sqrt()) / 2.0;
+        let growth = golden.ln() / FRAC_PI_2;
+        let radius = |t: f64| r0 * (growth * t).exp();
+        let turned = |r: f64| (r / r0).ln() / growth;
+        // A logarithmic spiral's arc length grows linearly with its radius.
+        let length_per_radius = (1.0 + growth * growth).sqrt() / growth;
+        let (near, far) = pane_distances(pane, a);
+        let inner = (SPIRAL_MIN_RADIUS * scale).min(r0);
+        let start = turned(inner);
+        // Past the farthest pane point the radius only grows, so the spiral never returns.
+        let end = turned(far + half);
+        let quarters = ((end - start) / FRAC_PI_2)
+            .ceil()
+            .clamp(1.0, MAX_SPIRAL_QUARTERS as f64) as usize;
+        let mut run: Vec<Point> = Vec::new();
+        let mut run_end = f64::NAN;
+        for index in 0..quarters {
+            let t0 = start + FRAC_PI_2 * index as f64;
+            if radius(t0 + FRAC_PI_2) + half < near {
+                continue;
+            }
+            let angle0 = (theta0 + turn * t0 + PI).rem_euclid(TAU) - PI;
+            let Some((from, sweep)) = visible_arc(pane, a, (angle0, turn * FRAC_PI_2)) else {
+                continue;
+            };
+            let (t_from, t_to) = (
+                t0 + (from - angle0) * turn,
+                t0 + (from + sweep - angle0) * turn,
+            );
+            let t_start = if (t_from - run_end).abs() <= 1e-9 {
+                // This piece continues the previous one.
+                t_from
+            } else {
+                if run.len() >= 2 {
+                    emit(&run);
+                }
+                run.clear();
+                if period > 0.0 {
+                    let travelled = (radius(t_from) - inner) * length_per_radius;
+                    turned(radius(t_from) - travelled.rem_euclid(period) / length_per_radius)
+                } else {
+                    t_from
+                }
+            };
+            let segments = shape::arc_segment_count(radius(t_to), t_to - t_start, CURVE_TOLERANCE);
+            let first = usize::from(!run.is_empty());
+            for step in first..=segments {
+                let t = t_start + (t_to - t_start) * step as f64 / segments as f64;
+                let (r, angle) = (radius(t), theta0 + turn * t);
+                run.push((a.0 + r * angle.cos(), a.1 + r * angle.sin()));
+            }
+            run_end = t_to;
+        }
+        if run.len() >= 2 {
+            emit(&run);
+        }
+    }
+}
+
+/// Smallest radius of the golden spiral, CSS px: it starts below a pixel, at its center.
+const SPIRAL_MIN_RADIUS: f64 = 0.5;
+/// Most quarter turns the golden spiral walks (φ^128 covers any pane from a sub-pixel start).
+const MAX_SPIRAL_QUARTERS: usize = 128;
+
+/// A ring tool's concentric arcs over the part of the pane they show
+/// ([`FibonacciArcGeometry::rings`]): every ring and band chain shares the window's angles, so
+/// paired band chains match point for point.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rings {
+    center: Point,
+    /// The whole arc: start angle and signed sweep.
+    arc: (f64, f64),
+    /// The part of `arc` the pane shows.
+    window: (f64, f64),
+    segments: usize,
+    /// Nearest and farthest pane point from the center.
+    near: f64,
+    far: f64,
+    /// Radius a ring beyond `far` closes at: the same pane pixels, with finite points.
+    cap: f64,
+    half: f64,
+}
+
+impl Rings {
+    /// Whether the band between radii `inner` and `outer` (a ring when equal) can reach the pane.
+    pub(crate) fn reaches(&self, inner: f64, outer: f64) -> bool {
+        outer + self.half >= self.near && inner - self.half <= self.far
+    }
+
+    /// The window's chain at `radius` (closed at the cap), replacing `out`.
+    pub(crate) fn chain(&self, radius: f64, out: &mut Vec<Point>) {
+        out.clear();
+        let radius = radius.min(self.cap);
+        let (start, sweep) = self.window;
+        out.extend((0..=self.segments).map(|step| {
+            let angle = start + sweep * step as f64 / self.segments as f64;
+            (
+                self.center.0 + radius * angle.cos(),
+                self.center.1 + radius * angle.sin(),
+            )
+        }));
+    }
+
+    /// Stroke the ring of `radius` over the window, as runs handed to `emit`. With a dash
+    /// `period` (caller px; 0 when solid) a ring the pane shows only in part starts each piece at
+    /// the last dash-period boundary before the window, in arc length from the arc's start, so
+    /// dashes stay put while the pane scrolls instead of following the window's edge.
+    pub(crate) fn stroke(
+        &self,
+        radius: f64,
+        period: f64,
+        out: &mut Vec<Point>,
+        mut emit: impl FnMut(&[Point]),
+    ) {
+        if period <= 0.0 || self.window == self.arc {
+            self.chain(radius, out);
+            emit(out);
+            return;
+        }
+        let (arc_start, sweep) = self.arc;
+        let direction = sweep.signum();
+        let length = self.window.1.abs();
+        // How far along the arc the window starts, within one turn.
+        let from = ((self.window.0 - arc_start) * direction).rem_euclid(std::f64::consts::TAU);
+        let wrapped = (from + length - std::f64::consts::TAU).max(0.0);
+        for (start, span) in [(from, length - wrapped), (0.0, wrapped)] {
+            if span <= 0.0 {
+                continue;
+            }
+            let back = (start * radius).rem_euclid(period) / radius;
+            let piece = shape::EllipseArc::circle(
+                self.center,
+                radius,
+                arc_start + direction * (start - back),
+                direction * (span + back),
+            );
+            out.clear();
+            piece.append_points(CURVE_TOLERANCE, out);
+            emit(out);
+        }
+    }
+}
+
+/// Distances from `point` to the nearest and the farthest point of `pane`.
+fn pane_distances(pane: Rect, point: Point) -> (f64, f64) {
+    let dx = (pane.left - point.0).max(point.0 - pane.right).max(0.0);
+    let dy = (pane.top - point.1).max(point.1 - pane.bottom).max(0.0);
+    let far = pane_corners(pane)
+        .iter()
+        .map(|corner| (corner.0 - point.0).hypot(corner.1 - point.1))
+        .fold(0.0_f64, f64::max);
+    (dx.hypot(dy), far)
+}
+
+fn pane_corners(pane: Rect) -> [Point; 4] {
+    [
+        (pane.left, pane.top),
+        (pane.right, pane.top),
+        (pane.right, pane.bottom),
+        (pane.left, pane.bottom),
+    ]
+}
+
+/// The part of the arc `(start, sweep)` around `center` that can reach `pane`: the whole arc
+/// when the center lies in the pane, else its overlap with the angular window the pane subtends
+/// from the center (under π wide; a full turn becomes the window, and an arc of at most π meets
+/// it in one piece), keeping the arc's direction. `None` when they miss.
+fn visible_arc(pane: Rect, center: Point, (start, sweep): (f64, f64)) -> Option<(f64, f64)> {
+    use std::f64::consts::{PI, TAU};
+    if pane.contains(center) {
+        return Some((start, sweep));
+    }
+    let reference = ((pane.top + pane.bottom) / 2.0 - center.1)
+        .atan2((pane.left + pane.right) / 2.0 - center.0);
+    let (mut low, mut high) = (0.0_f64, 0.0_f64);
+    for corner in pane_corners(pane) {
+        let angle = (corner.1 - center.1).atan2(corner.0 - center.0);
+        let delta = (angle - reference + PI).rem_euclid(TAU) - PI;
+        low = low.min(delta);
+        high = high.max(delta);
+    }
+    let window = (reference + low, reference + high);
+    if sweep.abs() >= TAU - 1e-9 {
+        return Some((window.0, window.1 - window.0));
+    }
+    let arc = if sweep >= 0.0 {
+        (start, start + sweep)
+    } else {
+        (start + sweep, start)
+    };
+    // Both ranges lie within (-3π, 3π], so shifts of up to two turns align them.
+    (-2..=2).find_map(|turns| {
+        let shift = TAU * f64::from(turns);
+        let (from, to) = (arc.0.max(window.0 + shift), arc.1.min(window.1 + shift));
+        (to > from).then_some(if sweep >= 0.0 {
+            (from, to - from)
+        } else {
+            (to, from - to)
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -572,6 +862,8 @@ pub(crate) struct DrawingGeometryOptions {
     pub(crate) icon_size: f64,
     pub(crate) extend_left: bool,
     pub(crate) extend_right: bool,
+    /// Speed resistance arcs sweep full circles (`tool_options.fibonacci.full_circles`).
+    pub(crate) full_circles: bool,
 }
 
 impl DrawingGeometryOptions {
@@ -586,6 +878,7 @@ impl DrawingGeometryOptions {
             icon_size: drawing.icon_size,
             extend_left: drawing.extend_left,
             extend_right: drawing.extend_right,
+            full_circles: super::kinds::fibonacci::options(drawing).full_circles,
         }
     }
 }
@@ -972,7 +1265,7 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 delta
             } else if spiral {
                 4.0 * std::f64::consts::PI
-            } else if kind == DrawingKind::FibonacciCircles {
+            } else if kind == DrawingKind::FibonacciCircles || options.full_circles {
                 std::f64::consts::TAU
             } else {
                 std::f64::consts::PI

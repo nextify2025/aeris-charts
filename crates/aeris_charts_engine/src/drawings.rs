@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use aeris_charts_core::model::data_validation::MAX_SAFE_VALUE;
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, LineType, RasterImage};
+use aeris_charts_render::draw_list::{LineStyle, LineType, RasterImage, TextAlign};
 use aeris_charts_render::shape;
 
 use super::*;
@@ -36,7 +36,8 @@ mod tools;
 
 pub(crate) use geometry::{
     curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry, DrawingBodyGeometry,
-    DrawingGeometryOptions, FibonacciGeometry, MeasureAxes, PositionGeometry, PositionZone,
+    DrawingGeometryOptions, FibonacciArcGeometry, FibonacciGeometry, MeasureAxes, PositionGeometry,
+    PositionZone, TimeLevelGeometry,
 };
 pub(crate) use parts::{arrow_cap_triangle, cap_radius, DrawingPart, DrawingParts, PartContext};
 pub(crate) use tools::{
@@ -365,6 +366,18 @@ impl DrawingBounds {
                     max_logical = max_logical.max(logical);
                     min_price = min_price.min(price);
                     max_price = max_price.max(price);
+                }
+            }
+        }
+        if kinds::fibonacci::draws_grid(drawing) && drawing.points.len() == 2 {
+            // The grid's vertical lines sit at each level's ratio of the anchors' time span,
+            // which a level beyond [0, 1] takes past the anchors.
+            let (start, end) = (drawing.points[0].logical, drawing.points[1].logical);
+            for level in drawing.levels.iter().filter(|level| level.visible) {
+                let logical = start + (end - start) * drawing.level_value(level.value);
+                if logical.is_finite() {
+                    min_logical = min_logical.min(logical);
+                    max_logical = max_logical.max(logical);
                 }
             }
         }
@@ -881,6 +894,23 @@ pub enum DrawingKind {
 }
 
 impl DrawingKind {
+    /// The ten Fibonacci tools (the fork's Fibonacci family, wire ids `36..=45`).
+    pub(crate) const fn is_fibonacci(self) -> bool {
+        matches!(
+            self,
+            Self::FibonacciRetracement
+                | Self::FibonacciExtension
+                | Self::FibonacciChannel
+                | Self::FibonacciTimeZones
+                | Self::FibonacciTrendTime
+                | Self::FibonacciSpeedFan
+                | Self::FibonacciSpeedArcs
+                | Self::FibonacciCircles
+                | Self::FibonacciSpiral
+                | Self::FibonacciWedge
+        )
+    }
+
     pub(crate) const fn has_levels(self) -> bool {
         matches!(
             self,
@@ -4420,14 +4450,19 @@ impl ChartEngine {
                 ) else {
                     return false;
                 };
-                if let DrawingBodyGeometry::FibonacciArcs(arcs) = geometry.body {
-                    let radius = arcs.radius
-                        * drawing
-                            .levels
-                            .iter()
-                            .filter(|level| level.visible)
-                            .map(|level| drawing.level_value(level.value).max(0.0))
-                            .fold(0.0, f64::max);
+                if kinds::fibonacci::phi_spiral(drawing) {
+                    // The golden spiral reaches past every pane corner.
+                    (box_left, box_right) = (0.0, self.pane_w);
+                    (box_top, box_bottom) = (pane.top, pane.top + pane.height);
+                } else if let DrawingBodyGeometry::FibonacciArcs(arcs) = geometry.body {
+                    let mut factor = kinds::fibonacci::largest_level(drawing);
+                    // The trend line ends on the level-1 ring (the circles' diameter included).
+                    if kinds::fibonacci::trend_line(drawing, &px[..drawing.points.len().min(4)])
+                        .is_some()
+                    {
+                        factor = factor.max(1.0);
+                    }
+                    let radius = arcs.radius * factor;
                     box_left = arcs.center.0 - radius;
                     box_right = arcs.center.0 + radius;
                     box_top = arcs.center.1 - radius;
@@ -6732,6 +6767,183 @@ impl ChartEngine {
         })
     }
 
+    /// Whether media px `point` lies in the box of the one-line text run `text` painted as a
+    /// `Prim::Text` at media px `anchor` (x its `align` edge, y its vertical center) at glyph
+    /// `size` CSS px in `drawing`'s text weight and slant: the measured run, one 1.25 × `size`
+    /// line tall (the parts labels' line box). Labels that paint as bare runs (the level arms')
+    /// are body hit targets through it.
+    fn text_run_hit(
+        &self,
+        drawing: &Drawing,
+        text: &str,
+        anchor: (f64, f64),
+        align: TextAlign,
+        size: f64,
+        point: (f64, f64),
+    ) -> bool {
+        // The line box rejects first, so a pointer off the label row measures nothing.
+        if (point.1 - anchor.1).abs() > size * 1.25 / 2.0 {
+            return false;
+        }
+        let width = self.measure_text_run(
+            text,
+            size,
+            &self.options.get().layout.font_family,
+            drawing.text_weight.unwrap_or(400),
+            drawing.text_italic,
+        );
+        let left = match align {
+            TextAlign::Left => anchor.0,
+            TextAlign::Center => anchor.0 - width / 2.0,
+            TextAlign::Right => anchor.0 - width,
+        };
+        point.0 >= left && point.0 <= left + width
+    }
+
+    /// Whether media px `point` hits a level arm's `label` (see [`Self::text_run_hit`]) at the
+    /// layout font the arms paint with.
+    fn level_label_hit(
+        &self,
+        drawing: &Drawing,
+        label: Option<kinds::fibonacci::LevelLabel>,
+        point: (f64, f64),
+    ) -> bool {
+        label.is_some_and(|label| {
+            self.text_run_hit(
+                drawing,
+                &label.text,
+                (label.x, label.y),
+                label.align,
+                self.options.get().layout.font_size,
+                point,
+            )
+        })
+    }
+
+    /// The Fibonacci-arc arm's body test (speed arcs, circles, spiral, wedge) at media px `point`
+    /// against the anchors `px`, as the frame paints it: the wedge's edges, each visible level's
+    /// ring or spiral (upstream's fixed chords, or the precise rings of a stored block), its
+    /// label, the golden spiral of an empty spiral, the trend line, and, while selected, the
+    /// bands. `tolerance` is the stroke's half width plus the pointer slack `hit_tolerance`.
+    fn fibonacci_arcs_hit(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        arcs: FibonacciArcGeometry,
+        pane: shape::Rect,
+        point: (f64, f64),
+        (tolerance, hit_tolerance): (f64, f64),
+    ) -> bool {
+        let (x, y) = point;
+        if arcs.kind == DrawingKind::FibonacciWedge
+            && px[1..3].iter().any(|side| {
+                distance_to_segment(x, y, px[0].0, px[0].1, side.0, side.1) <= tolerance
+            })
+        {
+            return true;
+        }
+        let precise = kinds::fibonacci::precise_rings(drawing);
+        let rings = precise
+            .then(|| {
+                arcs.rings(
+                    pane,
+                    drawing.width,
+                    arcs.radius * kinds::fibonacci::largest_level(drawing),
+                )
+            })
+            .flatten();
+        let (mut chain, mut other) = (Vec::new(), Vec::new());
+        let segments = arcs.segments();
+        let upstream_chain = |value: f64, out: &mut Vec<(f64, f64)>| {
+            out.clear();
+            out.extend((0..=segments).map(|step| {
+                arcs.point(
+                    drawing.level_value(value),
+                    f64::from(step) / f64::from(segments),
+                )
+            }));
+        };
+        for level in &drawing.levels {
+            let value = drawing.level_value(level.value);
+            if !level.visible || value <= 0.0 {
+                continue;
+            }
+            let radius = arcs.radius * value;
+            let line = if precise {
+                match rings.filter(|rings| rings.reaches(radius, radius)) {
+                    Some(rings) => {
+                        rings.chain(radius, &mut chain);
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                upstream_chain(level.value, &mut chain);
+                true
+            };
+            if (line && shape::distance_to_polyline(point, &chain) <= tolerance)
+                || (level.label_visible
+                    && self.level_label_hit(
+                        drawing,
+                        self.arc_level_label(drawing, arcs, level.value, 1.0),
+                        point,
+                    ))
+            {
+                return true;
+            }
+        }
+        if kinds::fibonacci::phi_spiral(drawing) {
+            let mut hit = false;
+            arcs.phi_spiral(
+                kinds::fibonacci::options(drawing).reverse,
+                pane,
+                (drawing.width, 1.0, 0.0),
+                |run| hit |= shape::distance_to_polyline(point, run) <= tolerance,
+            );
+            if hit {
+                return true;
+            }
+        }
+        if self.fibonacci_trend_line_hit(drawing, px, point, hit_tolerance) {
+            return true;
+        }
+        if self.selected_drawing != Some(drawing.id) {
+            return false;
+        }
+        level_band_pairs(drawing, &drawing.levels, true).any(|(prior, level)| {
+            if precise {
+                let radii =
+                    [prior, level.value].map(|value| arcs.radius * drawing.level_value(value));
+                let Some(rings) = rings
+                    .filter(|rings| rings.reaches(radii[0].min(radii[1]), radii[0].max(radii[1])))
+                else {
+                    return false;
+                };
+                rings.chain(radii[0], &mut chain);
+                rings.chain(radii[1], &mut other);
+            } else {
+                upstream_chain(prior, &mut chain);
+                upstream_chain(level.value, &mut other);
+            }
+            self.band_fill_hit(drawing, &chain, &other, point)
+        })
+    }
+
+    /// Whether media px `point` lies within `hit_tolerance` beyond the half width of the trend
+    /// line a Fibonacci tool strokes through its anchors `px` (`kinds::fibonacci::trend_line`).
+    fn fibonacci_trend_line_hit(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        point: (f64, f64),
+        hit_tolerance: f64,
+    ) -> bool {
+        kinds::fibonacci::trend_line(drawing, px).is_some_and(|(path, count)| {
+            let (width, _) = kinds::fibonacci::trend_stroke(drawing);
+            shape::distance_to_polyline(point, &path[..count]) <= width / 2.0 + hit_tolerance
+        })
+    }
+
     /// Whether media px `point` lies in the band fill between the paired chains `upper` and
     /// `lower` (the region `Prim::BandFill` paints, two lobes where the chains cross) of
     /// `drawing`, which is a drag surface only while the drawing is selected (the rectangle's
@@ -6944,43 +7156,103 @@ impl ChartEngine {
             DrawingBodyGeometry::RegressionWindow { a, b } => {
                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
             }
-            DrawingBodyGeometry::Fibonacci(fib) => drawing.levels.iter().any(|level| {
-                if !level.visible {
-                    return false;
-                }
-                let (a, b) = self.drawing_fibonacci_level_segment(drawing, fib, level.value, 1.0);
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
+            // Level lines, their labels, the fan grid, the trend line, and (while selected)
+            // the bands, as the frame paints them.
+            DrawingBodyGeometry::Fibonacci(fib) => {
+                let segment =
+                    |value| self.drawing_fibonacci_level_segment(drawing, fib, value, 1.0);
+                let visible = || drawing.levels.iter().filter(|level| level.visible);
+                visible().any(|level| {
+                    let (a, b) = segment(level.value);
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                        || (level.label_visible
+                            && self.level_label_hit(
+                                drawing,
+                                self.fibonacci_level_label(drawing, (a, b), level.value, 1.0),
+                                (x, y),
+                            ))
+                }) || (kinds::fibonacci::draws_grid(drawing)
+                    && visible().any(|level| {
+                        fib.grid_lines(drawing.level_value(level.value))
+                            .iter()
+                            .any(|&(a, b)| {
+                                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                            })
+                    }))
+                    || self.fibonacci_trend_line_hit(drawing, px, (x, y), hit_tolerance)
+                    || level_band_pairs(drawing, &drawing.levels, false).any(|(prior, level)| {
+                        let (prior, current) = (segment(prior), segment(level.value));
+                        let ((x0, y0), (x1, y1)) = current;
+                        if (y0 - y1).abs() <= f64::EPSILON {
+                            // The frame paints a band under a horizontal level as the box from
+                            // that level to the prior segment's start (at least 1 px each way).
+                            let (left, top) = (x0.min(x1), y0.min(prior.0 .1));
+                            let right = left + (x1 - x0).abs().max(1.0);
+                            let bottom = top + (y0 - prior.0 .1).abs().max(1.0);
+                            self.band_fill_hit(
+                                drawing,
+                                &[(left, top), (right, top)],
+                                &[(left, bottom), (right, bottom)],
+                                (x, y),
+                            )
+                        } else {
+                            self.band_fill_hit(
+                                drawing,
+                                &[prior.0, prior.1],
+                                &[current.0, current.1],
+                                (x, y),
+                            )
+                        }
+                    })
+            }
             DrawingBodyGeometry::TimeLevels(time) => {
-                y >= time.pane_top - hit_tolerance
+                let in_pane = |x: f64| (0.0..=self.pane_w).contains(&x);
+                (y >= time.pane_top - hit_tolerance
                     && y <= time.pane_bottom + hit_tolerance
                     && drawing.levels.iter().any(|level| {
                         level.visible
                             && (x - time.x(drawing.level_value(level.value))).abs() <= tolerance
-                    })
-            }
-            DrawingBodyGeometry::FibonacciArcs(arcs) => {
-                (arcs.kind == DrawingKind::FibonacciWedge
-                    && px[1..3].iter().any(|side| {
-                        distance_to_segment(x, y, px[0].0, px[0].1, side.0, side.1) <= tolerance
                     }))
                     || drawing.levels.iter().any(|level| {
+                        let line_x = time.x(drawing.level_value(level.value));
                         level.visible
-                            && drawing.level_value(level.value) > 0.0
-                            && (0..arcs.segments()).any(|step| {
-                                let segments = f64::from(arcs.segments());
-                                let a = arcs.point(
-                                    drawing.level_value(level.value),
-                                    f64::from(step) / segments,
-                                );
-                                let b = arcs.point(
-                                    drawing.level_value(level.value),
-                                    f64::from(step + 1) / segments,
-                                );
-                                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                            })
+                            && level.label_visible
+                            && in_pane(line_x)
+                            && self.level_label_hit(
+                                drawing,
+                                self.time_level_label(drawing, time, line_x, level.value, 1.0),
+                                (x, y),
+                            )
+                    })
+                    || self.fibonacci_trend_line_hit(drawing, px, (x, y), hit_tolerance)
+                    || level_band_pairs(drawing, &drawing.levels, false).any(|(prior, level)| {
+                        let prior_x = time.x(drawing.level_value(prior));
+                        let level_x = time.x(drawing.level_value(level.value));
+                        let left = level_x.min(prior_x).max(0.0);
+                        let right = level_x.max(prior_x).min(self.pane_w);
+                        let (top, bottom) = (time.pane_top, time.pane_bottom);
+                        right > left
+                            && self.band_fill_hit(
+                                drawing,
+                                &[(left, top), (right, top)],
+                                &[(left, bottom), (right, bottom)],
+                                (x, y),
+                            )
                     })
             }
+            DrawingBodyGeometry::FibonacciArcs(arcs) => self.fibonacci_arcs_hit(
+                drawing,
+                px,
+                arcs,
+                shape::Rect {
+                    left: 0.0,
+                    top: pane.top,
+                    right: self.pane_w,
+                    bottom: pane.top + pane.height,
+                },
+                (x, y),
+                (tolerance, hit_tolerance),
+            ),
             DrawingBodyGeometry::Pitchfork(fork) => drawing.levels.iter().any(|level| {
                 if !level.visible {
                     return false;

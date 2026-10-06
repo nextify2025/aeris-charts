@@ -5710,7 +5710,13 @@ mod tests {
                 "drawing {id}"
             );
         }
-        assert_eq!(block(10), None, "the wedge has no unstored default");
+        // The wedge has no unstored option value, but its block selects the fork's precise
+        // rings (R5, owner decision T1), as every fork ring tool's does.
+        assert_eq!(
+            block(10),
+            Some(crate::FibonacciToolOptions::default()),
+            "the wedge carries the empty block"
+        );
         // The fork labelled time levels right of their lines: upstream's `left`. An explicit
         // fork `left` is upstream's `right`.
         assert_eq!(chart.drawing(4).unwrap().level_label_align, "left");

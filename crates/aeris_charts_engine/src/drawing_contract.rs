@@ -504,7 +504,9 @@ pub enum DrawingKindOptions {
 /// layers the fork's stats box, trend-angle decorations and arrowheads on their upstream arms),
 /// the parallel, flat and disjoint channels read `channel`'s middle line, the regression trend
 /// reads all of `channel` (middle line as its dashed centre, per-side deviations and switches,
-/// source, Pearson's R), and the others do not read their keys yet. Each block's defaults are
+/// source, Pearson's R), the Fibonacci tools read `fibonacci` (trend line, fan grid, full circles,
+/// vertical label placement, the golden spiral's turn; a stored block also selects the ring
+/// tools' precise rings), and the others do not read their keys yet. Each block's defaults are
 /// upstream's look, and documents and payloads the fork wrote carry the fork's unstored defaults
 /// explicitly (`drawings::kinds::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -723,7 +725,8 @@ pub(crate) fn legacy_bars_pattern(bars: &[[f64; 4]]) -> Vec<crate::drawings::Bar
 /// patch that sends part of a block maps exactly the keys it sends. A block left empty is removed;
 /// every other key stays stored: the own-line families read theirs, and so do the upstream kinds
 /// that layer a presentation on their arms (the line tools' `line`, the channels' and the
-/// regression trend's `channel`), while the other upstream-rendered kinds do not read them yet.
+/// regression trend's `channel`, the Fibonacci tools' `fibonacci`), while the other
+/// upstream-rendered kinds do not read them yet.
 ///
 /// With `absent_block_is_default` (a document the fork wrote, which omitted values equal to its
 /// defaults) the fork block's defaults stand in for absent keys, including a block that is absent
@@ -737,8 +740,9 @@ pub(crate) fn legacy_bars_pattern(bars: &[[f64; 4]]) -> Vec<crate::drawings::Bar
 /// - Fibonacci tools, block `fibonacci`: `reverse` to `level_reverse` where the fork read it with
 ///   upstream's meaning: as is on the extension, channel, and time zones, inverted on the
 ///   retracement and the speed fan (the fork's level 0 sat on their second anchor, upstream's on the
-///   first). The spiral's `reverse` (a counterclockwise turn) has no flat counterpart, and the
-///   tools the fork never reversed have nothing to map, so their `reverse` stays stored but inert.
+///   first). The spiral's `reverse` (the golden spiral's counterclockwise turn) has no flat
+///   counterpart and stays stored, and the tools the fork never reversed have nothing to map, so
+///   their `reverse` stays stored but inert.
 ///   `log_scale` to `level_log_scale` (retracement, extension, channel); `show_prices` to
 ///   `level_show_prices`;
 ///   `show_levels` and `levels_as_percent` to `level_show_values` and `level_show_percents`;
@@ -764,19 +768,7 @@ pub(crate) fn take_legacy_flat_options(
     absent_block_is_default: bool,
 ) -> LegacyFlatOptions {
     let mut legacy = LegacyFlatOptions::default();
-    let fibonacci = matches!(
-        kind,
-        DrawingKind::FibonacciRetracement
-            | DrawingKind::FibonacciExtension
-            | DrawingKind::FibonacciChannel
-            | DrawingKind::FibonacciTimeZones
-            | DrawingKind::FibonacciTrendTime
-            | DrawingKind::FibonacciSpeedFan
-            | DrawingKind::FibonacciSpeedArcs
-            | DrawingKind::FibonacciCircles
-            | DrawingKind::FibonacciSpiral
-            | DrawingKind::FibonacciWedge
-    );
+    let fibonacci = kind.is_fibonacci();
     let gann = matches!(
         kind,
         DrawingKind::GannBox
