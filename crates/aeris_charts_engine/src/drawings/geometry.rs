@@ -883,6 +883,24 @@ impl DrawingGeometryOptions {
     }
 }
 
+/// The far corner of a fixed Gann square from its pivot `start` (caller px): `ratio_corner`, the
+/// corner a `tool_options.gann.scale_ratio` places (see `kinds::pitchforks_gann::ratio_point`),
+/// or else a square on screen toward `end` whose side is the anchors' smaller one.
+pub(crate) fn gann_fixed_end(
+    start: (f64, f64),
+    end: (f64, f64),
+    ratio_corner: Option<(f64, f64)>,
+) -> (f64, f64) {
+    if let Some(corner) = ratio_corner {
+        return corner;
+    }
+    let side = (end.0 - start.0).abs().min((end.1 - start.1).abs());
+    (
+        start.0 + side.copysign(end.0 - start.0),
+        start.1 + side.copysign(end.1 - start.1),
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GannGridGeometry {
     pub(crate) kind: DrawingKind,
@@ -1436,17 +1454,15 @@ pub(crate) fn resolve_drawing_geometry<'a>(
             let start = px[0];
             let mut end = *px.get(1)?;
             if kind == DrawingKind::GannSquareFixed {
-                let side = (end.0 - start.0).abs().min((end.1 - start.1).abs());
-                end = (
-                    start.0 + side.copysign(end.0 - start.0),
-                    start.1 + side.copysign(end.1 - start.1),
-                );
+                // A scale ratio's corner is the third render point.
+                end = gann_fixed_end(start, end, px.get(2).copied());
             }
             DrawingBodyGeometry::GannGrid(GannGridGeometry { kind, start, end })
         }
         DrawingKind::GannFan => {
             let start = px[0];
-            let end = *px.get(1)?;
+            // A scale ratio's 1×1 target is the third render point.
+            let end = px.get(2).copied().unwrap_or(*px.get(1)?);
             DrawingBodyGeometry::Fibonacci(FibonacciGeometry {
                 kind,
                 start,

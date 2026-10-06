@@ -890,18 +890,13 @@ fn migrate_fork_anchors(
             let corner = match ratio {
                 Some(ratio) => price(0) + direction * size * ratio,
                 // Without a scale ratio the fork kept the square square on screen, which no price
-                // per bar reproduces: the corner sits a price span the anchor's magnitude sets
-                // away, so the square's time side is normally its smaller one. Below a positive
-                // anchor that span would cross zero, where a logarithmic or percentage scale
-                // places nothing, so the corner divides the price instead (staying positive).
-                None => {
-                    let additive = price(0) + direction * size * price(0).abs().max(1.0);
-                    if price(0) > 0.0 && additive <= 0.0 {
-                        price(0) / (1.0 + size)
-                    } else {
-                        additive
-                    }
-                }
+                // per bar reproduces: the corner sits far beyond the square (the corner drag's
+                // rule), so the square's time side is normally its smaller one.
+                None => crate::drawings::kinds::pitchforks_gann::fixed_square_far_price(
+                    price(0),
+                    size,
+                    direction,
+                ),
             };
             Some(vec![keep(0), placed(logical + size, corner, None)])
         }

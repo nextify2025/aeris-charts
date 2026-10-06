@@ -355,17 +355,33 @@ impl DrawingBounds {
             DrawingKind::GannBox | DrawingKind::GannSquare | DrawingKind::GannSquareFixed
         ) && drawing.points.len() == 2
         {
-            for level in drawing.levels.iter().filter(|level| level.visible) {
+            // A fixed square's scale ratio puts its far corner at the ratio point, whose price
+            // may lie past the anchors.
+            let first = drawing.points[0];
+            let second = kinds::pitchforks_gann::ratio_point(drawing).unwrap_or(drawing.points[1]);
+            min_price = min_price.min(second.price);
+            max_price = max_price.max(second.price);
+            // A box with its own time levels splits the axes: its time levels reach along time
+            // only. Its price levels keep their time reach: their labels stay at upstream's
+            // diagonal point, which a level beyond [0, 1] takes past the box.
+            let time_levels = kinds::pitchforks_gann::box_time_levels(drawing);
+            let levels = drawing.levels.iter().map(|level| (level, true)).chain(
+                time_levels
+                    .into_iter()
+                    .flatten()
+                    .map(|level| (level, false)),
+            );
+            for (level, along_price) in levels.filter(|(level, _)| level.visible) {
                 let value = drawing.level_value(level.value);
-                let logical = drawing.points[0].logical
-                    + (drawing.points[1].logical - drawing.points[0].logical) * value;
-                let price = drawing.points[0].price
-                    + (drawing.points[1].price - drawing.points[0].price) * value;
+                let logical = first.logical + (second.logical - first.logical) * value;
+                let price = first.price + (second.price - first.price) * value;
                 if logical.is_finite() && price.is_finite() {
                     min_logical = min_logical.min(logical);
                     max_logical = max_logical.max(logical);
-                    min_price = min_price.min(price);
-                    max_price = max_price.max(price);
+                    if along_price {
+                        min_price = min_price.min(price);
+                        max_price = max_price.max(price);
+                    }
                 }
             }
         }
@@ -1873,10 +1889,10 @@ where
 
 /// The part of a drawing a hit/drag landed on: the whole shape (a move drag), one handle of the
 /// drawing's handle mode (a defining anchor, or a rectangle's bounds handle and a Long/Short
-/// Position's control by their handle index), or a derived handle a drawing family would place
-/// on its geometry, numbered in the family's derived-handle order. No family derives one since
-/// the upstream B8 sync (see the `ponytail:` note on the drag code), so `Handle` is never
-/// produced today.
+/// Position's control by their handle index), or a derived handle placed on the drawing's
+/// geometry, numbered in its derived-handle order: a pitchfork's or the pitchfan's base midpoint,
+/// which moves both handle anchors, and a fixed Gann square's painted far corner, which resizes
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawingDragPart {
     Body,
@@ -1942,8 +1958,8 @@ pub(crate) struct DrawingDrag {
     pub(crate) handle_px: (f64, f64),
     /// Original semantic snapshot retained for cancellation and the one committed history entry.
     pub(crate) history_points: Vec<DrawingPoint>,
-    /// Family options at the press: a family drag may edit them, and cancellation and the
-    /// history entry restore them with the anchors.
+    /// Tool options at the press: a derived-handle drag may edit them (a fixed Gann square's
+    /// scale ratio), and cancellation and the history entry restore them with the anchors.
     pub(crate) history_tool_options: crate::DrawingToolOptions,
     /// Anchored text's `(screen_x, screen_y)` at the press, restored with the anchors.
     pub(crate) history_screen_position: (f64, f64),
@@ -3313,13 +3329,31 @@ impl ChartEngine {
             }
             Some(changed)
         };
+        // A Gann fan's or fixed square's `scale_ratio` (price per bar) scales by its first
+        // anchor's factor, so the angle and the square keep measuring the same bars.
+        let rescale_ratio = |kind: DrawingKind,
+                             options: &mut crate::DrawingToolOptions,
+                             first: Option<&DrawingPoint>,
+                             pending: &[Option<f64>],
+                             apply: bool|
+         -> Option<bool> {
+            let factor = first.map_or(1.0, |first| factor_at(time_of(pending, 0, first)));
+            kinds::pitchforks_gann::rescale_scale_ratio(kind, options, factor, apply)
+        };
         let rescale_drawing = |drawing: &mut Drawing, apply: bool| -> Option<bool> {
+            let ratio = rescale_ratio(
+                drawing.kind,
+                &mut drawing.tool_options,
+                drawing.points.first(),
+                &drawing.pending_times,
+                apply,
+            )?;
             let changed = rescale(
                 drawing.kind,
                 &mut drawing.points,
                 &drawing.pending_times,
                 apply,
-            )?;
+            )? || ratio;
             if changed && apply {
                 drawing.revision = drawing.revision.saturating_add(1);
             }
@@ -3369,6 +3403,13 @@ impl ChartEngine {
                     visit(rescale(DrawingKind::Brush, &mut capture.points, &[], apply));
             }
             if let (Some(drag), Some(kind)) = (self.drawing_drag.as_mut(), drag_kind) {
+                transient_changed |= visit(rescale_ratio(
+                    kind,
+                    &mut drag.history_tool_options,
+                    drag.history_points.first(),
+                    &[],
+                    apply,
+                ));
                 transient_changed |= visit(rescale(kind, &mut drag.start_points, &[], apply));
                 transient_changed |= visit(rescale(kind, &mut drag.history_points, &[], apply));
             }
@@ -4310,7 +4351,9 @@ impl ChartEngine {
 
     /// The drawing's render geometry in media px: its anchors ([`ChartEngine::drawing_px`],
     /// anchored text's screen point), then a regression trend's six fitted points while it has
-    /// a fit. The runtime cache holds exactly this, so culling, hit testing, and frames agree.
+    /// a fit, or a Gann fan's or fixed square's scale-ratio point
+    /// (`kinds::pitchforks_gann::ratio_point`). The runtime cache holds exactly this, so
+    /// culling, hit testing, and frames agree.
     pub(crate) fn drawing_render_px(&self, drawing: &Drawing) -> Option<Vec<(f64, f64)>> {
         let mut px = Vec::with_capacity(drawing.points.len());
         self.extend_drawing_render_px(drawing, &mut px)?;
@@ -4336,6 +4379,15 @@ impl ChartEngine {
                     out.push(self.drawing_point_px(drawing, point)?);
                 }
             }
+        }
+        // A Gann fan's or fixed square's scale-ratio point, placed like an anchor (a non-positive
+        // price on a logarithmic scale lands at a finite px, as a non-positive anchor does); a
+        // non-finite px leaves the anchors' geometry.
+        if let Some(point) = kinds::pitchforks_gann::ratio_point(drawing)
+            .and_then(|point| self.drawing_point_px(drawing, point))
+            .filter(|&(x, y)| x.is_finite() && y.is_finite())
+        {
+            out.push(point);
         }
         Some(())
     }
@@ -7268,13 +7320,25 @@ impl ChartEngine {
                 (x, y),
                 (tolerance, hit_tolerance),
             ),
-            DrawingBodyGeometry::Pitchfork(fork) => drawing.levels.iter().any(|level| {
-                if !level.visible {
-                    return false;
-                }
-                let (a, b) = fork.segment(drawing.level_value(level.value));
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
+            // The tines and, while selected, the bands between them, as the frame paints them.
+            DrawingBodyGeometry::Pitchfork(fork) => {
+                let segment = |value| fork.segment(drawing.level_value(value));
+                drawing.levels.iter().any(|level| {
+                    if !level.visible {
+                        return false;
+                    }
+                    let (a, b) = segment(level.value);
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                }) || level_band_pairs(drawing, &drawing.levels, false).any(|(prior, level)| {
+                    let (prior, current) = (segment(prior), segment(level.value));
+                    self.band_fill_hit(
+                        drawing,
+                        &[prior.0, prior.1],
+                        &[current.0, current.1],
+                        (x, y),
+                    )
+                })
+            }
             DrawingBodyGeometry::Cycles(cycles) => {
                 y >= cycles.pane_top - hit_tolerance && y <= cycles.pane_bottom + hit_tolerance && {
                     let mut hit = false;
@@ -7347,36 +7411,49 @@ impl ChartEngine {
                     (bounds.right, bounds.bottom),
                     (bounds.left, bounds.bottom),
                 ];
-                (drawing.fill_enabled
-                    && self.selected_drawing == Some(drawing.id)
-                    && x >= bounds.left
-                    && x <= bounds.right
-                    && y >= bounds.top
-                    && y <= bounds.bottom)
-                    || (0..4).any(|index| {
-                        let a = corners[index];
-                        let b = corners[(index + 1) % 4];
-                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                    })
+                let near = |&(a, b): &((f64, f64), (f64, f64))| {
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                };
+                let time_levels = kinds::pitchforks_gann::box_time_levels(drawing);
+                let x_at = |value: f64| grid.start.0 + (grid.end.0 - grid.start.0) * value;
+                let between =
+                    |value: f64, (a, b): (f64, f64)| value >= a.min(b) && value <= a.max(b);
+                // While selected, the box and every zone the frame fills around it (level
+                // cells or per-axis bands past the box; fan and arc zones stay inside it) drag
+                // the body.
+                let zones_hit = || {
+                    (between(x, (bounds.left, bounds.right))
+                        && between(y, (bounds.top, bounds.bottom)))
+                        || kinds::pitchforks_gann::grid_bands(drawing, grid)
+                            .any(|(xs, ys, _)| between(x, xs) && between(y, ys))
+                };
+                (drawing.fill_enabled && self.selected_drawing == Some(drawing.id) && zones_hit())
+                    || (0..4).any(|index| near(&(corners[index], corners[(index + 1) % 4])))
                     || drawing
                         .levels
                         .iter()
                         .filter(|level| level.visible)
                         .any(|level| {
-                            grid.level_lines(drawing.level_value(level.value))
-                                .iter()
-                                .any(|&(a, b)| {
-                                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                                })
+                            let lines = grid.level_lines(drawing.level_value(level.value));
+                            // Split axes: price levels are horizontal lines only.
+                            lines[usize::from(time_levels.is_some())..].iter().any(near)
                         })
-                    || drawing
-                        .gann_fans
-                        .iter()
+                    || time_levels
+                        .into_iter()
+                        .flatten()
                         .filter(|level| level.visible)
                         .any(|level| {
-                            let (a, b) = grid.fan_segment(level.value, drawing.level_reverse);
-                            distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                            let line_x = x_at(drawing.level_value(level.value));
+                            near(&((line_x, grid.start.1), (line_x, grid.end.1)))
                         })
+                    || kinds::pitchforks_gann::angle_levels(drawing)
+                        .iter()
+                        .filter(|level| level.visible)
+                        .any(|level| near(&grid.fan_segment(level.value, drawing.level_reverse)))
+                    || (kinds::pitchforks_gann::shows_stats(drawing)
+                        && self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                            kinds::pitchforks_gann::square_stats(context, grid, parts);
+                        }))
                     || drawing
                         .gann_arcs
                         .iter()
@@ -7660,7 +7737,7 @@ impl ChartEngine {
         let (dx, dy) = (x - start_x, y - drag.start_y);
         let (id, part) = (drag.id, drag.part);
         let (start_points, start_px) = (drag.start_points.clone(), drag.start_px.clone());
-        let keyboard_step = drag.keyboard_step;
+        let (keyboard_step, handle_px) = (drag.keyboard_step, drag.handle_px);
         let Some(drawing) = self.drawing(id) else {
             return;
         };
@@ -7709,6 +7786,8 @@ impl ChartEngine {
         if self.drawing_from_px_for(pane, price_scale, x, y).is_none() {
             return;
         }
+        // The tool options a derived-handle drag sample leaves (a fixed square's scale ratio).
+        let mut tool_options = None;
         match part {
             DrawingDragPart::Anchor(index) => {
                 if kind.spec().handles == DrawingHandleMode::Position
@@ -8013,14 +8092,62 @@ impl ChartEngine {
                     *slot = point;
                 }
             }
-            // ponytail: derived drag handles (a family `handles` hook appending a
-            // `DrawingDragPart::Handle` that a family hook resolves) have no surviving family since
-            // the upstream B8 sync retired the fork's pitchfork, fixed-square, and rotated-rectangle
-            // renderers; re-add the drag hook with the first family that derives one.
-            DrawingDragPart::Handle(_) => {}
+            DrawingDragPart::Handle(_) => {
+                // A derived handle moves from its own baseline like an anchor: along the spec's
+                // movement axis, time-snapped, then magnet-snapped; the kind resolves what it
+                // drives (`kinds::drag_derived_handle`).
+                let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
+                let Some(mut target) =
+                    self.drawing_from_px_for(pane, price_scale, handle_px.0 + dx, handle_px.1 + dy)
+                else {
+                    return;
+                };
+                if snap_time_to_data {
+                    let Some(snapped) = self.snap_drawing_time_to_data(target) else {
+                        return;
+                    };
+                    target = snapped;
+                }
+                if modifiers.magnet {
+                    if let Some(snapped) =
+                        self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
+                    {
+                        target = kind.spec().movement_axis.constrain_snap(target, snapped);
+                    }
+                }
+                let (Some(target_px), Some(drawing), Some(drag)) = (
+                    self.drawing_to_px_for(pane, price_scale, target),
+                    self.drawing(id),
+                    self.drawing_drag.as_ref(),
+                ) else {
+                    return;
+                };
+                let sample = handles::HandleDrag {
+                    part,
+                    start_points: &start_points,
+                    start_px: &start_px,
+                    start_tool_options: &drag.history_tool_options,
+                    handle_px,
+                    target,
+                    target_px,
+                    straighten: modifiers.straighten,
+                    keyboard_step,
+                };
+                // A rejected sample keeps the last valid one, as the body drag does. Every
+                // accepted sample starts from the press: one that edits no option restores what
+                // an earlier sample of this drag edited.
+                let Some(edited) = kinds::drag_derived_handle(self, drawing, &sample, &mut points)
+                else {
+                    return;
+                };
+                tool_options = Some(edited.unwrap_or_else(|| drag.history_tool_options.clone()));
+            }
         }
         if let Some(drawing) = self.drawings.iter_mut().find(|d| d.id == id) {
             drawing.points = points;
+            if let Some(tool_options) = tool_options {
+                drawing.tool_options = tool_options;
+            }
         }
         if kind.spec().placement.is_freehand() {
             self.invalidate_brush_drag_runtime(id);

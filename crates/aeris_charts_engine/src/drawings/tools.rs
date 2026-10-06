@@ -20,11 +20,9 @@
 // upstream's lowering (their options stay stored but inert). Documents the fork wrote, and the
 // fork-era clipboard and sync items that prove where they came from, already carry each one's fork
 // default (`kinds::legacy_fork_tool_options` and the legacy defaults), so they regain the fork look
-// as each is re-applied. Pitchforks and Gann: zone fills as selected hit targets, base-midpoint
-// handle, Gann box time levels and angles, square stats box, fan scale ratio, fixed-square size
-// ratio and corner handle, price-basis rescale. Annotations: projection sector, note pin and
-// reveal-on-focus, the price note's boxed price, speech bubbles, the default texts of new fork-form
-// annotations ("Note", "Callout", ...), signpost pole and its editor on placement (upstream's
+// as each is re-applied. Annotations: projection sector, note pin and reveal-on-focus, the price
+// note's boxed price, speech bubbles, the default texts of new fork-form annotations ("Note",
+// "Callout", ...), signpost pole and its editor on placement (upstream's
 // signpost is a two-anchor marker that opens none), arrow-mark text, multi-line family boxes for
 // note/comment/callout/price_note/anchored_text, bars-pattern LOD aggregation, the forecast's
 // source and target boxes (absolute change, Success/Failure on market colors, the box as a hit
@@ -70,7 +68,18 @@
 // head-and-shoulders neckline on every drawing with its shading by `fill_enabled` (P2), the
 // 12-degree Frost-Prechter Elliott notation with rings and the start unlabeled (P4), and the
 // patterns' and waves' placement previews from the second anchor with labels, ratios and fills
-// (P5); channel `extend_*`, the callout's tip and box handles, the highlighter's once-filled tube,
+// (P5); the pitchforks' and Gann tools' presentation, read from the stored `tool_options.gann`
+// block on upstream's pitchfork, Gann grid and Fibonacci arms (`kinds::pitchforks_gann`; new
+// drawings have no block and render as upstream does): selected pitchfork and pitchfan bands and
+// the Gann grid's level cells past its box as body targets, the pitchforks' base-midpoint handle,
+// the Gann box's own time levels with overlapping per-axis bands (G1) and its angles, the
+// squares' translucent stats box (off for new squares, on for fork documents; G2), the fan's and
+// fixed square's scale ratio as a derived render point, the fixed square's corner handle in whole
+// bars (without a ratio its second anchor stays beyond the corner, moved far beyond it when it
+// was not, so the square normally keeps its bars under ordinary price zoom), and the price-basis
+// rescale of the ratios, the derived handles
+// dragging through `kinds::drag_derived_handle`; channel `extend_*`, the callout's tip and box
+// handles, the highlighter's once-filled tube,
 // the regression trend's dashed anchor segment while it has no fit, and the clip-aware flattening
 // of the ellipse, circle, arc, curve and double curve (`geometry.rs`: within 0.25 px of the true
 // curve at any zoom, bounded points, paint and hit flattened by the same rule, dashed outlines as
@@ -89,11 +98,15 @@
 // below lows (P1; upstream's labels, a migrated triangle's D-E leg and E label, and the three
 // drives' six labels stay), the speed fan's time rays, ring, arc and wedge label placement, half
 // speed arcs facing the other anchor rather than up or down, exact log-scale fib prices, the
-// pitchfork's A-B swing and B-C handle guides and always-red median, the Gann box's four-side
-// labels, the straighten modes, the fork's band and zone alphas, the regression's sample deviation,
-// a fork regression whose `middle_line` is off (upstream's solid centre, not none), and the third
-// handle of the parallel, flat and disjoint channels (on the free third anchor, not the second
-// line's midpoint).
+// pitchfork's unextended tines that honour `extend_*` (upstream's tines always ray to the pane
+// edge), A-B swing and B-C handle guides and always-red median, the Gann fan's lines bounded by
+// the anchors' box with "1x2" angle names and the `extend_right` default (upstream's fan rays to
+// the pane edge without the fork's angle names), the Gann box's four-side
+// labels (a split-axis box labels its time levels above it only) and its angles under the levels
+// (they paint above, as upstream's square fans do), the straighten modes, the fork's band and zone
+// alphas, the regression's sample deviation, a fork regression whose `middle_line` is off
+// (upstream's solid centre, not none), and the third handle of the parallel, flat and disjoint
+// channels (on the free third anchor, not the second line's midpoint).
 
 use super::kinds::DrawingFamily;
 use super::DrawingKind;

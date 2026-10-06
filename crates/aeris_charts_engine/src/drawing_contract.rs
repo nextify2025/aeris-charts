@@ -507,7 +507,10 @@ pub enum DrawingKindOptions {
 /// source, Pearson's R), the Fibonacci tools read `fibonacci` (trend line, fan grid, full circles,
 /// vertical label placement, the golden spiral's turn; a stored block also selects the ring
 /// tools' precise rings), the harmonic patterns read `pattern.show_ratios` and the Elliott waves
-/// `pattern.show_wave`, and the others do not read their keys yet. Each block's defaults are
+/// `pattern.show_wave`, the Gann tools read `gann` (the box's time levels and angles, the
+/// squares' stats box, the fan's and fixed square's scale ratio; the fixed square's `size_bars`
+/// only when a fork document's one-anchor square converts), and the others do not read their
+/// keys yet. Each block's defaults are
 /// upstream's look, and documents and payloads the fork wrote carry the fork's unstored defaults
 /// explicitly (`drawings::kinds::legacy_fork_tool_options`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -727,8 +730,10 @@ pub(crate) fn legacy_bars_pattern(bars: &[[f64; 4]]) -> Vec<crate::drawings::Bar
 /// every other key stays stored: the own-line families read theirs, and so do the upstream kinds
 /// that layer a presentation on their arms (the line tools' `line`, the channels' and the
 /// regression trend's `channel`, the Fibonacci tools' `fibonacci`, the harmonic patterns'
-/// `pattern.show_ratios` and the Elliott waves' `pattern.show_wave`), while the other
-/// upstream-rendered kinds do not read them yet.
+/// `pattern.show_ratios`, the Elliott waves' `pattern.show_wave`, and the Gann tools' `gann`:
+/// the box's time levels and angles, the squares' stats box, the fan's and fixed square's scale
+/// ratio, and the fixed square's `size_bars` only when a fork document's one-anchor square
+/// converts), while the other upstream-rendered kinds do not read them yet.
 ///
 /// With `absent_block_is_default` (a document the fork wrote, which omitted values equal to its
 /// defaults) the fork block's defaults stand in for absent keys, including a block that is absent

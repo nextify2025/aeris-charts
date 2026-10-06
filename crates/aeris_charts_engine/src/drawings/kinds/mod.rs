@@ -3,10 +3,10 @@
 //! upstream implementation (`geometry.rs` body resolver, frame arm, hit code), over which a stored
 //! option may layer shared parts (the frame's `push_parts` and the hit tester's `parts_hit`, which
 //! a family's parts share, with [`upstream_decoration_extent`], [`extend_upstream_schema`] and
-//! [`upstream_derived_handles`] dispatching per family); the own-line tools (`240..=246`) and the
-//! three measuring ranges (`13..=15`) carry a family whose module owns their tool specs, kind
-//! defaults, geometry (resolved into shared [`DrawingParts`]), typed options, schema additions, and
-//! tests. The engine reaches a family only through the [`DrawingFamily`] hook table its specs
+//! [`upstream_derived_handles`] with its drag side [`drag_derived_handle`] dispatching per family);
+//! the own-line tools (`240..=246`) and the three measuring ranges (`13..=15`) carry a family whose
+//! module owns their tool specs, kind defaults, geometry (resolved into shared [`DrawingParts`]),
+//! typed options, schema additions, and tests. The engine reaches a family only through the [`DrawingFamily`] hook table its specs
 //! reference: a closed, compile-time table rather than a plugin registry, so adding a family never
 //! edits the frame lowering, the hit tester, or another family.
 //!
@@ -14,15 +14,18 @@
 //! keep their public option types and the fork's pre-merge kind defaults, which
 //! [`apply_legacy_fork_defaults`] applies to documents the fork wrote, together with the fork's
 //! unstored `tool_options` defaults ([`legacy_fork_tool_options`]); the Fibonacci module also
-//! reads its stored options for upstream's level arms, and the patterns module resolves the parts
-//! it layers on upstream's polyline arm (re-applied features). The recipe (what to
+//! reads its stored options for upstream's level arms, the patterns module resolves the parts it
+//! layers on upstream's polyline arm, and the pitchforks and Gann module owns what upstream's
+//! pitchfork and Gann arms read from `tool_options.gann` and their derived handles (re-applied
+//! features). The recipe (what to
 //! add where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
 //! Shared single-list registries carry one `// B8: <family> — begin/end` block per family that
-//! takes part (lines, channels, fibonacci, patterns_elliott_cycles, projection_annotations).
+//! takes part (lines, channels, fibonacci, patterns_elliott_cycles, pitchforks_gann,
+//! projection_annotations).
 
 use aeris_charts_render::shape::Point;
 
-use super::handles::DrawingHandle;
+use super::handles::{DrawingHandle, HandleDrag};
 use super::parts::{DrawingParts, PartContext};
 use super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{ChartEngine, DrawingKind, DrawingKindOptions, DrawingPropertyDescriptor};
@@ -139,6 +142,9 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
         engine, drawing,
     ));
     // B8: patterns_elliott_cycles — end
+    // B8: pitchforks_gann — begin
+    extent = extent.max(pitchforks_gann::upstream_decoration_extent(engine, drawing));
+    // B8: pitchforks_gann — end
     extent
 }
 
@@ -162,21 +168,46 @@ pub(crate) fn extend_upstream_schema(
     // B8: patterns_elliott_cycles — begin
     patterns_elliott_cycles::extend_upstream_schema(kind, template, properties);
     // B8: patterns_elliott_cycles — end
+    // B8: pitchforks_gann — begin
+    pitchforks_gann::extend_upstream_schema(kind, properties);
+    // B8: pitchforks_gann — end
 }
 
-/// Move the handles of an upstream-rendered kind (no family) onto derived geometry, the
-/// upstream side of a family's `handles` hook: `handles.rs` builds the spec's set at the media-px
-/// anchors `px` and every reader of the set (painting, previews, hit testing, keyboard cycling,
-/// drag starts) sees the edited set. Must be cheap.
+/// Edit the handles of an upstream-rendered kind (no family) for derived geometry, the upstream
+/// side of a family's `handles` hook: move a handle onto it (a regression trend's on its fitted
+/// line), replace one (a fixed Gann square's corner) or append one (a pitchfork's base
+/// midpoint). `handles.rs` builds the spec's set at the media-px anchors `px` and every reader of
+/// the set (painting, previews, hit testing, keyboard cycling, drag starts) sees the edited set;
+/// [`drag_derived_handle`] resolves a derived `Handle`'s drags. Must be cheap.
 pub(crate) fn upstream_derived_handles(
     engine: &ChartEngine,
     drawing: &Drawing,
     px: &[Point],
-    handles: &mut [DrawingHandle],
+    handles: &mut Vec<DrawingHandle>,
 ) {
     // B8: channels — begin
     channels::regression_fit_handles(engine, drawing, px, handles);
     // B8: channels — end
+    // B8: pitchforks_gann — begin
+    pitchforks_gann::derived_handles(engine, drawing, px, handles);
+    // B8: pitchforks_gann — end
+}
+
+/// Resolve one drag sample of a derived `Handle` part of an upstream-rendered kind (the drag side
+/// of [`upstream_derived_handles`]): `points` holds the baseline anchors and receives the dragged
+/// ones; the returned tool options (an edit the drag makes, such as a fixed square's scale ratio)
+/// replace the drawing's, and the drag's history entry and cancellation restore them with the
+/// anchors. `None` rejects the sample: the drag discards `points` and keeps its last valid
+/// sample, as an anchor drag does past the data.
+pub(crate) fn drag_derived_handle(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    sample: &HandleDrag<'_>,
+    points: &mut [crate::DrawingPoint],
+) -> Option<Option<crate::DrawingToolOptions>> {
+    // B8: pitchforks_gann — begin
+    pitchforks_gann::drag_handle(engine, drawing, sample, points)
+    // B8: pitchforks_gann — end
 }
 
 /// Replace the common schema defaults with the template drawing's resolved values (a family's

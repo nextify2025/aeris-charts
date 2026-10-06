@@ -3160,34 +3160,49 @@ export interface fibonacci_tool_options {
   label_v_align?: drawing_text_v_align;
 }
 /**
- * Legacy Gann options (`tool_options.gann`). The shared catalog renders the pitchforks and the
- * Gann tools from the flat `levels`, `gann_fans`, `gann_arcs`, and `level_*` options: the
- * deprecated fields are input aliases mapped onto those flat fields on patch and restore and
- * never written back, and the other fields are stored but not rendered. Their defaults are the
- * shared catalog's look; documents an earlier fork build wrote restore a Gann box with that
- * build's seven `time_levels` and the squares with `show_stats: true`.
+ * Gann options (`tool_options.gann`). The shared catalog renders the pitchforks and the Gann
+ * tools from the flat `levels`, `gann_fans`, `gann_arcs`, and `level_*` options, and reads the
+ * fields below on top of them: the deprecated fields are input aliases mapped onto those flat
+ * fields on patch and restore and never written back. Every default keeps the shared catalog's
+ * look; documents an earlier fork build wrote restore a Gann box with that build's seven
+ * `time_levels` and the squares with `show_stats: true`.
  */
 export interface gann_tool_options {
-  /** Gann box vertical levels as fractions of the box width; empty (the default) follows `levels`. Stored but not rendered. */
+  /**
+   * Gann box vertical (time) levels as fractions of the box width from the pivot corner,
+   * labelled above the box. Non-empty, the box's `levels` draw horizontally only and the zones
+   * fill as overlapping per-axis bands (price bands across the width, time bands across the
+   * height); empty (the default) the vertical lines follow `levels` with diagonal cells.
+   */
   time_levels?: drawing_level[];
-  /** @deprecated Input alias of `gann_fans` (angle lines as multiples of the 1×1 slope). */
+  /**
+   * Gann box: angle lines from the pivot corner (multiples of the 1×1 slope, the box diagonal),
+   * painted while `show_angles` is on, unfilled. Gann squares: deprecated input alias of
+   * `gann_fans`.
+   */
   angles?: drawing_level[];
   /** @deprecated Input alias of `gann_arcs` (quarter arcs as fractions of the side). */
   arcs?: drawing_level[];
   /** @deprecated Input alias of `level_reverse`. */
   reverse?: boolean;
-  /** Gann box angle lines from the pivot corner. Stored but not rendered. */
+  /** Gann box: paint `angles` from the pivot corner (default off). */
   show_angles?: boolean;
-  /** Gann square stats box (default off). Stored but not rendered. */
+  /**
+   * Gann square and fixed square: a stats box beside the far corner with the price range, the
+   * bars, and the price per bar (default off; a body hit target).
+   */
   show_stats?: boolean;
   /**
-   * Price units per bar of the 1×1 angle (fan and fixed square). Stored but not rendered;
-   * restoring a legacy one-anchor fixed square reads it to place the second anchor.
+   * Price units per bar of the 1×1 angle (fan and fixed square; positive). The fan's 1×1 runs to
+   * the second anchor's bar at that slope, toward the second anchor's price; the fixed square's
+   * far corner sits at the second anchor's bar, the bars times the ratio from the first anchor's
+   * price. `null` (the default) keeps the anchor slope and the square on screen. Dragging the
+   * fixed square's corner edits it; a price-basis rescale scales it with the anchors.
    */
   scale_ratio?: number | null;
   /**
-   * Fixed square side length in bars, 1..=100000. Stored but not rendered; restoring a legacy
-   * one-anchor fixed square reads it to place the second anchor.
+   * Fixed square side length in bars, 1..=100000. Stored but not rendered (the anchors carry
+   * the size); restoring a legacy one-anchor fixed square reads it to place the second anchor.
    */
   size_bars?: number;
 }

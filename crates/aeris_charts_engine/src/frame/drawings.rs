@@ -20,7 +20,7 @@ use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
 use crate::drawings::kinds::patterns_elliott_cycles::{self, PatternLayer};
 use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
-use crate::drawings::kinds::{channels, fibonacci, lines};
+use crate::drawings::kinds::{channels, fibonacci, lines, pitchforks_gann};
 use crate::drawings::{
     arrow_cap_triangle, cap_radius, curve_clip, ellipse_outline, level_band_pairs,
     resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
@@ -1633,6 +1633,10 @@ impl ChartEngine {
             }
             DrawingBodyGeometry::GannGrid(grid) => {
                 let box_bounds = grid.bounds();
+                // A box's own time levels split the axes: price levels draw horizontally, time
+                // levels vertically, and the zones fill as overlapping per-axis bands.
+                let time_levels = pitchforks_gann::box_time_levels(drawing);
+                let x_at = |value: f64| grid.start.0 + (grid.end.0 - grid.start.0) * value;
                 if drawing.fill_enabled {
                     let fill = drawing
                         .fill_color
@@ -1648,28 +1652,16 @@ impl ChartEngine {
                         },
                         color: fill,
                     });
-                    let mut prior_grid: Option<f64> = None;
-                    for level in drawing.levels.iter().filter(|level| level.visible) {
-                        let value = drawing.level_value(level.value);
-                        if level.fill_between {
-                            if let Some(previous) = prior_grid {
-                                let x0 = grid.start.0 + (grid.end.0 - grid.start.0) * previous;
-                                let x1 = grid.start.0 + (grid.end.0 - grid.start.0) * value;
-                                let y0 = grid.start.1 + (grid.end.1 - grid.start.1) * previous;
-                                let y1 = grid.start.1 + (grid.end.1 - grid.start.1) * value;
-                                let fill = Self::drawing_level_fill(level, color);
-                                out.push(Prim::Rect {
-                                    rect: IRect {
-                                        x: x0.min(x1).round() as i32,
-                                        y: y0.min(y1).round() as i32,
-                                        w: (x1 - x0).abs().round().max(1.0) as i32,
-                                        h: (y1 - y0).abs().round().max(1.0) as i32,
-                                    },
-                                    color: fill,
-                                });
-                            }
-                        }
-                        prior_grid = Some(value);
+                    for ((x0, x1), (y0, y1), level) in pitchforks_gann::grid_bands(drawing, grid) {
+                        out.push(Prim::Rect {
+                            rect: IRect {
+                                x: x0.min(x1).round() as i32,
+                                y: y0.min(y1).round() as i32,
+                                w: (x1 - x0).abs().round().max(1.0) as i32,
+                                h: (y1 - y0).abs().round().max(1.0) as i32,
+                            },
+                            color: Self::drawing_level_fill(level, color),
+                        });
                     }
                     let mut prior_fan: Option<(f64, f64)> = None;
                     for level in drawing.gann_fans.iter().filter(|level| level.visible) {
@@ -1742,7 +1734,13 @@ impl ChartEngine {
                         "dashed" | "large_dashed" => LineStyle::Dashed,
                         _ => LineStyle::Solid,
                     };
-                    for (a, b) in grid.level_lines(drawing.level_value(level.value)) {
+                    let lines = grid.level_lines(drawing.level_value(level.value));
+                    let lines = if time_levels.is_some() {
+                        &lines[1..]
+                    } else {
+                        &lines[..]
+                    };
+                    for &(a, b) in lines {
                         let first_point = points.len() as u32;
                         points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
                         out.push(Prim::Polyline {
@@ -1785,21 +1783,62 @@ impl ChartEngine {
                         }
                     }
                 }
-                if grid.kind != DrawingKind::GannBox {
-                    for level in drawing.gann_fans.iter().filter(|level| level.visible) {
-                        let (a, b) = grid.fan_segment(level.value, drawing.level_reverse);
-                        let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                        let first_point = points.len() as u32;
-                        points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
-                        out.push(Prim::Polyline {
-                            first_point,
-                            point_count: 2,
-                            width: (drawing.width * vpr) as f32,
-                            style: Self::drawing_level_style(&level.style),
-                            line_type: LineType::Simple,
-                            color: level_color,
-                        });
+                for level in time_levels
+                    .into_iter()
+                    .flatten()
+                    .filter(|level| level.visible)
+                {
+                    let x = x_at(drawing.level_value(level.value));
+                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
+                    let first_point = points.len() as u32;
+                    points.extend([
+                        [x as f32, grid.start.1 as f32],
+                        [x as f32, grid.end.1 as f32],
+                    ]);
+                    out.push(Prim::Polyline {
+                        first_point,
+                        point_count: 2,
+                        width: (drawing.width * vpr) as f32,
+                        style: Self::drawing_level_style(&level.style),
+                        line_type: LineType::Simple,
+                        color: level_color,
+                    });
+                    if level.label_visible {
+                        if let Some(text) = self.drawing_level_label(drawing, level.value, None) {
+                            out.push(Prim::Text {
+                                x: x as f32,
+                                y: (box_bounds.top - 8.0 * vpr) as f32,
+                                text,
+                                color: level_color,
+                                size: (self.options.get().layout.font_size * vpr) as f32,
+                                family: self.options.get().layout.font_family.clone(),
+                                align: TextAlign::Center,
+                                weight: drawing.text_weight.unwrap_or(400),
+                                italic: drawing.text_italic,
+                            });
+                        }
                     }
+                }
+                // A box strokes its `tool_options.gann.angles` while `show_angles` is on; a
+                // square its `gann_fans`.
+                for level in pitchforks_gann::angle_levels(drawing)
+                    .iter()
+                    .filter(|level| level.visible)
+                {
+                    let (a, b) = grid.fan_segment(level.value, drawing.level_reverse);
+                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
+                    let first_point = points.len() as u32;
+                    points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
+                    out.push(Prim::Polyline {
+                        first_point,
+                        point_count: 2,
+                        width: (drawing.width * vpr) as f32,
+                        style: Self::drawing_level_style(&level.style),
+                        line_type: LineType::Simple,
+                        color: level_color,
+                    });
+                }
+                if grid.kind != DrawingKind::GannBox {
                     for level in drawing.gann_arcs.iter().filter(|level| level.visible) {
                         let level_color = Color::parse_css(&level.color).unwrap_or(color);
                         let first_point = points.len() as u32;
@@ -1820,6 +1859,15 @@ impl ChartEngine {
                             color: level_color,
                         });
                     }
+                }
+                // A square's stats box (`tool_options.gann.show_stats`) paints last.
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| pitchforks_gann::shows_stats(drawing))
+                {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        pitchforks_gann::square_stats(c, grid, parts);
+                    });
                 }
             }
             DrawingBodyGeometry::Quad { corners } => {

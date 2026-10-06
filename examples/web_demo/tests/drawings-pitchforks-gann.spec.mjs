@@ -286,7 +286,10 @@ test("a fixed Gann square sizes from its two anchors and a Gann fan projects its
   }, { s });
   expect(ids.schema).toContain("gann_fans");
   expect(ids.schema).toContain("gann_arcs");
+  // The anchors carry the size; the stats box and the scale ratio are the square's options.
   expect(ids.schema).not.toContain("tool_options.gann.size_bars");
+  expect(ids.schema).toContain("tool_options.gann.show_stats");
+  expect(ids.schema).toContain("tool_options.gann.scale_ratio");
   await settle_frames(page);
   const before = await capture(page);
   // Moving the second anchor resizes the square.
@@ -375,7 +378,7 @@ test("Pitchforks & Gann tools round-trip through persistence, clipboard, and syn
   expect(styles[2].tool_options).toBeUndefined();
   expect(styles[4].levels).toEqual([]);
   expect(styles[5].level_reverse).toBe(true);
-  // Earlier builds' Gann options without a flat counterpart stay stored, inert.
+  // Gann options without a flat counterpart stay stored (the box paints its angles).
   expect(styles[5].tool_options.gann.show_angles).toBe(true);
   expect(styles[7].tool_options.gann.size_bars).toBe(12);
   expect(styles[8].extend_right).toBe(true);
@@ -395,6 +398,131 @@ test("Pitchforks & Gann tools round-trip through persistence, clipboard, and syn
   expect(semantic(result.pasted)).toEqual(semantic(result.expected));
   expect(result.applied).toBe(true);
   expect(semantic(result.synced)).toEqual(semantic(result.expected));
+});
+
+test("a pitchfork drags its base midpoint and a fixed Gann square resizes from its painted corner", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  const fork = await page.evaluate(({ s }) => window.__chart.add_drawing("andrews_pitchfork", [
+    { logical: s.l0, price: s.p_lo },
+    { logical: s.lm, price: s.p_hi },
+    { logical: s.l1, price: s.p_mid },
+  ]).id, { s });
+  await settle_frames(page);
+  const a = await spot(page, s.l0, s.p_lo);
+  const b = await spot(page, s.lm, s.p_hi);
+  const c = await spot(page, s.l1, s.p_mid);
+  const base = { x: (b.x + c.x) / 2, y: (b.y + c.y) / 2 };
+  // Select through the tine past B; the base midpoint is then the fourth handle.
+  const direction = { x: base.x - a.x, y: base.y - a.y };
+  await page.mouse.click(b.x + direction.x * 0.6, b.y + direction.y * 0.6);
+  expect(await selected(page)).toBe(fork);
+  expect(await page.evaluate((id) => window.__chart.drawing_handle_count(id), fork)).toBe(4);
+  await page.mouse.move(base.x, base.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("pointer");
+  const before = await points_of(page, fork);
+  await page.mouse.down();
+  await page.mouse.move(base.x + 24, base.y - 18, { steps: 5 });
+  await page.mouse.up();
+  await settle_frames(page);
+  const after = await points_of(page, fork);
+  expect(after[0]).toEqual(before[0]);
+  // B and C move together by the pointer's move (fractional bars, so measured by bar spacing).
+  const spacing = (c.x - b.x) / (s.l1 - s.lm);
+  expect((after[1].logical - before[1].logical) * spacing).toBeCloseTo(24, 0);
+  const moved_y = await page.evaluate((price) => window.__main.price_to_coordinate(price), after[1].price);
+  expect(moved_y - b.y).toBeCloseTo(-18, 0);
+  expect(after[2].logical - before[2].logical).toBeCloseTo(after[1].logical - before[1].logical, 6);
+  expect(after[2].price - before[2].price).toBeCloseTo(after[1].price - before[1].price, 6);
+  expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  expect(await points_of(page, fork)).toEqual(before);
+  await page.evaluate(() => window.__chart.clear_drawings());
+
+  // A tall fixed square: its time side wins, so its handle sits on the painted corner, not on
+  // the second anchor.
+  const square = await page.evaluate(({ s }) => window.__chart.add_drawing("gann_square_fixed", [
+    { logical: s.l0, price: s.p_lo }, { logical: s.l0 + 60, price: s.p_hi + (s.p_hi - s.p_lo) * 10 },
+  ]).id, { s });
+  await settle_frames(page);
+  const pivot = await spot(page, s.l0, s.p_lo);
+  const corner_at = async (bars) => {
+    const x = await page.evaluate((logical) => window.__chart.time_scale().logical_to_coordinate(logical), s.l0 + bars);
+    return { x, y: pivot.y - (x - pivot.x) };
+  };
+  const corner = await corner_at(60);
+  await page.mouse.click(corner.x, (pivot.y + corner.y) / 2);
+  expect(await selected(page)).toBe(square);
+  await page.mouse.move(corner.x, corner.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("nesw-resize");
+  // The corner's larger distance sets the side in whole bars.
+  const target = await corner_at(90);
+  await page.mouse.down();
+  await page.mouse.move(target.x, target.y, { steps: 6 });
+  await page.mouse.up();
+  await settle_frames(page);
+  const resized = await points_of(page, square);
+  expect(resized[1].logical - resized[0].logical).toBe(90);
+  expect(resized[1].price).toBeGreaterThan(s.p_hi);
+  const moved_corner = await corner_at(90);
+  await page.mouse.move(moved_corner.x, moved_corner.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("nesw-resize");
+  expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  expect((await points_of(page, square))[1].logical - resized[0].logical).toBe(60);
+});
+
+test("Gann options paint: box time levels and angles, the square's stats box, and scale ratios", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  const id = await page.evaluate(({ s }) => window.__chart.add_drawing("gann_box", [
+    { logical: s.l0, price: s.p_lo }, { logical: s.l1, price: s.p_hi },
+  ]).id, { s });
+  await settle_frames(page);
+  const a = await spot(page, s.l0, s.p_lo);
+  const b = await spot(page, s.l1, s.p_hi);
+  const plain = await capture(page);
+  const level = (value) => ({ value, color: "#e91e63", visible: true, style: "solid", fill_between: true, label_visible: false });
+  await page.evaluate(({ id, levels }) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({
+      tool_options: { gann: { time_levels: levels, show_angles: true } },
+    });
+  }, { id, levels: [level(0), level(0.5), level(1)] });
+  await settle_frames(page);
+  expect(pixel_diff(plain, await capture(page)), "time levels and angles repaint").toBeGreaterThan(200);
+  // A vertical line only at the time levels: 0.25 across lets the pointer through between the
+  // price levels, 0.5 is a body target.
+  const between = a.y + (b.y - a.y) * 0.5625;
+  await page.mouse.move(a.x + (b.x - a.x) * 0.25, between);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+  await page.mouse.move(a.x + (b.x - a.x) * 0.5, between);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  await page.evaluate(() => window.__chart.clear_drawings());
+
+  const square = await page.evaluate(({ s }) => window.__chart.add_drawing("gann_square", [
+    { logical: s.l0, price: s.p_lo }, { logical: s.l1, price: s.p_hi },
+  ]).id, { s });
+  await settle_frames(page);
+  const without = await capture(page);
+  await page.evaluate((id) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ tool_options: { gann: { show_stats: true } } });
+  }, square);
+  await settle_frames(page);
+  expect(pixel_diff(without, await capture(page)), "the stats box paints").toBeGreaterThan(200);
+  // The box sits right of the far corner and is a body target.
+  const far = await spot(page, s.l1, s.p_hi);
+  await page.mouse.move(far.x + 24, far.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  await page.evaluate(() => window.__chart.clear_drawings());
+
+  const fan = await page.evaluate(({ s }) => window.__chart.add_drawing("gann_fan", [
+    { logical: s.l0, price: s.p_lo }, { logical: s.l1, price: s.p_hi },
+  ]).id, { s });
+  await settle_frames(page);
+  const anchor_slope = await capture(page);
+  await page.evaluate(({ id, ratio }) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ tool_options: { gann: { scale_ratio: ratio } } });
+  }, { id: fan, ratio: (s.p_hi - s.p_lo) / (s.l1 - s.l0) / 2 });
+  await settle_frames(page);
+  expect(pixel_diff(anchor_slope, await capture(page)), "the ratio sets the 1x1 slope").toBeGreaterThan(200);
 });
 
 test("the demo toolbar arms every Pitchforks & Gann tool", async ({ page }) => {
@@ -434,6 +562,20 @@ test("Pitchforks & Gann tools render pixel-identical on WebGPU and Canvas2D (AA 
       chart.add_drawing("gann_square", [{ logical: at(0.75), price: up(0.55) }, { logical: at(0.9), price: up(0.95) }], { width: 2 });
       chart.add_drawing("gann_fan", [{ logical: at(0.62), price: up(0.6) }, { logical: at(0.7), price: up(0.8) }]);
       chart.add_drawing("gann_square_fixed", [{ logical: at(0.8), price: up(0.1) }, { logical: at(0.84), price: up(0.3) }]);
+      // The restored Gann options: a stats box, a split-axis box with angles, and a ratio fan.
+      chart.add_drawing("gann_square", [{ logical: at(0.1), price: up(0.6) }, { logical: at(0.18), price: up(0.85) }], {
+        tool_options: { gann: { show_stats: true } },
+      });
+      chart.add_drawing("gann_box", [{ logical: at(0.45), price: up(0.6) }, { logical: at(0.55), price: up(0.9) }], {
+        tool_options: { gann: { show_angles: true, time_levels: [
+          { value: 0, color: "#00897b", visible: true, style: "solid", fill_between: true, label_visible: true },
+          { value: 0.5, color: "#00897b", visible: true, style: "dashed", fill_between: true, label_visible: true },
+          { value: 1, color: "#00897b", visible: true, style: "solid", fill_between: true, label_visible: true },
+        ] } },
+      });
+      chart.add_drawing("gann_fan", [{ logical: at(0.02), price: up(0.05) }, { logical: at(0.08), price: up(0.15) }], {
+        tool_options: { gann: { scale_ratio: (hi - lo) / 40 } },
+      });
       // Dashed and dotted strokes reach both executors as the same solid dash runs.
       chart.add_drawing("inside_pitchfork", [
         { logical: at(0.3), price: up(0.15) }, { logical: at(0.38), price: up(0.45) }, { logical: at(0.45), price: up(0.25) },
