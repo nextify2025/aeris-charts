@@ -473,6 +473,16 @@ impl DrawingBounds {
                 max_price: None,
             };
         }
+        // A fork-form projection's sector bulges up to its radius past the target's time, which
+        // the anchors cannot bound; its prices stay between the pivot's and the target's (the
+        // arc keeps to one quadrant), and the screen box bounds the rest.
+        if kinds::projection_annotations::draws_sector(drawing) {
+            return Self {
+                logical: LogicalBounds::Full,
+                min_price,
+                max_price,
+            };
+        }
         // An extended body reaches the pane edge in its own direction, which the anchors'
         // box cannot bound; stay conservative instead of culling the visible extension.
         if drawing.extend_left || drawing.extend_right {
@@ -522,6 +532,8 @@ struct DrawingCache {
     text_key: u64,
     text_width: f64,
     text_size: f64,
+    /// Lines of the text block (`Drawing::text_block_lines`), cached with the width.
+    text_lines: usize,
     /// Family decoration reach (CSS px) cached under `decoration_key` (the text key).
     decoration_key: u64,
     decoration: f64,
@@ -541,6 +553,7 @@ impl DrawingCache {
             text_key: u64::MAX,
             text_width: 0.0,
             text_size: 0.0,
+            text_lines: 1,
             decoration_key: u64::MAX,
             decoration: 0.0,
             screen_valid: false,
@@ -1727,6 +1740,26 @@ impl Drawing {
         self.text.as_str()
     }
 
+    /// Whether the drawing's own text paints as a block that may span lines (owner decisions:
+    /// the multi-line text owner) rather than one run: the text annotations (upstream's text
+    /// block, [`TextBlock`], or their fork-form box), and the fork-form signpost plate, arrow-mark
+    /// text, and price-label bubble (`kinds::projection_annotations::fork_text_box`). Static:
+    /// it never depends on the text or an open editor, so the editor a host opens on it keeps
+    /// its form while the text changes. The plain text tool stays one run (owner decision A11).
+    pub(crate) fn paints_text_block(&self) -> bool {
+        self.kind.is_text_annotation() || kinds::projection_annotations::fork_text_owner(self)
+    }
+
+    /// Lines of upstream's text block ([`TextBlock`]): a text annotation's text split at `\n`
+    /// (one line when empty); every other run is one line.
+    pub(crate) fn text_block_lines(&self) -> usize {
+        if self.kind.is_text_annotation() {
+            self.text.split('\n').count()
+        } else {
+            1
+        }
+    }
+
     /// The glyph size the label actually renders at in CSS px: `text_size` when set, else
     /// [`TEXT_TOOL_DEFAULT_SIZE`] for the text tool and the chart's `layout.font_size` for
     /// every other tool's label. Rendering, hit-testing, and host editing chrome must all
@@ -2081,6 +2114,81 @@ impl DrawingTextRun {
     }
 }
 
+/// A text annotation's text as upstream's run stacked into lines (one per `\n`): every line
+/// starts at the left edge the run's alignment gives the widest line, lines advance by the run's
+/// 1.2 em line box, and the block grows away from the reference box (up for `Top`, keeping the
+/// run's bottom; both ways for `Middle`; down for `Bottom`, keeping the run's top). One line is
+/// exactly the run's box, so single-line text paints, hits, and culls as before.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextBlock {
+    /// Left edge of every line.
+    pub(crate) left: f64,
+    /// Vertical center of the first line.
+    pub(crate) first_y: f64,
+    /// The widest line's advance.
+    pub(crate) width: f64,
+    pub(crate) line_height: f64,
+    pub(crate) lines: usize,
+}
+
+impl TextBlock {
+    /// The block of `lines` lines whose widest advance is `width`, where the run of glyph `size`
+    /// would sit at the aligned anchor `(x, y)` (`align` its horizontal edge, `y` its center).
+    pub(crate) fn new(
+        (x, y, align): (f64, f64, DrawingTextHAlign),
+        v_align: DrawingTextVAlign,
+        width: f64,
+        size: f64,
+        lines: usize,
+    ) -> Self {
+        let line_height = size * 1.2;
+        let extra = lines.saturating_sub(1) as f64 * line_height;
+        Self {
+            left: match align {
+                DrawingTextHAlign::Left => x,
+                DrawingTextHAlign::Center => x - width / 2.0,
+                DrawingTextHAlign::Right => x - width,
+            },
+            first_y: match v_align {
+                DrawingTextVAlign::Top => y - extra,
+                DrawingTextVAlign::Middle => y - extra / 2.0,
+                DrawingTextVAlign::Bottom => y,
+            },
+            width,
+            line_height,
+            lines,
+        }
+    }
+
+    /// Top edge of the first line's box.
+    pub(crate) fn top(&self) -> f64 {
+        self.first_y - self.line_height / 2.0
+    }
+
+    /// Height of the stacked line boxes.
+    pub(crate) fn height(&self) -> f64 {
+        self.lines as f64 * self.line_height
+    }
+
+    /// Vertical center of line `index`.
+    pub(crate) fn line_y(&self, index: usize) -> f64 {
+        self.first_y + index as f64 * self.line_height
+    }
+
+    /// Bottom edge of the last line's box.
+    pub(crate) fn bottom(&self) -> f64 {
+        self.line_y(self.lines.saturating_sub(1)) + self.line_height / 2.0
+    }
+
+    /// Whether `(x, y)` lies in the block grown by `pad` on every side.
+    pub(crate) fn contains(&self, (x, y): (f64, f64), pad: f64) -> bool {
+        x >= self.left - pad
+            && x <= self.left + self.width + pad
+            && y >= self.top() - pad
+            && y <= self.bottom() + pad
+    }
+}
+
 const DRAWING_HISTORY_LIMIT: usize = 100;
 
 /// Drawing options that are identity, placement, visibility, or content rather than style, in
@@ -2301,7 +2409,11 @@ const MEASURE_DRAG_SLOP: f64 = 5.0;
 /// intersection test share it so they cannot drift.
 fn drawing_kind_pad(drawing: &Drawing) -> (f64, f64) {
     if drawing.kind.is_marker() {
-        (16.0, 16.0)
+        // A signpost with coincident anchors stands its pole above its foot.
+        (
+            16.0,
+            16.0 + kinds::projection_annotations::signpost_pole(drawing, 1.0),
+        )
     } else if drawing.kind == DrawingKind::IconStamp {
         (drawing.icon_size / 2.0, drawing.icon_size / 2.0)
     } else if drawing.kind == DrawingKind::Forecast {
@@ -4250,7 +4362,10 @@ impl ChartEngine {
     /// Freeze the source bars between a bars pattern's first two anchors: the canonical source
     /// rows from `ceil(min)` through `floor(max)` of their logicals (replay-visible and as-of
     /// rows, whitespace skipped), each at its axis offset from the first index so gaps survive.
-    /// `None` for more than [`MAX_BARS_PATTERN_BARS`] slots or without a valid bar.
+    /// A range wider than [`MAX_BARS_PATTERN_BARS`] slots aggregates into at most that many OHLC
+    /// buckets of `stride` slots ([`Self::capture_bars_pattern_buckets`]), each at its bucket
+    /// index, so the copy stays within the stored offset bound (owner decision A9). `None`
+    /// without a valid bar.
     fn capture_bars_pattern(&self, drawing: &Drawing) -> Option<Vec<BarsPatternBar>> {
         use aeris_charts_core::model::plot_list::PlotValueIndex as Field;
         if drawing.kind != DrawingKind::BarsPattern || drawing.points.len() != 3 {
@@ -4258,11 +4373,7 @@ impl ChartEngine {
         }
         let (a, b) = (drawing.points[0].logical, drawing.points[1].logical);
         let (first, last) = (a.min(b).ceil().max(0.0), a.max(b).floor());
-        if !first.is_finite()
-            || !last.is_finite()
-            || last < first
-            || last - first >= MAX_BARS_PATTERN_BARS as f64
-        {
+        if !first.is_finite() || !last.is_finite() || last < first {
             return None;
         }
         // Both ends sit on the data axis (`last >= first >= 0`).
@@ -4270,7 +4381,16 @@ impl ChartEngine {
             return None;
         }
         let (first, last) = (first as i64, last as i64);
+        // `last >= first >= 0`, so the span is a positive count.
+        let stride = (last - first + 1)
+            .unsigned_abs()
+            .div_ceil(MAX_BARS_PATTERN_BARS as u64) as i64;
         let rows = self.drawing_source_window(drawing)?;
+        if stride > 1 {
+            return self
+                .capture_bars_pattern_buckets(rows, first, last, stride)
+                .map(|(bars, _)| bars);
+        }
         let mut bars: Vec<BarsPatternBar> = Vec::new();
         for row in rows.rows_between(first, last) {
             if rows.is_whitespace(row) {
@@ -4293,8 +4413,8 @@ impl ChartEngine {
                 continue;
             }
             // An as-of source collapses the rows between two axis points onto the later point's
-            // index; they merge into that slot's bar (first open, extremes, last close), so every
-            // row the forecast reads is also in the copy.
+            // index; they merge into that offset's bar (first open, extremes, last close), so
+            // every row the forecast reads is also in the copy.
             match bars.last_mut() {
                 Some(previous) if previous.offset == offset => {
                     previous.high = previous.high.max(bar.high);
@@ -4306,6 +4426,71 @@ impl ChartEngine {
             }
         }
         (!bars.is_empty()).then_some(bars)
+    }
+
+    /// The buckets of `stride` slots of a wide bars-pattern range `[first, last]` (see
+    /// [`Self::capture_bars_pattern`]): each bucket merges the canonical rows at its slots (first
+    /// open, highest high, lowest low, last close), so rows an as-of source collapses onto one
+    /// point merge as the narrow copy merges them. A union source reads each bucket's LOD summary
+    /// rows (endpoints and extrema), a logarithmic number of summaries per bucket; an as-of
+    /// source's LOD summarizes axis points rather than its own rows, so it reads the rows of the
+    /// range once, as its regression fit and forecast outcome do. Also returns the rows and
+    /// summaries read.
+    fn capture_bars_pattern_buckets(
+        &self,
+        rows: DrawingSourceRows<'_>,
+        first: i64,
+        last: i64,
+        stride: i64,
+    ) -> Option<(Vec<BarsPatternBar>, usize)> {
+        use aeris_charts_core::model::plot_list::PlotValueIndex as Field;
+        let lod = if rows.is_as_of() {
+            None
+        } else {
+            rows.plot.lod()
+        };
+        let mut bars = Vec::new();
+        let mut read = 0;
+        // The bucket's traded rows in order (LOD rows are sorted and never whitespace).
+        let mut traded = Vec::new();
+        for bucket in 0..(last - first + 1)
+            .unsigned_abs()
+            .div_ceil(stride.unsigned_abs()) as i64
+        {
+            let low_index = first + bucket * stride;
+            let range = rows.rows_between(low_index, (low_index + stride - 1).min(last));
+            traded.clear();
+            match lod {
+                Some(lod) => {
+                    let (summary, stats) = lod.rows_on_range(range, usize::MAX);
+                    read += stats.raw_rows + stats.summary_nodes;
+                    traded.extend(summary.iter());
+                }
+                None => {
+                    read += range.len();
+                    traded.extend(range.filter(|&row| !rows.is_whitespace(row)));
+                }
+            }
+            let (Some(&open_row), Some(&close_row)) = (traded.first(), traded.last()) else {
+                continue;
+            };
+            let (mut high, mut low) = (f64::NEG_INFINITY, f64::INFINITY);
+            for &row in &traded {
+                high = high.max(rows.value(row, Field::High));
+                low = low.min(rows.value(row, Field::Low));
+            }
+            let bar = BarsPatternBar {
+                offset: u16::try_from(bucket).ok()?,
+                open: rows.value(open_row, Field::Open),
+                high,
+                low,
+                close: rows.value(close_row, Field::Close),
+            };
+            if bar.valid() {
+                bars.push(bar);
+            }
+        }
+        (!bars.is_empty()).then_some((bars, read))
     }
 
     /// Least-squares center and residual-deviation boundaries over the source's values between
@@ -4487,16 +4672,18 @@ impl ChartEngine {
                     ),
                     _ => (pane.top, pane.top + pane.height),
                 };
-            if matches!(
-                drawing.kind,
-                DrawingKind::Circle
-                    | DrawingKind::Arc
-                    | DrawingKind::RotatedRectangle
-                    | DrawingKind::FibonacciSpeedArcs
-                    | DrawingKind::FibonacciCircles
-                    | DrawingKind::FibonacciSpiral
-                    | DrawingKind::FibonacciWedge
-            ) {
+            if kinds::projection_annotations::draws_sector(drawing)
+                || matches!(
+                    drawing.kind,
+                    DrawingKind::Circle
+                        | DrawingKind::Arc
+                        | DrawingKind::RotatedRectangle
+                        | DrawingKind::FibonacciSpeedArcs
+                        | DrawingKind::FibonacciCircles
+                        | DrawingKind::FibonacciSpiral
+                        | DrawingKind::FibonacciWedge
+                )
+            {
                 let mut px = [(0.0, 0.0); 4];
                 for (slot, &point) in px.iter_mut().zip(&drawing.points) {
                     let Some(converted) =
@@ -4688,7 +4875,7 @@ impl ChartEngine {
         key: u64,
         font_size: f64,
         font_family: &str,
-    ) -> Option<(f64, f64)> {
+    ) -> Option<(f64, f64, usize)> {
         // An open editor gives an empty label its one-em caret slot, which the frame paints
         // around and hit testing must not cull.
         let editing = self.editing_drawing() == Some(drawing.id);
@@ -4716,20 +4903,25 @@ impl ChartEngine {
                 self.measure_drawing_text_with_family(drawing, size, font_family)
             };
             entry.text_size = size;
+            entry.text_lines = drawing.text_block_lines();
             entry.text_key = key;
         }
-        Some((entry.text_width, entry.text_size))
+        Some((entry.text_width, entry.text_size, entry.text_lines))
     }
 
     /// Screen pad `(x, y)` in CSS px that a drawing's text run and family decorations reach
     /// beyond its anchors.
     fn drawing_label_pad(
-        text_metrics: Option<(f64, f64)>,
+        text_metrics: Option<(f64, f64, usize)>,
         text_layout: DrawingTextLayout,
         decoration: f64,
     ) -> (f64, f64) {
-        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size)| match text_layout {
-            DrawingTextLayout::Box => (width + TEXT_PAD * 2.0, size * 1.2 + TEXT_PAD * 2.0),
+        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size, lines)| match text_layout {
+            // A text block reaches its lines' height (one line: the run's line box).
+            DrawingTextLayout::Box => (
+                width + TEXT_PAD * 2.0,
+                lines as f64 * (size * 1.2) + TEXT_PAD * 2.0,
+            ),
             // A run along a segment rotates with it, so its length reaches past the anchors in
             // either axis: the run itself, its slot's normal offset (pad + half a glyph), and
             // half its thickness plus the pad.
@@ -4918,12 +5110,14 @@ impl ChartEngine {
     /// the full-width/full-height kinds in the same units. `pane_top` is the pane's vertical
     /// offset (0 for pane-local bitmap x media y are both chart-top-relative — see hit_test.rs).
     /// `None` when the geometry does not resolve: a zero box would put a caret at (0, 0).
+    /// `scale` is caller px per CSS px (the vertical pixel ratio at render, 1 in media px).
     pub(crate) fn text_box(
         drawing: &Drawing,
         px: &[(f64, f64)],
         pane_w: f64,
         pane_top: f64,
         pane_h: f64,
+        scale: f64,
     ) -> Option<TextBox> {
         resolve_drawing_geometry(
             drawing.kind,
@@ -4932,11 +5126,14 @@ impl ChartEngine {
             pane_top,
             pane_h,
             // The reference is the anchors' own geometry at unit scale: extensions and the icon
-            // size do not move a label.
+            // size do not move a label. Only a coincident signpost's pole follows `scale`
+            // (caller px per CSS px), so its label sits where the frame paints the pole at any
+            // device pixel ratio while every other marker keeps upstream's unit-scale box.
             DrawingGeometryOptions {
                 icon_size: 0.0,
                 extend_left: false,
                 extend_right: false,
+                signpost_pole: kinds::projection_annotations::signpost_pole(drawing, scale),
                 ..DrawingGeometryOptions::for_drawing(drawing, 1.0)
             },
         )
@@ -4967,6 +5164,9 @@ impl ChartEngine {
         (x, y, h, 0.0)
     }
 
+    /// The label's draw anchor of `drawing` at the anchors `px` (see [`Self::text_box`] for the
+    /// units): `size` is the glyph size and `scale` caller px per CSS px, which sizes the label's
+    /// [`TEXT_PAD`] and a coincident signpost's pole.
     pub(crate) fn drawing_text_placement(
         drawing: &Drawing,
         px: &[(f64, f64)],
@@ -4974,10 +5174,12 @@ impl ChartEngine {
         pane_top: f64,
         pane_h: f64,
         size: f64,
-        pad: f64,
+        scale: f64,
     ) -> (f64, f64, DrawingTextHAlign, f64) {
-        Self::try_drawing_text_placement(drawing, px, pane_w, pane_top, pane_h, size, pad)
-            .unwrap_or_else(|| Self::text_placement(drawing, &TextBox::default(), size, pad))
+        Self::try_drawing_text_placement(drawing, px, pane_w, pane_top, pane_h, size, scale)
+            .unwrap_or_else(|| {
+                Self::text_placement(drawing, &TextBox::default(), size, TEXT_PAD * scale)
+            })
     }
 
     /// [`ChartEngine::drawing_text_placement`] that reports `None` for a drawing whose geometry
@@ -4989,8 +5191,9 @@ impl ChartEngine {
         pane_top: f64,
         pane_h: f64,
         size: f64,
-        pad: f64,
+        scale: f64,
     ) -> Option<(f64, f64, DrawingTextHAlign, f64)> {
+        let pad = TEXT_PAD * scale;
         if drawing.kind.spec().text_layout == DrawingTextLayout::Segment && px.len() >= 2 {
             let (mut start, mut end) = (px[0], px[1]);
             let mut dx = end.0 - start.0;
@@ -5028,13 +5231,14 @@ impl ChartEngine {
                 return Some((x, y, drawing.text_h_align, dy.atan2(dx)));
             }
         }
-        let reference = Self::text_box(drawing, px, pane_w, pane_top, pane_h)?;
+        let reference = Self::text_box(drawing, px, pane_w, pane_top, pane_h, scale)?;
         Some(Self::text_placement(drawing, &reference, size, pad))
     }
 
     /// Measure (or estimate) a label's width in the same px units as `size`. Empty text tools
     /// use one em so the focus/hover chrome and hit target stay a caret-sized box (the host
-    /// never leaves an empty text drawing on the chart after editing).
+    /// never leaves an empty text drawing on the chart after editing). A text annotation's text
+    /// of several lines measures its widest line ([`TextBlock`]).
     pub(crate) fn measure_drawing_text(&self, drawing: &Drawing, size: f64) -> f64 {
         let layout = &self.options.get().layout;
         self.measure_drawing_text_with_family(drawing, size, &layout.font_family)
@@ -5048,6 +5252,16 @@ impl ChartEngine {
         }
         let text = drawing.display_text();
         let weight = drawing.text_weight.unwrap_or(400);
+        if drawing.text_block_lines() > 1 {
+            // Upstream's text block: its widest line.
+            return text
+                .split('\n')
+                .map(|line| {
+                    let line = line.trim_end_matches('\r');
+                    self.measure_text_run(line, size, family, weight, drawing.text_italic)
+                })
+                .fold(0.0, f64::max);
+        }
         self.measure_text_run(text, size, family, weight, drawing.text_italic)
     }
 
@@ -6232,7 +6446,7 @@ impl ChartEngine {
             pane.top,
             pane.height,
             size,
-            TEXT_PAD,
+            1.0,
         )?;
         Some(DrawingTextRun {
             x,
@@ -6274,24 +6488,27 @@ impl ChartEngine {
         let drawing = self.drawing(id)?;
         // The geometry the frame places text against (a regression's fitted box included).
         let px = self.drawing_render_px(drawing)?;
-        if drawing.kind.paints_generic_text() {
+        if kinds::projection_annotations::fork_text_owner(drawing) {
+            self.box_text_edit_layout(drawing, &px, kinds::projection_annotations::fork_text_box)
+        } else if drawing.kind.paints_generic_text() {
             self.run_text_edit_layout(drawing, &px)
         } else {
-            self.box_text_edit_layout(drawing, &px)
+            self.box_text_edit_layout(drawing, &px, drawing.kind.spec().family?.build_parts)
         }
     }
 
-    /// The editor layout of a family drawing's text box (see [`ChartEngine::drawing_text_edit_layout`]).
+    /// The editor layout of the text box `build` resolves for `drawing` (a family's, or a
+    /// fork-form annotation's; see [`ChartEngine::drawing_text_edit_layout`]).
     fn box_text_edit_layout(
         &self,
         drawing: &Drawing,
         px: &[(f64, f64)],
+        build: impl FnOnce(&PartContext<'_>, &mut DrawingParts),
     ) -> Option<DrawingTextEditLayout> {
-        let family = drawing.kind.spec().family?;
         let mut context = PartContext::media(self, drawing, px)?;
         context.text_editing = true;
         let mut parts = DrawingParts::default();
-        (family.build_parts)(&context, &mut parts);
+        build(&context, &mut parts);
         let text = parts.text?;
         let label = parts.labels.get(text.label)?;
         let font_family = &self.options.get().layout.font_family;
@@ -6333,14 +6550,38 @@ impl ChartEngine {
         let width = if drawing.text.is_empty() {
             run.size
         } else {
-            self.measure_text_run(
-                drawing.display_text(),
-                run.size,
-                font_family,
-                weight,
-                drawing.text_italic,
-            )
+            self.measure_drawing_text(drawing, run.size)
         };
+        // A text annotation edits its text block (several lines); one line is the run itself.
+        let block_owner = drawing.kind.is_text_annotation();
+        if block_owner && drawing.text_block_lines() > 1 {
+            // Upstream's text block: lines left-aligned at its left edge, over several lines.
+            let block = TextBlock::new(
+                (run.x, run.y, run.align),
+                drawing.text_v_align,
+                width,
+                run.size,
+                drawing.text_block_lines(),
+            );
+            return Some(DrawingTextEditLayout {
+                x: block.left,
+                y: block.first_y,
+                line_height: block.line_height,
+                size: run.size,
+                font_family: font_family.clone(),
+                weight,
+                italic: drawing.text_italic,
+                color: self.drawing_label_color(drawing).to_css(),
+                rect: [
+                    block.left - TEXT_PAD,
+                    block.top() - TEXT_PAD,
+                    block.left + block.width + TEXT_PAD,
+                    block.bottom() + TEXT_PAD,
+                ],
+                angle: 0.0,
+                multiline: true,
+            });
+        }
         let (x, y) = run.start(width);
         Some(DrawingTextEditLayout {
             x,
@@ -6353,7 +6594,7 @@ impl ChartEngine {
             color: self.drawing_label_color(drawing).to_css(),
             rect: run.bounds(width),
             angle: run.angle,
-            multiline: false,
+            multiline: block_owner,
         })
     }
 
@@ -6472,6 +6713,7 @@ impl ChartEngine {
                     | DrawingKind::AnchoredText
             )
             || !drawing.kind.paints_generic_text()
+            || kinds::projection_annotations::fork_text_owner(drawing)
         {
             return false;
         }
@@ -6487,6 +6729,9 @@ impl ChartEngine {
                 return false;
             };
             let width = width.unwrap_or_else(|| {
+                if drawing.text_block_lines() > 1 {
+                    return self.measure_drawing_text(drawing, run.size);
+                }
                 self.measure_text_run(
                     text,
                     run.size,
@@ -6495,6 +6740,17 @@ impl ChartEngine {
                     drawing.text_italic,
                 )
             });
+            if drawing.text_block_lines() > 1 {
+                // A callout's or price note's text block.
+                return TextBlock::new(
+                    (run.x, run.y, run.align),
+                    drawing.text_v_align,
+                    width,
+                    run.size,
+                    drawing.text_block_lines(),
+                )
+                .contains((x, y), TEXT_PAD);
+            }
             run.contains(width, x, y)
         })
         .unwrap_or(false)
@@ -7144,10 +7400,30 @@ impl ChartEngine {
                     kinds::lines::upstream_line_parts(context, segment, parts);
                 })
         };
+        // A fork-form annotation's text box is a body target, like the geometry under it.
+        if kinds::projection_annotations::fork_text_owner(drawing)
+            && self.parts_hit(
+                drawing,
+                px,
+                (x, y),
+                hit_tolerance,
+                kinds::projection_annotations::fork_text_box,
+            )
+        {
+            return true;
+        }
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
                     || line_parts_hit(Some((a, b)))
+                    || (kinds::projection_annotations::draws_forecast_boxes(drawing)
+                        && self.parts_hit(
+                            drawing,
+                            px,
+                            (x, y),
+                            hit_tolerance,
+                            kinds::projection_annotations::forecast_parts,
+                        ))
             }
             DrawingBodyGeometry::Horizontal { y: line_y, x0, x1 } => {
                 (y - line_y).abs() <= tolerance
@@ -7515,6 +7791,44 @@ impl ChartEngine {
                         distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
                     })
             }
+            DrawingBodyGeometry::Sector(arc) => {
+                // The outline and the stats box, and, while selected, the filled sector, as the
+                // frame paints them.
+                let mut arc_points = Vec::new();
+                arc.flatten(curve_clip(), &mut arc_points);
+                let mut outline = Vec::with_capacity(arc_points.len() + 2);
+                outline.push(arc.center);
+                outline.extend_from_slice(&arc_points);
+                outline.push(arc.center);
+                shape::distance_to_polyline((x, y), &outline) <= tolerance
+                    || (drawing.fill_enabled && {
+                        let hub = vec![arc.center; arc_points.len()];
+                        self.band_fill_hit(drawing, &arc_points, &hub, (x, y))
+                    })
+                    || px.get(1).is_some_and(|&target| {
+                        self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                            kinds::projection_annotations::projection_stats(
+                                context, arc.center, target, parts,
+                            );
+                        })
+                    })
+            }
+            DrawingBodyGeometry::NotePin(pin) => {
+                let mut outline = Vec::new();
+                pin.outline(&mut outline);
+                point_in_polygon((x, y), &outline)
+                    || (!outline.is_empty() && {
+                        outline.push(outline[0]);
+                        shape::distance_to_polyline((x, y), &outline) <= hit_tolerance
+                    })
+            }
+            DrawingBodyGeometry::SpeechTail { corners } => {
+                point_in_polygon((x, y), &corners)
+                    || (0..3).any(|index| {
+                        let (a, b) = (corners[index], corners[(index + 1) % 3]);
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= hit_tolerance
+                    })
+            }
             DrawingBodyGeometry::Arc(_) | DrawingBodyGeometry::Curve(_) => {
                 // The stroke (with its caps and tangent extensions) and, while selected, the
                 // chord region, as the frame paints them.
@@ -7644,17 +7958,14 @@ impl ChartEngine {
                 let size = drawing.resolved_text_size(layout.font_size);
                 let reference = geometry.text_box;
                 let (tx, ty, align, _) = Self::text_placement(drawing, &reference, size, TEXT_PAD);
-                let width = self.measure_drawing_text(drawing, size);
-                let height = size * 1.2;
-                let left = match align {
-                    DrawingTextHAlign::Left => tx,
-                    DrawingTextHAlign::Center => tx - width / 2.0,
-                    DrawingTextHAlign::Right => tx - width,
-                };
-                x >= left - TEXT_CHROME_PAD
-                    && x <= left + width + TEXT_CHROME_PAD
-                    && y >= ty - height / 2.0 - TEXT_CHROME_PAD
-                    && y <= ty + height / 2.0 + TEXT_CHROME_PAD
+                TextBlock::new(
+                    (tx, ty, align),
+                    drawing.text_v_align,
+                    self.measure_drawing_text(drawing, size),
+                    size,
+                    drawing.text_block_lines(),
+                )
+                .contains((x, y), TEXT_CHROME_PAD)
             }
         }
     }
@@ -8051,7 +8362,14 @@ impl ChartEngine {
                     // Derived geometry follows (a rotated rectangle's width, a curve's
                     // on-curve points).
                     if let Some(drawing) = self.drawing(id) {
-                        kinds::follow_anchor_drag(self, drawing, index, &start_px, &mut points);
+                        kinds::follow_anchor_drag(
+                            self,
+                            drawing,
+                            index,
+                            &start_points,
+                            &start_px,
+                            &mut points,
+                        );
                     }
                 }
             }
@@ -8476,10 +8794,13 @@ impl ChartEngine {
     }
 
     /// Whether a newly created drawing requests the platform text editor. The editor remains a
-    /// host surface, while the decision to enter it is part of the canonical tool definition.
+    /// host surface, while the decision to enter it is part of the canonical tool definition
+    /// (and, for a fork-form signpost, of its fork form: owner decision A7).
     pub fn drawing_requests_text_edit(&self, id: DrawingId) -> bool {
-        self.drawing(id)
-            .is_some_and(|drawing| drawing.kind.spec().requests_text_editor)
+        self.drawing(id).is_some_and(|drawing| {
+            drawing.kind.spec().requests_text_editor
+                || kinds::projection_annotations::requests_text_editor(drawing)
+        })
     }
 
     /// Merge options into the armed template and any in-flight creation. Browser and native
@@ -8521,7 +8842,6 @@ impl ChartEngine {
 
     fn creation_update_for_commit(
         &mut self,
-        kind: DrawingKind,
         id: DrawingId,
         pointer_capture: bool,
     ) -> DrawingCreationUpdate {
@@ -8541,7 +8861,7 @@ impl ChartEngine {
             consumed: true,
             changed: true,
             created: Some(id),
-            request_text_edit: kind.spec().requests_text_editor,
+            request_text_edit: self.drawing_requests_text_edit(id),
             pointer_capture,
         }
     }
@@ -8586,7 +8906,7 @@ impl ChartEngine {
                 }
                 let result = self.drawing_create_click(x, y, modifiers);
                 let id = u32::try_from(result).unwrap_or(0);
-                self.creation_update_for_commit(armed.kind, id, false)
+                self.creation_update_for_commit(id, false)
             }
             _ => DrawingCreationUpdate {
                 consumed: true,
@@ -8656,7 +8976,7 @@ impl ChartEngine {
         // move event happened to arrive before pointer-up.
         let changed = self.brush_create_add(x, y);
         let id = self.brush_create_end();
-        let mut update = self.creation_update_for_commit(kind, id, false);
+        let mut update = self.creation_update_for_commit(id, false);
         update.changed |= changed;
         update
     }
@@ -8702,7 +9022,7 @@ impl ChartEngine {
         let result = self.drawing_create_click(x, y, modifiers);
         let id = u32::try_from(result).unwrap_or(0);
         if id > 0 {
-            return self.creation_update_for_commit(kind, id, false);
+            return self.creation_update_for_commit(id, false);
         }
         DrawingCreationUpdate {
             consumed: true,
@@ -8721,7 +9041,7 @@ impl ChartEngine {
             return DrawingCreationUpdate::default();
         }
         let id = self.drawing_create_finish();
-        self.creation_update_for_commit(kind, id, false)
+        self.creation_update_for_commit(id, false)
     }
 
     /// Step back the armed tool's placement by its latest placed anchor (see
@@ -9162,6 +9482,11 @@ impl ChartEngine {
             drawing.points = points;
         }
         Drawing::normalize_points(drawing.kind, &mut drawing.points);
+        // A fork-form annotation starts from the fork's starter text (owner decision A6), so
+        // its placement opens the editor on it; upstream's form starts empty.
+        if let Some(text) = kinds::projection_annotations::starter_text(&drawing) {
+            drawing.text = text.to_string();
+        }
         // Anchored text starts at its anchor's screen position.
         if drawing.kind == DrawingKind::AnchoredText {
             if let Some((x, y)) = drawing.points.first().and_then(|&point| {

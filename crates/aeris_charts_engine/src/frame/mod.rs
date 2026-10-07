@@ -532,6 +532,9 @@ pub(crate) struct RetainedFrame {
     coordinate_generation: u64,
     last_layout_key: Option<[u64; 9]>,
     last_overlay_key: Option<[u64; 7]>,
+    /// The hovered and the selected drawing when either paints parts only while focused
+    /// (`kinds::projection_annotations::reveals_on_focus`), as of the last prepared frame.
+    last_focus_key: [Option<crate::DrawingId>; 2],
     last_options_generation: u64,
     last_series_revision: u64,
     last_time_scale_revision: u64,
@@ -1488,6 +1491,19 @@ impl ChartEngine {
         let time_scale_revision = self.time_scale.revision();
         if self.retained_frame.last_time_scale_revision != time_scale_revision {
             self.frame_invalidation.time_coordinates();
+        }
+        // Hover and selection normally reassemble retained drawing geometry without rebuilding
+        // it; a drawing that paints parts only while focused (a fork-form note's box) rebuilds
+        // the layer when it gains or loses focus, at most once per focus change.
+        let focus_key = [self.hovered_drawing(), self.selected_drawing()].map(|id| {
+            id.filter(|&id| {
+                self.drawing(id)
+                    .is_some_and(crate::drawings::kinds::projection_annotations::reveals_on_focus)
+            })
+        });
+        if self.retained_frame.last_focus_key != focus_key {
+            self.frame_invalidation.drawings();
+            self.retained_frame.last_focus_key = focus_key;
         }
         let price_scales_changed = self.retained_frame.last_price_scale_revisions.len()
             != self.panes.len()

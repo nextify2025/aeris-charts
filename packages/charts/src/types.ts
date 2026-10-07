@@ -3240,14 +3240,19 @@ export type drawing_icon =
   | "triangle_up"
   | "triangle_down";
 /**
- * Legacy Projection & Annotations options (`tool_options.projection_annotation`). The shared
- * catalog renders `bars_pattern`, `icon_stamp`, and `note`: the deprecated fields are input
- * aliases mapped onto flat drawing options on patch and restore and never written back, and the
- * other fields are stored but not rendered. A field is written only when it differs from its
- * default, so a block at its defaults reads back as `{}`: documents an earlier fork build wrote
- * (and that build's clipboard and sync items with its anchor counts) restore their projections,
- * notes, comments, price notes, price labels, signposts, arrow markers, and forecasts with that
- * empty block, which marks the fork's look of those tools; new drawings have none.
+ * Projection & Annotations options (`tool_options.projection_annotation`). The deprecated fields
+ * are input aliases mapped onto flat drawing options on patch and restore and never written back.
+ * The block's presence (even `{}`) selects the earlier fork build's look of `projection` (a
+ * filled sector and a stats box beside the target), `note` (a pin whose text box shows while the
+ * note is hovered, selected, or edited), `comment` and `price_label` (speech bubbles at the
+ * anchor, the price label's price first), `price_note` (its price and text in one box),
+ * `signpost` (a text plate; placing it opens the editor), the arrow markers (their text past the
+ * tail), and `forecast` (source and target boxes with `Success`/`Failure` on the market colors);
+ * `null` restores the upstream look, which new drawings keep. Placing a note, comment, callout,
+ * signpost, or anchored text with the block starts from that build's text (`"Note"`, ...). A
+ * field is written only when it differs from its default, so a block at its defaults reads back
+ * as `{}`: documents that build wrote (and its clipboard and sync items with its anchor counts)
+ * restore those tools with that empty block.
  */
 export interface projection_annotation_tool_options {
   /** @deprecated Input alias of `bars_pattern_mode` (`"hl_bars"` becomes `"bars"`). */
@@ -3265,7 +3270,7 @@ export interface projection_annotation_tool_options {
   icon?: drawing_icon;
   /** @deprecated Input alias of `icon_size`, 8..96 CSS px (larger legacy values are clamped on restore). */
   icon_size?: number;
-  /** `note`: paint the text box while the note is not focused. Stored but not rendered. */
+  /** `note` with the block: paint its text box also while the note is neither hovered, selected, nor edited. */
   always_show_text?: boolean;
 }
 /** @deprecated The same type as {@link drawing_wave_degree}. */
@@ -3325,7 +3330,9 @@ export interface drawing_tool_options {
  * stats instead, and the simple tag shows its text as its price-axis tag); `price_label` paints
  * its text inside its own label. A painted label is edited in place: double-click it (or select
  * the drawing and press Enter or F2; a single click on an already selected text annotation also
- * opens it), and tools that start from a default text open the editor when placed. Colors parse
+ * opens it), and tools that start from a default text open the editor when placed. The text
+ * annotations (`note`, `comment`, `callout`, `price_note`, `anchored_text`) stack `\n`-separated
+ * lines into one block; other labels stay on one line. Colors parse
  * per the engine's
  * CSS rules; `""` for optional colors means "follow the default" (the border color at
  * 20% alpha for a rectangle's fill, the chart's `layout.textColor` for labels), and
@@ -3497,7 +3504,11 @@ export interface persisted_drawing_style_v1 {
   icon_name?: string;
   /** Icon stamp size in CSS px, 8..96. */
   icon_size?: number;
-  /** Frozen OHLC sample for a bars-pattern ghost copy; at most 512 bars. */
+  /**
+   * Frozen OHLC sample for a bars-pattern ghost copy; at most 512 bars, `offset` below 512. A
+   * source range wider than 512 slots merges each `ceil(slots / 512)` slots into one bar at
+   * successive offsets.
+   */
   bars_pattern?: Array<{ offset: number; open: number; high: number; low: number; close: number }>;
   bars_pattern_mirror_x?: boolean;
   bars_pattern_mirror_y?: boolean;

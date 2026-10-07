@@ -275,6 +275,13 @@ impl<'a> PartContext<'a> {
     pub(crate) fn fills_hit(&self) -> bool {
         self.engine.selected_drawing() == Some(self.drawing.id)
     }
+
+    /// Whether the drawing is focused: hovered or selected (a fork-form note shows its box
+    /// then; the frame rebuilds the drawing layer when such a drawing gains or loses focus).
+    pub(crate) fn focused(&self) -> bool {
+        let id = Some(self.drawing.id);
+        self.engine.selected_drawing() == id || self.engine.hovered_drawing() == id
+    }
 }
 
 /// The label that holds a drawing's own `text` (see [`DrawingParts::text_label`]).

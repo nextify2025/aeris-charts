@@ -7,6 +7,9 @@
 use aeris_charts_render::draw_list::LineType;
 use aeris_charts_render::shape::{self, EllipseArc, Point, Rect};
 
+use super::kinds::projection_annotations::{
+    NOTE_DOT_RADIUS, NOTE_HEAD_RADIUS, NOTE_RISE, TAIL_HEIGHT, TAIL_WIDTH,
+};
 use super::{path_arrow_points, Drawing, DrawingKind, TextBox};
 use crate::DrawingLevel;
 
@@ -158,6 +161,16 @@ pub(crate) enum DrawingBodyGeometry<'a> {
         corners: [(f64, f64); 3],
     },
     Arc(ArcGeometry),
+    /// A fork-form projection's circular sector (owner decision A2): the arc around the pivot
+    /// from the horizontal ray toward the target to the target, closed through the pivot.
+    Sector(ArcGeometry),
+    /// A fork-form note's teardrop pin, its tip on the anchor.
+    NotePin(NotePinGeometry),
+    /// The speech-bubble tail of a fork-form comment or price label: its tip on the anchor, its
+    /// base on the bubble's bottom edge (the bubble is the drawing's text box).
+    SpeechTail {
+        corners: [(f64, f64); 3],
+    },
     Curve(CurveGeometry),
     /// A closed polyline (`tool_options.shape.closed`, three vertices or more): the last vertex
     /// joins the first, and the enclosed region fills by the nonzero rule.
@@ -747,6 +760,41 @@ impl MarkerGeometry {
     }
 }
 
+/// A fork-form note's pin (caller px): the tip on the anchor, the head circle `rise` above it,
+/// and the contrasting dot in the head.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NotePinGeometry {
+    pub(crate) tip: (f64, f64),
+    pub(crate) head: (f64, f64),
+    pub(crate) radius: f64,
+    pub(crate) dot_radius: f64,
+}
+
+impl NotePinGeometry {
+    /// The pin's convex outline: the tip, then the head's arc from the right tangent point over
+    /// the top to the left one (within [`CURVE_TOLERANCE`]).
+    pub(crate) fn outline(self, out: &mut Vec<Point>) {
+        let rise = self.tip.1 - self.head.1;
+        if rise <= self.radius {
+            return;
+        }
+        // The tangent points from the tip sit slightly below the head's center.
+        let tangent_y = self.radius * self.radius / rise;
+        let tangent_x = (self.radius * self.radius - tangent_y * tangent_y)
+            .max(0.0)
+            .sqrt();
+        let start = tangent_y.atan2(tangent_x);
+        out.push(self.tip);
+        EllipseArc::circle(
+            self.head,
+            self.radius,
+            start,
+            -(std::f64::consts::PI + 2.0 * start),
+        )
+        .append_points(CURVE_TOLERANCE, out);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArcGeometry {
     pub(crate) center: (f64, f64),
@@ -938,6 +986,14 @@ pub(crate) struct DrawingGeometryOptions {
     pub(crate) full_circles: bool,
     /// A polyline joins its last vertex to its first (`tool_options.shape.closed`).
     pub(crate) closed: bool,
+    /// The annotation's fork form (`tool_options.projection_annotation` present, owner decision
+    /// A1): a projection resolves its sector, a note its pin, a comment and a price label their
+    /// speech-bubble tail.
+    pub(crate) annotation_fork_form: bool,
+    /// Caller px of the pole a signpost with coincident anchors stands up from its foot (0 for
+    /// every other drawing): `kinds::projection_annotations::SIGNPOST_POLE` at the caller's
+    /// scale.
+    pub(crate) signpost_pole: f64,
 }
 
 impl DrawingGeometryOptions {
@@ -954,6 +1010,11 @@ impl DrawingGeometryOptions {
             extend_right: drawing.extend_right,
             full_circles: super::kinds::fibonacci::options(drawing).full_circles,
             closed: super::kinds::shapes::closed(drawing),
+            annotation_fork_form: super::kinds::projection_annotations::fork_form(drawing),
+            signpost_pole: super::kinds::projection_annotations::signpost_pole(
+                drawing,
+                device_scale,
+            ),
         }
     }
 }
@@ -1448,10 +1509,13 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         | DrawingKind::FlagMark
         | DrawingKind::Signpost => DrawingBodyGeometry::Marker(MarkerGeometry {
             kind,
-            anchor: if kind == DrawingKind::Signpost {
-                *px.get(1)?
-            } else {
+            anchor: if kind != DrawingKind::Signpost {
                 *px.first()?
+            } else if options.signpost_pole > 0.0 {
+                // Coincident anchors stand the fork's pole up from the foot.
+                (px[0].0, px[0].1 - options.signpost_pole)
+            } else {
+                *px.get(1)?
             },
             base: (kind == DrawingKind::Signpost).then(|| px[0]),
             radius: 7.0 * options.device_scale,
@@ -1534,6 +1598,25 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 bottom: a.1.max(b.1),
             }
         }
+        DrawingKind::Note if options.annotation_fork_form => {
+            let tip = px[0];
+            let scale = options.device_scale;
+            DrawingBodyGeometry::NotePin(NotePinGeometry {
+                tip,
+                head: (tip.0, tip.1 - NOTE_RISE * scale),
+                radius: NOTE_HEAD_RADIUS * scale,
+                dot_radius: NOTE_DOT_RADIUS * scale,
+            })
+        }
+        DrawingKind::Comment | DrawingKind::PriceLabel if options.annotation_fork_form => {
+            let tip = px[0];
+            let scale = options.device_scale;
+            // The tail reaches one CSS px into the bubble so the two never show a seam.
+            let base = tip.1 - (TAIL_HEIGHT + 1.0) * scale;
+            DrawingBodyGeometry::SpeechTail {
+                corners: [tip, (tip.0, base), (tip.0 + TAIL_WIDTH * scale, base)],
+            }
+        }
         DrawingKind::Text
         | DrawingKind::Note
         | DrawingKind::Comment
@@ -1576,8 +1659,25 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         DrawingKind::Projection => {
             let pivot = px[0];
             let target = *px.get(1)?;
-            DrawingBodyGeometry::Triangle {
-                corners: [pivot, (target.0, pivot.1), target],
+            let (dx, dy) = (target.0 - pivot.0, target.1 - pivot.1);
+            let radius = dx.hypot(dy);
+            if options.annotation_fork_form && radius > f64::EPSILON {
+                // From the horizontal ray on the target's side to the target: at most a quarter
+                // turn, so the sector stays in one quadrant of the pivot.
+                let start = if dx >= 0.0 { 0.0 } else { std::f64::consts::PI };
+                let sweep = (dy.atan2(dx) - start + std::f64::consts::PI)
+                    .rem_euclid(std::f64::consts::TAU)
+                    - std::f64::consts::PI;
+                DrawingBodyGeometry::Sector(ArcGeometry {
+                    center: pivot,
+                    radius,
+                    start,
+                    sweep,
+                })
+            } else {
+                DrawingBodyGeometry::Triangle {
+                    corners: [pivot, (target.0, pivot.1), target],
+                }
             }
         }
         DrawingKind::IconStamp => DrawingBodyGeometry::IconStamp {
@@ -1769,6 +1869,33 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 right: arc.center.0 + arc.radius,
                 top: arc.center.1 - arc.radius,
                 bottom: arc.center.1 + arc.radius,
+            },
+            DrawingBodyGeometry::Sector(arc) => {
+                // Exact: the arc stays within the quadrant its two end rays bound.
+                let end = arc.start + arc.sweep;
+                points_box(&[
+                    arc.center,
+                    (
+                        arc.center.0 + arc.radius * arc.start.cos(),
+                        arc.center.1 + arc.radius * arc.start.sin(),
+                    ),
+                    (
+                        arc.center.0 + arc.radius * end.cos(),
+                        arc.center.1 + arc.radius * end.sin(),
+                    ),
+                ])?
+            }
+            DrawingBodyGeometry::NotePin(pin) => TextBox {
+                left: pin.tip.0,
+                right: pin.tip.0,
+                top: pin.tip.1,
+                bottom: pin.tip.1,
+            },
+            DrawingBodyGeometry::SpeechTail { corners } => TextBox {
+                left: corners[0].0,
+                right: corners[0].0,
+                top: corners[0].1,
+                bottom: corners[0].1,
             },
             DrawingBodyGeometry::Curve(curve) => {
                 points_box(&curve.points[..if curve.cubic { 4 } else { 3 }])?
@@ -2311,5 +2438,80 @@ mod tests {
             panic!("projection triangle")
         };
         assert_eq!(corners, [(10.0, 50.0), (80.0, 50.0), (80.0, 10.0)]);
+    }
+
+    #[test]
+    fn projection_sector_resolves_from_the_horizon_ray_to_the_target() {
+        let fork = DrawingGeometryOptions {
+            annotation_fork_form: true,
+            ..DrawingGeometryOptions::default()
+        };
+        // Target up-right, up-left, and down-left of the pivot: the horizontal ray on the
+        // target's side, at most a quarter turn to the target.
+        for (target, start) in [
+            ((80.0, 10.0), 0.0),
+            ((-40.0, 20.0), std::f64::consts::PI),
+            ((-40.0, 90.0), std::f64::consts::PI),
+        ] {
+            let px = [(10.0, 50.0), target];
+            let geometry =
+                resolve_drawing_geometry(DrawingKind::Projection, &px, 100.0, 0.0, 100.0, fork)
+                    .unwrap();
+            let DrawingBodyGeometry::Sector(arc) = geometry.body else {
+                panic!("projection sector")
+            };
+            let radius = (target.0 - 10.0_f64).hypot(target.1 - 50.0);
+            assert!((arc.radius - radius).abs() < 1e-9);
+            assert_eq!(arc.center, (10.0, 50.0));
+            assert_eq!(arc.start, start);
+            assert!(arc.sweep.abs() <= std::f64::consts::FRAC_PI_2 + 1e-12);
+            let end = arc.point(1.0);
+            assert!((end.0 - target.0).abs() < 1e-9 && (end.1 - target.1).abs() < 1e-9);
+            // The text box is the quadrant box: pivot, horizon point, target.
+            let horizon = arc.point(0.0);
+            let box_ = geometry.text_box;
+            let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+            assert!(near(box_.left, 10.0_f64.min(horizon.0).min(target.0)));
+            assert!(near(box_.right, 10.0_f64.max(horizon.0).max(target.0)));
+            assert!(near(box_.top, 50.0_f64.min(target.1)));
+            assert!(near(box_.bottom, 50.0_f64.max(target.1)));
+        }
+        // A zero radius keeps upstream's (degenerate) triangle.
+        let geometry = resolve_drawing_geometry(
+            DrawingKind::Projection,
+            &[(10.0, 50.0), (10.0, 50.0)],
+            100.0,
+            0.0,
+            100.0,
+            fork,
+        )
+        .unwrap();
+        assert!(matches!(
+            geometry.body,
+            DrawingBodyGeometry::Triangle { .. }
+        ));
+    }
+
+    #[test]
+    fn coincident_signposts_stand_a_pole_scaled_like_the_marker() {
+        for scale in [1.0, 2.0] {
+            let options = DrawingGeometryOptions {
+                device_scale: scale,
+                signpost_pole: 40.0 * scale,
+                ..DrawingGeometryOptions::default()
+            };
+            let px = [(30.0, 80.0), (30.0, 80.0)];
+            let geometry =
+                resolve_drawing_geometry(DrawingKind::Signpost, &px, 100.0, 0.0, 100.0, options)
+                    .unwrap();
+            let DrawingBodyGeometry::Marker(marker) = geometry.body else {
+                panic!("signpost marker")
+            };
+            assert_eq!(
+                marker.stem(),
+                Some(((30.0, 80.0), (30.0, 80.0 - 40.0 * scale)))
+            );
+            assert_eq!(marker.radius, 7.0 * scale);
+        }
     }
 }

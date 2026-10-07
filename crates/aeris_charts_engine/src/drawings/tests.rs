@@ -5041,7 +5041,7 @@ fn placing_a_text_owning_annotation_requests_the_editor_but_price_labels_and_arr
 }
 
 #[test]
-fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owning_families() {
+fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owners() {
     let mut chart = settled_chart();
     let rectangle = chart
         .add_drawing(
@@ -5100,13 +5100,13 @@ fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owning_famil
     assert!(chart.set_drawing_text_edit("one\ntwo", usize::MAX));
     assert_eq!(chart.drawing(annotation).unwrap().text, "one\ntwo");
     assert!(chart.commit_drawing_text_edit());
-    // Upstream's text annotations paint one run, so their editor keeps one line too.
+    // The text annotations stack their lines into one text block, so their editor keeps them.
     let comment = chart
         .add_drawing(DrawingKind::Comment, 0, vec![pt(4.0, 12.0)], None)
         .unwrap();
     assert!(chart.begin_drawing_text_edit(comment, false));
     assert!(chart.set_drawing_text_edit("one\ntwo", usize::MAX));
-    assert_eq!(chart.drawing(comment).unwrap().text, "one two");
+    assert_eq!(chart.drawing(comment).unwrap().text, "one\ntwo");
     assert!(chart.commit_drawing_text_edit());
 }
 
