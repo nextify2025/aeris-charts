@@ -9,6 +9,186 @@ struct CountingCanvas {
     calls: usize,
 }
 
+/// VAL-CROSS-005: one host replay clock must project ordinary studies and trade-derived
+/// annotations from the same eligible history, including after seeking backwards.
+#[test]
+fn replay_seek_structure_auction_and_custom_study_match_fresh_prefix() {
+    struct TwoBarAverage;
+    impl CustomStudyRuntime for TwoBarAverage {
+        fn compute(
+            &mut self,
+            input: CustomStudyInput<'_>,
+            out: &mut [Vec<f64>],
+        ) -> Result<(), CustomStudyFault> {
+            for row in input.from..input.times.len() {
+                out[0].push(if row == 0 {
+                    f64::NAN
+                } else {
+                    (input.close[row - 1] + input.close[row]) / 2.0
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn setup(
+        times: &[f64],
+        highs: &[f64],
+        lows: &[f64],
+        trades: Vec<FootprintTrade>,
+    ) -> (ChartEngine, Vec<SeriesId>, SeriesId, NativePrimitiveId) {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let closes = highs
+            .iter()
+            .zip(lows)
+            .map(|(high, low)| (high + low) / 2.0)
+            .collect::<Vec<_>>();
+        chart
+            .set_series_data(0, times, &closes, highs, lows, &closes)
+            .unwrap();
+        let structure =
+            chart.add_indicator_kind(0, IndicatorKind::SwingPoints { left: 1, right: 1 }, None);
+        chart
+            .register_custom_study(
+                CustomStudyDefinition {
+                    type_id: "replay_two_bar_average".into(),
+                    version: 1,
+                    title: "Replay average".into(),
+                    parameters: vec![],
+                    outputs: vec![CustomStudyOutput {
+                        name: "Average".into(),
+                        plot: CustomStudyPlot::Line,
+                        pane: CustomStudyPane::Price,
+                        default_style: IndicatorOutputStyle::default(),
+                    }],
+                    uses_volume: false,
+                },
+                Box::new(|_| Ok(Box::new(TwoBarAverage))),
+            )
+            .unwrap();
+        let custom = chart
+            .add_custom_study(
+                "replay_two_bar_average",
+                0,
+                IndicatorInputSource::Close,
+                None,
+                CustomStudyParams::new(),
+            )
+            .unwrap()[0];
+        let stream = chart
+            .add_trade_stream(
+                "replay_auction",
+                FootprintAggregationOptions {
+                    tick_size: 1.0,
+                    ..FootprintAggregationOptions::default()
+                },
+            )
+            .unwrap();
+        chart.set_trade_stream_trades(stream, trades).unwrap();
+        let auction = chart
+            .add_auction_markers(
+                stream,
+                0,
+                AuctionMarkerOptions {
+                    include_forming_bar: true,
+                    ..AuctionMarkerOptions::default()
+                },
+            )
+            .unwrap();
+        (chart, structure, custom, auction)
+    }
+
+    fn output(chart: &ChartEngine, id: SeriesId) -> (Vec<i64>, Vec<Option<f64>>) {
+        let (times, columns) = chart.data.series_data(id).unwrap();
+        (
+            times.to_vec(),
+            columns[3]
+                .iter()
+                .map(|value| value.is_finite().then_some(*value))
+                .collect(),
+        )
+    }
+
+    let times = (1..=10).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
+    let highs = [10., 14., 12., 18., 16., 20., 19., 17., 25., 21.];
+    let lows = [8., 9., 10., 15., 11., 8., 16., 13., 22., 17.];
+    let trades = times
+        .iter()
+        .enumerate()
+        .flat_map(|(index, time)| {
+            [AggressorSide::Buy, AggressorSide::Sell]
+                .into_iter()
+                .enumerate()
+                .map(move |(offset, side)| FootprintTrade {
+                    timestamp_micros: *time as i64 * 1_000_000 + offset as i64,
+                    price: 100.0 + index as f64,
+                    volume: 2.0,
+                    aggressor: side,
+                    bid: None,
+                    ask: None,
+                    sequence: None,
+                    trade_id: None,
+                    conditions: 0,
+                    session_id: Some(1),
+                })
+        })
+        .collect::<Vec<_>>();
+    let (mut replay, structure, custom, auction) = setup(&times, &highs, &lows, trades.clone());
+    assert!(
+        !replay
+            .study_annotations(structure[0])
+            .unwrap()
+            .markers()
+            .is_empty()
+    );
+    assert!(!replay.auction_markers_snapshot(auction).unwrap().is_empty());
+    assert_eq!(output(&replay, custom).1[8], Some(21.25));
+
+    for len in [10usize, 6, 9, 3, 8, 1, 7, 10] {
+        let clock = times[len - 1] as i64 * 1_000_000 + 1;
+        replay.set_replay_clock_micros(Some(clock)).unwrap();
+        let eligible = trades
+            .iter()
+            .filter(|trade| trade.timestamp_micros <= clock)
+            .cloned()
+            .collect();
+        let (fresh, expected_structure, expected_custom, expected_auction) =
+            setup(&times[..len], &highs[..len], &lows[..len], eligible);
+        for (&actual, &expected) in structure.iter().zip(&expected_structure) {
+            assert_eq!(
+                output(&replay, actual),
+                output(&fresh, expected),
+                "structure prefix {len}"
+            );
+        }
+        assert_eq!(
+            replay.study_annotations(structure[0]).unwrap(),
+            fresh.study_annotations(expected_structure[0]).unwrap(),
+            "annotations prefix {len}"
+        );
+        assert_eq!(
+            output(&replay, custom),
+            output(&fresh, expected_custom),
+            "custom prefix {len}"
+        );
+        assert_eq!(
+            output(&replay, custom).0.len(),
+            len.saturating_sub(1),
+            "custom prefix {len}"
+        );
+        assert_eq!(
+            replay.auction_markers_snapshot(auction).unwrap().len(),
+            len * 2,
+            "each eligible bar has both unfinished-auction sides"
+        );
+        assert_eq!(
+            replay.auction_markers_snapshot(auction).unwrap(),
+            fresh.auction_markers_snapshot(expected_auction).unwrap(),
+            "auction prefix {len}"
+        );
+    }
+}
+
 impl Canvas2d for CountingCanvas {
     fn set_fill_solid(&mut self, _color: Color) {
         self.calls += 1;
@@ -2141,6 +2321,7 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
     let binding = &chart.indicators[binding_index];
     let (times, source) = chart.data.series_data(binding.source).unwrap();
     let expected = match binding.kind {
+        IndicatorKind::Custom { .. } => return,
         IndicatorKind::Aroon { period } => {
             let values = aeris_charts_indicators::aroon(source[1], source[2], period);
             vec![
@@ -5416,7 +5597,7 @@ fn macd_outputs_are_line_line_histogram_with_four_state_colors() {
     assert_eq!(chart.indicator_info(ids[2]).unwrap().output_index, 2);
     let info = chart.indicator_info(ids[0]).unwrap();
     assert_eq!(
-        (info.kind, info.period, info.deviation),
+        (info.kind.as_ref(), info.period, info.deviation),
         ("macd", 3, Some(2.0))
     );
     // Every installed histogram row carries one of the four palette colors.
@@ -5715,7 +5896,7 @@ fn wma_atr_and_stochastic_place_and_report() {
     assert_eq!(stoch.len(), 2);
     let info = chart.indicator_info(stoch[0]).unwrap();
     assert_eq!(
-        (info.kind, info.period, info.deviation),
+        (info.kind.as_ref(), info.period, info.deviation),
         ("stochastic", 2, Some(2.0))
     );
     assert_eq!(chart.indicator_info(stoch[1]).unwrap().output_index, 1);

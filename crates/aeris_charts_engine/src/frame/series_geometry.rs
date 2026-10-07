@@ -271,6 +271,32 @@ fn push_marker_arrow(
     });
 }
 
+/// Shared visible price-glyph placement for structural annotations and custom study plots.
+/// `direction` offsets a swing arrow away from its price; `None` stays at the exact price.
+fn study_price_marker_center(
+    x: i32,
+    price_y: i32,
+    size: f64,
+    ratios: (f64, f64),
+    direction: Option<bool>,
+    bounds: (i32, i32, i32),
+) -> Option<[f32; 2]> {
+    let (hpr, vpr) = ratios;
+    let (width, top, bottom) = bounds;
+    let half = marker_shape_size(size, 1.0) * hpr * 0.5;
+    let y = price_y as f64
+        + match direction {
+            Some(true) => size * vpr * 0.6,
+            Some(false) => -size * vpr * 0.6,
+            None => 0.0,
+        };
+    (x as f64 - half >= 0.0
+        && x as f64 + half <= width as f64
+        && y - half >= top as f64
+        && y + half < bottom as f64)
+        .then_some([x as f32, y as f32])
+}
+
 impl ChartEngine {
     /// Positions in `rows` (ascending drawn rows of `id`) that start a new line run: rows whose
     /// period key differs from the previous drawn row's. The period is the exchange trading day
@@ -537,30 +563,79 @@ impl ChartEngine {
                 return;
             };
             let size = marker_envelope_size(self.time_scale.bar_spacing());
-            let glyph_half = marker_shape_size(size, 1.0) * hpr * 0.5;
-            let glyph_y = y as f64
-                + if up {
-                    size * vpr * 0.6
-                } else {
-                    -size * vpr * 0.6
-                };
-            if x as f64 - glyph_half < x_min as f64
-                || x as f64 + glyph_half > x_max as f64
-                || glyph_y - glyph_half < top as f64
-                || glyph_y + glyph_half >= bottom as f64
-            {
+            let Some([x, glyph_y]) =
+                study_price_marker_center(x, y, size, (hpr, vpr), Some(up), (width, top, bottom))
+            else {
                 return;
-            }
+            };
             push_marker_arrow(
                 out,
-                x as f32,
-                glyph_y as f32,
+                x,
+                glyph_y,
                 size,
                 hpr,
                 up,
                 if up { up_color } else { down_color },
             );
         });
+    }
+
+    /// A custom Marker output is still a canonical scalar series; only its paint differs.
+    /// Walk exact visible rows rather than LOD line points so gaps and marker prices survive.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_custom_marker_plot_frame(
+        &self,
+        rs: ResolvedSeries,
+        from: i64,
+        to: i64,
+        width: i32,
+        hpr: f64,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
+    ) {
+        if scale.is_empty() || from > to {
+            return;
+        }
+        let plot = self.data.plot(rs.id);
+        let pane = &self.panes[rs.pane.expect("visible series pane")];
+        let top = (pane.top * vpr).round() as i32;
+        let bottom = ((pane.top + pane.height) * vpr).round() as i32;
+        let size = marker_envelope_size(self.time_scale.bar_spacing());
+        let radius = (marker_shape_size(size, 1.0) * hpr * 0.5) as f32;
+        for row in plot.visible_rows(from, to) {
+            if plot.is_whitespace_row(row) {
+                continue;
+            }
+            let price = plot.value_at(row, PlotValueIndex::Close);
+            let y = scale.price_to_coordinate(price, rs.base_value) * vpr;
+            if !y.is_finite() {
+                continue;
+            }
+            let x = (self
+                .time_scale
+                .index_to_coordinate(plot.index_at(row).expect("visible marker row index"))
+                * hpr)
+                .round() as i32;
+            let Some([cx, cy]) = study_price_marker_center(
+                x,
+                y.round() as i32,
+                size,
+                (hpr, vpr),
+                None,
+                (width, top, bottom),
+            ) else {
+                continue;
+            };
+            out.push(Prim::Circle {
+                cx,
+                cy,
+                radius,
+                fill: rs.color,
+                stroke_width: 0.0,
+                stroke: rs.color,
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

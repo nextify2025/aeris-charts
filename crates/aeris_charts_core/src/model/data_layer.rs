@@ -3562,6 +3562,36 @@ mod tests {
     }
 
     #[test]
+    fn all_whitespace_anchor_series_never_move_the_base_index() {
+        // Fork port of upstream's `whitespace_only_series_are_skipped_by_the_base_index`: the
+        // fork needs no `whitespace_only` flag, because `base_index` finds each series' last
+        // data row through the LOD pyramid (logarithmic) and an all-whitespace column has none.
+        let mut dl = DataLayer::new();
+        let a = dl.add_series();
+        set(&mut dl, a, &[1, 2], &[10.0, 20.0]);
+        assert_eq!(dl.base_index(), Some(1));
+        // A structure-study anchor: aligned to its source, longer than it, and all-whitespace.
+        let anchor = dl.add_series();
+        let nan = f64::NAN;
+        dl.set_data(
+            anchor,
+            vec![1, 2, 3, 4],
+            vec![nan, nan, nan, nan],
+            vec![nan, nan, nan, nan],
+            vec![nan, nan, nan, nan],
+            vec![nan, nan, nan, nan],
+        );
+        assert_eq!(dl.base_index(), Some(1));
+        // Streaming more whitespace rows into the anchor never moves it either.
+        assert!(dl.update(anchor, 5, [nan; 4]));
+        assert_eq!(dl.base_index(), Some(1));
+        // A real row on the source still advances the base index past the anchor's rows.
+        assert!(dl.update(a, 6, [30.0; 4]));
+        assert_eq!(dl.merged_times()[5], 6);
+        assert_eq!(dl.base_index(), Some(5));
+    }
+
+    #[test]
     fn whitespace_rows_stay_in_place_and_off_the_base_index() {
         let mut dl = DataLayer::new();
         let a = dl.add_series();

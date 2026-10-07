@@ -210,6 +210,13 @@ export interface offscreen_key_event {
  * synchronous screenshots, and ResizeObserver sizing).
  */
 export class offscreen_chart {
+  register_custom_study(): never {
+    throw new AerisChartsError("unsupported", "custom studies require a main-thread chart");
+  }
+
+  add_custom_study(): never {
+    throw new AerisChartsError("unsupported", "custom studies require a main-thread chart");
+  }
   private readonly stats_scratch = new Float64Array(AerisChart.frame_stats_len());
   private readonly backend_change_handlers = new Set<(backend: "webgpu" | "canvas2d") => void>();
   private primary_adopted = false;

@@ -12,6 +12,7 @@
 - [无障碍与自动尺寸](#无障碍与自动尺寸)
 - [主题、资源与分发](#主题资源与分发)
 - [值快照与指标演示](#值快照与指标演示)
+- [自定义研究桥接](#自定义研究桥接)
 - [公共边界与销毁](#公共边界与销毁)
 
 ## WASM 边界
@@ -57,6 +58,16 @@ JS 窗格图元与自定义系列的命令缓冲区在可于宿主机上测试�
 `chart.value_snapshot(logical_index?)` 仅跨越一次 WebAssembly 边界，并返回所有存活系列。该包在引擎记录上添加存活句柄，并通过只保留有值的条目来派生旧版十字光标 `series_data`。引擎拥有的特性系列暴露其标量比例尺投影，并保留旧版标量事件形态。任意自定义系列回调仍归宿主所有：精确快照为 null，而最新快照只能暴露在可见帧期间记录的最后一个值，并明确依赖渲染状态。品种/交易所元数据、VWAP 绑定之外的成交量关联、柱/日涨跌幅计算、交易时段日历、可见性设置以及图例 DOM 仍归宿主所有。
 
 Web 演示在可搜索的指标目录中公开所有内置计算 API。条目按需创建其引擎绑定（27 个 KLineChart 模板通过该包的 `add_klinechart_indicator` 创建），并在被清除时移除其拥有的全部输出，以及它们所依赖的任何合成成交量和成交额系列。RSI 使用与包使用者相同的引擎计算和振荡指标窗格；演示中不另行维护单独的公式。
+
+## 自定义研究桥接
+
+浏览器的[自定义研究](../../features/studies.md#自定义研究)由主线程适配层（`aeris_charts_wasm` 的 `chart/custom_studies.rs`）执行：`register_custom_study_result_json` 把定义解析为引擎类型，并把 JS 的 `init`、`update`、`rebuild` 包装成同步的 `CustomStudyRuntime`。每个运行时保留六列 `Float64Array` 镜像（时间、开、高、低、收、成交量），容量按 `next_power_of_two` 增长并复制已有前缀，每次调用只写入从 `from` 起变化的行；回调收到这些镜像的子数组与本次的 `from`、`length`、`tail`，并在 `outputs` 中写入 `[from, length)` 的结果，适配层把结果复制回引擎。成交量列在成交量序列没有的行上为 `NaN`。ponytail：镜像随最大行数增长到下一个 2 的幂（1,000,000 行时每个绑定约 6 × 8 MiB），受每图表 32 个绑定的上限约束；只有测量显示内存压力时才改为按需收缩。
+
+TypeScript 的 `get wasm()` 是唯一的守卫入口，顺序为：图表已销毁时抛出 `disposed`；处于渲染期间的宿主回调中时抛出 `unsupported_operation`；处于自定义研究回调中时抛出 `reentrant_call`；否则返回带故障分发的代理或原始实例。注册自定义研究的图表还会把自身的每个原型方法包装为同样的重入检查，普通图表保持直接调用。
+
+首次注册之后，图表改用一个 `Proxy` 包装 WASM 实例：除只读允许列表（`frame_pending`、`frame_stats`、`render`、`ring_source_count`、`wants_animation`、`time_scale_width`、`time_scale_height`、`visible_logical_range`、`visible_time_range`，以及本仓库每次重绘与倒计时读取的 `pane_geometry_json`、`series_last_value_data`）之外，每次调用之后都会取出故障（`take_custom_study_faults_json`，无故障时返回空字符串）并分发给 `subscribe_custom_study_fault` 的订阅者，包括环形缓冲区排空与系列 `pop` 等不按名称前缀区分的变更。手势层在安装时持有原始实例，因此指针、滚轮与按键路由不经过代理，不增加任何往返；它们不重建指标，产生的故障会在下一次经代理的调用后取出。
+
+OffscreenCanvas worker 门面的 `register_custom_study` 与 `add_custom_study` 抛出 `unsupported`（回调无法跨线程同步执行），不改变图表。主线程图表导入 V3 文档时，结果携带 `unresolved_custom_studies`（尚未注册类型的绑定），并为导入的研究输出重建浏览器系列句柄。
 
 ## 公共边界与销毁
 

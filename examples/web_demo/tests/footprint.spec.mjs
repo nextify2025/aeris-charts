@@ -555,6 +555,128 @@ test("big trades rebuild split prints into one order over ordinary candles", asy
   expect(result.stale).toBe("stale_handle");
 });
 
+test("auction markers expose deterministic tape-derived snapshots and reject invalid options", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const footprint = chart.add_series("footprint", {
+      tick_size: 1,
+      interval_seconds: 60,
+    });
+    const stream = chart.add_trade_stream("CME:ES:auction-markers", {
+      tick_size: 1,
+      interval_seconds: 60,
+    });
+    chart.bind_footprint_series_to_stream(footprint, stream);
+    const micros = Math.floor(window.__data[0].time / 60) * 60_000_000;
+    chart.set_trade_stream_trades(stream, [
+      { timestamp_micros: micros + 1, price: 100, volume: 150, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: micros + 1, price: 100, volume: 30, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: micros + 2, price: 101, volume: 25, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: micros + 3, price: 102, volume: 5, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: micros + 60_000_001, price: 100, volume: 120, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: micros + 60_000_002, price: 101, volume: 15, aggressor: "buy", session_id: 1 },
+    ]);
+    const marker = chart.add_auction_markers(footprint, stream);
+    const defaults = marker.options();
+    const first = marker.snapshot();
+    const repeat = marker.snapshot();
+    marker.apply_options({ min_side_volume: 2, exhaustion_max_volume: 6 });
+    const updated = marker.options();
+    const invalid = (() => {
+      try {
+        marker.apply_options({ exhaustion_levels: 0 });
+        return null;
+      } catch (error) {
+        return error.code;
+      }
+    })();
+    const after_invalid = marker.options();
+    const in_use = chart.trade_stream_stats(stream).dependent_count;
+    marker.remove();
+    const stale = (() => {
+      try {
+        marker.snapshot();
+        return null;
+      } catch (error) {
+        return error.code;
+      }
+    })();
+    return {
+      defaults, first, repeat, updated, invalid, after_invalid, in_use,
+      released: chart.trade_stream_stats(stream).dependent_count, stale,
+    };
+  });
+
+  expect(result.defaults).toMatchObject({
+    min_side_volume: 0,
+    exhaustion_max_volume: 10,
+    exhaustion_levels: 3,
+    absorption_min_volume: 100,
+    absorption_ratio: 3,
+    extreme_levels: 2,
+    min_rejection_rows: 1,
+    extend_until_revisited: false,
+    include_forming_bar: false,
+    visible: true,
+  });
+  expect(result.first).toEqual(result.repeat);
+  expect(result.first).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: "absorption", side: "low", price: 100, volume: 150 }),
+    expect.objectContaining({ kind: "exhaustion", side: "high", price: 102, volume: 5 }),
+  ]));
+  expect(result.first.every((mark) => mark.bar_time === result.first[0].bar_time)).toBe(true);
+  for (const mark of result.first) {
+    expect(["unfinished_auction", "exhaustion", "absorption"]).toContain(mark.kind);
+    expect(["high", "low"]).toContain(mark.side);
+    expect(Number.isFinite(mark.price)).toBe(true);
+    expect(Number.isFinite(mark.volume)).toBe(true);
+  }
+  expect(result.updated).toMatchObject({ min_side_volume: 2, exhaustion_max_volume: 6 });
+  expect(result.invalid).toBe("invalid_options");
+  expect(result.after_invalid).toEqual(result.updated);
+  expect(result.in_use).toBe(1);
+  expect(result.released).toBe(result.in_use - 1);
+  expect(result.stale).toBe("stale_handle");
+});
+
+test("footprint, auction markers and big trades share late prints and retention", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const footprint = chart.add_series("footprint", { tick_size: 1, interval_seconds: 60 });
+    const stream = chart.add_trade_stream("CME:ES:auction-shared", { tick_size: 1, interval_seconds: 60 });
+    chart.bind_footprint_series_to_stream(footprint, stream);
+    const base = Math.floor(window.__data[0].time / 60) * 60_000_000;
+    chart.set_trade_stream_trades(stream, [
+      { timestamp_micros: base + 1, price: 100, volume: 110, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: base + 2, price: 100, volume: 10, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: base + 60_000_001, price: 101, volume: 1, aggressor: "buy", session_id: 1 },
+    ]);
+    const markers = chart.add_auction_markers(footprint, stream);
+    const big = chart.add_big_trades(footprint, stream, { filter: { mode: "fixed", minimum_volume: 100 } });
+    const initial = markers.snapshot().find((mark) => mark.kind === "unfinished_auction" && mark.side === "low");
+    const initialBig = big.snapshot().bubbles.map((bubble) => bubble.volume);
+    chart.update_trade_stream_trades(stream,
+      [{ timestamp_micros: base + 3, price: 100, volume: 200, aggressor: "sell", session_id: 1 }]);
+    const repaired = markers.snapshot().find((mark) => mark.kind === "unfinished_auction" && mark.side === "low");
+    const repairedBig = big.snapshot().bubbles.map((bubble) => bubble.volume);
+    const level = footprint.footprint_bar(0).levels.find((row) => row.price === 100);
+    footprint.apply_options({ max_points: 1 });
+    return {
+      initial: initial?.volume, repaired: repaired?.volume, initialBig, repairedBig,
+      bid: level.bid_volume, retainedTimes: [...new Set(markers.snapshot().map((mark) => mark.bar_time))],
+      retainedBars: footprint.footprint_bars().length,
+    };
+  });
+  expect(result).toMatchObject({ initial: 120, repaired: 320, bid: 310, retainedBars: 1 });
+  expect(result.initialBig).toContain(110);
+  expect(result.repairedBig).toContain(200);
+  expect(result.retainedTimes).toEqual([]);
+});
+
 test("big trades rejections carry typed error codes", async ({ page }) => {
   await open_chart(page);
   const result = await page.evaluate(() => {

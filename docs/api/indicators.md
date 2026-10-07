@@ -199,6 +199,12 @@ AO、PVT、TRIX 与 EMV 同时存在内置研究和同名的 KLineChart 模板�
 
 Rust 宿主使用 `ChartEngine::{add_swing_points, add_market_structure, add_fair_value_gaps, add_order_blocks, add_session_levels, add_previous_period_levels, add_opening_range}`（拒绝时返回空列表）、`ChartEngine::study_annotations(binding)`、`set_study_calendar(Vec<ResampleBoundary>)` 与 `clear_study_calendar()`。确认语义、空白数据规则、检查点与绘制顺序见[结构与时段研究](../features/studies.md)。
 
+## 自定义研究
+
+浏览器宿主用 `chart.register_custom_study(definition)` 注册一个同步计算的研究类型：`definition` 给出 `type`（小写字母、数字与 `._-`，最多 64 字节）、`version`、`title`、`parameters`（与 `indicator_schema` 相同的参数描述，`choice` 参数带 `options`）、1 到 5 个 `outputs`（`name`、`plot`：`"line"`/`"histogram"`/`"area"`/`"marker"`、`pane`：`"price"`/`"dedicated"`、可选的 `default_style`）、可选的 `uses_volume`，以及回调 `init(params) → state`、可选的 `update(state, ctx)` 与必需的 `rebuild(state, ctx)`。`ctx` 携带 `from`、`length`、`tail` 与 `time`、`open`、`high`、`low`、`close`、`volume` 六个 `Float64Array`，回调把 `[from, length)` 的结果写入 `ctx.outputs`，`NaN` 表示空白。`chart.add_custom_study(type, source, params?, { input_source?, volume_source?, ...series_options })` 绑定该类型并按输出顺序返回 `series_api`；输出可以作为其他研究的源。`chart.subscribe_custom_study_fault(callback)` 订阅故障事件（`{ binding, message }`），返回取消订阅函数。回调中调用任何图表 API 都抛出 `reentrant_call`；OffscreenCanvas worker 图表的这两个方法抛出 `unsupported`。
+
+Rust 宿主使用 `ChartEngine::register_custom_study(CustomStudyDefinition, CustomStudyFactory)`、`add_custom_study`、`set_custom_study_parameters`、`set_custom_study_source`、`retry_custom_study`、`custom_study_stats` 与 `take_custom_study_faults`（需要轮询）。调度、界限、待定与故障状态、持久化与绘制见[自定义研究](../features/studies.md#自定义研究)。
+
 ## KLineChart 指标
 
 `chart.add_klinechart_indicator(source, indicator, volume_source?, options?)` 添加 KLineChart 的 27 个指标模板之一，采用 KLineChart 的公式与呈现方式，并按输出顺序为每个输出返回一个 `series_api`。`indicator` 是一个 `klinechart_indicator`：即 `indicator` 中的模板名称加上该模板的参数，全部显式写出（不设任何默认值，因此缺少字段会被拒绝）：

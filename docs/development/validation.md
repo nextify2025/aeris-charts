@@ -75,6 +75,8 @@ xvfb-run -a -s "-screen 0 1920x1080x24" bunx playwright test --headed <specs>
 
 该 spec 现在通过 `localization.time_formatter` 绘制 `Apr0`，在两个后端上以半覆盖度度量墨迹，要求其落在条带文本中心的一个设备像素之内，并且仍然检查日历标签保留其刻度空间和内边距。一个设备像素的容差涵盖的是半覆盖度墨迹框的光栅取整，而不是字体校准：宿主的修正量就是样本自身测得的墨迹（`logical_midpoint_correction`，相对于 `middle` 基线的 `(ascent - descent) / (2 * dpr)`），因此无论宿主解析出哪种字体，样本的墨迹按构造都居中于条带文本中心。
 
+研究与拍卖标记的浏览器证据位于 `custom-studies.spec.mjs`（自定义研究的调度、重入、worker 拒绝、故障投递，以及结构区域与拍卖标记在 Canvas2D 与 WebGPU 之间的几何一致性）与 `footprint.spec.mjs` 的两个拍卖标记测试。跨后端像素比较的共用函数（按不透明像素对齐、统计边缘与填充差异）提取到 `tests/parity-pixels.mjs`，`primitives.spec.mjs` 与 `custom-studies.spec.mjs` 共用它；在没有 WebGPU 的环境中，需要 WebGPU 的测试在后端检查处失败，属于环境基线。
+
 ## GPUI 一致性与回放
 
 对于浏览器行为、渲染、交互、打包或一致性方面的变更，运行 Playwright。对于 GPUI 执行器变更，运行 GPUI 一致性与回放检查。`pixel_parity` 测试框架会先写入 `results.json` 和图像，然后在以下情形退出且状态非零：某个门禁失败、某次捕获返回的尺寸与夹具尺寸不符、`results.json` 无法写入，或运行超过其墙钟截止时间（示例中的 `DEADLINE`，为 120 s，而正常的 Linux 运行耗时 13.7 到 13.9 s；没有 X 显示时 GPUI 只绘制一次，此后不再绘制，因此是该截止时间终止那次运行）。某个夹具的图像在其捕获之前被删除，捕获失败的行不携带 GPUI 或差异哈希，因此 `results.json` 绝不会保留更早一次运行的证据。在 Windows 上（`native-gpui` CI 作业在该平台上将其作为阻塞步骤运行，捕获取自 DWM 窗口），其门禁是官方窗口限值：填充的整数矩形和彩色图像夹具与原生渲染完全一致，十字光标图标图像和缩放后的彩色图像至多相差一个通道值的混合舍入，并且在半透明描边连接处 7 CSS px 范围内，没有任何通道与参考结果相差超过 32（这是邻域最大值，而不是像素占比，因此由 `check_joins` 来约束）；其他夹具仅作报告。对图标源或掩码的变更还要运行 `node examples/web_demo/build_crosshair_icon.mjs --check`。
@@ -87,6 +89,8 @@ env -u WAYLAND_DISPLAY GPUI_X11_SCALE_FACTOR=1 \
   xvfb-run -a -s "-screen 0 2560x1600x24" \
   cargo run -p aeris_charts_render_gpui --features gpui-backend --example pixel_parity
 ```
+
+`tests/parity.rs` 的 `studies_and_auction_scene_reaches_canvas_and_gpui_identically_and_replays_deterministically` 覆盖结构研究、自定义标记与拍卖标记的组合场景：在 DPR 1.0、1.5 与 2.0 下，公允价值缺口的半透明填充与边框、虚线结构线与 BOS/CHoCH 文字、摆动点箭头、自定义标记圆以及拍卖三角形、圆、`ABS` 方框与虚线延伸线，经 Canvas2D 与 GPUI 执行器得到相同的矩形与文字绘制流，没有被丢弃的图元；两个引擎实例对同一状态构建的帧与 GPUI 执行计划完全相同。
 
 Linux 门禁（`examples/pixel_parity.rs` 中的 `GATES` 与 `ALIGNED`，其文档注释记录了每个夹具的全部测量值与限值）是针对 dev profile 下的 Mesa lavapipe 25.2.8（LLVM 20.1.2）校准的：在缩放系数 1.0 与 1.5 下各连续运行三次，所得计数与 GPUI 图像哈希均完全相同（在 1.0 下以 `LP_NUM_THREADS=1` 运行一次，结果同样一致）。每个门禁限定一个夹具中与原生参考相差超过某一通道差值的像素所占的比例：在成因允许时要求精确一致，否则取缩放系数 1.0 的测量值再加 25% 的余量，以适应不同的 Mesa 或 LLVM 构建，这不是噪声容限，因为不存在需要容纳的运行间噪声。像素占比对位置而言是较弱的检验，因此抗锯齿夹具还必须满足对齐要求：GPUI 的图像与未平移的参考之间的距离，必须小于它与沿 x 或 y 方向（任一方向）平移一个像素的参考之间的距离。故意注入的回归会使门禁失败：将整个 GPUI 层平移一个像素，会使 crisp、icon、translucent、join 与 image 门禁失败，沿任一方向平移一个像素，会使每个抗锯齿夹具的对齐检查失败；但它不再使 gradients 门禁失败，该门禁的残差主要来自面积填充的边缘毛边。
 

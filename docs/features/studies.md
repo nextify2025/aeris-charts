@@ -1,8 +1,10 @@
-# 结构与时段研究
+# 结构、时段与自定义研究
 
 [文档导航](../README.md) · [指标计算与绑定](../architecture/data/indicators.md) · [指标 API](../api/indicators.md#结构与时段研究)
 
 本页记录七个结构与时段研究的领域契约：摆动点（`swing_points`）、市场结构（`market_structure`）、公允价值缺口（`fair_value_gaps`）、订单块（`order_blocks`）、交易时段高低点（`session_levels`）、上一周期高低收（`previous_period_levels`）与开盘区间（`opening_range`）。它们来自上游 `051a447`..`dc39045`，经合并 `dc39045` 的提交引入。浏览器与 Rust 的调用方式见[指标 API](../api/indicators.md#结构与时段研究)。
+
+本页还记录宿主注册的[自定义研究](#自定义研究)（上游 `1276c5e`..`92aefe5`，经合并 `4c1da4f` 的提交引入）：它们与内置研究共用同一个绑定、输出与依赖路径，只把计算交给宿主提供的运行时。
 
 ## 归属
 
@@ -78,4 +80,48 @@
 - `aeris_charts_indicators`：`structure_studies` 与 `study_annotations` 的单元测试、`tests/session_studies.rs`（批量与增量、检查点、宿主时段、周与月）。
 - 引擎：`structure_engine_tests`、`annotation_binding_tests`、`session_study_regressions`、`study_segment_tests`、`calendar_replacement_*`、`structure_and_session_slot_fill_ticks_take_the_tail_path`、`structure_studies_refuse_as_of_sources_atomically`、`study_outputs_report_warmup_and_no_fixed_convergence`、`structure_anchors_show_no_legend_value_and_are_never_hit`，以及包含七个研究的空白数据、随机变更与有界工作量测试。
 - 浏览器：`study-foundation`、`structure-studies`、`session-studies`、`study-replay` 与 `indicator-catalog` 规格。
-- 性能：`perf_gate` 的 Target M（studies）在 1,000,000 行上对追加与预先安装的时段槽位计时，并要求每个 Tick 的扫描行数为常数且每个绑定都有报告。
+- 性能：`perf_gate` 的 Target M（studies）在 1,000,000 行上对追加与预先安装的时段槽位计时，并要求每个 Tick 的扫描行数为常数且每个绑定都有报告；Target T 在 1,000,000 行上测量七个研究同时绑定时的末端替换 p99 与一次回溯 20,000 行的历史修正（见[性能契约](../development/performance.md#指标与绘图性能目标)）。
+
+## 自定义研究
+
+自定义研究让宿主在图表内注册自己的公式，同时把调度、界限、样式、依赖与持久化留在引擎中。它与[外部研究](../architecture/data/indicators.md)不同：外部研究由宿主推送已经算好的值，自定义研究由引擎在源变化时调用宿主的运行时计算。
+
+### 注册与绑定
+
+- 宿主注册一个类型化定义：类型标识（小写字母、数字与 `._-`，最多 64 字节）、版本（≥ 1）、标题、参数描述（与内置研究相同的 `IndicatorParameterDescriptor`，`Choice` 参数用 `options` 列出选项）、1 到 5 个输出（每个输出有名称、绘制方式 `line`/`histogram`/`area`/`marker`、窗格 `price`/`dedicated` 与默认样式）以及是否读取成交量。定义在引擎边界一次性校验，失败时原子拒绝。
+- Rust 宿主用 `ChartEngine::register_custom_study(definition, factory)` 注册，工厂按归一化后的参数创建一个实现 `CustomStudyRuntime::compute` 的运行时；浏览器用 `chart.register_custom_study({ type, version, title, parameters, outputs, uses_volume, init, update?, rebuild })`。
+- `add_custom_study(type, source, input, volume, parameters)` 创建绑定：参数先归一化（补全默认值、拒绝未知或越界的参数），输出与内置研究一样别名到源的时间轴，可以被其他研究链式引用，并沿用图例、取值、样式与 `indicator_info`（`kind` 为类型标识，`parameters.custom` 为归一化参数）。`set_custom_study_parameters`、`set_custom_study_source` 与 `retry_custom_study` 保持输出标识与依赖顺序不变。
+- 界限：每个图表最多 64 个注册类型（`MAX_CUSTOM_STUDY_TYPES`）、32 个自定义绑定（`MAX_CUSTOM_STUDY_BINDINGS`）、每个定义 5 个输出（`MAX_CUSTOM_STUDY_OUTPUTS`），最多保留 64 个待取的故障事件（`MAX_CUSTOM_STUDY_FAULTS`）。超出类型或绑定上限返回 `resource_limit`。
+
+### 调度与输入
+
+- 引擎拥有调度：只有在此前的计算连续成功覆盖到当前末端时，才以 `tail: true` 调用运行时（浏览器调用 `update`，未提供时调用 `rebuild`）；否则从变化的后缀或第一行调用 `rebuild`。每次调用携带 `from`，输出只覆盖 `[from, length)`。
+- 本仓库的调整：运行时读取绑定自有的输入列，与内置运行时相同——`hl2`、`hlc3`、`ohlc4`、`hlcc4` 等聚合价格列被保留并只派生变化的行，成交量按时间戳对齐到绑定自有的保留列（`AlignedWeights::full_column`），同样只派生变化的行；成交量序列没有的时间戳（包括成交量序列暂时落后于源时超出其末端的行）为 `NaN`。与上游相同，成交量列要么为空（没有成交量源），要么与时间列等长，运行时可以按源行直接索引。因此每个 Tick 不再为输入分配与历史等长的副本。
+- 本仓库的调整：运行时在源的数据末端（最后一个真实行之后）停止，与内置、结构和时段运行时一致，因此在分时图上填充预先安装的交易时段槽位仍是一次末端更新，不会让运行时重算其后的全部空白槽位；跳过若干槽位的 Tick 从运行时上次停下的位置继续。
+- `NaN` 表示空白数据。每个输出前导的 `NaN` 行不进入其对齐的时间范围，与内置研究的预热一致；内部的 `NaN` 行在范围内保持为空白；待定或故障的输出整体为空。链式研究因此不会把这些空白当作价格读取。
+- 每个绑定报告调用次数与行数（`custom_study_stats`），并计入 `last_indicator_work_rows`；引擎不设不确定的挂钟截止时间。
+
+### 待定、故障与恢复
+
+- 类型未注册、版本不匹配或参数无法归一化时，绑定处于待定状态：输出为空白，依赖照常存在。匹配的类型注册后，引擎应用绘制方式与输出标题（保留已恢复的样式与窗格），重建该绑定及其依赖。
+- 运行时返回错误、输出长度不对或输出含有超出安全范围的值时，绑定进入故障状态：清空全部输出、重建依赖，并把一条故障事件（绑定标识与最多 256 字节的消息）加入有界队列。故障状态下的源更新只写入变化后缀的空白，不再调用运行时；宿主通过 `retry_custom_study`、更换参数或源来恢复。
+- Rust 宿主轮询 `take_custom_study_faults()`；浏览器在每一次可能触发计算的 WASM 调用之后取出故障并投递给 `subscribe_custom_study_fault` 的订阅者（见[浏览器边界](../architecture/hosts/browser.md#自定义研究桥接)）。
+- ponytail：GPUI 宿主目前只能轮询故障；只有当 Aeris Terminal 需要推送式投递时，才在 GPUI 适配层增加一个钩子。
+
+### 持久化与窗格
+
+V3 文档保存自定义绑定的类型标识、精确版本、归一化参数、输出数量、各输出是否位于独立窗格（`dedicated_outputs`）与输出样式，不保存运行时。导入时未注册或版本不匹配的绑定恢复为待定，输出按原顺序恢复到原窗格，并占用恢复游标，使其后的研究保持原位；导入结果的 `unresolved_custom_studies` 列出这些绑定。持久化中的自定义契约（类型标识字符集、版本、1 到 5 个输出、最多 64 个参数且参数序列化后不超过 64 KiB、自定义绑定数量上限、与已注册定义的一致性）在安装任何状态之前校验，失败时原子拒绝。详见[兼容性](../api/compatibility.md#持久化-v3-研究)。
+
+### 绘制
+
+`marker` 输出仍是普通的标量序列，只是绘制方式不同：帧构建逐个可见行（不是 LOD 折线点）在精确价格处画一个圆（`Prim::Circle`），与结构研究的摆动点共用同一个可见性与放置函数，因此缺口与标记价格都保持准确。其余绘制方式沿用折线、直方图与面积。没有新增图元，后端无需改动。
+
+### 只用于显示的状态
+
+研究日历与[拍卖标记](footprint.md#拍卖标记)都只在运行时存在，不进入持久化文档（所有者决定 Q-E）；自定义研究只持久化定义。ponytail：注释、拍卖标记与自定义标记目前都没有命中目标；将来加入悬停或选择时进入引擎输入控制器，而不是宿主。
+
+### 验证
+
+- 引擎：`custom_studies::tests`（调度、链式修复、待定与故障、上限、持久化、多输出预热与内部空白）、`custom_marker_plot_uses_exact_visible_prices_without_line_or_whitespace_marks`、`combined_structure_custom_marker_and_auction_frame_uses_existing_primitives`、`replay_seek_structure_auction_and_custom_study_match_fresh_prefix`，以及本仓库的 `aggregate_input_custom_study_reuses_its_retained_price_column_per_tick`（聚合输入不在每个 Tick 分配 O(n) 副本）与 `custom_study_ticks_filling_pre_installed_session_slots_stay_tail_updates`。
+- GPUI：`studies_and_auction_scene_reaches_canvas_and_gpui_identically_and_replays_deterministically` 在多个 DPR 下比较 Canvas2D 与 GPUI 的绘制流，并在两个引擎实例之间比较帧与执行计划。
+- 浏览器：`custom-studies` 规格（重入、worker 拒绝、环形缓冲区与 `pop` 后的故障投递、跨后端像素一致性）。

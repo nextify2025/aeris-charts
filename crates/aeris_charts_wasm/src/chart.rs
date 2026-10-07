@@ -16,6 +16,7 @@
 //! series maps its data onto merged indices; a series absent at an index is whitespace there.
 
 mod custom_series;
+mod custom_studies;
 mod depth;
 mod feature_series;
 mod footprint;
@@ -31,6 +32,7 @@ mod sessions;
 mod text_runs;
 
 use custom_series::CustomSeriesEntry;
+use custom_studies::register_custom_study;
 use ring::{BoundRing, RingLayoutInput};
 use text_runs::TextRunStore;
 
@@ -272,16 +274,32 @@ fn parse_big_trades_options(
     })
 }
 
-/// Public error category of a big-trades rejection.
+/// Parse auction-marker options JSON; a malformed document is `invalid_options`.
+fn parse_auction_marker_options(
+    json: &str,
+) -> Result<aeris_charts_engine::AuctionMarkerOptions, aeris_charts_engine::ChartError> {
+    serde_json::from_str(json).map_err(|error| {
+        aeris_charts_engine::ChartError::new(
+            aeris_charts_engine::ErrorCode::InvalidOptions,
+            format!("invalid auction-marker options: {error}"),
+        )
+    })
+}
+
+/// Typed browser error of a big-trades or auction-marker rejection.
 fn big_trades_error(error: aeris_charts_engine::FootprintError) -> aeris_charts_engine::ChartError {
     use aeris_charts_engine::{ErrorCode, FootprintError};
     let code = match error {
-        FootprintError::BigTradesCapacity => ErrorCode::ResourceLimit,
+        FootprintError::BigTradesCapacity | FootprintError::AuctionMarkerCapacity => {
+            ErrorCode::ResourceLimit
+        }
         FootprintError::UnsupportedBigTradesSeries(_) => ErrorCode::UnsupportedOperation,
         FootprintError::UnknownTradeStream(_) | FootprintError::UnknownSeries(_) => {
             ErrorCode::InvalidHandle
         }
-        FootprintError::UnknownBigTrades(_) => ErrorCode::StaleHandle,
+        FootprintError::UnknownBigTrades(_) | FootprintError::UnknownAuctionMarkers(_) => {
+            ErrorCode::StaleHandle
+        }
         _ => ErrorCode::InvalidOptions,
     };
     aeris_charts_engine::ChartError::new(code, error.to_string())
@@ -2031,6 +2049,66 @@ impl AerisChart {
         self.inner.borrow_mut().engine.remove_big_trades(id)
     }
 
+    /// Attach tape-derived auction markers to a price series: `{ok:true,result:id}` or a typed
+    /// `{ok:false,error:{code,message}}` (`resource_limit` past 16 marker sets,
+    /// `unsupported_operation` for the series type, `invalid_handle` for an unknown stream or
+    /// series, `invalid_options` for rejected options).
+    pub fn add_auction_markers(
+        &mut self,
+        stream_id: u32,
+        series_id: u32,
+        options_json: &str,
+    ) -> String {
+        big_trades_result_json(
+            parse_auction_marker_options(options_json).and_then(|options| {
+                self.inner
+                    .borrow_mut()
+                    .engine
+                    .add_auction_markers(u64::from(stream_id), series_id, options)
+                    .map_err(big_trades_error)
+            }),
+        )
+    }
+
+    /// `{ok:true,result:null}` or a typed `{ok:false,error:{code,message}}` (`stale_handle` once
+    /// the markers are removed).
+    pub fn set_auction_marker_options(&mut self, id: u32, options_json: &str) -> String {
+        big_trades_result_json(
+            parse_auction_marker_options(options_json).and_then(|options| {
+                self.inner
+                    .borrow_mut()
+                    .engine
+                    .set_auction_marker_options(id, options)
+                    .map_err(big_trades_error)
+            }),
+        )
+    }
+
+    pub fn auction_marker_options(&self, id: u32) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.auction_marker_options(id))
+            .expect("validated auction marker options serialize")
+    }
+
+    pub fn auction_markers_snapshot(&self, id: u32) -> String {
+        serde_json::to_string(
+            &self
+                .inner
+                .borrow_mut()
+                .engine
+                .auction_markers_snapshot(id)
+                .ok(),
+        )
+        .expect("auction markers snapshot serializes")
+    }
+
+    pub fn remove_auction_markers(&mut self, id: u32) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .remove_auction_markers(id)
+            .is_ok()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn set_footprint_trades_typed(
         &mut self,
@@ -2576,6 +2654,48 @@ impl AerisChart {
         self.inner
             .borrow()
             .indicator_schema_json(kind, period, deviation)
+    }
+
+    /// Register synchronous JavaScript callbacks for a chart-local study.
+    pub fn register_custom_study_result_json(
+        &mut self,
+        definition: &str,
+        init: js_sys::Function,
+        update: Option<js_sys::Function>,
+        rebuild: js_sys::Function,
+    ) -> String {
+        let mut inner = self.inner.borrow_mut();
+        register_custom_study(&mut inner.engine, definition, init, update, rebuild)
+    }
+
+    pub fn add_custom_study_result_json(
+        &mut self,
+        type_id: &str,
+        source: u32,
+        input: &str,
+        volume: i64,
+        parameters: &str,
+    ) -> String {
+        self.inner
+            .borrow_mut()
+            .add_custom_study_result_json(type_id, source, input, volume, parameters)
+    }
+
+    pub fn take_custom_study_faults_json(&mut self) -> String {
+        let faults = self.inner.borrow_mut().engine.take_custom_study_faults();
+        // Empty drains happen after ordinary wasm calls; skip JSON allocation on that path.
+        if faults.is_empty() {
+            return String::new();
+        }
+        serde_json::json!(
+            faults
+                .iter()
+                .map(|fault| serde_json::json!({
+                    "binding": fault.binding, "message": fault.message
+                }))
+                .collect::<Vec<_>>()
+        )
+        .to_string()
     }
 
     pub fn study_annotations_json(&self, binding: u32) -> String {

@@ -21,7 +21,9 @@
 //!              the same per-tick cost, work rows, runtime bytes and a historical repair for
 //!              all 27 KLineChart templates bound to a 1M-row source; the per-tick cost and
 //!              constant work rows of the seven structure and session studies, appending and
-//!              filling pre-installed session slots
+//!              filling pre-installed session slots; and the per-tick cost, bounded work rows and
+//!              non-growing retained input columns of host-registered custom runtimes (`close`,
+//!              `hl2`, volume-weighted)
 //!   Target N — live ticks plus frame construction with regression trends anchored across a
 //!              1M-row source (data-reading drawings follow ticks by the changed rows)
 //!   Target O — daily-reset studies on daily bars: report-only frame, Canvas2D call, rasterizer,
@@ -37,6 +39,9 @@
 //!   Target R — sustained live order-flow tape: per-batch update + frame, retention, late print
 //!   Target S — seven sessions of order flow: batch cost through sealing and session eviction,
 //!              stream memory, and the session budget
+//!   Target T — 1M-row structure studies: tail update p99 and one bounded historical correction
+//!   Target U — the Target R tape with auction markers bound to the same stream, and a variant
+//!              with revisit rays (`extend_until_revisited`) under a footprint `max_points` ceiling
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
@@ -50,15 +55,17 @@ use std::time::Instant;
 
 use aeris_charts_core::model::data_layer::{DataLayer, SeriesId};
 use aeris_charts_engine::{
-    AggressorSide, AxisDimension, BigTradesOptions, ChartEngine, ChartFrame, ContinuousScaleType,
-    DepthHeatmapOptions, DepthLevel, DepthOptions, DepthSide, DepthSnapshot, DepthUpdate,
-    FootprintAggregationOptions, FootprintBarAggregation, FootprintSeriesOptions, FootprintTrade,
-    FootprintVisualOptions, GeneralAxisOptions, GeneralHitMode, GeneralScaleType,
-    GeneralSeriesOptions, GeneralXyInput, GestureResolver, HorizontalDomain, InputDevice,
-    InputTarget, ORDER_FLOW_MAX_RETAINED_SESSIONS, ORDER_FLOW_MAX_RETAINED_TRADES,
-    ORDER_FLOW_MAX_STREAM_BYTES, OrderFlowPresentationOptions, PeriodicProfilePresentationOptions,
-    PeriodicProfilePresentationRequest, PointerSample, ProfileSource, ResampleBoundary, SeriesKind,
-    TradeStudyOptions,
+    AggressorSide, AuctionMarkerOptions, AxisDimension, BigTradesOptions, CAP_TRIM_MARGIN_DIVISOR,
+    ChartEngine, ChartFrame, ContinuousScaleType, DepthHeatmapOptions, DepthLevel, DepthOptions,
+    DepthSide, DepthSnapshot, DepthUpdate, FootprintAggregationOptions, FootprintBarAggregation,
+    FootprintSeriesOptions, FootprintTrade, FootprintVisualOptions, GeneralAxisOptions,
+    GeneralHitMode, GeneralScaleType, GeneralSeriesOptions, GeneralXyInput, GestureResolver,
+    HorizontalDomain, InputDevice, InputTarget, ORDER_FLOW_MAX_RETAINED_SESSIONS,
+    ORDER_FLOW_MAX_RETAINED_TRADES, ORDER_FLOW_MAX_STREAM_BYTES, OrderBlockZone,
+    OrderFlowPresentationOptions, PeriodicProfilePresentationOptions,
+    PeriodicProfilePresentationRequest, PointerSample, PreviousPeriod, ProfileSource,
+    ResampleBoundary, SeriesKind, StructureBreakOn, StructureMitigation, StructureMitigationPrice,
+    StudyCalendarPolicy, TradeStudyOptions,
 };
 use aeris_charts_native::render_prims;
 use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute};
@@ -239,6 +246,8 @@ struct IndicatorTickCost {
     max_append_work_rows: usize,
     /// Indicator runtime bytes after the install and every measured tick.
     runtime_bytes: usize,
+    /// Indicator runtime bytes after the excluded first append, before the measured ticks.
+    settled_runtime_bytes: usize,
     /// `(mean, median, max)` milliseconds to revise a bar [`REPAIR_DEPTH`] rows before the newest
     /// on every series the studies read, measured for the KLineChart set only.
     repair_ms: Option<(f64, f64, f64)>,
@@ -260,6 +269,9 @@ enum StudySet {
     /// All 27 KLineChart templates with KLineChart's default parameters, the volume-reading ones
     /// on a volume series and AVP on a turnover series.
     KLineChart,
+    /// Host-registered custom studies (Rust runtimes): an SMA on `close`, the same SMA on `hl2`,
+    /// and a volume-weighted average reading the volume series.
+    Custom,
 }
 
 /// Deterministic `[open, high, low, close]` for `row`; `revision` moves the close so a tick
@@ -589,6 +601,89 @@ fn bind_klinechart_templates(
     NAMES.len()
 }
 
+/// Window of the custom runtimes Target M (custom) binds.
+const CUSTOM_STUDY_WINDOW: usize = 20;
+
+/// A host-written custom runtime: a `CUSTOM_STUDY_WINDOW`-row mean of the input column, weighted by
+/// volume when `weighted`. It reads the engine's input columns directly by source row, as a host
+/// runtime written against the documented contract does, and recomputes only rows `from..`.
+struct WindowMean {
+    weighted: bool,
+}
+
+impl aeris_charts_engine::CustomStudyRuntime for WindowMean {
+    fn compute(
+        &mut self,
+        input: aeris_charts_engine::CustomStudyInput<'_>,
+        out: &mut [Vec<f64>],
+    ) -> Result<(), aeris_charts_engine::CustomStudyFault> {
+        for row in input.from..input.times.len() {
+            let window = row + 1 - (row + 1).min(CUSTOM_STUDY_WINDOW);
+            let (mut sum, mut weights) = (0.0, 0.0);
+            for at in window..=row {
+                let weight = if self.weighted { input.volume[at] } else { 1.0 };
+                sum += input.close[at] * weight;
+                weights += weight;
+            }
+            out[0].push(if row + 1 < CUSTOM_STUDY_WINDOW {
+                f64::NAN
+            } else {
+                sum / weights
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Registers two custom study types and binds them to the candle series 0 (`close`, `hl2`, and a
+/// volume-weighted one on `volume`). Returns the number of bindings.
+fn bind_custom_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
+    use aeris_charts_engine::{
+        CustomStudyDefinition, CustomStudyOutput, CustomStudyPane, CustomStudyPlot,
+        CustomStudyRuntime, IndicatorInputSource, IndicatorOutputStyle,
+    };
+
+    for (type_id, weighted) in [("perf_mean", false), ("perf_weighted_mean", true)] {
+        let definition = CustomStudyDefinition {
+            type_id: type_id.into(),
+            version: 1,
+            title: type_id.into(),
+            parameters: Vec::new(),
+            outputs: vec![CustomStudyOutput {
+                name: "Mean".into(),
+                plot: CustomStudyPlot::Line,
+                pane: CustomStudyPane::Price,
+                default_style: IndicatorOutputStyle::default(),
+            }],
+            uses_volume: weighted,
+        };
+        chart
+            .register_custom_study(
+                definition,
+                Box::new(move |_| {
+                    Ok(Box::new(WindowMean { weighted }) as Box<dyn CustomStudyRuntime>)
+                }),
+            )
+            .expect("valid custom study definition");
+    }
+    let bindings = [
+        ("perf_mean", IndicatorInputSource::Close, None),
+        ("perf_mean", IndicatorInputSource::Hl2, None),
+        (
+            "perf_weighted_mean",
+            IndicatorInputSource::Close,
+            Some(volume),
+        ),
+    ];
+    for (type_id, input, volume) in bindings {
+        let outputs = chart
+            .add_custom_study(type_id, 0, input, volume, Default::default())
+            .expect("custom study binds");
+        assert_eq!(outputs.len(), 1, "{type_id} binds one output");
+    }
+    bindings.len()
+}
+
 /// Target M: bind a set of studies (every built-in study kind plus aggregate-input studies, or the
 /// 27 KLineChart templates) to one `rows`-row minute candle source and its volume series (and, for
 /// the KLineChart set, a turnover series), then time live ticks through the public engine path:
@@ -662,6 +757,7 @@ fn indicator_tick_cost(
             volume,
             turnover.expect("the KLineChart set has a turnover series"),
         ),
+        StudySet::Custom => bind_custom_studies(&mut chart, volume),
     };
 
     // Writes `row` at `revision` to every series the studies read, in the usual live order: the
@@ -738,6 +834,7 @@ fn indicator_tick_cost(
         min_work_rows,
         max_append_work_rows,
         runtime_bytes,
+        settled_runtime_bytes: after.indicator_runtime_bytes,
         repair_ms,
     }
 }
@@ -1284,12 +1381,30 @@ struct LiveTapeTimings {
     late_trade_ms: f64,
     late_rebuilt_ticks: usize,
     retained_trades_capped: bool,
+    auction_marks: usize,
 }
+
+/// The auction-marker load of a sustained tape run.
+#[derive(Clone, Copy, PartialEq)]
+enum SustainedTape {
+    /// No auction markers (Target R).
+    Plain,
+    /// One auction-marker set with default options (Target U).
+    Auction,
+    /// One auction-marker set drawing revisit rays (`extend_until_revisited`), with the footprint
+    /// held under a `max_points` ceiling so every tip also evicts bars (Target U variant).
+    AuctionRaysRetained,
+}
+
+/// Rows the footprint keeps in the `AuctionRaysRetained` tape variant.
+const RAYS_FOOTPRINT_MAX_POINTS: usize = 2_000;
 
 /// One host-shaped order-flow presentation (time footprint + CVD + delta panes) fed the way a
 /// terminal feeds a live tape: small suffix batches, each followed by a frame. The history sits
 /// just under the retention ceiling so the loop crosses it, and one late print lands a bar back.
-fn sustained_order_flow_tape() -> LiveTapeTimings {
+/// With auction markers (`variant`), one auction-marker set (OF13) is bound to the same stream
+/// before the live loop, so every batch and the late print also repair its marks.
+fn sustained_order_flow_tape(variant: SustainedTape) -> LiveTapeTimings {
     const HISTORY_BARS: usize = 2_600;
     const TRADES_PER_BAR: usize = 100;
     const BAR_MICROS: i64 = 60_000_000;
@@ -1348,6 +1463,22 @@ fn sustained_order_flow_tape() -> LiveTapeTimings {
     chart
         .update_order_flow_presentation(presentation, history, false)
         .expect("valid order-flow history");
+    let auction_markers = (variant != SustainedTape::Plain).then(|| {
+        chart
+            .add_auction_markers(
+                presentation.trade_stream(),
+                0,
+                AuctionMarkerOptions {
+                    extend_until_revisited: variant == SustainedTape::AuctionRaysRetained,
+                    ..AuctionMarkerOptions::default()
+                },
+            )
+            .expect("valid auction markers")
+    });
+    if variant == SustainedTape::AuctionRaysRetained {
+        let footprint = presentation.footprint_series().expect("footprint drawn");
+        assert!(chart.set_series_max_points(footprint, Some(RAYS_FOOTPRINT_MAX_POINTS)));
+    }
     chart.time_scale.set_width(1600.0);
     chart.fit_footprint_viewport();
     let mut frame = ChartFrame::default();
@@ -1378,8 +1509,15 @@ fn sustained_order_flow_tape() -> LiveTapeTimings {
             .trade_stream(presentation.trade_stream())
             .is_some_and(|stream| {
                 stream.trades().len() <= ORDER_FLOW_MAX_RETAINED_TRADES
-                    && stream.sealed_bar_count() > 0
-                    && stream.bars().len() >= history_bars
+                    && if variant == SustainedTape::AuctionRaysRetained {
+                        // Under a `max_points` ceiling the stream keeps the footprint's rows.
+                        (RAYS_FOOTPRINT_MAX_POINTS
+                            - RAYS_FOOTPRINT_MAX_POINTS / CAP_TRIM_MARGIN_DIVISOR
+                            ..=RAYS_FOOTPRINT_MAX_POINTS)
+                            .contains(&stream.bars().len())
+                    } else {
+                        stream.sealed_bar_count() > 0 && stream.bars().len() >= history_bars
+                    }
             });
     let before = chart.footprint_work_stats(footprint).expect("work stats");
     ordinal += 1;
@@ -1395,6 +1533,12 @@ fn sustained_order_flow_tape() -> LiveTapeTimings {
     let late_trade_ms = started.elapsed().as_secs_f64() * 1000.0;
     let after = chart.footprint_work_stats(footprint).expect("work stats");
 
+    let auction_marks = auction_markers.map_or(0, |id| {
+        chart
+            .auction_markers_snapshot(id)
+            .expect("auction markers snapshot")
+            .len()
+    });
     samples.sort_unstable_by(f64::total_cmp);
     let percentile =
         |fraction: f64| samples[((samples.len() - 1) as f64 * fraction).round() as usize];
@@ -1405,6 +1549,7 @@ fn sustained_order_flow_tape() -> LiveTapeTimings {
         late_trade_ms,
         late_rebuilt_ticks: after.rebuilt_ticks - before.rebuilt_ticks,
         retained_trades_capped,
+        auction_marks,
     }
 }
 
@@ -1822,6 +1967,9 @@ fn main() -> ExitCode {
     footprint
         .add_big_trades(footprint_stream, 0, BigTradesOptions::default())
         .expect("add big-trades dependent");
+    footprint
+        .add_auction_markers(footprint_stream, 0, AuctionMarkerOptions::default())
+        .expect("add auction-marker dependent");
     let history = gen_footprint_trades(0, FOOTPRINT_HISTORY_BARS, FOOTPRINT_TRADES_PER_BAR);
     let start = Instant::now();
     footprint
@@ -1878,7 +2026,7 @@ fn main() -> ExitCode {
     let footprint_stream_stats = footprint
         .trade_stream_stats(footprint_stream)
         .expect("shared footprint stream stats");
-    assert_eq!(footprint_stream_stats.dependent_count, 4);
+    assert_eq!(footprint_stream_stats.dependent_count, 5);
     println!(
         "Target D — {} footprint trades / {} bars + {}-trade live batch ({} incremental ticks, {} historical rebuilds, {} dependent incremental updates, {} retained bars, {:.2}/{:.2} MiB footprint capacity):",
         FOOTPRINT_HISTORY_BARS * FOOTPRINT_TRADES_PER_BAR,
@@ -1918,10 +2066,10 @@ fn main() -> ExitCode {
     );
 
     // Sustained single-trade live tips on the retained chart. Each tip must advance the footprint,
-    // bound candles, CVD, delta, and big-trades dependents by the changed bar suffix and the new
-    // trade only. The tip crossing the retention ceiling also evicts the leading bars, their
-    // trades, and their big-trades orders in place, without reconstructing or replaying the
-    // retained tape.
+    // bound candles, CVD, delta, big-trades and auction-marker dependents by the changed bar
+    // suffix and the new trade only. The tip crossing the retention ceiling also evicts the
+    // leading bars, their trades, their big-trades orders and their auction marks in place,
+    // without reconstructing, replaying or re-detecting the retained tape.
     let tip_trades = gen_footprint_trades(
         FOOTPRINT_HISTORY_BARS + FOOTPRINT_LIVE_BARS,
         FOOTPRINT_TIP_BARS,
@@ -2939,6 +3087,84 @@ fn main() -> ExitCode {
     }
     let m_studies = study_checks.iter().all(|&pass| pass);
 
+    // ---- Target M (custom): host-registered custom runtimes over a 1M-row source -------------
+    // A custom runtime reads binding-owned input columns: the aggregate `hl2` price and the
+    // timestamp-aligned volume are retained and extended by the changed rows, so a tick derives
+    // and computes a few rows per binding, never the history, and never regrows a retained
+    // column. Measured on a plain source and on pre-installed session slots, where the runtime
+    // stops at the last real row.
+    const CUSTOM_BINDINGS: usize = 3;
+    // A tick computes one or two rows and derives as many input rows per binding.
+    const CUSTOM_WORK_ROWS_PER_BINDING: usize = 4;
+    const CUSTOM_RETAINED_COLUMNS: usize = 2;
+    let mut custom_checks = Vec::new();
+    for (label, slots) in [("", 0), (", slots", 23_400)] {
+        let cost = indicator_tick_cost(
+            StudySet::Custom,
+            INDICATOR_TICK_ROWS,
+            slots,
+            None,
+            4,
+            INDICATOR_TICK_APPENDS,
+        );
+        println!(
+            "Target M (custom{label}) — per-tick cost, {} bindings over {INDICATOR_TICK_ROWS} rows{} (work rows per tick {}..={}; first append after install {:.2} ms):",
+            cost.bindings,
+            if slots == 0 {
+                String::new()
+            } else {
+                format!(" filling {slots} pre-installed session slots")
+            },
+            cost.min_work_rows,
+            cost.max_work_rows,
+            cost.first_append_ms,
+        );
+        assert_eq!(cost.bindings, CUSTOM_BINDINGS);
+        let (replace_mean, replace_median, replace_max) = cost.replace_ms;
+        custom_checks.push(report(
+            &format!(
+                "current-bar replace mean (median {replace_median:.3} ms, max {replace_max:.2} ms)"
+            ),
+            replace_mean,
+            INDICATOR_TICK_BUDGET_MS,
+        ));
+        let (append_mean, append_median, append_max) = cost.append_ms;
+        custom_checks.push(report(
+            &format!("new-bar append mean (median {append_median:.3} ms, max {append_max:.2} ms)"),
+            append_mean,
+            INDICATOR_TICK_BUDGET_MS,
+        ));
+        custom_checks.push(report_check(
+            "rows evaluated per tick, every binding reporting",
+            cost.min_work_rows >= CUSTOM_BINDINGS
+                && cost.max_work_rows <= CUSTOM_BINDINGS * CUSTOM_WORK_ROWS_PER_BINDING,
+            &format!(
+                "{}..={} (bound {CUSTOM_BINDINGS}..={})",
+                cost.min_work_rows,
+                cost.max_work_rows,
+                CUSTOM_BINDINGS * CUSTOM_WORK_ROWS_PER_BINDING
+            ),
+        ));
+        let retained_rows = INDICATOR_TICK_ROWS + slots + INDICATOR_TICK_APPENDS + 1;
+        custom_checks.push(report_bytes(
+            "retained hl2 and volume input columns",
+            cost.runtime_bytes,
+            CUSTOM_RETAINED_COLUMNS
+                * (retained_rows + retained_rows / 8 + 4096)
+                * std::mem::size_of::<f64>(),
+        ));
+        custom_checks.push(report_check(
+            "ticks do not regrow the retained input columns",
+            cost.runtime_bytes == cost.settled_runtime_bytes,
+            &format!(
+                "{:.2} MiB -> {:.2} MiB",
+                mib(cost.settled_runtime_bytes),
+                mib(cost.runtime_bytes)
+            ),
+        ));
+    }
+    let m_custom = custom_checks.iter().all(|&pass| pass);
+
     // ---- Target M (KLineChart): the 27 KLineChart templates over a 1M-row source ------------
     // Each template advances one row at a time from a checkpointed state, so a tick costs the
     // template's window however long the history is. The set is measured in its own block with the
@@ -3126,7 +3352,7 @@ fn main() -> ExitCode {
         );
     }
 
-    let live_tape = sustained_order_flow_tape();
+    let live_tape = sustained_order_flow_tape(SustainedTape::Plain);
     println!(
         "Target R — sustained live order-flow tape (footprint + CVD + delta, 260k-trade history, 600 x 4-trade batches each followed by a frame):"
     );
@@ -3156,6 +3382,172 @@ fn main() -> ExitCode {
             "FAIL"
         }
     );
+
+    // ---- Target T: structure studies over 1M rows (upstream B9 Target N) ---------------------
+    // All seven I3 studies bound to one 1M-row source. Tail updates replace the final row, so
+    // each binding repairs only its tip (rebuild_from(n-1)); the historical correction reopens a
+    // row STRUCTURE_CORRECTION_ROWS back, so repair is bounded by that suffix plus one checkpoint
+    // interval and bounded pivot/order-block lookback, never the full history.
+    const STRUCTURE_BARS: usize = 1_000_000;
+    const STRUCTURE_TIP_SAMPLES: usize = 200;
+    // Measured on the fork at the 4c1da4f merge (Linux, 4 CPUs, release, three runs): tip p99
+    // 0.63-1.32 ms and the correction about 17 ms. Upstream measured ~3.2 ms and attributed most of it to a full-column
+    // whitespace scan of the all-whitespace structure anchors, which it skips with a
+    // `whitespace_only` flag; the fork's base index finds the last data row through the LOD
+    // pyramid, so it needs no flag and keeps the 8 ms budget with wide margin.
+    const STRUCTURE_TIP_BUDGET_MS: f64 = 8.0;
+    const STRUCTURE_CORRECTION_ROWS: usize = 20_000;
+    const STRUCTURE_CORRECTION_BUDGET_MS: f64 = 100.0;
+    let (times, open, high, low, close) = {
+        let (times, mut open, mut high, mut low, mut close) = gen_series(STRUCTURE_BARS, 11.0);
+        // Periodic price jumps make the fixture produce real fair-value gaps and order blocks;
+        // a smooth sinusoid never gaps, so the zone studies would measure empty work.
+        let mut drift = 0.0;
+        for row in 0..STRUCTURE_BARS {
+            if row % 500 == 499 {
+                drift += if (row / 500) % 2 == 0 { 6.0 } else { -6.0 };
+            }
+            open[row] += drift;
+            high[row] += drift;
+            low[row] += drift;
+            close[row] += drift;
+        }
+        (times, open, high, low, close)
+    };
+    let mut structure = ChartEngine::new(1600.0, 800.0, 1.0);
+    structure
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .expect("valid structure fixture");
+    let started = Instant::now();
+    let swing = structure.add_swing_points(0, 5, 5);
+    structure.add_market_structure(0, 5, 5, StructureBreakOn::Close);
+    let fvg = structure.add_fair_value_gaps(
+        0,
+        0.0,
+        StructureMitigation::Touch,
+        StructureMitigationPrice::Wick,
+        20,
+        true,
+    );
+    let order_blocks = structure.add_order_blocks(
+        0,
+        5,
+        5,
+        StructureBreakOn::Close,
+        OrderBlockZone::Wick,
+        StructureMitigation::Touch,
+        StructureMitigationPrice::Wick,
+        20,
+        true,
+    );
+    structure.add_session_levels(0, StudyCalendarPolicy::Utc);
+    structure.add_previous_period_levels(0, PreviousPeriod::Day, StudyCalendarPolicy::Utc);
+    structure.add_opening_range(0, 3_600, StudyCalendarPolicy::Utc);
+    let structure_build_ms = started.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        !swing.is_empty() && !fvg.is_empty() && !order_blocks.is_empty(),
+        "structure bindings are created"
+    );
+    let last_row = STRUCTURE_BARS - 1;
+    let mut tip_samples = Vec::with_capacity(STRUCTURE_TIP_SAMPLES);
+    for sample in 0..STRUCTURE_TIP_SAMPLES {
+        let wobble = (sample as f64 * 0.37).sin() * 0.5;
+        let tip_close = close[last_row] + wobble;
+        let started = Instant::now();
+        structure.update_series_bar(
+            0,
+            times[last_row],
+            [tip_close - 0.2, tip_close + 0.4, tip_close - 0.4, tip_close],
+        );
+        tip_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    tip_samples.sort_unstable_by(f64::total_cmp);
+    let tip_p99_ms = tip_samples[((tip_samples.len() - 1) as f64 * 0.99).round() as usize];
+    let correction_row = STRUCTURE_BARS - STRUCTURE_CORRECTION_ROWS;
+    let started = Instant::now();
+    structure.update_series_bar(
+        0,
+        times[correction_row],
+        [
+            open[correction_row] + 0.3,
+            high[correction_row] + 0.9,
+            low[correction_row] - 0.1,
+            close[correction_row] + 0.3,
+        ],
+    );
+    let structure_correction_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let fvg_annotations = structure
+        .study_annotations(fvg[0])
+        .expect("fvg annotations snapshot");
+    let order_block_annotations = structure
+        .study_annotations(order_blocks[0])
+        .expect("order block annotations snapshot");
+    println!(
+        "Target T — 7 structure studies x {STRUCTURE_BARS} rows (initial build {structure_build_ms:.2} ms; {} FVG zones, {} order-block zones retained):",
+        fvg_annotations.zones().len(),
+        order_block_annotations.zones().len(),
+    );
+    let t_tip = report(
+        "tail update p99 (tip replacement, all bindings)",
+        tip_p99_ms,
+        STRUCTURE_TIP_BUDGET_MS,
+    );
+    let t_correction = report(
+        &format!("historical correction {STRUCTURE_CORRECTION_ROWS} rows back"),
+        structure_correction_ms,
+        STRUCTURE_CORRECTION_BUDGET_MS,
+    );
+
+    // ---- Target U: the Target R tape with auction markers bound to the same stream ----------
+    // (upstream B9 Target O). The rays variant also draws every unfinished auction's revisit ray
+    // and holds the footprint under a `max_points` ceiling, so each tip evicts marks in step with
+    // the stream bars and each frame scans for revisits.
+    let mut u_pass = true;
+    for (variant, label) in [
+        (SustainedTape::Auction, "default options"),
+        (
+            SustainedTape::AuctionRaysRetained,
+            "revisit rays, footprint max_points ceiling",
+        ),
+    ] {
+        let auction_tape = sustained_order_flow_tape(variant);
+        println!(
+            "Target U — sustained live order-flow tape with auction markers, {label} ({} retained marks):",
+            auction_tape.auction_marks
+        );
+        println!(
+            "  update + frame p50 {:.3} ms, p99 {:.3} ms",
+            auction_tape.update_frame_p50_ms, auction_tape.update_frame_p99_ms
+        );
+        let p99 = report("update + frame p99", auction_tape.update_frame_p99_ms, 4.0);
+        let max = report(
+            "worst update + frame (crosses retention ceiling)",
+            auction_tape.update_frame_max_ms,
+            FRAME_BUDGET_MS,
+        );
+        let late = report(
+            &format!(
+                "late print one bar back + frame ({} rebuilt ticks)",
+                auction_tape.late_rebuilt_ticks
+            ),
+            auction_tape.late_trade_ms,
+            FRAME_BUDGET_MS,
+        );
+        println!(
+            "  [{}] retained tape stays within the order-flow ceiling",
+            if auction_tape.retained_trades_capped {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        );
+        let marks = auction_tape.auction_marks > 0;
+        println!(
+            "  [{}] the tape produces auction marks",
+            if marks { "PASS" } else { "FAIL" }
+        );
+        u_pass &= p99 && max && late && auction_tape.retained_trades_capped && marks;
+    }
 
     let history = multi_session_order_flow_history();
     println!(
@@ -3232,6 +3624,7 @@ fn main() -> ExitCode {
         && m_kline_slot_fill
         && m_kline_slot_work
         && m_studies
+        && m_custom
         && n_tick
         && r_p99
         && r_max
@@ -3240,7 +3633,10 @@ fn main() -> ExitCode {
         && s_p99
         && s_max
         && s_memory
-        && s_retention;
+        && s_retention
+        && t_tip
+        && t_correction
+        && u_pass;
     println!(
         "\n{}",
         if all_pass {

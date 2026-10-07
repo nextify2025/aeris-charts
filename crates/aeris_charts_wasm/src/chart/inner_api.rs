@@ -2057,16 +2057,19 @@ impl ChartInner {
 
     pub fn import_state_result_json(&mut self, document: &str) -> String {
         match self.engine.import_state_json(document) {
-            Ok(result) => serde_json::json!({
-                "ok": true,
-                "result": {
+            Ok(result) => {
+                let mut summary = serde_json::json!({
                     "schema_version": result.schema_version,
                     "panes": result.panes,
                     "drawings": result.drawings,
                     "points": result.points,
+                });
+                if result.schema_version == 3 {
+                    summary["unresolved_custom_studies"] =
+                        serde_json::json!(result.unresolved_custom_studies);
                 }
-            })
-            .to_string(),
+                serde_json::json!({ "ok": true, "result": summary }).to_string()
+            }
             Err(error) => serde_json::json!({
                 "ok": false,
                 "error": { "code": error.code().name(), "message": error.message() }

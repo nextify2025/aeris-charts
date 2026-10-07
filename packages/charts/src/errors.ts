@@ -6,6 +6,8 @@ export type AerisChartsErrorCode =
   | "invalid_data"
   | "invalid_options"
   | "unsupported_operation"
+  | "unsupported"
+  | "reentrant_call"
   | "serialization_error"
   | "persistence_version_error"
   | "extension_error"

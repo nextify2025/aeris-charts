@@ -2561,3 +2561,225 @@ fn odd_even_and_fractional_viewport_geometry_stays_draw_call_identical() {
         }
     }
 }
+
+/// A candle chart carrying every B9 study and auction glyph the engine draws with existing prims:
+/// fair-value-gap fills and frames, dashed structure strokes with their BOS/CHoCH labels, swing
+/// arrows, custom Marker circles, and auction triangles, circles, ABS frames, and revisit rays.
+fn studies_and_auction_engine(dpr: f64) -> ChartEngine {
+    use aeris_charts_engine::{
+        AggressorSide, AuctionMarkerOptions, CustomStudyDefinition, CustomStudyFault,
+        CustomStudyInput, CustomStudyOutput, CustomStudyPane, CustomStudyPlot, CustomStudyRuntime,
+        FootprintAggregationOptions, FootprintTrade, StructureBreakOn, StructureMitigation,
+        StructureMitigationPrice,
+    };
+    struct EveryFifthClose;
+    impl CustomStudyRuntime for EveryFifthClose {
+        fn compute(
+            &mut self,
+            input: CustomStudyInput<'_>,
+            out: &mut [Vec<f64>],
+        ) -> Result<(), CustomStudyFault> {
+            for row in input.from..input.times.len() {
+                out[0].push(if row % 5 == 0 {
+                    input.close[row]
+                } else {
+                    f64::NAN
+                });
+            }
+            Ok(())
+        }
+    }
+    let mut engine = ChartEngine::new(900.0, 520.0, dpr);
+    let n = 120usize;
+    let times: Vec<f64> = (0..n).map(|i| 1_600_000_020.0 + i as f64 * 60.0).collect();
+    // Steps every twelve bars open gaps, break structure, and leave unrevisited auction edges.
+    let close: Vec<f64> = (0..n)
+        .map(|i| 100.0 + (i as f64 * 0.4).sin() * 3.0 + (i / 12) as f64 * 4.0)
+        .collect();
+    let open: Vec<f64> = (0..n)
+        .map(|i| if i == 0 { close[0] } else { close[i - 1] })
+        .collect();
+    let high: Vec<f64> = open
+        .iter()
+        .zip(&close)
+        .map(|(o, c)| o.max(*c) + 1.0)
+        .collect();
+    let low: Vec<f64> = open
+        .iter()
+        .zip(&close)
+        .map(|(o, c)| o.min(*c) - 1.0)
+        .collect();
+    engine
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .expect("candles load");
+    engine.series[0].kind = SeriesKind::Candlestick;
+    assert!(!engine.add_swing_points(0, 2, 2).is_empty());
+    assert!(
+        !engine
+            .add_market_structure(0, 2, 2, StructureBreakOn::Close)
+            .is_empty()
+    );
+    assert!(
+        !engine
+            .add_fair_value_gaps(
+                0,
+                0.0,
+                StructureMitigation::Touch,
+                StructureMitigationPrice::Wick,
+                20,
+                true,
+            )
+            .is_empty()
+    );
+    engine
+        .register_custom_study(
+            CustomStudyDefinition {
+                type_id: "every_fifth".into(),
+                version: 1,
+                title: "Every fifth".into(),
+                parameters: Vec::new(),
+                outputs: vec![CustomStudyOutput {
+                    name: "Close".into(),
+                    plot: CustomStudyPlot::Marker,
+                    pane: CustomStudyPane::Price,
+                    default_style: IndicatorOutputStyle {
+                        visible: true,
+                        line_color: Some("rgba(160, 80, 220, 0.6)".into()),
+                        ..IndicatorOutputStyle::default()
+                    },
+                }],
+                uses_volume: false,
+            },
+            Box::new(|_| Ok(Box::new(EveryFifthClose) as Box<dyn CustomStudyRuntime>)),
+        )
+        .expect("custom study registers");
+    engine
+        .add_custom_study(
+            "every_fifth",
+            0,
+            IndicatorInputSource::Close,
+            None,
+            Default::default(),
+        )
+        .expect("custom study binds");
+    let stream = engine
+        .add_trade_stream(
+            "PARITY:AUCTION",
+            FootprintAggregationOptions {
+                tick_size: 1.0,
+                ..FootprintAggregationOptions::default()
+            },
+        )
+        .expect("trade stream");
+    let print = |time: f64, price: f64, volume: f64, aggressor| FootprintTrade {
+        timestamp_micros: time as i64 * 1_000_000,
+        price,
+        volume,
+        aggressor,
+        bid: None,
+        ask: None,
+        sequence: None,
+        trade_id: None,
+        conditions: 0,
+        session_id: Some(1),
+    };
+    let tape = (0..n)
+        .flat_map(|i| {
+            let base = close[i].round();
+            [
+                print(times[i], base - 1.0, 150.0, AggressorSide::Sell),
+                print(times[i] + 1.0, base - 1.0, 20.0, AggressorSide::Buy),
+                print(times[i] + 2.0, base, 4.0, AggressorSide::Buy),
+                print(times[i] + 3.0, base + 1.0, 2.0, AggressorSide::Buy),
+                print(times[i] + 4.0, base + 1.0, 1.0, AggressorSide::Sell),
+            ]
+        })
+        .collect::<Vec<_>>();
+    engine
+        .set_trade_stream_trades(stream, tape)
+        .expect("tape loads");
+    engine
+        .add_auction_markers(
+            stream,
+            0,
+            AuctionMarkerOptions {
+                extend_until_revisited: true,
+                ..AuctionMarkerOptions::default()
+            },
+        )
+        .expect("auction markers bind");
+    engine.time_scale.set_width(900.0);
+    engine.set_bar_spacing(7.0);
+    engine.fit_content();
+    engine
+}
+
+#[test]
+fn studies_and_auction_scene_reaches_canvas_and_gpui_identically_and_replays_deterministically() {
+    for dpr in [1.0f64, 1.5, 2.0] {
+        let mut engine = studies_and_auction_engine(dpr);
+        let frame = engine.build_frame();
+        let pane = &frame.panes[0];
+        let has = |predicate: &dyn Fn(&Prim) -> bool| pane.main.iter().any(predicate);
+        assert!(has(
+            &|prim| matches!(prim, Prim::Rect { color, .. } if color.a() == 38)
+        ));
+        assert!(has(&|prim| matches!(prim, Prim::RectFrame { .. })));
+        assert!(has(&|prim| matches!(
+            prim,
+            Prim::HLine {
+                style: LineStyle::Dashed,
+                ..
+            }
+        )));
+        assert!(has(&|prim| matches!(prim, Prim::Triangle { .. })));
+        assert!(has(&|prim| matches!(prim, Prim::Circle { .. })));
+        assert!(has(
+            &|prim| matches!(prim, Prim::Text { text, .. } if text == "ABS")
+        ));
+        assert!(has(&|prim| matches!(
+            prim,
+            Prim::Text { text, .. } if text == "BOS" || text == "CHoCH"
+        )));
+        for (layer, prims) in [
+            ("under", &pane.under),
+            ("main", &pane.main),
+            ("top", &pane.top_prims),
+        ] {
+            let canvas = canvas_rects(prims, &pane.points);
+            let (plan, metrics) = gpui_plan(prims, &pane.points);
+            assert_eq!(
+                gpui_quads(&plan),
+                canvas.rects,
+                "DPR {dpr} {layer}: zone fills, frames and rules must be draw-call identical"
+            );
+            assert_eq!(metrics.dropped_prims, 0, "DPR {dpr} {layer}: {metrics:?}");
+            let gpui_text = plan
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    SceneOp::Text(run) => Some((run.text.clone(), run.x, run.y)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let canvas_text = canvas
+                .text_runs
+                .iter()
+                .map(|(text, x, y, ..)| (text.clone(), *x, *y))
+                .collect::<Vec<_>>();
+            assert_eq!(gpui_text, canvas_text, "DPR {dpr} {layer}: labels");
+        }
+        // Replay: a second engine fed the same state builds the same frame and the same plan.
+        let replayed = studies_and_auction_engine(dpr).build_frame();
+        assert_eq!(replayed, frame, "DPR {dpr}: the frame must be reproducible");
+        let mut first = GpuiChartRenderer::new();
+        first
+            .plan_frame(&PreparedAerisFrame::new(&frame), dpr as f32)
+            .expect("frame plans");
+        let mut second = GpuiChartRenderer::new();
+        second
+            .plan_frame(&PreparedAerisFrame::new(&replayed), dpr as f32)
+            .expect("replayed frame plans");
+        assert_eq!(first.plan().ops, second.plan().ops, "DPR {dpr}: op stream");
+    }
+}

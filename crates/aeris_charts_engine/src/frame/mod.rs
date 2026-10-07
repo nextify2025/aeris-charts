@@ -1827,6 +1827,20 @@ impl ChartEngine {
                                 &mut series_layer.layer.prims,
                                 scale,
                             ),
+                            SeriesKind::Line | SeriesKind::Area
+                                if self.custom_marker_plot(rs.id) =>
+                            {
+                                self.build_custom_marker_plot_frame(
+                                    *rs,
+                                    from,
+                                    to,
+                                    pane_w_px as i32,
+                                    hpr,
+                                    vpr,
+                                    &mut series_layer.layer.prims,
+                                    scale,
+                                );
+                            }
                             SeriesKind::Line | SeriesKind::Area => {
                                 if let Some(region) = rs.threshold_region {
                                     let y_upper =
@@ -1991,6 +2005,14 @@ impl ChartEngine {
                             _ => {}
                         }
                         self.build_big_trades_frame(
+                            rs.id,
+                            from,
+                            to,
+                            hpr,
+                            vpr,
+                            &mut cache.chrome.prims,
+                        );
+                        self.build_auction_markers_frame(
                             rs.id,
                             from,
                             to,

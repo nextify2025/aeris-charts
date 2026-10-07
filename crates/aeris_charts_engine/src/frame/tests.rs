@@ -21,6 +21,275 @@ const LIVE_TEXT: Color = Color::rgb(0xff, 0xff, 0xff);
 const LIVE_COUNTDOWN: Color = Color::rgba(0xff, 0xff, 0xff, 0xb3);
 
 #[test]
+fn custom_marker_plot_uses_exact_visible_prices_without_line_or_whitespace_marks() {
+    use crate::custom_studies::{
+        CustomStudyDefinition, CustomStudyFault, CustomStudyInput, CustomStudyOutput,
+        CustomStudyPane, CustomStudyPlot, CustomStudyRuntime,
+    };
+
+    struct Marks;
+    impl CustomStudyRuntime for Marks {
+        fn compute(
+            &mut self,
+            input: CustomStudyInput<'_>,
+            out: &mut [Vec<f64>],
+        ) -> Result<(), CustomStudyFault> {
+            for row in input.from..input.times.len() {
+                out[0].push(if row == 1 {
+                    f64::NAN
+                } else {
+                    input.close[row] + 5.0
+                });
+            }
+            Ok(())
+        }
+    }
+
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let prices = [100.0, 110.0, 120.0, 130.0];
+    chart
+        .set_series_data(0, &[1.0, 2.0, 3.0, 4.0], &prices, &prices, &prices, &prices)
+        .unwrap();
+    chart
+        .register_custom_study(
+            CustomStudyDefinition {
+                type_id: "frame_marks".into(),
+                version: 1,
+                title: "Marks".into(),
+                parameters: vec![],
+                outputs: vec![CustomStudyOutput {
+                    name: "Events".into(),
+                    plot: CustomStudyPlot::Marker,
+                    pane: CustomStudyPane::Price,
+                    default_style: crate::IndicatorOutputStyle {
+                        visible: true,
+                        line_color: Some("#123456".into()),
+                        point_markers: true,
+                        ..Default::default()
+                    },
+                }],
+                uses_volume: false,
+            },
+            Box::new(|_| Ok(Box::new(Marks))),
+        )
+        .unwrap();
+    let output = chart
+        .add_custom_study(
+            "frame_marks",
+            0,
+            crate::IndicatorInputSource::Close,
+            None,
+            Default::default(),
+        )
+        .unwrap()[0];
+    assert!(chart.custom_marker_plot(output));
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    let color = Color::rgb(0x12, 0x34, 0x56);
+    let frame = chart.build_frame();
+    let marks: Vec<_> = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Circle { cx, cy, fill, .. } if *fill == color => Some((*cx, *cy)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marks.len(), 3);
+    let scale = pane_scale(
+        &chart.panes[0],
+        series_scale_target(chart.series_entry(output).unwrap()),
+    );
+    let base = chart.series_base_value(output, 0).unwrap();
+    for (mark, row) in marks.iter().zip([0, 2, 3]) {
+        let logical = chart.data.plot(output).index_at(row).unwrap();
+        assert_eq!(
+            mark.0,
+            chart.time_scale.index_to_coordinate(logical).round() as f32
+        );
+        assert_eq!(
+            mark.1,
+            scale.price_to_coordinate(prices[row] + 5.0, base).round() as f32
+        );
+    }
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Polyline { color: stroke, .. } if *stroke == color))
+    );
+
+    chart.set_visible_logical_range(2.0, 3.0);
+    let visible = chart.build_frame();
+    assert_eq!(
+        visible.panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::Circle { fill, .. } if *fill == color))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn combined_structure_custom_marker_and_auction_frame_uses_existing_primitives() {
+    use crate::custom_studies::{
+        CustomStudyDefinition, CustomStudyFault, CustomStudyInput, CustomStudyOutput,
+        CustomStudyPane, CustomStudyPlot, CustomStudyRuntime,
+    };
+    use crate::{
+        AggressorSide, AuctionMarkerOptions, FootprintAggregationOptions, FootprintTrade,
+        IndicatorInputSource, IndicatorKind, IndicatorOutputStyle,
+    };
+
+    struct Marks;
+    impl CustomStudyRuntime for Marks {
+        fn compute(
+            &mut self,
+            input: CustomStudyInput<'_>,
+            out: &mut [Vec<f64>],
+        ) -> Result<(), CustomStudyFault> {
+            out[0].extend(
+                (input.from..input.times.len())
+                    .map(|row| if row == 3 { input.close[row] } else { f64::NAN }),
+            );
+            Ok(())
+        }
+    }
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..7)
+        .map(|row| 1_700_000_000.0 + row as f64 * 60.0)
+        .collect::<Vec<_>>();
+    let open = [9., 12., 12., 16., 16., 18., 19.];
+    let high = [10., 14., 12., 18., 16., 20., 21.];
+    let low = [8., 9., 10., 15., 15., 8., 16.];
+    let close = [9., 13., 11., 17., 15., 19., 20.];
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    chart.add_indicator_kind(0, IndicatorKind::SwingPoints { left: 1, right: 1 }, None);
+    chart.add_indicator_kind(
+        0,
+        IndicatorKind::MarketStructure {
+            left: 1,
+            right: 1,
+            break_on: crate::StructureBreakOn::Close,
+        },
+        None,
+    );
+    chart.add_indicator_kind(
+        0,
+        IndicatorKind::FairValueGaps {
+            min_size: 0.0,
+            mitigation: crate::StructureMitigation::Touch,
+            mitigation_price: crate::StructureMitigationPrice::Wick,
+            max_active: 20,
+            show_mitigated: true,
+        },
+        None,
+    );
+    chart
+        .register_custom_study(
+            CustomStudyDefinition {
+                type_id: "combined_marker".into(),
+                version: 1,
+                title: "Marker".into(),
+                parameters: vec![],
+                outputs: vec![CustomStudyOutput {
+                    name: "event".into(),
+                    plot: CustomStudyPlot::Marker,
+                    pane: CustomStudyPane::Price,
+                    default_style: IndicatorOutputStyle {
+                        visible: true,
+                        point_markers: true,
+                        line_color: Some("#ff00ff".into()),
+                        ..Default::default()
+                    },
+                }],
+                uses_volume: false,
+            },
+            Box::new(|_| Ok(Box::new(Marks))),
+        )
+        .unwrap();
+    let marker = chart
+        .add_custom_study(
+            "combined_marker",
+            0,
+            IndicatorInputSource::Close,
+            None,
+            Default::default(),
+        )
+        .unwrap()[0];
+    let stream = chart
+        .add_trade_stream(
+            "combined_frame",
+            FootprintAggregationOptions {
+                tick_size: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let trades = [(AggressorSide::Sell, 100.), (AggressorSide::Buy, 25.)]
+        .into_iter()
+        .enumerate()
+        .map(|(offset, (aggressor, volume))| FootprintTrade {
+            timestamp_micros: times[0] as i64 * 1_000_000 + offset as i64,
+            price: 10.0,
+            volume,
+            aggressor,
+            bid: None,
+            ask: None,
+            sequence: None,
+            trade_id: None,
+            conditions: 0,
+            session_id: Some(1),
+        })
+        .collect();
+    chart.set_trade_stream_trades(stream, trades).unwrap();
+    chart
+        .add_auction_markers(
+            stream,
+            0,
+            AuctionMarkerOptions {
+                include_forming_bar: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    let frame = chart.build_frame();
+    let prims = &frame.panes[0].main;
+    assert!(chart.custom_marker_plot(marker));
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::Rect { .. })),
+        "zone fill"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::RectFrame { .. })),
+        "zone border"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::HLine { .. })),
+        "structure segment"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::Text { .. })),
+        "structure label"
+    );
+    assert!(
+        prims
+            .iter()
+            .any(|p| matches!(p, Prim::Circle { fill, .. } if *fill == Color::rgb(0xff, 0, 0xff))),
+        "custom marker"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::Triangle { .. })),
+        "auction mark"
+    );
+}
+
+#[test]
 fn study_binding_paints_inside_its_output_layer_without_host_markers() {
     let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
     let output = chart.add_sma(0, 2).unwrap();
@@ -10180,6 +10449,26 @@ fn updown_volume_takes_its_direction_from_a_footprint_over_a_whitespace_primary(
     chart
         .update_order_flow_presentation(presentation, tape, false)
         .unwrap();
+    // Structure bindings keep a whitespace-only anchor for their zones. It must not
+    // displace the primary or hide the footprint fallback for volume tint.
+    let reference = chart.add_series(SeriesKind::Candlestick);
+    let prices = [100.0, 101.0, 105.0, 101.0];
+    chart
+        .set_series_data(reference, &times, &prices, &prices, &prices, &prices)
+        .unwrap();
+    let base_index = chart.data.base_index();
+    let gaps = chart.add_fair_value_gaps(
+        reference,
+        0.0,
+        crate::StructureMitigation::Touch,
+        crate::StructureMitigationPrice::Wick,
+        20,
+        true,
+    );
+    assert_eq!(gaps.len(), 1);
+    // The all-whitespace anchor never moves the base index (the fork has no
+    // `whitespace_only` flag; its base index skips whitespace through the LOD pyramid).
+    assert_eq!(chart.data.base_index(), base_index);
     chart.time_scale.set_width(1200.0);
     chart.fit_content();
 
@@ -10198,6 +10487,30 @@ fn updown_volume_takes_its_direction_from_a_footprint_over_a_whitespace_primary(
         .collect::<Vec<_>>();
     // Uncovered slots have no presented bar and keep the series' solid color.
     assert_eq!(columns, [HISTOGRAM, HISTOGRAM, VOLUME_UP, VOLUME_DOWN]);
+    chart.set_series_visible(presentation.footprint_series().unwrap(), false);
+    let frame = chart.build_frame();
+    let segment = chart
+        .frame_series_segments(0)
+        .iter()
+        .find(|segment| segment.series_id == Some(volume))
+        .unwrap();
+    let colors = frame.panes[0].main[segment.start..segment.end]
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Prim::Rect { color, .. } => Some(*color),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        colors, [HISTOGRAM; 4],
+        "anchors cannot tint uncovered volume"
+    );
+    // A whitespace session slot past every real row extends the anchor with its source; the
+    // all-whitespace anchor still leaves the base index at the last real row.
+    assert!(chart.update_series_bar(reference, 240.0, [f64::NAN; 4]));
+    assert_eq!(chart.data.series_data(gaps[0]).unwrap().0.len(), 5);
+    assert_eq!(chart.data.merged_times().len(), 5);
+    assert_eq!(chart.data.base_index(), base_index);
 }
 
 /// The footprint fallback over a whitespace primary follows the volume series' tint rule: with

@@ -684,6 +684,9 @@ pub enum FootprintError {
     InvalidBigTradesOptions,
     BigTradesCapacity,
     UnknownBigTrades(crate::NativePrimitiveId),
+    InvalidAuctionMarkerOptions,
+    AuctionMarkerCapacity,
+    UnknownAuctionMarkers(crate::NativePrimitiveId),
     UnknownSeries(SeriesId),
     StaleSeries(SeriesId),
     Depth(crate::DepthError),
@@ -742,6 +745,9 @@ impl core::fmt::Display for FootprintError {
             Self::InvalidBigTradesOptions => write!(f, "big-trades options are invalid"),
             Self::BigTradesCapacity => write!(f, "big-trades indicator capacity is exhausted"),
             Self::UnknownBigTrades(id) => write!(f, "unknown big-trades indicator {id}"),
+            Self::InvalidAuctionMarkerOptions => write!(f, "auction-marker options are invalid"),
+            Self::AuctionMarkerCapacity => write!(f, "auction-marker capacity is exhausted"),
+            Self::UnknownAuctionMarkers(id) => write!(f, "unknown auction markers {id}"),
             Self::UnknownSeries(id) => write!(f, "unknown series id {id}"),
             Self::StaleSeries(id) => write!(f, "stale series id {id}"),
             Self::Depth(error) => write!(f, "depth replay failed: {error}"),
@@ -2069,14 +2075,44 @@ impl FootprintAggregator {
             event.timestamp_micros <= clock
                 || event
                     .trade_id
-                    .and_then(|trade_id| self.trade_ids.get(&trade_id))
-                    .is_some_and(|&position| {
-                        self.trades[position - self.trade_id_base]
-                            .event
-                            .timestamp_micros
-                            <= clock
-                    })
+                    .and_then(|trade_id| self.stored_trade_timestamp(trade_id))
+                    .is_some_and(|timestamp| timestamp <= clock)
         })
+    }
+
+    /// Timestamp of the retained print a provider `trade_id` names. Positions in `trade_ids` are
+    /// absolute, so the deque index subtracts `trade_id_base` (advanced by retention).
+    fn stored_trade_timestamp(&self, trade_id: u64) -> Option<i64> {
+        let position = self.trade_ids.get(&trade_id)?;
+        let trade = self.trades.get(position.checked_sub(self.trade_id_base)?)?;
+        Some(trade.event.timestamp_micros)
+    }
+
+    /// First bar an auction-marker repair must re-detect for a historical batch: the bar holding
+    /// the earliest print the batch adds or, for a corrected `trade_id`, the print it replaces.
+    /// A non-time bar also re-detects the bar before it, which can share its start time.
+    fn auction_repair_from(&self, trades: &[FootprintTrade]) -> usize {
+        let earliest_trade = trades
+            .iter()
+            .flat_map(|trade| {
+                let original = trade
+                    .trade_id
+                    .and_then(|trade_id| self.stored_trade_timestamp(trade_id));
+                [Some(trade.timestamp_micros), original]
+                    .into_iter()
+                    .flatten()
+            })
+            .min()
+            .unwrap_or(i64::MIN);
+        let from = self
+            .bars()
+            .partition_point(|bar| bar.start_timestamp_micros <= earliest_trade)
+            .saturating_sub(1);
+        if matches!(self.options.bars, FootprintBarAggregation::Time { .. }) {
+            from
+        } else {
+            from.saturating_sub(1)
+        }
     }
 
     /// This stream re-aggregated under `options`: the same retained tape (prints the replay clock
@@ -2638,7 +2674,8 @@ impl ChartEngine {
             stream_capacity_bytes: stream.capacity_bytes(),
             dependent_count: dependents.map_or(0, Vec::len)
                 + bar_dependents.map_or(0, Vec::len)
-                + self.big_trades_count(stream_id),
+                + self.big_trades_count(stream_id)
+                + self.auction_markers_count(stream_id),
             dependent_rebuilds: dependents
                 .into_iter()
                 .flatten()
@@ -2723,6 +2760,7 @@ impl ChartEngine {
                 .get(&stream_id)
                 .is_some_and(|dependents| !dependents.is_empty())
             || self.big_trades_count(stream_id) > 0
+            || self.auction_markers_count(stream_id) > 0
         {
             return Err(FootprintError::TradeStreamInUse(stream_id));
         }
@@ -3308,11 +3346,21 @@ impl ChartEngine {
         trades: Vec<FootprintTrade>,
     ) -> Result<(), FootprintError> {
         let stream_id = presentation.trade_stream;
-        let previous_bar_count = self
+        let stream = self
             .trade_stream(stream_id)
-            .ok_or(FootprintError::UnknownTradeStream(stream_id))?
-            .bars()
-            .len();
+            .ok_or(FootprintError::UnknownTradeStream(stream_id))?;
+        let previous_bar_count = stream.bars().len();
+        // The aggregator may resume at an earlier replay checkpoint. Auction detection reads
+        // finished bars, not tape state, so it only needs the first bar intersecting the window.
+        let auction_from = trades
+            .iter()
+            .map(|trade| trade.timestamp_micros)
+            .min()
+            .map(|from| {
+                stream
+                    .bars()
+                    .partition_point(|bar| bar.end_timestamp_micros < from)
+            });
         let Some(first_bar) = self
             .trade_streams
             .get_mut(&stream_id)
@@ -3327,7 +3375,9 @@ impl ChartEngine {
             .is_some_and(|stream| stream.bars().len() >= previous_bar_count)
             .then_some(first_bar);
         self.invalidate_profile_drawings_using_stream(stream_id);
-        self.refresh_stream_presentations_from(stream_id, incremental_from, false)?;
+        // The bar projector may need a full install when the window shrinks, but
+        // auction marks retain their unchanged prefix and only replay the rewritten bars.
+        self.refresh_stream_presentations_from(stream_id, incremental_from, false, auction_from)?;
         self.enforce_order_flow_retention(presentation);
         Ok(())
     }
@@ -3353,7 +3403,7 @@ impl ChartEngine {
         }
         if stats.accepted_trades > 0 {
             self.invalidate_profile_drawings_using_stream(stream_id);
-            self.refresh_stream_presentations_from(stream_id, None, false)?;
+            self.refresh_stream_presentations_from(stream_id, None, false, None)?;
             self.enforce_order_flow_retention(presentation);
         }
         stats.history_full |= self
@@ -3594,7 +3644,8 @@ impl ChartEngine {
             })
             .count()
             + self.trade_dependents.get(&stream_id).map_or(0, Vec::len)
-            + self.big_trades_count(stream_id);
+            + self.big_trades_count(stream_id)
+            + self.auction_markers_count(stream_id);
         if dependent_count > 1 {
             return Err(FootprintError::TradeStreamInUse(stream_id));
         }
@@ -3754,6 +3805,9 @@ impl ChartEngine {
         let historical = !stream.batch_is_tip(&trades);
         let previous_bar_count = stream.bars().len();
         if historical {
+            // Auction marks re-detect from the bar of the earliest print the batch touches,
+            // read from the pre-merge bars (the merge below only runs once it cannot fail).
+            let auction_from = stream.auction_repair_from(&trades);
             // The batch is validated above and the merge refuses a bar-time collision before it
             // changes anything, so it is applied completely or not at all.
             let (result, first_bar) = self
@@ -3772,7 +3826,12 @@ impl ChartEngine {
                 .is_some_and(|stream| stream.bars().len() >= previous_bar_count)
                 .then_some(first_bar);
             self.invalidate_profile_drawings_using_stream(stream_id);
-            self.refresh_stream_presentations_from(stream_id, incremental_from, false)?;
+            self.refresh_stream_presentations_from(
+                stream_id,
+                incremental_from,
+                false,
+                Some(auction_from),
+            )?;
             return Ok(FootprintUpdateKind::Historical);
         }
 
@@ -3792,7 +3851,7 @@ impl ChartEngine {
         // Closed bars are immutable on the tip path: only the previously active bar and the bars
         // this batch opened change.
         let from = previous_bar_count.saturating_sub(1);
-        self.refresh_stream_presentations_from(stream_id, Some(from), true)?;
+        self.refresh_stream_presentations_from(stream_id, Some(from), true, Some(from))?;
         Ok(result)
     }
 
@@ -3801,11 +3860,14 @@ impl ChartEngine {
     /// ceiling may evict bars from the stream front; every other dependent then continues from
     /// the same stream bar on the evicted-adjusted index. `tip_append` is true only when the
     /// tape grew at its tip, which lets big trades continue instead of replaying the raw tape.
+    /// Auction marks re-detect from stream bar `auction_from` (every bar when `None`); retention
+    /// already dropped the marks of the evicted bars, so they continue on the adjusted index too.
     fn refresh_stream_presentations_from(
         &mut self,
         stream_id: u64,
         incremental_from: Option<usize>,
         tip_append: bool,
+        auction_from: Option<usize>,
     ) -> Result<(), FootprintError> {
         let bars_before = self
             .trade_stream(stream_id)
@@ -3819,6 +3881,7 @@ impl ChartEngine {
             stream_id,
             incremental_from.and_then(|from| from.checked_sub(evicted)),
             tip_append,
+            auction_from.and_then(|from| from.checked_sub(evicted)),
         )
     }
 
@@ -3908,7 +3971,12 @@ impl ChartEngine {
     /// the footprint whose retention cap fired, or the first presentation of an order-flow graph;
     /// `None` trims only the stream and its big-trades indicators. Shared by series retention and
     /// the order-flow history budget.
-    fn trim_trade_stream_front(&mut self, stream_id: u64, anchor: Option<SeriesId>, keep: usize) {
+    pub(crate) fn trim_trade_stream_front(
+        &mut self,
+        stream_id: u64,
+        anchor: Option<SeriesId>,
+        keep: usize,
+    ) {
         let Some(stream) = self.trade_stream(stream_id) else {
             return;
         };
@@ -3943,8 +4011,10 @@ impl ChartEngine {
         }
         // Big trades follow the evicted bars: they drop the orders that opened in them and keep
         // every other order and the automatic filter's state, without replaying the raw tape.
+        // Auction marks drop the evicted bars' marks and keep the rest, without re-detecting.
         if evict > 0 {
             self.refresh_big_trades(stream_id, true);
+            self.evict_auction_markers_front(stream_id, evict);
         }
         // A trimmed presentation lost rows outside its own write path, so the indicators and
         // resampled series reading it recompute from the retained rows, as a retention trim of
@@ -4068,7 +4138,8 @@ impl ChartEngine {
                 .trade_dependents
                 .get(&stream_id)
                 .is_some_and(|dependents| !dependents.is_empty())
-            || self.big_trades_count(stream_id) > 0;
+            || self.big_trades_count(stream_id) > 0
+            || self.auction_markers_count(stream_id) > 0;
         if !used {
             self.trade_streams.remove(&stream_id);
         }
@@ -4096,19 +4167,21 @@ impl ChartEngine {
     }
 
     fn refresh_trade_dependents(&mut self, stream_id: u64) -> Result<(), FootprintError> {
-        self.refresh_trade_dependents_from(stream_id, None, false)
+        self.refresh_trade_dependents_from(stream_id, None, false, None)
     }
 
-    /// Refresh every study, trade-bound candle/bar, and big-trades dependent of a stream.
-    /// `Some(from)`: stream bars before `from` are unchanged, so each study and candle works on
-    /// `bars[from..]` only. `None` rebuilds every dependent from the stream. `tip_append` is true
-    /// only when the tape grew at its tip, which lets big trades fold the new prints instead of
-    /// replaying the raw tape.
+    /// Refresh every study, trade-bound candle/bar, big-trades and auction-marker dependent of a
+    /// stream. `Some(from)`: stream bars before `from` are unchanged, so each study and candle
+    /// works on `bars[from..]` only. `None` rebuilds every dependent from the stream. `tip_append`
+    /// is true only when the tape grew at its tip, which lets big trades fold the new prints
+    /// instead of replaying the raw tape. Auction marks re-detect from bar `auction_from` (every
+    /// bar when `None`), which can precede `from` (a rewritten window or a corrected print).
     fn refresh_trade_dependents_from(
         &mut self,
         stream_id: u64,
         incremental_from: Option<usize>,
         tip_append: bool,
+        auction_from: Option<usize>,
     ) -> Result<(), FootprintError> {
         self.trade_stream(stream_id)
             .ok_or(FootprintError::UnknownTradeStream(stream_id))?;
@@ -4118,6 +4191,7 @@ impl ChartEngine {
         }
         self.refresh_trade_bar_dependents_from(stream_id, incremental_from)?;
         self.refresh_big_trades(stream_id, tip_append);
+        self.refresh_auction_markers(stream_id, auction_from);
         Ok(())
     }
 

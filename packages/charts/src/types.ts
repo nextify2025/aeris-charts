@@ -1410,9 +1410,52 @@ export interface indicator_output_style {
 }
 export interface indicator_schema {
   revision: number;
-  kind: indicator_kind;
+  kind: indicator_kind | (string & {});
   parameters: indicator_parameter_descriptor[];
   outputs: indicator_output_descriptor[];
+}
+
+/** The engine calls these functions synchronously. Output arrays cover only [from, length). */
+export interface custom_study_context {
+  from: number;
+  length: number;
+  tail: boolean;
+  time: Float64Array;
+  open: Float64Array;
+  high: Float64Array;
+  low: Float64Array;
+  close: Float64Array;
+  volume: Float64Array;
+  outputs: Float64Array[];
+}
+export interface custom_study_output {
+  name: string;
+  plot: "line" | "histogram" | "area" | "marker";
+  pane: "price" | "dedicated";
+  default_style?: Partial<indicator_output_style>;
+}
+export type custom_study_parameter_descriptor = Omit<indicator_parameter_descriptor, "min" | "max"> & {
+  min?: number | null;
+  max?: number | null;
+};
+export interface custom_study_definition<State = unknown> {
+  type: string;
+  version: number;
+  title: string;
+  parameters: custom_study_parameter_descriptor[];
+  outputs: custom_study_output[];
+  uses_volume?: boolean;
+  init(params: Record<string, unknown>): State;
+  update?(state: State, ctx: custom_study_context): void;
+  rebuild(state: State, ctx: custom_study_context): void;
+}
+export interface custom_study_fault_event {
+  binding: number;
+  message: string;
+}
+export interface custom_study_binding_options extends Partial<series_options> {
+  input_source?: indicator_input_source;
+  volume_source?: series_api | null;
 }
 
 /**
@@ -1425,7 +1468,7 @@ export interface indicator_schema {
 export interface indicator_info {
   /** Stable identity shared by all outputs in one indicator binding. */
   binding_id: number;
-  kind: indicator_kind;
+  kind: indicator_kind | (string & {});
   /** Complete structured parameters. Fields not used by this kind are `null`. */
   parameters: {
     calendar: study_calendar_policy | null;
@@ -1483,6 +1526,8 @@ export interface indicator_info {
     /** The complete KLineChart definition of a `klinechart_*` binding, as passed to
      *  {@link chart_api.add_klinechart_indicator}. Absent for every other kind. */
     klinechart?: klinechart_indicator;
+    /** Normalized registered custom-study parameters (null for built-in kinds). */
+    custom: Record<string, unknown> | null;
   };
   /** For a KLineChart template, its first period (0 for `avp`, `pvt`, and `sar`, which have none). */
   period: number;
@@ -3739,9 +3784,11 @@ export interface chart_state_v3 {
   drawings: persisted_drawing_v1[];
   indicators: {
     /** Engine indicator definition: `{ kind: indicator_kind, ...parameters }`. A KLineChart study stores
-     *  `kind: "klinechart"` beside its {@link klinechart_indicator} fields. */
+     *  `kind: "klinechart"` beside its {@link klinechart_indicator} fields; a custom study stores its
+     *  registered `type_id`, `version`, normalized `parameters`, and `output_count`. */
     kind:
       | ({ kind: "klinechart" } & klinechart_indicator)
+      | { kind: "custom"; type_id: string; version: number; parameters: Record<string, unknown>; output_count: number }
       | ({ kind: Exclude<indicator_kind, klinechart_indicator_kind> } & Record<string, unknown>);
     source: persisted_indicator_source_v3;
     source_input: indicator_input_source;
@@ -3749,6 +3796,9 @@ export interface chart_state_v3 {
     /** Turnover series of an amount-weighted VWAP; absent when the study has none. */
     amount_source?: persisted_indicator_source_v3 | null;
     styles: indicator_output_style[];
+    /** Custom-study output placement (true = dedicated pane), kept so an import without the
+     *  registered type restores its panes; absent for built-in studies. */
+    dedicated_outputs?: boolean[];
   }[];
   drawing_price_basis?: string;
   /** Drawing catalog marker; see {@link chart_state_v1.drawing_catalog}. */
@@ -3764,6 +3814,8 @@ export interface persistence_restore_result {
   panes: number;
   drawings: number;
   points: number;
+  /** V3 pending binding identities; absent on legacy V1/V2 documents. */
+  unresolved_custom_studies?: number[];
 }
 
 /** A live handle to an engine-owned drawing. */
@@ -4866,6 +4918,37 @@ export interface big_trades_api {
   remove(): void;
 }
 
+/** Tape-derived footprint auction event rules; all volumes use the stream's native units. */
+export interface auction_marker_options {
+  min_side_volume: number;
+  exhaustion_max_volume: number;
+  exhaustion_levels: number;
+  absorption_min_volume: number;
+  absorption_ratio: number;
+  extreme_levels: number;
+  min_rejection_rows: number;
+  extend_until_revisited: boolean;
+  include_forming_bar: boolean;
+  visible: boolean;
+}
+export interface auction_mark {
+  /** UTC seconds for time bars; the chart row key for non-time bars (the key footprint rows and
+   *  big-trades orders carry, which retention never re-keys). */
+  bar_time: number;
+  kind: "unfinished_auction" | "exhaustion" | "absorption";
+  side: "high" | "low";
+  price: number;
+  volume: number;
+}
+export interface auction_markers_api {
+  readonly id: number;
+  options(): auction_marker_options;
+  apply_options(options: Partial<auction_marker_options>): void;
+  /** Tape-derived marks in engine order. */
+  snapshot(): readonly auction_mark[];
+  remove(): void;
+}
+
 /** The chart. Create with {@link create_chart}. */
 export interface chart_api {
   /** Format a time with the chart's time zone, date pattern, and crosshair time formatter. */
@@ -4994,6 +5077,13 @@ export interface chart_api {
    */
   add_big_trades(series: series_api | number, stream_id: number, options?: Partial<big_trades_options>): big_trades_api;
   /**
+   * Present tape-derived auction markers (unfinished auctions, exhaustion, absorption) on a price
+   * series. Runtime-only: marks are not persisted. Throws `resource_limit` past 16 marker sets,
+   * `unsupported_operation` for a series type that cannot host them, `invalid_handle` for an
+   * unknown stream or series, and `invalid_options` for rejected options.
+   */
+  add_auction_markers(series: series_api | number, stream_id: number, options?: Partial<auction_marker_options>): auction_markers_api;
+  /**
    * Anchor a time-bar trade stream to exchange-local session windows in the chart's `time_zone`
    * and `session_start`: each window restarts the bar grid (A-share 60-minute bars open at 09:30,
    * 10:30, 13:00 and 14:00), and `outside` places auction, lunch, and after-hours prints. `null`
@@ -5097,6 +5187,10 @@ export interface chart_api {
   set_series_order(ordered: series_api[]): boolean;
   /** Add a Rust-native simple moving-average line derived from an existing series. */
   add_sma(source: series_api, period: number, options?: Partial<series_options>): series_api;
+  /** Register a synchronous chart-local study implementation. Worker charts do not support callbacks. */
+  register_custom_study<State>(definition: custom_study_definition<State>): void;
+  add_custom_study(type: string, source: series_api, params?: Record<string, unknown>, options?: custom_study_binding_options): series_api[];
+  subscribe_custom_study_fault(callback: (event: custom_study_fault_event) => void): () => void;
   add_aroon(source: series_api, period: number, options?: Partial<series_options>): [series_api, series_api];
   /** Confirmed pivot levels and marker snapshots; levels begin at confirmation, never at the pivot. */
   add_swing_points(source: series_api, left?: number, right?: number, options?: Partial<series_options>): [series_api, series_api];

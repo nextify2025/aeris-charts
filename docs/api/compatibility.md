@@ -21,7 +21,7 @@
 
 ## 错误与生命周期
 
-可预期的失败会抛出 `AerisChartsError`，它是 `Error` 的子类，带有以下稳定错误码之一：`disposed`、`invalid_handle`、`stale_handle`、`invalid_data`、`invalid_options`、`unsupported_operation`、`serialization_error`、`persistence_version_error`、`extension_error`、`renderer_platform_error` 或 `resource_limit`。
+可预期的失败会抛出 `AerisChartsError`，它是 `Error` 的子类，带有以下稳定错误码之一：`disposed`、`invalid_handle`、`stale_handle`、`invalid_data`、`invalid_options`、`unsupported_operation`、`serialization_error`、`persistence_version_error`、`extension_error`、`renderer_platform_error`、`resource_limit`、`unsupported` 或 `reentrant_call`。后两个错误码是新增的（上游 `2019f10`，经合并 `4c1da4f` 的提交引入），既有错误码的含义不变：`unsupported` 表示当前图表形态不支持该功能（OffscreenCanvas worker 图表的 `register_custom_study` 与 `add_custom_study`），`reentrant_call` 表示在自定义研究回调执行期间调用了图表 API。按错误码穷尽分派的宿主需要处理这两个新值；渲染期间的宿主回调重入仍为 `unsupported_operation`。
 
 `chart.remove()` 是幂等的。移除之后，每个需要有效图表状态的操作都会抛出 `disposed`。调用方已持有的标识字段仍然可以读取。已移除的系列、绘图、窗格和价格比例尺会抛出 `stale_handle`；过期的句柄绝不会指向替代对象。扩展清理异常仍被隔离，并作为开发警告报告。
 
@@ -71,6 +71,10 @@
 
 七个结构与时段研究（上游 `dc39045`）以新增的 V3 种类标签保存：`swing_points`、`market_structure`、`fair_value_gaps`、`order_blocks`、`session_levels`、`previous_period_levels` 与 `opening_range`，`schema_version` 仍为 3。不认识这些标签的旧构建会拒绝整个文档且不产生变更。只保存研究定义（时段研究包括 `calendar` 策略）与输出样式：结构注释与宿主的时段日历不进入文档；`source_input` 不是 `close` 的结构研究、超出范围的摆动窗口或 `max_active`、未知的日历或周期以及为 0 的开盘区间时长都会使导入原子失败。
 
+自定义研究（上游 `1276c5e`..`92aefe5`，经合并 `4c1da4f` 的提交引入）以 `kind: "custom"` 保存类型标识、精确版本、归一化参数与输出数量，并可带 `dedicated_outputs`（各输出是否位于独立窗格），`schema_version` 仍为 3；不认识这些标签或字段的旧构建会拒绝整个文档且不产生变更。只保存定义、窗格位置与输出样式，不保存运行时。类型未注册或版本不匹配时，导入照常完成，绑定处于待定状态（输出为空白），导入结果的 `unresolved_custom_studies` 列出这些绑定的标识（V1/V2 文档的结果不带该字段），宿主注册匹配的类型后自动恢复计算。自定义契约（类型标识字符集与长度、版本、1–5 个输出、最多 64 个参数且序列化后不超过 64 KiB、最多 32 个自定义绑定、与已注册定义一致的输出数量、成交量用法与归一化参数）在安装之前校验，失败时导入原子失败。
+
+拍卖标记与研究日历只在运行时存在，不进入任何版本的文档（所有者决定 Q-E）：导入不会恢复它们，宿主在导入后重新绑定标记、重新提供日历。拍卖标记快照的 `bar_time` 在时间柱上是柱开盘的 UTC 秒；本仓库在非时间柱上使用图表行键（与足迹图行和大单订单相同，保留裁剪不重新分配），而上游使用会在裁剪后重新编号的逻辑索引，因此依赖上游语义比较非时间标记键的宿主需要改为按行键比较。`chart.add_auction_markers` 与 `apply_options` 的拒绝与大单一样带类型：超过 16 组为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，选项无效为 `invalid_options`，句柄移除后为 `stale_handle`。
+
 ## 版本策略
 
 浏览器包版本低于 1.0 期间：
@@ -88,6 +92,7 @@
 - 选择参数的列表字段由 `choices` 改名为 `options`，`indicator_schema(kind)` 升为修订 4（上游 `051a447`，经合并 `dc39045` 的提交引入）。`indicator_parameter_descriptor.choices` 已移除且没有兼容别名：读取约定参数（`seed`、`estimator`）可选值的宿主需要改读 `options`，Rust 宿主改用 `IndicatorParameterDescriptor::options: Option<Vec<String>>` 与构造函数 `IndicatorParameterDescriptor::choice`。非选择参数不再带该字段。本仓库的修订号自此与上游分离（上游为 2、本仓库为 4），按修订号判断编辑器能力的宿主只应与同一仓库的修订号比较。
 - 大单取代足迹图成交气泡（上游 `9fc3f2b`）。`chart.add_trade_bubbles(series, stream_id, options)` 已移除且没有兼容垫片：其替代品 `chart.add_big_trades(series, stream_id, options)` 的行为不同（先由连续成交重建主动订单再过滤，默认按最近已完成订单的 98 分位数自动过滤，前 128 个订单完成之前不显示任何气泡；气泡是窗格 chrome，不再写入系列标记），并返回一个 `big_trades_api` 句柄；被拒绝时抛出带类型的错误：超过 16 个指标为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，选项无效为 `invalid_options`（`apply_options` 在句柄移除后为 `stale_handle`）。`trade_stream_stats` 的 `bubble_trades_scanned` 与 `bubble_markers_sized` 由 `big_trades_prints_scanned` 与 `big_trades_replays` 取代。按上文策略这属于 major 级别的变更，具体版本号在发布时决定。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
 - 足迹图改为真实的 bid × ask 聚簇（上游 `314fdc8`、`a8dad8a`）。这是视觉行为变更，不改变任何函数签名：详细层级从 48 CSS px 柱间距起显示数字（此前要求更宽的柱才显示摘要），柱摘要只剩 `Δ` 与 `V` 两行（不再有 H/L/B/A），POC 改为不遮挡数字的轮廓，柱左缘新增方向区间线，数字保持配置的字号而不随行高变大，小于 0.01 的成交量以两位有效数字显示。`footprint_series_options` 新增可选的 `adaptive_rows`（默认 `false`），按当前缩放以 1-2-5 步长合并行。依赖截图或帧图元比较足迹图的宿主测试需要更新。主系列的行是空白数据时，`histogram_updown` 成交量柱按成交量系列自身的 `histogram_updown_rule`，从同一窗格中可见的足迹图取得涨跌方向（上游 `ea789aa`），没有足迹图柱的位置保持纯色；此前这些柱始终是纯色。Rust 侧的订单流变更见 [Rust 接入](rust.md#更换固定修订)。
+- `indicator_info().kind` 与 `indicator_schema().kind` 的 TypeScript 类型由 `indicator_kind` 放宽为 `indicator_kind | (string & {})`（上游 `1276c5e`..`92aefe5`，经合并 `4c1da4f` 的提交引入）：自定义研究的输出报告其已注册的类型标识，可以是任意字符串。把 `info.kind` 赋给 `indicator_kind` 类型变量、或按 `indicator_kind` 穷尽 `switch` 的宿主将无法通过类型检查，需要先收窄类型或加一个兜底分支。`indicator_info.parameters` 同时新增 `custom` 字段（自定义研究的归一化参数，内置研究为 `null`），列出全部字段的对象字面量需要补上。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
 
 ## 品牌更名
 
