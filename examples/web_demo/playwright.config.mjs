@@ -5,6 +5,7 @@ const portable_browser = process.env.AERIS_CHARTS_PORTABLE_BROWSER === "1";
 
 export default defineConfig({
   testDir: "./tests",
+  globalSetup: "./global-setup.mjs",
   // GitHub's shared Windows runners are substantially slower than release developer machines.
   // Keep the local feedback ceiling tight while allowing the same assertions to finish in CI.
   timeout: process.env.CI ? 60_000 : 30_000,

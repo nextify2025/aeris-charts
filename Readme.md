@@ -10,6 +10,14 @@ Aeris Charts 是面向 [Aeris Terminal](https://aeristerminal.com) 和浏览器�
 
 Rust 宿主通过 Git 或路径依赖，从本仓库依赖 `aeris_charts_*` crate；这些 crate 不会发布到 crates.io。`aeris_charts_engine` 拥有图表状态、交互、绘图、指标和帧构建，宿主将其与渲染器（例如 `aeris_charts_render_wgpu` 或 `aeris_charts_native`）搭配使用（参见[仓库结构](#仓库结构)）。
 
+## 研究与订单流
+
+内置指标共用引擎持有的绑定、类型化参数模式、增量计算、渲染和布局持久化路径。目录包括趋势、动量、波动率和成交量指标，I2 广度层（包括 KST、Klinger、回归通道、TSI、Vortex、KAMA、Choppiness Index 和 ATR 带），以及七个 I3 结构与时段研究：摆动点、市场结构、公允价值缺口、订单块、时段高低点、前一周期价位和开盘区间。时段研究使用 UTC 边界，或宿主在运行时提供、不随布局持久化的研究日历。KLineChart 的指标模板与原生目录并存。参见[指标 API](docs/api/indicators.md)、[指标计算与绑定](docs/architecture/data/indicators.md)、[结构、时段与自定义研究](docs/features/studies.md)和[指标目录](plan/Expansion.md#指标目录)。
+
+Rust 宿主可以用 `ChartEngine::register_custom_study` 注册类型化的自定义研究，并用 `add_custom_study` 绑定。浏览器图表在 TypeScript 中提供 `register_custom_study`、`add_custom_study` 和 `subscribe_custom_study_fault`（仅限主线程图表，worker 图表以 `unsupported` 拒绝）。引擎拥有调度、输出校验、样式和持久化，回调只提供计算。另有一条独立的外部研究路径，接收宿主已经算好的数值。
+
+共享成交带同时支持足迹系列，以及仅在运行时存在的拍卖标记（未完成拍卖、衰竭与吸收）。规则、选项与快照语义见[足迹设计](docs/features/footprint.md#拍卖标记)。
+
 ## 浏览器包
 
 浏览器 SDK 通过 GitHub Packages 以 `@aeristerminal/aeris-charts` 发布。安装前请先配置 Aeris Terminal 作用域：
@@ -196,7 +204,11 @@ import "@aeristerminal/aeris-charts/design.css";
 开发工具链与 CI 对齐：Rust 版本由 `rust-toolchain.toml` 固定，rustup 会按该文件自动安装这一版本及 `wasm32-unknown-unknown` 目标；另需 `wasm-pack` 0.15.0、Bun 1.4.2 和 Node.js 24。完整环境与平台要求见[验证门禁](docs/development/validation.md)。
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p aeris_charts_wasm --target wasm32-unknown-unknown -- -D warnings
 cargo test --workspace
+cargo run -p aeris_charts_native --example perf_gate --release
 
 cd packages/charts
 bun install --frozen-lockfile

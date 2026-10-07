@@ -1,8 +1,5 @@
-import { test, expect } from "@playwright/test";
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-}
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 test("persistence V1 round-trips all drawing kinds across stable multi-pane references", async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));

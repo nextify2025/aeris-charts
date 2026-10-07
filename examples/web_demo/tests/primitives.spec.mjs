@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 import { readFileSync } from "node:fs";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
@@ -10,13 +11,6 @@ test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
 
 async function settle_frames(page) {
   await page.evaluate(() => new Promise((resolve) => {

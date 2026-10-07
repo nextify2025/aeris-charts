@@ -92,6 +92,8 @@ wasm        → core + engine + render + render_wgpu
 
 宿主获得行为，不负责拼装引擎机制。平台输入转换、捕获、光标应用、定时器、菜单、剪贴板、产品持久化和券商操作仍在宿主；交互仲裁与命中、绘图编辑和语义查询留在引擎。
 
+自定义研究是唯一由引擎调度的宿主计算回调：宿主只提供公式，调度、界限、样式、持久化与绘制都留在引擎，输出经共享帧以已有图元绘制，不引入新的图元或场景模型；浏览器中只有主线程图表支持它，worker 图表以 `unsupported` 拒绝。
+
 详见[浏览器与 React 边界](architecture/hosts/browser.md)和[扩展边界](architecture/hosts/extensions.md)。Aeris Terminal 是独立仓库，修改 Charts 不代表已经验证了 Terminal 的集成。
 
 ## 性能契约与验证

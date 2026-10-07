@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, monitor_page, wait_for_chart } from "./page-ready.mjs";
 import { PNG } from "pngjs";
 
 // industry-standard last-value cluster: title chip + price text + candle-close countdown row,
@@ -14,13 +15,6 @@ const ROW_CD = 14; // 10px countdown text + 2*2 padding
 const test_port = Number.parseInt(process.env.AERIS_CHARTS_TEST_PORT ?? "4174", 10);
 const test_base_url = `http://127.0.0.1:${test_port}`;
 
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
-
 // Geometry probes default to DPR 1; alignment coverage overrides it when needed.
 async function open_cluster_page(browser, options, deviceScaleFactor = 1, query = "") {
   const context = await browser.newContext({
@@ -29,6 +23,7 @@ async function open_cluster_page(browser, options, deviceScaleFactor = 1, query 
     colorScheme: "light",
   });
   const page = await context.newPage();
+  page.once("close", monitor_page(page));
   await page.goto(`${test_base_url}/${query}`);
   await wait_for_chart(page);
   await page.evaluate((opts) => {
@@ -712,6 +707,7 @@ test("price and countdown chips share an exact edge at any DPR (no attachment ga
   for (const dpr of [1, 1.35, 2]) {
     const context = await browser.newContext({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: dpr, colorScheme: "light" });
     const page = await context.newPage();
+    page.once("close", monitor_page(page));
     await page.goto(`${test_base_url}/?theme=light`);
     await wait_for_chart(page);
     await page.evaluate(() => {

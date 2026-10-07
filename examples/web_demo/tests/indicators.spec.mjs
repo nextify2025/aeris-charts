@@ -1,15 +1,26 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
 import { PNG } from "pngjs";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 // Engine-native indicators: Bollinger band fill, oscillator separate panes with channel strips,
 // MACD four-state histogram colors, and the full native set's placement/lineage.
 
 async function wait_grid(page) {
-  await page.waitForFunction(() => window.__grid !== undefined && window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
+  await wait_for_chart(page, { grid: true });
 }
+
+test("page readiness reports a failed static import instead of timing out", async ({ page }) => {
+  await page.route("**/fixture_features.js", (route) => route.abort("internetdisconnected"));
+  await page.goto("/");
+  await expect(wait_grid(page)).rejects.toThrow(/fixture_features\.js.*ERR_INTERNET_DISCONNECTED/);
+});
+
+test("page readiness reports a module error instead of timing out", async ({ page }) => {
+  await page.route("**/fixture_features.js", (route) =>
+    route.fulfill({ contentType: "text/javascript", body: "export const marker_fixture = null; export const timeline_mark_fixture = null; export const volume_fixture = null; throw new Error('fixture module crashed')" }));
+  await page.goto("/");
+  await expect(wait_grid(page)).rejects.toThrow(/fixture module crashed/);
+});
 
 function count_color(png, target, tol = 10) {
   let n = 0;

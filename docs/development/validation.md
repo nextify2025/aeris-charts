@@ -8,6 +8,7 @@
 - [标准门禁](#标准门禁)
 - [固定工具链与严格预算](#固定工具链与严格预算)
 - [浏览器与 Linux 呈现](#浏览器与-linux-呈现)
+  - [Playwright 全局准备与页面就绪](#playwright-全局准备与页面就绪)
 - [GPUI 一致性与回放](#gpui-一致性与回放)
   - [gpui-fast 证据线](#gpui-fast-证据线)
 - [发布与诊断的边界](#发布与诊断的边界)
@@ -75,7 +76,17 @@ xvfb-run -a -s "-screen 0 1920x1080x24" bunx playwright test --headed <specs>
 
 该 spec 现在通过 `localization.time_formatter` 绘制 `Apr0`，在两个后端上以半覆盖度度量墨迹，要求其落在条带文本中心的一个设备像素之内，并且仍然检查日历标签保留其刻度空间和内边距。一个设备像素的容差涵盖的是半覆盖度墨迹框的光栅取整，而不是字体校准：宿主的修正量就是样本自身测得的墨迹（`logical_midpoint_correction`，相对于 `middle` 基线的 `(ascent - descent) / (2 * dpr)`），因此无论宿主解析出哪种字体，样本的墨迹按构造都居中于条带文本中心。
 
-研究与拍卖标记的浏览器证据位于 `custom-studies.spec.mjs`（自定义研究的调度、重入、worker 拒绝、故障投递，以及结构区域与拍卖标记在 Canvas2D 与 WebGPU 之间的几何一致性）与 `footprint.spec.mjs` 的两个拍卖标记测试。跨后端像素比较的共用函数（按不透明像素对齐、统计边缘与填充差异）提取到 `tests/parity-pixels.mjs`，`primitives.spec.mjs` 与 `custom-studies.spec.mjs` 共用它；在没有 WebGPU 的环境中，需要 WebGPU 的测试在后端检查处失败，属于环境基线。
+研究与拍卖标记的浏览器证据位于 `custom-studies.spec.mjs`（自定义研究的调度、重入、worker 拒绝、故障投递，以及结构区域与拍卖标记在 Canvas2D 与 WebGPU 之间的几何一致性）与 `footprint.spec.mjs` 的两个拍卖标记测试。跨后端像素比较的共用函数提取到 `tests/parity-pixels.mjs`（见[下文](#playwright-全局准备与页面就绪)），`primitives.spec.mjs` 与 `custom-studies.spec.mjs` 共用它；在没有 WebGPU 的环境中，需要 WebGPU 的测试在后端检查处失败，属于环境基线。
+
+### Playwright 全局准备与页面就绪
+
+`examples/web_demo/playwright.config.mjs` 的 `globalSetup`（`global-setup.mjs`）在任何测试之前，从仓库根目录运行 `cargo build -p aeris_charts_native --example image_parity_fixture --example parity_fixture --locked`。因此每一次 Playwright 运行（包括 `--grep`、单个 spec 与 `bun run test:gpui-webgpu`）都需要 rustup 与 `rust-toolchain.toml` 固定的工具链；锁文件过期或原生编译错误会在任何测试运行之前中止整个套件，而不再只让两个一致性测试失败。`backend-parity.spec.mjs` 直接运行 `${CARGO_TARGET_DIR ?? <仓库>/target}/debug/examples/<名称>`（Windows 上带 `.exe`），不再在测试中调用 `cargo run`，原生夹具因此与 CI 使用同一个固定工具链构建。全局准备与测试必须看到同一个 `CARGO_TARGET_DIR`，并使用 dev profile 且不带 `--target`，否则测试会读到过期或缺失的二进制。CI 浏览器作业的 `Swatinem/rust-cache` 设置 `cache-on-failure: true`，测试失败的运行同样保存这次原生构建。
+
+本地包装配置（例如上文以 `executablePath` 指向已安装 Chromium、其余部分复用 `playwright.config.mjs` 的配置）通常以 `{ ...base, ... }` 展开仓库配置。展开会复制相对路径 `globalSetup: "./global-setup.mjs"`，而 Playwright 相对于包装配置所在的目录解析它，于是运行在任何测试之前就因找不到模块而失败。包装配置必须把 `globalSetup` 设为 `examples/web_demo/global-setup.mjs` 的绝对路径，并同样以绝对路径设置 `testDir` 与 `webServer.cwd`。
+
+`tests/page-ready.mjs` 是可选用的就绪夹具。它导出三项：扩展的 `test`，在导航之前为每个 `page` 安装监视器；`monitor_page(page)`，监听 `requestfailed` 与 `pageerror`（主框架导航会清除已记录的失败），返回取消监听的函数；`wait_for_chart(page, { grid = false, settle = true })`，等待 `window.__chart.backend()` 可用（`grid` 时还等待 `window.__grid`），与已记录的失败竞争，`settle` 时再等待两个动画帧。启动时的静态导入失败或模块错误因此立即以该错误失败，而不是等到超时。使用它的 spec 从 `./page-ready.mjs` 导入 `test` 与 `wait_for_chart`（`expect` 仍来自 `@playwright/test`），不再声明本地的 `wait_for_chart`。通过 `browser.newContext()` 自行创建、之后又要等待的页面，必须先登记 `page.once("close", monitor_page(page))`，否则 `wait_for_chart` 直接抛出 “page-ready wait requires the shared Playwright test fixture”。本仓库自有的 spec（例如 `drawing-time-identity`、`indicator-conventions` 以及使用内联 `window.__chart` 等待的 spec）保留各自的等待方式，迁移到该夹具是可选的后续工作。`indicators.spec.mjs` 的两个就绪测试中止或替换 `fixture_features.js`；替换的模块体必须导出演示页 `index.html` 导入的每个名称（本仓库多出 `timeline_mark_fixture`），否则模块链接错误会先于模块中的 `throw` 出现，测试读到的是错误的失败。
+
+`tests/parity-pixels.mjs` 提供跨后端像素比较的共用函数：`crop_png`、`count_different`（pixelmatch 阈值 0，计入抗锯齿像素）与 `max_channel_delta`，后两者在尺寸不一致时抛错。导入它的 spec 不得再声明同名的本地函数；`backend-parity.spec.mjs` 仍保留自己的 `crop_png` 与按容差统计的 `rgba_diff`，不导入该模块。
 
 ## GPUI 一致性与回放
 

@@ -3,20 +3,14 @@
 // engine in the project matrix (Chromium, Firefox, WebKit). Pixel-exact parity is deliberately not
 // asserted here — each engine's Canvas2D rasterizer differs — only that a real chart is drawn.
 
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 import { PNG } from "pngjs";
 
 test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(
-    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
-  );
-}
 
 test("Canvas2D fallback initializes and renders a chart", async ({ page }) => {
   await page.goto("/?backend=canvas2d");

@@ -2,7 +2,7 @@
 
 Aeris Charts 将成为完整的**无头**专业交易图表引擎：订单流、市场深度、非时间柱、专业指标目录，以及一套绘图系统，其中每个工具的可配置程度都与成熟交易平台中的工具相当。主要使用方是 Aeris Terminal GPUI 平台；浏览器宿主通过 WASM 使用同一引擎。
 
-这是**活跃计划**（自 2026-09-25 起）。[plan.md](plan.md) 涵盖通用（非金融）图表族，目前已暂停。两份计划共用同一个 `ChartEngine` 和同一份帧契约。
+这是**活跃计划**（自 2026-09-25 起）。上游已于 2026-10-06 宣布本计划完成；按所有者决定 Q-F，本仓库在合并后的构建通过全部完整门禁、并重新取得 B9 证据之前，B9 仍保持待定（见“完成定义”）。[plan.md](plan.md) 涵盖通用（非金融）图表族，目前已暂停。两份计划共用同一个 `ChartEngine` 和同一份帧契约。
 
 阅读本文件的方式：
 
@@ -20,7 +20,7 @@ Aeris Charts 将成为完整的**无头**专业交易图表引擎：订单流、
 
 ## 状态总览
 
-更新于 2026-10-04。基线经源码确认于 2026-09-24。
+更新于 2026-10-07。基线经源码确认于 2026-09-24。
 
 | 批次 | 范围 | 在平台侧解锁 | 状态 |
 | --- | --- | --- | --- |
@@ -244,7 +244,7 @@ Aeris Charts 将成为完整的**无头**专业交易图表引擎：订单流、
 
 ### B9 — 广度与扩展
 
-**范围**：I2、I3、I4、OF13。**依赖**：B3 与 B4。**状态**：实现已随上游合入（`9dd8cff`、`dc39045` 与 `4c1da4f`，含本仓库的调整），待本仓库完整门禁与证据。按所有者决定 Q-F，下列各项在本仓库合并后的构建通过全部完整门禁后才勾选；里程碑证据一项保持未完成，直到本仓库重新运行性能目标与浏览器套件。上游的无障碍与竞品对比评审只作为上游证据引用。
+**范围**：I2、I3、I4、OF13。**依赖**：B3 与 B4。**状态**：实现已随上游合入（`9dd8cff`、`dc39045`、`4c1da4f` 与 `8aca74f`，后者含拍卖标记修复起点的两条规则，均含本仓库的调整），待本仓库完整门禁与证据。按所有者决定 Q-F，下列各项在本仓库合并后的构建通过全部完整门禁后才勾选；里程碑证据一项保持未完成，直到本仓库重新运行性能目标与浏览器套件。上游的无障碍与竞品对比评审只作为上游证据引用。
 
 - [ ] **I2** 广度指标层级（见“指标目录”）。
 - [ ] **I3** 结构层级：摆动点、结构突破、公允价值缺口、订单块、交易时段与前一周期价位、开盘区间。
@@ -597,7 +597,7 @@ Aeris Terminal 路线图新增了风险控制、交易时段回放、交易复�
 | OF10 | 带有带状线的锚定 VWAP 绘图 | K 线或成交带 | F4, F5 | B7 | |
 | OF11 | 大单：由连续成交重建主动订单，按滚动分位数或固定最小成交量过滤，按成交量定大小、按买卖方向着色，标注成交量与扫单区间 | 成交带 | F2 | B3 | 窗格 chrome 中有界的气泡图元 |
 | OF12 | 足迹图变体：柱内分布、成交量价位梯、水平失衡模式、仅 delta、买/卖直方图单元格 | 成交带 | F2 | B3 | 扩展现有的足迹图细节层级（LOD） |
-| OF13 | 未完成拍卖、吸收与衰竭标记，规则明确且有文档记录 | 成交带 | OF12 | B9 | 规则必须是确定性且参数化的，绝不能是启发式黑箱 |
+| OF13 | 未完成拍卖、吸收与衰竭标记，规则明确且有文档记录 | 成交带 | OF12 | B9 | 规则必须是确定性且参数化的，绝不能是启发式黑箱。上游已在 B9 交付（`8aca74f`）：共享成交带上确定、参数化的标记，支持回放与保留，见[拍卖标记](../docs/features/footprint.md#拍卖标记)；本仓库按所有者决定 Q-F，待完整门禁与证据后再确认交付 |
 | OF14 | Tick K 线、成交量 K 线与区间 K 线；同一批柱上的足迹图 | 成交带 | F1 | B5 | 成交笔数聚合器和成交量聚合器已存在 |
 | OF15 | 流动性热力图（随时间变化的挂单深度），带颜色缩放、阈值，并叠加成交 | 深度 + 成交带 | F3, OF11 | B6 | 以可见时间桶 × 可见价格行为界 |
 | OF16 | DOM 价位梯数据模型：价格阶梯、买/卖数量、各价位近期成交量、自有订单 | 深度 + 交易 | F3 | B6 | 面向非 Aeris 宿主；图表侧的面板图元 |
@@ -617,7 +617,7 @@ Aeris Terminal 路线图新增了风险控制、交易时段回放、交易复�
 
 ### 指标目录
 
-当前已有：SMA、EMA、DEMA、TEMA、SMMA/RMA、HMA、VWMA、标准差、CCI、Williams %R、Stochastic RSI、ROC、Momentum、OBV、CMF、MFI、Volume/MA、Donchian Channels、Keltner Channels、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、EMA 彩带、WMA、Bollinger、RSI、MACD、Stochastic、ATR、VWAP。每个新指标都随附增量状态、重建测试、类型化 schema、持久化，以及一个独立计算的参考值夹具。
+当前已有：SMA、EMA、DEMA、TEMA、SMMA/RMA、HMA、VWMA、标准差、CCI、Williams %R、Stochastic RSI、ROC、Momentum、OBV、CMF、MFI、Volume/MA、Donchian Channels、Keltner Channels、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、EMA 彩带、WMA、Bollinger、RSI、MACD、Stochastic、ATR、VWAP，以及本仓库的 KDJ 与 KLineChart 指标模板。I2 广度层（随上游合入）新增 Aroon、Awesome Oscillator、Chande Momentum、Chaikin Oscillator、Coppock、DPO、Elder Force、Ease of Movement、Fisher Transform、Historical Volatility、KST、Klinger、线性回归、Mass Index、Ultimate Oscillator、TRIX、TSI、Vortex、Envelopes、ALMA、KAMA、McGinley Dynamic、Choppiness（以 Chop Zone 阈值呈现）、Bollinger %B 与 Bandwidth、ATR 带、Accumulation/Distribution、Price Volume Trend、Volume Oscillator 与 Relative Volume。I3 结构层新增摆动点、市场结构突破、公允价值缺口、订单块、交易时段高点/低点、前一日/前一周/前一月价位与开盘区间。新的标量指标都随附增量状态、重建测试、类型化 schema、持久化与独立计算的参考值；结构研究另外提供确定性的注释。
 
 | 层级 | 批次 | 指标 |
 | --- | --- | --- |
@@ -662,5 +662,7 @@ Aeris Terminal 路线图新增了风险控制、交易时段回放、交易复�
 [AGENTS.md](../AGENTS.md) 中的完整门禁在每个批次结束、提交之前运行一次。任何所有权或数据流变更都在同一次提交中更新 `docs/Architecture.md`。参考行为仅来自公开文档和观察到的行为；不得复制实现代码或资源（参见 AGENTS.md 中的许可规则）。
 
 ## 完成定义
+
+**上游已完成（2026-10-06）**：上游宣布 B1–B9 已交付，其 B9 发布门禁覆盖共享的 Rust、WASM、TypeScript、浏览器、GPUI 与 release 性能路径，主题与溢出截图、无障碍审查、竞品对比和基准证据记录在上游的 `docs/Studies.md` 中，本仓库只作为上游证据引用。按所有者决定 Q-F，本仓库在合并后的构建通过全部完整门禁、并在本仓库重新运行性能目标与浏览器套件之前，不宣布完成。
 
 对于本计划而言，当宿主仅使用类型化的引擎 API 就能构建专业的订单流与技术分析工作站时，Aeris Charts 即是一个完整的无头交易图表引擎。这意味着具备：足迹图、CVD、分布、TPO、流动性热力图、DOM、非时间柱、I1–I3 指标目录、带逐工具自定义的完整绘图目录，以及平台契约 PD1–PD11，并且所有后端结果一致、资源有界、持久化确定、性能证据经过实测。在此之前，应对照上文的批次清单和目录 ID，精确报告已交付项与剩余缺口。

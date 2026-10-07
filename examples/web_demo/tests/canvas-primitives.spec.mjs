@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, monitor_page, wait_for_chart } from "./page-ready.mjs";
 import { readFileSync } from "node:fs";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
@@ -9,13 +10,6 @@ test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
 
 async function settle_frames(page) {
   await page.evaluate(() => new Promise((resolve) => {
@@ -121,6 +115,7 @@ test("canvas primitive renders crisp at DPR 2 in bitmap and media space", async 
     colorScheme: "light",
   });
   const page = await context.newPage();
+  page.once("close", monitor_page(page));
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
   await page.goto("/?runtimeTest=presentedFrame&backend=canvas2d&forceFallbackAdapter=1&dpr=2");

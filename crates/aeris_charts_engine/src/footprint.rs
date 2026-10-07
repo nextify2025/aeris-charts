@@ -1103,6 +1103,22 @@ impl FootprintAggregator {
         &self.bars[..self.visible_bar_count()]
     }
 
+    /// Time bars restart at the bucket containing the changed timestamp. Non-time bars can
+    /// split equal-timestamp prints across many bars; the last bar starting strictly before
+    /// the change may also contain one, even when later bars start at that same timestamp.
+    /// Earlier bars cannot contain changed prints because trades are ordered by timestamp.
+    fn auction_repair_from(&self, earliest_trade: i64) -> usize {
+        if matches!(self.options.bars, FootprintBarAggregation::Time { .. }) {
+            self.bars()
+                .partition_point(|bar| bar.start_timestamp_micros <= earliest_trade)
+                .saturating_sub(1)
+        } else {
+            self.bars()
+                .partition_point(|bar| bar.start_timestamp_micros < earliest_trade)
+                .saturating_sub(1)
+        }
+    }
+
     /// One stored bar with its levels grouped into `ticks_per_row` display rows.
     pub fn presented_bar<'a>(&self, bar: &'a FootprintBar) -> std::borrow::Cow<'a, FootprintBar> {
         if self.options.ticks_per_row > 1 {
@@ -2086,33 +2102,6 @@ impl FootprintAggregator {
         let position = self.trade_ids.get(&trade_id)?;
         let trade = self.trades.get(position.checked_sub(self.trade_id_base)?)?;
         Some(trade.event.timestamp_micros)
-    }
-
-    /// First bar an auction-marker repair must re-detect for a historical batch: the bar holding
-    /// the earliest print the batch adds or, for a corrected `trade_id`, the print it replaces.
-    /// A non-time bar also re-detects the bar before it, which can share its start time.
-    fn auction_repair_from(&self, trades: &[FootprintTrade]) -> usize {
-        let earliest_trade = trades
-            .iter()
-            .flat_map(|trade| {
-                let original = trade
-                    .trade_id
-                    .and_then(|trade_id| self.stored_trade_timestamp(trade_id));
-                [Some(trade.timestamp_micros), original]
-                    .into_iter()
-                    .flatten()
-            })
-            .min()
-            .unwrap_or(i64::MIN);
-        let from = self
-            .bars()
-            .partition_point(|bar| bar.start_timestamp_micros <= earliest_trade)
-            .saturating_sub(1);
-        if matches!(self.options.bars, FootprintBarAggregation::Time { .. }) {
-            from
-        } else {
-            from.saturating_sub(1)
-        }
     }
 
     /// This stream re-aggregated under `options`: the same retained tape (prints the replay clock
@@ -3350,17 +3339,13 @@ impl ChartEngine {
             .trade_stream(stream_id)
             .ok_or(FootprintError::UnknownTradeStream(stream_id))?;
         let previous_bar_count = stream.bars().len();
-        // The aggregator may resume at an earlier replay checkpoint. Auction detection reads
-        // finished bars, not tape state, so it only needs the first bar intersecting the window.
+        // Auction detection reads finished bars, not tape checkpoints. Include the bar whose
+        // start precedes the window even when its last old print precedes the window too.
         let auction_from = trades
             .iter()
             .map(|trade| trade.timestamp_micros)
             .min()
-            .map(|from| {
-                stream
-                    .bars()
-                    .partition_point(|bar| bar.end_timestamp_micros < from)
-            });
+            .map(|from| stream.auction_repair_from(from));
         let Some(first_bar) = self
             .trade_streams
             .get_mut(&stream_id)
@@ -3805,11 +3790,23 @@ impl ChartEngine {
         let historical = !stream.batch_is_tip(&trades);
         let previous_bar_count = stream.bars().len();
         if historical {
-            // Auction marks re-detect from the bar of the earliest print the batch touches,
-            // read from the pre-merge bars (the merge below only runs once it cannot fail).
-            let auction_from = stream.auction_repair_from(&trades);
-            // The batch is validated above and the merge refuses a bar-time collision before it
+            // Auction marks re-detect from the bar of the earliest print the batch touches: a new
+            // print or, for a corrected `trade_id`, the retained print it replaces. They are read
+            // from the pre-merge bars; the merge below refuses a bar-time collision before it
             // changes anything, so it is applied completely or not at all.
+            let earliest_trade = trades
+                .iter()
+                .flat_map(|trade| {
+                    let original = trade
+                        .trade_id
+                        .and_then(|id| stream.stored_trade_timestamp(id));
+                    [Some(trade.timestamp_micros), original]
+                        .into_iter()
+                        .flatten()
+                })
+                .min()
+                .unwrap();
+            let auction_from = stream.auction_repair_from(earliest_trade);
             let (result, first_bar) = self
                 .trade_streams
                 .get_mut(&stream_id)
@@ -8568,5 +8565,88 @@ mod tests {
         assert!(merged.levels[2].stacked_ask_imbalance);
         assert_eq!(merged.poc_level, 52);
         assert_eq!(merged.total_volume, bar.total_volume);
+    }
+
+    #[test]
+    fn correcting_a_retained_trade_after_sealing_repairs_auction_marks_like_a_fresh_build() {
+        // Fork guarantee (X17): retention seals the oldest bars and advances `trade_id_base`, so
+        // the auction repair reads a corrected print's original timestamp at its deque index
+        // (`position - trade_id_base`), never at the absolute position, which names a later print.
+        let bars = FootprintBarAggregation::Time {
+            interval_micros: 60_000_000,
+            anchor_micros: 0,
+        };
+        let new_chart = || {
+            let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+            let stream = chart
+                .add_trade_stream(
+                    "auction",
+                    FootprintAggregationOptions {
+                        tick_size: 1.0,
+                        bars,
+                        ..FootprintAggregationOptions::default()
+                    },
+                )
+                .unwrap();
+            chart
+                .configure_footprint_series(0, FootprintSeriesOptions::default())
+                .unwrap();
+            chart.bind_footprint_series_to_stream(0, stream).unwrap();
+            (chart, stream)
+        };
+        let two_sided = |minute: i64| {
+            let time = minute * 60_000_000 + 1;
+            let id = minute as u64 * 2;
+            let mut buy = trade(time, 100.0, 3.0, AggressorSide::Buy);
+            buy.trade_id = Some(id);
+            let mut sell = trade(time + 1, 100.0, 4.0, AggressorSide::Sell);
+            sell.trade_id = Some(id + 1);
+            [buy, sell]
+        };
+        let mut tape = (0..20).flat_map(two_sided).collect::<Vec<_>>();
+        let (mut chart, stream) = new_chart();
+        chart.set_trade_stream_trades(stream, tape.clone()).unwrap();
+        let options = crate::AuctionMarkerOptions::default();
+        let id = chart
+            .add_auction_markers(stream, 0, options.clone())
+            .unwrap();
+        assert!(chart.set_series_max_points(0, Some(18)));
+        let retained = chart.trade_stream(stream).unwrap();
+        assert!(retained.trade_id_base > 0, "retention must seal raw trades");
+        let first_time = retained.bars()[0].start_timestamp_micros / 1_000_000;
+        assert!(
+            chart
+                .auction_markers_snapshot(id)
+                .unwrap()
+                .iter()
+                .any(|mark| mark.bar_time == 600),
+            "minute 10 must carry an auction mark the repair has to remove"
+        );
+
+        // Move minute 10's sell (still retained) into minute 11: minute 10 loses its unfinished
+        // auction. Its absolute tape position is a later print's deque index.
+        let mut corrected = tape[21].clone();
+        corrected.timestamp_micros = 11 * 60_000_000 + 3;
+        assert_eq!(
+            chart
+                .update_trade_stream_trade(stream, corrected.clone())
+                .unwrap(),
+            FootprintUpdateKind::Historical
+        );
+        tape[21] = corrected;
+        tape.sort_by_key(|print| print.timestamp_micros);
+
+        let (mut fresh, fresh_stream) = new_chart();
+        fresh.set_trade_stream_trades(fresh_stream, tape).unwrap();
+        let fresh_id = fresh.add_auction_markers(fresh_stream, 0, options).unwrap();
+        let expected = fresh
+            .auction_markers_snapshot(fresh_id)
+            .unwrap()
+            .into_iter()
+            .filter(|mark| mark.bar_time >= first_time)
+            .collect::<Vec<_>>();
+        assert!(!expected.iter().any(|mark| mark.bar_time == 600));
+        assert!(expected.iter().any(|mark| mark.bar_time == 660));
+        assert_eq!(chart.auction_markers_snapshot(id).unwrap(), expected);
     }
 }

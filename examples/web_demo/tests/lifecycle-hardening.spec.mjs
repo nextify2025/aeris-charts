@@ -1,8 +1,5 @@
-import { test, expect } from "@playwright/test";
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-}
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 test("retained chart disposal is idempotent and destroys every extension", async ({ page }) => {
   await page.goto("/?backend=canvas2d");

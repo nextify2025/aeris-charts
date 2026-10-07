@@ -1,14 +1,8 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 import { PNG } from "pngjs";
 
 // The demo's price-line style select and industry-standard "reset view" button.
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
 
 async function capture(page) {
   const data_url = await page.evaluate(() => window.__chart.take_screenshot().toDataURL("image/png"));
