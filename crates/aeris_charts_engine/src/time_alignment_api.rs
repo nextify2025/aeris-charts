@@ -33,25 +33,24 @@ impl ChartEngine {
                 return Err(ChartError::new(
                     ErrorCode::StaleHandle,
                     format!("series {id} was removed"),
-                ))
+                ));
             }
             Err(SeriesIdError::Unknown(_)) => {
                 return Err(ChartError::new(
                     ErrorCode::InvalidHandle,
                     format!("series {id} does not exist"),
-                ))
+                ));
             }
         }
         if let TimeAlignment::AsOf {
             max_staleness: Some(max),
         } = alignment
+            && max < 0
         {
-            if max < 0 {
-                return Err(ChartError::new(
-                    ErrorCode::InvalidOptions,
-                    "as_of_max_staleness must be a non-negative number of seconds",
-                ));
-            }
+            return Err(ChartError::new(
+                ErrorCode::InvalidOptions,
+                "as_of_max_staleness must be a non-negative number of seconds",
+            ));
         }
         if self.data.time_alignment(id) == Some(alignment) {
             return Ok(());

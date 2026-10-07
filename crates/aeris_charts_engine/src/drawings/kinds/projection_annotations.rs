@@ -27,7 +27,7 @@ use aeris_charts_render::shape::Point;
 
 use super::super::handles::{DrawingHandle, HandleDrag};
 use super::super::parts::{
-    text_lines, DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_PADDING,
+    DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_PADDING, text_lines,
 };
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
@@ -974,24 +974,23 @@ pub(crate) fn forecast_status(engine: &ChartEngine, drawing: &Drawing) -> Option
     }
     let plot = rows.plot;
     let data_last = plot.index_at(plot.last_non_whitespace_row_before(plot.size())?)?;
-    if first_index <= last_index.min(data_last) {
-        if let (Some(first_row), Some(last_row)) = (
+    if first_index <= last_index.min(data_last)
+        && let (Some(first_row), Some(last_row)) = (
             plot.first_non_whitespace_row(first_index),
             plot.last_non_whitespace_row(last_index.min(data_last)),
-        ) {
-            if first_row <= last_row {
-                let hit = match plot.lod() {
-                    Some(lod) => lod
-                        .rows_on_range(first_row..last_row + 1, usize::MAX)
-                        .0
-                        .iter()
-                        .any(reached),
-                    None => (first_row..=last_row).any(reached),
-                };
-                if hit {
-                    return Some(true);
-                }
-            }
+        )
+        && first_row <= last_row
+    {
+        let hit = match plot.lod() {
+            Some(lod) => lod
+                .rows_on_range(first_row..last_row + 1, usize::MAX)
+                .0
+                .iter()
+                .any(reached),
+            None => (first_row..=last_row).any(reached),
+        };
+        if hit {
+            return Some(true);
         }
     }
     (data_last > last_index).then_some(false)
@@ -1305,10 +1304,12 @@ pub(crate) fn follow_anchor_drag(
     points: &mut [crate::DrawingPoint],
 ) {
     let coincident = matches!(start_points, [foot, top] if foot == top);
-    if index == 0 && drawing.kind == DrawingKind::Signpost && coincident {
-        if let [foot, top, ..] = points {
-            *top = *foot;
-        }
+    if index == 0
+        && drawing.kind == DrawingKind::Signpost
+        && coincident
+        && let [foot, top, ..] = points
+    {
+        *top = *foot;
     }
 }
 

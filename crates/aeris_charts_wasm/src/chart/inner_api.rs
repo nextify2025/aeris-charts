@@ -1015,10 +1015,8 @@ impl ChartInner {
             // frame-rate console flood.
             telemetry.count_ring_dropped_rows(dropped);
         }
-        if had_work {
-            if let (Some(clock), Some(start)) = (clock.as_ref(), started) {
-                telemetry.add_pending_ingest_ms(clock.now() - start);
-            }
+        if had_work && let (Some(clock), Some(start)) = (clock.as_ref(), started) {
+            telemetry.add_pending_ingest_ms(clock.now() - start);
         }
         total
     }
@@ -1297,10 +1295,10 @@ impl ChartInner {
 
     /// Set a line/area series' stroke width (css px; non-positive ignored).
     pub fn set_series_line_width(&mut self, id: u32, width: f64) {
-        if width > 0.0 {
-            if let Some(s) = self.series.iter_mut().find(|s| s.id == id as SeriesId) {
-                s.line_width = Some(width);
-            }
+        if width > 0.0
+            && let Some(s) = self.series.iter_mut().find(|s| s.id == id as SeriesId)
+        {
+            s.line_width = Some(width);
         }
     }
 
@@ -1721,16 +1719,16 @@ impl ChartInner {
         });
         self.engine.invalidate_axis_frame();
         self.axis_dirty = true;
-        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into()) {
-            if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                let params = js_sys::Object::new();
-                let _ = js_sys::Reflect::set(&params, &"pane_index".into(), &pane.into());
-                if let Err(error) = hook.call1(&primitive, &params) {
-                    web_sys::console::warn_1(
-                        &format!("aeris_charts: pane primitive `attached` hook threw — {error:?}")
-                            .into(),
-                    );
-                }
+        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into())
+            && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+        {
+            let params = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&params, &"pane_index".into(), &pane.into());
+            if let Err(error) = hook.call1(&primitive, &params) {
+                web_sys::console::warn_1(
+                    &format!("aeris_charts: pane primitive `attached` hook threw — {error:?}")
+                        .into(),
+                );
             }
         }
         id
@@ -1746,15 +1744,13 @@ impl ChartInner {
         let entry = self.primitives.remove(position);
         self.engine.invalidate_axis_frame();
         self.axis_dirty = true;
-        if let Ok(hook) = js_sys::Reflect::get(&entry.obj, &"detached".into()) {
-            if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                if let Err(error) = hook.call0(&entry.obj) {
-                    web_sys::console::warn_1(
-                        &format!("aeris_charts: pane primitive `detached` hook threw — {error:?}")
-                            .into(),
-                    );
-                }
-            }
+        if let Ok(hook) = js_sys::Reflect::get(&entry.obj, &"detached".into())
+            && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+            && let Err(error) = hook.call0(&entry.obj)
+        {
+            web_sys::console::warn_1(
+                &format!("aeris_charts: pane primitive `detached` hook threw — {error:?}").into(),
+            );
         }
         true
     }
@@ -1788,25 +1784,23 @@ impl ChartInner {
         });
         self.engine.invalidate_axis_frame();
         self.axis_dirty = true;
-        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into()) {
-            if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                let params = js_sys::Object::new();
-                let _ = js_sys::Reflect::set(&params, &"series_id".into(), &series_id.into());
-                if pane_index < self.panes.len() {
-                    let _ = js_sys::Reflect::set(
-                        &params,
-                        &"pane_index".into(),
-                        &(pane_index as u32).into(),
-                    );
-                }
-                if let Err(error) = hook.call1(&primitive, &params) {
-                    web_sys::console::warn_1(
-                        &format!(
-                            "aeris_charts: series primitive `attached` hook threw — {error:?}"
-                        )
+        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into())
+            && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+        {
+            let params = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&params, &"series_id".into(), &series_id.into());
+            if pane_index < self.panes.len() {
+                let _ = js_sys::Reflect::set(
+                    &params,
+                    &"pane_index".into(),
+                    &(pane_index as u32).into(),
+                );
+            }
+            if let Err(error) = hook.call1(&primitive, &params) {
+                web_sys::console::warn_1(
+                    &format!("aeris_charts: series primitive `attached` hook threw — {error:?}")
                         .into(),
-                    );
-                }
+                );
             }
         }
         id
@@ -2345,14 +2339,13 @@ impl ChartInner {
         // `localization.locale` needs the host's `Intl` (the engine is headless), so it is
         // intercepted here; the engine routes `localization.dateFormat` itself and the store
         // keeps both keys for the options round-trip.
-        if let Ok(patch) = serde_json::from_str::<serde_json::Value>(patch_json) {
-            if let Some(locale) = patch
+        if let Ok(patch) = serde_json::from_str::<serde_json::Value>(patch_json)
+            && let Some(locale) = patch
                 .get("localization")
                 .and_then(|l| l.get("locale"))
                 .and_then(serde_json::Value::as_str)
-            {
-                self.set_locale(locale);
-            }
+        {
+            self.set_locale(locale);
         }
         if let Err(e) = self.engine.apply_options(patch_json) {
             web_sys::console::warn_1(
@@ -3561,14 +3554,12 @@ fn locale_month_names(locale: &str) -> Option<([String; 12], [String; 12])> {
 /// Fire a detached primitive's `detached` hook (shared by the series-primitive detach paths);
 /// a throwing hook is only reported.
 fn fire_primitive_detached(obj: &js_sys::Object) {
-    if let Ok(hook) = js_sys::Reflect::get(obj, &"detached".into()) {
-        if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-            if let Err(error) = hook.call0(obj) {
-                web_sys::console::warn_1(
-                    &format!("aeris_charts: series primitive `detached` hook threw — {error:?}")
-                        .into(),
-                );
-            }
-        }
+    if let Ok(hook) = js_sys::Reflect::get(obj, &"detached".into())
+        && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+        && let Err(error) = hook.call0(obj)
+    {
+        web_sys::console::warn_1(
+            &format!("aeris_charts: series primitive `detached` hook threw — {error:?}").into(),
+        );
     }
 }

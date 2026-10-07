@@ -18,9 +18,9 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point};
 
-use super::super::geometry::{gann_fixed_end, GannGridGeometry};
+use super::super::geometry::{GannGridGeometry, gann_fixed_end};
 use super::super::handles::{DrawingHandle, HandleDrag, HandleShape};
-use super::super::parts::{text_on, DrawingParts, PartContext, STATS_GAP, STATS_PADDING};
+use super::super::parts::{DrawingParts, PartContext, STATS_GAP, STATS_PADDING, text_on};
 use super::super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{
     ChartEngine, DrawingDragPart, DrawingKind, DrawingLevel, DrawingPoint,

@@ -38,15 +38,15 @@ fn append_segment_pairs(
 /// `Prim::Segments` and clear it. A batch that gathered no pair (every dash piece degenerate)
 /// emits nothing.
 fn flush_segments(out: &mut Vec<Prim>, batch: &mut Option<(u32, u32)>, width: f32, color: Color) {
-    if let Some((first_point, segment_count)) = batch.take() {
-        if segment_count > 0 {
-            out.push(Prim::Segments {
-                first_point,
-                segment_count,
-                width,
-                color,
-            });
-        }
+    if let Some((first_point, segment_count)) = batch.take()
+        && segment_count > 0
+    {
+        out.push(Prim::Segments {
+            first_point,
+            segment_count,
+            width,
+            color,
+        });
     }
 }
 
@@ -1887,11 +1887,7 @@ impl ChartEngine {
                     .display_heikin_ashi_row(series_id, plot, last)
                     .map(|values| values[0])
                     .unwrap_or_else(|| plot.value_at(last, PlotValueIndex::Open));
-                if close >= open {
-                    UP
-                } else {
-                    DOWN
-                }
+                if close >= open { UP } else { DOWN }
             }
         }
         .solid();

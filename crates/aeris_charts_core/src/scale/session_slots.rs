@@ -425,10 +425,9 @@ impl SessionBarGrid {
             let mut previous = [(0, 0); MAX_SESSION_WINDOWS];
             if let Ok(previous_count) =
                 place_windows(day - 1, &self.windows, &self.time, &mut previous)
+                && time < previous[previous_count - 1].1
             {
-                if time < previous[previous_count - 1].1 {
-                    return Ok(visit(&previous[..previous_count]));
-                }
+                return Ok(visit(&previous[..previous_count]));
             }
         }
         Ok(visit(&placed[..count]))
@@ -730,9 +729,11 @@ mod tests {
         assert!(slots.iter().all(|&slot| time.trading_day(slot) == tuesday));
         // The night session crosses midnight without a Day mark; the day session carries none
         // either, because the trading day started the evening before.
-        assert!(slots
-            .windows(2)
-            .all(|pair| { (weight_by_time_in(pair[1], pair[0], &time) as u8) < 50 }));
+        assert!(
+            slots
+                .windows(2)
+                .all(|pair| { (weight_by_time_in(pair[1], pair[0], &time) as u8) < 50 })
+        );
         // Monday's night session trades on Friday evening.
         let monday = day("2026-09-28");
         let slots = session_slot_times(monday, &session, 60, &time, SessionSlotConvention::BarOpen)
@@ -784,9 +785,11 @@ mod tests {
         assert_eq!(local(&call, monday[0]), "2024-01-07 17:00");
         assert_eq!(local(&call, monday[1379]), "2024-01-08 15:59");
         assert!(monday.windows(2).all(|pair| pair[1] - pair[0] == 60));
-        assert!(monday
-            .iter()
-            .all(|&slot| chart.trading_day(slot) == day("2024-01-08")));
+        assert!(
+            monday
+                .iter()
+                .all(|&slot| chart.trading_day(slot) == day("2024-01-08"))
+        );
 
         // The two-call form (the Sunday evening, then Monday's remaining windows under the chart's
         // own start) places the same slots.
@@ -814,9 +817,11 @@ mod tests {
         let evening = slots("2024-01-09", &globex, &call);
         assert_eq!(local(&call, evening[0]), "2024-01-09 17:00");
         assert_eq!(local(&call, evening[1379]), "2024-01-10 15:59");
-        assert!(evening
-            .iter()
-            .all(|&slot| chart.trading_day(slot) == day("2024-01-10")));
+        assert!(
+            evening
+                .iter()
+                .all(|&slot| chart.trading_day(slot) == day("2024-01-10"))
+        );
 
         // Both DST changes fall on a Sunday before the open, so the open keeps its wall clock
         // (22:00 UTC in CDT, 23:00 UTC in CST) and the session still spans 23 hours.
@@ -909,27 +914,34 @@ mod tests {
         // A Monday with its night session opens on Friday evening.
         let monday = slots("2024-09-30", &night);
         assert_eq!(local(&time, monday[0]), "2024-09-27 21:00");
-        assert!(monday
-            .iter()
-            .all(|&slot| time.trading_day(slot) == day("2024-09-30")));
+        assert!(
+            monday
+                .iter()
+                .all(|&slot| time.trading_day(slot) == day("2024-09-30"))
+        );
 
         // The first date after the break has no night session: it opens at 09:00 that morning,
         // and nothing lands on the evening before.
         let resumed = slots("2024-10-08", day_only);
         assert_eq!(local(&time, resumed[0]), "2024-10-08 09:00");
-        assert!(resumed
-            .iter()
-            .all(|&slot| local(&time, slot).starts_with("2024-10-08")));
-        assert!(resumed
-            .iter()
-            .all(|&slot| time.trading_day(slot) == day("2024-10-08")));
+        assert!(
+            resumed
+                .iter()
+                .all(|&slot| local(&time, slot).starts_with("2024-10-08"))
+        );
+        assert!(
+            resumed
+                .iter()
+                .all(|&slot| time.trading_day(slot) == day("2024-10-08"))
+        );
 
         // The next date has its night session again, placed on the evening of Oct 8.
         let next = slots("2024-10-09", &night);
         assert_eq!(local(&time, next[0]), "2024-10-08 21:00");
-        assert!(next
-            .iter()
-            .all(|&slot| time.trading_day(slot) == day("2024-10-09")));
+        assert!(
+            next.iter()
+                .all(|&slot| time.trading_day(slot) == day("2024-10-09"))
+        );
 
         assert!(monday[monday.len() - 1] < resumed[0]);
         assert!(resumed[resumed.len() - 1] < next[0]);
@@ -1473,12 +1485,16 @@ mod tests {
             OutOfSessionPolicy::Fold,
         )
         .unwrap();
-        assert!(collapsed
-            .bar_close(at(&new_york, "2024-03-10 04:00:00"))
-            .is_err());
-        assert!(collapsed
-            .bar_close(at(&new_york, "2024-03-12 02:10:00"))
-            .is_ok());
+        assert!(
+            collapsed
+                .bar_close(at(&new_york, "2024-03-10 04:00:00"))
+                .is_err()
+        );
+        assert!(
+            collapsed
+                .bar_close(at(&new_york, "2024-03-12 02:10:00"))
+                .is_ok()
+        );
     }
 
     #[test]

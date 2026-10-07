@@ -1,7 +1,7 @@
 //! `SAR` (抛物线指标). Ported from KLineChart `src/extension/indicator/stopAndReverse.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// The parabolic state machine between rows: acceleration factor, extreme point, trend direction
 /// and the previous SAR. The first row initialises it, so the default is never read.

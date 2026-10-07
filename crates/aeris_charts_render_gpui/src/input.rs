@@ -19,10 +19,10 @@ use aeris_charts_engine::{
     WheelDeltaMode, WheelSample,
 };
 use gpui::{
-    point, App, BackgroundExecutor, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase,
-    Entity, EntityId, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent,
+    App, BackgroundExecutor, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
+    EntityId, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Task,
-    WeakFocusHandle, Window,
+    WeakFocusHandle, Window, point,
 };
 
 use crate::backend::{text_cap_centerer, text_measurer};
@@ -402,10 +402,11 @@ impl GpuiChartInput {
             (Some(input), Some(countdown)) => Some(input.min(countdown)),
             (input, countdown) => input.or(countdown),
         };
-        if let (Some(deadline), Some(wake)) = (deadline, &self.wake) {
-            if wake.deadline.to_bits() == deadline.to_bits() && Some(wake.view) == self.view {
-                return;
-            }
+        if let (Some(deadline), Some(wake)) = (deadline, &self.wake)
+            && wake.deadline.to_bits() == deadline.to_bits()
+            && Some(wake.view) == self.view
+        {
+            return;
         }
         // Dropping the previous wake cancels its task and the timer it owns.
         self.wake = deadline.zip(self.view).map(|(deadline, view)| {
@@ -1147,7 +1148,7 @@ mod key_tests {
 #[cfg(test)]
 mod swipe_tests {
     use super::*;
-    use gpui::{px, TouchPhase};
+    use gpui::{TouchPhase, px};
 
     fn engine() -> ChartEngine {
         let mut engine = ChartEngine::new(800.0, 400.0, 2.0);

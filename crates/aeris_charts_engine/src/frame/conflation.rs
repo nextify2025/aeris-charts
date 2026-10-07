@@ -332,10 +332,10 @@ pub(crate) fn visible_ohlc_with_values(
             continue;
         };
         let bucket = x_at(plot.index_at(row).expect("visible row index")).floor() as i64;
-        if current_bucket.is_some_and(|previous| previous != bucket) {
-            if let Some(item) = current.take() {
-                out.push(item);
-            }
+        if current_bucket.is_some_and(|previous| previous != bucket)
+            && let Some(item) = current.take()
+        {
+            out.push(item);
         }
         match current.as_mut() {
             Some(item) => {

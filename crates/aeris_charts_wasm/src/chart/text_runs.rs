@@ -11,12 +11,12 @@
 //! The cache/placement logic is pure and lives in [`crate::text_cache`]; this module is the
 //! DOM seam (offscreen canvas + `getImageData` readback) and therefore wasm-only.
 
-use aeris_charts_render::draw_list::{text_font_spec, Prim};
-use aeris_charts_render_wgpu::{LabelAtlas, TexQuadInstance, ATLAS_SIZE};
+use aeris_charts_render::draw_list::{Prim, text_font_spec};
+use aeris_charts_render_wgpu::{ATLAS_SIZE, LabelAtlas, TexQuadInstance};
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, OffscreenCanvas};
 
-use crate::text_cache::{frac_bits, left_edge, place_run, CachedRun, TextRunCache, TextRunKey};
+use crate::text_cache::{CachedRun, TextRunCache, TextRunKey, frac_bits, left_edge, place_run};
 
 enum RasterCanvas {
     Html(HtmlCanvasElement),

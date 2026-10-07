@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    axis_metrics::{AxisMetrics, AXIS_FONT_SCALE},
     AlertLineStatus, AlertPriceScale, PriceScaleSide,
+    axis_metrics::{AXIS_FONT_SCALE, AxisMetrics},
 };
 use aeris_charts_core::style::{DEFAULT_MUTED_FOREGROUND_RGB, MARKET_WARNING_RGB};
 

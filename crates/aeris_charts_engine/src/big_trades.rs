@@ -481,11 +481,11 @@ impl OrderBuilder {
         side: AggressorSide,
         bar_time: i64,
     ) {
-        if let Some(open) = self.open.as_mut() {
-            if open.continues_with(trade, side, options.grouping_window_micros) {
-                open.add(trade);
-                return;
-            }
+        if let Some(open) = self.open.as_mut()
+            && open.continues_with(trade, side, options.grouping_window_micros)
+        {
+            open.add(trade);
+            return;
         }
         if let Some(open) = self.open.take() {
             self.complete(options, open.order());
@@ -1197,9 +1197,10 @@ mod tests {
         assert_eq!(circles[0].1, sell_fill, "the largest order paints first");
         assert_eq!(circles[0].0, 18.0);
         assert_eq!(circles[1].1, buy_fill);
-        assert!(main
-            .iter()
-            .any(|primitive| { matches!(primitive, Prim::Text { text, .. } if text == "500") }));
+        assert!(
+            main.iter()
+                .any(|primitive| { matches!(primitive, Prim::Text { text, .. } if text == "500") })
+        );
         let candle_end = chart
             .frame_series_segments(0)
             .iter()
@@ -1229,10 +1230,12 @@ mod tests {
             )
             .unwrap();
         let frame = chart.build_frame();
-        assert!(!frame.panes[0]
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "500")));
+        assert!(
+            !frame.panes[0]
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "500"))
+        );
         chart
             .set_big_trades_options(
                 id,
@@ -1243,10 +1246,12 @@ mod tests {
             )
             .unwrap();
         let frame = chart.build_frame();
-        assert!(!frame.panes[0]
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Circle { .. })));
+        assert!(
+            !frame.panes[0]
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Circle { .. }))
+        );
     }
 
     #[test]

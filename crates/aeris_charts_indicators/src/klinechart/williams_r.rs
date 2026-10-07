@@ -1,7 +1,7 @@
 //! `WR` (威廉指标). Ported from KLineChart `src/extension/indicator/williamsR.ts`.
 
-use super::stepper::{fold, Out, Window};
-use super::{highest_high_lowest_low, Column};
+use super::stepper::{Out, Window, fold};
+use super::{Column, highest_high_lowest_low};
 use crate::MAX_OUTPUTS;
 
 /// Stateless: every value is a scan of the window's highs and lows.

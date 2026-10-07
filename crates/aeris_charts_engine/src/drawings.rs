@@ -35,14 +35,14 @@ pub(crate) mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{
-    closed_outline, curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry,
     DrawingBodyGeometry, DrawingGeometryOptions, FibonacciArcGeometry, FibonacciGeometry,
-    MeasureAxes, PositionGeometry, PositionZone, TimeLevelGeometry,
+    MeasureAxes, PositionGeometry, PositionZone, TimeLevelGeometry, closed_outline, curve_clip,
+    ellipse_outline, level_band_pairs, resolve_drawing_geometry,
 };
-pub(crate) use parts::{arrow_cap_triangle, cap_radius, DrawingPart, DrawingParts, PartContext};
+pub(crate) use parts::{DrawingPart, DrawingParts, PartContext, arrow_cap_triangle, cap_radius};
 pub(crate) use tools::{
-    DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement, DrawingPriceExtent,
-    DrawingStraightenMode, DrawingTextLayout, DRAWING_TOOL_SPECS,
+    DRAWING_TOOL_SPECS, DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement,
+    DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
 };
 
 /// Chart-unique drawing id (never reused within a chart; 0 is the "no drawing" sentinel).
@@ -2708,44 +2708,41 @@ impl Drawing {
         {
             return false;
         }
-        if let Some(name) = patch.name.as_ref() {
-            if name.len() > crate::MAX_DRAWING_NAME_BYTES {
-                return false;
-            }
+        if let Some(name) = patch.name.as_ref()
+            && name.len() > crate::MAX_DRAWING_NAME_BYTES
+        {
+            return false;
         }
-        if let Some(group_id) = patch.group_id.as_ref() {
-            if group_id.len() > crate::MAX_DRAWING_GROUP_BYTES {
-                return false;
-            }
+        if let Some(group_id) = patch.group_id.as_ref()
+            && group_id.len() > crate::MAX_DRAWING_GROUP_BYTES
+        {
+            return false;
         }
-        if let Some(intervals) = patch.interval_visibility.as_ref() {
-            if !intervals.validate() {
-                return false;
-            }
+        if let Some(intervals) = patch.interval_visibility.as_ref()
+            && !intervals.validate()
+        {
+            return false;
         }
-        if let Some(labels) = patch.labels.as_ref() {
-            if labels.len() > crate::MAX_DRAWING_LABELS
-                || !labels.iter().all(|label| label.validate())
-            {
-                return false;
-            }
+        if let Some(labels) = patch.labels.as_ref()
+            && (labels.len() > crate::MAX_DRAWING_LABELS
+                || !labels.iter().all(|label| label.validate()))
+        {
+            return false;
         }
-        if let Some(levels) = patch.levels.as_ref() {
-            if levels.len() > crate::MAX_DRAWING_LEVELS
-                || !levels.iter().all(|level| level.validate())
-            {
-                return false;
-            }
+        if let Some(levels) = patch.levels.as_ref()
+            && (levels.len() > crate::MAX_DRAWING_LEVELS
+                || !levels.iter().all(|level| level.validate()))
+        {
+            return false;
         }
         for (family, fan) in [(&patch.gann_fans, true), (&patch.gann_arcs, false)] {
-            if let Some(levels) = family {
-                if !matches!(
+            if let Some(levels) = family
+                && (!matches!(
                     self.kind,
                     DrawingKind::GannSquare | DrawingKind::GannSquareFixed
-                ) || !valid_gann_family(levels, fan)
-                {
-                    return false;
-                }
+                ) || !valid_gann_family(levels, fan))
+            {
+                return false;
             }
         }
         if (patch.level_reverse.is_some()
@@ -2763,10 +2760,10 @@ impl Drawing {
         {
             return false;
         }
-        if let Some(degree) = patch.wave_degree.as_deref() {
-            if !self.kind.is_elliott() || !DrawingKind::valid_wave_degree(degree) {
-                return false;
-            }
+        if let Some(degree) = patch.wave_degree.as_deref()
+            && (!self.kind.is_elliott() || !DrawingKind::valid_wave_degree(degree))
+        {
+            return false;
         }
         if (patch.screen_x.is_some() || patch.screen_y.is_some())
             && (self.kind != DrawingKind::AnchoredText
@@ -3036,15 +3033,16 @@ impl Drawing {
         {
             self.price_scale = scale;
         }
-        if let Some(css) = patch.color {
-            if Color::parse_css(&css).is_some() {
-                self.color = css;
-            }
+        if let Some(css) = patch.color
+            && Color::parse_css(&css).is_some()
+        {
+            self.color = css;
         }
-        if let Some(width) = patch.width {
-            if width.is_finite() && width > 0.0 {
-                self.width = width;
-            }
+        if let Some(width) = patch.width
+            && width.is_finite()
+            && width > 0.0
+        {
+            self.width = width;
         }
         if let Some(style) = patch.style.as_ref().and_then(parse_drawing_style) {
             self.style = style;
@@ -3079,10 +3077,11 @@ impl Drawing {
         if let Some(css) = patch.text_color {
             update_css_slot(&mut self.text_color, css);
         }
-        if let Some(size) = patch.text_size {
-            if size.is_finite() && size > 0.0 {
-                self.text_size = Some(size);
-            }
+        if let Some(size) = patch.text_size
+            && size.is_finite()
+            && size > 0.0
+        {
+            self.text_size = Some(size);
         }
         // Explicit weight wins; the legacy `text_bold` shorthand maps onto it (true → 700,
         // false → normal).
@@ -3116,10 +3115,11 @@ impl Drawing {
         if let Some(css) = patch.box_border_color {
             update_css_slot(&mut self.box_border_color, css);
         }
-        if let Some(width) = patch.box_border_width {
-            if width.is_finite() && width > 0.0 {
-                self.box_border_width = width;
-            }
+        if let Some(width) = patch.box_border_width
+            && width.is_finite()
+            && width > 0.0
+        {
+            self.box_border_width = width;
         }
         if let Some(value) = patch.position_account_size {
             self.position_account_size = value;
@@ -4222,11 +4222,7 @@ impl ChartEngine {
             return price;
         };
         let snapped = (price / tick).round() * tick;
-        if snapped.is_finite() {
-            snapped
-        } else {
-            price
-        }
+        if snapped.is_finite() { snapped } else { price }
     }
 
     /// Grid-snapped tools place anchors on the crosshair's time slot under `x` and on the price
@@ -4558,11 +4554,11 @@ impl ChartEngine {
                 out.push(self.drawing_point_px(drawing, point)?);
             }
         }
-        if drawing.kind == DrawingKind::RegressionTrend {
-            if let Some(derived) = self.regression_points(drawing) {
-                for point in derived {
-                    out.push(self.drawing_point_px(drawing, point)?);
-                }
+        if drawing.kind == DrawingKind::RegressionTrend
+            && let Some(derived) = self.regression_points(drawing)
+        {
+            for point in derived {
+                out.push(self.drawing_point_px(drawing, point)?);
             }
         }
         // A Gann fan's or fixed square's scale-ratio point, placed like an anchor (a non-positive
@@ -5440,13 +5436,13 @@ impl ChartEngine {
         let mut drawing = Drawing::new(0, kind, pane_index, points);
         drawing.set_pending_times(pending);
         // Anchored text starts at its anchor's screen position; explicit options still win.
-        if kind == DrawingKind::AnchoredText {
-            if let Some((x, y)) = drawing.points.first().and_then(|&point| {
+        if kind == DrawingKind::AnchoredText
+            && let Some((x, y)) = drawing.points.first().and_then(|&point| {
                 self.anchored_text_screen_position(pane_index, drawing.price_scale, point)
-            }) {
-                drawing.screen_x = x;
-                drawing.screen_y = y;
-            }
+            })
+        {
+            drawing.screen_x = x;
+            drawing.screen_y = y;
         }
         let mut explicit_z_order = false;
         if let Some(json) = options_json {
@@ -5763,13 +5759,13 @@ impl ChartEngine {
                         format!(
                             "drawing anchor {index} is time-only, but this chart has no ordinary time axis"
                         ),
-                    ))
+                    ));
                 }
                 (None, None) => {
                     return Err(ChartError::new(
                         ErrorCode::InvalidData,
                         format!("drawing anchor {index} needs a logical index or a time"),
-                    ))
+                    ));
                 }
             };
             if pending_time.is_some() && pending.is_empty() {
@@ -7529,9 +7525,9 @@ impl ChartEngine {
                         if (y0 - y1).abs() <= f64::EPSILON {
                             // The frame paints a band under a horizontal level as the box from
                             // that level to the prior segment's start (at least 1 px each way).
-                            let (left, top) = (x0.min(x1), y0.min(prior.0 .1));
+                            let (left, top) = (x0.min(x1), y0.min(prior.0.1));
                             let right = left + (x1 - x0).abs().max(1.0);
-                            let bottom = top + (y0 - prior.0 .1).abs().max(1.0);
+                            let bottom = top + (y0 - prior.0.1).abs().max(1.0);
                             self.band_fill_hit(
                                 drawing,
                                 &[(left, top), (right, top)],
@@ -7923,7 +7919,7 @@ impl ChartEngine {
                 // run, or the inside of its degree ring.
                 if kinds::patterns_elliott_cycles::layers_parts(drawing.kind)
                     && self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
-                        use kinds::patterns_elliott_cycles::{pattern_parts, PatternLayer};
+                        use kinds::patterns_elliott_cycles::{PatternLayer, pattern_parts};
                         pattern_parts(context, PatternLayer::Under, parts);
                         pattern_parts(context, PatternLayer::Over, parts);
                     })
@@ -8134,12 +8130,12 @@ impl ChartEngine {
                     else {
                         return;
                     };
-                    if modifiers.magnet && index != 2 {
-                        if let Some(snapped) =
+                    if modifiers.magnet
+                        && index != 2
+                        && let Some(snapped) =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
-                        {
-                            cursor_pt = snapped;
-                        }
+                    {
+                        cursor_pt = snapped;
                     }
                     let raw_price = cursor_pt.price;
                     if matches!(index, 1 | 2) {
@@ -8223,12 +8219,11 @@ impl ChartEngine {
                         };
                         cursor_pt = snapped;
                     }
-                    if modifiers.magnet {
-                        if let Some(snapped) =
+                    if modifiers.magnet
+                        && let Some(snapped) =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
-                        {
-                            cursor_pt = snapped;
-                        }
+                    {
+                        cursor_pt = snapped;
                     }
                     let Some((mx, my)) = self.drawing_to_px_for(pane, price_scale, cursor_pt)
                     else {
@@ -8308,13 +8303,12 @@ impl ChartEngine {
                         point = snapped;
                     }
                     let mut magnet_chose = false;
-                    if modifiers.magnet {
-                        if let Some(snapped) =
+                    if modifiers.magnet
+                        && let Some(snapped) =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
-                        {
-                            point = kind.spec().movement_axis.constrain_snap(point, snapped);
-                            magnet_chose = true;
-                        }
+                    {
+                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                        magnet_chose = true;
                     }
                     if modifiers.straighten && index < 2 && points.len() >= 2 {
                         // The first two anchors are the straightened segment (a channel's base line);
@@ -8417,12 +8411,12 @@ impl ChartEngine {
                     // Single-anchor kinds drag by their line, not a handle — the body drag IS
                     // the anchor drag, so the magnet applies here too (a Ctrl-dragged vertical
                     // line snaps to bar centers, a horizontal one to the nearest rendered price).
-                    if modifiers.magnet && single_anchor {
-                        if let Some(snapped) =
+                    if modifiers.magnet
+                        && single_anchor
+                        && let Some(snapped) =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
-                        {
-                            point = kind.spec().movement_axis.constrain_snap(point, snapped);
-                        }
+                    {
+                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
                     }
                     if grid {
                         let raw_price = point.price;
@@ -8456,12 +8450,11 @@ impl ChartEngine {
                     };
                     target = snapped;
                 }
-                if modifiers.magnet {
-                    if let Some(snapped) =
+                if modifiers.magnet
+                    && let Some(snapped) =
                         self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
-                    {
-                        target = kind.spec().movement_axis.constrain_snap(target, snapped);
-                    }
+                {
+                    target = kind.spec().movement_axis.constrain_snap(target, snapped);
                 }
                 let (Some(target_px), Some(drawing), Some(drag)) = (
                     self.drawing_to_px_for(pane, price_scale, target),
@@ -9010,7 +9003,7 @@ impl ChartEngine {
                 return DrawingCreationUpdate {
                     consumed: true,
                     ..DrawingCreationUpdate::default()
-                }
+                };
             }
         }
         if self.drawing_controller.pending.is_none() && !self.begin_pending_from_armed() {
@@ -9415,13 +9408,11 @@ impl ChartEngine {
         if let Some(snapped) = magnet_point {
             point = snapped;
         }
-        if modifiers.straighten {
-            if let Some(fixed) = fixed {
-                if let Some(snapped) = self.straighten_point(pane, price_scale, kind, fixed, point)
-                {
-                    point = snapped;
-                }
-            }
+        if modifiers.straighten
+            && let Some(fixed) = fixed
+            && let Some(snapped) = self.straighten_point(pane, price_scale, kind, fixed, point)
+        {
+            point = snapped;
         }
         point = self.grid_snap_point(kind, pane, price_scale, x, point, magnet_point.is_some());
         let preset_points = if matches!(
@@ -9488,13 +9479,13 @@ impl ChartEngine {
             drawing.text = text.to_string();
         }
         // Anchored text starts at its anchor's screen position.
-        if drawing.kind == DrawingKind::AnchoredText {
-            if let Some((x, y)) = drawing.points.first().and_then(|&point| {
+        if drawing.kind == DrawingKind::AnchoredText
+            && let Some((x, y)) = drawing.points.first().and_then(|&point| {
                 self.anchored_text_screen_position(drawing.pane_index, drawing.price_scale, point)
-            }) {
-                drawing.screen_x = x;
-                drawing.screen_y = y;
-            }
+            })
+        {
+            drawing.screen_x = x;
+            drawing.screen_y = y;
         }
         // A bars pattern freezes its source bars; without any it is not created, and no
         // identity is consumed.
@@ -9630,16 +9621,13 @@ impl ChartEngine {
         if let Some(snapped) = magnet_point {
             point = snapped;
         }
-        if modifiers.straighten {
-            if let Some(pending) = &self.drawing_controller.pending {
-                if let Some(&fixed) = pending.drawing.points.last() {
-                    if let Some(snapped) =
-                        self.straighten_point(pane, price_scale, pending.drawing.kind, fixed, point)
-                    {
-                        point = snapped;
-                    }
-                }
-            }
+        if modifiers.straighten
+            && let Some(pending) = &self.drawing_controller.pending
+            && let Some(&fixed) = pending.drawing.points.last()
+            && let Some(snapped) =
+                self.straighten_point(pane, price_scale, pending.drawing.kind, fixed, point)
+        {
+            point = snapped;
         }
         if let Some(kind) = self
             .drawing_controller

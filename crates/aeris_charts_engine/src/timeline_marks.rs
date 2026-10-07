@@ -684,10 +684,10 @@ impl ChartEngine {
                 return Some(interval);
             }
         }
-        if let Some((step, _)) = self.future_time_projection {
-            if step > 0 {
-                return Some(step);
-            }
+        if let Some((step, _)) = self.future_time_projection
+            && step > 0
+        {
+            return Some(step);
         }
         prevailing_interval(times, true).map(|step| step as i64)
     }
@@ -1069,10 +1069,12 @@ mod tests {
             &before,
             "a rejected snapshot changes nothing"
         );
-        assert!(serde_json::from_str::<TimelineMarksSnapshot>(
-            r#"{"marks":[{"id":"a","time":1,"group":"g","extra":1}]}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<TimelineMarksSnapshot>(
+                r#"{"marks":[{"id":"a","time":1,"group":"g","extra":1}]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

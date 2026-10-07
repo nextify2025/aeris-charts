@@ -2,7 +2,7 @@
 //! retained frame groups then reuse the slot without competing with browser-rasterized text.
 
 use aeris_charts_render::draw_list::Prim;
-use aeris_charts_render_wgpu::{LabelAtlas, TexQuadInstance, ATLAS_SIZE};
+use aeris_charts_render_wgpu::{ATLAS_SIZE, LabelAtlas, TexQuadInstance};
 use std::borrow::Cow;
 
 fn premultiplied_pixels(pixels: &[u8]) -> Cow<'_, [u8]> {

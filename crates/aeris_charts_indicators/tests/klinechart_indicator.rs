@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use aeris_charts_indicators::klinechart::{Bars, Column, Figure, Indicator, Placement, NAMES};
+use aeris_charts_indicators::klinechart::{Bars, Column, Figure, Indicator, NAMES, Placement};
 use aeris_charts_indicators::{IncrementalState, IndicatorInput};
 use serde::Deserialize;
 

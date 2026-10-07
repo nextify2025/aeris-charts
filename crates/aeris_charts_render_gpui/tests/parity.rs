@@ -25,12 +25,12 @@ use aeris_charts_engine::{
     IndicatorOutputStyle, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PositionId,
     PositionSide, SeriesKind, TradingPosition, TradingPriceScale, WorkingOrder,
 };
-use aeris_charts_render::canvas2d::{execute as canvas_execute, Canvas2d, Viewport};
+use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute as canvas_execute};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim, TextAlign};
 use aeris_charts_render_gpui::{
-    fixtures, ExecutorOptions, GpuiChartRenderer, GpuiFrameMetrics, Paint, PreparedAerisFrame,
-    SceneOp, ScenePlan,
+    ExecutorOptions, GpuiChartRenderer, GpuiFrameMetrics, Paint, PreparedAerisFrame, SceneOp,
+    ScenePlan, fixtures,
 };
 
 /// A Canvas2D target that records only what the crisp-rect subset does: the current fill style and
@@ -902,10 +902,11 @@ fn native_golden_scene_reaches_canvas_and_gpui_with_no_dropped_primitives() {
     assert!(canvas.path_fills > 0 && canvas.path_strokes > 0);
     assert_eq!(canvas.images.len(), 1);
     assert_eq!(canvas.text_runs.len(), 1);
-    assert!(plan
-        .ops
-        .iter()
-        .any(|op| matches!(op, SceneOp::Image { .. })));
+    assert!(
+        plan.ops
+            .iter()
+            .any(|op| matches!(op, SceneOp::Image { .. }))
+    );
     assert!(plan.ops.iter().any(|op| matches!(op, SceneOp::Text(_))));
     assert!(plan.ops.iter().any(|op| matches!(op, SceneOp::Mesh { .. })));
 }
@@ -1366,14 +1367,18 @@ fn error_bar_engine_frame_reaches_canvas_and_gpui_stroke_and_point_routes() {
             2,
             "DPR {dpr}: missing observation must not emit a mark"
         );
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::HLine { .. })));
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::VLine { .. })));
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::HLine { .. }))
+        );
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::VLine { .. }))
+        );
         let canvas = canvas_rects(&pane_frame.main, &pane_frame.points);
         let (_plan, metrics) = gpui_plan(&pane_frame.main, &pane_frame.points);
         assert_eq!(
@@ -1537,14 +1542,18 @@ fn category_box_plot_frame_reaches_canvas_and_gpui_without_dropped_primitives() 
             2,
             "DPR {dpr}: only complete rows emit IQR boxes"
         );
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::HLine { .. })));
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::VLine { .. })));
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::HLine { .. }))
+        );
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::VLine { .. }))
+        );
 
         let canvas = canvas_rects(&pane_frame.main, &pane_frame.points);
         let (_plan, metrics) = gpui_plan(&pane_frame.main, &pane_frame.points);

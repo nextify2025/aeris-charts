@@ -9,8 +9,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::scale::exchange_time::ExchangeTime;
 use crate::TimePointIndex;
+use crate::scale::exchange_time::ExchangeTime;
 
 /// Exact values from the reference's `TickMarkWeight` (`horz-scale-behavior-time/types.ts`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -609,9 +609,11 @@ mod tests {
 
         // tight space: only high-weight marks survive
         let tight = tm.build(4.0, 80.0).to_vec(); // max_indexes_per_mark = 20
-        assert!(tight
-            .iter()
-            .all(|m| m.weight == TickMarkWeight::Month as u8));
+        assert!(
+            tight
+                .iter()
+                .all(|m| m.weight == TickMarkWeight::Month as u8)
+        );
         // and they respect the 20-index spacing (every other month mark dropped)
         assert!(tight.windows(2).all(|w| w[1].index - w[0].index >= 20));
     }
@@ -697,7 +699,7 @@ mod tests {
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(_, &w)| w >= TickMarkWeight::Day as u8)
+            .filter(|&(_, &w)| w >= TickMarkWeight::Day as u8)
             .map(|(index, _)| index)
             .collect();
         assert_eq!(day_marks, vec![per_day]);
@@ -743,7 +745,7 @@ mod tests {
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(_, &w)| w >= TickMarkWeight::Day as u8)
+            .filter(|&(_, &w)| w >= TickMarkWeight::Day as u8)
             .map(|(index, _)| index)
             .collect();
         assert_eq!(day_marks, vec![next]);
@@ -818,7 +820,7 @@ mod tests {
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(_, &weight)| weight >= TickMarkWeight::Day as u8)
+            .filter(|&(_, &weight)| weight >= TickMarkWeight::Day as u8)
             .map(|(index, _)| index)
             .collect();
         assert_eq!(day_marks, vec![per_day]);

@@ -23,25 +23,26 @@
 
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_engine::{
-    crosshair_mode_from_u8, marker_pos, marker_shape, AggressorSide, ChartEngine, ChartFrame,
-    ChartInputEvent, DeltaTooltipOptions, DrawingKind, DrawingPoint, FinancialFrameRequest,
-    FootprintAggregationOptions, FootprintBarAggregation, FootprintImbalanceOptions,
-    FootprintSeriesOptions, FootprintTrade, Marker, PriceLineExtent, PriceScaleTarget,
-    PrimitiveAutoscaleContribution, SeriesKind, SplitDirection, TradeStudyOptions, Workspace,
-    WorkspaceLayout,
+    AggressorSide, ChartEngine, ChartFrame, ChartInputEvent, DeltaTooltipOptions, DrawingKind,
+    DrawingPoint, FinancialFrameRequest, FootprintAggregationOptions, FootprintBarAggregation,
+    FootprintImbalanceOptions, FootprintSeriesOptions, FootprintTrade, Marker, PriceLineExtent,
+    PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind, SplitDirection,
+    TradeStudyOptions, Workspace, WorkspaceLayout, crosshair_mode_from_u8, marker_pos,
+    marker_shape,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, LineStyle, Prim, TextAlign};
 use aeris_charts_render_gpui::{
-    backend::measure_text,
-    input::{cursor_style, install_text_metrics, GpuiChartInput},
     AerisViewport, GpuiChartRenderer, GpuiFrameMetrics, PreparedAerisFrame,
+    backend::measure_text,
+    input::{GpuiChartInput, cursor_style, install_text_metrics},
 };
 use gpui::{
-    canvas, div, prelude::*, px, relative, rgb, size, AnyElement, App, Bounds, Context,
-    CursorStyle, Entity, FocusHandle, Focusable, HoverListenerMode, KeyDownEvent, KeyUpEvent,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent,
-    Render, ScrollHandle, ScrollWheelEvent, Subscription, Window, WindowBounds, WindowOptions,
+    AnyElement, App, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    HoverListenerMode, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Render, ScrollHandle,
+    ScrollWheelEvent, Subscription, Window, WindowBounds, WindowOptions, canvas, div, prelude::*,
+    px, relative, rgb, size,
 };
 use gpui_platform::application;
 
@@ -890,16 +891,15 @@ impl Probe {
             self.engine.remove_series(id);
         } else {
             self.sma_id = self.engine.add_sma(0, 20);
-            if let Some(id) = self.sma_id {
-                if let Some(series) = self
+            if let Some(id) = self.sma_id
+                && let Some(series) = self
                     .engine
                     .series
                     .iter_mut()
                     .find(|series| series.id == id && !series.removed)
-                {
-                    series.line_color = Some("#ff9800".into());
-                    series.line_width = Some(2.0);
-                }
+            {
+                series.line_color = Some("#ff9800".into());
+                series.line_width = Some(2.0);
             }
         }
         self.dirty = true;
@@ -988,16 +988,15 @@ impl Probe {
             self.engine.remove_series(id);
         } else {
             self.rsi_id = self.engine.add_rsi(0, 14);
-            if let Some(id) = self.rsi_id {
-                if let Some(series) = self
+            if let Some(id) = self.rsi_id
+                && let Some(series) = self
                     .engine
                     .series
                     .iter_mut()
                     .find(|series| series.id == id && !series.removed)
-                {
-                    series.line_color = Some("#ab47bc".into());
-                    series.line_width = Some(2.0);
-                }
+            {
+                series.line_color = Some("#ab47bc".into());
+                series.line_width = Some(2.0);
             }
         }
         self.dirty = true;
@@ -1210,17 +1209,18 @@ impl Probe {
                 });
             }
         }
-        if self.fixtures.vertical_line && count > 0 {
-            if let Some(x) = device_x((count / 2) as f64) {
-                top.push(Prim::VLine {
-                    x,
-                    y0: sy,
-                    y1: sy + sh,
-                    width: 3,
-                    style: LineStyle::Solid,
-                    color: Color::rgb(0xe9, 0x1e, 0x63),
-                });
-            }
+        if self.fixtures.vertical_line
+            && count > 0
+            && let Some(x) = device_x((count / 2) as f64)
+        {
+            top.push(Prim::VLine {
+                x,
+                y0: sy,
+                y1: sy + sh,
+                width: 3,
+                style: LineStyle::Solid,
+                color: Color::rgb(0xe9, 0x1e, 0x63),
+            });
         }
         if self.fixtures.plugin_watermark {
             top.push(Prim::Text {
@@ -2865,14 +2865,13 @@ impl InteractiveDemo {
 
 impl Render for InteractiveDemo {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.focus_initialized {
-            if let Some(focus) = self
+        if !self.focus_initialized
+            && let Some(focus) = self
                 .root_chart()
                 .and_then(|chart| chart.read(cx).focus_handle.clone())
-            {
-                window.focus(&focus, cx);
-                self.focus_initialized = true;
-            }
+        {
+            window.focus(&focus, cx);
+            self.focus_initialized = true;
         }
         let chart_count = self.workspace.chart_count();
         let mut b = |label, action| self.button(label, action, cx);
@@ -3533,10 +3532,12 @@ mod tests {
             .unwrap();
         let candle_times = &probe.source_bars.times;
         assert_eq!(times.len(), candle_times.len());
-        assert!(times
-            .iter()
-            .zip(candle_times)
-            .all(|(cvd, candle)| (*cvd as f64 - candle).abs() < 1e-9));
+        assert!(
+            times
+                .iter()
+                .zip(candle_times)
+                .all(|(cvd, candle)| (*cvd as f64 - candle).abs() < 1e-9)
+        );
 
         probe.toggle_cvd();
         probe.toggle_rsi();
@@ -3675,10 +3676,12 @@ mod tests {
             ]
         );
         assert_ne!(probe.frame.panes[0].scissor, old_scissor);
-        assert!(probe
-            .axis
-            .iter()
-            .any(|prim| matches!(prim, Prim::Text { .. })));
+        assert!(
+            probe
+                .axis
+                .iter()
+                .any(|prim| matches!(prim, Prim::Text { .. }))
+        );
     }
 
     fn assert_theme(engine: &ChartEngine, theme: DemoTheme) {
@@ -3812,10 +3815,12 @@ mod tests {
         assert!(id > 0);
         let drawing = probe.engine.drawing(id as u32).unwrap();
         assert_eq!(drawing.kind, DrawingKind::DatePriceRange);
-        assert!(drawing
-            .points
-            .iter()
-            .all(|point| point.logical.fract() == 0.0));
+        assert!(
+            drawing
+                .points
+                .iter()
+                .all(|point| point.logical.fract() == 0.0)
+        );
         rebuild(&mut probe);
 
         let inside = (350.0, 300.0);
@@ -3989,12 +3994,16 @@ mod tests {
             );
         }
         let none = InputModifiers::default();
-        assert!(probe
-            .engine
-            .input_key_down(ChartKey::Backspace, none, false, 0.0));
-        assert!(probe
-            .engine
-            .input_key_down(ChartKey::Enter, none, false, 0.0));
+        assert!(
+            probe
+                .engine
+                .input_key_down(ChartKey::Backspace, none, false, 0.0)
+        );
+        assert!(
+            probe
+                .engine
+                .input_key_down(ChartKey::Enter, none, false, 0.0)
+        );
         assert_eq!(probe.engine.drawings().len(), 1);
         assert_eq!(probe.engine.drawings()[0].kind, DrawingKind::Path);
         assert_eq!(probe.engine.drawings()[0].points.len(), 2);
@@ -4232,11 +4241,13 @@ mod semantic_regressions {
         assert!(probe.engine.series[0].visible);
         assert_eq!(probe.engine.bar_spacing(), previous_bar_spacing);
         assert_eq!(probe.engine.right_offset(), previous_right_offset);
-        assert!(probe
-            .engine
-            .series
-            .iter()
-            .all(|series| series.id != state.series_id || series.removed));
+        assert!(
+            probe
+                .engine
+                .series
+                .iter()
+                .all(|series| series.id != state.series_id || series.removed)
+        );
     }
 
     #[test]
@@ -4328,13 +4339,13 @@ mod semantic_regressions {
 mod window_input_tests {
     use super::*;
     use aeris_charts_engine::{
-        pinch_zoom_scale, wheel_zoom_scale, ChartCursor, ChartKey, ChartRegion, DrawingId,
-        InputModifiers, InteractionOptions, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus,
-        TradingHitKind, TradingPriceScale, TradingSnapshot, WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
+        ChartCursor, ChartKey, ChartRegion, DrawingId, InputModifiers, InteractionOptions, OrderId,
+        OrderKind, OrderRole, OrderSide, OrderStatus, TRADING_TOOLTIP_DWELL_MS, TradingHitKind,
+        TradingPriceScale, TradingSnapshot, WorkingOrder, pinch_zoom_scale, wheel_zoom_scale,
     };
     use gpui::{
-        point, ClipboardItem, Keystroke, Modifiers, Pixels, Point, ScrollDelta, StyleRefinement,
-        TestAppContext, VisualTestContext,
+        ClipboardItem, Keystroke, Modifiers, Pixels, Point, ScrollDelta, StyleRefinement,
+        TestAppContext, VisualTestContext, point,
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -5187,9 +5198,11 @@ mod window_input_tests {
             probe
                 .engine
                 .set_visible_logical_range(last as f64 - 100.0, last as f64 + 1.0);
-            assert!(probe
-                .engine
-                .series_apply_options_json(0, r#"{"live_bar_easing_ms":500}"#));
+            assert!(
+                probe
+                    .engine
+                    .series_apply_options_json(0, r#"{"live_bar_easing_ms":500}"#)
+            );
             let open = probe.source_bars.open[last];
             let close = open.max(probe.source_bars.close[last]) + 8.0;
             assert!(probe.engine.update_series_bar(

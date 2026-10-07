@@ -227,12 +227,12 @@ mod tests {
         let mut cache: ImageCache<u32> = ImageCache::default();
         let a = cache.get_or_insert(1, |_| 10);
         let b = cache.get_or_insert(2, |_| 10);
-        let gen = cache.generation();
+        let before = cache.generation();
 
         cache.invalidate();
         assert!(cache.is_empty());
         assert_eq!(cache.used_bytes(), 0);
-        assert_eq!(cache.generation(), gen + 1);
+        assert_eq!(cache.generation(), before + 1);
 
         let mut retired = cache.drain_retired();
         retired.sort_by_key(|e| match e {

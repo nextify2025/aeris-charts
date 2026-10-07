@@ -1,8 +1,8 @@
 //! `TRIX` (三重指数平滑平均线). Ported from KLineChart
 //! `src/extension/indicator/tripleExponentiallySmoothedAverage.ts`.
 
-use super::stepper::{fold, rolling_mean_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, rolling_mean_step};
 
 /// TRIX outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

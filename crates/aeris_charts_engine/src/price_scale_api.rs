@@ -677,10 +677,10 @@ impl ChartEngine {
                 .and_then(serde_json::Value::as_f64)
                 .filter(|v| v.is_finite())
         };
-        if let Some(visible) = flag("visible") {
-            if !self.set_price_scale_visible_for(pane, target, visible) {
-                return false;
-            }
+        if let Some(visible) = flag("visible")
+            && !self.set_price_scale_visible_for(pane, target, visible)
+        {
+            return false;
         }
         let Some(scale) = self.price_scale_for_mut(pane, target) else {
             return false;

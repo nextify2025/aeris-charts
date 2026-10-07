@@ -10,7 +10,7 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{IRect, Prim, TextAlign};
 
 use crate::{
-    axis_metrics::AxisMetrics, AxisFrame, AxisLabel, AxisTextAlign, AxisTextMidpoint, ChartEngine,
+    AxisFrame, AxisLabel, AxisTextAlign, AxisTextMidpoint, ChartEngine, axis_metrics::AxisMetrics,
 };
 
 impl ChartEngine {

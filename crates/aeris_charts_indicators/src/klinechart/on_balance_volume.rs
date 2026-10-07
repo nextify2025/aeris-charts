@@ -1,7 +1,7 @@
 //! `OBV` (能量潮). Ported from KLineChart `src/extension/indicator/onBalanceVolume.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// OBV outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

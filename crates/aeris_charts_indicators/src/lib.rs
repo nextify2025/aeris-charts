@@ -1631,11 +1631,7 @@ fn cmf_at(
         flow += location * bar_volume;
         volume += bar_volume;
     }
-    if volume > 0.0 {
-        flow / volume
-    } else {
-        0.0
-    }
+    if volume > 0.0 { flow / volume } else { 0.0 }
 }
 
 /// Money flow index over a rolling window, using typical price and non-negative volume. The first
@@ -1686,11 +1682,7 @@ fn mfi_at(
         }
     }
     if negative == 0.0 {
-        if positive == 0.0 {
-            50.0
-        } else {
-            100.0
-        }
+        if positive == 0.0 { 50.0 } else { 100.0 }
     } else {
         100.0 - 100.0 / (1.0 + positive / negative)
     }
@@ -1901,22 +1893,24 @@ impl<T: Copy + Default> RecursiveHistory<T> {
         let from = from.min(n);
         // `before_tail` is the state before the last row, so it resumes a replacement of that row
         // whether or not the same rebuild also appends rows.
-        if n >= self.len && from + 1 == self.len {
-            if let Some(state) = self.before_tail {
-                if self
-                    .checkpoints
-                    .last()
-                    .is_some_and(|checkpoint| checkpoint.row >= from)
-                {
-                    Arc::make_mut(&mut self.checkpoints).retain(|checkpoint| checkpoint.row < from);
-                }
-                return (from, state);
+        if n >= self.len
+            && from + 1 == self.len
+            && let Some(state) = self.before_tail
+        {
+            if self
+                .checkpoints
+                .last()
+                .is_some_and(|checkpoint| checkpoint.row >= from)
+            {
+                Arc::make_mut(&mut self.checkpoints).retain(|checkpoint| checkpoint.row < from);
             }
+            return (from, state);
         }
-        if n >= self.len && from == self.len {
-            if let Some(state) = self.tail {
-                return (from, state);
-            }
+        if n >= self.len
+            && from == self.len
+            && let Some(state) = self.tail
+        {
+            return (from, state);
         }
         let checkpoint = self
             .checkpoints
@@ -3115,11 +3109,13 @@ fn vwap_amount_step(
             volume: Some(0.0),
         },
     );
-    if let (Some(amount), Some(volume)) = (amount, volume) {
-        if amount.is_finite() && volume.is_finite() && volume > 0.0 {
-            state.cumulative_pv += amount;
-            state.cumulative_volume += volume;
-        }
+    if let (Some(amount), Some(volume)) = (amount, volume)
+        && amount.is_finite()
+        && volume.is_finite()
+        && volume > 0.0
+    {
+        state.cumulative_pv += amount;
+        state.cumulative_volume += volume;
     }
     (state.cumulative_volume > 0.0).then(|| state.cumulative_pv / state.cumulative_volume)
 }
@@ -4297,27 +4293,27 @@ impl IncrementalState {
                     let previous = accumulator;
                     let mut value = None;
                     let mut pushed = false;
-                    if !whitespace_row(&input, row) {
-                        if let Some(rsi) = indexed_rsi_step(
+                    if !whitespace_row(&input, row)
+                        && let Some(rsi) = indexed_rsi_step(
                             &mut accumulator,
                             input.close[row],
                             *rsi_period,
                             IndicatorSeed::Sma,
-                        ) {
-                            recent.push_back(rsi);
-                            if recent.len() > window {
-                                recent.pop_front();
-                            }
-                            pushed = true;
-                            if recent.len() == window {
-                                let low = recent.iter().copied().fold(f64::INFINITY, f64::min);
-                                let high = recent.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                                value = Some(if high > low {
-                                    100.0 * (rsi - low) / (high - low)
-                                } else {
-                                    0.0
-                                });
-                            }
+                        )
+                    {
+                        recent.push_back(rsi);
+                        if recent.len() > window {
+                            recent.pop_front();
+                        }
+                        pushed = true;
+                        if recent.len() == window {
+                            let low = recent.iter().copied().fold(f64::INFINITY, f64::min);
+                            let high = recent.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            value = Some(if high > low {
+                                100.0 * (rsi - low) / (high - low)
+                            } else {
+                                0.0
+                            });
                         }
                     }
                     state.checkpoint(row, accumulator);
@@ -4447,16 +4443,17 @@ impl IncrementalState {
                 let mut before_tail = None;
                 for row in start..n {
                     let previous = accumulator;
-                    if valid && !whitespace_row(&input, row) {
-                        if let Some(point) = zigzag_step(
+                    if valid
+                        && !whitespace_row(&input, row)
+                        && let Some(point) = zigzag_step(
                             &mut accumulator,
                             row,
                             input.high[row],
                             input.low[row],
                             threshold,
-                        ) {
-                            place(&mut self.outputs[0], point);
-                        }
+                        )
+                    {
+                        place(&mut self.outputs[0], point);
                     }
                     state.checkpoint(row, accumulator);
                     if row + 1 == n {
@@ -6392,9 +6389,11 @@ mod tests {
         let lows = closes.iter().map(|value| value - 1.0).collect::<Vec<_>>();
         let values = supertrend(&highs, &lows, &closes, 2, 3.0);
         assert!(values[1].is_none());
-        assert!(values[2..]
-            .iter()
-            .all(|value| value.is_some_and(f64::is_finite)));
+        assert!(
+            values[2..]
+                .iter()
+                .all(|value| value.is_some_and(f64::is_finite))
+        );
     }
 
     #[test]
@@ -6522,16 +6521,18 @@ mod tests {
             &eastern,
         );
         assert!(pivots.iter().all(|point| point.pivot.is_none()));
-        assert!(pivot_points(
-            &times,
-            &values,
-            &values,
-            &values,
-            &values,
-            PivotKind::Standard
-        )[2]
-        .pivot
-        .is_some());
+        assert!(
+            pivot_points(
+                &times,
+                &values,
+                &values,
+                &values,
+                &values,
+                PivotKind::Standard
+            )[2]
+            .pivot
+            .is_some()
+        );
     }
 
     #[test]

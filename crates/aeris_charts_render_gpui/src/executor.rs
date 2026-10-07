@@ -13,13 +13,13 @@
 //! unobservable. The adapter therefore must *not* wrap the chart in `Window::paint_layer`: a layer
 //! forces every primitive inside it to share one order, which would flatten the chart's z-order.
 
-use aeris_charts_render::draw_list::{positive_finite_extent, LineStyle, Prim};
+use aeris_charts_render::draw_list::{LineStyle, Prim, positive_finite_extent};
 use aeris_charts_render::line::{normalized_round_rect_radii, round_rect_border};
 
 use crate::geometry::{
-    area_fill_mesh, area_fringe_gradient, band_fill_mesh, dash_spans, dashed_polyline_meshes,
-    disc_mesh, fill_polygon, irect, line_span_start, polyline_mesh, rect_frame_edges, ring_mesh,
-    round_rect_polygon, round_rect_ring_mesh, segments_mesh, Scratch,
+    Scratch, area_fill_mesh, area_fringe_gradient, band_fill_mesh, dash_spans,
+    dashed_polyline_meshes, disc_mesh, fill_polygon, irect, line_span_start, polyline_mesh,
+    rect_frame_edges, ring_mesh, round_rect_polygon, round_rect_ring_mesh, segments_mesh,
 };
 use crate::metrics::GpuiFrameMetrics;
 use crate::scene::{DeviceRect, Paint, SceneOp, ScenePlan, TextRun};
@@ -1052,11 +1052,7 @@ mod tests {
                 };
                 distance = distance.min((p[0] - a[0] - d[0] * t).hypot(p[1] - a[1] - d[1] * t));
             }
-            if inside {
-                -distance
-            } else {
-                distance
-            }
+            if inside { -distance } else { distance }
         };
         // GPUI's path shader: `alpha = saturate(0.5 - (s² - t))` for a unit distance gradient.
         let coverage = |st: [f32; 2]| (0.5 - (st[0] * st[0] - st[1])).clamp(0.0, 1.0);

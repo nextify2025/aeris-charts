@@ -452,7 +452,7 @@ pub struct ExportFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::{negotiated_axis_width, FinancialFrameRequest};
+    use super::{FinancialFrameRequest, negotiated_axis_width};
     use crate::{ChartEngine, PriceScaleSide, SeriesKind};
 
     #[test]

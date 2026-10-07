@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use aeris_charts_indicators::volume_profile::{
-    volume_profile, volume_profile_developing, ProfileBar,
+    ProfileBar, volume_profile, volume_profile_developing,
 };
 use aeris_charts_render::color::Color;
 use serde::{Deserialize, Serialize};

@@ -1,8 +1,8 @@
 //! `EMA` (指数移动平均). Ported from KLineChart
 //! `src/extension/indicator/exponentialMovingAverage.ts`.
 
-use super::stepper::{fold, seeded_ema_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, seeded_ema_step};
 use crate::MAX_OUTPUTS;
 
 /// Per period: the sum that seeds the first value and the recursion's previous value.

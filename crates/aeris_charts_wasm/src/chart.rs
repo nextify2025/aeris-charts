@@ -37,43 +37,43 @@ use text_runs::TextRunStore;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use js_sys::Float64Array;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use web_sys::CanvasRenderingContext2d;
 
 use crate::backend_policy::{
-    surface_error_action, BackendStartupFailure, BackendStatus, BackendWarningDeduplicator,
-    SurfaceErrorAction,
+    BackendStartupFailure, BackendStatus, BackendWarningDeduplicator, SurfaceErrorAction,
+    surface_error_action,
 };
-use crate::telemetry::{FrameTelemetry, FRAME_STATS_LEN};
+use crate::telemetry::{FRAME_STATS_LEN, FrameTelemetry};
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_core::model::data_validation::sanitize_ohlc;
 use aeris_charts_core::model::plot_list::MismatchDirection;
 use aeris_charts_core::options::{ChartOptions, ChartTheme};
 use aeris_charts_core::scale::price_scale_core::PriceScaleMode;
 use aeris_charts_engine::{
-    crosshair_mode_from_u8, line_style_from_u8, marker_pos, marker_shape, AccountId, AlertId,
-    AlertLine, AlertSnapshot, AxisFrame, AxisLabel, AxisLabelCorners, AxisTextAlign,
-    AxisTextMidpoint, BrushRange, BrushStyle, ChartEngine, DrawingId, DrawingKind,
+    AccountId, AlertId, AlertLine, AlertSnapshot, AxisFrame, AxisLabel, AxisLabelCorners,
+    AxisTextAlign, AxisTextMidpoint, BrushRange, BrushStyle, ChartEngine, DrawingId, DrawingKind,
     DrawingModifiers, ExecutionId, FeatureSeriesKind, InputDevice, InputModifiers,
     InstrumentMetadata, Marker, OrderId, PaneId, PositionId, PriceFormatterFn, PriceScaleId,
     PriceScaleSide, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
     TickMarkFormatterFn, TimeFormatterFn, TradingExecution, TradingPosition, TradingSnapshot,
-    TradingStyleOptions, WorkingOrder,
+    TradingStyleOptions, WorkingOrder, crosshair_mode_from_u8, line_style_from_u8, marker_pos,
+    marker_shape,
 };
 use aeris_charts_render::canvas2d::{
-    execute as execute_canvas2d, Canvas2d, Viewport as CanvasViewport,
+    Canvas2d, Viewport as CanvasViewport, execute as execute_canvas2d,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineType, Prim};
 use aeris_charts_render_wgpu::{
-    prims_to_group, render_frame, DrawGroup, FrameResources, GpuTimer, LabelAtlas, MsaaTarget,
-    QuadRenderer, TexQuadRenderer, TriRenderer, SAMPLE_COUNT,
+    DrawGroup, FrameResources, GpuTimer, LabelAtlas, MsaaTarget, QuadRenderer, SAMPLE_COUNT,
+    TexQuadRenderer, TriRenderer, prims_to_group, render_frame,
 };
 
 #[wasm_bindgen(inline_js = r#"
@@ -1064,7 +1064,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.set_alert_snapshot(snapshot))
@@ -1082,7 +1082,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.update_alert_line(line))
@@ -1123,7 +1123,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1162,7 +1162,7 @@ impl AerisChart {
                     return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                         aeris_charts_engine::ErrorCode::InvalidData,
                         error.to_string(),
-                    )))
+                    )));
                 }
             };
         trading_result_json(self.inner.borrow_mut().engine.set_host_overlay(overlay))
@@ -1189,7 +1189,7 @@ impl AerisChart {
                     return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                         aeris_charts_engine::ErrorCode::InvalidData,
                         error.to_string(),
-                    )))
+                    )));
                 }
             };
         trading_result_json(self.inner.borrow_mut().engine.set_timeline_marks(snapshot))
@@ -1261,7 +1261,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1284,7 +1284,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.update_working_order(order))
@@ -1301,7 +1301,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1324,7 +1324,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1342,7 +1342,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.apply_trading_style(options))
@@ -3467,7 +3467,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidOptions,
                     "as_of_max_staleness must be a non-negative whole number of seconds or null",
-                )))
+                )));
             }
         };
         trading_result_json(

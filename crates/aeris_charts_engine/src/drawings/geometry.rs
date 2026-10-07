@@ -10,7 +10,7 @@ use aeris_charts_render::shape::{self, EllipseArc, Point, Rect};
 use super::kinds::projection_annotations::{
     NOTE_DOT_RADIUS, NOTE_HEAD_RADIUS, NOTE_RISE, TAIL_HEIGHT, TAIL_WIDTH,
 };
-use super::{path_arrow_points, Drawing, DrawingKind, TextBox};
+use super::{Drawing, DrawingKind, TextBox, path_arrow_points};
 use crate::DrawingLevel;
 
 /// Chord tolerance of a flattened curve (ellipse, circle, arc, Bézier): device px in the frame,

@@ -12,7 +12,7 @@ pub mod scene;
 
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont};
 use aeris_charts_engine::{ChartEngine, ExportFrameRequest};
-use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
+use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{Prim, RasterImage, TextAlign};
 use std::sync::{LazyLock, Mutex};
@@ -1969,10 +1969,12 @@ mod tests {
             .unwrap();
         let image = render_engine_rgba(&mut chart, ImageExportOptions::default()).unwrap();
         let pixel = |x: usize, y: usize| &image.pixels[(y * image.width as usize + x) * 4..][..4];
-        assert!(pixel(5, 0)
-            .iter()
-            .zip([0x11_u8, 0x22, 0x33, 0xff])
-            .all(|(actual, expected)| actual.abs_diff(expected) <= 1));
+        assert!(
+            pixel(5, 0)
+                .iter()
+                .zip([0x11_u8, 0x22, 0x33, 0xff])
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1)
+        );
         assert!(pixel(5, 20)[0] > pixel(5, 0)[0]);
     }
 

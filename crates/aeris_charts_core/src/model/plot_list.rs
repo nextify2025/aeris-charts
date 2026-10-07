@@ -11,9 +11,9 @@
 
 use std::collections::HashMap;
 
+use crate::TimePointIndex;
 use crate::helpers::algorithms::{lower_bound, upper_bound};
 use crate::model::lod::{LodPyramid, LodPyramidView};
-use crate::TimePointIndex;
 
 /// `CHUNK_SIZE` in reference.
 const CHUNK_SIZE: i64 = 30;
@@ -288,19 +288,19 @@ impl<'a> PlotListView<'a> {
     }
 
     pub fn value_at(self, row: usize, plot: PlotValueIndex) -> f64 {
-        if let Some((source_row, values)) = &self.row_override {
-            if self.values.source_row(row) == *source_row {
-                return values[plot as usize];
-            }
+        if let Some((source_row, values)) = &self.row_override
+            && self.values.source_row(row) == *source_row
+        {
+            return values[plot as usize];
         }
         self.values.value_at(row, plot)
     }
 
     pub fn is_whitespace_row(self, row: usize) -> bool {
-        if let Some((source_row, values)) = &self.row_override {
-            if self.values.source_row(row) == *source_row {
-                return values.iter().all(|value| value.is_nan());
-            }
+        if let Some((source_row, values)) = &self.row_override
+            && self.values.source_row(row) == *source_row
+        {
+            return values.iter().all(|value| value.is_nan());
         }
         self.values.is_whitespace_row(row)
     }
@@ -676,10 +676,9 @@ impl PlotList {
         if let (Some(first), Some(last)) = (
             self.index_at(rows.start),
             rows.end.checked_sub(1).and_then(|row| self.index_at(row)),
-        ) {
-            if !rows.is_empty() {
-                self.invalidate_index_chunks(first, last);
-            }
+        ) && !rows.is_empty()
+        {
+            self.invalidate_index_chunks(first, last);
         }
         rows
     }

@@ -1147,9 +1147,11 @@ mod tests {
         // OHLC writes, pop, or an independent retention cap would desynchronize replay and the
         // logical sequence from the aggregator's canonical state.
         assert!(!chart.update_series_bar(0, 5.0, [1.0, 1.0, 1.0, 1.0]));
-        assert!(chart
-            .set_series_data(0, &[5.0], &[1.0], &[1.0], &[1.0], &[1.0])
-            .is_err());
+        assert!(
+            chart
+                .set_series_data(0, &[5.0], &[1.0], &[1.0], &[1.0], &[1.0])
+                .is_err()
+        );
         assert_eq!(chart.series_pop(0, 1), None);
         assert!(!chart.set_series_max_points(0, Some(2)));
 

@@ -1018,9 +1018,10 @@ mod tests {
         assert!(prims.len() <= 400 / 24 + 4, "{} prims", prims.len());
         assert!(pool.len() <= prims.len() * 2);
         let reach = PANE.inflate(2.0 + 2.0 + 24.0);
-        assert!(pool
-            .iter()
-            .all(|p| f64::from(p[0]) >= reach.left && f64::from(p[0]) <= reach.right));
+        assert!(
+            pool.iter()
+                .all(|p| f64::from(p[0]) >= reach.left && f64::from(p[0]) <= reach.right)
+        );
         let spans = x_spans(&solid_runs(&prims, &pool));
         assert!(
             spans.iter().all(|s| s.0.rem_euclid(24.0) == 0.0),
@@ -1260,13 +1261,15 @@ mod tests {
         assert_eq!(-1.0e9_f32 + 12.0, -1.0e9_f32);
         let (prims, _, warnings) = decode_in(&command("-1000000000,\"x2\":1000000000"), PANE);
         assert!(warnings.is_empty());
-        let [Prim::HLine {
-            x0,
-            x1,
-            width,
-            style,
-            ..
-        }] = prims[..]
+        let [
+            Prim::HLine {
+                x0,
+                x1,
+                width,
+                style,
+                ..
+            },
+        ] = prims[..]
         else {
             panic!("{prims:?}");
         };
@@ -1332,9 +1335,11 @@ mod tests {
             PANE,
         );
         assert!(warnings.is_empty());
-        let [Prim::VLine {
-            x, y0, y1, style, ..
-        }] = prims[..]
+        let [
+            Prim::VLine {
+                x, y0, y1, style, ..
+            },
+        ] = prims[..]
         else {
             panic!("{prims:?}");
         };

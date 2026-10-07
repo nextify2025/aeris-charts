@@ -54,10 +54,10 @@ use aeris_charts_engine::{
     PointerSample, ProfileSource, ResampleBoundary, SeriesKind, TradeStudyOptions,
 };
 use aeris_charts_native::render_prims;
-use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
+use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::Prim;
-use aeris_charts_render_wgpu::{prims_to_group, DrawGroup, TexQuadInstance};
+use aeris_charts_render_wgpu::{DrawGroup, TexQuadInstance, prims_to_group};
 
 /// Parallel `(times, open, high, low, close)` columns.
 type OhlcColumns = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
@@ -388,9 +388,11 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
             },
         ),
     ] {
-        assert!(!chart
-            .add_indicator_kind_with_input(0, input, kind, None)
-            .is_empty());
+        assert!(
+            !chart
+                .add_indicator_kind_with_input(0, input, kind, None)
+                .is_empty()
+        );
         bindings += 1;
     }
     bindings
@@ -624,9 +626,11 @@ fn composite_input_cost(rows: usize, appends: usize) -> CompositeInputCost {
             },
         ];
         for (kind, input) in kinds.into_iter().zip(inputs) {
-            assert!(!chart
-                .add_indicator_kind_with_input(0, input, kind, None)
-                .is_empty());
+            assert!(
+                !chart
+                    .add_indicator_kind_with_input(0, input, kind, None)
+                    .is_empty()
+            );
         }
         let runtime_bytes = |chart: &ChartEngine| chart.memory_usage().indicator_runtime_bytes;
         let install = runtime_bytes(&chart);
@@ -1043,7 +1047,9 @@ fn retention_trim_matrix() {
         samples.sort_by(f64::total_cmp);
         samples[samples.len() / 2]
     };
-    println!("Target D2 — retention trim of the data layer, {EVICTED} rows evicted per series (report-only):");
+    println!(
+        "Target D2 — retention trim of the data layer, {EVICTED} rows evicted per series (report-only):"
+    );
     for series in [1, 4, 8] {
         for rows in [2_500, 10_000, 28_800, 40_000] {
             let mut sequential_ms = Vec::with_capacity(RUNS);
@@ -1259,8 +1265,8 @@ fn main() -> ExitCode {
     // is a binary search over the laid-out tokens, never a walk over every mark.
     {
         use aeris_charts_engine::{
-            TimelineMark, TimelineMarkGlyph, TimelineMarkGroup, TimelineMarksSnapshot,
-            MAX_TIMELINE_MARKS,
+            MAX_TIMELINE_MARKS, TimelineMark, TimelineMarkGlyph, TimelineMarkGroup,
+            TimelineMarksSnapshot,
         };
         let stride = FRAME_BARS / MAX_TIMELINE_MARKS;
         let marks = (0..MAX_TIMELINE_MARKS)

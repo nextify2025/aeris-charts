@@ -51,6 +51,8 @@ CI、标签发布工作流和基准测试工作流使用 `cargo install wasm-pac
 
 Rust 工具链同样是确切的发布版本：`rust-toolchain.toml` 指定了它（1.99.0），每个工作流都通过其 `toolchain:` 输入安装该版本，因此新的 stable Rust 无法改变 CI 编译或 lint 所用的内容（浮动的 `stable` 曾在一棵未改动的代码树上新增了一条 Clippy lint）。当某个工作流与该文件不一致时，`bun run check:release-gates` 会失败。更换该固定版本是一次有意为之的提交，它同时更改两处，并重新运行体积和性能预算。
 
+工作区为 Rust 2024 版次与 resolver 3，根 `Cargo.toml` 声明 `rust-version = "1.99"`，每个 crate 以 `rust-version.workspace = true` 继承，因此宿主得到明确的最低 rustc 版本要求（见 [Rust 分发](../api/rust.md#rust-分发)）。`rust-version` 不得高于固定的工具链；只升级固定工具链时不必同时提高它。`cargo fmt` 按 2024 风格版次格式化（`rustfmt.toml` 不另设 `style_edition`，跟随 crate 版次）。2024 版次的 lint 也存在于条件编译代码中，因此 Clippy 必须在三种配置下以 `-D warnings` 运行：`--workspace --all-targets`、`-p aeris_charts_wasm --target wasm32-unknown-unknown`，以及 `-p aeris_charts_render_gpui --features gpui-backend --all-targets`（后者覆盖带 `required-features` 的示例 `gpui_probe`、`pixel_parity`、`gpui_pane_capture` 与 `gpui_fixture_view`）。
+
 `perf_gate` 会针对每个目标输出 PASS/FAIL，并且仅当 `AERIS_CHARTS_PERF_STRICT=1` 时（必须恰为 `1`，这与浏览器性能 spec 采用的解析方式相同；未设置或为 `0` 时仍仅作报告）才会在失败时以非零状态退出，因此上方的本地门禁命令行保留该变量以与 CI 保持一致。逐帧目标是在一个预热帧之后取单窗口均值，因此应在其他方面空闲的机器上运行该门禁：并发的构建或浏览器运行可能使一个在空闲运行下能通过的预算失败。
 
 对下文非阻塞墙钟策略的已知例外：两个 `ring-source.spec.mjs` 断言度量墙钟行为（达到的生产者速率，以及“frame cost includes a sustained 50,000 rows/s drain”所测的 8 ms 帧成本中位数），并在必需的可移植套件中运行。确定性的环形缓冲区契约（每个 Tick 零次引擎调用、每帧排空、溢出报告）无论如何都是阻塞的。

@@ -16,10 +16,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
+use crate::TimePointIndex;
 use crate::helpers::algorithms::lower_bound;
 use crate::model::lod::LodPyramid;
 use crate::model::plot_list::{PlotList, PlotListView, PlotValueIndex, PlotValues};
-use crate::TimePointIndex;
 
 /// Opaque chart-local series identity. It is deliberately not a storage position: removed
 /// identities are never reused, while their storage slots are.
@@ -502,10 +502,10 @@ impl MergedTimeMapping {
         let upper = self
             .common_indices
             .partition_point(|&(old_index, _)| (old_index as f64) < logical);
-        if let Some(&(old_index, new_index)) = self.common_indices.get(upper) {
-            if old_index as f64 == logical {
-                return new_index as f64;
-            }
+        if let Some(&(old_index, new_index)) = self.common_indices.get(upper)
+            && old_index as f64 == logical
+        {
+            return new_index as f64;
         }
         if upper == 0 {
             let (old_index, new_index) = self.common_indices[0];
@@ -3139,7 +3139,7 @@ mod tests {
         let b = dl.add_series();
         set(&mut dl, a, &[1, 2, 3, 4], &[1.0, 2.0, 3.0, 4.0]);
         set(&mut dl, b, &[1, 4], &[9.0, 9.0]); // whitespace at 2,3
-                                               // B gets a point at time 3 (an existing merged time, index 2)
+        // B gets a point at time 3 (an existing merged time, index 2)
         dl.update(b, 3, [7.0, 7.0, 7.0, 7.0]);
         assert_eq!(dl.merged_times(), &[1, 2, 3, 4]);
         assert!(dl.plot(b).contains(2)); // time 3 -> merged index 2
@@ -3418,9 +3418,11 @@ mod tests {
         let rebuilds = dl.index_rebuilds();
         dl.trim_fronts(&[(output, 10)]);
         assert_eq!(dl.index_rebuilds(), rebuilds);
-        assert!(dl.series[dl.series_slot(output).unwrap()]
-            .time_alias
-            .is_none());
+        assert!(
+            dl.series[dl.series_slot(output).unwrap()]
+                .time_alias
+                .is_none()
+        );
         assert_eq!(
             dl.series_data(output).unwrap().0,
             &dl.series_data(a).unwrap().0[2..]
@@ -4013,11 +4015,7 @@ mod tests {
         }
 
         fn below(&mut self, n: u64) -> u64 {
-            if n == 0 {
-                0
-            } else {
-                self.next() % n
-            }
+            if n == 0 { 0 } else { self.next() % n }
         }
 
         fn chance(&mut self, percent: u64) -> bool {

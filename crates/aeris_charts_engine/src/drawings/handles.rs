@@ -8,7 +8,7 @@
 //! and `kinds::drag_derived_handle` resolves what the handle drives (anchors, and tool options
 //! the drag's one history entry and cancellation restore with them).
 
-use super::{kinds, ChartEngine, Drawing, DrawingDragPart, DrawingHandleMode, DrawingPoint};
+use super::{ChartEngine, Drawing, DrawingDragPart, DrawingHandleMode, DrawingPoint, kinds};
 
 /// Painted form of a handle (sizes are the frame's shared anchor radius and border).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,9 +171,11 @@ mod tests {
         assert!(handle_set(DrawingHandleMode::None, &two).is_empty());
         let anchors = handle_set(DrawingHandleMode::Anchors, &two);
         assert_eq!(anchors.len(), 2);
-        assert!(anchors
-            .iter()
-            .all(|handle| handle.shape == HandleShape::Disc && handle.cursor == "pointer"));
+        assert!(
+            anchors
+                .iter()
+                .all(|handle| handle.shape == HandleShape::Disc && handle.cursor == "pointer")
+        );
         let path = [(0.0, 0.0), (5.0, 5.0), (9.0, 1.0)];
         let ends = handle_set(DrawingHandleMode::Endpoints, &path);
         assert_eq!(

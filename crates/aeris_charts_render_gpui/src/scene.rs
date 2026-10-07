@@ -281,15 +281,19 @@ mod tests {
     fn fully_transparent_paints_are_invisible() {
         assert!(Paint::Solid(Color::rgba(1, 2, 3, 0)).is_invisible());
         assert!(!Paint::Solid(Color::rgba(1, 2, 3, 1)).is_invisible());
-        assert!(Paint::VGradient {
-            top: Color::rgba(0, 0, 0, 0),
-            bottom: Color::rgba(9, 9, 9, 0),
-        }
-        .is_invisible());
-        assert!(!Paint::VGradient {
-            top: Color::rgba(0, 0, 0, 0),
-            bottom: Color::rgba(9, 9, 9, 5),
-        }
-        .is_invisible());
+        assert!(
+            Paint::VGradient {
+                top: Color::rgba(0, 0, 0, 0),
+                bottom: Color::rgba(9, 9, 9, 0),
+            }
+            .is_invisible()
+        );
+        assert!(
+            !Paint::VGradient {
+                top: Color::rgba(0, 0, 0, 0),
+                bottom: Color::rgba(9, 9, 9, 5),
+            }
+            .is_invisible()
+        );
     }
 }

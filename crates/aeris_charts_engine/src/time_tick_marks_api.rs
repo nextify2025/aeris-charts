@@ -9,7 +9,7 @@
 
 use aeris_charts_core::format::time_formatter::{format_tick_label_in, weight_to_tick_mark_type};
 use aeris_charts_core::model::data_validation::validate_timestamp;
-use aeris_charts_core::scale::time_tick_marks::{weight_by_time_shifted, TickMarkWeight};
+use aeris_charts_core::scale::time_tick_marks::{TickMarkWeight, weight_by_time_shifted};
 use serde::{Deserialize, Serialize};
 
 use crate::axis_metrics::AXIS_FONT_SCALE;
@@ -336,10 +336,10 @@ mod tests {
     use aeris_charts_core::scale::exchange_time::ExchangeTime;
     use aeris_charts_render::draw_list::Prim;
 
-    use super::{TimeTickMark, TimeTickMarksError, MAX_TIME_TICK_MARKS};
+    use super::{MAX_TIME_TICK_MARKS, TimeTickMark, TimeTickMarksError};
     use crate::{
-        parse_iso_date, parse_wall_clock, session_slot_times, AxisTextAlign, ChartEngine,
-        SeriesKind, SessionSlotConvention, SessionWindow, UtcOffsetSchedule,
+        AxisTextAlign, ChartEngine, SeriesKind, SessionSlotConvention, SessionWindow,
+        UtcOffsetSchedule, parse_iso_date, parse_wall_clock, session_slot_times,
     };
 
     const WIDTH: f64 = 800.0;

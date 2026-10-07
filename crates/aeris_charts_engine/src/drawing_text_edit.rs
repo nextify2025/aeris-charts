@@ -14,7 +14,7 @@
 //! accessibility and mirrors it through [`ChartEngine::set_drawing_text_edit`]; native hosts use
 //! the typing API and ask the engine to paint the caret in the canonical frame.
 
-use crate::drawings::{collapse_line_breaks, DrawingId, DrawingKind};
+use crate::drawings::{DrawingId, DrawingKind, collapse_line_breaks};
 use crate::{ChartEngine, MAX_DRAWING_TEXT_BYTES};
 
 /// Editing keys a host forwards while a drawing text session is open. Movement keys extend the
@@ -179,11 +179,11 @@ impl ChartEngine {
 
     /// A host with a native text input surface paints its own caret over the shared label.
     pub fn set_drawing_text_edit_paint_caret(&mut self, paint_caret: bool) {
-        if let Some(session) = self.drawing_text_edit.as_mut() {
-            if session.paint_caret != paint_caret {
-                session.paint_caret = paint_caret;
-                self.invalidate_frame_drawings();
-            }
+        if let Some(session) = self.drawing_text_edit.as_mut()
+            && session.paint_caret != paint_caret
+        {
+            session.paint_caret = paint_caret;
+            self.invalidate_frame_drawings();
         }
     }
 
@@ -615,8 +615,8 @@ mod tests {
         // The text bound is 64 KiB, so a click inside a long label must not measure every prefix
         // (that is quadratic work on the input thread). Prefix widths grow with the prefix, so a
         // bisection finds the nearest boundary.
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let (mut chart, id) = chart_with(DrawingKind::Text, "");
         let counter = Arc::clone(&calls);
@@ -625,8 +625,12 @@ mod tests {
             text.chars().count() as f64 * 10.0
         })));
         let long = "a".repeat(20_000);
-        assert!(chart
-            .drawing_apply_options(id, &format!(r#"{{"text":"{long}","text_h_align":"left"}}"#)));
+        assert!(
+            chart.drawing_apply_options(
+                id,
+                &format!(r#"{{"text":"{long}","text_h_align":"left"}}"#)
+            )
+        );
         chart.build_frame();
         assert!(chart.begin_drawing_text_edit(id, true));
         let (x, y, _) = chart.drawing_text_transform(id).unwrap();

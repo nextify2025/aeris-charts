@@ -7,7 +7,7 @@
 //! matching weight — advances are never derived by shrinking another size's measurement.
 
 use super::*;
-use crate::axis_metrics::{AxisMetrics, AXIS_FONT_SCALE, COUNTDOWN_FONT_SCALE};
+use crate::axis_metrics::{AXIS_FONT_SCALE, AxisMetrics, COUNTDOWN_FONT_SCALE};
 
 /// A last-value label candidate before axis overlap resolution (reference IPriceAxisView state:
 /// the source `coordinate` plus the render coordinate the overlap pass adjusts). `align`
@@ -433,10 +433,10 @@ impl ChartEngine {
         if scale.mode() == PriceScaleMode::IndexedTo100 {
             return Self::format_indexed_value(value);
         }
-        if let Some(f) = &self.price_formatter_fn {
-            if let Some(s) = f(value) {
-                return s;
-            }
+        if let Some(f) = &self.price_formatter_fn
+            && let Some(s) = f(value)
+        {
+            return s;
         }
         self.price_formatter.format(value)
     }
@@ -504,10 +504,10 @@ impl ChartEngine {
         if scale.mode() == PriceScaleMode::IndexedTo100 {
             return Self::format_indexed_value(value);
         }
-        if let Some(f) = &self.price_formatter_fn {
-            if let Some(s) = f(value) {
-                return s;
-            }
+        if let Some(f) = &self.price_formatter_fn
+            && let Some(s) = f(value)
+        {
+            return s;
         }
         self.format_with_price_format(&series.price_format, value)
             .unwrap_or_else(|| self.price_formatter.format(value))
@@ -520,10 +520,10 @@ impl ChartEngine {
         series: &crate::SeriesEntry,
         value: f64,
     ) -> String {
-        if let Some(f) = &self.price_formatter_fn {
-            if let Some(s) = f(value) {
-                return s;
-            }
+        if let Some(f) = &self.price_formatter_fn
+            && let Some(s) = f(value)
+        {
+            return s;
         }
         self.format_with_price_format(&series.price_format, value)
             .unwrap_or_else(|| self.price_formatter.format(value))
@@ -548,10 +548,10 @@ impl ChartEngine {
             return Self::format_indexed_value(value);
         }
         let primary = self.scale_formatter_source(pane_index, target);
-        if let Some(series) = primary {
-            if let Some(s) = self.format_with_price_format(&series.price_format, value) {
-                return s;
-            }
+        if let Some(series) = primary
+            && let Some(s) = self.format_with_price_format(&series.price_format, value)
+        {
+            return s;
         }
         self.format_scale_value(scale, value)
     }
@@ -1013,10 +1013,10 @@ impl ChartEngine {
             return;
         }
         let mut points = pending.drawing.points.clone();
-        if points.len() < 2 {
-            if let Some(preview) = pending.preview {
-                points.push(preview);
-            }
+        if points.len() < 2
+            && let Some(preview) = pending.preview
+        {
+            points.push(preview);
         }
         if points.len() == 2 {
             self.append_rectangle_axis_view(&pending.drawing, &points, true, true, out, measure);
@@ -1321,58 +1321,52 @@ impl ChartEngine {
         } else {
             self.options.get().right_price_scale.visible && self.axis_w > 0.0
         };
-        if axes.price() && scale_visible {
-            if let Some(scale) = self.price_scale_for(drawing.pane_index, target) {
-                let base = self.drawing_scale_base_for(drawing.pane_index, drawing.price_scale);
-                for point in &drawing.points {
-                    let Some((_, y)) =
-                        self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, *point)
-                    else {
-                        continue;
-                    };
-                    if y < pane.top || y > pane.top + pane.height {
-                        continue;
-                    }
-                    let logical_price = scale.price_to_logical_value(point.price, base);
-                    let text =
-                        self.format_tick_value(drawing.pane_index, target, scale, logical_price);
-                    let width = AxisMetrics::price_tag_width(measure(&text, false));
-                    let height = metrics.price_tag_height();
-                    let (x, align, background_x) = if left_side {
-                        (
-                            self.pane_left - AxisMetrics::PRICE_TEXT_INSET,
-                            AxisTextAlign::Right,
-                            self.pane_left - width,
-                        )
-                    } else {
-                        (
-                            self.pane_left + self.pane_w + AxisMetrics::PRICE_TEXT_INSET,
-                            AxisTextAlign::Left,
-                            self.pane_left + self.pane_w,
-                        )
-                    };
-                    out.labels.push(AxisLabel {
-                        text,
-                        x,
-                        y,
-                        color: text_color,
-                        align,
-                        midpoint: AxisTextMidpoint::Label,
-                        font_scale: AXIS_FONT_SCALE,
-                        bold: false,
-                        background: Some((
-                            background_x,
-                            y - height / 2.0,
-                            width,
-                            height,
-                            background,
-                        )),
-                        background_corners: AxisLabelCorners::for_align(align),
-                        measure_extra: 0.0,
-                        attach_group: None,
-                        border: None,
-                    });
+        if axes.price()
+            && scale_visible
+            && let Some(scale) = self.price_scale_for(drawing.pane_index, target)
+        {
+            let base = self.drawing_scale_base_for(drawing.pane_index, drawing.price_scale);
+            for point in &drawing.points {
+                let Some((_, y)) =
+                    self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, *point)
+                else {
+                    continue;
+                };
+                if y < pane.top || y > pane.top + pane.height {
+                    continue;
                 }
+                let logical_price = scale.price_to_logical_value(point.price, base);
+                let text = self.format_tick_value(drawing.pane_index, target, scale, logical_price);
+                let width = AxisMetrics::price_tag_width(measure(&text, false));
+                let height = metrics.price_tag_height();
+                let (x, align, background_x) = if left_side {
+                    (
+                        self.pane_left - AxisMetrics::PRICE_TEXT_INSET,
+                        AxisTextAlign::Right,
+                        self.pane_left - width,
+                    )
+                } else {
+                    (
+                        self.pane_left + self.pane_w + AxisMetrics::PRICE_TEXT_INSET,
+                        AxisTextAlign::Left,
+                        self.pane_left + self.pane_w,
+                    )
+                };
+                out.labels.push(AxisLabel {
+                    text,
+                    x,
+                    y,
+                    color: text_color,
+                    align,
+                    midpoint: AxisTextMidpoint::Label,
+                    font_scale: AXIS_FONT_SCALE,
+                    bold: false,
+                    background: Some((background_x, y - height / 2.0, width, height, background)),
+                    background_corners: AxisLabelCorners::for_align(align),
+                    measure_extra: 0.0,
+                    attach_group: None,
+                    border: None,
+                });
             }
         }
         if axes.date() && self.time_axis_visible {
@@ -1441,10 +1435,10 @@ impl ChartEngine {
             return;
         }
         let mut points = pending.drawing.points.clone();
-        if points.len() < 3 {
-            if let Some(preview) = pending.preview {
-                points.push(preview);
-            }
+        if points.len() < 3
+            && let Some(preview) = pending.preview
+        {
+            points.push(preview);
         }
         if points.len() == 3 {
             self.append_position_axis_view(&pending.drawing, &points, out, measure);
@@ -1781,11 +1775,11 @@ impl ChartEngine {
                         false,
                     ));
                 }
-                if series.countdown_visible {
-                    if let Some(countdown) = self.series_countdown_text(series.id) {
-                        text_width =
-                            text_width.max(countdown_text_width(&countdown, &countdown_measure));
-                    }
+                if series.countdown_visible
+                    && let Some(countdown) = self.series_countdown_text(series.id)
+                {
+                    text_width =
+                        text_width.max(countdown_text_width(&countdown, &countdown_measure));
                 }
                 for line in &series.price_lines {
                     if !line.axis_label_visible {
@@ -1809,29 +1803,27 @@ impl ChartEngine {
             if self.crosshair_mode != CrosshairMode::Hidden
                 && self.options.get().crosshair.horz_line.label_visible
                 && !scale.is_empty()
-            {
-                if let Some(series) = self.series.iter().find(|series| {
+                && let Some(series) = self.series.iter().find(|series| {
                     series.visible
                         && series.pane_index == pane_index
                         && series.price_scale_target == target
-                }) {
-                    if let Some(base) = self.series_base_value(series.id, from) {
-                        let top = scale.coordinate_to_price(1.0, base);
-                        let bottom = scale.coordinate_to_price(pane.height - 2.0, base);
-                        for sample in [
-                            top.min(bottom).floor() + 0.111_111_111_111_11,
-                            top.max(bottom).ceil() - 0.111_111_111_111_11,
-                        ] {
-                            text_width = text_width.max(measure(
-                                &self.format_series_value(
-                                    series,
-                                    scale,
-                                    scale.price_to_logical_value(sample, base),
-                                ),
-                                false,
-                            ));
-                        }
-                    }
+                })
+                && let Some(base) = self.series_base_value(series.id, from)
+            {
+                let top = scale.coordinate_to_price(1.0, base);
+                let bottom = scale.coordinate_to_price(pane.height - 2.0, base);
+                for sample in [
+                    top.min(bottom).floor() + 0.111_111_111_111_11,
+                    top.max(bottom).ceil() - 0.111_111_111_111_11,
+                ] {
+                    text_width = text_width.max(measure(
+                        &self.format_series_value(
+                            series,
+                            scale,
+                            scale.price_to_logical_value(sample, base),
+                        ),
+                        false,
+                    ));
                 }
             }
         }
@@ -2048,19 +2040,19 @@ impl ChartEngine {
                 true,
                 false,
             );
-            if order.kind == crate::OrderKind::StopLimit {
-                if let Some(stop_price) = order.stop_price {
-                    append(
-                        order.pane_index,
-                        order.price_scale.into(),
-                        stop_price,
-                        self.format_trading_price(stop_price),
-                        color,
-                        false,
-                        true,
-                        false,
-                    );
-                }
+            if order.kind == crate::OrderKind::StopLimit
+                && let Some(stop_price) = order.stop_price
+            {
+                append(
+                    order.pane_index,
+                    order.price_scale.into(),
+                    stop_price,
+                    self.format_trading_price(stop_price),
+                    color,
+                    false,
+                    true,
+                    false,
+                );
             }
         }
         for line in &self.alert_state.lines {
@@ -2822,76 +2814,73 @@ impl ChartEngine {
         let options = self.options.get();
         let metrics = self.axis_metrics();
         let ch = &options.crosshair;
-        if ch.horz_line.label_visible {
-            if let Some(pi) = self
+        if ch.horz_line.label_visible
+            && let Some(pi) = self
                 .panes
                 .iter()
                 .position(|p| y_css >= p.top && y_css <= p.top + p.height)
-            {
-                // The horizontal line has one shared media-space coordinate. Each visible scale
-                // independently maps that coordinate through its own range/mode/formatter.
-                let snap_y = self.crosshair_snap(pi, x_css, y_css, from, to).1;
-                for target in self.panes[pi].scale_targets() {
-                    let Some((side, strip_x, strip_width)) =
-                        self.price_scale_axis_geometry(pi, target)
-                    else {
-                        continue;
-                    };
-                    let Some(series) = self.scale_formatter_source(pi, target) else {
-                        continue;
-                    };
-                    let scale = pane_scale(&self.panes[pi], target);
-                    if scale.is_empty() {
-                        continue;
-                    }
-                    let Some(base_value) = self.series_base_value(series.id, from) else {
-                        continue;
-                    };
-                    let price = scale.coordinate_to_price(snap_y, base_value);
-                    let text = self.format_series_value(
-                        series,
-                        scale,
-                        scale.price_to_logical_value(price, base_value),
-                    );
-                    let width = AxisMetrics::price_tag_width(measure(&text, false));
-                    let height = metrics.crosshair_price_tag_height();
-                    let (label_x, align, background_x) = if side == PriceScaleSide::Left {
-                        (
-                            strip_x + strip_width - AxisMetrics::PRICE_TEXT_INSET,
-                            AxisTextAlign::Right,
-                            strip_x + strip_width - width,
-                        )
-                    } else {
-                        (
-                            strip_x + AxisMetrics::PRICE_TEXT_INSET,
-                            AxisTextAlign::Left,
-                            strip_x,
-                        )
-                    };
-                    let label_bg =
-                        css_color(&ch.horz_line.label_background_color, CROSSHAIR_LABEL_BG);
-                    labels.push(AxisLabel {
-                        text,
-                        x: label_x,
-                        y: snap_y,
-                        color: self.axis_label_text_color(label_bg),
-                        align,
-                        midpoint: AxisTextMidpoint::Label,
-                        font_scale: AXIS_FONT_SCALE,
-                        bold: false,
-                        background: Some((
-                            background_x,
-                            snap_y - height / 2.0,
-                            width,
-                            height,
-                            label_bg,
-                        )),
-                        background_corners: AxisLabelCorners::for_align(align),
-                        measure_extra: 0.0,
-                        attach_group: None,
-                        border: None,
-                    });
+        {
+            // The horizontal line has one shared media-space coordinate. Each visible scale
+            // independently maps that coordinate through its own range/mode/formatter.
+            let snap_y = self.crosshair_snap(pi, x_css, y_css, from, to).1;
+            for target in self.panes[pi].scale_targets() {
+                let Some((side, strip_x, strip_width)) = self.price_scale_axis_geometry(pi, target)
+                else {
+                    continue;
+                };
+                let Some(series) = self.scale_formatter_source(pi, target) else {
+                    continue;
+                };
+                let scale = pane_scale(&self.panes[pi], target);
+                if scale.is_empty() {
+                    continue;
                 }
+                let Some(base_value) = self.series_base_value(series.id, from) else {
+                    continue;
+                };
+                let price = scale.coordinate_to_price(snap_y, base_value);
+                let text = self.format_series_value(
+                    series,
+                    scale,
+                    scale.price_to_logical_value(price, base_value),
+                );
+                let width = AxisMetrics::price_tag_width(measure(&text, false));
+                let height = metrics.crosshair_price_tag_height();
+                let (label_x, align, background_x) = if side == PriceScaleSide::Left {
+                    (
+                        strip_x + strip_width - AxisMetrics::PRICE_TEXT_INSET,
+                        AxisTextAlign::Right,
+                        strip_x + strip_width - width,
+                    )
+                } else {
+                    (
+                        strip_x + AxisMetrics::PRICE_TEXT_INSET,
+                        AxisTextAlign::Left,
+                        strip_x,
+                    )
+                };
+                let label_bg = css_color(&ch.horz_line.label_background_color, CROSSHAIR_LABEL_BG);
+                labels.push(AxisLabel {
+                    text,
+                    x: label_x,
+                    y: snap_y,
+                    color: self.axis_label_text_color(label_bg),
+                    align,
+                    midpoint: AxisTextMidpoint::Label,
+                    font_scale: AXIS_FONT_SCALE,
+                    bold: false,
+                    background: Some((
+                        background_x,
+                        snap_y - height / 2.0,
+                        width,
+                        height,
+                        label_bg,
+                    )),
+                    background_corners: AxisLabelCorners::for_align(align),
+                    measure_extra: 0.0,
+                    attach_group: None,
+                    border: None,
+                });
             }
         }
         if ch.vert_line.label_visible && x_css <= self.pane_w && self.time_axis_visible {

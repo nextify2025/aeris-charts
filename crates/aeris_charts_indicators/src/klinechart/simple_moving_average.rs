@@ -2,8 +2,8 @@
 //! rolling mean (that is [`super::ma`]). Ported from KLineChart
 //! `src/extension/indicator/simpleMovingAverage.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// The running sum that seeds the first value, and the recursion's previous value.
 #[derive(Clone, Copy, Debug, Default)]

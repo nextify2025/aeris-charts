@@ -66,11 +66,7 @@ impl Hash for GeneralRowId {
 }
 
 fn normalized_number_bits(value: f64) -> u64 {
-    if value == 0.0 {
-        0
-    } else {
-        value.to_bits()
-    }
+    if value == 0.0 { 0 } else { value.to_bits() }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1305,8 +1301,12 @@ fn validate_error_channels(
     for (values, validity, name) in bounds.into_iter().take(2) {
         validate_error_bound_channel(row_count, values, validity, name)?;
     }
-    let [(x_low, x_low_valid, _), (x_high, x_high_valid, _), (y_low, y_low_valid, _), (y_high, y_high_valid, _)] =
-        bounds;
+    let [
+        (x_low, x_low_valid, _),
+        (x_high, x_high_valid, _),
+        (y_low, y_low_valid, _),
+        (y_high, y_high_valid, _),
+    ] = bounds;
     for row in 0..row_count {
         if x_low_valid.is_none_or(|validity| validity[row] != 0) && x_low[row] > x[row] {
             return Err(invalid_data(

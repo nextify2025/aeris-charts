@@ -10,9 +10,9 @@
 //! the bars, so the same chart can be rendered in KLineChart for comparison.
 
 use aeris_charts_core::model::data_layer::SeriesId;
-use aeris_charts_engine::klinechart::{Indicator, Placement, NAMES};
+use aeris_charts_engine::klinechart::{Indicator, NAMES, Placement};
 use aeris_charts_engine::{ChartEngine, ChartTheme, SeriesKind};
-use aeris_charts_native::{render_engine, TinySkiaCanvas};
+use aeris_charts_native::{TinySkiaCanvas, render_engine};
 use aeris_charts_render::canvas2d::Canvas2d;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::TextAlign;

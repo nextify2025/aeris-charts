@@ -173,7 +173,9 @@ fn a_share_hour_candles_from_ticks_open_at_each_session_window() {
     // bar and shifts the whole afternoon to 12:30/13:30/14:30.
     assert_eq!(
         local_times(&zone, &rows(&tick.chart, tick.candles)),
-        ["08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30"]
+        [
+            "08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30"
+        ]
     );
 
     tick.chart
@@ -308,7 +310,9 @@ fn a_share_minute_candles_skip_the_lunch_break_and_fold_closing_prints() {
     let candles = rows(&tick.chart, tick.candles);
     assert_eq!(
         local_times(&zone, &candles),
-        ["09:30", "10:29", "10:30", "11:29", "13:00", "14:00", "14:59"]
+        [
+            "09:30", "10:29", "10:30", "11:29", "13:00", "14:00", "14:59"
+        ]
     );
     // 11:29 and 13:00 are neighbours on the ordinal time axis: the lunch break takes no width.
     assert_eq!(
@@ -882,7 +886,9 @@ fn footprint_option_changes_keep_sessions_the_replay_clock_and_hidden_prints() {
     // prints into 11:00 and 14:30.
     assert_eq!(
         local_times(&zone, &footprint_rows[..7]),
-        ["09:30", "10:00", "10:30", "11:00", "13:00", "14:00", "14:30"]
+        [
+            "09:30", "10:00", "10:30", "11:00", "13:00", "14:00", "14:30"
+        ]
     );
     for chart in [&mut chart, &mut reference] {
         chart.set_replay_clock_micros(None).unwrap();
@@ -939,12 +945,13 @@ fn a_session_change_that_folds_a_hidden_print_into_another_session_is_refused() 
         ),
         Err(FootprintError::ProjectionTimeCollision)
     );
-    assert!(tick
-        .chart
-        .trade_stream(tick.stream)
-        .unwrap()
-        .session_grid()
-        .is_none());
+    assert!(
+        tick.chart
+            .trade_stream(tick.stream)
+            .unwrap()
+            .session_grid()
+            .is_none()
+    );
     assert_eq!(rows(&tick.chart, tick.candles), before);
     // Excluding the lunch print leaves nothing to collide.
     tick.chart

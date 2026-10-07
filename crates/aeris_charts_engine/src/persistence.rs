@@ -499,10 +499,10 @@ fn validate_indicator_style(style: &IndicatorOutputStyle) -> Result<(), &'static
         ("area top color", style.area_top_color.as_deref()),
         ("area bottom color", style.area_bottom_color.as_deref()),
     ] {
-        if let Some(color) = color {
-            if color.len() > MAX_COLOR_BYTES || Color::parse_css(color).is_none() {
-                return Err(field);
-            }
+        if let Some(color) = color
+            && (color.len() > MAX_COLOR_BYTES || Color::parse_css(color).is_none())
+        {
+            return Err(field);
         }
     }
     Ok(())
@@ -730,19 +730,18 @@ fn lacks_upstream_b8_fields(item: &DrawingV1) -> bool {
 /// becomes the disjoint channel whose second line is that level ([`fork_flat_crossing_anchors`]).
 /// A base on one bar keeps the flat top or bottom its third anchor is above or below.
 fn stored_drawing_kind(name: &str, anchors: &[DrawingAnchor]) -> Option<DrawingKind> {
-    if name == "flat_top_bottom" {
-        if let [a, b, c] = anchors {
-            if let (Some(a_logical), Some(b_logical), Some(_)) = (a.logical, b.logical, c.logical) {
-                let (low, high) = (a.price.min(b.price), a.price.max(b.price));
-                return Some(if c.price >= high {
-                    DrawingKind::FlatTopChannel
-                } else if c.price <= low || a_logical == b_logical {
-                    DrawingKind::FlatBottomChannel
-                } else {
-                    DrawingKind::DisjointChannel
-                });
-            }
-        }
+    if name == "flat_top_bottom"
+        && let [a, b, c] = anchors
+        && let (Some(a_logical), Some(b_logical), Some(_)) = (a.logical, b.logical, c.logical)
+    {
+        let (low, high) = (a.price.min(b.price), a.price.max(b.price));
+        return Some(if c.price >= high {
+            DrawingKind::FlatTopChannel
+        } else if c.price <= low || a_logical == b_logical {
+            DrawingKind::FlatBottomChannel
+        } else {
+            DrawingKind::DisjointChannel
+        });
     }
     DrawingKind::from_name(name)
 }
@@ -1059,13 +1058,12 @@ fn legacy_gann_reverse(tool_options: Option<&serde_json::Value>) -> bool {
 /// square's grows-downward corner, the reversed square's swapped prices), so it does not also
 /// reach `level_reverse` and pivot the fans and arcs on the far corner.
 fn drop_consumed_gann_reverse(kind: DrawingKind, tool_options: Option<&mut serde_json::Value>) {
-    if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
-        if let Some(gann) = tool_options
+    if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed)
+        && let Some(gann) = tool_options
             .and_then(|options| options.get_mut("gann"))
             .and_then(serde_json::Value::as_object_mut)
-        {
-            gann.remove("reverse");
-        }
+    {
+        gann.remove("reverse");
     }
 }
 
@@ -1114,18 +1112,19 @@ pub(crate) fn migrate_fork_payload_item(item: &mut crate::DrawingClipboardItem) 
     let Some(options) = item.options.as_object_mut() else {
         return;
     };
-    if item.kind == DrawingKind::AnchoredText && !options.contains_key("screen_x") {
-        if let Some(anchor) = item.points.first_mut() {
-            anchor.time = None;
-            options.insert(
-                "screen_x".to_string(),
-                serde_json::json!(anchor.logical.unwrap_or(0.5).clamp(0.0, 1.0)),
-            );
-            options.insert(
-                "screen_y".to_string(),
-                serde_json::json!(anchor.price.clamp(0.0, 1.0)),
-            );
-        }
+    if item.kind == DrawingKind::AnchoredText
+        && !options.contains_key("screen_x")
+        && let Some(anchor) = item.points.first_mut()
+    {
+        anchor.time = None;
+        options.insert(
+            "screen_x".to_string(),
+            serde_json::json!(anchor.logical.unwrap_or(0.5).clamp(0.0, 1.0)),
+        );
+        options.insert(
+            "screen_y".to_string(),
+            serde_json::json!(anchor.price.clamp(0.0, 1.0)),
+        );
     }
     if converted || fork_info_line {
         let tool_options = options
@@ -1993,10 +1992,10 @@ impl ChartEngine {
             } else {
                 None
             };
-            if pane_position.is_some() {
-                if let Some(time) = anchor_times_micros.first_mut() {
-                    *time = None;
-                }
+            if pane_position.is_some()
+                && let Some(time) = anchor_times_micros.first_mut()
+            {
+                *time = None;
             }
             total_points = total_points
                 .checked_add(anchors.len())
@@ -2766,20 +2765,18 @@ impl ChartEngine {
                 .transpose()?;
             if let (Some(amount_source), Some(amount_ref)) =
                 (amount_source, indicator.amount_source.as_ref())
-            {
-                if !matches!(indicator.kind, IndicatorKind::Vwap)
+                && (!matches!(indicator.kind, IndicatorKind::Vwap)
                     || source_refs_equal(&indicator.source, amount_ref)
                     || indicator
                         .volume_source
                         .as_ref()
                         .is_none_or(|volume| source_refs_equal(volume, amount_ref))
                     || (matches!(amount_ref, IndicatorSourceV3::Series { .. })
-                        && !source_is_scalar(self, amount_source))
-                {
-                    return Err(invalid(format!(
-                        "indicator {study} amount source must be a distinct scalar VWAP input"
-                    )));
-                }
+                        && !source_is_scalar(self, amount_source)))
+            {
+                return Err(invalid(format!(
+                    "indicator {study} amount source must be a distinct scalar VWAP input"
+                )));
             }
             let expected = incremental_output_count(&indicator.kind);
             if indicator.styles.len() != expected {
@@ -4642,12 +4639,16 @@ mod tests {
                 DrawingKind::ShortPosition,
             ]
         );
-        assert!(chart.drawings[..3]
-            .iter()
-            .all(|drawing| drawing.pane_index == 0));
-        assert!(chart.drawings[3..]
-            .iter()
-            .all(|drawing| drawing.pane_index == 1));
+        assert!(
+            chart.drawings[..3]
+                .iter()
+                .all(|drawing| drawing.pane_index == 0)
+        );
+        assert!(
+            chart.drawings[3..]
+                .iter()
+                .all(|drawing| drawing.pane_index == 1)
+        );
         assert_eq!(chart.panes[0].persistent_id(), Some(3));
         assert_eq!(chart.panes[1].persistent_id(), Some(9));
     }
@@ -5620,8 +5621,12 @@ mod tests {
             }})
         );
         // A side override is a patch of its own side: the flat band stays.
-        assert!(chart
-            .drawing_apply_options(3, r#"{"tool_options":{"channel":{"upper_deviation":1.0}}}"#));
+        assert!(
+            chart.drawing_apply_options(
+                3,
+                r#"{"tool_options":{"channel":{"upper_deviation":1.0}}}"#
+            )
+        );
         let regression = chart.drawing(3).unwrap();
         assert_eq!(regression.regression_deviations, 2.0);
         assert_eq!(
@@ -5854,9 +5859,11 @@ mod tests {
         );
         assert_eq!(andrews.levels.len(), 19);
         assert!(andrews.levels[5..].iter().all(|level| !level.visible));
-        assert!(andrews.levels[5..]
-            .windows(2)
-            .all(|pair| pair[0].value <= pair[1].value));
+        assert!(
+            andrews.levels[5..]
+                .windows(2)
+                .all(|pair| pair[0].value <= pair[1].value)
+        );
         // Stored levels convert the same way; the median takes the drawing's line style, a
         // zero level (never drawn) drops out, and a stored fill colour moves with its band.
         let fan = chart.drawing(2).unwrap();
@@ -5915,7 +5922,7 @@ mod tests {
     #[test]
     fn fork_annotations_restore_in_their_fork_form() {
         use crate::drawings::{
-            resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions,
+            DrawingBodyGeometry, DrawingGeometryOptions, resolve_drawing_geometry,
         };
         let document = fork_document(vec![
             // The fork's three-anchor projection (pivot, radius point, price point).
@@ -6340,10 +6347,12 @@ mod tests {
             serde_json::json!(["dividends", "news"])
         );
         // A chart without hidden groups writes no key (byte-stable default documents).
-        assert!(!ChartEngine::new(800.0, 500.0, 1.0)
-            .export_state_json()
-            .unwrap()
-            .contains("hidden_mark_groups"));
+        assert!(
+            !ChartEngine::new(800.0, 500.0, 1.0)
+                .export_state_json()
+                .unwrap()
+                .contains("hidden_mark_groups")
+        );
 
         // Hosts import first and set marks later: the hidden set is live before any mark.
         let mut restored = ChartEngine::new(800.0, 500.0, 1.0);

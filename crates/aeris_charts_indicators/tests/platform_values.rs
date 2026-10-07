@@ -28,7 +28,7 @@
 //! the rule has no value yet.
 
 use aeris_charts_indicators::{
-    bollinger, kdj_with_seed, macd_with, IncrementalState, IndicatorInput, IndicatorSeed, KdjSeed,
+    IncrementalState, IndicatorInput, IndicatorSeed, KdjSeed, bollinger, kdj_with_seed, macd_with,
 };
 
 const NAN: f64 = f64::NAN;

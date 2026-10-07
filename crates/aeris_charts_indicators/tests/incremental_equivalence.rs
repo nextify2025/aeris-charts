@@ -5,8 +5,8 @@
 //! must equal the same formula evaluated with the whitespace rows removed.
 
 use aeris_charts_indicators::{
-    pivot_points_by_trading_day, stochastic_rsi, zigzag, DeviationEstimator, IncrementalState,
-    IndicatorInput, IndicatorSeed, KdjSeed, PivotKind, VwapReset,
+    DeviationEstimator, IncrementalState, IndicatorInput, IndicatorSeed, KdjSeed, PivotKind,
+    VwapReset, pivot_points_by_trading_day, stochastic_rsi, zigzag,
 };
 
 fn runtimes() -> Vec<(&'static str, IncrementalState)> {
@@ -738,11 +738,7 @@ fn zigzag_tail_work_is_bounded_by_the_rows_since_the_last_confirmed_turning_poin
                 columns.low[row] = bar[2];
                 columns.close[row] = bar[3];
             }
-            if whitespace {
-                base
-            } else {
-                next
-            }
+            if whitespace { base } else { next }
         };
         for row in 0..5_000 {
             close = write(&mut columns, row, &mut rng, close);

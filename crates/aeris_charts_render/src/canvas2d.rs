@@ -14,10 +14,10 @@
 
 use crate::color::Color;
 use crate::draw_list::{
-    positive_finite_extent, segment_points, text_font_spec, IRect, LineStyle, LineType, Prim,
-    RasterImage, TextAlign,
+    IRect, LineStyle, LineType, Prim, RasterImage, TextAlign, positive_finite_extent,
+    segment_points, text_font_spec,
 };
-use crate::line::{expand_band, expand_line, LinePoint};
+use crate::line::{LinePoint, expand_band, expand_line};
 
 /// Abstract 2D drawing target: the subset of `CanvasRenderingContext2D` this executor needs.
 /// Coordinates are bitmap-space (device px), matching the IR. Concrete impls wrap web-sys or a
@@ -482,10 +482,12 @@ pub fn execute(
                 rect,
                 opacity,
             } => {
-                if image.width > 0 && image.height > 0 && *opacity > 0.0 {
-                    if let Some(rect) = crate::draw_list::snap_image_rect(*rect) {
-                        target.draw_raster_image(image, rect, opacity.clamp(0.0, 1.0));
-                    }
+                if image.width > 0
+                    && image.height > 0
+                    && *opacity > 0.0
+                    && let Some(rect) = crate::draw_list::snap_image_rect(*rect)
+                {
+                    target.draw_raster_image(image, rect, opacity.clamp(0.0, 1.0));
                 }
             }
         }

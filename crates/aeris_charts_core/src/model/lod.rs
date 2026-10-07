@@ -449,11 +449,13 @@ mod tests {
         let data = vec![f64::NAN; 256];
         let mut pyramid = LodPyramid::default();
         pyramid.rebuild(values(&data));
-        assert!(pyramid
-            .view(values(&data))
-            .rows_on_range(0..data.len(), 1)
-            .0
-            .is_empty());
+        assert!(
+            pyramid
+                .view(values(&data))
+                .rows_on_range(0..data.len(), 1)
+                .0
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Headless-engine unit tests (extracted from `lib.rs`; `super` is the crate root).
 
 use super::*;
-use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
+use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute};
 use aeris_charts_render::color::Color;
 
 #[derive(Default)]
@@ -1079,10 +1079,12 @@ fn future_time_projection_labels_empty_space_without_creating_data() {
     assert_eq!(chart.data_layer().merged_times().len(), canonical_len);
     assert_eq!(chart.time_scale.base_index(), base_index);
     assert_eq!(chart.time_scale.points_len(), canonical_len);
-    assert!(chart
-        .time_marks(1.0)
-        .iter()
-        .any(|(index, _)| *index > base_index));
+    assert!(
+        chart
+            .time_marks(1.0)
+            .iter()
+            .any(|(index, _)| *index > base_index)
+    );
 }
 
 #[test]
@@ -1152,8 +1154,12 @@ fn reset_style_to_defaults_preserves_runtime_view_and_semantic_state() {
             "countdown_visible":false
         }"##,
     ));
-    assert!(chart
-        .series_apply_price_format_json(0, r#"{"type":"price","precision":4,"min_move":0.0001}"#,));
+    assert!(
+        chart.series_apply_price_format_json(
+            0,
+            r#"{"type":"price","precision":4,"min_move":0.0001}"#,
+        )
+    );
 
     let rsi = chart.add_rsi(0, 2).expect("valid RSI");
     assert!(chart.series_apply_options_json(
@@ -1460,12 +1466,16 @@ fn left_price_scale_owns_range_axis_labels_and_pane_offset() {
         chart.series_price_scale(0),
         Some((0, PriceScaleTarget::Left))
     );
-    assert!(chart
-        .price_scale_visible_range_for(0, PriceScaleTarget::Left)
-        .is_some());
-    assert!(chart
-        .price_scale_visible_range_for(0, PriceScaleTarget::Right)
-        .is_none());
+    assert!(
+        chart
+            .price_scale_visible_range_for(0, PriceScaleTarget::Left)
+            .is_some()
+    );
+    assert!(
+        chart
+            .price_scale_visible_range_for(0, PriceScaleTarget::Right)
+            .is_none()
+    );
     assert_eq!(frame.width, 300.0);
     assert_eq!(frame.panes[0].scissor[0], 58);
     assert!(frame.panes[0].main.iter().any(|prim| matches!(
@@ -1478,14 +1488,17 @@ fn left_price_scale_owns_range_axis_labels_and_pane_offset() {
         |text, _bold| text.len() as f64 * 7.0,
         |text, _bold| text.len() as f64 * 6.0,
     );
-    assert!(axis
-        .labels
-        .iter()
-        .any(|label| label.align == AxisTextAlign::Right));
-    assert!(!axis
-        .labels
-        .iter()
-        .any(|label| label.align == AxisTextAlign::Left));
+    assert!(
+        axis.labels
+            .iter()
+            .any(|label| label.align == AxisTextAlign::Right)
+    );
+    assert!(
+        !axis
+            .labels
+            .iter()
+            .any(|label| label.align == AxisTextAlign::Left)
+    );
     let coordinate = chart.series_price_to_coordinate(0, 101.5).unwrap();
     assert!((chart.series_coordinate_to_price(0, coordinate).unwrap() - 101.5).abs() < 1e-9);
 }
@@ -1637,18 +1650,24 @@ fn crosshair_geometry_is_host_independent() {
     chart.series[0].crosshair_marker_visible = true;
     chart.crosshair = Some((200.0, 120.0));
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::VLine { .. })));
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::HLine { .. })));
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::Circle { .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::VLine { .. }))
+    );
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::HLine { .. }))
+    );
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::Circle { .. }))
+    );
 
     let mut canvas = CountingCanvas::default();
     for pane in &frame.panes {
@@ -2504,9 +2523,11 @@ fn every_indicator_engine_path_matches_full_recomputation() {
         assert_indicator_binding_matches_full(&chart, binding);
 
         assert!(chart.remove_series(0));
-        assert!(outputs
-            .iter()
-            .all(|&output| chart.series_kind(output).is_none()));
+        assert!(
+            outputs
+                .iter()
+                .all(|&output| chart.series_kind(output).is_none())
+        );
         assert!(chart.indicators.is_empty());
     }
 }
@@ -2633,10 +2654,10 @@ fn indicator_kind_json_contract_is_identical_across_every_deserialization_path()
             seed: IndicatorSeed::default()
         }
     );
-    assert!(serde_json::from_value::<IndicatorKind>(
-        serde_json::json!({ "kind": "unknown_study" })
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<IndicatorKind>(serde_json::json!({ "kind": "unknown_study" }))
+            .is_err()
+    );
 }
 
 fn indicator_reads_volume(kind: &IndicatorKind) -> bool {
@@ -2888,12 +2909,16 @@ fn aggregate_twin_charts(rows: usize, slots: usize) -> (ChartEngine, ChartEngine
     load_aggregate_source(&mut canonical, rows, slots);
     load_aggregate_source(&mut composite, rows, slots);
     for (kind, input) in kinds.into_iter().zip(aggregates) {
-        assert!(!canonical
-            .add_indicator_kind_with_input(0, IndicatorInputSource::Close, kind.clone(), None)
-            .is_empty());
-        assert!(!composite
-            .add_indicator_kind_with_input(0, input, kind, None)
-            .is_empty());
+        assert!(
+            !canonical
+                .add_indicator_kind_with_input(0, IndicatorInputSource::Close, kind.clone(), None)
+                .is_empty()
+        );
+        assert!(
+            !composite
+                .add_indicator_kind_with_input(0, input, kind, None)
+                .is_empty()
+        );
     }
     (canonical, composite)
 }
@@ -3026,9 +3051,11 @@ fn indicator_ticks_over_100k_rows_do_bounded_engine_work() {
         .unwrap();
     for kind in every_indicator_kind() {
         let weighted = indicator_reads_volume(&kind);
-        assert!(!chart
-            .add_indicator_kind(0, kind, weighted.then_some(volume))
-            .is_empty());
+        assert!(
+            !chart
+                .add_indicator_kind(0, kind, weighted.then_some(volume))
+                .is_empty()
+        );
     }
     for input in [
         IndicatorInputSource::Hl2,
@@ -3036,21 +3063,25 @@ fn indicator_ticks_over_100k_rows_do_bounded_engine_work() {
         IndicatorInputSource::Ohlc4,
         IndicatorInputSource::Hlcc4,
     ] {
-        assert!(!chart
-            .add_indicator_kind_with_input(
-                0,
-                input,
-                IndicatorKind::StochasticRsi {
-                    rsi_period: 5,
-                    stochastic_period: 5,
-                },
-                None,
-            )
-            .is_empty());
+        assert!(
+            !chart
+                .add_indicator_kind_with_input(
+                    0,
+                    input,
+                    IndicatorKind::StochasticRsi {
+                        rsi_period: 5,
+                        stochastic_period: 5,
+                    },
+                    None,
+                )
+                .is_empty()
+        );
     }
-    assert!(!chart
-        .add_indicator_kind(0, IndicatorKind::Vwap, Some(gappy_volume))
-        .is_empty());
+    assert!(
+        !chart
+            .add_indicator_kind(0, IndicatorKind::Vwap, Some(gappy_volume))
+            .is_empty()
+    );
     // Every binding's latest rebuild (formula rows plus derived input rows) stays within its
     // window, so a regression in one binding cannot hide behind the others' small ticks.
     let assert_bounded = |chart: &ChartEngine, mutation: &str| {
@@ -3161,9 +3192,11 @@ fn indicator_ticks_filling_pre_installed_session_slots_do_bounded_work() {
         .unwrap();
     for kind in every_indicator_kind() {
         let weighted = indicator_reads_volume(&kind);
-        assert!(!chart
-            .add_indicator_kind(0, kind, weighted.then_some(volume))
-            .is_empty());
+        assert!(
+            !chart
+                .add_indicator_kind(0, kind, weighted.then_some(volume))
+                .is_empty()
+        );
     }
     let rsi = chart.add_indicator_kind(
         0,
@@ -3173,16 +3206,18 @@ fn indicator_ticks_filling_pre_installed_session_slots_do_bounded_work() {
         },
         None,
     )[0];
-    assert!(!chart
-        .add_indicator_kind(
-            rsi,
-            IndicatorKind::Ema {
-                period: 4,
-                seed: IndicatorSeed::Sma
-            },
-            None
-        )
-        .is_empty());
+    assert!(
+        !chart
+            .add_indicator_kind(
+                rsi,
+                IndicatorKind::Ema {
+                    period: 4,
+                    seed: IndicatorSeed::Sma
+                },
+                None
+            )
+            .is_empty()
+    );
     let assert_bounded = |chart: &ChartEngine, mutation: &str| {
         for binding in &chart.indicators {
             assert!(
@@ -3250,19 +3285,23 @@ fn replay_study_chart(rows: usize) -> (ChartEngine, SeriesId) {
         .unwrap();
     for kind in every_indicator_kind() {
         let weighted = indicator_reads_volume(&kind);
-        assert!(!chart
-            .add_indicator_kind(0, kind, weighted.then_some(volume))
-            .is_empty());
+        assert!(
+            !chart
+                .add_indicator_kind(0, kind, weighted.then_some(volume))
+                .is_empty()
+        );
     }
-    assert!(!chart
-        .add_indicator_kind_with_sources(
-            0,
-            IndicatorInputSource::Hlc3,
-            IndicatorKind::Vwap,
-            Some(volume),
-            Some(amount),
-        )
-        .is_empty());
+    assert!(
+        !chart
+            .add_indicator_kind_with_sources(
+                0,
+                IndicatorInputSource::Hlc3,
+                IndicatorKind::Vwap,
+                Some(volume),
+                Some(amount),
+            )
+            .is_empty()
+    );
     let rsi = chart.add_indicator_kind(
         0,
         IndicatorKind::Rsi {
@@ -3271,9 +3310,11 @@ fn replay_study_chart(rows: usize) -> (ChartEngine, SeriesId) {
         },
         None,
     )[0];
-    assert!(!chart
-        .add_indicator_kind(rsi, IndicatorKind::Sma { period: 3 }, None)
-        .is_empty());
+    assert!(
+        !chart
+            .add_indicator_kind(rsi, IndicatorKind::Sma { period: 3 }, None)
+            .is_empty()
+    );
     (chart, volume)
 }
 
@@ -3638,10 +3679,11 @@ fn host_formatters_override_builtin_labels() {
         "expected at least one time tick label"
     );
     assert!(time_ticks.iter().all(|l| l.text.starts_with('T')));
-    assert!(axis
-        .labels
-        .iter()
-        .any(|l| l.midpoint == AxisTextMidpoint::StableTime && l.text == "XHAIR"));
+    assert!(
+        axis.labels
+            .iter()
+            .any(|l| l.midpoint == AxisTextMidpoint::StableTime && l.text == "XHAIR")
+    );
 
     // Clearing a formatter restores the built-in output.
     chart.set_price_formatter(None);
@@ -3970,9 +4012,11 @@ fn indicator_binding_owns_group_chrome_visibility_and_removal() {
             .is_some_and(|series| !series.visible)
     }));
     assert!(chart.remove_indicator_for_series(outputs[1]));
-    assert!(outputs
-        .iter()
-        .all(|output| chart.series_entry(*output).is_none()));
+    assert!(
+        outputs
+            .iter()
+            .all(|output| chart.series_entry(*output).is_none())
+    );
     assert!(chart.indicator_bindings().is_empty());
     assert!(!chart.has_indicator_bindings());
 
@@ -4142,9 +4186,10 @@ fn macd_outputs_are_line_line_histogram_with_four_state_colors() {
     assert_eq!(chart.series_kind(ids[1]), Some(SeriesKind::Line));
     assert_eq!(chart.series_kind(ids[2]), Some(SeriesKind::Histogram));
     // All three live in the same new oscillator pane.
-    assert!(ids
-        .iter()
-        .all(|&id| chart.series.iter().find(|s| s.id == id).unwrap().pane_index == 1));
+    assert!(
+        ids.iter()
+            .all(|&id| chart.series.iter().find(|s| s.id == id).unwrap().pane_index == 1)
+    );
     // Output slots and the packed signal period.
     assert_eq!(chart.indicator_info(ids[0]).unwrap().output_index, 0);
     assert_eq!(chart.indicator_info(ids[2]).unwrap().output_index, 2);
@@ -4459,9 +4504,10 @@ fn indicator_info_reports_lineage_and_output_slots() {
     assert_eq!(upper.output_name, "Upper");
     assert_eq!(chart.indicator_info(ids[1]).unwrap().output_name, "Basis");
     assert_eq!(chart.indicator_info(ids[2]).unwrap().output_name, "Lower");
-    assert!(ids
-        .iter()
-        .all(|&id| chart.indicator_info(id).unwrap().binding_id == ids[0]));
+    assert!(
+        ids.iter()
+            .all(|&id| chart.indicator_info(id).unwrap().binding_id == ids[0])
+    );
     assert_eq!(
         (0..3)
             .map(|i| chart.indicator_info(ids[i]).unwrap().output_index)
@@ -4564,61 +4610,83 @@ fn generic_indicator_creation_rejects_invalid_definitions_atomically() {
     let order = chart.series_order().to_vec();
     let pane_count = chart.panes.len();
 
-    assert!(chart
-        .add_indicator_kind(u32::MAX, IndicatorKind::Sma { period: 2 }, None)
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(0, IndicatorKind::Sma { period: 0 }, None)
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(
-            0,
-            IndicatorKind::Keltner {
-                period: 14,
-                multiplier: -1.0,
-            },
-            None,
-        )
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(0, IndicatorKind::AdxDmi { period: 0 }, None)
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(stale, IndicatorKind::Sma { period: 2 }, None)
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(0, IndicatorKind::Vwap, Some(u32::MAX))
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(0, IndicatorKind::Vwap, Some(stale))
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(0, IndicatorKind::Vwap, Some(candle_volume))
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(0, IndicatorKind::Vwap, Some(0))
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(
-            0,
-            IndicatorKind::VwapBands {
-                reset: VwapReset::Session,
-                standard_deviation: f64::NAN,
-                percent: 10.0,
-            },
-            None,
-        )
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind(
-            0,
-            IndicatorKind::Rsi {
-                period: 2,
-                seed: IndicatorSeed::Sma,
-            },
-            Some(0)
-        )
-        .is_empty());
+    assert!(
+        chart
+            .add_indicator_kind(u32::MAX, IndicatorKind::Sma { period: 2 }, None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(0, IndicatorKind::Sma { period: 0 }, None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(
+                0,
+                IndicatorKind::Keltner {
+                    period: 14,
+                    multiplier: -1.0,
+                },
+                None,
+            )
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(0, IndicatorKind::AdxDmi { period: 0 }, None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(stale, IndicatorKind::Sma { period: 2 }, None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(0, IndicatorKind::Vwap, Some(u32::MAX))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(0, IndicatorKind::Vwap, Some(stale))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(0, IndicatorKind::Vwap, Some(candle_volume))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(0, IndicatorKind::Vwap, Some(0))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(
+                0,
+                IndicatorKind::VwapBands {
+                    reset: VwapReset::Session,
+                    standard_deviation: f64::NAN,
+                    percent: 10.0,
+                },
+                None,
+            )
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(
+                0,
+                IndicatorKind::Rsi {
+                    period: 2,
+                    seed: IndicatorSeed::Sma,
+                },
+                Some(0)
+            )
+            .is_empty()
+    );
 
     assert_eq!(chart.series_order(), order);
     assert_eq!(chart.panes.len(), pane_count);
@@ -4686,10 +4754,12 @@ fn typed_indicator_inputs_select_ohlc_aggregates_and_rebind_incrementally() {
         chart.indicator_info(rsi).unwrap().source_input,
         IndicatorInputSource::Open
     );
-    assert!(chart
-        .indicator_bindings()
-        .iter()
-        .any(|binding| { binding.outputs.contains(&sma) && binding.source == rsi }));
+    assert!(
+        chart
+            .indicator_bindings()
+            .iter()
+            .any(|binding| { binding.outputs.contains(&sma) && binding.source == rsi })
+    );
     assert!(!chart.set_indicator_input_source(u32::MAX, IndicatorInputSource::Close));
 }
 
@@ -5215,15 +5285,17 @@ fn crosshair_label_visibility_and_background_flow_from_options() {
     );
     let price_bg = Color::rgb(0x01, 0x02, 0x03);
     let time_bg = Color::rgb(0x04, 0x05, 0x06);
-    assert!(axis
-        .labels
-        .iter()
-        .any(|l| matches!(l.background, Some((.., c)) if c == price_bg)));
-    assert!(axis
-        .labels
-        .iter()
-        .any(|l| l.midpoint == AxisTextMidpoint::StableTime
-            && matches!(l.background, Some((.., c)) if c == time_bg)));
+    assert!(
+        axis.labels
+            .iter()
+            .any(|l| matches!(l.background, Some((.., c)) if c == price_bg))
+    );
+    assert!(
+        axis.labels
+            .iter()
+            .any(|l| l.midpoint == AxisTextMidpoint::StableTime
+                && matches!(l.background, Some((.., c)) if c == time_bg))
+    );
 
     // `labelVisible: false` suppresses each label independently.
     chart
@@ -5240,14 +5312,18 @@ fn crosshair_label_visibility_and_background_flow_from_options() {
         |text, _bold| text.len() as f64 * 7.0,
         |text, _bold| text.len() as f64 * 6.0,
     );
-    assert!(!axis
-        .labels
-        .iter()
-        .any(|l| matches!(l.background, Some((.., c)) if c == price_bg)));
-    assert!(!axis
-        .labels
-        .iter()
-        .any(|l| l.midpoint == AxisTextMidpoint::StableTime));
+    assert!(
+        !axis
+            .labels
+            .iter()
+            .any(|l| matches!(l.background, Some((.., c)) if c == price_bg))
+    );
+    assert!(
+        !axis
+            .labels
+            .iter()
+            .any(|l| l.midpoint == AxisTextMidpoint::StableTime)
+    );
 }
 
 #[test]
@@ -5321,14 +5397,18 @@ fn series_color_alpha_survives_into_line_and_histogram_strokes() {
     chart.fit_content();
 
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::Polyline { color, .. } if *color == translucent)));
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::Rect { color, .. } if *color == translucent)));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::Polyline { color, .. } if *color == translucent))
+    );
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::Rect { color, .. } if *color == translucent))
+    );
 
     // And the options getter round-trips the alpha channel back through CSS.
     let options: serde_json::Value =
@@ -5976,8 +6056,10 @@ fn series_baseline_price_reports_the_pinned_or_resolved_baseline_of_baseline_ser
     chart.set_visible_logical_range(2.0, 3.0);
     assert_eq!(chart.visible_range(), Some((2, 3)));
     assert_eq!(chart.series_baseline_price(short), None);
-    assert!(chart
-        .series_apply_options_json(short, r#"{"baseline_mode": "close_before_visible_range"}"#));
+    assert!(
+        chart
+            .series_apply_options_json(short, r#"{"baseline_mode": "close_before_visible_range"}"#)
+    );
     assert_eq!(chart.series_baseline_price(short), Some(20.0));
     chart.series[1].baseline = Some(7.0);
     assert_eq!(chart.series_baseline_price(short), Some(7.0));
@@ -6165,17 +6247,19 @@ fn point_colors_follow_the_winning_row_under_dedupe() {
     );
 
     // A color channel length mismatch rejects the ingest like a column mismatch.
-    assert!(chart
-        .set_series_data_styled(
-            0,
-            &[1.0, 2.0],
-            &[1.0, 2.0],
-            &[1.0, 2.0],
-            &[1.0, 2.0],
-            &[1.0, 2.0],
-            [Some(vec![1]), None, None],
-        )
-        .is_err());
+    assert!(
+        chart
+            .set_series_data_styled(
+                0,
+                &[1.0, 2.0],
+                &[1.0, 2.0],
+                &[1.0, 2.0],
+                &[1.0, 2.0],
+                &[1.0, 2.0],
+                [Some(vec![1]), None, None],
+            )
+            .is_err()
+    );
 }
 
 // --- per-series price_format (reference PriceFormat) ---
@@ -6743,8 +6827,12 @@ fn series_format_price_uses_the_resolved_price_format() {
         Some("12.35")
     );
     // per-series precision
-    assert!(chart
-        .series_apply_price_format_json(0, r#"{"type":"price","precision":4,"min_move":0.0001}"#));
+    assert!(
+        chart.series_apply_price_format_json(
+            0,
+            r#"{"type":"price","precision":4,"min_move":0.0001}"#
+        )
+    );
     assert_eq!(
         chart.series_format_price(0, 12.345).as_deref(),
         Some("12.3450")
@@ -6801,10 +6889,12 @@ fn crosshair_position_set_reject_and_clear() {
     // a following frame draws it: set again and check the crosshair prims exist
     assert!(chart.set_crosshair_position(102.0, 3.0, 0));
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::VLine { .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, aeris_charts_render::draw_list::Prim::VLine { .. }))
+    );
 }
 
 // ---- locale / dateFormat ----
@@ -7556,11 +7646,13 @@ fn heikin_ashi_easing_carries_the_previous_row_across_whitespace() {
     assert_eq!(drawn[0], (first[0] + first[3]) / 2.0, "row 1 is whitespace");
     let raw = displayed(&chart, 0);
     assert_eq!(drawn[3], (raw[0] + raw[1] + raw[2] + raw[3]) / 4.0);
-    assert!(chart
-        .heikin_ashi_row(0, 1)
-        .unwrap()
-        .iter()
-        .all(|v| v.is_nan()));
+    assert!(
+        chart
+            .heikin_ashi_row(0, 1)
+            .unwrap()
+            .iter()
+            .all(|v| v.is_nan())
+    );
 }
 
 #[test]
@@ -7876,10 +7968,11 @@ fn removing_series_zero_falls_back_to_the_first_live_series() {
         |t, _bold| t.len() as f64 * 7.0,
         |t, _bold| t.len() as f64 * 6.0,
     );
-    assert!(axis
-        .labels
-        .iter()
-        .any(|l| l.background.is_some() && l.text == "7.00"));
+    assert!(
+        axis.labels
+            .iter()
+            .any(|l| l.background.is_some() && l.text == "7.00")
+    );
 }
 
 #[test]
@@ -8032,10 +8125,12 @@ fn unparseable_verbatim_colors_fall_back_at_render_time() {
         aeris_charts_core::style::DEFAULT_MARKET_UP_RGB.2,
     );
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::Rect { color, .. } if *color == up)));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::Rect { color, .. } if *color == up))
+    );
     // but options() still returns the applied string verbatim
     let options: serde_json::Value =
         serde_json::from_str(&chart.series_options_json(0).unwrap()).unwrap();
@@ -8673,11 +8768,13 @@ fn empty_named_scales_survive_automatic_pane_cleanup() {
         chart.price_scale_target_for_id(0, "host-owned"),
         Some(named)
     );
-    assert!(chart
-        .price_scales(0)
-        .unwrap()
-        .iter()
-        .any(|info| { info.id == "host-owned" && info.series_ids.is_empty() }));
+    assert!(
+        chart
+            .price_scales(0)
+            .unwrap()
+            .iter()
+            .any(|info| { info.id == "host-owned" && info.series_ids.is_empty() })
+    );
 }
 
 #[test]
@@ -8897,9 +8994,11 @@ fn price_scale_apply_options_json_round_trip_and_chart_group_routing() {
     assert_eq!(defaults["entire_text_only"], false);
     assert_eq!(defaults["minimum_width"], 0.0);
     assert_eq!(defaults["text_color"], serde_json::Value::Null);
-    assert!(chart
-        .price_scale_options_json(9, PriceScaleTarget::Right)
-        .is_none());
+    assert!(
+        chart
+            .price_scale_options_json(9, PriceScaleTarget::Right)
+            .is_none()
+    );
     assert!(!chart.price_scale_apply_options_json(
         9,
         PriceScaleTarget::Right,
@@ -9054,10 +9153,12 @@ fn background_vertical_gradient_emits_a_per_pane_prim_solid_emits_none() {
     // Solid background (the default): no Background prim — the backends' clear color
     // covers it.
     let frame = chart.build_frame();
-    assert!(!frame.panes[0]
-        .under
-        .iter()
-        .any(|p| matches!(p, Prim::Background { .. })));
+    assert!(
+        !frame.panes[0]
+            .under
+            .iter()
+            .any(|p| matches!(p, Prim::Background { .. }))
+    );
 
     // reference VerticalGradient: one prim per pane spanning that pane's full bitmap rect,
     // first in the under layer (behind the grid).
@@ -9092,10 +9193,11 @@ fn background_vertical_gradient_emits_a_per_pane_prim_solid_emits_none() {
         .apply_options(r##"{"layout":{"background":{"type":"solid","color":"#ffffff"}}}"##)
         .unwrap();
     let frame = chart.build_frame();
-    assert!(!frame.panes.iter().any(|pane| pane
-        .under
-        .iter()
-        .any(|p| matches!(p, Prim::Background { .. }))));
+    assert!(!frame.panes.iter().any(|pane| {
+        pane.under
+            .iter()
+            .any(|p| matches!(p, Prim::Background { .. }))
+    }));
 }
 
 #[test]
@@ -10974,7 +11076,7 @@ fn kdj_seed_is_an_explicit_parameter_with_the_textbook_default() {
 
 #[test]
 fn china_kdj_starts_at_the_first_loaded_bar_through_streaming_trims_and_corrections() {
-    use aeris_charts_indicators::{kdj_with_seed, IndicatorConvention, KdjSeed};
+    use aeris_charts_indicators::{IndicatorConvention, KdjSeed, kdj_with_seed};
     let source = WhitespaceSource::new(64, &[]);
     let bar = |row: usize| {
         [
@@ -11152,33 +11254,39 @@ fn amount_weighted_vwap_divides_turnover_by_volume_and_validates_its_inputs() {
         )
         .unwrap();
 
-    assert!(chart
-        .add_indicator_kind_with_sources(
-            0,
-            IndicatorInputSource::Close,
-            IndicatorKind::Vwap,
-            None,
-            Some(amount),
-        )
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind_with_sources(
-            0,
-            IndicatorInputSource::Close,
-            IndicatorKind::Vwap,
-            Some(volume),
-            Some(volume),
-        )
-        .is_empty());
-    assert!(chart
-        .add_indicator_kind_with_sources(
-            0,
-            IndicatorInputSource::Close,
-            IndicatorKind::Obv,
-            Some(volume),
-            Some(amount),
-        )
-        .is_empty());
+    assert!(
+        chart
+            .add_indicator_kind_with_sources(
+                0,
+                IndicatorInputSource::Close,
+                IndicatorKind::Vwap,
+                None,
+                Some(amount),
+            )
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind_with_sources(
+                0,
+                IndicatorInputSource::Close,
+                IndicatorKind::Vwap,
+                Some(volume),
+                Some(volume),
+            )
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind_with_sources(
+                0,
+                IndicatorInputSource::Close,
+                IndicatorKind::Obv,
+                Some(volume),
+                Some(amount),
+            )
+            .is_empty()
+    );
 
     let vwap = chart.add_vwap_with_amount(0, volume, amount).unwrap();
     let values = chart.data.series_data(vwap).unwrap().1[3].to_vec();

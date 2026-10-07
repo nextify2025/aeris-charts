@@ -355,16 +355,16 @@ impl ChartEngine {
             .get("min_move")
             .or_else(|| patch.get("minMove"))
             .and_then(serde_json::Value::as_f64)
+            && min_move.is_finite()
+            && min_move > 0.0
         {
-            if min_move.is_finite() && min_move > 0.0 {
-                s.price_format.min_move = min_move;
-                // reference `precisionByMinMove` (chart-api.ts `patchPriceFormat`): a built-in
-                // format that names `min_move` without `precision` derives its decimals from it,
-                // so `{type:"price", min_move:0.0001}` labels with 4 decimals.
-                if precision.is_none() && kind != PriceFormatKind::Custom {
-                    s.price_format.precision =
-                        aeris_charts_core::format::price_formatter::precision_by_min_move(min_move);
-                }
+            s.price_format.min_move = min_move;
+            // reference `precisionByMinMove` (chart-api.ts `patchPriceFormat`): a built-in
+            // format that names `min_move` without `precision` derives its decimals from it,
+            // so `{type:"price", min_move:0.0001}` labels with 4 decimals.
+            if precision.is_none() && kind != PriceFormatKind::Custom {
+                s.price_format.precision =
+                    aeris_charts_core::format::price_formatter::precision_by_min_move(min_move);
             }
         }
         if let Some(tick_ladder) = tick_ladder {
@@ -971,10 +971,10 @@ impl ChartEngine {
         if let Some(s) = self.format_with_price_format(&series.price_format, value) {
             return s;
         }
-        if let Some(f) = &self.price_formatter_fn {
-            if let Some(s) = f(value) {
-                return s;
-            }
+        if let Some(f) = &self.price_formatter_fn
+            && let Some(s) = f(value)
+        {
+            return s;
         }
         self.price_formatter.format(value)
     }

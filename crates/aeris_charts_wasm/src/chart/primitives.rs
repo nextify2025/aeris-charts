@@ -240,17 +240,14 @@ impl ChartInner {
                 continue;
             };
 
-            if let Ok(hook) = js_sys::Reflect::get(&obj, &"update_all_views".into()) {
-                if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                    if let Err(error) = hook.call0(&obj) {
-                        web_sys::console::warn_1(
-                            &format!(
-                                "aeris_charts: pane primitive `update_all_views` threw — {error:?}"
-                            )
-                            .into(),
-                        );
-                    }
-                }
+            if let Ok(hook) = js_sys::Reflect::get(&obj, &"update_all_views".into())
+                && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+                && let Err(error) = hook.call0(&obj)
+            {
+                web_sys::console::warn_1(
+                    &format!("aeris_charts: pane primitive `update_all_views` threw — {error:?}")
+                        .into(),
+                );
             }
 
             let views = js_sys::Reflect::get(&obj, &"pane_views".into())
@@ -505,17 +502,14 @@ impl ChartInner {
             let base = visible_from
                 .and_then(|from| self.series_scale_base_value(series_id as SeriesId, from));
 
-            if let Ok(hook) = js_sys::Reflect::get(&obj, &"update_all_views".into()) {
-                if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                    if let Err(error) = hook.call0(&obj) {
-                        web_sys::console::warn_1(
-                            &format!(
-                                "aeris_charts: series primitive `update_all_views` threw — {error:?}"
-                            )
-                            .into(),
-                        );
-                    }
-                }
+            if let Ok(hook) = js_sys::Reflect::get(&obj, &"update_all_views".into())
+                && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+                && let Err(error) = hook.call0(&obj)
+            {
+                web_sys::console::warn_1(
+                    &format!("aeris_charts: series primitive `update_all_views` threw — {error:?}")
+                        .into(),
+                );
             }
 
             let views = js_sys::Reflect::get(&obj, &"pane_views".into())

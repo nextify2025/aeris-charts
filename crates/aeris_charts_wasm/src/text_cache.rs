@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(p.base_y, 38); // floor(50.6 - 10) - 2
         assert_eq!(p.w, 35); // ceil(100.4 + 29) + 2 - 97 = 132 - 97
         assert_eq!(p.h, 17); // ceil(50.6 + 2) + 2 - 38 = 55 - 38
-                             // The in-raster draw position keeps the anchor's fractional phase exactly.
+        // The in-raster draw position keeps the anchor's fractional phase exactly.
         assert!((p.draw_x - 3.4).abs() < 1e-4);
         assert!((p.draw_y - 12.6).abs() < 1e-4);
     }

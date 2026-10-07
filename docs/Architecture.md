@@ -44,7 +44,7 @@ GPUI | WebGPU | Canvas2D | 原生 tiny-skia
 | [`aeris_charts_native`](../crates/aeris_charts_native/Cargo.toml) | tiny-skia 渲染、原生图像导出、golden 与 release 性能门禁 | [原生执行](architecture/rendering/backends.md#原生渲染与图像导出) |
 | [`packages/charts`](../packages/charts/package.json) | TypeScript 句柄、DOM 生命周期、平台效果、可选 React 适配器 | [宿主边界](architecture/hosts/browser.md)、[公共 API](api/README.md) |
 
-所有 Rust crate 都是 `publish = false`，宿主通过固定 Git 修订或路径依赖使用。浏览器包 `@aeristerminal/aeris-charts` 是唯一发布的产物。GPUI 执行器当前固定 `gpui-pre =0.3.7`，宿主必须使用同一包与版本；历史升级说明见 [Rust 接入](api/rust.md)。CI 另以 gpui-fast 构建并测试该执行器，作为证据而非发布门禁（见 [gpui-fast 证据线](development/validation.md#gpui-fast-证据线)）。
+所有 Rust crate 都是 `publish = false`，宿主通过固定 Git 修订或路径依赖使用。工作区采用 Rust 2024 版次与 resolver 3，每个 crate 都继承工作区的 `rust-version = "1.99"`，因此宿主需要 rustc 1.99 或更高版本（见 [Rust 分发](api/rust.md#rust-分发)）。浏览器包 `@aeristerminal/aeris-charts` 是唯一发布的产物。GPUI 执行器当前固定 `gpui-pre =0.3.7`，宿主必须使用同一包与版本；历史升级说明见 [Rust 接入](api/rust.md)。CI 另以 gpui-fast 构建并测试该执行器，作为证据而非发布门禁（见 [gpui-fast 证据线](development/validation.md#gpui-fast-证据线)）。
 
 ## 依赖方向
 

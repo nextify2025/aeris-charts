@@ -728,9 +728,10 @@ mod tests {
         // A strip crossing the whole pane diagonally and far beyond it.
         let strip = [(-50.0, -10.0), (150.0, 30.0), (150.0, 60.0), (-50.0, 20.0)];
         clip_polygon_to_rect(&strip, PANE, &mut out);
-        assert!(out
-            .iter()
-            .all(|&(x, y)| (0.0..=100.0).contains(&x) && (0.0..=50.0).contains(&y)));
+        assert!(
+            out.iter()
+                .all(|&(x, y)| (0.0..=100.0).contains(&x) && (0.0..=50.0).contains(&y))
+        );
         for y in 0..50 {
             for x in 0..100 {
                 let point = (x as f64 + 0.37, y as f64 + 0.41);
@@ -776,9 +777,10 @@ mod tests {
         assert_eq!(parts[0].len(), 2);
         assert!((parts[0][0].0 - 0.0).abs() < 1e-3 && (parts[0][1].0 - 100.0).abs() < 1e-3);
         for part in clipped_parts(&[(-1e300, 25.0), (1e300, -25.0)], 12.0) {
-            assert!(part
-                .iter()
-                .all(|&(x, y)| (-12.0..=112.0).contains(&x) && (-12.0..=62.0).contains(&y)));
+            assert!(
+                part.iter()
+                    .all(|&(x, y)| (-12.0..=112.0).contains(&x) && (-12.0..=62.0).contains(&y))
+            );
         }
         let parts = clipped_parts(&[(-1e7 - 0.5, 25.0), (1e7, 25.0)], 12.0);
         assert_eq!(parts.len(), 1);
@@ -801,7 +803,7 @@ mod tests {
 
     #[test]
     fn polyline_clipping_keeps_the_dash_phase_inside_the_rect() {
-        use crate::line::{dash_split, LinePoint};
+        use crate::line::{LinePoint, dash_split};
         let pattern = [6.0, 6.0];
         // In, out below the rectangle, back in, and out through the right edge.
         let polyline = [
@@ -1252,7 +1254,7 @@ pub fn nonzero_ribbon_contours(points: &[Point], ends: &[usize], out: &mut Vec<P
                 let right = edge;
                 let rung = |y: f64| ((edges[left].x_at(y), y), (edges[right].x_at(y), y));
                 let (top_rung, bottom_rung) = (rung(top), rung(bottom));
-                if top_rung.1 .0 <= top_rung.0 .0 && bottom_rung.1 .0 <= bottom_rung.0 .0 {
+                if top_rung.1.0 <= top_rung.0.0 && bottom_rung.1.0 <= bottom_rung.0.0 {
                     // Coincident edges (collinear spikes) enclose no area.
                     continue;
                 }
@@ -1532,10 +1534,10 @@ pub fn tube_ribbon(
             .is_some_and(|bounds| bounds.inflate(radius + tolerance).intersects(&clip))
     };
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    if let [only] = points {
-        if reaches(&[*only], tolerance) {
-            runs.push((0, 1));
-        }
+    if let [only] = points
+        && reaches(&[*only], tolerance)
+    {
+        runs.push((0, 1));
     }
     for (index, segment) in points.windows(2).enumerate() {
         if !reaches(segment, tolerance) {
@@ -2023,9 +2025,10 @@ mod tube_tests {
         let mut disc = Vec::new();
         tube_outline(&[(5.0, 5.0), (5.0, 5.0)], 4.0, 0.05, &mut disc);
         assert!(disc.len() > 8);
-        assert!(disc
-            .iter()
-            .all(|point| ((point.0 - 5.0).hypot(point.1 - 5.0) - 4.0).abs() < 1e-9));
+        assert!(
+            disc.iter()
+                .all(|point| ((point.0 - 5.0).hypot(point.1 - 5.0) - 4.0).abs() < 1e-9)
+        );
         let mut empty = Vec::new();
         tube_outline(&[], 4.0, 0.05, &mut empty);
         assert!(empty.is_empty());

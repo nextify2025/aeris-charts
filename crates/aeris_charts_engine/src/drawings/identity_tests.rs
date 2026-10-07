@@ -588,9 +588,11 @@ fn keyboard_nudges_that_move_nothing_report_false_and_record_nothing() {
         ),
         (
             DrawingKind::AnchoredText,
-            vec![chart
-                .drawing_from_px_for(0, crate::DrawingPriceScale::Right, 0.0, 120.0)
-                .unwrap()],
+            vec![
+                chart
+                    .drawing_from_px_for(0, crate::DrawingPriceScale::Right, 0.0, 120.0)
+                    .unwrap(),
+            ],
             (-1.0, 0.0),
         ),
     ];
@@ -648,14 +650,16 @@ fn undo_during_a_drag_cancels_the_drag_first() {
 fn add_drawing_reports_invalid_options_instead_of_dropping_them() {
     let mut chart = settled();
     let points = vec![point(2.0, 101.0), point(7.0, 103.0)];
-    assert!(chart
-        .add_drawing(
-            DrawingKind::TrendLine,
-            0,
-            points.clone(),
-            Some(r#"{"width":"thick"}"#)
-        )
-        .is_none());
+    assert!(
+        chart
+            .add_drawing(
+                DrawingKind::TrendLine,
+                0,
+                points.clone(),
+                Some(r#"{"width":"thick"}"#)
+            )
+            .is_none()
+    );
     let anchors = points
         .iter()
         .copied()

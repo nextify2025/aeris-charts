@@ -8,7 +8,7 @@
 use super::*;
 use crate::{
     BigTrade, BigTradesFilter, BigTradesIntensity, BigTradesOptions, BigTradesSnapshot,
-    ChartEngine, NativePrimitiveId, SeriesKind, MAX_BIG_TRADES_BUBBLES,
+    ChartEngine, MAX_BIG_TRADES_BUBBLES, NativePrimitiveId, SeriesKind,
 };
 
 /// A minute-aligned Unix time in microseconds.
@@ -297,13 +297,13 @@ fn reference_orders(
             current.last_price = trade.price;
             continue;
         }
-        if let Some(done) = open.take().map(|done| finish(&done)) {
-            if done.volume >= minimum_volume {
-                if bubbles.len() == MAX_BIG_TRADES_BUBBLES {
-                    bubbles.pop_front();
-                }
-                bubbles.push_back(done);
+        if let Some(done) = open.take().map(|done| finish(&done))
+            && done.volume >= minimum_volume
+        {
+            if bubbles.len() == MAX_BIG_TRADES_BUBBLES {
+                bubbles.pop_front();
             }
+            bubbles.push_back(done);
         }
         if side != AggressorSide::Unknown {
             open = Some(Open {
@@ -682,9 +682,11 @@ fn host_markers_on_a_big_trades_series_stay_the_hosts() {
     live.tip(vec![tape_trade(100)]);
     let markers = &live.chart.series_entry(live.footprint).unwrap().markers;
     assert_eq!(markers.len(), 2);
-    assert!(markers
-        .iter()
-        .all(|kept| kept.id == marker.id && kept.time == marker.time));
+    assert!(
+        markers
+            .iter()
+            .all(|kept| kept.id == marker.id && kept.time == marker.time)
+    );
     let mut fresh = Harness::new(time_bars(), None);
     fresh.load(tape(0..101));
     assert_same(&live.snapshot(), &fresh.snapshot(), "host markers");
@@ -932,7 +934,7 @@ fn clean_tick_marks_shifted(
     label_shift: i64,
 ) -> Vec<aeris_charts_core::scale::time_tick_marks::TickMark> {
     use aeris_charts_core::scale::time_tick_marks::{
-        fill_weights_for_points_shifted_in, TimeTickMarks,
+        TimeTickMarks, fill_weights_for_points_shifted_in,
     };
     let times = chart.sequence_points().map_or_else(
         || chart.data_layer().merged_times().to_vec(),
@@ -1177,7 +1179,7 @@ fn non_time_presentations_bound_after_trims_continue_the_stream_keys() {
     }
 }
 
-fn stream_state(stream: &FootprintAggregator) -> impl PartialEq + core::fmt::Debug {
+fn stream_state(stream: &FootprintAggregator) -> impl PartialEq + core::fmt::Debug + use<> {
     let ids = stream
         .trade_ids
         .iter()
@@ -1487,9 +1489,11 @@ fn retention_trim_under_a_cutoff_equals_the_sequential_trims() {
             }
             let rebuilds = |harness: &Harness| harness.chart.data_layer().index_rebuilds();
             let (before_batched, before_sequential) = (rebuilds(&batched), rebuilds(&sequential));
-            assert!(batched
-                .chart
-                .set_series_max_points(batched.footprint, Some(KEEP)));
+            assert!(
+                batched
+                    .chart
+                    .set_series_max_points(batched.footprint, Some(KEEP))
+            );
             sequential_retention_reference(&mut sequential, KEEP);
             assert_eq!(
                 rebuilds(&batched) - before_batched,

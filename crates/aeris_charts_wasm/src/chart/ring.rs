@@ -216,7 +216,13 @@ impl BoundRing {
             }
 
             let stride = self.layout.row_stride;
-            let [time_offset, open_offset, high_offset, low_offset, close_offset] = [
+            let [
+                time_offset,
+                open_offset,
+                high_offset,
+                low_offset,
+                close_offset,
+            ] = [
                 self.layout.time_offset,
                 self.layout.open_offset,
                 self.layout.high_offset,

@@ -968,12 +968,10 @@ impl ChartEngine {
                 index,
                 grab_offset_y,
             }) => {
-                if dragging {
-                    if let Some(pane_below) = self.panes.get(index + 1) {
-                        let delta = y - grab_offset_y - pane_below.top;
-                        self.drag_pane_separator(index, delta);
-                        self.input.layout_dirty = true;
-                    }
+                if dragging && let Some(pane_below) = self.panes.get(index + 1) {
+                    let delta = y - grab_offset_y - pane_below.top;
+                    self.drag_pane_separator(index, delta);
+                    self.input.layout_dirty = true;
                 }
                 // The separator is chrome: the crosshair hides during the resize drag.
                 self.clear_pointer_hover();
@@ -1234,13 +1232,12 @@ impl ChartEngine {
                 // must still be under the release and still act. A press the control could not
                 // act on stays absorbed, and an order the host moved or put under the pointer
                 // during the click (a twin at the same price) is never the one cancelled.
-                if let Some(pressed) = press_close.filter(|_| !moved) {
-                    if self
+                if let Some(pressed) = press_close.filter(|_| !moved)
+                    && self
                         .pointer_trading_hit_at(x, y)
                         .is_some_and(|end| end.same_target(&pressed))
-                    {
-                        self.trading_activate_hit(&pressed);
-                    }
+                {
+                    self.trading_activate_hit(&pressed);
                 }
             }
             PressMode::Alert => {
@@ -2034,18 +2031,18 @@ impl ChartEngine {
     /// start its tooltip dwell, since the engine has no clock of its own.
     pub(crate) fn refresh_resting_pointer_affordance(&mut self) {
         let resting = self.input.press.is_none() && self.input.touch_tracking.is_none();
-        if let Some((x, y)) = self.input.pointer.filter(|_| resting) {
-            if matches!(self.region_at(x, y), ChartRegion::Pane) {
-                let changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
-                // A control that appeared under the resting pointer waits for the next motion to
-                // start its dwell. Otherwise a lane token whose dwell is still running keeps it
-                // (`refresh_pointer_hover`), and nothing pending clears the deadline.
-                let trading_pending = self.trading_tooltip_pending();
-                if (changed && trading_pending)
-                    || (!trading_pending && !self.timeline_tooltip_pending())
-                {
-                    self.input.tooltip_deadline_ms = None;
-                }
+        if let Some((x, y)) = self.input.pointer.filter(|_| resting)
+            && matches!(self.region_at(x, y), ChartRegion::Pane)
+        {
+            let changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
+            // A control that appeared under the resting pointer waits for the next motion to
+            // start its dwell. Otherwise a lane token whose dwell is still running keeps it
+            // (`refresh_pointer_hover`), and nothing pending clears the deadline.
+            let trading_pending = self.trading_tooltip_pending();
+            if (changed && trading_pending)
+                || (!trading_pending && !self.timeline_tooltip_pending())
+            {
+                self.input.tooltip_deadline_ms = None;
             }
         }
         self.refresh_input_cursor();
@@ -3831,7 +3828,10 @@ mod tests {
         let axis_x = chart.pane_w + 10.0;
         chart.input_context_menu(axis_x, 100.0);
         let events = chart.take_input_events();
-        let [ChartInputEvent::ContextMenu(pane), ChartInputEvent::ContextMenu(axis)] = events[..]
+        let [
+            ChartInputEvent::ContextMenu(pane),
+            ChartInputEvent::ContextMenu(axis),
+        ] = events[..]
         else {
             panic!("two context menus: {events:?}");
         };
@@ -4359,10 +4359,12 @@ mod tests {
         chart.input_pointer_down(sample(200.0), 2);
         chart.input_pointer_up(sample(201.0));
         assert_eq!(chart.editing_drawing(), None);
-        assert!(!chart
-            .take_input_events()
-            .iter()
-            .any(|event| matches!(event, ChartInputEvent::TextEditorOpened(_))));
+        assert!(
+            !chart
+                .take_input_events()
+                .iter()
+                .any(|event| matches!(event, ChartInputEvent::TextEditorOpened(_)))
+        );
 
         // Once the pair is spent, a later double-click on the drawing edits it again.
         let (inside_x, inside_y) = (x - 60.0, y);
@@ -4622,10 +4624,12 @@ mod tests {
 
         assert!(chart.set_drawing_tool(Some(DrawingKind::Callout), None, None));
         click(&mut chart, 300.0, 200.0);
-        assert!(!chart
-            .take_input_events()
-            .iter()
-            .any(|event| matches!(event, ChartInputEvent::DrawingCreated(_))));
+        assert!(
+            !chart
+                .take_input_events()
+                .iter()
+                .any(|event| matches!(event, ChartInputEvent::DrawingCreated(_)))
+        );
         click(&mut chart, 380.0, 170.0);
         let events = chart.take_input_events();
         let [ChartInputEvent::DrawingCreated(callout)] = events[..] else {

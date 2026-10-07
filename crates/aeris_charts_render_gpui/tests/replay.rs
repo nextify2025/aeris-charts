@@ -299,9 +299,9 @@ fn invalidating_caches_releases_everything_and_allows_regrowth() {
     for _ in 0..8 {
         renderer.plan_frame(&prepared, DPR as f32).unwrap();
     }
-    let gen = renderer.text_cache().generation();
+    let before = renderer.text_cache().generation();
     renderer.invalidate_caches();
-    assert_eq!(renderer.text_cache().generation(), gen + 1);
+    assert_eq!(renderer.text_cache().generation(), before + 1);
     assert!(renderer.text_cache().is_empty());
     // Planning still works after an invalidation.
     renderer.plan_frame(&prepared, DPR as f32).unwrap();

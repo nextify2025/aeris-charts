@@ -640,11 +640,11 @@ impl ChartInner {
 }
 
 fn fire_custom_destroy(entry: &CustomSeriesEntry) {
-    if let Some(destroy) = custom_hook(&entry.view, "destroy") {
-        if let Err(error) = destroy.call0(&entry.view) {
-            web_sys::console::warn_1(
-                &format!("aeris_charts: custom series `destroy` hook threw — {error:?}").into(),
-            );
-        }
+    if let Some(destroy) = custom_hook(&entry.view, "destroy")
+        && let Err(error) = destroy.call0(&entry.view)
+    {
+        web_sys::console::warn_1(
+            &format!("aeris_charts: custom series `destroy` hook threw — {error:?}").into(),
+        );
     }
 }

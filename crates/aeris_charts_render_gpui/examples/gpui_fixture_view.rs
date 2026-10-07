@@ -8,10 +8,10 @@
 //!     --features gpui-backend --example gpui_fixture_view
 //! ```
 
-use aeris_charts_render_gpui::{fixtures, AerisViewport, GpuiChartRenderer};
+use aeris_charts_render_gpui::{AerisViewport, GpuiChartRenderer, fixtures};
 use gpui::{
-    canvas, div, prelude::*, px, size, App, Bounds, Context, Entity, Render, Window, WindowBounds,
-    WindowOptions,
+    App, Bounds, Context, Entity, Render, Window, WindowBounds, WindowOptions, canvas, div,
+    prelude::*, px, size,
 };
 use gpui_platform::application;
 

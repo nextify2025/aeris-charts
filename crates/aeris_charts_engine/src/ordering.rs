@@ -20,8 +20,8 @@
 
 use aeris_charts_core::model::data_layer::SeriesId;
 
-use crate::drawings::DrawingId;
 use crate::ChartEngine;
+use crate::drawings::DrawingId;
 
 /// Active priority for chart content. Higher paints later (on top).
 /// Idle (0) stays in its stable group; selected (1) promotes above idle;

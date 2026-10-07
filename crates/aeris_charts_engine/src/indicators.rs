@@ -1470,10 +1470,10 @@ impl ChartEngine {
         let outputs = self.indicators[index].outputs.clone();
         for (output_index, &output) in outputs.iter().enumerate() {
             let previous_title = format!("EMA {}", previous[output_index]);
-            if let Some(series) = self.series.iter_mut().find(|series| series.id == output) {
-                if series.title == previous_title {
-                    series.title = format!("EMA {}", periods[output_index]);
-                }
+            if let Some(series) = self.series.iter_mut().find(|series| series.id == output)
+                && series.title == previous_title
+            {
+                series.title = format!("EMA {}", periods[output_index]);
             }
         }
         let kind = IndicatorKind::EmaRibbon { periods };
@@ -2999,11 +2999,7 @@ fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::Increment
 fn momentum_histogram_color(value: f64, previous: Option<f64>) -> u32 {
     let rising = previous.is_none_or(|previous| value >= previous);
     if value >= 0.0 {
-        if rising {
-            MACD_UP
-        } else {
-            MACD_UP_WEAK
-        }
+        if rising { MACD_UP } else { MACD_UP_WEAK }
     } else if rising {
         MACD_DOWN_WEAK
     } else {

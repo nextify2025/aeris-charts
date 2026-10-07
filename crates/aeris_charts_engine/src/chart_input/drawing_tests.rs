@@ -533,10 +533,12 @@ fn a_drawing_released_past_the_slop_without_crossing_motion_lands_at_the_release
     chart.input_pointer_up(at(body.0 + 30.0, body.1 - 20.0));
     assert_shifted(&chart, id, &start, (30.0, -20.0), "released");
     assert_eq!(chart.drawing_revision(), revision + 1);
-    assert!(!chart
-        .take_input_events()
-        .iter()
-        .any(|event| matches!(event, ChartInputEvent::Click { .. })));
+    assert!(
+        !chart
+            .take_input_events()
+            .iter()
+            .any(|event| matches!(event, ChartInputEvent::Click { .. }))
+    );
 }
 
 /// A wobbling click never lets the strong magnet pull a drawing onto a bar's price; the magnet

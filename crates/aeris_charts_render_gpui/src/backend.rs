@@ -24,9 +24,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{
-    fill, linear_color_stop, linear_gradient, point, px, radians, size, App, Background, Bounds,
-    ContentMask, Font, FontStyle, FontWeight, Hsla, Path, Pixels, RenderImage, Rgba, ShapedLine,
-    SharedString, TransformationMatrix, Window,
+    App, Background, Bounds, ContentMask, Font, FontStyle, FontWeight, Hsla, Path, Pixels,
+    RenderImage, Rgba, ShapedLine, SharedString, TransformationMatrix, Window, fill,
+    linear_color_stop, linear_gradient, point, px, radians, size,
 };
 use image::{Frame, RgbaImage};
 use smallvec::SmallVec;
@@ -166,7 +166,9 @@ pub fn measure_text(
 /// prefixes, the trend `+ Add text` prompt, and device-scaled frame runs alike — the native
 /// counterpart of the browser host's canvas `measureText` hook. It holds only the shared text
 /// system, so it stays valid across frames without borrowing the window.
-pub fn text_measurer(window: &Window) -> impl Fn(&str, f64, &str, u16, bool) -> f64 + 'static {
+pub fn text_measurer(
+    window: &Window,
+) -> impl Fn(&str, f64, &str, u16, bool) -> f64 + 'static + use<> {
     let text_system = window.text_system().clone();
     move |text, size, family, weight, italic| {
         if text.is_empty() || !(size.is_finite() && size > 0.0) {
@@ -179,7 +181,9 @@ pub fn text_measurer(window: &Window) -> impl Fn(&str, f64, &str, u16, bool) -> 
 /// A live engine glyph metric (`ChartEngine::set_text_cap_center`) backed by the window's native
 /// font metrics, the counterpart of the browser host's `measureText` ink bounds. GPUI font
 /// metrics report `descent` negative below the baseline, the convention `paint_text` places with.
-pub fn text_cap_centerer(window: &Window) -> impl Fn(f64, &str, u16, bool) -> f64 + 'static {
+pub fn text_cap_centerer(
+    window: &Window,
+) -> impl Fn(f64, &str, u16, bool) -> f64 + 'static + use<> {
     let text_system = window.text_system().clone();
     move |size, family, weight, italic| {
         if !(size.is_finite() && size > 0.0) {
@@ -414,15 +418,14 @@ impl RasterImageCache {
         let buffer = RgbaImage::from_raw(padded_width, padded_height, pixels)?;
         let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
         // A chart may show all 32 registered stamp images alongside depth and alert images.
-        if self.entries.len() == 64 {
-            if let Some(oldest) = self
+        if self.entries.len() == 64
+            && let Some(oldest) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, (_, stamp))| *stamp)
                 .map(|(key, _)| *key)
-            {
-                self.entries.remove(&oldest);
-            }
+        {
+            self.entries.remove(&oldest);
         }
         self.entries.insert(key, (Arc::clone(&image), self.tick));
         Some(image)
@@ -560,7 +563,7 @@ impl GpuiChartRenderer {
 /// Clip ops are handled by recursing into the masked range rather than by mutating a stack:
 /// `Window::with_content_mask` is a scoped call, so the nesting has to be expressed as nesting.
 #[allow(clippy::too_many_arguments)] // one context bundle per GPUI paint call; a wrapper struct
-                                     // would only move these borrows behind another name
+// would only move these borrows behind another name
 fn paint_plan(
     plan: &ScenePlan,
     text_cache: &mut crate::text::TextCache,
@@ -588,7 +591,7 @@ fn paint_plan(
 }
 
 #[allow(clippy::too_many_arguments)] // one context bundle per GPUI paint call; splitting it would
-                                     // only move the arguments behind a struct with no gain
+// only move the arguments behind a struct with no gain
 fn paint_range(
     plan: &ScenePlan,
     start: usize,
@@ -643,14 +646,14 @@ fn paint_range(
                 // long homogeneous runs to keep submission work bounded; see `batchable_run` for
                 // why this cannot change the output.
                 let run = batchable_run(plan, i, end);
-                if run >= QUAD_BATCH_THRESHOLD {
-                    if let Some(path) = build_quad_run_path(plan, i, i + run, transform) {
-                        window.paint_path(path, to_background(*paint));
-                        metrics.batched_quads += run as u32;
-                        metrics.quad_batches += 1;
-                        i += run;
-                        continue;
-                    }
+                if run >= QUAD_BATCH_THRESHOLD
+                    && let Some(path) = build_quad_run_path(plan, i, i + run, transform)
+                {
+                    window.paint_path(path, to_background(*paint));
+                    metrics.batched_quads += run as u32;
+                    metrics.quad_batches += 1;
+                    i += run;
+                    continue;
                 }
                 let bounds = transform.bounds(*rect);
                 let mut quad = fill(bounds, to_background(*paint));
@@ -1184,9 +1187,11 @@ mod tests {
         ];
         let bytes = image.as_bytes(0).expect("GPUI image payload");
         assert_eq!(bytes.len(), expected_row.len() * 3);
-        assert!(bytes
-            .chunks_exact(expected_row.len())
-            .all(|row| row == expected_row));
+        assert!(
+            bytes
+                .chunks_exact(expected_row.len())
+                .all(|row| row == expected_row)
+        );
         assert_eq!(source.pixels.as_ref(), &[255, 0, 0, 255, 0, 0, 255, 128]);
     }
 

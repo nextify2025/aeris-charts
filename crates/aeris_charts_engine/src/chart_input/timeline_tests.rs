@@ -2,7 +2,7 @@
 //! activation outcome, drag suppression, double-click editor guarding, hover, cursor, the dwell
 //! tooltip and the active trading group.
 
-use super::tests::{at, at_ms, chart, click, drag, relayout, BARS};
+use super::tests::{BARS, at, at_ms, chart, click, drag, relayout};
 use super::*;
 use crate::{
     ChartFrame, FinancialFrameRequest, OrderRole, PositionSide, TimelineGlyphShape, TimelineMark,
@@ -85,12 +85,16 @@ fn a_token_click_emits_one_activation_whose_hit_resolves() {
     // A plain pane click emits a click, never an activation.
     click(&mut chart, x, y - 120.0);
     let events = chart.take_input_events();
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, ChartInputEvent::Click { .. })));
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, ChartInputEvent::TimelineMarkActivated(_))));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ChartInputEvent::Click { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ChartInputEvent::TimelineMarkActivated(_)))
+    );
 }
 
 #[test]
@@ -290,10 +294,12 @@ fn a_double_click_on_a_token_never_opens_the_editor_under_it() {
     chart.input_pointer_down(sample(200.0), 2);
     chart.input_pointer_up(sample(201.0));
     assert_eq!(chart.editing_drawing(), None);
-    assert!(!chart
-        .take_input_events()
-        .iter()
-        .any(|event| matches!(event, ChartInputEvent::TextEditorOpened(_))));
+    assert!(
+        !chart
+            .take_input_events()
+            .iter()
+            .any(|event| matches!(event, ChartInputEvent::TextEditorOpened(_)))
+    );
     assert_eq!(
         chart.selected_drawing(),
         Some(id),
@@ -346,12 +352,16 @@ fn a_hidden_lane_leaves_every_input_to_the_pane() {
     assert_ne!(chart.input_hover(), ChartHover::TimelineMark);
     click(&mut chart, x, y);
     let events = chart.take_input_events();
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, ChartInputEvent::Click { .. })));
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, ChartInputEvent::TimelineMarkActivated(_))));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ChartInputEvent::Click { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ChartInputEvent::TimelineMarkActivated(_)))
+    );
     assert_eq!(BARS, 60);
 }
 

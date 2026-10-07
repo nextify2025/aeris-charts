@@ -103,9 +103,11 @@ mod tests {
         cache.row(1, columns, 2);
         let first = HeikinAshiCache::project(None, [10.0, 14.0, 8.0, 12.0]);
         assert_eq!(first, cache.rows()[0]);
-        assert!(HeikinAshiCache::project(Some(first), [f64::NAN; 4])
-            .iter()
-            .all(|value| value.is_nan()));
+        assert!(
+            HeikinAshiCache::project(Some(first), [f64::NAN; 4])
+                .iter()
+                .all(|value| value.is_nan())
+        );
         assert_eq!(
             HeikinAshiCache::project(Some(first), [14.0, 18.0, 12.0, 16.0]),
             cache.rows()[2]

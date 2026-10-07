@@ -263,9 +263,11 @@ fn every_klinechart_binding_matches_full_recomputation_through_every_update_path
 
         // Append one bar.
         let appended = bar(source, &fixture, [104.0, 107.0, 103.0, 106.0]);
-        assert!(fixture
-            .chart
-            .update_series_bar(source, ROWS as f64 * HOUR, appended));
+        assert!(
+            fixture
+                .chart
+                .update_series_bar(source, ROWS as f64 * HOUR, appended)
+        );
         check(&fixture, binding);
 
         // Append a batch.
@@ -334,9 +336,11 @@ fn every_klinechart_binding_matches_full_recomputation_through_every_update_path
         check(&fixture, binding);
 
         assert!(fixture.chart.remove_series(source));
-        assert!(outputs
-            .iter()
-            .all(|&output| fixture.chart.series_kind(output).is_none()));
+        assert!(
+            outputs
+                .iter()
+                .all(|&output| fixture.chart.series_kind(output).is_none())
+        );
     }
 }
 
@@ -371,9 +375,10 @@ fn klinechart_bindings_use_klinechart_layout_and_style() {
     assert!(ma.iter().all(|&id| entry(id).pane_index == price_pane));
     assert_eq!(entry(sar[0]).pane_index, price_pane);
     assert_eq!(chart.panes.len(), panes + 2);
-    assert!(macd
-        .iter()
-        .all(|&id| entry(id).pane_index == entry(macd[0]).pane_index));
+    assert!(
+        macd.iter()
+            .all(|&id| entry(id).pane_index == entry(macd[0]).pane_index)
+    );
     assert_ne!(entry(macd[0]).pane_index, price_pane);
     assert_ne!(entry(vol[0]).pane_index, entry(macd[0]).pane_index);
 
@@ -439,39 +444,53 @@ fn invalid_klinechart_bindings_leave_the_chart_unchanged() {
     let chart = &mut fixture.chart;
     let vol = Indicator::from_name("VOL").unwrap();
     let macd = Indicator::from_name("MACD").unwrap();
-    assert!(chart
-        .add_klinechart_indicator(0, vol.clone(), None)
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, vol.clone(), Some(0))
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, macd, Some(volume))
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, Indicator::Avp, Some(volume))
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, Indicator::Ma { periods: vec![] }, None)
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(
-            0,
-            Indicator::Ma {
-                periods: vec![1, 2, 3, 4, 5, 6],
-            },
-            None,
-        )
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(
-            0,
-            Indicator::Vol {
-                periods: vec![1, 2, 3, 4, 5]
-            },
-            Some(volume)
-        )
-        .is_empty());
+    assert!(
+        chart
+            .add_klinechart_indicator(0, vol.clone(), None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, vol.clone(), Some(0))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, macd, Some(volume))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, Indicator::Avp, Some(volume))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, Indicator::Ma { periods: vec![] }, None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(
+                0,
+                Indicator::Ma {
+                    periods: vec![1, 2, 3, 4, 5, 6],
+                },
+                None,
+            )
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(
+                0,
+                Indicator::Vol {
+                    periods: vec![1, 2, 3, 4, 5]
+                },
+                Some(volume)
+            )
+            .is_empty()
+    );
     assert_eq!(chart.series.len(), series_before);
     assert!(chart.indicators.is_empty());
 
@@ -786,12 +805,16 @@ fn feed(fixture: &mut Fixture, data: &Data, row: usize) {
     let volume = fixture.volume;
     let turnover = fixture.turnover;
     assert!(fixture.chart.update_series_bar(0, time, data.candles[row]));
-    assert!(fixture
-        .chart
-        .update_series_bar(volume, time, [data.volumes[row]; 4]));
-    assert!(fixture
-        .chart
-        .update_series_bar(turnover, time, [data.turnovers[row]; 4]));
+    assert!(
+        fixture
+            .chart
+            .update_series_bar(volume, time, [data.volumes[row]; 4])
+    );
+    assert!(
+        fixture
+            .chart
+            .update_series_bar(turnover, time, [data.turnovers[row]; 4])
+    );
 }
 
 fn label_of(indicator: &Indicator) -> String {
@@ -1183,10 +1206,12 @@ fn a_tick_over_pre_installed_session_slots_recolors_only_the_rows_it_rewrote() {
         |chart: &ChartEngine, output| chart.data.series_data(output).unwrap().1[3].len() - 1;
     for &(_, output) in &colored {
         let last = last_slot_row(&fixture.chart, output);
-        assert!(fixture
-            .chart
-            .data
-            .set_point_color(output, body, last, sentinel));
+        assert!(
+            fixture
+                .chart
+                .data
+                .set_point_color(output, body, last, sentinel)
+        );
     }
 
     // Fill the forming slot, revise it, and fill the next one.
@@ -1204,10 +1229,12 @@ fn a_tick_over_pre_installed_session_slots_recolors_only_the_rows_it_rewrote() {
             Some(sentinel),
             "a tick recolored a slot it did not rewrite"
         );
-        assert!(fixture
-            .chart
-            .data
-            .set_point_color(output, body, last, POINT_COLOR_ABSENT));
+        assert!(
+            fixture
+                .chart
+                .data
+                .set_point_color(output, body, last, POINT_COLOR_ABSENT)
+        );
     }
     for &(binding, _) in &colored {
         check(&fixture, binding);

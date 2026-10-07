@@ -48,12 +48,14 @@ mod tests {
         for size in 1..=MAX_ICON_SIZE {
             let image = crosshair_icon(size);
             assert_eq!(image.pixels.len(), (size * size * 4) as usize);
-            assert!(image
-                .pixels
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|pixel| pixel[3] > 0));
+            assert!(
+                image
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0)
+            );
         }
         assert_eq!(crosshair_icon(0).width, 1);
         assert_eq!(crosshair_icon(u32::MAX).width, MAX_ICON_SIZE);

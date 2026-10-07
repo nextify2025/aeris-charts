@@ -1,6 +1,6 @@
 use super::*;
-use crate::trading::{OrderRole, OrderSide, OrderStatus, PositionSide, TradingGroupVisualState};
 use crate::Pane;
+use crate::trading::{OrderRole, OrderSide, OrderStatus, PositionSide, TradingGroupVisualState};
 use aeris_charts_core::style::{
     DARK_ACCENT_RGB, DARK_ACTIVE_RGB, LIGHT_ACCENT_RGB, LIGHT_ACTIVE_RGB, RADIUS_LARGE,
     RADIUS_SMALL,
@@ -2006,40 +2006,37 @@ impl ChartEngine {
                     },
                 });
             }
-            if order.kind == crate::OrderKind::StopLimit {
-                if let Some(stop_price) = order.stop_price.filter(|price| *price != display_price) {
-                    if let Some(stop_y) =
-                        self.trading_price_coordinate(pane_index, order.price_scale, stop_price)
-                    {
-                        lines.push(Prim::HLine {
-                            y: (stop_y * vpr).round() as i32,
-                            x0: 0,
-                            x1: (self.pane_w * hpr).round() as i32,
-                            width: min_line_width,
-                            style: LineStyle::Dotted,
-                            color,
-                        });
-                        let trigger =
-                            format!("Trigger {}", self.format_trading_quantity(remaining));
-                        self.push_trading_segment(
-                            lines,
-                            TradingControlSegment {
-                                kind: TradingControlSegmentKind::OrderType,
-                                text: &trigger,
-                                width: 92.0,
-                                color,
-                                filled: false,
-                            },
-                            TradingControlFeedback::Idle,
-                            TradingChipLayout {
-                                x: self.trading_marker_start(),
-                                y: stop_y,
-                                hpr,
-                                vpr,
-                            },
-                        );
-                    }
-                }
+            if order.kind == crate::OrderKind::StopLimit
+                && let Some(stop_price) = order.stop_price.filter(|price| *price != display_price)
+                && let Some(stop_y) =
+                    self.trading_price_coordinate(pane_index, order.price_scale, stop_price)
+            {
+                lines.push(Prim::HLine {
+                    y: (stop_y * vpr).round() as i32,
+                    x0: 0,
+                    x1: (self.pane_w * hpr).round() as i32,
+                    width: min_line_width,
+                    style: LineStyle::Dotted,
+                    color,
+                });
+                let trigger = format!("Trigger {}", self.format_trading_quantity(remaining));
+                self.push_trading_segment(
+                    lines,
+                    TradingControlSegment {
+                        kind: TradingControlSegmentKind::OrderType,
+                        text: &trigger,
+                        width: 92.0,
+                        color,
+                        filled: false,
+                    },
+                    TradingControlFeedback::Idle,
+                    TradingChipLayout {
+                        x: self.trading_marker_start(),
+                        y: stop_y,
+                        hpr,
+                        vpr,
+                    },
+                );
             }
             self.push_host_trigger_line(
                 lines,
@@ -2072,120 +2069,117 @@ impl ChartEngine {
             .interaction
             .preview()
             .filter(|preview| preview.pane_index == pane_index)
-        {
-            if let Some(preview_y) =
+            && let Some(preview_y) =
                 self.trading_price_coordinate(pane_index, preview.price_scale, preview.price)
+        {
+            let creating_protection =
+                !matches!(preview.source, crate::TradingPreviewSource::Order { .. });
+            if creating_protection {
+                let semantic = if preview.role == OrderRole::TakeProfit {
+                    self.trading_state.style.take_profit
+                } else {
+                    self.trading_state.style.stop_loss
+                };
+                lines.push(Prim::HLine {
+                    y: (preview_y * vpr).round() as i32,
+                    x0: 0,
+                    x1: (self.trading_marker_end() * hpr).round() as i32,
+                    width: min_line_width,
+                    style: LineStyle::Dotted,
+                    color: semantic,
+                });
+                let quantity = self.format_trading_quantity(preview.quantity);
+                let role = if preview.role == OrderRole::TakeProfit {
+                    "TP"
+                } else {
+                    "SL"
+                };
+                let segments = [
+                    TradingControlSegment {
+                        kind: TradingControlSegmentKind::Quantity,
+                        text: quantity.as_str(),
+                        width: self.trading_quantity_width(&quantity),
+                        color: semantic,
+                        filled: true,
+                    },
+                    TradingControlSegment {
+                        kind: TradingControlSegmentKind::OrderType,
+                        text: role,
+                        width: ORDER_TYPE_WIDTH,
+                        color: semantic,
+                        filled: false,
+                    },
+                ];
+                let cluster = TradingControlCluster {
+                    segments: &segments,
+                    left: self.trading_marker_start(),
+                    color: semantic,
+                };
+                self.push_trading_cluster(
+                    lines,
+                    points,
+                    &cluster,
+                    None,
+                    None,
+                    TradingChipLayout {
+                        x: cluster.start(),
+                        y: preview_y,
+                        hpr,
+                        vpr,
+                    },
+                );
+            }
+            if let Some((anchor_price, long)) = self.trading_preview_relation(preview)
+                && let Some(anchor_y) =
+                    self.trading_price_coordinate(pane_index, preview.price_scale, anchor_price)
             {
-                let creating_protection =
-                    !matches!(preview.source, crate::TradingPreviewSource::Order { .. });
-                if creating_protection {
-                    let semantic = if preview.role == OrderRole::TakeProfit {
-                        self.trading_state.style.take_profit
-                    } else {
-                        self.trading_state.style.stop_loss
-                    };
-                    lines.push(Prim::HLine {
-                        y: (preview_y * vpr).round() as i32,
-                        x0: 0,
-                        x1: (self.trading_marker_end() * hpr).round() as i32,
-                        width: min_line_width,
-                        style: LineStyle::Dotted,
-                        color: semantic,
-                    });
-                    let quantity = self.format_trading_quantity(preview.quantity);
-                    let role = if preview.role == OrderRole::TakeProfit {
-                        "TP"
-                    } else {
-                        "SL"
-                    };
-                    let segments = [
-                        TradingControlSegment {
-                            kind: TradingControlSegmentKind::Quantity,
-                            text: quantity.as_str(),
-                            width: self.trading_quantity_width(&quantity),
-                            color: semantic,
-                            filled: true,
-                        },
-                        TradingControlSegment {
-                            kind: TradingControlSegmentKind::OrderType,
-                            text: role,
-                            width: ORDER_TYPE_WIDTH,
-                            color: semantic,
-                            filled: false,
-                        },
-                    ];
-                    let cluster = TradingControlCluster {
-                        segments: &segments,
-                        left: self.trading_marker_start(),
-                        color: semantic,
-                    };
-                    self.push_trading_cluster(
-                        lines,
-                        points,
-                        &cluster,
-                        None,
-                        None,
-                        TradingChipLayout {
-                            x: cluster.start(),
-                            y: preview_y,
-                            hpr,
-                            vpr,
-                        },
-                    );
-                }
-                if let Some((anchor_price, long)) = self.trading_preview_relation(preview) {
-                    if let Some(anchor_y) =
-                        self.trading_price_coordinate(pane_index, preview.price_scale, anchor_price)
-                    {
-                        let valid = match (long, preview.role) {
-                            (true, OrderRole::TakeProfit) => preview.price > anchor_price,
-                            (true, OrderRole::StopLoss) => preview.price < anchor_price,
-                            (false, OrderRole::TakeProfit) => preview.price < anchor_price,
-                            (false, OrderRole::StopLoss) => preview.price > anchor_price,
-                            (_, OrderRole::Working) => false,
+                let valid = match (long, preview.role) {
+                    (true, OrderRole::TakeProfit) => preview.price > anchor_price,
+                    (true, OrderRole::StopLoss) => preview.price < anchor_price,
+                    (false, OrderRole::TakeProfit) => preview.price < anchor_price,
+                    (false, OrderRole::StopLoss) => preview.price > anchor_price,
+                    (_, OrderRole::Working) => false,
+                };
+                if valid {
+                    let top = anchor_y.min(preview_y).max(pane.top);
+                    let bottom = anchor_y.max(preview_y).min(pane.top + pane.height);
+                    if bottom > top {
+                        let fill = if preview.role == OrderRole::TakeProfit {
+                            self.trading_state.style.profit
+                        } else {
+                            self.trading_state.style.risk
                         };
-                        if valid {
-                            let top = anchor_y.min(preview_y).max(pane.top);
-                            let bottom = anchor_y.max(preview_y).min(pane.top + pane.height);
-                            if bottom > top {
-                                let fill = if preview.role == OrderRole::TakeProfit {
-                                    self.trading_state.style.profit
-                                } else {
-                                    self.trading_state.style.risk
-                                };
-                                regions.push(Prim::Rect {
-                                    rect: IRect {
-                                        x: 0,
-                                        y: (top * vpr).round() as i32,
-                                        w: width,
-                                        h: ((bottom - top) * vpr).round().max(1.0) as i32,
-                                    },
-                                    color: Color::rgba(fill.r(), fill.g(), fill.b(), 32),
-                                });
-                            }
-                        }
-                        if (anchor_y - preview_y).abs() > 0.5 {
-                            let connector = self.trading_state.style.position;
-                            let x = ((self.pane_w - 8.0) * hpr).round() as i32;
-                            lines.push(Prim::VLine {
-                                x,
-                                y0: (anchor_y.min(preview_y) * vpr).round() as i32,
-                                y1: (anchor_y.max(preview_y) * vpr).round() as i32,
-                                width: min_line_width,
-                                style: LineStyle::Solid,
-                                color: connector,
-                            });
-                            for cy in [anchor_y, preview_y] {
-                                lines.push(Prim::Circle {
-                                    cx: x as f32,
-                                    cy: (cy * vpr) as f32,
-                                    radius: (3.0 * vpr) as f32,
-                                    fill: self.trading_chip_background(),
-                                    stroke_width: (1.0 * vpr) as f32,
-                                    stroke: connector,
-                                });
-                            }
-                        }
+                        regions.push(Prim::Rect {
+                            rect: IRect {
+                                x: 0,
+                                y: (top * vpr).round() as i32,
+                                w: width,
+                                h: ((bottom - top) * vpr).round().max(1.0) as i32,
+                            },
+                            color: Color::rgba(fill.r(), fill.g(), fill.b(), 32),
+                        });
+                    }
+                }
+                if (anchor_y - preview_y).abs() > 0.5 {
+                    let connector = self.trading_state.style.position;
+                    let x = ((self.pane_w - 8.0) * hpr).round() as i32;
+                    lines.push(Prim::VLine {
+                        x,
+                        y0: (anchor_y.min(preview_y) * vpr).round() as i32,
+                        y1: (anchor_y.max(preview_y) * vpr).round() as i32,
+                        width: min_line_width,
+                        style: LineStyle::Solid,
+                        color: connector,
+                    });
+                    for cy in [anchor_y, preview_y] {
+                        lines.push(Prim::Circle {
+                            cx: x as f32,
+                            cy: (cy * vpr) as f32,
+                            radius: (3.0 * vpr) as f32,
+                            fill: self.trading_chip_background(),
+                            stroke_width: (1.0 * vpr) as f32,
+                            stroke: connector,
+                        });
                     }
                 }
             }
@@ -2209,14 +2203,13 @@ impl ChartEngine {
                 }
                 if position.pane_index == pane_index
                     && self.trading_group_contains_position(group, position)
-                {
-                    if let Some(y) = self.trading_price_coordinate(
+                    && let Some(y) = self.trading_price_coordinate(
                         pane_index,
                         position.price_scale,
                         position.average_price,
-                    ) {
-                        include(y);
-                    }
+                    )
+                {
+                    include(y);
                 }
             }
             for order in &self.trading_state.orders {
@@ -2226,15 +2219,15 @@ impl ChartEngine {
                 {
                     continue;
                 }
-                if order.pane_index == pane_index && self.trading_group_contains_order(group, order)
-                {
-                    if let Some(y) = self.trading_price_coordinate(
+                if order.pane_index == pane_index
+                    && self.trading_group_contains_order(group, order)
+                    && let Some(y) = self.trading_price_coordinate(
                         pane_index,
                         order.price_scale,
                         self.trading_effective_order_price(order),
-                    ) {
-                        include(y);
-                    }
+                    )
+                {
+                    include(y);
                 }
             }
             if member_count >= 2 && bottom - top > 0.5 {
@@ -2257,14 +2250,13 @@ impl ChartEngine {
                     }
                     if position.pane_index == pane_index
                         && self.trading_group_contains_position(group, position)
-                    {
-                        if let Some(y) = self.trading_price_coordinate(
+                        && let Some(y) = self.trading_price_coordinate(
                             pane_index,
                             position.price_scale,
                             position.average_price,
-                        ) {
-                            self.push_trading_endpoint(lines, y, connector_color, hpr, vpr);
-                        }
+                        )
+                    {
+                        self.push_trading_endpoint(lines, y, connector_color, hpr, vpr);
                     }
                 }
                 for order in &self.trading_state.orders {
@@ -2276,14 +2268,13 @@ impl ChartEngine {
                     }
                     if order.pane_index == pane_index
                         && self.trading_group_contains_order(group, order)
-                    {
-                        if let Some(y) = self.trading_price_coordinate(
+                        && let Some(y) = self.trading_price_coordinate(
                             pane_index,
                             order.price_scale,
                             self.trading_effective_order_price(order),
-                        ) {
-                            self.push_trading_endpoint(lines, y, connector_color, hpr, vpr);
-                        }
+                        )
+                    {
+                        self.push_trading_endpoint(lines, y, connector_color, hpr, vpr);
                     }
                 }
             }

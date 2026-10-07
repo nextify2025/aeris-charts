@@ -609,10 +609,10 @@ impl ChartOptionsStore {
 
         // A theme patch supplies effective colors for creation/theme switching. A style reset must
         // restore the canonical follow semantics instead of pinning those effective values.
-        if let Some(layout) = defaults.get_mut("layout").and_then(Value::as_object_mut) {
-            if let Some(panes) = layout.get_mut("panes").and_then(Value::as_object_mut) {
-                panes.insert("separatorColor".into(), Value::String(String::new()));
-            }
+        if let Some(layout) = defaults.get_mut("layout").and_then(Value::as_object_mut)
+            && let Some(panes) = layout.get_mut("panes").and_then(Value::as_object_mut)
+        {
+            panes.insert("separatorColor".into(), Value::String(String::new()));
         }
         for key in ["leftPriceScale", "rightPriceScale"] {
             if let Some(scale) = defaults.get_mut(key).and_then(Value::as_object_mut) {

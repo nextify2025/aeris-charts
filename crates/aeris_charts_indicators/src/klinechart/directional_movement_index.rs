@@ -1,8 +1,8 @@
 //! `DMI` (趋向指标). Ported from KLineChart
 //! `src/extension/indicator/directionalMovementIndex.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// DMI outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

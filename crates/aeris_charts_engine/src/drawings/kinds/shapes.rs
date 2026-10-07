@@ -22,10 +22,10 @@ use std::borrow::Cow;
 
 use aeris_charts_render::shape::{self, Point, Rect};
 
-use super::super::geometry::{rotated_rectangle_corners, CurveGeometry, DrawingBodyGeometry};
-use super::super::handles::{DrawingHandle, HandleDrag};
-use super::super::parts::{cap_radius, DrawingParts};
 use super::super::Drawing;
+use super::super::geometry::{CurveGeometry, DrawingBodyGeometry, rotated_rectangle_corners};
+use super::super::handles::{DrawingHandle, HandleDrag};
+use super::super::parts::{DrawingParts, cap_radius};
 use crate::{
     ChartEngine, DrawingDragPart, DrawingKind, DrawingLineCap, DrawingPoint,
     DrawingPropertyDescriptor, DrawingPropertyType, DrawingToolOptions,

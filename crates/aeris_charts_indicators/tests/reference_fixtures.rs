@@ -18,9 +18,9 @@
 //! incremental runtime (full rebuild and bar-by-bar streaming) must reproduce them.
 
 use aeris_charts_indicators::{
+    DeviationEstimator, IncrementalState, IndicatorConvention, IndicatorInput, IndicatorSeed,
     bollinger, bollinger_with, ema, ema_with_seed, kdj, macd, macd_with, rsi, rsi_with_seed,
-    stochastic, DeviationEstimator, IncrementalState, IndicatorConvention, IndicatorInput,
-    IndicatorSeed,
+    stochastic,
 };
 
 const NAN: f64 = f64::NAN;

@@ -20,7 +20,7 @@
 
 use aeris_charts_core::scale::exchange_time::{ExchangeTime, UtcOffsetSchedule};
 use aeris_charts_core::scale::session_slots::{
-    parse_wall_clock, OutOfSessionPolicy, SessionBarGrid, SessionSlotError, SessionWindow,
+    OutOfSessionPolicy, SessionBarGrid, SessionSlotError, SessionWindow, parse_wall_clock,
 };
 use serde::Deserialize;
 
@@ -344,15 +344,16 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use aeris_charts_core::scale::time_tick_marks::{days_from_civil, TickMarkWeight};
+    use aeris_charts_core::scale::time_tick_marks::{TickMarkWeight, days_from_civil};
     use aeris_charts_render::color::Color;
     use aeris_charts_render::draw_list::Prim;
 
     use crate::native_primitives::{DeltaTooltipOptions, VerticalLineOptions};
     use crate::{
-        parse_iso_date, parse_wall_clock, session_slot_times, AxisTextAlign, AxisTextMidpoint,
-        BarTimeLabel, ChartEngine, DrawingKind, DrawingPoint, ExchangeTime, SeriesKind,
-        SessionSlotConvention, SessionWindow, TimeTickMark, UtcOffsetSchedule, UtcOffsetTransition,
+        AxisTextAlign, AxisTextMidpoint, BarTimeLabel, ChartEngine, DrawingKind, DrawingPoint,
+        ExchangeTime, SeriesKind, SessionSlotConvention, SessionWindow, TimeTickMark,
+        UtcOffsetSchedule, UtcOffsetTransition, parse_iso_date, parse_wall_clock,
+        session_slot_times,
     };
 
     const HOUR: i64 = 3_600;
@@ -1345,9 +1346,11 @@ mod tests {
             .unwrap();
         let document = source.export_state_json().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
-        assert!(parsed["chart_options"]["timeScale"]
-            .get("sessionStart")
-            .is_none());
+        assert!(
+            parsed["chart_options"]["timeScale"]
+                .get("sessionStart")
+                .is_none()
+        );
 
         // Chart B keeps its own session start (-03:00) for a document without the key, and at
         // that start the 22:00 window opens before the 08:00 window ends: an error, not a

@@ -14,7 +14,7 @@ use std::collections::HashSet;
 
 use aeris_charts_core::scale::exchange_time::ExchangeTime;
 use aeris_charts_core::scale::session_slots::{
-    session_window_bounds, SessionSlotError, SessionWindow,
+    SessionSlotError, SessionWindow, session_window_bounds,
 };
 use aeris_charts_core::scale::time_tick_marks::civil_from_timestamp;
 use serde::{Deserialize, Serialize};
@@ -841,8 +841,8 @@ mod tests {
     }
 
     use crate::{
-        parse_iso_date, parse_wall_clock, session_slot_times, SessionSlotConvention,
-        UtcOffsetSchedule, UtcOffsetTransition,
+        SessionSlotConvention, UtcOffsetSchedule, UtcOffsetTransition, parse_iso_date,
+        parse_wall_clock, session_slot_times,
     };
 
     const DAY: i64 = 86_400;
@@ -1058,7 +1058,9 @@ mod tests {
             bars.iter()
                 .map(|bar| local_clock(&zone, bar.timestamp))
                 .collect::<Vec<_>>(),
-            ["09:30", "10:30", "13:00", "14:00", "09:30", "10:30", "13:00", "14:00"]
+            [
+                "09:30", "10:30", "13:00", "14:00", "09:30", "10:30", "13:00", "14:00"
+            ]
         );
         assert!(bars.iter().all(|bar| bar.source_rows == 60));
         assert_eq!(
@@ -1120,13 +1122,17 @@ mod tests {
             bars.iter()
                 .map(|bar| local_clock(&zone, bar.timestamp))
                 .collect::<Vec<_>>(),
-            ["09:30", "10:30", "13:00", "14:00", "09:30", "10:30", "13:00", "14:00"]
+            [
+                "09:30", "10:30", "13:00", "14:00", "09:30", "10:30", "13:00", "14:00"
+            ]
         );
         assert_eq!(
             bars.iter()
                 .map(|bar| local_clock(&zone, chart.chart.bar_label_time(bar.timestamp)))
                 .collect::<Vec<_>>(),
-            ["10:30", "11:30", "14:00", "15:00", "10:30", "11:30", "14:00", "15:00"]
+            [
+                "10:30", "11:30", "14:00", "15:00", "10:30", "11:30", "14:00", "15:00"
+            ]
         );
         assert_eq!(rows(&chart.chart, chart.target).len(), 8);
     }
@@ -1237,21 +1243,24 @@ mod tests {
                 columns[2][row],
                 columns[3][row],
             ];
-            assert!(live
-                .chart
-                .update_series_bar(live.source, times[row] as f64, values));
-            assert!(live
-                .chart
-                .update_series_bar(live.volume, times[row] as f64, [volume[row]; 4]));
+            assert!(
+                live.chart
+                    .update_series_bar(live.source, times[row] as f64, values)
+            );
+            assert!(
+                live.chart
+                    .update_series_bar(live.volume, times[row] as f64, [volume[row]; 4])
+            );
             let after = live.chart.resample_stats(live.target).unwrap();
             assert_eq!(after.rebuilds, before.rebuilds);
             assert_eq!(after.tail_refreshes, before.tail_refreshes + 2);
             assert!(after.rows_scanned - before.rows_scanned <= 2 * 6, "{row}");
             // Replacing the forming minute is bounded the same way.
             let revised = [values[0], values[1] + 0.5, values[2], values[3] + 0.2];
-            assert!(live
-                .chart
-                .update_series_bar(live.source, times[row] as f64, revised));
+            assert!(
+                live.chart
+                    .update_series_bar(live.source, times[row] as f64, revised)
+            );
             let revised_stats = live.chart.resample_stats(live.target).unwrap();
             assert!(revised_stats.rows_scanned - after.rows_scanned <= 6);
         }
@@ -1358,14 +1367,18 @@ mod tests {
         // The third bucket traded two minutes: it closes at the last traded minute.
         assert_eq!(bars[2].close, columns[3][11]);
         assert_eq!(bars[2].volume, volume[10] + volume[11]);
-        assert!(bars[3..]
-            .iter()
-            .all(|bar| bar.close.is_nan() && bar.open.is_nan() && bar.volume.is_nan()));
+        assert!(
+            bars[3..]
+                .iter()
+                .all(|bar| bar.close.is_nan() && bar.open.is_nan() && bar.volume.is_nan())
+        );
         let target = rows(&chart.chart, chart.target);
         assert_eq!(target.len(), 48);
-        assert!(target[3..]
-            .iter()
-            .all(|row| row.1.iter().all(|value| value.is_nan())));
+        assert!(
+            target[3..]
+                .iter()
+                .all(|row| row.1.iter().all(|value| value.is_nan()))
+        );
     }
 
     #[test]
@@ -1426,9 +1439,11 @@ mod tests {
             // Only the forming bucket changed: the reserved buckets stay whitespace.
             let bars = live.chart.resampled_bars(live.target).unwrap();
             assert_eq!(bars.len(), 96);
-            assert!(bars[(row - times.len() / 2) / 5 + 49..]
-                .iter()
-                .all(|bar| bar.close.is_nan()));
+            assert!(
+                bars[(row - times.len() / 2) / 5 + 49..]
+                    .iter()
+                    .all(|bar| bar.close.is_nan())
+            );
         }
         assert_matches_fresh(&live);
     }
@@ -1472,29 +1487,34 @@ mod tests {
             } else {
                 (bar(row), [volume[row]; 4])
             };
-            assert!(live
-                .chart
-                .update_series_bar(live.source, times[row] as f64, values));
-            assert!(live
-                .chart
-                .update_series_bar(live.volume, times[row] as f64, size));
+            assert!(
+                live.chart
+                    .update_series_bar(live.source, times[row] as f64, values)
+            );
+            assert!(
+                live.chart
+                    .update_series_bar(live.volume, times[row] as f64, size)
+            );
             assert_matches_fresh(&live);
         }
         // Fill a missing historical bucket (a bar inserted mid-target), then blank a traded
         // minute and trade into a whitespace one.
         for row in [6, 7, 8] {
-            assert!(live
-                .chart
-                .update_series_bar(live.source, times[row] as f64, bar(row)));
-            assert!(live
-                .chart
-                .update_series_bar(live.volume, times[row] as f64, [volume[row]; 4]));
+            assert!(
+                live.chart
+                    .update_series_bar(live.source, times[row] as f64, bar(row))
+            );
+            assert!(
+                live.chart
+                    .update_series_bar(live.volume, times[row] as f64, [volume[row]; 4])
+            );
             assert_matches_fresh(&live);
         }
         let blank = times.len() - 39;
-        assert!(live
-            .chart
-            .update_series_bar(live.source, times[blank] as f64, [nan; 4]));
+        assert!(
+            live.chart
+                .update_series_bar(live.source, times[blank] as f64, [nan; 4])
+        );
         assert_matches_fresh(&live);
         let whitespace = times.len() - 40;
         assert!(live.chart.update_series_bar(
@@ -1507,12 +1527,14 @@ mod tests {
         assert!(live.chart.set_series_max_points(live.source, Some(200)));
         assert!(live.chart.set_series_max_points(live.volume, Some(200)));
         for row in times.len() - 20..times.len() {
-            assert!(live
-                .chart
-                .update_series_bar(live.source, times[row] as f64, bar(row)));
-            assert!(live
-                .chart
-                .update_series_bar(live.volume, times[row] as f64, [volume[row]; 4]));
+            assert!(
+                live.chart
+                    .update_series_bar(live.source, times[row] as f64, bar(row))
+            );
+            assert!(
+                live.chart
+                    .update_series_bar(live.volume, times[row] as f64, [volume[row]; 4])
+            );
         }
         assert!(rows(&live.chart, live.source).len() <= 200);
         assert_matches_fresh(&live);
@@ -1650,9 +1672,11 @@ mod tests {
             let before = rows(&live.chart, target);
             let bars = live.chart.resampled_bars(live.target).unwrap().to_vec();
             let chart = &mut live.chart;
-            assert!(chart
-                .set_series_data(target, &[open], &[1.0], &[2.0], &[0.5], &[1.5])
-                .is_err());
+            assert!(
+                chart
+                    .set_series_data(target, &[open], &[1.0], &[2.0], &[0.5], &[1.5])
+                    .is_err()
+            );
             assert!(!chart.install_series_data(
                 target,
                 vec![times[0]],
@@ -1846,10 +1870,11 @@ mod tests {
             },
             ..FootprintAggregationOptions::default()
         };
-        assert!(live
-            .chart
-            .add_trade_stream("SSE:600000:1m", minute_bars)
-            .is_ok());
+        assert!(
+            live.chart
+                .add_trade_stream("SSE:600000:1m", minute_bars)
+                .is_ok()
+        );
 
         let mut sequence = ChartEngine::new(800.0, 400.0, 1.0);
         let source = sequence.add_series(SeriesKind::Candlestick);

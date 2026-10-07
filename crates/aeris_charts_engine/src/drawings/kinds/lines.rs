@@ -17,9 +17,9 @@
 use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point};
 
-use super::super::geometry::{segment_extension, DrawingGeometryOptions, CURVE_TOLERANCE};
+use super::super::geometry::{CURVE_TOLERANCE, DrawingGeometryOptions, segment_extension};
 use super::super::parts::{
-    cap_radius, text_on, DrawingParts, PartContext, PartLabel, PartStroke, STATS_GAP, STATS_PADDING,
+    DrawingParts, PartContext, PartLabel, PartStroke, STATS_GAP, STATS_PADDING, cap_radius, text_on,
 };
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,

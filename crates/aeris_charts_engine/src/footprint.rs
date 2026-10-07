@@ -16,8 +16,8 @@ use aeris_charts_core::style::{MARKET_DOWN_RGB, MARKET_UP_RGB};
 use aeris_charts_render::color::Color;
 
 use crate::{
-    ChartEngine, PriceFormatKind, SeriesKind, SeriesOwner, SeriesPriceFormat,
-    SEPARATE_INDICATOR_PANE_STRETCH,
+    ChartEngine, PriceFormatKind, SEPARATE_INDICATOR_PANE_STRETCH, SeriesKind, SeriesOwner,
+    SeriesPriceFormat,
 };
 
 const MICROS_PER_SECOND: i64 = 1_000_000;
@@ -591,10 +591,10 @@ impl BarSequenceMapping {
         let upper = self
             .common_indices
             .partition_point(|&(old_index, _)| (old_index as f64) < logical);
-        if let Some(&(old_index, new_index)) = self.common_indices.get(upper) {
-            if old_index as f64 == logical {
-                return new_index as f64;
-            }
+        if let Some(&(old_index, new_index)) = self.common_indices.get(upper)
+            && old_index as f64 == logical
+        {
+            return new_index as f64;
         }
         if upper == 0 {
             let (old_index, new_index) = self.common_indices[0];
@@ -1248,10 +1248,10 @@ impl FootprintAggregator {
                 }
                 counted += 1;
             }
-            if let Some(trade_id) = trade.trade_id {
-                if self.trade_ids.get(&trade_id) == Some(&(self.trade_id_base + trade_start)) {
-                    self.trade_ids.remove(&trade_id);
-                }
+            if let Some(trade_id) = trade.trade_id
+                && self.trade_ids.get(&trade_id) == Some(&(self.trade_id_base + trade_start))
+            {
+                self.trade_ids.remove(&trade_id);
             }
             trade_start += 1;
             let side = stored.classified_side;
@@ -2950,18 +2950,16 @@ impl ChartEngine {
         let sequence_owner = self.trade_stream(stream_id).is_some_and(|stream| {
             !matches!(stream.options().bars, FootprintBarAggregation::Time { .. })
         });
-        if sequence_owner {
-            if let Some(points) = self.sequence_points.as_mut() {
-                if points.len() > keep {
-                    points.drain(..points.len() - keep);
-                }
-                for (index, point) in points.iter_mut().enumerate() {
-                    point.logical_index = index as u64;
-                }
-                // Every retention caller runs `sync_time_points` next, which reads this
-                // sidecar and applies the exact viewport compensation for the trim. Syncing
-                // the scale here as well would move the base index first and compensate twice.
+        if sequence_owner && let Some(points) = self.sequence_points.as_mut() {
+            if points.len() > keep {
+                points.drain(..points.len() - keep);
             }
+            for (index, point) in points.iter_mut().enumerate() {
+                point.logical_index = index as u64;
+            }
+            // Every retention caller runs `sync_time_points` next, which reads this
+            // sidecar and applies the exact viewport compensation for the trim. Syncing
+            // the scale here as well would move the base index first and compensate twice.
         }
         // Big trades drop the orders that opened in evicted bars and keep every other order and
         // the automatic filter's state, without replaying the retained tape.
@@ -3310,14 +3308,13 @@ impl ChartEngine {
                 .trade_bar_dependents
                 .get_mut(&stream_id)
                 .and_then(|dependents| dependents.get_mut(index))
+                && stored.applied_revision != revision
             {
-                if stored.applied_revision != revision {
-                    stored.applied_revision = revision;
-                    if updated {
-                        stored.incremental_updates = stored.incremental_updates.saturating_add(1);
-                    } else {
-                        stored.rebuilds = stored.rebuilds.saturating_add(1);
-                    }
+                stored.applied_revision = revision;
+                if updated {
+                    stored.incremental_updates = stored.incremental_updates.saturating_add(1);
+                } else {
+                    stored.rebuilds = stored.rebuilds.saturating_add(1);
                 }
             }
         }
@@ -3697,10 +3694,10 @@ fn validate_trade_batch(
     let mut ids = HashMap::with_capacity(input.len());
     for (index, trade) in input.iter().enumerate() {
         validate_trade(options, trade, index)?;
-        if let Some(trade_id) = trade.trade_id {
-            if ids.insert(trade_id, index).is_some() {
-                return Err(FootprintError::DuplicateTradeId { trade_id });
-            }
+        if let Some(trade_id) = trade.trade_id
+            && ids.insert(trade_id, index).is_some()
+        {
+            return Err(FootprintError::DuplicateTradeId { trade_id });
         }
     }
     Ok(())
@@ -5399,22 +5396,26 @@ mod tests {
         assert_eq!(chart.data_layer().series_data(sma).unwrap().0, &[2]);
         chart.fit_content();
         let frame = chart.build_frame();
-        assert!(frame
-            .panes
-            .iter()
-            .flat_map(|pane| &pane.main)
-            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Replay")));
-        assert!(frame
-            .panes
-            .iter()
-            .flat_map(|pane| &pane.main)
-            .any(|primitive| matches!(
-                primitive,
-                Prim::VLine {
-                    style: LineStyle::Dashed,
-                    ..
-                }
-            )));
+        assert!(
+            frame
+                .panes
+                .iter()
+                .flat_map(|pane| &pane.main)
+                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Replay"))
+        );
+        assert!(
+            frame
+                .panes
+                .iter()
+                .flat_map(|pane| &pane.main)
+                .any(|primitive| matches!(
+                    primitive,
+                    Prim::VLine {
+                        style: LineStyle::Dashed,
+                        ..
+                    }
+                ))
+        );
 
         assert!(chart.update_series_bar(0, 4.0, [40.0, 41.0, 39.0, 40.5]));
         assert_eq!(chart.data_layer().merged_times(), &[1, 2]);
@@ -5538,9 +5539,11 @@ mod tests {
         assert_eq!(lower.total_volume, 6.0);
         assert_eq!(lower.bid_volume, 2.0);
         assert_eq!(lower.ask_volume, 4.0);
-        assert!(levels
-            .iter()
-            .any(|level| level.price == 105.0 && level.total_volume == 4.0));
+        assert!(
+            levels
+                .iter()
+                .any(|level| level.price == 105.0 && level.total_volume == 4.0)
+        );
         // Bar high/low stay exact trade prices; the row extent covers whole rows.
         assert_eq!((bars[0].low, bars[0].high), (100.0, 105.0));
         assert_eq!(
@@ -5548,17 +5551,21 @@ mod tests {
             (99.5, 109.5)
         );
         // Trades are still validated against the instrument tick, not the row.
-        assert!(chart
-            .set_footprint_trades(
-                series,
-                vec![trade(1_400_000, 100.5, 1.0, AggressorSide::Buy)]
-            )
-            .is_err());
-        assert!(validate_options(FootprintAggregationOptions {
-            ticks_per_row: 0,
-            ..options
-        })
-        .is_err());
+        assert!(
+            chart
+                .set_footprint_trades(
+                    series,
+                    vec![trade(1_400_000, 100.5, 1.0, AggressorSide::Buy)]
+                )
+                .is_err()
+        );
+        assert!(
+            validate_options(FootprintAggregationOptions {
+                ticks_per_row: 0,
+                ..options
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -5700,9 +5707,11 @@ mod tests {
                 if *color == poc.solid() && rect.w == 2 && rect.h > 1)
         }));
         // Imbalance glyphs are bold so the signal scans at a glance.
-        assert!(prims
-            .iter()
-            .any(|primitive| { matches!(primitive, Prim::Text { weight, .. } if *weight == 700) }));
+        assert!(
+            prims.iter().any(|primitive| {
+                matches!(primitive, Prim::Text { weight, .. } if *weight == 700)
+            })
+        );
 
         chart.set_theme(crate::ChartTheme::Light);
         let expected_text = Color::parse_css(&chart.options.get().layout.text_color).unwrap();
@@ -5736,9 +5745,11 @@ mod tests {
             .find(|segment| segment.series_id == Some(0))
             .unwrap();
         let prims = &cells.panes[0].main[segment.start..segment.end];
-        assert!(!prims
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Text { .. })));
+        assert!(
+            !prims
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Text { .. }))
+        );
         assert!(prims.iter().any(|primitive| {
             matches!(primitive, Prim::Rect { rect, color }
                 if *color == poc.solid() && rect.w == 2 && rect.h > 1)
@@ -5759,12 +5770,16 @@ mod tests {
             .find(|segment| segment.series_id == Some(0))
             .unwrap();
         let prims = &summary.panes[0].main[segment.start..segment.end];
-        assert!(!prims
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Text { .. })));
-        assert!(prims
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Rect { color, .. } if *color == poc)));
+        assert!(
+            !prims
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Text { .. }))
+        );
+        assert!(
+            prims
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Rect { color, .. } if *color == poc))
+        );
     }
 
     #[test]

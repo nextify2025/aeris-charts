@@ -108,12 +108,16 @@ fn precision_derives_from_min_move_when_omitted() {
         serde_json::from_str(&chart.series_options_json(0).unwrap()).unwrap();
     assert_eq!(options["price_format"]["precision"], 4);
     let labels = tick_labels(&mut chart);
-    assert!(labels
-        .iter()
-        .all(|label| label.split('.').nth(1).map(str::len) == Some(4)));
+    assert!(
+        labels
+            .iter()
+            .all(|label| label.split('.').nth(1).map(str::len) == Some(4))
+    );
     // An explicit precision still wins, and a precision-only patch keeps the move.
-    assert!(chart
-        .series_apply_price_format_json(0, r#"{"type":"price","precision":3,"min_move":0.05}"#));
+    assert!(
+        chart
+            .series_apply_price_format_json(0, r#"{"type":"price","precision":3,"min_move":0.05}"#)
+    );
     let options: serde_json::Value =
         serde_json::from_str(&chart.series_options_json(0).unwrap()).unwrap();
     assert_eq!(options["price_format"]["precision"], 3);
@@ -185,9 +189,11 @@ fn us_sub_dollar_ladder_prints_four_decimals_below_one_dollar() {
     ));
     let labels = tick_labels(&mut chart);
     assert!(!labels.is_empty());
-    assert!(labels
-        .iter()
-        .all(|label| label.split('.').nth(1).map(str::len) == Some(4)));
+    assert!(
+        labels
+            .iter()
+            .all(|label| label.split('.').nth(1).map(str::len) == Some(4))
+    );
 }
 
 #[test]

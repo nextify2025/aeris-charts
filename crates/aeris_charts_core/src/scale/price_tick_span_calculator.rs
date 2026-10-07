@@ -170,11 +170,7 @@ pub fn align_span_to_min_move(span: f64, min_move: f64) -> f64 {
             }
         }
     }
-    if best.is_finite() {
-        best
-    } else {
-        span
-    }
+    if best.is_finite() { best } else { span }
 }
 
 /// The composite span used by the tick mark builder: the minimum over the three divider cycles.

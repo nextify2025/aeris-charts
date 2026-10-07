@@ -9,7 +9,7 @@ use std::collections::{HashSet, VecDeque};
 use aeris_charts_render::draw_list::RasterImage;
 use serde::{Deserialize, Serialize};
 
-use crate::{ChartEngine, ChartError, ErrorCode, PriceScaleTarget, PANELESS};
+use crate::{ChartEngine, ChartError, ErrorCode, PANELESS, PriceScaleTarget};
 
 pub const MAX_ALERT_LINES: usize = 4_096;
 const MAX_ALERT_REQUESTS: usize = 256;
@@ -397,11 +397,13 @@ mod tests {
         let before = chart.alert_snapshot();
         let mut invalid = line("bad", AlertLineStatus::Triggered);
         invalid.price = f64::NAN;
-        assert!(chart
-            .set_alert_snapshot(AlertSnapshot {
-                lines: vec![invalid],
-            })
-            .is_err());
+        assert!(
+            chart
+                .set_alert_snapshot(AlertSnapshot {
+                    lines: vec![invalid],
+                })
+                .is_err()
+        );
         assert_eq!(chart.alert_snapshot(), before);
 
         let mut negative = line("negative", AlertLineStatus::Active);
@@ -422,9 +424,11 @@ mod tests {
         let frame = chart.build_frame();
         let segments = chart.frame_pane_segments(0).unwrap();
         let actionable = &frame.panes[0].main[segments.drawings_end..segments.trading_end];
-        assert!(actionable
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::HLine { .. })));
+        assert!(
+            actionable
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::HLine { .. }))
+        );
         // The line is named by an attached bell badge — drawn geometry, not a glyph — so the
         // axis tag itself carries nothing but the price, like every other tag.
         let color = chart.alert_color(AlertLineStatus::Active);
@@ -433,9 +437,11 @@ mod tests {
             Prim::RoundRect { fill, radii, .. }
                 if *fill == color && radii[0] > 0.0 && radii[1] == 0.0
         )));
-        assert!(actionable
-            .iter()
-            .all(|primitive| !matches!(primitive, Prim::Text { text, .. } if text == "A")));
+        assert!(
+            actionable
+                .iter()
+                .all(|primitive| !matches!(primitive, Prim::Text { text, .. } if text == "A"))
+        );
         let axis = chart.build_axis_frame(
             100.0,
             |text, _bold| text.len() as f64 * 7.0,

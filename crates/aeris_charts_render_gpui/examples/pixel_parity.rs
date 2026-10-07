@@ -76,11 +76,11 @@ use std::time::Duration;
 use aeris_charts_render_gpui::fixtures::{self, Fixture};
 use aeris_charts_render_gpui::{AerisViewport, GpuiChartRenderer};
 use gpui::{
-    canvas, div, prelude::*, px, size, App, Bounds, Context, Entity, Render, Window, WindowBounds,
-    WindowOptions,
+    App, Bounds, Context, Entity, Render, Window, WindowBounds, WindowOptions, canvas, div,
+    prelude::*, px, size,
 };
 use gpui_platform::application;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "linux")]
@@ -374,7 +374,7 @@ fn compare(f: &Fixture, dir: &Path, tolerance: u8) -> Row {
                 "png load failed: gpui={:?} native={:?}",
                 a.err(),
                 b.err()
-            ))
+            ));
         }
     };
     if a.width() != b.width() || a.height() != b.height() {

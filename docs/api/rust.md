@@ -12,6 +12,8 @@ Rust crate 不发布到 crates.io。当前依赖与历史迁移说明分开阅�
 
 Rust crate 仅限仓库内使用（`publish = false`）；不会向 crates.io 发布任何内容，浏览器包是唯一发布的产物。Aeris Terminal 等宿主通过固定的 Git 修订版本或本地路径使用 `aeris_charts_*` crate。Rust API 低于 1.0，可能在任何修订中变更，因此宿主在更换其固定修订时应查阅下面的说明。
 
+工作区使用 Rust 2024 版次（edition 2024）与 `resolver = "3"`，并声明 `rust-version = "1.99"`；每个 `aeris_charts_*` crate 都以 `rust-version.workspace = true` 继承该值。因此宿主必须用 rustc 1.99 或更高版本构建这些 crate：1.85 至 1.98 的工具链会得到 Cargo 明确的最低版本错误（`rust-version` 检查），更早的 Cargo 不认识 2024 版次，会在解析清单时直接失败。版次按 crate 生效，宿主自己的 crate 可以留在 2021 版次。resolver 3 会在生成或更新锁文件时优先选择 `rust-version` 不高于工作区声明的依赖版本（MSRV 感知）；它只作用于本仓库自己的 `Cargo.lock`，宿主构建时由宿主工作区的 resolver 设置与锁文件决定依赖版本。仓库自身的工具链另由 `rust-toolchain.toml` 固定为 1.99.0（见[固定工具链与严格预算](../development/validation.md#固定工具链与严格预算)）。
+
 `aeris_charts_render_gpui` 是实验性的。它以精确版本要求固定 `gpui-pre` 0.3.7，即 gpui-kit 0.7.0 所依赖的 GPUI 快照，因此绘制图表的宿主必须使用同一个 `gpui`（宿主若使用其他 GPUI 构建，例如 Zed 的某个 Git 修订版本，就会持有其类型的两份不兼容副本）。GPUI 升级是显式的 manifest 与 lockfile 变更。
 
 在 macOS 上，宿主必须启用 `font-kit` feature 来构建其 GPUI 平台 crate（`gpui-pre-platform`，或直接构建 `gpui-pre-macos`），该 feature 即 GPUI 的 macOS 文本系统。否则 GPUI 会改用空操作的文本系统：图表不绘制任何文本（坐标轴、标签、图例、绘图文本），并将每个字符串的宽度度量为零，唯一的信号是启动时的一条 `log::warn!`。Linux 和 Windows 不受影响。
@@ -198,6 +200,11 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - `9fc3f2b`，新增项：`ChartEngine::{add_big_trades, set_big_trades_options, big_trades_options, big_trades_snapshot, remove_big_trades}`；公共类型 `BigTrade`、`BigTradesFilter`、`BigTradesIntensity`、`BigTradesOptions`、`BigTradesSize`、`BigTradesSnapshot`，上限 `MAX_BIG_TRADES_INDICATORS`（16）、`MAX_BIG_TRADES_BUBBLES`（4,096）与 `MAX_BIG_TRADES_GROUPING_WINDOW_MICROS`（1,000,000）；`OrderFlowPresentation::big_trades()`；`FootprintBar` 实现 `Default`。`FootprintError` 新增 `UnsupportedBigTradesSeries`、`InvalidBigTradesOptions`、`BigTradesCapacity` 与 `UnknownBigTrades` 四个变体，对它做穷尽 `match` 的代码需要补分支。
 - 合并时的自有线调整（合并 `9fc3f2b` 的提交）：`TradeStreamStats` 的 `bubble_trades_scanned` 与 `bubble_markers_sized` 改为 `big_trades_prints_scanned` 与 `big_trades_replays`（`#[serde(default)]`），列出全部字段的结构体字面量需要更新。大单在保留裁剪时就地丢弃开仓于被淘汰柱的订单而不回放成交带，非时间轴订单携带不随裁剪重新编号的行键（流没有任何展示时携带流内柱位置，随裁剪平移），被交易时段策略排除的成交不开启也不延续订单，并计入订单流成交带预算；淘汰之后的回放只从保留的成交带重建，可能与就地结果不同（首根保留柱上多出一个订单，自动阈值重新预热）。这些与上游 `9fc3f2b` 的回放语义不同，详见[成交流架构](../architecture/engine/market-data.md#共享成交流与唯一写入者)。
 - 浏览器与 WASM：`AerisChart::add_trade_bubbles` 与 `chart.add_trade_bubbles` 已移除；新增 `add_big_trades(stream_id, series_id, options_json)` 与 `set_big_trades_options(id, options_json)`（二者返回 `{ok, result}` / `{ok:false, error:{code, message}}` 信封：超过 16 个指标为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，已移除的指标为 `stale_handle`，其余为 `invalid_options`；上游返回 `u32`/`bool` 并统一报告为 `invalid_options`）、`big_trades_options`、`big_trades_snapshot` 与 `remove_big_trades`，TypeScript 的 `chart.add_big_trades` 返回 `big_trades_api`（见[兼容性](compatibility.md#已记录的不兼容变更)）。
+
+**Rust 2024 版次与最低 rustc 1.99**（自有线，即提交 `chore: move the fork tree to Rust edition 2024`，可用 `git log -S'rust-version.workspace' -- crates/aeris_charts_core/Cargo.toml` 找到；它按上游 `71cba91 chore: migrate to Rust 1.99, edition 2024, and latest dependencies` 的同一迁移改写本仓库代码树；参见 [Rust 分发](#rust-分发)）。宿主需要评审的只有工具链：
+
+- 构建 `aeris_charts_*` crate 需要 rustc 1.99 或更高版本（每个 crate 继承 `rust-version = "1.99"`）。宿主自己的 crate 可以留在 2021 版次。
+- 没有公共 API 变更。`aeris_charts_render_gpui::backend::text_measurer` 与 `text_cap_centerer` 的返回类型写成 `impl Fn(..) -> f64 + 'static + use<>`：2024 版次下返回的 `impl Trait` 默认会捕获参数 `&Window` 的生命周期，`use<>` 保留了此前不借用窗口的含义，调用点无需改动。
 
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 

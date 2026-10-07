@@ -12,7 +12,7 @@
 use std::sync::LazyLock;
 
 use crate::scale::exchange_time::ExchangeTime;
-use crate::scale::time_tick_marks::{civil_from_timestamp, TickMarkWeight};
+use crate::scale::time_tick_marks::{TickMarkWeight, civil_from_timestamp};
 
 const MONTHS_SHORT: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

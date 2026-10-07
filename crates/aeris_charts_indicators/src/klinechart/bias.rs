@@ -1,7 +1,7 @@
 //! `BIAS` (乖离率). Ported from KLineChart `src/extension/indicator/bias.ts`.
 
-use super::stepper::{fold, rolling_mean_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, rolling_mean_step};
 use crate::MAX_OUTPUTS;
 
 /// One running sum per period. A running add/subtract sum cannot be recomputed from its window

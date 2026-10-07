@@ -1,6 +1,6 @@
 use super::*;
 use crate::footprint::{
-    footprint_row_price_bounds, FootprintAggregationOptions, FootprintBar, FootprintCellMode,
+    FootprintAggregationOptions, FootprintBar, FootprintCellMode, footprint_row_price_bounds,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

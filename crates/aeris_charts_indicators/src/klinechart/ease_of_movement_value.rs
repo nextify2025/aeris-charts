@@ -1,8 +1,8 @@
 //! `EMV` (简易波动指标). Ported from KLineChart
 //! `src/extension/indicator/easeOfMovementValue.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// EMV outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

@@ -284,7 +284,9 @@ mod tests {
         // extend the record without moving these.
         assert_eq!(
             &out[slot::GPU_BUFFER_ALLOCATIONS..=slot::TRADING_REBUILDS],
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 6.0, 9.0, 10.0, 11.0, 12.0]
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 6.0, 9.0, 10.0, 11.0, 12.0
+            ]
         );
     }
 

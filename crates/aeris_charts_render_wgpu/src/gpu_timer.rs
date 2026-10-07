@@ -17,8 +17,8 @@
 
 use std::cell::Cell;
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
     Arc,
+    atomic::{AtomicU8, Ordering},
 };
 
 /// Bytes for two `u64` timestamps (the resolve destination and its staging copy).

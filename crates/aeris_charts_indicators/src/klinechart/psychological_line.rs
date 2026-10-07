@@ -1,7 +1,7 @@
 //! `PSY` (心理线). Ported from KLineChart `src/extension/indicator/psychologicalLine.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// PSY outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

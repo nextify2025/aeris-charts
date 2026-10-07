@@ -3,7 +3,7 @@
 //! per-band precision, the axis tick grid, and trading price snapping, so every surface agrees on
 //! which prices are tradable.
 
-use crate::format::price_formatter::{precision_by_min_move, PriceFormatter};
+use crate::format::price_formatter::{PriceFormatter, precision_by_min_move};
 use crate::scale::price_tick_span_calculator::is_multiple_of;
 
 /// Upper bound on bands per ladder; real spread tables have at most a dozen.
@@ -156,11 +156,7 @@ impl PriceTickLadder {
         let band = self.bands[band_index];
         let price = band.from + (magnitude - self.base_index[band_index]) * band.min_move;
         let price = (price / band.min_move).round() * band.min_move;
-        if index < 0 {
-            -price
-        } else {
-            price
-        }
+        if index < 0 { -price } else { price }
     }
 
     /// Move an on-grid (or snapped) price by `ticks` exact band ticks, crossing band boundaries.
@@ -318,17 +314,21 @@ mod tests {
     #[test]
     fn invalid_ladders_are_rejected() {
         assert!(PriceTickLadder::new(Vec::new()).is_err());
-        assert!(PriceTickLadder::new(vec![
-            PriceTickBand::new(1.0, 0.01),
-            PriceTickBand::new(0.5, 0.01),
-        ])
-        .is_err());
+        assert!(
+            PriceTickLadder::new(vec![
+                PriceTickBand::new(1.0, 0.01),
+                PriceTickBand::new(0.5, 0.01),
+            ])
+            .is_err()
+        );
         assert!(PriceTickLadder::new(vec![PriceTickBand::new(0.0, 0.0)]).is_err());
-        assert!(PriceTickLadder::new(vec![
-            PriceTickBand::new(0.0, 0.02),
-            PriceTickBand::new(10.01, 0.01),
-        ])
-        .is_err());
+        assert!(
+            PriceTickLadder::new(vec![
+                PriceTickBand::new(0.0, 0.02),
+                PriceTickBand::new(10.01, 0.01),
+            ])
+            .is_err()
+        );
         assert!(PriceTickLadder::new(vec![PriceTickBand::new(0.0, 0.01); 65]).is_err());
     }
 }

@@ -1,7 +1,7 @@
 //! `CCI` (顺势指标). Ported from KLineChart `src/extension/indicator/commodityChannelIndex.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// The running sum of the window's typical prices. A running add/subtract sum cannot be recomputed
 /// from its window bit for bit, so it lives in the checkpointed state.
