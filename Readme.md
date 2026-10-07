@@ -193,7 +193,7 @@ import "@aeristerminal/aeris-charts/design.css";
 
 ## 开发
 
-开发工具链与 CI 对齐：Rust 版本由 `rust-toolchain.toml` 固定，另需 `wasm32-unknown-unknown` 目标、`wasm-pack` 0.15.0、Bun 1.4.2 和 Node.js 24。完整环境与平台要求见[验证门禁](docs/development/validation.md)。
+开发工具链与 CI 对齐：Rust 版本由 `rust-toolchain.toml` 固定，rustup 会按该文件自动安装这一版本及 `wasm32-unknown-unknown` 目标；另需 `wasm-pack` 0.15.0、Bun 1.4.2 和 Node.js 24。完整环境与平台要求见[验证门禁](docs/development/validation.md)。
 
 ```sh
 cargo test --workspace

@@ -206,6 +206,13 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - 构建 `aeris_charts_*` crate 需要 rustc 1.99 或更高版本（每个 crate 继承 `rust-version = "1.99"`）。宿主自己的 crate 可以留在 2021 版次。
 - 没有公共 API 变更。`aeris_charts_render_gpui::backend::text_measurer` 与 `text_cap_centerer` 的返回类型写成 `impl Fn(..) -> f64 + 'static + use<>`：2024 版次下返回的 `impl Trait` 默认会捕获参数 `&Window` 的生命周期，`use<>` 保留了此前不借用窗口的含义，调用点无需改动。
 
+**Rust 1.99 工具链固定与依赖刷新**（上游，来自 `71cba91 chore: migrate to Rust 1.99, edition 2024, and latest dependencies`；它的代码迁移已由上一分组的自有线提交完成，参见[固定工具链与严格预算](../development/validation.md#固定工具链与严格预算)）。合并该提交时，宿主可见的结论如下：
+
+- Rust 源码、`Cargo.toml` 与公共 API 均不变：上游对 `.rs` 文件的修改只是 2024 风格版次的重新格式化（含 2024 的导入排序）、把嵌套 `if let` 合并为 let 链（Clippy 的 `collapsible_if` 改写，语义不变），以及上一分组已采纳的 `gen`→`before` 与 `use<>` 编辑；这些改写此前都已在上一分组的自有线提交中。
+- GPUI：不采纳上游把 Zed GPUI 与 `gpui_platform` 从 `1057c2cf` 升至 `a8468907`（gpui 0.2.2）的修改。本仓库继续固定 `gpui-pre =0.3.7` 与 `gpui-pre-platform =0.3.7`，宿主的 GPUI 依赖无需改动。
+- `Cargo.lock`：保留本仓库的锁文件，它与清单一致（`--locked` 构建通过），合并没有改动它。上游刷新后的 `wasm-bindgen` 0.2.129、`js-sys` 与 `web-sys` 0.3.106 和 `smallvec` 1.16.2 此前已在锁文件中；其余与上游锁文件的差异有意不引入，例如 `tokio` 1.53.1（上游 1.53.2）、`async-recursion` 1.1.1（上游 1.2.0），以及 `gpui-pre =0.3.7` 依赖图中经 `zed-font-kit` 引入的 `dirs` 5.0.1 / `dirs-sys` 0.4.1 / `redox_users` 0.4.6（上游 6.0.0 / 0.5.0 / 0.5.3），因为合并只做与清单一致的最小协调，不做全面的 `cargo update`；`unicode-properties` 保持 0.1.4（上游为 0.1.3），`borsh` 与 `x11-clipboard` 保留，不引入 Zed 的 Git 依赖。宿主构建时由宿主自己的锁文件决定依赖版本。
+- 工作流：`publish.yml` 与三个基准测试工作流的工作流级 `RUSTUP_TOOLCHAIN` 由浮动的 `stable` 改为 `1.99.0`（`benchmark-release.yml` 为 `1.99.0-x86_64-pc-windows-msvc`），因此从包含该合并的修订起，发布的 npm 包与基准测试数据都由固定工具链构建；安装工具链的动作保持 `dtolnay/rust-toolchain@stable` 加 `toolchain: 1.99.0`。npm 依赖（React 19.3、Playwright 1.63 等）此前已与上游一致；本仓库继续使用 `bun.lock`，不恢复上游的 `package-lock.json`。
+
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
 - `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming, viewport, price axis, and intraday charts`（自有线）：
