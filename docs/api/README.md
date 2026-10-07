@@ -43,6 +43,7 @@
 - 由引擎解析的辅助点击上下文，通过 `chart.subscribe_chart_context()` 提供，包括窗格、时间、逻辑索引、坐标、命中的系列，以及其比例尺上的精确价格；菜单、剪贴板操作和订单操作由宿主拥有；
 - 图表范围的引擎值查询，通过 `chart.value_snapshot(logical_index?)` 提供，包括每个存活系列的句柄/ID、当前类型、窗格/比例尺归属位置、由引擎拥有的精确值或各系列独立的最新值、前驱值，以及格式化字段；`mouse_event_params.value_snapshot` 携带相同的记录，并在十字光标离开时恢复最新值，而旧版 `series_data` 仍只包含有值的系列；
 - 新增的完整指标谱系元数据：稳定的绑定 ID、结构化参数、数据源与可选的 VWAP 成交量数据源，以及稳定的输出名称/索引/数量，同时保留旧字段；
+- 七个结构与时段研究：`chart.add_swing_points()`、`chart.add_market_structure()`、`chart.add_fair_value_gaps()`、`chart.add_order_blocks()`、`chart.add_session_levels()`、`chart.add_previous_period_levels()` 与 `chart.add_opening_range()`，配合只读的 `chart.study_annotations()` 标注快照，以及仅在运行时存在的研究日历 `chart.set_study_calendar()`/`chart.clear_study_calendar()`，详见[结构与时段研究](indicators.md#结构与时段研究)与[研究的领域设计](../features/studies.md)；
 - [指标约定](indicators.md#指标约定)一节所述的指标计算约定、KDJ、对空白数据安全的指标数据源、预热查询和成交额加权平均价；
 - 五输出 EMA 色带，通过 `chart.add_ema_ribbon()` 提供，默认周期为 `5/10/20/50/200`，默认颜色为 `#335cff/#FF9800/#7d52f4/#fb4ba3/#fb3748`，以及通过 `chart.set_ema_ribbon_periods()` 进行的原子的就地周期修改；
 - 自有的、与券商无关的交易展示、本地预览、意图与回滚、命中测试、语义样式，以及类型化的意图订阅（确认流程由宿主拥有），均通过 `chart.trading()` 暴露，宿主答复契约见[交易](trading.md)；

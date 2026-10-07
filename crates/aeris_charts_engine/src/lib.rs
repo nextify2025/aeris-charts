@@ -78,6 +78,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 
+pub use aeris_charts_indicators::study_annotations::{
+    SessionSpan, StudyAnnotations, StudyMarker, StudyMarkerKind, StudyZone,
+};
 pub use aeris_charts_indicators::{
     DeviationEstimator, IndicatorConvention, IndicatorSeed, KdjSeed, PivotKind, VwapReset,
     klinechart,
@@ -220,7 +223,8 @@ pub use indicators::{
     EMA_RIBBON_DEFAULT_COLORS, EMA_RIBBON_DEFAULT_PERIODS, INDICATOR_SCHEMA_REVISION,
     IndicatorBindingInfo, IndicatorChromeOptions, IndicatorInputSource, IndicatorKind,
     IndicatorOutputDescriptor, IndicatorOutputStyle, IndicatorParameterDescriptor,
-    IndicatorParameterType, IndicatorSchema,
+    IndicatorParameterType, IndicatorSchema, OrderBlockZone, PreviousPeriod, StructureBreakOn,
+    StructureMitigation, StructureMitigationPrice, StudyCalendarPolicy,
 };
 pub(crate) use indicators::{IndicatorBinding, IndicatorChange};
 pub use interaction::{
@@ -2002,6 +2006,9 @@ pub struct ChartEngine {
     sequence_points: Option<Vec<BarSequencePoint>>,
     synthetic_series: HashMap<SeriesId, SyntheticBarAggregator>,
     resampled_series: HashMap<SeriesId, resampling::ResampleBinding>,
+    /// Host-supplied study sessions; runtime-only, never included in workspace persistence.
+    study_calendar: Vec<ResampleBoundary>,
+    study_calendar_spans: Vec<aeris_charts_indicators::SessionSpan>,
     depth_streams: HashMap<u64, DepthBook>,
     depth_stream_keys: HashMap<String, u64>,
     next_depth_stream_id: u64,
@@ -2300,6 +2307,8 @@ impl ChartEngine {
             sequence_points: None,
             synthetic_series: HashMap::new(),
             resampled_series: HashMap::new(),
+            study_calendar: Vec::new(),
+            study_calendar_spans: Vec::new(),
             depth_streams: HashMap::new(),
             depth_stream_keys: HashMap::new(),
             next_depth_stream_id: 1,

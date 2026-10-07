@@ -6,8 +6,9 @@ use super::*;
 use aeris_charts_engine::{
     ChartEngine, ChartError, DeviationEstimator, DrawingAnchor, DrawingMagnetMode,
     DrawingPriceSegment, ErrorCode, IndicatorConvention, IndicatorInputSource, IndicatorKind,
-    IndicatorOutputStyle, IndicatorSeed, PivotKind, SyntheticBarOptions, SyntheticSourceBar,
-    VwapReset,
+    IndicatorOutputStyle, IndicatorSeed, OrderBlockZone, PivotKind, PreviousPeriod,
+    StructureBreakOn, StructureMitigation, StructureMitigationPrice, StudyCalendarPolicy,
+    SyntheticBarOptions, SyntheticSourceBar, VwapReset,
 };
 
 fn drawing_invalid_data(message: impl Into<String>) -> ChartError {
@@ -255,6 +256,18 @@ impl ChartInner {
             .unwrap_or_else(|_| "null".into())
     }
 
+    pub fn study_annotations_json(&self, binding: u32) -> String {
+        match self.engine.study_annotations(binding) {
+            Ok(annotations) => {
+                serde_json::to_string(&annotations).expect("finite study annotations")
+            }
+            Err(error) => {
+                serde_json::json!({ "error": error.message(), "code": error.code().name() })
+                    .to_string()
+            }
+        }
+    }
+
     fn indicator_input_source(value: &str) -> Option<IndicatorInputSource> {
         match value {
             "open" => Some(IndicatorInputSource::Open),
@@ -289,6 +302,165 @@ impl ChartInner {
     pub fn add_aroon(&mut self, source_id: u32, period: u32) -> Vec<u32> {
         self.engine
             .add_aroon(source_id as SeriesId, period as usize)
+    }
+
+    pub fn add_swing_points(&mut self, source_id: u32, left: u32, right: u32) -> Vec<u32> {
+        self.engine
+            .add_swing_points(source_id as SeriesId, left as usize, right as usize)
+    }
+
+    fn study_calendar_policy(value: &str) -> Option<StudyCalendarPolicy> {
+        match value {
+            "utc" => Some(StudyCalendarPolicy::Utc),
+            "host" => Some(StudyCalendarPolicy::Host),
+            _ => None,
+        }
+    }
+
+    pub fn add_session_levels(&mut self, source_id: u32, calendar: &str) -> Vec<u32> {
+        let Some(calendar) = Self::study_calendar_policy(calendar) else {
+            return Vec::new();
+        };
+        self.engine
+            .add_session_levels(source_id as SeriesId, calendar)
+    }
+
+    pub fn add_previous_period_levels(
+        &mut self,
+        source_id: u32,
+        period: &str,
+        calendar: &str,
+    ) -> Vec<u32> {
+        let (Some(period), Some(calendar)) = (
+            match period {
+                "day" => Some(PreviousPeriod::Day),
+                "week" => Some(PreviousPeriod::Week),
+                "month" => Some(PreviousPeriod::Month),
+                _ => None,
+            },
+            Self::study_calendar_policy(calendar),
+        ) else {
+            return Vec::new();
+        };
+        self.engine
+            .add_previous_period_levels(source_id as SeriesId, period, calendar)
+    }
+
+    pub fn add_opening_range(
+        &mut self,
+        source_id: u32,
+        duration_seconds: u32,
+        calendar: &str,
+    ) -> Vec<u32> {
+        let Some(calendar) = Self::study_calendar_policy(calendar) else {
+            return Vec::new();
+        };
+        self.engine
+            .add_opening_range(source_id as SeriesId, duration_seconds, calendar)
+    }
+
+    pub fn add_market_structure(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+    ) -> Vec<u32> {
+        let break_on = match break_on {
+            "close" => StructureBreakOn::Close,
+            "wick" => StructureBreakOn::Wick,
+            _ => return Vec::new(),
+        };
+        self.engine.add_market_structure(
+            source_id as SeriesId,
+            left as usize,
+            right as usize,
+            break_on,
+        )
+    }
+
+    pub fn add_fair_value_gaps(
+        &mut self,
+        source_id: u32,
+        min_size: f64,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        let (Some(mitigation), Some(mitigation_price)) = (
+            Self::structure_mitigation(mitigation),
+            Self::structure_mitigation_price(mitigation_price),
+        ) else {
+            return Vec::new();
+        };
+        self.engine.add_fair_value_gaps(
+            source_id as SeriesId,
+            min_size,
+            mitigation,
+            mitigation_price,
+            max_active as usize,
+            show_mitigated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_order_blocks(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+        zone: &str,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        let break_on = match break_on {
+            "close" => StructureBreakOn::Close,
+            "wick" => StructureBreakOn::Wick,
+            _ => return Vec::new(),
+        };
+        let zone = match zone {
+            "wick" => OrderBlockZone::Wick,
+            "body" => OrderBlockZone::Body,
+            _ => return Vec::new(),
+        };
+        let (Some(mitigation), Some(mitigation_price)) = (
+            Self::structure_mitigation(mitigation),
+            Self::structure_mitigation_price(mitigation_price),
+        ) else {
+            return Vec::new();
+        };
+        self.engine.add_order_blocks(
+            source_id as SeriesId,
+            left as usize,
+            right as usize,
+            break_on,
+            zone,
+            mitigation,
+            mitigation_price,
+            max_active as usize,
+            show_mitigated,
+        )
+    }
+
+    fn structure_mitigation(value: &str) -> Option<StructureMitigation> {
+        match value {
+            "touch" => Some(StructureMitigation::Touch),
+            "half" => Some(StructureMitigation::Half),
+            "full" => Some(StructureMitigation::Full),
+            _ => None,
+        }
+    }
+
+    fn structure_mitigation_price(value: &str) -> Option<StructureMitigationPrice> {
+        match value {
+            "wick" => Some(StructureMitigationPrice::Wick),
+            "close" => Some(StructureMitigationPrice::Close),
+            _ => None,
+        }
     }
 
     pub fn add_awesome_oscillator(&mut self, source_id: u32) -> u32 {

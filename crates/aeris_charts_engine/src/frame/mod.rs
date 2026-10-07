@@ -1906,6 +1906,39 @@ impl ChartEngine {
                             &mut series_layer.layer.points,
                             scale,
                         );
+                        if let Some(binding) = self.indicators.iter().find(|binding| {
+                            binding.outputs.first() == Some(&rs.id)
+                                && (binding.annotations.is_some() || binding.structure.is_some())
+                        }) && let Some(annotations) =
+                            binding.annotations.as_ref().or_else(|| {
+                                binding
+                                    .structure
+                                    .as_ref()
+                                    .map(|structure| structure.annotations())
+                            })
+                        {
+                            self.build_study_annotations_frame(
+                                rs.id,
+                                binding.source,
+                                annotations,
+                                matches!(
+                                    binding.kind,
+                                    crate::IndicatorKind::FairValueGaps {
+                                        show_mitigated: true,
+                                        ..
+                                    } | crate::IndicatorKind::OrderBlocks {
+                                        show_mitigated: true,
+                                        ..
+                                    }
+                                ),
+                                from,
+                                to,
+                                pane_w_px as i32,
+                                hpr,
+                                vpr,
+                                &mut series_layer.layer.prims,
+                            );
+                        }
                         if self
                             .series
                             .iter()

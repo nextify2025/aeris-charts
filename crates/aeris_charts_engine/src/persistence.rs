@@ -443,6 +443,11 @@ fn validate_positive_number(value: f64, field: &str) -> Result<(), ChartError> {
 
 fn incremental_output_count(kind: &IndicatorKind) -> usize {
     match kind {
+        IndicatorKind::SwingPoints { .. } | IndicatorKind::SessionLevels { .. } => 2,
+        IndicatorKind::PreviousPeriodLevels { .. } | IndicatorKind::OpeningRange { .. } => 3,
+        IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. } => 1,
         IndicatorKind::Aroon { .. } => 2,
         IndicatorKind::AwesomeOscillator => 1,
         IndicatorKind::Dpo { .. } => 1,
@@ -539,6 +544,14 @@ fn validate_indicator_style(style: &IndicatorOutputStyle) -> Result<(), &'static
 
 fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
     match kind {
+        IndicatorKind::SwingPoints { .. }
+        | IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. } => super::indicators::structure_kind_is_valid(kind),
+        IndicatorKind::SessionLevels { .. } | IndicatorKind::PreviousPeriodLevels { .. } => true,
+        IndicatorKind::OpeningRange {
+            duration_seconds, ..
+        } => *duration_seconds > 0,
         IndicatorKind::Aroon { period } => *period > 0,
         IndicatorKind::AwesomeOscillator => true,
         IndicatorKind::Dpo { period } => *period > 0,
@@ -2832,7 +2845,15 @@ impl ChartEngine {
         let mut resolved = Vec::with_capacity(state.indicators.len());
         let mut expected_outputs = Vec::with_capacity(state.indicators.len());
         for (study, indicator) in state.indicators.iter().enumerate() {
-            if !indicator_kind_is_valid(&indicator.kind) {
+            if !indicator_kind_is_valid(&indicator.kind)
+                || matches!(
+                    indicator.kind,
+                    IndicatorKind::SwingPoints { .. }
+                        | IndicatorKind::MarketStructure { .. }
+                        | IndicatorKind::FairValueGaps { .. }
+                        | IndicatorKind::OrderBlocks { .. }
+                ) && indicator.source_input != IndicatorInputSource::Close
+            {
                 return Err(invalid(format!("indicator {study} has invalid parameters")));
             }
             if indicator.styles.len() > aeris_charts_indicators::MAX_OUTPUTS {
@@ -3228,6 +3249,72 @@ mod tests {
             );
             assert_eq!(target.export_state_json().unwrap(), before);
         }
+    }
+
+    #[test]
+    fn structure_kinds_round_trip_without_annotations_and_reject_invalid_parameters() {
+        let mut chart = settled_chart();
+        let kinds = [
+            crate::IndicatorKind::SwingPoints { left: 2, right: 3 },
+            crate::IndicatorKind::MarketStructure {
+                left: 2,
+                right: 3,
+                break_on: crate::indicators::StructureBreakOn::Wick,
+            },
+            crate::IndicatorKind::FairValueGaps {
+                min_size: 0.5,
+                mitigation: crate::indicators::StructureMitigation::Full,
+                mitigation_price: crate::indicators::StructureMitigationPrice::Close,
+                max_active: 12,
+                show_mitigated: true,
+            },
+            crate::IndicatorKind::OrderBlocks {
+                left: 2,
+                right: 3,
+                break_on: crate::indicators::StructureBreakOn::Close,
+                zone: crate::indicators::OrderBlockZone::Body,
+                mitigation: crate::indicators::StructureMitigation::Touch,
+                mitigation_price: crate::indicators::StructureMitigationPrice::Wick,
+                max_active: 16,
+                show_mitigated: false,
+            },
+        ];
+        for kind in &kinds {
+            assert!(!chart.add_indicator_kind(0, kind.clone(), None).is_empty());
+        }
+        let document = chart.export_state_json().unwrap();
+        assert!(!document.contains("\"annotations\""));
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(
+            restored
+                .indicator_bindings()
+                .iter()
+                .map(|binding| &binding.kind)
+                .collect::<Vec<_>>(),
+            kinds.iter().collect::<Vec<_>>(),
+        );
+        for (index, field, value) in [
+            (0, "left", serde_json::json!(0)),
+            (1, "right", serde_json::json!(51)),
+            (2, "max_active", serde_json::json!(0)),
+            (3, "max_active", serde_json::json!(65)),
+        ] {
+            let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+            invalid["indicators"][index]["kind"][field] = value;
+            assert!(
+                settled_chart()
+                    .import_state_json(&invalid.to_string())
+                    .is_err()
+            );
+        }
+        let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+        invalid["indicators"][0]["source_input"] = serde_json::json!("hlc3");
+        assert!(
+            settled_chart()
+                .import_state_json(&invalid.to_string())
+                .is_err()
+        );
     }
 
     #[test]

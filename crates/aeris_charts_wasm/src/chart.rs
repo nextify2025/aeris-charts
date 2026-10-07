@@ -2578,6 +2578,10 @@ impl AerisChart {
             .indicator_schema_json(kind, period, deviation)
     }
 
+    pub fn study_annotations_json(&self, binding: u32) -> String {
+        self.inner.borrow().study_annotations_json(binding)
+    }
+
     /// reference v5.2 `ISeriesApi.pop(count)`: remove the last `count` data points (count clamps
     /// to the data length; per-point colors shift along). Returns the new data length.
     pub fn series_pop(&mut self, id: u32, count: u32) -> u32 {
@@ -2616,6 +2620,91 @@ impl AerisChart {
 
     pub fn add_aroon(&mut self, source_id: u32, period: u32) -> Vec<u32> {
         self.inner.borrow_mut().add_aroon(source_id, period)
+    }
+    pub fn add_swing_points(&mut self, source_id: u32, left: u32, right: u32) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_swing_points(source_id, left, right)
+    }
+    pub fn add_session_levels(&mut self, source_id: u32, calendar: &str) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_session_levels(source_id, calendar)
+    }
+    pub fn add_previous_period_levels(
+        &mut self,
+        source_id: u32,
+        period: &str,
+        calendar: &str,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_previous_period_levels(source_id, period, calendar)
+    }
+    pub fn add_opening_range(
+        &mut self,
+        source_id: u32,
+        duration_seconds: u32,
+        calendar: &str,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_opening_range(source_id, duration_seconds, calendar)
+    }
+    pub fn add_market_structure(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_market_structure(source_id, left, right, break_on)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_fair_value_gaps(
+        &mut self,
+        source_id: u32,
+        min_size: f64,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        self.inner.borrow_mut().add_fair_value_gaps(
+            source_id,
+            min_size,
+            mitigation,
+            mitigation_price,
+            max_active,
+            show_mitigated,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_order_blocks(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+        zone: &str,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        self.inner.borrow_mut().add_order_blocks(
+            source_id,
+            left,
+            right,
+            break_on,
+            zone,
+            mitigation,
+            mitigation_price,
+            max_active,
+            show_mitigated,
+        )
     }
 
     pub fn add_awesome_oscillator(&mut self, source_id: u32) -> u32 {
@@ -2861,6 +2950,24 @@ impl AerisChart {
     /// Add a session-anchored VWAP line on the source's pane (`volume_source` -1 = unit weights).
     pub fn add_vwap(&mut self, source_id: u32, volume_source: i32) -> u32 {
         self.inner.borrow_mut().add_vwap(source_id, volume_source)
+    }
+
+    /// Replace the host study calendar; invalid JSON or intervals leave the previous calendar intact.
+    pub fn set_study_calendar_json(&mut self, boundaries_json: &str) -> bool {
+        let Ok(boundaries) =
+            serde_json::from_str::<Vec<aeris_charts_engine::ResampleBoundary>>(boundaries_json)
+        else {
+            return false;
+        };
+        self.inner
+            .borrow_mut()
+            .engine
+            .set_study_calendar(boundaries)
+            .is_ok()
+    }
+
+    pub fn clear_study_calendar(&mut self) {
+        self.inner.borrow_mut().engine.clear_study_calendar();
     }
 
     /// Bind a host-created target to engine-owned, UTC boundary-driven OHLCV aggregation.

@@ -5,7 +5,22 @@
 //! headless engine can install as an ordinary series. `None` represents the warm-up window.
 
 pub mod klinechart;
+pub mod session_studies;
+pub mod structure_studies;
+pub mod study_annotations;
 pub mod volume_profile;
+
+pub use session_studies::{
+    PreviousPeriod, SessionSource, SessionStudy, SessionStudyPoint, SessionStudyState,
+    session_study,
+};
+pub use structure_studies::{
+    BreakOn, MAX_ORDER_BLOCK_SEARCH_ROWS, Mitigation, MitigationPrice, OrderBlockZone,
+    StructureStudy, StructureStudyKind, StructureStudyResult, structure_study,
+};
+pub use study_annotations::{
+    SessionSpan, StudyAnnotations, StudyMarker, StudyMarkerKind, StudyZone,
+};
 
 use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc};
 

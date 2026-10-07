@@ -194,6 +194,17 @@ fn financial_product_compatibility_fixture_survives_shared_frame_mutations() {
     assert!(chart.add_kama(0, 10, 2, 30).is_some());
     assert!(chart.add_mcginley(0, 10).is_some());
     assert_eq!(chart.add_linear_regression(0, 10, 2.0).len(), 3);
+    assert_eq!(
+        chart
+            .add_kst(0, [10, 15, 20, 30], [10, 10, 10, 15], 9)
+            .len(),
+        2
+    );
+    assert_eq!(chart.add_tsi(0, 25, 13, 13).len(), 2);
+    assert!(chart.add_mass_index(0, 9, 25).is_some());
+    assert_eq!(chart.add_vortex(0, 14).len(), 2);
+    assert!(chart.add_choppiness(0, 14).is_some());
+    assert_eq!(chart.add_atr_bands(0, 14, 2.0).len(), 3);
     assert!(chart.add_relative_volume(0, histogram, 5).is_some());
     assert!(chart.add_elder_force(0, histogram, 5).is_some());
     assert!(chart.add_ease_of_movement(0, histogram, 5, 100.0).is_some());
@@ -274,6 +285,26 @@ fn financial_product_compatibility_fixture_survives_shared_frame_mutations() {
             IndicatorKind::LinearRegression {
                 period: 10,
                 deviation: 2.0,
+            },
+            IndicatorKind::Kst {
+                roc: [10, 15, 20, 30],
+                smoothing: [10, 10, 10, 15],
+                signal: 9,
+            },
+            IndicatorKind::Tsi {
+                long: 25,
+                short: 13,
+                signal: 13,
+            },
+            IndicatorKind::MassIndex {
+                ema_period: 9,
+                sum_period: 25,
+            },
+            IndicatorKind::Vortex { period: 14 },
+            IndicatorKind::Choppiness { period: 14 },
+            IndicatorKind::AtrBands {
+                period: 14,
+                multiplier: 2.0,
             },
             IndicatorKind::RelativeVolume { period: 5 },
             IndicatorKind::ElderForce { period: 5 },
@@ -397,6 +428,131 @@ fn financial_product_compatibility_fixture_survives_shared_frame_mutations() {
             .collect::<Vec<_>>(),
         drawing_kinds
     );
+}
+
+#[test]
+fn all_i2_studies_round_trip_together_in_v3_with_non_default_parameters() {
+    let times = (0..96).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
+    let close = (0..96)
+        .map(|row| 100.0 + row as f64 * 0.3 + (row as f64 * 0.21).sin())
+        .collect::<Vec<_>>();
+    let high = close.iter().map(|value| value + 1.0).collect::<Vec<_>>();
+    let low = close.iter().map(|value| value - 1.0).collect::<Vec<_>>();
+    let volume_values = (0..96)
+        .map(|row| 20.0 + (row % 7) as f64)
+        .collect::<Vec<_>>();
+    let install_sources = || {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .set_series_data(0, &times, &close, &high, &low, &close)
+            .unwrap();
+        let volume = chart.add_series(SeriesKind::Histogram);
+        chart
+            .set_series_data(
+                volume,
+                &times,
+                &volume_values,
+                &volume_values,
+                &volume_values,
+                &volume_values,
+            )
+            .unwrap();
+        (chart, volume)
+    };
+    let (mut chart, volume) = install_sources();
+    let kinds = [
+        IndicatorKind::Klinger {
+            fast: 4,
+            slow: 9,
+            signal: 3,
+        },
+        IndicatorKind::Kama {
+            period: 7,
+            fast: 3,
+            slow: 12,
+        },
+        IndicatorKind::McGinley { period: 9 },
+        IndicatorKind::LinearRegression {
+            period: 8,
+            deviation: 1.5,
+        },
+        IndicatorKind::Kst {
+            roc: [3, 5, 7, 9],
+            smoothing: [2, 3, 4, 5],
+            signal: 4,
+        },
+        IndicatorKind::Tsi {
+            long: 7,
+            short: 4,
+            signal: 5,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 4,
+            sum_period: 7,
+        },
+        IndicatorKind::Vortex { period: 8 },
+        IndicatorKind::Choppiness { period: 8 },
+        IndicatorKind::AtrBands {
+            period: 8,
+            multiplier: 1.75,
+        },
+    ];
+    let mut original_outputs = Vec::new();
+    for (index, (kind, expected_outputs)) in
+        kinds.iter().zip([2, 1, 1, 3, 2, 2, 1, 2, 1, 3]).enumerate()
+    {
+        let outputs = chart.add_indicator_kind(0, kind.clone(), (index == 0).then_some(volume));
+        assert_eq!(outputs.len(), expected_outputs, "{kind:?}");
+        original_outputs.push(outputs);
+    }
+    assert!(chart.set_indicator_output_style(
+        original_outputs[3][1],
+        IndicatorOutputStyle {
+            visible: false,
+            line_color: Some("#123456".into()),
+            ..Default::default()
+        }
+    ));
+    let original_bindings = chart.indicator_bindings();
+    let document = chart.export_state_json().unwrap();
+    let json: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert_eq!(json["schema_version"], 3);
+    assert_eq!(json["indicators"].as_array().unwrap().len(), kinds.len());
+
+    let (mut restored, restored_volume) = install_sources();
+    assert_eq!(restored_volume, volume);
+    restored.import_state_json(&document).unwrap();
+    let bindings = restored.indicator_bindings();
+    assert_eq!(bindings.len(), kinds.len());
+    for (index, ((kind, original), binding)) in kinds
+        .iter()
+        .zip(&original_bindings)
+        .zip(&bindings)
+        .enumerate()
+    {
+        assert_eq!(&binding.kind, kind, "study {index}");
+        assert_eq!(binding.outputs, original.outputs, "study {index}");
+        assert_eq!(binding.styles, original.styles, "study {index}");
+        assert_eq!(
+            binding.volume_source,
+            (index == 0).then_some(restored_volume),
+            "study {index}"
+        );
+        for &output in &original_outputs[index] {
+            let before = chart.data.series_data(output).unwrap();
+            let after = restored.data.series_data(output).unwrap();
+            assert_eq!(before.0, after.0, "output {output} timestamps");
+            for (left, right) in before.1.into_iter().zip(after.1) {
+                assert_eq!(left.len(), right.len(), "output {output} rows");
+                assert!(
+                    left.iter()
+                        .zip(right)
+                        .all(|(a, b)| a == b || a.is_nan() && b.is_nan()),
+                    "output {output} values"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -2570,6 +2726,17 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
                 })
                 .collect()
         }
+        IndicatorKind::SwingPoints { .. }
+        | IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. }
+        | IndicatorKind::SessionLevels { .. }
+        | IndicatorKind::PreviousPeriodLevels { .. }
+        | IndicatorKind::OpeningRange { .. } => {
+            panic!(
+                "session and structural studies require calendar/annotation-aware reference fixtures"
+            )
+        }
     };
 
     // KLineChart outputs are dense from their declared warm-up row, with NaN where unset.
@@ -3073,6 +3240,63 @@ fn every_indicator_kind() -> Vec<IndicatorKind> {
             seed: aeris_charts_indicators::KdjSeed::Fifty,
         },
     ]
+    .into_iter()
+    .chain(study_indicator_kinds())
+    .collect()
+}
+
+fn structure_kind(kind: &IndicatorKind) -> bool {
+    matches!(
+        kind,
+        IndicatorKind::SwingPoints { .. }
+            | IndicatorKind::MarketStructure { .. }
+            | IndicatorKind::FairValueGaps { .. }
+            | IndicatorKind::OrderBlocks { .. }
+    )
+}
+
+/// The structure and session studies, with small windows so short fixtures confirm structure.
+fn study_indicator_kinds() -> Vec<IndicatorKind> {
+    use crate::indicators::{
+        OrderBlockZone, PreviousPeriod, StructureBreakOn, StructureMitigation,
+        StructureMitigationPrice, StudyCalendarPolicy,
+    };
+    vec![
+        IndicatorKind::SwingPoints { left: 2, right: 2 },
+        IndicatorKind::MarketStructure {
+            left: 2,
+            right: 2,
+            break_on: StructureBreakOn::Close,
+        },
+        IndicatorKind::FairValueGaps {
+            min_size: 0.0,
+            mitigation: StructureMitigation::Touch,
+            mitigation_price: StructureMitigationPrice::Wick,
+            max_active: 8,
+            show_mitigated: true,
+        },
+        IndicatorKind::OrderBlocks {
+            left: 2,
+            right: 2,
+            break_on: StructureBreakOn::Wick,
+            zone: OrderBlockZone::Body,
+            mitigation: StructureMitigation::Half,
+            mitigation_price: StructureMitigationPrice::Close,
+            max_active: 8,
+            show_mitigated: false,
+        },
+        IndicatorKind::SessionLevels {
+            calendar: StudyCalendarPolicy::Utc,
+        },
+        IndicatorKind::PreviousPeriodLevels {
+            period: PreviousPeriod::Day,
+            calendar: StudyCalendarPolicy::Utc,
+        },
+        IndicatorKind::OpeningRange {
+            duration_seconds: 3_600,
+            calendar: StudyCalendarPolicy::Utc,
+        },
+    ]
 }
 
 #[test]
@@ -3279,13 +3503,18 @@ fn streamed_aggregate_and_weight_inputs_match_a_fresh_install_for_every_indicato
     let mut cases = Vec::new();
     for kind in every_indicator_kind() {
         let weighted = indicator_reads_volume(&kind);
+        // Structure studies read the whole candle and accept only the close input.
+        let inputs = if structure_kind(&kind) { 1 } else { 5 };
         for input in [
             IndicatorInputSource::Close,
             IndicatorInputSource::Hl2,
             IndicatorInputSource::Hlc3,
             IndicatorInputSource::Ohlc4,
             IndicatorInputSource::Hlcc4,
-        ] {
+        ]
+        .into_iter()
+        .take(inputs)
+        {
             for order in orders.iter().take(if weighted { 3 } else { 1 }) {
                 cases.push((kind.clone(), input, *order, false));
             }
@@ -3559,6 +3788,18 @@ fn filling_the_first_session_slot_keeps_aggregate_input_columns() {
     }
 }
 
+/// Rows one tick may cost a binding: its window for the built-in runtimes; a structure study
+/// replays a revised row from its preceding 1,024-row checkpoint (appends scan one row).
+fn indicator_tick_work_bound(binding: &IndicatorBinding, window: usize) -> usize {
+    if binding.structure.is_some() {
+        STRUCTURE_CHECKPOINT_ROWS + window
+    } else {
+        window
+    }
+}
+
+const STRUCTURE_CHECKPOINT_ROWS: usize = 1_024;
+
 #[test]
 fn indicator_ticks_over_100k_rows_do_bounded_engine_work() {
     // Every kind plus aggregate inputs, a volume stream in both update orders, and a diverged
@@ -3630,9 +3871,10 @@ fn indicator_ticks_over_100k_rows_do_bounded_engine_work() {
     // window, so a regression in one binding cannot hide behind the others' small ticks.
     let assert_bounded = |chart: &ChartEngine, mutation: &str| {
         for binding in &chart.indicators {
+            let bound = indicator_tick_work_bound(binding, WORK_PER_BINDING);
             assert!(
-                binding.last_work_rows() <= WORK_PER_BINDING,
-                "{mutation}: {:?} {:?} did {} work rows (bound {WORK_PER_BINDING})",
+                binding.last_work_rows() <= bound,
+                "{mutation}: {:?} {:?} did {} work rows (bound {bound})",
                 binding.kind,
                 binding.source_input,
                 binding.last_work_rows()
@@ -3695,6 +3937,306 @@ fn indicator_ticks_over_100k_rows_do_bounded_engine_work() {
             assert_binding_matches_fresh_install(&chart, binding, &label);
         }
     }
+}
+
+#[test]
+fn structure_and_session_slot_fill_ticks_take_the_tail_path() {
+    // A time-sharing chart with the rest of the session pre-installed as whitespace slots. The
+    // structure and session runtimes stop at the last real row like the built-in ones, so filling
+    // the next slot scans that one row (an append), not a checkpoint replay through every slot,
+    // and revising it replays at most from its preceding checkpoint; the work is reported.
+    const ROWS: usize = 3_000;
+    const SLOTS: usize = 2_000;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..ROWS + SLOTS)
+        .map(|row| row as f64 * 60.0)
+        .collect::<Vec<_>>();
+    let bars = (0..ROWS + SLOTS)
+        .map(|row| {
+            if row < ROWS {
+                swinging_bar(row, 0)
+            } else {
+                [f64::NAN; 4]
+            }
+        })
+        .collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+    for kind in study_indicator_kinds() {
+        assert!(!chart.add_indicator_kind(0, kind, None).is_empty());
+    }
+    let assert_work =
+        |chart: &ChartEngine, mutation: &str, structure_bound: usize, bound: usize| {
+            for binding in &chart.indicators {
+                let bound = if binding.structure.is_some() {
+                    structure_bound
+                } else {
+                    bound
+                };
+                let work = binding.last_work_rows();
+                assert!(
+                    (1..=bound).contains(&work),
+                    "{mutation}: {:?} did {work} work rows (expected 1..={bound})",
+                    binding.kind
+                );
+            }
+        };
+    for row in ROWS..ROWS + 3 {
+        let time = row as f64 * 60.0;
+        chart.update_series_bar(0, time, swinging_bar(row, 0));
+        assert_work(&chart, "fill the next slot", 1, 1);
+        chart.update_series_bar(0, time, swinging_bar(row, 5));
+        assert_work(
+            &chart,
+            "revise the forming slot",
+            STRUCTURE_CHECKPOINT_ROWS,
+            1,
+        );
+    }
+    // A tick that skips a slot (a minute without trades) leaves a whitespace slot behind it: the
+    // scan resumes at the previous last real row and covers only that slot and the new row.
+    let row = ROWS + 4;
+    chart.update_series_bar(0, row as f64 * 60.0, swinging_bar(row, 0));
+    assert_work(&chart, "fill a slot past a whitespace one", 2, 2);
+    for binding in 0..chart.indicators.len() {
+        let label = format!("{:?}", chart.indicators[binding].kind);
+        assert_binding_matches_fresh_install(&chart, binding, &label);
+        let anchor = chart.indicators[binding].outputs[0];
+        if chart.indicators[binding].structure.is_some() {
+            let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+            let (times, values) = chart.data.series_data(0).unwrap();
+            let seconds = times.iter().map(|&time| time as f64).collect::<Vec<_>>();
+            fresh
+                .set_series_data(0, &seconds, values[0], values[1], values[2], values[3])
+                .unwrap();
+            let outputs = fresh.add_indicator_kind(0, chart.indicators[binding].kind.clone(), None);
+            assert_eq!(
+                chart.study_annotations(anchor).unwrap(),
+                fresh.study_annotations(outputs[0]).unwrap(),
+                "{label} annotations"
+            );
+        }
+    }
+}
+
+#[test]
+fn study_outputs_report_warmup_and_no_fixed_convergence() {
+    // Structure and session studies run their own scanners; their info must not read the
+    // single-output placeholder runtime (a second session output once panicked there).
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..40).map(|row| row as f64 * 3_600.0).collect::<Vec<_>>();
+    let bars = (0..40).map(|row| swinging_bar(row, 0)).collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+    for kind in study_indicator_kinds() {
+        let outputs = chart.add_indicator_kind(0, kind.clone(), None);
+        assert!(!outputs.is_empty());
+        let warmup = match kind {
+            IndicatorKind::SwingPoints { left, right } => left + right,
+            _ => 0,
+        };
+        for output in outputs {
+            let info = chart.indicator_info(output).expect("study output info");
+            assert_eq!(info.warmup_bars, warmup, "{kind:?}");
+            assert_eq!(info.convergence_bars, None, "{kind:?}");
+        }
+    }
+    // A study chained on a study output inherits the unbounded convergence.
+    let session_low = chart.indicators[4].outputs[1];
+    let sma = chart.add_sma(session_low, 3).unwrap();
+    let info = chart.indicator_info(sma).unwrap();
+    assert_eq!(info.warmup_bars, 2);
+    assert_eq!(info.convergence_bars, None);
+}
+
+#[test]
+fn structure_anchors_show_no_legend_value_and_are_never_hit() {
+    // The market-structure, fair-value-gap and order-block anchors are all whitespace: fork chrome
+    // (legend values, series hit testing) must treat them as carrying no value, and their zones
+    // and segments have no hit target.
+    use crate::financial_legend::{FinancialLegendIdentity, FinancialLegendRequest};
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..120).map(|row| row as f64 * 3_600.0).collect::<Vec<_>>();
+    // Swings on a rising trend, with gapping bars, so highs break and gaps open.
+    let bars = (0..120)
+        .map(|row| {
+            let [open, high, low, close] = swinging_bar(row, 0);
+            let lift = row as f64 * 0.6;
+            [open + lift, high + lift, low + lift, close + lift]
+        })
+        .collect::<Vec<_>>();
+    let column = |index: usize| bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &column(0), &column(1), &column(2), &column(3))
+        .unwrap();
+    let anchors = study_indicator_kinds()
+        .into_iter()
+        .filter(|kind| structure_kind(kind) && !matches!(kind, IndicatorKind::SwingPoints { .. }))
+        .map(|kind| {
+            let outputs = chart.add_indicator_kind(0, kind, None);
+            assert_eq!(outputs.len(), 1);
+            outputs[0]
+        })
+        .collect::<Vec<_>>();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    chart.build_frame();
+    let annotations = anchors
+        .iter()
+        .map(|&anchor| chart.study_annotations(anchor).unwrap())
+        .collect::<Vec<_>>();
+    assert!(annotations.iter().any(|a| !a.markers().is_empty()));
+    assert!(annotations.iter().any(|a| !a.zones().is_empty()));
+    let rows = chart.financial_legend(FinancialLegendRequest {
+        logical_index: None,
+        primary_title: "",
+        show_primary_ohlc: false,
+        primary_values_series: None,
+        leading_series: &[],
+        trailing_series: &[],
+    });
+    for &anchor in &anchors {
+        let row = rows
+            .iter()
+            .find(|row| row.identity == FinancialLegendIdentity::Indicator(anchor))
+            .expect("anchor legend row");
+        assert!(row.values.is_empty(), "{:?}", row.values);
+    }
+    // Probe every zone centre and every marker, plus a grid over the pane.
+    let mut probes = Vec::new();
+    for annotations in &annotations {
+        for zone in annotations.zones() {
+            probes.push((zone.start_row, (zone.top + zone.bottom) * 0.5));
+        }
+        for marker in annotations.markers() {
+            probes.push((marker.row, marker.price));
+        }
+    }
+    let mut points = probes
+        .into_iter()
+        .filter_map(|(row, price)| {
+            Some((
+                chart.logical_to_coordinate(row as f64)?,
+                chart.series_price_to_coordinate(0, price)?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert!(!points.is_empty());
+    points.extend((0..80).flat_map(|x| (0..50).map(move |y| (x as f64 * 10.0, y as f64 * 10.0))));
+    let mut candle_hits = 0;
+    for (x, y) in points {
+        if let Some(hit) = chart.hit_test_series(x, y) {
+            assert!(!anchors.contains(&hit), "anchor {hit} hit at ({x}, {y})");
+            candle_hits += usize::from(hit == 0);
+        }
+    }
+    // The probes reach the plotted bars, so the anchors' absence is not vacuous.
+    assert!(candle_hits > 0);
+}
+
+#[test]
+fn structure_studies_refuse_as_of_sources_atomically() {
+    use crate::indicators::StructureBreakOn;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let days = |list: &[f64]| list.iter().map(|day| day * 86_400.0).collect::<Vec<_>>();
+    let close = [100.0, 102.0, 101.0, 105.0, 104.0, 103.0, 107.0];
+    chart
+        .set_series_data(
+            0,
+            &days(&[1.0, 2.0, 3.0, 5.0, 6.0, 8.0, 9.0]),
+            &close,
+            &close,
+            &close,
+            &close,
+        )
+        .unwrap();
+    let overlay = chart.add_series(SeriesKind::Candlestick);
+    let other = [10.0, 12.0, 11.0, 15.0, 14.0, 13.0, 17.0];
+    chart
+        .set_series_data(
+            overlay,
+            &days(&[1.0, 2.0, 4.0, 5.0, 7.0, 8.0, 10.0]),
+            &other,
+            &other,
+            &other,
+            &other,
+        )
+        .unwrap();
+    let as_of = TimeAlignment::AsOf {
+        max_staleness: None,
+    };
+    chart.set_series_time_alignment(overlay, as_of).unwrap();
+    let swings = IndicatorKind::SwingPoints { left: 1, right: 1 };
+    let structure = IndicatorKind::MarketStructure {
+        left: 1,
+        right: 1,
+        break_on: StructureBreakOn::Close,
+    };
+    let before = chart.export_state_json().unwrap();
+    // The as-of overlay and an indicator output that follows its alignment are both refused,
+    // leaving the chart unchanged; a scalar study on the overlay is still accepted.
+    assert!(
+        chart
+            .add_indicator_kind(overlay, swings.clone(), None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_indicator_kind(overlay, structure, None)
+            .is_empty()
+    );
+    assert_eq!(chart.export_state_json().unwrap(), before);
+    let sma = chart.add_indicator_kind(overlay, IndicatorKind::Sma { period: 2 }, None);
+    assert_eq!(sma.len(), 1);
+    assert!(
+        chart
+            .add_indicator_kind(sma[0], swings.clone(), None)
+            .is_empty()
+    );
+    // A structure study on a union series keeps that series off the as-of alignment.
+    assert_eq!(chart.add_indicator_kind(0, swings.clone(), None).len(), 2);
+    let before = chart.export_state_json().unwrap();
+    assert_eq!(
+        chart
+            .set_series_time_alignment(0, as_of)
+            .unwrap_err()
+            .code(),
+        ErrorCode::UnsupportedOperation
+    );
+    assert_eq!(chart.export_state_json().unwrap(), before);
+    assert_eq!(chart.series_time_alignment(0), Some(TimeAlignment::Union));
+    // So does one chained on an indicator output of the series, which follows its alignment.
+    let chained = chart.add_series(SeriesKind::Candlestick);
+    chart
+        .set_series_data(
+            chained,
+            &days(&[1.0, 2.0, 3.0, 5.0, 6.0, 8.0, 9.0]),
+            &other,
+            &other,
+            &other,
+            &other,
+        )
+        .unwrap();
+    let sma = chart.add_indicator_kind(chained, IndicatorKind::Sma { period: 2 }, None);
+    assert_eq!(sma.len(), 1);
+    assert_eq!(chart.add_indicator_kind(sma[0], swings, None).len(), 2);
+    let before = chart.export_state_json().unwrap();
+    assert_eq!(
+        chart
+            .set_series_time_alignment(chained, as_of)
+            .unwrap_err()
+            .code(),
+        ErrorCode::UnsupportedOperation
+    );
+    assert_eq!(chart.export_state_json().unwrap(), before);
+    assert_eq!(
+        chart.series_time_alignment(chained),
+        Some(TimeAlignment::Union)
+    );
 }
 
 #[test]
@@ -3764,9 +4306,10 @@ fn indicator_ticks_filling_pre_installed_session_slots_do_bounded_work() {
     );
     let assert_bounded = |chart: &ChartEngine, mutation: &str| {
         for binding in &chart.indicators {
+            let bound = indicator_tick_work_bound(binding, WORK_PER_BINDING);
             assert!(
-                binding.last_work_rows() <= WORK_PER_BINDING,
-                "{mutation}: {:?} did {} work rows (bound {WORK_PER_BINDING})",
+                binding.last_work_rows() <= bound,
+                "{mutation}: {:?} did {} work rows (bound {bound})",
                 binding.kind,
                 binding.last_work_rows()
             );
@@ -5594,8 +6137,9 @@ fn indicator_schema_exposes_typed_parameters_and_outputs() {
         estimator: DeviationEstimator::Population,
     });
     assert_eq!(schema.revision, INDICATOR_SCHEMA_REVISION);
-    // Revision 3 introduced the boolean parameter type; hosts key editors on this number.
-    assert_eq!(INDICATOR_SCHEMA_REVISION, 3);
+    // Revision 3 introduced the boolean parameter type and revision 4 renamed the choice list to
+    // `options`; hosts key editors on this number.
+    assert_eq!(INDICATOR_SCHEMA_REVISION, 4);
     assert_eq!(schema.kind, "bollinger");
     assert_eq!(
         schema.parameters[0].parameter_type,
@@ -11712,6 +12256,9 @@ fn every_indicator_kind_with_conventions() -> Vec<IndicatorKind> {
             seed: aeris_charts_indicators::KdjSeed::FirstValue,
         },
     ]
+    .into_iter()
+    .chain(study_indicator_kinds())
+    .collect()
 }
 
 struct WhitespaceSource {
@@ -11849,7 +12396,31 @@ fn whitespace_source_rows_never_poison_any_indicator_binding() {
     let filled = WhitespaceSource::new(rows, &[7, 18, 19, 45, 58, 59]);
     let filled_compact = filled.compacted();
     for kind in every_indicator_kind_with_conventions() {
-        let (reference, reference_outputs) = whitespace_chart(&kind, &compact, compact.times.len());
+        // Structure studies count bars: a whitespace row breaks a pivot window rather than
+        // vanishing (upstream's rule; see docs/features/studies.md), so their reference is the
+        // same rows rebuilt fresh, and their whitespace rows must still emit nothing.
+        let structure = structure_kind(&kind);
+        let (reference, reference_outputs) = if structure {
+            whitespace_chart(&kind, &spaced, rows)
+        } else {
+            whitespace_chart(&kind, &compact, compact.times.len())
+        };
+        if structure {
+            for &output in &reference_outputs {
+                let (times, values) = reference.data.series_data(output).unwrap();
+                for (time, value) in times.iter().zip(values[3]) {
+                    let row = spaced
+                        .times
+                        .iter()
+                        .position(|t| *t as i64 == *time)
+                        .unwrap();
+                    assert!(
+                        !spaced.blank[row] || value.is_nan(),
+                        "{kind:?} at {time}: whitespace emitted {value}"
+                    );
+                }
+            }
+        }
 
         // Full rebuild over mid-history and trailing whitespace.
         let (full, full_outputs) = whitespace_chart(&kind, &spaced, rows);
@@ -11890,8 +12461,11 @@ fn whitespace_source_rows_never_poison_any_indicator_binding() {
                 filled.close[31],
             ],
         ));
-        let (filled_reference, filled_outputs) =
-            whitespace_chart(&kind, &filled_compact, filled_compact.times.len());
+        let (filled_reference, filled_outputs) = if structure {
+            whitespace_chart(&kind, &filled, rows)
+        } else {
+            whitespace_chart(&kind, &filled_compact, filled_compact.times.len())
+        };
         assert_whitespace_outputs_match(
             &kind,
             (&streamed, &streamed_outputs),
@@ -12058,7 +12632,10 @@ fn convention_preset_expands_to_explicit_parameters_and_matches_the_formulas() {
         .find(|parameter| parameter.name == "seed")
         .unwrap();
     assert_eq!(seed.parameter_type, IndicatorParameterType::Choice);
-    assert_eq!(seed.choices, ["sma", "first_value"]);
+    assert_eq!(
+        seed.options,
+        Some(vec!["sma".to_string(), "first_value".to_string()])
+    );
     assert_eq!(seed.default, serde_json::json!("first_value"));
 }
 
@@ -12191,7 +12768,10 @@ fn kdj_seed_is_an_explicit_parameter_with_the_textbook_default() {
         .find(|parameter| parameter.name == "seed")
         .unwrap();
     assert_eq!(seed.default, serde_json::json!("first_value"));
-    assert_eq!(seed.choices, ["fifty", "first_value"]);
+    assert_eq!(
+        seed.options,
+        Some(vec!["fifty".to_string(), "first_value".to_string()])
+    );
 }
 
 #[test]
@@ -12514,7 +13094,13 @@ fn random_engine_mutations_keep_every_indicator_equal_to_a_fresh_install() {
         for seed in 1..=2_u64 {
             let mut rng = MutationRng(seed * 0x51_7cc1 + kind_index as u64 * 977 + 1);
             let with_amount = matches!(kind, IndicatorKind::Vwap) && seed == 2;
-            let input = inputs[rng.below(inputs.len())];
+            let drawn = inputs[rng.below(inputs.len())];
+            // Structure studies accept only the close input (and refuse input switches).
+            let input = if structure_kind(&kind) {
+                IndicatorInputSource::Close
+            } else {
+                drawn
+            };
             let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
             let volume = chart.add_series(SeriesKind::Histogram);
             let amount = chart.add_series(SeriesKind::Histogram);
@@ -12652,6 +13238,670 @@ fn random_engine_mutations_keep_every_indicator_equal_to_a_fresh_install() {
                 }
                 assert_binding_matches_fresh_install(&chart, binding, &label);
             }
+        }
+    }
+}
+
+mod session_study_regressions {
+    use super::*;
+
+    fn boundary(start_time: i64, end_time: i64, session_id: u64) -> ResampleBoundary {
+        ResampleBoundary {
+            start_time,
+            end_time,
+            session_id,
+        }
+    }
+
+    fn install(chart: &mut ChartEngine, times: &[f64], highs: &[f64], lows: &[f64]) {
+        let open = highs
+            .iter()
+            .zip(lows)
+            .map(|(h, l)| (h + l) / 2.0)
+            .collect::<Vec<_>>();
+        chart
+            .set_series_data(0, times, &open, highs, lows, &open)
+            .unwrap();
+    }
+
+    fn values(chart: &ChartEngine, id: SeriesId) -> Vec<Option<f64>> {
+        chart.data.series_data(id).unwrap().1[3]
+            .iter()
+            .map(|value| value.is_finite().then_some(*value))
+            .collect()
+    }
+
+    fn all_studies(chart: &mut ChartEngine) -> Vec<Vec<SeriesId>> {
+        let mut bindings = Vec::new();
+        for calendar in [StudyCalendarPolicy::Utc, StudyCalendarPolicy::Host] {
+            bindings.push(chart.add_session_levels(0, calendar));
+            for period in [
+                PreviousPeriod::Day,
+                PreviousPeriod::Week,
+                PreviousPeriod::Month,
+            ] {
+                bindings.push(chart.add_previous_period_levels(0, period, calendar));
+            }
+            bindings.push(chart.add_opening_range(0, 60, calendar));
+        }
+        assert_eq!(
+            bindings.iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 3, 3, 3, 3, 2, 3, 3, 3, 3]
+        );
+        bindings
+    }
+
+    #[test]
+    fn host_calendar_merges_touching_identity_but_keeps_gaps_and_new_sessions_empty() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = [0., 30., 60., 90., 120., 150., 160., 86400., 86430.];
+        let high = [12., 15., 14., 20., 17., 16., 50., 30., 34.];
+        let low = [8., 7., 9., 6., 10., 11., 40., 25., 24.];
+        install(&mut chart, &times, &high, &low);
+        chart
+            .set_study_calendar(vec![
+                boundary(0, 100, 7),
+                boundary(100, 160, 7),
+                boundary(86400, 86500, 8),
+            ])
+            .unwrap();
+        assert_eq!(
+            chart.study_session_spans(),
+            vec![
+                aeris_charts_indicators::SessionSpan {
+                    start: 0,
+                    end: 160,
+                    session_id: 7
+                },
+                aeris_charts_indicators::SessionSpan {
+                    start: 86400,
+                    end: 86500,
+                    session_id: 8
+                }
+            ]
+        );
+        let session = chart.add_session_levels(0, StudyCalendarPolicy::Host);
+        let previous =
+            chart.add_previous_period_levels(0, PreviousPeriod::Day, StudyCalendarPolicy::Host);
+        let opening = chart.add_opening_range(0, 70, StudyCalendarPolicy::Host);
+        assert_eq!(
+            values(&chart, session[0]),
+            [
+                Some(12.),
+                Some(15.),
+                Some(15.),
+                Some(20.),
+                Some(20.),
+                Some(20.),
+                None,
+                Some(30.),
+                Some(34.)
+            ]
+        );
+        assert_eq!(
+            values(&chart, session[1]),
+            [
+                Some(8.),
+                Some(7.),
+                Some(7.),
+                Some(6.),
+                Some(6.),
+                Some(6.),
+                None,
+                Some(25.),
+                Some(24.)
+            ]
+        );
+        assert_eq!(
+            values(&chart, opening[0]),
+            [
+                Some(12.),
+                Some(15.),
+                Some(15.),
+                Some(15.),
+                Some(15.),
+                Some(15.),
+                None,
+                Some(30.),
+                Some(34.)
+            ]
+        );
+        assert_eq!(
+            values(&chart, opening[2]),
+            [
+                Some(10.),
+                Some(11.),
+                Some(11.),
+                Some(11.),
+                Some(11.),
+                Some(11.),
+                None,
+                Some(27.5),
+                Some(29.)
+            ]
+        );
+        assert_eq!(values(&chart, previous[0])[..7], [None; 7]);
+        assert_eq!(values(&chart, previous[0])[7..], [Some(20.), Some(20.)]);
+        assert_eq!(values(&chart, previous[1])[7..], [Some(6.), Some(6.)]);
+        assert_eq!(values(&chart, previous[2])[7..], [Some(13.5), Some(13.5)]);
+
+        // A rejected replacement cannot disturb the live calendar or any outputs.
+        let before = values(&chart, session[0]);
+        assert!(
+            chart
+                .set_study_calendar(vec![boundary(0, 100, 1), boundary(90, 200, 2)])
+                .is_err()
+        );
+        assert_eq!(values(&chart, session[0]), before);
+        chart
+            .set_study_calendar(vec![boundary(0, 80, 1), boundary(86400, 86500, 8)])
+            .unwrap();
+        assert_eq!(values(&chart, session[0])[3..7], [None; 4]);
+        chart.clear_study_calendar();
+        assert!(values(&chart, session[0]).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn utc_previous_periods_use_day_monday_week_and_civil_month_not_host_boundaries() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        // Monday Jan 29, Wednesday Jan 31, Thursday Feb 1, Monday Feb 5, 2024.
+        let times = [1706486400., 1706659200., 1706745600., 1707091200.];
+        install(
+            &mut chart,
+            &times,
+            &[12., 22., 32., 42.],
+            &[8., 18., 28., 38.],
+        );
+        chart
+            .set_study_calendar(vec![boundary(1706486400, 1707177600, 1)])
+            .unwrap();
+        let day =
+            chart.add_previous_period_levels(0, PreviousPeriod::Day, StudyCalendarPolicy::Utc);
+        let week =
+            chart.add_previous_period_levels(0, PreviousPeriod::Week, StudyCalendarPolicy::Utc);
+        let month =
+            chart.add_previous_period_levels(0, PreviousPeriod::Month, StudyCalendarPolicy::Utc);
+        let session = chart.add_session_levels(0, StudyCalendarPolicy::Utc);
+        let opening = chart.add_opening_range(0, 60, StudyCalendarPolicy::Utc);
+        assert_eq!(
+            values(&chart, session[0]),
+            [Some(12.), Some(22.), Some(32.), Some(42.)]
+        );
+        assert_eq!(
+            values(&chart, opening[2]),
+            [Some(10.), Some(20.), Some(30.), Some(40.)]
+        );
+        assert_eq!(
+            values(&chart, day[0]),
+            [None, Some(12.), Some(22.), Some(32.)]
+        );
+        assert_eq!(values(&chart, week[0]), [None, None, None, Some(32.)]);
+        assert_eq!(values(&chart, week[1]), [None, None, None, Some(8.)]);
+        assert_eq!(values(&chart, month[0]), [None, None, Some(22.), Some(22.)]);
+        assert_eq!(values(&chart, month[2]), [None, None, Some(20.), Some(20.)]);
+        chart.clear_study_calendar();
+        assert_eq!(values(&chart, week[0])[3], Some(32.));
+    }
+
+    #[test]
+    fn calendar_replacement_tip_updates_and_chained_sma_match_fresh_engine() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = [0., 30., 60., 90., 120., 180.];
+        let high = [12., 15., 14., 20., 17., 30.];
+        let low = [8., 7., 9., 6., 10., 25.];
+        install(&mut chart, &times, &high, &low);
+        let calendar = vec![boundary(0, 160, 1), boundary(180, 260, 2)];
+        chart.set_study_calendar(calendar.clone()).unwrap();
+        let levels = chart.add_session_levels(0, StudyCalendarPolicy::Host);
+        let opening = chart.add_opening_range(0, 90, StudyCalendarPolicy::Host);
+        let sma = chart.add_indicator_kind(levels[0], IndicatorKind::Sma { period: 2 }, None)[0];
+        let check =
+            |chart: &ChartEngine, calendar: Vec<ResampleBoundary>, high: &[f64], low: &[f64]| {
+                let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+                install(&mut fresh, &times, high, low);
+                fresh.set_study_calendar(calendar).unwrap();
+                let expected = fresh.add_session_levels(0, StudyCalendarPolicy::Host);
+                let expected_open = fresh.add_opening_range(0, 90, StudyCalendarPolicy::Host);
+                let expected_sma =
+                    fresh.add_indicator_kind(expected[0], IndicatorKind::Sma { period: 2 }, None)
+                        [0];
+                for (left, right) in levels
+                    .iter()
+                    .zip(expected.iter())
+                    .chain(opening.iter().zip(expected_open.iter()))
+                {
+                    assert_eq!(values(chart, *left), values(&fresh, *right));
+                }
+                assert_eq!(values(chart, sma), values(&fresh, expected_sma));
+            };
+        check(&chart, calendar.clone(), &high, &low);
+        assert!(chart.update_series_bar(0, 180., [31., 36., 22., 29.]));
+        let mut high = high;
+        let mut low = low;
+        high[5] = 36.;
+        low[5] = 22.;
+        check(&chart, calendar.clone(), &high, &low);
+        let changed = vec![boundary(0, 100, 1), boundary(100, 200, 2)];
+        chart.set_study_calendar(changed.clone()).unwrap();
+        check(&chart, changed, &high, &low);
+        assert!(chart.update_series_bar(0, 190., [29., 38., 20., 31.]));
+        assert_eq!(values(&chart, levels[0]).last(), Some(&Some(38.)));
+        assert_eq!(values(&chart, opening[0]).last(), Some(&Some(36.)));
+        assert_eq!(values(&chart, sma).last(), Some(&Some(37.)));
+    }
+
+    #[test]
+    fn all_session_variants_are_prefix_stable_through_replay_seek_and_tip_replacement() {
+        let times = [
+            1706486400.,
+            1706486460.,
+            1706659200.,
+            1706745600.,
+            1706745660.,
+            1707091200.,
+        ];
+        let high = [12., 15., 22., 32., 34., 42.];
+        let low = [8., 7., 18., 28., 24., 38.];
+        let calendar = vec![
+            boundary(1706486400, 1706659200, 1),
+            boundary(1706659200, 1706745600, 1),
+            boundary(1706745600, 1706918400, 2),
+            boundary(1707091200, 1707177600, 3),
+        ];
+        let mut replay = ChartEngine::new(800.0, 500.0, 1.0);
+        replay.set_study_calendar(calendar.clone()).unwrap();
+        let bindings = all_studies(&mut replay);
+        for len in (0..=times.len()).chain((0..times.len()).rev()) {
+            install(&mut replay, &times[..len], &high[..len], &low[..len]);
+            let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+            fresh.set_study_calendar(calendar.clone()).unwrap();
+            install(&mut fresh, &times[..len], &high[..len], &low[..len]);
+            let reference = all_studies(&mut fresh);
+            for (actual, expected) in bindings.iter().zip(reference.iter()) {
+                for (&actual, &expected) in actual.iter().zip(expected) {
+                    assert_eq!(
+                        values(&replay, actual),
+                        values(&fresh, expected),
+                        "prefix {len}"
+                    );
+                }
+            }
+        }
+        install(&mut replay, &times, &high, &low);
+        assert!(replay.update_series_bar(0, times[5], [40., 60., 35., 45.]));
+        let mut high = high;
+        let mut low = low;
+        high[5] = 60.;
+        low[5] = 35.;
+        let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+        fresh.set_study_calendar(calendar).unwrap();
+        install(&mut fresh, &times, &high, &low);
+        let reference = all_studies(&mut fresh);
+        for (actual, expected) in bindings.iter().zip(reference.iter()) {
+            for (&actual, &expected) in actual.iter().zip(expected) {
+                assert_eq!(values(&replay, actual), values(&fresh, expected));
+            }
+        }
+    }
+
+    #[test]
+    fn pd2_clock_seek_matches_fresh_prefix_for_all_seven_structure_studies() {
+        let times = (1..=12).map(f64::from).collect::<Vec<_>>();
+        let highs = [10., 14., 12., 18., 16., 20., 19., 17., 25., 21., 24., 15.];
+        let lows = [8., 9., 10., 15., 11., 8., 16., 13., 22., 17., 20., 9.];
+        let kinds = [
+            IndicatorKind::SwingPoints { left: 1, right: 1 },
+            IndicatorKind::MarketStructure {
+                left: 1,
+                right: 1,
+                break_on: StructureBreakOn::Wick,
+            },
+            IndicatorKind::FairValueGaps {
+                min_size: 0.0,
+                mitigation: StructureMitigation::Touch,
+                mitigation_price: StructureMitigationPrice::Wick,
+                max_active: 3,
+                show_mitigated: true,
+            },
+            IndicatorKind::OrderBlocks {
+                left: 1,
+                right: 1,
+                break_on: StructureBreakOn::Wick,
+                zone: OrderBlockZone::Wick,
+                mitigation: StructureMitigation::Touch,
+                mitigation_price: StructureMitigationPrice::Wick,
+                max_active: 3,
+                show_mitigated: true,
+            },
+            IndicatorKind::SessionLevels {
+                calendar: StudyCalendarPolicy::Utc,
+            },
+            IndicatorKind::PreviousPeriodLevels {
+                period: PreviousPeriod::Day,
+                calendar: StudyCalendarPolicy::Utc,
+            },
+            IndicatorKind::OpeningRange {
+                duration_seconds: 3,
+                calendar: StudyCalendarPolicy::Utc,
+            },
+        ];
+        let mut replay = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut replay, &times, &highs, &lows);
+        let outputs = kinds
+            .iter()
+            .map(|kind| replay.add_indicator_kind(0, kind.clone(), None))
+            .collect::<Vec<_>>();
+        for len in [8usize, 4, 11, 1, 12, 6] {
+            replay
+                .set_replay_clock_micros(Some(times[len - 1] as i64 * 1_000_000))
+                .unwrap();
+            let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+            install(&mut fresh, &times[..len], &highs[..len], &lows[..len]);
+            for (kind, actual) in kinds.iter().zip(&outputs) {
+                let expected = fresh.add_indicator_kind(0, kind.clone(), None);
+                for (&actual, &expected) in actual.iter().zip(&expected) {
+                    assert_eq!(
+                        values(&replay, actual),
+                        values(&fresh, expected),
+                        "{kind:?} prefix {len}"
+                    );
+                }
+                if matches!(
+                    kind,
+                    IndicatorKind::SwingPoints { .. }
+                        | IndicatorKind::MarketStructure { .. }
+                        | IndicatorKind::FairValueGaps { .. }
+                        | IndicatorKind::OrderBlocks { .. }
+                ) {
+                    assert_eq!(
+                        replay.study_annotations(actual[0]).unwrap(),
+                        fresh.study_annotations(expected[0]).unwrap(),
+                        "{kind:?} prefix {len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retention_trim_rebuilds_structure_from_only_the_retained_rows() {
+        let times = (0..96).map(|row| row as f64 + 1.).collect::<Vec<_>>();
+        let highs = (0..96)
+            .map(|row| 30. + (row / 7) as f64 * 16. + [0., 4., 2., 8., 6., 10., 11.][row % 7])
+            .collect::<Vec<_>>();
+        let lows = highs.iter().map(|high| high - 6.).collect::<Vec<_>>();
+        let opens = highs
+            .iter()
+            .enumerate()
+            .map(|(row, high)| high - if row % 7 == 4 { 1. } else { 3. })
+            .collect::<Vec<_>>();
+        let closes = highs
+            .iter()
+            .enumerate()
+            .map(|(row, high)| high - if row % 7 == 4 { 5. } else { 3. })
+            .collect::<Vec<_>>();
+        let kinds = [
+            IndicatorKind::SwingPoints { left: 1, right: 1 },
+            IndicatorKind::MarketStructure {
+                left: 1,
+                right: 1,
+                break_on: StructureBreakOn::Wick,
+            },
+            IndicatorKind::FairValueGaps {
+                min_size: 0.,
+                mitigation: StructureMitigation::Touch,
+                mitigation_price: StructureMitigationPrice::Wick,
+                max_active: 3,
+                show_mitigated: true,
+            },
+            IndicatorKind::OrderBlocks {
+                left: 1,
+                right: 1,
+                break_on: StructureBreakOn::Wick,
+                zone: OrderBlockZone::Wick,
+                mitigation: StructureMitigation::Touch,
+                mitigation_price: StructureMitigationPrice::Wick,
+                max_active: 3,
+                show_mitigated: true,
+            },
+        ];
+        let mut chart = ChartEngine::new(800., 500., 1.);
+        chart
+            .set_series_data(0, &times, &opens, &highs, &lows, &closes)
+            .unwrap();
+        let bindings = kinds
+            .iter()
+            .map(|kind| chart.add_indicator_kind(0, kind.clone(), None))
+            .collect::<Vec<_>>();
+        assert!(chart.set_series_max_points(0, Some(40)));
+        for row in 96..110 {
+            let high = 30. + (row / 7) as f64 * 16. + [0., 4., 2., 8., 6., 10., 11.][row % 7];
+            let (open, close) = if row % 7 == 4 {
+                (high - 1., high - 5.)
+            } else {
+                (high - 3., high - 3.)
+            };
+            assert!(chart.update_series_bar(0, row as f64 + 1., [open, high, high - 6., close]));
+        }
+        let (retained, columns) = chart.data.series_data(0).unwrap();
+        let (retained, open, high, low, close) = (
+            retained.to_vec(),
+            columns[0].to_vec(),
+            columns[1].to_vec(),
+            columns[2].to_vec(),
+            columns[3].to_vec(),
+        );
+        assert!(
+            retained[0] > times[56] as i64,
+            "streaming must evict additional leading rows"
+        );
+        let mut fresh = ChartEngine::new(800., 500., 1.);
+        fresh
+            .set_series_data(
+                0,
+                &retained.iter().map(|&t| t as f64).collect::<Vec<_>>(),
+                &open,
+                &high,
+                &low,
+                &close,
+            )
+            .unwrap();
+        for (kind, actual) in kinds.iter().zip(&bindings) {
+            let expected = fresh.add_indicator_kind(0, kind.clone(), None);
+            for (&actual, &expected) in actual.iter().zip(&expected) {
+                assert_eq!(values(&chart, actual), values(&fresh, expected), "{kind:?}");
+            }
+            let snapshot = chart.study_annotations(actual[0]).unwrap();
+            assert!(
+                !snapshot.markers().is_empty() || !snapshot.zones().is_empty(),
+                "{kind:?} must generate annotations after trimming"
+            );
+            assert_eq!(
+                snapshot,
+                fresh.study_annotations(expected[0]).unwrap(),
+                "{kind:?}"
+            );
+            assert!(
+                snapshot
+                    .markers()
+                    .iter()
+                    .all(|marker| marker.row < retained.len()
+                        && marker.from_row.is_none_or(|row| row < retained.len()))
+            );
+            assert!(
+                snapshot
+                    .zones()
+                    .iter()
+                    .all(|zone| zone.start_row < retained.len())
+            );
+        }
+    }
+
+    #[test]
+    fn kama_and_swings_on_chained_indicator_outputs_follow_source_repairs() {
+        let times = (1..=16).map(f64::from).collect::<Vec<_>>();
+        let high = [
+            12., 14., 18., 14., 11., 16., 22., 19., 15., 12., 17., 24., 18., 13., 20., 15.,
+        ];
+        let low = high.map(|high| high - 4.0);
+        let setup = |chart: &mut ChartEngine| {
+            let base = chart.add_indicator_kind(0, IndicatorKind::Sma { period: 2 }, None)[0];
+            let kama = chart.add_indicator_kind(
+                base,
+                IndicatorKind::Kama {
+                    period: 2,
+                    fast: 2,
+                    slow: 5,
+                },
+                None,
+            )[0];
+            let swings = chart.add_swing_points(kama, 1, 1);
+            assert_eq!(swings.len(), 2);
+            (base, kama, swings)
+        };
+        let mut incremental = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut incremental, &times[..8], &high[..8], &low[..8]);
+        let (base, kama, swings) = setup(&mut incremental);
+        let mut final_high = high;
+        let mut final_low = low;
+        for len in 9..=times.len() {
+            assert!(incremental.update_series_bar(
+                0,
+                times[len - 1],
+                [
+                    (high[len - 1] + low[len - 1]) / 2.0,
+                    high[len - 1],
+                    low[len - 1],
+                    (high[len - 1] + low[len - 1]) / 2.0
+                ],
+            ));
+        }
+        for (row, new_high) in [(15, 28.), (4, 25.)] {
+            final_high[row] = new_high;
+            final_low[row] = new_high - 4.0;
+            assert!(incremental.update_series_bar(
+                0,
+                times[row],
+                [new_high - 2.0, new_high, new_high - 4.0, new_high - 2.0],
+            ));
+            let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+            install(&mut fresh, &times, &final_high, &final_low);
+            let (fresh_base, fresh_kama, fresh_swings) = setup(&mut fresh);
+            for (actual, expected) in [(base, fresh_base), (kama, fresh_kama)]
+                .into_iter()
+                .chain(swings.iter().copied().zip(fresh_swings.iter().copied()))
+            {
+                assert_eq!(values(&incremental, actual), values(&fresh, expected));
+            }
+            assert_eq!(
+                incremental.study_annotations(swings[0]).unwrap(),
+                fresh.study_annotations(fresh_swings[0]).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn opening_range_zero_and_invalid_sources_are_atomic() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let before = chart.indicator_bindings().len();
+        assert!(
+            chart
+                .add_opening_range(0, 0, StudyCalendarPolicy::Utc)
+                .is_empty()
+        );
+        assert!(
+            chart
+                .add_session_levels(u32::MAX, StudyCalendarPolicy::Host)
+                .is_empty()
+        );
+        assert!(
+            chart
+                .add_previous_period_levels(
+                    u32::MAX,
+                    PreviousPeriod::Month,
+                    StudyCalendarPolicy::Utc
+                )
+                .is_empty()
+        );
+        assert!(
+            chart
+                .add_opening_range(u32::MAX, 30, StudyCalendarPolicy::Host)
+                .is_empty()
+        );
+        assert_eq!(chart.indicator_bindings().len(), before);
+        let valid = chart.add_opening_range(0, 1, StudyCalendarPolicy::Utc);
+        assert_eq!(valid.len(), 3);
+    }
+
+    #[test]
+    fn v3_persists_study_policies_not_runtime_calendar_or_annotations() {
+        let times = [0., 30., 60., 86400.];
+        let high = [12., 15., 14., 20.];
+        let low = [8., 7., 9., 16.];
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut chart, &times, &high, &low);
+        chart
+            .set_study_calendar(vec![boundary(0, 100, 1), boundary(86400, 86500, 2)])
+            .unwrap();
+        let session = chart.add_session_levels(0, StudyCalendarPolicy::Host);
+        let previous =
+            chart.add_previous_period_levels(0, PreviousPeriod::Day, StudyCalendarPolicy::Utc);
+        let opening = chart.add_opening_range(0, 50, StudyCalendarPolicy::Host);
+        let sma = chart.add_indicator_kind(session[0], IndicatorKind::Sma { period: 2 }, None)[0];
+        let mut annotations = aeris_charts_indicators::StudyAnnotations::default();
+        annotations.push_marker(aeris_charts_indicators::StudyMarker {
+            row: 1,
+            confirm_row: 2,
+            price: 15.,
+            kind: aeris_charts_indicators::StudyMarkerKind::SwingHigh,
+            from_row: None,
+        });
+        assert!(chart.inject_study_annotations_for_test(session[0], annotations));
+        let document = chart.export_state_json().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(json["schema_version"], 3);
+        assert!(json.get("study_calendar").is_none());
+        assert!(!document.contains("\"annotations\""));
+        assert_eq!(json["indicators"][0]["kind"]["calendar"], "host");
+        assert_eq!(json["indicators"][1]["kind"]["period"], "day");
+        assert_eq!(json["indicators"][2]["kind"]["duration_seconds"], 50);
+
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut restored, &times, &high, &low);
+        restored.import_state_json(&document).unwrap();
+        assert!(restored.study_session_spans().is_empty());
+        assert_eq!(restored.indicator_bindings().len(), 4);
+        assert_eq!(restored.indicator_bindings()[0].outputs, session);
+        assert_eq!(restored.indicator_bindings()[1].outputs, previous);
+        assert_eq!(restored.indicator_bindings()[2].outputs, opening);
+        assert_eq!(restored.indicator_bindings()[3].outputs, [sma]);
+        assert!(values(&restored, session[0]).iter().all(Option::is_none));
+        assert_eq!(values(&restored, previous[0]), values(&chart, previous[0]));
+        assert!(restored.study_annotations(session[0]).is_err());
+        restored
+            .set_study_calendar(vec![boundary(0, 100, 1), boundary(86400, 86500, 2)])
+            .unwrap();
+        for id in session.into_iter().chain(opening).chain([sma]) {
+            assert_eq!(values(&restored, id), values(&chart, id));
+        }
+
+        // Invalid persisted parameters fail without installing any binding.
+        for (index, field, invalid) in [
+            (0, "calendar", serde_json::json!("local")),
+            (1, "period", serde_json::json!("quarter")),
+            (2, "duration_seconds", serde_json::json!(0)),
+        ] {
+            let mut invalid_document = json.clone();
+            invalid_document["indicators"][index]["kind"][field] = invalid;
+            let mut target = ChartEngine::new(800.0, 500.0, 1.0);
+            install(&mut target, &times, &high, &low);
+            let before = target.export_state_json().unwrap();
+            assert!(
+                target
+                    .import_state_json(&invalid_document.to_string())
+                    .is_err()
+            );
+            assert_eq!(target.export_state_json().unwrap(), before);
         }
     }
 }

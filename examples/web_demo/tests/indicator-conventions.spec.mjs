@@ -157,7 +157,7 @@ test("convention presets expand to explicit parameters, KDJ binds three outputs,
   ]);
   expect(result.kdj_china_start.every((error) => Math.abs(error) < 1e-9)).toBe(true);
   expect(result.kdj_schema).toEqual(["K", "D", "J"]);
-  expect(result.seed_schema).toMatchObject({ parameter_type: "choice", default: "sma", choices: ["sma", "first_value"] });
+  expect(result.seed_schema).toMatchObject({ parameter_type: "choice", default: "sma", options: ["sma", "first_value"] });
   expect(result.chained).toEqual({ warmup: 18, convergence: 112 });
   expect(result.rejected).toBe("invalid_options");
   // Persistence carries the expanded parameters, never the preset name.

@@ -26,7 +26,7 @@ docs/
 │   ├── rendering/           帧、图元、执行器与资源生命周期
 │   └── hosts/               浏览器、React 与扩展边界
 ├── api/                     使用契约、示例、兼容性与 Rust 迁移
-├── features/                足迹图、深度等领域设计
+├── features/                足迹图、深度、结构与时段研究等领域设计
 └── development/             贡献、验证门禁与性能证据
 ```
 
@@ -51,8 +51,9 @@ docs/
 
 - [Footprint / Numbers Bars](features/footprint.md)：成交真值、聚合、主动方、LOD、恢复与证据。
 - [深度、流动性与成交带视图](features/depth.md)：订单簿投影、序号、重新同步、热力图与回放。
+- [结构与时段研究](features/studies.md)：摆动点、市场结构、公允价值缺口、订单块与时段水平的确认语义、检查点、时段日历与只读注释。
 
-这两份文档补充领域细节；crate 所有权与跨后端执行仍以[架构](Architecture.md)为准。
+这些文档补充领域细节；crate 所有权与跨后端执行仍以[架构](Architecture.md)为准。
 
 ## 维护约定
 

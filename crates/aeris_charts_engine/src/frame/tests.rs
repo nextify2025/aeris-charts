@@ -13,9 +13,329 @@ use crate::{
 };
 use aeris_charts_core::model::data_layer::DataLayer;
 use aeris_charts_core::model::plot_list::{PlotList, PlotValues};
+use aeris_charts_indicators::study_annotations::{
+    StudyAnnotations, StudyMarker, StudyMarkerKind, StudyZone,
+};
 
 const LIVE_TEXT: Color = Color::rgb(0xff, 0xff, 0xff);
 const LIVE_COUNTDOWN: Color = Color::rgba(0xff, 0xff, 0xff, 0xb3);
+
+#[test]
+fn study_binding_paints_inside_its_output_layer_without_host_markers() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    let output = chart.add_sma(0, 2).unwrap();
+    let border = Color::rgb(0x11, 0x22, 0x33);
+    chart
+        .series
+        .iter_mut()
+        .find(|series| series.id == output)
+        .unwrap()
+        .line_color = Some("#112233".into());
+    let mut study = StudyAnnotations::default();
+    study.push_zone(StudyZone {
+        start_row: 3,
+        confirm_row: 4,
+        top: 110.0,
+        bottom: 105.0,
+        bullish: true,
+        end_row: None,
+        retired: false,
+    });
+    assert!(chart.inject_study_annotations_for_test(output, study));
+    let frame = chart.build_frame();
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::RectFrame { color, .. } if *color == border))
+    );
+    assert!(chart.series.iter().all(|series| series.markers.is_empty()));
+    chart
+        .series
+        .iter_mut()
+        .find(|series| series.id == output)
+        .unwrap()
+        .visible = false;
+    chart.invalidate_frame_series(output);
+    let hidden = chart.build_frame();
+    assert!(
+        !hidden.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::RectFrame { color, .. } if *color == border))
+    );
+}
+
+#[test]
+fn mitigated_zone_visibility_follows_the_binding_choice() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    let border = Color::rgb(0x11, 0x22, 0x33);
+    for (show_mitigated, visible) in [(false, false), (true, true)] {
+        let output = chart.add_fair_value_gaps(
+            0,
+            0.0,
+            crate::StructureMitigation::Touch,
+            crate::StructureMitigationPrice::Wick,
+            20,
+            show_mitigated,
+        )[0];
+        assert!(chart.set_indicator_output_style(
+            output,
+            crate::IndicatorOutputStyle {
+                visible: true,
+                line_color: Some("#112233".into()),
+                ..Default::default()
+            },
+        ));
+        let mut annotations = StudyAnnotations::default();
+        annotations.push_zone(StudyZone {
+            start_row: 3,
+            confirm_row: 4,
+            top: 110.0,
+            bottom: 105.0,
+            bullish: true,
+            end_row: Some(10),
+            retired: false,
+        });
+        assert!(chart.inject_study_annotations_for_test(output, annotations));
+        let frame = chart.build_frame();
+        assert_eq!(
+            frame.panes[0]
+                .main
+                .iter()
+                .any(|prim| matches!(prim, Prim::RectFrame { color, .. } if *color == border)),
+            visible,
+        );
+        assert!(chart.remove_indicator_binding(output));
+    }
+}
+
+#[test]
+fn study_annotations_paint_in_shared_order_and_clip_to_the_pane() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    chart.build_frame();
+    let anchor = chart.series[0].id;
+    chart.series_entry_mut(anchor).unwrap().line_style = 2;
+    let mut study = StudyAnnotations::default();
+    study.push_zone(StudyZone {
+        start_row: 2,
+        confirm_row: 3,
+        top: 112.0,
+        bottom: 100.0,
+        bullish: true,
+        end_row: None,
+        retired: false,
+    });
+    study.push_zone(StudyZone {
+        start_row: 4,
+        confirm_row: 5,
+        top: 110.0,
+        bottom: 99.0,
+        bullish: false,
+        end_row: Some(10),
+        retired: false,
+    });
+    study.push_marker(StudyMarker {
+        row: 8,
+        confirm_row: 8,
+        price: 108.0,
+        kind: StudyMarkerKind::Bos { up: true },
+        from_row: Some(2),
+    });
+    study.push_marker(StudyMarker {
+        row: 9,
+        confirm_row: 10,
+        price: 109.0,
+        kind: StudyMarkerKind::SwingHigh,
+        from_row: None,
+    });
+    let mut prims = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, false, 0, 19, 800, 1.0, 1.0, &mut prims,
+    );
+    assert!(matches!(prims[0], Prim::Rect { .. }));
+    assert!(matches!(prims[1], Prim::RectFrame { .. }));
+    assert!(matches!(
+        prims[2],
+        Prim::HLine {
+            style: LineStyle::Dashed,
+            ..
+        }
+    ));
+    assert!(
+        prims
+            .iter()
+            .any(|p| matches!(p, Prim::Text { text, .. } if text == "BOS"))
+    );
+    assert!(prims.iter().any(|p| matches!(p, Prim::Triangle { .. })));
+    let pane = &chart.panes[0];
+    let top = pane.top.round() as i32;
+    let bottom = (pane.top + pane.height).round() as i32;
+    if let Prim::Rect { rect, .. } = prims[0] {
+        assert!(rect.x >= 0 && rect.x + rect.w <= 800);
+        assert!(rect.y >= top && rect.y + rect.h <= bottom);
+    }
+    prims.clear();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, true, 6, 19, 800, 1.0, 1.0, &mut prims,
+    );
+    assert_eq!(
+        prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Rect { .. }))
+            .count(),
+        2
+    );
+    assert!(
+        prims
+            .iter()
+            .all(|p| !matches!(p, Prim::Rect { rect, .. } if rect.x < 0))
+    );
+}
+#[test]
+fn structure_segment_uses_anchor_output_style_with_dashed_default() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    let anchor = chart.add_market_structure(0, 1, 1, crate::StructureBreakOn::Wick)[0];
+    chart.build_frame();
+    let mut study = StudyAnnotations::default();
+    study.push_marker(StudyMarker {
+        row: 8,
+        confirm_row: 8,
+        price: 108.0,
+        kind: StudyMarkerKind::Bos { up: true },
+        from_row: Some(2),
+    });
+    let segment_style = |chart: &ChartEngine| {
+        let mut prims = Vec::new();
+        chart.build_study_annotations_frame(
+            anchor, 0, &study, false, 0, 19, 800, 1.0, 1.0, &mut prims,
+        );
+        prims.into_iter().find_map(|prim| match prim {
+            Prim::HLine { style, .. } => Some(style),
+            _ => None,
+        })
+    };
+    assert_eq!(segment_style(&chart), Some(LineStyle::Dashed));
+    for (line_style, expected) in [
+        (0, LineStyle::Solid),
+        (1, LineStyle::Dotted),
+        (2, LineStyle::Dashed),
+    ] {
+        assert!(chart.set_indicator_output_style(
+            anchor,
+            crate::IndicatorOutputStyle {
+                visible: true,
+                line_style,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(segment_style(&chart), Some(expected));
+    }
+}
+
+#[test]
+fn retired_zone_is_hidden_until_show_mitigated_and_ends_at_retirement() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    chart.build_frame();
+    let anchor = chart.series[0].id;
+    let mut study = StudyAnnotations::default();
+    for (start_row, confirm_row) in [(2, 3), (5, 6)] {
+        study.push_zone_with_cap(
+            StudyZone {
+                start_row,
+                confirm_row,
+                top: 112.,
+                bottom: 100.,
+                bullish: true,
+                end_row: None,
+                retired: false,
+            },
+            1,
+        );
+    }
+    assert!(study.zones()[0].retired);
+    assert_eq!(study.zones()[0].end_row, Some(6));
+    let mut hidden = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor,
+        anchor,
+        &study,
+        false,
+        0,
+        19,
+        800,
+        1.,
+        1.,
+        &mut hidden,
+    );
+    let mut shown = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, true, 0, 19, 800, 1., 1., &mut shown,
+    );
+    assert_eq!(
+        hidden
+            .iter()
+            .filter(|p| matches!(p, Prim::RectFrame { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|p| matches!(p, Prim::RectFrame { .. }))
+            .count(),
+        2
+    );
+    let (Prim::RectFrame { rect: retired, .. }, Prim::RectFrame { rect: active, .. }) =
+        (&shown[1], &shown[3])
+    else {
+        panic!("fill then border for both zones")
+    };
+    assert!(retired.x + retired.w < active.x + active.w);
+}
+
+#[test]
+fn study_annotations_cull_offscreen_rows_and_drop_dense_labels() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 200);
+    chart.build_frame();
+    let anchor = chart.series[0].id;
+    let mut study = StudyAnnotations::default();
+    for row in [3, 30] {
+        study.push_marker(StudyMarker {
+            row,
+            confirm_row: row,
+            price: 120.0,
+            kind: StudyMarkerKind::Choch { up: false },
+            from_row: Some(row - 2),
+        });
+    }
+    study.push_marker(StudyMarker {
+        row: 31,
+        confirm_row: 31,
+        price: 120.0,
+        kind: StudyMarkerKind::SwingLow,
+        from_row: None,
+    });
+    chart.time_scale.set_bar_spacing(2.0);
+    let mut prims = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, false, 20, 40, 800, 1.0, 1.0, &mut prims,
+    );
+    assert_eq!(
+        prims
+            .iter()
+            .filter(|p| matches!(p, Prim::HLine { .. }))
+            .count(),
+        1
+    );
+    assert!(!prims.iter().any(|p| matches!(p, Prim::Text { .. })));
+    chart.series[0].visible = false;
+    prims.clear();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, false, 20, 40, 800, 1.0, 1.0, &mut prims,
+    );
+    assert!(prims.is_empty());
+}
 
 #[test]
 fn axis_text_uses_the_run_font_for_the_shared_cap_center_metric() {

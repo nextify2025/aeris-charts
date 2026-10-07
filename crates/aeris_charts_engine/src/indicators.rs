@@ -4,6 +4,12 @@
 //! ordinary engine series (`aeris_charts_indicators` holds the pure math). Extracted from `lib.rs`.
 
 use super::*;
+use aeris_charts_indicators::structure_studies::{
+    BreakOn, Mitigation, MitigationPrice, OrderBlockZone as CalculationOrderBlockZone,
+    StructureStudy, StructureStudyKind,
+};
+use aeris_charts_indicators::study_annotations::StudyAnnotations;
+use aeris_charts_indicators::{SessionSource, SessionStudy, SessionStudyState};
 
 /// Scalar source selected by a study.  The aggregate sources are calculated from the source
 /// bar's OHLC columns without changing the canonical source series; each binding keeps the derived
@@ -44,8 +50,58 @@ pub enum IndicatorParameterType {
     Boolean,
     Source,
     Series,
-    /// One of the string values listed in [`IndicatorParameterDescriptor::choices`].
+    /// One of the string values listed in [`IndicatorParameterDescriptor::options`].
     Choice,
+}
+
+/// Session policy selected by calendar-aware studies. No timezone is inferred from the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StudyCalendarPolicy {
+    Utc,
+    Host,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviousPeriod {
+    Day,
+    Week,
+    Month,
+}
+
+/// Price used to detect a structural break.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructureBreakOn {
+    #[default]
+    Close,
+    Wick,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructureMitigation {
+    #[default]
+    Touch,
+    Half,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructureMitigationPrice {
+    #[default]
+    Wick,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderBlockZone {
+    #[default]
+    Wick,
+    Body,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -57,9 +113,26 @@ pub struct IndicatorParameterDescriptor {
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
-    /// Allowed values of a [`IndicatorParameterType::Choice`] parameter.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub choices: Vec<String>,
+    /// Allowed values of a [`IndicatorParameterType::Choice`] parameter, in display order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+}
+
+impl IndicatorParameterDescriptor {
+    /// A choice has an ordered, nonempty option list and a default from that list.
+    pub fn choice(name: &str, default: &str, options: &[&str]) -> Option<Self> {
+        if options.is_empty() || !options.contains(&default) {
+            return None;
+        }
+        Some(Self {
+            name: name.into(),
+            parameter_type: IndicatorParameterType::Choice,
+            default: serde_json::json!(default),
+            min: None,
+            max: None,
+            options: Some(options.iter().map(|option| (*option).into()).collect()),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -95,7 +168,7 @@ pub struct IndicatorSchema {
     pub outputs: Vec<IndicatorOutputDescriptor>,
 }
 
-pub const INDICATOR_SCHEMA_REVISION: u32 = 3;
+pub const INDICATOR_SCHEMA_REVISION: u32 = 4;
 
 // `remote = "Self"` makes serde emit the derived bodies as inherent functions, so the trait impls below can
 // keep the large internally tagged `Deserialize` body out of line. Without that, every call path
@@ -334,6 +407,43 @@ pub enum IndicatorKind {
     Wma {
         period: usize,
     },
+    SwingPoints {
+        left: usize,
+        right: usize,
+    },
+    MarketStructure {
+        left: usize,
+        right: usize,
+        break_on: StructureBreakOn,
+    },
+    FairValueGaps {
+        min_size: f64,
+        mitigation: StructureMitigation,
+        mitigation_price: StructureMitigationPrice,
+        max_active: usize,
+        show_mitigated: bool,
+    },
+    OrderBlocks {
+        left: usize,
+        right: usize,
+        break_on: StructureBreakOn,
+        zone: OrderBlockZone,
+        mitigation: StructureMitigation,
+        mitigation_price: StructureMitigationPrice,
+        max_active: usize,
+        show_mitigated: bool,
+    },
+    SessionLevels {
+        calendar: StudyCalendarPolicy,
+    },
+    PreviousPeriodLevels {
+        period: PreviousPeriod,
+        calendar: StudyCalendarPolicy,
+    },
+    OpeningRange {
+        duration_seconds: u32,
+        calendar: StudyCalendarPolicy,
+    },
     /// KDJ: RSV over `period` rows, `K = SMA(RSV, k_smoothing, 1)`,
     /// `D = SMA(K, d_smoothing, 1)`, `J = 3K - 2D` (defaults 9/3/3). `seed` also decides whether
     /// the first rows use a partial RSV window (see `KdjSeed`).
@@ -431,7 +541,8 @@ impl IndicatorKind {
             // carries a `seed` parameter, so the China preset leaves them unchanged;
             // likewise Bollinger metrics always use the population deviation. Add the typed
             // parameters here (and to the schema, persistence and TS) once a platform reference
-            // for their formula-language forms is verified.
+            // for their formula-language forms is verified. The structure and session studies have
+            // no recursive average to seed, so no preset applies to them either.
             other => other,
         }
     }
@@ -444,6 +555,40 @@ impl IndicatorKind {
     pub fn schema_definition(kind: &str, period: usize, deviation: f64) -> Option<Self> {
         use aeris_charts_indicators::{PivotKind, VwapReset};
         Some(match kind {
+            "swing_points" => Self::SwingPoints { left: 5, right: 5 },
+            "market_structure" => Self::MarketStructure {
+                left: 5,
+                right: 5,
+                break_on: StructureBreakOn::Close,
+            },
+            "fair_value_gaps" => Self::FairValueGaps {
+                min_size: 0.0,
+                mitigation: StructureMitigation::Touch,
+                mitigation_price: StructureMitigationPrice::Wick,
+                max_active: 20,
+                show_mitigated: false,
+            },
+            "order_blocks" => Self::OrderBlocks {
+                left: 5,
+                right: 5,
+                break_on: StructureBreakOn::Close,
+                zone: OrderBlockZone::Wick,
+                mitigation: StructureMitigation::Touch,
+                mitigation_price: StructureMitigationPrice::Wick,
+                max_active: 20,
+                show_mitigated: false,
+            },
+            "session_levels" => Self::SessionLevels {
+                calendar: StudyCalendarPolicy::Utc,
+            },
+            "previous_period_levels" => Self::PreviousPeriodLevels {
+                period: PreviousPeriod::Day,
+                calendar: StudyCalendarPolicy::Utc,
+            },
+            "opening_range" => Self::OpeningRange {
+                duration_seconds: 1800,
+                calendar: StudyCalendarPolicy::Utc,
+            },
             "aroon" => Self::Aroon { period },
             "awesome_oscillator" => Self::AwesomeOscillator,
             "dpo" => Self::Dpo { period },
@@ -663,6 +808,12 @@ pub(crate) struct IndicatorBinding {
     pub(crate) volume_source: Option<SeriesId>,
     /// Turnover column of an amount-weighted VWAP, aligned by timestamp like volume.
     pub(crate) amount_source: Option<SeriesId>,
+    /// Structural-study geometry is binding-owned, never a synthetic output series.
+    pub(crate) annotations: Option<StudyAnnotations>,
+    /// Incremental OHLC scanner for structure studies; its history is not persisted.
+    pub(crate) structure: Option<StructureStudy>,
+    pub(crate) session: Option<SessionStudyState>,
+    pub(crate) calendar: Option<StudyCalendarPolicy>,
     runtime: aeris_charts_indicators::IncrementalState,
     inputs: IndicatorInputs,
     source_generation: u64,
@@ -675,10 +826,36 @@ pub(crate) struct IndicatorBinding {
 }
 
 impl IndicatorBinding {
+    /// Warm-up and convergence rows of output `output_index`. Structure and session studies run
+    /// their own scanners, not the scalar placeholder runtime: a swing level needs `left + right`
+    /// rows to confirm its first pivot, the other study outputs have no fixed warm-up, and none
+    /// converges after a fixed number of rows (each value follows the latest confirmed pivot or
+    /// the session and period its row falls in).
+    fn output_warmup(&self, output_index: usize) -> (usize, Option<usize>) {
+        match self.kind {
+            IndicatorKind::SwingPoints { left, right } => (left.saturating_add(right), None),
+            _ if self.structure.is_some() || self.session.is_some() => (0, None),
+            _ => (
+                self.runtime.warmup_rows(output_index),
+                self.runtime.convergence_rows(output_index),
+            ),
+        }
+    }
+
     /// Rows of work this binding's most recent rebuild performed: formula rows its runtime
-    /// evaluated plus aggregate-input and weight-alignment rows it derived.
+    /// evaluated plus aggregate-input and weight-alignment rows it derived, or the rows a
+    /// structure or session study scanned (checkpoint replays included).
     pub(crate) fn last_work_rows(&self) -> usize {
-        self.runtime.last_work_rows() + self.inputs.work_rows
+        self.runtime.last_work_rows()
+            + self.inputs.work_rows
+            + self
+                .structure
+                .as_ref()
+                .map_or(0, StructureStudy::last_work_rows)
+            + self
+                .session
+                .as_ref()
+                .map_or(0, SessionStudyState::last_work_rows)
     }
 }
 
@@ -909,6 +1086,18 @@ pub struct IndicatorInfo {
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct IndicatorParameters {
+    pub calendar: Option<StudyCalendarPolicy>,
+    pub previous_period: Option<PreviousPeriod>,
+    pub duration_seconds: Option<u32>,
+    pub left: Option<usize>,
+    pub right: Option<usize>,
+    pub break_on: Option<StructureBreakOn>,
+    pub min_size: Option<f64>,
+    pub mitigation: Option<StructureMitigation>,
+    pub mitigation_price: Option<StructureMitigationPrice>,
+    pub max_active: Option<usize>,
+    pub show_mitigated: Option<bool>,
+    pub zone: Option<OrderBlockZone>,
     pub period: Option<usize>,
     pub periods: Option<[usize; aeris_charts_indicators::MAX_OUTPUTS]>,
     pub pivot_kind: Option<aeris_charts_indicators::PivotKind>,
@@ -962,6 +1151,122 @@ fn indicator_default_line_width(kind: &IndicatorKind) -> f64 {
 }
 
 impl ChartEngine {
+    pub fn add_session_levels(
+        &mut self,
+        source: SeriesId,
+        calendar: StudyCalendarPolicy,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::SessionLevels { calendar }, None)
+    }
+
+    pub fn add_previous_period_levels(
+        &mut self,
+        source: SeriesId,
+        period: PreviousPeriod,
+        calendar: StudyCalendarPolicy,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::PreviousPeriodLevels { period, calendar },
+            None,
+        )
+    }
+
+    pub fn add_opening_range(
+        &mut self,
+        source: SeriesId,
+        duration_seconds: u32,
+        calendar: StudyCalendarPolicy,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::OpeningRange {
+                duration_seconds,
+                calendar,
+            },
+            None,
+        )
+    }
+
+    /// Add confirmed swing levels on the source price pane.
+    pub fn add_swing_points(
+        &mut self,
+        source: SeriesId,
+        left: usize,
+        right: usize,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::SwingPoints { left, right }, None)
+    }
+
+    pub fn add_market_structure(
+        &mut self,
+        source: SeriesId,
+        left: usize,
+        right: usize,
+        break_on: StructureBreakOn,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::MarketStructure {
+                left,
+                right,
+                break_on,
+            },
+            None,
+        )
+    }
+
+    pub fn add_fair_value_gaps(
+        &mut self,
+        source: SeriesId,
+        min_size: f64,
+        mitigation: StructureMitigation,
+        mitigation_price: StructureMitigationPrice,
+        max_active: usize,
+        show_mitigated: bool,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::FairValueGaps {
+                min_size,
+                mitigation,
+                mitigation_price,
+                max_active,
+                show_mitigated,
+            },
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_order_blocks(
+        &mut self,
+        source: SeriesId,
+        left: usize,
+        right: usize,
+        break_on: StructureBreakOn,
+        zone: OrderBlockZone,
+        mitigation: StructureMitigation,
+        mitigation_price: StructureMitigationPrice,
+        max_active: usize,
+        show_mitigated: bool,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::OrderBlocks {
+                left,
+                right,
+                break_on,
+                zone,
+                mitigation,
+                mitigation_price,
+                max_active,
+                show_mitigated,
+            },
+            None,
+        )
+    }
+
     pub(crate) fn reset_indicator_output_styles_to_defaults(&mut self) {
         let outputs = self
             .indicators
@@ -979,6 +1284,12 @@ impl ChartEngine {
                 series.line_color = indicator_output_color(&kind, output_index).map(str::to_string);
                 if let IndicatorKind::KLineChart(indicator) = &kind {
                     apply_klinechart_output_style(series, indicator, output_index);
+                }
+                if matches!(
+                    kind,
+                    IndicatorKind::MarketStructure { .. } | IndicatorKind::OrderBlocks { .. }
+                ) {
+                    series.line_style = 2;
                 }
             }
         }
@@ -1012,7 +1323,21 @@ impl ChartEngine {
     pub(crate) fn indicator_memory_usage(&self) -> (usize, usize) {
         self.indicators.iter().fold((0, 0), |usage, binding| {
             (
-                usage.0 + binding.runtime.runtime_bytes() + binding.inputs.bytes(),
+                usage.0
+                    + binding.runtime.runtime_bytes()
+                    + binding.inputs.bytes()
+                    + binding
+                        .structure
+                        .as_ref()
+                        .map_or(0, StructureStudy::capacity_bytes)
+                    + binding
+                        .session
+                        .as_ref()
+                        .map_or(0, SessionStudyState::capacity_bytes)
+                    + binding
+                        .annotations
+                        .as_ref()
+                        .map_or(0, StudyAnnotations::capacity_bytes),
                 usage.1 + binding.runtime.transfer_capacity_bytes(),
             )
         })
@@ -1046,6 +1371,56 @@ impl ChartEngine {
                     .collect(),
             })
             .collect()
+    }
+
+    // ponytail: annotations are display-only (no hit target, selection or hover). Interaction,
+    // if a product needs it, belongs in the engine input controller (`chart_input.rs`) querying
+    // the same interval index, never in a host.
+    /// Snapshot the bounded annotation history of a structural study by its binding identity.
+    ///
+    /// An ordinary scalar binding has no annotation output; passing an output other than the
+    /// binding's first output is not a binding identity.
+    pub fn study_annotations(&self, binding: SeriesId) -> Result<StudyAnnotations, ChartError> {
+        let producer = self
+            .indicators
+            .iter()
+            .find(|producer| producer.outputs.first() == Some(&binding))
+            .ok_or_else(|| ChartError::new(ErrorCode::InvalidHandle, "unknown study binding"))?;
+        producer
+            .annotations
+            .as_ref()
+            .or_else(|| producer.structure.as_ref().map(StructureStudy::annotations))
+            .cloned()
+            .ok_or_else(|| {
+                ChartError::new(
+                    ErrorCode::UnsupportedOperation,
+                    "study binding has no structural annotations",
+                )
+            })
+    }
+
+    /// Install bounded test geometry without exposing an incomplete structural-study kind.
+    #[cfg(test)]
+    pub(crate) fn inject_study_annotations_for_test(
+        &mut self,
+        binding: SeriesId,
+        annotations: StudyAnnotations,
+    ) -> bool {
+        let Some(producer) = self
+            .indicators
+            .iter_mut()
+            .find(|producer| producer.outputs.first() == Some(&binding))
+        else {
+            return false;
+        };
+        producer.annotations = Some(annotations);
+        let source = producer.source;
+        let outputs = producer.outputs.clone();
+        self.invalidate_frame_series(source);
+        for output in outputs {
+            self.invalidate_frame_series(output);
+        }
+        true
     }
 
     /// Whether the chart currently owns at least one live native indicator binding.
@@ -1181,6 +1556,7 @@ impl ChartEngine {
         series.down_color = style.down_color;
         series.area_top_color = style.area_top_color;
         series.area_bottom_color = style.area_bottom_color;
+        self.invalidate_frame_series(output);
         true
     }
 
@@ -1194,6 +1570,107 @@ impl ChartEngine {
                 .position(|&output| output == id)
                 .map(|output_index| {
                     let (kind, period, deviation, parameters) = match binding.kind {
+                        IndicatorKind::SwingPoints { left, right } => (
+                            "swing_points",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                left: Some(left),
+                                right: Some(right),
+                                ..Default::default()
+                            },
+                        ),
+                        IndicatorKind::MarketStructure {
+                            left,
+                            right,
+                            break_on,
+                        } => (
+                            "market_structure",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                left: Some(left),
+                                right: Some(right),
+                                break_on: Some(break_on),
+                                ..Default::default()
+                            },
+                        ),
+                        IndicatorKind::FairValueGaps {
+                            min_size,
+                            mitigation,
+                            mitigation_price,
+                            max_active,
+                            show_mitigated,
+                        } => (
+                            "fair_value_gaps",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                min_size: Some(min_size),
+                                mitigation: Some(mitigation),
+                                mitigation_price: Some(mitigation_price),
+                                max_active: Some(max_active),
+                                show_mitigated: Some(show_mitigated),
+                                ..Default::default()
+                            },
+                        ),
+                        IndicatorKind::OrderBlocks {
+                            left,
+                            right,
+                            break_on,
+                            zone,
+                            mitigation,
+                            mitigation_price,
+                            max_active,
+                            show_mitigated,
+                        } => (
+                            "order_blocks",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                left: Some(left),
+                                right: Some(right),
+                                break_on: Some(break_on),
+                                zone: Some(zone),
+                                mitigation: Some(mitigation),
+                                mitigation_price: Some(mitigation_price),
+                                max_active: Some(max_active),
+                                show_mitigated: Some(show_mitigated),
+                                ..Default::default()
+                            },
+                        ),
+                        IndicatorKind::SessionLevels { calendar } => (
+                            "session_levels",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                calendar: Some(calendar),
+                                ..Default::default()
+                            },
+                        ),
+                        IndicatorKind::PreviousPeriodLevels { period, calendar } => (
+                            "previous_period_levels",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                calendar: Some(calendar),
+                                previous_period: Some(period),
+                                ..Default::default()
+                            },
+                        ),
+                        IndicatorKind::OpeningRange {
+                            duration_seconds,
+                            calendar,
+                        } => (
+                            "opening_range",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                calendar: Some(calendar),
+                                duration_seconds: Some(duration_seconds),
+                                ..Default::default()
+                            },
+                        ),
                         IndicatorKind::Aroon { period } => (
                             "aroon",
                             period,
@@ -1881,9 +2358,10 @@ impl ChartEngine {
                 .position(|&output| output == current)
                 .map(|index| (binding, index))
         }) {
-            warmup = warmup.saturating_add(binding.runtime.warmup_rows(output_index));
+            let (own_warmup, own_convergence) = binding.output_warmup(output_index);
+            warmup = warmup.saturating_add(own_warmup);
             convergence = convergence
-                .zip(binding.runtime.convergence_rows(output_index))
+                .zip(own_convergence)
                 .map(|(total, own)| total.saturating_add(own));
             current = binding.source;
         }
@@ -2718,6 +3196,11 @@ impl ChartEngine {
         volume_source: Option<SeriesId>,
         amount_source: Option<SeriesId>,
     ) -> Vec<SeriesId> {
+        // OHLC structural rules consume the complete candle. A scalar source override
+        // must not be accepted and then silently ignored by their scanner.
+        if structure_output_count(&kind).is_some() && source_input != IndicatorInputSource::Close {
+            return Vec::new();
+        }
         let ids = self.add_indicator(
             source,
             source_input,
@@ -2894,6 +3377,13 @@ impl ChartEngine {
             | IndicatorKind::McGinley { .. }
             | IndicatorKind::LinearRegression { .. }
             | IndicatorKind::AtrBands { .. }
+            | IndicatorKind::SwingPoints { .. }
+            | IndicatorKind::MarketStructure { .. }
+            | IndicatorKind::FairValueGaps { .. }
+            | IndicatorKind::OrderBlocks { .. }
+            | IndicatorKind::SessionLevels { .. }
+            | IndicatorKind::PreviousPeriodLevels { .. }
+            | IndicatorKind::OpeningRange { .. }
             | IndicatorKind::Wma { .. } => {}
         }
         ids
@@ -2915,6 +3405,9 @@ impl ChartEngine {
         };
         if self.indicators[index].source_input == source_input {
             return true;
+        }
+        if self.indicators[index].structure.is_some() {
+            return false;
         }
         let kind = self.indicators[index].kind.clone();
         self.indicators[index].source_input = source_input;
@@ -2939,7 +3432,7 @@ impl ChartEngine {
                 default,
                 min: range.map(|range| range.0),
                 max: range.map(|range| range.1),
-                choices: Vec::new(),
+                options: None,
             };
         let mut parameters = vec![descriptor(
             "source",
@@ -2947,6 +3440,17 @@ impl ChartEngine {
             serde_json::json!(IndicatorInputSource::Close),
             None,
         )];
+        if structure_output_count(kind).is_some() {
+            parameters.clear();
+        }
+        if matches!(
+            kind,
+            IndicatorKind::SessionLevels { .. }
+                | IndicatorKind::PreviousPeriodLevels { .. }
+                | IndicatorKind::OpeningRange { .. }
+        ) {
+            parameters.clear();
+        }
         let integer = |name: &str, default: usize| {
             descriptor(
                 name,
@@ -2979,16 +3483,183 @@ impl ChartEngine {
                 None,
             )
         };
-        let choice = |name: &str, default: serde_json::Value, choices: &[&str]| {
-            IndicatorParameterDescriptor {
-                choices: choices.iter().map(|choice| (*choice).to_string()).collect(),
-                ..descriptor(name, IndicatorParameterType::Choice, default, None)
-            }
+        let choice = |name: &str, default: &str, options: &[&str]| {
+            IndicatorParameterDescriptor::choice(name, default, options)
+                .expect("built-in choice defaults are listed options")
         };
         let seed = |value: aeris_charts_indicators::IndicatorSeed| {
-            choice("seed", serde_json::json!(value), &["sma", "first_value"])
+            choice(
+                "seed",
+                match value {
+                    aeris_charts_indicators::IndicatorSeed::Sma => "sma",
+                    aeris_charts_indicators::IndicatorSeed::FirstValue => "first_value",
+                },
+                &["sma", "first_value"],
+            )
+        };
+        let swing = |parameters: &mut Vec<IndicatorParameterDescriptor>, left, right| {
+            for (name, value) in [("left", left), ("right", right)] {
+                let mut descriptor = integer(name, value);
+                descriptor.max = Some(50.0);
+                parameters.push(descriptor);
+            }
+        };
+        let zones = |parameters: &mut Vec<IndicatorParameterDescriptor>,
+                     mitigation: StructureMitigation,
+                     mitigation_price: StructureMitigationPrice,
+                     max_active: usize,
+                     show_mitigated: bool| {
+            parameters.push(
+                IndicatorParameterDescriptor::choice(
+                    "mitigation",
+                    match mitigation {
+                        StructureMitigation::Touch => "touch",
+                        StructureMitigation::Half => "half",
+                        StructureMitigation::Full => "full",
+                    },
+                    &["touch", "half", "full"],
+                )
+                .unwrap(),
+            );
+            parameters.push(
+                IndicatorParameterDescriptor::choice(
+                    "mitigation_price",
+                    match mitigation_price {
+                        StructureMitigationPrice::Wick => "wick",
+                        StructureMitigationPrice::Close => "close",
+                    },
+                    &["wick", "close"],
+                )
+                .unwrap(),
+            );
+            let mut active = integer("max_active", max_active);
+            active.max = Some(64.0);
+            parameters.push(active);
+            parameters.push(IndicatorParameterDescriptor {
+                name: "show_mitigated".into(),
+                parameter_type: IndicatorParameterType::Boolean,
+                default: serde_json::json!(show_mitigated),
+                min: None,
+                max: None,
+                options: None,
+            });
         };
         match *kind {
+            IndicatorKind::SwingPoints { left, right } => swing(&mut parameters, left, right),
+            IndicatorKind::MarketStructure {
+                left,
+                right,
+                break_on,
+            } => {
+                swing(&mut parameters, left, right);
+                parameters.push(
+                    IndicatorParameterDescriptor::choice(
+                        "break_on",
+                        if break_on == StructureBreakOn::Close {
+                            "close"
+                        } else {
+                            "wick"
+                        },
+                        &["close", "wick"],
+                    )
+                    .unwrap(),
+                );
+            }
+            IndicatorKind::FairValueGaps {
+                min_size,
+                mitigation,
+                mitigation_price,
+                max_active,
+                show_mitigated,
+            } => {
+                parameters.push(number("min_size", min_size));
+                zones(
+                    &mut parameters,
+                    mitigation,
+                    mitigation_price,
+                    max_active,
+                    show_mitigated,
+                );
+            }
+            IndicatorKind::OrderBlocks {
+                left,
+                right,
+                break_on,
+                zone,
+                mitigation,
+                mitigation_price,
+                max_active,
+                show_mitigated,
+            } => {
+                swing(&mut parameters, left, right);
+                parameters.push(
+                    IndicatorParameterDescriptor::choice(
+                        "break_on",
+                        if break_on == StructureBreakOn::Close {
+                            "close"
+                        } else {
+                            "wick"
+                        },
+                        &["close", "wick"],
+                    )
+                    .unwrap(),
+                );
+                parameters.push(
+                    IndicatorParameterDescriptor::choice(
+                        "zone",
+                        if zone == OrderBlockZone::Wick {
+                            "wick"
+                        } else {
+                            "body"
+                        },
+                        &["wick", "body"],
+                    )
+                    .unwrap(),
+                );
+                zones(
+                    &mut parameters,
+                    mitigation,
+                    mitigation_price,
+                    max_active,
+                    show_mitigated,
+                );
+            }
+            IndicatorKind::SessionLevels { calendar }
+            | IndicatorKind::PreviousPeriodLevels { calendar, .. }
+            | IndicatorKind::OpeningRange { calendar, .. } => {
+                if let IndicatorKind::PreviousPeriodLevels { period, .. } = kind {
+                    parameters.push(
+                        IndicatorParameterDescriptor::choice(
+                            "period",
+                            match period {
+                                PreviousPeriod::Day => "day",
+                                PreviousPeriod::Week => "week",
+                                PreviousPeriod::Month => "month",
+                            },
+                            &["day", "week", "month"],
+                        )
+                        .unwrap(),
+                    );
+                }
+                if let IndicatorKind::OpeningRange {
+                    duration_seconds, ..
+                } = kind
+                {
+                    parameters.push(integer("duration_seconds", *duration_seconds as usize));
+                }
+                parameters.push(
+                    IndicatorParameterDescriptor::choice(
+                        "calendar",
+                        if calendar == StudyCalendarPolicy::Utc {
+                            "utc"
+                        } else {
+                            "host"
+                        },
+                        &["utc", "host"],
+                    )
+                    .unwrap(),
+                );
+            }
             IndicatorKind::Aroon { period } => parameters.push(integer("period", period)),
             IndicatorKind::AwesomeOscillator => {}
             IndicatorKind::Dpo { period } => parameters.push(integer("period", period)),
@@ -3041,7 +3712,10 @@ impl ChartEngine {
                 parameters.push(number("deviation", deviation));
                 parameters.push(choice(
                     "estimator",
-                    serde_json::json!(estimator),
+                    match estimator {
+                        aeris_charts_indicators::DeviationEstimator::Population => "population",
+                        aeris_charts_indicators::DeviationEstimator::Sample => "sample",
+                    },
                     &["population", "sample"],
                 ));
             }
@@ -3235,7 +3909,10 @@ impl ChartEngine {
                 parameters.push(integer("d_smoothing", d_smoothing));
                 parameters.push(choice(
                     "seed",
-                    serde_json::json!(seed),
+                    match seed {
+                        aeris_charts_indicators::KdjSeed::Fifty => "fifty",
+                        aeris_charts_indicators::KdjSeed::FirstValue => "first_value",
+                    },
                     &["fifty", "first_value"],
                 ));
             }
@@ -3281,7 +3958,9 @@ impl ChartEngine {
                 }
             }
         }
-        let output_count = incremental_state(kind).output_count();
+        let output_count = session_output_count(kind)
+            .or_else(|| structure_output_count(kind))
+            .unwrap_or_else(|| incremental_state(kind).output_count());
         IndicatorSchema {
             revision: INDICATOR_SCHEMA_REVISION,
             kind: indicator_kind_name(kind).into(),
@@ -3394,7 +4073,9 @@ impl ChartEngine {
         volume_source: Option<SeriesId>,
         amount_source: Option<SeriesId>,
     ) -> Vec<SeriesId> {
-        if self.series_entry(source).is_none()
+        if !structure_kind_is_valid(&kind)
+            || !self.structure_source_is_supported(source, &kind)
+            || self.series_entry(source).is_none()
             || amount_source.is_some_and(|id| {
                 // Turnover weighting divides by volume, so it needs a distinct volume column.
                 !matches!(kind, IndicatorKind::Vwap)
@@ -3601,12 +4282,24 @@ impl ChartEngine {
                         || *percent < 0.0
                 }
                 IndicatorKind::KLineChart(indicator) => !indicator.is_valid(),
+                IndicatorKind::SwingPoints { .. }
+                | IndicatorKind::MarketStructure { .. }
+                | IndicatorKind::FairValueGaps { .. }
+                | IndicatorKind::OrderBlocks { .. } => !structure_kind_is_valid(&kind),
+                IndicatorKind::SessionLevels { .. }
+                | IndicatorKind::PreviousPeriodLevels { .. } => false,
+                IndicatorKind::OpeningRange {
+                    duration_seconds, ..
+                } => *duration_seconds == 0,
             }
         {
             return Vec::new();
         }
         let runtime = incremental_state(&kind);
-        let output_count = runtime.output_count();
+        let output_count = session_output_count(&kind)
+            .or_else(|| structure_output_count(&kind))
+            .unwrap_or_else(|| runtime.output_count());
+        let structure = structure_study_kind(&kind).map(StructureStudy::new);
         let source_price_format = self.series_entry(source).map(|series| {
             (
                 series.price_format.kind,
@@ -3614,6 +4307,9 @@ impl ChartEngine {
                 series.price_format.min_move,
             )
         });
+        let source_placement = self
+            .series_entry(source)
+            .map(|series| (series.pane_index, series.price_scale_target));
         let ids = (0..output_count)
             .map(|_| self.add_series(SeriesKind::Line))
             .collect::<Vec<_>>();
@@ -3630,6 +4326,29 @@ impl ChartEngine {
                 s.price_line_visible = self.indicator_chrome.price_lines_visible;
                 s.title = indicator_output_title(&kind, output_index);
                 s.line_width = Some(indicator_default_line_width(&kind));
+                if matches!(
+                    kind,
+                    IndicatorKind::SwingPoints { .. }
+                        | IndicatorKind::MarketStructure { .. }
+                        | IndicatorKind::FairValueGaps { .. }
+                        | IndicatorKind::OrderBlocks { .. }
+                        | IndicatorKind::SessionLevels { .. }
+                        | IndicatorKind::PreviousPeriodLevels { .. }
+                        | IndicatorKind::OpeningRange { .. }
+                ) && let Some((pane_index, price_scale_target)) = source_placement
+                {
+                    s.pane_index = pane_index;
+                    s.price_scale_target = price_scale_target;
+                }
+                if matches!(
+                    kind,
+                    IndicatorKind::MarketStructure { .. } | IndicatorKind::OrderBlocks { .. }
+                ) {
+                    s.line_style = 2;
+                }
+                if matches!(kind, IndicatorKind::SwingPoints { .. }) {
+                    s.line_type = LineType::WithSteps;
+                }
                 // The last-price pulse marks the traded series, never a derived study line.
                 s.last_price_animation = false;
                 if output_index == 0 {
@@ -3673,6 +4392,13 @@ impl ChartEngine {
                 }
             }
         }
+        let calendar = match &kind {
+            IndicatorKind::SessionLevels { calendar }
+            | IndicatorKind::PreviousPeriodLevels { calendar, .. }
+            | IndicatorKind::OpeningRange { calendar, .. } => Some(*calendar),
+            _ => None,
+        };
+        let session = session_study_kind(&kind).map(SessionStudyState::new);
         self.indicators.push(IndicatorBinding {
             source,
             source_input,
@@ -3682,6 +4408,10 @@ impl ChartEngine {
             outputs: ids.clone(),
             volume_source,
             amount_source,
+            annotations: None,
+            structure,
+            session,
+            calendar,
             source_generation: 0,
             volume_generation: None,
             amount_generation: None,
@@ -3704,6 +4434,17 @@ impl ChartEngine {
         self.propagate_indicator_changes();
         self.sync_time_points();
         self.refresh_resampled_dependents(dependency);
+    }
+
+    /// Whether `source` can carry a structure study. Its annotations name the source's own rows
+    /// and paint through the source's plot rows, which an as-of overlay (or an indicator output
+    /// of one) repeats or skips, so an as-of source is refused; other kinds accept any source.
+    fn structure_source_is_supported(&self, source: SeriesId, kind: &IndicatorKind) -> bool {
+        structure_output_count(kind).is_none()
+            || !self
+                .data
+                .time_alignment(source)
+                .is_some_and(TimeAlignment::is_as_of)
     }
 
     /// One past `source`'s last real row among its `rows` visible rows: the rows after it are
@@ -3852,14 +4593,23 @@ impl ChartEngine {
     /// Exchange time zone, session start, or calendar-date changes move trading-day boundaries:
     /// rebuild every period-keyed binding (VWAP, VWAP bands, pivots) and its dependents once.
     pub(crate) fn rebuild_trading_day_indicators(&mut self) {
-        self.indicator_changes.clear();
-        for index in 0..self.indicators.len() {
-            if matches!(
-                self.indicators[index].kind,
+        self.rebuild_calendar_indicators(|binding| {
+            matches!(
+                binding.kind,
                 IndicatorKind::Vwap
                     | IndicatorKind::VwapBands { .. }
                     | IndicatorKind::PivotPoints { .. }
-            ) {
+            )
+        });
+    }
+
+    /// The one rebuild for a calendar change (trading days or the host study calendar): rebuild
+    /// every binding `affected` selects from its first row, propagate to its dependents once, and
+    /// resync the time points so the time scale follows the new outputs.
+    pub(crate) fn rebuild_calendar_indicators(&mut self, affected: fn(&IndicatorBinding) -> bool) {
+        self.indicator_changes.clear();
+        for index in 0..self.indicators.len() {
+            if affected(&self.indicators[index]) {
                 let changes = self.rebuild_indicator(index, 0, true);
                 self.indicator_changes.extend(changes.into_iter().flatten());
             }
@@ -3870,7 +4620,7 @@ impl ChartEngine {
         }
     }
 
-    fn propagate_indicator_changes(&mut self) {
+    pub(crate) fn propagate_indicator_changes(&mut self) {
         // Bindings are topological by construction: an indicator output must exist before it can
         // be selected as a later indicator's source. One forward pass therefore updates direct
         // dependencies and every downstream chain without repeatedly scanning the whole graph.
@@ -3908,7 +4658,163 @@ impl ChartEngine {
         }
     }
 
-    fn rebuild_indicator(
+    /// Source rows a rebuild of binding `index` covers: through the source's last real row
+    /// (see [`Self::source_data_end`]), and never fewer than the previous rebuild covered unless
+    /// the source shrank, so rows that just turned whitespace are rewritten too.
+    fn indicator_data_end(&self, index: usize, rows: usize, full_replace: bool) -> usize {
+        let data_end = self.source_data_end(self.indicators[index].source, rows);
+        if full_replace {
+            data_end
+        } else {
+            data_end.max(self.indicators[index].data_end).min(rows)
+        }
+    }
+
+    fn rebuild_structure_indicator(
+        &mut self,
+        index: usize,
+        from: usize,
+        full_replace: bool,
+        outputs: [Option<SeriesId>; aeris_charts_indicators::MAX_OUTPUTS],
+    ) -> [Option<(SeriesId, IndicatorChange)>; aeris_charts_indicators::MAX_OUTPUTS] {
+        let mut changes = [None; aeris_charts_indicators::MAX_OUTPUTS];
+        let source = self.indicators[index].source;
+        let Some((times, values)) = self.data.series_data(source) else {
+            return changes;
+        };
+        let rows = times.len();
+        // Like the built-in runtimes, the scanner stops at the source's last real row, so a tick
+        // filling a pre-installed session slot stays a tail update.
+        let end = self.indicator_data_end(index, rows, full_replace);
+        let source_generation = self.data.series_generation(source).unwrap_or(0);
+        let input = aeris_charts_indicators::IndicatorInput {
+            times: &times[..end],
+            open: &values[0][..end],
+            high: &values[1][..end],
+            low: &values[2][..end],
+            close: &values[3][..end],
+            volume: &[],
+            amount: &[],
+        };
+        let binding = &mut self.indicators[index];
+        let structure = binding.structure.as_mut().expect("structure runtime");
+        // Only a full replacement requires a fresh runtime. Appends and tip replacements preserve
+        // its bounded checkpoint state. A tick that skips whitespace slots reports a `from` past
+        // the scanner's end, but the rows between are untouched whitespace, so the scan resumes
+        // at the scanner's end instead of replaying the history.
+        let output_start = if full_replace {
+            0
+        } else {
+            from.min(end).min(structure.len())
+        };
+        if full_replace {
+            *structure = StructureStudy::new(structure_study_kind(&binding.kind).unwrap());
+        }
+        structure.update(input, output_start);
+        binding.source_generation = source_generation;
+        binding.data_end = end;
+        for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
+            let values = structure.outputs()[output_index][output_start..end]
+                .iter()
+                .map(|value| value.unwrap_or(f64::NAN))
+                .collect::<Vec<_>>();
+            let rewrite = if full_replace {
+                OutputRows::Replace(values)
+            } else {
+                OutputRows::Update(&values)
+            };
+            let (_, change) = store_indicator_output(
+                &mut self.data,
+                source,
+                output,
+                output_start,
+                rewrite,
+                end,
+                rows,
+            );
+            changes[output_index] = change.map(|change| (output, change));
+        }
+        changes
+    }
+
+    fn rebuild_session_indicator(
+        &mut self,
+        index: usize,
+        from: usize,
+        full_replace: bool,
+        outputs: [Option<SeriesId>; aeris_charts_indicators::MAX_OUTPUTS],
+    ) -> [Option<(SeriesId, IndicatorChange)>; aeris_charts_indicators::MAX_OUTPUTS] {
+        let mut changes = [None; aeris_charts_indicators::MAX_OUTPUTS];
+        let source = self.indicators[index].source;
+        let Some((times, values)) = self.data.series_data(source) else {
+            return changes;
+        };
+        let rows = times.len();
+        let end = self.indicator_data_end(index, rows, full_replace);
+        let session_source = if self.indicators[index].calendar == Some(StudyCalendarPolicy::Host) {
+            SessionSource::Host(&self.study_calendar_spans)
+        } else {
+            SessionSource::Utc
+        };
+        let kind = session_study_kind(&self.indicators[index].kind).expect("session kind");
+        let state = self.indicators[index]
+            .session
+            .as_mut()
+            .expect("session runtime");
+        if full_replace {
+            *state = SessionStudyState::new(kind);
+        }
+        state.update(
+            aeris_charts_indicators::IndicatorInput {
+                times: &times[..end],
+                open: &values[0][..end],
+                high: &values[1][..end],
+                low: &values[2][..end],
+                close: &values[3][..end],
+                volume: &[],
+                amount: &[],
+            },
+            session_source,
+            if full_replace { 0 } else { from },
+        );
+        let points = state.outputs();
+        let source_generation = self.data.series_generation(source).unwrap_or(0);
+        let start = if full_replace {
+            0
+        } else {
+            from.min(points.len())
+        };
+        for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
+            let values = points[start..]
+                .iter()
+                .map(|p| {
+                    match output_index {
+                        0 => p.high,
+                        1 => p.low,
+                        2 if matches!(kind, SessionStudy::OpeningRange { .. }) => {
+                            p.high.zip(p.low).map(|(high, low)| (high + low) * 0.5)
+                        }
+                        2 => p.close,
+                        _ => None,
+                    }
+                    .unwrap_or(f64::NAN)
+                })
+                .collect::<Vec<_>>();
+            let rewrite = if full_replace {
+                OutputRows::Replace(values)
+            } else {
+                OutputRows::Update(&values)
+            };
+            let (_, change) =
+                store_indicator_output(&mut self.data, source, output, start, rewrite, end, rows);
+            changes[output_index] = change.map(|change| (output, change));
+        }
+        self.indicators[index].source_generation = source_generation;
+        self.indicators[index].data_end = end;
+        changes
+    }
+
+    pub(crate) fn rebuild_indicator(
         &mut self,
         index: usize,
         from: usize,
@@ -3925,6 +4831,18 @@ impl ChartEngine {
         let source_input = self.indicators[index].source_input;
         let volume_source = self.indicators[index].volume_source;
         let amount_source = self.indicators[index].amount_source;
+        let source_generation = self.data.series_generation(source).unwrap_or(0);
+        if self.indicators[index].structure.is_some() {
+            return self.rebuild_structure_indicator(index, from, full_replace, outputs);
+        }
+        if session_output_count(&self.indicators[index].kind).is_some() {
+            return self.rebuild_session_indicator(index, from, full_replace, outputs);
+        }
+        if (full_replace || self.indicators[index].source_generation != source_generation)
+            && let Some(annotations) = self.indicators[index].annotations.as_mut()
+        {
+            annotations.rebuild_from(if full_replace { 0 } else { from });
+        }
         let rows;
         let end;
         {
@@ -3936,12 +4854,7 @@ impl ChartEngine {
             // stops at that data end and the outputs keep the rows past it untouched, which keeps
             // a tick filling a slot as cheap as an append.
             rows = times.len();
-            let data_end = self.source_data_end(source, rows);
-            end = if full_replace {
-                data_end
-            } else {
-                data_end.max(self.indicators[index].data_end).min(rows)
-            };
+            end = self.indicator_data_end(index, rows, full_replace);
             let times = &times[..end];
             let values = values.map(|column| &column[..end.min(column.len())]);
             let from = if full_replace { 0 } else { from.min(end) };
@@ -3989,7 +4902,7 @@ impl ChartEngine {
             binding.inputs.work_rows = price_rows + volume_rows + amount_rows;
         }
         self.indicators[index].data_end = end;
-        self.indicators[index].source_generation = self.data.series_generation(source).unwrap_or(0);
+        self.indicators[index].source_generation = source_generation;
         self.indicators[index].volume_generation =
             volume_source.and_then(|id| self.data.series_generation(id));
         self.indicators[index].amount_generation =
@@ -3999,7 +4912,6 @@ impl ChartEngine {
         // First output row each output rewrote, for per-row colors.
         let mut changed_rows = [0usize; aeris_charts_indicators::MAX_OUTPUTS];
         for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
-            let previous_generation = self.data.series_generation(output).unwrap_or(0);
             // The runtime stops at the data end, so an output whose first row lies past it (its
             // warm-up, or the rebuild's first row, falls among trailing whitespace rows) starts
             // where it would over every row, not at the data end.
@@ -4013,37 +4925,27 @@ impl ChartEngine {
                     .clamp(end, rows)
             };
 
-            let output_from = if full_replace {
+            let rewrite = if full_replace {
                 let mut values = self.indicators[index].runtime.take_output(output_index);
                 values.resize(rows - source_from, f64::NAN);
                 if histogram_output(&self.indicators[index].kind) == Some(output_index) {
                     full_histogram_colors = Some(momentum_histogram_colors(&values));
                 }
-                self.data
-                    .set_single_data_aligned(output, source, source_from, values);
-                0
+                OutputRows::Replace(values)
             } else {
-                let values = self.indicators[index].runtime.output(output_index);
-                if end == rows {
-                    self.data
-                        .update_single_aligned(output, source, source_from, values)
-                } else {
-                    self.data
-                        .update_single_aligned_within(output, source, source_from, values)
-                }
-                .expect("indicator output remains aligned to its source")
+                OutputRows::Update(self.indicators[index].runtime.output(output_index))
             };
+            let (output_from, change) = store_indicator_output(
+                &mut self.data,
+                source,
+                output,
+                source_from,
+                rewrite,
+                end,
+                rows,
+            );
             changed_rows[output_index] = output_from;
-            if self.data.series_generation(output).unwrap_or(0) != previous_generation {
-                changes[output_index] = Some((
-                    output,
-                    IndicatorChange {
-                        from: output_from,
-                        previous_generation,
-                        full_replace,
-                    },
-                ));
-            }
+            changes[output_index] = change.map(|change| (output, change));
         }
 
         if let Some(output_index) = histogram_output(&self.indicators[index].kind) {
@@ -4104,6 +5006,52 @@ impl ChartEngine {
     }
 }
 
+/// Rows a rebuild writes into one indicator output, starting at its first rewritten source row.
+enum OutputRows<'a> {
+    /// The whole output from that row on; rows past the data end are padded with whitespace.
+    Replace(Vec<f64>),
+    /// Only the rewritten rows; the output keeps every other row.
+    Update(&'a [f64]),
+}
+
+/// Store the rows one rebuild produced for `output`, aligned to `source`, and report the change
+/// (first changed output row, and the generation it replaced) when the output changed. Built-in,
+/// structure and session studies share it: an update that stops at the data end `end` leaves the
+/// rows from `end` to `rows` (whitespace session slots) untouched.
+fn store_indicator_output(
+    data: &mut DataLayer,
+    source: SeriesId,
+    output: SeriesId,
+    source_from: usize,
+    rewrite: OutputRows<'_>,
+    end: usize,
+    rows: usize,
+) -> (usize, Option<IndicatorChange>) {
+    let previous_generation = data.series_generation(output).unwrap_or(0);
+    let full_replace = matches!(rewrite, OutputRows::Replace(_));
+    let output_from = match rewrite {
+        OutputRows::Replace(mut values) => {
+            values.resize(rows.saturating_sub(source_from), f64::NAN);
+            data.set_single_data_aligned(output, source, source_from, values);
+            0
+        }
+        OutputRows::Update(values) => if end == rows {
+            data.update_single_aligned(output, source, source_from, values)
+        } else {
+            data.update_single_aligned_within(output, source, source_from, values)
+        }
+        .expect("indicator output remains aligned to its source"),
+    };
+    let change = (data.series_generation(output).unwrap_or(0) != previous_generation).then_some(
+        IndicatorChange {
+            from: output_from,
+            previous_generation,
+            full_replace,
+        },
+    );
+    (output_from, change)
+}
+
 /// The output an indicator draws as a momentum-coloured histogram, if any.
 fn histogram_output(kind: &IndicatorKind) -> Option<usize> {
     match kind {
@@ -4151,6 +5099,13 @@ fn missing_volume(kind: &IndicatorKind) -> f64 {
 
 fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {
     match kind {
+        IndicatorKind::SwingPoints { .. } => "swing_points",
+        IndicatorKind::MarketStructure { .. } => "market_structure",
+        IndicatorKind::FairValueGaps { .. } => "fair_value_gaps",
+        IndicatorKind::OrderBlocks { .. } => "order_blocks",
+        IndicatorKind::SessionLevels { .. } => "session_levels",
+        IndicatorKind::PreviousPeriodLevels { .. } => "previous_period_levels",
+        IndicatorKind::OpeningRange { .. } => "opening_range",
         IndicatorKind::Aroon { .. } => "aroon",
         IndicatorKind::AwesomeOscillator => "awesome_oscillator",
         IndicatorKind::Dpo { .. } => "dpo",
@@ -4219,6 +5174,113 @@ fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {
     }
 }
 
+fn structure_output_count(kind: &IndicatorKind) -> Option<usize> {
+    match kind {
+        IndicatorKind::SwingPoints { .. } => Some(2),
+        IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. } => Some(1),
+        _ => None,
+    }
+}
+
+fn session_output_count(kind: &IndicatorKind) -> Option<usize> {
+    match kind {
+        IndicatorKind::SessionLevels { .. } => Some(2),
+        IndicatorKind::PreviousPeriodLevels { .. } | IndicatorKind::OpeningRange { .. } => Some(3),
+        _ => None,
+    }
+}
+
+fn session_study_kind(kind: &IndicatorKind) -> Option<SessionStudy> {
+    match kind {
+        IndicatorKind::SessionLevels { .. } => Some(SessionStudy::SessionLevels),
+        IndicatorKind::PreviousPeriodLevels { period, .. } => {
+            Some(SessionStudy::PreviousPeriodLevels(match period {
+                PreviousPeriod::Day => aeris_charts_indicators::PreviousPeriod::Day,
+                PreviousPeriod::Week => aeris_charts_indicators::PreviousPeriod::Week,
+                PreviousPeriod::Month => aeris_charts_indicators::PreviousPeriod::Month,
+            }))
+        }
+        IndicatorKind::OpeningRange {
+            duration_seconds, ..
+        } => Some(SessionStudy::OpeningRange {
+            duration_seconds: i64::from(*duration_seconds),
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn structure_kind_is_valid(kind: &IndicatorKind) -> bool {
+    structure_study_kind(kind).is_none_or(StructureStudyKind::is_valid)
+}
+
+fn structure_study_kind(kind: &IndicatorKind) -> Option<StructureStudyKind> {
+    let break_on = |value| match value {
+        StructureBreakOn::Close => BreakOn::Close,
+        StructureBreakOn::Wick => BreakOn::Wick,
+    };
+    let mitigation = |value| match value {
+        StructureMitigation::Touch => Mitigation::Touch,
+        StructureMitigation::Half => Mitigation::Half,
+        StructureMitigation::Full => Mitigation::Full,
+    };
+    let mitigation_price = |value| match value {
+        StructureMitigationPrice::Wick => MitigationPrice::Wick,
+        StructureMitigationPrice::Close => MitigationPrice::Close,
+    };
+    match kind {
+        IndicatorKind::SwingPoints { left, right } => {
+            Some(StructureStudyKind::swing_points(*left, *right))
+        }
+        IndicatorKind::MarketStructure {
+            left,
+            right,
+            break_on: mode,
+        } => Some(StructureStudyKind::market_structure(
+            *left,
+            *right,
+            break_on(*mode),
+        )),
+        IndicatorKind::FairValueGaps {
+            min_size,
+            mitigation: rule,
+            mitigation_price: price,
+            max_active,
+            show_mitigated,
+        } => Some(StructureStudyKind::fair_value_gaps(
+            *min_size,
+            mitigation(*rule),
+            mitigation_price(*price),
+            *max_active,
+            *show_mitigated,
+        )),
+        IndicatorKind::OrderBlocks {
+            left,
+            right,
+            break_on: mode,
+            zone,
+            mitigation: rule,
+            mitigation_price: price,
+            max_active,
+            show_mitigated,
+        } => Some(StructureStudyKind::OrderBlocks {
+            left: *left,
+            right: *right,
+            break_on: break_on(*mode),
+            zone: match zone {
+                OrderBlockZone::Wick => CalculationOrderBlockZone::Wick,
+                OrderBlockZone::Body => CalculationOrderBlockZone::Body,
+            },
+            mitigation: mitigation(*rule),
+            mitigation_price: mitigation_price(*price),
+            max_active: *max_active,
+            show_mitigated: *show_mitigated,
+        }),
+        _ => None,
+    }
+}
+
 fn pivot_kind_index(kind: aeris_charts_indicators::PivotKind) -> usize {
     match kind {
         aeris_charts_indicators::PivotKind::Standard => 1,
@@ -4231,6 +5293,14 @@ fn pivot_kind_index(kind: aeris_charts_indicators::PivotKind) -> usize {
 
 fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::IncrementalState {
     match *kind {
+        // Structural bindings execute their own OHLC scanner, not this scalar placeholder.
+        IndicatorKind::SwingPoints { .. } => aeris_charts_indicators::IncrementalState::aroon(1),
+        IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. } => aeris_charts_indicators::IncrementalState::sma(1),
+        IndicatorKind::SessionLevels { .. }
+        | IndicatorKind::PreviousPeriodLevels { .. }
+        | IndicatorKind::OpeningRange { .. } => aeris_charts_indicators::IncrementalState::sma(1),
         IndicatorKind::Aroon { period } => aeris_charts_indicators::IncrementalState::aroon(period),
         IndicatorKind::AwesomeOscillator => {
             aeris_charts_indicators::IncrementalState::awesome_oscillator()
@@ -4469,6 +5539,17 @@ fn indicator_title(kind: &IndicatorKind) -> String {
         }
     };
     match kind {
+        IndicatorKind::SwingPoints { left, right } => format!("Swing Points {left} {right}"),
+        IndicatorKind::MarketStructure { left, right, .. } => {
+            format!("Market Structure {left} {right}")
+        }
+        IndicatorKind::FairValueGaps { .. } => "Fair Value Gaps".into(),
+        IndicatorKind::OrderBlocks { .. } => "Order Blocks".into(),
+        IndicatorKind::SessionLevels { .. } => "Session Levels".into(),
+        IndicatorKind::PreviousPeriodLevels { period, .. } => format!("Previous {period:?} Levels"),
+        IndicatorKind::OpeningRange {
+            duration_seconds, ..
+        } => format!("Opening Range {duration_seconds}s"),
         IndicatorKind::Aroon { period } => format!("Aroon {period}"),
         IndicatorKind::AwesomeOscillator => "Awesome Oscillator".to_string(),
         IndicatorKind::Dpo { period } => format!("DPO {period}"),
@@ -4658,6 +5739,13 @@ fn style_color_is_valid(value: Option<&str>) -> bool {
 
 fn indicator_output_name(kind: &IndicatorKind, output_index: usize) -> &'static str {
     match kind {
+        IndicatorKind::SwingPoints { .. } => ["swing_high", "swing_low"][output_index],
+        IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. } => "anchor",
+        IndicatorKind::SessionLevels { .. } => ["high", "low"][output_index],
+        IndicatorKind::PreviousPeriodLevels { .. } => ["high", "low", "close"][output_index],
+        IndicatorKind::OpeningRange { .. } => ["high", "low", "mid"][output_index],
         IndicatorKind::Aroon { .. } => ["Aroon Up", "Aroon Down"][output_index],
         IndicatorKind::AwesomeOscillator => "AO",
         IndicatorKind::Dpo { .. } => "DPO",
@@ -4895,6 +5983,143 @@ mod tests {
 }
 
 #[cfg(test)]
+mod annotation_binding_tests {
+    use super::*;
+    use aeris_charts_indicators::study_annotations::{StudyMarker, StudyMarkerKind, StudyZone};
+
+    #[test]
+    fn schema_revision_two_exposes_only_choice_options() {
+        // The fork's revision: 2 with its `choices` seed field, 3 for the breadth tier, 4 for
+        // upstream's `options` field replacing `choices` (upstream itself is at 2).
+        assert_eq!(INDICATOR_SCHEMA_REVISION, 4);
+        let choice =
+            IndicatorParameterDescriptor::choice("calendar", "host", &["utc", "host"]).unwrap();
+        assert_eq!(
+            choice.options.as_deref(),
+            Some(&["utc".into(), "host".into()][..])
+        );
+        assert_eq!(choice.default, serde_json::json!("host"));
+        assert!(
+            IndicatorParameterDescriptor::choice("calendar", "local", &["utc", "host"]).is_none()
+        );
+        let schema = ChartEngine::indicator_schema(&IndicatorKind::Sma { period: 14 });
+        assert_eq!(schema.revision, 4);
+        assert!(
+            schema
+                .parameters
+                .iter()
+                .all(|parameter| parameter.options.is_none())
+        );
+        // The fork's seed choices travel under the same wire key; `choices` is gone.
+        let ema = serde_json::to_value(ChartEngine::indicator_schema(&IndicatorKind::Ema {
+            period: 14,
+            seed: aeris_charts_indicators::IndicatorSeed::Sma,
+        }))
+        .unwrap();
+        let seed = ema["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "seed")
+            .unwrap();
+        assert_eq!(seed["options"], serde_json::json!(["sma", "first_value"]));
+        assert!(seed.get("choices").is_none());
+    }
+
+    #[test]
+    fn binding_snapshot_repairs_on_source_changes_and_drops_on_removal() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let values = [10.0, 11.0, 12.0, 13.0];
+        chart
+            .set_series_data(0, &[1.0, 2.0, 3.0, 4.0], &values, &values, &values, &values)
+            .unwrap();
+        let binding = chart.add_sma(0, 2).unwrap();
+        assert_eq!(
+            chart.study_annotations(binding).unwrap_err().code(),
+            ErrorCode::UnsupportedOperation
+        );
+        assert_eq!(
+            chart.study_annotations(0).unwrap_err().code(),
+            ErrorCode::InvalidHandle
+        );
+        let mut annotations = StudyAnnotations::default();
+        for confirm_row in [1, 3] {
+            annotations.push_marker(StudyMarker {
+                row: confirm_row,
+                confirm_row,
+                price: values[confirm_row],
+                kind: StudyMarkerKind::SwingHigh,
+                from_row: None,
+            });
+        }
+        annotations.push_zone(StudyZone {
+            start_row: 0,
+            confirm_row: 1,
+            top: 12.0,
+            bottom: 10.0,
+            bullish: true,
+            end_row: None,
+            retired: false,
+        });
+        assert!(annotations.end_zone(0, 3));
+        assert!(chart.inject_study_annotations_for_test(binding, annotations.clone()));
+        let snapshot = chart.study_annotations(binding).unwrap();
+        assert_eq!(snapshot, annotations);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["markers"].as_array().unwrap().len(), 2);
+        assert_eq!(json["zones"].as_array().unwrap().len(), 1);
+        assert!(json.get("active_zones").is_none());
+        assert!(chart.update_series_bar(0, 4.0, [14.0; 4]));
+        let repaired = chart.study_annotations(binding).unwrap();
+        assert_eq!(repaired.markers().len(), 1);
+        assert_eq!(repaired.markers()[0].confirm_row, 1);
+        assert_eq!(repaired.zones()[0].end_row, None);
+        assert_eq!(snapshot.markers().len(), 2); // The returned snapshot does not alias the binding.
+        assert!(chart.remove_indicator_binding(binding));
+        assert_eq!(
+            chart.study_annotations(binding).unwrap_err().code(),
+            ErrorCode::InvalidHandle
+        );
+    }
+
+    #[test]
+    fn full_source_replacement_clears_test_annotations() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let values = [10.0, 11.0, 12.0];
+        chart
+            .set_series_data(0, &[1.0, 2.0, 3.0], &values, &values, &values, &values)
+            .unwrap();
+        let binding = chart.add_sma(0, 2).unwrap();
+        let mut annotations = StudyAnnotations::default();
+        annotations.push_marker(StudyMarker {
+            row: 1,
+            confirm_row: 2,
+            price: 11.0,
+            kind: StudyMarkerKind::SwingLow,
+            from_row: None,
+        });
+        assert!(chart.inject_study_annotations_for_test(binding, annotations));
+        chart
+            .set_series_data(
+                0,
+                &[2.0, 3.0],
+                &values[..2],
+                &values[..2],
+                &values[..2],
+                &values[..2],
+            )
+            .unwrap();
+        assert!(
+            chart
+                .study_annotations(binding)
+                .unwrap()
+                .markers()
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
 mod schema_mapping_tests {
     use super::*;
     use serde_json::{Value, json};
@@ -5042,5 +6267,270 @@ mod schema_mapping_tests {
         assert!(IndicatorKind::schema_definition("klinechart_unknown", 14, 2.0).is_none());
         assert!(IndicatorKind::schema_definition("unknown", 14, 2.0).is_none());
         assert!(IndicatorKind::schema_definition("pivot_points", 14, 2.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod structure_engine_tests {
+    use super::*;
+    use aeris_charts_indicators::structure_studies::StructureStudy;
+
+    #[test]
+    fn retained_source_bounds_annotations_and_attributes_their_bytes() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let n = 5_000;
+        let times: Vec<_> = (0..n).map(|i| i as f64 + 1.).collect();
+        let close: Vec<_> = (0..n).map(|i| (i * 3) as f64 + 10.).collect();
+        let high: Vec<_> = close.iter().map(|v| v + 1.).collect();
+        let low: Vec<_> = close.iter().map(|v| v - 1.).collect();
+        chart
+            .set_series_data(0, &times, &close, &high, &low, &close)
+            .unwrap();
+        let anchor = chart.add_fair_value_gaps(
+            0,
+            0.,
+            StructureMitigation::Full,
+            StructureMitigationPrice::Close,
+            1,
+            true,
+        )[0];
+        let before = chart.study_annotations(anchor).unwrap();
+        assert!(before.zones().len() > 4_096);
+        assert!(before.zones()[0].retired);
+        let large = chart.memory_usage().indicator_runtime_bytes;
+        assert!(
+            large
+                >= before.zones().len() * std::mem::size_of::<aeris_charts_indicators::StudyZone>()
+        );
+        assert!(chart.set_series_max_points(0, Some(128)));
+        let after = chart.study_annotations(anchor).unwrap();
+        assert!(after.zones().len() < 128);
+        assert!(after.zones().iter().all(|zone| zone.start_row < 128));
+        assert!(chart.memory_usage().indicator_runtime_bytes < large);
+    }
+
+    #[test]
+    fn structure_bindings_align_anchor_and_confirmed_swing_levels() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let high = [12.0, 14.0, 13.0, 11.0, 13.0];
+        let low = [9.0, 10.0, 9.0, 8.0, 10.0];
+        let open = [10.0, 11.0, 10.0, 9.0, 11.0];
+        let close = [11.0, 12.0, 10.0, 10.0, 12.0];
+        chart
+            .set_series_data(0, &[1.0, 2.0, 3.0, 4.0, 5.0], &open, &high, &low, &close)
+            .unwrap();
+        let swings = chart.add_swing_points(0, 1, 1);
+        assert_eq!(swings.len(), 2);
+        assert!(
+            swings
+                .iter()
+                .all(|id| chart.series_entry(*id).unwrap().line_type == LineType::WithSteps)
+        );
+        let high_values = chart.data.series_data(swings[0]).unwrap().1[3];
+        assert!(high_values[0].is_nan());
+        assert!(high_values[1].is_nan());
+        assert_eq!(high_values[2], 14.0);
+        assert_eq!(
+            chart.study_annotations(swings[0]).unwrap().markers()[0].row,
+            1
+        );
+        let gaps = chart.add_fair_value_gaps(
+            0,
+            0.0,
+            StructureMitigation::Touch,
+            StructureMitigationPrice::Wick,
+            20,
+            false,
+        );
+        assert_eq!(gaps.len(), 1);
+        let (times, values) = chart.data.series_data(gaps[0]).unwrap();
+        assert_eq!(times.len(), 5);
+        assert!(values[3].iter().all(|value| value.is_nan()));
+        assert!(chart.study_annotations(gaps[0]).is_ok());
+    }
+
+    #[test]
+    fn invalid_structure_parameters_do_not_create_outputs() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        for (left, right) in [(0, 5), (5, 0), (51, 5), (5, 51)] {
+            assert!(chart.add_swing_points(0, left, right).is_empty());
+        }
+        assert!(
+            chart
+                .add_fair_value_gaps(
+                    0,
+                    f64::NAN,
+                    StructureMitigation::Touch,
+                    StructureMitigationPrice::Wick,
+                    20,
+                    false
+                )
+                .is_empty()
+        );
+        assert!(
+            chart
+                .add_fair_value_gaps(
+                    0,
+                    0.0,
+                    StructureMitigation::Touch,
+                    StructureMitigationPrice::Wick,
+                    65,
+                    false
+                )
+                .is_empty()
+        );
+        assert!(
+            chart
+                .add_indicator_kind_with_input(
+                    0,
+                    IndicatorInputSource::Hlc3,
+                    IndicatorKind::SwingPoints { left: 2, right: 2 },
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(chart.indicator_bindings().is_empty());
+    }
+
+    #[test]
+    fn structure_schema_reports_exact_choices_and_bounds() {
+        let kind = IndicatorKind::OrderBlocks {
+            left: 3,
+            right: 7,
+            break_on: StructureBreakOn::Wick,
+            zone: OrderBlockZone::Body,
+            mitigation: StructureMitigation::Half,
+            mitigation_price: StructureMitigationPrice::Close,
+            max_active: 12,
+            show_mitigated: true,
+        };
+        let schema = ChartEngine::indicator_schema(&kind);
+        assert_eq!(schema.revision, INDICATOR_SCHEMA_REVISION);
+        assert_eq!(schema.outputs[0].name, "anchor");
+        for (name, default, options) in [
+            ("break_on", "wick", &["close", "wick"][..]),
+            ("zone", "body", &["wick", "body"][..]),
+            ("mitigation", "half", &["touch", "half", "full"][..]),
+            ("mitigation_price", "close", &["wick", "close"][..]),
+        ] {
+            let descriptor = schema.parameters.iter().find(|p| p.name == name).unwrap();
+            assert_eq!(descriptor.parameter_type, IndicatorParameterType::Choice);
+            assert_eq!(descriptor.default, serde_json::json!(default));
+            assert_eq!(
+                descriptor.options.as_ref().unwrap(),
+                &options.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            );
+        }
+        for (name, value) in [("left", 3), ("right", 7), ("max_active", 12)] {
+            let descriptor = schema.parameters.iter().find(|p| p.name == name).unwrap();
+            assert_eq!(descriptor.default, serde_json::json!(value));
+            assert_eq!(descriptor.min, Some(1.0));
+            assert_eq!(
+                descriptor.max,
+                Some(if name == "max_active" { 64.0 } else { 50.0 })
+            );
+        }
+    }
+
+    #[test]
+    fn structure_append_tip_and_history_repair_match_pure_study() {
+        let kinds = [
+            IndicatorKind::SwingPoints { left: 2, right: 1 },
+            IndicatorKind::MarketStructure {
+                left: 2,
+                right: 1,
+                break_on: StructureBreakOn::Wick,
+            },
+            IndicatorKind::FairValueGaps {
+                min_size: 0.1,
+                mitigation: StructureMitigation::Half,
+                mitigation_price: StructureMitigationPrice::Close,
+                max_active: 3,
+                show_mitigated: true,
+            },
+            IndicatorKind::OrderBlocks {
+                left: 2,
+                right: 1,
+                break_on: StructureBreakOn::Wick,
+                zone: OrderBlockZone::Body,
+                mitigation: StructureMitigation::Full,
+                mitigation_price: StructureMitigationPrice::Wick,
+                max_active: 3,
+                show_mitigated: false,
+            },
+        ];
+        let times = (1..=24).map(f64::from).collect::<Vec<_>>();
+        let mut close = (0..24)
+            .map(|row| 100.0 + ((row * 7) % 13) as f64)
+            .collect::<Vec<_>>();
+        let open = close.iter().map(|c| c - 0.5).collect::<Vec<_>>();
+        let high = close.iter().map(|c| c + 2.0).collect::<Vec<_>>();
+        let mut low = open.iter().map(|o| o - 2.0).collect::<Vec<_>>();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .set_series_data(
+                0,
+                &times[..8],
+                &open[..8],
+                &high[..8],
+                &low[..8],
+                &close[..8],
+            )
+            .unwrap();
+        let bindings = kinds
+            .iter()
+            .map(|kind| chart.add_indicator_kind(0, kind.clone(), None))
+            .collect::<Vec<_>>();
+        let assert_equal = |chart: &ChartEngine, len: usize, close: &[f64], low: &[f64]| {
+            let integer_times = (1..=len as i64).collect::<Vec<_>>();
+            for (kind, ids) in kinds.iter().zip(&bindings) {
+                let mut expected = StructureStudy::new(structure_study_kind(kind).unwrap());
+                expected.update(
+                    aeris_charts_indicators::IndicatorInput {
+                        times: &integer_times,
+                        open: &open[..len],
+                        high: &high[..len],
+                        low: &low[..len],
+                        close: &close[..len],
+                        volume: &[],
+                        amount: &[],
+                    },
+                    0,
+                );
+                assert_eq!(
+                    chart.study_annotations(ids[0]).unwrap(),
+                    *expected.annotations(),
+                    "{kind:?}"
+                );
+                for (index, &id) in ids.iter().enumerate() {
+                    let actual = chart.data.series_data(id).unwrap().1[3];
+                    assert_eq!(actual.len(), len);
+                    for (row, (actual, expected)) in
+                        actual.iter().zip(&expected.outputs()[index]).enumerate()
+                    {
+                        assert!(
+                            expected.is_some_and(|value| *actual == value)
+                                || expected.is_none() && actual.is_nan(),
+                            "{kind:?} output {index}, row {row}"
+                        );
+                    }
+                }
+            }
+        };
+        assert_equal(&chart, 8, &close, &low);
+        for len in 9..=24 {
+            assert!(chart.update_series_bar(
+                0,
+                times[len - 1],
+                [open[len - 1], high[len - 1], low[len - 1], close[len - 1]]
+            ));
+            assert_equal(&chart, len, &close, &low);
+        }
+        close[23] -= 1.0;
+        assert!(chart.update_series_bar(0, times[23], [open[23], high[23], low[23], close[23]]));
+        assert_equal(&chart, 24, &close, &low);
+        low[10] -= 1.0;
+        assert!(chart.update_series_bar(0, times[10], [open[10], high[10], low[10], close[10]]));
+        assert_equal(&chart, 24, &close, &low);
     }
 }

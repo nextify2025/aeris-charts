@@ -643,6 +643,20 @@ impl DataLayer {
         Some(self.series[owner].alignment)
     }
 
+    /// The series whose alignment `id` follows: `id` itself, or the source at the root of an
+    /// aliased output's chain. `None` for an unknown or stale id.
+    pub fn time_alignment_owner(&self, id: SeriesId) -> Option<SeriesId> {
+        let mut owner = id;
+        for _ in 0..self.series.len().max(1) {
+            match self.series[self.series_slot(owner)?].time_alias {
+                Some(alias) => owner = alias.source,
+                None => return Some(owner),
+            }
+        }
+        debug_assert!(false, "series time alias cycle");
+        None
+    }
+
     /// Series whose as-of plot rows changed as a side effect of another series' mutation (a new
     /// union point, a moved data extent, or any union reindex) since the previous call. The owner
     /// invalidates their retained presentation; each id appears once.

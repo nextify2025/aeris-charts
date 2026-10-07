@@ -19,7 +19,9 @@
 //!   Target M — per-tick cost of every built-in indicator bound to a 1M-row source, and the
 //!              bounded capacity of the aggregate price columns composite-input studies retain;
 //!              the same per-tick cost, work rows, runtime bytes and a historical repair for
-//!              all 27 KLineChart templates bound to a 1M-row source
+//!              all 27 KLineChart templates bound to a 1M-row source; the per-tick cost and
+//!              constant work rows of the seven structure and session studies, appending and
+//!              filling pre-installed session slots
 //!   Target N — live ticks plus frame construction with regression trends anchored across a
 //!              1M-row source (data-reading drawings follow ticks by the changed rows)
 //!   Target O — daily-reset studies on daily bars: report-only frame, Canvas2D call, rasterizer,
@@ -231,6 +233,10 @@ struct IndicatorTickCost {
     first_append_growth_bytes: usize,
     /// Largest `last_indicator_work_rows` any measured tick reported.
     max_work_rows: usize,
+    /// Smallest `last_indicator_work_rows` any measured tick reported.
+    min_work_rows: usize,
+    /// Largest `last_indicator_work_rows` any measured new-bar append (or slot fill) reported.
+    max_append_work_rows: usize,
     /// Indicator runtime bytes after the install and every measured tick.
     runtime_bytes: usize,
     /// `(mean, median, max)` milliseconds to revise a bar [`REPAIR_DEPTH`] rows before the newest
@@ -248,6 +254,9 @@ const REPAIR_SAMPLES: usize = 20;
 enum StudySet {
     /// Every built-in study kind plus the aggregate-input studies.
     BuiltIn,
+    /// The seven structure and session studies (swing points, market structure, fair value
+    /// gaps, order blocks, session levels, previous-day levels, opening range).
+    Studies,
     /// All 27 KLineChart templates with KLineChart's default parameters, the volume-reading ones
     /// on a volume series and AVP on a turnover series.
     KLineChart,
@@ -502,6 +511,60 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
     bindings
 }
 
+/// Binds the seven structure and session studies to the candle series 0 with the package
+/// defaults (UTC calendar). Returns the number of bindings.
+fn bind_structure_and_session_studies(chart: &mut ChartEngine) -> usize {
+    use aeris_charts_engine::{
+        IndicatorKind, OrderBlockZone, PreviousPeriod, StructureBreakOn, StructureMitigation,
+        StructureMitigationPrice, StudyCalendarPolicy,
+    };
+
+    let kinds = [
+        IndicatorKind::SwingPoints { left: 5, right: 5 },
+        IndicatorKind::MarketStructure {
+            left: 5,
+            right: 5,
+            break_on: StructureBreakOn::Close,
+        },
+        IndicatorKind::FairValueGaps {
+            min_size: 0.0,
+            mitigation: StructureMitigation::Touch,
+            mitigation_price: StructureMitigationPrice::Wick,
+            max_active: 20,
+            show_mitigated: false,
+        },
+        IndicatorKind::OrderBlocks {
+            left: 5,
+            right: 5,
+            break_on: StructureBreakOn::Close,
+            zone: OrderBlockZone::Wick,
+            mitigation: StructureMitigation::Touch,
+            mitigation_price: StructureMitigationPrice::Wick,
+            max_active: 20,
+            show_mitigated: false,
+        },
+        IndicatorKind::SessionLevels {
+            calendar: StudyCalendarPolicy::Utc,
+        },
+        IndicatorKind::PreviousPeriodLevels {
+            period: PreviousPeriod::Day,
+            calendar: StudyCalendarPolicy::Utc,
+        },
+        IndicatorKind::OpeningRange {
+            duration_seconds: 1_800,
+            calendar: StudyCalendarPolicy::Utc,
+        },
+    ];
+    let bindings = kinds.len();
+    for kind in kinds {
+        assert!(
+            !chart.add_indicator_kind(0, kind, None).is_empty(),
+            "study binds"
+        );
+    }
+    bindings
+}
+
 /// Binds the 27 KLineChart templates with KLineChart's default parameters to the candle series 0:
 /// the templates that read volume on `volume`, and AVP on the `turnover` series. Returns the
 /// number of bindings.
@@ -593,6 +656,7 @@ fn indicator_tick_cost(
     });
     let bindings = match studies {
         StudySet::BuiltIn => bind_builtin_studies(&mut chart, volume),
+        StudySet::Studies => bind_structure_and_session_studies(&mut chart),
         StudySet::KLineChart => bind_klinechart_templates(
             &mut chart,
             volume,
@@ -627,18 +691,23 @@ fn indicator_tick_cost(
     let mut replace_ms = Vec::new();
     let mut append_ms = Vec::new();
     let mut max_work_rows = 0;
+    let mut min_work_rows = usize::MAX;
+    let mut max_append_work_rows = 0;
     for _ in 0..appends {
         for revision in 1..=replaces_per_append {
             let started = Instant::now();
             write_row(&mut chart, last, revision);
             replace_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
+            min_work_rows = min_work_rows.min(chart.last_indicator_work_rows());
         }
         last += 1;
         let started = Instant::now();
         write_row(&mut chart, last, 0);
         append_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         max_work_rows = max_work_rows.max(chart.last_indicator_work_rows());
+        min_work_rows = min_work_rows.min(chart.last_indicator_work_rows());
+        max_append_work_rows = max_append_work_rows.max(chart.last_indicator_work_rows());
     }
     let runtime_bytes = chart.memory_usage().indicator_runtime_bytes;
     let summary = |mut samples: Vec<f64>| {
@@ -666,6 +735,8 @@ fn indicator_tick_cost(
         first_append_ms,
         first_append_growth_bytes,
         max_work_rows,
+        min_work_rows,
+        max_append_work_rows,
         runtime_bytes,
         repair_ms,
     }
@@ -2801,6 +2872,73 @@ fn main() -> ExitCode {
         INDICATOR_TICK_BUDGET_MS,
     );
 
+    // ---- Target M (studies): the seven structure and session studies over a 1M-row source ----
+    // Each study scans one row per append or slot fill; revising the forming bar replays a
+    // structure study from its preceding 1,024-row checkpoint and a session study from its kept
+    // tail state, so a tick's work is a constant independent of the history. Measured in its own
+    // block, like the KLineChart set, so it does not spend the built-in set's headroom. Every
+    // tick must report work for every binding (a study whose work went unreported would make the
+    // bound pass vacuously), and the work-row counts are exact, so these bounds are not noise:
+    // an append or slot fill must scan exactly one row per binding (a checkpoint replay there
+    // would hide inside the revision bound), and only a revision may reach the checkpoint bound.
+    const STUDY_BINDINGS: usize = 7;
+    const STRUCTURE_STUDIES: usize = 4;
+    const STRUCTURE_CHECKPOINT_ROWS: usize = 1_024;
+    let study_work_bound = STRUCTURE_STUDIES * (STRUCTURE_CHECKPOINT_ROWS + 1)
+        + (STUDY_BINDINGS - STRUCTURE_STUDIES) * 2;
+    let mut study_checks = Vec::new();
+    for (label, slots) in [("", 0), (", slots", 23_400)] {
+        let cost = indicator_tick_cost(
+            StudySet::Studies,
+            INDICATOR_TICK_ROWS,
+            slots,
+            None,
+            4,
+            INDICATOR_TICK_APPENDS,
+        );
+        println!(
+            "Target M (studies{label}) — per-tick cost, {} bindings over {INDICATOR_TICK_ROWS} rows{} (work rows per tick {}..={}; first append after install {:.2} ms):",
+            cost.bindings,
+            if slots == 0 {
+                String::new()
+            } else {
+                format!(" filling {slots} pre-installed session slots")
+            },
+            cost.min_work_rows,
+            cost.max_work_rows,
+            cost.first_append_ms,
+        );
+        assert_eq!(cost.bindings, STUDY_BINDINGS);
+        let (replace_mean, replace_median, replace_max) = cost.replace_ms;
+        study_checks.push(report(
+            &format!(
+                "current-bar replace mean (median {replace_median:.3} ms, max {replace_max:.2} ms)"
+            ),
+            replace_mean,
+            INDICATOR_TICK_BUDGET_MS,
+        ));
+        let (append_mean, append_median, append_max) = cost.append_ms;
+        study_checks.push(report(
+            &format!("new-bar append mean (median {append_median:.3} ms, max {append_max:.2} ms)"),
+            append_mean,
+            INDICATOR_TICK_BUDGET_MS,
+        ));
+        study_checks.push(report_check(
+            "rows scanned per tick, every binding reporting",
+            cost.min_work_rows >= STUDY_BINDINGS && cost.max_work_rows <= study_work_bound,
+            &format!(
+                "{}..={} (bound {STUDY_BINDINGS}..={study_work_bound})",
+                cost.min_work_rows, cost.max_work_rows
+            ),
+        ));
+        study_checks.push(report_check(
+            "rows scanned per append, one per binding",
+            cost.max_append_work_rows == STUDY_BINDINGS,
+            &format!("{} (expected {STUDY_BINDINGS})", cost.max_append_work_rows),
+        ));
+    }
+    let m_studies = study_checks.iter().all(|&pass| pass);
+
     // ---- Target M (KLineChart): the 27 KLineChart templates over a 1M-row source ------------
     // Each template advances one row at a time from a checkpointed state, so a tick costs the
     // template's window however long the history is. The set is measured in its own block with the
@@ -3093,6 +3231,7 @@ fn main() -> ExitCode {
         && m_kline_slot_replace
         && m_kline_slot_fill
         && m_kline_slot_work
+        && m_studies
         && n_tick
         && r_p99
         && r_max

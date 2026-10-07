@@ -68,6 +68,7 @@ wasm        → core + engine + render + render_wgpu
 | 系列数据、批量、as-of 对齐、摘要与保留 | [规范数据](architecture/data/storage.md) |
 | UTC 时间、交易日、时段槽位、收盘标签、视口重新定基 | [时间](architecture/data/time.md) |
 | 公式、预热、绑定、成交量分布、周期分布、TPO 与分布绘图、外部研究与指标 V3 | [指标](architecture/data/indicators.md) |
+| 结构与时段研究、时段日历、只读研究注释 | [结构与时段研究](features/studies.md) |
 | 金融窗格、命名比例尺、坐标、自动缩放与选项 | [窗格与比例尺](architecture/engine/panes-and-scales.md) |
 | 非金融域、坐标轴、类型化数据集、通用系列与交互 | [通用图表](architecture/engine/general-charts.md) |
 | 指针、触摸、滚轮、键盘、悬停、取消与动效 | [共享输入控制器](architecture/engine/input.md) |

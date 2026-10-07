@@ -9,6 +9,9 @@
 //! A source mutation refreshes only the derived bars whose buckets can contain a changed row:
 //! the unchanged prefix is kept and the tail is rebuilt from the first affected bucket, so a
 //! live tick costs the rows of one bucket rather than the whole history.
+//!
+//! Separate UTC civil-period helpers back the session studies' `utc` calendar; they do not infer
+//! trading sessions.
 
 use std::collections::HashSet;
 
@@ -16,7 +19,8 @@ use aeris_charts_core::scale::exchange_time::ExchangeTime;
 use aeris_charts_core::scale::session_slots::{
     SessionSlotError, SessionWindow, session_window_bounds,
 };
-use aeris_charts_core::scale::time_tick_marks::civil_from_timestamp;
+use aeris_charts_core::scale::time_tick_marks::{civil_from_timestamp, days_from_civil};
+use aeris_charts_indicators::SessionSpan;
 use serde::{Deserialize, Serialize};
 
 use crate::{ChartEngine, IndicatorChange, SeriesId, SeriesKind, SeriesOwner};
@@ -134,12 +138,8 @@ pub fn resample_boundaries(
     }
     // Dates whose sessions overlap (a weekend date under a negative session start shares
     // Monday's evening) cannot form disjoint periods.
-    let options = ResampleOptions {
-        interval_seconds: 1,
-        boundaries,
-    };
-    validate_options(&options)?;
-    Ok(options.boundaries)
+    validate_boundaries(&boundaries, false)?;
+    Ok(boundaries)
 }
 
 /// Lifetime work counters of one resampled series, like [`crate::TradeStreamStats`]: complete
@@ -195,6 +195,103 @@ pub(crate) struct ResampleBinding {
 }
 
 impl ChartEngine {
+    /// Replace the runtime study calendar atomically. An empty calendar clears all sessions.
+    pub fn set_study_calendar(
+        &mut self,
+        boundaries: Vec<ResampleBoundary>,
+    ) -> Result<(), ResampleError> {
+        validate_boundaries(&boundaries, true)?;
+        self.study_calendar = boundaries;
+        self.study_calendar_spans = self.study_session_spans();
+        self.rebuild_host_calendar_studies();
+        Ok(())
+    }
+
+    pub fn clear_study_calendar(&mut self) {
+        self.study_calendar.clear();
+        self.study_calendar_spans.clear();
+        self.rebuild_host_calendar_studies();
+    }
+
+    /// Merge only touching intervals sharing an identity. A gap remains outside any session.
+    pub fn study_session_spans(&self) -> Vec<SessionSpan> {
+        let mut spans: Vec<SessionSpan> = Vec::new();
+        for boundary in &self.study_calendar {
+            if let Some(last) = spans.last_mut()
+                && last.end == boundary.start_time
+                && last.session_id == boundary.session_id
+            {
+                last.end = boundary.end_time;
+                continue;
+            }
+            spans.push(SessionSpan {
+                start: boundary.start_time,
+                end: boundary.end_time,
+                session_id: boundary.session_id,
+            });
+        }
+        spans
+    }
+
+    /// Resolve each timestamp against the host calendar, preserving input row order.
+    pub fn study_session_spans_for_rows(&self, times: &[i64]) -> Vec<Option<SessionSpan>> {
+        let spans = self.study_session_spans();
+        times
+            .iter()
+            .map(|&time| {
+                let preceding = spans.partition_point(|span| span.start <= time);
+                preceding
+                    .checked_sub(1)
+                    .and_then(|index| spans.get(index))
+                    .copied()
+                    .filter(|span| time < span.end)
+            })
+            .collect()
+    }
+
+    /// UTC calendar intervals, independent of the host's trading-session policy.
+    pub fn study_utc_day_span(time: i64) -> Option<SessionSpan> {
+        let day = time.div_euclid(86_400);
+        Some(SessionSpan {
+            start: day.checked_mul(86_400)?,
+            end: day.checked_add(1)?.checked_mul(86_400)?,
+            session_id: (day as u64) ^ (1_u64 << 63),
+        })
+    }
+
+    /// ISO-style UTC week beginning Monday.
+    pub fn study_utc_week_span(time: i64) -> Option<SessionSpan> {
+        let day = time.div_euclid(86_400);
+        let monday = day.checked_sub(day.wrapping_add(3).rem_euclid(7))?;
+        Some(SessionSpan {
+            start: monday.checked_mul(86_400)?,
+            end: monday.checked_add(7)?.checked_mul(86_400)?,
+            session_id: (monday as u64) ^ (1_u64 << 63),
+        })
+    }
+
+    pub fn study_utc_month_span(time: i64) -> Option<SessionSpan> {
+        let (year, month, _) = civil_from_timestamp(time);
+        let start_day = days_from_civil(year, month, 1)?;
+        let (next_year, next_month) = if month == 12 {
+            (year.checked_add(1)?, 1)
+        } else {
+            (year, month + 1)
+        };
+        let end_day = days_from_civil(next_year, next_month, 1)?;
+        Some(SessionSpan {
+            start: start_day.checked_mul(86_400)?,
+            end: end_day.checked_mul(86_400)?,
+            session_id: (start_day as u64) ^ (1_u64 << 63),
+        })
+    }
+
+    fn rebuild_host_calendar_studies(&mut self) {
+        self.rebuild_calendar_indicators(|binding| {
+            binding.calendar == Some(crate::StudyCalendarPolicy::Host)
+        });
+    }
+
     pub fn configure_resampled_series(
         &mut self,
         source: SeriesId,
@@ -570,13 +667,15 @@ impl ChartEngine {
     }
 
     pub(crate) fn resampling_capacity_bytes(&self) -> usize {
-        self.resampled_series
-            .values()
-            .map(|binding| {
-                binding.options.boundaries.capacity() * std::mem::size_of::<ResampleBoundary>()
-                    + binding.bars.capacity() * std::mem::size_of::<ResampledBar>()
-            })
-            .sum()
+        self.study_calendar.capacity() * std::mem::size_of::<ResampleBoundary>()
+            + self
+                .resampled_series
+                .values()
+                .map(|binding| {
+                    binding.options.boundaries.capacity() * std::mem::size_of::<ResampleBoundary>()
+                        + binding.bars.capacity() * std::mem::size_of::<ResampledBar>()
+                })
+                .sum::<usize>()
     }
 }
 
@@ -584,16 +683,21 @@ fn validate_options(options: &ResampleOptions) -> Result<(), ResampleError> {
     if options.interval_seconds == 0 {
         return Err(ResampleError::InvalidInterval);
     }
-    if options.boundaries.len() > MAX_RESAMPLE_BOUNDARIES {
+    validate_boundaries(&options.boundaries, false)
+}
+
+fn validate_boundaries(
+    boundaries: &[ResampleBoundary],
+    allow_empty: bool,
+) -> Result<(), ResampleError> {
+    if boundaries.len() > MAX_RESAMPLE_BOUNDARIES {
         return Err(ResampleError::TooManyBoundaries);
     }
-    if options.boundaries.is_empty()
-        || options
-            .boundaries
+    if (!allow_empty && boundaries.is_empty())
+        || boundaries
             .iter()
             .any(|boundary| boundary.start_time >= boundary.end_time)
-        || options
-            .boundaries
+        || boundaries
             .windows(2)
             .any(|pair| pair[0].end_time > pair[1].start_time)
     {
@@ -696,7 +800,253 @@ fn resample_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SeriesKind;
+    use crate::{SeriesKind, StudyAnnotations, StudyCalendarPolicy, StudyMarker, StudyMarkerKind};
+
+    #[test]
+    fn calendar_replacement_rebuilds_host_bindings_without_touching_utc_bindings() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let values = [10.0, 11.0, 12.0, 13.0];
+        chart
+            .set_series_data(0, &[1.0, 2.0, 3.0, 4.0], &values, &values, &values, &values)
+            .unwrap();
+        let host = chart.add_sma(0, 2).unwrap();
+        let utc = chart.add_ema(0, 2).unwrap();
+        let mut annotations = StudyAnnotations::default();
+        annotations.push_marker(StudyMarker {
+            row: 2,
+            confirm_row: 3,
+            price: 12.0,
+            kind: StudyMarkerKind::SwingHigh,
+            from_row: None,
+        });
+        chart.inject_study_annotations_for_test(host, annotations);
+        chart
+            .indicators
+            .iter_mut()
+            .find(|b| b.outputs[0] == host)
+            .unwrap()
+            .calendar = Some(StudyCalendarPolicy::Host);
+        chart
+            .indicators
+            .iter_mut()
+            .find(|b| b.outputs[0] == utc)
+            .unwrap()
+            .calendar = Some(StudyCalendarPolicy::Utc);
+        let utc_generation = chart.data.series_generation(utc);
+        chart
+            .set_study_calendar(vec![ResampleBoundary {
+                start_time: 0,
+                end_time: 10,
+                session_id: 1,
+            }])
+            .unwrap();
+        assert!(chart.study_annotations(host).unwrap().markers().is_empty());
+        assert_eq!(chart.data.series_generation(utc), utc_generation);
+    }
+
+    #[test]
+    fn study_calendar_validates_atomically_and_accepts_empty_clear() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let valid = vec![
+            ResampleBoundary {
+                start_time: 10,
+                end_time: 20,
+                session_id: 1,
+            },
+            ResampleBoundary {
+                start_time: 20,
+                end_time: 30,
+                session_id: 1,
+            },
+        ];
+        chart.set_study_calendar(valid.clone()).unwrap();
+        for invalid in [
+            vec![ResampleBoundary {
+                start_time: 5,
+                end_time: 5,
+                session_id: 1,
+            }],
+            vec![
+                valid[0],
+                ResampleBoundary {
+                    start_time: 19,
+                    end_time: 25,
+                    session_id: 1,
+                },
+            ],
+            vec![valid[1], valid[0]],
+        ] {
+            assert_eq!(
+                chart.set_study_calendar(invalid),
+                Err(ResampleError::InvalidBoundaries)
+            );
+            assert_eq!(chart.study_calendar, valid);
+        }
+        assert_eq!(
+            chart.set_study_calendar(vec![valid[0]; MAX_RESAMPLE_BOUNDARIES + 1]),
+            Err(ResampleError::TooManyBoundaries)
+        );
+        assert_eq!(chart.study_calendar, valid);
+        chart.set_study_calendar(Vec::new()).unwrap();
+        assert!(chart.study_calendar.is_empty());
+    }
+
+    #[test]
+    fn study_sessions_merge_touching_identity_only_and_gaps_have_no_session() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .set_study_calendar(vec![
+                ResampleBoundary {
+                    start_time: 10,
+                    end_time: 20,
+                    session_id: 7,
+                },
+                ResampleBoundary {
+                    start_time: 20,
+                    end_time: 30,
+                    session_id: 7,
+                },
+                ResampleBoundary {
+                    start_time: 35,
+                    end_time: 40,
+                    session_id: 7,
+                },
+                ResampleBoundary {
+                    start_time: 40,
+                    end_time: 50,
+                    session_id: 8,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            chart.study_session_spans(),
+            vec![
+                SessionSpan {
+                    start: 10,
+                    end: 30,
+                    session_id: 7,
+                },
+                SessionSpan {
+                    start: 35,
+                    end: 40,
+                    session_id: 7,
+                },
+                SessionSpan {
+                    start: 40,
+                    end: 50,
+                    session_id: 8,
+                },
+            ]
+        );
+        let rows = chart.study_session_spans_for_rows(&[9, 10, 20, 30, 34, 35, 40, 50]);
+        assert_eq!(
+            rows.iter()
+                .map(|span| span.map(|s| s.start))
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some(10),
+                Some(10),
+                None,
+                None,
+                Some(35),
+                Some(40),
+                None
+            ]
+        );
+        assert_eq!(ChartEngine::study_utc_day_span(-1).unwrap().start, -86_400);
+        assert_eq!(ChartEngine::study_utc_week_span(0).unwrap().start, -259_200);
+        assert_eq!(
+            ChartEngine::study_utc_month_span(0).unwrap().end,
+            31 * 86_400
+        );
+    }
+
+    #[test]
+    fn calendar_replacement_rebuilds_host_sessions_and_their_dependents_in_sync() {
+        // Two sessions of three hourly bars; the host calendar names only the first one.
+        let times = [0.0, 3_600.0, 7_200.0, 86_400.0, 90_000.0, 93_600.0];
+        let high = [11.0, 14.0, 12.0, 21.0, 25.0, 22.0];
+        let low = [9.0, 10.0, 8.0, 19.0, 18.0, 20.0];
+        let close = [10.0, 13.0, 9.0, 20.0, 24.0, 21.0];
+        let install = |chart: &mut ChartEngine| {
+            chart
+                .set_series_data(0, &times, &close, &high, &low, &close)
+                .unwrap();
+            let host = chart.add_session_levels(0, StudyCalendarPolicy::Host);
+            let utc = chart.add_session_levels(0, StudyCalendarPolicy::Utc);
+            let chained = chart.add_sma(host[0], 2).unwrap();
+            (host, utc, chained)
+        };
+        let calendar = vec![ResampleBoundary {
+            start_time: 0,
+            end_time: 10_800,
+            session_id: 1,
+        }];
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let (host, utc, chained) = install(&mut chart);
+        let points = chart.time_scale.points_len();
+        let utc_generation = chart.data.series_generation(utc[0]);
+        let chained_generation = chart.data.series_generation(chained);
+        // A union point left pending, as a rebuilt dependent that moves the union would leave
+        // one: the calendar rebuild resyncs the time scale, so the extent takes the new point.
+        let other = chart.add_series(SeriesKind::Line);
+        chart
+            .set_series_data(other, &times, &close, &close, &close, &close)
+            .unwrap();
+        assert!(chart.data.update(other, 180_000, [30.0; 4]));
+        assert_ne!(
+            chart.synced_time_points_generation,
+            chart.data.time_points_generation()
+        );
+        chart.set_study_calendar(calendar.clone()).unwrap();
+        // The host binding, and the study chained on it, equal a fresh install under the new
+        // calendar; the UTC binding is untouched.
+        let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+        fresh.set_study_calendar(calendar).unwrap();
+        let (fresh_host, _, fresh_chained) = install(&mut fresh);
+        for (actual, expected) in host
+            .iter()
+            .zip(&fresh_host)
+            .chain([(&chained, &fresh_chained)])
+        {
+            let values = |chart: &ChartEngine, id: SeriesId| {
+                chart.data.series_data(id).unwrap().1[3]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values(&chart, *actual), values(&fresh, *expected));
+        }
+        assert_ne!(chart.data.series_generation(chained), chained_generation);
+        assert_eq!(chart.data.series_generation(utc[0]), utc_generation);
+        assert_eq!(chart.time_scale.points_len(), points + 1);
+        assert_eq!(
+            chart.synced_time_points_generation,
+            chart.data.time_points_generation()
+        );
+    }
+
+    #[test]
+    fn study_calendar_is_runtime_only_across_export_and_import() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let document_before = chart.export_state_json().unwrap();
+        chart
+            .set_study_calendar(vec![ResampleBoundary {
+                start_time: 0,
+                end_time: 60,
+                session_id: 4,
+            }])
+            .unwrap();
+        assert_eq!(chart.export_state_json().unwrap(), document_before);
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        restored.import_state_json(&document_before).unwrap();
+        assert!(restored.study_session_spans().is_empty());
+        chart.import_state_json(&document_before).unwrap();
+        assert_eq!(chart.study_session_spans().len(), 1);
+        chart.clear_study_calendar();
+        assert!(chart.study_session_spans().is_empty());
+    }
 
     #[test]
     fn derived_volume_cannot_overwrite_its_source() {

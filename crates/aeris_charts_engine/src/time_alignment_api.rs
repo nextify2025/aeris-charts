@@ -58,6 +58,20 @@ impl ChartEngine {
         if let Some(reason) = self.time_alignment_refusal(id) {
             return Err(ChartError::new(ErrorCode::UnsupportedOperation, reason));
         }
+        if alignment.is_as_of()
+            && self.indicators.iter().any(|binding| {
+                binding.structure.is_some()
+                    && self.data.time_alignment_owner(binding.source) == Some(id)
+            })
+        {
+            // Structure annotations name canonical rows, which an as-of plot repeats or skips.
+            // A study on an indicator output follows the output's source series, so a structure
+            // study anywhere down a chain keeps that series off the as-of alignment.
+            return Err(ChartError::new(
+                ErrorCode::UnsupportedOperation,
+                "a series with a structure study cannot become an as-of overlay",
+            ));
+        }
         self.apply_time_alignment(id, alignment);
         Ok(())
     }

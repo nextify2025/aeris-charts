@@ -22,6 +22,8 @@
 
 每个执行器都会丢弃范围超出点池的批量（`draw_list::segment_points`，使用带检查的 `usize` 运算，因为在 wasm32 上 `usize` 为 32 位）。`Prim` 是一个没有 `#[non_exhaustive]` 的公共枚举，因此该变体对下游的穷尽匹配是破坏性变更：消费固定修订的宿主（Aeris Terminal）在更换固定修订时需要添加相应分支。帧组装通过 `shift_point_indices` 对点池索引重新定基（原生图像导出不这样做，因为它针对每个窗格自己的点池执行该窗格的绘制列表），并且它与 WebGPU 网格化器都显式匹配每个变体，因此未来任何按点池索引的图元，在两者各自处理它之前都无法通过编译。
 
+系列标记的上下箭头（`ARROW_UP`/`ARROW_DOWN`）与结构研究的摆动点箭头共用 `push_marker_arrow`：一个 `Triangle` 箭头加一个无边框 `RoundRect` 箭杆，尺寸由标记包络与 `hpr` 决定，因此两处箭头在每个后端上逐像素一致。结构研究的区域、BOS/CHoCH 线段与文字同样只降级为 `Rect`、`RectFrame`、`HLine` 与 `Text`，没有新增图元。
+
 ## 图像
 
 `Prim::Image` 承载不可变的非预乘 alpha RGBA8 像素。其目标边缘按共享的设备像素规则对齐，缩放后的像素使用双线性采样。GPUI 将缓存的 RGBA 字节一次性转换为其 BGRA 图像上传顺序，而 WebGPU 与原生/Canvas2D 则在同一帧契约之后保留各自的平台编码。

@@ -211,18 +211,33 @@ test("Klinger, KAMA, McGinley and regression expose ordered browser values and r
     const schemas = ["klinger", "kama", "mcginley", "linear_regression"].map((kind) =>
       chart.indicator_schema(kind).parameters.map(({ name, default: value }) => [name, value]));
     const panesBefore = chart.panes().length;
+    const seriesOrderBefore = chart.series_order().map((series) => series.id);
     const invalid = [
       () => chart.add_klinger(price, 2, 2, 2, volume),
       () => chart.add_klinger(price, 1, 2, 2, null),
       () => chart.add_klinger(price, 1, 2, 1.5, volume),
       () => chart.add_kama(adaptive, 0, 2, 5),
       () => chart.add_kama(adaptive, 3, 5, 2),
+      () => chart.add_kama(adaptive, 3.5, 2, 5),
+      () => chart.add_kama(adaptive, 3, 0, 5),
+      () => chart.add_kama(adaptive, 3, 2, Infinity),
       () => chart.add_mcginley(dynamic, Infinity),
+      () => chart.add_mcginley(dynamic, 0),
+      () => chart.add_mcginley(dynamic, 2.5),
+      () => chart.add_mcginley(dynamic, 1_000_001),
       () => chart.add_linear_regression(regression, 0, 2),
       () => chart.add_linear_regression(regression, 3, -1),
       () => chart.add_linear_regression(regression, 3, NaN),
-    ].map((add) => { try { add(); return false; } catch (error) { return error.code === "invalid_options"; } });
+      () => chart.add_linear_regression(regression, 2.5, 2),
+      () => chart.add_linear_regression(regression, 3, Infinity),
+      () => chart.add_linear_regression(regression, 1_000_001, 2),
+    ].map((add) => {
+      try { add(); return false; } catch (error) {
+        return error.name === "AerisChartsError" && error.code === "invalid_options";
+      }
+    });
     const panesAfter = chart.panes().length;
+    const seriesOrderAfter = chart.series_order().map((series) => series.id);
     volume.update({ time: start + 60, value: 2 });
     adaptive.update({ time: start + 180, value: 5 });
     dynamic.update({ time: start + 60, value: 3 });
@@ -241,6 +256,7 @@ test("Klinger, KAMA, McGinley and regression expose ordered browser values and r
       chart.add_linear_regression(regression)[0],
     ].map((s) => s.indicator_info().parameters);
     return { before, signalAtLast, after, fresh, defaults, metadata, schemas, invalid, panesBefore, panesAfter,
+      seriesOrderBefore, seriesOrderAfter,
       pricePane: price.pane_index(), volumeId: volume.id };
   });
   expect(result.before[0][0]).toBeCloseTo(-50 / 3, 8);
@@ -251,8 +267,9 @@ test("Klinger, KAMA, McGinley and regression expose ordered browser values and r
   expect(result.before[3][0]).toBeCloseTo(2.5, 8);
   expect(result.before[3][1]).toBeCloseTo(2.5 + Math.SQRT2, 8);
   expect(result.before[3][2]).toBeCloseTo(2.5 - Math.SQRT2, 8);
-  expect(result.invalid).toEqual(Array(9).fill(true));
+  expect(result.invalid).toEqual(Array(18).fill(true));
   expect(result.panesAfter).toBe(result.panesBefore);
+  expect(result.seriesOrderAfter).toEqual(result.seriesOrderBefore);
   expect(result.metadata.map((group) => group.map(({ kind }) => kind))).toEqual([
     ["klinger", "klinger"], ["kama"], ["mcginley"],
     ["linear_regression", "linear_regression", "linear_regression"],
@@ -1084,6 +1101,17 @@ test("browser schemas retain every multi-parameter Rust canonical default", asyn
   // Explicit browser contract, independent of the engine's schema builder and indicator functions.
   // Includes volume-source descriptors when they are the second parameter.
   const defaults = {
+    swing_points: { left: 5, right: 5 },
+    market_structure: { left: 5, right: 5, break_on: "close" },
+    fair_value_gaps: {
+      min_size: 0, mitigation: "touch", mitigation_price: "wick", max_active: 20, show_mitigated: false,
+    },
+    order_blocks: {
+      left: 5, right: 5, break_on: "close", zone: "wick",
+      mitigation: "touch", mitigation_price: "wick", max_active: 20, show_mitigated: false,
+    },
+    previous_period_levels: { period: "day", calendar: "utc" },
+    opening_range: { duration_seconds: 1800, calendar: "utc" },
     stochastic_rsi: { rsi_period: 14, stochastic_period: 14 },
     bollinger_metrics: { period: 14, deviation: 2 },
     envelopes: { period: 14, percent: 2, exponential: false },
