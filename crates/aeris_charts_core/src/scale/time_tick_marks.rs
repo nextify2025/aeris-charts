@@ -7,7 +7,7 @@
 //! The default [`ExchangeTime::UTC`] reproduces the reference's UTC boundaries exactly. Mark
 //! selection keeps higher weights first and inserts lower-weight marks only where they fit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::TimePointIndex;
 use crate::scale::exchange_time::ExchangeTime;
@@ -176,21 +176,19 @@ pub fn fill_weights_for_points_shifted_in(
     } else {
         Some(times[start_index - 1])
     };
-    let mut total_time_diff: i64 = 0;
-
     for index in start_index..times.len() {
         let current = times[index];
         if let Some(prev) = prev_time {
             weights[index] = weight_by_time_shifted(current, prev, label_shift, time) as u8;
         }
-        total_time_diff += current - prev_time.unwrap_or(current);
         prev_time = Some(current);
     }
 
     if start_index == 0 && times.len() > 1 {
+        // The adjacent gaps telescope to `last - first`.
         weights[0] = first_point_weight_shifted_in(
             times[0],
-            total_time_diff,
+            times[times.len() - 1] - times[0],
             times.len(),
             label_shift,
             time,
@@ -198,8 +196,9 @@ pub fn fill_weights_for_points_shifted_in(
     }
 }
 
-/// The guessed weight of the first of `len > 1` points spanning `span` seconds: pretend the
-/// previous point was the average time diff back in history.
+/// The guessed weight of the first of `len` points spanning `span` seconds: pretend the previous
+/// point was the average time diff back in history. Only the endpoints and the count are needed,
+/// so an append revises it in constant time; a single point keeps weight zero.
 pub fn first_point_weight_in(first: i64, span: i64, len: usize, time: &ExchangeTime) -> u8 {
     first_point_weight_shifted_in(first, span, len, 0, time)
 }
@@ -213,6 +212,9 @@ pub fn first_point_weight_shifted_in(
     label_shift: i64,
     time: &ExchangeTime,
 ) -> u8 {
+    if len <= 1 {
+        return 0;
+    }
     let average_time_diff = ((span as f64) / (len as f64 - 1.0)).ceil() as i64;
     weight_by_time_shifted(first, first - average_time_diff, label_shift, time) as u8
 }
@@ -239,6 +241,9 @@ pub struct TickMark {
 #[derive(Default)]
 pub struct TimeTickMarks {
     marks_by_weight: BTreeMap<u8, Vec<TimePointIndex>>,
+    // Separate from potentially million-entry buckets: changing the inferred first weight
+    // never removes/shifts an index in a bucket.
+    first_mark: Option<TickMark>,
     cache: Option<(i64, Vec<TickMark>)>,
 }
 
@@ -258,7 +263,11 @@ impl TimeTickMarks {
         let cache = self.cache.as_ref().map_or(0, |(_, marks)| {
             marks.len() * std::mem::size_of::<TickMark>()
         });
-        buckets + cache
+        buckets
+            + cache
+            + self
+                .first_mark
+                .map_or(0, |_| std::mem::size_of::<TickMark>())
     }
 
     pub fn capacity_bytes(&self) -> usize {
@@ -270,7 +279,11 @@ impl TimeTickMarks {
         let cache = self.cache.as_ref().map_or(0, |(_, marks)| {
             marks.capacity() * std::mem::size_of::<TickMark>()
         });
-        buckets + cache
+        buckets
+            + cache
+            + self
+                .first_mark
+                .map_or(0, |_| std::mem::size_of::<TickMark>())
     }
 
     /// Full rebuild from per-point weights (incremental `firstChangedPointIndex` variant
@@ -282,6 +295,7 @@ impl TimeTickMarks {
     /// Full rebuild from per-point weights whose first logical index may be negative.
     pub fn set_weights_from(&mut self, start_index: TimePointIndex, weights: &[u8]) {
         self.marks_by_weight.clear();
+        self.first_mark = None;
         self.cache = None;
         for (index, &weight) in weights.iter().enumerate() {
             let Ok(index) = TimePointIndex::try_from(index) else {
@@ -290,7 +304,21 @@ impl TimeTickMarks {
             let Some(index) = start_index.checked_add(index) else {
                 break;
             };
-            self.marks_by_weight.entry(weight).or_default().push(index);
+            if self.first_mark.is_none() {
+                self.first_mark = Some(TickMark { index, weight });
+            } else {
+                self.marks_by_weight.entry(weight).or_default().push(index);
+            }
+        }
+    }
+
+    /// Revise the first mark without touching any weight bucket.
+    pub fn set_first_weight(&mut self, weight: u8) {
+        if let Some(first) = self.first_mark.as_mut()
+            && first.weight != weight
+        {
+            first.weight = weight;
+            self.cache = None;
         }
     }
 
@@ -306,20 +334,18 @@ impl TimeTickMarks {
             indices.iter_mut().for_each(|index| *index -= first);
             !indices.is_empty()
         });
-        self.marks_by_weight
-            .entry(first_weight)
-            .or_default()
-            .insert(0, 0);
+        // The new first point leaves its bucket for `first_mark`; no bucket is shifted for it.
+        self.first_mark = Some(TickMark {
+            index: 0,
+            weight: first_weight,
+        });
     }
 
     /// Append weights for newly-added points without rebuilding prior weight buckets.
     pub fn append_weights(&mut self, start_index: usize, weights: &[u8]) {
         self.cache = None;
         for (offset, &weight) in weights.iter().enumerate().skip(start_index) {
-            self.marks_by_weight
-                .entry(weight)
-                .or_default()
-                .push(offset as TimePointIndex);
+            self.push_weight(offset as TimePointIndex, weight);
         }
     }
 
@@ -328,7 +354,11 @@ impl TimeTickMarks {
     /// predecessor.
     pub fn push_weight(&mut self, index: TimePointIndex, weight: u8) {
         self.cache = None;
-        self.marks_by_weight.entry(weight).or_default().push(index);
+        if self.first_mark.is_none() {
+            self.first_mark = Some(TickMark { index, weight });
+        } else {
+            self.marks_by_weight.entry(weight).or_default().push(index);
+        }
     }
 
     /// Port of `TickMarks.build`: `max_width` is the max label width in px
@@ -352,16 +382,36 @@ impl TimeTickMarks {
     fn build_impl(&self, max_indexes_per_mark: i64) -> Vec<TickMark> {
         let mut marks: Vec<TickMark> = Vec::new();
 
-        for (&weight, current_weight_marks) in self.marks_by_weight.iter().rev() {
+        // There are at most the fixed calendar weight classes here. Include the standalone
+        // first mark in its normal weight pass so spacing and priority remain unchanged.
+        let weights = self
+            .marks_by_weight
+            .keys()
+            .copied()
+            .chain(self.first_mark.map(|mark| mark.weight))
+            .collect::<BTreeSet<_>>();
+        for weight in weights.into_iter().rev() {
+            let current_weight_marks = self.marks_by_weight.get(&weight);
             // built marks so far become prev_marks; marks restarts
             let prev_marks = marks;
-            marks = Vec::with_capacity(prev_marks.len() + current_weight_marks.len());
+            marks = Vec::with_capacity(
+                prev_marks.len()
+                    + current_weight_marks.map_or(0, Vec::len)
+                    + usize::from(self.first_mark.is_some_and(|mark| mark.weight == weight)),
+            );
 
             let mut prev_marks_pointer = 0usize;
             let mut right_index = i64::MAX;
             let mut left_index = i64::MIN;
 
-            for &current_index in current_weight_marks {
+            let first_index = self
+                .first_mark
+                .filter(|mark| mark.weight == weight)
+                .map(|mark| mark.index);
+            // One plain loop over the bucket slice (and the standalone first mark before it):
+            // a chained iterator here slowed a 1M-point rebuild by about a third in release
+            // measurements, so the merge keeps this shape rather than upstream's `chain`.
+            let mut visit = |current_index: i64| {
                 // move all prev marks strictly left of current into the result
                 while prev_marks_pointer < prev_marks.len() {
                     let last_mark = prev_marks[prev_marks_pointer];
@@ -386,6 +436,12 @@ impl TimeTickMarks {
                     });
                     left_index = current_index;
                 }
+            };
+            if let Some(index) = first_index {
+                visit(index);
+            }
+            for &current_index in current_weight_marks.map_or(&[][..], Vec::as_slice) {
+                visit(current_index);
             }
 
             // append the unused prev marks
@@ -551,6 +607,7 @@ mod tests {
                     marks.marks_by_weight, clean.marks_by_weight,
                     "round {round} dropped {dropped}"
                 );
+                assert_eq!(marks.first_mark, clean.first_mark, "round {round}");
                 assert_eq!(
                     marks.build(1_000.0, 10.0),
                     clean_marks(new).build(1_000.0, 10.0)
@@ -576,6 +633,64 @@ mod tests {
         assert_eq!(front_trim(&old, &[20, 30]), None);
         // One surviving point followed by new ones.
         assert_eq!(front_trim(&old, &[40, 50, 60]), Some(3));
+    }
+
+    #[test]
+    fn first_weight_uses_only_endpoints_count_and_time_zone() {
+        let irregular = [86_280, 86_340, 86_400, 86_460, 172_800];
+        let span = irregular[4] - irregular[0];
+        let mut weights = [0; 5];
+        fill_weights_for_points(&irregular, &mut weights, 0);
+        assert_eq!(weights, [32, 20, 50, 20, 50]);
+        assert_eq!(
+            weights[0],
+            first_point_weight_in(irregular[0], span, irregular.len(), &ExchangeTime::UTC)
+        );
+        assert_eq!(first_point_weight_in(86_280, 0, 1, &ExchangeTime::UTC), 0);
+        let eastern = new_york();
+        fill_weights_for_points_in(&irregular, &mut weights, 0, &eastern);
+        assert_eq!(
+            weights[0],
+            first_point_weight_in(irregular[0], span, irregular.len(), &eastern)
+        );
+        // Labels printed a bar later weigh the first point from its shifted label time.
+        fill_weights_for_points_shifted_in(&irregular, &mut weights, 0, 3_600, &eastern);
+        assert_eq!(
+            weights[0],
+            first_point_weight_shifted_in(irregular[0], span, irregular.len(), 3_600, &eastern)
+        );
+    }
+
+    #[test]
+    fn reclassifying_first_mark_does_not_move_large_bucket() {
+        let mut marks = TimeTickMarks::new();
+        marks.set_weights(&vec![20; 100_000]);
+        let bucket = marks.marks_by_weight.get(&20).unwrap();
+        let original_ptr = bucket.as_ptr();
+        let original_capacity = bucket.capacity();
+        marks.build(100.0, 0.0);
+        marks.set_first_weight(32);
+        let bucket = marks.marks_by_weight.get(&20).unwrap();
+        assert_eq!(bucket.as_ptr(), original_ptr);
+        assert_eq!(bucket.capacity(), original_capacity);
+        assert_eq!(bucket.len(), 99_999);
+        let selected = marks.build(100.0, 0.0);
+        assert_eq!(
+            selected.first(),
+            Some(&TickMark {
+                index: 0,
+                weight: 32
+            })
+        );
+        assert_eq!(selected.len(), 100_000);
+        marks.push_weight(100_000, 50);
+        assert_eq!(
+            marks.build(100.0, 0.0).last(),
+            Some(&TickMark {
+                index: 100_000,
+                weight: 50
+            })
+        );
     }
 
     #[test]

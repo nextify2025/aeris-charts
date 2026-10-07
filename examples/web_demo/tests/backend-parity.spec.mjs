@@ -1660,6 +1660,9 @@ async function render_measures(page, backend, theme) {
     chart.wasm.measure_pointer_down(start[0], start[1], true, false);
     chart.wasm.measure_pointer_move(end[0], end[1], false);
     chart.wasm.measure_pointer_up(end[0], end[1], false);
+    // The raw engine calls do not schedule a paint; without one the measure appears only on
+    // whatever repaint comes next (a countdown tick), possibly in just one backend's capture.
+    chart.render();
     const measured = JSON.parse(chart.wasm.measure_points_json());
     result.push(measured.map((point) => css(point.logical, point.price)));
     return result;

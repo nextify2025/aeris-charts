@@ -78,6 +78,8 @@ xvfb-run -a -s "-screen 0 1920x1080x24" bunx playwright test --headed <specs>
 
 研究与拍卖标记的浏览器证据位于 `custom-studies.spec.mjs`（自定义研究的调度、重入、worker 拒绝、故障投递，以及结构区域与拍卖标记在 Canvas2D 与 WebGPU 之间的几何一致性）与 `footprint.spec.mjs` 的两个拍卖标记测试。跨后端像素比较的共用函数提取到 `tests/parity-pixels.mjs`（见[下文](#playwright-全局准备与页面就绪)），`primitives.spec.mjs` 与 `custom-studies.spec.mjs` 共用它；在没有 WebGPU 的环境中，需要 WebGPU 的测试在后端检查处失败，属于环境基线。
 
+演示页的无障碍审计位于 `accessibility.spec.mjs`（上游 `7df2305`，经合并 `85bc10b` 的提交引入）：它用 axe-core（`examples/web_demo` 的开发依赖，MPL-2.0，只由该 spec 注入页面，不进入包）检查十个状态——金融与通用工作区、分屏网格、快捷键面板与 390 px 移动视口，各有浅色与深色——要求 WCAG 2.0/2.1 A/AA 标签（`wcag2a`、`wcag2aa`、`wcag21a`、`wcag21aa`）零违规、没有 `aria-prohibited-attr` 的未定项，且每个 `aria-describedby` 目标唯一并属于其图表（包的窗格描述 id 计数器为模块级，同一页上的两个图表不再产生重复 id）。它依赖 `page-ready.mjs` 的 `test` 与 `wait_for_chart`；它发现的问题应在本仓库的演示代码中修复，而不是在 spec 中放宽。上游对无障碍与竞品的人工评审只作为上游证据引用。`last-value-cluster.spec.mjs` 的倒计时测试在 Playwright 的假时钟上运行，计时器在某一秒的 200 ms 处启动，断言倒计时行在该秒后段不变、越过每个整秒后立即变化（上游 `85bc10b`）；包的倒计时计时器对齐到倒计时时钟（宿主 `set_clock` 时钟，否则为系统时钟）的下一个整秒之后 1 ms。
+
 ### Playwright 全局准备与页面就绪
 
 `examples/web_demo/playwright.config.mjs` 的 `globalSetup`（`global-setup.mjs`）在任何测试之前，从仓库根目录运行 `cargo build -p aeris_charts_native --example image_parity_fixture --example parity_fixture --locked`。因此每一次 Playwright 运行（包括 `--grep`、单个 spec 与 `bun run test:gpui-webgpu`）都需要 rustup 与 `rust-toolchain.toml` 固定的工具链；锁文件过期或原生编译错误会在任何测试运行之前中止整个套件，而不再只让两个一致性测试失败。`backend-parity.spec.mjs` 直接运行 `${CARGO_TARGET_DIR ?? <仓库>/target}/debug/examples/<名称>`（Windows 上带 `.exe`），不再在测试中调用 `cargo run`，原生夹具因此与 CI 使用同一个固定工具链构建。全局准备与测试必须看到同一个 `CARGO_TARGET_DIR`，并使用 dev profile 且不带 `--target`，否则测试会读到过期或缺失的二进制。CI 浏览器作业的 `Swatinem/rust-cache` 设置 `cache-on-failure: true`，测试失败的运行同样保存这次原生构建。

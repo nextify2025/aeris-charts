@@ -677,6 +677,64 @@ test("indicator sources recover from empty, short, and retention-trimmed warm-up
   expect(result.retained_rows).toBe(0);
 });
 
+test("RSI and EMA continue through an interior whitespace item across append and correction", async ({ page }) => {
+  await page.goto("/?backend=canvas2d");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("line", { visible: false });
+    const rows = Array.from({ length: 25 }, (_, index) => ({
+      time: 1_701_000_000 + index * 60,
+      ...(index === 9 ? {} : { value: 100 + index * 0.15 + Math.sin(index * 0.7) * 4 }),
+    }));
+    source.set_data(rows);
+    const rsi = chart.add_rsi(source, 4);
+    const ema = chart.add_ema(source, 4);
+    const check = () => ({ rows: rows.map((row) => ({ ...row })), rsi: rsi.data(), ema: ema.data() });
+    const stages = [check()];
+    const append = { time: 1_701_000_000 + 25 * 60, value: 112.5 };
+    rows.push(append);
+    source.update(append);
+    stages.push(check());
+    const correction = { ...rows[5], value: 95.25 };
+    rows[5] = correction;
+    source.update(correction);
+    stages.push(check());
+    return stages;
+  });
+  for (const { rows, rsi, ema } of result) {
+    const valid = rows.filter((row) => row.value !== undefined);
+    const expected = { rsi: new Map(), ema: new Map() };
+    let avg, gain = 0, loss = 0;
+    for (let i = 0; i < valid.length; i++) {
+      if (i === 3) avg = valid.slice(0, 4).reduce((sum, row) => sum + row.value, 0) / 4;
+      else if (i > 3) avg += (valid[i].value - avg) * 0.4;
+      if (i >= 3) expected.ema.set(valid[i].time, avg);
+      if (i > 0) {
+        const change = valid[i].value - valid[i - 1].value;
+        if (i <= 4) {
+          gain += Math.max(change, 0) / 4;
+          loss += Math.max(-change, 0) / 4;
+        } else {
+          gain = (gain * 3 + Math.max(change, 0)) / 4;
+          loss = (loss * 3 + Math.max(-change, 0)) / 4;
+        }
+        if (i >= 4) expected.rsi.set(valid[i].time,
+          loss === 0 ? (gain === 0 ? 50 : 100) : 100 - 100 / (1 + gain / loss));
+      }
+    }
+    for (const [kind, actual] of [["rsi", rsi], ["ema", ema]]) {
+      expect(actual.find((row) => row.time === rows[9].time)?.value).toBeUndefined();
+      for (const row of actual) {
+        const value = expected[kind].get(row.time);
+        if (value === undefined) expect(row.value).toBeUndefined();
+        else expect(Math.abs(row.value - value)).toBeLessThan(1e-9 * Math.max(1, Math.abs(value)));
+      }
+      expect(actual.at(-1).value).toBeDefined();
+    }
+  }
+});
+
 /** Chart screenshot decoded to a PNG plus a row-crop counter (geometry is CSS px, shots are device px). */
 async function shot(page) {
   const { url, chart_width } = await page.evaluate(() => ({

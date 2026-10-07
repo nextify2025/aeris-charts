@@ -187,7 +187,7 @@ function create_card(example, index) {
       <div class="general-card-copy"><h2>${example.title}</h2><p>${example.description}</p></div>
       <span class="general-kind-pill">${example.label}</span>
     </div>
-    <div class="general-chart-host" aria-label="${example.title} chart"><div class="general-chart-tooltip"></div></div>
+    <div class="general-chart-host" role="group" aria-label="${example.title} chart"><div class="general-chart-tooltip"></div></div>
     <div class="general-card-footer"><div class="general-card-legends"></div><span class="general-spacer"></span><span class="general-ready-state">loading</span></div>`;
   const legends = card.querySelector(".general-card-legends");
   for (const spec of example.series) {

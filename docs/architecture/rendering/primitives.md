@@ -26,7 +26,7 @@
 
 ## 图像
 
-`Prim::Image` 承载不可变的非预乘 alpha RGBA8 像素。其目标边缘按共享的设备像素规则对齐，缩放后的像素使用双线性采样。GPUI 将缓存的 RGBA 字节一次性转换为其 BGRA 图像上传顺序，而 WebGPU 与原生/Canvas2D 则在同一帧契约之后保留各自的平台编码。
+`Prim::Image` 承载不可变的非预乘 alpha RGBA8 像素。其目标边缘按共享的设备像素规则对齐，缩放后的像素使用双线性采样。图像的不透明度在每个执行器中都先经 `draw_list::quantize_image_opacity` 量化为一个舍入后的 alpha 字节（n/255，非有限值为 0；上游 `b75ec25`），量化为零的图像在进入图集或缓存之前即被跳过，因此 Canvas2D（以及经由 `canvas2d::execute` 的原生 tiny-skia）、GPUI 与 WebGPU（`chart/image_runs.rs` 在任何图集查找或上传之前完成准入）对同一不透明度得到同一个字节。GPUI 将缓存的 RGBA 字节一次性转换为其 BGRA 图像上传顺序，而 WebGPU 与原生/Canvas2D 则在同一帧契约之后保留各自的平台编码。
 
 ## 旋转文本
 

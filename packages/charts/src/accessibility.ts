@@ -165,6 +165,7 @@ export interface accessibility_handle {
 }
 
 const controllers = new WeakMap<chart_api, AccessibilityController>();
+let description_id = 0;
 
 const default_messages: accessibility_messages = {
   role_description: "Interactive chart pane",
@@ -1183,7 +1184,6 @@ class AccessibilityController implements accessibility_handle {
   private readonly status_writer = new LiveWriter(() => this.status);
   private dirty = new Set<PaneAccessibility>();
   private update_timer: ReturnType<typeof setTimeout> | null = null;
-  private description_id = 0;
   private detached = false;
   private refreshing = false;
   private refresh_queued = false;
@@ -1218,7 +1218,7 @@ class AccessibilityController implements accessibility_handle {
   }
 
   next_id(): number {
-    return ++this.description_id;
+    return ++description_id;
   }
 
   localization(): localization_options {

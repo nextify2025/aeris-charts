@@ -72,7 +72,7 @@ test("browser structure studies expose values, typed annotations and parameter v
   expect(result.snapshot[0].annotations.markers).toContainEqual(expect.objectContaining({
     row: 1, confirm_row: 2, price: 14, kind: "swing_high",
   }));
-  expect(result.snapshot[0].data[2].value).toBe(14);
+  expect(result.snapshot[0].data[0]).toEqual({ time: 1_700_000_120, value: 14 });
   expect(result.snapshot[0].parameters).toMatchObject({ left: 1, right: 1 });
   expect(result.snapshot[2].annotations.markers).toContainEqual(expect.objectContaining({
     row: 3, confirm_row: 3, price: 14, from_row: 1, kind: { bos: { up: true } },

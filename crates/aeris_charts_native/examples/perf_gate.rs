@@ -687,13 +687,13 @@ fn bind_custom_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
 /// Target M: bind a set of studies (every built-in study kind plus aggregate-input studies, or the
 /// 27 KLineChart templates) to one `rows`-row minute candle source and its volume series (and, for
 /// the KLineChart set, a turnover series), then time live ticks through the public engine path:
-/// current-bar replacements, and appends in the usual candle-then-volume order. `whitespace_row`
-/// makes one row of the history whitespace on every series.
+/// current-bar replacements, and appends in the usual candle-then-volume order. `whitespace`
+/// makes those row ranges of the history whitespace on every series.
 fn indicator_tick_cost(
     studies: StudySet,
     rows: usize,
     slots: usize,
-    whitespace_row: Option<usize>,
+    whitespace: &[std::ops::Range<usize>],
     replaces_per_append: usize,
     appends: usize,
 ) -> IndicatorTickCost {
@@ -709,15 +709,16 @@ fn indicator_tick_cost(
     let mut turnovers = Vec::with_capacity(rows + slots);
     for row in 0..rows + slots {
         times.push(row as f64 * 60.0);
-        let (values, volume_value, turnover_value) = if row < rows && whitespace_row != Some(row) {
-            (
-                indicator_bar(row, 0),
-                volume_at(row, 0),
-                turnover_at(row, 0),
-            )
-        } else {
-            ([f64::NAN; 4], f64::NAN, f64::NAN)
-        };
+        let (values, volume_value, turnover_value) =
+            if row < rows && !whitespace.iter().any(|gap| gap.contains(&row)) {
+                (
+                    indicator_bar(row, 0),
+                    volume_at(row, 0),
+                    turnover_at(row, 0),
+                )
+            } else {
+                ([f64::NAN; 4], f64::NAN, f64::NAN)
+            };
         for (column, value) in columns.iter_mut().zip(values) {
             column.push(value);
         }
@@ -2900,7 +2901,7 @@ fn main() -> ExitCode {
         StudySet::BuiltIn,
         INDICATOR_TICK_ROWS,
         0,
-        None,
+        &[],
         4,
         INDICATOR_TICK_APPENDS,
     );
@@ -2932,7 +2933,7 @@ fn main() -> ExitCode {
         StudySet::BuiltIn,
         INDICATOR_TICK_ROWS,
         23_400,
-        None,
+        &[],
         4,
         INDICATOR_TICK_APPENDS,
     );
@@ -2968,6 +2969,40 @@ fn main() -> ExitCode {
         ),
         slot_fill_mean,
         INDICATOR_TICK_BUDGET_MS,
+    );
+
+    // Whitespace in the history (report-only): three leading rows, one interior row, and an
+    // overnight-length gap of 1,000 rows ending two rows before the tip, so the first ticks'
+    // windows span it. Windowed kinds re-read the rows from their valid lookback start (gap
+    // included) and Stochastic, KDJ and Fisher rescan their extremes across it (`valid_extremes`,
+    // O(k + gap) per row); recursive kinds (Mass, KAMA, RSI, TSI, Klinger) replay from their tail.
+    let gap_end = INDICATOR_TICK_ROWS - 2;
+    let builtin_gap_cost = indicator_tick_cost(
+        StudySet::BuiltIn,
+        INDICATOR_TICK_ROWS,
+        0,
+        &[
+            0..3,
+            INDICATOR_TICK_ROWS / 2..INDICATOR_TICK_ROWS / 2 + 1,
+            gap_end - 1_000..gap_end,
+        ],
+        4,
+        INDICATOR_TICK_APPENDS,
+    );
+    println!(
+        "Target M (whitespace in history; report-only) — 3 leading rows, one interior row and a 1,000-row gap before the tip:"
+    );
+    println!(
+        "  current-bar replace mean {:.3} ms (median {:.3}, max {:.2}), new-bar append mean {:.3} ms (median {:.3}, max {:.2}), work rows per tick {}..={} (appends up to {})",
+        builtin_gap_cost.replace_ms.0,
+        builtin_gap_cost.replace_ms.1,
+        builtin_gap_cost.replace_ms.2,
+        builtin_gap_cost.append_ms.0,
+        builtin_gap_cost.append_ms.1,
+        builtin_gap_cost.append_ms.2,
+        builtin_gap_cost.min_work_rows,
+        builtin_gap_cost.max_work_rows,
+        builtin_gap_cost.max_append_work_rows,
     );
 
     // Aggregate-input studies keep one derived price column each. It must be resident (re-deriving
@@ -3040,7 +3075,7 @@ fn main() -> ExitCode {
             StudySet::Studies,
             INDICATOR_TICK_ROWS,
             slots,
-            None,
+            &[],
             4,
             INDICATOR_TICK_APPENDS,
         );
@@ -3103,7 +3138,7 @@ fn main() -> ExitCode {
             StudySet::Custom,
             INDICATOR_TICK_ROWS,
             slots,
-            None,
+            &[],
             4,
             INDICATOR_TICK_APPENDS,
         );
@@ -3174,7 +3209,7 @@ fn main() -> ExitCode {
         StudySet::KLineChart,
         INDICATOR_TICK_ROWS,
         0,
-        None,
+        &[],
         4,
         INDICATOR_TICK_APPENDS,
     );
@@ -3232,7 +3267,7 @@ fn main() -> ExitCode {
         StudySet::KLineChart,
         INDICATOR_TICK_ROWS,
         23_400,
-        None,
+        &[],
         4,
         INDICATOR_TICK_APPENDS,
     );
@@ -3271,11 +3306,12 @@ fn main() -> ExitCode {
 
     // One whitespace row in the history (report-only): every later tick also re-reads the rows
     // its window spans, so a tick costs the window instead of one row, still not the history.
+    let interior_row = INDICATOR_TICK_ROWS / 2..INDICATOR_TICK_ROWS / 2 + 1;
     let kline_gap_cost = indicator_tick_cost(
         StudySet::KLineChart,
         INDICATOR_TICK_ROWS,
         0,
-        Some(INDICATOR_TICK_ROWS / 2),
+        &[interior_row],
         4,
         INDICATOR_TICK_APPENDS,
     );
@@ -3390,11 +3426,12 @@ fn main() -> ExitCode {
     // interval and bounded pivot/order-block lookback, never the full history.
     const STRUCTURE_BARS: usize = 1_000_000;
     const STRUCTURE_TIP_SAMPLES: usize = 200;
-    // Measured on the fork at the 4c1da4f merge (Linux, 4 CPUs, release, three runs): tip p99
-    // 0.63-1.32 ms and the correction about 17 ms. Upstream measured ~3.2 ms and attributed most of it to a full-column
-    // whitespace scan of the all-whitespace structure anchors, which it skips with a
-    // `whitespace_only` flag; the fork's base index finds the last data row through the LOD
-    // pyramid, so it needs no flag and keeps the 8 ms budget with wide margin.
+    // Measured on the fork at the 85bc10b merge (Linux, 4 CPUs, release, four runs): tip p99
+    // 0.33-0.64 ms and the correction 16-17 ms, once 30 ms (0.63-1.32 ms and 17 ms at the 4c1da4f
+    // merge). Upstream attributed most of its earlier ~3.2 ms to a full-column whitespace scan
+    // of the all-whitespace structure anchors, which it skips with a `whitespace_only` flag; the
+    // fork's base index finds the last data row through the LOD pyramid, so it needs no flag and
+    // keeps the 8 ms budget with wide margin. (Upstream's own 0.16 ms is its machine's number.)
     const STRUCTURE_TIP_BUDGET_MS: f64 = 8.0;
     const STRUCTURE_CORRECTION_ROWS: usize = 20_000;
     const STRUCTURE_CORRECTION_BUDGET_MS: f64 = 100.0;

@@ -55,6 +55,142 @@ test("custom SMA matches built-in values and dispatches tail updates", async ({ 
   expect(result.calls.every(([, , , , inputs, outputs]) => inputs && outputs)).toBe(true);
 });
 
+test("leading whitespace trims built-in and custom outputs and preserves chains after correction", async ({ page }) => {
+  await page.goto("/?backend=canvas2d");
+  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const period = 3;
+    const formula = (name, close, row) => {
+      if (!Number.isFinite(close[row])) return NaN;
+      const valid = close.slice(0, row + 1).filter(Number.isFinite);
+      // The fork's window rule: a missing row is absent, so the SMA averages the last `period`
+      // valid closes.
+      if (name === "sma") {
+        return valid.length >= period
+          ? valid.slice(-period).reduce((sum, value) => sum + value, 0) / period : NaN;
+      }
+      if (name === "ema") {
+        if (valid.length < period) return NaN;
+        let value = valid.slice(0, period).reduce((sum, sample) => sum + sample, 0) / period;
+        for (const sample of valid.slice(period)) value += (sample - value) * 0.5;
+        return value;
+      }
+      if (valid.length <= period) return NaN;
+      const changes = valid.slice(1).map((value, i) => value - valid[i]);
+      let gain = changes.slice(0, period).reduce((sum, change) => sum + Math.max(change, 0), 0) / period;
+      let loss = changes.slice(0, period).reduce((sum, change) => sum + Math.max(-change, 0), 0) / period;
+      for (const change of changes.slice(period)) {
+        gain = (gain * (period - 1) + Math.max(change, 0)) / period;
+        loss = (loss * (period - 1) + Math.max(-change, 0)) / period;
+      }
+      return loss === 0 ? (gain === 0 ? 50 : 100) : 100 - 100 / (1 + gain / loss);
+    };
+    for (const name of ["sma", "ema", "rsi"]) {
+      chart.register_custom_study({
+        type: `test.trim.${name}`, version: 1, title: name, parameters: [],
+        outputs: [{ name, plot: "line", pane: "price" }],
+        init: () => null,
+        rebuild: (_state, ctx) => {
+          for (let row = ctx.from; row < ctx.length; row++) {
+            ctx.outputs[0][row - ctx.from] = formula(name, ctx.close, row);
+          }
+        },
+      });
+    }
+    const rows = Array.from({ length: 24 }, (_, i) => ({
+      time: 1701000000 + i * 60,
+      ...(i < 3 || i === 13 ? {} : { value: 100 + i * 0.35 + Math.sin(i * 0.8) * 3 }),
+    }));
+    const create = (data) => {
+      const source = chart.add_series("line", { visible: false });
+      source.set_data(data);
+      const builtin = ["sma", "ema", "rsi"].map((name) => ({
+        sma: () => chart.add_sma(source, period),
+        ema: () => chart.add_ema(source, period),
+        rsi: () => chart.add_rsi(source, period),
+      })[name]());
+      const custom = ["sma", "ema", "rsi"].map(
+        (name) => chart.add_custom_study(`test.trim.${name}`, source)[0]);
+      const chained = [chart.add_rsi(builtin[1], period), chart.add_sma(custom[1], period)];
+      return { source, builtin, custom, chained,
+        anchor: chart.add_fair_value_gaps(source) };
+    };
+    const study = create(rows);
+    const capture = (set) => ({
+      builtin: set.builtin.map((handle) => handle.data()),
+      custom: set.custom.map((handle) => handle.data()),
+      chained: set.chained.map((handle) => handle.data()),
+      anchor: set.anchor.data(),
+    });
+    const initial = capture(study);
+    const initialRows = rows.map((row) => ({ ...row }));
+    rows[0] = { time: rows[0].time, value: 98.5 };
+    study.source.update(rows[0]);
+    const corrected = capture(study);
+    const fresh = capture(create(rows));
+    return { initial, initialRows, corrected, fresh, rows };
+  });
+  for (const stage of [result.initial, result.corrected]) {
+    for (let i = 0; i < 3; i++) {
+      expect(stage.builtin[i]).toEqual(stage.custom[i]);
+      expect(stage.builtin[i][0].value).toBeDefined();
+    }
+    expect(stage.anchor).toHaveLength(result.rows.length);
+    expect(stage.anchor.every(({ value }) => value === undefined)).toBe(true);
+    expect(stage.chained.every((values) => values.some(({ value }) => value !== undefined))).toBe(true);
+  }
+  expect(result.initial.builtin[0][0].time).toBe(result.rows[5].time);
+  expect(result.initial.builtin[1][0].time).toBe(result.rows[5].time);
+  expect(result.initial.builtin[2][0].time).toBe(result.rows[6].time);
+  for (const [stage, sourceRows] of [
+    [result.initial, result.initialRows],
+    [result.corrected, result.rows],
+  ]) {
+    const ema = new Map();
+    const valid = sourceRows.filter((row) => row.value !== undefined);
+    let seed;
+    for (let i = 0; i < valid.length; i++) {
+      if (i === 2) seed = valid.slice(0, 3).reduce((sum, row) => sum + row.value, 0) / 3;
+      else if (i > 2) seed += (valid[i].value - seed) / 2;
+      if (i >= 2) ema.set(valid[i].time, seed);
+    }
+    const emaRows = sourceRows.map((row) => ({
+      time: row.time, value: ema.get(row.time),
+    }));
+    // The chained SMA averages the last 3 valid EMA samples (the fork's window rule).
+    const sma = new Map();
+    const emaSamples = emaRows.filter((row) => row.value !== undefined);
+    for (let i = 2; i < emaSamples.length; i++) {
+      const window = emaSamples.slice(i - 2, i + 1).map((row) => row.value);
+      sma.set(emaSamples[i].time, window.reduce((sum, value) => sum + value, 0) / 3);
+    }
+    const rsi = new Map();
+    const emaValid = emaRows.filter((row) => row.value !== undefined);
+    let gain = 0, loss = 0;
+    for (let i = 1; i < emaValid.length; i++) {
+      const change = emaValid[i].value - emaValid[i - 1].value;
+      if (i <= 3) {
+        gain += Math.max(change, 0) / 3;
+        loss += Math.max(-change, 0) / 3;
+      } else {
+        gain = (gain * 2 + Math.max(change, 0)) / 3;
+        loss = (loss * 2 + Math.max(-change, 0)) / 3;
+      }
+      if (i >= 3) rsi.set(emaValid[i].time,
+        loss === 0 ? (gain === 0 ? 50 : 100) : 100 - 100 / (1 + gain / loss));
+    }
+    for (const [chain, expected] of [[stage.chained[0], rsi], [stage.chained[1], sma]]) {
+      for (const row of chain) {
+        const value = expected.get(row.time);
+        if (value === undefined) expect(row.value).toBeUndefined();
+        else expect(Math.abs(row.value - value)).toBeLessThan(1e-9 * Math.max(1, Math.abs(value)));
+      }
+    }
+  }
+  expect(result.corrected).toEqual(result.fresh);
+});
+
 test("chained RSI, EMA and Bollinger respect custom warm-up and fault whitespace", async ({ page }) => {
   await page.goto("/?backend=canvas2d");
   await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);

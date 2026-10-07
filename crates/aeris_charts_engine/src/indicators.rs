@@ -4912,6 +4912,14 @@ impl ChartEngine {
         structure.update(input, output_start);
         binding.source_generation = source_generation;
         binding.data_end = end;
+        // Market-structure, fair-value-gap and order-block anchors keep every source time; the
+        // stepped levels start at their first value like every scalar output.
+        let anchor = matches!(
+            binding.kind,
+            IndicatorKind::MarketStructure { .. }
+                | IndicatorKind::FairValueGaps { .. }
+                | IndicatorKind::OrderBlocks { .. }
+        );
         for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
             let values = structure.outputs()[output_index][output_start..end]
                 .iter()
@@ -4922,16 +4930,19 @@ impl ChartEngine {
             } else {
                 OutputRows::Update(&values)
             };
-            let (_, change) = store_indicator_output(
+            let stored = store_indicator_output(
                 &mut self.data,
-                source,
-                output,
+                AlignedOutput {
+                    source,
+                    output,
+                    anchor,
+                },
                 output_start,
                 rewrite,
                 end,
                 rows,
             );
-            changes[output_index] = change.map(|change| (output, change));
+            changes[output_index] = stored.change.map(|change| (output, change));
         }
         changes
     }
@@ -5004,9 +5015,19 @@ impl ChartEngine {
             } else {
                 OutputRows::Update(&values)
             };
-            let (_, change) =
-                store_indicator_output(&mut self.data, source, output, start, rewrite, end, rows);
-            changes[output_index] = change.map(|change| (output, change));
+            let stored = store_indicator_output(
+                &mut self.data,
+                AlignedOutput {
+                    source,
+                    output,
+                    anchor: false,
+                },
+                start,
+                rewrite,
+                end,
+                rows,
+            );
+            changes[output_index] = stored.change.map(|change| (output, change));
         }
         self.indicators[index].source_generation = source_generation;
         self.indicators[index].data_end = end;
@@ -5113,9 +5134,10 @@ impl ChartEngine {
         self.indicators[index].amount_generation =
             amount_source.and_then(|id| self.data.series_generation(id));
 
-        let mut full_histogram_colors = None;
-        // First output row each output rewrote, for per-row colors.
+        // First output row each output rewrote, and whether it was rewritten whole, for per-row
+        // colors.
         let mut changed_rows = [0usize; aeris_charts_indicators::MAX_OUTPUTS];
+        let mut replaced = [false; aeris_charts_indicators::MAX_OUTPUTS];
         for (output_index, output) in outputs.iter().flatten().copied().enumerate() {
             // The runtime stops at the data end, so an output whose first row lies past it (its
             // warm-up, or the rebuild's first row, falls among trailing whitespace rows) starts
@@ -5139,15 +5161,12 @@ impl ChartEngine {
             };
 
             let rewrite = if full_replace {
-                let mut values = self.indicators[index]
-                    .runtime
-                    .built_in_mut()
-                    .take_output(output_index);
-                values.resize(rows - source_from, f64::NAN);
-                if histogram_output(&self.indicators[index].kind) == Some(output_index) {
-                    full_histogram_colors = Some(momentum_histogram_colors(&values));
-                }
-                OutputRows::Replace(values)
+                OutputRows::Replace(
+                    self.indicators[index]
+                        .runtime
+                        .built_in_mut()
+                        .take_output(output_index),
+                )
             } else {
                 OutputRows::Update(
                     self.indicators[index]
@@ -5156,22 +5175,31 @@ impl ChartEngine {
                         .output(output_index),
                 )
             };
-            let (output_from, change) = store_indicator_output(
+            let stored = store_indicator_output(
                 &mut self.data,
-                source,
-                output,
+                AlignedOutput {
+                    source,
+                    output,
+                    anchor: false,
+                },
                 source_from,
                 rewrite,
                 end,
                 rows,
             );
-            changed_rows[output_index] = output_from;
-            changes[output_index] = change.map(|change| (output, change));
+            changed_rows[output_index] = stored.from;
+            replaced[output_index] = stored.replaced;
+            changes[output_index] = stored.change.map(|change| (output, change));
         }
 
         if let Some(output_index) = histogram_output(&self.indicators[index].kind) {
             let histogram_id = outputs[output_index].unwrap();
-            if let Some(colors) = full_histogram_colors {
+            if replaced[output_index] {
+                let colors = self
+                    .data
+                    .series_data(histogram_id)
+                    .map(|(_, values)| momentum_histogram_colors(values[3]))
+                    .unwrap_or_default();
                 self.data
                     .set_point_colors(histogram_id, [Some(colors), None, None]);
             } else {
@@ -5179,17 +5207,8 @@ impl ChartEngine {
                     .runtime
                     .built_in()
                     .output(output_index);
-                // The histogram series aliases source rows from its warm-up row, which depends on
-                // the seed convention.
-                let first_histogram = self.indicators[index]
-                    .runtime
-                    .built_in()
-                    .warmup_rows(output_index);
-                let source_from = self.indicators[index]
-                    .runtime
-                    .built_in()
-                    .output_from(output_index);
-                let output_start = source_from.saturating_sub(first_histogram);
+                // Rows of the histogram series itself, which starts at its first value.
+                let output_start = changed_rows[output_index];
                 let mut previous = output_start.checked_sub(1).and_then(|row| {
                     self.data
                         .series_data(histogram_id)
@@ -5223,7 +5242,7 @@ impl ChartEngine {
                 if let (Some(rule), Some(output)) = (rule, outputs[output_index]) {
                     // The runtime rewrote this many rows from the first changed one; a tick over
                     // pre-installed session slots must not recolor the slots after them.
-                    let changed = (!full_replace).then(|| {
+                    let changed = (!replaced[output_index]).then(|| {
                         let from = changed_rows[output_index];
                         from..from
                             + self.indicators[index]
@@ -5246,48 +5265,134 @@ impl ChartEngine {
 
 /// Rows a rebuild writes into one indicator output, starting at its first rewritten source row.
 pub(crate) enum OutputRows<'a> {
-    /// The whole output from that row on; rows past the data end are padded with whitespace.
+    /// The whole output from that row on (a full rebuild).
     Replace(Vec<f64>),
     /// Only the rewritten rows; the output keeps every other row.
     Update(&'a [f64]),
 }
 
-/// Store the rows one rebuild produced for `output`, aligned to `source`, and report the change
-/// (first changed output row, and the generation it replaced) when the output changed. Built-in,
-/// structure and session studies share it: an update that stops at the data end `end` leaves the
-/// rows from `end` to `rows` (whitespace session slots) untouched.
+/// One indicator output series and the source it aliases rows of.
+#[derive(Clone, Copy)]
+pub(crate) struct AlignedOutput {
+    pub(crate) source: SeriesId,
+    pub(crate) output: SeriesId,
+    /// Keeps every source time (a structure anchor) instead of starting at the first value.
+    pub(crate) anchor: bool,
+}
+
+/// What [`store_indicator_output`] did to one output.
+pub(crate) struct StoredOutput {
+    /// First changed output row: an index into the output's own rows, which are the rows a
+    /// dependent study reads.
+    pub(crate) from: usize,
+    /// The whole output was rewritten (and its per-point colors cleared).
+    pub(crate) replaced: bool,
+    pub(crate) change: Option<IndicatorChange>,
+}
+
+/// Store the rows one rebuild produced for `output`, aligned to `source`. Built-in, structure,
+/// session and custom studies share it.
+///
+/// An output starts at its first value (owner decision Q-H, upstream's output shape): its leading
+/// NaN rows are not stored, except for an `anchor` output (the structure anchors), which keeps
+/// every source time. A rewrite that reaches the output's current start (its first row at or
+/// before that start, or an empty output) may move the start, so it replaces the whole output,
+/// built from the rewritten rows alone because no row precedes the start; it reports
+/// `full_replace` to dependents only for a full rebuild or when the start actually moved (their
+/// rows are renumbered), and an empty output that stays empty is not rewritten at all, so a
+/// warming or all-whitespace source stays bounded per tick. Any other update rewrites only its
+/// rows; one that stops at the data end `end` leaves the rows from `end` to `rows` (whitespace
+/// session slots) untouched. Replaced outputs are padded with whitespace to `rows`.
 pub(crate) fn store_indicator_output(
     data: &mut DataLayer,
-    source: SeriesId,
-    output: SeriesId,
+    target: AlignedOutput,
     source_from: usize,
     rewrite: OutputRows<'_>,
     end: usize,
     rows: usize,
-) -> (usize, Option<IndicatorChange>) {
+) -> StoredOutput {
+    let AlignedOutput {
+        source,
+        output,
+        anchor,
+    } = target;
     let previous_generation = data.series_generation(output).unwrap_or(0);
-    let full_replace = matches!(rewrite, OutputRows::Replace(_));
+    // The output aliases a contiguous range of source rows, so its first time locates its start.
+    let existing_start = data
+        .series_data(output)
+        .and_then(|(times, _)| times.first().copied())
+        .and_then(|first| {
+            data.series_data(source)
+                .and_then(|(times, _)| times.binary_search(&first).ok())
+        });
+    let full_rebuild = matches!(rewrite, OutputRows::Replace(_));
     let output_from = match rewrite {
-        OutputRows::Replace(mut values) => {
-            values.resize(rows.saturating_sub(source_from), f64::NAN);
-            data.set_single_data_aligned(output, source, source_from, values);
-            0
+        OutputRows::Update(values) if existing_start.is_some_and(|start| source_from > start) => {
+            if end == rows {
+                data.update_single_aligned(output, source, source_from, values)
+            } else {
+                data.update_single_aligned_within(output, source, source_from, values)
+            }
+            .expect("an update after the output's first row stays aligned to its source")
         }
-        OutputRows::Update(values) => if end == rows {
-            data.update_single_aligned(output, source, source_from, values)
-        } else {
-            data.update_single_aligned_within(output, source, source_from, values)
+        rewrite => {
+            let mut values = match rewrite {
+                OutputRows::Replace(values) => values,
+                OutputRows::Update(values) => values.to_vec(),
+            };
+            let first = if anchor {
+                0
+            } else {
+                values
+                    .iter()
+                    .position(|value| !value.is_nan())
+                    .unwrap_or(values.len())
+            };
+            if first == values.len() {
+                values.clear();
+            } else {
+                if first > 0 {
+                    // A trimmed output is stored exactly sized, like an untrimmed one, so the
+                    // first live append grows the column once instead of a later tick, once the
+                    // trimmed slack runs out.
+                    values = values[first..].to_vec();
+                }
+                values.resize(rows.saturating_sub(source_from + first), f64::NAN);
+            }
+            let start = (!values.is_empty()).then_some(source_from + first);
+            if !full_rebuild && start.is_none() && existing_start.is_none() {
+                // Still empty: nothing to store, nothing for dependents to redo.
+                return StoredOutput {
+                    from: 0,
+                    replaced: false,
+                    change: None,
+                };
+            }
+            let start_moved = start != existing_start;
+            data.set_single_data_aligned(output, source, start.unwrap_or(rows), values);
+            return StoredOutput {
+                from: 0,
+                replaced: true,
+                change: Some(IndicatorChange {
+                    from: 0,
+                    previous_generation,
+                    full_replace: full_rebuild || start_moved,
+                }),
+            };
         }
-        .expect("indicator output remains aligned to its source"),
     };
     let change = (data.series_generation(output).unwrap_or(0) != previous_generation).then_some(
         IndicatorChange {
             from: output_from,
             previous_generation,
-            full_replace,
+            full_replace: false,
         },
     );
-    (output_from, change)
+    StoredOutput {
+        from: output_from,
+        replaced: false,
+        change,
+    }
 }
 
 /// The output an indicator draws as a momentum-coloured histogram, if any.
@@ -6568,10 +6673,9 @@ mod structure_engine_tests {
                 .iter()
                 .all(|id| chart.series_entry(*id).unwrap().line_type == LineType::WithSteps)
         );
-        let high_values = chart.data.series_data(swings[0]).unwrap().1[3];
-        assert!(high_values[0].is_nan());
-        assert!(high_values[1].is_nan());
-        assert_eq!(high_values[2], 14.0);
+        let (high_times, high_values) = chart.data.series_data(swings[0]).unwrap();
+        assert_eq!(high_times[0], 3);
+        assert_eq!(high_values[3][0], 14.0);
         assert_eq!(
             chart.study_annotations(swings[0]).unwrap().markers()[0].row,
             1
@@ -6756,10 +6860,30 @@ mod structure_engine_tests {
                     "{kind:?}"
                 );
                 for (index, &id) in ids.iter().enumerate() {
-                    let actual = chart.data.series_data(id).unwrap().1[3];
-                    assert_eq!(actual.len(), len);
-                    for (row, (actual, expected)) in
-                        actual.iter().zip(&expected.outputs()[index]).enumerate()
+                    let (actual_times, actual) = chart.data.series_data(id).unwrap();
+                    let anchor = matches!(
+                        kind,
+                        IndicatorKind::MarketStructure { .. }
+                            | IndicatorKind::FairValueGaps { .. }
+                            | IndicatorKind::OrderBlocks { .. }
+                    );
+                    let from = if anchor {
+                        0
+                    } else {
+                        expected.outputs()[index]
+                            .iter()
+                            .position(Option::is_some)
+                            .unwrap_or(len)
+                    };
+                    assert_eq!(
+                        actual_times,
+                        &integer_times[from..],
+                        "{kind:?} output {index}"
+                    );
+                    for (row, (actual, expected)) in actual[3]
+                        .iter()
+                        .zip(&expected.outputs()[index][from..])
+                        .enumerate()
                     {
                         assert!(
                             expected.is_some_and(|value| *actual == value)

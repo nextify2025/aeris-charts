@@ -1,6 +1,6 @@
 //! Chart-local, engine-scheduled custom study definitions and runtimes.
 
-use crate::indicators::{OutputRows, price_input, store_indicator_output};
+use crate::indicators::{AlignedOutput, OutputRows, price_input, store_indicator_output};
 use crate::*;
 use aeris_charts_core::model::data_validation::MAX_SAFE_VALUE;
 
@@ -863,42 +863,28 @@ impl ChartEngine {
                 message,
             });
         }
-        let Some((times, _)) = self.data.series_data(source) else {
-            return changes;
-        };
-        let existing_starts: [usize; aeris_charts_indicators::MAX_OUTPUTS] =
-            std::array::from_fn(|slot| {
-                outputs[slot]
-                    .and_then(|output| self.data.series_data(output))
-                    .and_then(|(output_times, _)| output_times.first().copied())
-                    .and_then(|first| times[..n].binary_search(&first).ok())
-                    .unwrap_or(n)
-            });
+        // Custom outputs start at their first value like built-in ones (custom warm-up and wholly
+        // blank pending or faulted outputs alike): NaN is whitespace, not an input price for a
+        // dependent study.
         for (slot, output) in outputs.iter().flatten().copied().enumerate() {
-            let rewrite = if start <= existing_starts[slot] {
-                // Aligned built-in outputs have no rows before their first value. Keep
-                // custom warm-up and wholly blank pending/faulted outputs identical:
-                // NaN is whitespace, not an input price for a dependent study.
-                let first_value = result[slot]
-                    .iter()
-                    .position(|value| !value.is_nan())
-                    .unwrap_or(result[slot].len());
-                let mut values = std::mem::take(&mut result[slot]);
-                values.drain(..first_value);
-                (start + first_value, OutputRows::Replace(values))
+            let rewrite = if full_replace {
+                OutputRows::Replace(std::mem::take(&mut result[slot]))
             } else {
-                (start, OutputRows::Update(&result[slot]))
+                OutputRows::Update(&result[slot])
             };
-            let (_, change) = store_indicator_output(
+            let stored = store_indicator_output(
                 &mut self.data,
-                source,
-                output,
-                rewrite.0,
-                rewrite.1,
+                AlignedOutput {
+                    source,
+                    output,
+                    anchor: false,
+                },
+                start,
+                rewrite,
                 end,
                 rows,
             );
-            changes[slot] = change.map(|change| (output, change));
+            changes[slot] = stored.change.map(|change| (output, change));
         }
         changes
     }

@@ -832,13 +832,23 @@ fn expected_segments(chart: &ChartEngine, output: SeriesId) -> Vec<Vec<[f32; 2]>
     let hpr = chart.pane_w.round().max(1.0) / chart.pane_w.max(1.0);
     let vpr = chart.pane_h.round().max(1.0) / chart.pane_h.max(1.0);
     let half = chart.time_scale.bar_spacing() * hpr / 2.0;
-    let (_, columns) = chart.data.series_data(output).unwrap();
+    // A study output starts at its first value, so its rows are offset from the source's.
+    let (times, columns) = chart.data.series_data(output).unwrap();
+    let offset = times.first().map_or(0, |first| {
+        chart
+            .data
+            .series_data(0)
+            .unwrap()
+            .0
+            .binary_search(first)
+            .unwrap()
+    });
     columns[3]
         .iter()
         .enumerate()
         .filter(|(_, value)| value.is_finite())
         .map(|(row, &value)| {
-            let x = chart.time_scale.index_to_coordinate(row as i64) * hpr;
+            let x = chart.time_scale.index_to_coordinate((offset + row) as i64) * hpr;
             let y = chart.series_price_to_coordinate(output, value).unwrap() * vpr;
             vec![[(x - half) as f32, y as f32], [(x + half) as f32, y as f32]]
         })

@@ -2,11 +2,22 @@
 
 [文档导航](../README.md) · [架构总览](../Architecture.md) · [API 入口](README.md)
 
+- [空白数据与输出起点](#空白数据与输出起点)
 - [成交量分布](#成交量分布)
 - [指标约定](#指标约定)
 - [广度层指标](#广度层指标)
   - [广度层补全](#广度层补全)
 - [KLineChart 指标](#klinechart-指标)
+
+## 空白数据与输出起点
+
+以下规则对所有内置、自定义与 KLineChart 研究成立（所有者决定 Q-G 与 Q-H；领域契约见[空白与预热](../features/studies.md#空白与预热)）：
+
+- 没有值的源条目（空白数据，例如交易时段网格上没有成交的一分钟）不是样本。在该时间，指标的 `data()` 条目没有 `value`。递归研究（EMA、RSI、MACD、ATR、OBV、VWAP 等）从上一个有效样本继续；窗口研究（SMA、布林带、CCI、Donchian、Momentum、ROC、Stochastic 等）跨越最近 N 个有效条目，因此缺口之后的第一个条目即有值，等于删去缺口后计算出的值。
+- 每个输出的 `data()` 从其第一个有值的时间开始，不包含开头的空白条目；源以空白数据开头时，返回的列表更短。修正若使第一个值提前或改变，整条输出被替换，依赖它的研究随之重建。市场结构、公允价值缺口与订单块的锚定输出例外，覆盖每个源时间。请按 `time` 对齐指标与价格，不要按下标对齐。
+- `indicator_info().warmup_bars` 按无缺口的源度量；源以空白数据开头时第一个值会更晚出现。
+- Klinger 把价格有效但成交量为空的柱按零成交量计入：它不贡献力量，也不重启三条 EMA，与 OBV 及其他成交量研究对缺失成交量的处理一致。
+- Rust 的纯计算函数（`aeris_charts_indicators::sma` 等）在含 NaN 或 ±∞ 的输入上遵循同一规则，返回与图表相同的值。只接收成交量列的函数（`relative_volume`、`volume_oscillator`）无法区分空白柱与没有成交量的柱，把非有限的成交量视为空白行，与图表在空白槽位上的值相同。
 
 ## 成交量分布
 
@@ -175,7 +186,7 @@ AO、PVT、TRIX 与 EMV 同时存在内置研究和同名的 KLineChart 模板�
 
 `indicator_kind` 相应新增 `kst`、`tsi`、`mass_index`、`vortex`、`klinger`、`kama`、`mcginley`、`linear_regression`、`choppiness` 与 `atr_bands`。`indicator_info().parameters` 新增 `multiplier`（ATR 带）、`roc` 与 `smoothing_periods`（KST）、`ema_period` 与 `sum_period`（Mass Index），对不使用它们的种类为 `null`；KST、TSI 与 Klinger 的信号周期报告在 `signal`，TSI 的长短周期报告在 `long_period` 与 `short_period`，Klinger 与 KAMA 的快慢周期报告在 `fast` 与 `slow`。
 
-这些研究同样把空白数据行视为不存在（上游在空白数据之后重新预热，本仓库不同）。Klinger 与 McGinley 的 `convergence_bars` 为 `null`。TSI、Klinger、Mass Index 与 KAMA 以 SMA 起始，McGinley 以第一个收盘价起始；它们没有 `seed` 参数，`{ convention: "china" }` 不适用。Chop Zone 是 Choppiness 输出上的 38.2/61.8 阈值，目前没有绘制阈值区域。线性回归指标是滚动端点序列，与在两个锚点之间做一次拟合的 `regression_trend` 绘图不同；二者都使用残差的总体标准差。公式与空白数据处理详见[广度层补全](../architecture/data/indicators.md#广度层补全)。
+这些研究同样把空白数据行视为不存在。TSI、KAMA、Klinger、McGinley、Mass Index 与 ATR 带从最后一个有效样本继续，与上游相同；KST、线性回归、Choppiness 与 Vortex 的窗口跨越最近 N 个有效行，上游则在缺口仍位于窗口内时让它们保持空白，本仓库不采用（参见[与上游空白规则的对照](../architecture/data/indicators.md#广度层指标)）。Klinger 与 McGinley 的 `convergence_bars` 为 `null`。TSI、Klinger、Mass Index 与 KAMA 以 SMA 起始，McGinley 以第一个收盘价起始；它们没有 `seed` 参数，`{ convention: "china" }` 不适用。Chop Zone 是 Choppiness 输出上的 38.2/61.8 阈值，目前没有绘制阈值区域。线性回归指标是滚动端点序列，与在两个锚点之间做一次拟合的 `regression_trend` 绘图不同；二者都使用残差的总体标准差。公式与空白数据处理详见[广度层补全](../architecture/data/indicators.md#广度层补全)。
 
 ## 结构与时段研究
 

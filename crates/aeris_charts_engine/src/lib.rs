@@ -5851,6 +5851,17 @@ impl ChartEngine {
                 ) as u8;
                 self.tick_marks.push_weight(index as i64, weight);
             }
+            // The first point is weighed from the average cadence, which telescopes to
+            // (last - first) / (len - 1): an append revises it in O(1) while every other weight
+            // keeps its value. `appended` implies `tick_len > 1`.
+            self.tick_marks
+                .set_first_weight(time_tick_marks::first_point_weight_shifted_in(
+                    tick_time(0),
+                    tick_time(tick_len - 1) - tick_time(0),
+                    tick_len,
+                    label_shift,
+                    &self.exchange_time,
+                ));
         } else if let Some(dropped) = front_trim {
             // A retention trim on a time axis (and the points a tip appended with it): the
             // surviving points keep their timestamps and so their weights. Only the first point,

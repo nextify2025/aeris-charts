@@ -2,14 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<!-- Without this, mobile browsers lay the page out at a 980px virtual width and then
-     scale it down to the device, squishing the UI and adding a fractional CSS scale on top
-     of the canvas bitmap. user-scalable=no stops native pinch-zoom fighting the chart. -->
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<!-- Match the device width without disabling browser zoom; chart gestures use the chart's touch handlers. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Aeris Charts — aeris-charts demo</title>
 <link rel="stylesheet" href="./dist/aeris_charts.css" />
 <link rel="stylesheet" href="./general_dashboard.css" />
 <style>
+  :root {
+    --demo-accent-text: var(--primary-active);
+    --demo-bullish-text: #067a67;
+    --demo-bearish-text: #d6303e;
+  }
+  [data-theme="dark"] {
+    --demo-accent-text: color-mix(in srgb, var(--primary) 80%, #fff);
+    --demo-bullish-text: var(--bullish);
+    --demo-bearish-text: var(--bearish);
+  }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; overflow: hidden; background: var(--surface); }
   html { -webkit-font-smoothing: antialiased; }
@@ -28,16 +36,17 @@
   .brand-mark svg { width: 20px; height: 20px; }
   .brand-copy { display: grid; line-height: 1.25; }
   .brand { font-size: 13px; font-weight: 650; }
+  .mobile-heading { display: none; }
   .lab-title { margin-top: 2px; color: var(--text-secondary); font-size: 11px; }
   #demo_mode_switch { display: flex; gap: 2px; padding: 3px; background: var(--surface-secondary); border: var(--border-width) solid var(--border); border-radius: 9px; }
   #demo_mode_switch button, #demo_mode_switch a { display: inline-grid; place-items: center; height: 32px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text-secondary); font-size: 11px; font-weight: 600; text-decoration: none; }
   #demo_mode_switch button:hover, #demo_mode_switch a:hover { background: var(--hover-bg); color: var(--text-primary); }
-  #demo_mode_switch button[aria-pressed="true"] { background: var(--surface); color: var(--primary); box-shadow: 0 0 0 var(--border-width) var(--border-secondary); }
+  #demo_mode_switch button[aria-pressed="true"] { background: var(--surface); color: var(--demo-accent-text); box-shadow: 0 0 0 var(--border-width) var(--border-secondary); }
   .market-summary { display: flex; align-items: center; gap: 10px; min-width: 0; padding-left: 16px; border-left: var(--border-width) solid var(--border); }
   .market-symbol { font-size: 13px; font-weight: 600; white-space: nowrap; }
   .market-meta { color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
-  .market-price { min-width: 48px; color: var(--bullish); font-weight: 600; font-variant-numeric: tabular-nums; }
-  .market-price[data-direction="down"] { color: var(--bearish); }
+  .market-price { min-width: 48px; color: var(--demo-bullish-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .market-price[data-direction="down"] { color: var(--demo-bearish-text); }
   #comparison_controls { display: flex; gap: 6px; align-items: center; margin-left: auto; }
   #comparison_controls select, #comparison_controls button { height: 40px; color: var(--text-primary); background: var(--surface-secondary); border: var(--border-width) solid var(--border-secondary); border-radius: var(--radius-button); }
   #comparison_controls select { max-width: 148px; padding: 0 8px; font-size: 12px; }
@@ -71,7 +80,7 @@
   [data-demo-mode="general"] #inspector_toggle { display: none; }
   #tool_rail { z-index: 12; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 8px; background: var(--surface); border-right: var(--border-width) solid var(--border); }
   #tool_rail button { width: 60px; min-height: 56px; gap: 4px; padding: 8px 2px; border-radius: var(--radius-default); font-size: 10px; }
-  #tool_rail button[aria-current="true"] { color: var(--primary); background: color-mix(in srgb, var(--primary) 10%, transparent); border-color: color-mix(in srgb, var(--primary) 25%, transparent); }
+  #tool_rail button[aria-current="true"] { color: var(--demo-accent-text); background: color-mix(in srgb, var(--primary) 10%, transparent); border-color: color-mix(in srgb, var(--primary) 25%, transparent); }
   #tool_rail .rail-spacer { flex: 1; }
   #inspector { z-index: 11; display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; background: var(--surface); border-left: var(--border-width) solid var(--border); }
   #inspector[data-open="false"] { display: none; }
@@ -107,7 +116,7 @@
   #feature_search { width: 100%; padding: 8px 12px 8px 38px; }
   #feature_filters { display: flex; gap: 4px; width: 100%; margin: 12px 0 16px; padding: 4px; background: var(--surface-secondary); border-radius: 10px; }
   #feature_filters button { flex: 1; min-width: 0; padding: 6px; font-size: 11px; border-color: transparent; background: transparent; }
-  #feature_filters button[aria-pressed="true"] { color: var(--primary); background: var(--surface); border-color: var(--border-secondary); }
+  #feature_filters button[aria-pressed="true"] { color: var(--demo-accent-text); background: var(--surface); border-color: var(--border-secondary); }
   .scenario-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; width: 100%; }
   .scenario-grid .feature-card { display: grid; grid-template-columns: 32px minmax(0, 1fr); grid-template-rows: auto auto; gap: 3px 12px; min-height: 64px; padding: 10px 8px; text-align: left; background: transparent; border-color: transparent; border-radius: var(--radius-default); }
   .scenario-grid .feature-card:hover { background: var(--hover-bg); }
@@ -116,7 +125,7 @@
   .feature-card strong { font-size: 13px; font-weight: 600; white-space: normal; }
   .feature-card small { color: var(--text-secondary); font-size: 11px; line-height: 1.4; white-space: normal; text-wrap: pretty; }
   .scenario-grid .feature-card[aria-pressed="true"] { border-color: color-mix(in srgb, var(--primary) 40%, transparent); background: color-mix(in srgb, var(--primary) 10%, var(--surface)); }
-  .scenario-grid .feature-card[aria-pressed="true"] .feature-icon { color: var(--primary); }
+  .scenario-grid .feature-card[aria-pressed="true"] .feature-icon { color: var(--demo-accent-text); }
   .scenario-grid .feature-card[hidden] { display: none; }
   #feature_empty { display: none; padding: 24px 8px; color: var(--text-secondary); font-size: 12px; text-align: center; }
   #feature_empty[data-visible="true"] { display: block; }
@@ -154,6 +163,7 @@
     #mobile_backdrop[data-open="true"] { display: block; }
     .brand-lockup { min-width: auto; margin-right: auto; }
     .brand-copy { display: none; }
+    html:not([data-demo-mode="general"]) .mobile-heading { display: block; margin: 0 auto 0 0; font-size: 16px; font-weight: 650; }
     #comparison_controls select { max-width: 120px; }
     #comparison_controls select, #comparison_controls button { height: 44px; }
   }
@@ -176,17 +186,18 @@
         <span class="brand-mark" aria-hidden="true"><span data-icon="activity"></span></span>
         <span class="brand-copy"><span class="brand">Aeris Charts</span><span class="lab-title">Market lab</span></span>
       </div>
+      <h1 class="mobile-heading">Aeris Charts</h1>
       <nav id="demo_mode_switch" aria-label="Demo workspace">
         <button id="demo_mode_financial" type="button" aria-pressed="true">Financial</button>
         <button id="demo_mode_general" type="button" aria-pressed="false">General</button>
         <a id="demo_mode_intraday" href="./intraday.html" title="A-share time-sharing (分时) chart">Intraday</a>
       </nav>
-      <div class="market-summary" aria-label="Demo instrument">
+      <div class="market-summary" role="group" aria-label="Demo instrument">
         <span class="market-symbol">NCL · 1H</span>
         <span class="market-price" id="market_price">—</span>
         <span class="market-meta">Synthetic market · 1,000 bars</span>
       </div>
-      <div id="comparison_controls" aria-label="Comparison series controls">
+      <div id="comparison_controls" role="group" aria-label="Comparison series controls">
         <select id="comparison_symbol" aria-label="Comparison symbol">
           <option value="MOON">MOON · candles</option>
           <option value="ORBIT">ORBIT · candles</option>
@@ -235,7 +246,7 @@
         </label>
       </div>
 
-    <div id="controls_strip" aria-label="Chart training controls">
+    <div id="controls_strip" role="region" aria-label="Chart training controls">
 
     <section class="group" id="feature_lab_group" data-caption="Feature lab">
       <h2>Feature lab</h2>
@@ -262,7 +273,7 @@
       <label><input type="radio" name="series" value="histogram"> histogram</label>
       <label><input type="radio" name="series" value="baseline"> baseline</label>
       <p class="feature-lab-intro">Advanced engine-owned series</p>
-      <div id="series_grid" class="scenario-grid" aria-label="Advanced series"></div>
+      <div id="series_grid" class="scenario-grid" role="group" aria-label="Advanced series"></div>
     </div>
 
     <!-- candle/bar colors: body, wick, and border per direction + part visibility -->
@@ -605,7 +616,7 @@
         <div class="general-metric"><strong id="general_metric_ready">0</strong><span>live charts active</span></div>
       </section>
       <div class="general-error" id="general_dashboard_error" role="alert"></div>
-      <div class="general-toolbar" aria-label="General chart filters">
+      <div class="general-toolbar" role="group" aria-label="General chart filters">
         <span>Show</span>
         <button type="button" data-general-filter="all" aria-pressed="true">All</button>
         <button type="button" data-general-filter="trend" aria-pressed="false">Trends</button>

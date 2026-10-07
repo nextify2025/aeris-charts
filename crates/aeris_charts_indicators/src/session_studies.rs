@@ -160,7 +160,11 @@ impl Runtime {
         };
         if self.active_key != Some(key) {
             if self.active_key.is_some() {
-                self.previous = self.aggregate.take();
+                // A wholly blank period has no levels to publish. Keep the
+                // last observed period until another contributes valid bars.
+                if let Some(aggregate) = self.aggregate.take() {
+                    self.previous = Some(aggregate);
+                }
             }
             self.active_key = Some(key);
             self.aggregate = None;

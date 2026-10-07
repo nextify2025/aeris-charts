@@ -439,6 +439,199 @@ fn blank_boundary_row_does_not_replace_completed_period() {
 }
 
 #[test]
+fn entirely_blank_period_carries_last_observed_previous_levels() {
+    const DAY: i64 = 86_400;
+    for (period, days) in [
+        (PreviousPeriod::Day, [0, 1, 2]),
+        (PreviousPeriod::Week, [4, 11, 18]),
+        (PreviousPeriod::Month, [0, 31, 59]),
+    ] {
+        let times = [
+            days[0] * DAY,
+            days[1] * DAY,
+            days[1] * DAY + 60,
+            days[1] * DAY + 120,
+            days[2] * DAY,
+            days[2] * DAY + 60,
+        ];
+        let highs = [10., f64::NAN, f64::NAN, f64::NAN, 20., 21.];
+        let lows = [5., f64::NAN, f64::NAN, f64::NAN, 8., 7.];
+        let closes = [7., f64::NAN, f64::NAN, f64::NAN, 15., 16.];
+        let bars = input(&times, &highs, &lows, &closes);
+        let kind = SessionStudy::PreviousPeriodLevels(period);
+        let expected = [
+            SessionStudyPoint::default(),
+            SessionStudyPoint::default(),
+            SessionStudyPoint::default(),
+            SessionStudyPoint::default(),
+            point(10., 5., Some(7.)),
+            point(10., 5., Some(7.)),
+        ];
+        let valid = [0, 4, 5];
+        let missing_times = valid.map(|row| times[row]);
+        let missing_highs = valid.map(|row| highs[row]);
+        let missing_lows = valid.map(|row| lows[row]);
+        let missing_closes = valid.map(|row| closes[row]);
+        let missing = input(
+            &missing_times,
+            &missing_highs,
+            &missing_lows,
+            &missing_closes,
+        );
+        let dense = session_study(bars, SessionSource::Utc, kind);
+        let missing_dense = session_study(missing, SessionSource::Utc, kind);
+        assert_eq!(dense, expected, "{period:?}");
+        assert_eq!(
+            valid.map(|row| dense[row]),
+            missing_dense.as_slice(),
+            "dense blank vs missing {period:?}"
+        );
+        let mut state = SessionStudyState::new(kind);
+        let mut missing_state = SessionStudyState::new(kind);
+        for end in 1..=times.len() {
+            state.update(
+                input(&times[..end], &highs[..end], &lows[..end], &closes[..end]),
+                SessionSource::Utc,
+                end - 1,
+            );
+            let missing_end = valid.iter().filter(|&&row| row < end).count();
+            missing_state.update(
+                input(
+                    &missing_times[..missing_end],
+                    &missing_highs[..missing_end],
+                    &missing_lows[..missing_end],
+                    &missing_closes[..missing_end],
+                ),
+                SessionSource::Utc,
+                missing_end.saturating_sub(1),
+            );
+            assert_eq!(state.outputs(), &expected[..end], "append {end} {period:?}");
+            let observed: Vec<_> = valid
+                .iter()
+                .copied()
+                .filter(|&row| row < end)
+                .map(|row| state.outputs()[row])
+                .collect();
+            assert_eq!(
+                observed,
+                missing_state.outputs(),
+                "incremental blank vs missing {period:?} at {end}"
+            );
+        }
+    }
+}
+
+#[test]
+fn host_blank_session_and_historical_repair_preserve_period_semantics() {
+    const DAY: i64 = 86_400;
+    let spans = [0, 1, 2].map(|day| SessionSpan {
+        start: day * DAY,
+        end: (day + 1) * DAY,
+        session_id: day as u64,
+    });
+    let times = [0, DAY, DAY + 1, DAY + 2, 2 * DAY];
+    let mut highs = [10., f64::NAN, f64::NAN, f64::NAN, 20.];
+    let mut lows = [5., f64::NAN, f64::NAN, f64::NAN, 8.];
+    let mut closes = [7., f64::NAN, f64::NAN, f64::NAN, 15.];
+    let source = SessionSource::Host(&spans);
+    let missing_spans = [spans[0], spans[2]];
+    let missing_times = [times[0], times[4]];
+    let missing_highs = [highs[0], highs[4]];
+    let missing_lows = [lows[0], lows[4]];
+    let missing_closes = [closes[0], closes[4]];
+    let missing = input(
+        &missing_times,
+        &missing_highs,
+        &missing_lows,
+        &missing_closes,
+    );
+    let missing_source = SessionSource::Host(&missing_spans);
+    for kind in [
+        SessionStudy::SessionLevels,
+        SessionStudy::OpeningRange {
+            duration_seconds: 60,
+        },
+        SessionStudy::PreviousPeriodLevels(PreviousPeriod::Day),
+    ] {
+        let mut state = SessionStudyState::new(kind);
+        let expected = match kind {
+            SessionStudy::PreviousPeriodLevels(_) => [
+                SessionStudyPoint::default(),
+                SessionStudyPoint::default(),
+                SessionStudyPoint::default(),
+                SessionStudyPoint::default(),
+                point(10., 5., Some(7.)),
+            ],
+            _ => [
+                point(10., 5., None),
+                SessionStudyPoint::default(),
+                SessionStudyPoint::default(),
+                SessionStudyPoint::default(),
+                point(20., 8., None),
+            ],
+        };
+        let bars = input(&times, &highs, &lows, &closes);
+        let dense = session_study(bars, source, kind);
+        assert_eq!(dense, expected, "{kind:?}");
+        assert_eq!(
+            [dense[0], dense[4]],
+            session_study(missing, missing_source, kind).as_slice(),
+            "dense blank vs missing host session {kind:?}"
+        );
+        let mut missing_state = SessionStudyState::new(kind);
+        for end in 1..=times.len() {
+            state.update(
+                input(&times[..end], &highs[..end], &lows[..end], &closes[..end]),
+                source,
+                end - 1,
+            );
+            let missing_end = usize::from(end > 0) + usize::from(end > 4);
+            missing_state.update(
+                input(
+                    &missing_times[..missing_end],
+                    &missing_highs[..missing_end],
+                    &missing_lows[..missing_end],
+                    &missing_closes[..missing_end],
+                ),
+                missing_source,
+                missing_end.saturating_sub(1),
+            );
+        }
+        assert_eq!(state.outputs(), expected, "initial {kind:?}");
+        assert_eq!(
+            [state.outputs()[0], state.outputs()[4]],
+            missing_state.outputs(),
+            "incremental blank vs missing host session {kind:?}"
+        );
+
+        highs[1] = 12.;
+        lows[1] = 4.;
+        closes[1] = 9.;
+        let bars = input(&times, &highs, &lows, &closes);
+        state.update(bars, source, 1);
+        assert_eq!(
+            state.outputs(),
+            session_study(bars, source, kind),
+            "repair {kind:?}"
+        );
+        if matches!(kind, SessionStudy::PreviousPeriodLevels(_)) {
+            assert_eq!(state.outputs()[4], point(12., 4., Some(9.)));
+        }
+        highs[1] = f64::NAN;
+        lows[1] = f64::NAN;
+        closes[1] = f64::NAN;
+        let bars = input(&times, &highs, &lows, &closes);
+        state.update(bars, source, 1);
+        assert_eq!(state.outputs(), expected, "blank repair {kind:?}");
+        assert_eq!(
+            [state.outputs()[0], state.outputs()[4]],
+            missing_state.outputs(),
+            "repaired blank vs missing host session {kind:?}"
+        );
+    }
+}
+
+#[test]
 fn whitespace_prefixes_and_tip_corrections_recompute_without_lookahead() {
     let times = [0, 20, 40, 86_400, 86_420];
     let highs = [10., f64::NAN, 12., 15., 16.];

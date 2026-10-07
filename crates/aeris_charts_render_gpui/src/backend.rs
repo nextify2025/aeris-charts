@@ -370,7 +370,7 @@ impl ShapedTextCache {
 /// resource once per immutable image/opacity pair.
 #[derive(Default)]
 pub(crate) struct RasterImageCache {
-    entries: HashMap<(u64, u32), (Arc<RenderImage>, u64)>,
+    entries: HashMap<(u64, u8), (Arc<RenderImage>, u64)>,
     tick: u64,
 }
 
@@ -380,6 +380,11 @@ impl RasterImageCache {
         source: &aeris_charts_render::draw_list::RasterImage,
         opacity: f32,
     ) -> Option<Arc<RenderImage>> {
+        let opacity = aeris_charts_render::draw_list::quantize_image_opacity(opacity);
+        let alpha = (opacity * 255.0).round() as u8;
+        if alpha == 0 {
+            return None;
+        }
         let expected_len = usize::try_from(source.width)
             .ok()?
             .checked_mul(usize::try_from(source.height).ok()?)?
@@ -388,7 +393,7 @@ impl RasterImageCache {
             return None;
         }
         self.tick = self.tick.wrapping_add(1);
-        let key = (source.key, opacity.to_bits());
+        let key = (source.key, alpha);
         if let Some((image, stamp)) = self.entries.get_mut(&key) {
             *stamp = self.tick;
             return Some(Arc::clone(image));
@@ -404,8 +409,7 @@ impl RasterImageCache {
                 pixels[dst] = source.pixels[src + 2];
                 pixels[dst + 1] = source.pixels[src + 1];
                 pixels[dst + 2] = source.pixels[src];
-                pixels[dst + 3] =
-                    (f32::from(source.pixels[src + 3]) * opacity.clamp(0.0, 1.0)).round() as u8;
+                pixels[dst + 3] = (f32::from(source.pixels[src + 3]) * opacity).round() as u8;
             }
             let row = (y + 1) * row_bytes;
             pixels.copy_within(row + 4..row + 8, row);
@@ -1193,6 +1197,29 @@ mod tests {
                 .all(|row| row == expected_row)
         );
         assert_eq!(source.pixels.as_ref(), &[255, 0, 0, 255, 0, 0, 255, 128]);
+    }
+
+    #[test]
+    fn raster_image_cache_skips_zero_alpha_and_reuses_the_quantized_byte_key() {
+        let source = aeris_charts_render::draw_list::RasterImage {
+            key: 2,
+            width: 1,
+            height: 1,
+            pixels: Arc::from([255, 0, 0, 255]),
+        };
+        let mut cache = RasterImageCache::default();
+        for opacity in [-0.1, 0.0, 0.001] {
+            assert!(cache.resolve(&source, opacity).is_none());
+            assert!(cache.entries.is_empty());
+        }
+        let first = cache.resolve(&source, 0.72).unwrap();
+        let same_byte = cache.resolve(&source, 184.0 / 255.0).unwrap();
+        assert!(Arc::ptr_eq(&first, &same_byte));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&(source.key, 184)));
+        assert_eq!(first.as_bytes(0).unwrap()[3], 184);
+        assert!(cache.resolve(&source, 1.0 / 255.0).is_some());
+        assert_eq!(cache.entries.len(), 2);
     }
 
     #[test]

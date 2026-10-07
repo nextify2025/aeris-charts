@@ -396,6 +396,10 @@ fn lower_prim(
             rect,
             opacity,
         } => {
+            let opacity = aeris_charts_render::draw_list::quantize_image_opacity(*opacity);
+            if opacity == 0.0 {
+                return;
+            }
             let Some(rect) = aeris_charts_render::draw_list::snap_image_rect(*rect) else {
                 return;
             };
@@ -403,7 +407,6 @@ fn lower_prim(
             if rect.is_empty()
                 || image.width == 0
                 || image.height == 0
-                || *opacity <= 0.0
                 || image.pixels.len() != (image.width * image.height * 4) as usize
             {
                 return;
@@ -411,7 +414,7 @@ fn lower_prim(
             plan.ops.push(SceneOp::Image {
                 image: image.clone(),
                 rect,
-                opacity: opacity.clamp(0.0, 1.0),
+                opacity,
             });
             metrics.image_runs += 1;
             metrics.ops += 1;
@@ -1245,7 +1248,39 @@ mod tests {
         };
         assert_eq!(image.key, 9);
         assert_eq!(*rect, DeviceRect::new(10.0, 20.0, 30.0, 40.0));
-        assert_eq!(*opacity, 0.25);
+        assert_eq!(*opacity, 64.0 / 255.0);
+    }
+
+    #[test]
+    fn image_with_zero_quantized_opacity_never_enters_the_gpui_scene() {
+        let image = RasterImage {
+            key: 10,
+            width: 1,
+            height: 1,
+            pixels: Arc::<[u8]>::from([1, 2, 3, 255]),
+        };
+        for opacity in [-1.0, 0.0, 0.001] {
+            let (plan, metrics) = run(
+                &[Prim::Image {
+                    image: image.clone(),
+                    rect: [10.0, 20.0, 30.0, 40.0],
+                    opacity,
+                }],
+                &[],
+            );
+            assert!(plan.ops.is_empty(), "{opacity}");
+            assert_eq!(metrics.image_runs, 0);
+        }
+        let (plan, metrics) = run(
+            &[Prim::Image {
+                image,
+                rect: [10.0, 20.0, 30.0, 40.0],
+                opacity: 1.0 / 255.0,
+            }],
+            &[],
+        );
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(metrics.image_runs, 1);
     }
 
     #[test]

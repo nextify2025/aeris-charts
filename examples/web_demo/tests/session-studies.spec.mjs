@@ -32,6 +32,7 @@ test("session studies expose UTC and host-boundary values with choice schemas", 
       kind: output.indicator_info().kind,
       parameters: output.indicator_info().parameters,
       values: output.data().map(({ value }) => value ?? null),
+      times: output.data().map(({ time }) => time),
     }));
     const schemas = ["session_levels", "previous_period_levels", "opening_range"]
       .map((kind) => chart.indicator_schema(kind));
@@ -43,12 +44,16 @@ test("session studies expose UTC and host-boundary values with choice schemas", 
     chart.remove_series(source);
     return snapshot;
   });
+  const start = Date.UTC(2024, 0, 1) / 1000;
   expect(result.utc.session.map(({ values }) => values)).toEqual([
     [10, 15, 15, 20, 25], [8, 7, 7, 18, 17],
   ]);
   expect(result.utc.previous.map(({ values }) => values)).toEqual([
-    [null, null, null, 15, 15], [null, null, null, 7, 7], [null, null, null, 12, 12],
+    [15, 15], [7, 7], [12, 12],
   ]);
+  expect(result.utc.previous.map(({ times }) => times)).toEqual(
+    Array.from({ length: 3 }, () => [start + 86400, start + 87000]),
+  );
   expect(result.utc.opening.map(({ values }) => values)).toEqual([
     [10, 15, 15, 20, 25], [8, 7, 7, 18, 17], [9, 11, 11, 19, 21],
   ]);
@@ -56,8 +61,11 @@ test("session studies expose UTC and host-boundary values with choice schemas", 
     [10, 15, 13, 20, 25], [8, 7, 9, 9, 9],
   ]);
   expect(result.host.previous.map(({ values }) => values)).toEqual([
-    [null, null, 15, 15, 15], [null, null, 7, 7, 7], [null, null, 14, 14, 14],
+    [15, 15, 15], [7, 7, 7], [14, 14, 14],
   ]);
+  expect(result.host.previous.map(({ times }) => times)).toEqual(
+    Array.from({ length: 3 }, () => [start + 1200, start + 86400, start + 87000]),
+  );
   expect(result.host.opening.map(({ values }) => values)).toEqual([
     [10, 15, 13, 13, 13], [8, 7, 9, 9, 9], [9, 11, 11, 11, 11],
   ]);

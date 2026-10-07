@@ -112,6 +112,16 @@ pub fn snap_image_rect([x, y, width, height]: [f32; 4]) -> Option<[f32; 4]> {
     (right > left && bottom > top).then_some([left, top, right - left, bottom - top])
 }
 
+/// Image alpha is one rounded byte on every executor, including float-alpha backends.
+/// Non-finite input has no meaningful coverage and is treated as transparent.
+#[inline]
+pub fn quantize_image_opacity(opacity: f32) -> f32 {
+    if !opacity.is_finite() {
+        return 0.0;
+    }
+    (opacity.clamp(0.0, 1.0) * 255.0).round() / 255.0
+}
+
 /// Convert straight RGBA8 to premultiplied RGBA8 before bilinear filtering.
 pub fn premultiply_rgba8(pixels: &mut [u8]) {
     debug_assert_eq!(pixels.len() % 4, 0);
@@ -278,8 +288,9 @@ pub enum Prim {
     },
     /// Straight-alpha RGBA8 image scaled into `rect` in bitmap pixels. Executors snap each
     /// destination edge to a device pixel with [`snap_image_rect`] and sample with bilinear
-    /// filtering. Opacity multiplies source alpha before source-over blending. Resource decoding
-    /// belongs to the host boundary; placement and rendering remain in the shared frame.
+    /// filtering. Every executor first applies [`quantize_image_opacity`], skips images with
+    /// zero quantized opacity, then multiplies source alpha before source-over blending.
+    /// Resource decoding belongs to the host boundary; placement remains in the shared frame.
     Image {
         image: RasterImage,
         rect: [f32; 4],
@@ -327,7 +338,7 @@ pub struct DrawList {
 
 #[cfg(test)]
 mod tests {
-    use super::{premultiply_rgba8, segment_points, snap_image_rect};
+    use super::{premultiply_rgba8, quantize_image_opacity, segment_points, snap_image_rect};
 
     #[test]
     fn segment_window_is_bounded_by_the_pool() {
@@ -350,6 +361,23 @@ mod tests {
             None,
             "no wrap on the pair count"
         );
+    }
+
+    #[test]
+    fn image_opacity_uses_one_rounded_byte_for_every_executor() {
+        assert_eq!(quantize_image_opacity(0.72), 184.0 / 255.0);
+        for (input, expected) in [
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (-0.5, 0.0),
+            (1.5, 1.0),
+            (0.001, 0.0),
+            (1.0 / 255.0, 1.0 / 255.0),
+        ] {
+            assert_eq!(quantize_image_opacity(input), expected, "{input}");
+        }
+        assert_eq!(quantize_image_opacity(f32::NAN), 0.0);
+        assert_eq!(quantize_image_opacity(f32::INFINITY), 0.0);
     }
 
     #[test]

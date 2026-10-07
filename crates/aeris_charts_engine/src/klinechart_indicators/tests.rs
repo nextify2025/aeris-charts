@@ -198,7 +198,8 @@ fn bind(fixture: &mut Fixture, indicator: &Indicator) -> (SeriesId, Vec<SeriesId
     (source, outputs)
 }
 
-/// Every bar or dot output's per-row colors equal a fresh coloring of the current values.
+/// Every bar or dot output's per-row colors equal a fresh coloring of the current values. Each
+/// output row finds its source bar by time, independently of how the output was trimmed.
 fn assert_colors_match_full(chart: &ChartEngine, binding_index: usize) {
     let binding = &chart.indicators[binding_index];
     let IndicatorKind::KLineChart(indicator) = &binding.kind else {
@@ -208,12 +209,13 @@ fn assert_colors_match_full(chart: &ChartEngine, binding_index: usize) {
         let Some(rule) = klinechart_color_rule(indicator, output_index) else {
             continue;
         };
-        let (_, values) = chart.data.series_data(output).unwrap();
+        let (times, values) = chart.data.series_data(output).unwrap();
         let values = values[3];
-        let (_, bars) = chart.data.series_data(binding.source).unwrap();
-        let offset = bars[3].len() - values.len();
+        let (source_times, bars) = chart.data.series_data(binding.source).unwrap();
         for row in 0..values.len() {
-            let source_row = offset + row;
+            let source_row = source_times
+                .binary_search(&times[row])
+                .unwrap_or_else(|_| panic!("output row {row} has a source bar"));
             let expected = rule.color(
                 values[row],
                 row.checked_sub(1).map(|previous| values[previous]),
@@ -250,6 +252,57 @@ fn bar(source: SeriesId, fixture: &Fixture, values: [f64; 4]) -> [f64; 4] {
         [values[3] * 1_000.0; 4]
     } else {
         values
+    }
+}
+
+#[test]
+fn colored_outputs_start_after_leading_whitespace_and_follow_repairs_before_their_start() {
+    // Q-H trims every output to its first value, so a histogram or dot output over a source with
+    // leading whitespace starts later than the source; its colours start with it.
+    const COLOR_ROWS: usize = 60;
+    for indicator in short_indicators()
+        .into_iter()
+        .filter(|indicator| matches!(indicator.name(), "MACD" | "VOL" | "SAR" | "AO"))
+    {
+        let label = label_of(&indicator);
+        let mut data = Data::generate(COLOR_ROWS, &[0, 1, 2, 20]);
+        let mut fixture = install(&data, &(0..COLOR_ROWS).collect::<Vec<_>>());
+        let (_, outputs) = bind(&mut fixture, &indicator);
+        let binding = fixture.chart.indicators.len() - 1;
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, leading whitespace"));
+        let first_time = |fixture: &Fixture| {
+            outputs
+                .iter()
+                .map(|&output| fixture.chart.data.series_data(output).unwrap().0[0])
+                .min()
+                .unwrap()
+        };
+        assert!(
+            first_time(&fixture) >= 3 * HOUR as i64,
+            "{label}: no output row before the first bar"
+        );
+
+        // Repairs before the first value move every output's start earlier, then later.
+        let real = Data::generate(COLOR_ROWS, &[]);
+        for (row, step) in [(2, "row 2 filled"), (0, "row 0 filled")] {
+            data.candles[row] = real.candles[row];
+            data.volumes[row] = real.volumes[row];
+            data.turnovers[row] = real.turnovers[row];
+            feed(&mut fixture, &data, row);
+            assert_matches_fresh_bind(&fixture, binding, &format!("{label}, {step}"));
+        }
+        data.blank(0);
+        feed(&mut fixture, &data, 0);
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, row 0 blanked"));
+
+        // Live ticks after the repairs.
+        data.push_generated(COLOR_ROWS);
+        feed(&mut fixture, &data, COLOR_ROWS);
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, append"));
+        data.candles[COLOR_ROWS] = [101.0, 103.0, 99.5, 102.5];
+        data.turnovers[COLOR_ROWS] = data.volumes[COLOR_ROWS] * 102.5;
+        feed(&mut fixture, &data, COLOR_ROWS);
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, tick"));
     }
 }
 

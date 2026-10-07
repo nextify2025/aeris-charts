@@ -259,6 +259,14 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - `ea789aa fix(volume): tint up/down volume from the footprint over a whitespace primary`：主系列为空白数据时，`histogram_updown` 成交量从同一窗格中的足迹图读取方向。合并时的自有线调整：沿用成交量系列的 `histogram_updown_rule`、颜色与实时柱缓动。
 - `2277a4a feat(footprint): replace only the span a rewritten tape window covers`：新增 `ChartEngine::replace_order_flow_window`，安装宿主改写后的窗口而不丢弃更早的历史；用 `update_order_flow_presentation(.., append: false)` 重载窗口的宿主会丢弃封存历史，应改用它。
 
+**指标缺口契约、输出起点、首个刻度权重与图像不透明度**（上游，来自 `0da249d`、`0a71a12`、`0dcca70`、`606e2ce`、`3835fee`、`b75ec25`、`7df2305`、`5bc6ee2`、`dadaa4b`、`c45498a`、`1ba0f04`、`ef97955`、`4cfea16` 与 `85bc10b`，经合并 `85bc10b` 的提交引入；所有者决定 Q-G 与 Q-H；参见[指标计算与绑定](../architecture/data/indicators.md#广度层补全)与[空白与预热](../features/studies.md#空白与预热)）。下一次 Aeris Terminal 更换固定修订时需要评审：
+
+- `0dcca70 fix(indicators): align built-in and custom leading whitespace`，行为变更：每个标量指标输出（内置、结构、时段、自定义与 KLineChart）都从其第一个值开始，不再包含开头的空白行；源以空白数据开头时 `DataLayer::series_data(output)` 的时间更短、起点更晚。市场结构、公允价值缺口与订单块的锚定输出仍覆盖每个源时间。按行号把指标输出与源对齐的 Rust 宿主需要改为按时间对齐。合并时的自有线调整：在引擎的输出写入函数 `store_indicator_output` 中实现，不切片运行时输入。
+- `0da249d`、`0a71a12`、`c45498a`、`1ba0f04`、`ef97955` 与 `4cfea16`（指标缺口规则），行为变更：`aeris_charts_indicators` 的纯计算函数在非有限输入上有了定义——递归与累计函数从最后一个有效样本继续（此前被第一个 NaN 污染或在缺口后重新起始），窗口与滞后函数（`sma`、`cci`、`stochastic`、`kst`、`coppock_curve` 等）把缺口行视为不存在，在剩余行上求值并在缺口行返回 `Some(NaN)`（`fisher_transform` 返回 `None`），与图表的值相同。合并时的自有线调整：上游让窗口在缺口仍在窗口内时保持空白，本仓库不采用（Q-G）；`whitespace_row` 现在把 ±∞ 也视为空白；Klinger 把空（NaN）或负的成交量计为零力量，不再重启（上游仍重启）；RSI 运行时检查点改为保存 `IndexedRsiState`，`IncrementalState::runtime_bytes` 对 RSI 约为此前的两倍；Mass Index、KAMA 的检查点带有有界的双端队列。有限的倒挂柱（最高低于最低）照常计算（Klinger 与 Mass Index 在这样的柱上不输出、也不重置）。`4cfea16` 另使 DPO 与 CMO 在每个受影响的行上重新计算其窗口（每行 O(`period`)，已离开窗口的值不再残留舍入误差），布林带 %B 与带宽改用舍入后的上下轨之差，数值可能有几个 ULP 的变化。
+- `3835fee fix(axis): keep first tick weight in sync with cadence`，源码级：`TimeTickMarks` 新增公共方法 `set_first_weight(u8)`，第一个点的标记保存在权重桶之外（`set_weights_from` 与 `push_weight` 把第一个索引放在那里，`drop_front` 不再向桶头插入）；`first_point_weight_in` / `first_point_weight_shifted_in` 对一个点返回 0。合并时的自有线调整：不采用上游的 `inferred_first_weight(.., ChartTimeZone)`（本仓库没有 `*_in_time_zone` 辅助函数）；`606e2ce` 的原地读取在本仓库早已实现，其同步代码未合入。
+- `b75ec25 fix(render): share byte image opacity across executors`，源码级与行为：新增 `aeris_charts_render::draw_list::quantize_image_opacity(f32) -> f32`；每个图像执行器（Canvas2D、原生 tiny-skia、GPUI、WebGPU）先把不透明度量化为 n/255，量化为零的图像不绘制；GPUI 的栅格图像缓存改以 `(u64, u8)` 为键。自定义执行器应同样调用它。
+- `7df2305`、`5bc6ee2`、`85bc10b`：只涉及浏览器包、演示页与浏览器测试（倒计时按整秒对齐、窗格描述 id 全局唯一），Rust 宿主无需改动。
+
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
 - `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming, viewport, price axis, and intraday charts`（自有线）：

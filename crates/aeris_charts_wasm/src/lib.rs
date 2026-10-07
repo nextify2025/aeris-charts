@@ -35,6 +35,10 @@ mod session_slots;
 // target too so its state rules are tested outside the browser.
 #[cfg(any(target_arch = "wasm32", test))]
 mod stroke_state;
+// Image-run admission is pure; exercise its zero-opacity skip on the host without a GPU device.
+#[cfg(test)]
+#[path = "chart/image_runs.rs"]
+mod image_runs;
 
 #[cfg(target_arch = "wasm32")]
 mod canvas2d_target;
