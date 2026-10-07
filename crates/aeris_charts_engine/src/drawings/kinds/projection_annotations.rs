@@ -8,8 +8,11 @@
 //! arrow markers, icon stamp). This module keeps the data readers re-applied on upstream's
 //! forecast ([`forecast_status`], memoized in [`ForecastMemo`]), the built-in vector icon glyphs
 //! upstream's icon stamp falls back to ([`built_in_icon_parts`]), the fork's public option block
-//! ([`ProjectionAnnotationToolOptions`], [`BarsPatternMode`], [`DrawingIcon`]), and, for documents
-//! the fork wrote, its pre-merge kind defaults ([`legacy_defaults`]).
+//! ([`ProjectionAnnotationToolOptions`], [`BarsPatternMode`], [`DrawingIcon`]), for documents the
+//! fork wrote its pre-merge kind defaults ([`legacy_defaults`]), and the fork form those
+//! documents' block selects on upstream's lowering ([`fork_form`]): its predicates, its text boxes
+//! ([`fork_text_box`]), the projection's stats box and the forecast's parts, the coincident
+//! signpost's pole handle, and their culling reach.
 //!
 //! Every shape resolves into shared [`DrawingParts`], so frames and hit testing read the same
 //! geometry. The family renders the common `text` and `labels` itself: range fills at 20% of the
@@ -22,8 +25,9 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::Point;
 
+use super::super::handles::{DrawingHandle, HandleDrag};
 use super::super::parts::{
-    text_lines, DrawingParts, PartContext, PartLabel, PartStroke, STATS_PADDING,
+    text_lines, DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_PADDING,
 };
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
@@ -33,8 +37,8 @@ use super::super::tools::{
 use super::super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use super::DrawingFamily;
 use crate::{
-    ChartEngine, DrawingKind, DrawingKindOptions, DrawingLabelMetric, DrawingLabelOptions,
-    DrawingLabelPosition, DrawingLineCap,
+    ChartEngine, DrawingDragPart, DrawingKind, DrawingKindOptions, DrawingLabelMetric,
+    DrawingLabelOptions, DrawingLabelPosition, DrawingLineCap,
 };
 
 /// How a bars pattern paints its copied bars.
@@ -116,7 +120,8 @@ const DEFAULT_ICON_SIZE: f64 = 24.0;
 /// their defaults. For upstream's bars pattern and icon stamp, `bars_mode`, `mirrored`,
 /// `flipped`, `bars`, `icon`, and `icon_size` are input aliases of the flat `bars_pattern_*`,
 /// `icon_name`, and `icon_size` fields (see `drawing_contract::take_legacy_flat_options`);
-/// `always_show_text` is stored but not rendered. Every field is serialized only when it differs
+/// `always_show_text` keeps a fork-form note's box shown. The block's presence selects the fork
+/// form of the upstream annotations ([`fork_form`]). Every field is serialized only when it differs
 /// from its default, so a block at its defaults is written as `{}`: the marker documents the fork
 /// wrote carry on their annotations (see `kinds::legacy_fork_tool_options`), with no alias key
 /// written back.
@@ -369,6 +374,11 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
 /// text, forecast boxes) upstream does not draw. The block's presence selects that look on
 /// upstream's lowering, so documents the fork wrote keep it and new drawings keep upstream's.
 pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, serde_json::Value)> {
+    fork_form_kind(kind).then(|| ("projection_annotation", serde_json::json!({})))
+}
+
+/// The upstream annotation kinds with a fork look the fork-form marker selects.
+const fn fork_form_kind(kind: DrawingKind) -> bool {
     matches!(
         kind,
         DrawingKind::Projection
@@ -383,7 +393,383 @@ pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, se
             | DrawingKind::ArrowMarkerRight
             | DrawingKind::Forecast
     )
-    .then(|| ("projection_annotation", serde_json::json!({})))
+}
+
+// --- fork form ------------------------------------------------------------------------------
+//
+// Owner decision A1: an upstream annotation whose `tool_options.projection_annotation` block is
+// present takes the fork's look, layered on upstream's lowering: the projection's sector and
+// stats box (A2), the note's pin and focus-revealed box, the comment's and the price label's
+// speech bubbles (A5), the price note's boxed price (A4), the signpost's plate and its editor on
+// placement (A7), the arrow marks' text past the tail, and the forecast's boxes (A10). The pin,
+// the tail and the sector are body geometry (`geometry.rs`); the boxes are the drawing's text
+// block, painted by the frame's one text pass ([`fork_text_box`]). New drawings carry no block
+// and keep upstream's rendering; documents the fork wrote get it at restore.
+
+/// Note pin: head radius, head center height above the tip, and inner dot radius (CSS px).
+pub(crate) const NOTE_HEAD_RADIUS: f64 = 7.0;
+pub(crate) const NOTE_RISE: f64 = 17.0;
+pub(crate) const NOTE_DOT_RADIUS: f64 = 2.5;
+/// Speech-bubble tail height and width (CSS px).
+pub(crate) const TAIL_HEIGHT: f64 = 10.0;
+pub(crate) const TAIL_WIDTH: f64 = 10.0;
+/// Pole a signpost with coincident anchors stands up from its foot (CSS px): the fork's
+/// one-anchor signpost, which restore converts to two coincident anchors.
+pub(crate) const SIGNPOST_POLE: f64 = 40.0;
+/// Upstream's marker glyph radius (CSS px; `geometry.rs` `MarkerGeometry`).
+const MARKER_RADIUS: f64 = 7.0;
+
+/// Whether `drawing` takes its kind's fork look (owner decision A1): the
+/// `tool_options.projection_annotation` block is present on an annotation kind that has one.
+pub(crate) fn fork_form(drawing: &Drawing) -> bool {
+    drawing.tool_options.projection_annotation.is_some() && fork_form_kind(drawing.kind)
+}
+
+/// Whether the fork form paints `drawing`'s text as a box ([`fork_text_box`]) instead of
+/// upstream's run or text block. Static: it depends on the kind and the marker only, never on
+/// the text or an open editor, so the editor a host opens keeps its owner while it types.
+pub(crate) fn fork_text_owner(drawing: &Drawing) -> bool {
+    fork_form(drawing)
+        && matches!(
+            drawing.kind,
+            DrawingKind::Note
+                | DrawingKind::Comment
+                | DrawingKind::PriceNote
+                | DrawingKind::PriceLabel
+                | DrawingKind::Signpost
+                | DrawingKind::ArrowMarkerUp
+                | DrawingKind::ArrowMarkerDown
+                | DrawingKind::ArrowMarkerLeft
+                | DrawingKind::ArrowMarkerRight
+        )
+}
+
+/// Caller px of the pole a signpost with coincident anchors stands (0 otherwise), at `scale`
+/// caller px per CSS px. Coincidence is a data predicate, so the pole never switches with zoom.
+pub(crate) fn signpost_pole(drawing: &Drawing, scale: f64) -> f64 {
+    match drawing.points.as_slice() {
+        [foot, top] if drawing.kind == DrawingKind::Signpost && foot == top => {
+            SIGNPOST_POLE * scale
+        }
+        _ => 0.0,
+    }
+}
+
+/// The fork's starter text of a newly placed fork-form annotation whose text is empty (owner
+/// decision A6; upstream-form annotations start with an empty editor). The callout and the
+/// anchored text take theirs from the marker too, though they have no other fork look.
+pub(crate) fn starter_text(drawing: &Drawing) -> Option<&'static str> {
+    if drawing.tool_options.projection_annotation.is_none() || !drawing.text.is_empty() {
+        return None;
+    }
+    match drawing.kind {
+        DrawingKind::Note => Some("Note"),
+        DrawingKind::Comment => Some("Comment"),
+        DrawingKind::Callout => Some("Callout"),
+        DrawingKind::Signpost => Some("Signpost"),
+        DrawingKind::AnchoredText => Some("Text"),
+        _ => None,
+    }
+}
+
+/// Whether placing `drawing` opens the text editor beyond its spec's flag: a fork-form signpost
+/// (owner decision A7).
+pub(crate) fn requests_text_editor(drawing: &Drawing) -> bool {
+    drawing.kind == DrawingKind::Signpost && fork_form(drawing)
+}
+
+/// Whether `drawing` paints parts only while focused (hovered or selected): a fork-form note
+/// without `always_show_text` shows its box then. The frame rebuilds the drawing layer when
+/// focus moves onto or off such a drawing.
+pub(crate) fn reveals_on_focus(drawing: &Drawing) -> bool {
+    drawing.kind == DrawingKind::Note && fork_form(drawing) && !options(drawing).always_show_text
+}
+
+/// Whether `drawing` is a fork-form projection: it resolves its sector (owner decision A2) and
+/// paints its visible labels as a stats box beside its target ([`projection_stats`]; the
+/// generic label pass skips it).
+pub(crate) fn draws_sector(drawing: &Drawing) -> bool {
+    drawing.kind == DrawingKind::Projection && fork_form(drawing)
+}
+
+/// A fork-form projection's stats box: the visible labels' stats from the pivot to the target
+/// beside the target (`target`, caller px), on the far side from the pivot.
+pub(crate) fn projection_stats(
+    ctx: &PartContext<'_>,
+    pivot: Point,
+    target: Point,
+    parts: &mut DrawingParts,
+) {
+    let drawing = ctx.drawing;
+    if !drawing.labels.iter().any(|label| label.visible) {
+        return;
+    }
+    let lines = ctx.engine.drawing_stat_lines(drawing, 0, 1);
+    let gap = LABEL_GAP * ctx.scale;
+    let right = target.0 >= pivot.0;
+    parts.label(ctx.stats_box(
+        (
+            if right {
+                target.0 + gap
+            } else {
+                target.0 - gap
+            },
+            target.1,
+        ),
+        (
+            if right {
+                DrawingTextHAlign::Left
+            } else {
+                DrawingTextHAlign::Right
+            },
+            DrawingTextVAlign::Middle,
+        ),
+        lines,
+        None,
+        |background| box_text_color(drawing, background),
+    ));
+}
+
+/// The fork-form text box of a fork text owner ([`fork_text_owner`]), as `parts`' text label at
+/// `ctx`'s scale, placed on the body upstream's resolver gives the fork form: the note's box
+/// beside its pin head (only while edited, focused, or with `always_show_text`), the comment's
+/// and the price label's bubble above the tail (the price label's formatted price first), the
+/// price note's boxed price and text in upstream's text slot on its line, the signpost's plate on
+/// its pennant, and an arrow mark's text past its tail. Boxes sit on the stroke color with
+/// contrasting text and the `box_border_color` frame; the arrow mark's text has no box.
+pub(crate) fn fork_text_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
+    let drawing = ctx.drawing;
+    let pane = ctx.pane;
+    let Some(geometry) = super::super::geometry::resolve_drawing_geometry(
+        drawing.kind,
+        ctx.px,
+        pane.right,
+        pane.top,
+        pane.bottom - pane.top,
+        super::super::geometry::DrawingGeometryOptions::for_drawing(drawing, ctx.scale),
+    ) else {
+        return;
+    };
+    use super::super::geometry::DrawingBodyGeometry as Body;
+    let s = ctx.scale;
+    let background = Some(drawing.stroke_color());
+    match geometry.body {
+        Body::NotePin(pin) => {
+            if !(ctx.text_editing || ctx.focused() || options(drawing).always_show_text) {
+                return;
+            }
+            parts.text_label(
+                text_box(
+                    ctx,
+                    (pin.head.0 + pin.radius + LABEL_GAP * s / 2.0, pin.head.1),
+                    (DrawingTextHAlign::Left, DrawingTextVAlign::Middle),
+                    ctx.text_lines(),
+                    background,
+                ),
+                0,
+            );
+        }
+        Body::SpeechTail { corners: [tip, ..] } => {
+            let prefix = match (drawing.kind, drawing.points.first()) {
+                (DrawingKind::PriceLabel, Some(point)) => {
+                    vec![ctx.engine.drawing_price_text(drawing, point.price)]
+                }
+                _ => Vec::new(),
+            };
+            let (lines, first_line) = with_text(ctx, prefix);
+            parts.text_label(
+                text_box(
+                    ctx,
+                    (tip.0, tip.1 - TAIL_HEIGHT * s),
+                    (DrawingTextHAlign::Left, DrawingTextVAlign::Bottom),
+                    lines,
+                    background,
+                ),
+                first_line,
+            );
+        }
+        Body::Horizontal { .. } if drawing.kind == DrawingKind::PriceNote => {
+            let Some(point) = drawing.points.first() else {
+                return;
+            };
+            // Upstream's text slot: the box edge one text pad from the line's reference box.
+            let reference = geometry.text_box;
+            let pad = super::super::TEXT_PAD * s;
+            let x = match drawing.text_h_align {
+                DrawingTextHAlign::Left => reference.left + pad,
+                DrawingTextHAlign::Center => (reference.left + reference.right) / 2.0,
+                DrawingTextHAlign::Right => reference.right - pad,
+            };
+            let (y, v_align) = match drawing.text_v_align {
+                DrawingTextVAlign::Top => (reference.top - pad, DrawingTextVAlign::Bottom),
+                DrawingTextVAlign::Middle => (
+                    (reference.top + reference.bottom) / 2.0,
+                    DrawingTextVAlign::Middle,
+                ),
+                DrawingTextVAlign::Bottom => (reference.bottom + pad, DrawingTextVAlign::Top),
+            };
+            let price = ctx.engine.drawing_price_text(drawing, point.price);
+            let (lines, first_line) = with_text(ctx, vec![price]);
+            parts.text_label(
+                text_box(
+                    ctx,
+                    (x, y),
+                    (drawing.text_h_align, v_align),
+                    lines,
+                    background,
+                ),
+                first_line,
+            );
+        }
+        Body::Marker(marker) if drawing.kind == DrawingKind::Signpost => {
+            // The plate sits on the pennant, which stays visible below it.
+            parts.text_label(
+                text_box(
+                    ctx,
+                    (marker.anchor.0, marker.anchor.1 - 2.0 * marker.radius),
+                    (DrawingTextHAlign::Center, DrawingTextVAlign::Bottom),
+                    ctx.text_lines(),
+                    background,
+                ),
+                0,
+            );
+        }
+        Body::Marker(marker) => {
+            let Some(direction) = arrow_direction(drawing.kind) else {
+                return;
+            };
+            // Past the tail of upstream's glyph (its length is twice its radius).
+            let back = 2.0 * marker.radius + LABEL_GAP * s / 2.0;
+            let anchor = (
+                marker.anchor.0 - direction.0 * back,
+                marker.anchor.1 - direction.1 * back,
+            );
+            let alignment = match direction {
+                (_, y) if y < 0.0 => (DrawingTextHAlign::Center, DrawingTextVAlign::Top),
+                (_, y) if y > 0.0 => (DrawingTextHAlign::Center, DrawingTextVAlign::Bottom),
+                (x, _) if x < 0.0 => (DrawingTextHAlign::Left, DrawingTextVAlign::Middle),
+                _ => (DrawingTextHAlign::Right, DrawingTextVAlign::Middle),
+            };
+            let mut label = text_box(ctx, anchor, alignment, ctx.text_lines(), None);
+            label.color = Some(
+                drawing
+                    .text_color
+                    .as_deref()
+                    .and_then(Color::parse_css)
+                    .unwrap_or_else(|| drawing.stroke_color()),
+            );
+            label.padding = (0.0, 0.0);
+            parts.text_label(label, 0);
+        }
+        _ => {}
+    }
+}
+
+/// Whether `drawing` is a fork-form forecast: it adds the source dot and the source and target
+/// boxes ([`forecast_parts`]) to upstream's segment in place of upstream's outcome label.
+pub(crate) fn draws_forecast_boxes(drawing: &Drawing) -> bool {
+    drawing.kind == DrawingKind::Forecast && fork_form(drawing)
+}
+
+/// A fork-form forecast's parts over upstream's capped segment: a dot on the source, the source
+/// price in a stats box on the side away from the target, and beyond the target a stats box with
+/// the change, the target time, and the outcome (`Success` on the market's up color, `Failure`
+/// on its down color, nothing while pending: owner decision A10). Both boxes are body targets.
+pub(crate) fn forecast_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
+    let drawing = ctx.drawing;
+    let (Some(&a), Some(&b), Some(source)) =
+        (ctx.px.first(), ctx.px.get(1), drawing.points.first())
+    else {
+        return;
+    };
+    parts.disc(a, super::super::cap_radius(drawing.width) * ctx.scale, None);
+    let gap = LABEL_GAP * ctx.scale;
+    let forward = b.0 >= a.0;
+    let side = |forward: bool| {
+        if forward {
+            DrawingTextHAlign::Left
+        } else {
+            DrawingTextHAlign::Right
+        }
+    };
+    let text = |background| box_text_color(drawing, background);
+    parts.label(ctx.stats_box(
+        (if forward { a.0 - gap } else { a.0 + gap }, a.1),
+        (side(!forward), DrawingTextVAlign::Middle),
+        vec![ctx.engine.drawing_price_text(drawing, source.price)],
+        None,
+        text,
+    ));
+    let status = ctx.engine.forecast_result(drawing);
+    let market = |css: &str, fallback: (u8, u8, u8)| {
+        let color = Color::parse_css(css).unwrap_or(Color::rgb(fallback.0, fallback.1, fallback.2));
+        Color::rgba(color.r(), color.g(), color.b(), STATS_ALPHA)
+    };
+    let background = match status {
+        Some(true) => Some(market(
+            aeris_charts_core::style::MARKET_UP_CSS,
+            (8, 153, 129),
+        )),
+        Some(false) => Some(market(
+            aeris_charts_core::style::MARKET_DOWN_CSS,
+            (247, 82, 95),
+        )),
+        None => None,
+    };
+    parts.label(ctx.stats_box(
+        (if forward { b.0 + gap } else { b.0 - gap }, b.1),
+        (side(forward), DrawingTextVAlign::Middle),
+        forecast_target_lines(ctx.engine, drawing, status),
+        background,
+        text,
+    ));
+}
+
+/// A fork-form forecast's target box lines: the change and percent from the source, the target
+/// time (when the axis has time identity), and `Success`/`Failure` once evaluated.
+fn forecast_target_lines(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    status: Option<bool>,
+) -> Vec<String> {
+    let (Some(source), Some(target)) = (drawing.points.first(), drawing.points.get(1)) else {
+        return Vec::new();
+    };
+    let change = target.price - source.price;
+    let sign = if change > 0.0 { "+" } else { "" };
+    let mut first = format!("{sign}{}", engine.drawing_price_text(drawing, change));
+    if source.price.abs() > f64::EPSILON {
+        first.push_str(&format!(" ({:+.2}%)", change / source.price.abs() * 100.0));
+    }
+    let mut lines = vec![first];
+    if let Some(time) = engine.drawing_anchor_time_of(drawing, 1) {
+        lines.push(engine.format_crosshair_ts(time.round() as i64));
+    }
+    match status {
+        Some(true) => lines.push("Success".to_string()),
+        Some(false) => lines.push("Failure".to_string()),
+        None => {}
+    }
+    lines
+}
+
+/// The direction an arrow mark points (screen y down).
+fn arrow_direction(kind: DrawingKind) -> Option<Point> {
+    match kind {
+        DrawingKind::ArrowMarkerUp => Some((0.0, -1.0)),
+        DrawingKind::ArrowMarkerDown => Some((0.0, 1.0)),
+        DrawingKind::ArrowMarkerLeft => Some((-1.0, 0.0)),
+        DrawingKind::ArrowMarkerRight => Some((1.0, 0.0)),
+        _ => None,
+    }
+}
+
+/// `prefix` lines of engine text (a formatted price) followed by the drawing's own text lines
+/// ([`PartContext::text_lines`]), and the index of the first text line.
+fn with_text(ctx: &PartContext<'_>, mut prefix: Vec<String>) -> (Vec<String>, usize) {
+    let first_line = prefix.len();
+    prefix.extend(ctx.text_lines());
+    (prefix, first_line)
 }
 
 fn options(drawing: &Drawing) -> &ProjectionAnnotationToolOptions {
@@ -872,6 +1258,124 @@ fn decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
                 + ANNOTATION_STEM
                 + ANNOTATION_HEAD
                 + box_reach(engine, drawing, &lines, size, BOX_PADDING, 0.0)
+        }
+        _ => 0.0,
+    }
+}
+
+/// A signpost with coincident anchors keeps its top handle on its pole's top: the `Anchor(1)`
+/// handle becomes the derived `Handle(0)` there ([`drag_handle`]), so the top is grabbed where it
+/// is painted. Every other drawing keeps its handles.
+pub(crate) fn derived_handles(drawing: &Drawing, px: &[Point], handles: &mut [DrawingHandle]) {
+    let pole = signpost_pole(drawing, 1.0);
+    let Some(&foot) = px.first().filter(|_| pole > 0.0) else {
+        return;
+    };
+    if let Some(handle) = handles
+        .iter_mut()
+        .find(|handle| handle.part == DrawingDragPart::Anchor(1))
+    {
+        handle.point = (foot.0, foot.1 - pole);
+        handle.part = DrawingDragPart::Handle(0);
+    }
+}
+
+/// One drag sample of a coincident signpost's pole-top handle ([`derived_handles`]): the top
+/// anchor goes where the handle goes (time- and magnet-snapped like an anchor), so the drag
+/// starts from the painted top instead of jumping onto the foot.
+pub(crate) fn drag_handle(
+    sample: &HandleDrag<'_>,
+    points: &mut [crate::DrawingPoint],
+) -> Option<Option<crate::DrawingToolOptions>> {
+    if let (DrawingDragPart::Handle(0), Some(top)) = (sample.part, points.get_mut(1)) {
+        *top = sample.target;
+    }
+    Some(None)
+}
+
+/// After an anchor drag sample moved `points[index]`: dragging the foot of a signpost that was
+/// coincident when the drag began (`start_points`, the drag baseline; its foot is its only
+/// anchor handle, [`derived_handles`]) moves its top with it, so the pole stands on the new foot
+/// as the fork's one-anchor signpost moved whole. A distinct-anchor signpost whose foot passes
+/// over its top keeps its top.
+pub(crate) fn follow_anchor_drag(
+    drawing: &Drawing,
+    index: usize,
+    start_points: &[crate::DrawingPoint],
+    points: &mut [crate::DrawingPoint],
+) {
+    let coincident = matches!(start_points, [foot, top] if foot == top);
+    if index == 0 && drawing.kind == DrawingKind::Signpost && coincident {
+        if let [foot, top, ..] = points {
+            *top = *foot;
+        }
+    }
+}
+
+/// The CSS-px reach beyond the anchors' box of what an upstream annotation's fork form adds
+/// (`kinds::upstream_decoration_extent`): the projection's stats box, the note's pin and box, the
+/// bubbles above their tails, the signpost's plate (on its pole), an arrow mark's text past its
+/// tail, and the forecast's boxes. Text that follows data (prices, stats, the forecast outcome)
+/// gets four ems of slack so the cached pad stays valid between text-key refreshes. 0 in
+/// upstream form.
+pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
+    if !fork_form(drawing) {
+        return 0.0;
+    }
+    let size = engine.drawing_text_size(drawing);
+    let stats = engine.drawing_stats_size();
+    let text = || culling_text_lines(drawing);
+    let price = || {
+        drawing
+            .points
+            .first()
+            .map(|point| engine.drawing_price_text(drawing, point.price))
+    };
+    match drawing.kind {
+        DrawingKind::Projection if drawing.labels.iter().any(|label| label.visible) => {
+            let lines = engine.drawing_stat_lines(drawing, 0, 1);
+            box_reach(engine, drawing, &lines, stats, STATS_PADDING, LABEL_GAP) + 4.0 * stats
+        }
+        DrawingKind::Note => {
+            NOTE_RISE
+                + NOTE_HEAD_RADIUS
+                + LABEL_GAP / 2.0
+                + box_reach(engine, drawing, &text(), size, BOX_PADDING, 0.0)
+        }
+        DrawingKind::Comment | DrawingKind::PriceLabel => {
+            let mut lines = text();
+            lines.extend(price().filter(|_| drawing.kind == DrawingKind::PriceLabel));
+            TAIL_HEIGHT
+                + TAIL_WIDTH
+                + box_reach(engine, drawing, &lines, size, BOX_PADDING, 0.0)
+                + 4.0 * size
+        }
+        DrawingKind::Signpost => {
+            signpost_pole(drawing, 1.0)
+                + 2.0 * MARKER_RADIUS
+                + box_reach(engine, drawing, &text(), size, BOX_PADDING, 0.0)
+        }
+        DrawingKind::Forecast => {
+            let source = price().into_iter().collect::<Vec<_>>();
+            let target = forecast_target_lines(engine, drawing, Some(false));
+            LABEL_GAP
+                + box_reach(engine, drawing, &source, stats, STATS_PADDING, 0.0).max(box_reach(
+                    engine,
+                    drawing,
+                    &target,
+                    stats,
+                    STATS_PADDING,
+                    0.0,
+                ))
+                + 4.0 * stats
+        }
+        DrawingKind::ArrowMarkerUp
+        | DrawingKind::ArrowMarkerDown
+        | DrawingKind::ArrowMarkerLeft
+        | DrawingKind::ArrowMarkerRight => {
+            2.0 * MARKER_RADIUS
+                + LABEL_GAP / 2.0
+                + box_reach(engine, drawing, &text(), size, (0.0, 0.0), 0.0)
         }
         _ => 0.0,
     }

@@ -16,18 +16,11 @@
 //! arm, and hit code; `Some` for those three ranges and the own-line tools, whose constants live in
 //! their `kinds/<family>.rs` module.
 
-// ponytail: fork renderer extras retired by the upstream B8 sync and not yet re-applied on
-// upstream's lowering (their options stay stored but inert). Documents the fork wrote, and the
-// fork-era clipboard and sync items that prove where they came from, already carry each one's fork
-// default (`kinds::legacy_fork_tool_options` and the legacy defaults), so they regain the fork look
-// as each is re-applied. Annotations: projection sector, note pin and reveal-on-focus, the price
-// note's boxed price, speech bubbles, the default texts of new fork-form annotations ("Note",
-// "Callout", ...), signpost pole and its editor on placement (upstream's
-// signpost is a two-anchor marker that opens none), arrow-mark text, multi-line family boxes for
-// note/comment/callout/price_note/anchored_text, bars-pattern LOD aggregation, the forecast's
-// source and target boxes (absolute change, Success/Failure on market colors, the box as a hit
-// target; the target time stays, one line above upstream's outcome label). Re-applied on
-// upstream's lowering instead: the line tools' fork presentation, selected by
+// ponytail: fork renderer extras retired by the upstream B8 sync. Documents the fork wrote, and
+// the fork-era clipboard and sync items that prove where they came from, carry each one's fork
+// default (`kinds::legacy_fork_tool_options` and the legacy defaults), so they keep the fork look;
+// the options of the items not restored stay stored but inert. Re-applied on upstream's
+// lowering: the line tools' fork presentation, selected by
 // the stored `tool_options.line` block and layered on upstream's segment and cross arms
 // (`kinds::lines::upstream_line_parts`; new drawings have no block and render as upstream does):
 // the one engine-formatted stats box of the visible `labels` (stats_position, InfoLine's five-stat
@@ -88,7 +81,20 @@
 // stored as upstream's control points, with the arc placed ends first
 // (`kinds::shapes::placement_anchors`, S5), end caps on arc, curve and double_curve from
 // `stroke_start`/`stroke_end` (S6), and the rotated rectangle's and triangle's outline as one
-// seamless run from mid-edge (S7); channel `extend_*`, the callout's tip and box
+// seamless run from mid-edge (S7); the annotations' fork form, selected by the stored
+// `tool_options.projection_annotation` block (A1, `kinds::projection_annotations::fork_form`; new
+// drawings have no block and render as upstream does) and layered on upstream's annotation arms:
+// the projection's sector (`DrawingBodyGeometry::Sector`, A2; its culling bounds leave time open)
+// and its stats box, the note's pin (`NotePin`) with its box shown while edited, focused (the
+// frame's focus key rebuilds the layer) or `always_show_text`, the comment's and the price
+// label's speech-bubble tails (`SpeechTail`, A5), the price note's boxed price and text (A4,
+// additive only), the signpost's plate and its editor on placement (A7), the arrow marks' text past
+// the tail, every box the drawing's one text block (`fork_text_box`, owned statically by kind and
+// block), the fork's starter texts at commit (A6), and the forecast's source dot and boxes (change,
+// target time, Success/Failure on the market colors, hit targets; A10); independent of the form,
+// the coincident signpost's 40 CSS px pole with its pole-top handle, the text annotations'
+// multi-line text blocks (`TextBlock`; one line stays upstream's run), and the bars pattern's
+// bucket aggregation of wide sources at bucket-index offsets (A9); channel `extend_*`, the callout's tip and box
 // handles, the highlighter's once-filled tube,
 // the regression trend's dashed anchor segment while it has no fit, and the clip-aware flattening
 // of the ellipse, circle, arc, curve and double curve (`geometry.rs`: within 0.25 px of the true
@@ -96,8 +102,9 @@
 // solid dash runs). Not restored, by owner decision (they would change upstream's anchor or option
 // contracts): a ray turned into a segment and the extended line's `extend_*` toggles (upstream
 // payloads carry them as `false`), the five-stat default of new info lines (they keep upstream's
-// four; fork documents keep five), the projection's independent sector radius (its third anchor),
-// the price note's leader and label offset (its second anchor), the bars pattern's box fit, the
+// four; fork documents keep five), the projection's independent sector radius (its third anchor;
+// A3), the price note's leader and label offset (its second anchor; A4), the bars pattern's box
+// fit (A8), multi-line blocks for the plain text tool (A11: it stays one run), the
 // symmetric rotated rectangle placed and edited around its center axis (S4: upstream's edge and
 // depth placement stays; only the width handles are restored), a numeric fixed-square size, the three
 // drives' seventh anchor (its last leg; upstream's contract has six), the triangle pattern's apex

@@ -1219,3 +1219,51 @@ fn after_the_first_click_a_press_drag_release_only_moves_the_preview() {
     assert!(chart.undo_drawing());
     assert!(chart.drawings().is_empty());
 }
+
+#[test]
+fn a_fork_form_signpost_opens_its_editor_on_placement_and_keeps_an_emptied_text() {
+    // Owner decisions A6/A7: only a fork-form signpost (the `projection_annotation` marker)
+    // starts from the fork's starter text and opens the editor on placement; upstream's form
+    // opens nothing. A signpost is no text annotation, so emptying it keeps the drawing.
+    for (options, fork) in [
+        (
+            Some(r#"{"tool_options":{"projection_annotation":{}}}"#),
+            true,
+        ),
+        (None, false),
+    ] {
+        let mut chart = chart();
+        assert!(chart.set_drawing_tool(Some(DrawingKind::Signpost), options, None));
+        for (x, y) in [(300.0, 260.0), (300.0, 200.0)] {
+            chart.input_pointer_down(at(x, y), 1);
+            chart.input_pointer_up(at(x, y));
+        }
+        let events = chart.take_input_events();
+        let [ChartInputEvent::DrawingCreated(id)] = events[..] else {
+            panic!("one signpost was created: {events:?}");
+        };
+        assert_eq!(
+            chart.editing_drawing(),
+            fork.then_some(id),
+            "fork form {fork}"
+        );
+        if !fork {
+            assert_eq!(chart.drawing(id).unwrap().text, "");
+            continue;
+        }
+        assert_eq!(chart.drawing_text_edit(), Some((id, "Signpost", 8)));
+        assert!(chart.set_drawing_text_edit("", 0));
+        assert!(chart.commit_drawing_text_edit());
+        assert_eq!(
+            chart.drawing(id).unwrap().text,
+            "",
+            "an emptied signpost is kept"
+        );
+        // F2 reopens it on the empty text; cancelling (the editor's Escape) keeps the drawing.
+        assert!(key(&mut chart, ChartKey::EditText));
+        assert_eq!(chart.editing_drawing(), Some(id));
+        assert!(chart.cancel_drawing_text_edit());
+        assert_eq!(chart.editing_drawing(), None);
+        assert!(chart.drawing(id).is_some());
+    }
+}

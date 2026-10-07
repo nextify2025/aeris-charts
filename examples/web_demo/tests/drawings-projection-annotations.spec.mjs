@@ -653,6 +653,69 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(id);
 });
 
+test("the projection_annotation block brings back the fork look on upstream's rendering", async ({ page }) => {
+  await goto_fixture(page);
+  const range = await visible_range(page);
+  const l0 = Math.floor(range.from + (range.to - range.from) * 0.4);
+  const b0 = await bar(page, l0);
+  const b1 = await bar(page, l0 + 6);
+  const FORK = { tool_options: { projection_annotation: {} } };
+  const add = (kind, points, options) => page.evaluate(({ kind, points, options }) =>
+    window.__chart.add_drawing(kind, points.map(([logical, price]) => ({ logical, price })), {
+      color: "#e91e63", ...options,
+    }).id, { kind, points, options });
+  const remove = (id) => page.evaluate((id) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).remove();
+  }, id);
+  // Each tool's fork look differs from upstream's; without the block nothing changes.
+  const cases = [
+    ["projection", [[l0, b0.low], [l0 + 6, b1.high]], {}],
+    ["note", [[l0, b0.high]], { text: "Fork" }],
+    ["comment", [[l0, b0.high]], { text: "Fork" }],
+    ["price_label", [[l0, b0.high]], {}],
+    ["price_note", [[l0, b0.high]], { text: "Fork" }],
+    ["signpost", [[l0, b0.high], [l0, b0.high]], { text: "Fork" }],
+    ["arrow_marker_up", [[l0, b0.low]], { text: "Fork" }],
+    ["forecast", [[l0, b0.close], [l0 + 6, b1.high]], {}],
+  ];
+  for (const [kind, points, options] of cases) {
+    const upstream = await add(kind, points, options);
+    await settle_frames(page);
+    const plain = await capture(page);
+    await remove(upstream);
+    const fork = await add(kind, points, { ...options, ...FORK });
+    await settle_frames(page);
+    const forked = await capture(page);
+    await remove(fork);
+    const diff = pixelmatch(plain.data, forked.data, null, plain.width, plain.height, { threshold: 0 });
+    expect(diff, `${kind} takes the fork look`).toBeGreaterThan(20);
+  }
+
+  // A fork-look note is a pin: its head selects it, and its box shows while it is hovered.
+  const note = await add("note", [[l0, b0.high]], { text: "Hidden box", ...FORK });
+  await page.evaluate(() => window.__chart.wasm.set_selected_drawing(undefined));
+  await page.mouse.move(5, 5);
+  await settle_frames(page);
+  const tip = await spot(page, l0, b0.high);
+  const resting = color_extent(await capture(page), PINK);
+  expect(resting, "the pin paints").not.toBeNull();
+  await page.mouse.move(tip.x, tip.y - 17);
+  await settle_frames(page);
+  const hovered = color_extent(await capture(page), PINK);
+  expect(hovered.right - hovered.left, "hover reveals the box").toBeGreaterThan(resting.right - resting.left + 20 * PR);
+  await page.mouse.click(tip.x, tip.y - 17);
+  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(note);
+  await remove(note);
+
+  // A fork-look forecast's target box selects it.
+  const forecast = await add("forecast", [[l0, b0.close], [l0 + 6, b1.high]], FORK);
+  await page.evaluate(() => window.__chart.wasm.set_selected_drawing(undefined));
+  await settle_frames(page);
+  const target = await spot(page, l0 + 6, b1.high);
+  await page.mouse.click(target.x + 20, target.y);
+  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(forecast);
+});
+
 test("Projection & Annotations tools round-trip through persistence, clipboard, and sync with their options", async ({ page }) => {
   await page.goto("/?backend=canvas2d");
   await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);

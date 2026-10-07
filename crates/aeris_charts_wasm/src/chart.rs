@@ -5802,8 +5802,9 @@ impl AerisChart {
     /// The drawing's editor layout as JSON (`{x, y, line_height, size, font_family, weight,
     /// italic, color, rect, angle, multiline}` in overlay CSS px, `angle` in clockwise radians),
     /// or an empty string for a drawing that paints no text or whose anchors cannot convert.
-    /// `multiline` chooses the editor: a family text box (lines left-aligned at `x`, unrotated)
-    /// or one run whose start (`x`, `y`) rotates by `angle` about itself.
+    /// `multiline` chooses the editor: a text box or block (a family's, a text annotation's, or
+    /// an annotation's fork-look box; lines left-aligned at `x`, unrotated) or one run whose
+    /// start (`x`, `y`) rotates by `angle` about itself.
     pub fn drawing_text_edit_layout_json(&self, id: u32) -> String {
         self.inner.borrow().drawing_text_edit_layout_json(id)
     }

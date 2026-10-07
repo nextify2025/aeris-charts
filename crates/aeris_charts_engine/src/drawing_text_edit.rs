@@ -1,7 +1,9 @@
-//! Engine-owned typing session for every drawing that paints its own text: the text tool and the
-//! text annotations (note, comment, callout, price note, anchored text), the one-line run labels
-//! of trend lines and every other line, channel, Fibonacci, pitchfork, pattern, and shape tool,
-//! and the multi-line text boxes of the family tools that own their text.
+//! Engine-owned typing session for every drawing that paints its own text: the text tool, the
+//! multi-line text blocks of the text annotations (note, comment, callout, price note, anchored
+//! text) and of the fork-form signpost plate, arrow-mark text, and price-label bubble, the
+//! one-line run labels of trend lines and every other line, channel, Fibonacci, pitchfork,
+//! pattern, and shape tool, and the multi-line text boxes of the family tools that own their
+//! text.
 //!
 //! The session owns the product rules every host shares: live text, caret and selection,
 //! Enter/Escape semantics, and the empty lifecycle (an emptied text tool or text annotation is
@@ -52,7 +54,7 @@ pub(crate) struct DrawingTextEditSession {
 }
 
 /// The engine's text rules for one session. A run label stays on one line (a run of line breaks
-/// becomes one space) and a family text box keeps its line breaks (`\r\n` and `\r` become `\n`);
+/// becomes one space) and a text box or block keeps its line breaks (`\r\n` and `\r` become `\n`);
 /// every other control character, a tab included, becomes a space.
 fn sanitize(text: &str, multiline: bool) -> String {
     if !multiline {
@@ -117,10 +119,12 @@ fn byte_index(text: &str, caret: usize) -> usize {
 }
 
 impl ChartEngine {
-    /// Whether `id` is a family text box (several lines) rather than a one-line run.
+    /// Whether `id`'s text may span lines (a family text box, a text annotation's block, or a
+    /// fork-form annotation's box) rather than a one-line run.
     fn drawing_text_edit_multiline(&self, id: DrawingId) -> bool {
-        self.drawing(id)
-            .is_some_and(|drawing| !drawing.kind.paints_generic_text())
+        self.drawing(id).is_some_and(|drawing| {
+            !drawing.kind.paints_generic_text() || drawing.paints_text_block()
+        })
     }
 
     /// Open typing mode on any drawing that paints its own text ([`ChartEngine::drawing_text_editable`]:
@@ -812,8 +816,10 @@ mod tests {
         assert_eq!(text(&chart, note).as_deref(), Some("keep"));
     }
 
+    // The text annotations are the multi-line text owner (R9): their text keeps its lines, and
+    // their editor is the multi-line one.
     #[test]
-    fn text_annotations_edit_as_one_run() {
+    fn text_annotations_edit_as_multi_line_blocks() {
         for kind in [
             DrawingKind::Note,
             DrawingKind::Comment,
@@ -825,10 +831,10 @@ mod tests {
             let layout = chart
                 .drawing_text_edit_layout(id)
                 .expect("an editor layout");
-            assert!(!layout.multiline, "{kind:?}");
+            assert!(layout.multiline, "{kind:?}");
             assert!(chart.begin_drawing_text_edit(id, false), "{kind:?}");
-            assert!(chart.set_drawing_text_edit("a\nb", 3));
-            assert_eq!(text(&chart, id).as_deref(), Some("a b"), "{kind:?}");
+            assert!(chart.set_drawing_text_edit("a\r\nb", 3));
+            assert_eq!(text(&chart, id).as_deref(), Some("a\nb"), "{kind:?}");
         }
     }
 }

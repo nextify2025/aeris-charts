@@ -19,14 +19,14 @@ use std::fmt::Write;
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
 use crate::drawings::kinds::patterns_elliott_cycles::{self, PatternLayer};
-use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
+use crate::drawings::kinds::projection_annotations::{self, built_in_icon_parts, DrawingIcon};
 use crate::drawings::kinds::{channels, fibonacci, lines, pitchforks_gann, shapes};
 use crate::drawings::{
     arrow_cap_triangle, cap_radius, closed_outline, curve_clip, ellipse_outline, level_band_pairs,
     resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
     DrawingHandleMode, DrawingId, DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign,
     DrawingTextLayout, FibonacciArcGeometry, PartContext, PositionGeometry, PositionZone,
-    TimeLevelGeometry, TEXT_CHROME_PAD, TEXT_PAD, TREND_TEXT_PLACEHOLDER,
+    TextBlock, TimeLevelGeometry, TEXT_CHROME_PAD, TEXT_PAD, TREND_TEXT_PLACEHOLDER,
 };
 use crate::{ChartEngine, FibonacciLabelVAlign};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
@@ -223,7 +223,7 @@ mod trend_label_tests {
                 ] {
                     drawing.text_v_align = v_align;
                     let (x, y, align, angle) = ChartEngine::drawing_text_placement(
-                        &drawing, &line, 100.0, 0.0, 100.0, 12.0, 4.0,
+                        &drawing, &line, 100.0, 0.0, 100.0, 12.0, 1.0,
                     );
                     assert_eq!(align, h_align);
                     let (from_x, from_y) = (x - start.0, y - start.1);
@@ -240,7 +240,7 @@ mod trend_label_tests {
         let line = [(10.0, 80.0), (90.0, 20.0)];
         let reversed = [line[1], line[0]];
         let (x, y, _, angle) =
-            ChartEngine::drawing_text_placement(&drawing, &reversed, 100.0, 0.0, 100.0, 12.0, 4.0);
+            ChartEngine::drawing_text_placement(&drawing, &reversed, 100.0, 0.0, 100.0, 12.0, 1.0);
         assert!((x - 86.8).abs() < 1e-9);
         assert!((y - 22.4).abs() < 1e-9);
         assert!((angle - (-0.6_f64).atan2(0.8)).abs() < 1e-9);
@@ -555,7 +555,7 @@ impl ChartEngine {
                 .map(|(x, y)| (x * hpr, y * vpr))
                 .collect::<Vec<_>>();
             self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
-            self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+            self.build_drawing_text(drawing, &px, pane_w_px, vpr, out, points);
             self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
             self.build_drawing_labels(drawing, &px, vpr, out);
         }
@@ -607,7 +607,7 @@ impl ChartEngine {
                 let prim_start = out.len();
                 let point_start = points.len();
                 self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
-                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_labels(drawing, &px, vpr, out);
                 parts.push(super::RetainedDrawingPart {
@@ -644,7 +644,7 @@ impl ChartEngine {
                 let prim_start = out.len();
                 let point_start = points.len();
                 self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
-                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_labels(drawing, &px, vpr, out);
                 parts.push(super::RetainedDrawingPart {
@@ -2027,6 +2027,56 @@ impl ChartEngine {
                     }
                 }
             }
+            DrawingBodyGeometry::Sector(arc) => {
+                // A fork-form projection: the sector's fill (a fan from the pivot) under its
+                // outline from the pivot along the arc and back, then its stats box.
+                let mut arc_points = Vec::new();
+                arc.flatten(curve_clip(stroke.1, drawing.width, vpr), &mut arc_points);
+                if drawing.fill_enabled && arc_points.len() >= 2 {
+                    let count = arc_points.len();
+                    let mut ribbon = arc_points.clone();
+                    ribbon.resize(2 * count, arc.center);
+                    push_ribbon(&ribbon, count, drawing.fill_or_wash(51), out, points);
+                }
+                let mut outline = Vec::with_capacity(arc_points.len() + 2);
+                outline.push(arc.center);
+                outline.extend_from_slice(&arc_points);
+                outline.push(arc.center);
+                push_styled_stroke(out, points, &outline, LineType::Simple, stroke.0, stroke.1);
+                if let (Some(context), Some(&target)) = (
+                    self.frame_part_context(drawing, px, pane_w_px, vpr),
+                    px.get(1),
+                ) {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        projection_annotations::projection_stats(c, arc.center, target, parts);
+                    });
+                }
+            }
+            DrawingBodyGeometry::NotePin(pin) => {
+                // A fork-form note: the pin in the stroke color with a contrasting dot in its
+                // head; its box is the drawing's text (`build_drawing_text`).
+                let mut outline = Vec::new();
+                pin.outline(&mut outline);
+                let mut ribbon = Vec::new();
+                let count = aeris_charts_render::shape::convex_ribbon(&outline, &mut ribbon);
+                push_ribbon(&ribbon, count, color, out, points);
+                let dot = color.solid().contrast_text();
+                out.push(Prim::Circle {
+                    cx: pin.head.0 as f32,
+                    cy: pin.head.1 as f32,
+                    radius: pin.dot_radius as f32,
+                    fill: dot,
+                    stroke_width: 0.0,
+                    stroke: dot,
+                });
+            }
+            DrawingBodyGeometry::SpeechTail { corners } => {
+                // A fork-form comment's or price label's tail in the bubble's stroke color; the
+                // bubble is the drawing's text (`build_drawing_text`).
+                let mut ribbon = Vec::new();
+                let count = aeris_charts_render::shape::convex_ribbon(&corners, &mut ribbon);
+                push_ribbon(&ribbon, count, color, out, points);
+            }
             DrawingBodyGeometry::Arc(_) | DrawingBodyGeometry::Curve(_) => {
                 // The chord fill under the stroke; with an end cap, the shared capped stroke.
                 let clip = curve_clip(stroke.1, drawing.width, vpr);
@@ -2338,7 +2388,19 @@ impl ChartEngine {
                 }
             }
         }
-        if drawing.kind == DrawingKind::Forecast {
+        if projection_annotations::draws_forecast_boxes(drawing) {
+            // The fork form's dot and boxes take the place of upstream's outcome label.
+            if let Some(context) = self.frame_part_context(drawing, px, pane_w_px, vpr) {
+                self.push_parts(
+                    &context,
+                    pane_w_px,
+                    vpr,
+                    out,
+                    points,
+                    projection_annotations::forecast_parts,
+                );
+            }
+        } else if drawing.kind == DrawingKind::Forecast {
             if let (Some(entry), Some(target)) = (drawing.points.first(), px.get(1)) {
                 let change = drawing.points[1].price - entry.price;
                 let percent = if entry.price.abs() > f64::EPSILON {
@@ -3040,11 +3102,40 @@ impl ChartEngine {
         };
         // A family text box paints its caret with its label (`build_family_prims`): falling
         // through to the run placement would put the bar where the generic label would sit.
-        if !drawing.kind.paints_generic_text() {
+        if !drawing.kind.paints_generic_text() || projection_annotations::fork_text_owner(drawing) {
             return;
         }
         let (size, x, y, align, angle) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
         let text = drawing.display_text();
+        if drawing.text_block_lines() > 1 {
+            // Upstream's text block: the caret's own line, measured from the line start.
+            let block = TextBlock::new(
+                (x, y, align),
+                drawing.text_v_align,
+                self.measure_drawing_text(drawing, size),
+                size,
+                drawing.text_block_lines(),
+            );
+            let prefix: String = text.chars().take(session.caret).collect();
+            let row = prefix.matches('\n').count();
+            let line = prefix.rsplit('\n').next().unwrap_or("");
+            let prefix_css = self.measure_drawing_frame_text(drawing, line, size) / vpr;
+            let color = self.drawing_label_color(drawing);
+            push_caret_bar(
+                out,
+                points,
+                CaretBar {
+                    x: block.left,
+                    y: block.line_y(row),
+                    local_x: prefix_css.ceil() * vpr,
+                    half_height: size * 0.6,
+                    angle: 0.0,
+                },
+                vpr,
+                color,
+            );
+            return;
+        }
         let advance = if text.is_empty() {
             size
         } else {
@@ -3097,9 +3188,29 @@ impl ChartEngine {
             pane.top * vpr,
             pane.height * vpr,
             size,
-            TEXT_PAD * vpr,
+            vpr,
         );
         (size, x, y, align, angle)
+    }
+
+    /// The painted box of a fork-form annotation's text (`fork_text_box`) at bitmap-px anchors
+    /// `px`; `None` while it paints none (a fork-form note's box outside focus).
+    fn fork_text_rect(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w_px: i32,
+        vpr: f64,
+    ) -> Option<aeris_charts_render::shape::Rect> {
+        let context = self.frame_part_context(drawing, px, pane_w_px, vpr)?;
+        let mut parts = DrawingParts::default();
+        projection_annotations::fork_text_box(&context, &mut parts);
+        let label = parts.labels.get(parts.text?.label)?;
+        let family = &self.options.get().layout.font_family;
+        let layout = label.layout(|line| {
+            self.measure_text_run(line, label.size, family, label.weight, label.italic)
+        });
+        Some(layout.rect)
     }
 
     /// The text tool's interaction chrome (hover ring, focus border): a crisp integer-snapped
@@ -3116,20 +3227,34 @@ impl ChartEngine {
         color: Color,
         out: &mut Vec<Prim>,
     ) {
-        let (size, x, y, align, _) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
-        let width = self.measure_drawing_text(drawing, size);
-        let height = size * 1.2;
-        let pad = TEXT_CHROME_PAD * vpr;
-        let left = match align {
-            DrawingTextHAlign::Left => x,
-            DrawingTextHAlign::Center => x - width / 2.0,
-            DrawingTextHAlign::Right => x - width,
-        };
-        let rect = IRect {
-            x: (left - pad).round() as i32,
-            y: (y - height / 2.0 - pad).round() as i32,
-            w: (width + 2.0 * pad).round().max(1.0) as i32,
-            h: (height + 2.0 * pad).round().max(1.0) as i32,
+        let rect = if projection_annotations::fork_text_owner(drawing) {
+            // A fork-form box: its painted box grown by the editing border.
+            let Some(rect) = self.fork_text_rect(drawing, px, pane_w_px, vpr) else {
+                return;
+            };
+            let grow = (TEXT_CHROME_PAD - TEXT_PAD) * vpr;
+            IRect {
+                x: (rect.left - grow).round() as i32,
+                y: (rect.top - grow).round() as i32,
+                w: (rect.right - rect.left + 2.0 * grow).round().max(1.0) as i32,
+                h: (rect.bottom - rect.top + 2.0 * grow).round().max(1.0) as i32,
+            }
+        } else {
+            let (size, x, y, align, _) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
+            let block = TextBlock::new(
+                (x, y, align),
+                drawing.text_v_align,
+                self.measure_drawing_text(drawing, size),
+                size,
+                drawing.text_block_lines(),
+            );
+            let pad = TEXT_CHROME_PAD * vpr;
+            IRect {
+                x: (block.left - pad).round() as i32,
+                y: (block.top() - pad).round() as i32,
+                w: (block.width + 2.0 * pad).round().max(1.0) as i32,
+                h: (block.height() + 2.0 * pad).round().max(1.0) as i32,
+            }
         };
         out.push(Prim::RectFrame {
             rect,
@@ -3154,6 +3279,7 @@ impl ChartEngine {
         pane_w_px: i32,
         vpr: f64,
         out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
     ) {
         // Empty text paints nothing. While the host typing-mode editor is open the LABEL and
         // the focus border still paint — the editor wrap is borderless with transparent glyphs,
@@ -3165,6 +3291,21 @@ impl ChartEngine {
             .family
             .is_some_and(|family| family.owns_text)
         {
+            return;
+        }
+        // A fork-form annotation's text is its box (`fork_text_box`), with the open native
+        // session's caret.
+        if projection_annotations::fork_text_owner(drawing) {
+            if let Some(context) = self.frame_part_context(drawing, px, pane_w_px, vpr) {
+                self.push_parts(
+                    &context,
+                    pane_w_px,
+                    vpr,
+                    out,
+                    points,
+                    projection_annotations::fork_text_box,
+                );
+            }
             return;
         }
         let Some((text, placeholder)) = self.drawing_frame_text(drawing) else {
@@ -3193,20 +3334,28 @@ impl ChartEngine {
             .box_border_color
             .as_deref()
             .and_then(Color::parse_css);
-        if is_text_tool && (box_fill.is_some() || box_border.is_some()) {
-            let width = self.measure_drawing_text(drawing, size);
-            let height = size * 1.2;
+        // A text annotation's text of several lines stacks into upstream's text block.
+        let lines = drawing.text_block_lines();
+        let block = (lines > 1 || (is_text_tool && (box_fill.is_some() || box_border.is_some())))
+            .then(|| {
+                TextBlock::new(
+                    (x, y, align),
+                    drawing.text_v_align,
+                    self.measure_drawing_text(drawing, size),
+                    size,
+                    lines,
+                )
+            });
+        if let (true, Some(block)) = (
+            is_text_tool && (box_fill.is_some() || box_border.is_some()),
+            block,
+        ) {
             let pad = 4.0 * vpr;
-            let left = match align {
-                DrawingTextHAlign::Left => x,
-                DrawingTextHAlign::Center => x - width / 2.0,
-                DrawingTextHAlign::Right => x - width,
-            };
             let rect = IRect {
-                x: (left - pad).round() as i32,
-                y: (y - height / 2.0 - pad).round() as i32,
-                w: (width + 2.0 * pad).round().max(1.0) as i32,
-                h: (height + 2.0 * pad).round().max(1.0) as i32,
+                x: (block.left - pad).round() as i32,
+                y: (block.top() - pad).round() as i32,
+                w: (block.width + 2.0 * pad).round().max(1.0) as i32,
+                h: (block.height() + 2.0 * pad).round().max(1.0) as i32,
             };
             if let Some(fill) = box_fill {
                 out.push(Prim::Rect { rect, color: fill });
@@ -3221,6 +3370,23 @@ impl ChartEngine {
             }
         }
 
+        if let Some(block) = block.filter(|block| block.lines > 1) {
+            // One left-aligned run per line, at the left edge the multi-line editor shares.
+            for (index, line) in text.split('\n').enumerate() {
+                out.push(Prim::Text {
+                    x: block.left as f32,
+                    y: block.line_y(index) as f32,
+                    text: line.trim_end_matches('\r').to_string(),
+                    color,
+                    size: size as f32,
+                    family: layout.font_family.clone(),
+                    align: TextAlign::Left,
+                    weight: drawing.text_weight.unwrap_or(400),
+                    italic: drawing.text_italic,
+                });
+            }
+            return;
+        }
         let text_prim = Prim::RotatedText {
             x: x as f32,
             y: y as f32,
@@ -3283,6 +3449,7 @@ impl ChartEngine {
                 .family
                 .is_some_and(|family| family.owns_labels)
             || lines::fork_presentation(drawing)
+            || projection_annotations::draws_sector(drawing)
         {
             return;
         }

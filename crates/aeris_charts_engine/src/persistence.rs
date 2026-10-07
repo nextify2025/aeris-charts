@@ -5913,6 +5913,75 @@ mod tests {
     }
 
     #[test]
+    fn fork_annotations_restore_in_their_fork_form() {
+        use crate::drawings::{
+            resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions,
+        };
+        let document = fork_document(vec![
+            // The fork's three-anchor projection (pivot, radius point, price point).
+            stored(
+                1,
+                "projection",
+                &[timed(1.0, 10.0), timed(3.0, 10.0), timed(4.0, 12.0)],
+                serde_json::Value::Null,
+            ),
+            // The fork's one-anchor signpost.
+            stored(2, "signpost", &[timed(2.0, 11.0)], serde_json::Value::Null),
+            stored(3, "note", &[timed(2.0, 11.0)], serde_json::Value::Null),
+            stored(
+                4,
+                "price_label",
+                &[timed(2.0, 11.0)],
+                serde_json::Value::Null,
+            ),
+        ]);
+        let (chart, exported) = restore_round_trip(&document);
+        fn body<'a>(chart: &ChartEngine, id: u32, px: &'a [(f64, f64)]) -> DrawingBodyGeometry<'a> {
+            let drawing = chart.drawing(id).unwrap();
+            resolve_drawing_geometry(
+                drawing.kind,
+                px,
+                800.0,
+                0.0,
+                500.0,
+                DrawingGeometryOptions::for_drawing(drawing, 1.0),
+            )
+            .unwrap()
+            .body
+        }
+        // The projection resolves its sector, the note its pin, the price label its tail.
+        assert!(matches!(
+            body(&chart, 1, &[(100.0, 300.0), (200.0, 200.0)]),
+            DrawingBodyGeometry::Sector(_)
+        ));
+        assert!(matches!(
+            body(&chart, 3, &[(100.0, 300.0)]),
+            DrawingBodyGeometry::NotePin(_)
+        ));
+        assert!(matches!(
+            body(&chart, 4, &[(100.0, 300.0)]),
+            DrawingBodyGeometry::SpeechTail { .. }
+        ));
+        // The signpost's anchors coincide, so it stands the fork's 40 CSS px pole.
+        let points = &chart.drawing(2).unwrap().points;
+        assert_eq!(points[0], points[1]);
+        let DrawingBodyGeometry::Marker(marker) =
+            body(&chart, 2, &[(100.0, 300.0), (100.0, 300.0)])
+        else {
+            panic!("signpost marker");
+        };
+        assert_eq!(marker.anchor, (100.0, 260.0));
+        // Each keeps its marker, written as an empty block.
+        for id in 1..=4 {
+            assert_eq!(
+                written_tool_options(&exported, id),
+                serde_json::json!({"projection_annotation": {}}),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn fork_lines_annotations_patterns_and_shapes_keep_their_fork_options() {
         let two = [timed(1.0, 10.0), timed(4.0, 12.0)];
         let document = fork_document(vec![
