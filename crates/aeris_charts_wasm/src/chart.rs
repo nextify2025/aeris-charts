@@ -261,6 +261,45 @@ fn trading_result_json(result: Result<(), aeris_charts_engine::ChartError>) -> S
     }
 }
 
+fn parse_big_trades_options(
+    json: &str,
+) -> Result<aeris_charts_engine::BigTradesOptions, aeris_charts_engine::ChartError> {
+    serde_json::from_str(json).map_err(|error| {
+        aeris_charts_engine::ChartError::new(
+            aeris_charts_engine::ErrorCode::InvalidOptions,
+            format!("invalid big-trades options: {error}"),
+        )
+    })
+}
+
+/// Public error category of a big-trades rejection.
+fn big_trades_error(error: aeris_charts_engine::FootprintError) -> aeris_charts_engine::ChartError {
+    use aeris_charts_engine::{ErrorCode, FootprintError};
+    let code = match error {
+        FootprintError::BigTradesCapacity => ErrorCode::ResourceLimit,
+        FootprintError::UnsupportedBigTradesSeries(_) => ErrorCode::UnsupportedOperation,
+        FootprintError::UnknownTradeStream(_) | FootprintError::UnknownSeries(_) => {
+            ErrorCode::InvalidHandle
+        }
+        FootprintError::UnknownBigTrades(_) => ErrorCode::StaleHandle,
+        _ => ErrorCode::InvalidOptions,
+    };
+    aeris_charts_engine::ChartError::new(code, error.to_string())
+}
+
+fn big_trades_result_json<T: serde::Serialize>(
+    result: Result<T, aeris_charts_engine::ChartError>,
+) -> String {
+    match result {
+        Ok(result) => serde_json::json!({ "ok": true, "result": result }).to_string(),
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "error": { "code": error.code().name(), "message": error.message() }
+        })
+        .to_string(),
+    }
+}
+
 fn input_device_from_u8(value: u8) -> InputDevice {
     match value {
         1 => InputDevice::Touch,
@@ -1955,21 +1994,41 @@ impl AerisChart {
             .add_delta_series(stream_id, pane_index)
     }
 
-    pub fn add_trade_bubbles(
-        &mut self,
-        stream_id: u32,
-        series_id: u32,
-        minimum_volume: f64,
-        max_markers: usize,
-        aggregation_window_micros: f64,
-    ) -> bool {
-        self.inner.borrow_mut().add_trade_bubbles(
-            stream_id,
-            series_id,
-            minimum_volume,
-            max_markers,
-            aggregation_window_micros,
-        )
+    /// Draw a trade stream's large aggressive orders as volume bubbles over a price series.
+    /// Returns `{ok:true,result:id}` or a typed `{ok:false,error:{code,message}}`.
+    pub fn add_big_trades(&mut self, stream_id: u32, series_id: u32, options_json: &str) -> String {
+        big_trades_result_json(parse_big_trades_options(options_json).and_then(|options| {
+            self.inner
+                .borrow_mut()
+                .engine
+                .add_big_trades(u64::from(stream_id), series_id, options)
+                .map_err(big_trades_error)
+        }))
+    }
+
+    /// `{ok:true,result:null}` or a typed `{ok:false,error:{code,message}}`.
+    pub fn set_big_trades_options(&mut self, id: u32, options_json: &str) -> String {
+        big_trades_result_json(parse_big_trades_options(options_json).and_then(|options| {
+            self.inner
+                .borrow_mut()
+                .engine
+                .set_big_trades_options(id, options)
+                .map_err(big_trades_error)
+        }))
+    }
+
+    pub fn big_trades_options(&self, id: u32) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.big_trades_options(id))
+            .expect("validated big-trades options serialize")
+    }
+
+    pub fn big_trades_snapshot(&self, id: u32) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.big_trades_snapshot(id))
+            .expect("big-trades snapshot serializes")
+    }
+
+    pub fn remove_big_trades(&mut self, id: u32) -> bool {
+        self.inner.borrow_mut().engine.remove_big_trades(id)
     }
 
     #[allow(clippy::too_many_arguments)]

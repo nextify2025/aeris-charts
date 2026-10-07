@@ -13,6 +13,7 @@ mod alerts;
 mod axis_metrics;
 mod axis_primitives;
 mod bar_time_label_api;
+mod big_trades;
 mod chart_input;
 mod depth;
 mod domains;
@@ -84,6 +85,11 @@ pub use aeris_charts_indicators::{
 pub use alerts::{
     AlertCondition, AlertCreateRequest, AlertFrequency, AlertId, AlertLine, AlertLineStatus,
     AlertPriceScale, AlertSnapshot, MAX_ALERT_LINES,
+};
+pub use big_trades::{
+    BigTrade, BigTradesFilter, BigTradesIntensity, BigTradesOptions, BigTradesSize,
+    BigTradesSnapshot, MAX_BIG_TRADES_BUBBLES, MAX_BIG_TRADES_GROUPING_WINDOW_MICROS,
+    MAX_BIG_TRADES_INDICATORS,
 };
 pub use chart_input::{
     ChartContextMenu, ChartCursor, ChartFocusTarget, ChartHover, ChartInputEvent, ChartKey,
@@ -163,15 +169,14 @@ pub use financial_legend::{
     FinancialLegendValue, HostLegendSeries,
 };
 pub use footprint::{
-    adaptive_trade_bubble_threshold, auto_footprint_ticks_per_row, AggressorSide, BarSequence,
-    BarSequenceMapping, BarSequencePoint, CumulativeDeltaReset, FootprintAggregationOptions,
-    FootprintAggregator, FootprintBar, FootprintBarAggregation, FootprintCellMode, FootprintError,
-    FootprintImbalanceOptions, FootprintLevel, FootprintSeriesOptions, FootprintTrade,
-    FootprintUpdateKind, FootprintVisualOptions, FootprintWorkStats, OrderFlowPresentation,
+    auto_footprint_ticks_per_row, AggressorSide, BarSequence, BarSequenceMapping, BarSequencePoint,
+    CumulativeDeltaReset, FootprintAggregationOptions, FootprintAggregator, FootprintBar,
+    FootprintBarAggregation, FootprintCellMode, FootprintError, FootprintImbalanceOptions,
+    FootprintLevel, FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind,
+    FootprintVisualOptions, FootprintWorkStats, OrderFlowPresentation,
     OrderFlowPresentationOptions, ReplayClockStats, ReplaySeekStats, TimeAndSalesOptions,
-    TimeAndSalesRow, TradeBubbleOptions, TradeSessionOptions, TradeStreamStats, TradeStudyKind,
-    TradeStudyOptions, MAX_TIME_AND_SALES_ROWS, MAX_TRADE_STREAMS, MAX_TRADE_STREAM_KEY_BYTES,
-    ORDER_FLOW_SWEEP_WINDOW_MICROS, ORDER_FLOW_TRADE_BUBBLE_CAPACITY,
+    TimeAndSalesRow, TradeSessionOptions, TradeStreamStats, TradeStudyKind, TradeStudyOptions,
+    MAX_TIME_AND_SALES_ROWS, MAX_TRADE_STREAMS, MAX_TRADE_STREAM_KEY_BYTES,
 };
 pub use frame::{
     AxisBand, AxisFrame, AxisIcon, AxisLabel, AxisLabelCorners, AxisRotatedLabel, AxisTextAlign,
@@ -2121,7 +2126,7 @@ pub struct ChartEngine {
     trade_stream_keys: HashMap<String, u64>,
     trade_bar_dependents: HashMap<u64, Vec<footprint::TradeBarDependent>>,
     trade_dependents: HashMap<u64, Vec<footprint::TradeStudyDependent>>,
-    trade_bubbles: HashMap<u64, Vec<footprint::TradeBubbleDependent>>,
+    big_trades: HashMap<u64, Vec<big_trades::BigTradesIndicator>>,
     next_trade_stream_id: u64,
     synced_points_len: usize,
     synced_time_points_generation: u64,
@@ -2365,7 +2370,7 @@ impl ChartEngine {
             trade_stream_keys: HashMap::new(),
             trade_bar_dependents: HashMap::new(),
             trade_dependents: HashMap::new(),
-            trade_bubbles: HashMap::new(),
+            big_trades: HashMap::new(),
             next_trade_stream_id: 1,
             synced_points_len: 0,
             synced_time_points_generation: 0,
@@ -3063,6 +3068,13 @@ impl ChartEngine {
                     .volume_target
                     .is_none_or(|target| !tombstones.contains(&target))
         });
+        // Big-trades indicators leave with their series before liveness is computed, so a stream
+        // they alone kept alive is released in the same sweep.
+        for indicators in self.big_trades.values_mut() {
+            indicators.retain(|indicator| !tombstones.contains(&indicator.series_id));
+        }
+        self.big_trades
+            .retain(|_, indicators| !indicators.is_empty());
         let mut live_streams = self
             .series
             .iter()
@@ -3071,7 +3083,7 @@ impl ChartEngine {
         live_streams.extend(self.trade_stream_keys.values().copied());
         live_streams.extend(self.trade_bar_dependents.keys().copied());
         live_streams.extend(self.trade_dependents.keys().copied());
-        live_streams.extend(self.trade_bubbles.keys().copied());
+        live_streams.extend(self.big_trades.keys().copied());
         self.trade_streams
             .retain(|stream_id, _| live_streams.contains(stream_id));
         self.trade_stream_keys
@@ -3086,12 +3098,6 @@ impl ChartEngine {
             dependents.retain(|dependent| !tombstones.contains(&dependent.series_id));
         }
         self.trade_dependents.retain(|stream_id, dependents| {
-            live_streams.contains(stream_id) && !dependents.is_empty()
-        });
-        for dependents in self.trade_bubbles.values_mut() {
-            dependents.retain(|dependent| !tombstones.contains(&dependent.series_id));
-        }
-        self.trade_bubbles.retain(|stream_id, dependents| {
             live_streams.contains(stream_id) && !dependents.is_empty()
         });
         self.clear_sequence_axis_if_unused();
@@ -3823,8 +3829,6 @@ impl ChartEngine {
 
     pub fn set_series_markers(&mut self, id: SeriesId, markers: Vec<Marker>) {
         self.invalidate_frame_series(id);
-        // A trade-bubble fold writing this series must refold on its next refresh.
-        self.invalidate_trade_bubble_folds(id, None);
         if let Some(series) = self.series_entry_mut(id) {
             series.markers = markers;
         }

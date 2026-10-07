@@ -45,14 +45,13 @@ use std::time::Instant;
 
 use aeris_charts_core::model::data_layer::{DataLayer, SeriesId};
 use aeris_charts_engine::{
-    AggressorSide, AxisDimension, ChartEngine, ChartFrame, ContinuousScaleType,
+    AggressorSide, AxisDimension, BigTradesOptions, ChartEngine, ChartFrame, ContinuousScaleType,
     DepthHeatmapOptions, DepthLevel, DepthOptions, DepthSide, DepthSnapshot, DepthUpdate,
     FootprintAggregationOptions, FootprintBarAggregation, FootprintSeriesOptions, FootprintTrade,
     FootprintVisualOptions, GeneralAxisOptions, GeneralHitMode, GeneralScaleType,
     GeneralSeriesOptions, GeneralXyInput, GestureResolver, HorizontalDomain, InputDevice,
     InputTarget, PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest,
-    PointerSample, ProfileSource, ResampleBoundary, SeriesKind, TradeBubbleOptions,
-    TradeStudyOptions,
+    PointerSample, ProfileSource, ResampleBoundary, SeriesKind, TradeStudyOptions,
 };
 use aeris_charts_native::render_prims;
 use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
@@ -1400,16 +1399,8 @@ fn main() -> ExitCode {
         .add_delta_series(footprint_stream, 1)
         .expect("add delta dependent");
     footprint
-        .add_trade_bubbles(
-            footprint_stream,
-            0,
-            TradeBubbleOptions {
-                minimum_volume: 10.0,
-                max_markers: 2_048,
-                aggregation_window_micros: 0,
-            },
-        )
-        .expect("add bubble dependent");
+        .add_big_trades(footprint_stream, 0, BigTradesOptions::default())
+        .expect("add big-trades dependent");
     let history = gen_footprint_trades(0, FOOTPRINT_HISTORY_BARS, FOOTPRINT_TRADES_PER_BAR);
     let start = Instant::now();
     footprint
@@ -1506,9 +1497,10 @@ fn main() -> ExitCode {
     );
 
     // Sustained single-trade live tips on the retained chart. Each tip must advance the footprint,
-    // bound candles, CVD, delta, and bubble dependents by the changed bar suffix and the new trade
-    // only. The tip crossing the retention ceiling also evicts the leading bars, their trades, and
-    // their bubbles in place, without reconstructing the retained tape or refolding bubbles.
+    // bound candles, CVD, delta, and big-trades dependents by the changed bar suffix and the new
+    // trade only. The tip crossing the retention ceiling also evicts the leading bars, their
+    // trades, and their big-trades orders in place, without reconstructing or replaying the
+    // retained tape.
     let tip_trades = gen_footprint_trades(
         FOOTPRINT_HISTORY_BARS + FOOTPRINT_LIVE_BARS,
         FOOTPRINT_TIP_BARS,
@@ -1562,24 +1554,26 @@ fn main() -> ExitCode {
         |p: f64| tip_samples[((tip_samples.len() - 1) as f64 * p).round() as usize];
     let tip_study_rows = tip_work.dependent_rows_computed - tip_work_before.dependent_rows_computed;
     let tip_bar_rows = tip_work.bar_rows_projected - tip_work_before.bar_rows_projected;
-    let tip_bubble_trades = tip_work.bubble_trades_scanned - tip_work_before.bubble_trades_scanned;
-    let tip_bubble_sizes = tip_work.bubble_markers_sized - tip_work_before.bubble_markers_sized;
+    let tip_big_trades_prints =
+        tip_work.big_trades_prints_scanned - tip_work_before.big_trades_prints_scanned;
+    let tip_big_trades_replays = tip_work.big_trades_replays - tip_work_before.big_trades_replays;
     println!(
-        "  live tips: {tip_count} single-trade tips, {tip_trims} retention trim(s) (slowest {trim_tip_ms:.2} ms, {trim_tip_passes:?} union passes), {tip_rebuilds} tape reconstruction(s); p50 {:.4} ms, max {:.2} ms; per tip {:.2} study rows, {:.2} bar rows, {:.2} bubble trades, {:.2} bubble sizes",
+        "  live tips: {tip_count} single-trade tips, {tip_trims} retention trim(s) (slowest {trim_tip_ms:.2} ms, {trim_tip_passes:?} union passes), {tip_rebuilds} tape reconstruction(s), {tip_big_trades_replays} big-trades replay(s); p50 {:.4} ms, max {:.2} ms; per tip {:.2} study rows, {:.2} bar rows, {:.2} big-trades prints",
         tip_percentile(0.5),
         tip_percentile(1.0),
         tip_study_rows as f64 / tip_count as f64,
         tip_bar_rows as f64 / tip_count as f64,
-        tip_bubble_trades as f64 / tip_count as f64,
-        tip_bubble_sizes as f64 / tip_count as f64,
+        tip_big_trades_prints as f64 / tip_count as f64,
     );
     // CVD and delta each recompute the changed suffix (the active bar, plus the bar a tip opens);
-    // the footprint and bound candles project the same suffix; bubbles fold each new trade exactly
-    // once, also across the retention trim, and nothing reconstructs the retained tape. A trim
-    // runs one union merge and one reindex for all of its presentations, however many there are.
+    // the footprint and bound candles project the same suffix; big trades fold each new trade
+    // exactly once and replay nothing, also across the retention trim, and nothing reconstructs
+    // the retained tape. A trim runs one union merge and one reindex for all of its
+    // presentations, however many there are.
     let d_tip_work_pass = tip_study_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
         && tip_bar_rows <= 2 * (tip_count + FOOTPRINT_TIP_BARS as u64)
-        && tip_bubble_trades == tip_count
+        && tip_big_trades_prints == tip_count
+        && tip_big_trades_replays == 0
         && tip_rebuilds == 0
         && tip_trims >= 1
         && trim_tip_passes.iter().all(|&passes| passes == 2);

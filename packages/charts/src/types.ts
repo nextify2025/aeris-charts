@@ -3567,13 +3567,16 @@ export interface trade_stream_stats {
   dependent_rows_computed: number;
   /** Lifetime footprint and bound candle/bar rows projected; a live tip adds only its active bars. */
   bar_rows_projected: number;
-  /** Lifetime tape trades folded into bubble markers; a live tip adds only its new trades. */
-  bubble_trades_scanned: number;
   /**
-   * Lifetime bubble marker sizes computed; a live tip sizes only its new or merged bubbles unless
-   * the peak retained bubble volume changes, which rescales every retained bubble once.
+   * Lifetime prints big-trades indicators folded into rebuilt orders; a live tip adds only its
+   * new prints, and a retention trim evicts orders in place and adds none.
    */
-  bubble_markers_sized: number;
+  big_trades_prints_scanned: number;
+  /**
+   * Lifetime big-trades replays of the visible tape (tape replacement, corrections, replay seeks,
+   * filter or grouping changes); live tips and retention trims add none.
+   */
+  big_trades_replays: number;
 }
 
 export interface replay_seek_stats {
@@ -4720,6 +4723,61 @@ export interface volume_profile_indicator_api {
   remove(): void;
 }
 
+/** Which orders become bubbles. `auto` keeps orders above a percentile of the recently completed
+ * orders (weak 95th, medium 98th, strong 99.5th); `fixed` keeps orders of at least the volume. */
+export type big_trades_filter =
+  | { mode: "auto"; intensity: "weak" | "medium" | "strong" }
+  | { mode: "fixed"; minimum_volume: number };
+/** Large aggressive orders rebuilt from consecutive same-aggressor prints, then filtered. */
+export interface big_trades_options {
+  /** Default `{ mode: "auto", intensity: "medium" }`. */
+  filter: big_trades_filter;
+  /** Largest gap between prints of one order, 0-1,000,000 µs. Default 1000. */
+  grouping_window_micros: number;
+  /** Bubble diameter range. Default `medium`. */
+  size: "small" | "medium" | "large";
+  /** Draw the order volume inside bubbles large enough to hold it. Default true. */
+  show_volume: boolean;
+  visible: boolean;
+  buy_color: string;
+  sell_color: string;
+  buy_border_color: string;
+  sell_border_color: string;
+  /** `null` follows the chart layout text color. */
+  text_color: string | null;
+}
+export interface big_trade {
+  side: "buy" | "sell";
+  volume: number;
+  prints: number;
+  /** Volume-weighted fill price; the bubble is centred here. */
+  vwap: number;
+  low: number;
+  high: number;
+  start_timestamp_micros: number;
+  end_timestamp_micros: number;
+  /**
+   * UTC-second open of the bar the order opened in, or that bar's row key on trade, volume, and
+   * range bars. Retention never re-keys it: an order leaves with the bar it opened in.
+   */
+  bar_time: number;
+}
+export interface big_trades_snapshot {
+  /** The filter applied, or `null` while the automatic filter is still sampling. */
+  threshold: number | null;
+  /** Qualifying orders oldest first, ending with the still-forming order when it qualifies; the
+   * newest 4096 completed orders are kept. */
+  bubbles: readonly big_trade[];
+}
+export interface big_trades_api {
+  readonly id: number;
+  options(): big_trades_options;
+  /** Throws `invalid_options` for rejected options and `stale_handle` after removal. */
+  apply_options(options: Partial<big_trades_options>): void;
+  snapshot(): big_trades_snapshot;
+  remove(): void;
+}
+
 /** The chart. Create with {@link create_chart}. */
 export interface chart_api {
   /** Format a time with the chart's time zone, date pattern, and crosshair time formatter. */
@@ -4840,7 +4898,13 @@ export interface chart_api {
    * work.
    */
   add_delta_series(stream_id: number, pane?: number): series_api;
-  add_trade_bubbles(series: series_api | number, stream_id: number, options?: { minimum_volume?: number; max_markers?: number; aggregation_window_micros?: number }): void;
+  /**
+   * Draw a trade stream's large aggressive orders as volume bubbles over a price series. Throws
+   * `resource_limit` past 16 indicators, `unsupported_operation` for a series type that cannot
+   * host bubbles, `invalid_handle` for an unknown stream or series, and `invalid_options` for
+   * rejected options.
+   */
+  add_big_trades(series: series_api | number, stream_id: number, options?: Partial<big_trades_options>): big_trades_api;
   /**
    * Anchor a time-bar trade stream to exchange-local session windows in the chart's `time_zone`
    * and `session_start`: each window restarts the bar grid (A-share 60-minute bars open at 09:30,

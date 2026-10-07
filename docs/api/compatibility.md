@@ -79,6 +79,10 @@
 
 新增绘图/系列类型通常属于 minor 级别的包功能，但改变既有类型的含义则不兼容。新增持久化 schema 不会使 V1 失效；移除 V1 支持遵循另行记载的持久化窗口，属于 major 级别的兼容性事件。
 
+### 已记录的不兼容变更
+
+- 大单取代足迹图成交气泡（上游 `9fc3f2b`）。`chart.add_trade_bubbles(series, stream_id, options)` 已移除且没有兼容垫片：其替代品 `chart.add_big_trades(series, stream_id, options)` 的行为不同（先由连续成交重建主动订单再过滤，默认按最近已完成订单的 98 分位数自动过滤，前 128 个订单完成之前不显示任何气泡；气泡是窗格 chrome，不再写入系列标记），并返回一个 `big_trades_api` 句柄；被拒绝时抛出带类型的错误：超过 16 个指标为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，选项无效为 `invalid_options`（`apply_options` 在句柄移除后为 `stale_handle`）。`trade_stream_stats` 的 `bubble_trades_scanned` 与 `bubble_markers_sized` 由 `big_trades_prints_scanned` 与 `big_trades_replays` 取代。按上文策略这属于 major 级别的变更，具体版本号在发布时决定。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
+
 ## 品牌更名
 
 浏览器包为 `@aeristerminal/aeris-charts`（含 `@aeristerminal/aeris-charts/react`）。原先带有品牌名的错误导出已重命名为 `AerisChartsError` 和 `AerisChartsErrorCode`；迁移时请更新导入与 `instanceof` 检查。Rust 使用方使用仅限仓库的 `aeris_charts_*` crate。

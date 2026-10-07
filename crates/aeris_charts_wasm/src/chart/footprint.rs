@@ -4,7 +4,7 @@ use super::*;
 use aeris_charts_engine::{
     AggressorSide, CumulativeDeltaReset, FootprintBarAggregation, FootprintCellMode,
     FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind, TimeAndSalesOptions,
-    TradeBubbleOptions, TradeStudyOptions,
+    TradeStudyOptions,
 };
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -506,33 +506,6 @@ impl ChartInner {
         self.engine
             .add_delta_series(stream_id as u64, pane_index)
             .unwrap_or(u32::MAX)
-    }
-
-    pub(super) fn add_trade_bubbles(
-        &mut self,
-        stream_id: u32,
-        series_id: u32,
-        minimum_volume: f64,
-        max_markers: usize,
-        aggregation_window_micros: f64,
-    ) -> bool {
-        if !aggregation_window_micros.is_finite()
-            || aggregation_window_micros < 0.0
-            || aggregation_window_micros.fract() != 0.0
-        {
-            return false;
-        }
-        self.engine
-            .add_trade_bubbles(
-                stream_id as u64,
-                series_id,
-                TradeBubbleOptions {
-                    minimum_volume,
-                    max_markers,
-                    aggregation_window_micros: aggregation_window_micros as i64,
-                },
-            )
-            .is_ok()
     }
 
     pub(super) fn add_footprint_series(&mut self, adopt_primary: bool, options_json: &str) -> u32 {
