@@ -839,11 +839,11 @@ impl ChartEngine {
         // Already the rendered stroke (see `series_stroke_color`).
         let color = rs.color;
         let point_colors = self.data.point_colors(rs.id);
-        // Bollinger background fill: the band between this UPPER output and its LOWER
+        // Band background fill: the band between this UPPER output and its LOWER
         // companion, in the band color at the public reference's 0.2 background alpha, painted under
         // the band strokes. Both outputs share bar times, so the rows (and x's) align
         // point-for-point; a count mismatch skips the fill rather than drawing a wrong one.
-        if let Some(lower_id) = self.bollinger_fill_companion(rs.id) {
+        if let Some(lower_id) = self.band_fill_companion(rs.id) {
             let lower_plot = self.data.plot(lower_id);
             let lower_close = |row: usize| lower_plot.value_at(row, PlotValueIndex::Close);
             let mut work = conflation::DensityWork::default();

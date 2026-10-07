@@ -2614,6 +2614,53 @@ impl AerisChart {
         self.inner.borrow_mut().add_sma(source_id, period)
     }
 
+    pub fn add_aroon(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.inner.borrow_mut().add_aroon(source_id, period)
+    }
+
+    pub fn add_awesome_oscillator(&mut self, source_id: u32) -> u32 {
+        self.inner.borrow_mut().add_awesome_oscillator(source_id)
+    }
+
+    pub fn add_dpo(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner.borrow_mut().add_dpo(source_id, period)
+    }
+
+    pub fn add_chande_momentum(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_chande_momentum(source_id, period)
+    }
+
+    pub fn add_bollinger_metrics(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_bollinger_metrics(source_id, period, deviation)
+    }
+
+    pub fn add_envelopes(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        percent: f64,
+        exponential: bool,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_envelopes(source_id, period, percent, exponential)
+    }
+
+    pub fn add_alma(&mut self, source_id: u32, period: u32, offset: f64, sigma: f64) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_alma(source_id, period, offset, sigma)
+    }
+
     pub fn add_sma_with_source(&mut self, source_id: u32, source: &str, period: u32) -> u32 {
         self.inner
             .borrow_mut()
@@ -3027,6 +3074,112 @@ impl AerisChart {
     /// Add on-balance volume in its own oscillator pane (`volume_source` is required).
     pub fn add_obv(&mut self, source_id: u32, volume_source: i32) -> u32 {
         self.inner.borrow_mut().add_obv(source_id, volume_source)
+    }
+
+    pub fn add_accumulation_distribution(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_accumulation_distribution(source_id, volume_source)
+    }
+
+    pub fn add_price_volume_trend(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_price_volume_trend(source_id, volume_source)
+    }
+
+    pub fn add_chaikin_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_chaikin_oscillator(source_id, volume_source, fast, slow)
+    }
+
+    pub fn add_relative_volume(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_relative_volume(source_id, volume_source, period)
+    }
+
+    pub fn add_volume_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_volume_oscillator(source_id, volume_source, fast, slow, signal)
+    }
+
+    pub fn add_elder_force(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_elder_force(source_id, volume_source, period)
+    }
+
+    pub fn add_ease_of_movement(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        period: u32,
+        divisor: f64,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_ease_of_movement(source_id, volume_source, period, divisor)
+    }
+
+    pub fn add_historical_volatility(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        annualization: f64,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_historical_volatility(source_id, period, annualization)
+    }
+
+    pub fn add_trix(&mut self, source_id: u32, period: u32, signal: u32) -> Vec<u32> {
+        self.inner.borrow_mut().add_trix(source_id, period, signal)
+    }
+
+    pub fn add_coppock_curve(
+        &mut self,
+        source_id: u32,
+        long: u32,
+        short: u32,
+        smoothing: u32,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_coppock_curve(source_id, long, short, smoothing)
+    }
+
+    pub fn add_fisher_transform(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_fisher_transform(source_id, period)
+    }
+
+    pub fn add_ultimate_oscillator(
+        &mut self,
+        source_id: u32,
+        short: u32,
+        medium: u32,
+        long: u32,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_ultimate_oscillator(source_id, short, medium, long)
     }
 
     /// Add Chaikin money flow in its own oscillator pane.

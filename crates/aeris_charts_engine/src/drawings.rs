@@ -1706,7 +1706,7 @@ impl Drawing {
     }
 
     /// Long/Short Position has semantic levels, not three unrelated corners. Keep the stop on the
-    /// origin edge and project target/stop to the correct side of entry while preserving each
+    /// pivot edge and project target/stop to the correct side of entry while preserving each
     /// supplied distance. This also repairs older malformed persisted/programmatic values.
     fn normalize_position_points(kind: DrawingKind, points: &mut [DrawingPoint]) {
         if points.len() != 3 {
@@ -8176,7 +8176,7 @@ impl ChartEngine {
                                 _ => cursor_pt.price,
                             };
                         }
-                        // Entry/origin: move the entry level and the origin edge. Keep the stop
+                        // Entry/pivot: move the entry level and the pivot edge. Keep the stop
                         // point on that edge so its x never becomes an independent corner.
                         1 => {
                             let low = points[1].price.min(points[2].price);

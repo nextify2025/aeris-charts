@@ -23,6 +23,305 @@ function count_color(png, target, tol = 10) {
   return n;
 }
 
+test("breadth studies expose engine values and metadata through the browser host", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    source.set_data(Array.from({ length: 40 }, (_, index) => ({
+      time: 1_700_000_000 + index * 60,
+      open: 100 + index,
+      high: 101 + index,
+      low: 99 + index,
+      close: 100 + index,
+    })));
+    const aroon = chart.add_aroon(source, 3);
+    const ao = chart.add_awesome_oscillator(source);
+    const dpo = chart.add_dpo(source, 5);
+    const cmo = chart.add_chande_momentum(source, 5);
+    const metrics = chart.add_bollinger_metrics(source, 5, 2);
+    const envelopes = chart.add_envelopes(source, 5, 10, true);
+    const alma = chart.add_alma(source, 5);
+    const outputs = [...aroon, ao, dpo, cmo, ...metrics, ...envelopes, alma];
+    const schema = chart.indicator_schema("envelopes", 5, 10);
+    return { outputs: outputs.map((output) => ({
+      kind: output.indicator_info().kind,
+      value: output.data().at(-1)?.value,
+      pane: output.pane_index(),
+      exponential: output.indicator_info().parameters.exponential,
+      offset: output.indicator_info().parameters.offset,
+      sigma: output.indicator_info().parameters.sigma,
+    })), schema };
+  });
+  const outputs = result.outputs;
+  expect(outputs.slice(0, 5).map(({ kind, value }) => ({ kind, value }))).toEqual([
+    { kind: "aroon", value: 100 },
+    { kind: "aroon", value: 0 },
+    { kind: "awesome_oscillator", value: 14.5 },
+    { kind: "dpo", value: -1 },
+    { kind: "chande_momentum", value: 100 },
+  ]);
+  expect(outputs.slice(5, 7).map(({ kind }) => kind)).toEqual(["bollinger_metrics", "bollinger_metrics"]);
+  expect(outputs[5].value).toBeCloseTo((2 + 2 * Math.SQRT2) / (4 * Math.SQRT2), 8);
+  expect(outputs[6].value).toBeCloseTo(4 * Math.SQRT2 / 137 * 100, 8);
+  expect(outputs[5].pane).not.toBe(outputs[6].pane);
+  expect(outputs.slice(7, 10).map(({ kind, exponential }) => ({ kind, exponential }))).toEqual(Array(3).fill({ kind: "envelopes", exponential: true }));
+  for (const [index, expected] of [150.7, 137, 123.3].entries()) {
+    expect(outputs[7 + index].value).toBeCloseTo(expected, 8);
+  }
+  expect(result.schema.parameters.find(({ name }) => name === "exponential")).toMatchObject({ parameter_type: "boolean", default: false });
+  expect(outputs[10]).toMatchObject({ kind: "alma", offset: 0.85, sigma: 6 });
+  expect(outputs[10].value).toBeGreaterThan(137);
+  expect(outputs[10].value).toBeLessThan(139);
+});
+
+test("cumulative volume studies align sparse volume and repair historical insertions", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    const volume = chart.add_series("histogram", { visible: false });
+    const start = 1_700_000_000;
+    source.set_data([
+      { time: start, open: 10, high: 12, low: 8, close: 11 },
+      { time: start + 60, open: 11, high: 14, low: 10, close: 13 },
+      { time: start + 120, open: 13, high: 15, low: 11, close: 15 },
+    ]);
+    volume.set_data([{ time: start, value: 10 }, { time: start + 120, value: 30 }]);
+    const adl = chart.add_accumulation_distribution(source, volume);
+    const pvt = chart.add_price_volume_trend(source, volume);
+    const chaikin = chart.add_chaikin_oscillator(source, 2, 3, volume);
+    const relative = chart.add_relative_volume(source, 2, volume);
+    const elder = chart.add_elder_force(source, 2, volume);
+    const ease = chart.add_ease_of_movement(source, 2, volume, 100);
+    const studies = [adl, pvt, chaikin, relative, elder, ease];
+    const before = studies.map((output) => output.data().at(-1)?.value);
+    volume.update({ time: start + 60, value: 20 });
+    return {
+      before,
+      after: studies.map((output) => output.data().at(-1)?.value),
+      kinds: studies.map((output) => output.indicator_info().kind),
+      volume_ids: studies.map((output) => output.indicator_info().volume_source.id),
+      volume_id: volume.id,
+    };
+  });
+  expect(result.kinds).toEqual(["accumulation_distribution", "price_volume_trend", "chaikin_oscillator", "relative_volume", "elder_force", "ease_of_movement"]);
+  expect(result.volume_ids).toEqual(Array(6).fill(result.volume_id));
+  expect(result.before[0]).toBe(35);
+  expect(result.before[1]).toBeCloseTo(60 / 13, 8);
+  expect(result.before[2]).toBeCloseTo(10, 8);
+  expect(result.before[3]).toBeCloseTo(6, 8);
+  expect(result.before[4]).toBeCloseTo(30, 8);
+  expect(result.before[5]).toBeUndefined();
+  expect(result.after[0]).toBe(45);
+  expect(result.after[1]).toBeCloseTo(40 / 11 + 60 / 13, 8);
+  expect(result.after[2]).toBeCloseTo(35 / 3, 8);
+  expect(result.after[3]).toBeCloseTo(2, 8);
+  expect(result.after[4]).toBeCloseTo(50, 8);
+  expect(result.after[5]).toBeCloseTo(80 / 3, 8);
+});
+
+test("volume oscillator keeps three ordered outputs across historical volume repair", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    const volume = chart.add_series("histogram", { visible: false });
+    const start = 1_700_100_000;
+    source.set_data([0, 1, 2].map((i) => ({
+      time: start + i * 60, open: 10 + i, high: 12 + i, low: 9 + i, close: 11 + i,
+    })));
+    volume.set_data([{ time: start, value: 10 }, { time: start + 120, value: 30 }]);
+    const outputs = chart.add_volume_oscillator(source, 1, 2, 2, volume);
+    const before = outputs.map((output) => output.data().at(-1)?.value);
+    const kinds = outputs.map((output) => output.indicator_info().kind);
+    const output_indices = outputs.map((output) => output.indicator_info().output_index);
+    const binding_ids = outputs.map((output) => output.indicator_info().binding_id);
+    volume.update({ time: start + 60, value: 20 });
+    return {
+      before,
+      after: outputs.map((output) => output.data().at(-1)?.value),
+      kinds,
+      output_indices,
+      binding_ids,
+      ids: outputs.map((output) => output.id),
+      volume_id: outputs[0].indicator_info().volume_source.id,
+      expected_volume_id: volume.id,
+      schema: chart.indicator_schema("volume_oscillator"),
+    };
+  });
+  expect(result.kinds).toEqual(Array(3).fill("volume_oscillator"));
+  expect(result.output_indices).toEqual([0, 1, 2]);
+  expect(result.binding_ids).toEqual(Array(3).fill(result.ids[0]));
+  expect(result.volume_id).toBe(result.expected_volume_id);
+  expect(result.schema.parameters.map(({ name }) => name)).toContain("signal");
+  expect(result.before[0]).toBeCloseTo(500 / 13, 8);
+  expect(result.before[1]).toBeCloseTo(-400 / 13, 8);
+  expect(result.before[2]).toBeCloseTo(900 / 13, 8);
+  expect(result.after[0]).toBeCloseTo(20, 8);
+  expect(result.after[1]).toBeCloseTo(80 / 3, 8);
+  expect(result.after[2]).toBeCloseTo(-20 / 3, 8);
+});
+
+test("historical volatility annualizes sample log returns and repairs corrected history", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("line", { visible: false });
+    const start = 1_700_200_000;
+    source.set_data([1, 2, 4, 16].map((value, row) => ({
+      time: start + row * 60, value,
+    })));
+    const output = chart.add_historical_volatility(source, 2, 4);
+    const before = output.data().at(-1)?.value;
+    const info = output.indicator_info();
+    source.update({ time: start + 120, value: 2 });
+    return {
+      before,
+      after: output.data().at(-1)?.value,
+      kind: info.kind,
+      annualization: info.parameters.annualization,
+      schema: chart.indicator_schema("historical_volatility"),
+    };
+  });
+  expect(result.kind).toBe("historical_volatility");
+  expect(result.annualization).toBe(4);
+  expect(result.schema.parameters.map(({ name }) => name)).toContain("annualization");
+  expect(result.before).toBeCloseTo(200 * Math.log(2) / Math.SQRT2, 8);
+  expect(result.after).toBeCloseTo(200 * Math.log(8) / Math.SQRT2, 8);
+});
+
+test("TRIX returns ordered line and signal outputs after historical repair", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("line", { visible: false });
+    const start = 1_700_300_000;
+    source.set_data([1, 2, 3, 4, 5, 6].map((value, row) => ({
+      time: start + row * 60, value,
+    })));
+    const outputs = chart.add_trix(source, 2, 2);
+    const before = outputs.map((output) => output.data().at(-1)?.value);
+    const info = outputs.map((output) => output.indicator_info());
+    source.update({ time: start + 120, value: 2 });
+    return {
+      before,
+      after: outputs.map((output) => output.data().at(-1)?.value),
+      kinds: info.map((entry) => entry.kind),
+      indices: info.map((entry) => entry.output_index),
+      binding_ids: info.map((entry) => entry.binding_id),
+      schema: chart.indicator_schema("trix"),
+    };
+  });
+  expect(result.kinds).toEqual(["trix", "trix"]);
+  expect(result.indices).toEqual([0, 1]);
+  expect(result.binding_ids[0]).toBe(result.binding_ids[1]);
+  expect(result.schema.parameters.map(({ name }) => name)).toContain("signal");
+  expect(result.before[0]).toBeCloseTo(200 / 7, 8);
+  expect(result.before[1]).toBeCloseTo(240 / 7, 8);
+  expect(result.after[0]).not.toBe(result.before[0]);
+  expect(result.after[1]).not.toBe(result.before[1]);
+});
+
+test("Coppock Curve weights two rates of change and repairs historical prices", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("line", { visible: false });
+    const start = 1_700_400_000;
+    source.set_data([1, 2, 4, 8, 16].map((value, row) => ({
+      time: start + row * 60, value,
+    })));
+    const output = chart.add_coppock_curve(source, 2, 1, 2);
+    const before = output.data().at(-1)?.value;
+    const info = output.indicator_info();
+    source.update({ time: start + 120, value: 3 });
+    return {
+      before,
+      after: output.data().at(-1)?.value,
+      kind: info.kind,
+      parameters: info.parameters,
+      schema: chart.indicator_schema("coppock_curve"),
+    };
+  });
+  expect(result.kind).toBe("coppock_curve");
+  expect(result.parameters).toMatchObject({ long_period: 2, short_period: 1, smoothing: 2 });
+  expect(result.schema.parameters.map(({ name }) => name)).toEqual(["source", "long_period", "short_period", "smoothing"]);
+  expect(result.before).toBeCloseTo(400, 8);
+  expect(result.after).toBeCloseTo(4600 / 9, 8);
+});
+
+test("Fisher Transform shares ordered line and trigger outputs and repairs extrema", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    const start = 1_700_500_000;
+    source.set_data([0, 1, 2].map((row) => ({
+      time: start + row * 60, open: row * 2 + 1, high: row * 2 + 2,
+      low: row * 2, close: row * 2 + 1,
+    })));
+    const outputs = chart.add_fisher_transform(source, 2);
+    const before = outputs.map((output) => output.data().at(-1)?.value);
+    const info = outputs.map((output) => output.indicator_info());
+    source.update({ time: start + 60, open: 4, high: 5, low: 2, close: 4 });
+    return {
+      before,
+      after: outputs.map((output) => output.data().at(-1)?.value),
+      kinds: info.map((entry) => entry.kind),
+      indices: info.map((entry) => entry.output_index),
+      binding_ids: info.map((entry) => entry.binding_id),
+      schema: chart.indicator_schema("fisher_transform"),
+    };
+  });
+  const first = 0.5 * Math.log((1 + 0.165) / (1 - 0.165));
+  const secondValue = 0.165 + 0.67 * 0.165;
+  const second = 0.5 * Math.log((1 + secondValue) / (1 - secondValue)) + 0.5 * first;
+  expect(result.kinds).toEqual(["fisher_transform", "fisher_transform"]);
+  expect(result.indices).toEqual([0, 1]);
+  expect(result.binding_ids[0]).toBe(result.binding_ids[1]);
+  expect(result.schema.parameters.map(({ name }) => name)).toEqual(["source", "period"]);
+  expect(result.before[0]).toBeCloseTo(second, 8);
+  expect(result.before[1]).toBeCloseTo(first, 8);
+  expect(result.after[0]).not.toBe(result.before[0]);
+  expect(result.after[1]).not.toBe(result.before[1]);
+});
+
+test("Ultimate Oscillator weights buying pressure across three windows", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    const start = 1_700_600_000;
+    source.set_data([0, 1, 2].map((row) => ({
+      time: start + row * 60, open: row * 4 + 4,
+      high: row * 2 + 10, low: row * 2, close: row * 4 + 5,
+    })));
+    const output = chart.add_ultimate_oscillator(source, 1, 2, 3);
+    const before = output.data().at(-1)?.value;
+    const info = output.indicator_info();
+    source.update({ time: start + 60, open: 8, high: 12, low: 2, close: 8 });
+    return {
+      before, after: output.data().at(-1)?.value,
+      kind: info.kind, parameters: info.parameters,
+      schema: chart.indicator_schema("ultimate_oscillator"),
+    };
+  });
+  expect(result.kind).toBe("ultimate_oscillator");
+  expect(result.parameters).toMatchObject({ short_period: 1, period: 2, long_period: 3 });
+  expect(result.schema.parameters.map(({ name }) => name)).toEqual(["source", "short_period", "medium_period", "long_period"]);
+  expect(result.before).toBeCloseTo(590 / 7, 8);
+  expect(result.after).not.toBe(result.before);
+});
+
 test("EMA ribbon owns five colored outputs and updates periods in place", async ({ page }) => {
   await page.goto("/");
   await wait_grid(page);

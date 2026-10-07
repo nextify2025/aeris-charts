@@ -41,6 +41,7 @@ impl IndicatorInputSource {
 pub enum IndicatorParameterType {
     Integer,
     Number,
+    Boolean,
     Source,
     Series,
     /// One of the string values listed in [`IndicatorParameterDescriptor::choices`].
@@ -94,7 +95,7 @@ pub struct IndicatorSchema {
     pub outputs: Vec<IndicatorOutputDescriptor>,
 }
 
-pub const INDICATOR_SCHEMA_REVISION: u32 = 2;
+pub const INDICATOR_SCHEMA_REVISION: u32 = 3;
 
 // `remote = "Self"` makes serde emit the derived bodies as inherent functions, so the trait impls below can
 // keep the large internally tagged `Deserialize` body out of line. Without that, every call path
@@ -105,6 +106,16 @@ pub const INDICATOR_SCHEMA_REVISION: u32 = 2;
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", remote = "Self")]
 pub enum IndicatorKind {
+    Aroon {
+        period: usize,
+    },
+    AwesomeOscillator,
+    Dpo {
+        period: usize,
+    },
+    ChandeMomentum {
+        period: usize,
+    },
     Sma {
         period: usize,
     },
@@ -184,6 +195,20 @@ pub enum IndicatorKind {
         #[serde(default)]
         estimator: aeris_charts_indicators::DeviationEstimator,
     },
+    BollingerMetrics {
+        period: usize,
+        deviation: f64,
+    },
+    Envelopes {
+        period: usize,
+        percent: f64,
+        exponential: bool,
+    },
+    Alma {
+        period: usize,
+        offset: f64,
+        sigma: f64,
+    },
     Rsi {
         period: usize,
         #[serde(default)]
@@ -208,6 +233,48 @@ pub enum IndicatorKind {
     },
     Vwap,
     Obv,
+    AccumulationDistribution,
+    PriceVolumeTrend,
+    ChaikinOscillator {
+        fast: usize,
+        slow: usize,
+    },
+    RelativeVolume {
+        period: usize,
+    },
+    VolumeOscillator {
+        fast: usize,
+        slow: usize,
+        signal: usize,
+    },
+    ElderForce {
+        period: usize,
+    },
+    EaseOfMovement {
+        period: usize,
+        divisor: f64,
+    },
+    HistoricalVolatility {
+        period: usize,
+        annualization: f64,
+    },
+    Trix {
+        period: usize,
+        signal: usize,
+    },
+    CoppockCurve {
+        long: usize,
+        short: usize,
+        smoothing: usize,
+    },
+    FisherTransform {
+        period: usize,
+    },
+    UltimateOscillator {
+        short: usize,
+        medium: usize,
+        long: usize,
+    },
     Cmf {
         period: usize,
     },
@@ -316,6 +383,12 @@ impl IndicatorKind {
                 d_smoothing,
                 seed: convention.kdj_seed(),
             },
+            // ponytail: the breadth-tier EMA kinds (exponential Envelopes, Chaikin Oscillator,
+            // Volume Oscillator, Elder Force, TRIX) always seed with the SMA of their first N
+            // samples and carry no `seed` parameter, so the China preset leaves them unchanged;
+            // likewise Bollinger metrics always use the population deviation. Add the typed
+            // parameters here (and to the schema, persistence and TS) once a platform reference
+            // for their formula-language forms is verified.
             other => other,
         }
     }
@@ -612,6 +685,14 @@ pub struct IndicatorParameters {
     pub reset: Option<aeris_charts_indicators::VwapReset>,
     pub standard_deviation: Option<f64>,
     pub percent: Option<f64>,
+    pub exponential: Option<bool>,
+    pub offset: Option<f64>,
+    pub sigma: Option<f64>,
+    pub divisor: Option<f64>,
+    pub annualization: Option<f64>,
+    pub long_period: Option<usize>,
+    pub short_period: Option<usize>,
+    pub smoothing: Option<usize>,
     pub seed: Option<aeris_charts_indicators::IndicatorSeed>,
     pub histogram_multiplier: Option<f64>,
     pub estimator: Option<aeris_charts_indicators::DeviationEstimator>,
@@ -871,6 +952,39 @@ impl ChartEngine {
                 .position(|&output| output == id)
                 .map(|output_index| {
                     let (kind, period, deviation, parameters) = match binding.kind {
+                        IndicatorKind::Aroon { period } => (
+                            "aroon",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::AwesomeOscillator => (
+                            "awesome_oscillator",
+                            0,
+                            None,
+                            IndicatorParameters::default(),
+                        ),
+                        IndicatorKind::Dpo { period } => (
+                            "dpo",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::ChandeMomentum { period } => (
+                            "chande_momentum",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
                         IndicatorKind::Sma { period } => (
                             "sma",
                             period,
@@ -1081,6 +1195,46 @@ impl ChartEngine {
                                 ..IndicatorParameters::default()
                             },
                         ),
+                        IndicatorKind::BollingerMetrics { period, deviation } => (
+                            "bollinger_metrics",
+                            period,
+                            Some(deviation),
+                            IndicatorParameters {
+                                period: Some(period),
+                                deviation: Some(deviation),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::Envelopes {
+                            period,
+                            percent,
+                            exponential,
+                        } => (
+                            "envelopes",
+                            period,
+                            Some(percent),
+                            IndicatorParameters {
+                                period: Some(period),
+                                percent: Some(percent),
+                                exponential: Some(exponential),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::Alma {
+                            period,
+                            offset,
+                            sigma,
+                        } => (
+                            "alma",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                offset: Some(offset),
+                                sigma: Some(sigma),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
                         IndicatorKind::Rsi { period, seed } => (
                             "rsi",
                             period,
@@ -1132,6 +1286,129 @@ impl ChartEngine {
                         ),
                         IndicatorKind::Vwap => ("vwap", 0, None, IndicatorParameters::default()),
                         IndicatorKind::Obv => ("obv", 0, None, IndicatorParameters::default()),
+                        IndicatorKind::AccumulationDistribution => (
+                            "accumulation_distribution",
+                            0,
+                            None,
+                            IndicatorParameters::default(),
+                        ),
+                        IndicatorKind::PriceVolumeTrend => (
+                            "price_volume_trend",
+                            0,
+                            None,
+                            IndicatorParameters::default(),
+                        ),
+                        IndicatorKind::ChaikinOscillator { fast, slow } => (
+                            "chaikin_oscillator",
+                            0,
+                            None,
+                            IndicatorParameters {
+                                fast: Some(fast),
+                                slow: Some(slow),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::RelativeVolume { period } => (
+                            "relative_volume",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::VolumeOscillator { fast, slow, signal } => (
+                            "volume_oscillator",
+                            slow,
+                            Some(signal as f64),
+                            IndicatorParameters {
+                                fast: Some(fast),
+                                slow: Some(slow),
+                                signal: Some(signal),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::ElderForce { period } => (
+                            "elder_force",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::EaseOfMovement { period, divisor } => (
+                            "ease_of_movement",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                divisor: Some(divisor),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::HistoricalVolatility {
+                            period,
+                            annualization,
+                        } => (
+                            "historical_volatility",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                annualization: Some(annualization),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::Trix { period, signal } => (
+                            "trix",
+                            period,
+                            Some(signal as f64),
+                            IndicatorParameters {
+                                period: Some(period),
+                                signal: Some(signal),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::CoppockCurve {
+                            long,
+                            short,
+                            smoothing,
+                        } => (
+                            "coppock_curve",
+                            smoothing,
+                            None,
+                            IndicatorParameters {
+                                long_period: Some(long),
+                                short_period: Some(short),
+                                smoothing: Some(smoothing),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::FisherTransform { period } => (
+                            "fisher_transform",
+                            period,
+                            None,
+                            IndicatorParameters {
+                                period: Some(period),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
+                        IndicatorKind::UltimateOscillator {
+                            short,
+                            medium,
+                            long,
+                        } => (
+                            "ultimate_oscillator",
+                            medium,
+                            None,
+                            IndicatorParameters {
+                                short_period: Some(short),
+                                period: Some(medium),
+                                long_period: Some(long),
+                                ..IndicatorParameters::default()
+                            },
+                        ),
                         IndicatorKind::Cmf { period } => (
                             "cmf",
                             period,
@@ -1261,6 +1538,28 @@ impl ChartEngine {
 
     /// Add a Rust-native simple moving-average producer. The returned line series is owned by the
     /// engine and is recomputed whenever its source series changes.
+    pub fn add_aroon(&mut self, source: SeriesId, period: usize) -> Vec<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::Aroon { period }, None)
+    }
+
+    pub fn add_awesome_oscillator(&mut self, source: SeriesId) -> Option<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::AwesomeOscillator, None)
+            .into_iter()
+            .next()
+    }
+
+    pub fn add_dpo(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::Dpo { period }, None)
+            .into_iter()
+            .next()
+    }
+
+    pub fn add_chande_momentum(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::ChandeMomentum { period }, None)
+            .into_iter()
+            .next()
+    }
+
     pub fn add_sma(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
         self.add_indicator_kind(source, IndicatorKind::Sma { period }, None)
             .into_iter()
@@ -1505,6 +1804,57 @@ impl ChartEngine {
         )
     }
 
+    pub fn add_bollinger_metrics(
+        &mut self,
+        source: SeriesId,
+        period: usize,
+        deviation: f64,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::BollingerMetrics { period, deviation },
+            None,
+        )
+    }
+
+    pub fn add_envelopes(
+        &mut self,
+        source: SeriesId,
+        period: usize,
+        percent: f64,
+        exponential: bool,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Envelopes {
+                period,
+                percent,
+                exponential,
+            },
+            None,
+        )
+    }
+
+    pub fn add_alma(
+        &mut self,
+        source: SeriesId,
+        period: usize,
+        offset: f64,
+        sigma: f64,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::Alma {
+                period,
+                offset,
+                sigma,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
+    }
+
     /// Add a Wilder RSI line in its own oscillator pane (with dotted 30/70 band lines).
     pub fn add_rsi(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
         self.add_indicator_kind(
@@ -1584,6 +1934,173 @@ impl ChartEngine {
         self.add_indicator_kind(source, IndicatorKind::Obv, Some(volume_source))
             .into_iter()
             .next()
+    }
+
+    pub fn add_accumulation_distribution(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::AccumulationDistribution,
+            Some(volume_source),
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn add_price_volume_trend(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::PriceVolumeTrend, Some(volume_source))
+            .into_iter()
+            .next()
+    }
+
+    pub fn add_chaikin_oscillator(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+        fast: usize,
+        slow: usize,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::ChaikinOscillator { fast, slow },
+            Some(volume_source),
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn add_relative_volume(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+        period: usize,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::RelativeVolume { period },
+            Some(volume_source),
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn add_volume_oscillator(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+        fast: usize,
+        slow: usize,
+        signal: usize,
+    ) -> Vec<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::VolumeOscillator { fast, slow, signal },
+            Some(volume_source),
+        )
+    }
+
+    pub fn add_elder_force(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+        period: usize,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::ElderForce { period },
+            Some(volume_source),
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn add_ease_of_movement(
+        &mut self,
+        source: SeriesId,
+        volume_source: SeriesId,
+        period: usize,
+        divisor: f64,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::EaseOfMovement { period, divisor },
+            Some(volume_source),
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn add_historical_volatility(
+        &mut self,
+        source: SeriesId,
+        period: usize,
+        annualization: f64,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::HistoricalVolatility {
+                period,
+                annualization,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn add_trix(&mut self, source: SeriesId, period: usize, signal: usize) -> Vec<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::Trix { period, signal }, None)
+    }
+
+    pub fn add_coppock_curve(
+        &mut self,
+        source: SeriesId,
+        long: usize,
+        short: usize,
+        smoothing: usize,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::CoppockCurve {
+                long,
+                short,
+                smoothing,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn add_fisher_transform(&mut self, source: SeriesId, period: usize) -> Vec<SeriesId> {
+        self.add_indicator_kind(source, IndicatorKind::FisherTransform { period }, None)
+    }
+
+    pub fn add_ultimate_oscillator(
+        &mut self,
+        source: SeriesId,
+        short: usize,
+        medium: usize,
+        long: usize,
+    ) -> Option<SeriesId> {
+        self.add_indicator_kind(
+            source,
+            IndicatorKind::UltimateOscillator {
+                short,
+                medium,
+                long,
+            },
+            None,
+        )
+        .into_iter()
+        .next()
     }
 
     /// Add Chaikin money flow in its own oscillator pane.
@@ -1736,12 +2253,33 @@ impl ChartEngine {
             amount_source,
         );
         match kind {
+            IndicatorKind::Aroon { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::Dpo { .. } | IndicatorKind::ChandeMomentum { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::BollingerMetrics { .. } => {
+                for &id in &ids {
+                    self.place_outputs_in_oscillator_pane(&[id]);
+                }
+            }
+            IndicatorKind::AwesomeOscillator => {
+                if let Some(&histogram) = ids.first() {
+                    self.convert_series_kind(histogram, SeriesKind::Histogram);
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
             IndicatorKind::Rsi { .. } => {
                 if !ids.is_empty() {
                     self.place_outputs_in_oscillator_pane(&ids);
                 }
             }
-            IndicatorKind::Macd { .. } => {
+            IndicatorKind::Macd { .. } | IndicatorKind::VolumeOscillator { .. } => {
                 if let Some(&histogram) = ids.get(2) {
                     self.convert_series_kind(histogram, SeriesKind::Histogram);
                     self.place_outputs_in_oscillator_pane(&ids);
@@ -1787,7 +2325,46 @@ impl ChartEngine {
                     self.place_outputs_in_oscillator_pane(&ids);
                 }
             }
-            IndicatorKind::Obv => {
+            IndicatorKind::Obv
+            | IndicatorKind::AccumulationDistribution
+            | IndicatorKind::PriceVolumeTrend => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::ChaikinOscillator { .. }
+            | IndicatorKind::RelativeVolume { .. }
+            | IndicatorKind::ElderForce { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::EaseOfMovement { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::HistoricalVolatility { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::Trix { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::CoppockCurve { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::FisherTransform { .. } => {
+                if !ids.is_empty() {
+                    self.place_outputs_in_oscillator_pane(&ids);
+                }
+            }
+            IndicatorKind::UltimateOscillator { .. } => {
                 if !ids.is_empty() {
                     self.place_outputs_in_oscillator_pane(&ids);
                 }
@@ -1827,6 +2404,8 @@ impl ChartEngine {
             | IndicatorKind::Keltner { .. }
             | IndicatorKind::EmaRibbon { .. }
             | IndicatorKind::Bollinger { .. }
+            | IndicatorKind::Envelopes { .. }
+            | IndicatorKind::Alma { .. }
             | IndicatorKind::ParabolicSar
             | IndicatorKind::SuperTrend { .. }
             | IndicatorKind::Ichimoku
@@ -1909,6 +2488,14 @@ impl ChartEngine {
                 None,
             )
         };
+        let boolean = |name: &str, default: bool| {
+            descriptor(
+                name,
+                IndicatorParameterType::Boolean,
+                serde_json::json!(default),
+                None,
+            )
+        };
         let choice = |name: &str, default: serde_json::Value, choices: &[&str]| {
             IndicatorParameterDescriptor {
                 choices: choices.iter().map(|choice| (*choice).to_string()).collect(),
@@ -1919,6 +2506,10 @@ impl ChartEngine {
             choice("seed", serde_json::json!(value), &["sma", "first_value"])
         };
         match *kind {
+            IndicatorKind::Aroon { period } => parameters.push(integer("period", period)),
+            IndicatorKind::AwesomeOscillator => {}
+            IndicatorKind::Dpo { period } => parameters.push(integer("period", period)),
+            IndicatorKind::ChandeMomentum { period } => parameters.push(integer("period", period)),
             IndicatorKind::Sma { period }
             | IndicatorKind::Smma { period }
             | IndicatorKind::Hma { period }
@@ -1969,6 +2560,92 @@ impl ChartEngine {
                     "estimator",
                     serde_json::json!(estimator),
                     &["population", "sample"],
+                ));
+            }
+            IndicatorKind::BollingerMetrics { period, deviation } => {
+                parameters.push(integer("period", period));
+                parameters.push(number("deviation", deviation));
+            }
+            IndicatorKind::Envelopes {
+                period,
+                percent,
+                exponential,
+            } => {
+                parameters.push(integer("period", period));
+                parameters.push(number("percent", percent));
+                parameters.push(boolean("exponential", exponential));
+            }
+            IndicatorKind::ChaikinOscillator { fast, slow } => {
+                parameters.push(integer("fast", fast));
+                parameters.push(integer("slow", slow));
+                parameters.push(series("volume_source"));
+            }
+            IndicatorKind::RelativeVolume { period } => {
+                parameters.push(integer("period", period));
+                parameters.push(series("volume_source"));
+            }
+            IndicatorKind::ElderForce { period } => {
+                parameters.push(integer("period", period));
+                parameters.push(series("volume_source"));
+            }
+            IndicatorKind::EaseOfMovement { period, divisor } => {
+                parameters.push(integer("period", period));
+                parameters.push(number("divisor", divisor));
+                parameters.push(series("volume_source"));
+            }
+            IndicatorKind::HistoricalVolatility {
+                period,
+                annualization,
+            } => {
+                parameters.push(integer("period", period));
+                parameters.push(number("annualization", annualization));
+            }
+            IndicatorKind::Trix { period, signal } => {
+                parameters.push(integer("period", period));
+                parameters.push(integer("signal", signal));
+            }
+            IndicatorKind::CoppockCurve {
+                long,
+                short,
+                smoothing,
+            } => {
+                parameters.push(integer("long_period", long));
+                parameters.push(integer("short_period", short));
+                parameters.push(integer("smoothing", smoothing));
+            }
+            IndicatorKind::FisherTransform { period } => parameters.push(integer("period", period)),
+            IndicatorKind::UltimateOscillator {
+                short,
+                medium,
+                long,
+            } => {
+                parameters.push(integer("short_period", short));
+                parameters.push(integer("medium_period", medium));
+                parameters.push(integer("long_period", long));
+            }
+            IndicatorKind::VolumeOscillator { fast, slow, signal } => {
+                parameters.push(integer("fast", fast));
+                parameters.push(integer("slow", slow));
+                parameters.push(integer("signal", signal));
+                parameters.push(series("volume_source"));
+            }
+            IndicatorKind::Alma {
+                period,
+                offset,
+                sigma,
+            } => {
+                parameters.push(integer("period", period));
+                parameters.push(descriptor(
+                    "offset",
+                    IndicatorParameterType::Number,
+                    serde_json::json!(offset),
+                    Some((0.0, 1.0)),
+                ));
+                parameters.push(descriptor(
+                    "sigma",
+                    IndicatorParameterType::Number,
+                    serde_json::json!(sigma),
+                    Some((0.01, 1_000_000.0)),
                 ));
             }
             IndicatorKind::Keltner { period, multiplier } => {
@@ -2028,7 +2705,9 @@ impl ChartEngine {
                 parameters.push(series("volume_source"));
                 parameters.push(series("amount_source"));
             }
-            IndicatorKind::Obv => parameters.push(series("volume_source")),
+            IndicatorKind::Obv
+            | IndicatorKind::AccumulationDistribution
+            | IndicatorKind::PriceVolumeTrend => parameters.push(series("volume_source")),
             IndicatorKind::Cmf { period }
             | IndicatorKind::Mfi { period }
             | IndicatorKind::Volume { period }
@@ -2101,14 +2780,16 @@ impl ChartEngine {
         }
     }
 
-    /// The bollinger band-fill companion for an output series: when `id` is a bollinger UPPER
+    /// The band-fill companion for an output series: when `id` is a band UPPER
     /// (output slot 0), the LOWER series (slot 2) the fill closes toward, else `None`. The
     /// frame builder paints the fill between them under the band strokes (the public reference's
     /// background fill).
-    pub(crate) fn bollinger_fill_companion(&self, id: SeriesId) -> Option<SeriesId> {
+    pub(crate) fn band_fill_companion(&self, id: SeriesId) -> Option<SeriesId> {
         self.indicators.iter().find_map(|binding| {
-            if matches!(binding.kind, IndicatorKind::Bollinger { .. })
-                && binding.outputs.first() == Some(&id)
+            if matches!(
+                binding.kind,
+                IndicatorKind::Bollinger { .. } | IndicatorKind::Envelopes { .. }
+            ) && binding.outputs.first() == Some(&id)
             {
                 binding.outputs.get(2).copied()
             } else {
@@ -2187,6 +2868,13 @@ impl ChartEngine {
             })
             || match &kind {
                 IndicatorKind::Obv
+                | IndicatorKind::AccumulationDistribution
+                | IndicatorKind::PriceVolumeTrend
+                | IndicatorKind::ChaikinOscillator { .. }
+                | IndicatorKind::RelativeVolume { .. }
+                | IndicatorKind::VolumeOscillator { .. }
+                | IndicatorKind::ElderForce { .. }
+                | IndicatorKind::EaseOfMovement { .. }
                 | IndicatorKind::Cmf { .. }
                 | IndicatorKind::Mfi { .. }
                 | IndicatorKind::Volume { .. } => volume_source.is_none_or(|id| {
@@ -2221,6 +2909,10 @@ impl ChartEngine {
                 _ => volume_source.is_some(),
             }
             || match &kind {
+                IndicatorKind::Aroon { period } => *period == 0,
+                IndicatorKind::AwesomeOscillator => false,
+                IndicatorKind::Dpo { period } => *period == 0,
+                IndicatorKind::ChandeMomentum { period } => *period == 0,
                 IndicatorKind::Sma { period }
                 | IndicatorKind::Ema { period, .. }
                 | IndicatorKind::Dema { period, .. }
@@ -2230,7 +2922,6 @@ impl ChartEngine {
                 | IndicatorKind::Vwma { period }
                 | IndicatorKind::StandardDeviation { period }
                 | IndicatorKind::Donchian { period }
-                | IndicatorKind::Bollinger { period, .. }
                 | IndicatorKind::Rsi { period, .. }
                 | IndicatorKind::Atr { period }
                 | IndicatorKind::Wma { period } => *period == 0,
@@ -2240,6 +2931,26 @@ impl ChartEngine {
                     d_smoothing,
                     ..
                 } => *period == 0 || *k_smoothing == 0 || *d_smoothing == 0,
+                IndicatorKind::Bollinger {
+                    period, deviation, ..
+                }
+                | IndicatorKind::BollingerMetrics { period, deviation } => {
+                    *period == 0 || !deviation.is_finite() || *deviation < 0.0
+                }
+                IndicatorKind::Envelopes {
+                    period, percent, ..
+                } => *period == 0 || !percent.is_finite() || *percent < 0.0,
+                IndicatorKind::Alma {
+                    period,
+                    offset,
+                    sigma,
+                } => {
+                    *period == 0
+                        || !offset.is_finite()
+                        || !(0.0..=1.0).contains(offset)
+                        || !sigma.is_finite()
+                        || !(0.01..=1_000_000.0).contains(sigma)
+                }
                 IndicatorKind::EmaRibbon { periods } => periods.contains(&0),
                 IndicatorKind::Keltner { period, multiplier } => {
                     *period == 0 || !multiplier.is_finite() || *multiplier < 0.0
@@ -2280,6 +2991,34 @@ impl ChartEngine {
                 }
                 IndicatorKind::Vwap => false,
                 IndicatorKind::Obv => false,
+                IndicatorKind::AccumulationDistribution | IndicatorKind::PriceVolumeTrend => false,
+                IndicatorKind::ChaikinOscillator { fast, slow } => {
+                    *fast == 0 || *slow == 0 || *fast >= *slow
+                }
+                IndicatorKind::RelativeVolume { period } => *period == 0,
+                IndicatorKind::VolumeOscillator { fast, slow, signal } => {
+                    *fast == 0 || *fast >= *slow || *signal == 0
+                }
+                IndicatorKind::ElderForce { period } => *period == 0,
+                IndicatorKind::EaseOfMovement { period, divisor } => {
+                    *period == 0 || !divisor.is_finite() || *divisor <= 0.0
+                }
+                IndicatorKind::HistoricalVolatility {
+                    period,
+                    annualization,
+                } => *period < 2 || !annualization.is_finite() || *annualization <= 0.0,
+                IndicatorKind::Trix { period, signal } => *period == 0 || *signal == 0,
+                IndicatorKind::CoppockCurve {
+                    long,
+                    short,
+                    smoothing,
+                } => *long == 0 || *short == 0 || *smoothing == 0,
+                IndicatorKind::FisherTransform { period } => *period == 0,
+                IndicatorKind::UltimateOscillator {
+                    short,
+                    medium,
+                    long,
+                } => *short == 0 || *medium == 0 || *long == 0,
                 IndicatorKind::Cmf { period } => *period == 0,
                 IndicatorKind::Mfi { period } => *period == 0,
                 IndicatorKind::Volume { period } => *period == 0,
@@ -2709,9 +3448,7 @@ impl ChartEngine {
             let output_from = if full_replace {
                 let mut values = self.indicators[index].runtime.take_output(output_index);
                 values.resize(rows - source_from, f64::NAN);
-                if output_index == 2
-                    && matches!(self.indicators[index].kind, IndicatorKind::Macd { .. })
-                {
+                if histogram_output(&self.indicators[index].kind) == Some(output_index) {
                     full_histogram_colors = Some(momentum_histogram_colors(&values));
                 }
                 self.data
@@ -2741,17 +3478,17 @@ impl ChartEngine {
             }
         }
 
-        if matches!(self.indicators[index].kind, IndicatorKind::Macd { .. }) {
-            let histogram_id = outputs[2].unwrap();
+        if let Some(output_index) = histogram_output(&self.indicators[index].kind) {
+            let histogram_id = outputs[output_index].unwrap();
             if let Some(colors) = full_histogram_colors {
                 self.data
                     .set_point_colors(histogram_id, [Some(colors), None, None]);
             } else {
-                let histogram = self.indicators[index].runtime.output(2);
+                let histogram = self.indicators[index].runtime.output(output_index);
                 // The histogram series aliases source rows from its warm-up row, which depends on
                 // the seed convention.
-                let first_histogram = self.indicators[index].runtime.warmup_rows(2);
-                let source_from = self.indicators[index].runtime.output_from(2);
+                let first_histogram = self.indicators[index].runtime.warmup_rows(output_index);
+                let source_from = self.indicators[index].runtime.output_from(output_index);
                 let output_start = source_from.saturating_sub(first_histogram);
                 let mut previous = output_start.checked_sub(1).and_then(|row| {
                     self.data
@@ -2799,6 +3536,15 @@ impl ChartEngine {
     }
 }
 
+/// The output an indicator draws as a momentum-coloured histogram, if any.
+fn histogram_output(kind: &IndicatorKind) -> Option<usize> {
+    match kind {
+        IndicatorKind::Macd { .. } | IndicatorKind::VolumeOscillator { .. } => Some(2),
+        IndicatorKind::AwesomeOscillator => Some(0),
+        _ => None,
+    }
+}
+
 fn momentum_histogram_colors(values: &[f64]) -> Vec<u32> {
     let mut colors = Vec::with_capacity(values.len());
     let mut previous = None;
@@ -2819,6 +3565,13 @@ fn momentum_histogram_colors(values: &[f64]) -> Vec<u32> {
 fn missing_volume(kind: &IndicatorKind) -> f64 {
     match kind {
         IndicatorKind::Obv
+        | IndicatorKind::AccumulationDistribution
+        | IndicatorKind::PriceVolumeTrend
+        | IndicatorKind::ChaikinOscillator { .. }
+        | IndicatorKind::RelativeVolume { .. }
+        | IndicatorKind::VolumeOscillator { .. }
+        | IndicatorKind::ElderForce { .. }
+        | IndicatorKind::EaseOfMovement { .. }
         | IndicatorKind::Cmf { .. }
         | IndicatorKind::Mfi { .. }
         | IndicatorKind::Volume { .. } => 0.0,
@@ -2829,6 +3582,10 @@ fn missing_volume(kind: &IndicatorKind) -> f64 {
 
 fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {
     match kind {
+        IndicatorKind::Aroon { .. } => "aroon",
+        IndicatorKind::AwesomeOscillator => "awesome_oscillator",
+        IndicatorKind::Dpo { .. } => "dpo",
+        IndicatorKind::ChandeMomentum { .. } => "chande_momentum",
         IndicatorKind::Sma { .. } => "sma",
         IndicatorKind::Ema { .. } => "ema",
         IndicatorKind::Dema { .. } => "dema",
@@ -2852,12 +3609,27 @@ fn indicator_kind_name(kind: &IndicatorKind) -> &'static str {
         IndicatorKind::Ichimoku => "ichimoku",
         IndicatorKind::EmaRibbon { .. } => "ema_ribbon",
         IndicatorKind::Bollinger { .. } => "bollinger",
+        IndicatorKind::BollingerMetrics { .. } => "bollinger_metrics",
+        IndicatorKind::Envelopes { .. } => "envelopes",
+        IndicatorKind::Alma { .. } => "alma",
         IndicatorKind::Rsi { .. } => "rsi",
         IndicatorKind::Macd { .. } => "macd",
         IndicatorKind::Stochastic { .. } => "stochastic",
         IndicatorKind::Atr { .. } => "atr",
         IndicatorKind::Vwap => "vwap",
         IndicatorKind::Obv => "obv",
+        IndicatorKind::AccumulationDistribution => "accumulation_distribution",
+        IndicatorKind::PriceVolumeTrend => "price_volume_trend",
+        IndicatorKind::ChaikinOscillator { .. } => "chaikin_oscillator",
+        IndicatorKind::RelativeVolume { .. } => "relative_volume",
+        IndicatorKind::VolumeOscillator { .. } => "volume_oscillator",
+        IndicatorKind::ElderForce { .. } => "elder_force",
+        IndicatorKind::EaseOfMovement { .. } => "ease_of_movement",
+        IndicatorKind::HistoricalVolatility { .. } => "historical_volatility",
+        IndicatorKind::Trix { .. } => "trix",
+        IndicatorKind::CoppockCurve { .. } => "coppock_curve",
+        IndicatorKind::FisherTransform { .. } => "fisher_transform",
+        IndicatorKind::UltimateOscillator { .. } => "ultimate_oscillator",
         IndicatorKind::Cmf { .. } => "cmf",
         IndicatorKind::Mfi { .. } => "mfi",
         IndicatorKind::Volume { .. } => "volume",
@@ -2880,6 +3652,14 @@ fn pivot_kind_index(kind: aeris_charts_indicators::PivotKind) -> usize {
 
 fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::IncrementalState {
     match *kind {
+        IndicatorKind::Aroon { period } => aeris_charts_indicators::IncrementalState::aroon(period),
+        IndicatorKind::AwesomeOscillator => {
+            aeris_charts_indicators::IncrementalState::awesome_oscillator()
+        }
+        IndicatorKind::Dpo { period } => aeris_charts_indicators::IncrementalState::dpo(period),
+        IndicatorKind::ChandeMomentum { period } => {
+            aeris_charts_indicators::IncrementalState::chande_momentum(period)
+        }
         IndicatorKind::Sma { period } => aeris_charts_indicators::IncrementalState::sma(period),
         IndicatorKind::Ema { period, seed } => {
             aeris_charts_indicators::IncrementalState::ema_with_seed(period, seed)
@@ -2936,6 +3716,19 @@ fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::Increment
         } => {
             aeris_charts_indicators::IncrementalState::bollinger_with(period, deviation, estimator)
         }
+        IndicatorKind::BollingerMetrics { period, deviation } => {
+            aeris_charts_indicators::IncrementalState::bollinger_metrics(period, deviation)
+        }
+        IndicatorKind::Envelopes {
+            period,
+            percent,
+            exponential,
+        } => aeris_charts_indicators::IncrementalState::envelopes(period, percent, exponential),
+        IndicatorKind::Alma {
+            period,
+            offset,
+            sigma,
+        } => aeris_charts_indicators::IncrementalState::alma(period, offset, sigma),
         IndicatorKind::Rsi { period, seed } => {
             aeris_charts_indicators::IncrementalState::rsi_with_seed(period, seed)
         }
@@ -2969,6 +3762,49 @@ fn incremental_state(kind: &IndicatorKind) -> aeris_charts_indicators::Increment
         IndicatorKind::Atr { period } => aeris_charts_indicators::IncrementalState::atr(period),
         IndicatorKind::Vwap => aeris_charts_indicators::IncrementalState::vwap(),
         IndicatorKind::Obv => aeris_charts_indicators::IncrementalState::obv(),
+        IndicatorKind::AccumulationDistribution => {
+            aeris_charts_indicators::IncrementalState::accumulation_distribution()
+        }
+        IndicatorKind::PriceVolumeTrend => {
+            aeris_charts_indicators::IncrementalState::price_volume_trend()
+        }
+        IndicatorKind::ChaikinOscillator { fast, slow } => {
+            aeris_charts_indicators::IncrementalState::chaikin_oscillator(fast, slow)
+        }
+        IndicatorKind::RelativeVolume { period } => {
+            aeris_charts_indicators::IncrementalState::relative_volume(period)
+        }
+        IndicatorKind::VolumeOscillator { fast, slow, signal } => {
+            aeris_charts_indicators::IncrementalState::volume_oscillator(fast, slow, signal)
+        }
+        IndicatorKind::ElderForce { period } => {
+            aeris_charts_indicators::IncrementalState::elder_force(period)
+        }
+        IndicatorKind::EaseOfMovement { period, divisor } => {
+            aeris_charts_indicators::IncrementalState::ease_of_movement(period, divisor)
+        }
+        IndicatorKind::HistoricalVolatility {
+            period,
+            annualization,
+        } => {
+            aeris_charts_indicators::IncrementalState::historical_volatility(period, annualization)
+        }
+        IndicatorKind::Trix { period, signal } => {
+            aeris_charts_indicators::IncrementalState::trix(period, signal)
+        }
+        IndicatorKind::CoppockCurve {
+            long,
+            short,
+            smoothing,
+        } => aeris_charts_indicators::IncrementalState::coppock_curve(long, short, smoothing),
+        IndicatorKind::FisherTransform { period } => {
+            aeris_charts_indicators::IncrementalState::fisher_transform(period)
+        }
+        IndicatorKind::UltimateOscillator {
+            short,
+            medium,
+            long,
+        } => aeris_charts_indicators::IncrementalState::ultimate_oscillator(short, medium, long),
         IndicatorKind::Cmf { period } => aeris_charts_indicators::IncrementalState::cmf(period),
         IndicatorKind::Mfi { period } => aeris_charts_indicators::IncrementalState::mfi(period),
         IndicatorKind::Volume { period } => {
@@ -3019,6 +3855,10 @@ fn indicator_title(kind: &IndicatorKind) -> String {
         }
     };
     match kind {
+        IndicatorKind::Aroon { period } => format!("Aroon {period}"),
+        IndicatorKind::AwesomeOscillator => "Awesome Oscillator".to_string(),
+        IndicatorKind::Dpo { period } => format!("DPO {period}"),
+        IndicatorKind::ChandeMomentum { period } => format!("CMO {period}"),
         IndicatorKind::Sma { period } => format!("SMA {period}"),
         IndicatorKind::Ema { period, .. } => format!("EMA {period}"),
         IndicatorKind::Dema { period, .. } => format!("DEMA {period}"),
@@ -3058,6 +3898,23 @@ fn indicator_title(kind: &IndicatorKind) -> String {
         } => {
             format!("Bollinger {period} {}", params(*deviation))
         }
+        IndicatorKind::BollingerMetrics { period, deviation } => {
+            format!("Bollinger Metrics {period} {}", params(*deviation))
+        }
+        IndicatorKind::Envelopes {
+            period,
+            percent,
+            exponential,
+        } => format!(
+            "Envelopes {} {period} {}%",
+            if *exponential { "EMA" } else { "SMA" },
+            params(*percent)
+        ),
+        IndicatorKind::Alma {
+            period,
+            offset,
+            sigma,
+        } => format!("ALMA {period} {} {}", params(*offset), params(*sigma)),
         IndicatorKind::Rsi { period, .. } => format!("RSI {period}"),
         IndicatorKind::Macd {
             fast, slow, signal, ..
@@ -3068,6 +3925,35 @@ fn indicator_title(kind: &IndicatorKind) -> String {
         IndicatorKind::Atr { period } => format!("ATR {period}"),
         IndicatorKind::Vwap => "VWAP".to_string(),
         IndicatorKind::Obv => "OBV".to_string(),
+        IndicatorKind::AccumulationDistribution => "Accumulation/Distribution".to_string(),
+        IndicatorKind::PriceVolumeTrend => "PVT".to_string(),
+        IndicatorKind::ChaikinOscillator { fast, slow } => {
+            format!("Chaikin Oscillator {fast} {slow}")
+        }
+        IndicatorKind::RelativeVolume { period } => format!("Relative Volume {period}"),
+        IndicatorKind::VolumeOscillator { fast, slow, signal } => {
+            format!("Volume Oscillator {fast} {slow} {signal}")
+        }
+        IndicatorKind::ElderForce { period } => format!("Elder Force {period}"),
+        IndicatorKind::EaseOfMovement { period, divisor } => {
+            format!("Ease of Movement {period} {}", params(*divisor))
+        }
+        IndicatorKind::HistoricalVolatility {
+            period,
+            annualization,
+        } => format!("Historical Volatility {period} {}", params(*annualization)),
+        IndicatorKind::Trix { period, signal } => format!("TRIX {period} {signal}"),
+        IndicatorKind::CoppockCurve {
+            long,
+            short,
+            smoothing,
+        } => format!("Coppock Curve {long} {short} {smoothing}"),
+        IndicatorKind::FisherTransform { period } => format!("Fisher Transform {period}"),
+        IndicatorKind::UltimateOscillator {
+            short,
+            medium,
+            long,
+        } => format!("Ultimate Oscillator {short} {medium} {long}"),
         IndicatorKind::Cmf { period } => format!("CMF {period}"),
         IndicatorKind::Mfi { period } => format!("MFI {period}"),
         IndicatorKind::Volume { .. } => "Volume".to_string(),
@@ -3085,6 +3971,9 @@ fn indicator_title(kind: &IndicatorKind) -> String {
 
 fn indicator_output_title(kind: &IndicatorKind, output_index: usize) -> String {
     match kind {
+        IndicatorKind::Aroon { period } => {
+            format!("Aroon {} {period}", ["Up", "Down"][output_index])
+        }
         IndicatorKind::EmaRibbon { periods } => format!("EMA {}", periods[output_index]),
         IndicatorKind::KLineChart(indicator) => indicator
             .output_titles()
@@ -3125,6 +4014,10 @@ fn style_color_is_valid(value: Option<&str>) -> bool {
 
 fn indicator_output_name(kind: &IndicatorKind, output_index: usize) -> &'static str {
     match kind {
+        IndicatorKind::Aroon { .. } => ["Aroon Up", "Aroon Down"][output_index],
+        IndicatorKind::AwesomeOscillator => "AO",
+        IndicatorKind::Dpo { .. } => "DPO",
+        IndicatorKind::ChandeMomentum { .. } => "CMO",
         IndicatorKind::Sma { .. } => "SMA",
         IndicatorKind::Ema { .. } => "EMA",
         IndicatorKind::Dema { .. } => "DEMA",
@@ -3152,12 +4045,27 @@ fn indicator_output_name(kind: &IndicatorKind, output_index: usize) -> &'static 
             ["EMA 1", "EMA 2", "EMA 3", "EMA 4", "EMA 5"][output_index]
         }
         IndicatorKind::Bollinger { .. } => ["Upper", "Basis", "Lower"][output_index],
+        IndicatorKind::BollingerMetrics { .. } => ["%B", "BandWidth"][output_index],
+        IndicatorKind::Envelopes { .. } => ["Upper", "Basis", "Lower"][output_index],
+        IndicatorKind::Alma { .. } => "ALMA",
         IndicatorKind::Rsi { .. } => "RSI",
         IndicatorKind::Macd { .. } => ["MACD", "Signal", "Histogram"][output_index],
         IndicatorKind::Stochastic { .. } => ["%K", "%D"][output_index],
         IndicatorKind::Atr { .. } => "ATR",
         IndicatorKind::Vwap => "VWAP",
         IndicatorKind::Obv => "OBV",
+        IndicatorKind::AccumulationDistribution => "A/D",
+        IndicatorKind::PriceVolumeTrend => "PVT",
+        IndicatorKind::ChaikinOscillator { .. } => "Chaikin Oscillator",
+        IndicatorKind::RelativeVolume { .. } => "Relative Volume",
+        IndicatorKind::VolumeOscillator { .. } => ["PVO", "Signal", "Histogram"][output_index],
+        IndicatorKind::ElderForce { .. } => "Elder Force",
+        IndicatorKind::EaseOfMovement { .. } => "EOM",
+        IndicatorKind::HistoricalVolatility { .. } => "HV",
+        IndicatorKind::Trix { .. } => ["TRIX", "Signal"][output_index],
+        IndicatorKind::CoppockCurve { .. } => "Coppock Curve",
+        IndicatorKind::FisherTransform { .. } => ["Fisher", "Trigger"][output_index],
+        IndicatorKind::UltimateOscillator { .. } => "Ultimate Oscillator",
         IndicatorKind::Cmf { .. } => "CMF",
         IndicatorKind::Mfi { .. } => "MFI",
         IndicatorKind::Volume { .. } => ["Volume", "MA"][output_index],

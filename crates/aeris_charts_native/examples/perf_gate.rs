@@ -350,6 +350,62 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
             d_smoothing: 3,
             seed: KdjSeed::Fifty,
         },
+        IndicatorKind::Aroon { period: 14 },
+        IndicatorKind::AwesomeOscillator,
+        IndicatorKind::Dpo { period: 20 },
+        IndicatorKind::ChandeMomentum { period: 9 },
+        IndicatorKind::BollingerMetrics {
+            period: 20,
+            deviation: 2.0,
+        },
+        IndicatorKind::Envelopes {
+            period: 20,
+            percent: 2.5,
+            exponential: false,
+        },
+        IndicatorKind::Envelopes {
+            period: 20,
+            percent: 2.5,
+            exponential: true,
+        },
+        IndicatorKind::Alma {
+            period: 9,
+            offset: 0.85,
+            sigma: 6.0,
+        },
+        IndicatorKind::AccumulationDistribution,
+        IndicatorKind::PriceVolumeTrend,
+        IndicatorKind::ChaikinOscillator { fast: 3, slow: 10 },
+        IndicatorKind::RelativeVolume { period: 20 },
+        IndicatorKind::VolumeOscillator {
+            fast: 12,
+            slow: 26,
+            signal: 9,
+        },
+        IndicatorKind::ElderForce { period: 13 },
+        IndicatorKind::EaseOfMovement {
+            period: 14,
+            divisor: 100_000_000.0,
+        },
+        IndicatorKind::HistoricalVolatility {
+            period: 20,
+            annualization: 252.0,
+        },
+        IndicatorKind::Trix {
+            period: 15,
+            signal: 9,
+        },
+        IndicatorKind::CoppockCurve {
+            long: 14,
+            short: 11,
+            smoothing: 10,
+        },
+        IndicatorKind::FisherTransform { period: 9 },
+        IndicatorKind::UltimateOscillator {
+            short: 7,
+            medium: 14,
+            long: 28,
+        },
     ];
     let mut bindings = 0;
     for kind in kinds {
@@ -359,6 +415,13 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
                 | IndicatorKind::Vwap
                 | IndicatorKind::VwapBands { .. }
                 | IndicatorKind::Obv
+                | IndicatorKind::AccumulationDistribution
+                | IndicatorKind::PriceVolumeTrend
+                | IndicatorKind::ChaikinOscillator { .. }
+                | IndicatorKind::RelativeVolume { .. }
+                | IndicatorKind::VolumeOscillator { .. }
+                | IndicatorKind::ElderForce { .. }
+                | IndicatorKind::EaseOfMovement { .. }
                 | IndicatorKind::Cmf { .. }
                 | IndicatorKind::Mfi { .. }
                 | IndicatorKind::Volume { .. }
@@ -2329,7 +2392,7 @@ fn main() -> ExitCode {
     );
 
     // ---- Target M: bounded per-tick indicator work over a 1M-row source ---------------------
-    // Every built-in kind is bound, so one tick advances 38 bindings (~60 outputs) plus the volume
+    // Every built-in kind is bound, so one tick advances 58 bindings (~90 outputs) plus the volume
     // series. Bounded rolling state makes a tick O(period) per binding, independent of history;
     // the budget keeps a tick (candle + volume update) under 1 ms, so a 60 fps host absorbs a
     // burst of ticks inside one frame with most of its 16.67 ms left for frame construction.
@@ -2460,7 +2523,7 @@ fn main() -> ExitCode {
     // ---- Target M (KLineChart): the 27 KLineChart templates over a 1M-row source ------------
     // Each template advances one row at a time from a checkpointed state, so a tick costs the
     // template's window however long the history is. The set is measured in its own block with the
-    // same 1 ms per-tick budget, so its 27 bindings do not spend the headroom of the 38 built-in
+    // same 1 ms per-tick budget, so its 27 bindings do not spend the headroom of the 58 built-in
     // bindings above, which already read close to theirs.
     let kline_cost = indicator_tick_cost(
         StudySet::KLineChart,

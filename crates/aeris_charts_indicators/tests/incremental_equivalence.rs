@@ -84,6 +84,48 @@ fn runtimes() -> Vec<(&'static str, IncrementalState)> {
             "bollinger_sample",
             IncrementalState::bollinger_with(5, 2.0, DeviationEstimator::Sample),
         ),
+        ("aroon", IncrementalState::aroon(5)),
+        ("awesome_oscillator", IncrementalState::awesome_oscillator()),
+        ("dpo", IncrementalState::dpo(6)),
+        ("chande_momentum", IncrementalState::chande_momentum(5)),
+        (
+            "bollinger_metrics",
+            IncrementalState::bollinger_metrics(5, 2.0),
+        ),
+        ("envelopes", IncrementalState::envelopes(5, 2.5, false)),
+        ("envelopes_ema", IncrementalState::envelopes(5, 2.5, true)),
+        ("alma", IncrementalState::alma(6, 0.85, 6.0)),
+        (
+            "accumulation_distribution",
+            IncrementalState::accumulation_distribution(),
+        ),
+        ("price_volume_trend", IncrementalState::price_volume_trend()),
+        (
+            "chaikin_oscillator",
+            IncrementalState::chaikin_oscillator(3, 6),
+        ),
+        ("relative_volume", IncrementalState::relative_volume(5)),
+        (
+            "volume_oscillator",
+            IncrementalState::volume_oscillator(3, 6, 4),
+        ),
+        ("elder_force", IncrementalState::elder_force(4)),
+        (
+            "ease_of_movement",
+            IncrementalState::ease_of_movement(5, 1e4),
+        ),
+        (
+            "historical_volatility",
+            IncrementalState::historical_volatility(5, 252.0),
+        ),
+        ("trix", IncrementalState::trix(3, 4)),
+        ("coppock_curve", IncrementalState::coppock_curve(6, 4, 5)),
+        ("fisher_transform", IncrementalState::fisher_transform(5)),
+        (
+            "ultimate_oscillator",
+            IncrementalState::ultimate_oscillator(3, 5, 8),
+        ),
+        ("vortex", IncrementalState::vortex(5)),
     ]
 }
 

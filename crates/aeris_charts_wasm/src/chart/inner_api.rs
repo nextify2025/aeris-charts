@@ -249,6 +249,21 @@ impl ChartInner {
     pub fn indicator_schema_json(&self, kind: &str, period: u32, deviation: f64) -> String {
         let period = period as usize;
         let definition = match kind {
+            "aroon" => IndicatorKind::Aroon { period },
+            "awesome_oscillator" => IndicatorKind::AwesomeOscillator,
+            "dpo" => IndicatorKind::Dpo { period },
+            "chande_momentum" => IndicatorKind::ChandeMomentum { period },
+            "bollinger_metrics" => IndicatorKind::BollingerMetrics { period, deviation },
+            "envelopes" => IndicatorKind::Envelopes {
+                period,
+                percent: deviation,
+                exponential: false,
+            },
+            "alma" => IndicatorKind::Alma {
+                period,
+                offset: 0.85,
+                sigma: 6.0,
+            },
             "sma" => IndicatorKind::Sma { period },
             "ema" => IndicatorKind::Ema {
                 period,
@@ -332,6 +347,36 @@ impl ChartInner {
             "atr" => IndicatorKind::Atr { period },
             "vwap" => IndicatorKind::Vwap,
             "obv" => IndicatorKind::Obv,
+            "accumulation_distribution" => IndicatorKind::AccumulationDistribution,
+            "price_volume_trend" => IndicatorKind::PriceVolumeTrend,
+            "chaikin_oscillator" => IndicatorKind::ChaikinOscillator { fast: 3, slow: 10 },
+            "relative_volume" => IndicatorKind::RelativeVolume { period },
+            "elder_force" => IndicatorKind::ElderForce { period },
+            "ease_of_movement" => IndicatorKind::EaseOfMovement {
+                period,
+                divisor: 100_000_000.0,
+            },
+            "historical_volatility" => IndicatorKind::HistoricalVolatility {
+                period,
+                annualization: 252.0,
+            },
+            "trix" => IndicatorKind::Trix { period, signal: 9 },
+            "coppock_curve" => IndicatorKind::CoppockCurve {
+                long: 14,
+                short: 11,
+                smoothing: 10,
+            },
+            "fisher_transform" => IndicatorKind::FisherTransform { period },
+            "ultimate_oscillator" => IndicatorKind::UltimateOscillator {
+                short: 7,
+                medium: 14,
+                long: 28,
+            },
+            "volume_oscillator" => IndicatorKind::VolumeOscillator {
+                fast: 12,
+                slow: 26,
+                signal: 9,
+            },
             "cmf" => IndicatorKind::Cmf { period },
             "mfi" => IndicatorKind::Mfi { period },
             "volume" => IndicatorKind::Volume { period },
@@ -379,6 +424,56 @@ impl ChartInner {
     pub fn add_sma(&mut self, source_id: u32, period: u32) -> u32 {
         self.engine
             .add_sma(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_aroon(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.engine
+            .add_aroon(source_id as SeriesId, period as usize)
+    }
+
+    pub fn add_awesome_oscillator(&mut self, source_id: u32) -> u32 {
+        self.engine
+            .add_awesome_oscillator(source_id as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_dpo(&mut self, source_id: u32, period: u32) -> u32 {
+        self.engine
+            .add_dpo(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_chande_momentum(&mut self, source_id: u32, period: u32) -> u32 {
+        self.engine
+            .add_chande_momentum(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_bollinger_metrics(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        self.engine
+            .add_bollinger_metrics(source_id as SeriesId, period as usize, deviation)
+    }
+
+    pub fn add_envelopes(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        percent: f64,
+        exponential: bool,
+    ) -> Vec<u32> {
+        self.engine
+            .add_envelopes(source_id as SeriesId, period as usize, percent, exponential)
+    }
+
+    pub fn add_alma(&mut self, source_id: u32, period: u32, offset: f64, sigma: f64) -> u32 {
+        self.engine
+            .add_alma(source_id as SeriesId, period as usize, offset, sigma)
             .unwrap_or(u32::MAX)
     }
 
@@ -632,6 +727,165 @@ impl ChartInner {
         }
         self.engine
             .add_obv(source_id as SeriesId, volume_source as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_accumulation_distribution(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_accumulation_distribution(source_id as SeriesId, volume_source as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_price_volume_trend(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_price_volume_trend(source_id as SeriesId, volume_source as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_chaikin_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+    ) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_chaikin_oscillator(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                fast as usize,
+                slow as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_relative_volume(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_relative_volume(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                period as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_volume_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        if volume_source < 0 {
+            return Vec::new();
+        }
+        self.engine.add_volume_oscillator(
+            source_id as SeriesId,
+            volume_source as SeriesId,
+            fast as usize,
+            slow as usize,
+            signal as usize,
+        )
+    }
+
+    pub fn add_elder_force(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_elder_force(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                period as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_ease_of_movement(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        period: u32,
+        divisor: f64,
+    ) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_ease_of_movement(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                period as usize,
+                divisor,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_historical_volatility(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        annualization: f64,
+    ) -> u32 {
+        self.engine
+            .add_historical_volatility(source_id as SeriesId, period as usize, annualization)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_trix(&mut self, source_id: u32, period: u32, signal: u32) -> Vec<u32> {
+        self.engine
+            .add_trix(source_id as SeriesId, period as usize, signal as usize)
+    }
+
+    pub fn add_coppock_curve(
+        &mut self,
+        source_id: u32,
+        long: u32,
+        short: u32,
+        smoothing: u32,
+    ) -> u32 {
+        self.engine
+            .add_coppock_curve(
+                source_id as SeriesId,
+                long as usize,
+                short as usize,
+                smoothing as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_fisher_transform(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.engine
+            .add_fisher_transform(source_id as SeriesId, period as usize)
+    }
+
+    pub fn add_ultimate_oscillator(
+        &mut self,
+        source_id: u32,
+        short: u32,
+        medium: u32,
+        long: u32,
+    ) -> u32 {
+        self.engine
+            .add_ultimate_oscillator(
+                source_id as SeriesId,
+                short as usize,
+                medium as usize,
+                long as usize,
+            )
             .unwrap_or(u32::MAX)
     }
 

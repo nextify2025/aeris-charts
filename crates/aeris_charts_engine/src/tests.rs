@@ -187,6 +187,18 @@ fn financial_product_compatibility_fixture_survives_shared_frame_mutations() {
     assert!(chart.add_atr(0, 14).is_some());
     assert!(chart.add_vwap(0, Some(histogram)).is_some());
     assert!(chart.add_obv(0, histogram).is_some());
+    assert!(chart.add_accumulation_distribution(0, histogram).is_some());
+    assert!(chart.add_price_volume_trend(0, histogram).is_some());
+    assert!(chart.add_chaikin_oscillator(0, histogram, 3, 10).is_some());
+    assert!(chart.add_relative_volume(0, histogram, 5).is_some());
+    assert!(chart.add_elder_force(0, histogram, 5).is_some());
+    assert!(chart.add_ease_of_movement(0, histogram, 5, 100.0).is_some());
+    assert!(chart.add_historical_volatility(0, 5, 252.0).is_some());
+    assert_eq!(chart.add_trix(0, 5, 3).len(), 2);
+    assert!(chart.add_coppock_curve(0, 14, 11, 10).is_some());
+    assert_eq!(chart.add_fisher_transform(0, 10).len(), 2);
+    assert!(chart.add_ultimate_oscillator(0, 7, 14, 28).is_some());
+    assert_eq!(chart.add_volume_oscillator(0, histogram, 3, 10, 4).len(), 3);
     assert!(chart.add_cmf(0, histogram, 14).is_some());
     assert!(chart.add_mfi(0, histogram, 14).is_some());
     assert_eq!(chart.add_volume(0, histogram, 14).len(), 2);
@@ -241,6 +253,39 @@ fn financial_product_compatibility_fixture_survives_shared_frame_mutations() {
             IndicatorKind::Atr { period: 14 },
             IndicatorKind::Vwap,
             IndicatorKind::Obv,
+            IndicatorKind::AccumulationDistribution,
+            IndicatorKind::PriceVolumeTrend,
+            IndicatorKind::ChaikinOscillator { fast: 3, slow: 10 },
+            IndicatorKind::RelativeVolume { period: 5 },
+            IndicatorKind::ElderForce { period: 5 },
+            IndicatorKind::EaseOfMovement {
+                period: 5,
+                divisor: 100.0
+            },
+            IndicatorKind::HistoricalVolatility {
+                period: 5,
+                annualization: 252.0,
+            },
+            IndicatorKind::Trix {
+                period: 5,
+                signal: 3
+            },
+            IndicatorKind::CoppockCurve {
+                long: 14,
+                short: 11,
+                smoothing: 10
+            },
+            IndicatorKind::FisherTransform { period: 10 },
+            IndicatorKind::UltimateOscillator {
+                short: 7,
+                medium: 14,
+                long: 28
+            },
+            IndicatorKind::VolumeOscillator {
+                fast: 3,
+                slow: 10,
+                signal: 4
+            },
             IndicatorKind::Cmf { period: 14 },
             IndicatorKind::Mfi { period: 14 },
             IndicatorKind::Volume { period: 14 },
@@ -1900,6 +1945,13 @@ fn add_test_indicator(
             kind,
             IndicatorKind::Vwap
                 | IndicatorKind::Obv
+                | IndicatorKind::AccumulationDistribution
+                | IndicatorKind::PriceVolumeTrend
+                | IndicatorKind::ChaikinOscillator { .. }
+                | IndicatorKind::RelativeVolume { .. }
+                | IndicatorKind::ElderForce { .. }
+                | IndicatorKind::EaseOfMovement { .. }
+                | IndicatorKind::VolumeOscillator { .. }
                 | IndicatorKind::Cmf { .. }
                 | IndicatorKind::Mfi { .. }
                 | IndicatorKind::Volume { .. }
@@ -1913,6 +1965,20 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
     let binding = &chart.indicators[binding_index];
     let (times, source) = chart.data.series_data(binding.source).unwrap();
     let expected = match binding.kind {
+        IndicatorKind::Aroon { period } => {
+            let values = aeris_charts_indicators::aroon(source[1], source[2], period);
+            vec![
+                values.iter().map(|value| value.0).collect(),
+                values.iter().map(|value| value.1).collect(),
+            ]
+        }
+        IndicatorKind::AwesomeOscillator => vec![aeris_charts_indicators::awesome_oscillator(
+            source[1], source[2],
+        )],
+        IndicatorKind::Dpo { period } => vec![aeris_charts_indicators::dpo(source[3], period)],
+        IndicatorKind::ChandeMomentum { period } => {
+            vec![aeris_charts_indicators::chande_momentum(source[3], period)]
+        }
         IndicatorKind::Sma { period } => vec![aeris_charts_indicators::sma(source[3], period)],
         IndicatorKind::Ema { period, seed } => vec![aeris_charts_indicators::ema_with_seed(
             source[3], period, seed,
@@ -1931,6 +1997,46 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
         IndicatorKind::StandardDeviation { period } => {
             vec![aeris_charts_indicators::standard_deviation(
                 source[3], period,
+            )]
+        }
+        IndicatorKind::HistoricalVolatility {
+            period,
+            annualization,
+        } => vec![aeris_charts_indicators::historical_volatility(
+            source[3],
+            period,
+            annualization,
+        )],
+        IndicatorKind::Trix { period, signal } => {
+            let points = aeris_charts_indicators::trix(source[3], period, signal);
+            vec![
+                points.iter().map(|point| point.line).collect(),
+                points.iter().map(|point| point.signal).collect(),
+            ]
+        }
+        IndicatorKind::CoppockCurve {
+            long,
+            short,
+            smoothing,
+        } => {
+            vec![aeris_charts_indicators::coppock_curve(
+                source[3], long, short, smoothing,
+            )]
+        }
+        IndicatorKind::FisherTransform { period } => {
+            let points = aeris_charts_indicators::fisher_transform(source[1], source[2], period);
+            vec![
+                points.iter().map(|point| point.line).collect(),
+                points.iter().map(|point| point.trigger).collect(),
+            ]
+        }
+        IndicatorKind::UltimateOscillator {
+            short,
+            medium,
+            long,
+        } => {
+            vec![aeris_charts_indicators::ultimate_oscillator(
+                source[1], source[2], source[3], short, medium, long,
             )]
         }
         IndicatorKind::Cci { period } => {
@@ -2037,6 +2143,33 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
                 points.iter().map(|point| point.lower).collect(),
             ]
         }
+        IndicatorKind::BollingerMetrics { period, deviation } => {
+            let points = aeris_charts_indicators::bollinger_metrics(source[3], period, deviation);
+            vec![
+                points.iter().map(|point| point.0).collect(),
+                points.iter().map(|point| point.1).collect(),
+            ]
+        }
+        IndicatorKind::Envelopes {
+            period,
+            percent,
+            exponential,
+        } => {
+            let points =
+                aeris_charts_indicators::envelopes(source[3], period, percent, exponential);
+            vec![
+                points.iter().map(|point| point.0).collect(),
+                points.iter().map(|point| point.1).collect(),
+                points.iter().map(|point| point.2).collect(),
+            ]
+        }
+        IndicatorKind::Alma {
+            period,
+            offset,
+            sigma,
+        } => vec![aeris_charts_indicators::alma(
+            source[3], period, offset, sigma,
+        )],
         IndicatorKind::Rsi { period, seed } => vec![aeris_charts_indicators::rsi_with_seed(
             source[3], period, seed,
         )],
@@ -2095,7 +2228,14 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
                 times, source[1], source[2], source[3], &volume,
             )]
         }
-        IndicatorKind::Obv => {
+        IndicatorKind::Obv
+        | IndicatorKind::AccumulationDistribution
+        | IndicatorKind::PriceVolumeTrend
+        | IndicatorKind::ChaikinOscillator { .. }
+        | IndicatorKind::RelativeVolume { .. }
+        | IndicatorKind::ElderForce { .. }
+        | IndicatorKind::EaseOfMovement { .. }
+        | IndicatorKind::VolumeOscillator { .. } => {
             let volume = binding
                 .volume_source
                 .and_then(|id| chart.data.series_data(id))
@@ -2113,7 +2253,44 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
                     aligned
                 })
                 .unwrap_or_default();
-            vec![aeris_charts_indicators::obv(source[3], &volume)]
+            if let IndicatorKind::VolumeOscillator { fast, slow, signal } = binding.kind {
+                let points =
+                    aeris_charts_indicators::volume_oscillator(&volume, fast, slow, signal);
+                vec![
+                    points.iter().map(|point| point.line).collect(),
+                    points.iter().map(|point| point.signal).collect(),
+                    points.iter().map(|point| point.histogram).collect(),
+                ]
+            } else if let IndicatorKind::ElderForce { period } = binding.kind {
+                vec![aeris_charts_indicators::elder_force(
+                    source[3], &volume, period,
+                )]
+            } else if let IndicatorKind::EaseOfMovement { period, divisor } = binding.kind {
+                vec![aeris_charts_indicators::ease_of_movement(
+                    source[1], source[2], &volume, period, divisor,
+                )]
+            } else {
+                vec![match binding.kind {
+                    IndicatorKind::Obv => aeris_charts_indicators::obv(source[3], &volume),
+                    IndicatorKind::AccumulationDistribution => {
+                        aeris_charts_indicators::accumulation_distribution(
+                            source[1], source[2], source[3], &volume,
+                        )
+                    }
+                    IndicatorKind::PriceVolumeTrend => {
+                        aeris_charts_indicators::price_volume_trend(source[3], &volume)
+                    }
+                    IndicatorKind::ChaikinOscillator { fast, slow } => {
+                        aeris_charts_indicators::chaikin_oscillator(
+                            source[1], source[2], source[3], &volume, fast, slow,
+                        )
+                    }
+                    IndicatorKind::RelativeVolume { period } => {
+                        aeris_charts_indicators::relative_volume(&volume, period)
+                    }
+                    _ => unreachable!(),
+                }]
+            }
         }
         IndicatorKind::Cmf { period } => {
             let volume = binding
@@ -2369,6 +2546,10 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
 #[test]
 fn every_indicator_engine_path_matches_full_recomputation() {
     let kinds = [
+        IndicatorKind::Aroon { period: 5 },
+        IndicatorKind::AwesomeOscillator,
+        IndicatorKind::Dpo { period: 5 },
+        IndicatorKind::ChandeMomentum { period: 5 },
         IndicatorKind::Sma { period: 5 },
         IndicatorKind::Ema {
             period: 5,
@@ -2385,6 +2566,25 @@ fn every_indicator_engine_path_matches_full_recomputation() {
         IndicatorKind::Rsi {
             period: 5,
             seed: IndicatorSeed::Sma,
+        },
+        IndicatorKind::BollingerMetrics {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: false,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: true,
+        },
+        IndicatorKind::Alma {
+            period: 5,
+            offset: 0.85,
+            sigma: 6.0,
         },
         IndicatorKind::Macd {
             fast: 3,
@@ -2405,6 +2605,39 @@ fn every_indicator_engine_path_matches_full_recomputation() {
             percent: 5.0,
         },
         IndicatorKind::Obv,
+        IndicatorKind::AccumulationDistribution,
+        IndicatorKind::PriceVolumeTrend,
+        IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 },
+        IndicatorKind::RelativeVolume { period: 5 },
+        IndicatorKind::ElderForce { period: 5 },
+        IndicatorKind::EaseOfMovement {
+            period: 5,
+            divisor: 100.0,
+        },
+        IndicatorKind::HistoricalVolatility {
+            period: 5,
+            annualization: 252.0,
+        },
+        IndicatorKind::Trix {
+            period: 3,
+            signal: 4,
+        },
+        IndicatorKind::CoppockCurve {
+            long: 7,
+            short: 5,
+            smoothing: 3,
+        },
+        IndicatorKind::FisherTransform { period: 5 },
+        IndicatorKind::UltimateOscillator {
+            short: 3,
+            medium: 5,
+            long: 7,
+        },
+        IndicatorKind::VolumeOscillator {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
         IndicatorKind::Cmf { period: 5 },
         IndicatorKind::Mfi { period: 5 },
         IndicatorKind::Volume { period: 5 },
@@ -2536,6 +2769,10 @@ fn every_indicator_engine_path_matches_full_recomputation() {
 fn every_indicator_kind() -> Vec<IndicatorKind> {
     use aeris_charts_indicators::{PivotKind, VwapReset};
     vec![
+        IndicatorKind::Aroon { period: 5 },
+        IndicatorKind::AwesomeOscillator,
+        IndicatorKind::Dpo { period: 5 },
+        IndicatorKind::ChandeMomentum { period: 5 },
         IndicatorKind::Sma { period: 5 },
         IndicatorKind::Ema {
             period: 5,
@@ -2591,6 +2828,25 @@ fn every_indicator_kind() -> Vec<IndicatorKind> {
             period: 5,
             seed: IndicatorSeed::Sma,
         },
+        IndicatorKind::BollingerMetrics {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: false,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: true,
+        },
+        IndicatorKind::Alma {
+            period: 5,
+            offset: 0.85,
+            sigma: 6.0,
+        },
         IndicatorKind::Macd {
             fast: 3,
             slow: 6,
@@ -2605,6 +2861,39 @@ fn every_indicator_kind() -> Vec<IndicatorKind> {
         IndicatorKind::Atr { period: 5 },
         IndicatorKind::Vwap,
         IndicatorKind::Obv,
+        IndicatorKind::AccumulationDistribution,
+        IndicatorKind::PriceVolumeTrend,
+        IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 },
+        IndicatorKind::RelativeVolume { period: 5 },
+        IndicatorKind::ElderForce { period: 5 },
+        IndicatorKind::EaseOfMovement {
+            period: 5,
+            divisor: 100.0,
+        },
+        IndicatorKind::HistoricalVolatility {
+            period: 5,
+            annualization: 252.0,
+        },
+        IndicatorKind::Trix {
+            period: 3,
+            signal: 4,
+        },
+        IndicatorKind::CoppockCurve {
+            long: 7,
+            short: 5,
+            smoothing: 3,
+        },
+        IndicatorKind::FisherTransform { period: 5 },
+        IndicatorKind::UltimateOscillator {
+            short: 3,
+            medium: 5,
+            long: 7,
+        },
+        IndicatorKind::VolumeOscillator {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
         IndicatorKind::Cmf { period: 5 },
         IndicatorKind::Mfi { period: 5 },
         IndicatorKind::Volume { period: 5 },
@@ -2621,6 +2910,85 @@ fn every_indicator_kind() -> Vec<IndicatorKind> {
             seed: aeris_charts_indicators::KdjSeed::Fifty,
         },
     ]
+}
+
+#[test]
+fn volume_studies_weight_source_bars_missing_from_the_volume_series_as_zero() {
+    // The volume series lacks two source timestamps. Every volume-flow study must weight them as
+    // zero volume, exactly like a volume series that carries explicit zeros there.
+    let times = (0..30).map(|row| row as f64 * 60.0).collect::<Vec<_>>();
+    let close = (0..30)
+        .map(|row| 100.0 + (row as f64 * 0.7).sin() * 3.0)
+        .collect::<Vec<_>>();
+    let high = close.iter().map(|value| value + 1.0).collect::<Vec<_>>();
+    let low = close.iter().map(|value| value - 1.5).collect::<Vec<_>>();
+    let volume = |row: usize| 100.0 + (row % 5) as f64 * 40.0;
+    let missing = [7, 18];
+    let install = |kind: &IndicatorKind, sparse: bool| {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .set_series_data(0, &times, &close, &high, &low, &close)
+            .unwrap();
+        let volume_series = chart.add_series(SeriesKind::Histogram);
+        let rows = (0..30)
+            .filter(|row| !sparse || !missing.contains(row))
+            .collect::<Vec<_>>();
+        let volume_times = rows.iter().map(|&row| times[row]).collect::<Vec<_>>();
+        let values = rows
+            .iter()
+            .map(|&row| {
+                if missing.contains(&row) {
+                    0.0
+                } else {
+                    volume(row)
+                }
+            })
+            .collect::<Vec<_>>();
+        chart
+            .set_series_data(
+                volume_series,
+                &volume_times,
+                &values,
+                &values,
+                &values,
+                &values,
+            )
+            .unwrap();
+        let outputs = chart.add_indicator_kind(0, kind.clone(), Some(volume_series));
+        assert!(!outputs.is_empty(), "{kind:?} binds");
+        outputs
+            .iter()
+            .map(|&output| chart.data.series_data(output).unwrap().1[3].to_vec())
+            .collect::<Vec<_>>()
+    };
+    for kind in [
+        IndicatorKind::Obv,
+        IndicatorKind::AccumulationDistribution,
+        IndicatorKind::PriceVolumeTrend,
+        IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 },
+        IndicatorKind::RelativeVolume { period: 5 },
+        IndicatorKind::VolumeOscillator {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
+        IndicatorKind::ElderForce { period: 5 },
+        IndicatorKind::EaseOfMovement {
+            period: 5,
+            divisor: 100.0,
+        },
+    ] {
+        let sparse = install(&kind, true);
+        let zeros = install(&kind, false);
+        for (output, (sparse, zeros)) in sparse.iter().zip(&zeros).enumerate() {
+            for (row, (sparse, zeros)) in sparse.iter().zip(zeros).enumerate() {
+                assert!(
+                    (sparse.is_nan() && zeros.is_nan()) || (sparse - zeros).abs() < 1e-9,
+                    "{kind:?} output {output} row {row}: {sparse} != {zeros}"
+                );
+            }
+        }
+    }
 }
 
 /// `IndicatorKind` keeps its large internally tagged serde bodies out of line (see the enum), so every
@@ -2667,6 +3035,13 @@ fn indicator_reads_volume(kind: &IndicatorKind) -> bool {
             | IndicatorKind::Vwap
             | IndicatorKind::VwapBands { .. }
             | IndicatorKind::Obv
+            | IndicatorKind::AccumulationDistribution
+            | IndicatorKind::PriceVolumeTrend
+            | IndicatorKind::ChaikinOscillator { .. }
+            | IndicatorKind::RelativeVolume { .. }
+            | IndicatorKind::VolumeOscillator { .. }
+            | IndicatorKind::ElderForce { .. }
+            | IndicatorKind::EaseOfMovement { .. }
             | IndicatorKind::Cmf { .. }
             | IndicatorKind::Mfi { .. }
             | IndicatorKind::Volume { .. }
@@ -3376,6 +3751,10 @@ fn replay_seeks_in_both_directions_match_a_fresh_install_for_every_indicator() {
 #[test]
 fn batch_and_single_updates_are_semantically_identical_for_every_indicator() {
     let kinds = [
+        IndicatorKind::Aroon { period: 5 },
+        IndicatorKind::AwesomeOscillator,
+        IndicatorKind::Dpo { period: 5 },
+        IndicatorKind::ChandeMomentum { period: 5 },
         IndicatorKind::Sma { period: 5 },
         IndicatorKind::Ema {
             period: 5,
@@ -3388,6 +3767,25 @@ fn batch_and_single_updates_are_semantically_identical_for_every_indicator() {
             period: 5,
             deviation: 2.0,
             estimator: DeviationEstimator::Population,
+        },
+        IndicatorKind::BollingerMetrics {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: false,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: true,
+        },
+        IndicatorKind::Alma {
+            period: 5,
+            offset: 0.85,
+            sigma: 6.0,
         },
         IndicatorKind::Rsi {
             period: 5,
@@ -3406,6 +3804,39 @@ fn batch_and_single_updates_are_semantically_identical_for_every_indicator() {
         },
         IndicatorKind::Atr { period: 5 },
         IndicatorKind::Vwap,
+        IndicatorKind::AccumulationDistribution,
+        IndicatorKind::PriceVolumeTrend,
+        IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 },
+        IndicatorKind::RelativeVolume { period: 5 },
+        IndicatorKind::ElderForce { period: 5 },
+        IndicatorKind::EaseOfMovement {
+            period: 5,
+            divisor: 100.0,
+        },
+        IndicatorKind::HistoricalVolatility {
+            period: 5,
+            annualization: 252.0,
+        },
+        IndicatorKind::Trix {
+            period: 3,
+            signal: 4,
+        },
+        IndicatorKind::CoppockCurve {
+            long: 7,
+            short: 5,
+            smoothing: 3,
+        },
+        IndicatorKind::FisherTransform { period: 5 },
+        IndicatorKind::UltimateOscillator {
+            short: 3,
+            medium: 5,
+            long: 7,
+        },
+        IndicatorKind::VolumeOscillator {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
         IndicatorKind::Wma { period: 5 },
     ];
     for kind in kinds {
@@ -3454,7 +3885,18 @@ fn batch_and_single_updates_are_semantically_identical_for_every_indicator() {
             let single = singles.data.series_data(series).unwrap();
             let batched = batch.data.series_data(series).unwrap();
             assert_eq!(single.0, batched.0);
-            assert_eq!(single.1, batched.1);
+            for (single_column, batched_column) in single.1.iter().zip(batched.1.iter()) {
+                assert_eq!(single_column.len(), batched_column.len());
+                for (&single_value, &batched_value) in
+                    single_column.iter().zip(batched_column.iter())
+                {
+                    assert!(
+                        single_value == batched_value
+                            || (single_value.is_nan() && batched_value.is_nan()),
+                        "{kind:?} output {series}: {single_value} != {batched_value}"
+                    );
+                }
+            }
         }
 
         singles.time_scale.set_width(800.0);
@@ -4219,6 +4661,69 @@ fn macd_outputs_are_line_line_histogram_with_four_state_colors() {
 }
 
 #[test]
+fn volume_oscillator_uses_one_pane_and_histogram_output() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [10.0, 20.0, 30.0, 20.0, 10.0, 30.0];
+    let times = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart
+        .set_series_data(volume, &times, &values, &values, &values, &values)
+        .unwrap();
+    let ids = chart.add_volume_oscillator(0, volume, 2, 3, 2);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(chart.series_kind(ids[0]), Some(SeriesKind::Line));
+    assert_eq!(chart.series_kind(ids[1]), Some(SeriesKind::Line));
+    assert_eq!(chart.series_kind(ids[2]), Some(SeriesKind::Histogram));
+    assert!(ids.iter().all(|&id| {
+        chart
+            .series
+            .iter()
+            .find(|series| series.id == id)
+            .unwrap()
+            .pane_index
+            == 1
+    }));
+    assert_eq!(
+        chart.indicator_info(ids[2]).unwrap().output_name,
+        "Histogram"
+    );
+    assert_indicator_binding_matches_full(&chart, 0);
+}
+
+#[test]
+fn ease_of_movement_requires_positive_divisor_and_uses_oscillator_pane() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [10.0, 20.0, 30.0];
+    let times = [1.0, 2.0, 3.0];
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    chart
+        .set_series_data(volume, &times, &values, &values, &values, &values)
+        .unwrap();
+    assert!(chart.add_ease_of_movement(0, volume, 2, 0.0).is_none());
+    let output = chart.add_ease_of_movement(0, volume, 2, 100.0).unwrap();
+    assert_eq!(chart.series_kind(output), Some(SeriesKind::Line));
+    assert_eq!(
+        chart
+            .series
+            .iter()
+            .find(|series| series.id == output)
+            .unwrap()
+            .pane_index,
+        1
+    );
+    assert_eq!(
+        chart.indicator_info(output).unwrap().parameters.divisor,
+        Some(100.0)
+    );
+}
+
+#[test]
 fn generic_threshold_region_is_series_owned_and_validated() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     let line = chart.add_series(SeriesKind::Line);
@@ -4810,6 +5315,8 @@ fn indicator_schema_exposes_typed_parameters_and_outputs() {
         estimator: DeviationEstimator::Population,
     });
     assert_eq!(schema.revision, INDICATOR_SCHEMA_REVISION);
+    // Revision 3 introduced the boolean parameter type; hosts key editors on this number.
+    assert_eq!(INDICATOR_SCHEMA_REVISION, 3);
     assert_eq!(schema.kind, "bollinger");
     assert_eq!(
         schema.parameters[0].parameter_type,
@@ -4820,6 +5327,42 @@ fn indicator_schema_exposes_typed_parameters_and_outputs() {
     assert_eq!(schema.outputs.len(), 3);
     assert_eq!(schema.outputs[0].name, "Upper");
     assert!(schema.outputs.iter().all(|output| output.supports_style));
+
+    let envelopes = ChartEngine::indicator_schema(&IndicatorKind::Envelopes {
+        period: 20,
+        percent: 2.5,
+        exponential: true,
+    });
+    let exponential = envelopes
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "exponential")
+        .unwrap();
+    assert_eq!(exponential.parameter_type, IndicatorParameterType::Boolean);
+    assert_eq!(exponential.default, serde_json::json!(true));
+    assert_eq!((exponential.min, exponential.max), (None, None));
+}
+
+#[test]
+fn negative_bollinger_deviation_is_rejected_without_changing_the_chart() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [10.0, 11.0, 12.0, 11.0, 10.0];
+    chart
+        .set_series_data(
+            0,
+            &[0.0, 1.0, 2.0, 3.0, 4.0],
+            &values,
+            &values,
+            &values,
+            &values,
+        )
+        .unwrap();
+    let before = chart.export_state_json().unwrap();
+    assert!(chart.add_bollinger(0, 3, -1.0).is_empty());
+    assert!(chart.add_bollinger_metrics(0, 3, -1.0).is_empty());
+    assert!(chart.indicator_bindings().is_empty());
+    assert_eq!(chart.export_state_json().unwrap(), before);
+    assert_eq!(chart.add_bollinger(0, 3, 0.0).len(), 3);
 }
 
 #[test]
@@ -10506,6 +11049,10 @@ fn comparison_anchor_drives_shared_bases_and_bounded_legend_values() {
 /// Every built-in indicator kind, including the convention variants, for whitespace checks.
 fn every_indicator_kind_with_conventions() -> Vec<IndicatorKind> {
     vec![
+        IndicatorKind::Aroon { period: 5 },
+        IndicatorKind::AwesomeOscillator,
+        IndicatorKind::Dpo { period: 5 },
+        IndicatorKind::ChandeMomentum { period: 5 },
         IndicatorKind::Sma { period: 5 },
         IndicatorKind::Ema {
             period: 5,
@@ -10561,6 +11108,25 @@ fn every_indicator_kind_with_conventions() -> Vec<IndicatorKind> {
             deviation: 2.0,
             estimator: DeviationEstimator::Sample,
         },
+        IndicatorKind::BollingerMetrics {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: false,
+        },
+        IndicatorKind::Envelopes {
+            period: 5,
+            percent: 10.0,
+            exponential: true,
+        },
+        IndicatorKind::Alma {
+            period: 5,
+            offset: 0.85,
+            sigma: 6.0,
+        },
         IndicatorKind::Rsi {
             period: 5,
             seed: IndicatorSeed::Sma,
@@ -10590,6 +11156,39 @@ fn every_indicator_kind_with_conventions() -> Vec<IndicatorKind> {
         IndicatorKind::Atr { period: 5 },
         IndicatorKind::Vwap,
         IndicatorKind::Obv,
+        IndicatorKind::AccumulationDistribution,
+        IndicatorKind::PriceVolumeTrend,
+        IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 },
+        IndicatorKind::RelativeVolume { period: 5 },
+        IndicatorKind::ElderForce { period: 5 },
+        IndicatorKind::EaseOfMovement {
+            period: 5,
+            divisor: 100.0,
+        },
+        IndicatorKind::HistoricalVolatility {
+            period: 5,
+            annualization: 252.0,
+        },
+        IndicatorKind::Trix {
+            period: 3,
+            signal: 4,
+        },
+        IndicatorKind::CoppockCurve {
+            long: 7,
+            short: 5,
+            smoothing: 3,
+        },
+        IndicatorKind::FisherTransform { period: 5 },
+        IndicatorKind::UltimateOscillator {
+            short: 3,
+            medium: 5,
+            long: 7,
+        },
+        IndicatorKind::VolumeOscillator {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
         IndicatorKind::Cmf { period: 5 },
         IndicatorKind::Mfi { period: 5 },
         IndicatorKind::Volume { period: 5 },
@@ -10696,17 +11295,7 @@ fn whitespace_chart(
             &source.close[..rows],
         )
         .unwrap();
-    let volume_source = matches!(
-        kind,
-        IndicatorKind::Vwap
-            | IndicatorKind::Obv
-            | IndicatorKind::Cmf { .. }
-            | IndicatorKind::Mfi { .. }
-            | IndicatorKind::Volume { .. }
-            | IndicatorKind::VwapBands { .. }
-            | IndicatorKind::Vwma { .. }
-    )
-    .then_some(volume);
+    let volume_source = indicator_reads_volume(kind).then_some(volume);
     let outputs = chart.add_indicator_kind(0, kind.clone(), volume_source);
     assert!(!outputs.is_empty(), "{kind:?} accepted");
     (chart, outputs)
@@ -10812,7 +11401,6 @@ fn whitespace_source_rows_never_poison_any_indicator_binding() {
 
 #[test]
 fn macd_histogram_colors_match_a_full_rebuild_for_every_convention_and_whitespace() {
-    let spaced = WhitespaceSource::new(40, &[9, 22, 23]);
     for seed in [IndicatorSeed::Sma, IndicatorSeed::FirstValue] {
         let kind = IndicatorKind::Macd {
             fast: 3,
@@ -10821,43 +11409,74 @@ fn macd_histogram_colors_match_a_full_rebuild_for_every_convention_and_whitespac
             seed,
             histogram_multiplier: 2.0,
         };
-        let (mut streamed, outputs) = whitespace_chart(&kind, &spaced, 5);
-        for row in 5..40 {
-            streamed.update_series_bar(
-                0,
-                spaced.times[row],
-                [
-                    spaced.open[row],
-                    spaced.high[row],
-                    spaced.low[row],
-                    spaced.close[row],
-                ],
-            );
-        }
-        let (full, full_outputs) = whitespace_chart(&kind, &spaced, 40);
-        let rows = full.data.series_data(full_outputs[2]).unwrap().1[3].len();
-        assert_eq!(
-            streamed.data.series_data(outputs[2]).unwrap().1[3].len(),
-            rows
+        assert_streamed_histogram_colors_match_a_full_rebuild(&kind, 2);
+    }
+}
+
+#[test]
+fn awesome_and_volume_oscillator_histogram_colors_match_a_full_rebuild_over_whitespace() {
+    assert_streamed_histogram_colors_match_a_full_rebuild(&IndicatorKind::AwesomeOscillator, 0);
+    assert_streamed_histogram_colors_match_a_full_rebuild(
+        &IndicatorKind::VolumeOscillator {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
+        2,
+    );
+}
+
+/// Stream `kind` bar by bar over a source with mid-history whitespace and compare the per-bar
+/// momentum colours of its histogram output with a full rebuild; every finite bar is coloured.
+fn assert_streamed_histogram_colors_match_a_full_rebuild(kind: &IndicatorKind, histogram: usize) {
+    let spaced = WhitespaceSource::new(48, &[9, 22, 23, 40]);
+    let (mut streamed, outputs) = whitespace_chart(kind, &spaced, 5);
+    for row in 5..48 {
+        streamed.update_series_bar(
+            0,
+            spaced.times[row],
+            [
+                spaced.open[row],
+                spaced.high[row],
+                spaced.low[row],
+                spaced.close[row],
+            ],
         );
-        for row in 0..rows {
-            let color = |chart: &ChartEngine, id| {
-                chart
-                    .data
-                    .point_color(
-                        id,
-                        aeris_charts_core::model::data_layer::PointColorChannel::Body,
-                        row,
-                    )
-                    .unwrap_or(aeris_charts_core::model::data_layer::POINT_COLOR_ABSENT)
-            };
-            assert_eq!(
-                color(&streamed, outputs[2]),
-                color(&full, full_outputs[2]),
-                "{seed:?} histogram row {row}"
+    }
+    let (full, full_outputs) = whitespace_chart(kind, &spaced, 48);
+    let values = full.data.series_data(full_outputs[histogram]).unwrap().1[3];
+    assert_eq!(
+        streamed.data.series_data(outputs[histogram]).unwrap().1[3].len(),
+        values.len()
+    );
+    let mut coloured = 0;
+    for (row, value) in values.iter().enumerate() {
+        let color = |chart: &ChartEngine, id| {
+            chart
+                .data
+                .point_color(
+                    id,
+                    aeris_charts_core::model::data_layer::PointColorChannel::Body,
+                    row,
+                )
+                .unwrap_or(aeris_charts_core::model::data_layer::POINT_COLOR_ABSENT)
+        };
+        let full_color = color(&full, full_outputs[histogram]);
+        assert_eq!(
+            color(&streamed, outputs[histogram]),
+            full_color,
+            "{kind:?} histogram row {row}"
+        );
+        if value.is_finite() {
+            assert_ne!(
+                full_color,
+                aeris_charts_core::model::data_layer::POINT_COLOR_ABSENT,
+                "{kind:?} histogram row {row} is coloured"
             );
+            coloured += 1;
         }
     }
+    assert!(coloured > 0, "{kind:?} draws histogram bars");
 }
 
 #[test]

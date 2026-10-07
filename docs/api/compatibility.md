@@ -67,7 +67,7 @@
 
 ## 持久化 V3 研究
 
-带有引擎持有指标的金融图表导出 schema 版本 3。V3 仍由宿主持有市场历史与普通系列数据，但会持久化有序的研究绑定、标量输入选择、类型化指标参数（包括显式的 seed、histogram 与 estimator 取值）、按时间戳对齐的成交量与成交额来源引用，以及各输出的样式。链式来源被编码为对较早研究输出的引用，因此恢复不依赖旧的实时系列标识。宿主必须在导入 V3 之前重新创建来源系列及其数据；导入会在变更之前校验每一项依赖、参数、输出样式数量和资源限制。V1 和 V2 文档仍被原样接受，且 V3 文档只能恢复到全新的金融图表中。
+带有引擎持有指标的金融图表导出 schema 版本 3。V3 仍由宿主持有市场历史与普通系列数据，但会持久化有序的研究绑定、标量输入选择、类型化指标参数（包括显式的 seed、histogram 与 estimator 取值）、按时间戳对齐的成交量与成交额来源引用，以及各输出的样式。链式来源被编码为对较早研究输出的引用，因此恢复不依赖旧的实时系列标识。宿主必须在导入 V3 之前重新创建来源系列及其数据；导入会在变更之前校验每一项依赖、参数、输出样式数量和资源限制。V1 和 V2 文档仍被原样接受，且 V3 文档只能恢复到全新的金融图表中。广度层的 19 个指标种类（上游 `2f62875`）以其 `kind` 名称写入同一个 V3 schema，没有提升版本号，因此不包含这些种类的较早修订会拒绝导入含有它们的文档。
 
 ## 版本策略
 
@@ -81,6 +81,7 @@
 
 ### 已记录的不兼容变更
 
+- 布林带偏差必须有限且不小于 0（上游 `2f62875`）。`add_bollinger`、`add_bollinger_with_source` 与新增的 `add_bollinger_metrics` 拒绝负偏差（`invalid_options`），V3 导入同样拒绝含负布林带偏差的研究；此前负偏差会被接受并按 0 计算带宽，以前导出的此类文档不再能导入。`indicator_schema(kind)` 同时升为修订 3，新增 `"boolean"` 参数类型，按 `parameter_type` 穷尽分派的宿主编辑器需要处理它。
 - 大单取代足迹图成交气泡（上游 `9fc3f2b`）。`chart.add_trade_bubbles(series, stream_id, options)` 已移除且没有兼容垫片：其替代品 `chart.add_big_trades(series, stream_id, options)` 的行为不同（先由连续成交重建主动订单再过滤，默认按最近已完成订单的 98 分位数自动过滤，前 128 个订单完成之前不显示任何气泡；气泡是窗格 chrome，不再写入系列标记），并返回一个 `big_trades_api` 句柄；被拒绝时抛出带类型的错误：超过 16 个指标为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，选项无效为 `invalid_options`（`apply_options` 在句柄移除后为 `stale_handle`）。`trade_stream_stats` 的 `bubble_trades_scanned` 与 `bubble_markers_sized` 由 `big_trades_prints_scanned` 与 `big_trades_replays` 取代。按上文策略这属于 major 级别的变更，具体版本号在发布时决定。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
 
 ## 品牌更名

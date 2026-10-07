@@ -3716,7 +3716,7 @@ impl ChartEngine {
                 continue;
             };
 
-            // The progress origin is the first post-placement candle that actually reaches/crosses
+            // The progress pivot is the first post-placement candle that actually reaches/crosses
             // the entry. A position that has not filled emits no progress geometry at all.
             let Some((start_x, _)) =
                 self.drawing_to_px_for(pane_index, drawing.price_scale, run_start)

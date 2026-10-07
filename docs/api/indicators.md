@@ -4,6 +4,7 @@
 
 - [成交量分布](#成交量分布)
 - [指标约定](#指标约定)
+- [广度层指标](#广度层指标)
 - [KLineChart 指标](#klinechart-指标)
 
 ## 成交量分布
@@ -97,11 +98,11 @@ const [k, d, j] = chart.add_kdj(candles, 9, 3, 3);
 
 未验证：通达信/同花顺/富途终端的确切输出（因此不声称 China 预设与富途一致），终端如何处理平坦窗口（东方财富和新浪的网页图表使用 RSV 0，而不是重复上一个 RSV；通达信的公式帮助未记载除以零的处理），以及富途的网页图表（其页面处于机器人验证之后）。同花顺的旧版网页图表使用其他的 KDJ 起始方式（以 100 起始并裁剪，或对前 N 根柱使用滚动均值），不被视为终端定义。
 
-`indicator_schema(kind)` 为修订 2：约定参数以带有 `choices` 列表的 `"choice"` 参数形式出现，VWAP 会列出一个可选的 `amount_source` 系列。
+`indicator_schema(kind)` 为修订 3：约定参数以带有 `choices` 列表的 `"choice"` 参数形式出现，开关参数（包络线的 `exponential`）以 `"boolean"` 参数形式出现，VWAP 会列出一个可选的 `amount_source` 系列。属性面板按 `parameter_type` 分派编辑器时，需要处理 `"integer"`、`"number"`、`"boolean"`、`"source"`、`"series"` 与 `"choice"` 六种取值。
 
 **空白数据源**。指标源中的空白数据行（`{ time }`）保留其时间槽位，但绝不进入计算状态。每个研究都在该处输出一条空白数据输出行，并完全按该行不存在的方式继续计算：暂停的交易时段或预先填充的未来槽位不会重置或污染 EMA/RSI/MACD 递推，窗口类研究使用最近 N 根真实柱。之后填充某个空白槽位时，会从该行起重新计算。
 
-**预热查询与历史数据加载**。`indicator_info()` 为每个输出报告 `warmup_bars`（第一个值之前根价格源的柱数）和 `convergence_bars`（经过这么多柱的历史数据后，数值不再取决于已加载历史数据从何处开始：窗口类研究为预热柱数，再加上使每个递归种子的权重降到 0.1% 以下所需的柱数）。两者都包含链式源，因此 RSI 之上的 SMA 报告的是二者之和。当任何柱数都不足以满足时，`convergence_bars` 为 `null`：交易时段 VWAP 和枢轴点取决于时间锚点，OBV、Parabolic SAR、SuperTrend 和 ZigZag 则取决于整条路径。
+**预热查询与历史数据加载**。`indicator_info()` 为每个输出报告 `warmup_bars`（第一个值之前根价格源的柱数）和 `convergence_bars`（经过这么多柱的历史数据后，数值不再取决于已加载历史数据从何处开始：窗口类研究为预热柱数，再加上使每个递归种子的权重降到 0.1% 以下所需的柱数）。两者都包含链式源，因此 RSI 之上的 SMA 报告的是二者之和。当任何柱数都不足以满足时，`convergence_bars` 为 `null`：交易时段 VWAP 和枢轴点取决于时间锚点，OBV、累积/派发、价量趋势、Parabolic SAR、SuperTrend 和 ZigZag 则取决于整条路径。
 
 若要从第一根可见柱起就显示已收敛的值，请求其之前的历史数据：
 
@@ -119,6 +120,38 @@ chart.time_scale().set_visible_logical_range({ from: needed, to: needed + visibl
 **均价（分时均价）**。`add_vwap(price, volume, options, { amount_source: turnover })` 按每个 VWAP 重置周期报告 `sum(amount) / sum(volume)`，而不是对典型价格加权。成交量与成交额按时间戳与价格行对齐；没有正成交量或有限成交额的分钟，以及空白数据价格行，均不贡献任何内容，且在该周期的第一笔成交之前线条为空白。`indicator_info().amount_source` 标识成交额系列；移除它会移除该研究。重置周期遵循 VWAP 的交易时段键。
 
 **线条在重置处重新开始**。每条 VWAP 线（典型价格或按成交额加权）、每个 VWAP 带输出以及每个枢轴水平位，都在其周期重置处结束线条：新交易时段（VWAP 带则为新的一周或一月）中第一条被绘制的行开始新的一段连续线，没有任何线段、填充或命中区域将其与上一周期相连。周期遵循图表的交易所交易日（`time_zone`、`session_start`），与数值重置的方式完全一致，无论是完整安装之后还是实时更新之后均如此。某个周期中唯一被绘制的行就是其第一行时，会绘制一条一根柱宽的水平线段，因此日线柱上的交易时段 VWAP 每根柱显示一条短线段。普通的折线、面积和基线系列会跨日连接，除非 `break_on_trading_day: true` 要求它们在每个交易所交易日处断开（在 Renko 或 Tick 柱等非时间柱轴上，取每根柱开盘时间所在的日）；空白数据行绝不会使线断开。
+
+## 广度层指标
+
+以下 19 个方法（上游 `2f62875`）在源系列上添加内置研究，返回值与其他内置研究一样是普通的 `series_api` 输出句柄；`options` 应用于每个输出。参数无效、或成交量研究缺少独立的标量成交量系列时抛出 `invalid_options`。所有周期必须为正整数。
+
+| 方法 | 参数（默认值） | 输出与窗格 |
+| --- | --- | --- |
+| `add_aroon(source, period)` | | `Aroon Up`、`Aroon Down`，振荡器窗格 |
+| `add_awesome_oscillator(source)` | 固定 5/34 | `AO`，动量柱状图 |
+| `add_dpo(source, period)` | | `DPO` |
+| `add_chande_momentum(source, period)` | | `CMO` |
+| `add_bollinger_metrics(source, period, deviation)` | `deviation` 有限且不小于 0 | `%B` 与 `BandWidth`，各占一个振荡器窗格 |
+| `add_envelopes(source, period, percent, exponential = false)` | `percent` 有限且不小于 0；`exponential` 选择 EMA 基线 | `Upper`、`Basis`、`Lower`，价格窗格，上下轨之间带状填充 |
+| `add_alma(source, period, offset = 0.85, sigma = 6)` | `offset` 在 0–1，`sigma` 在 0.01–1,000,000 | `ALMA`，价格窗格 |
+| `add_accumulation_distribution(source, volume_source)` | | `A/D` |
+| `add_price_volume_trend(source, volume_source)` | | `PVT` |
+| `add_chaikin_oscillator(source, fast, slow, volume_source)` | `fast < slow` | `Chaikin Oscillator` |
+| `add_relative_volume(source, period, volume_source)` | | `Relative Volume`；基线为零时为空缺 |
+| `add_volume_oscillator(source, fast, slow, signal, volume_source)` | `fast < slow` | `PVO`、`Signal`、`Histogram`（动量柱状图），同一窗格 |
+| `add_elder_force(source, period, volume_source)` | | `Elder Force` |
+| `add_ease_of_movement(source, period, volume_source, divisor = 100_000_000)` | `divisor` 有限且为正 | `EOM`；窗口含零成交量柱时为空缺 |
+| `add_historical_volatility(source, period, annualization = 252)` | `period` 至少为 2；`annualization` 为每年的柱数 | `HV`（百分比） |
+| `add_trix(source, period, signal = 9)` | | `TRIX`、`Signal` |
+| `add_coppock_curve(source, long_period = 14, short_period = 11, smoothing = 10)` | | `Coppock Curve` |
+| `add_fisher_transform(source, period = 10)` | | `Fisher`、`Trigger`（上一 Fisher 值） |
+| `add_ultimate_oscillator(source, short_period = 7, medium_period = 14, long_period = 28)` | | `Ultimate Oscillator` |
+
+`indicator_kind` 相应新增 `aroon`、`awesome_oscillator`、`dpo`、`chande_momentum`、`bollinger_metrics`、`envelopes`、`alma`、`accumulation_distribution`、`price_volume_trend`、`chaikin_oscillator`、`relative_volume`、`volume_oscillator`、`elder_force`、`ease_of_movement`、`historical_volatility`、`trix`、`coppock_curve`、`fisher_transform` 与 `ultimate_oscillator`。`indicator_info().parameters` 新增 `exponential`、`offset`、`sigma`、`divisor`、`annualization`、`long_period`、`short_period` 与 `smoothing`（对不使用它们的种类为 `null`）；`deviation` 对布林带指标报告偏差，对包络线报告百分比，对成交量振荡器与 TRIX 报告信号周期。
+
+七个成交量研究把成交量序列中缺失的源时间戳视为零成交量。与其他研究一样，空白数据源行不进入计算，其输出为空白数据行。这些研究的 EMA 一律以前 N 个样本的均值起始，`{ convention: "china" }` 不适用于它们；布林带指标只使用总体标准差。
+
+AO、PVT、TRIX 与 EMV 同时存在内置研究和同名的 KLineChart 模板（`klinechart_ao`、`klinechart_pvt`、`klinechart_trix`、`klinechart_emv`），二者公式不同：内置 PVT 把缺失成交量记为 0 并截断负成交量，模板沿用 KLineChart 的缺失成交量 1；内置 TRIX 的 `period` 必填、`signal` 默认 9，信号线为 EMA，模板默认 12/9，`MATRIX` 为简单移动平均；内置 EOM 在零成交量处为空缺且只输出平滑值，模板在零成交量或零区间处记 0 并另外输出 EMV；AO 的核心公式相同，但模板可配置周期并沿用 KLineChart 的柱体呈现。引擎图例中 KLineChart 绑定的行标题带 `KLineChart` 前缀（例如 `KLineChart PVT` 与内置的 `PVT`）。各输出系列的 `title` 则沿用模板自身的输出名，以保持与 KLineChart 的显示一致，因此内置 PVT 与模板 PVT 的系列标题（名称徽标）都是 `PVT`；宿主需要区分时应读取 `indicator_info().kind`（`price_volume_trend` 与 `klinechart_pvt`）。详见[指标计算与绑定](../architecture/data/indicators.md#广度层指标)。
 
 ## KLineChart 指标
 

@@ -147,6 +147,10 @@ impl ChartEngine {
                 pane: first.pane_index,
                 title: if info.kind == "ema_ribbon" {
                     "EMA Ribbon".to_string()
+                } else if let Some(template) = &info.parameters.klinechart {
+                    // KLineChart templates share names with built-in studies of different
+                    // formulas (AO, PVT, TRIX, EMV), so their rows say where they come from.
+                    format!("KLineChart {}", template.title())
                 } else {
                     first.title.clone()
                 },
@@ -345,6 +349,54 @@ mod tests {
         assert_eq!(rows[1].identity, FinancialLegendIdentity::Host(7));
         assert_eq!(rows[1].first_series_id, volume);
         assert_eq!(rows[2].identity, FinancialLegendIdentity::Indicator(sma));
+    }
+
+    #[test]
+    fn klinechart_rows_are_labelled_apart_from_same_named_built_in_studies() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = [1.0, 2.0, 3.0, 4.0];
+        let closes = [10.0, 11.0, 10.5, 12.0];
+        chart
+            .set_series_data(0, &times, &closes, &closes, &closes, &closes)
+            .unwrap();
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let volumes = [100.0, 120.0, 140.0, 90.0];
+        chart
+            .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+            .unwrap();
+        let native = chart.add_price_volume_trend(0, volume).unwrap();
+        let template = chart.add_klinechart_indicator(
+            0,
+            aeris_charts_indicators::klinechart::Indicator::Pvt,
+            Some(volume),
+        )[0];
+        let rows = chart.financial_legend(FinancialLegendRequest {
+            logical_index: None,
+            primary_title: "",
+            show_primary_ohlc: false,
+            leading_series: &[],
+            trailing_series: &[],
+        });
+        let title = |id| {
+            rows.iter()
+                .find(|row| row.identity == FinancialLegendIdentity::Indicator(id))
+                .map(|row| row.title.as_str())
+        };
+        assert_eq!(title(native), Some("PVT"));
+        assert_eq!(title(template), Some("KLineChart PVT"));
+        // Output series keep the template's own KLineChart titles; the binding kind tells the
+        // two studies apart for hosts that only read series and indicator info.
+        for id in [native, template] {
+            assert_eq!(chart.series_entry(id).unwrap().title, "PVT");
+        }
+        assert_eq!(
+            chart.indicator_info(native).unwrap().kind,
+            "price_volume_trend"
+        );
+        assert_eq!(
+            chart.indicator_info(template).unwrap().kind,
+            "klinechart_pvt"
+        );
     }
 
     #[test]

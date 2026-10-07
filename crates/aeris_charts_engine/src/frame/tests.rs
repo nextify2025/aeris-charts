@@ -8533,31 +8533,37 @@ fn stop_first_progress_darkens_only_the_traveled_loss_slice() {
 }
 
 #[test]
-fn bollinger_band_fill_paints_between_upper_and_lower() {
-    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
-    let times = [1.0, 2.0, 3.0, 4.0];
-    let values = [10.0, 11.0, 12.0, 11.0];
-    chart
-        .set_series_data(0, &times, &values, &values, &values, &values)
-        .unwrap();
-    chart.time_scale.set_width(800.0);
-    chart.fit_content();
-    chart.add_bollinger(0, 2, 2.0);
+fn moving_average_band_fill_paints_between_upper_and_lower() {
+    for envelopes in [false, true] {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = [1.0, 2.0, 3.0, 4.0];
+        let values = [10.0, 11.0, 12.0, 11.0];
+        chart
+            .set_series_data(0, &times, &values, &values, &values, &values)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        if envelopes {
+            chart.add_envelopes(0, 2, 10.0, true);
+        } else {
+            chart.add_bollinger(0, 2, 2.0);
+        }
 
-    let frame = chart.build_frame();
-    let fill = frame.panes[0]
-        .main
-        .iter()
-        .find_map(|p| match p {
-            Prim::BandFill {
-                point_count, fill, ..
-            } => Some((*point_count, *fill)),
-            _ => None,
-        })
-        .expect("bollinger paints a band fill");
-    // Three valid rows (4 bars, warm-up 1) and the fill is the band color at 0.2 alpha.
-    assert_eq!(fill.0, 3);
-    assert_eq!(fill.1, Color::rgba(LINE.r(), LINE.g(), LINE.b(), 51));
+        let frame = chart.build_frame();
+        let fill = frame.panes[0]
+            .main
+            .iter()
+            .find_map(|p| match p {
+                Prim::BandFill {
+                    point_count, fill, ..
+                } => Some((*point_count, *fill)),
+                _ => None,
+            })
+            .expect("study paints a band fill");
+        // Three valid rows (4 bars, warm-up 1) and the fill is the band color at 0.2 alpha.
+        assert_eq!(fill.0, 3);
+        assert_eq!(fill.1, Color::rgba(LINE.r(), LINE.g(), LINE.b(), 51));
+    }
 }
 
 #[test]
