@@ -9807,6 +9807,163 @@ fn previous_close_rule_skips_whitespace_and_opens_against_the_reference_price() 
 }
 
 #[test]
+fn updown_volume_takes_its_direction_from_a_footprint_over_a_whitespace_primary() {
+    let mut chart = ChartEngine::new(1200.0, 600.0, 1.0);
+    let times: Vec<f64> = (0..4).map(|minute| f64::from(minute) * 60.0).collect();
+    let nan = vec![f64::NAN; times.len()];
+    chart
+        .set_series_data(0, &times, &nan, &nan, &nan, &nan)
+        .unwrap();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let volumes = [10.0, 20.0, 30.0, 40.0];
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .unwrap();
+    chart.series_entry_mut(volume).unwrap().histogram_updown = true;
+    let presentation = chart
+        .add_order_flow_presentation(
+            "ES",
+            0,
+            crate::OrderFlowPresentationOptions {
+                aggregation: crate::FootprintAggregationOptions {
+                    tick_size: 1.0,
+                    ticks_per_row: 1,
+                    ..crate::FootprintAggregationOptions::default()
+                },
+                visual: crate::FootprintVisualOptions::default(),
+                show_footprint: true,
+                show_cumulative_delta: false,
+                show_delta_histogram: false,
+                big_trades: None,
+            },
+        )
+        .unwrap();
+    let trade = |timestamp_micros: i64, price: f64| crate::FootprintTrade {
+        timestamp_micros,
+        price,
+        volume: 1.0,
+        aggressor: crate::AggressorSide::Buy,
+        bid: None,
+        ask: None,
+        sequence: None,
+        trade_id: None,
+        conditions: 0,
+        session_id: Some(1),
+    };
+    // The tape covers only the last two minutes: the third closes up, the fourth down.
+    let tape = vec![
+        trade(120_000_000, 100.0),
+        trade(130_000_000, 102.0),
+        trade(180_000_000, 105.0),
+        trade(190_000_000, 101.0),
+    ];
+    chart
+        .update_order_flow_presentation(presentation, tape, false)
+        .unwrap();
+    chart.time_scale.set_width(1200.0);
+    chart.fit_content();
+
+    let frame = chart.build_frame();
+    let segment = chart
+        .frame_series_segments(0)
+        .iter()
+        .find(|segment| segment.series_id == Some(volume))
+        .unwrap();
+    let columns = frame.panes[0].main[segment.start..segment.end]
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Prim::Rect { color, .. } => Some(*color),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // Uncovered slots have no presented bar and keep the series' solid color.
+    assert_eq!(columns, [HISTOGRAM, HISTOGRAM, VOLUME_UP, VOLUME_DOWN]);
+}
+
+/// The footprint fallback over a whitespace primary follows the volume series' tint rule: with
+/// `previous_close` a covered bar closing above its open but below the previous footprint close
+/// tints down, where `open_close` tints it up; the first covered bar has no previous close and
+/// compares with its open.
+#[test]
+fn updown_volume_over_a_whitespace_primary_follows_the_previous_close_rule() {
+    for (rule, last) in [
+        (crate::HistogramUpDownRule::OpenClose, VOLUME_UP),
+        (crate::HistogramUpDownRule::PreviousClose, VOLUME_DOWN),
+    ] {
+        let mut chart = ChartEngine::new(1200.0, 600.0, 1.0);
+        let times: Vec<f64> = (0..4).map(|minute| f64::from(minute) * 60.0).collect();
+        let nan = vec![f64::NAN; times.len()];
+        chart
+            .set_series_data(0, &times, &nan, &nan, &nan, &nan)
+            .unwrap();
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let volumes = [10.0, 20.0, 30.0, 40.0];
+        chart
+            .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+            .unwrap();
+        let series = chart.series_entry_mut(volume).unwrap();
+        series.histogram_updown = true;
+        series.histogram_updown_rule = rule;
+        let presentation = chart
+            .add_order_flow_presentation(
+                "ES",
+                0,
+                crate::OrderFlowPresentationOptions {
+                    aggregation: crate::FootprintAggregationOptions {
+                        tick_size: 1.0,
+                        ticks_per_row: 1,
+                        ..crate::FootprintAggregationOptions::default()
+                    },
+                    visual: crate::FootprintVisualOptions::default(),
+                    show_footprint: true,
+                    show_cumulative_delta: false,
+                    show_delta_histogram: false,
+                    big_trades: None,
+                },
+            )
+            .unwrap();
+        let trade = |timestamp_micros: i64, price: f64| crate::FootprintTrade {
+            timestamp_micros,
+            price,
+            volume: 1.0,
+            aggressor: crate::AggressorSide::Buy,
+            bid: None,
+            ask: None,
+            sequence: None,
+            trade_id: None,
+            conditions: 0,
+            session_id: Some(1),
+        };
+        // The third minute closes up at 104; the fourth opens at 101 and closes at 103.
+        let tape = vec![
+            trade(120_000_000, 100.0),
+            trade(130_000_000, 104.0),
+            trade(180_000_000, 101.0),
+            trade(190_000_000, 103.0),
+        ];
+        chart
+            .update_order_flow_presentation(presentation, tape, false)
+            .unwrap();
+        chart.time_scale.set_width(1200.0);
+        chart.fit_content();
+        let frame = chart.build_frame();
+        let segment = chart
+            .frame_series_segments(0)
+            .iter()
+            .find(|segment| segment.series_id == Some(volume))
+            .unwrap();
+        let columns = frame.panes[0].main[segment.start..segment.end]
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Prim::Rect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(columns, [HISTOGRAM, HISTOGRAM, VOLUME_UP, last], "{rule:?}");
+    }
+}
+
+#[test]
 fn line_per_point_colors_split_the_stroke_and_color_markers() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Line;

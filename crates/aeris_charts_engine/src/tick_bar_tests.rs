@@ -558,7 +558,12 @@ fn retention_keeps_a_folded_auction_print_with_its_bar() {
         ])
         .unwrap();
     assert_eq!(stream.bars().len(), 3);
-    stream.retain_last_bars(1);
+    // Sealing releases the two older bars' prints and keeps the bars as history; evicting them
+    // keeps the newest bar with the auction print it folded in.
+    assert_eq!(stream.seal_bars(2), 2);
+    assert_eq!(stream.bars().len(), 3);
+    assert_eq!(stream.trades().len(), 2);
+    stream.evict_sealed_bars(2);
     let bars = stream.bars();
     assert_eq!(bars.len(), 1);
     assert_eq!(
@@ -569,9 +574,10 @@ fn retention_keeps_a_folded_auction_print_with_its_bar() {
     assert_eq!(stream.trades().len(), 2);
 }
 
-/// The order-flow trade budget is a ceiling on the whole tape, not only on bar prints: prints the
-/// exclude policy keeps out of every bar (here a busy lunch break after each day's only bar) count
-/// toward it, so the retained bars and the excluded prints between them never pass it.
+/// The order-flow trade budget is a ceiling on the whole raw tape, not only on bar prints: prints
+/// the exclude policy keeps out of every bar (here a busy lunch break after each day's only bar)
+/// count toward it, so the raw bars and the excluded prints between them never pass it once the
+/// oldest bars are sealed.
 #[test]
 fn trade_budget_counts_session_excluded_prints() {
     const CEILING: usize = 64;
@@ -600,8 +606,9 @@ fn trade_budget_counts_session_excluded_prints() {
             )
         }));
         stream.update_trades(prints).unwrap();
-        if let Some(keep) = stream.bars_within_trade_budget(CEILING) {
-            stream.retain_last_bars(keep);
+        let seal = stream.bars_to_seal(CEILING);
+        if seal > 0 {
+            stream.seal_bars(seal);
             trims += 1;
             assert!(
                 stream.trades().len() <= CEILING,
@@ -611,7 +618,87 @@ fn trade_budget_counts_session_excluded_prints() {
         }
         assert!(stream.trades().len() <= CEILING + 8, "day {day}");
     }
-    assert!(trims > 0 && stream.bars().len() > 1, "{trims}");
+    assert!(
+        trims > 0 && stream.bars().len() > stream.sealed_bar_count(),
+        "{trims}"
+    );
+}
+
+/// Sealing releases exactly the prints its bars own and the excluded prints before the first
+/// print a later bar keeps (lunch and after-hours prints the exclude policy leaves out of every
+/// bar). The sealed bars and the raw bars rebuilt from the released prints' seed are the bars of
+/// the unsealed stream, also after later tips; excluded prints never reach a session delta.
+#[test]
+fn sealing_with_the_exclude_policy_releases_the_excluded_prints_it_precedes() {
+    let zone = shanghai();
+    let mut exchange = crate::ExchangeTime::default();
+    exchange.set_offsets(zone.clone());
+    let mut unsealed = FootprintAggregator::new(time_bars(HOUR, 0)).unwrap();
+    unsealed
+        .set_sessions(
+            Some(&a_share_sessions(OutOfSessionPolicy::Exclude)),
+            &exchange,
+        )
+        .unwrap();
+    let sell = |text: &str, price: f64, volume: f64| FootprintTrade {
+        aggressor: AggressorSide::Sell,
+        ..trade(&zone, text, price, volume)
+    };
+    unsealed
+        .set_trades(vec![
+            trade(&zone, "2026-09-24 09:31:00", 10.00, 1.0),
+            sell("2026-09-24 12:05:00", 10.10, 50.0),
+            trade(&zone, "2026-09-24 13:01:00", 10.20, 2.0),
+            sell("2026-09-24 15:30:00", 10.30, 70.0),
+            trade(&zone, "2026-09-25 09:31:00", 10.40, 3.0),
+            sell("2026-09-25 12:10:00", 10.50, 90.0),
+            trade(&zone, "2026-09-25 13:05:00", 10.60, 4.0),
+        ])
+        .unwrap();
+    assert_eq!(unsealed.bars().len(), 4);
+    let mut sealed = unsealed.clone();
+    // The two 2026-09-24 bars own two prints; the lunch and after-hours prints before the next
+    // bar's first print leave with them.
+    assert_eq!(sealed.raw_trades_of_bars(2), 4);
+    assert_eq!(sealed.seal_bars(2), 4);
+    assert_eq!(sealed.sealed_bar_count(), 2);
+    assert_eq!(sealed.bars(), unsealed.bars());
+    let raw = sealed
+        .trades()
+        .map(|print| (print.timestamp_micros, print.volume))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        raw,
+        [
+            (at(&zone, "2026-09-25 09:31:00") * MICROS, 3.0),
+            (at(&zone, "2026-09-25 12:10:00") * MICROS, 90.0),
+            (at(&zone, "2026-09-25 13:05:00") * MICROS, 4.0),
+        ]
+    );
+    // A late print rebuilds the raw bars from the seed of the released prints: they stay the
+    // unsealed stream's bars.
+    let late = vec![trade(&zone, "2026-09-25 13:04:00", 10.55, 1.0)];
+    assert_eq!(
+        sealed.update_trades(late.clone()).unwrap(),
+        FootprintUpdateKind::Historical
+    );
+    unsealed.update_trades(late).unwrap();
+    assert_eq!(sealed.bars(), unsealed.bars());
+    let next = vec![
+        sell("2026-09-25 15:20:00", 10.70, 30.0),
+        trade(&zone, "2026-09-26 09:40:00", 10.80, 5.0),
+    ];
+    sealed.update_trades(next.clone()).unwrap();
+    unsealed.update_trades(next).unwrap();
+    assert_eq!(sealed.bars(), unsealed.bars());
+    assert_eq!(
+        sealed
+            .bars()
+            .iter()
+            .map(|bar| bar.session_delta)
+            .collect::<Vec<_>>(),
+        [1.0, 3.0, 6.0, 11.0, 16.0]
+    );
 }
 
 /// Local `HH:MM` of the bar every big-trades order of `id` opened in.

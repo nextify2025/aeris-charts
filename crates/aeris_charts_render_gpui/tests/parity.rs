@@ -591,6 +591,33 @@ fn tessellated_prims_take_the_path_route_on_both_backends() {
                 border_color: Color::rgb(220, 30, 20),
             },
         ),
+        // The footprint point-of-control outline: square corners, a transparent fill, and only
+        // the inside border painted, so the row's numbers stay readable.
+        (
+            "Outlined RoundRect",
+            Prim::RoundRect {
+                x: 1.0,
+                y: 1.0,
+                w: 20.0,
+                h: 10.0,
+                radii: [0.0; 4],
+                fill: Color::rgba(0, 0, 0, 0),
+                border_width: 2.0,
+                border_color: Color::rgb(220, 30, 20),
+            },
+        ),
+        // A big-trades bubble: translucent fill under a translucent stroke.
+        (
+            "Alpha stroked Circle",
+            Prim::Circle {
+                cx: 10.0,
+                cy: 10.0,
+                radius: 6.0,
+                fill: Color::rgba(30, 90, 150, 0x60),
+                stroke_width: 1.0,
+                stroke: Color::rgba(30, 90, 150, 0xd0),
+            },
+        ),
     ];
     for (name, prim) in cases {
         let prims = [prim];
@@ -670,6 +697,19 @@ fn gpui_meshes_contain_the_webgpu_contract_vertices_for_each_shape() {
                 h: 20.0,
                 radii: [4.0; 4],
                 fill: c,
+                border_width: 2.0,
+                border_color: Color::rgb(80, 20, 20),
+            },
+        ),
+        (
+            "Outlined RoundRect",
+            Prim::RoundRect {
+                x: 4.0,
+                y: 5.0,
+                w: 30.0,
+                h: 20.0,
+                radii: [0.0; 4],
+                fill: Color::rgba(0, 0, 0, 0),
                 border_width: 2.0,
                 border_color: Color::rgb(80, 20, 20),
             },
@@ -948,6 +988,66 @@ fn text_runs_reach_both_backends_with_the_same_font_and_anchor() {
         ),
         *font
     );
+}
+
+/// A big-trades bubble with its volume centred on it: the translucent circle tessellates on both
+/// backends, and the label follows it with the same anchor, alignment and color.
+#[test]
+fn centred_text_over_an_alpha_circle_reaches_both_backends_in_order() {
+    let prims = [
+        Prim::Circle {
+            cx: 40.0,
+            cy: 30.0,
+            radius: 12.0,
+            fill: Color::rgba(0x26, 0xa6, 0x9a, 0x60),
+            stroke_width: 1.0,
+            stroke: Color::rgba(0x26, 0xa6, 0x9a, 0xd0),
+        },
+        Prim::Text {
+            x: 40.0,
+            y: 30.0,
+            text: "1.2K".into(),
+            color: Color::rgb(0xff, 0xff, 0xff),
+            size: 11.0,
+            family: "sans-serif".into(),
+            align: TextAlign::Center,
+            weight: 600,
+            italic: false,
+        },
+    ];
+    let canvas = canvas_rects(&prims, &[]);
+    let (plan, metrics) = gpui_plan(&prims, &[]);
+    assert_eq!(metrics.dropped_prims, 0);
+    assert!(canvas.path_fills > 0 && canvas.path_strokes > 0);
+    assert!(canvas.rects.is_empty() && metrics.quads == 0);
+    assert_eq!(canvas.text_runs.len(), 1);
+    assert_eq!(metrics.text_runs, 1);
+    let text_op = plan
+        .ops
+        .iter()
+        .position(|op| matches!(op, SceneOp::Text(_)))
+        .expect("the label reaches GPUI");
+    assert!(
+        plan.ops[..text_op]
+            .iter()
+            .any(|op| matches!(op, SceneOp::Mesh { .. })),
+        "the bubble is drawn before its label"
+    );
+    assert!(
+        !plan.ops[text_op..]
+            .iter()
+            .any(|op| matches!(op, SceneOp::Mesh { .. })),
+        "nothing of the bubble covers its label"
+    );
+    let (text, x, y, _, color, align) = &canvas.text_runs[0];
+    let SceneOp::Text(run) = &plan.ops[text_op] else {
+        unreachable!();
+    };
+    assert_eq!(run.text, *text);
+    assert_eq!((run.x, run.y), (*x, *y));
+    assert_eq!(run.color, *color);
+    assert_eq!(run.align, *align);
+    assert_eq!(run.align, TextAlign::Center);
 }
 
 #[test]

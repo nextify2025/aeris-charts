@@ -32,6 +32,9 @@
 //!   Target Q — a full 4,096-mark timeline lane on the Target A chart: a one-bar pan plus the
 //!              frame it rebuilds under 16.67 ms, and the lane hit query (every pointer move runs
 //!              it for hover and cursor) in the sub-0.01 ms class
+//!   Target R — sustained live order-flow tape: per-batch update + frame, retention, late print
+//!   Target S — seven sessions of order flow: batch cost through sealing and session eviction,
+//!              stream memory, and the session budget
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
@@ -50,8 +53,10 @@ use aeris_charts_engine::{
     FootprintAggregationOptions, FootprintBarAggregation, FootprintSeriesOptions, FootprintTrade,
     FootprintVisualOptions, GeneralAxisOptions, GeneralHitMode, GeneralScaleType,
     GeneralSeriesOptions, GeneralXyInput, GestureResolver, HorizontalDomain, InputDevice,
-    InputTarget, PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest,
-    PointerSample, ProfileSource, ResampleBoundary, SeriesKind, TradeStudyOptions,
+    InputTarget, ORDER_FLOW_MAX_RETAINED_SESSIONS, ORDER_FLOW_MAX_RETAINED_TRADES,
+    ORDER_FLOW_MAX_STREAM_BYTES, OrderFlowPresentationOptions, PeriodicProfilePresentationOptions,
+    PeriodicProfilePresentationRequest, PointerSample, ProfileSource, ResampleBoundary, SeriesKind,
+    TradeStudyOptions,
 };
 use aeris_charts_native::render_prims;
 use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute};
@@ -1161,6 +1166,246 @@ fn gate_exit(all_pass: bool, strict_value: Option<&str>) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Sustained live order-flow tape timings, in milliseconds.
+struct LiveTapeTimings {
+    update_frame_p50_ms: f64,
+    update_frame_p99_ms: f64,
+    update_frame_max_ms: f64,
+    late_trade_ms: f64,
+    late_rebuilt_ticks: usize,
+    retained_trades_capped: bool,
+}
+
+/// One host-shaped order-flow presentation (time footprint + CVD + delta panes) fed the way a
+/// terminal feeds a live tape: small suffix batches, each followed by a frame. The history sits
+/// just under the retention ceiling so the loop crosses it, and one late print lands a bar back.
+fn sustained_order_flow_tape() -> LiveTapeTimings {
+    const HISTORY_BARS: usize = 2_600;
+    const TRADES_PER_BAR: usize = 100;
+    const BAR_MICROS: i64 = 60_000_000;
+    const TRADE_STEP_MICROS: i64 = BAR_MICROS / TRADES_PER_BAR as i64;
+    const UPDATES: usize = 600;
+    const TRADES_PER_UPDATE: usize = 4;
+    let trade = |ordinal: u64, timestamp_micros: i64| FootprintTrade {
+        timestamp_micros,
+        price: 100.0 + ((ordinal * 7) % 21) as f64 * 0.25,
+        volume: (ordinal % 17 + 1) as f64,
+        aggressor: if ordinal.is_multiple_of(2) {
+            AggressorSide::Buy
+        } else {
+            AggressorSide::Sell
+        },
+        bid: None,
+        ask: None,
+        sequence: Some(ordinal),
+        trade_id: None,
+        conditions: 0,
+        session_id: Some(1),
+    };
+    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+    let presentation = chart
+        .add_order_flow_presentation(
+            "PERF:LIVE",
+            0,
+            OrderFlowPresentationOptions {
+                aggregation: FootprintAggregationOptions {
+                    tick_size: 0.25,
+                    ticks_per_row: 0,
+                    bars: FootprintBarAggregation::Time {
+                        interval_micros: BAR_MICROS as u64,
+                        anchor_micros: 0,
+                    },
+                    ..FootprintAggregationOptions::default()
+                },
+                visual: FootprintVisualOptions::default(),
+                show_footprint: true,
+                show_cumulative_delta: true,
+                show_delta_histogram: true,
+                big_trades: None,
+            },
+        )
+        .expect("valid order-flow presentation");
+    chart.set_series_visible(0, false);
+    let mut ordinal = 0_u64;
+    let mut timestamp = 0_i64;
+    let history = (0..HISTORY_BARS * TRADES_PER_BAR)
+        .map(|_| {
+            ordinal += 1;
+            timestamp += TRADE_STEP_MICROS;
+            trade(ordinal, timestamp)
+        })
+        .collect::<Vec<_>>();
+    chart
+        .update_order_flow_presentation(presentation, history, false)
+        .expect("valid order-flow history");
+    chart.time_scale.set_width(1600.0);
+    chart.fit_footprint_viewport();
+    let mut frame = ChartFrame::default();
+    chart.build_frame_into(&mut frame);
+    chart.build_frame_into(&mut frame);
+
+    let mut samples = Vec::with_capacity(UPDATES);
+    for _ in 0..UPDATES {
+        let batch = (0..TRADES_PER_UPDATE)
+            .map(|_| {
+                ordinal += 1;
+                timestamp += TRADE_STEP_MICROS;
+                trade(ordinal, timestamp)
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        chart
+            .update_order_flow_presentation(presentation, batch, true)
+            .expect("valid live batch");
+        chart.build_frame_into(&mut frame);
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let footprint = presentation.footprint_series().expect("footprint drawn");
+    // Crossing the ceiling seals the oldest bars: the raw tape is bounded and no bar is lost.
+    let history_bars = (ordinal as usize).div_ceil(TRADES_PER_BAR);
+    let retained_trades_capped =
+        chart
+            .trade_stream(presentation.trade_stream())
+            .is_some_and(|stream| {
+                stream.trades().len() <= ORDER_FLOW_MAX_RETAINED_TRADES
+                    && stream.sealed_bar_count() > 0
+                    && stream.bars().len() >= history_bars
+            });
+    let before = chart.footprint_work_stats(footprint).expect("work stats");
+    ordinal += 1;
+    let late = vec![trade(
+        ordinal,
+        timestamp - BAR_MICROS - TRADE_STEP_MICROS / 2,
+    )];
+    let started = Instant::now();
+    chart
+        .update_order_flow_presentation(presentation, late, true)
+        .expect("valid late print");
+    chart.build_frame_into(&mut frame);
+    let late_trade_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let after = chart.footprint_work_stats(footprint).expect("work stats");
+
+    samples.sort_unstable_by(f64::total_cmp);
+    let percentile =
+        |fraction: f64| samples[((samples.len() - 1) as f64 * fraction).round() as usize];
+    LiveTapeTimings {
+        update_frame_p50_ms: percentile(0.5),
+        update_frame_p99_ms: percentile(0.99),
+        update_frame_max_ms: samples[samples.len() - 1],
+        late_trade_ms,
+        late_rebuilt_ticks: after.rebuilt_ticks - before.rebuilt_ticks,
+        retained_trades_capped,
+    }
+}
+
+/// Multi-session order-flow history results.
+struct SessionHistoryResult {
+    batch_p99_ms: f64,
+    batch_max_ms: f64,
+    stream_bytes: usize,
+    sessions: usize,
+    bars: usize,
+    raw_trades: usize,
+    sealed_bars: usize,
+}
+
+/// Seven trading sessions of one-minute footprint bars streamed as host-sized suffix batches,
+/// with CVD, delta and big trades attached. Sealing runs many times along the way and evicts
+/// whole sessions at the end, so the batch timings include every retention step.
+fn multi_session_order_flow_history() -> SessionHistoryResult {
+    const SESSIONS: u64 = 7;
+    const BARS_PER_SESSION: u64 = 1_380;
+    const TRADES_PER_BAR: u64 = 150;
+    const BAR_MICROS: i64 = 60_000_000;
+    const BATCH_TRADES: usize = 1_000;
+    let mut chart = ChartEngine::new(1600.0, 800.0, 1.0);
+    let presentation = chart
+        .add_order_flow_presentation(
+            "PERF:SESSIONS",
+            0,
+            OrderFlowPresentationOptions {
+                aggregation: FootprintAggregationOptions {
+                    tick_size: 0.25,
+                    ticks_per_row: 0,
+                    bars: FootprintBarAggregation::Time {
+                        interval_micros: BAR_MICROS as u64,
+                        anchor_micros: 0,
+                    },
+                    ..FootprintAggregationOptions::default()
+                },
+                visual: FootprintVisualOptions::default(),
+                show_footprint: true,
+                show_cumulative_delta: true,
+                show_delta_histogram: true,
+                big_trades: Some(BigTradesOptions::default()),
+            },
+        )
+        .expect("valid order-flow presentation");
+    chart.set_series_visible(0, false);
+    chart.time_scale.set_width(1600.0);
+    let mut frame = ChartFrame::default();
+    let mut samples = Vec::new();
+    let mut batch = Vec::with_capacity(BATCH_TRADES);
+    let mut ordinal = 0_u64;
+    for session in 0..SESSIONS {
+        // Sessions are separated by an hour's break, as on CME futures.
+        let session_start = (session * (BARS_PER_SESSION + 60)) as i64 * BAR_MICROS;
+        for bar in 0..BARS_PER_SESSION {
+            let bar_time = session_start + bar as i64 * BAR_MICROS;
+            // A slow drift plus an intrabar swing spreads each bar over a few dozen ticks.
+            let center = ((bar as f64 * 0.05).sin() * 120.0) as i64;
+            for tick in 0..TRADES_PER_BAR {
+                ordinal += 1;
+                let swing = ((tick * 13 + bar * 7) % 41) as i64 - 20;
+                batch.push(FootprintTrade {
+                    timestamp_micros: bar_time + (tick * 400_000) as i64,
+                    price: 5_000.0 + (center + swing) as f64 * 0.25,
+                    volume: (ordinal % 7 + 1) as f64,
+                    aggressor: if ordinal.is_multiple_of(3) {
+                        AggressorSide::Sell
+                    } else {
+                        AggressorSide::Buy
+                    },
+                    bid: None,
+                    ask: None,
+                    sequence: Some(ordinal),
+                    trade_id: None,
+                    conditions: 0,
+                    session_id: Some(session),
+                });
+                if batch.len() == BATCH_TRADES {
+                    let trades = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_TRADES));
+                    let started = Instant::now();
+                    chart
+                        .update_order_flow_presentation(presentation, trades, true)
+                        .expect("valid session batch");
+                    chart.build_frame_into(&mut frame);
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+        }
+    }
+    samples.sort_unstable_by(f64::total_cmp);
+    let stream = chart
+        .trade_stream(presentation.trade_stream())
+        .expect("order-flow stream");
+    let mut sessions = stream
+        .bars()
+        .iter()
+        .map(|bar| bar.session_id)
+        .collect::<Vec<_>>();
+    sessions.dedup();
+    SessionHistoryResult {
+        batch_p99_ms: samples[((samples.len() - 1) as f64 * 0.99).round() as usize],
+        batch_max_ms: samples[samples.len() - 1],
+        stream_bytes: stream.capacity_bytes(),
+        sessions: sessions.len(),
+        bars: stream.bars().len(),
+        raw_trades: stream.trades().len(),
+        sealed_bars: stream.sealed_bar_count(),
     }
 }
 
@@ -2707,6 +2952,64 @@ fn main() -> ExitCode {
         );
     }
 
+    let live_tape = sustained_order_flow_tape();
+    println!(
+        "Target R — sustained live order-flow tape (footprint + CVD + delta, 260k-trade history, 600 x 4-trade batches each followed by a frame):"
+    );
+    println!(
+        "  update + frame p50 {:.3} ms, p99 {:.3} ms",
+        live_tape.update_frame_p50_ms, live_tape.update_frame_p99_ms
+    );
+    let r_p99 = report("update + frame p99", live_tape.update_frame_p99_ms, 4.0);
+    let r_max = report(
+        "worst update + frame (crosses retention ceiling)",
+        live_tape.update_frame_max_ms,
+        FRAME_BUDGET_MS,
+    );
+    let r_late = report(
+        &format!(
+            "late print one bar back + frame ({} rebuilt ticks)",
+            live_tape.late_rebuilt_ticks
+        ),
+        live_tape.late_trade_ms,
+        FRAME_BUDGET_MS,
+    );
+    println!(
+        "  [{}] retained tape stays within the order-flow ceiling",
+        if live_tape.retained_trades_capped {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+
+    let history = multi_session_order_flow_history();
+    println!(
+        "Target S — seven sessions of one-minute order flow (1.45M trades, footprint + CVD + delta + big trades, 1k-trade batches each followed by a frame):"
+    );
+    println!(
+        "  retained {} bars ({} sealed) over {} sessions, {} raw trades",
+        history.bars, history.sealed_bars, history.sessions, history.raw_trades
+    );
+    let s_p99 = report("batch + frame p99", history.batch_p99_ms, 8.0);
+    let s_max = report(
+        "worst batch + frame (sealing and session eviction)",
+        history.batch_max_ms,
+        FRAME_BUDGET_MS,
+    );
+    let s_memory = report_bytes(
+        "order-flow stream memory",
+        history.stream_bytes,
+        ORDER_FLOW_MAX_STREAM_BYTES,
+    );
+    let s_retention = history.sessions == ORDER_FLOW_MAX_RETAINED_SESSIONS
+        && history.raw_trades <= ORDER_FLOW_MAX_RETAINED_TRADES
+        && history.sealed_bars > 0;
+    println!(
+        "  [{}] history keeps the newest {ORDER_FLOW_MAX_RETAINED_SESSIONS} sessions over a bounded raw tape",
+        if s_retention { "PASS" } else { "FAIL" }
+    );
+
     let all_pass = a_pass
         && p_frame
         && p_no_autoscale
@@ -2754,7 +3057,15 @@ fn main() -> ExitCode {
         && m_kline_slot_replace
         && m_kline_slot_fill
         && m_kline_slot_work
-        && n_tick;
+        && n_tick
+        && r_p99
+        && r_max
+        && r_late
+        && live_tape.retained_trades_capped
+        && s_p99
+        && s_max
+        && s_memory
+        && s_retention;
     println!(
         "\n{}",
         if all_pass {

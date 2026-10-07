@@ -171,13 +171,15 @@ pub use financial_legend::{
 };
 pub use footprint::{
     AggressorSide, BarSequence, BarSequenceMapping, BarSequencePoint, CumulativeDeltaReset,
-    FootprintAggregationOptions, FootprintAggregator, FootprintBar, FootprintBarAggregation,
-    FootprintCellMode, FootprintError, FootprintImbalanceOptions, FootprintLevel,
-    FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind, FootprintVisualOptions,
-    FootprintWorkStats, MAX_TIME_AND_SALES_ROWS, MAX_TRADE_STREAM_KEY_BYTES, MAX_TRADE_STREAMS,
-    OrderFlowPresentation, OrderFlowPresentationOptions, ReplayClockStats, ReplaySeekStats,
-    TimeAndSalesOptions, TimeAndSalesRow, TradeSessionOptions, TradeStreamStats, TradeStudyKind,
-    TradeStudyOptions, auto_footprint_ticks_per_row,
+    FOOTPRINT_BAR_SPACING, FootprintAggregationOptions, FootprintAggregator, FootprintBar,
+    FootprintBarAggregation, FootprintCellMode, FootprintError, FootprintImbalanceOptions,
+    FootprintLevel, FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind,
+    FootprintVisualOptions, FootprintWorkStats, HistoryPrefixStats, MAX_TIME_AND_SALES_ROWS,
+    MAX_TRADE_STREAM_KEY_BYTES, MAX_TRADE_STREAMS, ORDER_FLOW_MAX_RETAINED_SESSIONS,
+    ORDER_FLOW_MAX_RETAINED_TRADES, ORDER_FLOW_MAX_STREAM_BYTES, OrderFlowPresentation,
+    OrderFlowPresentationOptions, ReplayClockStats, ReplaySeekStats, TimeAndSalesOptions,
+    TimeAndSalesRow, TradeSessionOptions, TradeStreamStats, TradeStudyKind, TradeStudyOptions,
+    footprint_row_merge,
 };
 pub use frame::{
     AxisBand, AxisFrame, AxisIcon, AxisLabel, AxisLabelCorners, AxisRotatedLabel, AxisTextAlign,
@@ -4560,16 +4562,35 @@ impl ChartEngine {
         for (index, point) in points.iter_mut().enumerate() {
             point.logical_index = (from + index) as u64;
         }
+        // A late print or correction can move bar identities inside the suffix (an earlier
+        // non-time bar opens and every later bar shifts one position); drawing anchors then
+        // follow their bars through one identity mapping, as a complete install maps them.
+        let moved = replaced
+            .iter()
+            .zip(&points)
+            .any(|(old, new)| old.open_timestamp_micros != new.open_timestamp_micros);
+        let mapping = moved.then(|| {
+            let mut old = sequence.clone();
+            old.extend_from_slice(&replaced);
+            let mut new = sequence.clone();
+            new.extend_from_slice(&points);
+            BarSequenceMapping::between_points(&old, &new)
+        });
         sequence.extend_from_slice(&points);
+        let previous_pending =
+            mapping.map(|mapping| self.pending_sequence_mapping.replace(mapping));
         let times = (from..from + points.len())
             .map(|index| key_base + index as i64)
             .collect::<Vec<_>>();
         let accepted = self.update_series_bars_sanitized_inner(id, times, open, high, low, close);
-        if accepted != points.len()
-            && let Some(sequence) = self.sequence_points.as_mut()
-        {
-            sequence.truncate(from);
-            sequence.extend(replaced);
+        if accepted != points.len() {
+            if let Some(sequence) = self.sequence_points.as_mut() {
+                sequence.truncate(from);
+                sequence.extend(replaced);
+            }
+            if let Some(previous) = previous_pending {
+                self.pending_sequence_mapping = previous;
+            }
         }
         accepted
     }

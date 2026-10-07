@@ -2511,6 +2511,8 @@ export interface footprint_series_options {
   stacked_bid_color: string;
   stacked_ask_color: string;
   show_bar_summary: boolean;
+  /** Merge rows in 1-2-5 steps so cells stay legible at the current zoom. Defaults to false. */
+  adaptive_rows?: boolean;
 }
 
 /** Engine-owned price-action transform applied to canonical host OHLC source bars. */
