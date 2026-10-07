@@ -3717,6 +3717,38 @@ fn one_bar_replay_steps_do_bounded_indicator_work() {
 }
 
 #[test]
+fn live_appends_after_the_first_grow_no_series_storage() {
+    // The first append past a bulk install grows each exactly sized column once (Target M
+    // reports it apart). Later appends must grow nothing: each study output reaches its next
+    // summary-pyramid node on its own tick (its warm-up offsets its rows from the source's), so
+    // levels sized exactly by the install would each be copied on one of those live ticks.
+    const ROWS: usize = 5_000;
+    let (mut chart, volume) = replay_study_chart(ROWS);
+    let amount = chart
+        .indicators
+        .iter()
+        .find_map(|binding| binding.amount_source)
+        .unwrap();
+    let append = |chart: &mut ChartEngine, row: usize| {
+        let time = row as f64 * 60.0;
+        let weight = (row % 13 + 1) as f64;
+        chart.update_series_bar(0, time, swinging_bar(row, 0));
+        chart.update_series_bar(volume, time, [weight; 4]);
+        chart.update_series_bar(amount, time, [weight * 101.0; 4]);
+    };
+    append(&mut chart, ROWS);
+    let capacity = chart.memory_usage().data.allocated_capacity_bytes;
+    for row in ROWS + 1..=ROWS + 2 * aeris_charts_core::model::lod::LOD_FANOUT {
+        append(&mut chart, row);
+        assert_eq!(
+            chart.memory_usage().data.allocated_capacity_bytes,
+            capacity,
+            "appending row {row}"
+        );
+    }
+}
+
+#[test]
 fn replay_seeks_in_both_directions_match_a_fresh_install_for_every_indicator() {
     let (mut chart, _) = replay_study_chart(240);
     let clock = |row: i64| Some(row * 60 * 1_000_000);
