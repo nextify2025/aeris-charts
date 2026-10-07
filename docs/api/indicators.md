@@ -5,6 +5,7 @@
 - [成交量分布](#成交量分布)
 - [指标约定](#指标约定)
 - [广度层指标](#广度层指标)
+  - [广度层补全](#广度层补全)
 - [KLineChart 指标](#klinechart-指标)
 
 ## 成交量分布
@@ -100,9 +101,11 @@ const [k, d, j] = chart.add_kdj(candles, 9, 3, 3);
 
 `indicator_schema(kind)` 为修订 3：约定参数以带有 `choices` 列表的 `"choice"` 参数形式出现，开关参数（包络线的 `exponential`）以 `"boolean"` 参数形式出现，VWAP 会列出一个可选的 `amount_source` 系列。属性面板按 `parameter_type` 分派编辑器时，需要处理 `"integer"`、`"number"`、`"boolean"`、`"source"`、`"series"` 与 `"choice"` 六种取值。
 
+`indicator_schema(kind, period = 14, deviation = 2)` 的名称解析由引擎拥有（`IndicatorKind::schema_definition`）。不传 `period` 与 `deviation` 时，返回每个研究自己的规范默认值：MACD 12/26/9、Stochastic `%D` 3、SuperTrend 倍数 3、EMA 彩带 5/10/20/50/200、VWAP 带 σ 1、Chaikin 3/10、KDJ 9/3/3，以及下文广度层各研究的默认值。签名无法表达“未传参”：`period` 14 与 `deviation` 2 本身即被视为隐式查询，即使显式传入也是如此，因此 `period` 14 时的 MACD、KDJ、Stochastic 与 EMA 彩带，以及 `deviation` 2 时的 SuperTrend 与 VWAP 带，同样返回上述规范默认值。只有其他显式值沿用原来的替换规则（例如 `indicator_schema("macd", 12)` 为 12/24/12，`indicator_schema("kdj", 9)` 为 9/3/3）。具有固定多参数默认值的种类忽略 `period`：KST、TSI、Mass Index、Klinger、KAMA、线性回归、Chaikin 振荡器、Coppock 曲线、终极振荡器与成交量振荡器始终返回各自的默认值（线性回归同样忽略 `deviation`）。带种子的种类报告 `seed: "sma"`，MACD 报告 `histogram_multiplier: 1`，布林带报告 `estimator: "population"`；`klinechart_*` 报告对应模板的默认参数；未知名称抛出 `invalid_options`。此前隐式查询会把 14 与 2 代入每个参数，变更记录见[兼容性](compatibility.md)。
+
 **空白数据源**。指标源中的空白数据行（`{ time }`）保留其时间槽位，但绝不进入计算状态。每个研究都在该处输出一条空白数据输出行，并完全按该行不存在的方式继续计算：暂停的交易时段或预先填充的未来槽位不会重置或污染 EMA/RSI/MACD 递推，窗口类研究使用最近 N 根真实柱。之后填充某个空白槽位时，会从该行起重新计算。
 
-**预热查询与历史数据加载**。`indicator_info()` 为每个输出报告 `warmup_bars`（第一个值之前根价格源的柱数）和 `convergence_bars`（经过这么多柱的历史数据后，数值不再取决于已加载历史数据从何处开始：窗口类研究为预热柱数，再加上使每个递归种子的权重降到 0.1% 以下所需的柱数）。两者都包含链式源，因此 RSI 之上的 SMA 报告的是二者之和。当任何柱数都不足以满足时，`convergence_bars` 为 `null`：交易时段 VWAP 和枢轴点取决于时间锚点，OBV、累积/派发、价量趋势、Parabolic SAR、SuperTrend 和 ZigZag 则取决于整条路径。
+**预热查询与历史数据加载**。`indicator_info()` 为每个输出报告 `warmup_bars`（第一个值之前根价格源的柱数）和 `convergence_bars`（经过这么多柱的历史数据后，数值不再取决于已加载历史数据从何处开始：窗口类研究为预热柱数，再加上使每个递归种子的权重降到 0.1% 以下所需的柱数）。两者都包含链式源，因此 RSI 之上的 SMA 报告的是二者之和。当任何柱数都不足以满足时，`convergence_bars` 为 `null`：交易时段 VWAP 和枢轴点取决于时间锚点，OBV、累积/派发、价量趋势、Parabolic SAR、SuperTrend、ZigZag、Klinger 和 McGinley Dynamic 则取决于整条路径。
 
 若要从第一根可见柱起就显示已收敛的值，请求其之前的历史数据：
 
@@ -123,7 +126,7 @@ chart.time_scale().set_visible_logical_range({ from: needed, to: needed + visibl
 
 ## 广度层指标
 
-以下 19 个方法（上游 `2f62875`）在源系列上添加内置研究，返回值与其他内置研究一样是普通的 `series_api` 输出句柄；`options` 应用于每个输出。参数无效、或成交量研究缺少独立的标量成交量系列时抛出 `invalid_options`。所有周期必须为正整数。
+广度层共 29 个内置研究。以下 19 个方法（上游 `2f62875`）在源系列上添加内置研究，返回值与其他内置研究一样是普通的 `series_api` 输出句柄；`options` 应用于每个输出。参数无效、或成交量研究缺少独立的标量成交量系列时抛出 `invalid_options`。所有周期必须为正整数。
 
 | 方法 | 参数（默认值） | 输出与窗格 |
 | --- | --- | --- |
@@ -149,9 +152,30 @@ chart.time_scale().set_visible_logical_range({ from: needed, to: needed + visibl
 
 `indicator_kind` 相应新增 `aroon`、`awesome_oscillator`、`dpo`、`chande_momentum`、`bollinger_metrics`、`envelopes`、`alma`、`accumulation_distribution`、`price_volume_trend`、`chaikin_oscillator`、`relative_volume`、`volume_oscillator`、`elder_force`、`ease_of_movement`、`historical_volatility`、`trix`、`coppock_curve`、`fisher_transform` 与 `ultimate_oscillator`。`indicator_info().parameters` 新增 `exponential`、`offset`、`sigma`、`divisor`、`annualization`、`long_period`、`short_period` 与 `smoothing`（对不使用它们的种类为 `null`）；`deviation` 对布林带指标报告偏差，对包络线报告百分比，对成交量振荡器与 TRIX 报告信号周期。
 
-七个成交量研究把成交量序列中缺失的源时间戳视为零成交量。与其他研究一样，空白数据源行不进入计算，其输出为空白数据行。这些研究的 EMA 一律以前 N 个样本的均值起始，`{ convention: "china" }` 不适用于它们；布林带指标只使用总体标准差。
+七个成交量研究（以及下文的 Klinger）把成交量序列中缺失的源时间戳视为零成交量。与其他研究一样，空白数据源行不进入计算，其输出为空白数据行。这些研究的 EMA 一律以前 N 个样本的均值起始，`{ convention: "china" }` 不适用于它们；布林带指标只使用总体标准差。
 
 AO、PVT、TRIX 与 EMV 同时存在内置研究和同名的 KLineChart 模板（`klinechart_ao`、`klinechart_pvt`、`klinechart_trix`、`klinechart_emv`），二者公式不同：内置 PVT 把缺失成交量记为 0 并截断负成交量，模板沿用 KLineChart 的缺失成交量 1；内置 TRIX 的 `period` 必填、`signal` 默认 9，信号线为 EMA，模板默认 12/9，`MATRIX` 为简单移动平均；内置 EOM 在零成交量处为空缺且只输出平滑值，模板在零成交量或零区间处记 0 并另外输出 EMV；AO 的核心公式相同，但模板可配置周期并沿用 KLineChart 的柱体呈现。引擎图例中 KLineChart 绑定的行标题带 `KLineChart` 前缀（例如 `KLineChart PVT` 与内置的 `PVT`）。各输出系列的 `title` 则沿用模板自身的输出名，以保持与 KLineChart 的显示一致，因此内置 PVT 与模板 PVT 的系列标题（名称徽标）都是 `PVT`；宿主需要区分时应读取 `indicator_info().kind`（`price_volume_trend` 与 `klinechart_pvt`）。详见[指标计算与绑定](../architecture/data/indicators.md#广度层指标)。
+
+### 广度层补全
+
+上游 `9dd8cff` 新增以下 10 个方法，约定与上表相同。所有周期为 1 到 1,000,000 的整数；参数无效时抛出 `invalid_options`，且不创建任何输出或窗格。
+
+| 方法 | 参数（默认值） | 输出与窗格 |
+| --- | --- | --- |
+| `add_kst(source, roc = [10, 15, 20, 30], smoothing = [10, 10, 10, 15], signal = 9)` | `roc` 与 `smoothing` 为四元组（`kst_periods`） | `KST`、`Signal`，振荡器窗格 |
+| `add_tsi(source, long = 25, short = 13, signal = 13)` | | `TSI`（−100 到 100）、`Signal`，振荡器窗格 |
+| `add_mass_index(source, ema_period = 9, sum_period = 25)` | | `Mass Index`，振荡器窗格 |
+| `add_vortex(source, period = 14)` | | `VI+`、`VI-`，振荡器窗格 |
+| `add_klinger(source, fast = 34, slow = 55, signal = 13, volume_source)` | `fast < slow`；成交量系列必填，位于周期之后（传 `undefined` 使用默认周期） | `Klinger`、`Signal`，振荡器窗格 |
+| `add_kama(source, period = 10, fast = 2, slow = 30)` | `fast < slow` | `KAMA`，价格窗格 |
+| `add_mcginley(source, period = 14)` | | `McGinley`，价格窗格 |
+| `add_linear_regression(source, period = 20, deviation = 2)` | `deviation` 有限且不小于 0 | `Curve`、`Upper`、`Lower`（残差标准差通道），价格窗格 |
+| `add_choppiness(source, period = 14)` | `period` 至少为 2 | `Choppiness`（0–100），振荡器窗格 |
+| `add_atr_bands(source, period = 14, multiplier = 2)` | `multiplier` 有限且不小于 0 | `Upper`、`Basis`（收盘价）、`Lower`，价格窗格 |
+
+`indicator_kind` 相应新增 `kst`、`tsi`、`mass_index`、`vortex`、`klinger`、`kama`、`mcginley`、`linear_regression`、`choppiness` 与 `atr_bands`。`indicator_info().parameters` 新增 `multiplier`（ATR 带）、`roc` 与 `smoothing_periods`（KST）、`ema_period` 与 `sum_period`（Mass Index），对不使用它们的种类为 `null`；KST、TSI 与 Klinger 的信号周期报告在 `signal`，TSI 的长短周期报告在 `long_period` 与 `short_period`，Klinger 与 KAMA 的快慢周期报告在 `fast` 与 `slow`。
+
+这些研究同样把空白数据行视为不存在（上游在空白数据之后重新预热，本仓库不同）。Klinger 与 McGinley 的 `convergence_bars` 为 `null`。TSI、Klinger、Mass Index 与 KAMA 以 SMA 起始，McGinley 以第一个收盘价起始；它们没有 `seed` 参数，`{ convention: "china" }` 不适用。Chop Zone 是 Choppiness 输出上的 38.2/61.8 阈值，目前没有绘制阈值区域。线性回归指标是滚动端点序列，与在两个锚点之间做一次拟合的 `regression_trend` 绘图不同；二者都使用残差的总体标准差。公式与空白数据处理详见[广度层补全](../architecture/data/indicators.md#广度层补全)。
 
 ## KLineChart 指标
 

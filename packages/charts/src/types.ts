@@ -1208,7 +1208,7 @@ export interface comparison_legend_entry {
 
 /** Scalar input accepted by a built-in indicator. The source series may itself be an indicator output. */
 export type indicator_input_source = "open" | "high" | "low" | "close" | "hl2" | "hlc3" | "ohlc4" | "hlcc4";
-export type indicator_kind = "aroon" | "awesome_oscillator" | "dpo" | "chande_momentum" | "bollinger_metrics" | "envelopes" | "alma" | "accumulation_distribution" | "price_volume_trend" | "chaikin_oscillator" | "relative_volume" | "volume_oscillator" | "elder_force" | "ease_of_movement" | "historical_volatility" | "trix" | "coppock_curve" | "fisher_transform" | "ultimate_oscillator" | "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma" | "kdj" | klinechart_indicator_kind;
+export type indicator_kind = "aroon" | "awesome_oscillator" | "dpo" | "chande_momentum" | "bollinger_metrics" | "envelopes" | "alma" | "accumulation_distribution" | "price_volume_trend" | "chaikin_oscillator" | "klinger" | "kama" | "mcginley" | "linear_regression" | "choppiness" | "atr_bands" | "relative_volume" | "volume_oscillator" | "elder_force" | "ease_of_movement" | "historical_volatility" | "trix" | "kst" | "tsi" | "mass_index" | "vortex" | "coppock_curve" | "fisher_transform" | "ultimate_oscillator" | "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma" | "kdj" | klinechart_indicator_kind;
 /**
  * One KLineChart indicator template with its parameters, as {@link chart_api.add_klinechart_indicator}
  * takes it and `indicator_info().parameters.klinechart` reports it. `indicator` names the template and
@@ -1388,6 +1388,8 @@ export interface indicator_info {
     periods: [number, number, number, number, number] | null;
     pivot_kind: pivot_kind | null;
     deviation: number | null;
+    /** ATR bands width in ATRs (`close ± multiplier × ATR`). Keltner and SuperTrend report theirs as `deviation`. */
+    multiplier: number | null;
     fast: number | null;
     slow: number | null;
     signal: number | null;
@@ -1404,6 +1406,13 @@ export interface indicator_info {
     long_period: number | null;
     short_period: number | null;
     smoothing: number | null;
+    /** KST rate-of-change lags. */
+    roc: [number, number, number, number] | null;
+    /** KST SMA lengths, one per rate of change. */
+    smoothing_periods: [number, number, number, number] | null;
+    /** Mass Index EMA length and ratio-sum length. */
+    ema_period: number | null;
+    sum_period: number | null;
     /** EMA/DEMA/TEMA/MACD/RSI seed convention. */
     seed: indicator_seed | null;
     /** MACD histogram scale. */
@@ -1454,6 +1463,7 @@ export interface indicator_info {
 
 /** Five EMA periods in fastest-to-slowest output order. */
 export type ema_ribbon_periods = readonly [number, number, number, number, number];
+export type kst_periods = readonly [number, number, number, number];
 
 /** Per-output style overrides in the same order as {@link ema_ribbon_periods}. */
 export type ema_ribbon_options = readonly [
@@ -5108,12 +5118,26 @@ export interface chart_api {
   add_accumulation_distribution(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_price_volume_trend(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_chaikin_oscillator(source: series_api, fast: number, slow: number, volume_source: series_api, options?: Partial<series_options>): series_api;
+  /** Klinger line and signal. Pass `undefined` for default periods (34/55/13); volume is required. */
+  add_klinger(source: series_api, fast: number | undefined, slow: number | undefined, signal: number | undefined, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api];
+  add_kama(source: series_api, period?: number, fast?: number, slow?: number, options?: Partial<series_options>): series_api;
+  add_mcginley(source: series_api, period?: number, options?: Partial<series_options>): series_api;
+  /** Regression curve, upper and lower residual-deviation bands. */
+  add_linear_regression(source: series_api, period?: number, deviation?: number, options?: Partial<series_options>): [series_api, series_api, series_api];
+  /** Choppiness Index (0–100), in a separate oscillator pane. */
+  add_choppiness(source: series_api, period?: number, options?: Partial<series_options>): series_api;
+  /** Price-pane bands in upper, close-basis, lower order using Wilder ATR. */
+  add_atr_bands(source: series_api, period?: number, multiplier?: number, options?: Partial<series_options>): [series_api, series_api, series_api];
   add_relative_volume(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_volume_oscillator(source: series_api, fast: number, slow: number, signal: number, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api, series_api];
   add_elder_force(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_ease_of_movement(source: series_api, period: number, volume_source: series_api, divisor?: number, options?: Partial<series_options>): series_api;
   add_historical_volatility(source: series_api, period: number, annualization?: number, options?: Partial<series_options>): series_api;
   add_trix(source: series_api, period: number, signal?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_kst(source: series_api, roc?: kst_periods, smoothing?: kst_periods, signal?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_tsi(source: series_api, long?: number, short?: number, signal?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_mass_index(source: series_api, ema_period?: number, sum_period?: number, options?: Partial<series_options>): series_api;
+  add_vortex(source: series_api, period?: number, options?: Partial<series_options>): [series_api, series_api];
   add_coppock_curve(source: series_api, long_period?: number, short_period?: number, smoothing?: number, options?: Partial<series_options>): series_api;
   add_fisher_transform(source: series_api, period?: number, options?: Partial<series_options>): [series_api, series_api];
   add_ultimate_oscillator(source: series_api, short_period?: number, medium_period?: number, long_period?: number, options?: Partial<series_options>): series_api;

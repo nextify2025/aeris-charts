@@ -126,6 +126,18 @@ fn runtimes() -> Vec<(&'static str, IncrementalState)> {
             IncrementalState::ultimate_oscillator(3, 5, 8),
         ),
         ("vortex", IncrementalState::vortex(5)),
+        ("kst", IncrementalState::kst([2, 3, 4, 5], [2, 2, 2, 3], 3)),
+        ("tsi", IncrementalState::tsi(5, 3, 3)),
+        ("mass_index", IncrementalState::mass_index(3, 5)),
+        ("klinger", IncrementalState::klinger(3, 7, 4)),
+        ("kama", IncrementalState::kama(5, 2, 10)),
+        ("mcginley", IncrementalState::mcginley(5)),
+        (
+            "linear_regression",
+            IncrementalState::linear_regression(5, 2.0),
+        ),
+        ("choppiness", IncrementalState::choppiness(5)),
+        ("atr_bands", IncrementalState::atr_bands(5, 2.0)),
     ]
 }
 
@@ -575,11 +587,12 @@ fn truncation_just_past_a_checkpoint_keeps_tail_windows_complete() {
 #[test]
 fn path_dependent_runtimes_repair_across_checkpoints_like_a_full_rebuild() {
     // Stochastic RSI, pivots and ZigZag carry recursive state with sparse checkpoints every 1,024
-    // rows; long sequences make historical corrections resume from real checkpoints.
+    // rows, and Stochastic and Mass Index a retained tail window besides; long sequences make
+    // historical corrections resume from real checkpoints.
     let include = |label: &str| {
         matches!(
             label,
-            "stochastic_rsi" | "pivot_points" | "zigzag" | "stochastic"
+            "stochastic_rsi" | "pivot_points" | "zigzag" | "stochastic" | "mass_index"
         )
     };
     for seed in 1..=3_u64 {

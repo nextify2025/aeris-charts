@@ -29,7 +29,7 @@ import type {
   depth_event_columns, depth_event_layer_options, depth_heatmap_options, depth_ladder_row, depth_options, depth_snapshot_columns, depth_study_snapshot, depth_update_columns,
   drawing_point, drawing_point_input, drawing_points_update, drawing_price_segment, drawing_magnet_mode,
   drawing_tool_change_handler, drawing_interval, drawing_property_schema, drawing_kind_options, drawing_template,
-  ema_ribbon_options, ema_ribbon_periods,
+  ema_ribbon_options, ema_ribbon_periods, kst_periods,
   feature_series_kind, frame_stats,
   footprint_bar, footprint_series_api, footprint_series_options, footprint_trade, footprint_trade_columns,
   general_accessibility_snapshot, general_axis_api, general_axis_options, general_axis_presentation_options, general_brush_snapshot, general_legend_snapshot, general_pane_options, general_reference_api, general_reference_options, general_reference_value, general_series_api, general_series_hit,
@@ -6408,6 +6408,57 @@ export class chart_impl implements chart_api {
     return this.indicator_series(this.wasm.add_chaikin_oscillator(source.id, volume_source.id, fast, slow), options);
   }
 
+  add_klinger(source: series_api, fast: number | undefined, slow: number | undefined, signal: number | undefined, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api] {
+    fast ??= 34;
+    slow ??= 55;
+    signal ??= 13;
+    if (![fast, slow, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000) || fast >= slow || !volume_source) {
+      throw new AerisChartsError("invalid_options", "Klinger requires volume and periods satisfying 1 <= fast < slow <= 1000000 and 1 <= signal <= 1000000");
+    }
+    const ids = this.wasm.add_klinger(source.id, volume_source.id, fast, slow, signal);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Klinger configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_kama(source: series_api, period = 10, fast = 2, slow = 30, options?: Partial<series_options>): series_api {
+    if (![period, fast, slow].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000) || fast >= slow) {
+      throw new AerisChartsError("invalid_options", "KAMA requires 1 <= period <= 1000000 and 1 <= fast < slow <= 1000000");
+    }
+    return this.indicator_series(this.wasm.add_kama(source.id, period, fast, slow), options);
+  }
+
+  add_mcginley(source: series_api, period = 14, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "McGinley period must be an integer from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_mcginley(source.id, period), options);
+  }
+
+  add_linear_regression(source: series_api, period = 20, deviation = 2, options?: Partial<series_options>): [series_api, series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(deviation) || deviation < 0) {
+      throw new AerisChartsError("invalid_options", "Linear Regression requires a period from 1 to 1000000 and a nonnegative finite deviation");
+    }
+    const ids = this.wasm.add_linear_regression(source.id, period, deviation);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Linear Regression configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
+  }
+
+  add_choppiness(source: series_api, period = 14, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 2 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Choppiness period must be an integer from 2 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_choppiness(source.id, period), options);
+  }
+
+  add_atr_bands(source: series_api, period = 14, multiplier = 2, options?: Partial<series_options>): [series_api, series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(multiplier) || multiplier < 0) {
+      throw new AerisChartsError("invalid_options", "ATR Bands require a period from 1 to 1000000 and a nonnegative finite multiplier");
+    }
+    const ids = this.wasm.add_atr_bands(source.id, period, multiplier);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid ATR Bands configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
+  }
+
   add_relative_volume(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api {
     if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
       throw new AerisChartsError("invalid_options", "Relative Volume period must be an integer from 1 to 1000000");
@@ -6451,6 +6502,47 @@ export class chart_impl implements chart_api {
     }
     const ids = this.wasm.add_trix(source.id, period, signal);
     if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid TRIX configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_kst(
+    source: series_api,
+    roc: kst_periods = [10, 15, 20, 30],
+    smoothing: kst_periods = [10, 10, 10, 15],
+    signal = 9,
+    options?: Partial<series_options>,
+  ): [series_api, series_api] {
+    if (roc.length !== 4 || smoothing.length !== 4 ||
+        ![...roc, ...smoothing, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "KST periods must be integers from 1 to 1000000");
+    }
+    const ids = this.wasm.add_kst(source.id, Uint32Array.from(roc), Uint32Array.from(smoothing), signal);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid KST configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_tsi(source: series_api, long = 25, short = 13, signal = 13, options?: Partial<series_options>): [series_api, series_api] {
+    if (![long, short, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "TSI periods must be integers from 1 to 1000000");
+    }
+    const ids = this.wasm.add_tsi(source.id, long, short, signal);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid TSI configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_mass_index(source: series_api, ema_period = 9, sum_period = 25, options?: Partial<series_options>): series_api {
+    if (![ema_period, sum_period].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "Mass Index periods must be integers from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_mass_index(source.id, ema_period, sum_period), options);
+  }
+
+  add_vortex(source: series_api, period = 14, options?: Partial<series_options>): [series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Vortex period must be an integer from 1 to 1000000");
+    }
+    const ids = this.wasm.add_vortex(source.id, period);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Vortex configuration");
     return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
   }
 

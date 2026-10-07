@@ -166,6 +166,126 @@ test("volume oscillator keeps three ordered outputs across historical volume rep
   expect(result.after[2]).toBeCloseTo(-20 / 3, 8);
 });
 
+test("Klinger, KAMA, McGinley and regression expose ordered browser values and repair history", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const start = 1_702_000_000;
+    const price = chart.add_series("candlestick", { visible: false });
+    const volume = chart.add_series("histogram", { visible: false });
+    price.set_data([2, 3, 2, 1].map((close, i) => ({
+      time: start + i * 60, open: close, high: close + 1, low: close - 1, close,
+    })));
+    volume.set_data([0, 1, 2, 3].map((i) => ({ time: start + i * 60, value: 1 })));
+    const adaptive = chart.add_series("line", { visible: false });
+    adaptive.set_data([1, 2, 3, 4, 3, 4].map((value, i) => ({ time: start + i * 60, value })));
+    const dynamic = chart.add_series("line", { visible: false });
+    dynamic.set_data([2, 4, 4].map((value, i) => ({ time: start + i * 60, value })));
+    const regression = chart.add_series("line", { visible: false });
+    regression.set_data([1, 3, 2, 5].map((value, i) => ({ time: start + i * 60, value })));
+
+    const bindings = [
+      chart.add_klinger(price, 1, 2, 2, volume),
+      [chart.add_kama(adaptive, 3, 2, 5)],
+      [chart.add_mcginley(dynamic, 2)],
+      chart.add_linear_regression(regression, 3, 2),
+    ];
+    const before = [
+      bindings[0].map((s) => s.data().find((row) => row.time === start + 120)?.value),
+      [bindings[1][0].data().find((row) => row.time === start + 240)?.value],
+      [bindings[2][0].data().find((row) => row.time === start + 60)?.value],
+      bindings[3].map((s) => s.data().find((row) => row.time === start + 120)?.value),
+    ];
+    const signalAtLast = bindings[0][1].data().at(-1)?.value;
+    const metadata = bindings.map((group) => group.map((s) => ({
+      id: s.id,
+      kind: s.indicator_info().kind,
+      parameters: s.indicator_info().parameters,
+      index: s.indicator_info().output_index,
+      count: s.indicator_info().output_count,
+      binding_id: s.indicator_info().binding_id,
+      volume_id: s.indicator_info().volume_source?.id,
+      pane: s.pane_index(),
+    })));
+    const schemas = ["klinger", "kama", "mcginley", "linear_regression"].map((kind) =>
+      chart.indicator_schema(kind).parameters.map(({ name, default: value }) => [name, value]));
+    const panesBefore = chart.panes().length;
+    const invalid = [
+      () => chart.add_klinger(price, 2, 2, 2, volume),
+      () => chart.add_klinger(price, 1, 2, 2, null),
+      () => chart.add_klinger(price, 1, 2, 1.5, volume),
+      () => chart.add_kama(adaptive, 0, 2, 5),
+      () => chart.add_kama(adaptive, 3, 5, 2),
+      () => chart.add_mcginley(dynamic, Infinity),
+      () => chart.add_linear_regression(regression, 0, 2),
+      () => chart.add_linear_regression(regression, 3, -1),
+      () => chart.add_linear_regression(regression, 3, NaN),
+    ].map((add) => { try { add(); return false; } catch (error) { return error.code === "invalid_options"; } });
+    const panesAfter = chart.panes().length;
+    volume.update({ time: start + 60, value: 2 });
+    adaptive.update({ time: start + 180, value: 5 });
+    dynamic.update({ time: start + 60, value: 3 });
+    regression.update({ time: start + 60, value: 4 });
+    const after = bindings.map((group) => group.map((s) => s.data().at(-1)?.value));
+    const fresh = [
+      chart.add_klinger(price, 1, 2, 2, volume),
+      [chart.add_kama(adaptive, 3, 2, 5)],
+      [chart.add_mcginley(dynamic, 2)],
+      chart.add_linear_regression(regression, 3, 2),
+    ].map((group) => group.map((s) => s.data().at(-1)?.value));
+    const defaults = [
+      chart.add_klinger(price, undefined, undefined, undefined, volume)[0],
+      chart.add_kama(adaptive),
+      chart.add_mcginley(dynamic),
+      chart.add_linear_regression(regression)[0],
+    ].map((s) => s.indicator_info().parameters);
+    return { before, signalAtLast, after, fresh, defaults, metadata, schemas, invalid, panesBefore, panesAfter,
+      pricePane: price.pane_index(), volumeId: volume.id };
+  });
+  expect(result.before[0][0]).toBeCloseTo(-50 / 3, 8);
+  expect(result.before[0][1]).toBeCloseTo(-100 / 3, 8);
+  expect(result.signalAtLast).toBeCloseTo(-200 / 9, 8);
+  expect(result.before[1][0]).toBeCloseTo(2 + 8 / 9 + (3 - 2 - 8 / 9) * 16 / 81, 8);
+  expect(result.before[2][0]).toBeCloseTo(2.0625, 8);
+  expect(result.before[3][0]).toBeCloseTo(2.5, 8);
+  expect(result.before[3][1]).toBeCloseTo(2.5 + Math.SQRT2, 8);
+  expect(result.before[3][2]).toBeCloseTo(2.5 - Math.SQRT2, 8);
+  expect(result.invalid).toEqual(Array(9).fill(true));
+  expect(result.panesAfter).toBe(result.panesBefore);
+  expect(result.metadata.map((group) => group.map(({ kind }) => kind))).toEqual([
+    ["klinger", "klinger"], ["kama"], ["mcginley"],
+    ["linear_regression", "linear_regression", "linear_regression"],
+  ]);
+  for (const [i, group] of result.metadata.entries()) {
+    expect(group.map(({ index }) => index)).toEqual([...group.keys()]);
+    expect(group.map(({ count }) => count)).toEqual(Array(group.length).fill(group.length));
+    expect(group.map(({ binding_id }) => binding_id)).toEqual(Array(group.length).fill(group[0].id));
+    expect(new Set(group.map(({ pane }) => pane)).size).toBe(1);
+    for (let j = 0; j < group.length; j++) expect(result.after[i][j]).toBeCloseTo(result.fresh[i][j], 8);
+  }
+  expect(result.metadata[0][0]).toMatchObject({
+    parameters: { fast: 1, slow: 2, signal: 2 }, volume_id: result.volumeId,
+  });
+  expect(result.metadata[0][0].pane).not.toBe(result.pricePane);
+  expect(result.metadata.slice(1).every((group) => group[0].pane === result.pricePane)).toBe(true);
+  expect(result.metadata[1][0].parameters).toMatchObject({ period: 3, fast: 2, slow: 5 });
+  expect(result.metadata[2][0].parameters).toMatchObject({ period: 2 });
+  expect(result.metadata[3][0].parameters).toMatchObject({ period: 3, deviation: 2 });
+  expect(result.defaults).toEqual([
+    expect.objectContaining({ fast: 34, slow: 55, signal: 13 }),
+    expect.objectContaining({ period: 10, fast: 2, slow: 30 }),
+    expect.objectContaining({ period: 14 }),
+    expect.objectContaining({ period: 20, deviation: 2 }),
+  ]);
+  expect(result.schemas).toEqual([
+    [["source", "close"], ["fast", 34], ["slow", 55], ["signal", 13], ["volume_source", null]],
+    [["source", "close"], ["period", 10], ["fast", 2], ["slow", 30]],
+    [["source", "close"], ["period", 14]],
+    [["source", "close"], ["period", 20], ["deviation", 2]],
+  ]);
+});
+
 test("historical volatility annualizes sample log returns and repairs corrected history", async ({ page }) => {
   await page.goto("/");
   await wait_grid(page);
@@ -226,6 +346,95 @@ test("TRIX returns ordered line and signal outputs after historical repair", asy
   expect(result.before[1]).toBeCloseTo(240 / 7, 8);
   expect(result.after[0]).not.toBe(result.before[0]);
   expect(result.after[1]).not.toBe(result.before[1]);
+});
+
+test("KST, TSI, Mass Index, and Vortex expose exact browser values and repair history", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const start = 1_701_000_000;
+    const source = chart.add_series("candlestick", { visible: false });
+    const bars = [1, 2, 4, 3, 5].map((value, i) => ({
+      time: start + i * 60, open: value, high: value, low: 0, close: value,
+    }));
+    source.set_data(bars);
+    const kst = chart.add_kst(source, [1, 1, 1, 1], [1, 1, 1, 1], 2);
+    const tsi = chart.add_tsi(source, 2, 2, 2);
+    const mass = chart.add_mass_index(source, 2, 2);
+    const vortexSource = chart.add_series("candlestick", { visible: false });
+    vortexSource.set_data([1, 3, 5].map((close, i) => ({
+      time: start + i * 60, open: close, high: close + 1, low: close - 1, close,
+    })));
+    const vortex = chart.add_vortex(vortexSource, 2);
+    const groups = [kst, tsi, [mass], vortex];
+    const before = groups.map((group) => group.map((s) => s.data().at(-1)?.value));
+    const metadata = groups.map((group) => group.map((s) => ({
+      kind: s.indicator_info().kind,
+      params: s.indicator_info().parameters,
+      index: s.indicator_info().output_index,
+      count: s.indicator_info().output_count,
+      pane: s.pane_index(),
+    })));
+    const schemas = ["kst", "tsi", "mass_index", "vortex"].map((kind) =>
+      chart.indicator_schema(kind).parameters.map(({ name, default: value }) => [name, value]));
+    const panesBefore = chart.panes().length;
+    const invalid = [
+      () => chart.add_kst(source, [1, 1, 0, 1], [1, 1, 1, 1], 2),
+      () => chart.add_kst(source, [1, 1, 1, 1], [1, 1, 1, 1], 1.5),
+      () => chart.add_tsi(source, 2, -1, 2),
+      () => chart.add_mass_index(source, 2, Infinity),
+      () => chart.add_vortex(vortexSource, 0),
+    ].map((add) => { try { add(); return false; } catch (error) { return error.code === "invalid_options"; } });
+    const panesAfter = chart.panes().length;
+    source.update({ ...bars[3], close: 2, high: 2, open: 2 });
+    vortexSource.update({ time: start + 60, open: 4, high: 5, low: 2, close: 4 });
+    const after = groups.map((group) => group.map((s) => s.data().at(-1)?.value));
+    // A fresh binding over the corrected history must agree with each live repaired binding.
+    const recreated = [
+      chart.add_kst(source, [1, 1, 1, 1], [1, 1, 1, 1], 2),
+      chart.add_tsi(source, 2, 2, 2),
+      [chart.add_mass_index(source, 2, 2)],
+      chart.add_vortex(vortexSource, 2),
+    ].map((group) => group.map((s) => s.data().at(-1)?.value));
+    return { before, after, recreated, metadata, schemas, invalid, panesBefore, panesAfter };
+  });
+  expect(result.before[0][0]).toBeCloseTo(2000 / 3, 8);
+  expect(result.before[0][1]).toBeCloseTo(625 / 3, 8); // mean of -250 and 2000/3
+  expect(result.before[1][0]).toBeCloseTo(2900 / 43, 8);
+  expect(result.before[1][1]).toBeCloseTo(2525 / 43, 8);
+  expect(result.before[2][0]).toBeCloseTo(165 / 152 + 705 / 622, 8);
+  expect(result.before[3][0]).toBeCloseTo(4 / 3, 8);
+  expect(result.before[3][1]).toBe(0);
+  expect(result.invalid).toEqual([true, true, true, true, true]);
+  expect(result.panesAfter).toBe(result.panesBefore);
+  expect(new Set(result.metadata.map((group) => group[0].pane)).size).toBe(4);
+  expect(result.after[0][0]).toBeCloseTo(1500, 8);
+  expect(result.after[0][1]).toBeCloseTo(500, 8);
+  expect(result.after[1][0]).not.toBe(result.before[1][0]);
+  expect(result.after[2][0]).not.toBe(result.before[2][0]);
+  expect(result.after[3][0]).not.toBe(result.before[3][0]);
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < result.after[i].length; j++) {
+      expect(result.after[i][j]).toBeCloseTo(result.recreated[i][j], 8);
+    }
+    expect(result.metadata[i].map(({ index }) => index)).toEqual([...result.metadata[i].keys()]);
+    expect(new Set(result.metadata[i].map(({ pane }) => pane)).size).toBe(1);
+  }
+  expect(result.metadata.map((group) => group.map(({ kind }) => kind))).toEqual([
+    ["kst", "kst"], ["tsi", "tsi"], ["mass_index"], ["vortex", "vortex"],
+  ]);
+  expect(result.metadata[0][0].params).toMatchObject({ roc: [1, 1, 1, 1], smoothing_periods: [1, 1, 1, 1], signal: 2 });
+  expect(result.metadata[1][0].params).toMatchObject({ long_period: 2, short_period: 2, signal: 2 });
+  expect(result.metadata[2][0].params).toMatchObject({ ema_period: 2, sum_period: 2 });
+  expect(result.metadata[3][0].params).toMatchObject({ period: 2 });
+  expect(result.schemas).toEqual([
+    [["source", "close"], ["roc_1", 10], ["roc_2", 15], ["roc_3", 20], ["roc_4", 30],
+      ["smoothing_1", 10], ["smoothing_2", 10], ["smoothing_3", 10], ["smoothing_4", 15], ["signal", 9]],
+    [["source", "close"], ["long", 25], ["short", 13], ["signal", 13]],
+    [["source", "close"], ["ema_period", 9], ["sum_period", 25]],
+    [["source", "close"], ["period", 14]],
+  ]);
 });
 
 test("Coppock Curve weights two rates of change and repairs historical prices", async ({ page }) => {
@@ -740,4 +949,189 @@ test("stochastic, atr, vwap, and wma register with lineage and placement", async
   // Both stochastic lines share one pane (and it is not the price pane).
   const stoch_pane = out.stoch_same_pane.findIndex(Boolean);
   expect(stoch_pane).toBeGreaterThan(0);
+});
+
+test("Choppiness computes short true-range windows in an oscillator pane", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    const bars = [
+      [12, 8, 10], [14, 9, 12], [13, 10, 11], [16, 11, 14], [15, 12, 13],
+    ];
+    source.set_data(bars.map(([high, low, close], index) => ({
+      time: 1_705_000_000 + index * 60, open: close, high, low, close,
+    })));
+    const panes_before = chart.panes().length;
+    const output = chart.add_choppiness(source, 2);
+    return {
+      data: output.data(),
+      info: {
+        ...output.indicator_info(),
+        source: { id: output.indicator_info().source.id },
+      },
+      source_id: source.id,
+      panes_before,
+      panes_after: chart.panes().length,
+      pane: output.pane_index(),
+      pane_has_output: chart.panes()[output.pane_index()].get_series().some((series) => series.id === output.id),
+    };
+  });
+  expect(result.data.map(({ value }) => value)).toHaveLength(3);
+  // At rows 2–4: TR pairs (5,3), (3,5), (5,3), and high-low spans 5, 6, 5.
+  expect(result.data.map(({ time }) => time)).toEqual([1_705_000_120, 1_705_000_180, 1_705_000_240]);
+  for (const [index, expected] of [8 / 5, 8 / 6, 8 / 5].entries()) {
+    expect(result.data[index].value).toBeCloseTo(100 * Math.log(expected) / Math.log(2), 8);
+  }
+  expect(result.panes_after).toBe(result.panes_before + 1);
+  expect(result.pane).toBeGreaterThan(0);
+  expect(result.pane_has_output).toBe(true);
+  expect(result.info).toMatchObject({
+    kind: "choppiness", period: 2, output_index: 0, source: { id: result.source_id },
+    parameters: { period: 2 },
+  });
+});
+
+test("ATR bands follow close plus or minus Wilder ATR on the price pane", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    const bars = [
+      [12, 8, 10], [14, 9, 12], [13, 10, 11], [16, 11, 14], [15, 12, 13],
+    ];
+    source.set_data(bars.map(([high, low, close], index) => ({
+      time: 1_705_100_000 + index * 60, open: close, high, low, close,
+    })));
+    const panes_before = chart.panes().length;
+    const outputs = chart.add_atr_bands(source, 2, 1.5);
+    return {
+      values: outputs.map((series) => series.data().map(({ value }) => value)),
+      info: outputs.map((series) => ({
+        ...series.indicator_info(),
+        source: { id: series.indicator_info().source.id },
+      })),
+      panes_before,
+      panes_after: chart.panes().length,
+      pane_indices: outputs.map((series) => series.pane_index()),
+      on_price_pane: outputs.map((series) =>
+        chart.panes()[0].get_series().some((candidate) => candidate.id === series.id)),
+      source_id: source.id,
+      output_ids: outputs.map((series) => series.id),
+    };
+  });
+  // First ATR = (TR[1] + TR[2]) / 2 = (5 + 3) / 2 = 4;
+  // subsequent Wilder ATRs are (4 + 5) / 2 = 4.5, (4.5 + 3) / 2 = 3.75.
+  const closes = [11, 14, 13];
+  const atrs = [4, 4.5, 3.75];
+  expect(result.values).toHaveLength(3);
+  for (const [slot, sign] of [[0, 1], [1, 0], [2, -1]]) {
+    expect(result.values[slot]).toHaveLength(3);
+    for (let row = 0; row < 3; row += 1) {
+      expect(result.values[slot][row]).toBeCloseTo(closes[row] + sign * 1.5 * atrs[row], 8);
+    }
+  }
+  expect(result.panes_after).toBe(result.panes_before);
+  expect(result.pane_indices).toEqual([0, 0, 0]);
+  expect(result.on_price_pane).toEqual([true, true, true]);
+  expect(result.info.map(({ kind, output_index, output_name }) => ({ kind, output_index, output_name }))).toEqual([
+    { kind: "atr_bands", output_index: 0, output_name: "Upper" },
+    { kind: "atr_bands", output_index: 1, output_name: "Basis" },
+    { kind: "atr_bands", output_index: 2, output_name: "Lower" },
+  ]);
+  for (const info of result.info) {
+    expect(info).toMatchObject({
+      period: 2, deviation: 1.5, source: { id: result.source_id },
+      parameters: { period: 2, multiplier: 1.5 },
+    });
+    expect(info.binding_id).toBe(result.output_ids[0]);
+  }
+});
+
+test("invalid Choppiness and ATR bands parameters reject without allocating outputs or panes", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const source = chart.add_series("candlestick", { visible: false });
+    source.set_data([10, 11, 12].map((close, index) => ({
+      time: 1_705_200_000 + index * 60, open: close, high: close + 2, low: close - 2, close,
+    })));
+    const snapshot = () => chart.panes().map((pane) => pane.get_series().map((series) => series.id));
+    const before = snapshot();
+    const attempts = [
+      () => chart.add_choppiness(source, 1),
+      () => chart.add_choppiness(source, 2.5),
+      () => chart.add_atr_bands(source, 0, 1.5),
+      () => chart.add_atr_bands(source, 2, -1),
+      () => chart.add_atr_bands(source, 2, Number.NaN),
+    ];
+    return attempts.map((attempt) => {
+      let code;
+      try { attempt(); } catch (error) { code = error.code; }
+      return { code, panes: snapshot(), unchanged: JSON.stringify(snapshot()) === JSON.stringify(before) };
+    });
+  });
+  expect(result.map(({ code }) => code)).toEqual(Array(5).fill("invalid_options"));
+  expect(result.every(({ unchanged }) => unchanged)).toBe(true);
+});
+
+test("browser schemas retain every multi-parameter Rust canonical default", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  // Explicit browser contract, independent of the engine's schema builder and indicator functions.
+  // Includes volume-source descriptors when they are the second parameter.
+  const defaults = {
+    stochastic_rsi: { rsi_period: 14, stochastic_period: 14 },
+    bollinger_metrics: { period: 14, deviation: 2 },
+    envelopes: { period: 14, percent: 2, exponential: false },
+    alma: { period: 14, offset: 0.85, sigma: 6 },
+    keltner: { period: 14, multiplier: 2 },
+    supertrend: { period: 14, multiplier: 3 },
+    ema_ribbon: { period_1: 5, period_2: 10, period_3: 20, period_4: 50, period_5: 200 },
+    // The fork's seed, histogram multiplier and estimator descriptors default to the textbook forms.
+    bollinger: { period: 14, deviation: 2, estimator: "population" },
+    macd: { fast: 12, slow: 26, signal: 9, seed: "sma", histogram_multiplier: 1 },
+    kdj: { period: 9, k_smoothing: 3, d_smoothing: 3, seed: "fifty" },
+    stochastic: { k_period: 14, d_period: 3 },
+    chaikin_oscillator: { fast: 3, slow: 10, volume_source: null },
+    klinger: { fast: 34, slow: 55, signal: 13, volume_source: null },
+    kama: { period: 10, fast: 2, slow: 30 },
+    linear_regression: { period: 20, deviation: 2 },
+    atr_bands: { period: 14, multiplier: 2 },
+    relative_volume: { period: 14, volume_source: null },
+    elder_force: { period: 14, volume_source: null },
+    ease_of_movement: { period: 14, divisor: 100_000_000, volume_source: null },
+    historical_volatility: { period: 14, annualization: 252 },
+    trix: { period: 14, signal: 9 },
+    kst: {
+      roc_1: 10, roc_2: 15, roc_3: 20, roc_4: 30,
+      smoothing_1: 10, smoothing_2: 10, smoothing_3: 10, smoothing_4: 15, signal: 9,
+    },
+    tsi: { long: 25, short: 13, signal: 13 },
+    mass_index: { ema_period: 9, sum_period: 25 },
+    coppock_curve: { long_period: 14, short_period: 11, smoothing: 10 },
+    ultimate_oscillator: { short_period: 7, medium_period: 14, long_period: 28 },
+    volume_oscillator: { fast: 12, slow: 26, signal: 9, volume_source: null },
+    cmf: { period: 14, volume_source: null },
+    mfi: { period: 14, volume_source: null },
+    volume: { period: 14, volume_source: null },
+    vwma: { period: 14, volume_source: null },
+    vwap_bands: { reset: "session", standard_deviation: 1, percent: 10, volume_source: null },
+  };
+  const actual = await page.evaluate((names) => Object.fromEntries(names.map((name) => {
+    const schema = window.__chart.indicator_schema(name);
+    return [name, {
+      kind: schema.kind,
+      parameters: Object.fromEntries(schema.parameters
+        .filter(({ name: parameter }) => parameter !== "source")
+        .map(({ name: parameter, default: value }) => [parameter, value])),
+    }];
+  })), Object.keys(defaults));
+  for (const [kind, expected] of Object.entries(defaults)) {
+    expect(actual[kind].kind, kind).toBe(kind);
+    expect(actual[kind].parameters, kind).toEqual(expected);
+  }
 });

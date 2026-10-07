@@ -411,6 +411,41 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
             medium: 14,
             long: 28,
         },
+        IndicatorKind::Kst {
+            roc: [10, 15, 20, 30],
+            smoothing: [10, 10, 10, 15],
+            signal: 9,
+        },
+        IndicatorKind::Tsi {
+            long: 25,
+            short: 13,
+            signal: 13,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 9,
+            sum_period: 25,
+        },
+        IndicatorKind::Klinger {
+            fast: 34,
+            slow: 55,
+            signal: 13,
+        },
+        IndicatorKind::Kama {
+            period: 10,
+            fast: 2,
+            slow: 30,
+        },
+        IndicatorKind::McGinley { period: 14 },
+        IndicatorKind::LinearRegression {
+            period: 20,
+            deviation: 2.0,
+        },
+        IndicatorKind::Choppiness { period: 14 },
+        IndicatorKind::AtrBands {
+            period: 14,
+            multiplier: 2.0,
+        },
+        IndicatorKind::Vortex { period: 14 },
     ];
     let mut bindings = 0;
     for kind in kinds {
@@ -423,6 +458,7 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
                 | IndicatorKind::AccumulationDistribution
                 | IndicatorKind::PriceVolumeTrend
                 | IndicatorKind::ChaikinOscillator { .. }
+                | IndicatorKind::Klinger { .. }
                 | IndicatorKind::RelativeVolume { .. }
                 | IndicatorKind::VolumeOscillator { .. }
                 | IndicatorKind::ElderForce { .. }
@@ -2637,7 +2673,7 @@ fn main() -> ExitCode {
     );
 
     // ---- Target M: bounded per-tick indicator work over a 1M-row source ---------------------
-    // Every built-in kind is bound, so one tick advances 58 bindings (~90 outputs) plus the volume
+    // Every built-in kind is bound, so one tick advances 68 bindings (~108 outputs) plus the volume
     // series. Bounded rolling state makes a tick O(period) per binding, independent of history;
     // the budget keeps a tick (candle + volume update) under 1 ms, so a 60 fps host absorbs a
     // burst of ticks inside one frame with most of its 16.67 ms left for frame construction.
@@ -2768,7 +2804,7 @@ fn main() -> ExitCode {
     // ---- Target M (KLineChart): the 27 KLineChart templates over a 1M-row source ------------
     // Each template advances one row at a time from a checkpointed state, so a tick costs the
     // template's window however long the history is. The set is measured in its own block with the
-    // same 1 ms per-tick budget, so its 27 bindings do not spend the headroom of the 58 built-in
+    // same 1 ms per-tick budget, so its 27 bindings do not spend the headroom of the 68 built-in
     // bindings above, which already read close to theirs.
     let kline_cost = indicator_tick_cost(
         StudySet::KLineChart,

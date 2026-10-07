@@ -247,150 +247,9 @@ impl ChartInner {
     }
 
     pub fn indicator_schema_json(&self, kind: &str, period: u32, deviation: f64) -> String {
-        let period = period as usize;
-        let definition = match kind {
-            "aroon" => IndicatorKind::Aroon { period },
-            "awesome_oscillator" => IndicatorKind::AwesomeOscillator,
-            "dpo" => IndicatorKind::Dpo { period },
-            "chande_momentum" => IndicatorKind::ChandeMomentum { period },
-            "bollinger_metrics" => IndicatorKind::BollingerMetrics { period, deviation },
-            "envelopes" => IndicatorKind::Envelopes {
-                period,
-                percent: deviation,
-                exponential: false,
-            },
-            "alma" => IndicatorKind::Alma {
-                period,
-                offset: 0.85,
-                sigma: 6.0,
-            },
-            "sma" => IndicatorKind::Sma { period },
-            "ema" => IndicatorKind::Ema {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "dema" => IndicatorKind::Dema {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "tema" => IndicatorKind::Tema {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "smma" | "rma" => IndicatorKind::Smma { period },
-            "hma" => IndicatorKind::Hma { period },
-            "vwma" => IndicatorKind::Vwma { period },
-            "standard_deviation" => IndicatorKind::StandardDeviation { period },
-            "cci" => IndicatorKind::Cci { period },
-            "williams_r" => IndicatorKind::WilliamsR { period },
-            "stochastic_rsi" => IndicatorKind::StochasticRsi {
-                rsi_period: period,
-                stochastic_period: period,
-            },
-            "momentum" => IndicatorKind::Momentum { period },
-            "roc" => IndicatorKind::RateOfChange { period },
-            "donchian" => IndicatorKind::Donchian { period },
-            "pivot_points" => {
-                let variant = match period {
-                    1 => PivotKind::Standard,
-                    2 => PivotKind::Fibonacci,
-                    3 => PivotKind::Camarilla,
-                    4 => PivotKind::Woodie,
-                    5 => PivotKind::DeMark,
-                    _ => return "null".into(),
-                };
-                IndicatorKind::PivotPoints { variant }
-            }
-            "zigzag" => IndicatorKind::ZigZag {
-                deviation_percent: deviation,
-            },
-            "keltner" => IndicatorKind::Keltner {
-                period,
-                multiplier: deviation,
-            },
-            "adx_dmi" => IndicatorKind::AdxDmi { period },
-            "parabolic_sar" => IndicatorKind::ParabolicSar,
-            "supertrend" => IndicatorKind::SuperTrend {
-                period,
-                multiplier: deviation,
-            },
-            "ichimoku" => IndicatorKind::Ichimoku,
-            "ema_ribbon" => IndicatorKind::EmaRibbon {
-                periods: [period; 5],
-            },
-            "bollinger" => IndicatorKind::Bollinger {
-                period,
-                deviation,
-                estimator: DeviationEstimator::Population,
-            },
-            "rsi" => IndicatorKind::Rsi {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "macd" => IndicatorKind::Macd {
-                fast: period,
-                slow: period.saturating_mul(2),
-                signal: period,
-                seed: IndicatorSeed::Sma,
-                histogram_multiplier: 1.0,
-            },
-            "kdj" => IndicatorKind::Kdj {
-                period,
-                k_smoothing: 3,
-                d_smoothing: 3,
-                seed: aeris_charts_engine::KdjSeed::Fifty,
-            },
-            "stochastic" => IndicatorKind::Stochastic {
-                k_period: period,
-                d_period: period,
-            },
-            "atr" => IndicatorKind::Atr { period },
-            "vwap" => IndicatorKind::Vwap,
-            "obv" => IndicatorKind::Obv,
-            "accumulation_distribution" => IndicatorKind::AccumulationDistribution,
-            "price_volume_trend" => IndicatorKind::PriceVolumeTrend,
-            "chaikin_oscillator" => IndicatorKind::ChaikinOscillator { fast: 3, slow: 10 },
-            "relative_volume" => IndicatorKind::RelativeVolume { period },
-            "elder_force" => IndicatorKind::ElderForce { period },
-            "ease_of_movement" => IndicatorKind::EaseOfMovement {
-                period,
-                divisor: 100_000_000.0,
-            },
-            "historical_volatility" => IndicatorKind::HistoricalVolatility {
-                period,
-                annualization: 252.0,
-            },
-            "trix" => IndicatorKind::Trix { period, signal: 9 },
-            "coppock_curve" => IndicatorKind::CoppockCurve {
-                long: 14,
-                short: 11,
-                smoothing: 10,
-            },
-            "fisher_transform" => IndicatorKind::FisherTransform { period },
-            "ultimate_oscillator" => IndicatorKind::UltimateOscillator {
-                short: 7,
-                medium: 14,
-                long: 28,
-            },
-            "volume_oscillator" => IndicatorKind::VolumeOscillator {
-                fast: 12,
-                slow: 26,
-                signal: 9,
-            },
-            "cmf" => IndicatorKind::Cmf { period },
-            "mfi" => IndicatorKind::Mfi { period },
-            "volume" => IndicatorKind::Volume { period },
-            "vwap_bands" => IndicatorKind::VwapBands {
-                reset: VwapReset::Session,
-                standard_deviation: deviation,
-                percent: 10.0,
-            },
-            "wma" => IndicatorKind::Wma { period },
-            // KLineChart templates (`klinechart_macd`, ...) describe their default parameters.
-            other => match aeris_charts_engine::klinechart_indicator_for_kind_name(other) {
-                Some(indicator) => IndicatorKind::KLineChart(indicator),
-                None => return "null".into(),
-            },
+        let Some(definition) = IndicatorKind::schema_definition(kind, period as usize, deviation)
+        else {
+            return "null".into();
         };
         serde_json::to_string(&ChartEngine::indicator_schema(&definition))
             .unwrap_or_else(|_| "null".into())
@@ -768,6 +627,79 @@ impl ChartInner {
             .unwrap_or(u32::MAX)
     }
 
+    pub fn add_klinger(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        if volume_source < 0 || fast == 0 || fast >= slow || signal == 0 {
+            return Vec::new();
+        }
+        self.engine.add_klinger(
+            source_id as SeriesId,
+            volume_source as SeriesId,
+            fast as usize,
+            slow as usize,
+            signal as usize,
+        )
+    }
+
+    pub fn add_kama(&mut self, source_id: u32, period: u32, fast: u32, slow: u32) -> u32 {
+        if period == 0 || fast == 0 || fast >= slow {
+            return u32::MAX;
+        }
+        self.engine
+            .add_kama(
+                source_id as SeriesId,
+                period as usize,
+                fast as usize,
+                slow as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_mcginley(&mut self, source_id: u32, period: u32) -> u32 {
+        if period == 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_mcginley(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_linear_regression(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        if period == 0 || !deviation.is_finite() || deviation < 0.0 {
+            return Vec::new();
+        }
+        self.engine
+            .add_linear_regression(source_id as SeriesId, period as usize, deviation)
+    }
+
+    pub fn add_choppiness(&mut self, source_id: u32, period: u32) -> u32 {
+        if period < 2 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_choppiness(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_atr_bands(&mut self, source_id: u32, period: u32, multiplier: f64) -> Vec<u32> {
+        if period == 0 || !multiplier.is_finite() || multiplier < 0.0 {
+            return Vec::new();
+        }
+        self.engine
+            .add_atr_bands(source_id as SeriesId, period as usize, multiplier)
+    }
+
     pub fn add_relative_volume(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
         if volume_source < 0 {
             return u32::MAX;
@@ -848,6 +780,62 @@ impl ChartInner {
     pub fn add_trix(&mut self, source_id: u32, period: u32, signal: u32) -> Vec<u32> {
         self.engine
             .add_trix(source_id as SeriesId, period as usize, signal as usize)
+    }
+
+    pub fn add_kst(
+        &mut self,
+        source_id: u32,
+        roc: [u32; 4],
+        smoothing: [u32; 4],
+        signal: u32,
+    ) -> Vec<u32> {
+        if roc
+            .iter()
+            .chain(smoothing.iter())
+            .chain([&signal])
+            .any(|&p| p == 0)
+        {
+            return Vec::new();
+        }
+        self.engine.add_kst(
+            source_id as SeriesId,
+            roc.map(|p| p as usize),
+            smoothing.map(|p| p as usize),
+            signal as usize,
+        )
+    }
+
+    pub fn add_tsi(&mut self, source_id: u32, long: u32, short: u32, signal: u32) -> Vec<u32> {
+        if [long, short, signal].contains(&0) {
+            return Vec::new();
+        }
+        self.engine.add_tsi(
+            source_id as SeriesId,
+            long as usize,
+            short as usize,
+            signal as usize,
+        )
+    }
+
+    pub fn add_mass_index(&mut self, source_id: u32, ema_period: u32, sum_period: u32) -> u32 {
+        if [ema_period, sum_period].contains(&0) {
+            return u32::MAX;
+        }
+        self.engine
+            .add_mass_index(
+                source_id as SeriesId,
+                ema_period as usize,
+                sum_period as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_vortex(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        if period == 0 {
+            return Vec::new();
+        }
+        self.engine
+            .add_vortex(source_id as SeriesId, period as usize)
     }
 
     pub fn add_coppock_curve(

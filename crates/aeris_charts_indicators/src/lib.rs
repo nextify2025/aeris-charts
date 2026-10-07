@@ -888,6 +888,174 @@ mod breadth_reference_tests {
         assert!((points[2].plus.unwrap() - 4.0 / 3.0).abs() < 1e-12);
         assert_eq!(points[2].minus, Some(0.0));
     }
+
+    #[test]
+    fn kst_weights_four_roc_averages_and_sma_signal() {
+        let out = kst(&[1.0, 2.0, 4.0], [1; 4], [1; 4], 2);
+        assert_eq!(
+            out[0],
+            KstPoint {
+                line: None,
+                signal: None
+            }
+        );
+        assert_eq!(
+            out[1],
+            KstPoint {
+                line: Some(1000.0),
+                signal: None
+            }
+        );
+        assert_eq!(
+            out[2],
+            KstPoint {
+                line: Some(1000.0),
+                signal: Some(1000.0)
+            }
+        );
+        let gap = kst(&[1.0, 2.0, f64::NAN, 4.0, 8.0, 16.0], [1; 4], [1; 4], 2);
+        assert!(gap[4].line.unwrap().is_finite());
+        assert!(gap[4].signal.unwrap().is_nan());
+        assert_eq!(gap[5].signal, Some(1000.0));
+        // Different ROC and smoothing windows exercise all four independent weights.
+        let closes: Vec<_> = (1..=12).map(f64::from).collect();
+        let roc = [1, 2, 3, 4];
+        let smoothing = [1, 2, 3, 4];
+        let weighted = |row: usize| {
+            roc.iter()
+                .zip(smoothing)
+                .enumerate()
+                .map(|(component, (&lag, period))| {
+                    let average = (row + 1 - period..=row)
+                        .map(|i| (closes[i] / closes[i - lag] - 1.0) * 100.0)
+                        .sum::<f64>()
+                        / period as f64;
+                    (component + 1) as f64 * average
+                })
+                .sum::<f64>()
+        };
+        let varied = kst(&closes, roc, smoothing, 2);
+        assert!(varied[..7].iter().all(|point| point.line.is_none()));
+        assert!((varied[7].line.unwrap() - weighted(7)).abs() < 1e-9);
+        assert!((varied[8].signal.unwrap() - (weighted(7) + weighted(8)) / 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tsi_double_ema_and_signal_match_hand_derived_momentum() {
+        let out = tsi(&[1.0, 2.0, 4.0, 3.0, 5.0], 2, 2, 2);
+        assert!(out[..3].iter().all(|point| point.line.is_none()));
+        assert!((out[3].line.unwrap() - 50.0).abs() < 1e-12);
+        assert_eq!(out[3].signal, None);
+        assert!((out[4].line.unwrap() - 2900.0 / 43.0).abs() < 1e-12);
+        assert!((out[4].signal.unwrap() - 2525.0 / 43.0).abs() < 1e-12);
+        assert!(
+            out.iter()
+                .filter_map(|point| point.line)
+                .all(|value| value.abs() <= 100.0)
+        );
+        let flat = tsi(&[5.0; 8], 2, 2, 2);
+        assert_eq!(flat[4].line, Some(0.0));
+        assert_eq!(flat[4].signal, Some(0.0));
+        let gap = tsi(
+            &[1.0, 2.0, 3.0, 4.0, f64::NAN, 5.0, 6.0, 7.0, 8.0, 9.0],
+            2,
+            2,
+            2,
+        );
+        assert!(gap[7].line.unwrap().is_nan());
+        assert!(gap[8].line.unwrap().is_finite());
+    }
+
+    #[test]
+    fn mass_index_sums_two_ema_ratios_and_reseeds_after_gap() {
+        let lows = [0.0; 5];
+        let out = mass_index(&[1.0, 2.0, 4.0, 3.0, 5.0], &lows, 2, 2);
+        assert_eq!(out[..3], [None; 3]);
+        assert!((out[3].unwrap() - (19.0 / 14.0 + 165.0 / 152.0)).abs() < 1e-12);
+        let flat = mass_index(&[0.0; 5], &lows, 2, 2);
+        assert!(flat[3].unwrap().is_nan());
+        let gap = mass_index(
+            &[1.0, 2.0, 4.0, f64::NAN, 1.0, 2.0, 4.0, 3.0],
+            &[0.0; 8],
+            2,
+            2,
+        );
+        assert!(gap[6].unwrap().is_nan());
+        assert!(gap[7].unwrap().is_finite());
+    }
+
+    #[test]
+    fn klinger_uses_signed_cumulative_range_force_and_ema_signal() {
+        // Ranges are all two; trends +,+,-,-. Force = 100, 0, 0, -100/3.
+        let highs = [3.0, 4.0, 3.0, 2.0];
+        let lows = [1.0, 2.0, 1.0, 0.0];
+        let closes = [2.0, 3.0, 2.0, 1.0];
+        let out = klinger(&highs, &lows, &closes, &[1.0; 4], 1, 2, 2);
+        assert_eq!(out[0].line, None);
+        assert_eq!(out[1].line, Some(-50.0));
+        assert_eq!(out[1].signal, None);
+        assert!((out[2].line.unwrap() + 50.0 / 3.0).abs() < 1e-12);
+        assert!((out[2].signal.unwrap() + 100.0 / 3.0).abs() < 1e-12);
+        let gap = klinger(
+            &[3.0, f64::NAN, 3.0, 4.0],
+            &[1.0; 4],
+            &[2.0; 4],
+            &[1.0; 4],
+            1,
+            2,
+            2,
+        );
+        assert!(gap[1].line.unwrap().is_nan());
+        assert!(gap[2].line.unwrap().is_nan());
+        assert!(gap[3].line.unwrap().is_finite());
+    }
+
+    #[test]
+    fn kama_squares_efficiency_adjusted_smoothing_and_reseeds() {
+        let out = kama(&[1.0, 2.0, 3.0, 4.0, 3.0, 4.0], 3, 2, 5);
+        assert_eq!(out[..2], [None, None]);
+        assert_eq!(out[2], Some(2.0));
+        assert!((out[3].unwrap() - (2.0 + 2.0 * (2.0_f64 / 3.0).powi(2))).abs() < 1e-12);
+        // Net 1, path 3: ER=1/3, SC=(1/3*(2/3-1/3)+1/3)^2 = 16/81.
+        let expected = out[3].unwrap() + (3.0 - out[3].unwrap()) * 16.0 / 81.0;
+        assert!((out[4].unwrap() - expected).abs() < 1e-12);
+        let gap = kama(&[1.0, 2.0, 3.0, f64::NAN, 4.0, 5.0, 6.0], 3, 2, 5);
+        assert!(gap[3..6].iter().all(|value| value.unwrap().is_nan()));
+        assert_eq!(gap[6], Some(5.0));
+        assert_eq!(kama(&[1.0; 5], 2, 2, 5)[4], Some(1.0));
+    }
+
+    #[test]
+    fn mcginley_adapts_with_fourth_power_ratio() {
+        let out = mcginley(&[2.0, 4.0, 4.0, f64::NAN, 8.0], 2);
+        assert_eq!(out[0], Some(2.0));
+        assert_eq!(out[1], Some(2.0625)); // 2 + (4-2)/(2 * (4/2)^4)
+        assert!(out[3].unwrap().is_nan());
+        assert_eq!(out[4], Some(8.0));
+        assert!(mcginley(&[0.0, 2.0], 2)[0].unwrap().is_nan());
+    }
+
+    #[test]
+    fn regression_channel_uses_residual_not_price_deviation() {
+        let out = linear_regression(&[1.0, 3.0, 2.0, 5.0], 3, 2.0);
+        assert_eq!(out[0].curve, None);
+        assert_eq!(out[1].upper, None);
+        // Window 1,3,2: slope 1/2, intercept 3/2, fitted 3/2,2,5/2.
+        // Residuals -1/2,1,-1/2: population variance 1/2.
+        assert!((out[2].curve.unwrap() - 2.5).abs() < 1e-12);
+        assert!((out[2].upper.unwrap() - (2.5 + 2.0 / 2.0_f64.sqrt())).abs() < 1e-12);
+        assert!((out[2].lower.unwrap() - (2.5 - 2.0 / 2.0_f64.sqrt())).abs() < 1e-12);
+        let linear = linear_regression(&[1.0, 2.0, 3.0], 3, 3.0);
+        assert_eq!(linear[2].upper, Some(3.0));
+        assert_eq!(linear[2].lower, Some(3.0));
+        assert!(
+            linear_regression(&[1.0, f64::NAN, 3.0], 2, 2.0)[2]
+                .curve
+                .unwrap()
+                .is_nan()
+        );
+        assert_eq!(linear_regression(&[5.0], 1, 2.0)[0].curve, Some(5.0));
+    }
 }
 
 pub fn sma(values: &[f64], period: usize) -> Vec<Option<f64>> {
@@ -906,6 +1074,277 @@ pub fn sma(values: &[f64], period: usize) -> Vec<Option<f64>> {
         }
     }
     out
+}
+
+/// Kaufman's adaptive moving average, SMA-seeded after `period` prices.
+/// Efficiency compares the net `period`-bar change with the sum of absolute
+/// changes; a flat window has zero efficiency.
+pub fn kama(values: &[f64], period: usize, fast: usize, slow: usize) -> Vec<Option<f64>> {
+    let mut out = vec![None; values.len()];
+    if period == 0 || fast == 0 || slow == 0 || fast >= slow {
+        return out;
+    }
+    let mut state = KamaState::default();
+    for (row, slot) in out.iter_mut().enumerate() {
+        let value = kama_step(
+            &mut state,
+            values[row],
+            values[..row].iter().rev().copied(),
+            period,
+            fast,
+            slow,
+        );
+        if row + 1 >= period {
+            *slot = Some(value.unwrap_or(f64::NAN));
+        }
+    }
+    out
+}
+
+/// McGinley Dynamic, initialized at the first close. A nonpositive
+/// price/ratio or an invalid input breaks the recurrence until a new
+/// positive close seeds it.
+pub fn mcginley(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let mut out = vec![None; values.len()];
+    if period == 0 {
+        return out;
+    }
+    let mut state = McGinleyState::default();
+    for (slot, &value) in out.iter_mut().zip(values) {
+        *slot = Some(mcginley_step(&mut state, value, period).unwrap_or(f64::NAN));
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinearRegressionPoint {
+    pub curve: Option<f64>,
+    pub upper: Option<f64>,
+    pub lower: Option<f64>,
+}
+
+/// Rolling least-squares line evaluated at the current bar. Channel width is
+/// `deviation` times the population standard deviation of residuals inside
+/// that window (not the standard deviation of the price itself).
+pub fn linear_regression(
+    values: &[f64],
+    period: usize,
+    deviation: f64,
+) -> Vec<LinearRegressionPoint> {
+    let mut out = vec![
+        LinearRegressionPoint {
+            curve: None,
+            upper: None,
+            lower: None,
+        };
+        values.len()
+    ];
+    if period == 0 || !deviation.is_finite() || deviation < 0.0 {
+        return out;
+    }
+    for (row, slot) in out.iter_mut().enumerate().skip(period - 1) {
+        let (curve, upper, lower) = linear_regression_at(values, row, period, deviation);
+        *slot = LinearRegressionPoint {
+            curve: Some(curve),
+            upper: Some(upper),
+            lower: Some(lower),
+        };
+    }
+    out
+}
+
+/// Choppiness Index on the last `period` true ranges, requiring a prior close
+/// for the first range. A zero high/low span or a broken OHLC window is whitespace.
+pub fn choppiness(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<Option<f64>> {
+    let n = highs.len().min(lows.len()).min(closes.len());
+    let mut out = vec![None; n];
+    if period < 2 {
+        return out;
+    }
+    for (row, slot) in out.iter_mut().enumerate().skip(period) {
+        *slot = Some(choppiness_at(highs, lows, closes, row, period));
+    }
+    out
+}
+
+fn choppiness_at(highs: &[f64], lows: &[f64], closes: &[f64], row: usize, period: usize) -> f64 {
+    let start = row + 1 - period;
+    let mut highest = f64::NEG_INFINITY;
+    let mut lowest = f64::INFINITY;
+    let mut sum_tr = 0.0;
+    for index in start..=row {
+        let (high, low, close, previous) =
+            (highs[index], lows[index], closes[index], closes[index - 1]);
+        if !high.is_finite()
+            || !low.is_finite()
+            || !close.is_finite()
+            || !previous.is_finite()
+            || high < low
+        {
+            return f64::NAN;
+        }
+        highest = highest.max(high);
+        lowest = lowest.min(low);
+        sum_tr += (high - low)
+            .max((high - previous).abs())
+            .max((low - previous).abs());
+    }
+    let span = highest - lowest;
+    if span <= 0.0 || !span.is_finite() || !sum_tr.is_finite() || sum_tr <= 0.0 {
+        f64::NAN
+    } else {
+        (100.0 * (sum_tr / span).log10() / (period as f64).log10()).clamp(0.0, 100.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtrBandsPoint {
+    pub basis: Option<f64>,
+    pub upper: Option<f64>,
+    pub lower: Option<f64>,
+}
+
+/// Close-centered bands at `close ± multiplier × Wilder ATR`. Invalid OHLC
+/// breaks the ATR seed and the next valid run must warm up again.
+pub fn atr_bands(
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+    period: usize,
+    multiplier: f64,
+) -> Vec<AtrBandsPoint> {
+    let n = highs.len().min(lows.len()).min(closes.len());
+    let mut out = vec![
+        AtrBandsPoint {
+            basis: None,
+            upper: None,
+            lower: None
+        };
+        n
+    ];
+    if period == 0 || !multiplier.is_finite() || multiplier < 0.0 {
+        return out;
+    }
+    let mut state = AtrState::default();
+    for (row, slot) in out.iter_mut().enumerate() {
+        let atr = atr_bands_step(&mut state, highs[row], lows[row], closes[row], period);
+        if row >= period {
+            *slot = atr_bands_point(closes[row], atr, multiplier);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod choppiness_atr_bands_tests {
+    use super::*;
+
+    #[test]
+    fn empty_single_warmup_flat_and_gapped_ohlc() {
+        assert!(choppiness(&[], &[], &[], 3).is_empty());
+        assert!(atr_bands(&[], &[], &[], 3, 2.0).is_empty());
+        assert_eq!(choppiness(&[2.0], &[1.0], &[1.5], 2), [None]);
+        assert_eq!(atr_bands(&[2.0], &[1.0], &[1.5], 2, 2.0)[0].basis, None);
+
+        let highs = [2.0, 2.0, 2.0, 2.0];
+        let lows = [0.0; 4];
+        let closes = [1.0; 4];
+        // Each TR = 2, range = 2: 100 * log10(2) / log10(2).
+        assert_eq!(
+            choppiness(&highs, &lows, &closes, 2),
+            [None, None, Some(100.0), Some(100.0)]
+        );
+        let bands = atr_bands(&highs, &lows, &closes, 2, 1.5);
+        assert_eq!(bands[2].basis, Some(1.0));
+        assert_eq!(bands[2].upper, Some(4.0));
+        assert_eq!(bands[2].lower, Some(-2.0));
+        assert!(
+            choppiness(&[1.0; 4], &[1.0; 4], &[1.0; 4], 2)[2]
+                .unwrap()
+                .is_nan()
+        );
+
+        let highs = [2.0, 2.0, f64::NAN, 2.0, 2.0, 2.0, 2.0];
+        let chop = choppiness(&highs, &[0.0; 7], &[1.0; 7], 2);
+        assert!(chop[2..4].iter().all(|value| value.unwrap().is_nan()));
+        assert_eq!(chop[4], Some(100.0));
+        assert_eq!(chop[5], Some(100.0));
+        let bands = atr_bands(&highs, &[0.0; 7], &[1.0; 7], 2, 1.5);
+        assert!(
+            bands[2..5]
+                .iter()
+                .all(|point| point.upper.unwrap().is_nan())
+        );
+        assert_eq!(bands[5].upper, Some(4.0));
+    }
+}
+
+fn atr_bands_step(
+    state: &mut AtrState,
+    high: f64,
+    low: f64,
+    close: f64,
+    period: usize,
+) -> Option<f64> {
+    if !high.is_finite() || !low.is_finite() || !close.is_finite() || high < low {
+        *state = AtrState::default();
+        return None;
+    }
+    atr_step(state, AtrSample { high, low, close }, period)
+}
+
+fn atr_bands_point(close: f64, atr: Option<f64>, multiplier: f64) -> AtrBandsPoint {
+    let (basis, upper, lower) = match atr {
+        Some(atr) if atr.is_finite() => {
+            let spread = atr * multiplier;
+            (Some(close), Some(close + spread), Some(close - spread))
+        }
+        _ => (Some(f64::NAN), Some(f64::NAN), Some(f64::NAN)),
+    };
+    AtrBandsPoint {
+        basis,
+        upper,
+        lower,
+    }
+}
+
+fn linear_regression_at(
+    values: &[f64],
+    row: usize,
+    period: usize,
+    deviation: f64,
+) -> (f64, f64, f64) {
+    let window = &values[row + 1 - period..=row];
+    if window.iter().any(|value| !value.is_finite()) {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let n = period as f64;
+    let mean_x = (n - 1.0) * 0.5;
+    let mean_y = window.iter().sum::<f64>() / n;
+    let denominator = n * (n * n - 1.0) / 12.0;
+    let slope = if period == 1 {
+        0.0
+    } else {
+        window
+            .iter()
+            .enumerate()
+            .map(|(x, &y)| (x as f64 - mean_x) * (y - mean_y))
+            .sum::<f64>()
+            / denominator
+    };
+    let intercept = mean_y - slope * mean_x;
+    let curve = intercept + slope * (n - 1.0);
+    let variance = window
+        .iter()
+        .enumerate()
+        .map(|(x, &y)| {
+            let residual = y - (intercept + slope * x as f64);
+            residual * residual
+        })
+        .sum::<f64>()
+        / n;
+    let spread = variance.sqrt() * deviation;
+    (curve, curve + spread, curve - spread)
 }
 
 /// Exponential moving average using the standard SMA seed, followed by the EMA recurrence.
@@ -2093,6 +2532,61 @@ pub struct VolumeOscillatorPoint {
     pub histogram: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KlingerPoint {
+    pub line: Option<f64>,
+    pub signal: Option<f64>,
+}
+
+/// Klinger volume oscillator: EMA(fast) - EMA(slow) of signed volume force,
+/// and an EMA signal. The trend follows the change in high + low + close;
+/// cumulative measurement restarts when the trend reverses. Flat ranges
+/// contribute zero force. Invalid OHLCV rows restart both EMA seeds.
+pub fn klinger(
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+    volumes: &[f64],
+    fast: usize,
+    slow: usize,
+    signal: usize,
+) -> Vec<KlingerPoint> {
+    let n = highs
+        .len()
+        .min(lows.len())
+        .min(closes.len())
+        .min(volumes.len());
+    let mut out = vec![
+        KlingerPoint {
+            line: None,
+            signal: None
+        };
+        n
+    ];
+    if fast == 0 || slow == 0 || signal == 0 || fast >= slow {
+        return out;
+    }
+    let mut state = KlingerState::default();
+    let signal_start = slow.saturating_add(signal).saturating_sub(2);
+    for row in 0..n {
+        let (line, signal_value) = klinger_step(
+            &mut state,
+            highs[row],
+            lows[row],
+            closes[row],
+            volumes[row],
+            [fast, slow, signal],
+        );
+        if row + 1 >= slow {
+            out[row].line = Some(line.unwrap_or(f64::NAN));
+        }
+        if row >= signal_start {
+            out[row].signal = Some(signal_value.unwrap_or(f64::NAN));
+        }
+    }
+    out
+}
+
 /// Percentage Volume Oscillator with an EMA signal and line-minus-signal histogram.
 pub fn volume_oscillator(
     volumes: &[f64],
@@ -2239,6 +2733,108 @@ pub fn trix(values: &[f64], period: usize, signal_period: usize) -> Vec<TrixPoin
         }
         if row >= signal_start {
             point.signal = Some(signal.unwrap_or(f64::NAN));
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KstPoint {
+    pub line: Option<f64>,
+    pub signal: Option<f64>,
+}
+
+/// Know Sure Thing: 1:2:3:4 weighted SMAs of four percentage ROC series,
+/// with an SMA signal. Each unavailable ROC invalidates its whole smoothing window.
+pub fn kst(
+    closes: &[f64],
+    roc_periods: [usize; 4],
+    sma_periods: [usize; 4],
+    signal_period: usize,
+) -> Vec<KstPoint> {
+    let mut out = vec![
+        KstPoint {
+            line: None,
+            signal: None
+        };
+        closes.len()
+    ];
+    if roc_periods.contains(&0) || sma_periods.contains(&0) || signal_period == 0 {
+        return out;
+    }
+    let start = kst_line_start(roc_periods, sma_periods);
+    for (row, point) in out.iter_mut().enumerate().skip(start) {
+        point.line = Some(kst_at(closes, row, roc_periods, sma_periods));
+        if row >= start.saturating_add(signal_period - 1) {
+            let signal = (row + 1 - signal_period..=row)
+                .map(|index| kst_at(closes, index, roc_periods, sma_periods))
+                .fold(0.0, |sum, value| sum + value);
+            point.signal = Some(signal / signal_period as f64);
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TsiPoint {
+    pub line: Option<f64>,
+    pub signal: Option<f64>,
+}
+
+/// True Strength Index: double EMA of close momentum divided by double EMA of its
+/// absolute value, multiplied by 100, with an EMA signal. Flat momentum gives zero.
+pub fn tsi(closes: &[f64], long: usize, short: usize, signal_period: usize) -> Vec<TsiPoint> {
+    let mut out = vec![
+        TsiPoint {
+            line: None,
+            signal: None
+        };
+        closes.len()
+    ];
+    if long == 0 || short == 0 || signal_period == 0 {
+        return out;
+    }
+    let line_start = long.saturating_add(short).saturating_sub(1);
+    let mut state = TsiState::default();
+    for (row, point) in out.iter_mut().enumerate() {
+        let (line, signal) = tsi_step(&mut state, closes[row], long, short, signal_period);
+        if row >= line_start {
+            point.line = Some(line.unwrap_or(f64::NAN));
+        }
+        if row >= line_start.saturating_add(signal_period - 1) {
+            point.signal = Some(signal.unwrap_or(f64::NAN));
+        }
+    }
+    out
+}
+
+/// Sum of `sum_period` ratios of EMA(high-low) to its second EMA.
+pub fn mass_index(
+    highs: &[f64],
+    lows: &[f64],
+    ema_period: usize,
+    sum_period: usize,
+) -> Vec<Option<f64>> {
+    let n = highs.len().min(lows.len());
+    let mut out = vec![None; n];
+    if ema_period == 0 || sum_period == 0 {
+        return out;
+    }
+    let mut state = MassState::default();
+    let mut ratios = VecDeque::with_capacity(sum_period.min(n));
+    let start = mass_start(ema_period, sum_period);
+    for row in 0..n {
+        let ratio = mass_step(&mut state, highs[row], lows[row], ema_period);
+        ratios.push_back(ratio.unwrap_or(f64::NAN));
+        if ratios.len() > sum_period {
+            ratios.pop_front();
+        }
+        if row >= start {
+            out[row] = Some(if ratios.iter().all(|value| value.is_finite()) {
+                ratios.iter().sum()
+            } else {
+                f64::NAN
+            });
         }
     }
     out
@@ -2533,6 +3129,230 @@ fn trix_step(
         }
     });
     (line, signal)
+}
+
+fn kst_line_start(roc: [usize; 4], smooth: [usize; 4]) -> usize {
+    roc.into_iter()
+        .zip(smooth)
+        .map(|(roc, smooth)| roc.saturating_add(smooth.saturating_sub(1)))
+        .max()
+        .unwrap_or(0)
+}
+
+fn kst_at(closes: &[f64], row: usize, roc: [usize; 4], smooth: [usize; 4]) -> f64 {
+    let mut line = 0.0;
+    for (component, (lag, period)) in roc.into_iter().zip(smooth).enumerate() {
+        let mut sum = 0.0;
+        for index in row + 1 - period..=row {
+            let current = closes[index];
+            let previous = closes[index - lag];
+            if !current.is_finite() || !previous.is_finite() || previous == 0.0 {
+                return f64::NAN;
+            }
+            sum += 100.0 * (current / previous - 1.0);
+        }
+        line += (component + 1) as f64 * sum / period as f64;
+    }
+    line
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TsiState {
+    previous: Option<f64>,
+    momentum_long: EmaState,
+    momentum_short: EmaState,
+    absolute_long: EmaState,
+    absolute_short: EmaState,
+    signal: EmaState,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct KamaState {
+    seen: usize,
+    value: f64,
+}
+
+/// One KAMA step at `close`. `earlier` yields the closes before it, newest first; the step reads
+/// `period - 1` of them for the SMA seed and `period` afterwards, so a caller that skips
+/// whitespace rows in `earlier` evaluates the window over the rows that carry a sample. A
+/// non-finite close restarts the warm-up.
+fn kama_step(
+    state: &mut KamaState,
+    close: f64,
+    earlier: impl Iterator<Item = f64>,
+    period: usize,
+    fast: usize,
+    slow: usize,
+) -> Option<f64> {
+    if !close.is_finite() {
+        *state = KamaState::default();
+        return None;
+    }
+    state.seen = state.seen.saturating_add(1).min(period.saturating_add(1));
+    if state.seen < period {
+        return None;
+    }
+    if state.seen == period {
+        state.value = (earlier.take(period - 1).sum::<f64>() + close) / period as f64;
+    } else {
+        let mut newer = close;
+        let mut volatility = 0.0;
+        for value in earlier.take(period) {
+            volatility += (newer - value).abs();
+            newer = value;
+        }
+        let change = (close - newer).abs();
+        let efficiency = if volatility == 0.0 {
+            0.0
+        } else {
+            change / volatility
+        };
+        let smoothing = (efficiency * (2.0 / (fast as f64 + 1.0) - 2.0 / (slow as f64 + 1.0))
+            + 2.0 / (slow as f64 + 1.0))
+            .powi(2);
+        state.value += smoothing * (close - state.value);
+    }
+    Some(state.value)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct McGinleyState {
+    value: Option<f64>,
+}
+
+fn mcginley_step(state: &mut McGinleyState, close: f64, period: usize) -> Option<f64> {
+    if !close.is_finite() || close <= 0.0 {
+        state.value = None;
+        return None;
+    }
+    let value = match state.value {
+        Some(previous) => {
+            let denominator = period as f64 * (close / previous).powi(4);
+            previous + (close - previous) / denominator
+        }
+        None => close,
+    };
+    state.value = value.is_finite().then_some(value);
+    state.value
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct KlingerState {
+    previous_sum: Option<f64>,
+    previous_range: f64,
+    trend: f64,
+    cumulative: f64,
+    fast: EmaState,
+    slow: EmaState,
+    signal: EmaState,
+}
+
+fn klinger_step(
+    state: &mut KlingerState,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    periods: [usize; 3],
+) -> (Option<f64>, Option<f64>) {
+    let range = high - low;
+    let sum = high + low + close;
+    if !sum.is_finite() || !range.is_finite() || range < 0.0 || !volume.is_finite() || volume < 0.0
+    {
+        *state = KlingerState::default();
+        return (None, None);
+    }
+    let trend = state
+        .previous_sum
+        .map_or(1.0, |previous| if sum > previous { 1.0 } else { -1.0 });
+    state.cumulative = if state.previous_sum.is_some() && trend == state.trend {
+        state.cumulative + range
+    } else {
+        state.previous_range + range
+    };
+    state.previous_range = range;
+    state.previous_sum = Some(sum);
+    state.trend = trend;
+    let force = if state.cumulative == 0.0 {
+        0.0
+    } else {
+        volume * trend * 100.0 * (2.0 * range / state.cumulative - 1.0).abs()
+    };
+    let first = ema_step(&mut state.fast, force, periods[0], IndicatorSeed::Sma);
+    let second = ema_step(&mut state.slow, force, periods[1], IndicatorSeed::Sma);
+    let line = first.zip(second).map(|(first, second)| first - second);
+    let signal_value =
+        line.and_then(|line| ema_step(&mut state.signal, line, periods[2], IndicatorSeed::Sma));
+    (line, signal_value)
+}
+
+fn tsi_step(
+    state: &mut TsiState,
+    close: f64,
+    long: usize,
+    short: usize,
+    signal_period: usize,
+) -> (Option<f64>, Option<f64>) {
+    if !close.is_finite() {
+        *state = TsiState::default();
+        return (None, None);
+    }
+    let previous = state.previous.replace(close);
+    let Some(previous) = previous else {
+        return (None, None);
+    };
+    let momentum = close - previous;
+    if !momentum.is_finite() {
+        *state = TsiState::default();
+        return (None, None);
+    }
+    let numerator = ema_step(&mut state.momentum_long, momentum, long, IndicatorSeed::Sma)
+        .and_then(|sample| ema_step(&mut state.momentum_short, sample, short, IndicatorSeed::Sma));
+    let denominator = ema_step(
+        &mut state.absolute_long,
+        momentum.abs(),
+        long,
+        IndicatorSeed::Sma,
+    )
+    .and_then(|sample| ema_step(&mut state.absolute_short, sample, short, IndicatorSeed::Sma));
+    let line = numerator.zip(denominator).map(|(numerator, denominator)| {
+        if denominator == 0.0 {
+            0.0
+        } else {
+            (100.0 * (numerator / denominator)).clamp(-100.0, 100.0)
+        }
+    });
+    let signal =
+        line.and_then(|line| ema_step(&mut state.signal, line, signal_period, IndicatorSeed::Sma));
+    (line, signal)
+}
+
+fn mass_start(ema_period: usize, sum_period: usize) -> usize {
+    ema_period
+        .saturating_sub(1)
+        .saturating_mul(2)
+        .saturating_add(sum_period - 1)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MassState {
+    first: EmaState,
+    second: EmaState,
+}
+
+fn mass_step(state: &mut MassState, high: f64, low: f64, period: usize) -> Option<f64> {
+    let range = high - low;
+    if !range.is_finite() || range < 0.0 {
+        *state = MassState::default();
+        return None;
+    }
+    let first = ema_step(&mut state.first, range, period, IndicatorSeed::Sma)?;
+    let second = ema_step(&mut state.second, first, period, IndicatorSeed::Sma)?;
+    Some(if second == 0.0 {
+        f64::NAN
+    } else {
+        first / second
+    })
 }
 
 fn log_return(closes: &[f64], row: usize) -> f64 {
@@ -4457,6 +5277,53 @@ enum IncrementalKind {
         signal_period: usize,
         state: RecursiveHistory<TrixState>,
     },
+    Kst {
+        roc_periods: [usize; 4],
+        sma_periods: [usize; 4],
+        signal_period: usize,
+    },
+    Tsi {
+        long: usize,
+        short: usize,
+        signal_period: usize,
+        state: RecursiveHistory<TsiState>,
+    },
+    MassIndex {
+        ema_period: usize,
+        sum_period: usize,
+        state: RecursiveHistory<MassState>,
+        tail_ratios: Vec<f64>,
+        tail_pushed: bool,
+        source_len: usize,
+    },
+    Klinger {
+        fast: usize,
+        slow: usize,
+        signal: usize,
+        state: RecursiveHistory<KlingerState>,
+    },
+    Kama {
+        period: usize,
+        fast: usize,
+        slow: usize,
+        state: RecursiveHistory<KamaState>,
+    },
+    McGinley {
+        period: usize,
+        state: RecursiveHistory<McGinleyState>,
+    },
+    LinearRegression {
+        period: usize,
+        deviation: f64,
+    },
+    Choppiness {
+        period: usize,
+    },
+    AtrBands {
+        period: usize,
+        multiplier: f64,
+        state: RecursiveHistory<AtrState>,
+    },
     CoppockCurve {
         long_period: usize,
         short_period: usize,
@@ -4959,6 +5826,96 @@ impl IncrementalState {
         )
     }
 
+    pub fn kst(roc_periods: [usize; 4], sma_periods: [usize; 4], signal_period: usize) -> Self {
+        Self::new(
+            IncrementalKind::Kst {
+                roc_periods,
+                sma_periods,
+                signal_period,
+            },
+            2,
+        )
+    }
+
+    pub fn tsi(long: usize, short: usize, signal_period: usize) -> Self {
+        Self::new(
+            IncrementalKind::Tsi {
+                long,
+                short,
+                signal_period,
+                state: RecursiveHistory::new(),
+            },
+            2,
+        )
+    }
+
+    pub fn mass_index(ema_period: usize, sum_period: usize) -> Self {
+        Self::new(
+            IncrementalKind::MassIndex {
+                ema_period,
+                sum_period,
+                state: RecursiveHistory::new(),
+                tail_ratios: Vec::new(),
+                tail_pushed: false,
+                source_len: 0,
+            },
+            1,
+        )
+    }
+
+    pub fn klinger(fast: usize, slow: usize, signal: usize) -> Self {
+        Self::new(
+            IncrementalKind::Klinger {
+                fast,
+                slow,
+                signal,
+                state: RecursiveHistory::new(),
+            },
+            2,
+        )
+    }
+
+    pub fn kama(period: usize, fast: usize, slow: usize) -> Self {
+        Self::new(
+            IncrementalKind::Kama {
+                period,
+                fast,
+                slow,
+                state: RecursiveHistory::new(),
+            },
+            1,
+        )
+    }
+
+    pub fn mcginley(period: usize) -> Self {
+        Self::new(
+            IncrementalKind::McGinley {
+                period,
+                state: RecursiveHistory::new(),
+            },
+            1,
+        )
+    }
+
+    pub fn linear_regression(period: usize, deviation: f64) -> Self {
+        Self::new(IncrementalKind::LinearRegression { period, deviation }, 3)
+    }
+
+    pub fn choppiness(period: usize) -> Self {
+        Self::new(IncrementalKind::Choppiness { period }, 1)
+    }
+
+    pub fn atr_bands(period: usize, multiplier: f64) -> Self {
+        Self::new(
+            IncrementalKind::AtrBands {
+                period,
+                multiplier,
+                state: RecursiveHistory::new(),
+            },
+            3,
+        )
+    }
+
     pub fn coppock_curve(long_period: usize, short_period: usize, smoothing: usize) -> Self {
         Self::new(
             IncrementalKind::CoppockCurve {
@@ -4991,8 +5948,6 @@ impl IncrementalState {
         )
     }
 
-    // ponytail: Vortex has a runtime and whitespace coverage but no engine `IndicatorKind`, WASM
-    // or TS binding yet; bind it through the engine like the other breadth studies when needed.
     pub fn vortex(period: usize) -> Self {
         Self::new(IncrementalKind::Vortex { period }, 2)
     }
@@ -5075,7 +6030,8 @@ impl IncrementalState {
     /// rows needed for every seed's weight to fall below 0.1% (`(1 - alpha)^k < 0.001`), summed
     /// over chained stages as a conservative bound. `None` means no row count suffices: the value
     /// depends on a time anchor (VWAP, VWAP bands, pivots) or on the entire loaded path (OBV,
-    /// Accumulation/Distribution and Price Volume Trend levels, Parabolic SAR, SuperTrend, ZigZag).
+    /// Accumulation/Distribution and Price Volume Trend levels, Parabolic SAR, SuperTrend, ZigZag,
+    /// Klinger's trend-run measurement, McGinley's price-ratio smoothing).
     pub fn convergence_rows(&self, index: usize) -> Option<usize> {
         let warmup = self.warmup_rows(index);
         let seed_offset = |seed: IndicatorSeed, period: usize| match seed {
@@ -5183,6 +6139,27 @@ impl IncrementalState {
             IncrementalKind::FisherTransform { .. } => {
                 warmup + seed_decay_rows(0.33) + seed_decay_rows(0.5)
             }
+            IncrementalKind::Tsi {
+                long,
+                short,
+                signal_period,
+                ..
+            } => {
+                let line = warmup + ema_decay_rows(*long) + ema_decay_rows(*short);
+                if index == 0 {
+                    line
+                } else {
+                    line + ema_decay_rows(*signal_period)
+                }
+            }
+            IncrementalKind::MassIndex { ema_period, .. } => {
+                warmup + 2 * ema_decay_rows(*ema_period)
+            }
+            IncrementalKind::AtrBands { period, .. } => warmup + wilder_decay_rows(*period),
+            // The smoothing constant is at least the slow constant `2 / (slow + 1)`, squared.
+            IncrementalKind::Kama { slow, .. } => {
+                warmup + seed_decay_rows((2.0 / (*slow as f64 + 1.0)).powi(2))
+            }
             IncrementalKind::Vwap { .. }
             | IncrementalKind::VwapBands { .. }
             | IncrementalKind::PivotPoints { .. }
@@ -5191,7 +6168,11 @@ impl IncrementalState {
             | IncrementalKind::PriceVolumeTrend { .. }
             | IncrementalKind::ParabolicSar { .. }
             | IncrementalKind::SuperTrend { .. }
-            | IncrementalKind::ZigZag { .. } => return None,
+            | IncrementalKind::ZigZag { .. }
+            // Klinger's cumulative measurement restarts only on a trend reversal, and McGinley's
+            // smoothing depends on the price ratio, so neither has a row bound.
+            | IncrementalKind::Klinger { .. }
+            | IncrementalKind::McGinley { .. } => return None,
             IncrementalKind::Sma { .. }
             | IncrementalKind::Hma { .. }
             | IncrementalKind::Vwma { .. }
@@ -5222,7 +6203,10 @@ impl IncrementalState {
             | IncrementalKind::HistoricalVolatility { .. }
             | IncrementalKind::CoppockCurve { .. }
             | IncrementalKind::UltimateOscillator { .. }
-            | IncrementalKind::Vortex { .. } => warmup,
+            | IncrementalKind::Vortex { .. }
+            | IncrementalKind::Kst { .. }
+            | IncrementalKind::LinearRegression { .. }
+            | IncrementalKind::Choppiness { .. } => warmup,
             // A KLineChart indicator that smooths recursively, keeps a running total, or carries
             // a path state depends on every row loaded before it, so no row count makes it
             // independent of where the loaded history begins; a windowed one needs its warm-up.
@@ -5297,6 +6281,17 @@ impl IncrementalState {
             IncrementalKind::EaseOfMovement { .. } => 0,
             IncrementalKind::HistoricalVolatility { .. } => 0,
             IncrementalKind::Trix { state, .. } => state.bytes(),
+            IncrementalKind::Kst { .. } => 0,
+            IncrementalKind::Tsi { state, .. } => state.bytes(),
+            IncrementalKind::MassIndex {
+                state, tail_ratios, ..
+            } => state.bytes() + tail_ratios.capacity() * std::mem::size_of::<f64>(),
+            IncrementalKind::Klinger { state, .. } => state.bytes(),
+            IncrementalKind::Kama { state, .. } => state.bytes(),
+            IncrementalKind::McGinley { state, .. } => state.bytes(),
+            IncrementalKind::LinearRegression { .. } => 0,
+            IncrementalKind::Choppiness { .. } => 0,
+            IncrementalKind::AtrBands { state, .. } => state.bytes(),
             IncrementalKind::CoppockCurve { .. } => 0,
             IncrementalKind::FisherTransform { state, .. } => state.bytes(),
             IncrementalKind::UltimateOscillator { .. } => 0,
@@ -5411,7 +6406,10 @@ impl IncrementalState {
             | IncrementalKind::EaseOfMovement { .. }
             | IncrementalKind::HistoricalVolatility { .. }
             | IncrementalKind::CoppockCurve { .. }
-            | IncrementalKind::Vortex { .. } => {
+            | IncrementalKind::Vortex { .. }
+            | IncrementalKind::Kst { .. }
+            | IncrementalKind::LinearRegression { .. }
+            | IncrementalKind::Choppiness { .. } => {
                 Some(output_starts(&self.kind).into_iter().max().unwrap_or(0))
             }
             // The first output row reads one close before its longest window (the previous
@@ -5452,6 +6450,12 @@ impl IncrementalState {
             | IncrementalKind::ElderForce { .. }
             | IncrementalKind::Trix { .. }
             | IncrementalKind::FisherTransform { .. }
+            | IncrementalKind::Tsi { .. }
+            | IncrementalKind::MassIndex { .. }
+            | IncrementalKind::Klinger { .. }
+            | IncrementalKind::Kama { .. }
+            | IncrementalKind::McGinley { .. }
+            | IncrementalKind::AtrBands { .. }
             | IncrementalKind::VwapBands { .. }
             | IncrementalKind::KLineChart { .. } => None,
         }
@@ -6983,6 +7987,291 @@ impl IncrementalState {
                 }
                 state.finish(n, tail, before_tail);
             }
+            IncrementalKind::Kst {
+                roc_periods,
+                sma_periods,
+                signal_period,
+            } => {
+                let start = self.output_from[0];
+                self.last_work_rows = n - start;
+                for row in start..n {
+                    self.outputs[0].push(kst_at(input.close, row, *roc_periods, *sma_periods));
+                    if row >= self.output_from[1] {
+                        let signal = (row + 1 - *signal_period..=row)
+                            .map(|index| kst_at(input.close, index, *roc_periods, *sma_periods))
+                            .fold(0.0, |sum, value| sum + value);
+                        self.outputs[1].push(signal / *signal_period as f64);
+                    }
+                }
+            }
+            IncrementalKind::Tsi {
+                long,
+                short,
+                signal_period,
+                state,
+            } => {
+                let (start, mut accumulator) = state.begin(n, requested);
+                self.last_work_rows = n - start;
+                let mut tail = None;
+                let mut before_tail = None;
+                for row in start..n {
+                    let previous = accumulator;
+                    let (line, signal) = if whitespace_row(&input, row) {
+                        (None, None)
+                    } else {
+                        tsi_step(
+                            &mut accumulator,
+                            input.close[row],
+                            *long,
+                            *short,
+                            *signal_period,
+                        )
+                    };
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        self.outputs[0].push(line.unwrap_or(f64::NAN));
+                    }
+                    if row >= self.output_from[1] {
+                        self.outputs[1].push(signal.unwrap_or(f64::NAN));
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                    }
+                }
+                state.finish(n, tail, before_tail);
+            }
+            IncrementalKind::MassIndex {
+                ema_period,
+                sum_period,
+                state,
+                tail_ratios,
+                tail_pushed,
+                source_len,
+            } => {
+                // The sum spans the ratios of the last `sum_period` non-whitespace rows. A tail
+                // mutation resumes from the retained ratio window (the Stochastic `%K` pattern);
+                // anything else replays the `sum_period - 1` earlier ratios from a sparse EMA
+                // checkpoint, so no source-length ratio column is kept.
+                let realtime = state.resumes_at_tail(n, requested);
+                let state_from = if realtime {
+                    requested
+                } else {
+                    tail_window_replay_start(&input, requested, n, sum_period.saturating_sub(1))
+                };
+                let (start, mut accumulator) = state.begin(n, state_from);
+                debug_assert!(!realtime || start == requested);
+                self.last_work_rows = n - start;
+                let mut ratios = VecDeque::with_capacity(*sum_period);
+                if realtime {
+                    ratios.extend(tail_ratios.iter().copied());
+                    if requested + 1 == *source_len && *tail_pushed {
+                        ratios.pop_back();
+                    }
+                }
+                let mut tail = None;
+                let mut before_tail = None;
+                // Unchanged unless the last row is replayed.
+                let mut pushed_last = *tail_pushed;
+                for row in start..n {
+                    let previous = accumulator;
+                    let pushed = !whitespace_row(&input, row);
+                    if pushed {
+                        let ratio = mass_step(
+                            &mut accumulator,
+                            input.high[row],
+                            input.low[row],
+                            *ema_period,
+                        );
+                        ratios.push_back(ratio.unwrap_or(f64::NAN));
+                        if ratios.len() > *sum_period {
+                            ratios.pop_front();
+                        }
+                    }
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        self.outputs[0].push(
+                            if pushed
+                                && ratios.len() == *sum_period
+                                && ratios.iter().all(|value| value.is_finite())
+                            {
+                                ratios.iter().sum()
+                            } else {
+                                f64::NAN
+                            },
+                        );
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                        pushed_last = pushed;
+                    }
+                }
+                state.finish(n, tail, before_tail);
+                tail_ratios.clear();
+                tail_ratios.extend(ratios);
+                *tail_pushed = pushed_last;
+                *source_len = n;
+            }
+            IncrementalKind::Klinger {
+                fast,
+                slow,
+                signal,
+                state,
+            } => {
+                let (start, mut accumulator) = state.begin(n, requested);
+                self.last_work_rows = n - start;
+                let mut tail = None;
+                let mut before_tail = None;
+                for row in start..n {
+                    let previous = accumulator;
+                    // A row past the end of the volume column carries no volume: zero force.
+                    let (line, signal_value) = if whitespace_row(&input, row) {
+                        (None, None)
+                    } else {
+                        klinger_step(
+                            &mut accumulator,
+                            input.high[row],
+                            input.low[row],
+                            input.close[row],
+                            input.volume.get(row).copied().unwrap_or(0.0),
+                            [*fast, *slow, *signal],
+                        )
+                    };
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        self.outputs[0].push(line.unwrap_or(f64::NAN));
+                    }
+                    if row >= self.output_from[1] {
+                        self.outputs[1].push(signal_value.unwrap_or(f64::NAN));
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                    }
+                }
+                state.finish(n, tail, before_tail);
+            }
+            IncrementalKind::Kama {
+                period,
+                fast,
+                slow,
+                state,
+            } => {
+                let (start, mut accumulator) = state.begin(n, requested);
+                self.last_work_rows = n - start;
+                let mut tail = None;
+                let mut before_tail = None;
+                for row in start..n {
+                    let previous = accumulator;
+                    // The efficiency window spans the closes of the last non-whitespace rows.
+                    let value = (!whitespace_row(&input, row))
+                        .then(|| {
+                            kama_step(
+                                &mut accumulator,
+                                input.close[row],
+                                (0..row)
+                                    .rev()
+                                    .filter(|&index| !whitespace_row(&input, index))
+                                    .map(|index| input.close[index]),
+                                *period,
+                                *fast,
+                                *slow,
+                            )
+                        })
+                        .flatten();
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        self.outputs[0].push(value.unwrap_or(f64::NAN));
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                    }
+                }
+                state.finish(n, tail, before_tail);
+            }
+            IncrementalKind::McGinley { period, state } => {
+                let (start, mut accumulator) = state.begin(n, requested);
+                self.last_work_rows = n - start;
+                let mut tail = None;
+                let mut before_tail = None;
+                for row in start..n {
+                    let previous = accumulator;
+                    let value = (!whitespace_row(&input, row))
+                        .then(|| mcginley_step(&mut accumulator, input.close[row], *period))
+                        .flatten();
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        self.outputs[0].push(value.unwrap_or(f64::NAN));
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                    }
+                }
+                state.finish(n, tail, before_tail);
+            }
+            IncrementalKind::LinearRegression { period, deviation } => {
+                let start = self.output_from[0];
+                self.last_work_rows = n - start;
+                for row in start..n {
+                    let (curve, upper, lower) =
+                        linear_regression_at(input.close, row, *period, *deviation);
+                    self.outputs[0].push(curve);
+                    self.outputs[1].push(upper);
+                    self.outputs[2].push(lower);
+                }
+            }
+            IncrementalKind::Choppiness { period } => {
+                let start = self.output_from[0];
+                self.last_work_rows = n - start;
+                for row in start..n {
+                    self.outputs[0].push(choppiness_at(
+                        input.high,
+                        input.low,
+                        input.close,
+                        row,
+                        *period,
+                    ));
+                }
+            }
+            IncrementalKind::AtrBands {
+                period,
+                multiplier,
+                state,
+            } => {
+                let (start, mut accumulator) = state.begin(n, requested);
+                self.last_work_rows = n - start;
+                let mut tail = None;
+                let mut before_tail = None;
+                for row in start..n {
+                    let previous = accumulator;
+                    let atr = (!whitespace_row(&input, row))
+                        .then(|| {
+                            atr_bands_step(
+                                &mut accumulator,
+                                input.high[row],
+                                input.low[row],
+                                input.close[row],
+                                *period,
+                            )
+                        })
+                        .flatten();
+                    state.checkpoint(row, accumulator);
+                    if row >= self.output_from[0] {
+                        let point = atr_bands_point(input.close[row], atr, *multiplier);
+                        self.outputs[0].push(point.upper.unwrap_or(f64::NAN));
+                        self.outputs[1].push(point.basis.unwrap_or(f64::NAN));
+                        self.outputs[2].push(point.lower.unwrap_or(f64::NAN));
+                    }
+                    if row + 1 == n {
+                        tail = Some(accumulator);
+                        before_tail = (row > 0).then_some(previous);
+                    }
+                }
+                state.finish(n, tail, before_tail);
+            }
             IncrementalKind::CoppockCurve {
                 long_period,
                 short_period,
@@ -7309,6 +8598,52 @@ fn output_starts(kind: &IncrementalKind) -> [usize; MAX_OUTPUTS] {
                 0,
             ]
         }
+        IncrementalKind::Kst {
+            roc_periods,
+            sma_periods,
+            signal_period,
+        } => {
+            let line = kst_line_start(*roc_periods, *sma_periods);
+            [
+                line,
+                line.saturating_add(signal_period.saturating_sub(1)),
+                0,
+                0,
+                0,
+            ]
+        }
+        IncrementalKind::Tsi {
+            long,
+            short,
+            signal_period,
+            ..
+        } => {
+            let line = long.saturating_add(*short).saturating_sub(1);
+            [
+                line,
+                line.saturating_add(signal_period.saturating_sub(1)),
+                0,
+                0,
+                0,
+            ]
+        }
+        IncrementalKind::MassIndex {
+            ema_period,
+            sum_period,
+            ..
+        } => [mass_start(*ema_period, *sum_period), 0, 0, 0, 0],
+        IncrementalKind::Klinger { slow, signal, .. } => {
+            let line = slow.saturating_sub(1);
+            [line, line.saturating_add(signal.saturating_sub(1)), 0, 0, 0]
+        }
+        IncrementalKind::Kama { period, .. } => [period.saturating_sub(1), 0, 0, 0, 0],
+        IncrementalKind::McGinley { .. } => [0; MAX_OUTPUTS],
+        IncrementalKind::LinearRegression { period, .. } => {
+            let start = period.saturating_sub(1);
+            [start, start, start, 0, 0]
+        }
+        IncrementalKind::Choppiness { period } => [*period, 0, 0, 0, 0],
+        IncrementalKind::AtrBands { period, .. } => [*period, *period, *period, 0, 0],
         IncrementalKind::CoppockCurve {
             long_period,
             short_period,
@@ -8726,6 +10061,15 @@ mod tests {
         EaseOfMovement,
         HistoricalVolatility,
         Trix,
+        Kst,
+        Tsi,
+        MassIndex,
+        Klinger,
+        Kama,
+        McGinley,
+        LinearRegression,
+        Choppiness,
+        AtrBands,
         CoppockCurve,
         FisherTransform,
         UltimateOscillator,
@@ -8939,6 +10283,47 @@ mod tests {
                     points.iter().map(|point| point.signal).collect(),
                 ]
             }
+            TestKind::Kst => {
+                let points = kst(input.close, [2, 3, 4, 5], [2, 2, 2, 3], 3);
+                vec![
+                    points.iter().map(|point| point.line).collect(),
+                    points.iter().map(|point| point.signal).collect(),
+                ]
+            }
+            TestKind::Tsi => {
+                let points = tsi(input.close, 5, 3, 3);
+                vec![
+                    points.iter().map(|point| point.line).collect(),
+                    points.iter().map(|point| point.signal).collect(),
+                ]
+            }
+            TestKind::MassIndex => vec![mass_index(input.high, input.low, 3, 5)],
+            TestKind::Klinger => {
+                let points = klinger(input.high, input.low, input.close, input.volume, 3, 7, 4);
+                vec![
+                    points.iter().map(|point| point.line).collect(),
+                    points.iter().map(|point| point.signal).collect(),
+                ]
+            }
+            TestKind::Kama => vec![kama(input.close, 5, 2, 10)],
+            TestKind::McGinley => vec![mcginley(input.close, 5)],
+            TestKind::LinearRegression => {
+                let points = linear_regression(input.close, 5, 2.0);
+                vec![
+                    points.iter().map(|point| point.curve).collect(),
+                    points.iter().map(|point| point.upper).collect(),
+                    points.iter().map(|point| point.lower).collect(),
+                ]
+            }
+            TestKind::Choppiness => vec![choppiness(input.high, input.low, input.close, 5)],
+            TestKind::AtrBands => {
+                let points = atr_bands(input.high, input.low, input.close, 5, 2.0);
+                vec![
+                    points.iter().map(|point| point.upper).collect(),
+                    points.iter().map(|point| point.basis).collect(),
+                    points.iter().map(|point| point.lower).collect(),
+                ]
+            }
             TestKind::CoppockCurve => vec![coppock_curve(input.close, 7, 5, 3)],
             TestKind::FisherTransform => {
                 let points = fisher_transform(input.high, input.low, 5);
@@ -9047,6 +10432,69 @@ mod tests {
         }
     }
 
+    /// The fork whitespace rule against the dense formulas: a runtime over a source with whitespace
+    /// rows (NaN close, high or low) equals the dense formula over the same source with those rows
+    /// removed, with NaN at each whitespace row. The dense formulas themselves restart after a gap,
+    /// so a gapped source cannot be checked against them directly.
+    fn assert_incremental_matches_whitespace_removed(
+        states: &mut [(TestKind, IncrementalState)],
+        input: IndicatorInput<'_>,
+        from: usize,
+    ) {
+        let rows = input.close.len();
+        let valid = (0..rows)
+            .filter(|&row| !whitespace_row(&input, row))
+            .collect::<Vec<_>>();
+        assert!(valid.len() < rows, "the source carries whitespace");
+        let pick = |column: &[f64]| valid.iter().map(|&row| column[row]).collect::<Vec<_>>();
+        let times = valid
+            .iter()
+            .map(|&row| input.times[row])
+            .collect::<Vec<_>>();
+        let (open, high, low, close, volume) = (
+            pick(input.open),
+            pick(input.high),
+            pick(input.low),
+            pick(input.close),
+            pick(input.volume),
+        );
+        let compacted = IndicatorInput {
+            times: &times,
+            open: &open,
+            high: &high,
+            low: &low,
+            close: &close,
+            volume: &volume,
+            amount: &[],
+        };
+        for (kind, state) in states {
+            state.rebuild_from(input, from);
+            let expected = expected(*kind, compacted);
+            assert_eq!(state.output_count(), expected.len());
+            for (output, expected) in expected.iter().enumerate() {
+                let output_from = state.output_from(output);
+                assert_eq!(state.output(output).len(), rows - output_from);
+                for (offset, &actual) in state.output(output).iter().enumerate() {
+                    let row = output_from + offset;
+                    match valid
+                        .binary_search(&row)
+                        .ok()
+                        .and_then(|compact| expected[compact])
+                    {
+                        Some(expected) if !expected.is_nan() => assert!(
+                            (actual - expected).abs() < 1e-10,
+                            "output {output} row {row}: {actual} != {expected}"
+                        ),
+                        _ => assert!(
+                            actual.is_nan(),
+                            "output {output} row {row}: expected NaN, got {actual}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_runtime_mutation_matches_fresh_full_recomputation() {
         let mut states = vec![
@@ -9148,6 +10596,21 @@ mod tests {
                 IncrementalState::historical_volatility(5, 252.0),
             ),
             (TestKind::Trix, IncrementalState::trix(3, 4)),
+            (
+                TestKind::Kst,
+                IncrementalState::kst([2, 3, 4, 5], [2, 2, 2, 3], 3),
+            ),
+            (TestKind::Tsi, IncrementalState::tsi(5, 3, 3)),
+            (TestKind::MassIndex, IncrementalState::mass_index(3, 5)),
+            (TestKind::Klinger, IncrementalState::klinger(3, 7, 4)),
+            (TestKind::Kama, IncrementalState::kama(5, 2, 10)),
+            (TestKind::McGinley, IncrementalState::mcginley(5)),
+            (
+                TestKind::LinearRegression,
+                IncrementalState::linear_regression(5, 2.0),
+            ),
+            (TestKind::Choppiness, IncrementalState::choppiness(5)),
+            (TestKind::AtrBands, IncrementalState::atr_bands(5, 2.0)),
             (
                 TestKind::CoppockCurve,
                 IncrementalState::coppock_curve(7, 5, 3),
@@ -9290,7 +10753,216 @@ mod tests {
     }
 
     #[test]
-    fn i1_reference_fixture_covers_catalog_outputs() {
+    fn new_studies_repair_gaps_across_sparse_checkpoints() {
+        let mut states = [
+            (
+                TestKind::Kst,
+                IncrementalState::kst([2, 3, 4, 5], [2, 2, 2, 3], 3),
+            ),
+            (TestKind::Tsi, IncrementalState::tsi(5, 3, 3)),
+            (TestKind::MassIndex, IncrementalState::mass_index(3, 5)),
+            (TestKind::Klinger, IncrementalState::klinger(3, 7, 4)),
+            (TestKind::Kama, IncrementalState::kama(5, 2, 10)),
+            (TestKind::McGinley, IncrementalState::mcginley(5)),
+            (
+                TestKind::LinearRegression,
+                IncrementalState::linear_regression(5, 2.0),
+            ),
+            (TestKind::Choppiness, IncrementalState::choppiness(5)),
+            (TestKind::AtrBands, IncrementalState::atr_bands(5, 2.0)),
+            (TestKind::Vortex, IncrementalState::vortex(5)),
+        ];
+        let times = (0..1100).map(i64::from).collect::<Vec<_>>();
+        let mut close = (0..1100)
+            .map(|row| 100.0 + (row as f64 / 7.0).sin() * 4.0)
+            .collect::<Vec<_>>();
+        let mut high = close.iter().map(|value| value + 2.0).collect::<Vec<_>>();
+        let mut low = close.iter().map(|value| value - 2.0).collect::<Vec<_>>();
+        let volume = vec![1.0; 1100];
+        let check = |states: &mut [(TestKind, IncrementalState)],
+                     close: &[f64],
+                     high: &[f64],
+                     low: &[f64],
+                     from| {
+            assert_incremental_matches_full(
+                states,
+                IndicatorInput {
+                    times: &times,
+                    open: close,
+                    high,
+                    low,
+                    close,
+                    volume: &volume,
+                    amount: &[],
+                },
+                from,
+            );
+        };
+        check(&mut states, &close, &high, &low, 0);
+        close[1030] = f64::NAN;
+        high[1030] = f64::NAN;
+        low[1030] = f64::NAN;
+        // Fork whitespace rule: the gap row is absent, not a restart.
+        assert_incremental_matches_whitespace_removed(
+            &mut states,
+            IndicatorInput {
+                times: &times,
+                open: &close,
+                high: &high,
+                low: &low,
+                close: &close,
+                volume: &volume,
+                amount: &[],
+            },
+            1030,
+        );
+        close[1030] = 99.0;
+        high[1030] = 101.0;
+        low[1030] = 97.0;
+        check(&mut states, &close, &high, &low, 1030);
+        close[1099] += 3.0;
+        high[1099] += 3.0;
+        low[1099] += 3.0;
+        check(&mut states, &close, &high, &low, 1099);
+    }
+
+    #[test]
+    fn new_studies_handle_empty_short_gap_and_historical_correction() {
+        let mut states = [
+            (
+                TestKind::Kst,
+                IncrementalState::kst([2, 3, 4, 5], [2, 2, 2, 3], 3),
+            ),
+            (TestKind::Klinger, IncrementalState::klinger(3, 7, 4)),
+            (
+                TestKind::LinearRegression,
+                IncrementalState::linear_regression(5, 2.0),
+            ),
+            (TestKind::MassIndex, IncrementalState::mass_index(3, 5)),
+            (TestKind::Tsi, IncrementalState::tsi(5, 3, 3)),
+            (TestKind::Vortex, IncrementalState::vortex(5)),
+            (TestKind::Kama, IncrementalState::kama(5, 2, 10)),
+            (TestKind::McGinley, IncrementalState::mcginley(5)),
+            (TestKind::Choppiness, IncrementalState::choppiness(5)),
+            (TestKind::AtrBands, IncrementalState::atr_bands(5, 2.0)),
+        ];
+        let times = (0..48).map(i64::from).collect::<Vec<_>>();
+        let mut close = (0..48)
+            .map(|row| 100.0 + (row as f64 * 0.41).sin() * 3.0 + row as f64 * 0.1)
+            .collect::<Vec<_>>();
+        let mut high = close.iter().map(|value| value + 2.0).collect::<Vec<_>>();
+        let mut low = close.iter().map(|value| value - 1.5).collect::<Vec<_>>();
+        let mut volume = (0..48).map(|row| (row % 7 + 1) as f64).collect::<Vec<_>>();
+        let check = |states: &mut [(TestKind, IncrementalState)],
+                     len: usize,
+                     close: &[f64],
+                     high: &[f64],
+                     low: &[f64],
+                     volume: &[f64],
+                     from: usize| {
+            assert_incremental_matches_full(
+                states,
+                IndicatorInput {
+                    times: &times[..len],
+                    open: &close[..len],
+                    high: &high[..len],
+                    low: &low[..len],
+                    close: &close[..len],
+                    volume: &volume[..len],
+                    amount: &[],
+                },
+                from,
+            );
+        };
+        // Fork whitespace rule while the gap is open: the gap row is absent, not a restart.
+        let check_gap = |states: &mut [(TestKind, IncrementalState)],
+                         close: &[f64],
+                         high: &[f64],
+                         low: &[f64],
+                         volume: &[f64],
+                         from: usize| {
+            assert_incremental_matches_whitespace_removed(
+                states,
+                IndicatorInput {
+                    times: &times,
+                    open: close,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    amount: &[],
+                },
+                from,
+            );
+        };
+
+        check(&mut states, 0, &close, &high, &low, &volume, 0);
+        for (_, state) in &states {
+            for output in 0..state.output_count() {
+                assert!(state.output(output).is_empty());
+            }
+        }
+
+        check(&mut states, 1, &close, &high, &low, &volume, 0);
+        for (kind, state) in &states {
+            for output in 0..state.output_count() {
+                if matches!(kind, TestKind::McGinley) {
+                    assert!(
+                        state.output(output)[0].is_finite(),
+                        "McGinley seeds at the first close"
+                    );
+                } else {
+                    assert!(
+                        state.output(output).iter().all(|value| value.is_nan()),
+                        "one-bar warmup must be blank"
+                    );
+                }
+            }
+        }
+
+        check(&mut states, 4, &close, &high, &low, &volume, 1);
+        for (kind, state) in &states {
+            for output in 0..state.output_count() {
+                if matches!(kind, TestKind::McGinley) {
+                    assert!(state.output(output).iter().all(|value| value.is_finite()));
+                } else {
+                    assert!(state.output(output).iter().all(|value| value.is_nan()));
+                }
+            }
+        }
+
+        check(&mut states, 48, &close, &high, &low, &volume, 4);
+        let gap = 24;
+        close[gap] = f64::NAN;
+        high[gap] = f64::NAN;
+        low[gap] = f64::NAN;
+        volume[gap] = f64::NAN;
+        check_gap(&mut states, &close, &high, &low, &volume, gap);
+        for (_, state) in &states {
+            for output in 0..state.output_count() {
+                let from = state.output_from(output);
+                assert!(
+                    state.output(output)[gap - from].is_nan(),
+                    "gap row must be blank"
+                );
+            }
+        }
+
+        close[7] += 5.0;
+        high[7] = close[7] + 2.0;
+        low[7] = close[7] - 1.5;
+        volume[7] += 4.0;
+        check_gap(&mut states, &close, &high, &low, &volume, 7);
+
+        close[gap] = 102.0;
+        high[gap] = 104.0;
+        low[gap] = 100.5;
+        volume[gap] = 6.0;
+        check(&mut states, 48, &close, &high, &low, &volume, gap);
+    }
+
+    #[test]
+    fn i1_and_i2_reference_fixture_covers_catalog_outputs() {
         // These values are a fixed external reference fixture. The assertions intentionally do
         // not call the dense formula functions, so a shared implementation defect cannot make
         // the incremental and reference paths agree by construction.
@@ -9329,6 +11001,277 @@ mod tests {
                     "{label}: {actual} != {expected}"
                 );
             };
+
+        // Independently calculated from the fixture OHLCV rows (not from dense indicator
+        // implementations). Short KST windows keep both its line and signal within 60 rows.
+        assert_final("Aroon up", IncrementalState::aroon(5), 0, 0.0);
+        assert_final("Aroon down", IncrementalState::aroon(5), 1, 60.0);
+        assert_final(
+            "Awesome Oscillator",
+            IncrementalState::awesome_oscillator(),
+            0,
+            -1.536797362138088,
+        );
+        assert_final(
+            "Chande Momentum",
+            IncrementalState::chande_momentum(5),
+            0,
+            -48.19370754205317,
+        );
+        assert_final(
+            "Chaikin Oscillator",
+            IncrementalState::chaikin_oscillator(3, 6),
+            0,
+            -8.099183009038654,
+        );
+        assert_final(
+            "Coppock Curve",
+            IncrementalState::coppock_curve(6, 3, 4),
+            0,
+            -9.41909313330223,
+        );
+        assert_final("DPO", IncrementalState::dpo(5), 0, -0.2351633003471107);
+        assert_final(
+            "Elder Force",
+            IncrementalState::elder_force(5),
+            0,
+            31.96442399619355,
+        );
+        assert_final(
+            "Ease of Movement",
+            IncrementalState::ease_of_movement(5, 1.0),
+            0,
+            -0.1166970104225895,
+        );
+        assert_final(
+            "Fisher line",
+            IncrementalState::fisher_transform(5),
+            0,
+            -0.6891408918939269,
+        );
+        assert_final(
+            "Fisher trigger",
+            IncrementalState::fisher_transform(5),
+            1,
+            -0.7700306869497627,
+        );
+        assert_final(
+            "Historical Volatility",
+            IncrementalState::historical_volatility(5, 252.0),
+            0,
+            33.55558767101923,
+        );
+        assert_final(
+            "KST line",
+            IncrementalState::kst([2, 3, 4, 5], [2, 3, 4, 5], 3),
+            0,
+            -45.15601171260293,
+        );
+        assert_final(
+            "KST signal",
+            IncrementalState::kst([2, 3, 4, 5], [2, 3, 4, 5], 3),
+            1,
+            -40.42890476968924,
+        );
+        assert_final(
+            "Klinger line",
+            IncrementalState::klinger(3, 6, 4),
+            0,
+            376.5561190129093,
+        );
+        assert_final(
+            "Klinger signal",
+            IncrementalState::klinger(3, 6, 4),
+            1,
+            -185.2666012083956,
+        );
+        assert_final(
+            "Regression curve",
+            IncrementalState::linear_regression(5, 2.0),
+            0,
+            100.4888887275999,
+        );
+        assert_final(
+            "Regression upper",
+            IncrementalState::linear_regression(5, 2.0),
+            1,
+            103.2854271400926,
+        );
+        assert_final(
+            "Regression lower",
+            IncrementalState::linear_regression(5, 2.0),
+            2,
+            97.69235031510719,
+        );
+        assert_final("Mass Index", IncrementalState::mass_index(5, 5), 0, 5.0);
+        assert_final(
+            "Ultimate Oscillator",
+            IncrementalState::ultimate_oscillator(3, 5, 7),
+            0,
+            45.65847840650458,
+        );
+        assert_final(
+            "TRIX line",
+            IncrementalState::trix(5, 3),
+            0,
+            -0.409962754833737,
+        );
+        assert_final(
+            "TRIX signal",
+            IncrementalState::trix(5, 3),
+            1,
+            -0.280666792016231,
+        );
+        assert_final(
+            "TSI line",
+            IncrementalState::tsi(5, 3, 3),
+            0,
+            -26.580720443143,
+        );
+        assert_final(
+            "TSI signal",
+            IncrementalState::tsi(5, 3, 3),
+            1,
+            -36.46784062557349,
+        );
+        assert_final(
+            "Vortex +VI",
+            IncrementalState::vortex(5),
+            0,
+            0.5579692505882866,
+        );
+        assert_final(
+            "Vortex -VI",
+            IncrementalState::vortex(5),
+            1,
+            1.038943112552389,
+        );
+        assert_final(
+            "Envelope SMA upper",
+            IncrementalState::envelopes(5, 2.0, false),
+            0,
+            103.4371031507486,
+        );
+        assert_final(
+            "Envelope SMA basis",
+            IncrementalState::envelopes(5, 2.0, false),
+            1,
+            101.4089246575966,
+        );
+        assert_final(
+            "Envelope SMA lower",
+            IncrementalState::envelopes(5, 2.0, false),
+            2,
+            99.38074616444469,
+        );
+        assert_final(
+            "Envelope EMA upper",
+            IncrementalState::envelopes(5, 2.0, true),
+            0,
+            104.0025555497179,
+        );
+        assert_final(
+            "Envelope EMA basis",
+            IncrementalState::envelopes(5, 2.0, true),
+            1,
+            101.9632897546254,
+        );
+        assert_final(
+            "Envelope EMA lower",
+            IncrementalState::envelopes(5, 2.0, true),
+            2,
+            99.92402395953289,
+        );
+        assert_final(
+            "ALMA",
+            IncrementalState::alma(5, 0.85, 6.0),
+            0,
+            100.8775648482768,
+        );
+        assert_final(
+            "KAMA",
+            IncrementalState::kama(5, 2, 30),
+            0,
+            101.9160311331937,
+        );
+        assert_final(
+            "McGinley",
+            IncrementalState::mcginley(5),
+            0,
+            102.2960315743182,
+        );
+        assert_final(
+            "Choppiness",
+            IncrementalState::choppiness(5),
+            0,
+            55.5975026457025,
+        );
+        assert_final(
+            "Bollinger %B",
+            IncrementalState::bollinger_metrics(5, 2.0),
+            0,
+            0.6276163411758227,
+        );
+        assert_final(
+            "Bollinger BandWidth",
+            IncrementalState::bollinger_metrics(5, 2.0),
+            1,
+            6.083105287510145,
+        );
+        assert_final(
+            "ATR bands upper",
+            IncrementalState::atr_bands(5, 2.0),
+            0,
+            108.6787277996608,
+        );
+        assert_final(
+            "ATR bands basis",
+            IncrementalState::atr_bands(5, 2.0),
+            1,
+            102.19616583077465,
+        );
+        assert_final(
+            "ATR bands lower",
+            IncrementalState::atr_bands(5, 2.0),
+            2,
+            95.71360386188844,
+        );
+        assert_final(
+            "Accumulation/Distribution",
+            IncrementalState::accumulation_distribution(),
+            0,
+            -349.2000000000132,
+        );
+        assert_final(
+            "Price Volume Trend",
+            IncrementalState::price_volume_trend(),
+            0,
+            -4.062813009843773,
+        );
+        assert_final(
+            "Volume Oscillator line",
+            IncrementalState::volume_oscillator(3, 6, 4),
+            0,
+            8.09094542282349,
+        );
+        assert_final(
+            "Volume Oscillator signal",
+            IncrementalState::volume_oscillator(3, 6, 4),
+            1,
+            -1.079470318694398,
+        );
+        assert_final(
+            "Volume Oscillator histogram",
+            IncrementalState::volume_oscillator(3, 6, 4),
+            2,
+            9.170415741517887,
+        );
+        assert_final(
+            "Relative Volume",
+            IncrementalState::relative_volume(5),
+            0,
+            2.0,
+        );
 
         assert_final("SMA", IncrementalState::sma(5), 0, 101.40892465759661);
         assert_final("EMA", IncrementalState::ema(5), 0, 101.96328975462541);
@@ -9803,6 +11746,18 @@ mod tests {
                 IncrementalState::ultimate_oscillator(3, 5, 8),
             ),
             ("vortex", IncrementalState::vortex(5)),
+            ("kst", IncrementalState::kst([2, 3, 4, 5], [2, 2, 2, 3], 3)),
+            ("tsi", IncrementalState::tsi(5, 3, 3)),
+            ("mass_index", IncrementalState::mass_index(3, 5)),
+            ("klinger", IncrementalState::klinger(3, 7, 4)),
+            ("kama", IncrementalState::kama(5, 2, 10)),
+            ("mcginley", IncrementalState::mcginley(5)),
+            (
+                "linear_regression",
+                IncrementalState::linear_regression(5, 2.0),
+            ),
+            ("choppiness", IncrementalState::choppiness(5)),
+            ("atr_bands", IncrementalState::atr_bands(5, 2.0)),
         ];
         states.extend(
             klinechart_whitespace_templates()
@@ -10081,6 +12036,37 @@ mod tests {
             columns.volume.push(pick((row % 6 + 1) as f64 * 10.0));
         }
         columns
+    }
+
+    #[test]
+    fn mass_index_repair_replays_its_ratio_window_over_rows_that_carry_a_sample() {
+        // A sparse checkpoint sits at row 1023 and whitespace fills rows 1024..=1027, so the
+        // five-ratio window of a correction at row 1030 reaches back past that checkpoint only
+        // when it is counted in rows that carry a sample.
+        let rows = 1100;
+        let blank = [1024, 1025, 1026, 1027];
+        let mut state = IncrementalState::mass_index(3, 5);
+        state.rebuild_from(whitespace_columns(rows, &blank).input(rows), 0);
+        let mut edited = whitespace_columns(rows, &blank);
+        edited.high[1030] += 1.5;
+        state.rebuild_from(edited.input(rows), 1030);
+        let mut full = IncrementalState::mass_index(3, 5);
+        full.rebuild_from(edited.input(rows), 0);
+        let from = state.output_from(0);
+        assert_eq!(from, 1030);
+        for (offset, (&actual, &expected)) in state
+            .output(0)
+            .iter()
+            .zip(&full.output(0)[from - full.output_from(0)..])
+            .enumerate()
+        {
+            assert!(
+                (actual.is_nan() && expected.is_nan()) || (actual - expected).abs() < 1e-12,
+                "row {}: {actual} != {expected}",
+                from + offset
+            );
+        }
+        assert!(state.output(0)[0].is_finite());
     }
 
     #[test]
@@ -10507,6 +12493,10 @@ mod tests {
             ("elder_force", IncrementalState::elder_force(13)),
             ("trix", IncrementalState::trix(15, 9)),
             ("fisher_transform", IncrementalState::fisher_transform(10)),
+            ("tsi", IncrementalState::tsi(25, 13, 13)),
+            ("atr_bands", IncrementalState::atr_bands(14, 2.0)),
+            // A slow constant of 10 keeps KAMA's (2/11)² bound inside the fixture.
+            ("kama", IncrementalState::kama(10, 2, 10)),
         ];
         for (label, mut state) in kinds {
             let shifted = run(&mut state.clone(), 5.0);
@@ -10612,6 +12602,27 @@ mod tests {
             [(0, None)]
         );
         assert_eq!(rows(IncrementalState::price_volume_trend()), [(0, None)]);
+        // The breadth completion: windows converge at their warm-up, Mass Index after two EMA
+        // decays, and Klinger's trend runs and McGinley's price-ratio smoothing never.
+        assert_eq!(
+            rows(IncrementalState::kst([10, 15, 20, 30], [10, 10, 10, 15], 9)),
+            [(44, Some(44)), (52, Some(52))]
+        );
+        assert_eq!(rows(IncrementalState::choppiness(14)), [(14, Some(14))]);
+        assert_eq!(
+            rows(IncrementalState::linear_regression(20, 2.0)),
+            [(19, Some(19)); 3]
+        );
+        assert_eq!(
+            rows(IncrementalState::vortex(14)),
+            [(14, Some(14)), (14, Some(14))]
+        );
+        assert_eq!(rows(IncrementalState::mass_index(9, 25)), [(40, Some(102))]);
+        assert_eq!(
+            rows(IncrementalState::klinger(34, 55, 13)),
+            [(54, None), (66, None)]
+        );
+        assert_eq!(rows(IncrementalState::mcginley(14)), [(0, None)]);
 
         // The horizon is exactly where a first-value seed's weight drops below 0.1%: perturbing
         // the first sample by 100 moves the EMA by less than 0.1 from that row on.

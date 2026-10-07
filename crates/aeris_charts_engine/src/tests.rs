@@ -190,6 +190,10 @@ fn financial_product_compatibility_fixture_survives_shared_frame_mutations() {
     assert!(chart.add_accumulation_distribution(0, histogram).is_some());
     assert!(chart.add_price_volume_trend(0, histogram).is_some());
     assert!(chart.add_chaikin_oscillator(0, histogram, 3, 10).is_some());
+    assert_eq!(chart.add_klinger(0, histogram, 3, 10, 4).len(), 2);
+    assert!(chart.add_kama(0, 10, 2, 30).is_some());
+    assert!(chart.add_mcginley(0, 10).is_some());
+    assert_eq!(chart.add_linear_regression(0, 10, 2.0).len(), 3);
     assert!(chart.add_relative_volume(0, histogram, 5).is_some());
     assert!(chart.add_elder_force(0, histogram, 5).is_some());
     assert!(chart.add_ease_of_movement(0, histogram, 5, 100.0).is_some());
@@ -256,6 +260,21 @@ fn financial_product_compatibility_fixture_survives_shared_frame_mutations() {
             IndicatorKind::AccumulationDistribution,
             IndicatorKind::PriceVolumeTrend,
             IndicatorKind::ChaikinOscillator { fast: 3, slow: 10 },
+            IndicatorKind::Klinger {
+                fast: 3,
+                slow: 10,
+                signal: 4,
+            },
+            IndicatorKind::Kama {
+                period: 10,
+                fast: 2,
+                slow: 30,
+            },
+            IndicatorKind::McGinley { period: 10 },
+            IndicatorKind::LinearRegression {
+                period: 10,
+                deviation: 2.0,
+            },
             IndicatorKind::RelativeVolume { period: 5 },
             IndicatorKind::ElderForce { period: 5 },
             IndicatorKind::EaseOfMovement {
@@ -1948,6 +1967,7 @@ fn add_test_indicator(
                 | IndicatorKind::AccumulationDistribution
                 | IndicatorKind::PriceVolumeTrend
                 | IndicatorKind::ChaikinOscillator { .. }
+                | IndicatorKind::Klinger { .. }
                 | IndicatorKind::RelativeVolume { .. }
                 | IndicatorKind::ElderForce { .. }
                 | IndicatorKind::EaseOfMovement { .. }
@@ -2012,6 +2032,70 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
             vec![
                 points.iter().map(|point| point.line).collect(),
                 points.iter().map(|point| point.signal).collect(),
+            ]
+        }
+        IndicatorKind::Kst {
+            roc,
+            smoothing,
+            signal,
+        } => {
+            let points = aeris_charts_indicators::kst(source[3], roc, smoothing, signal);
+            vec![
+                points.iter().map(|point| point.line).collect(),
+                points.iter().map(|point| point.signal).collect(),
+            ]
+        }
+        IndicatorKind::Kama { period, fast, slow } => {
+            vec![aeris_charts_indicators::kama(source[3], period, fast, slow)]
+        }
+        IndicatorKind::McGinley { period } => {
+            vec![aeris_charts_indicators::mcginley(source[3], period)]
+        }
+        IndicatorKind::LinearRegression { period, deviation } => {
+            let points = aeris_charts_indicators::linear_regression(source[3], period, deviation);
+            vec![
+                points.iter().map(|point| point.curve).collect(),
+                points.iter().map(|point| point.upper).collect(),
+                points.iter().map(|point| point.lower).collect(),
+            ]
+        }
+        IndicatorKind::Choppiness { period } => {
+            vec![aeris_charts_indicators::choppiness(
+                source[1], source[2], source[3], period,
+            )]
+        }
+        IndicatorKind::AtrBands { period, multiplier } => {
+            let points = aeris_charts_indicators::atr_bands(
+                source[1], source[2], source[3], period, multiplier,
+            );
+            vec![
+                points.iter().map(|point| point.upper).collect(),
+                points.iter().map(|point| point.basis).collect(),
+                points.iter().map(|point| point.lower).collect(),
+            ]
+        }
+        IndicatorKind::Tsi {
+            long,
+            short,
+            signal,
+        } => {
+            let points = aeris_charts_indicators::tsi(source[3], long, short, signal);
+            vec![
+                points.iter().map(|point| point.line).collect(),
+                points.iter().map(|point| point.signal).collect(),
+            ]
+        }
+        IndicatorKind::MassIndex {
+            ema_period,
+            sum_period,
+        } => vec![aeris_charts_indicators::mass_index(
+            source[1], source[2], ema_period, sum_period,
+        )],
+        IndicatorKind::Vortex { period } => {
+            let points = aeris_charts_indicators::vortex(source[1], source[2], source[3], period);
+            vec![
+                points.iter().map(|point| point.plus).collect(),
+                points.iter().map(|point| point.minus).collect(),
             ]
         }
         IndicatorKind::CoppockCurve {
@@ -2232,6 +2316,7 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
         | IndicatorKind::AccumulationDistribution
         | IndicatorKind::PriceVolumeTrend
         | IndicatorKind::ChaikinOscillator { .. }
+        | IndicatorKind::Klinger { .. }
         | IndicatorKind::RelativeVolume { .. }
         | IndicatorKind::ElderForce { .. }
         | IndicatorKind::EaseOfMovement { .. }
@@ -2260,6 +2345,14 @@ pub(crate) fn assert_indicator_binding_matches_full(chart: &ChartEngine, binding
                     points.iter().map(|point| point.line).collect(),
                     points.iter().map(|point| point.signal).collect(),
                     points.iter().map(|point| point.histogram).collect(),
+                ]
+            } else if let IndicatorKind::Klinger { fast, slow, signal } = binding.kind {
+                let points = aeris_charts_indicators::klinger(
+                    source[1], source[2], source[3], &volume, fast, slow, signal,
+                );
+                vec![
+                    points.iter().map(|point| point.line).collect(),
+                    points.iter().map(|point| point.signal).collect(),
                 ]
             } else if let IndicatorKind::ElderForce { period } = binding.kind {
                 vec![aeris_charts_indicators::elder_force(
@@ -2608,6 +2701,26 @@ fn every_indicator_engine_path_matches_full_recomputation() {
         IndicatorKind::AccumulationDistribution,
         IndicatorKind::PriceVolumeTrend,
         IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 },
+        IndicatorKind::Klinger {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
+        IndicatorKind::Kama {
+            period: 5,
+            fast: 2,
+            slow: 10,
+        },
+        IndicatorKind::McGinley { period: 5 },
+        IndicatorKind::LinearRegression {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Choppiness { period: 5 },
+        IndicatorKind::AtrBands {
+            period: 5,
+            multiplier: 2.0,
+        },
         IndicatorKind::RelativeVolume { period: 5 },
         IndicatorKind::ElderForce { period: 5 },
         IndicatorKind::EaseOfMovement {
@@ -2622,6 +2735,21 @@ fn every_indicator_engine_path_matches_full_recomputation() {
             period: 3,
             signal: 4,
         },
+        IndicatorKind::Kst {
+            roc: [2, 3, 4, 5],
+            smoothing: [2, 3, 2, 3],
+            signal: 3,
+        },
+        IndicatorKind::Tsi {
+            long: 5,
+            short: 3,
+            signal: 4,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 3,
+            sum_period: 5,
+        },
+        IndicatorKind::Vortex { period: 5 },
         IndicatorKind::CoppockCurve {
             long: 7,
             short: 5,
@@ -2889,6 +3017,41 @@ fn every_indicator_kind() -> Vec<IndicatorKind> {
             medium: 5,
             long: 7,
         },
+        IndicatorKind::Kst {
+            roc: [2, 3, 4, 5],
+            smoothing: [2, 2, 2, 3],
+            signal: 3,
+        },
+        IndicatorKind::Tsi {
+            long: 5,
+            short: 3,
+            signal: 3,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 3,
+            sum_period: 5,
+        },
+        IndicatorKind::Klinger {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
+        IndicatorKind::Kama {
+            period: 5,
+            fast: 2,
+            slow: 10,
+        },
+        IndicatorKind::McGinley { period: 5 },
+        IndicatorKind::LinearRegression {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Choppiness { period: 5 },
+        IndicatorKind::AtrBands {
+            period: 5,
+            multiplier: 2.0,
+        },
+        IndicatorKind::Vortex { period: 5 },
         IndicatorKind::VolumeOscillator {
             fast: 3,
             slow: 7,
@@ -2977,6 +3140,11 @@ fn volume_studies_weight_source_bars_missing_from_the_volume_series_as_zero() {
             period: 5,
             divisor: 100.0,
         },
+        IndicatorKind::Klinger {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
     ] {
         let sparse = install(&kind, true);
         let zeros = install(&kind, false);
@@ -3038,6 +3206,7 @@ fn indicator_reads_volume(kind: &IndicatorKind) -> bool {
             | IndicatorKind::AccumulationDistribution
             | IndicatorKind::PriceVolumeTrend
             | IndicatorKind::ChaikinOscillator { .. }
+            | IndicatorKind::Klinger { .. }
             | IndicatorKind::RelativeVolume { .. }
             | IndicatorKind::VolumeOscillator { .. }
             | IndicatorKind::ElderForce { .. }
@@ -3839,6 +4008,26 @@ fn batch_and_single_updates_are_semantically_identical_for_every_indicator() {
         IndicatorKind::AccumulationDistribution,
         IndicatorKind::PriceVolumeTrend,
         IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 },
+        IndicatorKind::Klinger {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
+        IndicatorKind::Kama {
+            period: 5,
+            fast: 2,
+            slow: 10,
+        },
+        IndicatorKind::McGinley { period: 5 },
+        IndicatorKind::LinearRegression {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Choppiness { period: 5 },
+        IndicatorKind::AtrBands {
+            period: 5,
+            multiplier: 2.0,
+        },
         IndicatorKind::RelativeVolume { period: 5 },
         IndicatorKind::ElderForce { period: 5 },
         IndicatorKind::EaseOfMovement {
@@ -3853,6 +4042,21 @@ fn batch_and_single_updates_are_semantically_identical_for_every_indicator() {
             period: 3,
             signal: 4,
         },
+        IndicatorKind::Kst {
+            roc: [2, 3, 4, 5],
+            smoothing: [2, 3, 2, 3],
+            signal: 3,
+        },
+        IndicatorKind::Tsi {
+            long: 5,
+            short: 3,
+            signal: 4,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 3,
+            sum_period: 5,
+        },
+        IndicatorKind::Vortex { period: 5 },
         IndicatorKind::CoppockCurve {
             long: 7,
             short: 5,
@@ -5224,6 +5428,49 @@ fn generic_indicator_creation_rejects_invalid_definitions_atomically() {
             )
             .is_empty()
     );
+    for kind in [
+        IndicatorKind::Kst {
+            roc: [2, 0, 4, 5],
+            smoothing: [2, 3, 4, 5],
+            signal: 2,
+        },
+        IndicatorKind::Kst {
+            roc: [2, 3, 4, 5],
+            smoothing: [2, 3, 0, 5],
+            signal: 2,
+        },
+        IndicatorKind::Kst {
+            roc: [2, 3, 4, 5],
+            smoothing: [2, 3, 4, 5],
+            signal: 0,
+        },
+        IndicatorKind::Tsi {
+            long: 0,
+            short: 3,
+            signal: 2,
+        },
+        IndicatorKind::Tsi {
+            long: 5,
+            short: 0,
+            signal: 2,
+        },
+        IndicatorKind::Tsi {
+            long: 5,
+            short: 3,
+            signal: 0,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 0,
+            sum_period: 5,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 3,
+            sum_period: 0,
+        },
+        IndicatorKind::Vortex { period: 0 },
+    ] {
+        assert!(chart.add_indicator_kind(0, kind, None).is_empty());
+    }
 
     assert_eq!(chart.series_order(), order);
     assert_eq!(chart.panes.len(), pane_count);
@@ -5373,6 +5620,193 @@ fn indicator_schema_exposes_typed_parameters_and_outputs() {
     assert_eq!(exponential.parameter_type, IndicatorParameterType::Boolean);
     assert_eq!(exponential.default, serde_json::json!(true));
     assert_eq!((exponential.min, exponential.max), (None, None));
+
+    for (kind, names, defaults, outputs) in [
+        (
+            IndicatorKind::Kst {
+                roc: [2, 3, 4, 5],
+                smoothing: [6, 7, 8, 9],
+                signal: 10,
+            },
+            vec![
+                "roc_1",
+                "roc_2",
+                "roc_3",
+                "roc_4",
+                "smoothing_1",
+                "smoothing_2",
+                "smoothing_3",
+                "smoothing_4",
+                "signal",
+            ],
+            vec![2, 3, 4, 5, 6, 7, 8, 9, 10],
+            vec!["KST", "Signal"],
+        ),
+        (
+            IndicatorKind::Tsi {
+                long: 11,
+                short: 12,
+                signal: 13,
+            },
+            vec!["long", "short", "signal"],
+            vec![11, 12, 13],
+            vec!["TSI", "Signal"],
+        ),
+        (
+            IndicatorKind::MassIndex {
+                ema_period: 14,
+                sum_period: 15,
+            },
+            vec!["ema_period", "sum_period"],
+            vec![14, 15],
+            vec!["Mass Index"],
+        ),
+        (
+            IndicatorKind::Vortex { period: 16 },
+            vec!["period"],
+            vec![16],
+            vec!["VI+", "VI-"],
+        ),
+    ] {
+        let schema = ChartEngine::indicator_schema(&kind);
+        assert_eq!(
+            schema
+                .parameters
+                .iter()
+                .skip(1)
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert_eq!(
+            schema
+                .parameters
+                .iter()
+                .skip(1)
+                .map(|parameter| parameter.default.as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            defaults
+        );
+        assert_eq!(
+            schema
+                .outputs
+                .iter()
+                .map(|output| output.name.as_str())
+                .collect::<Vec<_>>(),
+            outputs
+        );
+    }
+}
+
+#[test]
+fn adaptive_regression_and_klinger_bindings_validate_and_place_outputs() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let times = (0..24).map(|row| row as f64).collect::<Vec<_>>();
+    let values = (0..24).map(|row| 10.0 + row as f64).collect::<Vec<_>>();
+    chart
+        .set_series_data(0, &times, &values, &values, &values, &values)
+        .unwrap();
+    chart
+        .set_series_data(volume, &times, &values, &values, &values, &values)
+        .unwrap();
+
+    for (kind, volume_source) in [
+        (
+            IndicatorKind::Klinger {
+                fast: 3,
+                slow: 7,
+                signal: 4,
+            },
+            Some(volume),
+        ),
+        (
+            IndicatorKind::Kama {
+                period: 5,
+                fast: 2,
+                slow: 10,
+            },
+            None,
+        ),
+        (IndicatorKind::McGinley { period: 5 }, None),
+        (
+            IndicatorKind::LinearRegression {
+                period: 5,
+                deviation: 2.0,
+            },
+            None,
+        ),
+    ] {
+        let schema = ChartEngine::indicator_schema(&kind);
+        assert_eq!(schema.kind, serde_json::to_value(&kind).unwrap()["kind"]);
+        let outputs = chart.add_indicator_kind(0, kind.clone(), volume_source);
+        assert_eq!(outputs.len(), schema.outputs.len());
+        assert!(
+            outputs
+                .iter()
+                .all(|&output| { chart.indicator_info(output).unwrap().kind == schema.kind })
+        );
+        let pane = chart.series_entry(outputs[0]).unwrap().pane_index;
+        assert!(
+            outputs
+                .iter()
+                .all(|&output| chart.series_entry(output).unwrap().pane_index == pane)
+        );
+        assert_eq!(pane != 0, matches!(kind, IndicatorKind::Klinger { .. }));
+    }
+
+    for (kind, volume_source) in [
+        (
+            IndicatorKind::Klinger {
+                fast: 3,
+                slow: 7,
+                signal: 4,
+            },
+            None,
+        ),
+        (
+            IndicatorKind::Klinger {
+                fast: 7,
+                slow: 7,
+                signal: 4,
+            },
+            Some(volume),
+        ),
+        (
+            IndicatorKind::Klinger {
+                fast: 3,
+                slow: 7,
+                signal: 0,
+            },
+            Some(volume),
+        ),
+        (
+            IndicatorKind::Klinger {
+                fast: 3,
+                slow: 7,
+                signal: 4,
+            },
+            Some(0),
+        ),
+        (
+            IndicatorKind::Kama {
+                period: 5,
+                fast: 10,
+                slow: 2,
+            },
+            None,
+        ),
+        (IndicatorKind::McGinley { period: 0 }, None),
+        (
+            IndicatorKind::LinearRegression {
+                period: 5,
+                deviation: -1.0,
+            },
+            None,
+        ),
+    ] {
+        assert!(chart.add_indicator_kind(0, kind, volume_source).is_empty());
+    }
 }
 
 #[test]
@@ -11216,6 +11650,41 @@ fn every_indicator_kind_with_conventions() -> Vec<IndicatorKind> {
             medium: 5,
             long: 7,
         },
+        IndicatorKind::Kst {
+            roc: [2, 3, 4, 5],
+            smoothing: [2, 2, 2, 3],
+            signal: 3,
+        },
+        IndicatorKind::Tsi {
+            long: 5,
+            short: 3,
+            signal: 3,
+        },
+        IndicatorKind::MassIndex {
+            ema_period: 3,
+            sum_period: 5,
+        },
+        IndicatorKind::Klinger {
+            fast: 3,
+            slow: 7,
+            signal: 4,
+        },
+        IndicatorKind::Kama {
+            period: 5,
+            fast: 2,
+            slow: 10,
+        },
+        IndicatorKind::McGinley { period: 5 },
+        IndicatorKind::LinearRegression {
+            period: 5,
+            deviation: 2.0,
+        },
+        IndicatorKind::Choppiness { period: 5 },
+        IndicatorKind::AtrBands {
+            period: 5,
+            multiplier: 2.0,
+        },
+        IndicatorKind::Vortex { period: 5 },
         IndicatorKind::VolumeOscillator {
             fast: 3,
             slow: 7,

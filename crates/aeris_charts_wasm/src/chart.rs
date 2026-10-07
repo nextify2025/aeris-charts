@@ -3100,6 +3100,50 @@ impl AerisChart {
             .add_chaikin_oscillator(source_id, volume_source, fast, slow)
     }
 
+    pub fn add_klinger(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_klinger(source_id, volume_source, fast, slow, signal)
+    }
+
+    pub fn add_kama(&mut self, source_id: u32, period: u32, fast: u32, slow: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_kama(source_id, period, fast, slow)
+    }
+
+    pub fn add_mcginley(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner.borrow_mut().add_mcginley(source_id, period)
+    }
+
+    pub fn add_linear_regression(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_linear_regression(source_id, period, deviation)
+    }
+
+    pub fn add_choppiness(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner.borrow_mut().add_choppiness(source_id, period)
+    }
+
+    pub fn add_atr_bands(&mut self, source_id: u32, period: u32, multiplier: f64) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_atr_bands(source_id, period, multiplier)
+    }
+
     pub fn add_relative_volume(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
         self.inner
             .borrow_mut()
@@ -3150,6 +3194,37 @@ impl AerisChart {
 
     pub fn add_trix(&mut self, source_id: u32, period: u32, signal: u32) -> Vec<u32> {
         self.inner.borrow_mut().add_trix(source_id, period, signal)
+    }
+
+    pub fn add_kst(
+        &mut self,
+        source_id: u32,
+        roc: Vec<u32>,
+        smoothing: Vec<u32>,
+        signal: u32,
+    ) -> Vec<u32> {
+        let (Ok(roc), Ok(smoothing)) = (roc.try_into(), smoothing.try_into()) else {
+            return Vec::new();
+        };
+        self.inner
+            .borrow_mut()
+            .add_kst(source_id, roc, smoothing, signal)
+    }
+
+    pub fn add_tsi(&mut self, source_id: u32, long: u32, short: u32, signal: u32) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_tsi(source_id, long, short, signal)
+    }
+
+    pub fn add_mass_index(&mut self, source_id: u32, ema_period: u32, sum_period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_mass_index(source_id, ema_period, sum_period)
+    }
+
+    pub fn add_vortex(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.inner.borrow_mut().add_vortex(source_id, period)
     }
 
     pub fn add_coppock_curve(

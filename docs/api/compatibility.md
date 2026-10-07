@@ -67,7 +67,7 @@
 
 ## 持久化 V3 研究
 
-带有引擎持有指标的金融图表导出 schema 版本 3。V3 仍由宿主持有市场历史与普通系列数据，但会持久化有序的研究绑定、标量输入选择、类型化指标参数（包括显式的 seed、histogram 与 estimator 取值）、按时间戳对齐的成交量与成交额来源引用，以及各输出的样式。链式来源被编码为对较早研究输出的引用，因此恢复不依赖旧的实时系列标识。宿主必须在导入 V3 之前重新创建来源系列及其数据；导入会在变更之前校验每一项依赖、参数、输出样式数量和资源限制。V1 和 V2 文档仍被原样接受，且 V3 文档只能恢复到全新的金融图表中。广度层的 19 个指标种类（上游 `2f62875`）以其 `kind` 名称写入同一个 V3 schema，没有提升版本号，因此不包含这些种类的较早修订会拒绝导入含有它们的文档。
+带有引擎持有指标的金融图表导出 schema 版本 3。V3 仍由宿主持有市场历史与普通系列数据，但会持久化有序的研究绑定、标量输入选择、类型化指标参数（包括显式的 seed、histogram 与 estimator 取值）、按时间戳对齐的成交量与成交额来源引用，以及各输出的样式。链式来源被编码为对较早研究输出的引用，因此恢复不依赖旧的实时系列标识。宿主必须在导入 V3 之前重新创建来源系列及其数据；导入会在变更之前校验每一项依赖、参数、输出样式数量和资源限制。V1 和 V2 文档仍被原样接受，且 V3 文档只能恢复到全新的金融图表中。广度层的 29 个指标种类（上游 `2f62875` 的 19 个与 `9dd8cff` 的 10 个）以其 `kind` 名称写入同一个 V3 schema，没有提升版本号，因此不包含这些种类的较早修订会拒绝导入含有它们的文档。
 
 ## 版本策略
 
@@ -82,6 +82,7 @@
 ### 已记录的不兼容变更
 
 - 布林带偏差必须有限且不小于 0（上游 `2f62875`）。`add_bollinger`、`add_bollinger_with_source` 与新增的 `add_bollinger_metrics` 拒绝负偏差（`invalid_options`），V3 导入同样拒绝含负布林带偏差的研究；此前负偏差会被接受并按 0 计算带宽，以前导出的此类文档不再能导入。`indicator_schema(kind)` 同时升为修订 3，新增 `"boolean"` 参数类型，按 `parameter_type` 穷尽分派的宿主编辑器需要处理它。
+- `indicator_schema(kind)` 的隐式默认值改为每个研究的规范默认值（上游 `9dd8cff`）。不传 `period` 与 `deviation` 的查询此前把 14 与 2 代入每个参数（例如 MACD 14/28/14、Stochastic `%D` 14、SuperTrend 倍数 2、EMA 彩带五个 14、VWAP 带 σ 2、KDJ 14/3/3），现在返回 MACD 12/26/9、Stochastic `%D` 3、SuperTrend 3、EMA 彩带 5/10/20/50/200、VWAP 带 σ 1、KDJ 9/3/3；本仓库把同一规则用于 KDJ。查询没有单独的“未传参”信号：浏览器端的 `indicator_schema(kind, period = 14, deviation = 2)` 无法区分省略的参数与显式传入的 14 或 2，引擎因此把 `period` 14 与 `deviation` 2 本身视为隐式查询。显式传入这些值同样返回规范默认值：`period` 14 时的 MACD（此前 14/28/14）、KDJ（此前 14/3/3）、Stochastic `%D`（此前 14）与 EMA 彩带（此前五个 14），以及 `deviation` 2 时的 SuperTrend 倍数（此前 2，现为 3）与 VWAP 带 σ（此前 2，现为 1）。只有其他显式值沿用原来的替换规则（`indicator_schema("macd", 12)` 仍为 12/24/12）。从 schema 默认值构建设置面板的宿主会显示新的默认值。名称解析现由引擎的 `IndicatorKind::schema_definition` 拥有，WebAssembly 不再保留自己的映射表。
 - 大单取代足迹图成交气泡（上游 `9fc3f2b`）。`chart.add_trade_bubbles(series, stream_id, options)` 已移除且没有兼容垫片：其替代品 `chart.add_big_trades(series, stream_id, options)` 的行为不同（先由连续成交重建主动订单再过滤，默认按最近已完成订单的 98 分位数自动过滤，前 128 个订单完成之前不显示任何气泡；气泡是窗格 chrome，不再写入系列标记），并返回一个 `big_trades_api` 句柄；被拒绝时抛出带类型的错误：超过 16 个指标为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，选项无效为 `invalid_options`（`apply_options` 在句柄移除后为 `stale_handle`）。`trade_stream_stats` 的 `bubble_trades_scanned` 与 `bubble_markers_sized` 由 `big_trades_prints_scanned` 与 `big_trades_replays` 取代。按上文策略这属于 major 级别的变更，具体版本号在发布时决定。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
 - 足迹图改为真实的 bid × ask 聚簇（上游 `314fdc8`、`a8dad8a`）。这是视觉行为变更，不改变任何函数签名：详细层级从 48 CSS px 柱间距起显示数字（此前要求更宽的柱才显示摘要），柱摘要只剩 `Δ` 与 `V` 两行（不再有 H/L/B/A），POC 改为不遮挡数字的轮廓，柱左缘新增方向区间线，数字保持配置的字号而不随行高变大，小于 0.01 的成交量以两位有效数字显示。`footprint_series_options` 新增可选的 `adaptive_rows`（默认 `false`），按当前缩放以 1-2-5 步长合并行。依赖截图或帧图元比较足迹图的宿主测试需要更新。主系列的行是空白数据时，`histogram_updown` 成交量柱按成交量系列自身的 `histogram_updown_rule`，从同一窗格中可见的足迹图取得涨跌方向（上游 `ea789aa`），没有足迹图柱的位置保持纯色；此前这些柱始终是纯色。Rust 侧的订单流变更见 [Rust 接入](rust.md#更换固定修订)。
 
