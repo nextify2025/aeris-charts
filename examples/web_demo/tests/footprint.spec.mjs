@@ -124,6 +124,52 @@ test("footprint shared-frame semantics execute through WebGPU", async ({ page })
   expect(screenshot.byteLength).toBeGreaterThan(10_000);
 });
 
+for (const backend of ["canvas2d", "webgpu"]) {
+  test(`every footprint cell mode paints distinct pixels from one tape (${backend})`, async ({ page }) => {
+    await open_chart(page, backend);
+    const modes = ["bid_ask", "total", "delta", "profile_in_bar", "volume_ladder", "horizontal_imbalance", "bid_ask_histogram"];
+    await page.evaluate(() => {
+      const chart = window.__chart;
+      chart.remove_series(window.__main);
+      window.__footprint = chart.add_series("footprint", {
+        tick_size: 1,
+        interval_seconds: 60,
+        imbalance_ratio: 3,
+        imbalance_minimum_volume: 5,
+        price_line_visible: false,
+        last_value_visible: false,
+      });
+      const micros = Math.floor(window.__data[0].time / 60) * 60 * 1_000_000;
+      window.__footprint.set_trades([
+        { timestamp_micros: micros + 1, price: 100, volume: 30, aggressor: "sell" },
+        { timestamp_micros: micros + 2, price: 100, volume: 6, aggressor: "buy" },
+        { timestamp_micros: micros + 3, price: 101, volume: 12, aggressor: "buy" },
+        { timestamp_micros: micros + 4, price: 101, volume: 40, aggressor: "sell" },
+        { timestamp_micros: micros + 5, price: 102, volume: 45, aggressor: "buy" },
+        { timestamp_micros: micros + 6, price: 102, volume: 5, aggressor: "sell" },
+      ]);
+      chart.time_scale().fit_content();
+      chart.time_scale().apply_options({ bar_spacing: 160 });
+    });
+    const frames = [];
+    for (const mode of modes) {
+      const frame = await page.evaluate(async (cell_mode) => {
+        window.__footprint.apply_options({ cell_mode });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return {
+          backend: window.__chart.backend(),
+          mode: window.__footprint.options().cell_mode,
+          image: window.__chart.take_screenshot().toDataURL("image/png"),
+        };
+      }, mode);
+      expect(frame.backend).toBe(backend);
+      expect(frame.mode).toBe(mode);
+      frames.push(frame.image);
+    }
+    expect(new Set(frames).size, "each cell mode renders its own geometry").toBe(modes.length);
+  });
+}
+
 test("typed footprint columns reject off-grid data without replacing accepted bars", async ({ page }) => {
   await open_chart(page);
   const result = await page.evaluate(() => {

@@ -1932,16 +1932,17 @@ impl ChartEngine {
         }
     }
 
-    /// The temporary Ctrl/Cmd OHLC magnet mirrors the drawing magnet the engine will apply, and only
-    /// for drawing work: an armed tool whose effective magnet (chart mode, tool mode, Ctrl/Cmd as
-    /// the temporary toggle) is strong, or a drawing drag with Ctrl/Cmd held. Returns whether it
-    /// changed.
+    /// The controller is the one reader of the magnet modifier: Ctrl/Cmd held during drawing work
+    /// (an armed tool, a pending creation, or a drawing drag) is reported to the engine as the
+    /// held magnet modifier, which the crosshair resolves against the worked drawing's
+    /// effective magnet ([`ChartEngine::drawing_work_magnet`]). Free browsing never reports it.
+    /// Returns whether it changed.
     fn apply_input_magnet(&mut self) -> bool {
         let modifiers = self.input.modifiers;
-        let toggle = modifiers.control || modifiers.meta;
-        let armed = self.armed_drawing_magnet(toggle) == DrawingMagnetMode::Strong;
-        let dragging = toggle && self.drawing_drag_active();
-        self.set_crosshair_ohlc_magnet(armed || dragging)
+        let drawing = self.active_drawing_tool().is_some()
+            || self.drawing_create_active()
+            || self.drawing_drag_active();
+        self.set_crosshair_ohlc_magnet((modifiers.control || modifiers.meta) && drawing)
     }
 
     /// Whether a press lands on the text being edited: its label, a text tool's body, or the box
@@ -4560,28 +4561,106 @@ mod tests {
             },
             ..at(x, y)
         };
-        // No tool armed: Ctrl alone never turns the OHLC magnet on.
+        // No tool armed: Ctrl alone is never reported, and the crosshair magnet stays off.
         chart.input_pointer_move(ctrl(300.0, 200.0), false);
         assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
 
         // Chart magnet off: Ctrl is the temporary strong magnet while a tool is armed.
         assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
         chart.input_pointer_move(at(300.0, 200.0), false);
         assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
         chart.input_pointer_move(ctrl(300.0, 200.0), false);
         assert!(chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Strong);
 
         // Chart magnet strong: it snaps without Ctrl, and Ctrl turns it off for this placement.
         chart.set_drawing_magnet_mode(DrawingMagnetMode::Strong);
         chart.input_pointer_move(at(300.0, 200.0), false);
-        assert!(chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Strong);
         chart.input_pointer_move(ctrl(300.0, 200.0), false);
-        assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
 
-        // Chart magnet weak: Ctrl makes it off as well, and no Ctrl keeps the crosshair free.
+        // Chart magnet weak: the crosshair follows the weak magnet (it snaps only within the
+        // weak radius, like the anchor), and Ctrl turns it off as well.
         chart.set_drawing_magnet_mode(DrawingMagnetMode::Weak);
         chart.input_pointer_move(at(300.0, 200.0), false);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Weak);
+        chart.input_pointer_move(ctrl(300.0, 200.0), false);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
+
+        // Releasing the tool ends drawing work: the held key is no longer reported.
+        assert!(chart.set_drawing_tool(None, None, None));
+        chart.input_pointer_move(ctrl(300.0, 200.0), false);
         assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
+    }
+
+    #[test]
+    fn ctrl_held_drags_snap_the_anchor_and_the_crosshair_together() {
+        // A trend-line anchor dragged through the controller with Ctrl held, to bar 20
+        // ({o 106, h 109, l 103, c 107}) at 107.4: the anchor and the crosshair agree in every
+        // case, whether the held key toggles the chart magnet or upgrades the drawing's own.
+        let ctrl = |x, y| PointerInput {
+            modifiers: InputModifiers {
+                control: true,
+                ..InputModifiers::default()
+            },
+            ..at(x, y)
+        };
+        for (chart_mode, own, snaps) in [
+            (DrawingMagnetMode::Strong, "off", false),
+            (DrawingMagnetMode::Off, "off", true),
+            (DrawingMagnetMode::Strong, "weak", true),
+        ] {
+            let label = format!("chart {chart_mode:?}, own {own}");
+            let mut chart = chart();
+            chart.set_drawing_magnet_mode(chart_mode);
+            let id = chart
+                .add_drawing(
+                    DrawingKind::TrendLine,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: 10.0,
+                            price: 102.0,
+                        },
+                        DrawingPoint {
+                            logical: 40.0,
+                            price: 104.0,
+                        },
+                    ],
+                    Some(&format!(r#"{{"magnet":"{own}"}}"#)),
+                )
+                .unwrap();
+            chart.build_frame();
+            chart.set_selected_drawing(Some(id));
+            let anchor = chart.drawing_point_to_coordinate(id, 1).unwrap();
+            let target = chart
+                .drawing_to_px(
+                    0,
+                    DrawingPoint {
+                        logical: 20.0,
+                        price: 107.4,
+                    },
+                )
+                .unwrap();
+            chart.input_pointer_down(ctrl(anchor.0, anchor.1), 1);
+            chart.input_pointer_move(ctrl(anchor.0 - 20.0, anchor.1), true);
+            chart.input_pointer_move(ctrl(target.0, target.1), true);
+            assert!(chart.drawing_drag_active(), "{label}");
+            let placed = chart.drawing(id).unwrap().points[1].price;
+            let expected = if snaps { 107.0 } else { 107.4 };
+            assert!((placed - expected).abs() < 1e-6, "{label}: anchor {placed}");
+            let (from, to) = chart.visible_range_for_frame().unwrap();
+            let crosshair = chart.crosshair_snap(0, target.0, target.1, from, to).0;
+            assert!(
+                (crosshair - placed).abs() < 1e-6,
+                "{label}: crosshair {crosshair} vs anchor {placed}"
+            );
+            chart.input_pointer_up(ctrl(target.0, target.1));
+        }
     }
 
     #[test]

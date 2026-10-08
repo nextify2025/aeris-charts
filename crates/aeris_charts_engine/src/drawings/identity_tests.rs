@@ -356,7 +356,11 @@ fn a_drawings_own_magnet_mode_applies_to_its_edits() {
         None
     ));
     assert_eq!(chart.armed_drawing_magnet(false), DrawingMagnetMode::Weak);
-    assert_eq!(chart.armed_drawing_magnet(true), DrawingMagnetMode::Off);
+    assert_eq!(
+        chart.armed_drawing_magnet(true),
+        DrawingMagnetMode::Strong,
+        "the held modifier upgrades a drawing's own magnet to strong"
+    );
 }
 
 fn settled() -> ChartEngine {

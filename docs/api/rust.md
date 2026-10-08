@@ -286,6 +286,13 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - `4af2caf perf(indicators): bound live updates for pivots, zigzag, and engine inputs`：本仓库早已具备有界的枢轴点（按交易所交易日分组）、ZigZag（开放转折点）、Fisher 运行时，以及引擎绑定自有的派生价格列（`price_input`）、对齐成交量列（`AlignedWeights`）和按时间戳把稀疏成交量变更行映射回源行的 `weight_change_source_row`，因此未合入上游的 `BindingInputs`、`FisherCarry`、`volume_change_source_row` 与上游的枢轴点/ZigZag 文本，Rust 宿主无需改动。性能门禁新增 Target V（上游的 Target Q）。
 - `8ef6270 fix(benchmarks): raise WASM brotli ceiling for bounded live updates`：只提高上游自身的体积上限；本仓库保留体积预算策略 v8，不采用上游的数值。
 
+**绘图磁吸模式、OF12 足迹单元格变体与交易扩展计划收口**（上游，来自 `71b17a8 feat(engine): deliver drawing magnet modes and OF12 footprint variants` 与 `2f2012d docs(plan): retire the completed trading expansion plan`，经合并 `2f2012d` 的提交引入；参见[绘图锚点、磁吸与价格基准](drawings.md#绘图锚点磁吸与价格基准)、[共享输入控制器](../architecture/engine/input.md#绘图放置)与[足迹图领域契约](../features/footprint.md#3-聚合与记账)）。下一次 Aeris Terminal 更换固定修订时需要评审：
+
+- `ChartEngine::crosshair_ohlc_magnet` 的含义（行为变更，签名不变）。本仓库此前由输入控制器写入“实际生效的绘图磁吸为 `strong`”这一派生结果；现在与上游一致，它只表示绘图工作期间（工具已激活、正在创建或正在拖动绘图）按住的 Ctrl/Cmd，十字光标在帧构建时用它解析该绘图实际生效的磁吸（`drawing_work_magnet`，`weak` 只在 `DRAWING_WEAK_MAGNET_DISTANCE` 内吸附）。经 `ChartEngine::input_*`（或 `aeris_charts_render_gpui::input`）路由输入的宿主无需改动；直接调用 `set_crosshair_ohlc_magnet` 或写入该字段的宿主应传入按住修饰键的原始状态，而不是自行计算磁吸，读取该字段来判断十字光标是否吸附的宿主应改读帧输出。
+- 每个绘图的磁吸模式。本仓库早已在 `Drawing::magnet`、绘图契约属性 `magnet` 与持久化字段 `magnet`（缺少时读作 `Off`）中保存每个绘图的模式，并用它驱动放置、预览、锚点拖动、单锚点主体拖动与派生手柄拖动，因此没有新增字段或持久化变化。合并保留本仓库的图表级磁吸（`set_drawing_magnet_mode`，与绘图自身模式取较强者）与 12 CSS px 的 `DRAWING_WEAK_MAGNET_DISTANCE`，未合入上游的 `WEAK_MAGNET_RADIUS_PX`（10 CSS px）与 `drawing_magnet_point`；上游“按住修饰键升为 strong”的规则合入 `ChartEngine::effective_drawing_magnet`（行为变更，签名不变）：绘图自身模式为 `Weak` 或 `Strong` 时 `toggle` 一律得到 `Strong`（此前为 `Off`），自身模式为 `Off` 时仍切换图表模式。`armed_drawing_magnet(true)` 随之变化；`drawing_work_magnet` 对多锚点绘图的主体拖动返回 `Off`，与锚点一致。仅供已删除的 TS 内部镜像使用的 WASM 导出 `armed_drawing_magnet` 已移除（不属于公共 TS API）。
+- `FootprintCellMode` 的 `ProfileInBar`、`VolumeLadder`、`HorizontalImbalance` 与 `BidAskHistogram` 各自绘制独立的行几何（视觉行为变更，枚举与选项不变）；帧检查器或像素基线需要更新。
+- `plan/Expansion.md` 已随上游删除。Aeris Terminal 引用的稳定条目 ID（F、OF、CT、I、PD）仍可在上游提交 `71b17a8`（英文）或本仓库提交 `08d6b4e`（中文）的该文件中查到；本仓库对 B1–B9 的完成认定以本次同步的完整门禁为依据，B9 的人工证据在阶段收口时收集，上游 2026-10-06 的无障碍与竞品评审只作为上游证据引用（所有者决定 Q-F）。
+
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
 - `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming, viewport, price axis, and intraday charts`（自有线）：

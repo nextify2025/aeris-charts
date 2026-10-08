@@ -1943,10 +1943,11 @@ pub struct DrawingHit {
 }
 
 /// Modifier keys the host gesture layer forwards with pointer positions (the public reference modifier
-/// semantics): `magnet` is the temporary magnet toggle (Ctrl/Cmd — the same key that magnets the
-/// crosshair). It turns an inactive effective magnet (the stronger of the drawing's own
-/// `magnet` and the chart's [`ChartEngine::drawing_magnet_mode`]) into a strong one and an active
-/// one off. Snapping moves an anchor to the nearest bar — x to the bar's center, the price to its
+/// semantics): `magnet` is the held magnet modifier (Ctrl/Cmd — the same key that magnets the
+/// crosshair), resolved by [`ChartEngine::effective_drawing_magnet`]: it upgrades a drawing's own
+/// weak or strong `magnet` to strong and, for a drawing without its own magnet, toggles the
+/// chart's [`ChartEngine::drawing_magnet_mode`] (inactive becomes strong, active becomes off).
+/// Snapping moves an anchor to the nearest bar — x to the bar's center, the price to its
 /// closest rendered field (OHLC for candles/bars, value for scalar series);
 /// `straighten` constrains the dragged anchor of a two-anchor tool so the segment snaps to
 /// 0°/45°/90° (a rectangle to a square) and body drags to the dominant axis (Shift only —
@@ -3268,9 +3269,10 @@ impl ChartEngine {
 
     /// Set the chart's persistent drawing magnet (the toolbar magnet): `Weak` snaps creation and
     /// editing within [`DRAWING_WEAK_MAGNET_DISTANCE`], `Strong` always snaps to the nearest
-    /// rendered OHLC value. A drawing's own `magnet` option raises it for that drawing, and the
-    /// Ctrl/Cmd modifier toggles the effective mode temporarily. Touch input has no modifier and
-    /// therefore uses the chart mode directly.
+    /// rendered OHLC value. A drawing's own `magnet` option raises it for that drawing. Held
+    /// Ctrl/Cmd upgrades a drawing's own magnet to `Strong` and otherwise toggles this mode
+    /// temporarily ([`Self::effective_drawing_magnet`]). Touch input has no modifier and
+    /// therefore uses the resolved mode without the toggle.
     pub fn set_drawing_magnet_mode(&mut self, mode: crate::DrawingMagnetMode) {
         if self.drawing_settings.magnet_mode != mode {
             self.drawing_settings.magnet_mode = mode;
@@ -3283,29 +3285,29 @@ impl ChartEngine {
     }
 
     /// The magnet a drawing whose own mode is `own` uses: the stronger of `own` and the chart
-    /// mode, with `toggle` (Ctrl/Cmd held) turning an inactive magnet strong and an active one off.
+    /// mode. `toggle` (Ctrl/Cmd held) upgrades a drawing's own `Weak` or `Strong` magnet to
+    /// `Strong` (upstream F5); for a drawing without its own magnet it toggles the chart mode
+    /// temporarily, turning an inactive chart magnet strong and an active one off.
     pub fn effective_drawing_magnet(
         &self,
         own: crate::DrawingMagnetMode,
         toggle: bool,
     ) -> crate::DrawingMagnetMode {
         use crate::DrawingMagnetMode::{Off, Strong, Weak};
-        let rank = |mode| match mode {
-            Off => 0,
-            Weak => 1,
-            Strong => 2,
-        };
         let chart = self.drawing_settings.magnet_mode;
-        let active = if rank(own) >= rank(chart) { own } else { chart };
-        match (active, toggle) {
-            (Off, true) => Strong,
-            (_, true) => Off,
-            (active, false) => active,
+        match (own, chart, toggle) {
+            (Off, Off, true) => Strong,
+            (Off, _, true) => Off,
+            (_, _, true) => Strong,
+            (Strong, _, false) | (_, Strong, false) => Strong,
+            (Weak, _, false) | (_, Weak, false) => Weak,
+            (Off, Off, false) => Off,
         }
     }
 
     /// The effective magnet for the armed tool's next placement (`Off` while no tool is armed).
-    /// Hosts use it to mirror strong snapping in the crosshair while drawing.
+    /// A read-only query: the engine's crosshair already follows it while drawing
+    /// (`drawing_work_magnet`), so hosts never mirror it themselves.
     pub fn armed_drawing_magnet(&self, toggle: bool) -> crate::DrawingMagnetMode {
         let own = match (
             &self.drawing_controller.pending,
@@ -4285,6 +4287,44 @@ impl ChartEngine {
         let mut snapped = self.drawing_from_px_for(pane_index, price_scale, x, snapped_y)?;
         snapped.logical = logical as f64;
         Some(snapped)
+    }
+
+    /// The magnet of the drawing the pointer is currently creating or dragging (the pending
+    /// drawing, else the armed tool's template, else the dragged drawing), resolved like its
+    /// anchors by [`Self::effective_drawing_magnet`] with the controller-supplied held Ctrl/Cmd
+    /// state (`crosshair_ohlc_magnet`); `Off` for a drag part that never snaps. A Normal-mode
+    /// crosshair follows it, so the crosshair lands where the anchor will; `Off` without drawing
+    /// work, so free browsing never snaps.
+    pub(crate) fn drawing_work_magnet(&self) -> crate::DrawingMagnetMode {
+        let own = if let Some(pending) = &self.drawing_controller.pending {
+            pending.drawing.magnet
+        } else if let Some(armed) = &self.drawing_controller.armed {
+            armed.template.magnet
+        } else if let Some(drag) = &self.drawing_drag {
+            let Some(drawing) = self.drawing(drag.id) else {
+                return crate::DrawingMagnetMode::Off;
+            };
+            // Only drag parts that apply the magnet move the crosshair (mirrors
+            // `drawing_drag_apply`): a multi-anchor body moves rigidly with the pointer, anchored
+            // text never snaps, and a position tool's third handle keeps its raw point.
+            let snaps = match drag.part {
+                _ if drawing.kind == DrawingKind::AnchoredText => false,
+                DrawingDragPart::Body => drawing.points.len() == 1,
+                DrawingDragPart::Anchor(index) => {
+                    index != 2
+                        || drawing.points.len() != 3
+                        || drawing.kind.spec().handles != DrawingHandleMode::Position
+                }
+                DrawingDragPart::Handle(_) => true,
+            };
+            if !snaps {
+                return crate::DrawingMagnetMode::Off;
+            }
+            drawing.magnet
+        } else {
+            return crate::DrawingMagnetMode::Off;
+        };
+        self.effective_drawing_magnet(own, self.crosshair_ohlc_magnet)
     }
 
     /// Reference-informed straighten behavior (Shift held): recompute the dragged anchor of a two-anchor tool

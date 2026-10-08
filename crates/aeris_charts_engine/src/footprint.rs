@@ -259,16 +259,27 @@ impl FootprintAggregationOptions {
     }
 }
 
+/// How each footprint row is painted. Every mode reads the same stored bar; none rebuilds the
+/// tape or changes the stored bid/ask, delta, POC, or diagonal imbalance truth.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FootprintCellMode {
+    /// Bid and ask halves with volume bars growing outward from the center divider.
     #[default]
     BidAsk,
+    /// One full-width total-volume row tinted by the dominant side.
     Total,
+    /// One full-width row diverging from the center by signed delta.
     Delta,
+    /// A volume profile inside the bar: one total-volume bar per row from the cluster's left
+    /// edge, split into bid, ask, and unclassified segments, with no wash on empty space.
     ProfileInBar,
+    /// Staggered bid × ask ladder: the bid half is raised half a row, so each bid straddles the
+    /// boundary with the ask one price above that the diagonal imbalance rule compares it with.
     VolumeLadder,
+    /// Bid × ask whose imbalance highlights compare bid and ask at the same price.
     HorizontalImbalance,
+    /// Ask and bid histogram bars stacked in each row on one left baseline and one shared scale.
     BidAskHistogram,
 }
 
@@ -5020,6 +5031,33 @@ fn recompute_bar_derived(bar: &mut FootprintBar, options: FootprintImbalanceOpti
     }
 }
 
+/// Display copy of `bar` whose imbalance flags compare bid and ask at the same price (ask at `p`
+/// against bid at `p`) with the configured ratio, minimum, and stack length. The stored diagonal
+/// flags stay the bar's truth; only the horizontal-imbalance cell mode paints this projection.
+pub(crate) fn horizontal_imbalance_bar(
+    bar: &FootprintBar,
+    options: FootprintImbalanceOptions,
+) -> FootprintBar {
+    let mut projected = bar.clone();
+    for level in &mut projected.levels {
+        level.ask_imbalance = dominant(level.ask_volume, level.bid_volume, options);
+        level.bid_imbalance = dominant(level.bid_volume, level.ask_volume, options);
+        level.stacked_ask_imbalance = false;
+        level.stacked_bid_imbalance = false;
+    }
+    mark_stacks(
+        &mut projected.levels,
+        options.consecutive_levels as usize,
+        true,
+    );
+    mark_stacks(
+        &mut projected.levels,
+        options.consecutive_levels as usize,
+        false,
+    );
+    projected
+}
+
 fn dominant(value: f64, opposite: f64, options: FootprintImbalanceOptions) -> bool {
     value >= options.minimum_volume && (opposite == 0.0 || value / opposite >= options.ratio)
 }
@@ -6912,6 +6950,68 @@ mod tests {
     }
 
     #[test]
+    fn cvd_session_continuous_and_anchored_resets_share_one_tape() {
+        let mut chart = ChartEngine::new(600.0, 400.0, 1.0);
+        let stream = chart
+            .add_trade_stream(
+                "CME:ES",
+                FootprintAggregationOptions {
+                    tick_size: 1.0,
+                    ticks_per_row: 1,
+                    bars: FootprintBarAggregation::Time {
+                        interval_micros: 1_000_000,
+                        anchor_micros: 0,
+                    },
+                    ..FootprintAggregationOptions::default()
+                },
+            )
+            .unwrap();
+        let cvd = |chart: &mut ChartEngine, reset, anchor| {
+            chart
+                .add_cvd_series(
+                    stream,
+                    1,
+                    TradeStudyOptions {
+                        cumulative_delta_reset: reset,
+                        anchor_timestamp_micros: anchor,
+                    },
+                )
+                .unwrap()
+        };
+        let session = cvd(&mut chart, CumulativeDeltaReset::Session, None);
+        let continuous = cvd(&mut chart, CumulativeDeltaReset::Continuous, None);
+        let anchored = cvd(&mut chart, CumulativeDeltaReset::Anchored, Some(3_000_000));
+        assert_eq!(
+            chart.add_cvd_series(
+                stream,
+                1,
+                TradeStudyOptions {
+                    cumulative_delta_reset: CumulativeDeltaReset::Anchored,
+                    anchor_timestamp_micros: None,
+                },
+            ),
+            Err(FootprintError::InvalidAggregation),
+            "an anchored reset needs its anchor"
+        );
+        let mut tape = vec![
+            trade(1_500_000, 100.0, 5.0, AggressorSide::Buy),
+            trade(2_500_000, 100.0, 2.0, AggressorSide::Sell),
+            trade(3_500_000, 100.0, 4.0, AggressorSide::Buy),
+            trade(4_500_000, 100.0, 1.0, AggressorSide::Sell),
+        ];
+        tape[2].session_id = Some(2);
+        tape[3].session_id = Some(2);
+        chart.set_trade_stream_trades(stream, tape).unwrap();
+        let closes =
+            |chart: &ChartEngine, id| chart.data_layer().series_data(id).unwrap().1[3].to_vec();
+        assert_eq!(closes(&chart, session), vec![5.0, 3.0, 4.0, 3.0]);
+        assert_eq!(closes(&chart, continuous), vec![5.0, 3.0, 7.0, 6.0]);
+        assert_eq!(closes(&chart, anchored), vec![0.0, 0.0, 4.0, 3.0]);
+        let stats = chart.trade_stream_stats(stream).unwrap();
+        assert_eq!(stats.dependent_count, 3);
+    }
+
+    #[test]
     fn ticks_per_row_groups_adjacent_ticks_into_one_row() {
         let options = FootprintAggregationOptions {
             tick_size: 1.0,
@@ -7204,6 +7304,201 @@ mod tests {
         assert!(prims.iter().any(
             |primitive| matches!(primitive, Prim::Rect { color, .. } if *color == poc.solid())
         ));
+    }
+
+    #[test]
+    fn footprint_cell_variants_paint_distinct_geometry_from_one_tape() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let base = FootprintVisualOptions {
+            font_size: 9.0,
+            show_bar_summary: false,
+            ..FootprintVisualOptions::default()
+        };
+        let aggregation = FootprintAggregationOptions {
+            tick_size: 1.0,
+            ticks_per_row: 1,
+            bars: FootprintBarAggregation::Time {
+                interval_micros: 60_000_000,
+                anchor_micros: 0,
+            },
+            imbalance: FootprintImbalanceOptions {
+                ratio: 3.0,
+                minimum_volume: 20.0,
+                consecutive_levels: 2,
+            },
+        };
+        chart
+            .configure_footprint_series(
+                0,
+                FootprintSeriesOptions {
+                    aggregation,
+                    visual: base.clone(),
+                },
+            )
+            .unwrap();
+        // Diagonally balanced but horizontally one-sided at 100 (bid only) and 102 (ask only).
+        chart
+            .set_footprint_trades(
+                0,
+                vec![
+                    trade(1, 100.0, 30.0, AggressorSide::Sell),
+                    trade(2, 101.0, 40.0, AggressorSide::Buy),
+                    trade(3, 101.0, 30.0, AggressorSide::Sell),
+                    trade(4, 102.0, 50.0, AggressorSide::Buy),
+                ],
+            )
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        chart.set_bar_spacing(100.0);
+        let stored = chart.footprint_bar(0, 0).unwrap();
+        assert!(stored.levels.iter().all(|level| {
+            !level.bid_imbalance
+                && !level.ask_imbalance
+                && !level.stacked_bid_imbalance
+                && !level.stacked_ask_imbalance
+        }));
+
+        let mut paint = |mode: FootprintCellMode| -> Vec<Prim> {
+            chart
+                .apply_footprint_series_options(
+                    0,
+                    FootprintSeriesOptions {
+                        aggregation,
+                        visual: FootprintVisualOptions {
+                            cell_mode: mode,
+                            ..base.clone()
+                        },
+                    },
+                )
+                .unwrap();
+            let frame = chart.build_frame();
+            let segment = chart
+                .frame_series_segments(0)
+                .iter()
+                .find(|segment| segment.series_id == Some(0))
+                .map(|segment| segment.start..segment.end)
+                .unwrap();
+            frame.panes[0].main[segment].to_vec()
+        };
+        let modes = [
+            FootprintCellMode::BidAsk,
+            FootprintCellMode::Total,
+            FootprintCellMode::Delta,
+            FootprintCellMode::ProfileInBar,
+            FootprintCellMode::VolumeLadder,
+            FootprintCellMode::HorizontalImbalance,
+            FootprintCellMode::BidAskHistogram,
+        ];
+        let painted = modes.map(&mut paint);
+        for (left, left_prims) in painted.iter().enumerate() {
+            for right_prims in &painted[left + 1..] {
+                assert_ne!(
+                    format!("{left_prims:?}"),
+                    format!("{right_prims:?}"),
+                    "{:?} must not alias another cell mode",
+                    modes[left]
+                );
+            }
+        }
+        assert_eq!(chart.footprint_bar(0, 0).unwrap(), stored);
+
+        let rects = |prims: &[Prim]| {
+            prims
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Prim::Rect { rect, color } => Some((*rect, *color)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let texts = |prims: &[Prim]| {
+            prims
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Prim::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let same_rgb = |color: Color, base: Color| {
+            (color.r(), color.g(), color.b()) == (base.r(), base.g(), base.b())
+        };
+        let single_imbalance = |color: Color| Color::rgba(color.r(), color.g(), color.b(), 215);
+        let [bid_ask, _, _, profile, ladder, horizontal, histogram] = &painted;
+
+        // Diagonal truth has no imbalance; the horizontal projection marks bid at 100 and ask at
+        // 102 as single (unstacked) imbalances.
+        let has_color =
+            |prims: &[Prim], wanted: Color| rects(prims).iter().any(|(_, color)| *color == wanted);
+        let ask_single = single_imbalance(base.stacked_ask_color);
+        let bid_single = single_imbalance(base.stacked_bid_color);
+        assert!(!has_color(bid_ask, ask_single) && !has_color(bid_ask, bid_single));
+        assert!(has_color(horizontal, ask_single) && has_color(horizontal, bid_single));
+        assert!(!has_color(horizontal, base.stacked_bid_color.solid()));
+
+        // Profile-in-bar draws no wash, and the 101 row splits into adjacent bid then ask bars.
+        assert!(rects(profile).iter().all(|(_, color)| color.a() != 26));
+        let profile_rects = rects(profile);
+        let split_row = profile_rects.iter().any(|(bid_rect, bid_color)| {
+            same_rgb(*bid_color, base.bid_color)
+                && profile_rects.iter().any(|(ask_rect, ask_color)| {
+                    same_rgb(*ask_color, base.ask_color)
+                        && ask_rect.y == bid_rect.y
+                        && ask_rect.x == bid_rect.x + bid_rect.w
+                        && ask_rect.w > bid_rect.w
+                })
+        });
+        assert!(split_row, "{profile_rects:?}");
+        assert!(texts(profile).contains(&"70".to_string()));
+
+        // The ladder raises every bid track half a row above its ask track.
+        let tracks = |prims: &[Prim], side: Color| {
+            let mut ys = rects(prims)
+                .into_iter()
+                .filter(|(_, color)| color.a() == 26 && same_rgb(*color, side))
+                .map(|(rect, _)| rect.y)
+                .collect::<Vec<_>>();
+            ys.sort_unstable();
+            ys
+        };
+        let (ladder_bids, ladder_asks) = (
+            tracks(ladder, base.bid_color),
+            tracks(ladder, base.ask_color),
+        );
+        assert_eq!(ladder_bids.len(), 3);
+        assert_eq!(ladder_asks.len(), 3);
+        let raise = ladder_asks[0] - ladder_bids[0];
+        let row = ladder_asks[1] - ladder_asks[0];
+        assert!(
+            raise > 0 && (raise - row / 2).abs() <= 1,
+            "{raise} vs {row}"
+        );
+        assert!(
+            ladder_bids
+                .iter()
+                .zip(&ladder_asks)
+                .all(|(bid, ask)| ask - bid == raise)
+        );
+        assert_eq!(
+            tracks(bid_ask, base.bid_color),
+            tracks(bid_ask, base.ask_color)
+        );
+
+        // The histogram stacks ask above bid on one left baseline and one shared scale.
+        let histogram_rects = rects(histogram);
+        assert!(histogram_rects.iter().all(|(_, color)| color.a() != 26));
+        let stacked_pair = histogram_rects.iter().any(|(ask_rect, ask_color)| {
+            same_rgb(*ask_color, base.ask_color)
+                && histogram_rects.iter().any(|(bid_rect, bid_color)| {
+                    same_rgb(*bid_color, base.bid_color)
+                        && bid_rect.x == ask_rect.x
+                        && bid_rect.y == ask_rect.y + ask_rect.h
+                        && bid_rect.w < ask_rect.w
+                })
+        });
+        assert!(stacked_pair, "{histogram_rects:?}");
+        assert!(texts(histogram).contains(&"30 x 40".to_string()));
     }
 
     #[test]

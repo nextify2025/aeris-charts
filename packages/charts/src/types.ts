@@ -2620,6 +2620,7 @@ export interface footprint_series_options {
   imbalance_ratio: number;
   imbalance_minimum_volume: number;
   stacked_imbalance_levels: number;
+  /** Row presentation; every mode paints the same stored bars (see docs/features/footprint.md). */
   cell_mode: "bid_ask" | "total" | "delta" | "profile_in_bar" | "volume_ladder" | "horizontal_imbalance" | "bid_ask_histogram";
   font_size: number;
   bid_color: string;
@@ -3139,6 +3140,13 @@ export type drawing_text_h_align = "left" | "center" | "right";
 /** Vertical label alignment: above / inline with / below the tool at the selected horizontal slot. */
 export type drawing_text_v_align = "top" | "middle" | "bottom";
 export type drawing_line_cap = "none" | "arrow" | "circle";
+/**
+ * Anchor magnet of one drawing (or of the chart, `set_drawing_magnet_mode`): `strong` always snaps
+ * to the nearest rendered OHLC price, `weak` snaps only within 12 CSS px of it, and `off` keeps the
+ * pointer's point. A drawing uses the stronger of its own and the chart mode. Holding Ctrl/Cmd
+ * upgrades a drawing's own `weak` or `strong` magnet to `strong`; for a drawing whose own magnet
+ * is `off` it toggles the chart mode (off becomes strong, weak or strong becomes off).
+ */
 export type drawing_magnet_mode = "off" | "weak" | "strong";
 export type drawing_interval_unit = "seconds" | "minutes" | "hours" | "days" | "weeks" | "months" | "ticks" | "ranges";
 export interface drawing_interval { unit: drawing_interval_unit; value: number }
@@ -5546,8 +5554,9 @@ export interface chart_api {
   /**
    * Persistent chart drawing magnet (the toolbar magnet, default `"off"`): `"weak"` snaps anchor
    * placement and editing to the nearest OHLC value only within a small pixel distance,
-   * `"strong"` always snaps. A drawing's own `magnet` option can raise it for that drawing, and
-   * holding Ctrl/Cmd toggles the effective magnet temporarily. Touch input uses this mode.
+   * `"strong"` always snaps. A drawing's own `magnet` option can raise it for that drawing.
+   * Holding Ctrl/Cmd upgrades a drawing's own magnet to `"strong"` and otherwise toggles this
+   * mode temporarily. Touch input uses this mode.
    */
   set_drawing_magnet_mode(mode: drawing_magnet_mode): void;
   drawing_magnet_mode(): drawing_magnet_mode;

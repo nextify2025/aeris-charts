@@ -3,7 +3,8 @@ use std::borrow::Cow;
 use super::*;
 use crate::footprint::{
     FootprintAggregationOptions, FootprintBar, FootprintCellMode, FootprintLevel,
-    footprint_row_merge, footprint_row_price_bounds, merged_footprint_bar, merged_poc_price,
+    footprint_row_merge, footprint_row_price_bounds, horizontal_imbalance_bar,
+    merged_footprint_bar, merged_poc_price,
 };
 
 /// Bars at least this wide (CSS px) print cell numbers.
@@ -173,7 +174,7 @@ impl ChartEngine {
                 continue;
             }
             // Stored levels are per tick; display rows group `ticks_per_row` of them.
-            let bar = if aggregation.ticks_per_row > 1 {
+            let mut bar = if aggregation.ticks_per_row > 1 {
                 Cow::Owned(merged_footprint_bar(
                     source,
                     aggregation.ticks_per_row,
@@ -183,6 +184,9 @@ impl ChartEngine {
             } else {
                 Cow::Borrowed(source)
             };
+            if visual.cell_mode == FootprintCellMode::HorizontalImbalance {
+                bar = Cow::Owned(horizontal_imbalance_bar(&bar, stored.imbalance));
+            }
             let detailed = lod == FootprintLod::Detailed;
             push_range_line(
                 out,
@@ -211,30 +215,37 @@ impl ChartEngine {
                 };
                 let cell = CellRect { top, height };
                 let is_poc = level.level == bar.poc_level;
+                let text = detailed.then_some(&text_style);
                 match visual.cell_mode {
-                    FootprintCellMode::BidAsk
-                    | FootprintCellMode::HorizontalImbalance
-                    | FootprintCellMode::BidAskHistogram => push_bid_ask_row(
+                    FootprintCellMode::BidAsk | FootprintCellMode::HorizontalImbalance => {
+                        push_bid_ask_row(out, level, column, cell, 0, maxima, visual, text);
+                    }
+                    FootprintCellMode::VolumeLadder => push_bid_ask_row(
+                        out,
+                        level,
+                        column,
+                        cell,
+                        full_height / 2,
+                        maxima,
+                        visual,
+                        text,
+                    ),
+                    FootprintCellMode::BidAskHistogram => {
+                        push_bid_ask_histogram_row(out, level, column, cell, maxima, visual, text);
+                    }
+                    FootprintCellMode::ProfileInBar => push_profile_row(
                         out,
                         level,
                         column,
                         cell,
                         maxima,
                         visual,
-                        detailed.then_some(&text_style),
+                        text_style.fallback_color,
+                        text,
                     ),
-                    FootprintCellMode::Total
-                    | FootprintCellMode::Delta
-                    | FootprintCellMode::ProfileInBar
-                    | FootprintCellMode::VolumeLadder => push_single_value_row(
-                        out,
-                        level,
-                        column,
-                        cell,
-                        maxima,
-                        visual,
-                        detailed.then_some(&text_style),
-                    ),
+                    FootprintCellMode::Total | FootprintCellMode::Delta => {
+                        push_single_value_row(out, level, column, cell, maxima, visual, text);
+                    }
                 }
                 if is_poc {
                     push_poc_outline(out, column, cell, hpr, visual.poc_color);
@@ -366,12 +377,15 @@ fn push_range_summary(
 }
 
 /// One `bid x ask` row: each half carries a faint side track, a volume bar growing from the
-/// center divider, and its number. Imbalanced halves switch to the imbalance color.
+/// center divider, and its number. Imbalanced halves switch to the imbalance color. The bid half
+/// is drawn `bid_raise` device px above the row (the staggered volume ladder); zero keeps it level.
+#[allow(clippy::too_many_arguments)]
 fn push_bid_ask_row(
     out: &mut Vec<Prim>,
     level: &FootprintLevel,
     column: ClusterColumn,
     cell: CellRect,
+    bid_raise: i32,
     maxima: VolumeMaxima,
     visual: &crate::FootprintVisualOptions,
     text: Option<&FootprintTextStyle<'_>>,
@@ -384,6 +398,10 @@ fn push_bid_ask_row(
     let ask_width = (column.right - ask_left).max(1);
     let bid_imbalanced = level.bid_imbalance || level.stacked_bid_imbalance;
     let ask_imbalanced = level.ask_imbalance || level.stacked_ask_imbalance;
+    let bid_cell = CellRect {
+        top: cell.top - bid_raise,
+        height: cell.height,
+    };
 
     let bid_background = push_half(
         out,
@@ -392,7 +410,7 @@ fn push_bid_ask_row(
             width: bid_width,
             grows_left: true,
         },
-        cell,
+        bid_cell,
         level.bid_volume,
         maxima.bid,
         visual.bid_color,
@@ -421,7 +439,7 @@ fn push_bid_ask_row(
         push_cell_text(
             out,
             bid_left as f32 + bid_width as f32 / 2.0,
-            center_y,
+            center_y - bid_raise as f32,
             bid_width,
             cell.height,
             compact_volume(level.bid_volume),
@@ -511,7 +529,7 @@ fn push_half(
     }
 }
 
-/// One total, delta, or profile row spanning the full cell width.
+/// One total or delta row spanning the full cell width.
 fn push_single_value_row(
     out: &mut Vec<Prim>,
     level: &FootprintLevel,
@@ -616,6 +634,165 @@ fn push_single_value_row(
             imbalanced,
         );
     }
+}
+
+/// Profile-in-bar row: one total-volume bar from the cluster's left edge, scaled to the bar's
+/// peak row and split into bid, ask, and unclassified segments in that order. No track wash is
+/// drawn, so the empty space reads as the profile's shape. Imbalanced rows print in bold.
+#[allow(clippy::too_many_arguments)]
+fn push_profile_row(
+    out: &mut Vec<Prim>,
+    level: &FootprintLevel,
+    column: ClusterColumn,
+    cell: CellRect,
+    maxima: VolumeMaxima,
+    visual: &crate::FootprintVisualOptions,
+    unknown_color: Color,
+    text: Option<&FootprintTextStyle<'_>>,
+) {
+    let left = column.cells_left;
+    let width = column.cells_width().max(1);
+    let total = level.total_volume;
+    let bar_width = profile_width(width, total, maxima.total);
+    let mut background = Color::rgba(0, 0, 0, 0);
+    if bar_width > 0 {
+        let segment = |volume: f64| -> i32 {
+            ((f64::from(bar_width) * (volume / total).clamp(0.0, 1.0)).round() as i32)
+                .clamp(0, bar_width)
+        };
+        let bid_width = segment(level.bid_volume);
+        let ask_width = segment(level.ask_volume).min(bar_width - bid_width);
+        let unknown_width = bar_width - bid_width - ask_width;
+        let mut x = left;
+        let mut widest = (0, background);
+        for (segment_width, base) in [
+            (bid_width, visual.bid_color),
+            (ask_width, visual.ask_color),
+            (unknown_width, unknown_color),
+        ] {
+            if segment_width == 0 {
+                continue;
+            }
+            let color = profile_bar(base, total, maxima.total);
+            out.push(Prim::Rect {
+                rect: IRect {
+                    x,
+                    y: cell.top,
+                    w: segment_width,
+                    h: cell.height,
+                },
+                color,
+            });
+            if segment_width > widest.0 {
+                widest = (segment_width, color);
+            }
+            x += segment_width;
+        }
+        if bar_width * 4 >= width {
+            background = widest.1;
+        }
+    }
+    let imbalanced = level.bid_imbalance
+        || level.ask_imbalance
+        || level.stacked_bid_imbalance
+        || level.stacked_ask_imbalance;
+    if let Some(style) = text
+        && total != 0.0
+    {
+        push_cell_text(
+            out,
+            left as f32 + width as f32 / 2.0,
+            cell.top as f32 + cell.height as f32 / 2.0,
+            width,
+            cell.height,
+            compact_volume(total),
+            style,
+            contrast_on(background, style),
+            imbalanced,
+        );
+    }
+}
+
+/// Bid/ask histogram row: the ask bar fills the upper half of the row and the bid bar the lower
+/// half, both from the cluster's left edge on one scale (the larger side's peak) so their lengths
+/// compare directly. Imbalanced sides use the imbalance color; numbers print as `bid x ask`.
+fn push_bid_ask_histogram_row(
+    out: &mut Vec<Prim>,
+    level: &FootprintLevel,
+    column: ClusterColumn,
+    cell: CellRect,
+    maxima: VolumeMaxima,
+    visual: &crate::FootprintVisualOptions,
+    text: Option<&FootprintTextStyle<'_>>,
+) {
+    let left = column.cells_left;
+    let width = column.cells_width().max(1);
+    let peak = maxima.bid.max(maxima.ask);
+    let ask_height = (cell.height / 2).max(1);
+    let ask_cell = CellRect {
+        top: cell.top,
+        height: ask_height,
+    };
+    let bid_cell = CellRect {
+        top: cell.top + ask_height,
+        height: (cell.height - ask_height).max(1),
+    };
+    let sides = [
+        (
+            ask_cell,
+            level.ask_volume,
+            visual.ask_color,
+            (level.ask_imbalance || level.stacked_ask_imbalance)
+                .then(|| imbalance_cell(visual.stacked_ask_color, level.stacked_ask_imbalance)),
+        ),
+        (
+            bid_cell,
+            level.bid_volume,
+            visual.bid_color,
+            (level.bid_imbalance || level.stacked_bid_imbalance)
+                .then(|| imbalance_cell(visual.stacked_bid_color, level.stacked_bid_imbalance)),
+        ),
+    ];
+    for (side_cell, volume, base, imbalance) in sides {
+        let bar_width = profile_width(width, volume, peak);
+        if bar_width == 0 {
+            continue;
+        }
+        out.push(Prim::Rect {
+            rect: IRect {
+                x: left,
+                y: side_cell.top,
+                w: bar_width,
+                h: side_cell.height,
+            },
+            color: imbalance.unwrap_or_else(|| profile_bar(base, volume, peak)),
+        });
+    }
+    let Some(style) = text else {
+        return;
+    };
+    if level.bid_volume == 0.0 && level.ask_volume == 0.0 {
+        return;
+    }
+    let imbalanced = level.bid_imbalance
+        || level.ask_imbalance
+        || level.stacked_bid_imbalance
+        || level.stacked_ask_imbalance;
+    push_cell_text(
+        out,
+        left as f32 + width as f32 / 2.0,
+        cell.top as f32 + cell.height as f32 / 2.0,
+        width,
+        cell.height,
+        format!(
+            "{} x {}",
+            compact_volume(level.bid_volume),
+            compact_volume(level.ask_volume)
+        ),
+        style,
+        contrast_on(Color::rgba(0, 0, 0, 0), style),
+        imbalanced,
+    );
 }
 
 /// Faint full-cell wash so empty rows keep their shape without competing with prints.

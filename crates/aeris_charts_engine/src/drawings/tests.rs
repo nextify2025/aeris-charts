@@ -3104,6 +3104,313 @@ fn drawing_magnet_ignores_derived_indicator_lines() {
 }
 
 #[test]
+fn drawing_magnet_mode_snaps_without_the_modifier_by_strength() {
+    // Bar 2 reads {o 12, h 13, l 11, c 11}: 12.4 is far (in px) from every field, while 4 px
+    // above 12 is inside the weak radius.
+    let mut chart = ohlc_chart();
+    let x = x_at(&chart, 2.0);
+    let far_y = y_at(&chart, 12.4);
+    let near_y = y_at(&chart, 12.0) - 4.0;
+    assert!((far_y - y_at(&chart, 12.0)).abs() > DRAWING_WEAK_MAGNET_DISTANCE);
+    let first_anchor = |chart: &mut ChartEngine, magnet: &str, y: f64| {
+        assert!(chart.drawing_create_begin(DrawingKind::TrendLine, None));
+        assert!(chart.drawing_create_apply_options(&format!(r#"{{"magnet":"{magnet}"}}"#)));
+        assert_eq!(chart.drawing_create_click(x, y, NONE), -1);
+        let point = chart.pending_drawing().unwrap().drawing.points[0];
+        chart.drawing_create_cancel();
+        point
+    };
+    let strong = first_anchor(&mut chart, "strong", far_y);
+    assert_eq!((strong.logical, strong.price), (2.0, 12.0));
+    let weak_far = first_anchor(&mut chart, "weak", far_y);
+    assert!((weak_far.price - 12.4).abs() < 1e-6, "{weak_far:?}");
+    let weak_near = first_anchor(&mut chart, "weak", near_y);
+    assert_eq!((weak_near.logical, weak_near.price), (2.0, 12.0));
+    let off_near = first_anchor(&mut chart, "off", near_y);
+    assert!((off_near.price - 12.0).abs() > 1e-6);
+
+    // The creation preview and the crosshair follow the same configured magnet.
+    assert!(chart.drawing_create_begin(DrawingKind::TrendLine, None));
+    assert!(chart.drawing_create_apply_options(r#"{"magnet":"strong"}"#));
+    chart.drawing_create_move(x, far_y, NONE);
+    let preview = chart.pending_drawing().unwrap().preview.unwrap();
+    assert_eq!(preview.price, 12.0);
+    let (from, to) = chart.visible_range_for_frame().unwrap();
+    let (crosshair_price, _) = chart.crosshair_snap(0, x, far_y, from, to);
+    assert!((crosshair_price - 12.0).abs() < 1e-6, "{crosshair_price}");
+    chart.drawing_create_cancel();
+    let (free_price, _) = chart.crosshair_snap(0, x, far_y, from, to);
+    assert!((free_price - 12.4).abs() < 1e-6, "{free_price}");
+
+    // Dragging an anchor of a Strong drawing snaps without the modifier; Off stays free.
+    for (magnet, expected) in [("strong", Some(12.0)), ("off", None)] {
+        let id = chart
+            .add_drawing(
+                DrawingKind::TrendLine,
+                0,
+                vec![
+                    DrawingPoint {
+                        logical: 5.0,
+                        price: 12.0,
+                    },
+                    DrawingPoint {
+                        logical: 8.0,
+                        price: 13.0,
+                    },
+                ],
+                Some(&format!(r#"{{"magnet":"{magnet}"}}"#)),
+            )
+            .unwrap();
+        chart.set_selected_drawing(Some(id));
+        assert!(chart.drawing_drag_start_at(x_at(&chart, 8.0), y_at(&chart, 13.0)));
+        chart.drawing_drag_to(x, far_y, NONE);
+        chart.drawing_drag_end();
+        let moved = chart.drawing(id).unwrap().points[1];
+        match expected {
+            Some(price) => assert_eq!((moved.logical, moved.price), (2.0, price)),
+            None => assert!((moved.price - 12.4).abs() < 1e-6, "{moved:?}"),
+        }
+        assert!(chart.remove_drawing(id));
+    }
+}
+
+#[test]
+fn per_drawing_magnet_modes_snap_every_anchor_path_and_the_crosshair_agrees() {
+    // Bar 2 reads {o 12, h 13, l 11, c 11}. `near` is 4 px above 12 (inside the weak radius),
+    // `far` is at 12.4 (outside it). With the chart magnet off and no modifier held, a drawing's
+    // own mode decides: strong always lands on (2, 12), weak only from `near`. The Normal-mode
+    // crosshair resolves the same candidate while that drawing is armed, created or dragged.
+    let mut chart = ohlc_chart();
+    let x = x_at(&chart, 2.0);
+    let near = y_at(&chart, 12.0) - 4.0;
+    let far = y_at(&chart, 12.4);
+    assert!((far - y_at(&chart, 12.0)).abs() > DRAWING_WEAK_MAGNET_DISTANCE);
+    assert_eq!(chart.drawing_magnet_mode(), DrawingMagnetMode::Off);
+    let (from, to) = chart.visible_range_for_frame().unwrap();
+    let crosshair_price = |chart: &ChartEngine, y: f64| chart.crosshair_snap(0, x, y, from, to).0;
+    let options = |magnet: &str| format!(r#"{{"magnet":"{magnet}"}}"#);
+    let check = |label: &str, magnet: &str, y: f64, point: DrawingPoint| {
+        if magnet == "strong" || y == near {
+            assert_eq!(
+                (point.logical, point.price),
+                (2.0, 12.0),
+                "{label} {magnet} {y}"
+            );
+        } else {
+            assert!(
+                (point.price - 12.4).abs() < 1e-6,
+                "{label} {magnet} {y}: {point:?}"
+            );
+        }
+    };
+    let agree = |label: &str, chart: &ChartEngine, magnet: &str, y: f64, price: f64| {
+        let crosshair = crosshair_price(chart, y);
+        assert!(
+            (crosshair - price).abs() < 1e-6,
+            "{label} {magnet} {y}: crosshair {crosshair} vs anchor {price}"
+        );
+    };
+    let trend = |chart: &mut ChartEngine, magnet: &str| {
+        chart
+            .add_drawing(
+                DrawingKind::TrendLine,
+                0,
+                vec![
+                    DrawingPoint {
+                        logical: 5.0,
+                        price: 12.0,
+                    },
+                    DrawingPoint {
+                        logical: 8.0,
+                        price: 13.0,
+                    },
+                ],
+                Some(&options(magnet)),
+            )
+            .unwrap()
+    };
+
+    for magnet in ["weak", "strong"] {
+        for y in [near, far] {
+            // An armed tool's template magnet drives the crosshair before the first click.
+            assert!(chart.set_drawing_tool(
+                Some(DrawingKind::TrendLine),
+                Some(&options(magnet)),
+                None
+            ));
+            let expected = if magnet == "strong" || y == near {
+                12.0
+            } else {
+                12.4
+            };
+            assert!(
+                (crosshair_price(&chart, y) - expected).abs() < 1e-6,
+                "armed {magnet} {y}"
+            );
+            assert!(chart.set_drawing_tool(None, None, None));
+
+            // Creation preview and creation click.
+            assert!(chart.drawing_create_begin(DrawingKind::TrendLine, None));
+            assert!(chart.drawing_create_apply_options(&options(magnet)));
+            chart.drawing_create_move(x, y, NONE);
+            let preview = chart.pending_drawing().unwrap().preview.unwrap();
+            check("preview", magnet, y, preview);
+            agree("preview", &chart, magnet, y, preview.price);
+            assert_eq!(chart.drawing_create_click(x, y, NONE), -1);
+            let placed = chart.pending_drawing().unwrap().drawing.points[0];
+            check("click", magnet, y, placed);
+            agree("click", &chart, magnet, y, placed.price);
+            chart.drawing_create_cancel();
+
+            // Anchor drag.
+            let id = trend(&mut chart, magnet);
+            chart.set_selected_drawing(Some(id));
+            assert!(chart.drawing_drag_start_at(x_at(&chart, 8.0), y_at(&chart, 13.0)));
+            chart.drawing_drag_to(x, y, NONE);
+            let dragged = chart.drawing(id).unwrap().points[1];
+            check("anchor drag", magnet, y, dragged);
+            agree("anchor drag", &chart, magnet, y, dragged.price);
+            chart.drawing_drag_end();
+            assert!(chart.remove_drawing(id));
+
+            // Single-anchor body drag: a horizontal line moves only vertically.
+            let id = chart
+                .add_drawing(
+                    DrawingKind::HorizontalLine,
+                    0,
+                    vec![DrawingPoint {
+                        logical: 5.0,
+                        price: 10.0,
+                    }],
+                    Some(&options(magnet)),
+                )
+                .unwrap();
+            chart.set_selected_drawing(Some(id));
+            assert!(chart.drawing_drag_start_at(x_at(&chart, 6.0), y_at(&chart, 10.0)));
+            chart.drawing_drag_to(x, y, NONE);
+            let level = chart.drawing(id).unwrap().points[0];
+            check(
+                "body drag",
+                magnet,
+                y,
+                DrawingPoint {
+                    logical: 2.0,
+                    ..level
+                },
+            );
+            assert_eq!(level.logical, 5.0, "a horizontal line keeps its time");
+            agree("body drag", &chart, magnet, y, level.price);
+            chart.drawing_drag_end();
+            assert!(chart.remove_drawing(id));
+
+            // Derived-handle drag: a coincident signpost's pole-top handle moves its top anchor.
+            let foot = DrawingPoint {
+                logical: 5.0,
+                price: 10.0,
+            };
+            let id = chart
+                .add_drawing(
+                    DrawingKind::Signpost,
+                    0,
+                    vec![foot, foot],
+                    Some(&options(magnet)),
+                )
+                .unwrap();
+            chart.set_selected_drawing(Some(id));
+            let top = (x_at(&chart, 5.0), y_at(&chart, 10.0) - 40.0);
+            assert_eq!(
+                chart.hit_test_drawing(top.0, top.1).map(|hit| hit.part),
+                Some(DrawingDragPart::Handle(0))
+            );
+            assert!(chart.drawing_drag_start_at(top.0, top.1));
+            chart.drawing_drag_to(x, y, NONE);
+            let moved = chart.drawing(id).unwrap().points[1];
+            check("derived handle", magnet, y, moved);
+            agree("derived handle", &chart, magnet, y, moved.price);
+            chart.drawing_drag_end();
+            assert_eq!(chart.drawing(id).unwrap().points[0], foot);
+            assert!(chart.remove_drawing(id));
+        }
+    }
+    // Without drawing work the crosshair stays raw, even with the chart magnet strong.
+    chart.set_drawing_magnet_mode(DrawingMagnetMode::Strong);
+    assert!((crosshair_price(&chart, far) - 12.4).abs() < 1e-6);
+
+    // A multi-anchor body drag moves rigidly and never snaps, so the crosshair stays raw too,
+    // even with both the chart and the drawing magnet strong.
+    let id = trend(&mut chart, "strong");
+    chart.set_selected_drawing(Some(id));
+    let (a, b) = (
+        chart.drawing_point_to_coordinate(id, 0).unwrap(),
+        chart.drawing_point_to_coordinate(id, 1).unwrap(),
+    );
+    let body = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    assert_eq!(
+        chart.hit_test_drawing(body.0, body.1).map(|hit| hit.part),
+        Some(DrawingDragPart::Body)
+    );
+    assert!(chart.drawing_drag_start_at(body.0, body.1));
+    chart.drawing_drag_to(x, far, NONE);
+    assert!((crosshair_price(&chart, far) - 12.4).abs() < 1e-6);
+    chart.drawing_drag_end();
+    assert!(chart.remove_drawing(id));
+}
+
+#[test]
+fn held_modifier_upgrades_a_drawings_own_magnet_and_toggles_the_chart_magnet() {
+    // Bar 2 reads {o 12, h 13, l 11, c 11}; `far` (12.4) lies outside the weak radius. Ctrl/Cmd
+    // upgrades a drawing's own weak or strong magnet to strong (upstream F5) whatever the chart
+    // mode; a drawing without its own magnet toggles the chart mode instead. The crosshair, fed
+    // the held state as `crosshair_ohlc_magnet`, resolves the same candidate as the anchor.
+    let mut chart = ohlc_chart();
+    let x = x_at(&chart, 2.0);
+    let far = y_at(&chart, 12.4);
+    let (from, to) = chart.visible_range_for_frame().unwrap();
+    chart.crosshair_ohlc_magnet = true;
+    for chart_mode in [
+        DrawingMagnetMode::Off,
+        DrawingMagnetMode::Weak,
+        DrawingMagnetMode::Strong,
+    ] {
+        chart.set_drawing_magnet_mode(chart_mode);
+        for (own, snaps) in [
+            ("weak", true),
+            ("strong", true),
+            ("off", chart_mode == DrawingMagnetMode::Off),
+        ] {
+            let label = format!("own {own}, chart {chart_mode:?}");
+            let id = chart
+                .add_drawing(
+                    DrawingKind::TrendLine,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: 5.0,
+                            price: 12.0,
+                        },
+                        DrawingPoint {
+                            logical: 8.0,
+                            price: 13.0,
+                        },
+                    ],
+                    Some(&format!(r#"{{"magnet":"{own}"}}"#)),
+                )
+                .unwrap();
+            chart.set_selected_drawing(Some(id));
+            assert!(chart.drawing_drag_start_at(x_at(&chart, 8.0), y_at(&chart, 13.0)));
+            chart.drawing_drag_to(x, far, MAGNET);
+            let moved = chart.drawing(id).unwrap().points[1];
+            let expected = if snaps { 12.0 } else { 12.4 };
+            assert!((moved.price - expected).abs() < 1e-6, "{label}: {moved:?}");
+            let crosshair = chart.crosshair_snap(0, x, far, from, to).0;
+            assert!((crosshair - expected).abs() < 1e-6, "{label}: {crosshair}");
+            chart.drawing_drag_end();
+            assert!(chart.remove_drawing(id));
+        }
+    }
+}
+
+#[test]
 fn path_magnet_snaps_every_placed_vertex() {
     let mut chart = ohlc_chart();
     assert!(chart.drawing_create_begin(DrawingKind::Path, None));
@@ -3365,6 +3672,48 @@ fn crosshair_hline_y(chart: &mut ChartEngine) -> Option<i32> {
         }
         _ => None,
     })
+}
+
+#[test]
+fn crosshair_overlay_follows_a_change_of_the_worked_drawings_magnet() {
+    // Changing only the magnet the worked drawing resolves (the chart mode, or the pending
+    // drawing's own mode) moves the crosshair on the next frame: those edits invalidate the frame.
+    let mut chart = ohlc_chart();
+    let x = x_at(&chart, 2.0);
+    let far = y_at(&chart, 12.4);
+    let snapped = y_at(&chart, 12.0).round() as i32;
+    chart.crosshair = Some((x, far));
+    assert!(chart.set_drawing_tool(
+        Some(DrawingKind::TrendLine),
+        Some(r#"{"magnet":"weak"}"#),
+        None
+    ));
+    assert_eq!(crosshair_hline_y(&mut chart), Some(far.round() as i32));
+    chart.set_drawing_magnet_mode(DrawingMagnetMode::Strong);
+    assert_eq!(crosshair_hline_y(&mut chart), Some(snapped));
+    chart.set_drawing_magnet_mode(DrawingMagnetMode::Off);
+    assert_eq!(crosshair_hline_y(&mut chart), Some(far.round() as i32));
+    assert!(chart.set_drawing_tool(None, None, None));
+
+    assert!(chart.drawing_create_begin(DrawingKind::HorizontalLine, None));
+    assert_eq!(
+        crosshair_hline_y(&mut chart),
+        None,
+        "creation hides the free line"
+    );
+    chart.drawing_create_cancel();
+
+    // An armed tool's pending placement with no point yet aims with the crosshair, so the
+    // pending drawing's own magnet edit moves the built frame's crosshair line.
+    assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
+    assert!(chart.drawing_create_begin(DrawingKind::TrendLine, None));
+    assert_eq!(crosshair_hline_y(&mut chart), Some(far.round() as i32));
+    assert!(chart.drawing_create_apply_options(r#"{"magnet":"strong"}"#));
+    assert_eq!(crosshair_hline_y(&mut chart), Some(snapped));
+    assert!(chart.drawing_create_apply_options(r#"{"magnet":"off"}"#));
+    assert_eq!(crosshair_hline_y(&mut chart), Some(far.round() as i32));
+    chart.drawing_create_cancel();
+    assert!(chart.set_drawing_tool(None, None, None));
 }
 
 #[test]

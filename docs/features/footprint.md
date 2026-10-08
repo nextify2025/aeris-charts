@@ -50,7 +50,19 @@ POC 是总成交量最大的价位。并列时，选择最接近柱收盘价的�
 
 占优的一方必须达到配置的最小成交量和配置的比例。只要满足最小成交量，对侧成交量为零即符合条件。缺失的中间价位会打断堆叠。长度至少为 `consecutive_levels` 的相邻连续段中，每个成员都被标记为堆叠 bid 或 ask 失衡。水平失衡和其他失衡模式仅是视觉投影；它们不能改变所存储的 bid/ask 真值。
 
-视觉聚合模式独立于柱的构建：宿主可以基于同一份数据请求 Bid × Ask、Total、Delta、柱内分布（profile-in-bar）、成交量价位梯（volume-ladder）、水平失衡（horizontal-imbalance）或 bid/ask 直方图（bid/ask-histogram）单元格，而无需重建成交带。
+视觉聚合模式独立于柱的构建：宿主可以基于同一份数据请求 Bid × Ask、Total、Delta、柱内分布（profile-in-bar）、成交量价位梯（volume-ladder）、水平失衡（horizontal-imbalance）或 bid/ask 直方图（bid/ask-histogram）单元格，而无需重建成交带。每种模式都由共享帧按 `cell_mode` 绘制成各自的行几何，因此每个执行器原样继承它们：
+
+| 模式 | 行的呈现 |
+| --- | --- |
+| `bid_ask` | bid 与 ask 两半；成交量条在淡色的侧轨上从中央分隔线向外生长。 |
+| `total` | 一条从左侧起的整宽总成交量条，按占优一方着色。 |
+| `delta` | 一条整宽的行，按带符号的 delta 从中央向两侧发散。 |
+| `profile_in_bar` | 柱内的成交量分布：每行一条从左侧起的总成交量条，依次分为 bid、ask 与未分类三段，空白处不绘制底色。 |
+| `volume_ladder` | 错位的 Bid × Ask：bid 半格上移半行，使每个 bid 跨在它与上一价位 ask 的分界上，正是对角失衡规则所比较的那一对。 |
+| `horizontal_imbalance` | Bid × Ask，但高亮比较同一价位上的 bid 与 ask，使用配置的比例、最小成交量与堆叠长度。 |
+| `bid_ask_histogram` | ask（上半行）与 bid（下半行）直方图条，共用左侧基线与同一刻度，文本为 `bid x ask`。 |
+
+所有模式保持相同的 POC 轮廓、区间线、细节层级规则与柱摘要。水平失衡投影在帧构建时只针对可见柱计算（`horizontal_imbalance_bar`，每根可见柱一份显示副本，工作量随可见柱有界）；它绝不改写存储的对角失衡标记，`footprint_bar` 返回的仍是这些标记。
 
 ### 共享图表成交带与派生研究
 

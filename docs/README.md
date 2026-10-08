@@ -11,7 +11,7 @@
 | 修改引擎、交互、渲染或跨 crate 行为 | 先读[架构总览](Architecture.md)，再读涉及的主题 |
 | 搭建开发环境、提交变更与验证 | [贡献指南](development/contributing.md)、[验证门禁](development/validation.md) |
 | 测量性能或核对预算 | [性能契约](development/performance.md)、[基准测试指南](../benchmarks/README.md) |
-| 查看未完成工作与验收目标 | [`plan/plan.md`](../plan/plan.md)、[扩展计划](../plan/Expansion.md)、[感知计划](../plan/Perception.md) |
+| 查看未完成工作与验收目标 | [`plan/plan.md`](../plan/plan.md)、[感知计划](../plan/Perception.md) |
 
 ## 架构目录
 

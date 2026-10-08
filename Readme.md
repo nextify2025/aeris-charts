@@ -12,7 +12,7 @@ Rust 宿主通过 Git 或路径依赖，从本仓库依赖 `aeris_charts_*` crat
 
 ## 研究与订单流
 
-内置指标共用引擎持有的绑定、类型化参数模式、增量计算、渲染和布局持久化路径。目录包括趋势、动量、波动率和成交量指标，I2 广度层（包括 KST、Klinger、回归通道、TSI、Vortex、KAMA、Choppiness Index 和 ATR 带），以及七个 I3 结构与时段研究：摆动点、市场结构、公允价值缺口、订单块、时段高低点、前一周期价位和开盘区间。时段研究使用 UTC 边界，或宿主在运行时提供、不随布局持久化的研究日历。KLineChart 的指标模板与原生目录并存。参见[指标 API](docs/api/indicators.md)、[指标计算与绑定](docs/architecture/data/indicators.md)、[结构、时段与自定义研究](docs/features/studies.md)和[指标目录](plan/Expansion.md#指标目录)。
+内置指标共用引擎持有的绑定、类型化参数模式、增量计算、渲染和布局持久化路径。目录包括趋势、动量、波动率和成交量指标，I2 广度层（包括 KST、Klinger、回归通道、TSI、Vortex、KAMA、Choppiness Index 和 ATR 带），以及七个 I3 结构与时段研究：摆动点、市场结构、公允价值缺口、订单块、时段高低点、前一周期价位和开盘区间。时段研究默认按图表的交易所时区与交易日起点划分日、周、月（跨午夜的夜盘计入下一个交易日），也可改用 UTC 边界，或宿主在运行时提供、不随布局持久化的研究日历。KLineChart 的指标模板与原生目录并存。参见[指标 API](docs/api/indicators.md)、[指标计算与绑定](docs/architecture/data/indicators.md)和[结构、时段与自定义研究](docs/features/studies.md)。
 
 Rust 宿主可以用 `ChartEngine::register_custom_study` 注册类型化的自定义研究，并用 `add_custom_study` 绑定。浏览器图表在 TypeScript 中提供 `register_custom_study`、`add_custom_study` 和 `subscribe_custom_study_fault`（仅限主线程图表，worker 图表以 `unsupported` 拒绝）。引擎拥有调度、输出校验、样式和持久化，回调只提供计算。另有一条独立的外部研究路径，接收宿主已经算好的数值。
 
@@ -195,7 +195,7 @@ import "@aeristerminal/aeris-charts/design.css";
 - `packages/charts`——TypeScript 浏览器包。
 - `examples/web_demo`——浏览器集成与一致性测试宿主；它不是已发布的包。
 - `docs`——架构、公共 API、领域模型和贡献文档。
-- `plan`——现行的产品与扩展计划。
+- `plan`——现行与提议中的产品计划。
 
 完整入口见[文档导航](docs/README.md)。架构按数据基础、引擎领域、渲染与宿主边界分目录维护，详见[架构总览](docs/Architecture.md)；接入与兼容性契约见[公共 API](docs/api/README.md)。
 

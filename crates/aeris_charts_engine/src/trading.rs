@@ -6218,6 +6218,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn linked_charts_on_different_timeframes_converge_without_oscillation() {
+        let mut fast = ChartEngine::new(400.0, 240.0, 1.0);
+        let times = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let opens = [99.0, 100.0, 101.0, 100.0, 99.0, 100.0];
+        let highs = opens.map(|open| open + 3.0);
+        let lows = opens.map(|open| open - 1.0);
+        let closes = opens.map(|open| open + 2.0);
+        fast.set_series_data(0, &times, &opens, &highs, &lows, &closes)
+            .unwrap();
+        let mut slow = ChartEngine::new(400.0, 240.0, 1.0);
+        slow.set_series_data(
+            0,
+            &[10.0, 30.0, 50.0],
+            &[99.0, 101.0, 99.0],
+            &[103.0, 104.0, 103.0],
+            &[98.0, 99.0, 97.0],
+            &[102.0, 103.0, 101.0],
+        )
+        .unwrap();
+        slow.set_sync_mismatch_policy(crate::SyncMismatchPolicy::Nearest);
+        for chart in [&mut fast, &mut slow] {
+            chart.time_scale.set_width(400.0);
+            chart.fit_content();
+            chart.build_frame();
+            let _ = chart.take_sync_events();
+        }
+
+        assert!(fast.set_crosshair_position(102.0, 40.0, 0));
+        fast.set_visible_time_range(20.0, 50.0);
+        let mut last_revision = 0;
+        let mut rounds = 0;
+        loop {
+            let from_fast = fast.take_sync_events();
+            let from_slow = slow.take_sync_events();
+            if from_fast.is_empty() && from_slow.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert_eq!(rounds, 1, "applied events must never be re-published");
+            assert!(from_slow.is_empty());
+            for event in &from_fast {
+                assert!(event.revision > last_revision);
+                last_revision = event.revision;
+                slow.apply_external_sync_event(&event.kind);
+            }
+        }
+        assert_eq!(rounds, 1);
+        assert!(
+            slow.crosshair.is_some(),
+            "40 resolves to the nearest slow bar"
+        );
+        let (from, to) = slow.visible_time_range().unwrap();
+        assert!(from <= 30.0 && to >= 50.0, "{from}..{to}");
+
+        // The reverse direction uses the same queue discipline.
+        assert!(slow.set_crosshair_position(101.0, 30.0, 0));
+        let from_slow = slow.take_sync_events();
+        assert_eq!(from_slow.len(), 1);
+        fast.apply_external_sync_event(&from_slow[0].kind);
+        assert!(fast.take_sync_events().is_empty());
+        assert!(slow.take_sync_events().is_empty());
+    }
+
+    #[test]
     fn external_sync_application_preserves_pending_local_events() {
         let mut chart = chart_with_market();
         chart.fit_content();

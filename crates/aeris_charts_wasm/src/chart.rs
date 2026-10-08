@@ -5935,14 +5935,17 @@ impl AerisChart {
     pub fn set_crosshair(&mut self, x_css: f64, y_css: f64) {
         self.inner.borrow_mut().set_crosshair(x_css, y_css);
     }
-    /// the public reference's Ctrl-held magnet: the gesture layer forwards the live modifier state; a
-    /// Normal-mode crosshair then snaps to the hovered bar's rendered prices on the next
-    /// `render()` (OHLC for candles/bars, close/value for scalar series).
+    /// The held Ctrl/Cmd drawing-magnet modifier. The engine input controller reports it only
+    /// during drawing work (armed tool, pending creation or drawing drag), and a Normal-mode
+    /// crosshair resolves it against the worked drawing's effective magnet on the next
+    /// `render()`; outside drawing work it has no effect. Hosts that route input through the
+    /// controller never call this.
     pub fn set_crosshair_ohlc_magnet(&mut self, enabled: bool) {
         self.inner.borrow_mut().engine.crosshair_ohlc_magnet = enabled;
     }
 
-    /// Whether the OHLC crosshair magnet is currently engaged.
+    /// Whether the held Ctrl/Cmd drawing-magnet modifier is reported (not whether the crosshair
+    /// snaps: that follows the worked drawing's effective magnet).
     pub fn crosshair_ohlc_magnet(&self) -> bool {
         self.inner.borrow().engine.crosshair_ohlc_magnet
     }
@@ -6079,10 +6082,6 @@ impl AerisChart {
     }
     pub fn drawing_magnet_mode(&self) -> u8 {
         self.inner.borrow().drawing_magnet_mode()
-    }
-    /// Effective magnet (0/1/2) of the armed tool's next placement given the Ctrl/Cmd toggle.
-    pub fn armed_drawing_magnet(&self, toggle: bool) -> u8 {
-        self.inner.borrow().armed_drawing_magnet(toggle)
     }
     /// Keyboard-reachable handle count of a drawing (-1 when unknown or unplaceable).
     pub fn drawing_handle_count(&self, id: u32) -> i32 {

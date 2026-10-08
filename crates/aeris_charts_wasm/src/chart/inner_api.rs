@@ -3283,10 +3283,6 @@ impl ChartInner {
     pub fn drawing_magnet_mode(&self) -> u8 {
         drawing_magnet_to_u8(self.engine.drawing_magnet_mode())
     }
-    /// Effective magnet for the armed tool's next placement with the Ctrl/Cmd toggle state.
-    pub fn armed_drawing_magnet(&self, toggle: bool) -> u8 {
-        drawing_magnet_to_u8(self.engine.armed_drawing_magnet(toggle))
-    }
     /// Keyboard handle count of a drawing, or -1 for an unknown/unplaceable drawing.
     pub fn drawing_handle_count(&self, id: u32) -> i32 {
         self.engine

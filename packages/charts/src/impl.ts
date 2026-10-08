@@ -7321,11 +7321,6 @@ export class chart_impl implements chart_api {
     return DRAWING_MAGNET_FROM_U8[this.wasm.drawing_magnet_mode()] ?? "off";
   }
 
-  /** Whether the armed tool's next placement snaps strongly (crosshair magnet mirror). */
-  armed_drawing_magnet_strong(toggle: boolean): boolean {
-    return this.wasm.armed_drawing_magnet(toggle) === 2;
-  }
-
   drawings(): drawing_api[] {
     const list = JSON.parse(this.wasm.drawings_json()) as drawing_info[];
     return list.map((d) => new drawing_impl(this, d.id, d.kind, d.pane_index));
