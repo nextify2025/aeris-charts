@@ -1,14 +1,14 @@
 {
-  "policy_version": 8,
+  "policy_version": 9,
   "baseline": "explicit_previous_release",
   "thresholds": {},
   "absolute_maximums": {
-    "package-release-artifacts.npm_tarball_bytes.p50": 2270000,
-    "package-release-artifacts.npm_unpacked_bytes.p50": 6850000,
+    "package-release-artifacts.npm_tarball_bytes.p50": 2490000,
+    "package-release-artifacts.npm_unpacked_bytes.p50": 7480000,
     "package-release-artifacts.javascript_raw_bytes.p50": 620000,
     "package-release-artifacts.javascript_brotli_bytes.p50": 95000,
-    "package-release-artifacts.wasm_raw_bytes.p50": 5860000,
-    "package-release-artifacts.wasm_brotli_bytes.p50": 1430000,
+    "package-release-artifacts.wasm_raw_bytes.p50": 6400000,
+    "package-release-artifacts.wasm_brotli_bytes.p50": 1580000,
     "general-dashboard-100k.startup_ms.p50": 2000,
     "general-dashboard-100k.gpu_uploaded_bytes.p50": 100663296,
     "crosshair-reset-studies-daily-2520.canvas2d_ops.p50": 4500
@@ -185,6 +185,59 @@
         "The v6 lossless levers (IndicatorKind serde out of line, filtered chrono-tz, wasm-opt --converge, binaryen 132) were re-checked and none applies to the merged code; opt-level changes stay priced in benchmarks/README.md and not shipped because they cost frame time"
       ],
       "product_tradeoff": "Merging AerisTerminal upstream 57e00de and 1b81852 into the fork (owner decision 2026-10-05: upstream's B8 renderers are the one implementation for the 62 drawing tools both lines built). The module gains upstream's B7 capabilities (volume and session profiles, periodic and developing profiles, profile drawings, naked levels, anchored VWAP points, resampling with boundaries and stats) and upstream's B8 catalog lowering, and keeps the fork's own-line tools, measuring ranges and data readers plus the conversion of fork-written documents, clipboard items and sync payloads (legacy names, anchor contracts, flat options). The fork's per-family B8 renderers leave the module, so raw bytes stay level with main: the merged tree at 2c9ee9a measures 5,484,958 raw bytes (main 3c0efbe: 5,481,942) and 1,334,731 Brotli bytes, 4,731 bytes (0.36%) over the unchanged 1,330,000 ceiling (main: 1,324,197). Upstream's code compresses less well than the fork code it replaces; only the Brotli ceiling moves."
+    },
+    {
+      "policy_version": 9,
+      "commit": "eec305637ee95f569a6ca037beb3fef8ea1169fd",
+      "dirty_worktree": false,
+      "headroom_percent": 7,
+      "observed": {
+        "package-release-artifacts.npm_tarball_bytes.p50": 2327018,
+        "package-release-artifacts.npm_unpacked_bytes.p50": 6985796,
+        "package-release-artifacts.javascript_raw_bytes.p50": 445514,
+        "package-release-artifacts.javascript_brotli_bytes.p50": 75945,
+        "package-release-artifacts.wasm_raw_bytes.p50": 5976502,
+        "package-release-artifacts.wasm_brotli_bytes.p50": 1472953
+      },
+      "raised": {
+        "package-release-artifacts.npm_tarball_bytes.p50": {
+          "from": 2270000,
+          "to": 2490000
+        },
+        "package-release-artifacts.npm_unpacked_bytes.p50": {
+          "from": 6850000,
+          "to": 7480000
+        },
+        "package-release-artifacts.wasm_raw_bytes.p50": {
+          "from": 5860000,
+          "to": 6400000
+        },
+        "package-release-artifacts.wasm_brotli_bytes.p50": {
+          "from": 1430000,
+          "to": 1580000
+        }
+      },
+      "toolchain": {
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+        "wasm_pack": "wasm-pack 0.15.0",
+        "wasm_opt": "wasm-opt version 117 (version_117)",
+        "cargo_profile": "release",
+        "wasm_opt_args": [
+          "-Oz",
+          "--enable-mutable-globals",
+          "--enable-nontrapping-float-to-int",
+          "--enable-bulk-memory",
+          "--enable-sign-ext",
+          "--enable-simd"
+        ]
+      },
+      "levers": [
+        "eec3056: one axis-frame body via &dyn Fn instead of five monomorphized copies (-142,448 raw / -7,068 Brotli)",
+        "eec3056: one ChartOptions Value deserializer shared by core and V2 import (-54,829 / -10,001)",
+        "eec3056: shared PriceScaleTarget and naked-profile sorts (-55,942 / -7,412)",
+        "eec3056: shared effective-series-order sorts (-17,520 / -51)"
+      ],
+      "product_tradeoff": "Upstream AerisTerminal 1b81852..86e2aa2 merged into the fork (59 commits: big trades, two-tier sealed order-flow history with prepend/window/reconfigure, the 29 breadth-tier indicators, structure and session studies with study calendars and annotations, auction markers, engine-owned custom studies, the indicator gap contract and bounded live updates, drawing magnet modes, four footprint cell variants, scale price formats and single-pass axis tag placement) plus the fork's restored B8 drawing features (R1-R9), the exchange study calendar and the Chop Zone region"
     }
   ]
 }
