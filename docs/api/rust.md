@@ -279,6 +279,10 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - 行为变更：`ChartEngine::add_choppiness` 以及任何 `IndicatorKind::Choppiness` 绑定的输出 0 现在带有 `SeriesEntry::threshold_region = Some(SeriesThresholdRegion { lower: 38.2, upper: 61.8 })`，与 RSI 的 30/70 区域相同由指标种类推导。该窗格的帧因此多出一个半透明 `Prim::Rect` 通道与两条点状 `Prim::HLine` 边界线，随绑定显隐；其他窗格不受影响。
 - 区域不写入持久化文档，导入后由指标种类重建；没有新增类型、字段或变体，也不改变任何签名，因此不是源码级破坏。依赖 Choppiness 窗格像素的截图或帧快照需要更新基线。
 
+**WASM 体积：共享的反序列化与排序实例**（自有线，合并 `85bc10b` 之后的后续工作 S1）。只有一项新增，没有破坏性或行为变更：
+
+- 新增方法：`aeris_charts_core::options::ChartOptions::from_json_value(value) -> Result<ChartOptions, serde_json::Error>`，与 `serde_json::from_value::<ChartOptions>` 完全等价（接受、默认值与错误文本相同）。它是非泛型函数，选项存储与 V2 持久化校验都经由它，因此 WASM 模块只含一份该反序列化器。`build_axis_frame`、`recompute_layout_with_measure` 等接受测量闭包的公共方法签名不变，只是其内部主体改为按 trait 对象编译一次。
+
 **有界的实时指标更新与精确窗口**（上游，来自 `0fb16df`、`82c63ce`、`4af2caf` 与 `8ef6270`，经合并 `8ef6270` 的提交引入；所有者决定 Q-G 与 Q-H 仍适用；参见[指标计算与绑定](../architecture/data/indicators.md#纯计算与增量运行时)与[性能契约](../development/performance.md#指标与绘图性能目标)）。下一次 Aeris Terminal 更换固定修订时需要评审：
 
 - `0fb16df fix(indicators): recompute EoM and HV windows exactly`，数值：`ease_of_movement` 的批量函数与运行时对每个窗口重新求和，`historical_volatility` 只保留当前窗口的对数收益、以窗口自身均值为中心求样本偏差（本仓库此前以窗口第一个收益为偏移单遍求和）。大幅波动之后的平坦窗口精确为 0，其余值可能有几个 ULP 的变化；`IncrementalState::runtime_bytes` 对 HV 计入其窗口缓冲。

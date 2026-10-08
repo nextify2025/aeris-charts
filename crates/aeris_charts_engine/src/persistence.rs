@@ -3083,7 +3083,7 @@ impl ChartEngine {
         }
         let chart_options =
             crate::exchange_time_api::importable_chart_options(&state.chart_options);
-        serde_json::from_value::<aeris_charts_core::options::ChartOptions>(chart_options.clone())
+        aeris_charts_core::options::ChartOptions::from_json_value(chart_options.clone())
             .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
         let domains = state
             .panes

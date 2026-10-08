@@ -703,7 +703,7 @@ impl ChartEngine {
         G: Fn(&str, bool) -> f64,
     {
         self.sync_frame_input_invalidation();
-        let frame = self.build_axis_frame_impl(max_label_width, measure, countdown_measure, true);
+        let frame = self.build_axis_frame_impl(max_label_width, &measure, &countdown_measure, true);
         self.retained_frame.axis_generation = self.frame_invalidation.axis;
         frame
     }
@@ -711,17 +711,16 @@ impl ChartEngine {
     /// `include_transient` gates the crosshair labels: they paint per frame, but the axis-width
     /// negotiation must never see them — a wide hovered price would inflate the strip and the
     /// grow-fast/shrink-lazy policy would pin that width forever.
-    pub(crate) fn build_axis_frame_impl<F, G>(
+    ///
+    /// The measures are trait objects so this large body is compiled once instead of once per host
+    /// closure type (five copies, about 100 KB of the shipped WASM, when it was generic).
+    pub(crate) fn build_axis_frame_impl(
         &mut self,
         max_label_width: f64,
-        measure: F,
-        countdown_measure: G,
+        measure: &dyn Fn(&str, bool) -> f64,
+        countdown_measure: &dyn Fn(&str, bool) -> f64,
         include_transient: bool,
-    ) -> AxisFrame
-    where
-        F: Fn(&str, bool) -> f64,
-        G: Fn(&str, bool) -> f64,
-    {
+    ) -> AxisFrame {
         let uninitialized = !self.retained_frame.initialized;
         if uninitialized || self.retained_frame.layout_generation != self.frame_invalidation.layout
         {

@@ -275,9 +275,9 @@ impl ChartEngine {
     pub fn price_scales(&self, pane_index: usize) -> Option<Vec<PriceScaleInfo>> {
         let pane = self.panes.get(pane_index)?;
         let mut targets: Vec<_> = pane.scale_targets().collect();
-        targets.sort_by_key(|target| match pane.scale_side(*target) {
-            Some(PriceScaleSide::Left) => (0, pane.scale_order(*target).unwrap_or(0)),
-            Some(PriceScaleSide::Right) => (1, pane.scale_order(*target).unwrap_or(0)),
+        crate::sort_scale_targets(&mut targets, &|target| match pane.scale_side(target) {
+            Some(PriceScaleSide::Left) => (0, pane.scale_order(target).unwrap_or(0)),
+            Some(PriceScaleSide::Right) => (1, pane.scale_order(target).unwrap_or(0)),
             None => (2, 0),
         });
         Some(

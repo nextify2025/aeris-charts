@@ -947,7 +947,7 @@ impl ChartEngine {
                 let mut waiting = by_price
                     .into_iter()
                     .map(|(level, mut indices)| {
-                        indices.sort_unstable_by_key(|&index| levels[index].start_timestamp_micros);
+                        sort_by_start(&mut indices, &levels);
                         (level, VecDeque::from(indices))
                     })
                     .collect::<BTreeMap<_, _>>();
@@ -968,7 +968,7 @@ impl ChartEngine {
                 .data
                 .series_data(price_series)
                 .ok_or(ProfileError::UnknownSource)?;
-            candle_levels.sort_unstable_by_key(|&index| levels[index].start_timestamp_micros);
+            sort_by_start(&mut candle_levels, &levels);
             let mut next = 0;
             let mut waiting: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
             for (row, &time) in times.iter().enumerate() {
@@ -1473,6 +1473,13 @@ fn validate_profile_request(request: &ProfileRequest) -> Result<(), ProfileError
 fn valid_tick(tick: f64) -> bool {
     tick.is_finite() && tick > 0.0
 }
+
+/// Orders level indices by start time. Both naked-level sources share this one call so the WASM
+/// module carries a single unstable-sort instantiation (about 10 KB) instead of one per closure.
+fn sort_by_start(indices: &mut [usize], levels: &[NakedProfileLevel]) {
+    indices.sort_unstable_by_key(|&index| levels[index].start_timestamp_micros);
+}
+
 fn price_level(price: f64, tick: f64) -> i64 {
     (price / tick).round() as i64
 }

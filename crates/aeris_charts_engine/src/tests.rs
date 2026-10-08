@@ -7052,6 +7052,34 @@ fn v2_persistence_carries_the_crosshair_shade() {
 }
 
 #[test]
+fn v2_import_rejects_type_invalid_chart_options_before_mutation() {
+    // `import_state_v2` validates typed chart options through `ChartOptions::from_json_value`; a
+    // wrongly typed key must reject the document with the deserializer's reason and leave the
+    // fresh chart untouched.
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    chart
+        .add_pane_with_domain(true, HorizontalDomain::Temporal)
+        .unwrap();
+    let document = chart.export_state_json().unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    value["chart_options"]["layout"]["fontSize"] = serde_json::json!("big");
+    let tampered = serde_json::to_string(&value).unwrap();
+
+    let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+    let before = restored.options.value().clone();
+    let error = restored.import_state_json(&tampered).unwrap_err();
+    assert!(
+        error.message().starts_with("invalid V2 chart_options: ")
+            && error.message().contains("invalid type"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(restored.options.value(), &before);
+    assert_eq!(restored.panes.len(), 1);
+}
+
+#[test]
 fn crosshair_label_visibility_and_background_flow_from_options() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     chart.series[0].kind = SeriesKind::Line;

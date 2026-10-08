@@ -1695,9 +1695,9 @@ impl ChartEngine {
                                 && self.scale_formatter_source(pi, *target).is_some()
                         })
                         .collect();
-                    grid_targets.sort_by_key(|target| {
-                        let order = pane.scale_order(*target).unwrap_or(usize::MAX);
-                        let side = match pane.scale_side(*target) {
+                    crate::sort_scale_targets(&mut grid_targets, &|target| {
+                        let order = pane.scale_order(target).unwrap_or(usize::MAX);
+                        let side = match pane.scale_side(target) {
                             Some(PriceScaleSide::Right) => 0,
                             Some(PriceScaleSide::Left) => 1,
                             None => 2,

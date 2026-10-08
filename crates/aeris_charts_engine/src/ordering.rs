@@ -32,6 +32,16 @@ pub(crate) const PRIORITY_SELECTED: u8 = 1;
 pub(crate) const PRIORITY_HOVERED: u8 = 2;
 pub(crate) const PRIORITY_DRAG_EDIT: u8 = 3;
 
+// Both effective-order paths sort through these two functions, so each element type compiles one
+// stable sort instead of one per call site's closure (about 4 KB of WASM apiece).
+fn sort_by_position<T>(items: &mut [(usize, T)]) {
+    items.sort_by_key(|(position, _)| *position);
+}
+
+fn sort_by_priority<T>(items: &mut [(u8, usize, T)]) {
+    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+}
+
 impl ChartEngine {
     /// Binding identity for an indicator output series, or `None` for ordinary series.
     /// Bindings are the grouping owner — no classification by series type or title.
@@ -160,7 +170,7 @@ impl ChartEngine {
                 .zip(group.positions.iter().copied())
                 .map(|(id, p)| (p, id))
                 .collect();
-            paired.sort_by_key(|&(p, _)| p);
+            sort_by_position(&mut paired);
             group.ids = paired.into_iter().map(|(_, id)| id).collect();
         }
         let mut idle_indicators: Vec<(usize, Vec<SeriesId>)> = Vec::new();
@@ -178,10 +188,10 @@ impl ChartEngine {
                 ordinary_idle.push((group.first_pos, group.ids));
             }
         }
-        idle_indicators.sort_by_key(|&(p, _)| p);
-        ordinary_idle.sort_by_key(|&(p, _)| p);
+        sort_by_position(&mut idle_indicators);
+        sort_by_position(&mut ordinary_idle);
         // Priority ascending (selected below hovered), stable within a tier.
-        active.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        sort_by_priority(&mut active);
         let mut out = Vec::with_capacity(self.series_order.len());
         for (_, mut ids) in idle_indicators {
             out.append(&mut ids);
@@ -234,7 +244,7 @@ impl ChartEngine {
             let Some(mut group) = groups.remove(&key) else {
                 continue;
             };
-            group.ids.sort_by_key(|&(p, _)| p);
+            sort_by_position(&mut group.ids);
             if group.priority == PRIORITY_IDLE {
                 idle.append(&mut group.ids);
             } else {
@@ -246,9 +256,9 @@ impl ChartEngine {
             }
         }
         // Idle verbatim in explicit order; active ordered by priority then first position.
-        idle.sort_by_key(|&(p, _)| p);
+        sort_by_position(&mut idle);
         let mut out: Vec<SeriesId> = idle.into_iter().map(|(_, id)| id).collect();
-        active.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        sort_by_priority(&mut active);
         for (_, _, mut ids) in active {
             out.append(&mut ids);
         }
@@ -307,7 +317,63 @@ impl ChartEngine {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ChartEngine, SeriesKind};
+    use super::{sort_by_position, sort_by_priority};
+    use crate::{ChartEngine, PriceScaleId, PriceScaleTarget, SeriesKind, sort_scale_targets};
+
+    #[test]
+    fn shared_sorts_are_stable_by_their_keys() {
+        let named = |id: u32| PriceScaleTarget::Named(PriceScaleId::try_from(id).unwrap());
+        // Each shared sort replaced call-site `sort_by_key`/`sort_by` calls; equal keys must keep
+        // their input order exactly as those stable sorts did.
+        let mut positions = vec![(3, 'a'), (1, 'b'), (3, 'c'), (0, 'd'), (1, 'e')];
+        sort_by_position(&mut positions);
+        assert_eq!(
+            positions,
+            [(0, 'd'), (1, 'b'), (1, 'e'), (3, 'a'), (3, 'c')]
+        );
+
+        let mut active = vec![
+            (2, 5, 'a'),
+            (1, 9, 'b'),
+            (2, 1, 'c'),
+            (1, 9, 'd'),
+            (2, 1, 'e'),
+        ];
+        sort_by_priority(&mut active);
+        assert_eq!(
+            active,
+            [
+                (1, 9, 'b'),
+                (1, 9, 'd'),
+                (2, 1, 'c'),
+                (2, 1, 'e'),
+                (2, 5, 'a')
+            ]
+        );
+
+        let mut targets = vec![
+            named(4),
+            PriceScaleTarget::Right,
+            named(2),
+            PriceScaleTarget::Left,
+            PriceScaleTarget::Overlay,
+        ];
+        sort_scale_targets(&mut targets, &|target| match target {
+            PriceScaleTarget::Left | PriceScaleTarget::Right => (0, 1),
+            PriceScaleTarget::Named(id) => (0, id.get() as usize % 2),
+            PriceScaleTarget::Overlay => (0, 0),
+        });
+        assert_eq!(
+            targets,
+            [
+                named(4),
+                named(2),
+                PriceScaleTarget::Overlay,
+                PriceScaleTarget::Right,
+                PriceScaleTarget::Left,
+            ]
+        );
+    }
 
     fn chart_with_bars(n: usize) -> ChartEngine {
         let mut chart = ChartEngine::new(800.0, 500.0, 1.0);

@@ -508,6 +508,16 @@ pub struct AutoscaleInfo {
 /// series from autoscale). Hosts must not call back into the chart from the provider.
 pub type AutoscaleInfoProviderFn = Box<dyn Fn(Option<AutoscaleInfo>) -> Option<AutoscaleInfo>>;
 
+/// Stable sort of price-scale targets by `key`. Every target ordering goes through this one
+/// function so the WASM module carries a single sort instantiation instead of one per call site's
+/// key closure (about 10 KB each).
+pub(crate) fn sort_scale_targets(
+    targets: &mut [PriceScaleTarget],
+    key: &dyn Fn(PriceScaleTarget) -> (usize, usize),
+) {
+    targets.sort_by_key(|target| key(*target));
+}
+
 /// Apply the chart-level `leftPriceScale`/`rightPriceScale` tick keys (reference
 /// `tickMarkDensity`/`ensureEdgeTickMarksVisible`) present in `group` to one scale.
 fn apply_chart_tick_mark_options(
@@ -1927,7 +1937,9 @@ impl Pane {
                 .filter(|entry| entry.side == side)
                 .map(|entry| PriceScaleTarget::Named(entry.id)),
         );
-        targets.sort_by_key(|target| self.scale_order(*target).unwrap_or(usize::MAX));
+        sort_scale_targets(&mut targets, &|target| {
+            (self.scale_order(target).unwrap_or(usize::MAX), 0)
+        });
         targets
     }
 

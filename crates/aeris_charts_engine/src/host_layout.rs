@@ -164,6 +164,17 @@ impl ChartEngine {
         F: Fn(&str, bool) -> f64,
         G: Fn(&str, bool) -> f64,
     {
+        self.recompute_layout_measured(allow_axis_shrink, &measure, &countdown_measure);
+    }
+
+    /// The body of [`Self::recompute_layout_with_measure`], compiled once for every host closure
+    /// type (it and the axis frame it negotiates were otherwise duplicated per caller in the WASM).
+    fn recompute_layout_measured(
+        &mut self,
+        allow_axis_shrink: bool,
+        measure: &dyn Fn(&str, bool) -> f64,
+        countdown_measure: &dyn Fn(&str, bool) -> f64,
+    ) {
         self.frame_build_stats.layout_rebuilds += 1;
         // Tick density derives from the resolved axis metrics: sync before negotiating so the
         // measured tick sets match what the frame will build.
@@ -354,8 +365,8 @@ impl ChartEngine {
             .collect();
         let axis_frame = chart.build_axis_frame_impl(
             chart.axis_label_width_cap(),
-            measure,
-            countdown_measure,
+            &measure,
+            &countdown_measure,
             request.include_crosshair,
         );
         let mut axis_primitives = Vec::new();
@@ -461,6 +472,57 @@ mod tests {
         assert_eq!(negotiated_axis_width(58.0, 52.0, false), 58.0);
         assert_eq!(negotiated_axis_width(58.0, 52.0, true), 52.0);
         assert_eq!(negotiated_axis_width(0.0, 56.0, false), 56.0);
+    }
+
+    #[test]
+    fn axis_layout_is_identical_for_every_measure_callable() {
+        // API guard, not a behaviour regression test: the public generic entry points forward to
+        // trait-object bodies, so they must keep accepting a capturing closure, a function item and
+        // a `&dyn Fn` from hosts. Behaviour is covered by the frame and layout suites.
+        fn measure_fn(text: &str, bold: bool) -> f64 {
+            text.len() as f64 * if bold { 7.5 } else { 7.0 }
+        }
+        fn countdown_fn(text: &str, _: bool) -> f64 {
+            text.len() as f64 * 6.0
+        }
+        let run = |mode: u8| {
+            let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+            chart
+                .set_series_data(
+                    0,
+                    &[1.0, 2.0, 3.0],
+                    &[101.0, 102.0, 1_234.5],
+                    &[102.0, 103.0, 1_240.0],
+                    &[100.0, 101.0, 1_230.0],
+                    &[101.5, 102.5, 1_235.25],
+                )
+                .unwrap();
+            let base = 7.0;
+            let closure =
+                |text: &str, bold: bool| text.len() as f64 * if bold { base + 0.5 } else { base };
+            let countdown = |text: &str, _: bool| text.len() as f64 * (base - 1.0);
+            let dynamic: &dyn Fn(&str, bool) -> f64 = &measure_fn;
+            let dynamic_countdown: &dyn Fn(&str, bool) -> f64 = &countdown_fn;
+            let frame = match mode {
+                0 => {
+                    chart.recompute_layout_with_measure(true, closure, countdown);
+                    chart.build_axis_frame(80.0, closure, countdown)
+                }
+                1 => {
+                    chart.recompute_layout_with_measure(true, measure_fn, countdown_fn);
+                    chart.build_axis_frame(80.0, measure_fn, countdown_fn)
+                }
+                _ => {
+                    chart.recompute_layout_with_measure(true, dynamic, dynamic_countdown);
+                    chart.build_axis_frame(80.0, dynamic, dynamic_countdown)
+                }
+            };
+            (chart.axis_w, chart.left_axis_w, chart.pane_w, frame)
+        };
+        let reference = run(0);
+        assert!(reference.0 > 0.0 && !reference.3.labels.is_empty());
+        assert_eq!(run(1), reference);
+        assert_eq!(run(2), reference);
     }
 
     #[test]
