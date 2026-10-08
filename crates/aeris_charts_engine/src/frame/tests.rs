@@ -12053,6 +12053,51 @@ fn axis_width_negotiation_includes_the_secondary_countdown_row() {
     assert_eq!(with_cluster, 48.0, "outside chip must not widen the strip");
 }
 
+/// A price tick whose text a boxed tag covers drops the text but keeps its measured advance.
+/// That holds for any host measure, including one that reports a width for the empty string:
+/// the strip is exactly as wide as with no tag at all, so a tag never moves the plot edge.
+#[test]
+fn ticks_hidden_under_a_tag_keep_the_axis_width_for_any_host_measure() {
+    // A fixed-advance stand-in for host glyph measurement, the empty string included.
+    let measure = |_: &str, _: bool| 48.0;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times: Vec<f64> = (0..60).map(|i| 1_000.0 + f64::from(i) * 60.0).collect();
+    let open: Vec<f64> = (0..60).map(|i| 100.0 + f64::from(i % 7)).collect();
+    let high: Vec<f64> = open.iter().map(|value| value + 3.0).collect();
+    let low: Vec<f64> = open.iter().map(|value| value - 3.0).collect();
+    let close: Vec<f64> = open.iter().map(|value| value + 1.0).collect();
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    chart.recompute_layout_with_measure(true, measure, measure);
+    chart.fit_content();
+    chart.autoscale_visible();
+    chart.recompute_layout_with_measure(true, measure, measure);
+
+    // The live-price tag covers at least one tick, whose text is dropped.
+    let axis = chart.build_axis_frame(80.0, measure, measure);
+    assert!(
+        axis.labels.iter().any(|label| label.background.is_none()
+            && label.text.is_empty()
+            && label.measure_extra > 0.0),
+        "the fixture hides a tick under the live-price tag"
+    );
+    let with_tag = chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, measure);
+    let strip_with_tag = chart.right_builtin_axis_w;
+    let bar_x_with_tag = chart.time_to_coordinate(times[30]).unwrap();
+
+    chart.series[0].last_value_visible = false;
+    let axis = chart.build_axis_frame(80.0, measure, measure);
+    assert!(axis.labels.iter().all(|label| label.measure_extra == 0.0));
+    let without_tag = chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, measure);
+    assert_eq!(with_tag, without_tag);
+
+    // The full layout path keeps the plot edge, so a fixed bar stays where it was.
+    chart.recompute_layout_with_measure(true, measure, measure);
+    assert_eq!(chart.right_builtin_axis_w, strip_with_tag);
+    assert_eq!(chart.time_to_coordinate(times[30]).unwrap(), bar_x_with_tag);
+}
+
 #[test]
 fn exact_axis_width_negotiation_includes_the_countdown_row() {
     let measure = |text: &str, _bold: bool| text.len() as f64 * 7.0;

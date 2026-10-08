@@ -1783,8 +1783,12 @@ impl ChartEngine {
             .map(|label| {
                 // Advances are true host measurements at the rendered size: axis strings at
                 // the axis size (with matching weight), countdown strings at the countdown
-                // size. No shrink factors.
-                if label.font_scale == COUNTDOWN_FONT_SCALE {
+                // size. No shrink factors. A label without text paints nothing and contributes
+                // only its recorded extra, so a tick hidden under a tag keeps exactly its
+                // measured advance whatever the host reports for an empty string.
+                if label.text.is_empty() {
+                    label.measure_extra
+                } else if label.font_scale == COUNTDOWN_FONT_SCALE {
                     countdown_text_width(&label.text, &countdown_measure) + label.measure_extra
                 } else {
                     measure(&label.text, label.bold) + label.measure_extra
