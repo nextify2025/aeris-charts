@@ -530,9 +530,11 @@ fn stochastic_tail_window_is_reused_only_where_the_tail_state_resumes() {
     columns.write(1024, &mut rng, false);
     columns.low[1024] -= 40.0;
     assert_stochastic_resumes_like_a_full_rebuild(&mut state, &columns, 1024);
+    // One replayed row plus the four earlier valid rows of its %K window, read from the recorded
+    // valid rows; a resume that replays the %D window from earlier rows reads more.
     assert_eq!(
         state.last_work_rows(),
-        1,
+        5,
         "the replacement resumed from the tail state"
     );
 }
@@ -540,9 +542,9 @@ fn stochastic_tail_window_is_reused_only_where_the_tail_state_resumes() {
 #[test]
 fn truncation_just_past_a_checkpoint_keeps_tail_windows_complete() {
     // A truncation resumes from the sparse checkpoint at row 1023 when the new length is just past
-    // it. Runtimes with a retained tail window (Stochastic %D, Stochastic RSI) must rebuild that
-    // window with every sample the next replacement of the new last row needs, not just the
-    // samples before the truncation point.
+    // it. Runtimes with a retained tail window (Stochastic %D; Stochastic RSI now carries its RSI
+    // window in its checkpointed state) must rebuild that window with every sample the next
+    // replacement of the new last row needs, not just the samples before the truncation point.
     let mut rng = Rng(0x7c0a);
     let mut base = Columns::default();
     for row in 0..1_060 {

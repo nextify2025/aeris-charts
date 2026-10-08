@@ -279,6 +279,13 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - 行为变更：`ChartEngine::add_choppiness` 以及任何 `IndicatorKind::Choppiness` 绑定的输出 0 现在带有 `SeriesEntry::threshold_region = Some(SeriesThresholdRegion { lower: 38.2, upper: 61.8 })`，与 RSI 的 30/70 区域相同由指标种类推导。该窗格的帧因此多出一个半透明 `Prim::Rect` 通道与两条点状 `Prim::HLine` 边界线，随绑定显隐；其他窗格不受影响。
 - 区域不写入持久化文档，导入后由指标种类重建；没有新增类型、字段或变体，也不改变任何签名，因此不是源码级破坏。依赖 Choppiness 窗格像素的截图或帧快照需要更新基线。
 
+**有界的实时指标更新与精确窗口**（上游，来自 `0fb16df`、`82c63ce`、`4af2caf` 与 `8ef6270`，经合并 `8ef6270` 的提交引入；所有者决定 Q-G 与 Q-H 仍适用；参见[指标计算与绑定](../architecture/data/indicators.md#纯计算与增量运行时)与[性能契约](../development/performance.md#指标与绘图性能目标)）。下一次 Aeris Terminal 更换固定修订时需要评审：
+
+- `0fb16df fix(indicators): recompute EoM and HV windows exactly`，数值：`ease_of_movement` 的批量函数与运行时对每个窗口重新求和，`historical_volatility` 只保留当前窗口的对数收益、以窗口自身均值为中心求样本偏差（本仓库此前以窗口第一个收益为偏移单遍求和）。大幅波动之后的平坦窗口精确为 0，其余值可能有几个 ULP 的变化；`IncrementalState::runtime_bytes` 对 HV 计入其窗口缓冲。
+- `82c63ce fix(indicators): bound live updates for window and lag kinds`：标准差、CCI、Williams %R、Donchian、Ichimoku、CMF、动量与变动率的批量函数与运行时共用逐行辅助函数；`stochastic_rsi` 批量函数改为步进器的折叠，其运行时把 RSI 状态与 RSI 窗口一起存入检查点（数值不变）。行为变更：`IncrementalState::last_work_rows` 改为报告读取的源行数——窗口类为窗口所跨越的行（一次尖端更新为回看长度加一，此前为一），Stochastic、KDJ 与 Fisher 另加价格窗口在重放起点之前读取的有效行——因此 `ChartEngine::last_indicator_work_rows` 变大，依赖它的遥测阈值需要重新设定。合并时的自有线调整：CMF 与 MFI 保留本仓库的无状态函数（成交量列末端之后的行按零成交量照常输出，上游的运行时在那里停止输出）；窗口在缺口后跨越最近的有效行（Q-G），运行时为此新增私有的 `ValidRows` 记录尖端之前的有效行，使尖端之前紧邻任意长度的空白数据段时，实时更新读取的行数仍只由周期决定；不重算任何行的重建（例如引擎把位于数据末端或之后的成交量、成交额 Tick 夹到末端时）报告 0。内存遥测随之变化：窗口类、Stochastic、KDJ 与 Fisher 绑定的 `IncrementalState::runtime_bytes`（以及 `ChartEngine::memory_usage().indicator_runtime_bytes`）计入该有效行记录及其复用的查询缓冲（上界由周期决定，与历史长度无关；窗口类此前报告 0），Stochastic RSI 的检查点计入其 RSI 窗口，设有内存阈值的宿主可能看到小幅增加。
+- `4af2caf perf(indicators): bound live updates for pivots, zigzag, and engine inputs`：本仓库早已具备有界的枢轴点（按交易所交易日分组）、ZigZag（开放转折点）、Fisher 运行时，以及引擎绑定自有的派生价格列（`price_input`）、对齐成交量列（`AlignedWeights`）和按时间戳把稀疏成交量变更行映射回源行的 `weight_change_source_row`，因此未合入上游的 `BindingInputs`、`FisherCarry`、`volume_change_source_row` 与上游的枢轴点/ZigZag 文本，Rust 宿主无需改动。性能门禁新增 Target V（上游的 Target Q）。
+- `8ef6270 fix(benchmarks): raise WASM brotli ceiling for bounded live updates`：只提高上游自身的体积上限；本仓库保留体积预算策略 v8，不采用上游的数值。
+
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
 - `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming, viewport, price axis, and intraday charts`（自有线）：

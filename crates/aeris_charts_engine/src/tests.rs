@@ -3252,6 +3252,360 @@ fn structure_kind(kind: &IndicatorKind) -> bool {
     )
 }
 
+/// Source bars, a volume series on the same timestamps, and a volume series that skips every
+/// tenth history row, kept alongside the engine so a fresh engine can be loaded with the same data.
+struct LiveIndicatorFixture {
+    chart: ChartEngine,
+    aligned_volume: SeriesId,
+    sparse_volume: SeriesId,
+    times: Vec<f64>,
+    bars: Vec<[f64; 4]>,
+    volumes: Vec<f64>,
+    sparse_rows: Vec<usize>,
+    outputs: Vec<Vec<SeriesId>>,
+}
+
+impl LiveIndicatorFixture {
+    fn bar(row: usize) -> [f64; 4] {
+        let x = row as f64;
+        if row % 97 == 41 {
+            return [f64::NAN; 4];
+        }
+        let close = 100.0 + (x * 0.0031).sin() * 25.0 + (x * 0.17).sin() * 1.5;
+        let open = close - (x * 0.53).sin() * 0.6;
+        [open, close.max(open) + 0.4, close.min(open) - 0.4, close]
+    }
+
+    fn new(rows: usize) -> Self {
+        let times = (0..rows)
+            .map(|row| row as f64 * 3_600.0)
+            .collect::<Vec<_>>();
+        let bars = (0..rows).map(Self::bar).collect::<Vec<_>>();
+        let volumes = (0..rows)
+            .map(|row| 100.0 + (row % 37) as f64 * 7.0)
+            .collect::<Vec<_>>();
+        let sparse_rows = (0..rows).filter(|row| row % 10 != 9).collect();
+        let mut fixture = Self {
+            chart: ChartEngine::new(800.0, 500.0, 1.0),
+            aligned_volume: 0,
+            sparse_volume: 0,
+            times,
+            bars,
+            volumes,
+            sparse_rows,
+            outputs: Vec::new(),
+        };
+        fixture.load();
+        fixture.attach();
+        fixture
+    }
+
+    fn load(&mut self) {
+        let column = |index: usize| self.bars.iter().map(|bar| bar[index]).collect::<Vec<_>>();
+        let chart = &mut self.chart;
+        self.aligned_volume = chart.add_series(SeriesKind::Histogram);
+        self.sparse_volume = chart.add_series(SeriesKind::Histogram);
+        chart
+            .set_series_data(
+                0,
+                &self.times,
+                &column(0),
+                &column(1),
+                &column(2),
+                &column(3),
+            )
+            .unwrap();
+        let volumes = &self.volumes;
+        chart
+            .set_series_data(
+                self.aligned_volume,
+                &self.times,
+                volumes,
+                volumes,
+                volumes,
+                volumes,
+            )
+            .unwrap();
+        let sparse_times = self
+            .sparse_rows
+            .iter()
+            .map(|&row| self.times[row])
+            .collect::<Vec<_>>();
+        let sparse = self
+            .sparse_rows
+            .iter()
+            .map(|&row| self.volumes[row])
+            .collect::<Vec<_>>();
+        chart
+            .set_series_data(
+                self.sparse_volume,
+                &sparse_times,
+                &sparse,
+                &sparse,
+                &sparse,
+                &sparse,
+            )
+            .unwrap();
+    }
+
+    /// Every kind at once, plus each derived price input and volume on its own timeline. The
+    /// fork list carries the seed and convention variants, KDJ, the structure and session studies
+    /// and the KLineChart templates (upstream: its 71 built-in kinds plus the study schemas).
+    fn attach(&mut self) {
+        let kinds = every_indicator_kind_with_klinechart_templates();
+        let chart = &mut self.chart;
+        let mut outputs = kinds
+            .iter()
+            .map(|kind| add_test_indicator(chart, kind, Some(self.aligned_volume)))
+            .collect::<Vec<_>>();
+        for input in [
+            IndicatorInputSource::Hl2,
+            IndicatorInputSource::Hlc3,
+            IndicatorInputSource::Ohlc4,
+            IndicatorInputSource::Hlcc4,
+        ] {
+            outputs.push(chart.add_indicator_kind_with_input(
+                0,
+                input,
+                IndicatorKind::Sma { period: 5 },
+                None,
+            ));
+        }
+        outputs.push(chart.add_indicator_kind(0, IndicatorKind::Obv, Some(self.sparse_volume)));
+        outputs.push(chart.add_indicator_kind_with_input(
+            0,
+            IndicatorInputSource::Hlc3,
+            IndicatorKind::Vwap,
+            Some(self.sparse_volume),
+        ));
+        assert!(outputs.iter().all(|outputs| !outputs.is_empty()));
+        self.outputs = outputs;
+    }
+
+    /// Write one row to the source and then to both volume series, as a host feeding one
+    /// stream does.
+    fn write(&mut self, row: usize, bar: [f64; 4], volume: f64) {
+        let time = row as f64 * 3_600.0;
+        if row == self.times.len() {
+            self.times.push(time);
+            self.bars.push(bar);
+            self.volumes.push(volume);
+            self.sparse_rows.push(row);
+        } else {
+            self.bars[row] = bar;
+            self.volumes[row] = volume;
+            if let Err(position) = self.sparse_rows.binary_search(&row) {
+                self.sparse_rows.insert(position, row);
+            }
+        }
+        assert!(self.chart.update_series_bar(0, time, bar));
+        for series in [self.aligned_volume, self.sparse_volume] {
+            assert!(self.chart.update_series_bar(series, time, [volume; 4]));
+        }
+    }
+
+    fn assert_matches_fresh_engine(&self, stage: &str) {
+        let mut fresh = Self {
+            chart: ChartEngine::new(800.0, 500.0, 1.0),
+            aligned_volume: 0,
+            sparse_volume: 0,
+            times: self.times.clone(),
+            bars: self.bars.clone(),
+            volumes: self.volumes.clone(),
+            sparse_rows: self.sparse_rows.clone(),
+            outputs: Vec::new(),
+        };
+        fresh.load();
+        fresh.attach();
+        for (live, expected) in self.outputs.iter().zip(&fresh.outputs) {
+            for (&id, &reference) in live.iter().zip(expected) {
+                let kind = &self
+                    .chart
+                    .indicators
+                    .iter()
+                    .find(|binding| binding.outputs.contains(&id))
+                    .unwrap()
+                    .kind;
+                let (actual_times, actual) = self.chart.data.series_data(id).unwrap();
+                let (expected_times, values) = fresh.chart.data.series_data(reference).unwrap();
+                assert_eq!(actual_times, expected_times, "{kind:?} {stage} output {id}");
+                for (row, (&a, &b)) in actual[3].iter().zip(values[3]).enumerate() {
+                    assert!(
+                        (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-9 * b.abs().max(1.0),
+                        "{kind:?} {stage} output {id} row {row}: {a:?} != {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Indicator source rows read and the largest output LOD rewrite of the last update.
+    ///
+    /// Fork: ZigZag's count adds the rows it re-emits back to its unconfirmed leg's open row, which
+    /// follows the price path at each size rather than the history length, so it is summed apart
+    /// (the third value) and bounded instead of compared.
+    fn work(&self) -> (usize, usize, usize) {
+        let lod_nodes = self
+            .outputs
+            .iter()
+            .flatten()
+            .map(|&id| self.chart.data.last_lod_update_nodes(id).unwrap())
+            .max()
+            .unwrap();
+        let zigzag = self
+            .chart
+            .indicators
+            .iter()
+            .filter(|binding| matches!(binding.kind, IndicatorKind::ZigZag { .. }))
+            .map(IndicatorBinding::last_work_rows)
+            .sum::<usize>();
+        (
+            self.chart.last_indicator_work_rows() - zigzag,
+            lod_nodes,
+            zigzag,
+        )
+    }
+}
+
+#[test]
+fn engine_live_updates_with_every_kind_attached_do_bounded_work_and_match_a_fresh_engine() {
+    let mut work = Vec::new();
+    // Fork: a window that spans a whitespace row reads it too (KLineChart templates step in
+    // source rows; the compacted windows count the valid rows they read), so both sizes put the
+    // fixture's periodic gap rows (`row % 97 == 41`) at the same distance from the tip, and, like
+    // upstream's 65,536, at the same offset from the 1,024-row checkpoints the structure studies
+    // resume a tip replacement from: 103,424 = 4,096 + lcm(97, 1,024).
+    for rows in [4_096, 103_424] {
+        let mut fixture = LiveIndicatorFixture::new(rows);
+        let row = rows;
+        fixture.write(row, LiveIndicatorFixture::bar(row), 333.0);
+        let append = fixture.work();
+        let [open, high, low, close] = LiveIndicatorFixture::bar(row);
+        fixture.write(row, [open, high + 0.75, low - 0.5, close + 0.25], 444.0);
+        let replace = fixture.work();
+        work.push((rows, append, replace));
+        if rows == 4_096 {
+            fixture.assert_matches_fresh_engine("live tip");
+            // A historical volume sample at a timestamp the sparse series did not have shifts
+            // every later sparse volume row; the aligned rows before it must stay unchanged.
+            fixture.write(rows - 7, LiveIndicatorFixture::bar(rows - 7), 555.0);
+            fixture.assert_matches_fresh_engine("historical sparse volume insert");
+        }
+    }
+    let (_, small_append, small_replace) = work[0];
+    let (_, large_append, large_replace) = work[1];
+    assert_eq!(
+        (small_append.0, small_replace.0),
+        (large_append.0, large_replace.0),
+        "indicator source rows read per live update grow with history: {work:?}"
+    );
+    assert!(
+        large_append.1 <= 16 && large_replace.1 <= 16,
+        "an output series was rewritten beyond its tail: {work:?}"
+    );
+    assert!(
+        work.iter()
+            .all(|(_, append, replace)| append.2 <= 64 && replace.2 <= 64),
+        "ZigZag re-emitted more than its unconfirmed leg: {work:?}"
+    );
+}
+
+#[test]
+fn every_indicator_binding_matches_fresh_engine_on_flat_runs_after_large_moves() {
+    // Large $1M and $100 moves followed by exact flat runs (one straddling the 1,024-row
+    // checkpoint), $1M prices with 1e-7 moves, near-flat and alternating runs, single- and
+    // multi-row gaps. Half-ranges are dyadic so flat closes keep exactly flat midpoints while
+    // the range and volume change on every row; a running window sum leaves residue here.
+    const N: usize = 1_100;
+    let mut seed = 0x9e37_79b9_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut close = 1e6;
+    let mut bars = Vec::with_capacity(N + 3);
+    let mut volumes = Vec::with_capacity(N + 3);
+    for row in 0..N + 3 {
+        let unit = (next() >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0;
+        let tick = (next() % 11) as f64 - 5.0;
+        close = match row {
+            0..150 => close + unit * 5_000.0,
+            300..450 => 1e6 + tick * 1e-7,
+            450..600 => (if row == 450 { 100.0 } else { close } + unit * 5.0).max(25.0),
+            600..750 => 100.0 + tick * 1e-8,
+            750..900 => 100.0 + if row % 2 == 0 { 1.0 } else { -1.0 },
+            900..960 => (if row == 900 { 1e6 } else { close }) + unit * 5_000.0,
+            _ => close,
+        };
+        let half = 0.25
+            * (1 + next()
+                % match row {
+                    0..150 | 900..960 => 3_600,
+                    450..600 => 40,
+                    _ => 8,
+                }) as f64;
+        bars.push([close, close + half, close - half, close]);
+        volumes.push(if row % 29 == 0 {
+            0.0
+        } else if next() % 50 == 0 {
+            1e6
+        } else {
+            (1 + next() % 1_000) as f64
+        });
+    }
+    for row in [200, 640, 641, 1_019, 1_020, 1_021, 1_022, 1_023, 1_060] {
+        bars[row] = [f64::NAN; 4];
+    }
+    let times = (0..N + 3)
+        .map(|row| row as f64 * 3_600.0)
+        .collect::<Vec<_>>();
+    let column = |rows: usize, index: usize| bars[..rows].iter().map(|bar| bar[index]).collect();
+    let install = |rows: usize, kind: &IndicatorKind| {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let [open, high, low, close]: [Vec<f64>; 4] =
+            std::array::from_fn(|index| column(rows, index));
+        chart
+            .set_series_data(0, &times[..rows], &open, &high, &low, &close)
+            .unwrap();
+        let v = &volumes[..rows];
+        chart
+            .set_series_data(volume, &times[..rows], v, v, v, v)
+            .unwrap();
+        let outputs = add_test_indicator(&mut chart, kind, Some(volume));
+        (chart, volume, outputs)
+    };
+    for kind in every_indicator_kind_with_klinechart_templates() {
+        let (mut chart, volume, outputs) = install(N, &kind);
+        for rows in N + 1..=N + 3 {
+            let row = rows - 1;
+            assert!(
+                chart.update_series_bar(0, times[row], bars[row]),
+                "{kind:?}"
+            );
+            assert!(
+                chart.update_series_bar(volume, times[row], [volumes[row]; 4]),
+                "{kind:?}"
+            );
+            let (fresh, _, expected) = install(rows, &kind);
+            for (&id, &reference) in outputs.iter().zip(&expected) {
+                let (_, actual) = chart.data.series_data(id).unwrap();
+                let (_, wanted) = fresh.data.series_data(reference).unwrap();
+                assert_eq!(actual[3].len(), wanted[3].len(), "{kind:?} rows {rows}");
+                for (index, (&a, &b)) in actual[3].iter().zip(wanted[3]).enumerate() {
+                    assert!(
+                        (a.is_nan() && b.is_nan())
+                            || (a - b).abs() <= 1e-12_f64.max(1e-9 * b.abs()),
+                        "{kind:?} rows {rows} output {id} point {index}: binding {a:e} != fresh {b:e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The structure and session studies, with small windows so short fixtures confirm structure.
 fn study_indicator_kinds() -> Vec<IndicatorKind> {
     use crate::indicators::{
@@ -14880,14 +15234,14 @@ fn seeded_sequence_axis_appends_reweigh_the_first_tick_like_fresh_install() {
     );
 }
 
-#[test]
-fn every_indicator_engine_path_matches_fresh_engine_on_gap_mutations() {
+/// [`every_indicator_kind_with_conventions`] plus the KLineChart templates: every fork binding
+/// kind a chart can attach to one OHLC source. AVP reads turnover as its scalar source series;
+/// its gap rules are covered in `klinechart_indicators`.
+fn every_indicator_kind_with_klinechart_templates() -> Vec<IndicatorKind> {
     let mut kinds = every_indicator_kind_with_conventions();
     kinds.extend(
         aeris_charts_indicators::klinechart::NAMES
             .into_iter()
-            // AVP reads turnover as its scalar source series; its gap rules are covered in
-            // `klinechart_indicators`.
             .filter(|&name| name != "AVP")
             .map(|name| {
                 IndicatorKind::KLineChart(
@@ -14895,6 +15249,12 @@ fn every_indicator_engine_path_matches_fresh_engine_on_gap_mutations() {
                 )
             }),
     );
+    kinds
+}
+
+#[test]
+fn every_indicator_engine_path_matches_fresh_engine_on_gap_mutations() {
+    let kinds = every_indicator_kind_with_klinechart_templates();
     // Every built-in kind with its seed and convention variants (both Envelopes modes, both KDJ
     // seeds), the structure and session studies, and 26 of the 27 KLineChart templates.
     assert_eq!(kinds.len(), 102, "update the fork kind list count");

@@ -43,6 +43,11 @@
 //!              and one exchange time-zone change rebuilding the exchange-calendar session studies
 //!   Target U — the Target R tape with auction markers bound to the same stream, and a variant
 //!              with revisit rays (`extend_until_revisited`) under a footprint `max_points` ceiling
+//!   Target V — live indicator updates for every `IndicatorKind` (KDJ, every KLineChart template,
+//!              the convention variants, the structure and session studies and a custom study
+//!              included): tip append and tip replacement p99 at 10k and 1M rows per binding and
+//!              with all attached, history-length scaling, and fresh-engine equality
+//!              (`perf_gate/indicator_live.rs`; upstream's Target Q)
 //!
 //! Report-only by default (prints numbers + PASS/FAIL). Set `AERIS_CHARTS_PERF_STRICT=1` to exit non-zero
 //! on any failure so CI can treat it as a hard gate; thresholds are machine-dependent, so the
@@ -73,6 +78,9 @@ use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::Prim;
 use aeris_charts_render_wgpu::{DrawGroup, TexQuadInstance, prims_to_group};
+
+#[path = "perf_gate/indicator_live.rs"]
+mod indicator_live;
 
 /// Parallel `(times, open, high, low, close)` columns.
 type OhlcColumns = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
@@ -3673,6 +3681,9 @@ fn main() -> ExitCode {
         if s_retention { "PASS" } else { "FAIL" }
     );
 
+    // ---- Target V: live indicator updates for every IndicatorKind (upstream's Target Q) -------
+    let v_pass = indicator_live::run();
+
     let all_pass = a_pass
         && p_frame
         && p_no_autoscale
@@ -3734,7 +3745,8 @@ fn main() -> ExitCode {
         && t_tip
         && t_correction
         && t_zone_rebuild
-        && u_pass;
+        && u_pass
+        && v_pass;
     println!(
         "\n{}",
         if all_pass {

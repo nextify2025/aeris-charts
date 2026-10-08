@@ -97,7 +97,7 @@
 - `aeris_charts_core`：`session_open_is_the_latest_local_session_start_at_or_before_the_time`。
 - 引擎：`structure_engine_tests`、`annotation_binding_tests`、`session_study_regressions`、`study_segment_tests`、`calendar_replacement_*`、`structure_and_session_slot_fill_ticks_take_the_tail_path`、`structure_studies_refuse_as_of_sources_atomically`、`study_outputs_report_warmup_and_no_fixed_convergence`、`structure_anchors_show_no_legend_value_and_are_never_hit`、`exchange_calendar_*` 与 `exchange_time_changes_rebuild_every_exchange_study_in_one_operation`（上期所式夜盘的周与月、UTC 图表上与 `utc` 相同、时区与交易时段起点变化的一次重建、V3 往返），以及包含七个研究的空白数据、随机变更与有界工作量测试。
 - 浏览器：`study-foundation`、`structure-studies`、`session-studies`（含交易所日历的夜盘周与月及时区变化）、`study-replay`、`indicator-catalog` 与 `persistence`（V3 文档中 `exchange` 日历的往返，以及缺少日历字段时读作 `exchange`）规格。
-- 性能：`perf_gate` 的 Target M（studies）在 1,000,000 行上对追加与预先安装的时段槽位计时，并要求每个 Tick 的扫描行数为常数且每个绑定都有报告；Target T 在 1,000,000 行上测量七个研究同时绑定时的末端替换 p99、一次回溯 20,000 行的历史修正，以及一次交易所时区变化对三个时段研究的整段重建。两者的时段研究都使用默认的 `exchange` 日历，图表为 `Asia/Shanghai` 时区、交易时段起点 −3 小时（见[性能契约](../development/performance.md#指标与绘图性能目标)）。
+- 性能：`perf_gate` 的 Target M（studies）在 1,000,000 行上对追加与预先安装的时段槽位计时，并要求每个 Tick 的扫描行数为常数且每个绑定都有报告；Target T 在 1,000,000 行上测量七个研究同时绑定时的末端替换 p99、一次回溯 20,000 行的历史修正，以及一次交易所时区变化对三个时段研究的整段重建。两者的时段研究都使用默认的 `exchange` 日历，图表为 `Asia/Shanghai` 时区、交易时段起点 −3 小时（见[性能契约](../development/performance.md#指标与绘图性能目标)）。Target V 在 10,000 与 1,000,000 行上测量每一种 `IndicatorKind`（含结构与时段研究、KDJ 与 KLineChart 模板）的末端追加与替换 p99：每个绑定 0.5 ms 以内，全部同时绑定 4 ms 以内，增长不超过 10 倍（见[性能契约](../development/performance.md#指标与绘图性能目标)）。
 
 ## 自定义研究
 
