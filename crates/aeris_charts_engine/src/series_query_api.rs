@@ -6,9 +6,11 @@ use super::*;
 const MAX_AREA_BRUSH_RANGES: usize = 64;
 
 impl ChartEngine {
-    /// Apply one standard price format to every live series sharing a pane price scale. A price-band
-    /// tick ladder already installed on a series is kept, as with the price-format JSON: only a
-    /// `tick_ladder: null` patch clears it.
+    /// Select one standard price format for a pane price scale. Every live series on the scale
+    /// takes it now, price-kind series that join the scale later adopt it, and every
+    /// engine-built price label on the scale (trading, alert, drawing) formats through it. A
+    /// price-band tick ladder already installed on a series is kept, as with the price-format
+    /// JSON: only a `tick_ladder: null` patch clears it.
     pub fn set_price_format_for_scale(
         &mut self,
         pane: usize,
@@ -19,27 +21,53 @@ impl ChartEngine {
         if !min_move.is_finite() || min_move <= 0.0 {
             return false;
         }
-        let ids = self
-            .series
-            .iter()
-            .filter(|series| {
-                !series.removed && series.pane_index == pane && series.price_scale_target == target
-            })
-            .map(|series| series.id)
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
+        let Some(entry) = self
+            .panes
+            .get_mut(pane)
+            .filter(|entry| entry.scale(target).is_some())
+        else {
             return false;
-        }
-        for id in ids {
-            if let Some(series) = self.series_entry_mut(id) {
+        };
+        let format = ScalePriceFormat {
+            precision: precision.min(15),
+            min_move,
+        };
+        entry.set_explicit_price_format(target, Some(format));
+        for series in self.series.iter_mut() {
+            if !series.removed && series.pane_index == pane && series.price_scale_target == target {
                 series.price_format.kind = PriceFormatKind::Price;
-                series.price_format.precision = precision.min(15);
-                series.price_format.min_move = min_move;
+                series.price_format.precision = format.precision;
+                series.price_format.min_move = format.min_move;
                 series.price_format.formatter = None;
             }
         }
         self.invalidate_frame_all();
         true
+    }
+
+    /// A price-kind series bound to a scale with a selected format takes that format. Volume,
+    /// percent and custom formats are the series' own and stay untouched.
+    pub(crate) fn adopt_scale_price_format(&mut self, id: SeriesId) {
+        let Some((pane, target)) = self
+            .series_entry(id)
+            .map(|series| (series.pane_index, series.price_scale_target))
+        else {
+            return;
+        };
+        let Some(format) = self
+            .panes
+            .get(pane)
+            .and_then(|entry| entry.explicit_price_format(target))
+        else {
+            return;
+        };
+        if let Some(series) = self.series_entry_mut(id)
+            && series.price_format.kind == PriceFormatKind::Price
+        {
+            series.price_format.precision = format.precision;
+            series.price_format.min_move = format.min_move;
+            series.price_format.formatter = None;
+        }
     }
 
     /// Install transient brush styling on an ordinary Area series. Canonical data and all ordinary

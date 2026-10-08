@@ -3010,7 +3010,12 @@ impl ChartEngine {
         if let Some(series) = self.series_entry_mut(id) {
             series.title = "Volume".to_string();
             series.histogram_updown = true;
-            series.price_format.kind = PriceFormatKind::Volume;
+            // The volume format is the series' own: a precision the price scale selected (and
+            // adopted while the histogram was still a price series on pane 0) does not carry.
+            series.price_format = SeriesPriceFormat {
+                kind: PriceFormatKind::Volume,
+                ..SeriesPriceFormat::default()
+            };
         }
         self.register_trade_dependent(
             stream_id,
@@ -3568,6 +3573,7 @@ impl ChartEngine {
         });
         series.price_format = footprint_price_format(options.aggregation.tick_size);
         series.custom_frame = Default::default();
+        self.adopt_scale_price_format(id);
         self.data.set_rows_count_as_data(id, true);
         if had_data {
             let cleared = self.install_footprint_projection(
@@ -3674,6 +3680,7 @@ impl ChartEngine {
                 visual: options.visual,
             });
         series.price_format = footprint_price_format(options.aggregation.tick_size);
+        self.adopt_scale_price_format(id);
         // Trade-bound candles/bars present the same stream bars, so they follow the change too.
         // The footprint installs first: after a switch onto the sequence axis the other
         // presentations continue from its row keys, never from their old time keys.
@@ -6563,6 +6570,26 @@ mod tests {
         chart.remove_trade_stream(stream).unwrap();
     }
 
+    /// A trade volume histogram keeps its own volume format: a precision the price pane's scale
+    /// selected does not carry over while the histogram is created there and moved to its pane.
+    #[test]
+    fn trade_volume_series_keeps_its_own_format_under_a_selected_scale_precision() {
+        let mut chart = ChartEngine::new(600.0, 400.0, 1.0);
+        assert!(chart.set_price_format_for_scale(0, crate::PriceScaleTarget::Right, 0, 1.0));
+        let stream = chart
+            .add_trade_stream("K:1m", FootprintAggregationOptions::default())
+            .unwrap();
+        let volume = chart.add_trade_volume_series(stream, 1).unwrap();
+        let format = &chart.series_entry(volume).unwrap().price_format;
+        assert_eq!(format.kind, PriceFormatKind::Volume);
+        assert_eq!(format.precision, 2);
+        assert_eq!(format.min_move, 0.01);
+        assert_eq!(
+            chart.format_with_price_format(format, 1_250.0).as_deref(),
+            Some("1.25K")
+        );
+    }
+
     /// A series has one engine writer. Every attach path refuses a series another feature already
     /// writes, before it changes anything, so two writers never fight over one series' rows.
     #[test]
@@ -7959,6 +7986,71 @@ mod tests {
         assert!(chart.remove_order_flow_presentation(presentation));
         assert_eq!(chart.big_trades_options(big_trades), None);
         assert!(chart.trade_stream(presentation.trade_stream()).is_none());
+    }
+
+    #[test]
+    fn footprints_joining_a_scale_adopt_its_selected_price_format() {
+        let quarter_tick = |show_footprint| OrderFlowPresentationOptions {
+            aggregation: FootprintAggregationOptions {
+                tick_size: 0.25,
+                ticks_per_row: 1,
+                ..FootprintAggregationOptions::default()
+            },
+            show_cumulative_delta: false,
+            ..order_flow_options(show_footprint)
+        };
+        let mut chart = ChartEngine::new(600.0, 400.0, 1.0);
+        assert!(chart.set_price_format_for_scale(0, crate::PriceScaleTarget::Right, 0, 1.0));
+        let presentation = chart
+            .add_order_flow_presentation("CME:NQ", 0, quarter_tick(true))
+            .unwrap();
+        let footprint = presentation.footprint_series().unwrap();
+        let format = &chart.series_entry(footprint).unwrap().price_format;
+        assert_eq!((format.precision, format.min_move), (0, 1.0));
+        chart
+            .update_order_flow_presentation(
+                presentation,
+                vec![
+                    trade(1_000_000, 31_443.75, 2.0, AggressorSide::Buy),
+                    trade(61_000_000, 31_444.25, 1.0, AggressorSide::Sell),
+                ],
+                false,
+            )
+            .unwrap();
+        chart.time_scale.set_width(600.0);
+        chart.fit_content();
+        chart.build_frame();
+        let axis = chart.build_axis_frame(
+            100.0,
+            |text, _bold| text.len() as f64 * 7.0,
+            |text, _bold| text.len() as f64 * 6.0,
+        );
+        assert!(axis.labels.iter().any(|label| label.text == "31,444"));
+        assert!(
+            axis.labels
+                .iter()
+                .filter(|label| label.background.is_some())
+                .all(|label| !label.text.contains('.'))
+        );
+
+        // Switching to the footprint later rebuilds the series on the same scale.
+        let mut chart = ChartEngine::new(600.0, 400.0, 1.0);
+        assert!(chart.set_price_format_for_scale(0, crate::PriceScaleTarget::Right, 0, 1.0));
+        let mut presentation = chart
+            .add_order_flow_presentation("CME:NQ", 0, quarter_tick(false))
+            .unwrap();
+        chart
+            .reconfigure_order_flow_presentation(&mut presentation, quarter_tick(true))
+            .unwrap();
+        let footprint = presentation.footprint_series().unwrap();
+        assert_eq!(
+            chart
+                .series_entry(footprint)
+                .unwrap()
+                .price_format
+                .precision,
+            0
+        );
     }
 
     fn order_flow_options(show_footprint: bool) -> OrderFlowPresentationOptions {

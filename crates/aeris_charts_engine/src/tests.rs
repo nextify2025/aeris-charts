@@ -5484,6 +5484,45 @@ fn indicator_binding_owns_group_chrome_visibility_and_removal() {
 }
 
 #[test]
+fn a_selected_scale_price_format_carries_to_series_that_join_the_scale() {
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let values = [10.0, 11.0, 12.0];
+    chart
+        .set_series_data(0, &[1.0, 2.0, 3.0], &values, &values, &values, &values)
+        .unwrap();
+    let left = chart.add_series(SeriesKind::Line);
+    chart.set_series_price_scale(left, PriceScaleTarget::Left);
+    let volume = chart.add_series(SeriesKind::Histogram);
+    assert!(chart.series_apply_price_format_json(volume, r#"{"type":"volume"}"#));
+    chart.set_series_price_scale(volume, PriceScaleTarget::Left);
+    assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 0, 1.0));
+
+    let joined = chart.add_series(SeriesKind::Line);
+    assert_eq!(
+        chart.series_entry(joined).unwrap().price_format.precision,
+        0
+    );
+    chart.set_series_price_scale(left, PriceScaleTarget::Right);
+    assert_eq!(chart.series_entry(left).unwrap().price_format.precision, 0);
+    // A volume series keeps its own format on any scale.
+    chart.set_series_price_scale(volume, PriceScaleTarget::Right);
+    assert_eq!(
+        chart.series_entry(volume).unwrap().price_format.kind,
+        PriceFormatKind::Volume
+    );
+    let sma = chart.add_sma(0, 2).expect("valid SMA");
+    assert_eq!(chart.series_entry(sma).unwrap().price_format.precision, 0);
+    assert!(chart.try_set_series_pane(sma, 1, 0.3));
+    assert_eq!(chart.series_entry(sma).unwrap().price_format.precision, 0);
+
+    // Moving the scale's series to another built-in scale carries the selection with them.
+    assert!(chart.rebind_price_scale_series(0, PriceScaleTarget::Right, PriceScaleTarget::Left));
+    let late = chart.add_series(SeriesKind::Line);
+    chart.set_series_price_scale(late, PriceScaleTarget::Left);
+    assert_eq!(chart.series_entry(late).unwrap().price_format.precision, 0);
+}
+
+#[test]
 fn price_scale_series_operations_are_typed_and_atomic() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     let values = [10.0, 11.0, 12.0];

@@ -2196,7 +2196,7 @@ fn fork_form_comments_and_price_labels_are_speech_bubbles_at_their_anchor() {
                 .any(|&point| close(point, tip, 1e-3)),
         "the tail's tip is the anchor: {fills:?}"
     );
-    let price = chart.drawing_price_text(chart.drawing(label).unwrap(), 103.0);
+    let price = chart.format_drawing_price(chart.drawing(label).unwrap(), 103.0);
     let runs = text_runs(&mut chart);
     let (_, x, y, _) = run_of(&runs, &price);
     assert!(
@@ -2241,7 +2241,7 @@ fn a_fork_form_price_note_boxes_its_price_and_text_in_its_text_slot() {
         &fork(&format!(r##""text":"memo","color":"{INK}""##)),
     );
     let line_y = anchor(&chart, id, 0).1;
-    let price = chart.drawing_price_text(chart.drawing(id).unwrap(), 103.0);
+    let price = chart.format_drawing_price(chart.drawing(id).unwrap(), 103.0);
     let runs = text_runs(&mut chart);
     let (_, px, py, color) = run_of(&runs, &price);
     let (_, mx, my, _) = run_of(&runs, "memo");
@@ -2581,8 +2581,8 @@ fn fork_form_forecasts_box_the_source_and_target_on_market_colors() {
     );
     let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
     let drawing = chart.drawing(id).unwrap().clone();
-    let source = chart.drawing_price_text(&drawing, 101.0);
-    let change = format!("+{} (+4.95%)", chart.drawing_price_text(&drawing, 5.0));
+    let source = chart.format_drawing_price(&drawing, 101.0);
+    let change = format!("+{} (+4.95%)", chart.format_drawing_price(&drawing, 5.0));
     let runs = text_runs(&mut chart);
     // The source price left of the source, the change, time, and outcome right of the target.
     let (_, sx, sy, _) = run_of(&runs, &source);

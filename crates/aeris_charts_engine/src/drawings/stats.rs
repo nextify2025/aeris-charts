@@ -20,6 +20,15 @@ fn prints_zero(text: &str) -> bool {
     !text.chars().any(|c| c.is_ascii_digit() && c != '0')
 }
 
+/// Zero is unsigned: formatted text that rounds to nothing drops its sign.
+pub(crate) fn unsigned_zero(text: String) -> String {
+    if prints_zero(&text) {
+        text.trim_start_matches(['-', '\u{2212}', '+']).to_string()
+    } else {
+        text
+    }
+}
+
 /// Stats line a metric belongs to: price, time, then geometry.
 fn metric_group(metric: DrawingLabelMetric) -> usize {
     match metric {
@@ -68,31 +77,6 @@ impl ChartEngine {
         self.options.get().layout.font_size.max(11.0)
     }
 
-    /// A price or price difference in the drawing's own price format: the host formatter, then
-    /// instrument precision on the tick grid, then the bound scale's series format, then the
-    /// default. One owner for every price a drawing prints (positions, ranges, Fibonacci, Gann),
-    /// in the order the price axis itself follows.
-    pub(crate) fn drawing_price_text(&self, drawing: &Drawing, value: f64) -> String {
-        if let Some(text) = self
-            .price_formatter_fn
-            .as_ref()
-            .and_then(|format| format(value))
-        {
-            return text;
-        }
-        if let Some(precision) = self.trading_state.instrument.price_precision {
-            let tick = self.position_price_tick(drawing.pane_index, drawing.price_scale);
-            return crate::PriceFormatter::from_precision(
-                precision,
-                tick.unwrap_or(10.0_f64.powi(-(precision as i32))),
-            )
-            .format(value);
-        }
-        self.scale_formatter_source(drawing.pane_index, drawing.price_scale.target())
-            .and_then(|series| self.format_with_price_format(&series.price_format, value))
-            .unwrap_or_else(|| self.price_formatter.format(value))
-    }
-
     /// Screen angle (degrees, rising positive) and length (CSS px) between two anchors.
     pub(crate) fn drawing_screen_vector(
         &self,
@@ -119,13 +103,10 @@ impl ChartEngine {
         let last = drawing.points.get(to)?;
         let change = last.price - first.price;
         Some(match metric {
-            DrawingLabelMetric::Price => self.drawing_price_text(drawing, last.price),
+            DrawingLabelMetric::Price => self.format_drawing_price(drawing, last.price),
             DrawingLabelMetric::PriceChange => {
-                let text = self.drawing_price_text(drawing, change);
-                // Zero is unsigned: a change that rounds to nothing prints without a sign.
-                if prints_zero(&text) {
-                    text.trim_start_matches(['-', '\u{2212}', '+']).to_string()
-                } else if change > 0.0 {
+                let text = unsigned_zero(self.format_drawing_price(drawing, change));
+                if change > 0.0 && !prints_zero(&text) {
                     format!("+{text}")
                 } else {
                     text

@@ -334,7 +334,7 @@ fn price_line(ctx: &PartContext<'_>, a: Point, parts: &mut DrawingParts) {
         anchor: (a.0, a.1 - PRICE_LINE_GAP * ctx.scale),
         h_align: DrawingTextHAlign::Left,
         v_align: DrawingTextVAlign::Bottom,
-        lines: vec![ctx.engine.drawing_price_text(drawing, point.price)],
+        lines: vec![ctx.engine.format_drawing_price(drawing, point.price)],
         size: ctx.engine.drawing_text_size(drawing) * ctx.scale,
         weight: drawing.text_weight.unwrap_or(400),
         italic: drawing.text_italic,

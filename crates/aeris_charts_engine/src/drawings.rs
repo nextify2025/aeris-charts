@@ -40,6 +40,7 @@ pub(crate) use geometry::{
     ellipse_outline, level_band_pairs, resolve_drawing_geometry,
 };
 pub(crate) use parts::{DrawingPart, DrawingParts, PartContext, arrow_cap_triangle, cap_radius};
+pub(crate) use stats::unsigned_zero;
 pub(crate) use tools::{
     DRAWING_TOOL_SPECS, DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement,
     DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
@@ -7693,7 +7694,7 @@ impl ChartEngine {
                 y: label_y,
             } => {
                 let label = if drawing.text.is_empty() {
-                    self.price_formatter.format(drawing.points[0].price)
+                    self.format_drawing_price(drawing, drawing.points[0].price)
                 } else {
                     drawing.text.clone()
                 };

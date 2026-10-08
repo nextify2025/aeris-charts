@@ -242,6 +242,7 @@ impl ChartEngine {
                 series.price_format.min_move = min_move;
             }
         }
+        self.adopt_scale_price_format(series_id);
         let mut created_pane = None;
         let pane_index = match descriptor.pane {
             ExternalStudyPaneTarget::Price => 0,

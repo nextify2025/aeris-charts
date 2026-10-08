@@ -63,6 +63,10 @@ impl ChartEngine {
             return false;
         }
         let options = self.price_scale_options_json(pane, from);
+        let entry = &mut self.panes[pane];
+        if let Some(format) = entry.explicit_price_format(from) {
+            entry.set_explicit_price_format(to, Some(format));
+        }
         for id in ids {
             self.set_series_price_scale(id, to);
         }
@@ -259,6 +263,7 @@ impl ChartEngine {
         };
         let side = pane.named_scales[index].side;
         pane.named_scales.remove(index);
+        pane.set_explicit_price_format(target, None);
         let targets = pane.ordered_side_targets(side);
         for (order, candidate) in targets.into_iter().enumerate() {
             pane.set_scale_order(candidate, order);
@@ -645,6 +650,7 @@ impl ChartEngine {
             return;
         };
         if previous != target {
+            self.adopt_scale_price_format(id);
             // Both the scale the series left and the one it joined refit exactly.
             self.reset_scale_stabilization_at(pane_index, previous);
             self.reset_scale_stabilization_at(pane_index, target);

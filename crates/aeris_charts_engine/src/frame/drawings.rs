@@ -372,7 +372,7 @@ impl ChartEngine {
             if !label.is_empty() {
                 label.push_str(" · ");
             }
-            label.push_str(&self.price_formatter.format(price));
+            label.push_str(&self.format_drawing_price(drawing, price));
         }
         (!label.is_empty()).then_some(label)
     }
@@ -1587,7 +1587,7 @@ impl ChartEngine {
             }
             DrawingBodyGeometry::PriceLabel { x, y } => {
                 let label = if drawing.text.is_empty() {
-                    self.price_formatter.format(drawing.points[0].price)
+                    self.format_drawing_price(drawing, drawing.points[0].price)
                 } else {
                     drawing.text.clone()
                 };
@@ -3458,9 +3458,13 @@ impl ChartEngine {
                 let first = drawing.points.first().map_or(0.0, |point| point.price);
                 let second = drawing.points.get(1).map(|point| point.price);
                 match label.metric {
-                    crate::DrawingLabelMetric::Price => self.price_formatter.format(first),
+                    crate::DrawingLabelMetric::Price => self.format_drawing_price(drawing, first),
                     crate::DrawingLabelMetric::PriceChange => second
-                        .map(|value| self.price_formatter.format(value - first))
+                        .map(|value| {
+                            crate::drawings::unsigned_zero(
+                                self.format_drawing_price(drawing, value - first),
+                            )
+                        })
                         .unwrap_or_default(),
                     crate::DrawingLabelMetric::PercentChange => second
                         .filter(|_| first.abs() > f64::EPSILON)
@@ -3541,6 +3545,13 @@ impl ChartEngine {
         }
     }
 
+    /// A price-valued drawing text in the bound scale's price format through
+    /// [`ChartEngine::format_scale_price`]: the one owner for every price a drawing prints
+    /// (level and price labels, metrics, stats boxes, positions, ranges, Fibonacci, Gann).
+    pub(crate) fn format_drawing_price(&self, drawing: &Drawing, value: f64) -> String {
+        self.format_scale_price(drawing.pane_index, drawing.price_scale.target(), value)
+    }
+
     fn build_position_labels(
         &self,
         drawing: &Drawing,
@@ -3575,7 +3586,7 @@ impl ChartEngine {
             crate::DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
             crate::DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
         };
-        let format_price = |value: f64| self.drawing_price_text(drawing, value);
+        let format_price = |value: f64| self.format_drawing_price(drawing, value);
         let ticks = |from: f64, to: f64| {
             self.position_price_ticks_between(drawing.pane_index, drawing.price_scale, from, to)
                 .map_or_else(|| "—".to_string(), |ticks| position_stat_number(ticks, 0))

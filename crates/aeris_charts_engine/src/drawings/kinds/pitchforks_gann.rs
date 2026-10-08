@@ -597,7 +597,7 @@ pub(crate) fn square_stats(
         return;
     }
     let mut lines = vec![
-        ctx.engine.drawing_price_text(drawing, range),
+        ctx.engine.format_drawing_price(drawing, range),
         format!("{} bars", bars.round() as i64),
     ];
     if bars > f64::EPSILON {

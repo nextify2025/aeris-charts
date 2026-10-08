@@ -481,6 +481,7 @@ impl ChartEngine {
                     s.price_scale_target = scale;
                 }
             }
+            self.adopt_scale_price_format(id);
             if let Some(o) = descriptor {
                 match o.plot {
                     CustomStudyPlot::Histogram => {

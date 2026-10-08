@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn alert_axis_tag_remains_at_its_exact_price_coordinate() {
+    fn alert_axis_tag_keeps_its_price_coordinate_unless_the_live_price_holds_it() {
         let mut chart = chart_with_market();
         chart
             .set_series_data(
@@ -501,9 +501,11 @@ mod tests {
             )
             .unwrap();
         chart.fit_content();
+        let mut away = line("away", AlertLineStatus::Active);
+        away.price = 99.0;
         chart
             .set_alert_snapshot(AlertSnapshot {
-                lines: vec![line("active", AlertLineStatus::Active)],
+                lines: vec![line("active", AlertLineStatus::Active), away],
             })
             .unwrap();
 
@@ -512,15 +514,33 @@ mod tests {
             |text, _bold| text.len() as f64 * 7.0,
             |text, _bold| text.len() as f64 * 6.0,
         );
-        let alert = axis
+        let color = chart.alert_color(AlertLineStatus::Active);
+        let tag = |text: &str| {
+            axis.labels
+                .iter()
+                .find(|label| {
+                    label.text == text && label.background.is_some_and(|bg| bg.4 == color)
+                })
+                .expect("alert axis tag")
+        };
+        let coordinate = |price: f64| {
+            chart
+                .runtime_price_coordinate(0, PriceScaleTarget::Right, price)
+                .expect("populated right scale")
+        };
+        assert!((tag("99.00").y - coordinate(99.0)).abs() <= f64::EPSILON);
+        // The live price owns its slot; the alert at the same price stacks beside it.
+        let at_live = tag("102.00").background.unwrap();
+        let live = axis
             .labels
             .iter()
-            .find(|label| label.text == "102.00")
-            .expect("alert axis tag");
-        let expected_y = chart
-            .runtime_price_coordinate(0, PriceScaleTarget::Right, 102.0)
-            .expect("populated right scale");
-        assert!((alert.y - expected_y).abs() <= f64::EPSILON);
+            .find(|label| {
+                label.text == "102.00" && label.background.is_some_and(|bg| bg.4 != color)
+            })
+            .and_then(|label| label.background)
+            .expect("live price tag");
+        assert!(at_live.1 + at_live.3 <= live.1 + 1e-9 || live.1 + live.3 <= at_live.1 + 1e-9);
+        assert!((tag("102.00").y - coordinate(102.0)).abs() <= at_live.3 + 1e-9);
     }
 
     #[test]

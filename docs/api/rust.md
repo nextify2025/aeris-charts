@@ -293,6 +293,12 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - `FootprintCellMode` 的 `ProfileInBar`、`VolumeLadder`、`HorizontalImbalance` 与 `BidAskHistogram` 各自绘制独立的行几何（视觉行为变更，枚举与选项不变）；帧检查器或像素基线需要更新。
 - `plan/Expansion.md` 已随上游删除。Aeris Terminal 引用的稳定条目 ID（F、OF、CT、I、PD）仍可在上游提交 `71b17a8`（英文）或本仓库提交 `08d6b4e`（中文）的该文件中查到；本仓库对 B1–B9 的完成认定以本次同步的完整门禁为依据，B9 的人工证据在阶段收口时收集，上游 2026-10-06 的无障碍与竞品评审只作为上游证据引用（所有者决定 Q-F）。
 
+**价格标签按比例尺格式化，坐标轴标签重叠一次解决**（上游，来自 `86e2aa2 fix(engine): format price labels by scale and resolve axis tag overlap`，对应上游 issue #1，经合并 `86e2aa2` 的提交引入；参见[比例尺价格格式](../architecture/engine/panes-and-scales.md#比例尺价格格式)与[图层组装与金融控件](../architecture/rendering/frame.md#图层组装与金融控件)）。下一次 Aeris Terminal 更换固定修订时需要评审：
+
+- `ChartEngine::set_price_format_for_scale` 的含义（签名不变）。所选格式现在保留在窗格比例尺上：之后加入该比例尺的价格类系列（新系列、创建或重建的足迹图、内置/自定义/外部研究与 KLineChart 模板、窗格或比例尺移动、`rebind_price_scale_series`）采用它，成交量、百分比与自定义格式不变，已安装的价格带阶梯保留。返回值变化：窗格与比例尺存在时即返回 `true`，即使比例尺上还没有系列（此前返回 `false`）；只有未知的窗格/比例尺或无效的 `min_move` 返回 `false`。所选格式不写入持久化文档，恢复后需要重新调用。
+- 引擎构建的价格文本统一经 `format_scale_price`（crate 内部）：宿主 `priceFormatter`、比例尺所选格式、tick 网格上的品种精度、比例尺格式化器来源系列的格式、默认值。行为变更：交易标签与成交读数现在先询问宿主 `priceFormatter`（此前只看 `InstrumentMetadata::price_precision`，否则固定两位小数，从不调用宿主格式化器）；比例尺所选格式优先于品种精度；斐波那契档位价格、价格标签绘图与绘图的价格/价格变化指标此前固定两位小数，现在跟随比例尺；没有可见范围时的警报回退文本同样跟随。合并时的自有线调整：本仓库的 `drawing_price_text`（crate 内部）并入上游的 `format_drawing_price`，各族统计框、测量工具、江恩方图、预测与投影标注以及 KLineChart 价格线因此同样让比例尺所选格式优先于品种精度；比例尺的格式化器来源保留价格带阶梯时，所选格式下的交易与绘图价格按各价格带的精度输出，与该比例尺的刻度和最新值标签一致（上游没有阶梯）。
+- 坐标轴标签的放置（视觉行为变更，类型不变）。每个带框的价格坐标轴标签在一个 pass 中按持仓、订单与触发价、警报、价格线与绘图标签的优先级放置：空闲时保持精确价格，否则取最近的空闲位置；窗格过满时金融操作标签留在原价，价格线与绘图标签被省略；按优先级逆序绘制，系列簇最后绘制。此前金融操作标签不参与放置，总是位于精确坐标并可能与其他标签重叠。测量、头寸与矩形工具的价格轴投影标签在上游即属于绘图标签组。本仓库的调整仅在于：通过 `DrawingSpec.axis_price_label` 产生坐标轴标签的 KLineChart `simple_tag`、`price_line` 与十字线标签，同样按绘图标签的优先级参与。被标签遮挡的价格刻度现在以空文本出现在 `AxisFrame.labels` 中（`measure_extra` 保留其宽度，坐标轴宽度不变）；按刻度文本读取坐标轴的帧检查器或像素基线需要跳过空文本并更新基线。
+
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
 - `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming, viewport, price axis, and intraday charts`（自有线）：

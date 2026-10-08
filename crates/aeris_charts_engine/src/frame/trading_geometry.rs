@@ -451,11 +451,13 @@ impl ChartEngine {
         Some(scale.coordinate_to_price(y, self.runtime_scale_base(pane_index, target)))
     }
 
-    pub(crate) fn format_trading_price(&self, value: f64) -> String {
-        match self.trading_state.instrument.price_precision {
-            Some(precision) => format!("{value:.precision$}", precision = precision as usize),
-            None => self.price_formatter.format(value),
-        }
+    pub(crate) fn format_trading_price(
+        &self,
+        pane_index: usize,
+        scale: crate::TradingPriceScale,
+        value: f64,
+    ) -> String {
+        self.format_scale_price(pane_index, scale.into(), value)
     }
 
     pub(crate) fn format_trading_quantity(&self, value: f64) -> String {
@@ -1488,13 +1490,17 @@ impl ChartEngine {
             format!(
                 "{side} {} @ {}",
                 self.format_trading_quantity(fill.quantity),
-                self.format_trading_price(fill.price)
+                self.format_trading_price(pane_index, fill.price_scale, fill.price)
             )
         } else {
             format!(
                 "{side} {} @ {} avg · {} fills",
                 self.format_trading_quantity(quantity),
-                self.format_trading_price(notional / quantity),
+                self.format_trading_price(
+                    pane_index,
+                    executions[fills[0]].price_scale,
+                    notional / quantity
+                ),
                 fills.len()
             )
         };

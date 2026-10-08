@@ -8733,6 +8733,97 @@ fn measure_prices_honour_the_instrument_precision() {
 }
 
 #[test]
+fn fork_price_texts_follow_the_selected_scale_format_and_the_host_formatter() {
+    // The fork's stats boxes and KLineChart price-line text format through the one scale
+    // formatter: a selected scale format outranks the instrument precision, a host
+    // `priceFormatter` outranks both, and the stats conventions (an unsigned zero, two-space
+    // groups) stay.
+    let mut chart = settled_chart();
+    chart
+        .set_instrument_metadata(crate::InstrumentMetadata {
+            tick_size: Some(0.25),
+            price_precision: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 0, 1.0));
+    add_measure(
+        &mut chart,
+        DrawingKind::PriceRange,
+        (2.0, 11.0),
+        (6.0, 13.0),
+    );
+    add_measure(
+        &mut chart,
+        DrawingKind::PriceRange,
+        (2.0, 11.0),
+        (6.0, 11.25),
+    );
+    chart
+        .add_drawing(
+            DrawingKind::PriceLine,
+            0,
+            vec![DrawingPoint {
+                logical: 3.0,
+                price: 11.75,
+            }],
+            None,
+        )
+        .unwrap();
+    let texts = pane_texts(&mut chart);
+    for expected in ["+2  +18.18%  +8 ticks", "0  +2.27%  +1 ticks", "11"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "{expected} in {texts:?}"
+        );
+    }
+
+    chart.set_price_formatter(Some(Box::new(|value| Some(format!("${value:.3}")))));
+    let texts = pane_texts(&mut chart);
+    for expected in ["+$2.000  +18.18%  +8 ticks", "$11.750"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "{expected} in {texts:?}"
+        );
+    }
+}
+
+#[test]
+fn generic_price_change_label_prints_an_unsigned_zero_at_the_selected_precision() {
+    // A fall smaller than one whole unit rounds to zero at precision 0; the generic drawing label
+    // prints it unsigned, as the stats box does, and a rise stays unsigned as upstream prints it.
+    let mut chart = settled_chart();
+    assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 0, 1.0));
+    let label = Some(r#"{"labels":[{"metric":"price_change","visible":true,"position":"below"}]}"#);
+    let point = |logical: f64, price: f64| DrawingPoint { logical, price };
+    let trend = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![point(2.0, 10.5), point(7.0, 10.25)],
+            label,
+        )
+        .unwrap();
+    let texts = pane_texts(&mut chart);
+    assert!(texts.iter().any(|text| text == "0"), "{texts:?}");
+    assert!(
+        texts.iter().all(|text| text != "\u{2212}0" && text != "-0"),
+        "{texts:?}"
+    );
+    assert!(chart.remove_drawing(trend));
+    chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![point(2.0, 10.25), point(7.0, 12.5)],
+            label,
+        )
+        .unwrap();
+    let texts = pane_texts(&mut chart);
+    assert!(texts.iter().any(|text| text == "2"), "{texts:?}");
+}
+
+#[test]
 fn measure_label_keeps_an_offscreen_area_in_the_viewport_candidates() {
     let mut chart = settled_chart();
     // More than 20 drawings switches frame construction to indexed viewport culling.
@@ -9310,4 +9401,48 @@ fn every_catalog_tool_keeps_its_frame_work_bounded_at_extreme_zoom() {
             );
         }
     }
+}
+
+#[test]
+fn drawing_price_labels_follow_the_selected_scale_precision() {
+    let mut chart = settled_chart();
+    assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 0, 1.0));
+    let point = |logical: f64, price: f64| DrawingPoint { logical, price };
+    chart
+        .add_drawing(
+            DrawingKind::FibonacciRetracement,
+            0,
+            vec![point(1.0, 10.0), point(8.0, 13.0)],
+            Some(r#"{"level_show_prices":true,"level_show_values":false,"level_show_percents":false}"#),
+        )
+        .unwrap();
+    chart
+        .add_drawing(DrawingKind::PriceLabel, 0, vec![point(3.0, 11.4)], None)
+        .unwrap();
+    chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![point(2.0, 10.5), point(7.0, 12.5)],
+            Some(
+                r#"{"labels":[{"metric":"price","visible":true,"position":"above"},{"metric":"price_change","visible":true,"position":"below"}]}"#,
+            ),
+        )
+        .unwrap();
+    let frame = chart.build_frame();
+    let texts: Vec<String> = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Text { text, .. } | Prim::RotatedText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    for expected in ["13", "10", "11", "2"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "{expected} in {texts:?}"
+        );
+    }
+    assert!(texts.iter().all(|text| !text.contains('.')), "{texts:?}");
 }

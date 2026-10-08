@@ -4624,6 +4624,7 @@ impl ChartEngine {
                     apply_klinechart_value_format(s, indicator);
                 }
             }
+            self.adopt_scale_price_format(id);
         }
         let calendar = match &kind {
             IndicatorKind::SessionLevels { calendar }

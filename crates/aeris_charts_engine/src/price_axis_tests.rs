@@ -48,14 +48,19 @@ fn chart_with_bars(
     chart
 }
 
-/// Right-scale tick label texts (plain, unboxed, left-aligned labels on the right strip).
+/// Right-scale tick label texts (plain, unboxed, left-aligned labels on the right strip). A
+/// tick whose text a boxed tag covers keeps its slot with empty text and is not a label.
 fn tick_labels(chart: &mut ChartEngine) -> Vec<String> {
     chart.build_frame();
     chart
         .build_axis_frame(80.0, measure, measure)
         .labels
         .iter()
-        .filter(|label| label.background.is_none() && label.align == AxisTextAlign::Left)
+        .filter(|label| {
+            label.background.is_none()
+                && label.align == AxisTextAlign::Left
+                && !label.text.is_empty()
+        })
         .map(|label| label.text.clone())
         .collect()
 }

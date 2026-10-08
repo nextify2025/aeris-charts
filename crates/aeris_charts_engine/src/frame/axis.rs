@@ -43,6 +43,14 @@ struct LastValueLabel {
     selected: bool,
 }
 
+/// Financial-action price tags by overlap priority (positions over orders over alerts).
+#[derive(Default)]
+struct ActionAxisTags {
+    alerts: Vec<AxisLabel>,
+    orders: Vec<AxisLabel>,
+    positions: Vec<AxisLabel>,
+}
+
 #[derive(Clone, Copy)]
 struct LivePriceRegion {
     pane_index: usize,
@@ -488,6 +496,52 @@ impl ChartEngine {
         PriceFormatter::new(100, 1.0).format(value)
     }
 
+    /// The one price format for engine-built labels on a pane scale (positions, orders, stops,
+    /// executions, alerts without a visible range, and drawing prices): the host
+    /// `priceFormatter`, then the scale's explicitly selected format, then host instrument
+    /// precision on the tick grid, then the scale's formatter source series, then the default.
+    /// A price-band tick ladder that the formatter source keeps under a selected format still
+    /// prints each band at its own precision, as the scale's ticks and last-value label do.
+    pub(crate) fn format_scale_price(
+        &self,
+        pane_index: usize,
+        target: PriceScaleTarget,
+        value: f64,
+    ) -> String {
+        if let Some(text) = self
+            .price_formatter_fn
+            .as_ref()
+            .and_then(|formatter| formatter(value))
+        {
+            return text;
+        }
+        let source = self.scale_formatter_source(pane_index, target);
+        if let Some(format) = self
+            .panes
+            .get(pane_index)
+            .and_then(|pane| pane.explicit_price_format(target))
+        {
+            if let Some(ladder) = source.and_then(|series| series.price_format.active_tick_ladder())
+            {
+                return ladder.format(value);
+            }
+            return PriceFormatter::from_precision(format.precision, format.min_move).format(value);
+        }
+        if let Some(precision) = self.trading_state.instrument.price_precision {
+            let tick = self
+                .trading_state
+                .instrument
+                .tick_size
+                .or_else(|| source.map(|series| series.price_format.min_move))
+                .filter(|tick| tick.is_finite() && *tick > 0.0)
+                .unwrap_or(10.0_f64.powi(-(precision as i32)));
+            return PriceFormatter::from_precision(precision, tick).format(value);
+        }
+        source
+            .and_then(|series| self.format_with_price_format(&series.price_format, value))
+            .unwrap_or_else(|| self.price_formatter.format(value))
+    }
+
     /// A series' OWN format drives its last-value label, its price-line labels, and the
     /// crosshair price label when the series is the label source. the reference's
     /// `localization.priceFormatter` keeps precedence when installed (price-scale.ts
@@ -798,6 +852,7 @@ impl ChartEngine {
                 }
             }
         }
+        let price_tick_labels = 0..out.labels.len();
         let explicit_marks = self.resolved_time_tick_marks();
         if let (Some(range), Some(explicit)) =
             (self.visible_range_for_frame(), explicit_marks.as_deref())
@@ -872,17 +927,38 @@ impl ChartEngine {
         self.append_measure_drawing_axis_views(&mut out, &measure);
         self.append_price_line_labels(&mut out.labels, &measure);
         self.append_drawing_line_labels(&mut out.labels, &measure);
-        let last_value_start = out.labels.len();
+        let mut last_value_labels = Vec::new();
         let live_price_regions =
-            self.append_last_value_label(&mut out.labels, &measure, &countdown_measure);
+            self.append_last_value_label(&mut last_value_labels, &measure, &countdown_measure);
+        let mut action = ActionAxisTags::default();
+        self.append_action_axis_labels(&mut action, &live_price_regions, &measure);
+        // Paint order is the inverse of placement priority, so whenever a full pane leaves two
+        // tags overlapping the more important one is on top.
+        let alerts = out.labels.len()..out.labels.len() + action.alerts.len();
+        let orders = alerts.end..alerts.end + action.orders.len();
+        let positions = orders.end..orders.end + action.positions.len();
+        let live_price_start = positions.end;
+        let movable = movable_label_start..alerts.start;
+        out.labels.extend(action.alerts);
+        out.labels.extend(action.orders);
+        out.labels.extend(action.positions);
+        out.labels.extend(last_value_labels);
         self.resolve_boxed_price_label_overlap(
             &mut out.labels,
-            movable_label_start..last_value_start,
+            live_price_start,
+            &[
+                (positions, true),
+                (orders, true),
+                (alerts, true),
+                (movable, false),
+            ],
         );
-        let mut action_labels = Vec::new();
-        self.append_action_axis_labels(&mut action_labels, &live_price_regions, &measure);
-        out.labels
-            .splice(last_value_start..last_value_start, action_labels);
+        self.hide_price_ticks_under_tags(
+            &mut out.labels,
+            price_tick_labels,
+            movable_label_start,
+            &measure,
+        );
         if include_transient {
             self.append_crosshair_labels(&mut out.labels, &measure);
             self.append_alert_create_chip(&mut out);
@@ -897,16 +973,21 @@ impl ChartEngine {
         out
     }
 
-    /// Place line and drawing price tags around the already resolved series clusters. Each
-    /// frame starts from the tags' price coordinates, so a tag returns there as soon as the
-    /// obstacle moves away. Financial-action and crosshair tags retain their exact anchors.
+    /// Resolve every boxed price tag in one pass. The already spaced last-value clusters from
+    /// `live_price_start` on never move. Each group then claims space in priority order: a
+    /// tag keeps its price coordinate when that is free, otherwise it takes the nearest free
+    /// slot above or below everything placed before it. Each frame starts from the tags' price
+    /// coordinates, so a tag returns there as soon as the obstacle moves away. A group marked
+    /// `keep` stays at its exact price when the pane has no free slot (painted under the higher
+    /// priorities); other tags hide until a slot opens. Crosshair tags are added afterwards and
+    /// keep their exact anchors.
     fn resolve_boxed_price_label_overlap(
         &self,
         labels: &mut [AxisLabel],
-        movable: std::ops::Range<usize>,
+        live_price_start: usize,
+        groups: &[(std::ops::Range<usize>, bool)],
     ) {
-        let fixed_start = movable.end;
-        let mut occupied: Vec<(f64, f64, f64, f64)> = labels[fixed_start..]
+        let mut occupied: Vec<(f64, f64, f64, f64)> = labels[live_price_start..]
             .iter()
             .filter_map(|label| {
                 label
@@ -914,76 +995,141 @@ impl ChartEngine {
                     .map(|(x, y, width, height, _)| (x, y, width, height))
             })
             .collect();
-        for index in movable {
-            let Some((x, top, width, height, _)) = labels[index].background else {
-                continue;
-            };
-            if labels[index].text.is_empty() || width <= 0.0 || height <= 0.0 {
+        for (range, keep) in groups {
+            for index in range.clone() {
+                self.place_boxed_price_label(labels, index, *keep, &mut occupied);
+            }
+        }
+    }
+
+    /// A price tick whose text box meets a boxed tag would show through or beside the tag, so
+    /// its text is dropped. The tick keeps its measured advance, so tags moving over the scale
+    /// never change the negotiated axis width.
+    fn hide_price_ticks_under_tags<F>(
+        &self,
+        labels: &mut [AxisLabel],
+        ticks: std::ops::Range<usize>,
+        tags_start: usize,
+        measure: &F,
+    ) where
+        F: Fn(&str, bool) -> f64,
+    {
+        let (head, tags) = labels.split_at_mut(tags_start);
+        let tags: Vec<(f64, f64, f64, f64)> = tags
+            .iter()
+            .filter(|tag| !tag.text.is_empty())
+            .filter_map(|tag| tag.background)
+            .map(|(x, y, width, height, _)| (x, y, width, height))
+            .collect();
+        if tags.is_empty() {
+            return;
+        }
+        let text_height = self.axis_metrics().axis;
+        for tick in &mut head[ticks] {
+            if tick.text.is_empty() {
                 continue;
             }
-            let Some(pane) = self.panes.iter().find(|pane| {
-                top + height / 2.0 >= pane.top && top + height / 2.0 <= pane.top + pane.height
-            }) else {
-                continue;
+            let width = measure(&tick.text, tick.bold);
+            let left = match tick.align {
+                AxisTextAlign::Right => tick.x - width,
+                _ => tick.x,
             };
-            let target = match labels[index].align {
-                AxisTextAlign::Right => PriceScaleTarget::Left,
-                AxisTextAlign::Left => PriceScaleTarget::Right,
-                AxisTextAlign::Center => continue,
-            };
-            if !pane_scale(pane, target).options().align_labels || height > pane.height {
-                continue;
+            let (top, bottom) = (tick.y - text_height / 2.0, tick.y + text_height / 2.0);
+            if tags.iter().any(|&(x, y, tag_width, tag_height)| {
+                left < x + tag_width && x < left + width && top < y + tag_height && y < bottom
+            }) {
+                tick.measure_extra += width;
+                tick.text.clear();
             }
-            let raw_top = top;
-            let mut blocked = Vec::new();
-            for &(other_x, other_top, other_width, other_height) in &occupied {
-                if x < other_x + other_width
+        }
+    }
+
+    fn place_boxed_price_label(
+        &self,
+        labels: &mut [AxisLabel],
+        index: usize,
+        keep: bool,
+        occupied: &mut Vec<(f64, f64, f64, f64)>,
+    ) {
+        let Some((x, top, width, height, _)) = labels[index].background else {
+            return;
+        };
+        if labels[index].text.is_empty() || width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let center = top + height / 2.0;
+        let pane = self
+            .panes
+            .iter()
+            .find(|pane| center >= pane.top && center <= pane.top + pane.height);
+        let target = match labels[index].align {
+            AxisTextAlign::Right => Some(PriceScaleTarget::Left),
+            AxisTextAlign::Left => Some(PriceScaleTarget::Right),
+            AxisTextAlign::Center => None,
+        };
+        let (Some(pane), Some(target)) = (pane, target) else {
+            occupied.push((x, top, width, height));
+            return;
+        };
+        // reference `alignLabels` off: every tag on that scale keeps its raw coordinate.
+        if !pane_scale(pane, target).options().align_labels || height > pane.height {
+            occupied.push((x, top, width, height));
+            return;
+        }
+        let (pane_top, pane_bottom) = (pane.top, pane.top + pane.height);
+        let blocked: Vec<(f64, f64)> = occupied
+            .iter()
+            .filter(|&&(other_x, other_top, other_width, other_height)| {
+                x < other_x + other_width
                     && other_x < x + width
-                    && other_top < pane.top + pane.height
-                    && other_top + other_height > pane.top
-                {
-                    blocked.push((other_top, other_top + other_height));
+                    && other_top < pane_bottom
+                    && other_top + other_height > pane_top
+            })
+            .map(|&(_, other_top, _, other_height)| (other_top, other_top + other_height))
+            .collect();
+        let collides = |candidate: f64| {
+            blocked
+                .iter()
+                .find(|&&(start, end)| candidate < end && candidate + height > start)
+                .copied()
+        };
+        if collides(top).is_none() {
+            occupied.push((x, top, width, height));
+            return;
+        }
+        let find_space = |above: bool| {
+            let mut candidate = top.clamp(pane_top, pane_bottom - height);
+            for _ in 0..=blocked.len() {
+                let Some((start, end)) = collides(candidate) else {
+                    return Some(candidate);
+                };
+                candidate = if above { start - height } else { end };
+                if candidate < pane_top || candidate + height > pane_bottom {
+                    return None;
                 }
             }
-            if blocked.is_empty() {
-                occupied.push((x, top, width, height));
-                continue;
-            }
-            let find_space = |above: bool| {
-                let mut candidate = raw_top.clamp(pane.top, pane.top + pane.height - height);
-                for _ in 0..=blocked.len() {
-                    let overlap = blocked
-                        .iter()
-                        .find(|&&(start, end)| candidate < end && candidate + height > start);
-                    let Some(&(start, end)) = overlap else {
-                        return Some(candidate);
-                    };
-                    candidate = if above { start - height } else { end };
-                    if candidate < pane.top || candidate + height > pane.top + pane.height {
-                        return None;
-                    }
-                }
-                None
-            };
-            let above = find_space(true);
-            let below = find_space(false);
-            let placed = match (above, below) {
-                (Some(a), Some(b)) if (a - raw_top).abs() < (b - raw_top).abs() => Some(a),
-                (Some(_), Some(b)) => Some(b),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            if let Some(placed) = placed {
-                let shift = placed - top;
-                labels[index].y += shift;
+            None
+        };
+        let placed = match (find_space(true), find_space(false)) {
+            (Some(a), Some(b)) if (a - top).abs() < (b - top).abs() => Some(a),
+            (_, Some(b)) => Some(b),
+            (Some(a), None) => Some(a),
+            (None, None) => None,
+        };
+        match placed {
+            Some(placed) => {
+                labels[index].y += placed - top;
                 if let Some(background) = labels[index].background.as_mut() {
                     background.1 = placed;
                 }
                 occupied.push((x, placed, width, height));
-            } else {
-                // An overfull pane cannot show every optional tag without covering a price.
-                // This tag will be rebuilt from its anchor and reappear once a slot opens.
+            }
+            // A full pane keeps a financial-action tag on its price, beneath the tags that
+            // outrank it, so the order or position stays readable wherever it is uncovered.
+            None if keep => occupied.push((x, top, width, height)),
+            None => {
+                // An optional tag cannot show without covering a price. It is rebuilt from its
+                // anchor and reappears once a slot opens.
                 labels[index].text.clear();
                 labels[index].background = None;
             }
@@ -1936,7 +2082,7 @@ impl ChartEngine {
 
     fn append_action_axis_labels<F>(
         &self,
-        labels: &mut Vec<AxisLabel>,
+        tags: &mut ActionAxisTags,
         live_price_regions: &[LivePriceRegion],
         measure: &F,
     ) where
@@ -1947,14 +2093,15 @@ impl ChartEngine {
         let chip_fill = Color::parse_css(&self.options.get().layout.background.color)
             .unwrap_or(Color::rgb(fallback.0, fallback.1, fallback.2))
             .solid();
-        let mut append = |pane_index: usize,
-                          target: PriceScaleTarget,
-                          price: f64,
-                          text: String,
-                          color: Color,
-                          solid: bool,
-                          hollow_at_live_price: bool,
-                          bold: bool| {
+        let append = |labels: &mut Vec<AxisLabel>,
+                      pane_index: usize,
+                      target: PriceScaleTarget,
+                      price: f64,
+                      text: String,
+                      color: Color,
+                      solid: bool,
+                      hollow_at_live_price: bool,
+                      bold: bool| {
             let Some(pane) = self.panes.get(pane_index) else {
                 return;
             };
@@ -2012,10 +2159,15 @@ impl ChartEngine {
         };
         for position in &self.trading_state.positions {
             append(
+                &mut tags.positions,
                 position.pane_index,
                 position.price_scale.into(),
                 position.average_price,
-                self.format_trading_price(position.average_price),
+                self.format_trading_price(
+                    position.pane_index,
+                    position.price_scale,
+                    position.average_price,
+                ),
                 self.trading_position_color(position.side),
                 true,
                 true,
@@ -2031,10 +2183,15 @@ impl ChartEngine {
                 order.status,
             );
             append(
+                &mut tags.orders,
                 order.pane_index,
                 order.price_scale.into(),
                 self.trading_effective_order_price(order),
-                self.format_trading_price(self.trading_effective_order_price(order)),
+                self.format_trading_price(
+                    order.pane_index,
+                    order.price_scale,
+                    self.trading_effective_order_price(order),
+                ),
                 color,
                 order.status == crate::OrderStatus::Filled,
                 true,
@@ -2044,10 +2201,11 @@ impl ChartEngine {
                 && let Some(stop_price) = order.stop_price
             {
                 append(
+                    &mut tags.orders,
                     order.pane_index,
                     order.price_scale.into(),
                     stop_price,
-                    self.format_trading_price(stop_price),
+                    self.format_trading_price(order.pane_index, order.price_scale, stop_price),
                     color,
                     false,
                     true,
@@ -2069,10 +2227,11 @@ impl ChartEngine {
                         scale.price_to_logical_value(line.price, base),
                     ))
                 })
-                .unwrap_or_else(|| self.price_formatter.format(line.price));
+                .unwrap_or_else(|| self.format_scale_price(line.pane_index, target, line.price));
             // Labels are host metadata. The tag always shows the actual formatted price; the
             // attached bell badge is what marks the line as an alert.
             append(
+                &mut tags.alerts,
                 line.pane_index,
                 target,
                 line.price,

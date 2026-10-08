@@ -8172,7 +8172,7 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
         .labels
         .iter()
         .filter(|label| label.background.is_none() && label.align == AxisTextAlign::Left)
-        .map(|label| label.text.clone())
+        .map(|label| (label.y.to_bits(), label.text.clone()))
         .collect();
     let initial_range = chart
         .price_scale_visible_range_for(0, indicator_scale)
@@ -8181,7 +8181,15 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
     assert_eq!(chart.scale_tick_base(0, indicator_scale), 1);
     assert_eq!(chart.scale_autoscale_min_move(0, indicator_scale), 1.0);
     assert!(!initial_ticks.is_empty());
-    assert!(initial_ticks.iter().all(|label| !label.contains('.')));
+    assert!(initial_ticks.iter().all(|(_, label)| !label.contains('.')));
+    // A tick under the indicator's own tag drops its text while the tag shows, so ticks match
+    // by coordinate, and by text wherever both frames show it.
+    let same_ticks = |a: &[(u64, String)], b: &[(u64, String)]| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|((ya, ta), (yb, tb))| {
+                ya == yb && (ta == tb || ta.is_empty() || tb.is_empty())
+            })
+    };
 
     chart.set_series_visible(sma, false);
     assert!(chart.frame_requires_layout());
@@ -8192,11 +8200,11 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
         .labels
         .iter()
         .filter(|label| label.background.is_none() && label.align == AxisTextAlign::Left)
-        .map(|label| label.text.clone())
+        .map(|label| (label.y.to_bits(), label.text.clone()))
         .collect();
     assert_eq!(chart.scale_tick_base(0, indicator_scale), 1);
     assert_eq!(chart.scale_autoscale_min_move(0, indicator_scale), 1.0);
-    assert_eq!(hidden_ticks, initial_ticks);
+    assert!(same_ticks(&hidden_ticks, &initial_ticks));
     assert_eq!(
         chart.price_scale_visible_range_for(0, indicator_scale),
         Some(initial_range)
@@ -8215,7 +8223,7 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
         .labels
         .iter()
         .filter(|label| label.background.is_none() && label.align == AxisTextAlign::Left)
-        .map(|label| label.text.clone())
+        .map(|label| (label.y.to_bits(), label.text.clone()))
         .collect();
     assert_eq!(shown_ticks, initial_ticks);
     assert_eq!(
