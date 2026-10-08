@@ -806,6 +806,19 @@ test("rsi and macd stack their own panes with channel strip and four-state histo
   expect(macd_green, "macd histogram strong-state pixels").toBeGreaterThan(20);
 });
 
+test("choppiness paints its 38.2/61.8 Chop Zone strip in its own pane", async ({ page }) => {
+  await page.goto("/");
+  await wait_grid(page);
+  const pane = await page.evaluate(() => window.__chart.add_choppiness(window.__main, 14).pane_index());
+  expect(pane).toBe(1);
+  await wait_grid(page);
+  const geo = await page.evaluate(() => window.__chart.panes().map((p) => p.get_geometry()));
+  const { crop } = await shot(page);
+  // The same engine-owned threshold strip as RSI: rgba(120,123,134,0.2) over #1f1f1f.
+  const strip = count_color(crop(geo[1].top, geo[1].top + geo[1].height), [49, 49, 52], 6);
+  expect(strip, "choppiness 38.2/61.8 chop zone pixels").toBeGreaterThan(10_000);
+});
+
 test("indicator chips: auto-name on, no countdown, 2px default, style overrides", async ({ page }) => {
   await page.goto("/");
   await wait_grid(page);

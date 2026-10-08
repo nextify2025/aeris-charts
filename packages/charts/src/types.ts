@@ -5302,7 +5302,8 @@ export interface chart_api {
   add_mcginley(source: series_api, period?: number, options?: Partial<series_options>): series_api;
   /** Regression curve, upper and lower residual-deviation bands. */
   add_linear_regression(source: series_api, period?: number, deviation?: number, options?: Partial<series_options>): [series_api, series_api, series_api];
-  /** Choppiness Index (0–100), in a separate oscillator pane. */
+  /** Choppiness Index (0–100), in a separate oscillator pane (dotted 38.2/61.8 Chop Zone lines and
+   *  the translucent channel strip between them). */
   add_choppiness(source: series_api, period?: number, options?: Partial<series_options>): series_api;
   /** Price-pane bands in upper, close-basis, lower order using Wilder ATR. */
   add_atr_bands(source: series_api, period?: number, multiplier?: number, options?: Partial<series_options>): [series_api, series_api, series_api];

@@ -181,12 +181,12 @@ AO、PVT、TRIX 与 EMV 同时存在内置研究和同名的 KLineChart 模板�
 | `add_kama(source, period = 10, fast = 2, slow = 30)` | `fast < slow` | `KAMA`，价格窗格 |
 | `add_mcginley(source, period = 14)` | | `McGinley`，价格窗格 |
 | `add_linear_regression(source, period = 20, deviation = 2)` | `deviation` 有限且不小于 0 | `Curve`、`Upper`、`Lower`（残差标准差通道），价格窗格 |
-| `add_choppiness(source, period = 14)` | `period` 至少为 2 | `Choppiness`（0–100），振荡器窗格 |
+| `add_choppiness(source, period = 14)` | `period` 至少为 2 | `Choppiness`（0–100），振荡器窗格，带 38.2/61.8 Chop Zone 阈值区域 |
 | `add_atr_bands(source, period = 14, multiplier = 2)` | `multiplier` 有限且不小于 0 | `Upper`、`Basis`（收盘价）、`Lower`，价格窗格 |
 
 `indicator_kind` 相应新增 `kst`、`tsi`、`mass_index`、`vortex`、`klinger`、`kama`、`mcginley`、`linear_regression`、`choppiness` 与 `atr_bands`。`indicator_info().parameters` 新增 `multiplier`（ATR 带）、`roc` 与 `smoothing_periods`（KST）、`ema_period` 与 `sum_period`（Mass Index），对不使用它们的种类为 `null`；KST、TSI 与 Klinger 的信号周期报告在 `signal`，TSI 的长短周期报告在 `long_period` 与 `short_period`，Klinger 与 KAMA 的快慢周期报告在 `fast` 与 `slow`。
 
-这些研究同样把空白数据行视为不存在。TSI、KAMA、Klinger、McGinley、Mass Index 与 ATR 带从最后一个有效样本继续，与上游相同；KST、线性回归、Choppiness 与 Vortex 的窗口跨越最近 N 个有效行，上游则在缺口仍位于窗口内时让它们保持空白，本仓库不采用（参见[与上游空白规则的对照](../architecture/data/indicators.md#广度层指标)）。Klinger 与 McGinley 的 `convergence_bars` 为 `null`。TSI、Klinger、Mass Index 与 KAMA 以 SMA 起始，McGinley 以第一个收盘价起始；它们没有 `seed` 参数，`{ convention: "china" }` 不适用。Chop Zone 是 Choppiness 输出上的 38.2/61.8 阈值，目前没有绘制阈值区域。线性回归指标是滚动端点序列，与在两个锚点之间做一次拟合的 `regression_trend` 绘图不同；二者都使用残差的总体标准差。公式与空白数据处理详见[广度层补全](../architecture/data/indicators.md#广度层补全)。
+这些研究同样把空白数据行视为不存在。TSI、KAMA、Klinger、McGinley、Mass Index 与 ATR 带从最后一个有效样本继续，与上游相同；KST、线性回归、Choppiness 与 Vortex 的窗口跨越最近 N 个有效行，上游则在缺口仍位于窗口内时让它们保持空白，本仓库不采用（参见[与上游空白规则的对照](../architecture/data/indicators.md#广度层指标)）。Klinger 与 McGinley 的 `convergence_bars` 为 `null`。TSI、Klinger、Mass Index 与 KAMA 以 SMA 起始，McGinley 以第一个收盘价起始；它们没有 `seed` 参数，`{ convention: "china" }` 不适用。Chop Zone 是 Choppiness 输出上的 38.2/61.8 阈值，引擎把它绘制为内置阈值区域：振荡器窗格中 38.2 到 61.8 之间的半透明通道加两条点状边界线，与 RSI、Stochastic 的阈值区域相同，随绑定显隐，持久化恢复后自动重建；上游只在文档中说明该阈值而不绘制（参见[已记录的不兼容变更](compatibility.md#已记录的不兼容变更)）。线性回归指标是滚动端点序列，与在两个锚点之间做一次拟合的 `regression_trend` 绘图不同；二者都使用残差的总体标准差。公式与空白数据处理详见[广度层补全](../architecture/data/indicators.md#广度层补全)。
 
 ## 结构与时段研究
 

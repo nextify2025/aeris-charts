@@ -3361,6 +3361,8 @@ impl AerisChart {
             .add_linear_regression(source_id, period, deviation)
     }
 
+    /// Add a Choppiness Index (0–100) line in its own oscillator pane (38.2/61.8 Chop Zone band
+    /// lines + channel fill).
     pub fn add_choppiness(&mut self, source_id: u32, period: u32) -> u32 {
         self.inner.borrow_mut().add_choppiness(source_id, period)
     }

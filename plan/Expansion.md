@@ -622,7 +622,7 @@ Aeris Terminal 路线图新增了风险控制、交易时段回放、交易复�
 | 层级 | 批次 | 指标 |
 | --- | --- | --- |
 | I1 — 核心专业指标集 | B4 | 成交量（作为带 MA 的研究）、OBV、ADX/DMI、Parabolic SAR、SuperTrend、Ichimoku、Keltner Channels、Donchian Channels、CCI、Williams %R、Stochastic RSI、ROC/Momentum、MFI、CMF、HMA、VWMA、DEMA、TEMA、SMMA/RMA、标准差、枢轴点（标准、斐波那契、Camarilla、Woodie、DeMark）、ZigZag |
-| I2 — 广度 | B9 | Aroon、Awesome Oscillator、Chande Momentum、Chaikin Oscillator、Coppock、DPO、Elder Force、Ease of Movement、Fisher Transform、Historical Volatility、KST、Klinger、线性回归通道/曲线、Mass Index、Ultimate Oscillator、TRIX、TSI、Vortex、Envelopes、ALMA、KAMA、McGinley Dynamic、Chop Zone/Choppiness、Bollinger %B 与 Bandwidth、ATR 带、Accumulation/Distribution、Price Volume Trend、Volume Oscillator、Relative Volume。Chop Zone 以单一 0–100 Choppiness Index 输出上的阈值呈现：低于 38.2 为趋势，38.2–61.8 为中性，高于 61.8 为震荡；不另建区域序列。ATR 带为收盘价 ± 倍数 × Wilder ATR，输出顺序为上轨、收盘价基线、下轨。 |
+| I2 — 广度 | B9 | Aroon、Awesome Oscillator、Chande Momentum、Chaikin Oscillator、Coppock、DPO、Elder Force、Ease of Movement、Fisher Transform、Historical Volatility、KST、Klinger、线性回归通道/曲线、Mass Index、Ultimate Oscillator、TRIX、TSI、Vortex、Envelopes、ALMA、KAMA、McGinley Dynamic、Chop Zone/Choppiness、Bollinger %B 与 Bandwidth、ATR 带、Accumulation/Distribution、Price Volume Trend、Volume Oscillator、Relative Volume。Chop Zone 以单一 0–100 Choppiness Index 输出上的阈值呈现：低于 38.2 为趋势，38.2–61.8 为中性，高于 61.8 为震荡；不另建区域序列，本仓库按所有者决定 Q-D 把 38.2–61.8 绘制为与 RSI 相同的内置阈值区域（上游不绘制）。ATR 带为收盘价 ± 倍数 × Wilder ATR，输出顺序为上轨、收盘价基线、下轨。 |
 | I3 — 结构 | B9 | 摆动高点/低点、市场结构突破、公允价值缺口、订单块、交易时段高点/低点、前一日/前一周/前一月价位、开盘区间 |
 | I4 — 扩展 API | B9 | Rust 与 TypeScript 中的类型化自定义研究 API：声明输入、参数与输出；提供增量更新与重建函数；引擎拥有调度、界限、样式、持久化与渲染 |
 

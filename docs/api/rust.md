@@ -274,6 +274,11 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - 交易所时区、交易时段起点或日历日期轴变化时，`Exchange` 绑定与 VWAP、枢轴点一起经 `rebuild_calendar_indicators` 重建，宿主无需调用任何重建方法。
 - 新增方法：`aeris_charts_core::scale::exchange_time::ExchangeTime::session_open_utc(time)`（`time` 之前（含）最近一次本地交易时段起点的 UTC 时刻，开盘区间的锚点）。`aeris_charts_indicators::SessionSource` 新增 `Exchange { trading_day_seconds, session_open }` 变体（两个 `&dyn Fn(i64) -> i64`），不再派生 `Debug`，改为手写实现；穷尽匹配它的代码需要新增分支。
 
+**Choppiness Chop Zone**（自有线，合并 `85bc10b` 之后的后续工作 F2(b)，所有者决定 Q-D；参见[指标计算与绑定](../architecture/data/indicators.md#广度层补全)与[兼容性](compatibility.md#已记录的不兼容变更)）。
+
+- 行为变更：`ChartEngine::add_choppiness` 以及任何 `IndicatorKind::Choppiness` 绑定的输出 0 现在带有 `SeriesEntry::threshold_region = Some(SeriesThresholdRegion { lower: 38.2, upper: 61.8 })`，与 RSI 的 30/70 区域相同由指标种类推导。该窗格的帧因此多出一个半透明 `Prim::Rect` 通道与两条点状 `Prim::HLine` 边界线，随绑定显隐；其他窗格不受影响。
+- 区域不写入持久化文档，导入后由指标种类重建；没有新增类型、字段或变体，也不改变任何签名，因此不是源码级破坏。依赖 Choppiness 窗格像素的截图或帧快照需要更新基线。
+
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
 - `a565efc fix(kline): close K-line engine pitfalls across time, indicators, drawings, streaming, viewport, price axis, and intraday charts`（自有线）：

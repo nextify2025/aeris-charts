@@ -3046,6 +3046,8 @@ impl ChartEngine {
         )
     }
 
+    /// Add a Choppiness Index (0–100) line in its own oscillator pane (with the 38.2/61.8 Chop
+    /// Zone channel and dotted band lines).
     pub fn add_choppiness(&mut self, source: SeriesId, period: usize) -> Option<SeriesId> {
         self.add_indicator_kind(source, IndicatorKind::Choppiness { period }, None)
             .into_iter()
@@ -4600,6 +4602,11 @@ impl ChartEngine {
                         IndicatorKind::StochasticRsi { .. } => Some(SeriesThresholdRegion {
                             lower: 20.0,
                             upper: 80.0,
+                        }),
+                        // Chop Zone: below 38.2 trending, above 61.8 choppy.
+                        IndicatorKind::Choppiness { .. } => Some(SeriesThresholdRegion {
+                            lower: 38.2,
+                            upper: 61.8,
                         }),
                         _ => None,
                     };

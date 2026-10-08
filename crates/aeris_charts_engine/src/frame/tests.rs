@@ -9175,6 +9175,130 @@ fn rsi_channel_band_paints_a_translucent_strip_between_30_and_70() {
     assert!(strip, "the rsi pane paints its 30/70 channel strip");
 }
 
+/// Assert that `pane` paints exactly one threshold strip spanning `lower..upper` plus the two
+/// dotted boundary lines, at the coordinates the engine's own pane scale gives those levels.
+fn assert_threshold_region_lowered(
+    chart: &ChartEngine,
+    frame: &ChartFrame,
+    pane: usize,
+    lower: f64,
+    upper: f64,
+) {
+    let fill = Color::rgba(0x78, 0x7B, 0x86, 0x33);
+    let scale = &chart.panes[pane].price_scale;
+    let y = |price: f64| scale.price_to_coordinate(price, 0.0) as f32;
+    let (y_upper, y_lower) = (y(upper), y(lower));
+    let expected_rect = IRect {
+        x: 0,
+        y: y_upper.min(y_lower).round() as i32,
+        w: chart.pane_w.round() as i32,
+        h: (y_lower - y_upper).abs().round() as i32,
+    };
+    let strips = frame.panes[pane]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Rect { rect, color } if *color == fill => Some(*rect),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        strips,
+        vec![expected_rect],
+        "{lower}/{upper} strip in pane {pane}"
+    );
+    let mut boundaries = frame.panes[pane]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::HLine {
+                y,
+                style: LineStyle::Dotted,
+                color,
+                ..
+            } if *color == Color::rgb(0x78, 0x7B, 0x86) => Some(*y),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    let mut expected = vec![y_upper.round() as i32, y_lower.round() as i32];
+    expected.sort_unstable();
+    assert_eq!(
+        boundaries, expected,
+        "{lower}/{upper} boundaries in pane {pane}"
+    );
+    // Neither the strip nor its boundaries leak into the price pane.
+    assert!(
+        !frame.panes[0].main.iter().any(|prim| match prim {
+            Prim::Rect { color, .. } => *color == fill,
+            Prim::HLine {
+                style: LineStyle::Dotted,
+                color,
+                ..
+            } => *color == Color::rgb(0x78, 0x7B, 0x86),
+            _ => false,
+        }),
+        "{lower}/{upper} region leaked into the price pane"
+    );
+}
+
+#[test]
+fn choppiness_chop_zone_lowers_like_the_rsi_channel() {
+    let times = (0..12).map(f64::from).collect::<Vec<_>>();
+    let close = [
+        10.0, 11.0, 10.5, 12.0, 11.0, 13.0, 12.5, 12.0, 14.0, 13.0, 12.0, 12.5,
+    ];
+    let high = close.map(|value| value + 1.0);
+    let low = close.map(|value| value - 0.75);
+    let settled = |add: &dyn Fn(&mut ChartEngine) -> SeriesId| {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .set_series_data(0, &times, &close, &high, &low, &close)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        let output = add(&mut chart);
+        chart.build_frame();
+        (chart, output)
+    };
+
+    let (mut rsi_chart, rsi) = settled(&|chart| chart.add_rsi(0, 3).unwrap());
+    let frame = rsi_chart.build_frame();
+    assert_eq!(rsi_chart.series_entry(rsi).unwrap().pane_index, 1);
+    assert_threshold_region_lowered(&rsi_chart, &frame, 1, 30.0, 70.0);
+
+    // The Chop Zone is the same engine-owned threshold region on the single Choppiness output:
+    // a 38.2-61.8 strip plus dotted boundaries in its own oscillator pane, no extra series.
+    let (mut chart, chop) = settled(&|chart| chart.add_choppiness(0, 3).unwrap());
+    assert_eq!(
+        chart.series_entry(chop).unwrap().threshold_region,
+        Some(SeriesThresholdRegion {
+            lower: 38.2,
+            upper: 61.8,
+        })
+    );
+    assert_eq!(chart.series_entry(chop).unwrap().pane_index, 1);
+    assert_eq!(chart.series.len(), 2);
+    let frame = chart.build_frame();
+    assert_threshold_region_lowered(&chart, &frame, 1, 38.2, 61.8);
+
+    // Hiding the binding hides its zone with it; showing it restores the same geometry.
+    assert!(chart.set_indicator_binding_visible(chop, false));
+    let hidden = chart.build_frame();
+    assert!(
+        !hidden
+            .panes
+            .iter()
+            .any(|pane| pane.main.iter().any(|prim| matches!(
+                prim,
+                Prim::Rect { color, .. } if *color == Color::rgba(0x78, 0x7B, 0x86, 0x33)
+            )))
+    );
+    assert!(chart.set_indicator_binding_visible(chop, true));
+    let frame = chart.build_frame();
+    assert_threshold_region_lowered(&chart, &frame, 1, 38.2, 61.8);
+}
+
 #[test]
 fn line_visible_false_keeps_area_fill_but_drops_the_stroke() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);

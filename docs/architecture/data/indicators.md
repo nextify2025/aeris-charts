@@ -106,7 +106,7 @@ KLineChart 绑定（`IndicatorKind::KLineChart`，持久化为 `{"kind": "klinec
 | `choppiness`（14，`period ≥ 2`） | `100 × log10(ΣTR / (最高 − 最低)) / log10(period)`，截断到 0–100；首个真实波幅需要前一收盘价，区间为零时为空缺 | `Choppiness` | 振荡器窗格 |
 | `atr_bands`（14/2） | 收盘价 ± `multiplier` × Wilder ATR | `Upper`、`Basis`（收盘价）、`Lower` | 价格窗格 |
 
-校验与持久化规则相同：Klinger 与 KAMA 要求 `fast < slow`，Choppiness 要求 `period ≥ 2`，线性回归的 `deviation` 与 ATR 带的 `multiplier` 必须有限且不小于 0，KST 的八个周期与信号周期都必须大于 0。Chop Zone 是单一 Choppiness 输出上的 38.2/61.8 阈值（低于 38.2 为趋势，高于 61.8 为震荡），不另建区域序列；当前引擎没有为它绘制阈值区域，所有者已决定以内置阈值区域绘制（与 RSI、Stochastic 相同），作为本仓库的后续提交。
+校验与持久化规则相同：Klinger 与 KAMA 要求 `fast < slow`，Choppiness 要求 `period ≥ 2`，线性回归的 `deviation` 与 ATR 带的 `multiplier` 必须有限且不小于 0，KST 的八个周期与信号周期都必须大于 0。Chop Zone 是单一 Choppiness 输出上的 38.2/61.8 阈值（低于 38.2 为趋势，高于 61.8 为震荡），不另建区域序列，而是在该输出上挂载与 RSI、Stochastic、CCI、Williams %R 和 Stochastic RSI 相同的引擎持有阈值区域（`SeriesThresholdRegion { lower: 38.2, upper: 61.8 }`）：帧构建把它降为振荡器窗格中的半透明通道矩形与两条点状边界线，不新增图元种类，每个后端与宿主无需接线即可获得；区域由指标种类推导，不写入持久化文档，恢复时随绑定重建。上游只在文档中说明该阈值而不绘制，本仓库按所有者决定 Q-D 绘制。
 
 **空白数据**。这 10 个研究遵循“空白数据行如同不存在”的契约（上游自 `0a71a12` 起对递归类采用同一规则）：
 

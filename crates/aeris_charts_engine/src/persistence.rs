@@ -3280,6 +3280,112 @@ mod tests {
     }
 
     #[test]
+    fn chop_zone_follows_the_rsi_region_through_option_updates_and_restore() {
+        let rsi_region = crate::SeriesThresholdRegion {
+            lower: 30.0,
+            upper: 70.0,
+        };
+        let chop_zone = crate::SeriesThresholdRegion {
+            lower: 38.2,
+            upper: 61.8,
+        };
+        let regions = |chart: &ChartEngine| {
+            chart
+                .indicator_bindings()
+                .iter()
+                .map(|binding| {
+                    chart
+                        .series_entry(binding.outputs[0])
+                        .and_then(|series| series.threshold_region)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut chart = settled_chart();
+        let rsi = chart.add_rsi(0, 3).unwrap();
+        let chop = chart.add_choppiness(0, 3).unwrap();
+        assert_eq!(regions(&chart), vec![Some(rsi_region), Some(chop_zone)]);
+
+        // Every indicator option update leaves both engine-owned regions in place.
+        for output in [rsi, chop] {
+            let mut style =
+                chart.indicator_bindings()[usize::from(output == chop)].styles[0].clone();
+            style.line_color = Some("#123456".to_string());
+            style.line_width = Some(3.0);
+            style.line_style = 2;
+            assert!(chart.set_indicator_output_style(output, style));
+            assert!(chart.set_indicator_input_source(output, crate::IndicatorInputSource::Hlc3));
+            assert!(chart.set_indicator_binding_visible(output, false));
+        }
+        assert!(
+            chart.set_indicator_chrome_options(crate::IndicatorChromeOptions {
+                name_labels_visible: false,
+                value_labels_visible: false,
+                price_lines_visible: false,
+            })
+        );
+        chart.reset_style_to_defaults();
+        assert_eq!(regions(&chart), vec![Some(rsi_region), Some(chop_zone)]);
+
+        // The region is derived from the indicator kind, never stored: a restore re-derives it.
+        let document = chart.export_state_json().unwrap();
+        assert!(!document.contains("threshold"));
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(regions(&restored), vec![Some(rsi_region), Some(chop_zone)]);
+        assert_eq!(restored.export_state_json().unwrap(), document);
+
+        // Visibility round-trips with the region: both restored bindings stay hidden and draw no
+        // strip; re-showing them draws each region in its own pane, the Chop Zone at 38.2/61.8.
+        let fill = Color::rgba(0x78, 0x7B, 0x86, 0x33);
+        let strip_panes = |chart: &mut ChartEngine| {
+            let frame = chart.build_frame();
+            (0..frame.panes.len())
+                .filter(|&pane| {
+                    frame.panes[pane].main.iter().any(|prim| {
+                        matches!(prim, aeris_charts_render::draw_list::Prim::Rect { color, .. } if *color == fill)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip_panes(&mut restored), Vec::<usize>::new());
+        let outputs = restored
+            .indicator_bindings()
+            .iter()
+            .map(|binding| binding.outputs[0])
+            .collect::<Vec<_>>();
+        for &output in &outputs {
+            assert!(restored.set_indicator_binding_visible(output, true));
+        }
+        let chop_pane = restored.series_entry(outputs[1]).unwrap().pane_index;
+        let rsi_pane = restored.series_entry(outputs[0]).unwrap().pane_index;
+        assert_ne!(chop_pane, rsi_pane);
+        let mut expected_panes = vec![rsi_pane, chop_pane];
+        expected_panes.sort_unstable();
+        assert_eq!(strip_panes(&mut restored), expected_panes);
+        let frame = restored.build_frame();
+        let scale = &restored.panes[chop_pane].price_scale;
+        let mut expected_boundaries = [61.8, 38.2]
+            .map(|price| scale.price_to_coordinate(price, 0.0) as f32)
+            .map(|y| y.round() as i32);
+        expected_boundaries.sort_unstable();
+        let mut boundaries = frame.panes[chop_pane]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                aeris_charts_render::draw_list::Prim::HLine {
+                    y,
+                    style: LineStyle::Dotted,
+                    color,
+                    ..
+                } if *color == Color::rgb(0x78, 0x7B, 0x86) => Some(*y),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        boundaries.sort_unstable();
+        assert_eq!(boundaries, expected_boundaries);
+    }
+
+    #[test]
     fn historical_volatility_persists_annualization_and_output_identity() {
         let mut chart = settled_chart();
         let output = chart.add_historical_volatility(0, 3, 365.0).unwrap();
