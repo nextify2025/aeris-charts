@@ -198,17 +198,19 @@ AO、PVT、TRIX 与 EMV 同时存在内置研究和同名的 KLineChart 模板�
 | `add_market_structure(source, left = 5, right = 5, break_on = "close")` | `break_on`：`"close"` 或 `"wick"` | 一个空白锚定输出；BOS/CHoCH 由引擎绘制 |
 | `add_fair_value_gaps(source, { min_size = 0, mitigation = "touch", mitigation_price = "wick", max_active = 20, show_mitigated = false })` | `mitigation`：`"touch"`、`"half"`、`"full"`；`mitigation_price`：`"wick"`、`"close"`；`max_active` 为 1 到 64 | 一个空白锚定输出；区域由引擎绘制 |
 | `add_order_blocks(source, { left = 5, right = 5, break_on = "close", zone = "wick", mitigation, mitigation_price, max_active = 20, show_mitigated = false })` | `zone`：`"wick"` 或 `"body"`；其余同上 | 一个空白锚定输出；区域由引擎绘制 |
-| `add_session_levels(source, calendar = "utc")` | `calendar`：`"utc"` 或 `"host"` | `[时段高点, 时段低点]` |
-| `add_previous_period_levels(source, period = "day", calendar = "utc")` | `period`：`"day"`、`"week"`、`"month"` | `[上一周期高点, 低点, 收盘价]` |
-| `add_opening_range(source, duration_seconds, calendar = "utc")` | `duration_seconds` 为正的 32 位整数 | `[开盘区间高点, 低点, 中点]` |
+| `add_session_levels(source, calendar = "exchange")` | `calendar`：`"exchange"`、`"utc"` 或 `"host"` | `[时段高点, 时段低点]` |
+| `add_previous_period_levels(source, period = "day", calendar = "exchange")` | `period`：`"day"`、`"week"`、`"month"` | `[上一周期高点, 低点, 收盘价]` |
+| `add_opening_range(source, duration_seconds, calendar = "exchange")` | `duration_seconds` 为正的 32 位整数 | `[开盘区间高点, 低点, 中点]` |
 
 每个方法最后都可以再传一个 `options`（`Partial<series_options>`），应用于每个输出。`indicator_kind` 相应新增这七个 id，`indicator_schema(kind)` 以 `"choice"` 参数报告 `break_on`、`zone`、`mitigation`、`mitigation_price`、`period` 与 `calendar`，摆动窗口的上限为 50，`max_active` 的上限为 64；这些种类不列出 `source` 参数。结构研究只接受 `close` 输入，也不能切换输入。
 
 **注释快照**。`chart.study_annotations(binding)` 返回结构研究按确认行排序的 `{ markers, zones }`：标记带有 `row`、`confirm_row`、`price`、`kind`（`"swing_high"`、`"swing_low"`、`{ bos: { up } }` 或 `{ choch: { up } }`）与 `from_row`（BOS/CHoCH 线段的起点行），区域带有 `start_row`、`confirm_row`、`top`、`bottom`、`bullish`、`end_row`（缓解或退役的行）与 `retired`。`binding` 须为该研究的第一个输出；非结构研究抛出 `unsupported_operation`，失效的句柄抛出 `invalid_handle`。注释只用于显示，没有命中目标，也不持久化。
 
-**时段日历**。`chart.set_study_calendar(boundaries)` 以 `resample_boundary` 行（`startTime`、`endTime`、`sessionId`，UTC 秒）原子地替换运行时日历：最多 20,000 行，有序且不相交，违反时抛出 `invalid_options` 并保留原日历；空列表与 `chart.clear_study_calendar()` 都会清空它。`calendar: "host"` 的研究使用这些时段，替换日历会重建它们及其依赖的研究，`"utc"` 研究不受影响。日历不进入导出的文档。可以用 `resample_boundaries(options)` 从交易所时段窗口生成这些行。
+**日历策略**。`calendar` 默认为 `"exchange"`：按图表的交易所时区与交易时段起点（`time_scale().apply_options({ time_zone, session_start })`）计算交易日，与 VWAP 和枢轴点相同，跨越午夜的夜盘属于下一个交易日及其所在的周与月；修改时区或交易时段起点时引擎自动重建这些研究。交易所时间为 UTC 且交易时段起点为 0 时，它与 `"utc"` 的结果相同。`"utc"` 按 UTC 自然日、周与月计算；`"host"` 使用下述宿主时段。`indicator_schema(kind)` 报告 `calendar` 的默认值 `"exchange"` 与选项 `["exchange", "utc", "host"]`。完整语义见[时段日历](../features/studies.md#时段日历)。
 
-Rust 宿主使用 `ChartEngine::{add_swing_points, add_market_structure, add_fair_value_gaps, add_order_blocks, add_session_levels, add_previous_period_levels, add_opening_range}`（拒绝时返回空列表）、`ChartEngine::study_annotations(binding)`、`set_study_calendar(Vec<ResampleBoundary>)` 与 `clear_study_calendar()`。确认语义、空白数据规则、检查点与绘制顺序见[结构与时段研究](../features/studies.md)。
+**时段日历**。`chart.set_study_calendar(boundaries)` 以 `resample_boundary` 行（`startTime`、`endTime`、`sessionId`，UTC 秒）原子地替换运行时日历：最多 20,000 行，有序且不相交，违反时抛出 `invalid_options` 并保留原日历；空列表与 `chart.clear_study_calendar()` 都会清空它。`calendar: "host"` 的研究使用这些时段，替换日历会重建它们及其依赖的研究，`"exchange"` 与 `"utc"` 研究不受影响。日历不进入导出的文档。可以用 `resample_boundaries(options)` 从交易所时段窗口生成这些行。
+
+Rust 宿主使用 `ChartEngine::{add_swing_points, add_market_structure, add_fair_value_gaps, add_order_blocks, add_session_levels, add_previous_period_levels, add_opening_range}`（拒绝时返回空列表；日历策略为 `StudyCalendarPolicy::{Exchange, Utc, Host}`，`Default` 为 `Exchange`）、`ChartEngine::study_annotations(binding)`、`set_study_calendar(Vec<ResampleBoundary>)` 与 `clear_study_calendar()`。确认语义、空白数据规则、检查点与绘制顺序见[结构与时段研究](../features/studies.md)。
 
 ## 自定义研究
 

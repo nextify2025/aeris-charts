@@ -309,16 +309,8 @@ impl ChartInner {
             .add_swing_points(source_id as SeriesId, left as usize, right as usize)
     }
 
-    fn study_calendar_policy(value: &str) -> Option<StudyCalendarPolicy> {
-        match value {
-            "utc" => Some(StudyCalendarPolicy::Utc),
-            "host" => Some(StudyCalendarPolicy::Host),
-            _ => None,
-        }
-    }
-
     pub fn add_session_levels(&mut self, source_id: u32, calendar: &str) -> Vec<u32> {
-        let Some(calendar) = Self::study_calendar_policy(calendar) else {
+        let Some(calendar) = StudyCalendarPolicy::from_name(calendar) else {
             return Vec::new();
         };
         self.engine
@@ -338,7 +330,7 @@ impl ChartInner {
                 "month" => Some(PreviousPeriod::Month),
                 _ => None,
             },
-            Self::study_calendar_policy(calendar),
+            StudyCalendarPolicy::from_name(calendar),
         ) else {
             return Vec::new();
         };
@@ -352,7 +344,7 @@ impl ChartInner {
         duration_seconds: u32,
         calendar: &str,
     ) -> Vec<u32> {
-        let Some(calendar) = Self::study_calendar_policy(calendar) else {
+        let Some(calendar) = StudyCalendarPolicy::from_name(calendar) else {
             return Vec::new();
         };
         self.engine

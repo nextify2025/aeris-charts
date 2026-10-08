@@ -675,3 +675,99 @@ fn whitespace_prefixes_and_tip_corrections_recompute_without_lookahead() {
         }
     }
 }
+
+#[test]
+fn exchange_source_with_the_utc_calendar_equals_utc_and_replays_incrementally() {
+    const DAY: i64 = 86_400;
+    // Hourly bars from before the epoch (negative times floor) across several weeks and a month.
+    let times: Vec<_> = (0..2_175).map(|row| (row as i64 - 300) * 3_600).collect();
+    let mut highs: Vec<_> = (0..times.len())
+        .map(|row| 100. + (row % 29) as f64)
+        .collect();
+    let mut lows: Vec<_> = (0..times.len())
+        .map(|row| 70. - (row % 11) as f64)
+        .collect();
+    let closes: Vec<_> = (0..times.len()).map(|row| 90. + (row % 7) as f64).collect();
+    let utc_day = |time: i64| time.div_euclid(DAY) * DAY;
+    let identity = SessionSource::Exchange {
+        trading_day_seconds: &utc_day,
+        session_open: &utc_day,
+    };
+    // A +8h exchange whose trading day starts at 21:00 local (13:00 UTC).
+    let night_day = |time: i64| (time + 11 * 3_600).div_euclid(DAY) * DAY;
+    let night_open = |time: i64| (time + 11 * 3_600).div_euclid(DAY) * DAY - 11 * 3_600;
+    let night = SessionSource::Exchange {
+        trading_day_seconds: &night_day,
+        session_open: &night_open,
+    };
+    for kind in [
+        SessionStudy::SessionLevels,
+        SessionStudy::PreviousPeriodLevels(PreviousPeriod::Day),
+        SessionStudy::PreviousPeriodLevels(PreviousPeriod::Week),
+        SessionStudy::PreviousPeriodLevels(PreviousPeriod::Month),
+        SessionStudy::OpeningRange {
+            duration_seconds: 2 * 3_600,
+        },
+    ] {
+        let bars = input(&times, &highs, &lows, &closes);
+        assert_eq!(
+            session_study(bars, identity, kind),
+            session_study(bars, SessionSource::Utc, kind),
+            "{kind:?}"
+        );
+        let mut state = SessionStudyState::new(kind);
+        for (previous, end) in [(0, 1), (1, 1023), (1023, 1025), (1025, times.len())] {
+            let bars = input(&times[..end], &highs[..end], &lows[..end], &closes[..end]);
+            state.update(bars, night, previous);
+            assert_eq!(
+                state.outputs(),
+                session_study(bars, night, kind),
+                "{kind:?}"
+            );
+        }
+        for row in [times.len() - 1, 1500, 1024, 40] {
+            highs[row] += 250.;
+            lows[row] -= 250.;
+            let bars = input(&times, &highs, &lows, &closes);
+            state.update(bars, night, row);
+            assert_eq!(
+                state.outputs(),
+                session_study(bars, night, kind),
+                "{kind:?}"
+            );
+        }
+        // Switching from the exchange source to UTC replays every row.
+        let bars = input(&times, &highs, &lows, &closes);
+        state.update(bars, SessionSource::Utc, times.len());
+        assert_eq!(
+            state.outputs(),
+            session_study(bars, SessionSource::Utc, kind)
+        );
+        assert_eq!(state.last_work_rows(), times.len());
+    }
+    // The night-session opening range is anchored at 21:00 local, not at UTC midnight: the
+    // two-hour range of the trading day opened at 13:00 UTC covers 13:00 and 14:00 only.
+    let day_start = 13 * 3_600;
+    let window = [day_start, day_start + 3_600, day_start + 2 * 3_600, DAY];
+    let range = session_study(
+        input(
+            &window,
+            &[10., 12., 30., 40.],
+            &[5., 4., 1., 0.],
+            &[7., 7., 7., 7.],
+        ),
+        night,
+        SessionStudy::OpeningRange {
+            duration_seconds: 2 * 3_600,
+        },
+    );
+    assert_eq!(
+        range,
+        [
+            point(10., 5., None),
+            point(12., 4., None),
+            point(12., 4., None),
+            point(12., 4., None),
+        ]
+    );
+}

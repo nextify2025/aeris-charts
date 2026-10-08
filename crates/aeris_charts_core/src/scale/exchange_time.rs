@@ -327,6 +327,27 @@ impl ExchangeTime {
         self.trading_day(time).saturating_mul(DAY)
     }
 
+    /// UTC instant of the latest trading-day boundary (the local session start) at or before
+    /// `time`: where the session containing `time` opened on its own calendar evening or morning.
+    /// Unlike [`Self::trading_day_start_utc`], a weekend-rolled day is not moved back to Friday,
+    /// so a week that opens on Sunday evening opens on Sunday and one that opens on Friday
+    /// evening opens on Friday. Never later than `time` (a boundary inside a skipped DST hour
+    /// clamps to `time`). Calendar-date rows open at their own UTC midnight.
+    pub fn session_open_utc(&self, time: i64) -> i64 {
+        if self.calendar_dates {
+            return time.div_euclid(DAY).saturating_mul(DAY);
+        }
+        let start = i64::from(self.session_start_seconds);
+        let boundary = self
+            .offsets
+            .to_local(time)
+            .saturating_sub(start)
+            .div_euclid(DAY)
+            .saturating_mul(DAY)
+            .saturating_add(start);
+        self.offsets.to_utc(boundary).min(time)
+    }
+
     /// (year, month 1-12, day 1-31) of the trading day.
     pub fn trading_date(&self, time: i64) -> (i64, u32, u32) {
         civil_from_timestamp(self.trading_day_seconds(time))
@@ -645,6 +666,47 @@ mod tests {
         assert_eq!(
             new_york.local_seconds_of_day(ts(2024, 1, 6, 0, 30)),
             19 * HOUR + 30 * 60
+        );
+    }
+
+    #[test]
+    fn session_open_is_the_latest_local_session_start_at_or_before_the_time() {
+        // SHFE-style night session: 21:00 CST (13:00 UTC) opens the next trading day.
+        let futures =
+            ExchangeTime::new(UtcOffsetSchedule::fixed(8 * 3_600).unwrap(), -3 * 3_600).unwrap();
+        // Friday night 21:05 and Saturday 02:00 open on Friday 21:00, not on the Monday day start.
+        assert_eq!(
+            futures.session_open_utc(ts(2024, 1, 5, 13, 5)),
+            ts(2024, 1, 5, 13, 0)
+        );
+        assert_eq!(
+            futures.session_open_utc(ts(2024, 1, 5, 18, 0)),
+            ts(2024, 1, 5, 13, 0)
+        );
+        // Monday 09:00 CST is past Sunday 21:00, the latest boundary at or before it.
+        assert_eq!(
+            futures.session_open_utc(ts(2024, 1, 8, 1, 0)),
+            ts(2024, 1, 7, 13, 0)
+        );
+        // A week that opens on Sunday evening (CME 17:00 CT) opens on Sunday.
+        let cme = ExchangeTime::new(chicago_2024(), -7 * 3_600).unwrap();
+        assert_eq!(
+            cme.session_open_utc(ts(2024, 1, 7, 23, 30)),
+            ts(2024, 1, 7, 23, 0)
+        );
+        // UTC identity: the UTC midnight, exactly like the UTC study calendar.
+        let utc = ExchangeTime::default();
+        assert_eq!(
+            utc.session_open_utc(ts(2024, 1, 8, 10, 0)),
+            ts(2024, 1, 8, 0, 0)
+        );
+        // Negative times floor, never round toward zero.
+        assert_eq!(utc.session_open_utc(-1), -DAY);
+        let mut dates = futures.clone();
+        dates.set_calendar_dates(true);
+        assert_eq!(
+            dates.session_open_utc(ts(2024, 1, 8, 0, 0)),
+            ts(2024, 1, 8, 0, 0)
         );
     }
 

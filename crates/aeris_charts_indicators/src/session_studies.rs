@@ -2,12 +2,51 @@
 
 use crate::{IndicatorInput, SessionSpan, month_key};
 
-/// Calendar UTC days, or ordered disjoint host intervals (start inclusive, end exclusive).
-/// Adjacent intervals with the same identity form one continuous session.
-#[derive(Clone, Copy, Debug)]
+/// Calendar UTC days, ordered disjoint host intervals (start inclusive, end exclusive), or the
+/// exchange trading calendar. Adjacent host intervals with the same identity form one continuous
+/// session.
+#[derive(Clone, Copy)]
 pub enum SessionSource<'a> {
     Utc,
     Host(&'a [SessionSpan]),
+    /// Exchange trading days. `trading_day_seconds` maps a timestamp to the UTC-midnight seconds
+    /// of its trading date (identity on UTC days = the `Utc` source); days, Monday weeks and civil
+    /// months are counted on that date, so a night session that crosses midnight belongs to the
+    /// next trading day, week and month. `session_open` maps the first row of a trading day to
+    /// the instant its session opened (the opening-range anchor). Both are evaluated per row in
+    /// O(1) or O(log transitions); neither retains the input.
+    Exchange {
+        trading_day_seconds: &'a dyn Fn(i64) -> i64,
+        session_open: &'a dyn Fn(i64) -> i64,
+    },
+}
+
+impl std::fmt::Debug for SessionSource<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Utc => formatter.write_str("Utc"),
+            Self::Host(spans) => formatter.debug_tuple("Host").field(spans).finish(),
+            Self::Exchange { .. } => formatter.write_str("Exchange"),
+        }
+    }
+}
+
+/// Which source a [`SessionStudyState`] was built for; switching sources replays every row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceMode {
+    Utc,
+    Host,
+    Exchange,
+}
+
+impl SessionSource<'_> {
+    fn mode(&self) -> SourceMode {
+        match self {
+            Self::Utc => SourceMode::Utc,
+            Self::Host(_) => SourceMode::Host,
+            Self::Exchange { .. } => SourceMode::Exchange,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,7 +58,7 @@ pub enum PreviousPeriod {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStudy {
-    /// Running high and low, reset at each new UTC day or host session.
+    /// Running high and low, reset at each new UTC day, host session or exchange trading day.
     SessionLevels,
     /// Completed period levels become available only on the first row of the next period.
     PreviousPeriodLevels(PreviousPeriod),
@@ -125,6 +164,8 @@ impl HostCursor {
 struct Runtime {
     host: HostCursor,
     active_key: Option<i64>,
+    /// Opening instant of the active session (the opening-range anchor), fixed on its first row.
+    session_open: i128,
     aggregate: Option<Aggregate>,
     previous: Option<Aggregate>,
 }
@@ -138,20 +179,29 @@ impl Runtime {
         row: usize,
     ) -> SessionStudyPoint {
         let time = input.times[row];
-        let (session_key, start, day) = match source {
+        // The session's opening instant: known per row for UTC days and host spans, and taken
+        // from the first row of an exchange trading day (its local session start).
+        let (session_key, open, day) = match source {
             SessionSource::Host(spans) => {
                 let Some(group) = self.host.at(spans, time) else {
                     return SessionStudyPoint::default();
                 };
                 (
                     group.ordinal as i64,
-                    i128::from(group.start),
+                    Some(i128::from(group.start)),
                     (group.end - 1).div_euclid(86_400),
                 )
             }
             SessionSource::Utc => {
                 let day = time.div_euclid(86_400);
-                (day, i128::from(day) * 86_400, day)
+                (day, Some(i128::from(day) * 86_400), day)
+            }
+            SessionSource::Exchange {
+                trading_day_seconds,
+                ..
+            } => {
+                let day = trading_day_seconds(time).div_euclid(86_400);
+                (day, None, day)
             }
         };
         let key = match kind {
@@ -168,7 +218,11 @@ impl Runtime {
             }
             self.active_key = Some(key);
             self.aggregate = None;
+            if let SessionSource::Exchange { session_open, .. } = source {
+                self.session_open = i128::from(session_open(time));
+            }
         }
+        let start = open.unwrap_or(self.session_open);
         let (open, high, low, close) = (
             input.open[row],
             input.high[row],
@@ -226,7 +280,7 @@ struct Checkpoint {
 #[derive(Clone, Debug)]
 pub struct SessionStudyState {
     kind: SessionStudy,
-    host_mode: Option<bool>,
+    mode: Option<SourceMode>,
     outputs: Vec<SessionStudyPoint>,
     checkpoints: Vec<Checkpoint>,
     tail: Runtime,
@@ -239,7 +293,7 @@ impl SessionStudyState {
     pub fn new(kind: SessionStudy) -> Self {
         Self {
             kind,
-            host_mode: None,
+            mode: None,
             outputs: Vec::new(),
             checkpoints: Vec::new(),
             tail: Runtime::default(),
@@ -265,13 +319,14 @@ impl SessionStudyState {
     /// Replace/replay from the earliest changed source row. Input columns must
     /// retain the unchanged prefix and ascending times. Host spans must remain
     /// ordered/disjoint; when their boundaries or identity change, `from` must
-    /// include every affected earlier bar. Changing UTC/host mode rebuilds all.
+    /// include every affected earlier bar. Changing the source kind (UTC, host or exchange)
+    /// rebuilds all; a changed exchange calendar needs `from = 0` (or a new state).
     /// Host cursor checkpoints are row-local and do not retain the spans.
     pub fn update(&mut self, input: IndicatorInput<'_>, source: SessionSource<'_>, from: usize) {
         let n = input_len(input);
-        let host_mode = matches!(source, SessionSource::Host(_));
-        let from = if self.host_mode != Some(host_mode) {
-            self.host_mode = Some(host_mode);
+        let mode = source.mode();
+        let from = if self.mode != Some(mode) {
+            self.mode = Some(mode);
             0
         } else {
             from.min(n).min(self.outputs.len())
@@ -353,7 +408,8 @@ fn period_key(day: i64, period: PreviousPeriod) -> i64 {
 ///
 /// Only rows covered by a host interval emit in host mode; intervals must be ordered and
 /// disjoint. Adjacent pieces with the same session ID merge even if no bar falls at the
-/// join. In UTC mode only input timestamps create rows (never synthetic calendar gaps).
+/// join. In UTC and exchange mode only input timestamps create rows (never synthetic
+/// calendar gaps).
 /// Nonfinite or incomplete OHLC rows emit no point and do not affect accumulated levels.
 /// A nonpositive opening-range duration produces no levels.
 pub fn session_study(

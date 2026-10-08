@@ -1282,8 +1282,18 @@ export type klinechart_indicator =
 export type klinechart_indicator_name = klinechart_indicator["indicator"];
 /** The {@link indicator_kind} of a KLineChart binding (and the `kind` {@link chart_api.indicator_schema} takes): `klinechart_` followed by the template name. */
 export type klinechart_indicator_kind = `klinechart_${klinechart_indicator_name}`;
-/** UTC groups by calendar day/week/month; host uses spans supplied by set_study_calendar. */
-export type study_calendar_policy = "utc" | "host";
+/**
+ * Calendar of the session studies (session levels, previous day/week/month levels, opening range).
+ * `exchange` (the default) follows the chart's exchange time zone and trading-session start
+ * ({@link time_scale_options.time_zone} and {@link time_scale_options.session_start}, or the
+ * declarative `timeScale.timeZone` / `timeScale.sessionStart`), the calendar VWAP resets and
+ * pivots use: days, Monday weeks and months are counted on the trading date, so a night session
+ * that crosses midnight belongs to the next trading day, week and month, and an opening range
+ * starts at the session start. Changing the time zone or the session start recomputes these
+ * studies. On a chart whose exchange time is UTC with a midnight session start it equals `utc`.
+ * `utc` groups by UTC calendar day/week/month; `host` uses spans supplied by set_study_calendar.
+ */
+export type study_calendar_policy = "exchange" | "utc" | "host";
 export type previous_period = "day" | "week" | "month";
 export type structure_break_on = "close" | "wick";
 export type structure_mitigation = "touch" | "half" | "full";
@@ -1676,7 +1686,7 @@ export interface time_scale_options {
    * negative start every Saturday or Sunday instant belongs to Monday, and window placement
    * (`session_slot_times`, `resample_boundaries`, `set_trade_stream_sessions`) assumes the week
    * opens on Friday evening. Drives Day/Month/Year tick marks, VWAP session/weekly/monthly
-   * resets, and pivot sessions.
+   * resets, pivot sessions, and the `exchange` calendar of the session studies.
    */
   session_start?: number;
   /**
@@ -5194,11 +5204,11 @@ export interface chart_api {
   add_aroon(source: series_api, period: number, options?: Partial<series_options>): [series_api, series_api];
   /** Confirmed pivot levels and marker snapshots; levels begin at confirmation, never at the pivot. */
   add_swing_points(source: series_api, left?: number, right?: number, options?: Partial<series_options>): [series_api, series_api];
-  /** Intraday running session high/low. Host policy uses set_study_calendar boundaries. */
+  /** Intraday running session high/low. The calendar defaults to `exchange`; host policy uses set_study_calendar boundaries. */
   add_session_levels(source: series_api, calendar?: study_calendar_policy, options?: Partial<series_options>): [series_api, series_api];
-  /** Completed previous day/week/month high/low/close, available only in the next period. */
+  /** Completed previous day/week/month high/low/close, available only in the next period (calendar defaults to `exchange`). */
   add_previous_period_levels(source: series_api, period?: previous_period, calendar?: study_calendar_policy, options?: Partial<series_options>): [series_api, series_api, series_api];
-  /** Running opening high/low/mid, fixed after duration_seconds from the session start. */
+  /** Running opening high/low/mid, fixed after duration_seconds from the session start (calendar defaults to `exchange`). */
   add_opening_range(source: series_api, duration_seconds: number, calendar?: study_calendar_policy, options?: Partial<series_options>): [series_api, series_api, series_api];
   /** BOS/CHoCH segments rendered by the engine; the returned anchor is whitespace. */
   add_market_structure(source: series_api, left?: number, right?: number, break_on?: structure_break_on, options?: Partial<series_options>): series_api;

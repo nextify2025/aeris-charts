@@ -57,11 +57,43 @@ pub enum IndicatorParameterType {
 }
 
 /// Session policy selected by calendar-aware studies. No timezone is inferred from the host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StudyCalendarPolicy {
+    /// The chart's exchange trading calendar (the default): the exchange time zone and trading
+    /// session start of [`crate::ChartEngine::exchange_time`], the calendar VWAP resets and pivots
+    /// use. Days, Monday weeks and civil months are counted on the trading date, so a night
+    /// session that crosses midnight belongs to the next trading day, week and month; an opening
+    /// range starts at the latest session start at or before the trading day's first bar. Equal
+    /// to [`Self::Utc`] while the exchange time is UTC with a midnight session start.
+    #[default]
+    Exchange,
+    /// UTC calendar days, Monday UTC weeks and UTC civil months.
     Utc,
+    /// Host session spans from [`crate::ChartEngine::set_study_calendar`].
     Host,
+}
+
+impl StudyCalendarPolicy {
+    /// Wire names in display order (`exchange` first: the default).
+    pub const NAMES: [&'static str; 3] = ["exchange", "utc", "host"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Exchange => "exchange",
+            Self::Utc => "utc",
+            Self::Host => "host",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "exchange" => Some(Self::Exchange),
+            "utc" => Some(Self::Utc),
+            "host" => Some(Self::Host),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -435,15 +467,19 @@ pub enum IndicatorKind {
         max_active: usize,
         show_mitigated: bool,
     },
+    /// A persisted definition without `calendar` reads as [`StudyCalendarPolicy::Exchange`].
     SessionLevels {
+        #[serde(default)]
         calendar: StudyCalendarPolicy,
     },
     PreviousPeriodLevels {
         period: PreviousPeriod,
+        #[serde(default)]
         calendar: StudyCalendarPolicy,
     },
     OpeningRange {
         duration_seconds: u32,
+        #[serde(default)]
         calendar: StudyCalendarPolicy,
     },
     Custom {
@@ -589,15 +625,15 @@ impl IndicatorKind {
                 show_mitigated: false,
             },
             "session_levels" => Self::SessionLevels {
-                calendar: StudyCalendarPolicy::Utc,
+                calendar: StudyCalendarPolicy::Exchange,
             },
             "previous_period_levels" => Self::PreviousPeriodLevels {
                 period: PreviousPeriod::Day,
-                calendar: StudyCalendarPolicy::Utc,
+                calendar: StudyCalendarPolicy::Exchange,
             },
             "opening_range" => Self::OpeningRange {
                 duration_seconds: 1800,
-                calendar: StudyCalendarPolicy::Utc,
+                calendar: StudyCalendarPolicy::Exchange,
             },
             "aroon" => Self::Aroon { period },
             "awesome_oscillator" => Self::AwesomeOscillator,
@@ -3842,12 +3878,8 @@ impl ChartEngine {
                 parameters.push(
                     IndicatorParameterDescriptor::choice(
                         "calendar",
-                        if calendar == StudyCalendarPolicy::Utc {
-                            "utc"
-                        } else {
-                            "host"
-                        },
-                        &["utc", "host"],
+                        calendar.name(),
+                        &StudyCalendarPolicy::NAMES,
                     )
                     .unwrap(),
                 );
@@ -4785,15 +4817,17 @@ impl ChartEngine {
     }
 
     /// Exchange time zone, session start, or calendar-date changes move trading-day boundaries:
-    /// rebuild every period-keyed binding (VWAP, VWAP bands, pivots) and its dependents once.
+    /// rebuild every period-keyed binding (VWAP, VWAP bands, pivots, exchange-calendar session
+    /// studies) and its dependents once.
     pub(crate) fn rebuild_trading_day_indicators(&mut self) {
         self.rebuild_calendar_indicators(|binding| {
-            matches!(
-                binding.kind,
-                IndicatorKind::Vwap
-                    | IndicatorKind::VwapBands { .. }
-                    | IndicatorKind::PivotPoints { .. }
-            )
+            binding.calendar == Some(StudyCalendarPolicy::Exchange)
+                || matches!(
+                    binding.kind,
+                    IndicatorKind::Vwap
+                        | IndicatorKind::VwapBands { .. }
+                        | IndicatorKind::PivotPoints { .. }
+                )
         });
     }
 
@@ -4961,10 +4995,16 @@ impl ChartEngine {
         };
         let rows = times.len();
         let end = self.indicator_data_end(index, rows, full_replace);
-        let session_source = if self.indicators[index].calendar == Some(StudyCalendarPolicy::Host) {
-            SessionSource::Host(&self.study_calendar_spans)
-        } else {
-            SessionSource::Utc
+        let exchange_time = &self.exchange_time;
+        let trading_day_seconds = |time| exchange_time.trading_day_seconds(time);
+        let session_open = |time| exchange_time.session_open_utc(time);
+        let session_source = match self.indicators[index].calendar {
+            Some(StudyCalendarPolicy::Host) => SessionSource::Host(&self.study_calendar_spans),
+            Some(StudyCalendarPolicy::Utc) => SessionSource::Utc,
+            _ => SessionSource::Exchange {
+                trading_day_seconds: &trading_day_seconds,
+                session_open: &session_open,
+            },
         };
         let kind = session_study_kind(&self.indicators[index].kind).expect("session kind");
         let state = self.indicators[index]

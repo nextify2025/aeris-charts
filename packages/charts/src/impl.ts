@@ -7374,18 +7374,18 @@ export class chart_impl implements chart_api {
     return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
   }
   private validate_study_calendar_policy(calendar: study_calendar_policy): void {
-    if (calendar !== "utc" && calendar !== "host") {
-      throw new AerisChartsError("invalid_options", "study calendar must be utc or host");
+    if (calendar !== "exchange" && calendar !== "utc" && calendar !== "host") {
+      throw new AerisChartsError("invalid_options", "study calendar must be exchange, utc or host");
     }
   }
-  add_session_levels(source: series_api, calendar: study_calendar_policy = "utc", options?: Partial<series_options>): [series_api, series_api] {
+  add_session_levels(source: series_api, calendar: study_calendar_policy = "exchange", options?: Partial<series_options>): [series_api, series_api] {
     this.validate_study_calendar_policy(calendar);
     const ids = this.wasm.add_session_levels(source.id, calendar);
     if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Session Levels source or configuration");
     return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
   }
   add_previous_period_levels(
-    source: series_api, period: previous_period = "day", calendar: study_calendar_policy = "utc",
+    source: series_api, period: previous_period = "day", calendar: study_calendar_policy = "exchange",
     options?: Partial<series_options>,
   ): [series_api, series_api, series_api] {
     if (!["day", "week", "month"].includes(period)) {
@@ -7401,7 +7401,7 @@ export class chart_impl implements chart_api {
     ];
   }
   add_opening_range(
-    source: series_api, duration_seconds: number, calendar: study_calendar_policy = "utc",
+    source: series_api, duration_seconds: number, calendar: study_calendar_policy = "exchange",
     options?: Partial<series_options>,
   ): [series_api, series_api, series_api] {
     if (!Number.isInteger(duration_seconds) || duration_seconds < 1 || duration_seconds > 0xffffffff) {

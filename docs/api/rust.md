@@ -232,7 +232,7 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 **结构与时段研究**（上游，来自 `051a447`、`494d3be`、`8a2339e`、`140c96c`、`6366742`、`14c5f71` 与 `dc39045`，经合并 `dc39045` 的提交引入；参见[结构与时段研究](../features/studies.md)与[指标 API](indicators.md#结构与时段研究)）。下一次 Aeris Terminal 更换固定修订时需要评审以下各项：
 
 - 破坏性：`IndicatorParameterDescriptor::choices: Vec<String>` 改为上游的 `options: Option<Vec<String>>`（线上键 `"options"`），新增构造函数 `IndicatorParameterDescriptor::choice(name, default, options)`（默认值不在列表中时返回 `None`）；列出全部字段的结构体字面量与读取 `choices` 的代码需要更新。`INDICATOR_SCHEMA_REVISION` 由 3 升为 4（上游为 2）。
-- 新增变体：`IndicatorKind::{SwingPoints, MarketStructure, FairValueGaps, OrderBlocks, SessionLevels, PreviousPeriodLevels, OpeningRange}`；穷尽匹配 `IndicatorKind` 的代码需要新增分支。新增枚举：`StudyCalendarPolicy { Utc, Host }`、`PreviousPeriod`、`StructureBreakOn`、`StructureMitigation`、`StructureMitigationPrice` 与 `OrderBlockZone`，以及从 `aeris_charts_indicators::study_annotations` 重新导出的 `SessionSpan`、`StudyAnnotations`、`StudyMarker`、`StudyMarkerKind` 与 `StudyZone`。
+- 新增变体：`IndicatorKind::{SwingPoints, MarketStructure, FairValueGaps, OrderBlocks, SessionLevels, PreviousPeriodLevels, OpeningRange}`；穷尽匹配 `IndicatorKind` 的代码需要新增分支。新增枚举：`StudyCalendarPolicy { Utc, Host }`（后续工作 F2(a) 新增 `Exchange` 并设为默认值，见下文）、`PreviousPeriod`、`StructureBreakOn`、`StructureMitigation`、`StructureMitigationPrice` 与 `OrderBlockZone`，以及从 `aeris_charts_indicators::study_annotations` 重新导出的 `SessionSpan`、`StudyAnnotations`、`StudyMarker`、`StudyMarkerKind` 与 `StudyZone`。
 - 新增方法：`ChartEngine::{add_swing_points, add_market_structure, add_fair_value_gaps, add_order_blocks, add_session_levels, add_previous_period_levels, add_opening_range}`（拒绝时返回空列表）、`study_annotations(binding)`、`set_study_calendar`、`clear_study_calendar`、`study_session_spans`、`study_session_spans_for_rows` 与 `study_utc_{day,week,month}_span`。`aeris_charts_indicators` 新增 `structure_studies`、`session_studies` 与 `study_annotations` 模块；`StructureStudy` 与 `SessionStudyState` 另有本仓库的 `last_work_rows()`。
 - 行为：时段日历只在运行时存在，替换它会重建 `Host` 策略的绑定及其依赖；结构研究只接受 `Close` 输入；注释没有命中目标，不持久化。
 - 合并时的自有线调整（合并 `dc39045` 的提交）：结构与时段运行时在源的数据末端停止，填充预先安装的交易时段槽位是一次追加，输出与内置研究经同一个输出写入函数；`last_indicator_work_rows` 计入它们扫描的行；日历替换与交易所交易日变化共用一个重建函数（`rebuild_calendar_indicators`），其后重新同步时间点；结构研究拒绝 as-of 对齐的源（以及跟随这类源的指标输出），带结构研究的源（包括结构研究挂在其指标输出链上的源）不能切换为 as-of 对齐（`UnsupportedOperation`）；摆动点在空白数据行上不输出阶梯值（与上游 `ef97955` 相同，提前采用）。这些种类没有 `IndicatorSeed`，`with_convention` 不改变它们。
@@ -266,6 +266,13 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - `3835fee fix(axis): keep first tick weight in sync with cadence`，源码级：`TimeTickMarks` 新增公共方法 `set_first_weight(u8)`，第一个点的标记保存在权重桶之外（`set_weights_from` 与 `push_weight` 把第一个索引放在那里，`drop_front` 不再向桶头插入）；`first_point_weight_in` / `first_point_weight_shifted_in` 对一个点返回 0。合并时的自有线调整：不采用上游的 `inferred_first_weight(.., ChartTimeZone)`（本仓库没有 `*_in_time_zone` 辅助函数）；`606e2ce` 的原地读取在本仓库早已实现，其同步代码未合入。
 - `b75ec25 fix(render): share byte image opacity across executors`，源码级与行为：新增 `aeris_charts_render::draw_list::quantize_image_opacity(f32) -> f32`；每个图像执行器（Canvas2D、原生 tiny-skia、GPUI、WebGPU）先把不透明度量化为 n/255，量化为零的图像不绘制；GPUI 的栅格图像缓存改以 `(u64, u8)` 为键。自定义执行器应同样调用它。
 - `7df2305`、`5bc6ee2`、`85bc10b`：只涉及浏览器包、演示页与浏览器测试（倒计时按整秒对齐、窗格描述 id 全局唯一），Rust 宿主无需改动。
+
+**交易所研究日历**（自有线，合并 `85bc10b` 之后的后续工作 F2(a)，所有者决定 Q-A；参见[时段日历](../features/studies.md#时段日历)与[兼容性](compatibility.md#已记录的不兼容变更)）。
+
+- 破坏性：`StudyCalendarPolicy` 新增 `Exchange` 变体并派生 `Default`（默认 `Exchange`）；该枚举不是 `#[non_exhaustive]`，穷尽 `match` 的代码需要新增分支。新增 `StudyCalendarPolicy::{NAMES, name, from_name}`（线上名称 `"exchange"`、`"utc"`、`"host"`）。
+- 行为变更：`IndicatorKind::schema_definition("session_levels" | "previous_period_levels" | "opening_range", ..)` 与 `indicator_schema` 报告的 `calendar` 默认值由 `Utc` 改为 `Exchange`，选项为 `["exchange", "utc", "host"]`；反序列化缺少 `calendar` 字段的 `SessionLevels`、`PreviousPeriodLevels` 与 `OpeningRange` 时取 `Exchange`。显式传入 `Utc` 或 `Host` 的调用不受影响；交易所时间为 UTC 且交易时段起点为 0 时 `Exchange` 与 `Utc` 的输出相同。
+- 交易所时区、交易时段起点或日历日期轴变化时，`Exchange` 绑定与 VWAP、枢轴点一起经 `rebuild_calendar_indicators` 重建，宿主无需调用任何重建方法。
+- 新增方法：`aeris_charts_core::scale::exchange_time::ExchangeTime::session_open_utc(time)`（`time` 之前（含）最近一次本地交易时段起点的 UTC 时刻，开盘区间的锚点）。`aeris_charts_indicators::SessionSource` 新增 `Exchange { trading_day_seconds, session_open }` 变体（两个 `&dyn Fn(i64) -> i64`），不再派生 `Debug`，改为手写实现；穷尽匹配它的代码需要新增分支。
 
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 

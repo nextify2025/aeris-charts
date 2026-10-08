@@ -13181,7 +13181,11 @@ mod session_study_regressions {
 
     fn all_studies(chart: &mut ChartEngine) -> Vec<Vec<SeriesId>> {
         let mut bindings = Vec::new();
-        for calendar in [StudyCalendarPolicy::Utc, StudyCalendarPolicy::Host] {
+        for calendar in [
+            StudyCalendarPolicy::Utc,
+            StudyCalendarPolicy::Host,
+            StudyCalendarPolicy::Exchange,
+        ] {
             bindings.push(chart.add_session_levels(0, calendar));
             for period in [
                 PreviousPeriod::Day,
@@ -13194,7 +13198,7 @@ mod session_study_regressions {
         }
         assert_eq!(
             bindings.iter().map(Vec::len).collect::<Vec<_>>(),
-            [2, 3, 3, 3, 3, 2, 3, 3, 3, 3]
+            [2, 3, 3, 3, 3, 2, 3, 3, 3, 3, 2, 3, 3, 3, 3]
         );
         bindings
     }
@@ -13416,13 +13420,20 @@ mod session_study_regressions {
             boundary(1706745600, 1706918400, 2),
             boundary(1707091200, 1707177600, 3),
         ];
+        // The exchange variants run on a New York exchange calendar with an evening session start.
+        let exchange = |chart: &mut ChartEngine| {
+            chart.set_time_zone("America/New_York").unwrap();
+            chart.set_session_start_seconds(-7 * 3_600).unwrap();
+        };
         let mut replay = ChartEngine::new(800.0, 500.0, 1.0);
         replay.set_study_calendar(calendar.clone()).unwrap();
+        exchange(&mut replay);
         let bindings = all_studies(&mut replay);
         for len in (0..=times.len()).chain((0..times.len()).rev()) {
             install(&mut replay, &times[..len], &high[..len], &low[..len]);
             let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
             fresh.set_study_calendar(calendar.clone()).unwrap();
+            exchange(&mut fresh);
             install(&mut fresh, &times[..len], &high[..len], &low[..len]);
             let reference = all_studies(&mut fresh);
             for (actual, expected) in bindings.iter().zip(reference.iter()) {
@@ -13443,6 +13454,7 @@ mod session_study_regressions {
         low[5] = 35.;
         let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
         fresh.set_study_calendar(calendar).unwrap();
+        exchange(&mut fresh);
         install(&mut fresh, &times, &high, &low);
         let reference = all_studies(&mut fresh);
         for (actual, expected) in bindings.iter().zip(reference.iter()) {
@@ -13810,6 +13822,401 @@ mod session_study_regressions {
                     .is_err()
             );
             assert_eq!(target.export_state_json().unwrap(), before);
+        }
+    }
+
+    /// UTC instant of an exchange-local CST (UTC+8) wall time.
+    fn cst(month: u32, day: u32, hour: i64, minute: i64) -> f64 {
+        let day =
+            aeris_charts_core::scale::time_tick_marks::days_from_civil(2024, month, day).unwrap();
+        (day * 86_400 + (hour - 8) * 3_600 + minute * 60) as f64
+    }
+
+    /// A SHFE-style chart: day sessions and a 21:00-02:30 night session that opens the next
+    /// trading day, including a Friday night that belongs to Monday.
+    fn shfe_bars() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let rows = [
+            (cst(1, 31, 9, 0), 10., 5.), // 0: Wed Jan 31 day session, trading day Jan 31
+            (cst(1, 31, 21, 0), 20., 15.), // 1: Wed night: trading day Thu Feb 1 (February)
+            (cst(2, 1, 0, 30), 22., 14.), // 2: past midnight, still Feb 1's night session
+            (cst(2, 1, 9, 0), 21., 16.), // 3: Thu Feb 1 day session
+            (cst(2, 2, 21, 0), 30., 25.), // 4: Fri night: trading day Mon Feb 5 (next week)
+            (cst(2, 3, 1, 0), 31., 24.), // 5: Sat 01:00, still Monday's night session
+            (cst(2, 5, 9, 0), 32., 26.), // 6: Mon Feb 5 day session
+        ];
+        (
+            rows.iter().map(|row| row.0).collect(),
+            rows.iter().map(|row| row.1).collect(),
+            rows.iter().map(|row| row.2).collect(),
+        )
+    }
+
+    fn shfe_chart() -> ChartEngine {
+        let (times, high, low) = shfe_bars();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut chart, &times, &high, &low);
+        assert!(chart.set_time_zone("Asia/Shanghai").unwrap());
+        chart.set_session_start_seconds(-3 * 3_600).unwrap();
+        chart
+    }
+
+    #[test]
+    fn exchange_calendar_counts_night_sessions_in_the_next_trading_day_week_and_month() {
+        let mut chart = shfe_chart();
+        let exchange = |chart: &mut ChartEngine, period| {
+            chart.add_previous_period_levels(0, period, StudyCalendarPolicy::Exchange)
+        };
+        let day = exchange(&mut chart, PreviousPeriod::Day);
+        let week = exchange(&mut chart, PreviousPeriod::Week);
+        let month = exchange(&mut chart, PreviousPeriod::Month);
+        let utc_week =
+            chart.add_previous_period_levels(0, PreviousPeriod::Week, StudyCalendarPolicy::Utc);
+        let utc_month =
+            chart.add_previous_period_levels(0, PreviousPeriod::Month, StudyCalendarPolicy::Utc);
+        let session = chart.add_session_levels(0, StudyCalendarPolicy::Exchange);
+        // The night session (rows 1-2) and the following day session (row 3) are one trading day.
+        assert_eq!(
+            values(&chart, session[0]),
+            [
+                Some(10.),
+                Some(20.),
+                Some(22.),
+                Some(22.),
+                Some(30.),
+                Some(31.),
+                Some(32.)
+            ]
+        );
+        assert_eq!(
+            values(&chart, day[0]),
+            [
+                None,
+                Some(10.),
+                Some(10.),
+                Some(10.),
+                Some(22.),
+                Some(22.),
+                Some(22.)
+            ]
+        );
+        // The Friday night session opens Monday's week: last week's levels appear at 21:00 Friday.
+        assert_eq!(
+            values(&chart, week[0]),
+            [None, None, None, None, Some(22.), Some(22.), Some(22.)]
+        );
+        assert_eq!(
+            values(&chart, week[1]),
+            [None, None, None, None, Some(5.), Some(5.), Some(5.)]
+        );
+        assert_eq!(values(&chart, week[2])[4], Some(18.5));
+        // Wednesday night already trades February 1: January's levels appear on that row.
+        assert_eq!(
+            values(&chart, month[0]),
+            [
+                None,
+                Some(10.),
+                Some(10.),
+                Some(10.),
+                Some(10.),
+                Some(10.),
+                Some(10.)
+            ]
+        );
+        assert_eq!(values(&chart, month[1])[1], Some(5.));
+        // UTC counts the wall-clock UTC calendar instead: the week turns on Monday morning
+        // (row 6) and the month on Thursday 09:00 CST (row 3).
+        assert_eq!(values(&chart, utc_week[0])[..6], [None; 6]);
+        assert_eq!(values(&chart, utc_week[0])[6], Some(31.));
+        assert_eq!(values(&chart, utc_month[0])[..3], [None; 3]);
+        assert_eq!(values(&chart, utc_month[0])[3], Some(22.));
+    }
+
+    #[test]
+    fn exchange_opening_range_starts_at_the_night_session_open() {
+        let mut chart = shfe_chart();
+        let opening = chart.add_opening_range(0, 3_600, StudyCalendarPolicy::Exchange);
+        // Thursday's range is the first hour after Wednesday 21:00 (row 1 only); Monday's is the
+        // first hour after Friday 21:00 (row 4 only), not after the Monday day start.
+        assert_eq!(
+            values(&chart, opening[0]),
+            [
+                None,
+                Some(20.),
+                Some(20.),
+                Some(20.),
+                Some(30.),
+                Some(30.),
+                Some(30.)
+            ]
+        );
+        assert_eq!(
+            values(&chart, opening[1]),
+            [
+                None,
+                Some(15.),
+                Some(15.),
+                Some(15.),
+                Some(25.),
+                Some(25.),
+                Some(25.)
+            ]
+        );
+    }
+
+    #[test]
+    fn exchange_calendar_equals_utc_while_the_exchange_time_is_utc() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        // Irregular bars across Monday weeks and a civil month boundary, starting before 1970.
+        let times = (0..400_i64)
+            .map(|row| row * row * 97 % 3_000_000 - 900_000)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|time| time as f64)
+            .collect::<Vec<_>>();
+        let high = (0..times.len())
+            .map(|row| 100. + (row % 23) as f64)
+            .collect::<Vec<_>>();
+        let low = (0..times.len())
+            .map(|row| 80. - (row % 19) as f64)
+            .collect::<Vec<_>>();
+        install(&mut chart, &times, &high, &low);
+        for calendar_dates in [false, true] {
+            chart.set_calendar_date_axis(calendar_dates);
+            let mut pairs = Vec::new();
+            pairs.push((
+                chart.add_session_levels(0, StudyCalendarPolicy::Exchange),
+                chart.add_session_levels(0, StudyCalendarPolicy::Utc),
+            ));
+            for period in [
+                PreviousPeriod::Day,
+                PreviousPeriod::Week,
+                PreviousPeriod::Month,
+            ] {
+                pairs.push((
+                    chart.add_previous_period_levels(0, period, StudyCalendarPolicy::Exchange),
+                    chart.add_previous_period_levels(0, period, StudyCalendarPolicy::Utc),
+                ));
+            }
+            pairs.push((
+                chart.add_opening_range(0, 5_000, StudyCalendarPolicy::Exchange),
+                chart.add_opening_range(0, 5_000, StudyCalendarPolicy::Utc),
+            ));
+            for (exchange, utc) in pairs {
+                for (left, right) in exchange.into_iter().zip(utc) {
+                    let expected = values(&chart, right);
+                    assert!(expected.iter().any(Option::is_some));
+                    assert_eq!(
+                        values(&chart, left),
+                        expected,
+                        "calendar dates {calendar_dates}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exchange_time_changes_rebuild_every_exchange_study_in_one_operation() {
+        let (times, high, low) = shfe_bars();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut chart, &times, &high, &low);
+        let add = |chart: &mut ChartEngine, calendar| {
+            let mut outputs = chart.add_session_levels(0, calendar);
+            outputs.extend(chart.add_previous_period_levels(0, PreviousPeriod::Week, calendar));
+            outputs.extend(chart.add_previous_period_levels(0, PreviousPeriod::Month, calendar));
+            outputs.extend(chart.add_opening_range(0, 3_600, calendar));
+            outputs
+        };
+        let exchange = add(&mut chart, StudyCalendarPolicy::Exchange);
+        let utc = add(&mut chart, StudyCalendarPolicy::Utc);
+        let chained = chart.add_indicator_kind(exchange[2], IndicatorKind::Sma { period: 2 }, None);
+        let utc_before = utc.iter().map(|&id| values(&chart, id)).collect::<Vec<_>>();
+        let utc_generations = utc
+            .iter()
+            .map(|&id| chart.data.series_generation(id))
+            .collect::<Vec<_>>();
+        // Each step is one engine call; the expected outputs come from a fresh engine that had
+        // the same exchange time before any study was added.
+        type Step = fn(&mut ChartEngine);
+        let steps: [(Step, Step); 3] = [
+            (
+                |chart| assert!(chart.set_time_zone("Asia/Shanghai").unwrap()),
+                |chart| assert!(chart.set_time_zone("Asia/Shanghai").unwrap()),
+            ),
+            (
+                |chart| chart.set_session_start_seconds(-3 * 3_600).unwrap(),
+                |chart| {
+                    chart.set_time_zone("Asia/Shanghai").unwrap();
+                    chart.set_session_start_seconds(-3 * 3_600).unwrap();
+                },
+            ),
+            (
+                |chart| assert!(chart.set_time_zone("Etc/UTC").unwrap()),
+                |chart| chart.set_session_start_seconds(-3 * 3_600).unwrap(),
+            ),
+        ];
+        for (step, (change, configure)) in steps.into_iter().enumerate() {
+            let before = exchange
+                .iter()
+                .map(|&id| values(&chart, id))
+                .collect::<Vec<_>>();
+            change(&mut chart);
+            let mut fresh = ChartEngine::new(800.0, 500.0, 1.0);
+            install(&mut fresh, &times, &high, &low);
+            configure(&mut fresh);
+            let fresh_exchange = add(&mut fresh, StudyCalendarPolicy::Exchange);
+            let fresh_chained =
+                fresh.add_indicator_kind(fresh_exchange[2], IndicatorKind::Sma { period: 2 }, None);
+            let after = exchange
+                .iter()
+                .map(|&id| values(&chart, id))
+                .collect::<Vec<_>>();
+            assert_ne!(after, before, "step {step} moved no trading-day boundary");
+            for (&id, &expected) in exchange.iter().zip(&fresh_exchange) {
+                assert_eq!(values(&chart, id), values(&fresh, expected), "step {step}");
+            }
+            assert_eq!(
+                values(&chart, chained[0]),
+                values(&fresh, fresh_chained[0]),
+                "step {step}: dependents follow in the same operation"
+            );
+            // Invariant check only, not proof of the resync: session-study outputs reuse source
+            // rows, so this rebuild never changes the merged time points and the assertion would
+            // hold without `sync_time_points`. The resync is guaranteed by routing through the
+            // shared `rebuild_calendar_indicators` helper (the VWAP and pivot rebuild path); the
+            // routing itself is what the fresh-engine and chained comparisons above prove.
+            assert_eq!(
+                chart.data.time_points_generation(),
+                chart.synced_time_points_generation
+            );
+            // UTC studies are left untouched.
+            assert_eq!(
+                utc.iter().map(|&id| values(&chart, id)).collect::<Vec<_>>(),
+                utc_before
+            );
+            assert_eq!(
+                utc.iter()
+                    .map(|&id| chart.data.series_generation(id))
+                    .collect::<Vec<_>>(),
+                utc_generations
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_session_studies_do_bounded_work_per_tick() {
+        let rows = 5_000;
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = (0..rows).map(|row| row as f64 * 900.0).collect::<Vec<_>>();
+        let high = (0..rows)
+            .map(|row| 100. + (row % 7) as f64)
+            .collect::<Vec<_>>();
+        let low = (0..rows)
+            .map(|row| 90. - (row % 5) as f64)
+            .collect::<Vec<_>>();
+        install(&mut chart, &times, &high, &low);
+        assert!(chart.set_time_zone("Asia/Shanghai").unwrap());
+        chart.set_session_start_seconds(-3 * 3_600).unwrap();
+        chart.add_session_levels(0, StudyCalendarPolicy::Exchange);
+        chart.add_previous_period_levels(0, PreviousPeriod::Month, StudyCalendarPolicy::Exchange);
+        chart.add_opening_range(0, 1_800, StudyCalendarPolicy::Exchange);
+        for row in rows..rows + 200 {
+            let time = row as f64 * 900.0;
+            // A new bar, then a replacement of the forming bar.
+            assert!(chart.update_series_bar(0, time, [95.0, 101.0, 89.0, 96.0]));
+            assert!(chart.update_series_bar(0, time, [95.0, 102.0, 88.0, 97.0]));
+            for binding in &chart.indicators {
+                assert!(
+                    binding.last_work_rows() <= 2,
+                    "{:?} did {} rows of work on a tick",
+                    binding.kind,
+                    binding.last_work_rows()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v3_exchange_policy_round_trips_and_a_missing_calendar_reads_as_exchange() {
+        let (times, high, low) = shfe_bars();
+        let mut chart = shfe_chart();
+        let session = chart.add_session_levels(0, StudyCalendarPolicy::Exchange);
+        let week = chart.add_previous_period_levels(
+            0,
+            PreviousPeriod::Week,
+            StudyCalendarPolicy::Exchange,
+        );
+        let opening = chart.add_opening_range(0, 3_600, StudyCalendarPolicy::Exchange);
+        let document = chart.export_state_json().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&document).unwrap();
+        for index in 0..3 {
+            assert_eq!(json["indicators"][index]["kind"]["calendar"], "exchange");
+        }
+        let mut omitted = json.clone();
+        for index in 0..3 {
+            omitted["indicators"][index]["kind"]
+                .as_object_mut()
+                .unwrap()
+                .remove("calendar");
+        }
+        for document in [document, omitted.to_string()] {
+            let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+            install(&mut restored, &times, &high, &low);
+            restored.set_time_zone("Asia/Shanghai").unwrap();
+            restored.set_session_start_seconds(-3 * 3_600).unwrap();
+            restored.import_state_json(&document).unwrap();
+            assert!(
+                restored.indicators[..3]
+                    .iter()
+                    .all(|binding| binding.calendar == Some(StudyCalendarPolicy::Exchange))
+            );
+            for id in session.iter().chain(&week).chain(&opening).copied() {
+                assert_eq!(values(&restored, id), values(&chart, id));
+            }
+        }
+        // On a chart whose exchange time is UTC the new default reads exactly like `utc`.
+        let utc_times = [0., 30., 60., 86_400., 7. * 86_400.];
+        let utc_high = [12., 15., 14., 20., 30.];
+        let utc_low = [8., 7., 9., 16., 25.];
+        let mut utc_chart = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut utc_chart, &utc_times, &utc_high, &utc_low);
+        let explicit =
+            utc_chart.add_previous_period_levels(0, PreviousPeriod::Week, StudyCalendarPolicy::Utc);
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&utc_chart.export_state_json().unwrap()).unwrap();
+        assert_eq!(legacy["indicators"][0]["kind"]["calendar"], "utc");
+        legacy["indicators"][0]["kind"]
+            .as_object_mut()
+            .unwrap()
+            .remove("calendar");
+        let mut restored = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut restored, &utc_times, &utc_high, &utc_low);
+        restored.import_state_json(&legacy.to_string()).unwrap();
+        assert_eq!(
+            restored.indicators[0].calendar,
+            Some(StudyCalendarPolicy::Exchange)
+        );
+        for id in explicit {
+            assert_eq!(values(&restored, id), values(&utc_chart, id));
+        }
+    }
+
+    #[test]
+    fn session_study_schemas_default_to_the_exchange_calendar() {
+        for kind in ["session_levels", "previous_period_levels", "opening_range"] {
+            let schema = ChartEngine::indicator_schema(
+                &IndicatorKind::schema_definition(kind, 14, 2.0).unwrap(),
+            );
+            let calendar = schema
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == "calendar")
+                .unwrap();
+            assert_eq!(calendar.default, serde_json::json!("exchange"), "{kind}");
+            assert_eq!(
+                calendar.options.as_deref(),
+                Some(&["exchange".into(), "utc".into(), "host".into()][..])
+            );
         }
     }
 }

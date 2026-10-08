@@ -46,7 +46,7 @@ TradingView 对标列表中的时区（`TRADINGVIEW_TIME_ZONES`；WASM 的 `supp
 
 仅显示的时间投影：`ChartEngine::set_future_time_projection(cadence_seconds, points)` 和 `set_past_time_projection(cadence_seconds, points)`（各自上限为 4,096 个点；传入 `None` 或 0 个点会将其清除；`has_future_time_projection` / `has_past_time_projection` 可读回）为时间轴上最后一根柱之后和第一根柱之前的空白区域标注标签。投影点仅是标签（没有数据行、基础索引或点数），且不会被持久化。
 
-**交易日**。`session_start` 是交易日开始时刻相对交易所本地午夜的偏移秒数（默认 `0`，范围 ±86 399）。负值会把夜盘时段归入下一个交易日，例如 `-3 * 3600` 使 21:00 的中国期货夜盘从次日开始；起点为负时，本应落在周六或周日的交易日会顺延到周一，因此周五夜盘属于周一。Day/Month/Year 刻度标记、VWAP 的 `session`/`weekly`/`monthly` 重置以及枢轴点交易时段均使用交易日。每周周期从周一开始。
+**交易日**。`session_start` 是交易日开始时刻相对交易所本地午夜的偏移秒数（默认 `0`，范围 ±86 399）。负值会把夜盘时段归入下一个交易日，例如 `-3 * 3600` 使 21:00 的中国期货夜盘从次日开始；起点为负时，本应落在周六或周日的交易日会顺延到周一，因此周五夜盘属于周一。Day/Month/Year 刻度标记、VWAP 的 `session`/`weekly`/`monthly` 重置、枢轴点交易时段以及默认 `exchange` 日历的时段研究（交易时段高低点、上一日/周/月水平与开盘区间，见[时段日历](../features/studies.md#时段日历)）均使用交易日。每周周期从周一开始。
 
 周日晚间开盘的市场（CME Globex，美国中部时间 17:00）将 `session_start: -25200`：周日 17:00 属于周一的交易日，周一 17:00 属于周二的交易日，因此 Day 标记、交易时段 VWAP 与每周 VWAP 重置以及枢轴点都与交易时段对齐。取 `0` 时，周日晚间自成一个交易日：在交易时段中间的午夜会出现 Day 标记和交易时段 VWAP 重置，而每周 VWAP 把周日晚间的柱留在上一周，并在该午夜重置。起点为负时，每个周六或周日的时刻都属于周一，而窗口放置（`session_slot_times`、`resample_boundaries`、`set_trade_stream_sessions`）假定一周在周五晚间开盘：这对中国期货是正确的，但周日开盘的市场应在每次调用中以 `session_start` 为 `0` 来放置其晚间窗口（参见 *“分时图”* 和 *“Tick 转 K 线与重采样”*）。
 

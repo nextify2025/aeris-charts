@@ -39,7 +39,8 @@
 //!   Target R — sustained live order-flow tape: per-batch update + frame, retention, late print
 //!   Target S — seven sessions of order flow: batch cost through sealing and session eviction,
 //!              stream memory, and the session budget
-//!   Target T — 1M-row structure studies: tail update p99 and one bounded historical correction
+//!   Target T — 1M-row structure studies: tail update p99, one bounded historical correction,
+//!              and one exchange time-zone change rebuilding the exchange-calendar session studies
 //!   Target U — the Target R tape with auction markers bound to the same stream, and a variant
 //!              with revisit rays (`extend_until_revisited`) under a footprint `max_points` ceiling
 //!
@@ -523,13 +524,29 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
     bindings
 }
 
+/// Exchange time of the session-study workloads: a SHFE-style UTC+8 zone whose trading day opens
+/// at 21:00 the previous evening, so the default exchange study calendar does real work (an
+/// offset-schedule lookup per row and a session-open anchor per trading day) instead of reducing
+/// to UTC days.
+const STUDY_TIME_ZONE: &str = "Asia/Shanghai";
+const STUDY_SESSION_START_SECONDS: i32 = -3 * 3_600;
+
 /// Binds the seven structure and session studies to the candle series 0 with the package
-/// defaults (UTC calendar). Returns the number of bindings.
+/// defaults: the session studies use the exchange calendar, on a non-UTC exchange time with an
+/// evening session start. Returns the number of bindings.
 fn bind_structure_and_session_studies(chart: &mut ChartEngine) -> usize {
     use aeris_charts_engine::{
         IndicatorKind, OrderBlockZone, PreviousPeriod, StructureBreakOn, StructureMitigation,
         StructureMitigationPrice, StudyCalendarPolicy,
     };
+
+    assert!(
+        chart.set_time_zone(STUDY_TIME_ZONE).expect("known zone"),
+        "zone changes"
+    );
+    chart
+        .set_session_start_seconds(STUDY_SESSION_START_SECONDS)
+        .expect("valid session start");
 
     let kinds = [
         IndicatorKind::SwingPoints { left: 5, right: 5 },
@@ -556,15 +573,15 @@ fn bind_structure_and_session_studies(chart: &mut ChartEngine) -> usize {
             show_mitigated: false,
         },
         IndicatorKind::SessionLevels {
-            calendar: StudyCalendarPolicy::Utc,
+            calendar: StudyCalendarPolicy::Exchange,
         },
         IndicatorKind::PreviousPeriodLevels {
             period: PreviousPeriod::Day,
-            calendar: StudyCalendarPolicy::Utc,
+            calendar: StudyCalendarPolicy::Exchange,
         },
         IndicatorKind::OpeningRange {
             duration_seconds: 1_800,
-            calendar: StudyCalendarPolicy::Utc,
+            calendar: StudyCalendarPolicy::Exchange,
         },
     ];
     let bindings = kinds.len();
@@ -3435,6 +3452,13 @@ fn main() -> ExitCode {
     const STRUCTURE_TIP_BUDGET_MS: f64 = 8.0;
     const STRUCTURE_CORRECTION_ROWS: usize = 20_000;
     const STRUCTURE_CORRECTION_BUDGET_MS: f64 = 100.0;
+    // One exchange time-zone change: the time axis re-derives its trading days (about 0.11 s
+    // on 1M rows with no study bound) and the three exchange-calendar session studies rebuild
+    // from row 0, which costs about what installing them fresh does. Measured when the exchange
+    // calendar became the default (F2a; Linux, 4 CPUs, release): 0.49 s here, 0.53-0.67 s for
+    // the same three studies on a 1M-row ramp. A rare settings action, so the budget is a
+    // second rather than a frame; a per-row regression (the offset lookup) would still show.
+    const STRUCTURE_ZONE_REBUILD_BUDGET_MS: f64 = 1_000.0;
     let (times, open, high, low, close) = {
         let (times, mut open, mut high, mut low, mut close) = gen_series(STRUCTURE_BARS, 11.0);
         // Periodic price jumps make the fixture produce real fair-value gaps and order blocks;
@@ -3455,6 +3479,15 @@ fn main() -> ExitCode {
     structure
         .set_series_data(0, &times, &open, &high, &low, &close)
         .expect("valid structure fixture");
+    // The session studies use the default exchange calendar on a non-UTC exchange time.
+    assert!(
+        structure
+            .set_time_zone(STUDY_TIME_ZONE)
+            .expect("known zone")
+    );
+    structure
+        .set_session_start_seconds(STUDY_SESSION_START_SECONDS)
+        .expect("valid session start");
     let started = Instant::now();
     let swing = structure.add_swing_points(0, 5, 5);
     structure.add_market_structure(0, 5, 5, StructureBreakOn::Close);
@@ -3477,9 +3510,9 @@ fn main() -> ExitCode {
         20,
         true,
     );
-    structure.add_session_levels(0, StudyCalendarPolicy::Utc);
-    structure.add_previous_period_levels(0, PreviousPeriod::Day, StudyCalendarPolicy::Utc);
-    structure.add_opening_range(0, 3_600, StudyCalendarPolicy::Utc);
+    let session_levels = structure.add_session_levels(0, StudyCalendarPolicy::Exchange);
+    structure.add_previous_period_levels(0, PreviousPeriod::Day, StudyCalendarPolicy::Exchange);
+    structure.add_opening_range(0, 3_600, StudyCalendarPolicy::Exchange);
     let structure_build_ms = started.elapsed().as_secs_f64() * 1000.0;
     assert!(
         !swing.is_empty() && !fvg.is_empty() && !order_blocks.is_empty(),
@@ -3513,6 +3546,28 @@ fn main() -> ExitCode {
         ],
     );
     let structure_correction_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // A host changing the exchange time zone is one engine call that rebuilds every
+    // exchange-calendar study (here the three session studies) over the full history, plus
+    // their dependents. Timed once; the session high must move with the new trading days.
+    let session_high = |chart: &ChartEngine| {
+        chart
+            .data_layer()
+            .series_data(session_levels[0])
+            .map(|(_, columns)| columns[3].to_vec())
+    };
+    let session_high_before = session_high(&structure);
+    let started = Instant::now();
+    assert!(
+        structure
+            .set_time_zone("America/New_York")
+            .expect("known zone")
+    );
+    let structure_zone_rebuild_ms = started.elapsed().as_secs_f64() * 1000.0;
+    assert_ne!(
+        session_high(&structure),
+        session_high_before,
+        "the time-zone change rebuilt the exchange session studies"
+    );
     let fvg_annotations = structure
         .study_annotations(fvg[0])
         .expect("fvg annotations snapshot");
@@ -3533,6 +3588,11 @@ fn main() -> ExitCode {
         &format!("historical correction {STRUCTURE_CORRECTION_ROWS} rows back"),
         structure_correction_ms,
         STRUCTURE_CORRECTION_BUDGET_MS,
+    );
+    let t_zone_rebuild = report(
+        "exchange time-zone change (3 session studies rebuilt over the full history)",
+        structure_zone_rebuild_ms,
+        STRUCTURE_ZONE_REBUILD_BUDGET_MS,
     );
 
     // ---- Target U: the Target R tape with auction markers bound to the same stream ----------
@@ -3673,6 +3733,7 @@ fn main() -> ExitCode {
         && s_retention
         && t_tip
         && t_correction
+        && t_zone_rebuild
         && u_pass;
     println!(
         "\n{}",
