@@ -725,6 +725,89 @@ fn cancelled_drag_rolls_back_and_keyboard_nudge_uses_history() {
 }
 
 #[test]
+fn drawings_move_bar_by_bar_horizontally_without_tick_snapping_prices() {
+    let mut chart = settled_chart();
+    let bar = chart.bar_spacing();
+
+    // Creation lands each anchor on the bar under the cursor; the price stays continuous.
+    assert!(chart.drawing_create_begin(DrawingKind::TrendLine, None));
+    let (x0, y0) = (x_at(&chart, 2.0) + 0.3 * bar, y_at(&chart, 10.37));
+    assert_eq!(
+        chart.drawing_create_click(x0, y0, DrawingModifiers::default()),
+        -1
+    );
+    let id = chart.drawing_create_click(
+        x_at(&chart, 7.0) - 0.4 * bar,
+        y_at(&chart, 12.21),
+        DrawingModifiers::default(),
+    );
+    assert!(id > 0);
+    let id = id as DrawingId;
+    let created = chart.drawing(id).unwrap().points.clone();
+    assert_eq!(
+        created
+            .iter()
+            .map(|point| point.logical)
+            .collect::<Vec<_>>(),
+        [2.0, 7.0]
+    );
+    assert!((created[0].price - 10.37).abs() < 1e-9);
+
+    // A body move of 1.4 bars steps exactly one bar and keeps the shape.
+    // Grab the line on bar 4's center so the slot under the cursor is unambiguous.
+    let x = x_at(&chart, 4.0);
+    let y = y_at(
+        &chart,
+        created[0].price + (created[1].price - created[0].price) * 0.4,
+    );
+    assert!(chart.drawing_drag_start_at(x, y));
+    chart.drawing_drag_to(x + 1.4 * bar, y + 7.0, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    let moved = chart.drawing(id).unwrap().points.clone();
+    assert_eq!(
+        moved.iter().map(|point| point.logical).collect::<Vec<_>>(),
+        [3.0, 8.0]
+    );
+    assert!(
+        moved[0].price != created[0].price,
+        "price follows the cursor"
+    );
+
+    // An anchor drag lands on the bar under the moved anchor.
+    chart.set_selected_drawing(Some(id));
+    let (ax, ay) = (x_at(&chart, 3.0), y_at(&chart, moved[0].price));
+    assert!(chart.drawing_drag_start_at(ax, ay));
+    chart.drawing_drag_to(ax - 0.7 * bar, ay, DrawingModifiers::default());
+    chart.drawing_drag_end();
+    assert_eq!(chart.drawing(id).unwrap().points[0].logical, 2.0);
+
+    // A horizontal keyboard nudge moves one whole bar.
+    assert!(chart.nudge_selected_drawing(1.0, 0.0, None));
+    assert_eq!(
+        chart
+            .drawing(id)
+            .unwrap()
+            .points
+            .iter()
+            .map(|point| point.logical)
+            .collect::<Vec<_>>(),
+        [3.0, 9.0]
+    );
+}
+
+#[test]
+fn every_tool_defaults_to_a_one_pixel_line_except_the_highlighter() {
+    for spec in crate::drawings::tools::DRAWING_TOOL_SPECS {
+        let expected = if spec.kind == DrawingKind::Highlighter {
+            12.0
+        } else {
+            1.0
+        };
+        assert_eq!(spec.default_width, expected, "{}", spec.name);
+    }
+}
+
+#[test]
 fn touch_profile_expands_anchor_hits_without_changing_precision_hits() {
     let mut chart = settled_chart();
     let id = add_trend(&mut chart);
@@ -1585,9 +1668,14 @@ fn rectangle_anchor_drags_resize_independently_and_flip_across_the_opposite_side
     );
     assert!(close(b2, bottom + 50.0));
 
-    // Corner (4 = bottom-right) drag past the top-left: both axes flip independently.
+    // Corner (4 = bottom-right) drag past the top-left: both axes flip independently. The
+    // dragged x lands on the bar slot under the cursor.
     assert!(chart.drawing_drag_start_at(r, b2));
-    chart.drawing_drag_to(left - 60.0, t2 - 60.0, DrawingModifiers::default());
+    chart.drawing_drag_to(
+        left - chart.bar_spacing() - 3.0,
+        t2 - 60.0,
+        DrawingModifiers::default(),
+    );
     chart.drawing_drag_end();
     let (l3, t3, r3, b3) = box_of(&chart);
     assert!(
@@ -1595,7 +1683,11 @@ fn rectangle_anchor_drags_resize_independently_and_flip_across_the_opposite_side
         "the fixed corner side holds through the flip"
     );
     assert!(close(b3, t2));
-    assert!(close(l3, left - 60.0));
+    assert!(
+        close(l3, x_at(&chart, 1.0)),
+        "{l3} vs {}",
+        x_at(&chart, 1.0)
+    );
     assert!(close(t3, t2 - 60.0));
 }
 
@@ -2494,7 +2586,7 @@ fn path_uses_straight_segments_and_every_vertex_is_editable() {
     );
     assert!(chart.drawing_drag_start_at(segment_mid.0, segment_mid.1));
     chart.drawing_drag_to(
-        segment_mid.0 + 15.0,
+        segment_mid.0 + 2.0 * chart.bar_spacing(),
         segment_mid.1,
         DrawingModifiers::default(),
     );
@@ -3059,12 +3151,13 @@ fn magnet_snaps_placement_to_nearest_bar_and_ohlc() {
         point.price, 12.0,
         "price snaps to the nearest of the bar's OHLC"
     );
-    // Without the modifier the same click stays raw (fractional logical, unscaled price).
+    // Without the modifier the same click lands on the bar slot under the cursor, at the raw
+    // price.
     chart.drawing_create_cancel();
     assert!(chart.drawing_create_begin(DrawingKind::TrendLine, None));
     assert_eq!(chart.drawing_create_click(x, y, NONE), -1);
     let raw = chart.pending_drawing().unwrap().drawing.points[0];
-    assert!((raw.logical - 3.0).abs() > 1e-9);
+    assert_eq!(raw.logical, 2.0);
     assert!((raw.price - 12.0).abs() > 1e-9);
 }
 
@@ -5780,7 +5873,7 @@ fn measure_tools_have_stable_catalog_identity_and_defaults() {
         assert_eq!((kind.to_u8(), kind.name()), (wire, name));
         assert_eq!(kind.anchor_count(), 2);
         assert!(kind.valid_point_count(2) && !kind.valid_point_count(3));
-        assert!(kind.is_measure() && kind.spec().grid_snap);
+        assert!(kind.is_measure() && kind.spec().price_tick_snap);
         let drawing = Drawing::new(1, kind, 0, Vec::new());
         assert!(drawing.fill_enabled);
         assert_eq!(drawing.width, 1.0);
@@ -5799,7 +5892,7 @@ fn measure_tools_have_stable_catalog_identity_and_defaults() {
                 spec.kind,
                 DrawingKind::LongPosition | DrawingKind::ShortPosition
             );
-        assert_eq!(spec.grid_snap, snaps, "{:?}", spec.kind);
+        assert_eq!(spec.price_tick_snap, snaps, "{:?}", spec.kind);
     }
 }
 
@@ -5957,7 +6050,7 @@ fn line_catalog_has_stable_wire_ids_defaults_and_shared_frame_geometry() {
         assert_eq!(
             drawing.labels.len(),
             match kind {
-                DrawingKind::InfoLine => 4,
+                DrawingKind::InfoLine => 7,
                 DrawingKind::TrendAngle => 1,
                 _ => 0,
             }
@@ -6106,7 +6199,7 @@ fn polyline_and_highlighter_use_distinct_shared_frame_styles() {
         },
     ];
     for (kind, wire, name, width, line_type) in [
-        (DrawingKind::Polyline, 34, "polyline", 2.0, LineType::Simple),
+        (DrawingKind::Polyline, 34, "polyline", 1.0, LineType::Simple),
         (
             DrawingKind::Highlighter,
             35,
@@ -7046,13 +7139,14 @@ fn a_callout_moves_its_tip_and_its_box_by_their_own_handles() {
     let before = chart.drawing(id).unwrap().points.clone();
     let (x, y) = (x_at(&chart, 2.0), y_at(&chart, 10.5));
     assert!(chart.drawing_drag_start_at(x, y));
-    chart.drawing_drag_to(x - 30.0, y + 20.0, DrawingModifiers::default());
+    // Bars are 80 px apart: 100 px left is one whole bar.
+    assert_eq!(chart.bar_spacing(), 80.0);
+    chart.drawing_drag_to(x - 100.0, y + 20.0, DrawingModifiers::default());
     chart.drawing_drag_end();
     let after = chart.drawing(id).unwrap().points.clone();
-    assert!(
-        after[0].logical < before[0].logical,
-        "the tip follows the pointer"
-    );
+    assert_eq!(after[0].logical, 1.0, "the tip follows the pointer's bar");
+    let tip = chart.drawing_point_to_coordinate(id, 0).unwrap();
+    assert!((tip.1 - (y + 20.0)).abs() < 1e-6, "at the raw price");
     assert_eq!(after[1], before[1], "the box stays");
 }
 
@@ -7494,13 +7588,13 @@ fn fibonacci_speed_arcs_render_hit_and_persist_levels() {
     assert!(chart.drawing_apply_options(id, &serde_json::json!({"levels": levels}).to_string()));
     let frame = chart.build_frame();
     assert!(frame.panes[0].main.iter().any(|prim| {
-        matches!(prim, Prim::Polyline { point_count: 33, color, .. } if *color == primary())
+        matches!(prim, Prim::Polyline { point_count, color, .. } if *point_count > 8 && *color == primary())
     }));
     assert!(frame.panes[0].main.iter().any(|prim| {
         matches!(
             prim,
             Prim::BandFill {
-                point_count: 33,
+                point_count: 9..,
                 ..
             }
         )
@@ -7540,7 +7634,7 @@ fn fibonacci_speed_arcs_render_hit_and_persist_levels() {
     );
     let frame = chart.build_frame();
     assert!(frame.panes[0].main.iter().any(|prim| {
-        matches!(prim, Prim::Polyline { point_count: 33, color, .. } if *color == primary())
+        matches!(prim, Prim::Polyline { point_count, color, .. } if *point_count > 8 && *color == primary())
     }));
     assert_eq!(
         chart
@@ -7564,7 +7658,7 @@ fn fibonacci_spiral_and_wedge_render_and_survive_state_round_trip() {
             DrawingKind::FibonacciWedge,
             45,
             vec![(2.0, 10.0), (6.0, 14.0), (7.0, 12.0)],
-            33,
+            9,
         ),
     ] {
         assert_eq!(DrawingKind::from_u8(wire), Some(kind));
@@ -7581,7 +7675,7 @@ fn fibonacci_spiral_and_wedge_render_and_survive_state_round_trip() {
             .unwrap();
         let frame = chart.build_frame();
         assert!(frame.panes[0].main.iter().any(|prim| {
-            matches!(prim, Prim::Polyline { point_count, color, .. } if *point_count == count && *color == primary())
+            matches!(prim, Prim::Polyline { point_count, color, .. } if *point_count >= count && *color == primary())
         }));
         let saved = chart.export_state_json().unwrap();
         let mut restored = settled_chart();
@@ -7906,7 +8000,7 @@ fn text_annotations_render_editable_boxes_and_guides_from_shared_frame() {
 }
 
 #[test]
-fn price_label_paints_and_hits_only_its_pane_edge_badge() {
+fn price_label_bubble_paints_and_hits_at_its_anchor() {
     let mut chart = settled_chart();
     let id = chart
         .add_drawing(
@@ -7933,21 +8027,161 @@ fn price_label_paints_and_hits_only_its_pane_edge_badge() {
             .iter()
             .any(|prim| matches!(prim, Prim::HLine { color, .. } if *color == primary()))
     );
-    assert_eq!(
-        chart
-            .hit_test_drawing(chart.pane_w - 5.0, y_at(&chart, 11.0))
-            .map(|hit| hit.id),
-        Some(id)
-    );
-    assert!(
-        chart
-            .hit_test_drawing(chart.pane_w / 2.0, y_at(&chart, 11.0))
-            .is_none()
-    );
+    let (x, y) = (x_at(&chart, 3.0), y_at(&chart, 11.0));
+    // The bubble's text sits above-right of the anchor and its tail ends on the anchor.
+    let text_y = frame.panes[0]
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Text { text, x: tx, y, .. } if text == "Entry" => Some((*tx, *y)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(f64::from(text_y.0) > x && f64::from(text_y.1) < y);
+    assert!(frame.panes[0].main.iter().any(|prim| matches!(
+        prim,
+        Prim::Triangle { a, .. } if (f64::from(a[0]) - x).abs() < 1e-3 && (f64::from(a[1]) - y).abs() < 1e-3
+    )));
+    for probe in [(x + 4.0, y - 2.0), (x + 4.0, f64::from(text_y.1))] {
+        assert_eq!(
+            chart.hit_test_drawing(probe.0, probe.1).map(|hit| hit.id),
+            Some(id),
+            "{probe:?}"
+        );
+    }
+    assert!(chart.hit_test_drawing(chart.pane_w - 5.0, y).is_none());
+    assert!(chart.hit_test_drawing(x + 4.0, y + 12.0).is_none());
     let saved = chart.export_state_json().unwrap();
     let mut restored = settled_chart();
     restored.import_state_json(&saved).unwrap();
     assert_eq!(restored.drawing(id).unwrap().text, "Entry");
+}
+
+/// The painted position of the one text run `text` on the first pane.
+fn painted_text(chart: &mut ChartEngine, text: &str) -> Option<(f64, f64)> {
+    chart.build_frame().panes[0]
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Text {
+                text: run, x, y, ..
+            } if run == text => Some((f64::from(*x), f64::from(*y))),
+            _ => None,
+        })
+}
+
+#[test]
+fn price_label_text_edits_inside_its_bubble() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::PriceLabel,
+            0,
+            vec![point(3.0, 11.0)],
+            Some(r#"{"text":"Entry"}"#),
+        )
+        .unwrap();
+    let anchor = (x_at(&chart, 3.0), y_at(&chart, 11.0));
+    let text = painted_text(&mut chart, "Entry").unwrap();
+    let drawing = chart.drawing(id).unwrap().clone();
+    let bubble = chart.price_label_layout(&drawing, anchor, 1.0).rect;
+    // The editor opens on the painted run, level and left-aligned, inside the bubble's height.
+    let layout = chart.drawing_text_edit_layout(id).unwrap();
+    assert!((layout.x - text.0).abs() < 1e-3 && (layout.y - text.1).abs() < 1e-3);
+    assert_eq!(layout.angle, 0.0);
+    let [left, top, right, bottom] = layout.rect;
+    assert!((top - bubble[1]).abs() < 1e-9 && (bottom - (bubble[1] + bubble[3])).abs() < 1e-9);
+    assert!(
+        left >= bubble[0] && right <= bubble[0] + bubble[2],
+        "{:?} in {bubble:?}",
+        layout.rect
+    );
+    assert!(left < text.0 && right > text.0);
+    let coordinate = chart.drawing_text_coordinate(id).unwrap();
+    assert!((coordinate.0 - text.0).abs() < 1e-3 && (coordinate.1 - text.1).abs() < 1e-3);
+    assert!(chart.drawing_text_editable(id));
+    // The text hit is the bubble's text, not the tail tip at the anchor.
+    assert_eq!(chart.drawing_text_hit_at(text.0 + 4.0, text.1), Some(id));
+    assert_eq!(chart.drawing_text_hit_at(anchor.0, anchor.1 + 3.0), None);
+}
+
+#[test]
+fn price_label_bubble_paints_and_hits_with_its_anchor_below_the_pane() {
+    let mut chart = settled_chart();
+    // The anchor sits below the pane by the bubble's reach (tail and bubble) less 3 px, past
+    // the candidate pad, so only the bubble's top 3 px show.
+    let template = Drawing::new(0, DrawingKind::PriceLabel, 0, vec![point(3.0, 11.0)]);
+    let reach = -chart.price_label_layout(&template, (0.0, 0.0), 1.0).rect[1];
+    let bottom = chart.panes[0].top + chart.panes[0].height;
+    let price = chart.coordinate_to_price(bottom + reach - 3.0).unwrap();
+    let id = chart
+        .add_drawing(
+            DrawingKind::PriceLabel,
+            0,
+            vec![point(3.0, price)],
+            Some(r#"{"text":"Entry"}"#),
+        )
+        .unwrap();
+    let x = x_at(&chart, 3.0);
+    // The culling owner keeps it (a pane of more than 20 drawings paints only these).
+    let candidates = chart.take_drawing_candidates(0, None);
+    assert!(candidates.contains(&id));
+    chart.recycle_drawing_candidates(candidates);
+    let frame = chart.build_frame();
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::RoundRect { y, .. } if f64::from(*y) < bottom)),
+        "the bubble paints"
+    );
+    assert_eq!(
+        chart
+            .hit_test_drawing(x + 8.0, bottom - 1.5)
+            .map(|hit| hit.id),
+        Some(id)
+    );
+}
+
+#[test]
+fn trend_angle_reference_and_label_survive_their_anchors_scrolling_off() {
+    // A leftward trend angle whose anchors sit past the pane's left edge (beyond the label
+    // pad): its signed angle, past the end of its reference, reaches into the pane.
+    let mut chart = settled_chart();
+    let start = chart.coordinate_to_logical(-65.0).unwrap();
+    let id = chart
+        .add_drawing(
+            DrawingKind::TrendAngle,
+            0,
+            vec![point(start, 11.0), point(start - 1.0, 12.0)],
+            None,
+        )
+        .unwrap();
+    assert!(x_at(&chart, start) < -40.0);
+    // The culling owner keeps it (a pane of more than 20 drawings paints only these).
+    let candidates = chart.take_drawing_candidates(0, None);
+    assert!(candidates.contains(&id));
+    chart.recycle_drawing_candidates(candidates);
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    assert_eq!(
+        pane.main
+            .iter()
+            .filter(|prim| matches!(
+                prim,
+                Prim::Polyline {
+                    style: LineStyle::Dotted,
+                    ..
+                }
+            ))
+            .count(),
+        2,
+        "the reference and the arc"
+    );
+    assert!(pane.main.iter().any(|prim| matches!(
+        prim,
+        Prim::Text { text, x, .. } if text.ends_with('°') && *x > 0.0
+    )));
 }
 
 #[test]
@@ -9222,9 +9456,11 @@ fn every_catalog_tool_drags_and_nudges_as_one_history_entry_each() {
         let before = chart.drawing(id).unwrap().clone();
         let depth = chart.drawing_history.undo.len();
         assert!(chart.drawing_drag_start_at(x, y), "{kind:?}");
+        // Drawings move bar by bar horizontally: 100 px is over one 80 px bar wherever the
+        // grab sits in its slot, so time-only tools move too.
         for step in 1..=4 {
             let step = f64::from(step);
-            chart.drawing_drag_to(x + 12.0 * step, y + 9.0 * step, DrawingModifiers::default());
+            chart.drawing_drag_to(x + 25.0 * step, y + 9.0 * step, DrawingModifiers::default());
         }
         chart.drawing_drag_end();
         let dragged = chart.drawing(id).unwrap().clone();
@@ -9445,4 +9681,595 @@ fn drawing_price_labels_follow_the_selected_scale_precision() {
         );
     }
     assert!(texts.iter().all(|text| !text.contains('.')), "{texts:?}");
+}
+
+fn point(logical: f64, price: f64) -> DrawingPoint {
+    DrawingPoint { logical, price }
+}
+
+/// The selection chrome's painted anchor-handle centers: the fill discs (radius 4 at dpr 1).
+fn painted_handle_centers(frame: &crate::ChartFrame) -> Vec<(f64, f64)> {
+    frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Circle { cx, cy, radius, .. } if *radius == 4.0 => {
+                Some((f64::from(*cx), f64::from(*cy)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Distance from `p` to the nearest rendered stroke (polyline segment, horizontal or vertical
+/// rule) in the main pane list.
+fn distance_to_rendered_stroke(frame: &crate::ChartFrame, p: (f64, f64)) -> f64 {
+    let pane = &frame.panes[0];
+    let segment = |a: [f32; 2], b: [f32; 2]| {
+        distance_to_segment(
+            p.0,
+            p.1,
+            f64::from(a[0]),
+            f64::from(a[1]),
+            f64::from(b[0]),
+            f64::from(b[1]),
+        )
+    };
+    pane.main
+        .iter()
+        .filter_map(|prim| match *prim {
+            Prim::Polyline {
+                first_point,
+                point_count,
+                ..
+            } => {
+                let start = first_point as usize;
+                pane.points[start..start + point_count as usize]
+                    .windows(2)
+                    .map(|pair| segment(pair[0], pair[1]))
+                    .reduce(f64::min)
+            }
+            Prim::HLine { y, x0, x1, .. } => Some(segment(
+                [x0 as f32, y as f32 + 0.5],
+                [x1 as f32, y as f32 + 0.5],
+            )),
+            Prim::VLine { x, y0, y1, .. } => Some(segment(
+                [x as f32 + 0.5, y0 as f32],
+                [x as f32 + 0.5, y1 as f32],
+            )),
+            _ => None,
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+#[test]
+fn projected_anchor_handles_sit_on_their_strokes_and_hit_as_their_anchor() {
+    let two = vec![point(2.0, 10.5), point(7.0, 12.5)];
+    let three = vec![point(2.0, 10.5), point(5.0, 12.5), point(7.0, 11.0)];
+    // A channel width anchor close enough that the opposite boundary stays in the pane.
+    let channel = vec![point(2.0, 10.5), point(5.0, 12.5), point(6.0, 12.0)];
+    let four = vec![
+        point(2.0, 10.5),
+        point(4.0, 12.5),
+        point(6.0, 10.8),
+        point(8.0, 12.0),
+    ];
+    let cases = [
+        (DrawingKind::RegressionTrend, two.clone()),
+        (DrawingKind::ParallelChannel, channel.clone()),
+        (DrawingKind::FlatTopChannel, channel.clone()),
+        (DrawingKind::FlatBottomChannel, channel.clone()),
+        (DrawingKind::FibonacciChannel, channel),
+        (
+            DrawingKind::RotatedRectangle,
+            vec![point(2.0, 10.5), point(6.0, 12.0), point(5.0, 11.0)],
+        ),
+        (DrawingKind::GannSquareFixed, two),
+        (DrawingKind::Curve, three.clone()),
+        (DrawingKind::DoubleCurve, four),
+        (DrawingKind::FibonacciExtension, three.clone()),
+        (DrawingKind::FibonacciTrendTime, three.clone()),
+        (DrawingKind::AndrewsPitchfork, three.clone()),
+        (DrawingKind::SchiffPitchfork, three.clone()),
+        (DrawingKind::ModifiedSchiffPitchfork, three.clone()),
+        (DrawingKind::InsidePitchfork, three),
+    ];
+    for (kind, points) in cases {
+        let mut chart = settled_chart();
+        let id = chart.add_drawing(kind, 0, points.clone(), None).unwrap();
+        chart.set_selected_drawing(Some(id));
+        let frame = chart.build_frame();
+        let handles = painted_handle_centers(&frame);
+        // The fork's derived handles join the anchors: the rotated rectangle's near-side width
+        // handle (S4a), the pitchforks' base midpoint and the fixed square's corner, which
+        // replaces its second anchor (R7).
+        let mut expected = (0..points.len())
+            .map(DrawingDragPart::Anchor)
+            .collect::<Vec<_>>();
+        match kind {
+            DrawingKind::GannSquareFixed => expected[1] = DrawingDragPart::Handle(0),
+            DrawingKind::RotatedRectangle
+            | DrawingKind::AndrewsPitchfork
+            | DrawingKind::SchiffPitchfork
+            | DrawingKind::ModifiedSchiffPitchfork
+            | DrawingKind::InsidePitchfork => expected.push(DrawingDragPart::Handle(0)),
+            _ => {}
+        }
+        assert_eq!(handles.len(), expected.len(), "{kind:?}: {handles:?}");
+        let mut parts = Vec::new();
+        for (index, &(hx, hy)) in handles.iter().enumerate() {
+            let hit = chart.hit_test_drawing(hx, hy).map(|hit| (hit.id, hit.part));
+            let Some((hit_id, part)) = hit else {
+                panic!("{kind:?} handle {index} at {:?} hits nothing", (hx, hy));
+            };
+            assert_eq!(hit_id, id, "{kind:?} handle {index}");
+            assert!(
+                expected.contains(&part) && !parts.contains(&part),
+                "{kind:?} handle {index} hits {part:?}"
+            );
+            parts.push(part);
+            let distance = distance_to_rendered_stroke(&frame, (hx, hy));
+            assert!(
+                distance <= 1.5,
+                "{kind:?} handle {index} at {:?} is {distance}px off its stroke",
+                (hx, hy)
+            );
+        }
+        // The anchor handles paint in anchor order.
+        let anchors = parts
+            .iter()
+            .filter_map(|part| match part {
+                DrawingDragPart::Anchor(index) => Some(*index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(anchors.is_sorted(), "{kind:?}: {parts:?}");
+        if kind == DrawingKind::RegressionTrend {
+            for (handle, anchor) in handles.iter().zip(&points) {
+                let raw = (x_at(&chart, anchor.logical), y_at(&chart, anchor.price));
+                assert!(
+                    (handle.0 - raw.0).hypot(handle.1 - raw.1) > 1.0,
+                    "regression handle {handle:?} follows the fitted line, not the click {raw:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn round_tools_render_within_a_tenth_of_a_pixel_of_the_true_curve() {
+    let mut chart = settled_chart();
+    chart
+        .add_drawing(
+            DrawingKind::FibonacciCircles,
+            0,
+            vec![point(3.0, 10.4), point(6.0, 12.8)],
+            None,
+        )
+        .unwrap();
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    let mut circles = 0;
+    for prim in &pane.main {
+        let Prim::Polyline {
+            first_point,
+            point_count,
+            ..
+        } = *prim
+        else {
+            continue;
+        };
+        let first = first_point as usize;
+        let ring = &pane.points[first..first + point_count as usize];
+        if ring.len() < 9 || ring[0] != ring[ring.len() - 1] {
+            continue;
+        }
+        circles += 1;
+        // Uniform samples of a full circle average to its center.
+        let samples = &ring[..ring.len() - 1];
+        let n = samples.len() as f64;
+        let center = samples.iter().fold((0.0, 0.0), |acc, p| {
+            (acc.0 + f64::from(p[0]) / n, acc.1 + f64::from(p[1]) / n)
+        });
+        let distance = |x: f64, y: f64| (x - center.0).hypot(y - center.1);
+        let radius = distance(f64::from(ring[0][0]), f64::from(ring[0][1]));
+        for pair in ring.windows(2) {
+            let mid = (
+                (f64::from(pair[0][0]) + f64::from(pair[1][0])) / 2.0,
+                (f64::from(pair[0][1]) + f64::from(pair[1][1])) / 2.0,
+            );
+            let sagitta = radius - distance(mid.0, mid.1);
+            assert!(
+                sagitta <= 0.11,
+                "r={radius}: a chord sits {sagitta}px inside"
+            );
+        }
+    }
+    assert!(
+        circles >= 3,
+        "the fibonacci circle levels render as closed rings"
+    );
+
+    // A filled ellipse's fill edge runs exactly under its outline.
+    let mut chart = settled_chart();
+    chart
+        .add_drawing(
+            DrawingKind::Ellipse,
+            0,
+            vec![point(0.5, 13.0), point(9.0, 10.0)],
+            Some(r#"{"fill_enabled":true}"#),
+        )
+        .unwrap();
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    let outline = pane
+        .main
+        .iter()
+        .find_map(|prim| match *prim {
+            Prim::Polyline {
+                first_point,
+                point_count,
+                ..
+            } => Some(&pane.points[first_point as usize..(first_point + point_count) as usize]),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        outline.len() > 65,
+        "a large ellipse gets more than the old 64 chords"
+    );
+    // Uniform-angle chords sit cos(step / 2) inside the normalized ellipse; scaled by the larger
+    // radius that bounds their pixel deviation.
+    let (mut left, mut right, mut top, mut bottom) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for p in outline {
+        let (x, y) = (f64::from(p[0]), f64::from(p[1]));
+        (left, right, top, bottom) = (left.min(x), right.max(x), top.min(y), bottom.max(y));
+    }
+    let (cx, cy) = ((left + right) / 2.0, (top + bottom) / 2.0);
+    let (rx, ry) = ((right - left) / 2.0, (bottom - top) / 2.0);
+    for pair in outline.windows(2) {
+        let mid = (
+            (f64::from(pair[0][0]) + f64::from(pair[1][0])) / 2.0,
+            (f64::from(pair[0][1]) + f64::from(pair[1][1])) / 2.0,
+        );
+        let norm = ((mid.0 - cx) / rx).hypot((mid.1 - cy) / ry);
+        assert!(
+            (1.0 - norm) * rx.max(ry) <= 0.12,
+            "a chord sits {}px inside",
+            (1.0 - norm) * rx.max(ry)
+        );
+    }
+    let Some(&Prim::BandFill {
+        upper_first,
+        lower_first,
+        point_count,
+        ..
+    }) = pane
+        .main
+        .iter()
+        .find(|prim| matches!(prim, Prim::BandFill { .. }))
+    else {
+        panic!("filled ellipse");
+    };
+    let close = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3;
+    for first in [upper_first, lower_first] {
+        for point in &pane.points[first as usize..(first + point_count) as usize] {
+            assert!(
+                outline.iter().any(|vertex| close(*vertex, *point)),
+                "fill edge {point:?} is off the outline"
+            );
+        }
+    }
+}
+
+#[test]
+fn ellipse_edge_handles_sit_on_the_outline_and_resize_one_bound() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::Ellipse,
+            0,
+            vec![point(2.0, 12.5), point(6.0, 10.5)],
+            None,
+        )
+        .unwrap();
+    chart.set_selected_drawing(Some(id));
+    let frame = chart.build_frame();
+    let (l, r) = (x_at(&chart, 2.0), x_at(&chart, 6.0));
+    let (t, b) = (y_at(&chart, 12.5), y_at(&chart, 10.5));
+    let (cx, cy, rx, ry) = ((l + r) / 2.0, (t + b) / 2.0, (r - l) / 2.0, (b - t) / 2.0);
+    let mut handles = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match *prim {
+            Prim::RoundRect { x, y, w, h, .. } if w == h && w < 20.0 => Some((
+                (f64::from(x + w / 2.0) * 10.0).round() / 10.0,
+                (f64::from(y + h / 2.0) * 10.0).round() / 10.0,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    handles.dedup();
+    assert_eq!(handles.len(), 4, "{handles:?}");
+    // The fork keeps the rectangle's corner discs (owner decision S3), one per box corner.
+    let corners = painted_handle_centers(&frame);
+    assert_eq!(corners.len(), 4, "{corners:?}");
+    for (corner, slot) in [((l, t), 0), ((r, t), 2), ((r, b), 4), ((l, b), 6)] {
+        assert!(
+            corners
+                .iter()
+                .any(|disc| (disc.0 - corner.0).abs() < 1e-3 && (disc.1 - corner.1).abs() < 1e-3),
+            "a disc at {corner:?}: {corners:?}"
+        );
+        assert_eq!(
+            chart
+                .hit_test_drawing(corner.0, corner.1)
+                .map(|hit| hit.part),
+            Some(DrawingDragPart::Anchor(slot)),
+            "corner {corner:?}"
+        );
+    }
+    for (index, &(hx, hy)) in handles.iter().enumerate() {
+        let on = ((hx - cx) / rx).powi(2) + ((hy - cy) / ry).powi(2);
+        assert!(
+            (on - 1.0).abs() < 0.02,
+            "handle {index} {:?}: {on}",
+            (hx, hy)
+        );
+        assert_eq!(
+            chart.hit_test_drawing(hx, hy).map(|hit| hit.part),
+            Some(DrawingDragPart::Anchor([1, 3, 5, 7][index])),
+            "handle {index}"
+        );
+    }
+
+    // The right-edge handle (slot 3) moves only the right bound, in whole bars.
+    assert!(chart.drawing_drag_start_at(r, cy));
+    chart.drawing_drag_to(
+        r + 2.0 * chart.bar_spacing(),
+        cy + 25.0,
+        DrawingModifiers::default(),
+    );
+    chart.drawing_drag_end();
+    let mut moved = chart.drawing(id).unwrap().points.clone();
+    moved.sort_by(|a, b| a.logical.total_cmp(&b.logical));
+    assert_eq!((moved[0].logical, moved[1].logical), (2.0, 8.0));
+    let mut prices = moved.iter().map(|p| p.price).collect::<Vec<_>>();
+    prices.sort_by(f64::total_cmp);
+    assert!((prices[0] - 10.5).abs() < 1e-9 && (prices[1] - 12.5).abs() < 1e-9);
+}
+
+#[test]
+fn trend_angle_paints_a_dotted_reference_arc_and_signed_angle() {
+    let mut chart = settled_chart();
+    chart
+        .add_drawing(
+            DrawingKind::TrendAngle,
+            0,
+            vec![point(3.0, 10.5), point(6.0, 12.5)],
+            None,
+        )
+        .unwrap();
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    let start = (x_at(&chart, 3.0), y_at(&chart, 10.5));
+    let end = (x_at(&chart, 6.0), y_at(&chart, 12.5));
+    let dotted = pane
+        .main
+        .iter()
+        .filter_map(|prim| match *prim {
+            Prim::Polyline {
+                first_point,
+                point_count,
+                style: LineStyle::Dotted,
+                ..
+            } => {
+                let first = first_point as usize;
+                Some(&pane.points[first..first + point_count as usize])
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dotted.len(), 2, "a horizontal reference and an arc");
+    let near =
+        |p: [f32; 2], q: (f64, f64)| (f64::from(p[0]) - q.0).hypot(f64::from(p[1]) - q.1) < 0.5;
+    let reference = dotted[0];
+    assert_eq!(reference.len(), 2);
+    assert!(near(reference[0], start) && near(reference[1], (start.0 + 60.0, start.1)));
+    let arc = dotted[1];
+    assert!(arc.len() > 2);
+    for &p in arc {
+        let radius = (f64::from(p[0]) - start.0).hypot(f64::from(p[1]) - start.1);
+        assert!(
+            (radius - 60.0).abs() < 0.5,
+            "the arc is centered on the start"
+        );
+    }
+
+    let label = pane
+        .main
+        .iter()
+        .find_map(|prim| match prim {
+            Prim::Text { text, .. } if text.ends_with('°') => Some(text.clone()),
+            _ => None,
+        })
+        .expect("an angle label");
+    let value = label.trim_end_matches('°').parse::<f64>().unwrap();
+    let expected = (-(end.1 - start.1)).atan2(end.0 - start.0).to_degrees();
+    assert!(expected > 0.0, "a rising line reads a positive angle");
+    assert!((value - expected).abs() <= 0.01, "{label} vs {expected}");
+}
+
+#[test]
+fn info_line_paints_one_theme_token_card_with_three_rows() {
+    use aeris_charts_core::style as tokens;
+    let rgb = |(r, g, b): (u8, u8, u8)| Color::rgb(r, g, b);
+    for (theme, surface, border, foreground) in [
+        (
+            crate::ChartTheme::Dark,
+            tokens::DARK_SURFACE_RGB,
+            tokens::DARK_BORDER_RGB,
+            tokens::DARK_FOREGROUND_RGB,
+        ),
+        (
+            crate::ChartTheme::Light,
+            tokens::LIGHT_SURFACE_RGB,
+            tokens::LIGHT_BORDER_RGB,
+            tokens::LIGHT_FOREGROUND_RGB,
+        ),
+    ] {
+        let mut chart = settled_chart();
+        // Hosts may restyle the background without `set_theme`; the card follows the surface.
+        if theme == crate::ChartTheme::Light {
+            chart
+                .apply_options(r##"{"layout":{"background":{"color":"#ffffff"}}}"##)
+                .unwrap();
+        }
+        chart
+            .add_drawing(
+                DrawingKind::InfoLine,
+                0,
+                vec![point(2.0, 10.5), point(5.0, 12.0)],
+                None,
+            )
+            .unwrap();
+        let frame = chart.build_frame();
+        let main = &frame.panes[0].main;
+        // The card is the package tooltip panel: `--surface` fill, 1 px `--border`, 8 px radius.
+        let cards = main
+            .iter()
+            .filter_map(|prim| match *prim {
+                Prim::RoundRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    radii,
+                    fill,
+                    border_width,
+                    border_color,
+                } if fill == rgb(surface) && border_color == rgb(border) => {
+                    assert_eq!((radii, border_width), ([8.0; 4], 1.0));
+                    Some((x, y, w, h))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1, "{theme:?}: {cards:?}");
+        let (cx, cy, cw, ch) = cards[0];
+        let rows = main
+            .iter()
+            .filter_map(|prim| match prim {
+                Prim::Text {
+                    text,
+                    x,
+                    y,
+                    color,
+                    size,
+                    ..
+                } if *x >= cx && *x <= cx + cw && *y >= cy && *y <= cy + ch => {
+                    assert_eq!((*color, *size), (rgb(foreground), 12.0), "{text}");
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows[0].contains('(') && rows[0].contains('%'),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("bars") && rows[1].contains("distance:") && rows[1].contains("px"),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[2].ends_with('°'), "{}", rows[2]);
+    }
+}
+
+#[test]
+fn fibonacci_extension_trend_guide_hits_the_drawing() {
+    let mut chart = settled_chart();
+    let id = chart
+        .add_drawing(
+            DrawingKind::FibonacciExtension,
+            0,
+            vec![point(1.0, 10.2), point(4.0, 12.8), point(7.0, 11.0)],
+            None,
+        )
+        .unwrap();
+    chart.build_frame();
+    let mid = (
+        (x_at(&chart, 1.0) + x_at(&chart, 4.0)) / 2.0,
+        (y_at(&chart, 10.2) + y_at(&chart, 12.8)) / 2.0,
+    );
+    assert_eq!(
+        chart.hit_test_drawing(mid.0, mid.1).map(|hit| hit.id),
+        Some(id)
+    );
+    assert!(chart.hit_test_drawing(mid.0, mid.1 - 30.0).is_none());
+}
+
+/// Geometry strokes and fills in the main pane list (handles and text excluded).
+fn geometry_prim_count(frame: &crate::ChartFrame) -> usize {
+    frame.panes[0]
+        .main
+        .iter()
+        .filter(|prim| {
+            matches!(
+                prim,
+                Prim::Polyline { .. }
+                    | Prim::HLine { .. }
+                    | Prim::VLine { .. }
+                    | Prim::Triangle { .. }
+                    | Prim::AreaFill { .. }
+                    | Prim::BandFill { .. }
+                    | Prim::RectFrame { .. }
+                    | Prim::Rect { .. }
+            )
+        })
+        .count()
+}
+
+#[test]
+fn every_click_placed_tool_draws_live_after_its_first_anchor() {
+    let spots = [
+        (2.0, 10.6),
+        (4.0, 12.6),
+        (5.0, 11.2),
+        (6.0, 12.4),
+        (7.0, 10.8),
+        (8.0, 12.2),
+        (9.0, 11.0),
+    ];
+    let baseline = geometry_prim_count(&settled_chart().build_frame());
+    let mut stalled = Vec::new();
+    for spec in DRAWING_TOOL_SPECS {
+        let DrawingPlacement::ClickAnchors { count } = spec.placement else {
+            continue;
+        };
+        let mut chart = settled_chart();
+        assert!(chart.drawing_create_begin(spec.kind, None), "{}", spec.name);
+        // After each placed anchor (all but the last), the cursor's next anchor previews live.
+        for placed in 1..usize::from(count) {
+            let (logical, price) = spots[placed - 1];
+            chart.drawing_create_click(
+                x_at(&chart, logical),
+                y_at(&chart, price),
+                DrawingModifiers::default(),
+            );
+            let (logical, price) = spots[placed];
+            chart.drawing_create_move(
+                x_at(&chart, logical),
+                y_at(&chart, price),
+                DrawingModifiers::default(),
+            );
+            if geometry_prim_count(&chart.build_frame()) <= baseline {
+                stalled.push(format!("{} after {placed}/{count}", spec.name));
+            }
+        }
+    }
+    assert!(stalled.is_empty(), "no live preview: {stalled:#?}");
 }

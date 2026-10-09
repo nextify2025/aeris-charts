@@ -33,10 +33,14 @@ const MAX_TOTAL_TEXT_BYTES: usize = 1_048_576;
 const MAX_COLOR_BYTES: usize = 256;
 const MAX_STYLE_NUMBER: f64 = 1_000.0;
 /// Revision of the drawing catalog a document's anchors and kind names follow: 2 is
-/// AerisTerminal's B8 catalog (upstream kind names and anchor contracts). Every export writes it
-/// as `drawing_catalog`; a document without it was written before the fork adopted that catalog
-/// (by the fork, whose B8 tools are converted on load, or by an upstream pin, which loads as is).
-const DRAWING_CATALOG_REVISION: u32 = 2;
+/// AerisTerminal's B8 catalog (upstream kind names and anchor contracts), 3 the same catalog with
+/// the curves' inner anchors as points on the curve rather than Bézier control points (upstream
+/// 664d347). Every export writes it as `drawing_catalog`; a document without it was written before
+/// the fork adopted that catalog (by the fork, whose B8 tools are converted on load, or by an
+/// upstream pin, which loads as is), and a revision-2 one converts its curves
+/// ([`revision_two_curve_anchors`]) and its info lines' omitted labels
+/// ([`revision_two_info_labels`]).
+const DRAWING_CATALOG_REVISION: u32 = 3;
 /// The fork's own-line tools, which AerisTerminal's catalog does not have: a document without the
 /// catalog marker that names one was written by the fork.
 const OWN_LINE_KIND_NAMES: [&str; 7] = [
@@ -1097,52 +1101,13 @@ fn migrate_fork_anchors(
         }
         // Upstream's three drives end at the third drive; the fork's last leg has no place.
         (DrawingKind::PatternThreeDrives, 7) => Some((0..6).map(keep).collect()),
-        // The fork stored the arc's ends first and its through point last.
-        (DrawingKind::Arc, 3) if legacy_fork => Some(vec![keep(0), keep(2), keep(1)]),
-        // The fork's on-curve midpoint becomes the quadratic Bezier control point, an affine
-        // combination of the stored anchors' bars (and of their times where those are evenly
-        // spaced, [`interpolated_anchor_time`]).
-        (DrawingKind::Curve, 3) if legacy_fork => {
-            let logical = logicals()?;
-            let control = 2.0 * logical[2] - (logical[0] + logical[1]) / 2.0;
-            Some(vec![
-                keep(0),
-                placed(
-                    control,
-                    2.0 * price(2) - (price(0) + price(1)) / 2.0,
-                    interpolated_anchor_time(anchors, control),
-                ),
-                keep(1),
-            ])
+        // The fork stored the arc's and the curves' ends first and their points on the curve
+        // last; upstream stores them in order along the curve.
+        (DrawingKind::Arc | DrawingKind::Curve, 3) if legacy_fork => {
+            Some(vec![keep(0), keep(2), keep(1)])
         }
-        // The fork's on-curve points at a third and two thirds become the cubic Bezier control
-        // points, affine combinations of the stored anchors' bars (and of their times where
-        // those are evenly spaced).
         (DrawingKind::DoubleCurve, 4) if legacy_fork => {
-            let logical = logicals()?;
-            let prices = [price(0), price(1), price(2), price(3)];
-            // Weights over the stored [a, b, p, q].
-            let combine = |weights: [f64; 4], values: &[f64]| {
-                weights
-                    .iter()
-                    .zip(values)
-                    .map(|(weight, value)| weight * value)
-                    .sum::<f64>()
-            };
-            let control = |weights: [f64; 4]| {
-                let at = combine(weights, &logical);
-                placed(
-                    at,
-                    combine(weights, &prices),
-                    interpolated_anchor_time(anchors, at),
-                )
-            };
-            Some(vec![
-                keep(0),
-                control([-5.0 / 6.0, 1.0 / 3.0, 3.0, -1.5]),
-                control([1.0 / 3.0, -5.0 / 6.0, -1.5, 3.0]),
-                keep(1),
-            ])
+            Some(vec![keep(0), keep(2), keep(3), keep(1)])
         }
         // The fork's symmetric rectangle (an axis and a half-width point) becomes an edge plus a
         // depth handle on the opposite edge.
@@ -1182,6 +1147,83 @@ fn migrate_fork_anchors(
         (DrawingKind::SineLine, 2) if legacy_fork => Some(vec![midpoint()?, keep(1)]),
         _ => None,
     }
+}
+
+/// The anchors of a curve a revision-2 document stored, whose inner anchors were the Bézier
+/// control points, as the points on the same curve that revision 3 stores: the quadratic's point
+/// halfway along, `(a + 2c + b) / 4`, and the cubic's points at a third and two thirds,
+/// `(8a + 12c1 + 6c2 + b) / 27` and `(a + 6c1 + 12c2 + 8b) / 27`, the exact inverses of the
+/// curve the frame draws through them (`geometry::interpolating_curve`). Bars combine affinely
+/// (x is affine in logical), and prices too, which is exact on every affine price scale (normal,
+/// percentage, indexed to 100). A document carries no price-scale mode and restore builds its
+/// panes on the normal scale, so a curve drawn on a log scale passes through these points
+/// rather than the ones its control points put on screen there. The ends keep their time
+/// identity; a converted point takes the stored times interpolated at its bar
+/// ([`interpolated_anchor_time`]) or keeps its logical. `None` for any other drawing, or an
+/// anchor without a logical position.
+fn revision_two_curve_anchors(
+    kind: DrawingKind,
+    anchors: &[DrawingAnchor],
+) -> Option<Vec<MigratedAnchor>> {
+    // Weights over the stored [start, control.., end], and their sum.
+    let (weights, sum): (&[[f64; 4]], f64) = match (kind, anchors.len()) {
+        (DrawingKind::Curve, 3) => (&[[1.0, 2.0, 1.0, 0.0]], 4.0),
+        (DrawingKind::DoubleCurve, 4) => (&[[8.0, 12.0, 6.0, 1.0], [1.0, 6.0, 12.0, 8.0]], 27.0),
+        _ => return None,
+    };
+    let logicals = anchors
+        .iter()
+        .map(|anchor| anchor.logical)
+        .collect::<Option<Vec<f64>>>()?;
+    let prices = anchors
+        .iter()
+        .map(|anchor| anchor.price)
+        .collect::<Vec<_>>();
+    let combine = |weights: &[f64; 4], values: &[f64]| {
+        weights
+            .iter()
+            .zip(values)
+            .map(|(weight, value)| weight * value)
+            .sum::<f64>()
+            / sum
+    };
+    let keep = |index: usize| MigratedAnchor {
+        anchor: anchors[index],
+        identity: Some(index),
+    };
+    let mut converted = vec![keep(0)];
+    for weights in weights {
+        let logical = combine(weights, &logicals);
+        converted.push(MigratedAnchor {
+            anchor: DrawingAnchor {
+                logical: Some(logical),
+                price: combine(weights, &prices),
+                time: interpolated_anchor_time(anchors, logical),
+            },
+            identity: None,
+        });
+    }
+    converted.push(keep(anchors.len() - 1));
+    Some(converted)
+}
+
+/// The info line's default labels in a revision-2 document: the price change, percent change,
+/// bar count and angle, which its writer omitted as the kind's default (revision 3 has seven).
+fn revision_two_info_labels() -> Vec<crate::DrawingLabelOptions> {
+    [
+        crate::DrawingLabelMetric::PriceChange,
+        crate::DrawingLabelMetric::PercentChange,
+        crate::DrawingLabelMetric::BarCount,
+        crate::DrawingLabelMetric::Angle,
+    ]
+    .into_iter()
+    .map(|metric| crate::DrawingLabelOptions {
+        metric,
+        visible: true,
+        position: crate::DrawingLabelPosition::Above,
+        text: None,
+    })
+    .collect()
 }
 
 /// Whether a fork Gann block (`tool_options.gann`) stores `reverse: true`.
@@ -2039,6 +2081,7 @@ impl ChartEngine {
 
         // Read before the panes move out of the document.
         let legacy_fork = written_by_legacy_fork(&state);
+        let revision_two = state.drawing_catalog == Some(2);
         let mut pane_ids = HashSet::with_capacity(state.panes.len());
         let mut panes = Vec::with_capacity(state.panes.len());
         let mut max_persistent_pane_id = 0;
@@ -2109,12 +2152,17 @@ impl ChartEngine {
             // A drawing the fork stored under its own anchor contract converts to upstream's
             // before the anchor count is checked: restore is atomic, so one such drawing would
             // otherwise reject the whole layout.
-            let migrated = if item.kind == "flat_top_bottom" && kind == DrawingKind::DisjointChannel
-            {
-                Some(fork_flat_crossing_anchors(&anchors))
-            } else {
-                migrate_fork_anchors(kind, &anchors, tool_options.as_ref(), legacy_fork)
-            };
+            let migrated =
+                if item.kind == "flat_top_bottom" && kind == DrawingKind::DisjointChannel {
+                    Some(fork_flat_crossing_anchors(&anchors))
+                } else {
+                    migrate_fork_anchors(kind, &anchors, tool_options.as_ref(), legacy_fork)
+                        .or_else(|| {
+                            revision_two
+                                .then(|| revision_two_curve_anchors(kind, &anchors))
+                                .flatten()
+                        })
+                };
             let converted_bars_pattern = migrated.is_some() && kind == DrawingKind::BarsPattern;
             if migrated.is_some() {
                 drop_consumed_gann_reverse(kind, tool_options.as_mut());
@@ -2199,6 +2247,10 @@ impl ChartEngine {
             if legacy_fork {
                 // The fork omitted every value equal to its own defaults.
                 crate::drawings::kinds::apply_legacy_fork_defaults(&mut drawing);
+            }
+            if revision_two && kind == DrawingKind::InfoLine {
+                // Stored labels replace these below.
+                drawing.labels = revision_two_info_labels();
             }
             if let Some((screen_x, screen_y)) = pane_position {
                 drawing.screen_x = screen_x;
@@ -3270,6 +3322,22 @@ mod tests {
         let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
         let times = (0..10).map(|i| (i * 3600) as f64).collect::<Vec<_>>();
         let values = [11.0, 12.0, 11.0, 10.0, 11.0, 12.0, 13.0, 12.0, 11.0, 10.0];
+        chart
+            .set_series_data(0, &times, &values, &values, &values, &values)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        chart.build_frame();
+        chart
+    }
+
+    /// A chart of `count` hourly bars around 100.
+    fn settled_chart_with(count: usize) -> ChartEngine {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = (0..count).map(|i| (i * 3600) as f64).collect::<Vec<_>>();
+        let values = (0..count)
+            .map(|i| 100.0 + (i % 7) as f64)
+            .collect::<Vec<_>>();
         chart
             .set_series_data(0, &times, &values, &values, &values, &values)
             .unwrap();
@@ -6166,11 +6234,12 @@ mod tests {
         );
         assert_eq!(anchor_pairs(&chart, 11).len(), 6);
         assert_anchors(&chart, 12, &[(1.0, 10.0), (3.0, 12.0), (5.0, 10.0)]);
-        assert_anchors(&chart, 13, &[(0.0, 10.0), (2.0, 14.0), (4.0, 10.0)]);
+        // The curves' points on the curve move between their ends, unchanged.
+        assert_anchors(&chart, 13, &[(0.0, 10.0), (2.0, 12.0), (4.0, 10.0)]);
         assert_anchors(
             &chart,
             14,
-            &[(0.0, 10.0), (1.0, 11.5), (2.0, 11.5), (3.0, 10.0)],
+            &[(0.0, 10.0), (1.0, 11.0), (2.0, 11.0), (3.0, 10.0)],
         );
         assert_anchors(&chart, 15, &[(0.0, 13.0), (4.0, 15.0), (0.0, 7.0)]);
 
@@ -6217,17 +6286,10 @@ mod tests {
             exported_times(&value, 12),
             [time(1.0), time(3.0), time(5.0)]
         );
-        let controls = exported_times(&value, 14);
-        assert_eq!(controls[0], time(0.0));
-        assert!(
-            (controls[1].unwrap() - (T + 60.0)).abs() < 1e-3,
-            "{controls:?}"
+        assert_eq!(
+            exported_times(&value, 14),
+            [time(0.0), time(1.0), time(2.0), time(3.0)]
         );
-        assert!(
-            (controls[2].unwrap() - (T + 120.0)).abs() < 1e-3,
-            "{controls:?}"
-        );
-        assert_eq!(controls[3], time(3.0));
         assert_eq!(exported_times(&value, 16), [None]);
         assert!(!exported.contains("\"levels_as_percent\""));
         assert!(!exported.contains("\"bars_mode\""));
@@ -7019,8 +7081,8 @@ mod tests {
                 ],
                 serde_json::Value::Null,
             ),
-            // The fork's curve passes through its third anchor halfway along; upstream's middle
-            // control point takes a time identity where the stored times are evenly spaced.
+            // The fork's curve passes through its third anchor halfway along, which upstream
+            // stores between the ends.
             stored(
                 15,
                 "curve",
@@ -7085,7 +7147,7 @@ mod tests {
         assert_eq!(drawing(8).box_border_color, None);
         // The triangle pattern's apex sides.
         assert!(drawing(14).extend_left && drawing(14).extend_right);
-        assert_anchors(&chart, 15, &[(0.0, 10.0), (2.0, 14.0), (4.0, 10.0)]);
+        assert_anchors(&chart, 15, &[(0.0, 10.0), (2.0, 12.0), (4.0, 10.0)]);
         assert_eq!(
             exported_times(&exported, 15),
             [Some(0.0), Some(2.0 * 3_600.0), Some(4.0 * 3_600.0)]
@@ -7139,13 +7201,14 @@ mod tests {
             .set_series_data(0, &times, &values, &values, &values, &values)
             .unwrap();
         chart.import_state_json(&document).unwrap();
-        // The derived points keep the bars the fork's geometry put them on (time arithmetic
-        // across the gap would move them about two days of bars left).
-        assert_anchors(&chart, 1, &[(0.0, 10.0), (3.0, 14.0), (6.0, 10.0)]);
+        // The curves' points on the curve keep their own bars and times; the rectangle's derived
+        // depth handle keeps the bar the fork's geometry put it on (time arithmetic across the gap
+        // would move it about two days of bars left).
+        assert_anchors(&chart, 1, &[(0.0, 10.0), (3.0, 12.0), (6.0, 10.0)]);
         assert_anchors(
             &chart,
             2,
-            &[(0.0, 10.0), (2.0, 11.5), (4.0, 11.5), (6.0, 10.0)],
+            &[(0.0, 10.0), (2.0, 11.0), (4.0, 11.0), (6.0, 10.0)],
         );
         assert_anchors(&chart, 3, &[(5.0, 10.0), (5.0, 14.0), (-1.0, 10.0)]);
     }
@@ -7206,24 +7269,313 @@ mod tests {
         .collect()
     }
 
+    /// A document with the catalog marker `revision`.
+    fn catalog_document(revision: u32, drawings: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "schema": "aeris_charts-state",
+            "schema_version": 1,
+            "drawing_catalog": revision,
+            "panes": [{"id": "pane-1"}],
+            "drawings": drawings,
+        })
+        .to_string()
+    }
+
     #[test]
     fn documents_with_the_catalog_marker_are_never_converted() {
         let mut drawings = same_count_shapes();
         // An anchor time alone marks a fork document only without the catalog marker.
         drawings[0]["anchors"][0]["time"] = serde_json::json!(1_700_000_000.0);
-        let document = serde_json::json!({
-            "schema": "aeris_charts-state",
-            "schema_version": 1,
-            "drawing_catalog": DRAWING_CATALOG_REVISION,
-            "panes": [{"id": "pane-1"}],
-            "drawings": drawings,
-        })
-        .to_string();
+        drawings.push(serde_json::json!({
+            "id": 4,
+            "kind": "info_line",
+            "pane_id": "pane-1",
+            "anchors": [{"logical": 1.0, "price": 10.0}, {"logical": 6.0, "price": 12.0}],
+        }));
         let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
-        chart.import_state_json(&document).unwrap();
+        chart
+            .import_state_json(&catalog_document(
+                DRAWING_CATALOG_REVISION,
+                drawings.clone(),
+            ))
+            .unwrap();
         assert_anchors(&chart, 1, &[(0.0, 10.0), (4.0, 12.0), (2.0, 14.0)]);
         assert_anchors(&chart, 2, &[(1.0, 10.0), (5.0, 10.0), (3.0, 12.0)]);
         assert_anchors(&chart, 3, &[(0.0, 10.0), (4.0, 10.0), (2.0, 12.0)]);
+        let defaults = Drawing::new(0, DrawingKind::InfoLine, 0, Vec::new());
+        assert_eq!(chart.drawing(4).unwrap().labels, defaults.labels);
+        assert_eq!(defaults.labels.len(), 7);
+
+        // Revision 2 stored the curve's control point: only the curve and the info line's
+        // omitted labels convert.
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .import_state_json(&catalog_document(2, drawings))
+            .unwrap();
+        assert_anchors(&chart, 1, &[(0.0, 10.0), (4.0, 12.0), (2.0, 14.0)]);
+        assert_anchors(&chart, 2, &[(1.0, 10.0), (5.0, 10.0), (3.0, 12.0)]);
+        assert_anchors(&chart, 3, &[(0.0, 10.0), (2.5, 10.5), (2.0, 12.0)]);
+        assert_eq!(chart.drawing(4).unwrap().labels, revision_two_info_labels());
+        // The next export is revision 3 and restores unchanged.
+        let (_, exported) = restore_round_trip(&chart.export_state_json().unwrap());
+        assert_eq!(exported["drawing_catalog"], 3);
+    }
+
+    /// Distance from `point` to the polyline `line` (media px).
+    fn polyline_distance(point: (f64, f64), line: &[(f64, f64)]) -> f64 {
+        aeris_charts_render::shape::distance_to_polyline(point, line)
+    }
+
+    /// Bézier point at `t` of the control polygon `controls` (three or four points).
+    fn bezier(controls: &[(f64, f64)], t: f64) -> (f64, f64) {
+        let mut points = controls.to_vec();
+        while points.len() > 1 {
+            points = points
+                .windows(2)
+                .map(|pair| {
+                    (
+                        pair[0].0 + (pair[1].0 - pair[0].0) * t,
+                        pair[0].1 + (pair[1].1 - pair[0].1) * t,
+                    )
+                })
+                .collect();
+        }
+        points[0]
+    }
+
+    /// The one curve stroke the first pane paints.
+    fn painted_curve(chart: &mut ChartEngine) -> Vec<(f64, f64)> {
+        let frame = chart.build_frame();
+        let pane = &frame.panes[0];
+        let strokes = pane
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                aeris_charts_render::draw_list::Prim::Polyline {
+                    first_point,
+                    point_count,
+                    ..
+                } => Some(
+                    pane.points[*first_point as usize..(*first_point + *point_count) as usize]
+                        .iter()
+                        .map(|point| (f64::from(point[0]), f64::from(point[1])))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(strokes.len(), 1, "one curve stroke");
+        strokes.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn revision_two_curves_convert_to_points_on_the_curve_and_draw_unchanged() {
+        // Hourly bars: a quadratic and a cubic whose stored inner anchors are the Bézier control
+        // points of revision 2, with the times the fork wrote for every anchor.
+        let anchor = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price, "time": logical * 3_600.0});
+        let curves = [
+            (
+                "curve",
+                vec![(10.0, 101.0), (17.0, 109.0), (20.0, 102.0)],
+                vec![(10.0, 101.0), (16.0, 105.25), (20.0, 102.0)],
+            ),
+            (
+                "double_curve",
+                vec![(10.0, 101.0), (14.0, 110.0), (18.0, 96.0), (22.0, 103.0)],
+                vec![
+                    (10.0, 101.0),
+                    (14.0, 2807.0 / 27.0),
+                    (18.0, 2737.0 / 27.0),
+                    (22.0, 103.0),
+                ],
+            ),
+        ];
+        for (kind, controls, through) in curves {
+            let stored_anchors = controls
+                .iter()
+                .map(|&(logical, price)| anchor(logical, price))
+                .collect::<Vec<_>>();
+            let mut chart = settled_chart_with(40);
+            chart
+                .import_state_json(&catalog_document(
+                    2,
+                    vec![stored(1, kind, &stored_anchors, serde_json::Value::Null)],
+                ))
+                .unwrap();
+            // The exact inverse, and each converted point keeps a time identity (evenly
+            // spaced stored times).
+            assert_anchors(&chart, 1, &through);
+            let exported: serde_json::Value =
+                serde_json::from_str(&chart.export_state_json().unwrap()).unwrap();
+            assert_eq!(
+                exported_times(&exported, 1),
+                through
+                    .iter()
+                    .map(|&(logical, _)| Some(logical * 3_600.0))
+                    .collect::<Vec<_>>(),
+                "{kind}"
+            );
+            // The painted curve is revision 2's Bézier on every affine price scale.
+            for mode in [
+                crate::PriceScaleMode::Normal,
+                crate::PriceScaleMode::Percentage,
+            ] {
+                chart.set_price_scale_mode_for(0, crate::PriceScaleTarget::Right, mode);
+                let line = painted_curve(&mut chart);
+                let polygon = controls
+                    .iter()
+                    .map(|&(logical, price)| {
+                        chart
+                            .drawing_to_px_for(
+                                0,
+                                crate::DrawingPriceScale::Right,
+                                DrawingPoint { logical, price },
+                            )
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let samples = (0..=400)
+                    .map(|step| bezier(&polygon, f64::from(step) / 400.0))
+                    .collect::<Vec<_>>();
+                for &sample in &samples {
+                    let distance = polyline_distance(sample, &line);
+                    assert!(
+                        distance <= 0.15,
+                        "{kind} {mode:?}: {sample:?} off by {distance}"
+                    );
+                }
+                for &point in &line {
+                    let distance = polyline_distance(point, &samples);
+                    assert!(
+                        distance <= 0.15,
+                        "{kind} {mode:?}: {point:?} off by {distance}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn revision_two_curves_with_non_positive_prices_convert_exactly() {
+        // No logarithm is taken: a control point below zero converts like any other, and the
+        // converted curve paints on a log scale without panicking.
+        let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+        let document = catalog_document(
+            2,
+            vec![
+                stored(
+                    1,
+                    "curve",
+                    &[at(10.0, 101.0), at(15.0, -40.0), at(20.0, 103.0)],
+                    serde_json::Value::Null,
+                ),
+                stored(
+                    2,
+                    "double_curve",
+                    &[
+                        at(10.0, 0.0),
+                        at(13.0, -27.0),
+                        at(16.0, 54.0),
+                        at(19.0, 27.0),
+                    ],
+                    serde_json::Value::Null,
+                ),
+            ],
+        );
+        let mut chart = settled_chart_with(40);
+        chart.import_state_json(&document).unwrap();
+        assert_anchors(&chart, 1, &[(10.0, 101.0), (15.0, 31.0), (20.0, 103.0)]);
+        assert_anchors(
+            &chart,
+            2,
+            &[(10.0, 0.0), (13.0, 1.0), (16.0, 26.0), (19.0, 27.0)],
+        );
+        chart.set_price_scale_mode_for(
+            0,
+            crate::PriceScaleTarget::Right,
+            crate::PriceScaleMode::Logarithmic,
+        );
+        chart.build_frame();
+    }
+
+    #[test]
+    fn revision_two_info_lines_keep_their_four_default_labels() {
+        let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+        let anchors = [at(1.0, 10.0), at(6.0, 12.0)];
+        let custom = serde_json::json!([{"metric": "angle", "visible": true, "position": "above"}]);
+        let document = catalog_document(
+            2,
+            vec![
+                // Upstream's card.
+                stored(1, "info_line", &anchors, serde_json::Value::Null),
+                // The fork's stats box (the `line` block).
+                stored(
+                    2,
+                    "info_line",
+                    &anchors,
+                    serde_json::json!({"tool_options": {"line": {}}}),
+                ),
+                // Stored labels stay as stored.
+                stored(
+                    3,
+                    "info_line",
+                    &anchors,
+                    serde_json::json!({"labels": custom}),
+                ),
+            ],
+        );
+        let (chart, exported) = restore_round_trip(&document);
+        let four = revision_two_info_labels();
+        assert_eq!(
+            four.iter().map(|label| label.metric).collect::<Vec<_>>(),
+            [
+                crate::DrawingLabelMetric::PriceChange,
+                crate::DrawingLabelMetric::PercentChange,
+                crate::DrawingLabelMetric::BarCount,
+                crate::DrawingLabelMetric::Angle,
+            ]
+        );
+        assert_eq!(chart.drawing(1).unwrap().labels, four);
+        assert_eq!(chart.drawing(1).unwrap().tool_options.line, None);
+        assert_eq!(chart.drawing(2).unwrap().labels, four);
+        assert!(chart.drawing(2).unwrap().tool_options.line.is_some());
+        let stored: Vec<crate::DrawingLabelOptions> = serde_json::from_value(custom).unwrap();
+        assert_eq!(chart.drawing(3).unwrap().labels, stored);
+        // Revision 3 writes the four, which differ from its seven-label default.
+        for id in [1, 2] {
+            let written = exported["drawings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|drawing| drawing["id"] == id)
+                .unwrap()["style"]["labels"]
+                .clone();
+            assert_eq!(written.as_array().map(Vec::len), Some(4), "{id}");
+        }
+    }
+
+    #[test]
+    fn stored_line_widths_survive_the_one_pixel_default() {
+        let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+        let anchors = [at(1.0, 10.0), at(6.0, 12.0)];
+        for revision in [2, DRAWING_CATALOG_REVISION] {
+            let document = catalog_document(
+                revision,
+                ["trend_line", "horizontal_segment"]
+                    .into_iter()
+                    .zip(1u32..)
+                    .map(|(kind, id)| stored(id, kind, &anchors, serde_json::json!({"width": 2.0})))
+                    .collect(),
+            );
+            let (chart, _) = restore_round_trip(&document);
+            for (id, kind) in [
+                (1, DrawingKind::TrendLine),
+                (2, DrawingKind::HorizontalSegment),
+            ] {
+                assert_eq!(chart.drawing(id).unwrap().width, 2.0, "{kind:?}");
+                assert_eq!(Drawing::new(0, kind, 0, Vec::new()).width, 1.0, "{kind:?}");
+            }
+        }
     }
 
     #[test]

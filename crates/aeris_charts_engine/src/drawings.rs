@@ -36,8 +36,9 @@ mod tools;
 
 pub(crate) use geometry::{
     DrawingBodyGeometry, DrawingGeometryOptions, FibonacciArcGeometry, FibonacciGeometry,
-    MeasureAxes, PositionGeometry, PositionZone, TimeLevelGeometry, closed_outline, curve_clip,
-    ellipse_outline, level_band_pairs, resolve_drawing_geometry,
+    MeasureAxes, PositionGeometry, PositionZone, TimeLevelGeometry, anchor_handle_points,
+    arc_segments, closed_outline, curve_clip, ellipse_outline, level_band_pairs,
+    resolve_drawing_geometry,
 };
 pub(crate) use parts::{DrawingPart, DrawingParts, PartContext, arrow_cap_triangle, cap_radius};
 pub(crate) use stats::unsigned_zero;
@@ -45,6 +46,19 @@ pub(crate) use tools::{
     DRAWING_TOOL_SPECS, DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement,
     DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
 };
+
+/// Chords for a Gann grid's visible quarter arcs, sized by the largest one so fill bands pair
+/// their boundaries point for point. Frame output and hit testing share it.
+pub(crate) fn gann_arc_segments(grid: geometry::GannGridGeometry, drawing: &Drawing) -> u32 {
+    grid.arc_segments(
+        drawing
+            .gann_arcs
+            .iter()
+            .filter(|level| level.visible)
+            .map(|level| level.value.abs())
+            .fold(0.0, f64::max),
+    )
+}
 
 /// Chart-unique drawing id (never reused within a chart; 0 is the "no drawing" sentinel).
 pub type DrawingId = u32;
@@ -322,6 +336,42 @@ impl DrawingBounds {
                     max_logical = max_logical.max(projected.logical);
                     min_price = min_price.min(projected.price);
                     max_price = max_price.max(projected.price);
+                }
+            }
+        }
+        if matches!(drawing.kind, DrawingKind::Curve | DrawingKind::DoubleCurve)
+            && drawing.points.len() == drawing.kind.anchor_count()
+        {
+            // A curve passes through its inner anchors and stays inside the box of the Bézier
+            // controls it derives from them (`geometry::interpolating_curve`), which reach past
+            // the anchors. The controls are affine in logical; in price they are affine on a
+            // linear scale and in ln(price) on a log one, so both candidates widen the box and it
+            // holds on every scale.
+            let cubic = drawing.kind == DrawingKind::DoubleCurve;
+            let positive = drawing.points.iter().all(|point| point.price > 0.0);
+            for log in [false, true] {
+                if log && !positive {
+                    break;
+                }
+                let mut anchors = [(0.0, 0.0); 4];
+                for (anchor, point) in anchors.iter_mut().zip(&drawing.points) {
+                    let price = if log { point.price.ln() } else { point.price };
+                    *anchor = (point.logical, price);
+                }
+                let anchors = &anchors[..drawing.points.len()];
+                let Some(curve) = geometry::interpolating_curve(anchors, cubic) else {
+                    continue;
+                };
+                for &(logical, value) in &curve.points[1..3] {
+                    let price = if log { value.exp() } else { value };
+                    if logical.is_finite() {
+                        min_logical = min_logical.min(logical);
+                        max_logical = max_logical.max(logical);
+                    }
+                    if price.is_finite() {
+                        min_price = min_price.min(price);
+                        max_price = max_price.max(price);
+                    }
                 }
             }
         }
@@ -1308,7 +1358,7 @@ pub struct Drawing {
     pub regression_deviations: f64,
     /// Line/border color CSS string (default [`DRAWING_DEFAULT_COLOR`]).
     pub color: String,
-    /// Stroke width in CSS px (default 2; 1 for a rectangle's border).
+    /// Stroke width in CSS px (default 1; 12 for the highlighter).
     pub width: f64,
     pub style: LineStyle,
     /// Region fill CSS string of the rectangle and of family tools that fill; `None` washes out
@@ -1480,7 +1530,10 @@ impl Drawing {
                 DrawingKind::InfoLine => [
                     crate::DrawingLabelMetric::PriceChange,
                     crate::DrawingLabelMetric::PercentChange,
+                    crate::DrawingLabelMetric::Ticks,
                     crate::DrawingLabelMetric::BarCount,
+                    crate::DrawingLabelMetric::Duration,
+                    crate::DrawingLabelMetric::Distance,
                     crate::DrawingLabelMetric::Angle,
                 ]
                 .into_iter()
@@ -1988,8 +2041,8 @@ pub(crate) struct DrawingDrag {
     pub(crate) start_points: Vec<DrawingPoint>,
     /// Anchors converted to media px at drag start (the body-drag translation base).
     pub(crate) start_px: Vec<(f64, f64)>,
-    /// The dragged handle's media px at the baseline (a derived handle's drag base); the press
-    /// point for a body drag.
+    /// The dragged handle's media px at the baseline (a derived handle's drag base, the point an
+    /// anchor's bar steps count from); the press point for a body drag.
     pub(crate) handle_px: (f64, f64),
     /// Original semantic snapshot retained for cancellation and the one committed history entry.
     pub(crate) history_points: Vec<DrawingPoint>,
@@ -2925,7 +2978,7 @@ impl Drawing {
             return false;
         };
         let tool_options = match tool_patch.as_ref() {
-            Some(value) => match self.tool_options.merged(value) {
+            Some(value) => match self.tool_options.merged(self.kind, value) {
                 Some(merged) => Some(merged),
                 None => return false,
             },
@@ -3772,12 +3825,16 @@ impl ChartEngine {
             let points = drawing.points.clone();
             let px = self.drawing_px(drawing)?;
             // A derived handle rebases onto its current position (kept while the geometry
-            // cannot place it); every other part translates from the pointer.
+            // cannot place it), an anchor's handle too (the pointer while it has none); a body
+            // translates from the pointer.
             let handle = match drag.part {
                 DrawingDragPart::Handle(_) => self
                     .drawing_handle_px(drawing, drag.part)
                     .unwrap_or(drag.handle_px),
-                _ => (drag.current_x, drag.current_y),
+                DrawingDragPart::Anchor(_) => self
+                    .drawing_handle_px(drawing, drag.part)
+                    .unwrap_or((drag.current_x, drag.current_y)),
+                DrawingDragPart::Body => (drag.current_x, drag.current_y),
             };
             Some((points, px, handle, drag.current_x, drag.current_y))
         });
@@ -4228,11 +4285,13 @@ impl ChartEngine {
         if snapped.is_finite() { snapped } else { price }
     }
 
-    /// Grid-snapped tools place anchors on the crosshair's time slot under `x` and on the price
-    /// tick grid. `magnet_chose` holds when the magnet actually moved `point` onto a bar (it
-    /// found a candle to attract it); a magnet that is merely on, but kept the pointer's point
-    /// (weak and too far from every price, or no bar under the pointer), leaves the slot to this
-    /// snap so every anchor still lands on a whole bar.
+    /// Every anchor except anchored text's (which pins to a pane-relative screen position, not
+    /// a bar) lands on the crosshair's time slot under `x`, so drawings step bar by bar
+    /// horizontally; price-tick tools also land on the instrument/scale tick grid.
+    /// `magnet_chose` holds when the magnet actually moved `point` onto a bar (it found a candle
+    /// to attract it); a magnet that is merely on, but kept the pointer's point (weak and too far
+    /// from every price, or no bar under the pointer), leaves the slot to this snap so every
+    /// anchor still lands on a whole bar.
     fn grid_snap_point(
         &self,
         kind: DrawingKind,
@@ -4242,14 +4301,29 @@ impl ChartEngine {
         mut point: DrawingPoint,
         magnet_chose: bool,
     ) -> DrawingPoint {
-        if !kind.spec().grid_snap {
-            return point;
-        }
-        if !magnet_chose {
+        if !magnet_chose && kind != DrawingKind::AnchoredText {
             point.logical = self.snapped_crosshair_index(x) as f64;
         }
-        point.price = self.snap_position_price(pane_index, price_scale, point.price);
+        if kind.spec().price_tick_snap {
+            point.price = self.snap_position_price(pane_index, price_scale, point.price);
+        }
         point
+    }
+
+    /// Whole time slots one drag sample moves an anchor or handle by. A pointer sample counts the
+    /// crosshair slots crossed between `from_x` (the grabbed point's baseline media x, on screen)
+    /// and `from_x + dx`, so the moved anchor keeps its own slot even when it is off screen or its
+    /// handle sits on another stroke (the crosshair clamps to the visible range). A keyboard
+    /// sample (`dx` a whole number of bar spacings, [`Self::nudge_selected_drawing`]) steps in
+    /// logical space, never through the crosshair, so a nudged off-screen handle moves exactly
+    /// its bars instead of jumping to the pane edge.
+    fn drag_slot_steps(&self, from_x: f64, dx: f64, keyboard: bool) -> f64 {
+        if keyboard {
+            (dx / self.time_scale.bar_spacing().max(f64::EPSILON)).round()
+        } else {
+            (self.snapped_crosshair_index(from_x + dx) - self.snapped_crosshair_index(from_x))
+                as f64
+        }
     }
 
     fn snap_drawing_time_to_data(&self, mut point: DrawingPoint) -> Option<DrawingPoint> {
@@ -5269,6 +5343,18 @@ impl ChartEngine {
             }
         }
         let reference = Self::text_box(drawing, px, pane_w, pane_top, pane_h, scale)?;
+        if drawing.kind == DrawingKind::PriceLabel
+            && !kinds::projection_annotations::fork_form(drawing)
+        {
+            // Upstream's bubble: its reference is the tail tip at the anchor, and its text runs
+            // level and left-aligned inside the bubble above-right of it.
+            let (x, y) = kinds::projection_annotations::price_label_text_start(
+                (reference.left, reference.top),
+                size,
+                scale,
+            );
+            return Some((x, y, DrawingTextHAlign::Left, 0.0));
+        }
         Some(Self::text_placement(drawing, &reference, size, pad))
     }
 
@@ -7213,7 +7299,7 @@ impl ChartEngine {
             })
             .flatten();
         let (mut chain, mut other) = (Vec::new(), Vec::new());
-        let segments = arcs.segments();
+        let segments = arcs.segments(kinds::fibonacci::largest_level(drawing));
         let upstream_chain = |value: f64, out: &mut Vec<(f64, f64)>| {
             out.clear();
             out.extend((0..=segments).map(|step| {
@@ -7446,6 +7532,15 @@ impl ChartEngine {
                 hit_tolerance,
                 kinds::projection_annotations::fork_text_box,
             )
+        {
+            return true;
+        }
+        // Upstream's construction guides tie anchors off the body; a Fibonacci tool's stored
+        // block keeps the fork's trend line (`fibonacci_trend_line_hit`) in their place.
+        if kinds::fibonacci::draws_guides(drawing)
+            && geometry.guides.into_iter().flatten().any(|guide| {
+                distance_to_segment(x, y, guide.a.0, guide.a.1, guide.b.0, guide.b.1) <= tolerance
+            })
         {
             return true;
         }
@@ -7693,24 +7788,14 @@ impl ChartEngine {
                 x: label_x,
                 y: label_y,
             } => {
-                let label = if drawing.text.is_empty() {
-                    self.format_drawing_price(drawing, drawing.points[0].price)
-                } else {
-                    drawing.text.clone()
-                };
-                let layout = &self.options.get().layout;
-                let size = drawing.resolved_text_size(layout.font_size);
-                let width = self.measure_text_run(
-                    &label,
-                    size,
-                    &layout.font_family,
-                    drawing.text_weight.unwrap_or(400),
-                    drawing.text_italic,
-                );
-                x >= label_x - width - 8.0 - hit_tolerance
-                    && x <= label_x + hit_tolerance
-                    && y >= label_y - size * 0.6 - 4.0 - hit_tolerance
-                    && y <= label_y + size * 0.6 + 4.0 + hit_tolerance
+                // The bubble plus its tail, which ends at the anchor.
+                let [left, top, width, _] = self
+                    .price_label_layout(drawing, (label_x, label_y), 1.0)
+                    .rect;
+                x >= left - hit_tolerance
+                    && x <= left + width + hit_tolerance
+                    && y >= top - hit_tolerance
+                    && y <= label_y + hit_tolerance
             }
             DrawingBodyGeometry::IconStamp { center, size } => {
                 (x - center.0).abs() <= size / 2.0 + hit_tolerance
@@ -7729,6 +7814,7 @@ impl ChartEngine {
                 };
                 let time_levels = kinds::pitchforks_gann::box_time_levels(drawing);
                 let x_at = |value: f64| grid.start.0 + (grid.end.0 - grid.start.0) * value;
+                let gann_segments = gann_arc_segments(grid, drawing);
                 let between =
                     |value: f64, (a, b): (f64, f64)| value >= a.min(b) && value <= a.max(b);
                 // While selected, the box and every zone the frame fills around it (level
@@ -7772,15 +7858,15 @@ impl ChartEngine {
                         .iter()
                         .filter(|level| level.visible)
                         .any(|level| {
-                            (0..32).any(|step| {
+                            (0..gann_segments).any(|step| {
                                 let a = grid.arc_point(
                                     level.value,
-                                    f64::from(step) / 32.0,
+                                    f64::from(step) / f64::from(gann_segments),
                                     drawing.level_reverse,
                                 );
                                 let b = grid.arc_point(
                                     level.value,
-                                    f64::from(step + 1) / 32.0,
+                                    f64::from(step + 1) / f64::from(gann_segments),
                                     drawing.level_reverse,
                                 );
                                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
@@ -8046,7 +8132,10 @@ impl ChartEngine {
                 Some(point) => point,
                 None => return false,
             },
-            _ => (x, y),
+            DrawingDragPart::Anchor(_) => {
+                self.drawing_handle_px(drawing, hit.part).unwrap_or((x, y))
+            }
+            DrawingDragPart::Body => (x, y),
         };
         let history_tool_options = drawing.tool_options.clone();
         self.selected_drawing = Some(hit.id);
@@ -8180,15 +8269,15 @@ impl ChartEngine {
                     }
                     let raw_price = cursor_pt.price;
                     if matches!(index, 1 | 2) {
-                        cursor_pt.logical = self.snapped_crosshair_index(x) as f64;
-                        // The keyboard honours the same slot grid: a nudge that rounds back to
-                        // the grabbed slot still steps one slot the way the key points.
-                        if let Some((key_x, _)) = keyboard_step {
-                            let start = start_points[if index == 1 { 0 } else { 1 }].logical;
-                            if key_x != 0.0 && (cursor_pt.logical - start).abs() < 0.5 {
-                                cursor_pt.logical = start + key_x.signum();
+                        // The pointer lands on the slot under it; a keyboard nudge steps whole
+                        // bars from the dragged anchor's own slot, even off screen.
+                        cursor_pt.logical = match keyboard_step {
+                            Some(_) => {
+                                start_points[if index == 1 { 0 } else { 1 }].logical.round()
+                                    + self.drag_slot_steps(x, dx, true)
                             }
-                        }
+                            None => self.snapped_crosshair_index(x) as f64,
+                        };
                     }
                     cursor_pt.price = self.snap_position_price(pane, price_scale, raw_price);
                     if let (Some((_, key_y)), Some(start_index)) = (
@@ -8260,11 +8349,27 @@ impl ChartEngine {
                         };
                         cursor_pt = snapped;
                     }
+                    let mut magnet_chose = false;
                     if modifiers.magnet
                         && let Some(snapped) =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
                     {
                         cursor_pt = snapped;
+                        magnet_chose = true;
+                    }
+                    // The dragged corner or edge steps bar by bar like an anchor, before Shift
+                    // squares it; a keyboard nudge steps whole bars from the dragged side's own
+                    // bar ([`Self::drag_slot_steps`]), even when that side is off screen.
+                    cursor_pt =
+                        self.grid_snap_point(kind, pane, price_scale, x, cursor_pt, magnet_chose);
+                    if keyboard_step.is_some() {
+                        let (first, second) = (start_points[0].logical, start_points[1].logical);
+                        let side = if matches!(index, 2..=4) {
+                            first.max(second)
+                        } else {
+                            first.min(second)
+                        };
+                        cursor_pt.logical = side.round() + self.drag_slot_steps(x, dx, true);
                     }
                     let Some((mx, my)) = self.drawing_to_px_for(pane, price_scale, cursor_pt)
                     else {
@@ -8337,12 +8442,7 @@ impl ChartEngine {
                     let Some(mut point) = convert(index, dx, dy) else {
                         return;
                     };
-                    if snap_time_to_data {
-                        let Some(snapped) = self.snap_drawing_time_to_data(point) else {
-                            return;
-                        };
-                        point = snapped;
-                    }
+                    let raw_price = point.price;
                     let mut magnet_chose = false;
                     if modifiers.magnet
                         && let Some(snapped) =
@@ -8351,6 +8451,43 @@ impl ChartEngine {
                         point = kind.spec().movement_axis.constrain_snap(point, snapped);
                         magnet_chose = true;
                     }
+                    // Every anchor steps bar by bar from its own slot by the slots the grabbed
+                    // handle crossed ([`Self::drag_slot_steps`]), so a handle projected onto
+                    // another stroke, or an anchor off screen, never jumps; price-tick tools
+                    // also land on the tick grid.
+                    let start = start_points[index];
+                    if !magnet_chose {
+                        point.logical = start.logical.round()
+                            + self.drag_slot_steps(handle_px.0, dx, keyboard_step.is_some());
+                    }
+                    // The data clamp checks the anchor's final slot: a projected handle (a
+                    // channel's base midpoint, a rotated rectangle's far side) crosses slots
+                    // where its anchor's own px would not, so checking the converted point
+                    // could let the step carry the anchor past the data.
+                    if snap_time_to_data {
+                        let Some(snapped) = self.snap_drawing_time_to_data(point) else {
+                            return;
+                        };
+                        point = snapped;
+                    }
+                    if kind.spec().price_tick_snap {
+                        point.price = self.snap_position_price(pane, price_scale, point.price);
+                        // A keyboard nudge that snaps back to where it started still steps one
+                        // tick the way the key points, like the position handles above.
+                        if let Some((_, key_y)) = keyboard_step
+                            && key_y != 0.0
+                        {
+                            point.price = self.keyboard_position_price(
+                                (pane, price_scale),
+                                start.price,
+                                raw_price,
+                                point.price,
+                                key_y,
+                            );
+                        }
+                    }
+                    // Shift-straightening is an explicit geometric constraint, so it runs after
+                    // the bar snap and keeps its exact angle or square.
                     if modifiers.straighten && index < 2 && points.len() >= 2 {
                         // The first two anchors are the straightened segment (a channel's base line);
                         // the other one is fixed (only the dragged anchor moves).
@@ -8361,41 +8498,12 @@ impl ChartEngine {
                             point = snapped;
                         }
                     }
-                    if kind.spec().grid_snap {
-                        let raw_price = point.price;
-                        let anchor_x = start_px.get(index).map_or(x, |&(px, _)| px + dx);
-                        point = self.grid_snap_point(
-                            kind,
-                            pane,
-                            price_scale,
-                            anchor_x,
-                            point,
-                            magnet_chose,
-                        );
-                        // A keyboard nudge that snaps back to where it started still steps one
-                        // slot or tick the way the key points, like the position handles above.
-                        if let Some((key_x, key_y)) = keyboard_step {
-                            let start = start_points[index];
-                            if key_x != 0.0 && point.logical == start.logical {
-                                point.logical = start.logical + key_x.signum();
-                            }
-                            if key_y != 0.0 {
-                                point.price = self.keyboard_position_price(
-                                    (pane, price_scale),
-                                    start.price,
-                                    raw_price,
-                                    point.price,
-                                    key_y,
-                                );
-                            }
-                        }
-                    }
                     points[index] = point;
                     // A horizontal or vertical segment drags its linked coordinate on every
                     // anchor.
                     kind.spec().anchor_link.apply(&mut points, index);
-                    // Derived geometry follows (a rotated rectangle's width, a curve's
-                    // on-curve points).
+                    // Derived geometry follows (a rotated rectangle's width, a coincident
+                    // signpost's top).
                     if let Some(drawing) = self.drawing(id) {
                         kinds::follow_anchor_drag(
                             self,
@@ -8420,29 +8528,17 @@ impl ChartEngine {
                     (dx, dy)
                 };
                 let single_anchor = points.len() == 1;
-                let grid = kind.spec().grid_snap;
+                let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
                 // Follow the crosshair's slot changes from the grabbed point. One shared
-                // logical delta moves the body rigidly and preserves the grab offset/width.
-                let mut time_steps = if grid {
-                    (self.snapped_crosshair_index(start_x + dx)
-                        - self.snapped_crosshair_index(start_x)) as f64
-                } else {
-                    0.0
-                };
-                if let (true, Some((key_x, _))) = (grid, keyboard_step) {
-                    // A keyboard nudge steps at least one slot the way the key points.
-                    if key_x != 0.0 && time_steps == 0.0 {
-                        time_steps = key_x.signum();
-                    }
-                }
+                // logical delta moves the body rigidly and preserves the grab offset/width; a
+                // keyboard nudge steps whole bars in logical space, added unrounded so anchors
+                // between slots keep their fractions.
+                let time_steps = self.drag_slot_steps(start_x, dx, keyboard_step.is_some());
                 for (index, slot) in points.iter_mut().enumerate() {
-                    let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
                     let Some(mut point) = convert(index, dx, dy) else {
                         return;
                     };
-                    if grid {
-                        point.logical = slot.logical + time_steps;
-                    }
+                    point.logical = slot.logical + time_steps;
                     if snap_time_to_data {
                         let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                             return;
@@ -8459,7 +8555,7 @@ impl ChartEngine {
                     {
                         point = kind.spec().movement_axis.constrain_snap(point, snapped);
                     }
-                    if grid {
+                    if kind.spec().price_tick_snap {
                         let raw_price = point.price;
                         point.price = self.snap_position_price(pane, price_scale, raw_price);
                         if let Some((_, key_y)) = keyboard_step {
@@ -8485,17 +8581,47 @@ impl ChartEngine {
                 else {
                     return;
                 };
-                if snap_time_to_data {
-                    let Some(snapped) = self.snap_drawing_time_to_data(target) else {
-                        return;
-                    };
-                    target = snapped;
-                }
+                let mut magnet_chose = false;
                 if modifiers.magnet
                     && let Some(snapped) =
                         self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
                 {
                     target = kind.spec().movement_axis.constrain_snap(target, snapped);
+                    magnet_chose = true;
+                }
+                // The handle lands on the bar slot under it like an anchor (the grabbed handle is
+                // on screen); a keyboard nudge moves it by whole bars from its own position. The
+                // kind resolves what that drives in whole bars (a pitchfork's base, a fixed
+                // square's corner, a signpost's top). A rotated rectangle's width handle encodes
+                // a perpendicular distance and stays continuous.
+                let slot_snapped = !magnet_chose && kind != DrawingKind::RotatedRectangle;
+                if slot_snapped {
+                    target.logical = match keyboard_step {
+                        Some(_) => match self.drawing_from_px_for(
+                            pane,
+                            price_scale,
+                            handle_px.0,
+                            handle_px.1,
+                        ) {
+                            Some(from) => {
+                                from.logical + self.drag_slot_steps(handle_px.0, dx, true)
+                            }
+                            None => return,
+                        },
+                        None => self.snapped_crosshair_index(handle_px.0 + dx) as f64,
+                    };
+                }
+                // The data clamp checks the final target: the slot under the handle can lie in the
+                // empty area past the last bar. A keyboard step keeps a half-bar handle's fraction
+                // (an odd pitchfork base's midpoint); the kind steps what it drives by whole bars
+                // and keeps those on the data.
+                if snap_time_to_data {
+                    let Some(snapped) = self.snap_drawing_time_to_data(target) else {
+                        return;
+                    };
+                    if !(slot_snapped && keyboard_step.is_some()) {
+                        target = snapped;
+                    }
                 }
                 let (Some(target_px), Some(drawing), Some(drag)) = (
                     self.drawing_to_px_for(pane, price_scale, target),
@@ -8634,31 +8760,37 @@ impl ChartEngine {
     /// anchor, the brush's two ends, the rectangle's eight bounds handles, or the Long/Short
     /// Position's target/entry/width/stop controls); `None` moves the whole drawing. The session
     /// starts at the handle's own media position so handle kinds that follow the pointer move by
-    /// exactly the nudge delta. Keyboard nudges never magnet-snap, locked drawings do not move,
-    /// and an active pointer drag is left untouched. Returns true only when the nudge recorded an
-    /// undoable change: a nudge along an axis the drawing cannot move, one clamped at the pane
-    /// edge, or one a family quantizes back to the same value returns false and records nothing.
+    /// exactly the nudge delta. Drawings move horizontally in whole bars, so `dx_css` rounds to
+    /// a whole number of bar spacings, at least one; a rotated rectangle's width handle sets a
+    /// perpendicular distance and moves by `dx_css` unrounded. `dy_css` stays CSS px. Keyboard
+    /// nudges never magnet-snap, locked drawings do not move, and an active pointer drag is left
+    /// untouched. Returns true only when the nudge recorded an undoable change: a nudge along an
+    /// axis the drawing cannot move, one clamped at the pane edge, or one a family quantizes back
+    /// to the same value returns false and records nothing.
     pub fn nudge_selected_drawing(
         &mut self,
         dx_css: f64,
         dy_css: f64,
         handle: Option<usize>,
     ) -> bool {
-        self.nudge_selected_drawing_with_history(dx_css, dy_css, handle, true)
+        self.nudge_selected_drawing_with_history(dx_css, dy_css, handle, false, true)
     }
 
-    /// [`Self::nudge_selected_drawing`]; without `record`, the step joins an open keyboard edit
-    /// that commits through [`Self::record_drawing_edit`].
+    /// [`Self::nudge_selected_drawing`]; with `key_steps`, `dx` counts arrow-key steps (one bar
+    /// each, one CSS px on a rotated rectangle's width handle) instead of CSS px. Without
+    /// `record`, the step joins an open keyboard edit that commits through
+    /// [`Self::record_drawing_edit`].
     pub(crate) fn nudge_selected_drawing_with_history(
         &mut self,
-        dx_css: f64,
+        dx: f64,
         dy_css: f64,
         handle: Option<usize>,
+        key_steps: bool,
         record: bool,
     ) -> bool {
-        if !dx_css.is_finite()
+        if !dx.is_finite()
             || !dy_css.is_finite()
-            || (dx_css == 0.0 && dy_css == 0.0)
+            || (dx == 0.0 && dy_css == 0.0)
             || self.drawing_drag.is_some()
         {
             return false;
@@ -8690,6 +8822,22 @@ impl ChartEngine {
         let history_bars_pattern = drawing.bars_pattern.clone();
         let Some(start_px) = self.drawing_px(drawing) else {
             return false;
+        };
+        // Drawings move horizontally in whole bars, so a horizontal nudge steps at least one bar.
+        // A rotated rectangle's width handle sets a perpendicular distance and stays continuous
+        // (its pointer drag skips the slot snap too).
+        let continuous = drawing.kind == DrawingKind::RotatedRectangle
+            && matches!(part, DrawingDragPart::Handle(_));
+        let dx_css = if dx == 0.0 || continuous {
+            dx
+        } else {
+            let spacing = self.time_scale.bar_spacing().max(f64::EPSILON);
+            let bars = if key_steps {
+                dx
+            } else {
+                dx.signum() * (dx.abs() / spacing).round().max(1.0)
+            };
+            bars * spacing
         };
         let history_tool_options = drawing.tool_options.clone();
         self.drawing_drag = Some(DrawingDrag {
@@ -9449,13 +9597,13 @@ impl ChartEngine {
         if let Some(snapped) = magnet_point {
             point = snapped;
         }
+        point = self.grid_snap_point(kind, pane, price_scale, x, point, magnet_point.is_some());
         if modifiers.straighten
             && let Some(fixed) = fixed
             && let Some(snapped) = self.straighten_point(pane, price_scale, kind, fixed, point)
         {
             point = snapped;
         }
-        point = self.grid_snap_point(kind, pane, price_scale, x, point, magnet_point.is_some());
         let preset_points = if matches!(
             kind.spec().placement,
             DrawingPlacement::SingleClickPreset { .. }
@@ -9504,10 +9652,10 @@ impl ChartEngine {
     fn commit_pending_drawing(&mut self, pending: PendingDrawing) -> DrawingId {
         self.invalidate_frame_overlay();
         let mut drawing = pending.drawing;
-        // Tools placed through points on their geometry store the anchors those clicks define
-        // (an arc ends first, a curve through its on-curve points), as the preview showed.
+        // Tools placed ends first store their clicks in upstream's anchor order (start, the
+        // points the curve passes through, end), as the preview showed.
         if kinds::shapes::places_through(drawing.kind) {
-            let Some(points) = kinds::shapes::placement_anchors(self, &drawing, &drawing.points)
+            let Some(points) = kinds::shapes::placement_anchors(drawing.kind, &drawing.points)
             else {
                 return 0;
             };
@@ -9662,14 +9810,6 @@ impl ChartEngine {
         if let Some(snapped) = magnet_point {
             point = snapped;
         }
-        if modifiers.straighten
-            && let Some(pending) = &self.drawing_controller.pending
-            && let Some(&fixed) = pending.drawing.points.last()
-            && let Some(snapped) =
-                self.straighten_point(pane, price_scale, pending.drawing.kind, fixed, point)
-        {
-            point = snapped;
-        }
         if let Some(kind) = self
             .drawing_controller
             .pending
@@ -9677,6 +9817,14 @@ impl ChartEngine {
             .map(|pending| pending.drawing.kind)
         {
             point = self.grid_snap_point(kind, pane, price_scale, x, point, magnet_point.is_some());
+        }
+        if modifiers.straighten
+            && let Some(pending) = &self.drawing_controller.pending
+            && let Some(&fixed) = pending.drawing.points.last()
+            && let Some(snapped) =
+                self.straighten_point(pane, price_scale, pending.drawing.kind, fixed, point)
+        {
+            point = snapped;
         }
         if let Some(pending) = self.drawing_controller.pending.as_mut() {
             pending.drawing.pane_index = pane;

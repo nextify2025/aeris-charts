@@ -300,14 +300,17 @@ test("curves place through points on the curve and edit through on-curve handles
   for (const point of [start, end, through]) await page.mouse.click(point.x, point.y);
   const list = await drawings(page);
   expect(list).toHaveLength(1);
+  // Stored in order along the curve: its start, the clicked point it passes through, its end,
+  // each on its bar slot at the clicked price.
   const stored = list[0].points;
-  expect(stored[0].logical).toBeCloseTo(s.l0, 3);
-  expect(stored[2].logical).toBeCloseTo(s.l1, 3);
-  // The stored control lies off the curve, beyond the clicked point.
-  expect(stored[1].price).toBeGreaterThan(s.p_hi);
+  expect(stored.map((point) => point.logical)).toEqual([s.l0, mid, s.l1]);
+  expect(stored[0].price).toBeCloseTo(s.p_lo, 4);
+  expect(stored[1].price).toBeCloseTo(s.p_hi, 4);
+  expect(stored[2].price).toBeCloseTo(s.p_lo, 4);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.kind())).toBe("curve");
   expect(await page.evaluate((id) => window.__chart.drawing_handle_count(id), list[0].id)).toBe(3);
-  // The handle sits on the clicked point; dragging it bends the curve through the pointer.
+  // The clicked point is an anchor handle on the curve; dragging it bends the curve through the
+  // pointer and leaves the ends.
   await page.mouse.move(through.x, through.y);
   await expect.poll(() => overlay_cursor(page)).toBe("pointer");
   await page.mouse.down();
@@ -315,6 +318,9 @@ test("curves place through points on the curve and edit through on-curve handles
   await page.mouse.move(through.x, through.y + 40, { steps: 4 });
   await page.mouse.up();
   const bent = (await drawings(page))[0].points;
+  expect(bent[1].logical).toBe(mid);
+  const dropped = await page.evaluate((y) => window.__main.coordinate_to_price(y), through.y + 40);
+  expect(bent[1].price).toBeCloseTo(dropped, 4);
   expect(bent[1].price).toBeLessThan(stored[1].price);
   expect(bent[0]).toEqual(stored[0]);
   expect(bent[2]).toEqual(stored[2]);
@@ -406,8 +412,8 @@ test("Shapes tools round-trip through persistence, clipboard, and sync with thei
       ["circle", [{ logical: 2, price: 10 }, { logical: 4, price: 10 }], { fill_color: "rgba(1, 2, 3, 0.5)" }],
       ["triangle", [{ logical: 1, price: 9 }, { logical: 5, price: 9 }, { logical: 3, price: 12 }], { style: "dashed" }],
       ["arc", [{ logical: 1, price: 10 }, { logical: 5, price: 10 }, { logical: 3, price: 12 }], { stroke_end: "arrow" }],
-      ["curve", [{ logical: 1, price: 10 }, { logical: 5, price: 10 }, { logical: 3, price: 12 }], { extend_right: true, fill_enabled: true }],
-      ["double_curve", [{ logical: 1, price: 10 }, { logical: 7, price: 10 }, { logical: 3, price: 12 }, { logical: 5, price: 8 }], { stroke_start: "circle" }],
+      ["curve", [{ logical: 1, price: 10 }, { logical: 3, price: 12 }, { logical: 5, price: 10 }], { extend_right: true, fill_enabled: true }],
+      ["double_curve", [{ logical: 1, price: 10 }, { logical: 3, price: 12 }, { logical: 5, price: 8 }, { logical: 7, price: 10 }], { stroke_start: "circle" }],
       ["polyline", [{ logical: 1, price: 10 }, { logical: 3, price: 12 }, { logical: 5, price: 9 }, { logical: 6, price: 11 }], { tool_options: { shape: { closed: true } } }],
       ["highlighter", [{ logical: 1, price: 10 }, { logical: 2, price: 10.5 }, { logical: 3, price: 10.2 }], { width: 14 }],
     ];
@@ -524,8 +530,8 @@ test("Shapes tools render pixel-identical on WebGPU and Canvas2D (AA coverage st
       chart.add_drawing("circle", [{ logical: at(0.46), price: up(0.25) }, { logical: at(0.52), price: up(0.25) }], { color: "#7b1fa2", width: 3 });
       chart.add_drawing("triangle", [{ logical: at(0.6), price: up(0.1) }, { logical: at(0.75), price: up(0.1) }, { logical: at(0.68), price: up(0.4) }], { color: "#ff6d00", style: "dashed" });
       chart.add_drawing("arc", [{ logical: at(0.05), price: up(0.6) }, { logical: at(0.2), price: up(0.6) }, { logical: at(0.12), price: up(0.8) }], { color: "#2962ff" });
-      chart.add_drawing("curve", [{ logical: at(0.25), price: up(0.6) }, { logical: at(0.4), price: up(0.6) }, { logical: at(0.32), price: up(0.85) }], { color: "#00bcd4", fill_enabled: true, stroke_end: "arrow" });
-      chart.add_drawing("double_curve", [{ logical: at(0.45), price: up(0.7) }, { logical: at(0.62), price: up(0.7) }, { logical: at(0.5), price: up(0.9) }, { logical: at(0.56), price: up(0.55) }], { color: "#f44336", fill_enabled: true });
+      chart.add_drawing("curve", [{ logical: at(0.25), price: up(0.6) }, { logical: at(0.32), price: up(0.85) }, { logical: at(0.4), price: up(0.6) }], { color: "#00bcd4", fill_enabled: true, stroke_end: "arrow" });
+      chart.add_drawing("double_curve", [{ logical: at(0.45), price: up(0.7) }, { logical: at(0.5), price: up(0.9) }, { logical: at(0.56), price: up(0.55) }, { logical: at(0.62), price: up(0.7) }], { color: "#f44336", fill_enabled: true });
       chart.add_drawing("polyline", [{ logical: at(0.66), price: up(0.55) }, { logical: at(0.72), price: up(0.9) }, { logical: at(0.78), price: up(0.6) }, { logical: at(0.84), price: up(0.85) }], { color: "#4caf50", tool_options: { shape: { closed: true } } });
       chart.add_drawing("highlighter", Array.from({ length: 12 }, (_, index) => ({ logical: at(0.8 + index * 0.012), price: up(0.2 + 0.1 * Math.sin(index / 3)) })));
       chart.wasm.set_selected_drawing(chart.drawings()[2].id);

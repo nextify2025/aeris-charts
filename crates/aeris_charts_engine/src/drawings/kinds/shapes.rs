@@ -11,19 +11,19 @@
 //! - arc, curve, double curve: the region between the curve and its chord fills while
 //!   `fill_enabled`, the curves continue their end tangents by `extend_*`, and
 //!   `stroke_start`/`stroke_end` cap the unextended ends ([`CurveStroke`], [`capped`]).
-//! - rotated rectangle: its third handle sits on the far side's midpoint and a width handle on
-//!   the near side's (`Handle(0)`); dragging an edge corner keeps the on-screen width
-//!   ([`derived_handles`], [`drag_handle`], [`follow_anchor_drag`]).
-//! - curve and double curve: placed and edited through points on the curve (the quadratic's at
-//!   t = 1/2, the cubic's at t = 1/3 and 2/3), stored as upstream's control points
-//!   ([`placement_anchors`], the derived `Handle` parts); an arc is placed by its ends first.
+//! - rotated rectangle: a width handle on the near side's midpoint (`Handle(0)`, beside
+//!   upstream's third handle on the far side's); dragging an edge corner keeps the on-screen
+//!   width ([`derived_handles`], [`drag_handle`], [`follow_anchor_drag`]).
+//! - arc, curve and double curve: placed by their ends first, then the points they pass through
+//!   ([`placement_anchors`] reorders the clicks into upstream's stored order; upstream's curve
+//!   anchors are points on the curve).
 
 use std::borrow::Cow;
 
 use aeris_charts_render::shape::{self, Point, Rect};
 
 use super::super::Drawing;
-use super::super::geometry::{CurveGeometry, DrawingBodyGeometry, rotated_rectangle_corners};
+use super::super::geometry::{DrawingBodyGeometry, rotated_rectangle_corners};
 use super::super::handles::{DrawingHandle, HandleDrag};
 use super::super::parts::{DrawingParts, cap_radius};
 use crate::{
@@ -209,164 +209,63 @@ pub(crate) fn extend_upstream_schema(
     }
 }
 
-/// The quadratic control point of the curve from `a` to `b` through `m` at t = 1/2.
-pub(crate) fn quadratic_through(a: Point, b: Point, m: Point) -> Point {
-    (2.0 * m.0 - (a.0 + b.0) / 2.0, 2.0 * m.1 - (a.1 + b.1) / 2.0)
-}
-
-/// The cubic control points of the curve from `a` to `b` through `p` at t = 1/3 and `q` at
-/// t = 2/3.
-pub(crate) fn cubic_through(a: Point, b: Point, p: Point, q: Point) -> (Point, Point) {
-    let control = |near: Point, far: Point, through_near: Point, through_far: Point| {
-        let axis = |i: fn(Point) -> f64| {
-            3.0 * i(through_near) - 1.5 * i(through_far) - 5.0 / 6.0 * i(near) + i(far) / 3.0
-        };
-        (axis(|point| point.0), axis(|point| point.1))
-    };
-    (control(a, b, p, q), control(b, a, q, p))
-}
-
-/// The points on a curve with anchors at `px` (start, control(s), end) that its on-curve handles
-/// sit at: the quadratic's at t = 1/2, the cubic's at t = 1/3 and 2/3.
-fn on_curve_points(kind: DrawingKind, px: &[Point]) -> Option<Vec<Point>> {
-    let (cubic, count) = match kind {
-        DrawingKind::Curve => (false, 3),
-        DrawingKind::DoubleCurve => (true, 4),
-        _ => return None,
-    };
-    let px = px.get(..count)?;
-    let curve = CurveGeometry {
-        points: [px[0], px[1], px[2], px[count - 1]],
-        cubic,
-        extend: [None; 2],
-    };
-    Some(if cubic {
-        vec![curve.point(1.0 / 3.0), curve.point(2.0 / 3.0)]
-    } else {
-        vec![curve.point(0.5)]
-    })
-}
-
-/// The control points of the curve from `a` to `b` through `through` (one point for the
-/// quadratic, two for the cubic, see [`on_curve_points`]).
-fn controls_through(a: Point, b: Point, through: &[Point]) -> Vec<Point> {
-    match *through {
-        [m] => vec![quadratic_through(a, b, m)],
-        [p, q] => {
-            let (first, second) = cubic_through(a, b, p, q);
-            vec![first, second]
-        }
-        _ => Vec::new(),
-    }
-}
-
 /// The derived handles of the shapes (see `kinds::upstream_derived_handles`; `px` are the
-/// anchors' media px). A rotated rectangle's third handle moves to the midpoint of its far side
-/// (the depth point itself may lie anywhere on that side's line) and a width handle `Handle(0)`
-/// is appended at the near side's midpoint; a zero-length edge keeps the plain anchors. A curve's
-/// control handles become `Handle(k)` at its on-curve points, in their keyboard places.
+/// anchors' media px): a rotated rectangle gains a width handle `Handle(0)` at its near side's
+/// midpoint (upstream's projection already put the depth anchor's handle on the far side's); a
+/// zero-length edge keeps the plain anchors.
 pub(crate) fn derived_handles(drawing: &Drawing, px: &[Point], handles: &mut Vec<DrawingHandle>) {
-    match drawing.kind {
-        DrawingKind::RotatedRectangle => {
-            let Some(corners) = rotated_rectangle_corners(px) else {
-                return;
-            };
-            let Some(index) = handles
-                .iter()
-                .position(|handle| handle.part == DrawingDragPart::Anchor(2))
-            else {
-                return;
-            };
-            handles[index].point = shape::midpoint(corners[2], corners[3]);
-            handles.push(DrawingHandle {
-                point: shape::midpoint(corners[0], corners[1]),
-                part: DrawingDragPart::Handle(0),
-                ..handles[index]
-            });
-        }
-        DrawingKind::Curve | DrawingKind::DoubleCurve => {
-            let Some(through) = on_curve_points(drawing.kind, px) else {
-                return;
-            };
-            for (index, point) in through.into_iter().enumerate() {
-                if let Some(handle) = handles
-                    .iter_mut()
-                    .find(|handle| handle.part == DrawingDragPart::Anchor(index + 1))
-                {
-                    handle.point = point;
-                    handle.part = DrawingDragPart::Handle(index);
-                }
-            }
-        }
-        _ => {}
+    if drawing.kind != DrawingKind::RotatedRectangle {
+        return;
     }
+    let Some(corners) = rotated_rectangle_corners(px) else {
+        return;
+    };
+    let Some(&far) = handles
+        .iter()
+        .find(|handle| handle.part == DrawingDragPart::Anchor(2))
+    else {
+        return;
+    };
+    handles.push(DrawingHandle {
+        point: shape::midpoint(corners[0], corners[1]),
+        part: DrawingDragPart::Handle(0),
+        ..far
+    });
 }
 
 /// One drag sample of a shape's derived handle (see `kinds::drag_derived_handle`): the rotated
 /// rectangle's width handle moves its edge (anchors 0 and 1) perpendicular to itself by the
-/// target's move across it, so the far side stays; a curve's on-curve handle makes the curve pass
-/// through the target with its ends fixed, re-solving the control points from the baseline's
-/// other on-curve point (control points are not time-snapped). `None` rejects a sample whose
-/// anchors cannot be placed.
+/// target's move across it, so the far side stays. `None` rejects a sample whose anchors cannot
+/// be placed.
 pub(crate) fn drag_handle(
     engine: &ChartEngine,
     drawing: &Drawing,
     sample: &HandleDrag<'_>,
     points: &mut [DrawingPoint],
 ) -> Option<Option<DrawingToolOptions>> {
-    let DrawingDragPart::Handle(handle) = sample.part else {
+    if drawing.kind != DrawingKind::RotatedRectangle
+        || sample.part != DrawingDragPart::Handle(0)
+        || points.len() != 3
+    {
         return Some(None);
-    };
-    match drawing.kind {
-        DrawingKind::RotatedRectangle if handle == 0 && points.len() == 3 => {
-            let (&a, &b) = (sample.start_px.first()?, sample.start_px.get(1)?);
-            let normal = shape::segment_normal(a, b)?;
-            let delta = (sample.target_px.0 - sample.handle_px.0) * normal.0
-                + (sample.target_px.1 - sample.handle_px.1) * normal.1;
-            let shift = |point: Point| (point.0 + normal.0 * delta, point.1 + normal.1 * delta);
-            let (moved_a, moved_b) = (
-                engine.drawing_anchor_at(drawing, shift(a))?,
-                engine.drawing_anchor_at(drawing, shift(b))?,
-            );
-            (points[0], points[1]) = (moved_a, moved_b);
-        }
-        DrawingKind::Curve | DrawingKind::DoubleCurve => {
-            let mut through = on_curve_points(drawing.kind, sample.start_px)?;
-            let last = through.len() + 1;
-            if handle >= through.len() || points.len() != last + 1 {
-                return Some(None);
-            }
-            through[handle] = sample.target_px;
-            let controls = controls_through(sample.start_px[0], sample.start_px[last], &through);
-            set_controls(engine, drawing, &controls, points)?;
-        }
-        _ => {}
     }
+    let (&a, &b) = (sample.start_px.first()?, sample.start_px.get(1)?);
+    let normal = shape::segment_normal(a, b)?;
+    let delta = (sample.target_px.0 - sample.handle_px.0) * normal.0
+        + (sample.target_px.1 - sample.handle_px.1) * normal.1;
+    let shift = |point: Point| (point.0 + normal.0 * delta, point.1 + normal.1 * delta);
+    let (moved_a, moved_b) = (
+        engine.drawing_anchor_at(drawing, shift(a))?,
+        engine.drawing_anchor_at(drawing, shift(b))?,
+    );
+    (points[0], points[1]) = (moved_a, moved_b);
     Some(None)
-}
-
-/// Store the curve control points `controls` (media px) as `points[1..]`, without time snapping.
-fn set_controls(
-    engine: &ChartEngine,
-    drawing: &Drawing,
-    controls: &[Point],
-    points: &mut [DrawingPoint],
-) -> Option<()> {
-    let converted = controls
-        .iter()
-        .map(|&(x, y)| engine.drawing_from_px_for(drawing.pane_index, drawing.price_scale, x, y))
-        .collect::<Option<Vec<_>>>()?;
-    points
-        .get_mut(1..=converted.len())?
-        .copy_from_slice(&converted);
-    Some(())
 }
 
 /// After an anchor drag sample moved `points[index]` of a shape (from the baseline anchors at
 /// media px `start_px`), re-derive what keeps the shape's on-screen construction: dragging an
 /// edge corner of a rotated rectangle re-places its depth point on the new edge's far side at
-/// the baseline width (so turning the edge, even through a zero-length one, keeps the width);
-/// dragging a curve's end re-solves its control points so the baseline on-curve points stay.
+/// the baseline width (so turning the edge, even through a zero-length one, keeps the width).
 /// Leaves `points` unchanged when the new geometry cannot be placed.
 pub(crate) fn follow_anchor_drag(
     engine: &ChartEngine,
@@ -375,70 +274,39 @@ pub(crate) fn follow_anchor_drag(
     start_px: &[Point],
     points: &mut [DrawingPoint],
 ) {
-    match drawing.kind {
-        DrawingKind::RotatedRectangle if index < 2 && points.len() == 3 => {
-            let (Some(&a), Some(&b), Some(&c)) =
-                (start_px.first(), start_px.get(1), start_px.get(2))
-            else {
-                return;
-            };
-            let Some(normal) = shape::segment_normal(a, b) else {
-                return;
-            };
-            let depth = (c.0 - a.0) * normal.0 + (c.1 - a.1) * normal.1;
-            let (Some(a), Some(b)) = (
-                engine.drawing_point_px(drawing, points[0]),
-                engine.drawing_point_px(drawing, points[1]),
-            ) else {
-                return;
-            };
-            let Some(normal) = shape::segment_normal(a, b) else {
-                return;
-            };
-            let middle = shape::midpoint(a, b);
-            if let Some(point) = engine.drawing_from_px_for(
-                drawing.pane_index,
-                drawing.price_scale,
-                middle.0 + normal.0 * depth,
-                middle.1 + normal.1 * depth,
-            ) {
-                points[2] = point;
-            }
-        }
-        DrawingKind::Curve | DrawingKind::DoubleCurve => {
-            let Some(through) = on_curve_points(drawing.kind, start_px) else {
-                return;
-            };
-            let last = through.len() + 1;
-            if (index != 0 && index != last) || points.len() != last + 1 {
-                return;
-            }
-            let Some(moved) = engine.drawing_point_px(drawing, points[index]) else {
-                return;
-            };
-            let (a, b) = if index == 0 {
-                (moved, start_px[last])
-            } else {
-                (start_px[0], moved)
-            };
-            let mut edited = points.to_vec();
-            if set_controls(
-                engine,
-                drawing,
-                &controls_through(a, b, &through),
-                &mut edited,
-            )
-            .is_some()
-            {
-                points.copy_from_slice(&edited);
-            }
-        }
-        _ => {}
+    if drawing.kind != DrawingKind::RotatedRectangle || index >= 2 || points.len() != 3 {
+        return;
+    }
+    let (Some(&a), Some(&b), Some(&c)) = (start_px.first(), start_px.get(1), start_px.get(2))
+    else {
+        return;
+    };
+    let Some(normal) = shape::segment_normal(a, b) else {
+        return;
+    };
+    let depth = (c.0 - a.0) * normal.0 + (c.1 - a.1) * normal.1;
+    let (Some(a), Some(b)) = (
+        engine.drawing_point_px(drawing, points[0]),
+        engine.drawing_point_px(drawing, points[1]),
+    ) else {
+        return;
+    };
+    let Some(normal) = shape::segment_normal(a, b) else {
+        return;
+    };
+    let middle = shape::midpoint(a, b);
+    if let Some(point) = engine.drawing_from_px_for(
+        drawing.pane_index,
+        drawing.price_scale,
+        middle.0 + normal.0 * depth,
+        middle.1 + normal.1 * depth,
+    ) {
+        points[2] = point;
     }
 }
 
-/// Whether the clicks placing a `kind` are points on its geometry rather than its stored anchors
-/// (see [`placement_anchors`]).
+/// Whether a `kind` is placed by its ends first, in an order other than the one its anchors are
+/// stored in (see [`placement_anchors`]).
 pub(crate) fn places_through(kind: DrawingKind) -> bool {
     matches!(
         kind,
@@ -446,33 +314,19 @@ pub(crate) fn places_through(kind: DrawingKind) -> bool {
     )
 }
 
-/// The anchors a completed click placement of a [`places_through`] tool stores: an arc's clicks
-/// (start, end, a point it passes through) reorder into upstream's start, through point, end; a
-/// curve's (start, end, its point at t = 1/2) and a double curve's (start, end, its points at
-/// t = 1/3 and 2/3) solve upstream's control points in the drawing's px, without time snapping.
-/// The commit and the placement preview both convert here. `None` when a click has no px.
+/// The anchors a completed click placement of a [`places_through`] tool stores, in upstream's
+/// order (start, the points the curve passes through, end): an arc's clicks (start, end, a point
+/// it passes through) and a curve's (start, end, its point at t = 1/2) become start, through
+/// point, end; a double curve's (start, end, its points at t = 1/3 and 2/3) become start, the two
+/// points, end. The commit and the placement preview both reorder here. `None` for another kind
+/// or a placement that is not complete.
 pub(crate) fn placement_anchors(
-    engine: &ChartEngine,
-    drawing: &Drawing,
+    kind: DrawingKind,
     clicks: &[DrawingPoint],
 ) -> Option<Vec<DrawingPoint>> {
-    match (drawing.kind, clicks) {
-        (DrawingKind::Arc, &[a, b, through]) => Some(vec![a, through, b]),
-        (DrawingKind::Curve, &[a, b, _]) | (DrawingKind::DoubleCurve, &[a, b, _, _]) => {
-            let px = clicks
-                .iter()
-                .map(|&point| engine.drawing_point_px(drawing, point))
-                .collect::<Option<Vec<_>>>()?;
-            let mut points = vec![a; clicks.len()];
-            set_controls(
-                engine,
-                drawing,
-                &controls_through(px[0], px[1], &px[2..]),
-                &mut points,
-            )?;
-            *points.last_mut()? = b;
-            Some(points)
-        }
+    match (kind, clicks) {
+        (DrawingKind::Arc | DrawingKind::Curve, &[a, b, through]) => Some(vec![a, through, b]),
+        (DrawingKind::DoubleCurve, &[a, b, p, q]) => Some(vec![a, p, q, b]),
         _ => None,
     }
 }

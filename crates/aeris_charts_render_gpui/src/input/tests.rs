@@ -208,6 +208,18 @@ fn assert_near(actual: (f64, f64), expected: (f64, f64)) {
     );
 }
 
+/// Every drawing anchor but anchored text lands on the bar slot under the pointer, at the raw price.
+fn on_slot(chart: &ChartEngine, (x, y): (f64, f64)) -> (f64, f64) {
+    let logical = chart.coordinate_to_logical(x).unwrap().round();
+    (chart.logical_to_coordinate(logical).unwrap(), y)
+}
+
+/// The whole bars a drawing body moves when the pointer goes from `from_x` to `to_x`.
+fn slot_shift(chart: &ChartEngine, from_x: f64, to_x: f64) -> f64 {
+    let slot = |x: f64| chart.coordinate_to_logical(x).unwrap().round();
+    (slot(to_x) - slot(from_x)) * chart.bar_spacing()
+}
+
 fn empty_pane_point(chart: &ChartEngine) -> (f64, f64) {
     (40..chart.pane_w as i32)
         .step_by(17)
@@ -450,11 +462,13 @@ fn a_wobbling_click_moves_no_drawing_or_order_and_a_drag_past_the_slop_does() {
     assert_eq!(chart.drawing_revision(), revision);
     assert_eq!(chart.selected_drawing(), Some(id), "the press is a click");
 
+    // Past the slop the body moves by whole bars horizontally and exactly vertically.
+    let dx = slot_shift(&chart, body.0, body.0 + 30.0);
     drag(&input, &mut chart, body, (body.0 + 30.0, body.1 - 20.0));
     for (index, before) in anchors.into_iter().enumerate() {
         assert_near(
             chart.drawing_point_to_coordinate(id, index).unwrap(),
-            (before.0 + 30.0, before.1 - 20.0),
+            (before.0 + dx, before.1 - 20.0),
         );
     }
     assert_eq!(chart.drawing_revision(), revision + 1);
@@ -1527,11 +1541,11 @@ fn delete_and_backspace_mid_placement_step_back_only_the_drawing_being_placed() 
     };
     assert_near(
         chart.drawing_point_to_coordinate(id, 0).unwrap(),
-        (300.0, 120.0),
+        on_slot(&chart, (300.0, 120.0)),
     );
     assert_near(
         chart.drawing_point_to_coordinate(id, 1).unwrap(),
-        (450.0, 200.0),
+        on_slot(&chart, (450.0, 200.0)),
     );
     assert!(chart.drawing(old).is_some());
 }
@@ -1559,10 +1573,10 @@ fn an_armed_trend_line_places_by_click_and_a_drag_places_nothing() {
     };
     assert_near(
         chart.drawing_point_to_coordinate(id, 0).unwrap(),
-        (150.0, 150.0),
+        on_slot(&chart, (150.0, 150.0)),
     );
     assert_near(
         chart.drawing_point_to_coordinate(id, 1).unwrap(),
-        (450.0, 300.0),
+        on_slot(&chart, (450.0, 300.0)),
     );
 }

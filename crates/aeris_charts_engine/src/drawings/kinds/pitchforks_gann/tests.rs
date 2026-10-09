@@ -229,7 +229,42 @@ fn fork_pitchfork_levels_keep_their_tines_and_band_fills() {
         );
         assert_eq!(fills, [blue, green, green, blue], "{kind:?}");
         // The median and the four tines, in the drawing's and the levels' colors.
-        assert_eq!(polylines(&mut chart, MEDIAN_COLOR).len(), 1, "{kind:?}");
+        // In the drawing's color: upstream's solid base guide between the handle anchors (B..C;
+        // the inside pitchfork's runs on to C's mirror), the dashed leg from A to a shifted
+        // median start (Schiff, inside) as solid dash runs, then the median from that start.
+        let lines = polylines(&mut chart, MEDIAN_COLOR);
+        let [a, b, c] = [0, 1, 2].map(|index| anchor(&chart, id, index));
+        let base_end = if kind == DrawingKind::InsidePitchfork {
+            (2.0 * c.0 - b.0, 2.0 * c.1 - b.1)
+        } else {
+            c
+        };
+        let base = &lines[0].0;
+        assert!(
+            base.len() == 2 && close(base[0], b, 1e-3) && close(base[1], base_end, 1e-3),
+            "{kind:?}: {lines:?}"
+        );
+        let median_start = lines.last().unwrap().0[0];
+        let leg = &lines[1..lines.len() - 1];
+        let shifted = matches!(
+            kind,
+            DrawingKind::SchiffPitchfork | DrawingKind::InsidePitchfork
+        );
+        assert_eq!(!leg.is_empty(), shifted, "{kind:?}: {lines:?}");
+        assert_eq!(
+            close(median_start, a, 1e-3),
+            !shifted,
+            "{kind:?}: {median_start:?}"
+        );
+        if shifted {
+            assert!(close(leg[0].0[0], a, 1e-3), "{kind:?}: the leg starts at A");
+            assert!(leg.iter().all(|(points, _, style)| {
+                *style == LineStyle::Solid
+                    && points
+                        .iter()
+                        .all(|&point| shape::distance_to_polyline(point, &[a, median_start]) < 1e-2)
+            }));
+        }
         assert_eq!(polylines(&mut chart, "#089981").len(), 2, "{kind:?}");
         assert_eq!(polylines(&mut chart, "#2962ff").len(), 2, "{kind:?}");
     }
@@ -276,14 +311,20 @@ fn armed_tools_place_every_kind_with_a_guide_between_clicks() {
         for (index, &(x, y)) in clicks.iter().enumerate() {
             if index == 1 && clicks.len() == 3 {
                 // Between the first and second click of a three-anchor tool the placed anchor
-                // and the preview join in a guide in the drawing's stroke.
+                // and the preview join in a guide in the drawing's stroke; both ends sit on the
+                // bar slots under the pointer, at the raw prices.
                 chart.drawing_tool_pointer_move(x, y, DrawingModifiers::default(), false);
+                let slot = |(x, y): (f64, f64)| {
+                    let logical = chart.coordinate_to_logical(x).unwrap().round();
+                    (chart.logical_to_coordinate(logical).unwrap(), y)
+                };
+                let (from, to) = (slot(clicks[0]), slot((x, y)));
                 let guide = polylines(&mut chart, INK);
                 assert!(
                     guide.iter().any(|(points, ..)| points.len() == 2
-                        && close(points[0], clicks[0], 1e-3)
-                        && close(points[1], (x, y), 1e-3)),
-                    "{kind:?} guide: {guide:?}"
+                        && close(points[0], from, 1e-3)
+                        && close(points[1], to, 1e-3)),
+                    "{kind:?} guide {from:?}..{to:?}: {guide:?}"
                 );
             }
             created = chart
@@ -1220,13 +1261,21 @@ fn a_pitchfork_base_midpoint_handle_moves_both_handle_anchors() {
             (DrawingDragPart::Handle(0), "pointer"),
             "{kind:?}"
         );
-        // A pointer drag translates B and C by the midpoint's move, as one undo step.
+        // A pointer drag translates B and C by the midpoint's move in whole bars (13 px lands
+        // on the next 20 px slot) and by the raw vertical delta, as one undo step.
+        assert_eq!(chart.bar_spacing(), 20.0);
         assert!(chart.drawing_drag_start_at(base.0, base.1));
-        chart.drawing_drag_to(base.0 + 20.0, base.1 - 12.0, DrawingModifiers::default());
+        chart.drawing_drag_to(base.0 + 13.0, base.1 - 12.0, DrawingModifiers::default());
         chart.drawing_drag_end();
         assert!(close(anchor(&chart, id, 0), a, 1e-9), "{kind:?}");
         assert!(close(anchor(&chart, id, 1), (b.0 + 20.0, b.1 - 12.0), 1e-3));
         assert!(close(anchor(&chart, id, 2), (c.0 + 20.0, c.1 - 12.0), 1e-3));
+        let after = chart.drawing(id).unwrap().points.clone();
+        assert_eq!(
+            (after[1].logical, after[2].logical),
+            (before[1].logical + 1.0, before[2].logical + 1.0),
+            "{kind:?}"
+        );
         assert!(chart.undo_drawing());
         assert_eq!(chart.drawing(id).unwrap().points, before);
         // Keyboard: the fourth handle nudges the base the same way.

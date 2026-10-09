@@ -1605,9 +1605,10 @@ impl ChartEngine {
     /// - Separator: Home splits the two adjacent panes evenly; ArrowUp/ArrowDown move the divider
     ///   10 px.
     /// - Drawing: the target is selected. Enter opens or commits an edit; while editing, arrows
-    ///   nudge 1 px (10 px with Shift), Tab/Shift+Tab cycle the anchor, and Escape restores the
-    ///   start. A committed edit is one undo entry. Delete/Backspace remove the drawing, and F2
-    ///   opens the inline text editor of a drawing that paints text.
+    ///   nudge one bar horizontally and 1 px vertically (ten of either with Shift; a rotated
+    ///   rectangle's width handle moves 1 px horizontally too), Tab/Shift+Tab cycle the anchor,
+    ///   and Escape restores the start. A committed edit is one undo entry. Delete/Backspace
+    ///   remove the drawing, and F2 opens the inline text editor of a drawing that paints text.
     pub fn input_target_key_down(
         &mut self,
         target: ChartFocusTarget,
@@ -1827,6 +1828,8 @@ impl ChartEngine {
                 if editing =>
             {
                 let step = if modifiers.shift { 10.0 } else { 1.0 };
+                // Horizontal steps are key steps the nudge turns into bars (drawings move bar by
+                // bar); vertical steps are px.
                 let (dx, dy) = match key {
                     ChartKey::ArrowLeft => (-step, 0.0),
                     ChartKey::ArrowRight => (step, 0.0),
@@ -1838,7 +1841,7 @@ impl ChartEngine {
                     .drawing_edit
                     .as_ref()
                     .and_then(|session| session.anchor);
-                self.nudge_selected_drawing_with_history(dx, dy, anchor, false)
+                self.nudge_selected_drawing_with_history(dx, dy, anchor, true, false)
             }
             _ => false,
         }

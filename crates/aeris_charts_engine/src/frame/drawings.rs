@@ -25,8 +25,9 @@ use crate::drawings::{
     Drawing, DrawingBodyGeometry, DrawingGeometryOptions, DrawingHandleMode, DrawingId,
     DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign, DrawingTextLayout,
     FibonacciArcGeometry, PartContext, PositionGeometry, PositionZone, TEXT_CHROME_PAD, TEXT_PAD,
-    TREND_TEXT_PLACEHOLDER, TextBlock, TimeLevelGeometry, arrow_cap_triangle, cap_radius,
-    closed_outline, curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry,
+    TREND_TEXT_PLACEHOLDER, TextBlock, TimeLevelGeometry, arc_segments, arrow_cap_triangle,
+    cap_radius, closed_outline, curve_clip, ellipse_outline, gann_arc_segments, level_band_pairs,
+    resolve_drawing_geometry,
 };
 use crate::{ChartEngine, FibonacciLabelVAlign};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
@@ -139,6 +140,33 @@ fn push_ribbon(
         line_type: LineType::Simple,
         fill,
     });
+}
+
+/// A crisp dashed axis-aligned outline through two opposite corners.
+fn push_dashed_outline(a: (f64, f64), b: (f64, f64), color: Color, vpr: f64, out: &mut Vec<Prim>) {
+    let width = vpr.round().max(1.0) as i32;
+    let (left, right) = (a.0.min(b.0).round() as i32, a.0.max(b.0).round() as i32);
+    let (top, bottom) = (a.1.min(b.1).round() as i32, a.1.max(b.1).round() as i32);
+    for y in [top, bottom] {
+        out.push(Prim::HLine {
+            y,
+            x0: left,
+            x1: right,
+            width,
+            style: LineStyle::Dashed,
+            color,
+        });
+    }
+    for x in [left, right] {
+        out.push(Prim::VLine {
+            x,
+            y0: top,
+            y1: bottom,
+            width,
+            style: LineStyle::Dashed,
+            color,
+        });
+    }
 }
 
 fn push_drawing_cap(
@@ -720,15 +748,13 @@ impl ChartEngine {
                 // commit will store it.
                 let mut preview_drawing = pending.drawing.clone();
                 preview_drawing.points.clone_from(&anchors);
-                // A tool placed through points on its geometry previews the anchors its
-                // clicks will store (an arc ends first, a curve through its on-curve
-                // points); its handles stay on the placed clicks.
+                // A tool placed ends first (an arc, a curve) previews the anchors its clicks
+                // will store, in stored order (start, the points on the curve, end); its
+                // handles stay on the placed clicks.
                 let through = shapes::places_through(kind) && anchors.len() == kind.anchor_count();
                 if through {
-                    // A click without px previews nothing (the commit refuses it too).
                     preview_drawing.points =
-                        shapes::placement_anchors(self, &preview_drawing, &anchors)
-                            .unwrap_or_default();
+                        shapes::placement_anchors(kind, &anchors).unwrap_or_default();
                 }
                 if preview_drawing.kind == DrawingKind::AnchoredText {
                     // Anchored text paints at its screen position, which follows the
@@ -760,8 +786,8 @@ impl ChartEngine {
                         let handles = handle_set(DrawingHandleMode::RectangleBounds, &px);
                         build_handles(&handles, vpr, self.anchor_fill(), out);
                     } else if through {
-                        // Discs on the clicks placed so far, not on the stored anchors
-                        // (control points off the curve).
+                        // Discs on the clicks placed so far, which the stored anchors reorder
+                        // (ends first) until the last click.
                         let placed = pending
                             .drawing
                             .points
@@ -808,7 +834,11 @@ impl ChartEngine {
                     })
                     .collect();
                 if let (Some(px), Some(pane)) = (px, self.panes.get(pane_index)) {
-                    if px.len() >= 2 {
+                    if px.len() >= 2 && pending.drawing.kind == DrawingKind::BarsPattern {
+                        // The bars pattern's first two anchors bound its source window, which
+                        // shows as the dashed outline the selection uses.
+                        push_dashed_outline(px[0], px[1], pending.drawing.stroke_color(), vpr, out);
+                    } else if px.len() >= 2 {
                         let clip = aeris_charts_render::shape::Rect {
                             left: 0.0,
                             top: pane.top * vpr,
@@ -844,8 +874,9 @@ impl ChartEngine {
         }
     }
 
-    /// The selected/hovered drawing's converted bitmap-px anchor points, or `None` when the
-    /// id is stale, on another pane, or off-screen.
+    /// The selected/hovered drawing's converted bitmap-px anchor points (never its derived render
+    /// points, such as a regression's fitted band, which are no handles), or `None` when the id is
+    /// stale, on another pane, or off-screen.
     fn overlay_drawing_px(
         &self,
         pane_index: usize,
@@ -904,6 +935,21 @@ impl ChartEngine {
         let Some(px) = self.overlay_drawing_px(pane_index, id, 1.0, 1.0) else {
             return;
         };
+        if drawing.kind == DrawingKind::BarsPattern
+            && !drawing.bars_pattern.is_empty()
+            && px.len() >= 2
+        {
+            // The copied bars paint at the target; the source window the two range handles
+            // edit only exists as this selection outline, so the handles sit on its corners.
+            let corner = |(x, y): (f64, f64)| (x * hpr, y * vpr);
+            push_dashed_outline(
+                corner(px[0]),
+                corner(px[1]),
+                drawing.stroke_color(),
+                vpr,
+                out,
+            );
+        }
         let mut handles = self.drawing_handle_set(drawing, &px);
         for handle in &mut handles {
             handle.point = (handle.point.0 * hpr, handle.point.1 * vpr);
@@ -1004,6 +1050,20 @@ impl ChartEngine {
         ) else {
             return;
         };
+        // Upstream's construction guides paint under the body (a pitchfork's base, the trend
+        // legs of a Fibonacci extension or trend-based time without a stored block), one leg at
+        // a time through the stroke path, so each dashed leg starts drawn at its own anchor.
+        if fibonacci::draws_guides(drawing) {
+            for guide in geometry.guides.into_iter().flatten() {
+                let style = if guide.dashed {
+                    LineStyle::Dashed
+                } else {
+                    drawing.style
+                };
+                let leg = ((stroke.0.0, style, color), stroke.1);
+                push_segment(guide.a, guide.b, leg, out, points);
+            }
+        }
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
                 if let Some(context) = self
@@ -1025,6 +1085,17 @@ impl ChartEngine {
                     }
                     push_drawing_cap(drawing.stroke_start, a, b, drawing.width * vpr, color, out);
                     push_drawing_cap(drawing.stroke_end, b, a, drawing.width * vpr, color, out);
+                    // Without a `line` block the trend angle and the info line keep upstream's
+                    // dotted reference and arc, and statistics card.
+                    match drawing.kind {
+                        DrawingKind::TrendAngle => {
+                            self.build_trend_angle_prims(drawing, px, color, vpr, out, points);
+                        }
+                        DrawingKind::InfoLine => {
+                            self.build_info_line_prims(drawing, px, pane_w_px, vpr, out, points);
+                        }
+                        _ => {}
+                    }
                 }
             }
             DrawingBodyGeometry::Horizontal { y, x0, x1 } => {
@@ -1337,9 +1408,9 @@ impl ChartEngine {
                         push_segment(px[0], side, stroke, out, points);
                     }
                 }
-                let segments = arcs.segments();
+                let segments = arcs.segments(fibonacci::largest_level(drawing));
                 // The fork's precise rings: every ring and band over the part the pane shows,
-                // within a quarter pixel (`geometry::Rings`); upstream's fixed chords otherwise.
+                // within a tenth of a pixel (`geometry::Rings`); upstream's whole rings otherwise.
                 let precise = fibonacci::precise_rings(drawing);
                 let rings = precise
                     .then(|| {
@@ -1586,42 +1657,39 @@ impl ChartEngine {
                 });
             }
             DrawingBodyGeometry::PriceLabel { x, y } => {
-                let label = if drawing.text.is_empty() {
-                    self.format_drawing_price(drawing, drawing.points[0].price)
-                } else {
-                    drawing.text.clone()
-                };
-                let layout = &self.options.get().layout;
-                let size = drawing.resolved_text_size(layout.font_size) * vpr;
-                let width = self.measure_text_run(
-                    &label,
-                    size,
-                    &layout.font_family,
-                    drawing.text_weight.unwrap_or(400),
-                    drawing.text_italic,
-                );
-                let padding = 4.0 * vpr;
-                out.push(Prim::Rect {
-                    rect: IRect {
-                        x: (x - width - 2.0 * padding).round() as i32,
-                        y: (y - size * 0.6 - padding).round() as i32,
-                        w: (width + 2.0 * padding).round().max(1.0) as i32,
-                        h: (size * 1.2 + 2.0 * padding).round().max(1.0) as i32,
-                    },
+                let label = self.price_label_layout(drawing, (x, y), vpr);
+                let [left, top, width, height] = label.rect;
+                let bottom = top + height;
+                let radius = (3.0 * vpr).round().max(1.0) as f32;
+                out.push(Prim::RoundRect {
+                    x: left as f32,
+                    y: top as f32,
+                    w: width as f32,
+                    h: height as f32,
+                    radii: [radius, radius, radius, 0.0],
+                    fill: color,
+                    border_width: 0.0,
+                    border_color: color,
+                });
+                out.push(Prim::Triangle {
+                    a: [x as f32, y as f32],
+                    b: [left as f32, bottom as f32],
+                    c: [(left + label.tail * 1.5) as f32, bottom as f32],
                     color,
                 });
+                let layout = &self.options.get().layout;
                 out.push(Prim::Text {
-                    x: (x - padding) as f32,
-                    y: y as f32,
-                    text: label,
+                    x: (left + label.padding) as f32,
+                    y: (top + height / 2.0) as f32,
+                    text: label.text,
                     color: drawing
                         .text_color
                         .as_deref()
                         .and_then(Color::parse_css)
-                        .unwrap_or(Color::rgb(255, 255, 255)),
-                    size: size as f32,
+                        .unwrap_or_else(|| color.contrast_text()),
+                    size: label.size as f32,
                     family: layout.font_family.clone(),
-                    align: TextAlign::Right,
+                    align: TextAlign::Left,
                     weight: drawing.text_weight.unwrap_or(400),
                     italic: drawing.text_italic,
                 });
@@ -1713,25 +1781,26 @@ impl ChartEngine {
                         }
                         prior_fan = Some(end);
                     }
+                    let gann_segments = gann_arc_segments(grid, drawing);
                     let mut prior_arc: Option<f64> = None;
                     for level in drawing.gann_arcs.iter().filter(|level| level.visible) {
                         if level.fill_between
                             && let Some(previous) = prior_arc
                         {
                             let upper_first = points.len() as u32;
-                            for step in 0..=32 {
+                            for step in 0..=gann_segments {
                                 let p = grid.arc_point(
                                     previous,
-                                    f64::from(step) / 32.0,
+                                    f64::from(step) / f64::from(gann_segments),
                                     drawing.level_reverse,
                                 );
                                 points.push([p.0 as f32, p.1 as f32]);
                             }
                             let lower_first = points.len() as u32;
-                            for step in 0..=32 {
+                            for step in 0..=gann_segments {
                                 let p = grid.arc_point(
                                     level.value,
-                                    f64::from(step) / 32.0,
+                                    f64::from(step) / f64::from(gann_segments),
                                     drawing.level_reverse,
                                 );
                                 points.push([p.0 as f32, p.1 as f32]);
@@ -1739,7 +1808,7 @@ impl ChartEngine {
                             out.push(Prim::BandFill {
                                 upper_first,
                                 lower_first,
-                                point_count: 33,
+                                point_count: gann_segments + 1,
                                 line_type: LineType::Simple,
                                 fill: Self::drawing_level_fill(level, color),
                             });
@@ -1874,20 +1943,21 @@ impl ChartEngine {
                     });
                 }
                 if grid.kind != DrawingKind::GannBox {
+                    let gann_segments = gann_arc_segments(grid, drawing);
                     for level in drawing.gann_arcs.iter().filter(|level| level.visible) {
                         let level_color = Color::parse_css(&level.color).unwrap_or(color);
                         let first_point = points.len() as u32;
-                        for step in 0..=32 {
+                        for step in 0..=gann_segments {
                             let point = grid.arc_point(
                                 level.value,
-                                f64::from(step) / 32.0,
+                                f64::from(step) / f64::from(gann_segments),
                                 drawing.level_reverse,
                             );
                             points.push([point.0 as f32, point.1 as f32]);
                         }
                         out.push(Prim::Polyline {
                             first_point,
-                            point_count: 33,
+                            point_count: gann_segments + 1,
                             width: (drawing.width * vpr) as f32,
                             style: Self::drawing_level_style(&level.style),
                             line_type: LineType::Simple,
@@ -3432,6 +3502,7 @@ impl ChartEngine {
         let Some(anchor) = px.first().copied() else {
             return;
         };
+        // These kinds lay their metric labels out with their geometry (build_drawing_prims).
         if drawing.labels.is_empty()
             || drawing
                 .kind
@@ -3440,6 +3511,10 @@ impl ChartEngine {
                 .is_some_and(|family| family.owns_labels)
             || lines::fork_presentation(drawing)
             || projection_annotations::draws_sector(drawing)
+            || matches!(
+                drawing.kind,
+                DrawingKind::TrendAngle | DrawingKind::InfoLine
+            )
         {
             return;
         }
@@ -3545,11 +3620,308 @@ impl ChartEngine {
         }
     }
 
+    /// The visible label of `metric`: `Some(custom text)` when shown, `None` when hidden/absent.
+    fn visible_label(
+        drawing: &Drawing,
+        metric: crate::DrawingLabelMetric,
+    ) -> Option<Option<String>> {
+        drawing
+            .labels
+            .iter()
+            .find(|label| label.metric == metric && label.visible)
+            .map(|label| label.text.clone())
+    }
+
+    /// Trend Angle without a `line` block: a dotted horizontal reference from the first anchor,
+    /// a dotted arc sweeping from it to the line, and the signed angle (counter-clockwise
+    /// positive, as on a y-up chart; the shared metric text) beside the reference's end.
+    fn build_trend_angle_prims(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        color: Color,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
+    ) {
+        let (Some(&start), Some(&end)) = (px.first(), px.get(1)) else {
+            return;
+        };
+        let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+        if dx.hypot(dy) <= f64::EPSILON {
+            return;
+        }
+        let radius = lines::TREND_ANGLE_RADIUS_CSS * vpr;
+        let width = vpr.round().max(1.0) as f32;
+        let sweep = dy.atan2(dx);
+        let first_point = points.len() as u32;
+        points.extend([
+            [start.0 as f32, start.1 as f32],
+            [(start.0 + radius) as f32, start.1 as f32],
+        ]);
+        out.push(Prim::Polyline {
+            first_point,
+            point_count: 2,
+            width,
+            style: LineStyle::Dotted,
+            line_type: LineType::Simple,
+            color,
+        });
+        let steps = arc_segments(radius, sweep);
+        let first_point = points.len() as u32;
+        for step in 0..=steps {
+            let angle = sweep * f64::from(step) / f64::from(steps);
+            points.push([
+                (start.0 + radius * angle.cos()) as f32,
+                (start.1 + radius * angle.sin()) as f32,
+            ]);
+        }
+        out.push(Prim::Polyline {
+            first_point,
+            point_count: steps + 1,
+            width,
+            style: LineStyle::Dotted,
+            line_type: LineType::Simple,
+            color,
+        });
+        let Some(text) =
+            Self::visible_label(drawing, crate::DrawingLabelMetric::Angle).and_then(|custom| {
+                custom.or_else(|| {
+                    self.drawing_metric_text(drawing, crate::DrawingLabelMetric::Angle, 0, 1)
+                })
+            })
+        else {
+            return;
+        };
+        let layout = &self.options.get().layout;
+        out.push(Prim::Text {
+            x: (start.0 + radius + lines::TREND_ANGLE_LABEL_GAP_CSS * vpr) as f32,
+            y: start.1 as f32,
+            text,
+            color,
+            size: (self.drawing_stats_size() * vpr) as f32,
+            family: layout.font_family.clone(),
+            align: TextAlign::Left,
+            weight: drawing.text_weight.unwrap_or(400),
+            italic: drawing.text_italic,
+        });
+    }
+
+    /// The Info Line's statistics card rows, each listing only its visible metrics in the shared
+    /// metric text (`ChartEngine::drawing_metric_text`): price change (percent), ticks; bars
+    /// (elapsed), pixel distance; angle. A label's own `text` replaces its metric value; a
+    /// missing percent or tick count prints "—" and an elapsed time without time data is
+    /// omitted. A visible `DateTimeRange` label stands in for a hidden `Duration` one.
+    fn info_line_rows(&self, drawing: &Drawing) -> Vec<(InfoLineIcon, String)> {
+        use crate::DrawingLabelMetric as Metric;
+        let metric = |metric| self.drawing_metric_text(drawing, metric, 0, 1);
+        let mut rows = Vec::with_capacity(3);
+
+        let mut price = String::new();
+        if let Some(custom) = Self::visible_label(drawing, Metric::PriceChange) {
+            price = custom
+                .or_else(|| metric(Metric::PriceChange))
+                .unwrap_or_default();
+        }
+        if let Some(custom) = Self::visible_label(drawing, Metric::PercentChange) {
+            let percent = custom
+                .or_else(|| metric(Metric::PercentChange))
+                .unwrap_or_else(|| "—".to_string());
+            price = if price.is_empty() {
+                percent
+            } else {
+                format!("{price} ({percent})")
+            };
+        }
+        if let Some(custom) = Self::visible_label(drawing, Metric::Ticks) {
+            let ticks = custom
+                .or_else(|| metric(Metric::Ticks))
+                .unwrap_or_else(|| "—".to_string());
+            price = if price.is_empty() {
+                ticks
+            } else {
+                format!("{price}, {ticks}")
+            };
+        }
+        if !price.is_empty() {
+            rows.push((InfoLineIcon::Price, price));
+        }
+
+        let mut time = String::new();
+        if let Some(custom) = Self::visible_label(drawing, Metric::BarCount) {
+            time = custom
+                .or_else(|| metric(Metric::BarCount))
+                .unwrap_or_default();
+        }
+        let duration = Self::visible_label(drawing, Metric::Duration)
+            .or_else(|| Self::visible_label(drawing, Metric::DateTimeRange));
+        if let Some(custom) = duration
+            && let Some(elapsed) = custom.or_else(|| metric(Metric::Duration))
+        {
+            time = if time.is_empty() {
+                elapsed
+            } else {
+                format!("{time} ({elapsed})")
+            };
+        }
+        if let Some(custom) = Self::visible_label(drawing, Metric::Distance)
+            && let Some(distance) =
+                custom.or_else(|| metric(Metric::Distance).map(|text| format!("distance: {text}")))
+        {
+            time = if time.is_empty() {
+                distance
+            } else {
+                format!("{time}, {distance}")
+            };
+        }
+        if !time.is_empty() {
+            rows.push((InfoLineIcon::Time, time));
+        }
+
+        if let Some(custom) = Self::visible_label(drawing, Metric::Angle)
+            && let Some(angle) = custom.or_else(|| metric(Metric::Angle))
+        {
+            rows.push((InfoLineIcon::Angle, angle));
+        }
+        rows
+    }
+
+    /// The Info Line's statistics card without a `line` block: a rounded panel beside the
+    /// segment's midpoint, on the side the line leaves free (above-right of a falling line,
+    /// below-right of a rising one), kept inside the pane.
+    fn build_info_line_prims(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w_px: i32,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
+    ) {
+        let (Some(&a), Some(&b)) = (px.first(), px.get(1)) else {
+            return;
+        };
+        let Some(pane) = self.panes.get(drawing.pane_index) else {
+            return;
+        };
+        let rows = self.info_line_rows(drawing);
+        if rows.is_empty() {
+            return;
+        }
+        let layout = &self.options.get().layout;
+        let card = InfoLineCard::for_theme(self.surface_theme());
+        let size = INFO_LINE_FONT_CSS * vpr;
+        let line_height = INFO_LINE_LINE_HEIGHT_CSS * vpr;
+        let row_gap = INFO_LINE_ROW_GAP_CSS * vpr;
+        let pad_x = INFO_LINE_PAD_X_CSS * vpr;
+        let (pad_top, pad_bottom) = (INFO_LINE_PAD_TOP_CSS * vpr, INFO_LINE_PAD_BOTTOM_CSS * vpr);
+        let icon = INFO_LINE_ICON_CSS * vpr;
+        let text_inset = pad_x + icon + INFO_LINE_ICON_GAP_CSS * vpr;
+        let text_width = rows
+            .iter()
+            .map(|(_, text)| self.measure_text_run(text, size, &layout.font_family, 400, false))
+            .fold(0.0_f64, f64::max);
+        let width = (text_inset + text_width + pad_x).round();
+        let height = (pad_top
+            + rows.len() as f64 * line_height
+            + (rows.len() - 1) as f64 * row_gap
+            + pad_bottom)
+            .round();
+        let mid = point_on_segment(a, b, 0.5);
+        let gap_x = 12.0 * vpr;
+        let gap_y = 16.0 * vpr;
+        let pane_top = pane.top * vpr;
+        let pane_bottom = (pane.top + pane.height) * vpr;
+        let left = (mid.0 + gap_x)
+            .min(f64::from(pane_w_px) - width)
+            .max(0.0)
+            .round();
+        let top = if (b.0 - a.0) * (b.1 - a.1) >= 0.0 {
+            mid.1 - gap_y - height
+        } else {
+            mid.1 + gap_y
+        }
+        .min(pane_bottom - height)
+        .max(pane_top)
+        .round();
+        out.push(Prim::RoundRect {
+            x: left as f32,
+            y: top as f32,
+            w: width as f32,
+            h: height as f32,
+            radii: [(aeris_charts_core::style::RADIUS_DEFAULT * vpr).round() as f32; 4],
+            fill: card.surface,
+            border_width: aeris_charts_core::style::border_width_device_px(vpr) as f32,
+            border_color: card.border,
+        });
+        for (index, (kind, text)) in rows.into_iter().enumerate() {
+            let center_y =
+                top + pad_top + (line_height + row_gap) * index as f64 + line_height / 2.0;
+            push_info_line_icon(
+                kind,
+                (left + pad_x + icon / 2.0, center_y),
+                card.muted,
+                vpr,
+                out,
+                points,
+            );
+            out.push(Prim::Text {
+                x: (left + text_inset) as f32,
+                y: center_y as f32,
+                text,
+                color: card.foreground,
+                size: size as f32,
+                family: layout.font_family.clone(),
+                align: TextAlign::Left,
+                weight: 400,
+                italic: false,
+            });
+        }
+    }
+
     /// A price-valued drawing text in the bound scale's price format through
     /// [`ChartEngine::format_scale_price`]: the one owner for every price a drawing prints
     /// (level and price labels, metrics, stats boxes, positions, ranges, Fibonacci, Gann).
     pub(crate) fn format_drawing_price(&self, drawing: &Drawing, value: f64) -> String {
         self.format_scale_price(drawing.pane_index, drawing.price_scale.target(), value)
+    }
+
+    /// The price label's bubble in the anchor's px basis (`scale` is the bitmap/media ratio;
+    /// 1.0 at hit-test). The bubble rises above-right of the anchor and its tail's tip touches
+    /// the anchor, so the label and its handle are one attached shape.
+    pub(crate) fn price_label_layout(
+        &self,
+        drawing: &Drawing,
+        anchor: (f64, f64),
+        scale: f64,
+    ) -> PriceLabelLayout {
+        let text = if drawing.text.is_empty() {
+            self.format_drawing_price(drawing, drawing.points[0].price)
+        } else {
+            drawing.text.clone()
+        };
+        let layout = &self.options.get().layout;
+        let size = drawing.resolved_text_size(layout.font_size) * scale;
+        let text_width = self.measure_text_run(
+            &text,
+            size,
+            &layout.font_family,
+            drawing.text_weight.unwrap_or(400),
+            drawing.text_italic,
+        );
+        let (padding, tail, height) = projection_annotations::price_label_bubble(size, scale);
+        PriceLabelLayout {
+            rect: [
+                anchor.0,
+                anchor.1 - tail - height,
+                text_width + 2.0 * padding,
+                height,
+            ],
+            text,
+            size,
+            padding,
+            tail,
+        }
     }
 
     fn build_position_labels(
@@ -4024,8 +4396,10 @@ impl ChartEngine {
             .unwrap_or(Color::rgb(8, 153, 129));
         let risk = Color::parse_css(aeris_charts_core::style::MARKET_DOWN_CSS)
             .unwrap_or(Color::rgb(247, 82, 95));
+        // Statistic labels belong to the active position only; idle positions show their zones.
         for drawing in self.drawings.iter().filter(|drawing| {
-            drawing.pane_index == pane_index
+            self.selected_drawing == Some(drawing.id)
+                && drawing.pane_index == pane_index
                 && drawing.visible
                 && drawing.interval_visibility.allows(self.drawing_interval)
                 && matches!(
@@ -4119,13 +4493,157 @@ impl ChartEngine {
     /// The anchor-handle fill for the current theme (white on light backgrounds, black on dark —
     /// the series selection anchors' luminance rule, series_geometry.rs).
     fn anchor_fill(&self) -> Color {
+        match self.surface_theme() {
+            crate::ChartTheme::Light => Color::rgb(0xff, 0xff, 0xff),
+            crate::ChartTheme::Dark => Color::rgb(0, 0, 0),
+        }
+    }
+
+    /// The token theme matching the painted chart background, so in-chart chrome follows the
+    /// surface hosts actually show even when they restyle `layout` without `set_theme`.
+    fn surface_theme(&self) -> crate::ChartTheme {
         let fallback = aeris_charts_core::style::DEFAULT_SURFACE_RGB;
         let background = Color::parse_css(&self.options.get().layout.background.color)
             .unwrap_or(Color::rgb(fallback.0, fallback.1, fallback.2));
         if background.luminance() > 160.0 {
-            Color::rgb(0xff, 0xff, 0xff)
+            crate::ChartTheme::Light
         } else {
-            Color::rgb(0, 0, 0)
+            crate::ChartTheme::Dark
+        }
+    }
+}
+
+/// `ChartEngine::price_label_layout`: bubble `[left, top, width, height]`, label text and
+/// glyph size, the text inset, and the tail height below the bubble.
+pub(crate) struct PriceLabelLayout {
+    pub(crate) rect: [f64; 4],
+    pub(crate) text: String,
+    pub(crate) size: f64,
+    pub(crate) padding: f64,
+    pub(crate) tail: f64,
+}
+
+/// Info Line card metrics in CSS px, following the package's `.aeris_charts-tooltip` panel
+/// (12/16 px type, 10 px side and 6/7 px vertical padding, 12 px column gap). Rows get a little
+/// more spacing than the tooltip's 2 px so the 14 px icons do not touch.
+const INFO_LINE_FONT_CSS: f64 = 12.0;
+const INFO_LINE_LINE_HEIGHT_CSS: f64 = 16.0;
+const INFO_LINE_ROW_GAP_CSS: f64 = 4.0;
+const INFO_LINE_PAD_X_CSS: f64 = 10.0;
+const INFO_LINE_PAD_TOP_CSS: f64 = 6.0;
+const INFO_LINE_PAD_BOTTOM_CSS: f64 = 7.0;
+const INFO_LINE_ICON_CSS: f64 = 16.0;
+const INFO_LINE_ICON_GAP_CSS: f64 = 12.0;
+
+/// The Info Line card's theme colors: the tooltip panel's `--surface` fill, `--border` outline,
+/// `--text-primary` values, and `--text-secondary` (muted) icons.
+struct InfoLineCard {
+    surface: Color,
+    border: Color,
+    foreground: Color,
+    muted: Color,
+}
+
+impl InfoLineCard {
+    fn for_theme(theme: crate::ChartTheme) -> Self {
+        use aeris_charts_core::style::*;
+        let (surface, border, foreground, muted) = match theme {
+            crate::ChartTheme::Light => (
+                LIGHT_SURFACE_RGB,
+                LIGHT_BORDER_RGB,
+                LIGHT_FOREGROUND_RGB,
+                LIGHT_MUTED_FOREGROUND_RGB,
+            ),
+            crate::ChartTheme::Dark => (
+                DARK_SURFACE_RGB,
+                DARK_BORDER_RGB,
+                DARK_FOREGROUND_RGB,
+                DARK_MUTED_FOREGROUND_RGB,
+            ),
+        };
+        let rgb = |(r, g, b): (u8, u8, u8)| Color::rgb(r, g, b);
+        Self {
+            surface: rgb(surface),
+            border: rgb(border),
+            foreground: rgb(foreground),
+            muted: rgb(muted),
+        }
+    }
+}
+
+/// The glyph leading each Info Line card row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InfoLineIcon {
+    /// Price range: a double arrow between two horizontal bars.
+    Price,
+    /// Time range: a double arrow between two candles.
+    Time,
+    /// Angle: a ray rising from a baseline with its arc.
+    Angle,
+}
+
+/// Strokes `kind`'s glyph centered at `center`, drawn on a 16 CSS px grid.
+fn push_info_line_icon(
+    kind: InfoLineIcon,
+    center: (f64, f64),
+    color: Color,
+    vpr: f64,
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+) {
+    let (cx, cy) = center;
+    let at = |x: f64, y: f64| [(cx + x * vpr) as f32, (cy + y * vpr) as f32];
+    let mut stroke = |path: &[[f32; 2]]| {
+        let first_point = points.len() as u32;
+        points.extend_from_slice(path);
+        out.push(Prim::Polyline {
+            first_point,
+            point_count: path.len() as u32,
+            width: vpr.round().max(1.0) as f32,
+            style: LineStyle::Solid,
+            line_type: LineType::Simple,
+            color,
+        });
+    };
+    match kind {
+        InfoLineIcon::Price => {
+            stroke(&[at(-5.0, -7.0), at(5.0, -7.0)]);
+            stroke(&[at(-5.0, 7.0), at(5.0, 7.0)]);
+            stroke(&[at(0.0, -5.0), at(0.0, 5.0)]);
+            stroke(&[at(-3.0, -2.0), at(0.0, -5.0), at(3.0, -2.0)]);
+            stroke(&[at(-3.0, 2.0), at(0.0, 5.0), at(3.0, 2.0)]);
+        }
+        InfoLineIcon::Time => {
+            for side in [-1.0, 1.0] {
+                let x = 7.0 * side;
+                stroke(&[at(x, -7.0), at(x, -3.0)]);
+                stroke(&[at(x, 3.0), at(x, 7.0)]);
+                stroke(&[
+                    at(x - 1.5, -3.0),
+                    at(x + 1.5, -3.0),
+                    at(x + 1.5, 3.0),
+                    at(x - 1.5, 3.0),
+                    at(x - 1.5, -3.0),
+                ]);
+                stroke(&[
+                    at(-1.5 * side, -2.0),
+                    at(-3.5 * side, 0.0),
+                    at(-1.5 * side, 2.0),
+                ]);
+            }
+            stroke(&[at(-3.5, 0.0), at(3.5, 0.0)]);
+        }
+        InfoLineIcon::Angle => {
+            stroke(&[at(-7.0, 6.0), at(7.0, 6.0)]);
+            stroke(&[at(-7.0, 6.0), at(2.0, -7.0)]);
+            let ray = (-13.0_f64).atan2(9.0);
+            let arc: Vec<[f32; 2]> = (0..=8)
+                .map(|step| {
+                    let angle = ray * f64::from(step) / 8.0;
+                    at(-7.0 + 8.0 * angle.cos(), 6.0 + 8.0 * angle.sin())
+                })
+                .collect();
+            stroke(&arc);
         }
     }
 }

@@ -321,9 +321,11 @@ fn chart_magnet_modes_snap_without_a_modifier_and_ctrl_toggles_them() {
 
     chart.set_drawing_magnet_mode(DrawingMagnetMode::Weak);
     assert_eq!(first_placed(&mut chart, x, near, NO_KEYS), point(2.0, 12.0));
+    // Free of the magnet, the anchor still lands on the bar slot under the pointer (bar 2), at
+    // the raw price.
     let free = first_placed(&mut chart, x, far, NO_KEYS);
     assert!(
-        (free.price - 12.5).abs() < 0.05 && free.logical != 2.0,
+        (free.price - 12.5).abs() < 0.05 && free.logical == 2.0,
         "weak leaves a pointer beyond the capture distance free: {free:?}"
     );
 }
@@ -488,16 +490,18 @@ fn keyboard_nudge_moves_rectangle_and_position_handles_by_the_delta() {
     chart.set_selected_drawing(Some(rectangle));
     assert_eq!(chart.drawing_handle_count(rectangle), Some(8));
     let (top_left, bottom_right) = (px(&chart, rectangle, 1), px(&chart, rectangle, 0));
-    // Handle 1 is the top edge; handle 3 the right edge.
+    // Handle 1 is the top edge; handle 3 the right edge. Horizontal nudges step whole bars, at
+    // least one: 2 px moves the right edge one bar.
     assert!(chart.nudge_selected_drawing(0.0, 3.0, Some(1)));
     assert!(chart.nudge_selected_drawing(2.0, 0.0, Some(3)));
     let (moved_top, moved_bottom) = (px(&chart, rectangle, 1), px(&chart, rectangle, 0));
     assert_close(moved_top.1, top_left.1 + 3.0, "top edge moved by the nudge");
     assert_close(
         moved_top.0,
-        top_left.0 + 2.0,
-        "right edge moved by the nudge",
+        top_left.0 + chart.bar_spacing(),
+        "right edge moved by one bar",
     );
+    assert_eq!(logicals(&chart, rectangle), vec![2.0, 7.0]);
     assert_close(moved_bottom.1, bottom_right.1, "bottom edge unchanged");
     assert_close(moved_bottom.0, bottom_right.0, "left edge unchanged");
 
@@ -569,6 +573,160 @@ fn keyboard_nudge_moves_rectangle_and_position_handles_by_the_delta() {
     // Locked drawings stay put.
     assert!(chart.set_drawing_locked(position, true));
     assert!(!chart.nudge_selected_drawing(0.0, 1.0, None));
+}
+
+/// A projected handle can sit on screen while the anchor it drives is off it (a channel's width
+/// anchor far right of the pane). Dragging the handle moves that anchor by the bars the pointer
+/// crossed from the handle, never onto the slot under the pointer, which the crosshair clamps to
+/// the visible range.
+#[test]
+fn a_projected_handle_drags_its_off_screen_anchor_by_the_bars_it_crosses() {
+    let mut chart = settled();
+    // The second line runs half a unit under the base, through the width anchor 14 bars past the
+    // base's end and well right of the pane; its handle sits on bar 4, between the base anchors.
+    let id = chart
+        .add_drawing(
+            DrawingKind::ParallelChannel,
+            0,
+            vec![point(2.0, 101.0), point(6.0, 103.0), point(20.0, 109.5)],
+            None,
+        )
+        .unwrap();
+    chart.set_selected_drawing(Some(id));
+    chart.build_frame();
+    assert!(
+        px(&chart, id, 2).0 > chart.pane_w,
+        "the anchor is off screen"
+    );
+    let handle = chart
+        .drawing_handle_px(chart.drawing(id).unwrap(), DrawingDragPart::Anchor(2))
+        .unwrap();
+    assert!(handle.0 > 0.0 && handle.0 < chart.pane_w, "{handle:?}");
+    let before = chart.drawing(id).unwrap().points.clone();
+    let y = px(&chart, id, 2).1;
+    // 25 px is under half of an 80 px bar: the anchor keeps its bar and takes the raw price.
+    assert_eq!(chart.bar_spacing(), 80.0);
+    for (dx, bars) in [(25.0, 0.0), (100.0, 1.0), (-130.0, -2.0)] {
+        assert!(chart.drawing_drag_start_at(handle.0, handle.1));
+        chart.drawing_drag_to(handle.0 + dx, handle.1 + 6.0, NO_KEYS);
+        chart.drawing_drag_end();
+        let points = chart.drawing(id).unwrap().points.clone();
+        assert_eq!(points[..2], before[..2], "{dx}");
+        assert_eq!(points[2].logical, 20.0 + bars, "{dx}");
+        assert_close(px(&chart, id, 2).1, y + 6.0, &format!("{dx}: raw price"));
+        assert!(chart.undo_drawing());
+    }
+}
+
+/// A time-snapped channel's width handle sits on its odd base's midpoint, half a bar off the slot
+/// grid, so a sub-bar drag can cross a slot at the handle while the width anchor's own px still
+/// rounds to its bar. The data clamp checks the anchor's final slot, so an anchor on the first or
+/// last data bar never steps off the data.
+#[test]
+fn a_projected_handle_never_steps_a_time_snapped_anchor_off_the_data() {
+    let mut chart = settled();
+    let last = (chart.data.merged_times().len() - 1) as f64;
+    let mut crossed = false;
+    for (edge, dx) in [(last, 0.3), (0.0, -0.3)] {
+        let id = chart
+            .add_drawing(
+                DrawingKind::ParallelChannel,
+                0,
+                // The second line runs 1.5 under the base, so the handle stays on the pane.
+                vec![
+                    point(3.0, 101.0),
+                    point(6.0, 103.0),
+                    point(edge, 99.5 + (edge - 3.0) * 2.0 / 3.0),
+                ],
+                Some(r#"{"snap_time_to_data":true}"#),
+            )
+            .unwrap();
+        chart.set_selected_drawing(Some(id));
+        chart.build_frame();
+        let handle = chart
+            .drawing_handle_px(chart.drawing(id).unwrap(), DrawingDragPart::Anchor(2))
+            .unwrap();
+        let dx = dx * chart.bar_spacing();
+        crossed |=
+            chart.snapped_crosshair_index(handle.0 + dx) != chart.snapped_crosshair_index(handle.0);
+        assert!(chart.drawing_drag_start_at(handle.0, handle.1));
+        chart.drawing_drag_to(handle.0 + dx, handle.1, NO_KEYS);
+        chart.drawing_drag_end();
+        let logicals = logicals(&chart, id);
+        assert!(
+            logicals
+                .iter()
+                .all(|&logical| (0.0..=last).contains(&logical)),
+            "{edge}: {logicals:?}"
+        );
+        chart.remove_drawing(id);
+    }
+    assert!(crossed, "one drag crosses a slot at the handle");
+}
+
+/// Keyboard nudges step handles in logical space: an off-screen anchor, rectangle bounds corner
+/// or edge, or position handle moves exactly one bar per horizontal key step instead of jumping
+/// to the slot at the pane edge.
+#[test]
+fn keyboard_nudges_step_off_screen_handles_by_exactly_one_bar() {
+    let mut chart = settled();
+    let line = trend(&mut chart, point(2.0, 101.0), point(20.0, 104.0));
+    chart.set_selected_drawing(Some(line));
+    assert!(px(&chart, line, 1).0 > chart.pane_w);
+    assert!(chart.nudge_selected_drawing(1.0, 0.0, Some(1)));
+    assert_eq!(logicals(&chart, line), [2.0, 21.0]);
+    assert_eq!(prices(&chart, line), [101.0, 104.0]);
+    assert!(chart.nudge_selected_drawing(-1.0, 0.0, Some(1)));
+    assert_eq!(logicals(&chart, line), [2.0, 20.0]);
+
+    let rectangle = chart
+        .add_drawing(
+            DrawingKind::Rectangle,
+            0,
+            vec![point(2.0, 101.0), point(20.0, 104.0)],
+            None,
+        )
+        .unwrap();
+    chart.set_selected_drawing(Some(rectangle));
+    // Handle 2 is the top-right corner, 3 the right edge, both 11 bars right of the pane.
+    for (handle, right) in [(2, 21.0), (3, 22.0)] {
+        assert!(chart.nudge_selected_drawing(1.0, 0.0, Some(handle)));
+        let points = chart.drawing(rectangle).unwrap().points.clone();
+        let mut bars = logicals(&chart, rectangle);
+        bars.sort_by(f64::total_cmp);
+        assert_eq!(bars, [2.0, right], "handle {handle}");
+        let mut levels = points.iter().map(|point| point.price).collect::<Vec<_>>();
+        levels.sort_by(f64::total_cmp);
+        assert_eq!(levels, [101.0, 104.0], "handle {handle}");
+    }
+
+    let position = chart
+        .add_drawing(
+            DrawingKind::LongPosition,
+            0,
+            vec![point(2.0, 102.0), point(20.0, 104.0), point(2.0, 101.0)],
+            None,
+        )
+        .unwrap();
+    chart.set_selected_drawing(Some(position));
+    // Handle 2 is the width, on the target's off-screen right edge.
+    assert!(chart.nudge_selected_drawing(1.0, 0.0, Some(2)));
+    assert_eq!(logicals(&chart, position), [2.0, 21.0, 2.0]);
+    assert_eq!(prices(&chart, position), [102.0, 104.0, 101.0]);
+}
+
+/// A keyboard body nudge adds whole bars to every anchor without rounding them, so an anchor
+/// between slots (a Shift-straightened end, a time-identity anchor) keeps its fraction.
+#[test]
+fn keyboard_body_nudges_keep_fractional_anchors_between_their_slots() {
+    let mut chart = settled();
+    let line = trend(&mut chart, point(2.25, 101.0), point(6.6, 103.0));
+    chart.set_selected_drawing(Some(line));
+    assert!(chart.nudge_selected_drawing(1.0, 0.0, None));
+    assert_eq!(logicals(&chart, line), [3.25, 7.6]);
+    assert_eq!(prices(&chart, line), [101.0, 103.0]);
+    assert!(chart.nudge_selected_drawing(-1.0, 0.0, None));
+    assert_eq!(logicals(&chart, line), [2.25, 6.6]);
 }
 
 #[test]

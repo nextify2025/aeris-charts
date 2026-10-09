@@ -771,9 +771,10 @@ pub(crate) fn derived_handles(
 /// reject the whole sample (an anchor it cannot place, such as a time-snapped anchor past the
 /// data), so the drag keeps its last valid sample.
 ///
-/// The pitchfork base midpoint translates both handle anchors by the midpoint's (time- and
-/// magnet-snapped) move. The fixed square's corner sets the side in whole bars, toward the
-/// corner's side of the first anchor; a pointer rounds to the nearest bar and a keyboard step
+/// The pitchfork base midpoint shifts both handle anchors by whole bars toward the slot its handle
+/// lands on (a magnet's bar, or a keyboard step's bars) and their prices by its vertical move.
+/// The fixed square's corner sets the side in whole bars, toward the corner's side of the first
+/// anchor; a pointer rounds to the nearest bar and a keyboard step
 /// moves at least one whole bar the way the key moved, so sub-bar steps still resize it. With a
 /// `scale_ratio` the side comes from the corner's bar, its price sets the ratio (Shift keeps the
 /// press ratio), and the second anchor lands on the ratio corner. Without one the square stays
@@ -793,29 +794,33 @@ pub(crate) fn drag_handle(
         return Some(None);
     }
     if is_fork(drawing.kind) {
+        // One whole-bar shift for both: an odd base's midpoint sits half a bar off the grid,
+        // where snapping B and C on their own would round two .5 ties apart. A pointer's target
+        // is the slot under the handle, whose offset truncates, so the base moves once the
+        // pointer crosses a bar; a keyboard target moved whole bars from the midpoint, so
+        // rounding only drops the px round trip's noise. The prices follow the px move, and a
+        // time-snapped pitchfork keeps both on the data.
         let (&b, &c) = (sample.start_px.get(1)?, sample.start_px.get(2)?);
-        let from = shape::midpoint(b, c);
-        let delta = (sample.target_px.0 - from.0, sample.target_px.1 - from.1);
-        if !drawing.snap_time_to_data {
-            let moved_b = engine.drawing_anchor_at(drawing, (b.0 + delta.0, b.1 + delta.1))?;
-            let moved_c = engine.drawing_anchor_at(drawing, (c.0 + delta.0, c.1 + delta.1))?;
-            (points[1], points[2]) = (moved_b, moved_c);
-            return Some(None);
-        }
-        // Time-snapped: one whole-bar shift for both. An odd base's midpoint sits half a bar off
-        // the grid, where snapping B and C on their own rounds two .5 ties apart; the shift
-        // truncates the snapped target's offset, so the base moves once the pointer crosses a
-        // bar. The prices follow the px move.
+        let dy = sample.target_px.1 - shape::midpoint(b, c).1;
         let (start_b, start_c) = (sample.start_points.get(1)?, sample.start_points.get(2)?);
-        let shift = (sample.target.logical - (start_b.logical + start_c.logical) / 2.0).trunc();
+        let offset = sample.target.logical - (start_b.logical + start_c.logical) / 2.0;
+        let shift = match sample.keyboard_step {
+            Some(_) => offset.round(),
+            None => offset.trunc(),
+        };
         let moved = |start: &DrawingPoint, (x, y): Point| {
             let price = engine
-                .drawing_from_px_for(drawing.pane_index, drawing.price_scale, x, y + delta.1)?
+                .drawing_from_px_for(drawing.pane_index, drawing.price_scale, x, y + dy)?
                 .price;
-            engine.snap_drawing_time_to_data(DrawingPoint {
+            let point = DrawingPoint {
                 logical: start.logical + shift,
                 price,
-            })
+            };
+            if drawing.snap_time_to_data {
+                engine.snap_drawing_time_to_data(point)
+            } else {
+                Some(point)
+            }
         };
         // Both or neither: a shift that carries C past the data moves no anchor.
         let (moved_b, moved_c) = (moved(start_b, b)?, moved(start_c, c)?);

@@ -335,9 +335,11 @@ fn drags_nudges_and_straighten_edit_line_tools_as_single_history_entries() {
     assert_eq!(chart.drawing_handle_count(cross), Some(1));
     chart.set_selected_drawing(Some(id));
     let (x0, y0) = anchor(&chart, id, 0);
+    // Horizontal nudges step whole bars, at least one: 10 px (about half a bar) is one bar.
     assert!(chart.nudge_selected_drawing(10.0, 0.0, Some(0)));
     let (x1, y1) = anchor(&chart, id, 0);
-    assert!((x1 - x0 - 10.0).abs() < 1e-6 && (y1 - y0).abs() < 1e-6);
+    assert!((x1 - x0 - chart.bar_spacing()).abs() < 1e-6 && (y1 - y0).abs() < 1e-6);
+    assert_eq!(chart.drawing(id).unwrap().points[0], p(11.0, 101.0));
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().points, before);
 }
@@ -600,7 +602,8 @@ fn frames_scale_family_geometry_with_the_device_pixel_ratio() {
         let stroke = ink_polylines(&mut chart).remove(0);
         let hpr = (chart.pane_w * dpr).round() / chart.pane_w;
         let vpr = (chart.pane_h * dpr).round() / chart.pane_h;
-        assert!((f64::from(stroke.1) - 2.0 * vpr).abs() < 1e-5);
+        // The default 1 px line.
+        assert!((f64::from(stroke.1) - vpr).abs() < 1e-5);
         assert!((stroke.0[1].0 - b.0 * hpr).abs() < 1e-3);
         assert!((stroke.0[1].1 - b.1 * vpr).abs() < 1e-3);
         let (_, x, _) = texts(&mut chart)
@@ -1151,6 +1154,34 @@ fn installing_a_text_measurer_re_measures_the_stats_box_reach() {
 /// that draws them as one box.
 const FORK_INFO: &str = r##"{"color":"#123456","labels":[{"metric":"price_change","visible":true,"position":"on"},{"metric":"percent_change","visible":true,"position":"on"},{"metric":"bar_count","visible":true,"position":"on"},{"metric":"duration","visible":true,"position":"on"},{"metric":"angle","visible":true,"position":"on"}],"tool_options":{"line":{}}}"##;
 
+/// The rows of upstream's info card: the one rounded card of the first pane and the texts it
+/// holds, which are every text of the pane.
+fn info_card_rows(chart: &mut ChartEngine) -> Vec<String> {
+    let frame = chart.build_frame();
+    let main = &frame.panes[0].main;
+    let cards = main
+        .iter()
+        .filter_map(|prim| match *prim {
+            Prim::RoundRect { x, y, w, h, .. } => Some((x, y, w, h)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cards.len(), 1, "one card: {cards:?}");
+    let (cx, cy, cw, ch) = cards[0];
+    main.iter()
+        .filter_map(|prim| match prim {
+            Prim::Text { text, x, y, .. } => {
+                assert!(
+                    *x >= cx && *x <= cx + cw && *y >= cy && *y <= cy + ch,
+                    "{text} inside the card"
+                );
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn texts_of(chart: &mut ChartEngine) -> Vec<String> {
     texts(chart).into_iter().map(|(text, ..)| text).collect()
 }
@@ -1270,15 +1301,36 @@ fn a_line_block_draws_an_info_lines_labels_as_one_hittable_stats_box() {
         .unwrap();
     assert!(f64::from(middle_y) > (a.1 + b.1) / 2.0 + 8.0);
 
-    // Removing the block returns to upstream's per-label text at the first anchor.
+    // Removing the block returns to upstream's card: one row per metric group of the visible
+    // labels (no ticks or distance among the fork's five), which is no hit target.
     assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"line":null}}"#));
-    let runs = texts(&mut chart);
-    assert_eq!(runs.len(), 5, "{runs:?}");
-    assert!(
-        runs.iter()
-            .all(|(_, x, _)| (f64::from(*x) - a.0).abs() < 1e-3)
+    assert_eq!(
+        info_card_rows(&mut chart),
+        [
+            "+5.00 (+5.00%)".to_string(),
+            "10 bars (10h)".to_string(),
+            format!("{degrees:.2}°")
+        ]
     );
     assert_eq!(chart.hit_test_drawing(probe.0, probe.1), None);
+}
+
+/// Upstream's info card keeps its label semantics on the fork's metric text: a visible
+/// date-and-time-range label alone fills the elapsed slot with the duration, and a label's
+/// custom text replaces its metric value.
+#[test]
+fn the_info_card_rows_follow_the_visible_labels_and_their_custom_text() {
+    let mut chart = chart();
+    add(
+        &mut chart,
+        DrawingKind::InfoLine,
+        vec![p(10.0, 100.0), p(20.0, 105.0)],
+        r##"{"color":"#123456","labels":[{"metric":"date_time_range","visible":true,"position":"on"},{"metric":"price_change","visible":true,"position":"on","text":"target"},{"metric":"angle","visible":false,"position":"on"}]}"##,
+    );
+    assert_eq!(
+        info_card_rows(&mut chart),
+        ["target".to_string(), "10h".to_string()]
+    );
 }
 
 #[test]
@@ -1290,13 +1342,19 @@ fn upstream_line_tools_keep_upstreams_rendering_without_a_line_block() {
         vec![p(10.0, 100.0), p(20.0, 105.0)],
         r##"{"color":"#123456"}"##,
     );
-    let a = anchor(&chart, id, 0);
-    let runs = texts(&mut chart);
-    assert_eq!(runs.len(), 4, "upstream's four labels: {runs:?}");
+    // Upstream's card with its seven default metrics in three rows.
+    let (degrees, _) = chart
+        .drawing_screen_vector(chart.drawing(id).unwrap(), 0, 1)
+        .unwrap();
+    let rows = info_card_rows(&mut chart);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0], "+5.00 (+5.00%), +500 ticks");
     assert!(
-        runs.iter()
-            .all(|(_, x, _)| (f64::from(*x) - a.0).abs() < 1e-3)
+        rows[1].starts_with("10 bars (10h), distance: ") && rows[1].ends_with(" px"),
+        "{}",
+        rows[1]
     );
+    assert_eq!(rows[2], format!("{degrees:.2}°"));
     let background = Color::rgba(0x12, 0x34, 0x56, 224);
     let frame = chart.build_frame();
     assert!(
@@ -1313,8 +1371,19 @@ fn upstream_line_tools_keep_upstreams_rendering_without_a_line_block() {
         vec![p(10.0, 101.0), p(20.0, 104.0)],
         r##"{"color":"#123456"}"##,
     );
+    // Upstream's trend angle: the segment, a dotted horizontal reference and a dotted arc, and
+    // the signed angle; not the fork's dashed reference.
     assert_eq!(dashed_ink_hline(&mut chart), None);
-    assert_eq!(ink_polylines(&mut chart).len(), 1, "the segment alone");
+    let styles = ink_polylines(&mut chart)
+        .into_iter()
+        .map(|(_, _, style)| style)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        styles,
+        [LineStyle::Solid, LineStyle::Dotted, LineStyle::Dotted]
+    );
+    let labels = texts_of(&mut chart);
+    assert!(labels.len() == 1 && labels[0].ends_with('°'), "{labels:?}");
 }
 
 #[test]
@@ -1775,7 +1844,8 @@ fn a_line_blocks_stats_box_scales_with_the_device_pixel_ratio() {
         let stroke = ink_polylines(&mut chart).remove(0);
         let hpr = (chart.pane_w * dpr).round() / chart.pane_w;
         let vpr = (chart.pane_h * dpr).round() / chart.pane_h;
-        assert!((f64::from(stroke.1) - 2.0 * vpr).abs() < 1e-5);
+        // The default 1 px line.
+        assert!((f64::from(stroke.1) - vpr).abs() < 1e-5);
         assert!((stroke.0[1].0 - b.0 * hpr).abs() < 1e-3);
         assert!((stroke.0[1].1 - b.1 * vpr).abs() < 1e-3);
         let (_, x, _) = texts(&mut chart)
@@ -1931,7 +2001,7 @@ fn upstream_line_tools_list_the_stats_position_their_line_block_reads() {
         vec![p(10.0, 100.0), p(20.0, 105.0)],
         r##"{"color":"#123456"}"##,
     );
-    assert_eq!(texts(&mut chart).len(), 4);
+    assert_eq!(info_card_rows(&mut chart).len(), 3);
     assert!(
         chart.drawing_apply_options(id, r#"{"tool_options":{"line":{"stats_position":"end"}}}"#)
     );
@@ -1939,16 +2009,21 @@ fn upstream_line_tools_list_the_stats_position_their_line_block_reads() {
         chart.drawing(id).unwrap().tool_options.line,
         Some(Default::default())
     );
+    // A new info line's seven default metrics, as the box's three lines.
     assert_eq!(
-        texts_of(&mut chart)[..2],
-        ["+5.00  +5.00%".to_string(), "10 bars".to_string()]
+        texts_of(&mut chart),
+        [
+            "+5.00  +5.00%  +500 ticks".to_string(),
+            "10 bars  10h".to_string(),
+            "353 px  55.48°".to_string()
+        ]
     );
     assert_eq!(
         chart.drawing_kind_options_json(id).as_deref(),
         Some(r#"{"kind":"generic"}"#)
     );
     assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"line":null}}"#));
-    assert_eq!(texts(&mut chart).len(), 4);
+    assert_eq!(info_card_rows(&mut chart).len(), 3);
 }
 
 #[test]

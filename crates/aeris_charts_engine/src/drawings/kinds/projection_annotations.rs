@@ -230,7 +230,7 @@ const TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    grid_snap: false,
+    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -246,7 +246,7 @@ pub(crate) const PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     wire_id: 13,
     name: "price_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
-    grid_snap: true,
+    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
     ..TOOL
@@ -257,7 +257,7 @@ pub(crate) const DATE_RANGE: DrawingToolSpec = DrawingToolSpec {
     wire_id: 14,
     name: "date_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
-    grid_snap: true,
+    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
     ..TOOL
@@ -268,7 +268,7 @@ pub(crate) const DATE_PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     wire_id: 15,
     name: "date_price_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
-    grid_snap: true,
+    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
     ..TOOL
@@ -1280,14 +1280,17 @@ pub(crate) fn derived_handles(drawing: &Drawing, px: &[Point], handles: &mut [Dr
 }
 
 /// One drag sample of a coincident signpost's pole-top handle ([`derived_handles`]): the top
-/// anchor goes where the handle goes (time- and magnet-snapped like an anchor), so the drag
-/// starts from the painted top instead of jumping onto the foot.
+/// anchor goes where the handle goes (time- and magnet-snapped like an anchor, onto its bar
+/// slot), so the drag starts from the painted top instead of jumping onto the foot.
 pub(crate) fn drag_handle(
     sample: &HandleDrag<'_>,
     points: &mut [crate::DrawingPoint],
 ) -> Option<Option<crate::DrawingToolOptions>> {
     if let (DrawingDragPart::Handle(0), Some(top)) = (sample.part, points.get_mut(1)) {
-        *top = sample.target;
+        *top = crate::DrawingPoint {
+            logical: sample.target.logical.round(),
+            ..sample.target
+        };
     }
     Some(None)
 }
@@ -1313,15 +1316,37 @@ pub(crate) fn follow_anchor_drag(
     }
 }
 
+/// Upstream's price-label bubble (no fork-form block) for glyph `size` at `scale` px per CSS px:
+/// its text inset, the height of the tail below it, and its own height. The frame's
+/// `ChartEngine::price_label_layout`, the text run ([`price_label_text_start`]) and the culling
+/// pad ([`upstream_decoration_extent`]) all read it.
+pub(crate) fn price_label_bubble(size: f64, scale: f64) -> (f64, f64, f64) {
+    (6.0 * scale, 6.0 * scale, size * 1.2 + 8.0 * scale)
+}
+
+/// The start (left edge, vertical centre) of the text run in upstream's price-label bubble whose
+/// tail tip touches `anchor`: where the frame paints the label, and where the inline editor, its
+/// caret and the text hit test place it ([`price_label_bubble`]).
+pub(crate) fn price_label_text_start(anchor: (f64, f64), size: f64, scale: f64) -> (f64, f64) {
+    let (padding, tail, height) = price_label_bubble(size, scale);
+    (anchor.0 + padding, anchor.1 - tail - height / 2.0)
+}
+
 /// The CSS-px reach beyond the anchors' box of what an upstream annotation's fork form adds
 /// (`kinds::upstream_decoration_extent`): the projection's stats box, the note's pin and box, the
 /// bubbles above their tails, the signpost's plate (on its pole), an arrow mark's text past its
 /// tail, and the forecast's boxes. Text that follows data (prices, stats, the forecast outcome)
-/// gets four ems of slack so the cached pad stays valid between text-key refreshes. 0 in
-/// upstream form.
+/// gets four ems of slack so the cached pad stays valid between text-key refreshes. In upstream
+/// form only the price label reaches past its anchor: its bubble stands on a tail above it
+/// (`ChartEngine::price_label_layout`; its logical extent is the whole time axis); 0 otherwise.
 pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
     if !fork_form(drawing) {
-        return 0.0;
+        return if drawing.kind == DrawingKind::PriceLabel {
+            let (_, tail, height) = price_label_bubble(engine.drawing_text_size(drawing), 1.0);
+            tail + height
+        } else {
+            0.0
+        };
     }
     let size = engine.drawing_text_size(drawing);
     let stats = engine.drawing_stats_size();

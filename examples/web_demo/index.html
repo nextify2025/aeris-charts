@@ -360,8 +360,8 @@
       <!-- B8: lines — begin -->
       <button type="button" data-tool="ray" title="Ray: from the first anchor through the second to the pane edge">ray</button>
       <button type="button" data-tool="extended_line" title="Extended line: through both anchors to both pane edges">ext line</button>
-      <button type="button" data-tool="info_line" title="Info line: segment with its measurement labels (price change, percent, bars, duration)">info line</button>
-      <button type="button" data-tool="trend_angle" title="Trend angle: segment with its screen angle against the horizontal">trend angle</button>
+      <button type="button" data-tool="info_line" title="Info line: segment with one statistics card (price change, percent, ticks, bars, duration, distance, angle)">info line</button>
+      <button type="button" data-tool="trend_angle" title="Trend angle: segment with a dotted horizontal reference, an arc, and its signed screen angle">trend angle</button>
       <button type="button" data-tool="cross_line" title="Cross line: horizontal and vertical lines through one anchor">cross line</button>
       <button type="button" data-tool="arrow_line" title="Arrow: two-anchor segment ending in an arrowhead">arrow</button>
       <button type="button" data-tool="horizontal_segment" title="Horizontal segment: both anchors share one price">h-segment</button>
@@ -412,7 +412,7 @@
       <button type="button" data-tool="price_note" title="Price note: one-line text at a price">price note</button>
       <button type="button" data-tool="callout" title="Callout: text box with a pointer to a point">callout</button>
       <button type="button" data-tool="comment" title="Comment: one-line text at a point">comment</button>
-      <button type="button" data-tool="price_label" title="Price label: bubble with the point's price">price label</button>
+      <button type="button" data-tool="price_label" title="Price label: bubble above the point with its price">price label</button>
       <button type="button" data-tool="signpost" title="Signpost: a pole marker from its foot to its top">signpost</button>
       <button type="button" data-tool="flag_mark" title="Flag mark">flag</button>
       <button type="button" data-tool="arrow_marker_up" title="Arrow marker up">arrow up</button>
@@ -444,12 +444,17 @@
       <button type="button" data-tool="ellipse" title="Ellipse inscribed in two corners; Shift makes a circle">ellipse</button>
       <button type="button" data-tool="circle" title="Circle: click the center, then a point on the rim">circle</button>
       <button type="button" data-tool="triangle" title="Triangle: click three vertices">triangle</button>
-      <button type="button" data-tool="arc" title="Arc: click the start, a point the arc passes through, then the end">arc</button>
-      <button type="button" data-tool="curve" title="Curve: click the start, the control point, then the end">curve</button>
-      <button type="button" data-tool="double_curve" title="Double curve: click the start, two control points, then the end">double curve</button>
+      <button type="button" data-tool="arc" title="Arc: click the start, the end, then a point the arc passes through">arc</button>
+      <button type="button" data-tool="curve" title="Curve: click the start, the end, then a point the curve passes through">curve</button>
+      <button type="button" data-tool="double_curve" title="Double curve: click the start, the end, then two points the curve passes through">double curve</button>
       <button type="button" data-tool="polyline" title="Polyline: click vertices; double-click or Enter to finish, Backspace to remove the latest vertex">polyline</button>
       <button type="button" data-tool="highlighter" title="Highlighter: drag a translucent 12 px marker stroke">highlighter</button>
       <!-- B8: shapes — end -->
+      <!-- volume — begin -->
+      <button type="button" data-tool="fixed_range_volume_profile" title="Fixed range volume profile: volume by price between two bars">fixed range VP</button>
+      <button type="button" data-tool="anchored_volume_profile" title="Anchored volume profile: volume by price from the anchor bar to the latest bar">anchored VP</button>
+      <button type="button" data-tool="anchored_vwap" title="Anchored VWAP: volume-weighted average price from the anchor bar">anchored VWAP</button>
+      <!-- volume — end -->
       <label title="Hypothetical balance used by position drawing statistics">balance <input type="number" id="position_account_size" min="0.01" max="1000000000000000" step="any" value="1000"></label>
       <label title="Percentage of the hypothetical balance risked at the stop">risk % <input type="number" id="position_risk_percent" min="0" max="100" step="any" value="25"></label>
       <label title="Host-supplied quantity for placing the selected Long/Short Position drawing">order qty <input type="number" id="position_order_quantity" min="0.00000001" step="any" value="1"></label>
@@ -462,7 +467,7 @@
           <option value="dashed">dashed</option>
         </select>
       </label>
-      <label title="Stroke width in CSS px — templates new drawings and applies live to the selected one">w <input type="range" id="drawing_width" min="1" max="24" step="1" value="2"><span id="drawing_width_val">2</span></label>
+      <label title="Stroke width in CSS px — templates new drawings and applies live to the selected one">w <input type="range" id="drawing_width" min="1" max="24" step="1" value="1"><span id="drawing_width_val">1</span></label>
       <label title="Standalone Text tool content. Any drawing's own text is edited in place: double-click it, or select the drawing and press Enter or F2">text tool <input type="text" id="drawing_text" size="8"></label>
       <label title="Label text color — templates new drawings and applies live to the selected one">text <input type="color" id="drawing_text_color" value="#f0f0f0"></label>
       <label title="Label font size in CSS px — templates new drawings and applies live to the selected one">size <input type="number" id="drawing_text_size" min="8" max="72" step="1" value="14"></label>

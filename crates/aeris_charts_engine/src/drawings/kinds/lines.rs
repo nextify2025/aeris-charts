@@ -70,6 +70,10 @@ const ANGLE_ARC_MAX: f64 = 48.0;
 const ANGLE_LABEL_GAP: f64 = 6.0;
 /// Width of the trend angle's reference line and arc in CSS px.
 const ANGLE_DECORATION_WIDTH: f64 = 1.0;
+/// Upstream's trend angle (no `line` block): its dotted reference's and arc's radius and the gap
+/// before its angle label, in CSS px (`ChartEngine::build_trend_angle_prims`).
+pub(crate) const TREND_ANGLE_RADIUS_CSS: f64 = 60.0;
+pub(crate) const TREND_ANGLE_LABEL_GAP_CSS: f64 = 10.0;
 
 /// Shared two-anchor segment behavior; every spec below overrides its identity.
 const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
@@ -83,12 +87,12 @@ const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
     logical_extent: DrawingLogicalExtent::Finite,
     price_extent: DrawingPriceExtent::Finite,
     bounds_padding_ratio: 0.0,
-    default_width: 2.0,
+    default_width: 1.0,
     requests_text_editor: false,
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
-    grid_snap: false,
+    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -257,10 +261,24 @@ pub(crate) fn upstream_line_parts(
 }
 
 /// [`upstream_line_parts`]' reach beyond the anchors in CSS px for the culling pad: the stats box,
-/// the angle's label beside its arc, and the end caps. 0 without the `line` block.
+/// the angle's label beside its arc, and the end caps. Without the `line` block, upstream's trend
+/// angle's reference, arc, and label; 0 for the other tools.
 pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
     if !fork_presentation(drawing) {
-        return 0.0;
+        // Upstream's trend angle reaches its reference radius plus the widest signed angle
+        // label beyond the first anchor.
+        if drawing.kind != DrawingKind::TrendAngle {
+            return 0.0;
+        }
+        let size = engine.drawing_stats_size();
+        let width = engine.measure_text_run(
+            "-179.99°",
+            size,
+            &engine.options.get().layout.font_family,
+            drawing.text_weight.unwrap_or(400),
+            drawing.text_italic,
+        );
+        return TREND_ANGLE_RADIUS_CSS + TREND_ANGLE_LABEL_GAP_CSS + width + size;
     }
     let mut extent = decoration_extent(engine, drawing);
     if drawing.kind == DrawingKind::TrendAngle {
@@ -293,7 +311,8 @@ pub(crate) fn extend_upstream_schema(
 }
 
 /// Whether `labels` (a clipboard or sync item's) are the fork's info-line default, which no
-/// upstream drawing carries: upstream's info line starts with four `above` stats.
+/// upstream drawing carries: upstream's info line starts with seven `above` stats (four before
+/// upstream 664d347).
 pub(crate) fn is_legacy_info_stats(labels: &[DrawingLabelOptions]) -> bool {
     labels == default_info_stats()
 }

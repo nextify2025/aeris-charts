@@ -1158,7 +1158,8 @@ fn channel_handles_sit_on_the_painted_lines_and_drive_their_anchors() {
 #[test]
 fn dashed_and_dotted_channel_lines_reach_the_frame_as_solid_dash_runs() {
     // Executors without a dash concept (the WebGPU tessellator) paint exactly these runs, so the
-    // gaps match Canvas2D's dashes by construction.
+    // gaps match Canvas2D's dashes by construction. The width is explicit (new price channels
+    // default to 1 px) so the three 2 px boundaries stand apart from the 1 px middle line.
     for (style, on, off) in [("dashed", 12.0, 12.0), ("dotted", 2.0, 8.0)] {
         let mut chart = chart();
         let points = channel_points(&chart, 90.0);
@@ -1167,7 +1168,7 @@ fn dashed_and_dotted_channel_lines_reach_the_frame_as_solid_dash_runs() {
             DrawingKind::PriceChannel,
             points,
             &format!(
-                r##"{{"color":"#123456","style":"{style}","extend_left":false,"extend_right":false}}"##
+                r##"{{"color":"#123456","width":2,"style":"{style}","extend_left":false,"extend_right":false}}"##
             ),
         );
         let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));

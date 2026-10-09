@@ -548,7 +548,8 @@ test("a drawing's own magnet mode snaps unmodified anchor drags and Ctrl upgrade
       expect(point.logical).toBe(target);
       expect(point.price).toBeCloseTo(expected.nearest, 9);
     } else {
-      expect(point.logical).not.toBe(target);
+      // Every drawing lands on the bar under the cursor; only the magnet snaps the price.
+      expect(point.logical).toBe(target);
       // Browser pointer coordinates are quantized, so the raw price is exact only to ~1e-6.
       expect(point.price).toBeCloseTo(expected.raw, 4);
       expect(point.price).not.toBe(expected.nearest);
@@ -754,6 +755,9 @@ test("an empty trend line offers direct inline text entry at its configured slot
     { logical: l1, price: p_lo },
   ], {
     color: "#f59e0b",
+    // Two CSS px keep the stroke's core at full ink on the fixture's fractional pixel ratio, so
+    // the gap scan finds the line on both sides of the text.
+    width: 2,
     text_color: "#7b1fa2",
     text_size: 14,
     text_h_align: "center",
@@ -1269,7 +1273,7 @@ test("Ctrl magnet snaps placement to the nearest bar's OHLC", async ({ page }) =
   await page.keyboard.down(MAGNET_CLICK_KEY);
   await page.mouse.click(probe.x, probe.y);
   await page.keyboard.up(MAGNET_CLICK_KEY);
-  // Second click WITHOUT Ctrl: stays raw (fractional logical).
+  // Second click WITHOUT Ctrl: lands on the bar slot under the cursor, at the raw price.
   const free = await page.evaluate(() => {
     const range = window.__chart.time_scale().get_visible_logical_range();
     const index = Math.floor(range.from + (range.to - range.from) * 0.75);
@@ -1286,7 +1290,7 @@ test("Ctrl magnet snaps placement to the nearest bar's OHLC", async ({ page }) =
   const [first, second] = list[0].points;
   expect(first.logical).toBeCloseTo(probe.index + 1, 6);
   expect(probe.prices).toContainEqual(first.price);
-  expect(Number.isInteger(second.logical)).toBe(false);
+  expect(Number.isInteger(second.logical)).toBe(true);
   expect(probe.prices).not.toContainEqual(second.price);
 });
 

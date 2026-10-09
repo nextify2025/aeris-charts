@@ -298,10 +298,16 @@ fn three_anchor_previews_show_their_first_leg_before_the_second_click() {
         let (a, b) = ((200.0, 260.0), (420.0, 150.0));
         chart.drawing_tool_activate(a.0, a.1, DrawingModifiers::default());
         chart.drawing_tool_pointer_move(b.0, b.1, DrawingModifiers::default(), false);
+        // Both ends land on the bar slots under the pointer, at the raw prices.
+        let slot = |(x, y): (f64, f64)| {
+            let logical = chart.coordinate_to_logical(x).unwrap().round();
+            (x_of(&chart, logical), y)
+        };
+        let leg = [slot(a), slot(b)];
         let lines = Scene::of(&mut chart).runs(css(INK));
         assert!(
-            strokes_along(&lines, &[a, b], 1.0),
-            "{kind:?} previews its first leg: {lines:?}"
+            strokes_along(&lines, &leg, 1.0),
+            "{kind:?} previews its first leg {leg:?}: {lines:?}"
         );
         // The third anchor's preview resolves the whole tool.
         chart.drawing_tool_activate(b.0, b.1, DrawingModifiers::default());
@@ -817,6 +823,224 @@ fn trend_line_strokes_the_anchors_when_enabled() {
 /// The trend line is a body target away from every level: at t = 0.1 along the retracement's
 /// anchors (between levels 0 and 0.236; the midpoint lies on level 0.5), and between explicit
 /// levels 0 and 1 on the other tools.
+/// Without a stored `tool_options.fibonacci` block (every new drawing, every upstream document)
+/// the extension and the trend-based time draw upstream's construction guides instead of the
+/// fork's trend line: one dashed leg each, its dashes starting at the leg's first anchor, under
+/// the level band fills, stroked once and hit as the body.
+#[test]
+fn blockless_extensions_and_trend_times_draw_and_hit_upstreams_guides_once() {
+    let levels = levels_json(&[(0.0, "#abcdef"), (1.0, "#abcdef")]);
+    for kind in [
+        DrawingKind::FibonacciExtension,
+        DrawingKind::FibonacciTrendTime,
+    ] {
+        let mut chart = chart();
+        let id = add(
+            &mut chart,
+            kind,
+            anchors_for(kind),
+            &format!(r##"{{"color":"{INK}","levels":{levels},"fill_enabled":true}}"##),
+        );
+        assert!(chart.drawing(id).unwrap().tool_options.fibonacci.is_none());
+        // Selected, so the level bands fill.
+        chart.set_selected_drawing(Some(id));
+        let [a, b, c] = [0, 1, 2].map(|index| anchor(&chart, id, index));
+        let scene = Scene::of(&mut chart);
+        let runs = scene.runs(css(INK));
+        let on = |run: &Vec<(f64, f64)>, leg: [(f64, f64); 2]| {
+            run.iter()
+                .all(|&point| aeris_charts_render::shape::distance_to_polyline(point, &leg) < 0.01)
+        };
+        let (first, second): (Vec<_>, Vec<_>) =
+            runs.iter().cloned().partition(|run| on(run, [a, b]));
+        assert!(
+            second.iter().all(|run| on(run, [b, c])),
+            "{kind:?}: {runs:?}"
+        );
+        assert!(
+            strokes_along(&first, &[a, b], 1.0) && strokes_along(&second, &[b, c], 1.0),
+            "{kind:?}: {runs:?}"
+        );
+        // One stroke per leg: the trend line does not paint the legs a second time.
+        let starting =
+            |point: (f64, f64)| runs.iter().filter(|run| close(run[0], point, 0.01)).count();
+        assert_eq!((starting(a), starting(b)), (1, 1), "{kind:?}");
+        // Under the level band fills (in the levels' color).
+        let position = |wanted: &dyn Fn(&Prim) -> bool| scene.prims.iter().position(wanted);
+        let banded = |fill: &Color| (fill.r(), fill.g(), fill.b()) == (0xab, 0xcd, 0xef);
+        let guide =
+            position(&|prim| matches!(prim, Prim::Polyline { color, .. } if *color == css(INK)));
+        let fill = position(&|prim| match prim {
+            Prim::Rect { color, .. } => banded(color),
+            Prim::BandFill { fill, .. } => banded(fill),
+            _ => false,
+        });
+        assert!(guide.unwrap() < fill.expect("a level band"), "{kind:?}");
+        let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        assert_eq!(
+            body(&chart, middle.0, middle.1),
+            Some((id, crate::DrawingDragPart::Body)),
+            "{kind:?}"
+        );
+    }
+}
+
+/// A fork document's extension keeps the fork's trend line over upstream's guides (owner policy
+/// R1, the block-presence rule): its legs in the stored style, painted after the level band
+/// fills and before the levels, dashed with one continuous phase through the middle anchor;
+/// with the line off it has neither legs nor guides. A patch that stores a block on a new
+/// extension starts it from the kind's defaults, so the legs stay on.
+#[test]
+fn fork_extension_documents_keep_their_trend_line_over_upstreams_guides() {
+    let anchors = [(10.0, 101.0), (16.0, 105.0), (20.0, 103.0)];
+    let document = fork_document(&[
+        (
+            "trend_based_fib_extension",
+            &anchors,
+            serde_json::json!({"line_style": "solid"}),
+        ),
+        (
+            "trend_based_fib_extension",
+            &anchors,
+            serde_json::Value::Null,
+        ),
+        (
+            "trend_based_fib_extension",
+            &anchors,
+            serde_json::json!({"tool_options": {"fibonacci": {"trend_line": false}}}),
+        ),
+    ]);
+    let mut chart = chart();
+    chart.import_state_json(&document).unwrap();
+    chart.build_frame();
+    let only = |chart: &mut ChartEngine, id: DrawingId| {
+        for other in 1..=3 {
+            assert!(
+                chart.drawing_apply_options(other, &format!(r#"{{"visible":{}}}"#, other == id))
+            );
+        }
+    };
+    let gray = css("#787b86");
+    let path = |chart: &ChartEngine, id: DrawingId| [0, 1, 2].map(|index| anchor(chart, id, index));
+    // One solid stroke through `path`'s three points.
+    let solid_path = |legs: &[(Vec<(f64, f64)>, LineStyle)], path: [(f64, f64); 3]| {
+        legs.len() == 1
+            && legs[0].1 == LineStyle::Solid
+            && legs[0].0.len() == 3
+            && legs[0]
+                .0
+                .iter()
+                .zip(path)
+                .all(|(&point, at)| close(point, at, 1e-3))
+    };
+    // The gray strokes along the anchors' path: the trend line (or guides), never a level.
+    let legs = |chart: &mut ChartEngine, id: DrawingId| {
+        let path = path(chart, id);
+        Scene::of(chart)
+            .polylines(gray)
+            .into_iter()
+            .filter(|(points, _)| {
+                points.iter().all(|&point| {
+                    aeris_charts_render::shape::distance_to_polyline(point, &path) < 0.01
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Solid: one continuous stroke through the three anchors, after the fills, before the levels.
+    only(&mut chart, 1);
+    // Selected, so the level bands fill.
+    chart.set_selected_drawing(Some(1));
+    assert!(chart.drawing(1).unwrap().tool_options.fibonacci.is_some());
+    let [a, b, c] = path(&chart, 1);
+    let solid = legs(&mut chart, 1);
+    assert!(solid_path(&solid, [a, b, c]), "{solid:?}");
+    let scene = Scene::of(&mut chart);
+    let leg = scene
+        .prims
+        .iter()
+        .position(
+            |prim| matches!(prim, Prim::Polyline { point_count: 3, color, .. } if *color == gray),
+        )
+        .unwrap();
+    let last_fill = scene
+        .prims
+        .iter()
+        .rposition(|prim| matches!(prim, Prim::Rect { .. } | Prim::BandFill { .. }))
+        .expect("the fork's level bands");
+    let first_level = scene
+        .prims
+        .iter()
+        .position(|prim| matches!(prim, Prim::Polyline { .. } | Prim::HLine { .. }))
+        .unwrap();
+    assert!(
+        last_fill < leg && leg == first_level,
+        "{last_fill} {leg} {first_level}"
+    );
+    assert!(
+        scene.prims[leg + 1..]
+            .iter()
+            .any(|prim| matches!(prim, Prim::Polyline { .. } | Prim::HLine { .. })),
+        "the levels paint over the trend line"
+    );
+
+    // Dashed (the fork's default): the dashes run on through the middle anchor in one phase.
+    only(&mut chart, 2);
+    let runs = legs(&mut chart, 2)
+        .into_iter()
+        .map(|(points, _)| points)
+        .collect::<Vec<_>>();
+    assert!(strokes_along(&runs, &[a, b, c], 1.0), "{runs:?}");
+    let length = |p: (f64, f64), q: (f64, f64)| (q.0 - p.0).hypot(q.1 - p.1);
+    let along = |point: (f64, f64)| {
+        if aeris_charts_render::shape::distance_to_polyline(point, &[a, b]) < 0.01 {
+            length(a, point)
+        } else {
+            length(a, b) + length(b, point)
+        }
+    };
+    let period = along(runs[1][0]) - along(runs[0][0]);
+    assert!(
+        (length(a, b) / period).fract() > 0.05 && (length(a, b) / period).fract() < 0.95,
+        "the first leg is no whole number of dash periods"
+    );
+    for run in &runs {
+        let phase = along(run[0]) / period;
+        assert!((phase - phase.round()).abs() < 1e-3, "{phase}");
+    }
+
+    // Off: neither the trend line nor upstream's guides.
+    only(&mut chart, 3);
+    assert!(legs(&mut chart, 3).is_empty());
+    assert_eq!(body(&chart, (a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0), None);
+
+    // A new extension patched with another Fibonacci option keeps its legs.
+    let id = add(
+        &mut chart,
+        DrawingKind::FibonacciExtension,
+        anchors
+            .iter()
+            .map(|&(logical, price)| p(logical, price))
+            .collect(),
+        r##"{"color":"#787b86"}"##,
+    );
+    only(&mut chart, id);
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"tool_options":{"fibonacci":{"label_v_align":"top"}}}"#
+    ));
+    assert!(
+        chart
+            .drawing(id)
+            .unwrap()
+            .tool_options
+            .fibonacci
+            .is_some_and(|block| block.trend_line)
+    );
+    let patched = legs(&mut chart, id);
+    assert!(solid_path(&patched, [a, b, c]), "{patched:?}");
+}
+
 #[test]
 fn trend_line_is_a_body_target() {
     let on = r#"{"tool_options":{"fibonacci":{"trend_line":true}}}"#;
@@ -1341,8 +1565,8 @@ fn selected_fan_bands_hit_where_the_frame_paints_them() {
 /// Fork ring-tool documents repaint the fork's rings after their anchor migrations: full-circle
 /// speed arcs ring the fork's first anchor (upstream's second after the swap), the circles' trend
 /// line is the fork's a→b diameter through the migrated center, and every ring tool (the wedge
-/// with its block written empty) paints precise rings within a quarter pixel instead of
-/// upstream's 33-point polylines.
+/// with its block written empty) paints precise rings within a tenth of a pixel over the part of
+/// the ring the pane shows, where upstream's rings run whole.
 #[test]
 fn fork_ring_documents_repaint_their_rings_around_the_fork_anchors() {
     let fork_arcs = [(14.0, 103.0), (15.0, 103.2)];
@@ -1398,11 +1622,10 @@ fn fork_ring_documents_repaint_their_rings_around_the_fork_anchors() {
     };
     let precise = |points: &[(f64, f64)], center: (f64, f64)| {
         let radius = (points[0].0 - center.0).hypot(points[0].1 - center.1);
-        points.len() != 33
-            && points.windows(2).all(|pair| {
-                let middle = ((pair[0].0 + pair[1].0) / 2.0, (pair[0].1 + pair[1].1) / 2.0);
-                radius - (middle.0 - center.0).hypot(middle.1 - center.1) <= 0.26
-            })
+        points.windows(2).all(|pair| {
+            let middle = ((pair[0].0 + pair[1].0) / 2.0, (pair[0].1 + pair[1].1) / 2.0);
+            radius - (middle.0 - center.0).hypot(middle.1 - center.1) <= 0.11
+        })
     };
 
     // Speed arcs: closed rings around the fork's first anchor, now upstream's second.
@@ -1438,15 +1661,28 @@ fn fork_ring_documents_repaint_their_rings_around_the_fork_anchors() {
     assert!(!circles.is_empty());
     assert!(circles.iter().all(|ring| precise(ring, center)));
 
-    // Wedge: the fork's empty block selects the precise rings; a new wedge keeps upstream's.
+    // Wedge: the fork's empty block selects the precise rings, culled to the part the pane
+    // shows; a new wedge keeps upstream's whole rings. Zoomed in, the outer rings lie past the
+    // pane's right edge.
+    chart.set_visible_logical_range(27.0, 31.5);
+    chart.build_frame();
     let center = (x_of(&chart, wedge[0].0), y_of(&chart, wedge[0].1));
+    let right = chart.pane_w;
+    let shown = |ring: &&Vec<(f64, f64)>| ring.iter().any(|point| point.0 <= right);
     only(&mut chart, upstream_wedge);
     let upstream = rings(&mut chart, center);
-    assert!(!upstream.is_empty() && upstream.iter().all(|ring| ring.len() == 33));
+    let visible = upstream.iter().filter(shown).count();
+    assert!(
+        visible > 0 && visible < upstream.len(),
+        "upstream paints whole rings past the pane too: {upstream:?}"
+    );
     only(&mut chart, 3);
     let fork = rings(&mut chart, center);
-    assert_eq!(fork.len(), upstream.len());
-    assert!(fork.iter().all(|ring| precise(ring, center)));
+    assert_eq!(fork.len(), visible, "{fork:?}");
+    assert!(
+        fork.iter()
+            .all(|ring| shown(&ring) && precise(ring, center))
+    );
 }
 
 /// An empty spiral paints the golden spiral: through the second anchor, growing by φ every
@@ -1666,13 +1902,13 @@ fn dashed_spirals_and_precise_rings_keep_their_dash_phase_while_the_pane_scrolls
     }
 }
 
-/// A ring tool with a stored block (every fork document) tessellates within a quarter pixel over
-/// the part of the ring the pane shows, bounded; without one it keeps upstream's 33 points.
+/// A ring tool with a stored block (every fork document) tessellates within a tenth of a pixel
+/// over the part of the ring the pane shows, bounded; without one it paints upstream's whole ring.
 #[test]
-fn precise_rings_stay_within_a_quarter_pixel_where_they_show() {
+fn precise_rings_stay_within_a_tenth_of_a_pixel_where_they_show() {
     let mut chart = chart();
     let (top, bottom) = pane_box(&chart);
-    // The center sits about 8,000 px above the pane: upstream's 32 chords sag by tens of px.
+    // The center sits about 8,000 px above the pane: only a sliver of each ring shows.
     let (center, edge) = (
         at(&chart, 300.0, top - 8_000.0),
         at(&chart, 300.0, top - 7_900.0),
@@ -1688,21 +1924,55 @@ fn precise_rings_stay_within_a_quarter_pixel_where_they_show() {
     );
     let c = anchor(&chart, id, 1);
     let unit = (anchor(&chart, id, 0).1 - c.1).abs();
-    assert_eq!(
-        Scene::of(&mut chart).polylines(css("#111111"))[0].0.len(),
-        33
-    );
+    // Without the block: upstream's whole circle, reaching 16,000 px above the pane.
+    let whole = Scene::of(&mut chart).polylines(css("#111111"))[0].0.clone();
+    assert!(close(whole[0], *whole.last().unwrap(), 0.01), "closed");
+    assert!(whole.iter().any(|point| point.1 < top - 16_000.0));
     // Any stored key keeps the block (an empty patch block is dropped).
     assert!(
         chart.drawing_apply_options(id, r#"{"tool_options":{"fibonacci":{"trend_line":false}}}"#)
     );
+    // The pane's corners as seen from the center: every precise point lies inside that angular
+    // window, and the window's sweep at the largest radius that can show bounds the chords.
+    let corners = [
+        (0.0, top),
+        (chart.pane_w, top),
+        (0.0, bottom),
+        (chart.pane_w, bottom),
+    ];
+    let angle = |point: (f64, f64)| (point.1 - c.1).atan2(point.0 - c.0);
+    let (low, high) = corners
+        .iter()
+        .map(|&corner| angle(corner))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), a| {
+            (low.min(a), high.max(a))
+        });
+    let far = corners
+        .iter()
+        .map(|corner| (corner.0 - c.0).hypot(corner.1 - c.1))
+        .fold(0.0_f64, f64::max);
+    let largest = unit * radii[1] / 100.0;
     let scene = Scene::of(&mut chart);
     for (value, color) in [(radii[0] / 100.0, "#111111"), (radii[1] / 100.0, "#222222")] {
         let radius = unit * value;
         let arcs = scene.polylines(css(color));
         assert_eq!(arcs.len(), 1, "{color}");
         let points = &arcs[0].0;
-        assert!(points.len() <= 257, "bounded: {}", points.len());
+        assert!(
+            points
+                .iter()
+                .all(|&point| (low - 1e-6..=high + 1e-6).contains(&angle(point))),
+            "{color}: only the visible window"
+        );
+        // The chords span the pane's angular window at the largest radius that can show: the
+        // farthest corner plus the 1 px stroke width and a pixel (`FibonacciArcGeometry::rings`).
+        // `arc_segments` caps them at 2,048.
+        let bound = crate::drawings::geometry::arc_segments(largest.min(far + 2.0), high - low);
+        assert!(
+            points.len() <= bound as usize + 1,
+            "{color}: bounded: {} > {bound} + 1",
+            points.len()
+        );
         let sag = points
             .windows(2)
             .map(|pair| {
@@ -1710,7 +1980,7 @@ fn precise_rings_stay_within_a_quarter_pixel_where_they_show() {
                 radius - (middle.0 - c.0).hypot(middle.1 - c.1)
             })
             .fold(0.0_f64, f64::max);
-        assert!(sag <= 0.25 + 0.05, "{color}: chords sag {sag} px");
+        assert!(sag <= 0.11, "{color}: chords sag {sag} px");
         assert!(points.iter().any(|point| point.1 > top && point.1 < bottom));
     }
     // It hits along the visible ring.

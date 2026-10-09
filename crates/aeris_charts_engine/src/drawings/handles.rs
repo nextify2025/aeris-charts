@@ -1,10 +1,13 @@
-//! The one editable-handle set of a drawing. Selected-handle painting, handle hit testing, and
-//! keyboard handle cycling all iterate this set, so a handle can never be painted without being
-//! draggable, or reachable by keyboard without being painted. A family's `handles` hook edits
-//! the set (derived handles), as `kinds::upstream_derived_handles` does for upstream-rendered
-//! kinds; pointer drags, keyboard nudges, and magnet snapping share the engine's one drag path.
-//! A derived `DrawingDragPart::Handle` drags through that path too: `drawing_drag_apply` moves
-//! the handle like an anchor (movement axis, time snap, magnet) into one [`HandleDrag`] sample,
+//! The one editable-handle set of a drawing. Selected-handle painting, creation previews, handle
+//! hit testing, and keyboard handle cycling all iterate this set, so a handle can never be painted
+//! without being draggable, or reachable by keyboard without being painted. A family's `handles`
+//! hook edits the set (derived handles), as `kinds::upstream_derived_handles` does for
+//! upstream-rendered kinds: upstream's projection first puts an anchor that only parameterizes a
+//! shape on the stroke it controls (`geometry::anchor_handle_points`), then the fork's derived
+//! handles are added. Pointer drags, keyboard nudges, and magnet snapping share the engine's one
+//! drag path, which moves every anchor bar by bar from its own slot. A derived
+//! `DrawingDragPart::Handle` drags through that path too: `drawing_drag_apply` moves the handle
+//! like an anchor (movement axis, time snap, magnet, bar slots) into one [`HandleDrag`] sample,
 //! and `kinds::drag_derived_handle` resolves what the handle drives (anchors, and tool options
 //! the drag's one history entry and cancellation restore with them).
 
@@ -101,8 +104,9 @@ pub(crate) struct HandleDrag<'a> {
     /// The dragged handle's media px at the baseline.
     pub(crate) handle_px: (f64, f64),
     /// Where the handle goes: its baseline media px moved by the pointer delta (constrained to
-    /// the spec's movement axis), time-snapped and magnet-snapped like an anchor, as an anchor
-    /// point and back in media px.
+    /// the spec's movement axis), time-snapped and magnet-snapped like an anchor, and on the bar
+    /// slot under it (a keyboard step: whole bars from the handle's own position; a rotated
+    /// rectangle's width handle stays continuous), as an anchor point and back in media px.
     pub(crate) target: DrawingPoint,
     pub(crate) target_px: (f64, f64),
     /// Shift (straighten) is held.

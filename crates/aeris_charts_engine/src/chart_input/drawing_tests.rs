@@ -26,6 +26,17 @@ fn assert_near(actual: (f64, f64), expected: (f64, f64), what: &str) {
     );
 }
 
+/// Every anchor but anchored text lands on the bar slot under the pointer, at the raw price.
+fn on_slot(chart: &ChartEngine, (x, y): (f64, f64)) -> (f64, f64) {
+    let logical = chart.coordinate_to_logical(x).unwrap().round();
+    (chart.logical_to_coordinate(logical).unwrap(), y)
+}
+
+/// Drawings move horizontally by whole bars: `bars` bar spacings.
+fn bars(chart: &ChartEngine, bars: f64) -> f64 {
+    bars * chart.bar_spacing()
+}
+
 fn anchor_px(chart: &ChartEngine, id: DrawingId) -> Vec<(f64, f64)> {
     (0..chart.drawing(id).unwrap().points.len())
         .map(|index| chart.drawing_point_to_coordinate(id, index).unwrap())
@@ -181,7 +192,11 @@ fn path_anchors_placed_by_clicks_pop_on_backspace_and_a_double_click_finishes_on
     let expected = [(120.0, 140.0), (220.0, 260.0), (420.0, 220.0)];
     assert_eq!(anchors.len(), expected.len(), "{anchors:?}");
     for (index, (actual, expected)) in anchors.into_iter().zip(expected).enumerate() {
-        assert_near(actual, expected, &format!("anchor {index}"));
+        assert_near(
+            actual,
+            on_slot(&chart, expected),
+            &format!("anchor {index}"),
+        );
     }
     assert_eq!(chart.active_drawing_tool(), None);
     assert!(!chart.drawing_create_active());
@@ -199,13 +214,15 @@ fn a_click_or_double_click_on_a_polylines_first_vertex_finishes_it_closed() {
             click(&mut chart, x, y);
         }
         assert!(chart.take_input_events().is_empty(), "a polyline waits");
-        // Near the first vertex: a click there closes the polyline instead of adding a vertex.
-        // The platform double-click's second delivery finishes placement, as a double-click
-        // finishing an open polyline does: it creates nothing more and opens no editor on the
-        // new polyline under it.
-        click(&mut chart, 123.0, 138.0);
+        // Near the first vertex (on its bar slot): a click there closes the polyline instead of
+        // adding a vertex. The platform double-click's second delivery finishes placement, as a
+        // double-click finishing an open polyline does: it creates nothing more and opens no
+        // editor on the new polyline under it.
+        let first = on_slot(&chart, (120.0, 140.0));
+        let (x, y) = (first.0 + 3.0, first.1 - 2.0);
+        click(&mut chart, x, y);
         if double {
-            double_click(&mut chart, 123.0, 138.0);
+            double_click(&mut chart, x, y);
         }
         let events = chart.take_input_events();
         let [ChartInputEvent::DrawingCreated(id)] = events[..] else {
@@ -338,8 +355,10 @@ fn a_shift_press_on_a_drawing_drags_it_along_the_dominant_axis_instead_of_measur
     assert!(!chart.measure_active());
     assert!(!chart.drawing_drag_active());
     // Shift keeps a body move on its dominant axis: horizontal here, so prices are unchanged.
+    // 40 px is three whole bars.
+    let dx = bars(&chart, 3.0);
     for (index, (actual, before)) in anchor_px(&chart, id).into_iter().zip(start).enumerate() {
-        let expected = (before.0 + 40.0, before.1);
+        let expected = (before.0 + dx, before.1);
         assert_near(actual, expected, &format!("anchor {index}"));
     }
     assert_eq!(chart.drawing_revision(), revision + 1);
@@ -391,9 +410,10 @@ fn dragging_a_selected_drawings_anchor_moves_only_that_anchor_as_one_undo_step()
 
     let target = (a.0 + 30.0, a.1 - 25.0);
     drag(&mut chart, a, target);
+    // The anchor steps two whole bars (30 px) and keeps the raw price.
     assert_near(
         chart.drawing_point_to_coordinate(id, 0).unwrap(),
-        target,
+        (a.0 + bars(&chart, 2.0), target.1),
         "dragged anchor",
     );
     assert_eq!(chart.drawing(id).unwrap().points[1], before[1]);
@@ -464,8 +484,9 @@ fn a_wobbling_click_on_a_drawing_selects_it_without_moving_it_or_recording_an_un
     }
 }
 
-/// Past the slop a drawing catches up with the pointer at once and then follows it exactly, back
-/// inside the slop too, for a body and an anchor alike; each drag is one undo step.
+/// Past the slop a drawing catches up with the pointer at once and then follows it, bar by bar
+/// horizontally and exactly vertically, back inside the slop too, for a body and an anchor alike;
+/// each drag is one undo step.
 #[test]
 fn a_drawing_drag_past_the_slop_follows_the_pointer_back_near_its_start_as_one_undo_step() {
     let mut chart = chart();
@@ -476,11 +497,13 @@ fn a_drawing_drag_past_the_slop_follows_the_pointer_back_near_its_start_as_one_u
     chart.input_pointer_down(at(body.0, body.1), 1);
     chart.input_pointer_move(at(body.0 + 2.0, body.1 - 2.0), true);
     assert_shifted(&chart, id, &start, (0.0, 0.0), "body inside the slop");
+    // 12 px rounds to one bar, 2 px to none.
     chart.input_pointer_move(at(body.0 + 12.0, body.1 - 6.0), true);
-    assert_shifted(&chart, id, &start, (12.0, -6.0), "body crossing the slop");
+    let bar = bars(&chart, 1.0);
+    assert_shifted(&chart, id, &start, (bar, -6.0), "body crossing the slop");
     chart.input_pointer_move(at(body.0 + 2.0, body.1 - 1.0), true);
     chart.input_pointer_up(at(body.0 + 2.0, body.1 - 1.0));
-    assert_shifted(&chart, id, &start, (2.0, -1.0), "body released");
+    assert_shifted(&chart, id, &start, (0.0, -1.0), "body released");
     assert_eq!(chart.drawing_revision(), revision + 1);
 
     // The grab selected the drawing, so its first anchor is now a handle.
@@ -497,12 +520,12 @@ fn a_drawing_drag_past_the_slop_follows_the_pointer_back_near_its_start_as_one_u
     chart.input_pointer_move(at(a.0 - 15.0, a.1 + 5.0), true);
     assert_near(
         anchor(&chart),
-        (a.0 - 15.0, a.1 + 5.0),
+        (a.0 - bar, a.1 + 5.0),
         "anchor crossing the slop",
     );
     chart.input_pointer_move(at(a.0 - 2.0, a.1 + 1.0), true);
     chart.input_pointer_up(at(a.0 - 2.0, a.1 + 1.0));
-    assert_near(anchor(&chart), (a.0 - 2.0, a.1 + 1.0), "anchor released");
+    assert_near(anchor(&chart), (a.0, a.1 + 1.0), "anchor released");
     assert_near(
         chart.drawing_point_to_coordinate(id, 1).unwrap(),
         b,
@@ -520,7 +543,7 @@ fn a_drawing_drag_past_the_slop_follows_the_pointer_back_near_its_start_as_one_u
 }
 
 /// A release past the slop is a drag even when no motion sample crossed it first: the drawing
-/// lands where the pointer lets go, and the release is no click.
+/// lands on the bar slot where the pointer lets go, and the release is no click.
 #[test]
 fn a_drawing_released_past_the_slop_without_crossing_motion_lands_at_the_release() {
     let mut chart = chart();
@@ -531,7 +554,9 @@ fn a_drawing_released_past_the_slop_without_crossing_motion_lands_at_the_release
     chart.input_pointer_down(at(body.0, body.1), 1);
     chart.input_pointer_move(at(body.0 + 1.0, body.1), true);
     chart.input_pointer_up(at(body.0 + 30.0, body.1 - 20.0));
-    assert_shifted(&chart, id, &start, (30.0, -20.0), "released");
+    // 30 px is two whole bars.
+    let dx = bars(&chart, 2.0);
+    assert_shifted(&chart, id, &start, (dx, -20.0), "released");
     assert_eq!(chart.drawing_revision(), revision + 1);
     assert!(
         !chart
@@ -624,10 +649,12 @@ fn a_modifier_let_go_before_the_button_keeps_the_drag_as_shown() {
     chart.input_pointer_down(shifted(body.0, body.1), 1);
     chart.input_pointer_move(shifted(body.0 + 20.0, body.1 + 5.0), true);
     chart.input_pointer_move(shifted(body.0 + 40.0, body.1 + 10.0), true);
-    assert_shifted(&chart, id, &start, (40.0, 0.0), "straightened while held");
+    // 40 px is three whole bars.
+    let dx = bars(&chart, 3.0);
+    assert_shifted(&chart, id, &start, (dx, 0.0), "straightened while held");
     chart.input_modifiers_changed(InputModifiers::default());
     chart.input_pointer_up(at(body.0 + 40.0, body.1 + 10.0));
-    assert_shifted(&chart, id, &start, (40.0, 0.0), "committed as shown");
+    assert_shifted(&chart, id, &start, (dx, 0.0), "committed as shown");
 }
 
 /// A wobbling click on the selected text opens its editor and leaves the text where it was.
@@ -677,7 +704,8 @@ fn a_wobbling_double_click_on_a_selected_drawing_opens_its_editor_without_moving
 fn ctrl_or_cmd_held_while_placing_snaps_each_anchor_to_the_bars_ohlc() {
     let mut chart = chart();
     // Bar 20 is O 106 H 109 L 103 C 107; bar 40 is O 105 H 108 L 102 C 106. Each click lands
-    // just off its bar's center, nearest that bar's high or low.
+    // just off its bar's center, nearest that bar's high or low. Without the magnet the anchor
+    // still lands on the bar slot, at the raw price; the magnet adds the bar's high or low.
     let high = (
         chart.time_scale.index_to_coordinate(20) + 1.0,
         chart.series_price_to_coordinate(0, 108.6).unwrap(),
@@ -695,7 +723,8 @@ fn ctrl_or_cmd_held_while_placing_snaps_each_anchor_to_the_bars_ohlc() {
     let free = chart.drawing(free).unwrap().points.clone();
     assert!((free[0].price - 108.6).abs() < 1e-6, "{free:?}");
     assert!((free[1].price - 102.4).abs() < 1e-6, "{free:?}");
-    assert!((free[0].logical - 20.0).abs() > 1e-3, "{free:?}");
+    assert_eq!(free[0].logical, 20.0, "{free:?}");
+    assert_eq!(free[1].logical, 40.0, "{free:?}");
 
     let control = InputModifiers {
         control: true,
@@ -859,8 +888,8 @@ fn once_a_path_is_under_way_backspace_and_delete_step_back_only_that_path() {
     };
     let anchors = anchor_px(&chart, id);
     assert_eq!(anchors.len(), 2, "{anchors:?}");
-    assert_near(anchors[0], (140.0, 300.0), "first anchor");
-    assert_near(anchors[1], (360.0, 180.0), "second anchor");
+    assert_near(anchors[0], on_slot(&chart, (140.0, 300.0)), "first anchor");
+    assert_near(anchors[1], on_slot(&chart, (360.0, 180.0)), "second anchor");
     assert!(chart.drawing(old).is_some());
     assert_eq!(chart.drawing_revision(), revision + 1, "one create step");
 }
@@ -1138,7 +1167,8 @@ fn a_press_drag_release_with_a_click_placed_tool_armed_places_nothing() {
 
 /// The shared slop decides between a click and a drag at the release as well: a release under
 /// 5 px (Manhattan) from the press is a wobbly click that places its anchor where the button comes
-/// up, while a release past it is a drag that places nothing, even with no motion in between.
+/// up (on that bar slot), while a release past it is a drag that places nothing, even with no
+/// motion in between.
 #[test]
 fn the_click_slop_alone_decides_whether_a_click_placed_tool_places_an_anchor() {
     let (x, y) = (200.0, 200.0);
@@ -1155,7 +1185,7 @@ fn the_click_slop_alone_decides_whether_a_click_placed_tool_places_an_anchor() {
     };
     assert_near(
         anchor_px(&wobbly, id)[0],
-        (x + 3.0, y + 1.0),
+        on_slot(&wobbly, (x + 3.0, y + 1.0)),
         "at the release",
     );
 
@@ -1214,8 +1244,8 @@ fn after_the_first_click_a_press_drag_release_only_moves_the_preview() {
     };
     let anchors = anchor_px(&chart, id);
     assert_eq!(anchors.len(), 2, "{anchors:?}");
-    assert_near(anchors[0], first, "first anchor");
-    assert_near(anchors[1], last, "second anchor");
+    assert_near(anchors[0], on_slot(&chart, first), "first anchor");
+    assert_near(anchors[1], on_slot(&chart, last), "second anchor");
     assert_eq!(chart.drawing_revision(), revision + 1, "one create step");
     assert_eq!(chart.active_drawing_tool(), None, "a one-shot tool");
     assert!(chart.undo_drawing());

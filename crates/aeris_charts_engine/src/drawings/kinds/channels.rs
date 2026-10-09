@@ -34,7 +34,7 @@
 //! `±regression_deviations`, in population residual deviations) and switch, the dashed centre
 //! line in `middle_color` (`middle_line`), and Pearson's R below its start (`show_pearsons`,
 //! [`regression_parts`]). The anchors choose bars only: a regression moves along time, and its
-//! handles sit on the fitted line's ends ([`regression_fit_handles`]).
+//! handles sit on the fitted line's ends (upstream's projection, `geometry::anchor_handle_points`).
 
 use std::collections::HashMap;
 
@@ -172,12 +172,12 @@ pub(crate) const PRICE_CHANNEL: DrawingToolSpec = DrawingToolSpec {
     logical_extent: DrawingLogicalExtent::Finite,
     price_extent: DrawingPriceExtent::Full,
     bounds_padding_ratio: 0.0,
-    default_width: 2.0,
+    default_width: 1.0,
     requests_text_editor: false,
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
-    grid_snap: false,
+    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -558,32 +558,6 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
         drawing.text_italic,
     );
     PEARSON_GAP + width + size
-}
-
-/// A regression trend's handles on its fitted line (see [`super::upstream_derived_handles`]):
-/// each anchor's handle sits where the fit crosses that anchor's bar, so it is grabbed where it
-/// is painted; the anchors' own prices only shape the dashed placeholder while there is no fit,
-/// and the handles stay on the anchors then. Each still drives its own anchor by pointer deltas,
-/// along time only.
-pub(crate) fn regression_fit_handles(
-    engine: &ChartEngine,
-    drawing: &Drawing,
-    px: &[Point],
-    handles: &mut [DrawingHandle],
-) {
-    if drawing.kind != DrawingKind::RegressionTrend || px.is_empty() {
-        return;
-    }
-    let Some(derived) = engine.regression_points(drawing) else {
-        return;
-    };
-    for handle in handles {
-        if let DrawingDragPart::Anchor(index @ (0 | 1)) = handle.part
-            && let Some(point) = engine.drawing_point_px(drawing, derived[index])
-        {
-            handle.point = point;
-        }
-    }
 }
 
 /// Least-squares fit of a source series over a bar range.

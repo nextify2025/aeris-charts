@@ -992,14 +992,18 @@ impl EllipseArc {
         if !values.iter().all(|value| value.is_finite()) {
             return;
         }
-        // Wholly inside the clip, nothing can be skipped: the uniform chords are cheaper, and
-        // within tolerance while they stay under their cap.
+        // Wholly inside the clip (the rotated ellipse's own axis-aligned extents), nothing can
+        // be skipped: the uniform chords are cheaper, and within tolerance while they stay under
+        // their cap.
         let reach = self.rx.abs().max(self.ry.abs());
+        let (sin_r, cos_r) = self.rotation.sin_cos();
+        let half_x = (self.rx * cos_r).hypot(self.ry * sin_r);
+        let half_y = (self.rx * sin_r).hypot(self.ry * cos_r);
         let inside = Rect {
-            left: self.center.0 - reach,
-            top: self.center.1 - reach,
-            right: self.center.0 + reach,
-            bottom: self.center.1 + reach,
+            left: self.center.0 - half_x,
+            top: self.center.1 - half_y,
+            right: self.center.0 + half_x,
+            bottom: self.center.1 + half_y,
         };
         if clip.contains((inside.left, inside.top))
             && clip.contains((inside.right, inside.bottom))
@@ -1770,6 +1774,39 @@ mod flatten_and_fill_tests {
         EllipseArc::circle((5000.0, 5000.0), 100.0, 0.0, std::f64::consts::TAU)
             .append_clipped_points(0.25, clip, &mut out);
         assert!(out.len() <= 5);
+    }
+
+    #[test]
+    fn a_visible_wide_ellipse_takes_the_uniform_chords() {
+        // Inside the clip, though a square of its larger radius is taller than the clip: the
+        // test reads the ellipse's own extents, so it takes the uniform chords.
+        let clip = Rect {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 500.0,
+        };
+        let ellipse = EllipseArc {
+            center: (400.0, 250.0),
+            rx: 300.0,
+            ry: 150.0,
+            rotation: 0.0,
+            start: 0.0,
+            sweep: std::f64::consts::TAU,
+        };
+        let tolerance = 0.1;
+        let (mut clipped, mut uniform) = (Vec::new(), Vec::new());
+        ellipse.append_clipped_points(tolerance, clip, &mut clipped);
+        ellipse.append_points(tolerance, &mut uniform);
+        assert_eq!(clipped, uniform);
+        // Every chord's normalized deviation, scaled by the larger radius, stays in tolerance.
+        let unit = |(x, y): Point| ((x - 400.0) / 300.0, (y - 250.0) / 150.0);
+        for pair in clipped.windows(2) {
+            let (a, b) = (unit(pair[0]), unit(pair[1]));
+            let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+            let deviation = (1.0 - middle.0.hypot(middle.1)) * 300.0;
+            assert!(deviation <= tolerance + 1e-9, "{deviation}");
+        }
     }
 
     #[test]

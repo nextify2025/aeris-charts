@@ -586,9 +586,10 @@ impl DrawingToolOptions {
         style
     }
 
-    /// Deep-merge a JSON patch object into a copy of these options. `None` for a malformed or
-    /// oversized result, leaving the caller's options untouched.
-    pub(crate) fn merged(&self, patch: &serde_json::Value) -> Option<Self> {
+    /// Deep-merge a JSON patch object into a copy of a `kind` drawing's options. A Fibonacci block
+    /// the patch starts begins at the kind's defaults (`kinds::fibonacci::default_options`).
+    /// `None` for a malformed or oversized result, leaving the caller's options untouched.
+    pub(crate) fn merged(&self, kind: DrawingKind, patch: &serde_json::Value) -> Option<Self> {
         fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
             match (target, patch) {
                 (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
@@ -610,6 +611,18 @@ impl DrawingToolOptions {
             return None;
         }
         let mut value = serde_json::to_value(self).ok()?;
+        if self.fibonacci.is_none()
+            && kind.is_fibonacci()
+            && patch
+                .get("fibonacci")
+                .is_some_and(serde_json::Value::is_object)
+            && let (Some(target), Ok(defaults)) = (
+                value.as_object_mut(),
+                serde_json::to_value(crate::drawings::kinds::fibonacci::default_options(kind)),
+            )
+        {
+            target.insert("fibonacci".to_string(), defaults);
+        }
         merge(&mut value, patch);
         let merged: Self = serde_json::from_value(value).ok()?;
         merged.validate().then_some(merged)
@@ -811,7 +824,9 @@ pub(crate) fn take_legacy_flat_options(
     };
     let defaults = if absent_block_is_default {
         let defaults = match name {
-            "fibonacci" => serde_json::to_value(crate::FibonacciToolOptions::default()),
+            "fibonacci" => {
+                serde_json::to_value(crate::drawings::kinds::fibonacci::default_options(kind))
+            }
             "gann" => serde_json::to_value(crate::GannToolOptions::default()),
             "pattern" => serde_json::to_value(crate::PatternToolOptions::default()),
             // Written out: the block serializes nothing at its defaults.

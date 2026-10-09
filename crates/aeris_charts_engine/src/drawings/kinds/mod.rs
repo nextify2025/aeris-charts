@@ -18,11 +18,10 @@
 //! layers on upstream's polyline arm, and the pitchforks and Gann module owns what upstream's
 //! pitchfork and Gann arms read from `tool_options.gann` and their derived handles, and the
 //! shapes module what upstream's shape arms read from `tool_options.shape` and the caps, the
-//! shapes' derived handles and their through-point placement, and the projection-annotations
-//! module the fork form `tool_options.projection_annotation` selects on upstream's annotation arms
-//! (re-applied features). The recipe
-//! (what to
-//! add where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
+//! rotated rectangle's width handle and the curves' ends-first placement, and the
+//! projection-annotations module the fork form `tool_options.projection_annotation` selects on
+//! upstream's annotation arms (re-applied features). The recipe (what to add where, wire ids,
+//! test checklist) lives in `docs/architecture/engine/drawing-families.md`.
 //! Shared single-list registries carry one `// B8: <family> — begin/end` block per family that
 //! takes part (lines, channels, fibonacci, patterns_elliott_cycles, pitchforks_gann,
 //! projection_annotations, shapes).
@@ -189,20 +188,20 @@ pub(crate) fn extend_upstream_schema(
 }
 
 /// Edit the handles of an upstream-rendered kind (no family) for derived geometry, the upstream
-/// side of a family's `handles` hook: move a handle onto it (a regression trend's on its fitted
-/// line), replace one (a fixed Gann square's corner, a coincident signpost's pole top) or append
-/// one (a pitchfork's base midpoint). `handles.rs` builds the spec's set at the media-px anchors `px` and every reader of
-/// the set (painting, previews, hit testing, keyboard cycling, drag starts) sees the edited set;
-/// [`drag_derived_handle`] resolves a derived `Handle`'s drags. Must be cheap.
+/// side of a family's `handles` hook: first upstream's projection moves the handles of anchors
+/// that only parameterize a shape onto the stroke they control ([`project_anchor_handles`]),
+/// then the fork replaces one (a fixed Gann square's corner, a coincident signpost's pole top) or
+/// appends one (a pitchfork's base midpoint, a rotated rectangle's width). `handles.rs` builds the
+/// spec's set at the media-px anchors `px` and every reader of the set (painting, previews, hit
+/// testing, keyboard cycling, drag starts) sees the edited set; [`drag_derived_handle`] resolves a
+/// derived `Handle`'s drags. Must be cheap.
 pub(crate) fn upstream_derived_handles(
     engine: &ChartEngine,
     drawing: &Drawing,
     px: &[Point],
     handles: &mut Vec<DrawingHandle>,
 ) {
-    // B8: channels — begin
-    channels::regression_fit_handles(engine, drawing, px, handles);
-    // B8: channels — end
+    project_anchor_handles(engine, drawing, px, handles);
     // B8: pitchforks_gann — begin
     pitchforks_gann::derived_handles(engine, drawing, px, handles);
     // B8: pitchforks_gann — end
@@ -212,6 +211,65 @@ pub(crate) fn upstream_derived_handles(
     // B8: projection_annotations — begin
     projection_annotations::derived_handles(drawing, px, handles);
     // B8: projection_annotations — end
+}
+
+/// Upstream's on-stroke handles (`geometry::anchor_handle_points`) of an upstream-rendered kind
+/// whose anchors at media px `px` partly only parameterize its shape: a regression's on its fitted
+/// line's ends, a channel's and a Fibonacci channel's width control on its second line, a rotated
+/// rectangle's depth control on its far side. Only those kinds resolve their geometry here, so
+/// the other kinds' handle sets cost what they did. The anchor drag moves each anchor by the
+/// pointer delta, so its handle follows its stroke.
+fn project_anchor_handles(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    px: &[Point],
+    handles: &mut [DrawingHandle],
+) {
+    use DrawingKind::*;
+    if !matches!(
+        drawing.kind,
+        RegressionTrend
+            | ParallelChannel
+            | FlatTopChannel
+            | FlatBottomChannel
+            | FibonacciChannel
+            | RotatedRectangle
+    ) {
+        return;
+    }
+    let Some(pane) = engine.panes.get(drawing.pane_index) else {
+        return;
+    };
+    // A regression's fitted points follow its anchors in its render px.
+    let render;
+    let px = if drawing.kind == RegressionTrend {
+        let Some(full) = engine.drawing_render_px(drawing) else {
+            return;
+        };
+        render = full;
+        &render[..]
+    } else {
+        px
+    };
+    let Some(geometry) = super::resolve_drawing_geometry(
+        drawing.kind,
+        px,
+        engine.pane_w,
+        pane.top,
+        pane.height,
+        super::DrawingGeometryOptions::for_drawing(drawing, 1.0),
+    ) else {
+        return;
+    };
+    let points =
+        super::anchor_handle_points(drawing.kind, px, drawing.points.len(), &geometry.body);
+    for handle in handles {
+        if let crate::DrawingDragPart::Anchor(index) = handle.part
+            && let Some(&point) = points.get(index)
+        {
+            handle.point = point;
+        }
+    }
 }
 
 /// Resolve one drag sample of a derived `Handle` part of an upstream-rendered kind (the drag side
@@ -228,9 +286,7 @@ pub(crate) fn drag_derived_handle(
 ) -> Option<Option<crate::DrawingToolOptions>> {
     match drawing.kind {
         // B8: shapes — begin
-        DrawingKind::RotatedRectangle | DrawingKind::Curve | DrawingKind::DoubleCurve => {
-            shapes::drag_handle(engine, drawing, sample, points)
-        }
+        DrawingKind::RotatedRectangle => shapes::drag_handle(engine, drawing, sample, points),
         // B8: shapes — end
         // B8: projection_annotations — begin
         DrawingKind::Signpost => projection_annotations::drag_handle(sample, points),
@@ -245,8 +301,7 @@ pub(crate) fn drag_derived_handle(
 /// upstream-rendered kind, re-derive the anchors that keep its derived geometry on screen (the
 /// anchor side of [`upstream_derived_handles`]): `start_points` are the drag baseline's anchors
 /// and `start_px` their media px. A rotated rectangle keeps its width while its edge turns, a
-/// curve keeps its on-curve points while an end moves, a signpost coincident at the baseline
-/// keeps its top on its foot.
+/// signpost coincident at the baseline keeps its top on its foot.
 pub(crate) fn follow_anchor_drag(
     engine: &ChartEngine,
     drawing: &Drawing,
@@ -289,7 +344,8 @@ pub(crate) fn apply_template_defaults(
 /// `wave_degree`, icons, bars patterns, regression deviations) keep upstream's defaults; the fork's
 /// `tool_options` defaults reach them through `drawing_contract::take_legacy_flat_options`, and
 /// its option blocks through [`merge_legacy_fork_tool_options`]. A no-op for core tools, the
-/// own-line tools, and the ranges, whose defaults did not change.
+/// own-line tools, and the ranges: their documents always stored their width (which upstream's
+/// 1 px default changed), and their other defaults did not change.
 pub(crate) fn apply_legacy_fork_defaults(drawing: &mut Drawing) {
     let kind = drawing.kind;
     if !matches!(kind.spec().wire_id, 16..=84) {

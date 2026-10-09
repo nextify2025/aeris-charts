@@ -47,11 +47,12 @@ pub enum FibonacciLabelVAlign {
 /// are input aliases of `level_reverse`, `level_show_prices`, `level_log_scale`,
 /// `level_show_values`/`level_show_percents`, and `level_label_align` (see
 /// `drawing_contract::take_legacy_flat_options`); the other fields are rendered on upstream's
-/// arms. Their defaults are upstream's look (no trend line, no fan grid, half arcs, labels above
-/// their lines), so a block a patch creates for one key switches nothing else on; documents the
-/// fork wrote get the fork's values through `kinds::legacy_fork_tool_options`. A stored block also
-/// tessellates the ring tools' arcs within a quarter pixel over the part the pane shows
-/// ([`precise_rings`]).
+/// arms. Their defaults are upstream's look (no fan grid, half arcs, labels above their lines), so
+/// a block a patch creates for one key switches nothing else on ([`default_options`]: its trend
+/// line starts on only on the extension and the trend-based time, standing in for upstream's
+/// guides); documents the fork wrote get the fork's values through
+/// `kinds::legacy_fork_tool_options`. A stored block also tessellates the ring tools' arcs within
+/// a tenth of a pixel over the part the pane shows ([`precise_rings`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FibonacciToolOptions {
@@ -69,8 +70,9 @@ pub struct FibonacciToolOptions {
     pub log_scale: bool,
     /// Stroke the trend line through the anchors in the drawing's own stroke (the spiral's as a
     /// 1 CSS px dashed line; the circles' as the level-1 diameter through both anchors):
-    /// retracement, extension, time zones, trend time, speed arcs, circles, spiral. Default false
-    /// (the fork's default, true, reaches documents it wrote).
+    /// retracement, extension, time zones, trend time, speed arcs, circles, spiral. Default false,
+    /// true on the extension and trend time ([`default_options`]; the fork's default, true,
+    /// reaches documents it wrote).
     pub trend_line: bool,
     /// Show the speed resistance fan's grid: each visible level's horizontal and vertical line
     /// at that level's ratio of the anchors' box (past it for levels outside 0..1). Default false (the fork's default, true, reaches documents it
@@ -115,14 +117,41 @@ const SPIRAL_TREND_WIDTH: f64 = 1.0;
 
 /// The stored `tool_options.fibonacci` block of `drawing`, or its defaults.
 pub(crate) fn options(drawing: &Drawing) -> FibonacciToolOptions {
-    drawing.tool_options.fibonacci.unwrap_or_default()
+    drawing
+        .tool_options
+        .fibonacci
+        .unwrap_or_else(|| default_options(drawing.kind))
+}
+
+/// The `tool_options.fibonacci` block of a `kind` drawing without a stored one, and the block a
+/// patch that starts one begins from: the defaults, with the trend line on for the extension and
+/// the trend-based time. Without a stored block those two draw upstream's construction guides
+/// through their anchors ([`draws_guides`]); a patch that stores one switches them to the trend
+/// line, which therefore starts on so the legs stay visible.
+pub(crate) fn default_options(kind: DrawingKind) -> FibonacciToolOptions {
+    FibonacciToolOptions {
+        trend_line: matches!(
+            kind,
+            DrawingKind::FibonacciExtension | DrawingKind::FibonacciTrendTime
+        ),
+        ..FibonacciToolOptions::default()
+    }
+}
+
+/// `drawing` paints and hits upstream's construction guides (`ResolvedDrawingGeometry::guides`):
+/// every drawing except a Fibonacci tool with a stored `tool_options.fibonacci` block, which
+/// keeps the fork's trend line ([`trend_line`]: its own style, above the band fills) in their
+/// place, so a document the fork wrote keeps its legs (the block-presence rule).
+pub(crate) fn draws_guides(drawing: &Drawing) -> bool {
+    !(drawing.kind.is_fibonacci() && drawing.tool_options.fibonacci.is_some())
 }
 
 /// The trend line `drawing` strokes through its anchors `px` (caller px) while
 /// `tool_options.fibonacci.trend_line` is on, as up to three points and their count: the first
 /// leg of the retracement, time zones, speed arcs and spiral, both legs of the extension and the
-/// trend-based time, and the circles' level-1 diameter from the first anchor through the center
-/// (the second anchor). `None` for the other kinds.
+/// trend-based time (only with a stored block: without one, upstream's guides are their legs,
+/// see [`draws_guides`]), and the circles' level-1 diameter from the first anchor through the
+/// center (the second anchor). `None` for the other kinds.
 pub(crate) fn trend_line(drawing: &Drawing, px: &[Point]) -> Option<([Point; 3], usize)> {
     if !drawing.kind.is_fibonacci() || !options(drawing).trend_line {
         return None;
@@ -133,7 +162,9 @@ pub(crate) fn trend_line(drawing: &Drawing, px: &[Point]) -> Option<([Point; 3],
         | DrawingKind::FibonacciTimeZones
         | DrawingKind::FibonacciSpeedArcs
         | DrawingKind::FibonacciSpiral => Some(([a, b, b], 2)),
-        DrawingKind::FibonacciExtension | DrawingKind::FibonacciTrendTime => {
+        DrawingKind::FibonacciExtension | DrawingKind::FibonacciTrendTime
+            if drawing.tool_options.fibonacci.is_some() =>
+        {
             Some(([a, b, *px.get(2)?], 3))
         }
         DrawingKind::FibonacciCircles => Some(([a, (2.0 * b.0 - a.0, 2.0 * b.1 - a.1), b], 2)),
@@ -180,8 +211,8 @@ pub(crate) fn phi_spiral(drawing: &Drawing) -> bool {
 
 /// A ring tool (speed arcs, circles, wedge) that stores the `tool_options.fibonacci` block (every
 /// document the fork wrote; the wedge's carries it empty) tessellates its rings and bands within
-/// a quarter pixel over the part of the arc the pane shows (`geometry::Rings`); upstream's fixed
-/// 32 chords per ring stay otherwise.
+/// a tenth of a pixel over the part of the arc the pane shows (`geometry::Rings`); otherwise
+/// upstream's rings take whole circles of `geometry::arc_segments` chords at the same tolerance.
 pub(crate) fn precise_rings(drawing: &Drawing) -> bool {
     matches!(
         drawing.kind,

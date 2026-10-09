@@ -6,7 +6,7 @@ import { PNG } from "pngjs";
 // B8 Lines family (ray, extended line, info line, trend angle, cross line, arrow line, the
 // axis-locked horizontal segment, vertical ray, and vertical segment, and the price line) through the
 // public API and real pointer input: armed placement, edge-reaching extensions and their hit
-// testing, the info line's labels and the stats box its `tool_options.line` block selects, cross-line
+// testing, the info line's statistics card and the stats box its `tool_options.line` block selects, cross-line
 // body drags, persistence and clipboard round trips, the demo toolbar entries, and WebGPU == Canvas2D
 // parity.
 // Every geometry decision is engine-owned; these specs only drive the package API and pointer.
@@ -128,11 +128,13 @@ test("rays and extended lines reach the pane edges and hit along the extension",
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const width = await page.evaluate(() => window.__chart.time_scale().width());
+  // Two CSS px lines keep a solid core at the fixture's fractional pixel ratio (the 1 px default
+  // anti-aliases across rows), so the color extent finds their ends.
   const ids = await page.evaluate(({ s }) => {
     const ray = window.__chart.add_drawing("ray", [
       { logical: s.l0, price: s.p_mid },
       { logical: s.l1, price: s.p_mid },
-    ], { color: "#e91e63" });
+    ], { color: "#e91e63", width: 2 });
     return { ray: ray.id };
   }, { s });
   await settle_frames(page);
@@ -176,7 +178,7 @@ test("rays and extended lines reach the pane edges and hit along the extension",
     return window.__chart.add_drawing("extended_line", [
       { logical: s.l0, price: s.p_mid },
       { logical: s.l1, price: s.p_mid },
-    ], { color: "#e91e63" }).id;
+    ], { color: "#e91e63", width: 2 }).id;
   }, { s, ray: ids.ray });
   await settle_frames(page);
   extent = color_x_extent(await capture(page), PINK);
@@ -192,7 +194,7 @@ test("rays and extended lines reach the pane edges and hit along the extension",
     return window.__chart.add_drawing("trend_line", [
       { logical: s.l0, price: s.p_mid },
       { logical: s.l1, price: s.p_mid },
-    ], { color: "#e91e63", extend_left: true, extend_right: true }).id;
+    ], { color: "#e91e63", width: 2, extend_left: true, extend_right: true }).id;
   }, { s, extended });
   await settle_frames(page);
   extent = color_x_extent(await capture(page), PINK);
@@ -214,7 +216,7 @@ test("rays and extended lines reach the pane edges and hit along the extension",
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
 });
 
-test("the info line paints its labels, and its line block draws them as one stats box that selects it", async ({ page }) => {
+test("the info line paints its statistics card, and its line block draws its labels as one stats box that selects it", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const info = await page.evaluate(({ s }) => {
@@ -228,7 +230,7 @@ test("the info line paints its labels, and its line block draws them as one stat
       kind_options: window.__chart.drawing_kind_options(drawing),
     };
   }, { s });
-  expect(info.labels).toEqual(["price_change", "percent_change", "bar_count", "angle"]);
+  expect(info.labels).toEqual(["price_change", "percent_change", "ticks", "bar_count", "duration", "distance", "angle"]);
   expect(info.kind_options).toEqual({ kind: "generic" });
   await settle_frames(page);
 
@@ -266,7 +268,7 @@ test("the info line paints its labels, and its line block draws them as one stat
   await page.mouse.click(probe.x, probe.y);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
 
-  // Removing the block (`null`) restores upstream's per-label paint exactly.
+  // Removing the block (`null`) restores upstream's card exactly.
   await deselect();
   await page.mouse.move(1, 1);
   await page.evaluate((id) => {
@@ -287,7 +289,7 @@ test("the info line paints its labels, and its line block draws them as one stat
     return { code: null, width: drawing.options().width };
   }, info.id);
   expect(rejected.code).toBe("invalid_options");
-  expect(rejected.width).toBe(2);
+  expect(rejected.width).toBe(1);
 });
 
 test("a cross line drags on both axes from either line and undoes as one step", async ({ page }) => {

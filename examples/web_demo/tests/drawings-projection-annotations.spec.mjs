@@ -585,7 +585,8 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   const start = await px();
   const start_points = await points();
 
-  // Pointer: the tip handle follows the pointer and the box stays; one undo restores it.
+  // Pointer: the tip handle follows the pointer onto the bar slot under it at the raw price, and
+  // the box stays; one undo restores it.
   await page.mouse.move(start[0].x, start[0].y);
   await page.mouse.down();
   await page.mouse.move(start[0].x - 20, start[0].y + 15, { steps: 4 });
@@ -593,7 +594,9 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   await page.mouse.up();
   await settle_frames(page);
   const dragged = await px();
-  expect(dragged[0].x).toBeCloseTo(start[0].x - 40, 2);
+  const tip_bars = (await points())[0].logical - l0;
+  expect(Number.isInteger(tip_bars)).toBe(true);
+  expect(Math.abs(dragged[0].x - (start[0].x - 40))).toBeLessThanOrEqual(spacing / 2 + 1e-6);
   expect(dragged[0].y).toBeCloseTo(start[0].y + 30, 2);
   expect((await points())[1]).toEqual(start_points[1]);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
@@ -612,13 +615,14 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
     key("Tab"); // handle 1: the tip
     key("Tab"); // handle 2: the box
     key("ArrowUp", true); // 10 CSS px
-    key("ArrowRight"); // 1 CSS px
+    key("ArrowRight"); // one bar
     key("Enter");
     return chart.drawing_handle_count(id);
   }, id);
   expect(handles).toBe(2);
   const keyed = await px();
-  expect(keyed[1].x).toBeCloseTo(start[1].x + 1, 2);
+  expect((await points())[1].logical).toBe(start_points[1].logical + 1);
+  expect(keyed[1].x).toBeCloseTo(start[1].x + spacing, 2);
   expect(keyed[1].y).toBeCloseTo(start[1].y - 10, 2);
   expect((await points())[0]).toEqual(start_points[0]);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);

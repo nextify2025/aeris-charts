@@ -206,7 +206,7 @@ fn catalog_defaults_follow_each_tool() {
             assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 2 });
         }
         // Only the measuring ranges snap their anchors to whole bars and price ticks.
-        assert_eq!(spec.grid_snap, ranged, "{kind:?}");
+        assert_eq!(spec.price_tick_snap, ranged, "{kind:?}");
         let mut drawing = crate::Drawing::new(1, kind, 0, Vec::new());
         crate::drawings::kinds::apply_legacy_fork_defaults(&mut drawing);
         assert_eq!(
@@ -696,12 +696,13 @@ fn anchors_px(chart: &ChartEngine, id: DrawingId) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// A grid-snapped tool's anchor after a move: on the bar slot and price tick nearest the raw
-/// point, never further than half a slot or half a tick (0.01 on this scale) from it.
-fn assert_snapped_to_the_grid(
+/// `now` sits on the bar slot nearest the raw pointer position `raw_px`: a whole bar, at the raw
+/// price, or on the nearest price tick for the tick-snapped tools (the measuring ranges).
+fn assert_on_the_slot(
     chart: &ChartEngine,
     now: DrawingPoint,
     raw_px: (f64, f64),
+    tick: bool,
     context: &str,
 ) {
     let raw = chart
@@ -714,6 +715,15 @@ fn assert_snapped_to_the_grid(
         now.logical,
         raw.logical
     );
+    if !tick {
+        assert!(
+            (now.price - raw.price).abs() < 1e-9,
+            "{context}: raw price ({} vs {})",
+            now.price,
+            raw.price
+        );
+        return;
+    }
     assert!(
         (now.price * 100.0 - (now.price * 100.0).round()).abs() < 1e-6,
         "{context}: price tick"
@@ -741,9 +751,10 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
         assert_eq!(chart.drawing_handle_count(id), Some(count), "{kind:?}");
         let start = anchors_px(&chart, id);
         let start_points = chart.drawing(id).unwrap().points.clone();
-        // Grid-snapped tools (the measuring ranges) land on whole bars and price ticks instead
-        // of following the pointer pixel for pixel.
-        let grid = kind.spec().grid_snap;
+        // Every tool but the screen-pinned anchored text lands on whole bars; the measuring
+        // ranges also land on price ticks, the rest keep the raw price.
+        let bars = kind != DrawingKind::AnchoredText;
+        let tick = kind.spec().price_tick_snap;
         for handle in 0..count {
             // Pointer drag of the handle: only that anchor follows the pointer.
             let (x, y) = start[handle];
@@ -756,14 +767,15 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
             assert!(chart.drawing_drag_start_at(x, y));
             chart.drawing_drag_to(x + 13.0, y - 9.0, DrawingModifiers::default());
             chart.drawing_drag_end();
-            if grid {
+            if bars {
                 let points = chart.drawing(id).unwrap().points.clone();
                 for (index, (now, before)) in points.iter().zip(&start_points).enumerate() {
                     if index == handle {
-                        assert_snapped_to_the_grid(
+                        assert_on_the_slot(
                             &chart,
                             *now,
                             (start[handle].0 + 13.0, start[handle].1 - 9.0),
+                            tick,
                             &format!("{kind:?} handle {handle} drag"),
                         );
                     } else {
@@ -785,14 +797,15 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
                 }
             }
             assert!(chart.undo_drawing(), "{kind:?}");
-            // Keyboard nudge of the same handle.
+            // Keyboard nudge of the same handle: vertical, so the anchor keeps its bar.
             assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(handle)));
-            if grid {
+            if tick {
                 let points = chart.drawing(id).unwrap().points.clone();
-                assert_snapped_to_the_grid(
+                assert_on_the_slot(
                     &chart,
                     points[handle],
                     (start[handle].0, start[handle].1 - 10.0),
+                    tick,
                     &format!("{kind:?} nudged handle {handle}"),
                 );
                 assert_eq!(points[handle].logical, start_points[handle].logical);
@@ -806,16 +819,19 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
             assert!(chart.undo_drawing());
             assert!(close(anchor(&chart, id, handle), start[handle], 1e-6));
         }
-        // Body drag and body nudge translate every anchor rigidly (grid-snapped tools: by one
-        // shared whole-bar step, each anchor's price on its own tick).
+        // Body drag and body nudge translate every anchor rigidly (by one shared whole-bar
+        // step; the measuring ranges put each anchor's price on its own tick).
         let (x, y) = body_point(&chart, id);
         assert!(chart.drawing_drag_start_at(x, y), "{kind:?}");
         chart.drawing_drag_to(x + 17.0, y + 11.0, DrawingModifiers::default());
         chart.drawing_drag_end();
-        if grid {
+        if bars {
             let points = chart.drawing(id).unwrap().points.clone();
             let steps = points[0].logical - start_points[0].logical;
             assert_eq!(steps, steps.round(), "{kind:?} body drag whole bars");
+            // The body follows the slot changes under the grabbed point.
+            let slot = |x: f64| chart.coordinate_to_logical(x).unwrap();
+            assert_eq!(steps, slot(x + 17.0) - slot(x), "{kind:?} body drag steps");
             for (index, (now, before)) in points.iter().zip(&start_points).enumerate() {
                 assert_eq!(now.logical - before.logical, steps, "{kind:?} body drag");
                 let raw = chart
@@ -826,11 +842,18 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
                         start[index].1 + 11.0,
                     )
                     .unwrap();
-                assert!(
-                    (now.price - raw.price).abs() <= 0.005 + 1e-9
-                        && (now.price * 100.0 - (now.price * 100.0).round()).abs() < 1e-6,
-                    "{kind:?} body drag price tick"
-                );
+                if tick {
+                    assert!(
+                        (now.price - raw.price).abs() <= 0.005 + 1e-9
+                            && (now.price * 100.0 - (now.price * 100.0).round()).abs() < 1e-6,
+                        "{kind:?} body drag price tick"
+                    );
+                } else {
+                    assert!(
+                        (now.price - raw.price).abs() < 1e-9,
+                        "{kind:?} body drag raw price"
+                    );
+                }
             }
         } else {
             for (now, before) in anchors_px(&chart, id).into_iter().zip(&start) {
@@ -842,7 +865,7 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
         }
         assert!(chart.undo_drawing());
         assert!(chart.nudge_selected_drawing(5.0, 0.0, None));
-        if grid {
+        if bars {
             // A key step below one bar still moves the whole body by exactly one bar.
             let points = chart.drawing(id).unwrap().points.clone();
             for (now, before) in points.iter().zip(&start_points) {
@@ -1016,6 +1039,90 @@ fn style_templates_keep_each_annotations_own_text() {
         assert_eq!(restyled.text_color.as_deref(), Some("#123456"), "{kind:?}");
         assert_eq!(restyled.text_size, Some(19.0), "{kind:?}");
     }
+}
+
+/// The bars pattern's source window (its first two anchors) shows as a dashed outline while the
+/// pattern is placed, from its first anchor to the pointer on, and while it is selected; an
+/// unselected pattern paints only its copied bars.
+#[test]
+fn a_bars_patterns_source_window_outlines_in_its_preview_and_selection_only() {
+    // The dashed ink rules of the first pane as one (left, top, right, bottom) box, if any.
+    let outline = |chart: &mut ChartEngine| {
+        let ink = Color::parse_css(INK).unwrap();
+        let frame = chart.build_frame();
+        let (mut rows, mut columns) = (Vec::new(), Vec::new());
+        for prim in &frame.panes[0].main {
+            match *prim {
+                Prim::HLine {
+                    y,
+                    x0,
+                    x1,
+                    style: LineStyle::Dashed,
+                    color,
+                    ..
+                } if color == ink => rows.push((y, x0, x1)),
+                Prim::VLine {
+                    x,
+                    y0,
+                    y1,
+                    style: LineStyle::Dashed,
+                    color,
+                    ..
+                } if color == ink => columns.push((x, y0, y1)),
+                _ => {}
+            }
+        }
+        if rows.is_empty() && columns.is_empty() {
+            return None;
+        }
+        assert_eq!((rows.len(), columns.len()), (2, 2), "{rows:?} {columns:?}");
+        let (left, right) = (columns[0].0, columns[1].0);
+        let (top, bottom) = (rows[0].0, rows[1].0);
+        assert!(rows.iter().all(|&(_, x0, x1)| (x0, x1) == (left, right)));
+        assert!(columns.iter().all(|&(_, y0, y1)| (y0, y1) == (top, bottom)));
+        Some((left, top, right, bottom))
+    };
+    let window = |a: (f64, f64), b: (f64, f64)| {
+        Some((
+            a.0.min(b.0).round() as i32,
+            a.1.min(b.1).round() as i32,
+            a.0.max(b.0).round() as i32,
+            a.1.max(b.1).round() as i32,
+        ))
+    };
+    let mut chart = chart();
+    let slot = |chart: &ChartEngine, (x, y): (f64, f64)| {
+        let logical = chart.coordinate_to_logical(x).unwrap();
+        (chart.logical_to_coordinate(logical).unwrap(), y)
+    };
+    let modifiers = DrawingModifiers::default();
+    assert!(chart.set_drawing_tool(
+        Some(DrawingKind::BarsPattern),
+        Some(r##"{"color":"#123456"}"##),
+        None
+    ));
+    let (a, b, c) = ((200.0, 300.0), (330.0, 260.0), (520.0, 200.0));
+    assert_eq!(outline(&mut chart), None, "nothing placed");
+    chart.drawing_tool_activate(a.0, a.1, modifiers);
+    chart.drawing_tool_pointer_move(b.0, b.1, modifiers, false);
+    assert_eq!(
+        outline(&mut chart),
+        window(slot(&chart, a), slot(&chart, b)),
+        "the window follows the pointer"
+    );
+    chart.drawing_tool_activate(b.0, b.1, modifiers);
+    let id = chart
+        .drawing_tool_activate(c.0, c.1, modifiers)
+        .created
+        .expect("committed");
+    assert_eq!(chart.selected_drawing(), Some(id));
+    assert!(!chart.drawing(id).unwrap().bars_pattern.is_empty());
+    let source = window(anchor(&chart, id, 0), anchor(&chart, id, 1));
+    assert_eq!(outline(&mut chart), source, "selected");
+    chart.set_selected_drawing(None);
+    assert_eq!(outline(&mut chart), None, "unselected");
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(outline(&mut chart), source);
 }
 
 #[test]
@@ -2214,21 +2321,28 @@ fn fork_form_comments_and_price_labels_are_speech_bubbles_at_their_anchor() {
     // The editor edits from the line after the price.
     let layout = chart.drawing_text_edit_layout(label).unwrap();
     assert!(layout.multiline && (layout.y - entry_y).abs() < 1e-3);
-    // Upstream's price label keeps its right-edge tag.
+    // Upstream's price label keeps its own bubble: a tail whose tip is the anchor and the price
+    // left-aligned above-right of it, never the fork's speech bubble.
+    chart.remove_drawing(label);
     let upstream = add(
         &mut chart,
         DrawingKind::PriceLabel,
         vec![p(15.0, 103.0)],
         "{}",
     );
+    let tip = anchor(&chart, upstream, 0);
     let frame = chart.build_frame();
-    assert!(
-        frame.panes[0].main.iter().any(|prim| matches!(
-            prim,
-            Prim::Text { x, align: TextAlign::Right, .. } if f64::from(*x) > chart.pane_w - 10.0
-        )),
-        "{upstream}"
-    );
+    let main = &frame.panes[0].main;
+    assert!(main.iter().any(|prim| matches!(
+        prim,
+        Prim::Triangle { a, .. } if close((f64::from(a[0]), f64::from(a[1])), tip, 1e-3)
+    )));
+    assert!(main.iter().any(|prim| matches!(
+        prim,
+        Prim::Text { text, x, y, align: TextAlign::Left, .. }
+            if *text == price && f64::from(*x) > tip.0 && f64::from(*y) < tip.1
+    )));
+    assert!(band_fills(&mut chart).is_empty(), "{upstream}");
 }
 
 #[test]

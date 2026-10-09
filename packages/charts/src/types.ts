@@ -2769,6 +2769,14 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * Built-in drawing kinds. Each kind has an engine-owned placement rule, editable defining
  * anchors, shared frame geometry, and a stable wire ID in DRAWING_KIND_TO_U8.
  *
+ * Every kind except `anchored_text` lands its anchors on the bar slot under the pointer while
+ * placing, dragging, and moving its body, so drawings step bar by bar horizontally (a magnet's
+ * chosen bar wins; Shift-straightening runs after the snap; freehand strokes stay unsnapped), and
+ * a horizontal keyboard nudge steps whole bars (a rotated rectangle's width handle, a perpendicular
+ * distance, moves by px). Prices stay raw except on the measuring tools and
+ * the long and short positions, which also snap to price ticks. Every kind defaults to a 1 px
+ * line except the 12 px `highlighter`.
+ *
  * The measuring tools (`price_range`, `date_range`, `date_price_range`) snap both anchors to
  * whole bars and price ticks, and the measured sign follows start → end. Holding Shift while
  * clicking an empty pane starts a transient date-and-price range (the quick measure; it is never
@@ -2781,7 +2789,12 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * `arrow_line` reaches the pane's top or bottom edge on the ends those flags select, and one whose
  * two anchors coincide stays at its anchor. The `fibonacci_retracement`, `fibonacci_extension`,
  * and `fibonacci_channel` levels run to the pane's left and right edges by the same flags (the
- * channel's along their slope).
+ * channel's along their slope). Without a `tool_options.line` block an `info_line` paints one
+ * statistics card of its visible `labels` beside its midpoint and a `trend_angle` a dotted
+ * horizontal reference, a dotted arc, and its signed angle. The third handle of a
+ * `parallel_channel`, `flat_top_channel`, `flat_bottom_channel`, or `fibonacci_channel` sits on
+ * its second line (level 1), between the base anchors; a `regression_trend`'s handles sit on the
+ * fitted line's ends.
  *
  * The patterns and Elliott waves are a polyline through their anchors with a label above each
  * vertex; labels are body targets, and the tools preview as the drawing they commit from the
@@ -2802,7 +2815,8 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * the on-screen width. `arc` is placed by its start, its end, then a point it passes through
  * (stored as start, through point, end); `curve` by its start, its end, then its point at t = 1/2,
  * and `double_curve` by its start, its end, then its points at t = 1/3 and 2/3 (both stored as
- * Bézier start, control points, end, with their handles on the curve). An arc, curve, or double
+ * start, the points on the curve, end: the curve passes through every anchor, each anchor is a
+ * plain handle, and `add_drawing` takes the same order). An arc, curve, or double
  * curve fills the region between it and its chord while `fill_enabled` and caps its ends by
  * `stroke_start`/`stroke_end`; a curve continues its end tangents to the pane edge by
  * `extend_left`/`extend_right` (an extended end carries no cap). A `polyline` closes by
@@ -3209,8 +3223,9 @@ export type drawing_stats_position = "start" | "middle" | "end";
  * On the line tools of the shared catalog (`ray`, `extended_line`, `info_line`, `trend_angle`,
  * `cross_line`, `arrow_line`) the block's presence selects the earlier fork look, layered on the
  * shared rendering: the visible `labels` as one engine-formatted stats box (hoverable and
- * selectable) instead of one text per label, the trend angle's dashed horizontal reference, arc,
- * and screen angle folded into [-90°, 90°], and end caps only on the ends that do not reach the
+ * selectable) instead of the info line's statistics card, the trend angle's dashed horizontal
+ * reference, arc, and screen angle folded into [-90°, 90°] instead of its dotted reference, arc,
+ * and signed angle, and end caps only on the ends that do not reach the
  * pane edge, with the stroke trimmed under an arrowhead and the caps as hit targets. Without the
  * block these tools render as the shared catalog does; `null` removes it, and writing any key
  * (`{}` included) creates it. New drawings have none. Documents an earlier fork build wrote restore
@@ -3265,7 +3280,10 @@ export interface channel_tool_options {
  * speed fan, `label_v_align` `"middle"` on the price tools and `"bottom"` on the time tools, and
  * the block itself on the wedge). A stored block (with any key; an empty patch block is dropped)
  * also tessellates the rings of `fibonacci_speed_arcs`, `fibonacci_circles`, and
- * `fibonacci_wedge` within a quarter pixel over the part the pane shows. Level labels on every
+ * `fibonacci_wedge` within a tenth of a pixel over the part the pane shows (without one they are
+ * whole circles within the same tenth of a pixel). On `fibonacci_extension` and
+ * `fibonacci_trend_time` a stored block draws the `trend_line` in place of the dashed
+ * construction guides the shared catalog draws through their anchors without one. Level labels on every
  * Fibonacci tool, and its filled bands while it is selected, are drag surfaces like its lines.
  * A `fibonacci_spiral` with an empty `levels` list paints the golden spiral (growing by φ every
  * quarter turn) through its second anchor instead of the level spirals.
@@ -3285,10 +3303,12 @@ export interface fibonacci_tool_options {
   /** @deprecated Input alias of `level_log_scale`. */
   log_scale?: boolean;
   /**
-   * Trend line through the anchors in the drawing's own stroke (default off): both legs on the
-   * extension and trend time, the level-1 diameter through both anchors on the circles, a
-   * 1 CSS px dashed line on the spiral. A drag surface. Retracement, extension, time zones,
-   * trend time, speed arcs, circles, spiral.
+   * Trend line through the anchors in the drawing's own stroke (default off, but on for the
+   * extension and trend time, whose legs a block-less drawing shows as dashed construction
+   * guides, so a block a patch creates keeps them visible): both legs on the extension and trend
+   * time, the level-1 diameter through both anchors on the circles, a 1 CSS px dashed line on the
+   * spiral. A drag surface. Retracement, extension, time zones, trend time, speed arcs, circles,
+   * spiral.
    */
   trend_line?: boolean;
   /**
@@ -3388,7 +3408,8 @@ export type drawing_icon =
  * The block's presence (even `{}`) selects the earlier fork build's look of `projection` (a
  * filled sector and a stats box beside the target), `note` (a pin whose text box shows while the
  * note is hovered, selected, or edited), `comment` and `price_label` (speech bubbles at the
- * anchor, the price label's price first), `price_note` (its price and text in one box),
+ * anchor, the price label's price first, instead of the price label's rounded bubble above-right
+ * of its anchor, whose inline editor sits on its text), `price_note` (its price and text in one box),
  * `signpost` (a text plate; placing it opens the editor), the arrow markers (their text past the
  * tail), and `forecast` (source and target boxes with `Success`/`Failure` on the market colors);
  * `null` restores the upstream look, which new drawings keep. Placing a note, comment, callout,
@@ -3539,7 +3560,7 @@ export interface drawing_options {
   price_scale_id: "left" | "right" | "overlay";
   /** Line/border color (default: the canonical primary token). */
   color: string;
-  /** Stroke width in CSS px (default 2; 1 for a rectangle's border). */
+  /** Stroke width in CSS px (default 1; 12 for the highlighter). */
   width: number;
   /** Stroke style (default `"solid"`). */
   style: line_style;

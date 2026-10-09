@@ -365,23 +365,31 @@ fn drags_nudges_and_undo_edit_patterns_as_single_history_entries() {
     for index in [0, 1, 3, 4] {
         assert_eq!(after[index], before[index], "only anchor 2 moves");
     }
+    // Bars are 20 px apart: the anchor steps one whole bar and keeps the raw price.
+    assert_eq!(chart.bar_spacing(), 20.0);
+    assert_eq!(after[2].logical, before[2].logical + 1.0);
     assert!(close(anchor(&chart, id, 2), (bx + 20.0, by + 10.0), 1e-6));
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().points, before);
 
-    // Body drag from the first leg moves every anchor rigidly.
+    // Body drag from the first leg (a third of the way along, on bar 7) moves every anchor
+    // rigidly by whole bars: 45 px is two bars.
     let (x0, x1) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
-    let grab = ((x0.0 + x1.0) / 2.0, (x0.1 + x1.1) / 2.0);
+    let grab = (x0.0 + (x1.0 - x0.0) / 3.0, x0.1 + (x1.1 - x0.1) / 3.0);
     chart.set_selected_drawing(None);
     assert!(chart.drawing_drag_start_at(grab.0, grab.1));
-    chart.drawing_drag_to(grab.0 + 30.0, grab.1 - 12.0, DrawingModifiers::default());
+    chart.drawing_drag_to(grab.0 + 45.0, grab.1 - 12.0, DrawingModifiers::default());
     chart.drawing_drag_end();
     for (index, &point) in before.iter().enumerate() {
         let moved = anchor(&chart, id, index);
         let original = chart
             .drawing_to_px_for(0, DrawingPriceScale::Right, point)
             .unwrap();
-        assert!(close(moved, (original.0 + 30.0, original.1 - 12.0), 1e-6));
+        assert!(close(moved, (original.0 + 40.0, original.1 - 12.0), 1e-6));
+        assert_eq!(
+            chart.drawing(id).unwrap().points[index].logical,
+            point.logical + 2.0
+        );
     }
     assert!(chart.undo_drawing());
 
@@ -389,9 +397,14 @@ fn drags_nudges_and_undo_edit_patterns_as_single_history_entries() {
     assert_eq!(chart.drawing_handle_count(id), Some(5));
     chart.set_selected_drawing(Some(id));
     let (x3, y3) = anchor(&chart, id, 3);
+    // Horizontal nudges step whole bars, at least one: 10 px is one bar.
     assert!(chart.nudge_selected_drawing(10.0, 0.0, Some(3)));
     let (nx, ny) = anchor(&chart, id, 3);
-    assert!((nx - x3 - 10.0).abs() < 1e-6 && (ny - y3).abs() < 1e-6);
+    assert!((nx - x3 - 20.0).abs() < 1e-6 && (ny - y3).abs() < 1e-6);
+    assert_eq!(
+        chart.drawing(id).unwrap().points[3].logical,
+        before[3].logical + 1.0
+    );
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().points, before);
 

@@ -427,9 +427,12 @@ test("a pitchfork drags its base midpoint and a fixed Gann square resizes from i
   await settle_frames(page);
   const after = await points_of(page, fork);
   expect(after[0]).toEqual(before[0]);
-  // B and C move together by the pointer's move (fractional bars, so measured by bar spacing).
+  // B and C move together by whole bars, the bars the pointer's move crossed (within one bar of
+  // its 24 px), and by its vertical move in price.
   const spacing = (c.x - b.x) / (s.l1 - s.lm);
-  expect((after[1].logical - before[1].logical) * spacing).toBeCloseTo(24, 0);
+  const shift = after[1].logical - before[1].logical;
+  expect(Number.isInteger(shift)).toBe(true);
+  expect(Math.abs(shift * spacing - 24)).toBeLessThanOrEqual(spacing);
   const moved_y = await page.evaluate((price) => window.__main.price_to_coordinate(price), after[1].price);
   expect(moved_y - b.y).toBeCloseTo(-18, 0);
   expect(after[2].logical - before[2].logical).toBeCloseTo(after[1].logical - before[1].logical, 6);

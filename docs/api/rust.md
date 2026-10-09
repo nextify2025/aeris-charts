@@ -160,7 +160,7 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - 上游自 `5a2e6e8` 起的固定修订具有 `DrawingKind::DatePriceRange`、种类名称 `date_price_range`，以及线上 id 13（`PriceRange`）、14（`DateRange`）和 15（`DatePriceRange`）。自有线自 `36c9f09` 起的固定修订（例如 `36c9f09` 本身）已经具有 `DrawingKind::DateAndPriceRange`、名称 `date_and_price_range` 以及 id 130、131 和 132，main 将其一直保留到 B8 目录合并为止。对自有线的固定修订而言，没有重命名，也没有 id 重映射；只适用下文的网格吸附。任一侧早于这些提交的固定修订都没有范围工具。
 - 对上游的固定修订而言，`DrawingKind::DatePriceRange` 现在是 `DrawingKind::DateAndPriceRange`（`PriceRange` 与 `DateRange` 保持原名）。`DrawingKind::to_u8` 与 `from_u8` 的数值线上 id 已变动：`PriceRange` 为 130，`DateRange` 为 131，`DateAndPriceRange` 为 132，此前分别为 13、14 和 15。id 13 至 15 现为未分配，id 0 至 12 不变，因此存储了上游固定修订数值 id 的宿主需要重映射这些 id。
 - 种类名称 `date_price_range` 仍会被读取（serde 别名和 `DrawingKind::from_name`），但绝不会被写出，因此由上游固定修订保存的文档仍可加载；保存的文档、模板和剪贴板载荷写出的是 `date_and_price_range`。
-- 网格吸附。三个范围工具以及多头和空头仓位工具的创建、锚点拖动、主体拖动和键盘微调，都会吸附到整根柱以及品种 tick 或价格带价位梯。合并之前的自有线固定修订在这些工具上没有这种吸附，因此这五个工具都会获得这一变更（仓位工具的价格吸附更早，随合并 `2e7d19f` 引入）。上游自 `5a2e6e8` 起的固定修订已经让它们吸附到柱和价格 tick；它新增了价格带价位梯（`SeriesPriceFormat::tick_ladder`）。
+- 网格吸附。三个范围工具以及多头和空头仓位工具的创建、锚点拖动、主体拖动和键盘微调，都会吸附到整根柱以及品种 tick 或价格带价位梯。合并之前的自有线固定修订在这些工具上没有这种吸附，因此这五个工具都会获得这一变更（仓位工具的价格吸附更早，随合并 `2e7d19f` 引入）。上游自 `5a2e6e8` 起的固定修订已经让它们吸附到柱和价格 tick；它新增了价格带价位梯（`SeriesPriceFormat::tick_ladder`）。自 `664d347` 起（见上文“绘图逐柱移动”分组），时间槽吸附适用于除锚定文本外的每个工具，价格 tick 吸附仍只用于这五个工具（目录规格字段 `price_tick_snap`，crate 内部）。
 - Shift 点击快速测量随 `5a2e6e8` 引入（合并之前的自有线固定修订从未具有它）。main 由输入控制器驱动它（在窗格上按下 Shift），因此无需为此调用 `measure_pointer_*`。
 
 **B8 绘图目录与 B7 重采样**（两条线，来自将上游的 `57e00de feat(charts): complete B7 profiles and resampling` 与 `1b81852 B8: complete professional drawing catalog expansion` 合入自有线 `ace49b5` 的合并；参见[绘图族](drawings.md#绘图族)、[持久化 V1](compatibility.md#持久化-v1)和[重采样](aggregation.md#重采样)）。上游的 `1b81852` 与自有线的 `36c9f09 feat(charts): B8 drawing catalog, multi-calendar overlays, bounded ticks, tick-built candles, and resampling` 各自独立地构建了同一个绘图目录。该合并采纳了上游的目录、名称、线上 id、锚点契约、选项字段和渲染器，并保留了自有线的七个自有工具、其测量工具实现、其数据读取器以及其基于 id 的文本编辑。上游自 `1b81852` 起的固定修订已经具有上游的目录，因此只有面向上游固定修订的条目适用于它；自有线固定修订（直到 `ace49b5` 为止的任何固定修订）适用面向自有线固定修订的条目。
@@ -307,6 +307,16 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 
 - 行为变更（签名不变）：`SessionStudy::OpeningRange`、`session_study`、`SessionStudyState` 以及 `ChartEngine::add_opening_range` 与任何 `IndicatorKind::OpeningRange` 绑定，在 `Exchange`、`Utc` 与 `Host` 三种来源下都从时段第一根有效 K 线（开高低收均为有限值且最高不低于最低）的时间开始计时，此前分别从最近一次本地交易时段起点、UTC 午夜与宿主时段起点开始。第一根 K 线晚于时段起点的时段，以及开盘柱缺失或为空白数据的时段，输出会不同；其余时段不变。
 - 破坏性（源码级）：移除 `aeris_charts_core::scale::exchange_time::ExchangeTime::session_open_utc`；`aeris_charts_indicators::SessionSource::Exchange` 只剩 `trading_day_seconds` 字段，构造它时写出 `session_open` 的代码需要删去该字段。`SessionSource` 仍是手写 `Debug`，输出不变。
+
+**绘图逐柱移动、曲线经过锚点、信息线卡片与实时预览**（上游，来自 `664d347 feat(engine): live drawing previews, round curves, on-stroke handles, info line card`，经合并 `664d347` 的提交引入；参见[绘图](../architecture/engine/drawings.md#规范状态与工具目录)、[目录修订 3](../architecture/engine/drawing-families.md#目录修订-3)与[兼容性](compatibility.md#已记录的不兼容变更)）。没有新增或改变签名的公共类型（目录规格 `DrawingToolSpec` 是 crate 内部的，其 `grid_snap` 改名为 `price_tick_snap` 不构成编译期破坏），只有行为变更：
+
+- `ChartEngine::nudge_selected_drawing(dx_css, dy_css, handle)` 把非零的 `dx_css` 取整为整数个柱间距（至少一个），`dy_css` 仍按 CSS px；输入控制器的左右方向键每次一根柱（按住 Shift 为十根）。旋转矩形的宽度手柄表示垂直距离，不取整，方向键每次移动 1 CSS px（按住 Shift 为 10 px）。按 CSS px 微移、并断言小数逻辑位置的宿主需要更新。
+- 放置、锚点与手柄拖动以及主体移动把除 `AnchoredText` 外每个种类的锚点逻辑位置吸附到十字光标的时间槽（磁吸选中的柱优先）；价格只在测量与仓位种类上吸附到 tick。经 `add_drawing` 等 API 程序化设置的锚点不吸附。
+- 每个目录种类的默认 `Drawing::width` 为 1.0（`Highlighter` 为 12.0），包括自有线的四个线段工具与 `PriceChannel`；持久化、剪贴板与同步总是写出 `width`，因此已保存的绘图不变。
+- 多头与空头仓位的统计只在其为主选中绘图时进入帧（保留的 chrome 层）；`set_selected_drawing` 等每条选择路径在下一次帧输入同步时刷新它们。
+- `DrawingKind::Curve` 与 `DoubleCurve` 的锚点是曲线上的点：二次曲线为起点、t = 1/2 处的点、终点，三次曲线为起点、t = 1/3 与 2/3 处的点、终点，贝塞尔控制点由引擎推导。以控制点构造曲线的宿主需要改为传入曲线上的点；内部手柄的 `DrawingHit::part` 现在是 `DrawingDragPart::Anchor(k)`（此前为 `Handle(k)`）。持久化导出 `drawing_catalog: 3`，修订 2 的文档在恢复时精确转换（见[目录修订 3](../architecture/engine/drawing-families.md#目录修订-3)）。
+- `InfoLine` 的默认 `labels` 由四项变为七项（加上 tick 数、持续时间与距离），不带 `tool_options.line` 块时以一张统计卡片绘制；`TrendAngle` 不带该块时绘制点线参考线、圆弧与带符号的角度；`PriceLabel` 不带 `tool_options.projection_annotation` 块时绘制为锚点右上方的气泡，`drawing_text_edit_layout` 返回气泡的文本行。读取帧图元或像素的宿主需要更新基线。
+- 选中手柄与构造引导线：平行、平顶、平底与斐波那契通道的第三个手柄（`drawing_handle_count` 不变）移到第二条线上；不带 `tool_options.fibonacci` 块的斐波那契扩展与趋势时间、以及每个叉形线绘制可命中的构造引导线；椭圆、圆、圆弧、曲线与圆环按 0.1 px 的容差细分，点数约为此前的 1.6 倍，仍有界。
 
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 
