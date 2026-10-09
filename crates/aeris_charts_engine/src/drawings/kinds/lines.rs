@@ -2,7 +2,10 @@
 //! vertical ray, and vertical segment (axis-locked segments) and the price line. The upstream
 //! catalog's line tools (ray, extended line, info line, trend angle, cross line, arrow line) are
 //! upstream-rendered and carry no family hooks; [`legacy_defaults`] keeps the fork's pre-merge
-//! defaults of those tools for documents the fork wrote.
+//! defaults of those tools for documents the fork wrote, and the stored `tool_options.line` block
+//! layers the fork's presentation on their upstream arms ([`fork_presentation`]): the stats box,
+//! the trend angle's reference, arc and angle, and the segment tools' caps on their unextended
+//! ends, trimmed under arrowheads.
 //!
 //! The axis-locked segments share one geometry: the first two anchors, extended beyond the first
 //! anchor by `extend_left` and beyond the second by `extend_right` to the pane edge (the vertical
@@ -11,12 +14,12 @@
 //! printed above the line and tagged on the price axis. Any visible `labels` render as one stats
 //! box (see [`ChartEngine::drawing_stat_lines`]).
 
-use aeris_charts_render::color::Color;
+use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point};
 
+use super::super::geometry::{segment_extension, DrawingGeometryOptions, CURVE_TOLERANCE};
 use super::super::parts::{
-    text_on, DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_GAP,
-    STATS_PADDING,
+    cap_radius, text_on, DrawingParts, PartContext, PartLabel, PartStroke, STATS_GAP, STATS_PADDING,
 };
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
@@ -59,6 +62,14 @@ impl DrawingStatsPosition {
 pub struct LineToolOptions {
     pub stats_position: DrawingStatsPosition,
 }
+
+/// Trend-angle arc radius bounds in CSS px (a third of the segment between them).
+const ANGLE_ARC_MIN: f64 = 16.0;
+const ANGLE_ARC_MAX: f64 = 48.0;
+/// Gap between the arc and the angle text in CSS px.
+const ANGLE_LABEL_GAP: f64 = 6.0;
+/// Width of the trend angle's reference line and arc in CSS px.
+const ANGLE_DECORATION_WIDTH: f64 = 1.0;
 
 /// Shared two-anchor segment behavior; every spec below overrides its identity.
 const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
@@ -168,6 +179,125 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
     }
 }
 
+/// The fork's unstored `tool_options` default of the upstream line tools it rendered (see
+/// [`super::legacy_fork_tool_options`]): every one drew its visible `labels` as one stats box,
+/// which the presence of the `line` block selects on upstream's lowering.
+pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, serde_json::Value)> {
+    upstream_line(kind).then(|| ("line", serde_json::json!({})))
+}
+
+/// The upstream catalog's line tools, which the fork rendered as this family.
+const fn upstream_line(kind: DrawingKind) -> bool {
+    matches!(
+        kind,
+        DrawingKind::Ray
+            | DrawingKind::ExtendedLine
+            | DrawingKind::InfoLine
+            | DrawingKind::TrendAngle
+            | DrawingKind::CrossLine
+            | DrawingKind::ArrowLine
+    )
+}
+
+/// Whether the stored `tool_options.line` block selects the fork's presentation of an upstream
+/// line tool ([`upstream_line_parts`] layered on its upstream arm): its visible `labels` as one
+/// stats box instead of upstream's per-label text, the trend angle's reference line, arc and
+/// angle, and the segment tools' caps through the parts layer. Without the block the tool renders
+/// exactly as upstream does; `tool_options.line: null` removes it.
+pub(crate) fn fork_presentation(drawing: &Drawing) -> bool {
+    upstream_line(drawing.kind) && drawing.tool_options.line.is_some()
+}
+
+/// Whether `drawing` paints the trend angle's dashed reference, arc and angle.
+pub(crate) fn draws_angle_reference(drawing: &Drawing) -> bool {
+    drawing.kind == DrawingKind::TrendAngle
+        && drawing.points.len() >= 2
+        && fork_presentation(drawing)
+}
+
+/// The x the trend angle's dashed reference reaches from its first anchor `a` (in any px space,
+/// with its second anchor `b`): as long as the segment, toward the second anchor's side. Paint and
+/// the screen culling box share it, so the reference stays inside the box at any zoom.
+pub(crate) fn angle_reference_end(a: Point, b: Point) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let direction = if dx < 0.0 { -1.0 } else { 1.0 };
+    a.0 + direction * dx.hypot(dy)
+}
+
+/// The parts the `line` block layers on an upstream line tool's arm ([`fork_presentation`]). For
+/// the five segment tools, `segment` is the upstream body's resolved ends: the stroke between them
+/// with the drawing's caps on the ends that do not reach the pane edge (an arrow end trims the
+/// stroke under its head; see [`DrawingParts::capped_polyline`]) replaces upstream's stroke and
+/// caps, and a trend angle adds its reference, arc and angle. The cross line (`None`) keeps its
+/// crisp upstream lines. The stats box of the visible `labels` comes last.
+pub(crate) fn upstream_line_parts(
+    ctx: &PartContext<'_>,
+    segment: Option<(Point, Point)>,
+    parts: &mut DrawingParts,
+) {
+    let drawing = ctx.drawing;
+    if let Some((a, b)) = segment {
+        let options = DrawingGeometryOptions::for_drawing(drawing, ctx.scale);
+        // The anchors decide the direction (a vertical or empty segment), as in the resolver.
+        let (p, q) = match (ctx.px.first(), ctx.px.get(1)) {
+            (Some(&p), Some(&q)) => (p, q),
+            _ => (a, b),
+        };
+        let (extend_a, extend_b) = segment_extension(drawing.kind, options, p, q);
+        parts.capped_segment(drawing, a, b, (!extend_a, !extend_b), ctx.scale);
+        if let (true, Some(&a), Some(&b)) = (
+            draws_angle_reference(drawing),
+            ctx.px.first(),
+            ctx.px.get(1),
+        ) {
+            angle_decoration(ctx, a, b, parts);
+        }
+    }
+    line_stats(ctx, parts);
+}
+
+/// [`upstream_line_parts`]' reach beyond the anchors in CSS px for the culling pad: the stats box,
+/// the angle's label beside its arc, and the end caps. 0 without the `line` block.
+pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
+    if !fork_presentation(drawing) {
+        return 0.0;
+    }
+    let mut extent = decoration_extent(engine, drawing);
+    if drawing.kind == DrawingKind::TrendAngle {
+        let size = engine.drawing_text_size(drawing);
+        let width = engine.measure_text_run(
+            "-90.00°",
+            size,
+            &engine.options.get().layout.font_family,
+            drawing.text_weight.unwrap_or(400),
+            drawing.text_italic,
+        );
+        extent = extent.max(ANGLE_ARC_MAX + ANGLE_LABEL_GAP + width + size);
+    }
+    if drawing.stroke_start != DrawingLineCap::None || drawing.stroke_end != DrawingLineCap::None {
+        extent = extent.max(cap_radius(drawing.width));
+    }
+    extent
+}
+
+/// The `tool_options.line.stats_position` descriptor of an upstream line tool. Its default is the
+/// position a present block takes; the box itself exists only while the block does.
+pub(crate) fn extend_upstream_schema(
+    kind: DrawingKind,
+    template: &Drawing,
+    properties: &mut Vec<DrawingPropertyDescriptor>,
+) {
+    if upstream_line(kind) {
+        extend_schema(template, properties);
+    }
+}
+
+/// Whether `labels` (a clipboard or sync item's) are the fork's info-line default, which no
+/// upstream drawing carries: upstream's info line starts with four `above` stats.
+pub(crate) fn is_legacy_info_stats(labels: &[DrawingLabelOptions]) -> bool {
+    labels == default_info_stats()
+}
+
 fn options(drawing: &Drawing) -> LineToolOptions {
     drawing.tool_options.line.unwrap_or_default()
 }
@@ -187,7 +317,7 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         let (start, end) = shape::extend_segment(a, b, ctx.pane, extend_start, extend_end);
         parts.capped_segment(drawing, start, end, (!extend_start, !extend_end), ctx.scale);
     }
-    stats_box(ctx, parts);
+    line_stats(ctx, parts);
 }
 
 /// Gap between a price line and the price printed above its start (CSS px).
@@ -216,7 +346,79 @@ fn price_line(ctx: &PartContext<'_>, a: Point, parts: &mut DrawingParts) {
     });
 }
 
-fn stats_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
+/// The dashed horizontal reference toward the second anchor's side, the arc from it to the
+/// segment, and the screen angle beside the arc.
+fn angle_decoration(ctx: &PartContext<'_>, a: Point, b: Point, parts: &mut DrawingParts) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length = dx.hypot(dy);
+    if length <= f64::EPSILON {
+        return;
+    }
+    // Crisp like the horizontal-line tool, so the dash pattern is the executors' shared
+    // full-pixel dash rather than a path dash.
+    let decoration = PartStroke::decoration(ANGLE_DECORATION_WIDTH, LineStyle::Dashed);
+    parts.hline(a.1, a.0, angle_reference_end(a, b), decoration);
+
+    let radius = (length / 3.0)
+        .clamp(ANGLE_ARC_MIN * ctx.scale, ANGLE_ARC_MAX * ctx.scale)
+        .min(length);
+    let start = if dx < 0.0 { std::f64::consts::PI } else { 0.0 };
+    let sweep = {
+        let raw = dy.atan2(dx) - start;
+        (raw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+    };
+    // At most 48 CSS px of radius: the uniform chords stay small and within the tolerance.
+    let mut arc = Vec::new();
+    shape::EllipseArc::circle(a, radius, start, sweep).append_points(CURVE_TOLERANCE, &mut arc);
+    parts.stroke(
+        &arc,
+        PartStroke::decoration(ANGLE_DECORATION_WIDTH, LineStyle::Solid),
+        false,
+    );
+
+    let Some(degrees) = trend_angle_degrees(ctx.engine, ctx.drawing) else {
+        return;
+    };
+    let bisector = start + sweep / 2.0;
+    let distance = radius + ANGLE_LABEL_GAP * ctx.scale;
+    parts.label(PartLabel {
+        anchor: (
+            a.0 + distance * bisector.cos(),
+            a.1 + distance * bisector.sin(),
+        ),
+        h_align: if bisector.cos() >= 0.0 {
+            DrawingTextHAlign::Left
+        } else {
+            DrawingTextHAlign::Right
+        },
+        v_align: DrawingTextVAlign::Middle,
+        lines: vec![format!("{degrees:.2}°")],
+        size: ctx.engine.drawing_text_size(ctx.drawing) * ctx.scale,
+        weight: ctx.drawing.text_weight.unwrap_or(400),
+        italic: ctx.drawing.text_italic,
+        color: None,
+        background: None,
+        border: None,
+        padding: (0.0, 0.0),
+        hit: false,
+    });
+}
+
+/// The trend angle's value: the screen angle of the segment from the horizontal toward its
+/// second anchor, rising positive, folded into [-90°, 90°].
+fn trend_angle_degrees(engine: &ChartEngine, drawing: &Drawing) -> Option<f64> {
+    let (angle, _) = engine.drawing_screen_vector(drawing, 0, 1)?;
+    Some(if angle > 90.0 {
+        180.0 - angle
+    } else if angle < -90.0 {
+        -180.0 - angle
+    } else {
+        angle
+    })
+}
+
+/// The stats box of the visible `labels`, placed by `tool_options.line.stats_position`.
+fn line_stats(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     let drawing = ctx.drawing;
     if !drawing.labels.iter().any(|label| label.visible) {
         return;
@@ -257,15 +459,7 @@ fn stats_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
             DrawingTextVAlign::Top,
         ),
     };
-    let base = drawing.stroke_color();
-    let background = Color::rgba(base.r(), base.g(), base.b(), STATS_ALPHA);
-    parts.label(ctx.stats_label(
-        anchor,
-        (h_align, v_align),
-        lines,
-        background,
-        text_on(background),
-    ));
+    parts.label(ctx.stats_box(anchor, (h_align, v_align), lines, None, text_on));
 }
 
 /// Conservative reach of the stats box beyond the anchors, in CSS px. Text that follows the

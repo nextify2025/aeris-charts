@@ -18,14 +18,17 @@ use std::fmt::Write;
 
 use super::{POSITION_ENTRY, PRIMARY};
 use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
-use crate::drawings::kinds::projection_annotations::{built_in_icon_parts, DrawingIcon};
+use crate::drawings::kinds::patterns_elliott_cycles::{self, PatternLayer};
+use crate::drawings::kinds::projection_annotations::{self, built_in_icon_parts, DrawingIcon};
+use crate::drawings::kinds::{channels, fibonacci, lines, pitchforks_gann, shapes};
 use crate::drawings::{
-    cap_radius, resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
+    arrow_cap_triangle, cap_radius, closed_outline, curve_clip, ellipse_outline, level_band_pairs,
+    resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
     DrawingHandleMode, DrawingId, DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign,
-    DrawingTextLayout, PartContext, PositionGeometry, PositionZone, TEXT_CHROME_PAD, TEXT_PAD,
-    TREND_TEXT_PLACEHOLDER,
+    DrawingTextLayout, FibonacciArcGeometry, PartContext, PositionGeometry, PositionZone,
+    TextBlock, TimeLevelGeometry, TEXT_CHROME_PAD, TEXT_PAD, TREND_TEXT_PLACEHOLDER,
 };
-use crate::ChartEngine;
+use crate::{ChartEngine, FibonacciLabelVAlign};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
 
 /// industry-standard drawing anchor handle: a theme-derived disc with the primary-token border
@@ -68,6 +71,76 @@ fn push_segment(
     push_styled_stroke(out, points, &[a, b], LineType::Simple, stroke, pane);
 }
 
+/// A Fibonacci tool's trend line through its anchors `px` (`kinds::fibonacci::trend_line`), in
+/// the drawing's color and [`fibonacci::trend_stroke`], lowered like a core segment.
+fn push_fibonacci_trend_line(
+    drawing: &Drawing,
+    px: &[(f64, f64)],
+    vpr: f64,
+    pane: aeris_charts_render::shape::Rect,
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+) {
+    if let Some((path, count)) = fibonacci::trend_line(drawing, px) {
+        let (width, style) = fibonacci::trend_stroke(drawing);
+        push_styled_stroke(
+            out,
+            points,
+            &path[..count],
+            LineType::Simple,
+            ((width * vpr) as f32, style, drawing.stroke_color()),
+            pane,
+        );
+    }
+}
+
+/// Whether the box `center ± (rx, ry)` meets `clip` (a closed curve inside that box can paint).
+fn box_meets(center: (f64, f64), rx: f64, ry: f64, clip: aeris_charts_render::shape::Rect) -> bool {
+    clip.intersects(&aeris_charts_render::shape::Rect {
+        left: center.0 - rx,
+        top: center.1 - ry,
+        right: center.0 + rx,
+        bottom: center.1 + ry,
+    })
+}
+
+/// A closed polygon's outline as one run from mid-edge ([`closed_outline`]), in
+/// [`push_segment`]'s styling.
+fn push_closed_outline(
+    vertices: &[(f64, f64)],
+    (stroke, pane): ((f32, LineStyle, Color), aeris_charts_render::shape::Rect),
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+) {
+    let mut outline = Vec::new();
+    closed_outline(vertices, &mut outline);
+    if outline.len() >= 3 {
+        push_styled_stroke(out, points, &outline, LineType::Simple, stroke, pane);
+    }
+}
+
+/// A region fill: the paired chains `ribbon` (each `count` long) as one `Prim::BandFill`.
+fn push_ribbon(
+    ribbon: &[(f64, f64)],
+    count: usize,
+    fill: Color,
+    out: &mut Vec<Prim>,
+    points: &mut Vec<[f32; 2]>,
+) {
+    if count == 0 {
+        return;
+    }
+    let upper_first = points.len() as u32;
+    points.extend(ribbon.iter().map(|&(x, y)| [x as f32, y as f32]));
+    out.push(Prim::BandFill {
+        upper_first,
+        lower_first: upper_first + count as u32,
+        point_count: count as u32,
+        line_type: LineType::Simple,
+        fill,
+    });
+}
+
 fn push_drawing_cap(
     cap: crate::DrawingLineCap,
     endpoint: (f64, f64),
@@ -76,39 +149,25 @@ fn push_drawing_cap(
     color: Color,
     out: &mut Vec<Prim>,
 ) {
-    if cap == crate::DrawingLineCap::None {
+    // A cap needs a direction: none on a degenerate end.
+    let Some([tip, left, right]) = arrow_cap_triangle(endpoint, toward, width) else {
         return;
-    }
-    let dx = toward.0 - endpoint.0;
-    let dy = toward.1 - endpoint.1;
-    let distance = dx.hypot(dy);
-    if distance <= f64::EPSILON {
-        return;
-    }
-    let ux = dx / distance;
-    let uy = dy / distance;
-    let radius = cap_radius(width);
+    };
     match cap {
         crate::DrawingLineCap::Circle => out.push(Prim::Circle {
             cx: endpoint.0 as f32,
             cy: endpoint.1 as f32,
-            radius: radius as f32,
+            radius: cap_radius(width) as f32,
             fill: color,
             stroke_width: 0.0,
             stroke: color,
         }),
-        crate::DrawingLineCap::Arrow => {
-            let base_x = endpoint.0 + ux * radius * 2.0;
-            let base_y = endpoint.1 + uy * radius * 2.0;
-            let side_x = -uy * radius;
-            let side_y = ux * radius;
-            out.push(Prim::Triangle {
-                a: [endpoint.0 as f32, endpoint.1 as f32],
-                b: [(base_x + side_x) as f32, (base_y + side_y) as f32],
-                c: [(base_x - side_x) as f32, (base_y - side_y) as f32],
-                color,
-            });
-        }
+        crate::DrawingLineCap::Arrow => out.push(Prim::Triangle {
+            a: [tip.0 as f32, tip.1 as f32],
+            b: [left.0 as f32, left.1 as f32],
+            c: [right.0 as f32, right.1 as f32],
+            color,
+        }),
         crate::DrawingLineCap::None => {}
     }
 }
@@ -164,7 +223,7 @@ mod trend_label_tests {
                 ] {
                     drawing.text_v_align = v_align;
                     let (x, y, align, angle) = ChartEngine::drawing_text_placement(
-                        &drawing, &line, 100.0, 0.0, 100.0, 12.0, 4.0,
+                        &drawing, &line, 100.0, 0.0, 100.0, 12.0, 1.0,
                     );
                     assert_eq!(align, h_align);
                     let (from_x, from_y) = (x - start.0, y - start.1);
@@ -181,7 +240,7 @@ mod trend_label_tests {
         let line = [(10.0, 80.0), (90.0, 20.0)];
         let reversed = [line[1], line[0]];
         let (x, y, _, angle) =
-            ChartEngine::drawing_text_placement(&drawing, &reversed, 100.0, 0.0, 100.0, 12.0, 4.0);
+            ChartEngine::drawing_text_placement(&drawing, &reversed, 100.0, 0.0, 100.0, 12.0, 1.0);
         assert!((x - 86.8).abs() < 1e-9);
         assert!((y - 22.4).abs() < 1e-9);
         assert!((angle - (-0.6_f64).atan2(0.8)).abs() < 1e-9);
@@ -289,7 +348,7 @@ impl ChartEngine {
         price.is_finite().then_some(price)
     }
 
-    fn drawing_level_label(
+    pub(crate) fn drawing_level_label(
         &self,
         drawing: &Drawing,
         value: f64,
@@ -322,6 +381,115 @@ impl ChartEngine {
             "center" => TextAlign::Center,
             _ => TextAlign::Right,
         }
+    }
+
+    /// The label of the Fibonacci arm's level `value` whose line runs `(a, b)` (caller px at
+    /// `vpr` caller px per CSS px): upstream's above the line's `level_label_align` point (the
+    /// top row), below it, or beside the line's end (`label_v_align`). Frame and hit testing
+    /// (`vpr` 1) resolve it alike.
+    pub(crate) fn fibonacci_level_label(
+        &self,
+        drawing: &Drawing,
+        (a, b): ((f64, f64), (f64, f64)),
+        value: f64,
+        vpr: f64,
+    ) -> Option<fibonacci::LevelLabel> {
+        let ((x0, _), (x1, y1)) = (a, b);
+        let price = self.drawing_level_price_at(drawing, y1, vpr);
+        let text = self.drawing_level_label(drawing, value, price)?;
+        let label_x = match drawing.level_label_align.as_str() {
+            "left" => x0,
+            "center" => (x0 + x1) / 2.0,
+            _ => x1,
+        };
+        let (x, y, align) = match fibonacci::label_v_align(drawing) {
+            FibonacciLabelVAlign::Top => {
+                (label_x, y1 - 8.0 * vpr, Self::drawing_level_align(drawing))
+            }
+            FibonacciLabelVAlign::Bottom => {
+                (label_x, y1 + 8.0 * vpr, Self::drawing_level_align(drawing))
+            }
+            FibonacciLabelVAlign::Middle => fibonacci::middle_label_anchor(
+                drawing,
+                (a, b),
+                (drawing.extend_left, drawing.extend_right),
+                fibonacci::label_gap(vpr),
+            ),
+        };
+        Some(fibonacci::LevelLabel { x, y, text, align })
+    }
+
+    /// The label of the time-level arm's level `value` on its vertical line at `x` (caller px at
+    /// `vpr`): upstream's 4 CSS px beside the line by `level_label_align`, at the pane's top,
+    /// middle or bottom (`label_v_align`).
+    pub(crate) fn time_level_label(
+        &self,
+        drawing: &Drawing,
+        time: TimeLevelGeometry,
+        x: f64,
+        value: f64,
+        vpr: f64,
+    ) -> Option<fibonacci::LevelLabel> {
+        let text = self.drawing_level_label(drawing, value, None)?;
+        let offset = match drawing.level_label_align.as_str() {
+            "left" => 4.0 * vpr,
+            "right" => -4.0 * vpr,
+            _ => 0.0,
+        };
+        let y = match fibonacci::label_v_align(drawing) {
+            FibonacciLabelVAlign::Top => time.pane_top + 14.0 * vpr,
+            FibonacciLabelVAlign::Middle => (time.pane_top + time.pane_bottom) / 2.0,
+            FibonacciLabelVAlign::Bottom => time.pane_bottom - 14.0 * vpr,
+        };
+        Some(fibonacci::LevelLabel {
+            x: x + offset,
+            y,
+            text,
+            align: Self::drawing_level_align(drawing),
+        })
+    }
+
+    /// The label of the Fibonacci-arc arm's level `value` (caller px at `vpr`): upstream's, above
+    /// the arc's midpoint.
+    pub(crate) fn arc_level_label(
+        &self,
+        drawing: &Drawing,
+        arcs: FibonacciArcGeometry,
+        value: f64,
+        vpr: f64,
+    ) -> Option<fibonacci::LevelLabel> {
+        let (x, y) = arcs.point(drawing.level_value(value), 0.5);
+        let price = self.drawing_level_price_at(drawing, y, vpr);
+        let text = self.drawing_level_label(drawing, value, price)?;
+        Some(fibonacci::LevelLabel {
+            x,
+            y: y - 8.0 * vpr,
+            text,
+            align: Self::drawing_level_align(drawing),
+        })
+    }
+
+    /// Paint a level arm's `label` in `color` at the layout font (`vpr` caller px per CSS px).
+    fn push_level_label(
+        &self,
+        drawing: &Drawing,
+        label: fibonacci::LevelLabel,
+        color: Color,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+    ) {
+        let layout = &self.options.get().layout;
+        out.push(Prim::Text {
+            x: label.x as f32,
+            y: label.y as f32,
+            text: label.text,
+            color,
+            size: (layout.font_size * vpr) as f32,
+            family: layout.font_family.clone(),
+            align: label.align,
+            weight: drawing.text_weight.unwrap_or(400),
+            italic: drawing.text_italic,
+        });
     }
     fn drawing_frame_text<'a>(&self, drawing: &'a Drawing) -> Option<(&'a str, bool)> {
         if drawing.kind == DrawingKind::PriceLabel {
@@ -387,7 +555,7 @@ impl ChartEngine {
                 .map(|(x, y)| (x * hpr, y * vpr))
                 .collect::<Vec<_>>();
             self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
-            self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+            self.build_drawing_text(drawing, &px, pane_w_px, vpr, out, points);
             self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
             self.build_drawing_labels(drawing, &px, vpr, out);
         }
@@ -439,7 +607,7 @@ impl ChartEngine {
                 let prim_start = out.len();
                 let point_start = points.len();
                 self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
-                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_labels(drawing, &px, vpr, out);
                 parts.push(super::RetainedDrawingPart {
@@ -476,7 +644,7 @@ impl ChartEngine {
                 let prim_start = out.len();
                 let point_start = points.len();
                 self.build_drawing_prims(drawing, &px, pane_w_px, vpr, out, points);
-                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out);
+                self.build_drawing_text(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_text_caret(drawing, &px, pane_w_px, vpr, out, points);
                 self.build_drawing_labels(drawing, &px, vpr, out);
                 parts.push(super::RetainedDrawingPart {
@@ -528,14 +696,16 @@ impl ChartEngine {
                             .apply(&mut anchors, last);
                     }
                 }
-                // Families that resolve partial anchors preview from the second anchor on.
+                // Families that resolve partial anchors preview from the second anchor on, and
+                // so do the patterns and Elliott waves: their legs, labels, ratios and fills
+                // resolve from any prefix of their anchors (owner decision P5).
+                let kind = pending.drawing.kind;
                 let partial = anchors.len() >= 2
-                    && pending
-                        .drawing
-                        .kind
+                    && (kind
                         .spec()
                         .family
-                        .is_some_and(|family| family.partial_preview);
+                        .is_some_and(|family| family.partial_preview)
+                        || kind.vertex_labels().is_some());
                 let ready = if is_sequence {
                     anchors.len() >= pending.drawing.kind.anchor_count()
                 } else {
@@ -547,6 +717,17 @@ impl ChartEngine {
                     // commit will store it.
                     let mut preview_drawing = pending.drawing.clone();
                     preview_drawing.points.clone_from(&anchors);
+                    // A tool placed through points on its geometry previews the anchors its
+                    // clicks will store (an arc ends first, a curve through its on-curve
+                    // points); its handles stay on the placed clicks.
+                    let through =
+                        shapes::places_through(kind) && anchors.len() == kind.anchor_count();
+                    if through {
+                        // A click without px previews nothing (the commit refuses it too).
+                        preview_drawing.points =
+                            shapes::placement_anchors(self, &preview_drawing, &anchors)
+                                .unwrap_or_default();
+                    }
                     if preview_drawing.kind == DrawingKind::AnchoredText {
                         // Anchored text paints at its screen position, which follows the
                         // pointer while placing exactly as the commit will set it.
@@ -585,6 +766,20 @@ impl ChartEngine {
                             // the commit.
                             let handles = handle_set(DrawingHandleMode::RectangleBounds, &px);
                             build_handles(&handles, vpr, self.anchor_fill(), out);
+                        } else if through {
+                            // Discs on the clicks placed so far, not on the stored anchors
+                            // (control points off the curve).
+                            let placed = pending
+                                .drawing
+                                .points
+                                .iter()
+                                .map(|&point| {
+                                    self.drawing_point_px(&pending.drawing, point)
+                                        .map(|(x, y)| (x * hpr, y * vpr))
+                                })
+                                .collect::<Option<Vec<_>>>()
+                                .unwrap_or_default();
+                            build_anchor_handles(&placed, vpr, self.anchor_fill(), out);
                         } else {
                             // The placed anchors' handles, where the family paints them on the
                             // previewed geometry; derived handles wait for the committed
@@ -798,33 +993,49 @@ impl ChartEngine {
                 bottom: (pane.top + pane.height) * vpr,
             },
         );
+        // A channel's 1 CSS px dashed middle line, in its `middle_color` or the stroke color.
+        let channel_middle_stroke = |middle_color: Option<Color>| {
+            (
+                (
+                    (channels::MIDDLE_WIDTH * vpr) as f32,
+                    LineStyle::Dashed,
+                    middle_color.unwrap_or(color),
+                ),
+                stroke.1,
+            )
+        };
         let Some(geometry) = resolve_drawing_geometry(
             drawing.kind,
             px,
             f64::from(pane_w_px),
             pane.top * vpr,
             pane.height * vpr,
-            DrawingGeometryOptions {
-                line_width: drawing.width,
-                device_scale: vpr,
-                extend_left: drawing.extend_left,
-                icon_size: drawing.icon_size,
-                extend_right: drawing.extend_right,
-            },
+            DrawingGeometryOptions::for_drawing(drawing, vpr),
         ) else {
             return;
         };
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
-                let label_gap = self.segment_label_gap(drawing, px, pane_w_px, vpr, a, b);
-                if let Some((gap_start, gap_end)) = label_gap {
-                    push_segment(a, point_on_segment(a, b, gap_start), stroke, out, points);
-                    push_segment(point_on_segment(a, b, gap_end), b, stroke, out, points);
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| lines::fork_presentation(drawing))
+                {
+                    // The `line` block's presentation strokes and caps the resolved segment
+                    // through the parts layer, then adds its decorations and stats box.
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        lines::upstream_line_parts(c, Some((a, b)), parts);
+                    });
                 } else {
-                    push_segment(a, b, stroke, out, points);
+                    let label_gap = self.segment_label_gap(drawing, px, pane_w_px, vpr, a, b);
+                    if let Some((gap_start, gap_end)) = label_gap {
+                        push_segment(a, point_on_segment(a, b, gap_start), stroke, out, points);
+                        push_segment(point_on_segment(a, b, gap_end), b, stroke, out, points);
+                    } else {
+                        push_segment(a, b, stroke, out, points);
+                    }
+                    push_drawing_cap(drawing.stroke_start, a, b, drawing.width * vpr, color, out);
+                    push_drawing_cap(drawing.stroke_end, b, a, drawing.width * vpr, color, out);
                 }
-                push_drawing_cap(drawing.stroke_start, a, b, drawing.width * vpr, color, out);
-                push_drawing_cap(drawing.stroke_end, b, a, drawing.width * vpr, color, out);
             }
             DrawingBodyGeometry::Horizontal { y, x0, x1 } => {
                 let x0 = (x0.round() as i32).clamp(0, pane_w_px);
@@ -873,44 +1084,54 @@ impl ChartEngine {
                     style: drawing.style,
                     color,
                 });
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| lines::fork_presentation(drawing))
+                {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        lines::upstream_line_parts(c, None, parts);
+                    });
+                }
             }
             DrawingBodyGeometry::Channel { first, second } => {
+                // The fill and the middle line pair the lines' ends by side, so a disjoint whose
+                // second line runs opposite to its first fills its whole quad, and lines that
+                // cross fill two lobes meeting at the crossing on every executor; a concave
+                // disjoint quad fills through its exact ribbon instead.
+                let paired = channels::paired_second(first, second);
                 if drawing.fill_enabled {
                     let fill = drawing
                         .fill_color
                         .as_deref()
                         .and_then(Color::parse_css)
                         .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51));
-                    if drawing.kind == DrawingKind::DisjointChannel {
-                        let a = [first[0].0 as f32, first[0].1 as f32];
-                        let b = [first[1].0 as f32, first[1].1 as f32];
-                        let c = [second[1].0 as f32, second[1].1 as f32];
-                        let d = [second[0].0 as f32, second[0].1 as f32];
-                        out.push(Prim::Triangle {
-                            a,
-                            b,
-                            c,
-                            color: fill,
-                        });
-                        out.push(Prim::Triangle {
-                            a,
-                            b: c,
-                            c: d,
-                            color: fill,
-                        });
-                    } else {
-                        let upper_first = points.len() as u32;
-                        points.extend(first.map(|(x, y)| [x as f32, y as f32]));
-                        let lower_first = points.len() as u32;
-                        points.extend(second.map(|(x, y)| [x as f32, y as f32]));
+                    let upper_first = points.len() as u32;
+                    let point_count = match channels::channel_fill_ribbon(first, paired) {
+                        Some(ribbon) => {
+                            points.extend(ribbon.iter().map(|&(x, y)| [x as f32, y as f32]));
+                            (ribbon.len() / 2) as u32
+                        }
+                        None => {
+                            points.extend(first.map(|(x, y)| [x as f32, y as f32]));
+                            points.extend(paired.map(|(x, y)| [x as f32, y as f32]));
+                            2
+                        }
+                    };
+                    if point_count >= 2 {
                         out.push(Prim::BandFill {
                             upper_first,
-                            lower_first,
-                            point_count: 2,
+                            lower_first: upper_first + point_count,
+                            point_count,
                             line_type: LineType::Simple,
                             fill,
                         });
                     }
+                }
+                if let Some((middle, middle_color)) =
+                    channels::channel_middle(drawing, first, paired)
+                {
+                    let middle_stroke = channel_middle_stroke(middle_color);
+                    push_segment(middle[0], middle[1], middle_stroke, out, points);
                 }
                 push_segment(first[0], first[1], stroke, out, points);
                 push_segment(second[0], second[1], stroke, out, points);
@@ -920,16 +1141,19 @@ impl ChartEngine {
                 upper,
                 lower,
             } => {
-                if drawing.fill_enabled {
+                let band = channels::regression_band(drawing);
+                if let Some((first, second)) = channels::regression_zone(band, center, upper, lower)
+                    .filter(|_| drawing.fill_enabled)
+                {
                     let fill = drawing
                         .fill_color
                         .as_deref()
                         .and_then(Color::parse_css)
                         .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 35));
                     let upper_first = points.len() as u32;
-                    points.extend(upper.map(|(x, y)| [x as f32, y as f32]));
+                    points.extend(first.map(|(x, y)| [x as f32, y as f32]));
                     let lower_first = points.len() as u32;
-                    points.extend(lower.map(|(x, y)| [x as f32, y as f32]));
+                    points.extend(second.map(|(x, y)| [x as f32, y as f32]));
                     out.push(Prim::BandFill {
                         upper_first,
                         lower_first,
@@ -938,8 +1162,23 @@ impl ChartEngine {
                         fill,
                     });
                 }
-                for segment in [lower, upper, center] {
-                    push_segment(segment[0], segment[1], stroke, out, points);
+                // A side that is switched off has no line.
+                for (enabled, segment) in [(band.lower, lower), (band.upper, upper)] {
+                    if enabled.is_some() {
+                        push_segment(segment[0], segment[1], stroke, out, points);
+                    }
+                }
+                // `middle_line` draws the centre as the thin dashed middle line.
+                let center_stroke =
+                    channels::middle_line(drawing).map_or(stroke, channel_middle_stroke);
+                push_segment(center[0], center[1], center_stroke, out, points);
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| band.show_pearsons)
+                {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        channels::regression_parts(c, parts);
+                    });
                 }
             }
             DrawingBodyGeometry::RegressionWindow { a, b } => {
@@ -947,57 +1186,67 @@ impl ChartEngine {
                 push_segment(a, b, ((width, LineStyle::Dashed, color), pane), out, points);
             }
             DrawingBodyGeometry::Fibonacci(fib) => {
-                let mut previous: Option<((f64, f64), (f64, f64))> = None;
-                for level in &drawing.levels {
-                    if !level.visible {
-                        previous = None;
-                        continue;
-                    }
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, false) {
+                    let (prior_a, prior_b) =
+                        self.drawing_fibonacci_level_segment(drawing, fib, prior, vpr);
                     let ((x0, y0), (x1, y1)) =
                         self.drawing_fibonacci_level_segment(drawing, fib, level.value, vpr);
-                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some((prior_a, prior_b)) = previous {
-                            let fill = level
-                                .fill_color
-                                .as_deref()
-                                .and_then(Color::parse_css)
-                                .unwrap_or(Color::rgba(
-                                    level_color.r(),
-                                    level_color.g(),
-                                    level_color.b(),
-                                    35,
-                                ));
-                            if (y0 - y1).abs() <= f64::EPSILON {
-                                out.push(Prim::Rect {
-                                    rect: IRect {
-                                        x: x0.min(x1).round() as i32,
-                                        y: y0.min(prior_a.1).round() as i32,
-                                        w: (x1 - x0).abs().round().max(1.0) as i32,
-                                        h: (y0 - prior_a.1).abs().round().max(1.0) as i32,
-                                    },
-                                    color: fill,
-                                });
-                            } else {
-                                let upper_first = points.len() as u32;
-                                points.extend([
-                                    [prior_a.0 as f32, prior_a.1 as f32],
-                                    [prior_b.0 as f32, prior_b.1 as f32],
-                                ]);
-                                let lower_first = points.len() as u32;
-                                points.extend([[x0 as f32, y0 as f32], [x1 as f32, y1 as f32]]);
-                                out.push(Prim::BandFill {
-                                    upper_first,
-                                    lower_first,
-                                    point_count: 2,
-                                    line_type: LineType::Simple,
-                                    fill,
-                                });
-                            }
+                    let fill = Self::drawing_level_fill(level, color);
+                    if (y0 - y1).abs() <= f64::EPSILON {
+                        out.push(Prim::Rect {
+                            rect: IRect {
+                                x: x0.min(x1).round() as i32,
+                                y: y0.min(prior_a.1).round() as i32,
+                                w: (x1 - x0).abs().round().max(1.0) as i32,
+                                h: (y0 - prior_a.1).abs().round().max(1.0) as i32,
+                            },
+                            color: fill,
+                        });
+                    } else {
+                        let upper_first = points.len() as u32;
+                        points.extend([
+                            [prior_a.0 as f32, prior_a.1 as f32],
+                            [prior_b.0 as f32, prior_b.1 as f32],
+                        ]);
+                        let lower_first = points.len() as u32;
+                        points.extend([[x0 as f32, y0 as f32], [x1 as f32, y1 as f32]]);
+                        out.push(Prim::BandFill {
+                            upper_first,
+                            lower_first,
+                            point_count: 2,
+                            line_type: LineType::Simple,
+                            fill,
+                        });
+                    }
+                }
+                if fibonacci::draws_grid(drawing) {
+                    let (top, bottom) = (stroke.1.top, stroke.1.bottom);
+                    let right = f64::from(pane_w_px);
+                    for level in drawing.levels.iter().filter(|level| level.visible) {
+                        let [(h0, h1), (v0, v1)] = fib.grid_lines(drawing.level_value(level.value));
+                        if (top..=bottom).contains(&h0.1) {
+                            out.push(Prim::HLine {
+                                y: h0.1.round() as i32,
+                                x0: h0.0.min(h1.0).clamp(0.0, right).round() as i32,
+                                x1: h0.0.max(h1.0).clamp(0.0, right).round() as i32,
+                                width: crisp_width,
+                                style: drawing.style,
+                                color,
+                            });
+                        }
+                        if (0.0..=right).contains(&v0.0) {
+                            out.push(Prim::VLine {
+                                x: v0.0.round() as i32,
+                                y0: v0.1.min(v1.1).clamp(top, bottom).round() as i32,
+                                y1: v0.1.max(v1.1).clamp(top, bottom).round() as i32,
+                                width: crisp_width,
+                                style: drawing.style,
+                                color,
+                            });
                         }
                     }
-                    previous = Some(((x0, y0), (x1, y1)));
                 }
+                push_fibonacci_trend_line(drawing, px, vpr, stroke.1, out, points);
                 for level in &drawing.levels {
                     if !level.visible {
                         continue;
@@ -1032,67 +1281,36 @@ impl ChartEngine {
                         });
                     }
                     if level.label_visible {
-                        let price = self.drawing_level_price_at(drawing, y1, vpr);
-                        if let Some(text) = self.drawing_level_label(drawing, level.value, price) {
-                            let label_x = match drawing.level_label_align.as_str() {
-                                "left" => x0,
-                                "center" => (x0 + x1) / 2.0,
-                                _ => x1,
-                            };
-                            out.push(Prim::Text {
-                                x: label_x as f32,
-                                y: (y1 - 8.0 * vpr) as f32,
-                                text,
-                                color: level_color,
-                                size: (self.options.get().layout.font_size * vpr) as f32,
-                                family: self.options.get().layout.font_family.clone(),
-                                align: Self::drawing_level_align(drawing),
-                                weight: drawing.text_weight.unwrap_or(400),
-                                italic: drawing.text_italic,
-                            });
+                        if let Some(label) = self.fibonacci_level_label(
+                            drawing,
+                            ((x0, y0), (x1, y1)),
+                            level.value,
+                            vpr,
+                        ) {
+                            self.push_level_label(drawing, label, level_color, vpr, out);
                         }
                     }
                 }
             }
             DrawingBodyGeometry::TimeLevels(time) => {
-                let mut previous_x = None;
-                for level in &drawing.levels {
-                    if !level.visible {
-                        previous_x = None;
-                        continue;
-                    }
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, false) {
+                    let prior_x = time.x(drawing.level_value(prior));
                     let x = time.x(drawing.level_value(level.value));
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some(prior_x) = previous_x {
-                            let left = x.min(prior_x).max(0.0);
-                            let right = x.max(prior_x).min(f64::from(pane_w_px));
-                            if right > left {
-                                let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                                let fill = level
-                                    .fill_color
-                                    .as_deref()
-                                    .and_then(Color::parse_css)
-                                    .unwrap_or(Color::rgba(
-                                        level_color.r(),
-                                        level_color.g(),
-                                        level_color.b(),
-                                        35,
-                                    ));
-                                out.push(Prim::Rect {
-                                    rect: IRect {
-                                        x: left.round() as i32,
-                                        y: time.pane_top.round().max(0.0) as i32,
-                                        w: (right - left).round().max(1.0) as i32,
-                                        h: (time.pane_bottom - time.pane_top).round().max(1.0)
-                                            as i32,
-                                    },
-                                    color: fill,
-                                });
-                            }
-                        }
+                    let left = x.min(prior_x).max(0.0);
+                    let right = x.max(prior_x).min(f64::from(pane_w_px));
+                    if right > left {
+                        out.push(Prim::Rect {
+                            rect: IRect {
+                                x: left.round() as i32,
+                                y: time.pane_top.round().max(0.0) as i32,
+                                w: (right - left).round().max(1.0) as i32,
+                                h: (time.pane_bottom - time.pane_top).round().max(1.0) as i32,
+                            },
+                            color: Self::drawing_level_fill(level, color),
+                        });
                     }
-                    previous_x = Some(x);
                 }
+                push_fibonacci_trend_line(drawing, px, vpr, stroke.1, out, points);
                 for level in &drawing.levels {
                     if !level.visible {
                         continue;
@@ -1116,24 +1334,10 @@ impl ChartEngine {
                         color: level_color,
                     });
                     if level.label_visible {
-                        if let Some(text) = self.drawing_level_label(drawing, level.value, None) {
-                            out.push(Prim::Text {
-                                x: (x + if drawing.level_label_align == "left" {
-                                    4.0 * vpr
-                                } else if drawing.level_label_align == "right" {
-                                    -4.0 * vpr
-                                } else {
-                                    0.0
-                                }) as f32,
-                                y: (time.pane_top + 14.0 * vpr) as f32,
-                                text,
-                                color: level_color,
-                                size: (self.options.get().layout.font_size * vpr) as f32,
-                                family: self.options.get().layout.font_family.clone(),
-                                align: Self::drawing_level_align(drawing),
-                                weight: drawing.text_weight.unwrap_or(400),
-                                italic: drawing.text_italic,
-                            });
+                        if let Some(label) =
+                            self.time_level_label(drawing, time, x, level.value, vpr)
+                        {
+                            self.push_level_label(drawing, label, level_color, vpr, out);
                         }
                     }
                 }
@@ -1145,50 +1349,69 @@ impl ChartEngine {
                     }
                 }
                 let segments = arcs.segments();
-                let mut previous = None;
-                for level in &drawing.levels {
-                    if !level.visible || drawing.level_value(level.value) <= 0.0 {
-                        previous = None;
-                        continue;
-                    }
-                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some(prior_value) = previous {
-                            let fill = level
-                                .fill_color
-                                .as_deref()
-                                .and_then(Color::parse_css)
-                                .unwrap_or(Color::rgba(
-                                    level_color.r(),
-                                    level_color.g(),
-                                    level_color.b(),
-                                    35,
-                                ));
-                            let upper_first = points.len() as u32;
-                            for step in 0..=segments {
-                                let (x, y) =
-                                    arcs.point(prior_value, step as f64 / f64::from(segments));
-                                points.push([x as f32, y as f32]);
-                            }
-                            let lower_first = points.len() as u32;
+                // The fork's precise rings: every ring and band over the part the pane shows,
+                // within a quarter pixel (`geometry::Rings`); upstream's fixed chords otherwise.
+                let precise = fibonacci::precise_rings(drawing);
+                let rings = precise
+                    .then(|| {
+                        arcs.rings(
+                            stroke.1,
+                            drawing.width * vpr,
+                            arcs.radius * fibonacci::largest_level(drawing),
+                        )
+                    })
+                    .flatten();
+                let (mut chain, mut scratch) = (Vec::new(), Vec::new());
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, true) {
+                    let fill = Self::drawing_level_fill(level, color);
+                    let upper_first = points.len() as u32;
+                    let count = if precise {
+                        // A ring tool whose arc misses the pane paints no band.
+                        let Some(rings) = rings else {
+                            continue;
+                        };
+                        let radii = [prior, level.value]
+                            .map(|value| arcs.radius * drawing.level_value(value));
+                        if !rings.reaches(radii[0].min(radii[1]), radii[0].max(radii[1])) {
+                            continue;
+                        }
+                        for radius in radii {
+                            rings.chain(radius, &mut chain);
+                            points.extend(chain.iter().map(|&(x, y)| [x as f32, y as f32]));
+                        }
+                        chain.len() as u32
+                    } else {
+                        for value in [prior, level.value] {
                             for step in 0..=segments {
                                 let (x, y) = arcs.point(
-                                    drawing.level_value(level.value),
+                                    drawing.level_value(value),
                                     step as f64 / f64::from(segments),
                                 );
                                 points.push([x as f32, y as f32]);
                             }
-                            out.push(Prim::BandFill {
-                                upper_first,
-                                lower_first,
-                                point_count: segments + 1,
-                                line_type: LineType::Simple,
-                                fill,
-                            });
                         }
-                    }
-                    previous = Some(drawing.level_value(level.value));
+                        segments + 1
+                    };
+                    out.push(Prim::BandFill {
+                        upper_first,
+                        lower_first: upper_first + count,
+                        point_count: count,
+                        line_type: LineType::Simple,
+                        fill,
+                    });
                 }
+                if fibonacci::phi_spiral(drawing) {
+                    let width = drawing.width * vpr;
+                    arcs.phi_spiral(
+                        fibonacci::options(drawing).reverse,
+                        stroke.1,
+                        (width, vpr, fibonacci::dash_period(drawing.style, width)),
+                        |run| {
+                            push_clipped_stroke(out, points, run, stroke.1, stroke.0, &mut scratch)
+                        },
+                    );
+                }
+                push_fibonacci_trend_line(drawing, px, vpr, stroke.1, out, points);
                 for level in &drawing.levels {
                     if !level.visible || drawing.level_value(level.value) <= 0.0 {
                         continue;
@@ -1199,82 +1422,61 @@ impl ChartEngine {
                         "dashed" | "large_dashed" => LineStyle::Dashed,
                         _ => LineStyle::Solid,
                     };
-                    let first_point = points.len() as u32;
-                    for step in 0..=segments {
-                        let (x, y) = arcs.point(
-                            drawing.level_value(level.value),
-                            step as f64 / f64::from(segments),
-                        );
-                        points.push([x as f32, y as f32]);
-                    }
-                    out.push(Prim::Polyline {
-                        first_point,
-                        point_count: segments + 1,
-                        width: (drawing.width * vpr) as f32,
-                        style,
-                        line_type: LineType::Simple,
-                        color: level_color,
-                    });
-                    if level.label_visible {
-                        let (x, y) = arcs.point(drawing.level_value(level.value), 0.5);
-                        let price = self.drawing_level_price_at(drawing, y, vpr);
-                        if let Some(text) = self.drawing_level_label(drawing, level.value, price) {
-                            out.push(Prim::Text {
-                                x: x as f32,
-                                y: (y - 8.0 * vpr) as f32,
-                                text,
-                                color: level_color,
-                                size: (self.options.get().layout.font_size * vpr) as f32,
-                                family: self.options.get().layout.font_family.clone(),
-                                align: Self::drawing_level_align(drawing),
-                                weight: drawing.text_weight.unwrap_or(400),
-                                italic: drawing.text_italic,
+                    let width = drawing.width * vpr;
+                    if precise {
+                        let radius = arcs.radius * drawing.level_value(level.value);
+                        if let Some(rings) = rings.filter(|rings| rings.reaches(radius, radius)) {
+                            let period = fibonacci::dash_period(style, width);
+                            rings.stroke(radius, period, &mut chain, |run| {
+                                push_clipped_stroke(
+                                    out,
+                                    points,
+                                    run,
+                                    stroke.1,
+                                    (width as f32, style, level_color),
+                                    &mut scratch,
+                                );
                             });
+                        }
+                    } else {
+                        let first_point = points.len() as u32;
+                        for step in 0..=segments {
+                            let (x, y) = arcs.point(
+                                drawing.level_value(level.value),
+                                step as f64 / f64::from(segments),
+                            );
+                            points.push([x as f32, y as f32]);
+                        }
+                        out.push(Prim::Polyline {
+                            first_point,
+                            point_count: segments + 1,
+                            width: width as f32,
+                            style,
+                            line_type: LineType::Simple,
+                            color: level_color,
+                        });
+                    }
+                    if level.label_visible {
+                        if let Some(label) = self.arc_level_label(drawing, arcs, level.value, vpr) {
+                            self.push_level_label(drawing, label, level_color, vpr, out);
                         }
                     }
                 }
             }
             DrawingBodyGeometry::Pitchfork(fork) => {
-                let mut previous: Option<((f64, f64), (f64, f64))> = None;
-                for level in &drawing.levels {
-                    if !level.visible {
-                        previous = None;
-                        continue;
+                for (prior, level) in level_band_pairs(drawing, &drawing.levels, false) {
+                    let upper_first = points.len() as u32;
+                    for value in [prior, level.value] {
+                        let (a, b) = fork.segment(drawing.level_value(value));
+                        points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
                     }
-                    let segment = fork.segment(drawing.level_value(level.value));
-                    if drawing.fill_enabled && level.fill_between {
-                        if let Some((prior_a, prior_b)) = previous {
-                            let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                            let fill = level
-                                .fill_color
-                                .as_deref()
-                                .and_then(Color::parse_css)
-                                .unwrap_or(Color::rgba(
-                                    level_color.r(),
-                                    level_color.g(),
-                                    level_color.b(),
-                                    35,
-                                ));
-                            let upper_first = points.len() as u32;
-                            points.extend([
-                                [prior_a.0 as f32, prior_a.1 as f32],
-                                [prior_b.0 as f32, prior_b.1 as f32],
-                            ]);
-                            let lower_first = points.len() as u32;
-                            points.extend([
-                                [segment.0 .0 as f32, segment.0 .1 as f32],
-                                [segment.1 .0 as f32, segment.1 .1 as f32],
-                            ]);
-                            out.push(Prim::BandFill {
-                                upper_first,
-                                lower_first,
-                                point_count: 2,
-                                line_type: LineType::Simple,
-                                fill,
-                            });
-                        }
-                    }
-                    previous = Some(segment);
+                    out.push(Prim::BandFill {
+                        upper_first,
+                        lower_first: upper_first + 2,
+                        point_count: 2,
+                        line_type: LineType::Simple,
+                        fill: Self::drawing_level_fill(level, color),
+                    });
                 }
                 for level in &drawing.levels {
                     if !level.visible {
@@ -1460,9 +1662,9 @@ impl ChartEngine {
                 {
                     // A built-in icon name with no registered raster paints its vector glyph,
                     // so documents and hosts without icon assets keep rendering.
-                    let mut parts = DrawingParts::default();
-                    built_in_icon_parts(&context, icon, center, size, &mut parts);
-                    self.push_drawing_parts(&context, &parts, pane_w_px, vpr, out, points);
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        built_in_icon_parts(c, icon, center, size, parts);
+                    });
                 } else {
                     out.push(Prim::Rect {
                         rect: IRect {
@@ -1477,6 +1679,10 @@ impl ChartEngine {
             }
             DrawingBodyGeometry::GannGrid(grid) => {
                 let box_bounds = grid.bounds();
+                // A box's own time levels split the axes: price levels draw horizontally, time
+                // levels vertically, and the zones fill as overlapping per-axis bands.
+                let time_levels = pitchforks_gann::box_time_levels(drawing);
+                let x_at = |value: f64| grid.start.0 + (grid.end.0 - grid.start.0) * value;
                 if drawing.fill_enabled {
                     let fill = drawing
                         .fill_color
@@ -1492,28 +1698,16 @@ impl ChartEngine {
                         },
                         color: fill,
                     });
-                    let mut prior_grid: Option<f64> = None;
-                    for level in drawing.levels.iter().filter(|level| level.visible) {
-                        let value = drawing.level_value(level.value);
-                        if level.fill_between {
-                            if let Some(previous) = prior_grid {
-                                let x0 = grid.start.0 + (grid.end.0 - grid.start.0) * previous;
-                                let x1 = grid.start.0 + (grid.end.0 - grid.start.0) * value;
-                                let y0 = grid.start.1 + (grid.end.1 - grid.start.1) * previous;
-                                let y1 = grid.start.1 + (grid.end.1 - grid.start.1) * value;
-                                let fill = Self::drawing_level_fill(level, color);
-                                out.push(Prim::Rect {
-                                    rect: IRect {
-                                        x: x0.min(x1).round() as i32,
-                                        y: y0.min(y1).round() as i32,
-                                        w: (x1 - x0).abs().round().max(1.0) as i32,
-                                        h: (y1 - y0).abs().round().max(1.0) as i32,
-                                    },
-                                    color: fill,
-                                });
-                            }
-                        }
-                        prior_grid = Some(value);
+                    for ((x0, x1), (y0, y1), level) in pitchforks_gann::grid_bands(drawing, grid) {
+                        out.push(Prim::Rect {
+                            rect: IRect {
+                                x: x0.min(x1).round() as i32,
+                                y: y0.min(y1).round() as i32,
+                                w: (x1 - x0).abs().round().max(1.0) as i32,
+                                h: (y1 - y0).abs().round().max(1.0) as i32,
+                            },
+                            color: Self::drawing_level_fill(level, color),
+                        });
                     }
                     let mut prior_fan: Option<(f64, f64)> = None;
                     for level in drawing.gann_fans.iter().filter(|level| level.visible) {
@@ -1586,7 +1780,13 @@ impl ChartEngine {
                         "dashed" | "large_dashed" => LineStyle::Dashed,
                         _ => LineStyle::Solid,
                     };
-                    for (a, b) in grid.level_lines(drawing.level_value(level.value)) {
+                    let lines = grid.level_lines(drawing.level_value(level.value));
+                    let lines = if time_levels.is_some() {
+                        &lines[1..]
+                    } else {
+                        &lines[..]
+                    };
+                    for &(a, b) in lines {
                         let first_point = points.len() as u32;
                         points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
                         out.push(Prim::Polyline {
@@ -1629,21 +1829,62 @@ impl ChartEngine {
                         }
                     }
                 }
-                if grid.kind != DrawingKind::GannBox {
-                    for level in drawing.gann_fans.iter().filter(|level| level.visible) {
-                        let (a, b) = grid.fan_segment(level.value, drawing.level_reverse);
-                        let level_color = Color::parse_css(&level.color).unwrap_or(color);
-                        let first_point = points.len() as u32;
-                        points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
-                        out.push(Prim::Polyline {
-                            first_point,
-                            point_count: 2,
-                            width: (drawing.width * vpr) as f32,
-                            style: Self::drawing_level_style(&level.style),
-                            line_type: LineType::Simple,
-                            color: level_color,
-                        });
+                for level in time_levels
+                    .into_iter()
+                    .flatten()
+                    .filter(|level| level.visible)
+                {
+                    let x = x_at(drawing.level_value(level.value));
+                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
+                    let first_point = points.len() as u32;
+                    points.extend([
+                        [x as f32, grid.start.1 as f32],
+                        [x as f32, grid.end.1 as f32],
+                    ]);
+                    out.push(Prim::Polyline {
+                        first_point,
+                        point_count: 2,
+                        width: (drawing.width * vpr) as f32,
+                        style: Self::drawing_level_style(&level.style),
+                        line_type: LineType::Simple,
+                        color: level_color,
+                    });
+                    if level.label_visible {
+                        if let Some(text) = self.drawing_level_label(drawing, level.value, None) {
+                            out.push(Prim::Text {
+                                x: x as f32,
+                                y: (box_bounds.top - 8.0 * vpr) as f32,
+                                text,
+                                color: level_color,
+                                size: (self.options.get().layout.font_size * vpr) as f32,
+                                family: self.options.get().layout.font_family.clone(),
+                                align: TextAlign::Center,
+                                weight: drawing.text_weight.unwrap_or(400),
+                                italic: drawing.text_italic,
+                            });
+                        }
                     }
+                }
+                // A box strokes its `tool_options.gann.angles` while `show_angles` is on; a
+                // square its `gann_fans`.
+                for level in pitchforks_gann::angle_levels(drawing)
+                    .iter()
+                    .filter(|level| level.visible)
+                {
+                    let (a, b) = grid.fan_segment(level.value, drawing.level_reverse);
+                    let level_color = Color::parse_css(&level.color).unwrap_or(color);
+                    let first_point = points.len() as u32;
+                    points.extend([[a.0 as f32, a.1 as f32], [b.0 as f32, b.1 as f32]]);
+                    out.push(Prim::Polyline {
+                        first_point,
+                        point_count: 2,
+                        width: (drawing.width * vpr) as f32,
+                        style: Self::drawing_level_style(&level.style),
+                        line_type: LineType::Simple,
+                        color: level_color,
+                    });
+                }
+                if grid.kind != DrawingKind::GannBox {
                     for level in drawing.gann_arcs.iter().filter(|level| level.visible) {
                         let level_color = Color::parse_css(&level.color).unwrap_or(color);
                         let first_point = points.len() as u32;
@@ -1664,6 +1905,15 @@ impl ChartEngine {
                             color: level_color,
                         });
                     }
+                }
+                // A square's stats box (`tool_options.gann.show_stats`) paints last.
+                if let Some(context) = self
+                    .frame_part_context(drawing, px, pane_w_px, vpr)
+                    .filter(|_| pitchforks_gann::shows_stats(drawing))
+                {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        pitchforks_gann::square_stats(c, grid, parts);
+                    });
                 }
             }
             DrawingBodyGeometry::Quad { corners } => {
@@ -1690,102 +1940,63 @@ impl ChartEngine {
                         color: fill,
                     });
                 }
-                for index in 0..4 {
-                    push_segment(
-                        corners[index],
-                        corners[(index + 1) % 4],
-                        stroke,
-                        out,
-                        points,
-                    );
-                }
+                // One seamless outline run (owner decision S7): every corner is a join.
+                push_closed_outline(&corners, stroke, out, points);
             }
             DrawingBodyGeometry::Ellipse { center, rx, ry } => {
-                if rx > 0.0 && ry > 0.0 {
+                let clip = curve_clip(stroke.1, drawing.width, vpr);
+                if rx > 0.0 && ry > 0.0 && box_meets(center, rx, ry, clip) {
+                    let mut outline = Vec::new();
+                    ellipse_outline(center, rx, ry, clip, &mut outline);
                     if drawing.fill_enabled {
                         let fill = drawing
                             .fill_color
                             .as_deref()
                             .and_then(Color::parse_css)
                             .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51));
-                        let upper_first = points.len() as u32;
-                        for step in 0..=32 {
-                            let theta = std::f64::consts::PI * step as f64 / 32.0;
-                            points.push([
-                                (center.0 - rx * theta.cos()) as f32,
-                                (center.1 - ry * theta.sin()) as f32,
-                            ]);
+                        // The closing point repeats the first; the fill polygon needs it once.
+                        let mut ribbon = Vec::new();
+                        let count = aeris_charts_render::shape::convex_ribbon(
+                            &outline[..outline.len().saturating_sub(1)],
+                            &mut ribbon,
+                        ) as u32;
+                        if count > 0 {
+                            let upper_first = points.len() as u32;
+                            points.extend(ribbon.iter().map(|&(x, y)| [x as f32, y as f32]));
+                            out.push(Prim::BandFill {
+                                upper_first,
+                                lower_first: upper_first + count,
+                                point_count: count,
+                                line_type: LineType::Simple,
+                                fill,
+                            });
                         }
-                        let lower_first = points.len() as u32;
-                        for step in 0..=32 {
-                            let theta = std::f64::consts::PI * step as f64 / 32.0;
-                            points.push([
-                                (center.0 - rx * theta.cos()) as f32,
-                                (center.1 + ry * theta.sin()) as f32,
-                            ]);
-                        }
-                        out.push(Prim::BandFill {
-                            upper_first,
-                            lower_first,
-                            point_count: 33,
-                            line_type: LineType::Simple,
-                            fill,
-                        });
                     }
-                    let first_point = points.len() as u32;
-                    for step in 0..=64 {
-                        let theta = std::f64::consts::TAU * step as f64 / 64.0;
-                        points.push([
-                            (center.0 + rx * theta.cos()) as f32,
-                            (center.1 + ry * theta.sin()) as f32,
-                        ]);
-                    }
-                    out.push(Prim::Polyline {
-                        first_point,
-                        point_count: 65,
-                        width: (drawing.width * vpr) as f32,
-                        style: drawing.style,
-                        line_type: LineType::Simple,
-                        color,
-                    });
+                    push_styled_stroke(out, points, &outline, LineType::Simple, stroke.0, stroke.1);
                 }
             }
             DrawingBodyGeometry::Circle { center, radius } => {
-                let fill = if drawing.fill_enabled {
-                    drawing
-                        .fill_color
-                        .as_deref()
-                        .and_then(Color::parse_css)
-                        .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51))
-                } else {
-                    Color::rgba(0, 0, 0, 0)
-                };
-                if drawing.fill_enabled {
-                    out.push(Prim::Circle {
-                        cx: center.0 as f32,
-                        cy: center.1 as f32,
-                        radius: radius as f32,
-                        fill,
-                        stroke_width: 0.0,
-                        stroke: color,
-                    });
+                let clip = curve_clip(stroke.1, drawing.width, vpr);
+                if box_meets(center, radius, radius, clip) {
+                    if drawing.fill_enabled {
+                        let fill = drawing
+                            .fill_color
+                            .as_deref()
+                            .and_then(Color::parse_css)
+                            .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 51));
+                        out.push(Prim::Circle {
+                            cx: center.0 as f32,
+                            cy: center.1 as f32,
+                            radius: radius as f32,
+                            fill,
+                            stroke_width: 0.0,
+                            stroke: color,
+                        });
+                    }
+                    let mut outline = Vec::new();
+                    ellipse_outline(center, radius, radius, clip, &mut outline);
+                    push_styled_stroke(out, points, &outline, LineType::Simple, stroke.0, stroke.1);
                 }
-                let first_point = points.len() as u32;
-                for step in 0..=64 {
-                    let theta = std::f64::consts::TAU * step as f64 / 64.0;
-                    points.push([
-                        (center.0 + radius * theta.cos()) as f32,
-                        (center.1 + radius * theta.sin()) as f32,
-                    ]);
-                }
-                out.push(Prim::Polyline {
-                    first_point,
-                    point_count: 65,
-                    width: (drawing.width * vpr) as f32,
-                    style: drawing.style,
-                    line_type: LineType::Simple,
-                    color,
-                });
             }
             DrawingBodyGeometry::Triangle { corners } => {
                 if drawing.fill_enabled {
@@ -1801,45 +2012,115 @@ impl ChartEngine {
                         color: fill,
                     });
                 }
-                for index in 0..3 {
-                    push_segment(
-                        corners[index],
-                        corners[(index + 1) % 3],
-                        stroke,
-                        out,
-                        points,
-                    );
+                if drawing.kind == DrawingKind::Triangle {
+                    // One seamless outline run (owner decision S7): every corner is a join.
+                    push_closed_outline(&corners, stroke, out, points);
+                } else {
+                    for index in 0..3 {
+                        push_segment(
+                            corners[index],
+                            corners[(index + 1) % 3],
+                            stroke,
+                            out,
+                            points,
+                        );
+                    }
                 }
             }
-            DrawingBodyGeometry::Arc(arc) => {
-                let first_point = points.len() as u32;
-                for step in 0..=64 {
-                    let (x, y) = arc.point(step as f64 / 64.0);
-                    points.push([x as f32, y as f32]);
+            DrawingBodyGeometry::Sector(arc) => {
+                // A fork-form projection: the sector's fill (a fan from the pivot) under its
+                // outline from the pivot along the arc and back, then its stats box.
+                let mut arc_points = Vec::new();
+                arc.flatten(curve_clip(stroke.1, drawing.width, vpr), &mut arc_points);
+                if drawing.fill_enabled && arc_points.len() >= 2 {
+                    let count = arc_points.len();
+                    let mut ribbon = arc_points.clone();
+                    ribbon.resize(2 * count, arc.center);
+                    push_ribbon(&ribbon, count, drawing.fill_or_wash(51), out, points);
                 }
-                out.push(Prim::Polyline {
-                    first_point,
-                    point_count: 65,
-                    width: (drawing.width * vpr) as f32,
-                    style: drawing.style,
-                    line_type: LineType::Simple,
-                    color,
+                let mut outline = Vec::with_capacity(arc_points.len() + 2);
+                outline.push(arc.center);
+                outline.extend_from_slice(&arc_points);
+                outline.push(arc.center);
+                push_styled_stroke(out, points, &outline, LineType::Simple, stroke.0, stroke.1);
+                if let (Some(context), Some(&target)) = (
+                    self.frame_part_context(drawing, px, pane_w_px, vpr),
+                    px.get(1),
+                ) {
+                    self.push_parts(&context, pane_w_px, vpr, out, points, |c, parts| {
+                        projection_annotations::projection_stats(c, arc.center, target, parts);
+                    });
+                }
+            }
+            DrawingBodyGeometry::NotePin(pin) => {
+                // A fork-form note: the pin in the stroke color with a contrasting dot in its
+                // head; its box is the drawing's text (`build_drawing_text`).
+                let mut outline = Vec::new();
+                pin.outline(&mut outline);
+                let mut ribbon = Vec::new();
+                let count = aeris_charts_render::shape::convex_ribbon(&outline, &mut ribbon);
+                push_ribbon(&ribbon, count, color, out, points);
+                let dot = color.solid().contrast_text();
+                out.push(Prim::Circle {
+                    cx: pin.head.0 as f32,
+                    cy: pin.head.1 as f32,
+                    radius: pin.dot_radius as f32,
+                    fill: dot,
+                    stroke_width: 0.0,
+                    stroke: dot,
                 });
             }
-            DrawingBodyGeometry::Curve(curve) => {
-                let first_point = points.len() as u32;
-                for step in 0..=64 {
-                    let (x, y) = curve.point(step as f64 / 64.0);
-                    points.push([x as f32, y as f32]);
+            DrawingBodyGeometry::SpeechTail { corners } => {
+                // A fork-form comment's or price label's tail in the bubble's stroke color; the
+                // bubble is the drawing's text (`build_drawing_text`).
+                let mut ribbon = Vec::new();
+                let count = aeris_charts_render::shape::convex_ribbon(&corners, &mut ribbon);
+                push_ribbon(&ribbon, count, color, out, points);
+            }
+            DrawingBodyGeometry::Arc(_) | DrawingBodyGeometry::Curve(_) => {
+                // The chord fill under the stroke; with an end cap, the shared capped stroke.
+                let clip = curve_clip(stroke.1, drawing.width, vpr);
+                if let Some(curve) = shapes::CurveStroke::resolve(geometry.body, clip) {
+                    let run = curve.run();
+                    if curve.meets_clip(&run) {
+                        if drawing.fill_enabled {
+                            let mut ribbon = Vec::new();
+                            let count = curve.chord_fill(&mut ribbon);
+                            push_ribbon(&ribbon, count, drawing.fill_or_wash(51), out, points);
+                        }
+                        match self
+                            .frame_part_context(drawing, px, pane_w_px, vpr)
+                            .filter(|_| shapes::capped(drawing))
+                        {
+                            Some(context) => self.push_parts(
+                                &context,
+                                pane_w_px,
+                                vpr,
+                                out,
+                                points,
+                                |c, parts| curve.capped_parts(&run, c.drawing, c.scale, parts),
+                            ),
+                            None => push_styled_stroke(
+                                out,
+                                points,
+                                &run,
+                                LineType::Simple,
+                                stroke.0,
+                                stroke.1,
+                            ),
+                        }
+                    }
                 }
-                out.push(Prim::Polyline {
-                    first_point,
-                    point_count: 65,
-                    width: (drawing.width * vpr) as f32,
-                    style: drawing.style,
-                    line_type: LineType::Simple,
-                    color,
-                });
+            }
+            DrawingBodyGeometry::Polygon { points: vertices } => {
+                // A closed polyline: its nonzero fill under one outline run from mid-edge, no
+                // caps (they stay stored for reopening it).
+                if drawing.fill_enabled {
+                    let mut ribbon = Vec::new();
+                    let count = aeris_charts_render::shape::nonzero_ribbon(vertices, &mut ribbon);
+                    push_ribbon(&ribbon, count, drawing.fill_or_wash(51), out, points);
+                }
+                push_closed_outline(vertices, stroke, out, points);
             }
             DrawingBodyGeometry::Rectangle {
                 left,
@@ -1955,6 +2236,20 @@ impl ChartEngine {
                 } else {
                     color
                 };
+                // A pattern layers its fills under the zigzag and its sides, ratio connectors
+                // and ratios over it (`kinds::patterns_elliott_cycles`).
+                let pattern = if patterns_elliott_cycles::layers_parts(drawing.kind) {
+                    self.frame_part_context(drawing, px, pane_w_px, vpr)
+                } else {
+                    None
+                };
+                if let Some(context) = &pattern {
+                    self.push_parts(context, pane_w_px, vpr, out, points, |c, parts| {
+                        patterns_elliott_cycles::pattern_parts(c, PatternLayer::Under, parts);
+                    });
+                }
+                // An Elliott wave without `show_wave` paints only its labels.
+                let wave = patterns_elliott_cycles::draws_wave(drawing);
                 // A solid highlighter paints as the region its stroke covers (the tube around
                 // the same expanded path the stroke would take, round joins and caps), filled
                 // once per pixel: where a wide translucent stroke overlaps or crosses itself, the
@@ -1998,7 +2293,7 @@ impl ChartEngine {
                         line_type: LineType::Simple,
                         fill: color,
                     });
-                } else {
+                } else if wave {
                     push_styled_stroke(
                         out,
                         points,
@@ -2009,7 +2304,7 @@ impl ChartEngine {
                     );
                 }
                 if let (Some(first), Some(last)) = (line_points.first(), line_points.last()) {
-                    if line_points.len() >= 2 {
+                    if line_points.len() >= 2 && wave {
                         push_drawing_cap(
                             drawing.stroke_start,
                             *first,
@@ -2042,23 +2337,46 @@ impl ChartEngine {
                         color,
                     });
                 }
-                if let Some(labels) = drawing.kind.vertex_labels() {
+                if let Some(context) = &pattern {
+                    self.push_parts(context, pane_w_px, vpr, out, points, |c, parts| {
+                        patterns_elliott_cycles::pattern_parts(c, PatternLayer::Over, parts);
+                    });
+                }
+                if drawing.kind.vertex_labels().is_some() {
                     let label_color = drawing
                         .text_color
                         .as_deref()
                         .and_then(Color::parse_css)
                         .unwrap_or(color);
-                    let size =
-                        drawing.resolved_text_size(self.options.get().layout.font_size) * vpr;
-                    for (&(x, y), label) in line_points.iter().zip(labels.iter()) {
+                    // Upstream's placement, shared with hit testing and the culling pad; an
+                    // Elliott degree's ring (1 CSS px) paints before its label.
+                    let (size, labels) =
+                        patterns_elliott_cycles::vertex_labels(self, drawing, line_points, vpr);
+                    let clip = aeris_charts_render::shape::Rect {
+                        left: 0.0,
+                        top: pane.top * vpr,
+                        right: f64::from(pane_w_px),
+                        bottom: (pane.top + pane.height) * vpr,
+                    };
+                    let (mut ring, mut scratch) = (Vec::new(), Vec::new());
+                    for label in labels {
+                        patterns_elliott_cycles::ring_points(&label, &mut ring);
+                        push_clipped_stroke(
+                            out,
+                            points,
+                            &ring,
+                            clip,
+                            (
+                                (patterns_elliott_cycles::DECORATION_WIDTH * vpr) as f32,
+                                LineStyle::Solid,
+                                label_color,
+                            ),
+                            &mut scratch,
+                        );
                         out.push(Prim::Text {
-                            x: x as f32,
-                            y: (y - 8.0 * vpr) as f32,
-                            text: if drawing.kind.is_elliott() {
-                                format!("{label} ({})", drawing.wave_degree)
-                            } else {
-                                (*label).to_string()
-                            },
+                            x: label.center.0 as f32,
+                            y: label.center.1 as f32,
+                            text: label.text,
                             color: label_color,
                             size: size as f32,
                             family: self.options.get().layout.font_family.clone(),
@@ -2070,7 +2388,19 @@ impl ChartEngine {
                 }
             }
         }
-        if drawing.kind == DrawingKind::Forecast {
+        if projection_annotations::draws_forecast_boxes(drawing) {
+            // The fork form's dot and boxes take the place of upstream's outcome label.
+            if let Some(context) = self.frame_part_context(drawing, px, pane_w_px, vpr) {
+                self.push_parts(
+                    &context,
+                    pane_w_px,
+                    vpr,
+                    out,
+                    points,
+                    projection_annotations::forecast_parts,
+                );
+            }
+        } else if drawing.kind == DrawingKind::Forecast {
             if let (Some(entry), Some(target)) = (drawing.points.first(), px.get(1)) {
                 let change = drawing.points[1].price - entry.price;
                 let percent = if entry.price.abs() > f64::EPSILON {
@@ -2315,9 +2645,7 @@ impl ChartEngine {
                 }),
             "derived family points share the anchors' caller-px space"
         );
-        let mut parts = DrawingParts::default();
-        (family.build_parts)(&context, &mut parts);
-        self.push_drawing_parts(&context, &parts, pane_w_px, vpr, out, points);
+        self.push_parts(&context, pane_w_px, vpr, out, points, family.build_parts);
     }
 
     /// The bitmap-px part context of `drawing` with anchors at `px`; `None` for a stale pane.
@@ -2345,6 +2673,26 @@ impl ChartEngine {
             x_scale: hpr,
             text_editing: self.editing_drawing() == Some(drawing.id),
         })
+    }
+
+    /// Resolve the parts `build` describes for `context` (from [`Self::frame_part_context`]) and
+    /// lower them with [`Self::push_drawing_parts`]: a family's whole drawing, or the parts an
+    /// upstream-rendered drawing layers over its arm (the vector glyph of an icon stamp, the
+    /// presentation an upstream line tool's `line` block selects). Hit testing resolves the same
+    /// parts (`parts_hit`), and the culling pad covers their reach (a family's
+    /// `decoration_extent`, `kinds::upstream_decoration_extent`).
+    fn push_parts(
+        &self,
+        context: &PartContext<'_>,
+        pane_w_px: i32,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
+        build: impl FnOnce(&PartContext<'_>, &mut DrawingParts),
+    ) {
+        let mut parts = DrawingParts::default();
+        build(context, &mut parts);
+        self.push_drawing_parts(context, &parts, pane_w_px, vpr, out, points);
     }
 
     /// Lower `parts` resolved for `context` into frame primitives: dashed strokes as solid dash
@@ -2754,11 +3102,40 @@ impl ChartEngine {
         };
         // A family text box paints its caret with its label (`build_family_prims`): falling
         // through to the run placement would put the bar where the generic label would sit.
-        if !drawing.kind.paints_generic_text() {
+        if !drawing.kind.paints_generic_text() || projection_annotations::fork_text_owner(drawing) {
             return;
         }
         let (size, x, y, align, angle) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
         let text = drawing.display_text();
+        if drawing.text_block_lines() > 1 {
+            // Upstream's text block: the caret's own line, measured from the line start.
+            let block = TextBlock::new(
+                (x, y, align),
+                drawing.text_v_align,
+                self.measure_drawing_text(drawing, size),
+                size,
+                drawing.text_block_lines(),
+            );
+            let prefix: String = text.chars().take(session.caret).collect();
+            let row = prefix.matches('\n').count();
+            let line = prefix.rsplit('\n').next().unwrap_or("");
+            let prefix_css = self.measure_drawing_frame_text(drawing, line, size) / vpr;
+            let color = self.drawing_label_color(drawing);
+            push_caret_bar(
+                out,
+                points,
+                CaretBar {
+                    x: block.left,
+                    y: block.line_y(row),
+                    local_x: prefix_css.ceil() * vpr,
+                    half_height: size * 0.6,
+                    angle: 0.0,
+                },
+                vpr,
+                color,
+            );
+            return;
+        }
         let advance = if text.is_empty() {
             size
         } else {
@@ -2811,9 +3188,29 @@ impl ChartEngine {
             pane.top * vpr,
             pane.height * vpr,
             size,
-            TEXT_PAD * vpr,
+            vpr,
         );
         (size, x, y, align, angle)
+    }
+
+    /// The painted box of a fork-form annotation's text (`fork_text_box`) at bitmap-px anchors
+    /// `px`; `None` while it paints none (a fork-form note's box outside focus).
+    fn fork_text_rect(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        pane_w_px: i32,
+        vpr: f64,
+    ) -> Option<aeris_charts_render::shape::Rect> {
+        let context = self.frame_part_context(drawing, px, pane_w_px, vpr)?;
+        let mut parts = DrawingParts::default();
+        projection_annotations::fork_text_box(&context, &mut parts);
+        let label = parts.labels.get(parts.text?.label)?;
+        let family = &self.options.get().layout.font_family;
+        let layout = label.layout(|line| {
+            self.measure_text_run(line, label.size, family, label.weight, label.italic)
+        });
+        Some(layout.rect)
     }
 
     /// The text tool's interaction chrome (hover ring, focus border): a crisp integer-snapped
@@ -2830,20 +3227,34 @@ impl ChartEngine {
         color: Color,
         out: &mut Vec<Prim>,
     ) {
-        let (size, x, y, align, _) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
-        let width = self.measure_drawing_text(drawing, size);
-        let height = size * 1.2;
-        let pad = TEXT_CHROME_PAD * vpr;
-        let left = match align {
-            DrawingTextHAlign::Left => x,
-            DrawingTextHAlign::Center => x - width / 2.0,
-            DrawingTextHAlign::Right => x - width,
-        };
-        let rect = IRect {
-            x: (left - pad).round() as i32,
-            y: (y - height / 2.0 - pad).round() as i32,
-            w: (width + 2.0 * pad).round().max(1.0) as i32,
-            h: (height + 2.0 * pad).round().max(1.0) as i32,
+        let rect = if projection_annotations::fork_text_owner(drawing) {
+            // A fork-form box: its painted box grown by the editing border.
+            let Some(rect) = self.fork_text_rect(drawing, px, pane_w_px, vpr) else {
+                return;
+            };
+            let grow = (TEXT_CHROME_PAD - TEXT_PAD) * vpr;
+            IRect {
+                x: (rect.left - grow).round() as i32,
+                y: (rect.top - grow).round() as i32,
+                w: (rect.right - rect.left + 2.0 * grow).round().max(1.0) as i32,
+                h: (rect.bottom - rect.top + 2.0 * grow).round().max(1.0) as i32,
+            }
+        } else {
+            let (size, x, y, align, _) = self.text_run_geometry(drawing, px, pane_w_px, vpr);
+            let block = TextBlock::new(
+                (x, y, align),
+                drawing.text_v_align,
+                self.measure_drawing_text(drawing, size),
+                size,
+                drawing.text_block_lines(),
+            );
+            let pad = TEXT_CHROME_PAD * vpr;
+            IRect {
+                x: (block.left - pad).round() as i32,
+                y: (block.top() - pad).round() as i32,
+                w: (block.width + 2.0 * pad).round().max(1.0) as i32,
+                h: (block.height() + 2.0 * pad).round().max(1.0) as i32,
+            }
         };
         out.push(Prim::RectFrame {
             rect,
@@ -2868,6 +3279,7 @@ impl ChartEngine {
         pane_w_px: i32,
         vpr: f64,
         out: &mut Vec<Prim>,
+        points: &mut Vec<[f32; 2]>,
     ) {
         // Empty text paints nothing. While the host typing-mode editor is open the LABEL and
         // the focus border still paint — the editor wrap is borderless with transparent glyphs,
@@ -2879,6 +3291,21 @@ impl ChartEngine {
             .family
             .is_some_and(|family| family.owns_text)
         {
+            return;
+        }
+        // A fork-form annotation's text is its box (`fork_text_box`), with the open native
+        // session's caret.
+        if projection_annotations::fork_text_owner(drawing) {
+            if let Some(context) = self.frame_part_context(drawing, px, pane_w_px, vpr) {
+                self.push_parts(
+                    &context,
+                    pane_w_px,
+                    vpr,
+                    out,
+                    points,
+                    projection_annotations::fork_text_box,
+                );
+            }
             return;
         }
         let Some((text, placeholder)) = self.drawing_frame_text(drawing) else {
@@ -2907,20 +3334,28 @@ impl ChartEngine {
             .box_border_color
             .as_deref()
             .and_then(Color::parse_css);
-        if is_text_tool && (box_fill.is_some() || box_border.is_some()) {
-            let width = self.measure_drawing_text(drawing, size);
-            let height = size * 1.2;
+        // A text annotation's text of several lines stacks into upstream's text block.
+        let lines = drawing.text_block_lines();
+        let block = (lines > 1 || (is_text_tool && (box_fill.is_some() || box_border.is_some())))
+            .then(|| {
+                TextBlock::new(
+                    (x, y, align),
+                    drawing.text_v_align,
+                    self.measure_drawing_text(drawing, size),
+                    size,
+                    lines,
+                )
+            });
+        if let (true, Some(block)) = (
+            is_text_tool && (box_fill.is_some() || box_border.is_some()),
+            block,
+        ) {
             let pad = 4.0 * vpr;
-            let left = match align {
-                DrawingTextHAlign::Left => x,
-                DrawingTextHAlign::Center => x - width / 2.0,
-                DrawingTextHAlign::Right => x - width,
-            };
             let rect = IRect {
-                x: (left - pad).round() as i32,
-                y: (y - height / 2.0 - pad).round() as i32,
-                w: (width + 2.0 * pad).round().max(1.0) as i32,
-                h: (height + 2.0 * pad).round().max(1.0) as i32,
+                x: (block.left - pad).round() as i32,
+                y: (block.top() - pad).round() as i32,
+                w: (block.width + 2.0 * pad).round().max(1.0) as i32,
+                h: (block.height() + 2.0 * pad).round().max(1.0) as i32,
             };
             if let Some(fill) = box_fill {
                 out.push(Prim::Rect { rect, color: fill });
@@ -2935,6 +3370,23 @@ impl ChartEngine {
             }
         }
 
+        if let Some(block) = block.filter(|block| block.lines > 1) {
+            // One left-aligned run per line, at the left edge the multi-line editor shares.
+            for (index, line) in text.split('\n').enumerate() {
+                out.push(Prim::Text {
+                    x: block.left as f32,
+                    y: block.line_y(index) as f32,
+                    text: line.trim_end_matches('\r').to_string(),
+                    color,
+                    size: size as f32,
+                    family: layout.font_family.clone(),
+                    align: TextAlign::Left,
+                    weight: drawing.text_weight.unwrap_or(400),
+                    italic: drawing.text_italic,
+                });
+            }
+            return;
+        }
         let text_prim = Prim::RotatedText {
             x: x as f32,
             y: y as f32,
@@ -2996,6 +3448,8 @@ impl ChartEngine {
                 .spec()
                 .family
                 .is_some_and(|family| family.owns_labels)
+            || lines::fork_presentation(drawing)
+            || projection_annotations::draws_sector(drawing)
         {
             return;
         }
@@ -3264,13 +3718,7 @@ impl ChartEngine {
                 self.pane_w * hpr,
                 self.panes[pane_index].top * vpr,
                 self.panes[pane_index].height * vpr,
-                DrawingGeometryOptions {
-                    line_width: drawing.width,
-                    device_scale: vpr,
-                    extend_left: drawing.extend_left,
-                    icon_size: drawing.icon_size,
-                    extend_right: drawing.extend_right,
-                },
+                DrawingGeometryOptions::for_drawing(drawing, vpr),
             ) else {
                 continue;
             };
@@ -3598,13 +4046,7 @@ impl ChartEngine {
                 self.pane_w * hpr,
                 self.panes[pane_index].top * vpr,
                 self.panes[pane_index].height * vpr,
-                DrawingGeometryOptions {
-                    line_width: drawing.width,
-                    device_scale: vpr,
-                    extend_left: drawing.extend_left,
-                    icon_size: drawing.icon_size,
-                    extend_right: drawing.extend_right,
-                },
+                DrawingGeometryOptions::for_drawing(drawing, vpr),
             ) else {
                 continue;
             };

@@ -5,8 +5,88 @@
 //! and the interactive shape from drifting as more drawing kinds are added.
 
 use aeris_charts_render::draw_list::LineType;
+use aeris_charts_render::shape::{self, EllipseArc, Point, Rect};
 
-use super::{path_arrow_points, DrawingKind, TextBox};
+use super::kinds::projection_annotations::{
+    NOTE_DOT_RADIUS, NOTE_HEAD_RADIUS, NOTE_RISE, TAIL_HEIGHT, TAIL_WIDTH,
+};
+use super::{path_arrow_points, Drawing, DrawingKind, TextBox};
+use crate::DrawingLevel;
+
+/// Chord tolerance of a flattened curve (ellipse, circle, arc, Bézier): device px in the frame,
+/// media px in hit testing, so paint and hit stay within a quarter pixel of the true curve.
+pub(crate) const CURVE_TOLERANCE: f64 = 0.25;
+/// Reach in CSS px beyond a stroke's half width past which a curve piece can neither paint nor
+/// hit inside the pane (it covers the touch hit tolerance).
+const CURVE_CLIP_MARGIN: f64 = 16.0;
+
+/// The clip a curve flattens against: `pane` (in the caller's px) grown by the stroke's half
+/// width plus [`CURVE_CLIP_MARGIN`], `scale` caller px per CSS px. Pieces outside it become single
+/// chords, so a huge zoomed-in curve costs bounded work.
+pub(crate) fn curve_clip(pane: Rect, line_width: f64, scale: f64) -> Rect {
+    pane.inflate((line_width / 2.0 + CURVE_CLIP_MARGIN) * scale)
+}
+
+/// The outline of the axis-aligned ellipse around `center` with radii `rx`/`ry`, flattened against
+/// `clip` (see [`EllipseArc::append_clipped_points`]): starts at angle 0 and repeats its first
+/// point last.
+pub(crate) fn ellipse_outline(center: Point, rx: f64, ry: f64, clip: Rect, out: &mut Vec<Point>) {
+    EllipseArc {
+        center,
+        rx,
+        ry,
+        rotation: 0.0,
+        start: 0.0,
+        sweep: std::f64::consts::TAU,
+    }
+    .append_clipped_points(CURVE_TOLERANCE, clip, out);
+}
+
+/// The outline of the closed polygon through `vertices` as one run (a rotated rectangle, a
+/// triangle, a closed polyline): it starts and ends at the midpoint of the first edge of nonzero
+/// length, so the stroke's two butt ends meet collinearly mid-edge instead of notching a corner,
+/// and every corner is a join. Vertices repeating their predecessor are skipped. Nothing when
+/// every vertex coincides.
+pub(crate) fn closed_outline(vertices: &[Point], out: &mut Vec<Point>) {
+    let count = vertices.len();
+    let Some(first) = (0..count).find(|&index| vertices[index] != vertices[(index + 1) % count])
+    else {
+        return;
+    };
+    let start = shape::midpoint(vertices[first], vertices[(first + 1) % count]);
+    out.reserve(count + 2);
+    out.push(start);
+    for step in 1..=count {
+        let vertex = vertices[(first + step) % count];
+        if out.last() != Some(&vertex) {
+            out.push(vertex);
+        }
+    }
+    out.push(start);
+}
+
+/// The bands `drawing` fills between its `levels` (its own or another level list it owns), in
+/// list order, as `(previous level's raw value, level)`: visible levels chain in list order, a
+/// hidden level (or, with `positive_only`, one whose effective value is not positive) breaks the
+/// chain, and a level fills toward its predecessor while the drawing's fill is on and the level's
+/// `fill_between` is set. The Fibonacci, time-level, Fibonacci-arc and pitchfork band loops follow
+/// this rule; the Gann box's grid, fan and arc band loops still chain across a hidden level.
+pub(crate) fn level_band_pairs<'a>(
+    drawing: &'a Drawing,
+    levels: &'a [DrawingLevel],
+    positive_only: bool,
+) -> impl Iterator<Item = (f64, &'a DrawingLevel)> {
+    let levels = if drawing.fill_enabled { levels } else { &[] };
+    let mut previous = None;
+    levels.iter().filter_map(move |level| {
+        if !level.visible || (positive_only && drawing.level_value(level.value) <= 0.0) {
+            previous = None;
+            return None;
+        }
+        let prior = previous.replace(level.value)?;
+        level.fill_between.then_some((prior, level))
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DrawingBodyGeometry<'a> {
@@ -81,7 +161,22 @@ pub(crate) enum DrawingBodyGeometry<'a> {
         corners: [(f64, f64); 3],
     },
     Arc(ArcGeometry),
+    /// A fork-form projection's circular sector (owner decision A2): the arc around the pivot
+    /// from the horizontal ray toward the target to the target, closed through the pivot.
+    Sector(ArcGeometry),
+    /// A fork-form note's teardrop pin, its tip on the anchor.
+    NotePin(NotePinGeometry),
+    /// The speech-bubble tail of a fork-form comment or price label: its tip on the anchor, its
+    /// base on the bubble's bottom edge (the bubble is the drawing's text box).
+    SpeechTail {
+        corners: [(f64, f64); 3],
+    },
     Curve(CurveGeometry),
+    /// A closed polyline (`tool_options.shape.closed`, three vertices or more): the last vertex
+    /// joins the first, and the enclosed region fills by the nonzero rule.
+    Polygon {
+        points: &'a [(f64, f64)],
+    },
     Rectangle {
         left: f64,
         right: f64,
@@ -156,16 +251,44 @@ impl FibonacciGeometry {
                     self.start.1
                 };
                 let offset = (pivot.1 - base_y) * value;
-                (
+                let mut ends = [
                     (self.start.0, self.start.1 + offset),
                     (self.end.0, self.end.1 + offset),
-                )
+                ];
+                // `extend_left`/`extend_right` moved `x0`/`x1` to the pane's edges: each level
+                // runs along itself to the edge on that side of the screen (unextended, `x0` and
+                // `x1` are the anchors' own span and nothing moves).
+                if dx.abs() > f64::EPSILON {
+                    let slope = (self.end.1 - self.start.1) / dx;
+                    let (left, right) = if dx > 0.0 { (0, 1) } else { (1, 0) };
+                    for (index, x) in [(left, self.x0), (right, self.x1)] {
+                        if x != ends[index].0 {
+                            ends[index] = (x, ends[index].1 + (x - ends[index].0) * slope);
+                        }
+                    }
+                }
+                (ends[0], ends[1])
             }
             _ => {
                 let y = self.start.1 + (self.end.1 - self.start.1) * value;
                 ((self.x0, y), (self.x1, y))
             }
         }
+    }
+}
+
+impl FibonacciGeometry {
+    /// The speed resistance fan's grid lines at the effective level `value` inside the anchors'
+    /// box: the horizontal line through the level's price ray end, from the first anchor's time
+    /// to the second's, and the vertical line at the same ratio of the anchors' time span, from
+    /// the first anchor's price to the second's.
+    pub(crate) fn grid_lines(self, value: f64) -> [((f64, f64), (f64, f64)); 2] {
+        let y = self.start.1 + (self.end.1 - self.start.1) * value;
+        let x = self.start.0 + (self.end.0 - self.start.0) * value;
+        [
+            ((self.start.0, y), (self.end.0, y)),
+            ((x, self.start.1), (x, self.end.1)),
+        ]
     }
 }
 
@@ -219,6 +342,268 @@ impl FibonacciArcGeometry {
             32
         }
     }
+
+    /// The whole arc every level of a ring tool (speed arcs, circles, wedge) follows, as its
+    /// start angle and signed sweep: the parametrisation of [`Self::point`].
+    fn arc(self) -> (f64, f64) {
+        if self.kind == DrawingKind::FibonacciWedge {
+            (self.start_angle, self.sweep)
+        } else {
+            (self.start_angle - self.sweep / 2.0, self.sweep)
+        }
+    }
+
+    /// The precise rings of a ring tool (the fork's tessellation, `kinds::fibonacci::precise_rings`)
+    /// against `pane` (caller px), for strokes of half width `half` and levels up to the radius
+    /// `largest`: only the part of the arc the pane shows is tessellated, within
+    /// [`CURVE_TOLERANCE`] at the largest radius that can show (so at every smaller one), and a
+    /// radius beyond the farthest pane point closes at it. `None` when the arc misses the pane.
+    pub(crate) fn rings(self, pane: Rect, half: f64, largest: f64) -> Option<Rings> {
+        if self.kind == DrawingKind::FibonacciSpiral
+            || self.radius.is_nan()
+            || self.radius <= f64::EPSILON
+        {
+            return None;
+        }
+        let (near, far) = pane_distances(pane, self.center);
+        let cap = far + half + 1.0;
+        let window = visible_arc(pane, self.center, self.arc())?;
+        let segments = shape::arc_segment_count(largest.min(cap), window.1, CURVE_TOLERANCE);
+        Some(Rings {
+            center: self.center,
+            arc: self.arc(),
+            window,
+            segments,
+            near,
+            far,
+            cap,
+            half,
+        })
+    }
+
+    /// The golden spiral (`kinds::fibonacci::phi_spiral`) around the center through the second
+    /// anchor, growing by φ every quarter turn, clockwise on screen (counterclockwise with
+    /// `reverse`), from [`SPIRAL_MIN_RADIUS`] CSS px (`scale` caller px each) until it leaves
+    /// `pane` (caller px) for good, as runs handed to `emit`. Only the part of each quarter turn
+    /// inside the pane's angular window is tessellated (within [`CURVE_TOLERANCE`]), quarter turns
+    /// that cannot reach the pane are skipped, and at most [`MAX_SPIRAL_QUARTERS`] are walked, so
+    /// a spiral centered far off the pane costs bounded work. With a dash `period` (caller px; 0
+    /// when solid) a run starts at the last dash-period boundary before it, in arc length from the
+    /// inner end, so its dashes stay put while the pane scrolls.
+    pub(crate) fn phi_spiral(
+        self,
+        reverse: bool,
+        pane: Rect,
+        (half, scale, period): (f64, f64, f64),
+        mut emit: impl FnMut(&[Point]),
+    ) {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        let (a, r0, theta0) = (self.center, self.radius, self.start_angle);
+        if r0.is_nan() || r0 <= f64::EPSILON || !theta0.is_finite() {
+            return;
+        }
+        let turn = if reverse { -1.0 } else { 1.0 };
+        // r = r0·e^(k·t) after turning `t` radians past the second anchor; k = ln φ / (π/2).
+        let golden = (1.0 + 5.0_f64.sqrt()) / 2.0;
+        let growth = golden.ln() / FRAC_PI_2;
+        let radius = |t: f64| r0 * (growth * t).exp();
+        let turned = |r: f64| (r / r0).ln() / growth;
+        // A logarithmic spiral's arc length grows linearly with its radius.
+        let length_per_radius = (1.0 + growth * growth).sqrt() / growth;
+        let (near, far) = pane_distances(pane, a);
+        let inner = (SPIRAL_MIN_RADIUS * scale).min(r0);
+        let start = turned(inner);
+        // Past the farthest pane point the radius only grows, so the spiral never returns.
+        let end = turned(far + half);
+        let quarters = ((end - start) / FRAC_PI_2)
+            .ceil()
+            .clamp(1.0, MAX_SPIRAL_QUARTERS as f64) as usize;
+        let mut run: Vec<Point> = Vec::new();
+        let mut run_end = f64::NAN;
+        for index in 0..quarters {
+            let t0 = start + FRAC_PI_2 * index as f64;
+            if radius(t0 + FRAC_PI_2) + half < near {
+                continue;
+            }
+            let angle0 = (theta0 + turn * t0 + PI).rem_euclid(TAU) - PI;
+            let Some((from, sweep)) = visible_arc(pane, a, (angle0, turn * FRAC_PI_2)) else {
+                continue;
+            };
+            let (t_from, t_to) = (
+                t0 + (from - angle0) * turn,
+                t0 + (from + sweep - angle0) * turn,
+            );
+            let t_start = if (t_from - run_end).abs() <= 1e-9 {
+                // This piece continues the previous one.
+                t_from
+            } else {
+                if run.len() >= 2 {
+                    emit(&run);
+                }
+                run.clear();
+                if period > 0.0 {
+                    let travelled = (radius(t_from) - inner) * length_per_radius;
+                    turned(radius(t_from) - travelled.rem_euclid(period) / length_per_radius)
+                } else {
+                    t_from
+                }
+            };
+            let segments = shape::arc_segment_count(radius(t_to), t_to - t_start, CURVE_TOLERANCE);
+            let first = usize::from(!run.is_empty());
+            for step in first..=segments {
+                let t = t_start + (t_to - t_start) * step as f64 / segments as f64;
+                let (r, angle) = (radius(t), theta0 + turn * t);
+                run.push((a.0 + r * angle.cos(), a.1 + r * angle.sin()));
+            }
+            run_end = t_to;
+        }
+        if run.len() >= 2 {
+            emit(&run);
+        }
+    }
+}
+
+/// Smallest radius of the golden spiral, CSS px: it starts below a pixel, at its center.
+const SPIRAL_MIN_RADIUS: f64 = 0.5;
+/// Most quarter turns the golden spiral walks (φ^128 covers any pane from a sub-pixel start).
+const MAX_SPIRAL_QUARTERS: usize = 128;
+
+/// A ring tool's concentric arcs over the part of the pane they show
+/// ([`FibonacciArcGeometry::rings`]): every ring and band chain shares the window's angles, so
+/// paired band chains match point for point.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rings {
+    center: Point,
+    /// The whole arc: start angle and signed sweep.
+    arc: (f64, f64),
+    /// The part of `arc` the pane shows.
+    window: (f64, f64),
+    segments: usize,
+    /// Nearest and farthest pane point from the center.
+    near: f64,
+    far: f64,
+    /// Radius a ring beyond `far` closes at: the same pane pixels, with finite points.
+    cap: f64,
+    half: f64,
+}
+
+impl Rings {
+    /// Whether the band between radii `inner` and `outer` (a ring when equal) can reach the pane.
+    pub(crate) fn reaches(&self, inner: f64, outer: f64) -> bool {
+        outer + self.half >= self.near && inner - self.half <= self.far
+    }
+
+    /// The window's chain at `radius` (closed at the cap), replacing `out`.
+    pub(crate) fn chain(&self, radius: f64, out: &mut Vec<Point>) {
+        out.clear();
+        let radius = radius.min(self.cap);
+        let (start, sweep) = self.window;
+        out.extend((0..=self.segments).map(|step| {
+            let angle = start + sweep * step as f64 / self.segments as f64;
+            (
+                self.center.0 + radius * angle.cos(),
+                self.center.1 + radius * angle.sin(),
+            )
+        }));
+    }
+
+    /// Stroke the ring of `radius` over the window, as runs handed to `emit`. With a dash
+    /// `period` (caller px; 0 when solid) a ring the pane shows only in part starts each piece at
+    /// the last dash-period boundary before the window, in arc length from the arc's start, so
+    /// dashes stay put while the pane scrolls instead of following the window's edge.
+    pub(crate) fn stroke(
+        &self,
+        radius: f64,
+        period: f64,
+        out: &mut Vec<Point>,
+        mut emit: impl FnMut(&[Point]),
+    ) {
+        if period <= 0.0 || self.window == self.arc {
+            self.chain(radius, out);
+            emit(out);
+            return;
+        }
+        let (arc_start, sweep) = self.arc;
+        let direction = sweep.signum();
+        let length = self.window.1.abs();
+        // How far along the arc the window starts, within one turn.
+        let from = ((self.window.0 - arc_start) * direction).rem_euclid(std::f64::consts::TAU);
+        let wrapped = (from + length - std::f64::consts::TAU).max(0.0);
+        for (start, span) in [(from, length - wrapped), (0.0, wrapped)] {
+            if span <= 0.0 {
+                continue;
+            }
+            let back = (start * radius).rem_euclid(period) / radius;
+            let piece = shape::EllipseArc::circle(
+                self.center,
+                radius,
+                arc_start + direction * (start - back),
+                direction * (span + back),
+            );
+            out.clear();
+            piece.append_points(CURVE_TOLERANCE, out);
+            emit(out);
+        }
+    }
+}
+
+/// Distances from `point` to the nearest and the farthest point of `pane`.
+fn pane_distances(pane: Rect, point: Point) -> (f64, f64) {
+    let dx = (pane.left - point.0).max(point.0 - pane.right).max(0.0);
+    let dy = (pane.top - point.1).max(point.1 - pane.bottom).max(0.0);
+    let far = pane_corners(pane)
+        .iter()
+        .map(|corner| (corner.0 - point.0).hypot(corner.1 - point.1))
+        .fold(0.0_f64, f64::max);
+    (dx.hypot(dy), far)
+}
+
+fn pane_corners(pane: Rect) -> [Point; 4] {
+    [
+        (pane.left, pane.top),
+        (pane.right, pane.top),
+        (pane.right, pane.bottom),
+        (pane.left, pane.bottom),
+    ]
+}
+
+/// The part of the arc `(start, sweep)` around `center` that can reach `pane`: the whole arc
+/// when the center lies in the pane, else its overlap with the angular window the pane subtends
+/// from the center (under π wide; a full turn becomes the window, and an arc of at most π meets
+/// it in one piece), keeping the arc's direction. `None` when they miss.
+fn visible_arc(pane: Rect, center: Point, (start, sweep): (f64, f64)) -> Option<(f64, f64)> {
+    use std::f64::consts::{PI, TAU};
+    if pane.contains(center) {
+        return Some((start, sweep));
+    }
+    let reference = ((pane.top + pane.bottom) / 2.0 - center.1)
+        .atan2((pane.left + pane.right) / 2.0 - center.0);
+    let (mut low, mut high) = (0.0_f64, 0.0_f64);
+    for corner in pane_corners(pane) {
+        let angle = (corner.1 - center.1).atan2(corner.0 - center.0);
+        let delta = (angle - reference + PI).rem_euclid(TAU) - PI;
+        low = low.min(delta);
+        high = high.max(delta);
+    }
+    let window = (reference + low, reference + high);
+    if sweep.abs() >= TAU - 1e-9 {
+        return Some((window.0, window.1 - window.0));
+    }
+    let arc = if sweep >= 0.0 {
+        (start, start + sweep)
+    } else {
+        (start + sweep, start)
+    };
+    // Both ranges lie within (-3π, 3π], so shifts of up to two turns align them.
+    (-2..=2).find_map(|turns| {
+        let shift = TAU * f64::from(turns);
+        let (from, to) = (arc.0.max(window.0 + shift), arc.1.min(window.1 + shift));
+        (to > from).then_some(if sweep >= 0.0 {
+            (from, to - from)
+        } else {
+            (to, from - to)
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -375,6 +760,41 @@ impl MarkerGeometry {
     }
 }
 
+/// A fork-form note's pin (caller px): the tip on the anchor, the head circle `rise` above it,
+/// and the contrasting dot in the head.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NotePinGeometry {
+    pub(crate) tip: (f64, f64),
+    pub(crate) head: (f64, f64),
+    pub(crate) radius: f64,
+    pub(crate) dot_radius: f64,
+}
+
+impl NotePinGeometry {
+    /// The pin's convex outline: the tip, then the head's arc from the right tangent point over
+    /// the top to the left one (within [`CURVE_TOLERANCE`]).
+    pub(crate) fn outline(self, out: &mut Vec<Point>) {
+        let rise = self.tip.1 - self.head.1;
+        if rise <= self.radius {
+            return;
+        }
+        // The tangent points from the tip sit slightly below the head's center.
+        let tangent_y = self.radius * self.radius / rise;
+        let tangent_x = (self.radius * self.radius - tangent_y * tangent_y)
+            .max(0.0)
+            .sqrt();
+        let start = tangent_y.atan2(tangent_x);
+        out.push(self.tip);
+        EllipseArc::circle(
+            self.head,
+            self.radius,
+            start,
+            -(std::f64::consts::PI + 2.0 * start),
+        )
+        .append_points(CURVE_TOLERANCE, out);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArcGeometry {
     pub(crate) center: (f64, f64),
@@ -384,6 +804,8 @@ pub(crate) struct ArcGeometry {
 }
 
 impl ArcGeometry {
+    /// The exact arc point at `t` in `[0, 1]` (the reference its flattening approximates).
+    #[cfg(test)]
     pub(crate) fn point(self, t: f64) -> (f64, f64) {
         let angle = self.start + self.sweep * t;
         (
@@ -391,15 +813,71 @@ impl ArcGeometry {
             self.center.1 + self.radius * angle.sin(),
         )
     }
+
+    /// The arc flattened against `clip` within [`CURVE_TOLERANCE`], both ends included, at most
+    /// [`shape::MAX_FLATTEN_POINTS`] + 1 points (the same parametrisation as `point`).
+    pub(crate) fn flatten(self, clip: Rect, out: &mut Vec<Point>) {
+        EllipseArc::circle(self.center, self.radius, self.start, self.sweep).append_clipped_points(
+            CURVE_TOLERANCE,
+            clip,
+            out,
+        );
+    }
+
+    /// For each end, the point one caller px from it along the arc's exact tangent, into the arc
+    /// (the direction an end cap points away from).
+    pub(crate) fn end_towards(self) -> [Point; 2] {
+        let travel = self.sweep.signum();
+        let along = |angle: f64, sign: f64| {
+            let (sin, cos) = angle.sin_cos();
+            (
+                self.center.0 + self.radius * cos - sin * travel * sign,
+                self.center.1 + self.radius * sin + cos * travel * sign,
+            )
+        };
+        [along(self.start, 1.0), along(self.start + self.sweep, -1.0)]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurveGeometry {
     pub(crate) points: [(f64, f64); 4],
     pub(crate) cubic: bool,
+    /// Where `extend_left` / `extend_right` continue the start's and the end's tangent to the
+    /// pane edge (`None`: not extended, or the tangent never reaches the pane).
+    pub(crate) extend: [Option<(f64, f64)>; 2],
 }
 
 impl CurveGeometry {
+    /// The curve's defining points: start, control(s), end.
+    fn defining(&self) -> &[(f64, f64)] {
+        &self.points[..if self.cubic { 4 } else { 3 }]
+    }
+
+    /// The start and the end point.
+    pub(crate) fn ends(self) -> [Point; 2] {
+        let points = self.defining();
+        [points[0], points[points.len() - 1]]
+    }
+
+    /// For each end, the point its tangent runs toward: the nearest control point distinct from
+    /// it, else the other end (`None` when every point coincides with that end). Tangent
+    /// extensions and end caps follow it.
+    pub(crate) fn end_towards(self) -> [Option<Point>; 2] {
+        let points = self.defining();
+        let [first, last] = self.ends();
+        [
+            points[1..].iter().copied().find(|&point| point != first),
+            points[..points.len() - 1]
+                .iter()
+                .rev()
+                .copied()
+                .find(|&point| point != last),
+        ]
+    }
+
+    /// The exact Bézier point at `t` in `[0, 1]` (the reference its flattening approximates, and
+    /// where the on-curve handles sit).
     pub(crate) fn point(self, t: f64) -> (f64, f64) {
         let u = 1.0 - t;
         let weights = if self.cubic {
@@ -414,6 +892,17 @@ impl CurveGeometry {
             y += point.1 * weight;
         }
         (x, y)
+    }
+
+    /// The curve flattened against `clip` within [`CURVE_TOLERANCE`], both ends included, at most
+    /// [`shape::MAX_FLATTEN_POINTS`] + 1 points.
+    pub(crate) fn flatten(self, clip: Rect, out: &mut Vec<Point>) {
+        let [p0, p1, p2, p3] = self.points;
+        if self.cubic {
+            shape::flatten_cubic(p0, p1, p2, p3, CURVE_TOLERANCE, clip, out);
+        } else {
+            shape::flatten_quadratic(p0, p1, p2, CURVE_TOLERANCE, clip, out);
+        }
     }
 }
 
@@ -493,6 +982,59 @@ pub(crate) struct DrawingGeometryOptions {
     pub(crate) icon_size: f64,
     pub(crate) extend_left: bool,
     pub(crate) extend_right: bool,
+    /// Speed resistance arcs sweep full circles (`tool_options.fibonacci.full_circles`).
+    pub(crate) full_circles: bool,
+    /// A polyline joins its last vertex to its first (`tool_options.shape.closed`).
+    pub(crate) closed: bool,
+    /// The annotation's fork form (`tool_options.projection_annotation` present, owner decision
+    /// A1): a projection resolves its sector, a note its pin, a comment and a price label their
+    /// speech-bubble tail.
+    pub(crate) annotation_fork_form: bool,
+    /// Caller px of the pole a signpost with coincident anchors stands up from its foot (0 for
+    /// every other drawing): `kinds::projection_annotations::SIGNPOST_POLE` at the caller's
+    /// scale.
+    pub(crate) signpost_pole: f64,
+}
+
+impl DrawingGeometryOptions {
+    /// The resolver options of `drawing`'s stored style, `device_scale` caller px per CSS px (the
+    /// vertical pixel ratio in the frame, 1 in media px). Every site that resolves a stored
+    /// drawing builds its options here, so a new stored option reaches paint, hit testing,
+    /// culling and text placement together.
+    pub(crate) fn for_drawing(drawing: &Drawing, device_scale: f64) -> Self {
+        Self {
+            line_width: drawing.width,
+            device_scale,
+            icon_size: drawing.icon_size,
+            extend_left: drawing.extend_left,
+            extend_right: drawing.extend_right,
+            full_circles: super::kinds::fibonacci::options(drawing).full_circles,
+            closed: super::kinds::shapes::closed(drawing),
+            annotation_fork_form: super::kinds::projection_annotations::fork_form(drawing),
+            signpost_pole: super::kinds::projection_annotations::signpost_pole(
+                drawing,
+                device_scale,
+            ),
+        }
+    }
+}
+
+/// The far corner of a fixed Gann square from its pivot `start` (caller px): `ratio_corner`, the
+/// corner a `tool_options.gann.scale_ratio` places (see `kinds::pitchforks_gann::ratio_point`),
+/// or else a square on screen toward `end` whose side is the anchors' smaller one.
+pub(crate) fn gann_fixed_end(
+    start: (f64, f64),
+    end: (f64, f64),
+    ratio_corner: Option<(f64, f64)>,
+) -> (f64, f64) {
+    if let Some(corner) = ratio_corner {
+        return corner;
+    }
+    let side = (end.0 - start.0).abs().min((end.1 - start.1).abs());
+    (
+        start.0 + side.copysign(end.0 - start.0),
+        start.1 + side.copysign(end.1 - start.1),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -639,6 +1181,61 @@ fn extend_channel_line(
     [a, b]
 }
 
+/// Which ends of a segment-body tool's anchor segment reach the pane edge: `(beyond the first
+/// anchor, beyond the second)`, for anchors at `a` and `b`. The extended line always reaches both,
+/// a ray always reaches past its second anchor and past its first by `extend_left`, and the other
+/// segment tools follow `extend_left` and `extend_right`. A vertical segment extends to the pane's
+/// top or bottom edge the same way, except the trend line and the forecast, which stay their anchor
+/// segment. Coincident anchors have no direction: only upstream's ray (past its second anchor) and
+/// extended line keep their vertical reach, and every other segment tool stays its empty segment.
+/// Every reader of the resolved ends (the frame, hit testing, the line tools' end caps) takes them
+/// from here.
+pub(crate) fn segment_extension(
+    kind: DrawingKind,
+    options: DrawingGeometryOptions,
+    a: Point,
+    b: Point,
+) -> (bool, bool) {
+    let flags = (
+        kind == DrawingKind::ExtendedLine || options.extend_left,
+        matches!(kind, DrawingKind::Ray | DrawingKind::ExtendedLine) || options.extend_right,
+    );
+    if (b.0 - a.0).abs() > f64::EPSILON {
+        return flags;
+    }
+    let coincident = (b.1 - a.1).abs() <= f64::EPSILON;
+    match kind {
+        DrawingKind::TrendLine | DrawingKind::Forecast => (false, false),
+        DrawingKind::Ray | DrawingKind::ExtendedLine if coincident => {
+            (kind == DrawingKind::ExtendedLine, true)
+        }
+        _ if coincident => (false, false),
+        _ => flags,
+    }
+}
+
+/// The corners of a rotated rectangle with anchors at `px` (its edge `a → b` and a depth point,
+/// whose distance from the edge's line sets the depth), in order around it: `[a, b, b + o, a + o]`
+/// with `o` the depth offset perpendicular to the edge. `None` for a zero-length edge or fewer
+/// than three anchors.
+pub(crate) fn rotated_rectangle_corners(px: &[Point]) -> Option<[Point; 4]> {
+    let (&a, &b, &handle) = (px.first()?, px.get(1)?, px.get(2)?);
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let norm = dx * dx + dy * dy;
+    if norm <= f64::EPSILON {
+        return None;
+    }
+    let depth = ((handle.0 - a.0) * -dy + (handle.1 - a.1) * dx) / norm;
+    let offset = (-dy * depth, dx * depth);
+    Some([
+        a,
+        b,
+        (b.0 + offset.0, b.1 + offset.1),
+        (a.0 + offset.0, a.1 + offset.1),
+    ])
+}
+
 pub(crate) fn resolve_drawing_geometry<'a>(
     kind: DrawingKind,
     px: &'a [(f64, f64)],
@@ -662,35 +1259,36 @@ pub(crate) fn resolve_drawing_geometry<'a>(
             let mut b = *px.get(1)?;
             let dx = b.0 - a.0;
             let dy = b.1 - a.1;
+            let (extend_a, extend_b) = segment_extension(kind, options, a, b);
             if dx.abs() > f64::EPSILON {
                 let slope = dy / dx;
-                if kind == DrawingKind::ExtendedLine
-                    || (kind != DrawingKind::Ray && options.extend_left)
-                {
+                if extend_a {
                     let edge = if dx > 0.0 { 0.0 } else { pane_w };
                     a.1 += (edge - a.0) * slope;
                     a.0 = edge;
                 }
-                if matches!(kind, DrawingKind::Ray | DrawingKind::ExtendedLine)
-                    || options.extend_right
-                {
+                if extend_b {
                     let edge = if dx > 0.0 { pane_w } else { 0.0 };
                     b.1 += (edge - b.0) * slope;
                     b.0 = edge;
                 }
-            } else if matches!(kind, DrawingKind::Ray | DrawingKind::ExtendedLine) {
-                if kind == DrawingKind::ExtendedLine {
+            } else {
+                // A vertical segment extends to the pane's top or bottom edge on the ends
+                // `segment_extension` selects.
+                if extend_a {
                     a.1 = if dy > 0.0 {
                         pane_top
                     } else {
                         pane_top + pane_h
                     };
                 }
-                b.1 = if dy > 0.0 {
-                    pane_top + pane_h
-                } else {
-                    pane_top
-                };
+                if extend_b {
+                    b.1 = if dy > 0.0 {
+                        pane_top + pane_h
+                    } else {
+                        pane_top
+                    };
+                }
             }
             DrawingBodyGeometry::Segment { a, b }
         }
@@ -763,10 +1361,15 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                     b: *px.get(1)?,
                 }
             } else {
+                // `extend_left`/`extend_right` run the fitted lines (and so the zones) to the
+                // pane edges beyond the first and second anchor's bar, like a channel's.
+                let extend = |line| {
+                    extend_channel_line(line, options.extend_left, options.extend_right, pane_w)
+                };
                 DrawingBodyGeometry::Regression {
-                    center: [px[2], px[3]],
-                    upper: [px[4], px[5]],
-                    lower: [px[6], px[7]],
+                    center: extend([px[2], px[3]]),
+                    upper: extend([px[4], px[5]]),
+                    lower: extend([px[6], px[7]]),
                 }
             }
         }
@@ -838,7 +1441,7 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 delta
             } else if spiral {
                 4.0 * std::f64::consts::PI
-            } else if kind == DrawingKind::FibonacciCircles {
+            } else if kind == DrawingKind::FibonacciCircles || options.full_circles {
                 std::f64::consts::TAU
             } else {
                 std::f64::consts::PI
@@ -906,35 +1509,22 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         | DrawingKind::FlagMark
         | DrawingKind::Signpost => DrawingBodyGeometry::Marker(MarkerGeometry {
             kind,
-            anchor: if kind == DrawingKind::Signpost {
-                *px.get(1)?
-            } else {
+            anchor: if kind != DrawingKind::Signpost {
                 *px.first()?
+            } else if options.signpost_pole > 0.0 {
+                // Coincident anchors stand the fork's pole up from the foot.
+                (px[0].0, px[0].1 - options.signpost_pole)
+            } else {
+                *px.get(1)?
             },
             base: (kind == DrawingKind::Signpost).then(|| px[0]),
             radius: 7.0 * options.device_scale,
         }),
         DrawingKind::RotatedRectangle => {
-            let a = *px.first()?;
-            let b = *px.get(1)?;
-            let handle = *px.get(2)?;
-            let dx = b.0 - a.0;
-            let dy = b.1 - a.1;
-            let norm = dx * dx + dy * dy;
-            if norm <= f64::EPSILON {
-                DrawingBodyGeometry::Empty
-            } else {
-                let depth = ((handle.0 - a.0) * -dy + (handle.1 - a.1) * dx) / norm;
-                let offset = (-dy * depth, dx * depth);
-                DrawingBodyGeometry::Quad {
-                    corners: [
-                        a,
-                        b,
-                        (b.0 + offset.0, b.1 + offset.1),
-                        (a.0 + offset.0, a.1 + offset.1),
-                    ],
-                }
-            }
+            px.get(2)?;
+            rotated_rectangle_corners(px).map_or(DrawingBodyGeometry::Empty, |corners| {
+                DrawingBodyGeometry::Quad { corners }
+            })
         }
         DrawingKind::Ellipse => {
             let a = *px.first()?;
@@ -969,7 +1559,7 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         }
         DrawingKind::Curve | DrawingKind::DoubleCurve => {
             let cubic = kind == DrawingKind::DoubleCurve;
-            DrawingBodyGeometry::Curve(CurveGeometry {
+            let mut curve = CurveGeometry {
                 points: [
                     *px.first()?,
                     *px.get(1)?,
@@ -977,7 +1567,27 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                     if cubic { *px.get(3)? } else { *px.get(2)? },
                 ],
                 cubic,
-            })
+                extend: [None; 2],
+            };
+            // `extend_left`/`extend_right` continue the start's and the end's tangent to the
+            // pane edge.
+            let pane = Rect {
+                left: 0.0,
+                top: pane_top,
+                right: pane_w,
+                bottom: pane_top + pane_h,
+            };
+            let flags = [options.extend_left, options.extend_right];
+            let (towards, ends) = (curve.end_towards(), curve.ends());
+            for (((slot, flag), toward), end) in
+                curve.extend.iter_mut().zip(flags).zip(towards).zip(ends)
+            {
+                if let (true, Some(toward)) = (flag, toward) {
+                    let (_, edge) = shape::extend_segment(toward, end, pane, false, true);
+                    *slot = (edge != end).then_some(edge);
+                }
+            }
+            DrawingBodyGeometry::Curve(curve)
         }
         DrawingKind::Rectangle | DrawingKind::BarsPattern => {
             let (a, b) = (*px.first()?, *px.get(1)?);
@@ -986,6 +1596,25 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 right: a.0.max(b.0),
                 top: a.1.min(b.1),
                 bottom: a.1.max(b.1),
+            }
+        }
+        DrawingKind::Note if options.annotation_fork_form => {
+            let tip = px[0];
+            let scale = options.device_scale;
+            DrawingBodyGeometry::NotePin(NotePinGeometry {
+                tip,
+                head: (tip.0, tip.1 - NOTE_RISE * scale),
+                radius: NOTE_HEAD_RADIUS * scale,
+                dot_radius: NOTE_DOT_RADIUS * scale,
+            })
+        }
+        DrawingKind::Comment | DrawingKind::PriceLabel if options.annotation_fork_form => {
+            let tip = px[0];
+            let scale = options.device_scale;
+            // The tail reaches one CSS px into the bubble so the two never show a seam.
+            let base = tip.1 - (TAIL_HEIGHT + 1.0) * scale;
+            DrawingBodyGeometry::SpeechTail {
+                corners: [tip, (tip.0, base), (tip.0 + TAIL_WIDTH * scale, base)],
             }
         }
         DrawingKind::Text
@@ -1009,17 +1638,15 @@ pub(crate) fn resolve_drawing_geometry<'a>(
             let start = px[0];
             let mut end = *px.get(1)?;
             if kind == DrawingKind::GannSquareFixed {
-                let side = (end.0 - start.0).abs().min((end.1 - start.1).abs());
-                end = (
-                    start.0 + side.copysign(end.0 - start.0),
-                    start.1 + side.copysign(end.1 - start.1),
-                );
+                // A scale ratio's corner is the third render point.
+                end = gann_fixed_end(start, end, px.get(2).copied());
             }
             DrawingBodyGeometry::GannGrid(GannGridGeometry { kind, start, end })
         }
         DrawingKind::GannFan => {
             let start = px[0];
-            let end = *px.get(1)?;
+            // A scale ratio's 1×1 target is the third render point.
+            let end = px.get(2).copied().unwrap_or(*px.get(1)?);
             DrawingBodyGeometry::Fibonacci(FibonacciGeometry {
                 kind,
                 start,
@@ -1032,8 +1659,25 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         DrawingKind::Projection => {
             let pivot = px[0];
             let target = *px.get(1)?;
-            DrawingBodyGeometry::Triangle {
-                corners: [pivot, (target.0, pivot.1), target],
+            let (dx, dy) = (target.0 - pivot.0, target.1 - pivot.1);
+            let radius = dx.hypot(dy);
+            if options.annotation_fork_form && radius > f64::EPSILON {
+                // From the horizontal ray on the target's side to the target: at most a quarter
+                // turn, so the sector stays in one quadrant of the pivot.
+                let start = if dx >= 0.0 { 0.0 } else { std::f64::consts::PI };
+                let sweep = (dy.atan2(dx) - start + std::f64::consts::PI)
+                    .rem_euclid(std::f64::consts::TAU)
+                    - std::f64::consts::PI;
+                DrawingBodyGeometry::Sector(ArcGeometry {
+                    center: pivot,
+                    radius,
+                    start,
+                    sweep,
+                })
+            } else {
+                DrawingBodyGeometry::Triangle {
+                    corners: [pivot, (target.0, pivot.1), target],
+                }
             }
         }
         DrawingKind::IconStamp => DrawingBodyGeometry::IconStamp {
@@ -1050,6 +1694,9 @@ pub(crate) fn resolve_drawing_geometry<'a>(
             line_type: LineType::Simple,
             terminal: path_arrow_points(px, options.line_width, options.device_scale),
         },
+        DrawingKind::Polyline if options.closed && px.len() >= 3 => {
+            DrawingBodyGeometry::Polygon { points: px }
+        }
         DrawingKind::Polyline
         | DrawingKind::PatternXabcd
         | DrawingKind::PatternCypher
@@ -1223,6 +1870,33 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 top: arc.center.1 - arc.radius,
                 bottom: arc.center.1 + arc.radius,
             },
+            DrawingBodyGeometry::Sector(arc) => {
+                // Exact: the arc stays within the quadrant its two end rays bound.
+                let end = arc.start + arc.sweep;
+                points_box(&[
+                    arc.center,
+                    (
+                        arc.center.0 + arc.radius * arc.start.cos(),
+                        arc.center.1 + arc.radius * arc.start.sin(),
+                    ),
+                    (
+                        arc.center.0 + arc.radius * end.cos(),
+                        arc.center.1 + arc.radius * end.sin(),
+                    ),
+                ])?
+            }
+            DrawingBodyGeometry::NotePin(pin) => TextBox {
+                left: pin.tip.0,
+                right: pin.tip.0,
+                top: pin.tip.1,
+                bottom: pin.tip.1,
+            },
+            DrawingBodyGeometry::SpeechTail { corners } => TextBox {
+                left: corners[0].0,
+                right: corners[0].0,
+                top: corners[0].1,
+                bottom: corners[0].1,
+            },
             DrawingBodyGeometry::Curve(curve) => {
                 points_box(&curve.points[..if curve.cubic { 4 } else { 3 }])?
             }
@@ -1237,7 +1911,8 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 top,
                 bottom,
             },
-            DrawingBodyGeometry::Polyline { points, .. } => points_box(points)?,
+            DrawingBodyGeometry::Polyline { points, .. }
+            | DrawingBodyGeometry::Polygon { points } => points_box(points)?,
             DrawingBodyGeometry::Position(position) => TextBox {
                 left: position.left,
                 right: position.right,
@@ -1252,6 +1927,36 @@ pub(crate) fn resolve_drawing_geometry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_bands_chain_visible_levels_in_list_order() {
+        let mut drawing = Drawing::new(1, DrawingKind::FibonacciSpeedArcs, 0, Vec::new());
+        drawing.fill_enabled = true;
+        drawing.levels = [0.0, 0.5, 0.618, 1.0, 1.272, 1.618, -0.5, 2.0]
+            .into_iter()
+            .map(|value| DrawingLevel {
+                visible: value != 0.618,
+                fill_between: value != 1.272,
+                ..DrawingLevel::at(value, "#123456")
+            })
+            .collect();
+        let pairs = |drawing: &Drawing, positive_only| {
+            level_band_pairs(drawing, &drawing.levels, positive_only)
+                .map(|(prior, level)| (prior, level.value))
+                .collect::<Vec<_>>()
+        };
+        // A hidden level breaks the chain; a level without `fill_between` still links it.
+        assert_eq!(
+            pairs(&drawing, false),
+            [(0.0, 0.5), (1.272, 1.618), (1.618, -0.5), (-0.5, 2.0)]
+        );
+        // Radial levels also break on a non-positive effective value.
+        assert_eq!(pairs(&drawing, true), [(1.272, 1.618)]);
+        drawing.level_reverse = true;
+        assert_eq!(pairs(&drawing, true), [(0.0, 0.5)]);
+        drawing.fill_enabled = false;
+        assert!(pairs(&drawing, false).is_empty());
+    }
 
     #[test]
     fn gann_square_fans_and_arcs_share_bounded_geometry() {
@@ -1733,5 +2438,80 @@ mod tests {
             panic!("projection triangle")
         };
         assert_eq!(corners, [(10.0, 50.0), (80.0, 50.0), (80.0, 10.0)]);
+    }
+
+    #[test]
+    fn projection_sector_resolves_from_the_horizon_ray_to_the_target() {
+        let fork = DrawingGeometryOptions {
+            annotation_fork_form: true,
+            ..DrawingGeometryOptions::default()
+        };
+        // Target up-right, up-left, and down-left of the pivot: the horizontal ray on the
+        // target's side, at most a quarter turn to the target.
+        for (target, start) in [
+            ((80.0, 10.0), 0.0),
+            ((-40.0, 20.0), std::f64::consts::PI),
+            ((-40.0, 90.0), std::f64::consts::PI),
+        ] {
+            let px = [(10.0, 50.0), target];
+            let geometry =
+                resolve_drawing_geometry(DrawingKind::Projection, &px, 100.0, 0.0, 100.0, fork)
+                    .unwrap();
+            let DrawingBodyGeometry::Sector(arc) = geometry.body else {
+                panic!("projection sector")
+            };
+            let radius = (target.0 - 10.0_f64).hypot(target.1 - 50.0);
+            assert!((arc.radius - radius).abs() < 1e-9);
+            assert_eq!(arc.center, (10.0, 50.0));
+            assert_eq!(arc.start, start);
+            assert!(arc.sweep.abs() <= std::f64::consts::FRAC_PI_2 + 1e-12);
+            let end = arc.point(1.0);
+            assert!((end.0 - target.0).abs() < 1e-9 && (end.1 - target.1).abs() < 1e-9);
+            // The text box is the quadrant box: pivot, horizon point, target.
+            let horizon = arc.point(0.0);
+            let box_ = geometry.text_box;
+            let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+            assert!(near(box_.left, 10.0_f64.min(horizon.0).min(target.0)));
+            assert!(near(box_.right, 10.0_f64.max(horizon.0).max(target.0)));
+            assert!(near(box_.top, 50.0_f64.min(target.1)));
+            assert!(near(box_.bottom, 50.0_f64.max(target.1)));
+        }
+        // A zero radius keeps upstream's (degenerate) triangle.
+        let geometry = resolve_drawing_geometry(
+            DrawingKind::Projection,
+            &[(10.0, 50.0), (10.0, 50.0)],
+            100.0,
+            0.0,
+            100.0,
+            fork,
+        )
+        .unwrap();
+        assert!(matches!(
+            geometry.body,
+            DrawingBodyGeometry::Triangle { .. }
+        ));
+    }
+
+    #[test]
+    fn coincident_signposts_stand_a_pole_scaled_like_the_marker() {
+        for scale in [1.0, 2.0] {
+            let options = DrawingGeometryOptions {
+                device_scale: scale,
+                signpost_pole: 40.0 * scale,
+                ..DrawingGeometryOptions::default()
+            };
+            let px = [(30.0, 80.0), (30.0, 80.0)];
+            let geometry =
+                resolve_drawing_geometry(DrawingKind::Signpost, &px, 100.0, 0.0, 100.0, options)
+                    .unwrap();
+            let DrawingBodyGeometry::Marker(marker) = geometry.body else {
+                panic!("signpost marker")
+            };
+            assert_eq!(
+                marker.stem(),
+                Some(((30.0, 80.0), (30.0, 80.0 - 40.0 * scale)))
+            );
+            assert_eq!(marker.radius, 7.0 * scale);
+        }
     }
 }

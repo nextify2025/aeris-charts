@@ -172,6 +172,90 @@ test("restores land on the saved times in a shifted window, standalone and in th
   expect(result.grid_points[0]).toMatchObject({ logical: 30, time: BASE + 40 * HOUR });
 });
 
+test("a document an earlier fork build wrote restores its tools with that build's options through the TS API", async ({ page }) => {
+  await open_isolated(page);
+  const result = await page.evaluate(async ({ BASE, HOUR }) => {
+    const { create_chart } = await import("/dist/aeris_charts_financial.js");
+    const make_host = () => {
+      const host = document.createElement("div");
+      host.style.cssText = "position:absolute;left:-10000px;top:0;width:800px;height:500px";
+      document.body.append(host);
+      return host;
+    };
+    const bars = Array.from({ length: 60 }, (_, index) => ({ time: BASE + index * HOUR, value: 100 + (index % 5) }));
+    // No catalog marker, fork tool names, anchor times, and the fork's anchor contracts; values
+    // equal to the fork's defaults are left out, as that build wrote them.
+    const at = (logical, price) => ({ logical, price, time: BASE + logical * HOUR });
+    const drawing = (id, kind, anchors, style) => ({ id, kind, pane_id: "pane-1", anchors, ...(style ? { style } : {}) });
+    const fork = {
+      schema: "aeris_charts-state",
+      schema_version: 1,
+      panes: [{ id: "pane-1" }],
+      drawings: [
+        drawing(1, "flat_top_bottom", [at(10, 100), at(20, 104), at(15, 102)]),
+        drawing(2, "regression_trend", [at(10, 100), at(30, 102)], { tool_options: { channel: { upper_deviation: 3, lower_deviation: -1 } } }),
+        drawing(3, "parallel_channel", [at(10, 100), at(20, 104), at(15, 106)]),
+        drawing(4, "info_line", [at(10, 100), at(20, 104)]),
+        drawing(5, "projection", [at(10, 100), at(20, 104), at(15, 106)]),
+        drawing(6, "fib_time_zone", [at(10, 100), at(12, 104)]),
+        drawing(7, "gann_square_fixed", [at(10, 100)], { tool_options: { gann: { size_bars: 5, reverse: true } } }),
+        drawing(8, "andrews_pitchfork", [at(10, 100), at(20, 104), at(25, 101)]),
+      ],
+    };
+    const options = (chart) => chart.drawings().map((item) => ({
+      kind: item.kind(),
+      points: item.points(),
+      options: item.options(),
+    }));
+    const first_host = make_host();
+    const first = await create_chart(first_host, { backend: "canvas2d", autoSize: false });
+    first.add_series("line").set_data(bars);
+    first.import_state(fork);
+    const restored = options(first);
+    const state = first.export_state();
+    first.remove();
+    first_host.remove();
+
+    const second_host = make_host();
+    const second = await create_chart(second_host, { backend: "canvas2d", autoSize: false });
+    second.add_series("line").set_data(bars);
+    second.import_state(state);
+    const again = second.export_state();
+    // A fork-era clipboard item with the fork's three-anchor projection.
+    const pasted = second.paste_drawings(JSON.stringify({
+      schema: "aeris_charts-drawings",
+      revision: 1,
+      drawings: [{ kind: "projection", pane_index: 0, options: {}, points: [at(30, 100), at(40, 104), at(35, 106)] }],
+    }))[0].options().tool_options;
+    second.remove();
+    second_host.remove();
+    return { restored, state, again, pasted };
+  }, { BASE, HOUR });
+
+  const [crossing, regression, parallel, info, projection, zones, square, pitchfork] = result.restored;
+  // The flat channel whose level crosses its base is the disjoint channel with that level.
+  expect(crossing.kind).toBe("disjoint_channel");
+  expect(crossing.points.map((point) => [point.logical, point.price])).toEqual([[10, 100], [20, 104], [10, 102], [20, 102]]);
+  expect(crossing.points[3].time).toBe(BASE + 20 * HOUR);
+  // The regression keeps its sides; its flat band is the wider one.
+  expect(regression.options.regression_deviations).toBe(3);
+  expect(regression.options.tool_options).toEqual({
+    channel: { middle_line: true, upper_deviation: 3, lower_deviation: -1, show_pearsons: true },
+  });
+  expect(parallel.options.tool_options).toEqual({ channel: { middle_line: true } });
+  expect(info.options.tool_options).toEqual({ line: { stats_position: "end" } });
+  expect(projection.options.tool_options).toEqual({ projection_annotation: {} });
+  expect(zones.options.level_label_align).toBe("left");
+  expect(zones.options.tool_options.fibonacci).toMatchObject({ trend_line: true, label_v_align: "bottom" });
+  expect(square.options.level_reverse).toBe(false);
+  expect(square.options.tool_options.gann.show_stats).toBe(true);
+  expect(square.points[1].price).toBeLessThan(100);
+  expect(pitchfork.options.levels.filter((level) => level.visible).map((level) => level.value)).toEqual([0, 0.25, 0.5, 0.75, 1]);
+  // The export restores to itself.
+  expect(result.again).toEqual(result.state);
+  expect(result.pasted).toEqual({ projection_annotation: {} });
+});
+
 test("sync payloads, price-basis rescale, batch rewrites and option errors through the TS API", async ({ page }) => {
   await open_isolated(page);
   const result = await page.evaluate(async ({ BASE, HOUR, DAY }) => {

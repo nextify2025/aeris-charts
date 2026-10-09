@@ -6,8 +6,9 @@ import { PNG } from "pngjs";
 // B8 Shapes family (rotated rectangle, ellipse, circle, triangle, arc, curve, double curve,
 // polyline, highlighter) through the public API and real pointer input: armed placement for every
 // placement class (clicks with a progress preview from the first click, the multi-click polyline
-// finished with Enter, the freehand highlighter), outline hover and selected-only fill hits, body
-// and handle drags with undo, persistence, clipboard and sync round trips, the demo toolbar and
+// finished with Enter or closed on its first vertex, the freehand highlighter, curves placed
+// through points on the curve), outline hover and selected-only fill hits, body, width and
+// on-curve handle drags with undo, persistence, clipboard and sync round trips, the demo toolbar and
 // its live style edits, WebGPU == Canvas2D parity, and the translucent highlighter blending once
 // per pixel on WebGPU. Every geometry decision is engine-owned; these specs only drive the package
 // API and the pointer.
@@ -209,11 +210,11 @@ test("a circle hovers on its rim, hits its fill once selected, and drags as one 
   expect(restored[0].price).toBeCloseTo(before[0].price, 9);
 });
 
-test("a rotated rectangle's depth handle resizes it and an edge handle turns it, one undo step each", async ({ page }) => {
+test("a rotated rectangle's width handles on its long sides resize it and an edge corner turns it keeping its width, one undo step each", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const depth_price = s.p_mid + (s.p_hi - s.p_mid) / 2;
-  // Upstream's rotated rectangle: an edge (the first two anchors) and a point on the opposite edge.
+  // Upstream's rotated rectangle: an edge (the first two anchors) and a point setting the depth.
   const id = await page.evaluate(({ s, depth_price }) => window.__chart.add_drawing("rotated_rectangle", [
     { logical: s.l0, price: s.p_mid },
     { logical: s.l1, price: s.p_mid },
@@ -224,16 +225,19 @@ test("a rotated rectangle's depth handle resizes it and an edge handle turns it,
   const a = await spot(page, s.l0, s.p_mid);
   const b = await spot(page, s.l1, s.p_mid);
   const depth = await spot(page, s.l0, depth_price);
-  // Select through the edge, then grab the depth handle.
+  // The far side's midpoint carries the third handle; the near side's midpoint the width handle.
+  const far = { x: (a.x + b.x) / 2, y: depth.y };
+  const near = { x: (a.x + b.x) / 2, y: a.y };
+  // Select through the edge, then grab the far side's handle.
   await page.mouse.click((a.x + b.x) / 2, a.y);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(id);
-  expect(await page.evaluate((id) => window.__chart.drawing_handle_count(id), id)).toBe(3);
+  expect(await page.evaluate((id) => window.__chart.drawing_handle_count(id), id)).toBe(4);
   const before = await points(id);
-  await page.mouse.move(depth.x, depth.y);
+  await page.mouse.move(far.x, far.y);
   await expect.poll(() => overlay_cursor(page)).toBe("pointer");
   await page.mouse.down();
-  await page.mouse.move(depth.x, depth.y - 20, { steps: 4 });
-  await page.mouse.move(depth.x, depth.y - 30, { steps: 4 });
+  await page.mouse.move(far.x, far.y - 20, { steps: 4 });
+  await page.mouse.move(far.x, far.y - 30, { steps: 4 });
   await page.mouse.up();
   const after = await points(id);
   expect(after[2].price).toBeGreaterThan(before[2].price);
@@ -242,7 +246,35 @@ test("a rotated rectangle's depth handle resizes it and an edge handle turns it,
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points(id)).toEqual(before);
 
-  // Dragging the edge's end turns the rectangle; one undo restores it.
+  // The near side's handle moves the edge across itself; the far side stays.
+  await page.mouse.move(near.x, near.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("pointer");
+  await page.mouse.down();
+  await page.mouse.move(near.x, near.y + 10, { steps: 4 });
+  await page.mouse.move(near.x, near.y + 20, { steps: 4 });
+  await page.mouse.up();
+  const narrowed = await points(id);
+  expect(narrowed[0].price).toBeLessThan(before[0].price);
+  expect(narrowed[1].price).toBeCloseTo(narrowed[0].price, 9);
+  expect(narrowed[2]).toEqual(before[2]);
+  expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  expect(await points(id)).toEqual(before);
+
+  // Dragging the edge's end turns the rectangle and keeps its on-screen width; one undo
+  // restores it.
+  // The derived anchors sit between bars: interpolate x between the neighbouring whole bars.
+  const spot_between = async (logical, price) => {
+    const floor = await spot(page, Math.floor(logical), price);
+    const next = await spot(page, Math.floor(logical) + 1, price);
+    return { x: floor.x + (next.x - floor.x) * (logical - Math.floor(logical)), y: floor.y };
+  };
+  const width_px = async () => {
+    const [p0, p1, p2] = await points(id);
+    const [q0, q1, q2] = [await spot_between(p0.logical, p0.price), await spot_between(p1.logical, p1.price), await spot_between(p2.logical, p2.price)];
+    const length = Math.hypot(q1.x - q0.x, q1.y - q0.y);
+    return Math.abs(((q2.x - q0.x) * (q1.y - q0.y) - (q2.y - q0.y) * (q1.x - q0.x)) / length);
+  };
+  const width = await width_px();
   await page.mouse.move(b.x, b.y);
   await page.mouse.down();
   await page.mouse.move(b.x - 20, b.y + 30, { steps: 4 });
@@ -251,8 +283,50 @@ test("a rotated rectangle's depth handle resizes it and an edge handle turns it,
   const turned = await points(id);
   expect(turned[1].price).toBeLessThan(before[1].price);
   expect(turned[0]).toEqual(before[0]);
+  expect(Math.abs((await width_px()) - width)).toBeLessThan(0.5);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points(id)).toEqual(before);
+});
+
+test("curves place through points on the curve and edit through on-curve handles", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  const mid = Math.floor((s.l0 + s.l1) / 2);
+  const start = await spot(page, s.l0, s.p_lo);
+  const end = await spot(page, s.l1, s.p_lo);
+  const through = await spot(page, mid, s.p_hi);
+  await page.evaluate(() => window.__chart.set_drawing_tool("curve", { color: "#e91e63" }));
+  // Its start, its end, then the point it passes at its middle.
+  for (const point of [start, end, through]) await page.mouse.click(point.x, point.y);
+  const list = await drawings(page);
+  expect(list).toHaveLength(1);
+  const stored = list[0].points;
+  expect(stored[0].logical).toBeCloseTo(s.l0, 3);
+  expect(stored[2].logical).toBeCloseTo(s.l1, 3);
+  // The stored control lies off the curve, beyond the clicked point.
+  expect(stored[1].price).toBeGreaterThan(s.p_hi);
+  expect(await page.evaluate(() => window.__chart.selected_drawing()?.kind())).toBe("curve");
+  expect(await page.evaluate((id) => window.__chart.drawing_handle_count(id), list[0].id)).toBe(3);
+  // The handle sits on the clicked point; dragging it bends the curve through the pointer.
+  await page.mouse.move(through.x, through.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("pointer");
+  await page.mouse.down();
+  await page.mouse.move(through.x, through.y + 20, { steps: 4 });
+  await page.mouse.move(through.x, through.y + 40, { steps: 4 });
+  await page.mouse.up();
+  const bent = (await drawings(page))[0].points;
+  expect(bent[1].price).toBeLessThan(stored[1].price);
+  expect(bent[0]).toEqual(stored[0]);
+  expect(bent[2]).toEqual(stored[2]);
+  expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  expect((await drawings(page))[0].points).toEqual(stored);
+
+  // An ellipse edits with its box's eight handles.
+  const ellipse = await page.evaluate(({ s }) => window.__chart.add_drawing("ellipse", [
+    { logical: s.l0, price: s.p_lo },
+    { logical: s.l1, price: s.p_hi },
+  ], { color: "#e91e63" }).id, { s });
+  expect(await page.evaluate((id) => window.__chart.drawing_handle_count(id), ellipse)).toBe(8);
 });
 
 test("a polyline places by clicks and finishes with Enter", async ({ page }) => {
@@ -273,6 +347,44 @@ test("a polyline places by clicks and finishes with Enter", async ({ page }) => 
   expect(open).toHaveLength(1);
   expect(open[0].points).toHaveLength(3);
   expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
+});
+
+test("clicking a polyline's first vertex closes it", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  const mid = Math.floor((s.l0 + s.l1) / 2);
+  const vertices = [
+    await spot(page, s.l0, s.p_lo),
+    await spot(page, mid, s.p_hi),
+    await spot(page, s.l1, s.p_lo),
+  ];
+  await page.evaluate(() => window.__chart.set_drawing_tool("polyline", { color: "#e91e63", fill_enabled: true }));
+  for (const vertex of vertices) await page.mouse.click(vertex.x, vertex.y);
+  expect(await drawings(page)).toHaveLength(0);
+  const before = await capture(page);
+  // A click near the first vertex finishes the polyline closed instead of adding a vertex.
+  await page.mouse.click(vertices[0].x + 2, vertices[0].y - 2);
+  await settle_frames(page);
+  const closed = await drawings(page);
+  expect(closed).toHaveLength(1);
+  expect(closed[0].points).toHaveLength(3);
+  expect(closed[0].options.tool_options).toEqual({ shape: { closed: true } });
+  expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
+  // The enclosed region fills: a window around the centroid changes (candles may cover some of
+  // it, so most of the window, not every pixel).
+  const filled = await capture(page);
+  const cx = Math.round(((vertices[0].x + vertices[1].x + vertices[2].x) / 3) * PR);
+  const cy = Math.round(((vertices[0].y + vertices[1].y + vertices[2].y) / 3) * PR);
+  let changed = 0;
+  for (let y = cy - 5; y <= cy + 5; y += 1) {
+    for (let x = cx - 5; x <= cx + 5; x += 1) {
+      const o = (y * filled.width + x) * 4;
+      if ([0, 1, 2].some((channel) => filled.data[o + channel] !== before.data[o + channel])) changed += 1;
+    }
+  }
+  expect(changed, "the closed polyline fills").toBeGreaterThan(60);
+  expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  expect(await drawings(page)).toHaveLength(0);
 });
 
 test("Shapes tools round-trip through persistence, clipboard, and sync with their options", async ({ page }) => {

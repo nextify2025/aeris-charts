@@ -6,8 +6,9 @@ import { PNG } from "pngjs";
 // B8 Lines family (ray, extended line, info line, trend angle, cross line, arrow line, the
 // axis-locked horizontal segment, vertical ray, and vertical segment, and the price line) through the
 // public API and real pointer input: armed placement, edge-reaching extensions and their hit
-// testing, the info line's labels and its stored (inert) line options, cross-line body drags,
-// persistence and clipboard round trips, the demo toolbar entries, and WebGPU == Canvas2D parity.
+// testing, the info line's labels and the stats box its `tool_options.line` block selects, cross-line
+// body drags, persistence and clipboard round trips, the demo toolbar entries, and WebGPU == Canvas2D
+// parity.
 // Every geometry decision is engine-owned; these specs only drive the package API and pointer.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
@@ -157,8 +158,19 @@ test("rays and extended lines reach the pane edges and hit along the extension",
   await page.mouse.click(far.x, far.y);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(ids.ray);
 
-  // An extended line spans both edges (the pointer leaves the pane so no hover paints over it).
+  // `extend_left` runs the ray back through its first anchor to the opposite edge.
   await page.mouse.move(1, 1);
+  await page.evaluate((id) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ extend_left: true });
+    window.__chart.wasm.set_selected_drawing(undefined);
+    window.__chart.render();
+  }, ids.ray);
+  await settle_frames(page);
+  extent = color_x_extent(await capture(page), PINK);
+  expect(extent.min).toBeLessThanOrEqual(2);
+  expect(extent.max).toBeGreaterThanOrEqual(Math.floor((width - 2) * PR));
+
+  // An extended line spans both edges (the pointer leaves the pane so no hover paints over it).
   const extended = await page.evaluate(({ s, ray }) => {
     window.__chart.drawings().find((drawing) => drawing.id === ray).remove();
     return window.__chart.add_drawing("extended_line", [
@@ -202,7 +214,7 @@ test("rays and extended lines reach the pane edges and hit along the extension",
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
 });
 
-test("the info line paints its labels and keeps earlier builds' line options stored but inert", async ({ page }) => {
+test("the info line paints its labels, and its line block draws them as one stats box that selects it", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const info = await page.evaluate(({ s }) => {
@@ -225,15 +237,20 @@ test("the info line paints its labels and keeps earlier builds' line options sto
   const b = await spot(page, s.l1, s.p_hi);
   await page.mouse.click((a.x + b.x) / 2, (a.y + b.y) / 2);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
-  await page.evaluate(() => {
+  const deselect = () => page.evaluate(() => {
     window.__chart.wasm.set_selected_drawing(undefined);
     window.__chart.render();
   });
+  await deselect();
   await page.mouse.move(1, 1);
   await settle_frames(page);
   const painted = await capture(page);
 
-  // `tool_options.line` of earlier builds stays stored and changes nothing.
+  // Beyond the first anchor nothing is hit until the line block draws the stats box there.
+  const probe = { x: a.x - 30, y: a.y };
+  await page.mouse.move(probe.x, probe.y);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+  await page.mouse.move(1, 1);
   const options = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
     drawing.apply_options({ tool_options: { line: { stats_position: "start" } } });
@@ -242,8 +259,22 @@ test("the info line paints its labels and keeps earlier builds' line options sto
   expect(options.tool_options).toEqual({ line: { stats_position: "start" } });
   expect(options.kind_options).toEqual({ kind: "generic" });
   await settle_frames(page);
-  const inert = await capture(page);
-  expect(pixelmatch(painted.data, inert.data, null, painted.width, painted.height, { threshold: 0 })).toBe(0);
+  const boxed = await capture(page);
+  expect(pixelmatch(painted.data, boxed.data, null, painted.width, painted.height, { threshold: 0 })).toBeGreaterThan(200);
+  await page.mouse.move(probe.x, probe.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  await page.mouse.click(probe.x, probe.y);
+  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
+
+  // Removing the block (`null`) restores upstream's per-label paint exactly.
+  await deselect();
+  await page.mouse.move(1, 1);
+  await page.evaluate((id) => {
+    window.__chart.drawings().find((candidate) => candidate.id === id).apply_options({ tool_options: { line: null } });
+  }, info.id);
+  await settle_frames(page);
+  const restored = await capture(page);
+  expect(pixelmatch(painted.data, restored.data, null, painted.width, painted.height, { threshold: 0 })).toBe(0);
 
   // An invalid block is rejected atomically.
   const rejected = await page.evaluate((id) => {
@@ -338,8 +369,9 @@ test("Lines tools round-trip through persistence, clipboard, and sync with their
 
   expect(result.canonical).toEqual(result.state);
   const ray_style = result.state.drawings[0].style;
-  // The ray's `extend_*` options persist (a ray is always a ray); `extend_right: false` is its
-  // default, so it is not written.
+  // The ray's `extend_*` options persist: `extend_left` runs it back through its first anchor, and
+  // `extend_right: false` is its default, so it is not written (a ray always reaches past its second
+  // anchor).
   expect(ray_style.extend_left).toBe(true);
   expect(ray_style.extend_right).toBeUndefined();
   expect(result.state.drawings[1].style.extend_right).toBeUndefined();
@@ -426,6 +458,11 @@ test("Lines tools render pixel-identical on WebGPU and Canvas2D (AA coverage ste
       chart.add_drawing("vertical_ray", [{ logical: at(0.88), price: up(0.4) }, { logical: at(0.88), price: up(0.6) }], { color: "#d50000" });
       chart.add_drawing("vertical_segment", [{ logical: at(0.4), price: up(0.15) }, { logical: at(0.4), price: up(0.55) }], { color: "#00897b", style: "dashed" });
       chart.add_drawing("price_line", [{ logical: at(0.5), price: up(0.9) }], { color: "#6a1b9a", width: 2 });
+      // The line block's presentation: the trend angle's reference, arc and angle, a trimmed
+      // arrow under its head, and the info line's stats box.
+      chart.add_drawing("trend_angle", [{ logical: at(0.62), price: up(0.05) }, { logical: at(0.72), price: up(0.4) }], { color: "#00897b", tool_options: { line: {} } });
+      chart.add_drawing("arrow_line", [{ logical: at(0.45), price: up(0.95) }, { logical: at(0.58), price: up(0.7) }], { color: "#d50000", width: 2, tool_options: { line: {} } });
+      chart.add_drawing("info_line", [{ logical: at(0.05), price: up(0.6) }, { logical: at(0.18), price: up(0.85) }], { color: "#2962ff", tool_options: { line: { stats_position: "middle" } } });
       const first = chart.drawings()[0];
       chart.wasm.set_selected_drawing(first.id);
       chart.render();

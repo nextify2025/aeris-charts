@@ -16,33 +16,115 @@
 //! arm, and hit code; `Some` for those three ranges and the own-line tools, whose constants live in
 //! their `kinds/<family>.rs` module.
 
-// ponytail: fork renderer extras retired by the upstream B8 sync and not yet re-applied on
-// upstream's lowering (their options stay stored but inert). Lines: the one engine-formatted stats
-// box every line tool's `labels` rendered as (InfoLine's five-stat box and stats_position included;
-// each visible label now prints on its own line through upstream's label path, with the date range
-// and duration still engine-formatted), TrendAngle's arc and reference line, the fork arrowhead
-// geometry, and a ray's `extend_*` toggles (upstream's ray is always a ray). Channels: the parallel
-// channel's middle line, flat_top_bottom's crossing split, regression asymmetric and toggled
-// deviations (folded into one symmetric `regression_deviations` at the wider enabled side, a lossy
-// conversion), OHLC source selection, Pearson's R, fit-line handles, and time-only regression
-// moves (upstream's anchors are free handles, so a regression moves on both axes). Fibonacci:
-// per-level palette lines, dashed trend line, fan grid, full circles, vertical label alignment,
-// phi spiral, and level labels and selected bands as hit targets. Pitchforks and Gann: zone fills
-// as selected hit targets, base-midpoint handle, Gann box time levels and angles, square stats box,
-// fan scale ratio, fixed-square size and corner handle, price-basis rescale. Patterns: harmonic
-// ratio connectors and labels, point labels as hit targets, shaded XABCD triangles,
-// head-and-shoulders neckline, triangle apex extension, 12-degree Elliott notation, show_wave,
-// progressive previews. Annotations: projection sector, note pin and reveal-on-focus, price-note
-// leader, speech bubbles, the default texts of new annotations ("Note", "Callout", ...), signpost
-// pole and its editor on placement (upstream's signpost is a two-anchor marker that opens none),
-// arrow-mark text, multi-line family boxes for note/comment/callout/price_note/anchored_text,
-// bars-pattern box fit and LOD aggregation, the forecast's source and target boxes (absolute
-// change, Success/Failure on market colors, the box as a hit target; the target time stays, one
-// line above upstream's outcome label). Shapes: symmetric rotated rectangle and width handles,
-// ellipse bounds handles, on-curve anchors with tangent extension and chord fills, closed
-// polylines, clip-aware flattening. Re-applied on upstream's lowering instead: channel
-// `extend_*`, the callout's tip and box handles, the highlighter's once-filled tube, and the
-// regression trend's dashed anchor segment while it has no fit.
+// ponytail: fork renderer extras retired by the upstream B8 sync. Documents the fork wrote, and
+// the fork-era clipboard and sync items that prove where they came from, carry each one's fork
+// default (`kinds::legacy_fork_tool_options` and the legacy defaults), so they keep the fork look;
+// the options of the items not restored stay stored but inert. Re-applied on upstream's
+// lowering: the line tools' fork presentation, selected by
+// the stored `tool_options.line` block and layered on upstream's segment and cross arms
+// (`kinds::lines::upstream_line_parts`; new drawings have no block and render as upstream does):
+// the one engine-formatted stats box of the visible `labels` (stats_position, InfoLine's five-stat
+// box for fork documents), TrendAngle's dashed reference, arc and folded angle, and the five
+// segment tools' fork arrowhead (stroke trimmed under the head, no cap on an end that reaches the
+// pane edge, caps as hit targets); a ray's `extend_left` and the vertical extension of info_line,
+// trend_angle and arrow_line by `extend_*` (`geometry::segment_extension`); the channels'
+// presentation, read from the stored `tool_options.channel` block on upstream's channel and
+// regression arms (`kinds::channels`): the dashed middle line of every parallel, flat and disjoint
+// channel, the regression's dashed centre in `middle_color`, its per-side deviation overrides and
+// switches (both sides on one side of the centre fill from the centre to the farther one), its OHLC
+// source and Pearson's R; upstream behaviour changed by owner decision: one band fill between a
+// channel's lines paired by side, so a disjoint whose second line runs backward fills its whole
+// quad and a crossing (a fork `flat_top_bottom` whose level crosses its base restores as that
+// disjoint) fills two lobes, paint and selected-fill hit alike (C3); regression handles on the
+// fitted line's ends and time-only regression moves (C1); the regression's `extend_*` and its zones
+// as drag surfaces while selected (T1); the Fibonacci presentation, read from the stored
+// `tool_options.fibonacci` block on upstream's Fibonacci, time-level and Fibonacci-arc arms
+// (`kinds::fibonacci`; new drawings have no block and render as upstream does): the trend line
+// (both legs on the extension and trend time, the circles' level-1 diameter, the spiral's 1 px
+// dashed line), the speed fan's grid (its culling bounds cover levels past the anchors), full
+// speed-arc circles, the vertical label placement (`label_v_align`; the labels' measured reach pads
+// culling), and the ring tools' 0.25 px rings and bands over the part the pane shows, dashes
+// anchored to the arc (selected by the block's presence; T1); a spiral without levels paints the
+// golden spiral, turning by the stored `reverse` (F3); the per-level palette lines through
+// upstream's level colors (fork documents' levels; `Drawing::new` stays uncolored, F1); level
+// labels (the text-run hit box) and, while selected, the bands of every level arm (the Gann fan
+// included) as body targets; the fib channel's `extend_*` (T1); the patterns' and Elliott waves'
+// parts layered on upstream's polyline arm (`kinds::patterns_elliott_cycles::pattern_parts`): the
+// harmonic patterns' dashed ratio connectors and boxed ratios (`tool_options.pattern.show_ratios`,
+// on through its stored default, P6), the shaded XABCD and cypher triangles (`fill_enabled`), the
+// triangle pattern's sides to their apex by `extend_left`/`extend_right` (P3; its culling bounds
+// pad by one pattern width), vertex labels as body targets at upstream's placement (P1; the
+// text-run hit box) and `show_wave`; upstream behaviour changed by owner decision: the
+// head-and-shoulders neckline on every drawing with its shading by `fill_enabled` (P2), the
+// 12-degree Frost-Prechter Elliott notation with rings and the start unlabeled (P4), and the
+// patterns' and waves' placement previews from the second anchor with labels, ratios and fills
+// (P5); the pitchforks' and Gann tools' presentation, read from the stored `tool_options.gann`
+// block on upstream's pitchfork, Gann grid and Fibonacci arms (`kinds::pitchforks_gann`; new
+// drawings have no block and render as upstream does): selected pitchfork and pitchfan bands and
+// the Gann grid's level cells past its box as body targets, the pitchforks' base-midpoint handle,
+// the Gann box's own time levels with overlapping per-axis bands (G1) and its angles, the
+// squares' translucent stats box (off for new squares, on for fork documents; G2), the fan's and
+// fixed square's scale ratio as a derived render point, the fixed square's corner handle in whole
+// bars (without a ratio its second anchor stays beyond the corner, moved far beyond it when it
+// was not, so the square normally keeps its bars under ordinary price zoom), and the price-basis
+// rescale of the ratios, the derived handles
+// dragging through `kinds::drag_derived_handle`; the shapes' presentation on upstream's arc,
+// curve, polyline, rotated-rectangle and triangle arms (`kinds::shapes`; new drawings keep
+// upstream's defaults): the arc's circular segment and the curves' chord regions filled by
+// `fill_enabled` (a selected body target), the curves' tangent extension by `extend_*`, the closed
+// polyline (`tool_options.shape.closed`, nonzero fill by `fill_enabled`, no caps; fork documents
+// stay filled, new ones keep upstream's unfilled default, S1); upstream behaviour changed by
+// owner decision: clicking a polyline's first vertex once three are placed closes it (S2), the
+// ellipse's eight bounds handles with Shift for a circle (S3), the rotated rectangle's third
+// handle on its far side's midpoint with a near-side width handle and width-keeping edge-corner
+// drags (S4, `kinds::follow_anchor_drag`), curves placed and edited through points on the curve,
+// stored as upstream's control points, with the arc placed ends first
+// (`kinds::shapes::placement_anchors`, S5), end caps on arc, curve and double_curve from
+// `stroke_start`/`stroke_end` (S6), and the rotated rectangle's and triangle's outline as one
+// seamless run from mid-edge (S7); the annotations' fork form, selected by the stored
+// `tool_options.projection_annotation` block (A1, `kinds::projection_annotations::fork_form`; new
+// drawings have no block and render as upstream does) and layered on upstream's annotation arms:
+// the projection's sector (`DrawingBodyGeometry::Sector`, A2; its culling bounds leave time open)
+// and its stats box, the note's pin (`NotePin`) with its box shown while edited, focused (the
+// frame's focus key rebuilds the layer) or `always_show_text`, the comment's and the price
+// label's speech-bubble tails (`SpeechTail`, A5), the price note's boxed price and text (A4,
+// additive only), the signpost's plate and its editor on placement (A7), the arrow marks' text past
+// the tail, every box the drawing's one text block (`fork_text_box`, owned statically by kind and
+// block), the fork's starter texts at commit (A6), and the forecast's source dot and boxes (change,
+// target time, Success/Failure on the market colors, hit targets; A10); independent of the form,
+// the coincident signpost's 40 CSS px pole with its pole-top handle, the text annotations'
+// multi-line text blocks (`TextBlock`; one line stays upstream's run), and the bars pattern's
+// bucket aggregation of wide sources at bucket-index offsets (A9); channel `extend_*`, the callout's tip and box
+// handles, the highlighter's once-filled tube,
+// the regression trend's dashed anchor segment while it has no fit, and the clip-aware flattening
+// of the ellipse, circle, arc, curve and double curve (`geometry.rs`: within 0.25 px of the true
+// curve at any zoom, bounded points, paint and hit flattened by the same rule, dashed outlines as
+// solid dash runs). Not restored, by owner decision (they would change upstream's anchor or option
+// contracts): a ray turned into a segment and the extended line's `extend_*` toggles (upstream
+// payloads carry them as `false`), the five-stat default of new info lines (they keep upstream's
+// four; fork documents keep five), the projection's independent sector radius (its third anchor;
+// A3), the price note's leader and label offset (its second anchor; A4), the bars pattern's box
+// fit (A8), multi-line blocks for the plain text tool (A11: it stays one run), the
+// symmetric rotated rectangle placed and edited around its center axis (S4: upstream's edge and
+// depth placement stays; only the width handles are restored), a numeric fixed-square size, the three
+// drives' seventh anchor (its last leg; upstream's contract has six), the triangle pattern's apex
+// sides and the patterns' shading on new drawings (opt-in through `extend_*` and `fill_enabled`;
+// fork documents set them), and the fork's look as the default of new Fibonacci drawings (palette
+// levels with bands, the dashed trend line, the fan grid; F1) and of new spirals (the golden
+// spiral; F3): hosts arm those options explicitly. Also kept as upstream draws them
+// (docs/api/compatibility.md): the fork's boxed pattern and Elliott point labels above highs and
+// below lows (P1; upstream's labels, a migrated triangle's D-E leg and E label, and the three
+// drives' six labels stay), the speed fan's time rays, ring, arc and wedge label placement, half
+// speed arcs facing the other anchor rather than up or down, exact log-scale fib prices, the
+// pitchfork's unextended tines that honour `extend_*` (upstream's tines always ray to the pane
+// edge), A-B swing and B-C handle guides and always-red median, the Gann fan's lines bounded by
+// the anchors' box with "1x2" angle names and the `extend_right` default (upstream's fan rays to
+// the pane edge without the fork's angle names), the Gann box's four-side
+// labels (a split-axis box labels its time levels above it only) and its angles under the levels
+// (they paint above, as upstream's square fans do), the straighten modes, the fork's band and zone
+// alphas, the regression's sample deviation, a fork regression whose `middle_line` is off
+// (upstream's solid centre, not none), and the third handle of the parallel, flat and disjoint
+// channels (on the free third anchor, not the second line's midpoint).
 
 use super::kinds::DrawingFamily;
 use super::DrawingKind;
@@ -561,8 +643,11 @@ const fn channel_spec(
 
 const PARALLEL_CHANNEL: DrawingToolSpec =
     channel_spec(DrawingKind::ParallelChannel, 22, "parallel_channel", 3);
+// The anchors choose the fitted bars and the prices come from the data, so a regression moves
+// along time only (its handles sit on the fitted line, `kinds::channels::regression_fit_handles`).
 const REGRESSION_TREND: DrawingToolSpec = DrawingToolSpec {
     price_extent: DrawingPriceExtent::Full,
+    movement_axis: DrawingMovementAxis::HorizontalOnly,
     ..shape_spec(DrawingKind::RegressionTrend, 23, "regression_trend", 2)
 };
 const FLAT_TOP_CHANNEL: DrawingToolSpec =
@@ -608,7 +693,13 @@ const ROTATED_RECTANGLE: DrawingToolSpec = DrawingToolSpec {
     price_extent: DrawingPriceExtent::Full,
     ..shape_spec(DrawingKind::RotatedRectangle, 27, "rotated_rectangle", 3)
 };
-const ELLIPSE: DrawingToolSpec = shape_spec(DrawingKind::Ellipse, 28, "ellipse", 2);
+// The ellipse edits with the rectangle's eight bounds handles of the box it is inscribed in, and
+// Shift squares that box into a circle (owner decision S3).
+const ELLIPSE: DrawingToolSpec = DrawingToolSpec {
+    handles: DrawingHandleMode::RectangleBounds,
+    straighten: DrawingStraightenMode::Square,
+    ..shape_spec(DrawingKind::Ellipse, 28, "ellipse", 2)
+};
 const CIRCLE: DrawingToolSpec = DrawingToolSpec {
     logical_extent: DrawingLogicalExtent::Full,
     price_extent: DrawingPriceExtent::Full,

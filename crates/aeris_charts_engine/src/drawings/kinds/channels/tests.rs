@@ -4,7 +4,7 @@
 //! schema and kind options, patches with history, persistence, clipboard, and sync.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, Prim};
+use aeris_charts_render::draw_list::{LineStyle, Prim, TextAlign};
 use aeris_charts_render::shape::point_in_polygon;
 
 use super::super::super::{DrawingPlacement, DrawingTextHAlign, DrawingTextVAlign};
@@ -1525,9 +1525,1077 @@ fn channel_extensions_run_both_lines_and_the_fill_to_the_pane_edges() {
             Prim::BandFill { upper_first, .. } => {
                 f64::from(frame.panes[0].points[*upper_first as usize][0]) <= 1.0
             }
-            Prim::Triangle { a, b, c, .. } => [a, b, c].iter().any(|point| point[0] <= 1.0),
             _ => false,
         });
         assert!(filled_left, "{kind:?} fills to the left edge");
     }
+}
+
+/// Text runs of the first pane: text, position, and alignment.
+fn texts(chart: &mut ChartEngine) -> Vec<(String, (f64, f64), TextAlign)> {
+    let frame = chart.build_frame();
+    frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Text {
+                text, x, y, align, ..
+            } => Some((text.clone(), (f64::from(*x), f64::from(*y)), *align)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A regression's 14% default zone wash over the test ink.
+fn zone() -> Color {
+    Color::rgba(0x12, 0x34, 0x56, 35)
+}
+
+/// Population residual deviation of `stats` (the unit of a regression's band).
+fn population(stats: super::RegressionStats) -> f64 {
+    let count = stats.count as f64;
+    stats.deviation * ((count - 1.0) / count).sqrt()
+}
+
+/// Media px of the point `deviations` population deviations off `stats`' fit at `logical`.
+fn on_fit(
+    chart: &ChartEngine,
+    stats: super::RegressionStats,
+    logical: f64,
+    deviations: f64,
+) -> (f64, f64) {
+    to_px(
+        chart,
+        p(
+            logical,
+            stats.price_at(logical) + deviations * population(stats),
+        ),
+    )
+}
+
+fn fit(chart: &ChartEngine, id: DrawingId, source: IndicatorInputSource) -> super::RegressionStats {
+    regression_stats(chart, chart.drawing(id).unwrap(), source).unwrap()
+}
+
+/// The property schema lists the `tool_options.channel` rows each upstream channel kind reads:
+/// the middle line on every channel, and the regression trend's band, source, and Pearson's R
+/// rows on it alone, all at upstream's defaults.
+#[test]
+fn upstream_channel_schemas_list_the_channel_rows_they_read() {
+    use crate::{drawing_property_schema, DrawingPropertyType};
+    let rows = |kind: DrawingKind| {
+        drawing_property_schema(kind)
+            .properties
+            .into_iter()
+            .filter(|row| row.name.starts_with("tool_options.channel."))
+            .map(|row| {
+                let name = row.name["tool_options.channel.".len()..].to_string();
+                (name, row)
+            })
+            .collect::<Vec<_>>()
+    };
+    let middle = [
+        (
+            "middle_line",
+            DrawingPropertyType::Boolean,
+            serde_json::json!(false),
+        ),
+        (
+            "middle_color",
+            DrawingPropertyType::Color,
+            serde_json::json!(""),
+        ),
+    ];
+    for kind in [
+        DrawingKind::ParallelChannel,
+        DrawingKind::FlatTopChannel,
+        DrawingKind::FlatBottomChannel,
+        DrawingKind::DisjointChannel,
+    ] {
+        let rows = rows(kind);
+        assert_eq!(rows.len(), middle.len(), "{kind:?}: {rows:?}");
+        for ((name, row), (expected, property_type, default)) in rows.iter().zip(&middle) {
+            assert_eq!(
+                (name.as_str(), row.property_type, &row.default),
+                (*expected, *property_type, default),
+                "{kind:?}"
+            );
+        }
+    }
+    let rows = rows(DrawingKind::RegressionTrend);
+    let names = rows
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "middle_line",
+            "middle_color",
+            "upper_deviation",
+            "lower_deviation",
+            "use_upper_deviation",
+            "use_lower_deviation",
+            "source",
+            "show_pearsons",
+        ]
+    );
+    let row = |name: &str| &rows.iter().find(|(row, _)| row == name).unwrap().1;
+    for (name, (expected, property_type, default)) in names.iter().zip(&middle) {
+        assert_eq!(name, expected);
+        assert_eq!(
+            (row(name).property_type, &row(name).default),
+            (*property_type, default)
+        );
+    }
+    for name in ["upper_deviation", "lower_deviation"] {
+        let row = row(name);
+        assert_eq!(row.property_type, DrawingPropertyType::Number);
+        assert_eq!(row.default, serde_json::Value::Null);
+        assert_eq!((row.min, row.max), (Some(-100.0), Some(100.0)));
+    }
+    for (name, default) in [
+        ("use_upper_deviation", true),
+        ("use_lower_deviation", true),
+        ("show_pearsons", false),
+    ] {
+        assert_eq!(row(name).property_type, DrawingPropertyType::Boolean);
+        assert_eq!(row(name).default, serde_json::json!(default), "{name}");
+    }
+    let source = row("source");
+    assert_eq!(source.property_type, DrawingPropertyType::Enum);
+    assert_eq!(source.default, serde_json::json!("close"));
+    for value in [
+        "open", "high", "low", "close", "hl2", "hlc3", "ohlc4", "hlcc4",
+    ] {
+        assert!(
+            source.enum_values.iter().any(|item| item == value),
+            "{value}"
+        );
+    }
+}
+
+/// Upstream's parallel, flat, and disjoint channels paint the dashed middle line of their stored
+/// `middle_line` (off by default, upstream's look) between their two lines, under them, in
+/// `middle_color`, and run it to the pane edges with their extensions.
+#[test]
+fn upstream_channels_paint_a_dashed_middle_line_when_enabled() {
+    let mut chart = chart();
+    let cases = [
+        (
+            DrawingKind::ParallelChannel,
+            vec![p(10.0, 101.0), p(20.0, 104.0), p(15.0, 101.5)],
+        ),
+        (
+            DrawingKind::FlatTopChannel,
+            vec![p(10.0, 101.0), p(20.0, 103.0), p(15.0, 105.0)],
+        ),
+        (
+            DrawingKind::FlatBottomChannel,
+            vec![p(10.0, 103.0), p(20.0, 105.0), p(15.0, 100.5)],
+        ),
+        (
+            DrawingKind::DisjointChannel,
+            vec![
+                p(10.0, 101.0),
+                p(20.0, 104.0),
+                p(10.0, 100.0),
+                p(20.0, 99.0),
+            ],
+        ),
+    ];
+    for (kind, points) in cases {
+        let id = add(
+            &mut chart,
+            kind,
+            points,
+            r##"{"color":"#123456","width":2,"fill_enabled":false}"##,
+        );
+        let (boundaries, middles) = split_lines(&ink_polylines(&mut chart));
+        assert_eq!((boundaries.len(), middles.len()), (2, 0), "{kind:?}");
+        let (first, second) = (boundaries[0].line(), boundaries[1].line());
+        let halfway = [0, 1].map(|end| {
+            (
+                (first[end].0 + second[end].0) / 2.0,
+                (first[end].1 + second[end].1) / 2.0,
+            )
+        });
+        let probe = (
+            (halfway[0].0 + halfway[1].0) / 2.0,
+            (halfway[0].1 + halfway[1].1) / 2.0,
+        );
+        assert_eq!(hit_id(&chart, probe), None, "{kind:?}");
+
+        assert!(
+            chart.drawing_apply_options(id, r#"{"tool_options":{"channel":{"middle_line":true}}}"#)
+        );
+        let lines = ink_polylines(&mut chart);
+        let (boundaries, middles) = split_lines(&lines);
+        assert_eq!((boundaries.len(), middles.len()), (2, 1), "{kind:?}");
+        assert_eq!(boundaries[0].line(), first, "{kind:?}: the lines stay");
+        assert_eq!(middles[0].width, 1.0);
+        assert!(
+            middles[0].spans(halfway[0], halfway[1], 1e-3),
+            "{kind:?} {:?}",
+            middles[0]
+        );
+        // Under the lines: fill, middle, first, second.
+        assert_eq!(lines[0].1, 1.0, "{kind:?} paints its middle first");
+        // A body target while unselected, like the lines.
+        assert_eq!(
+            chart
+                .hit_test_drawing(probe.0, probe.1)
+                .map(|hit| (hit.id, hit.part)),
+            Some((id, DrawingDragPart::Body)),
+            "{kind:?}"
+        );
+        assert_eq!(
+            chart.hit_test_drawing(probe.0, probe.1),
+            chart.hit_test_drawing_bruteforce(probe.0, probe.1)
+        );
+
+        // `middle_color` recolours the middle line alone.
+        assert!(chart.drawing_apply_options(
+            id,
+            r##"{"tool_options":{"channel":{"middle_color":"#e91e63"}}}"##
+        ));
+        let pink = strokes(&color_polylines(
+            &mut chart,
+            Color::parse_css("#e91e63").unwrap(),
+        ));
+        assert!(pink.len() == 1 && pink[0].dashed(), "{kind:?}");
+        assert_eq!(strokes(&ink_polylines(&mut chart)).len(), 2);
+
+        // The extensions run it with the lines to where they leave the pane (its dashes are
+        // clipped to the pane, so a steep line stops at the top or bottom edge).
+        assert!(chart.drawing_apply_options(id, r#"{"extend_left":true,"extend_right":true}"#));
+        let reach = color_polylines(&mut chart, Color::parse_css("#e91e63").unwrap())
+            .iter()
+            .flat_map(|(points, ..)| points.iter().map(|point| point.0))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| {
+                (lo.min(x), hi.max(x))
+            });
+        assert!(
+            reach.0 < halfway[0].0 - 50.0 && reach.1 > halfway[1].0 + 50.0,
+            "{kind:?}: {reach:?} beyond {halfway:?}"
+        );
+        assert!(chart.remove_drawing(id));
+    }
+}
+
+/// A disjoint channel fills with one band between its lines, its ends paired by side (owner
+/// decision C3): a second line that runs opposite to the first still fills the whole quad (the
+/// former two triangles left its right-hand wedge unpainted and hit an hourglass), and lines that
+/// cross fill two lobes meeting at the crossing. The selected fill hits exactly where it paints.
+#[test]
+fn disjoint_channels_fill_and_hit_the_region_between_their_lines() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::DisjointChannel,
+        vec![
+            p(10.0, 101.0),
+            p(20.0, 101.0),
+            p(20.0, 104.0),
+            p(10.0, 104.0),
+        ],
+        r##"{"color":"#123456"}"##,
+    );
+    let (a, b, c) = (
+        anchor(&chart, id, 0),
+        anchor(&chart, id, 1),
+        anchor(&chart, id, 2),
+    );
+    let middle_y = (a.1 + c.1) / 2.0;
+    let quarters = [
+        (a.0 + 10.0, middle_y),
+        (b.0 - 10.0, middle_y),
+        ((a.0 + b.0) / 2.0, c.1 + 10.0),
+        ((a.0 + b.0) / 2.0, a.1 - 10.0),
+    ];
+    let regions = fills(&mut chart, wash());
+    assert_eq!(regions.len(), 1);
+    for probe in quarters {
+        assert!(point_in_polygon(probe, &regions[0]), "{probe:?}");
+        assert_eq!(hit_id(&chart, probe), None, "unselected: the pane pans");
+    }
+    chart.set_selected_drawing(Some(id));
+    for probe in quarters {
+        assert_eq!(
+            chart
+                .hit_test_drawing(probe.0, probe.1)
+                .map(|hit| (hit.id, hit.part)),
+            Some((id, DrawingDragPart::Body)),
+            "{probe:?}"
+        );
+    }
+
+    // Crossing lines: two lobes that meet where the lines cross; nothing beyond the crossing
+    // between the lines' outer ends.
+    assert!(chart
+        .set_drawing_anchors(
+            id,
+            &[
+                p(10.0, 101.0).into(),
+                p(20.0, 105.0).into(),
+                p(10.0, 104.0).into(),
+                p(20.0, 102.0).into(),
+            ],
+        )
+        .is_ok());
+    let px = [0, 1, 2, 3].map(|index| anchor(&chart, id, index));
+    let as_f32 = |point: (f64, f64)| [point.0 as f32, point.1 as f32];
+    let crossing = aeris_charts_render::line::band_crossing(
+        as_f32(px[0]),
+        as_f32(px[1]),
+        as_f32(px[2]),
+        as_f32(px[3]),
+    )
+    .expect("the lines cross");
+    let crossing = (f64::from(crossing[0]), f64::from(crossing[1]));
+    let regions = fills(&mut chart, wash());
+    assert_eq!(regions.len(), 1);
+    let between = |x: f64| {
+        let along = |(start, end): ((f64, f64), (f64, f64))| {
+            start.1 + (end.1 - start.1) * (x - start.0) / (end.0 - start.0)
+        };
+        (x, (along((px[0], px[1])) + along((px[2], px[3]))) / 2.0)
+    };
+    for lobe in [between(px[0].0 + 10.0), between(px[1].0 - 10.0)] {
+        assert!(point_in_polygon(lobe, &regions[0]), "{lobe:?}");
+        assert_eq!(hit_id(&chart, lobe), Some(id), "{lobe:?}");
+    }
+    for outside in [
+        (crossing.0, crossing.1 - 20.0),
+        (crossing.0, crossing.1 + 20.0),
+    ] {
+        assert!(!point_in_polygon(outside, &regions[0]), "{outside:?}");
+        assert_eq!(hit_id(&chart, outside), None, "{outside:?}");
+    }
+}
+
+/// The triangles the triangle executors (WebGPU, GPUI, native) paint for every `BandFill` of the
+/// first pane in `color`: two per band segment, split at a crossing.
+fn band_triangles(chart: &mut ChartEngine, color: Color) -> Vec<[(f64, f64); 3]> {
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    let mut triangles = Vec::new();
+    for prim in &pane.main {
+        let Prim::BandFill {
+            upper_first,
+            lower_first,
+            point_count,
+            fill,
+            ..
+        } = prim
+        else {
+            continue;
+        };
+        if *fill != color {
+            continue;
+        }
+        let at = |first: u32, index: u32| pane.points[(first + index) as usize];
+        for index in 1..*point_count {
+            let corners = aeris_charts_render::line::band_segment_triangles(
+                at(*upper_first, index - 1),
+                at(*upper_first, index),
+                at(*lower_first, index - 1),
+                at(*lower_first, index),
+            )
+            .map(|point| (f64::from(point[0]), f64::from(point[1])));
+            triangles.push([corners[0], corners[1], corners[2]]);
+            triangles.push([corners[3], corners[4], corners[5]]);
+        }
+    }
+    triangles
+}
+
+/// A disjoint's four free ends can make a concave quad, which the triangle executors' fixed fan
+/// over a 2-point band would overpaint (the notch at the reflex end, and twice where its two
+/// triangles overlap). Its fill lowers through the exact ribbon instead, so every executor paints,
+/// and the selected fill hits, the quad only.
+#[test]
+fn concave_disjoint_channels_fill_and_hit_only_their_quad() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::DisjointChannel,
+        vec![
+            p(10.0, 100.0),
+            p(15.0, 101.0),
+            p(10.0, 104.0),
+            p(20.0, 100.0),
+        ],
+        r##"{"color":"#123456"}"##,
+    );
+    chart.set_selected_drawing(Some(id));
+    let px = [0, 1, 2, 3].map(|index| anchor(&chart, id, index));
+    let quad = [px[0], px[2], px[3], px[1]];
+    // Under the reflex end (the second anchor), between the lines' ends at bar 15.
+    let notch = to_px(&chart, p(15.0, 100.5));
+    let inside = [to_px(&chart, p(15.0, 101.5)), to_px(&chart, p(12.0, 102.0))];
+    assert!(!point_in_polygon(notch, &quad));
+    let triangles = band_triangles(&mut chart, wash());
+    let painted = |probe: (f64, f64)| {
+        triangles
+            .iter()
+            .filter(|triangle| point_in_polygon(probe, &triangle[..]))
+            .count()
+    };
+    assert_eq!(painted(notch), 0, "the notch stays empty");
+    assert_eq!(hit_id(&chart, notch), None, "the notch does not hit");
+    for probe in inside {
+        assert!(point_in_polygon(probe, &quad), "{probe:?}");
+        assert_eq!(painted(probe), 1, "painted once: {probe:?}");
+        assert_eq!(hit_id(&chart, probe), Some(id), "{probe:?}");
+    }
+    // Canvas2D fills the same region as one path.
+    let regions = fills(&mut chart, wash());
+    assert_eq!(regions.len(), 1);
+    assert!(!point_in_polygon(notch, &regions[0]));
+    for probe in inside {
+        assert!(point_in_polygon(probe, &regions[0]), "{probe:?}");
+    }
+}
+
+/// The fork's signed per-side deviations are overrides of `regression_deviations` (owner decision
+/// C5): each moves its own line only, the band keeps the flat field, and two sides on the same
+/// side of the centre fill from the centre to the farther one.
+#[test]
+fn regression_side_overrides_offset_each_line() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        r##"{"color":"#123456","width":2,"tool_options":{"channel":{"upper_deviation":3,"lower_deviation":-1}}}"##,
+    );
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let lines = |chart: &mut ChartEngine| {
+        strokes(&ink_polylines(chart))
+            .iter()
+            .map(Stroke::line)
+            .collect::<Vec<_>>()
+    };
+    let ends = |chart: &ChartEngine, deviations: f64| {
+        [6.0, 31.0].map(|logical| on_fit(chart, stats, logical, deviations))
+    };
+    let painted = lines(&mut chart);
+    assert_eq!(painted.len(), 3);
+    // Upstream's order: lower, upper, centre.
+    for (line, deviations) in painted.iter().zip([-1.0, 3.0, 0.0]) {
+        let expected = ends(&chart, deviations);
+        assert!(
+            close(line[0], expected[0], 1e-3) && close(line[1], expected[1], 1e-3),
+            "{deviations}: {line:?} {expected:?}"
+        );
+    }
+    let block = chart
+        .drawing(id)
+        .unwrap()
+        .tool_options
+        .channel
+        .clone()
+        .unwrap();
+    assert_eq!(
+        (block.upper_deviation, block.lower_deviation),
+        (Some(3.0), Some(-1.0))
+    );
+    // A side patch moves its own line and leaves the flat band alone.
+    assert!(
+        chart.drawing_apply_options(id, r#"{"tool_options":{"channel":{"upper_deviation":1}}}"#)
+    );
+    let painted = lines(&mut chart);
+    assert!(close(painted[0][0], ends(&chart, -1.0)[0], 1e-3));
+    assert!(close(painted[1][0], ends(&chart, 1.0)[0], 1e-3));
+    assert_eq!(chart.drawing(id).unwrap().regression_deviations, 2.0);
+    // Changing the flat band keeps the override (owner decision C4): only the other side moves.
+    assert!(chart.drawing_apply_options(id, r#"{"regression_deviations":1.5}"#));
+    let painted = lines(&mut chart);
+    assert!(close(painted[0][0], ends(&chart, -1.0)[0], 1e-3));
+    assert!(close(painted[1][0], ends(&chart, 1.0)[0], 1e-3));
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"tool_options":{"channel":{"lower_deviation":null}}}"#
+    ));
+    assert!(close(lines(&mut chart)[0][0], ends(&chart, -1.5)[0], 1e-3));
+
+    // Both sides above the centre: the zone runs from the centre to the farther side.
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"tool_options":{"channel":{"upper_deviation":2,"lower_deviation":0.5}}}"#
+    ));
+    let regions = fills(&mut chart, zone());
+    assert_eq!(regions.len(), 1);
+    for (deviations, inside) in [(0.25, true), (1.0, true), (1.75, true), (-0.25, false)] {
+        assert_eq!(
+            point_in_polygon(on_fit(&chart, stats, 18.0, deviations), &regions[0]),
+            inside,
+            "{deviations}"
+        );
+    }
+}
+
+/// `use_upper_deviation` / `use_lower_deviation` switch a side's line and its zone off: the
+/// band fills from the centre to the other side, and with both off only the centre remains.
+#[test]
+fn regression_side_switches_drop_a_line_and_its_zone() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        r##"{"color":"#123456","width":2,"tool_options":{"channel":{"use_lower_deviation":false}}}"##,
+    );
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let painted = strokes(&ink_polylines(&mut chart));
+    assert_eq!(painted.len(), 2, "upper and centre");
+    assert!(close(
+        painted[0].start(),
+        on_fit(&chart, stats, 6.0, 2.0),
+        1e-3
+    ));
+    assert!(close(
+        painted[1].start(),
+        on_fit(&chart, stats, 6.0, 0.0),
+        1e-3
+    ));
+    let regions = fills(&mut chart, zone());
+    assert_eq!(regions.len(), 1);
+    // The zone's lower chain (the outline's last two points, reversed) is the centre line.
+    assert!(close(regions[0][3], on_fit(&chart, stats, 6.0, 0.0), 1e-3));
+    assert!(close(regions[0][2], on_fit(&chart, stats, 31.0, 0.0), 1e-3));
+    let gone = on_fit(&chart, stats, 18.0, -2.0);
+    assert_eq!(hit_id(&chart, gone), None, "no lower line to hit");
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(hit_id(&chart, on_fit(&chart, stats, 18.0, -1.0)), None);
+    chart.set_selected_drawing(None);
+
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"tool_options":{"channel":{"use_upper_deviation":false}}}"#
+    ));
+    assert!(fills(&mut chart, zone()).is_empty());
+    let painted = strokes(&ink_polylines(&mut chart));
+    assert_eq!(painted.len(), 1, "the centre alone");
+    assert!(close(
+        painted[0].start(),
+        on_fit(&chart, stats, 6.0, 0.0),
+        1e-3
+    ));
+}
+
+/// `source` picks the bar value the fit reads; a change refits once (the memo is keyed by it).
+#[test]
+fn regression_fits_the_selected_source_value() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let passes = |chart: &ChartEngine| chart.drawing_settings.regression_memo.borrow().passes;
+    let centre_start = |chart: &mut ChartEngine| strokes(&ink_polylines(chart))[2].start();
+    let close_fit = fit(&chart, id, IndicatorInputSource::Close);
+    assert!(close(
+        centre_start(&mut chart),
+        on_fit(&chart, close_fit, 6.0, 0.0),
+        1e-3
+    ));
+    let mut seen = Vec::new();
+    for (source, value) in [
+        (IndicatorInputSource::High, "\"high\""),
+        (IndicatorInputSource::Hl2, "\"hl2\""),
+        (IndicatorInputSource::Close, "null"),
+    ] {
+        let before = passes(&chart);
+        assert!(chart.drawing_apply_options(
+            id,
+            &format!(r#"{{"tool_options":{{"channel":{{"source":{value}}}}}}}"#)
+        ));
+        let start = centre_start(&mut chart);
+        assert_eq!(passes(&chart), before + 1, "{source:?} refits once");
+        let expected = on_fit(&chart, fit(&chart, id, source), 6.0, 0.0);
+        assert!(close(start, expected, 1e-3), "{source:?}");
+        seen.push(start);
+    }
+    assert!(seen[0] != seen[1] && seen[1] != seen[2]);
+    assert!(close(seen[2], on_fit(&chart, close_fit, 6.0, 0.0), 1e-3));
+}
+
+/// `show_pearsons` paints Pearson's R below the regression's start (off by default, upstream's
+/// look): left-aligned into the channel, ending at the start when the end lies left of it, not
+/// a hit target, nothing without a correlation, and culled with its reach.
+#[test]
+fn regressions_paint_pearsons_r_below_their_start_when_enabled() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    assert!(texts(&mut chart).is_empty(), "no label by default");
+    assert!(
+        chart.drawing_apply_options(id, r#"{"tool_options":{"channel":{"show_pearsons":true}}}"#)
+    );
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let pearson = format!("{:.4}", stats.pearson.unwrap());
+    let runs = texts(&mut chart);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let (text, at, align) = runs[0].clone();
+    assert_eq!(text, pearson);
+    assert_eq!(align, TextAlign::Left);
+    let start = on_fit(&chart, stats, 6.0, 0.0);
+    let lowest = on_fit(&chart, stats, 6.0, -2.0);
+    assert!((at.0 - start.0).abs() < 1e-3, "{at:?} {start:?}");
+    assert!(
+        at.1 > lowest.1 + 4.0,
+        "below the lowest line: {at:?} {lowest:?}"
+    );
+    assert_eq!(
+        hit_id(&chart, (at.0 + 12.0, at.1)),
+        None,
+        "not a hit target"
+    );
+
+    // Drawn right to left: right-aligned at the start, reading into the channel.
+    assert!(chart
+        .set_drawing_anchors(id, &[p(31.0, 104.0).into(), p(6.0, 101.0).into()])
+        .is_ok());
+    let (_, at, _) = texts(&mut chart)[0].clone();
+    let start = on_fit(&chart, stats, 31.0, 0.0);
+    assert!(at.0 < start.0 - 10.0, "ends at the start: {at:?} {start:?}");
+
+    // No correlation on constant data: no label.
+    let mut flat = chart_with(&hourly(40), 1.0);
+    let values = vec![100.0; 40];
+    flat.set_series_data(0, &hourly(40), &values, &values, &values, &values)
+        .unwrap();
+    add(
+        &mut flat,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        r#"{"tool_options":{"channel":{"show_pearsons":true}}}"#,
+    );
+    assert!(texts(&mut flat).is_empty());
+
+    // Two bars left of the pane: only the label reaches in, and the drawing stays a candidate.
+    let mut culled = trending_chart();
+    crowd(&mut culled);
+    culled.set_visible_logical_range(10.0, 210.0);
+    let narrow = add(
+        &mut culled,
+        DrawingKind::RegressionTrend,
+        vec![p(2.0, 101.0), p(3.0, 101.0)],
+        r#"{"tool_options":{"channel":{"show_pearsons":true}}}"#,
+    );
+    let end_x = anchor(&culled, narrow, 1).0;
+    assert!(end_x < -25.0, "{end_x}");
+    let runs = texts(&mut culled);
+    assert_eq!(runs.len(), 1, "the label paints: {runs:?}");
+    let size = culled.drawing_text_size(culled.drawing(narrow).unwrap());
+    let family = culled.options.get().layout.font_family.clone();
+    let label_end = runs[0].1 .0 + culled.measure_text_run(&runs[0].0, size, &family, 400, false);
+    assert!(
+        label_end > 0.0,
+        "the label reaches into the pane: {label_end}"
+    );
+    assert!(viewport_candidate(&culled, narrow));
+    assert!(culled.drawing_apply_options(
+        narrow,
+        r#"{"tool_options":{"channel":{"show_pearsons":false}}}"#
+    ));
+    assert!(!viewport_candidate(&culled, narrow));
+}
+
+/// `middle_line` draws a regression's centre as the 1 px dashed middle line in `middle_color`
+/// (the fork's look, which fork documents carry); without it the centre is upstream's solid line.
+#[test]
+fn regression_middle_line_dashes_the_centre_in_its_color() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let (solid, dashed) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!((solid.len(), dashed.len()), (3, 0));
+    assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"channel":{"middle_line":true}}}"#));
+    let (solid, dashed) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!((solid.len(), dashed.len()), (2, 1));
+    assert_eq!(dashed[0].width, 1.0);
+    assert!(dashed[0].spans(
+        on_fit(&chart, stats, 6.0, 0.0),
+        on_fit(&chart, stats, 31.0, 0.0),
+        1e-3
+    ));
+    assert_eq!(
+        hit_id(&chart, on_fit(&chart, stats, 18.0, 0.0)),
+        Some(id),
+        "the centre stays a body target"
+    );
+    assert!(chart.drawing_apply_options(
+        id,
+        r##"{"tool_options":{"channel":{"middle_color":"#e91e63"}}}"##
+    ));
+    let pink = strokes(&color_polylines(
+        &mut chart,
+        Color::parse_css("#e91e63").unwrap(),
+    ));
+    assert!(pink.len() == 1 && pink[0].dashed());
+    assert_eq!(strokes(&ink_polylines(&mut chart)).len(), 2);
+}
+
+/// `extend_left`/`extend_right` run a regression's lines and zone to the pane edges, like a
+/// channel's; Pearson's R stays at the fitted start.
+#[test]
+fn regression_extensions_run_the_band_to_the_pane_edges() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(10.0, 101.0), p(20.0, 104.0)],
+        r##"{"color":"#123456","tool_options":{"channel":{"show_pearsons":true}}}"##,
+    );
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let reach = |chart: &mut ChartEngine| {
+        ink_polylines(chart)
+            .iter()
+            .flat_map(|(points, ..)| points.iter().map(|point| point.0))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| {
+                (lo.min(x), hi.max(x))
+            })
+    };
+    let (start, end) = (
+        on_fit(&chart, stats, 10.0, 0.0),
+        on_fit(&chart, stats, 20.0, 0.0),
+    );
+    let (left, right) = reach(&mut chart);
+    assert!((left - start.0).abs() < 1e-3 && (right - end.0).abs() < 1e-3);
+    let beyond = on_fit(&chart, stats, 4.0, 2.0);
+    assert_eq!(hit_id(&chart, beyond), None);
+    let label = texts(&mut chart)[0].1;
+    assert!(chart.drawing_apply_options(id, r#"{"extend_left":true,"extend_right":true}"#));
+    let (left, right) = reach(&mut chart);
+    let width = chart.pane_w;
+    assert!(left <= 1.0 && right >= width - 1.0, "{left}..{right}");
+    assert_eq!(hit_id(&chart, beyond), Some(id), "hits along the extension");
+    let regions = fills(&mut chart, zone());
+    assert!(regions[0].iter().any(|point| point.0 <= 1.0));
+    assert!(regions[0].iter().any(|point| point.0 >= width - 1.0));
+    assert_eq!(
+        texts(&mut chart)[0].1,
+        label,
+        "Pearson's R stays at the start"
+    );
+}
+
+/// A selected regression's zone is a drag surface (unselected, the pane pans through it), and a
+/// body drag moves it along time only (owner decision C1).
+#[test]
+fn selected_regression_zones_are_drag_surfaces() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        r##"{"color":"#123456"}"##,
+    );
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let inside = on_fit(&chart, stats, 18.0, 1.0);
+    assert_eq!(hit_id(&chart, inside), None);
+    chart.set_selected_drawing(Some(id));
+    assert_eq!(
+        chart
+            .hit_test_drawing(inside.0, inside.1)
+            .map(|hit| (hit.id, hit.part)),
+        Some((id, DrawingDragPart::Body))
+    );
+    assert_eq!(
+        chart.hit_test_drawing(inside.0, inside.1),
+        chart.hit_test_drawing_bruteforce(inside.0, inside.1)
+    );
+    // Outside the band: nothing.
+    assert_eq!(hit_id(&chart, on_fit(&chart, stats, 18.0, 3.0)), None);
+    let before = chart.drawing(id).unwrap().points.clone();
+    let bar = chart.logical_to_coordinate(1.0).unwrap() - chart.logical_to_coordinate(0.0).unwrap();
+    assert!(chart.drawing_drag_start_at(inside.0, inside.1));
+    chart.drawing_drag_to(
+        inside.0 + 2.0 * bar,
+        inside.1 + 60.0,
+        DrawingModifiers::default(),
+    );
+    chart.drawing_drag_end();
+    for (old, new) in before.iter().zip(&chart.drawing(id).unwrap().points) {
+        assert!((new.logical - old.logical - 2.0).abs() < 1e-6);
+        assert_eq!(new.price, old.price);
+    }
+    // Without a fill there is nothing to grab between the lines.
+    assert!(chart.drawing_apply_options(id, r#"{"fill_enabled":false}"#));
+    let moved = fit(&chart, id, IndicatorInputSource::Close);
+    assert_eq!(hit_id(&chart, on_fit(&chart, moved, 20.0, 1.0)), None);
+}
+
+/// A regression's handles sit on the fitted line's ends, not at its clicks (owner decision C1):
+/// painted, hit, and dragged there, they follow the refit; without a fit they stay on the
+/// anchors of the dashed placeholder.
+#[test]
+fn regression_handles_sit_on_the_fitted_line_ends() {
+    let mut chart = trending_chart();
+    // Anchor prices far from the data.
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 60.0), p(31.0, 140.0)],
+        "{}",
+    );
+    chart.set_selected_drawing(Some(id));
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let ends = [6.0, 31.0].map(|logical| on_fit(&chart, stats, logical, 0.0));
+    let painted = painted_handles(&mut chart);
+    assert_eq!(painted.len(), 2);
+    for (painted, end) in painted.iter().zip(ends) {
+        assert!(close(*painted, end, 1e-3), "{painted:?} {end:?}");
+    }
+    assert_eq!(chart.drawing_handle_count(id), Some(2));
+    assert_eq!(
+        chart
+            .hit_test_drawing(ends[1].0, ends[1].1)
+            .map(|hit| hit.part),
+        Some(DrawingDragPart::Anchor(1))
+    );
+    let click = anchor(&chart, id, 1);
+    assert_eq!(chart.hit_test_drawing(click.0, click.1), None);
+
+    // Dragging the end handle three bars left refits the shorter range; the handle stays on
+    // the new line and the anchor keeps its price.
+    let bar = chart.logical_to_coordinate(1.0).unwrap() - chart.logical_to_coordinate(0.0).unwrap();
+    assert!(chart.drawing_drag_start_at(ends[1].0, ends[1].1));
+    chart.drawing_drag_to(
+        ends[1].0 - 3.0 * bar,
+        ends[1].1 + 40.0,
+        DrawingModifiers::default(),
+    );
+    chart.drawing_drag_end();
+    let end = chart.drawing(id).unwrap().points[1];
+    assert!((end.logical - 28.0).abs() < 1e-6);
+    assert_eq!(end.price, 140.0);
+    let refit = fit(&chart, id, IndicatorInputSource::Close);
+    assert!(close(
+        painted_handles(&mut chart)[1],
+        on_fit(&chart, refit, end.logical, 0.0),
+        1e-3
+    ));
+    // The keyboard reaches the handle from where it is painted.
+    assert!(chart.nudge_selected_drawing(bar, 0.0, Some(1)));
+    assert!((chart.drawing(id).unwrap().points[1].logical - 29.0).abs() < 1e-6);
+
+    // Without a fit (beyond the data), the handles stay on the placeholder's anchors.
+    assert!(chart
+        .set_drawing_anchors(id, &[p(50.0, 100.0).into(), p(60.0, 101.0).into()])
+        .is_ok());
+    let placeholder = [anchor(&chart, id, 0), anchor(&chart, id, 1)];
+    let painted = painted_handles(&mut chart);
+    assert!(close(painted[0], placeholder[0], 1e-3) && close(painted[1], placeholder[1], 1e-3));
+}
+
+/// Placing a regression previews the fit, and the placed anchor's handle sits on the previewed
+/// line, as it will once committed.
+#[test]
+fn regression_placement_previews_its_handle_on_the_fitted_line() {
+    let mut chart = trending_chart();
+    assert!(chart.set_drawing_tool(
+        Some(DrawingKind::RegressionTrend),
+        Some(r##"{"color":"#123456"}"##),
+        None
+    ));
+    // Clicks away from the fit: the prices only pick bars.
+    let start = to_px(&chart, p(6.0, 109.0));
+    let end = to_px(&chart, p(31.0, 100.0));
+    chart.drawing_tool_activate(start.0, start.1, DrawingModifiers::default());
+    chart.drawing_tool_pointer_move(end.0, end.1, DrawingModifiers::default(), false);
+    let preview = crate::Drawing::new(
+        0,
+        DrawingKind::RegressionTrend,
+        0,
+        vec![p(6.0, 109.0), p(31.0, 100.0)],
+    );
+    let stats = regression_stats(&chart, &preview, IndicatorInputSource::Close).unwrap();
+    let fitted_start = on_fit(&chart, stats, 6.0, 0.0);
+    let handles = painted_handles(&mut chart);
+    assert_eq!(handles.len(), 1);
+    assert!(close(handles[0], fitted_start, 1e-3), "{handles:?}");
+    let id = chart
+        .drawing_tool_activate(end.0, end.1, DrawingModifiers::default())
+        .created
+        .unwrap();
+    assert_eq!(painted_handles(&mut chart)[0], handles[0]);
+    assert_eq!(chart.selected_drawing(), Some(id));
+}
+
+/// A regression's anchors choose bars only (owner decision C1): body and handle drags, magnet
+/// snaps, and keyboard nudges move it along time, a vertical nudge records nothing, and undo
+/// restores each step.
+#[test]
+fn regression_trends_move_along_time_only() {
+    let mut chart = trending_chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::RegressionTrend,
+        vec![p(6.0, 101.0), p(31.0, 104.0)],
+        "{}",
+    );
+    let before = chart.drawing(id).unwrap().points.clone();
+    let stats = fit(&chart, id, IndicatorInputSource::Close);
+    let grab = on_fit(&chart, stats, 18.0, 0.0);
+    let bar = chart.logical_to_coordinate(1.0).unwrap() - chart.logical_to_coordinate(0.0).unwrap();
+    assert!(chart.drawing_drag_start_at(grab.0, grab.1));
+    chart.drawing_drag_to(
+        grab.0 + 3.0 * bar,
+        grab.1 - 80.0,
+        DrawingModifiers::default(),
+    );
+    chart.drawing_drag_end();
+    let after = chart.drawing(id).unwrap().points.clone();
+    for (old, new) in before.iter().zip(&after) {
+        assert!((new.logical - old.logical - 3.0).abs() < 1e-6);
+        assert_eq!(new.price, old.price, "the price never follows the pointer");
+    }
+    // An anchor drag from the handle on the fitted end snaps to a bar with the magnet and
+    // stays horizontal.
+    chart.set_selected_drawing(Some(id));
+    let moved = fit(&chart, id, IndicatorInputSource::Close);
+    let (bx, by) = on_fit(&chart, moved, after[1].logical, 0.0);
+    assert!(chart.drawing_drag_start_at(bx, by));
+    chart.drawing_drag_to(
+        bx - 2.4 * bar,
+        by + 50.0,
+        DrawingModifiers {
+            magnet: true,
+            straighten: false,
+        },
+    );
+    chart.drawing_drag_end();
+    let end = chart.drawing(id).unwrap().points[1];
+    assert_eq!(end.logical, 32.0);
+    assert_eq!(end.price, after[1].price);
+    // A vertical keyboard nudge cannot move it: no change and no history entry.
+    let revision = chart.drawing_revision();
+    assert!(!chart.nudge_selected_drawing(0.0, -5.0, None));
+    assert!(!chart.nudge_selected_drawing(0.0, 5.0, Some(0)));
+    assert_eq!(chart.drawing_revision(), revision);
+    assert!(chart.undo_drawing() && chart.undo_drawing());
+    assert_eq!(chart.drawing(id).unwrap().points, before);
+}
+
+/// The fork's documents keep its channel look through their stored (or fork-default) options:
+/// the parallel channel's middle line, the regression's dashed centre, asymmetric and one-sided
+/// bands, Pearson's R, and the fitted source; a `flat_top_bottom` whose level crosses its base
+/// paints both lobes.
+#[test]
+fn fork_documents_paint_their_channel_presentation() {
+    let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price, "time": logical * HOUR});
+    let document = serde_json::json!({
+        "schema": "aeris_charts-state",
+        "schema_version": 1,
+        "panes": [{"id": "pane-1"}],
+        "drawings": [
+            {"id": 1, "kind": "parallel_channel", "pane_id": "pane-1",
+             "style": {"color": INK},
+             "anchors": [at(10.0, 101.0), at(20.0, 104.0), at(15.0, 101.5)]},
+            {"id": 2, "kind": "regression_trend", "pane_id": "pane-1",
+             "style": {"color": INK, "tool_options": {"channel": {
+                 "upper_deviation": 3.0, "use_lower_deviation": false}}},
+             "anchors": [at(6.0, 101.0), at(31.0, 104.0)]},
+            {"id": 3, "kind": "flat_top_bottom", "pane_id": "pane-1",
+             "style": {"color": INK},
+             "anchors": [at(10.0, 101.0), at(20.0, 105.0), at(15.0, 103.0)]},
+            {"id": 4, "kind": "regression_trend", "pane_id": "pane-1",
+             "style": {"color": INK, "tool_options": {"channel": {"source": "hlc3"}}},
+             "anchors": [at(6.0, 101.0), at(31.0, 104.0)]}
+        ],
+    })
+    .to_string();
+    let mut chart = trending_chart();
+    chart.import_state_json(&document).unwrap();
+    let only = |chart: &mut ChartEngine, id: DrawingId| {
+        for other in [1, 2, 3, 4] {
+            let visible = format!(r#"{{"visible":{}}}"#, other == id);
+            assert!(chart.drawing_apply_options(other, &visible));
+        }
+    };
+    // The parallel channel's dashed middle line, on by the fork's default.
+    only(&mut chart, 1);
+    let (boundaries, middles) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!((boundaries.len(), middles.len()), (2, 1));
+    // The regression: one-sided at +3 (sample σ became population σ), dashed centre, R.
+    only(&mut chart, 2);
+    let stats = fit(&chart, 2, IndicatorInputSource::Close);
+    let (solid, dashed) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!((solid.len(), dashed.len()), (1, 1));
+    assert!(close(
+        solid[0].start(),
+        on_fit(&chart, stats, 6.0, 3.0),
+        1e-3
+    ));
+    assert!(dashed[0].spans(
+        on_fit(&chart, stats, 6.0, 0.0),
+        on_fit(&chart, stats, 31.0, 0.0),
+        1e-3
+    ));
+    let pearson = format!("{:.4}", stats.pearson.unwrap());
+    assert!(texts(&mut chart).iter().any(|(text, ..)| *text == pearson));
+    // The crossing flat level: a disjoint channel whose band fill splits into two lobes.
+    only(&mut chart, 3);
+    assert_eq!(chart.drawing(3).unwrap().kind, DrawingKind::DisjointChannel);
+    let regions = fills(&mut chart, wash());
+    assert_eq!(regions.len(), 1);
+    let [a, b, level_a, level_b] = [0, 1, 2, 3].map(|index| anchor(&chart, 3, index));
+    let between = |x: f64| {
+        let along = |(start, end): ((f64, f64), (f64, f64))| {
+            start.1 + (end.1 - start.1) * (x - start.0) / (end.0 - start.0)
+        };
+        (x, (along((a, b)) + along((level_a, level_b))) / 2.0)
+    };
+    for lobe in [between(a.0 + 10.0), between(b.0 - 10.0)] {
+        assert!(point_in_polygon(lobe, &regions[0]), "{lobe:?}");
+    }
+    // A stored `source` keeps its fit: the dashed centre runs along the HLC3 fit.
+    only(&mut chart, 4);
+    let hlc3 = fit(&chart, 4, IndicatorInputSource::Hlc3);
+    let (_, dashed) = split_lines(&ink_polylines(&mut chart));
+    assert_eq!(dashed.len(), 1);
+    assert!(dashed[0].spans(
+        on_fit(&chart, hlc3, 6.0, 0.0),
+        on_fit(&chart, hlc3, 31.0, 0.0),
+        1e-3
+    ));
+    assert!(!close(
+        dashed[0].start(),
+        on_fit(
+            &chart,
+            fit(&chart, 4, IndicatorInputSource::Close),
+            6.0,
+            0.0
+        ),
+        1e-3
+    ));
+
+    // An export restores to the same picture.
+    let frame = |chart: &mut ChartEngine| {
+        let frame = chart.build_frame();
+        (frame.panes[0].main.clone(), frame.panes[0].points.clone())
+    };
+    for id in [1, 2, 3, 4] {
+        assert!(chart.drawing_apply_options(id, r#"{"visible":true}"#));
+    }
+    let mut again = trending_chart();
+    again
+        .import_state_json(&chart.export_state_json().unwrap())
+        .unwrap();
+    assert_eq!(frame(&mut again), frame(&mut chart));
 }

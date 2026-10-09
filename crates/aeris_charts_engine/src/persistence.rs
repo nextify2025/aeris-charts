@@ -723,29 +723,55 @@ fn lacks_upstream_b8_fields(item: &DrawingV1) -> bool {
 }
 
 /// The kind a stored drawing names. The fork's `flat_top_bottom` was one tool for both upstream
-/// channels: a third anchor on or above the base line through the first two is a flat top, one
-/// below it a flat bottom.
+/// channels: a level line through the third anchor's price across the base's bars. A level at or
+/// above both base anchors is a flat top and one at or below both a flat bottom, which upstream
+/// draws at that price on a non-inverted price scale (it keeps the flat line outside the base
+/// anchors in screen y). A level between them crosses the base, which no flat channel draws: it
+/// becomes the disjoint channel whose second line is that level ([`fork_flat_crossing_anchors`]).
+/// A base on one bar keeps the flat top or bottom its third anchor is above or below.
 fn stored_drawing_kind(name: &str, anchors: &[DrawingAnchor]) -> Option<DrawingKind> {
     if name == "flat_top_bottom" {
         if let [a, b, c] = anchors {
-            if let (Some(a_logical), Some(b_logical), Some(c_logical)) =
-                (a.logical, b.logical, c.logical)
-            {
-                let base = if a_logical == b_logical {
-                    a.price.max(b.price)
-                } else {
-                    a.price
-                        + (b.price - a.price) * (c_logical - a_logical) / (b_logical - a_logical)
-                };
-                return Some(if c.price >= base {
+            if let (Some(a_logical), Some(b_logical), Some(_)) = (a.logical, b.logical, c.logical) {
+                let (low, high) = (a.price.min(b.price), a.price.max(b.price));
+                return Some(if c.price >= high {
                     DrawingKind::FlatTopChannel
-                } else {
+                } else if c.price <= low || a_logical == b_logical {
                     DrawingKind::FlatBottomChannel
+                } else {
+                    DrawingKind::DisjointChannel
                 });
             }
         }
     }
     DrawingKind::from_name(name)
+}
+
+/// The time identity of a derived anchor at `logical`: the stored anchors' times interpolated
+/// there, when every stored anchor has a time, those times are one affine function of their
+/// logicals (evenly spaced bars between them, to a millionth of a bar), and `logical` lies
+/// between them. Otherwise `None`, which keeps the derived anchor at its logical: time
+/// arithmetic across a session gap, or past the anchors where no bar times are known, would put
+/// it on another bar than the bar arithmetic its logical came from.
+fn interpolated_anchor_time(anchors: &[DrawingAnchor], logical: f64) -> Option<f64> {
+    let pairs = anchors
+        .iter()
+        .map(|anchor| Some((anchor.logical?, anchor.time?)))
+        .collect::<Option<Vec<(f64, f64)>>>()?;
+    let first = pairs.iter().copied().min_by(|a, b| a.0.total_cmp(&b.0))?;
+    let last = pairs.iter().copied().max_by(|a, b| a.0.total_cmp(&b.0))?;
+    if !(first.0..=last.0).contains(&logical) || last.0 <= first.0 {
+        return None;
+    }
+    let per_bar = (last.1 - first.1) / (last.0 - first.0);
+    if !(per_bar.is_finite() && per_bar > 0.0) {
+        return None;
+    }
+    let time_at = |at: f64| first.1 + (at - first.0) * per_bar;
+    pairs
+        .iter()
+        .all(|&(at, time)| ((time - time_at(at)) / per_bar).abs() <= 1e-6)
+        .then(|| time_at(logical))
 }
 
 /// One anchor of a fork drawing converted to the upstream anchor contract.
@@ -754,6 +780,26 @@ struct MigratedAnchor {
     /// The stored anchor whose time identity (`time` and `anchor_times_micros`) this anchor
     /// keeps; it sits at that anchor's logical position. `None` for an anchor placed elsewhere.
     identity: Option<usize>,
+}
+
+/// A fork `flat_top_bottom` whose level crosses its base ([`stored_drawing_kind`]) as the disjoint
+/// channel that draws the same two lines: the base, then the level across the base's bars at the
+/// third anchor's price, each end keeping the time identity of the base anchor on its bar.
+fn fork_flat_crossing_anchors(anchors: &[DrawingAnchor]) -> Vec<MigratedAnchor> {
+    let at = |index: usize, price: f64| MigratedAnchor {
+        anchor: DrawingAnchor {
+            price,
+            ..anchors[index]
+        },
+        identity: Some(index),
+    };
+    let level = anchors[2].price;
+    vec![
+        at(0, anchors[0].price),
+        at(1, anchors[1].price),
+        at(0, level),
+        at(1, level),
+    ]
 }
 
 /// The upstream anchors of a drawing the fork stored under its own anchor contract, or `None`
@@ -838,16 +884,27 @@ fn migrate_fork_anchors(
             } else {
                 1.0
             };
-            // Without a scale ratio the fork kept the square square on screen; no price per bar
-            // reproduces that, so the corner takes one the anchor's price magnitude sets.
-            let per_bar = option("scale_ratio")
+            let ratio = option("scale_ratio")
                 .and_then(serde_json::Value::as_f64)
-                .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
-                .unwrap_or_else(|| price(0).abs().max(1.0));
-            Some(vec![
-                keep(0),
-                placed(logical + size, price(0) + direction * size * per_bar, None),
-            ])
+                .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+            let corner = match ratio {
+                Some(ratio) => price(0) + direction * size * ratio,
+                // Without a scale ratio the fork kept the square square on screen, which no price
+                // per bar reproduces: the corner sits far beyond the square (the corner drag's
+                // rule), so the square's time side is normally its smaller one.
+                None => crate::drawings::kinds::pitchforks_gann::fixed_square_far_price(
+                    price(0),
+                    size,
+                    direction,
+                ),
+            };
+            Some(vec![keep(0), placed(logical + size, corner, None)])
+        }
+        // The fork's reversed square measured from the first anchor's time and the second's
+        // price; upstream's reverse pivots on the second anchor. Swapping the anchors' prices
+        // puts upstream's pivot on the fork's (the caller drops the `reverse` the swap consumed).
+        (DrawingKind::GannSquare, 2) if legacy_fork && legacy_gann_reverse(tool_options) => {
+            Some(vec![beside(0, price(1)), beside(1, price(0))])
         }
         // Apex and projected price; the time horizon anchor (the sector radius) has no place.
         (DrawingKind::Projection, 3) => Some(vec![keep(0), keep(2)]),
@@ -904,28 +961,28 @@ fn migrate_fork_anchors(
         (DrawingKind::PatternThreeDrives, 7) => Some((0..6).map(keep).collect()),
         // The fork stored the arc's ends first and its through point last.
         (DrawingKind::Arc, 3) if legacy_fork => Some(vec![keep(0), keep(2), keep(1)]),
-        // The fork's on-curve midpoint becomes the quadratic Bezier control point.
+        // The fork's on-curve midpoint becomes the quadratic Bezier control point, an affine
+        // combination of the stored anchors' bars (and of their times where those are evenly
+        // spaced, [`interpolated_anchor_time`]).
         (DrawingKind::Curve, 3) if legacy_fork => {
             let logical = logicals()?;
+            let control = 2.0 * logical[2] - (logical[0] + logical[1]) / 2.0;
             Some(vec![
                 keep(0),
                 placed(
-                    2.0 * logical[2] - (logical[0] + logical[1]) / 2.0,
+                    control,
                     2.0 * price(2) - (price(0) + price(1)) / 2.0,
-                    None,
+                    interpolated_anchor_time(anchors, control),
                 ),
                 keep(1),
             ])
         }
         // The fork's on-curve points at a third and two thirds become the cubic Bezier control
-        // points; an affine combination, so times convert by the same weights.
+        // points, affine combinations of the stored anchors' bars (and of their times where
+        // those are evenly spaced).
         (DrawingKind::DoubleCurve, 4) if legacy_fork => {
             let logical = logicals()?;
             let prices = [price(0), price(1), price(2), price(3)];
-            let times = anchors
-                .iter()
-                .map(|anchor| anchor.time)
-                .collect::<Option<Vec<f64>>>();
             // Weights over the stored [a, b, p, q].
             let combine = |weights: [f64; 4], values: &[f64]| {
                 weights
@@ -935,10 +992,11 @@ fn migrate_fork_anchors(
                     .sum::<f64>()
             };
             let control = |weights: [f64; 4]| {
+                let at = combine(weights, &logical);
                 placed(
-                    combine(weights, &logical),
+                    at,
                     combine(weights, &prices),
-                    times.as_deref().map(|times| combine(weights, times)),
+                    interpolated_anchor_time(anchors, at),
                 )
             };
             Some(vec![
@@ -961,11 +1019,14 @@ fn migrate_fork_anchors(
                     beside(0, price(0) - delta),
                 ]
             } else {
-                let delta = logical[2] - logical[0];
+                // A vertical axis: the first edge lies on the width point's bar (and keeps its
+                // time identity), the depth handle as many bars on the other side. That mirror
+                // lies past the stored anchors, where their times say nothing about the bars (a
+                // session gap on either side moves it), so it keeps its logical without a time.
                 vec![
-                    placed(logical[0] + delta, price(0), None),
-                    placed(logical[1] + delta, price(1), None),
-                    placed(logical[0] - delta, price(0), None),
+                    beside(2, price(0)),
+                    beside(2, price(1)),
+                    placed(2.0 * logical[0] - logical[2], price(0), None),
                 ]
             })
         }
@@ -985,31 +1046,76 @@ fn migrate_fork_anchors(
     }
 }
 
+/// Whether a fork Gann block (`tool_options.gann`) stores `reverse: true`.
+fn legacy_gann_reverse(tool_options: Option<&serde_json::Value>) -> bool {
+    tool_options
+        .and_then(|options| options.get("gann"))
+        .and_then(|gann| gann.get("reverse"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+/// Drop the fork `reverse` of a Gann square whose anchor conversion consumed it (the fixed
+/// square's grows-downward corner, the reversed square's swapped prices), so it does not also
+/// reach `level_reverse` and pivot the fans and arcs on the far corner.
+fn drop_consumed_gann_reverse(kind: DrawingKind, tool_options: Option<&mut serde_json::Value>) {
+    if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
+        if let Some(gann) = tool_options
+            .and_then(|options| options.get_mut("gann"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            gann.remove("reverse");
+        }
+    }
+}
+
 /// Convert a clipboard or drawing-sync item a fork build wrote to upstream's contracts: anchors
 /// stored under an anchor count upstream never stores take the same conversions a document gets
 /// (only those; the same-count ones need a document's provenance), a fork bars pattern without a
 /// snapshot takes its `tool_options` bars, and a fork anchored text (its options carry no
 /// `screen_x`; every upstream payload writes one) takes its pane-fraction anchor as its screen
-/// position. Items already on upstream's contracts are left as they are.
+/// position. A converted item is provably the fork's, so like a fork document it also takes the
+/// fork's unstored option defaults ([`kinds::merge_legacy_fork_tool_options`], the annotations'
+/// fork-form marker included; the triangle pattern's apex sides), and a fixed square's `reverse`
+/// stays in its converted corner. A fork info line, whose payload carries the fork's default
+/// labels (which no upstream info line has) and no `line` key, takes the `line` block that draws
+/// them as one stats box; this build writes an absent block as `"line": null`, which the merge
+/// keeps, so a restored fork info line whose box was removed stays without it. Items already on
+/// upstream's contracts are left as they are.
+///
+/// [`kinds::merge_legacy_fork_tool_options`]: crate::drawings::kinds::merge_legacy_fork_tool_options
 pub(crate) fn migrate_fork_payload_item(item: &mut crate::DrawingClipboardItem) {
-    let tool_options = item.options.get("tool_options");
+    let mut converted = false;
     if !item.kind.valid_point_count(item.points.len()) {
+        let tool_options = item.options.get("tool_options");
         if let Some(migrated) = migrate_fork_anchors(item.kind, &item.points, tool_options, false) {
             item.points = migrated.into_iter().map(|anchor| anchor.anchor).collect();
+            converted = true;
         }
     }
     if item.kind == DrawingKind::BarsPattern && item.bars_pattern.is_none() {
-        item.bars_pattern = tool_options
+        item.bars_pattern = item
+            .options
+            .get("tool_options")
             .and_then(|options| options.get("projection_annotation"))
             .and_then(|block| block.get("bars"))
             .and_then(|bars| serde_json::from_value::<Vec<[f64; 4]>>(bars.clone()).ok())
             .map(|bars| crate::drawing_contract::legacy_bars_pattern(&bars))
             .filter(|bars| !bars.is_empty());
     }
-    if item.kind == DrawingKind::AnchoredText && item.options.get("screen_x").is_none() {
-        if let (Some(anchor), Some(options)) =
-            (item.points.first_mut(), item.options.as_object_mut())
-        {
+    let fork_info_line = item.kind == DrawingKind::InfoLine
+        && item
+            .options
+            .get("labels")
+            .and_then(|labels| {
+                serde_json::from_value::<Vec<crate::DrawingLabelOptions>>(labels.clone()).ok()
+            })
+            .is_some_and(|labels| crate::drawings::kinds::lines::is_legacy_info_stats(&labels));
+    let Some(options) = item.options.as_object_mut() else {
+        return;
+    };
+    if item.kind == DrawingKind::AnchoredText && !options.contains_key("screen_x") {
+        if let Some(anchor) = item.points.first_mut() {
             anchor.time = None;
             options.insert(
                 "screen_x".to_string(),
@@ -1020,6 +1126,17 @@ pub(crate) fn migrate_fork_payload_item(item: &mut crate::DrawingClipboardItem) 
                 serde_json::json!(anchor.price.clamp(0.0, 1.0)),
             );
         }
+    }
+    if converted || fork_info_line {
+        let tool_options = options
+            .entry("tool_options")
+            .or_insert_with(|| serde_json::json!({}));
+        drop_consumed_gann_reverse(item.kind, Some(&mut *tool_options));
+        crate::drawings::kinds::merge_legacy_fork_tool_options(item.kind, tool_options);
+    }
+    if converted && item.kind == DrawingKind::PatternTriangle {
+        options.insert("extend_left".to_string(), serde_json::json!(true));
+        options.insert("extend_right".to_string(), serde_json::json!(true));
     }
 }
 
@@ -1844,8 +1961,16 @@ impl ChartEngine {
             // A drawing the fork stored under its own anchor contract converts to upstream's
             // before the anchor count is checked: restore is atomic, so one such drawing would
             // otherwise reject the whole layout.
-            let migrated = migrate_fork_anchors(kind, &anchors, tool_options.as_ref(), legacy_fork);
+            let migrated = if item.kind == "flat_top_bottom" && kind == DrawingKind::DisjointChannel
+            {
+                Some(fork_flat_crossing_anchors(&anchors))
+            } else {
+                migrate_fork_anchors(kind, &anchors, tool_options.as_ref(), legacy_fork)
+            };
             let converted_bars_pattern = migrated.is_some() && kind == DrawingKind::BarsPattern;
+            if migrated.is_some() {
+                drop_consumed_gann_reverse(kind, tool_options.as_mut());
+            }
             if let Some(migrated) = migrated {
                 if !anchor_times_micros.is_empty() {
                     anchor_times_micros = migrated
@@ -2322,6 +2447,19 @@ impl ChartEngine {
                 drawing.text_v_align = DrawingTextVAlign::from_name(&align)
                     .ok_or_else(|| invalid(format!("unknown vertical text alignment {align:?}")))?;
             }
+            // Every exporter writes the box colors whenever they are set, so an absent key is a
+            // box the user (or the fork's defaults) cleared, not the kind's tinted default.
+            if matches!(
+                kind,
+                DrawingKind::Note | DrawingKind::Comment | DrawingKind::Callout
+            ) {
+                if style.box_color.is_none() {
+                    drawing.box_color = None;
+                }
+                if style.box_border_color.is_none() {
+                    drawing.box_border_color = None;
+                }
+            }
             if let Some(color) = style.box_color {
                 validate_color(&color, "box_color")?;
                 drawing.box_color = (!color.is_empty()).then_some(color);
@@ -2334,8 +2472,14 @@ impl ChartEngine {
                 validate_positive_number(width, "box_border_width")?;
                 drawing.box_border_width = width;
             }
-            // What remains of the stored blocks after the flat-field keys moved out.
-            if let Some(tool_options) = tool_options.filter(|_| stored_tool_options) {
+            // What remains of the stored blocks after the flat-field keys moved out, over the
+            // fork's option defaults its documents never stored.
+            if let Some(mut tool_options) =
+                tool_options.filter(|_| stored_tool_options || legacy_fork)
+            {
+                if legacy_fork {
+                    crate::drawings::kinds::merge_legacy_fork_tool_options(kind, &mut tool_options);
+                }
                 let tool_options =
                     serde_json::from_value::<crate::DrawingToolOptions>(tool_options)
                         .ok()
@@ -2344,6 +2488,10 @@ impl ChartEngine {
                             invalid(format!("drawing {} has invalid tool options", item.id))
                         })?;
                 drawing.tool_options = tool_options;
+            }
+            if legacy_fork {
+                // With its style in place: the median takes the drawing's line style.
+                crate::drawings::kinds::pitchforks_gann::legacy_levels_to_upstream(&mut drawing);
             }
             max_drawing_id = max_drawing_id.max(item.id);
             // A bars pattern converted from a fork drawing that had copied no bars restores
@@ -4999,7 +5147,9 @@ mod tests {
         let icon = chart.drawing(17).unwrap();
         assert_eq!(icon.icon_name.as_deref(), Some("heart"));
         assert_eq!(icon.icon_size, 96.0);
-        assert!(chart.drawing(5).unwrap().level_reverse);
+        // The fixed square's `reverse` lives in its downward corner: the fans and arcs keep
+        // pivoting on the anchor, as the fork's did.
+        assert!(!chart.drawing(5).unwrap().level_reverse);
         let bars = chart.drawing(6).unwrap();
         assert_eq!(
             bars.bars_pattern
@@ -5107,6 +5257,15 @@ mod tests {
         assert_eq!(exported_times(&value, 16), [None]);
         assert!(!exported.contains("\"levels_as_percent\""));
         assert!(!exported.contains("\"bars_mode\""));
+        // The projection, the price note, and the signpost carry the fork-form marker, written
+        // as an empty block.
+        for id in [7, 8, 9] {
+            assert_eq!(
+                written_tool_options(&value, id),
+                serde_json::json!({"projection_annotation": {}}),
+                "drawing {id}"
+            );
+        }
 
         // The written document is upstream-format: it restores unchanged.
         let mut again = ChartEngine::new(800.0, 500.0, 1.0);
@@ -5176,7 +5335,14 @@ mod tests {
                 .clone()
         };
         assert_eq!(tool_options(6)["fibonacci"]["reverse"], true);
-        assert_eq!(tool_options(1), serde_json::Value::Null);
+        // The fork's unstored trend line and label placement are written out, the flat aliases
+        // are not.
+        assert_eq!(
+            tool_options(1),
+            serde_json::json!({"fibonacci": {
+                "trend_line": true, "grid": false, "full_circles": false, "label_v_align": "middle"
+            }})
+        );
         // Speed arcs turned around the first anchor: upstream's center is the second.
         assert_anchors(&chart, 8, &[(6.0, 12.0), (1.0, 10.0)]);
         // Circles centered between the anchors at half their distance: upstream centers them on
@@ -5222,6 +5388,8 @@ mod tests {
             fork.levels, upstream.levels,
             "the fixture tells the defaults apart"
         );
+        // The fork's pitchfork levels, in upstream's meaning.
+        crate::drawings::kinds::pitchforks_gann::legacy_levels_to_upstream(&mut fork);
         assert_eq!(chart.drawing(1).unwrap().levels, fork.levels);
         assert_anchors(&chart, 2, &[(1.0, 10.0), (3.0, 12.0), (5.0, 10.0)]);
 
@@ -5234,6 +5402,803 @@ mod tests {
             .unwrap();
         assert_eq!(pinned.drawing(1).unwrap().levels, upstream.levels);
         assert_anchors(&pinned, 2, &[(1.0, 10.0), (5.0, 10.0), (3.0, 12.0)]);
+    }
+
+    /// A document as the fork wrote it (no catalog marker) holding `drawings`.
+    fn fork_document(drawings: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "schema": "aeris_charts-state",
+            "schema_version": 1,
+            "panes": [{"id": "pane-1"}],
+            "drawings": drawings,
+        })
+        .to_string()
+    }
+
+    /// One stored drawing; `style` `null` leaves the style out.
+    fn stored(
+        id: u32,
+        kind: &str,
+        anchors: &[serde_json::Value],
+        style: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut drawing = serde_json::json!({
+            "id": id, "kind": kind, "pane_id": "pane-1", "anchors": anchors,
+        });
+        if !style.is_null() {
+            drawing["style"] = style;
+        }
+        drawing
+    }
+
+    /// An anchor with the time the fork wrote (on hourly bars from the epoch), which marks the
+    /// document as the fork's.
+    fn timed(logical: f64, price: f64) -> serde_json::Value {
+        serde_json::json!({"logical": logical, "price": price, "time": logical * 3_600.0})
+    }
+
+    fn untimed(logical: f64, price: f64) -> serde_json::Value {
+        serde_json::json!({"logical": logical, "price": price})
+    }
+
+    /// The `tool_options` an export wrote for drawing `id`.
+    fn written_tool_options(document: &serde_json::Value, id: u32) -> serde_json::Value {
+        document["drawings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|drawing| drawing["id"] == id)
+            .unwrap()["style"]["tool_options"]
+            .clone()
+    }
+
+    /// Restore `document`, then check that its export restores to the same export.
+    fn restore_round_trip(document: &str) -> (ChartEngine, serde_json::Value) {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart.import_state_json(document).unwrap();
+        let exported = chart.export_state_json().unwrap();
+        let mut again = ChartEngine::new(800.0, 500.0, 1.0);
+        again.import_state_json(&exported).unwrap();
+        assert_eq!(again.export_state_json().unwrap(), exported);
+        for drawing in &chart.drawings {
+            assert_eq!(
+                again.drawing(drawing.id),
+                Some(drawing),
+                "{:?}",
+                drawing.kind
+            );
+        }
+        (chart, serde_json::from_str(&exported).unwrap())
+    }
+
+    #[test]
+    fn fork_flat_channels_keep_their_level_line() {
+        let base = [timed(1.0, 10.0), timed(5.0, 12.0)];
+        let flat = |id: u32, level: serde_json::Value| {
+            stored(
+                id,
+                "flat_top_bottom",
+                &[base[0].clone(), base[1].clone(), level],
+                serde_json::Value::Null,
+            )
+        };
+        let document = fork_document(vec![
+            // A level between the base anchors crosses the base: the disjoint channel whose
+            // second line is that level.
+            flat(1, untimed(3.0, 11.5)),
+            // Below both base anchors, whatever its bar: a flat bottom at its price.
+            flat(2, untimed(-3.0, 9.5)),
+            flat(3, untimed(3.0, 12.0)),
+            flat(4, untimed(3.0, 10.0)),
+            // A base on one bar keeps its side of the base.
+            stored(
+                5,
+                "flat_top_bottom",
+                &[timed(2.0, 10.0), timed(2.0, 12.0), untimed(2.0, 11.0)],
+                serde_json::Value::Null,
+            ),
+        ]);
+        let (chart, exported) = restore_round_trip(&document);
+        let kinds = (1..=5)
+            .map(|id| chart.drawing(id).unwrap().kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                DrawingKind::DisjointChannel,
+                DrawingKind::FlatBottomChannel,
+                DrawingKind::FlatTopChannel,
+                DrawingKind::FlatBottomChannel,
+                DrawingKind::FlatBottomChannel,
+            ]
+        );
+        assert_anchors(
+            &chart,
+            1,
+            &[(1.0, 10.0), (5.0, 12.0), (1.0, 11.5), (5.0, 11.5)],
+        );
+        assert!(chart.drawing(1).unwrap().fill_enabled);
+        // Each end of the level keeps the time identity of the base anchor on its bar.
+        let time = |logical: f64| Some(logical * 3_600.0);
+        assert_eq!(
+            exported_times(&exported, 1),
+            [time(1.0), time(5.0), time(1.0), time(5.0)]
+        );
+        assert_anchors(&chart, 2, &[(1.0, 10.0), (5.0, 12.0), (-3.0, 9.5)]);
+        assert_anchors(&chart, 5, &[(2.0, 10.0), (2.0, 12.0), (2.0, 11.0)]);
+    }
+
+    #[test]
+    fn fork_channels_keep_their_unstored_defaults_and_regression_sides() {
+        let two = [timed(1.0, 10.0), timed(6.0, 12.0)];
+        let document = fork_document(vec![
+            stored(
+                1,
+                "regression_trend",
+                &two,
+                serde_json::json!({"tool_options": {"channel": {
+                    "upper_deviation": 3.0, "lower_deviation": -1.0
+                }}}),
+            ),
+            stored(
+                2,
+                "regression_trend",
+                &two,
+                serde_json::json!({"tool_options": {"channel": {"use_lower_deviation": false}}}),
+            ),
+            stored(3, "regression_trend", &two, serde_json::Value::Null),
+            stored(
+                4,
+                "parallel_channel",
+                &[two[0].clone(), two[1].clone(), untimed(3.0, 13.0)],
+                serde_json::Value::Null,
+            ),
+            stored(
+                5,
+                "parallel_channel",
+                &[two[0].clone(), two[1].clone(), untimed(3.0, 13.0)],
+                serde_json::json!({"tool_options": {"channel": {"middle_line": false}}}),
+            ),
+            stored(
+                6,
+                "disjoint_channel",
+                &[
+                    two[0].clone(),
+                    two[1].clone(),
+                    untimed(1.0, 8.0),
+                    untimed(6.0, 9.0),
+                ],
+                serde_json::Value::Null,
+            ),
+        ]);
+        let (mut chart, exported) = restore_round_trip(&document);
+        let channel =
+            |chart: &ChartEngine, id: u32| chart.drawing(id).unwrap().tool_options.channel.clone();
+        let options = |value: serde_json::Value| {
+            serde_json::from_value::<crate::ChannelToolOptions>(value).unwrap()
+        };
+        // Asymmetric and one-sided bands keep their sides (an omitted side at the fork's
+        // default); the flat band is the fold, for upstream's readers.
+        assert_eq!(chart.drawing(1).unwrap().regression_deviations, 3.0);
+        assert_eq!(
+            channel(&chart, 1),
+            Some(options(serde_json::json!({
+                "middle_line": true, "show_pearsons": true,
+                "upper_deviation": 3.0, "lower_deviation": -1.0
+            })))
+        );
+        assert_eq!(chart.drawing(2).unwrap().regression_deviations, 2.0);
+        assert_eq!(
+            channel(&chart, 2),
+            Some(options(serde_json::json!({
+                "middle_line": true, "show_pearsons": true, "use_lower_deviation": false,
+                "upper_deviation": 2.0, "lower_deviation": -2.0
+            })))
+        );
+        // The fork's on-by-default centre line and Pearson's R, and the parallel channel's
+        // middle line, which its documents never stored; a stored value wins.
+        assert_eq!(
+            channel(&chart, 3),
+            Some(options(
+                serde_json::json!({"middle_line": true, "show_pearsons": true})
+            ))
+        );
+        assert_eq!(
+            channel(&chart, 4),
+            Some(options(serde_json::json!({"middle_line": true})))
+        );
+        assert_eq!(
+            channel(&chart, 5),
+            Some(options(serde_json::json!({"middle_line": false})))
+        );
+        assert_eq!(channel(&chart, 6), None);
+        assert_eq!(
+            written_tool_options(&exported, 1),
+            serde_json::json!({"channel": {
+                "middle_line": true, "upper_deviation": 3.0, "lower_deviation": -1.0,
+                "show_pearsons": true
+            }})
+        );
+        // A side override is a patch of its own side: the flat band stays.
+        assert!(chart
+            .drawing_apply_options(3, r#"{"tool_options":{"channel":{"upper_deviation":1.0}}}"#));
+        let regression = chart.drawing(3).unwrap();
+        assert_eq!(regression.regression_deviations, 2.0);
+        assert_eq!(
+            regression
+                .tool_options
+                .channel
+                .as_ref()
+                .unwrap()
+                .upper_deviation,
+            Some(1.0)
+        );
+        // Upstream documents keep upstream's defaults.
+        let mut marked: serde_json::Value = exported.clone();
+        marked["drawings"][3]["style"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_options");
+        let mut upstream = ChartEngine::new(800.0, 500.0, 1.0);
+        upstream.import_state_json(&marked.to_string()).unwrap();
+        assert_eq!(channel(&upstream, 4), None);
+    }
+
+    #[test]
+    fn fork_fibonacci_documents_keep_their_trend_lines_grid_and_label_placement() {
+        let two = [untimed(1.0, 10.0), untimed(6.0, 12.0)];
+        let three = [untimed(1.0, 10.0), untimed(6.0, 12.0), untimed(8.0, 11.0)];
+        let fibonacci = |id: u32, kind: &str, anchors: &[serde_json::Value]| {
+            stored(id, kind, anchors, serde_json::Value::Null)
+        };
+        let document = fork_document(vec![
+            fibonacci(1, "fib_retracement", &two),
+            fibonacci(2, "trend_based_fib_extension", &three),
+            fibonacci(3, "fib_channel", &three),
+            fibonacci(4, "fib_time_zone", &two),
+            fibonacci(5, "trend_based_fib_time", &three),
+            fibonacci(6, "fib_speed_resistance_fan", &two),
+            fibonacci(7, "fib_speed_resistance_arcs", &two),
+            fibonacci(8, "fib_circles", &two),
+            fibonacci(9, "fib_spiral", &two),
+            fibonacci(10, "fib_wedge", &three),
+            // A stored block (the fork wrote whole blocks) keeps its values.
+            stored(
+                11,
+                "fib_retracement",
+                &two,
+                serde_json::json!({"tool_options": {"fibonacci": {
+                    "trend_line": false, "label_v_align": "top", "reverse": true
+                }}}),
+            ),
+            stored(
+                12,
+                "fib_time_zone",
+                &two,
+                serde_json::json!({"tool_options": {"fibonacci": {"label_h_align": "left"}}}),
+            ),
+        ]);
+        let (chart, _) = restore_round_trip(&document);
+        let block = |id: u32| chart.drawing(id).unwrap().tool_options.fibonacci;
+        let v_align = |align| Some(align);
+        for (id, trend_line, grid, label_v_align) in [
+            (1, true, false, v_align(crate::FibonacciLabelVAlign::Middle)),
+            (2, true, false, v_align(crate::FibonacciLabelVAlign::Middle)),
+            (
+                3,
+                false,
+                false,
+                v_align(crate::FibonacciLabelVAlign::Middle),
+            ),
+            (4, true, false, v_align(crate::FibonacciLabelVAlign::Bottom)),
+            (5, true, false, v_align(crate::FibonacciLabelVAlign::Bottom)),
+            (6, false, true, None),
+            (7, true, false, None),
+            (8, true, false, None),
+            (9, true, false, None),
+            (11, false, false, v_align(crate::FibonacciLabelVAlign::Top)),
+        ] {
+            let block = block(id).unwrap_or_else(|| panic!("drawing {id} has its block"));
+            assert_eq!(
+                (block.trend_line, block.grid, block.label_v_align),
+                (trend_line, grid, label_v_align),
+                "drawing {id}"
+            );
+        }
+        // The wedge has no unstored option value, but its block selects the fork's precise
+        // rings (R5, owner decision T1), as every fork ring tool's does.
+        assert_eq!(
+            block(10),
+            Some(crate::FibonacciToolOptions::default()),
+            "the wedge carries the empty block"
+        );
+        // The fork labelled time levels right of their lines: upstream's `left`. An explicit
+        // fork `left` is upstream's `right`.
+        assert_eq!(chart.drawing(4).unwrap().level_label_align, "left");
+        assert_eq!(chart.drawing(5).unwrap().level_label_align, "left");
+        assert_eq!(chart.drawing(12).unwrap().level_label_align, "right");
+        assert_eq!(chart.drawing(1).unwrap().level_label_align, "left");
+        // New drawings keep upstream's look: the option type's defaults switch nothing on.
+        let defaults = crate::FibonacciToolOptions::default();
+        assert!(!defaults.trend_line && !defaults.grid);
+    }
+
+    #[test]
+    fn fork_time_zone_labels_stay_right_of_their_lines() {
+        let document = fork_document(vec![stored(
+            1,
+            "fib_time_zone",
+            &[untimed(1.0, 11.0), untimed(2.0, 12.0)],
+            serde_json::Value::Null,
+        )]);
+        let mut chart = settled_chart();
+        chart.import_state_json(&document).unwrap();
+        let frame = chart.build_frame();
+        let pane = &frame.panes[0];
+        let lines = pane
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                aeris_charts_render::draw_list::Prim::VLine { x, .. } => Some(f64::from(*x)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let labels = pane
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                aeris_charts_render::draw_list::Prim::Text { x, text, align, .. }
+                    if text == "0" || text == "1" =>
+                {
+                    Some((f64::from(*x), *align))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!labels.is_empty(), "the zones are labelled");
+        for (x, align) in labels {
+            assert_eq!(align, aeris_charts_render::draw_list::TextAlign::Left);
+            assert!(
+                lines.iter().any(|line| x > *line && x - *line <= 6.0),
+                "label at {x} runs right from a line of {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_pitchforks_and_gann_tools_keep_the_geometry_the_fork_drew() {
+        let three = [timed(8.0, 101.0), timed(16.0, 105.0), timed(20.0, 102.0)];
+        let two = [timed(3.0, 10.0), timed(7.0, 12.0)];
+        let document = fork_document(vec![
+            stored(1, "andrews_pitchfork", &three, serde_json::Value::Null),
+            stored(
+                2,
+                "pitchfan",
+                &three,
+                serde_json::json!({"line_style": "dashed", "levels": [
+                    {"value": 0.5, "color": "#ff0000", "visible": true, "style": "solid",
+                     "fill_between": true, "fill_color": "#ff000040", "label_visible": true},
+                    {"value": 1.0, "color": "#00ff00", "visible": true, "style": "solid",
+                     "fill_between": true, "label_visible": false},
+                    {"value": 0.75, "color": "#0000ff", "visible": false, "style": "solid",
+                     "fill_between": true, "label_visible": false},
+                    {"value": 0.0, "color": "#000000", "visible": true, "style": "solid",
+                     "fill_between": false, "label_visible": false}
+                ]}),
+            ),
+            stored(3, "gann_box", &two, serde_json::Value::Null),
+            stored(4, "gann_square", &two, serde_json::Value::Null),
+            stored(
+                5,
+                "gann_square",
+                &two,
+                serde_json::json!({"tool_options": {"gann": {"reverse": true}}}),
+            ),
+            stored(
+                6,
+                "gann_fan",
+                &two,
+                serde_json::json!({"tool_options": {"gann": {"reverse": true, "scale_ratio": 0.5}}}),
+            ),
+            stored(
+                7,
+                "gann_square_fixed",
+                &[timed(3.0, 10.0)],
+                serde_json::json!({"tool_options": {"gann": {"size_bars": 20.0, "reverse": true}}}),
+            ),
+            stored(
+                8,
+                "gann_square_fixed",
+                &[timed(3.0, 10.0)],
+                serde_json::json!({"tool_options": {"gann": {"size_bars": 2.0}}}),
+            ),
+        ]);
+        let (chart, _) = restore_round_trip(&document);
+        let level = |value: f64, color: &str, visible: bool| crate::DrawingLevel {
+            value,
+            color: color.to_string(),
+            visible,
+            style: "solid".to_string(),
+            fill_between: true,
+            fill_color: None,
+            label_visible: false,
+        };
+        // The fork's defaults: tines at 0.5 and 1 half-handle each side of an always-drawn
+        // median. Upstream places the tines along the handle (0.25/0.75 and 0/1), the visible
+        // ones first; each lower band keeps the fill of the fork level outside it.
+        let andrews = chart.drawing(1).unwrap();
+        let visible = andrews
+            .levels
+            .iter()
+            .filter(|level| level.visible)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            [
+                crate::DrawingLevel {
+                    fill_between: false,
+                    ..level(0.0, "#2962ff", true)
+                },
+                crate::DrawingLevel {
+                    fill_color: Some("#2962ff23".to_string()),
+                    ..level(0.25, "#089981", true)
+                },
+                crate::DrawingLevel {
+                    fill_color: Some("#08998123".to_string()),
+                    ..level(0.5, "", true)
+                },
+                level(0.75, "#089981", true),
+                level(1.0, "#2962ff", true),
+            ]
+        );
+        assert_eq!(andrews.levels.len(), 19);
+        assert!(andrews.levels[5..].iter().all(|level| !level.visible));
+        assert!(andrews.levels[5..]
+            .windows(2)
+            .all(|pair| pair[0].value <= pair[1].value));
+        // Stored levels convert the same way; the median takes the drawing's line style, a
+        // zero level (never drawn) drops out, and a stored fill colour moves with its band.
+        let fan = chart.drawing(2).unwrap();
+        let values = fan
+            .levels
+            .iter()
+            .map(|level| (level.value, level.visible))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [
+                (0.0, true),
+                (0.25, true),
+                (0.5, true),
+                (0.75, true),
+                (1.0, true),
+                (0.125, false),
+                (0.875, false)
+            ]
+        );
+        assert_eq!(fan.levels[1].fill_color.as_deref(), Some("#00ff0023"));
+        assert_eq!(fan.levels[2].fill_color.as_deref(), Some("#ff000040"));
+        assert_eq!(fan.levels[2].style, "dashed");
+        assert_eq!(fan.levels[3].fill_color.as_deref(), Some("#ff000040"));
+        // The box's own time levels and the squares' stats box.
+        let gann = |id: u32| {
+            chart
+                .drawing(id)
+                .unwrap()
+                .tool_options
+                .gann
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(gann(3).time_levels.len(), 7);
+        assert!(!gann(3).show_stats);
+        assert!(gann(4).show_stats);
+        assert!(gann(4).time_levels.is_empty());
+        // A reversed square measured from the first anchor's time and the second's price:
+        // upstream's pivot sits on the first anchor once the prices swap.
+        assert_anchors(&chart, 5, &[(3.0, 12.0), (7.0, 10.0)]);
+        assert!(!chart.drawing(5).unwrap().level_reverse);
+        assert!(!chart.drawing(4).unwrap().level_reverse);
+        // The fork's fan never read `reverse`; its ratio stays.
+        assert!(!chart.drawing(6).unwrap().level_reverse);
+        assert_eq!(gann(6).scale_ratio, Some(0.5));
+        assert!(!gann(6).reverse);
+        // A downward fixed square without a ratio keeps a positive corner below its anchor
+        // (one a logarithmic scale can place); an upward one keeps the additive offset.
+        assert!(!chart.drawing(7).unwrap().level_reverse);
+        assert_anchors(&chart, 7, &[(3.0, 10.0), (23.0, 10.0 / 21.0)]);
+        assert_anchors(&chart, 8, &[(3.0, 10.0), (5.0, 30.0)]);
+        assert!(gann(7).show_stats);
+    }
+
+    #[test]
+    fn fork_annotations_restore_in_their_fork_form() {
+        use crate::drawings::{
+            resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions,
+        };
+        let document = fork_document(vec![
+            // The fork's three-anchor projection (pivot, radius point, price point).
+            stored(
+                1,
+                "projection",
+                &[timed(1.0, 10.0), timed(3.0, 10.0), timed(4.0, 12.0)],
+                serde_json::Value::Null,
+            ),
+            // The fork's one-anchor signpost.
+            stored(2, "signpost", &[timed(2.0, 11.0)], serde_json::Value::Null),
+            stored(3, "note", &[timed(2.0, 11.0)], serde_json::Value::Null),
+            stored(
+                4,
+                "price_label",
+                &[timed(2.0, 11.0)],
+                serde_json::Value::Null,
+            ),
+        ]);
+        let (chart, exported) = restore_round_trip(&document);
+        fn body<'a>(chart: &ChartEngine, id: u32, px: &'a [(f64, f64)]) -> DrawingBodyGeometry<'a> {
+            let drawing = chart.drawing(id).unwrap();
+            resolve_drawing_geometry(
+                drawing.kind,
+                px,
+                800.0,
+                0.0,
+                500.0,
+                DrawingGeometryOptions::for_drawing(drawing, 1.0),
+            )
+            .unwrap()
+            .body
+        }
+        // The projection resolves its sector, the note its pin, the price label its tail.
+        assert!(matches!(
+            body(&chart, 1, &[(100.0, 300.0), (200.0, 200.0)]),
+            DrawingBodyGeometry::Sector(_)
+        ));
+        assert!(matches!(
+            body(&chart, 3, &[(100.0, 300.0)]),
+            DrawingBodyGeometry::NotePin(_)
+        ));
+        assert!(matches!(
+            body(&chart, 4, &[(100.0, 300.0)]),
+            DrawingBodyGeometry::SpeechTail { .. }
+        ));
+        // The signpost's anchors coincide, so it stands the fork's 40 CSS px pole.
+        let points = &chart.drawing(2).unwrap().points;
+        assert_eq!(points[0], points[1]);
+        let DrawingBodyGeometry::Marker(marker) =
+            body(&chart, 2, &[(100.0, 300.0), (100.0, 300.0)])
+        else {
+            panic!("signpost marker");
+        };
+        assert_eq!(marker.anchor, (100.0, 260.0));
+        // Each keeps its marker, written as an empty block.
+        for id in 1..=4 {
+            assert_eq!(
+                written_tool_options(&exported, id),
+                serde_json::json!({"projection_annotation": {}}),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_lines_annotations_patterns_and_shapes_keep_their_fork_options() {
+        let two = [timed(1.0, 10.0), timed(4.0, 12.0)];
+        let document = fork_document(vec![
+            stored(1, "ray", &two, serde_json::Value::Null),
+            stored(2, "info_line", &two, serde_json::Value::Null),
+            stored(3, "trend_angle", &two, serde_json::Value::Null),
+            stored(
+                4,
+                "arrow_line",
+                &two,
+                serde_json::json!({"tool_options": {"line": {"stats_position": "middle"}}}),
+            ),
+            stored(5, "trend_line", &two, serde_json::Value::Null),
+            stored(6, "note", &[timed(2.0, 11.0)], serde_json::Value::Null),
+            stored(7, "comment", &[timed(2.0, 11.0)], serde_json::Value::Null),
+            stored(
+                8,
+                "callout",
+                &two,
+                serde_json::json!({"box_color": "#ff000033"}),
+            ),
+            stored(
+                9,
+                "price_label",
+                &[timed(2.0, 11.0)],
+                serde_json::Value::Null,
+            ),
+            stored(10, "forecast", &two, serde_json::Value::Null),
+            stored(
+                11,
+                "arrow_mark_left",
+                &[timed(2.0, 11.0)],
+                serde_json::Value::Null,
+            ),
+            stored(
+                12,
+                "note",
+                &[timed(2.0, 11.0)],
+                serde_json::json!({"tool_options": {"projection_annotation": {"always_show_text": true}}}),
+            ),
+            stored(
+                13,
+                "anchored_text",
+                &[timed(2.0, 11.0)],
+                serde_json::json!({"screen_x": 0.5, "screen_y": 0.5}),
+            ),
+            stored(
+                14,
+                "triangle_pattern",
+                &[
+                    timed(0.0, 10.0),
+                    timed(2.0, 14.0),
+                    timed(4.0, 11.0),
+                    timed(6.0, 13.0),
+                ],
+                serde_json::Value::Null,
+            ),
+            // The fork's curve passes through its third anchor halfway along; upstream's middle
+            // control point takes a time identity where the stored times are evenly spaced.
+            stored(
+                15,
+                "curve",
+                &[timed(0.0, 10.0), timed(4.0, 10.0), timed(2.0, 12.0)],
+                serde_json::Value::Null,
+            ),
+            // A rotated rectangle around a vertical axis.
+            stored(
+                16,
+                "rotated_rectangle",
+                &[timed(2.0, 10.0), timed(2.0, 14.0), timed(5.0, 12.0)],
+                serde_json::Value::Null,
+            ),
+        ]);
+        let (chart, exported) = restore_round_trip(&document);
+        let drawing = |id: u32| chart.drawing(id).unwrap();
+        // The line tools draw their stats as one box: the block selects it.
+        for id in 1..=3 {
+            assert_eq!(
+                drawing(id).tool_options.line,
+                Some(Default::default()),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            drawing(4).tool_options.line.unwrap().stats_position,
+            crate::DrawingStatsPosition::Middle
+        );
+        assert_eq!(drawing(5).tool_options, Default::default());
+        assert_eq!(
+            written_tool_options(&exported, 1),
+            serde_json::json!({"line": {"stats_position": "end"}})
+        );
+        // The annotations' fork-form marker, written as an empty block; a stored block keeps
+        // its keys.
+        for id in [6, 7, 9, 10, 11] {
+            assert_eq!(
+                drawing(id).tool_options.projection_annotation,
+                Some(Default::default()),
+                "{id}"
+            );
+            assert_eq!(
+                written_tool_options(&exported, id),
+                serde_json::json!({"projection_annotation": {}}),
+                "{id}"
+            );
+        }
+        assert!(
+            drawing(12)
+                .tool_options
+                .projection_annotation
+                .as_ref()
+                .unwrap()
+                .always_show_text
+        );
+        assert_eq!(drawing(8).tool_options, Default::default());
+        assert_eq!(drawing(13).tool_options, Default::default());
+        // The fork's boxes had no fill or border unless set, and an export writes a set one.
+        assert_eq!(drawing(6).box_color, None);
+        assert_eq!(drawing(6).box_border_color, None);
+        assert_eq!(drawing(8).box_color.as_deref(), Some("#ff000033"));
+        assert_eq!(drawing(8).box_border_color, None);
+        // The triangle pattern's apex sides.
+        assert!(drawing(14).extend_left && drawing(14).extend_right);
+        assert_anchors(&chart, 15, &[(0.0, 10.0), (2.0, 14.0), (4.0, 10.0)]);
+        assert_eq!(
+            exported_times(&exported, 15),
+            [Some(0.0), Some(2.0 * 3_600.0), Some(4.0 * 3_600.0)]
+        );
+        assert_anchors(&chart, 16, &[(5.0, 10.0), (5.0, 14.0), (-1.0, 10.0)]);
+        assert_eq!(
+            exported_times(&exported, 16),
+            [Some(5.0 * 3_600.0), Some(5.0 * 3_600.0), None]
+        );
+    }
+
+    #[test]
+    fn fork_derived_anchors_keep_their_bars_across_a_session_gap() {
+        // Hourly bars with a weekend after the fourth: a curve from L0 through L3 to L6, a double
+        // curve over L0..L6, and a rotated rectangle around a vertical axis at L2 straddle it.
+        let times = (0..10)
+            .map(|i| f64::from(if i < 4 { i } else { i + 48 }) * 3_600.0)
+            .collect::<Vec<_>>();
+        let gapped = |logical: f64, price: f64| {
+            let time = times[logical as usize];
+            serde_json::json!({"logical": logical, "price": price, "time": time})
+        };
+        let document = fork_document(vec![
+            stored(
+                1,
+                "curve",
+                &[gapped(0.0, 10.0), gapped(6.0, 10.0), gapped(3.0, 12.0)],
+                serde_json::Value::Null,
+            ),
+            stored(
+                2,
+                "double_curve",
+                &[
+                    gapped(0.0, 10.0),
+                    gapped(6.0, 10.0),
+                    gapped(2.0, 11.0),
+                    gapped(4.0, 11.0),
+                ],
+                serde_json::Value::Null,
+            ),
+            stored(
+                3,
+                "rotated_rectangle",
+                &[gapped(2.0, 10.0), gapped(2.0, 14.0), gapped(5.0, 12.0)],
+                serde_json::Value::Null,
+            ),
+        ]);
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let values = [11.0; 10];
+        chart
+            .set_series_data(0, &times, &values, &values, &values, &values)
+            .unwrap();
+        chart.import_state_json(&document).unwrap();
+        // The derived points keep the bars the fork's geometry put them on (time arithmetic
+        // across the gap would move them about two days of bars left).
+        assert_anchors(&chart, 1, &[(0.0, 10.0), (3.0, 14.0), (6.0, 10.0)]);
+        assert_anchors(
+            &chart,
+            2,
+            &[(0.0, 10.0), (2.0, 11.5), (4.0, 11.5), (6.0, 10.0)],
+        );
+        assert_anchors(&chart, 3, &[(5.0, 10.0), (5.0, 14.0), (-1.0, 10.0)]);
+    }
+
+    #[test]
+    fn cleared_annotation_boxes_survive_a_round_trip() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let points = vec![DrawingPoint {
+            logical: 2.0,
+            price: 11.0,
+        }];
+        let note = chart
+            .add_drawing(
+                DrawingKind::Note,
+                0,
+                points.clone(),
+                Some(r#"{"box_color":"","box_border_color":""}"#),
+            )
+            .unwrap();
+        let tinted = chart
+            .add_drawing(DrawingKind::Comment, 0, points, None)
+            .unwrap();
+        assert_eq!(chart.drawing(note).unwrap().box_color, None);
+        let exported = chart.export_state_json().unwrap();
+        let mut again = ChartEngine::new(800.0, 500.0, 1.0);
+        again.import_state_json(&exported).unwrap();
+        assert_eq!(again.drawing(note).unwrap().box_color, None);
+        assert_eq!(again.drawing(note).unwrap().box_border_color, None);
+        assert_eq!(
+            again.drawing(tinted).unwrap().box_color,
+            chart.drawing(tinted).unwrap().box_color
+        );
+        assert_eq!(again.export_state_json().unwrap(), exported);
     }
 
     /// Shapes whose anchor count is the same in both catalogs but whose anchors meant something

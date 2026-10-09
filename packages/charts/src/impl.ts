@@ -4071,7 +4071,8 @@ class series_primitive_handle_impl implements series_primitive_handle {
 
 /**
  * Where the engine paints a drawing's own text (`drawing_text_edit_layout_json`), in overlay CSS
- * px. A `multiline` layout is a family text box: lines left-aligned at `x`, line `i` centered at
+ * px. A `multiline` layout is a text box or block (a family's, a text annotation's, or an
+ * annotation's fork-look box): lines left-aligned at `x`, line `i` centered at
  * `y + i * line_height`, never rotated. Otherwise it is one run: `x`, `y` are its start (left
  * edge, vertical center), rotated clockwise by `angle` radians about that point, and `rect`
  * bounds its padded box. The host only presents the editor the layout describes.

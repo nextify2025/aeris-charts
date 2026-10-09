@@ -6,12 +6,13 @@
 //! sync, and bounded repeats at extreme zoom.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::Prim;
+use aeris_charts_render::draw_list::{LineStyle, Prim};
 
 use super::super::super::DrawingTextLayout;
+use super::{ElliottWaveDegree, WaveMark};
 use crate::{
     ChartEngine, DrawingAnchor, DrawingId, DrawingKind, DrawingMagnetMode, DrawingModifiers,
-    DrawingPoint, DrawingPriceScale,
+    DrawingPoint, DrawingPriceScale, HitProfile,
 };
 
 const KINDS: [DrawingKind; 14] = [
@@ -110,6 +111,131 @@ fn close(a: (f64, f64), b: (f64, f64), tolerance: f64) -> bool {
     (a.0 - b.0).abs() <= tolerance && (a.1 - b.1).abs() <= tolerance
 }
 
+fn ink_fill() -> Color {
+    Color::rgba(0x12, 0x34, 0x56, super::FILL_ALPHA)
+}
+
+/// One drawing-colored polyline of the first pane: points, width, and style.
+type InkLine = (Vec<(f64, f64)>, f32, LineStyle);
+
+fn ink_polylines(chart: &mut ChartEngine) -> Vec<InkLine> {
+    let frame = chart.build_frame();
+    let pane = &frame.panes[0];
+    pane.main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Polyline {
+                first_point,
+                point_count,
+                width,
+                style,
+                color,
+                ..
+            } if *color == ink() => Some((
+                pane.points[*first_point as usize..(*first_point + *point_count) as usize]
+                    .iter()
+                    .map(|point| (f64::from(point[0]), f64::from(point[1])))
+                    .collect(),
+                *width,
+                *style,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ink_fills(chart: &mut ChartEngine) -> usize {
+    let frame = chart.build_frame();
+    frame.panes[0]
+        .main
+        .iter()
+        .filter(|prim| matches!(prim, Prim::BandFill { fill, .. } if *fill == ink_fill()))
+        .count()
+}
+
+fn text_y(chart: &mut ChartEngine, text: &str) -> f64 {
+    texts(chart)
+        .into_iter()
+        .find(|(run, ..)| run == text)
+        .unwrap_or_else(|| panic!("{text} is painted"))
+        .2
+}
+
+/// Total length of the thin (1 CSS px at DPR 1) solid runs lying on segment `a → b`: a dashed
+/// connector reaches the frame pre-split into its dashes.
+fn dashes_on(lines: &[InkLine], a: (f64, f64), b: (f64, f64)) -> f64 {
+    lines
+        .iter()
+        .filter(|(points, width, style)| {
+            *width == 1.0
+                && *style == LineStyle::Solid
+                && points.len() == 2
+                && points.iter().all(|&point| {
+                    aeris_charts_render::shape::distance_to_segment(point, a, b) < 0.01
+                })
+        })
+        .map(|(points, ..)| (points[1].0 - points[0].0).hypot(points[1].1 - points[0].1))
+        .sum()
+}
+
+/// Whether `a → b` is painted as a dashed connector: about half its length in dashes.
+fn dashed_between(lines: &[InkLine], a: (f64, f64), b: (f64, f64)) -> bool {
+    let coverage = dashes_on(lines, a, b) / (b.0 - a.0).hypot(b.1 - a.1);
+    (0.35..=0.65).contains(&coverage)
+}
+
+fn px(chart: &ChartEngine, logical: f64, price: f64) -> (f64, f64) {
+    chart
+        .drawing_to_px_for(0, DrawingPriceScale::Right, p(logical, price))
+        .unwrap()
+}
+
+/// Enough unrelated drawings that hit testing takes the culled candidate path.
+fn crowd(chart: &mut ChartEngine) {
+    for index in 0..22 {
+        add(
+            chart,
+            DrawingKind::TrendLine,
+            vec![p(30.0 + index as f64 * 0.1, 100.0), p(31.0, 100.5)],
+            "{}",
+        );
+    }
+}
+
+fn viewport_candidate(chart: &ChartEngine, id: DrawingId) -> bool {
+    let candidates = chart.take_drawing_candidates(0, None);
+    let found = candidates.contains(&id);
+    chart.recycle_drawing_candidates(candidates);
+    found
+}
+
+fn hit(chart: &ChartEngine, (x, y): (f64, f64)) -> Option<DrawingId> {
+    let indexed = chart.hit_test_drawing(x, y);
+    assert_eq!(
+        indexed,
+        chart.hit_test_drawing_bruteforce(x, y),
+        "({x}, {y})"
+    );
+    indexed.map(|hit| hit.id)
+}
+
+const HEAD_AND_SHOULDERS: [(f64, f64); 7] = [
+    (4.0, 101.0),
+    (8.0, 104.0),
+    (12.0, 102.0),
+    (16.0, 106.0),
+    (20.0, 102.0),
+    (24.0, 104.0),
+    (28.0, 101.0),
+];
+
+fn points_of(anchors: &[(f64, f64)]) -> Vec<DrawingPoint> {
+    anchors
+        .iter()
+        .map(|&(logical, price)| p(logical, price))
+        .collect()
+}
+
 /// The fork's pre-merge pattern, Elliott, and cycle defaults, which documents it wrote omitted,
 /// come back through `apply_legacy_fork_defaults` (upstream renders these tools now).
 #[test]
@@ -141,8 +267,19 @@ fn catalog_defaults_follow_each_tool() {
             (color, fill, width),
             "{kind:?}"
         );
-        assert!(!drawing.extend_left && !drawing.extend_right);
+        // The fork drew a triangle pattern's apex sides; the extend flags select them.
+        let apex = kind == DrawingKind::PatternTriangle;
+        assert_eq!(
+            (drawing.extend_left, drawing.extend_right),
+            (apex, apex),
+            "{kind:?}"
+        );
         assert!(drawing.labels.is_empty() && drawing.tool_options.is_empty());
+        assert_eq!(
+            super::super::legacy_fork_tool_options(kind),
+            None,
+            "{kind:?}"
+        );
     }
 }
 
@@ -524,5 +661,888 @@ fn log_and_percentage_scales_keep_indexed_hits_equal_to_brute_force() {
                 );
             }
         }
+    }
+}
+
+/// The Frost-Prechter notation of every degree (owner decision P4).
+#[test]
+fn elliott_degrees_label_with_their_notation() {
+    let impulse = |degree: ElliottWaveDegree| {
+        (1..=5)
+            .map(|number| degree.label(WaveMark::Number(number)))
+            .collect::<Vec<_>>()
+    };
+    let owned = |labels: [&str; 5], ring: bool| {
+        labels
+            .into_iter()
+            .map(|label| (label.to_string(), ring))
+            .collect::<Vec<_>>()
+    };
+    use ElliottWaveDegree::*;
+    assert_eq!(
+        impulse(Supermillennium),
+        owned(["{I}", "{II}", "{III}", "{IV}", "{V}"], false)
+    );
+    assert_eq!(
+        impulse(Millennium),
+        owned(["[I]", "[II]", "[III]", "[IV]", "[V]"], false)
+    );
+    assert_eq!(
+        impulse(Submillennium),
+        owned(["<I>", "<II>", "<III>", "<IV>", "<V>"], false)
+    );
+    assert_eq!(
+        impulse(GrandSupercycle),
+        owned(["I", "II", "III", "IV", "V"], true)
+    );
+    assert_eq!(
+        impulse(Supercycle),
+        owned(["(I)", "(II)", "(III)", "(IV)", "(V)"], false)
+    );
+    assert_eq!(impulse(Cycle), owned(["I", "II", "III", "IV", "V"], false));
+    assert_eq!(impulse(Primary), owned(["1", "2", "3", "4", "5"], true));
+    assert_eq!(
+        impulse(Intermediate),
+        owned(["(1)", "(2)", "(3)", "(4)", "(5)"], false)
+    );
+    assert_eq!(impulse(Minor), owned(["1", "2", "3", "4", "5"], false));
+    assert_eq!(impulse(Minute), owned(["i", "ii", "iii", "iv", "v"], true));
+    assert_eq!(
+        impulse(Minuette),
+        owned(["(i)", "(ii)", "(iii)", "(iv)", "(v)"], false)
+    );
+    assert_eq!(
+        impulse(Subminuette),
+        owned(["i", "ii", "iii", "iv", "v"], false)
+    );
+    let letter = |degree: ElliottWaveDegree, letter| degree.label(WaveMark::Letter(letter));
+    assert_eq!(letter(Primary, 'a'), ("A".to_string(), true));
+    assert_eq!(letter(Intermediate, 'W'), ("(W)".to_string(), false));
+    assert_eq!(letter(Minor, 'z'), ("Z".to_string(), false));
+    assert_eq!(letter(Cycle, 'B'), ("b".to_string(), false));
+    assert_eq!(letter(Minuette, 'X'), ("(x)".to_string(), false));
+    assert_eq!(letter(Supermillennium, 'C'), ("{c}".to_string(), false));
+    // Every degree labels distinctly, and each is named by its upstream `wave_degree` value.
+    let impulses = ElliottWaveDegree::ALL.map(impulse);
+    for (index, labels) in impulses.iter().enumerate() {
+        assert!(impulses[index + 1..].iter().all(|other| other != labels));
+    }
+    for degree in ElliottWaveDegree::ALL {
+        let name = serde_json::to_value(degree).unwrap();
+        assert!(DrawingKind::valid_wave_degree(name.as_str().unwrap()));
+        assert_eq!(
+            ElliottWaveDegree::from_name(name.as_str().unwrap()),
+            Some(degree)
+        );
+    }
+}
+
+/// Harmonic ratio connectors and their boxed ratios paint by default (owner decision P6:
+/// `show_ratios` defaults to true) after the zigzag, every connector before every ratio, and
+/// `show_ratios: false` removes both.
+#[test]
+fn xabcd_draws_dashed_ratio_connectors_and_ratios_by_default() {
+    let mut chart = chart();
+    crowd(&mut chart);
+    let id = add(
+        &mut chart,
+        DrawingKind::PatternXabcd,
+        vec![
+            p(6.0, 100.0),
+            p(10.0, 105.0),
+            p(14.0, 101.91),
+            p(18.0, 104.0),
+            p(22.0, 100.5),
+        ],
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let runs = texts_of(&mut chart);
+    for ratio in ["0.618", "0.676", "1.675", "0.900"] {
+        assert!(runs.iter().any(|run| run == ratio), "{ratio} in {runs:?}");
+    }
+    let lines = ink_polylines(&mut chart);
+    assert_eq!(lines[0].0.len(), 5, "the zigzag passes every anchor");
+    assert_eq!((lines[0].1, lines[0].2), (2.0, LineStyle::Solid));
+    // Connectors XB, AC, BD, and XD, each pre-split into solid dashes.
+    let [x, a, b, c, d] = [0, 1, 2, 3, 4].map(|index| anchor(&chart, id, index));
+    for (from, to) in [(x, b), (a, c), (b, d), (x, d)] {
+        assert!(dashed_between(&lines, from, to), "{from:?} → {to:?}");
+    }
+    // Z-order: zigzag, connectors, ratio boxes, then the vertex labels.
+    let frame = chart.build_frame();
+    let main = &frame.panes[0].main;
+    let last_connector = main.iter().rposition(
+        |prim| matches!(prim, Prim::Polyline { width, color, .. } if *width == 1.0 && *color == ink()),
+    );
+    let first_box = main
+        .iter()
+        .position(|prim| matches!(prim, Prim::Rect { color, .. } if *color == ink()));
+    let first_vertex_label = main
+        .iter()
+        .position(|prim| matches!(prim, Prim::Text { text, .. } if text == "X"));
+    assert!(last_connector.is_some() && last_connector < first_box);
+    assert!(first_box < first_vertex_label);
+    // The XD connector beyond the zigzag and a ratio box are body targets.
+    let on_xd = (x.0 + (d.0 - x.0) * 0.3, x.1 + (d.1 - x.1) * 0.3);
+    assert_eq!(hit(&chart, on_xd), Some(id));
+    let (_, left, y) = texts(&mut chart)
+        .into_iter()
+        .find(|(text, ..)| text == "0.900")
+        .unwrap();
+    assert_eq!(hit(&chart, (left + 2.0, y)), Some(id));
+
+    assert!(
+        chart.drawing_apply_options(id, r#"{"tool_options":{"pattern":{"show_ratios":false}}}"#)
+    );
+    assert!(!texts_of(&mut chart).iter().any(|run| run == "0.618"));
+    assert!(ink_polylines(&mut chart)
+        .iter()
+        .all(|(_, width, _)| *width == 2.0));
+    assert!(!main_has_rect(&mut chart));
+    assert_eq!(hit(&chart, on_xd), None);
+}
+
+fn main_has_rect(chart: &mut ChartEngine) -> bool {
+    chart.build_frame().panes[0]
+        .main
+        .iter()
+        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == ink()))
+}
+
+/// Connectors stay dashed under a solid drawing style and reach the executors as solid runs.
+#[test]
+fn ratio_connectors_reach_executors_as_solid_dash_runs() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::PatternAbcd,
+        vec![p(6.0, 105.0), p(10.0, 101.0), p(14.0, 103.5), p(18.0, 99.5)],
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let frame = chart.build_frame();
+    assert!(frame.panes[0].main.iter().all(|prim| !matches!(
+        prim,
+        Prim::Polyline { style, .. } if *style != LineStyle::Solid
+    )));
+    let lines = ink_polylines(&mut chart);
+    let (a, c) = (anchor(&chart, id, 0), anchor(&chart, id, 2));
+    let coverage = dashes_on(&lines, a, c) / (c.0 - a.0).hypot(c.1 - a.1);
+    assert!((0.35..=0.65).contains(&coverage), "{coverage}");
+    assert!(
+        lines.iter().filter(|(_, width, _)| *width == 1.0).count() > 4,
+        "the connectors are split into dash runs"
+    );
+}
+
+#[test]
+fn cypher_abcd_and_three_drives_measure_their_conventional_ratios() {
+    let mut chart = chart();
+    add(
+        &mut chart,
+        DrawingKind::PatternCypher,
+        vec![
+            p(6.0, 100.0),
+            p(9.0, 105.0),
+            p(12.0, 102.0),
+            p(15.0, 106.0),
+            p(18.0, 101.284),
+        ],
+        r##"{"color":"#123456"}"##,
+    );
+    let runs = texts_of(&mut chart);
+    for ratio in ["0.600", "1.200", "0.786"] {
+        assert!(runs.iter().any(|run| run == ratio), "{ratio} in {runs:?}");
+    }
+    chart.clear_drawings();
+
+    add(
+        &mut chart,
+        DrawingKind::PatternAbcd,
+        vec![p(6.0, 105.0), p(10.0, 101.0), p(14.0, 103.5), p(18.0, 99.5)],
+        r##"{"color":"#123456"}"##,
+    );
+    let runs = texts_of(&mut chart);
+    // BC/AB = 2.5/4, CD/BC = 4/2.5.
+    for label in ["0.625", "1.600", "A", "B", "C", "D"] {
+        assert!(runs.iter().any(|run| run == label), "{label} in {runs:?}");
+    }
+    chart.clear_drawings();
+
+    // Upstream's six anchors 0, 1, A, 2, B, 3: each retracement against its drive and each
+    // drive against its retracement, drawn across both legs.
+    let drives = add(
+        &mut chart,
+        DrawingKind::PatternThreeDrives,
+        vec![
+            p(4.0, 100.0),
+            p(8.0, 102.0),
+            p(11.0, 101.0),
+            p(15.0, 103.5),
+            p(18.0, 102.5),
+            p(22.0, 105.0),
+        ],
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let runs = texts_of(&mut chart);
+    for label in ["0.500", "2.500", "0.400", "1", "2", "3"] {
+        assert!(runs.iter().any(|run| run == label), "{label} in {runs:?}");
+    }
+    assert_eq!(runs.iter().filter(|run| *run == "2.500").count(), 2);
+    let lines = ink_polylines(&mut chart);
+    for index in 1..=4 {
+        let (from, to) = (
+            anchor(&chart, drives, index - 1),
+            anchor(&chart, drives, index + 1),
+        );
+        assert!(dashed_between(&lines, from, to), "connector {index}");
+    }
+}
+
+/// XABCD and cypher shade X-A-B and B-C-D with `fill_enabled` (upstream's default stays off);
+/// the shading is a body target only while the drawing is selected.
+#[test]
+fn xabcd_and_cypher_shade_their_triangles_with_fill_enabled() {
+    for kind in [DrawingKind::PatternXabcd, DrawingKind::PatternCypher] {
+        let mut chart = chart();
+        let points = vec![
+            p(6.0, 100.0),
+            p(10.0, 105.0),
+            p(14.0, 101.91),
+            p(18.0, 104.0),
+            p(22.0, 100.5),
+        ];
+        let id = add(&mut chart, kind, points, r##"{"color":"#123456"}"##);
+        assert_eq!(ink_fills(&mut chart), 0, "{kind:?}: upstream's default");
+        assert!(chart.drawing_apply_options(id, r#"{"fill_enabled":true}"#));
+        assert_eq!(ink_fills(&mut chart), 2, "{kind:?}");
+        // Inside X-A-B, clear of every stroke and label.
+        let [x, a, b] = [0, 1, 2].map(|index| anchor(&chart, id, index));
+        let inside = ((x.0 + a.0 + b.0) / 3.0, (x.1 + 2.0 * a.1 + b.1) / 4.0 + 6.0);
+        assert_eq!(hit(&chart, inside), None, "{kind:?}: unselected");
+        chart.set_selected_drawing(Some(id));
+        assert_eq!(hit(&chart, inside), Some(id), "{kind:?}: selected");
+    }
+}
+
+/// Every head and shoulders draws its neckline (owner decision P2) from where it meets the
+/// first leg to where it meets the last; `fill_enabled` shades the shoulders and the head.
+#[test]
+fn head_and_shoulders_draws_the_neckline_between_the_outer_legs() {
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::PatternHeadShoulders,
+        points_of(&HEAD_AND_SHOULDERS),
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let lines = ink_polylines(&mut chart);
+    let neckline = lines
+        .iter()
+        .find(|(points, ..)| points.len() == 2)
+        .expect("neckline")
+        .0
+        .clone();
+    let start = px(&chart, 4.0 + 4.0 / 3.0, 102.0);
+    let end = px(&chart, 24.0 + 8.0 / 3.0, 102.0);
+    assert!(close(neckline[0], start, 0.01), "{neckline:?} vs {start:?}");
+    assert!(close(neckline[1], end, 0.01));
+    assert_eq!(ink_fills(&mut chart), 0);
+    // The neckline beyond the neck anchors is a body target.
+    let beyond = ((start.0 + px(&chart, 12.0, 102.0).0) / 2.0, start.1);
+    assert_eq!(hit(&chart, beyond), Some(id));
+    assert!(chart.drawing_apply_options(id, r#"{"fill_enabled":true}"#));
+    assert_eq!(ink_fills(&mut chart), 3, "both shoulders and the head");
+    // The inverse pattern draws its neckline too.
+    let mirrored =
+        HEAD_AND_SHOULDERS.map(|(logical, price)| DrawingAnchor::from(p(logical, 206.0 - price)));
+    assert!(chart.set_drawing_anchors(id, &mirrored).is_ok());
+    let start = px(&chart, 4.0 + 4.0 / 3.0, 104.0);
+    assert!(ink_polylines(&mut chart)
+        .iter()
+        .any(|(points, ..)| points.len() == 2 && close(points[0], start, 0.01)));
+}
+
+/// The triangle pattern's sides reach their apex only with the extend flag of their direction
+/// (owner decision P3); fork documents set both.
+#[test]
+fn triangle_pattern_extends_converging_sides_to_their_apex_when_extended() {
+    let mut chart = chart();
+    let converging = vec![
+        p(5.0, 106.0),
+        p(8.0, 100.0),
+        p(15.0, 104.0),
+        p(18.0, 102.0),
+        p(21.0, 103.0),
+    ];
+    let id = add(
+        &mut chart,
+        DrawingKind::PatternTriangle,
+        converging,
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let apex = px(&chart, 21.5, 102.7);
+    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
+    let to_apex = |chart: &mut ChartEngine, from: (f64, f64)| {
+        ink_polylines(chart)
+            .iter()
+            .any(|(line, ..)| close(line[0], from, 0.01) && close(line[1], apex, 0.01))
+    };
+    let beyond = ((a.0 + 9.0 * apex.0) / 10.0, (a.1 + 9.0 * apex.1) / 10.0);
+    // Upstream's default: the zigzag alone.
+    assert_eq!(ink_polylines(&mut chart).len(), 1);
+    assert_eq!(hit(&chart, beyond), None);
+    // A left extension does not reach forward.
+    assert!(chart.drawing_apply_options(id, r#"{"extend_left":true}"#));
+    assert_eq!(ink_polylines(&mut chart).len(), 1);
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"extend_left":false,"extend_right":true,"fill_enabled":true}"#
+    ));
+    assert!(to_apex(&mut chart, a) && to_apex(&mut chart, b));
+    assert_eq!(ink_fills(&mut chart), 1);
+    assert!(beyond.0 > anchor(&chart, id, 3).0);
+    assert_eq!(hit(&chart, beyond), Some(id));
+
+    // Diverging sides stay between their anchors and shade the convex quad.
+    let diverging = [
+        p(5.0, 106.0),
+        p(8.0, 100.0),
+        p(15.0, 107.0),
+        p(18.0, 99.5),
+        p(21.0, 108.0),
+    ]
+    .map(DrawingAnchor::from);
+    assert!(chart.set_drawing_anchors(id, &diverging).is_ok());
+    let (c, d) = (anchor(&chart, id, 2), anchor(&chart, id, 3));
+    let lines = ink_polylines(&mut chart);
+    assert!(lines
+        .iter()
+        .any(|(line, ..)| line.len() == 2 && close(line[0], a, 0.01) && close(line[1], c, 0.01)));
+    assert!(lines
+        .iter()
+        .any(|(line, ..)| line.len() == 2 && close(line[0], b, 0.01) && close(line[1], d, 0.01)));
+    assert_eq!(ink_fills(&mut chart), 1);
+    // Without the flag the fill alone shades the quad.
+    assert!(chart.drawing_apply_options(id, r#"{"extend_right":false}"#));
+    assert_eq!(ink_polylines(&mut chart).len(), 1);
+    assert_eq!(ink_fills(&mut chart), 1);
+}
+
+/// An extended triangle pattern keeps time culling: its logical bounds pad by one pattern
+/// width (the apex's farthest reach), so a triangle left of the pane still paints and hits its
+/// apex region while one far outside the window is no candidate.
+#[test]
+fn triangle_apexes_keep_time_culling_and_their_visible_reach() {
+    let mut chart = chart();
+    crowd(&mut chart);
+    let triangle = add(
+        &mut chart,
+        DrawingKind::PatternTriangle,
+        vec![
+            p(-14.0, 106.0),
+            p(-11.0, 100.0),
+            p(-4.0, 104.0),
+            p(-1.0, 102.0),
+            p(2.0, 103.0),
+        ],
+        r#"{"extend_right":true}"#,
+    );
+    chart.set_visible_logical_range(0.5, 39.0);
+    chart.build_frame();
+    assert!(viewport_candidate(&chart, triangle));
+    let apex = px(&chart, 2.5, 102.7);
+    let a = anchor(&chart, triangle, 0);
+    assert!(a.0 < 0.0 && apex.0 > 0.0);
+    let near_apex = ((a.0 + 9.0 * apex.0) / 10.0, (a.1 + 9.0 * apex.1) / 10.0);
+    assert!(near_apex.0 > 0.0);
+    assert_eq!(hit(&chart, near_apex), Some(triangle));
+    let far = add(
+        &mut chart,
+        DrawingKind::PatternTriangle,
+        vec![
+            p(-214.0, 106.0),
+            p(-211.0, 100.0),
+            p(-204.0, 104.0),
+            p(-201.0, 102.0),
+            p(-198.0, 103.0),
+        ],
+        r#"{"extend_left":true,"extend_right":true}"#,
+    );
+    chart.build_frame();
+    assert!(!viewport_candidate(&chart, far));
+}
+
+/// Vertex labels (upstream's placement, owner decision P1) are body targets, and the culling pad
+/// covers them, so indexed hits equal brute force at every label.
+#[test]
+fn vertex_labels_are_body_targets_on_the_culled_path() {
+    let mut chart = chart();
+    crowd(&mut chart);
+    let head = add(
+        &mut chart,
+        DrawingKind::PatternHeadShoulders,
+        points_of(&HEAD_AND_SHOULDERS),
+        "{}",
+    );
+    chart.build_frame();
+    let head_x = anchor(&chart, head, 3).0;
+    let label_y = text_y(&mut chart, "H");
+    assert!(label_y < anchor(&chart, head, 3).1);
+    assert_eq!(hit(&chart, (head_x, label_y)), Some(head));
+    assert_eq!(hit(&chart, (head_x, label_y - 20.0)), None);
+    chart.clear_drawings();
+    crowd(&mut chart);
+    for kind in &KINDS[..11] {
+        let id = add(&mut chart, *kind, zigzag_points(*kind), "{}");
+        chart.build_frame();
+        let points = zigzag_points(*kind);
+        for (index, point) in points.iter().enumerate() {
+            let (x, y) = px(&chart, point.logical, point.price);
+            let Some((_, _, label_y)) = texts(&mut chart)
+                .into_iter()
+                .find(|(_, tx, ty)| (tx - x).abs() < 0.5 && *ty < y && y - ty < 30.0)
+            else {
+                assert!(kind.is_elliott() && index == 0, "{kind:?} label {index}");
+                continue;
+            };
+            assert_eq!(
+                hit(&chart, (x, label_y)),
+                Some(id),
+                "{kind:?} label {index}"
+            );
+        }
+        assert!(chart.remove_drawing(id));
+    }
+}
+
+/// A ratio label of any width keeps its drawing a candidate past the anchors' box.
+#[test]
+fn wide_ratio_labels_keep_their_drawing_visible_past_the_anchors() {
+    let mut chart = chart();
+    crowd(&mut chart);
+    // A near-flat AB leg makes BC/AB a ten-digit ratio. Its A-C connector is vertical on the
+    // anchors' left edge, so half of that label reaches left of every anchor.
+    let id = add(
+        &mut chart,
+        DrawingKind::PatternAbcd,
+        vec![
+            p(20.0, 100.0),
+            p(24.0, 100.0 + 1e-9),
+            p(20.0, 104.0),
+            p(24.0, 101.0),
+        ],
+        r##"{"color":"#123456"}"##,
+    );
+    // The anchors sit past the right edge; only the label reaches into the pane.
+    chart.set_visible_logical_range(-21.5, 17.5);
+    chart.build_frame();
+    let a = anchor(&chart, id, 0);
+    assert!(a.0 > chart.pane_w + 30.0, "{a:?}");
+    let (text, left, y) = texts(&mut chart)
+        .into_iter()
+        .find(|(text, ..)| text.parse::<f64>().is_ok_and(|value| value > 1e9))
+        .expect("the ten-digit ratio is painted");
+    assert!(left < chart.pane_w - 5.0, "{text} starts inside the pane");
+    assert!(viewport_candidate(&chart, id));
+    assert_eq!(hit(&chart, (chart.pane_w - 3.0, y)), Some(id));
+}
+
+/// Elliott waves label in the notation of their `wave_degree` without the start label (owner
+/// decision P4), ring the ringed degrees, and `show_wave: false` keeps only the labels, which
+/// stay body targets.
+#[test]
+fn elliott_waves_label_each_wave_in_its_degree() {
+    let mut chart = chart();
+    crowd(&mut chart);
+    let id = add(
+        &mut chart,
+        DrawingKind::ElliottImpulse,
+        vec![
+            p(5.0, 100.0),
+            p(9.0, 103.0),
+            p(12.0, 101.5),
+            p(18.0, 106.0),
+            p(21.0, 104.0),
+            p(26.0, 105.5),
+        ],
+        r##"{"color":"#123456","width":2}"##,
+    );
+    let wave_texts = texts_of;
+    assert_eq!(wave_texts(&mut chart), ["1", "2", "3", "4", "5"]);
+    assert_eq!(ink_polylines(&mut chart).len(), 1);
+    assert!(chart.drawing_apply_options(id, r#"{"wave_degree":"intermediate"}"#));
+    assert_eq!(wave_texts(&mut chart), ["(1)", "(2)", "(3)", "(4)", "(5)"]);
+
+    // Ringed degrees add a 1 px ring around each label, clear of its vertex.
+    assert!(chart.drawing_apply_options(id, r#"{"wave_degree":"primary"}"#));
+    assert_eq!(wave_texts(&mut chart), ["1", "2", "3", "4", "5"]);
+    let rings = ink_polylines(&mut chart)
+        .into_iter()
+        .filter(|(points, width, _)| *width == 1.0 && points.len() > 8)
+        .collect::<Vec<_>>();
+    assert_eq!(rings.len(), 5);
+    let (_, x, y) = texts(&mut chart).remove(0);
+    let ring = &rings[0].0;
+    let center = (
+        ring.iter().map(|point| point.0).sum::<f64>() / ring.len() as f64,
+        ring.iter().map(|point| point.1).sum::<f64>() / ring.len() as f64,
+    );
+    assert!(close(center, (x, y), 1.0), "the ring wraps the label");
+    let lowest = ring.iter().map(|point| point.1).fold(f64::MIN, f64::max);
+    assert!(
+        lowest < anchor(&chart, id, 1).1,
+        "the ring clears its vertex"
+    );
+    // Inside the ring, off the glyphs (a one-digit run is narrower than the ring), hits.
+    let radius = ring
+        .iter()
+        .map(|point| (point.0 - center.0).hypot(point.1 - center.1))
+        .fold(0.0_f64, f64::max);
+    let inside = (x + 0.8 * radius, y);
+    assert!(
+        !chart.text_run_hit(
+            chart.drawing(id).unwrap(),
+            "1",
+            (x, y),
+            aeris_charts_render::draw_list::TextAlign::Center,
+            chart.drawing_text_size(chart.drawing(id).unwrap()),
+            inside,
+        ),
+        "the probe is off the glyph run"
+    );
+    assert_eq!(hit(&chart, inside), Some(id));
+
+    // Without the wave only the labels paint, and they remain body targets.
+    assert!(chart.drawing_apply_options(
+        id,
+        r#"{"wave_degree":"minor","tool_options":{"pattern":{"show_wave":false}}}"#
+    ));
+    assert!(ink_polylines(&mut chart).is_empty());
+    let (_, x, y) = texts(&mut chart).remove(0);
+    assert_eq!(hit(&chart, (x, y)), Some(id));
+    let (w1, w2) = (anchor(&chart, id, 2), anchor(&chart, id, 3));
+    assert_eq!(
+        hit(&chart, ((w1.0 + w2.0) / 2.0, (w1.1 + w2.1) / 2.0)),
+        None
+    );
+    assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"pattern":{"show_wave":true}}}"#));
+    assert_eq!(
+        hit(&chart, ((w1.0 + w2.0) / 2.0, (w1.1 + w2.1) / 2.0)),
+        Some(id)
+    );
+
+    // The other waves use their letters, capital on the minor degree.
+    let letters = [
+        (DrawingKind::ElliottCorrection, vec!["A", "B", "C"]),
+        (DrawingKind::ElliottTriangle, vec!["A", "B", "C", "D", "E"]),
+        (DrawingKind::ElliottDoubleCombination, vec!["W", "X", "Y"]),
+        (
+            DrawingKind::ElliottTripleCombination,
+            vec!["W", "X", "Y", "X", "Z"],
+        ),
+    ];
+    for (kind, expected) in letters {
+        chart.clear_drawings();
+        add(&mut chart, kind, zigzag_points(kind), "{}");
+        assert_eq!(texts_of(&mut chart), expected, "{kind:?}");
+        // Lower-case letters in parentheses on the minuette degree.
+        add(
+            &mut chart,
+            kind,
+            zigzag_points(kind),
+            r#"{"wave_degree":"minuette"}"#,
+        );
+        let minuette = expected
+            .iter()
+            .map(|letter| format!("({})", letter.to_lowercase()));
+        assert_eq!(
+            texts_of(&mut chart),
+            expected
+                .iter()
+                .map(|letter| letter.to_string())
+                .chain(minuette)
+                .collect::<Vec<_>>(),
+            "{kind:?}"
+        );
+    }
+}
+
+/// A degree ring hits up to the stroke tolerance past its edge, and the culling pad covers that
+/// band, so indexed hits equal brute force above the highest ring on either hit profile.
+#[test]
+fn ring_tolerance_band_stays_on_the_culled_path() {
+    let mut chart = chart();
+    crowd(&mut chart);
+    let id = add(
+        &mut chart,
+        DrawingKind::ElliottImpulse,
+        vec![
+            p(5.0, 100.0),
+            p(9.0, 103.0),
+            p(12.0, 101.5),
+            p(18.0, 106.0),
+            p(21.0, 104.0),
+            p(26.0, 105.5),
+        ],
+        r##"{"color":"#123456","wave_degree":"primary"}"##,
+    );
+    chart.build_frame();
+    // Wave 3 tops the impulse; its ring is the highest paint.
+    let top = anchor(&chart, id, 3);
+    let (_, x, y) = texts(&mut chart)
+        .into_iter()
+        .find(|(text, tx, _)| text == "3" && (tx - top.0).abs() < 0.5)
+        .expect("wave 3 label");
+    let ring = ink_polylines(&mut chart)
+        .into_iter()
+        .map(|(points, ..)| points)
+        .find(|points| points.len() > 8 && close(points[0], (x, y), 20.0))
+        .expect("wave 3 ring");
+    let radius = ring
+        .iter()
+        .map(|point| (point.0 - x).hypot(point.1 - y))
+        .fold(0.0_f64, f64::max);
+    for profile in [HitProfile::PRECISION, HitProfile::TOUCH] {
+        let tolerance = profile.drawing_stroke_tolerance;
+        let probe = |point: (f64, f64)| {
+            let indexed = chart.hit_test_drawing_impl(point.0, point.1, true, profile);
+            assert_eq!(
+                indexed,
+                chart.hit_test_drawing_impl(point.0, point.1, false, profile),
+                "{point:?} {profile:?}"
+            );
+            indexed.map(|hit| hit.id)
+        };
+        assert_eq!(probe((x, y - radius - tolerance + 0.5)), Some(id));
+        let mut dy = 0.0;
+        while dy <= tolerance + 2.0 {
+            let mut dx = -radius;
+            while dx <= radius {
+                probe((x + dx, y - radius - dy));
+                dx += 1.0;
+            }
+            dy += 0.5;
+        }
+    }
+}
+
+/// While a pattern is placed it previews as the drawing it will commit (owner decision P5):
+/// legs, labels, ratios and fills from the placed anchors and the pointer.
+#[test]
+fn placement_previews_the_legs_labels_ratios_and_fills_placed_so_far() {
+    let mut chart = chart();
+    assert!(chart.set_drawing_tool(
+        Some(DrawingKind::PatternXabcd),
+        Some(r##"{"color":"#123456","fill_enabled":true}"##),
+        None
+    ));
+    let (x, a) = (px(&chart, 6.0, 101.0), px(&chart, 10.0, 105.0));
+    let b = px(&chart, 14.0, 102.0);
+    chart.drawing_tool_activate(x.0, x.1, DrawingModifiers::default());
+    chart.drawing_tool_pointer_move(a.0, a.1, DrawingModifiers::default(), false);
+    let legs = ink_polylines(&mut chart);
+    assert_eq!(legs.len(), 1, "X to the pointer after one click");
+    assert!(close(legs[0].0[0], x, 0.01) && close(legs[0].0[1], a, 0.01));
+    chart.drawing_tool_activate(a.0, a.1, DrawingModifiers::default());
+    chart.drawing_tool_pointer_move(b.0, b.1, DrawingModifiers::default(), false);
+    let zigzag = ink_polylines(&mut chart)
+        .into_iter()
+        .find(|(points, ..)| points.len() == 3)
+        .expect("X-A-B preview");
+    assert!(close(zigzag.0[2], b, 0.01));
+    let runs = texts_of(&mut chart);
+    // AB/XA = 3/4.
+    for label in ["X", "A", "B", "0.750"] {
+        assert!(runs.iter().any(|run| run == label), "{label} in {runs:?}");
+    }
+    assert_eq!(ink_fills(&mut chart), 1, "the XAB triangle shades");
+    assert!(
+        chart.drawings().is_empty(),
+        "nothing commits before five anchors"
+    );
+
+    // Every kind previews every prefix with finite geometry.
+    for kind in KINDS {
+        assert!(chart.set_drawing_tool(Some(kind), None, None));
+        for index in 0..kind.anchor_count().saturating_sub(1) {
+            let (x, y) = (
+                150.0 + index as f64 * 60.0,
+                280.0 - (index % 2) as f64 * 100.0,
+            );
+            chart.drawing_tool_activate(x, y, DrawingModifiers::default());
+            chart.drawing_tool_pointer_move(x + 30.0, y - 40.0, DrawingModifiers::default(), false);
+            let frame = chart.build_frame();
+            assert!(frame.panes[0]
+                .points
+                .iter()
+                .all(|point| point[0].is_finite() && point[1].is_finite()));
+        }
+        chart.set_drawing_tool(None, None, None);
+    }
+}
+
+/// The schema lists the rendered pattern options: `show_ratios` on the harmonic patterns and
+/// `show_wave` on the Elliott waves, both on by default.
+#[test]
+fn schema_lists_the_rendered_pattern_options() {
+    for kind in &KINDS[..11] {
+        let schema = crate::drawing_property_schema(*kind);
+        let row = |name: &str| {
+            schema
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .map(|property| property.default.clone())
+        };
+        let harmonic = matches!(
+            kind,
+            DrawingKind::PatternXabcd
+                | DrawingKind::PatternCypher
+                | DrawingKind::PatternAbcd
+                | DrawingKind::PatternThreeDrives
+        );
+        assert_eq!(
+            row("tool_options.pattern.show_ratios"),
+            harmonic.then_some(serde_json::Value::Bool(true)),
+            "{kind:?}"
+        );
+        assert_eq!(
+            row("tool_options.pattern.show_wave"),
+            kind.is_elliott().then_some(serde_json::Value::Bool(true)),
+            "{kind:?}"
+        );
+    }
+    // The options persist.
+    let mut chart = chart();
+    let id = add(
+        &mut chart,
+        DrawingKind::ElliottImpulse,
+        zigzag_points(DrawingKind::ElliottImpulse),
+        r#"{"tool_options":{"pattern":{"show_wave":false}}}"#,
+    );
+    let saved = chart.export_state_json().unwrap();
+    let mut restored = chart_with(&hourly(40), 1.0);
+    restored.import_state_json(&saved).unwrap();
+    assert!(
+        !restored
+            .drawing(id)
+            .unwrap()
+            .tool_options
+            .pattern
+            .unwrap()
+            .show_wave
+    );
+    assert!(!super::draws_wave(restored.drawing(id).unwrap()));
+}
+
+/// Documents the fork wrote regain its pattern look: shaded harmonic triangles, the neckline
+/// with shaded shoulders, the triangle's sides to the apex, and intermediate Elliott labels.
+#[test]
+fn fork_documents_regain_the_fork_pattern_look() {
+    let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+    let drawing = |id: u32, kind: &str, anchors: &[(f64, f64)]| {
+        serde_json::json!({
+            "id": id,
+            "kind": kind,
+            "pane_id": "pane-1",
+            "anchors": anchors.iter().map(|&(l, p)| at(l, p)).collect::<Vec<_>>(),
+        })
+    };
+    let document = serde_json::json!({
+        "schema": "aeris_charts-state",
+        "schema_version": 1,
+        "panes": [{"id": "pane-1"}],
+        "drawings": [
+            drawing(1, "triangle_pattern", &[(5.0, 106.0), (8.0, 100.0), (15.0, 104.0), (18.0, 102.0)]),
+            drawing(2, "head_and_shoulders", &HEAD_AND_SHOULDERS),
+            drawing(3, "xabcd_pattern", &[(6.0, 100.0), (10.0, 105.0), (14.0, 101.91), (18.0, 104.0), (22.0, 100.5)]),
+            drawing(4, "elliott_impulse_wave", &[(5.0, 100.0), (9.0, 103.0), (12.0, 101.5), (18.0, 106.0), (21.0, 104.0), (26.0, 105.5)]),
+        ]
+    })
+    .to_string();
+    let fills = |chart: &mut ChartEngine, color: &str| {
+        let ink = Color::parse_css(color).unwrap();
+        let wash = Color::rgba(ink.r(), ink.g(), ink.b(), super::FILL_ALPHA);
+        let frame = chart.build_frame();
+        frame.panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::BandFill { fill, .. } if *fill == wash))
+            .count()
+    };
+    let only = |chart: &mut ChartEngine, keep: u32| {
+        for id in 1..=4 {
+            chart.set_drawing_visibility(id, id == keep);
+        }
+    };
+    let mut chart = chart();
+    chart.import_state_json(&document).unwrap();
+    chart.build_frame();
+    let triangle = chart.drawing(1).unwrap();
+    assert!(triangle.extend_left && triangle.extend_right && triangle.fill_enabled);
+    only(&mut chart, 1);
+    let apex = px(&chart, 21.5, 102.7);
+    let frame = chart.build_frame();
+    let purple = Color::parse_css("#673AB7").unwrap();
+    let pane = &frame.panes[0];
+    let reaches_apex = pane.main.iter().any(|prim| match prim {
+        Prim::Polyline {
+            first_point,
+            point_count: 2,
+            color,
+            ..
+        } if *color == purple => {
+            let end = pane.points[*first_point as usize + 1];
+            close((f64::from(end[0]), f64::from(end[1])), apex, 0.01)
+        }
+        _ => false,
+    });
+    assert!(reaches_apex);
+    assert_eq!(fills(&mut chart, "#673AB7"), 1);
+    only(&mut chart, 2);
+    assert_eq!(fills(&mut chart, "#089981"), 3);
+    only(&mut chart, 3);
+    assert_eq!(fills(&mut chart, "#2962FF"), 2);
+    assert!(texts_of(&mut chart).contains(&"0.618".to_string()));
+    only(&mut chart, 4);
+    assert_eq!(texts_of(&mut chart), ["(1)", "(2)", "(3)", "(4)", "(5)"]);
+}
+
+/// Pattern decorations scale with the device pixel ratio: 1 CSS px connectors and rings, ratio
+/// boxes and glyphs at the ratio's size.
+#[test]
+fn pattern_decorations_scale_with_the_device_pixel_ratio() {
+    for dpr in [1.0, 2.0] {
+        let mut chart = chart_with(&hourly(40), dpr);
+        add(
+            &mut chart,
+            DrawingKind::PatternAbcd,
+            vec![p(6.0, 105.0), p(10.0, 101.0), p(14.0, 103.5), p(18.0, 99.5)],
+            r##"{"color":"#123456","width":2}"##,
+        );
+        add(
+            &mut chart,
+            DrawingKind::ElliottCorrection,
+            zigzag_points(DrawingKind::ElliottCorrection),
+            r##"{"color":"#123456","width":2,"wave_degree":"minute"}"##,
+        );
+        let frame = chart.build_frame();
+        let main = &frame.panes[0].main;
+        let thin = main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::Polyline { width, color, .. } if f64::from(*width) == dpr && *color == ink()))
+            .count();
+        assert!(thin > 3 + 3, "connector dashes and three rings at {dpr}");
+        let ratio = main
+            .iter()
+            .find_map(|prim| match prim {
+                Prim::Text { text, size, .. } if text == "0.625" => Some(f64::from(*size)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(ratio, 12.0 * dpr);
+        assert!(main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "a")));
     }
 }

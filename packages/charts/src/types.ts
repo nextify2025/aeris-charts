@@ -2638,6 +2638,40 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * clicking an empty pane starts a transient date-and-price range (the quick measure; it is never
  * a drawing, history entry, or persisted object).
  *
+ * A `ray` always reaches past its second anchor to the pane edge, and `extend_left` also runs it
+ * back through its first anchor (`extend_right: false` does not make a segment of it; the
+ * `extended_line` always reaches both edges). `trend_line`, `info_line`, `trend_angle`, and
+ * `arrow_line` extend by `extend_left`/`extend_right`; a vertical `info_line`, `trend_angle`, or
+ * `arrow_line` reaches the pane's top or bottom edge on the ends those flags select, and one whose
+ * two anchors coincide stays at its anchor. The `fibonacci_retracement`, `fibonacci_extension`,
+ * and `fibonacci_channel` levels run to the pane's left and right edges by the same flags (the
+ * channel's along their slope).
+ *
+ * The patterns and Elliott waves are a polyline through their anchors with a label above each
+ * vertex; labels are body targets, and the tools preview as the drawing they commit from the
+ * second click on. The harmonic patterns (`pattern_xabcd`, `pattern_cypher`, `pattern_abcd`,
+ * `pattern_three_drives`) add dashed ratio connectors with boxed price ratios
+ * (`tool_options.pattern.show_ratios`, on by default); `pattern_xabcd` and `pattern_cypher` shade
+ * their X-A-B and B-C-D triangles with `fill_enabled`; `pattern_head_shoulders` always draws its
+ * neckline through the two neck anchors and shades the shoulders and head with `fill_enabled`;
+ * `pattern_triangle` draws its A-C and B-D sides, on to their apex when it lies ahead within one
+ * pattern width, while the extend flag of that direction is set (`extend_right` when the
+ * pattern runs right, `extend_left` when it runs left), shading the area between them with
+ * `fill_enabled`. Elliott waves label their waves in the notation of their `wave_degree` and
+ * leave the start unlabeled; `tool_options.pattern.show_wave: false` keeps only the labels.
+ *
+ * Shapes: an `ellipse` edits with the rectangle's eight bounds handles and Shift makes it a
+ * circle. A `rotated_rectangle` (an edge, then a point setting its depth) shows its third handle
+ * on the far side's midpoint and a width handle on the near side's; dragging an edge corner keeps
+ * the on-screen width. `arc` is placed by its start, its end, then a point it passes through
+ * (stored as start, through point, end); `curve` by its start, its end, then its point at t = 1/2,
+ * and `double_curve` by its start, its end, then its points at t = 1/3 and 2/3 (both stored as
+ * Bézier start, control points, end, with their handles on the curve). An arc, curve, or double
+ * curve fills the region between it and its chord while `fill_enabled` and caps its ends by
+ * `stroke_start`/`stroke_end`; a curve continues its end tangents to the pane edge by
+ * `extend_left`/`extend_right` (an extended end carries no cap). A `polyline` closes by
+ * `tool_options.shape.closed` ({@link shape_tool_options}).
+ *
  * Own-line kinds (not in the AerisTerminal upstream catalog): `horizontal_segment` keeps both
  * anchors on one price, and `vertical_ray` and `vertical_segment` keep both on one bar (the
  * shared coordinate follows the anchor placed or dragged last; the vertical ray defaults to
@@ -2981,7 +3015,13 @@ export type drawing_label_metric = "price" | "price_change" | "percent_change" |
 export type drawing_label_position = "above" | "on" | "below" | "inside" | "outside";
 export interface drawing_label_options { metric: drawing_label_metric; visible: boolean; position: drawing_label_position; text?: string }
 export interface drawing_level { value: number; color: string; visible: boolean; style: string; fill_between: boolean; fill_color?: string; label_visible: boolean }
-/** Elliott wave degree, smallest first; each vertex label reads `<label> (<degree>)`. */
+/**
+ * Elliott wave degree, smallest first. Each labels its waves in its Frost-Prechter notation:
+ * Roman numerals in capitals from `cycle` up and in lower case from `minute` down, Arabic numbers
+ * from `minor` to `primary` (letters in capitals there, lower case elsewhere); each triad cycles
+ * bare, parenthesized, and ringed labels (`minor` "3", `intermediate` "(3)", `primary` a ringed
+ * "3"), and the three millennium degrees wrap upper Roman numerals in `<>`, `[]`, and `{}`.
+ */
 export type drawing_wave_degree = "subminuette" | "minuette" | "minute" | "minor" | "intermediate" | "primary" | "cycle" | "supercycle" | "grand_supercycle" | "submillennium" | "millennium" | "supermillennium";
 export type drawing_property_type = "boolean" | "number" | "integer" | "string" | "color" | "enum" | "points" | "levels" | "interval_set";
 export interface drawing_property_descriptor { name: string; property_type: drawing_property_type; default: unknown; min?: number; max?: number; enum_values: string[] }
@@ -3023,48 +3063,75 @@ export type drawing_stats_position = "start" | "middle" | "end";
 /**
  * Line-family options (`tool_options.line`); absent fields keep their defaults. The own-line
  * line tools (`horizontal_segment`, `vertical_ray`, `vertical_segment`, `price_line`) read them.
- * The line tools of the shared catalog (`info_line` and the others) store them but do not render
- * them.
+ * On the line tools of the shared catalog (`ray`, `extended_line`, `info_line`, `trend_angle`,
+ * `cross_line`, `arrow_line`) the block's presence selects the earlier fork look, layered on the
+ * shared rendering: the visible `labels` as one engine-formatted stats box (hoverable and
+ * selectable) instead of one text per label, the trend angle's dashed horizontal reference, arc,
+ * and screen angle folded into [-90°, 90°], and end caps only on the ends that do not reach the
+ * pane edge, with the stroke trimmed under an arrowhead and the caps as hit targets. Without the
+ * block these tools render as the shared catalog does; `null` removes it, and writing any key
+ * (`{}` included) creates it. New drawings have none. Documents an earlier fork build wrote restore
+ * these six tools with the block (`{"stats_position": "end"}` once exported), as does a fork-era
+ * clipboard or sync `info_line` with that build's five default stats.
  */
 export interface line_tool_options {
-  /** Stats box position along the anchor segment (default `"end"`). */
+  /** Stats box position along the anchor segment (default `"end"` while the block exists). */
   stats_position?: drawing_stats_position;
 }
 /**
  * Channel options (`tool_options.channel`). Absent fields take the tool's own default and `null`
- * resets one field. The own-line `price_channel` reads `middle_line` and `middle_color`. For
- * `regression_trend`, which the shared catalog renders from the flat `regression_deviations` and
- * `regression_source_id`, the deviation fields are input aliases mapped onto
- * `regression_deviations` on patch and restore (never written back), and the other regression
- * fields are stored but not rendered. The shared catalog's other channels store the block
- * without rendering it.
+ * resets one field. Every channel reads `middle_line` and `middle_color`: the own-line
+ * `price_channel`, the shared catalog's `parallel_channel`, `flat_top_channel`,
+ * `flat_bottom_channel` and `disjoint_channel` (a 1 px dashed line joining the midpoints of the two
+ * lines' ends, paired by side: halfway between the lines wherever their ends share bars), and
+ * `regression_trend` (its centre line drawn 1 px dashed in `middle_color` instead of solid).
+ * `regression_trend` also reads the rest: the deviation fields and their switches are per-side
+ * overrides of the flat `regression_deviations` (an absent side follows it; patching one never
+ * changes the flat value, and changing the flat value keeps an overridden side), `source` picks the
+ * bar value it fits, and `show_pearsons` labels its correlation. Every default is the shared
+ * catalog's look; documents an earlier fork build wrote restore its parallel channels with
+ * `middle_line: true` and its regression trends with `middle_line` and `show_pearsons` on, and
+ * keep their asymmetric or one-sided deviations (their `regression_deviations` takes the wider
+ * enabled side, for readers of the flat field).
  */
 export interface channel_tool_options {
-  /** Dashed middle line (`price_channel`; default off). Stored but not rendered for the shared catalog's channels. */
+  /** Dashed middle line (every channel; on `regression_trend`, its dashed centre line). Default off. */
   middle_line?: boolean | null;
   /** Middle-line CSS color; `""` follows the stroke color (default). */
   middle_color?: string | null;
-  /** @deprecated Input alias of `regression_deviations` (upper line offset in residual standard deviations). */
+  /** Upper line offset in population residual standard deviations (`regression_trend`, signed, -100 to 100); absent follows `regression_deviations`. */
   upper_deviation?: number | null;
-  /** @deprecated Input alias of `regression_deviations` (lower line offset in residual standard deviations). */
+  /** Lower line offset in population residual standard deviations (`regression_trend`, signed, negative below the fit); absent follows `-regression_deviations`. When both sides lie on one side of the fit, the zone runs from the fit to the farther one. */
   lower_deviation?: number | null;
-  /** Paint the upper deviation line and its zone. Stored but not rendered. */
+  /** Paint the upper deviation line and its zone (`regression_trend`; default true). */
   use_upper_deviation?: boolean | null;
-  /** Paint the lower deviation line and its zone. Stored but not rendered. */
+  /** Paint the lower deviation line and its zone (`regression_trend`; default true). */
   use_lower_deviation?: boolean | null;
-  /** Bar value the regression fits. Stored but not rendered (the regression fits closes). */
+  /** Bar value the regression fits (`regression_trend`; default `"close"`). */
   source?: indicator_input_source | null;
-  /** Paint Pearson's R below the regression's start. Stored but not rendered. */
+  /** Paint Pearson's R below the regression's start (`regression_trend`; default off). Not a hit target. */
   show_pearsons?: boolean | null;
 }
 /**
- * Legacy Fibonacci options (`tool_options.fibonacci`). The shared catalog renders the Fibonacci
- * tools from the flat `levels` and `level_*` options: the deprecated fields are input aliases
- * mapped onto those flat fields on patch and restore and never written back, and the other
- * fields are stored but not rendered.
+ * Fibonacci options (`tool_options.fibonacci`). The shared catalog renders the Fibonacci tools
+ * from the flat `levels` and `level_*` options: the deprecated fields are input aliases mapped
+ * onto those flat fields on patch and restore and never written back; the other fields are
+ * rendered on top of that. Their defaults are the shared catalog's look; documents an earlier
+ * fork build wrote restore with that build's unstored defaults written out (`trend_line` on the
+ * retracement, extension, time zones, trend time, speed arcs, circles, and spiral, `grid` on the
+ * speed fan, `label_v_align` `"middle"` on the price tools and `"bottom"` on the time tools, and
+ * the block itself on the wedge). A stored block (with any key; an empty patch block is dropped)
+ * also tessellates the rings of `fibonacci_speed_arcs`, `fibonacci_circles`, and
+ * `fibonacci_wedge` within a quarter pixel over the part the pane shows. Level labels on every
+ * Fibonacci tool, and its filled bands while it is selected, are drag surfaces like its lines.
+ * A `fibonacci_spiral` with an empty `levels` list paints the golden spiral (growing by φ every
+ * quarter turn) through its second anchor instead of the level spirals.
  */
 export interface fibonacci_tool_options {
-  /** @deprecated Input alias of `level_reverse`. */
+  /**
+   * @deprecated Input alias of `level_reverse`. On `fibonacci_spiral` it is stored and turns the
+   * golden spiral (an empty spiral's) counterclockwise.
+   */
   reverse?: boolean;
   /** @deprecated Input alias of `level_show_values`. */
   show_levels?: boolean;
@@ -3074,44 +3141,80 @@ export interface fibonacci_tool_options {
   levels_as_percent?: boolean;
   /** @deprecated Input alias of `level_log_scale`. */
   log_scale?: boolean;
-  /** Dashed trend line through the anchors. Stored but not rendered. */
+  /**
+   * Trend line through the anchors in the drawing's own stroke (default off): both legs on the
+   * extension and trend time, the level-1 diameter through both anchors on the circles, a
+   * 1 CSS px dashed line on the spiral. A drag surface. Retracement, extension, time zones,
+   * trend time, speed arcs, circles, spiral.
+   */
   trend_line?: boolean;
-  /** Speed resistance fan grid. Stored but not rendered. */
+  /**
+   * Speed resistance fan grid (default off): each visible level's horizontal and vertical line
+   * at that level's ratio of the anchors' box (past it for levels outside 0..1) in the drawing's
+   * stroke. A drag surface.
+   */
   grid?: boolean;
-  /** Speed resistance arcs as full circles. Stored but not rendered. */
+  /** Speed resistance arcs as full circles around the second anchor (default off). */
   full_circles?: boolean;
-  /** @deprecated Input alias of `level_label_align`. */
+  /**
+   * @deprecated Input alias of `level_label_align`. On `fibonacci_time_zones` and
+   * `fibonacci_trend_time`, `"left"` and `"right"` map to the other side: this option names the
+   * side of the line the label sits on, `level_label_align` the edge of the text anchored at the
+   * line (`"left"` puts the label right of the line).
+   */
   label_h_align?: drawing_text_h_align;
-  /** Vertical level label placement. Stored but not rendered. */
+  /**
+   * Vertical level label placement (retracement, extension, channel, time zones, trend time;
+   * unset is `"top"`): price labels above their line, centered on it beside the line's end that
+   * `level_label_align` names (inside at an end extended to the pane edge; `"center"` on the
+   * line's midpoint), or below it; time labels at the pane's top, middle, or bottom.
+   */
   label_v_align?: drawing_text_v_align;
 }
 /**
- * Legacy Gann options (`tool_options.gann`). The shared catalog renders the pitchforks and the
- * Gann tools from the flat `levels`, `gann_fans`, `gann_arcs`, and `level_*` options: the
- * deprecated fields are input aliases mapped onto those flat fields on patch and restore and
- * never written back, and the other fields are stored but not rendered.
+ * Gann options (`tool_options.gann`). The shared catalog renders the pitchforks and the Gann
+ * tools from the flat `levels`, `gann_fans`, `gann_arcs`, and `level_*` options, and reads the
+ * fields below on top of them: the deprecated fields are input aliases mapped onto those flat
+ * fields on patch and restore and never written back. Every default keeps the shared catalog's
+ * look; documents an earlier fork build wrote restore a Gann box with that build's seven
+ * `time_levels` and the squares with `show_stats: true`.
  */
 export interface gann_tool_options {
-  /** Gann box vertical levels as fractions of the box width. Stored but not rendered. */
+  /**
+   * Gann box vertical (time) levels as fractions of the box width from the pivot corner,
+   * labelled above the box. Non-empty, the box's `levels` draw horizontally only and the zones
+   * fill as overlapping per-axis bands (price bands across the width, time bands across the
+   * height); empty (the default) the vertical lines follow `levels` with diagonal cells.
+   */
   time_levels?: drawing_level[];
-  /** @deprecated Input alias of `gann_fans` (angle lines as multiples of the 1×1 slope). */
+  /**
+   * Gann box: angle lines from the pivot corner (multiples of the 1×1 slope, the box diagonal),
+   * painted while `show_angles` is on, unfilled. Gann squares: deprecated input alias of
+   * `gann_fans`.
+   */
   angles?: drawing_level[];
   /** @deprecated Input alias of `gann_arcs` (quarter arcs as fractions of the side). */
   arcs?: drawing_level[];
   /** @deprecated Input alias of `level_reverse`. */
   reverse?: boolean;
-  /** Gann box angle lines from the pivot corner. Stored but not rendered. */
+  /** Gann box: paint `angles` from the pivot corner (default off). */
   show_angles?: boolean;
-  /** Gann square stats box. Stored but not rendered. */
+  /**
+   * Gann square and fixed square: a stats box beside the far corner with the price range, the
+   * bars, and the price per bar (default off; a body hit target).
+   */
   show_stats?: boolean;
   /**
-   * Price units per bar of the 1×1 angle (fan and fixed square). Stored but not rendered;
-   * restoring a legacy one-anchor fixed square reads it to place the second anchor.
+   * Price units per bar of the 1×1 angle (fan and fixed square; positive). The fan's 1×1 runs to
+   * the second anchor's bar at that slope, toward the second anchor's price; the fixed square's
+   * far corner sits at the second anchor's bar, the bars times the ratio from the first anchor's
+   * price. `null` (the default) keeps the anchor slope and the square on screen. Dragging the
+   * fixed square's corner edits it; a price-basis rescale scales it with the anchors.
    */
   scale_ratio?: number | null;
   /**
-   * Fixed square side length in bars, 1..=100000. Stored but not rendered; restoring a legacy
-   * one-anchor fixed square reads it to place the second anchor.
+   * Fixed square side length in bars, 1..=100000. Stored but not rendered (the anchors carry
+   * the size); restoring a legacy one-anchor fixed square reads it to place the second anchor.
    */
   size_bars?: number;
 }
@@ -3137,10 +3240,19 @@ export type drawing_icon =
   | "triangle_up"
   | "triangle_down";
 /**
- * Legacy Projection & Annotations options (`tool_options.projection_annotation`). The shared
- * catalog renders `bars_pattern`, `icon_stamp`, and `note`: the deprecated fields are input
- * aliases mapped onto flat drawing options on patch and restore and never written back, and the
- * other fields are stored but not rendered.
+ * Projection & Annotations options (`tool_options.projection_annotation`). The deprecated fields
+ * are input aliases mapped onto flat drawing options on patch and restore and never written back.
+ * The block's presence (even `{}`) selects the earlier fork build's look of `projection` (a
+ * filled sector and a stats box beside the target), `note` (a pin whose text box shows while the
+ * note is hovered, selected, or edited), `comment` and `price_label` (speech bubbles at the
+ * anchor, the price label's price first), `price_note` (its price and text in one box),
+ * `signpost` (a text plate; placing it opens the editor), the arrow markers (their text past the
+ * tail), and `forecast` (source and target boxes with `Success`/`Failure` on the market colors);
+ * `null` restores the upstream look, which new drawings keep. Placing a note, comment, callout,
+ * signpost, or anchored text with the block starts from that build's text (`"Note"`, ...). A
+ * field is written only when it differs from its default, so a block at its defaults reads back
+ * as `{}`: documents that build wrote (and its clipboard and sync items with its anchor counts)
+ * restore those tools with that empty block.
  */
 export interface projection_annotation_tool_options {
   /** @deprecated Input alias of `bars_pattern_mode` (`"hl_bars"` becomes `"bars"`). */
@@ -3158,35 +3270,47 @@ export interface projection_annotation_tool_options {
   icon?: drawing_icon;
   /** @deprecated Input alias of `icon_size`, 8..96 CSS px (larger legacy values are clamped on restore). */
   icon_size?: number;
-  /** `note`: paint the text box while the note is not focused. Stored but not rendered. */
+  /** `note` with the block: paint its text box also while the note is neither hovered, selected, nor edited. */
   always_show_text?: boolean;
 }
 /** @deprecated The same type as {@link drawing_wave_degree}. */
 export type elliott_wave_degree = drawing_wave_degree;
 /**
- * Legacy pattern and Elliott wave options (`tool_options.pattern`). The shared catalog renders
- * these tools: `degree` is an input alias of the flat `wave_degree` (mapped on patch and restore,
- * never written back), and the other fields are stored but not rendered.
+ * Pattern and Elliott wave options (`tool_options.pattern`), rendered on the shared catalog's
+ * pattern and wave tools; `degree` is an input alias of the flat `wave_degree` (mapped on patch
+ * and restore, never written back).
  */
 export interface pattern_tool_options {
-  /** XABCD, cypher, ABCD, and three drives ratio connectors. Stored but not rendered. */
+  /**
+   * XABCD, cypher, ABCD, and three drives: the dashed ratio connectors and their boxed price
+   * ratios, body targets (default `true`).
+   */
   show_ratios?: boolean;
   /** @deprecated Input alias of `wave_degree`. */
   degree?: elliott_wave_degree;
-  /** Elliott wave polyline visibility. Stored but not rendered. */
+  /** Elliott waves: the wave polyline; `false` keeps only the labels (default `true`). */
   show_wave?: boolean;
 }
-/** Legacy shape options (`tool_options.shape`); the shared catalog stores them but does not render them. */
+/** Shape options (`tool_options.shape`), read by the `polyline`. */
 export interface shape_tool_options {
-  /** Polyline: join the last vertex back to the first. Stored but not rendered. */
+  /**
+   * Polyline: join the last vertex back to the first as one outline (no end caps; they stay
+   * stored for reopening it), filling the enclosed region by the nonzero rule while
+   * `fill_enabled` (outline only past 2,048 vertices). Clicking the first vertex while placing,
+   * once three are placed, sets it and finishes the polyline. Default `false`.
+   */
   closed?: boolean;
 }
 
 /**
  * Fork extension blocks, one optional block per legacy drawing family. Fields that upstream
  * models as flat drawing options are deprecated input aliases (mapped on patch and restore, never
- * written back); the own-line tools still read their own blocks. Patches deep-merge: absent keys
- * keep their values and `null` resets a block to its defaults.
+ * written back); the own-line tools still read their own blocks, the shared catalog's line
+ * tools read `line`, whose presence selects their earlier fork look ({@link line_tool_options}),
+ * its pattern and wave tools read `pattern` ({@link pattern_tool_options}), and its polyline
+ * reads `shape` ({@link shape_tool_options}).
+ * Patches deep-merge: absent keys keep their values and `null` resets a block to its defaults
+ * (on `line`, `null` removes the block).
  */
 export interface drawing_tool_options {
   line?: line_tool_options | null;
@@ -3206,7 +3330,9 @@ export interface drawing_tool_options {
  * stats instead, and the simple tag shows its text as its price-axis tag); `price_label` paints
  * its text inside its own label. A painted label is edited in place: double-click it (or select
  * the drawing and press Enter or F2; a single click on an already selected text annotation also
- * opens it), and tools that start from a default text open the editor when placed. Colors parse
+ * opens it), and tools that start from a default text open the editor when placed. The text
+ * annotations (`note`, `comment`, `callout`, `price_note`, `anchored_text`) stack `\n`-separated
+ * lines into one block; other labels stay on one line. Colors parse
  * per the engine's
  * CSS rules; `""` for optional colors means "follow the default" (the border color at
  * 20% alpha for a rectangle's fill, the chart's `layout.textColor` for labels), and
@@ -3223,7 +3349,10 @@ export interface drawing_options {
    * pane's first ordinary series (custom series and indicator outputs excluded).
    */
   regression_source_id: number | null;
-  /** Residual standard deviations on each side of the Regression Trend center, from 0 to 10. */
+  /**
+   * Residual standard deviations on each side of the Regression Trend center, from 0 to 10; a side
+   * that `tool_options.channel.upper_deviation` / `lower_deviation` overrides keeps its override.
+   */
   regression_deviations: number;
   name: string;
   group_id: string;
@@ -3248,7 +3377,7 @@ export interface drawing_options {
   level_show_values: boolean;
   level_show_percents: boolean;
   level_label_align: "left" | "center" | "right";
-  /** Elliott wave degree used in the vertex labels (default `"minor"`). */
+  /** Elliott wave degree whose notation labels the waves (default `"minor"`). */
   wave_degree: drawing_wave_degree;
   /** Pane-relative screen position for anchored text, 0 to 1. */
   screen_x: number;
@@ -3318,7 +3447,9 @@ export interface drawing_options {
    * Fork extension blocks ({@link drawing_tool_options}); fields upstream models as flat options
    * above are deprecated input aliases, mapped on patch and restore and never written back. The
    * own-line tools read their own blocks (`tool_options.line.stats_position` places the stats box
-   * of the `labels` list on the own-line line tools).
+   * of the `labels` list on the own-line line tools), and `tool_options.line` on the shared
+   * catalog's line tools selects their stats box, trend-angle decorations, and arrowheads
+   * ({@link line_tool_options}).
    */
   tool_options: drawing_tool_options;
 }
@@ -3373,7 +3504,11 @@ export interface persisted_drawing_style_v1 {
   icon_name?: string;
   /** Icon stamp size in CSS px, 8..96. */
   icon_size?: number;
-  /** Frozen OHLC sample for a bars-pattern ghost copy; at most 512 bars. */
+  /**
+   * Frozen OHLC sample for a bars-pattern ghost copy; at most 512 bars, `offset` below 512. A
+   * source range wider than 512 slots merges each `ceil(slots / 512)` slots into one bar at
+   * successive offsets.
+   */
   bars_pattern?: Array<{ offset: number; open: number; high: number; low: number; close: number }>;
   bars_pattern_mirror_x?: boolean;
   bars_pattern_mirror_y?: boolean;

@@ -1,22 +1,35 @@
 //! B8 drawing families. Exactly one renderer owns each catalog kind, chosen by `spec().family`:
 //! upstream's catalog (wire ids `0..=12` and `16..=84`) carries no family and is rendered by the
-//! upstream implementation (`geometry.rs` body resolver, frame arm, hit code); the own-line tools
-//! (`240..=246`) and the three measuring ranges (`13..=15`) carry a family whose module owns their
-//! tool specs, kind defaults, geometry (resolved into shared [`DrawingParts`]), typed options,
-//! schema additions, and tests. The engine reaches a family only through the [`DrawingFamily`]
-//! hook table its specs reference: a closed, compile-time table rather than a plugin registry, so
-//! adding a family never edits the frame lowering, the hit tester, or another family.
+//! upstream implementation (`geometry.rs` body resolver, frame arm, hit code), over which a stored
+//! option may layer shared parts (the frame's `push_parts` and the hit tester's `parts_hit`, which
+//! a family's parts share, with [`upstream_decoration_extent`], [`extend_upstream_schema`] and
+//! [`upstream_derived_handles`] with its drag side [`drag_derived_handle`] dispatching per family);
+//! the own-line tools (`240..=246`) and the three measuring ranges (`13..=15`) carry a family whose
+//! module owns their tool specs, kind defaults, geometry (resolved into shared [`DrawingParts`]),
+//! typed options, schema additions, and tests. The engine reaches a family only through the [`DrawingFamily`] hook table its specs
+//! reference: a closed, compile-time table rather than a plugin registry, so adding a family never
+//! edits the frame lowering, the hit tester, or another family.
 //!
 //! The modules of the retired fork families (Fibonacci, pitchforks and Gann, patterns, shapes)
-//! keep only their public option types and the fork's pre-merge kind defaults, which
-//! [`apply_legacy_fork_defaults`] applies to documents the fork wrote. The recipe (what to add
-//! where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
-//! Shared single-list registries carry one `// B8: <family> — begin/end` block per surviving
-//! family (lines, channels, projection_annotations).
+//! keep their public option types and the fork's pre-merge kind defaults, which
+//! [`apply_legacy_fork_defaults`] applies to documents the fork wrote, together with the fork's
+//! unstored `tool_options` defaults ([`legacy_fork_tool_options`]); the Fibonacci module also
+//! reads its stored options for upstream's level arms, the patterns module resolves the parts it
+//! layers on upstream's polyline arm, and the pitchforks and Gann module owns what upstream's
+//! pitchfork and Gann arms read from `tool_options.gann` and their derived handles, and the
+//! shapes module what upstream's shape arms read from `tool_options.shape` and the caps, the
+//! shapes' derived handles and their through-point placement, and the projection-annotations
+//! module the fork form `tool_options.projection_annotation` selects on upstream's annotation arms
+//! (re-applied features). The recipe
+//! (what to
+//! add where, wire ids, test checklist) lives in `docs/architecture/engine/drawing-families.md`.
+//! Shared single-list registries carry one `// B8: <family> — begin/end` block per family that
+//! takes part (lines, channels, fibonacci, patterns_elliott_cycles, pitchforks_gann,
+//! projection_annotations, shapes).
 
 use aeris_charts_render::shape::Point;
 
-use super::handles::DrawingHandle;
+use super::handles::{DrawingHandle, HandleDrag};
 use super::parts::{DrawingParts, PartContext};
 use super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{ChartEngine, DrawingKind, DrawingKindOptions, DrawingPropertyDescriptor};
@@ -113,6 +126,143 @@ impl DrawingFamily {
     }
 }
 
+/// The CSS-px reach beyond its anchors' box of the parts an upstream-rendered kind (no family)
+/// layers on its upstream arm by a stored option (`push_parts` in the frame, `parts_hit` in hit
+/// testing): the culling pad its family would declare in `decoration_extent`. Must be cheap;
+/// cached like a family's. 0 for a kind that layers none.
+pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
+    let mut extent: f64 = 0.0;
+    // B8: lines — begin
+    extent = extent.max(lines::upstream_decoration_extent(engine, drawing));
+    // B8: lines — end
+    // B8: channels — begin
+    extent = extent.max(channels::upstream_decoration_extent(engine, drawing));
+    // B8: channels — end
+    // B8: fibonacci — begin
+    extent = extent.max(fibonacci::upstream_decoration_extent(engine, drawing));
+    // B8: fibonacci — end
+    // B8: patterns_elliott_cycles — begin
+    extent = extent.max(patterns_elliott_cycles::upstream_decoration_extent(
+        engine, drawing,
+    ));
+    // B8: patterns_elliott_cycles — end
+    // B8: pitchforks_gann — begin
+    extent = extent.max(pitchforks_gann::upstream_decoration_extent(engine, drawing));
+    // B8: pitchforks_gann — end
+    // B8: shapes — begin
+    extent = extent.max(shapes::upstream_decoration_extent(engine, drawing));
+    // B8: shapes — end
+    // B8: projection_annotations — begin
+    extent = extent.max(projection_annotations::upstream_decoration_extent(
+        engine, drawing,
+    ));
+    // B8: projection_annotations — end
+    extent
+}
+
+/// Append the `tool_options.*` descriptors an upstream-rendered kind (no family) reads through
+/// its layered parts, after the common ones (the family path's `extend_schema`; `template` is the
+/// kind's `Drawing::new`).
+pub(crate) fn extend_upstream_schema(
+    kind: DrawingKind,
+    template: &Drawing,
+    properties: &mut Vec<DrawingPropertyDescriptor>,
+) {
+    // B8: lines — begin
+    lines::extend_upstream_schema(kind, template, properties);
+    // B8: lines — end
+    // B8: channels — begin
+    channels::extend_upstream_schema(kind, template, properties);
+    // B8: channels — end
+    // B8: fibonacci — begin
+    fibonacci::extend_upstream_schema(kind, template, properties);
+    // B8: fibonacci — end
+    // B8: patterns_elliott_cycles — begin
+    patterns_elliott_cycles::extend_upstream_schema(kind, template, properties);
+    // B8: patterns_elliott_cycles — end
+    // B8: pitchforks_gann — begin
+    pitchforks_gann::extend_upstream_schema(kind, properties);
+    // B8: pitchforks_gann — end
+    // B8: shapes — begin
+    shapes::extend_upstream_schema(kind, properties);
+    // B8: shapes — end
+}
+
+/// Edit the handles of an upstream-rendered kind (no family) for derived geometry, the upstream
+/// side of a family's `handles` hook: move a handle onto it (a regression trend's on its fitted
+/// line), replace one (a fixed Gann square's corner, a coincident signpost's pole top) or append
+/// one (a pitchfork's base midpoint). `handles.rs` builds the spec's set at the media-px anchors `px` and every reader of
+/// the set (painting, previews, hit testing, keyboard cycling, drag starts) sees the edited set;
+/// [`drag_derived_handle`] resolves a derived `Handle`'s drags. Must be cheap.
+pub(crate) fn upstream_derived_handles(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    px: &[Point],
+    handles: &mut Vec<DrawingHandle>,
+) {
+    // B8: channels — begin
+    channels::regression_fit_handles(engine, drawing, px, handles);
+    // B8: channels — end
+    // B8: pitchforks_gann — begin
+    pitchforks_gann::derived_handles(engine, drawing, px, handles);
+    // B8: pitchforks_gann — end
+    // B8: shapes — begin
+    shapes::derived_handles(drawing, px, handles);
+    // B8: shapes — end
+    // B8: projection_annotations — begin
+    projection_annotations::derived_handles(drawing, px, handles);
+    // B8: projection_annotations — end
+}
+
+/// Resolve one drag sample of a derived `Handle` part of an upstream-rendered kind (the drag side
+/// of [`upstream_derived_handles`]): `points` holds the baseline anchors and receives the dragged
+/// ones; the returned tool options (an edit the drag makes, such as a fixed square's scale ratio)
+/// replace the drawing's, and the drag's history entry and cancellation restore them with the
+/// anchors. `None` rejects the sample: the drag discards `points` and keeps its last valid
+/// sample, as an anchor drag does past the data.
+pub(crate) fn drag_derived_handle(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    sample: &HandleDrag<'_>,
+    points: &mut [crate::DrawingPoint],
+) -> Option<Option<crate::DrawingToolOptions>> {
+    match drawing.kind {
+        // B8: shapes — begin
+        DrawingKind::RotatedRectangle | DrawingKind::Curve | DrawingKind::DoubleCurve => {
+            shapes::drag_handle(engine, drawing, sample, points)
+        }
+        // B8: shapes — end
+        // B8: projection_annotations — begin
+        DrawingKind::Signpost => projection_annotations::drag_handle(sample, points),
+        // B8: projection_annotations — end
+        // B8: pitchforks_gann — begin
+        _ => pitchforks_gann::drag_handle(engine, drawing, sample, points),
+        // B8: pitchforks_gann — end
+    }
+}
+
+/// After one anchor drag sample (pointer or keyboard) moved `points[index]` of an
+/// upstream-rendered kind, re-derive the anchors that keep its derived geometry on screen (the
+/// anchor side of [`upstream_derived_handles`]): `start_points` are the drag baseline's anchors
+/// and `start_px` their media px. A rotated rectangle keeps its width while its edge turns, a
+/// curve keeps its on-curve points while an end moves, a signpost coincident at the baseline
+/// keeps its top on its foot.
+pub(crate) fn follow_anchor_drag(
+    engine: &ChartEngine,
+    drawing: &Drawing,
+    index: usize,
+    start_points: &[crate::DrawingPoint],
+    start_px: &[Point],
+    points: &mut [crate::DrawingPoint],
+) {
+    // B8: shapes — begin
+    shapes::follow_anchor_drag(engine, drawing, index, start_px, points);
+    // B8: shapes — end
+    // B8: projection_annotations — begin
+    projection_annotations::follow_anchor_drag(drawing, index, start_points, points);
+    // B8: projection_annotations — end
+}
+
 /// Replace the common schema defaults with the template drawing's resolved values (a family's
 /// kind defaults, such as a ray's `extend_right`), keeping every other descriptor field.
 pub(crate) fn apply_template_defaults(
@@ -137,8 +287,9 @@ pub(crate) fn apply_template_defaults(
 /// to those defaults, so restore applies this between `Drawing::new` and the document's own style
 /// (see `persistence.rs`). Flat fields the fork did not have (`gann_fans`, `level_*`,
 /// `wave_degree`, icons, bars patterns, regression deviations) keep upstream's defaults; the fork's
-/// `tool_options` defaults reach them through `drawing_contract::take_legacy_flat_options`. A
-/// no-op for core tools, the own-line tools, and the ranges, whose defaults did not change.
+/// `tool_options` defaults reach them through `drawing_contract::take_legacy_flat_options`, and
+/// its option blocks through [`merge_legacy_fork_tool_options`]. A no-op for core tools, the
+/// own-line tools, and the ranges, whose defaults did not change.
 pub(crate) fn apply_legacy_fork_defaults(drawing: &mut Drawing) {
     let kind = drawing.kind;
     if !matches!(kind.spec().wire_id, 16..=84) {
@@ -170,6 +321,49 @@ pub(crate) fn apply_legacy_fork_defaults(drawing: &mut Drawing) {
     projection_annotations::legacy_defaults(drawing);
     patterns_elliott_cycles::legacy_defaults(drawing);
     shapes::legacy_defaults(drawing);
+}
+
+/// The fork's `tool_options` default of a tool of the upstream catalog's B8 range, as the block
+/// name and the keys it fills in, where the fork's default differs from the upstream-neutral
+/// default of the option type: the line tools' stats box (`line`), the channels' middle line and
+/// Pearson's R (`channel`), the Fibonacci trend line, fan grid, and vertical label placement
+/// (`fibonacci`), the Gann box's time levels and the squares' stats box (`gann`), and the
+/// fork-form marker of the annotations (`projection_annotation`). The fork skipped option values
+/// that were unset or at its defaults when writing, so its documents carry none of these;
+/// [`merge_legacy_fork_tool_options`] puts them under what such a document stored. `None` for a
+/// tool without one (the triangle pattern's apex sides are flat fields and come with
+/// [`apply_legacy_fork_defaults`]).
+pub(crate) fn legacy_fork_tool_options(
+    kind: DrawingKind,
+) -> Option<(&'static str, serde_json::Value)> {
+    lines::legacy_tool_options(kind)
+        .or_else(|| channels::legacy_tool_options(kind))
+        .or_else(|| fibonacci::legacy_tool_options(kind))
+        .or_else(|| pitchforks_gann::legacy_tool_options(kind))
+        .or_else(|| projection_annotations::legacy_tool_options(kind))
+}
+
+/// Merge [`legacy_fork_tool_options`] of `kind` under `tool_options` (a `tool_options` object the
+/// fork wrote, or what is left of one after `drawing_contract::take_legacy_flat_options`): a
+/// missing block is added, and a stored block keeps every key it has and gains the missing ones.
+/// A stored `null` or malformed block is left for the caller's validation.
+pub(crate) fn merge_legacy_fork_tool_options(
+    kind: DrawingKind,
+    tool_options: &mut serde_json::Value,
+) {
+    let (Some((name, serde_json::Value::Object(defaults))), Some(stored)) =
+        (legacy_fork_tool_options(kind), tool_options.as_object_mut())
+    else {
+        return;
+    };
+    let block = stored
+        .entry(name)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(block) = block.as_object_mut() {
+        for (key, value) in defaults {
+            block.entry(key).or_insert(value);
+        }
+    }
 }
 
 /// The fork tool's default stroke width (its family spec's `default_width`).
@@ -337,6 +531,31 @@ mod tests {
             assert_eq!(legacy.wave_degree, fresh.wave_degree);
             assert_eq!(legacy.icon_size, fresh.icon_size);
             assert_eq!(legacy.regression_deviations, fresh.regression_deviations);
+            // The fork's unstored option defaults: only for the tools it rendered, each a valid
+            // block that differs from the option type's (upstream-neutral) defaults, merged
+            // under a document's own keys idempotently.
+            let Some((name, block)) = super::legacy_fork_tool_options(spec.kind) else {
+                continue;
+            };
+            assert!((16..=84).contains(&spec.wire_id), "{}", spec.name);
+            let mut merged = serde_json::json!({});
+            super::merge_legacy_fork_tool_options(spec.kind, &mut merged);
+            assert_eq!(merged, serde_json::json!({ name: block }), "{}", spec.name);
+            let mut twice = merged.clone();
+            super::merge_legacy_fork_tool_options(spec.kind, &mut twice);
+            assert_eq!(twice, merged, "{}", spec.name);
+            let options = serde_json::from_value::<crate::DrawingToolOptions>(merged).unwrap();
+            assert!(options.validate(), "{}", spec.name);
+            assert_ne!(
+                options,
+                crate::DrawingToolOptions::default(),
+                "{}",
+                spec.name
+            );
+            // A block the document stored keeps its keys; a reset stays a reset.
+            let mut reset = serde_json::json!({ name: null });
+            super::merge_legacy_fork_tool_options(spec.kind, &mut reset);
+            assert_eq!(reset, serde_json::json!({ name: null }), "{}", spec.name);
         }
     }
 }

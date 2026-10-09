@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use aeris_charts_core::model::data_validation::MAX_SAFE_VALUE;
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, LineType, RasterImage};
+use aeris_charts_render::draw_list::{LineStyle, LineType, RasterImage, TextAlign};
+use aeris_charts_render::shape;
 
 use super::*;
 
@@ -34,10 +35,11 @@ pub(crate) mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{
-    resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, FibonacciGeometry,
-    MeasureAxes, PositionGeometry, PositionZone,
+    closed_outline, curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry,
+    DrawingBodyGeometry, DrawingGeometryOptions, FibonacciArcGeometry, FibonacciGeometry,
+    MeasureAxes, PositionGeometry, PositionZone, TimeLevelGeometry,
 };
-pub(crate) use parts::{cap_radius, DrawingPart, DrawingParts, PartContext};
+pub(crate) use parts::{arrow_cap_triangle, cap_radius, DrawingPart, DrawingParts, PartContext};
 pub(crate) use tools::{
     DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement, DrawingPriceExtent,
     DrawingStraightenMode, DrawingTextLayout, DRAWING_TOOL_SPECS,
@@ -353,17 +355,45 @@ impl DrawingBounds {
             DrawingKind::GannBox | DrawingKind::GannSquare | DrawingKind::GannSquareFixed
         ) && drawing.points.len() == 2
         {
-            for level in drawing.levels.iter().filter(|level| level.visible) {
+            // A fixed square's scale ratio puts its far corner at the ratio point, whose price
+            // may lie past the anchors.
+            let first = drawing.points[0];
+            let second = kinds::pitchforks_gann::ratio_point(drawing).unwrap_or(drawing.points[1]);
+            min_price = min_price.min(second.price);
+            max_price = max_price.max(second.price);
+            // A box with its own time levels splits the axes: its time levels reach along time
+            // only. Its price levels keep their time reach: their labels stay at upstream's
+            // diagonal point, which a level beyond [0, 1] takes past the box.
+            let time_levels = kinds::pitchforks_gann::box_time_levels(drawing);
+            let levels = drawing.levels.iter().map(|level| (level, true)).chain(
+                time_levels
+                    .into_iter()
+                    .flatten()
+                    .map(|level| (level, false)),
+            );
+            for (level, along_price) in levels.filter(|(level, _)| level.visible) {
                 let value = drawing.level_value(level.value);
-                let logical = drawing.points[0].logical
-                    + (drawing.points[1].logical - drawing.points[0].logical) * value;
-                let price = drawing.points[0].price
-                    + (drawing.points[1].price - drawing.points[0].price) * value;
+                let logical = first.logical + (second.logical - first.logical) * value;
+                let price = first.price + (second.price - first.price) * value;
                 if logical.is_finite() && price.is_finite() {
                     min_logical = min_logical.min(logical);
                     max_logical = max_logical.max(logical);
-                    min_price = min_price.min(price);
-                    max_price = max_price.max(price);
+                    if along_price {
+                        min_price = min_price.min(price);
+                        max_price = max_price.max(price);
+                    }
+                }
+            }
+        }
+        if kinds::fibonacci::draws_grid(drawing) && drawing.points.len() == 2 {
+            // The grid's vertical lines sit at each level's ratio of the anchors' time span,
+            // which a level beyond [0, 1] takes past the anchors.
+            let (start, end) = (drawing.points[0].logical, drawing.points[1].logical);
+            for level in drawing.levels.iter().filter(|level| level.visible) {
+                let logical = start + (end - start) * drawing.level_value(level.value);
+                if logical.is_finite() {
+                    min_logical = min_logical.min(logical);
+                    max_logical = max_logical.max(logical);
                 }
             }
         }
@@ -429,6 +459,30 @@ impl DrawingBounds {
             DrawingPriceExtent::Finite if line_extension => (None, None),
             DrawingPriceExtent::Finite => (Some(min_price), Some(max_price)),
         };
+        // A triangle pattern's sides reach their apex at most one pattern width ahead of its
+        // anchors, at any price: pad the logical bounds by the anchors' span instead of giving up
+        // time culling like the generic extension below.
+        if kinds::patterns_elliott_cycles::extends_to_apex(drawing) {
+            let span = (max_logical - min_logical).abs();
+            return Self {
+                logical: LogicalBounds::Finite {
+                    min: min_logical - span,
+                    max: max_logical + span,
+                },
+                min_price: None,
+                max_price: None,
+            };
+        }
+        // A fork-form projection's sector bulges up to its radius past the target's time, which
+        // the anchors cannot bound; its prices stay between the pivot's and the target's (the
+        // arc keeps to one quadrant), and the screen box bounds the rest.
+        if kinds::projection_annotations::draws_sector(drawing) {
+            return Self {
+                logical: LogicalBounds::Full,
+                min_price,
+                max_price,
+            };
+        }
         // An extended body reaches the pane edge in its own direction, which the anchors'
         // box cannot bound; stay conservative instead of culling the visible extension.
         if drawing.extend_left || drawing.extend_right {
@@ -478,6 +532,8 @@ struct DrawingCache {
     text_key: u64,
     text_width: f64,
     text_size: f64,
+    /// Lines of the text block (`Drawing::text_block_lines`), cached with the width.
+    text_lines: usize,
     /// Family decoration reach (CSS px) cached under `decoration_key` (the text key).
     decoration_key: u64,
     decoration: f64,
@@ -497,6 +553,7 @@ impl DrawingCache {
             text_key: u64::MAX,
             text_width: 0.0,
             text_size: 0.0,
+            text_lines: 1,
             decoration_key: u64::MAX,
             decoration: 0.0,
             screen_valid: false,
@@ -880,6 +937,23 @@ pub enum DrawingKind {
 }
 
 impl DrawingKind {
+    /// The ten Fibonacci tools (the fork's Fibonacci family, wire ids `36..=45`).
+    pub(crate) const fn is_fibonacci(self) -> bool {
+        matches!(
+            self,
+            Self::FibonacciRetracement
+                | Self::FibonacciExtension
+                | Self::FibonacciChannel
+                | Self::FibonacciTimeZones
+                | Self::FibonacciTrendTime
+                | Self::FibonacciSpeedFan
+                | Self::FibonacciSpeedArcs
+                | Self::FibonacciCircles
+                | Self::FibonacciSpiral
+                | Self::FibonacciWedge
+        )
+    }
+
     pub(crate) const fn has_levels(self) -> bool {
         matches!(
             self,
@@ -1227,7 +1301,9 @@ pub struct Drawing {
     pub position_risk_percent: f64,
     /// Optional explicit source for regression trend; `None` follows the pane's primary series.
     pub regression_source_id: Option<u32>,
-    /// Number of residual standard deviations on each side of the regression center.
+    /// Number of population residual standard deviations on each side of the regression center,
+    /// except a side that `tool_options.channel.upper_deviation` / `lower_deviation` overrides; an
+    /// override survives a change to this value.
     pub regression_deviations: f64,
     /// Line/border color CSS string (default [`DRAWING_DEFAULT_COLOR`]).
     pub color: String,
@@ -1664,6 +1740,26 @@ impl Drawing {
         self.text.as_str()
     }
 
+    /// Whether the drawing's own text paints as a block that may span lines (owner decisions:
+    /// the multi-line text owner) rather than one run: the text annotations (upstream's text
+    /// block, [`TextBlock`], or their fork-form box), and the fork-form signpost plate, arrow-mark
+    /// text, and price-label bubble (`kinds::projection_annotations::fork_text_box`). Static:
+    /// it never depends on the text or an open editor, so the editor a host opens on it keeps
+    /// its form while the text changes. The plain text tool stays one run (owner decision A11).
+    pub(crate) fn paints_text_block(&self) -> bool {
+        self.kind.is_text_annotation() || kinds::projection_annotations::fork_text_owner(self)
+    }
+
+    /// Lines of upstream's text block ([`TextBlock`]): a text annotation's text split at `\n`
+    /// (one line when empty); every other run is one line.
+    pub(crate) fn text_block_lines(&self) -> usize {
+        if self.kind.is_text_annotation() {
+            self.text.split('\n').count()
+        } else {
+            1
+        }
+    }
+
     /// The glyph size the label actually renders at in CSS px: `text_size` when set, else
     /// [`TEXT_TOOL_DEFAULT_SIZE`] for the text tool and the chart's `layout.font_size` for
     /// every other tool's label. Rendering, hit-testing, and host editing chrome must all
@@ -1826,10 +1922,10 @@ where
 
 /// The part of a drawing a hit/drag landed on: the whole shape (a move drag), one handle of the
 /// drawing's handle mode (a defining anchor, or a rectangle's bounds handle and a Long/Short
-/// Position's control by their handle index), or a derived handle a drawing family would place
-/// on its geometry, numbered in the family's derived-handle order. No family derives one since
-/// the upstream B8 sync (see the `ponytail:` note on the drag code), so `Handle` is never
-/// produced today.
+/// Position's control by their handle index), or a derived handle placed on the drawing's
+/// geometry, numbered in its derived-handle order: a pitchfork's or the pitchfan's base midpoint,
+/// which moves both handle anchors, and a fixed Gann square's painted far corner, which resizes
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawingDragPart {
     Body,
@@ -1895,8 +1991,8 @@ pub(crate) struct DrawingDrag {
     pub(crate) handle_px: (f64, f64),
     /// Original semantic snapshot retained for cancellation and the one committed history entry.
     pub(crate) history_points: Vec<DrawingPoint>,
-    /// Family options at the press: a family drag may edit them, and cancellation and the
-    /// history entry restore them with the anchors.
+    /// Tool options at the press: a derived-handle drag may edit them (a fixed Gann square's
+    /// scale ratio), and cancellation and the history entry restore them with the anchors.
     pub(crate) history_tool_options: crate::DrawingToolOptions,
     /// Anchored text's `(screen_x, screen_y)` at the press, restored with the anchors.
     pub(crate) history_screen_position: (f64, f64),
@@ -2015,6 +2111,81 @@ impl DrawingTextRun {
             ];
         }
         bounds
+    }
+}
+
+/// A text annotation's text as upstream's run stacked into lines (one per `\n`): every line
+/// starts at the left edge the run's alignment gives the widest line, lines advance by the run's
+/// 1.2 em line box, and the block grows away from the reference box (up for `Top`, keeping the
+/// run's bottom; both ways for `Middle`; down for `Bottom`, keeping the run's top). One line is
+/// exactly the run's box, so single-line text paints, hits, and culls as before.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextBlock {
+    /// Left edge of every line.
+    pub(crate) left: f64,
+    /// Vertical center of the first line.
+    pub(crate) first_y: f64,
+    /// The widest line's advance.
+    pub(crate) width: f64,
+    pub(crate) line_height: f64,
+    pub(crate) lines: usize,
+}
+
+impl TextBlock {
+    /// The block of `lines` lines whose widest advance is `width`, where the run of glyph `size`
+    /// would sit at the aligned anchor `(x, y)` (`align` its horizontal edge, `y` its center).
+    pub(crate) fn new(
+        (x, y, align): (f64, f64, DrawingTextHAlign),
+        v_align: DrawingTextVAlign,
+        width: f64,
+        size: f64,
+        lines: usize,
+    ) -> Self {
+        let line_height = size * 1.2;
+        let extra = lines.saturating_sub(1) as f64 * line_height;
+        Self {
+            left: match align {
+                DrawingTextHAlign::Left => x,
+                DrawingTextHAlign::Center => x - width / 2.0,
+                DrawingTextHAlign::Right => x - width,
+            },
+            first_y: match v_align {
+                DrawingTextVAlign::Top => y - extra,
+                DrawingTextVAlign::Middle => y - extra / 2.0,
+                DrawingTextVAlign::Bottom => y,
+            },
+            width,
+            line_height,
+            lines,
+        }
+    }
+
+    /// Top edge of the first line's box.
+    pub(crate) fn top(&self) -> f64 {
+        self.first_y - self.line_height / 2.0
+    }
+
+    /// Height of the stacked line boxes.
+    pub(crate) fn height(&self) -> f64 {
+        self.lines as f64 * self.line_height
+    }
+
+    /// Vertical center of line `index`.
+    pub(crate) fn line_y(&self, index: usize) -> f64 {
+        self.first_y + index as f64 * self.line_height
+    }
+
+    /// Bottom edge of the last line's box.
+    pub(crate) fn bottom(&self) -> f64 {
+        self.line_y(self.lines.saturating_sub(1)) + self.line_height / 2.0
+    }
+
+    /// Whether `(x, y)` lies in the block grown by `pad` on every side.
+    pub(crate) fn contains(&self, (x, y): (f64, f64), pad: f64) -> bool {
+        x >= self.left - pad
+            && x <= self.left + self.width + pad
+            && y >= self.top() - pad
+            && y <= self.bottom() + pad
     }
 }
 
@@ -2238,7 +2409,11 @@ const MEASURE_DRAG_SLOP: f64 = 5.0;
 /// intersection test share it so they cannot drift.
 fn drawing_kind_pad(drawing: &Drawing) -> (f64, f64) {
     if drawing.kind.is_marker() {
-        (16.0, 16.0)
+        // A signpost with coincident anchors stands its pole above its foot.
+        (
+            16.0,
+            16.0 + kinds::projection_annotations::signpost_pole(drawing, 1.0),
+        )
     } else if drawing.kind == DrawingKind::IconStamp {
         (drawing.icon_size / 2.0, drawing.icon_size / 2.0)
     } else if drawing.kind == DrawingKind::Forecast {
@@ -2964,6 +3139,18 @@ impl Drawing {
         true
     }
 
+    /// [`Self::options_json`] for a clipboard or sync item. An info line without its stats box
+    /// writes the absent `tool_options.line` as `null`, which a fork build never wrote: a fork
+    /// item carrying the fork's default stats takes the block
+    /// ([`crate::persistence::migrate_fork_payload_item`]), and this one keeps it removed.
+    fn payload_options_json(&self) -> serde_json::Value {
+        let mut options = self.options_json();
+        if self.kind == DrawingKind::InfoLine && self.tool_options.line.is_none() {
+            options["tool_options"]["line"] = serde_json::Value::Null;
+        }
+        options
+    }
+
     fn options_json(&self) -> serde_json::Value {
         let mut options = serde_json::json!({
             "name": self.name,
@@ -3254,13 +3441,31 @@ impl ChartEngine {
             }
             Some(changed)
         };
+        // A Gann fan's or fixed square's `scale_ratio` (price per bar) scales by its first
+        // anchor's factor, so the angle and the square keep measuring the same bars.
+        let rescale_ratio = |kind: DrawingKind,
+                             options: &mut crate::DrawingToolOptions,
+                             first: Option<&DrawingPoint>,
+                             pending: &[Option<f64>],
+                             apply: bool|
+         -> Option<bool> {
+            let factor = first.map_or(1.0, |first| factor_at(time_of(pending, 0, first)));
+            kinds::pitchforks_gann::rescale_scale_ratio(kind, options, factor, apply)
+        };
         let rescale_drawing = |drawing: &mut Drawing, apply: bool| -> Option<bool> {
+            let ratio = rescale_ratio(
+                drawing.kind,
+                &mut drawing.tool_options,
+                drawing.points.first(),
+                &drawing.pending_times,
+                apply,
+            )?;
             let changed = rescale(
                 drawing.kind,
                 &mut drawing.points,
                 &drawing.pending_times,
                 apply,
-            )?;
+            )? || ratio;
             if changed && apply {
                 drawing.revision = drawing.revision.saturating_add(1);
             }
@@ -3310,6 +3515,13 @@ impl ChartEngine {
                     visit(rescale(DrawingKind::Brush, &mut capture.points, &[], apply));
             }
             if let (Some(drag), Some(kind)) = (self.drawing_drag.as_mut(), drag_kind) {
+                transient_changed |= visit(rescale_ratio(
+                    kind,
+                    &mut drag.history_tool_options,
+                    drag.history_points.first(),
+                    &[],
+                    apply,
+                ));
                 transient_changed |= visit(rescale(kind, &mut drag.start_points, &[], apply));
                 transient_changed |= visit(rescale(kind, &mut drag.history_points, &[], apply));
             }
@@ -4150,7 +4362,10 @@ impl ChartEngine {
     /// Freeze the source bars between a bars pattern's first two anchors: the canonical source
     /// rows from `ceil(min)` through `floor(max)` of their logicals (replay-visible and as-of
     /// rows, whitespace skipped), each at its axis offset from the first index so gaps survive.
-    /// `None` for more than [`MAX_BARS_PATTERN_BARS`] slots or without a valid bar.
+    /// A range wider than [`MAX_BARS_PATTERN_BARS`] slots aggregates into at most that many OHLC
+    /// buckets of `stride` slots ([`Self::capture_bars_pattern_buckets`]), each at its bucket
+    /// index, so the copy stays within the stored offset bound (owner decision A9). `None`
+    /// without a valid bar.
     fn capture_bars_pattern(&self, drawing: &Drawing) -> Option<Vec<BarsPatternBar>> {
         use aeris_charts_core::model::plot_list::PlotValueIndex as Field;
         if drawing.kind != DrawingKind::BarsPattern || drawing.points.len() != 3 {
@@ -4158,11 +4373,7 @@ impl ChartEngine {
         }
         let (a, b) = (drawing.points[0].logical, drawing.points[1].logical);
         let (first, last) = (a.min(b).ceil().max(0.0), a.max(b).floor());
-        if !first.is_finite()
-            || !last.is_finite()
-            || last < first
-            || last - first >= MAX_BARS_PATTERN_BARS as f64
-        {
+        if !first.is_finite() || !last.is_finite() || last < first {
             return None;
         }
         // Both ends sit on the data axis (`last >= first >= 0`).
@@ -4170,7 +4381,16 @@ impl ChartEngine {
             return None;
         }
         let (first, last) = (first as i64, last as i64);
+        // `last >= first >= 0`, so the span is a positive count.
+        let stride = (last - first + 1)
+            .unsigned_abs()
+            .div_ceil(MAX_BARS_PATTERN_BARS as u64) as i64;
         let rows = self.drawing_source_window(drawing)?;
+        if stride > 1 {
+            return self
+                .capture_bars_pattern_buckets(rows, first, last, stride)
+                .map(|(bars, _)| bars);
+        }
         let mut bars: Vec<BarsPatternBar> = Vec::new();
         for row in rows.rows_between(first, last) {
             if rows.is_whitespace(row) {
@@ -4193,8 +4413,8 @@ impl ChartEngine {
                 continue;
             }
             // An as-of source collapses the rows between two axis points onto the later point's
-            // index; they merge into that slot's bar (first open, extremes, last close), so every
-            // row the forecast reads is also in the copy.
+            // index; they merge into that offset's bar (first open, extremes, last close), so
+            // every row the forecast reads is also in the copy.
             match bars.last_mut() {
                 Some(previous) if previous.offset == offset => {
                     previous.high = previous.high.max(bar.high);
@@ -4208,12 +4428,80 @@ impl ChartEngine {
         (!bars.is_empty()).then_some(bars)
     }
 
-    /// Least-squares center and residual-deviation boundaries over the source's closes between
-    /// the two anchors (the memoized `kinds::channels::regression_stats` fit, which follows the
-    /// replay clock and as-of sources and extends incrementally on live bars). The band is
-    /// `regression_deviations` population residual deviations on each side; the two defining
-    /// anchors select the window and remain editable independently of computed prices. `None`
-    /// (no fit) with fewer than two finite closes on distinct bars in the window.
+    /// The buckets of `stride` slots of a wide bars-pattern range `[first, last]` (see
+    /// [`Self::capture_bars_pattern`]): each bucket merges the canonical rows at its slots (first
+    /// open, highest high, lowest low, last close), so rows an as-of source collapses onto one
+    /// point merge as the narrow copy merges them. A union source reads each bucket's LOD summary
+    /// rows (endpoints and extrema), a logarithmic number of summaries per bucket; an as-of
+    /// source's LOD summarizes axis points rather than its own rows, so it reads the rows of the
+    /// range once, as its regression fit and forecast outcome do. Also returns the rows and
+    /// summaries read.
+    fn capture_bars_pattern_buckets(
+        &self,
+        rows: DrawingSourceRows<'_>,
+        first: i64,
+        last: i64,
+        stride: i64,
+    ) -> Option<(Vec<BarsPatternBar>, usize)> {
+        use aeris_charts_core::model::plot_list::PlotValueIndex as Field;
+        let lod = if rows.is_as_of() {
+            None
+        } else {
+            rows.plot.lod()
+        };
+        let mut bars = Vec::new();
+        let mut read = 0;
+        // The bucket's traded rows in order (LOD rows are sorted and never whitespace).
+        let mut traded = Vec::new();
+        for bucket in 0..(last - first + 1)
+            .unsigned_abs()
+            .div_ceil(stride.unsigned_abs()) as i64
+        {
+            let low_index = first + bucket * stride;
+            let range = rows.rows_between(low_index, (low_index + stride - 1).min(last));
+            traded.clear();
+            match lod {
+                Some(lod) => {
+                    let (summary, stats) = lod.rows_on_range(range, usize::MAX);
+                    read += stats.raw_rows + stats.summary_nodes;
+                    traded.extend(summary.iter());
+                }
+                None => {
+                    read += range.len();
+                    traded.extend(range.filter(|&row| !rows.is_whitespace(row)));
+                }
+            }
+            let (Some(&open_row), Some(&close_row)) = (traded.first(), traded.last()) else {
+                continue;
+            };
+            let (mut high, mut low) = (f64::NEG_INFINITY, f64::INFINITY);
+            for &row in &traded {
+                high = high.max(rows.value(row, Field::High));
+                low = low.min(rows.value(row, Field::Low));
+            }
+            let bar = BarsPatternBar {
+                offset: u16::try_from(bucket).ok()?,
+                open: rows.value(open_row, Field::Open),
+                high,
+                low,
+                close: rows.value(close_row, Field::Close),
+            };
+            if bar.valid() {
+                bars.push(bar);
+            }
+        }
+        (!bars.is_empty()).then_some((bars, read))
+    }
+
+    /// Least-squares center and residual-deviation boundaries over the source's values between
+    /// the two anchors (the memoized `kinds::channels::regression_stats` fit of the band's
+    /// `source`, default close, which follows the replay clock and as-of sources and extends
+    /// incrementally on live bars): the centre's ends, then the upper and the lower line's, each
+    /// at its anchor's bar. Each side lies its signed offset in population residual deviations
+    /// from the centre (`regression_deviations` on each side unless a per-side override sets
+    /// it, [`kinds::channels::regression_band`]); a side that is switched off lies on the centre.
+    /// The two defining anchors select the window; their prices only shape the placeholder. `None`
+    /// (no fit) with fewer than two finite values on distinct bars in the window.
     pub(crate) fn regression_points(&self, drawing: &Drawing) -> Option<[DrawingPoint; 6]> {
         if drawing.kind != DrawingKind::RegressionTrend {
             return None;
@@ -4221,15 +4509,17 @@ impl ChartEngine {
         let [start, end] = drawing.points.as_slice() else {
             return None;
         };
-        let stats = kinds::channels::regression_stats(self, drawing, IndicatorInputSource::Close)?;
+        let band = kinds::channels::regression_band(drawing);
+        let stats = kinds::channels::regression_stats(self, drawing, band.source)?;
         // Upstream's rule: no fit without two finite values on distinct bars.
         if stats.count < 2 || stats.spread <= 0.0 {
             return None;
         }
         let count = stats.count as f64;
         // The fit's sample deviation, rescaled to the population form.
-        let deviation =
-            drawing.regression_deviations * stats.deviation * ((count - 1.0) / count).sqrt();
+        let rescale = ((count - 1.0) / count).sqrt();
+        let offset = |side: Option<f64>| side.unwrap_or(0.0) * stats.deviation * rescale;
+        let (upper, lower) = (offset(band.upper), offset(band.lower));
         let make = |logical: f64, offset: f64| DrawingPoint {
             logical,
             price: stats.price_at(logical) + offset,
@@ -4237,16 +4527,18 @@ impl ChartEngine {
         Some([
             make(start.logical, 0.0),
             make(end.logical, 0.0),
-            make(start.logical, deviation),
-            make(end.logical, deviation),
-            make(start.logical, -deviation),
-            make(end.logical, -deviation),
+            make(start.logical, upper),
+            make(end.logical, upper),
+            make(start.logical, lower),
+            make(end.logical, lower),
         ])
     }
 
     /// The drawing's render geometry in media px: its anchors ([`ChartEngine::drawing_px`],
     /// anchored text's screen point), then a regression trend's six fitted points while it has
-    /// a fit. The runtime cache holds exactly this, so culling, hit testing, and frames agree.
+    /// a fit, or a Gann fan's or fixed square's scale-ratio point
+    /// (`kinds::pitchforks_gann::ratio_point`). The runtime cache holds exactly this, so
+    /// culling, hit testing, and frames agree.
     pub(crate) fn drawing_render_px(&self, drawing: &Drawing) -> Option<Vec<(f64, f64)>> {
         let mut px = Vec::with_capacity(drawing.points.len());
         self.extend_drawing_render_px(drawing, &mut px)?;
@@ -4272,6 +4564,15 @@ impl ChartEngine {
                     out.push(self.drawing_point_px(drawing, point)?);
                 }
             }
+        }
+        // A Gann fan's or fixed square's scale-ratio point, placed like an anchor (a non-positive
+        // price on a logarithmic scale lands at a finite px, as a non-positive anchor does); a
+        // non-finite px leaves the anchors' geometry.
+        if let Some(point) = kinds::pitchforks_gann::ratio_point(drawing)
+            .and_then(|point| self.drawing_point_px(drawing, point))
+            .filter(|&(x, y)| x.is_finite() && y.is_finite())
+        {
+            out.push(point);
         }
         Some(())
     }
@@ -4371,16 +4672,18 @@ impl ChartEngine {
                     ),
                     _ => (pane.top, pane.top + pane.height),
                 };
-            if matches!(
-                drawing.kind,
-                DrawingKind::Circle
-                    | DrawingKind::Arc
-                    | DrawingKind::RotatedRectangle
-                    | DrawingKind::FibonacciSpeedArcs
-                    | DrawingKind::FibonacciCircles
-                    | DrawingKind::FibonacciSpiral
-                    | DrawingKind::FibonacciWedge
-            ) {
+            if kinds::projection_annotations::draws_sector(drawing)
+                || matches!(
+                    drawing.kind,
+                    DrawingKind::Circle
+                        | DrawingKind::Arc
+                        | DrawingKind::RotatedRectangle
+                        | DrawingKind::FibonacciSpeedArcs
+                        | DrawingKind::FibonacciCircles
+                        | DrawingKind::FibonacciSpiral
+                        | DrawingKind::FibonacciWedge
+                )
+            {
                 let mut px = [(0.0, 0.0); 4];
                 for (slot, &point) in px.iter_mut().zip(&drawing.points) {
                     let Some(converted) =
@@ -4396,18 +4699,23 @@ impl ChartEngine {
                     self.pane_w,
                     pane.top,
                     pane.height,
-                    DrawingGeometryOptions::default(),
+                    DrawingGeometryOptions::for_drawing(drawing, 1.0),
                 ) else {
                     return false;
                 };
-                if let DrawingBodyGeometry::FibonacciArcs(arcs) = geometry.body {
-                    let radius = arcs.radius
-                        * drawing
-                            .levels
-                            .iter()
-                            .filter(|level| level.visible)
-                            .map(|level| drawing.level_value(level.value).max(0.0))
-                            .fold(0.0, f64::max);
+                if kinds::fibonacci::phi_spiral(drawing) {
+                    // The golden spiral reaches past every pane corner.
+                    (box_left, box_right) = (0.0, self.pane_w);
+                    (box_top, box_bottom) = (pane.top, pane.top + pane.height);
+                } else if let DrawingBodyGeometry::FibonacciArcs(arcs) = geometry.body {
+                    let mut factor = kinds::fibonacci::largest_level(drawing);
+                    // The trend line ends on the level-1 ring (the circles' diameter included).
+                    if kinds::fibonacci::trend_line(drawing, &px[..drawing.points.len().min(4)])
+                        .is_some()
+                    {
+                        factor = factor.max(1.0);
+                    }
+                    let radius = arcs.radius * factor;
                     box_left = arcs.center.0 - radius;
                     box_right = arcs.center.0 + radius;
                     box_top = arcs.center.1 - radius;
@@ -4418,6 +4726,19 @@ impl ChartEngine {
                     box_top = geometry.text_box.top;
                     box_bottom = geometry.text_box.bottom;
                 }
+            }
+            if kinds::lines::draws_angle_reference(drawing) {
+                // A trend angle's dashed reference runs from its first anchor as far as the
+                // segment is long on screen, which follows the viewport: bound it per key.
+                let anchor =
+                    |point| self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, point);
+                let (Some(a), Some(b)) = (anchor(drawing.points[0]), anchor(drawing.points[1]))
+                else {
+                    return false;
+                };
+                let end = kinds::lines::angle_reference_end(a, b);
+                box_left = box_left.min(end);
+                box_right = box_right.max(end);
             }
             (left, right, top, bottom) = (box_left, box_right, box_top, box_bottom);
         }
@@ -4453,7 +4774,19 @@ impl ChartEngine {
         let extra_x = base_extra.max(label_pad.0).max(kind_pad.0);
         let extra_y = base_extra.max(label_pad.1).max(kind_pad.1);
         let logical_pad = extra_x / self.time_scale.bar_spacing().max(f64::MIN_POSITIVE);
-        let logical_intersects = match bounds.logical {
+        // A trend angle's dashed reference reaches as far as its segment is long on screen,
+        // which no logical box bounds: only its side of the first anchor is known here, and the
+        // screen box bounds the rest (`refresh_drawing_screen_bounds`).
+        let logical = match bounds.logical {
+            LogicalBounds::Finite { .. } if kinds::lines::draws_angle_reference(drawing) => {
+                LogicalBounds::Ray {
+                    start: drawing.points[0].logical,
+                    towards_right: drawing.points[1].logical >= drawing.points[0].logical,
+                }
+            }
+            logical => logical,
+        };
+        let logical_intersects = match logical {
             LogicalBounds::Full => true,
             // A labeled ray can anchor its right-aligned label at the pane edge even when its
             // start sits beyond that edge, so keep it conservative.
@@ -4542,7 +4875,7 @@ impl ChartEngine {
         key: u64,
         font_size: f64,
         font_family: &str,
-    ) -> Option<(f64, f64)> {
+    ) -> Option<(f64, f64, usize)> {
         // An open editor gives an empty label its one-em caret slot, which the frame paints
         // around and hit testing must not cull.
         let editing = self.editing_drawing() == Some(drawing.id);
@@ -4570,20 +4903,25 @@ impl ChartEngine {
                 self.measure_drawing_text_with_family(drawing, size, font_family)
             };
             entry.text_size = size;
+            entry.text_lines = drawing.text_block_lines();
             entry.text_key = key;
         }
-        Some((entry.text_width, entry.text_size))
+        Some((entry.text_width, entry.text_size, entry.text_lines))
     }
 
     /// Screen pad `(x, y)` in CSS px that a drawing's text run and family decorations reach
     /// beyond its anchors.
     fn drawing_label_pad(
-        text_metrics: Option<(f64, f64)>,
+        text_metrics: Option<(f64, f64, usize)>,
         text_layout: DrawingTextLayout,
         decoration: f64,
     ) -> (f64, f64) {
-        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size)| match text_layout {
-            DrawingTextLayout::Box => (width + TEXT_PAD * 2.0, size * 1.2 + TEXT_PAD * 2.0),
+        let (x, y) = text_metrics.map_or((0.0, 0.0), |(width, size, lines)| match text_layout {
+            // A text block reaches its lines' height (one line: the run's line box).
+            DrawingTextLayout::Box => (
+                width + TEXT_PAD * 2.0,
+                lines as f64 * (size * 1.2) + TEXT_PAD * 2.0,
+            ),
             // A run along a segment rotates with it, so its length reaches past the anchors in
             // either axis: the run itself, its slot's normal offset (pad + half a glyph), and
             // half its thickness plus the pad.
@@ -4595,19 +4933,21 @@ impl ChartEngine {
         (x.max(decoration), y.max(decoration))
     }
 
-    /// A family tool's decoration reach (stats boxes, angle labels) beyond its anchors in CSS
-    /// px, cached with the text metrics and refreshed on drawing or options changes.
+    /// A tool's decoration reach (stats boxes, angle labels) beyond its anchors in CSS px: a
+    /// family's `decoration_extent`, or the parts an upstream kind layers on its arm
+    /// ([`kinds::upstream_decoration_extent`]); cached with the text metrics and refreshed on
+    /// drawing or options changes.
     fn cached_drawing_decoration(
         &self,
         drawing: &Drawing,
         entry: &mut DrawingCache,
         key: u64,
     ) -> f64 {
-        let Some(family) = drawing.kind.spec().family else {
-            return 0.0;
-        };
         if entry.decoration_key != key {
-            entry.decoration = (family.decoration_extent)(self, drawing);
+            entry.decoration = match drawing.kind.spec().family {
+                Some(family) => (family.decoration_extent)(self, drawing),
+                None => kinds::upstream_decoration_extent(self, drawing),
+            };
             entry.decoration_key = key;
         }
         entry.decoration
@@ -4770,23 +5110,31 @@ impl ChartEngine {
     /// the full-width/full-height kinds in the same units. `pane_top` is the pane's vertical
     /// offset (0 for pane-local bitmap x media y are both chart-top-relative — see hit_test.rs).
     /// `None` when the geometry does not resolve: a zero box would put a caret at (0, 0).
+    /// `scale` is caller px per CSS px (the vertical pixel ratio at render, 1 in media px).
     pub(crate) fn text_box(
-        kind: DrawingKind,
+        drawing: &Drawing,
         px: &[(f64, f64)],
         pane_w: f64,
         pane_top: f64,
         pane_h: f64,
+        scale: f64,
     ) -> Option<TextBox> {
         resolve_drawing_geometry(
-            kind,
+            drawing.kind,
             px,
             pane_w,
             pane_top,
             pane_h,
+            // The reference is the anchors' own geometry at unit scale: extensions and the icon
+            // size do not move a label. Only a coincident signpost's pole follows `scale`
+            // (caller px per CSS px), so its label sits where the frame paints the pole at any
+            // device pixel ratio while every other marker keeps upstream's unit-scale box.
             DrawingGeometryOptions {
-                line_width: 1.0,
-                device_scale: 1.0,
-                ..Default::default()
+                icon_size: 0.0,
+                extend_left: false,
+                extend_right: false,
+                signpost_pole: kinds::projection_annotations::signpost_pole(drawing, scale),
+                ..DrawingGeometryOptions::for_drawing(drawing, 1.0)
             },
         )
         .map(|geometry| geometry.text_box)
@@ -4816,6 +5164,9 @@ impl ChartEngine {
         (x, y, h, 0.0)
     }
 
+    /// The label's draw anchor of `drawing` at the anchors `px` (see [`Self::text_box`] for the
+    /// units): `size` is the glyph size and `scale` caller px per CSS px, which sizes the label's
+    /// [`TEXT_PAD`] and a coincident signpost's pole.
     pub(crate) fn drawing_text_placement(
         drawing: &Drawing,
         px: &[(f64, f64)],
@@ -4823,10 +5174,12 @@ impl ChartEngine {
         pane_top: f64,
         pane_h: f64,
         size: f64,
-        pad: f64,
+        scale: f64,
     ) -> (f64, f64, DrawingTextHAlign, f64) {
-        Self::try_drawing_text_placement(drawing, px, pane_w, pane_top, pane_h, size, pad)
-            .unwrap_or_else(|| Self::text_placement(drawing, &TextBox::default(), size, pad))
+        Self::try_drawing_text_placement(drawing, px, pane_w, pane_top, pane_h, size, scale)
+            .unwrap_or_else(|| {
+                Self::text_placement(drawing, &TextBox::default(), size, TEXT_PAD * scale)
+            })
     }
 
     /// [`ChartEngine::drawing_text_placement`] that reports `None` for a drawing whose geometry
@@ -4838,8 +5191,9 @@ impl ChartEngine {
         pane_top: f64,
         pane_h: f64,
         size: f64,
-        pad: f64,
+        scale: f64,
     ) -> Option<(f64, f64, DrawingTextHAlign, f64)> {
+        let pad = TEXT_PAD * scale;
         if drawing.kind.spec().text_layout == DrawingTextLayout::Segment && px.len() >= 2 {
             let (mut start, mut end) = (px[0], px[1]);
             let mut dx = end.0 - start.0;
@@ -4877,13 +5231,14 @@ impl ChartEngine {
                 return Some((x, y, drawing.text_h_align, dy.atan2(dx)));
             }
         }
-        let reference = Self::text_box(drawing.kind, px, pane_w, pane_top, pane_h)?;
+        let reference = Self::text_box(drawing, px, pane_w, pane_top, pane_h, scale)?;
         Some(Self::text_placement(drawing, &reference, size, pad))
     }
 
     /// Measure (or estimate) a label's width in the same px units as `size`. Empty text tools
     /// use one em so the focus/hover chrome and hit target stay a caret-sized box (the host
-    /// never leaves an empty text drawing on the chart after editing).
+    /// never leaves an empty text drawing on the chart after editing). A text annotation's text
+    /// of several lines measures its widest line ([`TextBlock`]).
     pub(crate) fn measure_drawing_text(&self, drawing: &Drawing, size: f64) -> f64 {
         let layout = &self.options.get().layout;
         self.measure_drawing_text_with_family(drawing, size, &layout.font_family)
@@ -4897,6 +5252,16 @@ impl ChartEngine {
         }
         let text = drawing.display_text();
         let weight = drawing.text_weight.unwrap_or(400);
+        if drawing.text_block_lines() > 1 {
+            // Upstream's text block: its widest line.
+            return text
+                .split('\n')
+                .map(|line| {
+                    let line = line.trim_end_matches('\r');
+                    self.measure_text_run(line, size, family, weight, drawing.text_italic)
+                })
+                .fold(0.0, f64::max);
+        }
         self.measure_text_run(text, size, family, weight, drawing.text_italic)
     }
 
@@ -4914,6 +5279,13 @@ impl ChartEngine {
         }
     }
 
+    /// One line of a parts label measured in its glyph size, weight and slant in the layout
+    /// font: the measure every parts hit test and editor layout uses, so both match the paint.
+    fn measure_part_label(&self, label: &parts::PartLabel, line: &str) -> f64 {
+        let family = &self.options.get().layout.font_family;
+        self.measure_text_run(line, label.size, family, label.weight, label.italic)
+    }
+
     /// Install (or clear with `None`) the host text-measure callback for drawing-label hit
     /// boxes (see [`TextMeasureFn`]).
     pub fn set_text_measure(&mut self, f: Option<TextMeasureFn>) {
@@ -4921,6 +5293,8 @@ impl ChartEngine {
         for entry in self.drawing_runtime.borrow_mut().entries.values_mut() {
             entry.screen_valid = false;
             entry.text_key = u64::MAX;
+            // A family decoration (stats box, angle label) is measured text: re-measure it.
+            entry.decoration_key = u64::MAX;
         }
         self.invalidate_frame_drawings();
         // Trading marker cells size themselves from measured quantity text.
@@ -5600,7 +5974,7 @@ impl ChartEngine {
                 kind: drawing.kind,
                 pane_index: drawing.pane_index,
                 points: self.drawing_anchors_of(drawing),
-                options: drawing.options_json(),
+                options: drawing.payload_options_json(),
                 bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
                     .then(|| drawing.bars_pattern.clone()),
             })
@@ -5942,7 +6316,7 @@ impl ChartEngine {
                 kind: drawing.kind,
                 pane_index: drawing.pane_index,
                 points: self.drawing_anchors_of(drawing),
-                options: drawing.options_json(),
+                options: drawing.payload_options_json(),
                 bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
                     .then(|| drawing.bars_pattern.clone()),
             })
@@ -6072,7 +6446,7 @@ impl ChartEngine {
             pane.top,
             pane.height,
             size,
-            TEXT_PAD,
+            1.0,
         )?;
         Some(DrawingTextRun {
             x,
@@ -6114,30 +6488,31 @@ impl ChartEngine {
         let drawing = self.drawing(id)?;
         // The geometry the frame places text against (a regression's fitted box included).
         let px = self.drawing_render_px(drawing)?;
-        if drawing.kind.paints_generic_text() {
+        if kinds::projection_annotations::fork_text_owner(drawing) {
+            self.box_text_edit_layout(drawing, &px, kinds::projection_annotations::fork_text_box)
+        } else if drawing.kind.paints_generic_text() {
             self.run_text_edit_layout(drawing, &px)
         } else {
-            self.box_text_edit_layout(drawing, &px)
+            self.box_text_edit_layout(drawing, &px, drawing.kind.spec().family?.build_parts)
         }
     }
 
-    /// The editor layout of a family drawing's text box (see [`ChartEngine::drawing_text_edit_layout`]).
+    /// The editor layout of the text box `build` resolves for `drawing` (a family's, or a
+    /// fork-form annotation's; see [`ChartEngine::drawing_text_edit_layout`]).
     fn box_text_edit_layout(
         &self,
         drawing: &Drawing,
         px: &[(f64, f64)],
+        build: impl FnOnce(&PartContext<'_>, &mut DrawingParts),
     ) -> Option<DrawingTextEditLayout> {
-        let family = drawing.kind.spec().family?;
         let mut context = PartContext::media(self, drawing, px)?;
         context.text_editing = true;
         let mut parts = DrawingParts::default();
-        (family.build_parts)(&context, &mut parts);
+        build(&context, &mut parts);
         let text = parts.text?;
         let label = parts.labels.get(text.label)?;
         let font_family = &self.options.get().layout.font_family;
-        let layout = label.layout(|line| {
-            self.measure_text_run(line, label.size, font_family, label.weight, label.italic)
-        });
+        let layout = label.layout(|line| self.measure_part_label(label, line));
         Some(DrawingTextEditLayout {
             x: layout.text_x,
             y: layout.first_y + text.first_line as f64 * layout.line_height,
@@ -6175,14 +6550,38 @@ impl ChartEngine {
         let width = if drawing.text.is_empty() {
             run.size
         } else {
-            self.measure_text_run(
-                drawing.display_text(),
-                run.size,
-                font_family,
-                weight,
-                drawing.text_italic,
-            )
+            self.measure_drawing_text(drawing, run.size)
         };
+        // A text annotation edits its text block (several lines); one line is the run itself.
+        let block_owner = drawing.kind.is_text_annotation();
+        if block_owner && drawing.text_block_lines() > 1 {
+            // Upstream's text block: lines left-aligned at its left edge, over several lines.
+            let block = TextBlock::new(
+                (run.x, run.y, run.align),
+                drawing.text_v_align,
+                width,
+                run.size,
+                drawing.text_block_lines(),
+            );
+            return Some(DrawingTextEditLayout {
+                x: block.left,
+                y: block.first_y,
+                line_height: block.line_height,
+                size: run.size,
+                font_family: font_family.clone(),
+                weight,
+                italic: drawing.text_italic,
+                color: self.drawing_label_color(drawing).to_css(),
+                rect: [
+                    block.left - TEXT_PAD,
+                    block.top() - TEXT_PAD,
+                    block.left + block.width + TEXT_PAD,
+                    block.bottom() + TEXT_PAD,
+                ],
+                angle: 0.0,
+                multiline: true,
+            });
+        }
         let (x, y) = run.start(width);
         Some(DrawingTextEditLayout {
             x,
@@ -6195,7 +6594,7 @@ impl ChartEngine {
             color: self.drawing_label_color(drawing).to_css(),
             rect: run.bounds(width),
             angle: run.angle,
-            multiline: false,
+            multiline: block_owner,
         })
     }
 
@@ -6314,6 +6713,7 @@ impl ChartEngine {
                     | DrawingKind::AnchoredText
             )
             || !drawing.kind.paints_generic_text()
+            || kinds::projection_annotations::fork_text_owner(drawing)
         {
             return false;
         }
@@ -6329,6 +6729,9 @@ impl ChartEngine {
                 return false;
             };
             let width = width.unwrap_or_else(|| {
+                if drawing.text_block_lines() > 1 {
+                    return self.measure_drawing_text(drawing, run.size);
+                }
                 self.measure_text_run(
                     text,
                     run.size,
@@ -6337,6 +6740,17 @@ impl ChartEngine {
                     drawing.text_italic,
                 )
             });
+            if drawing.text_block_lines() > 1 {
+                // A callout's or price note's text block.
+                return TextBlock::new(
+                    (run.x, run.y, run.align),
+                    drawing.text_v_align,
+                    width,
+                    run.size,
+                    drawing.text_block_lines(),
+                )
+                .contains((x, y), TEXT_PAD);
+            }
             run.contains(width, x, y)
         })
         .unwrap_or(false)
@@ -6653,6 +7067,220 @@ impl ChartEngine {
         hit
     }
 
+    /// Precise hit of the parts `build` resolves for `drawing` (a family's whole drawing, or the
+    /// parts an upstream-rendered drawing layers over its arm) at media px `point` against its
+    /// converted anchors `px`: the hit side of the frame's `push_parts`, measured like the paint
+    /// ([`Self::measure_part_label`]).
+    fn parts_hit(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        point: (f64, f64),
+        tolerance: f64,
+        build: impl FnOnce(&PartContext<'_>, &mut DrawingParts),
+    ) -> bool {
+        let Some(context) = PartContext::media(self, drawing, px) else {
+            return false;
+        };
+        let mut parts = DrawingParts::default();
+        build(&context, &mut parts);
+        parts.hit(drawing, point, tolerance, |label, line| {
+            self.measure_part_label(label, line)
+        })
+    }
+
+    /// Whether media px `point` lies in the box of the one-line text run `text` painted as a
+    /// `Prim::Text` at media px `anchor` (x its `align` edge, y its vertical center) at glyph
+    /// `size` CSS px in `drawing`'s text weight and slant: the measured run, one 1.25 × `size`
+    /// line tall (the parts labels' line box). Labels that paint as bare runs (the level arms'
+    /// labels and the patterns' and Elliott waves' vertex labels,
+    /// `kinds::patterns_elliott_cycles::vertex_labels`) are body hit targets through it.
+    fn text_run_hit(
+        &self,
+        drawing: &Drawing,
+        text: &str,
+        anchor: (f64, f64),
+        align: TextAlign,
+        size: f64,
+        point: (f64, f64),
+    ) -> bool {
+        // The line box rejects first, so a pointer off the label row measures nothing.
+        if (point.1 - anchor.1).abs() > size * 1.25 / 2.0 {
+            return false;
+        }
+        let width = self.measure_text_run(
+            text,
+            size,
+            &self.options.get().layout.font_family,
+            drawing.text_weight.unwrap_or(400),
+            drawing.text_italic,
+        );
+        let left = match align {
+            TextAlign::Left => anchor.0,
+            TextAlign::Center => anchor.0 - width / 2.0,
+            TextAlign::Right => anchor.0 - width,
+        };
+        point.0 >= left && point.0 <= left + width
+    }
+
+    /// Whether media px `point` hits a level arm's `label` (see [`Self::text_run_hit`]) at the
+    /// layout font the arms paint with.
+    fn level_label_hit(
+        &self,
+        drawing: &Drawing,
+        label: Option<kinds::fibonacci::LevelLabel>,
+        point: (f64, f64),
+    ) -> bool {
+        label.is_some_and(|label| {
+            self.text_run_hit(
+                drawing,
+                &label.text,
+                (label.x, label.y),
+                label.align,
+                self.options.get().layout.font_size,
+                point,
+            )
+        })
+    }
+
+    /// The Fibonacci-arc arm's body test (speed arcs, circles, spiral, wedge) at media px `point`
+    /// against the anchors `px`, as the frame paints it: the wedge's edges, each visible level's
+    /// ring or spiral (upstream's fixed chords, or the precise rings of a stored block), its
+    /// label, the golden spiral of an empty spiral, the trend line, and, while selected, the
+    /// bands. `tolerance` is the stroke's half width plus the pointer slack `hit_tolerance`.
+    fn fibonacci_arcs_hit(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        arcs: FibonacciArcGeometry,
+        pane: shape::Rect,
+        point: (f64, f64),
+        (tolerance, hit_tolerance): (f64, f64),
+    ) -> bool {
+        let (x, y) = point;
+        if arcs.kind == DrawingKind::FibonacciWedge
+            && px[1..3].iter().any(|side| {
+                distance_to_segment(x, y, px[0].0, px[0].1, side.0, side.1) <= tolerance
+            })
+        {
+            return true;
+        }
+        let precise = kinds::fibonacci::precise_rings(drawing);
+        let rings = precise
+            .then(|| {
+                arcs.rings(
+                    pane,
+                    drawing.width,
+                    arcs.radius * kinds::fibonacci::largest_level(drawing),
+                )
+            })
+            .flatten();
+        let (mut chain, mut other) = (Vec::new(), Vec::new());
+        let segments = arcs.segments();
+        let upstream_chain = |value: f64, out: &mut Vec<(f64, f64)>| {
+            out.clear();
+            out.extend((0..=segments).map(|step| {
+                arcs.point(
+                    drawing.level_value(value),
+                    f64::from(step) / f64::from(segments),
+                )
+            }));
+        };
+        for level in &drawing.levels {
+            let value = drawing.level_value(level.value);
+            if !level.visible || value <= 0.0 {
+                continue;
+            }
+            let radius = arcs.radius * value;
+            let line = if precise {
+                match rings.filter(|rings| rings.reaches(radius, radius)) {
+                    Some(rings) => {
+                        rings.chain(radius, &mut chain);
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                upstream_chain(level.value, &mut chain);
+                true
+            };
+            if (line && shape::distance_to_polyline(point, &chain) <= tolerance)
+                || (level.label_visible
+                    && self.level_label_hit(
+                        drawing,
+                        self.arc_level_label(drawing, arcs, level.value, 1.0),
+                        point,
+                    ))
+            {
+                return true;
+            }
+        }
+        if kinds::fibonacci::phi_spiral(drawing) {
+            let mut hit = false;
+            arcs.phi_spiral(
+                kinds::fibonacci::options(drawing).reverse,
+                pane,
+                (drawing.width, 1.0, 0.0),
+                |run| hit |= shape::distance_to_polyline(point, run) <= tolerance,
+            );
+            if hit {
+                return true;
+            }
+        }
+        if self.fibonacci_trend_line_hit(drawing, px, point, hit_tolerance) {
+            return true;
+        }
+        if self.selected_drawing != Some(drawing.id) {
+            return false;
+        }
+        level_band_pairs(drawing, &drawing.levels, true).any(|(prior, level)| {
+            if precise {
+                let radii =
+                    [prior, level.value].map(|value| arcs.radius * drawing.level_value(value));
+                let Some(rings) = rings
+                    .filter(|rings| rings.reaches(radii[0].min(radii[1]), radii[0].max(radii[1])))
+                else {
+                    return false;
+                };
+                rings.chain(radii[0], &mut chain);
+                rings.chain(radii[1], &mut other);
+            } else {
+                upstream_chain(prior, &mut chain);
+                upstream_chain(level.value, &mut other);
+            }
+            self.band_fill_hit(drawing, &chain, &other, point)
+        })
+    }
+
+    /// Whether media px `point` lies within `hit_tolerance` beyond the half width of the trend
+    /// line a Fibonacci tool strokes through its anchors `px` (`kinds::fibonacci::trend_line`).
+    fn fibonacci_trend_line_hit(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        point: (f64, f64),
+        hit_tolerance: f64,
+    ) -> bool {
+        kinds::fibonacci::trend_line(drawing, px).is_some_and(|(path, count)| {
+            let (width, _) = kinds::fibonacci::trend_stroke(drawing);
+            shape::distance_to_polyline(point, &path[..count]) <= width / 2.0 + hit_tolerance
+        })
+    }
+
+    /// Whether media px `point` lies in the band fill between the paired chains `upper` and
+    /// `lower` (the region `Prim::BandFill` paints, two lobes where the chains cross) of
+    /// `drawing`, which is a drag surface only while the drawing is selected (the rectangle's
+    /// convention), so an unselected tool never swallows chart drags inside its shading.
+    fn band_fill_hit(
+        &self,
+        drawing: &Drawing,
+        upper: &[(f64, f64)],
+        lower: &[(f64, f64)],
+        point: (f64, f64),
+    ) -> bool {
+        self.selected_drawing == Some(drawing.id) && shape::point_in_ribbon(point, upper, lower)
+    }
+
     /// The per-kind body test at media px `(x, y)` against the converted anchors `px`.
     fn drawing_body_hit(
         &self,
@@ -6739,15 +7367,7 @@ impl ChartEngine {
             return false;
         };
         if let Some(family) = drawing.kind.spec().family {
-            let Some(context) = PartContext::media(self, drawing, px) else {
-                return false;
-            };
-            let mut parts = DrawingParts::default();
-            (family.build_parts)(&context, &mut parts);
-            let font_family = &self.options.get().layout.font_family;
-            return parts.hit(drawing, (x, y), hit_tolerance, |label, line| {
-                self.measure_text_run(line, label.size, font_family, label.weight, label.italic)
-            });
+            return self.parts_hit(drawing, px, (x, y), hit_tolerance, family.build_parts);
         }
         let Some(geometry) = resolve_drawing_geometry(
             drawing.kind,
@@ -6755,19 +7375,55 @@ impl ChartEngine {
             self.pane_w,
             pane.top,
             pane.height,
-            DrawingGeometryOptions {
-                line_width: drawing.width,
-                device_scale: 1.0,
-                extend_left: drawing.extend_left,
-                icon_size: drawing.icon_size,
-                extend_right: drawing.extend_right,
-            },
+            DrawingGeometryOptions::for_drawing(drawing, 1.0),
         ) else {
             return false;
         };
+        // Curves flatten against the pane as the frame does (media px), so paint and hit agree.
+        let curve_clip = || {
+            curve_clip(
+                shape::Rect {
+                    left: 0.0,
+                    top: pane.top,
+                    right: self.pane_w,
+                    bottom: pane.top + pane.height,
+                },
+                drawing.width,
+                1.0,
+            )
+        };
+        // The parts an upstream line tool's `line` block layers on its arm (caps, the trend
+        // angle's reference and arc, the stats box) hit like the frame paints them.
+        let line_parts_hit = |segment| {
+            kinds::lines::fork_presentation(drawing)
+                && self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                    kinds::lines::upstream_line_parts(context, segment, parts);
+                })
+        };
+        // A fork-form annotation's text box is a body target, like the geometry under it.
+        if kinds::projection_annotations::fork_text_owner(drawing)
+            && self.parts_hit(
+                drawing,
+                px,
+                (x, y),
+                hit_tolerance,
+                kinds::projection_annotations::fork_text_box,
+            )
+        {
+            return true;
+        }
         match geometry.body {
             DrawingBodyGeometry::Segment { a, b } => {
                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    || line_parts_hit(Some((a, b)))
+                    || (kinds::projection_annotations::draws_forecast_boxes(drawing)
+                        && self.parts_hit(
+                            drawing,
+                            px,
+                            (x, y),
+                            hit_tolerance,
+                            kinds::projection_annotations::forecast_parts,
+                        ))
             }
             DrawingBodyGeometry::Horizontal { y: line_y, x0, x1 } => {
                 (y - line_y).abs() <= tolerance
@@ -6793,71 +7449,172 @@ impl ChartEngine {
                     || ((x - line_x).abs() <= tolerance
                         && y >= pane_top - hit_tolerance
                         && y <= pane_bottom + hit_tolerance)
+                    || line_parts_hit(None)
             }
             DrawingBodyGeometry::Channel { first, second } => {
-                (drawing.fill_enabled
-                    && self.selected_drawing == Some(drawing.id)
-                    && point_in_polygon((x, y), &[first[0], first[1], second[1], second[0]]))
-                    || distance_to_segment(x, y, first[0].0, first[0].1, first[1].0, first[1].1)
-                        <= tolerance
-                    || distance_to_segment(x, y, second[0].0, second[0].1, second[1].0, second[1].1)
-                        <= tolerance
+                // The fill and the middle line pair the lines' ends by side, as the frame does.
+                let paired = kinds::channels::paired_second(first, second);
+                let near = |[a, b]: [(f64, f64); 2], tolerance: f64| {
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                };
+                let fill_hit = || match kinds::channels::channel_fill_ribbon(first, paired) {
+                    Some(ribbon) => {
+                        let (upper, lower) = ribbon.split_at(ribbon.len() / 2);
+                        self.band_fill_hit(drawing, upper, lower, (x, y))
+                    }
+                    None => self.band_fill_hit(drawing, &first, &paired, (x, y)),
+                };
+                (drawing.fill_enabled && fill_hit())
+                    || near(first, tolerance)
+                    || near(second, tolerance)
+                    || kinds::channels::channel_middle(drawing, first, paired).is_some_and(
+                        |(middle, _)| {
+                            near(middle, kinds::channels::MIDDLE_WIDTH / 2.0 + hit_tolerance)
+                        },
+                    )
             }
             DrawingBodyGeometry::Regression {
                 center,
                 upper,
                 lower,
-            } => [center, upper, lower].into_iter().any(|segment| {
-                distance_to_segment(x, y, segment[0].0, segment[0].1, segment[1].0, segment[1].1)
-                    <= tolerance
-            }),
+            } => {
+                let band = kinds::channels::regression_band(drawing);
+                let near = |[a, b]: [(f64, f64); 2], tolerance: f64| {
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                };
+                // A dashed centre line is as thin as a channel's middle line.
+                let center_tolerance = if kinds::channels::middle_line(drawing).is_some() {
+                    kinds::channels::MIDDLE_WIDTH / 2.0 + hit_tolerance
+                } else {
+                    tolerance
+                };
+                (drawing.fill_enabled
+                    && kinds::channels::regression_zone(band, center, upper, lower).is_some_and(
+                        |(first, second)| self.band_fill_hit(drawing, &first, &second, (x, y)),
+                    ))
+                    || near(center, center_tolerance)
+                    || (band.upper.is_some() && near(upper, tolerance))
+                    || (band.lower.is_some() && near(lower, tolerance))
+            }
             DrawingBodyGeometry::RegressionWindow { a, b } => {
                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
             }
-            DrawingBodyGeometry::Fibonacci(fib) => drawing.levels.iter().any(|level| {
-                if !level.visible {
-                    return false;
-                }
-                let (a, b) = self.drawing_fibonacci_level_segment(drawing, fib, level.value, 1.0);
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
+            // Level lines, their labels, the fan grid, the trend line, and (while selected)
+            // the bands, as the frame paints them.
+            DrawingBodyGeometry::Fibonacci(fib) => {
+                let segment =
+                    |value| self.drawing_fibonacci_level_segment(drawing, fib, value, 1.0);
+                let visible = || drawing.levels.iter().filter(|level| level.visible);
+                visible().any(|level| {
+                    let (a, b) = segment(level.value);
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                        || (level.label_visible
+                            && self.level_label_hit(
+                                drawing,
+                                self.fibonacci_level_label(drawing, (a, b), level.value, 1.0),
+                                (x, y),
+                            ))
+                }) || (kinds::fibonacci::draws_grid(drawing)
+                    && visible().any(|level| {
+                        fib.grid_lines(drawing.level_value(level.value))
+                            .iter()
+                            .any(|&(a, b)| {
+                                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                            })
+                    }))
+                    || self.fibonacci_trend_line_hit(drawing, px, (x, y), hit_tolerance)
+                    || level_band_pairs(drawing, &drawing.levels, false).any(|(prior, level)| {
+                        let (prior, current) = (segment(prior), segment(level.value));
+                        let ((x0, y0), (x1, y1)) = current;
+                        if (y0 - y1).abs() <= f64::EPSILON {
+                            // The frame paints a band under a horizontal level as the box from
+                            // that level to the prior segment's start (at least 1 px each way).
+                            let (left, top) = (x0.min(x1), y0.min(prior.0 .1));
+                            let right = left + (x1 - x0).abs().max(1.0);
+                            let bottom = top + (y0 - prior.0 .1).abs().max(1.0);
+                            self.band_fill_hit(
+                                drawing,
+                                &[(left, top), (right, top)],
+                                &[(left, bottom), (right, bottom)],
+                                (x, y),
+                            )
+                        } else {
+                            self.band_fill_hit(
+                                drawing,
+                                &[prior.0, prior.1],
+                                &[current.0, current.1],
+                                (x, y),
+                            )
+                        }
+                    })
+            }
             DrawingBodyGeometry::TimeLevels(time) => {
-                y >= time.pane_top - hit_tolerance
+                let in_pane = |x: f64| (0.0..=self.pane_w).contains(&x);
+                (y >= time.pane_top - hit_tolerance
                     && y <= time.pane_bottom + hit_tolerance
                     && drawing.levels.iter().any(|level| {
                         level.visible
                             && (x - time.x(drawing.level_value(level.value))).abs() <= tolerance
-                    })
-            }
-            DrawingBodyGeometry::FibonacciArcs(arcs) => {
-                (arcs.kind == DrawingKind::FibonacciWedge
-                    && px[1..3].iter().any(|side| {
-                        distance_to_segment(x, y, px[0].0, px[0].1, side.0, side.1) <= tolerance
                     }))
                     || drawing.levels.iter().any(|level| {
+                        let line_x = time.x(drawing.level_value(level.value));
                         level.visible
-                            && drawing.level_value(level.value) > 0.0
-                            && (0..arcs.segments()).any(|step| {
-                                let segments = f64::from(arcs.segments());
-                                let a = arcs.point(
-                                    drawing.level_value(level.value),
-                                    f64::from(step) / segments,
-                                );
-                                let b = arcs.point(
-                                    drawing.level_value(level.value),
-                                    f64::from(step + 1) / segments,
-                                );
-                                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                            })
+                            && level.label_visible
+                            && in_pane(line_x)
+                            && self.level_label_hit(
+                                drawing,
+                                self.time_level_label(drawing, time, line_x, level.value, 1.0),
+                                (x, y),
+                            )
+                    })
+                    || self.fibonacci_trend_line_hit(drawing, px, (x, y), hit_tolerance)
+                    || level_band_pairs(drawing, &drawing.levels, false).any(|(prior, level)| {
+                        let prior_x = time.x(drawing.level_value(prior));
+                        let level_x = time.x(drawing.level_value(level.value));
+                        let left = level_x.min(prior_x).max(0.0);
+                        let right = level_x.max(prior_x).min(self.pane_w);
+                        let (top, bottom) = (time.pane_top, time.pane_bottom);
+                        right > left
+                            && self.band_fill_hit(
+                                drawing,
+                                &[(left, top), (right, top)],
+                                &[(left, bottom), (right, bottom)],
+                                (x, y),
+                            )
                     })
             }
-            DrawingBodyGeometry::Pitchfork(fork) => drawing.levels.iter().any(|level| {
-                if !level.visible {
-                    return false;
-                }
-                let (a, b) = fork.segment(drawing.level_value(level.value));
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
+            DrawingBodyGeometry::FibonacciArcs(arcs) => self.fibonacci_arcs_hit(
+                drawing,
+                px,
+                arcs,
+                shape::Rect {
+                    left: 0.0,
+                    top: pane.top,
+                    right: self.pane_w,
+                    bottom: pane.top + pane.height,
+                },
+                (x, y),
+                (tolerance, hit_tolerance),
+            ),
+            // The tines and, while selected, the bands between them, as the frame paints them.
+            DrawingBodyGeometry::Pitchfork(fork) => {
+                let segment = |value| fork.segment(drawing.level_value(value));
+                drawing.levels.iter().any(|level| {
+                    if !level.visible {
+                        return false;
+                    }
+                    let (a, b) = segment(level.value);
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                }) || level_band_pairs(drawing, &drawing.levels, false).any(|(prior, level)| {
+                    let (prior, current) = (segment(prior), segment(level.value));
+                    self.band_fill_hit(
+                        drawing,
+                        &[prior.0, prior.1],
+                        &[current.0, current.1],
+                        (x, y),
+                    )
+                })
+            }
             DrawingBodyGeometry::Cycles(cycles) => {
                 y >= cycles.pane_top - hit_tolerance && y <= cycles.pane_bottom + hit_tolerance && {
                     let mut hit = false;
@@ -6930,36 +7687,49 @@ impl ChartEngine {
                     (bounds.right, bounds.bottom),
                     (bounds.left, bounds.bottom),
                 ];
-                (drawing.fill_enabled
-                    && self.selected_drawing == Some(drawing.id)
-                    && x >= bounds.left
-                    && x <= bounds.right
-                    && y >= bounds.top
-                    && y <= bounds.bottom)
-                    || (0..4).any(|index| {
-                        let a = corners[index];
-                        let b = corners[(index + 1) % 4];
-                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                    })
+                let near = |&(a, b): &((f64, f64), (f64, f64))| {
+                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                };
+                let time_levels = kinds::pitchforks_gann::box_time_levels(drawing);
+                let x_at = |value: f64| grid.start.0 + (grid.end.0 - grid.start.0) * value;
+                let between =
+                    |value: f64, (a, b): (f64, f64)| value >= a.min(b) && value <= a.max(b);
+                // While selected, the box and every zone the frame fills around it (level
+                // cells or per-axis bands past the box; fan and arc zones stay inside it) drag
+                // the body.
+                let zones_hit = || {
+                    (between(x, (bounds.left, bounds.right))
+                        && between(y, (bounds.top, bounds.bottom)))
+                        || kinds::pitchforks_gann::grid_bands(drawing, grid)
+                            .any(|(xs, ys, _)| between(x, xs) && between(y, ys))
+                };
+                (drawing.fill_enabled && self.selected_drawing == Some(drawing.id) && zones_hit())
+                    || (0..4).any(|index| near(&(corners[index], corners[(index + 1) % 4])))
                     || drawing
                         .levels
                         .iter()
                         .filter(|level| level.visible)
                         .any(|level| {
-                            grid.level_lines(drawing.level_value(level.value))
-                                .iter()
-                                .any(|&(a, b)| {
-                                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                                })
+                            let lines = grid.level_lines(drawing.level_value(level.value));
+                            // Split axes: price levels are horizontal lines only.
+                            lines[usize::from(time_levels.is_some())..].iter().any(near)
                         })
-                    || drawing
-                        .gann_fans
-                        .iter()
+                    || time_levels
+                        .into_iter()
+                        .flatten()
                         .filter(|level| level.visible)
                         .any(|level| {
-                            let (a, b) = grid.fan_segment(level.value, drawing.level_reverse);
-                            distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                            let line_x = x_at(drawing.level_value(level.value));
+                            near(&((line_x, grid.start.1), (line_x, grid.end.1)))
                         })
+                    || kinds::pitchforks_gann::angle_levels(drawing)
+                        .iter()
+                        .filter(|level| level.visible)
+                        .any(|level| near(&grid.fan_segment(level.value, drawing.level_reverse)))
+                    || (kinds::pitchforks_gann::shows_stats(drawing)
+                        && self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                            kinds::pitchforks_gann::square_stats(context, grid, parts);
+                        }))
                     || drawing
                         .gann_arcs
                         .iter()
@@ -6999,13 +7769,9 @@ impl ChartEngine {
                 {
                     true
                 } else {
-                    (0..64).any(|step| {
-                        let theta0 = std::f64::consts::TAU * step as f64 / 64.0;
-                        let theta1 = std::f64::consts::TAU * (step + 1) as f64 / 64.0;
-                        let a = (center.0 + rx * theta0.cos(), center.1 + ry * theta0.sin());
-                        let b = (center.0 + rx * theta1.cos(), center.1 + ry * theta1.sin());
-                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                    })
+                    let mut outline = Vec::new();
+                    ellipse_outline(center, rx, ry, curve_clip(), &mut outline);
+                    shape::distance_to_polyline((x, y), &outline) <= tolerance
                 }
             }
             DrawingBodyGeometry::Circle { center, radius } => {
@@ -7025,16 +7791,79 @@ impl ChartEngine {
                         distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
                     })
             }
-            DrawingBodyGeometry::Arc(arc) => (0..64).any(|step| {
-                let a = arc.point(step as f64 / 64.0);
-                let b = arc.point((step + 1) as f64 / 64.0);
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
-            DrawingBodyGeometry::Curve(curve) => (0..64).any(|step| {
-                let a = curve.point(step as f64 / 64.0);
-                let b = curve.point((step + 1) as f64 / 64.0);
-                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-            }),
+            DrawingBodyGeometry::Sector(arc) => {
+                // The outline and the stats box, and, while selected, the filled sector, as the
+                // frame paints them.
+                let mut arc_points = Vec::new();
+                arc.flatten(curve_clip(), &mut arc_points);
+                let mut outline = Vec::with_capacity(arc_points.len() + 2);
+                outline.push(arc.center);
+                outline.extend_from_slice(&arc_points);
+                outline.push(arc.center);
+                shape::distance_to_polyline((x, y), &outline) <= tolerance
+                    || (drawing.fill_enabled && {
+                        let hub = vec![arc.center; arc_points.len()];
+                        self.band_fill_hit(drawing, &arc_points, &hub, (x, y))
+                    })
+                    || px.get(1).is_some_and(|&target| {
+                        self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                            kinds::projection_annotations::projection_stats(
+                                context, arc.center, target, parts,
+                            );
+                        })
+                    })
+            }
+            DrawingBodyGeometry::NotePin(pin) => {
+                let mut outline = Vec::new();
+                pin.outline(&mut outline);
+                point_in_polygon((x, y), &outline)
+                    || (!outline.is_empty() && {
+                        outline.push(outline[0]);
+                        shape::distance_to_polyline((x, y), &outline) <= hit_tolerance
+                    })
+            }
+            DrawingBodyGeometry::SpeechTail { corners } => {
+                point_in_polygon((x, y), &corners)
+                    || (0..3).any(|index| {
+                        let (a, b) = (corners[index], corners[(index + 1) % 3]);
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= hit_tolerance
+                    })
+            }
+            DrawingBodyGeometry::Arc(_) | DrawingBodyGeometry::Curve(_) => {
+                // The stroke (with its caps and tangent extensions) and, while selected, the
+                // chord region, as the frame paints them.
+                let Some(curve) = kinds::shapes::CurveStroke::resolve(geometry.body, curve_clip())
+                else {
+                    return false;
+                };
+                let run = curve.run();
+                let stroke_hit = if kinds::shapes::capped(drawing) {
+                    self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                        curve.capped_parts(&run, drawing, context.scale, parts);
+                    })
+                } else {
+                    shape::distance_to_polyline((x, y), &run) <= tolerance
+                };
+                stroke_hit
+                    || (drawing.fill_enabled && self.selected_drawing == Some(drawing.id) && {
+                        let mut ribbon = Vec::new();
+                        let count = curve.chord_fill(&mut ribbon);
+                        let (upper, lower) = ribbon.split_at(count);
+                        count > 0 && self.band_fill_hit(drawing, upper, lower, (x, y))
+                    })
+            }
+            DrawingBodyGeometry::Polygon { points: vertices } => {
+                let mut outline = Vec::new();
+                closed_outline(vertices, &mut outline);
+                // The nonzero fill the frame paints, a body target only while selected.
+                shape::distance_to_polyline((x, y), &outline) <= tolerance
+                    || (drawing.fill_enabled && self.selected_drawing == Some(drawing.id) && {
+                        let mut ribbon = Vec::new();
+                        let count = shape::nonzero_ribbon(vertices, &mut ribbon);
+                        let (upper, lower) = ribbon.split_at(count);
+                        count > 0 && self.band_fill_hit(drawing, upper, lower, (x, y))
+                    })
+            }
             DrawingBodyGeometry::Rectangle {
                 left,
                 right,
@@ -7067,34 +7896,55 @@ impl ChartEngine {
                 line_type,
                 terminal,
             } => {
-                if crate::hit_test::hit_test_line_series(
-                    points,
-                    x,
-                    y,
-                    line_type,
-                    drawing.width,
-                    None,
-                    self.time_scale.bar_spacing(),
-                    hit_tolerance,
-                )
-                .is_some()
+                let line_hit = |points: &[(f64, f64)], line_type| {
+                    crate::hit_test::hit_test_line_series(
+                        points,
+                        x,
+                        y,
+                        line_type,
+                        drawing.width,
+                        None,
+                        self.time_scale.bar_spacing(),
+                        hit_tolerance,
+                    )
+                    .is_some()
+                };
+                // An Elliott wave without `show_wave` is hit only through its labels.
+                if kinds::patterns_elliott_cycles::draws_wave(drawing)
+                    && line_hit(points, line_type)
                 {
                     return true;
                 }
-                let Some(terminal) = terminal else {
-                    return false;
-                };
-                crate::hit_test::hit_test_line_series(
-                    &terminal,
-                    x,
-                    y,
-                    LineType::Simple,
-                    drawing.width,
-                    None,
-                    self.time_scale.bar_spacing(),
-                    hit_tolerance,
-                )
-                .is_some()
+                if terminal.is_some_and(|terminal| line_hit(&terminal, LineType::Simple)) {
+                    return true;
+                }
+                // The parts a pattern layers on the arm (its sides, ratio connectors and labels,
+                // and while selected its fills), then the vertex labels: each label's measured
+                // run, or the inside of its degree ring.
+                if kinds::patterns_elliott_cycles::layers_parts(drawing.kind)
+                    && self.parts_hit(drawing, px, (x, y), hit_tolerance, |context, parts| {
+                        use kinds::patterns_elliott_cycles::{pattern_parts, PatternLayer};
+                        pattern_parts(context, PatternLayer::Under, parts);
+                        pattern_parts(context, PatternLayer::Over, parts);
+                    })
+                {
+                    return true;
+                }
+                let (size, labels) =
+                    kinds::patterns_elliott_cycles::vertex_labels(self, drawing, points, 1.0);
+                labels.iter().any(|label| match label.ring {
+                    Some(radius) => {
+                        (x - label.center.0).hypot(y - label.center.1) <= radius + hit_tolerance
+                    }
+                    None => self.text_run_hit(
+                        drawing,
+                        &label.text,
+                        label.center,
+                        TextAlign::Center,
+                        size,
+                        (x, y),
+                    ),
+                })
             }
             DrawingBodyGeometry::Empty => {
                 if drawing.kind != DrawingKind::Text && !drawing.kind.is_text_annotation() {
@@ -7108,17 +7958,14 @@ impl ChartEngine {
                 let size = drawing.resolved_text_size(layout.font_size);
                 let reference = geometry.text_box;
                 let (tx, ty, align, _) = Self::text_placement(drawing, &reference, size, TEXT_PAD);
-                let width = self.measure_drawing_text(drawing, size);
-                let height = size * 1.2;
-                let left = match align {
-                    DrawingTextHAlign::Left => tx,
-                    DrawingTextHAlign::Center => tx - width / 2.0,
-                    DrawingTextHAlign::Right => tx - width,
-                };
-                x >= left - TEXT_CHROME_PAD
-                    && x <= left + width + TEXT_CHROME_PAD
-                    && y >= ty - height / 2.0 - TEXT_CHROME_PAD
-                    && y <= ty + height / 2.0 + TEXT_CHROME_PAD
+                TextBlock::new(
+                    (tx, ty, align),
+                    drawing.text_v_align,
+                    self.measure_drawing_text(drawing, size),
+                    size,
+                    drawing.text_block_lines(),
+                )
+                .contains((x, y), TEXT_CHROME_PAD)
             }
         }
     }
@@ -7226,7 +8073,7 @@ impl ChartEngine {
         let (dx, dy) = (x - start_x, y - drag.start_y);
         let (id, part) = (drag.id, drag.part);
         let (start_points, start_px) = (drag.start_points.clone(), drag.start_px.clone());
-        let keyboard_step = drag.keyboard_step;
+        let (keyboard_step, handle_px) = (drag.keyboard_step, drag.handle_px);
         let Some(drawing) = self.drawing(id) else {
             return;
         };
@@ -7275,6 +8122,8 @@ impl ChartEngine {
         if self.drawing_from_px_for(pane, price_scale, x, y).is_none() {
             return;
         }
+        // The tool options a derived-handle drag sample leaves (a fixed square's scale ratio).
+        let mut tool_options = None;
         match part {
             DrawingDragPart::Anchor(index) => {
                 if kind.spec().handles == DrawingHandleMode::Position
@@ -7510,6 +8359,18 @@ impl ChartEngine {
                     // A horizontal or vertical segment drags its linked coordinate on every
                     // anchor.
                     kind.spec().anchor_link.apply(&mut points, index);
+                    // Derived geometry follows (a rotated rectangle's width, a curve's
+                    // on-curve points).
+                    if let Some(drawing) = self.drawing(id) {
+                        kinds::follow_anchor_drag(
+                            self,
+                            drawing,
+                            index,
+                            &start_points,
+                            &start_px,
+                            &mut points,
+                        );
+                    }
                 }
             }
             DrawingDragPart::Body => {
@@ -7579,14 +8440,62 @@ impl ChartEngine {
                     *slot = point;
                 }
             }
-            // ponytail: derived drag handles (a family `handles` hook appending a
-            // `DrawingDragPart::Handle` that a family hook resolves) have no surviving family since
-            // the upstream B8 sync retired the fork's pitchfork, fixed-square, and rotated-rectangle
-            // renderers; re-add the drag hook with the first family that derives one.
-            DrawingDragPart::Handle(_) => {}
+            DrawingDragPart::Handle(_) => {
+                // A derived handle moves from its own baseline like an anchor: along the spec's
+                // movement axis, time-snapped, then magnet-snapped; the kind resolves what it
+                // drives (`kinds::drag_derived_handle`).
+                let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
+                let Some(mut target) =
+                    self.drawing_from_px_for(pane, price_scale, handle_px.0 + dx, handle_px.1 + dy)
+                else {
+                    return;
+                };
+                if snap_time_to_data {
+                    let Some(snapped) = self.snap_drawing_time_to_data(target) else {
+                        return;
+                    };
+                    target = snapped;
+                }
+                if modifiers.magnet {
+                    if let Some(snapped) =
+                        self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
+                    {
+                        target = kind.spec().movement_axis.constrain_snap(target, snapped);
+                    }
+                }
+                let (Some(target_px), Some(drawing), Some(drag)) = (
+                    self.drawing_to_px_for(pane, price_scale, target),
+                    self.drawing(id),
+                    self.drawing_drag.as_ref(),
+                ) else {
+                    return;
+                };
+                let sample = handles::HandleDrag {
+                    part,
+                    start_points: &start_points,
+                    start_px: &start_px,
+                    start_tool_options: &drag.history_tool_options,
+                    handle_px,
+                    target,
+                    target_px,
+                    straighten: modifiers.straighten,
+                    keyboard_step,
+                };
+                // A rejected sample keeps the last valid one, as the body drag does. Every
+                // accepted sample starts from the press: one that edits no option restores what
+                // an earlier sample of this drag edited.
+                let Some(edited) = kinds::drag_derived_handle(self, drawing, &sample, &mut points)
+                else {
+                    return;
+                };
+                tool_options = Some(edited.unwrap_or_else(|| drag.history_tool_options.clone()));
+            }
         }
         if let Some(drawing) = self.drawings.iter_mut().find(|d| d.id == id) {
             drawing.points = points;
+            if let Some(tool_options) = tool_options {
+                drawing.tool_options = tool_options;
+            }
         }
         if kind.spec().placement.is_freehand() {
             self.invalidate_brush_drag_runtime(id);
@@ -7885,10 +8794,13 @@ impl ChartEngine {
     }
 
     /// Whether a newly created drawing requests the platform text editor. The editor remains a
-    /// host surface, while the decision to enter it is part of the canonical tool definition.
+    /// host surface, while the decision to enter it is part of the canonical tool definition
+    /// (and, for a fork-form signpost, of its fork form: owner decision A7).
     pub fn drawing_requests_text_edit(&self, id: DrawingId) -> bool {
-        self.drawing(id)
-            .is_some_and(|drawing| drawing.kind.spec().requests_text_editor)
+        self.drawing(id).is_some_and(|drawing| {
+            drawing.kind.spec().requests_text_editor
+                || kinds::projection_annotations::requests_text_editor(drawing)
+        })
     }
 
     /// Merge options into the armed template and any in-flight creation. Browser and native
@@ -7930,7 +8842,6 @@ impl ChartEngine {
 
     fn creation_update_for_commit(
         &mut self,
-        kind: DrawingKind,
         id: DrawingId,
         pointer_capture: bool,
     ) -> DrawingCreationUpdate {
@@ -7950,7 +8861,7 @@ impl ChartEngine {
             consumed: true,
             changed: true,
             created: Some(id),
-            request_text_edit: kind.spec().requests_text_editor,
+            request_text_edit: self.drawing_requests_text_edit(id),
             pointer_capture,
         }
     }
@@ -7995,7 +8906,7 @@ impl ChartEngine {
                 }
                 let result = self.drawing_create_click(x, y, modifiers);
                 let id = u32::try_from(result).unwrap_or(0);
-                self.creation_update_for_commit(armed.kind, id, false)
+                self.creation_update_for_commit(id, false)
             }
             _ => DrawingCreationUpdate {
                 consumed: true,
@@ -8065,7 +8976,7 @@ impl ChartEngine {
         // move event happened to arrive before pointer-up.
         let changed = self.brush_create_add(x, y);
         let id = self.brush_create_end();
-        let mut update = self.creation_update_for_commit(kind, id, false);
+        let mut update = self.creation_update_for_commit(id, false);
         update.changed |= changed;
         update
     }
@@ -8111,7 +9022,7 @@ impl ChartEngine {
         let result = self.drawing_create_click(x, y, modifiers);
         let id = u32::try_from(result).unwrap_or(0);
         if id > 0 {
-            return self.creation_update_for_commit(kind, id, false);
+            return self.creation_update_for_commit(id, false);
         }
         DrawingCreationUpdate {
             consumed: true,
@@ -8130,7 +9041,7 @@ impl ChartEngine {
             return DrawingCreationUpdate::default();
         }
         let id = self.drawing_create_finish();
-        self.creation_update_for_commit(kind, id, false)
+        self.creation_update_for_commit(id, false)
     }
 
     /// Step back the armed tool's placement by its latest placed anchor (see
@@ -8468,6 +9379,16 @@ impl ChartEngine {
         if bound_pane.is_some() && self.pane_at_y(y) != Some(pane) {
             return -1;
         }
+        // A click on a polyline's first vertex, once three are placed, finishes it closed.
+        if self.pending_close_hit(x, y).is_some() {
+            let Some(mut pending) = self.drawing_controller.pending.take() else {
+                return -1;
+            };
+            pending.drawing.tool_options.shape =
+                Some(kinds::shapes::ShapeToolOptions { closed: true });
+            pending.preview = None;
+            return i64::from(self.commit_pending_drawing(pending));
+        }
         let (anchor_count, kind, fixed, snap_time_to_data, own_magnet) = {
             let Some(pending) = &self.drawing_controller.pending else {
                 return 0;
@@ -8551,7 +9472,21 @@ impl ChartEngine {
     fn commit_pending_drawing(&mut self, pending: PendingDrawing) -> DrawingId {
         self.invalidate_frame_overlay();
         let mut drawing = pending.drawing;
+        // Tools placed through points on their geometry store the anchors those clicks define
+        // (an arc ends first, a curve through its on-curve points), as the preview showed.
+        if kinds::shapes::places_through(drawing.kind) {
+            let Some(points) = kinds::shapes::placement_anchors(self, &drawing, &drawing.points)
+            else {
+                return 0;
+            };
+            drawing.points = points;
+        }
         Drawing::normalize_points(drawing.kind, &mut drawing.points);
+        // A fork-form annotation starts from the fork's starter text (owner decision A6), so
+        // its placement opens the editor on it; upstream's form starts empty.
+        if let Some(text) = kinds::projection_annotations::starter_text(&drawing) {
+            drawing.text = text.to_string();
+        }
         // Anchored text starts at its anchor's screen position.
         if drawing.kind == DrawingKind::AnchoredText {
             if let Some((x, y)) = drawing.points.first().and_then(|&point| {
@@ -8582,6 +9517,24 @@ impl ChartEngine {
             index,
         });
         id
+    }
+
+    /// The first vertex of the polyline being placed when media px `(x, y)` lies within the
+    /// precision anchor radius of it and three vertices or more are placed: a click there
+    /// finishes the polyline closed (`tool_options.shape.closed`) instead of adding a vertex, and
+    /// the preview snaps onto it. Only the polyline closes this way; a path keeps its vertices.
+    fn pending_close_hit(&self, x: f64, y: f64) -> Option<DrawingPoint> {
+        let pending = self.drawing_controller.pending.as_ref()?;
+        let drawing = &pending.drawing;
+        if drawing.kind != DrawingKind::Polyline
+            || !drawing.kind.spec().placement.is_sequence()
+            || drawing.points.len() < 3
+        {
+            return None;
+        }
+        let first = *drawing.points.first()?;
+        let (fx, fy) = self.drawing_point_px(drawing, first)?;
+        ((fx - x).hypot(fy - y) <= HitProfile::PRECISION.drawing_anchor_radius).then_some(first)
     }
 
     /// Commit an active multi-click path. Enter and double-click route here after at least two
@@ -8653,6 +9606,13 @@ impl ChartEngine {
             bound_pane
         };
         if self.pane_at_y(y) != Some(pane) {
+            return;
+        }
+        // Over a polyline's first vertex the preview closes onto it, as a click there would.
+        if let Some(first) = self.pending_close_hit(x, y) {
+            if let Some(pending) = self.drawing_controller.pending.as_mut() {
+                pending.preview = Some(first);
+            }
             return;
         }
         let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {

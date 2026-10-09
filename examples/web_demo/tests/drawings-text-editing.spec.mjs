@@ -4,7 +4,7 @@ import { PNG } from "pngjs";
 
 // Inline editing of drawing text through real pointer and keyboard input: double-click, Enter,
 // and F2 open the caret overlay on the engine-resolved layout, typing is live (multi-line in the
-// simple annotation's box, one line in the text annotations, one rotated line in a run label such
+// simple annotation's box and the text annotations' blocks, one rotated line in a run label such
 // as a ray's or a rectangle's text), a commit is one undo step and a cancel restores the text, the
 // accessibility surface edits and gets its focus back, the edit persists and syncs, and placing a
 // text annotation opens the editor at once. Every layout decision is engine-owned; these specs
@@ -162,7 +162,7 @@ async function spot(page, logical, price) {
 
 test("double-click edits a family text box in place: live multi-line typing, one undo step, Escape restores", async ({ page }) => {
   await goto_fixture(page);
-  // The simple annotation keeps a multi-line box (the text annotations edit one line).
+  // The simple annotation's family box spans lines.
   const id = await add_on_bar(page, "simple_annotation", 0.4, { text: "Comment" });
   await settle_frames(page);
   const before = await edit_layout(page, id);
@@ -237,6 +237,66 @@ test("double-click edits a family text box in place: live multi-line typing, one
   expect(color_extent(await capture(page), PINK), "the emptied box keeps its caret line").not.toBeNull();
   await page.keyboard.press("Enter");
   expect(await text_of(page, id)).toBe("");
+});
+
+test("a text annotation's text spans lines: Shift+Enter stacks a line in its block, Enter commits one undo step", async ({ page }) => {
+  await goto_fixture(page);
+  const id = await add_on_bar(page, "note", 0.4, { text: "first" });
+  await settle_frames(page);
+  const before = await edit_layout(page, id);
+  expect(before.multiline).toBe(true);
+  const editor = page.locator(EDITOR);
+  await page.mouse.dblclick(before.center.x, before.center.y);
+  await expect(editor).toBeFocused();
+  expect(await editor.evaluate((el) => el.tagName)).toBe("TEXTAREA");
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("second");
+  await expect.poll(() => text_of(page, id)).toBe("first\nsecond");
+  // The note is centered on its anchor: its block grows by half a line each way.
+  const grown = await edit_layout(page, id);
+  expect(grown.y).toBeCloseTo(before.y - before.line_height / 2, 3);
+  expect(grown.rect[3] - grown.rect[1]).toBeCloseTo(before.rect[3] - before.rect[1] + before.line_height, 3);
+  await page.keyboard.press("Enter");
+  await expect(editor).toHaveCount(0);
+  expect(await text_of(page, id)).toBe("first\nsecond");
+  expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+  expect(await text_of(page, id), "one undo step").toBe("first");
+});
+
+test("placing a fork-look signpost opens its editor on its starter text; an upstream signpost opens none", async ({ page }) => {
+  await goto_fixture(page);
+  const editor = page.locator(EDITOR);
+  const range = await page.evaluate(() => window.__chart.time_scale().get_visible_logical_range());
+  const l0 = Math.floor(range.from + (range.to - range.from) * 0.4);
+  const b0 = await page.evaluate((logical) => window.__main.data_by_index(logical), l0);
+  for (const fork of [true, false]) {
+    await page.evaluate((fork) => {
+      window.__chart.set_drawing_tool("signpost", {
+        color: "#e91e63",
+        ...(fork ? { tool_options: { projection_annotation: {} } } : {}),
+      });
+    }, fork);
+    for (const price of [b0.low, b0.high]) {
+      const point = await spot(page, l0, price);
+      await page.mouse.click(point.x, point.y);
+      await page.waitForTimeout(650);
+    }
+    await settle_frames(page);
+    const id = await page.evaluate(() => window.__chart.drawings().at(-1)?.id);
+    if (!fork) {
+      await expect(editor).toHaveCount(0);
+      expect(await text_of(page, id)).toBe("");
+      continue;
+    }
+    await expect(editor).toBeFocused();
+    expect(await editor.evaluate((el) => el.tagName)).toBe("TEXTAREA");
+    expect(await text_of(page, id)).toBe("Signpost");
+    await page.keyboard.type(" A");
+    await expect.poll(() => text_of(page, id)).toBe("Signpost A");
+    await page.keyboard.press("Enter");
+    await expect(editor).toHaveCount(0);
+    expect(await text_of(page, id)).toBe("Signpost A");
+  }
 });
 
 test("every family text box opens the editor; a locked drawing does not", async ({ page }) => {

@@ -6,9 +6,10 @@ import { PNG } from "pngjs";
 // B8 Fibonacci family (retracement, trend-based extension, channel, time zones, trend-based time,
 // speed resistance fan and arcs, circles, spiral, wedge) through the public API and real pointer
 // input: armed placement of every tool, the three-anchor first-leg preview, level lines and their
-// hits, level-list and flat level-option edits, body drags with undo, persistence/clipboard/sync
-// round trips, the demo toolbar, and WebGPU == Canvas2D parity. Every geometry decision is
-// engine-owned; these specs only drive the package API and pointer.
+// hits, level-list and flat level-option edits, body drags with undo, the stored tool options
+// (trend line, label placement, label and selected-band hits, the golden spiral),
+// persistence/clipboard/sync round trips, the demo toolbar, and WebGPU == Canvas2D parity. Every
+// geometry decision is engine-owned; these specs only drive the package API and pointer.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
@@ -192,10 +193,12 @@ test("the retracement paints ratio levels and hits its level lines", async ({ pa
   const low = await spot(page, (s.l0 + s.l1) / 2, s.p_lo + (s.p_hi - s.p_lo) * 0.236);
   expect(rows.some((row) => Math.abs(row - low.y * PR) <= 2), `rows ${rows} near ${low.y * PR}`).toBe(true);
 
-  // A level line hovers and selects the drawing; the band between two levels does not.
+  // A level line hovers and selects the drawing; the band between two levels does not (it is
+  // unfilled here, and a band is a drag surface only while selected). The spot sits clear of
+  // the level labels, which hover like the lines.
   const half = (s.p_lo + s.p_hi) / 2;
   const level = await spot(page, (s.l0 + s.l1) / 2, half);
-  const band = await spot(page, (s.l0 + s.l1) / 2, s.p_lo + (s.p_hi - s.p_lo) * 0.7);
+  const band = await spot(page, s.l0 + (s.l1 - s.l0) * 0.15, s.p_lo + (s.p_hi - s.p_lo) * 0.7);
   await page.mouse.move(band.x, band.y);
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
   await page.mouse.move(level.x, level.y);
@@ -440,6 +443,90 @@ test("Fibonacci tools round-trip through persistence, clipboard, and sync with t
   expect(semantic(result.synced)).toEqual(semantic(result.expected));
 });
 
+test("Fibonacci tool options paint and hit through real pointer input", async ({ page }) => {
+  await goto_fixture(page);
+  await page.evaluate(() => window.__chart.apply_options({ crosshair: { mode: 2 } }));
+  const s = await anchor_spots(page);
+  const levels = [0, 0.5, 1].map((value) => ({
+    value, color: "#4caf50", visible: true, style: "solid", fill_between: true, label_visible: true,
+  }));
+  const info = await page.evaluate(({ s, levels }) => {
+    const drawing = window.__chart.add_drawing("fibonacci_retracement", [
+      { logical: s.l0, price: s.p_lo },
+      { logical: s.l1, price: s.p_hi },
+    ], { color: "#e91e63", levels, level_label_align: "left" });
+    return {
+      id: drawing.id,
+      schema: window.__chart.drawing_property_schema(drawing).properties
+        .filter((property) => property.name.startsWith("tool_options.fibonacci."))
+        .map((property) => [property.name, property.default]),
+    };
+  }, { s, levels });
+  expect(info.schema).toEqual([
+    ["tool_options.fibonacci.trend_line", false],
+    ["tool_options.fibonacci.label_v_align", "top"],
+  ]);
+  await settle_frames(page);
+  const plain = await capture(page);
+  const a = await spot(page, s.l0, s.p_lo);
+  const b = await spot(page, s.l1, s.p_hi);
+  // A tenth of the way along the anchors: between levels 0 and 0.5, off the labels.
+  const on_trend = { x: a.x + (b.x - a.x) * 0.1, y: a.y + (b.y - a.y) * 0.1 };
+  await page.mouse.move(on_trend.x, on_trend.y);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+
+  // The stored options: the trend line through the anchors and labels beside the lines' left
+  // ends, centered on them.
+  await page.evaluate((id) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({
+      tool_options: { fibonacci: { trend_line: true, label_v_align: "middle" } },
+    });
+  }, info.id);
+  await settle_frames(page);
+  const styled = await capture(page);
+  const diff = pixelmatch(plain.data, styled.data, null, plain.width, plain.height, { threshold: 0 });
+  expect(diff, "the trend line and the moved labels paint").toBeGreaterThan(50);
+  await page.mouse.move(on_trend.x + 1, on_trend.y + 1);
+  await page.mouse.move(on_trend.x, on_trend.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+
+  // A label left of the 0.5 line hovers like the line.
+  const level_half = await spot(page, s.l0, (s.p_lo + s.p_hi) / 2);
+  await page.mouse.move(level_half.x - 20, level_half.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+
+  // The band between levels 0 and 0.5 pans the chart until the drawing is selected, then drags it.
+  const band = await spot(page, s.l0 + (s.l1 - s.l0) * 0.7, s.p_lo + (s.p_hi - s.p_lo) * 0.3);
+  await page.mouse.move(band.x, band.y);
+  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+  await page.mouse.click(on_trend.x, on_trend.y);
+  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
+  await page.mouse.move(band.x + 1, band.y);
+  await page.mouse.move(band.x, band.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  await page.mouse.down();
+  await page.mouse.move(band.x + 20, band.y + 15, { steps: 4 });
+  await page.mouse.move(band.x + 40, band.y + 30, { steps: 4 });
+  await page.mouse.up();
+  await settle_frames(page);
+  const moved = await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).points(), info.id);
+  expect(moved[0].logical).toBeGreaterThan(s.l0);
+  expect(moved[0].price).toBeLessThan(s.p_lo);
+
+  // An empty spiral paints the golden spiral.
+  const before = await capture(page);
+  await page.evaluate(({ s }) => {
+    window.__chart.add_drawing("fibonacci_spiral", [
+      { logical: s.l2, price: s.p_mid },
+      { logical: s.l2 + 2, price: s.p_mid },
+    ], { color: "#7b1fa2", levels: [] });
+  }, { s });
+  await settle_frames(page);
+  const spiral = await capture(page);
+  const painted = pixelmatch(before.data, spiral.data, null, before.width, before.height, { threshold: 0 });
+  expect(painted, "the golden spiral paints").toBeGreaterThan(200);
+});
+
 test("the demo toolbar arms every Fibonacci tool", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
@@ -480,6 +567,15 @@ test("Fibonacci tools render pixel-identical on WebGPU and Canvas2D (AA coverage
         { logical: range.from - (range.to - range.from) * 0.3, price: up(0.5) },
         { logical: range.from - (range.to - range.from) * 0.1, price: up(0.5) },
       ], { levels: [ring(1.5, "#2962ff"), ring(2, "#f23645"), ring(2.5, "#089981")] });
+      // The same dashed rings centered right of the pane as precise rings (a stored block): the
+      // engine splits their dashes over the pane's window of each ring.
+      chart.add_drawing("fibonacci_circles", [
+        { logical: range.to + (range.to - range.from) * 0.3, price: up(0.5) },
+        { logical: range.to + (range.to - range.from) * 0.1, price: up(0.5) },
+      ], {
+        levels: [ring(1.5, "#2962ff"), ring(2, "#f23645"), ring(2.5, "#089981")],
+        tool_options: { fibonacci: { trend_line: false } },
+      });
       chart.add_drawing("fibonacci_speed_arcs", [{ logical: at(0.12), price: up(0.25) }, { logical: at(0.16), price: up(0.4) }], { style: "dotted" });
       chart.add_drawing("fibonacci_extension", [
         { logical: at(0.5), price: up(0.05) }, { logical: at(0.56), price: up(0.25) }, { logical: at(0.6), price: up(0.15) },
@@ -490,6 +586,22 @@ test("Fibonacci tools render pixel-identical on WebGPU and Canvas2D (AA coverage
       chart.add_drawing("fibonacci_wedge", [
         { logical: at(0.7), price: up(0.1) }, { logical: at(0.78), price: up(0.3) }, { logical: at(0.78), price: up(0.0) },
       ]);
+      // The stored options: the dashed trend line, labels beside the lines' ends, the fan grid,
+      // full circles over precise rings, and the golden spiral of an empty spiral.
+      const fill = (value, color) => ({ value, color, visible: true, style: "solid", fill_between: true, label_visible: true });
+      chart.add_drawing("fibonacci_retracement", [{ logical: at(0.66), price: up(0.6) }, { logical: at(0.74), price: up(0.95) }], {
+        style: "dashed", level_label_align: "left", levels: [fill(0, "#787b86"), fill(0.5, "#4caf50"), fill(1, "#2962ff")],
+        tool_options: { fibonacci: { trend_line: true, label_v_align: "middle" } },
+      });
+      chart.add_drawing("fibonacci_speed_fan", [{ logical: at(0.24), price: up(0.6) }, { logical: at(0.32), price: up(0.95) }], {
+        tool_options: { fibonacci: { grid: true } },
+      });
+      chart.add_drawing("fibonacci_speed_arcs", [{ logical: at(0.92), price: up(0.2) }, { logical: at(0.95), price: up(0.35) }], {
+        tool_options: { fibonacci: { full_circles: true, trend_line: true } },
+      });
+      chart.add_drawing("fibonacci_spiral", [{ logical: at(0.45), price: up(0.45) }, { logical: at(0.47), price: up(0.5) }], {
+        color: "#00897b", levels: [], tool_options: { fibonacci: { trend_line: true } },
+      });
       const first = chart.drawings()[0];
       chart.wasm.set_selected_drawing(first.id);
       chart.render();

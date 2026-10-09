@@ -5041,7 +5041,7 @@ fn placing_a_text_owning_annotation_requests_the_editor_but_price_labels_and_arr
 }
 
 #[test]
-fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owning_families() {
+fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owners() {
     let mut chart = settled_chart();
     let rectangle = chart
         .add_drawing(
@@ -5100,13 +5100,13 @@ fn drawing_text_is_bounded_atomically_and_one_line_outside_the_text_owning_famil
     assert!(chart.set_drawing_text_edit("one\ntwo", usize::MAX));
     assert_eq!(chart.drawing(annotation).unwrap().text, "one\ntwo");
     assert!(chart.commit_drawing_text_edit());
-    // Upstream's text annotations paint one run, so their editor keeps one line too.
+    // The text annotations stack their lines into one text block, so their editor keeps them.
     let comment = chart
         .add_drawing(DrawingKind::Comment, 0, vec![pt(4.0, 12.0)], None)
         .unwrap();
     assert!(chart.begin_drawing_text_edit(comment, false));
     assert!(chart.set_drawing_text_edit("one\ntwo", usize::MAX));
-    assert_eq!(chart.drawing(comment).unwrap().text, "one two");
+    assert_eq!(chart.drawing(comment).unwrap().text, "one\ntwo");
     assert!(chart.commit_drawing_text_edit());
 }
 
@@ -5657,13 +5657,17 @@ fn channel_catalog_renders_shared_band_and_keeps_editable_anchors() {
         assert!(chart.drawing(id).unwrap().fill_enabled);
         assert_eq!(chart.drawing(id).unwrap().points.len(), count);
         let frame = chart.build_frame();
-        assert!(frame.panes[0].main.iter().any(|prim| {
-            if kind == DrawingKind::DisjointChannel {
-                matches!(prim, Prim::Triangle { .. })
-            } else {
-                matches!(prim, Prim::BandFill { point_count: 2, .. })
-            }
-        }));
+        // Every channel, the disjoint one included, fills with one band between its lines
+        // (owner decision C3: the disjoint's two triangles left a quarter of a reversed channel
+        // unpainted).
+        assert!(frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::BandFill { point_count: 2, .. })));
+        assert!(!frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Triangle { .. })));
         assert!(chart.remove_drawing(id));
     }
 }
@@ -6464,6 +6468,134 @@ fn fork_era_clipboard_and_sync_items_convert_to_upstream_anchor_contracts() {
 }
 
 #[test]
+fn fork_era_payload_items_take_the_fork_option_defaults() {
+    let at = |logical: f64, price: f64| serde_json::json!({"logical": logical, "price": price});
+    let stats = [
+        "price_change",
+        "percent_change",
+        "bar_count",
+        "duration",
+        "angle",
+    ]
+    .map(|metric| serde_json::json!({"metric": metric, "visible": true, "position": "on"}));
+    // An anchor count upstream never stores, or the fork's default info-line stats, prove a fork
+    // build wrote the item; the same tools on upstream's contracts carry no such proof.
+    let items = serde_json::json!([
+        {"id": 1, "kind": "info_line", "pane_index": 0,
+         "options": {"labels": stats, "tool_options": {}},
+         "points": [at(1.0, 10.0), at(4.0, 12.0)]},
+        {"id": 2, "kind": "projection", "pane_index": 0, "options": {"tool_options": {}},
+         "points": [at(2.0, 10.0), at(5.0, 12.0), at(4.0, 13.0)]},
+        {"id": 3, "kind": "signpost", "pane_index": 0, "options": {},
+         "points": [at(7.0, 12.0)]},
+        {"id": 4, "kind": "price_note", "pane_index": 0, "options": {},
+         "points": [at(5.0, 11.0), at(8.0, 13.0)]},
+        {"id": 5, "kind": "gann_square_fixed", "pane_index": 0,
+         "options": {"tool_options": {"gann": {"size_bars": 4.0, "reverse": true}}},
+         "points": [at(3.0, 12.0)]},
+        {"id": 6, "kind": "triangle_pattern", "pane_index": 0,
+         "options": {"extend_left": false, "extend_right": false},
+         "points": [at(0.0, 10.0), at(2.0, 14.0), at(4.0, 11.0), at(6.0, 13.0)]},
+        {"id": 7, "kind": "info_line", "pane_index": 0, "options": {},
+         "points": [at(1.0, 10.0), at(4.0, 12.0)]},
+        {"id": 8, "kind": "projection", "pane_index": 0, "options": {},
+         "points": [at(2.0, 10.0), at(4.0, 13.0)]},
+        {"id": 9, "kind": "gann_square", "pane_index": 0,
+         "options": {"tool_options": {"gann": {"reverse": true}}},
+         "points": [at(3.0, 10.0), at(7.0, 12.0)]}
+    ]);
+    let check = |chart: &ChartEngine, ids: &[DrawingId]| {
+        let drawing = |index: usize| chart.drawing(ids[index]).unwrap();
+        assert_eq!(drawing(0).tool_options.line, Some(Default::default()));
+        for index in 1..=3 {
+            assert_eq!(
+                drawing(index).tool_options.projection_annotation,
+                Some(Default::default()),
+                "{:?} carries the fork-form marker",
+                drawing(index).kind
+            );
+        }
+        // The fixed square's `reverse` is its downward corner, not a reversed pivot; it shows
+        // the fork's stats box.
+        let square = drawing(4);
+        assert!(!square.level_reverse);
+        assert!(square.points[1].price < square.points[0].price);
+        let gann = square.tool_options.gann.as_ref().unwrap();
+        assert!(gann.show_stats);
+        assert_eq!(gann.size_bars, 4.0);
+        let triangle = drawing(5);
+        assert!(triangle.extend_left && triangle.extend_right);
+        // Items on upstream's contracts keep upstream's options.
+        assert_eq!(drawing(6).tool_options, Default::default());
+        assert_eq!(drawing(7).tool_options, Default::default());
+        assert!(
+            drawing(8).level_reverse,
+            "a patch keeps the documented alias"
+        );
+        assert_eq!(drawing(8).tool_options.gann, None);
+    };
+    let clipboard = serde_json::json!({
+        "schema": "aeris_charts-drawings",
+        "revision": 1,
+        "drawings": items,
+    })
+    .to_string();
+    let mut chart = settled_chart();
+    let pasted = chart.paste_drawings_json(&clipboard, 0, 0.0, 0.0).unwrap();
+    check(&chart, &pasted);
+    let sync = serde_json::json!({
+        "schema": "aeris_charts-drawing-sync",
+        "source": "fork-peer",
+        "revision": 3,
+        "drawings": items,
+    })
+    .to_string();
+    let mut peer = settled_chart();
+    assert!(peer.apply_drawing_sync_payload_json(&sync));
+    check(&peer, &(1..=9).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_removed_fork_info_line_stats_box_stays_removed_through_payloads() {
+    let stats = [
+        "price_change",
+        "percent_change",
+        "bar_count",
+        "duration",
+        "angle",
+    ]
+    .map(|metric| serde_json::json!({"metric": metric, "visible": true, "position": "on"}));
+    let fork = serde_json::json!({
+        "schema": "aeris_charts-drawings",
+        "revision": 1,
+        "drawings": [{"kind": "info_line", "pane_index": 0,
+            "options": {"labels": stats, "tool_options": {}},
+            "points": [{"logical": 1.0, "price": 10.0}, {"logical": 4.0, "price": 12.0}]}],
+    })
+    .to_string();
+    let mut chart = settled_chart();
+    let id = chart.paste_drawings_json(&fork, 0, 0.0, 0.0).unwrap()[0];
+    assert!(chart.drawing(id).unwrap().tool_options.line.is_some());
+    // The user removes the box; the drawing keeps the fork's five stats.
+    assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"line":null}}"#));
+    let drawing = chart.drawing(id).unwrap();
+    assert_eq!(drawing.tool_options.line, None);
+    assert!(crate::drawings::kinds::lines::is_legacy_info_stats(
+        &drawing.labels
+    ));
+
+    let copied = chart.copy_drawings_json(&[id]).unwrap();
+    let pasted = chart.paste_drawings_json(&copied, 0, 2.0, 0.0).unwrap()[0];
+    assert_eq!(chart.drawing(pasted).unwrap().tool_options.line, None);
+    let sync = chart.drawing_sync_payload_json("cell-a").unwrap();
+    let mut peer = settled_chart();
+    assert!(peer.apply_drawing_sync_payload_json(&sync));
+    for drawing in &peer.drawings {
+        assert_eq!(drawing.tool_options.line, None, "{}", drawing.id);
+    }
+}
+
+#[test]
 fn a_callout_moves_its_tip_and_its_box_by_their_own_handles() {
     let mut chart = settled_chart();
     let id = chart
@@ -7096,11 +7228,9 @@ fn pattern_and_elliott_paths_render_vertex_labels_hit_and_persist() {
             )
             .unwrap();
         let frame = chart.build_frame();
-        let expected_label = if kind.is_elliott() {
-            format!("{label} (minor)")
-        } else {
-            label.to_string()
-        };
+        // Elliott waves label in the Frost-Prechter notation of their degree (owner decision
+        // P4): the default minor degree writes Arabic numbers and capital letters bare.
+        let expected_label = label.to_string();
         assert!(frame.panes[0].main.iter().any(|prim| {
             matches!(prim, Prim::Polyline { point_count, .. } if *point_count == count as u32)
         }));
@@ -7120,8 +7250,21 @@ fn pattern_and_elliott_paths_render_vertex_labels_hit_and_persist() {
                 }));
             assert!(!chart.drawing_apply_options(id, r#"{"wave_degree":"invalid"}"#));
             assert_eq!(chart.drawing(id).unwrap().wave_degree, "minor");
+            let polylines = |chart: &mut ChartEngine| {
+                chart.build_frame().panes[0]
+                    .main
+                    .iter()
+                    .filter(|prim| matches!(prim, Prim::Polyline { .. }))
+                    .count()
+            };
+            let minor_polylines = polylines(&mut chart);
             assert!(chart.drawing_apply_options(id, r#"{"wave_degree":"primary"}"#));
-            assert!(pane_texts(&mut chart).contains(&"5 (primary)".to_string()));
+            // Primary rings its bare numbers (one ring per labeled wave); the wave start stays
+            // unlabeled.
+            let texts = pane_texts(&mut chart);
+            assert!(texts.contains(&"5".to_string()));
+            assert!(!texts.contains(&"0".to_string()));
+            assert_eq!(polylines(&mut chart), minor_polylines + 5);
         }
         assert_eq!(
             chart

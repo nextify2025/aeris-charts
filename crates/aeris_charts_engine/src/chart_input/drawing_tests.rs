@@ -190,6 +190,38 @@ fn path_anchors_placed_by_clicks_pop_on_backspace_and_a_double_click_finishes_on
 }
 
 #[test]
+fn a_click_or_double_click_on_a_polylines_first_vertex_finishes_it_closed() {
+    for double in [false, true] {
+        let mut chart = chart();
+        assert!(chart.set_drawing_tool(Some(DrawingKind::Polyline), None, None));
+        let revision = chart.drawing_revision();
+        for (x, y) in [(120.0, 140.0), (220.0, 260.0), (320.0, 160.0)] {
+            click(&mut chart, x, y);
+        }
+        assert!(chart.take_input_events().is_empty(), "a polyline waits");
+        // Near the first vertex: a click there closes the polyline instead of adding a vertex.
+        // The platform double-click's second delivery finishes placement, as a double-click
+        // finishing an open polyline does: it creates nothing more and opens no editor on the
+        // new polyline under it.
+        click(&mut chart, 123.0, 138.0);
+        if double {
+            double_click(&mut chart, 123.0, 138.0);
+        }
+        let events = chart.take_input_events();
+        let [ChartInputEvent::DrawingCreated(id)] = events[..] else {
+            panic!("the closing click finishes one polyline: {events:?}");
+        };
+        assert_eq!(chart.drawing_text_edit(), None, "double-click {double}");
+        assert_eq!(chart.drawings().len(), 1, "double-click {double}");
+        let drawing = chart.drawing(id).unwrap();
+        assert_eq!(drawing.points.len(), 3);
+        assert!(drawing.tool_options.shape.is_some_and(|shape| shape.closed));
+        assert_eq!(chart.active_drawing_tool(), None);
+        assert_eq!(chart.drawing_revision(), revision + 1, "one create step");
+    }
+}
+
+#[test]
 fn escape_discards_a_pending_path_and_disarms_the_tool() {
     let mut chart = chart();
     assert!(chart.set_drawing_tool(Some(DrawingKind::Path), None, None));
@@ -1186,4 +1218,52 @@ fn after_the_first_click_a_press_drag_release_only_moves_the_preview() {
     assert_eq!(chart.active_drawing_tool(), None, "a one-shot tool");
     assert!(chart.undo_drawing());
     assert!(chart.drawings().is_empty());
+}
+
+#[test]
+fn a_fork_form_signpost_opens_its_editor_on_placement_and_keeps_an_emptied_text() {
+    // Owner decisions A6/A7: only a fork-form signpost (the `projection_annotation` marker)
+    // starts from the fork's starter text and opens the editor on placement; upstream's form
+    // opens nothing. A signpost is no text annotation, so emptying it keeps the drawing.
+    for (options, fork) in [
+        (
+            Some(r#"{"tool_options":{"projection_annotation":{}}}"#),
+            true,
+        ),
+        (None, false),
+    ] {
+        let mut chart = chart();
+        assert!(chart.set_drawing_tool(Some(DrawingKind::Signpost), options, None));
+        for (x, y) in [(300.0, 260.0), (300.0, 200.0)] {
+            chart.input_pointer_down(at(x, y), 1);
+            chart.input_pointer_up(at(x, y));
+        }
+        let events = chart.take_input_events();
+        let [ChartInputEvent::DrawingCreated(id)] = events[..] else {
+            panic!("one signpost was created: {events:?}");
+        };
+        assert_eq!(
+            chart.editing_drawing(),
+            fork.then_some(id),
+            "fork form {fork}"
+        );
+        if !fork {
+            assert_eq!(chart.drawing(id).unwrap().text, "");
+            continue;
+        }
+        assert_eq!(chart.drawing_text_edit(), Some((id, "Signpost", 8)));
+        assert!(chart.set_drawing_text_edit("", 0));
+        assert!(chart.commit_drawing_text_edit());
+        assert_eq!(
+            chart.drawing(id).unwrap().text,
+            "",
+            "an emptied signpost is kept"
+        );
+        // F2 reopens it on the empty text; cancelling (the editor's Escape) keeps the drawing.
+        assert!(key(&mut chart, ChartKey::EditText));
+        assert_eq!(chart.editing_drawing(), Some(id));
+        assert!(chart.cancel_drawing_text_edit());
+        assert_eq!(chart.editing_drawing(), None);
+        assert!(chart.drawing(id).is_some());
+    }
 }
